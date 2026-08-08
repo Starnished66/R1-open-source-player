@@ -1,0 +1,31 @@
+#ifndef HW_BUTTONS_H
+#define HW_BUTTONS_H
+
+#include <stdbool.h>
+
+/* Starts a background thread reading the R1's physical volume/skip/play-pause
+ * buttons. They're exposed as two separate evdev nodes (md-gpio-keys and
+ * "jz adc keyboard"), already decoded by the kernel driver into standard key
+ * codes (KEY_VOLUMEUP/DOWN, KEY_PLAYPAUSE, KEY_NEXTSONG/PREVIOUSSONG).
+ *
+ * These act as direct hardware shortcuts, not keypad navigation for the UI,
+ * so this bypasses LVGL's indev/keypad abstraction entirely: the reader
+ * thread only sets flags/counters here, and the GUI's own periodic timer
+ * (already running on the one thread allowed to touch LVGL widgets) polls
+ * and applies them via the consume_* functions below. */
+void hw_buttons_init(void);
+
+bool hw_buttons_consume_play_pause(void);
+bool hw_buttons_consume_next(void);
+bool hw_buttons_consume_prev(void);
+
+/* Power button: must be applied on the GUI thread (not the reader thread
+ * that detects it) so the backlight toggle and the LVGL inactivity clock it
+ * shares with auto screen-timeout stay in sync -- see gui.c's update_timer_cb. */
+bool hw_buttons_consume_power(void);
+
+/* Net accumulated volume step (in percent) since the last call, then reset
+ * to 0. Positive for volume up, negative for volume down. */
+int hw_buttons_consume_volume_delta(void);
+
+#endif /* HW_BUTTONS_H */

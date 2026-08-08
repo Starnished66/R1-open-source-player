@@ -1,0 +1,190 @@
+#include "charge_limiter.h"
+#include "battery.h"
+#include "debug_log.h"
+
+#include <fcntl.h>
+#include <linux/i2c-dev.h>
+#include <linux/i2c.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+#include <time.h>
+#include <unistd.h>
+
+/* Real-device incident (2026-08-08): after this feature was active for a
+ * while on a charging device, the status bar's battery percentage/charge
+ * status stopped updating entirely. Not root-caused yet -- suspected
+ * culprit is this file's own repeated raw i2c smbus transactions straight
+ * against the AXP2101 (bypassing its kernel driver entirely, every
+ * CHARGE_LIMITER_REEVALUATE_SECONDS while charging), racing with or
+ * otherwise confusing whatever the kernel's own AXP2101/CW2015 drivers are
+ * doing on the same i2c bus concurrently and eventually wedging the
+ * power_supply sysfs nodes battery.c reads from -- but this is a
+ * hypothesis, not confirmed. Reverted to inert (charging left entirely
+ * alone, same as if this feature didn't exist) until that's actually
+ * root-caused -- a device that silently stops reporting its own battery
+ * state is a worse outcome than an unlimited charge cycle. The Settings
+ * row/toggle still exists and still saves its own setting, it just no
+ * longer does anything; re-enable by flipping this back to 1 once fixed. */
+#define CHARGE_LIMITER_ACTIVE 0
+
+#define AXP2101_I2C_BUS "/dev/i2c-0"
+#define AXP2101_I2C_ADDR 0x34
+
+/* module_en, X-Powers AXP2101 datasheet register map section 8.2 (addr
+ * 0x18) -- bit 1 (chg_en) is the real charger master enable/disable
+ * ("Cell Battery charge enable"), distinct from bit 3 (gauge_en, the fuel
+ * gauge -- must be preserved, never touched here) and bit 0 (watchdog_en).
+ * Always read-modify-write this register, never a blind write of just the
+ * one bit's value -- a naive write would silently disable the fuel gauge
+ * and/or watchdog too. */
+#define AXP2101_REG_MODULE_EN 0x18
+#define AXP2101_MODULE_EN_CHG_BIT (1u << 1)
+
+/* comm_stat1, addr 0x01, bits[2:0] -- charging status straight from the
+ * PMIC (000 tri-charge, 001 pre-charge, 010 constant-current, 011
+ * constant-voltage, 100 charge done, 101 not charging). Read-only,
+ * DBG_LOG'd around every throttle/restore call as the one live,
+ * trustworthy way to confirm the write actually took effect -- see this
+ * file's own history below for why nothing else here can be trusted at
+ * face value. */
+#define AXP2101_REG_CHG_STAT 0x01
+
+/* Real-device incident (2026-08-07): charge_limiter previously throttled by
+ * zeroing REG62 (ICC / "fast charge current", the constant-CURRENT phase
+ * target) instead of this register -- documented at length in
+ * charge_limiter.h's own history as the fix for an even earlier wrong
+ * approach (a sysfs node wired to the wrong register entirely). REG62 was a
+ * real, working control, just for the wrong phase of charging: per the
+ * official AXP2101 datasheet section 7.7.3.3, once VBAT reaches the target
+ * voltage (VREG) the charger enters constant-VOLTAGE (CV) mode and holds
+ * output voltage constant while current tapers on its own -- REG62's
+ * CC-phase current ceiling stops being the active constraint at that point,
+ * so zeroing it has no effect on a charge cycle that's already in CV phase.
+ * Confirmed as the actual bug: user report was charging stopping at
+ * ~91-92% instead of the configured 85% -- consistent with the battery
+ * already being in CV phase well before the 85% check ever fires, so the
+ * charger just ran its own CV taper down to its own internal termination-
+ * current threshold (ITERM, ~125mA default) and completed on its own,
+ * ignoring REG62 entirely. chg_en (this register) disables the WHOLE
+ * charger state machine, CC and CV phases alike -- confirmed against the
+ * same datasheet section: "the charger is enabled when an adapter is
+ * inserted" and "charger enable bit is reset to 1" (to exit battery-safe-
+ * mode) are both described as controls over this exact bit, not REG62. */
+
+#define CHARGE_LIMITER_STOP_PERCENT 85
+
+/* Re-checks and re-applies at most this often, rather than on every 500ms
+ * gui.c timer tick -- the i2c write itself is cheap, but there's no reason
+ * to repeat it dozens of times a minute while nothing has changed.
+ * Re-applying periodically (not just on threshold-crossing edges) also
+ * covers the datasheet's own documented auto-re-enable-on-adapter-insert
+ * behavior -- if the user unplugs/replugs the cable while already over the
+ * limit, the PMIC may re-enable charging on its own, and the next poll
+ * corrects it again within this interval.
+ *
+ * Was 30s; tightened after a real-device overshoot report (stopping at
+ * 86-91% instead of 85%) -- the primary cause turned out to be
+ * battery.c's own sensor-selection bug (see its history), not this
+ * interval, but a shorter window still directly reduces how much the
+ * battery can climb between "crossed 85%" and "we actually noticed and
+ * disabled charging," on general principle, for whatever residual lag the
+ * real fuel gauge itself has. The i2c read this costs every 5s is cheap
+ * (a couple of register reads/writes, no different in kind from what
+ * gui.c's own status-bar polling already does more often than this). */
+#define CHARGE_LIMITER_REEVALUATE_SECONDS 5
+
+#if CHARGE_LIMITER_ACTIVE
+static bool axp2101_smbus_xfer(uint8_t reg, uint8_t * value, bool write) {
+    int fd = open(AXP2101_I2C_BUS, O_RDWR);
+    if (fd < 0) return false;
+
+    bool ok = false;
+    if (ioctl(fd, I2C_SLAVE_FORCE, AXP2101_I2C_ADDR) >= 0) {
+        union i2c_smbus_data data;
+        if (write) data.byte = *value;
+
+        struct i2c_smbus_ioctl_data args = {
+            .read_write = write ? I2C_SMBUS_WRITE : I2C_SMBUS_READ,
+            .command = reg,
+            .size = I2C_SMBUS_BYTE_DATA,
+            .data = &data,
+        };
+        if (ioctl(fd, I2C_SMBUS, &args) >= 0) {
+            if (!write) *value = data.byte;
+            ok = true;
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+static bool axp2101_read_reg(uint8_t reg, uint8_t * out) {
+    return axp2101_smbus_xfer(reg, out, false);
+}
+
+static bool axp2101_write_reg(uint8_t reg, uint8_t value) {
+    return axp2101_smbus_xfer(reg, &value, true);
+}
+
+static void log_chg_stat(const char * when) {
+    uint8_t stat;
+    if (!axp2101_read_reg(AXP2101_REG_CHG_STAT, &stat)) return;
+    static const char * const names[8] = {
+        "tri_charge", "pre_charge", "constant_current", "constant_voltage",
+        "charge_done", "not_charging", "reserved", "reserved",
+    };
+    DBG_LOG("charge_limiter: chg_stat %s = %s (0x%02X)\n", when, names[stat & 0x07], stat & 0x07);
+}
+
+static void disable_charging(void) {
+    uint8_t module_en;
+    if (axp2101_read_reg(AXP2101_REG_MODULE_EN, &module_en)) {
+        axp2101_write_reg(AXP2101_REG_MODULE_EN, module_en & (uint8_t) ~AXP2101_MODULE_EN_CHG_BIT);
+    }
+    log_chg_stat("after throttle");
+}
+
+static void enable_charging(void) {
+    uint8_t module_en;
+    if (axp2101_read_reg(AXP2101_REG_MODULE_EN, &module_en)) {
+        axp2101_write_reg(AXP2101_REG_MODULE_EN, module_en | AXP2101_MODULE_EN_CHG_BIT);
+    }
+    log_chg_stat("after restore");
+}
+#endif
+
+void charge_limiter_poll(bool enabled, bool force) {
+#if !CHARGE_LIMITER_ACTIVE
+    (void) enabled;
+    (void) force;
+    return;
+#else
+    static time_t last_apply = 0;
+
+    time_t now = time(NULL);
+    if (!force && last_apply != 0 && now - last_apply < CHARGE_LIMITER_REEVALUATE_SECONDS) return;
+    last_apply = now;
+
+    if (!enabled) {
+        enable_charging();
+        return;
+    }
+
+    int percent = battery_get_percent();
+    if (percent < 0) return; /* no battery data (e.g. host build) -- nothing to act on */
+
+    /* battery_get_percent() itself, not just the chg_stat register logged
+     * inside disable_charging()/enable_charging(), so a live overshoot
+     * report can distinguish "we correctly disabled right at 85%, the
+     * fuel gauge itself later crept up" from "we were late/reading the
+     * wrong sensor" -- exactly the ambiguity the 86%-vs-91% two-tester
+     * report needed and didn't have visibility into before this. */
+    DBG_LOG("charge_limiter: poll percent=%d (stop threshold=%d)\n", percent, CHARGE_LIMITER_STOP_PERCENT);
+
+    if (percent >= CHARGE_LIMITER_STOP_PERCENT) {
+        disable_charging();
+    } else {
+        enable_charging();
+    }
+#endif
+}

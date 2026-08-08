@@ -1,0 +1,10885 @@
+#include "gui.h"
+#include "assets.h"
+#include "backlight.h"
+#include "debug_log.h"
+#include "import_web.h"
+#include "airplay_control.h"
+#include "dlna_control.h"
+#include "battery.h"
+#include "wifi_status.h"
+#include "audio.h"
+#include "file_browser.h"
+#include "text_reader.h"
+#include "hw_buttons.h"
+#include "metadata.h"
+#include "metadata_db.h"
+#include "peq.h"
+#include "screen_builders.h"
+#include "settings.h"
+#include "subsonic_client.h"
+#include "http_client.h"
+#include "cover_decode.h"
+#include "wifi_control.h"
+#include "bluetooth_control.h"
+#ifndef HOST_BUILD
+#include "bt_media_player.h"
+#endif
+#include "headphone_status.h"
+#include "led_control.h"
+#include "charge_limiter.h"
+#include "idle_shutdown.h"
+#include "power_suspend.h"
+#include "device_config.h"
+#include "usb_mode_control.h"
+#include "usb_dac_bridge.h"
+#include "firmware_update.h"
+#include "playlist_files.h"
+#include "timezone_data.h"
+#include "timezone_apply.h"
+#include "src/core/lv_obj.h"
+#include "src/core/lv_obj_pos.h"
+#include "src/core/lv_obj_style.h"
+#include "src/core/lv_obj_style_gen.h"
+#include "src/layouts/flex/lv_flex.h"
+#include "src/misc/lv_area.h"
+#include "src/draw/lv_draw_buf.h"
+#include "src/others/snapshot/lv_snapshot.h"
+#include "src/widgets/image/lv_image.h"
+#include "src/drivers/display/fb/lv_linux_fbdev.h"
+#include <ctype.h>
+#include <limits.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifdef HOST_BUILD
+  #define MUSIC_ROOT_DIR "./music"
+#else
+  /* SD card mount point, per the layout the stock hiby_player uses. */
+  #define MUSIC_ROOT_DIR "/data/mnt/sd_0"
+
+  /* main.c's own boot-checkpoint logger (see its own comment there) --
+   * gui_init() below calls it directly since the still-unresolved cold-boot
+   * hang has moved further into startup than main.c alone can see. Remove
+   * alongside main.c's own copy once cold boot is confirmed working. */
+  extern void boot_checkpoint(const char * step);
+
+  /* main.c's own best-effort `mount -t vfat .../sd_0` retry (see its own
+   * comment on why this needs to exist at all -- no hotplug mechanism for
+   * the internal SD card slot exists anywhere on this firmware). Called
+   * once at boot from main.c already; poll_sd_card_hotplug() below calls
+   * it again periodically so re-inserting the card after boot eventually
+   * gets mounted too, not just the very first insertion main.c catches. */
+  extern void mount_sd_card_if_needed(void);
+#endif
+
+/* ---- UI text size (Settings -> Font Size) ----
+ *
+ * Real-device feedback: the app's fixed text size (unchanged since the UI
+ * rebuild) reads fine on some eyes, too small on others. Every label in
+ * this codebase sets its own font via a plain per-object LVGL style
+ * (lv_obj_set_style_text_font()) rather than a shared lv_style_t object
+ * LVGL could bulk-refresh in place (the same trick app-wide accent color
+ * uses, see lv_obj_report_style_change()'s own comment elsewhere in this
+ * file) -- so these four pointers stand in for the four literal
+ * lv_font_montserrat_NN sizes (16/20/22/28) this app used at every call
+ * site that does NOT need fallback_font.h's non-Latin fallback chaining
+ * (fixed English UI chrome -- button captions, section headers, settings
+ * rows -- that will never show metadata-derived text). Deliberately named
+ * ui_size_* rather than app_font_* -- fallback_font.h already declares
+ * real (non-const) app_font_16/22/28 instances for the OTHER category
+ * (metadata-derived text: song title/artist, drill-down screen titles,
+ * ...), and those are handled separately, by resizing fallback_font.c's
+ * own copies in place (see its own comment) rather than through these
+ * pointers -- reusing that name here would silently collide.
+ *
+ * Set once by apply_font_size_tier(), called at the very top of
+ * gui_init() before any screen is built. Changing the setting afterward
+ * only takes effect on the next launch -- see settings.h's own comment on
+ * font_size_tier for why a live re-style isn't practical here.
+ *
+ * Metadata-derived text (song title/artist, ...) is NOT covered by this
+ * function -- that goes through fallback_font.h's app_font_16/22/28
+ * instead, resized by its own fallback_font_init_early(tier) call
+ * (gui_init() passes current_settings.font_size_tier there directly), so
+ * both systems move together without this function reaching into that
+ * one.
+ *
+ * Not static -- screen_builders.c's own handful of fixed-chrome literal
+ * font sites (build_title(), pill-list row labels/chevron) need these
+ * too, same cross-translation-unit pattern fallback_font.h's app_font_16/
+ * 22/28 already use. Declared extern in screen_builders.h rather than a
+ * new header of their own, since that's the one file already shared by
+ * every screen-building call site on both sides. */
+const lv_font_t * ui_size_16 = &lv_font_montserrat_16;
+const lv_font_t * ui_size_20 = &lv_font_montserrat_20;
+const lv_font_t * ui_size_22 = &lv_font_montserrat_22;
+const lv_font_t * ui_size_28 = &lv_font_montserrat_28;
+
+static void apply_font_size_tier(int tier) {
+    switch (tier) {
+        case 1: /* Medium */
+            ui_size_16 = &lv_font_montserrat_20;
+            ui_size_20 = &lv_font_montserrat_24;
+            ui_size_22 = &lv_font_montserrat_26;
+            ui_size_28 = &lv_font_montserrat_32;
+            break;
+        case 2: /* BlindMF -- literal feature name, requested verbatim */
+            ui_size_16 = &lv_font_montserrat_24;
+            ui_size_20 = &lv_font_montserrat_30;
+            ui_size_22 = &lv_font_montserrat_34;
+            ui_size_28 = &lv_font_montserrat_40;
+            break;
+        default: /* Small -- the original, unchanged sizing */
+            ui_size_16 = &lv_font_montserrat_16;
+            ui_size_20 = &lv_font_montserrat_20;
+            ui_size_22 = &lv_font_montserrat_22;
+            ui_size_28 = &lv_font_montserrat_28;
+            break;
+    }
+}
+
+static lv_obj_t * home_screen;
+static lv_obj_t * music_screen;
+static lv_obj_t * files_screen;
+static lv_obj_t * all_songs_screen;
+static lv_obj_t * artists_screen;
+static lv_obj_t * albums_screen;
+static lv_obj_t * album_artist_screen;
+static lv_obj_t * playlists_screen;
+static lv_obj_t * artist_albums_screen;
+static lv_obj_t * stream_media_screen;
+static lv_obj_t * subsonic_entry_screen;
+static lv_obj_t * wireless_screen;
+static lv_obj_t * wifi_screen;
+static lv_obj_t * bt_screen;
+static lv_obj_t * books_screen;
+static lv_obj_t * about_screen;
+static lv_obj_t * accent_color_screen;
+static lv_obj_t * player_screen;
+static lv_obj_t * settings_screen;
+
+static lv_obj_t * screen_timeout_screen;
+static lv_obj_t * screen_timeout_switch;
+static lv_obj_t * screen_timeout_slider_card;
+static lv_obj_t * screen_timeout_value_label;
+static lv_obj_t * screen_timeout_slider;
+
+static lv_obj_t * startup_volume_screen;
+static lv_obj_t * startup_volume_switch;
+static lv_obj_t * startup_volume_slider_card;
+static lv_obj_t * startup_volume_value_label;
+static lv_obj_t * startup_volume_slider;
+
+static lv_obj_t * sleep_timer_screen;
+static lv_obj_t * sleep_timer_value_label;
+static lv_obj_t * sleep_timer_slider;
+
+static lv_obj_t * idle_shutdown_screen;
+static lv_obj_t * idle_shutdown_switch;
+static lv_obj_t * idle_shutdown_slider_card;
+static lv_obj_t * idle_shutdown_value_label;
+static lv_obj_t * idle_shutdown_slider;
+static lv_obj_t * idle_suspend_mode_row;
+static lv_obj_t * idle_suspend_switch;
+
+/* timezone_region_screen (small, fixed, pre-built like every other screen)
+ * and timezone_city_screen (delete+rebuilt per region on every open) are
+ * declared alongside the rest of the Time Zone picker's code, not here --
+ * see that block's own comments for why the City screen can't just be
+ * pre-built once. */
+
+static lv_obj_t * eq_screen;
+static lv_obj_t * eq_bypass_switch;
+static lv_obj_t * eq_band_buttons[PEQ_NUM_BANDS];
+static lv_obj_t * eq_band_button_labels[PEQ_NUM_BANDS];
+static lv_obj_t * eq_band_enabled_switch;
+static lv_obj_t * eq_preamp_slider;
+static lv_obj_t * eq_preamp_value_label;
+static lv_obj_t * eq_freq_slider;
+static lv_obj_t * eq_gain_slider;
+static lv_obj_t * eq_q_slider;
+static lv_obj_t * eq_type_dropdown;
+static lv_obj_t * eq_freq_value_label;
+static lv_obj_t * eq_gain_value_label;
+static lv_obj_t * eq_q_value_label;
+static int current_eq_band = 0;
+
+#define EQ_FREQ_MIN_HZ 20.0
+#define EQ_FREQ_MAX_HZ 20000.0
+#define EQ_FREQ_SLIDER_MAX 1000
+
+static lv_obj_t * play_btn;
+static lv_obj_t * song_title_label;
+static lv_obj_t * song_folder_label;
+static lv_obj_t * progress_slider;
+static lv_obj_t * pos_label;
+static lv_obj_t * dur_label;
+static lv_obj_t * format_badge_label;
+static lv_obj_t * song_count_label;
+static lv_obj_t * favorite_icon;
+static lv_obj_t * cover_img;
+/* Backing pixels for the currently-displayed embedded cover art, if any --
+ * a plain RGB565 bitmap produced by cover_decode_to_rgb565() (see
+ * set_cover_art below), not the original compressed JPEG/PNG bytes. Freed
+ * and replaced whenever a new track loads; must outlive the lv_image_set_src()
+ * call since current_cover_dsc.data just points at it, unlike a plain PNG
+ * file path. */
+static uint8_t * current_cover_bytes;
+static lv_image_dsc_t current_cover_dsc;
+static bool favorite_is_set = false;
+static lv_obj_t * volume_slider;
+/* Clock, top bar center: real topbar/N.png digit + topbar/colon.png
+ * sprites, same asset family as the volume readout below, instead of an
+ * lv_label -- switched from font text so it's pixel-identical in size/style
+ * to the volume/headphone indicator rather than an approximate font-size
+ * match (real-device feedback: "match the size of ... the volume and
+ * headphone indicator"). Fixed HH:MM layout, always all 5 slots visible
+ * (no leading-zero hiding the way the volume/battery readouts need, since
+ * a clock always shows both digits of the hour). */
+static lv_obj_t * clock_topbar_group;
+static lv_obj_t * clock_topbar_digit[5]; /* H, H, :, M, M */
+/* Volume readout, far left of the status bar: real topbar/N.png digit
+ * sprites (theme2 asset set) plus topbar/speaker.png and topbar/po.png
+ * (headphone-out glyph), not a text label -- matches the stock player's own
+ * top bar exactly (confirmed via a real-device screenshot of the stock
+ * `hiby_player` binary: speaker icon, a red-recolored volume number, then a
+ * headphone icon, all pinned to the left edge, with the clock centered
+ * separately -- our previous layout had guessed a plain lv_label clock at
+ * the left edge with the volume group trailing after it, which doesn't
+ * match). Up to 3 digit slots for 0-100; unused leading slots are hidden
+ * rather than left blank, so the flex row collapses the gap instead of
+ * showing empty space before the first significant digit. volume_topbar_headphone
+ * is shown/hidden by refresh_headphone_icon() based on real jack-detect
+ * state (see headphone_status.h), not always-on. */
+static lv_obj_t * volume_topbar_group;
+static lv_obj_t * volume_topbar_digit[3];
+static lv_obj_t * volume_topbar_headphone;
+
+/* Loud-volume warning color threshold, read once at startup from the stock
+ * firmware's own /usr/resource/config.json (see device_config.h) -- e.g. a
+ * real R1 Pro had this set to 40 via the stock Settings screen. -1 means
+ * "feature disabled" (file missing/host build, or vol_warn_enable=0 in the
+ * config), in which case the volume digits always stay their native white
+ * and never recolor red, regardless of level. */
+static int volume_warn_threshold_percent = -1;
+
+/* Quick-access drawer mirrors of the persistent status bar / player-screen
+ * widgets above -- kept in sync from the same single update sites (see
+ * refresh_clock_label/refresh_battery_topbar/refresh_wifi_icon/
+ * set_play_button_state/favorite_icon_event_cb/apply_track_metadata_to_ui)
+ * rather than introducing a second, separately-polled source of truth.
+ * NULL until build_quick_drawer() runs; every update site guards on that. */
+static lv_obj_t * quick_drawer;
+static lv_obj_t * quick_drawer_wifi_icon;
+static lv_obj_t * quick_drawer_bt_icon;
+static lv_obj_t * quick_drawer_title_label;
+static lv_obj_t * quick_drawer_artist_label;
+static lv_obj_t * quick_drawer_favorite_icon;
+static lv_obj_t * quick_drawer_play_btn;
+static lv_obj_t * quick_drawer_order_icon; /* visual-only mirror of order_icon's mode, not independently clickable */
+static bool quick_drawer_open = false;
+
+static char ** playlist = NULL;
+static int playlist_count = 0;
+static int playlist_index = -1;
+
+/* Queue play mode -- cycled via the order/loop/single/random icon on the
+ * player screen (order_icon_event_cb). Persisted as current_settings.play_mode
+ * (plain int, see settings.h). Sequential is the only mode where reaching the
+ * end of the queue actually stops playback instead of continuing somewhere. */
+typedef enum {
+    PLAY_MODE_SEQUENTIAL = 0,
+    PLAY_MODE_REPEAT_ALL,
+    PLAY_MODE_REPEAT_ONE,
+    PLAY_MODE_SHUFFLE,
+} play_mode_t;
+
+static lv_obj_t * order_icon;
+
+/* Shuffle "bag": a permutation of 0..playlist_count-1 walked front-to-back
+ * rather than picking a fresh random index every time, so every track plays
+ * exactly once before any repeats -- a bare `rand() % count` on every
+ * advance can (and eventually will) replay the same track twice in a row or
+ * leave others unplayed for a long stretch, which reads as broken shuffle
+ * rather than random. Regenerated (and reshuffled) whenever it's stale --
+ * see ensure_shuffle_order_current(). */
+static int * shuffle_order = NULL;
+static int shuffle_order_count = 0; /* playlist_count this bag was generated for -- staleness check */
+static int shuffle_pos = -1;        /* index into shuffle_order such that shuffle_order[shuffle_pos] == playlist_index */
+
+static bool user_seeking = false;
+
+static player_settings_t current_settings;
+
+/* Shared style object driving the app-wide accent color (sliders, checked
+ * switches, the selected EQ band) -- one lv_style_t whose bg_color gets
+ * updated in place whenever the user picks a new color, so every widget
+ * that has this style attached re-renders automatically without having to
+ * walk and restyle each one individually. */
+static lv_style_t style_accent;
+/* Plain light-gray text style for the *unselected* EQ band labels -- kept
+ * as its own shared style (rather than a one-off lv_obj_set_style_text_color)
+ * so toggling selection is just swapping which shared style is attached,
+ * with no risk of a local per-object style override taking priority over
+ * style_accent and silently defeating the highlight. */
+static lv_style_t style_muted_text;
+
+static lv_color_t accent_lv_color(void) {
+    return lv_color_hex(current_settings.accent_color);
+}
+
+static void apply_accent_color(uint32_t rgb) {
+    current_settings.accent_color = rgb;
+    lv_style_set_bg_color(&style_accent, lv_color_hex(rgb));
+    lv_style_set_text_color(&style_accent, lv_color_hex(rgb));
+    /* Modifying a shared lv_style_t's properties in place doesn't by
+     * itself invalidate the objects that reference it -- LVGL needs an
+     * explicit nudge to know to redraw them (confirmed empirically: without
+     * this, the accent color only ever showed on whatever was drawn after
+     * the change, not on already-visible widgets like a switch already on
+     * screen). lv_obj_refresh_style(NULL, ...) is NOT the right call for
+     * this -- it crashes (NULL obj dereference); lv_obj_report_style_change
+     * is the API meant specifically for "a shared style changed, find and
+     * refresh whoever uses it", and safely walks every screen itself. */
+    lv_obj_report_style_change(&style_accent);
+    settings_save(&current_settings);
+}
+
+static const uint32_t accent_palette[] = {
+    0x2196F3, /* blue (default) */
+    0x4CAF50, /* green */
+    0xF44336, /* red */
+    0xFF9800, /* orange */
+    0x9C27B0, /* purple */
+    0x009688, /* teal */
+    0xE91E63, /* pink */
+    0xE0E0E0, /* light gray */
+};
+#define ACCENT_PALETTE_COUNT (sizeof(accent_palette) / sizeof(accent_palette[0]))
+static lv_obj_t * accent_swatches[ACCENT_PALETTE_COUNT];
+
+static void accent_swatch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    uint32_t rgb = (uint32_t) (intptr_t) lv_event_get_user_data(e);
+    apply_accent_color(rgb);
+
+    /* The screen isn't rebuilt on re-visit, so the selection ring has to be
+     * updated here rather than only at construction time. */
+    for (size_t i = 0; i < ACCENT_PALETTE_COUNT; i++) {
+        lv_obj_set_style_border_width(accent_swatches[i], accent_palette[i] == rgb ? 3 : 0, 0);
+    }
+}
+
+/* Generic back-stack, replacing the old pairwise hardcoded back targets
+ * (settings always -> browser, eq always -> settings). Every screen's back
+ * button and the left-to-right swipe gesture just call nav_pop(); forward
+ * navigation calls nav_push(). Root (home_screen) is seeded once in
+ * gui_init() and is never popped past. */
+#define NAV_STACK_MAX 16
+static lv_obj_t * nav_stack[NAV_STACK_MAX];
+static int nav_depth = 0;
+
+/* Forward navigation slides the current screen out to the left as the new
+ * one slides in from the right (matching a left-swipe gesture); back
+ * navigation is the mirror of that. */
+#define NAV_ANIM_TIME_MS 165 /* 220ms * 0.75, per real-hardware feedback */
+
+/* lv_screen_load_anim() animates the real screen OBJECTS, which on this
+ * GPU-less MIPS target meant fully re-rendering both the outgoing and
+ * incoming screen's whole widget tree on every single animation frame --
+ * confirmed via real-hardware testing to be the actual cause of choppy,
+ * tearing-prone navigation (not just a refresh-rate/vsync issue). Instead,
+ * take ONE snapshot of each screen as a static bitmap up front, and slide
+ * those two bitmaps on a top-layer overlay -- "N frames x 2 full re-renders"
+ * becomes "2 renders + N cheap bitmap blits". The real target screen is
+ * only actually made active once the slide finishes. */
+
+/* A deliberately narrow set of screens are pure static content -- fixed
+ * icon-grid/pill-list items baked in at build time, no toggles, no
+ * per-item state, nothing a timer ever touches (the clock/battery/wifi
+ * live on lv_layer_top(), outside every screen's own snapshot). Their
+ * transition bitmap is rendered ONCE at startup and reused forever,
+ * since re-rendering them before every single visit was the last
+ * remaining cost in an otherwise-cheap transition. Anything with actual
+ * dynamic content (player screen, file/song lists, Settings' toggles,
+ * the accent-color picker's selection ring, Subsonic status screens) is
+ * deliberately left out and always rendered fresh. */
+#define STATIC_SNAPSHOT_SCREEN_COUNT 6
+static lv_obj_t * static_snapshot_screen[STATIC_SNAPSHOT_SCREEN_COUNT];
+static lv_draw_buf_t * static_snapshot_buf[STATIC_SNAPSHOT_SCREEN_COUNT];
+
+static lv_draw_buf_t * get_static_snapshot(lv_obj_t * scr) {
+    for (int i = 0; i < STATIC_SNAPSHOT_SCREEN_COUNT; i++) {
+        if (static_snapshot_screen[i] == scr) return static_snapshot_buf[i];
+    }
+    return NULL;
+}
+
+static void register_static_snapshot(int index, lv_obj_t * scr) {
+    static_snapshot_screen[index] = scr;
+    static_snapshot_buf[index] = lv_snapshot_take(scr, LV_COLOR_FORMAT_RGB565);
+}
+
+typedef struct {
+    lv_obj_t * overlay;
+    lv_obj_t * img_from;
+    lv_obj_t * img_to;
+    lv_draw_buf_t * buf_from;
+    lv_draw_buf_t * buf_to;
+    bool buf_from_owned;
+    bool buf_to_owned;
+    lv_obj_t * to_scr;
+    int32_t to_offset;
+    /* Only meaningful for the interactive (finger-driven) player-swipe
+     * below (poll_quick_drawer_drag()'s own player_swipe_* state) --
+     * screen_transition_slide()'s own fixed-duration path always commits.
+     * true: the drag crossed its commit threshold, so finish entering
+     * to_scr for real once this settle animation reaches the end. false:
+     * released short of the threshold, snap back to from_scr instead --
+     * to_scr never becomes the active screen at all. */
+    bool commit;
+} slide_transition_ctx_t;
+
+static bool slide_transition_active = false;
+
+static void slide_transition_anim_x_cb(void * var, int32_t v) {
+    slide_transition_ctx_t * ctx = (slide_transition_ctx_t *) var;
+    lv_obj_set_x(ctx->img_from, v);
+    lv_obj_set_x(ctx->img_to, v + ctx->to_offset);
+}
+
+static void slide_transition_done_cb(lv_anim_t * a) {
+    slide_transition_ctx_t * ctx = (slide_transition_ctx_t *) lv_anim_get_user_data(a);
+    if (ctx->commit) lv_screen_load(ctx->to_scr); /* skipped on a cancelled interactive drag -- from_scr was never actually replaced, nothing to load */
+    lv_obj_delete(ctx->overlay); /* deletes img_from/img_to too */
+    if (ctx->buf_from_owned) lv_draw_buf_destroy(ctx->buf_from);
+    if (ctx->buf_to_owned) lv_draw_buf_destroy(ctx->buf_to);
+    lv_free(ctx);
+    slide_transition_active = false;
+}
+
+/* Shared setup for both screen_transition_slide()'s own fixed-duration
+ * path and the interactive (finger-driven) player-swipe further down
+ * (poll_quick_drawer_drag()'s player_swipe_* state) -- snapshotting
+ * from_scr/to_scr and building the two-image overlay is identical either
+ * way; only how the resulting ctx gets ANIMATED afterward differs (one
+ * fixed lv_anim_t vs. driven directly from live touch position, then a
+ * short commit/cancel settle animation). Returns NULL if to_scr is
+ * already active, a transition is already in flight, or a snapshot
+ * failed (OOM) -- the caller should fall back to an instant
+ * lv_screen_load(to_scr) in every one of those cases (screen_transition_slide()
+ * does; the interactive path just abandons the gesture and lets it fall
+ * through as whatever else it might have been, since there's no
+ * "genuinely already there" case to fall back to for a still-in-progress
+ * drag). ctx->commit defaults to true, matching every existing caller
+ * (only the interactive path ever sets it false, on a cancelled drag).
+ *
+ * force_snapshot skips the live-framebuffer-aliasing fast path below for
+ * img_from, always taking a real independent copy instead -- see that
+ * code's own comment for why the fast path is normally preferred, and
+ * player_swipe_tracking's own call site (poll_quick_drawer_drag()) for why
+ * it can't be used there: that comment accepts the live-alias's one
+ * known downside ("the outgoing bitmap could show that change a frame
+ * early") as a fine trade specifically because the ORIGINAL fixed-duration
+ * transition finishes in ~200ms, far too short for anything to visibly
+ * redraw. An interactive drag has no such bound -- it lasts exactly as
+ * long as the finger stays down, which can be seconds -- so from_scr
+ * stays the real lv_screen_active() (never swapped out until commit) and
+ * keeps getting its own completely normal LVGL redraws the whole time.
+ * Since the live-alias path makes img_from literally the same memory as
+ * the real framebuffer, every one of those redraws (the topbar clock
+ * ticking over, anything else on Home invalidating) bled through into the
+ * SLIDING overlay in real time -- confirmed as a real-device bug report
+ * ("swiping to enter the player causes the main menu to flicker"), not
+ * just a theoretical risk. A real snapshot is immune to that: whatever
+ * from_scr does afterward, img_from stays exactly what it looked like the
+ * instant this was called. */
+static slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward, bool force_snapshot) {
+    lv_obj_t * from_scr = lv_screen_active();
+    if (from_scr == to_scr || slide_transition_active) return NULL;
+
+    lv_display_t * disp = lv_display_get_default();
+    int32_t w = lv_display_get_horizontal_resolution(disp);
+
+    slide_transition_ctx_t * ctx = lv_malloc(sizeof(*ctx));
+    ctx->commit = true;
+
+    /* from_scr is, by definition, exactly what's on screen right now -- if
+     * the display driver can hand us that page directly (real double
+     * buffering via panning), reuse it instead of paying for a whole extra
+     * render pass. This is what actually made touch-to-slide-start latency
+     * noticeable: two full-screen snapshots taken synchronously in the
+     * touch handler, before the very first animation frame. Halving that
+     * to one is the single biggest lever available without a caching
+     * scheme. (This aliases live fb memory rather than an independent
+     * copy, so in the rare case something on from_scr redraws during the
+     * ~200ms slide -- e.g. the clock ticking over -- the outgoing bitmap
+     * could show that change a frame early; a fine trade for consistently
+     * lower latency.) */
+    /* lv_display_get_buf_active() -- the real LVGL 9.x API for this, not
+     * the fbdev-driver-specific function this used to call, which doesn't
+     * actually exist anywhere in the vendored lv_linux_fbdev.h (confirmed
+     * by grepping the whole vendored lvgl/ tree for it -- nothing, not
+     * even an unexported definition). That made every target build fail
+     * outright (implicit-declaration + pointer-from-int errors), so this
+     * optimization was never actually exercised on real hardware despite
+     * the comment above describing real touch-latency profiling -- either
+     * written against a different LVGL checkout that once had a custom
+     * fbdev patch, or the profiling was done before this line regressed.
+     * lv_display_get_buf_active() returns the same live-fb-aliased
+     * lv_draw_buf_t the display driver itself is using -- works on host
+     * (SDL) too, so the separate HOST_BUILD/LV_USE_LINUX_FBDEV branch
+     * this used to need is gone; NULL there just means no frame has
+     * flushed yet, same fallback-to-snapshot reasoning as below. */
+    lv_draw_buf_t * active_buf = force_snapshot ? NULL : lv_display_get_buf_active(disp);
+    lv_draw_buf_t * buf_from;
+    if (active_buf) {
+        buf_from = active_buf;
+        ctx->buf_from_owned = false;
+    } else {
+        buf_from = lv_snapshot_take(from_scr, LV_COLOR_FORMAT_RGB565);
+        ctx->buf_from_owned = true;
+    }
+    lv_draw_buf_t * buf_to = get_static_snapshot(to_scr);
+    if (buf_to) {
+        ctx->buf_to_owned = false;
+    } else {
+        buf_to = lv_snapshot_take(to_scr, LV_COLOR_FORMAT_RGB565);
+        ctx->buf_to_owned = true;
+    }
+    if (!buf_from || !buf_to) {
+        /* Snapshot failed (e.g. OOM) -- caller falls back to an instant cut
+         * rather than crash or get stuck mid-navigation/mid-drag. */
+        if (buf_from && ctx->buf_from_owned) lv_draw_buf_destroy(buf_from);
+        if (buf_to && ctx->buf_to_owned) lv_draw_buf_destroy(buf_to);
+        lv_free(ctx);
+        return NULL;
+    }
+
+    lv_obj_t * overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE); /* swallow touches while the slide is in flight */
+    /* The persistent status bar (clock/battery/wifi) and the volume popup
+     * both live on this same top layer, created once in gui_init() and
+     * meant to stay fixed on every screen, Android-status-bar style. Since
+     * this overlay is a sibling created fresh on every transition, it would
+     * otherwise draw ON TOP of them (later-added siblings draw over
+     * earlier ones) and briefly cover the status bar during every slide --
+     * push it to the back of the layer instead so those stay visibly on
+     * top throughout. */
+    lv_obj_move_to_index(overlay, 0);
+
+    lv_obj_t * img_from = lv_image_create(overlay);
+    lv_image_set_src(img_from, buf_from);
+    lv_obj_set_pos(img_from, 0, 0);
+
+    int32_t to_offset = forward ? w : -w;
+    lv_obj_t * img_to = lv_image_create(overlay);
+    lv_image_set_src(img_to, buf_to);
+    lv_obj_set_pos(img_to, to_offset, 0);
+
+    ctx->overlay = overlay;
+    ctx->img_from = img_from;
+    ctx->img_to = img_to;
+    ctx->buf_from = buf_from;
+    ctx->buf_to = buf_to;
+    ctx->to_scr = to_scr;
+    ctx->to_offset = to_offset;
+
+    slide_transition_active = true;
+    return ctx;
+}
+
+static void screen_transition_slide(lv_obj_t * to_scr, bool forward) {
+    slide_transition_ctx_t * ctx = begin_slide_transition(to_scr, forward, false); /* fast live-alias path -- fine here, this transition always finishes in NAV_ANIM_TIME_MS */
+    if (!ctx) {
+        lv_screen_load(to_scr);
+        return;
+    }
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, ctx);
+    lv_anim_set_user_data(&a, ctx);
+    lv_anim_set_values(&a, 0, -ctx->to_offset);
+    lv_anim_set_duration(&a, NAV_ANIM_TIME_MS);
+    lv_anim_set_exec_cb(&a, slide_transition_anim_x_cb);
+    lv_anim_set_completed_cb(&a, slide_transition_done_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void nav_push(lv_obj_t * scr) {
+    if (nav_depth > 0 && nav_stack[nav_depth - 1] == scr) {
+        lv_screen_load(scr); /* already the active screen -- nothing to push */
+        return;
+    }
+    if (nav_depth < NAV_STACK_MAX) {
+        nav_stack[nav_depth++] = scr;
+    }
+    /* Live A/B test: forward navigation (entering a submenu) now cuts
+     * instantly instead of sliding -- screen_transition_slide() is still
+     * used by nav_pop() below, so backing out still animates. */
+    lv_screen_load(scr);
+}
+
+static void nav_pop(void) {
+    if (nav_depth > 1) nav_depth--;
+    screen_transition_slide(nav_stack[nav_depth - 1], false);
+}
+
+/* Splices the stack slot at `index` out entirely (shifting everything
+ * above it down by one), with no screen load of any kind -- used when a
+ * transient interstitial screen (Wi-Fi/Subsonic's "Connecting..."/
+ * "Downloading..." screen, or a chained show_text_entry() call) has
+ * already been left behind by something that pushed a DIFFERENT screen on
+ * top of it instead of returning to it. Real-device bug report: a
+ * downloaded Subsonic track played fine (see poll_subsonic_download()'s
+ * own comment on the race this and its sibling nav_pop()-skipping fixes
+ * solve), but backing out of the player afterward landed back on the now-
+ * defunct "Downloading..." screen instead of the song list underneath it
+ * -- because skipping nav_pop() to avoid yanking the player screen away
+ * left that interstitial's own slot sitting in the stack forever, one
+ * level below wherever things actually ended up. This removes exactly
+ * that stale slot after the fact, once it's clear something else already
+ * took its place, so a later Back walks back through where the user
+ * really came from instead of a resolved, no-longer-relevant waiting
+ * screen. Purely bookkeeping -- whatever's currently on screen was
+ * already loaded by the nav_push() that grew the stack past `index` in
+ * the first place, so nothing here should touch the display. */
+static void nav_remove_stack_slot(int index) {
+    for (int i = index; i < nav_depth - 1; i++) nav_stack[i] = nav_stack[i + 1];
+    if (nav_depth > 0) nav_depth--;
+}
+
+/* Collapses the whole nav stack back to Home -- used after a library rescan,
+ * since any deeper screen (Artists/Albums/group songs/...) may be showing
+ * rows built from the pre-rescan data and would otherwise still be reachable
+ * via back-navigation. */
+static void nav_reset_to_home(void) {
+    nav_depth = 1;
+    nav_stack[0] = home_screen;
+    lv_screen_load(home_screen);
+}
+
+/* Shared back-button handler for every screen built via the reusable
+ * icon-grid/pill-list builders -- passed directly as their back_btn_cb. */
+static void generic_back_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_pop();
+}
+
+/* Sets LV_OBJ_FLAG_GESTURE_BUBBLE on every descendant of `obj` so a swipe
+ * started anywhere inside a screen (over a label, button, or scrollable
+ * list) bubbles up to the screen itself to be handled as app-wide
+ * navigation. Deliberately does NOT recurse into drag-to-adjust widgets
+ * (sliders/switches/dropdowns/rollers) -- those consume horizontal drags
+ * themselves (e.g. seeking the progress bar), and letting a big drag on one
+ * of those also fire a navigation swipe would be surprising. */
+static void enable_gesture_bubble_recursive(lv_obj_t * obj) {
+    uint32_t count = lv_obj_get_child_count(obj);
+    for (uint32_t i = 0; i < count; i++) {
+        lv_obj_t * child = lv_obj_get_child(obj, i);
+        if (lv_obj_check_type(child, &lv_slider_class) ||
+            lv_obj_check_type(child, &lv_switch_class) ||
+            lv_obj_check_type(child, &lv_dropdown_class) ||
+            lv_obj_check_type(child, &lv_roller_class)) {
+            continue;
+        }
+        lv_obj_add_flag(child, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        enable_gesture_bubble_recursive(child);
+    }
+}
+
+/* Defined later alongside the rest of the quick-access drawer, but needed
+ * here for the swipe-down-from-the-top-edge trigger below. */
+static void open_quick_drawer(void);
+#define QUICK_DRAWER_ANIM_MS 120 /* real-hardware feedback: 200 felt slow for the post-release snap */
+#define QUICK_DRAWER_TRIGGER_ZONE 140 /* swipe-down must start within this many px of the top edge to open it */
+
+/* Global swipe handling for back/forward nav. Swipe left-to-right (finger
+ * drags rightward) = go back, matching the standard back gesture shown in
+ * the reference photos. Swipe right-to-left (finger drags leftward) = jump
+ * straight to the player screen from anywhere, matching the real device's
+ * "now playing" shortcut. Registered per-screen in
+ * finalize_screen_navigation(), which bubbles correctly via
+ * enable_gesture_bubble_recursive() (see its own comment).
+ *
+ * The quick-access drawer's open/close used to also be driven from here
+ * (swipe-down/up as instant, threshold-triggered LV_EVENT_GESTURE actions),
+ * but that's now poll_quick_drawer_drag()'s job instead -- see its own
+ * comment for why: both the GESTURE-bubbling approach here and an
+ * indev-wide LV_EVENT_PRESSING attempt turned out unreliable on real
+ * hardware for a surface as densely covered in its own interactive
+ * children (icons, a 300px-wide slider) as the drawer is. */
+static void screen_gesture_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+    lv_indev_t * indev = lv_indev_active();
+    if (!indev) return;
+
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if (dir == LV_DIR_RIGHT) {
+        nav_pop();
+        /* The finger is still down mid-gesture when the screen swaps out
+         * from under it -- without this, its eventual release gets
+         * delivered to whatever object now sits at that same coordinate on
+         * the NEW screen, firing an unwanted click there (real-hardware
+         * testing: swiping back from a submenu landed a phantom tap on
+         * whatever Home tile happened to be under the finger). Telling the
+         * indev to disregard everything until the next physical release
+         * stops that bleed-through. */
+        lv_indev_wait_release(indev);
+    }
+    /* Swipe-left-to-player used to be handled here too (instant
+     * nav_push(player_screen), no animation) -- real-device bug report:
+     * entering the player didn't follow the finger the way the quick
+     * drawer's own drag does. Replaced with a live, finger-driven version
+     * in poll_quick_drawer_drag() (see its own player_swipe_* state),
+     * which claims the press well before LVGL's own ~50px built-in gesture
+     * threshold (LV_INDEV_DEF_GESTURE_LIMIT) would ever fire this handler
+     * for LV_DIR_LEFT -- left here removed rather than merely unreachable,
+     * since leaving it live risked a second, redundant nav_push() firing
+     * behind the new interactive one, and creating an overlay object under
+     * an already-moving finger is exactly the kind of thing that corrupts
+     * LVGL's own press tracking (see the PRESS_LOST history on the
+     * drawer's own icons, quick_drawer_wifi_long_press_cb's comment) if
+     * anything else is still independently reacting to the same gesture.
+     *
+     * Swipe-up-to-Home is deliberately NOT handled here -- real-device
+     * feedback: this fired from anywhere on screen, including a drag that
+     * started well above the home indicator band and only incidentally
+     * ended up moving upward (e.g. an aborted attempt to scroll a list up).
+     * home_indicator_gesture_cb() (see build_home_indicator_bar()) is the
+     * only path to nav_reset_to_home() now -- it only ever fires for a drag
+     * that actually started within the reserved bottom strip, matching the
+     * Android gesture-bar convention this is modeled on. */
+}
+
+/* Finishing touch every build_XXX_screen() calls just before returning: wire
+ * up the swipe gestures generically instead of repeating this per screen. */
+static void finalize_screen_navigation(lv_obj_t * scr) {
+    /* lv_obj_hit_test() -- and therefore all press/drag/gesture detection --
+     * bails out immediately for any object lacking LV_OBJ_FLAG_CLICKABLE
+     * (confirmed by reading lv_obj_hit_test() in lv_obj_pos.c). A plain
+     * lv_obj_create(NULL) screen doesn't have that flag by default, so a
+     * swipe starting on bare screen background (anywhere not already
+     * covered by a clickable child) would otherwise never even register as
+     * a press, let alone a gesture. */
+    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
+    /* Every inner container built by this codebase already has SCROLLABLE
+     * removed, but the screen root itself never did -- left scrollable (the
+     * lv_obj default), a drag is first consumed as a scroll attempt (visible
+     * on real hardware as the whole screen dragging/rubber-banding) and only
+     * escalates to a real LV_EVENT_GESTURE in narrower cases, which is why
+     * swipe-to-go-back wasn't firing reliably. None of these screens use
+     * their own root as a scroll viewport -- scrolling, where it exists,
+     * always happens on a dedicated inner list/container instead. */
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    enable_gesture_bubble_recursive(scr);
+    /* LV_EVENT_PRESSED is deliberately NOT registered here -- see the
+     * indev-level registration in gui_init() below for why. */
+    lv_obj_add_event_cb(scr, screen_gesture_event_cb, LV_EVENT_GESTURE, NULL);
+}
+
+/* Persistent status bar (clock + battery/wifi icons), built once on LVGL's
+ * top layer rather than duplicated into every build_XXX_screen() -- objects
+ * on the top layer are drawn over whichever screen is currently active, on
+ * every screen, automatically. Left non-clickable throughout so touches
+ * still fall through to the real screen underneath (confirmed by reading
+ * lv_indev.c's search order: layer_top is checked before the active screen,
+ * but only objects with LV_OBJ_FLAG_CLICKABLE ever hit-test positive, so a
+ * plain informational bar like this never intercepts anything). Battery
+ * percentage (battery_get_percent()), wifi connection state
+ * (wifi_get_status()), and the clock are all real, live data -- the
+ * battery reads -1 on host (no /sys/class/power_supply there), in which
+ * case the label is just left blank and only the plain icon shows; wifi
+ * always reads disconnected on host too, since there's no wlan0
+ * wpa_supplicant instance to query there, same honest "no data" treatment
+ * either way. Battery percentage is rendered the same sprite-digit way as
+ * the clock/volume readouts (see battery_topbar_group below), not an
+ * lv_label, for the same size/style match. */
+static lv_obj_t * battery_topbar_group;
+static lv_obj_t * battery_topbar_digit[3];
+static lv_obj_t * battery_topbar_percent;
+static lv_obj_t * battery_icon_frame;
+static lv_obj_t * battery_icon_fill_clip;
+static lv_obj_t * battery_icon_fill_img;
+
+/* Fill sprite (topbar/battery.png) bbox within its own 20x30 native canvas,
+ * measured directly off the asset (alpha bbox: x 4-15, y 9-22) -- used to
+ * clip it down from the bottom as a charge-level gauge in
+ * refresh_battery_topbar(). Not derived at runtime since nothing else in
+ * this codebase decodes PNG alpha to find sprite bounds; a fixed asset gets
+ * a fixed constant, same as every other hand-placed topbar sprite here. */
+#define BATTERY_FILL_W 12
+#define BATTERY_FILL_H 14
+static lv_obj_t * wifi_icon;
+static lv_obj_t * bt_status_icon;
+static lv_obj_t * a2dp_status_icon;
+static lv_obj_t * play_pause_status_icon;
+static lv_obj_t * status_bar_band;
+
+static void build_status_bar(void) {
+    lv_obj_t * bar = lv_layer_top();
+
+    /* Every plain lv_obj_create() gets LV_OBJ_FLAG_SCROLLABLE by default
+     * (confirmed in lv_obj.c's base constructor), including layer_top
+     * itself -- nothing ever removes it since we only ever add children to
+     * this layer, never scroll it. Left alone, lv_indev_find_scroll_obj()
+     * walks the pressed object's FULL ancestor chain (see lv_indev_scroll.c)
+     * looking for a scrollable object with overflow, and can end up
+     * "claiming" a touch as a scroll of layer_top instead of delivering it
+     * as a normal press/click/gesture to whatever real widget was actually
+     * touched (this is exactly what silently broke the quick-drawer's
+     * swipe-up-to-close gesture, and is a very plausible cause of the
+     * drawer's on-screen buttons appearing unresponsive on the real
+     * touchscreen -- a real finger tap always has a few px of jitter, unlike
+     * a synthetic zero-movement click, and that's enough to trigger this
+     * scroll-vs-click arbitration). */
+    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* A dedicated band sized exactly to STATUS_BAR_CLEARANCE, with every
+     * status bar element vertically MID-aligned within it, rather than
+     * each element aligned to the full-screen top layer with a small
+     * hand-tuned Y offset -- the old per-element offsets (1, -3) put
+     * everything within a few px of the true screen top regardless of how
+     * tall STATUS_BAR_CLEARANCE actually was, so shrinking the clearance
+     * left all the real content hugging y=0 with dead space below it
+     * instead of using the newly smaller band evenly. */
+    lv_obj_t * band = lv_obj_create(bar);
+    status_bar_band = band;
+    lv_obj_remove_style_all(band);
+    lv_obj_set_size(band, lv_pct(100), STATUS_BAR_CLEARANCE);
+    lv_obj_set_pos(band, 0, 0);
+    lv_obj_remove_flag(band, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Centered on screen, not left-aligned -- confirmed against a real
+     * stock-player screenshot: "02:45" sat at x=205-273 out of a 480px-wide
+     * panel (center ~239, screen center is 240), not flush against the
+     * left edge like our previous layout had it. Sprite digits (topbar/
+     * N.png + colon.png), same as volume_topbar_group below, instead of an
+     * lv_label -- keeps every top bar readout pixel-identical in size/style
+     * rather than an lv_font approximating it. */
+    clock_topbar_group = lv_obj_create(band);
+    lv_obj_remove_style_all(clock_topbar_group);
+    lv_obj_set_size(clock_topbar_group, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(clock_topbar_group, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(clock_topbar_group, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(clock_topbar_group, 0, 0);
+    lv_obj_remove_flag(clock_topbar_group, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < 5; i++) {
+        clock_topbar_digit[i] = lv_image_create(clock_topbar_group);
+        lv_image_set_src(clock_topbar_digit[i], asset_path(i == 2 ? "topbar/colon.png" : "topbar/0.png"));
+        lv_image_set_scale(clock_topbar_digit[i], LV_SCALE_NONE);
+    }
+
+    /* LAST, after every child exists -- see the matching comment on
+     * volume_topbar_group's own align() call below for why (LV_SIZE_CONTENT
+     * doesn't retroactively re-run an earlier alignment as children grow
+     * it). refresh_clock_label() (called right after build_status_bar() in
+     * gui_init) immediately overwrites these placeholder "0"/":" sprites
+     * with the real time, so there's no visible flash of "00:00". */
+    lv_obj_align(clock_topbar_group, LV_ALIGN_CENTER, 0, 0);
+
+    /* Left edge of the bar, in the clock's old spot -- matches the stock
+     * player's own layout (speaker icon, red volume number, headphone-out
+     * icon, all pinned left, confirmed via real-device screenshot). A flex
+     * row lets hidden digit slots (see refresh_volume_topbar()) collapse
+     * cleanly instead of leaving a gap. */
+    volume_topbar_group = lv_obj_create(band);
+    lv_obj_remove_style_all(volume_topbar_group);
+    lv_obj_set_size(volume_topbar_group, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(volume_topbar_group, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(volume_topbar_group, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    /* No extra column padding -- each digit sprite already has ~1px of
+     * transparent margin baked into its own canvas on both edges (e.g.
+     * topbar/9.png is a 14px-wide canvas with the glyph itself only
+     * spanning x=1..13), which is enough separation on its own. Adding a
+     * pad_column on top of that visibly widened the gap between digits at
+     * this size (confirmed against real-device feedback: "space between
+     * the numbers"). */
+    lv_obj_set_style_pad_column(volume_topbar_group, 0, 0);
+    lv_obj_remove_flag(volume_topbar_group, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Rendered at native asset resolution (LV_SCALE_NONE), same as
+     * battery_icon/wifi_icon/bt_status_icon below -- an earlier downscale
+     * here (~0.65x) was based on a mismeasured comparison against the
+     * clock text and came out looking too small (real-device feedback).
+     * Re-measured directly against a real stock-player screenshot: the red
+     * "93" glyph bbox was 21px tall vs the clock's 19px -- i.e. native size
+     * is already the right size, no downscale needed. */
+    lv_obj_t * volume_topbar_icon = lv_image_create(volume_topbar_group);
+    lv_image_set_src(volume_topbar_icon, asset_path("topbar/speaker.png"));
+    lv_image_set_scale(volume_topbar_icon, LV_SCALE_NONE);
+
+    /* White by default (the sprite's own native color, no recolor style
+     * applied at creation); refresh_volume_topbar() below switches each
+     * digit to a flat (255,0,0) recolor once the level reaches
+     * volume_warn_threshold_percent, matching the stock player's own
+     * config-driven behavior (see device_config.h) instead of the flat
+     * always-red guess from the previous round. */
+    for (int i = 0; i < 3; i++) {
+        volume_topbar_digit[i] = lv_image_create(volume_topbar_group);
+        lv_image_set_src(volume_topbar_digit[i], asset_path("topbar/0.png"));
+        lv_image_set_scale(volume_topbar_digit[i], LV_SCALE_NONE);
+    }
+
+    /* Headphone-out glyph (topbar/po.png, confirmed by pixel comparison
+     * against a real-device screenshot) -- starts hidden and is only shown
+     * by refresh_headphone_icon() once real jack-detect state says a
+     * headphone/dongle is actually plugged in (see headphone_status.h),
+     * not shown unconditionally like the previous round had it. */
+    volume_topbar_headphone = lv_image_create(volume_topbar_group);
+    lv_image_set_src(volume_topbar_headphone, asset_path("topbar/po.png"));
+    lv_image_set_scale(volume_topbar_headphone, LV_SCALE_NONE);
+    lv_obj_add_flag(volume_topbar_headphone, LV_OBJ_FLAG_HIDDEN);
+
+    /* Same flex row as the headphone-jack glyph above, not a separate fixed
+     * position -- shown/hidden independently by its own real A2DP state
+     * (poll_refresh_bt_icon()), so it naturally sits right next to the jack
+     * glyph when both a wired and a Bluetooth output are connected at once,
+     * or takes the jack glyph's spot on its own when only Bluetooth is (the
+     * flex row's own hidden-children-collapse behavior, already relied on
+     * by the volume digit slots above, does this for free -- no manual
+     * "replace" logic needed). */
+    a2dp_status_icon = lv_image_create(volume_topbar_group);
+    lv_image_set_src(a2dp_status_icon, asset_path("topbar/a2dp.png"));
+    lv_image_set_scale(a2dp_status_icon, LV_SCALE_NONE);
+    lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN); /* shown by poll_refresh_bt_icon() once an A2DP source PCM exists */
+
+    /* Rightmost in this row -- always after whichever headphone-output
+     * glyph(s) above are currently shown, per the same flex-collapse
+     * reasoning. play.png while actually playing, pause.png while paused,
+     * hidden entirely when stopped/nothing loaded --
+     * refresh_play_pause_topbar(). */
+    play_pause_status_icon = lv_image_create(volume_topbar_group);
+    lv_image_set_src(play_pause_status_icon, asset_path("topbar/play.png"));
+    lv_image_set_scale(play_pause_status_icon, LV_SCALE_NONE);
+    lv_obj_add_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
+
+    /* Deliberately LAST, after every child exists -- done earlier, the
+     * LV_SIZE_CONTENT group still had zero content size at that point, and
+     * its later growth as children were added did NOT retroactively re-run
+     * this alignment (confirmed on real hardware in an earlier round of
+     * this same bug: the group ended up anchored low and out of vertical
+     * sync with the rest of the bar). */
+    lv_obj_align(volume_topbar_group, LV_ALIGN_LEFT_MID, 16, 0);
+
+    /* Outline frame -- swapped between battery_bg.png (normal),
+     * battery_charge_bg.png (charging, has its own baked-in bolt glyph) and
+     * battery_low_bg.png (red, <5% and not charging) by
+     * refresh_battery_topbar(). Previously this was a single static
+     * "topbar/battery.png" (the plain fill rectangle below, with no outline
+     * at all) that was never touched again after creation -- the icon never
+     * reflected charge state or percentage at all, just a fixed white
+     * square regardless of real battery level. */
+    battery_icon_frame = lv_image_create(band);
+    lv_image_set_src(battery_icon_frame, asset_path("topbar/battery_bg.png"));
+    lv_image_set_scale(battery_icon_frame, LV_SCALE_NONE);
+    lv_obj_align(battery_icon_frame, LV_ALIGN_RIGHT_MID, -15, 0);
+
+    /* Charge-level gauge: a plain clipping container sized/positioned every
+     * refresh to BATTERY_FILL_W x (BATTERY_FILL_H * percent/100), holding
+     * the full-size fill sprite bottom-aligned inside it -- lv_obj clips
+     * children to its own box by default (no LV_OBJ_FLAG_OVERFLOW_VISIBLE
+     * set here), so shrinking the container's height reveals progressively
+     * less of the sprite from the top down, same visual as a liquid gauge
+     * draining towards the frame's terminal nub. Hidden outright while
+     * charging (the charge_bg frame already shows its own bolt glyph) or
+     * below 5% (the low frame should read as "empty", not partially
+     * filled). */
+    battery_icon_fill_clip = lv_obj_create(band);
+    lv_obj_remove_style_all(battery_icon_fill_clip);
+    lv_obj_set_size(battery_icon_fill_clip, BATTERY_FILL_W, BATTERY_FILL_H);
+    lv_obj_remove_flag(battery_icon_fill_clip, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align_to(battery_icon_fill_clip, battery_icon_frame, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    battery_icon_fill_img = lv_image_create(battery_icon_fill_clip);
+    lv_image_set_src(battery_icon_fill_img, asset_path("topbar/battery.png"));
+    lv_image_set_scale(battery_icon_fill_img, LV_SCALE_NONE);
+    lv_obj_align(battery_icon_fill_img, LV_ALIGN_BOTTOM_MID, 0, 7);
+
+    /* Sprite digits (topbar/N.png + percent.png), same treatment as the
+     * clock/volume readouts above -- up to 3 digit slots (0-100, same
+     * leading-slot-hiding scheme as volume_topbar_digit) plus a trailing
+     * percent sign. The whole group is hidden outright when the real
+     * percent is unknown (battery_get_percent() < 0, e.g. host with no
+     * /sys/class/power_supply) -- same "icon only, no fake reading" honesty
+     * the old blank-text label had. */
+    battery_topbar_group = lv_obj_create(band);
+    lv_obj_remove_style_all(battery_topbar_group);
+    lv_obj_set_size(battery_topbar_group, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(battery_topbar_group, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(battery_topbar_group, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(battery_topbar_group, 0, 0);
+    lv_obj_remove_flag(battery_topbar_group, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < 3; i++) {
+        battery_topbar_digit[i] = lv_image_create(battery_topbar_group);
+        lv_image_set_src(battery_topbar_digit[i], asset_path("topbar/0.png"));
+        lv_image_set_scale(battery_topbar_digit[i], LV_SCALE_NONE);
+    }
+    battery_topbar_percent = lv_image_create(battery_topbar_group);
+    lv_image_set_src(battery_topbar_percent, asset_path("topbar/percent.png"));
+    lv_image_set_scale(battery_topbar_percent, LV_SCALE_NONE);
+
+    /* Anchored to battery_icon itself (not a hand-tuned x) rather than a
+     * fixed band offset, since the group's own width varies with the
+     * digit count (1-3) -- LAST, after every child exists, same reasoning
+     * as volume_topbar_group's align() below. */
+    lv_obj_align_to(battery_topbar_group, battery_icon_frame, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+
+    wifi_icon = lv_image_create(band);
+    lv_image_set_src(wifi_icon, asset_path("topbar/wifi_unconnect.png"));
+    lv_image_set_scale(wifi_icon, LV_SCALE_NONE);
+    lv_obj_align(wifi_icon, LV_ALIGN_RIGHT_MID, -105, 0);
+    lv_obj_add_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN); /* shown by refresh_wifi_icon() once wifi_control_is_enabled() */
+
+    bt_status_icon = lv_image_create(band);
+    lv_image_set_src(bt_status_icon, asset_path("topbar/bluetooth.png"));
+    lv_image_set_scale(bt_status_icon, LV_SCALE_NONE);
+    lv_obj_align(bt_status_icon, LV_ALIGN_RIGHT_MID, -145, 0);
+    lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN); /* shown by refresh_bt_icon() once bt_control_is_powered() */
+}
+
+static void refresh_play_pause_topbar(void) {
+    if (audio_is_playing()) {
+        lv_obj_remove_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(play_pause_status_icon, asset_path("topbar/play.png"));
+    } else if (audio_is_paused()) {
+        lv_obj_remove_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(play_pause_status_icon, asset_path("topbar/pause.png"));
+    } else {
+        lv_obj_add_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void refresh_battery_topbar(void) {
+    int percent = battery_get_percent();
+    if (percent < 0) {
+        lv_obj_add_flag(battery_topbar_group, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(battery_icon_fill_clip, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(battery_icon_frame, asset_path("topbar/battery_bg.png"));
+        return;
+    }
+    lv_obj_remove_flag(battery_topbar_group, LV_OBJ_FLAG_HIDDEN);
+    if (percent > 100) percent = 100;
+
+    bool charging = battery_is_charging();
+    bool low = !charging && percent < 5;
+
+    lv_image_set_src(battery_icon_frame,
+                      asset_path(charging ? "topbar/battery_charge_bg.png"
+                                 : low    ? "topbar/battery_low_bg.png"
+                                          : "topbar/battery_bg.png"));
+
+    /* Fill gauge only makes sense for the plain frame -- the charging frame
+     * already carries its own bolt glyph, and "low" should read as visually
+     * empty, not a sliver of fill. */
+    if (charging || low) {
+        lv_obj_add_flag(battery_icon_fill_clip, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(battery_icon_fill_clip, LV_OBJ_FLAG_HIDDEN);
+        int fill_h = (BATTERY_FILL_H * percent + 50) / 100;
+        if (fill_h < 1) fill_h = 1;
+        if (fill_h > BATTERY_FILL_H) fill_h = BATTERY_FILL_H;
+        lv_obj_set_height(battery_icon_fill_clip, fill_h);
+        lv_obj_align_to(battery_icon_fill_clip, battery_icon_frame, LV_ALIGN_BOTTOM_MID, 0, -8);
+    }
+
+    /* Same leading-slot-hiding scheme as refresh_volume_topbar(). */
+    char digits[4];
+    snprintf(digits, sizeof(digits), "%d", percent);
+    int len = (int) strlen(digits);
+
+    for (int i = 0; i < 3; i++) {
+        int digit_index = i - (3 - len);
+        if (digit_index < 0) {
+            lv_obj_add_flag(battery_topbar_digit[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            char asset[24];
+            snprintf(asset, sizeof(asset), "topbar/%c.png", digits[digit_index]);
+            lv_image_set_src(battery_topbar_digit[i], asset_path(asset));
+            lv_obj_remove_flag(battery_topbar_digit[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+/* Called once at startup (gui_init, with the volume loaded from settings)
+ * and every time the hardware volume buttons change the level
+ * (update_timer_cb) -- there's no separate "poll" path since volume only
+ * ever changes at those two call sites. */
+static void refresh_volume_topbar(int32_t percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+
+    char digits[4];
+    snprintf(digits, sizeof(digits), "%d", (int) percent);
+    int len = (int) strlen(digits);
+
+    /* volume_warn_threshold_percent is -1 when the feature is off (see its
+     * declaration) -- guard it explicitly rather than just comparing
+     * percent >= threshold, since percent >= -1 is always true. */
+    bool warn = volume_warn_threshold_percent >= 0 && percent >= volume_warn_threshold_percent;
+
+    for (int i = 0; i < 3; i++) {
+        int digit_index = i - (3 - len);
+        if (digit_index < 0) {
+            lv_obj_add_flag(volume_topbar_digit[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            char asset[24];
+            snprintf(asset, sizeof(asset), "topbar/%c.png", digits[digit_index]);
+            lv_image_set_src(volume_topbar_digit[i], asset_path(asset));
+            lv_obj_remove_flag(volume_topbar_digit[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        /* LV_OPA_TRANSP disables the recolor mix entirely, leaving the
+         * sprite's own native white showing through -- simpler than
+         * swapping between a white-recolor and a red-recolor style. */
+        lv_obj_set_style_image_recolor(volume_topbar_digit[i], lv_color_make(255, 0, 0), 0);
+        lv_obj_set_style_image_recolor_opa(volume_topbar_digit[i], warn ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    }
+}
+
+/* Polled every timer tick alongside refresh_battery_topbar() -- like
+ * battery.c's sysfs read, this is a single cheap fopen/fgets with no
+ * subprocess fork, so it doesn't need wifi/bt's throttled polling. */
+static void refresh_headphone_icon(void) {
+    if (headphone_is_connected()) {
+        lv_obj_remove_flag(volume_topbar_headphone, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(volume_topbar_headphone, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* wpa_cli forks a process per call (see wifi_status.c), so this is only
+ * polled every WIFI_POLL_TICKS timer ticks rather than every tick like the
+ * clock/battery -- wifi signal doesn't change fast enough to need
+ * sub-second polling anyway. */
+#define WIFI_POLL_TICKS 10
+static int wifi_poll_tick_counter = 0;
+
+/* The drawer's own wifi icon just reflects radio-on/off (blue as soon as
+ * enabled, real-device feedback: the connected-vs-just-enabled distinction
+ * is a top-bar-only thing) -- the top bar icon keeps the finer-grained
+ * enabled-vs-actually-associated-to-an-AP distinction below. */
+static void refresh_wifi_icon(void) {
+    bool enabled = wifi_control_is_enabled();
+    if (quick_drawer_wifi_icon) {
+        lv_image_set_src(quick_drawer_wifi_icon, asset_path(enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
+    }
+
+    if (!enabled) {
+        lv_obj_add_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_remove_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
+
+    int level;
+    if (wifi_get_status(&level)) {
+        char asset[40];
+        snprintf(asset, sizeof(asset), "topbar/wifi_connect_%d.png", level);
+        lv_image_set_src(wifi_icon, asset_path(asset));
+    } else {
+        lv_image_set_src(wifi_icon, asset_path("topbar/wifi_unconnect.png"));
+    }
+}
+
+/* Same treatment as refresh_wifi_icon(): the drawer's bt icon just reflects
+ * powered-on/off, blue as soon as enabled -- only the top bar distinguishes
+ * powered-but-nothing-paired from actually-connected, via
+ * bt_control_is_connected() (checks each paired device's "Connected: yes"
+ * state via bluetoothctl info, cheap -- no discovery scan). */
+/* Mirrors current_settings.bt_dac_mode_enabled's real-world effect --
+ * external_dac_block_reason() reads this (see its own comment) instead of
+ * calling bt_control_is_powered() itself, since that's a subprocess spawn
+ * (bluetoothctl show, potentially several seconds when Bluetooth actually is
+ * powered on) and the block check runs on every play-button tap. Kept fresh
+ * by refresh_bt_icon()'s existing periodic poll and by poll_bt_toggle()'s
+ * immediate refresh after a manual toggle, rather than adding a new
+ * subprocess call to the play hot path. */
+static bool bt_is_powered_cached = false;
+
+/* Moved up from the Bluetooth settings screen section further down (still
+ * used there, see populate_bt_screen()) -- refresh_bt_icon_thread_func()
+ * below needs to reference bt_scan_results directly, before its own
+ * definition down there, to fix a real-device bug: the settings screen's
+ * device list only ever reflected paired/connected state as of the last
+ * explicit scan, never refreshed afterward unlike the top-bar icon (see
+ * poll_refresh_bt_icon()'s own comment on the merge step below). */
+#define BT_MAX_RESULTS 32
+static bt_device_t bt_scan_results[BT_MAX_RESULTS];
+static int bt_scan_result_count = 0;
+
+/* Written by refresh_bt_icon_thread_func() below, merged into
+ * bt_scan_results by poll_refresh_bt_icon() -- see its own comment. */
+static bt_device_t bt_paired_states_result[BT_MAX_RESULTS];
+static int bt_paired_states_count = 0;
+
+/* Real-device incident: this used to call bt_control_is_powered()/
+ * bt_control_is_connected() (bluetoothctl show / bluetoothctl info)
+ * directly, synchronously, right here on the UI thread -- every call site
+ * of what's now start_refresh_bt_icon() ran on that thread, including the
+ * periodic ~5s poll. subprocess_run()'s own 15s timeout-and-kill exists
+ * specifically because bluetoothctl show is known to hang under certain
+ * Bluetooth states (see its doc comment) -- confirmed on a real device
+ * that active A2DP audio streaming (Bluetooth DAC, phone actively playing)
+ * is exactly such a state: bluetoothctl show hung, and since the periodic
+ * poll re-issued another call as soon as (or before) the previous one's
+ * bounded wait gave up, the whole UI stayed frozen for as long as the hang
+ * persisted, not just one bounded 15s stall. Backgrounded the same way
+ * every other slow Bluetooth operation in this file already is, so a hang
+ * here can no longer block LVGL's own timer_handler() from running. */
+static pthread_t refresh_bt_icon_thread;
+static bool refresh_bt_icon_active = false;
+static volatile bool refresh_bt_icon_done_flag = false;
+static bool refresh_bt_icon_result_powered = false;
+static bool refresh_bt_icon_result_connected = false;
+static bool refresh_bt_icon_result_a2dp_connected = false;
+
+static void * refresh_bt_icon_thread_func(void * arg) {
+    (void) arg;
+    bool powered = bt_control_is_powered();
+    refresh_bt_icon_result_powered = powered;
+
+    /* Same background thread/cadence as everything else here -- one more
+     * subprocess call (bluealsa-cli list-pcms) alongside the bluetoothctl
+     * calls below, not a separate poll loop. */
+    refresh_bt_icon_result_a2dp_connected = powered && bt_control_is_a2dp_source_connected();
+
+    if (powered) {
+        /* bt_control_list_paired_states(), not bt_control_is_connected() --
+         * same per-device `bluetoothctl info` cost either way, but this also
+         * hands back the full breakdown poll_refresh_bt_icon() merges into
+         * bt_scan_results below, instead of throwing it away. -1 (the query
+         * itself failed, not "genuinely 0 paired") is normalized to 0 here
+         * for the any_connected scan below (an empty loop either way), but
+         * poll_refresh_bt_icon() checks the raw value separately before
+         * treating "nothing here" as authoritative -- see its own comment. */
+        bt_paired_states_count = bt_control_list_paired_states(bt_paired_states_result, BT_MAX_RESULTS);
+        bool any_connected = false;
+        for (int i = 0; i < bt_paired_states_count; i++) {
+            if (bt_paired_states_result[i].connected) { any_connected = true; break; }
+        }
+        refresh_bt_icon_result_connected = any_connected;
+    } else {
+        bt_paired_states_count = 0;
+        refresh_bt_icon_result_connected = false;
+    }
+
+    refresh_bt_icon_done_flag = true; /* written last -- poll_refresh_bt_icon only checks this flag */
+    return NULL;
+}
+
+static void start_refresh_bt_icon(void) {
+    if (refresh_bt_icon_active) return; /* previous check still in flight -- same "ignore taps until it lands" pattern as everything else here */
+    refresh_bt_icon_active = true;
+    refresh_bt_icon_done_flag = false;
+    pthread_create(&refresh_bt_icon_thread, NULL, refresh_bt_icon_thread_func, NULL);
+}
+
+static void populate_bt_screen(void); /* defined with the rest of the Bluetooth settings screen, below */
+
+static void poll_refresh_bt_icon(void) {
+    if (!refresh_bt_icon_active || !refresh_bt_icon_done_flag) return;
+    refresh_bt_icon_active = false;
+    pthread_join(refresh_bt_icon_thread, NULL);
+
+    bt_is_powered_cached = refresh_bt_icon_result_powered;
+    if (quick_drawer_bt_icon) {
+        lv_image_set_src(quick_drawer_bt_icon, asset_path(refresh_bt_icon_result_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
+    }
+
+    if (!refresh_bt_icon_result_powered) {
+        lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+        /* Bluetooth screen's own toggle row + everything gated on it reads
+         * bt_is_powered_cached too -- but only actually needs rebuilding
+         * while that screen is the one on screen, see the comment below on
+         * the other populate_bt_screen() call site for why. */
+        if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen) populate_bt_screen();
+        return;
+    }
+    lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_src(bt_status_icon, asset_path(refresh_bt_icon_result_connected ? "topbar/bluetooth.png" : "topbar/bluetooth_unconnect.png"));
+    if (refresh_bt_icon_result_a2dp_connected) {
+        lv_obj_remove_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* Real-device bug: the Bluetooth settings screen's device list kept
+     * showing paired/connected state as of the last explicit scan forever
+     * after -- populate_bt_screen() re-runs every poll tick already (right
+     * below), but it only re-renders bt_scan_results, which nothing kept
+     * fresh; only this function's own icon update above was ever current.
+     * Update in place by MAC match rather than appending -- a device not
+     * already in bt_scan_results (nothing scanned yet) still needs an
+     * explicit Rescan, same as before; this only fixes staleness for
+     * entries already on screen.
+     *
+     * Real-device bug #2 (found later): "Forget Device" (poll_bt_forget())
+     * clears bt_scan_results[i].paired locally and immediately, but this
+     * loop used to only ever UPDATE an entry that appeared in the fresh
+     * bt_paired_states_result[] snapshot -- never explicitly clear one that
+     * dropped OUT of it. A background poll that started (bt_control_
+     * list_paired_states() takes several real subprocess round trips)
+     * before the user hit Forget, but which HAPPENS to land afterward,
+     * still carried the stale "still paired" snapshot -- reapplying it
+     * here silently undid poll_bt_forget()'s own correct clear, confirmed
+     * live as "forgot a device, it stopped showing up at all" (stuck
+     * showing as still-paired, so filtered out of both list sections it
+     * could sanely appear in). Iterating bt_scan_results and searching
+     * bt_paired_states_result (inverted from the original nesting) instead
+     * makes this poll's own result authoritative in BOTH directions: found
+     * -> apply it, not found -> it's not paired, full stop, regardless of
+     * whatever an even-more-stale direct clear or a previous poll left
+     * behind.
+     *
+     * Guarded on bt_paired_states_count >= 0 (not -1, see
+     * bt_control_list_paired_states()'s own doc comment): a failed query
+     * means no fresh data at all this cycle, not "0 devices are paired" --
+     * applying the "not found -> clear it" half on a failed query would
+     * incorrectly wipe every device's real paired state over a transient
+     * subprocess hiccup. Skipping the whole merge (leaving bt_scan_results
+     * exactly as it was) just means this cycle contributes nothing, same as
+     * if the poll simply hadn't run yet -- the next successful cycle
+     * catches up normally. */
+    if (bt_paired_states_count >= 0) {
+        for (int j = 0; j < bt_scan_result_count; j++) {
+            bool found = false;
+            for (int i = 0; i < bt_paired_states_count; i++) {
+                if (strcmp(bt_scan_results[j].mac, bt_paired_states_result[i].mac) == 0) {
+                    bt_scan_results[j].paired = bt_paired_states_result[i].paired;
+                    bt_scan_results[j].connected = bt_paired_states_result[i].connected;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                bt_scan_results[j].paired = false;
+                bt_scan_results[j].connected = false;
+            }
+        }
+    }
+    /* Real-device bug: this used to call populate_bt_screen() unconditionally
+     * every ~5s poll tick regardless of which screen was actually on
+     * screen -- lv_obj_clean() + rebuilding every device row (icons,
+     * labels, buttons) is real LVGL work, confirmed live as visible UI
+     * tearing/animation stutter on OTHER screens (player, home, ...) the
+     * whole time Bluetooth was on, not just while the Bluetooth screen was
+     * open. bt_scan_results itself is still kept fresh above every cycle
+     * regardless (cheap, no LVGL calls) -- only the actual widget rebuild is
+     * gated, and open_bluetooth_screen() already calls populate_bt_screen()
+     * itself once on entry, so the screen is never stale when the user
+     * actually opens it. */
+    if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen) populate_bt_screen();
+
+    /* Real-device bug: pairing/connecting Bluetooth headphones worked (this
+     * poll's own refresh_bt_icon_result_connected went true), but no audio
+     * ever played -- see audio_set_bt_output()'s doc comment in audio.h for
+     * the root cause (this app's output was hardcoded to local hardware,
+     * with no path to bluealsa at all). Gated on bt_dac_mode_enabled being
+     * off: DAC mode runs bluealsa as a2dp-sink (receiving audio FROM a
+     * phone), not a2dp-source, so there's no source profile for this app's
+     * own playback to route into while DAC mode has that swapped out (see
+     * bt_control_apply_output_settings()'s own comment on the two being
+     * mutually exclusive). */
+    bool use_bt_output = refresh_bt_icon_result_connected && !current_settings.bt_dac_mode_enabled;
+    audio_set_bt_output(use_bt_output);
+
+    /* Same gating as audio_set_bt_output() right above -- real-device bug
+     * report: once Bluetooth output itself worked, the headphones' own
+     * volume buttons had no effect on this app and vice versa. See
+     * bt_control_source_volume_sync_start()'s own comment in
+     * bluetooth_control.c for why this doesn't double-attenuate on top of
+     * this app's own volume taper. */
+    if (use_bt_output) {
+        bt_control_source_volume_sync_start();
+    } else {
+        bt_control_source_volume_sync_stop();
+    }
+
+    /* Same gating again -- real-device bug report: "can't use bluetooth
+     * headphones while on USB DAC". usb_dac_bridge.c's own output stream
+     * used to always go straight to local hardware regardless of this;
+     * now it shares the same audio_output module local playback uses (see
+     * usb_dac_bridge_set_bt_output()'s own doc comment), so it needs the
+     * same signal. Harmless to call when USB DAC mode isn't even active
+     * (the bridge just isn't running, so this only updates a flag it'll
+     * read next time it starts). */
+    usb_dac_bridge_set_bt_output(use_bt_output);
+
+#ifndef HOST_BUILD
+    /* Same gating again -- real-device bug report: the headphones' own
+     * play/pause/next/previous buttons had no effect on this app. See
+     * bt_media_player.c's own top-of-file comment for why this needs a
+     * real D-Bus service rather than a one-shot bluetoothctl call like
+     * everything else here. */
+    bt_media_player_set_active(use_bt_output);
+#endif
+}
+
+/* Transient volume popup (Task #28 / closes Task #17): built once, hidden,
+ * on the top layer -- same reasoning as the status bar, but shown only for
+ * a couple of seconds after the hardware volume buttons change the level,
+ * then auto-hidden, instead of a permanently visible slider. */
+static lv_obj_t * volume_popup;
+static lv_obj_t * volume_popup_track;
+static lv_timer_t * volume_popup_hide_timer;
+
+static void volume_popup_hide_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    lv_obj_add_flag(volume_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_pause(volume_popup_hide_timer);
+}
+
+static void build_volume_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    volume_popup = lv_obj_create(top);
+    lv_obj_set_size(volume_popup, 440, 60);
+    /* Right below the status bar, not floating mid-screen. */
+    lv_obj_align(volume_popup, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 12);
+    /* bg.png (and vol_bg.png/vol_progress.png/cursor.png below) are
+     * rounded-rect sprites with genuinely transparent corners (verified:
+     * corner pixel alpha is 0 in the source PNGs). bg_opa and bg_image_opa
+     * are independent LVGL v9 style properties (lv_obj_draw.c gates them
+     * separately) -- the previous fix set an opaque bg_color to cover
+     * LVGL's default light background, but that just replaced it with an
+     * opaque BLACK square showing through those same transparent corners.
+     * Turning bg_opa fully off removes the rect fill entirely; the
+     * background IMAGE still draws (bg_image_opa defaults to COVER on its
+     * own, per lv_style_prop_get_default()), so the transparent corners
+     * now correctly show whatever is actually behind the popup. */
+    lv_obj_set_style_bg_opa(volume_popup, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_image_src(volume_popup, asset_path("volume/bg.png"), 0);
+    lv_obj_set_style_border_width(volume_popup, 0, 0);
+    /* The real cause of the icon/slider overlap: lv_obj_create() pulls in
+     * the default theme's "card" style, which sets pad_all to PAD_DEF
+     * (16-24px depending on disp_size, lv_theme_default.c) -- left
+     * un-zeroed, that shrinks the box speaker_icon's LEFT_MID/+20 and
+     * volume_popup_track's RIGHT_MID/-20 actually align within on each
+     * side, which was enough to make the two visually touch/overlap on a
+     * real-device screenshot despite the 32px gap the raw 440/20/340/20
+     * numbers below suggest. Zeroing it makes this object's content box
+     * the full 440x60 those numbers assume. */
+    lv_obj_set_style_pad_all(volume_popup, 0, 0);
+    lv_obj_remove_flag(volume_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(volume_popup, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * speaker_icon = lv_image_create(volume_popup);
+    lv_image_set_src(speaker_icon, asset_path("volume/vol.png"));
+    lv_obj_align(speaker_icon, LV_ALIGN_LEFT_MID, 20, 0);
+
+    volume_popup_track = lv_slider_create(volume_popup);
+    lv_obj_set_size(volume_popup_track, 340, 12);
+    lv_obj_align(volume_popup_track, LV_ALIGN_RIGHT_MID, -20, 0);
+    lv_slider_set_range(volume_popup_track, 0, 100);
+    /* Same bg_opa-vs-bg_image_opa fix as volume_popup itself -- each part
+     * (MAIN/INDICATOR/KNOB) has its own independent bg_opa/bg_color. */
+    lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/vol_bg.png"), LV_PART_MAIN);
+    lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/vol_progress.png"), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
+    lv_obj_set_style_width(volume_popup_track, 30, LV_PART_KNOB);
+    lv_obj_set_style_height(volume_popup_track, 30, LV_PART_KNOB);
+    lv_obj_remove_flag(volume_popup_track, LV_OBJ_FLAG_CLICKABLE); /* display-only -- hw buttons drive the real value */
+
+    volume_popup_hide_timer = lv_timer_create(volume_popup_hide_timer_cb, 1500, NULL);
+    lv_timer_pause(volume_popup_hide_timer);
+}
+
+/* Android-style home indicator: a small pill fixed to the bottom edge,
+ * living on lv_layer_top() (drawn above every screen, same trick as the
+ * status bar) so a swipe-up starting there is always caught by THIS object
+ * instead of whatever scrollable list happens to be underneath it.
+ *
+ * Real-device bug report: plain swipe-up-anywhere (screen_gesture_event_cb()
+ * above) didn't work on any screen with a scrollable list -- LVGL claims a
+ * vertical drag as a list SCROLL before it ever escalates to a gesture (see
+ * enable_gesture_bubble_recursive()'s own comment: that only affects whether
+ * a completed gesture bubbles up, not whether one gets generated in the
+ * first place on an object that can still scroll in that direction). A
+ * horizontal swipe doesn't have this problem since none of these lists
+ * scroll sideways, which is why back/forward navigation swipes were never
+ * affected. Deliberately NOT shrinking every screen's own content height to
+ * visually reserve this strip too (touches this many build_XXX_screen()
+ * call sites for a first pass) -- it overlays the very bottom of scrollable
+ * content instead, same tradeoff plenty of real apps make with a floating
+ * gesture bar.
+ *
+ * Second real-device bug report: an LV_EVENT_GESTURE handler directly on
+ * this band (the first attempt) never fired at all. Same root cause already
+ * documented and fixed for the quick drawer's own edge-swipe (see
+ * poll_quick_drawer_drag()'s own long comment): LVGL's gesture detection is
+ * unreliable for this exact "small dedicated edge zone" shape of
+ * interaction on real hardware. Tracking is done there instead, by polling
+ * the indev's raw position every tick alongside the drawer's own drag
+ * tracking (home_swipe_tracking/home_swipe_start_y/home_swipe_triggered,
+ * declared there) -- sidesteps LVGL's hit-testing/gesture-escalation
+ * machinery entirely, the same fix that made the drawer's own swipe
+ * reliable. */
+#define HOME_INDICATOR_BAND_HEIGHT 34
+static lv_obj_t * home_indicator_band;
+
+static void build_home_indicator_bar(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    home_indicator_band = lv_obj_create(top);
+    lv_obj_remove_style_all(home_indicator_band);
+    lv_obj_set_size(home_indicator_band, lv_pct(100), HOME_INDICATOR_BAND_HEIGHT);
+    lv_obj_align(home_indicator_band, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_remove_flag(home_indicator_band, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_CLICKABLE); /* claims touches in this strip before any list underneath can -- the actual swipe-up trigger is poll_quick_drawer_drag()'s raw position polling, not a click/gesture event on this object */
+
+    /* The visible pill itself -- plain light-gray rounded bar, matching
+     * Android's own gesture-nav home indicator. */
+    lv_obj_t * pill = lv_obj_create(home_indicator_band);
+    lv_obj_remove_style_all(pill);
+    lv_obj_set_size(pill, 120, 4);
+    lv_obj_align(pill, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(pill, lv_color_make(220, 220, 220), 0);
+    lv_obj_set_style_bg_opa(pill, LV_OPA_60, 0);
+    lv_obj_set_style_radius(pill, 2, 0);
+    lv_obj_remove_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(pill, LV_OBJ_FLAG_CLICKABLE); /* purely visual -- home_indicator_band above is what's actually clickable */
+
+    lv_obj_add_flag(home_indicator_band, current_settings.swipe_up_home_enabled ? 0 : LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Generic transient error/status toast, top layer, auto-hides after 2.5s --
+ * same shape as volume_popup above. Reusable anywhere a background op can
+ * fail with something worth telling the user about; nothing like this
+ * existed before (see poll_subsonic_download()'s and
+ * subsonic_connect_row_cb's own "no error-toast UI exists yet" notes) --
+ * first real use is Wi-Fi/Bluetooth connect failures. */
+static lv_obj_t * error_toast;
+static lv_obj_t * error_toast_label;
+static lv_timer_t * error_toast_hide_timer;
+
+static void error_toast_hide_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    lv_obj_add_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_pause(error_toast_hide_timer);
+}
+
+static void build_error_toast(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    error_toast = lv_obj_create(top);
+    lv_obj_set_size(error_toast, 400, 70);
+    lv_obj_align(error_toast, LV_ALIGN_CENTER, 0, -180);
+    lv_obj_set_style_radius(error_toast, 16, 0);
+    lv_obj_set_style_bg_color(error_toast, lv_color_make(40, 20, 20), 0);
+    lv_obj_set_style_bg_opa(error_toast, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(error_toast, 0, 0);
+    lv_obj_remove_flag(error_toast, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
+
+    error_toast_label = lv_label_create(error_toast);
+    lv_obj_set_width(error_toast_label, lv_pct(90));
+    lv_label_set_long_mode(error_toast_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(error_toast_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(error_toast_label, lv_color_make(255, 200, 200), 0);
+    lv_obj_set_style_text_font(error_toast_label, ui_size_20, 0);
+    lv_obj_center(error_toast_label);
+
+    error_toast_hide_timer = lv_timer_create(error_toast_hide_timer_cb, 2500, NULL);
+    lv_timer_pause(error_toast_hide_timer);
+}
+
+/* Dismiss-on-tap info popup -- same hand-built top-layer overlay shape as
+ * eq_reset_popup/factory_reset_popup, but a single acknowledgment button
+ * instead of a confirm/cancel pair, and sized for a real paragraph of text
+ * rather than those two's short titles. show_error_toast()'s fixed 400x70
+ * box (auto-hides after 2.5s) doesn't fit a message this long or give
+ * enough time to actually read it -- this stays up until the user
+ * dismisses it. Reusable anywhere a longer explanation is worth showing;
+ * first use is Qobuz/Tidal's "not available in my region" tiles. */
+static lv_obj_t * info_popup;
+static lv_obj_t * info_popup_backdrop;
+static lv_obj_t * info_popup_label;
+
+static void hide_info_popup(void) {
+    lv_obj_add_flag(info_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void info_popup_dismiss_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_info_popup();
+}
+
+static void show_info_popup(const char * msg) {
+    lv_label_set_text(info_popup_label, msg);
+    lv_obj_remove_flag(info_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(info_popup_backdrop);
+    lv_obj_move_foreground(info_popup);
+}
+
+static void build_info_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    info_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(info_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(info_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(info_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(info_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(info_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(info_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(info_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(info_popup_backdrop, info_popup_dismiss_cb, LV_EVENT_CLICKED, NULL);
+
+    info_popup = lv_obj_create(top);
+    lv_obj_set_size(info_popup, 420, 280);
+    lv_obj_align(info_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(info_popup, 16, 0);
+    lv_obj_set_style_bg_color(info_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(info_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(info_popup, 0, 0);
+    lv_obj_remove_flag(info_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
+
+    info_popup_label = lv_label_create(info_popup);
+    lv_obj_set_width(info_popup_label, lv_pct(88));
+    lv_label_set_long_mode(info_popup_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(info_popup_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(info_popup_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(info_popup_label, ui_size_20, 0);
+    lv_obj_align(info_popup_label, LV_ALIGN_TOP_MID, 0, 24);
+
+    lv_obj_t * ok_row = lv_obj_create(info_popup);
+    lv_obj_set_size(ok_row, lv_pct(90), 56);
+    lv_obj_align(ok_row, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_set_style_radius(ok_row, 12, 0);
+    lv_obj_set_style_bg_opa(ok_row, 0, 0);
+    lv_obj_set_style_border_width(ok_row, 0, 0);
+    lv_obj_remove_flag(ok_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ok_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ok_row, info_popup_dismiss_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * ok_label = lv_label_create(ok_row);
+    lv_label_set_text(ok_label, "OK");
+    lv_obj_set_style_text_color(ok_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(ok_label, ui_size_20, 0);
+    lv_obj_center(ok_label);
+}
+
+static void show_error_toast(const char * msg) {
+    lv_label_set_text(error_toast_label, msg);
+    lv_obj_remove_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(error_toast);
+    lv_timer_reset(error_toast_hide_timer);
+    lv_timer_resume(error_toast_hide_timer);
+}
+
+/* Shows the popup at the given 0-100 level and (re)starts its 1.5s
+ * auto-hide countdown -- called every time the level actually changes, so
+ * it stays visible for as long as the user keeps pressing volume buttons. */
+static void show_volume_popup(int32_t percent) {
+    lv_slider_set_value(volume_popup_track, percent, LV_ANIM_OFF);
+    lv_obj_remove_flag(volume_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_reset(volume_popup_hide_timer);
+    lv_timer_resume(volume_popup_hide_timer);
+}
+
+/* Quick-access drawer (Android-style notification-shade convention): slides
+ * down over the whole screen from a swipe-down starting near the status
+ * bar. Real pull_down/ theme2 assets throughout. Every row-1 icon (Wifi/
+ * Bluetooth, mirroring the same wifi_status.c/bluetooth_control.c state as
+ * the main status bar; crossfade; sleep timer) and the now-playing card
+ * (real playback state, reusing the exact same callbacks as the player
+ * screen's own transport buttons) are backed by real functionality.
+ * QUICK_DRAWER_ANIM_MS/TRIGGER_ZONE are defined earlier, alongside
+ * screen_gesture_event_cb, which needs the latter for its
+ * swipe-down-near-the-top-edge check. */
+
+/* Real control now -- see crossfade_switch_event_cb (Settings > Crossfade)
+ * for the other half of this same toggle; both read/write
+ * current_settings.crossfade_enabled and both keep the OTHER one's icon/
+ * switch state in sync via refresh_quick_drawer_crossfade_icon(), so
+ * whichever one you use, the other reflects it next time you look. Uses
+ * pull_down/fade.png/fade_s.png (a real stock asset, dedicated to this --
+ * confirmed by name, unlike gain_h.png/gain_l.png this used to show, which
+ * was always a placeholder for "output gain", never a real control). */
+static lv_obj_t * quick_drawer_crossfade_icon;
+static void refresh_quick_drawer_crossfade_icon(void) {
+    if (!quick_drawer_crossfade_icon) return;
+    lv_image_set_src(quick_drawer_crossfade_icon,
+                     asset_path(current_settings.crossfade_enabled ? "pull_down/fade_s.png" : "pull_down/fade.png"));
+}
+static void quick_drawer_crossfade_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    current_settings.crossfade_enabled = !current_settings.crossfade_enabled;
+    audio_set_crossfade_enabled(current_settings.crossfade_enabled);
+    settings_save(&current_settings);
+    refresh_quick_drawer_crossfade_icon();
+}
+
+/* Defined later, alongside the rest of the transport-button wiring --
+ * forward-declared here since poll_sleep_timer() below needs it on
+ * expiry. */
+static void toggle_play_pause(void);
+
+/* Sleep timer: tapping this icon arms/disarms a real countdown (current
+ * duration from current_settings.sleep_timer_minutes, configurable via
+ * Settings > Sleep Timer) that pauses playback once it elapses -- see
+ * poll_sleep_timer() (update_timer_cb) for the actual countdown/expiry
+ * logic. quick_drawer_sleep_label shows the remaining time below the icon
+ * while armed, per real-device feedback wanting a visible countdown, not
+ * just an on/off glow -- hidden the rest of the time. Session-only state
+ * (sleep_timer_active): arming isn't persisted, so a relaunch never resumes
+ * a stale countdown from a previous session. */
+static bool sleep_timer_active = false;
+static uint32_t sleep_timer_start_tick = 0;
+static lv_obj_t * quick_drawer_sleep_icon;
+static lv_obj_t * quick_drawer_sleep_label;
+static void quick_drawer_sleep_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    sleep_timer_active = !sleep_timer_active;
+    if (sleep_timer_active) {
+        sleep_timer_start_tick = lv_tick_get();
+        lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch_s.png"));
+        lv_label_set_text_fmt(quick_drawer_sleep_label, "%dm", current_settings.sleep_timer_minutes);
+        lv_obj_remove_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
+        lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Called every update_timer_cb tick (500ms). Cheap no-op when not armed. */
+static void poll_sleep_timer(void) {
+    if (!sleep_timer_active) return;
+
+    uint32_t total_ms = (uint32_t) current_settings.sleep_timer_minutes * 60000;
+    uint32_t elapsed_ms = lv_tick_elaps(sleep_timer_start_tick);
+
+    if (elapsed_ms >= total_ms) {
+        sleep_timer_active = false;
+        if (audio_is_playing()) toggle_play_pause(); /* pause, not stop -- resumable, same as any other pause */
+        lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
+        lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    /* Round up so the label never shows "0m" for the last, still-live
+     * sub-minute stretch -- counts down 15,14,...,1 then disarms above
+     * rather than ever displaying a misleading zero. */
+    int remaining_min = (int) ((total_ms - elapsed_ms + 59999) / 60000);
+    lv_label_set_text_fmt(quick_drawer_sleep_label, "%dm", remaining_min);
+}
+
+static void quick_drawer_anim_y_cb(void * var, int32_t v) {
+    lv_obj_set_y((lv_obj_t *) var, v);
+}
+
+static void open_quick_drawer(void) {
+    if (quick_drawer_open) return;
+    quick_drawer_open = true;
+    lv_obj_move_foreground(quick_drawer); /* above regular screens/volume popup while showing */
+    /* ...but the status bar (clock/battery/wifi/bt) stays above THAT --
+     * real-hardware feedback wanted it to stay visible/readable the whole
+     * time the drawer is open, not get covered by it. quick_drawer's own
+     * pull_down/bg.png is opaque black for the first ~59px anyway (measured
+     * directly off the asset), so the status bar ends up sitting on that as
+     * a backdrop rather than on anything from the screen underneath. */
+    lv_obj_move_foreground(status_bar_band);
+    /* Real-device bug report: "drawer animation is sluggish" -- root cause
+     * was two (or more) of these animations running concurrently, not a
+     * rendering-speed problem. lv_anim_start() only dedupes same-var/
+     * same-exec_cb animations via its own early_apply path (see
+     * remove_concurrent_anims() in lv_anim.c), which this never opts into
+     * -- so a second open/close triggered before a prior 120ms animation
+     * finished (an easy thing to do with a quick double-flick, or
+     * re-grabbing the drawer to drag again right after a release-snap)
+     * left BOTH animations alive, each calling quick_drawer_anim_y_cb with
+     * its own diverging interpolated Y every tick and visibly fighting
+     * each other -- indistinguishable from slow/janky rendering unless you
+     * know to look for it. Explicitly cancelling any prior animation on
+     * this exact (var, exec_cb) pair before starting a new one removes
+     * that race entirely. */
+    lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, quick_drawer);
+    lv_anim_set_values(&a, lv_obj_get_y(quick_drawer), 0);
+    lv_anim_set_duration(&a, QUICK_DRAWER_ANIM_MS);
+    lv_anim_set_exec_cb(&a, quick_drawer_anim_y_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void close_quick_drawer(void) {
+    if (!quick_drawer_open) return;
+    quick_drawer_open = false;
+    int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
+    lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb); /* see open_quick_drawer()'s own comment on why */
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, quick_drawer);
+    lv_anim_set_values(&a, lv_obj_get_y(quick_drawer), -h);
+    lv_anim_set_duration(&a, QUICK_DRAWER_ANIM_MS);
+    lv_anim_set_exec_cb(&a, quick_drawer_anim_y_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static bool quick_drawer_drag_tracking = false;
+static bool quick_drawer_was_pressed = false;
+static int32_t quick_drawer_drag_touch_start_y = 0;
+static int32_t quick_drawer_drag_panel_start_y = 0;
+static int32_t quick_drawer_last_velocity = 0;
+#define QUICK_DRAWER_FLICK_VELOCITY 12 /* px/tick (~750px/s at the ~16ms poll rate) -- fast enough to read as an intentional flick */
+#define QUICK_DRAWER_DRAG_DEADZONE 10 /* matches LVGL's own LV_INDEV_DEF_SCROLL_LIMIT -- see poll_quick_drawer_drag()'s comment */
+
+/* Home-indicator swipe-up tracking -- see build_home_indicator_bar()'s own
+ * comment for why this rides alongside the quick drawer's own drag tracking
+ * in poll_quick_drawer_drag() below instead of an LV_EVENT_GESTURE handler.
+ * Independent of quick_drawer_drag_tracking above (a press can only ever be
+ * the start of one or the other, decided by where it lands). */
+static bool home_swipe_tracking = false;
+static int32_t home_swipe_start_y = 0;
+static bool home_swipe_triggered = false; /* fires nav_reset_to_home() at most once per press, even if the finger keeps moving past the threshold */
+#define HOME_SWIPE_UP_THRESHOLD 40 /* px the finger must move up from its start point before this counts as a swipe, not a stray tap in the band */
+
+/* Swipe-left-to-player tracking -- same "raw indev polling, own dedicated
+ * fast timer" reasoning as poll_quick_drawer_drag()'s own doc comment,
+ * replacing the old LV_EVENT_GESTURE-based instant cut (see
+ * screen_gesture_event_cb()'s own comment on why that couldn't just be
+ * left running alongside this). Unlike the drawer's drag (claimed
+ * instantly, by which zone the press started in) or the home-swipe
+ * (claimed instantly, by starting inside a fixed band), this can start
+ * ANYWHERE on screen -- matching the gesture it replaces -- so which
+ * press this is can't be decided at press-down; it's provisional
+ * (player_swipe_candidate) until enough movement accumulates to judge
+ * direction, then either confirmed (player_swipe_tracking, the overlay
+ * gets built and starts following the finger) or abandoned, letting the
+ * press fall through as whatever else it actually was (a tap, a vertical
+ * scroll, or the existing swipe-RIGHT-to-back gesture, still handled the
+ * old event-based way since only entering the player needed this). */
+static bool player_swipe_candidate = false;
+static bool player_swipe_tracking = false;
+static int32_t player_swipe_touch_start_x = 0;
+static int32_t player_swipe_touch_start_y = 0;
+static int32_t player_swipe_last_v = 0; /* last x actually applied to img_from, for per-tick velocity -- same idea as quick_drawer_last_velocity */
+static int32_t player_swipe_last_velocity = 0;
+static slide_transition_ctx_t * player_swipe_ctx = NULL;
+#define PLAYER_SWIPE_DEADZONE 20 /* px before judging direction -- comfortably under LVGL's own ~50px built-in gesture threshold (LV_INDEV_DEF_GESTURE_LIMIT) so this always claims a genuine left-swipe before LVGL's own dormant gesture recognition would have */
+#define PLAYER_SWIPE_FLICK_VELOCITY 12 /* same scale/reasoning as QUICK_DRAWER_FLICK_VELOCITY */
+
+/* Drives the quick drawer's open/close by directly following the finger's
+ * raw Y position every tick -- "dynamic", per real-hardware feedback,
+ * rather than an instant threshold-triggered animation -- snapping to fully
+ * open or fully closed only once the finger actually lifts.
+ *
+ * Polled from its own dedicated fast lv_timer (see gui_init()) rather than
+ * update_timer_cb's existing 500ms one, or driven by touch events, for two
+ * separate reasons discovered in that order: first, LV_EVENT_PRESSED/
+ * RELEASED/CLICKED/LONG_PRESSED are the only events LVGL ever dispatches to
+ * an indev's own event list regardless of which object was actually hit
+ * (confirmed directly in lv_indev.c's send_event()) -- LV_EVENT_PRESSING is
+ * deliberately NOT among them, so a first attempt (an indev-wide
+ * LV_EVENT_PRESSING handler) silently never fired at all, and the attempt
+ * before THAT (the drawer's own LV_EVENT_GESTURE handler, relying on
+ * enable_gesture_bubble_recursive()) got swallowed whenever the swipe
+ * started on the 300px-wide brightness slider, deliberately excluded from
+ * gesture-bubbling for the same reason every other screen excludes its own
+ * sliders. Reading the indev's raw position directly instead sidesteps
+ * hit-testing entirely. Second, once switched to polling, real-device
+ * testing showed the drag still wasn't followed smoothly: it turned out
+ * update_timer_cb's 500ms period is far slower than a typical swipe (well
+ * under 300ms start to finish), so it was only ever sampling zero or one
+ * point per gesture -- hence this gets its own ~60fps timer instead. */
+static void poll_quick_drawer_drag(lv_timer_t * timer) {
+    (void) timer;
+    /* Not just lv_indev_get_next(NULL) -- the target build only ever
+     * registers the one touchscreen indev, but the host simulator also
+     * registers a keyboard indev (see main.c's lv_sdl_keyboard_create()),
+     * and there's no guarantee which one comes back first. Explicitly
+     * finding the pointer-type one is correct on both. */
+    lv_indev_t * indev = NULL;
+    for (lv_indev_t * candidate = lv_indev_get_next(NULL); candidate; candidate = lv_indev_get_next(candidate)) {
+        if (lv_indev_get_type(candidate) == LV_INDEV_TYPE_POINTER) {
+            indev = candidate;
+            break;
+        }
+    }
+    if (!indev) return;
+
+    bool pressed = lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
+
+    if (pressed && !quick_drawer_was_pressed) {
+        /* Cancel any release-snap animation still in flight -- re-grabbing
+         * the drawer right after a flick (within its 120ms animation
+         * window) used to leave that old animation alive, fighting this
+         * new drag's own direct lv_obj_set_y() calls every tick (same
+         * underlying issue as open_quick_drawer()'s own comment on
+         * concurrent animations). Harmless/cheap no-op when nothing's
+         * actually animating. */
+        lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb);
+
+        /* A new press just started. If the drawer's already open, any press
+         * anywhere could be the start of a close-drag -- a plain tap on a
+         * button/slider still works fine, since a tap has ~0 movement and
+         * this only ever repositions the drawer by that same ~0 delta. If
+         * it's closed, only a press starting near the very top edge
+         * counts, so e.g. scrolling a list elsewhere never accidentally
+         * drags it open. Panel start reference is the drawer's ACTUAL
+         * current Y (not a fixed 0/-h assumption) -- with the animation
+         * just cancelled above, that could be mid-flight anywhere between
+         * fully open and fully closed, not only at one of the two
+         * endpoints. */
+        if (quick_drawer_open) {
+            quick_drawer_drag_tracking = true;
+            quick_drawer_drag_panel_start_y = lv_obj_get_y(quick_drawer);
+        } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE) {
+            quick_drawer_drag_tracking = true;
+            quick_drawer_drag_panel_start_y = lv_obj_get_y(quick_drawer);
+            lv_obj_move_foreground(quick_drawer); /* above regular screens/volume popup while dragging into view */
+            lv_obj_move_foreground(status_bar_band); /* but the status bar stays above THAT -- see open_quick_drawer()'s comment */
+        } else {
+            quick_drawer_drag_tracking = false;
+        }
+        quick_drawer_drag_touch_start_y = p.y;
+
+        /* Home-indicator swipe-up: only a press starting within the band
+         * itself counts, matching the Android gesture-bar convention this
+         * is modeled on (see build_home_indicator_bar()) -- a press
+         * anywhere else on screen never triggers this, even if it later
+         * moves upward (e.g. an aborted attempt to scroll a list).
+         * Real-device bug report: with the drawer already open, ANY press
+         * is presumed to be the start of a close-drag (see quick_drawer_open
+         * branch just above) regardless of where on screen it starts --
+         * competing for the same swipe-up gesture let a single upward drag
+         * both close the drawer AND jump to Home. Excluded outright while
+         * the drawer is open; the drawer itself always wins that gesture
+         * there. */
+        home_swipe_tracking = current_settings.swipe_up_home_enabled && !quick_drawer_open &&
+                               p.y >= h - HOME_INDICATOR_BAND_HEIGHT;
+        home_swipe_start_y = p.y;
+        home_swipe_triggered = false;
+
+        /* Player-swipe: eligible unless this exact press already got
+         * claimed by the drawer-drag above (quick_drawer_drag_tracking),
+         * the drawer is open (its own close-drag owns every press while
+         * open), or the player screen is already the one showing (nothing
+         * to swipe TO). Real direction isn't knowable from a single point
+         * -- judged once real movement accumulates, below -- so this only
+         * marks the press as a CANDIDATE, not yet a confirmed drag. */
+        player_swipe_candidate = !quick_drawer_drag_tracking && !quick_drawer_open &&
+                                  lv_screen_active() != player_screen;
+        player_swipe_touch_start_x = p.x;
+        player_swipe_touch_start_y = p.y;
+        player_swipe_tracking = false;
+    }
+
+    if (pressed && home_swipe_tracking && !home_swipe_triggered && home_swipe_start_y - p.y >= HOME_SWIPE_UP_THRESHOLD) {
+        home_swipe_triggered = true;
+        nav_reset_to_home();
+    }
+
+    if (pressed && player_swipe_candidate && !player_swipe_tracking) {
+        int32_t dx = p.x - player_swipe_touch_start_x;
+        int32_t dy = p.y - player_swipe_touch_start_y;
+        int32_t adx = dx < 0 ? -dx : dx;
+        int32_t ady = dy < 0 ? -dy : dy;
+        if (adx >= PLAYER_SWIPE_DEADZONE || ady >= PLAYER_SWIPE_DEADZONE) {
+            /* Enough movement to judge direction. Horizontal-left-dominant
+             * confirms it; anything else (vertical, or rightward) rules it
+             * out for good -- either way, stop re-checking every tick. */
+            if (dx < 0 && adx > ady) {
+                player_swipe_ctx = begin_slide_transition(player_screen, true, true); /* force a real snapshot -- see begin_slide_transition()'s own comment on why the live-alias path flickers here */
+                if (player_swipe_ctx) {
+                    player_swipe_tracking = true;
+                    player_swipe_last_v = 0;
+                    player_swipe_last_velocity = 0;
+                    /* Same reasoning as nav_pop()'s own lv_indev_wait_release()
+                     * call -- the overlay just created sits directly under
+                     * this still-down finger, and without this, the eventual
+                     * release would hit whatever's now underneath at that
+                     * coordinate instead (a real screen swap mid-press, same
+                     * PRESS_LOST-adjacent class of bug already found and
+                     * fixed once for the drawer's own icons). */
+                    lv_indev_wait_release(indev);
+                }
+            }
+            player_swipe_candidate = false;
+        }
+    }
+
+    if (pressed && player_swipe_tracking) {
+        int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
+        int32_t v = p.x - player_swipe_touch_start_x;
+        if (v > 0) v = 0;   /* never past fully-open (finger drifting back right of the start point just holds at 0) */
+        if (v < -w) v = -w; /* never past fully-off (finger overshooting left of a full screen width) */
+        player_swipe_last_velocity = v - player_swipe_last_v;
+        player_swipe_last_v = v;
+        slide_transition_anim_x_cb(player_swipe_ctx, v);
+    }
+
+    if (pressed && quick_drawer_drag_tracking) {
+        /* Deadzone before actually moving the panel -- real-device feedback:
+         * long-pressing a drawer icon (wifi/bt) wasn't opening its settings
+         * screen at all. Root cause, confirmed by reading indev_proc_press()
+         * in lv_indev.c: it re-hit-tests the SAME raw screen point on every
+         * tick, and if that now resolves to a different object than the one
+         * originally pressed, LVGL sends PRESS_LOST and resets the press --
+         * killing the long-press timer before it can fire. Moving the whole
+         * drawer (and everything on it, including the icon under the
+         * finger) by even a couple of px in response to ordinary touch
+         * jitter during a "held still" long-press was exactly triggering
+         * that. 10px matches LVGL's own LV_INDEV_DEF_SCROLL_LIMIT -- the
+         * same threshold it uses internally to tell a stationary press from
+         * an intentional scroll/drag. Below it, the panel doesn't move at
+         * all, so a tap or long-press on a child stays stable under the
+         * finger; past it, the deadzone amount is subtracted so dragging
+         * starts smoothly from zero rather than jumping. */
+        int32_t raw_delta = p.y - quick_drawer_drag_touch_start_y;
+        if (raw_delta > QUICK_DRAWER_DRAG_DEADZONE || raw_delta < -QUICK_DRAWER_DRAG_DEADZONE) {
+            int32_t adjusted_delta = raw_delta > 0 ? raw_delta - QUICK_DRAWER_DRAG_DEADZONE
+                                                    : raw_delta + QUICK_DRAWER_DRAG_DEADZONE;
+            int32_t new_y = quick_drawer_drag_panel_start_y + adjusted_delta;
+            if (new_y > 0) new_y = 0;
+            if (new_y < -h) new_y = -h;
+            /* Per-tick velocity, in case the finger lifts mid-flick (see the
+             * release branch below) -- a plain position delta rather than
+             * lv_indev_get_vect() so it's driven by the exact same samples
+             * this function already reads, not a second/possibly-
+             * differently-timed source. */
+            quick_drawer_last_velocity = new_y - lv_obj_get_y(quick_drawer);
+            lv_obj_set_y(quick_drawer, new_y);
+        } else {
+            quick_drawer_last_velocity = 0;
+        }
+    }
+
+    if (!pressed && quick_drawer_was_pressed && quick_drawer_drag_tracking) {
+        /* Finger lifted. A fast flick -- real-hardware feedback: "a quick
+         * swap [that] goes back to closed"/"keeps open" -- often doesn't
+         * travel far enough to cross the halfway rubber-band point before
+         * the finger leaves, even though the user's intent was obvious from
+         * how fast it moved. Falls back to the halfway position check only
+         * for a slow/undecided drag that ends with little to no velocity. */
+        quick_drawer_drag_tracking = false;
+        bool snap_open;
+        if (quick_drawer_last_velocity > QUICK_DRAWER_FLICK_VELOCITY) {
+            snap_open = true; /* still moving down at release */
+        } else if (quick_drawer_last_velocity < -QUICK_DRAWER_FLICK_VELOCITY) {
+            snap_open = false; /* still moving up at release */
+        } else {
+            snap_open = lv_obj_get_y(quick_drawer) > -h / 2;
+        }
+        /* open_quick_drawer()/close_quick_drawer() animate from the
+         * drawer's CURRENT (mid-drag) position, so forcing quick_drawer_open
+         * to the opposite state first just defeats their own early-return
+         * guard rather than fighting the animation. */
+        if (snap_open) {
+            quick_drawer_open = false;
+            open_quick_drawer();
+        } else {
+            quick_drawer_open = true;
+            close_quick_drawer();
+        }
+    }
+
+    if (!pressed && quick_drawer_was_pressed && player_swipe_tracking) {
+        /* Finger lifted mid-swipe. Same flick-vs-halfway decision as the
+         * drawer's own release logic just above, just horizontal. */
+        player_swipe_tracking = false;
+        int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
+        int32_t current_v = lv_obj_get_x(player_swipe_ctx->img_from);
+        bool commit;
+        if (player_swipe_last_velocity < -PLAYER_SWIPE_FLICK_VELOCITY) {
+            commit = true; /* still moving left fast at release */
+        } else if (player_swipe_last_velocity > PLAYER_SWIPE_FLICK_VELOCITY) {
+            commit = false; /* still moving back right fast at release */
+        } else {
+            commit = current_v < -w / 2; /* past halfway, slow/undecided release */
+        }
+        player_swipe_ctx->commit = commit;
+        if (commit) {
+            /* Stack bookkeeping mirroring nav_push()'s own -- the real
+             * lv_screen_load() happens inside slide_transition_done_cb()
+             * once this settle animation finishes, not here; nothing else
+             * reads the nav stack before then, so only the bookkeeping
+             * needs to be right immediately. */
+            if (nav_depth < NAV_STACK_MAX && !(nav_depth > 0 && nav_stack[nav_depth - 1] == player_screen)) {
+                nav_stack[nav_depth++] = player_screen;
+            }
+        }
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, player_swipe_ctx);
+        lv_anim_set_user_data(&a, player_swipe_ctx);
+        lv_anim_set_values(&a, current_v, commit ? -w : 0);
+        lv_anim_set_duration(&a, QUICK_DRAWER_ANIM_MS); /* short settle, same duration class as the drawer's own release-snap */
+        lv_anim_set_exec_cb(&a, slide_transition_anim_x_cb);
+        lv_anim_set_completed_cb(&a, slide_transition_done_cb);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+        player_swipe_ctx = NULL;
+    }
+
+    quick_drawer_was_pressed = pressed;
+}
+
+/* Forward declarations -- defined later in this file (with the player
+ * screen's own transport buttons, which they were originally written for),
+ * but the quick drawer's mini now-playing card reuses them verbatim. */
+static void favorite_icon_event_cb(lv_event_t * e);
+static void prev_btn_event_cb(lv_event_t * e);
+static void play_btn_event_cb(lv_event_t * e);
+static void next_btn_event_cb(lv_event_t * e);
+static const char * play_mode_icon_asset(play_mode_t mode);
+static const char * basename_of(const char * path);
+static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
+/* Defined much later, alongside the rest of the new Wi-Fi/Bluetooth
+ * screens -- long-pressing the drawer's wifi/bt icons opens the real
+ * settings screen for that radio, matching Android's quick-settings
+ * convention (tap toggles, long-press opens the full screen). */
+static void open_wifi_screen(void);
+static void open_bluetooth_screen(void);
+
+/* Long-press handlers for the drawer's wifi/bt icons -- hides the drawer
+ * instantly (no slide-out animation; the settings screen navigation is
+ * about to slide in over it anyway) then opens the real settings screen.
+ *
+ * Real-device incident: LVGL still sends LV_EVENT_CLICKED on release even
+ * when LV_EVENT_LONG_PRESSED already fired earlier in that same press --
+ * confirmed directly in lv_indev.c's indev_proc_release(), which doesn't
+ * check whether a long-press was already sent before deciding a release
+ * without enough movement counts as a click. Without this flag, a
+ * long-press opened the settings screen AND, on release, the click handler
+ * fired right behind it and toggled the radio -- e.g. long-pressing the
+ * wifi icon opened Wi-Fi settings but also turned wifi off. Each click
+ * handler below checks and clears its own flag first, skipping its toggle
+ * entirely when the long-press already handled this press. */
+static bool quick_drawer_wifi_long_press_fired = false;
+static bool quick_drawer_bt_long_press_fired = false;
+
+static void quick_drawer_wifi_long_press_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+    quick_drawer_wifi_long_press_fired = true;
+    quick_drawer_open = false;
+    lv_obj_set_y(quick_drawer, -lv_display_get_vertical_resolution(lv_display_get_default()));
+    open_wifi_screen();
+}
+
+static void quick_drawer_bt_long_press_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+    quick_drawer_bt_long_press_fired = true;
+    quick_drawer_open = false;
+    lv_obj_set_y(quick_drawer, -lv_display_get_vertical_resolution(lv_display_get_default()));
+    open_bluetooth_screen();
+}
+
+/* Real tap-to-toggle for the wifi icon -- unlike quick_drawer_bt_event_cb
+ * (a purely local sprite swap, "no real backend" per its own comment), wifi
+ * actually has one (wifi_control_enable()/disable()), it just was never
+ * wired to anything that could turn it back OFF: the only existing caller,
+ * wifi_scan_thread_func(), only ever enables it (auto-enabling when the
+ * Wi-Fi settings screen is opened), so wifi previously could only ever go
+ * from off to on, matching the "stays on all the time" real-device report.
+ * enable()/disable() each block for about a second, so this runs on its own
+ * thread, polled the same way as every other background op in this file. */
+static pthread_t wifi_toggle_thread;
+static bool wifi_toggle_active = false;
+static volatile bool wifi_toggle_done_flag = false;
+
+static void * wifi_toggle_thread_func(void * arg) {
+    (void) arg;
+    if (wifi_control_is_enabled()) wifi_control_disable();
+    else wifi_control_enable();
+    wifi_toggle_done_flag = true; /* written last -- poll_wifi_toggle only checks this flag */
+    return NULL;
+}
+
+static void quick_drawer_wifi_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (quick_drawer_wifi_long_press_fired) { /* see quick_drawer_wifi_long_press_cb()'s own comment */
+        quick_drawer_wifi_long_press_fired = false;
+        return;
+    }
+    if (wifi_toggle_active) return; /* already toggling -- ignore taps until it lands */
+    wifi_toggle_active = true;
+    wifi_toggle_done_flag = false;
+    pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL);
+}
+
+static void populate_wifi_screen(void); /* defined with the rest of the Wi-Fi settings screen, below */
+
+static void poll_wifi_toggle(void) {
+    if (!wifi_toggle_active || !wifi_toggle_done_flag) return;
+    wifi_toggle_active = false;
+    pthread_join(wifi_toggle_thread, NULL);
+    refresh_wifi_icon(); /* re-reads the real state -- updates both the status bar and drawer icons */
+    populate_wifi_screen(); /* the Wi-Fi screen's own toggle row + everything gated on it needs the same refresh */
+}
+
+/* Same real tap-to-toggle treatment for Bluetooth, mirroring the wifi
+ * mechanism above -- bluetoothctl's power on/off each block for about a
+ * second, so this runs on its own thread too. Turning ON additionally
+ * brings up the chip first via bt_control_init_chip() if it isn't already
+ * (no-op once hci0 exists) -- see that function's own comment for why this,
+ * not just bluetoothctl power on, is what actually makes the toggle work at
+ * all on a fresh boot. */
+static pthread_t bt_toggle_thread;
+static bool bt_toggle_active = false;
+static volatile bool bt_toggle_done_flag = false;
+
+static lv_obj_t * subsonic_downloading_screen; /* forward decl -- fully built below with the rest of that shared screen */
+static lv_obj_t * subsonic_downloading_label;
+
+/* Set by bt_toggle_thread_func() when disabling Bluetooth while DAC mode
+ * was on -- consumed by poll_bt_toggle() to turn the setting off and close
+ * the DAC overlay screen if it's the one currently showing. */
+static bool bt_toggle_forced_dac_off = false;
+
+static void * bt_toggle_thread_func(void * arg) {
+    (void) arg;
+    bt_toggle_forced_dac_off = false;
+    if (bt_control_is_powered()) {
+        /* Real-device incident: turning Bluetooth off via the quick drawer
+         * while Bluetooth DAC mode was still on left bluealsa/bt-agent
+         * (spawned by bt_control_apply_output_settings() when DAC mode
+         * turned on) running orphaned against an adapter that was about to
+         * be powered off out from under them -- confirmed to corrupt
+         * bluetoothd's own adapter registration (hci0 stayed up fine at
+         * the kernel level, but bluetoothd stopped seeing it entirely,
+         * "No default controller available", and Bluetooth couldn't be
+         * re-enabled again until bluetoothd was manually restarted). Tear
+         * DAC mode's processes down first, same call
+         * bt_dac_leave_confirm_cb() uses, before disabling the radio. */
+        if (current_settings.bt_dac_mode_enabled) {
+            bt_control_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
+            bt_toggle_forced_dac_off = true;
+        }
+        bt_control_disable();
+    } else {
+        bt_control_init_chip();
+        bt_control_enable();
+    }
+    bt_toggle_done_flag = true; /* written last -- poll_bt_toggle only checks this flag */
+    return NULL;
+}
+
+static void quick_drawer_bt_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (quick_drawer_bt_long_press_fired) { /* see quick_drawer_bt_long_press_cb()'s own comment */
+        quick_drawer_bt_long_press_fired = false;
+        return;
+    }
+    if (bt_toggle_active) return; /* already toggling -- ignore taps until it lands */
+    bt_toggle_active = true;
+    bt_toggle_done_flag = false;
+
+    /* Runs fully in the background, same as the stock player -- no busy
+     * screen. Turning on cold can take ~10-13s (bt_control_init_chip()),
+     * during which the drawer's own bt icon is the only feedback (still
+     * whatever it showed before the tap, until refresh_bt_icon() catches
+     * up once this thread finishes). An earlier version pushed a "Turning
+     * on Bluetooth..." interstitial here, shared with wifi/bt scan's own
+     * overlay -- see git history if that's ever needed again, but it was
+     * also the source of a real, repeatedly-hit stuck-screen bug (multiple
+     * uncoordinated users of one shared overlay), which not having an
+     * overlay at all sidesteps entirely. */
+    pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL);
+}
+
+static lv_obj_t * bt_dac_overlay_screen; /* fully built with the rest of the Bluetooth DAC screen, below */
+
+static void poll_bt_toggle(void) {
+    if (!bt_toggle_active || !bt_toggle_done_flag) return;
+    bt_toggle_active = false;
+    pthread_join(bt_toggle_thread, NULL);
+
+    if (bt_toggle_forced_dac_off) {
+        current_settings.bt_dac_mode_enabled = false;
+        settings_save(&current_settings);
+        /* Bluetooth just got disabled out from under DAC mode -- if its
+         * overlay is the screen currently showing, staying on it is
+         * meaningless (there's no Bluetooth left to receive audio over),
+         * so close it automatically instead of leaving a "Bluetooth DAC
+         * mode" screen up with nothing backing it. */
+        if (lv_screen_active() == bt_dac_overlay_screen) nav_pop();
+    }
+
+    /* start_refresh_bt_icon() only starts the background check -- it
+     * hasn't updated bt_is_powered_cached yet by the time this returns, so
+     * populate_bt_screen() (which now reads that cache, not a fresh
+     * bt_control_is_powered() call -- see its own comment) can't be called
+     * here too or the Bluetooth screen's toggle row would show stale
+     * (pre-toggle) state until something else happens to repopulate it.
+     * poll_refresh_bt_icon() calls populate_bt_screen() itself once the
+     * cache is actually fresh. */
+    start_refresh_bt_icon(); /* re-reads the real state -- updates the status bar/drawer icons and (once done) the Bluetooth screen's toggle row */
+}
+
+/* Real-device incident: bt_dac_enable_row_cb() is the ONLY call site for
+ * bt_control_apply_output_settings() -- current_settings.bt_dac_mode_enabled
+ * is persisted to disk, so if it was left on at the end of a previous
+ * session, this app's UI comes back up on next launch already showing the
+ * toggle as on (and correctly blocking local playback via
+ * external_dac_block_reason()), but the actual bluealsa/bt-agent processes
+ * that make a Bluetooth DAC connection possible were never started this
+ * boot -- confirmed on a real device: the toggle read "on", yet no device
+ * could connect at all (bluealsa/bt-agent simply weren't running). This
+ * reapplies the persisted state once at startup, mirroring
+ * bt_toggle_thread_func() (chip init can take ~10-13s on a fresh boot, so
+ * this can't block gui_init() / the UI thread). */
+static pthread_t bt_dac_startup_reapply_thread;
+static bool bt_dac_startup_reapply_active = false;
+static volatile bool bt_dac_startup_reapply_done_flag = false;
+
+static void * bt_dac_startup_reapply_thread_func(void * arg) {
+    (void) arg;
+    bt_control_init_chip();
+    bt_control_enable();
+    bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
+    bt_dac_startup_reapply_done_flag = true; /* written last -- poll_bt_dac_startup_reapply only checks this flag */
+    return NULL;
+}
+
+/* Called once from gui_init(), only if bt_dac_mode_enabled was already true
+ * at load time (a fresh toggle-on tap already goes through
+ * bt_dac_toggle_cb() directly and doesn't need this). */
+static void start_bt_dac_startup_reapply_if_needed(void) {
+    if (!current_settings.bt_dac_mode_enabled) return;
+    bt_dac_startup_reapply_active = true;
+    bt_dac_startup_reapply_done_flag = false;
+    pthread_create(&bt_dac_startup_reapply_thread, NULL, bt_dac_startup_reapply_thread_func, NULL);
+}
+
+static void poll_bt_dac_startup_reapply(void) {
+    if (!bt_dac_startup_reapply_active || !bt_dac_startup_reapply_done_flag) return;
+    bt_dac_startup_reapply_active = false;
+    pthread_join(bt_dac_startup_reapply_thread, NULL);
+    start_refresh_bt_icon();
+}
+
+/* Real-device incident: bt_dac_toggle_cb(), bt_volume_sync_toggle_cb(), and
+ * airplay_toggle_cb() (when turning AirPlay on forces Bluetooth DAC off)
+ * all called bt_control_apply_output_settings() directly from their LVGL
+ * click handlers, i.e. on the UI thread -- despite that function's own doc
+ * comment already saying "blocking, call off the UI thread". Confirmed on a
+ * real device: it kills and respawns bluealsa/bt-agent/bluealsa-aplay with
+ * two separate 500ms sleeps plus several subprocess spawns baked in, easily
+ * 1-3+ seconds of pure blocking -- since lv_timer_handler() runs on this
+ * same thread, that froze the entire UI (no redraws, no touch input at all)
+ * for the whole duration, with whatever screen happened to be showing at
+ * that instant stuck on screen looking unresponsive, no way to back out of
+ * it, until the call finally returned. This backgrounds it the same way
+ * every other slow Bluetooth/Wi-Fi operation in this file already is. */
+static pthread_t bt_apply_output_settings_thread;
+static bool bt_apply_output_settings_active = false;
+static volatile bool bt_apply_output_settings_done_flag = false;
+
+typedef struct {
+    bool dac_mode_enabled;
+    bool volume_sync_enabled;
+} bt_apply_output_settings_request_t;
+
+static void * bt_apply_output_settings_thread_func(void * arg) {
+    bt_apply_output_settings_request_t * req = (bt_apply_output_settings_request_t *) arg;
+    bt_control_apply_output_settings(req->dac_mode_enabled, req->volume_sync_enabled);
+    free(req);
+    bt_apply_output_settings_done_flag = true; /* written last -- poll_bt_apply_output_settings only checks this flag */
+    return NULL;
+}
+
+/* Silently ignores overlap (another apply already in flight) rather than
+ * queuing -- same "ignore taps until it lands" treatment as
+ * quick_drawer_bt_event_cb()/quick_drawer_wifi_event_cb() use for their own
+ * slow operations, and the current_settings values the caller already wrote
+ * before calling this are what the eventually-scheduled apply would use
+ * anyway once the in-flight one finishes and the screen is re-populated. */
+static void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled) {
+    if (bt_apply_output_settings_active) return;
+    bt_apply_output_settings_request_t * req = malloc(sizeof(*req));
+    req->dac_mode_enabled = dac_mode_enabled;
+    req->volume_sync_enabled = volume_sync_enabled;
+    bt_apply_output_settings_done_flag = false;
+    bt_apply_output_settings_active = true;
+    pthread_create(&bt_apply_output_settings_thread, NULL, bt_apply_output_settings_thread_func, req);
+}
+
+static void populate_bt_dac_screen(void); /* defined with the rest of the Bluetooth DAC screen, below */
+
+static void poll_bt_apply_output_settings(void) {
+    if (!bt_apply_output_settings_active || !bt_apply_output_settings_done_flag) return;
+    bt_apply_output_settings_active = false;
+    pthread_join(bt_apply_output_settings_thread, NULL);
+    populate_bt_dac_screen(); /* the DAC screen's own toggle rows need the post-apply state */
+}
+
+/* pull_down/bg.png bakes in two fixed rounded panels (measured directly off
+ * the asset: a vertical scan for opaque-color transitions at x=240 finds
+ * flat color from y=59-338, a gap, then y=363-730; a horizontal scan finds
+ * the fill spanning x=19-459 either way) -- everything below is positioned
+ * against those measured bounds, not guessed, since anything placed outside
+ * them draws on the plain black gap/margin around the panels instead of
+ * inside the rounded box that's supposed to contain it (this is what was
+ * actually wrong before: row 1's icons started at STATUS_BAR_CLEARANCE-8=40,
+ * 19px above the real panel top of 59, and the card started at
+ * STATUS_BAR_CLEARANCE+250=298, 65px above the real second panel's top of
+ * 363). */
+#define QUICK_DRAWER_PANEL1_TOP 59
+#define QUICK_DRAWER_PANEL1_BOTTOM 338
+#define QUICK_DRAWER_PANEL2_TOP 363
+
+static void quick_drawer_brightness_changed_cb(lv_event_t * e) {
+    lv_obj_t * slider = (lv_obj_t *) lv_event_get_target(e);
+    int32_t percent = lv_slider_get_value(slider);
+    backlight_set_percent((int) percent);
+    lv_obj_t * label = (lv_obj_t *) lv_event_get_user_data(e);
+    lv_label_set_text_fmt(label, "%d%%", (int) percent);
+}
+
+static void build_quick_drawer(void) {
+    int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
+    int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
+
+    quick_drawer = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(quick_drawer);
+    lv_obj_set_size(quick_drawer, w, h);
+    lv_obj_set_pos(quick_drawer, 0, -h); /* fully off-screen above until opened */
+    lv_obj_set_style_bg_image_src(quick_drawer, asset_path("pull_down/bg.png"), 0);
+    lv_obj_set_style_bg_opa(quick_drawer, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(quick_drawer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(quick_drawer, LV_OBJ_FLAG_CLICKABLE); /* swallow touches to whatever's behind while open */
+
+    /* Row 1: every toggle icon (Bluetooth / Wifi / sleep timer / output
+     * gain) together in one row -- 4 icons x 84px + 5 gaps of 21px exactly
+     * fills the panel's measured 440px content width (19 to 459). No clock,
+     * no volume slider here anymore (clock duplicated the always-visible
+     * main status bar; a second volume control duplicated the hardware
+     * volume buttons' own popup) -- brightness (row 2 below) is the only
+     * slider left in this drawer. */
+    quick_drawer_wifi_icon = lv_image_create(quick_drawer);
+    lv_image_set_src(quick_drawer_wifi_icon, asset_path("pull_down/wifi.png"));
+    lv_obj_align(quick_drawer_wifi_icon, LV_ALIGN_TOP_LEFT, 40, QUICK_DRAWER_PANEL1_TOP + 30);
+    lv_obj_add_flag(quick_drawer_wifi_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(quick_drawer_wifi_icon, quick_drawer_wifi_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(quick_drawer_wifi_icon, quick_drawer_wifi_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
+
+    quick_drawer_bt_icon = lv_image_create(quick_drawer);
+    lv_image_set_src(quick_drawer_bt_icon, asset_path("pull_down/bt.png"));
+    lv_obj_align(quick_drawer_bt_icon, LV_ALIGN_TOP_LEFT, 145, QUICK_DRAWER_PANEL1_TOP + 30);
+    lv_obj_add_flag(quick_drawer_bt_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(quick_drawer_bt_icon, quick_drawer_bt_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(quick_drawer_bt_icon, quick_drawer_bt_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
+
+    quick_drawer_sleep_icon = lv_image_create(quick_drawer);
+    lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
+    lv_obj_align(quick_drawer_sleep_icon, LV_ALIGN_TOP_LEFT, 250, QUICK_DRAWER_PANEL1_TOP + 30);
+    lv_obj_add_flag(quick_drawer_sleep_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(quick_drawer_sleep_icon, quick_drawer_sleep_event_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Countdown while armed -- see quick_drawer_sleep_event_cb()/
+     * poll_sleep_timer()'s own comments. Hidden until armed, centered under
+     * the 84px-wide icon above it. */
+    quick_drawer_sleep_label = lv_label_create(quick_drawer);
+    lv_obj_set_style_text_color(quick_drawer_sleep_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_text_font(quick_drawer_sleep_label, ui_size_16, 0);
+    lv_obj_set_width(quick_drawer_sleep_label, 84);
+    lv_obj_set_style_text_align(quick_drawer_sleep_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(quick_drawer_sleep_label, LV_ALIGN_TOP_LEFT, 250, QUICK_DRAWER_PANEL1_TOP + 30 + 84 + 4);
+    lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
+
+    quick_drawer_crossfade_icon = lv_image_create(quick_drawer);
+    lv_obj_align(quick_drawer_crossfade_icon, LV_ALIGN_TOP_LEFT, 355, QUICK_DRAWER_PANEL1_TOP + 30);
+    lv_obj_add_flag(quick_drawer_crossfade_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(quick_drawer_crossfade_icon, quick_drawer_crossfade_event_cb, LV_EVENT_CLICKED, NULL);
+    refresh_quick_drawer_crossfade_icon();
+
+    /* Row 2: screen brightness -- real control, via the standard Linux
+     * backlight sysfs class (backlight.h), no dedicated slider-track asset
+     * in this theme so it reuses the (generic-looking) volume slider's own. */
+    lv_obj_t * brightness_icon = lv_image_create(quick_drawer);
+    lv_image_set_src(brightness_icon, asset_path("pull_down/blk.png"));
+    lv_obj_align(brightness_icon, LV_ALIGN_TOP_LEFT, 40, QUICK_DRAWER_PANEL1_TOP + 174);
+
+    lv_obj_t * brightness_label = lv_label_create(quick_drawer);
+    lv_obj_set_style_text_color(brightness_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(brightness_label, ui_size_20, 0);
+    lv_obj_align(brightness_label, LV_ALIGN_TOP_RIGHT, -20, QUICK_DRAWER_PANEL1_TOP + 177);
+
+    lv_obj_t * brightness_track = lv_slider_create(quick_drawer);
+    lv_obj_set_size(brightness_track, 300, 12);
+    lv_obj_align(brightness_track, LV_ALIGN_TOP_LEFT, 90, QUICK_DRAWER_PANEL1_TOP + 185);
+    lv_slider_set_range(brightness_track, BACKLIGHT_MIN_PERCENT, 100);
+    int initial_brightness = backlight_get_percent();
+    if (initial_brightness < BACKLIGHT_MIN_PERCENT) initial_brightness = 100; /* host / no backlight node -- harmless placeholder */
+    lv_slider_set_value(brightness_track, initial_brightness, LV_ANIM_OFF);
+    lv_label_set_text_fmt(brightness_label, "%d%%", initial_brightness);
+    lv_obj_set_style_bg_color(brightness_track, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(brightness_track, lv_color_black(), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(brightness_track, lv_color_black(), LV_PART_KNOB);
+    lv_obj_set_style_bg_image_src(brightness_track, asset_path("volume/vol_bg.png"), LV_PART_MAIN);
+    lv_obj_set_style_bg_image_src(brightness_track, asset_path("volume/vol_progress.png"), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_image_src(brightness_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(brightness_track, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(brightness_track, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(brightness_track, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_width(brightness_track, 26, LV_PART_KNOB);
+    lv_obj_set_style_height(brightness_track, 26, LV_PART_KNOB);
+    lv_obj_add_event_cb(brightness_track, quick_drawer_brightness_changed_cb, LV_EVENT_VALUE_CHANGED, brightness_label);
+
+    /* Mini now-playing card: real track title/artist/transport, reusing the
+     * exact same callbacks as the player screen's own buttons. Transparent
+     * -- it sits directly on the second bg.png panel (which already is a
+     * rounded dark box) rather than drawing a second, slightly-differently
+     * colored rounded rect on top of that one.
+     *
+     * Real-device feedback comparing against the stock drawer: this used
+     * to be only 200px tall, well short of the second panel's own measured
+     * 367px height (y=363-730, see build_quick_drawer()'s own panel-bounds
+     * comment) -- leaving most of the panel empty and the transport row
+     * sitting high up rather than low in the card like the stock
+     * reference. 330 leaves a comparable margin above the panel's bottom
+     * edge instead. */
+    lv_obj_t * card = lv_obj_create(quick_drawer);
+    lv_obj_set_size(card, 440, 330);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, QUICK_DRAWER_PANEL2_TOP + 12);
+    lv_obj_set_style_bg_opa(card, 0, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Title/artist centered (matching the stock drawer's own mini card,
+     * confirmed via a real-device screenshot comparison -- this was
+     * previously left-aligned with the favorite icon pinned separately in
+     * the top-right corner, not part of the transport row at all). Both
+     * need an explicit width for LV_TEXT_ALIGN_CENTER to have something to
+     * center within. */
+    quick_drawer_title_label = lv_label_create(card);
+    lv_label_set_text(quick_drawer_title_label, "No track loaded");
+    lv_obj_set_style_text_color(quick_drawer_title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(quick_drawer_title_label, &app_font_16, 0); /* see song_title_label's own comment */
+    lv_obj_set_width(quick_drawer_title_label, lv_pct(100));
+    lv_obj_set_style_text_align(quick_drawer_title_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(quick_drawer_title_label, LV_ALIGN_TOP_MID, 0, 14);
+
+    quick_drawer_artist_label = lv_label_create(card);
+    lv_label_set_text(quick_drawer_artist_label, "");
+    lv_obj_set_style_text_color(quick_drawer_artist_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_set_style_text_font(quick_drawer_artist_label, &app_font_16, 0);
+    lv_obj_set_width(quick_drawer_artist_label, lv_pct(100));
+    lv_obj_set_style_text_align(quick_drawer_artist_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(quick_drawer_artist_label, LV_ALIGN_TOP_MID, 0, 44);
+
+    /* Transport row: order/prev/play/next/favorite, all five in one row --
+     * matching the stock drawer exactly (shuffle-style icon leftmost,
+     * favorite heart rightmost, same as the reference screenshot). This
+     * copy of the order icon is a visual-only mirror of the main player
+     * screen's own (see order_icon_event_cb) -- not independently
+     * clickable, just kept in sync so the drawer doesn't show a stale mode. */
+    lv_obj_t * controls_row = lv_obj_create(card);
+    /* 84, not 70 -- btn_play.png/btn_pause.png are 84x84 (confirmed via the
+     * actual asset files), and a shorter row was clipping the top/bottom of
+     * that icon, confirmed on a real device. */
+    lv_obj_set_size(controls_row, lv_pct(100), 84);
+    lv_obj_align(controls_row, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_opa(controls_row, 0, 0);
+    lv_obj_set_style_border_width(controls_row, 0, 0);
+    lv_obj_remove_flag(controls_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(controls_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(controls_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    quick_drawer_order_icon = lv_image_create(controls_row);
+    lv_image_set_src(quick_drawer_order_icon, asset_path(play_mode_icon_asset((play_mode_t) current_settings.play_mode)));
+
+    lv_obj_t * prev_btn = lv_image_create(controls_row);
+    lv_image_set_src(prev_btn, asset_path("playing_plane/btn_prev.png"));
+    lv_obj_add_flag(prev_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(prev_btn, prev_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    quick_drawer_play_btn = lv_image_create(controls_row);
+    lv_image_set_src(quick_drawer_play_btn, asset_path("playing_plane/btn_play.png"));
+    lv_obj_add_flag(quick_drawer_play_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(quick_drawer_play_btn, play_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * next_btn = lv_image_create(controls_row);
+    lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
+    lv_obj_add_flag(next_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(next_btn, next_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    quick_drawer_favorite_icon = lv_image_create(controls_row);
+    lv_image_set_src(quick_drawer_favorite_icon, asset_path("playing_plane/collect_out.png"));
+    lv_obj_add_flag(quick_drawer_favorite_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(quick_drawer_favorite_icon, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void refresh_clock_label(void) {
+    time_t now = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    char buf[8];
+    strftime(buf, sizeof(buf), "%H:%M", &tm_info);
+
+    /* buf is always "HH:MM" (5 chars) from strftime's %H/%M, so this maps
+     * 1:1 onto the 5 fixed slots -- no leading-slot-hiding needed here,
+     * unlike the volume/battery readouts. */
+    for (int i = 0; i < 5; i++) {
+        char asset[24];
+        if (buf[i] == ':') {
+            snprintf(asset, sizeof(asset), "topbar/colon.png");
+        } else {
+            snprintf(asset, sizeof(asset), "topbar/%c.png", buf[i]);
+        }
+        lv_image_set_src(clock_topbar_digit[i], asset_path(asset));
+    }
+}
+
+static void free_playlist(void) {
+    for (int i = 0; i < playlist_count; i++) free(playlist[i]);
+    free(playlist);
+    playlist = NULL;
+    playlist_count = 0;
+    playlist_index = -1;
+}
+
+static const char * play_mode_icon_asset(play_mode_t mode) {
+    switch (mode) {
+        case PLAY_MODE_REPEAT_ALL: return "playing_plane/loop.png";
+        case PLAY_MODE_REPEAT_ONE: return "playing_plane/single.png";
+        case PLAY_MODE_SHUFFLE:    return "playing_plane/random.png";
+        default:                   return "playing_plane/order.png";
+    }
+}
+
+/* Fisher-Yates shuffle of a fresh 0..count-1 permutation. */
+static void fisher_yates_shuffle(int * arr, int count) {
+    for (int i = count - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+    }
+}
+
+/* (Re)generates shuffle_order if it's stale (playlist size changed, or it
+ * was never generated) and points shuffle_pos at wherever the currently
+ * playing track landed in the new order -- switching into shuffle mode, or
+ * the playlist changing size mid-shuffle, should never itself jump away
+ * from whatever's already playing. */
+static void ensure_shuffle_order_current(void) {
+    if (shuffle_order && shuffle_order_count == playlist_count) return;
+
+    static bool rng_seeded = false;
+    if (!rng_seeded) {
+        srand((unsigned int) time(NULL));
+        rng_seeded = true;
+    }
+
+    free(shuffle_order);
+    shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
+    for (int i = 0; i < playlist_count; i++) shuffle_order[i] = i;
+    fisher_yates_shuffle(shuffle_order, playlist_count);
+    shuffle_order_count = playlist_count;
+
+    shuffle_pos = 0;
+    if (playlist_index >= 0) {
+        for (int i = 0; i < playlist_count; i++) {
+            if (shuffle_order[i] == playlist_index) {
+                shuffle_pos = i;
+                break;
+            }
+        }
+    }
+}
+
+/* Set only when compute_auto_advance_index() has to precompute a reshuffled
+ * continuation bag for the shuffle-wrap case -- see both functions' own
+ * comments. */
+static int * pending_shuffle_order = NULL;
+
+/* What track to move to when the current one finishes naturally (auto-
+ * advance) -- as opposed to compute_manual_step_index() below, for an
+ * explicit Prev/Next tap. Returns -1 for "stop, end of queue" (only
+ * possible in Sequential mode).
+ *
+ * Deliberately read-only (never mutates shuffle_pos/shuffle_order) --
+ * arm_next_track_for_audio() calls this speculatively, well before the
+ * transition it's asking about is actually confirmed (gapless preload/
+ * crossfade prep), so it must be safe to call more than once for the same
+ * `index` and always get the same answer. commit_auto_advance() below is
+ * the only thing allowed to actually advance the shuffle state, called
+ * exactly once at the point a transition is confirmed real. */
+static int compute_auto_advance_index(int index) {
+    if (index < 0 || playlist_count <= 0) return -1;
+
+    switch ((play_mode_t) current_settings.play_mode) {
+        case PLAY_MODE_REPEAT_ONE:
+            return index;
+        case PLAY_MODE_REPEAT_ALL:
+            return (index + 1) % playlist_count;
+        case PLAY_MODE_SHUFFLE: {
+            ensure_shuffle_order_current();
+            int peek_pos = shuffle_pos + 1;
+            if (peek_pos < playlist_count) return shuffle_order[peek_pos];
+
+            /* Bag exhausted -- precompute the reshuffled continuation now
+             * rather than waiting for commit_auto_advance(), so whatever
+             * gets armed for gapless preload here and whatever that commit
+             * later confirms are guaranteed to be the same track. */
+            free(pending_shuffle_order);
+            pending_shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
+            memcpy(pending_shuffle_order, shuffle_order, sizeof(int) * (size_t) playlist_count);
+            fisher_yates_shuffle(pending_shuffle_order, playlist_count);
+            return pending_shuffle_order[0];
+        }
+        case PLAY_MODE_SEQUENTIAL:
+        default:
+            return (index + 1 < playlist_count) ? index + 1 : -1;
+    }
+}
+
+/* Call exactly once, right when an auto-advance computed by
+ * compute_auto_advance_index() actually happens (the playback thread really
+ * moved on, or the hard-restart fallback is about to play that index after
+ * a true end-of-playlist/failed-file) -- advances shuffle_pos, swapping in
+ * the reshuffled bag precomputed above if a wrap happened. No-op outside
+ * Shuffle mode, where compute_auto_advance_index() is already pure/stateless. */
+static void commit_auto_advance(void) {
+    if ((play_mode_t) current_settings.play_mode != PLAY_MODE_SHUFFLE) return;
+
+    int peek_pos = shuffle_pos + 1;
+    if (peek_pos < playlist_count) {
+        shuffle_pos = peek_pos;
+        return;
+    }
+    if (pending_shuffle_order) {
+        free(shuffle_order);
+        shuffle_order = pending_shuffle_order;
+        pending_shuffle_order = NULL;
+        shuffle_order_count = playlist_count;
+        shuffle_pos = 0;
+    }
+}
+
+/* What track an explicit Prev/Next button tap should move to. direction is
+ * +1 (Next) or -1 (Prev). Repeat One doesn't affect manual skipping (only
+ * auto-advance-at-end) -- a deliberate Next tap should never mean "restart
+ * this same track". Returns -1 for "no-op, already at that edge". */
+static int compute_manual_step_index(int index, int direction) {
+    if (index < 0 || playlist_count <= 0) return -1;
+
+    if ((play_mode_t) current_settings.play_mode == PLAY_MODE_SHUFFLE) {
+        ensure_shuffle_order_current();
+        int new_pos = shuffle_pos + direction;
+        if (new_pos < 0) return -1; /* no history to go back past */
+        if (new_pos >= playlist_count) {
+            fisher_yates_shuffle(shuffle_order, playlist_count);
+            new_pos = 0;
+        }
+        shuffle_pos = new_pos;
+        return shuffle_order[shuffle_pos];
+    }
+
+    if ((play_mode_t) current_settings.play_mode == PLAY_MODE_REPEAT_ALL) {
+        return (index + direction + playlist_count) % playlist_count;
+    }
+
+    int next = index + direction;
+    return (next >= 0 && next < playlist_count) ? next : -1;
+}
+
+/* Splits a full path into a display title (filename, no extension) and the
+ * name of its containing folder. No tag/metadata parsing yet, so the
+ * filename is the best "song title" available. */
+static void get_display_names(const char * path, char * title_out, size_t title_size,
+                               char * folder_out, size_t folder_size) {
+    const char * slash = strrchr(path, '/');
+    const char * filename = slash ? slash + 1 : path;
+
+    const char * dot = strrchr(filename, '.');
+    size_t len = dot ? (size_t) (dot - filename) : strlen(filename);
+    if (len >= title_size) len = title_size - 1;
+    memcpy(title_out, filename, len);
+    title_out[len] = '\0';
+
+    folder_out[0] = '\0';
+    if (slash) {
+        char dir_path[PATH_MAX];
+        size_t dir_len = (size_t) (slash - path);
+        if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
+        memcpy(dir_path, path, dir_len);
+        dir_path[dir_len] = '\0';
+
+        const char * folder_slash = strrchr(dir_path, '/');
+        const char * folder_name = folder_slash ? folder_slash + 1 : dir_path;
+        snprintf(folder_out, folder_size, "%s", folder_name);
+    }
+}
+
+static void format_time(double seconds, char * buf, size_t buf_size) {
+    if (seconds < 0) seconds = 0;
+    int total = (int) seconds;
+    snprintf(buf, buf_size, "%d:%02d", total / 60, total % 60);
+}
+
+static void set_play_button_state(bool is_playing) {
+    lv_image_set_src(play_btn, asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
+    if (quick_drawer_play_btn) {
+        lv_image_set_src(quick_drawer_play_btn,
+                         asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
+    }
+}
+
+/* File extension (already known synchronously from the filename) plus the
+ * live sample rate (only known once the decoder's actually opened, on the
+ * playback thread -- may briefly read 0 right at track-start, self-corrects
+ * on the next timer tick same as position/duration do). */
+static void refresh_format_badge(void) {
+    if (playlist_index < 0) {
+        lv_label_set_text(format_badge_label, "");
+        return;
+    }
+
+    const char * path = playlist[playlist_index];
+    const char * dot = strrchr(path, '.');
+    char ext[16] = "";
+    if (dot) {
+        size_t i = 0;
+        for (const char * p = dot + 1; *p && i < sizeof(ext) - 1; p++, i++) {
+            ext[i] = (char) toupper((unsigned char) *p);
+        }
+        ext[i] = '\0';
+    }
+
+    unsigned int sample_rate = audio_get_sample_rate();
+    if (sample_rate > 0) {
+        lv_label_set_text_fmt(format_badge_label, "%s  %.1fkHz", ext, sample_rate / 1000.0);
+    } else {
+        lv_label_set_text(format_badge_label, ext);
+    }
+}
+
+#define COVER_ART_WIDTH 480
+#define COVER_ART_HEIGHT 480
+
+/* Takes ownership of `owned_data` (must be a malloc()'d buffer from
+ * metadata_read(), or NULL) and displays it as the cover image, freeing
+ * whatever the previous track's picture was. Falls back to the firmware's
+ * own default cover placeholder when there's no embedded art (or it failed
+ * to decode).
+ *
+ * Fully decodes and cover-fit resizes the art ourselves (cover_decode.c)
+ * into an exact COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565 buffer, rather
+ * than handing LVGL the raw compressed bytes to decode lazily -- real
+ * embedded art is essentially never exactly this size, and LVGL's own
+ * zoom/stretch transform doesn't apply to tjpgd's (JPEG) lazily-decoded
+ * output, only to fully-decoded buffers like lodepng's, so the raw-bytes
+ * approach displayed art at its native size with black gaps around/below
+ * it whenever that didn't match. Pre-resizing sidesteps the limitation
+ * entirely -- by the time LVGL sees it, it's just a plain raw bitmap. */
+static void set_cover_art(uint8_t * owned_data, uint32_t size) {
+    uint16_t * resized = NULL;
+    bool decoded = owned_data && size > 0 &&
+                   cover_decode_to_rgb565(owned_data, size, COVER_ART_WIDTH, COVER_ART_HEIGHT, &resized);
+    free(owned_data); /* the compressed bytes are no longer needed once decoded (or decode failed) */
+
+    free(current_cover_bytes);
+    current_cover_bytes = NULL;
+
+    if (!decoded) {
+        lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
+        return;
+    }
+
+    current_cover_bytes = (uint8_t *) resized;
+
+    /* Real-device incident: "severe noise/corruption" on the actual on-
+     * screen cover art, root-caused via a raw dump of current_cover_bytes
+     * taken the instant cover_decode_to_rgb565() returns (before this
+     * point) -- a correct, undamaged image every time, on the real target
+     * hardware, not just a host-build test, which ruled out the decode
+     * pipeline entirely. An intermediate theory (LVGL's image cache, keyed
+     * on the source pointer, serving stale tiles since current_cover_dsc is
+     * a reused static struct) turned out to be wrong too -- lv_image_cache_
+     * drop() before every reassignment made no difference, and the same
+     * corruption showed up on a completely different track's art, not just
+     * a stale leftover from the previous one.
+     *
+     * The real bug: lv_image_header_t.magic (lv_image_dsc.h) must be
+     * LV_IMAGE_HEADER_MAGIC -- lv_bin_decoder.c (the decoder this hand-
+     * constructed raw descriptor actually goes through) treats any other
+     * value as an old-format header from before the magic field existed,
+     * and "fixes it up" in place via `header->cf = header->magic;
+     * header->magic = LV_IMAGE_HEADER_MAGIC;`. memset()ing the whole
+     * descriptor to 0 before setting cf/w/h/stride left magic at 0, so this
+     * quirks-mode shim fired on literally every track change, silently
+     * overwriting our just-set LV_COLOR_FORMAT_RGB565 with 0 right before
+     * the image ever got drawn -- corrupting the color format used to
+     * interpret every pixel, not the pixel data itself, which is exactly
+     * why the underlying buffer always dumped correctly but the screen
+     * never showed it right. */
+    memset(&current_cover_dsc, 0, sizeof(current_cover_dsc));
+    current_cover_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    current_cover_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    current_cover_dsc.header.w = COVER_ART_WIDTH;
+    current_cover_dsc.header.h = COVER_ART_HEIGHT;
+    current_cover_dsc.header.stride = COVER_ART_WIDTH * 2;
+    current_cover_dsc.data = current_cover_bytes;
+    current_cover_dsc.data_size = (uint32_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2;
+
+    lv_image_set_src(cover_img, &current_cover_dsc);
+    /* TEMPORARY DIAGNOSTIC -- forcing a full-screen invalidate (not just
+     * cover_img's own, which lv_image_set_src() already does internally)
+     * to test whether this device's custom direct-render/page-flip fbdev
+     * patch (lv_conf.h, search "pan_double_buffer") has a bug specific to
+     * how the dirty region is computed for a single large (480x480) widget
+     * update, vs however a full-screen invalidate's dirty region ends up
+     * differing. Remove once the real album-art corruption bug is found. */
+    lv_obj_invalidate(lv_screen_active());
+}
+
+static void favorite_icon_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (playlist_index < 0 || playlist_index >= playlist_count) return;
+
+    favorite_is_set = !favorite_is_set;
+    metadata_db_song_favorite_set(playlist[playlist_index], favorite_is_set);
+    lv_image_set_src(favorite_icon, asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
+    if (quick_drawer_favorite_icon) {
+        lv_image_set_src(quick_drawer_favorite_icon,
+                         asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
+    }
+}
+
+static void arm_next_track_for_audio(int index);
+
+static void order_icon_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    play_mode_t mode = (play_mode_t) current_settings.play_mode;
+    mode = (play_mode_t) ((mode + 1) % 4);
+    current_settings.play_mode = (int) mode;
+    settings_save(&current_settings);
+
+    lv_image_set_src(order_icon, asset_path(play_mode_icon_asset(mode)));
+    if (quick_drawer_order_icon) lv_image_set_src(quick_drawer_order_icon, asset_path(play_mode_icon_asset(mode)));
+
+    /* What comes after the current track changes with the mode (e.g.
+     * entering Shuffle picks a random next instead of index+1) -- re-arm the
+     * gapless/crossfade target immediately rather than waiting for whatever
+     * was armed under the old mode to turn out wrong. */
+    if (playlist_index >= 0) arm_next_track_for_audio(playlist_index);
+}
+
+/* Shared by both an explicit track pick (play_track_at_from) and the audio
+ * thread autonomously advancing into a queued next track on its own
+ * (on_track_auto_advanced) -- title/folder/art/format-badge/progress-reset
+ * are identical either way. Returns the metadata it read (out_meta) so
+ * callers that also need ReplayGain (play_track_at_from, to hand it to
+ * audio_play_file_at) don't have to read the file's tags a second time. */
+static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
+    char title[128];
+    char folder[128];
+    get_display_names(playlist[index], title, sizeof(title), folder, sizeof(folder));
+
+    metadata_read(playlist[index], out_meta);
+
+    const char * title_text = out_meta->has_title ? out_meta->title : title;
+    const char * folder_text = out_meta->has_artist ? out_meta->artist : folder;
+
+    lv_label_set_text(song_title_label, title_text);
+    lv_label_set_text(song_folder_label, folder_text);
+    if (quick_drawer_title_label) {
+        lv_label_set_text(quick_drawer_title_label, title_text);
+        lv_label_set_text(quick_drawer_artist_label, folder_text);
+    }
+    refresh_format_badge();
+    set_cover_art(out_meta->picture_data, out_meta->picture_size); /* takes ownership */
+
+    favorite_is_set = metadata_db_song_favorite_is_set(playlist[index]);
+    const char * favorite_icon_asset = favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png";
+    lv_image_set_src(favorite_icon, asset_path(favorite_icon_asset));
+    if (quick_drawer_favorite_icon) lv_image_set_src(quick_drawer_favorite_icon, asset_path(favorite_icon_asset));
+
+    /* Once per real "this track started playing" event -- apply_track_
+     * metadata_to_ui() is called exactly here for both an explicit pick
+     * (play_track_at_from) and a gapless auto-advance (on_track_
+     * auto_advanced), never on a repeat UI refresh of the same still-
+     * playing track, so this can't double-count. Backs the Most Played
+     * auto-generated playlist (Music > Playlists). */
+    metadata_db_song_play_count_increment(playlist[index]);
+
+    /* The real position/duration come from audio_get_*_seconds() once the
+     * decoder's opened -- the timer picks that up within its next tick. */
+    lv_slider_set_value(progress_slider, 0, LV_ANIM_OFF);
+    lv_label_set_text(pos_label, "0:00");
+    lv_label_set_text(dur_label, "0:00");
+
+    lv_label_set_text_fmt(song_count_label, "%d/%d", index + 1, playlist_count);
+}
+
+/* Tells audio.c what comes after `index` (per the current play mode -- see
+ * compute_auto_advance_index()) so its playback thread can gapless-handoff
+ * or crossfade into it near `index`'s natural end without a GUI round-trip.
+ * Must be re-called (from on_track_auto_advanced) every time the thread
+ * advances on its own, or the chain of automatic transitions stops after
+ * one hop. */
+static void arm_next_track_for_audio(int index) {
+    int next_index = compute_auto_advance_index(index);
+    if (next_index < 0) {
+        audio_set_next_track(NULL, false, 0.0, false, 0.0);
+        return;
+    }
+    track_metadata_t next_meta;
+    metadata_read(playlist[next_index], &next_meta);
+    audio_set_next_track(playlist[next_index], next_meta.has_replaygain, next_meta.replaygain_gain_db,
+                          next_meta.has_replaygain_peak, next_meta.replaygain_peak);
+    free(next_meta.picture_data); /* only needed the gain/peak fields, not the art */
+}
+
+/* Bluetooth DAC mode and AirPlay receive mode both feed real-time audio
+ * from another device straight into this device's own physical ALSA
+ * hardware (hw:0,0) -- confirmed by checking what each one's consumer
+ * process (aplay -D bluealsa; shairport -o ot) actually targets. Local
+ * playback uses that same hardware directly via tinyalsa, so all three are
+ * mutually exclusive: only one may be "using" the speaker/DAC output at a
+ * time. bt_dac_toggle_cb()/airplay_toggle_cb() turn each other off when
+ * either is enabled; this covers local playback's side of the same rule.
+ *
+ * bt_dac_mode_enabled is also gated on bt_is_powered_cached: it's a
+ * persisted setting, so it can still read true from a previous session
+ * after a reboot where Bluetooth was never turned back on (chip
+ * re-init isn't automatic -- see TESTING.md). With Bluetooth actually off,
+ * bt_control_apply_output_settings() never started bluealsa/aplay, so
+ * nothing is really using the DAC output -- blocking playback in that case
+ * was a real dead end: the Bluetooth DAC toggle to turn it back off only
+ * appears once Bluetooth is powered, which needs a chip re-init the app
+ * itself has no way to trigger. */
+static const char * external_dac_block_reason(void) {
+    if (current_settings.bt_dac_mode_enabled && bt_is_powered_cached) return "Turn off Bluetooth DAC to play music on this device";
+    if (current_settings.wifi_dac_mode_enabled) return "Turn off AirPlay to play music on this device";
+    if (current_settings.usb_mode == USB_MODE_DAC) return "Exit USB DAC mode to play music on this device";
+    return NULL;
+}
+
+static void play_track_at_from(int index, double start_seconds) {
+    if (index < 0 || index >= playlist_count) return;
+
+    const char * block_reason = external_dac_block_reason();
+    if (block_reason) {
+        show_error_toast(block_reason);
+        return;
+    }
+
+    playlist_index = index;
+
+    track_metadata_t meta;
+    apply_track_metadata_to_ui(index, &meta);
+    audio_play_file_at(playlist[index], start_seconds, meta.has_replaygain, meta.replaygain_gain_db,
+                        meta.has_replaygain_peak, meta.replaygain_peak);
+    arm_next_track_for_audio(index);
+
+    set_play_button_state(true);
+    nav_push(player_screen);
+
+    snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist[index]);
+    current_settings.last_position = start_seconds;
+    settings_save(&current_settings);
+}
+
+/* Called from update_timer_cb when audio_consume_track_advanced() reports
+ * the playback thread moved on to the queued next track by itself (gapless
+ * handoff or a completed crossfade) -- audio is already playing it, so
+ * unlike play_track_at_from() this must NOT call audio_play_file_at()
+ * (that would hard-restart audio that's already mid-track). */
+static void on_track_auto_advanced(int index) {
+    if (index < 0 || index >= playlist_count) return;
+
+    playlist_index = index;
+
+    track_metadata_t meta;
+    apply_track_metadata_to_ui(index, &meta); /* audio.c already applied this track's ReplayGain during the handoff */
+    arm_next_track_for_audio(index);
+
+    set_play_button_state(true);
+
+    snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist[index]);
+    current_settings.last_position = 0.0;
+    settings_save(&current_settings);
+}
+
+static void play_track_at(int index) {
+    play_track_at_from(index, 0.0);
+}
+
+static void on_file_selected(char ** new_playlist, int count, int selected_index) {
+    free_playlist();
+    playlist = new_playlist;
+    playlist_count = count;
+    play_track_at(selected_index);
+}
+
+static void toggle_play_pause(void) {
+    if (playlist_index < 0) return; /* nothing loaded yet */
+    /* Same DAC-mode exclusion as play_track_at_from() -- only blocks
+     * resuming (paused -> playing), pausing an already-playing track always
+     * goes through (though bt_dac_toggle_cb()/airplay_toggle_cb() already
+     * stop playback the moment either DAC mode turns on, so in practice
+     * there's nothing left playing to pause by the time this could
+     * matter). */
+    if (!audio_is_playing()) {
+        const char * block_reason = external_dac_block_reason();
+        if (block_reason) {
+            show_error_toast(block_reason);
+            return;
+        }
+    }
+    audio_toggle_pause();
+    bool now_playing = audio_is_playing();
+    set_play_button_state(now_playing);
+
+    if (!now_playing) {
+        /* Checkpoint the resume position on pause -- a natural point to
+         * persist, and far less write-heavy than saving on every tick. */
+        current_settings.last_position = audio_get_position_seconds();
+        settings_save(&current_settings);
+    }
+}
+
+static void play_btn_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    toggle_play_pause();
+}
+
+/* Standard CD-player/iPod convention: a tap partway into a track restarts
+ * it, and only a tap already near the start (real device feedback: "first
+ * press rewind, second press goes to previous song") moves to the actual
+ * previous track -- no separate double-tap timer needed, since "already
+ * near the start" is naturally true right after the first tap rewound it. */
+#define PREV_BUTTON_REWIND_THRESHOLD_SECONDS 3.0
+
+static void prev_btn_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (playlist_index < 0) return;
+
+    if (audio_get_position_seconds() > PREV_BUTTON_REWIND_THRESHOLD_SECONDS) {
+        audio_seek(0.0);
+        return;
+    }
+
+    int prev_index = compute_manual_step_index(playlist_index, -1);
+    if (prev_index >= 0) play_track_at(prev_index);
+}
+
+static void next_btn_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (playlist_index < 0) return;
+    int next_index = compute_manual_step_index(playlist_index, 1);
+    if (next_index >= 0) play_track_at(next_index);
+}
+
+static void library_btn_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    /* Functionally "go back to wherever playback was started from" -- the
+     * player screen is always reached via nav_push(), so popping is correct
+     * here rather than a hardcoded jump to a fixed screen. */
+    nav_pop();
+}
+
+static void crossfade_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.crossfade_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    audio_set_crossfade_enabled(current_settings.crossfade_enabled);
+    settings_save(&current_settings);
+    refresh_quick_drawer_crossfade_icon(); /* see its own comment -- keeps the drawer icon in sync */
+}
+
+static void car_mode_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.car_mode_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+}
+
+static void swipe_up_home_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.swipe_up_home_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    if (current_settings.swipe_up_home_enabled) {
+        lv_obj_remove_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+    }
+    settings_save(&current_settings);
+}
+
+static void led_indicator_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.led_indicator_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    led_control_apply(current_settings.led_indicator_enabled);
+    settings_save(&current_settings);
+}
+
+static void charge_limiter_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.charge_limiter_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    charge_limiter_poll(current_settings.charge_limiter_enabled, true);
+    settings_save(&current_settings);
+}
+
+/* Log-scale mapping so the slider gives fine control at low frequencies
+ * (where the ear is more sensitive to small Hz changes) instead of wasting
+ * most of the slider's travel on the top octave. */
+static int32_t freq_to_slider(double freq_hz) {
+    if (freq_hz < EQ_FREQ_MIN_HZ) freq_hz = EQ_FREQ_MIN_HZ;
+    if (freq_hz > EQ_FREQ_MAX_HZ) freq_hz = EQ_FREQ_MAX_HZ;
+    double ratio = log(freq_hz / EQ_FREQ_MIN_HZ) / log(EQ_FREQ_MAX_HZ / EQ_FREQ_MIN_HZ);
+    return (int32_t) (ratio * EQ_FREQ_SLIDER_MAX);
+}
+
+static double slider_to_freq(int32_t slider_val) {
+    double ratio = (double) slider_val / (double) EQ_FREQ_SLIDER_MAX;
+    return EQ_FREQ_MIN_HZ * pow(EQ_FREQ_MAX_HZ / EQ_FREQ_MIN_HZ, ratio);
+}
+
+/* Forward-declared: show_text_entry() and its callback typedef aren't
+ * defined until much later in this file (the shared text-entry screen,
+ * also used by Subsonic/Wi-Fi setup), but the PEQ tap-to-edit handlers
+ * below need to call it. */
+typedef void (*text_entry_done_cb_t)(const char * text, void * user_data);
+static void show_text_entry(const char * title, const char * initial_text, bool is_password, bool numeric,
+                             text_entry_done_cb_t on_done, void * user_data);
+
+/* Which numeric field a tap-to-edit label represents -- passed through
+ * show_text_entry()'s user_data so one shared done-callback can update the
+ * right slider/label/peq setter instead of needing four near-identical
+ * callbacks. */
+typedef enum {
+    EQ_FIELD_PREAMP,
+    EQ_FIELD_FREQ,
+    EQ_FIELD_GAIN,
+    EQ_FIELD_Q,
+} eq_field_t;
+
+static void eq_numeric_entry_done_cb(const char * text, void * user_data) {
+    eq_field_t field = (eq_field_t) (intptr_t) user_data;
+    double val = atof(text);
+    const peq_band_t * band;
+
+    switch (field) {
+        case EQ_FIELD_PREAMP:
+            if (val < -12.0) val = -12.0;
+            if (val > 12.0) val = 12.0;
+            peq_set_preamp_db(val);
+            lv_slider_set_value(eq_preamp_slider, (int32_t) (val * 10.0), LV_ANIM_OFF);
+            lv_label_set_text_fmt(eq_preamp_value_label, "Pre-Amp: %+.2f dB", val);
+            peq_save();
+            break;
+        case EQ_FIELD_FREQ:
+            band = peq_get_band(current_eq_band);
+            if (!band) break;
+            if (val < EQ_FREQ_MIN_HZ) val = EQ_FREQ_MIN_HZ;
+            if (val > EQ_FREQ_MAX_HZ) val = EQ_FREQ_MAX_HZ;
+            peq_set_band(current_eq_band, val, band->gain_db, band->q);
+            lv_slider_set_value(eq_freq_slider, freq_to_slider(val), LV_ANIM_OFF);
+            lv_label_set_text_fmt(eq_freq_value_label, "Frequency: %.0f Hz", val);
+            peq_save();
+            break;
+        case EQ_FIELD_GAIN:
+            band = peq_get_band(current_eq_band);
+            if (!band) break;
+            if (val < -12.0) val = -12.0;
+            if (val > 12.0) val = 12.0;
+            peq_set_band(current_eq_band, band->freq_hz, val, band->q);
+            lv_slider_set_value(eq_gain_slider, (int32_t) (val * 10.0), LV_ANIM_OFF);
+            lv_label_set_text_fmt(eq_gain_value_label, "Gain: %+.2f dB", val);
+            peq_save();
+            break;
+        case EQ_FIELD_Q:
+            band = peq_get_band(current_eq_band);
+            if (!band) break;
+            if (val < 0.1) val = 0.1;
+            if (val > 10.0) val = 10.0;
+            peq_set_band(current_eq_band, band->freq_hz, band->gain_db, val);
+            lv_slider_set_value(eq_q_slider, (int32_t) (val * 10.0), LV_ANIM_OFF);
+            lv_label_set_text_fmt(eq_q_value_label, "Q: %.2f", val);
+            peq_save();
+            break;
+    }
+}
+
+/* Tap-to-edit: attached to each slider card's value label (see
+ * create_eq_slider_card()) -- opens the shared numeric keypad pre-filled
+ * with the field's current exact value, for typing a precise number
+ * instead of only dragging a slider. */
+static void eq_field_label_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    eq_field_t field = (eq_field_t) (intptr_t) lv_event_get_user_data(e);
+    const peq_band_t * band;
+    char buf[32];
+    const char * title;
+
+    switch (field) {
+        case EQ_FIELD_PREAMP:
+            title = "Pre-Amp (dB, -12 to 12)";
+            snprintf(buf, sizeof(buf), "%.2f", peq_get_preamp_db());
+            break;
+        case EQ_FIELD_FREQ:
+            title = "Frequency (Hz, 20 to 20000)";
+            band = peq_get_band(current_eq_band);
+            snprintf(buf, sizeof(buf), "%.0f", band ? band->freq_hz : 0.0);
+            break;
+        case EQ_FIELD_GAIN:
+            title = "Gain (dB, -12 to 12)";
+            band = peq_get_band(current_eq_band);
+            snprintf(buf, sizeof(buf), "%.2f", band ? band->gain_db : 0.0);
+            break;
+        case EQ_FIELD_Q:
+        default:
+            title = "Q (0.1 to 10)";
+            band = peq_get_band(current_eq_band);
+            snprintf(buf, sizeof(buf), "%.2f", band ? band->q : 0.0);
+            break;
+    }
+
+    show_text_entry(title, buf, false, true, eq_numeric_entry_done_cb, (void *) (intptr_t) field);
+}
+
+static void eq_screen_btn_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(eq_screen);
+}
+
+static void eq_bypass_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    /* Switch shows "EQ Enabled" -- checked means NOT bypassed. */
+    peq_set_bypass(!lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+    peq_save();
+}
+
+static void refresh_eq_band_widgets(void) {
+    const peq_band_t * band = peq_get_band(current_eq_band);
+    if (!band) return;
+
+    for (int i = 0; i < PEQ_NUM_BANDS; i++) {
+        bool selected = (i == current_eq_band);
+        /* Toggling which SHARED style is attached (rather than setting a
+         * one-off direct color) so this keeps tracking the accent color
+         * live if the user changes it later -- a direct
+         * lv_obj_set_style_text_color() would sit in the object's local
+         * style, which takes priority over any added style and would
+         * silently defeat style_accent. */
+        lv_obj_remove_style(eq_band_button_labels[i], &style_accent, 0);
+        lv_obj_remove_style(eq_band_button_labels[i], &style_muted_text, 0);
+        lv_obj_add_style(eq_band_button_labels[i], selected ? &style_accent : &style_muted_text, 0);
+    }
+
+    if (band->enabled) lv_obj_add_state(eq_band_enabled_switch, LV_STATE_CHECKED);
+    else lv_obj_clear_state(eq_band_enabled_switch, LV_STATE_CHECKED);
+
+    lv_dropdown_set_selected(eq_type_dropdown, (uint32_t) band->type);
+
+    lv_slider_set_value(eq_freq_slider, freq_to_slider(band->freq_hz), LV_ANIM_OFF);
+    lv_slider_set_value(eq_gain_slider, (int32_t) (band->gain_db * 10.0), LV_ANIM_OFF);
+    lv_slider_set_value(eq_q_slider, (int32_t) (band->q * 10.0), LV_ANIM_OFF);
+
+    lv_label_set_text_fmt(eq_freq_value_label, "Frequency: %.0f Hz", band->freq_hz);
+    lv_label_set_text_fmt(eq_gain_value_label, "Gain: %+.2f dB", band->gain_db);
+    lv_label_set_text_fmt(eq_q_value_label, "Q: %.2f", band->q);
+}
+
+static void eq_band_button_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    current_eq_band = (int) (intptr_t) lv_event_get_user_data(e);
+    refresh_eq_band_widgets();
+}
+
+static void eq_type_dropdown_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    peq_set_band_type(current_eq_band, (peq_band_type_t) lv_dropdown_get_selected(lv_event_get_target(e)));
+    peq_save();
+}
+
+static void eq_preamp_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    double db = (double) lv_slider_get_value(lv_event_get_target(e)) / 10.0;
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        peq_set_preamp_db(db);
+        lv_label_set_text_fmt(eq_preamp_value_label, "Pre-Amp: %+.2f dB", db);
+    } else if (code == LV_EVENT_RELEASED) {
+        peq_save();
+    }
+}
+
+static void eq_band_enabled_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    peq_set_band_enabled(current_eq_band, lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+    peq_save();
+}
+
+static void eq_freq_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    const peq_band_t * band = peq_get_band(current_eq_band);
+    if (!band) return;
+    double freq = slider_to_freq(lv_slider_get_value(lv_event_get_target(e)));
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        peq_set_band(current_eq_band, freq, band->gain_db, band->q);
+        lv_label_set_text_fmt(eq_freq_value_label, "%.0f Hz", freq);
+    } else if (code == LV_EVENT_RELEASED) {
+        peq_save();
+    }
+}
+
+static void eq_gain_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    const peq_band_t * band = peq_get_band(current_eq_band);
+    if (!band) return;
+    double gain = (double) lv_slider_get_value(lv_event_get_target(e)) / 10.0;
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        peq_set_band(current_eq_band, band->freq_hz, gain, band->q);
+        lv_label_set_text_fmt(eq_gain_value_label, "%+.1f dB", gain);
+    } else if (code == LV_EVENT_RELEASED) {
+        peq_save();
+    }
+}
+
+static void eq_q_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    const peq_band_t * band = peq_get_band(current_eq_band);
+    if (!band) return;
+    double q = (double) lv_slider_get_value(lv_event_get_target(e)) / 10.0;
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        peq_set_band(current_eq_band, band->freq_hz, band->gain_db, q);
+        lv_label_set_text_fmt(eq_q_value_label, "Q %.2f", q);
+    } else if (code == LV_EVENT_RELEASED) {
+        peq_save();
+    }
+}
+
+static void progress_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t * slider = lv_event_get_target(e);
+
+    if (code == LV_EVENT_PRESSED) {
+        user_seeking = true;
+    } else if (code == LV_EVENT_RELEASED) {
+        double duration = audio_get_duration_seconds();
+        int32_t percent = lv_slider_get_value(slider);
+        audio_seek(duration * ((double) percent / 100.0));
+        user_seeking = false;
+    }
+}
+
+static void volume_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    int32_t percent = lv_slider_get_value(lv_event_get_target(e));
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        audio_set_volume((float) percent / 100.0f); /* live feedback while dragging */
+    } else if (code == LV_EVENT_RELEASED) {
+        /* Only persist once the drag settles, not on every intermediate tick. */
+        current_settings.volume = (float) percent / 100.0f;
+        settings_save(&current_settings);
+    }
+}
+
+/* Defined with the rest of the Subsonic streaming logic further down;
+ * forward-declared here since polling for a finished background download
+ * belongs alongside every other per-tick "did a background thing finish"
+ * check in update_timer_cb (hw_buttons, audio_consume_track_advanced, ...). */
+static void poll_subsonic_download(void);
+static void poll_dlna_control(void);
+static void poll_subsonic_connect(void);
+static void poll_wifi_scan(void);
+static void poll_wifi_connect(void);
+static void poll_wifi_connect_saved(void);
+static void poll_wifi_disconnect(void);
+static void poll_wifi_forget(void);
+static void poll_bt_scan(void);
+static void poll_bt_connect(void);
+static void poll_bt_forget(void);
+static void poll_library_rescan(void);
+static void poll_usb_mode_switch(void);
+static void poll_sd_card_hotplug(void);
+
+/* Full radio suspend after a long stretch with the screen off and nothing
+ * going on -- deliberately separate from (and much longer than) the
+ * screen-timeout backlight-off state itself: that can fire as often as
+ * every 30s from ordinary momentary inactivity during otherwise-continuous
+ * use, and WiFi/Bluetooth reassociation has a real cost, so tying radio
+ * suspend to the same short timer would punish a user who's still actively
+ * using the device, just with the screen dimming between taps. Skipped
+ * entirely while music is playing, either DAC receive mode is on (both need
+ * their radio to stay up to receive), or the device is charging (no battery
+ * pressure to justify the reassociation cost). Whichever radios were
+ * actually on get suspended, and only those get resumed on wake -- a radio
+ * the user already had off before sleeping stays off. */
+#define RADIO_SUSPEND_DELAY_MS (10 * 60 * 1000)
+static uint32_t screen_off_since_tick = 0;
+static bool radios_suspended = false;
+static bool wifi_was_on_before_suspend = false;
+static bool bt_was_on_before_suspend = false;
+
+/* Idle shutdown: a full poweroff (see idle_shutdown.h) after
+ * current_settings.idle_shutdown_minutes with the screen off and nothing
+ * going on -- same gating as radio-suspend above (not playing, not
+ * charging, no DAC receive mode active) since none of those should ever be
+ * interrupted by the device turning itself off. idle_shutdown_attempted
+ * guards against retrying every single tick if idle_shutdown_now() doesn't
+ * actually terminate the process for some reason (e.g. /sbin/poweroff
+ * missing) -- reset on wake so a genuine idle stretch always gets a fresh
+ * attempt rather than being permanently given up on after one failure. */
+static bool idle_shutdown_attempted = false;
+
+/* Real-device bug report: waking from suspend needed two power-button
+ * presses -- see the resume fixup below (right after power_suspend_now())
+ * for the full mechanism, and its own comment for the actual confirmed
+ * root cause (an unreset LVGL inactivity clock, not this grace window --
+ * this window handles a separate, secondary race only). Short grace
+ * window, not a one-shot drain: the physical press that wakes the kernel
+ * is captured by hw_buttons.c's own independent evdev reader thread, whose
+ * timing relative to this (main) thread's own resume handling isn't
+ * guaranteed -- a drain attempted too early could miss a flag that thread
+ * hadn't set yet. Any power-button press consumed within this window of a
+ * resume is treated as an echo of the wake press and silently discarded
+ * rather than toggling the screen; long enough to comfortably cover
+ * realistic evdev delivery latency, short enough that a genuinely
+ * deliberate second press to go back to sleep right after waking is a rare
+ * enough tradeoff to accept. */
+#define RESUME_POWER_DRAIN_WINDOW_MS 1000
+static uint32_t resumed_from_suspend_tick = 0;
+static bool resumed_from_suspend_pending = false;
+
+static void update_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+
+    /* Physical volume/skip/play-pause buttons: applied here, on the one
+     * thread allowed to touch LVGL widgets (see hw_buttons.h). */
+    bool played_paused = hw_buttons_consume_play_pause();
+    if (played_paused) {
+        toggle_play_pause();
+    }
+    /* Real-device bug report: shuffle "sometimes shuffles, sometimes just
+     * plays the next song," and physical-button skip never shuffled at all.
+     * Root cause -- this block used to step playlist_index by a plain +-1
+     * regardless of play mode, rather than going through
+     * compute_manual_step_index() (the same shuffle-aware/repeat-all-wrap
+     * logic the touchscreen Prev/Next buttons already used, further down in
+     * next_btn_event_cb/prev_btn_event_cb) -- so a physical button press
+     * always played the literal next track in playlist order no matter what
+     * current_settings.play_mode was. In Shuffle mode specifically, the
+     * *touchscreen* buttons genuinely did shuffle every time; the
+     * "sometimes" in the report was almost certainly this exact
+     * inconsistency between the two input paths, not real randomness in
+     * the shuffle logic itself. */
+    bool skipped_next = hw_buttons_consume_next();
+    if (skipped_next) {
+        int next_index = compute_manual_step_index(playlist_index, 1);
+        if (next_index >= 0) play_track_at(next_index);
+    }
+    bool skipped_prev = hw_buttons_consume_prev();
+    if (skipped_prev) {
+        int prev_index = compute_manual_step_index(playlist_index, -1);
+        if (prev_index >= 0) play_track_at(prev_index);
+    }
+
+#ifndef HOST_BUILD
+    /* Bluetooth accessory's own play/pause/next/previous buttons -- same
+     * "background thread sets a flag, this is the one thread allowed to
+     * touch LVGL/playlist state" pattern as the physical hw_buttons above,
+     * since bt_media_player.c's D-Bus dispatch runs on its own thread. Now
+     * shares the same shuffle-aware compute_manual_step_index() stepping as
+     * hw_buttons and the touchscreen buttons -- see the shuffle bug comment
+     * just above; a remote's buttons should behave like every other
+     * "skip" input, not bypass play mode entirely. */
+    if (bt_media_player_consume_play_pause()) {
+        toggle_play_pause();
+    }
+    if (bt_media_player_consume_next()) {
+        int next_index = compute_manual_step_index(playlist_index, 1);
+        if (next_index >= 0) play_track_at(next_index);
+    }
+    if (bt_media_player_consume_prev()) {
+        int prev_index = compute_manual_step_index(playlist_index, -1);
+        if (prev_index >= 0) play_track_at(prev_index);
+    }
+    /* Keeps PlaybackStatus accurate for whenever BlueZ/the accessory next
+     * queries it -- cheap (no subprocess, just a mutex-protected bool),
+     * safe to do unconditionally every tick rather than hunting down every
+     * call site that can change play state. */
+    bt_media_player_notify_playback_state(audio_is_playing());
+#endif
+
+    int volume_delta = hw_buttons_consume_volume_delta();
+    if (volume_delta != 0) {
+        int32_t new_percent = lv_slider_get_value(volume_slider) + volume_delta;
+        if (new_percent < 0) new_percent = 0;
+        if (new_percent > 100) new_percent = 100;
+        lv_slider_set_value(volume_slider, new_percent, LV_ANIM_OFF);
+        audio_set_volume((float) new_percent / 100.0f);
+        current_settings.volume = (float) new_percent / 100.0f;
+        settings_save(&current_settings);
+        show_volume_popup(new_percent);
+        refresh_volume_topbar(new_percent);
+    }
+
+    /* Auto-stop on headphone-output loss: this hardware has no built-in
+     * speaker, so a mid-playback disconnect (headphone jack pulled, or the
+     * connected Bluetooth A2DP headphone drops) leaves nowhere for the
+     * audio to go -- stop outright rather than leaving it silently playing
+     * into nothing. Checked every tick, deliberately NOT gated on
+     * screen_on_now below (background, screen-off playback needs the same
+     * protection). headphone_is_connected() is a cheap sysfs read (no
+     * subprocess); the A2DP half reuses whatever poll_refresh_bt_icon()
+     * last found rather than re-querying bluealsa-cli here every tick --
+     * that's already throttled to its own ~5s cadence (see
+     * refresh_bt_icon_thread_func()), and a few seconds of extra latency on
+     * just the Bluetooth half is an acceptable tradeoff against forking a
+     * process every single tick.
+     *
+     * Target-only: HOST_BUILD has no real jack/BT hardware to detect at
+     * all (headphone_is_connected() is unconditionally false there, see
+     * headphone_status.h), so this would otherwise fire a spurious "stop"
+     * on the very first tick after starting playback in the simulator --
+     * there's no real disconnect to protect against on host, since the dev
+     * machine's own speakers are the actual output regardless of this
+     * app's simulated jack/BT state. */
+#ifndef HOST_BUILD
+    /* Real-device bug report: "Bluetooth dropping connection randomly."
+     * refresh_bt_icon_result_a2dp_connected comes from a subprocess-backed
+     * poll (bluealsa-cli list-pcms, gated on bt_control_is_powered()) that
+     * this file's own Bluetooth wedge-recovery logic (see
+     * bt_control_recover_wedged_daemon()'s doc comment) already documents,
+     * with a real-device strace to back it up, as prone to a single false
+     * "not connected"/"No default controller" reading during a normal,
+     * several-second-long bluetoothd/bluealsa busy window -- not a genuine
+     * disconnect. That existing recovery logic requires several CONSECUTIVE
+     * failures (TIMEOUT_RECOVERY_THRESHOLD) before concluding it's a real
+     * wedge, specifically to filter out that blip. This auto-stop check
+     * used to have no such filter at all -- a single bad poll cut playback
+     * immediately, which is a far more likely explanation for "random"
+     * drops than the radio itself actually losing the connection.
+     *
+     * Debounced on wall-clock time (not a "how many ticks in a row" counter
+     * -- refresh_bt_icon_result_a2dp_connected only actually changes value
+     * once every ~5s poll cycle, so counting 500ms update_timer_cb ticks
+     * would just recount the same stale reading many times over) rather
+     * than the raw signal, and only the Bluetooth half: headphone_is_
+     * connected() is a direct, instant sysfs read with no such ambiguity,
+     * so a wired jack pull still stops playback immediately, unchanged. */
+#define BT_OUTPUT_DISCONNECT_DEBOUNCE_MS 12000
+    {
+        static uint32_t bt_disconnected_since_tick = 0; /* 0 = currently connected (or never sampled) */
+        if (refresh_bt_icon_result_a2dp_connected) {
+            bt_disconnected_since_tick = 0;
+        } else if (bt_disconnected_since_tick == 0) {
+            bt_disconnected_since_tick = lv_tick_get();
+        }
+        bool bt_connected_debounced = refresh_bt_icon_result_a2dp_connected ||
+            lv_tick_elaps(bt_disconnected_since_tick) < BT_OUTPUT_DISCONNECT_DEBOUNCE_MS;
+
+        static bool last_output_connected = true; /* starts true so nothing fires before any real state has been sampled */
+        bool output_connected = headphone_is_connected() || bt_connected_debounced;
+        if (last_output_connected && !output_connected && (audio_is_playing() || audio_is_paused())) {
+            audio_stop();
+            set_play_button_state(false);
+            show_error_toast("Playback stopped: headphones disconnected");
+        }
+        last_output_connected = output_connected;
+    }
+#endif
+
+    /* Car Mode (Settings toggle, off by default). Real-device bug report
+     * corrected the original design here: this is NOT about resuming when
+     * headphones connect -- it matches the stock firmware's own actual
+     * behavior, confirmed by the user against a real car install --
+     * unplugging power (car ignition off) sleeps/powers the device off,
+     * and plugging power back in (ignition on) powers it back on and
+     * resumes whatever was playing.
+     *
+     * Implemented as a full poweroff (idle_shutdown_now()), not
+     * power_suspend_now() -- matching idle_shutdown.h's own documented
+     * reasoning for preferring poweroff generally on this hardware: real
+     * suspend-to-RAM's display resume path is confirmed broken on this
+     * board (jzfb spins forever on "pan display wait timeout"), while a
+     * full poweroff is the mechanism already proven reliable. Resuming
+     * after power returns falls out of the existing auto-resume-on-launch
+     * startup path for free (see gui_init()'s own auto-resume block) --
+     * NOTE: that startup path is currently disabled entirely
+     * (AUTO_RESUME_ON_LAUNCH_ENABLED, gui_init()) after a real-device
+     * crash-reboot report, so until that's re-enabled, Car Mode still
+     * checkpoints and powers off correctly here but will NOT resume
+     * playback on the next boot -- it'll just boot to Home like a normal
+     * cold start. This just also force-checkpoints the current position
+     * immediately
+     * before shutting down (auto-resume normally only checkpoints on pause/
+     * track-change, not continuously, so a mid-track unplug would otherwise
+     * resume from a stale position) and makes gui_init() treat
+     * car_mode_enabled as an auto-resume trigger in its own right,
+     * independent of the user's separate auto_resume_enabled preference --
+     * whether "always resume on launch" is on or off shouldn't change
+     * whether it's on for this ignition-cycle-driven flow.
+     *
+     * Not power_suspend_now()/idle_shutdown_now() waking the device back up
+     * by itself on power insert -- that's a hardware/PMIC wake source
+     * outside this app's control, the same one the stock firmware already
+     * relies on for this exact feature on this exact board, per the user's
+     * own real-device report. Nothing to implement here for that half.
+     *
+     * Edge-triggered on battery_is_charging() so a normal desk charge with
+     * Car Mode left on doesn't repeatedly retrigger, and gated on something
+     * actually being loaded (audio_is_playing() || audio_is_paused()) --
+     * no track loaded means nothing to "continue playing," so no reason to
+     * force a shutdown cycle. Target-only, same reasoning as the auto-stop
+     * block above -- battery_is_charging() is unconditionally false on
+     * host. */
+#ifndef HOST_BUILD
+    {
+        static bool last_charging = true; /* starts true so nothing fires before any real state has been sampled */
+        bool charging = battery_is_charging();
+        if (current_settings.car_mode_enabled && last_charging && !charging &&
+            (audio_is_playing() || audio_is_paused())) {
+            current_settings.last_position = audio_get_position_seconds();
+            settings_save(&current_settings);
+            idle_shutdown_now();
+        }
+        last_charging = charging;
+    }
+#endif
+
+    /* Auto screen-timeout. Physical button presses don't go through LVGL's
+     * own indev system at all (see hw_buttons.h's own comment on why this
+     * needs a raw evdev thread), so lv_display_get_inactive_time() alone
+     * would only track touches -- feed it button activity too via
+     * lv_display_trigger_activity(), or a session spent purely skipping
+     * tracks would still auto-sleep the screen despite being actively used.
+     * This only delays the NEXT auto-sleep, though -- it deliberately does
+     * NOT wake an already-off screen (see the power-button block below for
+     * why: touches don't either, real-device feedback was that a screen
+     * meant to be off shouldn't relight itself from a pocket touch/bump,
+     * only a deliberate power-button press should turn it back on). */
+    if (played_paused || skipped_next || skipped_prev || volume_delta != 0) {
+        lv_display_trigger_activity(NULL);
+    }
+
+    bool screen_was_on = backlight_screen_is_on();
+
+    /* The ONLY way the screen turns back on, whether it went off from the
+     * auto-timeout below or a previous manual power-button press -- deliberately
+     * not touch, and not the hw button presses above either, even though both
+     * feed the same LVGL inactivity clock: real-device feedback was that
+     * touching a screen that's meant to be off (auto-timeout or manual) was
+     * turning it back on, which isn't the expected "screen off means off
+     * until you explicitly wake it" behavior. Applied here rather than
+     * straight from the hw_buttons reader thread so the backlight toggle and
+     * the LVGL inactivity clock (used below for the auto-timeout check)
+     * update atomically on this thread -- toggling the backlight from the
+     * other thread without also resetting the inactivity clock left it stuck
+     * expired, so the auto-timeout check just below immediately re-fired and
+     * turned the screen straight back off on the very next tick, a
+     * press-to-wake that looked like a frozen black screen. */
+    if (resumed_from_suspend_pending && lv_tick_elaps(resumed_from_suspend_tick) >= RESUME_POWER_DRAIN_WINDOW_MS) {
+        DBG_LOG("resume: grace window expired unused at tick=%u\n", lv_tick_get());
+        resumed_from_suspend_pending = false;
+    }
+    if (hw_buttons_consume_power()) {
+        DBG_LOG("resume: hw_buttons_consume_power() true at tick=%u, pending=%d\n", lv_tick_get(), resumed_from_suspend_pending);
+        if (resumed_from_suspend_pending) {
+            /* Echo of the press that woke the device from suspend -- see
+             * resumed_from_suspend_pending's own comment. Swallowed once
+             * (not the whole window's worth of presses): only the wake
+             * press itself should ever land here, so there's nothing more
+             * to drain after the first one arrives, and continuing to
+             * suppress every press for the rest of the window would make a
+             * deliberate quick re-sleep tap right after waking do nothing. */
+            resumed_from_suspend_pending = false;
+        } else {
+            lv_display_trigger_activity(NULL);
+            backlight_set_screen_on(!backlight_screen_is_on());
+        }
+    }
+
+    uint32_t screen_inactive_ms = lv_display_get_inactive_time(NULL);
+    if (current_settings.screen_timeout_enabled && backlight_screen_is_on() &&
+        screen_inactive_ms >= (uint32_t) current_settings.screen_timeout_seconds * 1000) {
+        backlight_set_screen_on(false);
+    }
+
+    /* Battery: skip every bit of UI-only refresh work below (label updates,
+     * and especially the wpa_cli/bluetoothctl subprocess forks behind
+     * refresh_wifi_icon()/refresh_bt_icon()) while nobody can see the
+     * screen -- otherwise a music session left playing overnight with the
+     * screen asleep still forks a bluetoothctl process every
+     * WIFI_POLL_TICKS ticks for pixels nobody's looking at. Force one
+     * refresh right on wake so nothing looks stale afterwards instead of
+     * waiting up to WIFI_POLL_TICKS ticks to catch up. */
+    bool screen_on_now = backlight_screen_is_on();
+    bool screen_just_woke = screen_on_now && !screen_was_on;
+
+    /* Touch input, not just the backlight, needs to follow screen on/off --
+     * real-device feedback: a touch on a screen that's meant to be off was
+     * both relighting it (fixed above, by no longer waking on plain
+     * activity) AND, independent of that, still being delivered to whatever
+     * was underneath in the dark (a blind touch could still press a button
+     * or navigate a screen the user can't see). Disabling every indev while
+     * off blocks both: LVGL never processes the touch at all, so there's
+     * nothing left to wake the screen OR act on. Physical hardware buttons
+     * are unaffected -- hw_buttons.c reads them on its own raw evdev thread
+     * outside LVGL's indev system entirely, so play/pause/skip/volume/power
+     * keep working with the screen dark, matching a normal DAP. */
+    if (screen_on_now != screen_was_on) {
+        lv_indev_enable(NULL, screen_on_now);
+    }
+
+    if (screen_just_woke) {
+        idle_shutdown_attempted = false;
+        if (radios_suspended) {
+            /* Only resume a radio we actually suspended, and only if it's
+             * still off -- reuses the same toggle-thread infrastructure as
+             * the quick-drawer tap-to-toggle (wifi_toggle_thread_func()/
+             * bt_toggle_thread_func() just flip whatever the current state
+             * is), guarded the same way against a toggle already in
+             * flight. */
+            if (wifi_was_on_before_suspend && !wifi_control_is_enabled() && !wifi_toggle_active) {
+                wifi_toggle_active = true;
+                wifi_toggle_done_flag = false;
+                pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL);
+            }
+            if (bt_was_on_before_suspend && !bt_is_powered_cached && !bt_toggle_active) {
+                bt_toggle_active = true;
+                bt_toggle_done_flag = false;
+                pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL);
+            }
+            radios_suspended = false;
+        }
+    } else if (!screen_on_now) {
+        if (screen_was_on) {
+            /* Just went to sleep this tick -- the 10-minute countdown starts
+             * from here, not from whenever the inactivity that caused it
+             * began. */
+            screen_off_since_tick = lv_tick_get();
+        }
+        /* bt_is_powered_cached, not bt_control_is_powered(), deliberately --
+         * the latter forks a process, and this condition is checked every
+         * tick while the screen is off, not throttled like refresh_bt_icon()
+         * is. The cached value is frozen at whatever it was when the screen
+         * went dark, which is fine: nothing in this app can change BT power
+         * state without a UI the user can't reach with the screen off. */
+        if (!radios_suspended && !current_settings.wifi_dac_mode_enabled && !current_settings.bt_dac_mode_enabled &&
+            !audio_is_playing() && !battery_is_charging() &&
+            lv_tick_elaps(screen_off_since_tick) >= RADIO_SUSPEND_DELAY_MS) {
+            wifi_was_on_before_suspend = wifi_control_is_enabled();
+            bt_was_on_before_suspend = bt_is_powered_cached;
+            if (wifi_was_on_before_suspend && !wifi_toggle_active) {
+                wifi_toggle_active = true;
+                wifi_toggle_done_flag = false;
+                pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL);
+            }
+            if (bt_was_on_before_suspend && !bt_toggle_active) {
+                bt_toggle_active = true;
+                bt_toggle_done_flag = false;
+                pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL);
+            }
+            radios_suspended = true;
+        }
+
+        /* Deliberately independent of radios_suspended -- idle_shutdown_minutes
+         * is a separate, normally-longer setting than RADIO_SUSPEND_DELAY_MS,
+         * and shutdown should still happen on its own schedule even if radio
+         * suspend is impossible right now (e.g. wifi_dac_mode_enabled) --
+         * except it explicitly shares the same DAC-mode/playing/charging
+         * gate, since none of those should ever be interrupted by the
+         * device powering itself off out from under them. */
+        if (!idle_shutdown_attempted && current_settings.idle_shutdown_enabled &&
+            !current_settings.wifi_dac_mode_enabled && !current_settings.bt_dac_mode_enabled &&
+            !audio_is_playing() && !battery_is_charging() &&
+            lv_tick_elaps(screen_off_since_tick) >= (uint32_t) current_settings.idle_shutdown_minutes * 60 * 1000) {
+            if (current_settings.idle_suspend_enabled) {
+                power_suspend_now();
+
+                /* Real-device bug report: after resuming from suspend, the
+                 * backlight itself came back on (the kernel's own fbdev/
+                 * backlight power-notifier chain does that automatically in
+                 * response to power_suspend_now()'s raw `/sys/class/
+                 * graphics/fb0/blank` write) but the UI itself was never
+                 * visible again -- confirmed root cause: that raw sysfs
+                 * write completely bypasses this app's OWN screen-on state
+                 * (backlight.c's screen_on static, only ever flipped by
+                 * backlight_set_screen_on()) and this function's own
+                 * indev-enable logic just above, which only reacts to a
+                 * screen_on_now/screen_was_on transition it detects BETWEEN
+                 * ticks -- but both are read from the exact same
+                 * backlight_screen_is_on() call, so flipping that state
+                 * mid-tick here (rather than waiting for a real transition
+                 * to be observed across two separate ticks) would never be
+                 * seen as an "edge" and that logic would never fire again.
+                 * Fixed by explicitly doing here, right now, everything
+                 * that logic would otherwise have done on a real wake:
+                 * resync backlight.c's own state (also restores correct
+                 * brightness, in case the kernel's auto-restore didn't
+                 * match), re-enable touch input (LVGL's indev was still
+                 * disabled from before suspend -- with it off, a touch
+                 * couldn't even be delivered to trigger a redraw), and force
+                 * a full-screen invalidate so a fresh frame actually gets
+                 * pushed into whatever this display controller's own resume
+                 * left in the framebuffer (same real-device-confirmed fix
+                 * as the album art corruption bug above, on this same
+                 * device's custom double-buffered fbdev path). */
+                backlight_set_screen_on(true);
+                lv_indev_enable(NULL, true);
+                lv_obj_invalidate(lv_screen_active());
+
+                /* Real-device bug report: waking from suspend needed two
+                 * power-button presses -- the first visibly flashed the
+                 * backlight on then straight back off, only the second
+                 * actually brought the UI up and left it up. Instrumented
+                 * with real-device timestamps (DBG_LOG on both the
+                 * hw_buttons.c reader thread and this resume path) to
+                 * confirm the actual root cause, since an earlier fix
+                 * attempt here (a grace window swallowing the echoed
+                 * KEY_POWER event hw_buttons.c independently captures for
+                 * the same physical wake press) turned out to already be
+                 * working correctly and NOT the reason a second press was
+                 * still needed -- the logged echo was swallowed exactly as
+                 * intended, first time, every time.
+                 *
+                 * Confirmed real root cause instead: lv_display_get_inactive_
+                 * time(NULL), read by the auto-screen-timeout check just
+                 * below, is fed only by lv_display_trigger_activity() calls,
+                 * none of which happen anywhere during the entire suspend
+                 * duration (the whole app, including this timer, is frozen).
+                 * So the instant this code force-enables the screen above,
+                 * that check sees an inactivity duration spanning the ENTIRE
+                 * sleep (easily minutes), always over screen_timeout_seconds,
+                 * and immediately flips the screen back off again on this
+                 * same tick -- the "flash on then off" the bug report
+                 * describes. The grace window above still correctly stops
+                 * the echoed press from ALSO toggling the screen off a
+                 * second time, but does nothing about this separate,
+                 * unconditional timeout check. The second press "fixes" it
+                 * only as a side effect: being a genuine, non-swallowed
+                 * press, it calls lv_display_trigger_activity() in the
+                 * toggle branch below, which is what finally resets the
+                 * clock. Fixed at the source instead -- reset the clock
+                 * here, before that check ever runs. */
+                lv_display_trigger_activity(NULL);
+
+                /* Grace window: still needed independently of the fix above,
+                 * so the echoed KEY_POWER event doesn't ALSO toggle the
+                 * screen back off on top of the timeout-check race just
+                 * fixed. See resumed_from_suspend_pending's own comment. */
+                resumed_from_suspend_tick = lv_tick_get();
+                resumed_from_suspend_pending = true;
+                DBG_LOG("resume: grace window armed at tick=%u\n", resumed_from_suspend_tick);
+
+                /* Unlike idle_shutdown_now() (which never returns --
+                 * poweroff ends the process), this call CAN legitimately
+                 * return without a real user wake (e.g. a spurious IRQ) --
+                 * screen_just_woke won't fire to reset this flag in that
+                 * case, so reset it here instead. Worst case if the device
+                 * really did just wake for a moment is one immediate
+                 * re-suspend on the next tick, not getting stuck awake
+                 * indefinitely after a single spurious wake. */
+                idle_shutdown_attempted = false;
+            } else {
+                idle_shutdown_attempted = true;
+                idle_shutdown_now();
+            }
+        }
+    }
+
+    if (screen_on_now) {
+        refresh_clock_label();
+        refresh_battery_topbar();
+        refresh_headphone_icon();
+        refresh_play_pause_topbar(); /* cheap in-process state check, safe to call every tick unlike the BT/wifi subprocess calls below */
+        if (screen_just_woke || ++wifi_poll_tick_counter >= WIFI_POLL_TICKS) {
+            wifi_poll_tick_counter = 0;
+            refresh_wifi_icon();
+            start_refresh_bt_icon(); /* also forks a process (bluetoothctl show), same low cadence as wifi */
+        }
+    }
+
+    /* Also unconditional on screen state -- charging happens with the
+     * screen off far more often than on, so gating this the same way as the
+     * topbar refreshes above would leave it capped at whatever percent the
+     * screen happened to be on last. charge_limiter_poll() throttles its
+     * own actual sysfs work internally, so calling it every tick here is
+     * cheap. */
+    charge_limiter_poll(current_settings.charge_limiter_enabled, false);
+    led_control_poll(current_settings.led_indicator_enabled);
+
+    /* Polling for in-flight async operations (wifi/bt connect, library scan,
+     * subsonic sync, ...) keeps running regardless of screen state -- these
+     * only do real work when a request the user already made is still
+     * pending, so gating them on screen state would leave that operation
+     * stuck until the user wakes the screen back up. */
+    poll_subsonic_download();
+    poll_dlna_control();
+    poll_subsonic_connect();
+    poll_wifi_scan();
+    poll_wifi_connect();
+    poll_wifi_connect_saved();
+    poll_wifi_disconnect();
+    poll_wifi_forget();
+    poll_wifi_toggle();
+    poll_bt_toggle();
+    poll_refresh_bt_icon();
+    poll_bt_dac_startup_reapply();
+    poll_bt_apply_output_settings();
+    poll_bt_scan();
+    poll_bt_connect();
+    poll_bt_forget();
+    poll_library_rescan();
+    poll_sleep_timer();
+    poll_usb_mode_switch();
+    poll_sd_card_hotplug();
+
+    if (audio_consume_track_advanced()) {
+        /* The playback thread already moved on to the queued next track by
+         * itself (gapless handoff or a completed crossfade) -- just sync
+         * the GUI's own index/labels to match, don't restart audio. The
+         * target must match exactly what arm_next_track_for_audio() armed
+         * for this same `playlist_index`, so commit_auto_advance() (which
+         * only actually mutates shuffle state) is called right after. */
+        int advanced_index = compute_auto_advance_index(playlist_index);
+        if (advanced_index >= 0) {
+            commit_auto_advance();
+            on_track_auto_advanced(advanced_index);
+        }
+    }
+
+    if (audio_consume_track_finished()) {
+        /* A true end-of-playlist, OR the queued next track failed to open
+         * (e.g. a corrupt file) -- fall back to the old hard-restart-based
+         * skip so a single bad file in a playlist doesn't stall it. Only
+         * Sequential mode can actually reach "nothing next" here (every
+         * other mode always has somewhere to go -- see
+         * compute_auto_advance_index()). */
+        int finished_index = compute_auto_advance_index(playlist_index);
+        if (finished_index >= 0) {
+            commit_auto_advance();
+            play_track_at(finished_index);
+        } else {
+            set_play_button_state(false);
+        }
+    }
+
+    if (playlist_index < 0 || user_seeking) return;
+
+    double position = audio_get_position_seconds();
+    double duration = audio_get_duration_seconds();
+
+    if (duration > 0) {
+        int32_t percent = (int32_t) ((position / duration) * 100.0);
+        lv_slider_set_value(progress_slider, percent, LV_ANIM_OFF);
+    }
+
+    char pos_str[16];
+    char dur_str[16];
+    format_time(position, pos_str, sizeof(pos_str));
+    format_time(duration, dur_str, sizeof(dur_str));
+    lv_label_set_text(pos_label, pos_str);
+    lv_label_set_text(dur_label, dur_str);
+
+    refresh_format_badge();
+}
+
+typedef struct {
+    lv_obj_t * img;
+    const char * normal_path;
+    const char * pressed_path;
+} transport_btn_ctx_t;
+
+static void transport_btn_press_event_cb(lv_event_t * e) {
+    transport_btn_ctx_t * ctx = (transport_btn_ctx_t *) lv_event_get_user_data(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        lv_image_set_src(ctx->img, asset_path(ctx->pressed_path));
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        lv_image_set_src(ctx->img, asset_path(ctx->normal_path));
+    }
+}
+
+/* ---- Player screen "more" menu: Add to Playlist / EQ / Delete -----------
+ * Same hand-built top-layer overlay shape as every other popup in this file
+ * (bt_action_popup, eq_reset_popup, firmware_update_popup -- this codebase
+ * doesn't use LVGL's lv_msgbox anywhere). ---- */
+
+#define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
+
+static lv_obj_t * add_to_playlist_screen;
+static lv_obj_t * add_to_playlist_list;
+
+static void new_playlist_name_done_cb(const char * text, void * user_data) {
+    (void) user_data;
+    if (text[0] == '\0' || playlist_index < 0) return;
+
+    char created_path[512];
+    bool ok = playlist_files_create(PLAYLISTS_DIR, text, playlist[playlist_index], created_path, sizeof(created_path));
+    show_error_toast(ok ? "Playlist created" : "Failed to create playlist");
+    nav_pop(); /* leave the Add to Playlist picker too, back to the player */
+}
+
+static void new_playlist_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_text_entry("Playlist Name", "", false, false, new_playlist_name_done_cb, NULL);
+}
+
+static void existing_playlist_row_cb(lv_event_t * e) {
+    const char * path = (const char *) lv_event_get_user_data(e);
+    if (playlist_index < 0) return;
+
+    bool ok = playlist_files_append(path, playlist[playlist_index]);
+    show_error_toast(ok ? "Added to playlist" : "Failed to add to playlist");
+    nav_pop();
+}
+
+static void populate_add_to_playlist_screen(void) {
+    lv_obj_clean(add_to_playlist_list);
+
+    lv_obj_t * new_row = lv_obj_create(add_to_playlist_list);
+    lv_obj_set_size(new_row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+    lv_obj_set_style_radius(new_row, LIST_ROW_RADIUS, 0);
+    lv_obj_set_style_bg_color(new_row, LIST_ROW_BG_COLOR, 0);
+    lv_obj_set_style_bg_opa(new_row, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(new_row, 0, 0);
+    lv_obj_remove_flag(new_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(new_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(new_row, new_playlist_row_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * new_label = lv_label_create(new_row);
+    lv_label_set_text(new_label, "+ New Playlist");
+    lv_obj_set_style_text_color(new_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(new_label, &LIST_ROW_FONT, 0);
+    lv_obj_align(new_label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+
+    char ** paths;
+    int count;
+    if (!playlist_files_scan(MUSIC_ROOT_DIR, &paths, &count)) return;
+
+    for (int i = 0; i < count; i++) {
+        lv_obj_t * row = lv_obj_create(add_to_playlist_list);
+        lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, existing_playlist_row_cb, LV_EVENT_CLICKED, paths[i]); /* not freed here -- same lives-for-the-screen's-lifetime tradeoff as eq_profile_row_cb's own paths[i] */
+
+        lv_obj_t * label = lv_label_create(row);
+        lv_label_set_text(label, basename_of(paths[i]));
+        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+    }
+    free(paths);
+}
+
+static lv_obj_t * build_add_to_playlist_screen(void) {
+    lv_obj_t * title_label;
+    return build_subsonic_list_screen("Add to Playlist", &title_label, &add_to_playlist_list);
+}
+
+/* ---- Delete confirmation popup ---- */
+static lv_obj_t * delete_song_popup;
+static lv_obj_t * delete_song_popup_backdrop;
+static lv_obj_t * delete_song_popup_title;
+
+static void hide_delete_song_popup(void) {
+    lv_obj_add_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(delete_song_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void delete_song_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_delete_song_popup();
+}
+
+static void delete_song_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_delete_song_popup();
+}
+
+static void delete_song_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_delete_song_popup();
+    if (playlist_index < 0 || playlist_index >= playlist_count) return;
+
+    char * to_delete = strdup(playlist[playlist_index]);
+    int del_index = playlist_index;
+
+    /* What to play next is decided BEFORE touching the file or the array --
+     * whatever ends up sitting at del_index once the deleted entry is
+     * removed (i.e. what used to be right after it), or the new last track
+     * if the deleted one was last. Doesn't try to honor Shuffle/Repeat here
+     * -- a delete is a one-off structural change to the queue, not a
+     * "what's next" playback decision. */
+    free(playlist[del_index]);
+    for (int i = del_index; i < playlist_count - 1; i++) playlist[i] = playlist[i + 1];
+    playlist_count--;
+
+    if (playlist_count == 0) {
+        audio_stop();
+        free(playlist);
+        playlist = NULL;
+        playlist_index = -1;
+        set_play_button_state(false);
+        lv_label_set_text(song_title_label, "No track loaded");
+        nav_pop(); /* nothing left to show on the player screen */
+    } else {
+        int new_index = (del_index < playlist_count) ? del_index : playlist_count - 1;
+        play_track_at(new_index);
+    }
+
+    unlink(to_delete); /* only after playback has moved off it */
+    free(to_delete);
+    show_error_toast("Song deleted");
+}
+
+static void build_delete_song_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    delete_song_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(delete_song_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(delete_song_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(delete_song_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(delete_song_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(delete_song_popup_backdrop, delete_song_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    delete_song_popup = lv_obj_create(top);
+    lv_obj_set_size(delete_song_popup, 420, 220);
+    lv_obj_align(delete_song_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(delete_song_popup, 16, 0);
+    lv_obj_set_style_bg_color(delete_song_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(delete_song_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(delete_song_popup, 0, 0);
+    lv_obj_remove_flag(delete_song_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(delete_song_popup, LV_OBJ_FLAG_HIDDEN);
+
+    delete_song_popup_title = lv_label_create(delete_song_popup);
+    lv_obj_set_width(delete_song_popup_title, lv_pct(90));
+    lv_label_set_long_mode(delete_song_popup_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(delete_song_popup_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(delete_song_popup_title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(delete_song_popup_title, ui_size_22, 0);
+    lv_obj_align(delete_song_popup_title, LV_ALIGN_TOP_MID, 0, 20);
+
+    lv_obj_t * delete_row = lv_obj_create(delete_song_popup);
+    lv_obj_set_size(delete_row, lv_pct(90), 56);
+    lv_obj_align(delete_row, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_radius(delete_row, 12, 0);
+    lv_obj_set_style_bg_opa(delete_row, 0, 0);
+    lv_obj_set_style_border_width(delete_row, 0, 0);
+    lv_obj_remove_flag(delete_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(delete_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(delete_row, delete_song_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * delete_label = lv_label_create(delete_row);
+    lv_label_set_text(delete_label, "Delete");
+    lv_obj_set_style_text_color(delete_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(delete_label, ui_size_20, 0);
+    lv_obj_center(delete_label);
+
+    lv_obj_t * cancel_row = lv_obj_create(delete_song_popup);
+    lv_obj_set_size(cancel_row, lv_pct(90), 56);
+    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
+    lv_obj_set_style_radius(cancel_row, 12, 0);
+    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
+    lv_obj_set_style_border_width(cancel_row, 0, 0);
+    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cancel_row, delete_song_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * cancel_label = lv_label_create(cancel_row);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_center(cancel_label);
+}
+
+/* ---- The "more" 3-row menu itself ---- */
+static lv_obj_t * more_menu_popup;
+static lv_obj_t * more_menu_popup_backdrop;
+
+static void hide_more_menu_popup(void) {
+    lv_obj_add_flag(more_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(more_menu_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void more_menu_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_more_menu_popup();
+}
+
+static void more_menu_add_to_playlist_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_more_menu_popup();
+    populate_add_to_playlist_screen();
+    nav_push(add_to_playlist_screen);
+}
+
+static void more_menu_eq_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_more_menu_popup();
+    nav_push(eq_screen);
+}
+
+static void more_menu_delete_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_more_menu_popup();
+    if (playlist_index < 0 || playlist_index >= playlist_count) return;
+
+    lv_label_set_text_fmt(delete_song_popup_title, "Delete %s?\nThis cannot be undone.", basename_of(playlist[playlist_index]));
+    lv_obj_remove_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(delete_song_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(delete_song_popup_backdrop);
+    lv_obj_move_foreground(delete_song_popup);
+}
+
+static void more_icon_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (playlist_index < 0) return;
+
+    lv_obj_remove_flag(more_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(more_menu_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(more_menu_popup_backdrop);
+    lv_obj_move_foreground(more_menu_popup);
+}
+
+static void build_more_menu_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    more_menu_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(more_menu_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(more_menu_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(more_menu_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(more_menu_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(more_menu_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(more_menu_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(more_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(more_menu_popup_backdrop, more_menu_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    more_menu_popup = lv_obj_create(top);
+    lv_obj_set_size(more_menu_popup, 400, 244);
+    lv_obj_align(more_menu_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(more_menu_popup, 16, 0);
+    lv_obj_set_style_bg_color(more_menu_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(more_menu_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(more_menu_popup, 0, 0);
+    lv_obj_remove_flag(more_menu_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(more_menu_popup, LV_OBJ_FLAG_HIDDEN);
+
+    static const struct {
+        const char * label;
+        lv_event_cb_t cb;
+        bool destructive;
+    } rows[] = {
+        { "Add to Playlist", more_menu_add_to_playlist_cb, false },
+        { "EQ", more_menu_eq_cb, false },
+        { "Delete", more_menu_delete_cb, true },
+    };
+
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        lv_obj_t * row = lv_obj_create(more_menu_popup);
+        lv_obj_set_size(row, lv_pct(90), 56);
+        lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 20 + (int) i * 66);
+        lv_obj_set_style_radius(row, 12, 0);
+        lv_obj_set_style_bg_opa(row, 0, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, rows[i].cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t * label = lv_label_create(row);
+        lv_label_set_text(label, rows[i].label);
+        lv_obj_set_style_text_color(label, rows[i].destructive ? lv_color_make(255, 120, 120) : accent_lv_color(), 0);
+        lv_obj_set_style_text_font(label, ui_size_20, 0);
+        lv_obj_center(label);
+    }
+}
+
+static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_height) {
+    (void) screen_width;
+    (void) screen_height;
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_make(0, 0, 0), 0);
+
+    /* Full-bleed album art (real per-track art is Task #16 -- this is the
+     * firmware's own default cover placeholder, 480x480, top-aligned) plus
+     * a matching 480x320 gradient panel that exactly fills the remaining
+     * screen height below it (480 + 320 = 800), giving the seamless
+     * art-fades-to-dark backdrop from the reference photo without needing
+     * any distortion/stretching of the square art. */
+    cover_img = lv_image_create(scr);
+    lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
+    lv_obj_align(cover_img, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t * overlay = lv_obj_create(scr);
+    lv_obj_set_size(overlay, 480, 320);
+    lv_obj_align(overlay, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_image_src(overlay, asset_path("playing_plane/buttom.png"), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_set_style_radius(overlay, 0, 0);
+    lv_obj_remove_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(overlay, 16, 0);
+    /* Extra bottom padding, on top of pad_all's 16 -- SPACE_BETWEEN below
+     * packs controls_row (the transport row: prev/play/next) flush against
+     * this panel's own bottom padding edge, which otherwise put it directly
+     * under the home indicator bar (see build_home_indicator_bar()) and its
+     * swipe-up hit zone, confirmed overlapping on a real screenshot. Only
+     * the bottom side changes -- top/left/right stay at the plain 16 set
+     * above. */
+    lv_obj_set_style_pad_bottom(overlay, 16 + HOME_INDICATOR_BAND_HEIGHT, 0);
+    lv_obj_set_flex_flow(overlay, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(overlay, 6, 0);
+    /* Without an explicit main-axis alignment, flex defaults to packing
+     * children at the top, leaving the rest of this 320px panel empty below
+     * the transport row -- SPACE_BETWEEN spreads title/artist/progress/time/
+     * controls out to fill the whole panel instead, controls_row landing at
+     * the very bottom edge. */
+    lv_obj_set_flex_align(overlay, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    /* Dismiss affordance over the album art, top-left -- same left-pointing
+     * back arrow as every other screen's back button, for a consistent
+     * back-button convention across the app. */
+    /* Hitbox is deliberately larger than the visual icon (64x64 vs the
+     * icon's native size) -- real-hardware testing showed taps aimed at this
+     * corner landing a handful of pixels below a tight 44x44 box (finger
+     * imprecision on a small corner target), so the touch area is padded out
+     * generously while the icon itself stays centered at its normal size. */
+    lv_obj_t * dismiss_btn = lv_obj_create(scr);
+    lv_obj_set_size(dismiss_btn, 64, 64);
+    lv_obj_align(dismiss_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(dismiss_btn, 0, 0);
+    lv_obj_set_style_border_width(dismiss_btn, 0, 0);
+    lv_obj_remove_flag(dismiss_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(dismiss_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(dismiss_btn, library_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * dismiss_arrow = lv_image_create(dismiss_btn);
+    lv_image_set_src(dismiss_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(dismiss_arrow);
+
+    /* Title row: song title (left) + favorite icon (right) -- matches the
+     * reference layout, where the 3-dot "more" menu lives in the transport
+     * row below instead (repeat/prev/play/next/more), not up here. */
+    lv_obj_t * title_row = lv_obj_create(overlay);
+    lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(title_row, 0, 0);
+    lv_obj_set_style_border_width(title_row, 0, 0);
+    lv_obj_set_style_pad_all(title_row, 0, 0);
+    lv_obj_remove_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    song_title_label = lv_label_create(title_row);
+    lv_label_set_text(song_title_label, "No track loaded");
+    lv_obj_set_style_text_color(song_title_label, lv_color_make(255, 255, 255), 0);
+    /* Explicit rather than relying on LV_FONT_DEFAULT -- see fallback_font.h,
+     * this is one of the handful of labels that needs the non-Latin
+     * fallback but was never otherwise styled. */
+    lv_obj_set_style_text_font(song_title_label, &app_font_16, 0);
+
+    favorite_icon = lv_image_create(title_row);
+    lv_image_set_src(favorite_icon, asset_path("playing_plane/collect_out.png"));
+    lv_obj_add_flag(favorite_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(favorite_icon, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Artist row: artist (left) + format/quality badge (right). */
+    lv_obj_t * artist_row = lv_obj_create(overlay);
+    lv_obj_set_size(artist_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(artist_row, 0, 0);
+    lv_obj_set_style_border_width(artist_row, 0, 0);
+    lv_obj_set_style_pad_all(artist_row, 0, 0);
+    lv_obj_remove_flag(artist_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(artist_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(artist_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    song_folder_label = lv_label_create(artist_row);
+    lv_label_set_text(song_folder_label, "");
+    lv_obj_set_style_text_color(song_folder_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_set_style_text_font(song_folder_label, &app_font_16, 0); /* see song_title_label's own comment above */
+
+    format_badge_label = lv_label_create(artist_row);
+    lv_label_set_text(format_badge_label, "");
+    lv_obj_set_style_text_color(format_badge_label, lv_color_make(150, 150, 150), 0);
+
+    /* Real seek bar: progress_bg/progress/cursor are all sized to their own
+     * fixed 440x12 (track) / 30x30 (knob) pixel art, so the slider is given
+     * those exact dimensions rather than a percentage width -- stretching
+     * would blur/tile the asset. */
+    progress_slider = lv_slider_create(overlay);
+    lv_obj_set_size(progress_slider, 440, 12);
+    lv_obj_align(progress_slider, LV_ALIGN_TOP_MID, 0, 0);
+    lv_slider_set_range(progress_slider, 0, 100);
+    lv_slider_set_value(progress_slider, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_image_src(progress_slider, asset_path("playing_plane/progress_bg.png"), LV_PART_MAIN);
+    lv_obj_set_style_bg_image_src(progress_slider, asset_path("playing_plane/progress.png"), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_image_src(progress_slider, asset_path("playing_plane/cursor.png"), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_width(progress_slider, 30, LV_PART_KNOB);
+    lv_obj_set_style_height(progress_slider, 30, LV_PART_KNOB);
+    lv_obj_add_event_cb(progress_slider, progress_slider_event_cb, LV_EVENT_ALL, NULL);
+
+    lv_obj_t * time_row = lv_obj_create(overlay);
+    lv_obj_set_size(time_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(time_row, 0, 0);
+    lv_obj_set_style_border_width(time_row, 0, 0);
+    lv_obj_set_style_pad_all(time_row, 0, 0);
+    lv_obj_remove_flag(time_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(time_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(time_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    pos_label = lv_label_create(time_row);
+    lv_label_set_text(pos_label, "0:00");
+    lv_obj_set_style_text_color(pos_label, lv_color_make(180, 180, 180), 0);
+
+    dur_label = lv_label_create(time_row);
+    lv_label_set_text(dur_label, "0:00");
+    lv_obj_set_style_text_color(dur_label, lv_color_make(180, 180, 180), 0);
+
+    /* "N/M" position within the current queue -- centered, between the
+     * progress bar and the transport row below it. */
+    song_count_label = lv_label_create(overlay);
+    lv_label_set_text(song_count_label, "");
+    lv_obj_set_style_text_color(song_count_label, lv_color_make(140, 140, 140), 0);
+
+    /* Transport row: prev / play-pause / next, centered. */
+    lv_obj_t * controls_row = lv_obj_create(overlay);
+    lv_obj_set_size(controls_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(controls_row, 0, 0);
+    lv_obj_set_style_border_width(controls_row, 0, 0);
+    lv_obj_set_style_pad_all(controls_row, 0, 0);
+    lv_obj_set_style_pad_top(controls_row, 10, 0);
+    lv_obj_remove_flag(controls_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(controls_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(controls_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(controls_row, 36, 0);
+
+    /* Play-mode icon (sequential/repeat/shuffle) -- leftmost, matching the
+     * reference layout (repeat / prev / play / next / more). Tapping cycles
+     * Sequential -> Repeat All -> Repeat One -> Shuffle (order_icon_event_cb). */
+    order_icon = lv_image_create(controls_row);
+    lv_image_set_src(order_icon, asset_path(play_mode_icon_asset((play_mode_t) current_settings.play_mode)));
+    lv_obj_add_flag(order_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(order_icon, 16);
+    lv_obj_add_event_cb(order_icon, order_icon_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * prev_btn = lv_image_create(controls_row);
+    lv_image_set_src(prev_btn, asset_path("playing_plane/btn_prev.png"));
+    lv_obj_add_flag(prev_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(prev_btn, prev_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    transport_btn_ctx_t * prev_ctx = malloc(sizeof(transport_btn_ctx_t));
+    *prev_ctx = (transport_btn_ctx_t){ prev_btn, "playing_plane/btn_prev.png", "playing_plane/btn_prev_s.png" };
+    lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, prev_ctx);
+    lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, prev_ctx);
+    lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, prev_ctx);
+
+    play_btn = lv_image_create(controls_row);
+    lv_image_set_src(play_btn, asset_path("playing_plane/btn_play.png"));
+    lv_obj_add_flag(play_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(play_btn, play_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * next_btn = lv_image_create(controls_row);
+    lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
+    lv_obj_add_flag(next_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(next_btn, next_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    transport_btn_ctx_t * next_ctx = malloc(sizeof(transport_btn_ctx_t));
+    *next_ctx = (transport_btn_ctx_t){ next_btn, "playing_plane/btn_next.png", "playing_plane/btn_next_s.png" };
+    lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, next_ctx);
+    lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, next_ctx);
+    lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, next_ctx);
+
+    /* 3-dot "more" menu -- rightmost, matching the reference layout. Opens
+     * more_menu_popup (Add to Playlist / EQ / Delete). */
+    lv_obj_t * more_icon = lv_image_create(controls_row);
+    lv_image_set_src(more_icon, asset_path("playing_plane/ic_more.png"));
+    lv_obj_add_flag(more_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(more_icon, 16);
+    lv_obj_add_event_cb(more_icon, more_icon_event_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Volume is controlled via hardware buttons (see update_timer_cb) and,
+     * per the real device, shown only as a transient overlay rather than a
+     * permanently visible slider (Task #28) -- kept alive here, just
+     * invisible, so the existing hw-button volume logic keeps working
+     * unchanged until that overlay lands. */
+    volume_slider = lv_slider_create(scr);
+    lv_obj_add_flag(volume_slider, LV_OBJ_FLAG_HIDDEN);
+    lv_slider_set_range(volume_slider, 0, 100);
+    lv_slider_set_value(volume_slider, (int32_t) (audio_get_volume() * 100.0f), LV_ANIM_OFF);
+    lv_obj_add_event_cb(volume_slider, volume_slider_event_cb, LV_EVENT_ALL, NULL);
+
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* Same true-black rationale as screen_builders.c's own SCREEN_BG_COLOR --
+ * kept as a separate copy since these screens are built directly in gui.c
+ * rather than through the shared screen_builders.c helpers. */
+#define SCREEN_BG_COLOR lv_color_make(0, 0, 0)
+
+static lv_obj_t * build_files_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Files");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title, ui_size_28, 0);
+
+    file_browser_init(scr, MUSIC_ROOT_DIR, on_file_selected);
+
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void music_files_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(files_screen);
+}
+
+/* Library-wide (not one-directory) views -- All Songs, Artists, Albums --
+ * all built from one scan-and-tag-read pass over the whole music root,
+ * done once at startup (library_scan_once(), called from gui_init before
+ * any of these screens are built) rather than every time a screen is
+ * entered: simpler, and a personal music library isn't expected to change
+ * shape mid-session the way a single directory being actively browsed
+ * might. */
+static char ** all_songs_paths = NULL;
+static int all_songs_count = 0;
+
+static const char * basename_of(const char * path) {
+    const char * slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+/* Parallel array to all_songs_paths -- title/artist/album tag per song
+ * (reading all of them from the same metadata_read() call, rather than once
+ * per grouping, since that's the expensive part of indexing a whole
+ * library). Untagged artist/album/album_artist/genre fall back to an
+ * explicit "Unknown" bucket rather than silently dropping the song from
+ * these views the way a missing group would -- title is the odd one out: it
+ * isn't a grouping key, just a display string, so it's left empty on a
+ * missing tag and show_group_songs() falls back to the filename itself at
+ * render time instead of baking a fake title into the cache. */
+typedef struct {
+    char title[128];
+    char artist[128];
+    char album[128];
+    char album_artist[128];
+    char genre[128];
+} song_tags_t;
+
+static song_tags_t * all_song_tags = NULL;
+
+/* Real song title (from tags) everywhere navigation is metadata-driven
+ * (Artists/Albums/Album Artist/Genre drill-downs, All Songs) -- falls back
+ * to the filename only when the file genuinely has no title tag, never as
+ * the default. The plain file/folder browser (file_browser.c) is a
+ * different, deliberately filename-based view and does NOT go through this
+ * -- browsing raw files on the card needs to show what's actually on disk. */
+static const char * song_display_title_of(int index) {
+    if (all_song_tags[index].title[0] != '\0') return all_song_tags[index].title;
+    return basename_of(all_songs_paths[index]);
+}
+
+/* One artist/album/album-artist/genre's songs, as indices into
+ * all_songs_paths/all_song_tags (not owned copies -- those arrays already
+ * own the strings and outlive every group). */
+typedef struct {
+    char name[128];
+    int * indices;
+    int count;
+} group_t;
+
+static group_t * artist_groups = NULL;
+static int artist_group_count = 0;
+static group_t * album_groups = NULL;
+static int album_group_count = 0;
+static group_t * album_artist_groups = NULL;
+static int album_artist_group_count = 0;
+
+static const char * artist_key_of(int index) { return all_song_tags[index].artist; }
+static const char * album_key_of(int index) { return all_song_tags[index].album; }
+static const char * album_artist_key_of(int index) { return all_song_tags[index].album_artist; }
+
+static int compare_index_by_artist(const void * a, const void * b) {
+    int ia = *(const int *) a, ib = *(const int *) b;
+    int cmp = strcasecmp(artist_key_of(ia), artist_key_of(ib));
+    return cmp != 0 ? cmp : strcasecmp(all_songs_paths[ia], all_songs_paths[ib]);
+}
+
+static int compare_index_by_album(const void * a, const void * b) {
+    int ia = *(const int *) a, ib = *(const int *) b;
+    int cmp = strcasecmp(album_key_of(ia), album_key_of(ib));
+    return cmp != 0 ? cmp : strcasecmp(all_songs_paths[ia], all_songs_paths[ib]);
+}
+
+static int compare_index_by_album_artist(const void * a, const void * b) {
+    int ia = *(const int *) a, ib = *(const int *) b;
+    int cmp = strcasecmp(album_artist_key_of(ia), album_artist_key_of(ib));
+    return cmp != 0 ? cmp : strcasecmp(all_songs_paths[ia], all_songs_paths[ib]);
+}
+
+/* Sorts the given song indices by key_of (via cmp, which also tie-breaks by
+ * path so each resulting group's members come out path-sorted for free) and
+ * slices the sorted run into one group_t per distinct key. Used both for
+ * whole-library grouping (build_groups_by, below) and for regrouping a
+ * single group's members by a second key -- e.g. an artist's songs by
+ * album, for show_artist_albums(). */
+static void build_groups_by_indices(const int * indices, int count,
+                                     const char * (*key_of)(int), int (*cmp)(const void *, const void *),
+                                     group_t ** out_groups, int * out_count) {
+    if (count <= 0) { *out_groups = NULL; *out_count = 0; return; }
+
+    int * order = malloc(sizeof(int) * (size_t) count);
+    memcpy(order, indices, sizeof(int) * (size_t) count);
+    qsort(order, (size_t) count, sizeof(int), cmp);
+
+    group_t * groups = NULL;
+    int group_count = 0;
+    int group_capacity = 0;
+
+    int i = 0;
+    while (i < count) {
+        const char * key = key_of(order[i]);
+        int j = i;
+        while (j < count && strcasecmp(key_of(order[j]), key) == 0) j++;
+        int member_count = j - i;
+
+        if (group_count == group_capacity) {
+            group_capacity = group_capacity ? group_capacity * 2 : 16;
+            groups = realloc(groups, sizeof(group_t) * (size_t) group_capacity);
+        }
+        group_t * g = &groups[group_count++];
+        snprintf(g->name, sizeof(g->name), "%s", key);
+        g->count = member_count;
+        g->indices = malloc(sizeof(int) * (size_t) member_count);
+        memcpy(g->indices, &order[i], sizeof(int) * (size_t) member_count);
+
+        i = j;
+    }
+
+    free(order);
+    *out_groups = groups;
+    *out_count = group_count;
+}
+
+static void build_groups_by(const char * (*key_of)(int), int (*cmp)(const void *, const void *),
+                             group_t ** out_groups, int * out_count) {
+    if (all_songs_count <= 0) { *out_groups = NULL; *out_count = 0; return; }
+
+    int * order = malloc(sizeof(int) * (size_t) all_songs_count);
+    for (int i = 0; i < all_songs_count; i++) order[i] = i;
+    build_groups_by_indices(order, all_songs_count, key_of, cmp, out_groups, out_count);
+    free(order);
+}
+
+static void free_group_array(group_t * groups, int count) {
+    for (int i = 0; i < count; i++) free(groups[i].indices);
+    free(groups);
+}
+
+/* Undoes everything library_scan_once() below allocates -- needed before a
+ * rescan (Settings > Update Music Database) can safely repopulate these from
+ * scratch, not just on first run. */
+static void library_free_scan_state(void) {
+    for (int i = 0; i < all_songs_count; i++) free(all_songs_paths[i]);
+    free(all_songs_paths);
+    all_songs_paths = NULL;
+    free(all_song_tags);
+    all_song_tags = NULL;
+    all_songs_count = 0;
+
+    free_group_array(artist_groups, artist_group_count);
+    artist_groups = NULL;
+    artist_group_count = 0;
+    free_group_array(album_groups, album_group_count);
+    album_groups = NULL;
+    album_group_count = 0;
+    free_group_array(album_artist_groups, album_artist_group_count);
+    album_artist_groups = NULL;
+    album_artist_group_count = 0;
+}
+
+/* A stuck read on a corrupted SD card block (confirmed on a real device via
+ * /proc/<pid>/task/<tid>/status+wchan showing the main thread parked in
+ * __bread_gfp, a kernel block-device read, after the card came back from an
+ * unclean unmount) lands the calling thread in an uninterruptible (D-state)
+ * kernel wait. That can't be interrupted by a signal, alarm(), or
+ * pthread_cancel() -- the only way to bound it is to run the risky call on
+ * its own throwaway thread and simply stop waiting on it if it doesn't
+ * finish in time. On timeout, the thread and its heap-allocated work struct
+ * below are deliberately never joined or freed: the worker may still be
+ * blocked in the kernel indefinitely, joining it would just reintroduce the
+ * exact hang this exists to avoid, and freeing memory it might still write
+ * to would be a use-after-free. This leaks one thread and one small
+ * allocation per genuinely stuck path for the life of the process, which
+ * only happens on real filesystem corruption -- a bounded cost, and far
+ * better than the whole UI freezing. */
+#define LIBRARY_SCAN_FILE_TIMEOUT_MS 5000
+#define LIBRARY_SCAN_WALK_TIMEOUT_MS 30000
+
+typedef struct {
+    char root[600];
+    volatile bool done;
+    bool ok;
+    char ** paths;
+    int count;
+} scan_walk_work_t;
+
+static void * scan_walk_worker(void * arg) {
+    scan_walk_work_t * w = (scan_walk_work_t *) arg;
+    w->ok = file_browser_scan_all_songs(w->root, &w->paths, &w->count);
+    w->done = true; /* written last -- the only field polled below */
+    return NULL;
+}
+
+/* Real-device incident: scan_walk_worker() recurses into every subdirectory
+ * (file_browser.c's scan_all_songs_recursive(), a few KB of stack per level
+ * for its own PATH_MAX buffer), and a plain pthread_create() with no
+ * explicit attr gets musl's fairly small default stack -- confirmed live as
+ * a real crash (stack overflow surfacing as a SIGSEGV inside vsnprintf) even
+ * after that function grew its own depth cap and stopped following
+ * symlinks. 1MB is cheap on this device for one short-lived worker thread
+ * (a rescan finishes long before it would ever hold that memory for long)
+ * and leaves enormous headroom over the worst case even at the cap. Falls
+ * back to the default stack size if setting this fails, rather than not
+ * spawning the scan at all -- attribute setup failing is not itself a
+ * reason to skip the whole feature. */
+#define SCAN_WALK_THREAD_STACK_SIZE (1024 * 1024)
+static bool scan_all_songs_with_timeout(const char * root, char *** out_paths, int * out_count) {
+    scan_walk_work_t * w = calloc(1, sizeof(*w));
+    snprintf(w->root, sizeof(w->root), "%s", root);
+
+    pthread_attr_t attr;
+    pthread_attr_t * attr_ptr = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        if (pthread_attr_setstacksize(&attr, SCAN_WALK_THREAD_STACK_SIZE) == 0) attr_ptr = &attr;
+    }
+
+    pthread_t thread;
+    bool created = pthread_create(&thread, attr_ptr, scan_walk_worker, w) == 0;
+    if (attr_ptr) pthread_attr_destroy(&attr);
+    if (!created) {
+        free(w);
+        return false;
+    }
+    pthread_detach(thread); /* never joined either way -- see block comment above */
+
+    for (int waited_ms = 0; waited_ms < LIBRARY_SCAN_WALK_TIMEOUT_MS; waited_ms += 20) {
+        if (w->done) {
+            bool ok = w->ok;
+            *out_paths = w->paths;
+            *out_count = w->count;
+            free(w);
+            return ok;
+        }
+        usleep(20000);
+    }
+
+    fprintf(stderr, "Warning: timed out scanning %s for songs (possible filesystem corruption) -- treating library as empty\n", root);
+    return false;
+}
+
+/* Runs the original (pre-timeout) stat + cache-lookup + metadata_read body
+ * for every file from start_index to all_songs_count, writing straight into
+ * the shared all_song_tags array -- exactly like a plain for loop, no
+ * per-file thread spawning. An earlier version of this function ran each
+ * file's stat()/metadata_read() on its own throwaway thread; that bounded a
+ * stuck read correctly, but on this device (single core, 56MB RAM) spawning
+ * two threads per file made a real ~2000-song library visibly slow, purely
+ * from thread-create overhead on files that were never actually going to
+ * hang. completed_index is updated after each file so scan_songs_range()
+ * (below) can tell this worker apart from a genuinely stuck one without
+ * touching any per-file timing itself. */
+typedef struct {
+    int start_index;
+    volatile int completed_index; /* last index this worker fully finished; written last within each iteration */
+    volatile bool done;
+} scan_range_work_t;
+
+/* Overall scan progress, polled by update_timer_cb while library_rescan_active
+ * is true to drive the "Updating music database..." screen's progress bar
+ * (Settings > Update Music Database) -- purely cosmetic, for the user's
+ * peace of mind that a rescan is actually moving rather than stuck, since
+ * the underlying incremental scan (metadata_db.c's mtime/size cache) is
+ * already fast on an unchanged library. _total is set once all_songs_count
+ * is known (library_scan_once(), before scan_songs_range() starts); _done
+ * only ever increases across however many sequential scan_range_worker
+ * threads a scan actually uses (see scan_songs_range()'s own comment on
+ * why there can be more than one), so a single running total here is safe
+ * without needing to know which worker is currently active. */
+static volatile int library_scan_progress_done = 0;
+static int library_scan_progress_total = 0;
+
+static void * scan_range_worker(void * arg) {
+    scan_range_work_t * w = (scan_range_work_t *) arg;
+    w->completed_index = w->start_index - 1;
+
+    for (int i = w->start_index; i < all_songs_count; i++) {
+        struct stat st;
+        bool have_stat = stat(all_songs_paths[i], &st) == 0;
+        int64_t mtime = have_stat ? (int64_t) st.st_mtime : 0;
+        int64_t size = have_stat ? (int64_t) st.st_size : 0;
+
+        cached_tags_t cached;
+        /* cached.title[0] == '\0' also forces a fresh read, not just a
+         * missing/changed cache row -- rows written before the title column
+         * existed got backfilled to '' by metadata_db.c's ALTER TABLE
+         * migration, and would otherwise stay blank forever (mtime/size
+         * still match, so metadata_db_get() would keep "hitting" that same
+         * stale empty title on every future scan too). The ongoing cost for
+         * a file that genuinely has no title tag is one extra
+         * metadata_read() per scan for that file only, not the whole
+         * library -- worth it to self-heal every already-cached library
+         * the first time it's rescanned under the new schema. */
+        if (have_stat && metadata_db_get(all_songs_paths[i], mtime, size, &cached) && cached.title[0] != '\0') {
+            snprintf(all_song_tags[i].title, sizeof(all_song_tags[i].title), "%s", cached.title);
+            snprintf(all_song_tags[i].artist, sizeof(all_song_tags[i].artist), "%s", cached.artist);
+            snprintf(all_song_tags[i].album, sizeof(all_song_tags[i].album), "%s", cached.album);
+            snprintf(all_song_tags[i].album_artist, sizeof(all_song_tags[i].album_artist), "%s", cached.album_artist);
+            snprintf(all_song_tags[i].genre, sizeof(all_song_tags[i].genre), "%s", cached.genre);
+            w->completed_index = i;
+            library_scan_progress_done = i + 1;
+            continue;
+        }
+
+        /* Isolated (forked + hard-killed on timeout), not a plain
+         * metadata_read() call -- real-device incident: a handful of FLAC
+         * files with a malformed leading ID3v2 tag made the underlying
+         * parser (dr_flac, misparsing garbage as fake metadata blocks --
+         * see metadata_read_isolated()'s own comment) pathologically slow
+         * on this single-core device, and since the stuck-worker handling
+         * below can only ever ABANDON a stuck thread (never actually stop
+         * it), several such files in a row each left one more runaway
+         * thread permanently competing for the one core -- which read as
+         * the whole device freezing even though no single file was
+         * technically stuck forever. This still leaves the stuck-worker
+         * handling below in place as a backstop, but it should now rarely
+         * or never trigger, since a single file's parse can no longer
+         * block this worker indefinitely. */
+        track_metadata_t meta;
+        metadata_read_isolated(all_songs_paths[i], &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS);
+        snprintf(all_song_tags[i].title, sizeof(all_song_tags[i].title), "%s", meta.has_title ? meta.title : "");
+        snprintf(all_song_tags[i].artist, sizeof(all_song_tags[i].artist), "%s", meta.has_artist ? meta.artist : "Unknown Artist");
+        snprintf(all_song_tags[i].album, sizeof(all_song_tags[i].album), "%s", meta.has_album ? meta.album : "Unknown Album");
+        /* Album artist falls back to the track artist (not "Unknown") when
+         * there's no explicit ALBUMARTIST/TPE2/aART tag -- for the common
+         * non-compilation case, the album artist genuinely IS the track
+         * artist, and a tagger simply not bothering to write a redundant
+         * second tag shouldn't dump the song into an "Unknown" bucket the
+         * user has to know to check. */
+        const char * album_artist_value = meta.has_album_artist ? meta.album_artist
+                                         : (meta.has_artist ? meta.artist : "Unknown Artist");
+        snprintf(all_song_tags[i].album_artist, sizeof(all_song_tags[i].album_artist), "%s", album_artist_value);
+        snprintf(all_song_tags[i].genre, sizeof(all_song_tags[i].genre), "%s", meta.has_genre ? meta.genre : "Unknown Genre");
+        free(meta.picture_data); /* only the tags were needed, not the art */
+
+        if (have_stat) {
+            cached_tags_t fresh;
+            snprintf(fresh.title, sizeof(fresh.title), "%s", all_song_tags[i].title);
+            snprintf(fresh.artist, sizeof(fresh.artist), "%s", all_song_tags[i].artist);
+            snprintf(fresh.album, sizeof(fresh.album), "%s", all_song_tags[i].album);
+            snprintf(fresh.album_artist, sizeof(fresh.album_artist), "%s", all_song_tags[i].album_artist);
+            snprintf(fresh.genre, sizeof(fresh.genre), "%s", all_song_tags[i].genre);
+            metadata_db_put(all_songs_paths[i], mtime, size, &fresh);
+        }
+        w->completed_index = i; /* written last -- the only field scan_songs_range() polls */
+        library_scan_progress_done = i + 1;
+    }
+
+    w->done = true;
+    return NULL;
+}
+
+/* Covers [start_index, all_songs_count) by handing the whole range to one
+ * worker thread -- the common case (a healthy card) pays for exactly one
+ * thread for the entire scan, not one per file. If the worker goes
+ * LIBRARY_SCAN_FILE_TIMEOUT_MS without finishing another file, it's
+ * considered stuck on completed_index+1 (a corrupted block -- see the block
+ * comment further up on why this can't be interrupted, only abandoned): that
+ * worker is leaked exactly like the timeout cases above, the stuck file's
+ * tags are filled with a placeholder, and a fresh worker picks up one file
+ * further along. Thread creation only happens once per scan plus once per
+ * actual stall, so a large healthy library costs the same as the original
+ * unbounded loop. */
+static void scan_songs_range(int start_index) {
+    while (start_index < all_songs_count) {
+        scan_range_work_t * w = calloc(1, sizeof(*w));
+        w->start_index = start_index;
+
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, scan_range_worker, w) != 0) {
+            free(w);
+            return; /* can't spawn a thread at all -- remaining tags stay at their malloc'd (garbage) contents, same failure mode as the rest of this call chain already tolerates */
+        }
+        pthread_detach(thread); /* never joined either way -- see block comment above */
+
+        int last_seen = start_index - 1;
+        int waited_ms = 0;
+        for (;;) {
+            if (w->done) { free(w); return; }
+            int completed = w->completed_index;
+            if (completed != last_seen) {
+                last_seen = completed;
+                waited_ms = 0;
+            } else {
+                waited_ms += 20;
+                if (waited_ms >= LIBRARY_SCAN_FILE_TIMEOUT_MS) break;
+            }
+            usleep(20000);
+        }
+
+        int stuck_index = last_seen + 1; /* w is now abandoned -- never touch it again */
+        fprintf(stderr, "Warning: timed out reading tags from %s (possible filesystem corruption) -- skipping\n", all_songs_paths[stuck_index]);
+        all_song_tags[stuck_index].title[0] = '\0';
+        snprintf(all_song_tags[stuck_index].artist, sizeof(all_song_tags[stuck_index].artist), "Unknown Artist");
+        snprintf(all_song_tags[stuck_index].album, sizeof(all_song_tags[stuck_index].album), "Unknown Album");
+        snprintf(all_song_tags[stuck_index].album_artist, sizeof(all_song_tags[stuck_index].album_artist), "Unknown Artist");
+        snprintf(all_song_tags[stuck_index].genre, sizeof(all_song_tags[stuck_index].genre), "Unknown Genre");
+        start_index = stuck_index + 1;
+    }
+}
+
+/* Defined later, alongside the rest of the Books screen (needs
+ * books_scan_txt_files_with_timeout(), the live-walk fallback it shares
+ * with populate_books_files_screen()'s old scanning code). Folds the
+ * now-removed "Scanning" row's job into this same rescan, per real-device
+ * feedback -- one rescan action, not two separate ones for music and
+ * books. */
+static void rescan_books(void);
+
+static void library_scan_once(void) {
+    library_free_scan_state();
+    library_scan_progress_done = 0;
+    library_scan_progress_total = 0;
+    scan_all_songs_with_timeout(MUSIC_ROOT_DIR, &all_songs_paths, &all_songs_count);
+
+    /* metadata_db_open() is idempotent (a no-op once already open, see its
+     * own guard) -- called here, ahead of its other call site below, so
+     * rescan_books() always has a real db handle to write into regardless
+     * of whether any music was found. Unconditional, before the
+     * all_songs_count==0 early return just below -- an empty (or
+     * music-free) library shouldn't skip refreshing the book cache too,
+     * they're independent collections. */
+    metadata_db_open();
+    rescan_books();
+
+    if (all_songs_count == 0) return;
+
+    library_scan_progress_total = all_songs_count;
+
+    metadata_db_begin_update();
+
+    all_song_tags = malloc(sizeof(song_tags_t) * (size_t) all_songs_count);
+    scan_songs_range(0);
+
+    metadata_db_end_update();
+
+    build_groups_by(artist_key_of, compare_index_by_artist, &artist_groups, &artist_group_count);
+    build_groups_by(album_key_of, compare_index_by_album, &album_groups, &album_group_count);
+    build_groups_by(album_artist_key_of, compare_index_by_album_artist, &album_artist_groups, &album_artist_group_count);
+}
+
+/* Boot-time equivalent of library_scan_once() above (still used verbatim
+ * for the user-triggered Settings > Update Music Database rescan) that
+ * matches the stock player's own boot behavior: load whatever's already
+ * cached, don't walk the filesystem or re-read any file's tags. Real-device
+ * incident: the full scan_once() path took ~149 seconds against a real
+ * cache-cold 2066-song library (confirmed via persistent boot-checkpoint
+ * logging -- library_scan_once() ran synchronously from gui_init(), before
+ * this app's first frame could render or the main loop could start), long
+ * enough that this app had never once survived a genuine cold boot in this
+ * project's history -- no hardware watchdog would tolerate that delay, on
+ * any user's library of meaningful size. metadata_db_open() itself stays
+ * here (not removed): its own stock-db warm-start import (metadata_db.c)
+ * is plain bounded SQLite row reads, not per-file filesystem I/O, and
+ * finishes in well under a second even for a large library -- it's
+ * specifically the filesystem walk + per-file tag-parsing pass that had to
+ * move to the user-triggered-only path. */
+static void library_load_from_cache_only(void) {
+    library_free_scan_state();
+    library_scan_progress_done = 0;
+    library_scan_progress_total = 0;
+
+    metadata_db_open();
+
+    /* metadata_db_load_all() fills a cached_tags_t array (metadata_db.h);
+     * all_song_tags is declared song_tags_t -- a separately-named struct
+     * with an identical field layout (see song_tags_t's own comment), kept
+     * distinct because gui.c's copy predates metadata_db.h and this is the
+     * only place the two ever need to cross paths. Safe to reinterpret the
+     * pointer rather than copy field-by-field. */
+    cached_tags_t * tags = NULL;
+    metadata_db_load_all(&all_songs_paths, &tags, &all_songs_count);
+    all_song_tags = (song_tags_t *) tags;
+    if (all_songs_count == 0) return;
+
+    build_groups_by(artist_key_of, compare_index_by_artist, &artist_groups, &artist_group_count);
+    build_groups_by(album_key_of, compare_index_by_album, &album_groups, &album_group_count);
+    build_groups_by(album_artist_key_of, compare_index_by_album_artist, &album_artist_groups, &album_artist_group_count);
+}
+
+static void all_songs_row_click_cb(int index) {
+    /* on_file_selected() takes ownership of (and eventually frees) the
+     * playlist it's given, but all_songs_paths must survive for the next
+     * tap too -- hand it a fresh copy rather than the persistent array
+     * itself. */
+    char ** playlist_copy = malloc(sizeof(char *) * (size_t) all_songs_count);
+    for (int i = 0; i < all_songs_count; i++) playlist_copy[i] = strdup(all_songs_paths[i]);
+    on_file_selected(playlist_copy, all_songs_count, index);
+}
+
+static lv_obj_t * build_all_songs_screen(void) {
+    compact_list_item_t * items = NULL;
+    if (all_songs_count > 0) {
+        items = malloc(sizeof(compact_list_item_t) * (size_t) all_songs_count);
+        for (int i = 0; i < all_songs_count; i++) {
+            items[i] = (compact_list_item_t){ song_display_title_of(i) };
+        }
+    }
+
+    lv_obj_t * scr = build_compact_list_screen("All Songs", generic_back_cb, items, all_songs_count, all_songs_row_click_cb);
+    free(items);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void all_songs_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(all_songs_screen);
+}
+
+/* Shared drill-down target for both Artists and Albums: one persistent
+ * screen whose row list is rebuilt each time (same "one object, rebuilt on
+ * demand" approach file_browser.c uses for its own directory listing)
+ * rather than pre-building a screen per artist/album -- a real library can
+ * have hundreds of those, most never opened in a given session. */
+static lv_obj_t * group_songs_screen;
+static lv_obj_t * group_songs_title_label;
+static lv_obj_t * group_songs_list;
+static const int * group_songs_indices; /* borrowed from whichever group_t is currently shown */
+static int group_songs_count;
+
+static void group_song_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int pos = (int) (intptr_t) lv_event_get_user_data(e); /* position within the CURRENT group, not the whole library */
+
+    char ** playlist_copy = malloc(sizeof(char *) * (size_t) group_songs_count);
+    for (int i = 0; i < group_songs_count; i++) playlist_copy[i] = strdup(all_songs_paths[group_songs_indices[i]]);
+    on_file_selected(playlist_copy, group_songs_count, pos);
+}
+
+static void show_group_songs(const group_t * group) {
+    group_songs_indices = group->indices;
+    group_songs_count = group->count;
+
+    lv_label_set_text(group_songs_title_label, group->name);
+    lv_obj_clean(group_songs_list);
+
+    for (int i = 0; i < group->count; i++) {
+        /* One lv_label via the shared list_row_style, not a container +
+         * child label each with their own local style properties -- see
+         * list_row_style's own doc comment (screen_builders.h). */
+        lv_obj_t * row = lv_label_create(group_songs_list);
+        lv_obj_add_style(row, &list_row_style, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_label_set_text(row, song_display_title_of(group->indices[i]));
+
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, group_song_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+
+    nav_push(group_songs_screen);
+}
+
+static lv_obj_t * build_group_songs_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    group_songs_title_label = lv_label_create(scr);
+    lv_label_set_text(group_songs_title_label, "");
+    lv_obj_align(group_songs_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(group_songs_title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(group_songs_title_label, &app_font_28, 0); /* shows a metadata-derived artist/album/genre name -- see fallback_font.h */
+
+    group_songs_list = lv_obj_create(scr);
+    lv_obj_set_size(group_songs_list, lv_pct(100),
+                    lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
+                        TITLE_ROW_HEIGHT);
+    lv_obj_align(group_songs_list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(group_songs_list, 0, 0);
+    lv_obj_set_style_border_width(group_songs_list, 0, 0);
+    lv_obj_set_scroll_dir(group_songs_list, LV_DIR_VER); /* see build_icon_grid_screen's comment */
+    lv_obj_set_flex_flow(group_songs_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(group_songs_list, 4, 0);
+    lv_obj_set_style_pad_top(group_songs_list, 4, 0);
+
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* Reusable on-screen keyboard text entry -- the app had none of this
+ * before network streaming needed a way to type a server URL/username/
+ * password. One persistent screen (title + textarea + lv_keyboard),
+ * repurposed for whatever's being entered via show_text_entry() rather
+ * than a screen per use, same "one object, rebuilt/retargeted on demand"
+ * approach as group_songs_screen above. Deliberately skips
+ * finalize_screen_navigation() (no swipe-to-go-back) -- a swipe gesture
+ * while typing on the keyboard would be an easy accidental way to lose
+ * whatever was being entered. (text_entry_done_cb_t itself is forward-
+ * declared earlier, alongside show_text_entry(), for the PEQ screen's
+ * tap-to-edit handlers.) */
+
+static lv_obj_t * text_entry_screen;
+static lv_obj_t * text_entry_title_label;
+static lv_obj_t * text_entry_textarea;
+static lv_obj_t * text_entry_keyboard;
+static lv_obj_t * text_entry_reveal_btn;
+static text_entry_done_cb_t text_entry_on_done;
+static void * text_entry_user_data;
+
+/* Bumped on every show_text_entry() call -- lets the READY handler below
+ * tell whether the caller's done-callback chained straight into ANOTHER
+ * show_text_entry() (Wi-Fi manual SSID entry is the one place that does:
+ * SSID entered -> immediately prompts for the password) versus a callback
+ * that just saved a value and returned. Real-device bug report: manual SSID
+ * entry never actually asked for the password. Root cause was a race, not a
+ * missing call -- the chained show_text_entry() DID run and DID push the
+ * password screen, but this handler's own nav_pop() (issued for the SSID
+ * screen, right before invoking the callback) is an ANIMATED transition
+ * (screen_transition_slide(), ~NAV_ANIM_TIME_MS), and its completion
+ * callback unconditionally lv_screen_load()s the screen nav_pop() was
+ * originally headed to once that animation finishes -- landing well after
+ * the password screen had already been pushed on top of it, and snapping
+ * straight back to the Wi-Fi list before the user ever got a real chance at
+ * it. nav_push()'s own dedup guard (same screen object already on top of
+ * the stack -> just reload, don't grow the stack) means comparing nav_depth
+ * before/after the callback can't detect this -- a chained call reuses this
+ * same singleton text_entry_screen without changing nav_depth at all -- so
+ * a dedicated generation counter is what actually distinguishes the two
+ * cases. */
+static uint32_t text_entry_generation = 0;
+
+static void text_entry_reveal_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    bool now_masked = !lv_textarea_get_password_mode(text_entry_textarea);
+    lv_textarea_set_password_mode(text_entry_textarea, now_masked);
+    lv_label_set_text(lv_obj_get_child(text_entry_reveal_btn, 0), now_masked ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN);
+}
+
+static void text_entry_kb_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY) {
+        /* lv_textarea_get_text()'s buffer belongs to the textarea and would
+         * be invalidated/reused the moment another screen starts editing
+         * it, so copy it out before invoking the caller's callback (which
+         * may itself push a screen that reuses this same textarea, e.g.
+         * entering the next field). */
+        char text_copy[256];
+        snprintf(text_copy, sizeof(text_copy), "%s", lv_textarea_get_text(text_entry_textarea));
+        text_entry_done_cb_t cb = text_entry_on_done;
+        void * user_data = text_entry_user_data;
+        uint32_t generation_before = text_entry_generation;
+        int depth_before = nav_depth;
+        /* Callback runs BEFORE nav_pop() now (reversed from the original
+         * order) specifically so the checks below can see whether it
+         * navigated anywhere on its own -- see text_entry_generation's own
+         * comment. Real-device bug report (Wi-Fi manual SSID entry): the
+         * generation check alone wasn't enough -- it only catches a callback
+         * that chains into ANOTHER show_text_entry() call reusing this same
+         * singleton screen (nav_depth unchanged, dedup guard in nav_push()
+         * eats the push). Wi-Fi's password-entered callback instead calls
+         * start_wifi_connect(), which nav_push()es a DIFFERENT screen
+         * (subsonic_downloading_screen, "Connecting to X...") straight off
+         * this one -- nav_depth DOES grow there, since that push isn't a
+         * dedup no-op. Confirmed live: the connecting screen flashed up
+         * then was animated straight back to the password field by nav_pop()
+         * a moment later, looking like nothing happened -- each repeat tap
+         * on the keyboard's OK button (six of them, one real device test)
+         * genuinely re-ran the whole callback, creating a fresh duplicate
+         * saved network every time (wifi_control_connect() always
+         * add_network()s a new entry, see its own comment).
+         *
+         * Simply skipping nav_pop() in that case (an earlier version of
+         * this fix) stopped the yank-back, but left THIS screen's own
+         * stack slot sitting there permanently, one level below wherever
+         * the callback's own push actually landed -- confirmed live via
+         * the Subsonic download path's identical shape (see poll_subsonic_
+         * download()'s own comment): backing out of the destination screen
+         * afterward surfaced this now-defunct form again instead of
+         * whatever was open before it, since nothing had ever removed its
+         * slot. nav_remove_stack_slot() splices it out after the fact once
+         * it's clear something else already took its place. */
+        if (cb) cb(text_copy, user_data);
+        if (nav_depth > depth_before) {
+            nav_remove_stack_slot(depth_before - 1);
+        } else if (text_entry_generation == generation_before) {
+            nav_pop();
+        }
+        /* else (nav_depth == depth_before && generation changed): the
+         * callback chained into another show_text_entry() call reusing
+         * this exact screen object -- nav_push()'s own dedup guard already
+         * reloaded it in place, nothing further to do here. */
+    } else if (code == LV_EVENT_CANCEL) {
+        nav_pop();
+    }
+}
+
+static lv_obj_t * build_text_entry_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    text_entry_title_label = lv_label_create(scr);
+    lv_label_set_text(text_entry_title_label, "");
+    lv_obj_align(text_entry_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 8);
+    lv_obj_set_style_text_color(text_entry_title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(text_entry_title_label, ui_size_16, 0);
+
+    text_entry_textarea = lv_textarea_create(scr);
+    lv_obj_set_size(text_entry_textarea, lv_pct(78), 50);
+    lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 40);
+    lv_textarea_set_one_line(text_entry_textarea, true);
+
+    /* Real-device bug report: no way to unmask a password field while
+     * typing it. Reuses LVGL's own built-in eye symbols (already present in
+     * the montserrat fonts this app ships) rather than a custom asset.
+     * Hidden entirely for non-password fields by show_text_entry() below --
+     * the textarea is narrowed to make room for it unconditionally so
+     * switching between password/non-password fields doesn't reflow the
+     * textarea's width and position. */
+    text_entry_reveal_btn = lv_button_create(scr);
+    lv_obj_set_size(text_entry_reveal_btn, 44, 44);
+    lv_obj_align_to(text_entry_reveal_btn, text_entry_textarea, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+    lv_obj_add_event_cb(text_entry_reveal_btn, text_entry_reveal_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * reveal_icon = lv_label_create(text_entry_reveal_btn);
+    lv_label_set_text(reveal_icon, LV_SYMBOL_EYE_CLOSE);
+    lv_obj_center(reveal_icon);
+
+    text_entry_keyboard = lv_keyboard_create(scr);
+    lv_keyboard_set_textarea(text_entry_keyboard, text_entry_textarea);
+    lv_obj_add_event_cb(text_entry_keyboard, text_entry_kb_event_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(text_entry_keyboard, text_entry_kb_event_cb, LV_EVENT_CANCEL, NULL);
+
+    return scr;
+}
+
+/* Pushes the text entry screen pre-filled with initial_text (may be NULL
+ * for empty) under `title`; on_done fires with whatever was typed when the
+ * keyboard's OK/Enter is pressed (not called at all if the keyboard's
+ * Cancel/close is pressed instead -- callers shouldn't assume it always
+ * fires). is_password masks the input the same way a real password field
+ * would. numeric switches the keyboard to LV_KEYBOARD_MODE_NUMBER (digits,
+ * decimal point, +/- -- everything peq.c's freq/gain/Q fields need) instead
+ * of the default full QWERTY layout. */
+static void show_text_entry(const char * title, const char * initial_text, bool is_password, bool numeric,
+                             text_entry_done_cb_t on_done, void * user_data) {
+    lv_label_set_text(text_entry_title_label, title);
+    lv_textarea_set_text(text_entry_textarea, initial_text ? initial_text : "");
+    lv_textarea_set_password_mode(text_entry_textarea, is_password);
+    /* Always reset to masked/hidden -- otherwise a field left revealed by
+     * the previous show_text_entry() call (e.g. Wi-Fi's chained SSID ->
+     * password, which reuses this same singleton screen without an
+     * intervening rebuild) would carry that state into an unrelated field. */
+    lv_label_set_text(lv_obj_get_child(text_entry_reveal_btn, 0), LV_SYMBOL_EYE_CLOSE);
+    if (is_password) {
+        lv_obj_remove_flag(text_entry_reveal_btn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(text_entry_reveal_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_keyboard_set_mode(text_entry_keyboard, numeric ? LV_KEYBOARD_MODE_NUMBER : LV_KEYBOARD_MODE_TEXT_LOWER);
+    text_entry_on_done = on_done;
+    text_entry_user_data = user_data;
+    text_entry_generation++;
+    nav_push(text_entry_screen);
+}
+
+/* ---- Subsonic-compatible network streaming ----
+ *
+ * Downloads the whole track to a local temp file (/tmp, wiped on reboot,
+ * same reasoning as everywhere else in this app that only needs a
+ * transient file) before handing it to the existing, local-file-only
+ * decoder pipeline, rather than decoding a true network stream --
+ * retrofitting every decoder here (including the vendored AIFF/DSD/AAC/
+ * ALAC/APE ones, all built around a plain seekable FILE*) for streaming
+ * reads is a much bigger project than this round's scope. The tradeoff is
+ * a short wait before playback starts instead of it starting instantly. */
+
+static subsonic_server_t subsonic_server_from_settings(void) {
+    subsonic_server_t server;
+    snprintf(server.base_url, sizeof(server.base_url), "%s", current_settings.subsonic_url);
+    snprintf(server.username, sizeof(server.username), "%s", current_settings.subsonic_username);
+    snprintf(server.password, sizeof(server.password), "%s", current_settings.subsonic_password);
+    server.verify_tls = current_settings.subsonic_verify_tls;
+    return server;
+}
+
+/* Background download thread + a "done" flag polled from update_timer_cb --
+ * the same shape as audio.c's own track_finished flag, for the same reason:
+ * LVGL isn't thread-safe, so the thread can't touch any screen/widget
+ * state directly. */
+static pthread_t download_thread;
+static bool download_active = false;
+static volatile bool download_done_flag = false;
+static volatile bool download_success_flag = false;
+static char download_dest_path[512];
+
+typedef struct {
+    char url[1536];
+    char dest_path[512];
+    bool verify_tls;
+} download_request_t;
+
+static void * download_thread_func(void * arg) {
+    download_request_t * req = (download_request_t *) arg;
+    bool ok = http_get_to_file(req->url, req->verify_tls, req->dest_path, NULL, NULL);
+    download_success_flag = ok;
+    download_done_flag = true; /* written last -- update_timer_cb only checks this flag */
+    free(req);
+    return NULL;
+}
+
+static lv_obj_t * subsonic_downloading_screen;
+static lv_obj_t * subsonic_downloading_label;
+static lv_obj_t * subsonic_downloading_progress_bar;
+static void start_subsonic_download(const char * url, bool verify_tls, const char * dest_path, const char * display_title) {
+    snprintf(download_dest_path, sizeof(download_dest_path), "%s", dest_path);
+
+    download_request_t * req = malloc(sizeof(*req));
+    snprintf(req->url, sizeof(req->url), "%s", url);
+    snprintf(req->dest_path, sizeof(req->dest_path), "%s", dest_path);
+    req->verify_tls = verify_tls;
+
+    download_done_flag = false;
+    download_success_flag = false;
+    download_active = true;
+
+    lv_label_set_text_fmt(subsonic_downloading_label, "Downloading\n%s...", display_title);
+    nav_push(subsonic_downloading_screen);
+
+    pthread_create(&download_thread, NULL, download_thread_func, req);
+}
+
+static void poll_subsonic_download(void) {
+    if (!download_active || !download_done_flag) return;
+
+    download_active = false;
+    pthread_join(download_thread, NULL);
+    bool success = download_success_flag;
+
+    /* Real-device bug report: a downloaded Subsonic track needed a second
+     * tap on the song to actually start playing -- same race already fixed
+     * for Wi-Fi manual SSID entry (see text_entry_kb_event_cb's own comment
+     * for the full mechanism). on_file_selected() -> play_track_at_from()
+     * nav_push()es the player screen the instant playback starts; nav_pop()
+     * below (leaving the "Downloading..." screen) is an ANIMATED transition
+     * queued via screen_transition_slide(), whose completion callback
+     * unconditionally lv_screen_load()s back to the song list once that
+     * animation finishes, a moment after the player screen was already
+     * showing -- yanking the UI back even though audio was, underneath,
+     * genuinely already playing.
+     *
+     * Real-device follow-up: simply skipping nav_pop() when on_file_
+     * selected() already navigated (an earlier version of this fix) did
+     * stop the yank-back, but left subsonic_downloading_screen's own slot
+     * sitting in the stack forever, one level below the player screen --
+     * confirmed live as backing out of the player landing back on the now-
+     * defunct "Downloading..." screen instead of the song list underneath
+     * it. nav_remove_stack_slot() (see its own comment) splices that slot
+     * out once it's clear the player screen already took its place,
+     * rather than trying to avoid creating it in the first place -- the
+     * push already happened by the time this code can tell whether it
+     * did. */
+    int depth_before = nav_depth;
+    if (success) {
+        char ** playlist = malloc(sizeof(char *));
+        playlist[0] = strdup(download_dest_path);
+        on_file_selected(playlist, 1, 0);
+    }
+    if (nav_depth > depth_before) {
+        nav_remove_stack_slot(depth_before - 1);
+    } else {
+        nav_pop(); /* leave the downloading screen */
+    }
+    /* else (download failed, or play_track_at_from() bailed out early via
+     * external_dac_block_reason() without navigating): silently stays
+     * wherever nav_pop() landed -- no error-toast UI exists yet to explain
+     * a failed download (network drop, server error mid-stream, disk
+     * full, ...), same gap already noted for subsonic_connect_row_cb
+     * above. */
+}
+
+/* DLNA/UPnP-AV cast-and-play -- see dlna_control.h for the full mechanism
+ * (dmrd relays SetAVTransportURI/Play/Stop over an undocumented socket;
+ * this module downloads the cast URL and hands it to the normal local
+ * playback pipeline, same download-then-play shape as Subsonic streaming
+ * just above, and the same reason: no decoder here reads a true network
+ * stream). Relies on the downloaded file's own embedded tags for Now
+ * Playing display via the standard on_file_selected() path, same as
+ * Subsonic, rather than the richer DIDL-Lite title/artist/album
+ * dlna_control_consume_ready_track() also provides -- real casts observed
+ * during this feature's investigation had matching embedded tags, and
+ * threading an override path through apply_track_metadata_to_ui() for a
+ * case that may not come up in practice wasn't worth the added risk this
+ * round. No "please wait" screen the way subsonic downloads get one --
+ * a cast is user-initiated from another device, not from a tap on this
+ * screen, so there's no local navigation context to hold open while it
+ * downloads. */
+static void poll_dlna_control(void) {
+    char path[512], title[256], artist[256], album[256];
+    if (dlna_control_consume_ready_track(path, sizeof(path), title, sizeof(title),
+                                          artist, sizeof(artist), album, sizeof(album))) {
+        char ** playlist = malloc(sizeof(char *));
+        playlist[0] = strdup(path);
+        on_file_selected(playlist, 1, 0);
+    }
+    if (dlna_control_consume_stop_requested()) {
+        audio_stop();
+        set_play_button_state(false);
+    }
+}
+
+/* Shared "please wait" interstitial for background ops that still use it
+ * (subsonic downloads/connects, wifi connect, library rescan) -- an
+ * in-flight download/connect/rescan isn't safely cancelable (partial file,
+ * half-applied network config, ...), so this has no way back, by design.
+ * Wi-Fi/Bluetooth scans and the Bluetooth power toggle used to share this
+ * same screen too (with a cancel button, since abandoning a scan is safe),
+ * but that was the source of a real, repeatedly-hit stuck-screen bug
+ * (multiple uncoordinated users of one shared overlay/button, plus the
+ * overlay getting buried under further navigation) -- see git history for
+ * that mechanism if it's ever needed again. Those three now run fully in
+ * the background with no screen of their own at all, matching the stock
+ * player; this interstitial and its (now permanently hidden, nothing sets
+ * it) cancel button are what's left for the remaining, genuinely
+ * non-cancelable uses. */
+static lv_obj_t * build_subsonic_downloading_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    subsonic_downloading_label = lv_label_create(scr);
+    lv_label_set_text(subsonic_downloading_label, "");
+    lv_obj_set_style_text_color(subsonic_downloading_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_align(subsonic_downloading_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(subsonic_downloading_label, LV_ALIGN_CENTER, 0, -20);
+
+    /* Only the library-rescan flow (start_library_rescan()/poll_library_
+     * rescan()) ever shows this -- the other reuses of this shared "please
+     * wait" screen (subsonic download/connect, wifi connect) don't have a
+     * meaningful total to report progress against, so it stays hidden
+     * unless a rescan explicitly shows it, and gets hidden again as soon as
+     * that rescan's success message is dismissed. */
+    subsonic_downloading_progress_bar = lv_bar_create(scr);
+    lv_obj_set_size(subsonic_downloading_progress_bar, 280, 14);
+    lv_obj_align(subsonic_downloading_progress_bar, LV_ALIGN_CENTER, 0, 30);
+    lv_bar_set_range(subsonic_downloading_progress_bar, 0, 100);
+    lv_obj_add_style(subsonic_downloading_progress_bar, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
+
+    return scr;
+}
+
+/* Shared by the artists/albums/songs screens: a titled list of compact
+ * rows, one per index-based click callback, built fresh from a persistent
+ * (never-deleted) list container each time the user drills into a new
+ * artist/album -- same "rebuild in place" approach as the local library's
+ * group_songs_screen, since a real server library can have far too many
+ * artists/albums/songs to pre-build a screen per one. */
+static void populate_indexed_list(lv_obj_t * list, int count, const char * (*label_of)(int), lv_event_cb_t click_cb) {
+    lv_obj_clean(list);
+    for (int i = 0; i < count; i++) {
+        /* One lv_label via the shared list_row_style, not a container +
+         * child label each with their own local style properties -- see
+         * list_row_style's own doc comment (screen_builders.h). */
+        lv_obj_t * row = lv_label_create(list);
+        lv_obj_add_style(row, &list_row_style, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_label_set_text(row, label_of(i));
+
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title_label = lv_label_create(scr);
+    lv_label_set_text(title_label, default_title);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title_label, &app_font_28, 0); /* later re-set to a real (possibly non-Latin) server artist/album/song name -- see fallback_font.h */
+
+    lv_obj_t * list = lv_obj_create(scr);
+    lv_obj_set_size(list, lv_pct(100),
+                    lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
+                        TITLE_ROW_HEIGHT);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(list, 0, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER); /* see build_icon_grid_screen's comment in screen_builders.c */
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(list, 4, 0);
+    lv_obj_set_style_pad_top(list, 4, 0);
+
+    *out_title_label = title_label;
+    *out_list = list;
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* Pill-styled toggle/chevron rows for the Wi-Fi/Bluetooth settings screens'
+ * dynamic top section -- same real assets (touch_list/item_bg.png,
+ * settings/on.png/off.png) as screen_builders.c's build_pill_list_screen(),
+ * but built directly into an already-existing dynamically-repopulated list
+ * container rather than that function's own fixed item array, since these
+ * screens mix a handful of fixed settings rows with variable-length device/
+ * network lists below them (build_pill_list_screen has no notion of
+ * "and also whatever these dynamic sections need appended after"). */
+static lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) {
+    lv_obj_t * row = lv_obj_create(parent);
+    lv_obj_set_size(row, 448, 124);
+    lv_obj_set_style_bg_color(row, SCREEN_BG_COLOR, 0);
+    lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * label = lv_label_create(row);
+    lv_label_set_text(label, label_text);
+    lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(label, ui_size_16, 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
+    return row;
+}
+
+static lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click) {
+    lv_obj_t * row = add_pill_row_base(parent, label_text);
+
+    lv_obj_t * toggle_img = lv_image_create(row);
+    lv_image_set_src(toggle_img, asset_path(checked ? "settings/on.png" : "settings/off.png"));
+    lv_obj_align(toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
+
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    if (on_click) lv_obj_add_event_cb(row, on_click, LV_EVENT_CLICKED, NULL);
+    return row;
+}
+
+static lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_text, lv_event_cb_t on_click) {
+    lv_obj_t * row = add_pill_row_base(parent, label_text);
+
+    /* No matching real chevron asset found in theme2 at this screen scale
+     * (see screen_builders.c's own PILL_ACCESSORY_CHEVRON) -- plain text is
+     * the honest fallback rather than forcing a mismatched sprite. */
+    lv_obj_t * chevron = lv_label_create(row);
+    lv_label_set_text(chevron, ">");
+    lv_obj_set_style_text_color(chevron, lv_color_make(140, 140, 140), 0);
+    lv_obj_set_style_text_font(chevron, ui_size_16, 0);
+    lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, -20, 0);
+
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    if (on_click) lv_obj_add_event_cb(row, on_click, LV_EVENT_CLICKED, NULL);
+    return row;
+}
+
+static lv_obj_t * add_section_header(lv_obj_t * parent, const char * text) {
+    lv_obj_t * label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_color(label, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_font(label, ui_size_16, 0);
+    lv_obj_set_style_pad_top(label, 12, 0);
+    lv_obj_set_style_pad_left(label, 24, 0);
+    return label;
+}
+
+static subsonic_artist_t * subsonic_artists_cache = NULL;
+static int subsonic_artists_count = 0;
+static subsonic_album_t * subsonic_albums_cache = NULL;
+static int subsonic_albums_count = 0;
+static subsonic_song_t * subsonic_songs_cache = NULL;
+static int subsonic_songs_count = 0;
+
+static lv_obj_t * subsonic_artists_screen;
+static lv_obj_t * subsonic_artists_title_label;
+static lv_obj_t * subsonic_artists_list;
+static lv_obj_t * subsonic_albums_screen;
+static lv_obj_t * subsonic_albums_title_label;
+static lv_obj_t * subsonic_albums_list;
+static lv_obj_t * subsonic_songs_screen;
+static lv_obj_t * subsonic_songs_title_label;
+static lv_obj_t * subsonic_songs_list;
+static lv_obj_t * subsonic_saved_servers_screen;
+static lv_obj_t * subsonic_saved_servers_list;
+static lv_obj_t * subsonic_new_connection_screen;
+
+static const char * subsonic_artist_label_of(int i) { return subsonic_artists_cache[i].name; }
+static const char * subsonic_album_label_of(int i) { return subsonic_albums_cache[i].name; }
+static const char * subsonic_song_label_of(int i) { return subsonic_songs_cache[i].title; }
+
+/* Real-device bug report: connecting to a Subsonic (Navidrome) server and
+ * selecting a song crashed the player instead of playing it. Root cause:
+ * this device has only 64MB of RAM total, and /tmp here is tmpfs (RAM-
+ * backed, capped at ~28MB by the rootfs) -- not disk, unlike a normal Linux
+ * box. A single downloaded FLAC landed at ~26MB, confirmed via dmesg's own
+ * OOM killer trace ("Out of memory: Kill process ... open_hiby_playe") --
+ * the file alone nearly filled the entire tmpfs cap, and pushed system-wide
+ * free memory low enough for the kernel to kill this process outright.
+ * MUSIC_ROOT_DIR (the SD card, vfat, tens of GB free on a real device) is
+ * genuinely disk-backed and already exactly where every other file this app
+ * touches lives -- moving the download destination there instead of /tmp
+ * fixes this for any track size, not just ones under some smaller cap. */
+#define SUBSONIC_STREAM_CACHE_DIR MUSIC_ROOT_DIR "/.subsonic_cache"
+
+static void subsonic_song_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    subsonic_song_t * song = &subsonic_songs_cache[index];
+
+    subsonic_server_t server = subsonic_server_from_settings();
+    char url[1536];
+    subsonic_build_stream_url(&server, song->id, url, sizeof(url));
+
+    mkdir(SUBSONIC_STREAM_CACHE_DIR, 0755); /* no-op (EEXIST) if it's already there */
+    char dest[256];
+    snprintf(dest, sizeof(dest), SUBSONIC_STREAM_CACHE_DIR "/stream.%s", song->suffix);
+
+    start_subsonic_download(url, server.verify_tls, dest, song->title);
+}
+
+static void subsonic_album_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+
+    subsonic_server_t server = subsonic_server_from_settings();
+    free(subsonic_songs_cache);
+    subsonic_songs_cache = NULL;
+    subsonic_songs_count = 0;
+    if (!subsonic_get_album_songs(&server, subsonic_albums_cache[index].id, &subsonic_songs_cache, &subsonic_songs_count)) return;
+
+    lv_label_set_text(subsonic_songs_title_label, subsonic_albums_cache[index].name);
+    populate_indexed_list(subsonic_songs_list, subsonic_songs_count, subsonic_song_label_of, subsonic_song_row_click_cb);
+    nav_push(subsonic_songs_screen);
+}
+
+static void subsonic_artist_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+
+    subsonic_server_t server = subsonic_server_from_settings();
+    free(subsonic_albums_cache);
+    subsonic_albums_cache = NULL;
+    subsonic_albums_count = 0;
+    if (!subsonic_get_artist_albums(&server, subsonic_artists_cache[index].id, &subsonic_albums_cache, &subsonic_albums_count)) return;
+
+    lv_label_set_text(subsonic_albums_title_label, subsonic_artists_cache[index].name);
+    populate_indexed_list(subsonic_albums_list, subsonic_albums_count, subsonic_album_label_of, subsonic_album_row_click_cb);
+    nav_push(subsonic_albums_screen);
+}
+
+/* Ping + getArtists run on the same background-thread-plus-polled-flag
+ * shape as the per-song download (see download_thread_func/
+ * poll_subsonic_download above) -- these were originally called straight
+ * from the click handler on the main LVGL thread on the theory that a
+ * ping+one API call is a sub-second round trip, but real-hardware testing
+ * showed just how badly *any* main-thread stall reads on this device (a
+ * frozen screen is indistinguishable from a real hang), and a TCP connect()
+ * to an unreachable/slow server has no such sub-second guarantee -- it can
+ * block for the OS's full connect timeout. Silently stays wherever it
+ * lands on any failure (wrong credentials, unreachable server, ...) --
+ * there's still no toast/error-message UI in this app to explain why,
+ * which remains a real, separately-tracked gap. Shared by both Saved
+ * Servers (tapping a row) and New Connection (the form's own Connect &
+ * Browse button) below, rather than each having its own copy. */
+static pthread_t subsonic_connect_thread;
+static bool subsonic_connect_active = false;
+static volatile bool subsonic_connect_done_flag = false;
+static volatile bool subsonic_connect_success_flag = false;
+/* Snapshot of whichever server this in-flight attempt is for -- the
+ * request struct itself is freed inside the thread function before
+ * poll_subsonic_connect() ever runs, so this is what poll_subsonic_
+ * connect() reads back to know what to persist on success. */
+static subsonic_server_t subsonic_connect_pending_server;
+
+typedef struct {
+    subsonic_server_t server;
+} subsonic_connect_request_t;
+
+static void * subsonic_connect_thread_func(void * arg) {
+    subsonic_connect_request_t * req = (subsonic_connect_request_t *) arg;
+
+    bool ok = subsonic_ping(&req->server);
+    if (ok) {
+        free(subsonic_artists_cache);
+        subsonic_artists_cache = NULL;
+        subsonic_artists_count = 0;
+        ok = subsonic_get_artists(&req->server, &subsonic_artists_cache, &subsonic_artists_count);
+    }
+
+    subsonic_connect_success_flag = ok;
+    subsonic_connect_done_flag = true; /* written last -- poll_subsonic_connect only checks this flag */
+    free(req);
+    return NULL;
+}
+
+static void poll_subsonic_connect(void) {
+    if (!subsonic_connect_active || !subsonic_connect_done_flag) return;
+
+    subsonic_connect_active = false;
+    pthread_join(subsonic_connect_thread, NULL);
+    bool success = subsonic_connect_success_flag;
+
+    /* Same nav_pop()-races-a-navigating-callback issue already fixed for
+     * Wi-Fi manual SSID entry and the Subsonic download-then-play path --
+     * see text_entry_kb_event_cb's own comment for the full mechanism, and
+     * poll_subsonic_download()'s own comment for why skipping nav_pop()
+     * alone isn't enough either (it leaves this screen's own stack slot
+     * stuck underneath the artists screen forever) -- nav_remove_stack_
+     * slot() splices it out instead, once it's clear the artists screen
+     * already took its place. */
+    int depth_before = nav_depth;
+    if (success) {
+        /* Becomes the active connection everything else in this app's
+         * Subsonic browsing/download flow reads via subsonic_server_from_
+         * settings() -- Saved Servers and New Connection both funnel
+         * through this one function, so this is the one place that needs
+         * to update it, regardless of which screen the user connected
+         * from. Also persisted to the Saved Servers list itself (an
+         * upsert, so reconnecting to an already-saved server with updated
+         * credentials just refreshes it rather than duplicating it). */
+        snprintf(current_settings.subsonic_url, sizeof(current_settings.subsonic_url), "%s",
+                 subsonic_connect_pending_server.base_url);
+        snprintf(current_settings.subsonic_username, sizeof(current_settings.subsonic_username), "%s",
+                 subsonic_connect_pending_server.username);
+        snprintf(current_settings.subsonic_password, sizeof(current_settings.subsonic_password), "%s",
+                 subsonic_connect_pending_server.password);
+        current_settings.subsonic_verify_tls = subsonic_connect_pending_server.verify_tls;
+        settings_save(&current_settings);
+
+        metadata_db_subsonic_server_save(subsonic_connect_pending_server.base_url, subsonic_connect_pending_server.username,
+                                          subsonic_connect_pending_server.password, subsonic_connect_pending_server.verify_tls);
+
+        populate_indexed_list(subsonic_artists_list, subsonic_artists_count, subsonic_artist_label_of, subsonic_artist_row_click_cb);
+        nav_push(subsonic_artists_screen);
+    }
+    if (nav_depth > depth_before) {
+        nav_remove_stack_slot(depth_before - 1);
+    } else {
+        nav_pop(); /* leave the connecting screen */
+    }
+    /* else (failure): silently stays wherever nav_pop() landed -- same
+     * documented gap as poll_subsonic_download above. */
+}
+
+static void start_subsonic_connect(const subsonic_server_t * server) {
+    subsonic_connect_pending_server = *server;
+
+    subsonic_connect_request_t * req = malloc(sizeof(*req));
+    req->server = *server;
+
+    subsonic_connect_done_flag = false;
+    subsonic_connect_success_flag = false;
+    subsonic_connect_active = true;
+
+    lv_label_set_text(subsonic_downloading_label, "Connecting to server...");
+    nav_push(subsonic_downloading_screen);
+
+    pthread_create(&subsonic_connect_thread, NULL, subsonic_connect_thread_func, req);
+}
+
+/* ---- Saved Servers -- every server metadata_db_subsonic_server_save() has
+ * ever remembered a successful connection for (see poll_subsonic_connect()
+ * above), listed by URL; tapping one reconnects with its stored
+ * credentials via the same start_subsonic_connect() the New Connection
+ * form below also uses. ---- */
+
+static subsonic_server_row_t * subsonic_saved_servers = NULL;
+static int subsonic_saved_server_count = 0;
+
+static void subsonic_saved_server_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    subsonic_server_row_t * row = &subsonic_saved_servers[index];
+
+    subsonic_server_t server;
+    snprintf(server.base_url, sizeof(server.base_url), "%s", row->url);
+    snprintf(server.username, sizeof(server.username), "%s", row->username);
+    snprintf(server.password, sizeof(server.password), "%s", row->password);
+    server.verify_tls = row->verify_tls;
+    start_subsonic_connect(&server);
+}
+
+static const char * subsonic_saved_server_label_of(int i) { return subsonic_saved_servers[i].url; }
+
+static void populate_subsonic_saved_servers_screen(void) {
+    free(subsonic_saved_servers);
+    subsonic_saved_servers = NULL;
+    subsonic_saved_server_count = 0;
+    metadata_db_load_subsonic_servers(&subsonic_saved_servers, &subsonic_saved_server_count);
+
+    lv_obj_clean(subsonic_saved_servers_list);
+    if (subsonic_saved_server_count == 0) {
+        lv_obj_t * label = lv_label_create(subsonic_saved_servers_list);
+        lv_label_set_text(label, "No saved servers yet");
+        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+        return;
+    }
+    populate_indexed_list(subsonic_saved_servers_list, subsonic_saved_server_count, subsonic_saved_server_label_of,
+                          subsonic_saved_server_row_cb);
+}
+
+static lv_obj_t * build_subsonic_saved_servers_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("Saved Servers", &title_label, &subsonic_saved_servers_list);
+}
+
+static void subsonic_saved_servers_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    populate_subsonic_saved_servers_screen();
+    nav_push(subsonic_saved_servers_screen);
+}
+
+/* ---- New Connection -- a blank form with its own transient state, kept
+ * deliberately separate from current_settings.subsonic_* (which only ever
+ * gets updated on a SUCCESSFUL connect, in poll_subsonic_connect() above)
+ * so an abandoned or failed new-connection attempt can never clobber
+ * whatever server was actually active before it.
+ *
+ * Real-device bug report: no indicator on screen showed a field had
+ * already been filled in -- the original build_pill_list_screen()-based
+ * rows (same as the old single-connection setup screen) show only a
+ * static label baked in once at gui_init() time, never anything reflecting
+ * current state. Rebuilt as a dynamic list instead, same shape as the
+ * Wi-Fi/DNS settings screens (add_pill_chevron_row/add_pill_toggle_row on
+ * a plain scrollable container, repopulated on demand via lv_obj_clean() +
+ * rebuild) -- every row here shows the field's current value (or a masked
+ * "Set"/"Not set" for the password, so it's never actually shown on
+ * screen), and gets refreshed after every edit. ---- */
+static subsonic_server_t subsonic_new_conn_form = { .verify_tls = true };
+static lv_obj_t * subsonic_new_connection_list;
+
+static void populate_subsonic_new_connection_screen(void); /* defined below, after the row callbacks it references */
+
+static void subsonic_new_conn_url_entry_done(const char * text, void * user_data) {
+    (void) user_data;
+    snprintf(subsonic_new_conn_form.base_url, sizeof(subsonic_new_conn_form.base_url), "%s", text);
+    populate_subsonic_new_connection_screen();
+}
+
+static void subsonic_new_conn_url_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_text_entry("Server URL (e.g. https://myserver:4040)", subsonic_new_conn_form.base_url, false, false,
+                    subsonic_new_conn_url_entry_done, NULL);
+}
+
+static void subsonic_new_conn_username_entry_done(const char * text, void * user_data) {
+    (void) user_data;
+    snprintf(subsonic_new_conn_form.username, sizeof(subsonic_new_conn_form.username), "%s", text);
+    populate_subsonic_new_connection_screen();
+}
+
+static void subsonic_new_conn_username_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_text_entry("Username", subsonic_new_conn_form.username, false, false, subsonic_new_conn_username_entry_done, NULL);
+}
+
+static void subsonic_new_conn_password_entry_done(const char * text, void * user_data) {
+    (void) user_data;
+    snprintf(subsonic_new_conn_form.password, sizeof(subsonic_new_conn_form.password), "%s", text);
+    populate_subsonic_new_connection_screen();
+}
+
+static void subsonic_new_conn_password_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_text_entry("Password", subsonic_new_conn_form.password, true, false, subsonic_new_conn_password_entry_done, NULL);
+}
+
+static void subsonic_new_conn_verify_tls_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    subsonic_new_conn_form.verify_tls = !subsonic_new_conn_form.verify_tls;
+    populate_subsonic_new_connection_screen();
+}
+
+static void subsonic_new_conn_connect_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    start_subsonic_connect(&subsonic_new_conn_form);
+}
+
+static void populate_subsonic_new_connection_screen(void) {
+    lv_obj_clean(subsonic_new_connection_list);
+
+    char url_text[300];
+    snprintf(url_text, sizeof(url_text), "Server URL: %s",
+             subsonic_new_conn_form.base_url[0] ? subsonic_new_conn_form.base_url : "Not set");
+    add_pill_chevron_row(subsonic_new_connection_list, url_text, subsonic_new_conn_url_row_cb);
+
+    add_pill_toggle_row(subsonic_new_connection_list, "Verify server certificate", subsonic_new_conn_form.verify_tls,
+                        subsonic_new_conn_verify_tls_toggle_cb);
+
+    char username_text[160];
+    snprintf(username_text, sizeof(username_text), "Username: %s",
+             subsonic_new_conn_form.username[0] ? subsonic_new_conn_form.username : "Not set");
+    add_pill_chevron_row(subsonic_new_connection_list, username_text, subsonic_new_conn_username_row_cb);
+
+    add_pill_chevron_row(subsonic_new_connection_list, subsonic_new_conn_form.password[0] ? "Password: Set" : "Password: Not set",
+                         subsonic_new_conn_password_row_cb);
+
+    add_pill_chevron_row(subsonic_new_connection_list, "Connect & Browse", subsonic_new_conn_connect_row_cb);
+}
+
+static lv_obj_t * build_subsonic_new_connection_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("New Connection", &title_label, &subsonic_new_connection_list);
+}
+
+static void subsonic_new_connection_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    /* Only the text fields reset -- verify_tls deliberately carries over
+     * between visits (no widget-desync risk here anymore, unlike the old
+     * build_pill_list_screen()-based version -- this screen's rows are
+     * fully rebuilt by populate_subsonic_new_connection_screen() below on
+     * every visit, so there's nothing stale left to desync from). */
+    subsonic_new_conn_form.base_url[0] = '\0';
+    subsonic_new_conn_form.username[0] = '\0';
+    subsonic_new_conn_form.password[0] = '\0';
+    populate_subsonic_new_connection_screen();
+    nav_push(subsonic_new_connection_screen);
+}
+
+/* ---- Subsonic entry point -- just the two options; subsonic_tile_cb below
+ * (Stream Media's Subsonic tile) pushes this instead of what used to be a
+ * single combined setup+connect screen for one connection only. ---- */
+static lv_obj_t * build_subsonic_entry_screen(void) {
+    static pill_list_item_t items[2];
+    items[0] = (pill_list_item_t){ "Saved Servers", PILL_ACCESSORY_CHEVRON, false, subsonic_saved_servers_row_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "New Connection", PILL_ACCESSORY_CHEVRON, false, subsonic_new_connection_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* Drill-down target for Artists and Album Artists: tapping either shows the
+ * artist's own albums (regrouping just their songs by album, via
+ * build_groups_by_indices) rather than dumping straight into a flat song
+ * list -- tapping an album from there lands on show_group_songs() same as
+ * every other terminal list. One persistent screen shared by both callers,
+ * same rebuild-in-place approach as group_songs_screen. */
+static lv_obj_t * artist_albums_title_label;
+static lv_obj_t * artist_albums_list;
+static group_t * artist_albums_groups;
+static int artist_albums_group_count;
+
+static const char * artist_album_label_of(int i) { return artist_albums_groups[i].name; }
+
+static void artist_album_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    show_group_songs(&artist_albums_groups[index]);
+}
+
+static void show_artist_albums(const group_t * artist_group) {
+    free_group_array(artist_albums_groups, artist_albums_group_count);
+    build_groups_by_indices(artist_group->indices, artist_group->count, album_key_of, compare_index_by_album,
+                             &artist_albums_groups, &artist_albums_group_count);
+
+    lv_label_set_text(artist_albums_title_label, artist_group->name);
+    populate_indexed_list(artist_albums_list, artist_albums_group_count, artist_album_label_of, artist_album_row_click_cb);
+
+    nav_push(artist_albums_screen);
+}
+
+static void artist_row_click_cb(int index) {
+    show_artist_albums(&artist_groups[index]);
+}
+
+static void album_row_click_cb(int index) {
+    show_group_songs(&album_groups[index]);
+}
+
+static lv_obj_t * build_artists_screen(void) {
+    compact_list_item_t * items = NULL;
+    if (artist_group_count > 0) {
+        items = malloc(sizeof(compact_list_item_t) * (size_t) artist_group_count);
+        for (int i = 0; i < artist_group_count; i++) {
+            items[i] = (compact_list_item_t){ artist_groups[i].name };
+        }
+    }
+    lv_obj_t * scr = build_compact_list_screen("Artists", generic_back_cb, items, artist_group_count, artist_row_click_cb);
+    free(items);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_albums_screen(void) {
+    compact_list_item_t * items = NULL;
+    if (album_group_count > 0) {
+        items = malloc(sizeof(compact_list_item_t) * (size_t) album_group_count);
+        for (int i = 0; i < album_group_count; i++) {
+            items[i] = (compact_list_item_t){ album_groups[i].name };
+        }
+    }
+    lv_obj_t * scr = build_compact_list_screen("Albums", generic_back_cb, items, album_group_count, album_row_click_cb);
+    free(items);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void album_artist_row_click_cb(int index) {
+    show_artist_albums(&album_artist_groups[index]);
+}
+
+static lv_obj_t * build_album_artist_screen(void) {
+    compact_list_item_t * items = NULL;
+    if (album_artist_group_count > 0) {
+        items = malloc(sizeof(compact_list_item_t) * (size_t) album_artist_group_count);
+        for (int i = 0; i < album_artist_group_count; i++) {
+            items[i] = (compact_list_item_t){ album_artist_groups[i].name };
+        }
+    }
+    lv_obj_t * scr = build_compact_list_screen("Album Artist", generic_back_cb, items, album_artist_group_count, album_artist_row_click_cb);
+    free(items);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* ---- Playlists (Music submenu, replacing the old Genres tile -- real-
+ * device feedback: genre tags are inconsistently populated across
+ * libraries, unlike play history/manual curation) --
+ *
+ * Favorites and Most Played (top 20 by play count, see metadata_db's
+ * song_play_count table) are synthesized as group_t's and shown through
+ * show_group_songs() -- the exact same drill-down screen Artists/Albums/
+ * Album Artist already use -- rather than a screen of their own. Unlike
+ * those groups (fixed at library-scan time), favorite/play-count
+ * membership can change between visits, so these two are recomputed fresh
+ * every time their row is tapped instead of once at scan time; the backing
+ * indices arrays are freed+realloc'd on each tap rather than per screen
+ * object, same lifetime as show_group_songs()'s own group_songs_indices
+ * (borrowed, must outlive the group_songs_screen it's currently showing).
+ *
+ * User-created .m3u playlists (Player screen's "Add to Playlist", or
+ * dropped onto the SD card by hand) are listed below those two via
+ * playlist_files_scan() -- already used for the Add to Playlist picker,
+ * just not previously surfaced anywhere for actually playing one. ---- */
+
+#define MOST_PLAYED_LIMIT 20
+
+static int * favorites_indices = NULL;
+static group_t favorites_group;
+static int * most_played_indices = NULL;
+static group_t most_played_group;
+
+/* all_songs_paths has no path->index map -- this only runs on the rare
+ * "user tapped Favorites/Most Played" event, not a hot path, so a linear
+ * scan is fine (same tradeoff metadata_db's own favorite/play-count tables
+ * make by keying on path rather than this array's index). */
+static int find_song_index_by_path(const char * path) {
+    for (int i = 0; i < all_songs_count; i++) {
+        if (strcmp(all_songs_paths[i], path) == 0) return i;
+    }
+    return -1;
+}
+
+static void show_favorites(void) {
+    char ** paths;
+    int count;
+    metadata_db_load_favorite_songs(&paths, &count);
+
+    free(favorites_indices);
+    favorites_indices = count > 0 ? malloc(sizeof(int) * (size_t) count) : NULL;
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        int idx = find_song_index_by_path(paths[i]);
+        if (idx >= 0) favorites_indices[found++] = idx; /* skip a favorite not in the currently-loaded library */
+        free(paths[i]);
+    }
+    free(paths);
+
+    snprintf(favorites_group.name, sizeof(favorites_group.name), "Favorites");
+    favorites_group.indices = favorites_indices;
+    favorites_group.count = found;
+    show_group_songs(&favorites_group);
+}
+
+static void show_most_played(void) {
+    char ** paths;
+    int count;
+    metadata_db_load_top_played_songs(MOST_PLAYED_LIMIT, &paths, &count);
+
+    free(most_played_indices);
+    most_played_indices = count > 0 ? malloc(sizeof(int) * (size_t) count) : NULL;
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        int idx = find_song_index_by_path(paths[i]);
+        if (idx >= 0) most_played_indices[found++] = idx;
+        free(paths[i]);
+    }
+    free(paths);
+
+    snprintf(most_played_group.name, sizeof(most_played_group.name), "Most Played");
+    most_played_group.indices = most_played_indices;
+    most_played_group.count = found;
+    show_group_songs(&most_played_group);
+}
+
+static lv_obj_t * playlists_list;
+static char ** playlists_m3u_paths = NULL;
+static int playlists_m3u_count = 0;
+
+static void playlist_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+
+    if (index == 0) {
+        show_favorites();
+        return;
+    }
+    if (index == 1) {
+        show_most_played();
+        return;
+    }
+
+    int m3u_index = index - 2;
+    if (m3u_index < 0 || m3u_index >= playlists_m3u_count) return;
+
+    char ** songs;
+    int count;
+    if (!file_browser_build_playlist_from_m3u(playlists_m3u_paths[m3u_index], &songs, &count)) {
+        show_error_toast("Playlist is empty or unreadable");
+        return;
+    }
+    on_file_selected(songs, count, 0);
+}
+
+static void populate_playlists_screen(void) {
+    lv_obj_clean(playlists_list);
+
+    for (int i = 0; i < playlists_m3u_count; i++) free(playlists_m3u_paths[i]);
+    free(playlists_m3u_paths);
+    playlists_m3u_paths = NULL;
+    playlists_m3u_count = 0;
+    playlist_files_scan(MUSIC_ROOT_DIR, &playlists_m3u_paths, &playlists_m3u_count);
+
+    lv_obj_t * favorites_row = add_pill_row_base(playlists_list, "Favorites");
+    lv_obj_add_flag(favorites_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(favorites_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 0);
+
+    lv_obj_t * most_played_row = add_pill_row_base(playlists_list, "Most Played");
+    lv_obj_add_flag(most_played_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(most_played_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 1);
+
+    for (int i = 0; i < playlists_m3u_count; i++) {
+        lv_obj_t * row = add_pill_row_base(playlists_list, basename_of(playlists_m3u_paths[i]));
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (2 + i));
+    }
+}
+
+static lv_obj_t * build_playlists_screen(void) {
+    lv_obj_t * title_label;
+    return build_subsonic_list_screen("Playlists", &title_label, &playlists_list);
+}
+
+/* Settings > Update Music Database: reruns library_scan_once() (a full
+ * rescan + tag re-read of MUSIC_ROOT_DIR, same as gui_init's startup call)
+ * on a background thread -- a real library's tag reads are too slow to do
+ * on the UI thread, same reasoning as every other pthread_create() in this
+ * file -- then rebuilds the four prebuilt library screens (All Songs,
+ * Artists, Albums, Album Artist), since unlike group_songs_screen/
+ * artist_albums_screen (which rebuild their rows on every visit) these are
+ * only ever built once at startup and would otherwise keep showing rows
+ * bound to indices into the now-freed pre-rescan arrays. Playlists isn't
+ * one of these four -- see its own build_playlists_screen()/populate_
+ * playlists_screen() comment for why it doesn't need rebuilding here. */
+static pthread_t library_rescan_thread;
+static bool library_rescan_active = false;
+static volatile bool library_rescan_done_flag = false;
+
+static void * library_rescan_thread_func(void * arg) {
+    (void) arg;
+    library_scan_once();
+    library_rescan_done_flag = true; /* written last -- update_timer_cb only checks this flag */
+    return NULL;
+}
+
+static void start_library_rescan(void) {
+    library_rescan_done_flag = false;
+    library_rescan_active = true;
+    lv_label_set_text(subsonic_downloading_label, "Updating\nmusic database...");
+    lv_bar_set_value(subsonic_downloading_progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_remove_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    nav_push(subsonic_downloading_screen);
+    pthread_create(&library_rescan_thread, NULL, library_rescan_thread_func, NULL);
+}
+
+/* How long the "Library updated" success message stays up once a rescan
+ * finishes, before falling back to Home -- purely so the user gets a
+ * moment to actually read it, not a wait for anything real. */
+#define LIBRARY_RESCAN_SUCCESS_MS 1500
+static bool library_rescan_success_pending = false;
+static uint32_t library_rescan_success_since_tick = 0;
+
+static void poll_library_rescan(void) {
+    /* Keep the screen awake for the whole "Updating music database..."/
+     * "Library updated" window -- label and progress-bar text updates
+     * don't touch LVGL's own indev-driven inactivity clock (no touch, no
+     * hw button), so without this the auto screen-timeout would fire mid-
+     * scan on a short timeout setting same as it would on any other idle
+     * screen. Real-device feedback: with the screen-timeout fix that made
+     * touch no longer wake an auto-slept screen (only the power button
+     * does now), that read as the whole device freezing -- a dark,
+     * touch-unresponsive screen mid-rescan looks identical to a genuine
+     * hang from the outside. */
+    if (library_rescan_active || library_rescan_success_pending) {
+        lv_display_trigger_activity(NULL);
+    }
+
+    if (library_rescan_success_pending) {
+        if (lv_tick_elaps(library_rescan_success_since_tick) >= LIBRARY_RESCAN_SUCCESS_MS) {
+            library_rescan_success_pending = false;
+            nav_reset_to_home(); /* leaves the busy screen and discards any stale deeper screen */
+        }
+        return;
+    }
+
+    if (!library_rescan_active) return;
+
+    if (!library_rescan_done_flag) {
+        /* Still scanning -- total stays 0 until the initial file walk
+         * finishes (see library_scan_once()), so there's nothing
+         * meaningful to show yet in that window; the label just keeps
+         * reading "Updating music database..." until then. */
+        if (library_scan_progress_total > 0) {
+            lv_label_set_text_fmt(subsonic_downloading_label, "Updating\nmusic database...\n%d / %d",
+                                   library_scan_progress_done, library_scan_progress_total);
+            lv_bar_set_value(subsonic_downloading_progress_bar,
+                              (int32_t) ((int64_t) library_scan_progress_done * 100 / library_scan_progress_total),
+                              LV_ANIM_OFF);
+        }
+        return;
+    }
+
+    library_rescan_active = false;
+    pthread_join(library_rescan_thread, NULL);
+
+    lv_obj_delete(all_songs_screen);
+    lv_obj_delete(artists_screen);
+    lv_obj_delete(albums_screen);
+    lv_obj_delete(album_artist_screen);
+    all_songs_screen = build_all_songs_screen();
+    artists_screen = build_artists_screen();
+    albums_screen = build_albums_screen();
+    album_artist_screen = build_album_artist_screen();
+    /* playlists_screen deliberately NOT rebuilt here -- unlike the four
+     * screens above, its content (Favorites/Most Played/user .m3u
+     * playlists) is never stale to begin with: populate_playlists_screen()
+     * recomputes it from the database/filesystem fresh every time the
+     * screen is opened (see playlists_tile_cb()), not just after a rescan. */
+
+    lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text_fmt(subsonic_downloading_label, "Library updated\n%d songs", all_songs_count);
+    library_rescan_success_pending = true;
+    library_rescan_success_since_tick = lv_tick_get();
+}
+
+#ifndef HOST_BUILD
+/* Real-device bug report: reinserting the SD card while the device is
+ * already on doesn't populate its files in the player. Root cause -- see
+ * main.c's own mount_sd_card_if_needed() comment for the full real-device
+ * investigation: this firmware has NO hotplug mechanism at all for the
+ * internal SD card slot (confirmed by reading every relevant piece of
+ * config -- /etc/mdev.conf only has a rule for external USB mass-storage
+ * sd[a-z] devices, not the internal mmcblk* card; no fstab entry; no
+ * init.d script). Something else on the system does eventually retry
+ * mounting it reactively, but confirmed (via dmesg) to take on the order
+ * of many minutes, and even once mounted, this app itself never notices --
+ * only the user-triggered Settings > Update Music Database rescan reads
+ * the SD card, and nothing was polling for "did it just become mounted"
+ * to trigger that automatically.
+ *
+ * This polls whether MUSIC_ROOT_DIR is currently a real mount point (its
+ * st_dev differs from its parent /data/mnt's -- the standard POSIX "is
+ * this a mountpoint" check, since an unmounted MUSIC_ROOT_DIR is just an
+ * empty directory living directly on /data/mnt's own filesystem). While
+ * not mounted, it retries mount_sd_card_if_needed() itself every few
+ * seconds instead of waiting on whatever slow reactive mechanism the OS
+ * has -- harmless to call when nothing's inserted (see that function's own
+ * comment: it just fails silently). On the unmounted -> mounted edge, it
+ * kicks off the same rescan Settings > Update Music Database triggers, so
+ * a card inserted after boot actually shows up without the user needing
+ * to know to go find that button. */
+#define SD_CARD_MOUNT_POLL_SECONDS 5
+
+static bool sd_card_root_is_mounted(void) {
+    struct stat parent_st, root_st;
+    if (stat("/data/mnt", &parent_st) != 0) return false;
+    if (stat(MUSIC_ROOT_DIR, &root_st) != 0) return false;
+    return parent_st.st_dev != root_st.st_dev;
+}
+
+static void poll_sd_card_hotplug(void) {
+    /* Starts true: mount_sd_card_if_needed() already ran once at boot
+     * (main.c, before gui_init()) and the initial library load already
+     * happened against whatever was mounted by then -- assuming "already
+     * mounted" here avoids this poll re-triggering a redundant rescan on
+     * its very first tick when the card was present all along. If it
+     * wasn't actually mounted yet at that point, the very next branch
+     * below correctly falls into the "not mounted" case anyway and starts
+     * retrying/rescanning from there. */
+    static bool was_mounted = true;
+    static time_t last_check = 0;
+
+    time_t now = time(NULL);
+    if (last_check != 0 && now - last_check < SD_CARD_MOUNT_POLL_SECONDS) return;
+    last_check = now;
+
+    bool mounted = sd_card_root_is_mounted();
+    if (!mounted) {
+        mount_sd_card_if_needed();
+        was_mounted = false;
+        return;
+    }
+
+    if (!was_mounted && !library_rescan_active) {
+        start_library_rescan();
+    }
+    was_mounted = true;
+}
+#else
+static void poll_sd_card_hotplug(void) {
+}
+#endif
+
+static void update_music_database_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    start_library_rescan();
+}
+
+static void artists_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(artists_screen);
+}
+
+static void albums_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(albums_screen);
+}
+
+static void album_artist_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(album_artist_screen);
+}
+
+static void playlists_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    populate_playlists_screen();
+    nav_push(playlists_screen);
+}
+
+static lv_obj_t * build_music_screen(void) {
+    static icon_grid_item_t items[6];
+    items[0] = (icon_grid_item_t){ "category/explorer.png", "category/explorer_s.png", "Files", music_files_tile_cb, NULL };
+    items[1] = (icon_grid_item_t){ "category/artist.png", "category/artist_s.png", "Artists", artists_tile_cb, NULL };
+    items[2] = (icon_grid_item_t){ "category/album.png", "category/album_s.png", "Albums", albums_tile_cb, NULL };
+    items[3] = (icon_grid_item_t){ "category/album_artist.png", "category/album_artist_s.png", "Album Artist", album_artist_tile_cb, NULL };
+    items[4] = (icon_grid_item_t){ "category/all.png", "category/all_s.png", "All Songs", all_songs_tile_cb, NULL };
+    /* No dedicated "playlist" icon exists anywhere in the stock theme pack
+     * (assets/theme2/category/ has album/album_artist/all/artist/explorer/
+     * genre/item/net_radio and nothing else playlist-shaped) -- reusing
+     * genre.png/genre_s.png here since Genres no longer has a tile of its
+     * own to need it. */
+    items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
+    lv_obj_t * scr = build_icon_grid_screen("Music", generic_back_cb, items, 6);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void subsonic_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(subsonic_entry_screen);
+}
+
+/* Qobuz/Tidal both require a paid regional subscription and a real API
+ * integration this project's author can't personally test or verify
+ * against -- tapping either explains that instead of doing nothing (the
+ * previous NULL-callback placeholder) or pretending to work. */
+static void unavailable_region_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_info_popup("Qobuz/Tidal not available in my region, can't test/deploy functionality, feel free to fork this project and implement");
+}
+
+static void net_radio_placeholder_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_error_toast("Net Radio coming soon");
+}
+
+/* Subsonic is the one real, working option here (Net Radio has no callback
+ * wired up -- a placeholder), so it's first, not last. Its icon (stream_
+ * media/subsonic.png/_s.png) isn't from the stock theme pack at all
+ * (Subsonic isn't a stock HiBy feature) -- see assets.c's THEME_OVERRIDE_ROOT
+ * for how this app adds its own new asset on top of the stock resource pack
+ * despite that living on read-only storage on a real device. */
+static lv_obj_t * build_stream_media_screen(void) {
+    static icon_grid_item_t items[4];
+    items[0] = (icon_grid_item_t){ "stream_media/subsonic.png", "stream_media/subsonic_s.png", "Subsonic", subsonic_tile_cb, NULL };
+    items[1] = (icon_grid_item_t){ "stream_media/qobuz.png", "stream_media/qobuz_s.png", "Qobuz", unavailable_region_tile_cb, NULL };
+    items[2] = (icon_grid_item_t){ "stream_media/tidal.png", "stream_media/tidal_s.png", "Tidal", unavailable_region_tile_cb, NULL };
+    items[3] = (icon_grid_item_t){ "stream_media/radio.png", "stream_media/radio_s.png", "Net Radio", net_radio_placeholder_tile_cb, NULL };
+    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, 4);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* ---- Wi-Fi settings screen ----
+ *
+ * Enable/disable toggle at top; everything else (info/manual entry/DNS,
+ * memorized networks, available networks) only appears once Wi-Fi is on,
+ * rebuilt into the one dynamic wifi_list container by populate_wifi_screen()
+ * -- reachable both from the Wireless submenu's Wi-Fi tile and from a
+ * long-press on the quick-access drawer's wifi icon (see
+ * quick_drawer_wifi_long_press_cb near build_quick_drawer). Scan/connect/
+ * disconnect/forget all share the same background-thread-plus-polled-flag
+ * shape as the Subsonic connect/download machinery above, and reuse its
+ * subsonic_downloading_screen/label as the shared "please wait" interstitial
+ * rather than building a second one. */
+
+#define WIFI_MAX_RESULTS 32
+#define WIFI_MAX_SAVED 32
+static wifi_network_t wifi_scan_results[WIFI_MAX_RESULTS];
+static int wifi_scan_result_count = 0;
+static wifi_saved_network_t wifi_saved_results[WIFI_MAX_SAVED];
+static int wifi_saved_result_count = 0;
+static lv_obj_t * wifi_list;
+static char wifi_connect_pending_ssid[WIFI_MAX_SSID_LEN];
+
+static void start_wifi_scan(void);
+
+static pthread_t wifi_connect_thread;
+static bool wifi_connect_active = false;
+static volatile bool wifi_connect_done_flag = false;
+static volatile bool wifi_connect_succeeded = false;
+
+typedef struct {
+    char ssid[WIFI_MAX_SSID_LEN];
+    char password[256];
+} wifi_connect_request_t;
+
+static void * wifi_connect_thread_func(void * arg) {
+    wifi_connect_request_t * req = (wifi_connect_request_t *) arg;
+    bool accepted = wifi_control_connect(req->ssid, req->password[0] != '\0' ? req->password : NULL);
+    free(req);
+
+    /* wifi_control_connect() returning true only confirms wpa_cli accepted
+     * the configuration, not that association actually happened -- a wrong
+     * password fails silently at that layer (see its own doc comment).
+     * Poll the real link state for a few seconds before calling this a
+     * genuine success, same real-world wait the "Connecting to X..." screen
+     * already covers. */
+    bool associated = false;
+    if (accepted) {
+        for (int i = 0; i < 10 && !associated; i++) {
+            int level;
+            associated = wifi_get_status(&level);
+            if (!associated) usleep(500000);
+        }
+    }
+    wifi_connect_succeeded = accepted && associated;
+    wifi_connect_done_flag = true; /* written last -- poll_wifi_connect only checks this flag */
+    return NULL;
+}
+
+static void start_wifi_connect(const char * ssid, const char * password) {
+    wifi_connect_request_t * req = malloc(sizeof(*req));
+    snprintf(req->ssid, sizeof(req->ssid), "%s", ssid);
+    snprintf(req->password, sizeof(req->password), "%s", password ? password : "");
+
+    wifi_connect_done_flag = false;
+    wifi_connect_active = true;
+
+    lv_label_set_text_fmt(subsonic_downloading_label, "Connecting to\n%s...", ssid);
+    nav_push(subsonic_downloading_screen);
+
+    pthread_create(&wifi_connect_thread, NULL, wifi_connect_thread_func, req);
+}
+
+static void poll_wifi_connect(void) {
+    if (!wifi_connect_active || !wifi_connect_done_flag) return;
+
+    wifi_connect_active = false;
+    pthread_join(wifi_connect_thread, NULL);
+    nav_pop(); /* leave the connecting screen, back to the network list */
+    if (!wifi_connect_succeeded) {
+        show_error_toast("Couldn't connect to Wi-Fi network");
+    }
+    start_wifi_scan(); /* refresh so the list reflects the new connection state */
+}
+
+/* Reconnecting to an already-memorized network -- deliberately a separate
+ * thread/flag pair from the plain connect above (not a shared "mode" on the
+ * same one) rather than reusing wifi_connect_active's state, matching this
+ * file's existing convention of one dedicated pair per background Wi-Fi
+ * operation (scan/connect/disconnect/forget already each have their own).
+ * See wifi_control_connect_saved()'s own doc comment for why this can't
+ * just call start_wifi_connect(ssid, NULL) instead. */
+static pthread_t wifi_connect_saved_thread;
+static bool wifi_connect_saved_active = false;
+static volatile bool wifi_connect_saved_done_flag = false;
+static volatile bool wifi_connect_saved_succeeded = false;
+
+typedef struct {
+    int id;
+} wifi_connect_saved_request_t;
+
+static void * wifi_connect_saved_thread_func(void * arg) {
+    wifi_connect_saved_request_t * req = (wifi_connect_saved_request_t *) arg;
+    bool accepted = wifi_control_connect_saved(req->id);
+    free(req);
+
+    bool associated = false;
+    if (accepted) {
+        for (int i = 0; i < 10 && !associated; i++) {
+            int level;
+            associated = wifi_get_status(&level);
+            if (!associated) usleep(500000);
+        }
+    }
+    wifi_connect_saved_succeeded = accepted && associated;
+    wifi_connect_saved_done_flag = true; /* written last -- poll_wifi_connect_saved only checks this flag */
+    return NULL;
+}
+
+static void start_wifi_connect_saved(int id, const char * ssid) {
+    wifi_connect_saved_request_t * req = malloc(sizeof(*req));
+    req->id = id;
+
+    wifi_connect_saved_done_flag = false;
+    wifi_connect_saved_active = true;
+
+    lv_label_set_text_fmt(subsonic_downloading_label, "Connecting to\n%s...", ssid);
+    nav_push(subsonic_downloading_screen);
+
+    pthread_create(&wifi_connect_saved_thread, NULL, wifi_connect_saved_thread_func, req);
+}
+
+static void poll_wifi_connect_saved(void) {
+    if (!wifi_connect_saved_active || !wifi_connect_saved_done_flag) return;
+
+    wifi_connect_saved_active = false;
+    pthread_join(wifi_connect_saved_thread, NULL);
+    nav_pop(); /* leave the connecting screen, back to the network list */
+    if (!wifi_connect_saved_succeeded) {
+        show_error_toast("Couldn't connect to Wi-Fi network");
+    }
+    start_wifi_scan(); /* refresh so the list reflects the new connection state */
+}
+
+static pthread_t wifi_disconnect_thread;
+static bool wifi_disconnect_active = false;
+static volatile bool wifi_disconnect_done_flag = false;
+
+static void * wifi_disconnect_thread_func(void * arg) {
+    (void) arg;
+    wifi_control_disconnect();
+    wifi_disconnect_done_flag = true; /* written last -- poll_wifi_disconnect only checks this flag */
+    return NULL;
+}
+
+static void start_wifi_disconnect(void) {
+    wifi_disconnect_done_flag = false;
+    wifi_disconnect_active = true;
+    pthread_create(&wifi_disconnect_thread, NULL, wifi_disconnect_thread_func, NULL);
+}
+
+static void poll_wifi_disconnect(void) {
+    if (!wifi_disconnect_active || !wifi_disconnect_done_flag) return;
+    wifi_disconnect_active = false;
+    pthread_join(wifi_disconnect_thread, NULL);
+    start_wifi_scan(); /* refresh so the list reflects the disconnected state */
+}
+
+static void wifi_password_entered_cb(const char * text, void * user_data) {
+    (void) user_data;
+    start_wifi_connect(wifi_connect_pending_ssid, text);
+}
+
+static void wifi_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    wifi_network_t * net = &wifi_scan_results[index];
+    if (net->is_current) {
+        start_wifi_disconnect();
+        return;
+    }
+
+    snprintf(wifi_connect_pending_ssid, sizeof(wifi_connect_pending_ssid), "%s", net->ssid);
+    if (net->secured) {
+        show_text_entry("Wi-Fi Password", NULL, true, false, wifi_password_entered_cb, NULL);
+    } else {
+        start_wifi_connect(net->ssid, NULL);
+    }
+}
+
+static void wifi_rescan_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    start_wifi_scan();
+}
+
+static pthread_t wifi_scan_thread;
+static bool wifi_scan_active = false;
+static volatile bool wifi_scan_done_flag = false;
+
+static void * wifi_scan_thread_func(void * arg) {
+    (void) arg;
+    /* No auto-enable here anymore -- the screen's own toggle row is now the
+     * explicit way to turn Wi-Fi on, so a stray Rescan tap while it's off
+     * should just find nothing rather than silently flipping the radio on
+     * behind the toggle's back. */
+    wifi_control_scan_start();
+    sleep(3); /* wpa_cli's scan is async -- give the radio time before reading scan_results */
+    wifi_scan_result_count = wifi_control_get_results(wifi_scan_results, WIFI_MAX_RESULTS);
+    wifi_scan_done_flag = true; /* written last -- poll_wifi_scan only checks this flag */
+    return NULL;
+}
+
+/* Runs fully in the background, same as the stock player -- no busy
+ * screen, no navigation at all. The list just updates in place
+ * (populate_wifi_screen(), below) once the scan finishes, whichever screen
+ * the user happens to be on by then. An earlier version pushed a
+ * "Scanning for networks..." interstitial shared with bt scan/the bt
+ * toggle's own overlay -- see git history if that's ever needed again, but
+ * it was also the source of a real, repeatedly-hit stuck-screen bug
+ * (multiple uncoordinated users of one shared overlay, plus the overlay
+ * getting buried under further navigation), which not having an overlay at
+ * all sidesteps entirely. */
+static void start_wifi_scan(void) {
+    if (wifi_scan_active) return;
+
+    wifi_scan_done_flag = false;
+    wifi_scan_active = true;
+
+    pthread_create(&wifi_scan_thread, NULL, wifi_scan_thread_func, NULL);
+}
+
+static void poll_wifi_scan(void) {
+    if (!wifi_scan_active || !wifi_scan_done_flag) return;
+
+    wifi_scan_active = false;
+    pthread_join(wifi_scan_thread, NULL);
+    populate_wifi_screen(); /* refresh the list either way -- worth keeping current even if the user already backed out */
+}
+
+static pthread_t wifi_forget_thread;
+static bool wifi_forget_active = false;
+static volatile bool wifi_forget_done_flag = false;
+
+typedef struct {
+    int id;
+} wifi_forget_request_t;
+
+static void * wifi_forget_thread_func(void * arg) {
+    wifi_forget_request_t * req = (wifi_forget_request_t *) arg;
+    wifi_control_forget(req->id);
+    free(req);
+    wifi_forget_done_flag = true; /* written last -- poll_wifi_forget only checks this flag */
+    return NULL;
+}
+
+static void start_wifi_forget(int id) {
+    wifi_forget_request_t * req = malloc(sizeof(*req));
+    req->id = id;
+    wifi_forget_done_flag = false;
+    wifi_forget_active = true;
+    pthread_create(&wifi_forget_thread, NULL, wifi_forget_thread_func, req);
+}
+
+static void poll_wifi_forget(void) {
+    if (!wifi_forget_active || !wifi_forget_done_flag) return;
+    wifi_forget_active = false;
+    pthread_join(wifi_forget_thread, NULL);
+    start_wifi_scan(); /* refresh both memorized and available sections */
+}
+
+/* ---- Wi-Fi saved-network action popup ------------------------------------
+ * Real-device bug report: tapping a memorized network used to call
+ * start_wifi_forget() directly and unconditionally -- there was no way to
+ * just reconnect to one, and no confirmation before it got forgotten either.
+ * Mirrors bt_action_popup's exact shape (same hand-built top-layer overlay,
+ * same tap-outside-to-dismiss backdrop) for a consistent feel between the
+ * two screens, per that same feedback ("just like on the bluetooth page").
+ * Unlike Bluetooth's popup, both actions are always offered here -- a
+ * memorized network is by definition not the live association status, so
+ * "Connect" is always at least plausible (also covers reconnecting after a
+ * manual disconnect), and "Forget" always applies to anything memorized. */
+static lv_obj_t * wifi_action_popup;
+static lv_obj_t * wifi_action_popup_backdrop;
+static lv_obj_t * wifi_action_popup_title;
+static lv_obj_t * wifi_action_connect_row;
+static lv_obj_t * wifi_action_forget_row;
+static int wifi_action_popup_network_index = -1;
+
+static void hide_wifi_action_popup(void) {
+    lv_obj_add_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(wifi_action_popup, LV_OBJ_FLAG_HIDDEN);
+    wifi_action_popup_network_index = -1;
+}
+
+static void wifi_action_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_wifi_action_popup();
+}
+
+static void wifi_action_connect_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (wifi_action_popup_network_index < 0 || wifi_action_popup_network_index >= wifi_saved_result_count) {
+        hide_wifi_action_popup();
+        return;
+    }
+    wifi_saved_network_t * net = &wifi_saved_results[wifi_action_popup_network_index];
+    int id = net->id;
+    char ssid[WIFI_MAX_SSID_LEN];
+    snprintf(ssid, sizeof(ssid), "%s", net->ssid);
+    hide_wifi_action_popup();
+    start_wifi_connect_saved(id, ssid);
+}
+
+static void wifi_action_forget_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (wifi_action_popup_network_index < 0 || wifi_action_popup_network_index >= wifi_saved_result_count) {
+        hide_wifi_action_popup();
+        return;
+    }
+    int id = wifi_saved_results[wifi_action_popup_network_index].id;
+    hide_wifi_action_popup();
+    start_wifi_forget(id);
+}
+
+static void build_wifi_action_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    wifi_action_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(wifi_action_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(wifi_action_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(wifi_action_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(wifi_action_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(wifi_action_popup_backdrop, wifi_action_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    wifi_action_popup = lv_obj_create(top);
+    lv_obj_set_size(wifi_action_popup, 400, 220);
+    lv_obj_align(wifi_action_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(wifi_action_popup, 16, 0);
+    lv_obj_set_style_bg_color(wifi_action_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(wifi_action_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wifi_action_popup, 0, 0);
+    lv_obj_remove_flag(wifi_action_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(wifi_action_popup, LV_OBJ_FLAG_HIDDEN);
+
+    wifi_action_popup_title = lv_label_create(wifi_action_popup);
+    lv_obj_set_width(wifi_action_popup_title, lv_pct(90));
+    lv_label_set_long_mode(wifi_action_popup_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(wifi_action_popup_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(wifi_action_popup_title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(wifi_action_popup_title, ui_size_22, 0);
+    lv_obj_align(wifi_action_popup_title, LV_ALIGN_TOP_MID, 0, 20);
+
+    wifi_action_connect_row = lv_obj_create(wifi_action_popup);
+    lv_obj_set_size(wifi_action_connect_row, lv_pct(90), 56);
+    lv_obj_set_style_radius(wifi_action_connect_row, 12, 0);
+    lv_obj_set_style_bg_opa(wifi_action_connect_row, 0, 0);
+    lv_obj_set_style_border_width(wifi_action_connect_row, 0, 0);
+    lv_obj_remove_flag(wifi_action_connect_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(wifi_action_connect_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(wifi_action_connect_row, wifi_action_connect_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(wifi_action_connect_row, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_t * connect_label = lv_label_create(wifi_action_connect_row);
+    lv_label_set_text(connect_label, "Connect");
+    lv_obj_set_style_text_color(connect_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(connect_label, ui_size_20, 0);
+    lv_obj_center(connect_label);
+
+    wifi_action_forget_row = lv_obj_create(wifi_action_popup);
+    lv_obj_set_size(wifi_action_forget_row, lv_pct(90), 56);
+    lv_obj_set_style_radius(wifi_action_forget_row, 12, 0);
+    lv_obj_set_style_bg_opa(wifi_action_forget_row, 0, 0);
+    lv_obj_set_style_border_width(wifi_action_forget_row, 0, 0);
+    lv_obj_remove_flag(wifi_action_forget_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(wifi_action_forget_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(wifi_action_forget_row, wifi_action_forget_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(wifi_action_forget_row, LV_ALIGN_TOP_MID, 0, 136);
+    lv_obj_t * forget_label = lv_label_create(wifi_action_forget_row);
+    lv_label_set_text(forget_label, "Forget");
+    lv_obj_set_style_text_color(forget_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(forget_label, ui_size_20, 0);
+    lv_obj_center(forget_label);
+}
+
+static void show_wifi_action_popup(int index) {
+    wifi_action_popup_network_index = index;
+    lv_label_set_text(wifi_action_popup_title, wifi_saved_results[index].ssid);
+
+    lv_obj_remove_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(wifi_action_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(wifi_action_popup_backdrop);
+    lv_obj_move_foreground(wifi_action_popup);
+}
+
+static void wifi_saved_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    show_wifi_action_popup(index);
+}
+
+/* ---- Wi-Fi Info screen (read-only) ---- */
+
+static lv_obj_t * wifi_info_screen;
+static lv_obj_t * wifi_info_list;
+
+static void populate_wifi_info_screen(void) {
+    lv_obj_clean(wifi_info_list);
+
+    wifi_info_t info;
+    if (!wifi_control_get_info(&info)) {
+        lv_obj_t * label = lv_label_create(wifi_info_list);
+        lv_label_set_text(label, "Not connected");
+        lv_obj_set_style_text_color(label, lv_color_make(180, 180, 180), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+        return;
+    }
+
+    static const char * signal_labels[] = { "Weak", "Fair", "Good", "Excellent" };
+    int signal_index = (info.signal_level >= 0 && info.signal_level <= 3) ? info.signal_level : 0;
+    char lines[5][80];
+    snprintf(lines[0], sizeof(lines[0]), "SSID: %s", info.ssid);
+    snprintf(lines[1], sizeof(lines[1]), "IP Address: %s", info.ip[0] ? info.ip : "-");
+    snprintf(lines[2], sizeof(lines[2]), "Gateway: %s", info.gateway[0] ? info.gateway : "-");
+    snprintf(lines[3], sizeof(lines[3]), "MAC Address: %s", info.mac[0] ? info.mac : "-");
+    snprintf(lines[4], sizeof(lines[4]), "Signal: %s", signal_labels[signal_index]);
+
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t * label = lv_label_create(wifi_info_list);
+        lv_label_set_text(label, lines[i]);
+        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+        lv_obj_set_style_pad_top(label, 12, 0);
+    }
+}
+
+static lv_obj_t * build_wifi_info_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("Wi-Fi Info", &title_label, &wifi_info_list);
+}
+
+static void open_wifi_info_screen(void) {
+    populate_wifi_info_screen();
+    nav_push(wifi_info_screen);
+}
+
+static void wifi_info_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_wifi_info_screen();
+}
+
+/* ---- Manual SSID entry -- chains the same show_text_entry() flow scan
+ * results already use for a secured network's password, just starting from
+ * a typed SSID instead of a tapped scan row. An empty password submission
+ * connects as an open network (start_wifi_connect() already treats an empty
+ * password as "no password"), so there's no separate "is this secured?"
+ * question to ask up front. ---- */
+
+static void wifi_manual_ssid_entered_cb(const char * text, void * user_data) {
+    (void) user_data;
+    snprintf(wifi_connect_pending_ssid, sizeof(wifi_connect_pending_ssid), "%s", text);
+    show_text_entry("Wi-Fi Password", NULL, true, false, wifi_password_entered_cb, NULL);
+}
+
+static void wifi_manual_entry_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_text_entry("Network Name (SSID)", NULL, false, false, wifi_manual_ssid_entered_cb, NULL);
+}
+
+/* ---- DNS settings screen -- view/edit the 2 servers currently in
+ * /etc/resolv.conf (see wifi_control_get_dns()'s own doc comment for why
+ * this is a "until the next DHCP renewal" override, not a permanent one).
+ * ---- */
+
+static lv_obj_t * wifi_dns_screen;
+static lv_obj_t * wifi_dns_list;
+static char wifi_dns_servers[2][16];
+static int wifi_dns_server_count = 0;
+
+static void wifi_dns_row_cb(lv_event_t * e);
+
+static void populate_wifi_dns_screen(void) {
+    lv_obj_clean(wifi_dns_list);
+
+    char current[2][16];
+    int count = wifi_control_get_dns(current, 2);
+    for (int i = 0; i < 2; i++) {
+        snprintf(wifi_dns_servers[i], sizeof(wifi_dns_servers[i]), "%s", i < count ? current[i] : "");
+    }
+    wifi_dns_server_count = count;
+
+    static const char * slot_labels[2] = { "Primary DNS", "Secondary DNS" };
+    for (int i = 0; i < 2; i++) {
+        char text[64];
+        snprintf(text, sizeof(text), "%s: %s", slot_labels[i], wifi_dns_servers[i][0] ? wifi_dns_servers[i] : "Not set");
+        lv_obj_t * row = add_pill_chevron_row(wifi_dns_list, text, NULL);
+        lv_obj_add_event_cb(row, wifi_dns_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static void wifi_dns_entered_cb(const char * text, void * user_data) {
+    int slot = (int) (intptr_t) user_data;
+    snprintf(wifi_dns_servers[slot], sizeof(wifi_dns_servers[slot]), "%s", text);
+    if (slot + 1 > wifi_dns_server_count) wifi_dns_server_count = slot + 1;
+
+    const char * servers[2] = { wifi_dns_servers[0], wifi_dns_servers[1] };
+    wifi_control_set_dns(servers, wifi_dns_server_count);
+    populate_wifi_dns_screen();
+}
+
+static void wifi_dns_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int slot = (int) (intptr_t) lv_event_get_user_data(e);
+    show_text_entry(slot == 0 ? "Primary DNS" : "Secondary DNS", wifi_dns_servers[slot], false, false, wifi_dns_entered_cb,
+                    (void *) (intptr_t) slot);
+}
+
+static lv_obj_t * build_wifi_dns_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("DNS Settings", &title_label, &wifi_dns_list);
+}
+
+static void open_wifi_dns_screen(void) {
+    populate_wifi_dns_screen();
+    nav_push(wifi_dns_screen);
+}
+
+static void wifi_dns_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_wifi_dns_screen();
+}
+
+/* ---- Master rebuild for the Wi-Fi screen's one dynamic list: toggle row,
+ * then (only while enabled) the info/manual-entry/DNS rows, memorized
+ * networks, and available networks -- called after every state change
+ * (toggle, scan, connect, disconnect, forget) rather than patched
+ * incrementally, same full-rebuild convention as every other list in this
+ * file. ---- */
+static void populate_wifi_screen(void) {
+    lv_obj_clean(wifi_list);
+
+    bool enabled = wifi_control_is_enabled();
+    /* quick_drawer_wifi_event_cb is the SAME real toggle-thread trigger the
+     * drawer's own wifi icon uses -- no drawer-specific logic in it, so
+     * it's reused directly here rather than duplicating the thread-kickoff
+     * boilerplate. poll_wifi_toggle() repopulates this screen once the
+     * toggle completes. */
+    add_pill_toggle_row(wifi_list, "Wi-Fi", enabled, quick_drawer_wifi_event_cb);
+
+    if (!enabled) return;
+
+    add_pill_chevron_row(wifi_list, "Wi-Fi Info", wifi_info_row_cb);
+    add_pill_chevron_row(wifi_list, "Manual SSID Entry", wifi_manual_entry_row_cb);
+    add_pill_chevron_row(wifi_list, "DNS Settings", wifi_dns_settings_row_cb);
+
+    add_section_header(wifi_list, "Memorized Networks");
+    wifi_saved_result_count = wifi_control_list_saved(wifi_saved_results, WIFI_MAX_SAVED);
+    if (wifi_saved_result_count == 0) {
+        lv_obj_t * label = lv_label_create(wifi_list);
+        lv_label_set_text(label, "No memorized networks");
+        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+    }
+    /* Real-device bug report: no indicator of which saved network is
+     * actually connected -- Available Networks below already shows this
+     * (net->is_current, from the scan results), but the scan and the
+     * saved-network list are two entirely separate queries (wpa_cli
+     * status vs. list_networks), so nothing here ever cross-referenced
+     * them. wifi_control_get_info() (already used by the Wi-Fi Info
+     * screen) is the same "ask wpa_cli status directly" source of truth
+     * as is_current itself, just reused here by SSID match instead of
+     * scan-result identity. */
+    wifi_info_t current_wifi_info;
+    bool wifi_currently_connected = wifi_control_get_info(&current_wifi_info);
+    for (int i = 0; i < wifi_saved_result_count; i++) {
+        lv_obj_t * row = lv_obj_create(wifi_list);
+        lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        bool is_connected = wifi_currently_connected && strcmp(wifi_saved_results[i].ssid, current_wifi_info.ssid) == 0;
+        char text[WIFI_MAX_SSID_LEN + 20];
+        snprintf(text, sizeof(text), "%s%s", wifi_saved_results[i].ssid, is_connected ? "  - Connected" : "");
+
+        lv_obj_t * label = lv_label_create(row);
+        lv_label_set_text(label, text);
+        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, wifi_saved_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+
+    add_section_header(wifi_list, "Available Networks");
+    for (int i = 0; i < wifi_scan_result_count; i++) {
+        wifi_network_t * net = &wifi_scan_results[i];
+
+        lv_obj_t * row = lv_obj_create(wifi_list);
+        lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t * icon = lv_image_create(row);
+        char icon_path[40];
+        snprintf(icon_path, sizeof(icon_path), "topbar/wifi_connect_%d.png", net->signal_level);
+        lv_image_set_src(icon, asset_path(icon_path));
+        lv_obj_align(icon, LV_ALIGN_LEFT_MID, 20, 0);
+
+        lv_obj_t * label = lv_label_create(row);
+        char text[96];
+        snprintf(text, sizeof(text), "%s%s%s", net->ssid, net->secured ? "  (secured)" : "",
+                 net->is_current ? "  - Connected" : "");
+        lv_label_set_text(label, text);
+        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, 64, 0);
+
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, wifi_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+    if (wifi_scan_result_count == 0) {
+        lv_obj_t * label = lv_label_create(wifi_list);
+        lv_label_set_text(label, "No networks found");
+        lv_obj_set_style_text_color(label, lv_color_make(180, 180, 180), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+    }
+}
+
+static lv_obj_t * build_wifi_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    lv_obj_t * scr = build_subsonic_list_screen("Wi-Fi", &title_label, &wifi_list);
+
+    lv_obj_t * rescan_btn = lv_label_create(scr);
+    lv_label_set_text(rescan_btn, "Rescan");
+    lv_obj_set_style_text_color(rescan_btn, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(rescan_btn, ui_size_20, 0);
+    lv_obj_align(rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(rescan_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(rescan_btn, wifi_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    return scr;
+}
+
+static void open_wifi_screen(void) {
+    populate_wifi_screen();
+    nav_push(wifi_screen);
+    if (wifi_control_is_enabled()) start_wifi_scan(); /* auto-refresh -- matches the old always-scan-on-open behavior, but only when there's a radio to scan with */
+}
+
+static void wifi_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_wifi_screen();
+}
+
+/* ---- Bluetooth settings screen ----
+ *
+ * Same shape as the Wi-Fi screen above: full scan + pair/connect, reachable
+ * from the Wireless submenu's Bluetooth tile and from a long-press on the
+ * drawer's bt icon. bt_control_scan() blocks for its whole scan window
+ * itself (bluetoothctl's own --timeout), so the scan thread has no separate
+ * sleep to add, unlike wifi_scan_thread_func above. */
+
+static lv_obj_t * bt_list;
+
+static void start_bt_scan(void);
+
+static pthread_t bt_connect_thread;
+static bool bt_connect_active = false;
+static volatile bool bt_connect_done_flag = false;
+static volatile bool bt_connect_succeeded = false;
+
+/* Which device's row (see add_bt_device_row()) should show inline
+ * "Connecting..."/"Failed to connect" status -- an earlier version of this
+ * blocked the whole screen with a "Pairing & connecting..." overlay
+ * instead, same class of issue as the scan/toggle overlays removed
+ * elsewhere in this file (see start_wifi_scan()'s comment): running fully
+ * in the background with inline per-row feedback, matching the stock
+ * player, means there's no screen to get stuck on at all. */
+static char bt_connecting_mac[18] = "";
+static char bt_connect_failed_mac[18] = "";
+
+typedef struct {
+    char mac[18];
+} bt_connect_request_t;
+
+static void * bt_connect_thread_func(void * arg) {
+    bt_connect_request_t * req = (bt_connect_request_t *) arg;
+    bt_connect_succeeded = bt_control_connect(req->mac);
+    free(req);
+    bt_connect_done_flag = true; /* written last -- poll_bt_connect only checks this flag */
+    return NULL;
+}
+
+static void start_bt_connect(const char * mac) {
+    if (bt_connect_active) return; /* one at a time -- bt_connect_thread/succeeded are single shared slots */
+
+    bt_connect_request_t * req = malloc(sizeof(*req));
+    snprintf(req->mac, sizeof(req->mac), "%s", mac);
+
+    bt_connect_done_flag = false;
+    bt_connect_active = true;
+    snprintf(bt_connecting_mac, sizeof(bt_connecting_mac), "%s", mac);
+    bt_connect_failed_mac[0] = '\0';
+    populate_bt_screen(); /* immediate inline "Connecting..." on that row */
+
+    pthread_create(&bt_connect_thread, NULL, bt_connect_thread_func, req);
+}
+
+static void poll_bt_connect(void) {
+    if (!bt_connect_active || !bt_connect_done_flag) return;
+
+    bt_connect_active = false;
+    pthread_join(bt_connect_thread, NULL);
+    if (!bt_connect_succeeded) {
+        snprintf(bt_connect_failed_mac, sizeof(bt_connect_failed_mac), "%s", bt_connecting_mac);
+    }
+    bt_connecting_mac[0] = '\0';
+    start_bt_scan(); /* refresh so the list reflects the new pair/connect state -- runs in the background too, see its own comment */
+}
+
+static pthread_t bt_forget_thread;
+static bool bt_forget_active = false;
+static volatile bool bt_forget_done_flag = false;
+
+typedef struct {
+    char mac[18];
+} bt_forget_request_t;
+
+/* Kept alive past the thread completing (freed in poll_bt_forget() instead
+ * of the thread func itself) so the completion handler still knows which
+ * device to update in bt_scan_results -- see poll_bt_forget()'s own
+ * comment for why. */
+static bt_forget_request_t * bt_forget_pending_req = NULL;
+
+static void * bt_forget_thread_func(void * arg) {
+    bt_forget_request_t * req = (bt_forget_request_t *) arg;
+    bt_control_forget(req->mac);
+    bt_forget_done_flag = true; /* written last -- poll_bt_forget only checks this flag */
+    return NULL;
+}
+
+static void start_bt_forget(const char * mac) {
+    bt_forget_request_t * req = malloc(sizeof(*req));
+    snprintf(req->mac, sizeof(req->mac), "%s", mac);
+    bt_forget_pending_req = req;
+
+    bt_forget_done_flag = false;
+    bt_forget_active = true;
+    pthread_create(&bt_forget_thread, NULL, bt_forget_thread_func, req);
+}
+
+/* Real-device feedback: forgetting a device used to refresh the list via
+ * start_bt_scan() -- a brand new 6+ second discovery scan with its own busy
+ * overlay flashing on screen, surprising ("it shouldn't be triggered") for
+ * what's really just a local state change we already know the outcome of.
+ * Updating bt_scan_results directly and redrawing is instant and needs no
+ * scan at all -- the forgotten device just moves from the Paired section to
+ * Available (or disappears next real scan, if it's not actually in range). */
+static void poll_bt_forget(void) {
+    if (!bt_forget_active || !bt_forget_done_flag) return;
+    bt_forget_active = false;
+    pthread_join(bt_forget_thread, NULL);
+
+    for (int i = 0; i < bt_scan_result_count; i++) {
+        if (strcmp(bt_scan_results[i].mac, bt_forget_pending_req->mac) == 0) {
+            bt_scan_results[i].paired = false;
+            bt_scan_results[i].connected = false;
+            break;
+        }
+    }
+    free(bt_forget_pending_req);
+    bt_forget_pending_req = NULL;
+    populate_bt_screen();
+}
+
+/* ---- Bluetooth device action popup --------------------------------------
+ * Tapping a device row used to implicitly Forget (if ->connected) or
+ * Connect (otherwise) -- that meant a paired-but-not-currently-connected
+ * device had NO path to being forgotten at all, since the only route to
+ * start_bt_forget() required ->connected. This replaces that with an
+ * explicit popup offering just the actions that make sense for the
+ * device's actual state. Same hand-built top-layer overlay shape as
+ * error_toast/volume_popup above (this codebase doesn't use LVGL's
+ * lv_msgbox anywhere), plus a tap-outside-to-dismiss backdrop. */
+static lv_obj_t * bt_action_popup;
+static lv_obj_t * bt_action_popup_backdrop;
+static lv_obj_t * bt_action_popup_title;
+static lv_obj_t * bt_action_connect_row;
+static lv_obj_t * bt_action_forget_row;
+static int bt_action_popup_device_index = -1;
+
+static void hide_bt_action_popup(void) {
+    lv_obj_add_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(bt_action_popup, LV_OBJ_FLAG_HIDDEN);
+    bt_action_popup_device_index = -1;
+}
+
+static void bt_action_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_bt_action_popup();
+}
+
+static void bt_action_connect_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (bt_action_popup_device_index < 0 || bt_action_popup_device_index >= bt_scan_result_count) {
+        hide_bt_action_popup();
+        return;
+    }
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%s", bt_scan_results[bt_action_popup_device_index].mac);
+    hide_bt_action_popup();
+    start_bt_connect(mac);
+}
+
+static void bt_action_forget_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (bt_action_popup_device_index < 0 || bt_action_popup_device_index >= bt_scan_result_count) {
+        hide_bt_action_popup();
+        return;
+    }
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%s", bt_scan_results[bt_action_popup_device_index].mac);
+    hide_bt_action_popup();
+    start_bt_forget(mac);
+}
+
+static void build_bt_action_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    bt_action_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(bt_action_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(bt_action_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(bt_action_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(bt_action_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(bt_action_popup_backdrop, bt_action_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    bt_action_popup = lv_obj_create(top);
+    lv_obj_set_size(bt_action_popup, 400, 220);
+    lv_obj_align(bt_action_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(bt_action_popup, 16, 0);
+    lv_obj_set_style_bg_color(bt_action_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(bt_action_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(bt_action_popup, 0, 0);
+    lv_obj_remove_flag(bt_action_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(bt_action_popup, LV_OBJ_FLAG_HIDDEN);
+
+    bt_action_popup_title = lv_label_create(bt_action_popup);
+    lv_obj_set_width(bt_action_popup_title, lv_pct(90));
+    lv_label_set_long_mode(bt_action_popup_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(bt_action_popup_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(bt_action_popup_title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(bt_action_popup_title, ui_size_22, 0);
+    lv_obj_align(bt_action_popup_title, LV_ALIGN_TOP_MID, 0, 20);
+
+    bt_action_connect_row = lv_obj_create(bt_action_popup);
+    lv_obj_set_size(bt_action_connect_row, lv_pct(90), 56);
+    lv_obj_set_style_radius(bt_action_connect_row, 12, 0);
+    lv_obj_set_style_bg_opa(bt_action_connect_row, 0, 0);
+    lv_obj_set_style_border_width(bt_action_connect_row, 0, 0);
+    lv_obj_remove_flag(bt_action_connect_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(bt_action_connect_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(bt_action_connect_row, bt_action_connect_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * connect_label = lv_label_create(bt_action_connect_row);
+    lv_label_set_text(connect_label, "Connect");
+    lv_obj_set_style_text_color(connect_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(connect_label, ui_size_20, 0);
+    lv_obj_center(connect_label);
+
+    bt_action_forget_row = lv_obj_create(bt_action_popup);
+    lv_obj_set_size(bt_action_forget_row, lv_pct(90), 56);
+    lv_obj_set_style_radius(bt_action_forget_row, 12, 0);
+    lv_obj_set_style_bg_opa(bt_action_forget_row, 0, 0);
+    lv_obj_set_style_border_width(bt_action_forget_row, 0, 0);
+    lv_obj_remove_flag(bt_action_forget_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(bt_action_forget_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(bt_action_forget_row, bt_action_forget_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * forget_label = lv_label_create(bt_action_forget_row);
+    lv_label_set_text(forget_label, "Forget");
+    lv_obj_set_style_text_color(forget_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(forget_label, ui_size_20, 0);
+    lv_obj_center(forget_label);
+}
+
+static void show_bt_action_popup(int index) {
+    bt_action_popup_device_index = index;
+    bt_device_t * dev = &bt_scan_results[index];
+
+    lv_label_set_text(bt_action_popup_title, dev->name[0] != '\0' ? dev->name : dev->mac);
+
+    /* Connect makes sense unless already connected. Forget makes sense for
+     * anything paired OR connected (the "OR connected" is just a safety net
+     * -- a connected-but-somehow-not-paired device shouldn't be able to land
+     * on a popup with neither action available). */
+    bool show_connect = !dev->connected;
+    bool show_forget = dev->paired || dev->connected;
+    if (show_connect) lv_obj_remove_flag(bt_action_connect_row, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(bt_action_connect_row, LV_OBJ_FLAG_HIDDEN);
+    if (show_forget) lv_obj_remove_flag(bt_action_forget_row, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(bt_action_forget_row, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_align(bt_action_connect_row, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_align(bt_action_forget_row, LV_ALIGN_TOP_MID, 0, show_connect ? 136 : 70);
+
+    lv_obj_remove_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(bt_action_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(bt_action_popup_backdrop);
+    lv_obj_move_foreground(bt_action_popup);
+}
+
+static void bt_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    show_bt_action_popup(index);
+}
+
+static void bt_rescan_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    start_bt_scan();
+}
+
+/* Real-device finding (confirmed via `bluetoothctl devices` directly): a
+ * device with no advertised name doesn't come back with an empty name at
+ * all -- bluetoothctl itself substitutes the device's own MAC address,
+ * dashes instead of colons (e.g. mac "5D:C4:96:7E:56:88" -> name
+ * "5D-C4-96-7E-56-88"), as a placeholder. bt_scan_results[i].name[0] ==
+ * '\0' (an earlier version of the "hide unnamed devices" filter below)
+ * essentially never matches real-world unnamed devices because of this --
+ * confirmed live as "not reliable, doesn't hide them". Detects that exact
+ * placeholder shape instead of assuming an empty string. */
+static bool bt_name_is_mac_placeholder(const bt_device_t * dev) {
+    if (dev->name[0] == '\0') return true;
+    size_t mac_len = strlen(dev->mac);
+    if (strlen(dev->name) != mac_len) return false;
+    for (size_t i = 0; i < mac_len; i++) {
+        char m = dev->mac[i];
+        char n = dev->name[i];
+        if (m == ':') { if (n != '-' && n != ':') return false; }
+        else if (m != n) return false;
+    }
+    return true;
+}
+
+static void add_bt_device_row(lv_obj_t * parent, int index) {
+    bt_device_t * dev = &bt_scan_results[index];
+
+    lv_obj_t * row = lv_obj_create(parent);
+    lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+    lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+    lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * label = lv_label_create(row);
+    char text[96];
+    const char * status;
+    if (strcmp(dev->mac, bt_connecting_mac) == 0) status = "  - Connecting...";
+    else if (strcmp(dev->mac, bt_connect_failed_mac) == 0) status = "  - Failed to connect";
+    else if (dev->connected) status = "  - Connected";
+    else if (dev->paired) status = "  - Paired";
+    else status = "";
+    snprintf(text, sizeof(text), "%s%s", dev->name[0] != '\0' ? dev->name : dev->mac, status);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, bt_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) index);
+}
+
+static pthread_t bt_scan_thread;
+static bool bt_scan_active = false;
+static volatile bool bt_scan_done_flag = false;
+
+static void * bt_scan_thread_func(void * arg) {
+    (void) arg;
+    bt_scan_result_count = bt_control_scan(6, bt_scan_results, BT_MAX_RESULTS);
+    bt_scan_done_flag = true; /* written last -- poll_bt_scan only checks this flag */
+    return NULL;
+}
+
+/* Runs fully in the background, same as the stock player -- no busy
+ * screen, no navigation at all. See start_wifi_scan()'s own comment for
+ * why (same mechanism, same real incident, just the Bluetooth side of it). */
+static void start_bt_scan(void) {
+    if (bt_scan_active) return;
+
+    bt_scan_done_flag = false;
+    bt_scan_active = true;
+
+    pthread_create(&bt_scan_thread, NULL, bt_scan_thread_func, NULL);
+}
+
+static void poll_bt_scan(void) {
+    if (!bt_scan_active || !bt_scan_done_flag) return;
+
+    bt_scan_active = false;
+    pthread_join(bt_scan_thread, NULL);
+    populate_bt_screen(); /* refresh the list either way -- worth keeping current even if the user already backed out */
+}
+
+/* ---- Bluetooth DAC screen -- lets this device accept incoming A2DP audio
+ * (another device streaming TO it, using it as an external DAC) rather than
+ * only ever sending audio out. See bt_control_apply_output_settings()'s own
+ * doc comment for exactly what toggling this does at the bluealsa/
+ * discoverability level -- it's a real running-service restart, not just a
+ * flag flip. ---- */
+
+static lv_obj_t * bt_dac_screen;
+static lv_obj_t * bt_dac_list;
+
+static void bt_dac_enable_row_cb(lv_event_t * e);
+
+/* Explanation + a single "Enable" action, not a toggle -- turning Bluetooth
+ * DAC on takes over the whole screen with its own overlay (see
+ * build_bt_dac_overlay_screen() below), matching USB DAC mode's own design
+ * (build_usb_dac_overlay_screen()): the device can't sensibly be used as a
+ * normal music player while it's set up to receive and play audio FROM
+ * another device, so that isn't something a background toggle should hide.
+ * open_bt_dac_screen() only ever reaches this screen when Bluetooth DAC is
+ * currently off -- while on, it goes straight to the overlay instead. */
+static void populate_bt_dac_screen(void) {
+    lv_obj_clean(bt_dac_list);
+
+    lv_obj_t * explanation = lv_label_create(bt_dac_list);
+    lv_label_set_text(explanation,
+                      "When on, this device stays visible and pairable to other Bluetooth devices, "
+                      "so a phone or computer can stream audio TO it and play through this device's "
+                      "own output -- using it as an external DAC.");
+    lv_obj_set_width(explanation, lv_pct(90));
+    lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(explanation, lv_color_make(160, 160, 160), 0);
+    lv_obj_set_style_text_font(explanation, ui_size_16, 0);
+    lv_obj_set_style_pad_left(explanation, 24, 0);
+    lv_obj_set_style_pad_top(explanation, 12, 0);
+    lv_obj_set_style_pad_bottom(explanation, 12, 0);
+
+    lv_obj_t * row = add_pill_row_base(bt_dac_list, "Enable Bluetooth DAC");
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, bt_dac_enable_row_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* Shared by bt_dac_enable_row_cb() and open_bt_dac_screen()'s "already
+ * enabled" shortcut -- ALWAYS re-applies the actual bluealsa/bt-agent
+ * sink configuration rather than trusting current_settings.bt_dac_mode_enabled
+ * as proof the underlying pipeline is really in that state. Real-device
+ * incident: the two could desync -- the flag stayed true (and the overlay
+ * kept showing on re-entry) while bluealsa had actually drifted back to
+ * its plain a2dp-source baseline (observed after live debugging that
+ * involved manually restarting bluetoothd/bluealsa outside the app's own
+ * control, but the same desync could happen from any crash or external
+ * interference) -- leaving the user staring at a "Bluetooth DAC mode"
+ * screen that silently wasn't receiving audio at all, with nothing to
+ * indicate why. Re-applying unconditionally on every visit, not just the
+ * first enable, is cheap (a few subprocess spawns) and makes the overlay
+ * a reliable guarantee of the underlying state instead of a one-time
+ * side effect that can go stale. */
+static void enable_bt_dac_and_show_overlay(void) {
+    current_settings.bt_dac_mode_enabled = true;
+    settings_save(&current_settings);
+    start_bt_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
+
+    /* This device's incoming-audio consumers (aplay -D bluealsa for
+     * Bluetooth DAC, shairport -o ot for AirPlay) and this app's own
+     * tinyalsa playback all target the same physical ALSA hardware (hw:0,0
+     * / "hibysoundcard") -- real-device testing confirmed fighting over it
+     * is a genuine problem, not just a theoretical one. So all three are
+     * mutually exclusive: enabling Bluetooth DAC stops local playback (see
+     * play_track_at_from()/toggle_play_pause()'s own guards) and turns off
+     * AirPlay if it was on. */
+    if (audio_is_playing()) {
+        audio_stop();
+        set_play_button_state(false);
+    }
+    if (current_settings.wifi_dac_mode_enabled) {
+        current_settings.wifi_dac_mode_enabled = false;
+        settings_save(&current_settings);
+        airplay_control_stop();
+    }
+
+    nav_push(bt_dac_overlay_screen);
+}
+
+static void bt_dac_enable_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    enable_bt_dac_and_show_overlay();
+}
+
+static lv_obj_t * build_bt_dac_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("Bluetooth DAC", &title_label, &bt_dac_list);
+}
+
+static void open_bt_dac_screen(void) {
+    /* Already on -- re-apply and go straight to the overlay rather than
+     * showing the "explanation + Enable" screen for a mode that's already
+     * supposed to be active (see enable_bt_dac_and_show_overlay()'s own
+     * comment on why re-applying here, not just trusting the flag,
+     * matters). */
+    if (current_settings.bt_dac_mode_enabled) {
+        enable_bt_dac_and_show_overlay();
+        return;
+    }
+    populate_bt_dac_screen();
+    nav_push(bt_dac_screen);
+}
+
+static void bt_dac_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_bt_dac_screen();
+}
+
+/* ---- Bluetooth DAC overlay + leave-confirmation popup -- same shape as
+ * USB DAC mode's own (build_usb_dac_overlay_screen()/
+ * build_usb_dac_leave_popup()): full-screen takeover, no swipe-to-back, the
+ * only way out is the back button which asks for confirmation first. ---- */
+static lv_obj_t * bt_dac_leave_popup;
+static lv_obj_t * bt_dac_leave_popup_backdrop;
+
+static void hide_bt_dac_leave_popup(void) {
+    lv_obj_add_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(bt_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void bt_dac_leave_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_bt_dac_leave_popup();
+}
+
+static void bt_dac_leave_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_bt_dac_leave_popup();
+}
+
+static void bt_dac_leave_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_bt_dac_leave_popup();
+    nav_pop(); /* leave the DAC overlay screen */
+
+    current_settings.bt_dac_mode_enabled = false;
+    settings_save(&current_settings);
+    start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
+}
+
+static void bt_dac_overlay_back_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    lv_obj_remove_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(bt_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(bt_dac_leave_popup_backdrop);
+    lv_obj_move_foreground(bt_dac_leave_popup);
+}
+
+static void build_bt_dac_leave_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    bt_dac_leave_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(bt_dac_leave_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(bt_dac_leave_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(bt_dac_leave_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(bt_dac_leave_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(bt_dac_leave_popup_backdrop, bt_dac_leave_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    bt_dac_leave_popup = lv_obj_create(top);
+    lv_obj_set_size(bt_dac_leave_popup, 400, 220);
+    lv_obj_align(bt_dac_leave_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(bt_dac_leave_popup, 16, 0);
+    lv_obj_set_style_bg_color(bt_dac_leave_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(bt_dac_leave_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(bt_dac_leave_popup, 0, 0);
+    lv_obj_remove_flag(bt_dac_leave_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(bt_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * title = lv_label_create(bt_dac_leave_popup);
+    lv_obj_set_width(title, lv_pct(90));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_label_set_text(title, "Leave Bluetooth DAC mode?");
+
+    lv_obj_t * leave_row = lv_obj_create(bt_dac_leave_popup);
+    lv_obj_set_size(leave_row, lv_pct(90), 56);
+    lv_obj_align(leave_row, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_radius(leave_row, 12, 0);
+    lv_obj_set_style_bg_opa(leave_row, 0, 0);
+    lv_obj_set_style_border_width(leave_row, 0, 0);
+    lv_obj_remove_flag(leave_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(leave_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(leave_row, bt_dac_leave_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * leave_label = lv_label_create(leave_row);
+    lv_label_set_text(leave_label, "Leave");
+    lv_obj_set_style_text_color(leave_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(leave_label, ui_size_20, 0);
+    lv_obj_center(leave_label);
+
+    lv_obj_t * cancel_row = lv_obj_create(bt_dac_leave_popup);
+    lv_obj_set_size(cancel_row, lv_pct(90), 56);
+    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
+    lv_obj_set_style_radius(cancel_row, 12, 0);
+    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
+    lv_obj_set_style_border_width(cancel_row, 0, 0);
+    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cancel_row, bt_dac_leave_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * cancel_label = lv_label_create(cancel_row);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_center(cancel_label);
+}
+
+static lv_obj_t * build_bt_dac_overlay_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, bt_dac_overlay_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * icon = lv_image_create(scr);
+    lv_image_set_src(icon, asset_path("bt/bt.png"));
+    lv_obj_align(icon, LV_ALIGN_CENTER, 0, -40);
+
+    lv_obj_t * status_label = lv_label_create(scr);
+    lv_label_set_text(status_label, "Bluetooth DAC mode");
+    lv_obj_set_style_text_color(status_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(status_label, ui_size_28, 0);
+    lv_obj_align_to(status_label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
+
+    lv_obj_t * hint_label = lv_label_create(scr);
+    lv_label_set_text(hint_label, "This device is now receiving Bluetooth audio");
+    lv_obj_set_style_text_color(hint_label, lv_color_make(160, 160, 160), 0);
+    lv_obj_set_style_text_font(hint_label, ui_size_16, 0);
+    lv_obj_align_to(hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+    return scr;
+}
+
+/* ---- Codec selection screen -- single-select list, current choice shown
+ * via an accent-colored border rather than a checkmark glyph (same
+ * indicator build_accent_color_screen's swatches use; safer than a unicode
+ * checkmark that this project's subset LVGL fonts may not actually have a
+ * glyph for). Writes straight into /usr/data/alsa.conf via
+ * bt_control_set_codec() -- see its own doc comment for the LDAC_HQ/
+ * LDAC_SQ caveat. ---- */
+
+typedef struct {
+    const char * value; /* matches player_settings_t.bt_codec / bt_control_set_codec()'s argument */
+    const char * label;
+} bt_codec_option_t;
+
+static const bt_codec_option_t bt_codec_options[] = {
+    { "auto", "Auto" },      { "ldac_hq", "LDAC Quality" }, { "ldac_sq", "LDAC Standard" },
+    { "aptx", "aptX" },      { "aac", "AAC" },              { "sbc", "SBC" },
+};
+#define BT_CODEC_OPTION_COUNT (sizeof(bt_codec_options) / sizeof(bt_codec_options[0]))
+
+static lv_obj_t * bt_codec_screen;
+static lv_obj_t * bt_codec_list;
+
+static void bt_codec_option_row_cb(lv_event_t * e);
+
+static void populate_bt_codec_screen(void) {
+    lv_obj_clean(bt_codec_list);
+    for (size_t i = 0; i < BT_CODEC_OPTION_COUNT; i++) {
+        bool selected = strcmp(current_settings.bt_codec, bt_codec_options[i].value) == 0;
+        lv_obj_t * row = add_pill_row_base(bt_codec_list, bt_codec_options[i].label);
+        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
+        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, bt_codec_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static void bt_codec_option_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    snprintf(current_settings.bt_codec, sizeof(current_settings.bt_codec), "%s", bt_codec_options[index].value);
+    settings_save(&current_settings);
+    bt_control_set_codec(current_settings.bt_codec);
+    populate_bt_codec_screen();
+}
+
+static lv_obj_t * build_bt_codec_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("Codec", &title_label, &bt_codec_list);
+}
+
+static void open_bt_codec_screen(void) {
+    populate_bt_codec_screen();
+    nav_push(bt_codec_screen);
+}
+
+static void bt_codec_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_bt_codec_screen();
+}
+
+/* ---- Font size selection screen (Settings > Font Size) -- same
+ * accent-colored-border single-select shape as the Bluetooth codec screen
+ * just above, but selecting a row only saves the setting and shows a
+ * toast rather than applying anything live -- see gui.c's own
+ * apply_font_size_tier() and fallback_font.h's fallback_font_init_early()
+ * for why an already-built screen can't be restyled in place, and needs
+ * an app restart to pick up the new tier instead. ---- */
+
+typedef struct {
+    int tier; /* matches player_settings_t.font_size_tier */
+    const char * label;
+} font_size_option_t;
+
+static const font_size_option_t font_size_options[] = {
+    { 0, "Small" }, { 1, "Medium" }, { 2, "BlindMF" },
+};
+#define FONT_SIZE_OPTION_COUNT (sizeof(font_size_options) / sizeof(font_size_options[0]))
+
+static lv_obj_t * font_size_screen;
+static lv_obj_t * font_size_list;
+
+static void font_size_option_row_cb(lv_event_t * e);
+
+static void populate_font_size_screen(void) {
+    lv_obj_clean(font_size_list);
+    for (size_t i = 0; i < FONT_SIZE_OPTION_COUNT; i++) {
+        bool selected = current_settings.font_size_tier == font_size_options[i].tier;
+        lv_obj_t * row = add_pill_row_base(font_size_list, font_size_options[i].label);
+        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
+        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, font_size_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static void font_size_option_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    current_settings.font_size_tier = font_size_options[index].tier;
+    settings_save(&current_settings);
+    populate_font_size_screen();
+    show_error_toast("Restart the app for the new font size to take effect");
+}
+
+static lv_obj_t * build_font_size_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("Font Size", &title_label, &font_size_list);
+}
+
+static void open_font_size_screen(void) {
+    populate_font_size_screen();
+    nav_push(font_size_screen);
+}
+
+static void font_size_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_font_size_screen();
+}
+
+/* ---- USB device mode (Settings > USB Mode) -- single-select list, same
+ * shape as the Bluetooth codec screen just above (accent-colored border on
+ * the current choice). Applying a mode is real configfs/sysfs work (see
+ * usb_mode_control.c), so it runs on its own thread and gets polled from
+ * update_timer_cb like every other real-device toggle in this file, rather
+ * than blocking the UI thread the way bt_codec_option_row_cb's direct call
+ * does. ---- */
+
+typedef struct {
+    usb_mode_t mode;
+    const char * label;
+} usb_mode_option_t;
+
+static const usb_mode_option_t usb_mode_options[] = {
+    { USB_MODE_STORAGE, "Storage" },
+    { USB_MODE_DAC, "USB DAC" },
+    { USB_MODE_ADB, "ADB" },
+};
+#define USB_MODE_OPTION_COUNT (sizeof(usb_mode_options) / sizeof(usb_mode_options[0]))
+
+static lv_obj_t * usb_mode_screen;
+static lv_obj_t * usb_mode_list;
+static lv_obj_t * usb_dac_overlay_screen;
+
+static pthread_t usb_mode_switch_thread;
+static bool usb_mode_switch_active = false;
+static volatile bool usb_mode_switch_done_flag = false;
+static volatile bool usb_mode_switch_succeeded = false;
+static usb_mode_t usb_mode_switch_target;
+
+static void usb_mode_option_row_cb(lv_event_t * e);
+static void usb_mode_adb_toggle_cb(lv_event_t * e);
+
+/* ADB is a separate toggle, not a third equal option alongside Storage/DAC
+ * -- matches the stock firmware's own USB device mode screen (confirmed by
+ * the user against a real stock device: ADB overrides Storage/DAC while
+ * on, turning it off falls back to the other two). This also matches the
+ * actual gadget architecture: ADB lives under its own "adb_demo" configfs
+ * directory, entirely separate from the "android0" one Storage and DAC
+ * share (see usb_mode_control.c), so it really is orthogonal rather than a
+ * third position in the same rotation. */
+static void populate_usb_mode_screen(void) {
+    lv_obj_clean(usb_mode_list);
+
+    bool adb_active = current_settings.usb_mode == (int) USB_MODE_ADB;
+    add_pill_toggle_row(usb_mode_list, "ADB", adb_active, usb_mode_adb_toggle_cb);
+
+    for (size_t i = 0; i < USB_MODE_OPTION_COUNT; i++) {
+        if (usb_mode_options[i].mode == USB_MODE_ADB) continue; /* handled by the toggle above */
+
+        bool selected = !adb_active && current_settings.usb_mode == (int) usb_mode_options[i].mode;
+        lv_obj_t * row = add_pill_row_base(usb_mode_list, usb_mode_options[i].label);
+        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
+        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+
+        if (adb_active) {
+            /* Storage/DAC aren't meaningful choices while ADB owns the USB
+             * port -- dimmed and inert rather than removed, so the row
+             * stays put (no layout jump) and it's visually clear these
+             * exist but aren't the current mode. */
+            lv_obj_set_style_opa(row, LV_OPA_50, 0);
+        } else {
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, usb_mode_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        }
+    }
+}
+
+static void * usb_mode_switch_thread_func(void * arg) {
+    (void) arg;
+    usb_mode_switch_succeeded = usb_mode_control_apply(usb_mode_switch_target);
+    usb_mode_switch_done_flag = true; /* written last -- poll_usb_mode_switch only checks this flag */
+    return NULL;
+}
+
+static void start_usb_mode_switch(usb_mode_t target) {
+    if (usb_mode_switch_active) return; /* already switching -- ignore taps until it lands, same guard as wifi/bt toggles */
+    usb_mode_switch_target = target;
+    usb_mode_switch_active = true;
+    usb_mode_switch_done_flag = false;
+    pthread_create(&usb_mode_switch_thread, NULL, usb_mode_switch_thread_func, NULL);
+}
+
+static void poll_usb_mode_switch(void) {
+    if (!usb_mode_switch_active || !usb_mode_switch_done_flag) return;
+    usb_mode_switch_active = false;
+    pthread_join(usb_mode_switch_thread, NULL);
+
+    /* usb_mode_control_apply() only reports success once the target
+     * gadget is actually verified bound, not just "the script ran" -- on
+     * failure current_settings.usb_mode is deliberately left untouched
+     * (the switch genuinely didn't happen) rather than optimistically
+     * recording what was merely requested. */
+    if (!usb_mode_switch_succeeded) {
+        const char * label = "USB mode";
+        for (size_t i = 0; i < USB_MODE_OPTION_COUNT; i++) {
+            if (usb_mode_options[i].mode == usb_mode_switch_target) { label = usb_mode_options[i].label; break; }
+        }
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Failed to switch to %s", label);
+        show_error_toast(msg);
+        populate_usb_mode_screen(); /* in case current_settings.usb_mode's actual row needs re-highlighting */
+        return;
+    }
+
+    current_settings.usb_mode = (int) usb_mode_switch_target;
+    settings_save(&current_settings);
+    populate_usb_mode_screen(); /* refresh which row shows the accent border */
+
+    /* DAC mode takes over the whole screen with its own overlay (matching
+     * the stock firmware's hiby_usb.view) -- the device can't sensibly be
+     * used as a normal music player while it's presenting itself to a PC
+     * as a USB sound card. Storage/ADB have no such conflict (the app
+     * keeps running normally), so they don't get an overlay. */
+    if (usb_mode_switch_target == USB_MODE_DAC) {
+        /* Same three-way mutual exclusion as bt_dac_toggle_cb()/
+         * airplay_toggle_cb() -- all three (local playback, Bluetooth DAC,
+         * AirPlay) fight over the same hw:0,0 output. usb_dac_bridge_start()
+         * (called from usb_mode_control_apply(), already run on the
+         * background thread by this point) already called audio_stop()
+         * itself, but that only stops the backend -- the play button icon
+         * needs its own explicit refresh, same as every other call site
+         * that stops playback out from under the UI. */
+        if (audio_is_playing() || audio_is_paused()) {
+            audio_stop();
+            set_play_button_state(false);
+        }
+        if (current_settings.bt_dac_mode_enabled) {
+            current_settings.bt_dac_mode_enabled = false;
+            settings_save(&current_settings);
+            start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
+        }
+        if (current_settings.wifi_dac_mode_enabled) {
+            current_settings.wifi_dac_mode_enabled = false;
+            settings_save(&current_settings);
+            airplay_control_stop();
+        }
+        nav_push(usb_dac_overlay_screen);
+    }
+}
+
+static void usb_mode_option_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    usb_mode_t target = usb_mode_options[index].mode;
+    if (current_settings.usb_mode == (int) target) return;
+    start_usb_mode_switch(target);
+}
+
+static void usb_mode_adb_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    bool currently_adb = current_settings.usb_mode == (int) USB_MODE_ADB;
+    /* Turning ADB off falls back to Storage -- the stock default, and the
+     * safer of the other two since DAC takes over the whole screen with
+     * its own overlay rather than just quietly changing what the USB port
+     * does. */
+    start_usb_mode_switch(currently_adb ? USB_MODE_STORAGE : USB_MODE_ADB);
+}
+
+static lv_obj_t * build_usb_mode_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("USB Mode", &title_label, &usb_mode_list);
+}
+
+static void open_usb_mode_screen(void) {
+    /* current_settings.usb_mode is only a UI hint (see settings.h's own
+     * comment: never re-applied to hardware on startup, so it can't be
+     * trusted to reflect reality after a reboot or any change made outside
+     * this app) -- correct it against live gadget state whenever that
+     * state is unambiguous, rather than showing a stale/wrong row
+     * highlighted, which is exactly what was happening before (always
+     * defaulted to showing Storage selected regardless of what was
+     * actually connected). Just sysfs reads, fast enough for the UI
+     * thread. */
+    usb_mode_t detected;
+    if (usb_mode_control_detect_current(&detected) && current_settings.usb_mode != (int) detected) {
+        current_settings.usb_mode = (int) detected;
+        settings_save(&current_settings);
+    }
+    populate_usb_mode_screen();
+    nav_push(usb_mode_screen);
+}
+
+static void usb_mode_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_usb_mode_screen();
+}
+
+/* ---- USB DAC mode overlay + leave-confirmation popup --------------------
+ * Full-screen takeover matching the stock firmware's hiby_usb.view (a
+ * centered USB icon + a top-left back button, nothing else) -- deliberately
+ * skips finalize_screen_navigation()'s swipe-to-back/swipe-to-player-screen
+ * wiring, same reasoning as build_import_wifi_screen()'s own comment: the
+ * only way out is the back button, which asks for confirmation rather than
+ * leaving immediately, and an accidental swipe bypassing that would defeat
+ * the point. The confirmation popup itself reuses bt_action_popup's own
+ * hand-built top-layer overlay shape (this codebase doesn't use LVGL's
+ * lv_msgbox anywhere). ---- */
+static lv_obj_t * usb_dac_leave_popup;
+static lv_obj_t * usb_dac_leave_popup_backdrop;
+
+static void hide_usb_dac_leave_popup(void) {
+    lv_obj_add_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(usb_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void usb_dac_leave_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_usb_dac_leave_popup(); /* tap-outside = cancel, matches bt_action_popup precedent */
+}
+
+static void usb_dac_leave_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_usb_dac_leave_popup();
+}
+
+static void usb_dac_leave_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_usb_dac_leave_popup();
+    nav_pop(); /* leave the DAC overlay screen */
+    start_usb_mode_switch(USB_MODE_STORAGE); /* "switch back to Storage (Default)" */
+}
+
+static void usb_dac_overlay_back_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    lv_obj_remove_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(usb_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(usb_dac_leave_popup_backdrop);
+    lv_obj_move_foreground(usb_dac_leave_popup);
+}
+
+static void build_usb_dac_leave_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    usb_dac_leave_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(usb_dac_leave_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(usb_dac_leave_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(usb_dac_leave_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(usb_dac_leave_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(usb_dac_leave_popup_backdrop, usb_dac_leave_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    usb_dac_leave_popup = lv_obj_create(top);
+    lv_obj_set_size(usb_dac_leave_popup, 400, 220);
+    lv_obj_align(usb_dac_leave_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(usb_dac_leave_popup, 16, 0);
+    lv_obj_set_style_bg_color(usb_dac_leave_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(usb_dac_leave_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(usb_dac_leave_popup, 0, 0);
+    lv_obj_remove_flag(usb_dac_leave_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(usb_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * title = lv_label_create(usb_dac_leave_popup);
+    lv_obj_set_width(title, lv_pct(90));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_label_set_text(title, "Leave USB DAC mode?");
+
+    lv_obj_t * leave_row = lv_obj_create(usb_dac_leave_popup);
+    lv_obj_set_size(leave_row, lv_pct(90), 56);
+    lv_obj_align(leave_row, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_radius(leave_row, 12, 0);
+    lv_obj_set_style_bg_opa(leave_row, 0, 0);
+    lv_obj_set_style_border_width(leave_row, 0, 0);
+    lv_obj_remove_flag(leave_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(leave_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(leave_row, usb_dac_leave_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * leave_label = lv_label_create(leave_row);
+    lv_label_set_text(leave_label, "Leave");
+    lv_obj_set_style_text_color(leave_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(leave_label, ui_size_20, 0);
+    lv_obj_center(leave_label);
+
+    lv_obj_t * cancel_row = lv_obj_create(usb_dac_leave_popup);
+    lv_obj_set_size(cancel_row, lv_pct(90), 56);
+    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
+    lv_obj_set_style_radius(cancel_row, 12, 0);
+    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
+    lv_obj_set_style_border_width(cancel_row, 0, 0);
+    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cancel_row, usb_dac_leave_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * cancel_label = lv_label_create(cancel_row);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_center(cancel_label);
+}
+
+static lv_obj_t * build_usb_dac_overlay_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, usb_dac_overlay_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * icon = lv_image_create(scr);
+    lv_image_set_src(icon, asset_path("usb/usb.png"));
+    lv_obj_align(icon, LV_ALIGN_CENTER, 0, -40);
+
+    lv_obj_t * status_label = lv_label_create(scr);
+    lv_label_set_text(status_label, "USB DAC mode");
+    lv_obj_set_style_text_color(status_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(status_label, ui_size_28, 0);
+    lv_obj_align_to(status_label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
+
+    lv_obj_t * hint_label = lv_label_create(scr);
+    lv_label_set_text(hint_label, "This device is now a USB sound card");
+    lv_obj_set_style_text_color(hint_label, lv_color_make(160, 160, 160), 0);
+    lv_obj_set_style_text_font(hint_label, ui_size_16, 0);
+    lv_obj_align_to(hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+    return scr;
+}
+
+static void bt_volume_sync_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    current_settings.bt_volume_sync_enabled = !current_settings.bt_volume_sync_enabled;
+    settings_save(&current_settings);
+    start_bt_apply_output_settings(current_settings.bt_dac_mode_enabled, current_settings.bt_volume_sync_enabled);
+    populate_bt_screen();
+}
+
+/* Real-device feedback: "bluetooth screen is showing a lot of devices
+ * without a name" -- nearby BLE beacons/accessories that never broadcast
+ * one show up as raw MAC addresses (add_bt_device_row()'s own fallback)
+ * cluttering the Available Devices list. Purely a display filter, unlike
+ * the volume-sync toggle above -- no bluealsa/bluetoothctl state to push,
+ * just a settings flag and a re-render. Paired devices are never filtered
+ * by this (see populate_bt_screen()'s own loop) -- you wouldn't have
+ * paired with one you couldn't identify in the first place. */
+static void bt_hide_unnamed_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    current_settings.bt_hide_unnamed_devices = !current_settings.bt_hide_unnamed_devices;
+    settings_save(&current_settings);
+    populate_bt_screen();
+}
+
+/* ---- Master rebuild for the Bluetooth screen's one dynamic list: toggle
+ * row, then (only while powered) volume sync/DAC/Codec rows, Paired
+ * Devices, and Available Devices -- same full-rebuild-on-any-change
+ * convention as populate_wifi_screen() above. bt_scan_results already holds
+ * both paired and freshly-discovered devices from one bt_control_scan()
+ * call; this just splits that single list into the two sections by
+ * ->paired rather than needing two separate scans. ---- */
+static void populate_bt_screen(void) {
+    /* Real-device bug: this screen rebuilds from scratch on every ~5s
+     * connection poll tick (see poll_refresh_bt_icon()'s own call site),
+     * and lv_obj_clean() below resets the list's scroll position to the
+     * top along with destroying its children -- confirmed live: with
+     * enough devices to need scrolling, the periodic rebuild snapped the
+     * view back to the top every cycle, making it impossible to actually
+     * read anything past the first screenful. Captured before the clean
+     * and restored after rebuilding (both exit paths -- the early return
+     * just below when Bluetooth is off has nothing to restore into, but
+     * costs nothing to always capture/restore symmetrically). */
+    int32_t saved_scroll_y = lv_obj_get_scroll_y(bt_list);
+
+    lv_obj_clean(bt_list);
+
+    /* bt_is_powered_cached, not bt_control_is_powered() -- same reasoning
+     * as external_dac_block_reason()'s own use of the cache (see its
+     * comment): calling bt_control_is_powered() directly here forked
+     * bluetoothctl show synchronously on the UI thread every time this
+     * screen opened, which on a real device produced a multi-second freeze
+     * entering the Bluetooth submenu (a milder version of the same
+     * pre-existing hang class start_refresh_bt_icon()'s own comment
+     * documents). The cache is kept fresh in the background regardless. */
+    bool powered = bt_is_powered_cached;
+    /* quick_drawer_bt_event_cb is the SAME real toggle-thread trigger the
+     * drawer's own bt icon uses -- see populate_wifi_screen()'s identical
+     * reasoning for wifi. */
+    add_pill_toggle_row(bt_list, "Bluetooth", powered, quick_drawer_bt_event_cb);
+
+    if (!powered) {
+        lv_obj_scroll_to_y(bt_list, saved_scroll_y, LV_ANIM_OFF);
+        return;
+    }
+
+    add_pill_toggle_row(bt_list, "Bluetooth Volume Sync", current_settings.bt_volume_sync_enabled,
+                        bt_volume_sync_toggle_cb);
+    add_pill_chevron_row(bt_list, "Bluetooth DAC", bt_dac_settings_row_cb);
+    add_pill_chevron_row(bt_list, "Codec", bt_codec_settings_row_cb);
+    add_pill_toggle_row(bt_list, "Hide Unnamed Devices", current_settings.bt_hide_unnamed_devices,
+                        bt_hide_unnamed_toggle_cb);
+
+    add_section_header(bt_list, "Paired Devices");
+    int paired_shown = 0;
+    for (int i = 0; i < bt_scan_result_count; i++) {
+        if (!bt_scan_results[i].paired) continue;
+        add_bt_device_row(bt_list, i);
+        paired_shown++;
+    }
+    if (paired_shown == 0) {
+        lv_obj_t * label = lv_label_create(bt_list);
+        lv_label_set_text(label, "No paired devices");
+        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+    }
+
+    add_section_header(bt_list, "Available Devices");
+    int available_shown = 0;
+    for (int i = 0; i < bt_scan_result_count; i++) {
+        if (bt_scan_results[i].paired) continue;
+        if (current_settings.bt_hide_unnamed_devices && bt_name_is_mac_placeholder(&bt_scan_results[i])) continue;
+        add_bt_device_row(bt_list, i);
+        available_shown++;
+    }
+    if (available_shown == 0) {
+        lv_obj_t * label = lv_label_create(bt_list);
+        lv_label_set_text(label, "No devices found");
+        lv_obj_set_style_text_color(label, lv_color_make(180, 180, 180), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+    }
+
+    lv_obj_scroll_to_y(bt_list, saved_scroll_y, LV_ANIM_OFF);
+}
+
+static lv_obj_t * build_bluetooth_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    lv_obj_t * scr = build_subsonic_list_screen("Bluetooth", &title_label, &bt_list);
+
+    lv_obj_t * rescan_btn = lv_label_create(scr);
+    lv_label_set_text(rescan_btn, "Rescan");
+    lv_obj_set_style_text_color(rescan_btn, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(rescan_btn, ui_size_20, 0);
+    lv_obj_align(rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(rescan_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(rescan_btn, bt_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    return scr;
+}
+
+static void open_bluetooth_screen(void) {
+    populate_bt_screen();
+    nav_push(bt_screen);
+    if (bt_is_powered_cached) start_bt_scan(); /* auto-refresh -- matches the old always-scan-on-open behavior, but only when there's a radio to scan with -- cached, not a fresh bt_control_is_powered() call, same reasoning as populate_bt_screen() */
+}
+
+static void bt_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_bluetooth_screen();
+}
+
+/* ---- Import via Wi-Fi screen -- this is just the on-device "here's the
+ * address to open" front end; the actual file-manager webapp is the stock
+ * firmware's own thttpd + CGI binaries, managed via import_web.h. ---- */
+
+static lv_obj_t * import_wifi_screen;
+static lv_obj_t * import_wifi_status_label;
+static lv_obj_t * import_wifi_url_label;
+#if LV_USE_QRCODE
+static lv_obj_t * import_wifi_qrcode;
+#endif
+
+static void populate_import_wifi_screen(void) {
+    wifi_info_t info;
+    if (!wifi_control_get_info(&info) || info.ip[0] == '\0') {
+        lv_label_set_text(import_wifi_status_label, "Connect to Wi-Fi first");
+        lv_label_set_text(import_wifi_url_label, "");
+#if LV_USE_QRCODE
+        lv_obj_add_flag(import_wifi_qrcode, LV_OBJ_FLAG_HIDDEN);
+#endif
+        return;
+    }
+
+    char url[64];
+    snprintf(url, sizeof(url), "http://%s:4399", info.ip);
+    lv_label_set_text(import_wifi_status_label, "Open this address on your phone or computer:");
+    lv_label_set_text(import_wifi_url_label, url);
+#if LV_USE_QRCODE
+    lv_obj_remove_flag(import_wifi_qrcode, LV_OBJ_FLAG_HIDDEN);
+    lv_qrcode_update(import_wifi_qrcode, url, strlen(url));
+#endif
+}
+
+/* ---- "Update music database?" confirmation, shown on leaving Import via
+ * Wi-Fi -- mirrors build_delete_song_popup()'s own centered-card/two-row
+ * shape. Real-device feedback: a full rescan used to run unconditionally on
+ * every exit from this screen, even if the user never actually uploaded
+ * anything (just looked at the QR code, or backed out immediately) --
+ * wasteful on a real library, and gave no way to skip it. import_web_stop()
+ * and nav_pop() both still happen unconditionally right away (leaving the
+ * screen and tearing down the HTTP server is correct regardless of whether
+ * a rescan follows); only the rescan itself is now behind this choice. */
+static lv_obj_t * import_rescan_popup;
+static lv_obj_t * import_rescan_popup_backdrop;
+
+static void hide_import_rescan_popup(void) {
+    lv_obj_add_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(import_rescan_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void import_rescan_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_import_rescan_popup();
+}
+
+static void import_rescan_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_import_rescan_popup();
+}
+
+static void import_rescan_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_import_rescan_popup();
+    start_library_rescan();
+}
+
+static void build_import_rescan_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    import_rescan_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(import_rescan_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(import_rescan_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(import_rescan_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(import_rescan_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(import_rescan_popup_backdrop, import_rescan_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    import_rescan_popup = lv_obj_create(top);
+    lv_obj_set_size(import_rescan_popup, 420, 220);
+    lv_obj_align(import_rescan_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(import_rescan_popup, 16, 0);
+    lv_obj_set_style_bg_color(import_rescan_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(import_rescan_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(import_rescan_popup, 0, 0);
+    lv_obj_remove_flag(import_rescan_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(import_rescan_popup, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * title = lv_label_create(import_rescan_popup);
+    lv_label_set_text(title, "Update music database?");
+    lv_obj_set_width(title, lv_pct(90));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+
+    lv_obj_t * update_row = lv_obj_create(import_rescan_popup);
+    lv_obj_set_size(update_row, lv_pct(90), 56);
+    lv_obj_align(update_row, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_radius(update_row, 12, 0);
+    lv_obj_set_style_bg_opa(update_row, 0, 0);
+    lv_obj_set_style_border_width(update_row, 0, 0);
+    lv_obj_remove_flag(update_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(update_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(update_row, import_rescan_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * update_label = lv_label_create(update_row);
+    lv_label_set_text(update_label, "Update");
+    lv_obj_set_style_text_color(update_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(update_label, ui_size_20, 0);
+    lv_obj_center(update_label);
+
+    lv_obj_t * not_now_row = lv_obj_create(import_rescan_popup);
+    lv_obj_set_size(not_now_row, lv_pct(90), 56);
+    lv_obj_align(not_now_row, LV_ALIGN_TOP_MID, 0, 136);
+    lv_obj_set_style_radius(not_now_row, 12, 0);
+    lv_obj_set_style_bg_opa(not_now_row, 0, 0);
+    lv_obj_set_style_border_width(not_now_row, 0, 0);
+    lv_obj_remove_flag(not_now_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(not_now_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(not_now_row, import_rescan_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * not_now_label = lv_label_create(not_now_row);
+    lv_label_set_text(not_now_label, "Not now");
+    lv_obj_set_style_text_color(not_now_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_text_font(not_now_label, ui_size_20, 0);
+    lv_obj_center(not_now_label);
+}
+
+static void import_wifi_back_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    import_web_stop();
+    nav_pop();
+    lv_obj_remove_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(import_rescan_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(import_rescan_popup_backdrop);
+    lv_obj_move_foreground(import_rescan_popup);
+}
+
+static lv_obj_t * build_import_wifi_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, import_wifi_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Import via Wi-Fi");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title, ui_size_28, 0);
+
+    import_wifi_status_label = lv_label_create(scr);
+    lv_obj_set_width(import_wifi_status_label, lv_pct(90));
+    lv_label_set_long_mode(import_wifi_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(import_wifi_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(import_wifi_status_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_text_font(import_wifi_status_label, ui_size_20, 0);
+    lv_obj_align(import_wifi_status_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 30);
+
+#if LV_USE_QRCODE
+    import_wifi_qrcode = lv_qrcode_create(scr);
+    lv_qrcode_set_size(import_wifi_qrcode, 220);
+    lv_qrcode_set_dark_color(import_wifi_qrcode, lv_color_black());
+    lv_qrcode_set_light_color(import_wifi_qrcode, lv_color_white());
+    lv_obj_set_style_border_width(import_wifi_qrcode, 4, 0);
+    lv_obj_set_style_border_color(import_wifi_qrcode, lv_color_white(), 0);
+    lv_obj_align(import_wifi_qrcode, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 110);
+#endif
+
+    import_wifi_url_label = lv_label_create(scr);
+    lv_obj_set_style_text_color(import_wifi_url_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(import_wifi_url_label, ui_size_22, 0);
+    lv_obj_align(import_wifi_url_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 350);
+
+    /* Deliberately skips finalize_screen_navigation()'s swipe-to-back --
+     * an accidental swipe here would leave thttpd/udp_server running with
+     * nothing to tear them down, same reasoning as text_entry_screen
+     * skipping it for its keyboard. The back button above is the only way
+     * out, and always runs import_web_stop(). */
+    return scr;
+}
+
+static void open_import_wifi_screen(void) {
+    import_web_start();
+    populate_import_wifi_screen();
+    nav_push(import_wifi_screen);
+}
+
+static void import_wifi_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_import_wifi_screen();
+}
+
+/* ---- AirPlay screen -- WiFi analogue of Bluetooth DAC mode, see
+ * airplay_control.h for the real mechanism (stock firmware's own shairport
+ * binary). Same shape as build_bt_dac_screen(): a toggle plus an
+ * explanation, and the same three-way mutual exclusion with local playback
+ * and Bluetooth DAC. ---- */
+
+static lv_obj_t * airplay_screen;
+static lv_obj_t * airplay_list;
+
+static void airplay_toggle_cb(lv_event_t * e);
+
+static void populate_airplay_screen(void) {
+    lv_obj_clean(airplay_list);
+    add_pill_toggle_row(airplay_list, "AirPlay", current_settings.wifi_dac_mode_enabled, airplay_toggle_cb);
+
+    lv_obj_t * explanation = lv_label_create(airplay_list);
+    lv_label_set_text(explanation,
+                      "When on, this device is visible to AirPlay senders on your Wi-Fi network -- stream "
+                      "audio from an iPhone, iPad, or Mac to be played through this device's own output.");
+    lv_obj_set_width(explanation, lv_pct(90));
+    lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(explanation, lv_color_make(160, 160, 160), 0);
+    lv_obj_set_style_text_font(explanation, ui_size_16, 0);
+    lv_obj_set_style_pad_left(explanation, 24, 0);
+    lv_obj_set_style_pad_top(explanation, 12, 0);
+}
+
+/* /usr/resource/hostname is the same file wifi_on.sh already reads for the
+ * DHCP hostname it advertises -- reusing it here keeps the name AirPlay
+ * senders see consistent with how this device already identifies itself on
+ * the network, rather than inventing a second name. "HiBy_Music" matches
+ * that script's own fallback default when the file is missing. */
+static void get_device_name(char * out, size_t out_size) {
+    snprintf(out, out_size, "HiBy_Music");
+    FILE * f = fopen("/usr/resource/hostname", "r");
+    if (f) {
+        if (fgets(out, (int) out_size, f)) out[strcspn(out, "\n")] = '\0';
+        fclose(f);
+    }
+}
+
+static void airplay_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    current_settings.wifi_dac_mode_enabled = !current_settings.wifi_dac_mode_enabled;
+    settings_save(&current_settings);
+
+    if (current_settings.wifi_dac_mode_enabled) {
+        char name[64];
+        get_device_name(name, sizeof(name));
+        airplay_control_start(name);
+
+        /* Same three-way mutual exclusion as bt_dac_toggle_cb() -- see its
+         * own comment for why. */
+        if (audio_is_playing()) {
+            audio_stop();
+            set_play_button_state(false);
+        }
+        if (current_settings.bt_dac_mode_enabled) {
+            current_settings.bt_dac_mode_enabled = false;
+            settings_save(&current_settings);
+            start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
+        }
+    } else {
+        airplay_control_stop();
+    }
+
+    populate_airplay_screen();
+}
+
+static lv_obj_t * build_airplay_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("AirPlay", &title_label, &airplay_list);
+}
+
+static void open_airplay_screen(void) {
+    populate_airplay_screen();
+    nav_push(airplay_screen);
+}
+
+static void airplay_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_airplay_screen();
+}
+
+/* ---- DLNA screen -- see dlna_control.h for the real mechanism (stock
+ * firmware's own dmrd binary) and its documented limitations (Pause/Mute/
+ * reliable-Volume-feedback/Seek are all confirmed broken inside dmrd
+ * itself on real-device testing, independent of anything built here).
+ * Same toggle-plus-explanation shape as build_airplay_screen(), but no
+ * mutual exclusion with Bluetooth DAC/AirPlay -- see settings.h's own
+ * comment on dlna_renderer_enabled for why. ---- */
+
+static lv_obj_t * dlna_screen;
+static lv_obj_t * dlna_list;
+
+static void dlna_toggle_cb(lv_event_t * e);
+
+static void populate_dlna_screen(void) {
+    lv_obj_clean(dlna_list);
+    add_pill_toggle_row(dlna_list, "DLNA Renderer", current_settings.dlna_renderer_enabled, dlna_toggle_cb);
+
+    lv_obj_t * explanation = lv_label_create(dlna_list);
+    lv_label_set_text(explanation,
+                      "When on, this device is visible to DLNA/UPnP controller apps on your Wi-Fi network -- cast "
+                      "a track from one to play it here. Pause, mute, volume, and seek from the controller app "
+                      "aren't supported; use this device's own controls instead once a track starts.");
+    lv_obj_set_width(explanation, lv_pct(90));
+    lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(explanation, lv_color_make(160, 160, 160), 0);
+    lv_obj_set_style_text_font(explanation, ui_size_16, 0);
+    lv_obj_set_style_pad_left(explanation, 24, 0);
+    lv_obj_set_style_pad_top(explanation, 12, 0);
+}
+
+static void dlna_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    current_settings.dlna_renderer_enabled = !current_settings.dlna_renderer_enabled;
+    settings_save(&current_settings);
+
+    if (current_settings.dlna_renderer_enabled) {
+        dlna_control_start();
+    } else {
+        dlna_control_stop();
+    }
+
+    populate_dlna_screen();
+}
+
+static lv_obj_t * build_dlna_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("DLNA", &title_label, &dlna_list);
+}
+
+static void open_dlna_screen(void) {
+    populate_dlna_screen();
+    nav_push(dlna_screen);
+}
+
+static void dlna_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_dlna_screen();
+}
+
+static lv_obj_t * build_wireless_screen(void) {
+    static icon_grid_item_t items[6];
+    items[0] = (icon_grid_item_t){ "wireless/wifi.png", "wireless/wifi_s.png", "Wi-Fi", wifi_tile_cb, NULL };
+    items[1] = (icon_grid_item_t){ "wireless/bt.png", "wireless/bt_s.png", "Bluetooth", bt_tile_cb, NULL };
+    items[2] = (icon_grid_item_t){ "wireless/airplay.png", "wireless/airplay_s.png", "AirPlay", airplay_tile_cb, NULL };
+    items[3] = (icon_grid_item_t){ "wireless/dlna.png", "wireless/dlna_s.png", "DLNA", dlna_tile_cb, NULL };
+    items[4] = (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "HiBy Link", NULL, NULL };
+    items[5] = (icon_grid_item_t){ "wireless/via.png", "wireless/via_s.png", "Import via Wi-Fi", import_wifi_tile_cb, NULL };
+    lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* ---- Basic .txt reader ----
+ *
+ * "Books" row of the Books menu (originally "Files", folded into this one
+ * row and renamed per real-device feedback -- see build_books_screen()):
+ * a flat list of every .txt file under MUSIC_ROOT_DIR (there's no separate
+ * books partition on this device, same root the music library itself
+ * scans), sourced from the persistent book cache (metadata_db.c), tap one
+ * to read it. Deliberately basic, matching what was actually asked for --
+ * no per-directory navigation (file_browser.c's UI, built for browsing
+ * playable audio and building playlists, doesn't fit this shape of
+ * problem), no pagination, just load the whole file into one scrollable
+ * label. */
+
+static lv_obj_t * books_files_screen;
+static lv_obj_t * books_files_list;
+static lv_obj_t * books_files_title_label;
+/* Which data source populate_books_files_screen() reads from -- set right
+ * before nav_push()ing books_files_screen by whichever row (Books or
+ * Favorites) opened it, see books_files_row_cb()/books_favorites_row_cb()
+ * below. One shared screen/list for both, same as the player screen's
+ * transport buttons being reused by the quick drawer -- these are
+ * structurally identical (a flat list of book rows, tap to open), just
+ * sourced differently. */
+static bool books_showing_favorites = false;
+
+static lv_obj_t * text_reader_screen;
+static lv_obj_t * text_reader_title_label;
+static lv_obj_t * text_reader_scroll;
+static lv_obj_t * text_reader_content_label;
+static lv_obj_t * text_reader_favorite_icon;
+static char * text_reader_current_content = NULL; /* owned; replaced (freed) on every new file opened */
+static char text_reader_current_path[600] = ""; /* the currently open book's path -- what the favorite icon below toggles */
+
+static void refresh_text_reader_favorite_icon(void) {
+    bool is_favorite = text_reader_current_path[0] != '\0' && metadata_db_book_favorite_is_set(text_reader_current_path);
+    lv_image_set_src(text_reader_favorite_icon,
+                     asset_path(is_favorite ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
+}
+
+static void text_reader_favorite_icon_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (text_reader_current_path[0] == '\0') return;
+    bool is_favorite = metadata_db_book_favorite_is_set(text_reader_current_path);
+    metadata_db_book_favorite_set(text_reader_current_path, !is_favorite);
+    refresh_text_reader_favorite_icon();
+}
+
+static void open_text_reader(const char * path) {
+    free(text_reader_current_content);
+    bool truncated = false;
+    text_reader_current_content = text_reader_load(path, &truncated);
+
+    if (!text_reader_current_content) {
+        lv_label_set_text(text_reader_content_label, "Could not open this file.");
+    } else if (truncated) {
+        /* Prepend a plain-text note rather than reaching for a separate
+         * toast/label widget -- simplest way to say "there's more" for a
+         * feature this basic. */
+        char * buf = malloc(strlen(text_reader_current_content) + 128);
+        if (buf) {
+            snprintf(buf, strlen(text_reader_current_content) + 128,
+                     "[File truncated at %d KB -- showing the first part only]\n\n%s",
+                     TEXT_READER_MAX_BYTES / 1024, text_reader_current_content);
+            free(text_reader_current_content);
+            text_reader_current_content = buf;
+        }
+        lv_label_set_text(text_reader_content_label, text_reader_current_content);
+    } else {
+        lv_label_set_text(text_reader_content_label, text_reader_current_content);
+    }
+
+    lv_label_set_text(text_reader_title_label, basename_of(path));
+    snprintf(text_reader_current_path, sizeof(text_reader_current_path), "%s", path);
+    refresh_text_reader_favorite_icon();
+    lv_obj_scroll_to_y(text_reader_scroll, 0, LV_ANIM_OFF);
+    nav_push(text_reader_screen);
+}
+
+static void books_file_row_cb(lv_event_t * e) {
+    const char * path = (const char *) lv_event_get_user_data(e);
+    open_text_reader(path);
+}
+
+/* Real-device bug report: opening the Files/Books screen visibly slowed
+ * the device down and could look like a crash -- text_reader_scan_txt_files()
+ * does a full, uncached recursive readdir()+stat() walk of the WHOLE
+ * MUSIC_ROOT_DIR (the entire SD card/storage mount, same root the music
+ * library itself scans), synchronously on the UI thread, every single time
+ * this screen opens. There's no per-file tag-reading here to cache the way
+ * metadata_db.c caches audio metadata (a .txt file's content is never
+ * inspected ahead of time, just its name), so the walk itself -- not
+ * missing caching -- is the real cost, and on a large/deep library or a
+ * slow SD card that's a real multi-second block. Same fix as this
+ * codebase's own scan_all_songs_with_timeout() above (a stuck read on a
+ * corrupted SD card block lands the thread in an uninterruptible kernel
+ * wait -- see that function's own comment for the full mechanism): run it
+ * on a throwaway worker thread and stop waiting past a bound rather than
+ * risk it. Shorter timeout than the music library's own 30s bound -- this
+ * is just a directory walk with no per-file content reading, so it should
+ * be far faster, and there's no value in blocking the UI for as long. */
+#define BOOKS_SCAN_TIMEOUT_MS 8000
+
+typedef struct {
+    char root[600];
+    volatile bool done;
+    bool ok;
+    char ** paths;
+    int count;
+} books_scan_work_t;
+
+static void * books_scan_worker(void * arg) {
+    books_scan_work_t * w = (books_scan_work_t *) arg;
+    w->ok = text_reader_scan_txt_files(w->root, &w->paths, &w->count);
+    w->done = true; /* written last -- the only field polled below */
+    return NULL;
+}
+
+static bool books_scan_txt_files_with_timeout(const char * root, char *** out_paths, int * out_count) {
+    books_scan_work_t * w = calloc(1, sizeof(*w));
+    snprintf(w->root, sizeof(w->root), "%s", root);
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, books_scan_worker, w) != 0) {
+        free(w);
+        return false;
+    }
+    pthread_detach(thread); /* never joined either way -- see scan_all_songs_with_timeout()'s own comment */
+
+    for (int waited_ms = 0; waited_ms < BOOKS_SCAN_TIMEOUT_MS; waited_ms += 20) {
+        if (w->done) {
+            bool ok = w->ok;
+            *out_paths = w->paths;
+            *out_count = w->count;
+            free(w);
+            return ok;
+        }
+        usleep(20000);
+    }
+
+    fprintf(stderr, "Warning: timed out scanning %s for .txt files (possible filesystem corruption) -- treating as empty\n", root);
+    return false;
+}
+
+/* Real-device feedback: the Books menu's old separate "Scanning" row was a
+ * dead stub, and the actual per-visit scan (in populate_books_files_screen(),
+ * before this existed) made that screen slow to open every time -- see
+ * metadata_db_list_books_from_stock()'s own comment. Both problems share one
+ * fix: a real persistent book cache (metadata_db.c, same shape as media's
+ * own), refreshed only here -- called from library_scan_once(), i.e. folded
+ * into the existing Settings > Update Music Database action, not a separate
+ * menu item. Tries the fast stock-db path first (a bounded SQLite read);
+ * only falls back to a real live filesystem walk if that finds nothing, so
+ * an explicit user-triggered rescan can still discover books the stock
+ * scanner never indexed, unlike the boot-time warm-start in metadata_db_
+ * open() (fast-path only, deliberately never walks the filesystem, same
+ * reasoning as library_load_from_cache_only()'s own comment on why a slow
+ * scan can't run before the first frame renders). */
+static void rescan_books(void) {
+    char ** paths = NULL;
+    int count = 0;
+    if (!metadata_db_list_books_from_stock(&paths, &count)) {
+        books_scan_txt_files_with_timeout(MUSIC_ROOT_DIR, &paths, &count);
+    }
+
+    metadata_db_book_replace_all(paths, count);
+
+    for (int i = 0; i < count; i++) free(paths[i]);
+    free(paths);
+}
+
+static void populate_books_files_screen(void) {
+    lv_obj_clean(books_files_list);
+    lv_label_set_text(books_files_title_label, books_showing_favorites ? "Favorites" : "Books");
+
+    char ** paths;
+    int count;
+    /* Real-device bug report: this screen was slow to open every time -- a
+     * live recursive readdir()+stat() walk of the whole SD card on every
+     * visit (see books_scan_txt_files_with_timeout()'s own comment). Reads
+     * from the persistent book cache now instead (metadata_db.c), kept
+     * fresh only by rescan_books() (folded into Settings > Update Music
+     * Database) -- this screen itself never touches the filesystem or the
+     * stock db at all anymore. */
+    if (books_showing_favorites) {
+        metadata_db_load_favorite_books(&paths, &count);
+    } else {
+        metadata_db_load_all_books(&paths, &count);
+    }
+
+    if (count == 0) {
+        lv_obj_t * label = lv_label_create(books_files_list);
+        lv_label_set_text(label, books_showing_favorites ? "No favorites yet" : "No .txt files found");
+        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+        free(paths);
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        lv_obj_t * row = lv_obj_create(books_files_list);
+        lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t * label = lv_label_create(row);
+        lv_label_set_text(label, basename_of(paths[i]));
+        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+
+        /* paths[i] itself becomes the row's user_data -- ownership passes
+         * to the row's event callback closure for as long as this screen
+         * exists (the array is only ever rebuilt by lv_obj_clean() above,
+         * which destroys these rows and their callbacks together, so
+         * there's no dangling-pointer window). The char** array holding
+         * them is freed here since each element's ownership already moved
+         * to its row. */
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, books_file_row_cb, LV_EVENT_CLICKED, paths[i]);
+    }
+    free(paths);
+}
+
+static void books_files_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    books_showing_favorites = false;
+    populate_books_files_screen();
+    nav_push(books_files_screen);
+}
+
+static void books_favorites_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    books_showing_favorites = true;
+    populate_books_files_screen();
+    nav_push(books_files_screen);
+}
+
+static lv_obj_t * build_books_files_screen(void) {
+    lv_obj_t * scr = build_subsonic_list_screen("Books", &books_files_title_label, &books_files_list);
+    return scr;
+}
+
+static lv_obj_t * build_text_reader_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    /* Favorite toggle, top-right -- same collect_in/collect_out asset pair
+     * and click-to-toggle shape as the player screen's own favorite_icon,
+     * just persisted for real here (metadata_db_book_favorite_set()) rather
+     * than that one's purely in-memory, never-saved toggle. */
+    text_reader_favorite_icon = lv_image_create(scr);
+    lv_image_set_src(text_reader_favorite_icon, asset_path("playing_plane/collect_out.png"));
+    lv_obj_align(text_reader_favorite_icon, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(text_reader_favorite_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(text_reader_favorite_icon, 16);
+    lv_obj_add_event_cb(text_reader_favorite_icon, text_reader_favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
+
+    text_reader_title_label = lv_label_create(scr);
+    lv_label_set_text(text_reader_title_label, "");
+    lv_obj_align(text_reader_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(text_reader_title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(text_reader_title_label, &app_font_28, 0); /* shows the (possibly non-Latin) file's own name -- see fallback_font.h */
+    /* Narrower than build_subsonic_list_screen()'s equivalent titles (70%
+     * -- this one has both the back button AND the favorite icon eating
+     * into its available width) -- same width-capped dot-scroll treatment
+     * as the player screen's own title label either way. */
+    lv_obj_set_width(text_reader_title_label, lv_pct(55));
+    lv_label_set_long_mode(text_reader_title_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(text_reader_title_label, LV_TEXT_ALIGN_CENTER, 0);
+
+    text_reader_scroll = lv_obj_create(scr);
+    lv_obj_set_size(text_reader_scroll, lv_pct(100),
+                    lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
+                        TITLE_ROW_HEIGHT);
+    lv_obj_align(text_reader_scroll, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(text_reader_scroll, 0, 0);
+    lv_obj_set_style_border_width(text_reader_scroll, 0, 0);
+    lv_obj_set_scroll_dir(text_reader_scroll, LV_DIR_VER);
+    lv_obj_set_style_pad_all(text_reader_scroll, 16, 0);
+
+    text_reader_content_label = lv_label_create(text_reader_scroll);
+    lv_label_set_long_mode(text_reader_content_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(text_reader_content_label, lv_pct(100));
+    lv_obj_set_style_text_color(text_reader_content_label, lv_color_make(220, 220, 220), 0);
+    lv_obj_set_style_text_font(text_reader_content_label, ui_size_20, 0);
+    lv_label_set_text(text_reader_content_label, "");
+
+    finalize_screen_navigation(scr);
+    /* Same reasoning as every other scrollable-content screen in this
+     * file: a drag inside the text itself should scroll the text, not
+     * bubble up as an app-wide swipe. */
+    lv_obj_remove_flag(text_reader_scroll, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    return scr;
+}
+
+/* Audio Books has no real implementation yet (no format/UI decided) --
+ * this row is a deliberate placeholder, per real-device feedback, rather
+ * than silently absent or a dead no-op tap. */
+static void audio_books_placeholder_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_error_toast("Audio Books coming soon");
+}
+
+static lv_obj_t * build_books_screen(void) {
+    static pill_list_item_t items[3];
+    items[0] = (pill_list_item_t){ "Books", PILL_ACCESSORY_CHEVRON, false, books_files_row_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "Favorites", PILL_ACCESSORY_CHEVRON, false, books_favorites_row_cb, NULL, NULL };
+    items[2] = (pill_list_item_t){ "Audio Books", PILL_ACCESSORY_CHEVRON, false, audio_books_placeholder_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, 3);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* ---- Firmware update confirmation popup -- same hand-built top-layer
+ * overlay shape as eq_reset_popup/bt_dac_leave_popup (this codebase doesn't
+ * use LVGL's lv_msgbox anywhere). Confirmation is required since this
+ * reboots the device into its own recovery partition -- see
+ * firmware_update.h for how that reuses the exact same "*.upt on the SD
+ * card + /usr/bin/bootmode.sh Recovery" mechanism the stock closed-source
+ * hiby_player's own "Firmware Update" menu item uses, so no custom flashing
+ * logic lives here at all. ---- */
+static lv_obj_t * firmware_update_popup;
+static lv_obj_t * firmware_update_popup_backdrop;
+static lv_obj_t * firmware_update_popup_title;
+
+static void hide_firmware_update_popup(void) {
+    lv_obj_add_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(firmware_update_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void firmware_update_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_firmware_update_popup();
+}
+
+static void firmware_update_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_firmware_update_popup();
+}
+
+static void firmware_update_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_firmware_update_popup();
+    firmware_update_enter_recovery();
+}
+
+static void build_firmware_update_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    firmware_update_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(firmware_update_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(firmware_update_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(firmware_update_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(firmware_update_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(firmware_update_popup_backdrop, firmware_update_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    firmware_update_popup = lv_obj_create(top);
+    lv_obj_set_size(firmware_update_popup, 420, 260);
+    lv_obj_align(firmware_update_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(firmware_update_popup, 16, 0);
+    lv_obj_set_style_bg_color(firmware_update_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(firmware_update_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(firmware_update_popup, 0, 0);
+    lv_obj_remove_flag(firmware_update_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(firmware_update_popup, LV_OBJ_FLAG_HIDDEN);
+
+    firmware_update_popup_title = lv_label_create(firmware_update_popup);
+    lv_obj_set_width(firmware_update_popup_title, lv_pct(90));
+    lv_label_set_long_mode(firmware_update_popup_title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(firmware_update_popup_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(firmware_update_popup_title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(firmware_update_popup_title, ui_size_22, 0);
+    lv_obj_align(firmware_update_popup_title, LV_ALIGN_TOP_MID, 0, 20);
+
+    lv_obj_t * update_row = lv_obj_create(firmware_update_popup);
+    lv_obj_set_size(update_row, lv_pct(90), 56);
+    lv_obj_align(update_row, LV_ALIGN_TOP_MID, 0, 110);
+    lv_obj_set_style_radius(update_row, 12, 0);
+    lv_obj_set_style_bg_opa(update_row, 0, 0);
+    lv_obj_set_style_border_width(update_row, 0, 0);
+    lv_obj_remove_flag(update_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(update_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(update_row, firmware_update_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * update_label = lv_label_create(update_row);
+    lv_label_set_text(update_label, "Update & Reboot");
+    lv_obj_set_style_text_color(update_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(update_label, ui_size_20, 0);
+    lv_obj_center(update_label);
+
+    lv_obj_t * cancel_row = lv_obj_create(firmware_update_popup);
+    lv_obj_set_size(cancel_row, lv_pct(90), 56);
+    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 176);
+    lv_obj_set_style_radius(cancel_row, 12, 0);
+    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
+    lv_obj_set_style_border_width(cancel_row, 0, 0);
+    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cancel_row, firmware_update_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * cancel_label = lv_label_create(cancel_row);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_center(cancel_label);
+}
+
+static void firmware_update_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    char path[512];
+    if (!firmware_update_scan(path, sizeof(path))) {
+        show_error_toast("No .upt firmware file found on SD card");
+        return;
+    }
+
+    const char * filename = strrchr(path, '/');
+    filename = filename ? filename + 1 : path;
+    lv_label_set_text_fmt(firmware_update_popup_title, "Update using %s?\nDevice will reboot into recovery mode.",
+                           filename);
+
+    lv_obj_remove_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(firmware_update_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(firmware_update_popup_backdrop);
+    lv_obj_move_foreground(firmware_update_popup);
+}
+
+static lv_obj_t * build_about_screen(void) {
+    static pill_list_item_t items[4];
+    /* TEST_BUILD_TAG: optional -D from the Makefile (see TEST_BUILD_TAG
+     * there), e.g. `make target TEST_BUILD_TAG=test25_avrcp` -- a
+     * friendly label for which of this session's many test builds is
+     * actually running, without needing to check timestamps/MD5s by
+     * hand. BUILD_STAMP is the fallback: always defined automatically by
+     * the Makefile (a build date/time, no flag needed), for the flashed/
+     * real-deployment path where TEST_BUILD_TAG is never explicitly set
+     * but the same "which build is this" question still matters. */
+    static char version_line[64];
+#if defined(TEST_BUILD_TAG)
+    snprintf(version_line, sizeof(version_line), "Alpha 1 (%s)", TEST_BUILD_TAG);
+#elif defined(BUILD_STAMP)
+    snprintf(version_line, sizeof(version_line), "Alpha 1 (%s)", BUILD_STAMP);
+#else
+    snprintf(version_line, sizeof(version_line), "Alpha 1");
+#endif
+    items[0] = (pill_list_item_t){ "Hiby Open Source Player", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
+    items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
+    items[2] = (pill_list_item_t){ "Jose Garita's private build", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
+    items[3] =
+        (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 4);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_accent_color_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Accent Color");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title, ui_size_28, 0);
+
+    lv_obj_t * swatch_row = lv_obj_create(scr);
+    lv_obj_set_size(swatch_row, lv_pct(90), 50);
+    lv_obj_align(swatch_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
+    lv_obj_set_style_bg_opa(swatch_row, 0, 0);
+    lv_obj_set_style_border_width(swatch_row, 0, 0);
+    lv_obj_set_flex_flow(swatch_row, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(swatch_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    for (size_t i = 0; i < ACCENT_PALETTE_COUNT; i++) {
+        lv_obj_t * swatch = lv_obj_create(swatch_row);
+        lv_obj_set_size(swatch, 36, 36);
+        lv_obj_set_style_radius(swatch, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(swatch, lv_color_hex(accent_palette[i]), 0);
+        lv_obj_set_style_border_width(swatch, current_settings.accent_color == accent_palette[i] ? 3 : 0, 0);
+        lv_obj_set_style_border_color(swatch, lv_color_make(255, 255, 255), 0);
+        lv_obj_add_flag(swatch, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(swatch, accent_swatch_event_cb, LV_EVENT_CLICKED, (void *) (intptr_t) accent_palette[i]);
+        accent_swatches[i] = swatch;
+    }
+
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void accent_color_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(accent_color_screen);
+}
+
+/* "45s" below 1 minute, "1m"/"2m" on an exact minute, "1m 30s" otherwise --
+ * matches the 30s-10min range (SCREEN_TIMEOUT_MIN/MAX_SECONDS) without ever
+ * needing more than whole minutes+seconds. */
+static void format_screen_timeout(char * buf, size_t buf_size, int seconds) {
+    if (seconds < 60) {
+        snprintf(buf, buf_size, "%ds", seconds);
+        return;
+    }
+    int minutes = seconds / 60;
+    int remainder = seconds % 60;
+    if (remainder == 0) snprintf(buf, buf_size, "%dm", minutes);
+    else snprintf(buf, buf_size, "%dm %ds", minutes, remainder);
+}
+
+/* Index into SCREEN_TIMEOUT_STEPS closest to `seconds` -- settings_load()
+ * already snaps stored values onto a step, so this normally finds an exact
+ * match; the nearest-match fallback just keeps the slider from landing on a
+ * bogus index if it's ever called before that snapping has happened. */
+static int screen_timeout_seconds_to_step_index(int seconds) {
+    int best = 0;
+    int best_diff = abs(seconds - SCREEN_TIMEOUT_STEPS[0]);
+    for (int i = 1; i < SCREEN_TIMEOUT_STEP_COUNT; i++) {
+        int diff = abs(seconds - SCREEN_TIMEOUT_STEPS[i]);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void screen_timeout_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.screen_timeout_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+
+    if (current_settings.screen_timeout_enabled) {
+        lv_obj_remove_flag(screen_timeout_slider_card, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(screen_timeout_slider_card, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Same VALUE_CHANGED-updates-live/RELEASED-persists split as the EQ sliders
+ * (eq_preamp_slider_event_cb etc.) -- writing settings.c's file on every
+ * drag tick would be needless disk I/O for a value that only matters once
+ * the user lets go. The slider itself moves over step indices (0..
+ * SCREEN_TIMEOUT_STEP_COUNT-1), not raw seconds, so it can only ever land on
+ * one of the fixed presets (30s/1m/2m/5m/10m/30m) rather than an arbitrary
+ * linear value. */
+static void screen_timeout_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    int32_t index = lv_slider_get_value(lv_event_get_target(e));
+    int seconds = SCREEN_TIMEOUT_STEPS[index];
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        current_settings.screen_timeout_seconds = seconds;
+        char buf[32];
+        format_screen_timeout(buf, sizeof(buf), seconds);
+        lv_label_set_text(screen_timeout_value_label, buf);
+    } else if (code == LV_EVENT_RELEASED) {
+        settings_save(&current_settings);
+    }
+}
+
+static lv_obj_t * build_screen_timeout_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Screen Timeout");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title, ui_size_28, 0);
+
+    lv_obj_t * enable_row = lv_obj_create(scr);
+    lv_obj_set_size(enable_row, lv_pct(90), 50);
+    lv_obj_align(enable_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
+    lv_obj_set_style_bg_opa(enable_row, 0, 0);
+    lv_obj_set_style_border_width(enable_row, 0, 0);
+    lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * enable_label = lv_label_create(enable_row);
+    lv_label_set_text(enable_label, "Turn off screen automatically");
+    lv_obj_set_style_text_color(enable_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
+    lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
+
+    screen_timeout_switch = lv_switch_create(enable_row);
+    lv_obj_align(screen_timeout_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_style(screen_timeout_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (current_settings.screen_timeout_enabled) lv_obj_add_state(screen_timeout_switch, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(screen_timeout_switch, screen_timeout_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* Reuses the EQ card look (rounded dark card, live numeric readout +
+     * slider) for a consistent "settings with a live readout" feel, without
+     * depending on the EQ screen's own green-tinted EQ_CARD_COLOR/
+     * EQ_BG_COLOR (this screen matches the plain System settings screen's
+     * own SCREEN_BG_COLOR instead). Taller than the EQ card (170 vs 82),
+     * with the slider near the top and the value label centered well below
+     * it (rather than the EQ card's label-top-left/slider-along-the-bottom
+     * layout) -- real-device feedback: the original thin-track/small-text/
+     * top-left-label version was hard to reliably grab, and a later
+     * bottom-anchored label still visually overlapped the slider's knob
+     * (its default theme style draws it noticeably larger than the 36px
+     * track height it's centered on), needing extra clearance below the
+     * slider rather than just under it. */
+    screen_timeout_slider_card = lv_obj_create(scr);
+    lv_obj_set_size(screen_timeout_slider_card, lv_pct(90), 170);
+    lv_obj_align(screen_timeout_slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90);
+    lv_obj_set_style_bg_color(screen_timeout_slider_card, lv_color_make(30, 30, 34), 0);
+    lv_obj_set_style_border_width(screen_timeout_slider_card, 0, 0);
+    lv_obj_set_style_radius(screen_timeout_slider_card, 10, 0);
+    if (!current_settings.screen_timeout_enabled) lv_obj_add_flag(screen_timeout_slider_card, LV_OBJ_FLAG_HIDDEN);
+
+    screen_timeout_slider = lv_slider_create(screen_timeout_slider_card);
+    lv_obj_set_width(screen_timeout_slider, lv_pct(94));
+    lv_obj_set_height(screen_timeout_slider, 36);
+    lv_obj_align(screen_timeout_slider, LV_ALIGN_TOP_MID, 0, 18);
+    lv_slider_set_range(screen_timeout_slider, 0, SCREEN_TIMEOUT_STEP_COUNT - 1);
+    lv_slider_set_value(screen_timeout_slider, screen_timeout_seconds_to_step_index(current_settings.screen_timeout_seconds), LV_ANIM_OFF);
+    lv_obj_add_style(screen_timeout_slider, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_style(screen_timeout_slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_event_cb(screen_timeout_slider, screen_timeout_slider_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_set_ext_click_area(screen_timeout_slider, 20);
+
+    screen_timeout_value_label = lv_label_create(screen_timeout_slider_card);
+    lv_obj_set_style_text_color(screen_timeout_value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(screen_timeout_value_label, ui_size_28, 0);
+    lv_obj_align(screen_timeout_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
+    char initial_buf[32];
+    format_screen_timeout(initial_buf, sizeof(initial_buf), current_settings.screen_timeout_seconds);
+    lv_label_set_text(screen_timeout_value_label, initial_buf);
+
+    finalize_screen_navigation(scr);
+    /* Unlike every other plain container on this screen, this card's own
+     * background must NOT bubble drags up as an app-wide swipe:
+     * finalize_screen_navigation() -> enable_gesture_bubble_recursive() just
+     * gave it LV_OBJ_FLAG_GESTURE_BUBBLE like any other non-slider
+     * container (blank space on any screen is meant to swipe-navigate).
+     * Real-device feedback: a drag anywhere in this particular card that
+     * missed the (thin, bottom-aligned) slider track landed on that
+     * background instead and bubbled to screen_gesture_event_cb() as a
+     * swipe (down = jump to player, up = back) rather than moving the
+     * slider. Removing the flag here, after it was added, makes any drag
+     * starting in this card go nowhere instead of misfiring navigation,
+     * regardless of whether it lands on the slider or the card around it. */
+    lv_obj_remove_flag(screen_timeout_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    return scr;
+}
+
+static void screen_timeout_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(screen_timeout_screen);
+}
+
+static void startup_volume_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.startup_volume_fixed_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+
+    if (current_settings.startup_volume_fixed_enabled) {
+        lv_obj_remove_flag(startup_volume_slider_card, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(startup_volume_slider_card, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Same VALUE_CHANGED-updates-live/RELEASED-persists split as
+ * screen_timeout_slider_event_cb -- this only sets what the NEXT launch
+ * starts at, not the current session's live volume, so there's no reason
+ * to call audio_set_volume() here at all. */
+static void startup_volume_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    int32_t percent = lv_slider_get_value(lv_event_get_target(e));
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        current_settings.startup_volume_fixed_percent = (int) percent;
+        lv_label_set_text_fmt(startup_volume_value_label, "%d%%", (int) percent);
+    } else if (code == LV_EVENT_RELEASED) {
+        settings_save(&current_settings);
+    }
+}
+
+/* Mirrors build_screen_timeout_screen()'s own layout (toggle row + a
+ * dark card holding a live-readout slider, shown/hidden with the toggle) --
+ * see that function's comments for the reasoning behind the specific
+ * measurements reused here. */
+static lv_obj_t * build_startup_volume_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Startup Volume");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title, ui_size_28, 0);
+
+    lv_obj_t * enable_row = lv_obj_create(scr);
+    lv_obj_set_size(enable_row, lv_pct(90), 50);
+    lv_obj_align(enable_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
+    lv_obj_set_style_bg_opa(enable_row, 0, 0);
+    lv_obj_set_style_border_width(enable_row, 0, 0);
+    lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * enable_label = lv_label_create(enable_row);
+    lv_label_set_text(enable_label, "Launch at a fixed volume");
+    lv_obj_set_style_text_color(enable_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
+    lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
+
+    startup_volume_switch = lv_switch_create(enable_row);
+    lv_obj_align(startup_volume_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_style(startup_volume_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (current_settings.startup_volume_fixed_enabled) lv_obj_add_state(startup_volume_switch, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(startup_volume_switch, startup_volume_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    startup_volume_slider_card = lv_obj_create(scr);
+    lv_obj_set_size(startup_volume_slider_card, lv_pct(90), 170);
+    lv_obj_align(startup_volume_slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90);
+    lv_obj_set_style_bg_color(startup_volume_slider_card, lv_color_make(30, 30, 34), 0);
+    lv_obj_set_style_border_width(startup_volume_slider_card, 0, 0);
+    lv_obj_set_style_radius(startup_volume_slider_card, 10, 0);
+    if (!current_settings.startup_volume_fixed_enabled) lv_obj_add_flag(startup_volume_slider_card, LV_OBJ_FLAG_HIDDEN);
+
+    startup_volume_slider = lv_slider_create(startup_volume_slider_card);
+    lv_obj_set_width(startup_volume_slider, lv_pct(94));
+    lv_obj_set_height(startup_volume_slider, 36);
+    lv_obj_align(startup_volume_slider, LV_ALIGN_TOP_MID, 0, 18);
+    lv_slider_set_range(startup_volume_slider, 0, 100);
+    lv_slider_set_value(startup_volume_slider, current_settings.startup_volume_fixed_percent, LV_ANIM_OFF);
+    lv_obj_add_style(startup_volume_slider, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_style(startup_volume_slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_event_cb(startup_volume_slider, startup_volume_slider_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_set_ext_click_area(startup_volume_slider, 20);
+
+    startup_volume_value_label = lv_label_create(startup_volume_slider_card);
+    lv_obj_set_style_text_color(startup_volume_value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(startup_volume_value_label, ui_size_28, 0);
+    lv_obj_align(startup_volume_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_label_set_text_fmt(startup_volume_value_label, "%d%%", current_settings.startup_volume_fixed_percent);
+
+    finalize_screen_navigation(scr);
+    /* Same reasoning as screen_timeout_slider_card's identical line: don't
+     * let a drag that misses the slider bubble up as an app-wide swipe. */
+    lv_obj_remove_flag(startup_volume_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    return scr;
+}
+
+static void startup_volume_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(startup_volume_screen);
+}
+
+/* Index into SLEEP_TIMER_STEPS closest to `minutes' -- same reasoning as
+ * screen_timeout_seconds_to_step_index() above. */
+static int sleep_timer_minutes_to_step_index(int minutes) {
+    int best = 0;
+    int best_diff = abs(minutes - SLEEP_TIMER_STEPS[0]);
+    for (int i = 1; i < SLEEP_TIMER_STEP_COUNT; i++) {
+        int diff = abs(minutes - SLEEP_TIMER_STEPS[i]);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best = i;
+        }
+    }
+    return best;
+}
+
+/* This only sets the duration the quick-drawer sleep icon uses NEXT time
+ * it's armed -- unlike screen_timeout_slider_event_cb's sibling, there's no
+ * enable toggle here and no live countdown to interrupt, since arming
+ * itself only ever happens from the drawer icon (quick_drawer_sleep_event_cb),
+ * never from this screen. */
+static void sleep_timer_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    int32_t index = lv_slider_get_value(lv_event_get_target(e));
+    int minutes = SLEEP_TIMER_STEPS[index];
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        current_settings.sleep_timer_minutes = minutes;
+        lv_label_set_text_fmt(sleep_timer_value_label, "%d min", minutes);
+    } else if (code == LV_EVENT_RELEASED) {
+        settings_save(&current_settings);
+    }
+}
+
+/* Mirrors build_screen_timeout_screen()'s layout minus the enable toggle
+ * (a plain duration picker -- see sleep_timer_slider_event_cb's own
+ * comment for why arming doesn't belong on this screen). */
+static lv_obj_t * build_sleep_timer_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Sleep Timer");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title, ui_size_28, 0);
+
+    lv_obj_t * slider_card = lv_obj_create(scr);
+    lv_obj_set_size(slider_card, lv_pct(90), 170);
+    lv_obj_align(slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
+    lv_obj_set_style_bg_color(slider_card, lv_color_make(30, 30, 34), 0);
+    lv_obj_set_style_border_width(slider_card, 0, 0);
+    lv_obj_set_style_radius(slider_card, 10, 0);
+
+    sleep_timer_slider = lv_slider_create(slider_card);
+    lv_obj_set_width(sleep_timer_slider, lv_pct(94));
+    lv_obj_set_height(sleep_timer_slider, 36);
+    lv_obj_align(sleep_timer_slider, LV_ALIGN_TOP_MID, 0, 18);
+    lv_slider_set_range(sleep_timer_slider, 0, SLEEP_TIMER_STEP_COUNT - 1);
+    lv_slider_set_value(sleep_timer_slider, sleep_timer_minutes_to_step_index(current_settings.sleep_timer_minutes), LV_ANIM_OFF);
+    lv_obj_add_style(sleep_timer_slider, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_style(sleep_timer_slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_event_cb(sleep_timer_slider, sleep_timer_slider_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_set_ext_click_area(sleep_timer_slider, 20);
+
+    sleep_timer_value_label = lv_label_create(slider_card);
+    lv_obj_set_style_text_color(sleep_timer_value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(sleep_timer_value_label, ui_size_28, 0);
+    lv_obj_align(sleep_timer_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_label_set_text_fmt(sleep_timer_value_label, "%d min", current_settings.sleep_timer_minutes);
+
+    finalize_screen_navigation(scr);
+    /* Same reasoning as screen_timeout_slider_card's identical line: don't
+     * let a drag that misses the slider bubble up as an app-wide swipe. */
+    lv_obj_remove_flag(slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    return scr;
+}
+
+static void sleep_timer_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(sleep_timer_screen);
+}
+
+/* All IDLE_SHUTDOWN_STEPS values are whole minutes, so unlike
+ * format_screen_timeout() this never needs a seconds remainder -- "10m" /
+ * "1h" / "2h", not "1h 30m", since 90 isn't one of the steps. */
+static void format_idle_shutdown(char * buf, size_t buf_size, int minutes) {
+    if (minutes < 60) {
+        snprintf(buf, buf_size, "%dm", minutes);
+        return;
+    }
+    snprintf(buf, buf_size, "%dh", minutes / 60);
+}
+
+static int idle_shutdown_minutes_to_step_index(int minutes) {
+    int best = 0;
+    int best_diff = abs(minutes - IDLE_SHUTDOWN_STEPS[0]);
+    for (int i = 1; i < IDLE_SHUTDOWN_STEP_COUNT; i++) {
+        int diff = abs(minutes - IDLE_SHUTDOWN_STEPS[i]);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void idle_shutdown_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.idle_shutdown_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+
+    if (current_settings.idle_shutdown_enabled) {
+        lv_obj_remove_flag(idle_shutdown_slider_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(idle_suspend_mode_row, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(idle_shutdown_slider_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(idle_suspend_mode_row, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void idle_suspend_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.idle_suspend_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+}
+
+static void idle_shutdown_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    int32_t index = lv_slider_get_value(lv_event_get_target(e));
+    int minutes = IDLE_SHUTDOWN_STEPS[index];
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        current_settings.idle_shutdown_minutes = minutes;
+        char buf[32];
+        format_idle_shutdown(buf, sizeof(buf), minutes);
+        lv_label_set_text(idle_shutdown_value_label, buf);
+    } else if (code == LV_EVENT_RELEASED) {
+        settings_save(&current_settings);
+    }
+}
+
+static lv_obj_t * build_idle_shutdown_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Idle Shutdown");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title, ui_size_28, 0);
+
+    lv_obj_t * enable_row = lv_obj_create(scr);
+    lv_obj_set_size(enable_row, lv_pct(90), 50);
+    lv_obj_align(enable_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
+    lv_obj_set_style_bg_opa(enable_row, 0, 0);
+    lv_obj_set_style_border_width(enable_row, 0, 0);
+    lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * enable_label = lv_label_create(enable_row);
+    lv_label_set_text(enable_label, "Power off automatically when idle");
+    lv_obj_set_style_text_color(enable_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
+    lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
+
+    idle_shutdown_switch = lv_switch_create(enable_row);
+    lv_obj_align(idle_shutdown_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_style(idle_shutdown_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (current_settings.idle_shutdown_enabled) lv_obj_add_state(idle_shutdown_switch, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(idle_shutdown_switch, idle_shutdown_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* Same card/slider look as the screen-timeout screen above, for
+     * consistency between the two "enable switch + discrete-step slider"
+     * settings screens. */
+    idle_shutdown_slider_card = lv_obj_create(scr);
+    lv_obj_set_size(idle_shutdown_slider_card, lv_pct(90), 170);
+    lv_obj_align(idle_shutdown_slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90);
+    lv_obj_set_style_bg_color(idle_shutdown_slider_card, lv_color_make(30, 30, 34), 0);
+    lv_obj_set_style_border_width(idle_shutdown_slider_card, 0, 0);
+    lv_obj_set_style_radius(idle_shutdown_slider_card, 10, 0);
+    if (!current_settings.idle_shutdown_enabled) lv_obj_add_flag(idle_shutdown_slider_card, LV_OBJ_FLAG_HIDDEN);
+
+    idle_shutdown_slider = lv_slider_create(idle_shutdown_slider_card);
+    lv_obj_set_width(idle_shutdown_slider, lv_pct(94));
+    lv_obj_set_height(idle_shutdown_slider, 36);
+    lv_obj_align(idle_shutdown_slider, LV_ALIGN_TOP_MID, 0, 18);
+    lv_slider_set_range(idle_shutdown_slider, 0, IDLE_SHUTDOWN_STEP_COUNT - 1);
+    lv_slider_set_value(idle_shutdown_slider, idle_shutdown_minutes_to_step_index(current_settings.idle_shutdown_minutes), LV_ANIM_OFF);
+    lv_obj_add_style(idle_shutdown_slider, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_style(idle_shutdown_slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_event_cb(idle_shutdown_slider, idle_shutdown_slider_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_set_ext_click_area(idle_shutdown_slider, 20);
+
+    idle_shutdown_value_label = lv_label_create(idle_shutdown_slider_card);
+    lv_obj_set_style_text_color(idle_shutdown_value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(idle_shutdown_value_label, ui_size_28, 0);
+    lv_obj_align(idle_shutdown_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
+    char initial_buf[32];
+    format_idle_shutdown(initial_buf, sizeof(initial_buf), current_settings.idle_shutdown_minutes);
+    lv_label_set_text(idle_shutdown_value_label, initial_buf);
+
+    /* Mode choice between the two idle actions -- full poweroff
+     * (idle_shutdown_now(), the default, better-tested path) or real
+     * suspend-to-RAM (power_suspend_now(), quick resume instead of a
+     * reboot). Same shown/hidden-with-the-main-toggle treatment as
+     * idle_shutdown_slider_card above, toggled together in
+     * idle_shutdown_switch_event_cb(). */
+    idle_suspend_mode_row = lv_obj_create(scr);
+    lv_obj_set_size(idle_suspend_mode_row, lv_pct(90), 50);
+    lv_obj_align(idle_suspend_mode_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 280);
+    lv_obj_set_style_bg_opa(idle_suspend_mode_row, 0, 0);
+    lv_obj_set_style_border_width(idle_suspend_mode_row, 0, 0);
+    lv_obj_remove_flag(idle_suspend_mode_row, LV_OBJ_FLAG_SCROLLABLE);
+    if (!current_settings.idle_shutdown_enabled) lv_obj_add_flag(idle_suspend_mode_row, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * suspend_mode_label = lv_label_create(idle_suspend_mode_row);
+    lv_label_set_text(suspend_mode_label, "Suspend instead of power off");
+    lv_obj_set_style_text_color(suspend_mode_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(suspend_mode_label, ui_size_20, 0);
+    lv_obj_align(suspend_mode_label, LV_ALIGN_LEFT_MID, 0, 0);
+
+    idle_suspend_switch = lv_switch_create(idle_suspend_mode_row);
+    lv_obj_align(idle_suspend_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_add_style(idle_suspend_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (current_settings.idle_suspend_enabled) lv_obj_add_state(idle_suspend_switch, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(idle_suspend_switch, idle_suspend_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    finalize_screen_navigation(scr);
+    /* Same reasoning as screen_timeout_slider_card's identical line: don't
+     * let a drag that misses the slider bubble up as an app-wide swipe. */
+    lv_obj_remove_flag(idle_shutdown_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    return scr;
+}
+
+static void idle_shutdown_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(idle_shutdown_screen);
+}
+
+/* ---- Time Zone picker ----------------------------------------------------
+ * Region -> City, matching the stock firmware's own selection flow (per
+ * user direction: "just a region -> country selector that sets up the
+ * current time" -- the hardware's RTC already ships with a reasonable
+ * date/time, confirmed live, so there's no separate manual date/time entry
+ * here, only the zone). TIMEZONE_TABLE (timezone_data.h, ~370 entries) is
+ * generated offline from the stock firmware's own city-name list,
+ * cross-checked against this device's real /usr/share/zoneinfo tree -- see
+ * timezone_data.c's own header comment; it's already sorted by UTC offset
+ * then city name, which stays a sensible order even after filtering down to
+ * one region (most regions span a limited, roughly west-to-east offset
+ * range). Region names below are exactly the top-level IANA region
+ * components actually present in TIMEZONE_TABLE (confirmed by inspection),
+ * not a hand-typed guess. */
+static const char * const TIMEZONE_REGIONS[] = {
+    "Africa", "America", "Antarctica", "Arctic", "Asia", "Atlantic", "Australia", "Europe", "Indian", "Pacific"
+};
+#define TIMEZONE_REGION_COUNT (sizeof(TIMEZONE_REGIONS) / sizeof(TIMEZONE_REGIONS[0]))
+
+static lv_obj_t * timezone_region_screen;
+static lv_obj_t * timezone_city_screen;
+/* Maps a City-screen row index (as passed to timezone_city_row_click_cb)
+ * back to its real TIMEZONE_TABLE index -- the City screen only ever shows
+ * one region's subset, so row index != table index. */
+static int timezone_city_indices[TIMEZONE_TABLE_COUNT];
+static int timezone_city_count;
+
+static void timezone_city_row_click_cb(int row_index) {
+    if (row_index < 0 || row_index >= timezone_city_count) return;
+    const timezone_entry_t * entry = &TIMEZONE_TABLE[timezone_city_indices[row_index]];
+    timezone_apply(entry->iana_id);
+    snprintf(current_settings.timezone, sizeof(current_settings.timezone), "%s", entry->iana_id);
+    settings_save(&current_settings);
+    refresh_clock_label(); /* topbar clock reflects the new zone immediately, not just on the next periodic refresh */
+    nav_pop(); /* City -> Region */
+    nav_pop(); /* Region -> Settings -- picking a leaf city is a completed action, not a place to linger browsing further */
+}
+
+/* Rebuilt (delete + rebuild, same idiom as all_songs_screen after a library
+ * rescan -- see poll_library_rescan()) every time a region is opened,
+ * filtered down to just that region's entries, rather than built once --
+ * needed both because the region changes on every open and so the
+ * "(current)" marker always reflects current_settings.timezone as of the
+ * most recent selection. Cheap even at TIMEZONE_TABLE_COUNT entries since
+ * build_compact_list_screen is virtualized (screen_builders.h) -- only a
+ * small pool of row widgets actually gets created, not one per entry.
+ * `labels` is this function's own long-lived backing array for the
+ * "(current)"-suffixed copy build_compact_list_screen's own doc comment
+ * requires (label pointers must outlive the screen, not just this call) --
+ * previous generation's entries are freed up to prev_count (the region
+ * filter means the count varies per open, unlike a fixed-size table) right
+ * before this rebuild, once the previous screen holding those pointers has
+ * already been deleted by the caller. */
+static void build_timezone_city_screen_items(compact_list_item_t * items, const char * region) {
+    static char * labels[TIMEZONE_TABLE_COUNT];
+    static int prev_count = 0;
+    for (int i = 0; i < prev_count; i++) {
+        free(labels[i]);
+        labels[i] = NULL;
+    }
+
+    size_t region_len = strlen(region);
+    timezone_city_count = 0;
+    for (int i = 0; i < TIMEZONE_TABLE_COUNT; i++) {
+        const char * id = TIMEZONE_TABLE[i].iana_id;
+        if (strncmp(id, region, region_len) != 0 || id[region_len] != '/') continue;
+
+        int row = timezone_city_count;
+        bool is_current = strcmp(current_settings.timezone, id) == 0;
+        if (is_current) {
+            size_t len = strlen(TIMEZONE_TABLE[i].display_name) + 16;
+            labels[row] = malloc(len);
+            snprintf(labels[row], len, "%s (current)", TIMEZONE_TABLE[i].display_name);
+        } else {
+            labels[row] = strdup(TIMEZONE_TABLE[i].display_name);
+        }
+        timezone_city_indices[row] = i;
+        items[row] = (compact_list_item_t){ labels[row] };
+        timezone_city_count++;
+    }
+    prev_count = timezone_city_count;
+}
+
+static lv_obj_t * build_timezone_city_screen(const char * region) {
+    compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) TIMEZONE_TABLE_COUNT);
+    build_timezone_city_screen_items(items, region);
+    lv_obj_t * scr = build_compact_list_screen(region, generic_back_cb, items, timezone_city_count, timezone_city_row_click_cb);
+    free(items);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void open_timezone_city_screen(const char * region) {
+    if (timezone_city_screen) lv_obj_delete(timezone_city_screen);
+    timezone_city_screen = build_timezone_city_screen(region);
+    nav_push(timezone_city_screen);
+}
+
+static void timezone_region_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    open_timezone_city_screen(TIMEZONE_REGIONS[index]);
+}
+
+/* Small (10 rows) and fixed -- built once at startup like every other
+ * screen, unlike the per-region City screen above. */
+static lv_obj_t * build_timezone_region_screen(void) {
+    static pill_list_item_t items[TIMEZONE_REGION_COUNT];
+    for (size_t i = 0; i < TIMEZONE_REGION_COUNT; i++) {
+        items[i] = (pill_list_item_t){ TIMEZONE_REGIONS[i], PILL_ACCESSORY_CHEVRON, false, timezone_region_row_cb, NULL,
+                                        (void *) (intptr_t) i };
+    }
+    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void timezone_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(timezone_region_screen);
+}
+
+/* Defined later, alongside its confirmation popup (build_factory_reset_popup(),
+ * right after build_eq_reset_popup() -- same hand-built top-layer overlay
+ * shape). */
+static void factory_reset_btn_cb(lv_event_t * e);
+
+/* Alphabetical by label -- real-device feedback: the previous ad-hoc
+ * ordering (roughly "added in this order") made a specific setting hard
+ * to find in a 17-row list. Keep new entries sorted in too rather than
+ * appended at the end. */
+static lv_obj_t * build_settings_screen(void) {
+    /* "Auto-resume on launch" deliberately has no row here -- real-device
+     * incident: auto-resume-on-launch is entirely disabled at compile time
+     * (AUTO_RESUME_ON_LAUNCH_ENABLED, gui_init()) after a crash-reboot loop
+     * report, but this toggle itself was left fully interactive and
+     * defaulting to checked -- functionally inert either way, but showing
+     * a live-looking control for a feature that silently does nothing is
+     * actively misleading (a beta tester spotted it checked, right next to
+     * the new Font Size row after the System list got alphabetized, and
+     * understandably read that as "auto-resume is back"). Removed until
+     * the feature itself is re-enabled; current_settings.auto_resume_enabled
+     * and auto_resume_switch_event_cb are both still there, just
+     * unreferenced from here for now. */
+    static pill_list_item_t items[16];
+    items[0] = (pill_list_item_t){ "Accent Color", PILL_ACCESSORY_CHEVRON, false, accent_color_row_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
+    items[2] = (pill_list_item_t){ "Charge Limiter (85%)", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.charge_limiter_enabled, NULL, charge_limiter_switch_event_cb, NULL };
+    items[3] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.crossfade_enabled, NULL, crossfade_switch_event_cb, NULL };
+    items[4] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
+    items[5] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
+    items[6] = (pill_list_item_t){ "Font Size", PILL_ACCESSORY_CHEVRON, false, font_size_settings_row_cb, NULL, NULL };
+    items[7] = (pill_list_item_t){ "Idle Shutdown", PILL_ACCESSORY_CHEVRON, false, idle_shutdown_row_cb, NULL, NULL };
+    items[8] = (pill_list_item_t){ "LED Indicator", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.led_indicator_enabled, NULL, led_indicator_switch_event_cb, NULL };
+    items[9] = (pill_list_item_t){ "Screen Timeout", PILL_ACCESSORY_CHEVRON, false, screen_timeout_row_cb, NULL, NULL };
+    items[10] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
+    items[11] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
+    items[12] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
+                                     current_settings.swipe_up_home_enabled, NULL, swipe_up_home_switch_event_cb, NULL };
+    items[13] = (pill_list_item_t){ "Time Zone", PILL_ACCESSORY_CHEVRON, false, timezone_settings_row_cb, NULL, NULL };
+    items[14] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
+    items[15] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, 16);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void music_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(music_screen);
+}
+
+static void stream_media_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(stream_media_screen);
+}
+
+static void wireless_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(wireless_screen);
+}
+
+static void books_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(books_screen);
+}
+
+static void system_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(settings_screen);
+}
+
+static void about_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(about_screen);
+}
+
+static lv_obj_t * build_home_screen(void) {
+    static icon_grid_item_t items[6];
+    items[0] = (icon_grid_item_t){ "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb, NULL };
+    items[1] = (icon_grid_item_t){ "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb, NULL };
+    items[2] = (icon_grid_item_t){ "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb, NULL };
+    items[3] = (icon_grid_item_t){ "launcher/book.png", "launcher/book_s.png", "Books", books_tile_cb, NULL };
+    items[4] = (icon_grid_item_t){ "launcher/sys_set.png", "launcher/sys_set_s.png", "System", system_tile_cb, NULL };
+    items[5] = (icon_grid_item_t){ "launcher/about.png", "launcher/about_s.png", "About", about_tile_cb, NULL };
+    /* No back_btn_cb -- this is the true root, nothing to go back to. No
+     * title either -- matches the real stock launcher, which has no header
+     * text above its icon grid. */
+    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, 6);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* Neutral card color matching every other settings-style screen's cards
+ * (screen_timeout_slider_card, idle_shutdown_slider_card, ...) -- the
+ * previous green tint was this screen's own one-off look, which is
+ * exactly what real-device feedback asked to drop ("styling should use
+ * the same as all the other screens"). */
+#define EQ_CARD_COLOR lv_color_make(30, 30, 34)
+
+/* Bigger than the old 82px-tall/default-font cards (real-device feedback:
+ * "sliders and text should be a little bigger and not overlap") -- value
+ * label gets its own clear band at the top in a larger font, then a solid
+ * gap before a taller slider track, instead of a small label crammed above
+ * a thin slider in the same tight card. Card is now a plain flex-flow
+ * child (no y/lv_obj_align -- see build_eq_screen()'s content container)
+ * so screen-wide spacing lives in one place (the container's pad_gap)
+ * rather than being hand-tuned per card. */
+static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_obj_t ** out_value_label,
+                                        lv_obj_t ** out_slider, int32_t range_min, int32_t range_max) {
+    lv_obj_t * card = lv_obj_create(parent);
+    lv_obj_set_size(card, lv_pct(92), 132);
+    lv_obj_set_style_bg_color(card, EQ_CARD_COLOR, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Clickable (tap-to-edit, see eq_field_label_click_cb()) -- the whole
+     * label area is the tap target, not just the text glyphs, via
+     * lv_obj_set_ext_click_area() below. */
+    lv_obj_t * value_label = lv_label_create(card);
+    lv_obj_set_style_text_color(value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(value_label, ui_size_22, 0);
+    /* y=6, not the original 14 -- real-device feedback: the value text
+     * needed more separation from the slider below it, so it moves up a
+     * little rather than the slider moving down (slider stays anchored to
+     * the card bottom). */
+    lv_obj_align(value_label, LV_ALIGN_TOP_LEFT, 14, 6);
+    lv_obj_add_flag(value_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(value_label, 16);
+    lv_obj_add_event_cb(value_label, eq_field_label_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) field);
+
+    lv_obj_t * slider = lv_slider_create(card);
+    lv_obj_set_width(slider, lv_pct(90));
+    lv_obj_set_height(slider, 34);
+    lv_obj_align(slider, LV_ALIGN_BOTTOM_MID, 0, -18);
+    lv_slider_set_range(slider, range_min, range_max);
+    lv_obj_add_style(slider, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_style(slider, &style_accent, LV_PART_KNOB);
+    lv_obj_set_ext_click_area(slider, 20);
+
+    *out_value_label = value_label;
+    *out_slider = slider;
+    return card;
+}
+
+/* ---- PEQ named profiles (save/load to/from the SD card) ----
+ *
+ * peq.c's own peq_load()/peq_save() always target one fixed, always-current
+ * file (loaded at startup, saved on every change) -- these profiles are a
+ * separate, explicit "keep this exact setup around under a name" action,
+ * living in their own SD card folder rather than mixed in with music. */
+#define PEQ_PROFILES_DIR MUSIC_ROOT_DIR "/PEQ_Profiles"
+
+static lv_obj_t * eq_profiles_screen;
+static lv_obj_t * eq_profiles_list;
+
+/* Refreshes every widget on the EQ screen from peq.c's current state --
+ * shared by the initial build and by "Load Profile" (which changes
+ * everything at once, unlike the individual per-field setters that only
+ * ever touch one widget). */
+static void refresh_all_eq_widgets(void) {
+    if (peq_get_bypass()) lv_obj_clear_state(eq_bypass_switch, LV_STATE_CHECKED);
+    else lv_obj_add_state(eq_bypass_switch, LV_STATE_CHECKED);
+    lv_slider_set_value(eq_preamp_slider, (int32_t) (peq_get_preamp_db() * 10.0), LV_ANIM_OFF);
+    lv_label_set_text_fmt(eq_preamp_value_label, "Pre-Amp: %+.2f dB", peq_get_preamp_db());
+    refresh_eq_band_widgets();
+}
+
+/* ---- Reset PEQ to defaults, with a confirmation popup -- same hand-built
+ * top-layer overlay shape as bt_dac_leave_popup (this codebase doesn't use
+ * LVGL's lv_msgbox anywhere), since a factory reset of every band's
+ * freq/gain/Q/type plus the preamp is not something a stray tap should be
+ * able to trigger by accident. ---- */
+static lv_obj_t * eq_reset_popup;
+static lv_obj_t * eq_reset_popup_backdrop;
+
+static void hide_eq_reset_popup(void) {
+    lv_obj_add_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(eq_reset_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void eq_reset_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_eq_reset_popup();
+}
+
+static void eq_reset_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_eq_reset_popup();
+}
+
+static void eq_reset_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_eq_reset_popup();
+    peq_reset_to_defaults();
+    refresh_all_eq_widgets();
+    peq_save();
+    show_error_toast("PEQ reset to defaults");
+}
+
+static void eq_reset_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    lv_obj_remove_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(eq_reset_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(eq_reset_popup_backdrop);
+    lv_obj_move_foreground(eq_reset_popup);
+}
+
+static void build_eq_reset_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    eq_reset_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(eq_reset_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(eq_reset_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(eq_reset_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(eq_reset_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(eq_reset_popup_backdrop, eq_reset_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    eq_reset_popup = lv_obj_create(top);
+    lv_obj_set_size(eq_reset_popup, 400, 220);
+    lv_obj_align(eq_reset_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(eq_reset_popup, 16, 0);
+    lv_obj_set_style_bg_color(eq_reset_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(eq_reset_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(eq_reset_popup, 0, 0);
+    lv_obj_remove_flag(eq_reset_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(eq_reset_popup, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * title = lv_label_create(eq_reset_popup);
+    lv_obj_set_width(title, lv_pct(90));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_label_set_text(title, "Reset PEQ to defaults?");
+
+    lv_obj_t * reset_row = lv_obj_create(eq_reset_popup);
+    lv_obj_set_size(reset_row, lv_pct(90), 56);
+    lv_obj_align(reset_row, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_radius(reset_row, 12, 0);
+    lv_obj_set_style_bg_opa(reset_row, 0, 0);
+    lv_obj_set_style_border_width(reset_row, 0, 0);
+    lv_obj_remove_flag(reset_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(reset_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(reset_row, eq_reset_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * reset_label = lv_label_create(reset_row);
+    lv_label_set_text(reset_label, "Reset");
+    lv_obj_set_style_text_color(reset_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(reset_label, ui_size_20, 0);
+    lv_obj_center(reset_label);
+
+    lv_obj_t * cancel_row = lv_obj_create(eq_reset_popup);
+    lv_obj_set_size(cancel_row, lv_pct(90), 56);
+    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
+    lv_obj_set_style_radius(cancel_row, 12, 0);
+    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
+    lv_obj_set_style_border_width(cancel_row, 0, 0);
+    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cancel_row, eq_reset_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * cancel_label = lv_label_create(cancel_row);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_center(cancel_label);
+}
+
+/* ---- Factory Reset, with a confirmation popup -- same hand-built
+ * top-layer overlay shape as eq_reset_popup right above (this codebase
+ * doesn't use LVGL's lv_msgbox anywhere). Wiping every app setting is
+ * exactly the kind of thing a stray tap must never be able to trigger.
+ * Reboots immediately on confirm (settings_factory_reset() deletes the
+ * settings file and returns -- see its own comment in settings.h for why
+ * nothing here tries to hot-apply the reset settings instead of just
+ * rebooting into them fresh). ---- */
+static lv_obj_t * factory_reset_popup;
+static lv_obj_t * factory_reset_popup_backdrop;
+
+static void hide_factory_reset_popup(void) {
+    lv_obj_add_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(factory_reset_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void factory_reset_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_factory_reset_popup();
+}
+
+static void factory_reset_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_factory_reset_popup();
+}
+
+static void factory_reset_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_factory_reset_popup();
+    settings_factory_reset(); /* deletes the settings file and reboots -- see its own comment in settings.h/.c */
+}
+
+static void factory_reset_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    lv_obj_remove_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(factory_reset_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(factory_reset_popup_backdrop);
+    lv_obj_move_foreground(factory_reset_popup);
+}
+
+static void build_factory_reset_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    factory_reset_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(factory_reset_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(factory_reset_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(factory_reset_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(factory_reset_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(factory_reset_popup_backdrop, factory_reset_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    factory_reset_popup = lv_obj_create(top);
+    lv_obj_set_size(factory_reset_popup, 400, 220);
+    lv_obj_align(factory_reset_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(factory_reset_popup, 16, 0);
+    lv_obj_set_style_bg_color(factory_reset_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(factory_reset_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(factory_reset_popup, 0, 0);
+    lv_obj_remove_flag(factory_reset_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(factory_reset_popup, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * title = lv_label_create(factory_reset_popup);
+    lv_obj_set_width(title, lv_pct(90));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_label_set_text(title, "Reset all settings and reboot?");
+
+    lv_obj_t * reset_row = lv_obj_create(factory_reset_popup);
+    lv_obj_set_size(reset_row, lv_pct(90), 56);
+    lv_obj_align(reset_row, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_radius(reset_row, 12, 0);
+    lv_obj_set_style_bg_opa(reset_row, 0, 0);
+    lv_obj_set_style_border_width(reset_row, 0, 0);
+    lv_obj_remove_flag(reset_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(reset_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(reset_row, factory_reset_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * reset_label = lv_label_create(reset_row);
+    lv_label_set_text(reset_label, "Reset");
+    lv_obj_set_style_text_color(reset_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(reset_label, ui_size_20, 0);
+    lv_obj_center(reset_label);
+
+    lv_obj_t * cancel_row = lv_obj_create(factory_reset_popup);
+    lv_obj_set_size(cancel_row, lv_pct(90), 56);
+    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
+    lv_obj_set_style_radius(cancel_row, 12, 0);
+    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
+    lv_obj_set_style_border_width(cancel_row, 0, 0);
+    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cancel_row, factory_reset_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * cancel_label = lv_label_create(cancel_row);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_center(cancel_label);
+}
+
+static void eq_profile_row_cb(lv_event_t * e) {
+    const char * path = (const char *) lv_event_get_user_data(e);
+    if (!peq_load_from_path(path)) {
+        show_error_toast("Failed to load profile");
+        return;
+    }
+    refresh_all_eq_widgets();
+    peq_save(); /* the loaded profile becomes the new always-current state too */
+    nav_pop();
+    show_error_toast("Profile loaded");
+}
+
+static void populate_eq_profiles_screen(void) {
+    lv_obj_clean(eq_profiles_list);
+
+    char ** paths;
+    int count;
+    if (!peq_scan_profiles(PEQ_PROFILES_DIR, &paths, &count)) {
+        lv_obj_t * label = lv_label_create(eq_profiles_list);
+        lv_label_set_text(label, "No saved profiles");
+        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        lv_obj_t * row = lv_obj_create(eq_profiles_list);
+        lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char display[64];
+        snprintf(display, sizeof(display), "%s", basename_of(paths[i]));
+        char * dot = strrchr(display, '.');
+        if (dot) *dot = '\0'; /* drop the .peq extension for display */
+
+        lv_obj_t * label = lv_label_create(row);
+        lv_label_set_text(label, display);
+        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, eq_profile_row_cb, LV_EVENT_CLICKED, paths[i]);
+    }
+    free(paths);
+}
+
+static lv_obj_t * build_eq_profiles_screen(void) {
+    lv_obj_t * title_label;
+    return build_subsonic_list_screen("Load Profile", &title_label, &eq_profiles_list);
+}
+
+static void eq_load_profile_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    populate_eq_profiles_screen();
+    nav_push(eq_profiles_screen);
+}
+
+static void eq_save_profile_name_done_cb(const char * text, void * user_data) {
+    (void) user_data;
+    if (text[0] == '\0') return;
+
+    mkdir(PEQ_PROFILES_DIR, 0755); /* no-op (EEXIST) if it's already there */
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s.peq", PEQ_PROFILES_DIR, text);
+    show_error_toast(peq_save_to_path(path) ? "Profile saved" : "Failed to save profile");
+}
+
+static void eq_save_profile_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_text_entry("Profile Name", "", false, false, eq_save_profile_name_done_cb, NULL);
+}
+
+static lv_obj_t * build_eq_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    /* Standard back button + title, matching every other sub-screen
+     * (build_subsonic_list_screen et al) instead of the old screen's own
+     * one-off green "< Back" button -- the other half of "styling should
+     * use the same as all the other screens". */
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "PEQ");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title, ui_size_28, 0);
+
+    /* "EQ Enabled" switch lives in the title row itself (top-right), same
+     * spot other screens put a title-row action (e.g. the Wi-Fi screen's
+     * "Rescan"). */
+    eq_bypass_switch = lv_switch_create(scr);
+    lv_obj_align(eq_bypass_switch, LV_ALIGN_TOP_RIGHT, -16, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_style(eq_bypass_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+
+    /* Reset to defaults -- sits right next to the enable switch per the
+     * bug report ask, aligned relative to the switch itself (not a fixed
+     * x offset) so it stays correctly placed regardless of the switch's
+     * actual rendered width. Confirmation required (build_eq_reset_popup())
+     * since this clobbers every band's freq/gain/Q/type plus the preamp. */
+    lv_obj_t * reset_btn = lv_label_create(scr);
+    lv_label_set_text(reset_btn, "Reset");
+    lv_obj_set_style_text_color(reset_btn, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(reset_btn, ui_size_16, 0);
+    lv_obj_align_to(reset_btn, eq_bypass_switch, LV_ALIGN_OUT_LEFT_MID, -14, 0);
+    lv_obj_add_flag(reset_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(reset_btn, 16);
+    lv_obj_add_event_cb(reset_btn, eq_reset_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Everything else lives in one scrollable flex-column container below
+     * the title row -- pad_gap gives every card the same, generous spacing
+     * (the "sliders more spaced out" ask) from one place instead of
+     * hand-tuned per-element y-offsets that made it easy for things to end
+     * up too close together or overlapping as fields got bigger. */
+    lv_obj_t * content = lv_obj_create(scr);
+    lv_obj_set_size(content, lv_pct(100),
+                    lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
+                        TITLE_ROW_HEIGHT);
+    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(content, 0, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_scroll_dir(content, LV_DIR_VER);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    /* Main-place (1st arg) must be START, not CENTER -- this column's
+     * children overflow the container height on purpose (that's what makes
+     * it scrollable), and CENTER main-place centers that whole oversized
+     * stack instead of anchoring it to the top. That pushed the first card
+     * (Pre-Amp) above the reachable top of the scroll range entirely --
+     * real-device bug report: "can't see the preamp part, can't scroll up
+     * enough". START anchors the stack's top to the container's top, same
+     * as every other scrollable list in this file (e.g.
+     * build_subsonic_list_screen's list, which never sets this at all and
+     * gets START by default). */
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(content, 16, 0);
+    lv_obj_set_style_pad_top(content, 12, 0);
+    lv_obj_set_style_pad_bottom(content, 24, 0);
+
+    /* Pre-Amp: an overall gain applied before the per-band filters, so
+     * boosted bands can be pulled back down without touching every band's
+     * own gain -- same role as the reference DAP's "Pre AMP" control. */
+    create_eq_slider_card(content, EQ_FIELD_PREAMP, &eq_preamp_value_label, &eq_preamp_slider, -120, 120);
+
+    /* Band picker: a 5x2 grid of tappable band numbers -- edit one band's
+     * freq/Q/gain/type at a time rather than showing 10 bands' worth of
+     * controls simultaneously. Bigger buttons than before (80x44 vs
+     * 60x28) for the same "bigger, not overlapping" reasoning as the
+     * slider cards; LV_SIZE_CONTENT height so it's never a guess at
+     * exactly how tall two rows of these need to be. */
+    lv_obj_t * band_grid = lv_obj_create(content);
+    lv_obj_set_width(band_grid, lv_pct(92));
+    lv_obj_set_height(band_grid, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(band_grid, EQ_CARD_COLOR, 0);
+    lv_obj_set_style_border_width(band_grid, 0, 0);
+    lv_obj_set_style_radius(band_grid, 12, 0);
+    lv_obj_set_style_pad_all(band_grid, 10, 0);
+    lv_obj_remove_flag(band_grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(band_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(band_grid, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    for (int i = 0; i < PEQ_NUM_BANDS; i++) {
+        lv_obj_t * btn = lv_obj_create(band_grid);
+        lv_obj_set_size(btn, 80, 44);
+        lv_obj_set_style_bg_opa(btn, 0, 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(btn, eq_band_button_event_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+
+        lv_obj_t * label = lv_label_create(btn);
+        lv_label_set_text_fmt(label, "Band%d", i);
+        lv_obj_set_style_text_font(label, ui_size_20, 0);
+        lv_obj_add_style(label, &style_muted_text, 0);
+        lv_obj_center(label);
+
+        eq_band_buttons[i] = btn;
+        eq_band_button_labels[i] = label;
+    }
+
+    create_eq_slider_card(content, EQ_FIELD_FREQ, &eq_freq_value_label, &eq_freq_slider, 0, EQ_FREQ_SLIDER_MAX);
+    create_eq_slider_card(content, EQ_FIELD_GAIN, &eq_gain_value_label, &eq_gain_slider, -120, 120);
+    create_eq_slider_card(content, EQ_FIELD_Q, &eq_q_value_label, &eq_q_slider, 1, 100);
+
+    lv_obj_t * type_row = lv_obj_create(content);
+    lv_obj_set_size(type_row, lv_pct(92), 64);
+    lv_obj_set_style_bg_color(type_row, EQ_CARD_COLOR, 0);
+    lv_obj_set_style_border_width(type_row, 0, 0);
+    lv_obj_set_style_radius(type_row, 12, 0);
+    lv_obj_remove_flag(type_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * type_label = lv_label_create(type_row);
+    lv_label_set_text(type_label, "Type");
+    lv_obj_set_style_text_color(type_label, lv_color_make(220, 220, 220), 0);
+    lv_obj_set_style_text_font(type_label, ui_size_20, 0);
+    lv_obj_align(type_label, LV_ALIGN_LEFT_MID, 16, 0);
+
+    eq_type_dropdown = lv_dropdown_create(type_row);
+    lv_dropdown_set_options(eq_type_dropdown, "Peaking\nLow Shelf\nHigh Shelf");
+    lv_obj_set_width(eq_type_dropdown, 170);
+    lv_obj_align(eq_type_dropdown, LV_ALIGN_RIGHT_MID, -14, 0);
+
+    lv_obj_t * enable_row = lv_obj_create(content);
+    lv_obj_set_size(enable_row, lv_pct(92), 64);
+    lv_obj_set_style_bg_color(enable_row, EQ_CARD_COLOR, 0);
+    lv_obj_set_style_border_width(enable_row, 0, 0);
+    lv_obj_set_style_radius(enable_row, 12, 0);
+    lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * enabled_label = lv_label_create(enable_row);
+    lv_label_set_text(enabled_label, "Enable");
+    lv_obj_set_style_text_color(enabled_label, lv_color_make(220, 220, 220), 0);
+    lv_obj_set_style_text_font(enabled_label, ui_size_20, 0);
+    lv_obj_align(enabled_label, LV_ALIGN_LEFT_MID, 16, 0);
+
+    eq_band_enabled_switch = lv_switch_create(enable_row);
+    lv_obj_align(eq_band_enabled_switch, LV_ALIGN_RIGHT_MID, -14, 0);
+    lv_obj_add_style(eq_band_enabled_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+
+    /* Save/Load Profile row -- the new SD card persistence ask, sitting at
+     * the end of the same scrollable list as everything else rather than
+     * a separate screen of its own. */
+    lv_obj_t * profile_row = lv_obj_create(content);
+    lv_obj_set_size(profile_row, lv_pct(92), 64);
+    lv_obj_set_style_bg_opa(profile_row, 0, 0);
+    lv_obj_set_style_border_width(profile_row, 0, 0);
+    lv_obj_remove_flag(profile_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(profile_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(profile_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(profile_row, 12, 0);
+
+    lv_obj_t * save_btn = lv_obj_create(profile_row);
+    lv_obj_set_size(save_btn, lv_pct(46), 56);
+    lv_obj_set_style_bg_color(save_btn, EQ_CARD_COLOR, 0);
+    lv_obj_set_style_border_width(save_btn, 0, 0);
+    lv_obj_set_style_radius(save_btn, 12, 0);
+    lv_obj_remove_flag(save_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(save_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(save_btn, eq_save_profile_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * save_label = lv_label_create(save_btn);
+    lv_label_set_text(save_label, "Save Profile");
+    lv_obj_set_style_text_font(save_label, ui_size_20, 0);
+    lv_obj_add_style(save_label, &style_accent, 0);
+    lv_obj_center(save_label);
+
+    lv_obj_t * load_btn = lv_obj_create(profile_row);
+    lv_obj_set_size(load_btn, lv_pct(46), 56);
+    lv_obj_set_style_bg_color(load_btn, EQ_CARD_COLOR, 0);
+    lv_obj_set_style_border_width(load_btn, 0, 0);
+    lv_obj_set_style_radius(load_btn, 12, 0);
+    lv_obj_remove_flag(load_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(load_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(load_btn, eq_load_profile_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * load_label = lv_label_create(load_btn);
+    lv_label_set_text(load_label, "Load Profile");
+    lv_obj_set_style_text_font(load_label, ui_size_20, 0);
+    lv_obj_add_style(load_label, &style_accent, 0);
+    lv_obj_center(load_label);
+
+    /* Establish correct initial visual state for every widget BEFORE
+     * binding any event callbacks -- lv_obj_add_state()/clear_state() can
+     * itself fire LV_EVENT_VALUE_CHANGED, which would otherwise trigger a
+     * spurious peq_save() during screen construction (observed empirically:
+     * band 0 ended up saved as enabled=1 on a fresh run with no user
+     * interaction at all). */
+    refresh_all_eq_widgets();
+
+    lv_obj_add_event_cb(eq_bypass_switch, eq_bypass_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(eq_preamp_slider, eq_preamp_slider_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(eq_band_enabled_switch, eq_band_enabled_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(eq_type_dropdown, eq_type_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(eq_freq_slider, eq_freq_slider_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(eq_gain_slider, eq_gain_slider_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(eq_q_slider, eq_q_slider_event_cb, LV_EVENT_ALL, NULL);
+
+    finalize_screen_navigation(scr);
+    /* Same reasoning as every other scrollable-content screen in this
+     * file: a drag over a card that isn't the slider itself should scroll
+     * the list, not bubble up as an app-wide swipe. */
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    return scr;
+}
+
+void gui_init(uint32_t screen_width, uint32_t screen_height) {
+#ifndef HOST_BUILD
+    boot_checkpoint("gui_init entered");
+#endif
+    settings_load(&current_settings);
+#ifndef HOST_BUILD
+    boot_checkpoint("settings_load done");
+#endif
+
+    /* Must run before any screen below captures a ui_size_16/20/22/28
+     * pointer into its own style -- see this function's own doc comment. */
+    apply_font_size_tier(current_settings.font_size_tier);
+
+    /* Correct the persisted USB mode against live gadget state before
+     * anything else reads it (external_dac_block_reason() in particular --
+     * a stale usb_mode==USB_MODE_DAC left over from a previous run would
+     * otherwise wrongly block local playback from the moment the app
+     * starts). Hardware USB gadget state doesn't survive a reboot, but this
+     * binary can also be killed and relaunched without a reboot (as it was
+     * repeatedly during development), which is exactly when the persisted
+     * value and reality can disagree. */
+    usb_mode_t detected_usb_mode;
+    if (usb_mode_control_detect_current(&detected_usb_mode)) current_settings.usb_mode = (int) detected_usb_mode;
+
+    /* current_settings.volume itself is left untouched here even when the
+     * fixed-startup path below is taken -- it keeps tracking "last used"
+     * independently (still updated normally by volume_slider_event_cb's
+     * RELEASED case during the session), so turning startup_volume_fixed_enabled
+     * back off later resumes from wherever the slider was really last left,
+     * not from stale fixed-mode state. */
+    audio_set_volume(current_settings.startup_volume_fixed_enabled
+                          ? (float) current_settings.startup_volume_fixed_percent / 100.0f
+                          : current_settings.volume); /* picked up below when the volume slider reads audio_get_volume() */
+    audio_set_crossfade_enabled(current_settings.crossfade_enabled);
+    led_control_apply(current_settings.led_indicator_enabled);
+    charge_limiter_poll(current_settings.charge_limiter_enabled, true);
+    if (current_settings.timezone[0] != '\0') timezone_apply(current_settings.timezone);
+
+    /* Reapply persisted external-DAC state -- see
+     * start_bt_dac_startup_reapply_if_needed()'s own comment for the real
+     * incident this fixes. AirPlay's equivalent (wifi_dac_mode_enabled) has
+     * the same shape of bug but no slow chip-init step, so it's cheap enough
+     * to just call directly here rather than needing its own background
+     * thread. */
+    if (current_settings.wifi_dac_mode_enabled) {
+        char name[64];
+        get_device_name(name, sizeof(name));
+        airplay_control_start(name);
+    }
+    start_bt_dac_startup_reapply_if_needed();
+    if (current_settings.dlna_renderer_enabled) dlna_control_start();
+
+    /* The quick drawer's own open/close drag tracking is polled from
+     * update_timer_cb instead (poll_quick_drawer_drag()) -- see its comment
+     * for why event-based approaches (both indev-wide LV_EVENT_PRESSED/
+     * PRESSING and per-object LV_EVENT_GESTURE bubbling) proved unreliable
+     * here specifically. */
+
+    lv_style_init(&style_accent);
+    lv_style_set_bg_color(&style_accent, accent_lv_color());
+    lv_style_set_text_color(&style_accent, accent_lv_color());
+
+    lv_style_init(&style_muted_text);
+    lv_style_set_text_color(&style_muted_text, lv_color_make(220, 220, 220));
+
+    fallback_font_init_early(current_settings.font_size_tier); /* must run before any style/screen captures &app_font_16/&app_font_22 -- see fallback_font.h */
+    screen_builders_init_list_row_style();
+#ifndef HOST_BUILD
+    boot_checkpoint("pre-screen-build setup done");
+#endif
+
+    player_screen = build_player_screen(screen_width, screen_height);
+#ifndef HOST_BUILD
+    boot_checkpoint("build_player_screen done");
+#endif
+    library_load_from_cache_only();
+#ifndef HOST_BUILD
+    boot_checkpoint("library_load_from_cache_only done");
+#endif
+    files_screen = build_files_screen();
+    all_songs_screen = build_all_songs_screen();
+    artists_screen = build_artists_screen();
+    albums_screen = build_albums_screen();
+    album_artist_screen = build_album_artist_screen();
+    playlists_screen = build_playlists_screen();
+    group_songs_screen = build_group_songs_screen();
+    artist_albums_screen = build_subsonic_list_screen("Albums", &artist_albums_title_label, &artist_albums_list);
+    text_entry_screen = build_text_entry_screen();
+    music_screen = build_music_screen();
+    stream_media_screen = build_stream_media_screen();
+    subsonic_saved_servers_screen = build_subsonic_saved_servers_screen();
+    subsonic_new_connection_screen = build_subsonic_new_connection_screen();
+    subsonic_entry_screen = build_subsonic_entry_screen();
+    subsonic_downloading_screen = build_subsonic_downloading_screen();
+    subsonic_artists_screen = build_subsonic_list_screen("Artists", &subsonic_artists_title_label, &subsonic_artists_list);
+    subsonic_albums_screen = build_subsonic_list_screen("Albums", &subsonic_albums_title_label, &subsonic_albums_list);
+    subsonic_songs_screen = build_subsonic_list_screen("Songs", &subsonic_songs_title_label, &subsonic_songs_list);
+    wifi_screen = build_wifi_screen();
+    wifi_info_screen = build_wifi_info_screen();
+    wifi_dns_screen = build_wifi_dns_screen();
+    bt_screen = build_bluetooth_screen();
+    bt_dac_screen = build_bt_dac_screen();
+    bt_dac_overlay_screen = build_bt_dac_overlay_screen();
+    bt_codec_screen = build_bt_codec_screen();
+    font_size_screen = build_font_size_screen();
+    usb_mode_screen = build_usb_mode_screen();
+    usb_dac_overlay_screen = build_usb_dac_overlay_screen();
+    build_import_rescan_popup(); /* must exist before import_wifi_back_cb (wired below) can show it */
+    import_wifi_screen = build_import_wifi_screen();
+    airplay_screen = build_airplay_screen();
+    dlna_screen = build_dlna_screen();
+    wireless_screen = build_wireless_screen();
+    books_screen = build_books_screen();
+    books_files_screen = build_books_files_screen();
+    text_reader_screen = build_text_reader_screen();
+    about_screen = build_about_screen();
+    accent_color_screen = build_accent_color_screen();
+    screen_timeout_screen = build_screen_timeout_screen();
+    startup_volume_screen = build_startup_volume_screen();
+    sleep_timer_screen = build_sleep_timer_screen();
+    idle_shutdown_screen = build_idle_shutdown_screen();
+    timezone_region_screen = build_timezone_region_screen();
+    settings_screen = build_settings_screen();
+    eq_screen = build_eq_screen();
+    eq_profiles_screen = build_eq_profiles_screen();
+    build_eq_reset_popup();
+    build_factory_reset_popup();
+    build_firmware_update_popup();
+    add_to_playlist_screen = build_add_to_playlist_screen();
+    build_delete_song_popup();
+    build_more_menu_popup();
+    home_screen = build_home_screen();
+#ifndef HOST_BUILD
+    boot_checkpoint("all screens built");
+#endif
+
+    /* See static_snapshot_screen's comment -- these 6 are pure fixed
+     * content (icon grid / pill list, no toggles or per-item state) and
+     * never change after this point, so their transition bitmap is worth
+     * rendering once now rather than on every single visit. */
+    register_static_snapshot(0, home_screen);
+    register_static_snapshot(1, music_screen);
+    register_static_snapshot(2, stream_media_screen);
+    register_static_snapshot(3, wireless_screen);
+    register_static_snapshot(4, books_screen);
+    register_static_snapshot(5, about_screen);
+
+    build_status_bar();
+    build_volume_popup();
+    build_home_indicator_bar();
+    build_error_toast();
+    build_info_popup();
+    build_bt_action_popup();
+    build_wifi_action_popup();
+    build_usb_dac_leave_popup();
+    build_bt_dac_leave_popup();
+    build_quick_drawer();
+    refresh_clock_label();
+    refresh_battery_topbar();
+    refresh_wifi_icon();
+    refresh_play_pause_topbar();
+#ifndef HOST_BUILD
+    boot_checkpoint("start_refresh_bt_icon about to be called");
+#endif
+    start_refresh_bt_icon();
+#ifndef HOST_BUILD
+    boot_checkpoint("start_refresh_bt_icon done");
+#endif
+    refresh_headphone_icon();
+    /* Read once at startup, not per-refresh -- this is a static device
+     * config file, not something that changes while the app is running
+     * (the stock player itself only writes it from its own Settings
+     * screen, which isn't reachable from here). Must happen before this
+     * first refresh_volume_topbar() call so the initial color is correct. */
+    if (!device_config_get_volume_warn_threshold(&volume_warn_threshold_percent)) {
+        volume_warn_threshold_percent = -1;
+    }
+    refresh_volume_topbar((int32_t) (audio_get_volume() * 100.0f));
+    lv_timer_create(update_timer_cb, 500, NULL);
+    /* Its own fast timer -- see poll_quick_drawer_drag()'s comment for why
+     * update_timer_cb's 500ms period is too slow to track a swipe with. */
+    lv_timer_create(poll_quick_drawer_drag, LV_DEF_REFR_PERIOD, NULL);
+
+    /* home_screen is the permanent root of the nav stack -- nav_pop() never
+     * goes past it. Load it first so there's always something valid on
+     * screen even before any auto-resume logic below runs. */
+    nav_stack[0] = home_screen;
+    nav_depth = 1;
+    lv_screen_load(home_screen);
+#ifndef HOST_BUILD
+    boot_checkpoint("lv_screen_load(home_screen) done");
+#endif
+
+    /* Real-device incident (2026-08-08): auto-resuming into a Subsonic
+     * track (cached locally at SUBSONIC_STREAM_CACHE_DIR/stream.<suffix>,
+     * see gui.c's own comment there -- last_track points at that cache
+     * file, not a live stream URL, so this wasn't expected to touch the
+     * network at all) crashed and rebooted the device on a cold boot with
+     * no Wi-Fi connected yet. Not yet root-caused -- candidates include the
+     * cache file being a leftover partial/corrupt download from the
+     * previous session (killed mid-stream) that the decoder chokes on, or
+     * something else on this path unexpectedly blocking on network state.
+     * Disabled entirely (both auto_resume_enabled and car_mode_enabled,
+     * which forces this same path -- see their own settings-row comments)
+     * until root-caused: a crash-reboot loop on every cold boot is a worse
+     * outcome than just not resuming. Re-enable by flipping this back to 1
+     * once fixed -- and also re-add the "Auto-resume on launch" row and its
+     * auto_resume_switch_event_cb() to build_settings_screen() (removed
+     * entirely, not just left inert, after real-device feedback that a
+     * live-looking toggle for a feature that silently did nothing read as
+     * a regression -- see that function's own comment). */
+#define AUTO_RESUME_ON_LAUNCH_ENABLED 0
+#if AUTO_RESUME_ON_LAUNCH_ENABLED
+    if ((current_settings.auto_resume_enabled || current_settings.car_mode_enabled) && current_settings.last_track[0] != '\0') {
+        char ** resume_playlist;
+        int resume_count, resume_index;
+        if (file_browser_build_playlist_for_path(current_settings.last_track, &resume_playlist, &resume_count, &resume_index)) {
+            free_playlist();
+            playlist = resume_playlist;
+            playlist_count = resume_count;
+            /* play_track_at_from() itself nav_push()es player_screen on top
+             * of the seeded root, so a back-swipe from the resumed player
+             * correctly lands back on the home screen. */
+            play_track_at_from(resume_index, current_settings.last_position);
+        }
+    }
+#endif
+#ifndef HOST_BUILD
+    boot_checkpoint("gui_init returning");
+#endif
+
+    /* Deliberately the very last thing gui_init() does -- see
+     * fallback_font_schedule_deferred_load()'s own doc comment for why this
+     * can't just load the font directly here or anywhere earlier in this
+     * function (the auto-resume path just above is exactly the kind of
+     * pre-first-frame call site that hung boot on the previous attempt at
+     * this). */
+    fallback_font_schedule_deferred_load();
+}

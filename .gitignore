@@ -1,0 +1,47 @@
+# Vendored dependencies -- the Makefile clones/downloads all of these fresh
+# on first build (see the ifeq($(wildcard ...)) blocks near its top), so
+# committing them here would just be an untracked-drift-prone copy of
+# someone else's upstream repo.
+/lvgl
+/dr_libs
+/tinyalsa
+/faad2
+/alac
+/mbedtls
+/cJSON
+/sqlite3
+/dbus
+
+# Stock-firmware UI assets (theme2 PNGs). Proprietary HiBy graphics --
+# never redistributed, see README.md's own note on this. Populate this
+# locally from your own device/firmware dump if you want to build with the
+# real UI; assets/fonts/ (this repo's own, openly-licensed subsets, see its
+# own NOTICE.md) is tracked normally.
+/assets/theme2
+
+# Korean.ttf-derived host-simulator font: excluded, unlike the rest of
+# assets/fonts/, because this particular file's own embedded metadata
+# doesn't state a license (see assets/fonts/NOTICE.md). Populate locally
+# from your own device dump (/usr/resource/fonts/Korean.ttf, subsetted to
+# U+1100-11FF,U+3130-318F,U+AC00-D7A3) if you want Korean text to render in
+# `make host`'s simulator -- on target this is a non-issue, the real device
+# build reads Korean.ttf directly from the stock firmware at runtime.
+/assets/fonts/korean.ttf
+
+# Build outputs
+/build_host/
+/build_target/
+/open_hiby_player_host
+/open_hiby_player_target
+/open_hiby_player_target_*
+/compile_commands.json
+/compile_flags.txt
+
+# Host-only runtime state (target uses /usr/data instead)
+/open_hiby_player_settings.txt*
+/open_hiby_player_peq.txt*
+/open_hiby_player_music.db
+
+# Host-only test audio fixtures (generated locally for manual verification,
+# not needed to build or run the project)
+/music/

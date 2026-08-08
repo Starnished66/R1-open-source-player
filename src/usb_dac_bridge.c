@@ -1,0 +1,238 @@
+#include "usb_dac_bridge.h"
+
+#include "audio.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#ifndef HOST_BUILD
+  #include <poll.h>
+  #include "audio_output.h"
+#endif
+
+#define UAC_SA_DEVICE_PATH "/dev/uac_sa"
+/* Neither of these match uac_device_config.sh's own gadget config
+ * (c_chmask=0x03/c_ssize=2/c_srate=48000) -- confirmed empirically against
+ * a real device instead, since the driver's actual behavior doesn't match
+ * what it advertises (see usb_dac_bridge.h for why the real protocol
+ * isn't known and this is empirical rather than derived):
+ *   - Channels: of the two interleaved 16-bit slots per frame, only the
+ *     second one (index 1) ever carries real audio -- the first is
+ *     full-scale noise on every capture, not silence. Verified by
+ *     comparing zero-crossing rate/amplitude of each slot in a raw capture,
+ *     and that a byte-level shift doesn't fix it (rules out a framing
+ *     offset -- it's a per-slot behavior, not misalignment). Worked around
+ *     by overwriting the noise slot with the real one before playback
+ *     rather than declaring 1 channel, since duplicating into fake stereo
+ *     is simpler than reconfiguring tinyalsa/the hardware path for mono.
+ *   - Rate: wall-clock-measured actual frame arrival rate on a real device
+ *     converged to ~96300 frames/s, not the declared 48000 -- and 96000
+ *     is also what sounded correct to a human listener, independently
+ *     confirming the measurement. */
+#define BRIDGE_CHANNELS 2
+#define BRIDGE_SAMPLE_RATE 96000
+#define BRIDGE_PERIOD_FRAMES 1024
+
+#define OPEN_RETRY_TIMEOUT_MS 5000
+#define POLL_INTERVAL_MS 200
+
+static pthread_mutex_t bridge_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool bridge_running = false;
+static volatile bool stop_requested = false;
+
+#ifndef HOST_BUILD
+static void set_running(bool running) {
+    pthread_mutex_lock(&bridge_mutex);
+    bridge_running = running;
+    pthread_mutex_unlock(&bridge_mutex);
+}
+
+static void * bridge_thread_func(void * arg) {
+    (void) arg;
+
+    /* audio_stop() (called by usb_dac_bridge_start() before spawning this
+     * thread) only signals the audio thread -- audio_output_close() happens
+     * asynchronously on that thread. Wait for it to actually finish before
+     * touching the shared output device ourselves, or audio_output_ensure()
+     * below fails with the same "Resource busy" this project has already
+     * hit once (see subprocess.c's close_inherited_fds() doc comment for
+     * that incident). */
+    for (int waited_ms = 0; waited_ms < 2000; waited_ms += 20) {
+        if (!audio_is_playing() && !audio_is_paused()) break;
+        usleep(20000);
+    }
+
+    int uac_fd = -1;
+    for (int waited_ms = 0; waited_ms < OPEN_RETRY_TIMEOUT_MS; waited_ms += POLL_INTERVAL_MS) {
+        if (stop_requested) {
+            set_running(false);
+            return NULL;
+        }
+        uac_fd = open(UAC_SA_DEVICE_PATH, O_RDWR);
+        if (uac_fd >= 0) break;
+        usleep(POLL_INTERVAL_MS * 1000);
+    }
+    if (uac_fd < 0) {
+        fprintf(stderr, "usb_dac_bridge: %s never appeared, giving up\n", UAC_SA_DEVICE_PATH);
+        set_running(false);
+        return NULL;
+    }
+
+    if (!audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE)) {
+        fprintf(stderr, "usb_dac_bridge: audio_output_ensure failed\n");
+        close(uac_fd);
+        set_running(false);
+        return NULL;
+    }
+
+    size_t frame_bytes = (size_t) BRIDGE_CHANNELS * sizeof(int16_t);
+    size_t buf_bytes = (size_t) BRIDGE_PERIOD_FRAMES * frame_bytes;
+    uint8_t * buf = malloc(buf_bytes);
+
+    uint64_t total_bytes_read = 0;
+    int poll_timeouts_in_a_row = 0;
+    int exit_reason_n = 0; /* read()'s return value that broke the loop, for the exit log below */
+    int exit_reason_errno = 0;
+
+    /* EPERM here (as opposed to e.g. EIO/ENODEV) matches the shape of a
+     * driver-side "host hasn't armed the streaming interface yet" gate
+     * (uac_setup_complete, alongside uac_read/uac_ioctl in /proc/kallsyms,
+     * looks like the USB gadget framework's SET_INTERFACE-completion
+     * callback) rather than a permanent failure -- retried with backoff
+     * instead of treated as fatal on the first hit, up to a bound generous
+     * enough for a PC's audio stack to actually finish selecting the
+     * device after enumeration. */
+    int eperm_retries = 0;
+    #define EPERM_RETRY_LIMIT 75 /* ~15s at POLL_INTERVAL_MS between retries */
+
+    while (!stop_requested) {
+        struct pollfd pfd = { .fd = uac_fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, POLL_INTERVAL_MS);
+        if (pr <= 0) {
+            poll_timeouts_in_a_row++;
+            if (poll_timeouts_in_a_row == 25) /* ~5s of nothing but still open -- worth knowing */
+                fprintf(stderr, "usb_dac_bridge: no data from %s in ~5s (still waiting)\n", UAC_SA_DEVICE_PATH);
+            continue; /* timeout (check stop_requested again) or poll() error */
+        }
+        poll_timeouts_in_a_row = 0;
+
+        ssize_t n = read(uac_fd, buf, buf_bytes);
+        if (n <= 0) {
+            if (errno == EPERM && eperm_retries < EPERM_RETRY_LIMIT) {
+                eperm_retries++;
+                if (eperm_retries == 1)
+                    fprintf(stderr, "usb_dac_bridge: read() EPERM, retrying for up to ~15s "
+                                     "(host may not have armed the streaming interface yet)\n");
+                usleep(POLL_INTERVAL_MS * 1000);
+                continue;
+            }
+            exit_reason_n = (int) n;
+            exit_reason_errno = errno;
+            break; /* device closed/error -- gadget likely torn down underneath us */
+        }
+        if (eperm_retries > 0) {
+            fprintf(stderr, "usb_dac_bridge: read() succeeded after %d EPERM retries\n", eperm_retries);
+            eperm_retries = 0;
+        }
+
+        total_bytes_read += (uint64_t) n;
+
+        /* Same reasoning as audio.c's own playback loop (see its comment
+         * above the equivalent call): the requested Bluetooth target can
+         * change at any moment from the GUI thread's poll
+         * (usb_dac_bridge_set_bt_output()), and this stream has no natural
+         * "track boundary" to piggyback the check on the way audio.c's
+         * playback loop originally did, so it's checked every chunk here
+         * unconditionally -- cheap, since audio_output_ensure() only
+         * actually reopens if something changed. */
+        audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE);
+
+        /* Overwrite the always-noise first channel slot with the real
+         * second one -- see the empirical finding in this file's top
+         * comment. */
+        int16_t * frame_samples = (int16_t *) buf;
+        size_t frame_count = (size_t) n / frame_bytes;
+        for (size_t i = 0; i < frame_count; i++) {
+            frame_samples[i * 2] = frame_samples[i * 2 + 1];
+        }
+
+        audio_output_write(frame_samples, frame_count, BRIDGE_CHANNELS);
+    }
+
+    if (!stop_requested) {
+        fprintf(stderr, "usb_dac_bridge: read() returned %d (errno=%d %s) after %llu bytes total -- exiting\n",
+                exit_reason_n, exit_reason_errno, strerror(exit_reason_errno), (unsigned long long) total_bytes_read);
+    } else {
+        fprintf(stderr, "usb_dac_bridge: stopped, %llu bytes read total\n", (unsigned long long) total_bytes_read);
+    }
+
+    free(buf);
+    audio_output_close();
+    close(uac_fd);
+    set_running(false);
+    return NULL;
+}
+#endif
+
+void usb_dac_bridge_start(void) {
+#ifndef HOST_BUILD
+    pthread_mutex_lock(&bridge_mutex);
+    if (bridge_running) {
+        pthread_mutex_unlock(&bridge_mutex);
+        return;
+    }
+    bridge_running = true;
+    pthread_mutex_unlock(&bridge_mutex);
+    stop_requested = false;
+
+    audio_stop();
+
+    pthread_t thread;
+    pthread_create(&thread, NULL, bridge_thread_func, NULL);
+    pthread_detach(thread);
+#endif
+}
+
+void usb_dac_bridge_stop(void) {
+#ifndef HOST_BUILD
+    pthread_mutex_lock(&bridge_mutex);
+    bool was_running = bridge_running;
+    pthread_mutex_unlock(&bridge_mutex);
+    if (!was_running) return;
+
+    stop_requested = true;
+
+    /* No join() available (the thread is detached, since usb_dac_bridge_start()
+     * doesn't keep its handle around) -- poll for the thread clearing
+     * bridge_running itself instead, same pattern as subprocess.c's bounded
+     * waitpid() polling loop. */
+    for (int waited_ms = 0; waited_ms < 3000; waited_ms += 50) {
+        pthread_mutex_lock(&bridge_mutex);
+        bool still_running = bridge_running;
+        pthread_mutex_unlock(&bridge_mutex);
+        if (!still_running) return;
+        usleep(50000);
+    }
+#endif
+}
+
+void usb_dac_bridge_set_bt_output(bool enabled) {
+#ifndef HOST_BUILD
+    /* Same shared flag audio_set_bt_output() itself sets (see
+     * audio_output_set_bt_requested()) -- both call into the same
+     * audio_output module, since only one of this bridge's thread or
+     * audio.c's own playback thread is ever actually running at a time
+     * (see audio_output.h's own comment on why that makes sharing this
+     * safe without a lock). */
+    audio_output_set_bt_requested(enabled);
+#else
+    (void) enabled;
+#endif
+}

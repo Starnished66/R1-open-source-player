@@ -2,9 +2,11 @@
 #include "audio.h"
 #include <stdint.h>
 #include <unistd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #ifdef HOST_BUILD
@@ -102,13 +104,53 @@ static bool wait_for_fbdev_ready(const char * path, int max_attempts, int delay_
  * exact same reason (shelling out, not a raw syscall, to match this
  * codebase's own established convention) -- if the card's genuinely not
  * inserted, or something already mounted it, this just fails harmlessly and
- * startup proceeds with whatever's actually there. */
+ * startup proceeds with whatever's actually there.
+ *
+ * Real-device bug report: a card that shows up in the OS as detected but
+ * never populates the library. The official HiBy R1 user manual explicitly
+ * lists FAT32, exFAT *and* NTFS as supported card filesystems, but this
+ * function only ever attempted -t vfat -- any exFAT/NTFS card would just
+ * silently fail to mount here forever, exactly matching that report. There
+ * is no mount.exfat/ntfs-3g/exfatprogs/ntfsprogs anywhere in this firmware's
+ * rootfs (confirmed by searching it), but the same is true of vfat itself
+ * (no vfat.ko/fat.ko either -- see module_driver/'s own contents), so FAT
+ * support is compiled directly into this vendor's kernel image rather than
+ * loaded as a module; exFAT/NTFS support, if the manual's claim is accurate,
+ * is almost certainly built in the same way, needing nothing more than
+ * picking the right -t. There's no reliable way to ask busybox's mount to
+ * auto-detect the type here, so this just tries each supported type in turn
+ * and stops at the first one that actually results in a mounted
+ * filesystem. exFAT/NTFS use deliberately minimal options (just rw,relatime)
+ * rather than reusing vfat's own tuned option set above -- fmask/dmask/
+ * codepage/shortname are vfat-specific, and this exact kernel's exFAT/NTFS
+ * driver (whatever it actually is under the hood) has never been inspected
+ * directly, so guessing at option names it might reject risks turning a
+ * mountable card into an unmountable one. */
+static bool sd_mount_point_mounted(void) {
+    struct stat parent_st, mnt_st;
+    if (stat("/data/mnt", &parent_st) != 0) return false;
+    if (stat("/data/mnt/sd_0", &mnt_st) != 0) return false;
+    return parent_st.st_dev != mnt_st.st_dev;
+}
+
 void mount_sd_card_if_needed(void) {
     mkdir("/data/mnt/sd_0", 0755);
-    char * argv[] = { (char *) "mount", (char *) "-t", (char *) "vfat", (char *) "-o",
-                       (char *) "rw,relatime,fmask=0022,dmask=0022,codepage=936,iocharset=utf8,shortname=mixed",
-                       (char *) "/dev/mmcblk0p1", (char *) "/data/mnt/sd_0", NULL };
-    subprocess_run(argv, NULL, 0);
+    if (sd_mount_point_mounted()) return;
+
+    char * vfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "vfat", (char *) "-o",
+                            (char *) "rw,relatime,fmask=0022,dmask=0022,codepage=936,iocharset=utf8,shortname=mixed",
+                            (char *) "/dev/mmcblk0p1", (char *) "/data/mnt/sd_0", NULL };
+    subprocess_run(vfat_argv, NULL, 0);
+    if (sd_mount_point_mounted()) return;
+
+    char * exfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "exfat", (char *) "-o",
+                             (char *) "rw,relatime", (char *) "/dev/mmcblk0p1", (char *) "/data/mnt/sd_0", NULL };
+    subprocess_run(exfat_argv, NULL, 0);
+    if (sd_mount_point_mounted()) return;
+
+    char * ntfs_argv[] = { (char *) "mount", (char *) "-t", (char *) "ntfs", (char *) "-o",
+                            (char *) "rw,relatime", (char *) "/dev/mmcblk0p1", (char *) "/data/mnt/sd_0", NULL };
+    subprocess_run(ntfs_argv, NULL, 0);
 }
 
 /* Diagnostic instrumentation for the still-unresolved cold-boot failure:
@@ -168,6 +210,35 @@ void boot_checkpoint(const char * step) {
 #endif
 
 int main(void) {
+    /* Real-device bug report: a Bluetooth disconnect during playback froze
+     * the device and triggered a reboot, sometimes leaving Bluetooth
+     * unrecoverable short of a long power-button press. Root cause: this
+     * process never installed a SIGPIPE handler anywhere (confirmed by
+     * grepping the whole codebase), so its default disposition -- immediate
+     * process termination, no unwind, no cleanup -- was still in effect.
+     * audio_output.c's Bluetooth output path (audio_output_write())
+     * write()s decoded audio into a pipe feeding an `aplay -D bluealsa`
+     * child; BlueZ tearing down the A2DP transport on a real disconnect
+     * kills that child, and the very next write() into the now-reader-less
+     * pipe raises SIGPIPE. On the real device, hiby_player.sh (the stock
+     * launcher this binary replaces in place -- see README.md's own
+     * real-device testing notes) runs `sleep 1; reboot` the instant
+     * hiby_player exits for any reason, so a SIGPIPE kill here reads
+     * exactly like "device reboot" -- and because the process dies
+     * mid-write rather than exiting cleanly, whatever BT/UART transaction
+     * was in flight at that exact instant can be left wedged badly enough
+     * that even bt_resume can't recover it without a hard power cycle,
+     * matching the "Bluetooth not recoverable" half of the report too.
+     * Ignoring SIGPIPE process-wide is the standard fix for this class of
+     * bug: write()/send() calls into a broken pipe/socket then just return
+     * -1/EPIPE instead of killing the process -- audio_output_write()
+     * already handles exactly that return value correctly (breaks its
+     * retry loop, lets the next audio_output_ensure() reopen), so this
+     * lets that existing, already-correct fallback path actually run
+     * instead of being pre-empted by a fatal signal first. Must run before
+     * anything else below gets a chance to open a subprocess pipe. */
+    signal(SIGPIPE, SIG_IGN);
+
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("Starting open_hiby_player...\n");
 

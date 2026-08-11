@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -232,8 +233,50 @@ static void bt_control_recover_wedged_daemon(void) {
  * immediately. */
 #define TIMEOUT_RECOVERY_THRESHOLD 4
 
+/* Real-device bug report: Bluetooth visibly turns itself off then back on
+ * right after boot, with no user action -- root cause confirmed by reading
+ * this function's own logic against S80_bt_init's documented boot timing
+ * (see ensure_single_dbus_daemon()'s own comment: bt_init/bt_resume-
+ * equivalent bring-up finishes ~3.6s after boot on a real device). This
+ * app's own first Bluetooth status poll (start_refresh_bt_icon(), called
+ * early in gui_init()) can land BEFORE bluetoothd has finished registering
+ * the adapter object, even though hci0 already exists at the kernel level
+ * (bt_control_adapter_present() above is a cheap hciconfig check, sees the
+ * chip immediately) -- `bluetoothctl show` then genuinely, correctly
+ * reports "No default controller available" for a brief, entirely normal
+ * startup window, not because anything is actually wedged. That exact
+ * string was treated below as an unambiguous, immediate wedge signal (no
+ * threshold, unlike the timeout path just above) because mid-session it
+ * reliably is one -- but during this boot window it isn't, and the
+ * resulting bt_control_recover_wedged_daemon() call (kill bluetoothd,
+ * hciconfig reset, respawn, re-power) is itself a real, visible
+ * disable-then-enable cycle, which is exactly what got reported. Made far
+ * more noticeable by Car Mode's rework back to a real poweroff+reboot per
+ * ignition cycle (see gui.c's own Car Mode comment) -- every power-on is
+ * now a full cold boot hitting this exact race, not just an occasional
+ * manual reboot. Fixed by giving "No default controller available"
+ * specifically the same not-immediately-fatal treatment as a timeout
+ * (logged, not acted on) for a grace window after this process's own first
+ * poll -- generous margin over the ~3.6s boot timing above -- after which
+ * it reverts to triggering recovery immediately, same as before, since by
+ * then it really would mean bluetoothd is stuck. */
+#define BT_BOOT_RACE_GRACE_MS 8000
+
+static uint32_t bt_control_monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t) (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
 bool bt_control_is_powered(void) {
     static int consecutive_timeouts = 0;
+    static bool first_poll_seen = false;
+    static uint32_t first_poll_tick = 0;
+
+    if (!first_poll_seen) {
+        first_poll_seen = true;
+        first_poll_tick = bt_control_monotonic_ms();
+    }
 
     if (!bt_control_adapter_present()) {
         DBG_LOG("bt_control: bt_control_is_powered: no adapter present\n");
@@ -257,7 +300,14 @@ bool bt_control_is_powered(void) {
     if (strstr(out, "Powered: yes") != NULL) return true;
 
     if (strstr(out, "No default controller available") != NULL) {
-        bt_control_recover_wedged_daemon();
+        uint32_t since_first_poll = bt_control_monotonic_ms() - first_poll_tick;
+        if (since_first_poll < BT_BOOT_RACE_GRACE_MS) {
+            DBG_LOG("bt_control: bt_control_is_powered: 'No default controller' %ums after first poll -- "
+                    "within boot grace window, treating as still starting up, not a wedge\n",
+                    (unsigned) since_first_poll);
+        } else {
+            bt_control_recover_wedged_daemon();
+        }
     } else {
         DBG_LOG("bt_control: bt_control_is_powered: not powered (output: %.200s)\n", out);
     }
@@ -699,7 +749,22 @@ static void bt_volume_curve_start(void) {
 static bool find_source_pcm_path(char * out, size_t out_size) {
     char list_out[4096];
     char * argv[] = { (char *) "bluealsa-cli", (char *) "list-pcms", NULL };
-    if (!subprocess_run(argv, list_out, sizeof(list_out))) return false;
+    if (!subprocess_run(argv, list_out, sizeof(list_out))) {
+        /* Real-device bug report: BT "hangs" (needs disable/enable +
+         * reconnect to recover) sometime after reconnecting and starting a
+         * new track -- not yet reproduced/confirmed, but bt_control_is_
+         * powered()'s own wedge detection only watches `bluetoothctl show`;
+         * a bluealsa-cli call timing out/failing here was previously
+         * completely silent, so if bluealsa itself (not bluetoothd) is
+         * what's actually wedging, there was nothing in the log to show it.
+         * Logged, not auto-recovered -- this alone doesn't yet know it's a
+         * genuine wedge vs. a normal transient "nothing connected right
+         * now" (see this function's own callers), so it shouldn't trigger
+         * bt_control_recover_wedged_daemon() itself without more evidence
+         * that this is the actual failure mode. */
+        DBG_LOG("bt_control: find_source_pcm_path: bluealsa-cli list-pcms failed/timed out\n");
+        return false;
+    }
 
     char * line_save = NULL;
     char * line = strtok_r(list_out, "\n", &line_save);
@@ -851,6 +916,90 @@ void bt_control_source_volume_sync_stop(void) {
     bt_source_vol_sync_monitor_pid = -1;
 }
 
+/* See bt_control_output_disconnect_watch_start()'s own doc comment
+ * (bluetooth_control.h) for what this is and why. Plain `monitor`, no `-p`
+ * needed -- confirmed via `strings` on the real bluealsa-cli binary that
+ * PCMAdded/PCMRemoved come from its base InterfacesAdded/InterfacesRemoved
+ * subscription (path_namespace='/org/bluealsa'), which is always active;
+ * `-p` only adds the separate PropertyChanged stream (Volume/Codec/Running/
+ * SoftVolume) the two volume-sync threads above already use -- this doesn't
+ * need any of that. "/a2dpsrc/sink" matches find_source_pcm_path()'s own
+ * naming exactly: the PCM this app itself writes local playback into
+ * (audio_output.c's `aplay -D bluealsa`), not any other PCM bluealsa might
+ * have (e.g. one from DAC mode). */
+static pthread_t bt_output_disconnect_thread;
+static bool bt_output_disconnect_active = false;
+static pid_t bt_output_disconnect_monitor_pid = -1;
+static volatile bool bt_output_disconnect_flag = false;
+
+static void * bt_output_disconnect_thread_func(void * arg) {
+    (void) arg;
+
+    char * argv[] = { (char *) "bluealsa-cli", (char *) "monitor", NULL };
+    pid_t pid;
+    int read_fd;
+    if (!subprocess_popen(argv, &pid, &read_fd)) {
+        DBG_LOG("bt_control: output_disconnect_watch: failed to spawn bluealsa-cli monitor\n");
+        return NULL;
+    }
+    bt_output_disconnect_monitor_pid = pid;
+    DBG_LOG("bt_control: output_disconnect_watch: monitor started (pid %d)\n", (int) pid);
+
+    FILE * f = fdopen(read_fd, "r");
+    if (!f) {
+        subprocess_terminate(pid);
+        close(read_fd);
+        return NULL;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char path[256];
+        if (sscanf(line, "PCMRemoved %255s", path) == 1) {
+            if (strstr(path, "/a2dpsrc/sink") != NULL) {
+                DBG_LOG("bt_control: output_disconnect_watch: PCMRemoved %s -- flagging disconnect\n", path);
+                bt_output_disconnect_flag = true;
+            }
+        } else if (strncmp(line, "PCMAdded ", 9) == 0) {
+            /* Diagnostic only -- real-device bug report: BT "hangs" some
+             * time after reconnecting and starting a new track. If a
+             * reconnect's own AVDTP renegotiation briefly tears down and
+             * recreates this PCM (PCMRemoved immediately followed by
+             * PCMAdded, not a genuine physical disconnect), that would
+             * already be visible here as a spurious flag right after
+             * reconnecting -- logged so a future capture can show whether
+             * that's what's happening, without changing behavior yet. */
+            DBG_LOG("bt_control: output_disconnect_watch: %s", line);
+        }
+    }
+
+    DBG_LOG("bt_control: output_disconnect_watch: monitor exited (pid %d)\n", (int) pid);
+    fclose(f); /* also closes read_fd -- reached once bt_control_output_disconnect_watch_stop() kills the monitor subprocess and fgets() sees EOF, same as bt_volume_curve_stop()'s identical shutdown pattern above */
+    return NULL;
+}
+
+void bt_control_output_disconnect_watch_start(void) {
+    if (bt_output_disconnect_active) return;
+    bt_output_disconnect_active = true;
+    bt_output_disconnect_flag = false;
+    pthread_create(&bt_output_disconnect_thread, NULL, bt_output_disconnect_thread_func, NULL);
+}
+
+void bt_control_output_disconnect_watch_stop(void) {
+    if (!bt_output_disconnect_active) return;
+    bt_output_disconnect_active = false;
+    DBG_LOG("bt_control: output_disconnect_watch: stopping (pid %d)\n", (int) bt_output_disconnect_monitor_pid);
+    if (bt_output_disconnect_monitor_pid > 0) subprocess_terminate(bt_output_disconnect_monitor_pid);
+    pthread_join(bt_output_disconnect_thread, NULL);
+    bt_output_disconnect_monitor_pid = -1;
+}
+
+bool bt_control_output_disconnect_consume(void) {
+    if (!bt_output_disconnect_flag) return false;
+    bt_output_disconnect_flag = false;
+    return true;
+}
+
 /* Recorded so bt_control_reapply_last_output_settings() (the wedge
  * recovery in bt_control_is_powered(), above) can restore this after a
  * bluetoothd restart -- a fresh bluetoothd/bt_resume-equivalent bring-up
@@ -859,6 +1008,15 @@ void bt_control_source_volume_sync_stop(void) {
 static bool last_applied_dac_mode_enabled = false;
 static bool last_applied_volume_sync_enabled = false;
 static bool output_settings_ever_applied = false;
+
+/* Serializes bt_control_apply_output_settings() against itself across the
+ * two independent threads that can call it (see that function's own
+ * comment for the real-device race this fixes) -- a plain, non-recursive
+ * mutex is safe here specifically because bt_control_recover_wedged_
+ * daemon() never holds it while calling into bt_control_apply_output_
+ * settings() (it only reaches that indirectly, via bt_control_reapply_
+ * last_output_settings(), and never locks this mutex itself). */
+static pthread_mutex_t bt_daemon_respawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define BLUEALSA_STARTUP_LOG_PATH "/usr/data/bluealsa_startup.log"
 
@@ -891,6 +1049,25 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
     last_applied_dac_mode_enabled = dac_mode_enabled;
     last_applied_volume_sync_enabled = volume_sync_enabled;
     output_settings_ever_applied = true;
+
+    /* Real-device concurrency finding: this function and bt_control_recover_
+     * wedged_daemon() (via bt_control_reapply_last_output_settings() at the
+     * end of its own recovery sequence) each independently kill-then-respawn
+     * bluealsa/bt-agent, with nothing previously stopping both from doing so
+     * at once -- e.g. a wedge detected on the ~5s connection poll at the
+     * same moment the user (or a BT disconnect's own auto-stop path) touches
+     * a DAC-mode/output-setting toggle. That's the exact "9 accumulated
+     * bt-agent processes" failure mode kill_all_matching() below was
+     * originally added to fix (see its own comment), just reachable through
+     * two separate call sites racing instead of one call site respawning
+     * without cleanup. bt_daemon_respawn_mutex below serializes them.
+     * Both call sites already run on their own background thread (gui.c's
+     * start_bt_apply_output_settings() thread wrapper for this function;
+     * refresh_bt_icon_thread_func() for the wedge-recovery path), never the
+     * UI thread, so blocking here on the other one finishing can't freeze
+     * the UI -- it just makes one wait briefly instead of interleaving with
+     * the other's kill/respawn sequence. */
+    pthread_mutex_lock(&bt_daemon_respawn_mutex);
 
     /* Sink and source are mutually exclusive here, matching the real
      * firmware's own /usr/bin/bluealsa_profile script exactly (confirmed by
@@ -959,7 +1136,10 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
      * it was `-c` "SBC" `-c` "AAC" appended to argv right after
      * --a2dp-volume, only when dac_mode_enabled. */
     argv[i] = NULL;
-    if (!spawn_bluealsa_and_verify(argv)) return false;
+    if (!spawn_bluealsa_and_verify(argv)) {
+        pthread_mutex_unlock(&bt_daemon_respawn_mutex);
+        return false;
+    }
 
     if (dac_mode_enabled) {
         char * agent_argv[] = { (char *) "bt-agent", (char *) "-c", (char *) "NoInputNoOutput", NULL };
@@ -1041,6 +1221,7 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
         char * disc_argv[] = { (char *) "bluetoothctl", (char *) "discoverable", (char *) "off", NULL };
         subprocess_run(disc_argv, NULL, 0);
     }
+    pthread_mutex_unlock(&bt_daemon_respawn_mutex);
     return true;
 }
 

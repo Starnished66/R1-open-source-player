@@ -16,6 +16,13 @@ typedef void (*file_browser_select_cb_t)(char ** playlist, int count, int select
  * subdirectories and back up, but never above `root_dir`. */
 void file_browser_init(lv_obj_t * parent, const char * root_dir, file_browser_select_cb_t on_select);
 
+/* Resets the browser back to its root directory and re-scans it from disk,
+ * discarding whatever subdirectory the user was previously browsing. For
+ * refreshing after the underlying storage changes out from under the UI
+ * (SD card removed/reinserted) rather than in response to user navigation.
+ * No-op if file_browser_init() hasn't run yet. */
+void file_browser_reset_to_root(void);
+
 /* One-shot lookup that doesn't touch (or require) any browser UI state:
  * scans path's containing directory and builds the same kind of playlist
  * tapping it in the browser would have, for resuming a track on launch
@@ -30,8 +37,16 @@ bool file_browser_build_playlist_for_path(const char * path, char *** out_playli
  * that aren't scoped to one directory the way the interactive browser
  * above is. Caller owns *out_paths (free each entry, then the array).
  * Returns false if root can't be read or has no playable files anywhere
- * under it. */
-bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count);
+ * under it.
+ *
+ * progress, if non-NULL, is incremented (not overwritten -- start it at 0)
+ * every time a playable file is found, so a caller running this on a
+ * background thread can tell genuine forward progress on a large/deep
+ * library apart from a stuck readdir()/lstat() (real filesystem
+ * corruption) without needing its own copy of the running count -- see
+ * gui.c's scan_all_songs_with_timeout() for the actual stall-detection
+ * logic this exists to support. */
+bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, volatile int * progress);
 
 /* Parses a M3U/M3U8 playlist file: one entry path per non-blank,
  * non-comment line, resolved relative to the playlist's own directory

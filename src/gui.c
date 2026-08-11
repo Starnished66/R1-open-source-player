@@ -34,6 +34,7 @@
 #include "usb_dac_bridge.h"
 #include "firmware_update.h"
 #include "playlist_files.h"
+#include "subprocess.h"
 #include "timezone_data.h"
 #include "timezone_apply.h"
 #include "src/core/lv_obj.h"
@@ -225,6 +226,13 @@ static lv_obj_t * format_badge_label;
 static lv_obj_t * song_count_label;
 static lv_obj_t * favorite_icon;
 static lv_obj_t * cover_img;
+/* The 480x320 panel behind the transport controls (title/artist/progress/
+ * time/controls_row) -- built in build_player_screen(), but also targeted
+ * by set_cover_art()/generate_reflection() below to swap its background
+ * between the plain static buttom.png (no embedded art to reflect) and a
+ * freshly generated per-track reflection, hence file-scope rather than a
+ * local inside build_player_screen(). */
+static lv_obj_t * player_overlay_panel;
 /* Backing pixels for the currently-displayed embedded cover art, if any --
  * a plain RGB565 bitmap produced by cover_decode_to_rgb565() (see
  * set_cover_art below), not the original compressed JPEG/PNG bytes. Freed
@@ -233,6 +241,11 @@ static lv_obj_t * cover_img;
  * file path. */
 static uint8_t * current_cover_bytes;
 static lv_image_dsc_t current_cover_dsc;
+/* Same idea as current_cover_bytes/current_cover_dsc above, for the
+ * generated reflection (see generate_reflection()) shown as
+ * player_overlay_panel's background. */
+static uint8_t * current_reflection_bytes;
+static lv_image_dsc_t current_reflection_dsc;
 static bool favorite_is_set = false;
 static lv_obj_t * volume_slider;
 /* Clock, top bar center: real topbar/N.png digit + topbar/colon.png
@@ -1408,6 +1421,16 @@ static void poll_refresh_bt_icon(void) {
         bt_control_source_volume_sync_start();
     } else {
         bt_control_source_volume_sync_stop();
+    }
+
+    /* Same gating again -- see bt_control_output_disconnect_watch_start()'s
+     * own comment (bluetooth_control.h) for what this buys over the plain
+     * ~5s poll below (refresh_bt_icon_result_a2dp_connected itself): a real
+     * disconnect surfaces in well under a second instead of up to ~17s. */
+    if (use_bt_output) {
+        bt_control_output_disconnect_watch_start();
+    } else {
+        bt_control_output_disconnect_watch_stop();
     }
 
     /* Same gating again -- real-device bug report: "can't use bluetooth
@@ -2875,6 +2898,144 @@ static void refresh_format_badge(void) {
 #define COVER_ART_WIDTH 480
 #define COVER_ART_HEIGHT 480
 
+/* Feature request: reuse the stock firmware's own "frosted mirror" look --
+ * a heavily blurred, darkened, vertically-mirrored copy of the album art
+ * filling the panel behind the transport controls (player_overlay_panel,
+ * built in build_player_screen()), rather than that panel's plain flat
+ * buttom.png background. Confirmed via investigation that the stock
+ * firmware itself doesn't ship this as a static asset (every buttom.png
+ * across both themes is a flat opaque solid color, no gradient or baked-in
+ * art) and no now-playing layout JSON was available to inspect directly --
+ * so this is generated fresh here, from the same per-track RGB565 buffer
+ * set_cover_art() already decodes, rather than reverse-engineered from an
+ * asset that doesn't exist in this codebase's copy of the firmware. */
+#define REFLECTION_WIDTH 480
+#define REFLECTION_HEIGHT 320
+#define REFLECTION_BLUR_RADIUS 16
+/* Kept as an integer ratio (channel * NUM / DEN) rather than a float --
+ * matches this codebase's general preference for integer arithmetic on the
+ * embedded target, and there's no accuracy need here that would justify a
+ * float. 1/4 reads as "mostly faded into black" without the panel going
+ * fully flat. */
+#define REFLECTION_DARKEN_NUM 1
+#define REFLECTION_DARKEN_DEN 4
+
+/* 1D box blur via a sliding running sum -- O(length) regardless of radius,
+ * rather than O(length * radius) from re-summing the whole window at every
+ * pixel. `stride` is measured in elements, not bytes, so the same function
+ * serves both passes of the separable 2D blur generate_reflection() below
+ * does: 1 for a horizontal pass along a contiguous row, `width` for a
+ * vertical pass down a column. Edges are clamped (repeats the edge pixel)
+ * rather than wrapping or zero-padding, so the blur doesn't darken/lighten
+ * near the image boundary. */
+static void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stride, int radius) {
+    int window = radius * 2 + 1;
+    int sum = 0;
+    for (int i = -radius; i <= radius; i++) {
+        int idx = i < 0 ? 0 : (i >= length ? length - 1 : i);
+        sum += src[idx * stride];
+    }
+    for (int i = 0; i < length; i++) {
+        dst[i * stride] = (uint8_t) (sum / window);
+        int add_idx = i + radius + 1;
+        if (add_idx >= length) add_idx = length - 1;
+        int rem_idx = i - radius;
+        if (rem_idx < 0) rem_idx = 0;
+        sum += src[add_idx * stride] - src[rem_idx * stride];
+    }
+}
+
+/* Builds the reflection from current_cover_bytes (COVER_ART_WIDTH x
+ * COVER_ART_HEIGHT RGB565, set just before this is called in
+ * set_cover_art() below) and sets it as player_overlay_panel's background,
+ * replacing whatever it currently shows. Only ever called with real
+ * decoded art already in current_cover_bytes -- the no-art path in
+ * set_cover_art() resets the panel back to the plain buttom.png instead,
+ * since there's no in-memory raw bitmap to reflect for the static
+ * placeholder cover. */
+static void generate_reflection(void) {
+    int w = REFLECTION_WIDTH, h = REFLECTION_HEIGHT;
+    uint8_t * r = malloc((size_t) w * h);
+    uint8_t * g = malloc((size_t) w * h);
+    uint8_t * b = malloc((size_t) w * h);
+    uint8_t * tmp = malloc((size_t) w * h);
+    if (!r || !g || !b || !tmp) {
+        free(r); free(g); free(b); free(tmp);
+        return;
+    }
+
+    /* Unpack RGB565 -> separate 8-bit-per-channel planes (blurring packed
+     * 5/6/5 values directly isn't meaningful -- each channel needs its own
+     * running sum), cropping to the source's bottom `h` rows and flipping
+     * them vertically at the same time: source row (COVER_ART_HEIGHT-1-y)
+     * becomes reflection row y, so the real album art's very last row
+     * (right at the seam with this panel) becomes the reflection's first
+     * row, mirroring exactly at the boundary between the two. */
+    for (int y = 0; y < h; y++) {
+        int src_y = COVER_ART_HEIGHT - 1 - y;
+        const uint16_t * src_row = (const uint16_t *) (current_cover_bytes + (size_t) src_y * COVER_ART_WIDTH * 2);
+        for (int x = 0; x < w; x++) {
+            uint16_t px = src_row[x];
+            r[y * w + x] = (uint8_t) ((px >> 11) & 0x1F);
+            g[y * w + x] = (uint8_t) ((px >> 5) & 0x3F);
+            b[y * w + x] = (uint8_t) (px & 0x1F);
+        }
+    }
+
+    /* Separable box blur: one horizontal pass (per row) then one vertical
+     * pass (per column), on each channel independently -- a full 2D blur
+     * at a fraction of the cost of a real 2D kernel. Heavy (radius 16)
+     * deliberately, per the "frosted glass" look this is going for rather
+     * than a sharp mirror image. */
+    for (int y = 0; y < h; y++) {
+        box_blur_1d(r + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+        memcpy(r + y * w, tmp + y * w, (size_t) w);
+        box_blur_1d(g + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+        memcpy(g + y * w, tmp + y * w, (size_t) w);
+        box_blur_1d(b + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+        memcpy(b + y * w, tmp + y * w, (size_t) w);
+    }
+    for (int x = 0; x < w; x++) box_blur_1d(r + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+    memcpy(r, tmp, (size_t) w * h);
+    for (int x = 0; x < w; x++) box_blur_1d(g + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+    memcpy(g, tmp, (size_t) w * h);
+    for (int x = 0; x < w; x++) box_blur_1d(b + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+    memcpy(b, tmp, (size_t) w * h);
+
+    free(current_reflection_bytes);
+    current_reflection_bytes = malloc((size_t) w * h * 2);
+    if (!current_reflection_bytes) {
+        free(r); free(g); free(b); free(tmp);
+        return;
+    }
+
+    /* Darken (mostly faded into player_overlay_panel's black background)
+     * and repack into RGB565, same channel layout current_cover_dsc uses. */
+    uint16_t * out = (uint16_t *) current_reflection_bytes;
+    for (int i = 0; i < w * h; i++) {
+        int rv = (r[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
+        int gv = (g[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
+        int bv = (b[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
+        out[i] = (uint16_t) ((rv << 11) | (gv << 5) | bv);
+    }
+    free(r); free(g); free(b); free(tmp);
+
+    /* Same LV_IMAGE_HEADER_MAGIC requirement as current_cover_dsc below --
+     * see that struct's own comment in set_cover_art() for the real-device
+     * corruption bug this guards against (lv_bin_decoder.c's old-format
+     * quirks-mode shim firing on a zeroed magic field). */
+    memset(&current_reflection_dsc, 0, sizeof(current_reflection_dsc));
+    current_reflection_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    current_reflection_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    current_reflection_dsc.header.w = w;
+    current_reflection_dsc.header.h = h;
+    current_reflection_dsc.header.stride = w * 2;
+    current_reflection_dsc.data = current_reflection_bytes;
+    current_reflection_dsc.data_size = (uint32_t) w * h * 2;
+
+    lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
+}
+
 /* Takes ownership of `owned_data` (must be a malloc()'d buffer from
  * metadata_read(), or NULL) and displays it as the cover image, freeing
  * whatever the previous track's picture was. Falls back to the firmware's
@@ -2901,6 +3062,13 @@ static void set_cover_art(uint8_t * owned_data, uint32_t size) {
 
     if (!decoded) {
         lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
+        /* No in-memory raw bitmap to reflect for the static placeholder
+         * cover -- reset the panel back to its plain background rather
+         * than leaving a stale reflection from whatever track played
+         * before this one. */
+        free(current_reflection_bytes);
+        current_reflection_bytes = NULL;
+        lv_obj_set_style_bg_image_src(player_overlay_panel, asset_path("playing_plane/buttom.png"), 0);
         return;
     }
 
@@ -2941,6 +3109,7 @@ static void set_cover_art(uint8_t * owned_data, uint32_t size) {
     current_cover_dsc.data_size = (uint32_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2;
 
     lv_image_set_src(cover_img, &current_cover_dsc);
+    generate_reflection();
     /* TEMPORARY DIAGNOSTIC -- forcing a full-screen invalidate (not just
      * cover_img's own, which lv_image_set_src() already does internally)
      * to test whether this device's custom direct-render/page-flip fbdev
@@ -3503,8 +3672,14 @@ static void volume_slider_event_cb(lv_event_t * e) {
  * belongs alongside every other per-tick "did a background thing finish"
  * check in update_timer_cb (hw_buttons, audio_consume_track_advanced, ...). */
 static void poll_subsonic_download(void);
+static void poll_subsonic_library_download(void);
 static void poll_dlna_control(void);
 static void poll_subsonic_connect(void);
+/* Defined alongside library_scan_once()'s own background-thread wrapper,
+ * much further down -- forward-declared here since subsonic_library_
+ * download_thread_func() (defined well before that point) needs to trigger
+ * a rescan once its own batch download finishes. */
+static void start_library_rescan(void);
 static void poll_wifi_scan(void);
 static void poll_wifi_connect(void);
 static void poll_wifi_connect_saved(void);
@@ -3516,6 +3691,8 @@ static void poll_bt_forget(void);
 static void poll_library_rescan(void);
 static void poll_usb_mode_switch(void);
 static void poll_sd_card_hotplug(void);
+static void poll_sd_format(void);
+static void poll_import_web_stop(void);
 
 /* Full radio suspend after a long stretch with the screen off and nothing
  * going on -- deliberately separate from (and much longer than) the
@@ -3564,6 +3741,25 @@ static bool idle_shutdown_attempted = false;
 #define RESUME_POWER_DRAIN_WINDOW_MS 1000
 static uint32_t resumed_from_suspend_tick = 0;
 static bool resumed_from_suspend_pending = false;
+
+/* Everything a caller of power_suspend_now() needs to do immediately after
+ * it returns, factored out so Car Mode (below) can share it with the
+ * idle-shutdown "suspend instead of power off" path this was originally
+ * written for -- see that call site's own comment for the full history of
+ * each individual fixup (backlight/indev resync, the inactivity-timer
+ * flash-on-then-off bug, the two-presses-to-wake bug). Doesn't call
+ * power_suspend_now() itself: the two callers gate entry into suspend
+ * differently (a screen-off idle timer vs. a charging-edge transition), so
+ * each still makes that call directly, right before calling this. */
+static void resume_from_suspend_fixups(void) {
+    backlight_set_screen_on(true);
+    lv_indev_enable(NULL, true);
+    lv_obj_invalidate(lv_screen_active());
+    lv_display_trigger_activity(NULL);
+    resumed_from_suspend_tick = lv_tick_get();
+    resumed_from_suspend_pending = true;
+    DBG_LOG("resume: grace window armed at tick=%u\n", resumed_from_suspend_tick);
+}
 
 static void update_timer_cb(lv_timer_t * timer) {
     (void) timer;
@@ -3681,7 +3877,10 @@ static void update_timer_cb(lv_timer_t * timer) {
      * would just recount the same stale reading many times over) rather
      * than the raw signal, and only the Bluetooth half: headphone_is_
      * connected() is a direct, instant sysfs read with no such ambiguity,
-     * so a wired jack pull still stops playback immediately, unchanged. */
+     * so a wired jack pull still pauses playback immediately, unchanged --
+     * this debounce only ever gated the Bluetooth reading going into the
+     * same shared output_connected/audio_toggle_pause() check below, which
+     * a wired pull reaches exactly the same way BT does. */
 #define BT_OUTPUT_DISCONNECT_DEBOUNCE_MS 12000
     {
         static uint32_t bt_disconnected_since_tick = 0; /* 0 = currently connected (or never sampled) */
@@ -3690,56 +3889,74 @@ static void update_timer_cb(lv_timer_t * timer) {
         } else if (bt_disconnected_since_tick == 0) {
             bt_disconnected_since_tick = lv_tick_get();
         }
-        bool bt_connected_debounced = refresh_bt_icon_result_a2dp_connected ||
-            lv_tick_elaps(bt_disconnected_since_tick) < BT_OUTPUT_DISCONNECT_DEBOUNCE_MS;
+        /* Fast path: bt_control_output_disconnect_watch_start() (started
+         * alongside audio_set_bt_output() -- see poll_refresh_bt_icon())
+         * catches a real disconnect via bluealsa's own D-Bus signal in well
+         * under a second, instead of waiting on this debounce's full 12s (on
+         * top of refresh_bt_icon_result_a2dp_connected's own ~5s poll
+         * cadence) -- see bluetooth_control.h's own comment on why the
+         * debounce itself still has to stay, as the fallback for if this
+         * monitor subprocess dies or bluealsa doesn't emit the signal.
+         * Edge-triggered (consumed once), so this only forces the debounced
+         * read false for the one tick right after a real removal -- harmless
+         * if refresh_bt_icon_result_a2dp_connected is still stale-true a tick
+         * later (nothing auto-resumes playback off output_connected going
+         * back to true, so there's no user-visible flicker, just the stop
+         * below firing sooner than the plain poll+debounce alone would have). */
+        bool bt_connected_debounced = !bt_control_output_disconnect_consume() &&
+            (refresh_bt_icon_result_a2dp_connected ||
+             lv_tick_elaps(bt_disconnected_since_tick) < BT_OUTPUT_DISCONNECT_DEBOUNCE_MS);
 
         static bool last_output_connected = true; /* starts true so nothing fires before any real state has been sampled */
         bool output_connected = headphone_is_connected() || bt_connected_debounced;
-        if (last_output_connected && !output_connected && (audio_is_playing() || audio_is_paused())) {
-            audio_stop();
+        /* Real-device bug report: this used to call audio_stop() -- not
+         * audio_toggle_pause() -- on a disconnect. audio_stop() (audio.c)
+         * doesn't just silence output: its playback thread fully unwinds
+         * the current track (decoder_close(), free()s the path, have_current
+         * = false), the same as if the user had never opened it. That left
+         * no way to resume once reconnected -- confirmed by a live test
+         * report ("stops the music, instead of pause, so it can't be
+         * resumed later"). audio_toggle_pause() keeps the decoder/position
+         * intact and is what toggle_play_pause() itself already uses for an
+         * ordinary pause tap, so resuming afterward (headphones reconnected,
+         * tap play) picks up exactly where it left off. Only fires while
+         * actually playing -- audio_is_paused() removed from the trigger
+         * condition entirely, since toggling pause on an ALREADY-paused
+         * track would incorrectly resume it into a dead/disconnected
+         * output, the opposite of what this is for. */
+        bool was_playing = audio_is_playing();
+        if (last_output_connected && !output_connected && was_playing) {
+            DBG_LOG("gui: output disconnected while playing -- pausing playback\n");
+            audio_toggle_pause();
             set_play_button_state(false);
-            show_error_toast("Playback stopped: headphones disconnected");
+            show_error_toast("Paused: headphones disconnected");
         }
         last_output_connected = output_connected;
     }
 #endif
 
-    /* Car Mode (Settings toggle, off by default). Real-device bug report
-     * corrected the original design here: this is NOT about resuming when
-     * headphones connect -- it matches the stock firmware's own actual
-     * behavior, confirmed by the user against a real car install --
-     * unplugging power (car ignition off) sleeps/powers the device off,
-     * and plugging power back in (ignition on) powers it back on and
-     * resumes whatever was playing.
+    /* Car Mode (Settings toggle, off by default). Matches the stock
+     * firmware's own real behavior (confirmed by real-device report):
+     * unplugging power (car ignition off) checkpoints position and powers
+     * the device off; plugging power back in (ignition on) powers it back
+     * on and auto-resumes the same track/position (see gui_init()'s
+     * resume-on-launch block, below).
      *
-     * Implemented as a full poweroff (idle_shutdown_now()), not
-     * power_suspend_now() -- matching idle_shutdown.h's own documented
-     * reasoning for preferring poweroff generally on this hardware: real
-     * suspend-to-RAM's display resume path is confirmed broken on this
-     * board (jzfb spins forever on "pan display wait timeout"), while a
-     * full poweroff is the mechanism already proven reliable. Resuming
-     * after power returns falls out of the existing auto-resume-on-launch
-     * startup path for free (see gui_init()'s own auto-resume block) --
-     * NOTE: that startup path is currently disabled entirely
-     * (AUTO_RESUME_ON_LAUNCH_ENABLED, gui_init()) after a real-device
-     * crash-reboot report, so until that's re-enabled, Car Mode still
-     * checkpoints and powers off correctly here but will NOT resume
-     * playback on the next boot -- it'll just boot to Home like a normal
-     * cold start. This just also force-checkpoints the current position
-     * immediately
-     * before shutting down (auto-resume normally only checkpoints on pause/
-     * track-change, not continuously, so a mid-track unplug would otherwise
-     * resume from a stale position) and makes gui_init() treat
-     * car_mode_enabled as an auto-resume trigger in its own right,
-     * independent of the user's separate auto_resume_enabled preference --
-     * whether "always resume on launch" is on or off shouldn't change
-     * whether it's on for this ignition-cycle-driven flow.
-     *
-     * Not power_suspend_now()/idle_shutdown_now() waking the device back up
-     * by itself on power insert -- that's a hardware/PMIC wake source
-     * outside this app's control, the same one the stock firmware already
-     * relies on for this exact feature on this exact board, per the user's
-     * own real-device report. Nothing to implement here for that half.
+     * Reworked back to a full poweroff (idle_shutdown_now()) rather than
+     * power_suspend_now() -- an earlier version of this used suspend-to-RAM
+     * for a near-instant resume with no boot splash, but real-device
+     * testing found two problems with that neither had a fix: suspend
+     * never actually woke back up when power returned (this board's
+     * PMIC/kernel wakeup-source support for VBUS insert, as opposed to a
+     * power-button press, couldn't be confirmed -- see this function's own
+     * prior git history for the sysfs probe that would be needed), and
+     * suspending with an actively-connected Bluetooth output could reboot
+     * the device outright. A full poweroff sidesteps both: /sbin/poweroff
+     * and a cold power-on are both already proven-reliable on this
+     * hardware (idle_shutdown_now() itself already uses poweroff as its
+     * own default, for the same jzfb suspend/resume reason -- see
+     * idle_shutdown.h), at the cost of a real boot splash + library check
+     * on every resume instead of an instant one.
      *
      * Edge-triggered on battery_is_charging() so a normal desk charge with
      * Car Mode left on doesn't repeatedly retrigger, and gated on something
@@ -3756,7 +3973,7 @@ static void update_timer_cb(lv_timer_t * timer) {
             (audio_is_playing() || audio_is_paused())) {
             current_settings.last_position = audio_get_position_seconds();
             settings_save(&current_settings);
-            idle_shutdown_now();
+            idle_shutdown_now(); /* full poweroff -- does not return, see idle_shutdown.h */
         }
         last_charging = charging;
     }
@@ -3928,64 +4145,26 @@ static void update_timer_cb(lv_timer_t * timer) {
                  * mid-tick here (rather than waiting for a real transition
                  * to be observed across two separate ticks) would never be
                  * seen as an "edge" and that logic would never fire again.
-                 * Fixed by explicitly doing here, right now, everything
-                 * that logic would otherwise have done on a real wake:
-                 * resync backlight.c's own state (also restores correct
-                 * brightness, in case the kernel's auto-restore didn't
-                 * match), re-enable touch input (LVGL's indev was still
-                 * disabled from before suspend -- with it off, a touch
-                 * couldn't even be delivered to trigger a redraw), and force
-                 * a full-screen invalidate so a fresh frame actually gets
-                 * pushed into whatever this display controller's own resume
-                 * left in the framebuffer (same real-device-confirmed fix
-                 * as the album art corruption bug above, on this same
-                 * device's custom double-buffered fbdev path). */
-                backlight_set_screen_on(true);
-                lv_indev_enable(NULL, true);
-                lv_obj_invalidate(lv_screen_active());
-
-                /* Real-device bug report: waking from suspend needed two
-                 * power-button presses -- the first visibly flashed the
-                 * backlight on then straight back off, only the second
-                 * actually brought the UI up and left it up. Instrumented
-                 * with real-device timestamps (DBG_LOG on both the
-                 * hw_buttons.c reader thread and this resume path) to
-                 * confirm the actual root cause, since an earlier fix
-                 * attempt here (a grace window swallowing the echoed
-                 * KEY_POWER event hw_buttons.c independently captures for
-                 * the same physical wake press) turned out to already be
-                 * working correctly and NOT the reason a second press was
-                 * still needed -- the logged echo was swallowed exactly as
-                 * intended, first time, every time.
                  *
-                 * Confirmed real root cause instead: lv_display_get_inactive_
-                 * time(NULL), read by the auto-screen-timeout check just
-                 * below, is fed only by lv_display_trigger_activity() calls,
-                 * none of which happen anywhere during the entire suspend
-                 * duration (the whole app, including this timer, is frozen).
-                 * So the instant this code force-enables the screen above,
-                 * that check sees an inactivity duration spanning the ENTIRE
-                 * sleep (easily minutes), always over screen_timeout_seconds,
-                 * and immediately flips the screen back off again on this
-                 * same tick -- the "flash on then off" the bug report
-                 * describes. The grace window above still correctly stops
-                 * the echoed press from ALSO toggling the screen off a
-                 * second time, but does nothing about this separate,
-                 * unconditional timeout check. The second press "fixes" it
-                 * only as a side effect: being a genuine, non-swallowed
-                 * press, it calls lv_display_trigger_activity() in the
-                 * toggle branch below, which is what finally resets the
-                 * clock. Fixed at the source instead -- reset the clock
-                 * here, before that check ever runs. */
-                lv_display_trigger_activity(NULL);
-
-                /* Grace window: still needed independently of the fix above,
-                 * so the echoed KEY_POWER event doesn't ALSO toggle the
-                 * screen back off on top of the timeout-check race just
-                 * fixed. See resumed_from_suspend_pending's own comment. */
-                resumed_from_suspend_tick = lv_tick_get();
-                resumed_from_suspend_pending = true;
-                DBG_LOG("resume: grace window armed at tick=%u\n", resumed_from_suspend_tick);
+                 * Also folds in the fix for a related real-device report --
+                 * waking from suspend needed two power-button presses, the
+                 * first visibly flashing the backlight on then straight back
+                 * off. Root cause: lv_display_get_inactive_time(NULL), read
+                 * by the auto-screen-timeout check just below, is fed only
+                 * by lv_display_trigger_activity() calls, none of which
+                 * happen anywhere during the entire suspend duration (the
+                 * whole app, including this timer, is frozen) -- so the
+                 * instant the screen is force-enabled, that check sees an
+                 * inactivity duration spanning the ENTIRE sleep, always over
+                 * screen_timeout_seconds, and immediately flips the screen
+                 * back off again on this same tick. The second press only
+                 * "fixed" it as a side effect (a genuine press resets that
+                 * clock in the toggle branch below) -- resetting it
+                 * explicitly here is the real fix.
+                 *
+                 * See resume_from_suspend_fixups()'s own comment for why
+                 * this is shared with Car Mode's own suspend call below. */
+                resume_from_suspend_fixups();
 
                 /* Unlike idle_shutdown_now() (which never returns --
                  * poweroff ends the process), this call CAN legitimately
@@ -4030,6 +4209,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * pending, so gating them on screen state would leave that operation
      * stuck until the user wakes the screen back up. */
     poll_subsonic_download();
+    poll_subsonic_library_download();
     poll_dlna_control();
     poll_subsonic_connect();
     poll_wifi_scan();
@@ -4046,6 +4226,8 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_bt_connect();
     poll_bt_forget();
     poll_library_rescan();
+    poll_sd_format();
+    poll_import_web_stop();
     poll_sleep_timer();
     poll_usb_mode_switch();
     poll_sd_card_hotplug();
@@ -4144,6 +4326,19 @@ static void new_playlist_row_cb(lv_event_t * e) {
 static void existing_playlist_row_cb(lv_event_t * e) {
     const char * path = (const char *) lv_event_get_user_data(e);
     if (playlist_index < 0) return;
+
+    /* Playlist design change: adding a song already in the target playlist
+     * used to just append a second copy with no feedback -- confirmed by
+     * playlist_files_append()'s own unconditional fprintf(). Checked here
+     * rather than inside playlist_files_append() itself so that function
+     * stays a plain, unconditional "add this line" primitive other callers
+     * (e.g. new_playlist_name_done_cb() below, adding a brand-new file's
+     * first song) don't pay an unnecessary duplicate scan for. */
+    if (playlist_files_contains(path, playlist[playlist_index])) {
+        show_error_toast("Song already added");
+        nav_pop();
+        return;
+    }
 
     bool ok = playlist_files_append(path, playlist[playlist_index]);
     show_error_toast(ok ? "Added to playlist" : "Failed to add to playlist");
@@ -4432,7 +4627,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
     lv_obj_align(cover_img, LV_ALIGN_TOP_MID, 0, 0);
 
-    lv_obj_t * overlay = lv_obj_create(scr);
+    player_overlay_panel = lv_obj_create(scr);
+    lv_obj_t * overlay = player_overlay_panel; /* short local alias, rest of this function was written against this name */
     lv_obj_set_size(overlay, 480, 320);
     lv_obj_align(overlay, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_image_src(overlay, asset_path("playing_plane/buttom.png"), 0);
@@ -4851,7 +5047,27 @@ static void library_free_scan_state(void) {
  * only happens on real filesystem corruption -- a bounded cost, and far
  * better than the whole UI freezing. */
 #define LIBRARY_SCAN_FILE_TIMEOUT_MS 5000
-#define LIBRARY_SCAN_WALK_TIMEOUT_MS 30000
+/* Real-device bug report: a library of a few thousand tracks spread across
+ * many subfolders (nested Artist/Album directories on a plain SD card
+ * labeled "Music") scanned as completely empty -- no error shown anywhere
+ * a real deployment could surface one (stderr has no reader outside a
+ * TEST_BUILD_TAG debug session, see debug_log.h), just a silently empty
+ * library. Root cause: this used to be a flat wall-clock budget for the
+ * ENTIRE recursive walk (file_browser.c's scan_all_songs_recursive()) --
+ * fine for the genuine-corruption case it was built for (a single lstat()
+ * stuck in an uninterruptible kernel wait, same reasoning as
+ * LIBRARY_SCAN_FILE_TIMEOUT_MS above), but it couldn't tell that apart from
+ * a large, healthy, deeply-nested library on a slow card just legitimately
+ * taking longer than the flat budget to finish readdir()+lstat() on every
+ * entry -- the whole scan was discarded either way. Now a stall timeout
+ * instead (see the progress-counter poll loop below): as long as
+ * file_browser_scan_all_songs() keeps making forward progress (any real
+ * directory entry examined, not just playable files -- see its own
+ * progress parameter's doc comment in file_browser.h), no matter how long
+ * the walk takes in total, it's never treated as stuck. Only a stretch of
+ * this many ms with zero new progress -- the actual "something is
+ * genuinely wedged" signal -- gives up. */
+#define LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS 30000
 
 typedef struct {
     char root[600];
@@ -4859,11 +5075,12 @@ typedef struct {
     bool ok;
     char ** paths;
     int count;
+    volatile int progress;
 } scan_walk_work_t;
 
 static void * scan_walk_worker(void * arg) {
     scan_walk_work_t * w = (scan_walk_work_t *) arg;
-    w->ok = file_browser_scan_all_songs(w->root, &w->paths, &w->count);
+    w->ok = file_browser_scan_all_songs(w->root, &w->paths, &w->count, &w->progress);
     w->done = true; /* written last -- the only field polled below */
     return NULL;
 }
@@ -4900,7 +5117,13 @@ static bool scan_all_songs_with_timeout(const char * root, char *** out_paths, i
     }
     pthread_detach(thread); /* never joined either way -- see block comment above */
 
-    for (int waited_ms = 0; waited_ms < LIBRARY_SCAN_WALK_TIMEOUT_MS; waited_ms += 20) {
+    /* Stall detection, not a flat budget -- see LIBRARY_SCAN_WALK_STALL_
+     * TIMEOUT_MS's own comment. Same shape as scan_songs_range()'s own
+     * completed_index polling further down, just watching w->progress
+     * instead. */
+    int last_seen_progress = 0;
+    int stalled_ms = 0;
+    for (;;) {
         if (w->done) {
             bool ok = w->ok;
             *out_paths = w->paths;
@@ -4908,10 +5131,19 @@ static bool scan_all_songs_with_timeout(const char * root, char *** out_paths, i
             free(w);
             return ok;
         }
+        int progress = w->progress;
+        if (progress != last_seen_progress) {
+            last_seen_progress = progress;
+            stalled_ms = 0;
+        } else {
+            stalled_ms += 20;
+            if (stalled_ms >= LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS) break;
+        }
         usleep(20000);
     }
 
-    fprintf(stderr, "Warning: timed out scanning %s for songs (possible filesystem corruption) -- treating library as empty\n", root);
+    fprintf(stderr, "Warning: scan of %s stalled with no progress for %ds (possible filesystem corruption) -- treating library as empty\n",
+            root, LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS / 1000);
     return false;
 }
 
@@ -5192,8 +5424,30 @@ static void all_songs_tile_cb(lv_event_t * e) {
 static lv_obj_t * group_songs_screen;
 static lv_obj_t * group_songs_title_label;
 static lv_obj_t * group_songs_list;
+static lv_obj_t * group_songs_edit_btn;
 static const int * group_songs_indices; /* borrowed from whichever group_t is currently shown */
 static int group_songs_count;
+
+/* Playlist design change: user .m3u playlists needed a way to remove a song
+ * again after adding it. Non-NULL only when the group currently shown is a
+ * user-created .m3u playlist (set by show_m3u_playlist() below, via
+ * show_group_songs_editable()) -- stays NULL for Artists/Albums/Favorites/
+ * Most Played, none of which back onto a file this app can rewrite (Favorites
+ * is metadata_db-backed, Most Played is derived play-count ranking, and
+ * unfavoriting/uncounting a song isn't what "remove from playlist" means for
+ * either). Borrowed from playlists_m3u_paths[], same lifetime guarantee
+ * show_favorites()/show_most_played()'s own indices arrays already rely on
+ * (valid for as long as this screen is showing it). group_songs_edit_mode is
+ * reset to false on every fresh entry into this screen so leaving and
+ * re-entering never starts already in edit mode. */
+static const char * group_songs_edit_m3u_path = NULL;
+static bool group_songs_edit_mode = false;
+
+/* Defined near show_m3u_playlist() further down, where playlist_m3u_group/
+ * playlist_m3u_song_indices and file_browser_build_playlist_from_m3u() are
+ * already in scope -- forward-declared here since populate_group_songs_rows()
+ * (just below) needs to wire it up as the remove-icon's click handler. */
+static void group_song_remove_row_cb(lv_event_t * e);
 
 static void group_song_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -5204,27 +5458,88 @@ static void group_song_row_click_cb(lv_event_t * e) {
     on_file_selected(playlist_copy, group_songs_count, pos);
 }
 
-static void show_group_songs(const group_t * group) {
+/* Rebuilds group_songs_list's rows from whatever group_songs_indices/count
+ * currently hold, in either of two shapes: a plain tappable-to-play label
+ * (list_row_style, same as every other group -- Artists/Albums/Favorites/
+ * Most Played always use this one) when not actively editing a playlist, or
+ * a row with a trailing remove icon (no play-on-tap -- see
+ * group_song_remove_row_cb() below) when group_songs_edit_mode is on for an
+ * editable .m3u playlist. Split out from show_group_songs_editable() so the
+ * remove callback and the Edit/Done toggle can both redraw in place without
+ * re-deriving the group or nav_push()ing a second copy of this screen. */
+static void populate_group_songs_rows(void) {
+    lv_obj_clean(group_songs_list);
+
+    bool editable = group_songs_edit_m3u_path != NULL;
+    if (editable) {
+        lv_obj_clear_flag(group_songs_edit_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(group_songs_edit_btn, group_songs_edit_mode ? "Done" : "Edit");
+    } else {
+        lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    bool editing = editable && group_songs_edit_mode;
+
+    for (int i = 0; i < group_songs_count; i++) {
+        if (editing) {
+            /* Container row (label + remove icon), same shape as e.g.
+             * build_wifi_screen()'s saved/scanned network rows -- unlike the
+             * plain-label rows below, this needs a second child so it can't
+             * reuse list_row_style as-is. */
+            lv_obj_t * row = lv_obj_create(group_songs_list);
+            lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+            lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+            lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t * label = lv_label_create(row);
+            lv_label_set_text(label, song_display_title_of(group_songs_indices[i]));
+            lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+            lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
+            lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+
+            lv_obj_t * remove_icon = lv_image_create(row);
+            lv_image_set_src(remove_icon, asset_path("touch_list/del.png"));
+            lv_obj_align(remove_icon, LV_ALIGN_RIGHT_MID, -20, 0);
+            lv_obj_add_flag(remove_icon, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(remove_icon, group_song_remove_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        } else {
+            /* One lv_label via the shared list_row_style, not a container +
+             * child label each with their own local style properties -- see
+             * list_row_style's own doc comment (screen_builders.h). */
+            lv_obj_t * row = lv_label_create(group_songs_list);
+            lv_obj_add_style(row, &list_row_style, 0);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_label_set_text(row, song_display_title_of(group_songs_indices[i]));
+
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, group_song_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        }
+    }
+}
+
+static void group_songs_edit_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    group_songs_edit_mode = !group_songs_edit_mode;
+    populate_group_songs_rows();
+}
+
+static void show_group_songs_editable(const group_t * group, const char * editable_m3u_path) {
+    group_songs_edit_m3u_path = editable_m3u_path;
+    group_songs_edit_mode = false;
     group_songs_indices = group->indices;
     group_songs_count = group->count;
 
     lv_label_set_text(group_songs_title_label, group->name);
-    lv_obj_clean(group_songs_list);
-
-    for (int i = 0; i < group->count; i++) {
-        /* One lv_label via the shared list_row_style, not a container +
-         * child label each with their own local style properties -- see
-         * list_row_style's own doc comment (screen_builders.h). */
-        lv_obj_t * row = lv_label_create(group_songs_list);
-        lv_obj_add_style(row, &list_row_style, 0);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_label_set_text(row, song_display_title_of(group->indices[i]));
-
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, group_song_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
-    }
+    populate_group_songs_rows();
 
     nav_push(group_songs_screen);
+}
+
+static void show_group_songs(const group_t * group) {
+    show_group_songs_editable(group, NULL);
 }
 
 static lv_obj_t * build_group_songs_screen(void) {
@@ -5249,6 +5564,18 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_obj_set_style_text_color(group_songs_title_label, lv_color_make(240, 240, 240), 0);
     lv_obj_set_style_text_font(group_songs_title_label, &app_font_28, 0); /* shows a metadata-derived artist/album/genre name -- see fallback_font.h */
 
+    /* Hidden by default -- populate_group_songs_rows() (via
+     * show_group_songs_editable()) is what actually shows this, and only
+     * for a group backed by an editable .m3u playlist. */
+    group_songs_edit_btn = lv_label_create(scr);
+    lv_label_set_text(group_songs_edit_btn, "Edit");
+    lv_obj_set_style_text_color(group_songs_edit_btn, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(group_songs_edit_btn, ui_size_20, 0);
+    lv_obj_align(group_songs_edit_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(group_songs_edit_btn, group_songs_edit_btn_cb, LV_EVENT_CLICKED, NULL);
+
     group_songs_list = lv_obj_create(scr);
     lv_obj_set_size(group_songs_list, lv_pct(100),
                     lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
@@ -5267,23 +5594,152 @@ static lv_obj_t * build_group_songs_screen(void) {
 
 /* Reusable on-screen keyboard text entry -- the app had none of this
  * before network streaming needed a way to type a server URL/username/
- * password. One persistent screen (title + textarea + lv_keyboard),
+ * password. One persistent screen (title + textarea + T9 keypad),
  * repurposed for whatever's being entered via show_text_entry() rather
  * than a screen per use, same "one object, rebuilt/retargeted on demand"
  * approach as group_songs_screen above. Deliberately skips
  * finalize_screen_navigation() (no swipe-to-go-back) -- a swipe gesture
- * while typing on the keyboard would be an easy accidental way to lose
+ * while typing on the keypad would be an easy accidental way to lose
  * whatever was being entered. (text_entry_done_cb_t itself is forward-
  * declared earlier, alongside show_text_entry(), for the PEQ screen's
- * tap-to-edit handlers.) */
+ * tap-to-edit handlers.)
+ *
+ * Real T9 multi-tap keypad, replacing an earlier lv_keyboard_create()-based
+ * QWERTY layout -- feature request: reuse the stock firmware's own
+ * keyboard/ theme assets (confirmed present under THEME_ROOT on a real
+ * device, same asset_path() convention as every other themed icon in this
+ * app) for a phone-keypad-style input instead of LVGL's generic keyboard
+ * widget. 12-key layout (1-9, Mode, Shift, plus dedicated Del/Left/Right/
+ * Enter/Space keys) in a 4-column x 5-row grid; keys 2-9 cycle through their
+ * letter group (e.g. key 2 -> a -> b -> c) on repeated taps within
+ * TEXT_ENTRY_MULTITAP_MS, matching classic phone-keypad multi-tap text
+ * entry. Three keypad modes (ABC/NUM/SYM), cycled via the Mode key: ABC
+ * cycles letters per key (0 and 1 have no letter group on this asset set,
+ * so they always insert their literal digit); NUM makes every digit key
+ * insert its literal digit directly, no cycling; SYM cycles each key's own
+ * punctuation set (symbol0.png..symbol9.png). PEQ's numeric-only fields
+ * (show_text_entry()'s `numeric` flag) skip all three and lock permanently
+ * to plain-digit entry, hiding Mode/Shift (neither means anything for a
+ * frequency/gain/Q value) and exposing a dedicated "./-" key instead (gain
+ * needs negative numbers; nothing else here provides them once Mode is
+ * hidden).
+ *
+ * Scope cuts, deliberate for this first pass: num_more.png/symbol_more.png
+ * (a second punctuation page) aren't wired up -- symbol0-9 alone covers
+ * ordinary punctuation (. , ! ? etc.), and every text_entry field here is a
+ * short single-line value (URLs, names, credentials), not prose. The
+ * select/ subfolder's pressed-state art isn't used either (no PRESSED/
+ * RELEASED image swap, unlike screen_builders.c's icon-grid tiles) --
+ * LV_EVENT_CLICKED alone is enough feedback for a keypad tap. bg.png/
+ * text_bg.png/cursor.png (decorative chrome) and ok.png/ok_s.png (redundant
+ * with enter.png's own baked-in "Enter" text) are unused. char_l.png/
+ * char_u.png are never referenced -- confirmed byte-identical to each other
+ * and to no clear distinct purpose from char.png (the Mode key's own ABC
+ * glyph) by direct pixel inspection. */
 
 static lv_obj_t * text_entry_screen;
 static lv_obj_t * text_entry_title_label;
 static lv_obj_t * text_entry_textarea;
-static lv_obj_t * text_entry_keyboard;
 static lv_obj_t * text_entry_reveal_btn;
 static text_entry_done_cb_t text_entry_on_done;
 static void * text_entry_user_data;
+
+/* ---- T9 keypad geometry: 5 columns x 4 rows of TEXT_ENTRY_KEY_SIZE keys,
+ * centered under the 480px-wide screen and anchored to the bottom of the
+ * 800px-tall screen (both hardcoded directly rather than shared from
+ * SCREEN_WIDTH/SCREEN_HEIGHT constants -- main.c's copies aren't visible
+ * here, same as everywhere else in this file that needs the screen's own
+ * pixel size, e.g. COVER_ART_WIDTH above). Matches a real-device photo of
+ * the stock keyboard exactly (not asset-name guessing -- an earlier 4x5
+ * layout with a single cycling Mode key was wrong): column 0 holds three
+ * always-visible mode-jump buttons (123/ABC/sym) stacked vertically rather
+ * than one key that cycles between them; columns 1-3 hold the actual T9
+ * 3x3 letter/digit/symbol pad; column 4 holds Del (row 0), the key-0/Shift
+ * slot (row 1, see text_entry_key0_click_cb's own comment), and Enter
+ * (rows 2-3, tall). Row 3's remaining cells are Left/Right and a wide
+ * Space spanning columns 2-3. 5 columns at the native 94px key size only
+ * just fits 480px wide (a 2px gap leaves a 1px margin each side) -- real
+ * device photo confirms the stock keyboard packs this tight too. ---- */
+#define TEXT_ENTRY_KEY_SIZE 94
+#define TEXT_ENTRY_KEY_GAP 2
+#define TEXT_ENTRY_GRID_COLS 5
+#define TEXT_ENTRY_GRID_ROWS 4
+#define TEXT_ENTRY_GRID_WIDTH (TEXT_ENTRY_GRID_COLS * TEXT_ENTRY_KEY_SIZE + (TEXT_ENTRY_GRID_COLS - 1) * TEXT_ENTRY_KEY_GAP)
+#define TEXT_ENTRY_GRID_HEIGHT (TEXT_ENTRY_GRID_ROWS * TEXT_ENTRY_KEY_SIZE + (TEXT_ENTRY_GRID_ROWS - 1) * TEXT_ENTRY_KEY_GAP)
+#define TEXT_ENTRY_BOTTOM_MARGIN 16
+#define TEXT_ENTRY_GRID_X ((480 - TEXT_ENTRY_GRID_WIDTH) / 2)
+#define TEXT_ENTRY_GRID_Y (800 - TEXT_ENTRY_GRID_HEIGHT - TEXT_ENTRY_BOTTOM_MARGIN)
+#define TEXT_ENTRY_MULTITAP_MS 900
+
+typedef enum {
+    TEXT_ENTRY_KP_ABC = 0,
+    TEXT_ENTRY_KP_NUM,
+    TEXT_ENTRY_KP_SYM,
+} text_entry_kp_mode_t;
+
+/* Key index 10 is the numeric-lock-only "./-" key (T9_LETTER_GROUPS/
+ * T9_SYMBOL_GROUPS below only cover 0-9, the real digit keys). NULL entries
+ * mean "no letter group on this asset set" (keys 0 and 1) -- those always
+ * insert their own literal digit in ABC mode, same as NUM mode does for
+ * every key. */
+static const char * const TEXT_ENTRY_LETTER_GROUPS[10] = {
+    NULL, NULL, "abc", "def", "ghi", "jkl", "mno", "pqrs", "tuv", "wxyz"
+};
+/* Read off symbolN.png's own rendered glyphs directly (contact-sheet
+ * inspection, see this feature's own design notes) -- no declarative source
+ * for these exists anywhere in the squashfs. */
+static const char * const TEXT_ENTRY_SYMBOL_GROUPS[10] = {
+    ".,", "!?", "()[]", "/\\|", "$%", "@#&", "+-*^", "_{}", ":;", "<=>"
+};
+
+static text_entry_kp_mode_t text_entry_kp_mode = TEXT_ENTRY_KP_ABC;
+/* Real-device bug report: Shift behaved as a persistent caps toggle (tap
+ * once, every following letter stays capitalized until tapped again) --
+ * every real T9/phone keypad instead treats these as two separate things:
+ * Shift (the key-0 slot) capitalizes only the very next letter typed, then
+ * reverts on its own, while tapping the ABC mode button AGAIN while it's
+ * already the active mode is what toggles persistent caps ("Caps Lock").
+ * text_entry_is_uppercase() below is the union of both -- everywhere that
+ * used to read text_entry_shift directly for case now reads that instead. */
+static bool text_entry_shift = false;     /* one-shot: consumed by the next letter (see text_entry_handle_digit_key) */
+static bool text_entry_caps_lock = false; /* persistent: toggled by re-tapping the ABC mode button */
+static bool text_entry_numeric_only = false;
+
+static bool text_entry_is_uppercase(void) {
+    return text_entry_caps_lock || text_entry_shift;
+}
+
+/* Case for a pending multi-tap cycle is pinned to whatever it was on that
+ * cycle's FIRST tap (text_entry_handle_digit_key), not re-read live on every
+ * repeat tap -- otherwise a one-shot Shift (consumed immediately after that
+ * first tap, see below) would make the letter flip back to lowercase the
+ * moment the user cycles to a second candidate for the SAME letter, even
+ * though they're still resolving that one same keypress. */
+static bool text_entry_pending_shift = false;
+
+/* Multi-tap state: which key (0-10, or -1 = none) is mid-cycle and which
+ * character of its cycle is currently showing in the textarea. A repeat tap
+ * on the SAME key within TEXT_ENTRY_MULTITAP_MS deletes and re-inserts the
+ * next character in its cycle; any other input (a different key, or the
+ * timer simply elapsing) finalizes it, so the next tap on that key starts a
+ * fresh cycle instead of continuing the old one. */
+static int text_entry_pending_key = -1;
+static int text_entry_pending_tap_index = 0;
+static lv_timer_t * text_entry_multitap_timer;
+
+/* The 10 T9 pad digit-slot keys, indexed by digit 0-9 -- kept so
+ * text_entry_refresh_keys() can update their images/visibility in place
+ * when the mode/shift/numeric-lock state changes, without rebuilding the
+ * screen. Index 0 is special: it shares its screen position with Shift
+ * (see text_entry_key0_click_cb's own comment). The numeric-lock "./-" key
+ * and the three always-visible mode-jump buttons (123/ABC/sym) each need
+ * their own visibility toggled independently of the digit-slot keys, so
+ * they get their own named pointers rather than living in this array. */
+static lv_obj_t * text_entry_key_img[10];
+static lv_obj_t * text_entry_dotneg_key;
+static lv_obj_t * text_entry_num_mode_key;
+static lv_obj_t * text_entry_abc_mode_key;
+static lv_obj_t * text_entry_sym_mode_key;
 
 /* Bumped on every show_text_entry() call -- lets the READY handler below
  * tell whether the caller's done-callback chained straight into ANOTHER
@@ -5311,70 +5767,364 @@ static void text_entry_reveal_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     bool now_masked = !lv_textarea_get_password_mode(text_entry_textarea);
     lv_textarea_set_password_mode(text_entry_textarea, now_masked);
-    lv_label_set_text(lv_obj_get_child(text_entry_reveal_btn, 0), now_masked ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN);
+    lv_image_set_src(text_entry_reveal_btn, asset_path(now_masked ? "keyboard/psk_show.png" : "keyboard/psk_hide.png"));
 }
 
-static void text_entry_kb_event_cb(lv_event_t * e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_READY) {
-        /* lv_textarea_get_text()'s buffer belongs to the textarea and would
-         * be invalidated/reused the moment another screen starts editing
-         * it, so copy it out before invoking the caller's callback (which
-         * may itself push a screen that reuses this same textarea, e.g.
-         * entering the next field). */
-        char text_copy[256];
-        snprintf(text_copy, sizeof(text_copy), "%s", lv_textarea_get_text(text_entry_textarea));
-        text_entry_done_cb_t cb = text_entry_on_done;
-        void * user_data = text_entry_user_data;
-        uint32_t generation_before = text_entry_generation;
-        int depth_before = nav_depth;
-        /* Callback runs BEFORE nav_pop() now (reversed from the original
-         * order) specifically so the checks below can see whether it
-         * navigated anywhere on its own -- see text_entry_generation's own
-         * comment. Real-device bug report (Wi-Fi manual SSID entry): the
-         * generation check alone wasn't enough -- it only catches a callback
-         * that chains into ANOTHER show_text_entry() call reusing this same
-         * singleton screen (nav_depth unchanged, dedup guard in nav_push()
-         * eats the push). Wi-Fi's password-entered callback instead calls
-         * start_wifi_connect(), which nav_push()es a DIFFERENT screen
-         * (subsonic_downloading_screen, "Connecting to X...") straight off
-         * this one -- nav_depth DOES grow there, since that push isn't a
-         * dedup no-op. Confirmed live: the connecting screen flashed up
-         * then was animated straight back to the password field by nav_pop()
-         * a moment later, looking like nothing happened -- each repeat tap
-         * on the keyboard's OK button (six of them, one real device test)
-         * genuinely re-ran the whole callback, creating a fresh duplicate
-         * saved network every time (wifi_control_connect() always
-         * add_network()s a new entry, see its own comment).
-         *
-         * Simply skipping nav_pop() in that case (an earlier version of
-         * this fix) stopped the yank-back, but left THIS screen's own
-         * stack slot sitting there permanently, one level below wherever
-         * the callback's own push actually landed -- confirmed live via
-         * the Subsonic download path's identical shape (see poll_subsonic_
-         * download()'s own comment): backing out of the destination screen
-         * afterward surfaced this now-defunct form again instead of
-         * whatever was open before it, since nothing had ever removed its
-         * slot. nav_remove_stack_slot() splices it out after the fact once
-         * it's clear something else already took its place. */
-        if (cb) cb(text_copy, user_data);
-        if (nav_depth > depth_before) {
-            nav_remove_stack_slot(depth_before - 1);
-        } else if (text_entry_generation == generation_before) {
-            nav_pop();
-        }
-        /* else (nav_depth == depth_before && generation changed): the
-         * callback chained into another show_text_entry() call reusing
-         * this exact screen object -- nav_push()'s own dedup guard already
-         * reloaded it in place, nothing further to do here. */
-    } else if (code == LV_EVENT_CANCEL) {
+/* Extracted from what used to be lv_keyboard's own LV_EVENT_READY handler
+ * (the T9 Enter key below just calls this directly) -- the chained-
+ * show_text_entry()/nav_remove_stack_slot() logic is unrelated to the
+ * keypad rewrite, so it's preserved verbatim rather than re-derived. */
+static void text_entry_commit(void) {
+    /* lv_textarea_get_text()'s buffer belongs to the textarea and would be
+     * invalidated/reused the moment another screen starts editing it, so
+     * copy it out before invoking the caller's callback (which may itself
+     * push a screen that reuses this same textarea, e.g. entering the next
+     * field). */
+    char text_copy[256];
+    snprintf(text_copy, sizeof(text_copy), "%s", lv_textarea_get_text(text_entry_textarea));
+    text_entry_done_cb_t cb = text_entry_on_done;
+    void * user_data = text_entry_user_data;
+    uint32_t generation_before = text_entry_generation;
+    int depth_before = nav_depth;
+    /* Callback runs BEFORE nav_pop() specifically so the checks below can
+     * see whether it navigated anywhere on its own -- see
+     * text_entry_generation's own comment. Real-device bug report (Wi-Fi
+     * manual SSID entry): the generation check alone wasn't enough -- it
+     * only catches a callback that chains into ANOTHER show_text_entry()
+     * call reusing this same singleton screen (nav_depth unchanged, dedup
+     * guard in nav_push() eats the push). Wi-Fi's password-entered callback
+     * instead calls start_wifi_connect(), which nav_push()es a DIFFERENT
+     * screen (subsonic_downloading_screen, "Connecting to X...") straight
+     * off this one -- nav_depth DOES grow there, since that push isn't a
+     * dedup no-op. Confirmed live: the connecting screen flashed up then was
+     * animated straight back to the password field by nav_pop() a moment
+     * later, looking like nothing happened -- each repeat tap on the
+     * keyboard's OK button (six of them, one real device test) genuinely
+     * re-ran the whole callback, creating a fresh duplicate saved network
+     * every time (wifi_control_connect() always add_network()s a new entry,
+     * see its own comment).
+     *
+     * Simply skipping nav_pop() in that case (an earlier version of this
+     * fix) stopped the yank-back, but left THIS screen's own stack slot
+     * sitting there permanently, one level below wherever the callback's
+     * own push actually landed -- confirmed live via the Subsonic download
+     * path's identical shape (see poll_subsonic_download()'s own comment):
+     * backing out of the destination screen afterward surfaced this
+     * now-defunct form again instead of whatever was open before it, since
+     * nothing had ever removed its slot. nav_remove_stack_slot() splices it
+     * out after the fact once it's clear something else already took its
+     * place. */
+    if (cb) cb(text_copy, user_data);
+    if (nav_depth > depth_before) {
+        nav_remove_stack_slot(depth_before - 1);
+    } else if (text_entry_generation == generation_before) {
         nav_pop();
     }
+    /* else (nav_depth == depth_before && generation changed): the callback
+     * chained into another show_text_entry() call reusing this exact screen
+     * object -- nav_push()'s own dedup guard already reloaded it in place,
+     * nothing further to do here. */
+}
+
+/* Clears any in-progress multi-tap cycle without touching the textarea --
+ * called at the top of every OTHER key's handler (anything that isn't a
+ * repeat tap of the same cycling key) so the next tap on that key starts a
+ * fresh cycle instead of continuing whatever was pending before. Also what
+ * the timeout itself does when no further tap arrives in time. */
+static void text_entry_finalize_pending(void) {
+    text_entry_pending_key = -1;
+    lv_timer_pause(text_entry_multitap_timer);
+}
+
+static void text_entry_multitap_timeout_cb(lv_timer_t * timer) {
+    (void) timer;
+    text_entry_finalize_pending();
+}
+
+/* Every character (or character group) a given digit-slot key currently
+ * produces, as a NUL-terminated string -- length 1 means "just insert this
+ * one character, no cycling" (NUM mode, or ABC mode's key 0/1, or a
+ * genuinely single-symbol group); length > 1 is what the multi-tap cycle in
+ * text_entry_key_click_cb() steps through. key_index 10 is the
+ * numeric-lock-only "./-" key, meaningful only when text_entry_numeric_only
+ * is set (its caller already knows not to ask otherwise). out must be at
+ * least 8 bytes -- the longest real group (TEXT_ENTRY_SYMBOL_GROUPS' 4-char
+ * entries) plus the NUL. uppercase is passed in explicitly (rather than read
+ * live off text_entry_is_uppercase()) so text_entry_handle_digit_key() can
+ * pin a multi-tap cycle's case to whatever it was on that cycle's first tap
+ * -- see text_entry_pending_shift's own comment. */
+static void text_entry_key_chars_ex(int key_index, char * out, size_t out_size, bool uppercase) {
+    if (key_index == 10) {
+        snprintf(out, out_size, ".-");
+        return;
+    }
+    if (text_entry_numeric_only || text_entry_kp_mode == TEXT_ENTRY_KP_NUM) {
+        out[0] = (char) ('0' + key_index);
+        out[1] = '\0';
+        return;
+    }
+    if (text_entry_kp_mode == TEXT_ENTRY_KP_SYM) {
+        snprintf(out, out_size, "%s", TEXT_ENTRY_SYMBOL_GROUPS[key_index]);
+        return;
+    }
+    /* ABC mode. Key 1 has no letter group on this asset set -- real-device
+     * photo confirmed the stock keyboard repurposes it as a punctuation
+     * shortcut here specifically (char_l.png/char_u.png's own baked-in
+     * glyph), not literal "1" the way NUM mode's key 1 is. */
+    if (key_index == 1) {
+        snprintf(out, out_size, "._@/#");
+        return;
+    }
+    const char * letters = TEXT_ENTRY_LETTER_GROUPS[key_index];
+    if (!letters) {
+        out[0] = (char) ('0' + key_index);
+        out[1] = '\0';
+        return;
+    }
+    size_t n = strlen(letters);
+    size_t i;
+    for (i = 0; i < n && i + 1 < out_size; i++) {
+        out[i] = uppercase ? (char) toupper((unsigned char) letters[i]) : letters[i];
+    }
+    out[i] = '\0';
+}
+
+/* asset_path() only needs relative_path for the duration of its own call
+ * (it strdup()s its own "S:..." result -- see its doc comment), so handing
+ * back a reused static buffer here is safe: every call site below both
+ * builds and consumes the path synchronously, on the GUI thread, one at a
+ * time. */
+static const char * text_entry_key_image(int key_index) {
+    static char buf[64];
+    if (text_entry_numeric_only || text_entry_kp_mode == TEXT_ENTRY_KP_NUM) {
+        snprintf(buf, sizeof(buf), "keyboard/%d.png", key_index);
+    } else if (text_entry_kp_mode == TEXT_ENTRY_KP_SYM) {
+        snprintf(buf, sizeof(buf), "keyboard/symbol%d.png", key_index);
+    } else if (key_index == 1) {
+        /* char_l.png/char_u.png are byte-identical (confirmed via md5sum),
+         * so this always resolves to the same image regardless of case --
+         * picking by case anyway just for symmetry with every other
+         * letter-group key below, which does need it. */
+        snprintf(buf, sizeof(buf), "keyboard/char_%c.png", text_entry_is_uppercase() ? 'u' : 'l');
+    } else {
+        const char * letters = TEXT_ENTRY_LETTER_GROUPS[key_index];
+        if (!letters) {
+            snprintf(buf, sizeof(buf), "keyboard/%d.png", key_index);
+        } else {
+            snprintf(buf, sizeof(buf), "keyboard/%s_%c.png", letters, text_entry_is_uppercase() ? 'u' : 'l');
+        }
+    }
+    return buf;
+}
+
+/* Re-syncs every key's image and (for the mode buttons/numeric-lock "./-"
+ * key) visibility with the current mode/shift/numeric-lock state -- called
+ * once from show_text_entry() and again on every mode/Shift/digit-0 tap. */
+static void text_entry_refresh_keys(void) {
+    for (int i = 1; i < 10; i++) {
+        lv_image_set_src(text_entry_key_img[i], asset_path(text_entry_key_image(i)));
+    }
+    /* Index 0's slot shows Shift while cycling letters (case has no other
+     * meaning), and the literal digit-0/symbol-0 key otherwise -- see
+     * text_entry_key0_click_cb's own comment for the input-side half of
+     * this same split. */
+    if (!text_entry_numeric_only && text_entry_kp_mode == TEXT_ENTRY_KP_ABC) {
+        lv_image_set_src(text_entry_key_img[0], asset_path("keyboard/upper.png"));
+    } else {
+        lv_image_set_src(text_entry_key_img[0], asset_path(text_entry_key_image(0)));
+    }
+
+    if (text_entry_numeric_only) {
+        lv_obj_add_flag(text_entry_num_mode_key, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(text_entry_abc_mode_key, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(text_entry_sym_mode_key, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(text_entry_dotneg_key, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_add_flag(text_entry_dotneg_key, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(text_entry_num_mode_key, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(text_entry_abc_mode_key, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(text_entry_sym_mode_key, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Shared by every cycling key (the 9 digit-slot keys, the key-0/digit-0
+ * slot when it isn't acting as Shift, and the numeric-lock "./-" key) --
+ * pulled out of the click handler so text_entry_key0_click_cb below can
+ * reuse it without duplicating the multi-tap bookkeeping. A tap on a key
+ * whose current character group has more than one character, repeated on
+ * the SAME key before text_entry_multitap_timer elapses, cycles to the next
+ * character in that group instead of inserting a new one (classic phone-
+ * keypad multi-tap: key 2 pressed twice quickly types "b", not "aa"). Any
+ * other case (a new key, a single-character group, or the timer having
+ * already elapsed) just inserts the group's first character fresh.
+ *
+ * Case is decided once, on the FIRST tap of a fresh cycle (same_key_pending
+ * false), and then pinned in text_entry_pending_shift for any further taps
+ * that just cycle through candidates for that SAME letter -- see that
+ * variable's own comment. That first tap is also where a one-shot Shift
+ * (text_entry_shift, as opposed to the persistent text_entry_caps_lock) gets
+ * consumed: it already did its job baking uppercase into chars[] above, so
+ * it's cleared right after, letting the very next DIFFERENT key fall back to
+ * whatever text_entry_caps_lock alone says. */
+static void text_entry_handle_digit_key(int key_index) {
+    bool same_key_pending = (text_entry_pending_key == key_index);
+    bool uppercase = same_key_pending ? text_entry_pending_shift : text_entry_is_uppercase();
+
+    char chars[8];
+    text_entry_key_chars_ex(key_index, chars, sizeof(chars), uppercase);
+    size_t n = strlen(chars);
+
+    if (n > 1 && same_key_pending) {
+        lv_textarea_delete_char(text_entry_textarea);
+        text_entry_pending_tap_index = (text_entry_pending_tap_index + 1) % (int) n;
+    } else {
+        text_entry_pending_key = n > 1 ? key_index : -1;
+        text_entry_pending_tap_index = 0;
+        text_entry_pending_shift = uppercase;
+        if (!text_entry_numeric_only && text_entry_kp_mode == TEXT_ENTRY_KP_ABC && text_entry_shift) {
+            text_entry_shift = false;
+            text_entry_refresh_keys();
+        }
+    }
+    lv_textarea_add_char(text_entry_textarea, (uint32_t) chars[text_entry_pending_tap_index]);
+
+    if (n > 1) {
+        lv_timer_reset(text_entry_multitap_timer);
+        lv_timer_resume(text_entry_multitap_timer);
+    }
+}
+
+static void text_entry_key_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_handle_digit_key((int) (intptr_t) lv_event_get_user_data(e));
+}
+
+/* Key index 0's screen slot (column 4, row 1) does double duty, matching
+ * the real stock keyboard's own layout: while cycling letters, tapping it
+ * arms a one-shot Shift for the next letter typed (text_entry_is_uppercase()'s
+ * own comment) -- there's no digit "0" needed there since ABC mode has no
+ * use for one. In NUM/SYM mode (or numeric_only, which behaves like NUM mode
+ * regardless of text_entry_kp_mode's stale value -- see text_entry_key_chars_ex()'s
+ * own numeric_only check) it's a completely ordinary cycling digit-slot key
+ * for index 0, same as any other. */
+static void text_entry_key0_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!text_entry_numeric_only && text_entry_kp_mode == TEXT_ENTRY_KP_ABC) {
+        text_entry_finalize_pending();
+        text_entry_shift = !text_entry_shift;
+        text_entry_refresh_keys();
+        return;
+    }
+    text_entry_handle_digit_key(0);
+}
+
+/* The three mode buttons stacked in column 0 (rows 0-2) are always visible
+ * together and each jump straight to their own mode -- unlike the earlier
+ * single cycling Mode key this replaces, matching a real-device photo of
+ * the stock keyboard's own layout exactly. */
+static void text_entry_mode_num_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_finalize_pending();
+    text_entry_kp_mode = TEXT_ENTRY_KP_NUM;
+    text_entry_shift = false; /* one-shot Shift is meaningless outside ABC -- don't let it carry back in */
+    text_entry_refresh_keys();
+}
+
+/* Real-device bug report: tapping ABC again while it was ALREADY the active
+ * mode did nothing -- the real stock keyboard uses exactly that (re-tapping
+ * the already-active mode button) as its persistent Caps Lock toggle,
+ * distinct from Shift's one-shot-next-letter behavior on the key-0 slot
+ * above. Switching INTO ABC from NUM/SYM just activates it, same as before;
+ * text_entry_caps_lock deliberately isn't reset there, so a caps-lock
+ * preference set earlier survives a detour through NUM/SYM and back. */
+static void text_entry_mode_abc_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_finalize_pending();
+    if (!text_entry_numeric_only && text_entry_kp_mode == TEXT_ENTRY_KP_ABC) {
+        text_entry_caps_lock = !text_entry_caps_lock;
+        text_entry_shift = false; /* toggling caps lock supersedes any pending one-shot arm */
+    } else {
+        text_entry_kp_mode = TEXT_ENTRY_KP_ABC;
+    }
+    text_entry_refresh_keys();
+}
+
+static void text_entry_mode_sym_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_finalize_pending();
+    text_entry_kp_mode = TEXT_ENTRY_KP_SYM;
+    text_entry_shift = false; /* one-shot Shift is meaningless outside ABC -- don't let it carry back in */
+    text_entry_refresh_keys();
+}
+
+static void text_entry_del_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_finalize_pending();
+    lv_textarea_delete_char(text_entry_textarea);
+}
+
+static void text_entry_left_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_finalize_pending();
+    lv_textarea_cursor_left(text_entry_textarea);
+}
+
+static void text_entry_right_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_finalize_pending();
+    lv_textarea_cursor_right(text_entry_textarea);
+}
+
+static void text_entry_space_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_finalize_pending();
+    lv_textarea_add_char(text_entry_textarea, ' ');
+}
+
+static void text_entry_enter_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_finalize_pending();
+    text_entry_commit();
+}
+
+/* Every key is a plain clickable image at its own top-left grid cell (col,
+ * row) -- see the icon_tile_press_event_cb doc comment in screen_builders.c
+ * for the precedent this follows (clickable lv_image, no wrapper container).
+ * Taller/wider keys (Enter, Space) just have a native asset that extends
+ * past one cell; their top-left anchor is computed the same way as every
+ * other key. */
+static lv_obj_t * text_entry_make_key(lv_obj_t * scr, int col, int row, lv_event_cb_t cb, void * user_data) {
+    lv_obj_t * img = lv_image_create(scr);
+    lv_obj_add_flag(img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(img, LV_ALIGN_TOP_LEFT,
+                 TEXT_ENTRY_GRID_X + col * (TEXT_ENTRY_KEY_SIZE + TEXT_ENTRY_KEY_GAP),
+                 TEXT_ENTRY_GRID_Y + row * (TEXT_ENTRY_KEY_SIZE + TEXT_ENTRY_KEY_GAP));
+    if (cb) lv_obj_add_event_cb(img, cb, LV_EVENT_CLICKED, user_data);
+    return img;
 }
 
 static lv_obj_t * build_text_entry_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    /* lv_keyboard_create()'s built-in Close/X key used to be this screen's
+     * only cancel path (see the old LV_EVENT_CANCEL branch this replaces --
+     * generic_back_cb below is functionally identical, just nav_pop()).
+     * Removing lv_keyboard for the T9 keypad below means that key is gone,
+     * so this screen needs its own explicit back button now -- same
+     * top-left 64x64/sub_back/btn_back.png pattern as build_files_screen()
+     * and every other hand-built screen in this file. */
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
 
     text_entry_title_label = lv_label_create(scr);
     lv_label_set_text(text_entry_title_label, "");
@@ -5388,36 +6138,68 @@ static lv_obj_t * build_text_entry_screen(void) {
     lv_textarea_set_one_line(text_entry_textarea, true);
 
     /* Real-device bug report: no way to unmask a password field while
-     * typing it. Reuses LVGL's own built-in eye symbols (already present in
-     * the montserrat fonts this app ships) rather than a custom asset.
-     * Hidden entirely for non-password fields by show_text_entry() below --
-     * the textarea is narrowed to make room for it unconditionally so
-     * switching between password/non-password fields doesn't reflow the
-     * textarea's width and position. */
-    text_entry_reveal_btn = lv_button_create(scr);
-    lv_obj_set_size(text_entry_reveal_btn, 44, 44);
+     * typing it. Hidden entirely for non-password fields by
+     * show_text_entry() below -- the textarea is narrowed to make room for
+     * it unconditionally so switching between password/non-password fields
+     * doesn't reflow the textarea's width and position. */
+    text_entry_reveal_btn = lv_image_create(scr);
+    lv_image_set_src(text_entry_reveal_btn, asset_path("keyboard/psk_show.png"));
     lv_obj_align_to(text_entry_reveal_btn, text_entry_textarea, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+    lv_obj_add_flag(text_entry_reveal_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(text_entry_reveal_btn, text_entry_reveal_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * reveal_icon = lv_label_create(text_entry_reveal_btn);
-    lv_label_set_text(reveal_icon, LV_SYMBOL_EYE_CLOSE);
-    lv_obj_center(reveal_icon);
 
-    text_entry_keyboard = lv_keyboard_create(scr);
-    lv_keyboard_set_textarea(text_entry_keyboard, text_entry_textarea);
-    lv_obj_add_event_cb(text_entry_keyboard, text_entry_kb_event_cb, LV_EVENT_READY, NULL);
-    lv_obj_add_event_cb(text_entry_keyboard, text_entry_kb_event_cb, LV_EVENT_CANCEL, NULL);
+    /* ---- T9 keypad: 5 columns x 4 rows (see TEXT_ENTRY_GRID_X/Y's own
+     * comment above for the real-device-photo source of this layout).
+     * Row 0: Mode:123 / 1 / 2-ABC / 3-DEF / Del. Row 1: Mode:ABC / 4-GHI /
+     * 5-JKL / 6-MNO / 0-or-Shift. Row 2: Mode:sym / 7-PQRS / 8-TUV /
+     * 9-WXYZ / Enter (spans rows 2-3). Row 3: Left / Right / Space (spans
+     * cols 2-3) / Enter continues. The numeric-lock "./-" key (numeric_only
+     * fields only) occupies the same cell as Mode:123, since the three mode
+     * buttons are hidden together whenever it's shown -- see
+     * text_entry_refresh_keys(). ---- */
+    for (int i = 1; i <= 9; i++) {
+        int col = 1 + (i - 1) % 3;
+        int row = (i - 1) / 3;
+        text_entry_key_img[i] = text_entry_make_key(scr, col, row, text_entry_key_click_cb, (void *) (intptr_t) i);
+    }
+    text_entry_key_img[0] = text_entry_make_key(scr, 4, 1, text_entry_key0_click_cb, NULL);
+
+    text_entry_dotneg_key = text_entry_make_key(scr, 0, 0, text_entry_key_click_cb, (void *) (intptr_t) 10);
+    lv_image_set_src(text_entry_dotneg_key, asset_path("keyboard/dot.png"));
+
+    text_entry_num_mode_key = text_entry_make_key(scr, 0, 0, text_entry_mode_num_click_cb, NULL);
+    lv_image_set_src(text_entry_num_mode_key, asset_path("keyboard/num.png"));
+    text_entry_abc_mode_key = text_entry_make_key(scr, 0, 1, text_entry_mode_abc_click_cb, NULL);
+    lv_image_set_src(text_entry_abc_mode_key, asset_path("keyboard/char.png"));
+    text_entry_sym_mode_key = text_entry_make_key(scr, 0, 2, text_entry_mode_sym_click_cb, NULL);
+    lv_image_set_src(text_entry_sym_mode_key, asset_path("keyboard/symbol.png"));
+
+    lv_obj_t * del_key = text_entry_make_key(scr, 4, 0, text_entry_del_click_cb, NULL);
+    lv_image_set_src(del_key, asset_path("keyboard/del.png"));
+    lv_obj_t * left_key = text_entry_make_key(scr, 0, 3, text_entry_left_click_cb, NULL);
+    lv_image_set_src(left_key, asset_path("keyboard/left.png"));
+    lv_obj_t * right_key = text_entry_make_key(scr, 1, 3, text_entry_right_click_cb, NULL);
+    lv_image_set_src(right_key, asset_path("keyboard/right.png"));
+    lv_obj_t * enter_key = text_entry_make_key(scr, 4, 2, text_entry_enter_click_cb, NULL);
+    lv_image_set_src(enter_key, asset_path("keyboard/enter.png"));
+    lv_obj_t * space_key = text_entry_make_key(scr, 2, 3, text_entry_space_click_cb, NULL);
+    lv_image_set_src(space_key, asset_path("keyboard/space2.png"));
+
+    text_entry_multitap_timer = lv_timer_create(text_entry_multitap_timeout_cb, TEXT_ENTRY_MULTITAP_MS, NULL);
+    lv_timer_pause(text_entry_multitap_timer);
 
     return scr;
 }
 
 /* Pushes the text entry screen pre-filled with initial_text (may be NULL
  * for empty) under `title`; on_done fires with whatever was typed when the
- * keyboard's OK/Enter is pressed (not called at all if the keyboard's
- * Cancel/close is pressed instead -- callers shouldn't assume it always
- * fires). is_password masks the input the same way a real password field
- * would. numeric switches the keyboard to LV_KEYBOARD_MODE_NUMBER (digits,
- * decimal point, +/- -- everything peq.c's freq/gain/Q fields need) instead
- * of the default full QWERTY layout. */
+ * T9 keypad's Enter key is pressed (not called at all if the screen's own
+ * back button is used instead -- callers shouldn't assume it always fires).
+ * is_password masks the input the same way a real password field would.
+ * numeric locks the keypad to plain-digit entry (see text_entry_numeric_
+ * only's own comment) instead of the normal ABC/NUM/SYM T9 cycle --
+ * everything peq.c's freq/gain/Q fields need (digits, a decimal point, and
+ * a minus sign for negative gain), nothing else. */
 static void show_text_entry(const char * title, const char * initial_text, bool is_password, bool numeric,
                              text_entry_done_cb_t on_done, void * user_data) {
     lv_label_set_text(text_entry_title_label, title);
@@ -5427,13 +6209,18 @@ static void show_text_entry(const char * title, const char * initial_text, bool 
      * the previous show_text_entry() call (e.g. Wi-Fi's chained SSID ->
      * password, which reuses this same singleton screen without an
      * intervening rebuild) would carry that state into an unrelated field. */
-    lv_label_set_text(lv_obj_get_child(text_entry_reveal_btn, 0), LV_SYMBOL_EYE_CLOSE);
+    lv_image_set_src(text_entry_reveal_btn, asset_path("keyboard/psk_show.png"));
     if (is_password) {
         lv_obj_remove_flag(text_entry_reveal_btn, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(text_entry_reveal_btn, LV_OBJ_FLAG_HIDDEN);
     }
-    lv_keyboard_set_mode(text_entry_keyboard, numeric ? LV_KEYBOARD_MODE_NUMBER : LV_KEYBOARD_MODE_TEXT_LOWER);
+    text_entry_kp_mode = TEXT_ENTRY_KP_ABC;
+    text_entry_shift = false;
+    text_entry_caps_lock = false;
+    text_entry_numeric_only = numeric;
+    text_entry_finalize_pending();
+    text_entry_refresh_keys();
     text_entry_on_done = on_done;
     text_entry_user_data = user_data;
     text_entry_generation++;
@@ -5625,6 +6412,205 @@ static lv_obj_t * build_subsonic_downloading_screen(void) {
     return scr;
 }
 
+/* ---- "Download to library" -- Subsonic screen redesign. Unlike the
+ * single-song download-then-play flow just above (which caches into
+ * SUBSONIC_STREAM_CACHE_DIR and is never meant to persist), this
+ * permanently saves every song in an artist/album/playlist under
+ * MUSIC_ROOT_DIR itself, laid out the same way a manually-ripped library
+ * usually is: <Artist>/<Album>/<track> - <title>.<ext>. One background
+ * thread does N sequential HTTP downloads (http_get_to_file() blocks per
+ * file, same as the single-song path above), then a normal
+ * start_library_rescan() so the new files actually show up in Artists/
+ * Albums/All Songs without a separate manual "Update Music Database" step.
+ * ---- */
+
+/* FAT32/exFAT can't hold '/', and the rest of this set covers characters
+ * various filesystems/tools choke on -- artist/album/song names from a real
+ * server are free-form text from whoever tagged that library, unlike every
+ * other path this app builds internally out of known-safe components. */
+static void sanitize_path_component(const char * in, char * out, size_t out_size) {
+    size_t pos = 0;
+    for (const char * p = in; *p && pos + 1 < out_size; p++) {
+        char c = *p;
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+            c = '_';
+        }
+        out[pos++] = c;
+    }
+    out[pos] = '\0';
+}
+
+typedef struct {
+    subsonic_server_t server;
+    /* Mode A (Album/Playlist download): songs/song_count are already fully
+     * known -- an owned copy the thread frees when done. Mode B (Artist
+     * download, from the Artist page's own Download button): songs is NULL
+     * and albums_to_expand is set instead, since an artist's total song
+     * count isn't known until the thread itself fetches each album's songs
+     * first (subsonic_get_album_songs() per album, aggregated). */
+    subsonic_song_t * songs;
+    int song_count;
+    subsonic_album_t * albums_to_expand;
+    int album_to_expand_count;
+    char playlist_name[128]; /* non-empty only for a Playlist download -- also creates a local .m3u alongside the downloaded files */
+} subsonic_library_download_request_t;
+
+static pthread_t subsonic_library_download_thread;
+static bool subsonic_library_download_active = false;
+static volatile bool subsonic_library_download_done_flag = false;
+static volatile int subsonic_library_download_progress = 0; /* songs completed so far */
+static volatile int subsonic_library_download_total = 0;    /* 0 while still expanding an artist's albums (Mode B) -- see poll_subsonic_library_download() */
+static int subsonic_library_download_success_count = 0;
+
+static void * subsonic_library_download_thread_func(void * arg) {
+    subsonic_library_download_request_t * req = (subsonic_library_download_request_t *) arg;
+
+    subsonic_song_t * songs = req->songs; /* Mode A: the caller's owned copy; Mode B: NULL, built below */
+    int song_count = req->song_count;
+
+    if (req->albums_to_expand) {
+        int capacity = 0;
+        int count = 0;
+        for (int i = 0; i < req->album_to_expand_count; i++) {
+            subsonic_song_t * album_songs = NULL;
+            int album_song_count = 0;
+            if (subsonic_get_album_songs(&req->server, req->albums_to_expand[i].id, &album_songs, &album_song_count)) {
+                if (count + album_song_count > capacity) {
+                    capacity = (count + album_song_count) * 2;
+                    songs = realloc(songs, sizeof(subsonic_song_t) * (size_t) capacity);
+                }
+                memcpy(songs + count, album_songs, sizeof(subsonic_song_t) * (size_t) album_song_count);
+                count += album_song_count;
+            }
+            free(album_songs);
+        }
+        song_count = count;
+        subsonic_library_download_total = song_count; /* was 0 until this expansion finished -- unblocks poll_subsonic_library_download()'s progress display */
+        free(req->albums_to_expand);
+    }
+
+    char playlist_m3u_path[512] = "";
+    bool playlist_first = true;
+    int success_count = 0;
+
+    for (int i = 0; i < song_count; i++) {
+        subsonic_song_t * song = &songs[i];
+
+        char safe_artist[160], safe_album[160], safe_title[160];
+        sanitize_path_component(song->artist[0] ? song->artist : "Unknown Artist", safe_artist, sizeof(safe_artist));
+        sanitize_path_component(song->album[0] ? song->album : "Unknown Album", safe_album, sizeof(safe_album));
+        sanitize_path_component(song->title[0] ? song->title : "Unknown Title", safe_title, sizeof(safe_title));
+
+        char artist_dir[400], album_dir[400], dest_path[600];
+        snprintf(artist_dir, sizeof(artist_dir), "%s/%s", MUSIC_ROOT_DIR, safe_artist);
+        mkdir(artist_dir, 0755); /* no-op (EEXIST) if it's already there, same as every other mkdir() in this file */
+        snprintf(album_dir, sizeof(album_dir), "%s/%s", artist_dir, safe_album);
+        mkdir(album_dir, 0755);
+        if (song->track > 0) {
+            snprintf(dest_path, sizeof(dest_path), "%s/%02d - %s.%s", album_dir, song->track, safe_title, song->suffix);
+        } else {
+            snprintf(dest_path, sizeof(dest_path), "%s/%s.%s", album_dir, safe_title, song->suffix);
+        }
+
+        char url[1536];
+        subsonic_build_stream_url(&req->server, song->id, url, sizeof(url));
+        bool ok = http_get_to_file(url, req->server.verify_tls, dest_path, NULL, NULL);
+
+        if (ok) {
+            success_count++;
+            if (req->playlist_name[0] != '\0') {
+                if (playlist_first) {
+                    playlist_files_create(PLAYLISTS_DIR, req->playlist_name, dest_path, playlist_m3u_path, sizeof(playlist_m3u_path));
+                    playlist_first = false;
+                } else if (playlist_m3u_path[0] != '\0') {
+                    playlist_files_append(playlist_m3u_path, dest_path);
+                }
+            }
+        }
+
+        subsonic_library_download_progress = i + 1;
+    }
+
+    subsonic_library_download_success_count = success_count;
+    free(songs);
+    free(req);
+    subsonic_library_download_done_flag = true; /* written last -- poll_subsonic_library_download() only checks this flag */
+    return NULL;
+}
+
+/* songs/albums_to_expand are handed off to the thread, which frees them --
+ * callers must pass owned, malloc'd copies, never a shared cache pointer
+ * (subsonic_songs_cache/subsonic_albums_cache themselves can be replaced by
+ * the next browse click while this download is still in flight). Exactly
+ * one of songs or albums_to_expand should be non-NULL (Mode A vs Mode B --
+ * see subsonic_library_download_request_t's own comment). playlist_name
+ * NULL/empty means "don't create a .m3u." */
+static void start_subsonic_library_download(subsonic_song_t * songs, int song_count,
+                                              subsonic_album_t * albums_to_expand, int album_to_expand_count,
+                                              const char * playlist_name, const char * progress_label) {
+    subsonic_library_download_request_t * req = malloc(sizeof(*req));
+    req->server = subsonic_server_from_settings();
+    req->songs = songs;
+    req->song_count = song_count;
+    req->albums_to_expand = albums_to_expand;
+    req->album_to_expand_count = album_to_expand_count;
+    snprintf(req->playlist_name, sizeof(req->playlist_name), "%s", playlist_name ? playlist_name : "");
+
+    subsonic_library_download_progress = 0;
+    subsonic_library_download_total = albums_to_expand ? 0 : song_count; /* 0 = "still figuring out the total," see poll_subsonic_library_download() */
+    subsonic_library_download_success_count = 0;
+    subsonic_library_download_done_flag = false;
+    subsonic_library_download_active = true;
+
+    lv_label_set_text(subsonic_downloading_label, progress_label);
+    lv_bar_set_value(subsonic_downloading_progress_bar, 0, LV_ANIM_OFF);
+    if (albums_to_expand) {
+        lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN); /* no meaningful total yet -- see the "0 while expanding" comment above */
+    } else {
+        lv_obj_remove_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+    nav_push(subsonic_downloading_screen);
+
+    pthread_create(&subsonic_library_download_thread, NULL, subsonic_library_download_thread_func, req);
+}
+
+static void poll_subsonic_library_download(void) {
+    if (!subsonic_library_download_active) return;
+
+    if (!subsonic_library_download_done_flag) {
+        int total = subsonic_library_download_total;
+        if (total > 0) {
+            lv_obj_remove_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text_fmt(subsonic_downloading_label, "Downloading to library...\n%d / %d",
+                                   subsonic_library_download_progress, total);
+            lv_bar_set_value(subsonic_downloading_progress_bar,
+                              (subsonic_library_download_progress * 100) / total, LV_ANIM_OFF);
+        }
+        return;
+    }
+
+    subsonic_library_download_active = false;
+    pthread_join(subsonic_library_download_thread, NULL);
+
+    /* Leave this download's own use of the shared "please wait" screen
+     * before either branch below -- start_library_rescan() pushes that same
+     * screen again fresh for its own "Updating music database..." phase,
+     * and would otherwise stack a second copy on top of this one still
+     * sitting there. */
+    nav_pop();
+
+    if (subsonic_library_download_success_count > 0) {
+        /* start_library_rescan() finishes with nav_reset_to_home(), same as
+         * every other "the library just changed on disk" trigger in this
+         * app (SD import, Wi-Fi import, manual rescan) -- no separate
+         * success toast first, the label just switches straight from this
+         * download's own progress text to the rescan's. */
+        start_library_rescan();
+    } else {
+        show_error_toast("Download failed");
+    }
+}
+
 /* Shared by the artists/albums/songs screens: a titled list of compact
  * rows, one per index-based click callback, built fresh from a persistent
  * (never-deleted) list container each time the user drills into a new
@@ -5757,23 +6743,55 @@ static subsonic_album_t * subsonic_albums_cache = NULL;
 static int subsonic_albums_count = 0;
 static subsonic_song_t * subsonic_songs_cache = NULL;
 static int subsonic_songs_count = 0;
+static subsonic_playlist_t * subsonic_playlists_cache = NULL;
+static int subsonic_playlists_count = 0;
 
+static lv_obj_t * subsonic_menu_screen;
+static lv_obj_t * subsonic_menu_title_label;
+static lv_obj_t * subsonic_menu_list;
 static lv_obj_t * subsonic_artists_screen;
 static lv_obj_t * subsonic_artists_title_label;
 static lv_obj_t * subsonic_artists_list;
 static lv_obj_t * subsonic_albums_screen;
 static lv_obj_t * subsonic_albums_title_label;
 static lv_obj_t * subsonic_albums_list;
+static lv_obj_t * subsonic_albums_download_btn;
 static lv_obj_t * subsonic_songs_screen;
 static lv_obj_t * subsonic_songs_title_label;
 static lv_obj_t * subsonic_songs_list;
+static lv_obj_t * subsonic_songs_download_btn;
+static lv_obj_t * subsonic_playlists_screen;
+static lv_obj_t * subsonic_playlists_title_label;
+static lv_obj_t * subsonic_playlists_list;
 static lv_obj_t * subsonic_saved_servers_screen;
 static lv_obj_t * subsonic_saved_servers_list;
 static lv_obj_t * subsonic_new_connection_screen;
 
+/* Subsonic screen redesign: subsonic_albums_screen is reused both for "one
+ * artist's albums" (reached from Artists) and "every album on the server"
+ * (reached from the new Albums menu row, via subsonic_get_all_albums()) --
+ * same list shape, same tap-to-see-songs destination either way. The
+ * Download button (top of "an Artist page", per the feature request) only
+ * makes sense for the former -- downloading "all albums in the whole
+ * library" is a much bigger, likely-unintended operation nobody asked for
+ * -- so this tracks which case is currently showing: non-empty when it's
+ * one artist's albums (holds that artist's name, both to gate the button
+ * and to label the download's progress screen), empty for the flat
+ * top-level list. Set by whichever click handler populates the screen. */
+static char subsonic_albums_context_artist[128] = "";
+
+/* subsonic_songs_screen is reused for "one album's songs" (Download creates
+ * no playlist file) and "one playlist's songs" (Download also creates a
+ * local .m3u alongside the downloaded files) -- this tracks which, and the
+ * playlist's own name when it's the latter. Set by whichever click handler
+ * populates the screen. */
+static bool subsonic_songs_context_is_playlist = false;
+static char subsonic_songs_context_playlist_name[128] = "";
+
 static const char * subsonic_artist_label_of(int i) { return subsonic_artists_cache[i].name; }
 static const char * subsonic_album_label_of(int i) { return subsonic_albums_cache[i].name; }
 static const char * subsonic_song_label_of(int i) { return subsonic_songs_cache[i].title; }
+static const char * subsonic_playlist_label_of(int i) { return subsonic_playlists_cache[i].name; }
 
 /* Real-device bug report: connecting to a Subsonic (Navidrome) server and
  * selecting a song crashed the player instead of playing it. Root cause:
@@ -5815,7 +6833,9 @@ static void subsonic_album_row_click_cb(lv_event_t * e) {
     subsonic_songs_count = 0;
     if (!subsonic_get_album_songs(&server, subsonic_albums_cache[index].id, &subsonic_songs_cache, &subsonic_songs_count)) return;
 
+    subsonic_songs_context_is_playlist = false; /* an album's Download button never creates an .m3u -- see subsonic_download_songs_btn_cb() */
     lv_label_set_text(subsonic_songs_title_label, subsonic_albums_cache[index].name);
+    lv_obj_clear_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
     populate_indexed_list(subsonic_songs_list, subsonic_songs_count, subsonic_song_label_of, subsonic_song_row_click_cb);
     nav_push(subsonic_songs_screen);
 }
@@ -5830,9 +6850,116 @@ static void subsonic_artist_row_click_cb(lv_event_t * e) {
     subsonic_albums_count = 0;
     if (!subsonic_get_artist_albums(&server, subsonic_artists_cache[index].id, &subsonic_albums_cache, &subsonic_albums_count)) return;
 
+    /* Non-empty -- this is "an Artist page" (one artist's albums), so its
+     * Download button (downloads every song across every album shown here)
+     * is meaningful; see subsonic_albums_context_artist's own comment. */
+    snprintf(subsonic_albums_context_artist, sizeof(subsonic_albums_context_artist), "%s", subsonic_artists_cache[index].name);
     lv_label_set_text(subsonic_albums_title_label, subsonic_artists_cache[index].name);
+    lv_obj_clear_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
     populate_indexed_list(subsonic_albums_list, subsonic_albums_count, subsonic_album_label_of, subsonic_album_row_click_cb);
     nav_push(subsonic_albums_screen);
+}
+
+/* ---- Subsonic screen redesign: Playlists (new top-level menu row) and the
+ * flat "every album in the library" Albums row -- both reuse existing
+ * screens/caches (subsonic_songs_screen and subsonic_albums_screen
+ * respectively) rather than needing screens of their own, since a
+ * playlist's songs and an album's songs are shown identically, and the flat
+ * album list is shown identically to one artist's album list. ---- */
+
+static void subsonic_playlist_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+
+    subsonic_server_t server = subsonic_server_from_settings();
+    free(subsonic_songs_cache);
+    subsonic_songs_cache = NULL;
+    subsonic_songs_count = 0;
+    if (!subsonic_get_playlist_songs(&server, subsonic_playlists_cache[index].id, &subsonic_songs_cache, &subsonic_songs_count)) return;
+
+    subsonic_songs_context_is_playlist = true; /* this page's Download button also creates a local .m3u -- see subsonic_download_songs_btn_cb() */
+    snprintf(subsonic_songs_context_playlist_name, sizeof(subsonic_songs_context_playlist_name), "%s",
+             subsonic_playlists_cache[index].name);
+    lv_label_set_text(subsonic_songs_title_label, subsonic_playlists_cache[index].name);
+    lv_obj_clear_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
+    populate_indexed_list(subsonic_songs_list, subsonic_songs_count, subsonic_song_label_of, subsonic_song_row_click_cb);
+    nav_push(subsonic_songs_screen);
+}
+
+static void subsonic_menu_artists_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    /* Already fetched/populated at connect time (poll_subsonic_connect()) --
+     * no re-fetch needed here, matching every other "browse from cache"
+     * screen entry in this app. */
+    nav_push(subsonic_artists_screen);
+}
+
+static void subsonic_menu_playlists_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    subsonic_server_t server = subsonic_server_from_settings();
+    free(subsonic_playlists_cache);
+    subsonic_playlists_cache = NULL;
+    subsonic_playlists_count = 0;
+    if (!subsonic_get_playlists(&server, &subsonic_playlists_cache, &subsonic_playlists_count)) return;
+
+    populate_indexed_list(subsonic_playlists_list, subsonic_playlists_count, subsonic_playlist_label_of,
+                           subsonic_playlist_row_click_cb);
+    nav_push(subsonic_playlists_screen);
+}
+
+static void subsonic_menu_albums_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    subsonic_server_t server = subsonic_server_from_settings();
+    free(subsonic_albums_cache);
+    subsonic_albums_cache = NULL;
+    subsonic_albums_count = 0;
+    if (!subsonic_get_all_albums(&server, &subsonic_albums_cache, &subsonic_albums_count)) return;
+
+    /* Empty -- this is the flat, whole-library album list, not "an Artist
+     * page," so no Download-everything button (see subsonic_albums_context_
+     * artist's own comment for why that distinction matters). */
+    subsonic_albums_context_artist[0] = '\0';
+    lv_label_set_text(subsonic_albums_title_label, "Albums");
+    lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
+    populate_indexed_list(subsonic_albums_list, subsonic_albums_count, subsonic_album_label_of, subsonic_album_row_click_cb);
+    nav_push(subsonic_albums_screen);
+}
+
+/* Top-of-screen Download button shared by subsonic_songs_screen (an
+ * album's or a playlist's songs -- see subsonic_songs_context_is_playlist)
+ * -- downloads exactly what's currently shown, into the local library. */
+static void subsonic_download_songs_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (subsonic_songs_count == 0) return;
+
+    subsonic_song_t * songs_copy = malloc(sizeof(subsonic_song_t) * (size_t) subsonic_songs_count);
+    memcpy(songs_copy, subsonic_songs_cache, sizeof(subsonic_song_t) * (size_t) subsonic_songs_count);
+
+    const char * playlist_name = subsonic_songs_context_is_playlist ? subsonic_songs_context_playlist_name : NULL;
+    char label[192];
+    snprintf(label, sizeof(label), "Downloading\n%s...", lv_label_get_text(subsonic_songs_title_label));
+    start_subsonic_library_download(songs_copy, subsonic_songs_count, NULL, 0, playlist_name, label);
+}
+
+/* Top-of-screen Download button on subsonic_albums_screen, active only when
+ * it's showing "an Artist page" (see subsonic_albums_context_artist) --
+ * downloads every song across every album currently listed. Hands the
+ * thread the album list itself (Mode B, see subsonic_library_download_
+ * request_t's own comment) rather than pre-fetching every album's songs
+ * here on the UI thread first, since that could be a lot of sequential
+ * network round trips for an artist with many albums. */
+static void subsonic_download_artist_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (subsonic_albums_context_artist[0] == '\0' || subsonic_albums_count == 0) return;
+
+    subsonic_album_t * albums_copy = malloc(sizeof(subsonic_album_t) * (size_t) subsonic_albums_count);
+    memcpy(albums_copy, subsonic_albums_cache, sizeof(subsonic_album_t) * (size_t) subsonic_albums_count);
+
+    char label[192];
+    snprintf(label, sizeof(label), "Downloading\n%s...", subsonic_albums_context_artist);
+    start_subsonic_library_download(NULL, 0, albums_copy, subsonic_albums_count, NULL, label);
 }
 
 /* Ping + getArtists run on the same background-thread-plus-polled-flag
@@ -5917,8 +7044,14 @@ static void poll_subsonic_connect(void) {
         metadata_db_subsonic_server_save(subsonic_connect_pending_server.base_url, subsonic_connect_pending_server.username,
                                           subsonic_connect_pending_server.password, subsonic_connect_pending_server.verify_tls);
 
+        /* Subsonic screen redesign: lands on a menu (Artists/Playlists/
+         * Albums) rather than jumping straight into the artist list --
+         * getArtists is still fetched right here as part of connecting
+         * (below), so tapping Artists from the menu is instant with no
+         * extra round trip; Playlists/Albums fetch lazily on their own tap,
+         * same as every other drill-down in this screen already does. */
         populate_indexed_list(subsonic_artists_list, subsonic_artists_count, subsonic_artist_label_of, subsonic_artist_row_click_cb);
-        nav_push(subsonic_artists_screen);
+        nav_push(subsonic_menu_screen);
     }
     if (nav_depth > depth_before) {
         nav_remove_stack_slot(depth_before - 1);
@@ -6285,6 +7418,76 @@ static lv_obj_t * playlists_list;
 static char ** playlists_m3u_paths = NULL;
 static int playlists_m3u_count = 0;
 
+static int * playlist_m3u_song_indices = NULL;
+static group_t playlist_m3u_group;
+
+/* Maps paths/count (an m3u's contents, straight from file_browser_build_
+ * playlist_from_m3u()) onto playlist_m3u_group.indices/count -- the same
+ * path-to-library-index resolution show_favorites()/show_most_played() do,
+ * since show_group_songs()/show_group_songs_editable() operate on library
+ * indices, not raw paths. An m3u entry that isn't part of the currently-
+ * scanned library (stale entry, or added since the last rescan) is silently
+ * skipped, same tolerance those two already have. name is optional (NULL
+ * leaves playlist_m3u_group.name as whatever it already was) -- the remove
+ * callback below reuses this after a removal without needing to re-pass the
+ * still-unchanged display name. Shared by show_m3u_playlist() (initial
+ * entry) and group_song_remove_row_cb() (refresh in place after a removal). */
+static void rebuild_playlist_m3u_group(const char * name, char ** paths, int count) {
+    free(playlist_m3u_song_indices);
+    playlist_m3u_song_indices = count > 0 ? malloc(sizeof(int) * (size_t) count) : NULL;
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        int idx = find_song_index_by_path(paths[i]);
+        if (idx >= 0) playlist_m3u_song_indices[found++] = idx;
+    }
+
+    if (name) snprintf(playlist_m3u_group.name, sizeof(playlist_m3u_group.name), "%s", name);
+    playlist_m3u_group.indices = playlist_m3u_song_indices;
+    playlist_m3u_group.count = found;
+}
+
+/* Shows an .m3u's contents the same way Favorites/Most Played do -- a
+ * tappable song list (show_group_songs_editable()), not straight into
+ * playback -- rather than the old behavior of jumping directly to track 0
+ * the moment the playlist row itself was tapped, matching every other entry
+ * point into a group of songs elsewhere in this screen (Artists/Albums/
+ * Album Artist all list first too). m3u_path is passed through as the
+ * editable-playlist marker so the Edit/remove UI (group_songs_edit_m3u_path,
+ * see its own comment) only ever shows up here, not for Favorites/Most
+ * Played/Artists/Albums. */
+static void show_m3u_playlist(const char * name, const char * m3u_path, char ** paths, int count) {
+    rebuild_playlist_m3u_group(name, paths, count);
+    show_group_songs_editable(&playlist_m3u_group, m3u_path);
+}
+
+/* Remove-icon handler for an editable playlist's rows (see
+ * populate_group_songs_rows() -- forward-declared near
+ * group_songs_edit_m3u_path). Rewrites the underlying .m3u file, then
+ * re-reads it back and redraws in place (no nav_push -- this stays on the
+ * same group_songs_screen instance, just with the file's new contents)
+ * rather than trusting the in-memory indices array to still match the file
+ * after the rewrite. */
+static void group_song_remove_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int pos = (int) (intptr_t) lv_event_get_user_data(e);
+    if (!group_songs_edit_m3u_path || pos < 0 || pos >= group_songs_count) return;
+
+    const char * m3u_path = group_songs_edit_m3u_path;
+    playlist_files_remove(m3u_path, all_songs_paths[group_songs_indices[pos]]);
+
+    char ** songs = NULL;
+    int count = 0;
+    file_browser_build_playlist_from_m3u(m3u_path, &songs, &count); /* false (empty playlist) leaves songs/count at 0 -- rebuild below handles that fine */
+    rebuild_playlist_m3u_group(NULL, songs, count);
+    for (int i = 0; i < count; i++) free(songs[i]);
+    free(songs);
+
+    group_songs_indices = playlist_m3u_group.indices;
+    group_songs_count = playlist_m3u_group.count;
+    populate_group_songs_rows();
+    show_error_toast("Removed from playlist");
+}
+
 static void playlist_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
@@ -6307,7 +7510,9 @@ static void playlist_row_click_cb(lv_event_t * e) {
         show_error_toast("Playlist is empty or unreadable");
         return;
     }
-    on_file_selected(songs, count, 0);
+    show_m3u_playlist(basename_of(playlists_m3u_paths[m3u_index]), playlists_m3u_paths[m3u_index], songs, count);
+    for (int i = 0; i < count; i++) free(songs[i]);
+    free(songs);
 }
 
 static void populate_playlists_screen(void) {
@@ -6441,6 +7646,17 @@ static void poll_library_rescan(void) {
     library_rescan_success_since_tick = lv_tick_get();
 }
 
+/* SD mount-failure detection + Format SD Card -- see poll_sd_card_hotplug()
+ * below for the detection/debounce logic and sd_format_card_worker() further
+ * down for the actual format sequence. These three are declared here
+ * (rather than alongside their real definitions further down) so that both
+ * halves of the feature -- the gated detection logic below, and the
+ * ungated popups/background thread that come after it in this file -- can
+ * see them regardless of which one is defined first. */
+static void show_sd_mount_failed_popup(void); /* defined below, alongside its popup */
+static bool sd_mount_fail_notified = false;
+static volatile bool sd_format_active = false;
+
 #ifndef HOST_BUILD
 /* Real-device bug report: reinserting the SD card while the device is
  * already on doesn't populate its files in the player. Root cause -- see
@@ -6466,14 +7682,71 @@ static void poll_library_rescan(void) {
  * comment: it just fails silently). On the unmounted -> mounted edge, it
  * kicks off the same rescan Settings > Update Music Database triggers, so
  * a card inserted after boot actually shows up without the user needing
- * to know to go find that button. */
+ * to know to go find that button.
+ *
+ * Real-device feature request (2026-08-08): removal wasn't handled at all
+ * symmetrically -- pulling the card left All Songs/Artists/Albums/
+ * Playlists, and the Files screen, still showing entries for files that no
+ * longer exist (tapping one would just fail to play), and there was no way
+ * back to a correct state short of a manual Settings > Update Music
+ * Database rescan. The mounted -> unmounted edge below now fires the same
+ * rescan (correctly collapsing to an empty library against an empty
+ * mountpoint) plus a Files-screen reset, mirroring the insertion side.
+ *
+ * That edge relies on sd_card_root_is_mounted() actually flipping to false
+ * on a physical eject, which isn't guaranteed on its own: this firmware has
+ * no hotplug mechanism at all for this slot (see above), so nothing ever
+ * calls umount() when the card is pulled -- the VFS mount entry for
+ * MUSIC_ROOT_DIR can just sit there claiming to still be mounted (same
+ * st_dev) with reads underneath it now failing at the I/O layer instead.
+ * sd_card_device_node_present() checks for the card's block device node
+ * separately -- mdev creates/removes /dev/mmcblk0p1 directly off the
+ * kernel's own uevents for the mmc host controller's card-detect line, a
+ * baseline mdev behavior independent of the custom per-device *rules*
+ * mdev.conf lacks for mmcblk* (those only add extra actions on top, they're
+ * not what makes the node itself appear/disappear) -- so the node going
+ * away is a real, kernel-driven signal of physical removal even though
+ * nothing above the block layer reacts to it. When it disappears while
+ * still nominally mounted, this self-issues the same `umount` this
+ * firmware's own mass_storage_removing.sh uses for external USB media, so
+ * the ordinary mounted -> unmounted edge below fires correctly on the very
+ * next poll instead of never firing at all. Unverified against a real
+ * eject on this exact device/kernel at the time this was written (no live
+ * unit on hand) -- flagged for a real removal-cycle test rather than
+ * asserted as confirmed working. */
 #define SD_CARD_MOUNT_POLL_SECONDS 5
+
+/* Consecutive failed poll cycles (SD_CARD_MOUNT_POLL_SECONDS apart) before
+ * the mount-failure popup shows -- 6 * 5s = 30s of genuinely stuck retries,
+ * matching this file's own LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS in spirit
+ * (long enough that the kernel's own brief card-enumeration window right
+ * after physical insertion can't false-positive, short enough the user
+ * isn't left staring at an empty library wondering what's wrong). */
+#define SD_MOUNT_FAIL_STREAK_THRESHOLD 6
 
 static bool sd_card_root_is_mounted(void) {
     struct stat parent_st, root_st;
     if (stat("/data/mnt", &parent_st) != 0) return false;
     if (stat(MUSIC_ROOT_DIR, &root_st) != 0) return false;
     return parent_st.st_dev != root_st.st_dev;
+}
+
+static bool sd_card_device_node_present(void) {
+    struct stat st;
+    return stat("/dev/mmcblk0p1", &st) == 0;
+}
+
+/* Whole-disk node, as opposed to sd_card_device_node_present()'s first-
+ * partition node above -- present whenever a card is physically inserted
+ * regardless of whether it has a partition table at all, so this is what
+ * distinguishes "no card" from "card inserted but can't be mounted" for the
+ * mount-failure/Format SD Card flow below (mount_sd_card_if_needed() itself
+ * -- see main.c -- already tries every filesystem type this platform
+ * actually supports, so a card that's physically present but still never
+ * mounts genuinely needs a repartition/reformat, not just a different -t). */
+static bool sd_card_base_device_present(void) {
+    struct stat st;
+    return stat("/dev/mmcblk0", &st) == 0;
 }
 
 static void poll_sd_card_hotplug(void) {
@@ -6487,20 +7760,67 @@ static void poll_sd_card_hotplug(void) {
      * retrying/rescanning from there. */
     static bool was_mounted = true;
     static time_t last_check = 0;
+    static int mount_fail_streak = 0;
 
     time_t now = time(NULL);
     if (last_check != 0 && now - last_check < SD_CARD_MOUNT_POLL_SECONDS) return;
     last_check = now;
 
     bool mounted = sd_card_root_is_mounted();
+    if (mounted && !sd_card_device_node_present()) {
+        /* -l (lazy): the node's already gone, so there's no real device
+         * left to flush to, and a plain umount would fail with EBUSY if
+         * this app (or anything else) still has an fd open on a file under
+         * MUSIC_ROOT_DIR from right before the card was pulled -- the same
+         * reasoning mass_storage_removing.sh already applies to external
+         * USB media on this firmware (see its own "umount -l" call). */
+        char * argv[] = { (char *) "umount", (char *) "-l", (char *) MUSIC_ROOT_DIR, NULL };
+        subprocess_run(argv, NULL, 0);
+        mounted = false;
+    }
+
     if (!mounted) {
         mount_sd_card_if_needed();
+        if (was_mounted && !library_rescan_active) {
+            start_library_rescan();
+            file_browser_reset_to_root();
+        }
         was_mounted = false;
+
+        /* Card is physically there (the whole-disk node exists) but still
+         * won't mount after repeated retries -- either it never got the
+         * /dev/mmcblk0p1 partition node at all (no partition table, or a
+         * "superfloppy" filesystem written straight to the raw disk with
+         * no MBR) or that partition exists but holds something none of
+         * mount_sd_card_if_needed()'s filesystem attempts could mount
+         * (corruption, or a filesystem this platform genuinely doesn't
+         * support). Both need the same fix -- reformat -- so this doesn't
+         * try to tell them apart. Debounced (SD_MOUNT_FAIL_STREAK_THRESHOLD
+         * consecutive failed polls, SD_CARD_MOUNT_POLL_SECONDS apart) so
+         * the kernel's own brief card-enumeration window right after
+         * physical insertion -- where the node legitimately isn't there
+         * *yet* -- doesn't fire a false alarm; not re-shown on every poll
+         * once shown once (sd_mount_fail_notified), so the user isn't
+         * nagged again until the card actually changes (removed, or a
+         * format attempt runs -- both reset it below/in poll_sd_format()). */
+        if (sd_card_base_device_present()) {
+            mount_fail_streak++;
+            if (mount_fail_streak >= SD_MOUNT_FAIL_STREAK_THRESHOLD && !sd_mount_fail_notified && !sd_format_active) {
+                sd_mount_fail_notified = true;
+                show_sd_mount_failed_popup();
+            }
+        } else {
+            mount_fail_streak = 0;
+            sd_mount_fail_notified = false;
+        }
         return;
     }
 
+    mount_fail_streak = 0;
+    sd_mount_fail_notified = false;
     if (!was_mounted && !library_rescan_active) {
         start_library_rescan();
+        file_browser_reset_to_root();
     }
     was_mounted = true;
 }
@@ -6508,6 +7828,319 @@ static void poll_sd_card_hotplug(void) {
 static void poll_sd_card_hotplug(void) {
 }
 #endif
+
+/* Actual "Format SD Card" sequence -- runs on a background thread (see
+ * start_sd_format()/poll_sd_format() below), since fdisk/mkdosfs can take
+ * real time on a slow card and this must never block the UI thread.
+ *
+ * UNVERIFIED ON REAL HARDWARE. Every command here was chosen from static
+ * analysis of the real firmware's own busybox binary (`strings` confirmed
+ * mkdosfs/fdisk/dd/umount/partprobe are all compiled-in applets, including
+ * fdisk's own interactive prompt text, proving a standard util-linux-style
+ * command menu), not from an actual run -- this is a MIPS binary and can't
+ * be executed on the dev host, and no live device was available while this
+ * was written. Test with a spare/non-critical card before trusting it with
+ * a card that matters.
+ *
+ * Sequence: best-effort unmount, zero the first sector (so fdisk always
+ * sees a blank disk regardless of whatever partition table, or lack of
+ * one, the card came in with -- avoids needing to conditionally script
+ * fdisk's own delete-partition flow for "already has a stale/foreign
+ * table"), script fdisk to create one primary partition spanning the whole
+ * disk typed W95 FAT32 (LBA), partprobe to force the kernel to notice the
+ * new partition, wait for its device node to appear, mkdosfs it, then hand
+ * off to the normal mount path and confirm it actually mounted. */
+#ifndef HOST_BUILD
+static bool sd_format_card_worker(void) {
+    char * umount_argv[] = { (char *) "umount", (char *) "-l", (char *) MUSIC_ROOT_DIR, NULL };
+    subprocess_run(umount_argv, NULL, 0);
+
+    if (!sd_card_base_device_present()) return false; /* card pulled before/during format */
+
+    char * dd_argv[] = { (char *) "dd", (char *) "if=/dev/zero", (char *) "of=/dev/mmcblk0",
+                          (char *) "bs=512", (char *) "count=1", NULL };
+    if (!subprocess_run_timeout(dd_argv, NULL, 0, 15000)) return false;
+
+    pid_t fdisk_pid;
+    int fdisk_write_fd;
+    char * fdisk_argv[] = { (char *) "fdisk", (char *) "/dev/mmcblk0", NULL };
+    if (!subprocess_popen_stdin(fdisk_argv, &fdisk_pid, &fdisk_write_fd)) return false;
+    /* n(ew) -> p(rimary) -> partition 1 -> default first sector [Enter] ->
+     * default last sector [Enter] -> t(ype) -> c (W95 FAT32, LBA) -> w(rite)+exit. */
+    const char * fdisk_cmds = "n\np\n1\n\n\nt\nc\nw\n";
+    ssize_t ignored = write(fdisk_write_fd, fdisk_cmds, strlen(fdisk_cmds));
+    (void) ignored;
+    close(fdisk_write_fd);
+    subprocess_terminate(fdisk_pid); /* reaps it -- `w` alone isn't guaranteed to have taken effect yet */
+
+    char * partprobe_argv[] = { (char *) "partprobe", (char *) "/dev/mmcblk0", NULL };
+    subprocess_run_timeout(partprobe_argv, NULL, 0, 10000);
+
+    bool got_partition = false;
+    for (int i = 0; i < 20 && !got_partition; i++) {
+        if (sd_card_device_node_present()) { got_partition = true; break; }
+        usleep(250000);
+    }
+    if (!got_partition) return false;
+
+    char * mkdosfs_argv[] = { (char *) "mkdosfs", (char *) "-F", (char *) "32", (char *) "-n",
+                               (char *) "MUSIC", (char *) "/dev/mmcblk0p1", NULL };
+    if (!subprocess_run_timeout(mkdosfs_argv, NULL, 0, 120000)) return false;
+
+    mount_sd_card_if_needed();
+    return sd_card_root_is_mounted();
+}
+#else
+static bool sd_format_card_worker(void) {
+    return false;
+}
+#endif
+
+static pthread_t sd_format_thread;
+static volatile bool sd_format_done_flag = false;
+static volatile bool sd_format_succeeded = false;
+
+static void * sd_format_thread_func(void * arg) {
+    (void) arg;
+    sd_format_succeeded = sd_format_card_worker();
+    sd_format_done_flag = true; /* written last -- poll_sd_format() only checks this flag */
+    return NULL;
+}
+
+static void start_sd_format(void) {
+    sd_format_done_flag = false;
+    sd_format_active = true;
+    lv_label_set_text(subsonic_downloading_label, "Formatting\nSD Card...");
+    lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN); /* no meaningful sub-progress to show */
+    nav_push(subsonic_downloading_screen);
+    pthread_create(&sd_format_thread, NULL, sd_format_thread_func, NULL);
+}
+
+static void poll_sd_format(void) {
+    if (!sd_format_active || !sd_format_done_flag) return;
+
+    sd_format_active = false;
+    pthread_join(sd_format_thread, NULL);
+    nav_pop(); /* leave the "Formatting SD Card..." screen */
+
+    if (sd_format_succeeded) {
+        show_error_toast("SD card formatted");
+        sd_mount_fail_notified = false; /* give the freshly-formatted card a clean slate */
+        if (!library_rescan_active) {
+            start_library_rescan();
+            file_browser_reset_to_root();
+        }
+    } else {
+        show_error_toast("SD card format failed");
+    }
+}
+
+static lv_obj_t * sd_mount_failed_popup;
+static lv_obj_t * sd_mount_failed_popup_backdrop;
+static lv_obj_t * sd_format_confirm_popup;
+static lv_obj_t * sd_format_confirm_popup_backdrop;
+
+static void hide_sd_mount_failed_popup(void) {
+    lv_obj_add_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(sd_mount_failed_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void hide_sd_format_confirm_popup(void) {
+    lv_obj_add_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(sd_format_confirm_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void sd_mount_failed_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_sd_mount_failed_popup();
+}
+
+static void sd_mount_failed_dismiss_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_sd_mount_failed_popup();
+}
+
+static void sd_format_confirm_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_sd_format_confirm_popup();
+}
+
+static void sd_format_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_sd_format_confirm_popup();
+}
+
+static void sd_mount_failed_format_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_sd_mount_failed_popup();
+    lv_obj_remove_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(sd_format_confirm_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(sd_format_confirm_popup_backdrop);
+    lv_obj_move_foreground(sd_format_confirm_popup);
+}
+
+static void sd_format_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_sd_format_confirm_popup();
+    start_sd_format();
+}
+
+/* Only ever shown from the debounced detection in poll_sd_card_hotplug()
+ * above -- deliberately has no permanent home in Settings, so it can't be
+ * used to format a perfectly working card by mistake; it only exists at
+ * all once a real, sustained mount failure has actually been observed. */
+static void show_sd_mount_failed_popup(void) {
+    lv_obj_remove_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(sd_mount_failed_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(sd_mount_failed_popup_backdrop);
+    lv_obj_move_foreground(sd_mount_failed_popup);
+}
+
+static void build_sd_mount_failed_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    sd_mount_failed_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(sd_mount_failed_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(sd_mount_failed_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(sd_mount_failed_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(sd_mount_failed_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(sd_mount_failed_popup_backdrop, sd_mount_failed_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    sd_mount_failed_popup = lv_obj_create(top);
+    lv_obj_set_size(sd_mount_failed_popup, 400, 300);
+    lv_obj_align(sd_mount_failed_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(sd_mount_failed_popup, 16, 0);
+    lv_obj_set_style_bg_color(sd_mount_failed_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(sd_mount_failed_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(sd_mount_failed_popup, 0, 0);
+    lv_obj_remove_flag(sd_mount_failed_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(sd_mount_failed_popup, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * title = lv_label_create(sd_mount_failed_popup);
+    lv_obj_set_width(title, lv_pct(90));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_label_set_text(title, "SD card couldn't be read");
+
+    lv_obj_t * body = lv_label_create(sd_mount_failed_popup);
+    lv_obj_set_width(body, lv_pct(90));
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(body, lv_color_make(180, 180, 180), 0);
+    lv_obj_set_style_text_font(body, ui_size_16, 0);
+    lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 58);
+    lv_label_set_text(body,
+        "It may have no partition table or a file system this player can't use. "
+        "Formatting will erase it and set it up for this player.");
+
+    lv_obj_t * format_row = lv_obj_create(sd_mount_failed_popup);
+    lv_obj_set_size(format_row, lv_pct(90), 56);
+    lv_obj_align(format_row, LV_ALIGN_TOP_MID, 0, 156);
+    lv_obj_set_style_radius(format_row, 12, 0);
+    lv_obj_set_style_bg_opa(format_row, 0, 0);
+    lv_obj_set_style_border_width(format_row, 0, 0);
+    lv_obj_remove_flag(format_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(format_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(format_row, sd_mount_failed_format_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * format_label = lv_label_create(format_row);
+    lv_label_set_text(format_label, "Format SD Card");
+    lv_obj_set_style_text_color(format_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(format_label, ui_size_20, 0);
+    lv_obj_center(format_label);
+
+    lv_obj_t * dismiss_row = lv_obj_create(sd_mount_failed_popup);
+    lv_obj_set_size(dismiss_row, lv_pct(90), 56);
+    lv_obj_align(dismiss_row, LV_ALIGN_TOP_MID, 0, 222);
+    lv_obj_set_style_radius(dismiss_row, 12, 0);
+    lv_obj_set_style_bg_opa(dismiss_row, 0, 0);
+    lv_obj_set_style_border_width(dismiss_row, 0, 0);
+    lv_obj_remove_flag(dismiss_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(dismiss_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(dismiss_row, sd_mount_failed_dismiss_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * dismiss_label = lv_label_create(dismiss_row);
+    lv_label_set_text(dismiss_label, "Dismiss");
+    lv_obj_set_style_text_color(dismiss_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(dismiss_label, ui_size_20, 0);
+    lv_obj_center(dismiss_label);
+}
+
+static void build_sd_format_confirm_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    sd_format_confirm_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(sd_format_confirm_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(sd_format_confirm_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(sd_format_confirm_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(sd_format_confirm_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(sd_format_confirm_popup_backdrop, sd_format_confirm_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    sd_format_confirm_popup = lv_obj_create(top);
+    lv_obj_set_size(sd_format_confirm_popup, 400, 260);
+    lv_obj_align(sd_format_confirm_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(sd_format_confirm_popup, 16, 0);
+    lv_obj_set_style_bg_color(sd_format_confirm_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(sd_format_confirm_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(sd_format_confirm_popup, 0, 0);
+    lv_obj_remove_flag(sd_format_confirm_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(sd_format_confirm_popup, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * title = lv_label_create(sd_format_confirm_popup);
+    lv_obj_set_width(title, lv_pct(90));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_label_set_text(title, "Erase and format SD card?");
+
+    lv_obj_t * body = lv_label_create(sd_format_confirm_popup);
+    lv_obj_set_width(body, lv_pct(90));
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(body, lv_color_make(180, 180, 180), 0);
+    lv_obj_set_style_text_font(body, ui_size_16, 0);
+    lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 58);
+    lv_label_set_text(body, "This permanently deletes everything on the card. This cannot be undone.");
+
+    lv_obj_t * confirm_row = lv_obj_create(sd_format_confirm_popup);
+    lv_obj_set_size(confirm_row, lv_pct(90), 56);
+    lv_obj_align(confirm_row, LV_ALIGN_TOP_MID, 0, 116);
+    lv_obj_set_style_radius(confirm_row, 12, 0);
+    lv_obj_set_style_bg_opa(confirm_row, 0, 0);
+    lv_obj_set_style_border_width(confirm_row, 0, 0);
+    lv_obj_remove_flag(confirm_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(confirm_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(confirm_row, sd_format_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * confirm_label = lv_label_create(confirm_row);
+    lv_label_set_text(confirm_label, "Format");
+    lv_obj_set_style_text_color(confirm_label, lv_color_make(255, 120, 120), 0);
+    lv_obj_set_style_text_font(confirm_label, ui_size_20, 0);
+    lv_obj_center(confirm_label);
+
+    lv_obj_t * cancel_row = lv_obj_create(sd_format_confirm_popup);
+    lv_obj_set_size(cancel_row, lv_pct(90), 56);
+    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 182);
+    lv_obj_set_style_radius(cancel_row, 12, 0);
+    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
+    lv_obj_set_style_border_width(cancel_row, 0, 0);
+    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cancel_row, sd_format_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * cancel_label = lv_label_create(cancel_row);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_center(cancel_label);
+}
 
 static void update_music_database_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -8465,10 +10098,12 @@ static void populate_import_wifi_screen(void) {
  * shape. Real-device feedback: a full rescan used to run unconditionally on
  * every exit from this screen, even if the user never actually uploaded
  * anything (just looked at the QR code, or backed out immediately) --
- * wasteful on a real library, and gave no way to skip it. import_web_stop()
- * and nav_pop() both still happen unconditionally right away (leaving the
- * screen and tearing down the HTTP server is correct regardless of whether
- * a rescan follows); only the rescan itself is now behind this choice. */
+ * wasteful on a real library, and gave no way to skip it. Leaving the screen
+ * and tearing down the HTTP server (import_web_stop(), now backgrounded --
+ * see poll_import_web_stop()'s own comment) both still happen
+ * unconditionally regardless of the choice made here; only the rescan
+ * itself is behind it. This popup is shown once that teardown finishes,
+ * not right when back is tapped. */
 static lv_obj_t * import_rescan_popup;
 static lv_obj_t * import_rescan_popup_backdrop;
 
@@ -8556,14 +10191,64 @@ static void build_import_rescan_popup(void) {
     lv_obj_center(not_now_label);
 }
 
-static void import_wifi_back_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+/* Real-device feedback: leaving Import via Wi-Fi used to just hang -- no
+ * visible feedback at all -- for however long import_web_stop() took (its
+ * own comment: killall -9 across up to 8 process names, plus a bounded
+ * pgrep-polled wait for all of them to actually be reaped, up to ~500ms of
+ * genuine subprocess churn) before the screen finally changed, since that
+ * call used to run right on this UI-thread click handler. Same background-
+ * thread-plus-polled-done-flag shape as every other multi-hundred-ms
+ * operation in this file (start_wifi_connect()/poll_wifi_connect() is the
+ * closest match: same "push the shared busy screen, no numeric progress to
+ * show" shape), reusing subsonic_downloading_screen/_label rather than
+ * building new UI just for this one line of text. */
+static pthread_t import_web_stop_thread;
+static bool import_web_stop_active = false;
+static volatile bool import_web_stop_done_flag = false;
+/* Import via Wi-Fi screen's own stack slot, recorded right before the busy
+ * screen gets pushed on top of it -- spliced out via nav_remove_stack_slot()
+ * once teardown finishes (same pattern text_entry_commit()/
+ * poll_subsonic_download() already use), so backing out later lands on
+ * whatever was open before Import via Wi-Fi, not on this now-defunct
+ * "Closing Web Server..." screen or a stale extra copy of the screen
+ * underneath it. */
+static int import_web_stop_nav_slot = -1;
+
+static void * import_web_stop_thread_func(void * arg) {
+    (void) arg;
     import_web_stop();
-    nav_pop();
+    import_web_stop_done_flag = true; /* written last -- poll_import_web_stop() only checks this flag */
+    return NULL;
+}
+
+static void poll_import_web_stop(void) {
+    if (!import_web_stop_active || !import_web_stop_done_flag) return;
+
+    import_web_stop_active = false;
+    pthread_join(import_web_stop_thread, NULL);
+
+    if (import_web_stop_nav_slot >= 0 && import_web_stop_nav_slot < nav_depth) {
+        nav_remove_stack_slot(import_web_stop_nav_slot);
+    }
+    nav_pop(); /* leave the busy screen */
+    import_web_stop_nav_slot = -1;
+
     lv_obj_remove_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(import_rescan_popup, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(import_rescan_popup_backdrop);
     lv_obj_move_foreground(import_rescan_popup);
+}
+
+static void import_wifi_back_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    import_web_stop_nav_slot = nav_depth - 1; /* this screen's own slot, before pushing the busy screen on top of it */
+    lv_label_set_text(subsonic_downloading_label, "Closing\nWeb Server...");
+    nav_push(subsonic_downloading_screen);
+
+    import_web_stop_done_flag = false;
+    import_web_stop_active = true;
+    pthread_create(&import_web_stop_thread, NULL, import_web_stop_thread_func, NULL);
 }
 
 static lv_obj_t * build_import_wifi_screen(void) {
@@ -8779,7 +10464,13 @@ static lv_obj_t * build_wireless_screen(void) {
     items[1] = (icon_grid_item_t){ "wireless/bt.png", "wireless/bt_s.png", "Bluetooth", bt_tile_cb, NULL };
     items[2] = (icon_grid_item_t){ "wireless/airplay.png", "wireless/airplay_s.png", "AirPlay", airplay_tile_cb, NULL };
     items[3] = (icon_grid_item_t){ "wireless/dlna.png", "wireless/dlna_s.png", "DLNA", dlna_tile_cb, NULL };
-    items[4] = (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "HiBy Link", NULL, NULL };
+    /* Relabeled from the stock "HiBy Link" -- this project doesn't implement
+     * that proprietary protocol (see the remote-control design doc/plan for
+     * why: only partially recoverable from firmware strings, and only useful
+     * against HiBy's own closed-source app). "Open Link" is a placeholder
+     * name for this app's own future phone-remote-control feature; still no
+     * click handler (NULL) until that's actually built. */
+    items[4] = (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "Open Link", NULL, NULL };
     items[5] = (icon_grid_item_t){ "wireless/via.png", "wireless/via_s.png", "Import via Wi-Fi", import_wifi_tile_cb, NULL };
     lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6);
     finalize_screen_navigation(scr);
@@ -10738,9 +12429,57 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     subsonic_new_connection_screen = build_subsonic_new_connection_screen();
     subsonic_entry_screen = build_subsonic_entry_screen();
     subsonic_downloading_screen = build_subsonic_downloading_screen();
+
+    /* Subsonic screen redesign: the menu (Artists/Playlists/Albums) that's
+     * now the first screen after connecting -- see poll_subsonic_connect().
+     * Rows built once here, not repopulated per visit, since this list
+     * never changes. */
+    subsonic_menu_screen = build_subsonic_list_screen("Subsonic", &subsonic_menu_title_label, &subsonic_menu_list);
+    {
+        lv_obj_t * artists_row = add_pill_row_base(subsonic_menu_list, "Artists");
+        lv_obj_add_flag(artists_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(artists_row, subsonic_menu_artists_row_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t * playlists_row = add_pill_row_base(subsonic_menu_list, "Playlists");
+        lv_obj_add_flag(playlists_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(playlists_row, subsonic_menu_playlists_row_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t * albums_row = add_pill_row_base(subsonic_menu_list, "Albums");
+        lv_obj_add_flag(albums_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(albums_row, subsonic_menu_albums_row_cb, LV_EVENT_CLICKED, NULL);
+    }
+
     subsonic_artists_screen = build_subsonic_list_screen("Artists", &subsonic_artists_title_label, &subsonic_artists_list);
     subsonic_albums_screen = build_subsonic_list_screen("Albums", &subsonic_albums_title_label, &subsonic_albums_list);
     subsonic_songs_screen = build_subsonic_list_screen("Songs", &subsonic_songs_title_label, &subsonic_songs_list);
+    subsonic_playlists_screen = build_subsonic_list_screen("Playlists", &subsonic_playlists_title_label, &subsonic_playlists_list);
+
+    /* Top-of-screen Download buttons -- see subsonic_download_artist_btn_cb()/
+     * subsonic_download_songs_btn_cb() for what each actually downloads.
+     * Added directly onto the already-built screens (same pattern as
+     * build_wifi_screen()'s Rescan button) rather than threading a new
+     * parameter through build_subsonic_list_screen() itself, which ~20
+     * other, unrelated screens also share. Hidden by default -- shown only
+     * when the screen's own click handler determines it's actually
+     * applicable (an Artist page for the albums one; always for the songs
+     * one, whether it's an album or a playlist). */
+    subsonic_albums_download_btn = lv_label_create(subsonic_albums_screen);
+    lv_label_set_text(subsonic_albums_download_btn, "Download");
+    lv_obj_set_style_text_color(subsonic_albums_download_btn, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(subsonic_albums_download_btn, ui_size_20, 0);
+    lv_obj_align(subsonic_albums_download_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(subsonic_albums_download_btn, subsonic_download_artist_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    subsonic_songs_download_btn = lv_label_create(subsonic_songs_screen);
+    lv_label_set_text(subsonic_songs_download_btn, "Download");
+    lv_obj_set_style_text_color(subsonic_songs_download_btn, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(subsonic_songs_download_btn, ui_size_20, 0);
+    lv_obj_align(subsonic_songs_download_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(subsonic_songs_download_btn, subsonic_download_songs_btn_cb, LV_EVENT_CLICKED, NULL);
     wifi_screen = build_wifi_screen();
     wifi_info_screen = build_wifi_info_screen();
     wifi_dns_screen = build_wifi_dns_screen();
@@ -10771,6 +12510,8 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     eq_profiles_screen = build_eq_profiles_screen();
     build_eq_reset_popup();
     build_factory_reset_popup();
+    build_sd_mount_failed_popup();
+    build_sd_format_confirm_popup();
     build_firmware_update_popup();
     add_to_playlist_screen = build_add_to_playlist_screen();
     build_delete_song_popup();
@@ -10839,25 +12580,37 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 
     /* Real-device incident (2026-08-08): auto-resuming into a Subsonic
      * track (cached locally at SUBSONIC_STREAM_CACHE_DIR/stream.<suffix>,
-     * see gui.c's own comment there -- last_track points at that cache
-     * file, not a live stream URL, so this wasn't expected to touch the
-     * network at all) crashed and rebooted the device on a cold boot with
-     * no Wi-Fi connected yet. Not yet root-caused -- candidates include the
-     * cache file being a leftover partial/corrupt download from the
-     * previous session (killed mid-stream) that the decoder chokes on, or
-     * something else on this path unexpectedly blocking on network state.
-     * Disabled entirely (both auto_resume_enabled and car_mode_enabled,
-     * which forces this same path -- see their own settings-row comments)
-     * until root-caused: a crash-reboot loop on every cold boot is a worse
-     * outcome than just not resuming. Re-enable by flipping this back to 1
-     * once fixed -- and also re-add the "Auto-resume on launch" row and its
-     * auto_resume_switch_event_cb() to build_settings_screen() (removed
-     * entirely, not just left inert, after real-device feedback that a
-     * live-looking toggle for a feature that silently did nothing read as
-     * a regression -- see that function's own comment). */
-#define AUTO_RESUME_ON_LAUNCH_ENABLED 0
-#if AUTO_RESUME_ON_LAUNCH_ENABLED
-    if ((current_settings.auto_resume_enabled || current_settings.car_mode_enabled) && current_settings.last_track[0] != '\0') {
+     * see that macro's own comment further down -- last_track points at
+     * that cache file, not a live stream URL) crashed and rebooted the
+     * device on a cold boot with no Wi-Fi connected yet. Root cause was
+     * never fully pinned down -- candidates included the cache file being
+     * a leftover partial/corrupt download from a session killed mid-stream,
+     * or something else on this path unexpectedly touching network state
+     * -- so this whole path was disabled outright rather than resuming
+     * into a file of unknown safety on every single cold boot.
+     *
+     * Car Mode's rework back to poweroff+auto-resume (see its own comment
+     * above, in the update_timer_cb Car Mode block) needs this path
+     * working again, so it's re-enabled here with the guard that was
+     * actually missing before: last_track is skipped if it's inside
+     * SUBSONIC_STREAM_CACHE_DIR rather than a real library file. This can't
+     * rule out every possible cause of the original crash, but it removes
+     * the one concretely different thing about a Subsonic-cache resume
+     * versus a normal library-file resume -- this same path already worked
+     * fine for ordinary local files before that incident -- so it's the
+     * correct first fix to try rather than leaving auto-resume disabled
+     * for everyone over one still-unexplained edge case.
+     *
+     * Gated on car_mode_enabled only, NOT auto_resume_enabled -- that
+     * separate "resume on every launch" setting has had no UI toggle since
+     * this incident (its Settings row was removed entirely, not just left
+     * inert -- a live-looking toggle for a feature that silently did
+     * nothing read as a regression) and defaults to true, so wiring it back
+     * in here would silently auto-resume on EVERY cold boot for every
+     * user, not just those who deliberately opted into Car Mode's specific
+     * docking routine. */
+    if (current_settings.car_mode_enabled && current_settings.last_track[0] != '\0' &&
+        strncmp(current_settings.last_track, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) != 0) {
         char ** resume_playlist;
         int resume_count, resume_index;
         if (file_browser_build_playlist_for_path(current_settings.last_track, &resume_playlist, &resume_count, &resume_index)) {
@@ -10870,7 +12623,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
             play_track_at_from(resume_index, current_settings.last_position);
         }
     }
-#endif
 #ifndef HOST_BUILD
     boot_checkpoint("gui_init returning");
 #endif

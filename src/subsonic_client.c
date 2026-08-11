@@ -229,9 +229,109 @@ bool subsonic_get_album_songs(const subsonic_server_t * server, const char * alb
         snprintf(songs[i].id, sizeof(songs[i].id), "%s", json_str(song_item, "id", ""));
         snprintf(songs[i].title, sizeof(songs[i].title), "%s", json_str(song_item, "title", "(unknown)"));
         snprintf(songs[i].artist, sizeof(songs[i].artist), "%s", json_str(song_item, "artist", ""));
+        snprintf(songs[i].album, sizeof(songs[i].album), "%s", json_str(song_item, "album", ""));
         snprintf(songs[i].suffix, sizeof(songs[i].suffix), "%s", json_str(song_item, "suffix", "mp3"));
         songs[i].track = json_int(song_item, "track", 0);
         songs[i].duration_seconds = json_int(song_item, "duration", 0);
+        i++;
+    }
+
+    cJSON_Delete(root);
+    *out_songs = songs;
+    *out_count = count;
+    return count > 0;
+}
+
+bool subsonic_get_all_albums(const subsonic_server_t * server, subsonic_album_t ** out_albums, int * out_count) {
+    *out_albums = NULL;
+    *out_count = 0;
+
+    cJSON * root = NULL;
+    cJSON * resp = api_request(server, "getAlbumList2.view", "type=alphabeticalByName&size=500", &root);
+    if (!resp) return false;
+
+    cJSON * list_obj = cJSON_GetObjectItemCaseSensitive(resp, "albumList2");
+    cJSON * album_arr = cJSON_GetObjectItemCaseSensitive(list_obj, "album");
+    if (!cJSON_IsArray(album_arr)) { cJSON_Delete(root); return false; }
+
+    int count = cJSON_GetArraySize(album_arr);
+    subsonic_album_t * albums = malloc(sizeof(subsonic_album_t) * (size_t) (count > 0 ? count : 1));
+
+    int i = 0;
+    cJSON * album_item;
+    cJSON_ArrayForEach(album_item, album_arr) {
+        snprintf(albums[i].id, sizeof(albums[i].id), "%s", json_str(album_item, "id", ""));
+        snprintf(albums[i].name, sizeof(albums[i].name), "%s", json_str(album_item, "name", "(unknown)"));
+        snprintf(albums[i].artist, sizeof(albums[i].artist), "%s", json_str(album_item, "artist", ""));
+        i++;
+    }
+
+    cJSON_Delete(root);
+    *out_albums = albums;
+    *out_count = count;
+    return count > 0;
+}
+
+bool subsonic_get_playlists(const subsonic_server_t * server, subsonic_playlist_t ** out_playlists, int * out_count) {
+    *out_playlists = NULL;
+    *out_count = 0;
+
+    cJSON * root = NULL;
+    cJSON * resp = api_request(server, "getPlaylists.view", NULL, &root);
+    if (!resp) return false;
+
+    cJSON * list_obj = cJSON_GetObjectItemCaseSensitive(resp, "playlists");
+    cJSON * playlist_arr = cJSON_GetObjectItemCaseSensitive(list_obj, "playlist");
+    if (!cJSON_IsArray(playlist_arr)) { cJSON_Delete(root); return false; }
+
+    int count = cJSON_GetArraySize(playlist_arr);
+    subsonic_playlist_t * playlists = malloc(sizeof(subsonic_playlist_t) * (size_t) (count > 0 ? count : 1));
+
+    int i = 0;
+    cJSON * playlist_item;
+    cJSON_ArrayForEach(playlist_item, playlist_arr) {
+        snprintf(playlists[i].id, sizeof(playlists[i].id), "%s", json_str(playlist_item, "id", ""));
+        snprintf(playlists[i].name, sizeof(playlists[i].name), "%s", json_str(playlist_item, "name", "(unknown)"));
+        i++;
+    }
+
+    cJSON_Delete(root);
+    *out_playlists = playlists;
+    *out_count = count;
+    return count > 0;
+}
+
+bool subsonic_get_playlist_songs(const subsonic_server_t * server, const char * playlist_id,
+                                  subsonic_song_t ** out_songs, int * out_count) {
+    *out_songs = NULL;
+    *out_count = 0;
+
+    char id_enc[256];
+    url_encode(playlist_id, id_enc, sizeof(id_enc));
+    char params[300];
+    snprintf(params, sizeof(params), "id=%s", id_enc);
+
+    cJSON * root = NULL;
+    cJSON * resp = api_request(server, "getPlaylist.view", params, &root);
+    if (!resp) return false;
+
+    cJSON * playlist_obj = cJSON_GetObjectItemCaseSensitive(resp, "playlist");
+    cJSON * entry_arr = cJSON_GetObjectItemCaseSensitive(playlist_obj, "entry");
+    if (!cJSON_IsArray(entry_arr)) { cJSON_Delete(root); return false; }
+
+    int count = cJSON_GetArraySize(entry_arr);
+    subsonic_song_t * songs = malloc(sizeof(subsonic_song_t) * (size_t) (count > 0 ? count : 1));
+
+    int i = 0;
+    cJSON * entry_item;
+    cJSON_ArrayForEach(entry_item, entry_arr) {
+        snprintf(songs[i].id, sizeof(songs[i].id), "%s", json_str(entry_item, "id", ""));
+        snprintf(songs[i].title, sizeof(songs[i].title), "%s", json_str(entry_item, "title", "(unknown)"));
+        snprintf(songs[i].artist, sizeof(songs[i].artist), "%s", json_str(entry_item, "artist", ""));
+        snprintf(songs[i].album, sizeof(songs[i].album), "%s", json_str(entry_item, "album", ""));
+        snprintf(songs[i].suffix, sizeof(songs[i].suffix), "%s", json_str(entry_item, "suffix", "mp3"));
+        songs[i].track = json_int(entry_item, "track", 0);
+        songs[i].duration_seconds = json_int(entry_item, "duration", 0);
         i++;
     }
 

@@ -30,12 +30,18 @@ typedef struct {
     char id[64];
     char title[128];
     char artist[128];
+    char album[128]; /* used to lay out downloaded files as Artist/Album/Song -- see subsonic_download_to_library() */
     char suffix[16]; /* file extension (no dot), e.g. "mp3"/"flac" -- the
                        * downloaded temp file needs this so the existing
                        * decoder dispatch (by extension) picks the right one */
     int track;
     int duration_seconds;
 } subsonic_song_t;
+
+typedef struct {
+    char id[64];
+    char name[128];
+} subsonic_playlist_t;
 
 /* Checks the server is reachable and the credentials are accepted
  * (ping.view). Doesn't distinguish *why* it failed (network vs auth) --
@@ -59,6 +65,25 @@ bool subsonic_get_artist_albums(const subsonic_server_t * server, const char * a
  * them (already track-ordered). */
 bool subsonic_get_album_songs(const subsonic_server_t * server, const char * album_id,
                                subsonic_song_t ** out_songs, int * out_count);
+
+/* getAlbumList2.view (type=alphabeticalByName) -- every album in the whole
+ * library, not scoped to one artist (unlike subsonic_get_artist_albums()
+ * above). Capped at 500 results (the Subsonic API's own per-call max, no
+ * paging implemented here) -- reasonable for the libraries this app has
+ * been tested against, but a genuinely huge server library could be
+ * truncated; not expected to matter in practice for a portable player's
+ * use case. Caller owns *out_albums. */
+bool subsonic_get_all_albums(const subsonic_server_t * server, subsonic_album_t ** out_albums, int * out_count);
+
+/* getPlaylists.view -- every playlist visible to this user. Caller owns
+ * *out_playlists. */
+bool subsonic_get_playlists(const subsonic_server_t * server, subsonic_playlist_t ** out_playlists, int * out_count);
+
+/* getPlaylist.view -- that playlist's songs, in playlist order. Same
+ * subsonic_song_t shape as subsonic_get_album_songs() (a playlist entry and
+ * an album's song are the same "Child" element in the Subsonic API). */
+bool subsonic_get_playlist_songs(const subsonic_server_t * server, const char * playlist_id,
+                                  subsonic_song_t ** out_songs, int * out_count);
 
 /* Builds the full stream.view URL (auth params included) for song_id --
  * pass straight to http_get_to_file() to download it before playback (see

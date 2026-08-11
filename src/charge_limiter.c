@@ -12,20 +12,20 @@
 
 /* Real-device incident (2026-08-08): after this feature was active for a
  * while on a charging device, the status bar's battery percentage/charge
- * status stopped updating entirely. Not root-caused yet -- suspected
- * culprit is this file's own repeated raw i2c smbus transactions straight
- * against the AXP2101 (bypassing its kernel driver entirely, every
- * CHARGE_LIMITER_REEVALUATE_SECONDS while charging), racing with or
- * otherwise confusing whatever the kernel's own AXP2101/CW2015 drivers are
- * doing on the same i2c bus concurrently and eventually wedging the
- * power_supply sysfs nodes battery.c reads from -- but this is a
- * hypothesis, not confirmed. Reverted to inert (charging left entirely
- * alone, same as if this feature didn't exist) until that's actually
- * root-caused -- a device that silently stops reporting its own battery
- * state is a worse outcome than an unlimited charge cycle. The Settings
- * row/toggle still exists and still saves its own setting, it just no
- * longer does anything; re-enable by flipping this back to 1 once fixed. */
-#define CHARGE_LIMITER_ACTIVE 0
+ * status stopped updating, and separately the whole UI went white/text-only
+ * (asset loading failing). At the time this looked like it might be this
+ * file's own repeated raw i2c smbus transactions against the AXP2101
+ * somehow wedging the power_supply sysfs nodes battery.c reads from, so
+ * this was reverted to fully inert as a precaution. Root-caused since:
+ * battery.c's read_best_battery_status() had a real, unrelated file
+ * descriptor leak (its "battery" fast path returned early without
+ * closedir()) that leaked a few fds a second on every status-bar poll --
+ * exhausting the process's fd limit in well under ten minutes, at which
+ * point every open()/fopen() call in the whole process starts failing at
+ * once (sysfs reads AND PNG asset loading, together, matching exactly what
+ * was seen). Fixed in battery.c; confirmed independent of this file. Back
+ * to active. */
+#define CHARGE_LIMITER_ACTIVE 1
 
 #define AXP2101_I2C_BUS "/dev/i2c-0"
 #define AXP2101_I2C_ADDR 0x34

@@ -162,4 +162,27 @@ bool bt_control_set_codec(const char * codec);
 void bt_control_source_volume_sync_start(void);
 void bt_control_source_volume_sync_stop(void);
 
+/* Fast disconnect detection for that same a2dp-source output PCM. Real-
+ * device bug report: a genuine BT headphone disconnect took up to ~17s to
+ * even be noticed (gui.c's own ~5s poll cadence plus its 12s debounce --
+ * see that debounce's own comment for why it can't just be shortened; a
+ * real A2DP renegotiation blip looks identical to a genuine drop over a
+ * window that short). bluealsa itself knows the instant BlueZ tears the
+ * transport down and broadcasts it over D-Bus -- `bluealsa-cli monitor`
+ * (confirmed via `strings` on the real binary) surfaces that as a
+ * "PCMRemoved <path>" line in well under a second. This is a fast-path
+ * NOTIFICATION only, not a replacement for the polled/debounced check --
+ * that one stays as the fallback in case this monitor subprocess dies or
+ * bluealsa doesn't emit the signal for some reason.
+ *
+ * Same start/stop lifecycle convention as bt_control_source_volume_sync_start()/
+ * _stop() just above -- start whenever Bluetooth output is actually in use,
+ * stop when it isn't, both idempotent. bt_control_output_disconnect_consume()
+ * is edge-triggered: true (and clears itself) the first poll after a real
+ * removal was observed, false otherwise -- callers don't need to know the
+ * PCM path themselves. */
+void bt_control_output_disconnect_watch_start(void);
+void bt_control_output_disconnect_watch_stop(void);
+bool bt_control_output_disconnect_consume(void);
+
 #endif /* BLUETOOTH_CONTROL_H */

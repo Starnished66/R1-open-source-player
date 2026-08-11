@@ -65,6 +65,7 @@ static bool open_bt_device(unsigned int channels, unsigned int sample_rate) {
 }
 
 static void close_bt_device(void) {
+    bt_active = false; /* only open_device() below was ever setting this back to false, never this side */
     if (bt_aplay_pid < 0) return;
     subprocess_terminate(bt_aplay_pid);
     close(bt_aplay_fd);

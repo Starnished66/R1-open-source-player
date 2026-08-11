@@ -3,17 +3,21 @@
 #include "subprocess.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #ifdef HOST_BUILD
   #define SETTINGS_FILE_PATH "./open_hiby_player_settings.txt"
+  #define SETTINGS_DIR_PATH "."
 #else
   /* /usr/data is the device's persistent ubifs partition (survives reboots,
    * unlike /tmp) -- the same place the stock firmware keeps its own small
    * settings files (theme_id, region, etc). */
   #define SETTINGS_FILE_PATH "/usr/data/open_hiby_player_settings.txt"
+  #define SETTINGS_DIR_PATH "/usr/data"
 #endif
 
 #define SETTINGS_TMP_FILE_PATH SETTINGS_FILE_PATH ".tmp"
@@ -199,6 +203,34 @@ bool settings_load(player_settings_t * out) {
     return true;
 }
 
+/* Real-device bug reports: settings (most visibly volume, since hardware
+ * volume buttons call this on every single press -- see gui.c's
+ * update_timer_cb) reset back to defaults after a reboot on some devices,
+ * inconsistently. Root cause: this used to just fclose() the tmp file and
+ * rename() it over the real one, with no fsync anywhere -- fclose() only
+ * flushes stdio's own userspace buffer into the kernel page cache, it
+ * doesn't force that page to actual flash, and neither does rename(). This
+ * device's UBIFS partition has been separately confirmed (see TESTING.md's
+ * own note on losing a file deletion across an unclean shutdown) to drop
+ * recently-written-but-not-yet-committed metadata across anything other than
+ * a clean shutdown -- and a clean, UI-driven shutdown isn't how most users of
+ * a physical-button DAP actually power one of these off; holding the power
+ * button is. That made this a routine case, not a rare edge one, and volume
+ * being saved (and lost) more often than anything else made it the most
+ * visibly broken setting even though every field here was equally at risk.
+ * fsync() on the tmp file's own fd before close ensures its *contents* are
+ * durable; a rename() being applied is itself just a directory-metadata
+ * change, so the containing directory's own fd needs its own fsync()
+ * afterward for the rename itself to survive an unclean shutdown -- the
+ * standard atomic-durable-replace recipe (write tmp -> fsync tmp -> rename
+ * -> fsync directory). */
+static void fsync_settings_dir(void) {
+    int dir_fd = open(SETTINGS_DIR_PATH, O_RDONLY);
+    if (dir_fd < 0) return;
+    fsync(dir_fd);
+    close(dir_fd);
+}
+
 void settings_save(const player_settings_t * settings) {
     DBG_LOG("settings_save: called (idle_suspend_enabled=%d)\n", settings->idle_suspend_enabled ? 1 : 0);
     FILE * f = fopen(SETTINGS_TMP_FILE_PATH, "w");
@@ -237,8 +269,11 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "timezone=%s\n", settings->timezone);
     fprintf(f, "font_size_tier=%d\n", settings->font_size_tier);
 
+    fflush(f);
+    fsync(fileno(f));
     fclose(f);
     rename(SETTINGS_TMP_FILE_PATH, SETTINGS_FILE_PATH);
+    fsync_settings_dir();
 }
 
 void settings_factory_reset(void) {

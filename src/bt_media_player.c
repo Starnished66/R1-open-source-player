@@ -296,10 +296,24 @@ static DBusObjectPathVTable vtable = {
     NULL, NULL, NULL, NULL
 };
 
-/* Blocking (dbus_connection_send_with_reply_and_block) -- only ever
- * called from this file's own dispatch thread (see do_set_active() below),
- * never from the caller of bt_media_player_set_active(), so this doesn't
- * risk blocking the GUI thread the way a direct call would. */
+/* Real-device concurrency finding: this used to block via
+ * dbus_connection_send_with_reply_and_block(conn, msg, 5000, &err) -- fine
+ * in isolation (never called from the GUI thread, only this file's own
+ * dispatch thread, so it couldn't freeze the UI directly), but this same
+ * call fires on every single BT connect/disconnect (see gui.c's
+ * poll_refresh_bt_icon(), which calls bt_media_player_set_active() every
+ * ~5s poll cycle), including the exact moment bluetooth_control.c's
+ * bt_control_recover_wedged_daemon() might ALSO be killing and restarting
+ * bluetoothd if it looks wedged -- meaning this could sit blocked for up to
+ * 5s waiting on a reply from a peer that's being torn down mid-request,
+ * while ALSO blocking this thread's own dbus_connection_read_write_
+ * dispatch() loop from processing incoming AVRCP button presses for that
+ * whole window. Neither RegisterPlayer's nor UnregisterPlayer's reply
+ * content was ever actually used here beyond logging a failure (actual_
+ * active is set unconditionally either way -- see the call site below), so
+ * there was nothing this genuinely needed to block for. Fire-and-forget
+ * instead: dbus_message_set_no_reply() tells BlueZ not to even bother
+ * sending one, and dbus_connection_send() queues the call without waiting. */
 static void call_register_player(bool register_it) {
     const char * member = register_it ? "RegisterPlayer" : "UnregisterPlayer";
     DBusMessage * msg = dbus_message_new_method_call("org.bluez", BT_MEDIA_PLAYER_ADAPTER_PATH,
@@ -344,14 +358,9 @@ static void call_register_player(bool register_it) {
         dbus_message_iter_close_container(&iter, &dict_iter);
     }
 
-    DBusError err;
-    dbus_error_init(&err);
-    DBusMessage * reply = dbus_connection_send_with_reply_and_block(conn, msg, 5000, &err);
-    if (!reply) {
-        DBG_LOG("bt_media_player: %s failed: %s\n", member, err.message ? err.message : "(no message)");
-        dbus_error_free(&err);
-    } else {
-        dbus_message_unref(reply);
+    dbus_message_set_no_reply(msg, TRUE);
+    if (!dbus_connection_send(conn, msg, NULL)) {
+        DBG_LOG("bt_media_player: failed to queue %s\n", member);
     }
     dbus_message_unref(msg);
 }

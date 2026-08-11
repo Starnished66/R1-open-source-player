@@ -73,7 +73,7 @@ static int jpeg_mem_output(JDEC * jd, void * bitmap, JRECT * rect) {
     return 1;
 }
 
-static bool decode_jpeg_rgb888(const uint8_t * data, uint32_t size, int target_w, int target_h,
+static bool decode_jpeg_rgb888(const uint8_t * data, uint32_t size,
                                 uint8_t ** out_buf, int * out_w, int * out_h) {
     uint8_t workbuf[4096];
     JDEC jd;
@@ -81,15 +81,37 @@ static bool decode_jpeg_rgb888(const uint8_t * data, uint32_t size, int target_w
 
     if (jd_prepare(&jd, jpeg_mem_read, workbuf, sizeof(workbuf), &ctx) != JDR_OK) return false;
 
-    /* tjpgd's built-in scale halves each dimension per step (0=1/1, 1=1/2,
-     * 2=1/4, 3=1/8) -- use the smallest step that still leaves the decoded
-     * image at least as big as the target, instead of always decoding
-     * embedded art at full resolution just to immediately shrink it back
-     * down in the resize pass below. */
+    /* tjpgd's built-in scale (0=1/1 .. 3=1/8) is only used here as a
+     * memory-safety fallback for pathologically large embedded art now, not
+     * for its normal purpose of shrinking the decode buffer down toward the
+     * target size. Real-device testing (2026-08-08) with a real 1200x1200
+     * embedded cover proved tjpgd's scale>0 output is corrupted in this
+     * vendored build: block_idct() (tjpgd.c) always produces a full,
+     * unreduced 8x8 spatial block regardless of jd->scale (the only
+     * scale-aware step there is a DC-only shortcut at scale==3), and the RGB
+     * conversion loop in jd_mcu_output() converts that full block using
+     * unscaled MCU dimensions -- the "squeeze" step that would repack it
+     * down to the smaller, scale-halved rect it then reports to this file's
+     * output callback only runs for right/bottom edge-clipped MCUs
+     * (rx < mx), never for interior ones. So for any image with interior
+     * MCUs (essentially all of them), jpeg_mem_output() above is told a
+     * small rect but reads pixel data still laid out at full MCU stride --
+     * a stride mismatch producing exactly the blocky/checkerboard
+     * corruption reported. Confirmed via a standalone host test harness
+     * decoding that same real JPEG: scale=1 (600x600 output) was visibly
+     * corrupted, scale=0 (native 1200x1200) was clean. Always decode at
+     * native resolution now and let resize_cover_fit()'s own box filter
+     * (already correct, unrelated bug) do all the downscaling -- except
+     * above MAX_NATIVE_DECODE_BYTES, where the native decode buffer itself
+     * would risk exhausting this device's limited RAM; only then fall back
+     * to tjpgd's scale, accepting its known corruption as the lesser risk
+     * vs an OOM crash for that rare oversized-art case. */
+#define MAX_NATIVE_DECODE_BYTES (8 * 1024 * 1024)
     uint8_t scale = 0;
-    while (scale < 3 && (jd.width >> (scale + 1)) >= (unsigned) target_w &&
-           (jd.height >> (scale + 1)) >= (unsigned) target_h) {
+    size_t native_bytes = (size_t) jd.width * jd.height * 3;
+    while (scale < 3 && native_bytes > MAX_NATIVE_DECODE_BYTES) {
         scale++;
+        native_bytes = (size_t) (jd.width >> scale) * (jd.height >> scale) * 3;
     }
 
     int decoded_w = jd.width >> scale;
@@ -253,7 +275,7 @@ bool cover_decode_to_rgb565(const uint8_t * data, uint32_t size, int target_w, i
     bool ok;
 
     if (data[0] == 0xFF && data[1] == 0xD8) {
-        ok = decode_jpeg_rgb888(data, size, target_w, target_h, &native_buf, &native_w, &native_h);
+        ok = decode_jpeg_rgb888(data, size, &native_buf, &native_w, &native_h);
     } else if (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') {
         ok = decode_png_rgb888(data, size, &native_buf, &native_w, &native_h);
     } else {

@@ -16,6 +16,20 @@ bool playlist_files_scan(const char * root, char *** out_paths, int * out_count)
  * false if the file can't be opened for appending. */
 bool playlist_files_append(const char * m3u_path, const char * song_path);
 
+/* True if song_path already appears as a line in the M3U file at m3u_path
+ * (exact string match). False if the file doesn't exist/can't be read, or
+ * the path just isn't in it -- callers that need to distinguish those two
+ * cases don't exist yet, so this collapses them the same way
+ * playlist_files_append()'s own bool return does. */
+bool playlist_files_contains(const char * m3u_path, const char * song_path);
+
+/* Rewrites the M3U file at m3u_path with every line matching song_path
+ * exactly removed (all occurrences, not just the first -- cheap insurance
+ * against a stray duplicate from before playlist_files_contains() started
+ * being checked on add). Returns false if m3u_path can't be read or the
+ * rewrite can't be completed. */
+bool playlist_files_remove(const char * m3u_path, const char * song_path);
+
 /* Creates a new M3U playlist at dir/name.m3u (creating dir if needed) with
  * song_path as its first entry. name must be non-empty and is used as-is
  * for the filename (the caller is responsible for it being a sane filename

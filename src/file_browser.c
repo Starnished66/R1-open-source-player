@@ -300,7 +300,8 @@ static void rebuild_list(void) {
  * result gets one final sort by full path anyway -- sorting each
  * directory's entries individually first would be wasted work. */
 #define SCAN_ALL_SONGS_MAX_DEPTH 64
-static void scan_all_songs_recursive(const char * dir_path, char *** paths, int * count, int * capacity, int depth) {
+static void scan_all_songs_recursive(const char * dir_path, char *** paths, int * count, int * capacity, int depth,
+                                      volatile int * progress) {
     if (depth > SCAN_ALL_SONGS_MAX_DEPTH) return;
 
     DIR * dir = opendir(dir_path);
@@ -314,10 +315,24 @@ static void scan_all_songs_recursive(const char * dir_path, char *** paths, int 
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, de->d_name);
 
         struct stat st;
-        if (lstat(full_path, &st) != 0) continue;
+        bool stat_ok = lstat(full_path, &st) == 0;
+        /* Bumped only once lstat() actually returns, for every real entry
+         * examined (not just playable files found) -- a long stretch of
+         * non-music subfolders (playlists, artwork, whatever else shares
+         * the card) is still genuine forward progress, not a stall, and
+         * counting only matches would let a caller's stall detector
+         * false-trigger partway through a large library just because the
+         * music itself is unevenly distributed across the tree. Placed
+         * after the call, not before it starts, so a caller watching this
+         * can't mistake a currently-hung lstat() (the exact corrupted-block
+         * D-state scenario this exists to catch, per this file's own
+         * caller in gui.c) for progress that already happened. See this
+         * parameter's own doc comment in file_browser.h. */
+        if (progress) (*progress)++;
+        if (!stat_ok) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            scan_all_songs_recursive(full_path, paths, count, capacity, depth + 1);
+            scan_all_songs_recursive(full_path, paths, count, capacity, depth + 1, progress);
             continue;
         }
         if (!is_playable_file(de->d_name)) continue;
@@ -339,12 +354,12 @@ static int compare_paths(const void * a, const void * b) {
     return strcasecmp(*pa, *pb);
 }
 
-bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count) {
+bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, volatile int * progress) {
     char ** paths = NULL;
     int count = 0;
     int capacity = 0;
 
-    scan_all_songs_recursive(root, &paths, &count, &capacity, 0);
+    scan_all_songs_recursive(root, &paths, &count, &capacity, 0, progress);
 
     if (count == 0) {
         free(paths);
@@ -386,6 +401,26 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
     lv_obj_set_style_pad_gap(list, 4, 0);
     lv_obj_set_style_pad_top(list, 4, 0);
 
+    scan_current_dir();
+    rebuild_list();
+}
+
+/* Real-device bug report (2026-08-08): the Files screen's own listing (root
+ * and any subdirectory) is otherwise only ever scanned once -- at
+ * file_browser_init() time (app boot) and again on each interactive
+ * up/entry click above -- so an SD-card hotplug event that happens while the
+ * user isn't actively navigating the browser (or on the very first view of
+ * the root, before any click) left it showing a stale snapshot: files that
+ * no longer exist after a card is pulled, or a newly inserted card's
+ * content not showing up at all without the user manually navigating away
+ * and back. Called from gui.c's poll_sd_card_hotplug() on both the
+ * unmounted->mounted and mounted->unmounted edges. Resets back to the
+ * browser's root (not just re-scanning whatever directory happened to be
+ * current) since a directory the user was sitting in on a since-removed SD
+ * card may no longer exist at all. */
+void file_browser_reset_to_root(void) {
+    if (!list) return; /* files_screen not built yet -- nothing to refresh */
+    snprintf(current_dir, sizeof(current_dir), "%s", root_dir);
     scan_current_dir();
     rebuild_list();
 }

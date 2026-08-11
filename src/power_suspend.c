@@ -31,6 +31,23 @@ void power_suspend_now(void) {
 
     if (wifi_was_on) wifi_control_disable();
 
+    /* Real-device bug report: suspending with an actively-connected
+     * Bluetooth output reboots the device, the same watchdog-driven
+     * mechanism suspected for the BT-disconnect-freeze bug (see
+     * bt_media_player.c/bluetooth_control.c's own concurrency-fix
+     * comments). bt_suspend (below) is the raw radio teardown --
+     * bluetooth_control.c's own bt_control_disable() doc comment already
+     * confirms it "fully tears down the chip's UART firmware link (kills
+     * brcm_patchram_plus/hciattach, rfkill block)" -- fine for a genuinely
+     * idle radio, but yanking that transport out from under a live,
+     * actively-streaming ACL/SCO link (rather than a clean BlueZ-level
+     * disconnect) is a plausible way to wedge the kernel driver hard
+     * enough to trip the same watchdog. bt_control_disable() first goes
+     * through BlueZ's own D-Bus adapter power-off, which cleanly
+     * disconnects any connected device as part of normal adapter
+     * shutdown, before the raw UART teardown below ever runs. */
+    if (bt_was_on) bt_control_disable();
+
     char * bt_suspend_argv[] = { (char *) "/usr/bin/bt_suspend", NULL };
     subprocess_run(bt_suspend_argv, NULL, 0);
 

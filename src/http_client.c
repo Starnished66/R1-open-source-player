@@ -1,5 +1,6 @@
 #include "http_client.h"
 #include "ca_bundle.h"
+#include "debug_log.h"
 
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
@@ -279,10 +280,14 @@ static bool read_body(buffered_reader_t * r, bool is_chunked, uint64_t content_l
 static bool do_get(const char * url, bool verify_tls, int * out_status, body_sink_t * sink) {
     bool is_https;
     char host[256], port[16], path[2048];
-    if (!parse_url(url, &is_https, host, sizeof(host), port, sizeof(port), path, sizeof(path))) return false;
+    if (!parse_url(url, &is_https, host, sizeof(host), port, sizeof(port), path, sizeof(path))) {
+        DBG_LOG("http_client: parse_url failed for '%s'\n", url);
+        return false;
+    }
 
     http_conn_t conn;
     if (!conn_open(&conn, host, port, is_https, verify_tls)) {
+        DBG_LOG("http_client: conn_open failed for host='%s' port='%s' https=%d\n", host, port, is_https);
         conn_close(&conn);
         return false;
     }
@@ -291,12 +296,20 @@ static bool do_get(const char * url, bool verify_tls, int * out_status, body_sin
     int req_len = snprintf(request, sizeof(request),
                             "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: open_hiby_player\r\nConnection: close\r\n\r\n",
                             path, host);
-    if (req_len < 0 || (size_t) req_len >= sizeof(request)) { conn_close(&conn); return false; }
+    if (req_len < 0 || (size_t) req_len >= sizeof(request)) {
+        DBG_LOG("http_client: request too long for path='%s'\n", path);
+        conn_close(&conn);
+        return false;
+    }
 
     size_t sent = 0;
     while (sent < (size_t) req_len) {
         int n = conn_write(&conn, (const uint8_t *) request + sent, (size_t) req_len - sent);
-        if (n <= 0) { conn_close(&conn); return false; }
+        if (n <= 0) {
+            DBG_LOG("http_client: conn_write failed (n=%d) after %zu/%d bytes\n", n, sent, req_len);
+            conn_close(&conn);
+            return false;
+        }
         sent += (size_t) n;
     }
 
@@ -305,12 +318,21 @@ static bool do_get(const char * url, bool verify_tls, int * out_status, body_sin
     reader.conn = &conn;
 
     char status_line[256];
-    if (!reader_line(&reader, status_line, sizeof(status_line))) { conn_close(&conn); return false; }
+    if (!reader_line(&reader, status_line, sizeof(status_line))) {
+        DBG_LOG("http_client: failed to read status line from host='%s'\n", host);
+        conn_close(&conn);
+        return false;
+    }
+    DBG_LOG("http_client: status line: '%s'\n", status_line);
 
     int status = 0;
     /* "HTTP/1.1 200 OK" -- skip the version token, read the 3-digit code. */
     const char * sp = strchr(status_line, ' ');
-    if (!sp) { conn_close(&conn); return false; }
+    if (!sp) {
+        DBG_LOG("http_client: malformed status line '%s'\n", status_line);
+        conn_close(&conn);
+        return false;
+    }
     status = atoi(sp + 1);
 
     bool is_chunked = false;
@@ -335,10 +357,16 @@ static bool do_get(const char * url, bool verify_tls, int * out_status, body_sin
             snprintf(sink->out_content_type, sink->out_content_type_size, "%s", value);
         }
     }
+    DBG_LOG("http_client: status=%d content_length=%llu chunked=%d\n", status,
+            (unsigned long long) content_length, is_chunked);
 
     bool ok = read_body(&reader, is_chunked, content_length, sink);
     conn_close(&conn);
-    if (!ok) return false;
+    if (!ok) {
+        DBG_LOG("http_client: read_body failed (chunked=%d content_length=%llu)\n", is_chunked,
+                (unsigned long long) content_length);
+        return false;
+    }
 
     *out_status = status;
     return true;

@@ -69,4 +69,18 @@ bool dlna_control_consume_ready_track(char * out_path, size_t path_size,
  * touches audio.c/LVGL directly, same layering as everywhere else). */
 bool dlna_control_consume_stop_requested(void);
 
+/* Push the current playback state so a GET state@ command (relayed from
+ * dmrd's own UPnP AVTransport GetTransportInfo) can report the real
+ * transport state back to the phone's DLNA controller, instead of the
+ * hardcoded "STOPPED" this used to always reply with regardless of what was
+ * actually happening -- real-device bug report: a cast played audio
+ * correctly on the device but the phone's own UI never reflected it, since
+ * it was polling this same state@ command to know. playing/paused should
+ * mirror audio_is_playing()/audio_is_paused() exactly. Call once per tick
+ * from update_timer_cb, same "background-thread-readable snapshot the main
+ * thread refreshes" shape as remote_control_notify_status()/bt_media_
+ * player.c's own status pushes -- cheap, and safe even when the listener
+ * isn't running (the snapshot is just unread in that case). */
+void dlna_control_notify_status(bool playing, bool paused);
+
 #endif /* DLNA_CONTROL_H */

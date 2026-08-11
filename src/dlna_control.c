@@ -3,6 +3,7 @@
 #include "http_client.h"
 #include "debug_log.h"
 
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,38 @@
  * path is a symlink target" note), the one writable partition. */
 #define DMR_STREAMER_SOCKET_PATH "/data/dmr_streamer"
 
-#define DLNA_TEMP_DOWNLOAD_PATH "/tmp/dlna_track.download"
+/* Real-device incident, first fix: this used to be under /tmp, which this
+ * firmware mounts as tmpfs (RAM-backed, confirmed via `mount`) -- on a
+ * device with only ~57MB total RAM and only a few MB typically free,
+ * downloading any real-sized cast track (a FLAC can easily be tens of MB)
+ * into /tmp filled memory directly and got the whole app OOM-killed by the
+ * kernel partway through, which looked to the user like the device freezing
+ * (confirmed via `dmesg`: "Out of memory: Kill process ... (hiby_player)").
+ *
+ * Real-device incident, second fix: moving it to /data (the same writable
+ * UBIFS partition DMR_STREAMER_SOCKET_PATH above uses) fixed the OOM, but
+ * that partition is only ~35.8MB total, most of it already used by the
+ * firmware/app itself -- confirmed live: a real 61MB cast FLAC failed
+ * partway through download (`read_body failed`) because /data simply
+ * doesn't have room for a file that size, and even a middling one would
+ * fight with test binaries or normal app growth for the same few MB. The
+ * SD card (MUSIC_ROOT_DIR, same as gui.c's own Subsonic download-to-
+ * library feature already uses for exactly this "need to write a real,
+ * possibly-large audio file somewhere" need) has actual capacity instead.
+ * A dot-prefixed subdirectory keeps it out of the library scan entirely --
+ * file_browser.c's scan_all_songs_recursive() skips any dirent whose name
+ * starts with '.', so a cast track never briefly shows up as a phantom
+ * library entry. Falls back to failing the download gracefully (existing
+ * !ok handling in dlna_download_thread_func()) if no SD card is mounted at
+ * all, same as Subsonic download-to-library already does in that case --
+ * this device genuinely has nowhere else with enough room for a real audio
+ * file. */
+#ifdef HOST_BUILD
+#define DLNA_TEMP_DOWNLOAD_DIR "./music/.dlna_cast"
+#else
+#define DLNA_TEMP_DOWNLOAD_DIR "/data/mnt/sd_0/.dlna_cast"
+#endif
+#define DLNA_TEMP_DOWNLOAD_PATH DLNA_TEMP_DOWNLOAD_DIR "/dlna_track.download"
 
 static pthread_mutex_t dlna_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -47,6 +79,34 @@ static char ready_title[256] = {0};
 static char ready_artist[256] = {0};
 static char ready_album[256] = {0};
 static char last_produced_path[512] = {0}; /* superseded on the next successful download, then removed */
+
+/* Guarded by dlna_mutex like everything else above -- see dlna_control_
+ * notify_status()'s own doc comment in the header. */
+static bool status_playing = false;
+static bool status_paused = false;
+
+/* Real-device finding: the phone's DLNA controller app queries state@
+ * exactly once, immediately after sending play@ -- and never again,
+ * apparently treating that single answer as the lasting transport state
+ * (its later polling is get_volume only, not another state@). This app's
+ * download-then-play architecture (see dlna_control.h's own reasoning)
+ * means real playback only starts once the download finishes, well after
+ * that single query -- so status_playing was still (correctly, at that
+ * instant) false, the controller's UI never got told it was actually
+ * playing, and the app looked "stuck" from the phone's side even though
+ * audio was playing fine on the device itself. Confirmed live via a raw
+ * command trace: play@0 immediately followed by state@0, replied to with
+ * the real-but-premature "STOPPED", then the download proceeding
+ * afterward with nothing left to tell the controller otherwise.
+ *
+ * Fixed by answering that one query optimistically: as soon as handle_play()
+ * accepts a valid URI (matching what a real-time-streaming DLNA renderer's
+ * own instant Play->PLAYING transition would look like from the
+ * controller's side), state@ reports PLAYING immediately, before the
+ * download has even started -- cleared once the real state actually
+ * catches up (dlna_control_notify_status(playing=true)) or a Stop is
+ * processed, so it doesn't linger past its purpose. */
+static bool cast_intent_playing = false;
 
 typedef struct {
     char uri[2048];
@@ -83,6 +143,8 @@ static const char * extension_for_content_type(const char * content_type) {
 static void * dlna_download_thread_func(void * arg) {
     dlna_download_request_t * req = (dlna_download_request_t *) arg;
 
+    mkdir(DLNA_TEMP_DOWNLOAD_DIR, 0755); /* ignore EEXIST -- same best-effort pattern as playlist_files_create() */
+
     char content_type[128];
     bool ok = http_get_to_file_ex(req->uri, true, DLNA_TEMP_DOWNLOAD_PATH, NULL, NULL,
                                    content_type, sizeof(content_type));
@@ -101,8 +163,11 @@ static void * dlna_download_thread_func(void * arg) {
         return NULL;
     }
 
+    /* Same reasoning as DLNA_TEMP_DOWNLOAD_PATH above -- rename() also
+     * requires the source and destination to be on the same filesystem, so
+     * this must stay in step with wherever that constant points. */
     char final_path[512];
-    snprintf(final_path, sizeof(final_path), "/tmp/dlna_track%s", ext);
+    snprintf(final_path, sizeof(final_path), DLNA_TEMP_DOWNLOAD_DIR "/dlna_track%s", ext);
     if (rename(DLNA_TEMP_DOWNLOAD_PATH, final_path) != 0) {
         DBG_LOG("dlna_control: rename to '%s' failed\n", final_path);
         remove(DLNA_TEMP_DOWNLOAD_PATH);
@@ -140,6 +205,10 @@ static void handle_play(void) {
         return;
     }
 
+    pthread_mutex_lock(&dlna_mutex);
+    cast_intent_playing = true;
+    pthread_mutex_unlock(&dlna_mutex);
+
     /* Detached, one-shot -- this listener thread must stay free to keep
      * accepting/answering the frequent get_volume polls a real DLNA
      * controller app sends throughout playback (confirmed live: every few
@@ -158,6 +227,7 @@ static void handle_connection(int cfd) {
     ssize_t n = read(cfd, buf, sizeof(buf) - 1);
     if (n <= 0) { close(cfd); return; }
     buf[n] = '\0';
+    DBG_LOG("dlna_control: recv '%.100s'\n", (const char *) buf);
 
     if ((size_t) n >= 10 && memcmp(buf, "get_volume", 10) == 0) {
         /* Real-device finding: dmrd's own GetVolume response construction
@@ -172,10 +242,23 @@ static void handle_connection(int cfd) {
         const char * reply = "0";
         write(cfd, reply, strlen(reply));
     } else if ((size_t) n >= 6 && memcmp(buf, "state@", 6) == 0) {
-        /* Never observed dmrd actually blocking on a missing reply here in
-         * testing, but answering costs nothing and matches every other
-         * get_-shaped command. */
-        const char * reply = "STOPPED";
+        /* Real-device bug report: a cast played correctly on this device but
+         * the phone's own DLNA controller UI never showed it as playing --
+         * this used to always reply "STOPPED" here regardless of actual
+         * state. dmrd relays this from its own UPnP AVTransport
+         * GetTransportInfo, whose CurrentTransportState argument is a fixed
+         * enumeration (UPnP AVTransport:1 spec) -- PLAYING/PAUSED_PLAYBACK/
+         * STOPPED are the three this app can actually distinguish (no
+         * TRANSITIONING/RECORDING/etc. state exists in this app's own
+         * playback model). status_playing/status_paused are pushed from
+         * gui.c every tick via dlna_control_notify_status(), mirroring
+         * audio_is_playing()/audio_is_paused() exactly. */
+        pthread_mutex_lock(&dlna_mutex);
+        const char * reply = (status_playing || cast_intent_playing) ? "PLAYING"
+                              : status_paused                         ? "PAUSED_PLAYBACK"
+                                                                       : "STOPPED";
+        pthread_mutex_unlock(&dlna_mutex);
+        DBG_LOG("dlna_control: replying to state@ with '%s'\n", reply);
         write(cfd, reply, strlen(reply));
     } else if ((size_t) n > 8 && memcmp(buf, "set_uri:", 8) == 0) {
         pthread_mutex_lock(&dlna_mutex);
@@ -196,6 +279,9 @@ static void handle_connection(int cfd) {
     } else if ((size_t) n >= 5 && memcmp(buf, "play@", 5) == 0) {
         handle_play();
     } else if ((size_t) n >= 4 && memcmp(buf, "stop", 4) == 0) {
+        pthread_mutex_lock(&dlna_mutex);
+        cast_intent_playing = false;
+        pthread_mutex_unlock(&dlna_mutex);
         stop_requested = true; /* consumed from the LVGL thread */
     }
     /* Everything else (set_meta:albumarturi:/duration:, and any command
@@ -207,14 +293,33 @@ static void handle_connection(int cfd) {
     close(cfd);
 }
 
+/* Real-device incident (2026-08-11): this used to call a plain blocking
+ * accept() and rely on dlna_control_stop() closing listen_fd to unblock it
+ * -- the exact same pattern remote_control.c's own listener used to use,
+ * fixed there for the identical reason (see that file's own
+ * ACCEPT_POLL_TIMEOUT_MS comment): on this device's kernel, closing a
+ * socket from another thread does NOT reliably wake a thread already
+ * blocked in accept() on it. Confirmed live here too -- disabling DLNA
+ * froze the whole app (main thread stuck in dlna_control_stop()'s
+ * pthread_join(), this thread stuck forever in accept()), needing a hard
+ * power-cycle to recover; this file had been explicitly flagged as sharing
+ * remote_control.c's own pre-fix bug but was left unfixed until it actually
+ * happened. Same fix: poll with a bounded timeout instead of blocking
+ * directly in accept(), so this thread notices `running` went false within
+ * one poll interval on its own, independent of whatever close()-from-
+ * another-thread does or doesn't do on this kernel. */
+#define ACCEPT_POLL_TIMEOUT_MS 200
+
 static void * listener_thread_func(void * arg) {
     (void) arg;
-    for (;;) {
+    while (running) {
+        struct pollfd pfd = { .fd = listen_fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, ACCEPT_POLL_TIMEOUT_MS);
+        if (pr <= 0) continue; /* timeout or interrupted -- just re-check running and poll again */
+        if (!running) break;
+
         int cfd = accept(listen_fd, NULL, NULL);
-        if (cfd < 0) {
-            if (!running) break; /* socket closed out from under us by dlna_control_stop() */
-            continue;
-        }
+        if (cfd < 0) continue;
         handle_connection(cfd);
     }
     return NULL;
@@ -258,15 +363,17 @@ void dlna_control_stop(void) {
     if (!running) return;
     running = false;
 
-    /* Unblocks the accept() loop -- closing a socket a thread is blocked
-     * in accept() on causes that call to return with an error on Linux,
-     * which listener_thread_func() checks `running` after to know to exit
-     * rather than looping forever on a now-invalid fd. */
+    /* The listener thread notices `running` went false on its own, within
+     * one ACCEPT_POLL_TIMEOUT_MS poll cycle (see listener_thread_func()'s
+     * own comment on why this doesn't rely on closing listen_fd to
+     * interrupt a blocking accept()) -- so this join is bounded to ~200ms,
+     * not indefinite. Only close the fd after the thread has actually
+     * exited and is guaranteed to no longer touch it. */
+    pthread_join(listener_thread, NULL);
     if (listen_fd >= 0) {
         close(listen_fd);
         listen_fd = -1;
     }
-    pthread_join(listener_thread, NULL);
     unlink(DMR_STREAMER_SOCKET_PATH);
 
     char * argv[] = { (char *) "killall", (char *) "dmrd", NULL };
@@ -294,4 +401,17 @@ bool dlna_control_consume_stop_requested(void) {
     if (!stop_requested) return false;
     stop_requested = false;
     return true;
+}
+
+void dlna_control_notify_status(bool playing, bool paused) {
+    pthread_mutex_lock(&dlna_mutex);
+    status_playing = playing;
+    status_paused = paused;
+    if (playing) {
+        /* Real playback has caught up -- the optimistic flag has done its
+         * job (see its declaration comment) and can stop overriding
+         * status_paused/status_playing transitions from here on. */
+        cast_intent_playing = false;
+    }
+    pthread_mutex_unlock(&dlna_mutex);
 }

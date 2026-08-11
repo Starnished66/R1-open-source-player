@@ -231,14 +231,14 @@ static lv_obj_t * favorite_icon;
 static lv_obj_t * cover_img;
 /* The 480x320 panel behind the transport controls (title/artist/progress/
  * time/controls_row) -- built in build_player_screen(), but also targeted
- * by set_cover_art()/generate_reflection() below to swap its background
+ * by poll_cover_decode()/compute_reflection_bytes() below to swap its background
  * between the plain static buttom.png (no embedded art to reflect) and a
  * freshly generated per-track reflection, hence file-scope rather than a
  * local inside build_player_screen(). */
 static lv_obj_t * player_overlay_panel;
 /* Backing pixels for the currently-displayed embedded cover art, if any --
  * a plain RGB565 bitmap produced by cover_decode_to_rgb565() (see
- * set_cover_art below), not the original compressed JPEG/PNG bytes. Freed
+ * poll_cover_decode() below), not the original compressed JPEG/PNG bytes. Freed
  * and replaced whenever a new track loads; must outlive the lv_image_set_src()
  * call since current_cover_dsc.data just points at it, unlike a plain PNG
  * file path. */
@@ -2970,8 +2970,8 @@ static void refresh_format_badge(void) {
  * across both themes is a flat opaque solid color, no gradient or baked-in
  * art) and no now-playing layout JSON was available to inspect directly --
  * so this is generated fresh here, from the same per-track RGB565 buffer
- * set_cover_art() already decodes, rather than reverse-engineered from an
- * asset that doesn't exist in this codebase's copy of the firmware. */
+ * cover_decode_to_rgb565() already decodes, rather than reverse-engineered
+ * from an asset that doesn't exist in this codebase's copy of the firmware. */
 #define REFLECTION_WIDTH 480
 #define REFLECTION_HEIGHT 320
 #define REFLECTION_BLUR_RADIUS 16
@@ -3008,15 +3008,12 @@ static void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stri
     }
 }
 
-/* Builds the reflection from current_cover_bytes (COVER_ART_WIDTH x
- * COVER_ART_HEIGHT RGB565, set just before this is called in
- * set_cover_art() below) and sets it as player_overlay_panel's background,
- * replacing whatever it currently shows. Only ever called with real
- * decoded art already in current_cover_bytes -- the no-art path in
- * set_cover_art() resets the panel back to the plain buttom.png instead,
- * since there's no in-memory raw bitmap to reflect for the static
- * placeholder cover. */
-static void generate_reflection(void) {
+/* Pure pixel math -- no LVGL/shared-state touch, so it's safe to call from
+ * a background thread (see the async cover-decode pipeline below). Builds
+ * the reflection from a given COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565
+ * buffer and returns a freshly malloc'd REFLECTION_WIDTH x REFLECTION_HEIGHT
+ * RGB565 buffer, or NULL on allocation failure. Caller owns the result. */
+static uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
     int w = REFLECTION_WIDTH, h = REFLECTION_HEIGHT;
     uint8_t * r = malloc((size_t) w * h);
     uint8_t * g = malloc((size_t) w * h);
@@ -3024,7 +3021,7 @@ static void generate_reflection(void) {
     uint8_t * tmp = malloc((size_t) w * h);
     if (!r || !g || !b || !tmp) {
         free(r); free(g); free(b); free(tmp);
-        return;
+        return NULL;
     }
 
     /* Unpack RGB565 -> separate 8-bit-per-channel planes (blurring packed
@@ -3036,7 +3033,7 @@ static void generate_reflection(void) {
      * row, mirroring exactly at the boundary between the two. */
     for (int y = 0; y < h; y++) {
         int src_y = COVER_ART_HEIGHT - 1 - y;
-        const uint16_t * src_row = (const uint16_t *) (current_cover_bytes + (size_t) src_y * COVER_ART_WIDTH * 2);
+        const uint16_t * src_row = (const uint16_t *) (cover_bytes + (size_t) src_y * COVER_ART_WIDTH * 2);
         for (int x = 0; x < w; x++) {
             uint16_t px = src_row[x];
             r[y * w + x] = (uint8_t) ((px >> 11) & 0x1F);
@@ -3065,16 +3062,15 @@ static void generate_reflection(void) {
     for (int x = 0; x < w; x++) box_blur_1d(b + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
     memcpy(b, tmp, (size_t) w * h);
 
-    free(current_reflection_bytes);
-    current_reflection_bytes = malloc((size_t) w * h * 2);
-    if (!current_reflection_bytes) {
+    uint8_t * out_bytes = malloc((size_t) w * h * 2);
+    if (!out_bytes) {
         free(r); free(g); free(b); free(tmp);
-        return;
+        return NULL;
     }
 
     /* Darken (mostly faded into player_overlay_panel's black background)
      * and repack into RGB565, same channel layout current_cover_dsc uses. */
-    uint16_t * out = (uint16_t *) current_reflection_bytes;
+    uint16_t * out = (uint16_t *) out_bytes;
     for (int i = 0; i < w * h; i++) {
         int rv = (r[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
         int gv = (g[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
@@ -3082,48 +3078,124 @@ static void generate_reflection(void) {
         out[i] = (uint16_t) ((rv << 11) | (gv << 5) | bv);
     }
     free(r); free(g); free(b); free(tmp);
-
-    /* Same LV_IMAGE_HEADER_MAGIC requirement as current_cover_dsc below --
-     * see that struct's own comment in set_cover_art() for the real-device
-     * corruption bug this guards against (lv_bin_decoder.c's old-format
-     * quirks-mode shim firing on a zeroed magic field). */
-    memset(&current_reflection_dsc, 0, sizeof(current_reflection_dsc));
-    current_reflection_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-    current_reflection_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-    current_reflection_dsc.header.w = w;
-    current_reflection_dsc.header.h = h;
-    current_reflection_dsc.header.stride = w * 2;
-    current_reflection_dsc.data = current_reflection_bytes;
-    current_reflection_dsc.data_size = (uint32_t) w * h * 2;
-
-    lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
+    return out_bytes;
 }
 
-/* Takes ownership of `owned_data` (must be a malloc()'d buffer from
- * metadata_read(), or NULL) and displays it as the cover image, freeing
- * whatever the previous track's picture was. Falls back to the firmware's
- * own default cover placeholder when there's no embedded art (or it failed
- * to decode).
- *
- * Fully decodes and cover-fit resizes the art ourselves (cover_decode.c)
- * into an exact COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565 buffer, rather
- * than handing LVGL the raw compressed bytes to decode lazily -- real
- * embedded art is essentially never exactly this size, and LVGL's own
- * zoom/stretch transform doesn't apply to tjpgd's (JPEG) lazily-decoded
- * output, only to fully-decoded buffers like lodepng's, so the raw-bytes
- * approach displayed art at its native size with black gaps around/below
- * it whenever that didn't match. Pre-resizing sidesteps the limitation
- * entirely -- by the time LVGL sees it, it's just a plain raw bitmap. */
-static void set_cover_art(uint8_t * owned_data, uint32_t size) {
-    uint16_t * resized = NULL;
-    bool decoded = owned_data && size > 0 &&
-                   cover_decode_to_rgb565(owned_data, size, COVER_ART_WIDTH, COVER_ART_HEIGHT, &resized);
-    free(owned_data); /* the compressed bytes are no longer needed once decoded (or decode failed) */
+/* Real-device bug report: entering the player screen right after picking a
+ * song left its on-screen play/pause/next/prev buttons unresponsive for a
+ * couple of seconds. Root cause: apply_track_metadata_to_ui() used to
+ * decode the embedded cover art (cover_decode_to_rgb565(), a full native-
+ * resolution JPEG/PNG decode -- see cover_decode.c's own comment on why
+ * this can't use tjpgd's faster scaled decode) and run the reflection blur
+ * above synchronously, on the UI thread, before play_track_at_from() ever
+ * reached nav_push(player_screen) -- easily 1-3+ seconds of pure blocking
+ * on this hardware for a large embedded image, during which
+ * lv_timer_handler() never runs, so nothing redraws and no touch input is
+ * processed at all. Exact same shape of bug (and fix) as the real-device
+ * incident documented at bt_apply_output_settings_thread_func()'s own
+ * comment above -- backgrounded here the same way: launch_cover_decode()
+ * kicks off the decode+blur on a pthread (cover_decode_to_rgb565() and
+ * compute_reflection_bytes() touch no LVGL/shared state, so this is safe),
+ * and poll_cover_decode() (called from update_timer_cb every tick) applies
+ * the result to the actual widgets once it's ready -- so nav_push() and
+ * audio_play_file_at() in play_track_at_from() now run immediately, with
+ * the cover art/reflection catching up a moment later instead of blocking
+ * everything else on the way there. */
+typedef struct {
+    int for_index;
+    uint8_t * picture_data; /* owned; NULL if the track has no embedded art */
+    uint32_t picture_size;
+} cover_decode_request_t;
 
-    free(current_cover_bytes);
-    current_cover_bytes = NULL;
+static pthread_t cover_decode_thread;
+static bool cover_decode_active = false;
+static volatile bool cover_decode_done_flag = false;
 
-    if (!decoded) {
+/* Result fields, written by cover_decode_thread_func() on the background
+ * thread and consumed (freed or applied) by poll_cover_decode() on the main
+ * thread once cover_decode_done_flag is seen true -- never touched by both
+ * at once, same "background thread writes then sets the flag last, main
+ * thread only reads after seeing the flag" contract as every other _done_
+ * flag in this file. */
+static int cover_decode_result_for_index;
+static bool cover_decode_result_ok;
+static uint16_t * cover_decode_result_pixels;    /* COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565, owned */
+static uint8_t * cover_decode_result_reflection; /* REFLECTION_WIDTH x REFLECTION_HEIGHT RGB565, owned */
+
+static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t picture_size);
+
+/* Holds at most one superseded request -- see launch_cover_decode()'s own
+ * comment on why a track change that arrives while a decode is already in
+ * flight can't just be dropped (that would leave the cover permanently
+ * stuck showing an earlier track's art). */
+static bool cover_decode_pending_valid = false;
+static cover_decode_request_t cover_decode_pending;
+
+static void * cover_decode_thread_func(void * arg) {
+    cover_decode_request_t * req = (cover_decode_request_t *) arg;
+
+    uint16_t * pixels = NULL;
+    bool ok = req->picture_data && req->picture_size > 0 &&
+              cover_decode_to_rgb565(req->picture_data, req->picture_size, COVER_ART_WIDTH, COVER_ART_HEIGHT, &pixels);
+    free(req->picture_data); /* the compressed bytes are no longer needed once decoded (or decode failed) */
+
+    uint8_t * reflection = ok ? compute_reflection_bytes((const uint8_t *) pixels) : NULL;
+
+    cover_decode_result_for_index = req->for_index;
+    cover_decode_result_ok = ok;
+    cover_decode_result_pixels = pixels;
+    cover_decode_result_reflection = reflection;
+    free(req);
+    cover_decode_done_flag = true; /* written last -- poll_cover_decode() only checks this flag */
+    return NULL;
+}
+
+/* Takes ownership of picture_data (a malloc()'d buffer from metadata_read(),
+ * or NULL). If a decode is already running, this doesn't launch a second
+ * one (cover_decode_to_rgb565()/compute_reflection_bytes() are reentrant --
+ * no shared state -- but there's no value in two decodes racing when only
+ * the newest one's result will ever get applied) -- it instead replaces
+ * cover_decode_pending (freeing whatever was queued there before), and
+ * poll_cover_decode() launches that pending request the moment the active
+ * one finishes. A rapid sequence of track changes only ever actually
+ * decodes the first and the final one, which is exactly the set of results
+ * that matters. */
+static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t picture_size) {
+    if (cover_decode_active) {
+        free(cover_decode_pending.picture_data);
+        cover_decode_pending.for_index = for_index;
+        cover_decode_pending.picture_data = picture_data;
+        cover_decode_pending.picture_size = picture_size;
+        cover_decode_pending_valid = true;
+        return;
+    }
+
+    cover_decode_request_t * req = malloc(sizeof(*req));
+    req->for_index = for_index;
+    req->picture_data = picture_data;
+    req->picture_size = picture_size;
+    cover_decode_done_flag = false;
+    cover_decode_active = true;
+    pthread_create(&cover_decode_thread, NULL, cover_decode_thread_func, req);
+}
+
+/* Called every tick from update_timer_cb. Applies the finished decode to
+ * cover_img/player_overlay_panel -- unless playlist_index has already moved
+ * on to a different track by the time this lands (another launch_cover_
+ * decode() call superseded it via cover_decode_pending, in which case that
+ * one is now either running or about to be), in which case the result is
+ * just discarded rather than briefly flashing a stale track's art. */
+static void poll_cover_decode(void) {
+    if (!cover_decode_active || !cover_decode_done_flag) return;
+    cover_decode_active = false;
+    pthread_join(cover_decode_thread, NULL);
+
+    if (cover_decode_result_for_index != playlist_index) {
+        free(cover_decode_result_pixels);
+        free(cover_decode_result_reflection);
+    } else if (!cover_decode_result_ok) {
+        free(current_cover_bytes);
+        current_cover_bytes = NULL;
         lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
         /* No in-memory raw bitmap to reflect for the static placeholder
          * cover -- reset the panel back to its plain background rather
@@ -3132,55 +3204,78 @@ static void set_cover_art(uint8_t * owned_data, uint32_t size) {
         free(current_reflection_bytes);
         current_reflection_bytes = NULL;
         lv_obj_set_style_bg_image_src(player_overlay_panel, asset_path("playing_plane/buttom.png"), 0);
-        return;
+    } else {
+        free(current_cover_bytes);
+        current_cover_bytes = (uint8_t *) cover_decode_result_pixels;
+        free(current_reflection_bytes);
+        current_reflection_bytes = cover_decode_result_reflection;
+
+        /* Real-device incident: "severe noise/corruption" on the actual on-
+         * screen cover art, root-caused via a raw dump of current_cover_bytes
+         * taken the instant cover_decode_to_rgb565() returns (before this
+         * point) -- a correct, undamaged image every time, on the real
+         * target hardware, not just a host-build test, which ruled out the
+         * decode pipeline entirely. An intermediate theory (LVGL's image
+         * cache, keyed on the source pointer, serving stale tiles since
+         * current_cover_dsc is a reused static struct) turned out to be
+         * wrong too -- lv_image_cache_drop() before every reassignment made
+         * no difference, and the same corruption showed up on a completely
+         * different track's art, not just a stale leftover from the
+         * previous one.
+         *
+         * The real bug: lv_image_header_t.magic (lv_image_dsc.h) must be
+         * LV_IMAGE_HEADER_MAGIC -- lv_bin_decoder.c (the decoder this hand-
+         * constructed raw descriptor actually goes through) treats any other
+         * value as an old-format header from before the magic field existed,
+         * and "fixes it up" in place via `header->cf = header->magic;
+         * header->magic = LV_IMAGE_HEADER_MAGIC;`. memset()ing the whole
+         * descriptor to 0 before setting cf/w/h/stride left magic at 0, so
+         * this quirks-mode shim fired on literally every track change,
+         * silently overwriting our just-set LV_COLOR_FORMAT_RGB565 with 0
+         * right before the image ever got drawn -- corrupting the color
+         * format used to interpret every pixel, not the pixel data itself,
+         * which is exactly why the underlying buffer always dumped correctly
+         * but the screen never showed it right. */
+        memset(&current_cover_dsc, 0, sizeof(current_cover_dsc));
+        current_cover_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        current_cover_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        current_cover_dsc.header.w = COVER_ART_WIDTH;
+        current_cover_dsc.header.h = COVER_ART_HEIGHT;
+        current_cover_dsc.header.stride = COVER_ART_WIDTH * 2;
+        current_cover_dsc.data = current_cover_bytes;
+        current_cover_dsc.data_size = (uint32_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2;
+        lv_image_set_src(cover_img, &current_cover_dsc);
+
+        /* Same LV_IMAGE_HEADER_MAGIC requirement as current_cover_dsc above. */
+        memset(&current_reflection_dsc, 0, sizeof(current_reflection_dsc));
+        current_reflection_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        current_reflection_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        current_reflection_dsc.header.w = REFLECTION_WIDTH;
+        current_reflection_dsc.header.h = REFLECTION_HEIGHT;
+        current_reflection_dsc.header.stride = REFLECTION_WIDTH * 2;
+        current_reflection_dsc.data = current_reflection_bytes;
+        current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * REFLECTION_HEIGHT * 2;
+        lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
+
+        /* TEMPORARY DIAGNOSTIC -- forcing a full-screen invalidate (not just
+         * cover_img's own, which lv_image_set_src() already does internally)
+         * to test whether this device's custom direct-render/page-flip fbdev
+         * patch (lv_conf.h, search "pan_double_buffer") has a bug specific to
+         * how the dirty region is computed for a single large (480x480)
+         * widget update, vs however a full-screen invalidate's dirty region
+         * ends up differing. Remove once the real album-art corruption bug
+         * is found. */
+        lv_obj_invalidate(lv_screen_active());
     }
 
-    current_cover_bytes = (uint8_t *) resized;
+    cover_decode_result_pixels = NULL;
+    cover_decode_result_reflection = NULL;
 
-    /* Real-device incident: "severe noise/corruption" on the actual on-
-     * screen cover art, root-caused via a raw dump of current_cover_bytes
-     * taken the instant cover_decode_to_rgb565() returns (before this
-     * point) -- a correct, undamaged image every time, on the real target
-     * hardware, not just a host-build test, which ruled out the decode
-     * pipeline entirely. An intermediate theory (LVGL's image cache, keyed
-     * on the source pointer, serving stale tiles since current_cover_dsc is
-     * a reused static struct) turned out to be wrong too -- lv_image_cache_
-     * drop() before every reassignment made no difference, and the same
-     * corruption showed up on a completely different track's art, not just
-     * a stale leftover from the previous one.
-     *
-     * The real bug: lv_image_header_t.magic (lv_image_dsc.h) must be
-     * LV_IMAGE_HEADER_MAGIC -- lv_bin_decoder.c (the decoder this hand-
-     * constructed raw descriptor actually goes through) treats any other
-     * value as an old-format header from before the magic field existed,
-     * and "fixes it up" in place via `header->cf = header->magic;
-     * header->magic = LV_IMAGE_HEADER_MAGIC;`. memset()ing the whole
-     * descriptor to 0 before setting cf/w/h/stride left magic at 0, so this
-     * quirks-mode shim fired on literally every track change, silently
-     * overwriting our just-set LV_COLOR_FORMAT_RGB565 with 0 right before
-     * the image ever got drawn -- corrupting the color format used to
-     * interpret every pixel, not the pixel data itself, which is exactly
-     * why the underlying buffer always dumped correctly but the screen
-     * never showed it right. */
-    memset(&current_cover_dsc, 0, sizeof(current_cover_dsc));
-    current_cover_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-    current_cover_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-    current_cover_dsc.header.w = COVER_ART_WIDTH;
-    current_cover_dsc.header.h = COVER_ART_HEIGHT;
-    current_cover_dsc.header.stride = COVER_ART_WIDTH * 2;
-    current_cover_dsc.data = current_cover_bytes;
-    current_cover_dsc.data_size = (uint32_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2;
-
-    lv_image_set_src(cover_img, &current_cover_dsc);
-    generate_reflection();
-    /* TEMPORARY DIAGNOSTIC -- forcing a full-screen invalidate (not just
-     * cover_img's own, which lv_image_set_src() already does internally)
-     * to test whether this device's custom direct-render/page-flip fbdev
-     * patch (lv_conf.h, search "pan_double_buffer") has a bug specific to
-     * how the dirty region is computed for a single large (480x480) widget
-     * update, vs however a full-screen invalidate's dirty region ends up
-     * differing. Remove once the real album-art corruption bug is found. */
-    lv_obj_invalidate(lv_screen_active());
+    if (cover_decode_pending_valid) {
+        cover_decode_pending_valid = false;
+        launch_cover_decode(cover_decode_pending.for_index, cover_decode_pending.picture_data,
+                             cover_decode_pending.picture_size);
+    }
 }
 
 static void favorite_icon_event_cb(lv_event_t * e) {
@@ -3239,7 +3334,7 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
         lv_label_set_text(quick_drawer_artist_label, folder_text);
     }
     refresh_format_badge();
-    set_cover_art(out_meta->picture_data, out_meta->picture_size); /* takes ownership */
+    launch_cover_decode(index, out_meta->picture_data, out_meta->picture_size); /* takes ownership, applied async */
 
     favorite_is_set = metadata_db_song_favorite_is_set(playlist[index]);
     const char * favorite_icon_asset = favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png";
@@ -4389,6 +4484,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_sleep_timer();
     poll_usb_mode_switch();
     poll_sd_card_hotplug();
+    poll_cover_decode();
 
     if (audio_consume_track_advanced()) {
         /* The playback thread already moved on to the queued next track by
@@ -6569,6 +6665,7 @@ static void poll_dlna_control(void) {
         audio_stop();
         set_play_button_state(false);
     }
+    dlna_control_notify_status(audio_is_playing(), audio_is_paused());
 }
 
 /* Shared "please wait" interstitial for background ops that still use it

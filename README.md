@@ -1,4 +1,4 @@
-# Hiby Open Source Player
+# Open Source Player for HiBy OS
 
 A from-scratch, open-source reimplementation of the HiBy R1's stock music player firmware, built in C with LVGL. It fully replaces the closed-source stock `hiby_player` binary while reusing the stock firmware's own UI assets, fonts, and system daemons (Bluetooth, Wi-Fi, DLNA) wherever it makes sense to.
 

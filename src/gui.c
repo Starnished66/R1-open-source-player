@@ -10921,7 +10921,7 @@ static void firmware_update_row_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_about_screen(void) {
-    static pill_list_item_t items[4];
+    static pill_list_item_t items[3];
     /* TEST_BUILD_TAG: optional -D from the Makefile (see TEST_BUILD_TAG
      * there), e.g. `make target TEST_BUILD_TAG=test25_avrcp` -- a
      * friendly label for which of this session's many test builds is
@@ -10938,12 +10938,11 @@ static lv_obj_t * build_about_screen(void) {
 #else
     snprintf(version_line, sizeof(version_line), "Alpha 1");
 #endif
-    items[0] = (pill_list_item_t){ "Hiby Open Source Player", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
+    items[0] = (pill_list_item_t){ "Open Source Player for HiBy OS", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
-    items[2] = (pill_list_item_t){ "Jose Garita's private build", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
-    items[3] =
+    items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 4);
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3);
     finalize_screen_navigation(scr);
     return scr;
 }

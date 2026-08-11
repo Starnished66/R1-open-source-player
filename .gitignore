@@ -48,3 +48,7 @@
 
 # Local-only known-issues tracker (not part of the public docs)
 /ISSUES.md
+
+# Claude Code
+/CLAUDE.md
+.claude/

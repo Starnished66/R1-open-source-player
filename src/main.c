@@ -155,7 +155,42 @@ static void try_mount_sd_device_node(const char * device_node) {
     subprocess_run(ntfs_argv, NULL, 0);
 }
 
+/* Real-device bug report: SD card never mounts on a genuine cold
+ * flash+first-boot, despite working fine across many prior test sessions on
+ * this exact device. Root cause goes deeper than a missing mkdir -- /data is
+ * a plain directory baked directly into this firmware's read-only squashfs
+ * rootfs (confirmed live: `mount` shows only "/", tmpfs mounts, and
+ * /usr/data's own ubifs volume -- nothing at /data; `mkdir /data/mnt` fails
+ * with EROFS), true on stock firmware as much as this project's own repacks
+ * (etc/init.d/S21mount_ubifs only mounts the "userdata" UBI volume onto
+ * /usr/data, nothing mounts anything onto /data). Every "working" test
+ * session this project has ever run was against a device that had been
+ * powered on continuously for a long time without a real reboot (only
+ * `adb shell`-launched test binaries, which never touch the kernel's mount
+ * table) -- so /data/mnt/sd_0 was riding on a leftover mount some earlier,
+ * unrelated manual `mount` command had set up, which just never got torn
+ * down across the device's entire uptime since. A genuine cold boot (the
+ * first time this was actually tested end-to-end via a real flash) exposed
+ * that /data was never actually writable to begin with. Fixed by mounting a
+ * tmpfs on /data once per process lifetime, before anything below tries to
+ * use it -- same tmpfs convention this firmware's own fstab already uses for
+ * /tmp, /dev/shm, /run. Guarded by a static bool rather than re-checking the
+ * mount table, since poll_sd_card_hotplug() (gui.c) calls this function
+ * repeatedly on retry -- mounting a second tmpfs on top of the first would
+ * shadow (and orphan) the SD card submount already living under it. */
+static void mount_data_tmpfs_if_needed(void) {
+    static bool tried = false;
+    if (tried) return;
+    tried = true;
+
+    char * argv[] = { (char *) "mount", (char *) "-t", (char *) "tmpfs",
+                       (char *) "tmpfs", (char *) "/data", NULL };
+    subprocess_run(argv, NULL, 0);
+}
+
 void mount_sd_card_if_needed(void) {
+    mount_data_tmpfs_if_needed();
+    mkdir("/data/mnt", 0755);
     mkdir("/data/mnt/sd_0", 0755);
     if (sd_mount_point_mounted()) return;
 

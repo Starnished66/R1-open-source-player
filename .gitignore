@@ -45,3 +45,6 @@
 # Host-only test audio fixtures (generated locally for manual verification,
 # not needed to build or run the project)
 /music/
+
+# Local-only known-issues tracker (not part of the public docs)
+/ISSUES.md

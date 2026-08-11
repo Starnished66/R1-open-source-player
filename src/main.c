@@ -133,24 +133,53 @@ static bool sd_mount_point_mounted(void) {
     return parent_st.st_dev != mnt_st.st_dev;
 }
 
-void mount_sd_card_if_needed(void) {
-    mkdir("/data/mnt/sd_0", 0755);
-    if (sd_mount_point_mounted()) return;
-
+/* Tries all three supported filesystem types against one device node, same
+ * "try each in turn, stop at the first that actually mounts" approach as
+ * mount_sd_card_if_needed() itself -- factored out so that function can
+ * call it twice: once for the partition node, once (see its own comment)
+ * as a fallback for the whole-disk node. */
+static void try_mount_sd_device_node(const char * device_node) {
     char * vfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "vfat", (char *) "-o",
                             (char *) "rw,relatime,fmask=0022,dmask=0022,codepage=936,iocharset=utf8,shortname=mixed",
-                            (char *) "/dev/mmcblk0p1", (char *) "/data/mnt/sd_0", NULL };
+                            (char *) device_node, (char *) "/data/mnt/sd_0", NULL };
     subprocess_run(vfat_argv, NULL, 0);
     if (sd_mount_point_mounted()) return;
 
     char * exfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "exfat", (char *) "-o",
-                             (char *) "rw,relatime", (char *) "/dev/mmcblk0p1", (char *) "/data/mnt/sd_0", NULL };
+                             (char *) "rw,relatime", (char *) device_node, (char *) "/data/mnt/sd_0", NULL };
     subprocess_run(exfat_argv, NULL, 0);
     if (sd_mount_point_mounted()) return;
 
     char * ntfs_argv[] = { (char *) "mount", (char *) "-t", (char *) "ntfs", (char *) "-o",
-                            (char *) "rw,relatime", (char *) "/dev/mmcblk0p1", (char *) "/data/mnt/sd_0", NULL };
+                            (char *) "rw,relatime", (char *) device_node, (char *) "/data/mnt/sd_0", NULL };
     subprocess_run(ntfs_argv, NULL, 0);
+}
+
+void mount_sd_card_if_needed(void) {
+    mkdir("/data/mnt/sd_0", 0755);
+    if (sd_mount_point_mounted()) return;
+
+    try_mount_sd_device_node("/dev/mmcblk0p1");
+    if (sd_mount_point_mounted()) return;
+
+    /* Real-device bug report: a card that mounts fine on a PC but never
+     * populates the library on this device. /dev/mmcblk0p1 (the first
+     * partition) only ever gets a device node from the kernel if the card
+     * actually has a partition table -- a card formatted as a "superfloppy"
+     * (a filesystem written straight to the raw disk, no MBR/partition
+     * table at all, which some SD formatting tools produce by default,
+     * especially for smaller cards) never gets a p1 node, so every attempt
+     * above was guaranteed to fail no matter which -t was tried. Falling
+     * back to the whole-disk node here covers that case; gui.c's own
+     * poll_sd_card_hotplug()/sd_card_base_device_present() already knew
+     * about this scenario (see its own comment) but had no mount attempt to
+     * fall back to before concluding the card needed reformatting -- this
+     * is that missing attempt, tried before ever reaching that destructive
+     * path. Harmless no-op for a normally-partitioned card: mount just
+     * fails (whole-disk-as-filesystem on a partitioned card isn't a valid
+     * filesystem), same "best effort, check the result" pattern as every
+     * other attempt in this function. */
+    try_mount_sd_device_node("/dev/mmcblk0");
 }
 
 /* Diagnostic instrumentation for the still-unresolved cold-boot failure:

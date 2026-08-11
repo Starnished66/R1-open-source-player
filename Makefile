@@ -194,7 +194,7 @@ TARGET_LDFLAGS = -static -no-pie -lpthread -lm
 
 # Source files
 APP_SRCS = src/main.c src/gui.c src/audio.c src/file_browser.c src/hw_buttons.c src/input_device_utils.c src/metadata.c src/metadata_db.c src/settings.c src/aiff_decoder.c src/dsd_filter.c src/dsd_decoder.c src/aac_decoder.c src/mp4_demux.c src/ape_demux.c src/ape_decoder.c src/peq.c src/assets.c src/screen_builders.c src/battery.c src/wifi_status.c src/ca_bundle.c src/http_client.c src/subsonic_client.c src/cover_decode.c src/asf_demux.c src/wma_decoder.c src/fallback_font.c \
-src/subprocess.c src/wifi_control.c src/bluetooth_control.c src/backlight.c src/import_web.c src/airplay_control.c src/headphone_status.c src/device_config.c src/led_control.c src/charge_limiter.c src/idle_shutdown.c src/power_suspend.c src/text_reader.c src/usb_mode_control.c src/usb_dac_bridge.c src/firmware_update.c src/playlist_files.c src/timezone_data.c src/timezone_apply.c src/dlna_control.c
+src/subprocess.c src/wifi_control.c src/bluetooth_control.c src/backlight.c src/import_web.c src/airplay_control.c src/headphone_status.c src/device_config.c src/led_control.c src/charge_limiter.c src/idle_shutdown.c src/power_suspend.c src/text_reader.c src/usb_mode_control.c src/usb_dac_bridge.c src/firmware_update.c src/playlist_files.c src/timezone_data.c src/timezone_apply.c src/dlna_control.c src/remote_control.c
 APP_CXX_SRCS = src/alac_decoder.cpp
 LVGL_SRCS = $(shell find $(LVGL_DIR)/src -type f -name '*.c')
 TINYALSA_SRCS = $(shell find $(TINYALSA_DIR)/src -type f -name '*.c')

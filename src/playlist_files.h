@@ -39,4 +39,27 @@ bool playlist_files_remove(const char * m3u_path, const char * song_path);
 bool playlist_files_create(const char * dir, const char * name, const char * song_path, char * out_path,
                             size_t out_path_size);
 
+/* Deletes the whole M3U file at m3u_path outright (not a song within it --
+ * see playlist_files_remove() for that). Used both for an explicit
+ * user-initiated "delete this playlist" and for auto-deleting a playlist
+ * that's become empty (see gui.c's playlist_row_click_cb()/
+ * group_song_remove_row_cb()) -- never call this on Favorites/Most Played,
+ * which aren't backed by a real M3U file at all. Returns false if the file
+ * doesn't exist or can't be removed. */
+bool playlist_files_delete(const char * m3u_path);
+
+/* Reads back a playlist's song paths, in file order -- the read-back
+ * counterpart to playlist_files_append()/_create(). Skips blank lines and
+ * '#'-prefixed M3U directives/comments. Doesn't filter by file extension
+ * the way file_browser.c's own file_browser_build_playlist_from_m3u() does
+ * (that one also has to handle directory listings and hand-dropped M3U
+ * files, which can contain non-audio entries) -- these playlists are only
+ * ever written by this app's own playlist_files_append()/_create(), which
+ * already only ever write real song paths, and this function deliberately
+ * stays free of any LVGL/screen dependency (file_browser.c pulls those in
+ * via screen_builders.h) so it can be called from a plain background
+ * thread. Caller owns *out_paths (free each entry, then the array).
+ * Returns false if the file can't be read. */
+bool playlist_files_read(const char * m3u_path, char *** out_paths, int * out_count);
+
 #endif /* PLAYLIST_FILES_H */

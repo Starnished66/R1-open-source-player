@@ -90,6 +90,7 @@ static void set_defaults(player_settings_t * out) {
     out->bt_hide_unnamed_devices = true;
     out->wifi_dac_mode_enabled = false;
     out->dlna_renderer_enabled = false;
+    out->remote_control_enabled = false;
     out->screen_timeout_enabled = true;
     out->screen_timeout_seconds = 60;
     out->led_indicator_enabled = true;
@@ -157,6 +158,8 @@ bool settings_load(player_settings_t * out) {
             out->wifi_dac_mode_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "dlna_renderer_enabled") == 0) {
             out->dlna_renderer_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "remote_control_enabled") == 0) {
+            out->remote_control_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "screen_timeout_enabled") == 0) {
             out->screen_timeout_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "screen_timeout_seconds") == 0) {
@@ -253,6 +256,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "bt_hide_unnamed_devices=%d\n", settings->bt_hide_unnamed_devices ? 1 : 0);
     fprintf(f, "wifi_dac_mode=%d\n", settings->wifi_dac_mode_enabled ? 1 : 0);
     fprintf(f, "dlna_renderer_enabled=%d\n", settings->dlna_renderer_enabled ? 1 : 0);
+    fprintf(f, "remote_control_enabled=%d\n", settings->remote_control_enabled ? 1 : 0);
     fprintf(f, "screen_timeout_enabled=%d\n", settings->screen_timeout_enabled ? 1 : 0);
     fprintf(f, "screen_timeout_seconds=%d\n", settings->screen_timeout_seconds);
     fprintf(f, "led_indicator_enabled=%d\n", settings->led_indicator_enabled ? 1 : 0);

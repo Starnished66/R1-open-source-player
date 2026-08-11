@@ -25,22 +25,42 @@
 #define VOLUME_REPEAT_INITIAL_DELAY_MS 350
 #define VOLUME_REPEAT_INTERVAL_MS 60
 
+/* Real-device bug report: holding the power button turned the screen off
+ * immediately (the previous behavior fired on every KEY_POWER down edge,
+ * tap or hold alike) with no way to actually power the device off short of
+ * the idle-shutdown timer. A hold past this threshold now instead fires
+ * hw_buttons_consume_power_long_press() (see handle_key_event() below) so
+ * gui.c can show a power-off countdown; a genuine short tap still toggles
+ * the screen exactly as before. 700ms -- long enough that a normal
+ * screen-toggle tap never crosses it, short enough to feel deliberate
+ * rather than sluggish. */
+#define POWER_LONG_PRESS_MS 700
+
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool play_pause_requested = false;
 static bool next_requested = false;
 static bool prev_requested = false;
 static bool power_requested = false;
+static bool power_long_press_requested = false;
 static int volume_delta = 0;
 
 /* Held-state + next-repeat-due tracking for volume up/down specifically --
- * the only two keys that repeat while held. Everything else (power,
- * play/pause, next/prev) stays single-shot: repeating a track skip or a
- * power toggle while a finger lingers on the button would be actively
- * wrong, not just unnecessary. */
+ * the only two keys that repeat while held. Everything else (play/pause,
+ * next/prev) stays single-shot: repeating a track skip while a finger
+ * lingers on the button would be actively wrong, not just unnecessary. */
 static bool volume_up_held = false;
 static bool volume_down_held = false;
 static uint32_t volume_up_next_repeat_ms = 0;
 static uint32_t volume_down_next_repeat_ms = 0;
+
+/* Power held-state + long-press-due tracking, same shape as the volume
+ * repeat state above -- power_long_press_fired guards against firing the
+ * long-press flag more than once per physical press, and (in
+ * handle_key_event()'s value==0 branch) against also firing the short-tap
+ * flag once the same press has already turned into a long-press. */
+static bool power_held = false;
+static bool power_long_press_fired = false;
+static uint32_t power_long_press_due_ms = 0;
 
 static uint32_t monotonic_ms(void) {
     struct timespec ts;
@@ -56,10 +76,14 @@ static void handle_key_event(unsigned short code, int value) {
     pthread_mutex_lock(&state_mutex);
     if (value == 1) {
         switch (code) {
-            case KEY_POWER:
-                power_requested = true;
-                DBG_LOG("hw_buttons: KEY_POWER down at t=%u\n", monotonic_ms());
+            case KEY_POWER: {
+                uint32_t now = monotonic_ms();
+                power_held = true;
+                power_long_press_fired = false;
+                power_long_press_due_ms = now + POWER_LONG_PRESS_MS;
+                DBG_LOG("hw_buttons: KEY_POWER down at t=%u\n", now);
                 break;
+            }
             case KEY_PLAYPAUSE:      play_pause_requested = true; break;
             case KEY_NEXTSONG:       next_requested = true; break;
             case KEY_PREVIOUSSONG:   prev_requested = true; break;
@@ -77,6 +101,17 @@ static void handle_key_event(unsigned short code, int value) {
         }
     } else if (value == 0) {
         switch (code) {
+            case KEY_POWER:
+                /* Only a short tap (released before the long-press
+                 * threshold fired) sets the screen-toggle flag -- if
+                 * power_long_press_fired is already true, that flag
+                 * (hw_buttons_consume_power_long_press()) already told
+                 * gui.c to show the power-off countdown for this same
+                 * press, and the release shouldn't also toggle the screen
+                 * out from under it. */
+                if (power_held && !power_long_press_fired) power_requested = true;
+                power_held = false;
+                break;
             case KEY_VOLUMEUP:   volume_up_held = false; break;
             case KEY_VOLUMEDOWN: volume_down_held = false; break;
             default: break;
@@ -100,6 +135,20 @@ static void apply_due_volume_repeats(void) {
     if (volume_down_held && (int32_t) (now - volume_down_next_repeat_ms) >= 0) {
         volume_delta -= VOLUME_STEP_PERCENT;
         volume_down_next_repeat_ms = now + VOLUME_REPEAT_INTERVAL_MS;
+    }
+    pthread_mutex_unlock(&state_mutex);
+}
+
+/* Called on every poll() timeout while the power button is held (see the
+ * main loop below) -- fires the long-press flag exactly once per press, the
+ * moment the hold crosses POWER_LONG_PRESS_MS, independent of when (or
+ * whether) the button is ever released. */
+static void apply_due_power_long_press(void) {
+    uint32_t now = monotonic_ms();
+    pthread_mutex_lock(&state_mutex);
+    if (power_held && !power_long_press_fired && (int32_t) (now - power_long_press_due_ms) >= 0) {
+        power_long_press_fired = true;
+        power_long_press_requested = true;
     }
     pthread_mutex_unlock(&state_mutex);
 }
@@ -154,17 +203,20 @@ static void * hw_buttons_thread_func(void * arg) {
     while (1) {
         pthread_mutex_lock(&state_mutex);
         bool volume_held = volume_up_held || volume_down_held;
+        bool power_pending_long_press = power_held && !power_long_press_fired;
         pthread_mutex_unlock(&state_mutex);
 
         /* Blocks indefinitely (no wasted wakeups) except while a volume key
-         * is actually held, when a short timeout is the only way to notice
-         * "still held, no new event" and fire the next repeat step -- see
-         * apply_due_volume_repeats(). Reverts to -1 the moment both volume
-         * keys are released, same idle efficiency as before this feature
-         * existed. */
-        int ret = poll(fds, (nfds_t) nfds, volume_held ? VOLUME_REPEAT_INTERVAL_MS : -1);
+         * is held or the power button is held awaiting its long-press
+         * threshold, when a short timeout is the only way to notice "still
+         * held, no new event" and fire the next repeat step / long-press --
+         * see apply_due_volume_repeats()/apply_due_power_long_press().
+         * Reverts to -1 the moment nothing is pending either way, same idle
+         * efficiency as before either feature existed. */
+        int ret = poll(fds, (nfds_t) nfds, (volume_held || power_pending_long_press) ? VOLUME_REPEAT_INTERVAL_MS : -1);
         if (ret == 0) {
             apply_due_volume_repeats();
+            apply_due_power_long_press();
             continue;
         }
         if (ret < 0) continue;
@@ -194,6 +246,14 @@ bool hw_buttons_consume_power(void) {
     pthread_mutex_lock(&state_mutex);
     bool result = power_requested;
     power_requested = false;
+    pthread_mutex_unlock(&state_mutex);
+    return result;
+}
+
+bool hw_buttons_consume_power_long_press(void) {
+    pthread_mutex_lock(&state_mutex);
+    bool result = power_long_press_requested;
+    power_long_press_requested = false;
     pthread_mutex_unlock(&state_mutex);
     return result;
 }

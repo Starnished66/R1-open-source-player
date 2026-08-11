@@ -148,3 +148,47 @@ bool playlist_files_create(const char * dir, const char * name, const char * son
     if (out_path) snprintf(out_path, out_path_size, "%s", path);
     return true;
 }
+
+bool playlist_files_delete(const char * m3u_path) {
+    return remove(m3u_path) == 0;
+}
+
+bool playlist_files_read(const char * m3u_path, char *** out_paths, int * out_count) {
+    FILE * f = fopen(m3u_path, "r");
+    if (!f) return false;
+
+    char dir_path[PATH_MAX];
+    const char * slash = strrchr(m3u_path, '/');
+    size_t dir_len = slash ? (size_t) (slash - m3u_path) : 0;
+    if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
+    memcpy(dir_path, m3u_path, dir_len);
+    dir_path[dir_len] = '\0';
+
+    char ** paths = NULL;
+    int count = 0;
+    int capacity = 0;
+    char line[PATH_MAX];
+
+    while (fgets(line, sizeof(line), f)) {
+        trim_eol(line);
+        if (line[0] == '\0' || line[0] == '#') continue;
+
+        char full_path[PATH_MAX];
+        if (line[0] == '/') {
+            snprintf(full_path, sizeof(full_path), "%s", line);
+        } else {
+            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, line);
+        }
+
+        if (count == capacity) {
+            capacity = capacity ? capacity * 2 : 16;
+            paths = realloc(paths, sizeof(char *) * (size_t) capacity);
+        }
+        paths[count++] = strdup(full_path);
+    }
+    fclose(f);
+
+    *out_paths = paths;
+    *out_count = count;
+    return true;
+}

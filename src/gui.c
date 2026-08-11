@@ -5,6 +5,7 @@
 #include "import_web.h"
 #include "airplay_control.h"
 #include "dlna_control.h"
+#include "remote_control.h"
 #include "battery.h"
 #include "wifi_status.h"
 #include "audio.h"
@@ -154,6 +155,8 @@ static lv_obj_t * artists_screen;
 static lv_obj_t * albums_screen;
 static lv_obj_t * album_artist_screen;
 static lv_obj_t * playlists_screen;
+static lv_obj_t * playlists_edit_btn;
+static bool playlists_edit_mode = false;
 static lv_obj_t * artist_albums_screen;
 static lv_obj_t * stream_media_screen;
 static lv_obj_t * subsonic_entry_screen;
@@ -1223,6 +1226,35 @@ static void refresh_wifi_icon(void) {
  * subprocess call to the play hot path. */
 static bool bt_is_powered_cached = false;
 
+/* Real-device incident: on a genuine cold boot, hci0 briefly reads
+ * "powered" right after S80_bt_init's own firmware flash (which leaves the
+ * raw HCI device up as a side effect of attaching it), before bluetoothd
+ * itself has even started (~11.5s into boot, confirmed via
+ * /proc/<pid>/stat) and forces it back off per its own AutoEnable=false
+ * default (/etc/bluetooth/main.conf) -- a real, if brief, on-then-off
+ * transition, not a UI caching bug. This app's own ~5s passive status poll
+ * can straddle that window and flash the topbar/drawer icon on, then off,
+ * a few seconds apart. Not fixed by changing AutoEnable (that would make
+ * Bluetooth default ON every boot, a real behavior change, not requested).
+ * Instead, PASSIVE polls only (the automatic startup check and periodic
+ * timer, not an explicit user tap) simply don't display a "powered" result
+ * during this early window -- purely cosmetic, doesn't touch actual radio
+ * state, and self-corrects to the real (already-off) steady state once the
+ * window passes either way. An explicit toggle tap always reflects
+ * immediately regardless of this window (see start_refresh_bt_icon() vs
+ * start_refresh_bt_icon_passive() below) -- AND permanently disables the
+ * suppression for the rest of the session the instant one happens (see
+ * bt_boot_settle_suppress_disabled below), not just for that one poll:
+ * without this, a user who manually enables Bluetooth inside the 20s
+ * window would see it correctly turn on, then get incorrectly suppressed
+ * back to "off" on screen by the very next automatic ~5s poll, which would
+ * still be inside the window and would otherwise have no way to tell "the
+ * user really did just turn this on" apart from "this is the same boot
+ * flash transient." */
+#define BT_ICON_BOOT_SETTLE_MS 20000
+static bool refresh_bt_icon_is_passive_poll = false;
+static bool bt_boot_settle_suppress_disabled = false;
+
 /* Moved up from the Bluetooth settings screen section further down (still
  * used there, see populate_bt_screen()) -- refresh_bt_icon_thread_func()
  * below needs to reference bt_scan_results directly, before its own
@@ -1294,11 +1326,26 @@ static void * refresh_bt_icon_thread_func(void * arg) {
     return NULL;
 }
 
-static void start_refresh_bt_icon(void) {
+static void start_refresh_bt_icon_ex(bool passive) {
     if (refresh_bt_icon_active) return; /* previous check still in flight -- same "ignore taps until it lands" pattern as everything else here */
     refresh_bt_icon_active = true;
     refresh_bt_icon_done_flag = false;
+    refresh_bt_icon_is_passive_poll = passive;
     pthread_create(&refresh_bt_icon_thread, NULL, refresh_bt_icon_thread_func, NULL);
+}
+
+/* Explicit user action (a toggle tap, a manual Bluetooth screen open) --
+ * always reflects the real state immediately, see BT_ICON_BOOT_SETTLE_MS's
+ * own comment above. */
+static void start_refresh_bt_icon(void) {
+    start_refresh_bt_icon_ex(false);
+}
+
+/* Automatic checks only (startup + the periodic timer) -- subject to the
+ * early-boot "powered" suppression window, see BT_ICON_BOOT_SETTLE_MS's
+ * own comment above. */
+static void start_refresh_bt_icon_passive(void) {
+    start_refresh_bt_icon_ex(true);
 }
 
 static void populate_bt_screen(void); /* defined with the rest of the Bluetooth settings screen, below */
@@ -1308,12 +1355,18 @@ static void poll_refresh_bt_icon(void) {
     refresh_bt_icon_active = false;
     pthread_join(refresh_bt_icon_thread, NULL);
 
-    bt_is_powered_cached = refresh_bt_icon_result_powered;
-    if (quick_drawer_bt_icon) {
-        lv_image_set_src(quick_drawer_bt_icon, asset_path(refresh_bt_icon_result_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
+    bool display_powered = refresh_bt_icon_result_powered;
+    if (display_powered && refresh_bt_icon_is_passive_poll && !bt_boot_settle_suppress_disabled &&
+        lv_tick_get() < BT_ICON_BOOT_SETTLE_MS) {
+        display_powered = false; /* see BT_ICON_BOOT_SETTLE_MS's own comment -- cosmetic only, doesn't touch actual radio state */
     }
 
-    if (!refresh_bt_icon_result_powered) {
+    bt_is_powered_cached = display_powered;
+    if (quick_drawer_bt_icon) {
+        lv_image_set_src(quick_drawer_bt_icon, asset_path(display_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
+    }
+
+    if (!display_powered) {
         lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
         /* Bluetooth screen's own toggle row + everything gated on it reads
@@ -2277,6 +2330,11 @@ static bool bt_toggle_forced_dac_off = false;
 
 static void * bt_toggle_thread_func(void * arg) {
     (void) arg;
+    /* See bt_boot_settle_suppress_disabled's own comment above
+     * BT_ICON_BOOT_SETTLE_MS -- this app is about to make a real,
+     * deliberate state change, so the passive-poll boot-flicker
+     * suppression must never fight it. */
+    bt_boot_settle_suppress_disabled = true;
     bt_toggle_forced_dac_off = false;
     if (bt_control_is_powered()) {
         /* Real-device incident: turning Bluetooth off via the quick drawer
@@ -2373,6 +2431,11 @@ static volatile bool bt_dac_startup_reapply_done_flag = false;
 
 static void * bt_dac_startup_reapply_thread_func(void * arg) {
     (void) arg;
+    /* Same reasoning as bt_toggle_thread_func()'s own comment -- this is
+     * also the app deliberately turning Bluetooth on, not a spontaneous
+     * boot-time transient, so it must never fight the passive-poll
+     * suppression window either. */
+    bt_boot_settle_suppress_disabled = true;
     bt_control_init_chip();
     bt_control_enable();
     bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
@@ -3761,6 +3824,17 @@ static void resume_from_suspend_fixups(void) {
     DBG_LOG("resume: grace window armed at tick=%u\n", resumed_from_suspend_tick);
 }
 
+/* Defined with the rest of the All Songs screen, much further down --
+ * forward-declared here since update_timer_cb() (just below) needs it for
+ * the remote-control play-by-index consumer. */
+static void all_songs_row_click_cb(int index);
+
+/* Defined with the rest of the power-off countdown popup, much further
+ * down -- forward-declared here since update_timer_cb() (just below) needs
+ * them for the power-button long-press consumer. */
+static void start_power_off_countdown(void);
+static void poll_power_off_countdown(void);
+
 static void update_timer_cb(lv_timer_t * timer) {
     (void) timer;
 
@@ -3832,6 +3906,43 @@ static void update_timer_cb(lv_timer_t * timer) {
         settings_save(&current_settings);
         show_volume_popup(new_percent);
         refresh_volume_topbar(new_percent);
+    }
+
+    /* Phone remote-control (Phase 2, remote_control.h): same "background
+     * thread sets a flag, this is the one thread allowed to touch LVGL/
+     * audio state" pattern as hw_buttons/bt_media_player just above --
+     * reuses the exact same shuffle-aware stepping and volume-persistence
+     * shape as those, rather than a separate implementation. */
+    if (remote_control_consume_play_pause()) {
+        toggle_play_pause();
+    }
+    if (remote_control_consume_next()) {
+        int next_index = compute_manual_step_index(playlist_index, 1);
+        if (next_index >= 0) play_track_at(next_index);
+    }
+    if (remote_control_consume_prev()) {
+        int prev_index = compute_manual_step_index(playlist_index, -1);
+        if (prev_index >= 0) play_track_at(prev_index);
+    }
+    int remote_seek_seconds;
+    if (remote_control_consume_seek(&remote_seek_seconds)) {
+        audio_seek((double) remote_seek_seconds);
+    }
+    int remote_volume_percent;
+    if (remote_control_consume_volume(&remote_volume_percent)) {
+        lv_slider_set_value(volume_slider, remote_volume_percent, LV_ANIM_OFF);
+        audio_set_volume((float) remote_volume_percent / 100.0f);
+        current_settings.volume = (float) remote_volume_percent / 100.0f;
+        settings_save(&current_settings);
+        show_volume_popup(remote_volume_percent);
+        refresh_volume_topbar(remote_volume_percent);
+    }
+    int remote_play_index;
+    if (remote_control_consume_play_index(&remote_play_index)) {
+        /* Same handler the All Songs screen's own rows use -- builds a
+         * fresh playlist from the whole library and starts at this index,
+         * exactly like tapping that row there. */
+        all_songs_row_click_cb(remote_play_index);
     }
 
     /* Auto-stop on headphone-output loss: this hardware has no built-in
@@ -4030,6 +4141,35 @@ static void update_timer_cb(lv_timer_t * timer) {
             backlight_set_screen_on(!backlight_screen_is_on());
         }
     }
+    if (hw_buttons_consume_power_long_press()) {
+        /* Same resumed_from_suspend_pending guard as the short-tap consumer
+         * just above -- a long hold that woke the device from suspend
+         * shouldn't also immediately pop up a power-off countdown the
+         * instant the screen comes back on. power_off_countdown_active's
+         * own guard (inside start_power_off_countdown() isn't needed here
+         * since hw_buttons.c already only fires this once per physical
+         * press) still lets a *second* long-press restart the countdown
+         * from the top while one is already showing, which is fine. */
+        if (resumed_from_suspend_pending) {
+            resumed_from_suspend_pending = false;
+        } else {
+            /* Real-device bug report: the countdown popped up invisibly if
+             * the screen was already asleep (from timeout or a previous
+             * short tap) when the hold crossed the long-press threshold --
+             * lv_display_trigger_activity() alone only resets the
+             * inactivity clock, it doesn't touch the backlight. Explicit
+             * backlight_set_screen_on(true) here (unconditional, same
+             * idiom as resume_from_suspend_fixups()'s own wake-up) makes
+             * screen_on_now below come out true, which is what already
+             * drives lv_indev_enable(NULL, true) further down -- so this
+             * also re-enables touch for the Cancel button, not just the
+             * backlight. */
+            backlight_set_screen_on(true);
+            lv_display_trigger_activity(NULL);
+            start_power_off_countdown();
+        }
+    }
+    poll_power_off_countdown();
 
     uint32_t screen_inactive_ms = lv_display_get_inactive_time(NULL);
     if (current_settings.screen_timeout_enabled && backlight_screen_is_on() &&
@@ -4190,7 +4330,7 @@ static void update_timer_cb(lv_timer_t * timer) {
         if (screen_just_woke || ++wifi_poll_tick_counter >= WIFI_POLL_TICKS) {
             wifi_poll_tick_counter = 0;
             refresh_wifi_icon();
-            start_refresh_bt_icon(); /* also forks a process (bluetoothctl show), same low cadence as wifi */
+            start_refresh_bt_icon_passive(); /* also forks a process (bluetoothctl show), same low cadence as wifi */
         }
     }
 
@@ -4202,6 +4342,24 @@ static void update_timer_cb(lv_timer_t * timer) {
      * cheap. */
     charge_limiter_poll(current_settings.charge_limiter_enabled, false);
     led_control_poll(current_settings.led_indicator_enabled);
+
+    if (current_settings.remote_control_enabled) {
+        /* No separate now-playing metadata cache exists in this app beyond
+         * what's already on screen -- song_title_label/song_folder_label
+         * are this app's own single source of truth for title/artist (see
+         * apply_track_metadata_to_ui()), so read them back rather than
+         * standing up a second copy of the same state just for this.
+         * Album isn't tracked anywhere after the initial metadata_read()
+         * call, so it's left blank here -- a real gap, not an oversight,
+         * see remote_control.h's own Phase 1 scope note. */
+        const char * now_playing_path =
+            (playlist_count > 0 && playlist_index >= 0 && playlist_index < playlist_count) ? playlist[playlist_index]
+                                                                                             : NULL;
+        remote_control_notify_status(audio_is_playing(), audio_is_paused(), lv_label_get_text(song_title_label),
+                                      lv_label_get_text(song_folder_label), "", now_playing_path,
+                                      (int) audio_get_position_seconds(), (int) audio_get_duration_seconds(),
+                                      audio_get_volume());
+    }
 
     /* Polling for in-flight async operations (wifi/bt connect, library scan,
      * subsonic sync, ...) keeps running regardless of screen state -- these
@@ -5411,6 +5569,41 @@ static lv_obj_t * build_all_songs_screen(void) {
     return scr;
 }
 
+/* Hands remote_control.c its own copy of the library for GET /api/library
+ * and playlist mutation (see remote_control_sync_library()'s own doc
+ * comment on why the index ordering must exactly match all_songs_paths/
+ * all_song_tags) -- call every time those are rebuilt, same call sites as
+ * build_all_songs_screen() itself. Builds three plain arrays rather than
+ * passing all_song_tags directly since that struct also carries album/
+ * album_artist/genre this doesn't need, and song_display_title_of()'s
+ * filename-fallback logic isn't something remote_control.c should have to
+ * duplicate. Paths are needed (not just for display) because playlist
+ * creation/add-to-playlist reference a song by this same library index. */
+static void sync_remote_control_library(void) {
+    if (all_songs_count == 0) {
+        remote_control_sync_library(NULL, NULL, NULL, NULL, NULL, 0);
+        return;
+    }
+    const char ** titles = malloc(sizeof(char *) * (size_t) all_songs_count);
+    const char ** artists = malloc(sizeof(char *) * (size_t) all_songs_count);
+    const char ** album_artists = malloc(sizeof(char *) * (size_t) all_songs_count);
+    const char ** albums = malloc(sizeof(char *) * (size_t) all_songs_count);
+    const char ** paths = malloc(sizeof(char *) * (size_t) all_songs_count);
+    for (int i = 0; i < all_songs_count; i++) {
+        titles[i] = song_display_title_of(i);
+        artists[i] = all_song_tags[i].artist;
+        album_artists[i] = all_song_tags[i].album_artist;
+        albums[i] = all_song_tags[i].album;
+        paths[i] = all_songs_paths[i];
+    }
+    remote_control_sync_library(titles, artists, album_artists, albums, paths, all_songs_count);
+    free(titles);
+    free(artists);
+    free(album_artists);
+    free(albums);
+    free(paths);
+}
+
 static void all_songs_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_push(all_songs_screen);
@@ -5448,6 +5641,12 @@ static bool group_songs_edit_mode = false;
  * already in scope -- forward-declared here since populate_group_songs_rows()
  * (just below) needs to wire it up as the remove-icon's click handler. */
 static void group_song_remove_row_cb(lv_event_t * e);
+
+/* Defined near populate_playlists_screen() further down -- forward-declared
+ * here since group_song_remove_row_cb() (below) and playlist_row_click_cb()
+ * both need to refresh the Playlists screen's list after auto-deleting a
+ * playlist that's become empty. */
+static void populate_playlists_screen(void);
 
 static void group_song_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -7477,7 +7676,22 @@ static void group_song_remove_row_cb(lv_event_t * e) {
 
     char ** songs = NULL;
     int count = 0;
-    file_browser_build_playlist_from_m3u(m3u_path, &songs, &count); /* false (empty playlist) leaves songs/count at 0 -- rebuild below handles that fine */
+    file_browser_build_playlist_from_m3u(m3u_path, &songs, &count); /* false (empty playlist) leaves songs/count at 0, nothing allocated -- handled below */
+
+    if (count == 0) {
+        /* Empty playlists are auto-deleted rather than left around as a
+         * stuck row nothing can open again -- this is the normal, in-app
+         * way a playlist becomes empty (removing its last song). m3u_path
+         * (== group_songs_edit_m3u_path) is a pointer into
+         * playlists_m3u_paths, so delete before populate_playlists_screen()
+         * below frees/rebuilds that array out from under it. */
+        playlist_files_delete(m3u_path);
+        populate_playlists_screen(); /* not auto-refreshed by nav_pop() -- see build_playlists_screen()'s own comment */
+        nav_pop();
+        show_error_toast("Playlist deleted (last song removed)");
+        return;
+    }
+
     rebuild_playlist_m3u_group(NULL, songs, count);
     for (int i = 0; i < count; i++) free(songs[i]);
     free(songs);
@@ -7507,12 +7721,46 @@ static void playlist_row_click_cb(lv_event_t * e) {
     char ** songs;
     int count;
     if (!file_browser_build_playlist_from_m3u(playlists_m3u_paths[m3u_index], &songs, &count)) {
-        show_error_toast("Playlist is empty or unreadable");
+        /* False here means either "genuinely can't open" (leave it alone --
+         * could be a transient SD-card issue, not the playlist's fault) or
+         * "opened fine, zero playable entries" (a stale empty playlist,
+         * e.g. one that predates the auto-delete-on-last-removal fix in
+         * group_song_remove_row_cb() -- safe to clean up now that it's been
+         * tapped). fopen() success alone distinguishes the two without
+         * risking deleting a file we merely failed to read. */
+        FILE * probe = fopen(playlists_m3u_paths[m3u_index], "r");
+        if (probe) {
+            fclose(probe);
+            playlist_files_delete(playlists_m3u_paths[m3u_index]);
+            populate_playlists_screen();
+            show_error_toast("Empty playlist deleted");
+        } else {
+            show_error_toast("Playlist is empty or unreadable");
+        }
         return;
     }
     show_m3u_playlist(basename_of(playlists_m3u_paths[m3u_index]), playlists_m3u_paths[m3u_index], songs, count);
     for (int i = 0; i < count; i++) free(songs[i]);
     free(songs);
+}
+
+/* Edit-mode delete icon for a user-created .m3u row -- never wired onto the
+ * Favorites/Most Played rows (see populate_playlists_screen() below), since
+ * neither is backed by a real file playlist_files_delete() could remove. */
+static void playlist_delete_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int m3u_index = (int) (intptr_t) lv_event_get_user_data(e);
+    if (m3u_index < 0 || m3u_index >= playlists_m3u_count) return;
+
+    playlist_files_delete(playlists_m3u_paths[m3u_index]);
+    populate_playlists_screen();
+    show_error_toast("Playlist deleted");
+}
+
+static void playlists_edit_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    playlists_edit_mode = !playlists_edit_mode;
+    populate_playlists_screen();
 }
 
 static void populate_playlists_screen(void) {
@@ -7524,24 +7772,59 @@ static void populate_playlists_screen(void) {
     playlists_m3u_count = 0;
     playlist_files_scan(MUSIC_ROOT_DIR, &playlists_m3u_paths, &playlists_m3u_count);
 
+    lv_label_set_text(playlists_edit_btn, playlists_edit_mode ? "Done" : "Edit");
+
+    /* Favorites/Most Played are never deletable (neither is a real .m3u
+     * file -- see playlist_row_click_cb()'s index==0/1 special cases), so
+     * edit mode just makes them inert instead of showing a delete icon
+     * that would have nothing to act on. Same "row does nothing, only the
+     * per-row action works" convention as populate_group_songs_rows()'s
+     * own edit mode. */
     lv_obj_t * favorites_row = add_pill_row_base(playlists_list, "Favorites");
-    lv_obj_add_flag(favorites_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(favorites_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 0);
+    if (!playlists_edit_mode) {
+        lv_obj_add_flag(favorites_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(favorites_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 0);
+    }
 
     lv_obj_t * most_played_row = add_pill_row_base(playlists_list, "Most Played");
-    lv_obj_add_flag(most_played_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(most_played_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 1);
+    if (!playlists_edit_mode) {
+        lv_obj_add_flag(most_played_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(most_played_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 1);
+    }
 
     for (int i = 0; i < playlists_m3u_count; i++) {
         lv_obj_t * row = add_pill_row_base(playlists_list, basename_of(playlists_m3u_paths[i]));
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (2 + i));
+        if (playlists_edit_mode) {
+            lv_obj_t * delete_icon = lv_image_create(row);
+            lv_image_set_src(delete_icon, asset_path("touch_list/del.png"));
+            lv_obj_align(delete_icon, LV_ALIGN_RIGHT_MID, -20, 0);
+            lv_obj_add_flag(delete_icon, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(delete_icon, playlist_delete_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        } else {
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (2 + i));
+        }
     }
 }
 
 static lv_obj_t * build_playlists_screen(void) {
     lv_obj_t * title_label;
-    return build_subsonic_list_screen("Playlists", &title_label, &playlists_list);
+    lv_obj_t * scr = build_subsonic_list_screen("Playlists", &title_label, &playlists_list);
+
+    /* Attached directly onto this specific screen instance rather than
+     * threaded through build_subsonic_list_screen()'s own parameters --
+     * that builder is shared by ~20 unrelated screens, same established
+     * pattern as build_wifi_screen()'s Rescan button and the Subsonic
+     * Download buttons. */
+    playlists_edit_btn = lv_label_create(scr);
+    lv_label_set_text(playlists_edit_btn, "Edit");
+    lv_obj_set_style_text_color(playlists_edit_btn, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(playlists_edit_btn, ui_size_20, 0);
+    lv_obj_align(playlists_edit_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(playlists_edit_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(playlists_edit_btn, playlists_edit_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    return scr;
 }
 
 /* Settings > Update Music Database: reruns library_scan_once() (a full
@@ -7631,6 +7914,7 @@ static void poll_library_rescan(void) {
     lv_obj_delete(albums_screen);
     lv_obj_delete(album_artist_screen);
     all_songs_screen = build_all_songs_screen();
+    sync_remote_control_library();
     artists_screen = build_artists_screen();
     albums_screen = build_albums_screen();
     album_artist_screen = build_album_artist_screen();
@@ -7733,7 +8017,14 @@ static bool sd_card_root_is_mounted(void) {
 
 static bool sd_card_device_node_present(void) {
     struct stat st;
-    return stat("/dev/mmcblk0p1", &st) == 0;
+    /* Either node counts as "still present" -- mount_sd_card_if_needed()
+     * (main.c) now falls back to the whole-disk node for a partition-less
+     * card (see its own comment), so a card mounted that way only ever has
+     * a /dev/mmcblk0 node, never a p1 one. Checking p1 alone here would
+     * make this wrongly conclude such a card had been physically removed
+     * on the very next poll after it successfully mounted, force-unmounting
+     * a card that's still sitting right there. */
+    return stat("/dev/mmcblk0p1", &st) == 0 || stat("/dev/mmcblk0", &st) == 0;
 }
 
 /* Whole-disk node, as opposed to sd_card_device_node_present()'s first-
@@ -7788,14 +8079,16 @@ static void poll_sd_card_hotplug(void) {
         was_mounted = false;
 
         /* Card is physically there (the whole-disk node exists) but still
-         * won't mount after repeated retries -- either it never got the
-         * /dev/mmcblk0p1 partition node at all (no partition table, or a
-         * "superfloppy" filesystem written straight to the raw disk with
-         * no MBR) or that partition exists but holds something none of
-         * mount_sd_card_if_needed()'s filesystem attempts could mount
+         * won't mount after repeated retries. mount_sd_card_if_needed()
+         * (main.c) already tries every supported filesystem type against
+         * both the first-partition node and, as a fallback, the whole-disk
+         * node itself (covering a "superfloppy" card with no partition
+         * table/MBR at all) -- so reaching here means either the partition
+         * exists but holds something none of those attempts could mount
          * (corruption, or a filesystem this platform genuinely doesn't
-         * support). Both need the same fix -- reformat -- so this doesn't
-         * try to tell them apart. Debounced (SD_MOUNT_FAIL_STREAK_THRESHOLD
+         * support), or the raw disk itself does too. Both need the same fix
+         * -- reformat -- so this doesn't try to tell them apart. Debounced
+         * (SD_MOUNT_FAIL_STREAK_THRESHOLD
          * consecutive failed polls, SD_CARD_MOUNT_POLL_SECONDS apart) so
          * the kernel's own brief card-enumeration window right after
          * physical insertion -- where the node legitimately isn't there
@@ -8142,6 +8435,128 @@ static void build_sd_format_confirm_popup(void) {
     lv_obj_center(cancel_label);
 }
 
+/* Power-off countdown -- shown when hw_buttons_consume_power_long_press()
+ * fires (see update_timer_cb()'s own consumer block). Same lv_layer_top()
+ * overlay shape as sd_mount_failed_popup/sd_format_confirm_popup above,
+ * built once and shown/hidden by flag rather than nav_push()'d, so it can
+ * appear over whatever screen is currently active. Unlike those two, the
+ * countdown itself isn't tied to the popup being visible for any particular
+ * duration on its own -- poll_power_off_countdown() (called every tick from
+ * update_timer_cb) drives it, and idle_shutdown_now() at zero doesn't
+ * return on a real device, so there's no explicit "now power off" call site
+ * beyond that. */
+#define POWER_OFF_COUNTDOWN_SECONDS 3
+
+static lv_obj_t * power_off_countdown_popup;
+static lv_obj_t * power_off_countdown_popup_backdrop;
+static lv_obj_t * power_off_countdown_label;
+static bool power_off_countdown_active = false;
+static uint32_t power_off_countdown_start_tick;
+
+static void hide_power_off_countdown_popup(void) {
+    lv_obj_add_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(power_off_countdown_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void cancel_power_off_countdown(void) {
+    power_off_countdown_active = false;
+    hide_power_off_countdown_popup();
+}
+
+static void power_off_countdown_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    cancel_power_off_countdown();
+}
+
+static void power_off_countdown_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    cancel_power_off_countdown();
+}
+
+static void start_power_off_countdown(void) {
+    power_off_countdown_active = true;
+    power_off_countdown_start_tick = lv_tick_get();
+    lv_label_set_text_fmt(power_off_countdown_label, "%d", POWER_OFF_COUNTDOWN_SECONDS);
+    lv_obj_remove_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(power_off_countdown_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(power_off_countdown_popup_backdrop);
+    lv_obj_move_foreground(power_off_countdown_popup);
+}
+
+/* Called every tick from update_timer_cb while power_off_countdown_active --
+ * updates the on-screen seconds-remaining label, and calls idle_shutdown_now()
+ * once the countdown reaches zero (only reachable by letting it run out;
+ * tapping Cancel or the backdrop aborts it first, via
+ * cancel_power_off_countdown() above). */
+static void poll_power_off_countdown(void) {
+    if (!power_off_countdown_active) return;
+
+    uint32_t elapsed_ms = lv_tick_elaps(power_off_countdown_start_tick);
+    uint32_t total_ms = (uint32_t) POWER_OFF_COUNTDOWN_SECONDS * 1000;
+    if (elapsed_ms >= total_ms) {
+        power_off_countdown_active = false;
+        idle_shutdown_now(); /* does not return on a real device */
+        return;
+    }
+
+    int seconds_left = (int) ((total_ms - elapsed_ms + 999) / 1000);
+    lv_label_set_text_fmt(power_off_countdown_label, "%d", seconds_left);
+}
+
+static void build_power_off_countdown_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    power_off_countdown_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(power_off_countdown_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(power_off_countdown_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(power_off_countdown_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(power_off_countdown_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(power_off_countdown_popup_backdrop, power_off_countdown_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    power_off_countdown_popup = lv_obj_create(top);
+    lv_obj_set_size(power_off_countdown_popup, 320, 280);
+    lv_obj_align(power_off_countdown_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(power_off_countdown_popup, 16, 0);
+    lv_obj_set_style_bg_color(power_off_countdown_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(power_off_countdown_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(power_off_countdown_popup, 0, 0);
+    lv_obj_remove_flag(power_off_countdown_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(power_off_countdown_popup, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t * title = lv_label_create(power_off_countdown_popup);
+    lv_obj_set_width(title, lv_pct(90));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_label_set_text(title, "Powering Off");
+
+    power_off_countdown_label = lv_label_create(power_off_countdown_popup);
+    lv_obj_set_style_text_color(power_off_countdown_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(power_off_countdown_label, ui_size_28, 0);
+    lv_obj_align(power_off_countdown_label, LV_ALIGN_CENTER, 0, -10);
+    lv_label_set_text_fmt(power_off_countdown_label, "%d", POWER_OFF_COUNTDOWN_SECONDS);
+
+    lv_obj_t * cancel_row = lv_obj_create(power_off_countdown_popup);
+    lv_obj_set_size(cancel_row, lv_pct(90), 56);
+    lv_obj_align(cancel_row, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_set_style_radius(cancel_row, 12, 0);
+    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
+    lv_obj_set_style_border_width(cancel_row, 0, 0);
+    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cancel_row, power_off_countdown_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * cancel_label = lv_label_create(cancel_row);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_center(cancel_label);
+}
+
 static void update_music_database_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     start_library_rescan();
@@ -8164,6 +8579,7 @@ static void album_artist_tile_cb(lv_event_t * e) {
 
 static void playlists_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    playlists_edit_mode = false; /* fresh entry from the menu always starts out of edit mode, same convention as show_group_songs_editable() */
     populate_playlists_screen();
     nav_push(playlists_screen);
 }
@@ -10453,6 +10869,165 @@ static void open_dlna_screen(void) {
     nav_push(dlna_screen);
 }
 
+/* ---- Remote Control screen (Wireless -> "Open Link") -- see
+ * remote_control.h for the Phase 1 (read-only Now Playing web page, no
+ * playback control yet, no auth) scope. Toggle row styled like
+ * build_dlna_screen()'s own row; the IP/QR/URL display below it is styled
+ * exactly like build_import_wifi_screen()'s (same colors, sizes, and even
+ * the same 20px QR-to-URL-label gap) -- this is the same "here's an
+ * address, scan or type it" moment for the user, just for a different
+ * feature. ---- */
+
+static lv_obj_t * remote_control_screen;
+static lv_obj_t * remote_control_toggle_img;
+static lv_obj_t * remote_control_status_label;
+static lv_obj_t * remote_control_url_label;
+#if LV_USE_QRCODE
+static lv_obj_t * remote_control_qrcode;
+#endif
+
+static void remote_control_refresh_address(void) {
+    if (!current_settings.remote_control_enabled) {
+        lv_label_set_text(remote_control_status_label,
+                           "Turn this on to see the address here.");
+        lv_label_set_text(remote_control_url_label, "");
+#if LV_USE_QRCODE
+        lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
+#endif
+        return;
+    }
+
+    wifi_info_t info;
+    if (!wifi_control_get_info(&info) || info.ip[0] == '\0') {
+        lv_label_set_text(remote_control_status_label, "Connect to Wi-Fi first");
+        lv_label_set_text(remote_control_url_label, "");
+#if LV_USE_QRCODE
+        lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
+#endif
+        return;
+    }
+
+    char url[64];
+    snprintf(url, sizeof(url), "http://%s:8899", info.ip);
+    lv_label_set_text(remote_control_status_label, "Open this address on your phone or computer:");
+    lv_label_set_text(remote_control_url_label, url);
+#if LV_USE_QRCODE
+    lv_obj_remove_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
+    lv_qrcode_update(remote_control_qrcode, url, strlen(url));
+#endif
+}
+
+static void remote_control_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    current_settings.remote_control_enabled = !current_settings.remote_control_enabled;
+    settings_save(&current_settings);
+
+    lv_image_set_src(remote_control_toggle_img,
+                      asset_path(current_settings.remote_control_enabled ? "settings/on.png" : "settings/off.png"));
+    if (current_settings.remote_control_enabled) {
+        remote_control_start();
+    } else {
+        remote_control_stop();
+    }
+    remote_control_refresh_address();
+}
+
+static lv_obj_t * build_remote_control_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Remote Control");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_set_style_text_font(title, ui_size_28, 0);
+
+    /* Same 448x124/item_bg.png pill look as add_pill_row_base(), built
+     * directly here (not via that helper) since it needs to sit above the
+     * absolutely-positioned Import-Wi-Fi-style fields below rather than
+     * inside a flex-column list. */
+    lv_obj_t * toggle_row = lv_obj_create(scr);
+    lv_obj_set_size(toggle_row, 448, 124);
+    lv_obj_align(toggle_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 10);
+    lv_obj_set_style_bg_color(toggle_row, SCREEN_BG_COLOR, 0);
+    lv_obj_set_style_bg_image_src(toggle_row, asset_path("touch_list/item_bg.png"), 0);
+    lv_obj_set_style_bg_opa(toggle_row, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(toggle_row, 0, 0);
+    lv_obj_remove_flag(toggle_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(toggle_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(toggle_row, remote_control_toggle_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * toggle_label = lv_label_create(toggle_row);
+    lv_label_set_text(toggle_label, "Remote Control");
+    lv_obj_set_style_text_color(toggle_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(toggle_label, ui_size_16, 0);
+    lv_obj_align(toggle_label, LV_ALIGN_LEFT_MID, 24, 0);
+
+    remote_control_toggle_img = lv_image_create(toggle_row);
+    lv_image_set_src(remote_control_toggle_img,
+                      asset_path(current_settings.remote_control_enabled ? "settings/on.png" : "settings/off.png"));
+    lv_obj_align(remote_control_toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
+
+    lv_obj_t * explanation = lv_label_create(scr);
+    lv_label_set_text(explanation,
+                       "Shows what's currently playing to anyone on your Wi-Fi network who opens the address "
+                       "below -- no password. Playback control isn't available yet, just Now Playing info.");
+    lv_obj_set_width(explanation, lv_pct(90));
+    lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(explanation, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(explanation, lv_color_make(160, 160, 160), 0);
+    lv_obj_set_style_text_font(explanation, ui_size_16, 0);
+    lv_obj_align(explanation, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 150);
+
+    remote_control_status_label = lv_label_create(scr);
+    lv_obj_set_width(remote_control_status_label, lv_pct(90));
+    lv_label_set_long_mode(remote_control_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(remote_control_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(remote_control_status_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_text_font(remote_control_status_label, ui_size_20, 0);
+    lv_obj_align(remote_control_status_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 270);
+
+#if LV_USE_QRCODE
+    remote_control_qrcode = lv_qrcode_create(scr);
+    lv_qrcode_set_size(remote_control_qrcode, 220);
+    lv_qrcode_set_dark_color(remote_control_qrcode, lv_color_black());
+    lv_qrcode_set_light_color(remote_control_qrcode, lv_color_white());
+    lv_obj_set_style_border_width(remote_control_qrcode, 4, 0);
+    lv_obj_set_style_border_color(remote_control_qrcode, lv_color_white(), 0);
+    lv_obj_align(remote_control_qrcode, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 340);
+#endif
+
+    remote_control_url_label = lv_label_create(scr);
+    lv_obj_set_style_text_color(remote_control_url_label, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(remote_control_url_label, ui_size_22, 0);
+    lv_obj_align(remote_control_url_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 592);
+
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void open_remote_control_screen(void) {
+    remote_control_refresh_address();
+    nav_push(remote_control_screen);
+}
+
+static void remote_control_tile_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_remote_control_screen();
+}
+
 static void dlna_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     open_dlna_screen();
@@ -10467,10 +11042,11 @@ static lv_obj_t * build_wireless_screen(void) {
     /* Relabeled from the stock "HiBy Link" -- this project doesn't implement
      * that proprietary protocol (see the remote-control design doc/plan for
      * why: only partially recoverable from firmware strings, and only useful
-     * against HiBy's own closed-source app). "Open Link" is a placeholder
-     * name for this app's own future phone-remote-control feature; still no
-     * click handler (NULL) until that's actually built. */
-    items[4] = (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "Open Link", NULL, NULL };
+     * against HiBy's own closed-source app). This is that plan's own Phase 1
+     * (read-only Now Playing web page) now wired up -- see
+     * build_remote_control_screen(). */
+    items[4] =
+        (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "Remote Control", remote_control_tile_cb, NULL };
     items[5] = (icon_grid_item_t){ "wireless/via.png", "wireless/via_s.png", "Import via Wi-Fi", import_wifi_tile_cb, NULL };
     lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6);
     finalize_screen_navigation(scr);
@@ -12385,6 +12961,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     }
     start_bt_dac_startup_reapply_if_needed();
     if (current_settings.dlna_renderer_enabled) dlna_control_start();
+    if (current_settings.remote_control_enabled) remote_control_start();
 
     /* The quick drawer's own open/close drag tracking is polled from
      * update_timer_cb instead (poll_quick_drawer_drag()) -- see its comment
@@ -12415,6 +12992,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #endif
     files_screen = build_files_screen();
     all_songs_screen = build_all_songs_screen();
+    sync_remote_control_library();
     artists_screen = build_artists_screen();
     albums_screen = build_albums_screen();
     album_artist_screen = build_album_artist_screen();
@@ -12493,6 +13071,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     import_wifi_screen = build_import_wifi_screen();
     airplay_screen = build_airplay_screen();
     dlna_screen = build_dlna_screen();
+    remote_control_screen = build_remote_control_screen();
     wireless_screen = build_wireless_screen();
     books_screen = build_books_screen();
     books_files_screen = build_books_files_screen();
@@ -12511,6 +13090,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     build_factory_reset_popup();
     build_sd_mount_failed_popup();
     build_sd_format_confirm_popup();
+    build_power_off_countdown_popup();
     build_firmware_update_popup();
     add_to_playlist_screen = build_add_to_playlist_screen();
     build_delete_song_popup();
@@ -12548,7 +13128,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("start_refresh_bt_icon about to be called");
 #endif
-    start_refresh_bt_icon();
+    start_refresh_bt_icon_passive();
 #ifndef HOST_BUILD
     boot_checkpoint("start_refresh_bt_icon done");
 #endif

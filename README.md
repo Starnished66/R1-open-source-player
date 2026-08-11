@@ -6,6 +6,12 @@ A from-scratch, open-source reimplementation of the HiBy R1's stock music player
 - "host device", "host": the machine you're developing on (your laptop/PC).
 - "target device", "target": the machine you're building for (the R1 or R3 Pro II).
 
+## Acknowledgments
+
+This project builds on prior work from two repos:
+- [hiby-modding/hiby_os_crack](https://github.com/hiby-modding/hiby_os_crack) — the parent toolkit this project was originally developed alongside. Its `.upt` firmware unpack/repack tooling, QEMU emulation setup, and general HiBy OS reverse-engineering groundwork (`.upt` format, device layouts) are what make building and flashing a modified image possible at all.
+- [bidhata/Hiby-R1-Mod](https://github.com/bidhata/Hiby-R1-Mod) — an unpacked/mirrored copy of the R1's stock firmware assets was used as the local dev-machine source for the host simulator's `theme2` UI asset mirror and for identifying the stock font files this project reads from at runtime.
+
 ## License
 
 This project is **GNU GPLv2** (see [LICENSE](LICENSE)) because it statically links [FAAD2](https://github.com/knik0/faad2) for AAC decoding, which is GPLv2-licensed. That's a stronger copyleft than the project's other dependencies (dr_libs, LVGL, tinyalsa are all permissive), and it binds the whole resulting binary, not just the AAC-decoding piece. If that's ever a problem, the fix is dropping AAC support (or swapping FAAD2 for something non-copyleft), not trying to isolate it.

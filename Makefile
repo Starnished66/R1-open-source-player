@@ -138,7 +138,11 @@ endif
 
 # Compile flags
 # -DLV_CONF_INCLUDE_SIMPLE=1 is required to include lv_conf.h as "lv_conf.h"
-CFLAGS = -O3 -g -Wall -I. -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(SQLITE_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
+# src/*/ dirs: so a quoted #include "foo.h" in one category (e.g. src/ui/gui.c
+# including "audio.h") still resolves via the compiler's -I fallback search
+# even though foo.h now lives in a different category folder -- no #include
+# statements needed changing when src/ was reorganized into subfolders.
+CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(SQLITE_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
 HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
 HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
@@ -192,10 +196,14 @@ SQLITE_CFLAGS = -O3 -g -I$(SQLITE_DIR) -DSQLITE_OMIT_LOAD_EXTENSION=1
 HOST_LDFLAGS = $(shell sdl2-config --libs) -lpthread -lm
 TARGET_LDFLAGS = -static -no-pie -lpthread -lm
 
-# Source files
-APP_SRCS = src/main.c src/gui.c src/audio.c src/file_browser.c src/hw_buttons.c src/input_device_utils.c src/metadata.c src/metadata_db.c src/settings.c src/aiff_decoder.c src/dsd_filter.c src/dsd_decoder.c src/aac_decoder.c src/mp4_demux.c src/ape_demux.c src/ape_decoder.c src/peq.c src/assets.c src/screen_builders.c src/battery.c src/wifi_status.c src/ca_bundle.c src/http_client.c src/subsonic_client.c src/cover_decode.c src/asf_demux.c src/wma_decoder.c src/fallback_font.c \
-src/subprocess.c src/wifi_control.c src/bluetooth_control.c src/backlight.c src/import_web.c src/airplay_control.c src/headphone_status.c src/device_config.c src/led_control.c src/charge_limiter.c src/idle_shutdown.c src/power_suspend.c src/text_reader.c src/usb_mode_control.c src/usb_dac_bridge.c src/firmware_update.c src/playlist_files.c src/timezone_data.c src/timezone_apply.c src/dlna_control.c src/remote_control.c
-APP_CXX_SRCS = src/alac_decoder.cpp
+# Source files -- organized under src/ by category: audio/ (playback engine +
+# format decoders/demuxers), network/ (wifi/bluetooth/dlna/remote-control/
+# streaming), library/ (metadata/file browsing/playlists), hardware/ (device
+# control), ui/ (gui/screens/assets/fonts), core/ (settings, subprocess,
+# misc). main.c stays at src/ root as the entry point.
+APP_SRCS = src/main.c src/ui/gui.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_client.c src/network/subsonic_client.c src/library/cover_decode.c src/audio/asf_demux.c src/audio/wma_decoder.c src/ui/fallback_font.c \
+src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/network/dlna_control.c src/network/remote_control.c
+APP_CXX_SRCS = src/audio/alac_decoder.cpp
 LVGL_SRCS = $(shell find $(LVGL_DIR)/src -type f -name '*.c')
 TINYALSA_SRCS = $(shell find $(TINYALSA_DIR)/src -type f -name '*.c')
 FAAD2_SRCS = $(shell find $(FAAD2_DIR)/libfaad -type f -name '*.c')
@@ -230,7 +238,7 @@ DBUS_SRCS = $(filter-out %-win.c %-win32.c %wince-glue.c $(DBUS_DIR)/dbus/dbus-s
 # stack to talk to anyway). Its call sites in gui.c/bluetooth_control.c
 # are guarded with #ifndef HOST_BUILD for the same reason audio.c's own
 # Bluetooth-output code is.
-TARGET_ONLY_APP_SRCS = src/bt_media_player.c src/audio_output.c
+TARGET_ONLY_APP_SRCS = src/network/bt_media_player.c src/audio/audio_output.c
 
 # Object files
 HOST_OBJS = $(APP_SRCS:src/%.c=build_host/%.o) $(APP_CXX_SRCS:src/%.cpp=build_host/%.o) \

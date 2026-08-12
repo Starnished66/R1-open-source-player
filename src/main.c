@@ -41,20 +41,10 @@ static uint32_t custom_tick_get(void) {
 extern void gui_init(uint32_t screen_width, uint32_t screen_height);
 
 #ifndef HOST_BUILD
-/* On a genuine cold boot, S92_03_start_music_player is the LAST init.d
- * script to run, so /dev/fb0 should already exist by then -- but the device
- * node existing doesn't guarantee the underlying driver is done settling;
- * open()/ioctl() on it can still transiently fail for a short window right
- * after S11jpeg_display_shell hands off. lv_linux_fbdev_set_file() doesn't
- * report failure back to its caller and silently leaves the framebuffer
- * unusable in that case, which then crashes on the very first render flush
- * -- and since hiby_player.sh runs us in the foreground and unconditionally
- * reboots once we exit, that crash becomes an invisible boot loop (red LED
- * repeatedly restarting, never reaching the UI). This was never caught by
- * interactive testing, since launching the binary by hand (adb, well after
- * the system had been fully booted for minutes) never hits the race. Poll
- * with a real open()+ioctl() readiness check instead of trusting the device
- * node's mere existence. */
+/* Polls /dev/fb0 with a real open()+ioctl() check rather than trusting the
+ * device node's mere existence -- the node can appear before the underlying
+ * driver has finished settling, and using it too early crashes on the first
+ * render flush. */
 static bool wait_for_fbdev_ready(const char * path, int max_attempts, int delay_ms) {
     for (int attempt = 0; attempt < max_attempts; attempt++) {
         int fd = open(path, O_RDWR);
@@ -69,63 +59,8 @@ static bool wait_for_fbdev_ready(const char * path, int max_attempts, int delay_
     return false;
 }
 
-/* Real-device incident: the SD card is never mounted at boot by anything in
- * the OS layer -- confirmed by reading every relevant piece of config on a
- * real device: /etc/mdev.conf has no rule matching mmcblk* (only external
- * USB mass-storage sd[a-z][0-9] insertion is handled there), /etc/fstab has
- * no entry for it at all, and none of the /etc/init.d/S* scripts touch it
- * either (S21mount_ubifs only mounts the separate internal UBIFS
- * partition). This app's very first genuine cold boot after fixing the
- * D-Bus-cleanup boot hang (see bluetooth_control.h's comment above
- * bt_control_is_powered()) came up with /data/mnt/sd_0 completely
- * unmounted -- MUSIC_ROOT_DIR (gui.c) is just an empty mountpoint until
- * something mounts the real card there, breaking both
- * firmware_update_check_boot_combo() (scans that path for a *.upt) and
- * metadata_db.c's stock-db warm-start import (reads
- * .../sd_0/usrlocal_media.db) if it runs first.
- *
- * The mount point directory itself doesn't exist either -- confirmed live:
- * /data/mnt/ was completely empty (no "sd_0" entry at all) on that same
- * cold boot, and a manual `mount` attempt failed with "No such file or
- * directory" until this ran `mkdir -p` first. Something else on the system
- * does appear to retry mounting the card reactively (confirmed via dmesg:
- * a successful FAT-fs mount landed at kernel uptime ~914s, many minutes
- * after boot, using different default options than specified here -- not
- * triggered by anything this function did) but silently keeps failing for
- * however long the target directory doesn't exist, since mount(8) never
- * creates missing mount points itself. Whatever that other mechanism is,
- * creating the directory ourselves, immediately at boot, is what actually
- * unblocks it (and our own explicit mount attempt right after covers the
- * case where nothing else would ever get around to it). Options match what
- * a working device's own `mount` output showed earlier this session: vfat,
- * fmask/dmask 0022, codepage 936 (CJK filename support), utf8 iocharset,
- * shortname=mixed. Best-effort via the same busybox `mount`
- * mass_storage_inserting.sh already uses elsewhere on this firmware for the
- * exact same reason (shelling out, not a raw syscall, to match this
- * codebase's own established convention) -- if the card's genuinely not
- * inserted, or something already mounted it, this just fails harmlessly and
- * startup proceeds with whatever's actually there.
- *
- * Real-device bug report: a card that shows up in the OS as detected but
- * never populates the library. The official HiBy R1 user manual explicitly
- * lists FAT32, exFAT *and* NTFS as supported card filesystems, but this
- * function only ever attempted -t vfat -- any exFAT/NTFS card would just
- * silently fail to mount here forever, exactly matching that report. There
- * is no mount.exfat/ntfs-3g/exfatprogs/ntfsprogs anywhere in this firmware's
- * rootfs (confirmed by searching it), but the same is true of vfat itself
- * (no vfat.ko/fat.ko either -- see module_driver/'s own contents), so FAT
- * support is compiled directly into this vendor's kernel image rather than
- * loaded as a module; exFAT/NTFS support, if the manual's claim is accurate,
- * is almost certainly built in the same way, needing nothing more than
- * picking the right -t. There's no reliable way to ask busybox's mount to
- * auto-detect the type here, so this just tries each supported type in turn
- * and stops at the first one that actually results in a mounted
- * filesystem. exFAT/NTFS use deliberately minimal options (just rw,relatime)
- * rather than reusing vfat's own tuned option set above -- fmask/dmask/
- * codepage/shortname are vfat-specific, and this exact kernel's exFAT/NTFS
- * driver (whatever it actually is under the hood) has never been inspected
- * directly, so guessing at option names it might reject risks turning a
- * mountable card into an unmountable one. */
+/* True if a real filesystem is mounted at /data/mnt/sd_0 (its st_dev differs
+ * from its parent's), as opposed to just an empty directory sitting there. */
 static bool sd_mount_point_mounted(void) {
     struct stat parent_st, mnt_st;
     if (stat("/data/mnt", &parent_st) != 0) return false;
@@ -133,11 +68,8 @@ static bool sd_mount_point_mounted(void) {
     return parent_st.st_dev != mnt_st.st_dev;
 }
 
-/* Tries all three supported filesystem types against one device node, same
- * "try each in turn, stop at the first that actually mounts" approach as
- * mount_sd_card_if_needed() itself -- factored out so that function can
- * call it twice: once for the partition node, once (see its own comment)
- * as a fallback for the whole-disk node. */
+/* Tries each supported filesystem type (vfat, exfat, ntfs) against one
+ * device node in turn, stopping at the first that actually mounts. */
 static void try_mount_sd_device_node(const char * device_node) {
     char * vfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "vfat", (char *) "-o",
                             (char *) "rw,relatime,fmask=0022,dmask=0022,codepage=936,iocharset=utf8,shortname=mixed",
@@ -155,41 +87,11 @@ static void try_mount_sd_device_node(const char * device_node) {
     subprocess_run(ntfs_argv, NULL, 0);
 }
 
-/* Real-device bug report: SD card never mounts on a genuine cold
- * flash+first-boot, despite working fine across many prior test sessions on
- * this exact device. Root cause goes deeper than a missing mkdir -- /data is
- * a plain directory baked directly into this firmware's read-only squashfs
- * rootfs (confirmed live: `mount` shows only "/", tmpfs mounts, and
- * /usr/data's own ubifs volume -- nothing at /data; `mkdir /data/mnt` fails
- * with EROFS), true on stock firmware as much as this project's own repacks
- * (etc/init.d/S21mount_ubifs only mounts the "userdata" UBI volume onto
- * /usr/data, nothing mounts anything onto /data). Every "working" test
- * session this project has ever run was against a device that had been
- * powered on continuously for a long time without a real reboot (only
- * `adb shell`-launched test binaries, which never touch the kernel's mount
- * table) -- so /data/mnt/sd_0 was riding on a leftover mount some earlier,
- * unrelated manual `mount` command had set up, which just never got torn
- * down across the device's entire uptime since. A genuine cold boot (the
- * first time this was actually tested end-to-end via a real flash) exposed
- * that /data was never actually writable to begin with. Fixed by mounting a
- * tmpfs on /data once per process lifetime, before anything below tries to
- * use it -- same tmpfs convention this firmware's own fstab already uses for
- * /tmp, /dev/shm, /run. Guarded by a static bool rather than re-checking the
- * mount table, since poll_sd_card_hotplug() (gui.c) calls this function
- * repeatedly on retry -- mounting a second tmpfs on top of the first would
- * shadow (and orphan) the SD card submount already living under it. */
-static void mount_data_tmpfs_if_needed(void) {
-    static bool tried = false;
-    if (tried) return;
-    tried = true;
-
-    char * argv[] = { (char *) "mount", (char *) "-t", (char *) "tmpfs",
-                       (char *) "tmpfs", (char *) "/data", NULL };
-    subprocess_run(argv, NULL, 0);
-}
-
+/* Ensures the SD card is mounted at /data/mnt/sd_0. Creates the mount point
+ * first (best-effort -- /data/mnt may not exist yet on a fresh boot), then
+ * tries the card's partition node, falling back to the whole-disk node for
+ * a partition-less ("superfloppy") card. */
 void mount_sd_card_if_needed(void) {
-    mount_data_tmpfs_if_needed();
     mkdir("/data/mnt", 0755);
     mkdir("/data/mnt/sd_0", 0755);
     if (sd_mount_point_mounted()) return;
@@ -197,70 +99,20 @@ void mount_sd_card_if_needed(void) {
     try_mount_sd_device_node("/dev/mmcblk0p1");
     if (sd_mount_point_mounted()) return;
 
-    /* Real-device bug report: a card that mounts fine on a PC but never
-     * populates the library on this device. /dev/mmcblk0p1 (the first
-     * partition) only ever gets a device node from the kernel if the card
-     * actually has a partition table -- a card formatted as a "superfloppy"
-     * (a filesystem written straight to the raw disk, no MBR/partition
-     * table at all, which some SD formatting tools produce by default,
-     * especially for smaller cards) never gets a p1 node, so every attempt
-     * above was guaranteed to fail no matter which -t was tried. Falling
-     * back to the whole-disk node here covers that case; gui.c's own
-     * poll_sd_card_hotplug()/sd_card_base_device_present() already knew
-     * about this scenario (see its own comment) but had no mount attempt to
-     * fall back to before concluding the card needed reformatting -- this
-     * is that missing attempt, tried before ever reaching that destructive
-     * path. Harmless no-op for a normally-partitioned card: mount just
-     * fails (whole-disk-as-filesystem on a partitioned card isn't a valid
-     * filesystem), same "best effort, check the result" pattern as every
-     * other attempt in this function. */
     try_mount_sd_device_node("/dev/mmcblk0");
 }
 
-/* Diagnostic instrumentation for the still-unresolved cold-boot failure:
- * this app has never been confirmed to reach the main loop on a genuine
- * flash+cold-boot cycle (only ever launched manually, well after the system
- * had already settled), and hiby_player.sh runs us in the foreground with
- * an unconditional `reboot` once we exit -- so a crash or hang anywhere in
- * startup is otherwise completely invisible, just a boot loop with no
- * diagnostic trail. This writes to /usr/data -- UBIFS, mounted early by
- * S21mount_ubifs well before we run, and not touched by a normal OS-only
- * firmware revert -- so whatever step this dies on is still readable via
- * adb after reverting to stock. Cold boot itself is now confirmed working
- * (see bluetooth_control.h's comment above bt_control_is_powered() for the
- * root cause and fix) -- kept around a while longer since it's still useful
- * for chasing any other startup-path issues that turn up, rather than
- * ripping it out immediately. Not static: gui_init() (gui.c) also calls
- * this directly, via its own extern declaration, since the hang this was
- * built to diagnose had moved further into startup than main.c alone could
- * see.
- *
- * Real-device incident: confirmed via this very log on a genuine cold boot
- * that the FIRST call (main entered) always succeeds, but even the SECOND
- * call ever made in the process's lifetime sometimes never completes --
- * with no other code at all between them (see main()'s own two calls back
- * to back). The original implementation did a full fopen(append)+fprintf+
- * fflush+fsync+fclose cycle on every single call, repeating directory/inode
- * lookup work each time; kept open across the whole process instead
- * (opened lazily on first use, reused after), so every call after the
- * first is just a raw write()+fdatasync() -- smaller surface for whatever
- * is contending for UBIFS/flash I/O at this exact moment in a genuine cold
- * boot (other init.d-started services still settling) to actually hang on,
- * though this doesn't fully rule out the boot logging itself being at risk
- * on this specific device -- if checkpoints are still missing after this
- * change, the app's own startup work, not the logging, is what's stuck. */
+/* Lightweight boot-time diagnostic log at /usr/data/boot_debug.log, readable
+ * via adb even after a crash/reboot loop (hiby_player.sh reboots
+ * unconditionally on any exit). Not static: gui_init() (gui.c) also calls
+ * this directly via its own extern declaration. */
 static int boot_debug_fd = -1;
 
 void boot_checkpoint(const char * step) {
     if (boot_debug_fd < 0) {
-        /* O_TRUNC, not O_APPEND -- this log's only purpose is diagnosing
-         * *this* boot's startup sequence (see the block comment above), so
-         * appending forever across the device's entire lifetime just grows
-         * a file nobody reads past the most recent boot, for no benefit --
-         * real, avoidable wear on this device's limited flash storage.
-         * Opened once per process lifetime either way (see above), so this
-         * naturally resets on every fresh boot without needing its own
-         * rotation/truncation logic elsewhere. */
+        /* O_TRUNC, not O_APPEND -- only this boot's sequence matters, and
+         * opened once per process lifetime so this naturally resets fresh
+         * on every boot. */
         boot_debug_fd = open("/usr/data/boot_debug.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (boot_debug_fd < 0) return;
     }
@@ -274,33 +126,11 @@ void boot_checkpoint(const char * step) {
 #endif
 
 int main(void) {
-    /* Real-device bug report: a Bluetooth disconnect during playback froze
-     * the device and triggered a reboot, sometimes leaving Bluetooth
-     * unrecoverable short of a long power-button press. Root cause: this
-     * process never installed a SIGPIPE handler anywhere (confirmed by
-     * grepping the whole codebase), so its default disposition -- immediate
-     * process termination, no unwind, no cleanup -- was still in effect.
-     * audio_output.c's Bluetooth output path (audio_output_write())
-     * write()s decoded audio into a pipe feeding an `aplay -D bluealsa`
-     * child; BlueZ tearing down the A2DP transport on a real disconnect
-     * kills that child, and the very next write() into the now-reader-less
-     * pipe raises SIGPIPE. On the real device, hiby_player.sh (the stock
-     * launcher this binary replaces in place -- see README.md's own
-     * real-device testing notes) runs `sleep 1; reboot` the instant
-     * hiby_player exits for any reason, so a SIGPIPE kill here reads
-     * exactly like "device reboot" -- and because the process dies
-     * mid-write rather than exiting cleanly, whatever BT/UART transaction
-     * was in flight at that exact instant can be left wedged badly enough
-     * that even bt_resume can't recover it without a hard power cycle,
-     * matching the "Bluetooth not recoverable" half of the report too.
-     * Ignoring SIGPIPE process-wide is the standard fix for this class of
-     * bug: write()/send() calls into a broken pipe/socket then just return
-     * -1/EPIPE instead of killing the process -- audio_output_write()
-     * already handles exactly that return value correctly (breaks its
-     * retry loop, lets the next audio_output_ensure() reopen), so this
-     * lets that existing, already-correct fallback path actually run
-     * instead of being pre-empted by a fatal signal first. Must run before
-     * anything else below gets a chance to open a subprocess pipe. */
+    /* Ignore SIGPIPE process-wide: a Bluetooth disconnect during playback
+     * kills the `aplay -D bluealsa` child audio_output.c writes into, and
+     * without this the next write() would kill the whole process instead of
+     * just returning EPIPE (which audio_output_write() already handles
+     * correctly). Must run before anything else opens a subprocess pipe. */
     signal(SIGPIPE, SIG_IGN);
 
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -309,45 +139,24 @@ int main(void) {
 #ifndef HOST_BUILD
     boot_checkpoint("main entered");
 
-    /* Real-device incident: an earlier library audit of the read-only
-     * squashfs rootfs (documented in the user's own repack staging tree,
-     * not this repo) removed /usr/lib/libldacdec.so as "unused" -- wrong:
-     * /usr/bin/bluealsa links it unconditionally (DT_NEEDED), regardless of
-     * which A2DP codec actually gets negotiated at runtime, so bluealsa
-     * failed to even start ("error while loading shared libraries"), which
-     * silently broke every Bluetooth audio profile (A2DP, AVRCP) with no
-     * error surfaced anywhere in this app -- confirmed live via bluetoothd's
-     * own debug log showing `a2dp-sink profile connect failed: Protocol not
-     * available`, several layers removed from the actual cause. / (the
-     * squashfs image) can't be written to at runtime to restore the file in
-     * place, so this instead adds /usr/data (the writable ubifs partition)
-     * as a fallback library search path -- a copy of the restored .so lives
-     * there for now. Harmless even once the rootfs image itself is properly
-     * fixed on the next reflash: ld.so just never finds anything to load
-     * from here at that point, this line becomes a no-op. */
+    /* Fallback library search path on the writable partition, for restoring
+     * a shared library the read-only squashfs rootfs is missing without
+     * needing a reflash (e.g. libldacdec.so, required by bluealsa). */
     setenv("LD_LIBRARY_PATH", "/usr/data/lib", 1);
 
     /* Must run before firmware_update_check_boot_combo() and gui_init() --
-     * both read from the SD card, which starts unmounted on a genuine cold
-     * boot (see mount_sd_card_if_needed()'s own comment for why). */
+     * both read from the SD card. */
     mount_sd_card_if_needed();
     boot_checkpoint("mount_sd_card_if_needed done");
 
-    /* No startup-time Bluetooth/D-Bus cleanup call here -- see the comment
-     * above bt_control_is_powered() in bluetooth_control.h for why: real-
-     * device testing (three rounds of fixing real bugs in a bounded version
-     * of it, none of which changed where or whether boot succeeded, then
-     * confirmed live that just not calling it at all fixes cold boot
-     * completely) showed doing that work at this exact point in boot -- not
-     * just being slow at it -- reliably hung this app before it ever
-     * reached the main loop. */
+    /* Deliberately no startup-time Bluetooth/D-Bus cleanup call here -- see
+     * bluetooth_control.h's comment above bt_control_is_powered(): doing
+     * that work at this point in boot reliably hangs the app before it
+     * reaches the main loop. */
 
     /* Must run before any display/GUI setup -- if Power+Volume Up are held
-     * (the deliberate recovery-boot gesture) and a *.upt update file is on
-     * the SD card, this reboots straight into the recovery partition and
-     * never returns, so the normal UI should never even flash on screen
-     * first. See firmware_update.h for why no confirmation prompt is needed
-     * here (a boot-time hold is already an unambiguous, deliberate act). */
+     * (the recovery-boot gesture) and a *.upt update file is on the SD
+     * card, this reboots straight into recovery and never returns. */
     firmware_update_check_boot_combo();
     boot_checkpoint("firmware_update_check_boot_combo done");
 #endif
@@ -441,14 +250,10 @@ int main(void) {
 #ifndef HOST_BUILD
     boot_checkpoint("audio_init done");
 
-    /* AVRCP transport-button support (see bt_media_player.c's own
-     * top-of-file comment) -- connects to the system bus and starts its
-     * own dispatch thread now, for the app's whole lifetime, same as
-     * audio_init() just above. Doesn't register with BlueZ yet (that only
-     * happens once Bluetooth output is actually in use, see
-     * bt_media_player_set_active() in gui.c's poll_refresh_bt_icon()), so
-     * it's safe to call unconditionally at startup regardless of whether
-     * Bluetooth is even on. */
+    /* AVRCP transport-button support -- connects to the system bus and
+     * starts its dispatch thread now, for the app's whole lifetime. Doesn't
+     * register with BlueZ until Bluetooth output is actually in use, so
+     * this is safe to call unconditionally regardless of whether BT is on. */
     bt_media_player_init();
     boot_checkpoint("bt_media_player_init done");
 #endif

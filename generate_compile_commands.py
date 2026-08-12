@@ -9,16 +9,17 @@ def main():
     db = []
     
     # Core app files
-    files = ["src/main.c", "src/gui.c"]
-    
+    files = ["src/main.c", "src/ui/gui.c"]
+
     # Find all LVGL C source files recursively
     lvgl_c_files = glob.glob("lvgl/src/**/*.c", recursive=True)
     files.extend(lvgl_c_files)
-    
+
+    src_includes = " ".join(f"-Isrc/{d}" for d in ["audio", "network", "library", "hardware", "ui", "core"])
     for f in files:
         db.append({
             "directory": cwd,
-            "command": f"gcc -O3 -g -Wall -I. -Ilvgl -DLV_CONF_INCLUDE_SIMPLE=1 -DHOST_BUILD=1 -I/usr/include/SDL2 -c {f}",
+            "command": f"gcc -O3 -g -Wall -I. {src_includes} -Ilvgl -DLV_CONF_INCLUDE_SIMPLE=1 -DHOST_BUILD=1 -I/usr/include/SDL2 -c {f}",
             "file": f
         })
         

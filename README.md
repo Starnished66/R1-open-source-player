@@ -1,64 +1,185 @@
 # Open Source Player for HiBy OS
 
-A from-scratch, open-source reimplementation of the HiBy R1's stock music player firmware, built in C with LVGL. It fully replaces the closed-source stock `hiby_player` binary while reusing the stock firmware's own UI assets, fonts, and system daemons (Bluetooth, Wi-Fi, DLNA) wherever it makes sense to.
+An open-source music player replacement for HiBy OS, built from scratch in C with [LVGL](https://lvgl.io/).
 
-**Terminology**:
-- "host device", "host": the machine you're developing on (your laptop/PC).
-- "target device", "target": the machine you're building for (the R1 or R3 Pro II).
+The goal is simple: replace the closed-source stock `hiby_player` with a modern, community-driven player that makes better use of the hardware while retaining the parts of HiBy OS that already work well.
 
-## Acknowledgments
+The project currently targets the **HiBy R1** and is being developed with support for additional HiBy devices in mind. The R1 has been tested extensively on real hardware, not just in the host simulator.
 
-This project builds on prior work from two repos:
-- [hiby-modding/hiby_os_crack](https://github.com/hiby-modding/hiby_os_crack) — the parent toolkit this project was originally developed alongside. Its `.upt` firmware unpack/repack tooling, QEMU emulation setup, and general HiBy OS reverse-engineering groundwork (`.upt` format, device layouts) are what make building and flashing a modified image possible at all.
-- [bidhata/Hiby-R1-Mod](https://github.com/bidhata/Hiby-R1-Mod) — an unpacked/mirrored copy of the R1's stock firmware assets was used as the local dev-machine source for the host simulator's `theme2` UI asset mirror and for identifying the stock font files this project reads from at runtime.
+The player reuses the stock firmware's UI assets, fonts, and existing system services where practical, including Bluetooth, Wi-Fi, and DLNA functionality. Everything else is implemented from scratch.
 
-## License
+> **Status:** Fully usable on real R1 hardware, with a growing set of features beyond the stock player.
 
-This project is **GNU GPLv2** (see [LICENSE](LICENSE)) because it statically links [FAAD2](https://github.com/knik0/faad2) for AAC decoding, which is GPLv2-licensed. That's a stronger copyleft than the project's other dependencies (dr_libs, LVGL, tinyalsa are all permissive), and it binds the whole resulting binary, not just the AAC-decoding piece. If that's ever a problem, the fix is dropping AAC support (or swapping FAAD2 for something non-copyleft), not trying to isolate it.
+---
 
-## Features
+## Why?
 
-Confirmed working on real R1 hardware (fbdev + evdev touch + tinyalsa), not just the host simulator. Deeper technical detail — root causes, verification methods, real-device bugs found and fixed — lives in [Technical Notes](#technical-notes--real-device-findings) below; this list is just the "what."
+HiBy's stock player is closed source and tightly integrated with the firmware. That makes fixing bugs, adding features, or changing how the device behaves difficult.
 
-**Playback**
-- Formats: FLAC, MP3, WAV, AIFF/AIFF-C, DSD (`.dsf`/`.dff`, DSD64/128), AAC (raw ADTS + `.m4a`), ALAC, APE (Monkey's Audio)
-- Gapless playback, with an opt-in crossfade
+This project aims to change that.
+
+The player provides:
+
+- A fully open-source playback engine
+- A more capable music library
+- Better playlist handling
+- Network streaming and remote control
+- Improved device integration
+- Modern touch interactions
+- Features that are missing or unnecessarily restricted in the stock software
+- A foundation for future community development
+
+The intention isn't to recreate every quirk of the stock application. Where the stock player gets in the way, this project aims to improve it.
+
+---
+
+# Features
+
+## 🎵 Playback
+
+- FLAC, MP3, WAV, AIFF/AIFF-C
+- DSD64 / DSD128 (`.dsf` / `.dff`)
+- AAC — raw ADTS and `.m4a`
+- ALAC
+- APE / Monkey's Audio
+- Gapless playback **enabled by default**
+- Crossfade
 - ReplayGain track gain
-- Parametric EQ — 10 ISO-standard bands, per-band type/gain/Q, pre-amp
-- Physical hardware buttons: volume, play/pause, next/prev
-- Auto-advance to the next track; stops at playlist end
+- 10-band parametric EQ (PEQ)
+- Per-band filter type, gain, and Q
+- Pre-amp control
+- Physical hardware controls for volume, play/pause, next/previous
+- Automatic track advancement
+- Proper playlist-end handling
 
-**Library**
-- File browser (`./music` on host, the SD card mount point on target)
-- Music → All Songs / Artists / Albums / Album Artist / Genres, built from real tag scans
-- M3U/M3U8 playlist support
-- Real tag metadata (FLAC, MP3 ID3v2/v1, WAV RIFF, M4A) and embedded album art (JPEG/PNG)
+## 📚 Music Library
 
-**Network**
-- Subsonic-compatible streaming (Subsonic, Navidrome, Airsonic, …) — browse and stream over HTTPS with real TLS
-- DLNA/UPnP-AV renderer — cast a track from a controller app on your phone/PC and it plays through this device
+- File browser
+- All Songs
+- Artists
+- Albums
+- Album Artists
+- Genres
+- Real tag scanning
+- Embedded album artwork
+- FLAC metadata
+- MP3 ID3v1 / ID3v2
+- WAV RIFF metadata
+- M4A metadata
+- M3U / M3U8 playlists
+- Dynamic playlist loading directly from the SD card
+- Incremental music database updates instead of rescanning the entire library
+- SD card hotplug support
 
-**Device integration**
-- Real battery percentage and Wi-Fi signal status (read the same way the stock firmware does)
-- Time Zone picker (Region → City, applies immediately and persists)
-- Charge limiter — caps charging at 85% for battery longevity (Charge cap differ from one device to another(some at 88% and some at 91%, still in investigation, but works so far)
-- Sleep timer and a crossfade quick-toggle in the pull-down drawer
-- Startup volume (launch at a fixed level instead of resuming the last one)
-- Non-Latin text rendering: Cyrillic, Japanese kana/kanji, Korean Hangul, Thai
-- Topbar play/pause and Bluetooth A2DP status icons; auto-stops playback if the audio output disconnects mid-track
-- Interactive (finger-following) swipe into the now-playing screen
+## 🌐 Network & Streaming
+
+- **Subsonic-compatible streaming**
+  - Subsonic
+  - Navidrome
+  - Airsonic
+  - Other compatible servers
+  - HTTPS streaming with TLS
+- **Subsonic music downloading**
+- DLNA / UPnP-AV renderer
+- AirPlay support using the existing stock protocols where possible
+- Remote control over LAN
+- Built-in lightweight web server
+- Wi-Fi music import with the stock limitations removed
+- Import support for all supported file types
+
+The LAN remote-control interface provides a simple way to control the player from a phone, tablet, or PC without requiring a dedicated application.
+
+## 🔌 Device & Hardware Integration
+
+- USB DAC support
+- Real battery percentage
+- Real Wi-Fi signal strength
+- Charge limiter for improved battery longevity
+- Suspend-to-RAM instead of the default standby behavior
+- Car mode
+- Improved Bluetooth connection reliability
+- Bluetooth A2DP status in the top bar
+- Automatic playback stop when the audio output disconnects
+- Physical hardware button support
+- Time Zone picker with immediate application and persistent settings
+- Startup volume
+- Easier ADB access through the USB mode selector
+
+## 🎨 Interface
+
+- Stock firmware UI assets and fonts
+- Interactive finger-following swipe transitions
+- Swipe up to return home
+- Pull-down quick controls
+- Sleep timer
+- Crossfade quick toggle
+- Non-Latin text rendering:
+  - Cyrillic
+  - Japanese kana/kanji
+  - Korean Hangul
+  - Thai
 - App-wide accent color theming
-- Real-asset UI — built from the stock firmware's own icon/theme pack, not hand-drawn widgets
+- No unnecessary "books" functionality from the stock player
 
-**Not yet implemented**: WMA Lossless , MSEB (HiBy's proprietary DSP effect), and Remote Control Playback(Similar to the Proprietary Hiby Link).
+---
 
-### A note on device testing
+# Planned Features
 
-If you're testing on real hardware over ADB: stop the stock player gracefully (`killall hiby_player` **then** `killall -9 hiby_player` if it's still around, matching what `hiby_player.sh` itself does) before launching this binary. Force-killing it straight to `-9` was observed to leave the framebuffer/backlight in a bad state that persisted across warm reboots (`adb reboot`) and even affected the stock player on relaunch — only a full power-off/power-on cycle recovered it. Also note `/tmp` is tmpfs, so anything pushed there is wiped on every reboot.
+The following features are planned or currently incomplete:
 
-## 1. Local Development (Arch Linux Host Simulation)
+- Audiobook support
+- Opus playback
+- Global accent color system
+- Background image/color customization
+- Full theme support
+- Lyrics support
+- Bluetooth DAC support
+  - The existing option can connect, but playback through it is not currently functional
+- Additional community-requested features
 
-Running the GUI simulated on the host system (i.e. your laptop).
+This list will evolve as development continues.
+
+---
+
+# Device Support
+
+## HiBy R1
+
+**Status: Supported and actively tested.**
+
+The R1 is the primary development and testing platform for this project.
+
+The player has been tested on real hardware using the device's framebuffer, touchscreen, audio hardware, physical buttons, Bluetooth, Wi-Fi, and other system interfaces.
+
+## HiBy R3 Pro II
+
+**Status: Currently untested.**
+
+The R3 Pro II is not currently considered supported.
+
+Additional work is required before it can be properly supported:
+
+- Add support for the **balanced output port**
+- Add support for the device's **additional hardware buttons**
+- Test and adjust **UI scaling** for the R3 Pro II's display resolution
+- Perform full real-device testing
+
+Support for other HiBy devices may also be possible, but should not be assumed without hardware testing.
+
+---
+
+# Terminology
+
+- **Host device / host** — the machine you're developing on, such as your laptop or PC.
+- **Target device / target** — the HiBy device you're building for, such as the R1.
+
+---
+
+# Development
+
+## 1. Local Development — Arch Linux Host Simulator
+
+The project includes an SDL2-based host simulator, allowing the GUI and much of the player logic to be developed without a physical device.
 
 ### Requirements
 
@@ -68,62 +189,165 @@ Running the GUI simulated on the host system (i.e. your laptop).
 - `pkg-config`
 - `git`
 
-### Running the Simulator
+### Build
 
 ```bash
 make
 ```
 
-This automatically clones LVGL (if not already present) and compiles the project for your host architecture.
+This automatically clones LVGL if necessary and builds the project for the host architecture.
+
+### Run
 
 ```bash
 ./open_hiby_player_host
 ```
 
-Opens an SDL2 window. Click-and-drag works the same as touch/scroll on the real device.
+This opens the player in an SDL2 window.
+
+Mouse click-and-drag can be used to simulate touch interaction and scrolling.
 
 ---
 
-## 2. Cross-Compiling for the HiBy Device (MIPS Target)
+# 2. Cross-Compiling for HiBy OS
 
-The device's rootfs ships an old glibc (2.22), with no readily available matching cross sysroot. Rather than fight that, the target build uses a **musl-based static toolchain**: the resulting binary is statically linked and depends only on the (stable) Linux kernel syscall ABI, not the device's libc. This is the standard approach for cross-compiling to old/obscure embedded Linux targets.
+The HiBy devices use a MIPS target environment with an old glibc version (2.22). Rather than depending on a matching legacy sysroot, the target build uses a **musl-based static toolchain**.
 
-### Install Target Cross-Compiler
+The resulting executable is statically linked and therefore depends on the stable Linux kernel syscall ABI rather than the target device's libc.
+
+This makes it practical to build for the older and somewhat unusual HiBy OS environment.
+
+## Install the Target Toolchain
+
+On Arch Linux:
 
 ```bash
-# Arch Linux:
 yay -S mipsel-linux-musl-cross
 ```
 
-Builds a full self-contained toolchain (gcc + musl libc) from source — can take 15-30+ minutes the first time. No documented install path for other distros yet; contributions welcome.
+The package builds a complete GCC + musl toolchain from source.
 
-### Build for Target
+The initial build may take 15–30 minutes or more depending on the host system.
+
+Support for other distributions is not documented yet. Contributions are welcome.
+
+## Build for the Target
 
 ```bash
 make target
 ```
 
-Produces `open_hiby_player_target`, statically linked for MIPS (mipsel).
+This produces:
 
-### Testing Without Hardware
-
-Sanity-check that the binary runs (not full device behavior — no real framebuffer/touch) via QEMU user-mode emulation:
-
-```bash
-# Arch Linux:
-sudo pacman -S qemu-user
-
-qemu-mipsel ./open_hiby_player_target
+```text
+open_hiby_player_target
 ```
 
-It should print its startup banner, then fail trying to open `/dev/fb0`/`/dev/input/eventN` — that failure means the binary itself is working correctly, since those devices don't exist on a normal host.
-
-### Modifying Unpacked Firmware
-
-(TODO)
+The resulting binary is statically linked for little-endian MIPS (`mipsel`).
 
 ---
 
-## Technical Notes & Real-Device Findings
+# Testing Without Hardware
 
-Deeper implementation detail and real-hardware bugs found (and fixed) during development, organized by area, now lives in [TECHNICAL_NOTES.md](TECHNICAL_NOTES.md) — skip it unless you're modifying the code or debugging something specific.
+The target binary can be sanity-checked using QEMU user-mode emulation.
+
+On Arch Linux:
+
+```bash
+sudo pacman -S qemu-user
+```
+
+Then:
+
+```bash
+qemu-mipsel ./open_hiby_player_target
+```
+
+The program should print its startup banner and then fail when attempting to access devices such as:
+
+```text
+/dev/fb0
+/dev/input/eventN
+```
+
+This is expected when running under normal host Linux. Those device nodes do not exist in the host environment.
+
+The test is primarily intended to verify that the binary starts and executes correctly under the target architecture.
+
+---
+
+# Real Device Testing
+
+For instructions on installing, launching, and testing the player on real HiBy hardware, see:
+
+**[TESTING.md](TESTING.md)**
+
+The testing guide contains the device-specific procedures and important warnings for working with the stock player, ADB, framebuffer, and other hardware interfaces.
+
+---
+
+# Modifying Unpacked Firmware
+
+TODO
+
+---
+
+# Technical Notes & Real-Device Findings
+
+Detailed implementation notes, reverse-engineering information, root causes, verification methods, and real-device bugs discovered during development are maintained separately in:
+
+**[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**
+
+If you're simply looking to use the player, you can safely skip this section.
+
+If you're modifying the code, debugging hardware behavior, or working on HiBy OS itself, the technical notes are the place to start.
+
+---
+
+# Acknowledgments
+
+This project builds on important prior work from the HiBy modding community.
+
+### [hiby-modding/hiby_os_crack](https://github.com/hiby-modding/hiby_os_crack)
+
+The parent toolkit this project was originally developed alongside.
+
+Its `.upt` firmware unpacking/repacking tools, QEMU setup, device layouts, and general HiBy OS reverse-engineering work made it possible to build and flash modified firmware images in the first place.
+
+### [bidhata/Hiby-R1-Mod](https://github.com/bidhata/Hiby-R1-Mod)
+
+An unpacked/mirrored copy of the R1 stock firmware was used as the local development source for the host simulator's `theme2` UI asset mirror and for identifying stock font files used by the player at runtime.
+
+Huge thanks to everyone who has contributed to the existing HiBy reverse-engineering ecosystem.
+
+---
+
+# License
+
+This project is licensed under the **GNU General Public License v2.0**. See [LICENSE](LICENSE).
+
+The project statically links [FAAD2](https://github.com/knik0/faad2) for AAC decoding, which is GPLv2-licensed. As a result, the resulting binary is distributed under GPLv2 as a whole rather than treating the AAC decoder as an isolated component.
+
+Other major dependencies, including `dr_libs`, LVGL, and tinyalsa, use permissive licenses.
+
+If GPLv2 is ever undesirable for a particular deployment, the practical solution would be to remove AAC support or replace FAAD2 with a decoder under a compatible permissive license—not to attempt to isolate the existing FAAD2 implementation from the resulting binary.
+
+---
+
+# Contributing
+
+Contributions, bug reports, hardware testing, reverse-engineering findings, and feature requests are welcome.
+
+If you have a HiBy device that isn't currently supported, testing and reporting hardware-specific behavior can be particularly useful.
+
+Feature requests are also welcome—especially those that improve the player without adding unnecessary complexity.
+
+---
+
+# Project Direction
+
+The long-term goal is not simply to make a replacement for `hiby_player`.
+
+It's to build a **community-maintained music player for HiBy hardware** that is easier to modify, easier to debug, and capable of features that the stock software doesn't provide.
+
+The project is still actively evolving. Expect rough edges, experimental features, and hardware-specific quirks—but also expect the player to keep getting better.

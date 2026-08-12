@@ -125,7 +125,7 @@ A few MB of RSS growth right after launch is normal (the image cache
 filling up to its ~4MB cap, LV_CACHE_DEF_SIZE in lv_conf.h). It should
 plateau, not keep climbing. If `free -m`'s `available` column keeps
 dropping every time you check, stop and investigate before doing anything
-else -- don't let the user interact with a device that's actively leaking
+else -- don't interact with a device that's actively leaking
 memory, it can freeze the whole thing (not just the app).
 
 ## 6. Watch `/usr/data` free space -- it's a 35.8MB partition
@@ -150,7 +150,7 @@ which otherwise looks like your cleanup "undid itself" after a crash.
 
 Don't leave a raw test binary running as the device's final state --
 relaunch the real thing via its normal init.d path (not the raw binary) so
-the device is left exactly as a real user would find it after a normal
+the device is left exactly as you would find it after a normal
 boot:
 
 ```
@@ -167,10 +167,10 @@ running before considering the session done.
 `adb devices` still showing the device but every `adb shell` command
 failing with `error: closed` means the **device** is in trouble, not the
 adb client -- restarting `adb kill-server && adb start-server` will not
-fix it. This is what a frozen device looks like over adb. Ask the user to
-check the physical screen and power-cycle if needed.
+fix it. This is what a frozen device looks like over adb. Power cycle the
+device in this case.
 
 If `adb devices` shows nothing at all for more than ~20-30s after a kill/
 launch command, that's consistent with an actual reboot in progress (not
 just a hung shell) -- see step 1's reboot-on-exit trap first before assuming
-something is wrong with the app under test.
+something is wrong with the app under test. Re-enable ADB after reboot.

@@ -64,6 +64,20 @@ void audio_output_close(void);
  * behavior as a format change. */
 void audio_output_set_bt_requested(bool requested);
 
+/* Routes subsequent audio_output_ensure()/_write() calls to an external
+ * USB audio device (DAC/amp) instead of local hardware, or back again --
+ * mirrors audio_output_set_bt_requested() above exactly, just targeting a
+ * resolved ALSA device string (from usb_audio_output_is_connected(),
+ * usb_audio_output.h) instead of the fixed "bluealsa" literal. Takes
+ * priority over Bluetooth if both are somehow requested at once (see
+ * audio_output.c's open_device()) -- a user physically plugging something
+ * in is a more deliberate, more recent signal than an already-standing
+ * Bluetooth connection. alsa_device is copied internally (safe to pass a
+ * stack buffer); ignored when requested is false. Only takes effect on
+ * the next audio_output_ensure() call, same lazy-reopen behavior as a
+ * format change. */
+void audio_output_set_usb_requested(bool requested, const char * alsa_device);
+
 /* Writes the codec's own hardware attenuation registers ("Left"/"Right
  * Playback Volume", raw 0-255) directly via tinyalsa's mixer API -- see
  * audio.c's volume_set_hw_raw() doc comment for the full real-device

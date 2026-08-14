@@ -66,6 +66,16 @@ void audio_set_crossfade_enabled(bool enabled);
  * differs from what's currently open, same as a sample-rate change does. */
 void audio_set_bt_output(bool enabled);
 
+/* Same shape as audio_set_bt_output() above, for an externally connected
+ * USB audio device (DAC/amp) instead of Bluetooth -- alsa_device is the
+ * resolved ALSA target string from usb_audio_output_is_connected()
+ * (usb_audio_output.h), e.g. "plughw:1,0". The GUI calls this whenever its
+ * own USB audio hotplug poll changes (see poll_usb_audio_output() in
+ * gui.c) -- unlike Bluetooth, there is no manual toggle for this; it's
+ * meant to feel exactly like the wired headphone jack, fully automatic.
+ * ignored when enabled is false. */
+void audio_set_usb_output(bool enabled, const char * alsa_device);
+
 /* Toggle between playing and paused. No-op if nothing is loaded */
 void audio_toggle_pause(void);
 

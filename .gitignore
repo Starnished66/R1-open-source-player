@@ -18,7 +18,29 @@
 # locally from your own device/firmware dump if you want to build with the
 # real UI; assets/fonts/ (this repo's own, openly-licensed subsets, see its
 # own NOTICE.md) is tracked normally.
-/assets/theme2
+#
+# A handful of files under here are exceptions, confirmed NOT present in a
+# genuine stock firmware dump (diffed directly against one) -- this app's
+# own boot animation and Subsonic integration icons, not HiBy IP, so they're
+# safe to track normally. Excluding everything else in the tree first, then
+# re-including just those specific paths one directory level at a time --
+# git won't apply a file-level negation inside a directory that's still
+# itself excluded, so each level needs its own `!` before the next. Anyone
+# who populates the rest of this directory locally from their own firmware
+# dump (per the note above) won't have those real stock files
+# accidentally un-ignored by this.
+/assets/theme2/*
+!/assets/theme2/boot_animation/
+/assets/theme2/boot_animation/*
+!/assets/theme2/boot_animation/en/
+/assets/theme2/boot_animation/en/*
+!/assets/theme2/boot_animation/en/0.png
+!/assets/theme2/boot_animation/en/config.ini
+!/assets/theme2/boot_animation/en/push.bat
+!/assets/theme2/stream_media/
+/assets/theme2/stream_media/*
+!/assets/theme2/stream_media/subsonic.png
+!/assets/theme2/stream_media/subsonic_s.png
 
 # Korean.ttf-derived host-simulator font: excluded, unlike the rest of
 # assets/fonts/, because this particular file's own embedded metadata

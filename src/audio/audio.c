@@ -839,6 +839,16 @@ void audio_set_bt_output(bool enabled) {
 #endif
 }
 
+void audio_set_usb_output(bool enabled, const char * alsa_device) {
+#ifndef HOST_BUILD
+    /* Same no-lock reasoning as audio_set_bt_output() right above. */
+    audio_output_set_usb_requested(enabled, alsa_device);
+#else
+    (void) enabled;
+    (void) alsa_device; /* host build has no USB audio-host output path -- SDL only */
+#endif
+}
+
 void audio_toggle_pause(void) {
     pthread_mutex_lock(&audio_mutex);
     if (!have_current) {

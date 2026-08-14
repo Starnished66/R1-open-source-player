@@ -21,6 +21,7 @@
   #include "firmware_update.h"
   #include "subprocess.h"
   #include "bt_media_player.h"
+  #include "gui.h"
   #include <fcntl.h>
   #include <sys/ioctl.h>
   #include <sys/stat.h>
@@ -37,8 +38,12 @@ static uint32_t custom_tick_get(void) {
     return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
 }
 
-/* GUI initialization declaration */
+#ifdef HOST_BUILD
+/* gui.h isn't included in the HOST_BUILD branch above (it pulls in
+ * target-only headers transitively), so this is the only declaration
+ * gui_init() gets there. */
 extern void gui_init(uint32_t screen_width, uint32_t screen_height);
+#endif
 
 #ifndef HOST_BUILD
 /* Polls /dev/fb0 with a real open()+ioctl() check rather than trusting the
@@ -139,6 +144,20 @@ int main(void) {
 #ifndef HOST_BUILD
     boot_checkpoint("main entered");
 
+    /* AVRCP transport-button support -- connects to the system bus and
+     * registers this app as BlueZ's active media player, all on its own
+     * thread (non-blocking). Called as early as this process possibly can
+     * (right after boot_checkpoint's own fd setup, before literally
+     * anything else) -- see bt_media_player.c's own top-of-file comment
+     * (task #44, 2026-08-13) for why: comparing against the stock
+     * firmware showed its own AVRCP handler (sys_server) starts even
+     * before hci0 exists, at init.d's S50 vs this app's own S92, and stays
+     * registered unconditionally for its whole lifetime. This is the
+     * closest this app's own S92 init.d position allows to that head
+     * start. */
+    bt_media_player_init();
+    boot_checkpoint("bt_media_player_init done");
+
     /* Fallback library search path on the writable partition, for restoring
      * a shared library the read-only squashfs rootfs is missing without
      * needing a reflash (e.g. libldacdec.so, required by bluealsa). */
@@ -209,6 +228,12 @@ int main(void) {
     lv_linux_fbdev_set_file(disp, "/dev/fb0");
     boot_checkpoint("lv_linux_fbdev_set_file done");
 
+    /* As early as this process can paint anything -- see gui_show_boot_
+     * splash()'s own comment (gui.c) for why this exists and how gui_init()
+     * further down uses the tick recorded here. */
+    gui_show_boot_splash();
+    boot_checkpoint("gui_show_boot_splash done");
+
     /* Create Touch Input device via evdev. Auto-detect the touch controller
      * by name first (works on the R1's Hynitron "hyn_ts"); fall back to
      * guessing event0/event1 for variants where that lookup doesn't match. */
@@ -249,13 +274,6 @@ int main(void) {
     audio_init();
 #ifndef HOST_BUILD
     boot_checkpoint("audio_init done");
-
-    /* AVRCP transport-button support -- connects to the system bus and
-     * starts its dispatch thread now, for the app's whole lifetime. Doesn't
-     * register with BlueZ until Bluetooth output is actually in use, so
-     * this is safe to call unconditionally regardless of whether BT is on. */
-    bt_media_player_init();
-    boot_checkpoint("bt_media_player_init done");
 #endif
     gui_init(SCREEN_WIDTH, SCREEN_HEIGHT);
 #ifndef HOST_BUILD

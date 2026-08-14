@@ -2,6 +2,7 @@
 #define BLUETOOTH_CONTROL_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 typedef struct {
     char mac[18]; /* "XX:XX:XX:XX:XX:XX" + NUL */
@@ -10,37 +11,22 @@ typedef struct {
     bool connected;
 } bt_device_t;
 
-/* Real BlueZ/bluetoothd stack already running on this device (bluetoothd +
- * bluealsa for audio output + a NoInputNoOutput pairing agent, confirmed
- * via `ps` on a real unit) -- everything here just drives bluetoothctl's
- * own non-interactive CLI mode (`bluetoothctl <command> [args]`, distinct
- * from its interactive shell), confirmed directly on a real device to
- * behave cleanly with no ANSI/prompt junk to strip. */
+/* bluetoothd, bluealsa, and a NoInputNoOutput pairing agent are already
+ * running on this device; everything here just drives bluetoothctl's
+ * non-interactive CLI mode (`bluetoothctl <command> [args]`), which
+ * produces clean output with no ANSI/prompt junk to strip. */
 
 bool bt_control_is_powered(void);
 
-/* Deliberately no startup-time cleanup call here (there used to be one --
- * bt_control_startup_cleanup()/bt_control_startup_cleanup_bounded(), killed
- * a stray stock hiby_player and consolidated the two independent D-Bus
- * daemons S30dbus and S80_bt_init's bt_init always leave running). Real-
- * device incident: on a genuine cold boot, actually performing that
- * cleanup -- not just being slow at it -- reliably hung this app before it
- * ever reached the main loop, confirmed after three separate rounds of
- * fixing real bugs in the bounded wrapper (an overall timeout, a supervisor
- * -wait bug, a fork()-failure-fallback bug) made no difference whatsoever
- * to where or whether boot succeeded. Skipping the call entirely, proven
- * live: boots cleanly and reliably. The likely mechanism: killing/
- * respawning D-Bus daemons that other still-starting init.d services
- * (S50sys_server, S80_bt_init itself) are actively relying on at that exact
- * moment is disruptive in a way no amount of bounding can fix, since the
- * problem was never about *how long* it takes. The stock-hiby_player-kill
- * half is moot anyway for a flashed deployment -- this binary replaces
- * /usr/bin/hiby_player outright, so there's never a second copy running to
- * kill. The D-Bus split-brain condition itself is still handled, just
- * reactively instead of preemptively: see the wedge-recovery logic further
- * down, which calls ensure_single_dbus_daemon() only once a real symptom
- * (bluetoothctl hanging, an agent registered on the wrong bus) is actually
- * observed during normal use, long after boot has settled. */
+/* Deliberately no startup-time cleanup call here (there used to be one).
+ * Running it during boot -- killing/respawning the D-Bus daemons that
+ * S30dbus and S80_bt_init leave running, which other still-starting
+ * init.d services depend on -- reliably hung the app before it reached
+ * the main loop; skipping it entirely boots cleanly and reliably. The
+ * D-Bus split-brain condition it addressed is instead handled reactively:
+ * see ensure_single_dbus_daemon() further down, called only once a real
+ * symptom (bluetoothctl hanging, an agent registered on the wrong bus) is
+ * observed during normal use. */
 
 /* Brings up the Bluetooth chip if it isn't already (no hci0 this boot) by
  * running the real firmware's own /usr/bin/bt_resume script -- the same
@@ -68,6 +54,24 @@ bool bt_control_init_chip(void);
 void bt_control_enable(void);
 void bt_control_disable(void);
 
+/* Task #44 fix: kill + relaunch bluetoothd (adapter reset, power restore,
+ * output profile reapply), same recipe the reactive wedge-recovery in
+ * bt_control_is_powered() already uses, but called unconditionally rather
+ * than only after a detected wedge symptom -- see bluetooth_control.c's
+ * own comment on this function for the real-device diagnosis that led
+ * here (a cold-boot-only AVRCP passthrough bug bluetoothctl-based wedge
+ * detection never observes, since the daemon answers every other query
+ * normally the whole time). Blocks for a few seconds (kill/reset/respawn/
+ * re-enable, each its own subprocess call) -- NOT the "no startup-time
+ * cleanup" case warned about just above bt_control_init_chip(): that
+ * warning is specifically about running daemon cleanup before the main
+ * loop starts; this is safe to call any time AFTER that, from any
+ * thread that isn't the UI thread. bt_media_player.c's dispatch thread
+ * (already running well past app startup by the time BT first connects)
+ * is the intended caller, once, right before its own first real
+ * RegisterPlayer this boot. */
+void bt_control_restart_daemon(void);
+
 /* True if any paired device currently has an active connection. Cheap
  * relative to bt_control_scan() (no discovery window): just `info` on each
  * already-paired device, same query bt_control_scan() already does per
@@ -92,6 +96,26 @@ int bt_control_list_paired_states(bt_device_t * out, int max_count);
  * necessarily one that actually supports/negotiated A2DP audio). Forks a
  * process (`bluealsa-cli list-pcms`); call off the UI thread. */
 bool bt_control_is_a2dp_source_connected(void);
+
+/* Writes the connected A2DP-source accessory's Bluetooth MAC address (e.g.
+ * "DC:69:E2:99:43:06") into out, extracted from the same bluealsa PCM path
+ * bt_control_is_a2dp_source_connected() already checks for
+ * ("/org/bluealsa/hci0/dev_XX_XX_XX_XX_XX_XX/a2dpsrc/sink" -- underscores
+ * swapped back to colons). Returns false (out left untouched) if nothing's
+ * connected. Same subprocess cost as the other bt_control_* calls here;
+ * call off the UI thread. */
+bool bt_control_get_connected_device_mac(char * out, size_t out_size);
+
+/* Writes the ACTUAL negotiated A2DP codec the connected accessory is
+ * currently streaming with (e.g. "AAC", "LDAC", "SBC" -- whatever
+ * `bluealsa-cli info` reports as "Selected codec") into out. This is the
+ * real, live-negotiated codec, NOT current_settings.bt_codec (this app's
+ * own PREFERRED codec setting, Settings > Bluetooth > Codec) -- those can
+ * differ if the accessory doesn't support the preferred one and bluealsa
+ * fell back to something else. Same subprocess cost as the other
+ * bt_control_* calls here; call off the UI thread. Returns false (out left
+ * untouched) if nothing's connected. */
+bool bt_control_get_connected_device_codec(char * out, size_t out_size);
 
 /* Blocking: scans for `seconds` (bluetoothctl's own --timeout), then reads
  * back the combined paired+discovered device list via `info` on each one

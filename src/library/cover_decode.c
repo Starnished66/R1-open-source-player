@@ -6,19 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Why this exists: LVGL's own image "zoom"/"stretch" transform only applies
- * to fully-decoded ARGB8888 buffers (what lodepng produces) -- for a JPEG
- * source (the common case for embedded album art), LVGL's tjpgd binding
- * decodes lazily, tile by tile, straight into the draw pipeline, and the
- * transform never touches it. That leaves real embedded art displayed at
- * its native pixel size with no scaling at all, which is visibly wrong
- * whenever art isn't exactly the target size (near-universal in practice) --
- * black gaps around/below it instead of a full-bleed cover.
- *
- * The fix is to fully decode the image ourselves (bypassing LVGL's lazy
- * JPEG path entirely) and resize into an exact target-sized buffer before
- * LVGL ever sees it -- at that point it's just a plain raw RGB565 bitmap,
- * the same as any other image source, no transform quirks involved. */
+/* LVGL's zoom/stretch transform only applies to fully-decoded ARGB8888
+ * buffers; its tjpgd binding decodes JPEGs lazily, tile by tile, straight
+ * into the draw pipeline, so the transform never touches JPEG album art.
+ * This file decodes JPEG/PNG cover art itself and resizes it into an exact
+ * target-sized RGB565 buffer before LVGL ever sees it, avoiding that gap. */
 
 typedef struct {
     const uint8_t * data;
@@ -56,14 +48,10 @@ static int jpeg_mem_output(JDEC * jd, void * bitmap, JRECT * rect) {
 
         uint8_t * dst_row = ctx->out_buf + (size_t) dy * ctx->out_w * 3 + (size_t) rect->left * 3;
         const uint8_t * src_row = src + (size_t) y * w * 3;
-        /* tjpgd's own YCbCr-to-RGB conversion in jd_mcu_output() writes its
-         * three output bytes per pixel in B, G, R order, not R, G, B --
-         * confirmed both by reading that loop directly in tjpgd.c and by
-         * feeding known-color test JPEGs through this exact code path (a
-         * solid red source decoded as solid blue, and vice versa, before
-         * this fix). A per-pixel swap here instead of a straight memcpy
-         * corrects it. lodepng's PNG path is unaffected -- lodepng_decode24()
-         * already returns standard R, G, B and needs no such swap. */
+        /* tjpgd's YCbCr-to-RGB conversion writes its three output bytes per
+         * pixel in B, G, R order, not R, G, B; swap per-pixel here instead of
+         * a straight memcpy to correct it. lodepng's PNG path already
+         * returns standard R, G, B and needs no such swap. */
         for (int x = 0; x < copy_w; x++) {
             dst_row[x * 3 + 0] = src_row[x * 3 + 2]; /* R <- src B */
             dst_row[x * 3 + 1] = src_row[x * 3 + 1]; /* G <- src G */
@@ -81,31 +69,17 @@ static bool decode_jpeg_rgb888(const uint8_t * data, uint32_t size,
 
     if (jd_prepare(&jd, jpeg_mem_read, workbuf, sizeof(workbuf), &ctx) != JDR_OK) return false;
 
-    /* tjpgd's built-in scale (0=1/1 .. 3=1/8) is only used here as a
-     * memory-safety fallback for pathologically large embedded art now, not
-     * for its normal purpose of shrinking the decode buffer down toward the
-     * target size. Real-device testing (2026-08-08) with a real 1200x1200
-     * embedded cover proved tjpgd's scale>0 output is corrupted in this
-     * vendored build: block_idct() (tjpgd.c) always produces a full,
-     * unreduced 8x8 spatial block regardless of jd->scale (the only
-     * scale-aware step there is a DC-only shortcut at scale==3), and the RGB
-     * conversion loop in jd_mcu_output() converts that full block using
-     * unscaled MCU dimensions -- the "squeeze" step that would repack it
-     * down to the smaller, scale-halved rect it then reports to this file's
-     * output callback only runs for right/bottom edge-clipped MCUs
-     * (rx < mx), never for interior ones. So for any image with interior
-     * MCUs (essentially all of them), jpeg_mem_output() above is told a
-     * small rect but reads pixel data still laid out at full MCU stride --
-     * a stride mismatch producing exactly the blocky/checkerboard
-     * corruption reported. Confirmed via a standalone host test harness
-     * decoding that same real JPEG: scale=1 (600x600 output) was visibly
-     * corrupted, scale=0 (native 1200x1200) was clean. Always decode at
-     * native resolution now and let resize_cover_fit()'s own box filter
-     * (already correct, unrelated bug) do all the downscaling -- except
-     * above MAX_NATIVE_DECODE_BYTES, where the native decode buffer itself
-     * would risk exhausting this device's limited RAM; only then fall back
-     * to tjpgd's scale, accepting its known corruption as the lesser risk
-     * vs an OOM crash for that rare oversized-art case. */
+    /* tjpgd's built-in scale (0=1/1 .. 3=1/8) is used only as a memory-safety
+     * fallback for pathologically large embedded art, not for its normal
+     * purpose of shrinking the decode buffer: scale>0 output is corrupted in
+     * this vendored build (the IDCT always produces full unscaled 8x8
+     * blocks, but the RGB conversion loop is told a smaller, scale-reduced
+     * rect for interior MCUs, so it reads pixel data at the wrong stride).
+     * Always decode at native resolution and let resize_cover_fit()'s own
+     * box filter do the downscaling, except above MAX_NATIVE_DECODE_BYTES,
+     * where the native decode buffer itself would risk exhausting this
+     * device's limited RAM -- only then fall back to tjpgd's scale,
+     * accepting its known corruption as the lesser risk vs an OOM crash. */
 #define MAX_NATIVE_DECODE_BYTES (8 * 1024 * 1024)
     uint8_t scale = 0;
     size_t native_bytes = (size_t) jd.width * jd.height * 3;
@@ -183,26 +157,16 @@ static void bilinear_sample(const uint8_t * src, int src_w, int src_h, float fx,
 }
 
 /* "Cover fit": scale so the source fully covers the target box (the larger
- * of the two axis ratios), then center-crop whichever dimension overflows --
- * a photo app's thumbnail/cover mode, and what full-bleed player artwork
- * needs regardless of the source image's native aspect ratio.
+ * of the two axis scale ratios), then center-crop whichever dimension
+ * overflows -- the same behavior as a photo app's cover/thumbnail mode.
  *
- * Box-filter (area-average) when downscaling: each destination pixel
- * averages every source pixel whose center falls in its inverse-mapped
- * footprint, rather than sampling a single nearest source pixel --
- * real-device feedback: "downscaled album art looks pixelated" (most
- * embedded cover art is far larger than the on-screen art box, so
- * nearest-neighbor was discarding most of the source detail instead of
- * blending it).
- *
- * Bilinear when upscaling: box-filter's own footprint degrades to a single
- * source pixel once it's narrower than one source pixel (i.e. the box
- * filter IS nearest-neighbor for magnification), which is exactly why
- * "still pixelated for most songs" persisted after the box-filter fix
- * above -- most real-world embedded art is smaller than this app's 480x480
- * on-screen box, so most tracks were hitting this exact code path, not the
- * downscale one the box filter actually fixed. Smoothly interpolating
- * between the 4 nearest source pixels instead removes the blockiness. */
+ * Downscaling uses a box filter (area-average of every source pixel whose
+ * center falls in the destination pixel's inverse-mapped footprint) rather
+ * than nearest-neighbor, since embedded art is usually far larger than the
+ * on-screen art box. Upscaling uses bilinear interpolation instead, since a
+ * box filter's footprint degrades to nearest-neighbor once it's narrower
+ * than one source pixel -- the common case, since most embedded art is
+ * smaller than this app's on-screen art box. */
 static uint16_t * resize_cover_fit(const uint8_t * src, int src_w, int src_h, int dst_w, int dst_h) {
     uint16_t * dst = malloc((size_t) dst_w * dst_h * sizeof(uint16_t));
     if (!dst) return NULL;

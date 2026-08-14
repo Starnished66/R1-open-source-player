@@ -137,6 +137,8 @@ static const char * extension_for_content_type(const char * content_type) {
         strcasecmp(content_type, "audio/m4a") == 0) return ".m4a";
     if (strcasecmp(content_type, "audio/x-ape") == 0 || strcasecmp(content_type, "audio/ape") == 0) return ".ape";
     if (strcasecmp(content_type, "audio/x-ms-wma") == 0) return ".wma";
+    if (strcasecmp(content_type, "audio/opus") == 0 || strcasecmp(content_type, "audio/ogg") == 0 ||
+        strcasecmp(content_type, "application/ogg") == 0) return ".opus";
     return NULL;
 }
 

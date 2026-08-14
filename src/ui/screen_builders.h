@@ -47,6 +47,21 @@ extern const lv_font_t * ui_size_28;
  * that PNG's own fill color (sampled directly from the asset) so the look
  * carries over despite the switch. */
 #define LIST_ROW_WIDTH 464
+/* Wider rows for Files/Artists/Album Artist/Albums/All Songs/Playlists --
+ * explicit user request for a bigger tap target (real-device feedback: the
+ * default width read as cramped). NOT a flat +15%: this device's screen is
+ * only 480px wide (SCREEN_WIDTH, main.c), and LIST_ROW_WIDTH already uses
+ * 464 of those, so a literal 15% bump (533px) would overflow the physical
+ * display by 53px. 476px is the practical max -- edge-to-edge minus a thin
+ * 4px total margin -- confirmed with the user after flagging the overflow.
+ * Rows still use the shared plain-rounded-rect list_row_style (see
+ * build_compact_list_widget()'s per-row width override) rather than a new
+ * style, so height/radius/color/font stay identical -- only the box widens,
+ * and callers passing this must also make sure their row is horizontally
+ * centered/positioned so it doesn't clip past the container's own edge
+ * (see build_compact_list_widget()'s row_x and file_browser.c's/
+ * build_playlists_screen()'s explicit flex-center alignment). */
+#define LIST_ROW_WIDTH_WIDE 476
 #define LIST_ROW_HEIGHT 84
 #define LIST_ROW_RADIUS 16
 #define LIST_ROW_BG_COLOR lv_color_make(28, 28, 30)
@@ -86,9 +101,13 @@ typedef struct {
  * a flex-wrap grid of icon tiles below, each swapping to its "_s" asset
  * while pressed for visual feedback. Caller owns navigation wiring
  * (nav_pop/nav_push, swipe gestures) via finalize_screen_navigation() after
- * this returns. */
+ * this returns. icon_scale_percent scales ICON_GRID_TARGET_ICON_PX for this
+ * screen only (100 = the shared default every other icon-grid screen uses;
+ * pass a value above/below 100 to make just this screen's icons bigger or
+ * smaller without affecting the others). */
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
-                                   const icon_grid_item_t * items, int item_count);
+                                   const icon_grid_item_t * items, int item_count,
+                                   int32_t icon_scale_percent);
 
 typedef enum {
     PILL_ACCESSORY_NONE = 0,
@@ -141,6 +160,49 @@ typedef void (*compact_list_click_cb_t)(int index);
  * screens get torn down and rebuilt too. */
 lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                       const compact_list_item_t * items, int item_count,
-                                      compact_list_click_cb_t on_click);
+                                      compact_list_click_cb_t on_click, lv_obj_t ** out_list,
+                                      int32_t row_width, bool enable_now_playing, lv_color_t now_playing_color);
+
+/* The virtualized list widget itself (what build_compact_list_screen()
+ * builds internally), with no screen/back-button/title wrapper -- for a
+ * caller that already has its own screen and wants to attach a compact
+ * list directly onto it (e.g. a search-results overlay layered on top of
+ * an existing screen's own UI). Returns the list object directly (not a
+ * screen) -- caller owns positioning it via lv_obj_align()/lv_obj_set_size().
+ * row_width overrides list_row_style's own LIST_ROW_WIDTH per-instance (pass
+ * LIST_ROW_WIDTH for the shared default, or LIST_ROW_WIDTH_WIDE to match a
+ * widened parent screen -- e.g. the Files search overlay matching Files'
+ * own now-wider rows). enable_now_playing/now_playing_color: see
+ * compact_list_set_now_playing()'s own doc comment below -- pass false/
+ * anything when a list has no now-playing concept (e.g. the Files search
+ * overlay, the timezone city list). Color is threaded through as a
+ * parameter rather than read directly (screen_builders.c has no visibility
+ * into gui.c's current_settings.accent_color/accent_lv_color()). */
+lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_t * items, int item_count,
+                                      compact_list_click_cb_t on_click, int32_t row_width,
+                                      bool enable_now_playing, lv_color_t now_playing_color);
+
+/* Shows/moves/hides a thin accent-colored bar flush against the screen's
+ * far-left edge (independent of row_width/any row's own inset -- this is a
+ * "far left of the screen" indicator, not "far left of the row"), at the
+ * same y as the row for `item_index` (an index into whatever `items` array
+ * this list was built/last set with) -- item_index < 0 hides it. No-op if
+ * this list wasn't built with enable_now_playing=true. Position tracks the
+ * item directly (not the visible scroll window), so LVGL's own list
+ * scrolling/clipping naturally shows or hides it as the matching row
+ * scrolls in and out of view -- no separate scroll-event wiring needed. */
+void compact_list_set_now_playing(lv_obj_t * list, int item_index);
+
+/* Scrolls a build_compact_list_screen() list so item `index` lands at the
+ * top of the viewport -- exposed as a semantic helper (rather than exposing
+ * COMPACT_LIST_TOP_PAD/COMPACT_LIST_ROW_STRIDE themselves, private to
+ * screen_builders.c) so callers like gui.c's A-Z browse index don't need to
+ * know this list's internal row geometry. */
+void compact_list_scroll_to_index(lv_obj_t * list, int index);
+
+/* Swaps a build_compact_list_screen() list's contents in place -- used for
+ * live search filtering -- without the delete()+rebuild this project
+ * otherwise uses for changing a screen's list contents. */
+void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, int item_count);
 
 #endif /* SCREEN_BUILDERS_H */

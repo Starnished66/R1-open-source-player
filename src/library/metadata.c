@@ -2,6 +2,8 @@
 
 #include "dr_flac.h"
 #include "dr_wav.h"
+#include "ogg_demux.h"
+#include "mbedtls/base64.h"
 
 #include <poll.h>
 #include <signal.h>
@@ -17,6 +19,92 @@ static void copy_bounded(char * dst, size_t dst_size, const char * src, size_t s
     if (src_len >= dst_size) src_len = dst_size - 1;
     memcpy(dst, src, src_len);
     dst[src_len] = '\0';
+}
+
+/* Generic Vorbis-Comment "KEY=VALUE" field matching -- shared by FLAC's
+ * VORBIS_COMMENT block (below, via dr_flac's own iterator) and Opus's
+ * OpusTags (read_opus_metadata(), same comment-list layout per RFC 7845
+ * 5.2). Only the iteration mechanism differs between formats; this matching
+ * logic has no dr_flac-specific coupling. */
+static void apply_vorbis_comment_field(track_metadata_t * out, const char * comment, size_t comment_len) {
+    const char * eq = memchr(comment, '=', comment_len);
+    if (!eq) return;
+
+    size_t key_len = (size_t) (eq - comment);
+    const char * value = eq + 1;
+    size_t value_len = comment_len - key_len - 1;
+
+    if (key_len == 5 && strncasecmp(comment, "TITLE", 5) == 0) {
+        copy_bounded(out->title, sizeof(out->title), value, value_len);
+        out->has_title = true;
+    } else if (key_len == 6 && strncasecmp(comment, "ARTIST", 6) == 0) {
+        copy_bounded(out->artist, sizeof(out->artist), value, value_len);
+        out->has_artist = true;
+    } else if (key_len == 5 && strncasecmp(comment, "ALBUM", 5) == 0) {
+        copy_bounded(out->album, sizeof(out->album), value, value_len);
+        out->has_album = true;
+    } else if (key_len == 11 && strncasecmp(comment, "ALBUMARTIST", 11) == 0) {
+        copy_bounded(out->album_artist, sizeof(out->album_artist), value, value_len);
+        out->has_album_artist = true;
+    } else if (key_len == 5 && strncasecmp(comment, "GENRE", 5) == 0) {
+        copy_bounded(out->genre, sizeof(out->genre), value, value_len);
+        out->has_genre = true;
+    } else if (key_len == 21 && strncasecmp(comment, "REPLAYGAIN_TRACK_GAIN", 21) == 0) {
+        char value_buf[32];
+        copy_bounded(value_buf, sizeof(value_buf), value, value_len);
+        out->replaygain_gain_db = strtod(value_buf, NULL); /* strtod stops at the trailing " dB", no need to strip it */
+        out->has_replaygain = true;
+    } else if (key_len == 21 && strncasecmp(comment, "REPLAYGAIN_TRACK_PEAK", 21) == 0) {
+        char value_buf[32];
+        copy_bounded(value_buf, sizeof(value_buf), value, value_len);
+        out->replaygain_peak = strtod(value_buf, NULL);
+        out->has_replaygain_peak = true;
+    }
+}
+
+/* Parses a METADATA_BLOCK_PICTURE structure (https://xiph.org/flac/format.html#metadata_block_picture,
+ * also used verbatim -- just base64-wrapped as an Ogg/Opus comment value --
+ * by Xiph's own "PICTURE" tag convention for Vorbis-Comment-based formats):
+ * a fixed run of big-endian fields (type, then length-prefixed MIME string,
+ * length-prefixed description, width/height/depth/color-count) followed by
+ * the length-prefixed image bytes themselves. dr_flac parses this same
+ * layout internally for native FLAC picture blocks (exposed directly via
+ * meta->data.picture in flac_meta_cb() above), but that parsing isn't
+ * reusable source code -- this is a from-scratch equivalent for the
+ * base64-decoded bytes the Opus path hands it, keeping only the final
+ * image bytes since track_metadata_t has no fields for the others. */
+static void parse_flac_picture_block(const uint8_t * data, size_t size, track_metadata_t * out) {
+    if (out->picture_data != NULL) return; /* keep the first picture found, same as FLAC/MP3/M4A */
+
+    size_t pos = 0;
+    if (pos + 4 > size) return;
+    pos += 4; /* picture type -- not discriminated on, matching FLAC/MP3/M4A's "first picture wins" */
+
+    if (pos + 4 > size) return;
+    uint32_t mime_len = ((uint32_t) data[pos] << 24) | ((uint32_t) data[pos + 1] << 16) | ((uint32_t) data[pos + 2] << 8) | data[pos + 3];
+    pos += 4;
+    if (pos + mime_len > size) return;
+    pos += mime_len;
+
+    if (pos + 4 > size) return;
+    uint32_t desc_len = ((uint32_t) data[pos] << 24) | ((uint32_t) data[pos + 1] << 16) | ((uint32_t) data[pos + 2] << 8) | data[pos + 3];
+    pos += 4;
+    if (pos + desc_len > size) return;
+    pos += desc_len;
+
+    if (pos + 16 > size) return; /* width, height, depth, color-count -- 4 bytes each */
+    pos += 16;
+
+    if (pos + 4 > size) return;
+    uint32_t pic_data_len = ((uint32_t) data[pos] << 24) | ((uint32_t) data[pos + 1] << 16) | ((uint32_t) data[pos + 2] << 8) | data[pos + 3];
+    pos += 4;
+    if (pic_data_len == 0 || pos + pic_data_len > size) return;
+
+    uint8_t * copy = malloc(pic_data_len);
+    if (!copy) return;
+    memcpy(copy, data + pos, pic_data_len);
+    out->picture_data = copy;
+    out->picture_size = pic_data_len;
 }
 
 /* ---- FLAC: VORBIS_COMMENT block ---- */
@@ -46,39 +134,7 @@ static void flac_meta_cb(void * user_data, drflac_metadata * meta) {
     drflac_uint32 comment_len;
     const char * comment;
     while ((comment = drflac_next_vorbis_comment(&iter, &comment_len)) != NULL) {
-        const char * eq = memchr(comment, '=', comment_len);
-        if (!eq) continue;
-
-        size_t key_len = (size_t) (eq - comment);
-        const char * value = eq + 1;
-        size_t value_len = comment_len - key_len - 1;
-
-        if (key_len == 5 && strncasecmp(comment, "TITLE", 5) == 0) {
-            copy_bounded(out->title, sizeof(out->title), value, value_len);
-            out->has_title = true;
-        } else if (key_len == 6 && strncasecmp(comment, "ARTIST", 6) == 0) {
-            copy_bounded(out->artist, sizeof(out->artist), value, value_len);
-            out->has_artist = true;
-        } else if (key_len == 5 && strncasecmp(comment, "ALBUM", 5) == 0) {
-            copy_bounded(out->album, sizeof(out->album), value, value_len);
-            out->has_album = true;
-        } else if (key_len == 11 && strncasecmp(comment, "ALBUMARTIST", 11) == 0) {
-            copy_bounded(out->album_artist, sizeof(out->album_artist), value, value_len);
-            out->has_album_artist = true;
-        } else if (key_len == 5 && strncasecmp(comment, "GENRE", 5) == 0) {
-            copy_bounded(out->genre, sizeof(out->genre), value, value_len);
-            out->has_genre = true;
-        } else if (key_len == 21 && strncasecmp(comment, "REPLAYGAIN_TRACK_GAIN", 21) == 0) {
-            char value_buf[32];
-            copy_bounded(value_buf, sizeof(value_buf), value, value_len);
-            out->replaygain_gain_db = strtod(value_buf, NULL); /* strtod stops at the trailing " dB", no need to strip it */
-            out->has_replaygain = true;
-        } else if (key_len == 21 && strncasecmp(comment, "REPLAYGAIN_TRACK_PEAK", 21) == 0) {
-            char value_buf[32];
-            copy_bounded(value_buf, sizeof(value_buf), value, value_len);
-            out->replaygain_peak = strtod(value_buf, NULL);
-            out->has_replaygain_peak = true;
-        }
+        apply_vorbis_comment_field(out, comment, comment_len);
     }
 }
 
@@ -770,6 +826,50 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out) {
     fclose(f);
 }
 
+/* ---- Opus: OpusTags (Ogg comment header, RFC 7845 5.2) ---- */
+
+static void read_opus_metadata(const char * path, track_metadata_t * out) {
+    ogg_demux_t * demux = ogg_demux_open(path);
+    if (!demux) return;
+
+    unsigned int count = ogg_demux_get_comment_count(demux);
+    for (unsigned int i = 0; i < count; i++) {
+        uint32_t comment_len;
+        const char * comment = ogg_demux_get_comment(demux, i, &comment_len);
+        if (!comment) continue;
+
+        /* METADATA_BLOCK_PICTURE isn't a plain KEY=VALUE text field --
+         * apply_vorbis_comment_field() would just fail its '='-split match
+         * on the base64 payload harmlessly, but handling it explicitly
+         * here (rather than teaching that shared helper about base64/
+         * binary decoding) keeps it a pure text-field matcher. */
+        static const char picture_key[] = "METADATA_BLOCK_PICTURE=";
+        size_t picture_key_len = sizeof(picture_key) - 1;
+        if (comment_len > picture_key_len && strncasecmp(comment, picture_key, picture_key_len) == 0) {
+            const char * b64 = comment + picture_key_len;
+            size_t b64_len = comment_len - picture_key_len;
+
+            size_t decoded_len = 0;
+            int size_err = mbedtls_base64_decode(NULL, 0, &decoded_len, (const unsigned char *) b64, b64_len);
+            if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) && decoded_len > 0) {
+                uint8_t * decoded = malloc(decoded_len);
+                if (decoded) {
+                    size_t actual_len = 0;
+                    if (mbedtls_base64_decode(decoded, decoded_len, &actual_len, (const unsigned char *) b64, b64_len) == 0) {
+                        parse_flac_picture_block(decoded, actual_len, out);
+                    }
+                    free(decoded);
+                }
+            }
+            continue;
+        }
+
+        apply_vorbis_comment_field(out, comment, comment_len);
+    }
+
+    ogg_demux_close(demux);
+}
+
 void metadata_read(const char * path, track_metadata_t * out) {
     memset(out, 0, sizeof(*out));
 
@@ -786,6 +886,8 @@ void metadata_read(const char * path, track_metadata_t * out) {
         read_aac_metadata(path, out);
     } else if (strcasecmp(ext, ".m4a") == 0) {
         read_m4a_metadata(path, out);
+    } else if (strcasecmp(ext, ".opus") == 0) {
+        read_opus_metadata(path, out);
     }
 }
 

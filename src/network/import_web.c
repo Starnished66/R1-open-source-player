@@ -51,34 +51,20 @@ static bool process_running(const char * name) {
     return exit_code == 0; /* pgrep: 0 = at least one match, 1 = none */
 }
 
-/* Real-device crash: entering and leaving this screen a few times in a row
- * eventually crashed the whole player. Root cause: busybox's killall here
- * only sends SIGTERM and returns as soon as the signal is delivered -- it
- * has no -w/wait flag (confirmed via `strings` on the on-device busybox;
- * GNU killall's -w doesn't exist in this busybox build) -- so this used to
- * return with no guarantee any target had actually exited yet. thttpd's own
- * CGI children (create/delete/download/list/move/upload.cgi) are ordinary
- * forked processes under no obligation to honor SIGTERM promptly, or at
- * all if caught mid-syscall. import_web_start() then unconditionally
- * respawns udp_server/thttpd on the very next screen entry with no check
- * that the prior instances are gone -- on this device's 64MB of total RAM,
- * a few cycles' worth of duplicate/leaked daemon or CGI processes stacking
- * up is enough to trigger an OOM-kill of something, possibly this app
- * itself. Fixed two ways: SIGKILL instead of the default SIGTERM (can't be
- * caught, ignored, or delayed by whatever the target is doing), and an
- * actual bounded wait verifying every target is gone via pgrep before
- * returning, so the next import_web_start() never races a fresh spawn
- * against a not-yet-dead prior one. */
+/* Kills udp_server, thttpd, and any running CGI handlers with SIGKILL
+ * (busybox's killall only sends SIGTERM and doesn't wait for exit), then
+ * polls with pgrep until they're actually gone. Ensures the next
+ * import_web_start() never races a fresh spawn against a not-yet-dead
+ * prior process. */
 void import_web_stop(void) {
     for (size_t i = 0; i < IMPORT_WEB_PROCESS_COUNT; i++) {
         char * argv[] = { (char *) "killall", (char *) "-9", (char *) IMPORT_WEB_PROCESS_NAMES[i], NULL };
         subprocess_run(argv, NULL, 0);
     }
 
-    /* SIGKILL can't be blocked, but a just-killed process still takes the
-     * kernel a moment to actually reap off the runqueue -- polled rather
-     * than assumed instant. Bounded so a genuinely wedged process (D-state
-     * on a stuck filesystem, say) can't hang screen navigation forever. */
+    /* A just-killed process still takes the kernel a moment to reap, so
+     * poll rather than assume it's instant. Bounded so a wedged process
+     * can't hang screen navigation forever. */
     for (int waited_ms = 0; waited_ms < 500; waited_ms += 50) {
         bool any_alive = false;
         for (size_t i = 0; i < IMPORT_WEB_PROCESS_COUNT; i++) {

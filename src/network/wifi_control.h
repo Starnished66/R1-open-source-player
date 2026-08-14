@@ -20,12 +20,12 @@ typedef struct {
  * wifi_status.h for that). */
 bool wifi_control_is_enabled(void);
 
-/* Real enable/disable, reusing the stock firmware's own scripts
+/* Enable/disable Wi-Fi via the stock firmware's own scripts
  * (/usr/bin/wifi_on.sh, /usr/bin/wifi_off.sh) rather than reimplementing
- * the ifconfig/wpa_supplicant/udhcpc dance ourselves -- confirmed on a
- * real device to bring wlan0 up, start wpa_supplicant against
- * /data/wpa_supplicant.conf (auto-reconnecting to any saved network), and
- * get a DHCP lease. Blocking for a second or so; call off the UI thread. */
+ * the ifconfig/wpa_supplicant/udhcpc dance ourselves. Brings wlan0 up,
+ * starts wpa_supplicant against /data/wpa_supplicant.conf (auto-reconnecting
+ * to any saved network), and gets a DHCP lease. Blocking for a second or
+ * so; call off the UI thread. */
 void wifi_control_enable(void);
 void wifi_control_disable(void);
 
@@ -40,18 +40,15 @@ void wifi_control_scan_start(void);
 int wifi_control_get_results(wifi_network_t * out, int max_count);
 
 /* Joins `ssid`, with `password` (NULL/empty for an open network). The PSK
- * is derived from the passphrase ourselves via PBKDF2-HMAC-SHA1 (mbedTLS,
- * already vendored) exactly as WPA-PSK's spec defines (salt = SSID, 4096
- * iterations, 256-bit output), then handed to wpa_cli as a precomputed
- * hex PSK -- both it and the (also hex-encoded) SSID go over argv via
- * subprocess_run(), never through a shell, so arbitrary characters the
- * user typed can't be misinterpreted as shell syntax. Adds + enables +
- * saves the network (persists across reboots, confirmed against a real
- * device's /data/wpa_supplicant.conf already having one saved this way).
- * Blocking; takes a few seconds for association, call off the UI thread.
- * Returns true once wpa_cli accepted the configuration -- doesn't itself
- * confirm association succeeded (poll wifi_get_status() afterward for
- * that, same as the status bar already does). */
+ * is derived from the passphrase via PBKDF2-HMAC-SHA1 (mbedTLS) per the
+ * WPA-PSK spec (salt = SSID, 4096 iterations, 256-bit output), then handed
+ * to wpa_cli as a precomputed hex PSK; both it and the hex-encoded SSID go
+ * over argv via subprocess_run(), never through a shell, so arbitrary
+ * characters the user typed can't be misinterpreted as shell syntax. Adds,
+ * enables, and saves the network (persists across reboots). Blocking; takes
+ * a few seconds for association, call off the UI thread. Returns true once
+ * wpa_cli accepted the configuration -- doesn't itself confirm association
+ * succeeded (poll wifi_get_status() afterward for that). */
 bool wifi_control_connect(const char * ssid, const char * password);
 
 /* Drops the current association (wpa_cli disconnect) without touching the
@@ -76,16 +73,14 @@ int wifi_control_list_saved(wifi_saved_network_t * out, int max_count);
  * UI thread. */
 bool wifi_control_forget(int id);
 
-/* Reconnects to an already-saved network by id (wpa_cli select_network,
- * which -- unlike wifi_control_connect() -- reuses the existing profile's
- * stored PSK instead of creating a brand new network block. Deliberately
- * NOT wifi_control_connect(ssid, NULL): that always creates a fresh
- * add_network entry and, called with no password against an SSID that's
- * already saved as secured, would add a second, broken, open-network
- * duplicate alongside the real one instead of actually reconnecting.
- * select_network also handles the disconnect from whatever's currently
- * associated, if anything -- no separate disconnect call needed first.
- * Blocking; call off the UI thread. */
+/* Reconnects to an already-saved network by id (wpa_cli select_network),
+ * which reuses the existing profile's stored PSK instead of creating a new
+ * network block. Deliberately not wifi_control_connect(ssid, NULL): that
+ * always creates a fresh add_network entry, which called with no password
+ * against an SSID already saved as secured would add a broken duplicate
+ * open network instead of reconnecting. select_network also handles
+ * disconnecting from whatever's currently associated -- no separate
+ * disconnect call needed first. Blocking; call off the UI thread. */
 bool wifi_control_connect_saved(int id);
 
 typedef struct {
@@ -102,11 +97,10 @@ typedef struct {
  * the UI thread. */
 bool wifi_control_get_info(wifi_info_t * out);
 
-/* Real DNS servers currently active, parsed from /etc/resolv.conf. On this
- * device (confirmed against the real firmware's udhcpc default.script)
- * that file is a symlink to /tmp/resolv.conf and gets overwritten with
- * DHCP-provided servers on every renew/reconnect -- a manual override set
- * via wifi_control_set_dns() persists only until the next one. */
+/* DNS servers currently active, parsed from /etc/resolv.conf. That file is
+ * a symlink to /tmp/resolv.conf and gets overwritten with DHCP-provided
+ * servers on every renew/reconnect -- a manual override set via
+ * wifi_control_set_dns() persists only until the next one. */
 int wifi_control_get_dns(char out[][16], int max_count);
 bool wifi_control_set_dns(const char * const * servers, int count);
 

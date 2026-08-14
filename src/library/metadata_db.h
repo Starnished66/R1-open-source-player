@@ -108,6 +108,33 @@ void metadata_db_book_favorite_set(const char * path, bool is_favorite);
  * convention as metadata_db_load_all_books(). */
 void metadata_db_load_favorite_books(char *** out_paths, int * out_count);
 
+/* Persistent playlist (.m3u) cache -- same "load whatever's cached, don't
+ * touch the filesystem" reasoning as the book cache above (the Playlists
+ * screen in gui.c was slow to open, ~5s against a real SD card, because it
+ * ran playlist_files_scan()'s live recursive readdir()+stat() walk on
+ * every visit). Unlike books there's no fast stock-db path to warm-start
+ * from (m3u playlists are this app's own concept, not something the stock
+ * player ever indexes) -- populated only by gui.c's rescan_playlists()
+ * (folded into library_scan_once(), same as rescan_books(), so it runs at
+ * boot and on an explicit Settings > Update Music Database rescan, never
+ * on the fast cache-only boot path) and by the single-row insert/delete
+ * functions below for ordinary in-app playlist create/delete, so those
+ * stay instant without a full rescan. */
+void metadata_db_playlist_replace_all(char * const * paths, int count);
+
+/* Enumerates every cached playlist path, alphabetically -- caller-owned
+ * array, same convention as metadata_db_load_all_books(). */
+void metadata_db_load_all_playlists(char *** out_paths, int * out_count);
+
+/* Adds/removes a single path from the playlist cache -- for gui.c's own
+ * playlist_files_create()/playlist_files_delete() call sites, so creating
+ * or deleting one playlist doesn't pay for a full metadata_db_playlist_
+ * replace_all() rescan just to reflect that one file. INSERT is a no-op if
+ * the path's already cached (PRIMARY KEY conflict, ignored); DELETE is a
+ * no-op if it wasn't. */
+void metadata_db_playlist_insert_one(const char * path);
+void metadata_db_playlist_delete_one(const char * path);
+
 /* Per-song favorite flag, keyed by path -- toggled from the player screen's
  * heart icon (favorite_icon/favorite_icon_event_cb in gui.c). Persists
  * across restarts and rescans, same convention as the book favorite

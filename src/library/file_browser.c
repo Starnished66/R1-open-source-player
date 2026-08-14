@@ -26,11 +26,19 @@ static lv_obj_t * path_label;
 static lv_obj_t * list;
 static file_browser_select_cb_t select_cb;
 
+/* Snapshot of the directory + raw on-screen row (entries[] index, not the
+ * file-only position select_cb receives) a file/playlist was last tapped
+ * from -- set in entry_click_cb() right before invoking select_cb(), for
+ * gui.c's player "List" option to later reopen the browser at that same
+ * spot via file_browser_navigate_to(). */
+static char last_selected_dir[PATH_MAX];
+static int last_selected_row = -1;
+
 static void rebuild_list(void);
 
 /* Kept in sync with audio.c's decoder dispatch. */
 static const char * const PLAYABLE_EXTENSIONS[] = {
-    ".flac", ".mp3", ".wav", ".aiff", ".aif", ".dsf", ".dff", ".aac", ".m4a", ".ape", ".wma",
+    ".flac", ".mp3", ".wav", ".aiff", ".aif", ".dsf", ".dff", ".aac", ".m4a", ".ape", ".wma", ".opus",
 };
 
 static bool is_playable_file(const char * name) {
@@ -219,9 +227,13 @@ static void entry_click_cb(lv_event_t * e) {
         char ** playlist;
         int count;
         if (file_browser_build_playlist_from_m3u(m3u_path, &playlist, &count)) {
+            snprintf(last_selected_dir, sizeof(last_selected_dir), "%s", current_dir);
+            last_selected_row = index;
             select_cb(playlist, count, 0);
         }
     } else {
+        snprintf(last_selected_dir, sizeof(last_selected_dir), "%s", current_dir);
+        last_selected_row = index;
         build_playlist_and_select(index);
     }
 }
@@ -232,7 +244,7 @@ static void entry_click_cb(lv_event_t * e) {
  * their own real icon. */
 static lv_obj_t * add_file_row(const char * label_text, const char * icon_asset, lv_event_cb_t cb, void * user_data) {
     lv_obj_t * row = lv_obj_create(list);
-    lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+    lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, LIST_ROW_HEIGHT); /* 15% wider than the shared default -- explicit user request */
     lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
     lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -400,6 +412,12 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(list, 4, 0);
     lv_obj_set_style_pad_top(list, 4, 0);
+    /* Rows are LIST_ROW_WIDTH_WIDE (476px, this device's 480px-wide screen
+     * minus a thin 4px margin) -- explicit cross-axis centering so that
+     * width is guaranteed to sit centered within this full-width container
+     * regardless of the default theme's own flex padding, rather than
+     * risking an unverified assumption about it clipping past the edge. */
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
 
     scan_current_dir();
     rebuild_list();
@@ -423,6 +441,32 @@ void file_browser_reset_to_root(void) {
     snprintf(current_dir, sizeof(current_dir), "%s", root_dir);
     scan_current_dir();
     rebuild_list();
+}
+
+const char * file_browser_get_last_selected_dir(void) {
+    return last_selected_dir;
+}
+
+int file_browser_get_last_selected_row(void) {
+    return last_selected_row;
+}
+
+/* row_to_reveal is the raw entries[] index (same value
+ * file_browser_get_last_selected_row() returned), not a file-only
+ * position -- rebuild_list() prepends an "Up" row whenever current_dir
+ * isn't root_dir, shifting every entries[] row down by one on screen, so
+ * that offset is added here to land on the right actual child. */
+void file_browser_navigate_to(const char * dir, int row_to_reveal) {
+    if (!list) return; /* files_screen not built yet */
+    snprintf(current_dir, sizeof(current_dir), "%s", dir);
+    scan_current_dir();
+    rebuild_list();
+    if (row_to_reveal < 0) return;
+    int child_index = row_to_reveal + (strlen(current_dir) > strlen(root_dir) ? 1 : 0);
+    lv_obj_update_layout(list);
+    if (child_index < (int) lv_obj_get_child_count(list)) {
+        lv_obj_scroll_to_view(lv_obj_get_child(list, child_index), LV_ANIM_OFF);
+    }
 }
 
 bool file_browser_build_playlist_for_path(const char * path, char *** out_playlist, int * out_count, int * out_selected_index) {

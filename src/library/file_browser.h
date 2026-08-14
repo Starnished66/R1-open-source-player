@@ -48,6 +48,21 @@ bool file_browser_build_playlist_for_path(const char * path, char *** out_playli
  * logic this exists to support. */
 bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, volatile int * progress);
 
+/* Snapshot of the directory + on-screen row a file/playlist was last
+ * tapped from, and a way to jump the browser back there -- for the
+ * player's "List" option to reopen the folder a track was played from.
+ * The getters are only meaningful right after a tap (same convention as
+ * e.g. lv_event_get_user_data() being valid only within its own
+ * callback), so gui.c must read them synchronously from its own
+ * select_cb before returning. file_browser_navigate_to() points the
+ * browser at `dir`, rebuilds its row list as if the user had tapped
+ * their way there, and scrolls `row_to_reveal` (the exact value
+ * file_browser_get_last_selected_row() returned) into view; both are
+ * no-ops if file_browser_init() hasn't run yet. */
+const char * file_browser_get_last_selected_dir(void);
+int file_browser_get_last_selected_row(void);
+void file_browser_navigate_to(const char * dir, int row_to_reveal);
+
 /* Parses a M3U/M3U8 playlist file: one entry path per non-blank,
  * non-comment line, resolved relative to the playlist's own directory
  * (standard M3U convention) unless already absolute. Entries that aren't

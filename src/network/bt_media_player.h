@@ -15,22 +15,26 @@
  * other Bluetooth-output-only code path in this codebase (e.g.
  * audio_set_bt_output()'s own callers in gui.c). */
 
-/* Connects to the system bus, registers this app's D-Bus object, and
- * starts the background dispatch thread that runs for the app's whole
- * lifetime (same shape as audio_init(): call once from main.c, safe to
- * call more than once, only the first call does anything). Does NOT yet
- * tell BlueZ about the player -- see bt_media_player_set_active() below --
- * so this is safe to call unconditionally at startup regardless of
- * whether Bluetooth is even on yet. */
+/* Starts two independent background threads, both non-blocking and both
+ * for the app's whole lifetime -- call once, as early as possible in
+ * main() (right after the SIGPIPE guard); safe to call more than once,
+ * only the first call does anything:
+ *
+ * 1. Connects to the system bus, registers this app's D-Bus object, and
+ *    registers as BlueZ's active media player (org.bluez.Media1.
+ *    RegisterPlayer), unconditionally, not gated on whether Bluetooth
+ *    output is in use. Real-device finding (task #44, 2026-08-13): does
+ *    NOT drive actual button dispatch on this device (see bt_media_
+ *    player.c's own top-of-file comment) -- kept because it still answers
+ *    standard AVRCP metadata/status queries correctly for any remote that
+ *    asks.
+ *
+ * 2. Watches for BlueZ's own virtual "(AVRCP)" evdev keyboard device and
+ *    reads button presses from it directly -- this is what actually
+ *    drives bt_media_player_consume_play_pause()/_next()/_prev() below on
+ *    real hardware. See bt_media_player.c's own top-of-file comment for
+ *    the full story. */
 void bt_media_player_init(void);
-
-/* Registers/unregisters this app as BlueZ's active media player
- * (org.bluez.Media1.RegisterPlayer/UnregisterPlayer on the hci0 adapter).
- * Call whenever Bluetooth output is actually in use, mirroring
- * audio_set_bt_output()'s own gating exactly -- gui.c calls both
- * together. Cheap to call repeatedly with the same value (no-ops if
- * already in the requested state). */
-void bt_media_player_set_active(bool active);
 
 /* Tells BlueZ (and therefore the connected accessory, if it displays
  * play/pause state) this app's current playback state -- call whenever

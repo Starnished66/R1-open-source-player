@@ -1,5 +1,6 @@
 #include "bluetooth_control.h"
 #include "debug_log.h"
+#include "hiby_sys_server.h"
 #include "subprocess.h"
 #include "audio.h"
 
@@ -15,13 +16,10 @@
 #include <unistd.h>
 
 /* Finds PIDs whose `ps` command line contains needle and kills them all
- * together. Shared by this file's own wedge-recovery cleanup and
- * bt_control_apply_output_settings()'s own cleanup. 16 rather than a
- * tighter cap: bt_control_apply_output_settings() uses this for bt-agent
- * cleanup, and confirmed live on a real device, repeated toggles before
- * this function existed left as many as nine of them accumulated at once
- * (see that function's own comment) -- this should never happen again now
- * that cleanup is reliable, but the cap has margin for it regardless. */
+ * together. Shared by this file's wedge-recovery cleanup and
+ * bt_control_apply_output_settings()'s bt-agent cleanup. Capped at 16 with
+ * margin to spare: repeated toggles before this cleanup existed could leave
+ * several stray bt-agent processes accumulated at once. */
 static void kill_all_matching(const char * needle) {
     char out[4096];
     char * argv[] = { (char *) "ps", NULL };
@@ -41,35 +39,18 @@ static void kill_all_matching(const char * needle) {
     for (int i = 0; i < pid_count; i++) kill(pids[i], SIGKILL);
 }
 
-/* Real-device incident: /etc/init.d/S80_bt_init unconditionally runs
- * /usr/bin/bt_init on every boot, and bt_init's own script always starts a
- * second, independent dbus-daemon (`dbus-daemon
- * --config-file=/usr/share/dbus-1/system.conf`) alongside the one
- * S30dbus already started at boot (`dbus-daemon --system`) -- confirmed via
- * /proc/<pid>/stat on a real device: the second one's start time is ~3.6s
- * after boot, matching S80_bt_init exactly. This happens on every boot
- * regardless of anything this app does; bt_control_init_chip() calling
- * bt_resume instead of bt_init (see its own comment) avoids adding a THIRD
- * one, but doesn't touch the pair that's already there from boot.
- *
- * Depending on which of the two independently-bound system buses a given
- * client (bluetoothd, bluealsa, bt-agent, or this file's own bluetoothctl
- * calls) happens to land on, they can lose visibility of each other --
- * confirmed on a real device to cause exactly this feature's instability: an
- * incoming AVDTP connect got rejected outright ("Authentication attempt
- * without agent") because bt-agent had registered its pairing agent on the
- * bus bluetoothd wasn't listening on. Originally this only checked whether
- * the system bus was reachable AT ALL, on the theory that a healthy-looking
- * bus meant nothing to fix -- but that's true even with two daemons up
- * simultaneously, as long as whichever one dbus-send happens to land on
- * answers fine, so it silently left the actual split-brain condition (two
- * daemons, clients scattered across both) intact. Confirmed on a real
- * device: freshly rebooted, this exact split (S30dbus's `--system` plus
- * S80_bt_init's `--config-file=...system.conf`, see above) reappeared and
- * a bus-reachability-only check didn't catch it, because the bus one of
- * them was listening on happened to still answer. Counting dbus-daemon
- * processes directly, not just probing reachability, is what actually
- * detects this -- cheap either way (a single `ps`), so safe to call
+/* /etc/init.d/S80_bt_init always starts a second, independent dbus-daemon
+ * (`--config-file=/usr/share/dbus-1/system.conf`) alongside the one
+ * S30dbus already started at boot (`--system`), regardless of anything
+ * this app does. Depending on which of the two buses a given client
+ * (bluetoothd, bluealsa, bt-agent, or this file's own bluetoothctl calls)
+ * lands on, they can lose visibility of each other -- e.g. an incoming
+ * AVDTP connect gets rejected ("Authentication attempt without agent")
+ * because bt-agent registered its pairing agent on the bus bluetoothd
+ * wasn't listening on. A bus-reachability check alone doesn't catch this,
+ * since either daemon individually still answers fine even with the
+ * split-brain intact; counting dbus-daemon processes directly is what
+ * actually detects it, and is cheap enough (a single `ps`) to call
  * unconditionally. */
 static int count_matching(const char * needle) {
     char out[4096];
@@ -113,16 +94,13 @@ static void ensure_single_dbus_daemon(void) {
  * down, which is defined earlier in the file than that section. */
 static void bt_control_reapply_last_output_settings(void);
 
-/* Real-device incident: with no hci0 (bt_init not yet run this boot, or the
- * chip failed to come up), `bluetoothctl show` doesn't fail fast -- it can
- * take close to subprocess_run()'s full 15s timeout to give up, and since
- * this is called every update_timer_cb tick to keep the status bar icon
- * current, that meant the main UI thread re-blocked for ~15s on almost
- * every single poll cycle -- a near-continuous freeze, not an occasional
- * stutter. `hciconfig` (confirmed on this exact firmware: ~0.01s, empty
- * output when no adapter exists) is used as a cheap pre-check so the
- * expensive/unreliable bluetoothctl-over-D-Bus round trip is only ever
- * attempted when there's actually an adapter to ask about. */
+/* Cheap pre-check for whether a Bluetooth adapter exists before asking
+ * bluetoothctl about it. With no hci0, `bluetoothctl show` doesn't fail
+ * fast -- it can take close to subprocess_run()'s full 15s timeout to give
+ * up, which would stall the UI thread since this is called every
+ * update_timer_cb tick. `hciconfig` returns almost instantly (empty output
+ * when no adapter exists), so the bluetoothctl-over-D-Bus round trip is
+ * only attempted when there's actually an adapter to ask about. */
 static bool bt_control_adapter_present(void) {
     char out[64];
     char * argv[] = { (char *) "hciconfig", NULL };
@@ -130,22 +108,17 @@ static bool bt_control_adapter_present(void) {
     return out[0] != '\0';
 }
 
-/* Real-device incident: confirmed reproducible -- once real A2DP audio
- * starts flowing during Bluetooth DAC mode, bluetoothd can end up in a
- * state where `bluetoothctl show` reports "No default controller
- * available" even though hci0 is still genuinely up at the kernel level
- * (bt_control_adapter_present() above already true) and bluealsa/
- * bluealsa-aplay may still be actively streaming real audio through it.
- * bluetoothd itself doesn't crash or restart (same PID, still S/sleeping,
- * not a zombie) -- its D-Bus interface just stops answering correctly.
- * The only recovery found that actually works is restarting bluetoothd,
- * and doing that alone once wasn't enough to prevent a repeat on a later
- * test -- this instead mirrors /usr/bin/bt_resume's own remediation
- * shape exactly (confirmed by reading that script): stop bluetoothd,
- * `hciconfig hci0 reset`, start bluetoothd again. Rate-limited via
- * last_recovery_attempt so a wedge that recovery doesn't actually fix
- * can't turn into restarting the daemon on every ~5s status poll
- * indefinitely. */
+/* Once real A2DP audio starts flowing during Bluetooth DAC mode,
+ * bluetoothd can end up in a state where `bluetoothctl show` reports "No
+ * default controller available" even though hci0 is still genuinely up
+ * (bt_control_adapter_present() already true) and bluealsa/bluealsa-aplay
+ * may still be actively streaming through it -- bluetoothd itself doesn't
+ * crash (same PID, still sleeping), its D-Bus interface just stops
+ * answering correctly. The only recovery that works is restarting
+ * bluetoothd, mirroring /usr/bin/bt_resume's own remediation: stop
+ * bluetoothd, `hciconfig hci0 reset`, start bluetoothd again.
+ * Rate-limited via last_recovery_attempt so a wedge that recovery doesn't
+ * fix can't trigger a restart on every ~5s status poll indefinitely. */
 #define WEDGED_RECOVERY_COOLDOWN_SECONDS 20
 
 static void bt_control_recover_wedged_daemon(void) {
@@ -185,81 +158,49 @@ static void bt_control_recover_wedged_daemon(void) {
     bool spawn_ok = subprocess_spawn_daemon(bluetoothd_argv);
     usleep(500000); /* give it a moment to register the adapter before the next step touches it */
 
-    /* A freshly-restarted bluetoothd comes up with the adapter powered
-     * off by default -- this recovery only ever runs because something
-     * expected Bluetooth to be on (that's what "wedged", not "cleanly
-     * off", means), so leaving it off after "fixing" it is just a
-     * different way of the same "Bluetooth silently disabled itself"
-     * failure the caller was trying to recover from. Confirmed on a real
-     * device: recovery reported success (both subprocess calls returned
-     * true) but Bluetooth stayed off across every check afterward until
-     * this was added. */
+    /* A freshly-restarted bluetoothd comes up with the adapter powered off
+     * by default; this recovery only ever runs because Bluetooth was
+     * expected to be on, so leaving it off after "fixing" it would just be
+     * a different flavor of the same failure. */
     bt_control_enable();
 
-    /* Same gap as the power-off one above, one layer further in: even with
-     * power restored, bluealsa was still whatever bluetoothd's restart
-     * left it as -- confirmed on a real device to be the STOCK default
-     * a2dp-source (bt_resume's own baseline), not the a2dp-sink profile
-     * Bluetooth DAC mode actually needs to receive audio. The phone would
-     * reconnect fine (the radio itself is genuinely back), then drop the
-     * instant it tried to actually stream, since there was no sink profile
-     * registered to receive it. Restores whatever
-     * bt_control_apply_output_settings() was last actually asked for. */
+    /* Even with power restored, bluealsa is left at whatever bluetoothd's
+     * restart left it as -- the stock a2dp-source default, not the
+     * a2dp-sink profile Bluetooth DAC mode needs to receive audio. Without
+     * this, the phone would reconnect fine but drop the instant it tried
+     * to stream, since no sink profile was registered to receive it. */
     bt_control_reapply_last_output_settings();
 
     DBG_LOG("bt_control: recovery attempt done (hci0 reset=%d, bluetoothd spawn=%d)\n", reset_ok, spawn_ok);
 }
 
-/* Real-device incident: a captured strace of bluealsa itself during a real
- * A2DP connection attempt showed a worker thread doing a normal ~15s
- * internal futex wait (for the host to actually send Start after Open --
- * this particular phone opens the transport, doesn't start, then closes
- * it) before cleanly exit()ing that thread -- not a hang, not a crash,
- * just bluealsa patiently giving up on a connection that never started
- * streaming. bluetoothd can legitimately be slow to answer unrelated
- * D-Bus queries (like this file's own bluetoothctl show) while that's in
- * flight. A single subprocess_run() timeout here isn't proof of a genuine
- * wedge, then -- it can equally mean "caught bluetoothd mid this entirely
- * normal ~15s window", and triggering the recovery below (kills and
- * restarts bluetoothd) right then would tear down a connection that was
- * about to resolve on its own, guaranteeing exactly the failure it's
- * trying to prevent. Requiring several CONSECUTIVE timeouts (spanning
- * well over 15s given this is polled every ~5s) before concluding it's
- * genuinely stuck filters out that normal window while still catching a
- * real wedge, which by definition doesn't self-resolve. "No default
- * controller available" (a fast, clean response, not a timeout) is a
- * different, unambiguous signal -- that's bluetoothd definitively saying
- * there's no adapter, not "I'm busy" -- so that one still recovers
- * immediately. */
+/* A single subprocess_run() timeout on `bluetoothctl show` isn't proof of
+ * a genuine bluetoothd wedge: bluealsa can legitimately spend ~15s in a
+ * normal futex wait for the remote device to send Start after Open (some
+ * phones open the transport, never start, then close it), during which
+ * bluetoothd can be slow to answer unrelated D-Bus queries. Requiring
+ * several CONSECUTIVE timeouts (polled every ~5s, so spanning well over
+ * 15s) before triggering recovery filters out that normal window while
+ * still catching a real wedge, which by definition doesn't self-resolve.
+ * "No default controller available" (a fast, clean response, not a
+ * timeout) is a different, unambiguous signal that there's no adapter at
+ * all, so that one still recovers immediately without a threshold. */
 #define TIMEOUT_RECOVERY_THRESHOLD 4
 
-/* Real-device bug report: Bluetooth visibly turns itself off then back on
- * right after boot, with no user action -- root cause confirmed by reading
- * this function's own logic against S80_bt_init's documented boot timing
- * (see ensure_single_dbus_daemon()'s own comment: bt_init/bt_resume-
- * equivalent bring-up finishes ~3.6s after boot on a real device). This
- * app's own first Bluetooth status poll (start_refresh_bt_icon(), called
- * early in gui_init()) can land BEFORE bluetoothd has finished registering
- * the adapter object, even though hci0 already exists at the kernel level
- * (bt_control_adapter_present() above is a cheap hciconfig check, sees the
- * chip immediately) -- `bluetoothctl show` then genuinely, correctly
- * reports "No default controller available" for a brief, entirely normal
- * startup window, not because anything is actually wedged. That exact
- * string was treated below as an unambiguous, immediate wedge signal (no
- * threshold, unlike the timeout path just above) because mid-session it
- * reliably is one -- but during this boot window it isn't, and the
- * resulting bt_control_recover_wedged_daemon() call (kill bluetoothd,
- * hciconfig reset, respawn, re-power) is itself a real, visible
- * disable-then-enable cycle, which is exactly what got reported. Made far
- * more noticeable by Car Mode's rework back to a real poweroff+reboot per
- * ignition cycle (see gui.c's own Car Mode comment) -- every power-on is
- * now a full cold boot hitting this exact race, not just an occasional
- * manual reboot. Fixed by giving "No default controller available"
- * specifically the same not-immediately-fatal treatment as a timeout
- * (logged, not acted on) for a grace window after this process's own first
- * poll -- generous margin over the ~3.6s boot timing above -- after which
- * it reverts to triggering recovery immediately, same as before, since by
- * then it really would mean bluetoothd is stuck. */
+/* Bluetooth could visibly turn itself off then back on right after boot
+ * with no user action. Cause: this app's first status poll can land
+ * before bluetoothd finishes registering the adapter object even though
+ * hci0 already exists at the kernel level, so `bluetoothctl show`
+ * correctly reports "No default controller available" for a brief, normal
+ * startup window -- not because anything is wedged. That string is
+ * normally treated as an immediate wedge signal (no threshold, unlike the
+ * timeout path above) since mid-session it reliably is one, but during
+ * this boot window it isn't, and the resulting recovery (kill bluetoothd,
+ * reset, respawn, re-power) is itself the visible disable-then-enable
+ * cycle that was reported. Fixed by giving "No default controller
+ * available" the same not-immediately-fatal treatment as a timeout for a
+ * grace window after this process's first poll, after which it reverts to
+ * triggering recovery immediately. */
 #define BT_BOOT_RACE_GRACE_MS 8000
 
 static uint32_t bt_control_monotonic_ms(void) {
@@ -316,41 +257,27 @@ bool bt_control_is_powered(void) {
 
 #define BT_INIT_TIMEOUT_MS 30000
 
-/* /usr/bin/bt_resume, not /usr/bin/bt_init -- confirmed via `strings
- * hiby_player`, which references bt_resume, bt_enable, bt_suspend, and
- * `bt-device -l` by exact path, but never bt_init/bt_done/bluealsa_profile
- * (those exist in /usr/bin too, but nothing in the real running system
- * appears to call them, based on both the stock binary's own strings and
- * grepping the rest of the squashfs). An earlier version of this function
- * used bt_init, which reliably created a duplicate dbus-daemon and needed
- * an extra `killall dbus-daemon` workaround here -- bt_resume doesn't have
- * that problem: its own dbus-daemon-startup lines exist in the script but
- * are entirely commented out, so it just uses whatever system dbus-daemon
- * is already running (the one S30dbus starts at boot), matching this
- * function no longer needing to touch dbus-daemon at all. Otherwise
+/* Uses /usr/bin/bt_resume, not /usr/bin/bt_init -- the stock hiby_player
+ * binary references bt_resume, bt_enable, bt_suspend, and `bt-device -l`
+ * by exact path, never bt_init/bt_done/bluealsa_profile. bt_init reliably
+ * creates a duplicate dbus-daemon; bt_resume avoids that since its own
+ * dbus-daemon-startup lines are commented out in the script, so it just
+ * uses whatever system dbus-daemon is already running. Otherwise
  * near-identical to bt_init: same chip detection/firmware flash, plus
  * pgrep guards around starting bluetoothd/bt-agent/bluealsa so it won't
  * double-start any of those if called again while they're still up. */
-/* Real-device incident, found while diagnosing an A2DP connect that failed
- * with bluetoothd logging `a2dp-sink profile connect failed: Protocol not
- * available` (ENOPROTOOPT) even though pairing/bonding itself was clean:
- * hci0 can come up already-present at the kernel level (module auto-load,
- * bluetoothd restoring a persisted "Powered" state) WITHOUT bt_resume ever
- * having run this boot -- confirmed live after a device reboot, hci0 and
- * bluetoothd's adapter object were both up, but bluealsa was not running at
- * all, so bluetoothd had no local A2DP source SDP record to offer and every
- * connect attempt failed this way regardless of the remote device. Since
- * bt_control_init_chip()'s early return above is keyed purely on hci0
- * presence (bt_control_adapter_present()), that early return was also
- * silently skipping bt_resume's own `if ! pgrep bluealsa; then bluealsa -p
- * a2dp-source --a2dp-volume & fi` line -- the only thing on this firmware
- * that ever starts bluealsa. Decoupled here: ensure bluealsa specifically,
- * every time, regardless of whether hci0 needed a fresh bring-up. Mirrors
- * bt_resume's own default flags exactly, since this is just closing the gap
- * left by skipping bt_resume's script, not deciding output settings itself
- * -- bt_control_apply_output_settings() (DAC mode, --a2dp-volume) still
- * layers on top of this via its own existing call sites once the user
- * actually touches a Bluetooth output setting. */
+/* hci0 can come up already-present at the kernel level (module auto-load,
+ * bluetoothd restoring a persisted "Powered" state) without bt_resume ever
+ * having run this boot; in that case bluealsa never gets started, so
+ * bluetoothd has no local A2DP source SDP record to offer and every
+ * connect attempt fails with `a2dp-sink profile connect failed: Protocol
+ * not available` regardless of the remote device. Since
+ * bt_control_init_chip()'s early return is keyed purely on hci0 presence,
+ * it was silently skipping bt_resume's own bluealsa-start step. This
+ * ensures bluealsa specifically, every time, decoupled from whether hci0
+ * needed a fresh bring-up; bt_control_apply_output_settings() still layers
+ * DAC mode / --a2dp-volume on top via its own call sites once the user
+ * touches a Bluetooth output setting. */
 static void ensure_bluealsa_running(void) {
     if (count_matching("bluealsa") > 0) return;
     char * argv[] = { (char *) "bluealsa", (char *) "-p", (char *) "a2dp-source",
@@ -798,6 +725,53 @@ bool bt_control_is_a2dp_source_connected(void) {
     return find_source_pcm_path(path, sizeof(path));
 }
 
+bool bt_control_get_connected_device_mac(char * out, size_t out_size) {
+    char path[256];
+    if (!find_source_pcm_path(path, sizeof(path))) return false;
+
+    const char * dev = strstr(path, "dev_");
+    if (!dev) return false;
+    dev += 4; /* skip "dev_" */
+
+    char mac[18];
+    if (strlen(dev) < 17) return false; /* "XX_XX_XX_XX_XX_XX" */
+    for (int i = 0; i < 17; i++) mac[i] = (dev[i] == '_') ? ':' : dev[i];
+    mac[17] = '\0';
+
+    snprintf(out, out_size, "%s", mac);
+    return true;
+}
+
+bool bt_control_get_connected_device_codec(char * out, size_t out_size) {
+    char path[256];
+    if (!find_source_pcm_path(path, sizeof(path))) return false;
+
+    char info_out[2048];
+    char * argv[] = { (char *) "bluealsa-cli", (char *) "info", path, NULL };
+    if (!subprocess_run(argv, info_out, sizeof(info_out))) return false;
+
+    /* "Selected codec: AAC" -- confirmed live via `bluealsa-cli info
+     * <pcm-path>` (also reports "Available codecs: SBC AAC", but that's
+     * every codec the accessory advertised support for, not what's
+     * actually in use right now). */
+    const char * line = strstr(info_out, "Selected codec:");
+    if (!line) return false;
+    line += strlen("Selected codec:");
+    while (*line == ' ') line++;
+
+    char codec[32];
+    int i = 0;
+    while (line[i] != '\0' && line[i] != '\n' && line[i] != '\r' && i < (int) sizeof(codec) - 1) {
+        codec[i] = line[i];
+        i++;
+    }
+    codec[i] = '\0';
+    if (i == 0) return false;
+
+    snprintf(out, out_size, "%s", codec);
+    return true;
+}
+
 static pthread_t bt_source_vol_sync_thread;
 static bool bt_source_vol_sync_active = false;
 static pid_t bt_source_vol_sync_monitor_pid = -1;
@@ -889,6 +863,7 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
                     snprintf(raw_str, sizeof(raw_str), "%d", raw);
                     char * vol_argv[] = { (char *) "bluealsa-cli", (char *) "volume", path, raw_str, raw_str, NULL };
                     subprocess_run(vol_argv, NULL, 0);
+                    hiby_sys_server_report_volume((int) (current_percent * 100.0f + 0.5f));
                 }
                 /* else: nothing connected right now -- leave
                  * last_synced_app_percent unchanged so this retries on the
@@ -1171,20 +1146,8 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
          * one actually starts streaming rather than needing one to already
          * be attached at launch. That's exactly the long-running,
          * connection-order-independent behavior this needs. */
-        /* TEMPORARILY DISABLED for a live A/B test: the stock player's own
-         * bluealsa_profile script never spawns bluealsa-aplay at all (or
-         * any external PCM consumer) and was just confirmed working
-         * flawlessly over a real phone connection -- testing whether
-         * bluealsa-aplay's mere presence as a registered consumer affects
-         * the AVDTP negotiation itself, separately from the question of
-         * how audio actually gets consumed once a connection succeeds. No
-         * audio will play with this removed (nothing reads the PCM), but
-         * that's not what this specific test is checking. */
-        (void) 0;
-        /*
         char * bluealsa_aplay_argv[] = { (char *) "bluealsa-aplay", NULL };
         subprocess_spawn_daemon(bluealsa_aplay_argv);
-        */
 
         /* bt_volume_curve_start() is DISABLED for now -- see its own
          * comment (above bt_control_apply_output_settings()) for the

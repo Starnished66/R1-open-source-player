@@ -142,22 +142,11 @@ bool wifi_control_connect(const char * ssid, const char * password) {
         return false;
     }
 
-    /* Real-device bug report: couldn't connect to a network typed in via
-     * Manual SSID Entry ("SmartDevices") -- confirmed via wpa_cli directly
-     * that it never once appeared by name in a fresh scan, while 8 other
-     * in-range networks did, including two OTHER BSSIDs sharing the exact
-     * same router's OUI that also came back with blank SSIDs -- the
-     * signature of a non-broadcasting (hidden) network. wpa_supplicant will
-     * never associate to a hidden SSID unless its network profile has
-     * scan_ssid=1, which makes it send active probe requests naming that
-     * exact SSID instead of only ever matching a beacon it can passively
-     * see -- without it, this exact "I typed the name in myself, it's
-     * right there, why won't it connect" case can never work, which is
-     * precisely what Manual SSID Entry exists for in the first place (a
-     * network already visible in a scan wouldn't need typing in manually
-     * at all). Harmless to set unconditionally for a normal broadcasting
-     * network too, so this isn't gated on "did the user come from Manual
-     * SSID Entry specifically" -- every network this function adds gets it. */
+    /* scan_ssid=1 makes wpa_supplicant send active probe requests naming
+     * this exact SSID instead of only matching a passively-seen beacon --
+     * required for hidden (non-broadcasting) networks, which is exactly
+     * what Manual SSID Entry is for. Harmless for a normal broadcasting
+     * network too, so it's set unconditionally for every network added. */
     char * set_scan_ssid_argv[] = { (char *) "wpa_cli",     (char *) "-i",  (char *) WIFI_INTERFACE,
                                     (char *) "set_network", id_str,         (char *) "scan_ssid",
                                     (char *) "1",            NULL };
@@ -243,21 +232,12 @@ bool wifi_control_connect_saved(int id) {
 
     char out[256];
 
-    /* Real-device bug report: a saved network that used to connect fine
-     * stopped working after this device was reflashed. Root cause: the
-     * hidden-SSID fix in wifi_control_connect() (scan_ssid=1, see its own
-     * comment) only ever applies to a network profile at the moment it's
-     * first created via add_network -- it does nothing for a profile that
-     * already existed before that fix shipped, which is exactly this
-     * saved-network path (reconnecting reuses whatever's already
-     * persisted, via select_network below, rather than recreating the
-     * profile from scratch). Confirmed live via wpa_cli directly: this
-     * device's one saved network still had scan_ssid=0 after the reflash,
-     * wpa_state stuck at SCANNING. Setting it here too, every time,
-     * self-heals any pre-fix saved profile (and is a harmless no-op for a
-     * normal broadcasting network) without needing the user to manually
-     * forget and re-add it. save_config persists the repair so it doesn't
-     * need repeating on every future reconnect. */
+    /* Sets scan_ssid=1 here too (not just in wifi_control_connect()) since
+     * this path reuses an already-persisted profile via select_network
+     * rather than recreating it -- a saved profile from before the
+     * hidden-SSID fix existed would otherwise stay stuck at scan_ssid=0.
+     * Harmless no-op for a normal broadcasting network; save_config
+     * persists the repair so it doesn't need repeating. */
     char * set_scan_ssid_argv[] = { (char *) "wpa_cli",     (char *) "-i",  (char *) WIFI_INTERFACE,
                                     (char *) "set_network", id_str,         (char *) "scan_ssid",
                                     (char *) "1",            NULL };

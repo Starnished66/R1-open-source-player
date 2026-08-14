@@ -13,6 +13,7 @@
 #include "mp4_demux.h"
 #include "ape_decoder.h"
 #include "wma_decoder.h"
+#include "opus_decoder.h"
 #include "peq.h"
 
 #include <math.h>
@@ -46,7 +47,8 @@ typedef enum {
     DECODER_AAC,
     DECODER_ALAC,
     DECODER_APE,
-    DECODER_WMA
+    DECODER_WMA,
+    DECODER_OPUS
 } decoder_type_t;
 
 typedef struct {
@@ -61,6 +63,7 @@ typedef struct {
         alac_decoder_t * alac;
         ape_decoder_t * ape;
         wma_decoder_t * wma;
+        opus_decoder_wrap_t * opus;
     } as;
     unsigned int channels;
     unsigned int sample_rate;
@@ -192,6 +195,16 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         return true;
     }
 
+    if (strcasecmp(ext, ".opus") == 0) {
+        dec->type = DECODER_OPUS;
+        dec->as.opus = opus_open_file(path);
+        if (!dec->as.opus) return false;
+        dec->channels = opus_get_channels(dec->as.opus);
+        dec->sample_rate = opus_get_sample_rate(dec->as.opus);
+        dec->total_frames = opus_get_total_pcm_frame_count(dec->as.opus);
+        return true;
+    }
+
     return false;
 }
 
@@ -206,6 +219,7 @@ static uint64_t decoder_read_s16(decoder_t * dec, uint64_t frames, int16_t * buf
         case DECODER_ALAC: return alac_read_pcm_frames_s16(dec->as.alac, frames, buf);
         case DECODER_APE:  return ape_read_pcm_frames_s16(dec->as.ape, frames, buf);
         case DECODER_WMA:  return wma_read_pcm_frames_s16(dec->as.wma, frames, buf);
+        case DECODER_OPUS: return opus_read_pcm_frames_s16(dec->as.opus, frames, buf);
     }
     return 0;
 }
@@ -221,6 +235,7 @@ static void decoder_seek(decoder_t * dec, uint64_t frame) {
         case DECODER_ALAC: alac_seek_to_pcm_frame(dec->as.alac, frame); break;
         case DECODER_APE:  ape_seek_to_pcm_frame(dec->as.ape, frame); break;
         case DECODER_WMA:  wma_seek_to_pcm_frame(dec->as.wma, frame); break;
+        case DECODER_OPUS: opus_seek_to_pcm_frame(dec->as.opus, frame); break;
     }
 }
 
@@ -252,6 +267,9 @@ static void decoder_close(decoder_t * dec) {
             break;
         case DECODER_WMA:
             if (dec->as.wma) wma_close(dec->as.wma);
+            break;
+        case DECODER_OPUS:
+            if (dec->as.opus) opus_close(dec->as.opus);
             break;
     }
 }

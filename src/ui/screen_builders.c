@@ -113,7 +113,10 @@ static void icon_tile_press_event_cb(lv_event_t * e) {
 }
 
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
-                                   const icon_grid_item_t * items, int item_count) {
+                                   const icon_grid_item_t * items, int item_count,
+                                   int32_t icon_scale_percent) {
+    int32_t target_icon_px = (ICON_GRID_TARGET_ICON_PX * icon_scale_percent) / 100;
+
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
 
@@ -243,11 +246,11 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_image_set_src(img, icon_full_path);
 
         lv_image_header_t icon_header;
-        int32_t icon_scale = 340; /* fallback: matches the historical flat scale if the header can't be read */
+        int32_t icon_scale = (340 * icon_scale_percent) / 100; /* fallback: matches the historical flat scale (at 100%) if the header can't be read */
         int32_t icon_w = 100, icon_h = 100; /* fallback: matches the "category" folder icons' native size */
         if (lv_image_decoder_get_info(icon_full_path, &icon_header) == LV_RESULT_OK) {
             int32_t native_max = icon_header.w > icon_header.h ? icon_header.w : icon_header.h;
-            if (native_max > 0) icon_scale = (int32_t) (((int64_t) ICON_GRID_TARGET_ICON_PX * 256) / native_max);
+            if (native_max > 0) icon_scale = (int32_t) (((int64_t) target_icon_px * 256) / native_max);
             icon_w = icon_header.w;
             icon_h = icon_header.h;
         }
@@ -462,7 +465,15 @@ typedef struct {
     int window_start; /* index currently shown by rows[0]; -1 forces the first update to actually run */
     lv_obj_t * rows[COMPACT_LIST_POOL_SIZE];
     void * row_ctx[COMPACT_LIST_POOL_SIZE]; /* opaque to this struct, freed alongside it -- see compact_list_row_ctx_t below */
+    lv_obj_t * spacer; /* repositioned by compact_list_set_items() when item_count changes */
+    lv_obj_t * now_playing_bar; /* NULL if this list wasn't built with enable_now_playing -- see compact_list_set_now_playing() */
+    int now_playing_index; /* -1 = nothing playing/matching in this list */
 } compact_list_virtual_data_t;
+
+/* Bar width only -- height always matches LIST_ROW_HEIGHT (see
+ * compact_list_set_now_playing()). Thin enough to read as an accent stripe,
+ * not a second column competing with the row's own content. */
+#define COMPACT_LIST_NOW_PLAYING_BAR_WIDTH 5
 
 typedef struct {
     compact_list_virtual_data_t * data;
@@ -522,16 +533,71 @@ static void compact_list_delete_event_cb(lv_event_t * e) {
     free(data);
 }
 
-lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_cb,
-                                      const compact_list_item_t * items, int item_count,
-                                      compact_list_click_cb_t on_click) {
-    lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+void compact_list_scroll_to_index(lv_obj_t * list, int index) {
+    lv_obj_scroll_to_y(list, COMPACT_LIST_TOP_PAD + index * COMPACT_LIST_ROW_STRIDE, LV_ANIM_OFF);
+}
 
-    if (back_btn_cb) build_back_button(scr, back_btn_cb);
-    build_title(scr, title);
+void compact_list_set_now_playing(lv_obj_t * list, int item_index) {
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    if (!data->now_playing_bar) return; /* this list wasn't built with enable_now_playing */
 
-    lv_obj_t * list = lv_obj_create(scr);
+    data->now_playing_index = item_index;
+    if (item_index < 0 || item_index >= data->item_count) {
+        lv_obj_add_flag(data->now_playing_bar, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_remove_flag(data->now_playing_bar, LV_OBJ_FLAG_HIDDEN);
+    /* y matches a row's own position exactly (see the row pool's own
+     * lv_obj_set_y() in compact_list_update_window()) -- x is fixed at 0
+     * (this list's own left edge, i.e. the screen's far left, see this
+     * function's own doc comment in screen_builders.h), set once at
+     * creation and never touched again since it doesn't depend on scroll
+     * position. LVGL's own scroll clipping hides it exactly like any other
+     * child once it scrolls out of the visible viewport -- no need to track
+     * the pool's current window here at all. */
+    lv_obj_set_y(data->now_playing_bar, COMPACT_LIST_TOP_PAD + item_index * COMPACT_LIST_ROW_STRIDE);
+}
+
+/* Swaps a build_compact_list_screen() list's contents in place -- e.g. a
+ * live search filter -- without the lv_obj_delete()+rebuild this project
+ * otherwise always used for that (see poll_library_rescan()'s own
+ * rebuild-from-scratch precedent in gui.c). Copies `items` the same way
+ * build_compact_list_screen() itself does (caller doesn't need to keep the
+ * array or its strings alive afterward, though the strings themselves
+ * still need to outlive this call the same way the original construction-
+ * time ones do -- see build_compact_list_screen()'s own doc comment). */
+void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, int item_count) {
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+
+    free(data->items);
+    data->items = NULL;
+    if (item_count > 0) {
+        data->items = malloc(sizeof(compact_list_item_t) * (size_t) item_count);
+        memcpy(data->items, items, sizeof(compact_list_item_t) * (size_t) item_count);
+    }
+    data->item_count = item_count;
+    data->window_start = -1; /* force compact_list_update_window() below to actually repaint */
+
+    int32_t total_height = COMPACT_LIST_TOP_PAD + item_count * COMPACT_LIST_ROW_STRIDE;
+    lv_obj_set_pos(data->spacer, 0, total_height > 0 ? total_height - 1 : 0);
+
+    /* A shorter result set than the previous scroll position would
+     * otherwise leave the view showing blank space past the new (shorter)
+     * scrollable range. */
+    lv_obj_scroll_to_y(list, 0, LV_ANIM_OFF);
+    compact_list_update_window(list, data);
+}
+
+/* The virtualized list widget itself, with no screen/back-button/title
+ * wrapper -- factored out of build_compact_list_screen() (which now just
+ * calls this against a fresh screen) so a caller that already has its own
+ * screen can attach a compact list directly onto it, e.g. gui.c's Files
+ * search results overlay, layered on top of build_files_screen()'s own
+ * folder-browsing UI rather than needing a whole separate screen. */
+lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_t * items, int item_count,
+                                      compact_list_click_cb_t on_click, int32_t row_width,
+                                      bool enable_now_playing, lv_color_t now_playing_color) {
+    lv_obj_t * list = lv_obj_create(parent);
     lv_obj_set_size(list, lv_pct(100),
                     lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
                         TITLE_ROW_HEIGHT);
@@ -553,11 +619,24 @@ lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_
         memcpy(data->items, items, sizeof(compact_list_item_t) * (size_t) item_count);
     }
 
+    /* Rows are pinned at x=0 by default (LIST_ROW_WIDTH already leaves an
+     * unused right-side margin at this screen's width) -- only centered
+     * when a caller overrides row_width, so a widened row can't overhang
+     * past the list's own right edge instead of just eating into that
+     * margin. Left at 0 for the default width so every existing caller's
+     * layout (e.g. the timezone city list) is untouched. */
+    int32_t row_x = 0;
+    if (row_width != LIST_ROW_WIDTH) {
+        row_x = (lv_display_get_horizontal_resolution(lv_display_get_default()) - row_width) / 2;
+        if (row_x < 0) row_x = 0;
+    }
+
     for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) {
         lv_obj_t * row = lv_label_create(list);
         lv_obj_add_style(row, &list_row_style, 0);
+        if (row_width != LIST_ROW_WIDTH) lv_obj_set_style_width(row, row_width, 0); /* local override -- see this param's own doc comment (screen_builders.h) */
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(row, 0, COMPACT_LIST_TOP_PAD + slot * COMPACT_LIST_ROW_STRIDE);
+        lv_obj_set_pos(row, row_x, COMPACT_LIST_TOP_PAD + slot * COMPACT_LIST_ROW_STRIDE);
         lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN); /* shown by the initial window update below once it has real content */
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         data->rows[slot] = row;
@@ -583,6 +662,30 @@ lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_
     lv_obj_remove_flag(spacer, LV_OBJ_FLAG_CLICKABLE);
     int32_t total_height = COMPACT_LIST_TOP_PAD + item_count * COMPACT_LIST_ROW_STRIDE;
     lv_obj_set_pos(spacer, 0, total_height > 0 ? total_height - 1 : 0);
+    data->spacer = spacer;
+
+    /* Created after the row pool (and therefore drawn on top of it, LVGL
+     * z-orders siblings by creation order) so it isn't hidden behind a
+     * row's own opaque background. Fixed at x=0 -- the list's own left
+     * edge, i.e. the physical screen's far left -- regardless of row_x/
+     * row_width above; see compact_list_set_now_playing()'s own doc
+     * comment (screen_builders.h) for why this is deliberately NOT tied to
+     * the row's own (possibly inset/centered) position. */
+    data->now_playing_bar = NULL;
+    data->now_playing_index = -1;
+    if (enable_now_playing) {
+        lv_obj_t * bar = lv_obj_create(list);
+        lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, COMPACT_LIST_NOW_PLAYING_BAR_WIDTH, LIST_ROW_HEIGHT);
+        lv_obj_set_style_bg_color(bar, now_playing_color, 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(bar, COMPACT_LIST_NOW_PLAYING_BAR_WIDTH / 2, 0);
+        lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_pos(bar, 0, COMPACT_LIST_TOP_PAD);
+        lv_obj_add_flag(bar, LV_OBJ_FLAG_HIDDEN); /* shown by compact_list_set_now_playing() once something's actually playing */
+        data->now_playing_bar = bar;
+    }
 
     lv_obj_set_user_data(list, data);
     lv_obj_add_event_cb(list, compact_list_scroll_event_cb, LV_EVENT_SCROLL, NULL);
@@ -590,5 +693,22 @@ lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_
 
     compact_list_update_window(list, data); /* populate the initially-visible rows */
 
+    return list;
+}
+
+lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_cb,
+                                      const compact_list_item_t * items, int item_count,
+                                      compact_list_click_cb_t on_click, lv_obj_t ** out_list,
+                                      int32_t row_width, bool enable_now_playing, lv_color_t now_playing_color) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+
+    if (back_btn_cb) build_back_button(scr, back_btn_cb);
+    build_title(scr, title);
+
+    lv_obj_t * list = build_compact_list_widget(scr, items, item_count, on_click, row_width,
+                                                 enable_now_playing, now_playing_color);
+
+    if (out_list) *out_list = list;
     return scr;
 }

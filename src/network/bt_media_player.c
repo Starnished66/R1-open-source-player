@@ -1,48 +1,46 @@
 #include "bt_media_player.h"
 #include "debug_log.h"
+#include "hiby_sys_server.h"
+#include "input_device_utils.h"
 
 #include <dbus/dbus.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/input.h>
+#include <poll.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
-/* Real-device bug report: connecting Bluetooth headphones played audio
- * fine (once BT output itself worked, see audio_set_bt_output()'s history
- * in audio.h) and volume synced (see bt_control_source_volume_sync_start()
- * in bluetooth_control.c), but the headphones' own play/pause/next/
- * previous buttons had no effect on this app at all.
+/* AVRCP transport button support. Two independent halves:
  *
- * Root cause: AVRCP transport passthrough commands (a headphone pressing
- * play/pause/skip) arrive at bluetoothd, which delivers them by calling
- * Play()/Pause()/Next()/Previous() as D-Bus METHODS on an object *this
- * app* must register and host -- not something reachable via the
- * one-shot bluetoothctl/dbus-send/bluealsa-cli invocations everything
- * else in bluetooth_control.c uses (those can only send calls out, not
- * receive incoming ones). Confirmed by reading BlueZ's own
- * doc/org.bluez.Media.rst: Media1.RegisterPlayer's registered object
- * "must implement at least org.mpris.MediaPlayer2.Player as defined in
- * [the freedesktop] MPRIS 2.2 spec" -- the standard "media player on
- * D-Bus" interface (also used by desktop apps like VLC/Spotify), not a
- * BlueZ-specific one.
+ * 1. A D-Bus org.mpris.MediaPlayer2.Player object this app registers and
+ *    hosts via Media1.RegisterPlayer (below) -- this is the *standard*
+ *    BlueZ mechanism, and still correctly answers metadata/status queries
+ *    from any AVRCP controller that asks. Uses a vendored libdbus (this
+ *    project targets mipsel-linux-musl, incompatible with the device's
+ *    glibc-built libdbus-1.so.3).
  *
- * This needed a real D-Bus *service* (responding to incoming calls, not
- * just sending them), which needed a real D-Bus client library --
- * vendored from source (libdbus) rather than reusing the device's own
- * glibc-built libdbus-1.so.3, since this whole project targets
- * mipsel-linux-musl and musl/glibc aren't ABI-compatible (dlopen() from a
- * static musl binary doesn't work on this device either, per the
- * Makefile's own mbedTLS comment) -- see the Makefile's DBUS_DIR section
- * for the full story.
- *
- * Everything below runs on ONE dedicated thread that owns the
- * DBusConnection exclusively: it both dispatches BlueZ's incoming method
- * calls AND makes this app's own outgoing calls (RegisterPlayer/
- * UnregisterPlayer), so there's no need for libdbus's own thread-safety
- * locking mode (dbus_threads_init_default()) -- avoids a whole class of
- * "which thread touches the connection when" bugs by construction, the
- * same reasoning audio.c's playback thread being the sole owner of
- * alsa_pcm/bt_aplay_fd already follows. */
+ * 2. Actual button *dispatch* (avrcp_input_thread_func(), further down):
+ *    real-device testing (task #44, 2026-08-13) proved exhaustively that
+ *    this device's bluetoothd never calls Play()/Pause()/Next()/Previous()
+ *    on the registered player above, no matter how it's registered. The
+ *    real mechanism, confirmed via a raw /dev/input capture against the
+ *    stock firmware's own reference behavior: BlueZ's own standard "input"
+ *    plugin (loaded unconditionally by bluetoothd -- not a HiBy patch)
+ *    creates a virtual evdev keyboard device whenever an AVRCP-capable
+ *    accessory connects, named "<accessory's own Bluetooth name> (AVRCP)",
+ *    and injects ordinary KEY_PLAYCD/KEY_PAUSECD/KEY_NEXTSONG/
+ *    KEY_PREVIOUSSONG press/release events into it -- exactly the same
+ *    shape hw_buttons.c already reads for this device's own physical
+ *    buttons. Kept in this file rather than hw_buttons.c since the device
+ *    appears/disappears dynamically with the BT connection (unlike the
+ *    two always-present physical-button devices hw_buttons.c assumes),
+ *    and because it shares play_pause_requested/next_requested/
+ *    prev_requested below with part 1 -- gui.c's existing bt_media_player_
+ *    consume_play_pause()/_next()/_prev() calls need no changes at all. */
 
 #define BT_MEDIA_PLAYER_OBJECT_PATH "/org/openhibyplayer/MediaPlayer"
 #define BT_MEDIA_PLAYER_ADAPTER_PATH "/org/bluez/hci0"
@@ -53,8 +51,6 @@ static pthread_t dispatch_thread;
 static bool init_done = false;
 
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
-static bool requested_active = false; /* what gui.c wants (bt_media_player_set_active) */
-static bool actual_active = false;    /* what the dispatch thread has actually told BlueZ (RegisterPlayer done) -- only that thread writes this */
 static bool playing_state = false;    /* mirrors audio_is_playing(), for PlaybackStatus -- set via bt_media_player_notify_playback_state() */
 static bool play_pause_requested = false;
 static bool next_requested = false;
@@ -193,12 +189,10 @@ static DBusHandlerResult handle_properties_get_all(DBusConnection * c, DBusMessa
 
 /* MPRIS's Volume/LoopStatus/Rate are writable in the spec, but this app
  * doesn't use MPRIS for volume (see bt_control_source_volume_sync_start()
- * in bluetooth_control.c -- that goes through bluealsa's own AVRCP
- * absolute-volume property instead, the mechanism actually reachable from
- * a2dp-source audio) and has no loop-status/rate concept remotely
- * controllable yet. Accept and ignore rather than erroring, so a
- * conformant MPRIS client that tries doesn't get an unexpected failure
- * for a property it reasonably expects to be settable. */
+ * in bluetooth_control.c) and has no remotely-controllable loop-status/rate
+ * concept. Accept and ignore rather than erroring, so a conformant MPRIS
+ * client doesn't get an unexpected failure for a property it expects to be
+ * settable. */
 static DBusHandlerResult handle_properties_set(DBusConnection * c, DBusMessage * msg) {
     send_empty_reply(c, msg);
     return DBUS_HANDLER_RESULT_HANDLED;
@@ -255,13 +249,11 @@ static DBusHandlerResult message_handler(DBusConnection * c, DBusMessage * msg, 
 
     if (strcmp(interface, "org.mpris.MediaPlayer2.Player") == 0) {
         /* Play/Pause/PlayPause/Stop all reduce to this app's single
-         * audio_toggle_pause() (see gui.c's toggle_play_pause(), which
-         * bt_media_player_consume_play_pause() below ultimately triggers)
-         * -- there's no separate "force play" vs "force pause" entry
-         * point, so Play()/Stop() only request a toggle when that would
-         * actually move toward the state they're asking for, using the
-         * cached playing_state bt_media_player_notify_playback_state()
-         * keeps current. */
+         * audio_toggle_pause() (see gui.c's toggle_play_pause()); there's
+         * no separate "force play" vs "force pause" entry point, so
+         * Play()/Stop() only request a toggle when that would actually
+         * move toward the state they're asking for, using the cached
+         * playing_state. */
         pthread_mutex_lock(&state_mutex);
         bool currently_playing = playing_state;
         if (strcmp(member, "PlayPause") == 0) {
@@ -296,24 +288,13 @@ static DBusObjectPathVTable vtable = {
     NULL, NULL, NULL, NULL
 };
 
-/* Real-device concurrency finding: this used to block via
- * dbus_connection_send_with_reply_and_block(conn, msg, 5000, &err) -- fine
- * in isolation (never called from the GUI thread, only this file's own
- * dispatch thread, so it couldn't freeze the UI directly), but this same
- * call fires on every single BT connect/disconnect (see gui.c's
- * poll_refresh_bt_icon(), which calls bt_media_player_set_active() every
- * ~5s poll cycle), including the exact moment bluetooth_control.c's
- * bt_control_recover_wedged_daemon() might ALSO be killing and restarting
- * bluetoothd if it looks wedged -- meaning this could sit blocked for up to
- * 5s waiting on a reply from a peer that's being torn down mid-request,
- * while ALSO blocking this thread's own dbus_connection_read_write_
- * dispatch() loop from processing incoming AVRCP button presses for that
- * whole window. Neither RegisterPlayer's nor UnregisterPlayer's reply
- * content was ever actually used here beyond logging a failure (actual_
- * active is set unconditionally either way -- see the call site below), so
- * there was nothing this genuinely needed to block for. Fire-and-forget
- * instead: dbus_message_set_no_reply() tells BlueZ not to even bother
- * sending one, and dbus_connection_send() queues the call without waiting. */
+/* Fire-and-forget: dbus_message_set_no_reply() tells BlueZ not to send a
+ * reply, and dbus_connection_send() queues the call without blocking.
+ * Neither RegisterPlayer's nor UnregisterPlayer's reply content is used
+ * here beyond logging, and blocking on a reply would stall this thread's
+ * own dispatch loop -- including incoming AVRCP button presses -- for up
+ * to the reply timeout, which matters since this can fire during a
+ * bluetoothd restart. */
 static void call_register_player(bool register_it) {
     const char * member = register_it ? "RegisterPlayer" : "UnregisterPlayer";
     DBusMessage * msg = dbus_message_new_method_call("org.bluez", BT_MEDIA_PLAYER_ADAPTER_PATH,
@@ -325,24 +306,15 @@ static void call_register_player(bool register_it) {
     dbus_message_iter_init_append(msg, &iter);
     dbus_message_iter_append_basic(&iter, DBUS_TYPE_OBJECT_PATH, &path);
     if (register_it) {
-        /* Real-device root cause: BlueZ's RegisterPlayer handler
-         * (profiles/audio/media.c's register_player()/
-         * parse_player_properties(), confirmed by reading BlueZ's own
-         * source) reads CanPlay/CanPause/CanControl/CanGoNext/
-         * CanGoPrevious DIRECTLY out of THIS properties dict argument to
-         * populate its internal capability flags -- it never queries the
-         * registered object's own D-Bus properties afterward, contrary to
-         * what the MPRIS spec's property-based design might suggest.
-         * Leaving this dict empty (the original version of this function)
-         * left every flag false, so bluetoothd's local_player_play()/
-         * _pause()/_next() etc. silently no-op without ever calling this
-         * app at all -- confirmed live: bluetoothd's own debug log showed
-         * "AV/C: PLAY pressed" and its play()/next()/m_pause() firing on
-         * every button press, but this app's message handler never once
-         * received a call. This app always supports all five (see
-         * append_property_value()'s own hardcoded TRUE for these same
-         * properties when BlueZ or anything else queries them normally
-         * via Properties.Get/GetAll). */
+        /* BlueZ's RegisterPlayer handler reads CanPlay/CanPause/
+         * CanControl/CanGoNext/CanGoPrevious directly out of this
+         * properties dict argument to populate its internal capability
+         * flags -- it never queries the registered object's own D-Bus
+         * properties afterward. Leaving this dict empty leaves every flag
+         * false, so bluetoothd silently no-ops button presses without
+         * ever calling this app. This app always supports all five
+         * (matching append_property_value()'s hardcoded TRUE for the same
+         * properties). */
         DBusMessageIter dict_iter;
         dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &dict_iter);
         static const char * const cap_names[] = {
@@ -365,25 +337,13 @@ static void call_register_player(bool register_it) {
     dbus_message_unref(msg);
 }
 
-/* Real-device bug report: "I have to press twice the play/pause action to
- * get it to work the first time, then it's just once". Root cause: this
- * app only ever ANSWERED PlaybackStatus queries (Properties.Get/GetAll);
- * it never proactively told BlueZ/the accessory when it changed. A
- * physical play/pause button on a real headset tracks its OWN idea of
- * "currently playing" (confirmed live in bluetoothd's own debug log: a
- * single physical button sends distinct AV/C PLAY vs PAUSE op-codes, not
- * one unconditional toggle) so it can send the opposite action next time
- * -- and with no PropertiesChanged ever emitted, that idea starts from
- * whatever the accessory defaults to (observed behavior consistent with
- * "assume paused") regardless of whether this app was already mid-track
- * when the connection was made. The mismatched first press is silently a
- * no-op on this app's side (message_handler()'s Play()/Pause() handlers
- * already correctly ignore a request that doesn't match actual state --
- * see their own comment), which is exactly "the first press did nothing";
- * the second press then lines up. Emitting this signal whenever playback
- * state actually changes keeps the accessory's own assumption correct
- * going forward, closing the gap a fresh connection would otherwise hit
- * once. */
+/* Emits PropertiesChanged for PlaybackStatus whenever playback state
+ * actually changes. A physical play/pause button on a headset tracks its
+ * own idea of "currently playing" and sends the opposite action next time
+ * -- without this signal that idea never syncs with reality, so the first
+ * button press after a state mismatch is a silent no-op (message_handler()
+ * already ignores a request that doesn't match actual state) and only the
+ * second press takes effect. */
 static void send_playback_status_changed(void) {
     DBusMessage * signal = dbus_message_new_signal(BT_MEDIA_PLAYER_OBJECT_PATH,
                                                      "org.freedesktop.DBus.Properties", "PropertiesChanged");
@@ -413,38 +373,47 @@ static void send_playback_status_changed(void) {
 static void * dispatch_thread_func(void * arg) {
     (void) arg;
 
-    /* Forces the first loop iteration to always send an initial
-     * PropertiesChanged once actually registered, regardless of which way
-     * playing_state happens to default -- a fresh connection should never
-     * start from BlueZ's own unknown/default assumption if this app
-     * already knows the real state. */
+    /* Forces the first loop iteration to send an initial PropertiesChanged
+     * once registered, regardless of playing_state's default -- a fresh
+     * connection shouldn't start from BlueZ's own default assumption if
+     * this app already knows the real state. */
     bool last_notified_playing = !playing_state;
+
+    /* Registers once, immediately and unconditionally, for the app's whole
+     * lifetime -- not gated on whether BT output is the currently active
+     * route, matching the stock platform's own sys_server (which also
+     * registers once, early, and stays registered regardless of what's
+     * outputting audio). No periodic re-register: task #44's real-device
+     * investigation (2026-08-13) conclusively traced actual AVRCP button
+     * *dispatch* to a completely different mechanism (avrcp_input_thread_
+     * func() below, evdev-based) that doesn't depend on this registration
+     * at all -- re-registering repeatedly was a workaround for a theory
+     * ("maybe timing/frequency helps bluetoothd pick this up") that turned
+     * out to be wrong, so it added churn without ever fixing anything. This
+     * registration's only remaining job is answering standard AVRCP
+     * metadata/status queries for any controller that asks, which a single
+     * registration already does correctly. */
+    call_register_player(true);
+    DBG_LOG("bt_media_player: registered\n");
 
     for (;;) {
         pthread_mutex_lock(&state_mutex);
-        bool want_active = requested_active;
         bool current_playing = playing_state;
         pthread_mutex_unlock(&state_mutex);
 
-        if (want_active != actual_active) {
-            call_register_player(want_active);
-            actual_active = want_active; /* only this thread writes actual_active -- no lock needed for the write itself */
-            if (actual_active) last_notified_playing = !current_playing; /* force a fresh notify right after (re)registering */
-        }
-
-        if (actual_active && current_playing != last_notified_playing) {
+        if (current_playing != last_notified_playing) {
             send_playback_status_changed();
+            hiby_sys_server_report_playback_status(current_playing);
             last_notified_playing = current_playing;
         }
 
         /* Processes any incoming method calls (dispatched to
          * message_handler() above) and blocks for up to this long if
          * there's nothing to do -- also what paces this loop's own
-         * requested_active/playing_state checks above, so a connect/
-         * disconnect or a play/pause is reflected within one timeout
-         * window, not instantly, matching every other ~poll-interval
-         * Bluetooth state sync in this codebase (e.g. the GUI's own ~5s
-         * connection poll is far coarser than this). */
+         * playing_state check above, so a play/pause is reflected within
+         * one timeout window, not instantly, matching every other
+         * ~poll-interval Bluetooth state sync in this codebase (e.g. the
+         * GUI's own ~5s connection poll is far coarser than this). */
         dbus_connection_read_write_dispatch(conn, BT_MEDIA_PLAYER_POLL_TIMEOUT_MS);
     }
 
@@ -512,54 +481,141 @@ static bool attempt_connect_once(void) {
  * chip bring-up (bt_control_init_chip() itself already documents ~10-13s
  * for that alone), makes plausible -- can outlast 3s even on a completely
  * normal, non-crash-triggered boot, not just the freeze-reboot scenario
- * the original fix targeted.
- *
- * Falls back to this slower, effectively-unbounded background retry
- * instead of giving up outright once the fast loop below is exhausted --
- * deliberately on its OWN thread, unlike the fast loop (which main.c
- * already accepts blocking startup for, up to 3s): retrying every 5s
- * indefinitely from the main thread would either reintroduce that same
- * kind of startup stall repeatedly, or (worse, if done from update_timer_
- * cb's periodic polling) freeze the UI for a moment on every single retry
- * for as long as the bus stays down. A background thread waking up briefly
- * every 5s is negligible overhead even in the worst case (a bus that never
- * comes up at all), so there's no real cost to just retrying forever
- * rather than picking some arbitrary give-up point that would only
- * reproduce this exact bug again for anyone whose boot is slower than
- * that. */
+ * the original fix targeted. Falls back to a slower, effectively-unbounded
+ * retry (5s apart) once the fast loop is exhausted rather than giving up
+ * outright -- negligible overhead even in the worst case (a bus that never
+ * comes up at all), so there's no real cost to just retrying forever rather
+ * than picking some arbitrary give-up point that would only reproduce this
+ * exact bug again for anyone whose boot is slower than that. */
 #define BT_MEDIA_PLAYER_BACKGROUND_RETRY_DELAY_US (5 * 1000000)
 
-static void * background_retry_thread_func(void * arg) {
+/* Task #44, real-device finding (2026-08-13): live debugging traced the
+ * cold-boot AVRCP failure past every registration-side theory this app
+ * could control on its own (a single early RegisterPlayer, a periodic
+ * re-register over 10 minutes, a genuinely fresh D-Bus connection identity
+ * after a live app relaunch, a genuinely fresh AVRCP session after a live
+ * headset reconnect, even connecting lazily to avoid early-boot D-Bus
+ * contention entirely) -- none of it made bluetoothd dispatch a single
+ * passthrough command. What did work, live: killing and restarting
+ * bluetoothd itself, then reconnecting the headset. That pointed at
+ * bluetoothd's own AVRCP subsystem needing to see a player registered at
+ * (or very near) the moment its own AVRCP subsystem initializes, not one
+ * registered onto an already-running subsystem, however freshly.
+ *
+ * Confirmed by comparing against the stock firmware: its closed-source
+ * hiby_player binary has zero AVRCP/MPRIS strings in it at all -- the
+ * actual registration happens in a separate stock service, sys_server
+ * (confirmed via its own strings: RegisterPlayer, org.bluez.MediaPlayer1,
+ * org.mpris.MediaPlayer2.Player, /org/bluez/hiby/player), which starts at
+ * init.d's S50sys_server -- before S80_bt_init even brings up hci0, and
+ * long before this app's own S92_03_start_music_player. sys_server also
+ * registers unconditionally, for its whole lifetime, with no concept of
+ * "is BT output currently active" gating the registration at all.
+ *
+ * This app now mirrors both properties: bt_media_player_init() is called
+ * unconditionally again, as early as main.c can call it (right after the
+ * SIGPIPE guard, before even mount_sd_card_if_needed()) rather than lazily
+ * on first BT use, so this connect loop starts racing for the bus the
+ * moment this process exists at all -- as close to sys_server's own head
+ * start as this app's own S92 init.d position allows. And registration
+ * itself (dispatch_thread_func()) no longer waits for BT output to become
+ * active; it registers immediately once connected and stays registered,
+ * matching sys_server's always-on model. Still never touches bluetoothd/
+ * hci0 directly -- only this app's own D-Bus connection and timing changed
+ * (see bluetooth_control.c's own history for why touching the daemon
+ * itself is unsafe). */
+static void * connect_thread_func(void * arg) {
     (void) arg;
+    for (int attempt = 0; attempt < DBUS_BUS_GET_RETRY_ATTEMPTS; attempt++) {
+        if (attempt_connect_once()) return NULL;
+        if (attempt + 1 < DBUS_BUS_GET_RETRY_ATTEMPTS) usleep(DBUS_BUS_GET_RETRY_DELAY_US);
+    }
+
+    DBG_LOG("bt_media_player: exhausted fast retry, falling back to background retry\n");
     for (;;) {
         usleep(BT_MEDIA_PLAYER_BACKGROUND_RETRY_DELAY_US);
-        if (attempt_connect_once()) {
-            init_done = true;
-            return NULL;
+        if (attempt_connect_once()) return NULL;
+    }
+}
+
+/* See avrcp_input_thread_func()'s own comment (top of file) for why this
+ * exists and why it's a separate device from hw_buttons.c's own two. */
+#define BT_AVRCP_INPUT_NAME_MARKER "(AVRCP)"
+#define BT_AVRCP_INPUT_RESCAN_DELAY_US (3 * 1000000)
+#define BT_AVRCP_INPUT_POLL_TIMEOUT_MS 1000
+
+static void * avrcp_input_thread_func(void * arg) {
+    (void) arg;
+    int fd = -1;
+
+    for (;;) {
+        if (fd < 0) {
+            char path[64];
+            if (find_input_device_containing(BT_AVRCP_INPUT_NAME_MARKER, path, sizeof(path))) {
+                fd = open(path, O_RDONLY | O_NONBLOCK);
+                if (fd >= 0) {
+                    DBG_LOG("bt_media_player: AVRCP input device found at %s\n", path);
+                } else {
+                    DBG_LOG("bt_media_player: failed to open AVRCP input device %s\n", path);
+                }
+            }
+            if (fd < 0) {
+                usleep(BT_AVRCP_INPUT_RESCAN_DELAY_US);
+                continue;
+            }
+        }
+
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        int ret = poll(&pfd, 1, BT_AVRCP_INPUT_POLL_TIMEOUT_MS);
+        if (ret < 0) {
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        if (ret == 0) continue; /* timeout, nothing to read -- just re-poll */
+
+        struct input_event ev;
+        ssize_t n;
+        while ((n = read(fd, &ev, sizeof(ev))) == (ssize_t) sizeof(ev)) {
+            if (ev.type == EV_KEY && ev.value == 1) { /* press only -- matches hw_buttons.c's own next/prev/play-pause handling, no release-triggered action */
+                pthread_mutex_lock(&state_mutex);
+                switch (ev.code) {
+                    case KEY_PLAYCD:
+                    case KEY_PAUSECD:      play_pause_requested = true; break;
+                    case KEY_NEXTSONG:     next_requested = true; break;
+                    case KEY_PREVIOUSSONG: prev_requested = true; break;
+                    default: break;
+                }
+                pthread_mutex_unlock(&state_mutex);
+            }
+        }
+        /* n == 0 (EOF) or a real error (not EAGAIN, which just means the
+         * queue is empty for now) means the accessory disconnected and
+         * BlueZ's input plugin destroyed this device -- close and go back
+         * to rescanning rather than spinning on a dead fd. */
+        if (n == 0 || (n < 0 && errno != EAGAIN)) {
+            DBG_LOG("bt_media_player: AVRCP input device gone\n");
+            close(fd);
+            fd = -1;
         }
     }
+
+    return NULL; /* unreached -- this thread runs for the app's whole lifetime, same as the D-Bus dispatch thread above */
 }
 
 void bt_media_player_init(void) {
     if (init_done) return;
     init_done = true;
 
-    for (int attempt = 0; attempt < DBUS_BUS_GET_RETRY_ATTEMPTS; attempt++) {
-        if (attempt_connect_once()) return;
-        if (attempt + 1 < DBUS_BUS_GET_RETRY_ATTEMPTS) usleep(DBUS_BUS_GET_RETRY_DELAY_US);
-    }
+    pthread_t connect_thread;
+    pthread_create(&connect_thread, NULL, connect_thread_func, NULL);
+    pthread_detach(connect_thread);
 
-    DBG_LOG("bt_media_player: exhausted fast retry, falling back to background retry\n");
-    init_done = false;
-    pthread_t retry_thread;
-    pthread_create(&retry_thread, NULL, background_retry_thread_func, NULL);
-    pthread_detach(retry_thread);
-}
-
-void bt_media_player_set_active(bool active) {
-    pthread_mutex_lock(&state_mutex);
-    requested_active = active;
-    pthread_mutex_unlock(&state_mutex);
+    pthread_t avrcp_input_thread;
+    pthread_create(&avrcp_input_thread, NULL, avrcp_input_thread_func, NULL);
+    pthread_detach(avrcp_input_thread);
 }
 
 void bt_media_player_notify_playback_state(bool playing) {

@@ -244,6 +244,7 @@ void metadata_db_open(void) {
 
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS book (path TEXT PRIMARY KEY);", NULL, NULL, NULL);
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS book_favorite (path TEXT PRIMARY KEY);", NULL, NULL, NULL);
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS playlist (path TEXT PRIMARY KEY);", NULL, NULL, NULL);
     sqlite3_exec(db,
                  "CREATE TABLE IF NOT EXISTS subsonic_server (url TEXT PRIMARY KEY, username TEXT, password TEXT, verify_tls INTEGER);",
                  NULL, NULL, NULL);
@@ -582,6 +583,77 @@ void metadata_db_load_all_books(char *** out_paths, int * out_count) {
 
     *out_paths = paths;
     *out_count = i;
+}
+
+void metadata_db_playlist_replace_all(char * const * paths, int count) {
+    if (!db) return;
+
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    sqlite3_exec(db, "DELETE FROM playlist;", NULL, NULL, NULL);
+
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT INTO playlist (path) VALUES (?);", -1, &st, NULL) == SQLITE_OK) {
+        for (int i = 0; i < count; i++) {
+            sqlite3_reset(st);
+            sqlite3_bind_text(st, 1, paths[i], -1, SQLITE_STATIC);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+}
+
+void metadata_db_load_all_playlists(char *** out_paths, int * out_count) {
+    *out_paths = NULL;
+    *out_count = 0;
+    if (!db) return;
+
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM playlist;", -1, &st, NULL) != SQLITE_OK) return;
+    int row_count = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) row_count = (int) sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (row_count <= 0) return;
+
+    char ** paths = malloc(sizeof(char *) * (size_t) row_count);
+    if (sqlite3_prepare_v2(db, "SELECT path FROM playlist ORDER BY path COLLATE NOCASE;", -1, &st, NULL) != SQLITE_OK) {
+        free(paths);
+        return;
+    }
+
+    int i = 0;
+    while (i < row_count && sqlite3_step(st) == SQLITE_ROW) {
+        paths[i] = strdup((const char *) sqlite3_column_text(st, 0));
+        i++;
+    }
+    sqlite3_finalize(st);
+
+    *out_paths = paths;
+    *out_count = i;
+}
+
+void metadata_db_playlist_insert_one(const char * path) {
+    if (!db) return;
+
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, "INSERT INTO playlist (path) VALUES (?) ON CONFLICT(path) DO NOTHING;", -1, &st, NULL) !=
+        SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void metadata_db_playlist_delete_one(const char * path) {
+    if (!db) return;
+
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM playlist WHERE path = ?;", -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
 }
 
 bool metadata_db_book_favorite_is_set(const char * path) {

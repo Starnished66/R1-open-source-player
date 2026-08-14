@@ -13,15 +13,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-/* Placeholder ~8899, confirmed free (no listener at all besides adb's own
- * 127.0.0.1:5037) via `netstat -tln` on a real device -- port 4399 is
- * already taken by Import via Wi-Fi's thttpd. */
+/* Port 8899 -- verified free on a real device; 4399 is already used by
+ * Import via Wi-Fi's thttpd. */
 #define REMOTE_CONTROL_PORT 8899
 
-/* Same definition as gui.c's own MUSIC_ROOT_DIR/PLAYLISTS_DIR -- duplicated
- * rather than shared via a header since gui.c doesn't expose either as
- * part of its own public surface (there isn't one; it's the top-level app
- * file). Must stay in sync if either ever changes there. */
+/* Same definition as gui.c's own MUSIC_ROOT_DIR/PLAYLISTS_DIR, duplicated
+ * since gui.c doesn't expose either publicly. Must stay in sync. */
 #ifdef HOST_BUILD
 #define MUSIC_ROOT_DIR "./music"
 #else
@@ -39,15 +36,15 @@ static char status_path[512] = {0};
 static int status_position_seconds = 0;
 static int status_duration_seconds = 0;
 static float status_volume = 0;
+static int status_play_mode = 0;
 
-/* Phase 2 playback requests -- same edge-triggered "background thread
- * sets a flag, update_timer_cb consumes it" pattern as hw_buttons.c/
- * bt_media_player.c's own transport buttons, guarded by the same mutex
- * as the status snapshot above rather than a second one (this server has
- * exactly one background thread touching both, no real contention). */
+/* Playback requests -- same edge-triggered "background thread sets a flag,
+ * update_timer_cb consumes it" pattern as hw_buttons.c/bt_media_player.c's
+ * transport buttons, guarded by the same mutex as the status snapshot. */
 static bool request_play_pause = false;
 static bool request_next = false;
 static bool request_prev = false;
+static bool request_mode_cycle = false;
 static bool request_has_seek = false;
 static int request_seek_seconds = 0;
 static bool request_has_volume = false;
@@ -55,11 +52,9 @@ static int request_volume_percent = 0;
 static bool request_has_play_index = false;
 static int request_play_index = 0;
 
-/* Phase 3 (library browsing) -- this server's own copy of gui.c's
- * all_songs_paths/all_song_tags title+artist strings, kept in the exact
- * same index order (see remote_control_sync_library()'s own doc comment
- * in the header for why that indexing must never drift). Guarded by the
- * same status_mutex as everything else here. */
+/* This server's own copy of gui.c's library title/artist strings, kept in
+ * the exact same index order (see remote_control_sync_library() in the
+ * header). Guarded by status_mutex. */
 static char ** library_titles = NULL;
 static char ** library_artists = NULL;
 static char ** library_album_artists = NULL;
@@ -73,7 +68,7 @@ static pthread_t listener_thread;
 
 void remote_control_notify_status(bool playing, bool paused, const char * title, const char * artist,
                                    const char * album, const char * path, int position_seconds,
-                                   int duration_seconds, float volume) {
+                                   int duration_seconds, float volume, int play_mode) {
     pthread_mutex_lock(&status_mutex);
     status_playing = playing;
     status_paused = paused;
@@ -84,6 +79,7 @@ void remote_control_notify_status(bool playing, bool paused, const char * title,
     status_position_seconds = position_seconds;
     status_duration_seconds = duration_seconds;
     status_volume = volume;
+    status_play_mode = play_mode;
     pthread_mutex_unlock(&status_mutex);
 }
 
@@ -107,6 +103,14 @@ bool remote_control_consume_prev(void) {
     pthread_mutex_lock(&status_mutex);
     bool result = request_prev;
     request_prev = false;
+    pthread_mutex_unlock(&status_mutex);
+    return result;
+}
+
+bool remote_control_consume_mode_cycle(void) {
+    pthread_mutex_lock(&status_mutex);
+    bool result = request_mode_cycle;
+    request_mode_cycle = false;
     pthread_mutex_unlock(&status_mutex);
     return result;
 }
@@ -188,12 +192,9 @@ void remote_control_sync_library(const char * const * titles, const char * const
     pthread_mutex_unlock(&status_mutex);
 }
 
-/* Minimal JSON string escaping -- only the characters a real song/artist/
- * album tag could plausibly contain that would otherwise break the JSON
- * (quote, backslash, control characters). Not a general-purpose escaper;
- * this project has cJSON vendored for parsing but nothing for building
- * JSON strings by hand yet, and pulling in a whole serializer for four
- * string fields is more machinery than this needs. */
+/* Minimal JSON string escaping -- handles quote, backslash, and control
+ * characters, the only ones a real song/artist/album tag could plausibly
+ * contain that would break the JSON. Not a general-purpose escaper. */
 static void json_escape_append(char * out, size_t out_size, const char * in) {
     size_t len = strlen(out);
     for (const char * p = in; *p && len + 2 < out_size; p++) {
@@ -211,9 +212,8 @@ static void json_escape_append(char * out, size_t out_size, const char * in) {
     out[len] = '\0';
 }
 
-/* Hand-rolled rather than strcasestr() -- not confirmed available in this
- * project's musl target libc (see CLAUDE.md's own "don't guess API
- * availability" rule), and this is only a handful of lines anyway. */
+/* Hand-rolled rather than strcasestr(), which isn't confirmed available on
+ * this project's musl target libc. */
 static bool contains_case_insensitive(const char * haystack, const char * needle) {
     if (!*needle) return true;
     size_t needle_len = strlen(needle);
@@ -226,10 +226,8 @@ static bool contains_case_insensitive(const char * haystack, const char * needle
 }
 
 /* Decodes application/x-www-form-urlencoded query-string bytes (%XX and
- * "+" for space) -- browsers' own URLSearchParams/encodeURIComponent
- * produce %20 for spaces, not "+", but query strings built by hand (or by
- * other tools) commonly use "+", so both are handled. Bounded, truncates
- * rather than overflowing out if the decoded result wouldn't fit. */
+ * "+" for space; both %20 and "+" are accepted for space). Bounded,
+ * truncates rather than overflowing if the decoded result wouldn't fit. */
 static void url_decode(const char * in, char * out, size_t out_size) {
     size_t len = 0;
     while (*in && len + 1 < out_size) {
@@ -249,10 +247,8 @@ static void url_decode(const char * in, char * out, size_t out_size) {
     out[len] = '\0';
 }
 
-/* Pulls a raw (still percent-encoded) string query parameter's value --
- * same key-scanning shape as query_param_int(), just copying bytes up to
- * the next '&' or end of string instead of parsing an integer. Returns
- * false (leaving out untouched) if the key isn't present. */
+/* Pulls a raw (still percent-encoded) string query parameter's value.
+ * Returns false (leaving out untouched) if the key isn't present. */
 static bool query_param_str(const char * path, const char * key, char * out, size_t out_size) {
     const char * q = strchr(path, '?');
     if (!q) return false;
@@ -276,22 +272,14 @@ static bool query_param_str(const char * path, const char * key, char * out, siz
     return false;
 }
 
-/* Two passes over the library: one to count how many entries match `query`
- * (so the client can tell whether there's more to page through), one to
- * actually emit the limit-bounded page starting at offset. O(library size)
- * twice per request -- fine for a personal-library-sized collection polled
- * only when the user is actively searching, not every tick like /api/status
- * is. LIBRARY_JSON_MAX_LIMIT caps both the page size and (indirectly, via
- * the caller-provided out buffer) the response size. */
+/* Caps both the page size for build_library_json() and, indirectly, the
+ * response size. */
 #define LIBRARY_JSON_MAX_LIMIT 100
 
 /* artist_filter/album_artist_filter/album_filter, each if non-empty,
  * restrict to songs whose corresponding tag exactly matches
- * (case-insensitive) -- the Artist -> Albums -> Songs and Album Artist ->
- * Albums -> Songs drill-downs (see GET /api/library/albums) both end up
- * here with one of artist_filter/album_artist_filter plus album_filter set.
- * query is still a substring match against title/artist on top of
- * whichever exact filters are active, same as before. */
+ * (case-insensitive); query is still a substring match against
+ * title/artist on top of whichever exact filters are active. */
 static bool library_song_matches(int i, const char * query, const char * artist_filter,
                                   const char * album_artist_filter, const char * album_filter) {
     if (artist_filter[0] != '\0' && strcasecmp(library_artists[i], artist_filter) != 0) return false;
@@ -450,9 +438,9 @@ static void build_status_json(char * out, size_t out_size) {
     json_escape_append(album_esc, sizeof(album_esc), status_album);
     snprintf(out, out_size,
              "{\"playing\":%s,\"paused\":%s,\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
-             "\"position_seconds\":%d,\"duration_seconds\":%d,\"volume\":%.2f}",
+             "\"position_seconds\":%d,\"duration_seconds\":%d,\"volume\":%.2f,\"play_mode\":%d}",
              status_playing ? "true" : "false", status_paused ? "true" : "false", title_esc, artist_esc, album_esc,
-             status_position_seconds, status_duration_seconds, (double) status_volume);
+             status_position_seconds, status_duration_seconds, (double) status_volume, status_play_mode);
     pthread_mutex_unlock(&status_mutex);
 }
 
@@ -561,6 +549,10 @@ static const char * const NOW_PLAYING_HTML =
     "<svg viewBox=\"0 0 24 24\"><path d=\"M8 5v14l11-7z\"/></svg></button>"
     "<button onclick=\"post('/api/playback/next')\">"
     "<svg viewBox=\"0 0 24 24\"><path d=\"M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z\"/></svg></button>"
+    "<button id=\"modebtn\" onclick=\"post('/api/playback/mode')\">"
+    "<svg viewBox=\"0 0 24 24\"><rect x=\"4\" y=\"6\" width=\"16\" height=\"2.4\" rx=\"1.2\"/>"
+    "<rect x=\"4\" y=\"11\" width=\"16\" height=\"2.4\" rx=\"1.2\"/>"
+    "<rect x=\"4\" y=\"16\" width=\"10\" height=\"2.4\" rx=\"1.2\"/></svg></button>"
     "</div>"
     "<div id=\"volumeRow\"><span>Volume</span><input type=\"range\" id=\"volume\" min=\"0\" max=\"100\" value=\"0\">"
     "</div>"
@@ -685,6 +677,24 @@ static const char * const NOW_PLAYING_HTML =
     "var dragging=false,lastArtKey='';"
     "var ICON_PLAY='<svg viewBox=\"0 0 24 24\"><path d=\"M8 5v14l11-7z\"/></svg>';"
     "var ICON_PAUSE='<svg viewBox=\"0 0 24 24\"><path d=\"M6 5h4v14H6zM14 5h4v14h-4z\"/></svg>';"
+    /* Same one-button cycle as the player screen's own order_icon
+     * (Sequential -> Repeat All -> Repeat One -> Shuffle), indexed by
+     * play_mode_t's own int values -- see remote_control.h's own comment
+     * on remote_control_notify_status()'s play_mode param. Repeat All/One
+     * share a circle-with-gap-plus-arrowhead glyph (stroke-dasharray
+     * leaves a small opening, the polygon caps it with an arrowhead);
+     * Repeat One adds a "1". Shuffle is a plain crossing-lines glyph. */
+    "var MODE_ICONS=["
+    "'<svg viewBox=\"0 0 24 24\"><rect x=\"4\" y=\"6\" width=\"16\" height=\"2.4\" rx=\"1.2\"/>"
+    "<rect x=\"4\" y=\"11\" width=\"16\" height=\"2.4\" rx=\"1.2\"/>"
+    "<rect x=\"4\" y=\"16\" width=\"10\" height=\"2.4\" rx=\"1.2\"/></svg>',"
+    "'<svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"8\" fill=\"none\" stroke=\"currentColor\" "
+    "stroke-width=\"2\" stroke-dasharray=\"43 7\"/><polygon points=\"12,3 16,7 12,7\"/></svg>',"
+    "'<svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"8\" fill=\"none\" stroke=\"currentColor\" "
+    "stroke-width=\"2\" stroke-dasharray=\"43 7\"/><polygon points=\"12,3 16,7 12,7\"/>"
+    "<text x=\"12\" y=\"16\" font-size=\"8\" text-anchor=\"middle\">1</text></svg>',"
+    "'<svg viewBox=\"0 0 24 24\"><path d=\"M4 6l16 12M20 6 4 18\" stroke=\"currentColor\" "
+    "stroke-width=\"2.2\" fill=\"none\" stroke-linecap=\"round\"/></svg>'];"
     "function fmt(s){s=Math.max(0,s|0);var m=(s/60)|0,r=s%60;return m+':'+(r<10?'0':'')+r;}"
     "function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{"
     "document.getElementById('title').textContent=d.title||'(nothing playing)';"
@@ -695,6 +705,7 @@ static const char * const NOW_PLAYING_HTML =
     "document.getElementById('fill').style.width=pct+'%';"
     "document.getElementById('time').textContent=fmt(d.position_seconds)+' / '+fmt(d.duration_seconds);"
     "document.getElementById('playbtn').innerHTML=d.playing?ICON_PAUSE:ICON_PLAY;"
+    "document.getElementById('modebtn').innerHTML=MODE_ICONS[d.play_mode]||MODE_ICONS[0];"
     "if(!dragging)document.getElementById('volume').value=Math.round(d.volume*100);"
     "var artKey=(d.title||'')+'|'+(d.artist||'');"
     "if(artKey!==lastArtKey){lastArtKey=artKey;var art=document.getElementById('art');"
@@ -1149,6 +1160,8 @@ static void handle_connection(int cfd) {
                 request_next = true;
             } else if (strcmp(path_only, "/api/playback/prev") == 0) {
                 request_prev = true;
+            } else if (strcmp(path_only, "/api/playback/mode") == 0) {
+                request_mode_cycle = true;
             } else if (strcmp(path_only, "/api/playback/seek") == 0) {
                 int seconds;
                 if (query_param_int(path, "seconds", &seconds) && seconds >= 0) {

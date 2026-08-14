@@ -314,7 +314,29 @@ static lv_obj_t * quick_drawer_artist_label;
 static lv_obj_t * quick_drawer_favorite_icon;
 static lv_obj_t * quick_drawer_play_btn;
 static lv_obj_t * quick_drawer_order_icon; /* visual-only mirror of order_icon's mode, not independently clickable */
+static lv_obj_t * quick_drawer_brightness_track;
+static lv_obj_t * quick_drawer_brightness_label;
 static bool quick_drawer_open = false;
+
+/* Real-device bug report: the drawer's brightness slider/label only ever
+ * reflected whatever backlight_get_percent() read back at build_quick_
+ * drawer() time (app startup) -- turning the screen off and back on
+ * restores the real prior brightness (see backlight_set_screen_on()'s own
+ * comment) without this ever re-reading it, so the slider silently drifted
+ * out of sync with the real screen brightness on every screen-off/on cycle,
+ * not just the one the reset bug above also affected. Called once at build
+ * time (build_quick_drawer() itself) and again every time the drawer opens
+ * (open_quick_drawer()), so it's never stale by the time the user can
+ * actually see it. */
+static void refresh_quick_drawer_brightness(void) {
+    int brightness = backlight_get_percent();
+    /* backlight_get_percent() already returns a clean logical 0-100 (see
+     * backlight.h's own comment) -- host/no-backlight-node is the only
+     * remaining case needing a fallback here. */
+    if (brightness < 0) brightness = 100;
+    lv_slider_set_value(quick_drawer_brightness_track, brightness, LV_ANIM_OFF);
+    lv_label_set_text_fmt(quick_drawer_brightness_label, "%d%%", brightness);
+}
 
 static char ** playlist = NULL;
 static int playlist_count = 0;
@@ -2052,6 +2074,7 @@ static void quick_drawer_anim_y_cb(void * var, int32_t v) {
 static void open_quick_drawer(void) {
     if (quick_drawer_open) return;
     quick_drawer_open = true;
+    refresh_quick_drawer_brightness(); /* see its own comment -- keeps the slider from showing a stale pre-screen-off value */
     lv_obj_move_foreground(quick_drawer); /* above regular screens/volume popup while showing */
     /* ...but the status bar (clock/battery/wifi/bt) stays above THAT --
      * real-hardware feedback wanted it to stay visible/readable the whole
@@ -3038,31 +3061,36 @@ static void build_quick_drawer(void) {
     lv_image_set_src(brightness_icon, asset_path("pull_down/blk.png"));
     lv_obj_align(brightness_icon, LV_ALIGN_TOP_LEFT, 40, QUICK_DRAWER_PANEL1_TOP + 174);
 
-    lv_obj_t * brightness_label = lv_label_create(quick_drawer);
-    lv_obj_set_style_text_color(brightness_label, lv_color_make(230, 230, 230), 0);
-    lv_obj_set_style_text_font(brightness_label, ui_size_20, 0);
-    lv_obj_align(brightness_label, LV_ALIGN_TOP_RIGHT, -20, QUICK_DRAWER_PANEL1_TOP + 177);
+    quick_drawer_brightness_label = lv_label_create(quick_drawer);
+    lv_obj_set_style_text_color(quick_drawer_brightness_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_set_style_text_font(quick_drawer_brightness_label, ui_size_20, 0);
+    lv_obj_align(quick_drawer_brightness_label, LV_ALIGN_TOP_RIGHT, -20, QUICK_DRAWER_PANEL1_TOP + 177);
 
-    lv_obj_t * brightness_track = lv_slider_create(quick_drawer);
-    lv_obj_set_size(brightness_track, 300, 12);
-    lv_obj_align(brightness_track, LV_ALIGN_TOP_LEFT, 90, QUICK_DRAWER_PANEL1_TOP + 185);
-    lv_slider_set_range(brightness_track, BACKLIGHT_MIN_PERCENT, 100);
-    int initial_brightness = backlight_get_percent();
-    if (initial_brightness < BACKLIGHT_MIN_PERCENT) initial_brightness = 100; /* host / no backlight node -- harmless placeholder */
-    lv_slider_set_value(brightness_track, initial_brightness, LV_ANIM_OFF);
-    lv_label_set_text_fmt(brightness_label, "%d%%", initial_brightness);
-    lv_obj_set_style_bg_color(brightness_track, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(brightness_track, lv_color_black(), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(brightness_track, lv_color_black(), LV_PART_KNOB);
-    lv_obj_set_style_bg_image_src(brightness_track, asset_path("volume/vol_bg.png"), LV_PART_MAIN);
-    lv_obj_set_style_bg_image_src(brightness_track, asset_path("volume/vol_progress.png"), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_image_src(brightness_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
-    lv_obj_set_style_bg_opa(brightness_track, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(brightness_track, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(brightness_track, LV_OPA_COVER, LV_PART_KNOB);
-    lv_obj_set_style_width(brightness_track, 26, LV_PART_KNOB);
-    lv_obj_set_style_height(brightness_track, 26, LV_PART_KNOB);
-    lv_obj_add_event_cb(brightness_track, quick_drawer_brightness_changed_cb, LV_EVENT_VALUE_CHANGED, brightness_label);
+    quick_drawer_brightness_track = lv_slider_create(quick_drawer);
+    lv_obj_set_size(quick_drawer_brightness_track, 300, 12);
+    lv_obj_align(quick_drawer_brightness_track, LV_ALIGN_TOP_LEFT, 90, QUICK_DRAWER_PANEL1_TOP + 185);
+    /* Full 0-100 -- backlight.c now maps this logical range to its own safe
+     * raw range internally (see backlight.h's own comment), so the slider
+     * itself is free to show a clean, honest 0%-100% again. */
+    lv_slider_set_range(quick_drawer_brightness_track, 0, 100);
+    /* Initial value set below by refresh_quick_drawer_brightness() (also
+     * called on every open_quick_drawer(), see its own comment) --
+     * defined here just so it runs once at build time too, same as
+     * every other quick-drawer widget's own initial state. */
+    lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_KNOB);
+    lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/vol_bg.png"), LV_PART_MAIN);
+    lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/vol_progress.png"), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_width(quick_drawer_brightness_track, 26, LV_PART_KNOB);
+    lv_obj_set_style_height(quick_drawer_brightness_track, 26, LV_PART_KNOB);
+    lv_obj_add_event_cb(quick_drawer_brightness_track, quick_drawer_brightness_changed_cb, LV_EVENT_VALUE_CHANGED,
+                         quick_drawer_brightness_label);
+    refresh_quick_drawer_brightness();
 
     /* Mini now-playing card: real track title/artist/transport, reusing the
      * exact same callbacks as the player screen's own buttons. Transparent

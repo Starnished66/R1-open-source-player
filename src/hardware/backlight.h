@@ -5,21 +5,33 @@
 
 /* Screen backlight brightness, via the standard Linux backlight sysfs class
  * (confirmed present on a real R1: /sys/class/backlight/backlight_pwm0,
- * writable as root). */
+ * writable as root).
+ *
+ * Every function below works in "logical" percent -- a clean 0-100 the UI
+ * can show directly ("0%" and "100%" included). Internally, backlight.c
+ * maps that to a narrower safe raw range before ever touching hardware:
+ * never all the way down to a literal 0 (see BACKLIGHT_MIN_PERCENT below),
+ * and never the literal max_brightness value either -- confirmed live on a
+ * real R1 that writing that exact raw value makes the screen fully
+ * invisible instead of "as bright as possible" (a PWM-at-max-duty-cycle
+ * glitch, not something fixable from software beyond just never writing
+ * that value). Callers never need to think about either edge themselves. */
 
 /* Real-hardware feedback: letting the quick-drawer slider go all the way to
- * 0 turns the screen fully black with no way to see what you're doing to
- * bring it back up. Never go lower than this, in either direction. */
+ * a literal 0 turns the screen fully black with no way to see what you're
+ * doing to bring it back up. Never go lower than this (in raw/safe-percent
+ * terms) in either direction -- logical 0 still maps here, not to a true
+ * off; only backlight_set_screen_on(false) ever writes a true 0. */
 #define BACKLIGHT_MIN_PERCENT 5
 
-/* Current brightness as 0-100 (percent of the device's own max_brightness),
- * or -1 if no backlight class device is present (host, or a future unit
- * with a different driver stack entirely). */
+/* Current brightness as logical 0-100, or -1 if no backlight class device
+ * is present (host, or a future unit with a different driver stack
+ * entirely). */
 int backlight_get_percent(void);
 
-/* Sets brightness to `percent`, clamped to [BACKLIGHT_MIN_PERCENT, 100] and
- * scaled against the real max_brightness. No-op if no backlight class
- * device is present. */
+/* Sets brightness to logical `percent`, clamped to [0, 100] and mapped to
+ * the safe raw range described above. No-op if no backlight class device
+ * is present. */
 void backlight_set_percent(int percent);
 
 /* Screen power (fully off, not just dimmed to BACKLIGHT_MIN_PERCENT) -- the

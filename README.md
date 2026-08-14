@@ -42,6 +42,7 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - AAC — raw ADTS and `.m4a`
 - ALAC
 - APE / Monkey's Audio
+- OPUS
 - Gapless playback **enabled by default**
 - Crossfade
 - ReplayGain track gain
@@ -51,6 +52,10 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - Physical hardware controls for volume, play/pause, next/previous
 - Automatic track advancement
 - Proper playlist-end handling
+- Bluetooth playback support
+- Bluetooth metadata streaming
+- Bluetooth DAC finally works
+- Album art downscaling, supporting up to 1200x1200 resolutions
 
 ## 📚 Music Library
 
@@ -128,13 +133,10 @@ The LAN remote-control interface provides a simple way to control the player fro
 The following features are planned or currently incomplete:
 
 - Audiobook support
-- Opus playback
 - Global accent color system
 - Background image/color customization
 - Full theme support
 - Lyrics support
-- Bluetooth DAC support
-  - The existing option can connect, but playback through it is not currently functional
 - Additional community-requested features
 
 This list will evolve as development continues.

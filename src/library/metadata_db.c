@@ -11,9 +11,31 @@
 #ifdef HOST_BUILD
   #define METADATA_DB_PATH "./open_hiby_player_music.db"
 #else
-  /* /usr/data is the device's persistent ubifs partition -- same convention
-   * as settings.c's SETTINGS_FILE_PATH. */
-  #define METADATA_DB_PATH "/usr/data/open_hiby_player_music.db"
+  /* Real-device bug report: a library of 5000+ songs rebooted the device
+   * mid-rescan. Root cause: this lived on /usr/data, a 35.8MB ubifs
+   * partition already close to full with settings/logs/other app state (see
+   * settings.c's own SETTINGS_FILE_PATH comment) -- metadata_db_begin_update()
+   * wraps the ENTIRE rescan in one SQLite transaction, so the rollback
+   * journal alone (roughly proportional to how many rows a big library
+   * touches) stays open and grows for the whole scan, on top of the actual
+   * database file itself also growing with new rows. A large enough library
+   * could exhaust that partition mid-scan; what a failed write does to this
+   * particular ubifs from there (not something this app can recover from
+   * gracefully either way) is consistent with the reported reboot. Moved to
+   * the SD card instead -- same MUSIC_ROOT_DIR the library itself lives on,
+   * so there's no plausible library size this device could hold that
+   * wouldn't also fit a cache of that library's own tags many times over.
+   * Safe to depend on the SD card being mounted here: metadata_db_open() is
+   * only ever called from gui_init() (see its own doc comment), which always
+   * runs after main()'s mount_sd_card_if_needed(). If the card genuinely
+   * isn't mounted, sqlite3_open() below just fails like any other open
+   * failure -- metadata_db_open() already treats that as a degraded-but-
+   * working no-cache state, not a fatal error, so this doesn't introduce a
+   * new failure mode on top of the existing SD-mount-failure handling
+   * (see main.c's own mount-retry/format-prompt logic). Dot-prefixed, same
+   * pattern as dlna_control.c's own .dlna_cast, so it doesn't clutter a
+   * plain directory listing of the card. */
+  #define METADATA_DB_PATH "/data/mnt/sd_0/.open_hiby_player_music.db"
 #endif
 
 /* The stock (closed-source) hiby_player's own on-disk library cache --
@@ -209,8 +231,59 @@ static void import_from_stock_player_db(void) {
 }
 #endif
 
+#ifndef HOST_BUILD
+/* One-time migration for anyone updating from before this file moved to the
+ * SD card (see METADATA_DB_PATH's own comment) -- without this, a device
+ * with an existing database at the old path would silently appear to lose
+ * every song_favorite/song_play_count/playlist/subsonic_server row (real
+ * user data, not just the rebuildable tag cache) the next time the app
+ * opens, since it would just create a fresh empty database at the new path
+ * instead. Plain read/copy/write rather than rename() -- the old and new
+ * paths are on different filesystems (ubifs vs. the SD card's vfat), and
+ * rename(2) can't cross that boundary (EXDEV). Only removes the old copy
+ * once every byte of the new one has been written successfully, so a
+ * failure partway through (e.g. the SD card filling up) leaves the original
+ * still in place to retry from, rather than losing both. */
+#define OLD_METADATA_DB_PATH "/usr/data/open_hiby_player_music.db"
+static void migrate_old_db_if_needed(void) {
+    if (access(METADATA_DB_PATH, F_OK) == 0) return; /* already migrated (or fresh install) */
+    if (access(OLD_METADATA_DB_PATH, F_OK) != 0) return; /* nothing to migrate */
+
+    FILE * in = fopen(OLD_METADATA_DB_PATH, "rb");
+    if (!in) return;
+    FILE * out = fopen(METADATA_DB_PATH, "wb");
+    if (!out) {
+        fclose(in);
+        return;
+    }
+
+    bool ok = true;
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            ok = false;
+            break;
+        }
+    }
+    ok = ok && !ferror(in);
+    fclose(in);
+    fclose(out);
+
+    if (ok) {
+        remove(OLD_METADATA_DB_PATH);
+    } else {
+        remove(METADATA_DB_PATH); /* don't leave a truncated/partial db at the new path */
+    }
+}
+#endif
+
 void metadata_db_open(void) {
     if (db) return;
+
+#ifndef HOST_BUILD
+    migrate_old_db_if_needed();
+#endif
 
     if (sqlite3_open(METADATA_DB_PATH, &db) != SQLITE_OK) {
         /* No cache is a degraded-but-working state (every scan just falls

@@ -112,6 +112,50 @@ task's output file and check for `Entering main event loop...` (clean
 start) vs. an error/crash. Separately confirm with `ps` that the process is
 actually running and `adb devices` still shows the device connected.
 
+## 4a. Launching a test binary that must survive a physical USB unplug
+
+Step 4's plain-foreground launch only stays alive because the adb *client*
+stays connected the whole time (via the Bash tool's `run_in_background:
+true`) -- the remote process is still a descendant of that one shell
+session. If the test itself requires physically unplugging the device (e.g.
+testing what happens when a suspend/idle timer fires while unplugged), that
+launch method is the wrong tool: confirmed on a real device (2026-08-14)
+that a real USB disconnect kills it every time, and that neither `setsid
+PROG &` nor `nohup PROG &` nor a double-backgrounded subshell (`(setsid
+PROG &) &`) survive it either, even though `setsid` alone genuinely does
+give the process its own session (confirmed via `/proc/<pid>/stat`) --
+session/process-group separation isn't what matters here; **parentage**
+is. All of those leave the process a descendant of the adb shell's own
+process tree, and something in that teardown path kills the whole tree,
+session or no session, once the connection genuinely drops (this device has
+no cgroups mounted, so it isn't a cgroup-based kill).
+
+What actually works: `start-stop-daemon` (present at `/sbin/start-stop-daemon`,
+a real double-forking daemonizer, not a shell trick) reparents the process
+directly to init (confirmed `ppid=1` via `/proc/<pid>/stat`, vs. remaining a
+child of the shell for every method above) -- genuinely outside the
+adb-launched process tree, not just in a different session within it.
+
+```
+adb shell "start-stop-daemon -S -b -m -p /usr/data/hiby_test.pid -x /bin/sh -- -c 'exec /usr/data/hiby_player_<tag>_test > /usr/data/hiby_test.log 2>&1'"
+```
+
+- `-b` backgrounds and double-forks; `-m -p <pidfile>` records the real
+  child's PID (needed since `-x /bin/sh` means the immediate exec target is
+  the wrapper shell, not the player itself -- reading the pidfile is more
+  reliable than grepping `ps` for the binary name).
+- Wrapping in `/bin/sh -c 'exec ... > logfile 2>&1'` is necessary because
+  `start-stop-daemon -x EXECUTABLE` execs the target directly with no shell
+  involved, so there's no other way to redirect its stdout/stderr
+  (DBG_LOG's output) to a file you can `cat` afterward.
+- Verify real detachment before trusting it, don't just assume the recipe
+  above is enough on faith: `cat /proc/$(cat /usr/data/hiby_test.pid)/stat
+  | awk '{print $4}'` should print `1`.
+
+Kill it the same way any other test binary is killed (`killall -9
+hiby_player_<tag>_test`) -- `start-stop-daemon`'s own `-K` mode is only
+needed if you want to match by pidfile/executable instead of by name.
+
 ## 5. Verify stability before handing back for interactive testing
 
 Don't assume "it launched" means "it's fine" -- watch it idle for at least
@@ -125,7 +169,7 @@ A few MB of RSS growth right after launch is normal (the image cache
 filling up to its ~4MB cap, LV_CACHE_DEF_SIZE in lv_conf.h). It should
 plateau, not keep climbing. If `free -m`'s `available` column keeps
 dropping every time you check, stop and investigate before doing anything
-else -- don't interact with a device that's actively leaking
+else -- don't let the user interact with a device that's actively leaking
 memory, it can freeze the whole thing (not just the app).
 
 ## 6. Watch `/usr/data` free space -- it's a 35.8MB partition
@@ -150,7 +194,7 @@ which otherwise looks like your cleanup "undid itself" after a crash.
 
 Don't leave a raw test binary running as the device's final state --
 relaunch the real thing via its normal init.d path (not the raw binary) so
-the device is left exactly as you would find it after a normal
+the device is left exactly as a real user would find it after a normal
 boot:
 
 ```
@@ -167,10 +211,10 @@ running before considering the session done.
 `adb devices` still showing the device but every `adb shell` command
 failing with `error: closed` means the **device** is in trouble, not the
 adb client -- restarting `adb kill-server && adb start-server` will not
-fix it. This is what a frozen device looks like over adb. Power cycle the
-device in this case.
+fix it. This is what a frozen device looks like over adb. Ask the user to
+check the physical screen and power-cycle if needed.
 
 If `adb devices` shows nothing at all for more than ~20-30s after a kill/
 launch command, that's consistent with an actual reboot in progress (not
 just a hung shell) -- see step 1's reboot-on-exit trap first before assuming
-something is wrong with the app under test. Re-enable ADB after reboot.
+something is wrong with the app under test.

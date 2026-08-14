@@ -28,7 +28,15 @@
  * radios_suspended logic already follows (in the common case, that same
  * logic has usually already suspended them by the time this fires, since
  * idle_shutdown_minutes is normally longer than RADIO_SUSPEND_DELAY_MS --
- * this just double-checks rather than assuming that always holds). */
+ * this just double-checks rather than assuming that always holds).
+ *
+ * The restore itself happens in a detached background thread, not inline
+ * before this function returns -- real-device bug report: with Bluetooth
+ * on, the inline version blocked the caller (the main GUI thread) for the
+ * ~10-13s bt_control_init_chip() firmware reflash takes, leaving the
+ * screen dark that whole time even though the kernel itself had already
+ * resumed. Callers can treat this function as returning right after the
+ * kernel wakes up; the radios catch up shortly after on their own. */
 void power_suspend_now(void);
 
 #endif /* POWER_SUSPEND_H */

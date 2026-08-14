@@ -15,6 +15,21 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Guards bt_control_init_chip()/bt_control_enable()/bt_control_disable() --
+ * the three functions that actually touch the physical chip (chip firmware
+ * flash, or the D-Bus adapter power toggle). Real-device incident: BT ended
+ * up permanently wedged (unrecoverable without a full reboot) after waking
+ * from suspend, traced to gui.c's own pre-existing radio-suspend/restore
+ * threads and power_suspend.c's post-resume restore thread both being able
+ * to call into these with no coordination between the two modules -- two
+ * concurrent chip operations racing each other, which this chip is already
+ * documented (see bt_control_disable()'s own comment on bt_suspend/
+ * bt_resume) not to tolerate. Held for the entire body of each of the three
+ * functions below, not just the individual subprocess_run() calls, so a
+ * caller can never observe or interleave with a partial chip operation from
+ * another thread. */
+static pthread_mutex_t bt_chip_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* Finds PIDs whose `ps` command line contains needle and kills them all
  * together. Shared by this file's wedge-recovery cleanup and
  * bt_control_apply_output_settings()'s bt-agent cleanup. Capped at 16 with
@@ -82,9 +97,22 @@ static void ensure_single_dbus_daemon(void) {
     remove("/var/run/messagebus.pid"); /* stale pidfile blocks a fresh start otherwise */
     usleep(300000);
 
-    char out[256];
-    char * argv[] = { (char *) "dbus-daemon", (char *) "--system", NULL };
-    subprocess_run(argv, out, sizeof(out));
+    /* Real-device incident: without --fork, this build of dbus-daemon
+     * doesn't daemonize -- it stays in the foreground indefinitely. This
+     * used to be launched with the blocking subprocess_run(), which waited
+     * out its full 15s timeout (freezing whichever thread called this --
+     * the main GUI thread, when reached via
+     * bt_control_recover_wedged_daemon()) and then SIGKILLed the
+     * dbus-daemon it had just started, leaving the system with no system
+     * bus at all. Confirmed live: `dbus-daemon --system` alone stayed
+     * foreground; `dbus-daemon --system --fork` returned immediately with
+     * the daemon still running. subprocess_spawn_daemon() (fire and
+     * forget, same as every other long-running daemon this file starts --
+     * bluetoothd, bluealsa) is the correct call shape regardless of --fork,
+     * but passing --fork too matches how a real dbus-daemon is meant to be
+     * started and costs nothing. */
+    char * argv[] = { (char *) "dbus-daemon", (char *) "--system", (char *) "--fork", NULL };
+    subprocess_spawn_daemon(argv);
     usleep(300000);
 }
 
@@ -286,8 +314,11 @@ static void ensure_bluealsa_running(void) {
 }
 
 bool bt_control_init_chip(void) {
+    pthread_mutex_lock(&bt_chip_mutex);
+
     if (bt_control_adapter_present()) {
         ensure_bluealsa_running();
+        pthread_mutex_unlock(&bt_chip_mutex);
         return true;
     }
 
@@ -296,7 +327,9 @@ bool bt_control_init_chip(void) {
     subprocess_run_timeout(bt_resume_argv, out, sizeof(out), BT_INIT_TIMEOUT_MS);
 
     ensure_bluealsa_running(); /* belt-and-suspenders: bt_resume already starts it, but confirm rather than assume */
-    return bt_control_adapter_present();
+    bool result = bt_control_adapter_present();
+    pthread_mutex_unlock(&bt_chip_mutex);
+    return result;
 }
 
 /* /usr/bin/bt_enable -- matches hiby_player's own confirmed strings rather
@@ -312,9 +345,11 @@ bool bt_control_init_chip(void) {
  * bt_control_init_chip()'s comment), bt_enable brings hci0 fully up in
  * about a second, no re-flash needed. */
 void bt_control_enable(void) {
+    pthread_mutex_lock(&bt_chip_mutex);
     char out[256];
     char * argv[] = { (char *) "/usr/bin/bt_enable", NULL };
     subprocess_run(argv, out, sizeof(out));
+    pthread_mutex_unlock(&bt_chip_mutex);
 }
 
 /* /usr/bin/bt_disable, NOT /usr/bin/bt_suspend, despite bt_suspend being
@@ -334,9 +369,11 @@ void bt_control_enable(void) {
  * later bt_enable can bring it back in ~1s with no re-flash -- this is the
  * safe pairing. */
 void bt_control_disable(void) {
+    pthread_mutex_lock(&bt_chip_mutex);
     char out[256];
     char * argv[] = { (char *) "/usr/bin/bt_disable", NULL };
     subprocess_run(argv, out, sizeof(out));
+    pthread_mutex_unlock(&bt_chip_mutex);
 }
 
 /* Parses "Paired: yes"/"Connected: yes" out of `bluetoothctl info <mac>`'s

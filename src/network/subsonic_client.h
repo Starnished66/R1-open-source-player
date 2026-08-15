@@ -34,6 +34,11 @@ typedef struct {
     char suffix[16]; /* file extension (no dot), e.g. "mp3"/"flac" -- the
                        * downloaded temp file needs this so the existing
                        * decoder dispatch (by extension) picks the right one */
+    char cover_art[64]; /* getCoverArt.view's own id param -- a DIFFERENT
+                          * value from id above (confirmed against a real
+                          * server, not assumed: id="7yjzu1an..." vs.
+                          * cover_art="mf-7yjzu1an..._212a3c00" for the same
+                          * song), empty if the server didn't send one */
     int track;
     int duration_seconds;
 } subsonic_song_t;
@@ -85,10 +90,19 @@ bool subsonic_get_playlists(const subsonic_server_t * server, subsonic_playlist_
 bool subsonic_get_playlist_songs(const subsonic_server_t * server, const char * playlist_id,
                                   subsonic_song_t ** out_songs, int * out_count);
 
-/* Builds the full stream.view URL (auth params included) for song_id --
- * pass straight to http_get_to_file() to download it before playback (see
- * README for why this project downloads-then-plays rather than decoding
- * a true network stream). */
+/* Builds the full stream.view URL (auth params included) for song_id.
+ * mp3/flac songs get played directly against this URL (see decoder_open()
+ * in audio.c); every other format is still downloaded first via
+ * http_get_to_file() before playback -- see subsonic_song_row_click_cb()
+ * in gui.c for which path a given song takes. */
 void subsonic_build_stream_url(const subsonic_server_t * server, const char * song_id, char * out_url, size_t out_url_size);
+
+/* Builds the full getCoverArt.view URL (auth params included) for
+ * cover_art_id (subsonic_song_t.cover_art, NOT the song's own id -- these
+ * are different values, see that field's own comment). Returns real
+ * JPEG/PNG image bytes when fetched (http_get_to_buffer()), suitable for
+ * the same cover_decode_to_rgb565() path local files' embedded art already
+ * goes through. */
+void subsonic_build_cover_art_url(const subsonic_server_t * server, const char * cover_art_id, char * out_url, size_t out_url_size);
 
 #endif /* SUBSONIC_CLIENT_H */

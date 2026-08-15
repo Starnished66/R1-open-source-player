@@ -231,6 +231,7 @@ bool subsonic_get_album_songs(const subsonic_server_t * server, const char * alb
         snprintf(songs[i].artist, sizeof(songs[i].artist), "%s", json_str(song_item, "artist", ""));
         snprintf(songs[i].album, sizeof(songs[i].album), "%s", json_str(song_item, "album", ""));
         snprintf(songs[i].suffix, sizeof(songs[i].suffix), "%s", json_str(song_item, "suffix", "mp3"));
+        snprintf(songs[i].cover_art, sizeof(songs[i].cover_art), "%s", json_str(song_item, "coverArt", ""));
         songs[i].track = json_int(song_item, "track", 0);
         songs[i].duration_seconds = json_int(song_item, "duration", 0);
         i++;
@@ -330,6 +331,7 @@ bool subsonic_get_playlist_songs(const subsonic_server_t * server, const char * 
         snprintf(songs[i].artist, sizeof(songs[i].artist), "%s", json_str(entry_item, "artist", ""));
         snprintf(songs[i].album, sizeof(songs[i].album), "%s", json_str(entry_item, "album", ""));
         snprintf(songs[i].suffix, sizeof(songs[i].suffix), "%s", json_str(entry_item, "suffix", "mp3"));
+        snprintf(songs[i].cover_art, sizeof(songs[i].cover_art), "%s", json_str(entry_item, "coverArt", ""));
         songs[i].track = json_int(entry_item, "track", 0);
         songs[i].duration_seconds = json_int(entry_item, "duration", 0);
         i++;
@@ -349,4 +351,14 @@ void subsonic_build_stream_url(const subsonic_server_t * server, const char * so
     url_encode(song_id, id_enc, sizeof(id_enc));
 
     snprintf(out_url, out_url_size, "%s/rest/stream.view?%s&id=%s", server->base_url, auth, id_enc);
+}
+
+void subsonic_build_cover_art_url(const subsonic_server_t * server, const char * cover_art_id, char * out_url, size_t out_url_size) {
+    char auth[512];
+    build_auth_query(server, auth, sizeof(auth));
+
+    char id_enc[256];
+    url_encode(cover_art_id, id_enc, sizeof(id_enc));
+
+    snprintf(out_url, out_url_size, "%s/rest/getCoverArt.view?%s&id=%s", server->base_url, auth, id_enc);
 }

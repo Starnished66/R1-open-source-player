@@ -16,7 +16,16 @@ void audio_init(void);
  * for explicit user actions (tapping a track, prev/next, initial pick), as
  * opposed to the audio thread's own automatic advance into a queued next
  * track (see audio_set_next_track()), which can gapless-handoff or
- * crossfade instead. Format is picked from the file extension. Clears any
+ * crossfade instead. Format is picked from the file extension -- except a
+ * path starting with "http://" or "https://", which is instead opened as a
+ * live network stream (internet radio) and always decoded as MP3
+ * regardless of what the URL looks like, the only decoder with a
+ * callback-based streaming API wired up so far (see decoder_open() in
+ * audio.c). A live stream reports a duration of 0 (see
+ * audio_get_duration_seconds()), can't be seeked, and never reaches true
+ * EOF, so auto-advance and gapless/crossfade into/out of it never engage --
+ * all by construction of total_frames staying 0, not a special case
+ * elsewhere. start_seconds is ignored for a stream. Clears any
  * previously staged next track -- the caller should call
  * audio_set_next_track() again right after, for whatever comes after path.
  * has_replaygain/replaygain_gain_db/has_replaygain_peak/replaygain_peak are

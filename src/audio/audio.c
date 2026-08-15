@@ -15,6 +15,7 @@
 #include "wma_decoder.h"
 #include "opus_decoder.h"
 #include "peq.h"
+#include "http_stream.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -68,13 +69,120 @@ typedef struct {
     unsigned int channels;
     unsigned int sample_rate;
     uint64_t total_frames;
+
+    /* Non-NULL only for a live network stream opened via a URL (see
+     * is_stream_url() below) -- decoder_close() must also tear this down,
+     * and decoder_seek() must refuse to seek while it's set (there's
+     * nothing to seek back to on a live source). type is still DECODER_MP3
+     * in that case: dr_mp3's decode/read calls don't care whether the
+     * drmp3* was opened against a local file or a read callback, only
+     * decoder_open()/decoder_close() need to know the difference. */
+    http_stream_t * net_stream;
 } decoder_t;
 
+/* A stream URL is never dispatched by file extension (see decoder_open()
+ * below) -- most internet radio URLs don't end in anything recognizable
+ * anyway (an opaque mount point, or a query string). */
+static bool is_stream_url(const char * path) {
+    return strncasecmp(path, "http://", 7) == 0 || strncasecmp(path, "https://", 8) == 0;
+}
+
+/* A trailing "#.<ext>" on a stream URL is a local-only format hint (never
+ * sent to the server -- http_conn_parse_url() strips it, see that
+ * function's own comment): the '#' can't legally appear in a Subsonic/
+ * plugin-built URL's own path or query otherwise (this app always
+ * percent-encodes it via url_encode()), so a literal one is unambiguously
+ * ours. Absent a hint, MP3 stays the default (unchanged from before this
+ * hint existed, so plain internet-radio URLs work exactly as before). */
+static const char * stream_format_hint(const char * url) {
+    const char * frag = strrchr(url, '#');
+    return frag ? frag + 1 : NULL;
+}
+
+static size_t stream_read_cb(void * user_data, void * buf, size_t bytes_to_read) {
+    return http_stream_read((http_stream_t *) user_data, buf, bytes_to_read);
+}
+
+/* FLAC's onSeek is NOT optional (unlike dr_mp3's) -- drflac_open() itself
+ * requires a non-NULL callback. Passing onTell=NULL below skips the only
+ * place dr_flac would ever ask for an absolute/backward seek (the
+ * SEEK_END-then-SEEK_SET-back file-size sanity check in
+ * drflac__read_and_decode_metadata(), gated on "onTell != NULL && onSeek !=
+ * NULL" -- confirmed by reading dr_flac.h directly, not assumed), so this
+ * only ever needs to handle a DRFLAC_SEEK_CUR forward skip (used to skip
+ * past metadata blocks this app doesn't care about -- PADDING, SEEKTABLE,
+ * CUESHEET, PICTURE, VORBIS_COMMENT since onMeta is also NULL here). A live
+ * stream can't seek backward at all, so anything else fails cleanly rather
+ * than silently doing the wrong thing. */
+static drflac_bool32 flac_stream_seek_cb(void * user_data, int offset, drflac_seek_origin origin) {
+    if (origin != DRFLAC_SEEK_CUR || offset < 0) return DRFLAC_FALSE;
+    uint8_t discard[1024];
+    int remaining = offset;
+    while (remaining > 0) {
+        size_t take = (size_t) remaining < sizeof(discard) ? (size_t) remaining : sizeof(discard);
+        if (http_stream_read((http_stream_t *) user_data, discard, take) != take) return DRFLAC_FALSE;
+        remaining -= (int) take;
+    }
+    return DRFLAC_TRUE;
+}
+
 static bool decoder_open(decoder_t * dec, const char * path) {
+    memset(dec, 0, sizeof(*dec));
+
+    if (is_stream_url(path)) {
+        const char * hint = stream_format_hint(path);
+        bool is_flac = hint && strcasecmp(hint, ".flac") == 0;
+
+        /* Live network stream -- MP3 and FLAC both have a callback-based
+         * streaming API already available in their vendored decoders (see
+         * flac_stream_seek_cb()'s own comment for FLAC's real seek
+         * requirement, and drmp3_init()'s tolerance of NULL onSeek/onTell
+         * for MP3). Everything else either prescans the whole file up front
+         * (fundamentally incompatible with an infinite/unbounded source) or
+         * has no callback abstraction available at all -- see audio.h's
+         * own top comment. Absent a recognized hint, MP3 is the default
+         * (matches this feature's original internet-radio-only behavior). */
+        dec->net_stream = http_stream_open(path, true);
+        if (!dec->net_stream) return false;
+
+        if (is_flac) {
+            dec->type = DECODER_FLAC;
+            dec->as.flac = drflac_open(stream_read_cb, flac_stream_seek_cb, NULL, dec->net_stream, NULL);
+            if (!dec->as.flac) {
+                http_stream_close(dec->net_stream);
+                dec->net_stream = NULL;
+                return false;
+            }
+            dec->channels = dec->as.flac->channels;
+            dec->sample_rate = dec->as.flac->sampleRate;
+            /* Unlike MP3, this is a REAL, authoritative count straight from
+             * the STREAMINFO metadata block (near the top of the file, not
+             * a full-stream prescan) -- safe to use for real, matching
+             * local FLAC playback below. Gives a Subsonic FLAC stream a
+             * correct duration/progress bar for free, unlike MP3 streams
+             * (which have no equivalent authoritative source without a
+             * full prescan, so those stay at the unknown-duration 0 below). */
+            dec->total_frames = dec->as.flac->totalPCMFrameCount;
+            return true;
+        }
+
+        dec->type = DECODER_MP3;
+        dec->as.mp3 = malloc(sizeof(drmp3));
+        if (!dec->as.mp3 || !drmp3_init(dec->as.mp3, stream_read_cb, NULL, NULL, NULL, dec->net_stream, NULL)) {
+            free(dec->as.mp3);
+            dec->as.mp3 = NULL;
+            http_stream_close(dec->net_stream);
+            dec->net_stream = NULL;
+            return false;
+        }
+        dec->channels = dec->as.mp3->channels;
+        dec->sample_rate = dec->as.mp3->sampleRate;
+        dec->total_frames = 0; /* unknown/unbounded -- never prescan a live stream (see drmp3_get_pcm_frame_count() below) */
+        return true;
+    }
+
     const char * ext = strrchr(path, '.');
     if (!ext) return false;
-
-    memset(dec, 0, sizeof(*dec));
 
     if (strcasecmp(ext, ".flac") == 0) {
         dec->type = DECODER_FLAC;
@@ -225,6 +333,7 @@ static uint64_t decoder_read_s16(decoder_t * dec, uint64_t frames, int16_t * buf
 }
 
 static void decoder_seek(decoder_t * dec, uint64_t frame) {
+    if (dec->net_stream) return; /* live stream -- nothing to seek back to, onSeek is NULL */
     switch (dec->type) {
         case DECODER_FLAC: drflac_seek_to_pcm_frame(dec->as.flac, frame); break;
         case DECODER_MP3:  drmp3_seek_to_pcm_frame(dec->as.mp3, frame); break;
@@ -243,9 +352,11 @@ static void decoder_close(decoder_t * dec) {
     switch (dec->type) {
         case DECODER_FLAC:
             if (dec->as.flac) drflac_close(dec->as.flac);
+            if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_MP3:
             if (dec->as.mp3) { drmp3_uninit(dec->as.mp3); free(dec->as.mp3); }
+            if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_WAV:
             if (dec->as.wav) { drwav_uninit(dec->as.wav); free(dec->as.wav); }

@@ -437,6 +437,17 @@ static void apply_accent_color(uint32_t rgb) {
     current_settings.accent_color = rgb;
     lv_style_set_bg_color(&style_accent, lv_color_hex(rgb));
     lv_style_set_text_color(&style_accent, lv_color_hex(rgb));
+    /* Real-device bug report: accent color wasn't applying to the volume
+     * popup slider, the quick-drawer brightness slider, or the player
+     * screen's scrub bar -- those three, unlike every other slider/switch
+     * in the app, are built from fixed-art bg_image_src assets
+     * (volume/vol_progress.png, playing_plane/progress.png) rather than a
+     * plain bg_color fill, so style_accent's bg_color alone never touched
+     * them. bg_image_recolor tints an image in place (same "shared style,
+     * one update point" mechanism as everything else here) -- see those
+     * three sliders' own lv_obj_add_style(..., &style_accent, ...) calls. */
+    lv_style_set_bg_image_recolor(&style_accent, lv_color_hex(rgb));
+    lv_style_set_bg_image_recolor_opa(&style_accent, LV_OPA_COVER);
     /* Modifying a shared lv_style_t's properties in place doesn't by
      * itself invalidate the objects that reference it -- LVGL needs an
      * explicit nudge to know to redraw them (confirmed empirically: without
@@ -1701,6 +1712,11 @@ static void build_volume_popup(void) {
     lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/vol_bg.png"), LV_PART_MAIN);
     lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/vol_progress.png"), LV_PART_INDICATOR);
     lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
+    /* Real-device bug report: accent color didn't apply here -- see
+     * apply_accent_color()'s own comment on why an image-art slider needs
+     * bg_image_recolor, not just bg_color. */
+    lv_obj_add_style(volume_popup_track, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_style(volume_popup_track, &style_accent, LV_PART_KNOB);
     lv_obj_set_style_width(volume_popup_track, 30, LV_PART_KNOB);
     lv_obj_set_style_height(volume_popup_track, 30, LV_PART_KNOB);
     /* Clickable by default (lv_slider_create()) -- drag/touch-able, not
@@ -3083,6 +3099,11 @@ static void build_quick_drawer(void) {
     lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/vol_bg.png"), LV_PART_MAIN);
     lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/vol_progress.png"), LV_PART_INDICATOR);
     lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
+    /* Real-device bug report: accent color didn't apply here -- see
+     * apply_accent_color()'s own comment on why an image-art slider needs
+     * bg_image_recolor, not just bg_color. */
+    lv_obj_add_style(quick_drawer_brightness_track, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_style(quick_drawer_brightness_track, &style_accent, LV_PART_KNOB);
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_KNOB);
@@ -4470,6 +4491,8 @@ static void resume_from_suspend_fixups(void) {
  * forward-declared here since update_timer_cb() (just below) needs it for
  * the remote-control play-by-index consumer. */
 static void all_songs_row_click_cb(int index);
+static int all_songs_count;
+static int * all_songs_sort_order;
 
 /* Defined with the rest of the power-off countdown popup, much further
  * down -- forward-declared here since update_timer_cb() (just below) needs
@@ -4584,10 +4607,33 @@ static void update_timer_cb(lv_timer_t * timer) {
     }
     int remote_play_index;
     if (remote_control_consume_play_index(&remote_play_index)) {
+        /* Real-device bug report: the remote control web UI played the
+         * wrong song when one was tapped. Root cause: remote_play_index is
+         * a raw scan-order index into all_songs_paths/all_song_tags
+         * (remote_control.c's own library index space -- see
+         * remote_control_sync_library()'s doc comment, every other
+         * consumer there, like playlist add/remove, indexes the same way),
+         * but all_songs_row_click_cb() below expects a position in
+         * all_songs_sort_order, the alphabetically *sorted display* order
+         * the on-device All Songs screen and its A-Z index use -- a
+         * different index space. Passing the raw index straight through
+         * played whatever song happened to sit at that same numeric
+         * position in the sorted list instead, which is virtually always
+         * a different song. Translate by finding this song's actual
+         * position in the sorted display order first, same shape as
+         * search_remap_index()'s own index translation just inside that
+         * callback. */
+        int remote_play_display_index = -1;
+        for (int i = 0; i < all_songs_count; i++) {
+            if (all_songs_sort_order[i] == remote_play_index) {
+                remote_play_display_index = i;
+                break;
+            }
+        }
         /* Same handler the All Songs screen's own rows use -- builds a
          * fresh playlist from the whole library and starts at this index,
          * exactly like tapping that row there. */
-        all_songs_row_click_cb(remote_play_index);
+        if (remote_play_display_index >= 0) all_songs_row_click_cb(remote_play_display_index);
     }
 
     /* Auto-stop on headphone-output loss: this hardware has no built-in
@@ -5551,6 +5597,11 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_bg_image_src(progress_slider, asset_path("playing_plane/progress_bg.png"), LV_PART_MAIN);
     lv_obj_set_style_bg_image_src(progress_slider, asset_path("playing_plane/progress.png"), LV_PART_INDICATOR);
     lv_obj_set_style_bg_image_src(progress_slider, asset_path("playing_plane/cursor.png"), LV_PART_KNOB);
+    /* Real-device bug report: accent color didn't apply here -- see
+     * apply_accent_color()'s own comment on why an image-art slider needs
+     * bg_image_recolor, not just bg_color. */
+    lv_obj_add_style(progress_slider, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_style(progress_slider, &style_accent, LV_PART_KNOB);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_KNOB);
@@ -15030,6 +15081,8 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     lv_style_init(&style_accent);
     lv_style_set_bg_color(&style_accent, accent_lv_color());
     lv_style_set_text_color(&style_accent, accent_lv_color());
+    lv_style_set_bg_image_recolor(&style_accent, accent_lv_color());
+    lv_style_set_bg_image_recolor_opa(&style_accent, LV_OPA_COVER);
 
     lv_style_init(&style_muted_text);
     lv_style_set_text_color(&style_muted_text, lv_color_make(220, 220, 220));

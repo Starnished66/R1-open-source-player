@@ -7,6 +7,25 @@
 lv_style_t list_row_style;
 lv_style_t list_row_pressed_style;
 
+/* Theming: three shared, mutable-in-place bg_color styles, one per
+ * "background category" the app has -- every screen root
+ * (style_theme_screen_bg), every popup/EQ-card/slider-card
+ * (style_theme_card_bg), and every list row (list_row_style itself,
+ * reused directly -- no separate style needed, its bg_color just needs to
+ * become live-mutable too). Declared here (not gui.c) since screen_builders.c
+ * already owns list_row_style, the one existing precedent for a style
+ * shared across both files; gui.c's plugin_manager bridge
+ * (gui_plugin_set_background_color()) mutates whichever of these three a
+ * plugin's plugin.set_background_color() call names, then
+ * lv_obj_report_style_change()s it -- the exact same "shared style updated
+ * in place + report_style_change" mechanism apply_accent_color() already
+ * uses successfully for the app's existing accent color feature. Not
+ * style_accent itself: that style already claims bg_color for its own
+ * purpose (slider/switch fill), so reusing it here would wrongly tie
+ * every screen's background to whatever accent color is picked. */
+lv_style_t style_theme_screen_bg;
+lv_style_t style_theme_card_bg;
+
 void screen_builders_init_list_row_style(void) {
     lv_style_init(&list_row_style);
     lv_style_set_width(&list_row_style, LIST_ROW_WIDTH);
@@ -33,13 +52,24 @@ void screen_builders_init_list_row_style(void) {
      * quick tap, not just a held press. */
     lv_style_init(&list_row_pressed_style);
     lv_style_set_bg_color(&list_row_pressed_style, lv_color_make(60, 60, 64));
-}
 
-/* True black -- every icon-grid/pill-list tile has a transparent background
- * (bg_opa=0), so this color always shows through around/between them. A
- * near-black (18,18,22) created a visible seam against real-device testing
- * showing the icon assets' own baked-in black canvas, hence pure black. */
-#define SCREEN_BG_COLOR lv_color_make(0, 0, 0)
+    /* Default values match this app's own existing look before theming
+     * existed: true black for screens (every icon-grid/pill-list tile has
+     * a transparent background, bg_opa=0, so this color always shows
+     * through around/between them -- a near-black (18,18,22) created a
+     * visible seam against real-device testing showing the icon assets'
+     * own baked-in black canvas, hence pure black), and the popup/EQ-card
+     * gray every one of those already converged on by real-device
+     * feedback (see the EQ screen's own former EQ_CARD_COLOR comment
+     * history in gui.c) for cards. gui.c keeps its own separate
+     * SCREEN_BG_COLOR copy for gui_show_boot_splash(), which runs before
+     * this function (and style_theme_screen_bg) ever does -- see that
+     * function's own comment. */
+    lv_style_init(&style_theme_screen_bg);
+    lv_style_set_bg_color(&style_theme_screen_bg, lv_color_make(0, 0, 0));
+    lv_style_init(&style_theme_card_bg);
+    lv_style_set_bg_color(&style_theme_card_bg, lv_color_make(32, 32, 32));
+}
 
 /* Generous upper bound on rows for a 2-column icon grid -- every real
  * screen using build_icon_grid_screen tops out at 6 items (3 rows). */
@@ -133,7 +163,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
     int32_t target_icon_px = (ICON_GRID_TARGET_ICON_PX * icon_scale_percent) / 100;
 
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     /* NULL back_btn_cb means "this screen has nothing to go back to" (the
      * Home launcher) -- skip the arrow entirely rather than drawing a dead
@@ -375,7 +405,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
                                    lv_style_t * toggle_accent_style) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     /* NULL back_btn_cb means "this screen has nothing to go back to" (the
      * Home launcher) -- skip the arrow entirely rather than drawing a dead
@@ -407,7 +437,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
          * corners, since bg_opa=COVER is needed for the image itself to
          * draw at all and also fills the object's full square bounding
          * box underneath it. */
-        lv_obj_set_style_bg_color(row, SCREEN_BG_COLOR, 0);
+        lv_obj_add_style(row, &style_theme_screen_bg, 0);
         lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
@@ -758,7 +788,7 @@ lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_
                                       lv_obj_t ** out_list, int32_t row_width, bool enable_now_playing,
                                       lv_color_t now_playing_color) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     if (back_btn_cb) build_back_button(scr, back_btn_cb);
     build_title(scr, title);

@@ -37,4 +37,12 @@ void gui_plugin_play_paths(const char * const * paths, int count, int start_inde
  * queue"). */
 void gui_plugin_show_toast(const char * msg);
 
+/* Sets one of the three shared background-color styles (screen_builders.h's
+ * style_theme_screen_bg/style_theme_card_bg, or list_row_style itself for
+ * "list_row") live, app-wide -- slot must be "screen", "card", or
+ * "list_row" (plugin_manager.c's l_plugin_set_background_color() already
+ * validates this before calling here, so this trusts its caller). rgb is
+ * a packed 0xRRGGBB value. */
+void gui_plugin_set_background_color(const char * slot, uint32_t rgb);
+
 #endif /* GUI_H */

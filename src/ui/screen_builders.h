@@ -92,6 +92,17 @@ extern lv_style_t list_row_style;
  * see screen_builders_init_list_row_style()'s own comment on why this is a
  * separate style rather than folded into list_row_style itself. */
 extern lv_style_t list_row_pressed_style;
+/* Theming: shared, mutable bg_color styles for the app's other two
+ * "background categories" -- attach with lv_obj_add_style(x, &style_theme_screen_bg, 0)
+ * on every screen root, or &style_theme_card_bg on every popup/EQ-card/
+ * slider-card. Initialized (with this app's original default colors)
+ * alongside list_row_style by screen_builders_init_list_row_style() below
+ * -- see its own comment for why these three specifically, and why not
+ * gui.c's style_accent. gui.c's gui_plugin_set_background_color() is what
+ * actually mutates these later, in response to a plugin's
+ * plugin.set_background_color() call. */
+extern lv_style_t style_theme_screen_bg;
+extern lv_style_t style_theme_card_bg;
 void screen_builders_init_list_row_style(void);
 
 typedef struct {

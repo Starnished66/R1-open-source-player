@@ -22,6 +22,19 @@
  * (see audio_books_row_cb()) rather than listing tiles anywhere itself. */
 #define PLUGIN_MAX_TILES 16
 
+/* Upper bound on how many tiles all plugins combined may register via
+ * plugin.register_stream_media_tile() -- a SEPARATE registry from
+ * plugin_tiles[]/PLUGIN_MAX_TILES above (different Lua function, different
+ * surface). Stream Media has exactly one built-in tile (Subsonic) after
+ * this session's Qobuz/Tidal/Net Radio cleanup, so unlike Home (already
+ * full at 6, can't scroll) it has real room -- capped at 5 to keep the
+ * total at 6, the same "fills exactly 3 rows, no scroll" ceiling proven
+ * out for Home. gui.c's build_stream_media_screen() sizes its own static
+ * items[] array off this (1 built-in + this many plugin tiles), same
+ * reasoning as PLUGIN_MAX_TILES's own comment on icon_grid_item_t having
+ * no runtime-append API. */
+#define PLUGIN_MAX_STREAM_TILES 5
+
 /* Scans <SD card>/.plugins/ for .lua files and loads each one, discovering
  * the tiles they register via plugin.register_tile() during load. Should
  * run before anything might dispatch a tile tap (gui_init() calls it early,
@@ -48,5 +61,15 @@ void plugin_manager_tile_clicked(int index);
  * with a 1-based Lua index. No-op if no plugin.show_list() call is still
  * "current" (i.e. none has ever been made yet). */
 void plugin_manager_list_item_selected(int index);
+
+/* Same shape as the plugin_manager_get_tile_* / plugin_manager_tile_clicked
+ * family above, but for the separate plugin.register_stream_media_tile()
+ * registry -- gui.c's build_stream_media_screen() reads these to append
+ * plugin-registered tiles after the built-in Subsonic one. */
+int plugin_manager_get_stream_tile_count(void);
+const char * plugin_manager_get_stream_tile_label(int index);
+const char * plugin_manager_get_stream_tile_icon(int index);
+const char * plugin_manager_get_stream_tile_icon_selected(int index);
+void plugin_manager_stream_tile_clicked(int index);
 
 #endif /* PLUGIN_MANAGER_H */

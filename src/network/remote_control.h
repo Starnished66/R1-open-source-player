@@ -2,6 +2,7 @@
 #define REMOTE_CONTROL_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 /* Phone remote-control feature: a small hand-rolled HTTP/1.1 server
  * serving a static Now Playing web page and a JSON API (status polling,
@@ -68,8 +69,16 @@ void remote_control_sync_library(const char * const * titles, const char * const
 
 /* Same edge-triggered convention as remote_control_consume_seek() --
  * out_index is an index into the array remote_control_sync_library() was
- * last called with. */
-bool remote_control_consume_play_index(int * out_index);
+ * last called with. out_playlist/out_artist/out_album_artist/out_album are
+ * always written (empty string if the request carried no such context, the
+ * "whole library" case) -- see request_play_playlist_name's own comment in
+ * remote_control.c for why these exist: they let the caller scope the
+ * playback queue to whichever Album/Playlist/Artist view the song was
+ * actually tapped from, matching the on-device Group Songs/Playlist
+ * screens, instead of always queuing the entire library. */
+bool remote_control_consume_play_index(int * out_index, char * out_playlist, size_t playlist_size,
+                                        char * out_artist, size_t artist_size, char * out_album_artist,
+                                        size_t album_artist_size, char * out_album, size_t album_size);
 
 /* Playlist mutation (create a playlist / add a song to an existing one),
  * mirroring gui.c's in-app "Add to Playlist" flow (same PLAYLISTS_DIR,

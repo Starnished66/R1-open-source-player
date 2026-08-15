@@ -51,6 +51,24 @@ static bool request_has_volume = false;
 static int request_volume_percent = 0;
 static bool request_has_play_index = false;
 static int request_play_index = 0;
+/* Real-device bug report: playing a song from the web UI always built the
+ * playback queue from the whole library (alphabetical, whatever play_mode
+ * happens to be), regardless of which Album/Playlist the song was actually
+ * tapped from -- reads as "it ignores the list I picked from and just
+ * shuffles/plays through everything" even though play_mode itself was
+ * always honored correctly, just against the wrong (too-broad) queue. The
+ * web UI already fetches each of these views with the exact same artist/
+ * album_artist/album/playlist context (see build_library_json()'s own
+ * filters and /api/playlists/songs), so /api/playback/play now accepts the
+ * same params echoed back -- empty/absent means "whole library", same as
+ * today. gui.c resolves these into the same artist_groups/album_groups/
+ * album_artist_groups or .m3u file its own on-device Artist/Album/Playlist
+ * screens already use, so a remote play scopes next/prev identically to
+ * tapping that song on the device itself. */
+static char request_play_playlist_name[128] = "";
+static char request_play_artist_filter[128] = "";
+static char request_play_album_artist_filter[128] = "";
+static char request_play_album_filter[128] = "";
 
 /* This server's own copy of gui.c's library title/artist strings, kept in
  * the exact same index order (see remote_control_sync_library() in the
@@ -137,12 +155,18 @@ bool remote_control_consume_volume(int * out_percent) {
     return result;
 }
 
-bool remote_control_consume_play_index(int * out_index) {
+bool remote_control_consume_play_index(int * out_index, char * out_playlist, size_t playlist_size,
+                                        char * out_artist, size_t artist_size, char * out_album_artist,
+                                        size_t album_artist_size, char * out_album, size_t album_size) {
     pthread_mutex_lock(&status_mutex);
     bool result = request_has_play_index;
     if (result) {
         request_has_play_index = false;
         *out_index = request_play_index;
+        snprintf(out_playlist, playlist_size, "%s", request_play_playlist_name);
+        snprintf(out_artist, artist_size, "%s", request_play_artist_filter);
+        snprintf(out_album_artist, album_artist_size, "%s", request_play_album_artist_filter);
+        snprintf(out_album, album_size, "%s", request_play_album_filter);
     }
     pthread_mutex_unlock(&status_mutex);
     return result;
@@ -561,7 +585,7 @@ static const char * const NOW_PLAYING_HTML =
     "<input type=\"text\" id=\"search\" placeholder=\"Search library...\" style=\"display:none\">"
     "<div id=\"content\"></div>"
     "<script>"
-    "var view='menu',artistKind=null,artistName=null,libOffset=0,libQuery='';"
+    "var view='menu',artistKind=null,artistName=null,libOffset=0,libQuery='',playContext='';"
     "function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}"
     "function post(path){fetch(path,{method:'POST'}).catch(()=>{});}"
     "function addToPlaylist(index){"
@@ -599,7 +623,7 @@ static const char * const NOW_PLAYING_HTML =
     "thumb.src='/api/art?index='+s.index;"
     "var info=document.createElement('div');info.className='info';"
     "info.innerHTML='<div class=\"t\">'+esc(s.title)+'</div><div class=\"a\">'+esc(s.artist)+'</div>';"
-    "info.onclick=function(){post('/api/playback/play?index='+s.index);};"
+    "info.onclick=function(){post('/api/playback/play?index='+s.index+playContext);};"
     "var add=document.createElement('div');add.className='add';add.textContent='+';"
     "add.onclick=function(e){e.stopPropagation();addToPlaylist(s.index);};"
     "row.appendChild(thumb);row.appendChild(info);row.appendChild(add);return row;}"
@@ -640,15 +664,17 @@ static const char * const NOW_PLAYING_HTML =
     "}).catch(()=>{});}"
     "function showAlbumSongs(album){"
     "view='album_songs';setHeader(true,album);"
-    "var url='/api/library?limit=200&'+(artistKind==='artist'?'artist=':'album_artist=')+"
-    "encodeURIComponent(artistName)+'&album='+encodeURIComponent(album);"
+    "var kindParam=(artistKind==='artist'?'artist=':'album_artist=')+encodeURIComponent(artistName);"
+    "playContext='&'+kindParam+'&album='+encodeURIComponent(album);"
+    "var url='/api/library?limit=200&'+kindParam+'&album='+encodeURIComponent(album);"
     "fetch(url).then(r=>r.json()).then(function(d){renderRows(d.songs,songRow);}).catch(()=>{});}"
     "function showPlaylistSongs(name){"
     "view='playlist_songs';setHeader(true,name);"
+    "playContext='&playlist='+encodeURIComponent(name);"
     "fetch('/api/playlists/songs?name='+encodeURIComponent(name)).then(r=>r.json()).then(function(d){"
     "renderRows(d.songs,songRow);}).catch(()=>{});}"
     "function showAllSongs(){"
-    "view='all_songs';setHeader(true,'All Songs');"
+    "view='all_songs';setHeader(true,'All Songs');playContext='';"
     "var s=document.getElementById('search');s.style.display='block';s.value='';libQuery='';"
     "loadLibrary(true);}"
     "function loadLibrary(reset){"
@@ -1183,6 +1209,24 @@ static void handle_connection(int cfd) {
                 if (query_param_int(path, "index", &index) && index >= 0 && index < library_count) {
                     request_has_play_index = true;
                     request_play_index = index;
+
+                    char raw[128];
+                    request_play_playlist_name[0] = '\0';
+                    request_play_artist_filter[0] = '\0';
+                    request_play_album_artist_filter[0] = '\0';
+                    request_play_album_filter[0] = '\0';
+                    if (query_param_str(path, "playlist", raw, sizeof(raw))) {
+                        url_decode(raw, request_play_playlist_name, sizeof(request_play_playlist_name));
+                    }
+                    if (query_param_str(path, "artist", raw, sizeof(raw))) {
+                        url_decode(raw, request_play_artist_filter, sizeof(request_play_artist_filter));
+                    }
+                    if (query_param_str(path, "album_artist", raw, sizeof(raw))) {
+                        url_decode(raw, request_play_album_artist_filter, sizeof(request_play_album_artist_filter));
+                    }
+                    if (query_param_str(path, "album", raw, sizeof(raw))) {
+                        url_decode(raw, request_play_album_filter, sizeof(request_play_album_filter));
+                    }
                 } else {
                     ok = false;
                 }

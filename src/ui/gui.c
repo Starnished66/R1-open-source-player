@@ -448,6 +448,13 @@ static void apply_accent_color(uint32_t rgb) {
      * three sliders' own lv_obj_add_style(..., &style_accent, ...) calls. */
     lv_style_set_bg_image_recolor(&style_accent, lv_color_hex(rgb));
     lv_style_set_bg_image_recolor_opa(&style_accent, LV_OPA_COVER);
+    /* image_recolor (distinct LVGL property from bg_image_recolor above) is
+     * what a plain lv_image_create() widget reads -- needed for toggle rows
+     * built once at startup and never rebuilt (e.g. remote_control_toggle_img),
+     * which can't just re-read accent_lv_color() on a later screen visit the
+     * way a repopulated list (add_pill_toggle_row()) can. */
+    lv_style_set_image_recolor(&style_accent, lv_color_hex(rgb));
+    lv_style_set_image_recolor_opa(&style_accent, LV_OPA_COVER);
     /* Modifying a shared lv_style_t's properties in place doesn't by
      * itself invalidate the objects that reference it -- LVGL needs an
      * explicit nudge to know to redraw them (confirmed empirically: without
@@ -4493,6 +4500,12 @@ static void resume_from_suspend_fixups(void) {
 static void all_songs_row_click_cb(int index);
 static int all_songs_count;
 static int * all_songs_sort_order;
+/* Defined with the rest of the remote-control scoped-play machinery, much
+ * further down (needs find_song_index_by_path()/artist_groups/etc. already
+ * in scope) -- forward-declared here since update_timer_cb() (just below)
+ * needs it for the remote-control play-by-index consumer. */
+static void play_remote_control_song(int song_index, const char * playlist_name, const char * artist_filter,
+                                      const char * album_artist_filter, const char * album_filter);
 
 /* Defined with the rest of the power-off countdown popup, much further
  * down -- forward-declared here since update_timer_cb() (just below) needs
@@ -4606,34 +4619,21 @@ static void update_timer_cb(lv_timer_t * timer) {
         refresh_volume_topbar(remote_volume_percent);
     }
     int remote_play_index;
-    if (remote_control_consume_play_index(&remote_play_index)) {
-        /* Real-device bug report: the remote control web UI played the
-         * wrong song when one was tapped. Root cause: remote_play_index is
-         * a raw scan-order index into all_songs_paths/all_song_tags
-         * (remote_control.c's own library index space -- see
-         * remote_control_sync_library()'s doc comment, every other
-         * consumer there, like playlist add/remove, indexes the same way),
-         * but all_songs_row_click_cb() below expects a position in
-         * all_songs_sort_order, the alphabetically *sorted display* order
-         * the on-device All Songs screen and its A-Z index use -- a
-         * different index space. Passing the raw index straight through
-         * played whatever song happened to sit at that same numeric
-         * position in the sorted list instead, which is virtually always
-         * a different song. Translate by finding this song's actual
-         * position in the sorted display order first, same shape as
-         * search_remap_index()'s own index translation just inside that
-         * callback. */
-        int remote_play_display_index = -1;
-        for (int i = 0; i < all_songs_count; i++) {
-            if (all_songs_sort_order[i] == remote_play_index) {
-                remote_play_display_index = i;
-                break;
-            }
-        }
-        /* Same handler the All Songs screen's own rows use -- builds a
-         * fresh playlist from the whole library and starts at this index,
-         * exactly like tapping that row there. */
-        if (remote_play_display_index >= 0) all_songs_row_click_cb(remote_play_display_index);
+    char remote_play_playlist[128], remote_play_artist[128], remote_play_album_artist[128], remote_play_album[128];
+    if (remote_control_consume_play_index(&remote_play_index, remote_play_playlist, sizeof(remote_play_playlist),
+                                           remote_play_artist, sizeof(remote_play_artist), remote_play_album_artist,
+                                           sizeof(remote_play_album_artist), remote_play_album,
+                                           sizeof(remote_play_album))) {
+        /* remote_play_index is a raw scan-order index into all_songs_paths/
+         * all_song_tags (remote_control.c's own library index space -- see
+         * remote_control_sync_library()'s doc comment). play_remote_control_
+         * song() (defined with the rest of the remote-control scoped-play
+         * machinery, much further down) resolves both this and the
+         * playlist/artist/album context into the right playlist and
+         * position, falling back to the whole library (same translation
+         * this used to do inline) when no scope applies. */
+        play_remote_control_song(remote_play_index, remote_play_playlist, remote_play_artist,
+                                  remote_play_album_artist, remote_play_album);
     }
 
     /* Auto-stop on headphone-output loss: this hardware has no built-in
@@ -6482,14 +6482,27 @@ static lv_obj_t * group_songs_now_playing_bar;
 /* clear_player_source()/set_player_source_all_songs() etc. are defined
  * right after on_file_selected() -- this one needs group_songs_indices/
  * count/title_label above already in scope, which those didn't. */
-static void set_player_source_group_songs(int pos) {
+/* Split out of set_player_source_group_songs() below so a caller that has
+ * its own indices/title -- not the on-device Group Songs screen's own
+ * group_songs_indices/title_label -- can set the same source kind without
+ * touching that screen's shared, mutable display state. Used by remote
+ * control's scoped play (play_remote_control_song()), which deliberately
+ * never nav_pushes group_songs_screen and so must not reuse (and risk
+ * corrupting, via rebuild_playlist_m3u_group()'s free()+realloc, out from
+ * under whatever that screen currently has on-device) its live globals. */
+static void set_player_source_group_songs_direct(const int * indices, int count, const char * title, int pos) {
     clear_player_source();
     player_source_kind = PLAYER_SOURCE_GROUP_SONGS;
-    player_source_group_title = strdup(lv_label_get_text(group_songs_title_label));
-    player_source_group_indices = malloc(sizeof(int) * (size_t) group_songs_count);
-    memcpy(player_source_group_indices, group_songs_indices, sizeof(int) * (size_t) group_songs_count);
-    player_source_group_count = group_songs_count;
+    player_source_group_title = strdup(title);
+    player_source_group_indices = malloc(sizeof(int) * (size_t) count);
+    memcpy(player_source_group_indices, indices, sizeof(int) * (size_t) count);
+    player_source_group_count = count;
     player_source_group_pos = pos;
+}
+
+static void set_player_source_group_songs(int pos) {
+    set_player_source_group_songs_direct(group_songs_indices, group_songs_count,
+                                          lv_label_get_text(group_songs_title_label), pos);
 }
 
 /* Playlist design change: user .m3u playlists needed a way to remove a song
@@ -8032,6 +8045,16 @@ static lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text
     lv_obj_t * toggle_img = lv_image_create(row);
     lv_image_set_src(toggle_img, asset_path(checked ? "settings/on.png" : "settings/off.png"));
     lv_obj_align(toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
+    /* Real-device bug report: accent color wasn't applying to the Wi-Fi/
+     * Bluetooth screens' own toggle rows -- add_style(&style_accent) isn't
+     * usable here (these rows are torn down and rebuilt fresh on every
+     * dynamic-list repopulation, same as the rest of this file's screens,
+     * so a plain local style is just as correct and doesn't need
+     * lv_obj_report_style_change() to reach it), but the on.png/off.png
+     * sprite itself still needs an explicit recolor -- see
+     * apply_accent_color()'s own comment on image_recolor vs bg_color. */
+    lv_obj_set_style_image_recolor(toggle_img, accent_lv_color(), 0);
+    lv_obj_set_style_image_recolor_opa(toggle_img, LV_OPA_COVER, 0);
 
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     if (on_click) lv_obj_add_event_cb(row, on_click, LV_EVENT_CLICKED, NULL);
@@ -8575,7 +8598,7 @@ static lv_obj_t * build_subsonic_entry_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "Saved Servers", PILL_ACCESSORY_CHEVRON, false, subsonic_saved_servers_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "New Connection", PILL_ACCESSORY_CHEVRON, false, subsonic_new_connection_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2);
+    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -9238,6 +9261,106 @@ static int find_song_index_by_path(const char * path) {
         if (strcmp(all_songs_paths[i], path) == 0) return i;
     }
     return -1;
+}
+
+static const group_t * find_group_by_name(const group_t * groups, int group_count, const char * name) {
+    for (int i = 0; i < group_count; i++) {
+        if (strcasecmp(groups[i].name, name) == 0) return &groups[i];
+    }
+    return NULL;
+}
+
+/* One specific album within one artist/album-artist's own songs -- same
+ * scoping build_groups_by_indices() does for the on-device Artist ->
+ * Albums drill-down (see artist_album_row_click_cb()), just resolving the
+ * one album a remote play actually needs instead of materializing every
+ * other album of that artist's too. Order-preserving: parent->indices is
+ * already path-sorted within a shared artist (build_groups_by()'s own
+ * tie-break), so this comes out in the same track order the on-device
+ * Album Songs screen would show. Caller owns *out_indices (free() it). */
+static void filter_group_by_album(const group_t * parent, const char * album, int ** out_indices, int * out_count) {
+    int * indices = malloc(sizeof(int) * (size_t) parent->count);
+    int count = 0;
+    for (int i = 0; i < parent->count; i++) {
+        if (strcasecmp(all_song_tags[parent->indices[i]].album, album) == 0) indices[count++] = parent->indices[i];
+    }
+    *out_indices = indices;
+    *out_count = count;
+}
+
+/* Real-device bug report: playing a song from the remote-control web UI
+ * always queued the entire library (alphabetical order, whatever play_mode
+ * happened to be) instead of just the Album/Playlist the song was actually
+ * tapped from -- see remote_control.c's own request_play_playlist_name
+ * comment for the full story. playlist_name/artist_filter/album_artist_
+ * filter/album_filter are remote_control_consume_play_index()'s own
+ * context, empty string meaning "not provided". song_index is a raw
+ * all_songs_paths/all_song_tags index (already translated from remote_
+ * control.c's library index space by the caller). Falls back to the
+ * existing whole-library behavior whenever no usable scope resolves --
+ * both the plain "no filters at all" case (someone playing from All
+ * Songs/search) and a stale reference (e.g. a playlist renamed/deleted
+ * since the phone last loaded its song list). */
+static void play_remote_control_song(int song_index, const char * playlist_name, const char * artist_filter,
+                                      const char * album_artist_filter, const char * album_filter) {
+    if (song_index < 0 || song_index >= all_songs_count) return;
+
+    int * scoped_indices = NULL;
+    int scoped_count = 0;
+    char scoped_title[128] = "";
+
+    if (playlist_name[0] != '\0') {
+        char m3u_path[512];
+        snprintf(m3u_path, sizeof(m3u_path), "%s/%s.m3u", PLAYLISTS_DIR, playlist_name);
+        char ** paths = NULL;
+        int count = 0;
+        if (file_browser_build_playlist_from_m3u(m3u_path, &paths, &count) && count > 0) {
+            scoped_indices = malloc(sizeof(int) * (size_t) count);
+            for (int i = 0; i < count; i++) {
+                int idx = find_song_index_by_path(paths[i]);
+                if (idx >= 0) scoped_indices[scoped_count++] = idx;
+            }
+            for (int i = 0; i < count; i++) free(paths[i]);
+            free(paths);
+            snprintf(scoped_title, sizeof(scoped_title), "%s", playlist_name);
+        }
+    } else if (album_filter[0] != '\0' && (artist_filter[0] != '\0' || album_artist_filter[0] != '\0')) {
+        const group_t * parent = artist_filter[0] != '\0'
+                                      ? find_group_by_name(artist_groups, artist_group_count, artist_filter)
+                                      : find_group_by_name(album_artist_groups, album_artist_group_count, album_artist_filter);
+        if (parent) {
+            filter_group_by_album(parent, album_filter, &scoped_indices, &scoped_count);
+            snprintf(scoped_title, sizeof(scoped_title), "%s", album_filter);
+        }
+    }
+
+    if (scoped_indices && scoped_count > 0) {
+        int pos = -1;
+        for (int i = 0; i < scoped_count; i++) {
+            if (scoped_indices[i] == song_index) {
+                pos = i;
+                break;
+            }
+        }
+        if (pos >= 0) {
+            char ** playlist_copy = malloc(sizeof(char *) * (size_t) scoped_count);
+            for (int i = 0; i < scoped_count; i++) playlist_copy[i] = strdup(all_songs_paths[scoped_indices[i]]);
+            set_player_source_group_songs_direct(scoped_indices, scoped_count, scoped_title, pos);
+            on_file_selected(playlist_copy, scoped_count, pos);
+            free(scoped_indices);
+            return;
+        }
+    }
+    free(scoped_indices);
+
+    int display_index = -1;
+    for (int i = 0; i < all_songs_count; i++) {
+        if (all_songs_sort_order[i] == song_index) {
+            display_index = i;
+            break;
+        }
+    }
+    if (display_index >= 0) all_songs_row_click_cb(display_index);
 }
 
 /* Called from apply_track_metadata_to_ui() right after now_playing_song_
@@ -12804,6 +12927,13 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_image_set_src(remote_control_toggle_img,
                       asset_path(current_settings.remote_control_enabled ? "settings/on.png" : "settings/off.png"));
     lv_obj_align(remote_control_toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
+    /* Real-device bug report: accent color wasn't applying to this toggle
+     * either. Unlike add_pill_toggle_row() (rebuilt fresh on every screen
+     * repopulation, so a plain local color read is fine there), this
+     * screen is built exactly once at startup (see its own call site) and
+     * never rebuilt -- needs the live-updating shared style so a later
+     * accent color change still reaches it. */
+    lv_obj_add_style(remote_control_toggle_img, &style_accent, 0);
 
     lv_obj_t * explanation = lv_label_create(scr);
     lv_label_set_text(explanation,
@@ -13201,7 +13331,7 @@ static lv_obj_t * build_books_screen(void) {
     items[0] = (pill_list_item_t){ "Books", PILL_ACCESSORY_CHEVRON, false, books_files_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Favorites", PILL_ACCESSORY_CHEVRON, false, books_favorites_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Audio Books", PILL_ACCESSORY_CHEVRON, false, audio_books_placeholder_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, 3);
+    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, 3, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -13343,7 +13473,7 @@ static lv_obj_t * build_about_screen(void) {
     items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3);
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -14121,7 +14251,7 @@ static lv_obj_t * build_timezone_region_screen(void) {
         items[i] = (pill_list_item_t){ TIMEZONE_REGIONS[i], PILL_ACCESSORY_CHEVRON, false, timezone_region_row_cb, NULL,
                                         (void *) (intptr_t) i };
     }
-    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT);
+    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -14154,7 +14284,7 @@ static lv_obj_t * build_settings_playback_screen(void) {
     items[2] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, 5);
+    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, 5, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -14166,7 +14296,7 @@ static lv_obj_t * build_settings_display_screen(void) {
     items[2] = (pill_list_item_t){ "Screen Timeout", PILL_ACCESSORY_CHEVRON, false, screen_timeout_row_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
                                     current_settings.swipe_up_home_enabled, NULL, swipe_up_home_switch_event_cb, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, 4);
+    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, 4, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -14178,7 +14308,7 @@ static lv_obj_t * build_settings_power_screen(void) {
     items[1] = (pill_list_item_t){ "Idle Shutdown", PILL_ACCESSORY_CHEVRON, false, idle_shutdown_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "LED charge indicator", PILL_ACCESSORY_TOGGLE,
                                     current_settings.led_indicator_enabled, NULL, led_indicator_switch_event_cb, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, 3);
+    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, 3, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -14189,7 +14319,7 @@ static lv_obj_t * build_settings_system_screen(void) {
     items[1] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, 4);
+    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, 4, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -14235,7 +14365,7 @@ static lv_obj_t * build_settings_screen(void) {
     items[2] = (pill_list_item_t){ "Power", PILL_ACCESSORY_CHEVRON, false, settings_category_power_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "System", PILL_ACCESSORY_CHEVRON, false, settings_category_system_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "About", PILL_ACCESSORY_CHEVRON, false, settings_about_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, 5);
+    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, 5, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -14307,7 +14437,7 @@ static lv_obj_t * build_dac_home_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "USB DAC", PILL_ACCESSORY_CHEVRON, false, dac_home_usb_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Bluetooth DAC", PILL_ACCESSORY_CHEVRON, false, bt_dac_settings_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2);
+    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -15083,6 +15213,8 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     lv_style_set_text_color(&style_accent, accent_lv_color());
     lv_style_set_bg_image_recolor(&style_accent, accent_lv_color());
     lv_style_set_bg_image_recolor_opa(&style_accent, LV_OPA_COVER);
+    lv_style_set_image_recolor(&style_accent, accent_lv_color());
+    lv_style_set_image_recolor_opa(&style_accent, LV_OPA_COVER);
 
     lv_style_init(&style_muted_text);
     lv_style_set_text_color(&style_muted_text, lv_color_make(220, 220, 220));

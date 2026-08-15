@@ -357,7 +357,8 @@ static void pill_toggle_row_event_cb(lv_event_t * e) {
 }
 
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
-                                   const pill_list_item_t * items, int item_count) {
+                                   const pill_list_item_t * items, int item_count,
+                                   lv_style_t * toggle_accent_style) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
 
@@ -410,6 +411,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
             lv_obj_t * toggle_img = lv_image_create(row);
             lv_image_set_src(toggle_img, asset_path(item->toggle_initial_state ? "settings/on.png" : "settings/off.png"));
             lv_obj_align(toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
+            if (toggle_accent_style) lv_obj_add_style(toggle_img, toggle_accent_style, 0);
             if (item->toggle_initial_state) lv_obj_add_state(toggle_img, LV_STATE_CHECKED);
 
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);

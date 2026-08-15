@@ -126,9 +126,23 @@ typedef struct {
 
 /* Titled screen: real back-arrow button and a vertically scrollable list of
  * touch_list/item_bg.png pill rows, each with a label and an optional
- * right-side chevron or toggle. */
+ * right-side chevron or toggle. toggle_accent_style is applied (via
+ * lv_obj_add_style(), not read as a plain value) to every PILL_ACCESSORY_
+ * TOGGLE row's on.png/off.png sprite -- a style pointer rather than a
+ * resolved lv_color_t like build_compact_list_widget()'s own
+ * now_playing_color, specifically because these pill-list screens are each
+ * built once at startup and never rebuilt (see e.g.
+ * build_timezone_region_screen()'s own comment), unlike the list screens
+ * now_playing_color feeds -- a plain color captured once here would go
+ * stale forever after the very next accent color change, where a shared,
+ * in-place-updated style (gui.c's style_accent, kept live via
+ * lv_obj_report_style_change()) doesn't. Caller owns the style object's
+ * lifetime; screen_builders.c never reads its properties directly, only
+ * attaches it (same "no visibility into gui.c's accent state" boundary as
+ * now_playing_color's own doc comment describes). */
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
-                                   const pill_list_item_t * items, int item_count);
+                                   const pill_list_item_t * items, int item_count,
+                                   lv_style_t * toggle_accent_style);
 
 typedef struct {
     const char * label;

@@ -62,4 +62,25 @@ bool playlist_files_delete(const char * m3u_path);
  * Returns false if the file can't be read. */
 bool playlist_files_read(const char * m3u_path, char *** out_paths, int * out_count);
 
+/* Resolves a single M3U line (as read via fgets(), already trimmed of its
+ * trailing newline) against the directory m3u_path itself lives in -- a
+ * line starting with '/' is treated as already-absolute and used as-is;
+ * anything else is joined onto m3u_path's own directory (the standard M3U
+ * convention, and the one every writer in this file now uses -- see
+ * playlist_files_append()/_create()'s own comments). Shared by
+ * playlist_files_read()/_contains()/_remove(), and by file_browser.c's own
+ * file_browser_build_playlist_from_m3u(), which used to duplicate this
+ * exact logic inline. */
+void playlist_files_resolve_path(const char * m3u_path, const char * line, char * out_full_path, size_t out_size);
+
+/* Rewrites every .m3u/.m3u8 file directly under dir (found via
+ * playlist_files_scan()) so every line becomes relative to that file's own
+ * directory, converting any old absolute-path entries left over from
+ * before playlist_files_append()/_create() started writing relative ones.
+ * Runs at most once: gated by a marker file (dir/.relative_paths_migrated),
+ * so calling this on every boot is a cheap no-op after the first real run.
+ * Not meant to be called on a schedule -- gui_init() calls it once, guarded
+ * #ifndef HOST_BUILD, before the first library/playlist scan. */
+void playlist_files_migrate_to_relative(const char * dir);
+
 #endif /* PLAYLIST_FILES_H */

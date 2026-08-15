@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -278,10 +279,49 @@ static void migrate_old_db_if_needed(void) {
 }
 #endif
 
+#ifndef HOST_BUILD
+/* True if MUSIC_ROOT_DIR (gui.c's own name for this same path) is
+ * currently a real mount point -- same "compare st_dev against the parent
+ * directory's" check gui.c's own sd_card_root_is_mounted() uses,
+ * duplicated here rather than shared (same "each file that needs it
+ * defines its own copy" convention as MUSIC_ROOT_DIR/METADATA_DB_PATH
+ * themselves, see this file's own comments above).
+ *
+ * Real-device bug found while testing SD-hotplug reinsertion: sqlite3_open()
+ * happily creates a brand-new, empty database file at whatever's sitting
+ * at METADATA_DB_PATH right now, even if that's just this mount point's
+ * own directory living directly on the internal rootfs because nothing's
+ * actually mounted there at this instant. gui.c's own SD-hotplug removal
+ * handling (poll_sd_card_hotplug()) calls this on a genuinely unmounted
+ * MUSIC_ROOT_DIR by design (to collapse the in-memory library to empty),
+ * racing against its own auto-remount attempt on a separate thread -- if
+ * this function's sqlite3_open() below ran during that brief window
+ * before the real card was back, it created exactly that kind of bogus
+ * internal-storage stand-in file. The instant the real card remounts, that
+ * bogus file gets silently hidden (mounted over, not replaced) by the SD
+ * card's own real cache file underneath -- but this module's own `db`
+ * handle keeps pointing at the now-hidden bogus file's already-open fd
+ * forever after (the `if (db) return;` guard just below never revisits
+ * it), so every later read/write silently misses the real, populated
+ * cache sitting right there on the card. Confirmed exactly this failure
+ * mode on a real device: a reinsertion's cache-only reload kept coming
+ * back with 0 songs despite a real, populated database on the card. */
+static bool music_root_is_mounted(void) {
+    struct stat parent_st, root_st;
+    if (stat("/data/mnt", &parent_st) != 0) return false;
+    if (stat("/data/mnt/sd_0", &root_st) != 0) return false;
+    return parent_st.st_dev != root_st.st_dev;
+}
+#endif
+
 void metadata_db_open(void) {
     if (db) return;
 
 #ifndef HOST_BUILD
+    /* Degraded-but-working no-cache state, same as an open()/sqlite3_open()
+     * failure just below -- see music_root_is_mounted()'s own comment for
+     * why this guard exists at all. */
+    if (!music_root_is_mounted()) return;
     migrate_old_db_if_needed();
 #endif
 

@@ -1874,83 +1874,6 @@ static void build_error_toast(void) {
     lv_timer_pause(error_toast_hide_timer);
 }
 
-/* Dismiss-on-tap info popup -- same hand-built top-layer overlay shape as
- * eq_reset_popup/factory_reset_popup, but a single acknowledgment button
- * instead of a confirm/cancel pair, and sized for a real paragraph of text
- * rather than those two's short titles. show_error_toast()'s fixed 400x70
- * box (auto-hides after 2.5s) doesn't fit a message this long or give
- * enough time to actually read it -- this stays up until the user
- * dismisses it. Reusable anywhere a longer explanation is worth showing;
- * first use is Qobuz/Tidal's "not available in my region" tiles. */
-static lv_obj_t * info_popup;
-static lv_obj_t * info_popup_backdrop;
-static lv_obj_t * info_popup_label;
-
-static void hide_info_popup(void) {
-    lv_obj_add_flag(info_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void info_popup_dismiss_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_info_popup();
-}
-
-static void show_info_popup(const char * msg) {
-    lv_label_set_text(info_popup_label, msg);
-    lv_obj_remove_flag(info_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(info_popup_backdrop);
-    lv_obj_move_foreground(info_popup);
-}
-
-static void build_info_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    info_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(info_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(info_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(info_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(info_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(info_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(info_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(info_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(info_popup_backdrop, info_popup_dismiss_cb, LV_EVENT_CLICKED, NULL);
-
-    info_popup = lv_obj_create(top);
-    lv_obj_set_size(info_popup, 420, 280);
-    lv_obj_align(info_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(info_popup, 16, 0);
-    lv_obj_set_style_bg_color(info_popup, lv_color_make(32, 32, 32), 0);
-    lv_obj_set_style_bg_opa(info_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(info_popup, 0, 0);
-    lv_obj_remove_flag(info_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-
-    info_popup_label = lv_label_create(info_popup);
-    lv_obj_set_width(info_popup_label, lv_pct(88));
-    lv_label_set_long_mode(info_popup_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(info_popup_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(info_popup_label, lv_color_make(230, 230, 230), 0);
-    lv_obj_set_style_text_font(info_popup_label, ui_size_20, 0);
-    lv_obj_align(info_popup_label, LV_ALIGN_TOP_MID, 0, 24);
-
-    lv_obj_t * ok_row = lv_obj_create(info_popup);
-    lv_obj_set_size(ok_row, lv_pct(90), 56);
-    lv_obj_align(ok_row, LV_ALIGN_BOTTOM_MID, 0, -20);
-    lv_obj_set_style_radius(ok_row, 12, 0);
-    lv_obj_set_style_bg_opa(ok_row, 0, 0);
-    lv_obj_set_style_border_width(ok_row, 0, 0);
-    lv_obj_remove_flag(ok_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ok_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(ok_row, info_popup_dismiss_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * ok_label = lv_label_create(ok_row);
-    lv_label_set_text(ok_label, "OK");
-    lv_obj_set_style_text_color(ok_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(ok_label, ui_size_20, 0);
-    lv_obj_center(ok_label);
-}
-
 static void show_error_toast(const char * msg) {
     lv_label_set_text(error_toast_label, msg);
     lv_obj_remove_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
@@ -2008,7 +1931,7 @@ static void build_info_toast(void) {
     lv_obj_set_size(info_toast, 420, 140);
     lv_obj_align(info_toast, LV_ALIGN_CENTER, 0, -160);
     lv_obj_set_style_radius(info_toast, 16, 0);
-    lv_obj_set_style_bg_color(info_toast, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(info_toast, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(info_toast, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(info_toast, 0, 0);
     lv_obj_remove_flag(info_toast, LV_OBJ_FLAG_SCROLLABLE);
@@ -3689,6 +3612,15 @@ typedef struct {
     int for_index;
     uint8_t * picture_data; /* owned; NULL if the track has no embedded art */
     uint32_t picture_size;
+
+    /* Set instead of picture_data/picture_size for a Subsonic stream's cover
+     * art (see launch_cover_decode_from_url()) -- there's no local file to
+     * have already extracted embedded art from, so the compressed image
+     * bytes are fetched here, on the same background thread, before falling
+     * into the same decode path local art already uses. Empty string for
+     * every other caller. */
+    char stream_url[1536];
+    bool stream_verify_tls;
 } cover_decode_request_t;
 
 static pthread_t cover_decode_thread;
@@ -3718,6 +3650,22 @@ static cover_decode_request_t cover_decode_pending;
 static void * cover_decode_thread_func(void * arg) {
     cover_decode_request_t * req = (cover_decode_request_t *) arg;
 
+    if (req->stream_url[0] != '\0') {
+        int status = 0;
+        uint8_t * body = NULL;
+        size_t body_size = 0;
+        if (http_get_to_buffer(req->stream_url, req->stream_verify_tls, &status, &body, &body_size) && status == 200) {
+            req->picture_data = body;
+            req->picture_size = (uint32_t) body_size;
+        } else {
+            free(body);
+            /* Left NULL/0 -- decode below no-ops, same as "no embedded art"
+             * for a local file. No error surfaced beyond that; a failed
+             * cover-art fetch isn't worth blocking or retrying playback
+             * over. */
+        }
+    }
+
     uint16_t * pixels = NULL;
     bool ok = req->picture_data && req->picture_size > 0 &&
               cover_decode_to_rgb565(req->picture_data, req->picture_size, COVER_ART_WIDTH, COVER_ART_HEIGHT, &pixels);
@@ -3744,23 +3692,37 @@ static void * cover_decode_thread_func(void * arg) {
  * one finishes. A rapid sequence of track changes only ever actually
  * decodes the first and the final one, which is exactly the set of results
  * that matters. */
-static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t picture_size) {
+static void launch_cover_decode_req(cover_decode_request_t r) {
     if (cover_decode_active) {
         free(cover_decode_pending.picture_data);
-        cover_decode_pending.for_index = for_index;
-        cover_decode_pending.picture_data = picture_data;
-        cover_decode_pending.picture_size = picture_size;
+        cover_decode_pending = r;
         cover_decode_pending_valid = true;
         return;
     }
 
     cover_decode_request_t * req = malloc(sizeof(*req));
-    req->for_index = for_index;
-    req->picture_data = picture_data;
-    req->picture_size = picture_size;
+    *req = r;
     cover_decode_done_flag = false;
     cover_decode_active = true;
     pthread_create(&cover_decode_thread, NULL, cover_decode_thread_func, req);
+}
+
+static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t picture_size) {
+    cover_decode_request_t r = { .for_index = for_index, .picture_data = picture_data, .picture_size = picture_size,
+                                  .stream_url = "", .stream_verify_tls = false };
+    launch_cover_decode_req(r);
+}
+
+/* Subsonic streaming's own art source -- see cover_decode_request_t's own
+ * comment. url is subsonic_build_cover_art_url()'s output, fetched on the
+ * same background thread that would otherwise be decoding already-local
+ * bytes, so a slow/flaky connection can't block the UI here either, same
+ * reasoning as launch_cover_decode() itself. */
+static void launch_cover_decode_from_url(int for_index, const char * url, bool verify_tls) {
+    cover_decode_request_t r = { .for_index = for_index, .picture_data = NULL, .picture_size = 0,
+                                  .stream_verify_tls = verify_tls };
+    snprintf(r.stream_url, sizeof(r.stream_url), "%s", url);
+    launch_cover_decode_req(r);
 }
 
 /* Called every tick from update_timer_cb. Applies the finished decode to
@@ -3857,8 +3819,7 @@ static void poll_cover_decode(void) {
 
     if (cover_decode_pending_valid) {
         cover_decode_pending_valid = false;
-        launch_cover_decode(cover_decode_pending.for_index, cover_decode_pending.picture_data,
-                             cover_decode_pending.picture_size);
+        launch_cover_decode_req(cover_decode_pending); /* not launch_cover_decode() -- must carry stream_url too, see that field's own comment */
     }
 }
 
@@ -3919,12 +3880,60 @@ static void refresh_now_playing_indicators(void);
  * are identical either way. Returns the metadata it read (out_meta) so
  * callers that also need ReplayGain (play_track_at_from, to hand it to
  * audio_play_file_at) don't have to read the file's tags a second time. */
+/* Set by subsonic_song_row_click_cb() (gui.c, further down) right before a
+ * streamed mp3/flac Subsonic queue starts playing -- metadata_read() can't
+ * read tags from a network URL the way it does a local file, but the real
+ * title/artist/album (and where to fetch cover art) for every song in the
+ * queue are already known from the API responses that built it, so they're
+ * stashed here, one entry per playlist[] slot (same indexing, built and
+ * freed together), and matched by exact URL string in apply_track_metadata_
+ * to_ui() below -- the string match (not just the index) is what makes it
+ * safe to leave this array up indefinitely rather than needing to track
+ * every other place a new, unrelated playlist might start: subsonic_build_
+ * stream_url() bakes a fresh random salt into every URL it builds, so a
+ * later, different playlist's paths can never coincidentally match one of
+ * these even if this array outlives its own playlist (the array is only
+ * ever replaced, on the next Subsonic streaming tap, not proactively freed
+ * when some other playback source starts). Forward-declared here (rather
+ * than moving apply_track_metadata_to_ui() itself) since the Subsonic click
+ * handler that WRITES these lives much further down this file, alongside
+ * the rest of the Subsonic screens. */
+typedef struct {
+    char url[1536]; /* the exact playlist[i] this entry describes */
+    char title[128];
+    char artist[128];
+    char album[128];
+    char cover_url[1536];
+    bool verify_tls;
+} subsonic_stream_song_meta_t;
+static subsonic_stream_song_meta_t * subsonic_stream_meta = NULL; /* parallel array, NULL when no Subsonic stream queue is loaded */
+static int subsonic_stream_meta_count = 0;
+
 static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     char title[128];
     char folder[128];
     get_display_names(playlist[index], title, sizeof(title), folder, sizeof(folder));
 
-    metadata_read(playlist[index], out_meta);
+    bool is_subsonic_stream = subsonic_stream_meta && index < subsonic_stream_meta_count &&
+                               strcmp(playlist[index], subsonic_stream_meta[index].url) == 0;
+
+    if (is_subsonic_stream) {
+        memset(out_meta, 0, sizeof(*out_meta));
+        if (subsonic_stream_meta[index].title[0]) {
+            snprintf(out_meta->title, sizeof(out_meta->title), "%s", subsonic_stream_meta[index].title);
+            out_meta->has_title = true;
+        }
+        if (subsonic_stream_meta[index].artist[0]) {
+            snprintf(out_meta->artist, sizeof(out_meta->artist), "%s", subsonic_stream_meta[index].artist);
+            out_meta->has_artist = true;
+        }
+        if (subsonic_stream_meta[index].album[0]) {
+            snprintf(out_meta->album, sizeof(out_meta->album), "%s", subsonic_stream_meta[index].album);
+            out_meta->has_album = true;
+        }
+    } else {
+        metadata_read(playlist[index], out_meta);
+    }
 
     /* -1 (not found) is a real, expected outcome, not just "library not
      * scanned yet" -- Group Songs/Files/.m3u playback can hand play_track_
@@ -3944,7 +3953,11 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
         lv_label_set_text(quick_drawer_artist_label, folder_text);
     }
     refresh_format_badge();
-    launch_cover_decode(index, out_meta->picture_data, out_meta->picture_size); /* takes ownership, applied async */
+    if (is_subsonic_stream && subsonic_stream_meta[index].cover_url[0]) {
+        launch_cover_decode_from_url(index, subsonic_stream_meta[index].cover_url, subsonic_stream_meta[index].verify_tls);
+    } else {
+        launch_cover_decode(index, out_meta->picture_data, out_meta->picture_size); /* takes ownership, applied async */
+    }
 
     favorite_is_set = metadata_db_song_favorite_is_set(playlist[index]);
     const char * favorite_icon_asset = favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png";
@@ -5525,6 +5538,26 @@ void gui_plugin_show_toast(const char * msg) {
     show_info_toast(msg);
 }
 
+void gui_plugin_set_background_color(const char * slot, uint32_t rgb) {
+    lv_color_t color = lv_color_hex(rgb);
+
+    if (strcmp(slot, "screen") == 0) {
+        lv_style_set_bg_color(&style_theme_screen_bg, color);
+        lv_obj_report_style_change(&style_theme_screen_bg);
+    } else if (strcmp(slot, "card") == 0) {
+        lv_style_set_bg_color(&style_theme_card_bg, color);
+        lv_obj_report_style_change(&style_theme_card_bg);
+    } else if (strcmp(slot, "list_row") == 0) {
+        lv_style_set_bg_color(&list_row_style, color);
+        lv_obj_report_style_change(&list_row_style);
+    }
+    /* Else: unknown slot -- plugin_manager.c's l_plugin_set_background_color()
+     * already validates against the three known names and raises a Lua
+     * error before ever reaching here, so this is unreachable in practice;
+     * silently ignored rather than asserting, matching this file's own
+     * "degraded but working" tolerance elsewhere. */
+}
+
 /* ---- Delete confirmation popup ---- */
 static lv_obj_t * delete_song_popup;
 static lv_obj_t * delete_song_popup_backdrop;
@@ -5599,7 +5632,7 @@ static void build_delete_song_popup(void) {
     lv_obj_set_size(delete_song_popup, 420, 220);
     lv_obj_align(delete_song_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(delete_song_popup, 16, 0);
-    lv_obj_set_style_bg_color(delete_song_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(delete_song_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(delete_song_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(delete_song_popup, 0, 0);
     lv_obj_remove_flag(delete_song_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -5724,7 +5757,7 @@ static void build_more_menu_popup(void) {
     lv_obj_set_size(more_menu_popup, 400, 376); /* +66 over the old 310 -- one more row, same per-row spacing */
     lv_obj_align(more_menu_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(more_menu_popup, 16, 0);
-    lv_obj_set_style_bg_color(more_menu_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(more_menu_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(more_menu_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(more_menu_popup, 0, 0);
     lv_obj_remove_flag(more_menu_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -5829,7 +5862,7 @@ static void build_song_context_menu_popup(void) {
     lv_obj_set_size(song_context_menu_popup, 400, 244);
     lv_obj_align(song_context_menu_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(song_context_menu_popup, 16, 0);
-    lv_obj_set_style_bg_color(song_context_menu_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(song_context_menu_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(song_context_menu_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(song_context_menu_popup, 0, 0);
     lv_obj_remove_flag(song_context_menu_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -6087,9 +6120,12 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     return scr;
 }
 
-/* Same true-black rationale as screen_builders.c's own SCREEN_BG_COLOR --
- * kept as a separate copy since these screens are built directly in gui.c
- * rather than through the shared screen_builders.c helpers. */
+/* Same true-black default screen_builders.c's own style_theme_screen_bg is
+ * initialized with. Kept as a separate plain literal (not that shared
+ * style) specifically for gui_show_boot_splash() below -- that function
+ * runs from main.c before gui_init() (and screen_builders_init_list_row_style(),
+ * which initializes style_theme_screen_bg) has ever run, so the shared
+ * style would still be all-zero memory at that point. */
 #define SCREEN_BG_COLOR lv_color_make(0, 0, 0)
 
 /* Real device uptime (lv_tick_get() is CLOCK_MONOTONIC-backed, see main.c's
@@ -6147,6 +6183,10 @@ void gui_show_boot_splash(void) {
     lv_obj_add_flag(lv_layer_top(), LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t * scr = lv_obj_create(NULL);
+    /* Plain literal, not style_theme_screen_bg -- this runs from main.c
+     * before gui_init() (and its lv_style_init(&style_theme_screen_bg))
+     * has ever run, so that style object would still be all-zero memory
+     * here. */
     lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
     lv_obj_set_style_border_width(scr, 0, 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
@@ -6161,7 +6201,7 @@ void gui_show_boot_splash(void) {
 
 static lv_obj_t * build_files_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -7138,7 +7178,7 @@ static void show_group_songs(const group_t * group) {
 
 static lv_obj_t * build_group_songs_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -7858,7 +7898,7 @@ static void t9_keypad_release(void) {
 
 static lv_obj_t * build_text_entry_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     /* lv_keyboard_create()'s built-in Close/X key used to be this screen's
      * only cancel path (see the old LV_EVENT_CANCEL branch this replaces --
@@ -7963,14 +8003,18 @@ static void show_text_entry(const char * title, const char * initial_text, bool 
 
 /* ---- Subsonic-compatible network streaming ----
  *
- * Downloads the whole track to a local temp file (/tmp, wiped on reboot,
- * same reasoning as everywhere else in this app that only needs a
- * transient file) before handing it to the existing, local-file-only
- * decoder pipeline, rather than decoding a true network stream --
- * retrofitting every decoder here (including the vendored AIFF/DSD/AAC/
- * ALAC/APE ones, all built around a plain seekable FILE*) for streaming
- * reads is a much bigger project than this round's scope. The tradeoff is
- * a short wait before playback starts instead of it starting instantly. */
+ * mp3/flac songs (the two decoders audio.c can open against a true network
+ * stream -- see decoder_open()'s own comment in audio.c) play directly off
+ * the server via subsonic_song_row_click_cb() below, no local file at all.
+ * Every other format (aac/ogg/wma/m4a/ape/opus/wav/aiff/dsf -- whatever
+ * this server's own transcoding settings hand back) still downloads the
+ * whole track first via the mechanism right below, before handing it to the
+ * existing local-file-only decoder for that format: retrofitting every
+ * remaining decoder here (the vendored AIFF/DSD/AAC/ALAC/APE ones, all
+ * built around a plain seekable FILE*) for streaming reads is a much bigger
+ * project than this round's scope. The downloaded copy lands on the SD card
+ * (SUBSONIC_STREAM_CACHE_DIR below), not /tmp -- see that macro's own
+ * comment for why. */
 
 static subsonic_server_t subsonic_server_from_settings(void) {
     subsonic_server_t server;
@@ -8125,7 +8169,7 @@ static void poll_dlna_control(void) {
  * non-cancelable uses. */
 static lv_obj_t * build_subsonic_downloading_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     subsonic_downloading_label = lv_label_create(scr);
     lv_label_set_text(subsonic_downloading_label, "");
@@ -8393,7 +8437,7 @@ static void populate_indexed_list_from_items(lv_obj_t * list, const compact_list
 
 static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -8442,7 +8486,7 @@ static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_
 static lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) {
     lv_obj_t * row = lv_obj_create(parent);
     lv_obj_set_size(row, 448, 124);
-    lv_obj_set_style_bg_color(row, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(row, &style_theme_screen_bg, 0);
     lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(row, 0, 0);
@@ -8591,20 +8635,103 @@ static const char * subsonic_playlist_label_of(int i) { return subsonic_playlist
  * fixes this for any track size, not just ones under some smaller cap. */
 #define SUBSONIC_STREAM_CACHE_DIR MUSIC_ROOT_DIR "/.subsonic_cache"
 
-static void subsonic_song_row_click_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int index = (int) (intptr_t) lv_event_get_user_data(e);
+/* Builds one queue entry (stream URL + parallel metadata) for song into
+ * new_playlist[slot]/new_meta[slot] -- shared by subsonic_song_row_click_cb()
+ * below across every mp3/flac song it queues, not just the tapped one. */
+static void subsonic_fill_stream_queue_entry(const subsonic_server_t * server, const subsonic_song_t * song,
+                                              char ** new_playlist, subsonic_stream_song_meta_t * new_meta, int slot) {
+    char url[1536];
+    subsonic_build_stream_url(server, song->id, url, sizeof(url));
+    /* The "#.<suffix>" appended here is a local-only hint consumed by
+     * audio.c's decoder_open() (stream_format_hint()); http_conn_parse_url()
+     * strips it before it ever reaches the actual HTTP request, so it has
+     * no effect on the server-facing URL. */
+    size_t len = strlen(url);
+    snprintf(url + len, sizeof(url) - len, "#.%s", song->suffix);
+
+    new_playlist[slot] = strdup(url);
+
+    subsonic_stream_song_meta_t * m = &new_meta[slot];
+    snprintf(m->url, sizeof(m->url), "%s", url);
+    snprintf(m->title, sizeof(m->title), "%s", song->title);
+    snprintf(m->artist, sizeof(m->artist), "%s", song->artist);
+    snprintf(m->album, sizeof(m->album), "%s", song->album);
+    if (song->cover_art[0]) {
+        subsonic_build_cover_art_url(server, song->cover_art, m->cover_url, sizeof(m->cover_url));
+    } else {
+        m->cover_url[0] = '\0';
+    }
+    m->verify_tls = server->verify_tls;
+}
+
+/* The actual logic behind tapping a Subsonic song, index into subsonic_
+ * songs_cache -- split out from subsonic_song_row_click_cb() (immediately
+ * below, the real LVGL callback) purely so it has a plain (int) signature
+ * callable directly, without needing to fabricate an lv_event_t. */
+static void subsonic_play_song_and_queue_rest(int index) {
     subsonic_song_t * song = &subsonic_songs_cache[index];
 
     subsonic_server_t server = subsonic_server_from_settings();
+
+    /* mp3/flac plays directly off the stream URL -- no download, no wait --
+     * and queues the rest of this album/playlist (subsonic_songs_cache is
+     * already the full song list either way, see subsonic_songs_context_is_
+     * playlist's own comment above) that's ALSO mp3/flac, in original order,
+     * starting at the tapped song, so Prev/Next/auto-advance/Repeat/Shuffle
+     * all work across the whole thing exactly like a local-library playlist.
+     * A song in some other format is simply left out of this queue -- there's
+     * no good way to background-download it without either stalling the
+     * queue right there or building a much bigger hybrid stream+download
+     * pipeline, and skipping it keeps every other song in the album/playlist
+     * reachable instead of the queue silently dead-ending on it. See this
+     * section's own top comment for why a non-streamable format tapped
+     * directly still downloads first, as a single track, same as before. */
+    if (strcasecmp(song->suffix, "mp3") == 0 || strcasecmp(song->suffix, "flac") == 0) {
+        char ** new_playlist = malloc(sizeof(char *) * (size_t) subsonic_songs_count);
+        subsonic_stream_song_meta_t * new_meta = malloc(sizeof(subsonic_stream_song_meta_t) * (size_t) subsonic_songs_count);
+        int count = 0;
+        int start_index = -1;
+
+        for (int i = 0; i < subsonic_songs_count; i++) {
+            subsonic_song_t * s = &subsonic_songs_cache[i];
+            if (strcasecmp(s->suffix, "mp3") != 0 && strcasecmp(s->suffix, "flac") != 0) continue;
+            subsonic_fill_stream_queue_entry(&server, s, new_playlist, new_meta, count);
+            if (i == index) start_index = count;
+            count++;
+        }
+
+        if (start_index < 0) {
+            /* Shouldn't happen -- the tapped song itself was mp3/flac, so it
+             * must have been included above -- but fail safely rather than
+             * play the wrong track if this invariant is ever violated. */
+            for (int i = 0; i < count; i++) free(new_playlist[i]);
+            free(new_playlist);
+            free(new_meta);
+            return;
+        }
+
+        free(subsonic_stream_meta);
+        subsonic_stream_meta = new_meta;
+        subsonic_stream_meta_count = count;
+
+        clear_player_source(); /* a streamed queue has no on-device list to go back to */
+        on_file_selected(new_playlist, count, start_index);
+        return;
+    }
+
     char url[1536];
     subsonic_build_stream_url(&server, song->id, url, sizeof(url));
-
     mkdir(SUBSONIC_STREAM_CACHE_DIR, 0755); /* no-op (EEXIST) if it's already there */
     char dest[256];
     snprintf(dest, sizeof(dest), SUBSONIC_STREAM_CACHE_DIR "/stream.%s", song->suffix);
 
     start_subsonic_download(url, server.verify_tls, dest, song->title);
+}
+
+static void subsonic_song_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    subsonic_play_song_and_queue_rest(index);
 }
 
 static void subsonic_album_row_click_cb(lv_event_t * e) {
@@ -10183,6 +10310,78 @@ static void start_library_rescan(void) {
     pthread_create(&library_rescan_thread, NULL, library_rescan_thread_func, NULL);
 }
 
+/* Rebuilds the four prebuilt library screens (All Songs, Artists, Albums,
+ * Album Artist) against whatever's now in all_songs_paths/artist_groups/
+ * album_groups/album_artist_groups -- unlike group_songs_screen/
+ * artist_albums_screen (which rebuild their rows on every visit) these are
+ * only ever built once at startup and would otherwise keep showing rows
+ * bound to indices into freed arrays after ANY reload of the underlying
+ * data, not just a full rescan -- shared by poll_library_rescan()'s
+ * background-scan-completion path below and reload_library_on_sd_reinsert()'s
+ * fast-cache-load path further down, both of which replace that data via a
+ * different route (library_scan_once() vs library_load_from_cache_only())
+ * but need the exact same screen-side cleanup afterward. playlists_screen
+ * deliberately NOT rebuilt here -- see poll_library_rescan()'s own former
+ * comment on why (still applies verbatim): its content is recomputed fresh
+ * on every visit already, never stale to begin with. */
+static void refresh_library_screens_after_reload(void) {
+    lv_obj_delete(all_songs_screen);
+    lv_obj_delete(artists_screen);
+    lv_obj_delete(albums_screen);
+    lv_obj_delete(album_artist_screen);
+    all_songs_screen = build_all_songs_screen();
+    sync_remote_control_library();
+    artists_screen = build_artists_screen();
+    albums_screen = build_albums_screen();
+    album_artist_screen = build_album_artist_screen();
+
+    /* The four old screens' A-Z index bindings (strip/popup/list pointers)
+     * just went dangling along with the lv_obj_delete()s above -- re-register
+     * against the freshly rebuilt screens/lists before anything can poll them. */
+    az_index_registered_count = 0;
+    register_az_index(artists_screen, artists_list, artist_group_name_of, &artist_group_count);
+    register_az_index(albums_screen, albums_list, album_group_name_of, &album_group_count);
+    register_az_index(album_artist_screen, album_artist_list, album_artist_group_name_of, &album_artist_group_count);
+    register_az_index(all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count);
+
+    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, artist_group_name_of, &artist_group_count, false);
+    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, album_group_name_of, &album_group_count, false);
+    register_search(SEARCH_BINDING_ALBUM_ARTIST, album_artist_screen, album_artist_list, album_artist_group_name_of,
+                     &album_artist_group_count, false);
+    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count, false);
+}
+
+/* SD-card-reinsertion fast path -- see poll_sd_card_hotplug()'s own call
+ * site. Real-device feature request: reinserting a card the app has
+ * already scanned before was recreating/re-reading its whole tag cache
+ * from scratch every single time (a full start_library_rescan(), same
+ * multi-minute cost as a genuinely new library, since that's the only path
+ * poll_sd_card_hotplug() ever used on the mount edge) instead of just
+ * loading the cache that same card's own root already carries (metadata_db.c's
+ * METADATA_DB_PATH lives ON the SD card itself, not somewhere device-global
+ * -- see its own comment -- so a previously-scanned card reinserted here
+ * has its own already-populated database sitting right there).
+ * library_load_from_cache_only() (a bounded SQLite read, not a filesystem
+ * walk -- see its own comment) already does exactly this; the only thing
+ * missing was calling it here instead of unconditionally reaching for
+ * start_library_rescan(). Falls through to that full scan only if the
+ * cache load comes back with nothing -- a genuinely new/never-scanned
+ * card, or one whose database failed to open. A plain toast rather than
+ * the "Updating music database..." screen start_library_rescan() shows --
+ * this is a reload the user didn't explicitly ask for, over before they'd
+ * even notice a progress screen, so pushing/popping that screen would just
+ * yank them away from whatever they're actually doing right now for no
+ * reason. */
+static void reload_library_on_sd_reinsert(void) {
+    library_load_from_cache_only();
+    if (all_songs_count > 0) {
+        refresh_library_screens_after_reload();
+        show_info_toast("Library updated");
+    } else {
+        start_library_rescan();
+    }
+}
+
 /* How long the "Library updated" success message stays up once a rescan
  * finishes, before falling back to Home -- purely so the user gets a
  * moment to actually read it, not a wait for anything real. */
@@ -10233,35 +10432,7 @@ static void poll_library_rescan(void) {
     library_rescan_active = false;
     pthread_join(library_rescan_thread, NULL);
 
-    lv_obj_delete(all_songs_screen);
-    lv_obj_delete(artists_screen);
-    lv_obj_delete(albums_screen);
-    lv_obj_delete(album_artist_screen);
-    all_songs_screen = build_all_songs_screen();
-    sync_remote_control_library();
-    artists_screen = build_artists_screen();
-    albums_screen = build_albums_screen();
-    album_artist_screen = build_album_artist_screen();
-
-    /* The four old screens' A-Z index bindings (strip/popup/list pointers)
-     * just went dangling along with the lv_obj_delete()s above -- re-register
-     * against the freshly rebuilt screens/lists before anything can poll them. */
-    az_index_registered_count = 0;
-    register_az_index(artists_screen, artists_list, artist_group_name_of, &artist_group_count);
-    register_az_index(albums_screen, albums_list, album_group_name_of, &album_group_count);
-    register_az_index(album_artist_screen, album_artist_list, album_artist_group_name_of, &album_artist_group_count);
-    register_az_index(all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count);
-
-    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, artist_group_name_of, &artist_group_count, false);
-    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, album_group_name_of, &album_group_count, false);
-    register_search(SEARCH_BINDING_ALBUM_ARTIST, album_artist_screen, album_artist_list, album_artist_group_name_of,
-                     &album_artist_group_count, false);
-    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count, false);
-    /* playlists_screen deliberately NOT rebuilt here -- unlike the four
-     * screens above, its content (Favorites/Most Played/user .m3u
-     * playlists) is never stale to begin with: populate_playlists_screen()
-     * recomputes it from the database/filesystem fresh every time the
-     * screen is opened (see playlists_tile_cb()), not just after a rescan. */
+    refresh_library_screens_after_reload();
 
     lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text_fmt(subsonic_downloading_label, "Library updated\n%d songs", all_songs_count);
@@ -10391,6 +10562,25 @@ static void poll_sd_card_hotplug(void) {
     static bool was_mounted = true;
     static time_t last_check = 0;
     static int mount_fail_streak = 0;
+    /* Real-device testing: a plain single-poll "was mounted, now isn't"
+     * edge fires the removal-collapse rescan below too eagerly -- confirmed
+     * live that mount_sd_card_if_needed() (called synchronously, right
+     * above that rescan's own pthread_create()) can complete a re-mount
+     * faster than this function's own SD_CARD_MOUNT_POLL_SECONDS poll
+     * interval, so a brief unmount (this app's own umount -l retry above,
+     * or -- unverified but plausible -- a very fast physical reseat) can
+     * have already remounted again by the time the removal rescan's
+     * background thread actually gets scheduled, making it scan and fully
+     * re-tag the *already-back* real card instead of correctly finding
+     * nothing, exactly the slow full-rescan reload_library_on_sd_reinsert()
+     * below exists to avoid. Requiring the unmounted state to be seen on
+     * SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD consecutive polls (reset to 0 the
+     * moment "mounted" is seen again, see the mounted branch below) before
+     * acting filters that out -- a genuine removal stays gone far longer
+     * than this short confirmation window, so real removal handling is
+     * delayed by only a few seconds, not skipped. */
+    static int unmount_confirm_streak = 0;
+#define SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD 2
 
     time_t now = time(NULL);
     if (last_check != 0 && now - last_check < SD_CARD_MOUNT_POLL_SECONDS) return;
@@ -10411,11 +10601,39 @@ static void poll_sd_card_hotplug(void) {
 
     if (!mounted) {
         mount_sd_card_if_needed();
-        if (was_mounted && !library_rescan_active) {
-            start_library_rescan();
-            file_browser_reset_to_root();
+        if (was_mounted) {
+            unmount_confirm_streak++;
+            if (unmount_confirm_streak >= SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD && !library_rescan_active) {
+                /* Real-device bug report: metadata_db_open() only ever
+                 * checks `if (db) return;` -- left open across a removal,
+                 * it would keep reusing this now-dead connection (pointing
+                 * at a file on a card that's physically gone) forever
+                 * after, even across a later reinsertion of the same or a
+                 * different card, silently defeating
+                 * reload_library_on_sd_reinsert()'s own cache-load fast
+                 * path below (a query against a dead handle isn't a real
+                 * cache hit). Closing it here -- guarded by the same
+                 * !library_rescan_active this branch already requires, so
+                 * there's no background rescan thread concurrently using
+                 * the connection -- makes the next metadata_db_open()
+                 * (from whichever path runs on the next insertion)
+                 * genuinely reopen fresh against whatever's actually
+                 * mounted by then. */
+                metadata_db_close();
+                start_library_rescan();
+                file_browser_reset_to_root();
+                was_mounted = false;
+                unmount_confirm_streak = 0;
+            }
+            /* Else: not yet confirmed (or a rescan from something else,
+             * e.g. Settings > Update Music Database, is already running)
+             * -- was_mounted deliberately stays true, so a flicker that
+             * remounts before reaching the threshold below is
+             * indistinguishable from nothing having happened at all: the
+             * mounted branch's own streak reset plus its own
+             * `!was_mounted` reinsertion check (still false) mean neither
+             * edge ever fires. */
         }
-        was_mounted = false;
 
         /* Card is physically there (the whole-disk node exists) but still
          * won't mount after repeated retries. mount_sd_card_if_needed()
@@ -10450,8 +10668,9 @@ static void poll_sd_card_hotplug(void) {
 
     mount_fail_streak = 0;
     sd_mount_fail_notified = false;
+    unmount_confirm_streak = 0; /* seeing "mounted" again cancels any not-yet-confirmed removal */
     if (!was_mounted && !library_rescan_active) {
-        start_library_rescan();
+        reload_library_on_sd_reinsert();
         file_browser_reset_to_root();
     }
     was_mounted = true;
@@ -10645,7 +10864,7 @@ static void build_sd_mount_failed_popup(void) {
     lv_obj_set_size(sd_mount_failed_popup, 400, 300);
     lv_obj_align(sd_mount_failed_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(sd_mount_failed_popup, 16, 0);
-    lv_obj_set_style_bg_color(sd_mount_failed_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(sd_mount_failed_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(sd_mount_failed_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(sd_mount_failed_popup, 0, 0);
     lv_obj_remove_flag(sd_mount_failed_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -10719,7 +10938,7 @@ static void build_sd_format_confirm_popup(void) {
     lv_obj_set_size(sd_format_confirm_popup, 400, 260);
     lv_obj_align(sd_format_confirm_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(sd_format_confirm_popup, 16, 0);
-    lv_obj_set_style_bg_color(sd_format_confirm_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(sd_format_confirm_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(sd_format_confirm_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(sd_format_confirm_popup, 0, 0);
     lv_obj_remove_flag(sd_format_confirm_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -10859,7 +11078,7 @@ static void build_power_off_countdown_popup(void) {
     lv_obj_set_size(power_off_countdown_popup, 320, 280);
     lv_obj_align(power_off_countdown_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(power_off_countdown_popup, 16, 0);
-    lv_obj_set_style_bg_color(power_off_countdown_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(power_off_countdown_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(power_off_countdown_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(power_off_countdown_popup, 0, 0);
     lv_obj_remove_flag(power_off_countdown_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -10946,33 +11165,45 @@ static void subsonic_tile_cb(lv_event_t * e) {
     nav_push(subsonic_entry_screen);
 }
 
-/* Qobuz/Tidal both require a paid regional subscription and a real API
- * integration this project's author can't personally test or verify
- * against -- tapping either explains that instead of doing nothing (the
- * previous NULL-callback placeholder) or pretending to work. */
-static void unavailable_region_tile_cb(lv_event_t * e) {
+/* Shared click handler for every plugin-registered Stream Media tile below
+ * -- user_data is the tile's index into plugin_manager's own
+ * plugin_stream_tiles[] (not an LVGL object), same index-not-object shape
+ * plugin_list_row_click_cb() already uses. */
+static void plugin_stream_tile_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    show_info_popup("Qobuz/Tidal not available in my region, can't test/deploy functionality, feel free to fork this project and implement");
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_stream_tile_clicked(index);
 }
 
-static void net_radio_placeholder_tile_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    show_error_toast("Net Radio coming soon");
-}
-
-/* Subsonic is the one real, working option here (Net Radio has no callback
- * wired up -- a placeholder), so it's first, not last. Its icon (stream_
- * media/subsonic.png/_s.png) isn't from the stock theme pack at all
- * (Subsonic isn't a stock HiBy feature) -- see assets.c's THEME_OVERRIDE_ROOT
- * for how this app adds its own new asset on top of the stock resource pack
- * despite that living on read-only storage on a real device. */
+/* Subsonic is the one built-in, real, working option here -- Qobuz/Tidal
+ * (paid regional subscriptions + a real API integration this project's
+ * author couldn't personally test or verify against) and Net Radio (never
+ * wired up past a placeholder) were removed rather than left as dead/
+ * stalled tiles. Its icon (stream_media/subsonic.png/_s.png) isn't from
+ * the stock theme pack at all (Subsonic isn't a stock HiBy feature) --
+ * see assets.c's THEME_OVERRIDE_ROOT for how this app adds its own new
+ * asset on top of the stock resource pack despite that living on
+ * read-only storage on a real device.
+ *
+ * Any plugin.register_stream_media_tile() calls (a real Net Radio plugin,
+ * for instance) are appended after Subsonic -- unlike Home (already full
+ * at 6 tiles, can't scroll), Stream Media has real room: 1 built-in +
+ * PLUGIN_MAX_STREAM_TILES caps the total at 6, the same "fills exactly 3
+ * rows" ceiling proven out for Home. */
 static lv_obj_t * build_stream_media_screen(void) {
-    static icon_grid_item_t items[4];
+    static icon_grid_item_t items[1 + PLUGIN_MAX_STREAM_TILES];
     items[0] = (icon_grid_item_t){ "stream_media/subsonic.png", "stream_media/subsonic_s.png", "Subsonic", subsonic_tile_cb, NULL };
-    items[1] = (icon_grid_item_t){ "stream_media/qobuz.png", "stream_media/qobuz_s.png", "Qobuz", unavailable_region_tile_cb, NULL };
-    items[2] = (icon_grid_item_t){ "stream_media/tidal.png", "stream_media/tidal_s.png", "Tidal", unavailable_region_tile_cb, NULL };
-    items[3] = (icon_grid_item_t){ "stream_media/radio.png", "stream_media/radio_s.png", "Net Radio", net_radio_placeholder_tile_cb, NULL };
-    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, 4, 100);
+
+    int count = 1;
+    int plugin_count = plugin_manager_get_stream_tile_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_STREAM_TILES; i++) {
+        items[count++] = (icon_grid_item_t){
+            plugin_manager_get_stream_tile_icon(i), plugin_manager_get_stream_tile_icon_selected(i),
+            plugin_manager_get_stream_tile_label(i), plugin_stream_tile_click_cb, (void *) (intptr_t) i
+        };
+    }
+
+    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -11317,7 +11548,7 @@ static void build_wifi_action_popup(void) {
     lv_obj_set_size(wifi_action_popup, 400, 220);
     lv_obj_align(wifi_action_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(wifi_action_popup, 16, 0);
-    lv_obj_set_style_bg_color(wifi_action_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(wifi_action_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(wifi_action_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(wifi_action_popup, 0, 0);
     lv_obj_remove_flag(wifi_action_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -11834,7 +12065,7 @@ static void build_bt_action_popup(void) {
     lv_obj_set_size(bt_action_popup, 400, 220);
     lv_obj_align(bt_action_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(bt_action_popup, 16, 0);
-    lv_obj_set_style_bg_color(bt_action_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(bt_action_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(bt_action_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(bt_action_popup, 0, 0);
     lv_obj_remove_flag(bt_action_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -12207,7 +12438,7 @@ static void build_bt_dac_leave_popup(void) {
     lv_obj_set_size(bt_dac_leave_popup, 400, 220);
     lv_obj_align(bt_dac_leave_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(bt_dac_leave_popup, 16, 0);
-    lv_obj_set_style_bg_color(bt_dac_leave_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(bt_dac_leave_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(bt_dac_leave_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(bt_dac_leave_popup, 0, 0);
     lv_obj_remove_flag(bt_dac_leave_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -12660,7 +12891,7 @@ static void build_usb_dac_leave_popup(void) {
     lv_obj_set_size(usb_dac_leave_popup, 400, 220);
     lv_obj_align(usb_dac_leave_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(usb_dac_leave_popup, 16, 0);
-    lv_obj_set_style_bg_color(usb_dac_leave_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(usb_dac_leave_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(usb_dac_leave_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(usb_dac_leave_popup, 0, 0);
     lv_obj_remove_flag(usb_dac_leave_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -12954,7 +13185,7 @@ static void build_import_rescan_popup(void) {
     lv_obj_set_size(import_rescan_popup, 420, 220);
     lv_obj_align(import_rescan_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(import_rescan_popup, 16, 0);
-    lv_obj_set_style_bg_color(import_rescan_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(import_rescan_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(import_rescan_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(import_rescan_popup, 0, 0);
     lv_obj_remove_flag(import_rescan_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -13062,7 +13293,7 @@ static void import_wifi_back_cb(lv_event_t * e) {
 
 static lv_obj_t * build_import_wifi_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -13334,7 +13565,7 @@ static void remote_control_toggle_cb(lv_event_t * e) {
 
 static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -13361,7 +13592,7 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_t * toggle_row = lv_obj_create(scr);
     lv_obj_set_size(toggle_row, 448, 124);
     lv_obj_align(toggle_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 10);
-    lv_obj_set_style_bg_color(toggle_row, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(toggle_row, &style_theme_screen_bg, 0);
     lv_obj_set_style_bg_image_src(toggle_row, asset_path("touch_list/item_bg.png"), 0);
     lv_obj_set_style_bg_opa(toggle_row, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(toggle_row, 0, 0);
@@ -13715,7 +13946,7 @@ static lv_obj_t * build_books_files_screen(void) {
 
 static lv_obj_t * build_text_reader_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -13857,7 +14088,7 @@ static void build_firmware_update_popup(void) {
     lv_obj_set_size(firmware_update_popup, 420, 260);
     lv_obj_align(firmware_update_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(firmware_update_popup, 16, 0);
-    lv_obj_set_style_bg_color(firmware_update_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(firmware_update_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(firmware_update_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(firmware_update_popup, 0, 0);
     lv_obj_remove_flag(firmware_update_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -13951,7 +14182,7 @@ static lv_obj_t * build_about_screen(void) {
 
 static lv_obj_t * build_accent_color_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -14078,7 +14309,7 @@ static void screen_timeout_slider_event_cb(lv_event_t * e) {
 
 static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -14118,10 +14349,9 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_add_event_cb(screen_timeout_switch, screen_timeout_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     /* Reuses the EQ card look (rounded dark card, live numeric readout +
-     * slider) for a consistent "settings with a live readout" feel, without
-     * depending on the EQ screen's own green-tinted EQ_CARD_COLOR/
-     * EQ_BG_COLOR (this screen matches the plain System settings screen's
-     * own SCREEN_BG_COLOR instead). Taller than the EQ card (170 vs 82),
+     * slider, style_theme_card_bg -- the same shared "card surface" style
+     * every popup/EQ-card/slider-card in the app uses) for a consistent
+     * "settings with a live readout" feel. Taller than the EQ card (170 vs 82),
      * with the slider near the top and the value label centered well below
      * it (rather than the EQ card's label-top-left/slider-along-the-bottom
      * layout) -- real-device feedback: the original thin-track/small-text/
@@ -14133,7 +14363,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     screen_timeout_slider_card = lv_obj_create(scr);
     lv_obj_set_size(screen_timeout_slider_card, lv_pct(90), 170);
     lv_obj_align(screen_timeout_slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90);
-    lv_obj_set_style_bg_color(screen_timeout_slider_card, lv_color_make(30, 30, 34), 0);
+    lv_obj_add_style(screen_timeout_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(screen_timeout_slider_card, 0, 0);
     lv_obj_set_style_radius(screen_timeout_slider_card, 10, 0);
     if (!current_settings.screen_timeout_enabled) lv_obj_add_flag(screen_timeout_slider_card, LV_OBJ_FLAG_HIDDEN);
@@ -14217,7 +14447,7 @@ static void startup_volume_slider_event_cb(lv_event_t * e) {
  * measurements reused here. */
 static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -14259,7 +14489,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     startup_volume_slider_card = lv_obj_create(scr);
     lv_obj_set_size(startup_volume_slider_card, lv_pct(90), 170);
     lv_obj_align(startup_volume_slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90);
-    lv_obj_set_style_bg_color(startup_volume_slider_card, lv_color_make(30, 30, 34), 0);
+    lv_obj_add_style(startup_volume_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(startup_volume_slider_card, 0, 0);
     lv_obj_set_style_radius(startup_volume_slider_card, 10, 0);
     if (!current_settings.startup_volume_fixed_enabled) lv_obj_add_flag(startup_volume_slider_card, LV_OBJ_FLAG_HIDDEN);
@@ -14334,7 +14564,7 @@ static void sleep_timer_slider_event_cb(lv_event_t * e) {
  * comment for why arming doesn't belong on this screen). */
 static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -14357,7 +14587,7 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_t * slider_card = lv_obj_create(scr);
     lv_obj_set_size(slider_card, lv_pct(90), 170);
     lv_obj_align(slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
-    lv_obj_set_style_bg_color(slider_card, lv_color_make(30, 30, 34), 0);
+    lv_obj_add_style(slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(slider_card, 0, 0);
     lv_obj_set_style_radius(slider_card, 10, 0);
 
@@ -14465,7 +14695,7 @@ static void idle_shutdown_slider_event_cb(lv_event_t * e) {
 
 static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
@@ -14575,7 +14805,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     idle_shutdown_slider_card = lv_obj_create(scr);
     lv_obj_set_size(idle_shutdown_slider_card, lv_pct(90), 200);
     lv_obj_align(idle_shutdown_slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90 + 292 + 20);
-    lv_obj_set_style_bg_color(idle_shutdown_slider_card, lv_color_make(30, 30, 34), 0);
+    lv_obj_add_style(idle_shutdown_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(idle_shutdown_slider_card, 0, 0);
     lv_obj_set_style_radius(idle_shutdown_slider_card, 10, 0);
     if (!current_settings.idle_shutdown_enabled) lv_obj_add_flag(idle_shutdown_slider_card, LV_OBJ_FLAG_HIDDEN);
@@ -14946,13 +15176,6 @@ static lv_obj_t * build_home_screen(void) {
     return scr;
 }
 
-/* Neutral card color matching every other settings-style screen's cards
- * (screen_timeout_slider_card, idle_shutdown_slider_card, ...) -- the
- * previous green tint was this screen's own one-off look, which is
- * exactly what real-device feedback asked to drop ("styling should use
- * the same as all the other screens"). */
-#define EQ_CARD_COLOR lv_color_make(30, 30, 34)
-
 /* Bigger than the old 82px-tall/default-font cards (real-device feedback:
  * "sliders and text should be a little bigger and not overlap") -- value
  * label gets its own clear band at the top in a larger font, then a solid
@@ -14965,7 +15188,7 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
                                         lv_obj_t ** out_slider, int32_t range_min, int32_t range_max) {
     lv_obj_t * card = lv_obj_create(parent);
     lv_obj_set_size(card, lv_pct(92), 132);
-    lv_obj_set_style_bg_color(card, EQ_CARD_COLOR, 0);
+    lv_obj_add_style(card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_radius(card, 12, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -15079,7 +15302,7 @@ static void build_eq_reset_popup(void) {
     lv_obj_set_size(eq_reset_popup, 400, 220);
     lv_obj_align(eq_reset_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(eq_reset_popup, 16, 0);
-    lv_obj_set_style_bg_color(eq_reset_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(eq_reset_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(eq_reset_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(eq_reset_popup, 0, 0);
     lv_obj_remove_flag(eq_reset_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -15182,7 +15405,7 @@ static void build_factory_reset_popup(void) {
     lv_obj_set_size(factory_reset_popup, 400, 220);
     lv_obj_align(factory_reset_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(factory_reset_popup, 16, 0);
-    lv_obj_set_style_bg_color(factory_reset_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(factory_reset_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(factory_reset_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(factory_reset_popup, 0, 0);
     lv_obj_remove_flag(factory_reset_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -15289,7 +15512,7 @@ static void build_font_size_reboot_popup(void) {
     lv_obj_set_size(font_size_reboot_popup, 400, 220);
     lv_obj_align(font_size_reboot_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(font_size_reboot_popup, 16, 0);
-    lv_obj_set_style_bg_color(font_size_reboot_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_add_style(font_size_reboot_popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(font_size_reboot_popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(font_size_reboot_popup, 0, 0);
     lv_obj_remove_flag(font_size_reboot_popup, LV_OBJ_FLAG_SCROLLABLE);
@@ -15415,7 +15638,7 @@ static void eq_save_profile_btn_cb(lv_event_t * e) {
 
 static lv_obj_t * build_eq_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     /* Standard back button + title, matching every other sub-screen
      * (build_subsonic_list_screen et al) instead of the old screen's own
@@ -15503,7 +15726,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_t * band_grid = lv_obj_create(content);
     lv_obj_set_width(band_grid, lv_pct(92));
     lv_obj_set_height(band_grid, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(band_grid, EQ_CARD_COLOR, 0);
+    lv_obj_add_style(band_grid, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(band_grid, 0, 0);
     lv_obj_set_style_radius(band_grid, 12, 0);
     lv_obj_set_style_pad_all(band_grid, 10, 0);
@@ -15535,7 +15758,7 @@ static lv_obj_t * build_eq_screen(void) {
 
     lv_obj_t * type_row = lv_obj_create(content);
     lv_obj_set_size(type_row, lv_pct(92), 64);
-    lv_obj_set_style_bg_color(type_row, EQ_CARD_COLOR, 0);
+    lv_obj_add_style(type_row, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(type_row, 0, 0);
     lv_obj_set_style_radius(type_row, 12, 0);
     lv_obj_remove_flag(type_row, LV_OBJ_FLAG_SCROLLABLE);
@@ -15553,7 +15776,7 @@ static lv_obj_t * build_eq_screen(void) {
 
     lv_obj_t * enable_row = lv_obj_create(content);
     lv_obj_set_size(enable_row, lv_pct(92), 64);
-    lv_obj_set_style_bg_color(enable_row, EQ_CARD_COLOR, 0);
+    lv_obj_add_style(enable_row, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(enable_row, 0, 0);
     lv_obj_set_style_radius(enable_row, 12, 0);
     lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
@@ -15582,7 +15805,7 @@ static lv_obj_t * build_eq_screen(void) {
 
     lv_obj_t * save_btn = lv_obj_create(profile_row);
     lv_obj_set_size(save_btn, lv_pct(46), 56);
-    lv_obj_set_style_bg_color(save_btn, EQ_CARD_COLOR, 0);
+    lv_obj_add_style(save_btn, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(save_btn, 0, 0);
     lv_obj_set_style_radius(save_btn, 12, 0);
     lv_obj_remove_flag(save_btn, LV_OBJ_FLAG_SCROLLABLE);
@@ -15596,7 +15819,7 @@ static lv_obj_t * build_eq_screen(void) {
 
     lv_obj_t * load_btn = lv_obj_create(profile_row);
     lv_obj_set_size(load_btn, lv_pct(46), 56);
-    lv_obj_set_style_bg_color(load_btn, EQ_CARD_COLOR, 0);
+    lv_obj_add_style(load_btn, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(load_btn, 0, 0);
     lv_obj_set_style_radius(load_btn, 12, 0);
     lv_obj_remove_flag(load_btn, LV_OBJ_FLAG_SCROLLABLE);
@@ -15742,6 +15965,15 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     player_screen = build_player_screen(screen_width, screen_height);
 #ifndef HOST_BUILD
     boot_checkpoint("build_player_screen done");
+#endif
+    /* Converts any pre-existing absolute-path playlist entries (everything
+     * written before playlist_files_append()/_create() started writing
+     * relative ones) to relative -- see playlist_files_migrate_to_relative()'s
+     * own comment. Runs before the first read of any playlist below. Host-only
+     * exclusion matches migrate_old_db_if_needed()'s own -- ./music/Playlists
+     * locally is dev test fixtures, not real user data. */
+#ifndef HOST_BUILD
+    playlist_files_migrate_to_relative(PLAYLISTS_DIR);
 #endif
     library_load_from_cache_only();
 #ifndef HOST_BUILD
@@ -15949,7 +16181,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     build_home_indicator_bar();
     build_error_toast();
     build_info_toast();
-    build_info_popup();
     build_bt_action_popup();
     build_wifi_action_popup();
     build_usb_dac_leave_popup();

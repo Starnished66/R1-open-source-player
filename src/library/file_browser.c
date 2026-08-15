@@ -1,6 +1,7 @@
 #include "file_browser.h"
 #include "assets.h"
 #include "screen_builders.h" /* STATUS_BAR_CLEARANCE / TITLE_ROW_HEIGHT / LIST_ROW_* */
+#include "playlist_files.h" /* playlist_files_resolve_path() -- shared M3U line resolution */
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -154,13 +155,6 @@ bool file_browser_build_playlist_from_m3u(const char * m3u_path, char *** out_pl
     FILE * f = fopen(m3u_path, "r");
     if (!f) return false;
 
-    char dir_path[PATH_MAX];
-    const char * slash = strrchr(m3u_path, '/');
-    size_t dir_len = slash ? (size_t) (slash - m3u_path) : 0;
-    if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
-    memcpy(dir_path, m3u_path, dir_len);
-    dir_path[dir_len] = '\0';
-
     char ** playlist = NULL;
     int capacity = 0;
     int count = 0;
@@ -172,12 +166,12 @@ bool file_browser_build_playlist_from_m3u(const char * m3u_path, char *** out_pl
         if (len == 0 || line[0] == '#') continue; /* blank line or M3U directive/comment */
         if (!is_playable_file(line)) continue;
 
+        /* Resolves both absolute lines (old-style) and lines relative to
+         * m3u_path's own directory (the standard M3U convention, and what
+         * playlist_files_append()/_create() now write) -- see
+         * playlist_files_resolve_path()'s own comment. */
         char full_path[PATH_MAX];
-        if (line[0] == '/') {
-            snprintf(full_path, sizeof(full_path), "%s", line);
-        } else {
-            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, line);
-        }
+        playlist_files_resolve_path(m3u_path, line, full_path, sizeof(full_path));
 
         if (count == capacity) {
             capacity = capacity ? capacity * 2 : 8;

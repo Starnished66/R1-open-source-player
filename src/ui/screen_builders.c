@@ -426,8 +426,13 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
             lv_obj_t * toggle_img = lv_image_create(row);
             lv_image_set_src(toggle_img, asset_path(item->toggle_initial_state ? "settings/on.png" : "settings/off.png"));
             lv_obj_align(toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
-            if (toggle_accent_style) lv_obj_add_style(toggle_img, toggle_accent_style, 0);
             if (item->toggle_initial_state) lv_obj_add_state(toggle_img, LV_STATE_CHECKED);
+            /* LV_STATE_CHECKED selector, not unconditional -- otherwise the
+             * recolor hits both the ON and OFF sprite alike, making the
+             * toggle unreadable in either state (real-device bug report).
+             * pill_toggle_row_event_cb() above already keeps this state in
+             * sync with which sprite is showing on every tap. */
+            if (toggle_accent_style) lv_obj_add_style(toggle_img, toggle_accent_style, LV_STATE_CHECKED);
 
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             pill_toggle_ctx_t * ctx = malloc(sizeof(pill_toggle_ctx_t));

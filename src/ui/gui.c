@@ -493,6 +493,14 @@ static const uint32_t accent_palette[] = {
     0x009688, /* teal */
     0xE91E63, /* pink */
     0xE0E0E0, /* light gray */
+    0xFFEB3B, /* yellow */
+    0x00BCD4, /* cyan */
+    0x3F51B5, /* indigo */
+    0xFFC107, /* amber */
+    0xCDDC39, /* lime */
+    0x795548, /* brown */
+    0x607D8B, /* blue gray */
+    0xFFFFFF, /* white */
 };
 #define ACCENT_PALETTE_COUNT (sizeof(accent_palette) / sizeof(accent_palette[0]))
 static lv_obj_t * accent_swatches[ACCENT_PALETTE_COUNT];
@@ -505,7 +513,7 @@ static void accent_swatch_event_cb(lv_event_t * e) {
     /* The screen isn't rebuilt on re-visit, so the selection ring has to be
      * updated here rather than only at construction time. */
     for (size_t i = 0; i < ACCENT_PALETTE_COUNT; i++) {
-        lv_obj_set_style_border_width(accent_swatches[i], accent_palette[i] == rgb ? 3 : 0, 0);
+        lv_obj_set_style_border_width(accent_swatches[i], accent_palette[i] == rgb ? 4 : 0, 0);
     }
 }
 
@@ -8357,9 +8365,21 @@ static lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text
      * so a plain local style is just as correct and doesn't need
      * lv_obj_report_style_change() to reach it), but the on.png/off.png
      * sprite itself still needs an explicit recolor -- see
-     * apply_accent_color()'s own comment on image_recolor vs bg_color. */
-    lv_obj_set_style_image_recolor(toggle_img, accent_lv_color(), 0);
-    lv_obj_set_style_image_recolor_opa(toggle_img, LV_OPA_COVER, 0);
+     * apply_accent_color()'s own comment on image_recolor vs bg_color.
+     *
+     * Real-device bug report #2: recoloring unconditionally (regardless of
+     * `checked`) tinted BOTH on.png and off.png the same accent color,
+     * making every toggle look identical in either state -- the whole
+     * point of a two-sprite toggle is that they're already visually
+     * distinct (on.png accent-ish/colored, off.png neutral gray), and this
+     * was overwriting that distinction rather than adding to it. Only the
+     * ON sprite should ever be recolored, same as every lv_switch-based
+     * toggle in this file only applies style_accent with the
+     * LV_STATE_CHECKED selector, never unconditionally. */
+    if (checked) {
+        lv_obj_set_style_image_recolor(toggle_img, accent_lv_color(), 0);
+        lv_obj_set_style_image_recolor_opa(toggle_img, LV_OPA_COVER, 0);
+    }
 
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     if (on_click) lv_obj_add_event_cb(row, on_click, LV_EVENT_CLICKED, NULL);
@@ -13189,6 +13209,13 @@ static void remote_control_toggle_cb(lv_event_t * e) {
 
     lv_image_set_src(remote_control_toggle_img,
                       asset_path(current_settings.remote_control_enabled ? "settings/on.png" : "settings/off.png"));
+    /* Keeps the LV_STATE_CHECKED selector on remote_control_toggle_img's own
+     * style_accent attachment (see build_remote_control_screen()'s own
+     * comment) tracking reality, so the accent recolor only ever shows on
+     * the ON sprite -- see add_pill_toggle_row()'s own bug report #2 for
+     * why an unconditional recolor is wrong here. */
+    if (current_settings.remote_control_enabled) lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
+    else lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
     if (current_settings.remote_control_enabled) {
         remote_control_start();
     } else {
@@ -13244,13 +13271,21 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_image_set_src(remote_control_toggle_img,
                       asset_path(current_settings.remote_control_enabled ? "settings/on.png" : "settings/off.png"));
     lv_obj_align(remote_control_toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
+    if (current_settings.remote_control_enabled) lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
     /* Real-device bug report: accent color wasn't applying to this toggle
      * either. Unlike add_pill_toggle_row() (rebuilt fresh on every screen
      * repopulation, so a plain local color read is fine there), this
      * screen is built exactly once at startup (see its own call site) and
      * never rebuilt -- needs the live-updating shared style so a later
-     * accent color change still reaches it. */
-    lv_obj_add_style(remote_control_toggle_img, &style_accent, 0);
+     * accent color change still reaches it.
+     *
+     * Real-device bug report #2: LV_STATE_CHECKED selector, not the
+     * unconditional 0 this originally used -- otherwise the recolor hits
+     * both the ON and OFF sprite alike, making the toggle unreadable in
+     * either state. lv_obj_add_state() above (and remote_control_toggle_
+     * cb()'s own add/clear) keeps this selector matching which sprite is
+     * actually showing. */
+    lv_obj_add_style(remote_control_toggle_img, &style_accent, LV_STATE_CHECKED);
 
     lv_obj_t * explanation = lv_label_create(scr);
     lv_label_set_text(explanation,
@@ -13817,20 +13852,31 @@ static lv_obj_t * build_accent_color_screen(void) {
     lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
+    /* Real-device feedback: the swatches were too small to comfortably tap
+     * and the 8-color palette felt limited -- bumped from 36px to 64px
+     * (matching this screen's own back_btn hitbox size) and doubled the
+     * palette to 16. That no longer fits one 50px row, so this container
+     * grows to LV_SIZE_CONTENT height and wraps across as many rows as it
+     * needs -- pad_row/pad_column give the bigger circles even breathing
+     * room in both directions, matching SPACE_EVENLY's own horizontal
+     * distribution instead of just relying on it alone. */
     lv_obj_t * swatch_row = lv_obj_create(scr);
-    lv_obj_set_size(swatch_row, lv_pct(90), 50);
+    lv_obj_set_size(swatch_row, lv_pct(92), LV_SIZE_CONTENT);
     lv_obj_align(swatch_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
     lv_obj_set_style_bg_opa(swatch_row, 0, 0);
     lv_obj_set_style_border_width(swatch_row, 0, 0);
+    lv_obj_remove_flag(swatch_row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(swatch_row, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(swatch_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(swatch_row, 20, 0);
+    lv_obj_set_style_pad_column(swatch_row, 16, 0);
 
     for (size_t i = 0; i < ACCENT_PALETTE_COUNT; i++) {
         lv_obj_t * swatch = lv_obj_create(swatch_row);
-        lv_obj_set_size(swatch, 36, 36);
+        lv_obj_set_size(swatch, 64, 64);
         lv_obj_set_style_radius(swatch, LV_RADIUS_CIRCLE, 0);
         lv_obj_set_style_bg_color(swatch, lv_color_hex(accent_palette[i]), 0);
-        lv_obj_set_style_border_width(swatch, current_settings.accent_color == accent_palette[i] ? 3 : 0, 0);
+        lv_obj_set_style_border_width(swatch, current_settings.accent_color == accent_palette[i] ? 4 : 0, 0);
         lv_obj_set_style_border_color(swatch, lv_color_make(255, 255, 255), 0);
         lv_obj_add_flag(swatch, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(swatch, accent_swatch_event_cb, LV_EVENT_CLICKED, (void *) (intptr_t) accent_palette[i]);

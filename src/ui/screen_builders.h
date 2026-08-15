@@ -127,6 +127,16 @@ typedef struct {
     lv_event_cb_t on_click;         /* fired on row LV_EVENT_CLICKED (NONE/CHEVRON rows) */
     lv_event_cb_t on_toggle_change; /* fired on LV_EVENT_VALUE_CHANGED (TOGGLE rows) */
     void * user_data;
+    /* Optional (NULL for every row that doesn't need it): on a
+     * PILL_ACCESSORY_TOGGLE row, *out_toggle_img is set to the toggle's own
+     * lv_image_t once built, so a caller can update its sprite/LV_STATE_CHECKED
+     * later from somewhere else entirely (e.g. a quick-drawer icon that
+     * mirrors the same underlying setting) -- these screens are built once
+     * at startup and never rebuilt, so nothing else keeps this row's visual
+     * state in sync with the setting on its own. See gui.c's
+     * settings_crossfade_toggle_img for the motivating real-device bug
+     * (drawer/settings crossfade toggles falling out of sync). */
+    lv_obj_t ** out_toggle_img;
 } pill_list_item_t;
 
 /* Titled screen: real back-arrow button and a vertically scrollable list of

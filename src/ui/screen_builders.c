@@ -434,6 +434,8 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
              * sync with which sprite is showing on every tap. */
             if (toggle_accent_style) lv_obj_add_style(toggle_img, toggle_accent_style, LV_STATE_CHECKED);
 
+            if (item->out_toggle_img) *item->out_toggle_img = toggle_img;
+
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             pill_toggle_ctx_t * ctx = malloc(sizeof(pill_toggle_ctx_t));
             ctx->toggle_img = toggle_img;

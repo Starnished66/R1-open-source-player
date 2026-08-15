@@ -469,9 +469,25 @@ static void apply_accent_color(uint32_t rgb) {
      * what a plain lv_image_create() widget reads -- needed for toggle rows
      * built once at startup and never rebuilt (e.g. remote_control_toggle_img),
      * which can't just re-read accent_lv_color() on a later screen visit the
-     * way a repopulated list (add_pill_toggle_row()) can. */
+     * way a repopulated list (add_pill_toggle_row()) can.
+     *
+     * Real-device bug report: on.png's ON sprite bakes its white handle
+     * circle and colored track into one flat bitmap (no separate LVGL
+     * part/knob the way a real lv_switch has) -- recoloring at LV_OPA_COVER
+     * (the previous value here) replaces every non-transparent pixel with
+     * the exact same solid accent color regardless of its original
+     * lightness, so the handle and track become one indistinguishable
+     * blob. LVGL's image recolor is a plain per-channel alpha blend
+     * (result = recolor*opa + original*(255-opa), see
+     * lv_draw_sw_img.c's "Apply recolor" block) -- at any opa below COVER,
+     * the handle's original white and the track's original (darker, more
+     * saturated) color still land at different final brightnesses after
+     * blending toward the same accent color, since they started from
+     * different values. LV_OPA_80 keeps a strong, clearly accent-tinted
+     * look while leaving enough of that original contrast for the handle
+     * to still read as a distinct circle against the track. */
     lv_style_set_image_recolor(&style_accent, lv_color_hex(rgb));
-    lv_style_set_image_recolor_opa(&style_accent, LV_OPA_COVER);
+    lv_style_set_image_recolor_opa(&style_accent, LV_OPA_80);
     /* Modifying a shared lv_style_t's properties in place doesn't by
      * itself invalidate the objects that reference it -- LVGL needs an
      * explicit nudge to know to redraw them (confirmed empirically: without
@@ -2042,23 +2058,45 @@ static void show_volume_popup(int32_t percent) {
 /* Real control now -- see crossfade_switch_event_cb (Settings > Crossfade)
  * for the other half of this same toggle; both read/write
  * current_settings.crossfade_enabled and both keep the OTHER one's icon/
- * switch state in sync via refresh_quick_drawer_crossfade_icon(), so
- * whichever one you use, the other reflects it next time you look. Uses
- * pull_down/fade.png/fade_s.png (a real stock asset, dedicated to this --
- * confirmed by name, unlike gain_h.png/gain_l.png this used to show, which
- * was always a placeholder for "output gain", never a real control). */
+ * switch state in sync (refresh_quick_drawer_crossfade_icon() /
+ * sync_settings_crossfade_toggle()), so whichever one you use, the other
+ * reflects it next time you look. Uses pull_down/fade.png/fade_s.png (a
+ * real stock asset, dedicated to this -- confirmed by name, unlike
+ * gain_h.png/gain_l.png this used to show, which was always a placeholder
+ * for "output gain", never a real control). */
 static lv_obj_t * quick_drawer_crossfade_icon;
 static void refresh_quick_drawer_crossfade_icon(void) {
     if (!quick_drawer_crossfade_icon) return;
     lv_image_set_src(quick_drawer_crossfade_icon,
                      asset_path(current_settings.crossfade_enabled ? "pull_down/fade_s.png" : "pull_down/fade.png"));
 }
+
+/* Settings > Playback's own Crossfade toggle row (build_settings_playback_screen(),
+ * captured via pill_list_item_t's out_toggle_img) -- that screen is built
+ * once at gui_init() and never rebuilt, so its toggle's sprite/LV_STATE_CHECKED
+ * only ever reflects whatever current_settings.crossfade_enabled was at
+ * that one build time unless something explicitly pokes it afterward.
+ * Real-device bug report: toggling crossfade from the quick drawer left
+ * this row showing the old (now wrong) state the next time Settings >
+ * Playback was opened -- the settings->drawer direction already worked
+ * (crossfade_switch_event_cb calls refresh_quick_drawer_crossfade_icon()),
+ * but nothing called the reverse. */
+static lv_obj_t * settings_crossfade_toggle_img;
+static void sync_settings_crossfade_toggle(void) {
+    if (!settings_crossfade_toggle_img) return;
+    lv_image_set_src(settings_crossfade_toggle_img,
+                     asset_path(current_settings.crossfade_enabled ? "settings/on.png" : "settings/off.png"));
+    if (current_settings.crossfade_enabled) lv_obj_add_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
+    else lv_obj_clear_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
+}
+
 static void quick_drawer_crossfade_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     current_settings.crossfade_enabled = !current_settings.crossfade_enabled;
     audio_set_crossfade_enabled(current_settings.crossfade_enabled);
     settings_save(&current_settings);
     refresh_quick_drawer_crossfade_icon();
+    sync_settings_crossfade_toggle();
 }
 
 /* Defined later, alongside the rest of the transport-button wiring --
@@ -8444,7 +8482,11 @@ static lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text
      * LV_STATE_CHECKED selector, never unconditionally. */
     if (checked) {
         lv_obj_set_style_image_recolor(toggle_img, accent_lv_color(), 0);
-        lv_obj_set_style_image_recolor_opa(toggle_img, LV_OPA_COVER, 0);
+        /* LV_OPA_80, not LV_OPA_COVER -- see apply_accent_color()'s own
+         * comment on style_accent's image_recolor_opa for why COVER
+         * flattens on.png's handle and track into one indistinguishable
+         * solid color. */
+        lv_obj_set_style_image_recolor_opa(toggle_img, LV_OPA_80, 0);
     }
 
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -14720,7 +14762,8 @@ static lv_obj_t * build_settings_playback_screen(void) {
     items[0] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
                                     current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
-                                    current_settings.crossfade_enabled, NULL, crossfade_switch_event_cb, NULL };
+                                    current_settings.crossfade_enabled, NULL, crossfade_switch_event_cb, NULL,
+                                    &settings_crossfade_toggle_img };
     items[2] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
@@ -15449,7 +15492,7 @@ static lv_obj_t * build_eq_screen(void) {
     /* Pre-Amp: an overall gain applied before the per-band filters, so
      * boosted bands can be pulled back down without touching every band's
      * own gain -- same role as the reference DAP's "Pre AMP" control. */
-    create_eq_slider_card(content, EQ_FIELD_PREAMP, &eq_preamp_value_label, &eq_preamp_slider, -120, 120);
+    lv_obj_t * eq_preamp_card = create_eq_slider_card(content, EQ_FIELD_PREAMP, &eq_preamp_value_label, &eq_preamp_slider, -120, 120);
 
     /* Band picker: a 5x2 grid of tappable band numbers -- edit one band's
      * freq/Q/gain/type at a time rather than showing 10 bands' worth of
@@ -15486,9 +15529,9 @@ static lv_obj_t * build_eq_screen(void) {
         eq_band_button_labels[i] = label;
     }
 
-    create_eq_slider_card(content, EQ_FIELD_FREQ, &eq_freq_value_label, &eq_freq_slider, 0, EQ_FREQ_SLIDER_MAX);
-    create_eq_slider_card(content, EQ_FIELD_GAIN, &eq_gain_value_label, &eq_gain_slider, -120, 120);
-    create_eq_slider_card(content, EQ_FIELD_Q, &eq_q_value_label, &eq_q_slider, 1, 100);
+    lv_obj_t * eq_freq_card = create_eq_slider_card(content, EQ_FIELD_FREQ, &eq_freq_value_label, &eq_freq_slider, 0, EQ_FREQ_SLIDER_MAX);
+    lv_obj_t * eq_gain_card = create_eq_slider_card(content, EQ_FIELD_GAIN, &eq_gain_value_label, &eq_gain_slider, -120, 120);
+    lv_obj_t * eq_q_card = create_eq_slider_card(content, EQ_FIELD_Q, &eq_q_value_label, &eq_q_slider, 1, 100);
 
     lv_obj_t * type_row = lv_obj_create(content);
     lv_obj_set_size(type_row, lv_pct(92), 64);
@@ -15586,6 +15629,26 @@ static lv_obj_t * build_eq_screen(void) {
      * file: a drag over a card that isn't the slider itself should scroll
      * the list, not bubble up as an app-wide swipe. */
     lv_obj_remove_flag(content, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    /* Real-device bug report: dragging a PEQ slider (Pre-Amp/Freq/Gain/Q)
+     * right-to-left could still get hijacked into the app-wide "swipe to
+     * player" transition mid-drag, abandoning the slider adjustment --
+     * the exact same real-device incident already fixed for the Idle
+     * Shutdown/Screen Timeout/Startup Volume sliders (see
+     * active_press_is_over_drag_adjust_widget()'s and
+     * register_swipe_dead_zone()'s own comments): the swipe-to-player
+     * gesture is detected by a separate raw-indev-polling path that
+     * doesn't go through LVGL's GESTURE_BUBBLE/event system at all, so
+     * removing content's own GESTURE_BUBBLE flag above doesn't reach it.
+     * These 4 cards were never registered as dead zones for that path,
+     * unlike those other sliders' own cards -- fixing that omission here. */
+    lv_obj_remove_flag(eq_preamp_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    register_swipe_dead_zone(eq_preamp_card);
+    lv_obj_remove_flag(eq_freq_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    register_swipe_dead_zone(eq_freq_card);
+    lv_obj_remove_flag(eq_gain_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    register_swipe_dead_zone(eq_gain_card);
+    lv_obj_remove_flag(eq_q_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    register_swipe_dead_zone(eq_q_card);
     return scr;
 }
 
@@ -15654,7 +15717,12 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     lv_style_set_bg_image_recolor(&style_accent, accent_lv_color());
     lv_style_set_bg_image_recolor_opa(&style_accent, LV_OPA_COVER);
     lv_style_set_image_recolor(&style_accent, accent_lv_color());
-    lv_style_set_image_recolor_opa(&style_accent, LV_OPA_COVER);
+    /* LV_OPA_80, not LV_OPA_COVER -- see apply_accent_color()'s own comment
+     * on this same property for why COVER flattens on.png's handle and
+     * track into one indistinguishable solid color. Mirrored here since
+     * this is the initial setup at boot, before apply_accent_color() might
+     * ever run again. */
+    lv_style_set_image_recolor_opa(&style_accent, LV_OPA_80);
 
     lv_style_init(&style_muted_text);
     lv_style_set_text_color(&style_muted_text, lv_color_make(220, 220, 220));

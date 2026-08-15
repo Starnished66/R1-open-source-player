@@ -5,6 +5,7 @@
 #include <string.h>
 
 lv_style_t list_row_style;
+lv_style_t list_row_pressed_style;
 
 void screen_builders_init_list_row_style(void) {
     lv_style_init(&list_row_style);
@@ -18,6 +19,20 @@ void screen_builders_init_list_row_style(void) {
     lv_style_set_pad_top(&list_row_style, (LIST_ROW_HEIGHT - lv_font_get_line_height(&LIST_ROW_FONT)) / 2);
     lv_style_set_text_color(&list_row_style, lv_color_make(230, 230, 230));
     lv_style_set_text_font(&list_row_style, &LIST_ROW_FONT);
+
+    /* Real-device bug report: no visual feedback at all on touching a song
+     * row (list_row_style has no LV_STATE_PRESSED override, so the row's
+     * bg_color never changed) -- a plain tap had nothing confirming it
+     * registered, and a long-press-in-progress looked identical to not
+     * touching the screen at all until the context menu suddenly appeared.
+     * Added as its own style (not folded into list_row_style itself) so it
+     * can be attached with the LV_STATE_PRESSED selector specifically --
+     * see build_compact_list_widget()/populate_group_songs_rows()'s own
+     * lv_obj_add_style() calls. Noticeably lighter than LIST_ROW_BG_COLOR
+     * (28,28,30) rather than a subtle tint, so it reads clearly even in a
+     * quick tap, not just a held press. */
+    lv_style_init(&list_row_pressed_style);
+    lv_style_set_bg_color(&list_row_pressed_style, lv_color_make(60, 60, 64));
 }
 
 /* True black -- every icon-grid/pill-list tile has a transparent background
@@ -464,6 +479,16 @@ typedef struct {
     compact_list_item_t * items; /* owned copy -- see build_compact_list_screen()'s own doc comment */
     int item_count;
     compact_list_click_cb_t on_click;
+    compact_list_click_cb_t on_long_press; /* NULL for a list with no long-press action (e.g. Artists/Albums name rows) */
+    /* Real-device incident: LVGL still sends LV_EVENT_CLICKED on release
+     * even when LV_EVENT_LONG_PRESSED already fired earlier in that same
+     * press (lv_indev.c's indev_proc_release() doesn't check) -- same root
+     * cause as quick_drawer_wifi_long_press_cb's own doc comment in gui.c,
+     * fixed the same way: the long-press handler sets this, the click
+     * handler checks-and-clears it first and skips entirely if set. One
+     * flag for the whole list, not per-row -- this is a single-touch
+     * device, only one row can plausibly be mid-press at a time. */
+    bool long_press_fired;
     int window_start; /* index currently shown by rows[0]; -1 forces the first update to actually run */
     lv_obj_t * rows[COMPACT_LIST_POOL_SIZE];
     void * row_ctx[COMPACT_LIST_POOL_SIZE]; /* opaque to this struct, freed alongside it -- see compact_list_row_ctx_t below */
@@ -485,9 +510,27 @@ typedef struct {
 static void compact_list_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     compact_list_row_ctx_t * ctx = (compact_list_row_ctx_t *) lv_event_get_user_data(e);
+    if (ctx->data->long_press_fired) { /* see compact_list_row_long_press_cb()'s own comment */
+        ctx->data->long_press_fired = false;
+        return;
+    }
     int index = ctx->data->window_start + ctx->pool_slot;
     if (index < 0 || index >= ctx->data->item_count) return; /* this pool slot is currently a hidden, contentless row (list shorter than the pool) -- shouldn't be reachable, guarded anyway */
     ctx->data->on_click(index);
+}
+
+/* Same index resolution as compact_list_row_click_cb() above, for the
+ * optional long-press action (song context menu -- Add to Queue/Add to
+ * Playlist) -- only ever attached (see the row-pool setup below) when the
+ * caller actually passed an on_long_press, so this is never invoked for a
+ * list that doesn't have one. */
+static void compact_list_row_long_press_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+    compact_list_row_ctx_t * ctx = (compact_list_row_ctx_t *) lv_event_get_user_data(e);
+    ctx->data->long_press_fired = true;
+    int index = ctx->data->window_start + ctx->pool_slot;
+    if (index < 0 || index >= ctx->data->item_count) return;
+    ctx->data->on_long_press(index);
 }
 
 /* Repositions/relabels the row pool so it covers the range of items
@@ -597,8 +640,8 @@ void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, 
  * search results overlay, layered on top of build_files_screen()'s own
  * folder-browsing UI rather than needing a whole separate screen. */
 lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_t * items, int item_count,
-                                      compact_list_click_cb_t on_click, int32_t row_width,
-                                      bool enable_now_playing, lv_color_t now_playing_color) {
+                                      compact_list_click_cb_t on_click, compact_list_click_cb_t on_long_press,
+                                      int32_t row_width, bool enable_now_playing, lv_color_t now_playing_color) {
     lv_obj_t * list = lv_obj_create(parent);
     lv_obj_set_size(list, lv_pct(100),
                     lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
@@ -614,6 +657,8 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     compact_list_virtual_data_t * data = malloc(sizeof(*data));
     data->item_count = item_count;
     data->on_click = on_click;
+    data->on_long_press = on_long_press;
+    data->long_press_fired = false;
     data->window_start = -1;
     data->items = NULL;
     if (item_count > 0) {
@@ -636,6 +681,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) {
         lv_obj_t * row = lv_label_create(list);
         lv_obj_add_style(row, &list_row_style, 0);
+        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
         if (row_width != LIST_ROW_WIDTH) lv_obj_set_style_width(row, row_width, 0); /* local override -- see this param's own doc comment (screen_builders.h) */
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_pos(row, row_x, COMPACT_LIST_TOP_PAD + slot * COMPACT_LIST_ROW_STRIDE);
@@ -648,6 +694,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
         ctx->pool_slot = slot;
         data->row_ctx[slot] = ctx;
         lv_obj_add_event_cb(row, compact_list_row_click_cb, LV_EVENT_CLICKED, ctx);
+        if (on_long_press) lv_obj_add_event_cb(row, compact_list_row_long_press_cb, LV_EVENT_LONG_PRESSED, ctx);
     }
 
     /* 1x1 invisible spacer at the bottom of the FULL virtual list -- not
@@ -700,15 +747,16 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
 
 lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                       const compact_list_item_t * items, int item_count,
-                                      compact_list_click_cb_t on_click, lv_obj_t ** out_list,
-                                      int32_t row_width, bool enable_now_playing, lv_color_t now_playing_color) {
+                                      compact_list_click_cb_t on_click, compact_list_click_cb_t on_long_press,
+                                      lv_obj_t ** out_list, int32_t row_width, bool enable_now_playing,
+                                      lv_color_t now_playing_color) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, SCREEN_BG_COLOR, 0);
 
     if (back_btn_cb) build_back_button(scr, back_btn_cb);
     build_title(scr, title);
 
-    lv_obj_t * list = build_compact_list_widget(scr, items, item_count, on_click, row_width,
+    lv_obj_t * list = build_compact_list_widget(scr, items, item_count, on_click, on_long_press, row_width,
                                                  enable_now_playing, now_playing_color);
 
     if (out_list) *out_list = list;

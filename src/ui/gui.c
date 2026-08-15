@@ -342,6 +342,22 @@ static char ** playlist = NULL;
 static int playlist_count = 0;
 static int playlist_index = -1;
 
+/* "Up Next" queue (long-press a song -> Add to Queue): how many playlist[]
+ * slots starting right at playlist_index+1 are still-unplayed queue
+ * insertions, and where the NEXT "Add to Queue" tap should splice one in.
+ * Implemented as a splice into the live playlist[] array (queue_add_song(),
+ * defined with the rest of the playback-advance machinery below) rather
+ * than a separate out-of-band list, since apply_track_metadata_to_ui()/
+ * arm_next_track_for_audio()/the "Track X of Y" label are all already
+ * deeply coupled to playlist[]/playlist_index -- reusing that machinery
+ * needs zero changes to any of it. compute_auto_advance_index()/compute_
+ * manual_step_index() both check queued_pending_count first, ahead of
+ * play_mode, so a queued song plays next regardless of shuffle/repeat --
+ * plain array adjacency alone wouldn't guarantee that under Shuffle, which
+ * jumps around the array via shuffle_order rather than stepping by 1. */
+static int queued_pending_count = 0;
+static int queue_next_insert_index = -1; /* -1 = nothing pending, next add goes right after playlist_index */
+
 /* Index into all_songs_paths/all_song_tags (NOT playlist[]/playlist_index --
  * those track the CURRENT PLAYBACK QUEUE's own position, which for Group
  * Songs/Files/Subsonic playback isn't an index into the whole-library
@@ -3303,6 +3319,12 @@ static int * pending_shuffle_order = NULL;
 static int compute_auto_advance_index(int index) {
     if (index < 0 || playlist_count <= 0) return -1;
 
+    /* A queued song always plays next, ahead of play_mode entirely (Repeat
+     * One included -- queueing something is an explicit override of
+     * whatever's currently looping) -- see queued_pending_count's own
+     * comment. */
+    if (queued_pending_count > 0 && index + 1 < playlist_count) return index + 1;
+
     switch ((play_mode_t) current_settings.play_mode) {
         case PLAY_MODE_REPEAT_ONE:
             return index;
@@ -3336,6 +3358,16 @@ static int compute_auto_advance_index(int index) {
  * the reshuffled bag precomputed above if a wrap happened. No-op outside
  * Shuffle mode, where compute_auto_advance_index() is already pure/stateless. */
 static void commit_auto_advance(void) {
+    /* Matches compute_auto_advance_index()'s own queue-priority check --
+     * a queue-jump never steps through the shuffle bag (shuffle_pos is
+     * untouched), so it's handled here first and returns before any of the
+     * shuffle bookkeeping below. */
+    if (queued_pending_count > 0) {
+        queued_pending_count--;
+        if (queued_pending_count == 0) queue_next_insert_index = -1;
+        return;
+    }
+
     if ((play_mode_t) current_settings.play_mode != PLAY_MODE_SHUFFLE) return;
 
     int peek_pos = shuffle_pos + 1;
@@ -3358,6 +3390,19 @@ static void commit_auto_advance(void) {
  * this same track". Returns -1 for "no-op, already at that edge". */
 static int compute_manual_step_index(int index, int direction) {
     if (index < 0 || playlist_count <= 0) return -1;
+
+    /* Same queue-priority override as compute_auto_advance_index()/
+     * commit_auto_advance() -- a manual Next tap should land on a queued
+     * song too, not skip past it into whatever play_mode would otherwise
+     * pick. Every caller of this function (direction=+1 case) is a real,
+     * one-shot commit (touchscreen/hw button/BT remote/phone remote Next,
+     * each behind its own edge-triggered "consume" flag) -- never a
+     * speculative preview call -- so decrementing here is safe. */
+    if (direction > 0 && queued_pending_count > 0 && index + 1 < playlist_count) {
+        queued_pending_count--;
+        if (queued_pending_count == 0) queue_next_insert_index = -1;
+        return index + 1;
+    }
 
     if ((play_mode_t) current_settings.play_mode == PLAY_MODE_SHUFFLE) {
         ensure_shuffle_order_current();
@@ -3895,6 +3940,40 @@ static void arm_next_track_for_audio(int index) {
     free(next_meta.picture_data); /* only needed the gain/peak fields, not the art */
 }
 
+/* Song long-press context menu's "Add to Queue" -- splices `path` into the
+ * live playlist right after whatever was queued last (or right after the
+ * currently-playing track, if the queue's currently empty), so repeated
+ * Add to Queue taps play back in the order they were added. See
+ * queued_pending_count's own comment for why this reuses playlist[]
+ * directly instead of a separate list. No-op with a toast if nothing's
+ * playing -- there's no "currently playing track" position to queue
+ * after. */
+static void queue_add_song(const char * path) {
+    if (playlist_index < 0 || !playlist) {
+        show_error_toast("Nothing is playing");
+        return;
+    }
+
+    int pos = (queue_next_insert_index >= 0 && queue_next_insert_index <= playlist_count) ? queue_next_insert_index
+                                                                                            : playlist_index + 1;
+
+    char ** grown = realloc(playlist, sizeof(char *) * (size_t) (playlist_count + 1));
+    playlist = grown;
+    memmove(&playlist[pos + 1], &playlist[pos], sizeof(char *) * (size_t) (playlist_count - pos));
+    playlist[pos] = strdup(path);
+    playlist_count++;
+    queued_pending_count++;
+    queue_next_insert_index = pos + 1;
+
+    lv_label_set_text_fmt(song_count_label, "%d/%d", playlist_index + 1, playlist_count);
+    /* Re-arm gapless preload -- what comes right after playlist_index may
+     * have just changed (a brand new queue, or this insert landing exactly
+     * there). */
+    arm_next_track_for_audio(playlist_index);
+
+    show_info_toast("Added to queue");
+}
+
 /* Bluetooth DAC mode and AirPlay receive mode both feed real-time audio
  * from another device straight into this device's own physical ALSA
  * hardware (hw:0,0) -- confirmed by checking what each one's consumer
@@ -3986,6 +4065,13 @@ static void on_file_selected(char ** new_playlist, int count, int selected_index
     free_playlist();
     playlist = new_playlist;
     playlist_count = count;
+    /* A brand new playback context (a fresh song tapped from any list)
+     * invalidates whatever was queued against the OLD playlist[] -- those
+     * array positions no longer mean anything once the array itself has
+     * been replaced. Matches every other music app: starting something new
+     * clears "Up Next". */
+    queued_pending_count = 0;
+    queue_next_insert_index = -1;
     play_track_at(selected_index);
 }
 
@@ -5159,12 +5245,19 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
 static lv_obj_t * add_to_playlist_screen;
 static lv_obj_t * add_to_playlist_list;
 
+/* Which song this screen adds to whatever playlist is picked -- set by
+ * open_add_to_playlist_for() right before nav_push(), not always the
+ * currently-playing track anymore (see that function's own comment: the
+ * song long-press context menu reaches this same screen for an arbitrary
+ * row, not just the player's own "..." menu). */
+static char add_to_playlist_target_path[512] = "";
+
 static void new_playlist_name_done_cb(const char * text, void * user_data) {
     (void) user_data;
-    if (text[0] == '\0' || playlist_index < 0) return;
+    if (text[0] == '\0' || add_to_playlist_target_path[0] == '\0') return;
 
     char created_path[512];
-    bool ok = playlist_files_create(PLAYLISTS_DIR, text, playlist[playlist_index], created_path, sizeof(created_path));
+    bool ok = playlist_files_create(PLAYLISTS_DIR, text, add_to_playlist_target_path, created_path, sizeof(created_path));
     if (ok) metadata_db_playlist_insert_one(created_path);
     show_error_toast(ok ? "Playlist created" : "Failed to create playlist");
     nav_pop(); /* leave the Add to Playlist picker too, back to the player */
@@ -5177,7 +5270,7 @@ static void new_playlist_row_cb(lv_event_t * e) {
 
 static void existing_playlist_row_cb(lv_event_t * e) {
     const char * path = (const char *) lv_event_get_user_data(e);
-    if (playlist_index < 0) return;
+    if (add_to_playlist_target_path[0] == '\0') return;
 
     /* Playlist design change: adding a song already in the target playlist
      * used to just append a second copy with no feedback -- confirmed by
@@ -5186,13 +5279,13 @@ static void existing_playlist_row_cb(lv_event_t * e) {
      * stays a plain, unconditional "add this line" primitive other callers
      * (e.g. new_playlist_name_done_cb() below, adding a brand-new file's
      * first song) don't pay an unnecessary duplicate scan for. */
-    if (playlist_files_contains(path, playlist[playlist_index])) {
+    if (playlist_files_contains(path, add_to_playlist_target_path)) {
         show_error_toast("Song already added");
         nav_pop();
         return;
     }
 
-    bool ok = playlist_files_append(path, playlist[playlist_index]);
+    bool ok = playlist_files_append(path, add_to_playlist_target_path);
     show_error_toast(ok ? "Added to playlist" : "Failed to add to playlist");
     nav_pop();
 }
@@ -5247,6 +5340,77 @@ static void populate_add_to_playlist_screen(void) {
 static lv_obj_t * build_add_to_playlist_screen(void) {
     lv_obj_t * title_label;
     return build_subsonic_list_screen("Add to Playlist", &title_label, &add_to_playlist_list);
+}
+
+/* Shared entry point into the Add to Playlist picker -- the player's own
+ * "..." menu (more_menu_add_to_playlist_cb() below) and the song long-press
+ * context menu (song_context_menu_add_to_playlist_cb(), defined with the
+ * rest of that popup further down) both reach this screen for whatever
+ * song path they have, not necessarily the currently-playing one. */
+static void open_add_to_playlist_for(const char * path) {
+    snprintf(add_to_playlist_target_path, sizeof(add_to_playlist_target_path), "%s", path);
+    populate_add_to_playlist_screen();
+    nav_push(add_to_playlist_screen);
+}
+
+/* ---- Queue ("Up Next") screen -- reachable from the player's "..." menu
+ * and as a special row in Playlists, same treatment as Favorites/Most
+ * Played there. Shows whatever queued_pending_count currently tracks
+ * (playlist[playlist_index+1 .. +queued_pending_count]), in play order.
+ * Tapping a row jumps straight to that song -- play_track_at() naturally
+ * treats it as a manual pick, no special-casing needed since these are
+ * already just ordinary playlist[] positions (see queued_pending_count's
+ * own comment on why the queue is implemented as a splice, not a separate
+ * list). Rebuilt fresh on every open (queue sizes are always small, no
+ * virtualization needed, same as the Group Songs screen). ---- */
+static lv_obj_t * queue_screen;
+static lv_obj_t * queue_list;
+
+static void queue_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int offset = (int) (intptr_t) lv_event_get_user_data(e); /* 0-based position within the queued run */
+    if (playlist_index < 0) return;
+    int target = playlist_index + 1 + offset;
+    if (target < playlist_count) play_track_at(target);
+}
+
+static void populate_queue_screen(void) {
+    lv_obj_clean(queue_list);
+
+    if (playlist_index < 0 || queued_pending_count <= 0) {
+        lv_obj_t * label = lv_label_create(queue_list);
+        lv_label_set_text(label, "Queue is empty");
+        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+        return;
+    }
+
+    for (int i = 0; i < queued_pending_count; i++) {
+        int idx = playlist_index + 1 + i;
+        if (idx >= playlist_count) break;
+
+        lv_obj_t * row = lv_label_create(queue_list);
+        lv_obj_add_style(row, &list_row_style, 0);
+        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char title[128], folder[128];
+        get_display_names(playlist[idx], title, sizeof(title), folder, sizeof(folder));
+        lv_label_set_text(row, title);
+
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, queue_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static lv_obj_t * build_queue_screen(void) {
+    lv_obj_t * title_label;
+    return build_subsonic_list_screen("Queue", &title_label, &queue_list);
+}
+
+static void open_queue_screen(void) {
+    populate_queue_screen();
+    nav_push(queue_screen);
 }
 
 /* ---- Delete confirmation popup ---- */
@@ -5393,8 +5557,14 @@ static void more_menu_list_cb(lv_event_t * e);
 static void more_menu_add_to_playlist_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_more_menu_popup();
-    populate_add_to_playlist_screen();
-    nav_push(add_to_playlist_screen);
+    if (playlist_index < 0) return;
+    open_add_to_playlist_for(playlist[playlist_index]);
+}
+
+static void more_menu_queue_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_more_menu_popup();
+    open_queue_screen();
 }
 
 static void more_menu_eq_cb(lv_event_t * e) {
@@ -5439,7 +5609,7 @@ static void build_more_menu_popup(void) {
     lv_obj_add_event_cb(more_menu_popup_backdrop, more_menu_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
 
     more_menu_popup = lv_obj_create(top);
-    lv_obj_set_size(more_menu_popup, 400, 310);
+    lv_obj_set_size(more_menu_popup, 400, 376); /* +66 over the old 310 -- one more row, same per-row spacing */
     lv_obj_align(more_menu_popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(more_menu_popup, 16, 0);
     lv_obj_set_style_bg_color(more_menu_popup, lv_color_make(32, 32, 32), 0);
@@ -5454,6 +5624,7 @@ static void build_more_menu_popup(void) {
         bool destructive;
     } rows[] = {
         { "List", more_menu_list_cb, false },
+        { "Queue", more_menu_queue_cb, false },
         { "Add to Playlist", more_menu_add_to_playlist_cb, false },
         { "EQ", more_menu_eq_cb, false },
         { "Delete", more_menu_delete_cb, true },
@@ -5461,6 +5632,109 @@ static void build_more_menu_popup(void) {
 
     for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
         lv_obj_t * row = lv_obj_create(more_menu_popup);
+        lv_obj_set_size(row, lv_pct(90), 56);
+        lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 20 + (int) i * 66);
+        lv_obj_set_style_radius(row, 12, 0);
+        lv_obj_set_style_bg_opa(row, 0, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, rows[i].cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t * label = lv_label_create(row);
+        lv_label_set_text(label, rows[i].label);
+        lv_obj_set_style_text_color(label, rows[i].destructive ? lv_color_make(255, 120, 120) : accent_lv_color(), 0);
+        lv_obj_set_style_text_font(label, ui_size_20, 0);
+        lv_obj_center(label);
+    }
+}
+
+/* ---- Song long-press context menu: Add to Queue / Add to Playlist / Cancel
+ * Same hand-built popup shape as build_more_menu_popup() just above, for a
+ * long-pressed row in any song list (All Songs, an Artist's/Album's songs,
+ * a Playlist, Favorites, Most Played) rather than only the player screen's
+ * own currently-playing track. ---- */
+
+static lv_obj_t * song_context_menu_popup;
+static lv_obj_t * song_context_menu_popup_backdrop;
+/* Set right before showing the popup (open_song_context_menu()) -- which
+ * song "Add to Queue"/"Add to Playlist" act on, since a long-pressed row
+ * isn't necessarily the currently-playing track. */
+static char song_context_menu_target_path[512] = "";
+
+static void hide_song_context_menu_popup(void) {
+    lv_obj_add_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(song_context_menu_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void song_context_menu_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_song_context_menu_popup();
+}
+
+static void song_context_menu_add_to_queue_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_song_context_menu_popup();
+    if (song_context_menu_target_path[0] != '\0') queue_add_song(song_context_menu_target_path);
+}
+
+static void song_context_menu_add_to_playlist_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_song_context_menu_popup();
+    if (song_context_menu_target_path[0] != '\0') open_add_to_playlist_for(song_context_menu_target_path);
+}
+
+static void song_context_menu_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_song_context_menu_popup();
+}
+
+/* Called from every song list's long-press handler (all_songs_row_long_
+ * press_cb(), group_song_row_long_press_cb()) with that row's actual song
+ * path. */
+static void open_song_context_menu(const char * path) {
+    snprintf(song_context_menu_target_path, sizeof(song_context_menu_target_path), "%s", path);
+    lv_obj_remove_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(song_context_menu_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(song_context_menu_popup_backdrop);
+    lv_obj_move_foreground(song_context_menu_popup);
+}
+
+static void build_song_context_menu_popup(void) {
+    lv_obj_t * top = lv_layer_top();
+
+    song_context_menu_popup_backdrop = lv_obj_create(top);
+    lv_obj_set_size(song_context_menu_popup_backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(song_context_menu_popup_backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(song_context_menu_popup_backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(song_context_menu_popup_backdrop, 0, 0);
+    lv_obj_remove_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(song_context_menu_popup_backdrop, song_context_menu_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    song_context_menu_popup = lv_obj_create(top);
+    lv_obj_set_size(song_context_menu_popup, 400, 244);
+    lv_obj_align(song_context_menu_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(song_context_menu_popup, 16, 0);
+    lv_obj_set_style_bg_color(song_context_menu_popup, lv_color_make(32, 32, 32), 0);
+    lv_obj_set_style_bg_opa(song_context_menu_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(song_context_menu_popup, 0, 0);
+    lv_obj_remove_flag(song_context_menu_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(song_context_menu_popup, LV_OBJ_FLAG_HIDDEN);
+
+    static const struct {
+        const char * label;
+        lv_event_cb_t cb;
+        bool destructive;
+    } rows[] = {
+        { "Add to Queue", song_context_menu_add_to_queue_cb, false },
+        { "Add to Playlist", song_context_menu_add_to_playlist_cb, false },
+        { "Cancel", song_context_menu_cancel_cb, false },
+    };
+
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        lv_obj_t * row = lv_obj_create(song_context_menu_popup);
         lv_obj_set_size(row, lv_pct(90), 56);
         lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 20 + (int) i * 66);
         lv_obj_set_style_radius(row, 12, 0);
@@ -6405,6 +6679,11 @@ static void all_songs_row_click_cb(int display_index) {
     on_file_selected(playlist_copy, all_songs_count, display_index);
 }
 
+static void all_songs_row_long_press_cb(int display_index) {
+    display_index = search_remap_index(SEARCH_BINDING_ALL_SONGS, display_index);
+    open_song_context_menu(all_songs_paths[all_songs_sort_order[display_index]]);
+}
+
 static lv_obj_t * build_all_songs_screen(void) {
     compact_list_item_t * items = NULL;
     if (all_songs_count > 0) {
@@ -6414,7 +6693,7 @@ static lv_obj_t * build_all_songs_screen(void) {
         }
     }
 
-    lv_obj_t * scr = build_compact_list_screen("All Songs", generic_back_cb, items, all_songs_count, all_songs_row_click_cb, &all_songs_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    lv_obj_t * scr = build_compact_list_screen("All Songs", generic_back_cb, items, all_songs_count, all_songs_row_click_cb, all_songs_row_long_press_cb, &all_songs_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
     free(items);
     finalize_screen_navigation(scr);
     return scr;
@@ -6532,14 +6811,36 @@ static void group_song_remove_row_cb(lv_event_t * e);
  * playlist that's become empty. */
 static void populate_playlists_screen(void);
 
+/* Real-device incident: LVGL still sends LV_EVENT_CLICKED on release even
+ * when LV_EVENT_LONG_PRESSED already fired earlier in that same press --
+ * same root cause/fix as quick_drawer_wifi_long_press_cb's own doc comment
+ * (search that name for the full story) and compact_list_row_click_cb's
+ * own matching fix (screen_builders.c) for All Songs -- without this, long-
+ * pressing a Group Songs row (Artist/Album/Playlist/Favorites/Most Played)
+ * to open the context menu also started that song playing on release. One
+ * flag, not per-row -- single-touch device, only one row can plausibly be
+ * mid-press at a time. */
+static bool group_song_row_long_press_fired = false;
+
 static void group_song_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (group_song_row_long_press_fired) {
+        group_song_row_long_press_fired = false;
+        return;
+    }
     int pos = (int) (intptr_t) lv_event_get_user_data(e); /* position within the CURRENT group, not the whole library */
 
     char ** playlist_copy = malloc(sizeof(char *) * (size_t) group_songs_count);
     for (int i = 0; i < group_songs_count; i++) playlist_copy[i] = strdup(all_songs_paths[group_songs_indices[i]]);
     set_player_source_group_songs(pos);
     on_file_selected(playlist_copy, group_songs_count, pos);
+}
+
+static void group_song_row_long_press_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+    group_song_row_long_press_fired = true;
+    int pos = (int) (intptr_t) lv_event_get_user_data(e);
+    open_song_context_menu(all_songs_paths[group_songs_indices[pos]]);
 }
 
 /* Positions/shows or hides group_songs_now_playing_bar against the CURRENT
@@ -6624,11 +6925,13 @@ static void populate_group_songs_rows(void) {
              * list_row_style's own doc comment (screen_builders.h). */
             lv_obj_t * row = lv_label_create(group_songs_list);
             lv_obj_add_style(row, &list_row_style, 0);
+            lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
             lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
             lv_label_set_text(row, song_display_title_of(group_songs_indices[i]));
 
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(row, group_song_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+            lv_obj_add_event_cb(row, group_song_row_long_press_cb, LV_EVENT_LONG_PRESSED, (void *) (intptr_t) i);
         }
     }
 
@@ -7947,6 +8250,7 @@ static void populate_indexed_list(lv_obj_t * list, int count, const char * (*lab
          * list_row_style's own doc comment (screen_builders.h). */
         lv_obj_t * row = lv_label_create(list);
         lv_obj_add_style(row, &list_row_style, 0);
+        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_label_set_text(row, label_of(i));
 
@@ -7967,6 +8271,7 @@ static void populate_indexed_list_from_items(lv_obj_t * list, const compact_list
     for (int i = 0; i < count; i++) {
         lv_obj_t * row = lv_label_create(list);
         lv_obj_add_style(row, &list_row_style, 0);
+        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_label_set_text(row, items[i].label);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -8702,7 +9007,7 @@ static lv_obj_t * build_artists_screen(void) {
             items[i] = (compact_list_item_t){ artist_groups[i].name };
         }
     }
-    lv_obj_t * scr = build_compact_list_screen("Artists", generic_back_cb, items, artist_group_count, artist_row_click_cb, &artists_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    lv_obj_t * scr = build_compact_list_screen("Artists", generic_back_cb, items, artist_group_count, artist_row_click_cb, NULL, &artists_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
     free(items);
     finalize_screen_navigation(scr);
     return scr;
@@ -8716,7 +9021,7 @@ static lv_obj_t * build_albums_screen(void) {
             items[i] = (compact_list_item_t){ album_groups[i].name };
         }
     }
-    lv_obj_t * scr = build_compact_list_screen("Albums", generic_back_cb, items, album_group_count, album_row_click_cb, &albums_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    lv_obj_t * scr = build_compact_list_screen("Albums", generic_back_cb, items, album_group_count, album_row_click_cb, NULL, &albums_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
     free(items);
     finalize_screen_navigation(scr);
     return scr;
@@ -8735,7 +9040,7 @@ static lv_obj_t * build_album_artist_screen(void) {
             items[i] = (compact_list_item_t){ album_artist_groups[i].name };
         }
     }
-    lv_obj_t * scr = build_compact_list_screen("Album Artist", generic_back_cb, items, album_artist_group_count, album_artist_row_click_cb, &album_artist_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    lv_obj_t * scr = build_compact_list_screen("Album Artist", generic_back_cb, items, album_artist_group_count, album_artist_row_click_cb, NULL, &album_artist_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
     free(items);
     finalize_screen_navigation(scr);
     return scr;
@@ -9553,8 +9858,12 @@ static void playlist_row_click_cb(lv_event_t * e) {
         show_most_played();
         return;
     }
+    if (index == 2) {
+        open_queue_screen();
+        return;
+    }
 
-    int m3u_index = index - 2;
+    int m3u_index = index - 3;
     if (m3u_index < 0 || m3u_index >= playlists_m3u_count) return;
 
     char ** songs;
@@ -9663,6 +9972,14 @@ static void populate_playlists_screen(void) {
         lv_obj_add_event_cb(most_played_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 1);
     }
 
+    /* Never deletable either -- same treatment as Favorites/Most Played
+     * above, see playlist_row_click_cb()'s index==2 case. */
+    lv_obj_t * queue_row = add_playlist_row_base(playlists_list, "Queue");
+    if (!playlists_edit_mode) {
+        lv_obj_add_flag(queue_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(queue_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 2);
+    }
+
     for (int i = 0; i < playlists_m3u_count; i++) {
         lv_obj_t * row = add_playlist_row_base(playlists_list, basename_of(playlists_m3u_paths[i]));
         if (playlists_edit_mode) {
@@ -9673,7 +9990,7 @@ static void populate_playlists_screen(void) {
             lv_obj_add_event_cb(delete_icon, playlist_delete_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
         } else {
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (2 + i));
+            lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (3 + i));
         }
     }
 }
@@ -14225,7 +14542,7 @@ static void build_timezone_city_screen_items(compact_list_item_t * items, const 
 static lv_obj_t * build_timezone_city_screen(const char * region) {
     compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) TIMEZONE_TABLE_COUNT);
     build_timezone_city_screen_items(items, region);
-    lv_obj_t * scr = build_compact_list_screen(region, generic_back_cb, items, timezone_city_count, timezone_city_row_click_cb, NULL, LIST_ROW_WIDTH, false, lv_color_black());
+    lv_obj_t * scr = build_compact_list_screen(region, generic_back_cb, items, timezone_city_count, timezone_city_row_click_cb, NULL, NULL, LIST_ROW_WIDTH, false, lv_color_black());
     free(items);
     finalize_screen_navigation(scr);
     return scr;
@@ -15257,7 +15574,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * on a library rescan (file_browser.c manages its own directory
      * listing independently), so this is only ever registered here, not
      * at the post-rescan rebuild site too. */
-    files_search_list = build_compact_list_widget(files_screen, NULL, 0, files_search_row_click_cb, LIST_ROW_WIDTH_WIDE, false, lv_color_black());
+    files_search_list = build_compact_list_widget(files_screen, NULL, 0, files_search_row_click_cb, NULL, LIST_ROW_WIDTH_WIDE, false, lv_color_black());
     /* build_compact_list_widget() leaves its list transparent by default --
      * fine for the other four screens (it's the only content there), but
      * this one needs to actually COVER file_browser.c's own folder-browsing
@@ -15401,8 +15718,10 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     build_power_off_countdown_popup();
     build_firmware_update_popup();
     add_to_playlist_screen = build_add_to_playlist_screen();
+    queue_screen = build_queue_screen();
     build_delete_song_popup();
     build_more_menu_popup();
+    build_song_context_menu_popup();
     dac_home_screen = build_dac_home_screen();
     home_screen = build_home_screen();
 #ifndef HOST_BUILD

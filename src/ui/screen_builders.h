@@ -87,6 +87,11 @@ extern const lv_font_t * ui_size_28;
  * default. Call screen_builders_init_list_row_style() once, before
  * building any list screen (gui_init() does this). */
 extern lv_style_t list_row_style;
+/* LV_STATE_PRESSED-only bg_color override for a list_row_style row -- attach
+ * with lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED),
+ * see screen_builders_init_list_row_style()'s own comment on why this is a
+ * separate style rather than folded into list_row_style itself. */
+extern lv_style_t list_row_pressed_style;
 void screen_builders_init_list_row_style(void);
 
 typedef struct {
@@ -172,10 +177,16 @@ typedef void (*compact_list_click_cb_t)(int index);
  * from long-lived backing arrays (song tags, artist/album group names)
  * that only go away alongside a full library rescan, at which point these
  * screens get torn down and rebuilt too. */
+/* on_long_press: fired on LV_EVENT_LONG_PRESSED, same index-resolution
+ * shape as on_click -- NULL for a list whose rows aren't individual songs
+ * (Artists/Albums/Album Artist name rows, the Time Zone city list), so
+ * there's nothing sensible to long-press into a context menu. Passed
+ * straight through to build_compact_list_widget() below. */
 lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                       const compact_list_item_t * items, int item_count,
-                                      compact_list_click_cb_t on_click, lv_obj_t ** out_list,
-                                      int32_t row_width, bool enable_now_playing, lv_color_t now_playing_color);
+                                      compact_list_click_cb_t on_click, compact_list_click_cb_t on_long_press,
+                                      lv_obj_t ** out_list, int32_t row_width, bool enable_now_playing,
+                                      lv_color_t now_playing_color);
 
 /* The virtualized list widget itself (what build_compact_list_screen()
  * builds internally), with no screen/back-button/title wrapper -- for a
@@ -193,8 +204,8 @@ lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_
  * parameter rather than read directly (screen_builders.c has no visibility
  * into gui.c's current_settings.accent_color/accent_lv_color()). */
 lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_t * items, int item_count,
-                                      compact_list_click_cb_t on_click, int32_t row_width,
-                                      bool enable_now_playing, lv_color_t now_playing_color);
+                                      compact_list_click_cb_t on_click, compact_list_click_cb_t on_long_press,
+                                      int32_t row_width, bool enable_now_playing, lv_color_t now_playing_color);
 
 /* Shows/moves/hides a thin accent-colored bar flush against the screen's
  * far-left edge (independent of row_width/any row's own inset -- this is a

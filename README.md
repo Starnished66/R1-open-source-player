@@ -56,6 +56,7 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - Bluetooth metadata streaming
 - Bluetooth DAC finally works
 - Album art downscaling, supporting up to 1200x1200 resolutions
+- Queue / "Up Next" — long-press a song to play it next, independent of shuffle or repeat mode
 
 ## 📚 Music Library
 
@@ -64,7 +65,7 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - Artists
 - Albums
 - Album Artists
-- Genres
+- Playlists — Favorites, Most Played, and user-created M3U/M3U8, all in one place
 - Real tag scanning
 - Embedded album artwork
 - FLAC metadata
@@ -75,6 +76,7 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - Dynamic playlist loading directly from the SD card
 - Incremental music database updates instead of rescanning the entire library
 - SD card hotplug support
+- Built-in plain-text (`.txt`) book reader, with Favorites
 
 ## 🌐 Network & Streaming
 
@@ -126,17 +128,24 @@ The LAN remote-control interface provides a simple way to control the player fro
 - App-wide accent color theming
 - No unnecessary "books" functionality from the stock player
 
+## 🧩 Plugins
+
+- Third-party Lua plugins — no rebuild or reflash needed
+- Drop a `.lua` file in `.plugins/` on the SD card, it's picked up automatically
+- Small `plugin.*` API: list screens, SD card browsing, playback control
+- Example **Audiobooks** plugin included, reachable from Books → Audio Books
+
 ---
 
 # Planned Features
 
 The following features are planned or currently incomplete:
 
-- Audiobook support
-- Global accent color system
+- Native audiobook support (currently available via the example Audiobooks plugin — see [PLUGINS.md](PLUGINS.md))
 - Background image/color customization
 - Full theme support
 - Lyrics support
+- A picker UI for choosing among multiple installed plugins (currently only the first-registered plugin is reachable)
 - Additional community-requested features
 
 This list will evolve as development continues.
@@ -303,6 +312,20 @@ Detailed implementation notes, reverse-engineering information, root causes, ver
 If you're simply looking to use the player, you can safely skip this section.
 
 If you're modifying the code, debugging hardware behavior, or working on HiBy OS itself, the technical notes are the place to start.
+
+---
+
+# 🧩 Plugins
+
+Third-party functionality can be added without recompiling the app, as plain Lua scripts — no toolchain, no C, no rebuild/reflash cycle.
+
+Drop a `.lua` file into `.plugins/` on the SD card and it's picked up automatically at startup, with a small `plugin.*` API for showing list screens, browsing the SD card, and controlling playback.
+
+An example **Audiobooks** plugin is included (`plugins_examples/Audiobooks.lua`) — a book-folder browser → chapter-list → playback plugin, reachable from **Books → Audio Books**.
+
+For the full `plugin.*` API reference and instructions on writing and testing your own plugin, see:
+
+**[PLUGINS.md](PLUGINS.md)**
 
 ---
 

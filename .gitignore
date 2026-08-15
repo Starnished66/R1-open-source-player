@@ -12,6 +12,7 @@
 /sqlite3
 /dbus
 /opus
+/lua
 
 # Stock-firmware UI assets (theme2 PNGs). Proprietary HiBy graphics --
 # never redistributed, see README.md's own note on this. Populate this

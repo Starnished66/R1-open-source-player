@@ -28,6 +28,7 @@
 #endif
 #include "headphone_status.h"
 #include "usb_audio_output.h"
+#include "plugin_manager.h"
 #include "led_control.h"
 #include "charge_limiter.h"
 #include "idle_shutdown.h"
@@ -5419,6 +5420,71 @@ static lv_obj_t * build_queue_screen(void) {
 static void open_queue_screen(void) {
     populate_queue_screen();
     nav_push(queue_screen);
+}
+
+/* ---- Plugin list screens (src/plugins/plugin_manager.c's gui_plugin_show_list()
+ * bridge) ----
+ *
+ * A small pool of reusable screens, not one shared screen, because a plugin
+ * can chain plugin.show_list() calls (e.g. Audiobooks: pick a book -> pick
+ * a chapter) -- nav_push() treats pushing the screen already on top of the
+ * stack as a no-op reload rather than a real push (see its own comment), so
+ * a single shared screen would make Back skip the first list entirely once
+ * a second was opened on top of it. Four levels covers any realistic
+ * plugin nesting depth with headroom under NAV_STACK_MAX (16); reusing a
+ * still-on-the-stack slot beyond that is a known, accepted bound rather
+ * than something plugins are expected to hit. */
+#define PLUGIN_LIST_SCREEN_POOL_SIZE 4
+static lv_obj_t * plugin_list_screens[PLUGIN_LIST_SCREEN_POOL_SIZE];
+static lv_obj_t * plugin_list_title_labels[PLUGIN_LIST_SCREEN_POOL_SIZE];
+static lv_obj_t * plugin_list_lists[PLUGIN_LIST_SCREEN_POOL_SIZE];
+static int plugin_list_pool_next = 0;
+
+static void plugin_list_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_list_item_selected(index);
+}
+
+void gui_plugin_show_list(const char * title, const char * const * labels, int count) {
+    int slot = plugin_list_pool_next;
+    plugin_list_pool_next = (plugin_list_pool_next + 1) % PLUGIN_LIST_SCREEN_POOL_SIZE;
+
+    lv_label_set_text(plugin_list_title_labels[slot], title);
+    lv_obj_t * list = plugin_list_lists[slot];
+    lv_obj_clean(list);
+
+    if (count <= 0) {
+        lv_obj_t * label = lv_label_create(list);
+        lv_label_set_text(label, "Nothing here");
+        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+    }
+    for (int i = 0; i < count; i++) {
+        lv_obj_t * row = lv_label_create(list);
+        lv_obj_add_style(row, &list_row_style, 0);
+        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_label_set_text(row, labels[i]);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, plugin_list_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+
+    nav_push(plugin_list_screens[slot]);
+}
+
+void gui_plugin_play_paths(const char * const * paths, int count, int start_index) {
+    if (count <= 0) return;
+    if (start_index < 0) start_index = 0;
+    if (start_index >= count) start_index = count - 1;
+
+    char ** new_playlist = malloc(sizeof(char *) * count);
+    for (int i = 0; i < count; i++) new_playlist[i] = strdup(paths[i]);
+    on_file_selected(new_playlist, count, start_index);
+}
+
+void gui_plugin_show_toast(const char * msg) {
+    show_info_toast(msg);
 }
 
 /* ---- Delete confirmation popup ---- */
@@ -13670,19 +13736,30 @@ static lv_obj_t * build_text_reader_screen(void) {
     return scr;
 }
 
-/* Audio Books has no real implementation yet (no format/UI decided) --
- * this row is a deliberate placeholder, per real-device feedback, rather
- * than silently absent or a dead no-op tap. */
-static void audio_books_placeholder_row_cb(lv_event_t * e) {
+/* Audio Books has no native implementation of its own -- it's driven by
+ * whatever Lua plugin registers itself first via plugin.register_tile()
+ * (see src/plugins/plugin_manager.c), the Audiobooks example plugin
+ * (plugins_examples/Audiobooks.lua) being the intended one. Originally
+ * this fired plugin tiles into their own Home-screen grid slot, but the
+ * Home icon grid can't be scrolled (real-device feedback), so anything
+ * past its fixed 6 tiles would be unreachable -- routing through this
+ * already-existing native row instead needs no scrolling and degrades
+ * cleanly (the pre-existing placeholder toast) when no plugin is
+ * installed. */
+static void audio_books_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    show_error_toast("Audio Books coming soon");
+    if (plugin_manager_get_tile_count() > 0) {
+        plugin_manager_tile_clicked(0);
+    } else {
+        show_error_toast("Audio Books coming soon");
+    }
 }
 
 static lv_obj_t * build_books_screen(void) {
     static pill_list_item_t items[3];
     items[0] = (pill_list_item_t){ "Books", PILL_ACCESSORY_CHEVRON, false, books_files_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Favorites", PILL_ACCESSORY_CHEVRON, false, books_favorites_row_cb, NULL, NULL };
-    items[2] = (pill_list_item_t){ "Audio Books", PILL_ACCESSORY_CHEVRON, false, audio_books_placeholder_row_cb, NULL, NULL };
+    items[2] = (pill_list_item_t){ "Audio Books", PILL_ACCESSORY_CHEVRON, false, audio_books_row_cb, NULL, NULL };
     lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, 3, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
@@ -15584,6 +15661,12 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 
     fallback_font_init_early(current_settings.font_size_tier); /* must run before any style/screen captures &app_font_16/&app_font_22 -- see fallback_font.h */
     screen_builders_init_list_row_style();
+
+    /* Discovers plugin tiles by loading and running every .lua file under
+     * <SD card>/.plugins/ -- run early, well before Books (the only current
+     * tile entry point, see audio_books_row_cb()) could plausibly be
+     * reached. */
+    plugin_manager_init();
 #ifndef HOST_BUILD
     boot_checkpoint("pre-screen-build setup done");
 #endif
@@ -15765,6 +15848,9 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     build_firmware_update_popup();
     add_to_playlist_screen = build_add_to_playlist_screen();
     queue_screen = build_queue_screen();
+    for (int i = 0; i < PLUGIN_LIST_SCREEN_POOL_SIZE; i++) {
+        plugin_list_screens[i] = build_subsonic_list_screen("Plugin", &plugin_list_title_labels[i], &plugin_list_lists[i]);
+    }
     build_delete_song_popup();
     build_more_menu_popup();
     build_song_context_menu_popup();

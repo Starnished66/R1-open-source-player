@@ -21,6 +21,7 @@ MBEDTLS_DIR = mbedtls
 CJSON_DIR = cJSON
 SQLITE_DIR = sqlite3
 DBUS_DIR = dbus
+LUA_DIR = lua
 
 # Self-bootstrap: clone dependencies if they don't exist yet before evaluating variables
 ifeq ($(wildcard $(LVGL_DIR)),)
@@ -131,6 +132,20 @@ $(info Fetching SQLite 3.53.4 amalgamation...)
 $(shell curl -fsSL -o /tmp/sqlite-amalgamation.zip https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip && unzip -q -o /tmp/sqlite-amalgamation.zip -d /tmp && mv /tmp/sqlite-amalgamation-3530400 $(SQLITE_DIR) && rm /tmp/sqlite-amalgamation.zip)
 endif
 
+# Lua (MIT) -- the plugin scripting engine (src/plugins/plugin_manager.c):
+# each file under the SD card's .plugins/ folder gets its own lua_State,
+# with a small C API table (plugin.*) exposed for registering Home-screen
+# tiles and driving playback, so third-party plugins are plain text .lua
+# files rather than compiled code. Vendored as the official source tarball
+# (library sources only -- LUA_SRCS below excludes lua.c/luac.c, the
+# standalone interpreter/compiler CLI mains, since this is an embedded
+# library build) rather than a system package, matching every other
+# dependency here targeting mipsel-linux-musl.
+ifeq ($(wildcard $(LUA_DIR)),)
+$(info Fetching Lua 5.5.1 source...)
+$(shell curl -fsSL -o /tmp/lua-5.5.1.tar.gz https://www.lua.org/ftp/lua-5.5.1.tar.gz && tar -xzf /tmp/lua-5.5.1.tar.gz -C /tmp && mv /tmp/lua-5.5.1 $(LUA_DIR) && rm /tmp/lua-5.5.1.tar.gz)
+endif
+
 # UI assets (theme2 -- real PNGs from the stock HiBy firmware, not ours to
 # redistribute). On target these are read straight from the firmware's own
 # /usr/resource/litegui/theme2 -- nothing to fetch. On host, best-effort
@@ -154,7 +169,7 @@ endif
 # including "audio.h") still resolves via the compiler's -I fallback search
 # even though foo.h now lives in a different category folder -- no #include
 # statements needed changing when src/ was reorganized into subfolders.
-CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(SQLITE_DIR) -I$(OPUS_DIR)/include -DLV_CONF_INCLUDE_SIMPLE=1
+CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(SQLITE_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -DLV_CONF_INCLUDE_SIMPLE=1
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
 HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
 HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
@@ -220,6 +235,15 @@ OPUS_CFLAGS = -O3 -g -Wall -I$(OPUS_DIR)/include -I$(OPUS_DIR)/celt -I$(OPUS_DIR
 # binary anyway (see the mbedTLS comment above), so this just avoids
 # compiling in the dead code path that would otherwise call it.
 SQLITE_CFLAGS = -O3 -g -I$(SQLITE_DIR) -DSQLITE_OMIT_LOAD_EXTENSION=1
+# No configure step (luaconf.h auto-detects a POSIX/Linux target off the
+# compiler's own predefined __linux__/__unix__ macros, which musl's cross
+# compiler still defines for a Linux target -- same as every other
+# no-configure dependency in this Makefile). No LUA_USE_DLOPEN: package
+# C-module loading needs dlopen(), which doesn't work from a static musl
+# binary anyway (see the mbedTLS comment above); loadlib.c's own fallback
+# stub handles that absence cleanly, and plugins load as plain .lua text
+# via luaL_loadfile(), never as compiled C modules.
+LUA_CFLAGS = -O2 -g -Wall -I$(LUA_DIR)/src
 
 # Link flags
 HOST_LDFLAGS = $(shell sdl2-config --libs) -lpthread -lm
@@ -231,7 +255,7 @@ TARGET_LDFLAGS = -static -no-pie -lpthread -lm
 # control), ui/ (gui/screens/assets/fonts), core/ (settings, subprocess,
 # misc). main.c stays at src/ root as the entry point.
 APP_SRCS = src/main.c src/ui/gui.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_client.c src/network/subsonic_client.c src/library/cover_decode.c src/audio/asf_demux.c src/audio/wma_decoder.c src/audio/ogg_demux.c src/audio/opus_decoder.c src/ui/fallback_font.c \
-src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/network/dlna_control.c src/network/remote_control.c
+src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/hardware/usb_audio_output.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/network/dlna_control.c src/network/remote_control.c src/plugins/plugin_manager.c
 APP_CXX_SRCS = src/audio/alac_decoder.cpp
 LVGL_SRCS = $(shell find $(LVGL_DIR)/src -type f -name '*.c')
 TINYALSA_SRCS = $(shell find $(TINYALSA_DIR)/src -type f -name '*.c')
@@ -258,6 +282,13 @@ OPUS_SRCS = $(filter-out %/repacketizer_demo.c %/opus_demo.c %/opus_compare.c %/
 MBEDTLS_SRCS = $(shell find $(MBEDTLS_DIR)/library -type f -name '*.c')
 CJSON_SRCS = $(CJSON_DIR)/cJSON.c
 SQLITE_SRCS = $(SQLITE_DIR)/sqlite3.c
+# Library sources only (verified against this checkout's own doc/readme.html
+# file list) -- excludes lua.c/luac.c, the standalone interpreter/compiler
+# CLI mains, since this is an embedded library build.
+LUA_SRCS = $(addprefix $(LUA_DIR)/src/, lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c \
+             llex.c lmem.c lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c \
+             lvm.c lzio.c lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c \
+             loslib.c lstrlib.c ltablib.c lutf8lib.c linit.c)
 # Excludes (all confirmed via a real link+run test on the actual device
 # before wiring this in): Windows/WinCE sources (irrelevant, this is
 # Linux-only), dbus-server*.c (DBusServer is for LISTENING for incoming
@@ -290,7 +321,8 @@ HOST_OBJS = $(APP_SRCS:src/%.c=build_host/%.o) $(APP_CXX_SRCS:src/%.cpp=build_ho
             $(ALAC_C_SRCS:$(ALAC_DIR)/codec/%.c=build_host/alac/%.o) $(ALAC_CXX_SRCS:$(ALAC_DIR)/codec/%.cpp=build_host/alac/%.o) \
             $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=build_host/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=build_host/cjson/%.o) \
             $(SQLITE_SRCS:$(SQLITE_DIR)/%.c=build_host/sqlite3/%.o) \
-            $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_host/opus/%.o)
+            $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_host/opus/%.o) \
+            $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_host/lua/%.o)
 TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=build_target/%.o) \
               $(TARGET_ONLY_APP_SRCS:src/%.c=build_target/%.o) \
               $(LVGL_SRCS:$(LVGL_DIR)/%.c=build_target/lvgl/%.o) $(TINYALSA_SRCS:$(TINYALSA_DIR)/%.c=build_target/tinyalsa/%.o) \
@@ -299,7 +331,8 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=buil
               $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=build_target/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=build_target/cjson/%.o) \
               $(SQLITE_SRCS:$(SQLITE_DIR)/%.c=build_target/sqlite3/%.o) \
               $(DBUS_SRCS:$(DBUS_DIR)/dbus/%.c=build_target/dbus/%.o) \
-              $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_target/opus/%.o)
+              $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_target/opus/%.o) \
+              $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_target/lua/%.o)
 
 .PHONY: all host target clean compile_commands.json
 
@@ -352,6 +385,10 @@ build_host/sqlite3/%.o: $(SQLITE_DIR)/%.c
 build_host/opus/%.o: $(OPUS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(OPUS_CFLAGS) -c $< -o $@
+
+build_host/lua/%.o: $(LUA_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(LUA_CFLAGS) -DHOST_BUILD=1 -c $< -o $@
 
 # Build for target (MIPS HiBy Device)
 target: $(TARGET_BIN)
@@ -407,6 +444,10 @@ build_target/dbus/%.o: $(DBUS_DIR)/dbus/%.c
 build_target/opus/%.o: $(OPUS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(OPUS_CFLAGS) -c $< -o $@
+
+build_target/lua/%.o: $(LUA_DIR)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CROSS_CC) $(LUA_CFLAGS) -c $< -o $@
 
 # Generate compile_commands.json for Zed/clangd LSP autofill and hover popups
 compile_commands.json:

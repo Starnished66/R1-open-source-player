@@ -15,4 +15,26 @@ void gui_init(uint32_t screen_width, uint32_t screen_height);
 void gui_show_boot_splash(void);
 #endif
 
+/* ---- Bridge for src/plugins/plugin_manager.c ----
+ * plugin_manager.c owns Lua state/script lifecycle and has no LVGL code of
+ * its own; these let a plugin's C API calls (plugin.show_list/play_file/
+ * play_list/show_toast, see plugin_manager.c's register_plugin_api()) reach
+ * gui.c's existing screens/playback plumbing instead of duplicating it. */
+
+/* Repopulates and pushes a shared plugin-list screen (one of a small
+ * reusable pool -- see gui.c's own comment on why a pool rather than a
+ * single shared screen) showing `labels[0..count)` as plain tappable rows.
+ * Tapping row i calls plugin_manager_list_item_selected(i). */
+void gui_plugin_show_list(const char * title, const char * const * labels, int count);
+
+/* Starts playback of a brand-new playlist built from `paths[0..count)`,
+ * starting at paths[start_index] -- same "starting something new clears
+ * Up Next" semantics as every other play-launch path (on_file_selected()).
+ * Copies paths/strings itself; caller retains ownership of its own array. */
+void gui_plugin_play_paths(const char * const * paths, int count, int start_index);
+
+/* Shows the same transient toast used elsewhere in the app (e.g. "Added to
+ * queue"). */
+void gui_plugin_show_toast(const char * msg);
+
 #endif /* GUI_H */

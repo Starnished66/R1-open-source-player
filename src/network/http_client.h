@@ -17,6 +17,18 @@
  * subsonic_client.h) -- never the default. */
 bool http_get_to_buffer(const char * url, bool verify_tls, int * out_status, uint8_t ** out_body, size_t * out_body_size);
 
+/* Same contract as http_get_to_buffer() above (false on network/TLS-level
+ * failure, true with *out_status set otherwise -- a 4xx/5xx is still a
+ * "successful" request as far as this function's return value is
+ * concerned), for a POST instead. body/body_size may be NULL/0 for an empty
+ * body. content_type is sent as the Content-Type header verbatim -- pass
+ * "application/x-www-form-urlencoded" for a plain key=value&key=value body,
+ * "application/json" for a JSON body, etc.; this function doesn't encode or
+ * validate body itself, just sends whatever bytes it's given with the
+ * Content-Length they imply. *out_body is malloc'd; caller must free() it. */
+bool http_post_to_buffer(const char * url, bool verify_tls, const char * content_type, const uint8_t * body,
+                          size_t body_size, int * out_status, uint8_t ** out_body, size_t * out_body_size);
+
 /* Optional progress callback for http_get_to_file: bytes_downloaded so far,
  * and total_bytes from the response's Content-Length header (0 if the
  * server didn't send one, e.g. chunked transfer-encoding -- callers should

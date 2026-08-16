@@ -2312,13 +2312,43 @@ static bool active_press_is_over_drag_adjust_widget(void) {
  * based back/down-swipe path) -- register_swipe_dead_zone() reuses that
  * same set of objects for this unrelated raw-polling path, checked by
  * raw point-in-rect instead of by hit-tested object identity so it
- * doesn't matter whether the card itself is clickable. */
-#define SWIPE_DEAD_ZONE_MAX 8
+ * doesn't matter whether the card itself is clickable.
+ *
+ * Widened from 8 to 16: the original 8 slots are all native sliders (built
+ * once at startup, live forever). plugin.show_settings_list()'s own slider
+ * rows (gui_plugin_show_settings_list()) add real, bounded headroom on top
+ * -- PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE pool slots x PLUGIN_SETTINGS_
+ * LIST_MAX_SLIDERS sliders each (plugin_manager.h) -- not unbounded growth,
+ * since a pool slot's own slider cards are unregistered (see
+ * unregister_swipe_dead_zone() below) before that slot is ever repopulated. */
+#define SWIPE_DEAD_ZONE_MAX 16
 static lv_obj_t * swipe_dead_zones[SWIPE_DEAD_ZONE_MAX];
 static int swipe_dead_zone_count = 0;
 
 static void register_swipe_dead_zone(lv_obj_t * obj) {
     if (swipe_dead_zone_count < SWIPE_DEAD_ZONE_MAX) swipe_dead_zones[swipe_dead_zone_count++] = obj;
+}
+
+/* Compact-remove by pointer identity -- pairs with register_swipe_dead_zone()
+ * above for objects that DON'T live forever (unlike every native slider
+ * card, which registers once at startup and never needs to unregister). A
+ * plugin.show_settings_list() pool slot's slider cards are deleted and
+ * recreated on every call that reuses that slot (lv_obj_clean(), see
+ * gui_plugin_show_settings_list()) -- calling this for each of a slot's own
+ * previously-registered cards BEFORE that lv_obj_clean() runs is required,
+ * not just tidy: point_in_swipe_dead_zone()'s own lv_obj_get_screen(obj) !=
+ * lv_screen_active() guard still needs `obj` to be a live pointer to
+ * dereference, so leaving a freed card's pointer in this array would be a
+ * use-after-free on the next swipe check, not a graceful skip. No-op if obj
+ * isn't currently registered. */
+static void unregister_swipe_dead_zone(lv_obj_t * obj) {
+    for (int i = 0; i < swipe_dead_zone_count; i++) {
+        if (swipe_dead_zones[i] == obj) {
+            swipe_dead_zones[i] = swipe_dead_zones[swipe_dead_zone_count - 1];
+            swipe_dead_zone_count--;
+            return;
+        }
+    }
 }
 
 static bool point_in_swipe_dead_zone(lv_point_t p) {
@@ -4182,6 +4212,33 @@ static const char * external_dac_block_reason(void) {
     return NULL;
 }
 
+/* Cached now-playing metadata for plugin.get_now_playing() -- populated at
+ * the same two call sites that fire the "track_started" plugin event
+ * (notify_plugin_track_started() below), so there's no separate tracking
+ * needed. plugin_now_playing_loaded distinguishes "nothing has ever played
+ * this session" from "a track is playing with an empty title" -- the title
+ * buffer alone can't tell those apart. */
+static char plugin_now_playing_title[128];
+static char plugin_now_playing_artist[128];
+static char plugin_now_playing_album[128];
+static double plugin_now_playing_duration;
+static bool plugin_now_playing_loaded = false;
+
+/* Shared by play_track_at_from()/on_track_auto_advanced() below -- caches
+ * meta into the plugin_now_playing_* globals above and fires the
+ * "track_started" plugin event. Called after audio_play_file_at()/the
+ * gapless handoff has already happened in both call sites, so
+ * audio_get_duration_seconds() reflects the new track. */
+static void notify_plugin_track_started(const track_metadata_t * meta) {
+    snprintf(plugin_now_playing_title, sizeof(plugin_now_playing_title), "%s", meta->title);
+    snprintf(plugin_now_playing_artist, sizeof(plugin_now_playing_artist), "%s", meta->artist);
+    snprintf(plugin_now_playing_album, sizeof(plugin_now_playing_album), "%s", meta->album);
+    plugin_now_playing_duration = audio_get_duration_seconds();
+    plugin_now_playing_loaded = true;
+
+    plugin_manager_notify_track_started(meta->title, meta->artist, meta->album, plugin_now_playing_duration);
+}
+
 static void play_track_at_from(int index, double start_seconds) {
     if (index < 0 || index >= playlist_count) return;
 
@@ -4204,6 +4261,7 @@ static void play_track_at_from(int index, double start_seconds) {
                                      (long) (audio_get_duration_seconds() * 1000.0));
     hiby_sys_server_report_position((long) (start_seconds * 1000.0));
 #endif
+    notify_plugin_track_started(&meta);
 
     set_play_button_state(true);
     nav_push(player_screen);
@@ -4232,6 +4290,7 @@ static void on_track_auto_advanced(int index) {
                                      (long) (audio_get_duration_seconds() * 1000.0));
     hiby_sys_server_report_position(0);
 #endif
+    notify_plugin_track_started(&meta);
 
     set_play_button_state(true);
 
@@ -4318,11 +4377,14 @@ static void toggle_play_pause(void) {
     bool now_playing = audio_is_playing();
     set_play_button_state(now_playing);
 
-    if (!now_playing) {
+    if (now_playing) {
+        plugin_manager_notify_resumed();
+    } else {
         /* Checkpoint the resume position on pause -- a natural point to
          * persist, and far less write-heavy than saving on every tick. */
         current_settings.last_position = audio_get_position_seconds();
         settings_save(&current_settings);
+        plugin_manager_notify_paused();
     }
 }
 
@@ -5719,6 +5781,7 @@ void gui_plugin_stop(void) {
     if (audio_is_playing()) {
         audio_stop();
         set_play_button_state(false);
+        plugin_manager_notify_stopped();
     }
 }
 
@@ -5764,6 +5827,56 @@ double gui_plugin_get_duration_seconds(void) {
     return audio_get_duration_seconds();
 }
 
+bool gui_plugin_get_now_playing(char * title_out, size_t title_size, char * artist_out, size_t artist_size,
+                                 char * album_out, size_t album_size, double * out_duration_seconds) {
+    if (!plugin_now_playing_loaded) return false;
+
+    snprintf(title_out, title_size, "%s", plugin_now_playing_title);
+    snprintf(artist_out, artist_size, "%s", plugin_now_playing_artist);
+    snprintf(album_out, album_size, "%s", plugin_now_playing_album);
+    *out_duration_seconds = plugin_now_playing_duration;
+    return true;
+}
+
+/* ---- plugin.set_interval()/clear_interval() -- a small fixed pool of
+ * lv_timer_t*, same repeating-timer mechanism update_timer_cb()'s own
+ * 500ms polling loop already uses (gui_init(), near the end of this file).
+ * One shared timer callback for every slot -- its own slot index is read
+ * back out via lv_timer_get_user_data() rather than needing one distinct
+ * callback function per slot. ---- */
+static lv_timer_t * plugin_interval_timers[PLUGIN_MAX_INTERVALS];
+
+static void plugin_interval_timer_cb(lv_timer_t * timer) {
+    int slot = (int) (intptr_t) lv_timer_get_user_data(timer);
+    plugin_manager_interval_fired(slot);
+}
+
+void gui_plugin_set_interval(int slot, uint32_t period_ms) {
+    if (slot < 0 || slot >= PLUGIN_MAX_INTERVALS) return;
+    if (plugin_interval_timers[slot]) lv_timer_delete(plugin_interval_timers[slot]); /* defensive -- shouldn't happen, l_plugin_set_interval() only hands out a free slot */
+    plugin_interval_timers[slot] = lv_timer_create(plugin_interval_timer_cb, period_ms, (void *) (intptr_t) slot);
+}
+
+void gui_plugin_clear_interval(int slot) {
+    if (slot < 0 || slot >= PLUGIN_MAX_INTERVALS || !plugin_interval_timers[slot]) return;
+    lv_timer_delete(plugin_interval_timers[slot]);
+    plugin_interval_timers[slot] = NULL;
+}
+
+/* plugin.show_text_input() bridge -- wraps this file's own show_text_entry()
+ * singleton screen (forward-declared above, defined further down alongside
+ * text_entry_screen's own construction). numeric is always false here -- a
+ * plugin wanting numeric-only input can validate/convert the returned
+ * string itself, not worth a second Lua-facing parameter for. */
+static void plugin_text_entry_done_cb(const char * text, void * user_data) {
+    (void) user_data;
+    plugin_manager_text_input_submitted(text);
+}
+
+void gui_plugin_show_text_input(const char * title, const char * initial_text, bool is_password) {
+    show_text_entry(title, initial_text, is_password, false, plugin_text_entry_done_cb, NULL);
+}
+
 /* ---- Delete confirmation popup ---- */
 static lv_obj_t * delete_song_popup;
 static lv_obj_t * delete_song_popup_backdrop;
@@ -5804,6 +5917,7 @@ static void delete_song_confirm_cb(lv_event_t * e) {
 
     if (playlist_count == 0) {
         audio_stop();
+        plugin_manager_notify_stopped();
         free(playlist);
         playlist = NULL;
         playlist_index = -1;
@@ -8366,6 +8480,7 @@ static void poll_dlna_control(void) {
     if (dlna_control_consume_stop_requested()) {
         audio_stop();
         set_play_button_state(false);
+        plugin_manager_notify_stopped();
     }
     dlna_control_notify_status(audio_is_playing(), audio_is_paused());
 }
@@ -8780,6 +8895,219 @@ static lv_obj_t * add_section_header(lv_obj_t * parent, const char * text) {
     lv_obj_set_style_pad_top(label, 12, 0);
     lv_obj_set_style_pad_left(label, 24, 0);
     return label;
+}
+
+/* ---- plugin.show_settings_list() -- src/plugins/plugin_manager.c's
+ * l_plugin_show_settings_list() bridge. A second, separate screen pool from
+ * gui_plugin_show_list()'s own (PLUGIN_LIST_SCREEN_POOL_SIZE above): that
+ * pool's rows are plain list_row_style labels, but a settings submenu needs
+ * the pill-row visual language (add_pill_row_base()/add_pill_toggle_row()/
+ * add_pill_chevron_row() just above -- the same building blocks the Wi-Fi/
+ * Bluetooth screens' own dynamic top section already uses) plus a new
+ * slider-row variant neither of those screens needed. See plugin_manager.h's
+ * own comment on PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE/_MAX_ROWS/_MAX_
+ * SLIDERS for the sizing rationale. ---- */
+
+typedef struct {
+    int type; /* PLUGIN_SETTINGS_ROW_TAP/_TOGGLE/_SLIDER, plugin_manager.h */
+    char label[96];
+    bool toggle_value;
+    int slider_min, slider_max, slider_value;
+} plugin_settings_list_row_state_t;
+
+static plugin_settings_list_row_state_t
+    plugin_settings_list_row_state[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE][PLUGIN_SETTINGS_LIST_MAX_ROWS];
+static int plugin_settings_list_row_state_count[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE];
+
+static lv_obj_t * plugin_settings_list_screens[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE];
+static lv_obj_t * plugin_settings_list_title_labels[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE];
+static lv_obj_t * plugin_settings_list_lists[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE];
+static int plugin_settings_list_pool_next = 0;
+
+/* Which slider cards THIS slot registered as swipe dead zones on its last
+ * populate -- unregistered (see unregister_swipe_dead_zone()'s own comment)
+ * right before lv_obj_clean() frees them on the next populate of this same
+ * slot, so swipe_dead_zones[] never holds a dangling pointer into a card
+ * this pool slot already deleted. */
+static lv_obj_t * plugin_settings_list_slider_cards[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE][PLUGIN_SETTINGS_LIST_MAX_SLIDERS];
+static int plugin_settings_list_slider_card_count[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE];
+
+/* Slider-row variant of add_pill_toggle_row()/add_pill_chevron_row() above --
+ * no existing helper covers this (native sliders are each their own
+ * full-screen card, screen_timeout_slider_card and neighbors, never embedded
+ * as one row inside a scrollable list). Same card-with-live-readout shape as
+ * those, sized to fit as a list row instead of its own screen: label
+ * top-left, live numeric value top-right, slider along the bottom. Caller
+ * (populate_plugin_settings_list_screen() below) handles the swipe-dead-zone
+ * registration and LV_OBJ_FLAG_GESTURE_BUBBLE removal, same split of
+ * responsibility screen_timeout_slider_card's own construction uses. */
+static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text, int min, int max, int value,
+                                       lv_event_cb_t slider_event_cb, void * user_data) {
+    lv_obj_t * card = lv_obj_create(parent);
+    lv_obj_set_size(card, 448, 130);
+    lv_obj_add_style(card, &style_theme_card_bg, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * label = lv_label_create(card); /* child 0 */
+    lv_label_set_text(label, label_text);
+    lv_obj_add_style(label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(label, ui_size_16, 0);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 20, 12);
+
+    lv_obj_t * value_label = lv_label_create(card); /* child 1 -- see plugin_settings_slider_event_cb()'s lookup */
+    lv_obj_add_style(value_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(value_label, ui_size_16, 0);
+    lv_obj_align(value_label, LV_ALIGN_TOP_RIGHT, -20, 12);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", value);
+    lv_label_set_text(value_label, buf);
+
+    lv_obj_t * slider = lv_slider_create(card); /* child 2 */
+    lv_obj_set_width(slider, lv_pct(88));
+    lv_obj_set_height(slider, 32);
+    lv_obj_align(slider, LV_ALIGN_BOTTOM_MID, 0, -14);
+    if (max <= min) max = min + 1; /* lv_slider_set_range requires min < max */
+    lv_slider_set_range(slider, min, max);
+    lv_slider_set_value(slider, value, LV_ANIM_OFF);
+    lv_obj_add_style(slider, &style_accent, LV_PART_INDICATOR);
+    lv_obj_add_style(slider, &style_accent, LV_PART_KNOB);
+    lv_obj_set_ext_click_area(slider, 20);
+    lv_obj_add_event_cb(slider, slider_event_cb, LV_EVENT_ALL, user_data);
+
+    return card;
+}
+
+/* Packs a pool slot + row index into one lv_event_cb_t user_data pointer --
+ * PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE and PLUGIN_SETTINGS_LIST_MAX_ROWS
+ * are both tiny (2 and 24), so 16 bits each leaves enormous headroom. */
+static void * pack_plugin_settings_slot_row(int slot, int row) {
+    return (void *) (intptr_t) (((intptr_t) slot << 16) | (intptr_t) (row & 0xFFFF));
+}
+static int unpack_plugin_settings_slot(void * packed) { return (int) (((intptr_t) packed) >> 16); }
+static int unpack_plugin_settings_row(void * packed) { return (int) (((intptr_t) packed) & 0xFFFF); }
+
+static void plugin_settings_tap_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    void * packed = lv_event_get_user_data(e);
+    plugin_manager_settings_list_row_selected(unpack_plugin_settings_slot(packed), unpack_plugin_settings_row(packed));
+}
+
+static void populate_plugin_settings_list_screen(int slot); /* forward -- toggle click rebuilds its own slot */
+
+static void plugin_settings_toggle_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    void * packed = lv_event_get_user_data(e);
+    int slot = unpack_plugin_settings_slot(packed);
+    int row = unpack_plugin_settings_row(packed);
+
+    plugin_settings_list_row_state_t * st = &plugin_settings_list_row_state[slot][row];
+    st->toggle_value = !st->toggle_value;
+    plugin_manager_settings_list_toggled(slot, row, st->toggle_value);
+    /* Full rebuild to reflect the flipped on.png/off.png sprite -- same
+     * "flip the setting, then repopulate" pattern every native dynamic pill
+     * toggle row already uses (e.g. dlna_toggle_cb() -> populate_dlna_screen()),
+     * rather than reaching into the row's own image object to swap it in
+     * place. */
+    populate_plugin_settings_list_screen(slot);
+}
+
+/* Same VALUE_CHANGED-updates-live/RELEASED-notifies-Lua split as every
+ * native settings slider (screen_timeout_slider_event_cb et al.) -- calling
+ * back into Lua on every drag tick would hammer the plugin's on_change for a
+ * value that only matters once the user lets go. */
+static void plugin_settings_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t * slider = lv_event_get_target(e);
+    int32_t value = lv_slider_get_value(slider);
+    void * packed = lv_event_get_user_data(e);
+    int slot = unpack_plugin_settings_slot(packed);
+    int row = unpack_plugin_settings_row(packed);
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        lv_obj_t * card = lv_obj_get_parent(slider);
+        lv_obj_t * value_label = lv_obj_get_child(card, 1); /* see add_pill_slider_row()'s own child-index comment */
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", (int) value);
+        lv_label_set_text(value_label, buf);
+    } else if (code == LV_EVENT_RELEASED) {
+        plugin_settings_list_row_state[slot][row].slider_value = (int) value;
+        plugin_manager_settings_list_slid(slot, row, (int) value);
+    }
+}
+
+/* Rebuilds pool slot `slot` from plugin_settings_list_row_state[slot][] --
+ * shared by gui_plugin_show_settings_list() (initial build) and
+ * plugin_settings_toggle_row_click_cb() (rebuild after a toggle flips). */
+static void populate_plugin_settings_list_screen(int slot) {
+    for (int i = 0; i < plugin_settings_list_slider_card_count[slot]; i++) {
+        unregister_swipe_dead_zone(plugin_settings_list_slider_cards[slot][i]);
+    }
+    plugin_settings_list_slider_card_count[slot] = 0;
+
+    lv_obj_t * list = plugin_settings_list_lists[slot];
+    lv_obj_clean(list);
+
+    int count = plugin_settings_list_row_state_count[slot];
+    if (count <= 0) {
+        lv_obj_t * label = lv_label_create(list);
+        lv_label_set_text(label, "Nothing here");
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
+        lv_obj_set_style_pad_left(label, 24, 0);
+        return;
+    }
+
+    for (int row = 0; row < count; row++) {
+        plugin_settings_list_row_state_t * st = &plugin_settings_list_row_state[slot][row];
+        void * packed = pack_plugin_settings_slot_row(slot, row);
+
+        if (st->type == PLUGIN_SETTINGS_ROW_TOGGLE) {
+            lv_obj_t * row_obj = add_pill_toggle_row(list, st->label, st->toggle_value, NULL);
+            lv_obj_add_event_cb(row_obj, plugin_settings_toggle_row_click_cb, LV_EVENT_CLICKED, packed);
+        } else if (st->type == PLUGIN_SETTINGS_ROW_SLIDER) {
+            lv_obj_t * card = add_pill_slider_row(list, st->label, st->slider_min, st->slider_max, st->slider_value,
+                                                   plugin_settings_slider_event_cb, packed);
+            /* Same reasoning as every native slider card's own identical
+             * pair of calls -- see register_swipe_dead_zone()'s own
+             * top-of-block comment. */
+            lv_obj_remove_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+            register_swipe_dead_zone(card);
+            if (plugin_settings_list_slider_card_count[slot] < PLUGIN_SETTINGS_LIST_MAX_SLIDERS) {
+                plugin_settings_list_slider_cards[slot][plugin_settings_list_slider_card_count[slot]++] = card;
+            }
+        } else { /* PLUGIN_SETTINGS_ROW_TAP */
+            lv_obj_t * row_obj = add_pill_chevron_row(list, st->label, NULL);
+            lv_obj_add_event_cb(row_obj, plugin_settings_tap_row_click_cb, LV_EVENT_CLICKED, packed);
+        }
+    }
+}
+
+int gui_plugin_show_settings_list(const char * title, const int * row_types, const char * const * labels,
+                                   const bool * toggle_initial, const int * slider_min, const int * slider_max,
+                                   const int * slider_value, int count) {
+    int slot = plugin_settings_list_pool_next;
+    plugin_settings_list_pool_next = (plugin_settings_list_pool_next + 1) % PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE;
+
+    lv_label_set_text(plugin_settings_list_title_labels[slot], title);
+
+    int n = count;
+    if (n > PLUGIN_SETTINGS_LIST_MAX_ROWS) n = PLUGIN_SETTINGS_LIST_MAX_ROWS;
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) {
+        plugin_settings_list_row_state_t * st = &plugin_settings_list_row_state[slot][i];
+        st->type = row_types[i];
+        snprintf(st->label, sizeof(st->label), "%s", labels[i] ? labels[i] : "");
+        st->toggle_value = toggle_initial[i];
+        st->slider_min = slider_min[i];
+        st->slider_max = slider_max[i];
+        st->slider_value = slider_value[i];
+    }
+    plugin_settings_list_row_state_count[slot] = n;
+
+    populate_plugin_settings_list_screen(slot);
+    nav_push(plugin_settings_list_screens[slot]);
+    return slot;
 }
 
 static subsonic_artist_t * subsonic_artists_cache = NULL;
@@ -12545,6 +12873,7 @@ static void enable_bt_dac_and_show_overlay(void) {
     if (audio_is_playing()) {
         audio_stop();
         set_play_button_state(false);
+        plugin_manager_notify_stopped();
     }
     if (current_settings.wifi_dac_mode_enabled) {
         current_settings.wifi_dac_mode_enabled = false;
@@ -13042,6 +13371,7 @@ static void poll_usb_mode_switch(void) {
         if (audio_is_playing() || audio_is_paused()) {
             audio_stop();
             set_play_button_state(false);
+            plugin_manager_notify_stopped();
         }
         if (current_settings.bt_dac_mode_enabled) {
             current_settings.bt_dac_mode_enabled = false;
@@ -13684,6 +14014,7 @@ static void airplay_toggle_cb(lv_event_t * e) {
         if (audio_is_playing()) {
             audio_stop();
             set_play_button_state(false);
+            plugin_manager_notify_stopped();
         }
         if (current_settings.bt_dac_mode_enabled) {
             current_settings.bt_dac_mode_enabled = false;
@@ -15273,8 +15604,17 @@ static void factory_reset_btn_cb(lv_event_t * e);
  * screens plus About, rather than one long scroll. Each sub-screen reuses
  * the exact same items/callbacks the old flat list had, just grouped. ---- */
 
+/* Shared click handler for every plugin-registered Playback list row below
+ * -- same index-not-object shape plugin_display_list_item_click_cb() already
+ * uses. */
+static void plugin_playback_list_item_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_playback_list_item_clicked(index);
+}
+
 static lv_obj_t * build_settings_playback_screen(void) {
-    static pill_list_item_t items[6];
+    static pill_list_item_t items[6 + PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
                                     current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
@@ -15284,7 +15624,17 @@ static lv_obj_t * build_settings_playback_screen(void) {
     items[3] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
     items[5] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, 6, &style_accent);
+
+    int count = 6;
+    int plugin_count = plugin_manager_get_playback_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_PLAYBACK_LIST_ITEMS; i++) {
+        items[count++] = (pill_list_item_t){
+            plugin_manager_get_playback_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_playback_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -15322,25 +15672,63 @@ static lv_obj_t * build_settings_display_screen(void) {
     return scr;
 }
 
+/* Shared click handler for every plugin-registered Power list row below --
+ * same index-not-object shape plugin_display_list_item_click_cb() already
+ * uses. */
+static void plugin_power_list_item_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_power_list_item_clicked(index);
+}
+
 static lv_obj_t * build_settings_power_screen(void) {
-    static pill_list_item_t items[3];
+    static pill_list_item_t items[3 + PLUGIN_MAX_POWER_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Charge Limiter (85%)", PILL_ACCESSORY_TOGGLE,
                                     current_settings.charge_limiter_enabled, NULL, charge_limiter_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Idle Shutdown", PILL_ACCESSORY_CHEVRON, false, idle_shutdown_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "LED charge indicator", PILL_ACCESSORY_TOGGLE,
                                     current_settings.led_indicator_enabled, NULL, led_indicator_switch_event_cb, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, 3, &style_accent);
+
+    int count = 3;
+    int plugin_count = plugin_manager_get_power_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_POWER_LIST_ITEMS; i++) {
+        items[count++] = (pill_list_item_t){
+            plugin_manager_get_power_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_power_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
 
+/* Shared click handler for every plugin-registered System list row below --
+ * same index-not-object shape plugin_display_list_item_click_cb() already
+ * uses. */
+static void plugin_system_list_item_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_system_list_item_clicked(index);
+}
+
 static lv_obj_t * build_settings_system_screen(void) {
-    static pill_list_item_t items[4];
+    static pill_list_item_t items[4 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Time Zone", PILL_ACCESSORY_CHEVRON, false, timezone_settings_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, 4, &style_accent);
+
+    int count = 4;
+    int plugin_count = plugin_manager_get_system_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SYSTEM_LIST_ITEMS; i++) {
+        items[count++] = (pill_list_item_t){
+            plugin_manager_get_system_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_system_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -16488,6 +16876,10 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     queue_screen = build_queue_screen();
     for (int i = 0; i < PLUGIN_LIST_SCREEN_POOL_SIZE; i++) {
         plugin_list_screens[i] = build_subsonic_list_screen("Plugin", &plugin_list_title_labels[i], &plugin_list_lists[i]);
+    }
+    for (int i = 0; i < PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE; i++) {
+        plugin_settings_list_screens[i] =
+            build_subsonic_list_screen("Settings", &plugin_settings_list_title_labels[i], &plugin_settings_list_lists[i]);
     }
     build_delete_song_popup();
     build_more_menu_popup();

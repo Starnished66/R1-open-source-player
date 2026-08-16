@@ -1,6 +1,8 @@
 #ifndef PLUGIN_MANAGER_H
 #define PLUGIN_MANAGER_H
 
+#include <stdbool.h>
+
 /* Third-party Lua plugin support. Every *.lua file under
  * <SD card>/.plugins/ is loaded into its own lua_State at startup, with a
  * small C API (the `plugin` global table, see plugin_manager.c's own
@@ -45,6 +47,26 @@
  * top-level Settings list. */
 #define PLUGIN_MAX_DISPLAY_LIST_ITEMS 8
 
+/* Same shape and reasoning as PLUGIN_MAX_DISPLAY_LIST_ITEMS above, for
+ * plugin.register_list_item("playback", ...) -- sizes plugin_manager.c's own
+ * internal plugin_playback_list_items[] array, and gui.c's build_settings_
+ * playback_screen() sizes its own static items[] array off this (6 built-in
+ * rows -- "Car Mode", "Crossfade", "Equalizer", "Resume Last Track", "Sleep
+ * Timer", "Startup Volume" -- plus this many plugin rows). */
+#define PLUGIN_MAX_PLAYBACK_LIST_ITEMS 8
+
+/* Same shape and reasoning as PLUGIN_MAX_DISPLAY_LIST_ITEMS above, for
+ * plugin.register_list_item("power", ...) -- sizes plugin_manager.c's own
+ * internal plugin_power_list_items[] array, and gui.c's build_settings_
+ * power_screen() sizes its own static items[] array off this. */
+#define PLUGIN_MAX_POWER_LIST_ITEMS 8
+
+/* Same shape and reasoning as PLUGIN_MAX_DISPLAY_LIST_ITEMS above, for
+ * plugin.register_list_item("system", ...) -- sizes plugin_manager.c's own
+ * internal plugin_system_list_items[] array, and gui.c's build_settings_
+ * system_screen() sizes its own static items[] array off this. */
+#define PLUGIN_MAX_SYSTEM_LIST_ITEMS 8
+
 /* Upper bound on how many tiles all plugins combined may register via
  * plugin.register_stream_media_tile() -- sizes plugin_manager.c's own
  * internal plugin_stream_tiles[] array. Stream Media has exactly one
@@ -56,6 +78,80 @@
  * (1 built-in + this many plugin tiles) -- icon_grid_item_t has no
  * runtime-append API, so that array has to be sized up front. */
 #define PLUGIN_MAX_STREAM_TILES 5
+
+/* ---- plugin.show_settings_list() -- a second, separate screen pool from
+ * plugin.show_list() (PLUGIN_LIST_SCREEN_POOL_SIZE, gui.c), for a plugin's
+ * OWN nested settings submenu with real toggle/slider rows, not plain
+ * tappable text. Shared between plugin_manager.c (per-slot Lua callback ref
+ * storage, so a reused pool slot's stale refs get released rather than
+ * leaked) and gui.c (the pool itself + its per-slot row state) -- see
+ * gui.c's gui_plugin_show_settings_list() and plugin_manager.c's
+ * l_plugin_show_settings_list(). ---- */
+
+/* Row type tags, passed as plain ints across the gui.c/plugin_manager.c
+ * boundary (parallel-array style, matching every other plugin.* bridge in
+ * this codebase -- no shared struct type needed across the two headers). */
+#define PLUGIN_SETTINGS_ROW_TAP    0 /* plain tap row -- on_select(), no args */
+#define PLUGIN_SETTINGS_ROW_TOGGLE 1 /* on/off switch -- on_change(new_value: bool) */
+#define PLUGIN_SETTINGS_ROW_SLIDER 2 /* on_change(new_value: number), fires on release only */
+
+/* Two pool slots -- settings submenus nest shallower in practice than plain
+ * list browsing (plugin.show_list()'s own pool is 4), so smaller with real
+ * headroom under NAV_STACK_MAX. Sizes both gui.c's screen pool and
+ * plugin_manager.c's per-slot callback-ref storage below. */
+#define PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE 2
+
+/* Upper bound on rows per plugin.show_settings_list() call -- silently
+ * truncates past this, same convention plugin.show_list()'s own
+ * PLUGIN_MAX_LIST_ITEMS cap uses. Sizes both plugin_manager.c's per-slot ref
+ * storage and gui.c's per-slot row-state storage. */
+#define PLUGIN_SETTINGS_LIST_MAX_ROWS 24
+
+/* Upper bound on "slider"-type rows per call specifically -- separate from
+ * PLUGIN_SETTINGS_LIST_MAX_ROWS because each slider row needs a real,
+ * bounded slot in gui.c's swipe_dead_zones[] (see SWIPE_DEAD_ZONE_MAX's own
+ * comment there): PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE pool slots x this
+ * many sliders each is real, accounted-for headroom, not unbounded growth.
+ * A slider row past this cap is silently dropped (not rendered at all),
+ * same truncate-don't-error convention as the row cap above. */
+#define PLUGIN_SETTINGS_LIST_MAX_SLIDERS 4
+
+/* ---- plugin.on(event, callback) -- lets a plugin react to a playback
+ * lifecycle change it didn't itself cause (a scrobbler needs to know when a
+ * track starts, for instance), rather than only ever running in response to
+ * a direct tap. Unlike plugin.register_list_item() (each plugin's row
+ * coexists as its own list entry), an event has no UI real estate to divide
+ * up -- every subscriber to a given event fires, so storage is a small
+ * per-event array of Lua refs rather than one ref per plugin. See gui.c's
+ * own comment on where each event actually fires (play_track_at_from()/
+ * on_track_auto_advanced()/toggle_play_pause()/the six audio_stop() call
+ * sites). ---- */
+
+/* Upper bound on how many plugin.on() subscriptions any ONE event may have,
+ * across every loaded plugin combined -- luaL_error()s past this, same
+ * cap-and-fail-loudly convention as PLUGIN_MAX_STREAM_TILES. Four events
+ * (track_started/paused/resumed/stopped) each get their own array sized off
+ * this, in plugin_manager.c. */
+#define PLUGIN_MAX_EVENT_SUBSCRIBERS 8
+
+/* ---- plugin.set_interval(seconds, callback) / plugin.clear_interval(handle)
+ * -- a generic repeating timer, needed so a plugin can periodically poll
+ * plugin.get_position() (e.g. a scrobbler checking Last.fm's own "50% or 4
+ * minutes played" threshold) without a native event to hang that logic off
+ * of. Backed by gui.c's lv_timer_create(), the same mechanism
+ * update_timer_cb() already uses for its own 500ms polling loop. ---- */
+
+/* Fixed pool of concurrently-active intervals, across every loaded plugin
+ * combined -- luaL_error()s a set_interval() call past this rather than
+ * silently overwriting or refusing quietly. Sizes gui.c's own
+ * plugin_interval_timers[] array too. */
+#define PLUGIN_MAX_INTERVALS 8
+
+/* Minimum enforced period for plugin.set_interval() -- a request for less
+ * than this is silently clamped up to it (not an error: asking for 100ms
+ * isn't misusing the API, just asking for more than makes sense), so one
+ * misbehaving plugin can't flood the main UI thread with timer callbacks. */
+#define PLUGIN_INTERVAL_MIN_MS 1000
 
 /* Scans <SD card>/.plugins/ for .lua files and loads each one, discovering
  * the rows/tiles they register during load. Should run before anything
@@ -93,6 +189,25 @@ int plugin_manager_get_display_list_item_count(void);
 const char * plugin_manager_get_display_list_item_label(int index);
 void plugin_manager_display_list_item_clicked(int index);
 
+/* Same shape again, for plugin.register_list_item("playback", ...) -- gui.c's
+ * build_settings_playback_screen() appends these after its own 6 built-in
+ * rows. */
+int plugin_manager_get_playback_list_item_count(void);
+const char * plugin_manager_get_playback_list_item_label(int index);
+void plugin_manager_playback_list_item_clicked(int index);
+
+/* Same shape again, for plugin.register_list_item("power", ...) -- gui.c's
+ * build_settings_power_screen() appends these after its own built-in rows. */
+int plugin_manager_get_power_list_item_count(void);
+const char * plugin_manager_get_power_list_item_label(int index);
+void plugin_manager_power_list_item_clicked(int index);
+
+/* Same shape again, for plugin.register_list_item("system", ...) -- gui.c's
+ * build_settings_system_screen() appends these after its own built-in rows. */
+int plugin_manager_get_system_list_item_count(void);
+const char * plugin_manager_get_system_list_item_label(int index);
+void plugin_manager_system_list_item_clicked(int index);
+
 /* Invoked by gui.c's plugin-list-screen row click handler when row `index`
  * (into whatever items table the most recent plugin.show_list() call
  * passed) is tapped -- calls back into that call's on_select Lua function
@@ -109,6 +224,49 @@ const char * plugin_manager_get_stream_tile_label(int index);
 const char * plugin_manager_get_stream_tile_icon(int index);
 const char * plugin_manager_get_stream_tile_icon_selected(int index);
 void plugin_manager_stream_tile_clicked(int index);
+
+/* Invoked by gui.c's plugin-settings-list row widgets (see
+ * gui_plugin_show_settings_list()) when a "row"-type row in pool slot `slot`
+ * at position `row` is tapped -- calls that row's own on_select Lua function
+ * with no arguments. Unlike plugin_manager_list_item_selected() above (one
+ * shared "current" ref for plugin.show_list()), this looks up a ref stored
+ * per (slot, row) -- see plugin_manager.c's own plugin_settings_list_rows[]
+ * comment for why. No-op if slot/row is out of range or was never
+ * populated. */
+void plugin_manager_settings_list_row_selected(int slot, int row);
+
+/* Same shape, for a "toggle"-type row -- calls its on_change(new_value)
+ * with the toggle's new boolean state. */
+void plugin_manager_settings_list_toggled(int slot, int row, bool new_value);
+
+/* Same shape, for a "slider"-type row -- calls its on_change(new_value) with
+ * the slider's new integer value. Fired once on release, not on every drag
+ * tick -- see gui.c's plugin_settings_slider_event_cb()'s own comment. */
+void plugin_manager_settings_list_slid(int slot, int row, int new_value);
+
+/* ---- Dispatchers for plugin.on() event subscribers -- called from gui.c
+ * at the exact points each event actually happens (see plugin_manager.h's
+ * own PLUGIN_MAX_EVENT_SUBSCRIBERS comment above for the hook-point list).
+ * Each loops every plugin currently subscribed to that event and
+ * lua_pcall()s it -- a no-op if nothing is subscribed. ---- */
+void plugin_manager_notify_track_started(const char * title, const char * artist, const char * album,
+                                          double duration_seconds);
+void plugin_manager_notify_paused(void);
+void plugin_manager_notify_resumed(void);
+void plugin_manager_notify_stopped(void);
+
+/* Invoked by gui.c's shared plugin-interval lv_timer callback when the
+ * timer for pool slot `slot` (plugin_interval_timers[], gui.c) fires --
+ * looks up that slot's stored Lua ref and calls it with no arguments. */
+void plugin_manager_interval_fired(int slot);
+
+/* Invoked by gui.c's plugin_text_entry_done_cb() when the single pending
+ * plugin.show_text_input() call is submitted (T9 keypad Enter) -- calls its
+ * on_submit(text) once, then clears the pending ref (one-shot, matching
+ * show_text_entry()'s own "never fires on cancel" semantics -- see
+ * plugin_manager.c's l_plugin_show_text_input() for the caveat this
+ * inherits from the native singleton screen). */
+void plugin_manager_text_input_submitted(const char * text);
 
 #endif /* PLUGIN_MANAGER_H */
 

@@ -3,6 +3,7 @@
 
 #include "lvgl/lvgl.h"
 #include <stdint.h>
+#include <stddef.h>
 
 /* Initialize the user interface elements and callbacks */
 void gui_init(uint32_t screen_width, uint32_t screen_height);
@@ -26,6 +27,20 @@ void gui_show_boot_splash(void);
  * single shared screen) showing `labels[0..count)` as plain tappable rows.
  * Tapping row i calls plugin_manager_list_item_selected(i). */
 void gui_plugin_show_list(const char * title, const char * const * labels, int count);
+
+/* Repopulates and pushes a shared plugin-settings-list screen -- a SEPARATE
+ * pool from gui_plugin_show_list()'s own (PLUGIN_SETTINGS_LIST_SCREEN_POOL_
+ * SIZE slots, plugin_manager.h), for a plugin's own nested settings submenu
+ * built from real toggle/slider rows, not plain tappable text. Parallel
+ * arrays, row_types[i] one of PLUGIN_SETTINGS_ROW_TAP/_TOGGLE/_SLIDER
+ * (plugin_manager.h) -- toggle_initial[]/slider_min[]/slider_max[]/
+ * slider_value[] are read only for the matching row type, ignored (may be
+ * garbage) otherwise. Returns the pool slot index this call landed in, so
+ * plugin_manager.c can key its own per-slot Lua callback-ref storage off
+ * the same slot gui.c actually used. */
+int gui_plugin_show_settings_list(const char * title, const int * row_types, const char * const * labels,
+                                   const bool * toggle_initial, const int * slider_min, const int * slider_max,
+                                   const int * slider_value, int count);
 
 /* Starts playback of a brand-new playlist built from `paths[0..count)`,
  * starting at paths[start_index] -- same "starting something new clears
@@ -97,5 +112,32 @@ bool gui_plugin_is_playing(void);
 bool gui_plugin_is_paused(void);
 double gui_plugin_get_position_seconds(void);
 double gui_plugin_get_duration_seconds(void);
+
+/* ---- Bridges for plugin.get_now_playing()/set_interval()/clear_interval()/
+ * show_text_input() -- see plugin_manager.h's own comments on the Lua-facing
+ * shape of each. ---- */
+
+/* Fills title/artist/album (NUL-terminated, truncated to fit) and
+ * *out_duration_seconds from gui.c's own cached now-playing state (the same
+ * metadata already passed to a "track_started" event handler, populated at
+ * the same two call sites that fire it) -- returns false (buffers/duration
+ * untouched) if nothing is currently loaded. */
+bool gui_plugin_get_now_playing(char * title_out, size_t title_size, char * artist_out, size_t artist_size,
+                                 char * album_out, size_t album_size, double * out_duration_seconds);
+
+/* Creates/deletes an lv_timer for plugin pool slot `slot` (0-based, into a
+ * PLUGIN_MAX_INTERVALS-sized array) -- the shared timer callback reads its
+ * own slot back out and calls plugin_manager_interval_fired(slot). Same
+ * repeating-timer mechanism this file's own update_timer_cb() already uses
+ * for its 500ms polling loop. */
+void gui_plugin_set_interval(int slot, uint32_t period_ms);
+void gui_plugin_clear_interval(int slot);
+
+/* Thin wrapper around this file's own show_text_entry() singleton screen
+ * (numeric=false always -- a plugin wanting a numeric-only keypad can still
+ * just validate/convert the returned string itself). See
+ * plugin_manager.h's own doc comment on plugin.show_text_input() for the
+ * singleton/cancel-semantics caveats this inherits as-is. */
+void gui_plugin_show_text_input(const char * title, const char * initial_text, bool is_password);
 
 #endif /* GUI_H */

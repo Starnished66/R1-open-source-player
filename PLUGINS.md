@@ -33,7 +33,8 @@ whichever fits your plugin's own subject matter:
 
 **`plugin.register_list_item(list_id, ...)`** -- every plugin that calls
 this gets its own row, appended to whichever native list screen `list_id`
-names, after that screen's own built-in rows. Three recognized values:
+names, after that screen's own built-in rows. Six recognized values --
+every one of Settings' own screens, plus Books:
 
 - `"books"` -- the **Books** screen, after "Books"/"Favorites", up to
   `PLUGIN_MAX_BOOKS_LIST_ITEMS` (currently 8) combined across plugins.
@@ -45,6 +46,16 @@ names, after that screen's own built-in rows. Three recognized values:
   `PLUGIN_MAX_DISPLAY_LIST_ITEMS` (currently 8). This is where a
   display-theming plugin's own entry point belongs -- see
   `plugins_examples/Themes.lua`.
+- `"playback"` -- the **Settings -> Playback** sub-screen, after "Car
+  Mode"/"Crossfade"/"Equalizer"/"Resume Last Track"/"Sleep Timer"/"Startup
+  Volume", up to `PLUGIN_MAX_PLAYBACK_LIST_ITEMS` (currently 8). See
+  `plugins_examples/PlaybackExtras.lua`.
+- `"power"` -- the **Settings -> Power** sub-screen, after "Charge Limiter"/
+  "Idle Shutdown"/"LED charge indicator", up to `PLUGIN_MAX_POWER_LIST_ITEMS`
+  (currently 8).
+- `"system"` -- the **Settings -> System** sub-screen, after "Time Zone"/
+  "USB Mode"/"Update Music Database"/"Factory Reset", up to
+  `PLUGIN_MAX_SYSTEM_LIST_ITEMS` (currently 8).
 
 Passing anything else raises a Lua error at load time rather than silently
 registering into nothing. If no plugin registers a row for a given
@@ -72,13 +83,14 @@ from the moment your script starts running (injected before
 
 Adds a row to an existing native list screen.
 
-- `list_id` (string): which screen to add to -- `"books"`, `"settings"`, or
-  `"display"` (see "Reaching a plugin from the UI" above for what each
-  targets) -- anything else raises a Lua error immediately, rather than
-  silently registering into nothing.
+- `list_id` (string): which screen to add to -- `"books"`, `"settings"`,
+  `"display"`, `"playback"`, `"power"`, or `"system"` (see "Reaching a
+  plugin from the UI" above for what each targets) -- anything else raises
+  a Lua error immediately, rather than silently registering into nothing.
 - `label` (string): the row's visible text.
 - `on_open` (function): called with zero arguments when the row is tapped.
-  This is where you'd call `plugin.show_list()` to show your first screen.
+  This is where you'd call `plugin.show_list()` or
+  `plugin.show_settings_list()` to show your first screen.
 
 Every plugin that calls this gets its own row (unlike the old
 `register_tile()` this replaced, where only the first caller was ever
@@ -86,7 +98,7 @@ reachable) -- a script can still call it more than once if it genuinely
 wants multiple independent entry points into the same list.
 
 Errors if more than that `list_id`'s own cap (currently 8 for each of the
-three) is registered, across every loaded plugin combined.
+six) is registered, across every loaded plugin combined.
 
 ### `plugin.register_stream_media_tile(label, on_open [, icon])`
 
@@ -203,6 +215,57 @@ screen calls `show_list` again itself. In practice, structuring your
 plugin as "each screen's `on_select` immediately calls `show_list` again
 for the next screen" (exactly what `Audiobooks.lua` does) avoids ever
 hitting this.
+
+### `plugin.show_settings_list(title, items)`
+
+Opens a **settings submenu** -- indistinguishable from a native Settings
+screen, with real toggle switches and sliders, not plain tappable text.
+Use this instead of `show_list()` whenever your plugin's own screen is
+itself a small settings panel (see `plugins_examples/PlaybackExtras.lua`).
+
+- `title` (string): the screen's header text.
+- `items` (array table of row tables): one row per entry, shown in order.
+  Every row needs `type` and `label`; the rest depends on `type`:
+  - `{ type = "row", label = "...", on_select = function() ... end }` -- a
+    plain tap. `on_select` is called with no arguments. A `show_settings_list`
+    call from inside `on_select` is how you nest a submenu inside a
+    submenu -- no separate "submenu" row type needed.
+  - `{ type = "toggle", label = "...", value = true/false, on_change =
+    function(new_value) ... end }` -- a real on/off switch. `value` is its
+    initial state; `on_change` is called with the new boolean every time
+    it's tapped.
+  - `{ type = "slider", label = "...", min = n, max = n, value = n,
+    on_change = function(new_value) ... end }` -- a real slider, integer
+    range `min`..`max`, initial position `value`. `on_change` fires **once,
+    when the drag is released** -- not on every intermediate tick, same
+    convention every native settings slider (Screen Timeout, Startup
+    Volume, the EQ bands) already uses, so a callback that writes to disk
+    isn't hammered mid-drag.
+
+Capped at 24 rows per call, and 4 `"slider"`-type rows per call
+specifically (the underlying swipe-gesture-safety bookkeeping -- see below
+-- needs a real, bounded slot per slider). Both cases silently drop the
+excess rather than erroring, same convention as `show_list()`'s own item
+cap. An unknown/missing `type`, or a row missing its required callback
+(`on_select` for `"row"`, `on_change` for `"toggle"`/`"slider"`), raises a
+Lua error immediately instead.
+
+Each call opens a screen from a small **separate** pool from `show_list()`'s
+own (2 slots, smaller since settings submenus nest shallower in practice --
+`PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE` in `plugin_manager.h`). Unlike
+`show_list()`, each pool slot keeps its **own** row callbacks (not one
+shared "most recently opened" registration) -- so if your plugin has a
+submenu open on top of another, backing out to the first one still routes
+its toggle/slider taps correctly, no equivalent to `show_list()`'s own
+"structure it as immediate re-calls" caveat above. Nesting more than 2
+levels deep reuses an earlier pool slot and will corrupt back-navigation at
+that depth, same bounded-pool tradeoff `show_list()` makes at 4.
+
+Every slider row you create is also registered against a fixed-size,
+app-wide "don't let a drag on this become a swipe-to-player/back gesture"
+list -- purely internal bookkeeping (`gui.c`'s `swipe_dead_zones[]`), not
+something your plugin needs to manage, but it's *why* the 4-sliders-per-call
+cap above exists and isn't just an arbitrary round number.
 
 Items beyond the first 500 (`PLUGIN_MAX_LIST_ITEMS`) in a single call are
 silently dropped.
@@ -397,6 +460,103 @@ UI until the request completes or times out. Keep calls fast, or trigger
 them from a user tap (a `register_list_item`/`show_list` row) rather than
 anywhere that could be called in a loop.
 
+### `plugin.http_post(url, body [, content_type] [, verify_tls])`
+
+Same shape, return values, and blocking caveat as `http_get()` above, for a
+POST. `content_type` defaults to `"application/x-www-form-urlencoded"` if
+omitted or `nil` -- what most simple API POSTs (including Last.fm's) expect;
+pass `"application/json"` or anything else your target API needs. `body` is
+sent as-is, byte for byte -- this function doesn't URL-encode or otherwise
+transform it, so build the string yourself first.
+
+### `plugin.md5(text)`
+
+Returns the MD5 hash of `text` as a lowercase hex string. Bridges
+`mbedtls_md5()` (already vendored, already used the same way by this app's
+own Subsonic integration for its token auth) -- no new dependency. Useful
+for any API that needs a request signed this way, e.g. Last.fm's own
+`api_sig` scheme (see `plugins_examples/LastFmScrobbler.lua`).
+
+### `plugin.show_text_input(title, initial_text, is_password, on_submit)`
+
+Opens the app's own T9 multi-tap keypad text-entry screen -- the same one
+used for Wi-Fi passwords and Subsonic server login.
+
+- `title` (string): the screen's header text.
+- `initial_text` (string or `nil`): pre-fills the field; `nil` starts empty.
+- `is_password` (boolean): masks the input.
+- `on_submit` (function): called with the entered text when the T9 keypad's
+  Enter key is pressed.
+
+**`on_submit` is not called if the user backs out instead of submitting** --
+not with an empty string, not at all. Don't assume it always fires.
+
+This is a **true singleton screen**: calling `show_text_input()` again
+before a previous call's `on_submit` has fired silently replaces the
+pending callback. Chaining calls from within `on_submit` itself (e.g. "ask
+for a username, then in that callback ask for a password") is exactly what
+this is for and works fine, since each call resolves before the next one
+happens. Two unrelated plugins racing to show text input at the same moment
+would stomp each other, same as any two native callers of this same screen
+already would.
+
+### `plugin.get_now_playing()`
+
+Returns `title, artist, album, duration_seconds` for whatever's currently
+loaded, or a single `nil` if nothing has played yet this session. The same
+metadata a `"track_started"` event handler already receives as arguments
+(see "Events" below) -- this is for code that isn't reacting to that event
+directly, e.g. a `set_interval()` tick double-checking what's still playing.
+
+## Events
+
+### `plugin.on(event, callback)`
+
+Subscribes to a playback lifecycle change your plugin didn't itself cause.
+Unlike `register_list_item()` (where each plugin's row coexists as its own
+list entry), an event has no UI real estate to divide up -- **every**
+plugin subscribed to a given event fires, not just the first or the most
+recent. Four recognized events:
+
+- `"track_started"` -- `callback(title, artist, album, duration_seconds)`.
+  Fires whenever a new track begins playing, whatever the cause: a manual
+  tap, next/prev, a gapless or crossfade auto-advance, a plugin's own
+  `play_file()`/`play_list()`, or remote control. There's deliberately no
+  separate "next"/"prev" event -- from a subscriber's point of view it's
+  the same fact ("a new track started, here's its metadata") regardless of
+  what triggered it.
+- `"paused"` / `"resumed"` -- `callback()`, no arguments. Fire on every
+  pause/resume transition, however it was triggered (the play/pause button,
+  a hardware button, `plugin.toggle_pause()`).
+- `"stopped"` -- `callback()`, no arguments. Fires when playback stops
+  outright (not paused) -- deleting the currently-playing song, a DLNA stop
+  request, enabling Bluetooth/USB/AirPlay DAC mode (which force-stops local
+  playback), or `plugin.stop()`. **Known gap**: does *not* fire when a
+  playlist simply reaches its end with Repeat off -- that path doesn't
+  route through any of this app's own explicit stop points. Not needed for
+  scrobbling (which only cares about elapsed listening time, and simply
+  stops noticing once nothing's playing), but worth knowing if you're
+  relying on it for something else.
+
+Passing an unrecognized event name raises a Lua error immediately, same
+convention as an unrecognized `list_id`. Capped at 8 subscribers per event,
+across every loaded plugin combined.
+
+### `plugin.set_interval(seconds, callback)` / `plugin.clear_interval(handle)`
+
+A generic repeating timer -- for anything that needs to poll rather than
+react to an event, e.g. checking `get_position()` against some threshold
+periodically. `set_interval()` returns a `handle` to later pass to
+`clear_interval()` to stop it. `seconds` below 1 is silently clamped up to
+1 second (not an error) -- this prevents one plugin from flooding the main
+UI thread with timer callbacks. Capped at 8 concurrently-active intervals,
+across every loaded plugin combined -- exceeding that raises a Lua error.
+
+A callback registered this way runs on the main UI thread, exactly like
+every other `plugin.*` callback -- a slow `http_get()`/`http_post()` inside
+one will visibly stall the whole UI until it returns, same tradeoff
+`http_get()` itself already documents.
+
 ## Complete examples
 
 `plugins_examples/Audiobooks.lua` uses most of the API: `sd_root()`/
@@ -431,10 +591,28 @@ restart to fully catch up after switching mid-session).
 
 `plugins_examples/SoundProfiles.lua` is the reference implementation for the
 EQ functions -- a handful of curated `.peq` presets reachable from
-Settings -> Sound Profile, switched with `plugin.eq_load_profile()` and
+Settings -> Playback -> Sound Profile, switched with `plugin.eq_load_profile()` and
 `plugin.show_list()`, following the exact same "`register_list_item` ->
 `show_list` -> apply and persist to a state file" shape `Themes.lua` already
 established for theme switching.
+
+`plugins_examples/PlaybackExtras.lua` is the reference implementation for
+`register_list_item("playback", ...)` and `show_settings_list()` -- a
+"Loudness Boost" row in Settings -> Playback opening a submenu with a real
+toggle switch, a real slider (both driving `plugin.eq_set_preamp()`), and a
+nested `"row"` ("About") that opens a second `show_settings_list()` screen
+on top of the first, demonstrating submenu-inside-a-submenu nesting.
+
+`plugins_examples/LastFmScrobbler.lua` is the reference implementation for
+`plugin.on()`, `set_interval()`/`clear_interval()`, `get_now_playing()`,
+`http_post()`, `md5()`, and `show_text_input()` together -- a real Last.fm
+scrobbler. Logs in via `show_text_input()` (username, then password,
+chained), signs and POSTs `auth.getMobileSession` to obtain a session key
+(persisted; the password itself isn't), sends `track.updateNowPlaying` on
+every `"track_started"` event, and uses a 15-second `set_interval()` to
+POST `track.scrobble` once `get_position()` crosses Last.fm's own "50% or 4
+minutes played" threshold. Requires a free Last.fm API account -- see the
+plugin's own header comment for where to get one and where to put the key.
 
 ## Writing and testing your own plugin
 

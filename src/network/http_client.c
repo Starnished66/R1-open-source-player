@@ -89,6 +89,24 @@ static bool read_body(http_conn_reader_t * r, bool is_chunked, uint64_t content_
     return true;
 }
 
+/* Writes exactly len bytes of data (headers or a POST body -- either way,
+ * just a byte buffer to the wire), retrying short writes -- shared by
+ * do_get()/do_post() below. */
+static bool write_all(http_conn_t * conn, const uint8_t * data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        int n = http_conn_write(conn, data + sent, len - sent);
+        if (n <= 0) {
+            DBG_LOG("http_client: conn_write failed (n=%d) after %zu/%zu bytes\n", n, sent, len);
+            return false;
+        }
+        sent += (size_t) n;
+    }
+    return true;
+}
+
+static bool read_response(http_conn_t * conn, int * out_status, body_sink_t * sink); /* defined below -- shared by do_get()/do_post() */
+
 static bool do_get(const char * url, bool verify_tls, int * out_status, body_sink_t * sink) {
     bool is_https;
     char host[256], port[16], path[2048];
@@ -114,25 +132,73 @@ static bool do_get(const char * url, bool verify_tls, int * out_status, body_sin
         return false;
     }
 
-    size_t sent = 0;
-    while (sent < (size_t) req_len) {
-        int n = http_conn_write(&conn, (const uint8_t *) request + sent, (size_t) req_len - sent);
-        if (n <= 0) {
-            DBG_LOG("http_client: conn_write failed (n=%d) after %zu/%d bytes\n", n, sent, req_len);
-            http_conn_close(&conn);
-            return false;
-        }
-        sent += (size_t) n;
+    if (!write_all(&conn, (const uint8_t *) request, (size_t) req_len)) {
+        http_conn_close(&conn);
+        return false;
     }
 
+    bool ok = read_response(&conn, out_status, sink);
+    http_conn_close(&conn);
+    return ok;
+}
+
+/* Same connection-handling shape as do_get() above, with a request body --
+ * see http_post_to_buffer()'s own doc comment in http_client.h. Headers and
+ * body are written as two separate write_all() calls rather than one
+ * combined buffer, since a POST body's own size is unbounded (unlike the
+ * fixed-size `request` header buffer GET already uses) -- concatenating
+ * them into one buffer would mean either a second malloc'd copy of the
+ * whole body or an arbitrary size cap neither GET nor POST currently has. */
+static bool do_post(const char * url, bool verify_tls, const char * content_type, const uint8_t * body,
+                     size_t body_size, int * out_status, body_sink_t * sink) {
+    bool is_https;
+    char host[256], port[16], path[2048];
+    if (!http_conn_parse_url(url, &is_https, host, sizeof(host), port, sizeof(port), path, sizeof(path))) {
+        DBG_LOG("http_client: parse_url failed for '%s'\n", url);
+        return false;
+    }
+
+    http_conn_t conn;
+    if (!http_conn_open(&conn, host, port, is_https, verify_tls)) {
+        DBG_LOG("http_client: conn_open failed for host='%s' port='%s' https=%d\n", host, port, is_https);
+        http_conn_close(&conn);
+        return false;
+    }
+
+    char request[2560];
+    int req_len = snprintf(request, sizeof(request),
+                            "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: open_hiby_player\r\n"
+                            "Content-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                            path, host, content_type, body_size);
+    if (req_len < 0 || (size_t) req_len >= sizeof(request)) {
+        DBG_LOG("http_client: request too long for path='%s'\n", path);
+        http_conn_close(&conn);
+        return false;
+    }
+
+    if (!write_all(&conn, (const uint8_t *) request, (size_t) req_len) ||
+        (body_size > 0 && !write_all(&conn, body, body_size))) {
+        http_conn_close(&conn);
+        return false;
+    }
+
+    bool ok = read_response(&conn, out_status, sink);
+    http_conn_close(&conn);
+    return ok;
+}
+
+/* Reads a response (status line, headers, body) off an already-open
+ * connection whose request has already been fully written -- shared tail
+ * end of do_get()/do_post() below, since a GET and a POST response are read
+ * identically once the request itself is on the wire. */
+static bool read_response(http_conn_t * conn, int * out_status, body_sink_t * sink) {
     http_conn_reader_t reader;
     memset(&reader, 0, sizeof(reader));
-    reader.conn = &conn;
+    reader.conn = conn;
 
     char status_line[256];
     if (!http_conn_reader_line(&reader, status_line, sizeof(status_line))) {
-        DBG_LOG("http_client: failed to read status line from host='%s'\n", host);
-        http_conn_close(&conn);
+        DBG_LOG("http_client: failed to read status line\n");
         return false;
     }
     DBG_LOG("http_client: status line: '%s'\n", status_line);
@@ -142,7 +208,6 @@ static bool do_get(const char * url, bool verify_tls, int * out_status, body_sin
     const char * sp = strchr(status_line, ' ');
     if (!sp) {
         DBG_LOG("http_client: malformed status line '%s'\n", status_line);
-        http_conn_close(&conn);
         return false;
     }
     status = atoi(sp + 1);
@@ -172,9 +237,7 @@ static bool do_get(const char * url, bool verify_tls, int * out_status, body_sin
     DBG_LOG("http_client: status=%d content_length=%llu chunked=%d\n", status,
             (unsigned long long) content_length, is_chunked);
 
-    bool ok = read_body(&reader, is_chunked, content_length, sink);
-    http_conn_close(&conn);
-    if (!ok) {
+    if (!read_body(&reader, is_chunked, content_length, sink)) {
         DBG_LOG("http_client: read_body failed (chunked=%d content_length=%llu)\n", is_chunked,
                 (unsigned long long) content_length);
         return false;
@@ -192,6 +255,23 @@ bool http_get_to_buffer(const char * url, bool verify_tls, int * out_status, uin
                           .progress_cb = NULL, .progress_user_data = NULL,
                           .out_content_type = NULL, .out_content_type_size = 0 };
     if (!do_get(url, verify_tls, out_status, &sink)) {
+        free(*out_body);
+        *out_body = NULL;
+        *out_body_size = 0;
+        return false;
+    }
+    return true;
+}
+
+bool http_post_to_buffer(const char * url, bool verify_tls, const char * content_type, const uint8_t * body,
+                          size_t body_size, int * out_status, uint8_t ** out_body, size_t * out_body_size) {
+    *out_body = NULL;
+    *out_body_size = 0;
+
+    body_sink_t sink = { .out_buffer = out_body, .out_buffer_size = out_body_size, .out_file = NULL,
+                          .progress_cb = NULL, .progress_user_data = NULL,
+                          .out_content_type = NULL, .out_content_type_size = 0 };
+    if (!do_post(url, verify_tls, content_type, body, body_size, out_status, &sink)) {
         free(*out_body);
         *out_body = NULL;
         *out_body_size = 0;

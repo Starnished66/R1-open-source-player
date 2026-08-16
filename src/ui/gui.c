@@ -181,6 +181,8 @@ static lv_obj_t * settings_playback_screen;
 static lv_obj_t * settings_display_screen;
 static lv_obj_t * settings_power_screen;
 static lv_obj_t * settings_system_screen;
+static lv_obj_t * resume_mode_screen;
+static lv_obj_t * resume_mode_list;
 static lv_obj_t * dac_home_screen;
 
 static lv_obj_t * screen_timeout_screen;
@@ -1400,20 +1402,64 @@ static char bt_connected_codec_cached[32] = "";
 /* Real-device incident: on a genuine cold boot, hci0 briefly reads
  * "powered" right after S80_bt_init's own firmware flash (which leaves the
  * raw HCI device up as a side effect of attaching it), before bluetoothd
- * itself has even started (~11.5s into boot, confirmed via
- * /proc/<pid>/stat) and forces it back off per its own AutoEnable=false
- * default (/etc/bluetooth/main.conf) -- a real, if brief, on-then-off
- * transition, not a UI caching bug. This app's own ~5s passive status poll
- * can straddle that window and flash the topbar/drawer icon on, then off,
- * a few seconds apart. A 20s passive-poll suppression window was tried
- * here and removed (2026-08-13): it only hid the transient from polls
- * that happened to land inside the window, so the same on-then-off flash
- * still showed up right after the window closed instead -- not an actual
- * fix, just relocating when the flicker becomes visible, so not worth the
- * extra state (bt_boot_settle_suppress_disabled, the active/passive poll
- * distinction) it required. If this is worth fixing for real, the fix
- * belongs where the transient itself originates (S80_bt_init/bluetoothd
- * startup), not in this app's display layer. */
+ * itself has even started, and forces it back off per its own
+ * AutoEnable=false default (/etc/bluetooth/main.conf) once bluetoothd does
+ * start -- a real, if variable-length (real-device measurements from ~5s
+ * to ~16s depending on boot timing), on-then-off transition at the
+ * hci0/bluetoothd level, not a UI caching bug -- see S80_bt_init's own
+ * /usr/bin/bt_init for the actual sequence. This app's own status poll can
+ * straddle that window and flash the topbar/drawer icon on, then off, a
+ * few seconds apart.
+ *
+ * A plain time-boxed suppression window was tried here and removed
+ * (2026-08-13): it only hid the transient from polls that happened to land
+ * inside the window, so the same on-then-off flash still showed up right
+ * after the window closed instead -- not an actual fix, just relocating
+ * when the flicker becomes visible.
+ *
+ * Reintroduced with a real difference this time: rather than a fixed
+ * window a slow boot can simply outlast, this suppresses the display
+ * (forces "off", regardless of the real polled state -- see
+ * poll_refresh_bt_icon()'s own use of this) until EITHER a generous
+ * safety cap elapses OR the user manually taps the Bluetooth toggle
+ * themselves (quick_drawer_bt_event_cb() ends it immediately on tap) --
+ * whichever comes first. A manual tap ending it immediately is the part
+ * the 2026-08-13 attempt didn't have: it means a user who taps to turn
+ * Bluetooth on isn't fighting a suppression window that doesn't know
+ * they've acted, and from that point on this app shows real state
+ * honestly, including if S80_bt_init's own still-in-flight script later
+ * reverts that tap -- at least that's now visible as what it is (a real
+ * state change) instead of unexplained UI noise. Doesn't fix the
+ * underlying transient itself (still S80_bt_init/bluetoothd startup, still
+ * outside this app), just stops this app's own display from being
+ * confusing about it. */
+static uint32_t bt_boot_suppress_start_tick = 0; /* 0 once suppression has ended (cap elapsed or a manual tap) */
+#define BT_BOOT_SUPPRESS_MS 20000
+
+/* /usr/bin/bt_init's (stock, unmodified) very last line is
+ * `mkdir -p /tmp; echo > /tmp/bt_init_ok`, right after its own real UART
+ * chip firmware flash and everything else it does. /tmp is tmpfs on this
+ * device, so this file can never be a stale leftover from a previous boot.
+ *
+ * Real-device incident: tapping Bluetooth on (quick_drawer_bt_event_cb()
+ * below) while bt_init's own chip flash was still genuinely in progress
+ * raced this app's own bt_control_init_chip() -> /usr/bin/bt_resume
+ * against it -- confirmed live to actually wedge the chip (unrecoverable
+ * without a full power cycle), the exact class of incident bt_chip_mutex's
+ * own comment already documents (a userspace mutex in THIS app can't
+ * protect against a SEPARATE process, bt_init, touching the same UART).
+ * The display-suppression window above made the *cosmetic* flicker
+ * disappear, but made this WORSE, not better: "graduate on tap" meant a
+ * tap landing early now reliably reached the real toggle thread instead of
+ * being naturally rate-limited by the flicker's own visibility. Checked in
+ * quick_drawer_bt_event_cb() before it does anything real -- see its own
+ * comment. */
+#define BT_INIT_OK_FLAG_PATH "/tmp/bt_init_ok"
+
+static bool bt_boot_suppress_active(void) {
+    if (bt_boot_suppress_start_tick == 0) return false;
+    return lv_tick_get() - bt_boot_suppress_start_tick < BT_BOOT_SUPPRESS_MS;
+}
 
 /* Moved up from the Bluetooth settings screen section further down (still
  * used there, see populate_bt_screen()) -- refresh_bt_icon_thread_func()
@@ -1516,6 +1562,7 @@ static void poll_refresh_bt_icon(void) {
     pthread_join(refresh_bt_icon_thread, NULL);
 
     bool display_powered = refresh_bt_icon_result_powered;
+    if (bt_boot_suppress_active()) display_powered = false; /* see bt_boot_suppress_active()'s own comment */
 
     bt_is_powered_cached = display_powered;
     snprintf(bt_connected_mac_cached, sizeof(bt_connected_mac_cached), "%s", refresh_bt_icon_result_mac);
@@ -2811,6 +2858,48 @@ static void * bt_toggle_thread_func(void * arg) {
     return NULL;
 }
 
+/* Real-device incident: a tap that landed while bt_init's own chip flash
+ * was still genuinely in progress used to just be refused outright (see
+ * BT_INIT_OK_FLAG_PATH's own comment for the actual chip-wedging risk that
+ * guards against) -- functionally safe, but made the user re-tap
+ * themselves once it settled, AND gave no visual feedback at all that
+ * anything had registered (the drawer's own icon never flipped, unlike a
+ * normal toggle). This queues the intent properly instead: waits for
+ * BT_INIT_OK_FLAG_PATH (cheap access() polling, no subprocess spawn), then
+ * performs the exact same turn-on sequence bt_toggle_thread_func()'s own
+ * turning-on path uses, automatically, no second tap needed. Deliberately
+ * NOT the same thing as the unconditional-auto-enable-at-boot approach
+ * tried and reverted earlier -- this only ever fires because the user
+ * explicitly asked to turn Bluetooth on, just before it was safe to.
+ *
+ * Reuses bt_toggle_active/bt_toggle_thread/bt_toggle_done_flag/
+ * poll_bt_toggle() -- the exact same in-flight-toggle bookkeeping
+ * bt_toggle_thread_func() already uses -- rather than a separate parallel
+ * flag, specifically so quick_drawer_bt_event_cb()'s own optimistic icon
+ * flip (and populate_bt_screen() guard) apply here too automatically,
+ * fixing the "no visual clue" gap. poll_bt_toggle()'s own
+ * start_refresh_bt_icon() call at the end is exactly what's wanted here
+ * too: a fresh real-state poll once this either succeeds or times out.
+ * Capped at BT_BOOT_ENABLE_MAX_WAIT_MS so a genuinely wedged/never-
+ * finishing bt_init doesn't leave this polling forever. */
+#define BT_BOOT_ENABLE_MAX_WAIT_MS 30000
+#define BT_BOOT_ENABLE_POLL_INTERVAL_MS 300
+
+static void * bt_pending_enable_thread_func(void * arg) {
+    (void) arg;
+    uint32_t waited_ms = 0;
+    while (waited_ms < BT_BOOT_ENABLE_MAX_WAIT_MS) {
+        if (access(BT_INIT_OK_FLAG_PATH, F_OK) == 0) {
+            if (bt_control_init_chip()) bt_control_enable();
+            break;
+        }
+        usleep(BT_BOOT_ENABLE_POLL_INTERVAL_MS * 1000);
+        waited_ms += BT_BOOT_ENABLE_POLL_INTERVAL_MS;
+    }
+    bt_toggle_done_flag = true; /* written last -- poll_bt_toggle only checks this flag */
+    return NULL;
+}
+
 static void quick_drawer_bt_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     if (quick_drawer_bt_long_press_fired) { /* see quick_drawer_bt_long_press_cb()'s own comment */
@@ -2818,6 +2907,30 @@ static void quick_drawer_bt_event_cb(lv_event_t * e) {
         return;
     }
     if (bt_toggle_active) return; /* already toggling -- ignore taps until it lands */
+
+    bool bt_will_be_powered = !bt_is_powered_cached;
+
+    /* Real-device incident: turning Bluetooth ON before BT_INIT_OK_FLAG_PATH
+     * exists raced this app's own bt_control_init_chip() against bt_init's
+     * own still-in-progress UART chip firmware flash and genuinely wedged
+     * the chip (unrecoverable without a full power cycle) -- see its own
+     * comment. Turning OFF is always safe (bt_control_disable() is
+     * D-Bus-only, no chip-level operation), so this only ever affects the
+     * turning-on direction: bt_pending_now queues bt_toggle_thread_func()'s
+     * usual work behind bt_pending_enable_thread_func() instead of running
+     * it directly, but everything below (icon flip, cached value,
+     * settings-screen refresh, bt_toggle_active bookkeeping) is identical
+     * either way -- exactly the fix for the earlier version of this, which
+     * showed no visual feedback at all for a tap that landed too early. */
+    bool bt_pending_now = bt_will_be_powered && access(BT_INIT_OK_FLAG_PATH, F_OK) != 0;
+
+    /* Ends the early-boot display suppression immediately on a real user
+     * tap -- see bt_boot_suppress_active()'s own comment for why this
+     * matters (a manual tap shouldn't be fighting a window that doesn't
+     * know the user has acted). No-op once suppression has already ended
+     * on its own. */
+    bt_boot_suppress_start_tick = 0;
+
     bt_toggle_active = true;
     bt_toggle_done_flag = false;
 
@@ -2825,11 +2938,11 @@ static void quick_drawer_bt_event_cb(lv_event_t * e) {
      * own comment -- bt_is_powered_cached (kept fresh by
      * poll_refresh_bt_icon()) is a plain bool read, not the subprocess spawn
      * bt_control_is_powered() itself is, so it's safe to read synchronously
-     * here. Turning on cold can take ~10-13s (bt_control_init_chip()); this
-     * is what makes the tap itself read as instant instead of the icon
+     * here. Turning on cold can take ~10-13s (bt_control_init_chip()), or
+     * however long is left of bt_init's own run if bt_pending_now; this is
+     * what makes the tap itself read as instant instead of the icon
      * sitting frozen until poll_bt_toggle() confirms the real state once
-     * this thread lands. */
-    bool bt_will_be_powered = !bt_is_powered_cached;
+     * the thread lands. */
     lv_image_set_src(quick_drawer_bt_icon, asset_path(bt_will_be_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
 
     /* Optimistically rebuild the whole Bluetooth settings screen too (not
@@ -2856,7 +2969,7 @@ static void quick_drawer_bt_event_cb(lv_event_t * e) {
      * real, repeatedly-hit stuck-screen bug (multiple uncoordinated users of
      * one shared overlay), which not having an overlay at all sidesteps
      * entirely. */
-    pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL);
+    pthread_create(&bt_toggle_thread, NULL, bt_pending_now ? bt_pending_enable_thread_func : bt_toggle_thread_func, NULL);
 }
 
 static void poll_bt_toggle(void) {
@@ -2920,6 +3033,7 @@ static void start_bt_dac_startup_reapply_if_needed(void) {
     bt_dac_startup_reapply_done_flag = false;
     pthread_create(&bt_dac_startup_reapply_thread, NULL, bt_dac_startup_reapply_thread_func, NULL);
 }
+
 
 static void poll_bt_dac_startup_reapply(void) {
     if (!bt_dac_startup_reapply_active || !bt_dac_startup_reapply_done_flag) return;
@@ -2999,11 +3113,20 @@ static void poll_bt_apply_output_settings(void) {
 #define QUICK_DRAWER_PANEL2_TOP 363
 
 static void quick_drawer_brightness_changed_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * slider = (lv_obj_t *) lv_event_get_target(e);
     int32_t percent = lv_slider_get_value(slider);
-    backlight_set_percent((int) percent);
     lv_obj_t * label = (lv_obj_t *) lv_event_get_user_data(e);
-    lv_label_set_text_fmt(label, "%d%%", (int) percent);
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        backlight_set_percent((int) percent); /* live feedback while dragging */
+        lv_label_set_text_fmt(label, "%d%%", (int) percent);
+    } else if (code == LV_EVENT_RELEASED) {
+        /* Only persist once the drag settles, not on every intermediate
+         * tick -- same as volume_popup_track_event_cb/volume_slider_event_cb. */
+        current_settings.brightness_percent = (int) percent;
+        settings_save(&current_settings);
+    }
 }
 
 static void build_quick_drawer(void) {
@@ -3102,7 +3225,7 @@ static void build_quick_drawer(void) {
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_width(quick_drawer_brightness_track, 26, LV_PART_KNOB);
     lv_obj_set_style_height(quick_drawer_brightness_track, 26, LV_PART_KNOB);
-    lv_obj_add_event_cb(quick_drawer_brightness_track, quick_drawer_brightness_changed_cb, LV_EVENT_VALUE_CHANGED,
+    lv_obj_add_event_cb(quick_drawer_brightness_track, quick_drawer_brightness_changed_cb, LV_EVENT_ALL,
                          quick_drawer_brightness_label);
     refresh_quick_drawer_brightness();
 
@@ -5581,6 +5704,66 @@ void gui_plugin_set_text_color(const char * slot, uint32_t rgb) {
      * comment on l_plugin_set_text_color() validating first. */
 }
 
+/* ---- Playback control bridges -- see gui.h's own comment on why these
+ * can't just call audio_toggle_pause()/audio_stop()/audio_set_volume()
+ * directly from plugin_manager.c the way plugin.eq_*() calls peq_* directly.
+ * Each of these calls the exact same local helper the native UI itself uses
+ * for that action, so a plugin-driven change looks identical to a
+ * button/remote-control-driven one. ---- */
+
+void gui_plugin_toggle_pause(void) {
+    toggle_play_pause();
+}
+
+void gui_plugin_stop(void) {
+    if (audio_is_playing()) {
+        audio_stop();
+        set_play_button_state(false);
+    }
+}
+
+void gui_plugin_next_track(void) {
+    int next_index = compute_manual_step_index(playlist_index, 1);
+    if (next_index >= 0) play_track_at(next_index);
+}
+
+void gui_plugin_prev_track(void) {
+    int prev_index = compute_manual_step_index(playlist_index, -1);
+    if (prev_index >= 0) play_track_at(prev_index);
+}
+
+void gui_plugin_seek(double seconds) {
+    audio_seek(seconds);
+}
+
+void gui_plugin_set_volume(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+
+    lv_slider_set_value(volume_slider, percent, LV_ANIM_OFF);
+    audio_set_volume((float) percent / 100.0f);
+    current_settings.volume = (float) percent / 100.0f;
+    settings_save(&current_settings);
+    show_volume_popup(percent);
+    refresh_volume_topbar(percent);
+}
+
+bool gui_plugin_is_playing(void) {
+    return audio_is_playing();
+}
+
+bool gui_plugin_is_paused(void) {
+    return audio_is_paused();
+}
+
+double gui_plugin_get_position_seconds(void) {
+    return audio_get_position_seconds();
+}
+
+double gui_plugin_get_duration_seconds(void) {
+    return audio_get_duration_seconds();
+}
+
 /* ---- Delete confirmation popup ---- */
 static lv_obj_t * delete_song_popup;
 static lv_obj_t * delete_song_popup_backdrop;
@@ -6160,7 +6343,18 @@ static uint32_t boot_splash_start_tick = 0;
 
 /* Stock player's own boot image stays up at least this long -- see
  * gui_show_boot_splash()'s comment. Used by gui_init()'s own settle-wait,
- * further below. */
+ * further below.
+ *
+ * Deliberately does NOT wait for /etc/init.d/S80_bt_init's own
+ * /usr/bin/bt_init to finish -- real-device confirmed requirement:
+ * Bluetooth must read "off" right when the splash lifts and STAY off
+ * (no auto-enable of any kind) until the user explicitly turns it on
+ * themselves. Two earlier attempts at extending this wait to hide
+ * bt_init's own boot-time Bluetooth behavior, and a later attempt at
+ * having this app auto-enable Bluetooth once bt_init finished in the
+ * background, were all tried and reverted -- this app now does neither:
+ * it just leaves Bluetooth exactly where bt_init's own (patched) script
+ * leaves it, off, and never touches it again until the user does. */
 #define BOOT_SPLASH_MIN_DISPLAY_MS 3000
 
 /* Task #44 (stock-UX request): the stock firmware holds its own boot image
@@ -12602,6 +12796,62 @@ static void bt_codec_settings_row_cb(lv_event_t * e) {
     open_bt_codec_screen();
 }
 
+/* ---- Resume Last Track selection screen (Settings > Playback > Resume Last
+ * Track) -- same accent-colored-border single-select shape as Font Size
+ * just below, but takes effect on the NEXT cold boot (there's nothing to
+ * apply live -- this only ever matters at startup), so no reboot popup is
+ * needed, just a toast confirming the choice. See gui_init()'s own resume
+ * path for what each option actually does and the Subsonic-cache guard it
+ * shares with Car Mode's separate, always-on resume mechanism. ---- */
+
+typedef struct {
+    int mode; /* matches player_settings_t.resume_mode */
+    const char * label;
+} resume_mode_option_t;
+
+static const resume_mode_option_t resume_mode_options[] = {
+    { 0, "Off" }, { 1, "Resume and Play" }, { 2, "Resume, but Paused" },
+};
+#define RESUME_MODE_OPTION_COUNT (sizeof(resume_mode_options) / sizeof(resume_mode_options[0]))
+
+static void resume_mode_option_row_cb(lv_event_t * e);
+
+static void populate_resume_mode_screen(void) {
+    lv_obj_clean(resume_mode_list);
+    for (size_t i = 0; i < RESUME_MODE_OPTION_COUNT; i++) {
+        bool selected = current_settings.resume_mode == resume_mode_options[i].mode;
+        lv_obj_t * row = add_pill_row_base(resume_mode_list, resume_mode_options[i].label);
+        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
+        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, resume_mode_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static void resume_mode_option_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    current_settings.resume_mode = resume_mode_options[index].mode;
+    settings_save(&current_settings);
+    populate_resume_mode_screen();
+    show_info_toast("Applies next time you launch the app");
+}
+
+static lv_obj_t * build_resume_mode_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("Resume Last Track", &title_label, &resume_mode_list);
+}
+
+static void open_resume_mode_screen(void) {
+    populate_resume_mode_screen();
+    nav_push(resume_mode_screen);
+}
+
+static void resume_mode_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_resume_mode_screen();
+}
+
 /* ---- Font size selection screen (Settings > Font Size) -- same
  * accent-colored-border single-select shape as the Bluetooth codec screen
  * just above, but selecting a row only saves the setting and shows a
@@ -15024,16 +15274,17 @@ static void factory_reset_btn_cb(lv_event_t * e);
  * the exact same items/callbacks the old flat list had, just grouped. ---- */
 
 static lv_obj_t * build_settings_playback_screen(void) {
-    static pill_list_item_t items[5];
+    static pill_list_item_t items[6];
     items[0] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
                                     current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
                                     current_settings.crossfade_enabled, NULL, crossfade_switch_event_cb, NULL,
                                     &settings_crossfade_toggle_img };
     items[2] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, 5, &style_accent);
+    items[3] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
+    items[5] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, 6, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -15954,6 +16205,7 @@ static lv_obj_t * build_eq_screen(void) {
 void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("gui_init entered");
+    bt_boot_suppress_start_tick = lv_tick_get(); /* see bt_boot_suppress_active()'s own comment */
 #endif
     settings_load(&current_settings);
 #ifndef HOST_BUILD
@@ -15985,6 +16237,14 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
                           ? (float) current_settings.startup_volume_fixed_percent / 100.0f
                           : current_settings.volume); /* picked up below when the volume slider reads audio_get_volume() */
     audio_set_crossfade_enabled(current_settings.crossfade_enabled);
+
+    /* Real-device bug report: brightness jumped to an arbitrary value after
+     * a real power-down/power-up -- root cause, nothing in this app applied
+     * ANY brightness at startup before this, so the screen just came up at
+     * whatever raw value the kernel/bootloader itself left the backlight
+     * sysfs attribute at. See settings.h's own comment on brightness_percent. */
+    backlight_set_percent(current_settings.brightness_percent);
+
     led_control_apply(current_settings.led_indicator_enabled);
     charge_limiter_poll(current_settings.charge_limiter_enabled, true);
     if (current_settings.timezone[0] != '\0') timezone_apply(current_settings.timezone);
@@ -16191,6 +16451,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     bt_dac_overlay_screen = build_bt_dac_overlay_screen();
     bt_codec_screen = build_bt_codec_screen();
     font_size_screen = build_font_size_screen();
+    resume_mode_screen = build_resume_mode_screen();
     usb_mode_screen = build_usb_mode_screen();
     usb_dac_overlay_screen = build_usb_dac_overlay_screen();
     build_import_rescan_popup(); /* must exist before import_wifi_back_cb (wired below) can show it */
@@ -16298,7 +16559,12 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * whatever this function's own setup (library load, screen building)
      * already consumed -- only adds *additional* wait if that finished
      * faster, so this isn't always a flat tax on boot time. This also
-     * delays start_refresh_bt_icon() (called above) by the same margin. */
+     * delays start_refresh_bt_icon() (called above) by the same margin.
+     *
+     * Deliberately NOT waiting here for bt_init to finish -- see
+     * BOOT_SPLASH_MIN_DISPLAY_MS's own comment, further up, for what was
+     * tried and reverted, and why Bluetooth is left alone (off, and
+     * staying off) rather than this app touching it at all during boot. */
     while (boot_splash_start_tick != 0 &&
            lv_tick_get() - boot_splash_start_tick < BOOT_SPLASH_MIN_DISPLAY_MS) {
         uint32_t wait_ms = lv_timer_handler();
@@ -16347,14 +16613,20 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * correct first fix to try rather than leaving auto-resume disabled
      * for everyone over one still-unexplained edge case.
      *
-     * Gated on car_mode_enabled only, NOT auto_resume_enabled -- that
-     * separate "resume on every launch" setting has had no UI toggle since
-     * this incident (its Settings row was removed entirely, not just left
-     * inert -- a live-looking toggle for a feature that silently did
-     * nothing read as a regression) and defaults to true, so wiring it back
-     * in here would silently auto-resume on EVERY cold boot for every
-     * user, not just those who deliberately opted into Car Mode's specific
-     * docking routine. */
+     * This block was, for a long time, gated on car_mode_enabled only, NOT
+     * the separate general "resume on every launch" setting -- that one had
+     * no UI toggle at all since this incident (its Settings row was removed
+     * entirely, not just left inert -- a live-looking toggle for a feature
+     * that silently did nothing read as a regression) and defaulted to true,
+     * so wiring it back in here unconditionally would have silently
+     * auto-resumed on EVERY cold boot for every user, not just those who
+     * deliberately opted into Car Mode's specific docking routine.
+     *
+     * Now reintroduced as Settings -> Playback -> Resume Last Track
+     * (player_settings_t.resume_mode), opt-in and defaulting to off (0),
+     * handled in the separate `else if` below so it can share this same
+     * Subsonic-cache guard without duplicating it, while staying fully
+     * independent of Car Mode's own always-on, headphone-gated resume. */
     if (current_settings.car_mode_enabled && current_settings.last_track[0] != '\0' &&
         strncmp(current_settings.last_track, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) != 0) {
 #ifndef HOST_BUILD
@@ -16396,6 +16668,31 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
                  * of the seeded root, so a back-swipe from the resumed player
                  * correctly lands back on the home screen. */
                 play_track_at_from(resume_index, current_settings.last_position);
+            }
+        }
+    } else if (current_settings.resume_mode != 0 && current_settings.last_track[0] != '\0' &&
+               strncmp(current_settings.last_track, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) != 0) {
+        /* General-purpose "Resume Last Track" (Settings -> Playback),
+         * independent of Car Mode's own dedicated docking-routine resume
+         * above -- reuses the exact same Subsonic-cache guard (the one
+         * concretely identified cause of the 2026-08-08 crash-reboot-loop
+         * incident) but deliberately has none of Car Mode's own
+         * headphone-presence requirement, which is specific to its docking
+         * assumption and doesn't apply to a normal user just picking this
+         * setting up in Settings. */
+        char ** resume_playlist;
+        int resume_count, resume_index;
+        if (file_browser_build_playlist_for_path(current_settings.last_track, &resume_playlist, &resume_count, &resume_index)) {
+            free_playlist();
+            playlist = resume_playlist;
+            playlist_count = resume_count;
+            play_track_at_from(resume_index, current_settings.last_position);
+            if (current_settings.resume_mode == 2) {
+                /* "Resume, but Paused" -- load/seek exactly as resume_mode 1
+                 * does, then immediately pause, same as a user tapping Play
+                 * then Pause right after. No audible auto-play at boot; the
+                 * track is ready the instant the user hits play themselves. */
+                toggle_play_pause();
             }
         }
     }

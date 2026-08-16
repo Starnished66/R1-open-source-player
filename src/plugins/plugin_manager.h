@@ -111,3 +111,4 @@ const char * plugin_manager_get_stream_tile_icon_selected(int index);
 void plugin_manager_stream_tile_clicked(int index);
 
 #endif /* PLUGIN_MANAGER_H */
+

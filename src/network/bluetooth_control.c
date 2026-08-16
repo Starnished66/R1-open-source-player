@@ -228,8 +228,21 @@ static void bt_control_recover_wedged_daemon(void) {
  * cycle that was reported. Fixed by giving "No default controller
  * available" the same not-immediately-fatal treatment as a timeout for a
  * grace window after this process's first poll, after which it reverts to
- * triggering recovery immediately. */
-#define BT_BOOT_RACE_GRACE_MS 8000
+ * triggering recovery immediately.
+ *
+ * Real-device bug report: Bluetooth still visibly flickered on then off
+ * shortly after a real power-down/power-up, despite this grace window
+ * already existing. Root cause: bt_control_init_chip()'s own comment above
+ * documents cold chip-init (bt_resume, a real UART firmware flash) taking up
+ * to ~10-13s, but this window was only 8000ms -- shorter than the
+ * documented worst case, so a slower boot could legitimately still be
+ * mid-init when the grace window expired, at which point the very next
+ * "No default controller available" poll was treated as a genuine wedge and
+ * triggered bt_control_recover_wedged_daemon() (which unconditionally
+ * force-repowers Bluetooth), producing exactly the on-then-off flicker
+ * reported. Widened to comfortably clear the documented worst case with
+ * headroom, rather than just matching it exactly. */
+#define BT_BOOT_RACE_GRACE_MS 15000
 
 static uint32_t bt_control_monotonic_ms(void) {
     struct timespec ts;
@@ -237,7 +250,29 @@ static uint32_t bt_control_monotonic_ms(void) {
     return (uint32_t) (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
-bool bt_control_is_powered(void) {
+/* Guards bt_control_is_powered()'s own static bookkeeping below
+ * (consecutive_timeouts, first_poll_seen/first_poll_tick) -- separate from
+ * bt_chip_mutex above, not reused, since bt_control_is_powered() can itself
+ * call into bt_control_recover_wedged_daemon() -> bt_control_enable(), which
+ * takes bt_chip_mutex; reusing the same mutex here would self-deadlock.
+ *
+ * Real-device bug report: Bluetooth toggled off by the user sometimes
+ * flipped back on by itself a moment later. Root cause: this function is
+ * polled from gui.c's own periodic refresh_bt_icon() timer on the main
+ * thread AND, concurrently, from inside bt_toggle_thread_func()'s own
+ * post-toggle confirmation retry loop on a background thread -- with no
+ * synchronization at all on the static counters below. Two callers racing
+ * on a plain (non-atomic) consecutive_timeouts increment/reset could hit
+ * TIMEOUT_RECOVERY_THRESHOLD from a lost update rather than genuine
+ * consecutive timeouts, or interleave a stale first_poll_tick read -- either
+ * way spuriously triggering bt_control_recover_wedged_daemon(), which
+ * unconditionally force-repowers Bluetooth regardless of what the user just
+ * asked for. Serializing the whole function (not just the counter updates)
+ * is the simplest fix that can't leave the bookkeeping and the decision it
+ * drives observing different, interleaved states. */
+static pthread_mutex_t bt_status_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool bt_control_is_powered_impl(void) {
     static int consecutive_timeouts = 0;
     static bool first_poll_seen = false;
     static uint32_t first_poll_tick = 0;
@@ -281,6 +316,13 @@ bool bt_control_is_powered(void) {
         DBG_LOG("bt_control: bt_control_is_powered: not powered (output: %.200s)\n", out);
     }
     return false;
+}
+
+bool bt_control_is_powered(void) {
+    pthread_mutex_lock(&bt_status_mutex);
+    bool result = bt_control_is_powered_impl();
+    pthread_mutex_unlock(&bt_status_mutex);
+    return result;
 }
 
 #define BT_INIT_TIMEOUT_MS 30000

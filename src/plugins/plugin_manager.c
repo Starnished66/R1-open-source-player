@@ -1,5 +1,7 @@
 #include "plugin_manager.h"
 #include "gui.h"
+#include "peq.h"
+#include "http_client.h"
 
 #include "lua.h"
 #include "lauxlib.h"
@@ -9,6 +11,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/stat.h>
@@ -162,6 +165,56 @@ static int current_list_select_ref = LUA_NOREF;
  *     "primary" (dominant near-white text) or "muted" (secondary/disabled-
  *     ish gray text). Destructive-red and accent-tinted text are not
  *     covered -- see l_plugin_set_text_color()'s own comment.
+ *
+ *   plugin.eq_load_profile(path) -> bool
+ *     Loads and applies a .peq profile file (src/audio/peq.c's own
+ *     save/load format) from an arbitrary path, then persists it as the
+ *     new always-current EQ state. Returns false (not a Lua error) if path
+ *     doesn't exist or isn't readable.
+ *
+ *   plugin.eq_save_profile(path) -> bool
+ *     Saves the current EQ state (bypass, preamp, all 10 bands) to path in
+ *     the same format. Returns false on write failure.
+ *
+ *   plugin.eq_reset()
+ *     Restores every band, the preamp, and bypass to peq.c's own built-in
+ *     defaults (same as the native EQ screen's Reset button).
+ *
+ *   plugin.eq_set_bypass(enabled)
+ *   plugin.eq_set_preamp(db)
+ *     Toggles/sets the whole-EQ bypass and pre-amp (dB).
+ *
+ *   plugin.eq_set_band(index, freq_hz, gain_db, q)
+ *   plugin.eq_set_band_type(index, type)
+ *   plugin.eq_set_band_enabled(index, enabled)
+ *     Per-band controls. index is 1-based (1..10, matching every other
+ *     1-based index in this API). type is "peaking", "low_shelf", or
+ *     "high_shelf".
+ *
+ *   plugin.toggle_pause()
+ *   plugin.stop()
+ *   plugin.next_track()
+ *   plugin.prev_track()
+ *   plugin.seek(seconds)
+ *   plugin.set_volume(percent)
+ *   plugin.is_playing() -> bool
+ *   plugin.is_paused() -> bool
+ *   plugin.get_position() -> seconds
+ *   plugin.get_duration() -> seconds
+ *     Playback control/query, bridged through gui.c so a plugin-driven
+ *     change stays in sync with the play/pause icon, volume slider/popup,
+ *     and shuffle-aware next/prev stepping the native UI itself uses -- see
+ *     gui.h's own comment on gui_plugin_toggle_pause() and neighbors.
+ *     percent is 0..100, clamped.
+ *
+ *   plugin.http_get(url [, verify_tls]) -> status, body
+ *     Synchronous GET request (src/network/http_client.c). verify_tls
+ *     defaults to true. Runs on the calling thread -- i.e. whatever plugin
+ *     callback invoked it, always the main UI thread -- so a slow/hanging
+ *     server blocks the UI until the request completes; keep calls fast or
+ *     user-initiated. Returns nil, "network error" on a DNS/connect/TLS
+ *     failure; a real HTTP error status (404, 500, ...) still returns
+ *     normally with that status and whatever body the server sent.
  * ---- */
 
 /* Used by l_plugin_register_stream_media_tile() -- fills t->icon/icon_selected
@@ -483,6 +536,184 @@ static int l_plugin_set_text_color(lua_State * L) {
     return 0;
 }
 
+/* ---- plugin.eq_*() -- bridge straight into peq.c's public API, no gui.c
+ * layer needed (peq.c has no LVGL dependency, matching l_plugin_list_dir()/
+ * l_plugin_sd_root() already calling plain C functions directly). Every
+ * setter ends with peq_save(), the same "persist on every change" pattern
+ * every native EQ-screen event handler already follows (see e.g. gui.c's
+ * eq_bypass_switch_event_cb()), so a plugin-driven EQ change survives
+ * reboot with no new persistence code. ---- */
+
+static int l_plugin_eq_load_profile(lua_State * L) {
+    const char * path = luaL_checkstring(L, 1);
+    bool ok = peq_load_from_path(path);
+    if (ok) peq_save();
+    lua_pushboolean(L, ok);
+    return 1;
+}
+
+static int l_plugin_eq_save_profile(lua_State * L) {
+    const char * path = luaL_checkstring(L, 1);
+    lua_pushboolean(L, peq_save_to_path(path));
+    return 1;
+}
+
+static int l_plugin_eq_reset(lua_State * L) {
+    (void) L;
+    peq_reset_to_defaults();
+    peq_save();
+    return 0;
+}
+
+static int l_plugin_eq_set_bypass(lua_State * L) {
+    bool enabled = lua_toboolean(L, 1);
+    peq_set_bypass(enabled);
+    peq_save();
+    return 0;
+}
+
+static int l_plugin_eq_set_preamp(lua_State * L) {
+    double db = luaL_checknumber(L, 1);
+    peq_set_preamp_db(db);
+    peq_save();
+    return 0;
+}
+
+/* Converts a 1-based Lua band index to peq.c's 0-based one, luaL_error()ing
+ * if out of range -- same "fail loudly at call time" convention
+ * l_plugin_register_list_item() already uses for a bad list_id. */
+static int check_eq_band_index(lua_State * L, int arg) {
+    lua_Integer index = luaL_checkinteger(L, arg);
+    if (index < 1 || index > PEQ_NUM_BANDS) {
+        luaL_error(L, "band index %d out of range (expected 1..%d)", (int) index, PEQ_NUM_BANDS);
+    }
+    return (int) index - 1;
+}
+
+static int l_plugin_eq_set_band(lua_State * L) {
+    int index = check_eq_band_index(L, 1);
+    double freq_hz = luaL_checknumber(L, 2);
+    double gain_db = luaL_checknumber(L, 3);
+    double q = luaL_checknumber(L, 4);
+    peq_set_band(index, freq_hz, gain_db, q);
+    peq_save();
+    return 0;
+}
+
+static int l_plugin_eq_set_band_type(lua_State * L) {
+    int index = check_eq_band_index(L, 1);
+    const char * type = luaL_checkstring(L, 2);
+
+    peq_band_type_t t;
+    if (strcmp(type, "peaking") == 0) t = PEQ_TYPE_PEAKING;
+    else if (strcmp(type, "low_shelf") == 0) t = PEQ_TYPE_LOW_SHELF;
+    else if (strcmp(type, "high_shelf") == 0) t = PEQ_TYPE_HIGH_SHELF;
+    else return luaL_error(L, "plugin.eq_set_band_type: unknown type '%s' (expected \"peaking\", \"low_shelf\", or \"high_shelf\")", type);
+
+    peq_set_band_type(index, t);
+    peq_save();
+    return 0;
+}
+
+static int l_plugin_eq_set_band_enabled(lua_State * L) {
+    int index = check_eq_band_index(L, 1);
+    bool enabled = lua_toboolean(L, 2);
+    peq_set_band_enabled(index, enabled);
+    peq_save();
+    return 0;
+}
+
+/* ---- plugin.toggle_pause()/stop()/next_track()/prev_track()/seek()/
+ * set_volume()/is_playing()/is_paused()/get_position()/get_duration() --
+ * thin wrappers over gui.h's gui_plugin_*() bridges, needed here (unlike
+ * plugin.eq_*() above) because audio.c's own functions must be paired with
+ * gui.c-local UI state (play/pause icon, volume slider/popup, shuffle-aware
+ * stepping) -- see gui.h's own comment on gui_plugin_toggle_pause() and
+ * neighbors for why. ---- */
+
+static int l_plugin_toggle_pause(lua_State * L) {
+    (void) L;
+    gui_plugin_toggle_pause();
+    return 0;
+}
+
+static int l_plugin_stop(lua_State * L) {
+    (void) L;
+    gui_plugin_stop();
+    return 0;
+}
+
+static int l_plugin_next_track(lua_State * L) {
+    (void) L;
+    gui_plugin_next_track();
+    return 0;
+}
+
+static int l_plugin_prev_track(lua_State * L) {
+    (void) L;
+    gui_plugin_prev_track();
+    return 0;
+}
+
+static int l_plugin_seek(lua_State * L) {
+    double seconds = luaL_checknumber(L, 1);
+    gui_plugin_seek(seconds);
+    return 0;
+}
+
+static int l_plugin_set_volume(lua_State * L) {
+    lua_Integer percent = luaL_checkinteger(L, 1);
+    gui_plugin_set_volume((int) percent);
+    return 0;
+}
+
+static int l_plugin_is_playing(lua_State * L) {
+    lua_pushboolean(L, gui_plugin_is_playing());
+    return 1;
+}
+
+static int l_plugin_is_paused(lua_State * L) {
+    lua_pushboolean(L, gui_plugin_is_paused());
+    return 1;
+}
+
+static int l_plugin_get_position(lua_State * L) {
+    lua_pushnumber(L, gui_plugin_get_position_seconds());
+    return 1;
+}
+
+static int l_plugin_get_duration(lua_State * L) {
+    lua_pushnumber(L, gui_plugin_get_duration_seconds());
+    return 1;
+}
+
+/* plugin.http_get(url [, verify_tls]) -> status, body | nil, "network error"
+ * -- bridges http_client.c's http_get_to_buffer() directly (no gui.c layer,
+ * same reasoning as plugin.eq_*() above: no LVGL/gui-state dependency).
+ * body is pushed with lua_pushlstring() (exact byte count), not
+ * lua_pushstring(), since a response body isn't guaranteed NUL-free. Runs
+ * synchronously on the calling (main UI) thread -- see this file's own
+ * top-of-file doc comment for the blocking caveat. */
+static int l_plugin_http_get(lua_State * L) {
+    const char * url = luaL_checkstring(L, 1);
+    bool verify_tls = lua_gettop(L) >= 2 ? lua_toboolean(L, 2) : true;
+
+    int status = 0;
+    uint8_t * body = NULL;
+    size_t body_size = 0;
+    bool ok = http_get_to_buffer(url, verify_tls, &status, &body, &body_size);
+    if (!ok) {
+        lua_pushnil(L);
+        lua_pushstring(L, "network error");
+        return 2;
+    }
+
+    lua_pushinteger(L, status);
+    lua_pushlstring(L, (const char *) body, body_size);
+    free(body);
+    return 2;
+}
+
 static const luaL_Reg plugin_funcs[] = {
     { "register_list_item",        l_plugin_register_list_item },
     { "register_stream_media_tile", l_plugin_register_stream_media_tile },
@@ -495,6 +726,25 @@ static const luaL_Reg plugin_funcs[] = {
     { "set_icon",                  l_plugin_set_icon },
     { "set_background_color",      l_plugin_set_background_color },
     { "set_text_color",            l_plugin_set_text_color },
+    { "eq_load_profile",           l_plugin_eq_load_profile },
+    { "eq_save_profile",           l_plugin_eq_save_profile },
+    { "eq_reset",                  l_plugin_eq_reset },
+    { "eq_set_bypass",             l_plugin_eq_set_bypass },
+    { "eq_set_preamp",             l_plugin_eq_set_preamp },
+    { "eq_set_band",               l_plugin_eq_set_band },
+    { "eq_set_band_type",          l_plugin_eq_set_band_type },
+    { "eq_set_band_enabled",       l_plugin_eq_set_band_enabled },
+    { "toggle_pause",              l_plugin_toggle_pause },
+    { "stop",                      l_plugin_stop },
+    { "next_track",                l_plugin_next_track },
+    { "prev_track",                l_plugin_prev_track },
+    { "seek",                      l_plugin_seek },
+    { "set_volume",                l_plugin_set_volume },
+    { "is_playing",                l_plugin_is_playing },
+    { "is_paused",                 l_plugin_is_paused },
+    { "get_position",              l_plugin_get_position },
+    { "get_duration",              l_plugin_get_duration },
+    { "http_get",                  l_plugin_http_get },
     { NULL, NULL }
 };
 

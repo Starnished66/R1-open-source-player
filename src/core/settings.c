@@ -76,7 +76,7 @@ static void set_defaults(player_settings_t * out) {
     out->volume = 1.0f;
     out->last_track[0] = '\0';
     out->last_position = 0.0;
-    out->auto_resume_enabled = true;
+    out->resume_mode = 0;
     out->accent_color = 0x2196F3; /* matches the app's existing default blue */
     out->crossfade_enabled = false;
     out->car_mode_enabled = false;
@@ -106,6 +106,7 @@ static void set_defaults(player_settings_t * out) {
     out->sleep_timer_minutes = 15;
     out->timezone[0] = '\0';
     out->font_size_tier = 0;
+    out->brightness_percent = 80;
 }
 
 bool settings_load(player_settings_t * out) {
@@ -130,8 +131,8 @@ bool settings_load(player_settings_t * out) {
             snprintf(out->last_track, sizeof(out->last_track), "%s", value);
         } else if (strcmp(key, "last_position") == 0) {
             out->last_position = atof(value);
-        } else if (strcmp(key, "auto_resume") == 0) {
-            out->auto_resume_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "resume_mode") == 0) {
+            out->resume_mode = atoi(value);
         } else if (strcmp(key, "accent_color") == 0) {
             out->accent_color = (uint32_t) strtoul(value, NULL, 16);
         } else if (strcmp(key, "crossfade") == 0) {
@@ -190,6 +191,8 @@ bool settings_load(player_settings_t * out) {
             snprintf(out->timezone, sizeof(out->timezone), "%s", value);
         } else if (strcmp(key, "font_size_tier") == 0) {
             out->font_size_tier = atoi(value);
+        } else if (strcmp(key, "brightness_percent") == 0) {
+            out->brightness_percent = atoi(value);
         }
     }
 
@@ -197,6 +200,8 @@ bool settings_load(player_settings_t * out) {
     if (out->play_mode < 0 || out->play_mode > 3) out->play_mode = 0;
     if (out->font_size_tier < 0 || out->font_size_tier > 2) out->font_size_tier = 0;
     if (out->startup_volume_fixed_percent < 0 || out->startup_volume_fixed_percent > 100) out->startup_volume_fixed_percent = 20;
+    if (out->brightness_percent < 0 || out->brightness_percent > 100) out->brightness_percent = 80;
+    if (out->resume_mode < 0 || out->resume_mode > 2) out->resume_mode = 0;
 
     out->screen_timeout_seconds = nearest_screen_timeout_step(out->screen_timeout_seconds);
     out->idle_shutdown_minutes = nearest_idle_shutdown_step(out->idle_shutdown_minutes);
@@ -242,7 +247,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "volume=%.3f\n", (double) settings->volume);
     fprintf(f, "last_track=%s\n", settings->last_track);
     fprintf(f, "last_position=%.3f\n", settings->last_position);
-    fprintf(f, "auto_resume=%d\n", settings->auto_resume_enabled ? 1 : 0);
+    fprintf(f, "resume_mode=%d\n", settings->resume_mode);
     fprintf(f, "accent_color=%06X\n", (unsigned int) (settings->accent_color & 0xFFFFFF));
     fprintf(f, "crossfade=%d\n", settings->crossfade_enabled ? 1 : 0);
     fprintf(f, "car_mode_enabled=%d\n", settings->car_mode_enabled ? 1 : 0);
@@ -272,6 +277,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "sleep_timer_minutes=%d\n", settings->sleep_timer_minutes);
     fprintf(f, "timezone=%s\n", settings->timezone);
     fprintf(f, "font_size_tier=%d\n", settings->font_size_tier);
+    fprintf(f, "brightness_percent=%d\n", settings->brightness_percent);
 
     fflush(f);
     fsync(fileno(f));

@@ -51,4 +51,51 @@ void gui_plugin_set_background_color(const char * slot, uint32_t rgb);
  * comment for what each covers and what's deliberately excluded. */
 void gui_plugin_set_text_color(const char * slot, uint32_t rgb);
 
+/* ---- Playback control bridges for plugin.toggle_pause()/stop()/next_track()/
+ * prev_track()/seek()/set_volume()/is_playing()/is_paused()/get_position()/
+ * get_duration() ----
+ *
+ * Unlike peq.c's plugin.eq_*() bindings (which call peq_set_*()/peq_save()
+ * directly from plugin_manager.c, no LVGL/gui.c state involved), these can't
+ * just call audio_toggle_pause()/audio_stop()/audio_set_volume() directly --
+ * gui.c's own native call sites always pair each of those with extra local
+ * state (the play/pause icon, the volume slider/popup, shuffle-aware
+ * next/prev stepping, DAC-mode blocking) that would otherwise go stale. Each
+ * bridge below just calls the exact same local gui.c helper the native UI
+ * itself already uses for that action. */
+
+/* Calls the same local toggle_play_pause() the play/pause button's own
+ * click handler uses -- includes its external_dac_block_reason() guard,
+ * set_play_button_state() icon update, and last_position checkpoint. */
+void gui_plugin_toggle_pause(void);
+
+/* audio_stop() + set_play_button_state(false), guarded by audio_is_playing()
+ * -- same pairing every native audio_stop() call site already uses (e.g.
+ * gui.c's Bluetooth-DAC-mode-enable handler). */
+void gui_plugin_stop(void);
+
+/* Shuffle-aware next/prev -- compute_manual_step_index() + play_track_at(),
+ * the same pair gui.c's own remote-control (BT/phone) consume path uses. */
+void gui_plugin_next_track(void);
+void gui_plugin_prev_track(void);
+
+/* Seeks the current track to an absolute position in seconds. */
+void gui_plugin_seek(double seconds);
+
+/* Clamps to [0,100], then mirrors gui.c's own remote-control volume path:
+ * audio_set_volume() + the volume_slider widget + current_settings.volume/
+ * settings_save() + show_volume_popup()/refresh_volume_topbar(), so a
+ * plugin-driven volume change looks identical to a hardware/remote one. */
+void gui_plugin_set_volume(int percent);
+
+/* Pure state reads -- trivial wraps of audio_is_playing()/audio_is_paused()/
+ * audio_get_position_seconds()/audio_get_duration_seconds(), routed through
+ * gui.c for the same "plugin_manager.c has no audio-state code of its own"
+ * boundary the rest of this block keeps, even though none of these need any
+ * gui.c-local state. */
+bool gui_plugin_is_playing(void);
+bool gui_plugin_is_paused(void);
+double gui_plugin_get_position_seconds(void);
+double gui_plugin_get_duration_seconds(void);
+
 #endif /* GUI_H */

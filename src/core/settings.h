@@ -32,7 +32,23 @@ typedef struct {
     float volume;              /* 0.0 - 1.0 */
     char last_track[512];      /* absolute path, empty if none */
     double last_position;      /* seconds into last_track */
-    bool auto_resume_enabled;  /* if true, launch straight into last_track/last_position */
+
+    /* Settings -> Playback -> Resume Last Track. 0 = off (default), 1 =
+     * resume and start playing immediately on a cold boot, 2 = resume
+     * (load last_track, seek to last_position, show the player screen) but
+     * stay paused -- no audible auto-play, just ready the moment the user
+     * hits play. Replaces the old plain auto_resume_enabled bool (defaulted
+     * true, defaulting a boot-time auto-play feature to on) -- see gui_init()
+     * for the actual resume path, gated on this and reusing the exact same
+     * Subsonic-cache guard Car Mode's own separate, always-on resume
+     * mechanism already established after a real crash-reboot-loop
+     * incident (2026-08-08) traced to resuming into a cached stream file.
+     * Independent of car_mode_enabled below -- Car Mode has its own
+     * dedicated docking-routine resume (always plays, requires a headphone
+     * connected at boot), this is the general-purpose one a normal user
+     * opts into by hand. */
+    int resume_mode;
+
     uint32_t accent_color;     /* packed 0xRRGGBB, applied to sliders/switches app-wide */
     bool crossfade_enabled;    /* if true, fade into the next queued track near the current one's end */
 
@@ -209,6 +225,19 @@ typedef struct {
      * worth of already-built widgets live. Changing this setting takes
      * effect on the next launch, same as usb_mode above. */
     int font_size_tier;
+
+    /* Screen brightness, logical 0-100 (same scale as backlight.h's
+     * backlight_get_percent()/backlight_set_percent()). Real-device bug
+     * report: brightness had no memory across a real power-down/power-up --
+     * nothing applied any brightness at startup, so the screen came up at
+     * whatever raw value the kernel/bootloader itself defaults the backlight
+     * to, not whatever the user had it set to before powering off. Applied
+     * once in gui_init(), before any screen is built (same timing as
+     * apply_font_size_tier()), and re-persisted on every slider release
+     * (quick_drawer_brightness_changed_cb() in gui.c) the same way volume
+     * is. Default 80 matches backlight.c's own restore_percent fallback
+     * default, for consistency. */
+    int brightness_percent;
 } player_settings_t;
 
 /* Loads settings from disk into *out. If the settings file doesn't exist or

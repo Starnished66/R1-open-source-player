@@ -297,6 +297,106 @@ queue"). Useful for "nothing found" / error feedback -- see
 `Audiobooks.lua`'s use of this when a book folder has no playable chapter
 files in it.
 
+### EQ / sound profiles
+
+This app has its own 10-band parametric EQ (`src/audio/peq.c`) -- these
+functions expose it directly, `luaL_check*`-validated wrappers straight over
+`peq.c`'s own C API (unlike most of the rest of this table, no `gui.c`
+bridge is involved, since the EQ engine has no LVGL/screen state to keep in
+sync -- see "Extending the `plugin.*` API itself" below). Every setter
+below persists immediately (same `peq_save()` every native EQ-screen control
+already calls after each change), so a plugin-driven EQ change survives
+reboot with no extra work and stays consistent with the native EQ screen.
+
+- **`plugin.eq_load_profile(path)` -> bool** -- loads and applies a `.peq`
+  profile file from an arbitrary path (see `eq_save_profile` below for the
+  format), applying it immediately and persisting it as the new
+  always-current EQ state. Returns `false` (not a Lua error) if `path`
+  doesn't exist or can't be read.
+- **`plugin.eq_save_profile(path)` -> bool** -- saves the current EQ state
+  (bypass, preamp, all 10 bands) to `path`, plain text, one `key=value` line
+  per field (`bypass=`, `preamp=`, `bandN_freq=`/`bandN_gain=`/`bandN_q=`/
+  `bandN_type=`/`bandN_enabled=` for `N` 0-9). This is the exact format the
+  native EQ screen's own "Save Profile" already writes and "Load Profile"
+  already reads -- a plugin's saved/loaded profiles are fully interchangeable
+  with ones a user creates by hand in the EQ screen. Returns `false` if
+  `path` can't be written.
+- **`plugin.eq_reset()`** -- restores every band, the preamp, and bypass to
+  built-in defaults (same as the native EQ screen's Reset button), then
+  persists.
+- **`plugin.eq_set_bypass(enabled)`** -- `enabled` (bool): `true` bypasses
+  the whole EQ (flat, unprocessed).
+- **`plugin.eq_set_preamp(db)`** -- `db` (number): the whole-EQ pre-amp gain,
+  in dB.
+- **`plugin.eq_set_band(index, freq_hz, gain_db, q)`** -- sets one band's
+  frequency, gain, and Q. `index` is **1-based** (1..10, matching every
+  other 1-based index in this API), not `peq.c`'s own 0-based one. Raises a
+  Lua error if `index` is out of range.
+- **`plugin.eq_set_band_type(index, type)`** -- `type` (string): `"peaking"`,
+  `"low_shelf"`, or `"high_shelf"`. Raises a Lua error on an unrecognized
+  string or out-of-range `index`.
+- **`plugin.eq_set_band_enabled(index, enabled)`** -- toggles whether that
+  band is applied at all.
+
+There's no getter -- nothing in the profile-switcher use case these are
+built for needs to read EQ state back into Lua, and the native EQ screen
+already re-reads `peq_get_*()` fresh every time it's opened, so it stays
+correct regardless of what a plugin changed. See
+`plugins_examples/SoundProfiles.lua`.
+
+### Playback control
+
+Unlike the EQ functions above, these **do** go through `gui.c` bridges
+(`gui_plugin_toggle_pause()` and neighbors, declared in `gui.h`) rather than
+calling `src/audio/audio.c` directly -- the native UI always pairs a
+playback change with other state (the play/pause icon, the volume
+slider/popup, shuffle-aware next/prev stepping) that a direct `audio_*` call
+would leave stale. Each function here calls the exact same local helper the
+native UI itself uses, so a plugin-driven change looks identical to a
+button/remote-control-driven one.
+
+- **`plugin.toggle_pause()`** -- same as tapping the play/pause button
+  (respects the same Bluetooth-DAC/AirPlay-mode block that button does).
+- **`plugin.stop()`** -- stops playback outright (not resumable the way
+  pause is).
+- **`plugin.next_track()` / `plugin.prev_track()`** -- shuffle-aware
+  next/previous, same stepping logic Prev/Next and a Bluetooth/phone remote
+  already use.
+- **`plugin.seek(seconds)`** -- seeks the current track to an absolute
+  position.
+- **`plugin.set_volume(percent)`** -- `percent` (0-100, clamped): sets
+  system volume, also updating the on-screen volume slider/popup, same as a
+  hardware volume-button press.
+- **`plugin.is_playing()` / `plugin.is_paused()`** -> bool.
+- **`plugin.get_position()` / `plugin.get_duration()`** -> number (seconds).
+
+These are always called from inside a plugin callback (`on_open`,
+`on_select`, a tile click), which is itself already dispatched synchronously
+on the main UI thread from an LVGL click event -- the same thread every
+native playback control already runs on, so there's nothing new to worry
+about thread-safety-wise.
+
+### `plugin.http_get(url [, verify_tls])`
+
+Synchronous GET request, bridging `src/network/http_client.c` (the same one
+this app's own Subsonic integration uses) directly -- no `gui.c` layer
+needed, since there's no LVGL/playback state involved. `verify_tls` defaults
+to `true`; pass `false` only for a server you've deliberately chosen to
+trust despite a self-signed/invalid certificate.
+
+Returns `status, body` on success (`status` an HTTP status code, `body` the
+full response as a Lua string -- binary-safe, not truncated at a NUL byte).
+On a DNS/connect/TLS-level failure, returns `nil, "network error"` instead
+of raising, so a plugin can show its own error toast rather than crash. A
+real HTTP error status (404, 500, ...) is **not** treated as failure here --
+you still get `status, body` back and inspect `status` yourself.
+
+**Runs on the calling thread** -- i.e. whatever plugin callback invoked it,
+always the main UI thread. A slow or hanging server blocks the whole app's
+UI until the request completes or times out. Keep calls fast, or trigger
+them from a user tap (a `register_list_item`/`show_list` row) rather than
+anywhere that could be called in a loop.
+
 ## Complete examples
 
 `plugins_examples/Audiobooks.lua` uses most of the API: `sd_root()`/
@@ -329,6 +429,13 @@ settings storage involved), and is a useful reference for the load-time-only
 constraint on `set_icon()` (backgrounds/text apply live; icons need a
 restart to fully catch up after switching mid-session).
 
+`plugins_examples/SoundProfiles.lua` is the reference implementation for the
+EQ functions -- a handful of curated `.peq` presets reachable from
+Settings -> Sound Profile, switched with `plugin.eq_load_profile()` and
+`plugin.show_list()`, following the exact same "`register_list_item` ->
+`show_list` -> apply and persist to a state file" shape `Themes.lua` already
+established for theme switching.
+
 ## Writing and testing your own plugin
 
 1. No toolchain needed -- a plugin is a plain text `.lua` file. Any editor
@@ -357,11 +464,31 @@ restart to fully catch up after switching mid-session).
 If you're modifying `plugin_manager.c` to add a new function (not writing
 a plugin script, but adding to what plugins *can* call): follow the
 existing `l_plugin_*` functions as the pattern -- `luaL_check*`/`luaL_opt*`
-to pull typed arguments off the Lua stack, do the work (usually by calling
-into a `gui_plugin_*` bridge function declared in `gui.h` and implemented
-in `gui.c`, since `plugin_manager.c` itself has no LVGL/screen code of its
-own), push however many return values, `return <that count>;`, then add
-the new `{ "name", l_plugin_name }` entry to the `plugin_funcs[]` table.
-`gui.c`'s bridge functions are the *only* thing plugin_manager.c is allowed
-to call into the rest of the app through -- keeps the Lua-facing surface
-and the app's own internals from becoming entangled.
+to pull typed arguments off the Lua stack, do the work, push however many
+return values, `return <that count>;`, then add the new
+`{ "name", l_plugin_name }` entry to the `plugin_funcs[]` table.
+
+"Do the work" means one of two things, depending on whether LVGL/screen
+state is involved:
+
+- If it touches LVGL objects/styles or other `gui.c`-local state (screens,
+  widgets, the current playlist/play-button icon) -- go through a
+  `gui_plugin_*` bridge function declared in `gui.h` and implemented in
+  `gui.c`, same as `show_list`/`play_file`/`set_background_color`/the
+  playback-control functions all do. `gui.c` is where that state actually
+  lives; `plugin_manager.c` itself has no LVGL/screen code of its own.
+- If it's a self-contained subsystem with no LVGL dependency of its own
+  (`src/audio/peq.c`'s EQ engine, `src/network/http_client.c`'s HTTP client)
+  -- call its public API directly from `plugin_manager.c`, the way
+  `plugin.eq_*()`/`plugin.http_get()` and `list_dir`/`sd_root` already do.
+  No pointless `gui.c` indirection for something that was never a
+  screen/widget concern in the first place.
+
+When in doubt, check whether the native UI's own call sites for that
+functionality do anything beyond the bare library call (icon updates, extra
+persistence, a guard condition) -- if they do, that logic needs to live in
+the `gui.c` bridge too, not be silently skipped by a plugin. This is exactly
+why playback control (`toggle_pause`/`stop`/`next_track`/...) goes through
+`gui.c` while the EQ and HTTP functions don't: `audio.c`'s own functions are
+always paired with `gui.c`-local UI updates at their native call sites,
+while `peq.c`/`http_client.c` are not.

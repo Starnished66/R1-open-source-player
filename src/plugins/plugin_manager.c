@@ -41,17 +41,50 @@ typedef struct {
     char icon_selected[96];
 } plugin_tile_t;
 
+/* Leaner sibling of plugin_tile_t for plugin.register_list_item() -- no
+ * icon fields, since pill-list rows (screen_builders.h's pill_list_item_t)
+ * have no icon slot at all to fill; storing one would just be dead data
+ * again, the exact problem this whole plugin theming/list-item redesign
+ * started from (icon/label fields captured but never rendered). */
+typedef struct {
+    lua_State * L;
+    int open_ref;
+    char label[64];
+} plugin_list_item_t;
+
 static lua_State * plugin_instances[PLUGIN_MAX_FILES];
 static int plugin_instance_count = 0;
 
-static plugin_tile_t plugin_tiles[PLUGIN_MAX_TILES];
-static int plugin_tile_count = 0;
+/* Registry for plugin.register_list_item("books", ...) -- gui.c's
+ * build_books_screen() appends these after its own 2 built-in rows. See
+ * PLUGIN_MAX_BOOKS_LIST_ITEMS's own comment in plugin_manager.h. list_id is
+ * validated against a fixed, small set of recognized strings ("books",
+ * "settings", "display") rather than driving any real per-list-id
+ * storage/dispatch here -- each recognized list_id gets its own array +
+ * validation branch (see plugin_settings_list_items[]/plugin_display_list_
+ * items[] right below), not a fully generic dispatch table built ahead of
+ * actually needing one. */
+static plugin_list_item_t plugin_books_list_items[PLUGIN_MAX_BOOKS_LIST_ITEMS];
+static int plugin_books_list_item_count = 0;
+
+/* Registry for plugin.register_list_item("settings", ...) -- gui.c's
+ * build_settings_screen() appends these after its own 5 built-in category
+ * rows. See PLUGIN_MAX_SETTINGS_LIST_ITEMS's own comment in
+ * plugin_manager.h. */
+static plugin_list_item_t plugin_settings_list_items[PLUGIN_MAX_SETTINGS_LIST_ITEMS];
+static int plugin_settings_list_item_count = 0;
+
+/* Registry for plugin.register_list_item("display", ...) -- gui.c's
+ * build_settings_display_screen() appends these after its own 4 built-in
+ * rows. See PLUGIN_MAX_DISPLAY_LIST_ITEMS's own comment in
+ * plugin_manager.h. */
+static plugin_list_item_t plugin_display_list_items[PLUGIN_MAX_DISPLAY_LIST_ITEMS];
+static int plugin_display_list_item_count = 0;
 
 /* Separate registry for plugin.register_stream_media_tile() -- same
- * plugin_tile_t shape, different surface (gui.c's Stream Media screen,
- * not the Books -> "Audio Books" row). See PLUGIN_MAX_STREAM_TILES's own
- * comment in plugin_manager.h for why Stream Media gets real tiles when
- * Home doesn't. */
+ * plugin_tile_t shape, different surface (gui.c's Stream Media screen).
+ * See PLUGIN_MAX_STREAM_TILES's own comment in plugin_manager.h for why
+ * Stream Media gets real tiles when Home doesn't. */
 static plugin_tile_t plugin_stream_tiles[PLUGIN_MAX_STREAM_TILES];
 static int plugin_stream_tile_count = 0;
 
@@ -65,16 +98,19 @@ static int current_list_select_ref = LUA_NOREF;
 /* ---- plugin.* C API, exposed as a global table `plugin` in every loaded
  * script's own lua_State (see register_plugin_api() below):
  *
- *   plugin.register_tile(label, on_open [, icon])
- *     Registers the plugin's entry point. on_open(): lua_State function,
- *     called with no arguments when the plugin is opened -- currently: the
- *     first plugin to register is invoked from gui.c's Books -> "Audio
- *     Books" row (see audio_books_row_cb() and PLUGIN_MAX_TILES's own
- *     comment in plugin_manager.h for why it isn't its own Home-screen
- *     tile). label/icon are accepted (icon: optional theme2-relative asset
- *     path, e.g. "launcher/dac.png", "_s" variant derived automatically)
- *     for a future picker UI once more than one plugin is reachable;
- *     unused today.
+ *   plugin.register_list_item(list_id, label, on_open)
+ *     Adds a row labeled `label` to an existing native list screen,
+ *     identified by `list_id` -- "books" (gui.c's Books screen, appended
+ *     after its own "Books"/"Favorites" rows), "settings" (gui.c's
+ *     Settings screen, appended after its own "Playback"/"Display"/
+ *     "Power"/"System"/"About" rows), or "display" (gui.c's Settings ->
+ *     Display sub-screen, appended after its own "Accent Color"/"Font
+ *     Size"/"Screen Timeout"/"Swipe Up for Home" rows); see
+ *     PLUGIN_MAX_BOOKS_LIST_ITEMS, PLUGIN_MAX_SETTINGS_LIST_ITEMS, and
+ *     PLUGIN_MAX_DISPLAY_LIST_ITEMS in plugin_manager.h for the per-screen
+ *     caps. Every plugin that calls this gets its own row (not just the
+ *     first, unlike the old register_tile()/"Audio Books" row this
+ *     replaced) -- tapping it calls on_open() with no arguments.
  *
  *   plugin.show_list(title, items, on_select)
  *     Opens a list screen titled `title` showing each string in the
@@ -100,11 +136,10 @@ static int current_list_select_ref = LUA_NOREF;
  *     Shows the same transient toast used elsewhere in the app.
  *
  *   plugin.register_stream_media_tile(label, on_open [, icon])
- *     Same shape as register_tile() above, but appended as a real
- *     icon-grid tile in gui.c's Stream Media screen (after the built-in
- *     Subsonic tile) rather than routed through Books -> "Audio Books" --
- *     for plugins that thematically belong there (a Net Radio source, or
- *     similar). Up to PLUGIN_MAX_STREAM_TILES (plugin_manager.h) across
+ *     Appended as a real icon-grid tile in gui.c's Stream Media screen
+ *     (after the built-in Subsonic tile) -- for plugins that thematically
+ *     belong there (a Net Radio source, or similar) rather than in the
+ *     Books list. Up to PLUGIN_MAX_STREAM_TILES (plugin_manager.h) across
  *     all loaded plugins combined. icon defaults to stream_media/radio.png
  *     if omitted.
  *
@@ -121,13 +156,18 @@ static int current_list_select_ref = LUA_NOREF;
  *     needed: "screen", "card", or "list_row" -- see
  *     l_plugin_set_background_color()'s own comment for exactly what each
  *     covers. rgb is a packed 0xRRGGBB integer, e.g. 0x1E1E22.
+ *
+ *   plugin.set_text_color(slot, rgb)
+ *     Sets one of two text-color slots app-wide, live, no restart needed --
+ *     "primary" (dominant near-white text) or "muted" (secondary/disabled-
+ *     ish gray text). Destructive-red and accent-tinted text are not
+ *     covered -- see l_plugin_set_text_color()'s own comment.
  * ---- */
 
-/* Shared by l_plugin_register_tile()/l_plugin_register_stream_media_tile()
- * -- fills t->icon/icon_selected from an explicit icon string (deriving
- * the "_s" selected-state variant the same way every real icon pair in
- * this app is named), or from (default_icon, default_icon_selected) if
- * icon is NULL. */
+/* Used by l_plugin_register_stream_media_tile() -- fills t->icon/icon_selected
+ * from an explicit icon string (deriving the "_s" selected-state variant
+ * the same way every real icon pair in this app is named), or from
+ * (default_icon, default_icon_selected) if icon is NULL. */
 static void fill_tile_icon(plugin_tile_t * t, const char * icon, const char * default_icon,
                             const char * default_icon_selected) {
     if (icon) {
@@ -143,23 +183,51 @@ static void fill_tile_icon(plugin_tile_t * t, const char * icon, const char * de
     }
 }
 
-static int l_plugin_register_tile(lua_State * L) {
-    const char * label = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TFUNCTION);
-    const char * icon = (lua_gettop(L) >= 3 && !lua_isnil(L, 3)) ? luaL_checkstring(L, 3) : NULL;
-
-    if (plugin_tile_count >= PLUGIN_MAX_TILES) {
-        return luaL_error(L, "too many plugin tiles registered (max %d)", PLUGIN_MAX_TILES);
-    }
-
-    lua_pushvalue(L, 2);
+/* Shared by l_plugin_register_list_item() below, once its capacity check
+ * for the target array has already passed -- pushes on_open (Lua stack
+ * index 3 in the caller) into the registry and appends {L, ref, label}. */
+static void append_list_item(plugin_list_item_t * array, int * count, lua_State * L, const char * label) {
+    lua_pushvalue(L, 3);
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-    plugin_tile_t * t = &plugin_tiles[plugin_tile_count++];
-    t->L = L;
-    t->open_ref = ref;
-    snprintf(t->label, sizeof(t->label), "%s", label);
-    fill_tile_icon(t, icon, "launcher/book.png", "launcher/book_s.png");
+    plugin_list_item_t * item = &array[(*count)++];
+    item->L = L;
+    item->open_ref = ref;
+    snprintf(item->label, sizeof(item->label), "%s", label);
+}
+
+/* Adds a row to an existing native list screen -- see PLUGIN_MAX_BOOKS_
+ * LIST_ITEMS/PLUGIN_MAX_SETTINGS_LIST_ITEMS's own comments in plugin_
+ * manager.h. list_id is checked against a small, fixed set of recognized
+ * strings ("books", "settings") rather than accepted as-is: a typo'd or
+ * unsupported list_id should fail loudly at plugin load time, not silently
+ * register into nothing. */
+static int l_plugin_register_list_item(lua_State * L) {
+    const char * list_id = luaL_checkstring(L, 1);
+    const char * label = luaL_checkstring(L, 2);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+
+    if (strcmp(list_id, "books") == 0) {
+        if (plugin_books_list_item_count >= PLUGIN_MAX_BOOKS_LIST_ITEMS) {
+            return luaL_error(L, "plugin.register_list_item: too many items registered for \"books\" (max %d)",
+                               PLUGIN_MAX_BOOKS_LIST_ITEMS);
+        }
+        append_list_item(plugin_books_list_items, &plugin_books_list_item_count, L, label);
+    } else if (strcmp(list_id, "settings") == 0) {
+        if (plugin_settings_list_item_count >= PLUGIN_MAX_SETTINGS_LIST_ITEMS) {
+            return luaL_error(L, "plugin.register_list_item: too many items registered for \"settings\" (max %d)",
+                               PLUGIN_MAX_SETTINGS_LIST_ITEMS);
+        }
+        append_list_item(plugin_settings_list_items, &plugin_settings_list_item_count, L, label);
+    } else if (strcmp(list_id, "display") == 0) {
+        if (plugin_display_list_item_count >= PLUGIN_MAX_DISPLAY_LIST_ITEMS) {
+            return luaL_error(L, "plugin.register_list_item: too many items registered for \"display\" (max %d)",
+                               PLUGIN_MAX_DISPLAY_LIST_ITEMS);
+        }
+        append_list_item(plugin_display_list_items, &plugin_display_list_item_count, L, label);
+    } else {
+        return luaL_error(L, "plugin.register_list_item: unknown list_id '%s' (expected \"books\", \"settings\", or \"display\")", list_id);
+    }
     return 0;
 }
 
@@ -323,10 +391,10 @@ static bool copy_file(const char * src_path, const char * dst_path) {
 
 /* Reskins an EXISTING theme2 asset in place, e.g.
  * plugin.set_icon("launcher/book.png", plugin.sd_root() .. "/my_book.png")
- * to change what the Books tile looks like -- a different case from
- * plugin.register_tile()/register_stream_media_tile()'s own icon argument
- * (which points a BRAND NEW tile at whatever icon it likes with no special
- * handling needed). Copies source_path's bytes into
+ * to change what Home's Books tile looks like -- a different case from
+ * plugin.register_stream_media_tile()'s own icon argument (which points a
+ * BRAND NEW tile at whatever icon it likes with no special handling
+ * needed). Copies source_path's bytes into
  * THEME_OVERRIDE_ROOT/relative_path, the same writable-override mechanism
  * assets.c's own asset_path() already checks first for every icon
  * resolution in the app (already how Subsonic's own non-stock icon works
@@ -396,8 +464,27 @@ static int l_plugin_set_background_color(lua_State * L) {
     return 0;
 }
 
+/* Sets one of two fixed text-color slots, live, app-wide, no restart needed
+ * -- see gui_plugin_set_text_color()'s own comment in gui.c. "primary": the
+ * app's dominant near-white text (labels, titles, list rows). "muted":
+ * secondary/disabled-ish gray text (chevrons, timestamps, subtitles).
+ * Destructive-red and accent-tinted text are NOT covered by either slot --
+ * they're semantically fixed, not part of the light/dark background split
+ * plugin.set_background_color() drives. */
+static int l_plugin_set_text_color(lua_State * L) {
+    const char * slot = luaL_checkstring(L, 1);
+    lua_Integer rgb = luaL_checkinteger(L, 2);
+
+    if (strcmp(slot, "primary") != 0 && strcmp(slot, "muted") != 0) {
+        return luaL_error(L, "plugin.set_text_color: unknown slot '%s' (expected \"primary\" or \"muted\")", slot);
+    }
+
+    gui_plugin_set_text_color(slot, (uint32_t) rgb);
+    return 0;
+}
+
 static const luaL_Reg plugin_funcs[] = {
-    { "register_tile",             l_plugin_register_tile },
+    { "register_list_item",        l_plugin_register_list_item },
     { "register_stream_media_tile", l_plugin_register_stream_media_tile },
     { "show_list",                 l_plugin_show_list },
     { "list_dir",                  l_plugin_list_dir },
@@ -407,6 +494,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "show_toast",                l_plugin_show_toast },
     { "set_icon",                  l_plugin_set_icon },
     { "set_background_color",      l_plugin_set_background_color },
+    { "set_text_color",            l_plugin_set_text_color },
     { NULL, NULL }
 };
 
@@ -451,26 +539,65 @@ void plugin_manager_init(void) {
     closedir(d);
 }
 
-int plugin_manager_get_tile_count(void) {
-    return plugin_tile_count;
+/* Shared by plugin_manager_books_list_item_clicked()/_settings_list_item_
+ * clicked() below -- kind is just for the stderr message ("books list
+ * item"/"settings list item"), so a load-time error in one plugin's row is
+ * distinguishable from another's in the log. */
+static void dispatch_list_item_open(plugin_list_item_t * item, const char * kind) {
+    lua_rawgeti(item->L, LUA_REGISTRYINDEX, item->open_ref);
+    if (lua_pcall(item->L, 0, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(item->L, -1);
+        fprintf(stderr, "[plugins] %s '%s' on_open error: %s\n", kind, item->label, err ? err : "unknown error");
+        lua_pop(item->L, 1);
+    }
 }
 
-const char * plugin_manager_get_tile_label(int index) {
-    if (index < 0 || index >= plugin_tile_count) return "";
-    return plugin_tiles[index].label;
+int plugin_manager_get_books_list_item_count(void) {
+    return plugin_books_list_item_count;
 }
 
-const char * plugin_manager_get_tile_icon(int index) {
-    if (index < 0 || index >= plugin_tile_count) return "launcher/book.png";
-    return plugin_tiles[index].icon;
+const char * plugin_manager_get_books_list_item_label(int index) {
+    if (index < 0 || index >= plugin_books_list_item_count) return "";
+    return plugin_books_list_items[index].label;
 }
 
-const char * plugin_manager_get_tile_icon_selected(int index) {
-    if (index < 0 || index >= plugin_tile_count) return "launcher/book_s.png";
-    return plugin_tiles[index].icon_selected;
+void plugin_manager_books_list_item_clicked(int index) {
+    if (index < 0 || index >= plugin_books_list_item_count) return;
+    dispatch_list_item_open(&plugin_books_list_items[index], "books list item");
 }
 
-/* Shared by plugin_manager_tile_clicked()/_stream_tile_clicked() below. */
+int plugin_manager_get_settings_list_item_count(void) {
+    return plugin_settings_list_item_count;
+}
+
+const char * plugin_manager_get_settings_list_item_label(int index) {
+    if (index < 0 || index >= plugin_settings_list_item_count) return "";
+    return plugin_settings_list_items[index].label;
+}
+
+void plugin_manager_settings_list_item_clicked(int index) {
+    if (index < 0 || index >= plugin_settings_list_item_count) return;
+    dispatch_list_item_open(&plugin_settings_list_items[index], "settings list item");
+}
+
+int plugin_manager_get_display_list_item_count(void) {
+    return plugin_display_list_item_count;
+}
+
+const char * plugin_manager_get_display_list_item_label(int index) {
+    if (index < 0 || index >= plugin_display_list_item_count) return "";
+    return plugin_display_list_items[index].label;
+}
+
+void plugin_manager_display_list_item_clicked(int index) {
+    if (index < 0 || index >= plugin_display_list_item_count) return;
+    dispatch_list_item_open(&plugin_display_list_items[index], "display list item");
+}
+
+/* Shared by plugin_manager_stream_tile_clicked() below (the only remaining
+ * caller now that plugin_manager_tile_clicked() -- the old, single-slot
+ * "Audio Books" dispatch -- is gone, replaced by the books-list-item
+ * registry above). */
 static void dispatch_tile_open(plugin_tile_t * t) {
     lua_rawgeti(t->L, LUA_REGISTRYINDEX, t->open_ref);
     if (lua_pcall(t->L, 0, 0, 0) != LUA_OK) {
@@ -478,11 +605,6 @@ static void dispatch_tile_open(plugin_tile_t * t) {
         fprintf(stderr, "[plugins] tile '%s' on_open error: %s\n", t->label, err ? err : "unknown error");
         lua_pop(t->L, 1);
     }
-}
-
-void plugin_manager_tile_clicked(int index) {
-    if (index < 0 || index >= plugin_tile_count) return;
-    dispatch_tile_open(&plugin_tiles[index]);
 }
 
 int plugin_manager_get_stream_tile_count(void) {

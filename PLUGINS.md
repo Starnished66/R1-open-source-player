@@ -31,29 +31,36 @@ affecting any other `.lua` file in the folder.
 There are two separate registries, reached two different ways -- pick
 whichever fits your plugin's own subject matter:
 
-**`plugin.register_tile()`** -- only the *first* plugin to call this is
-reachable. There's no picker UI yet for choosing among several -- if two
-plugin files each register a tile this way, the second's registration
-succeeds (it's still tracked internally) but nothing in the UI currently
-invokes it. The one reachable slot is **Books -> "Audio Books"** (a
-pre-existing native row, `gui.c`'s `audio_books_row_cb()`): tapping it calls
-`plugin_manager_tile_clicked(0)`, which runs tile 0's `on_open` function. If
-no plugin has registered a tile this way, that row falls back to its
-original "Audio Books coming soon" toast, so an app build with no plugins
-installed behaves exactly as before. This used to be a dedicated
-Home-screen icon per plugin instead. That was dropped: `build_icon_grid_screen()`'s
-grid (real-device testing confirmed) **cannot be scrolled**, and Home
-already has all 6 of its built-in tiles filling the screen -- any 7th tile
-would render but be permanently unreachable. Routing through an existing,
-already-visible native row sidesteps that entirely.
+**`plugin.register_list_item(list_id, ...)`** -- every plugin that calls
+this gets its own row, appended to whichever native list screen `list_id`
+names, after that screen's own built-in rows. Three recognized values:
+
+- `"books"` -- the **Books** screen, after "Books"/"Favorites", up to
+  `PLUGIN_MAX_BOOKS_LIST_ITEMS` (currently 8) combined across plugins.
+- `"settings"` -- the top-level **Settings** screen, after "Playback"/
+  "Display"/"Power"/"System"/"About", up to `PLUGIN_MAX_SETTINGS_LIST_ITEMS`
+  (currently 8).
+- `"display"` -- the **Settings -> Display** sub-screen, after "Accent
+  Color"/"Font Size"/"Screen Timeout"/"Swipe Up for Home", up to
+  `PLUGIN_MAX_DISPLAY_LIST_ITEMS` (currently 8). This is where a
+  display-theming plugin's own entry point belongs -- see
+  `plugins_examples/Themes.lua`.
+
+Passing anything else raises a Lua error at load time rather than silently
+registering into nothing. If no plugin registers a row for a given
+`list_id`, that screen just shows its native rows, no placeholder.
+`build_pill_list_screen()`'s rows genuinely scroll (real-device confirmed),
+unlike the icon grid below, so there's no "only the first plugin wins"
+limitation here the way the icon-grid registry has to work around.
 
 **`plugin.register_stream_media_tile()`** -- every plugin that calls this
 gets a real, visible icon-grid tile, appended to **Stream Media** after the
 built-in Subsonic tile (up to `PLUGIN_MAX_STREAM_TILES`, currently 5, so 6
-total -- the same "fills the grid without needing to scroll" ceiling as
-Home). Unlike Home, Stream Media had room after Qobuz/Tidal/Net Radio's
-placeholder tiles were removed, so this one doesn't need a native-row
-workaround -- your plugin's `label`/`icon` are actually shown.
+total). Unlike the Books list above, `build_icon_grid_screen()`'s grid
+**cannot be scrolled** (real-device testing confirmed) -- Stream Media
+happens to have room for this cap because it only has 1 built-in tile,
+unlike Home, which is already full at 6 and has no room for plugin tiles
+of its own at all.
 
 ## The `plugin` API
 
@@ -61,33 +68,30 @@ Every function below is a field on the global `plugin` table, available
 from the moment your script starts running (injected before
 `luaL_dofile()`). All of it is implemented in `src/plugins/plugin_manager.c`.
 
-### `plugin.register_tile(label, on_open [, icon])`
+### `plugin.register_list_item(list_id, label, on_open)`
 
-Registers your plugin's entry point.
+Adds a row to an existing native list screen.
 
-- `label` (string): stored, not currently shown anywhere (see above).
-- `on_open` (function): called with zero arguments when your plugin is
-  opened. This is where you'd call `plugin.show_list()` to show your first
-  screen.
-- `icon` (string, optional): a theme2-relative asset path (e.g.
-  `"launcher/dac.png"`), stored but not currently shown anywhere (see
-  above -- this registry has no picker UI yet). Its "_s" (pressed) variant
-  is derived automatically by inserting `_s` before the file extension.
-  Omit it (or pass `nil`) to default to the Books icon.
+- `list_id` (string): which screen to add to -- `"books"`, `"settings"`, or
+  `"display"` (see "Reaching a plugin from the UI" above for what each
+  targets) -- anything else raises a Lua error immediately, rather than
+  silently registering into nothing.
+- `label` (string): the row's visible text.
+- `on_open` (function): called with zero arguments when the row is tapped.
+  This is where you'd call `plugin.show_list()` to show your first screen.
 
-Only the first call across all loaded plugins currently has any visible
-effect (see above). A script can still call this more than once for
-multiple internal "screens" of its own conceptual UI if that's useful to
-its own structure, but only tile index 0 is ever dispatched from the
-native UI.
+Every plugin that calls this gets its own row (unlike the old
+`register_tile()` this replaced, where only the first caller was ever
+reachable) -- a script can still call it more than once if it genuinely
+wants multiple independent entry points into the same list.
 
-Errors if more than 16 tiles (`PLUGIN_MAX_TILES`, across every loaded
-plugin combined) are registered.
+Errors if more than that `list_id`'s own cap (currently 8 for each of the
+three) is registered, across every loaded plugin combined.
 
 ### `plugin.register_stream_media_tile(label, on_open [, icon])`
 
-Same shape as `register_tile()` above, but reached differently -- see
-"Reaching a plugin from the UI". Use this one for a plugin that
+A separate registry from `register_list_item()` above, reached differently
+-- see "Reaching a plugin from the UI". Use this one for a plugin that
 thematically belongs in Stream Media (a streaming/radio source, for
 instance -- see `plugins_examples/NetRadio.lua`).
 
@@ -104,9 +108,11 @@ loaded plugin combined) are registered.
 
 ### `plugin.set_icon(theme2_relative_path, source_file_path)`
 
-Reskins an **existing** tile's icon in place -- a different case from the
-two `register_*` functions above (which point a brand-new tile at
-whatever icon they like, no special handling needed). For example,
+Reskins an **existing** tile's icon in place -- a different case from
+`register_stream_media_tile()`'s own icon argument above (which points a
+brand-new tile at whatever icon it likes, no special handling needed).
+`register_list_item()` has no icon argument at all -- pill-list rows have
+no icon slot to fill. For example,
 `plugin.set_icon("launcher/book.png", plugin.sd_root() .. "/my_icon.png")`
 changes what Home's Books tile looks like.
 
@@ -151,6 +157,24 @@ inside a callback well after load -- it's a plain style-property update
 plus a redraw request, no file/cache involved.
 
 Raises a Lua error if `slot` isn't one of the three names above.
+
+### `plugin.set_text_color(slot, rgb)`
+
+Sets one of two text-color slots, live, app-wide, no restart needed:
+
+- `"primary"` -- the app's dominant near-white text (labels, titles, list
+  row text).
+- `"muted"` -- secondary/disabled-ish gray text (chevrons, timestamps,
+  subtitles).
+
+Destructive-red text (delete/reset confirmations) and accent-tinted text
+are **not** covered by either slot -- they're semantically fixed, not part
+of the light/dark split these two slots (and `set_background_color()`)
+drive. `rgb` is a packed `0xRRGGBB` integer, same convention as
+`set_background_color()`. Safe to call at any time, same live-update
+mechanism as `set_background_color()` -- no file/cache involved.
+
+Raises a Lua error if `slot` isn't `"primary"` or `"muted"`.
 
 ### `plugin.show_list(title, items, on_select)`
 
@@ -281,7 +305,7 @@ files in it.
 first's `on_select` into the second), `play_list()` to start playback from
 whichever chapter was tapped, and `show_toast()` for the "no chapters
 found" / "no audiobooks found" empty states. Read it top to bottom as the
-reference implementation for `register_tile()`; the `README.md`'s own
+reference implementation for `register_list_item()`; the `README.md`'s own
 Plugins section (section 5) has the install steps (copy to
 `.plugins/Audiobooks.lua`, create an `Audiobooks/<book>/` folder
 structure).
@@ -292,6 +316,18 @@ internet radio stations (label + `http(s)://` MP3 stream URL), shown via
 `show_list()`, played with `plugin.play_list()`. Its own header comment
 covers the "Live stream URLs" caveats above (MP3-only, no seeking, no
 auto-advance into or out of it).
+
+`plugins_examples/Themes.lua` is the reference implementation for
+`"display"` list items, `set_icon()`, `set_background_color()`, and
+`set_text_color()` together -- a Dark/White theme switcher reachable from
+Settings -> Display. It reskins icons app-wide by copying from the stock
+firmware's own `theme1`/`theme2` litegui asset packs (both present on every
+real R1 at `/usr/resource/litegui/`), persists the chosen theme in its own
+state file under `.plugins/` (re-applied at the top of the script on every
+boot, since that's how every plugin already survives a restart -- no native
+settings storage involved), and is a useful reference for the load-time-only
+constraint on `set_icon()` (backgrounds/text apply live; icons need a
+restart to fully catch up after switching mid-session).
 
 ## Writing and testing your own plugin
 
@@ -304,16 +340,17 @@ auto-advance into or out of it).
    startup, there's no hot-reload.
 3. Watch stderr for `[plugins] failed to load ...` (a load-time error --
    syntax error, or an API call failing during your script's top-level
-   code) or `[plugins] tile '...' on_open error: ...` / `[plugins]
-   show_list on_select error: ...` (a runtime error inside one of your
-   callbacks). Per [TESTING.md](TESTING.md)'s launch method, this shows up
-   directly in the foreground `adb shell` output.
-4. If you're using `plugin.register_tile()` (the Books -> "Audio Books"
-   route), there's currently no way to see two plugins' tiles side by side
-   -- test with exactly one `.lua` file using that registry in
-   `.plugins/` at a time until a picker exists. `plugin.register_stream_media_tile()`
-   doesn't have this limitation -- every plugin using it gets its own
-   visible tile, up to `PLUGIN_MAX_STREAM_TILES`.
+   code) or `[plugins] books list item '...' on_open error: ...` /
+   `[plugins] settings list item '...' on_open error: ...` /
+   `[plugins] display list item '...' on_open error: ...` /
+   `[plugins] tile '...' on_open error: ...` / `[plugins] show_list
+   on_select error: ...` (a runtime error inside one of your callbacks).
+   Per [TESTING.md](TESTING.md)'s launch method, this shows up directly in
+   the foreground `adb shell` output.
+4. Both `plugin.register_list_item()` and `plugin.register_stream_media_tile()`
+   let every installed plugin have its own row/tile -- no "only the first
+   one wins" limitation on either, so testing multiple plugins side by
+   side works normally.
 
 ## Extending the `plugin.*` API itself
 

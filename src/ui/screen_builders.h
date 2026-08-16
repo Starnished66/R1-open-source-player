@@ -103,6 +103,19 @@ extern lv_style_t list_row_pressed_style;
  * plugin.set_background_color() call. */
 extern lv_style_t style_theme_screen_bg;
 extern lv_style_t style_theme_card_bg;
+/* Same live-mutable-style mechanism, for text color instead of background:
+ * "primary" (the app's dominant near-white text -- labels, titles, list
+ * rows) and "muted" (secondary/disabled-ish gray text -- chevrons,
+ * timestamps, subtitles). Deliberately NOT covering destructive-red text
+ * (delete/reset confirmations) or accent-tinted text (already tracks the
+ * user's accent color pick independently) -- those are semantically fixed,
+ * not part of the light/dark background split. list_row_style's own
+ * text_color is a separate literal (not one of these two), since rows
+ * attach list_row_style directly rather than a second style object for
+ * text; gui.c's gui_plugin_set_text_color() mutates list_row_style's
+ * text_color too when slot is "primary" so rows stay in sync. */
+extern lv_style_t style_theme_text_primary;
+extern lv_style_t style_theme_text_muted;
 void screen_builders_init_list_row_style(void);
 
 typedef struct {

@@ -1941,7 +1941,7 @@ static void build_info_toast(void) {
     lv_obj_set_width(info_toast_label, lv_pct(90));
     lv_label_set_long_mode(info_toast_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(info_toast_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(info_toast_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(info_toast_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(info_toast_label, ui_size_20, 0);
     lv_obj_center(info_toast_label);
 
@@ -3050,7 +3050,7 @@ static void build_quick_drawer(void) {
      * poll_sleep_timer()'s own comments. Hidden until armed, centered under
      * the 84px-wide icon above it. */
     quick_drawer_sleep_label = lv_label_create(quick_drawer);
-    lv_obj_set_style_text_color(quick_drawer_sleep_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_add_style(quick_drawer_sleep_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(quick_drawer_sleep_label, ui_size_16, 0);
     lv_obj_set_width(quick_drawer_sleep_label, 84);
     lv_obj_set_style_text_align(quick_drawer_sleep_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -3071,7 +3071,7 @@ static void build_quick_drawer(void) {
     lv_obj_align(brightness_icon, LV_ALIGN_TOP_LEFT, 40, QUICK_DRAWER_PANEL1_TOP + 174);
 
     quick_drawer_brightness_label = lv_label_create(quick_drawer);
-    lv_obj_set_style_text_color(quick_drawer_brightness_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(quick_drawer_brightness_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(quick_drawer_brightness_label, ui_size_20, 0);
     lv_obj_align(quick_drawer_brightness_label, LV_ALIGN_TOP_RIGHT, -20, QUICK_DRAWER_PANEL1_TOP + 177);
 
@@ -3134,7 +3134,7 @@ static void build_quick_drawer(void) {
      * center within. */
     quick_drawer_title_label = lv_label_create(card);
     lv_label_set_text(quick_drawer_title_label, "No track loaded");
-    lv_obj_set_style_text_color(quick_drawer_title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(quick_drawer_title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(quick_drawer_title_label, &app_font_16, 0); /* see song_title_label's own comment */
     lv_obj_set_width(quick_drawer_title_label, lv_pct(100));
     lv_obj_set_style_text_align(quick_drawer_title_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -3142,7 +3142,7 @@ static void build_quick_drawer(void) {
 
     quick_drawer_artist_label = lv_label_create(card);
     lv_label_set_text(quick_drawer_artist_label, "");
-    lv_obj_set_style_text_color(quick_drawer_artist_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_add_style(quick_drawer_artist_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(quick_drawer_artist_label, &app_font_16, 0);
     lv_obj_set_width(quick_drawer_artist_label, lv_pct(100));
     lv_obj_set_style_text_align(quick_drawer_artist_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -5390,7 +5390,7 @@ static void populate_add_to_playlist_screen(void) {
 
         lv_obj_t * label = lv_label_create(row);
         lv_label_set_text(label, basename_of(paths[i]));
-        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
         lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
     }
@@ -5440,7 +5440,7 @@ static void populate_queue_screen(void) {
     if (playlist_index < 0 || queued_pending_count <= 0) {
         lv_obj_t * label = lv_label_create(queue_list);
         lv_label_set_text(label, "Queue is empty");
-        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
         return;
     }
@@ -5508,7 +5508,7 @@ void gui_plugin_show_list(const char * title, const char * const * labels, int c
     if (count <= 0) {
         lv_obj_t * label = lv_label_create(list);
         lv_label_set_text(label, "Nothing here");
-        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
     }
     for (int i = 0; i < count; i++) {
@@ -5556,6 +5556,29 @@ void gui_plugin_set_background_color(const char * slot, uint32_t rgb) {
      * error before ever reaching here, so this is unreachable in practice;
      * silently ignored rather than asserting, matching this file's own
      * "degraded but working" tolerance elsewhere. */
+}
+
+/* Same shape as gui_plugin_set_background_color() above, for text color --
+ * see screen_builders.h's own comment on style_theme_text_primary/
+ * style_theme_text_muted for scope (destructive-red and accent-tinted text
+ * are deliberately not covered). "primary" also mutates list_row_style's
+ * own text_color so list rows -- which attach list_row_style directly, not
+ * style_theme_text_primary -- stay in sync with the rest of the app's
+ * primary text. */
+void gui_plugin_set_text_color(const char * slot, uint32_t rgb) {
+    lv_color_t color = lv_color_hex(rgb);
+
+    if (strcmp(slot, "primary") == 0) {
+        lv_style_set_text_color(&style_theme_text_primary, color);
+        lv_obj_report_style_change(&style_theme_text_primary);
+        lv_style_set_text_color(&list_row_style, color);
+        lv_obj_report_style_change(&list_row_style);
+    } else if (strcmp(slot, "muted") == 0) {
+        lv_style_set_text_color(&style_theme_text_muted, color);
+        lv_obj_report_style_change(&style_theme_text_muted);
+    }
+    /* Else: unreachable -- see gui_plugin_set_background_color()'s own
+     * comment on l_plugin_set_text_color() validating first. */
 }
 
 /* ---- Delete confirmation popup ---- */
@@ -5642,7 +5665,7 @@ static void build_delete_song_popup(void) {
     lv_obj_set_width(delete_song_popup_title, lv_pct(90));
     lv_label_set_long_mode(delete_song_popup_title, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(delete_song_popup_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(delete_song_popup_title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(delete_song_popup_title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(delete_song_popup_title, ui_size_22, 0);
     lv_obj_align(delete_song_popup_title, LV_ALIGN_TOP_MID, 0, 20);
 
@@ -5974,7 +5997,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
     song_title_label = lv_label_create(title_row);
     lv_label_set_text(song_title_label, "No track loaded");
-    lv_obj_set_style_text_color(song_title_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_add_style(song_title_label, &style_theme_text_primary, 0);
     /* Explicit rather than relying on LV_FONT_DEFAULT -- see fallback_font.h,
      * this is one of the handful of labels that needs the non-Latin
      * fallback but was never otherwise styled. */
@@ -5997,12 +6020,12 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
     song_folder_label = lv_label_create(artist_row);
     lv_label_set_text(song_folder_label, "");
-    lv_obj_set_style_text_color(song_folder_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_add_style(song_folder_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(song_folder_label, &app_font_16, 0); /* see song_title_label's own comment above */
 
     format_badge_label = lv_label_create(artist_row);
     lv_label_set_text(format_badge_label, "");
-    lv_obj_set_style_text_color(format_badge_label, lv_color_make(150, 150, 150), 0);
+    lv_obj_add_style(format_badge_label, &style_theme_text_muted, 0);
 
     /* Real seek bar: progress_bg/progress/cursor are all sized to their own
      * fixed 440x12 (track) / 30x30 (knob) pixel art, so the slider is given
@@ -6039,17 +6062,17 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
     pos_label = lv_label_create(time_row);
     lv_label_set_text(pos_label, "0:00");
-    lv_obj_set_style_text_color(pos_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_add_style(pos_label, &style_theme_text_muted, 0);
 
     dur_label = lv_label_create(time_row);
     lv_label_set_text(dur_label, "0:00");
-    lv_obj_set_style_text_color(dur_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_add_style(dur_label, &style_theme_text_muted, 0);
 
     /* "N/M" position within the current queue -- centered, between the
      * progress bar and the transport row below it. */
     song_count_label = lv_label_create(overlay);
     lv_label_set_text(song_count_label, "");
-    lv_obj_set_style_text_color(song_count_label, lv_color_make(140, 140, 140), 0);
+    lv_obj_add_style(song_count_label, &style_theme_text_muted, 0);
 
     /* Transport row: prev / play-pause / next, centered. */
     lv_obj_t * controls_row = lv_obj_create(overlay);
@@ -6218,7 +6241,7 @@ static lv_obj_t * build_files_screen(void) {
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Files");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
     file_browser_init(scr, MUSIC_ROOT_DIR, on_file_browser_selected);
@@ -7062,7 +7085,7 @@ static void populate_group_songs_rows(void) {
 
             lv_obj_t * label = lv_label_create(row);
             lv_label_set_text(label, song_display_title_of(group_songs_indices[i]));
-            lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+            lv_obj_add_style(label, &style_theme_text_primary, 0);
             lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
             lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
 
@@ -7195,7 +7218,7 @@ static lv_obj_t * build_group_songs_screen(void) {
     group_songs_title_label = lv_label_create(scr);
     lv_label_set_text(group_songs_title_label, "");
     lv_obj_align(group_songs_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(group_songs_title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(group_songs_title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(group_songs_title_label, &app_font_28, 0); /* shows a metadata-derived artist/album/genre name -- see fallback_font.h */
 
     /* Hidden by default -- populate_group_songs_rows() (via
@@ -7922,7 +7945,7 @@ static lv_obj_t * build_text_entry_screen(void) {
     text_entry_title_label = lv_label_create(scr);
     lv_label_set_text(text_entry_title_label, "");
     lv_obj_align(text_entry_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 8);
-    lv_obj_set_style_text_color(text_entry_title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(text_entry_title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(text_entry_title_label, ui_size_16, 0);
 
     text_entry_textarea = lv_textarea_create(scr);
@@ -8173,7 +8196,7 @@ static lv_obj_t * build_subsonic_downloading_screen(void) {
 
     subsonic_downloading_label = lv_label_create(scr);
     lv_label_set_text(subsonic_downloading_label, "");
-    lv_obj_set_style_text_color(subsonic_downloading_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(subsonic_downloading_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_align(subsonic_downloading_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(subsonic_downloading_label, LV_ALIGN_CENTER, 0, -20);
 
@@ -8454,7 +8477,7 @@ static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_
     lv_obj_t * title_label = lv_label_create(scr);
     lv_label_set_text(title_label, default_title);
     lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title_label, &app_font_28, 0); /* later re-set to a real (possibly non-Latin) server artist/album/song name -- see fallback_font.h */
 
     lv_obj_t * list = lv_obj_create(scr);
@@ -8494,7 +8517,7 @@ static lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) 
 
     lv_obj_t * label = lv_label_create(row);
     lv_label_set_text(label, label_text);
-    lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, ui_size_16, 0);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
     return row;
@@ -8546,7 +8569,7 @@ static lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_tex
      * the honest fallback rather than forcing a mismatched sprite. */
     lv_obj_t * chevron = lv_label_create(row);
     lv_label_set_text(chevron, ">");
-    lv_obj_set_style_text_color(chevron, lv_color_make(140, 140, 140), 0);
+    lv_obj_add_style(chevron, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(chevron, ui_size_16, 0);
     lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, -20, 0);
 
@@ -8558,7 +8581,7 @@ static lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_tex
 static lv_obj_t * add_section_header(lv_obj_t * parent, const char * text) {
     lv_obj_t * label = lv_label_create(parent);
     lv_label_set_text(label, text);
-    lv_obj_set_style_text_color(label, lv_color_make(150, 150, 150), 0);
+    lv_obj_add_style(label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(label, ui_size_16, 0);
     lv_obj_set_style_pad_top(label, 12, 0);
     lv_obj_set_style_pad_left(label, 24, 0);
@@ -9025,7 +9048,7 @@ static void populate_subsonic_saved_servers_screen(void) {
     if (subsonic_saved_server_count == 0) {
         lv_obj_t * label = lv_label_create(subsonic_saved_servers_list);
         lv_label_set_text(label, "No saved servers yet");
-        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
         return;
     }
@@ -9360,7 +9383,7 @@ static void register_az_index(lv_obj_t * screen, lv_obj_t * list, az_index_name_
     lv_obj_t * strip = lv_label_create(screen);
     lv_label_set_text(strip, "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL\nM\nN\nO\nP\nQ\nR\nS\nT\nU\nV\nW\nX\nY\nZ\n#");
     lv_obj_set_style_text_font(strip, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(strip, lv_color_white(), 0);
+    lv_obj_add_style(strip, &style_theme_text_primary, 0);
     lv_obj_set_style_text_align(strip, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_bg_opa(strip, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(strip, 0, 0);
@@ -9384,7 +9407,7 @@ static void register_az_index(lv_obj_t * screen, lv_obj_t * list, az_index_name_
 
     lv_obj_t * popup_label = lv_label_create(popup);
     lv_obj_set_style_text_font(popup_label, &lv_font_montserrat_32, 0);
-    lv_obj_set_style_text_color(popup_label, lv_color_white(), 0);
+    lv_obj_add_style(popup_label, &style_theme_text_primary, 0);
     lv_obj_center(popup_label);
 
     az_index_bindings[az_index_registered_count++] =
@@ -10168,7 +10191,7 @@ static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_te
 
     lv_obj_t * label = lv_label_create(row);
     lv_label_set_text(label, label_text);
-    lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
     return row;
@@ -10874,7 +10897,7 @@ static void build_sd_mount_failed_popup(void) {
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
     lv_label_set_text(title, "SD card couldn't be read");
@@ -10883,7 +10906,7 @@ static void build_sd_mount_failed_popup(void) {
     lv_obj_set_width(body, lv_pct(90));
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(body, lv_color_make(180, 180, 180), 0);
+    lv_obj_add_style(body, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(body, ui_size_16, 0);
     lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 58);
     lv_label_set_text(body,
@@ -10948,7 +10971,7 @@ static void build_sd_format_confirm_popup(void) {
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
     lv_label_set_text(title, "Erase and format SD card?");
@@ -10957,7 +10980,7 @@ static void build_sd_format_confirm_popup(void) {
     lv_obj_set_width(body, lv_pct(90));
     lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(body, lv_color_make(180, 180, 180), 0);
+    lv_obj_add_style(body, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(body, ui_size_16, 0);
     lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 58);
     lv_label_set_text(body, "This permanently deletes everything on the card. This cannot be undone.");
@@ -11088,13 +11111,13 @@ static void build_power_off_countdown_popup(void) {
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
     lv_label_set_text(title, "Powering Off");
 
     power_off_countdown_label = lv_label_create(power_off_countdown_popup);
-    lv_obj_set_style_text_color(power_off_countdown_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(power_off_countdown_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(power_off_countdown_label, ui_size_28, 0);
     lv_obj_align(power_off_countdown_label, LV_ALIGN_CENTER, 0, -10);
     lv_label_set_text_fmt(power_off_countdown_label, "%d", POWER_OFF_COUNTDOWN_SECONDS);
@@ -11558,7 +11581,7 @@ static void build_wifi_action_popup(void) {
     lv_obj_set_width(wifi_action_popup_title, lv_pct(90));
     lv_label_set_long_mode(wifi_action_popup_title, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(wifi_action_popup_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(wifi_action_popup_title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(wifi_action_popup_title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(wifi_action_popup_title, ui_size_22, 0);
     lv_obj_align(wifi_action_popup_title, LV_ALIGN_TOP_MID, 0, 20);
 
@@ -11621,7 +11644,7 @@ static void populate_wifi_info_screen(void) {
     if (!wifi_control_get_info(&info)) {
         lv_obj_t * label = lv_label_create(wifi_info_list);
         lv_label_set_text(label, "Not connected");
-        lv_obj_set_style_text_color(label, lv_color_make(180, 180, 180), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
         return;
     }
@@ -11638,7 +11661,7 @@ static void populate_wifi_info_screen(void) {
     for (int i = 0; i < 5; i++) {
         lv_obj_t * label = lv_label_create(wifi_info_list);
         lv_label_set_text(label, lines[i]);
-        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
         lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
         lv_obj_set_style_pad_top(label, 12, 0);
@@ -11774,7 +11797,7 @@ static void populate_wifi_screen(bool enabled) {
     if (wifi_saved_result_count == 0) {
         lv_obj_t * label = lv_label_create(wifi_list);
         lv_label_set_text(label, "No memorized networks");
-        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
     }
     /* Real-device bug report: no indicator of which saved network is
@@ -11803,7 +11826,7 @@ static void populate_wifi_screen(bool enabled) {
 
         lv_obj_t * label = lv_label_create(row);
         lv_label_set_text(label, text);
-        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
         lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
 
@@ -11834,7 +11857,7 @@ static void populate_wifi_screen(bool enabled) {
         snprintf(text, sizeof(text), "%s%s%s", net->ssid, net->secured ? "  (secured)" : "",
                  net->is_current ? "  - Connected" : "");
         lv_label_set_text(label, text);
-        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
         lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, 64, 0);
 
@@ -11844,7 +11867,7 @@ static void populate_wifi_screen(bool enabled) {
     if (wifi_scan_result_count == 0) {
         lv_obj_t * label = lv_label_create(wifi_list);
         lv_label_set_text(label, "No networks found");
-        lv_obj_set_style_text_color(label, lv_color_make(180, 180, 180), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
     }
 }
@@ -12075,7 +12098,7 @@ static void build_bt_action_popup(void) {
     lv_obj_set_width(bt_action_popup_title, lv_pct(90));
     lv_label_set_long_mode(bt_action_popup_title, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(bt_action_popup_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(bt_action_popup_title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(bt_action_popup_title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(bt_action_popup_title, ui_size_22, 0);
     lv_obj_align(bt_action_popup_title, LV_ALIGN_TOP_MID, 0, 20);
 
@@ -12205,7 +12228,7 @@ static void add_bt_device_row(lv_obj_t * parent, int index) {
     else status = "";
     snprintf(text, sizeof(text), "%s%s", dev->name[0] != '\0' ? dev->name : dev->mac, status);
     lv_label_set_text(label, text);
-    lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
     if (show_codec) {
         lv_obj_align(label, LV_ALIGN_TOP_LEFT, LIST_ROW_LABEL_INSET, 14);
@@ -12216,7 +12239,7 @@ static void add_bt_device_row(lv_obj_t * parent, int index) {
     if (show_codec) {
         lv_obj_t * codec_label = lv_label_create(row);
         lv_label_set_text(codec_label, bt_connected_codec_cached);
-        lv_obj_set_style_text_color(codec_label, lv_color_make(160, 160, 160), 0);
+        lv_obj_add_style(codec_label, &style_theme_text_muted, 0);
         lv_obj_set_style_text_font(codec_label, ui_size_16, 0);
         lv_obj_align(codec_label, LV_ALIGN_BOTTOM_LEFT, LIST_ROW_LABEL_INSET, -12);
     }
@@ -12286,7 +12309,7 @@ static void populate_bt_dac_screen(void) {
                       "own output -- using it as an external DAC.");
     lv_obj_set_width(explanation, lv_pct(90));
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(explanation, lv_color_make(160, 160, 160), 0);
+    lv_obj_add_style(explanation, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(explanation, ui_size_16, 0);
     lv_obj_set_style_pad_left(explanation, 24, 0);
     lv_obj_set_style_pad_top(explanation, 12, 0);
@@ -12448,7 +12471,7 @@ static void build_bt_dac_leave_popup(void) {
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
     lv_label_set_text(title, "Leave Bluetooth DAC mode?");
@@ -12506,13 +12529,13 @@ static lv_obj_t * build_bt_dac_overlay_screen(void) {
 
     lv_obj_t * status_label = lv_label_create(scr);
     lv_label_set_text(status_label, "Bluetooth DAC mode");
-    lv_obj_set_style_text_color(status_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(status_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(status_label, ui_size_28, 0);
     lv_obj_align_to(status_label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
 
     lv_obj_t * hint_label = lv_label_create(scr);
     lv_label_set_text(hint_label, "This device is now receiving Bluetooth audio");
-    lv_obj_set_style_text_color(hint_label, lv_color_make(160, 160, 160), 0);
+    lv_obj_add_style(hint_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(hint_label, ui_size_16, 0);
     lv_obj_align_to(hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
@@ -12901,7 +12924,7 @@ static void build_usb_dac_leave_popup(void) {
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
     lv_label_set_text(title, "Leave USB DAC mode?");
@@ -12959,13 +12982,13 @@ static lv_obj_t * build_usb_dac_overlay_screen(void) {
 
     lv_obj_t * status_label = lv_label_create(scr);
     lv_label_set_text(status_label, "USB DAC mode");
-    lv_obj_set_style_text_color(status_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(status_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(status_label, ui_size_28, 0);
     lv_obj_align_to(status_label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
 
     lv_obj_t * hint_label = lv_label_create(scr);
     lv_label_set_text(hint_label, "This device is now a USB sound card");
-    lv_obj_set_style_text_color(hint_label, lv_color_make(160, 160, 160), 0);
+    lv_obj_add_style(hint_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(hint_label, ui_size_16, 0);
     lv_obj_align_to(hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
@@ -13053,7 +13076,7 @@ static void populate_bt_screen(void) {
     if (paired_shown == 0) {
         lv_obj_t * label = lv_label_create(bt_list);
         lv_label_set_text(label, "No paired devices");
-        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
     }
 
@@ -13068,7 +13091,7 @@ static void populate_bt_screen(void) {
     if (available_shown == 0) {
         lv_obj_t * label = lv_label_create(bt_list);
         lv_label_set_text(label, "No devices found");
-        lv_obj_set_style_text_color(label, lv_color_make(180, 180, 180), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
     }
 
@@ -13196,7 +13219,7 @@ static void build_import_rescan_popup(void) {
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
 
@@ -13226,7 +13249,7 @@ static void build_import_rescan_popup(void) {
     lv_obj_add_event_cb(not_now_row, import_rescan_cancel_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * not_now_label = lv_label_create(not_now_row);
     lv_label_set_text(not_now_label, "Not now");
-    lv_obj_set_style_text_color(not_now_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_add_style(not_now_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(not_now_label, ui_size_20, 0);
     lv_obj_center(not_now_label);
 }
@@ -13310,14 +13333,14 @@ static lv_obj_t * build_import_wifi_screen(void) {
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Import via Wi-Fi");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
     import_wifi_status_label = lv_label_create(scr);
     lv_obj_set_width(import_wifi_status_label, lv_pct(90));
     lv_label_set_long_mode(import_wifi_status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(import_wifi_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(import_wifi_status_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_add_style(import_wifi_status_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(import_wifi_status_label, ui_size_20, 0);
     lv_obj_align(import_wifi_status_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 30);
 
@@ -13376,7 +13399,7 @@ static void populate_airplay_screen(void) {
                       "audio from an iPhone, iPad, or Mac to be played through this device's own output.");
     lv_obj_set_width(explanation, lv_pct(90));
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(explanation, lv_color_make(160, 160, 160), 0);
+    lv_obj_add_style(explanation, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(explanation, ui_size_16, 0);
     lv_obj_set_style_pad_left(explanation, 24, 0);
     lv_obj_set_style_pad_top(explanation, 12, 0);
@@ -13463,7 +13486,7 @@ static void populate_dlna_screen(void) {
                       "aren't supported; use this device's own controls instead once a track starts.");
     lv_obj_set_width(explanation, lv_pct(90));
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(explanation, lv_color_make(160, 160, 160), 0);
+    lv_obj_add_style(explanation, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(explanation, ui_size_16, 0);
     lv_obj_set_style_pad_left(explanation, 24, 0);
     lv_obj_set_style_pad_top(explanation, 12, 0);
@@ -13582,7 +13605,7 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Remote Control");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
     /* Same 448x124/item_bg.png pill look as add_pill_row_base(), built
@@ -13602,7 +13625,7 @@ static lv_obj_t * build_remote_control_screen(void) {
 
     lv_obj_t * toggle_label = lv_label_create(toggle_row);
     lv_label_set_text(toggle_label, "Remote Control");
-    lv_obj_set_style_text_color(toggle_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(toggle_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(toggle_label, ui_size_16, 0);
     lv_obj_align(toggle_label, LV_ALIGN_LEFT_MID, 24, 0);
 
@@ -13633,7 +13656,7 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_set_width(explanation, lv_pct(90));
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(explanation, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(explanation, lv_color_make(160, 160, 160), 0);
+    lv_obj_add_style(explanation, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(explanation, ui_size_16, 0);
     lv_obj_align(explanation, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 150);
 
@@ -13641,7 +13664,7 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_set_width(remote_control_status_label, lv_pct(90));
     lv_label_set_long_mode(remote_control_status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(remote_control_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(remote_control_status_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_add_style(remote_control_status_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(remote_control_status_label, ui_size_20, 0);
     lv_obj_align(remote_control_status_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 270);
 
@@ -13891,7 +13914,7 @@ static void populate_books_files_screen(void) {
     if (count == 0) {
         lv_obj_t * label = lv_label_create(books_files_list);
         lv_label_set_text(label, books_showing_favorites ? "No favorites yet" : "No .txt files found");
-        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
         free(paths);
         return;
@@ -13908,7 +13931,7 @@ static void populate_books_files_screen(void) {
 
         lv_obj_t * label = lv_label_create(row);
         lv_label_set_text(label, basename_of(paths[i]));
-        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
         lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
 
@@ -13974,7 +13997,7 @@ static lv_obj_t * build_text_reader_screen(void) {
     text_reader_title_label = lv_label_create(scr);
     lv_label_set_text(text_reader_title_label, "");
     lv_obj_align(text_reader_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(text_reader_title_label, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(text_reader_title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(text_reader_title_label, &app_font_28, 0); /* shows the (possibly non-Latin) file's own name -- see fallback_font.h */
     /* Narrower than build_subsonic_list_screen()'s equivalent titles (70%
      * -- this one has both the back button AND the favorite icon eating
@@ -13997,7 +14020,7 @@ static lv_obj_t * build_text_reader_screen(void) {
     text_reader_content_label = lv_label_create(text_reader_scroll);
     lv_label_set_long_mode(text_reader_content_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(text_reader_content_label, lv_pct(100));
-    lv_obj_set_style_text_color(text_reader_content_label, lv_color_make(220, 220, 220), 0);
+    lv_obj_add_style(text_reader_content_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(text_reader_content_label, ui_size_20, 0);
     lv_label_set_text(text_reader_content_label, "");
 
@@ -14009,31 +14032,44 @@ static lv_obj_t * build_text_reader_screen(void) {
     return scr;
 }
 
-/* Audio Books has no native implementation of its own -- it's driven by
- * whatever Lua plugin registers itself first via plugin.register_tile()
- * (see src/plugins/plugin_manager.c), the Audiobooks example plugin
- * (plugins_examples/Audiobooks.lua) being the intended one. Originally
- * this fired plugin tiles into their own Home-screen grid slot, but the
- * Home icon grid can't be scrolled (real-device feedback), so anything
- * past its fixed 6 tiles would be unreachable -- routing through this
- * already-existing native row instead needs no scrolling and degrades
- * cleanly (the pre-existing placeholder toast) when no plugin is
- * installed. */
-static void audio_books_row_cb(lv_event_t * e) {
+/* Shared click handler for every plugin-registered Books list row below --
+ * user_data is the row's index into plugin_manager's own plugin_books_
+ * list_items[] (not an LVGL object), same index-not-object shape
+ * plugin_stream_tile_click_cb() already uses for Stream Media tiles. */
+static void plugin_books_list_item_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (plugin_manager_get_tile_count() > 0) {
-        plugin_manager_tile_clicked(0);
-    } else {
-        show_error_toast("Audio Books coming soon");
-    }
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_books_list_item_clicked(index);
 }
 
+/* "Books" and "Favorites" are this screen's only native rows -- anything
+ * else (an "Audio Books" row, or any other plugin-driven entry) comes from
+ * plugin.register_list_item("books", ...) (src/plugins/plugin_manager.c),
+ * the Audiobooks example plugin (plugins_examples/Audiobooks.lua) being the
+ * intended one. This used to be a single hardcoded "Audio Books" row
+ * routed to whichever plugin happened to register first (plugin.
+ * register_tile(), only one slot, real Home-screen tiles ruled out by the
+ * icon grid's own inability to scroll -- see PLUGIN_MAX_STREAM_TILES's own
+ * comment in plugin_manager.h for that same constraint elsewhere). Unlike
+ * that icon grid, build_pill_list_screen()'s rows genuinely scroll
+ * (screen_builders.h's own comment), so there's no reason every plugin
+ * that wants a Books row can't have its own -- if none are installed, this
+ * screen now just shows its 2 native rows, no dead placeholder toast. */
 static lv_obj_t * build_books_screen(void) {
-    static pill_list_item_t items[3];
+    static pill_list_item_t items[2 + PLUGIN_MAX_BOOKS_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Books", PILL_ACCESSORY_CHEVRON, false, books_files_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Favorites", PILL_ACCESSORY_CHEVRON, false, books_favorites_row_cb, NULL, NULL };
-    items[2] = (pill_list_item_t){ "Audio Books", PILL_ACCESSORY_CHEVRON, false, audio_books_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, 3, &style_accent);
+
+    int count = 2;
+    int plugin_count = plugin_manager_get_books_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_BOOKS_LIST_ITEMS; i++) {
+        items[count++] = (pill_list_item_t){
+            plugin_manager_get_books_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_books_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -14098,7 +14134,7 @@ static void build_firmware_update_popup(void) {
     lv_obj_set_width(firmware_update_popup_title, lv_pct(90));
     lv_label_set_long_mode(firmware_update_popup_title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(firmware_update_popup_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(firmware_update_popup_title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(firmware_update_popup_title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(firmware_update_popup_title, ui_size_22, 0);
     lv_obj_align(firmware_update_popup_title, LV_ALIGN_TOP_MID, 0, 20);
 
@@ -14199,7 +14235,7 @@ static lv_obj_t * build_accent_color_screen(void) {
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Accent Color");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
     /* Real-device feedback: the swatches were too small to comfortably tap
@@ -14326,7 +14362,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Screen Timeout");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
     lv_obj_t * enable_row = lv_obj_create(scr);
@@ -14338,7 +14374,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
 
     lv_obj_t * enable_label = lv_label_create(enable_row);
     lv_label_set_text(enable_label, "Turn off screen automatically");
-    lv_obj_set_style_text_color(enable_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
     lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
 
@@ -14380,7 +14416,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_set_ext_click_area(screen_timeout_slider, 20);
 
     screen_timeout_value_label = lv_label_create(screen_timeout_slider_card);
-    lv_obj_set_style_text_color(screen_timeout_value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(screen_timeout_value_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(screen_timeout_value_label, ui_size_28, 0);
     lv_obj_align(screen_timeout_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     char initial_buf[32];
@@ -14464,7 +14500,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Startup Volume");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
     lv_obj_t * enable_row = lv_obj_create(scr);
@@ -14476,7 +14512,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
 
     lv_obj_t * enable_label = lv_label_create(enable_row);
     lv_label_set_text(enable_label, "Launch at a fixed volume");
-    lv_obj_set_style_text_color(enable_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
     lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
 
@@ -14506,7 +14542,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_set_ext_click_area(startup_volume_slider, 20);
 
     startup_volume_value_label = lv_label_create(startup_volume_slider_card);
-    lv_obj_set_style_text_color(startup_volume_value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(startup_volume_value_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(startup_volume_value_label, ui_size_28, 0);
     lv_obj_align(startup_volume_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_label_set_text_fmt(startup_volume_value_label, "%d%%", current_settings.startup_volume_fixed_percent);
@@ -14581,7 +14617,7 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Sleep Timer");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
     lv_obj_t * slider_card = lv_obj_create(scr);
@@ -14603,7 +14639,7 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_set_ext_click_area(sleep_timer_slider, 20);
 
     sleep_timer_value_label = lv_label_create(slider_card);
-    lv_obj_set_style_text_color(sleep_timer_value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(sleep_timer_value_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(sleep_timer_value_label, ui_size_28, 0);
     lv_obj_align(sleep_timer_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_label_set_text_fmt(sleep_timer_value_label, "%d min", current_settings.sleep_timer_minutes);
@@ -14712,7 +14748,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Idle Shutdown");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
     lv_obj_t * enable_row = lv_obj_create(scr);
@@ -14724,7 +14760,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
 
     lv_obj_t * enable_label = lv_label_create(enable_row);
     lv_label_set_text(enable_label, "Automatically go idle");
-    lv_obj_set_style_text_color(enable_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
     lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
 
@@ -14771,7 +14807,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
 
     lv_obj_t * idle_action_explain_label = lv_label_create(idle_action_section);
     lv_label_set_text(idle_action_explain_label, "Choose what happens when idle:");
-    lv_obj_set_style_text_color(idle_action_explain_label, lv_color_make(160, 160, 160), 0);
+    lv_obj_add_style(idle_action_explain_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(idle_action_explain_label, ui_size_16, 0);
     lv_obj_align(idle_action_explain_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
@@ -14812,7 +14848,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
 
     lv_obj_t * idle_shutdown_slider_caption = lv_label_create(idle_shutdown_slider_card);
     lv_label_set_text(idle_shutdown_slider_caption, "Idle timeout:");
-    lv_obj_set_style_text_color(idle_shutdown_slider_caption, lv_color_make(160, 160, 160), 0);
+    lv_obj_add_style(idle_shutdown_slider_caption, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(idle_shutdown_slider_caption, ui_size_16, 0);
     lv_obj_align(idle_shutdown_slider_caption, LV_ALIGN_TOP_LEFT, 24, 14);
 
@@ -14828,7 +14864,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_set_ext_click_area(idle_shutdown_slider, 20);
 
     idle_shutdown_value_label = lv_label_create(idle_shutdown_slider_card);
-    lv_obj_set_style_text_color(idle_shutdown_value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(idle_shutdown_value_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(idle_shutdown_value_label, ui_size_28, 0);
     lv_obj_align(idle_shutdown_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     char initial_buf[32];
@@ -15002,14 +15038,35 @@ static lv_obj_t * build_settings_playback_screen(void) {
     return scr;
 }
 
+/* Shared click handler for every plugin-registered Display list row below --
+ * same index-not-object shape plugin_settings_list_item_click_cb() (defined
+ * further down, alongside build_settings_screen()) already uses. Forward-
+ * declared static since build_settings_display_screen() is defined earlier
+ * in the file than that sibling. */
+static void plugin_display_list_item_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_display_list_item_clicked(index);
+}
+
 static lv_obj_t * build_settings_display_screen(void) {
-    static pill_list_item_t items[4];
+    static pill_list_item_t items[4 + PLUGIN_MAX_DISPLAY_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Accent Color", PILL_ACCESSORY_CHEVRON, false, accent_color_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Font Size", PILL_ACCESSORY_CHEVRON, false, font_size_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Screen Timeout", PILL_ACCESSORY_CHEVRON, false, screen_timeout_row_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
                                     current_settings.swipe_up_home_enabled, NULL, swipe_up_home_switch_event_cb, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, 4, &style_accent);
+
+    int count = 4;
+    int plugin_count = plugin_manager_get_display_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_DISPLAY_LIST_ITEMS; i++) {
+        items[count++] = (pill_list_item_t){
+            plugin_manager_get_display_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_display_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -15071,14 +15128,33 @@ static void settings_about_row_cb(lv_event_t * e) {
  * nothing is actively misleading. Removed until the feature itself is
  * re-enabled; current_settings.auto_resume_enabled and
  * auto_resume_switch_event_cb are both still there, just unreferenced. */
+/* Shared click handler for every plugin-registered Settings list row below
+ * -- same index-not-object shape plugin_books_list_item_click_cb() already
+ * uses for the Books screen. */
+static void plugin_settings_list_item_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_settings_list_item_clicked(index);
+}
+
 static lv_obj_t * build_settings_screen(void) {
-    static pill_list_item_t items[5];
+    static pill_list_item_t items[5 + PLUGIN_MAX_SETTINGS_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Playback", PILL_ACCESSORY_CHEVRON, false, settings_category_playback_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Display", PILL_ACCESSORY_CHEVRON, false, settings_category_display_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Power", PILL_ACCESSORY_CHEVRON, false, settings_category_power_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "System", PILL_ACCESSORY_CHEVRON, false, settings_category_system_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "About", PILL_ACCESSORY_CHEVRON, false, settings_about_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, 5, &style_accent);
+
+    int count = 5;
+    int plugin_count = plugin_manager_get_settings_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SETTINGS_LIST_ITEMS; i++) {
+        items[count++] = (pill_list_item_t){
+            plugin_manager_get_settings_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_settings_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -15197,7 +15273,7 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
      * label area is the tap target, not just the text glyphs, via
      * lv_obj_set_ext_click_area() below. */
     lv_obj_t * value_label = lv_label_create(card);
-    lv_obj_set_style_text_color(value_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(value_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(value_label, ui_size_22, 0);
     /* y=6, not the original 14 -- real-device feedback: the value text
      * needed more separation from the slider below it, so it moves up a
@@ -15312,7 +15388,7 @@ static void build_eq_reset_popup(void) {
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
     lv_label_set_text(title, "Reset PEQ to defaults?");
@@ -15415,7 +15491,7 @@ static void build_factory_reset_popup(void) {
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
     lv_label_set_text(title, "Reset all settings and reboot?");
@@ -15522,7 +15598,7 @@ static void build_font_size_reboot_popup(void) {
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(title, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
     lv_label_set_text(title, "Restart now to apply the new font size?");
@@ -15553,7 +15629,7 @@ static void build_font_size_reboot_popup(void) {
     lv_obj_add_event_cb(later_row, font_size_reboot_later_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * later_label = lv_label_create(later_row);
     lv_label_set_text(later_label, "Later");
-    lv_obj_set_style_text_color(later_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_add_style(later_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(later_label, ui_size_20, 0);
     lv_obj_center(later_label);
 }
@@ -15578,7 +15654,7 @@ static void populate_eq_profiles_screen(void) {
     if (!peq_scan_profiles(PEQ_PROFILES_DIR, &paths, &count)) {
         lv_obj_t * label = lv_label_create(eq_profiles_list);
         lv_label_set_text(label, "No saved profiles");
-        lv_obj_set_style_text_color(label, lv_color_make(140, 140, 140), 0);
+        lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
         return;
     }
@@ -15599,7 +15675,7 @@ static void populate_eq_profiles_screen(void) {
 
         lv_obj_t * label = lv_label_create(row);
         lv_label_set_text(label, display);
-        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
         lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
 
@@ -15659,7 +15735,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "PEQ");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(title, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
     /* "EQ Enabled" switch lives in the title row itself (top-right), same
@@ -15765,7 +15841,7 @@ static lv_obj_t * build_eq_screen(void) {
 
     lv_obj_t * type_label = lv_label_create(type_row);
     lv_label_set_text(type_label, "Type");
-    lv_obj_set_style_text_color(type_label, lv_color_make(220, 220, 220), 0);
+    lv_obj_add_style(type_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(type_label, ui_size_20, 0);
     lv_obj_align(type_label, LV_ALIGN_LEFT_MID, 16, 0);
 
@@ -15783,7 +15859,7 @@ static lv_obj_t * build_eq_screen(void) {
 
     lv_obj_t * enabled_label = lv_label_create(enable_row);
     lv_label_set_text(enabled_label, "Enable");
-    lv_obj_set_style_text_color(enabled_label, lv_color_make(220, 220, 220), 0);
+    lv_obj_add_style(enabled_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(enabled_label, ui_size_20, 0);
     lv_obj_align(enabled_label, LV_ALIGN_LEFT_MID, 16, 0);
 
@@ -15953,10 +16029,11 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     fallback_font_init_early(current_settings.font_size_tier); /* must run before any style/screen captures &app_font_16/&app_font_22 -- see fallback_font.h */
     screen_builders_init_list_row_style();
 
-    /* Discovers plugin tiles by loading and running every .lua file under
-     * <SD card>/.plugins/ -- run early, well before Books (the only current
-     * tile entry point, see audio_books_row_cb()) could plausibly be
-     * reached. */
+    /* Discovers plugin rows/tiles by loading and running every .lua file
+     * under <SD card>/.plugins/ -- run early, well before Books, Settings,
+     * or Stream Media (the current plugin entry points, see build_books_
+     * screen()/build_settings_screen()/build_stream_media_screen()) could
+     * plausibly be reached. */
     plugin_manager_init();
 #ifndef HOST_BUILD
     boot_checkpoint("pre-screen-build setup done");

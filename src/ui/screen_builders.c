@@ -26,6 +26,12 @@ lv_style_t list_row_pressed_style;
 lv_style_t style_theme_screen_bg;
 lv_style_t style_theme_card_bg;
 
+/* Same mechanism, for text color -- see screen_builders.h's own comment on
+ * style_theme_text_primary/style_theme_text_muted for why destructive-red
+ * and accent-tinted text are deliberately excluded. */
+lv_style_t style_theme_text_primary;
+lv_style_t style_theme_text_muted;
+
 void screen_builders_init_list_row_style(void) {
     lv_style_init(&list_row_style);
     lv_style_set_width(&list_row_style, LIST_ROW_WIDTH);
@@ -69,6 +75,15 @@ void screen_builders_init_list_row_style(void) {
     lv_style_set_bg_color(&style_theme_screen_bg, lv_color_make(0, 0, 0));
     lv_style_init(&style_theme_card_bg);
     lv_style_set_bg_color(&style_theme_card_bg, lv_color_make(32, 32, 32));
+
+    /* Defaults match this app's own dominant literal text colors before
+     * theming existed -- (230,230,230) is the single most common primary
+     * text literal across gui.c, (160,160,160) a representative value from
+     * the muted tier's (140-200,...) range. */
+    lv_style_init(&style_theme_text_primary);
+    lv_style_set_text_color(&style_theme_text_primary, lv_color_make(230, 230, 230));
+    lv_style_init(&style_theme_text_muted);
+    lv_style_set_text_color(&style_theme_text_muted, lv_color_make(160, 160, 160));
 }
 
 /* Generous upper bound on rows for a 2-column icon grid -- every real
@@ -134,7 +149,7 @@ static lv_obj_t * build_title(lv_obj_t * scr, const char * title) {
     /* Vertically centered within the TITLE_ROW_HEIGHT band below the
      * status bar (matches the back button's own 64px height). */
     lv_obj_align(label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_set_style_text_color(label, lv_color_make(240, 240, 240), 0);
+    lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, ui_size_28, 0);
     return label;
 }
@@ -307,7 +322,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
 
         lv_obj_t * label = lv_label_create(tile);
         lv_label_set_text(label, item->label);
-        lv_obj_set_style_text_color(label, lv_color_make(220, 220, 220), 0);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
         /* Bumped from montserrat_16 -- real-device feedback: the main
          * menu/submenu text still read too small even after the app-wide
          * LV_FONT_DEFAULT bump, since these tiles always set an explicit
@@ -445,7 +460,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
 
         lv_obj_t * label = lv_label_create(row);
         lv_label_set_text(label, item->label);
-        lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
         /* Bumped from montserrat_16 -- see the matching comment on the icon
          * grid's own label above; the row is a fixed 124px tall so this
          * doesn't need any layout math adjustment like the grid did. */
@@ -481,7 +496,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                  * than forcing a mismatched sprite. */
                 lv_obj_t * chevron = lv_label_create(row);
                 lv_label_set_text(chevron, ">");
-                lv_obj_set_style_text_color(chevron, lv_color_make(140, 140, 140), 0);
+                lv_obj_add_style(chevron, &style_theme_text_muted, 0);
                 lv_obj_set_style_text_font(chevron, ui_size_20, 0);
                 lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, -20, 0);
             }

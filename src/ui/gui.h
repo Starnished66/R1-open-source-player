@@ -45,4 +45,10 @@ void gui_plugin_show_toast(const char * msg);
  * a packed 0xRRGGBB value. */
 void gui_plugin_set_background_color(const char * slot, uint32_t rgb);
 
+/* Same shape, for text color -- slot must be "primary" or "muted"
+ * (plugin_manager.c's l_plugin_set_text_color() already validates this).
+ * See screen_builders.h's style_theme_text_primary/style_theme_text_muted
+ * comment for what each covers and what's deliberately excluded. */
+void gui_plugin_set_text_color(const char * slot, uint32_t rgb);
+
 #endif /* GUI_H */

@@ -1,6 +1,7 @@
 #include "screen_builders.h"
 #include "assets.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -416,6 +417,80 @@ static void pill_toggle_row_event_cb(lv_event_t * e) {
     lv_obj_send_event(img, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
+void pill_row_apply_icon(lv_obj_t * row, lv_obj_t * label, const char * icon_path, int32_t icon_px,
+                          lv_align_t align, int32_t x, int32_t y) {
+    if (!icon_path) return;
+
+    /* "S:" is LVGL's own POSIX-filesystem driver letter (lv_conf.h) --
+     * unlike asset_path(), this doesn't prefix THEME_ROOT, so it opens
+     * icon_path verbatim as a real absolute path (e.g. a file on the SD
+     * card, not this app's own theme directory). */
+    char src[600];
+    snprintf(src, sizeof(src), "S:%s", icon_path);
+
+    /* lv_image_set_scale() only changes what's DRAWN -- the widget's own
+     * coordinate box stays at the source's native (unscaled) size, same
+     * reason build_icon_grid_screen() above never aligns/sizes an
+     * lv_image directly either. Left as its native size, `img` would (a)
+     * paint its own default background across that full native box, not
+     * just the visibly-scaled content -- a real-device bug report: a
+     * near-black launcher icon rendered as a solid black square wildly
+     * bigger than the intended 64px target -- and (b) throw off `label`'s
+     * own re-alignment math below, which needs to know the icon's REAL
+     * on-screen width. Same fix as build_icon_grid_screen(): a
+     * fully-style-stripped wrapper explicitly sized to the true scaled
+     * (target_w x target_h) dimensions, with `img` centered inside it --
+     * the wrapper both clips any of img's own oversized background and
+     * gives align/label-offset math a box that matches what's actually
+     * visible. */
+    lv_obj_t * img_wrap = lv_obj_create(row);
+    lv_obj_remove_style_all(img_wrap);
+    lv_obj_remove_flag(img_wrap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(img_wrap, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t * img = lv_image_create(img_wrap);
+    lv_image_set_src(img, src);
+
+    /* Same scale-to-target-px-on-screen formula as build_icon_grid_screen()
+     * above -- read the source's native size, compute the zoom that lands
+     * it at icon_px regardless of the source file's own resolution. 256 =
+     * LV_SCALE_NONE (100%), used as a safe fallback if the header can't be
+     * read (a missing/corrupt file just renders at native size rather than
+     * erroring -- a plugin icon is cosmetic, not worth failing the whole
+     * row over). */
+    lv_image_header_t header;
+    int32_t scale = 256;
+    int32_t native_w = icon_px, native_h = icon_px;
+    if (lv_image_decoder_get_info(src, &header) == LV_RESULT_OK) {
+        int32_t native_max = header.w > header.h ? header.w : header.h;
+        if (native_max > 0) scale = (int32_t) (((int64_t) icon_px * 256) / native_max);
+        native_w = header.w;
+        native_h = header.h;
+    }
+    lv_image_set_scale(img, scale);
+    int32_t target_w = (int32_t) (((int64_t) native_w * scale) / 256);
+    int32_t target_h = (int32_t) (((int64_t) native_h * scale) / 256);
+    lv_obj_set_size(img_wrap, target_w, target_h);
+    lv_obj_center(img);
+    lv_obj_align(img_wrap, align, x, y);
+
+    /* Re-align, not re-inset -- label may already be non-default-aligned
+     * (e.g. a caller that already moved it for its own reasons); this always
+     * wins as the final word on the label's position, matching every other
+     * call site's own single lv_obj_align() call. icon_px (not target_w) is
+     * the reserved gap -- icon_px is always the longer edge, so this never
+     * underestimates the icon's real width even for a non-square source. */
+    lv_obj_align(label, align, x + icon_px + 12, y);
+}
+
+const lv_font_t * pill_row_resolve_text_size(const char * text_size) {
+    if (!text_size) return ui_size_20;
+    if (strcmp(text_size, "small") == 0) return &app_font_16;
+    if (strcmp(text_size, "medium") == 0) return &app_font_22;
+    if (strcmp(text_size, "large") == 0) return &app_font_28;
+    return ui_size_20;
+}
+
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
                                    lv_style_t * toggle_accent_style) {
@@ -444,8 +519,21 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
     for (int i = 0; i < item_count; i++) {
         const pill_list_item_t * item = &items[i];
 
+        /* 0 (every existing native row's compound literal leaves this
+         * unset) means "default" -- 124px, PNG pill sprite, exactly today's
+         * look. A plugin-resized row instead gets a plain rounded-rect fill
+         * -- see PILL_ROW_HEIGHT_MIN's own comment in screen_builders.h for
+         * why the PNG sprite can't just stretch to a new height. */
+        int32_t height = 124;
+        bool resized = item->row_height > 0;
+        if (resized) {
+            height = item->row_height;
+            if (height < PILL_ROW_HEIGHT_MIN) height = PILL_ROW_HEIGHT_MIN;
+            if (height > PILL_ROW_HEIGHT_MAX) height = PILL_ROW_HEIGHT_MAX;
+        }
+
         lv_obj_t * row = lv_obj_create(list);
-        lv_obj_set_size(row, 448, 124);
+        lv_obj_set_size(row, 448, height);
         /* item_bg.png is a rounded-rect sprite with transparent corners --
          * without an explicit black bg_color here, LVGL's own default
          * object background (light gray/white) shows through at those
@@ -453,7 +541,12 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
          * draw at all and also fills the object's full square bounding
          * box underneath it. */
         lv_obj_add_style(row, &style_theme_screen_bg, 0);
-        lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
+        if (resized) {
+            lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+            lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        } else {
+            lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
+        }
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
@@ -462,10 +555,12 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_label_set_text(label, item->label);
         lv_obj_add_style(label, &style_theme_text_primary, 0);
         /* Bumped from montserrat_16 -- see the matching comment on the icon
-         * grid's own label above; the row is a fixed 124px tall so this
-         * doesn't need any layout math adjustment like the grid did. */
-        lv_obj_set_style_text_font(label, ui_size_20, 0);
+         * grid's own label above. text_size NULL (every native row) ->
+         * ui_size_20, unchanged from before this field existed -- see
+         * pill_row_resolve_text_size()'s own comment. */
+        lv_obj_set_style_text_font(label, pill_row_resolve_text_size(item->text_size), 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
+        pill_row_apply_icon(row, label, item->icon_asset, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
 
         if (item->accessory == PILL_ACCESSORY_TOGGLE) {
             lv_obj_t * toggle_img = lv_image_create(row);

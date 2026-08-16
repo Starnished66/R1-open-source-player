@@ -5682,7 +5682,8 @@ static void plugin_list_row_click_cb(lv_event_t * e) {
     plugin_manager_list_item_selected(index);
 }
 
-void gui_plugin_show_list(const char * title, const char * const * labels, int count) {
+void gui_plugin_show_list(const char * title, const char * const * labels, const char * const * icon_paths,
+                           const char * const * text_sizes, int32_t height, int count) {
     int slot = plugin_list_pool_next;
     plugin_list_pool_next = (plugin_list_pool_next + 1) % PLUGIN_LIST_SCREEN_POOL_SIZE;
 
@@ -5696,12 +5697,63 @@ void gui_plugin_show_list(const char * title, const char * const * labels, int c
         lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
     }
+
+    /* Any icon anywhere in this call, or an explicit height, means every row
+     * in it builds as a small icon+label container instead of the original
+     * bare list_row_style label -- a call with neither anywhere keeps
+     * today's exact fast, plain-label path untouched. */
+    bool any_icon = false;
+    for (int i = 0; i < count && icon_paths; i++) {
+        if (icon_paths[i]) { any_icon = true; break; }
+    }
+    bool use_container_rows = any_icon || height > 0;
+
+    int32_t row_h = LIST_ROW_HEIGHT;
+    if (height > 0) {
+        row_h = height;
+        if (row_h < PILL_ROW_HEIGHT_MIN) row_h = PILL_ROW_HEIGHT_MIN;
+        if (row_h > PILL_ROW_HEIGHT_MAX) row_h = PILL_ROW_HEIGHT_MAX;
+    }
+
     for (int i = 0; i < count; i++) {
-        lv_obj_t * row = lv_label_create(list);
-        lv_obj_add_style(row, &list_row_style, 0);
-        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+        const char * icon = icon_paths ? icon_paths[i] : NULL;
+        const char * text_size = text_sizes ? text_sizes[i] : NULL;
+
+        if (!use_container_rows) {
+            lv_obj_t * row = lv_label_create(list);
+            lv_obj_add_style(row, &list_row_style, 0);
+            lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_label_set_text(row, labels[i]);
+            /* NULL text_size leaves list_row_style's own default font
+             * (LIST_ROW_FONT, already fallback-capable) untouched -- see
+             * pill_row_resolve_text_size()'s own comment on why a genuine
+             * NULL only ever reaches it from a truly-unset call like this. */
+            if (text_size) lv_obj_set_style_text_font(row, pill_row_resolve_text_size(text_size), 0);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, plugin_list_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+            continue;
+        }
+
+        lv_obj_t * row = lv_obj_create(list);
+        lv_obj_set_size(row, LIST_ROW_WIDTH, row_h);
+        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_label_set_text(row, labels[i]);
+        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+
+        lv_obj_t * label = lv_label_create(row);
+        lv_label_set_text(label, labels[i]);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
+        /* "medium" default -- matches LIST_ROW_FONT (app_font_22), today's
+         * existing show_list() row font, so a row without an explicit
+         * text_size still renders at its previous size. */
+        lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size ? text_size : "medium"), 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+        pill_row_apply_icon(row, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, plugin_list_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
     }
@@ -8913,6 +8965,9 @@ typedef struct {
     char label[96];
     bool toggle_value;
     int slider_min, slider_max, slider_value;
+    char icon_path[256]; /* "" = none */
+    int32_t row_height;  /* 0 = default, ignored for a slider row */
+    char text_size[8];   /* "" = this row type's own default -- see populate_plugin_settings_list_screen() */
 } plugin_settings_list_row_state_t;
 
 static plugin_settings_list_row_state_t
@@ -8942,7 +8997,8 @@ static int plugin_settings_list_slider_card_count[PLUGIN_SETTINGS_LIST_SCREEN_PO
  * registration and LV_OBJ_FLAG_GESTURE_BUBBLE removal, same split of
  * responsibility screen_timeout_slider_card's own construction uses. */
 static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text, int min, int max, int value,
-                                       lv_event_cb_t slider_event_cb, void * user_data) {
+                                       lv_event_cb_t slider_event_cb, void * user_data, const char * icon_path,
+                                       const char * text_size) {
     lv_obj_t * card = lv_obj_create(parent);
     lv_obj_set_size(card, 448, 130);
     lv_obj_add_style(card, &style_theme_card_bg, 0);
@@ -8953,8 +9009,12 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
     lv_obj_t * label = lv_label_create(card); /* child 0 */
     lv_label_set_text(label, label_text);
     lv_obj_add_style(label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(label, ui_size_16, 0);
+    /* text_size is never NULL here -- populate_plugin_settings_list_screen()
+     * already defaults it to "small" (matching this row's own previous
+     * hardcoded ui_size_16) before calling in. */
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, 20, 12);
+    lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
+    pill_row_apply_icon(card, label, icon_path, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_TOP_LEFT, 20, 12);
 
     lv_obj_t * value_label = lv_label_create(card); /* child 1 -- see plugin_settings_slider_event_cb()'s lookup */
     lv_obj_add_style(value_label, &style_theme_text_muted, 0);
@@ -8992,6 +9052,24 @@ static void plugin_settings_tap_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     void * packed = lv_event_get_user_data(e);
     plugin_manager_settings_list_row_selected(unpack_plugin_settings_slot(packed), unpack_plugin_settings_row(packed));
+}
+
+/* Applies a plugin row's optional `height` -- no-op if unset (<=0). Only
+ * used for toggle/tap rows (add_pill_row_base()-based, PNG pill background)
+ * -- a slider row's own card already has its own fixed 130px layout with no
+ * spare room to grow into, per plugin.show_settings_list()'s own documented
+ * "height ignored for slider" rule. Switches the PNG sprite for a plain
+ * rounded-rect fill -- see PILL_ROW_HEIGHT_MIN's own comment in
+ * screen_builders.h for why a resized row can't just keep the PNG. */
+static void apply_plugin_pill_row_resize(lv_obj_t * row_obj, int32_t row_height) {
+    if (row_height <= 0) return;
+    int32_t height = row_height;
+    if (height < PILL_ROW_HEIGHT_MIN) height = PILL_ROW_HEIGHT_MIN;
+    if (height > PILL_ROW_HEIGHT_MAX) height = PILL_ROW_HEIGHT_MAX;
+    lv_obj_set_height(row_obj, height);
+    lv_obj_set_style_bg_image_src(row_obj, NULL, 0);
+    lv_obj_set_style_radius(row_obj, LIST_ROW_RADIUS, 0);
+    lv_obj_set_style_bg_color(row_obj, LIST_ROW_BG_COLOR, 0);
 }
 
 static void populate_plugin_settings_list_screen(int slot); /* forward -- toggle click rebuilds its own slot */
@@ -9061,13 +9139,22 @@ static void populate_plugin_settings_list_screen(int slot) {
     for (int row = 0; row < count; row++) {
         plugin_settings_list_row_state_t * st = &plugin_settings_list_row_state[slot][row];
         void * packed = pack_plugin_settings_slot_row(slot, row);
+        const char * icon = st->icon_path[0] ? st->icon_path : NULL;
+        /* Default "small" -- matches this whole screen's own previous
+         * hardcoded ui_size_16, so a row that doesn't set text_size renders
+         * exactly as it did before this field existed. */
+        const char * text_size = st->text_size[0] ? st->text_size : "small";
 
         if (st->type == PLUGIN_SETTINGS_ROW_TOGGLE) {
             lv_obj_t * row_obj = add_pill_toggle_row(list, st->label, st->toggle_value, NULL);
             lv_obj_add_event_cb(row_obj, plugin_settings_toggle_row_click_cb, LV_EVENT_CLICKED, packed);
+            lv_obj_t * label = lv_obj_get_child(row_obj, 0); /* add_pill_row_base()'s own child-0-is-the-label layout */
+            lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
+            pill_row_apply_icon(row_obj, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
+            apply_plugin_pill_row_resize(row_obj, st->row_height);
         } else if (st->type == PLUGIN_SETTINGS_ROW_SLIDER) {
             lv_obj_t * card = add_pill_slider_row(list, st->label, st->slider_min, st->slider_max, st->slider_value,
-                                                   plugin_settings_slider_event_cb, packed);
+                                                   plugin_settings_slider_event_cb, packed, icon, text_size);
             /* Same reasoning as every native slider card's own identical
              * pair of calls -- see register_swipe_dead_zone()'s own
              * top-of-block comment. */
@@ -9079,13 +9166,18 @@ static void populate_plugin_settings_list_screen(int slot) {
         } else { /* PLUGIN_SETTINGS_ROW_TAP */
             lv_obj_t * row_obj = add_pill_chevron_row(list, st->label, NULL);
             lv_obj_add_event_cb(row_obj, plugin_settings_tap_row_click_cb, LV_EVENT_CLICKED, packed);
+            lv_obj_t * label = lv_obj_get_child(row_obj, 0);
+            lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
+            pill_row_apply_icon(row_obj, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
+            apply_plugin_pill_row_resize(row_obj, st->row_height);
         }
     }
 }
 
 int gui_plugin_show_settings_list(const char * title, const int * row_types, const char * const * labels,
                                    const bool * toggle_initial, const int * slider_min, const int * slider_max,
-                                   const int * slider_value, int count) {
+                                   const int * slider_value, const char * const * icon_paths, const int32_t * heights,
+                                   const char * const * text_sizes, int count) {
     int slot = plugin_settings_list_pool_next;
     plugin_settings_list_pool_next = (plugin_settings_list_pool_next + 1) % PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE;
 
@@ -9102,6 +9194,9 @@ int gui_plugin_show_settings_list(const char * title, const int * row_types, con
         st->slider_min = slider_min[i];
         st->slider_max = slider_max[i];
         st->slider_value = slider_value[i];
+        snprintf(st->icon_path, sizeof(st->icon_path), "%s", icon_paths[i] ? icon_paths[i] : "");
+        st->row_height = heights[i];
+        snprintf(st->text_size, sizeof(st->text_size), "%s", text_sizes[i] ? text_sizes[i] : "");
     }
     plugin_settings_list_row_state_count[slot] = n;
 
@@ -14644,10 +14739,14 @@ static lv_obj_t * build_books_screen(void) {
     int count = 2;
     int plugin_count = plugin_manager_get_books_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_BOOKS_LIST_ITEMS; i++) {
-        items[count++] = (pill_list_item_t){
+        pill_list_item_t item = {
             plugin_manager_get_books_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
             plugin_books_list_item_click_cb, NULL, (void *) (intptr_t) i
         };
+        const char * text_size = NULL;
+        plugin_manager_get_books_list_item_options(i, &item.icon_asset, &item.row_height, &text_size);
+        item.text_size = text_size ? text_size : "medium"; /* see pill_row_resolve_text_size()'s own comment on why plugin rows always supply a non-NULL default */
+        items[count++] = item;
     }
 
     lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent);
@@ -15628,10 +15727,14 @@ static lv_obj_t * build_settings_playback_screen(void) {
     int count = 6;
     int plugin_count = plugin_manager_get_playback_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_PLAYBACK_LIST_ITEMS; i++) {
-        items[count++] = (pill_list_item_t){
+        pill_list_item_t item = {
             plugin_manager_get_playback_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
             plugin_playback_list_item_click_cb, NULL, (void *) (intptr_t) i
         };
+        const char * text_size = NULL;
+        plugin_manager_get_playback_list_item_options(i, &item.icon_asset, &item.row_height, &text_size);
+        item.text_size = text_size ? text_size : "medium";
+        items[count++] = item;
     }
 
     lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, &style_accent);
@@ -15661,10 +15764,14 @@ static lv_obj_t * build_settings_display_screen(void) {
     int count = 4;
     int plugin_count = plugin_manager_get_display_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_DISPLAY_LIST_ITEMS; i++) {
-        items[count++] = (pill_list_item_t){
+        pill_list_item_t item = {
             plugin_manager_get_display_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
             plugin_display_list_item_click_cb, NULL, (void *) (intptr_t) i
         };
+        const char * text_size = NULL;
+        plugin_manager_get_display_list_item_options(i, &item.icon_asset, &item.row_height, &text_size);
+        item.text_size = text_size ? text_size : "medium";
+        items[count++] = item;
     }
 
     lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, &style_accent);
@@ -15692,10 +15799,14 @@ static lv_obj_t * build_settings_power_screen(void) {
     int count = 3;
     int plugin_count = plugin_manager_get_power_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_POWER_LIST_ITEMS; i++) {
-        items[count++] = (pill_list_item_t){
+        pill_list_item_t item = {
             plugin_manager_get_power_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
             plugin_power_list_item_click_cb, NULL, (void *) (intptr_t) i
         };
+        const char * text_size = NULL;
+        plugin_manager_get_power_list_item_options(i, &item.icon_asset, &item.row_height, &text_size);
+        item.text_size = text_size ? text_size : "medium";
+        items[count++] = item;
     }
 
     lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, &style_accent);
@@ -15722,10 +15833,14 @@ static lv_obj_t * build_settings_system_screen(void) {
     int count = 4;
     int plugin_count = plugin_manager_get_system_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SYSTEM_LIST_ITEMS; i++) {
-        items[count++] = (pill_list_item_t){
+        pill_list_item_t item = {
             plugin_manager_get_system_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
             plugin_system_list_item_click_cb, NULL, (void *) (intptr_t) i
         };
+        const char * text_size = NULL;
+        plugin_manager_get_system_list_item_options(i, &item.icon_asset, &item.row_height, &text_size);
+        item.text_size = text_size ? text_size : "medium";
+        items[count++] = item;
     }
 
     lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, &style_accent);
@@ -15787,10 +15902,14 @@ static lv_obj_t * build_settings_screen(void) {
     int count = 5;
     int plugin_count = plugin_manager_get_settings_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SETTINGS_LIST_ITEMS; i++) {
-        items[count++] = (pill_list_item_t){
+        pill_list_item_t item = {
             plugin_manager_get_settings_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
             plugin_settings_list_item_click_cb, NULL, (void *) (intptr_t) i
         };
+        const char * text_size = NULL;
+        plugin_manager_get_settings_list_item_options(i, &item.icon_asset, &item.row_height, &text_size);
+        item.text_size = text_size ? text_size : "medium";
+        items[count++] = item;
     }
 
     lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent);

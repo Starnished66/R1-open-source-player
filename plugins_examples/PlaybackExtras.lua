@@ -2,6 +2,10 @@
 -- and plugin.show_settings_list() (see PLUGINS.md): adds a "Loudness Boost"
 -- row to Settings -> Playback, opening a nested submenu with a real toggle
 -- switch, a real slider, and a nested row (a submenu inside a submenu).
+-- Also demonstrates the icon/height/text_size row options: the toggle row
+-- gets a real icon (pointed at a real stock theme2 asset by its raw
+-- filesystem path -- no user-supplied image needed for this example to
+-- work), and the "About" row is shown at "large" text size.
 --
 -- The toggle/slider directly drive plugin.eq_set_preamp() -- the same
 -- whole-EQ preamp the native Equalizer screen's own Preamp slider controls
@@ -37,6 +41,12 @@ end
 
 local state = read_state()
 
+-- A real stock theme2 asset, present on every real device -- see this
+-- file's own header comment. Raw absolute filesystem path, not a
+-- theme2-relative one (see PLUGINS.md's "Row images, resizing, and text
+-- size" section for why).
+local BOOST_ICON = "/usr/resource/litegui/theme2/launcher/music.png"
+
 local function apply_state()
     plugin.eq_set_preamp(state.enabled and state.boost_db or 0)
 end
@@ -61,6 +71,7 @@ local function open_menu()
             type = "toggle",
             label = "Enable Boost",
             value = state.enabled,
+            icon = BOOST_ICON,
             on_change = function(new_value)
                 state.enabled = new_value
                 write_state(state)
@@ -82,6 +93,7 @@ local function open_menu()
         {
             type = "row",
             label = "About",
+            text_size = "large",
             on_select = open_about_menu,
         },
     })

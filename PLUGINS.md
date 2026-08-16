@@ -79,7 +79,7 @@ Every function below is a field on the global `plugin` table, available
 from the moment your script starts running (injected before
 `luaL_dofile()`). All of it is implemented in `src/plugins/plugin_manager.c`.
 
-### `plugin.register_list_item(list_id, label, on_open)`
+### `plugin.register_list_item(list_id, label, on_open [, options])`
 
 Adds a row to an existing native list screen.
 
@@ -91,6 +91,9 @@ Adds a row to an existing native list screen.
 - `on_open` (function): called with zero arguments when the row is tapped.
   This is where you'd call `plugin.show_list()` or
   `plugin.show_settings_list()` to show your first screen.
+- `options` (table, optional): `{ icon = "...", height = n, text_size =
+  "..." }` -- see "Row images, resizing, and text size" below for all
+  three.
 
 Every plugin that calls this gets its own row (unlike the old
 `register_tile()` this replaced, where only the first caller was ever
@@ -122,9 +125,12 @@ loaded plugin combined) are registered.
 
 Reskins an **existing** tile's icon in place -- a different case from
 `register_stream_media_tile()`'s own icon argument above (which points a
-brand-new tile at whatever icon it likes, no special handling needed).
-`register_list_item()` has no icon argument at all -- pill-list rows have
-no icon slot to fill. For example,
+brand-new tile at whatever icon it likes, no special handling needed) and
+from `register_list_item()`'s/`show_list()`'s/`show_settings_list()`'s own
+`icon` option (which puts a NEW icon on a row that has none, from an
+arbitrary SD-card file rather than an existing theme2 asset -- see "Row
+images, resizing, and text size" below). This function is specifically for
+changing what an *already-existing* stock icon looks like. For example,
 `plugin.set_icon("launcher/book.png", plugin.sd_root() .. "/my_icon.png")`
 changes what Home's Books tile looks like.
 
@@ -188,15 +194,23 @@ mechanism as `set_background_color()` -- no file/cache involved.
 
 Raises a Lua error if `slot` isn't `"primary"` or `"muted"`.
 
-### `plugin.show_list(title, items, on_select)`
+### `plugin.show_list(title, items, on_select [, options])`
 
 Opens a list screen.
 
 - `title` (string): the screen's header text.
-- `items` (array table of strings): one row per entry, shown in order.
+- `items` (array table): one row per entry, shown in order. Each entry is
+  either a plain string (a row with just a label, as before) or a table
+  `{ label = "...", icon = "...", text_size = "..." }` for a row with its
+  own icon and/or text size -- see "Row images, resizing, and text size"
+  below.
 - `on_select` (function): called with the **1-based** index of whichever
   row was tapped (Lua array convention, not C's 0-based one) when the user
   taps a row. Not called if the user backs out without tapping anything.
+- `options` (table, optional): `{ height = n }` -- resizes every row in
+  this call (not per-row -- a plain browsing list mixing wildly different
+  row heights would look broken in a way an occasional taller settings-
+  submenu row doesn't).
 
 Each call opens a **new** screen (from a pool of 4 reusable ones -- see
 `PLUGIN_LIST_SCREEN_POOL_SIZE` in `gui.c`), so calling `show_list` again
@@ -242,13 +256,18 @@ itself a small settings panel (see `plugins_examples/PlaybackExtras.lua`).
     Volume, the EQ bands) already uses, so a callback that writes to disk
     isn't hammered mid-drag.
 
+  Every row type also accepts `icon`, `height`, and `text_size` (see "Row
+  images, resizing, and text size" below) -- except `height` on a
+  `"slider"` row, which is ignored (its card has its own fixed layout with
+  no spare room to grow into).
+
 Capped at 24 rows per call, and 4 `"slider"`-type rows per call
 specifically (the underlying swipe-gesture-safety bookkeeping -- see below
 -- needs a real, bounded slot per slider). Both cases silently drop the
 excess rather than erroring, same convention as `show_list()`'s own item
-cap. An unknown/missing `type`, or a row missing its required callback
-(`on_select` for `"row"`, `on_change` for `"toggle"`/`"slider"`), raises a
-Lua error immediately instead.
+cap. An unknown/missing `type`, an unrecognized `text_size`, or a row
+missing its required callback (`on_select` for `"row"`, `on_change` for
+`"toggle"`/`"slider"`), raises a Lua error immediately instead.
 
 Each call opens a screen from a small **separate** pool from `show_list()`'s
 own (2 slots, smaller since settings submenus nest shallower in practice --
@@ -269,6 +288,38 @@ cap above exists and isn't just an arbitrary round number.
 
 Items beyond the first 500 (`PLUGIN_MAX_LIST_ITEMS`) in a single call are
 silently dropped.
+
+### Row images, resizing, and text size
+
+`register_list_item()`'s `options` table, `show_list()`'s per-row table
+entries, and `show_settings_list()`'s per-row tables all accept the same
+three optional fields:
+
+- **`icon`** (string) -- a **raw absolute filesystem path**, e.g.
+  `plugin.sd_root() .. "/.plugins/my_icon.png"` -- **not** a theme2-relative
+  path like `register_stream_media_tile()`'s `icon` argument or
+  `set_icon()`'s first argument use. Any file your plugin can read works,
+  including a file it downloaded itself at runtime. Drawn to the left of
+  the row's label, scaled to a consistent on-screen size regardless of the
+  source file's own resolution. A missing or corrupt file just renders at
+  its native size rather than erroring -- an icon is cosmetic, not worth
+  failing the whole row over.
+- **`height`** (number, px) -- resizes the row. Clamped to a fixed range
+  (currently 100-220px) rather than erroring if you ask for more or less.
+  Not available on a `show_settings_list()` `"slider"` row (see that
+  function's own section above) -- everywhere else, an unset/zero height
+  keeps that row type's own default (124px for a pill/`register_list_item`
+  row, 84px for a plain `show_list` row).
+- **`text_size`** (string) -- `"small"`, `"medium"`, or `"large"`. Every
+  size uses a font with full non-Latin fallback (Cyrillic, CJK, Korean,
+  Thai) -- correct for plugin-authored text, which (unlike this app's own
+  fixed English UI chrome) might not be English. An unrecognized value
+  raises a Lua error; omitting it keeps that row type's own existing
+  default size.
+
+None of the three affect a row that doesn't set them -- a plugin that
+never uses this section's fields renders exactly as it did before they
+existed.
 
 ### `plugin.list_dir(path)`
 
@@ -601,7 +652,10 @@ established for theme switching.
 "Loudness Boost" row in Settings -> Playback opening a submenu with a real
 toggle switch, a real slider (both driving `plugin.eq_set_preamp()`), and a
 nested `"row"` ("About") that opens a second `show_settings_list()` screen
-on top of the first, demonstrating submenu-inside-a-submenu nesting.
+on top of the first, demonstrating submenu-inside-a-submenu nesting -- and,
+since this session's row-images/resizing/text-size work, the toggle row's
+own `icon` (pointed at a real stock theme2 asset by its raw filesystem
+path) and the "About" row's `text_size = "large"`.
 
 `plugins_examples/LastFmScrobbler.lua` is the reference implementation for
 `plugin.on()`, `set_interval()`/`clear_interval()`, `get_now_playing()`,

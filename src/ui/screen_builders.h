@@ -161,7 +161,85 @@ typedef struct {
      * settings_crossfade_toggle_img for the motivating real-device bug
      * (drawer/settings crossfade toggles falling out of sync). */
     lv_obj_t ** out_toggle_img;
+
+    /* ---- Plugin-row extensions (plugin.register_list_item()'s optional
+     * `options` table, PLUGINS.md) -- every existing native row across every
+     * build_pill_list_screen() caller leaves these NULL/0 (a plain compound
+     * literal without designators for trailing fields already defaults them
+     * that way), which reproduces today's exact rendering: PNG pill
+     * background, 124px height, ui_size_20 label font. Only a
+     * plugin-appended row (gui.c's build_settings_*_screen() plugin-row
+     * loops) ever sets these. ---- */
+
+    /* Raw absolute filesystem path (e.g. "/data/mnt/sd_0/.plugins/icon.png"),
+     * NOT a theme2-relative asset path -- a plugin's icon lives on the SD
+     * card, not in this app's own theme directory. See pill_row_apply_icon()
+     * below. NULL = no icon, today's exact layout. */
+    const char * icon_asset;
+
+    /* 0 = default (124px, PNG pill sprite). A non-zero value (clamped to
+     * PILL_ROW_HEIGHT_MIN..MAX) resizes the row AND switches its background
+     * from the PNG sprite to a plain rounded-rect fill -- see
+     * PILL_ROW_HEIGHT_MIN's own comment for why the PNG can't just stretch. */
+    int32_t row_height;
+
+    /* NULL = this call site's own default (native rows: ui_size_20,
+     * unchanged; plugin rows: gui.c always supplies a non-NULL default
+     * before this reaches here -- see pill_row_resolve_text_size()'s own
+     * comment). "small"/"medium"/"large" -> app_font_16/22/28
+     * (fallback_font.h) -- the fallback-capable family, since plugin row
+     * text (unlike native chrome) may be non-Latin. Validated by the Lua
+     * boundary in plugin_manager.c; this layer trusts it's already one of
+     * the three recognized values or NULL. */
+    const char * text_size;
 } pill_list_item_t;
+
+/* Row-height bounds for a plugin-resized pill row (register_list_item()'s
+ * `height` option) or a plugin-resized show_list() row (gui_plugin_show_list()'s
+ * own `height` option) -- shared range for both, silently clamped rather than
+ * erroring (same convention plugin.set_interval()'s own minimum-clamp uses).
+ * Floor is comfortably above PILL_ROW_ICON_PX_DEFAULT so a default-size icon
+ * always has real clearance; ceiling keeps one row from dominating the
+ * screen. */
+#define PILL_ROW_HEIGHT_MIN 100
+#define PILL_ROW_HEIGHT_MAX 220
+
+/* On-screen icon footprint (longest edge, in px) a plugin row's icon targets
+ * -- same scaling formula as build_icon_grid_screen()'s own
+ * ICON_GRID_TARGET_ICON_PX, just a smaller target since this sits inside a
+ * single row rather than a whole tile. Fits a 124px-tall default pill row
+ * with real clearance (124-64=60px, 30px top/bottom). */
+#define PILL_ROW_ICON_PX_DEFAULT 64
+
+/* Adds a plugin-supplied icon to an already-built row and re-aligns `label`
+ * to start after it -- shared by build_pill_list_screen() below (native
+ * pill rows) and gui.c's own plugin-row builders (add_pill_row_base()'s
+ * pill-toggle/-chevron rows, the settings-list slider row, gui_plugin_
+ * show_list()'s icon rows), so the icon-loading/scaling logic exists in
+ * exactly one place rather than four. No-op if icon_path is NULL --
+ * `label`'s alignment is left completely untouched in that case, preserving
+ * every existing call site's exact layout. `icon_px` is the on-screen
+ * target size (longest edge); pass PILL_ROW_ICON_PX_DEFAULT unless a caller
+ * has a specific reason not to. `align`/`x`/`y` are the alignment to apply
+ * to BOTH the icon and (offset by icon_px + a 12px gap) the label -- most
+ * rows are a single vertically-centered line (LV_ALIGN_LEFT_MID), but the
+ * settings-list slider row's label sits top-left instead (its value label
+ * and slider fill the rest of the card), so this isn't hardcoded. See this
+ * file's own top-of-block comment for why icon_path is a raw filesystem
+ * path, not a theme2-relative one. */
+void pill_row_apply_icon(lv_obj_t * row, lv_obj_t * label, const char * icon_path, int32_t icon_px,
+                          lv_align_t align, int32_t x, int32_t y);
+
+/* Resolves a plugin's chosen text-size tier to the correspondingly-sized
+ * fallback-capable font -- NULL returns ui_size_20 (build_pill_list_screen()'s
+ * own native-row default; every plugin call site is responsible for
+ * supplying its OWN non-NULL default -- e.g. "medium" -- before calling
+ * this, precisely so NULL unambiguously means "a genuine native row" here,
+ * never "a plugin row that happened not to set text_size"). "small"/
+ * "medium"/"large" -> &app_font_16/22/28 (fallback_font.h). Any other
+ * string (shouldn't happen -- plugin_manager.c validates at the Lua
+ * boundary) falls back to ui_size_20 rather than dereferencing garbage. */
+const lv_font_t * pill_row_resolve_text_size(const char * text_size);
 
 /* Titled screen: real back-arrow button and a vertically scrollable list of
  * touch_list/item_bg.png pill rows, each with a label and an optional

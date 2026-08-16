@@ -45,15 +45,21 @@ typedef struct {
     char icon_selected[96];
 } plugin_tile_t;
 
-/* Leaner sibling of plugin_tile_t for plugin.register_list_item() -- no
- * icon fields, since pill-list rows (screen_builders.h's pill_list_item_t)
- * have no icon slot at all to fill; storing one would just be dead data
- * again, the exact problem this whole plugin theming/list-item redesign
- * started from (icon/label fields captured but never rendered). */
+/* Leaner sibling of plugin_tile_t for plugin.register_list_item() -- pill-
+ * list rows (screen_builders.h's pill_list_item_t) now DO have an icon/
+ * height/text_size slot (this session's row-images/resize/text-size work),
+ * populated from this call's optional 4th `options` table -- see
+ * append_list_item()'s own comment. Empty string ("") means "unset" for
+ * icon_path/text_size, matching pill_list_item_t's own NULL convention one
+ * level up (plugin_manager_get_*_list_item_options() below translates
+ * empty-string back to NULL for its callers). */
 typedef struct {
     lua_State * L;
     int open_ref;
     char label[64];
+    char icon_path[256];
+    int32_t row_height;
+    char text_size[8];
 } plugin_list_item_t;
 
 static lua_State * plugin_instances[PLUGIN_MAX_FILES];
@@ -158,10 +164,22 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *     first, unlike the old register_tile()/"Audio Books" row this
  *     replaced) -- tapping it calls on_open() with no arguments.
  *
- *   plugin.show_list(title, items, on_select)
- *     Opens a list screen titled `title` showing each string in the
- *     `items` array table as a row. on_select(index): called with the
- *     1-based Lua index of the tapped row.
+ *     Optional 4th arg `options`: { icon = "...", height = n, text_size =
+ *     "small"/"medium"/"large" } -- icon is a raw absolute filesystem path
+ *     (e.g. plugin.sd_root() .. "/icon.png", NOT a theme2-relative one);
+ *     height (px) resizes the row (clamped, see PILL_ROW_HEIGHT_MIN/MAX,
+ *     screen_builders.h); text_size picks the row's font. All three default
+ *     to sensible values matching this row's own pre-existing look if
+ *     omitted -- see PLUGINS.md for the full picture.
+ *
+ *   plugin.show_list(title, items, on_select [, options])
+ *     Opens a list screen titled `title`. Each `items` entry is either a
+ *     plain string (a row with just a label) or a table { label = "...",
+ *     icon = "...", text_size = "..." } for a row with its own icon/text
+ *     size (same `icon`/`text_size` meaning as register_list_item()'s
+ *     `options` above). on_select(index): called with the 1-based Lua index
+ *     of the tapped row. Optional 4th arg `options`: { height = n } --
+ *     applies to every row in this call (not per-row).
  *
  *   plugin.show_settings_list(title, items)
  *     Opens a nested settings submenu titled `title`, indistinguishable
@@ -175,10 +193,14 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *     on/off switch; or { type = "slider", label = "...", min = n, max = n,
  *     value = n, on_change = function(new_value) ... end } for a slider --
  *     on_change fires once when the drag is released, not on every
- *     intermediate tick. Capped at 24 rows and 4 slider rows per call,
- *     silently truncated past that (same convention as show_list()'s own
- *     item cap) -- an unknown/missing `type`, or a row missing its required
- *     callback, raises a Lua error instead.
+ *     intermediate tick. Every row type also accepts `icon`/`text_size`
+ *     (same meaning as register_list_item()'s `options` above); `height`
+ *     too, except for a "slider" row (its own fixed-layout card has no
+ *     spare room to grow into). Capped at 24 rows and 4 slider rows per
+ *     call, silently truncated past that (same convention as show_list()'s
+ *     own item cap) -- an unknown/missing `type`, an unrecognized
+ *     `text_size`, or a row missing its required callback, all raise a Lua
+ *     error instead.
  *
  *   plugin.list_dir(path)
  *     Returns an array table of { name = "...", dir = true/false } for
@@ -349,9 +371,25 @@ static void fill_tile_icon(plugin_tile_t * t, const char * icon, const char * de
     }
 }
 
+/* Validates a text_size string against the three recognized tiers -- shared
+ * by append_list_item() below and l_plugin_show_settings_list()/
+ * l_plugin_show_list() (fail loudly at the Lua boundary, same convention
+ * every other unrecognized-string case in this file already uses; the
+ * resolved font itself is picked later, in screen_builders.c's
+ * pill_row_resolve_text_size(), which trusts this was already validated). */
+static bool is_valid_text_size(const char * text_size) {
+    return strcmp(text_size, "small") == 0 || strcmp(text_size, "medium") == 0 || strcmp(text_size, "large") == 0;
+}
+
 /* Shared by l_plugin_register_list_item() below, once its capacity check
  * for the target array has already passed -- pushes on_open (Lua stack
- * index 3 in the caller) into the registry and appends {L, ref, label}. */
+ * index 3 in the caller) into the registry and appends {L, ref, label}, plus
+ * this call's optional 4th `options` table ({ icon, height, text_size },
+ * PLUGINS.md) if present. icon_path/text_size are left as empty strings
+ * (not touched at all here, matching the struct's already-zero-initialized
+ * static-array storage) when `options` is absent or doesn't set that field
+ * -- plugin_manager_get_*_list_item_options() below is what translates that
+ * back to NULL for its own callers. */
 static void append_list_item(plugin_list_item_t * array, int * count, lua_State * L, const char * label) {
     lua_pushvalue(L, 3);
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -360,6 +398,32 @@ static void append_list_item(plugin_list_item_t * array, int * count, lua_State 
     item->L = L;
     item->open_ref = ref;
     snprintf(item->label, sizeof(item->label), "%s", label);
+    item->icon_path[0] = '\0';
+    item->row_height = 0;
+    item->text_size[0] = '\0';
+
+    if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
+        lua_getfield(L, 4, "icon");
+        const char * icon = lua_tostring(L, -1);
+        if (icon) snprintf(item->icon_path, sizeof(item->icon_path), "%s", icon);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 4, "height");
+        item->row_height = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 4, "text_size");
+        const char * text_size = lua_tostring(L, -1);
+        if (text_size) {
+            if (!is_valid_text_size(text_size)) {
+                lua_pop(L, 1);
+                luaL_error(L, "plugin.register_list_item: unknown text_size '%s' (expected \"small\", \"medium\", or \"large\")",
+                           text_size);
+            }
+            snprintf(item->text_size, sizeof(item->text_size), "%s", text_size);
+        }
+        lua_pop(L, 1);
+    }
 }
 
 /* Adds a row to an existing native list screen -- see PLUGIN_MAX_BOOKS_
@@ -443,6 +507,14 @@ static int l_plugin_register_stream_media_tile(lua_State * L) {
     return 0;
 }
 
+/* Each items[] entry is either a plain string (today's original behavior,
+ * unchanged) or a table { label = "...", icon = "...", text_size = "..." }
+ * for a row that wants its own icon/text size -- see this function's own
+ * doc comment. An optional trailing `options` table (4th arg) carries
+ * `height`, applying to every row in this call (a call-level, not per-row,
+ * setting -- a plain browsing list mixing wildly different row heights
+ * would look broken in a way an occasional taller settings-submenu row
+ * doesn't, see PLUGINS.md). */
 static int l_plugin_show_list(lua_State * L) {
     const char * title = luaL_checkstring(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
@@ -453,11 +525,55 @@ static int l_plugin_show_list(lua_State * L) {
 
     static char label_bufs[PLUGIN_MAX_LIST_ITEMS][160];
     static const char * labels[PLUGIN_MAX_LIST_ITEMS];
+    static char icon_bufs[PLUGIN_MAX_LIST_ITEMS][256];
+    static const char * icon_paths[PLUGIN_MAX_LIST_ITEMS];
+    static char text_size_bufs[PLUGIN_MAX_LIST_ITEMS][8];
+    static const char * text_sizes[PLUGIN_MAX_LIST_ITEMS];
+
     for (int i = 0; i < n; i++) {
         lua_rawgeti(L, 2, i + 1);
-        const char * s = lua_tostring(L, -1);
-        snprintf(label_bufs[i], sizeof(label_bufs[i]), "%s", s ? s : "");
+        icon_bufs[i][0] = '\0';
+        icon_paths[i] = NULL;
+        text_size_bufs[i][0] = '\0';
+        text_sizes[i] = NULL;
+
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "label");
+            const char * s = lua_tostring(L, -1);
+            snprintf(label_bufs[i], sizeof(label_bufs[i]), "%s", s ? s : "");
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "icon");
+            const char * icon = lua_tostring(L, -1);
+            if (icon) {
+                snprintf(icon_bufs[i], sizeof(icon_bufs[i]), "%s", icon);
+                icon_paths[i] = icon_bufs[i];
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "text_size");
+            const char * text_size = lua_tostring(L, -1);
+            if (text_size) {
+                if (!is_valid_text_size(text_size)) {
+                    return luaL_error(L, "plugin.show_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", or \"large\")",
+                                       i + 1, text_size);
+                }
+                snprintf(text_size_bufs[i], sizeof(text_size_bufs[i]), "%s", text_size);
+                text_sizes[i] = text_size_bufs[i];
+            }
+            lua_pop(L, 1);
+        } else {
+            const char * s = lua_tostring(L, -1);
+            snprintf(label_bufs[i], sizeof(label_bufs[i]), "%s", s ? s : "");
+        }
         labels[i] = label_bufs[i];
+        lua_pop(L, 1);
+    }
+
+    int32_t height = 0;
+    if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
+        lua_getfield(L, 4, "height");
+        height = (int32_t) luaL_optinteger(L, -1, 0);
         lua_pop(L, 1);
     }
 
@@ -468,7 +584,7 @@ static int l_plugin_show_list(lua_State * L) {
     current_list_select_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     current_list_L = L;
 
-    gui_plugin_show_list(title, labels, n);
+    gui_plugin_show_list(title, labels, icon_paths, text_sizes, height, n);
     return 0;
 }
 
@@ -502,6 +618,11 @@ static int l_plugin_show_settings_list(lua_State * L) {
     static int slider_min[PLUGIN_SETTINGS_LIST_MAX_ROWS];
     static int slider_max[PLUGIN_SETTINGS_LIST_MAX_ROWS];
     static int slider_value[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static char icon_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][256];
+    static const char * icon_paths[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static int32_t heights[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static char text_size_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][8];
+    static const char * text_sizes[PLUGIN_SETTINGS_LIST_MAX_ROWS];
     int new_refs[PLUGIN_SETTINGS_LIST_MAX_ROWS];
 
     int count = 0;
@@ -563,6 +684,34 @@ static int l_plugin_show_settings_list(lua_State * L) {
             lua_pop(L, 1);
         }
 
+        icon_bufs[count][0] = '\0';
+        icon_paths[count] = NULL;
+        lua_getfield(L, -1, "icon");
+        const char * icon = lua_tostring(L, -1);
+        if (icon) {
+            snprintf(icon_bufs[count], sizeof(icon_bufs[count]), "%s", icon);
+            icon_paths[count] = icon_bufs[count];
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, -1, "height");
+        heights[count] = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        text_size_bufs[count][0] = '\0';
+        text_sizes[count] = NULL;
+        lua_getfield(L, -1, "text_size");
+        const char * text_size = lua_tostring(L, -1);
+        if (text_size) {
+            if (!is_valid_text_size(text_size)) {
+                return luaL_error(L, "plugin.show_settings_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", or \"large\")",
+                                   i + 1, text_size);
+            }
+            snprintf(text_size_bufs[count], sizeof(text_size_bufs[count]), "%s", text_size);
+            text_sizes[count] = text_size_bufs[count];
+        }
+        lua_pop(L, 1);
+
         labels[count] = label_bufs[count];
         row_types[count] = row_type;
         if (row_type == PLUGIN_SETTINGS_ROW_SLIDER) slider_count++;
@@ -572,7 +721,7 @@ static int l_plugin_show_settings_list(lua_State * L) {
     }
 
     int slot = gui_plugin_show_settings_list(title, row_types, labels, toggle_initial, slider_min, slider_max,
-                                              slider_value, count);
+                                              slider_value, icon_paths, heights, text_sizes, count);
     if (slot < 0 || slot >= PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE) return 0; /* defensive -- shouldn't happen */
 
     /* Release whatever the reused slot held from its previous population
@@ -1263,6 +1412,25 @@ static void dispatch_list_item_open(plugin_list_item_t * item, const char * kind
     }
 }
 
+/* Shared by every plugin_manager_get_*_list_item_options() below --
+ * translates a plugin_list_item_t's empty-string "unset" convention back to
+ * NULL, matching what screen_builders.c's pill_row_apply_icon()/
+ * pill_row_resolve_text_size() already expect. Out-of-range index leaves
+ * every out param at its "unset" value, same tolerance every other
+ * out-of-range accessor in this family already has. */
+static void get_list_item_options(const plugin_list_item_t * array, int count, int index, const char ** out_icon,
+                                   int32_t * out_height, const char ** out_text_size) {
+    *out_icon = NULL;
+    *out_height = 0;
+    *out_text_size = NULL;
+    if (index < 0 || index >= count) return;
+
+    const plugin_list_item_t * item = &array[index];
+    if (item->icon_path[0]) *out_icon = item->icon_path;
+    *out_height = item->row_height;
+    if (item->text_size[0]) *out_text_size = item->text_size;
+}
+
 int plugin_manager_get_books_list_item_count(void) {
     return plugin_books_list_item_count;
 }
@@ -1275,6 +1443,12 @@ const char * plugin_manager_get_books_list_item_label(int index) {
 void plugin_manager_books_list_item_clicked(int index) {
     if (index < 0 || index >= plugin_books_list_item_count) return;
     dispatch_list_item_open(&plugin_books_list_items[index], "books list item");
+}
+
+void plugin_manager_get_books_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                 const char ** out_text_size) {
+    get_list_item_options(plugin_books_list_items, plugin_books_list_item_count, index, out_icon, out_height,
+                           out_text_size);
 }
 
 int plugin_manager_get_settings_list_item_count(void) {
@@ -1291,6 +1465,12 @@ void plugin_manager_settings_list_item_clicked(int index) {
     dispatch_list_item_open(&plugin_settings_list_items[index], "settings list item");
 }
 
+void plugin_manager_get_settings_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                    const char ** out_text_size) {
+    get_list_item_options(plugin_settings_list_items, plugin_settings_list_item_count, index, out_icon, out_height,
+                           out_text_size);
+}
+
 int plugin_manager_get_display_list_item_count(void) {
     return plugin_display_list_item_count;
 }
@@ -1303,6 +1483,12 @@ const char * plugin_manager_get_display_list_item_label(int index) {
 void plugin_manager_display_list_item_clicked(int index) {
     if (index < 0 || index >= plugin_display_list_item_count) return;
     dispatch_list_item_open(&plugin_display_list_items[index], "display list item");
+}
+
+void plugin_manager_get_display_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                   const char ** out_text_size) {
+    get_list_item_options(plugin_display_list_items, plugin_display_list_item_count, index, out_icon, out_height,
+                           out_text_size);
 }
 
 int plugin_manager_get_playback_list_item_count(void) {
@@ -1319,6 +1505,12 @@ void plugin_manager_playback_list_item_clicked(int index) {
     dispatch_list_item_open(&plugin_playback_list_items[index], "playback list item");
 }
 
+void plugin_manager_get_playback_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                    const char ** out_text_size) {
+    get_list_item_options(plugin_playback_list_items, plugin_playback_list_item_count, index, out_icon, out_height,
+                           out_text_size);
+}
+
 int plugin_manager_get_power_list_item_count(void) {
     return plugin_power_list_item_count;
 }
@@ -1333,6 +1525,12 @@ void plugin_manager_power_list_item_clicked(int index) {
     dispatch_list_item_open(&plugin_power_list_items[index], "power list item");
 }
 
+void plugin_manager_get_power_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                 const char ** out_text_size) {
+    get_list_item_options(plugin_power_list_items, plugin_power_list_item_count, index, out_icon, out_height,
+                           out_text_size);
+}
+
 int plugin_manager_get_system_list_item_count(void) {
     return plugin_system_list_item_count;
 }
@@ -1345,6 +1543,12 @@ const char * plugin_manager_get_system_list_item_label(int index) {
 void plugin_manager_system_list_item_clicked(int index) {
     if (index < 0 || index >= plugin_system_list_item_count) return;
     dispatch_list_item_open(&plugin_system_list_items[index], "system list item");
+}
+
+void plugin_manager_get_system_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                  const char ** out_text_size) {
+    get_list_item_options(plugin_system_list_items, plugin_system_list_item_count, index, out_icon, out_height,
+                           out_text_size);
 }
 
 /* Shared by plugin_manager_stream_tile_clicked() below (the only remaining

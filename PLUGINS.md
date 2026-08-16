@@ -681,15 +681,20 @@ plugin's own header comment for where to get one and where to put the key.
 2. Copy your `.lua` file to `<SD card>/.plugins/` (create the folder if it
    doesn't exist yet) and (re)launch the app -- plugins are only scanned at
    startup, there's no hot-reload.
-3. Watch stderr for `[plugins] failed to load ...` (a load-time error --
-   syntax error, or an API call failing during your script's top-level
-   code) or `[plugins] books list item '...' on_open error: ...` /
-   `[plugins] settings list item '...' on_open error: ...` /
-   `[plugins] display list item '...' on_open error: ...` /
-   `[plugins] tile '...' on_open error: ...` / `[plugins] show_list
-   on_select error: ...` (a runtime error inside one of your callbacks).
-   Per [TESTING.md](TESTING.md)'s launch method, this shows up directly in
-   the foreground `adb shell` output.
+3. Watch stderr for `[plugins] failed to load <path>: <error>` (a load-time
+   error -- syntax error, or an API call failing during your script's
+   top-level code) or `[plugins] <context> error: <error>` (a runtime error
+   inside one of your own callbacks -- `<context>` names which one:
+   `<list_id> list item '<label>' on_open` for a `register_list_item()` row
+   (`books`/`settings`/`display`/`playback`/`power`/`system`), `tile
+   '<label>' on_open` for a `register_stream_media_tile()` tile, `show_list
+   on_select`, `show_settings_list on_select`/`on_change`, `<event>
+   handler` for a `plugin.on()` subscriber (`track_started`/`paused`/
+   `resumed`/`stopped`), `set_interval callback`, or `show_text_input
+   on_submit`). Per [TESTING.md](TESTING.md)'s launch method, this shows up
+   directly in the foreground `adb shell` output. None of these crash the
+   app or disable your plugin -- one bad callback just logs and moves on,
+   the same tolerance a load-time failure gets.
 4. Both `plugin.register_list_item()` and `plugin.register_stream_media_tile()`
    let every installed plugin have its own row/tile -- no "only the first
    one wins" limitation on either, so testing multiple plugins side by

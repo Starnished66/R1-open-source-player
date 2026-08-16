@@ -5,6 +5,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef HOST_BUILD
+  #define MUSIC_ROOT_DIR "./music"
+#else
+  /* SD card mount point -- each file that needs it defines its own copy
+   * rather than sharing a header, same convention gui.c/audio.c/
+   * plugin_manager.c already use. Needed here for pill_row_apply_icon()'s
+   * own relative-icon-path resolution -- see its own comment. */
+  #define MUSIC_ROOT_DIR "/data/mnt/sd_0"
+#endif
+
 lv_style_t list_row_style;
 lv_style_t list_row_pressed_style;
 
@@ -421,12 +431,33 @@ void pill_row_apply_icon(lv_obj_t * row, lv_obj_t * label, const char * icon_pat
                           lv_align_t align, int32_t x, int32_t y) {
     if (!icon_path) return;
 
+    /* Real-device bug report: a plugin's icon path "didn't load" -- root
+     * cause was PLUGINS.md's own documented "absolute path" requirement
+     * being non-obvious/easy to miss; the actual plugin passed a relative
+     * one ("./headphones.png"), which LVGL's POSIX fs driver (below) opens
+     * relative to the app's own process working directory, nowhere near
+     * the SD card. A relative path is also a completely reasonable thing
+     * for a plugin author to reach for ("a file sitting next to my own
+     * script"), so rather than only fixing the docs, resolve any icon_path
+     * that doesn't start with '/' against <sd_root>/.plugins/ -- the
+     * folder every plugin's own .lua file already lives in, matching that
+     * exact "next to my script" expectation. An already-absolute path
+     * (e.g. plugin.sd_root() .. "/..." or a real stock theme2 asset,
+     * plugins_examples/PlaybackExtras.lua's own reference usage) is passed
+     * through untouched, unaffected by this. */
+    char resolved[600];
+    if (icon_path[0] == '/') {
+        snprintf(resolved, sizeof(resolved), "%s", icon_path);
+    } else {
+        snprintf(resolved, sizeof(resolved), "%s/.plugins/%s", MUSIC_ROOT_DIR, icon_path);
+    }
+
     /* "S:" is LVGL's own POSIX-filesystem driver letter (lv_conf.h) --
      * unlike asset_path(), this doesn't prefix THEME_ROOT, so it opens
-     * icon_path verbatim as a real absolute path (e.g. a file on the SD
+     * resolved verbatim as a real absolute path (e.g. a file on the SD
      * card, not this app's own theme directory). */
     char src[600];
-    snprintf(src, sizeof(src), "S:%s", icon_path);
+    snprintf(src, sizeof(src), "S:%s", resolved);
 
     /* lv_image_set_scale() only changes what's DRAWN -- the widget's own
      * coordinate box stays at the source's native (unscaled) size, same

@@ -1134,7 +1134,13 @@ static void build_status_bar(void) {
      * this is meant to feel like the wired headphone jack, not a mode you
      * switch into). */
     usb_audio_status_icon = lv_image_create(volume_topbar_group);
-    lv_image_set_src(usb_audio_status_icon, asset_path("usb/usb.png"));
+    /* topbar/usb.png, NOT usb/usb.png -- real-device bug report: the latter
+     * is the big centered glyph the USB DAC mode overlay screen uses
+     * (build_usb_dac_overlay_screen(), further down), a different asset
+     * sized/styled for that full-screen context, not this small topbar
+     * status row (which every other icon here -- topbar/a2dp.png,
+     * topbar/play.png -- already correctly pulls from topbar/). */
+    lv_image_set_src(usb_audio_status_icon, asset_path("topbar/usb.png"));
     lv_image_set_scale(usb_audio_status_icon, LV_SCALE_NONE);
     lv_obj_add_flag(usb_audio_status_icon, LV_OBJ_FLAG_HIDDEN);
 
@@ -1561,6 +1567,26 @@ static void poll_refresh_bt_icon(void) {
     refresh_bt_icon_active = false;
     pthread_join(refresh_bt_icon_thread, NULL);
 
+    /* Real-device bug report: enabling Bluetooth from the quick drawer
+     * flipped the drawer icon on (quick_drawer_bt_event_cb()'s own
+     * optimistic flip), then back off, then back on again. Root cause:
+     * this poll runs independently, on its own periodic cadence, of the
+     * user's own tap-to-toggle -- if one lands mid-flight (turning
+     * Bluetooth on for real can take ~10-13s cold), refresh_bt_icon_result_
+     * powered still reflects the OLD, pre-toggle state, since bt_control_
+     * is_powered() genuinely hasn't changed yet. The populate_bt_screen()
+     * call further down was ALREADY guarded against exactly this race (see
+     * its own comment) after an earlier, identical bug report about the
+     * Bluetooth settings screen's own toggle row -- but that fix only
+     * covered the settings screen, not bt_is_powered_cached itself or the
+     * drawer icon below, which this same stale result was still freely
+     * overwriting. Skipping the whole result application while
+     * bt_toggle_active leaves the optimistic flip standing undisturbed
+     * everywhere, not just on the settings screen, until poll_bt_toggle()'s
+     * own follow-up start_refresh_bt_icon() call lands with the real,
+     * settled state once the in-flight toggle actually completes. */
+    if (bt_toggle_active) return;
+
     bool display_powered = refresh_bt_icon_result_powered;
     if (bt_boot_suppress_active()) display_powered = false; /* see bt_boot_suppress_active()'s own comment */
 
@@ -1575,19 +1601,13 @@ static void poll_refresh_bt_icon(void) {
         lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
         /* Bluetooth screen's own toggle row + everything gated on it reads
-         * bt_is_powered_cached too -- but only actually needs rebuilding
-         * while that screen is the one on screen, see the comment below on
-         * the other populate_bt_screen() call site for why. Also skipped
-         * while bt_toggle_active -- this poll runs independently of the
-         * user's own tap-to-toggle (quick_drawer_bt_event_cb's optimistic
-         * flip), and its bt_is_powered_cached is stale until THAT toggle
-         * lands; rebuilding from it mid-flight was confirmed live as the
-         * toggle row flipping on (the tap's own optimistic flip), then back
-         * off (this poll landing first, mid-flight, with the still-stale
-         * cached value), then back on once poll_bt_toggle() finally catches
-         * up -- skipping the rebuild here just leaves the optimistic flip
-         * standing undisturbed until that real completion. */
-        if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen && !bt_toggle_active) populate_bt_screen();
+         * bt_is_powered_cached too -- only actually needs rebuilding while
+         * that screen is the one on screen, see the comment below on the
+         * other populate_bt_screen() call site for why. (No bt_toggle_active
+         * check needed here anymore -- the whole function already returned
+         * early above while a toggle's in flight, see that comment for the
+         * real-device bug this used to only half-fix.) */
+        if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen) populate_bt_screen();
         return;
     }
     lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
@@ -1662,11 +1682,10 @@ static void poll_refresh_bt_icon(void) {
      * regardless (cheap, no LVGL calls) -- only the actual widget rebuild is
      * gated, and open_bluetooth_screen() already calls populate_bt_screen()
      * itself once on entry, so the screen is never stale when the user
-     * actually opens it. Also skipped while bt_toggle_active -- same
-     * mid-flight-stale-rebuild race as the other populate_bt_screen() call
-     * site above (this function's own !display_powered branch), just
-     * reachable from the display_powered == true side of the same poll. */
-    if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen && !bt_toggle_active) populate_bt_screen();
+     * actually opens it. (No bt_toggle_active check needed here either --
+     * same reasoning as the other populate_bt_screen() call site above,
+     * this function's own !display_powered branch.) */
+    if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen) populate_bt_screen();
 
     /* Real-device bug: pairing/connecting Bluetooth headphones worked (this
      * poll's own refresh_bt_icon_result_connected went true), but no audio
@@ -7537,6 +7556,59 @@ static void more_menu_list_cb(lv_event_t * e) {
     }
 }
 
+/* Every screen's back button is a fixed 64x64 at the screen's own left
+ * edge (build_group_songs_screen() below, build_subsonic_list_screen()) --
+ * this is where a title label should start, not centered over top of it. */
+#define TITLE_LABEL_LEFT_INSET 76 /* 64px back button + 12px breathing room */
+/* Default right margin for a title with no right-side icon of its own on
+ * that particular screen -- most build_subsonic_list_screen() callers
+ * (Playlists, Saved Servers, New Connection, Queue, DLNA, Remote Control,
+ * the plugin list pool, ...) never get anywhere near this wide anyway
+ * (always a short fixed string), so this is mostly headroom for the ones
+ * that do have a long dynamic title but no button beside it (the local
+ * library's Artist -> Albums drill-down, artist_albums_screen). */
+#define TITLE_LABEL_DEFAULT_RIGHT_MARGIN 20
+
+/* Narrows an already left-aligned, auto-scrolling title label (see
+ * build_subsonic_list_screen()'s and build_group_songs_screen()'s own
+ * construction) so its right edge stops before `right_icon`'s own left
+ * edge, instead of running underneath it -- call once, right after
+ * right_icon's own final on-screen position is set (real coordinates, not
+ * a pending layout -- lv_label/lv_image both size/position synchronously
+ * on lv_obj_align(), no intervening refresh pass needed). Safe to call
+ * even while right_icon is currently hidden (e.g. a Download button only
+ * shown for some views of a reused screen) -- a hidden object still has a
+ * real position, and reserving room for it whether or not it's showing
+ * right now is simpler and safer than tracking two different widths.
+ *
+ * Uses lv_obj_get_coords(), NOT lv_obj_get_x() -- real-device bug report:
+ * lv_obj_get_x() reflects the coordinate as set relative to whichever
+ * alignment reference the object was last lv_obj_align()'d against (e.g. a
+ * TOP_RIGHT-aligned button's "x" isn't a left-relative position at all), so
+ * comparing it against title's own TOP_LEFT-relative x produced nonsense.
+ * lv_obj_get_coords() always returns real absolute screen coordinates
+ * regardless of how the object was positioned, so title_area.x1/icon_area.x1
+ * are directly comparable -- BUT only once a layout pass has actually run:
+ * lv_obj_align() (lv_obj_pos.c) just sets style properties (align + offset)
+ * for the layout engine to resolve LATER, it does not compute real
+ * coordinates on the spot. Without lv_obj_update_layout() first,
+ * lv_obj_get_coords() here was reading stale/uncommitted (0,0) coordinates
+ * from before either object was ever positioned -- second real-device bug
+ * report, same "only a couple characters visible" symptom as the
+ * lv_obj_get_x() bug this replaced, different root cause. Forcing the
+ * layout pass on the screen (both objects' common parent) resolves both at
+ * once. */
+static void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon) {
+    lv_obj_update_layout(lv_obj_get_parent(title));
+
+    lv_area_t title_area, icon_area;
+    lv_obj_get_coords(title, &title_area);
+    lv_obj_get_coords(right_icon, &icon_area);
+    int32_t width = icon_area.x1 - title_area.x1 - 12;
+    if (width < 40) width = 40; /* never collapse to nothing/negative on a pathological layout */
+    lv_obj_set_width(title, width);
+}
+
 static void group_songs_edit_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     group_songs_edit_mode = !group_songs_edit_mode;
@@ -7577,9 +7649,21 @@ static lv_obj_t * build_group_songs_screen(void) {
 
     group_songs_title_label = lv_label_create(scr);
     lv_label_set_text(group_songs_title_label, "");
-    lv_obj_align(group_songs_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(group_songs_title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(group_songs_title_label, &app_font_28, 0); /* shows a metadata-derived artist/album/genre name -- see fallback_font.h */
+    /* Real-device bug report: a long artist/album/genre/playlist name
+     * (this label's whole reason for existing, per the comment above)
+     * centered via LV_ALIGN_TOP_MID ran directly under the back button on
+     * the left and the Edit button on the right. Left-aligned starting
+     * just past the back button, narrowed below (once group_songs_edit_btn
+     * itself exists) to stop before it, with auto-scroll for whatever
+     * still overflows -- same fix as build_subsonic_list_screen()'s own
+     * title. */
+    int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
+    lv_obj_set_width(group_songs_title_label, scr_w - TITLE_LABEL_LEFT_INSET - TITLE_LABEL_DEFAULT_RIGHT_MARGIN);
+    lv_label_set_long_mode(group_songs_title_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_align(group_songs_title_label, LV_ALIGN_TOP_LEFT, TITLE_LABEL_LEFT_INSET,
+                 STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
 
     /* Hidden by default -- populate_group_songs_rows() (via
      * show_group_songs_editable()) is what actually shows this, and only
@@ -7592,6 +7676,10 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(group_songs_edit_btn, group_songs_edit_btn_cb, LV_EVENT_CLICKED, NULL);
+    /* Reserved whether or not Edit is currently visible -- see
+     * reserve_title_width_before()'s own comment on why that's safe/
+     * simpler than tracking two different widths. */
+    reserve_title_width_before(group_songs_title_label, group_songs_edit_btn);
 
     group_songs_list = lv_obj_create(scr);
     lv_obj_set_size(group_songs_list, lv_pct(100),
@@ -8837,9 +8925,22 @@ static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_
 
     lv_obj_t * title_label = lv_label_create(scr);
     lv_label_set_text(title_label, default_title);
-    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title_label, &app_font_28, 0); /* later re-set to a real (possibly non-Latin) server artist/album/song name -- see fallback_font.h */
+    /* Real-device bug report: a long artist/album/playlist name (this
+     * label's whole reason for existing, per the comment above) centered
+     * via LV_ALIGN_TOP_MID ran directly under the back button on the left
+     * and, on a screen that also has a search/download button on the
+     * right (see reserve_title_width_before()'s own callers below), under
+     * that too. Left-aligned starting just past the back button, with a
+     * generous default width (narrowed later, per-screen, by
+     * reserve_title_width_before() once that screen's own right-side
+     * button actually exists) and auto-scroll for whatever still overflows
+     * -- same fix as group_songs_screen's own title (build_group_songs_screen()). */
+    int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
+    lv_obj_set_width(title_label, scr_w - TITLE_LABEL_LEFT_INSET - TITLE_LABEL_DEFAULT_RIGHT_MARGIN);
+    lv_label_set_long_mode(title_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_align(title_label, LV_ALIGN_TOP_LEFT, TITLE_LABEL_LEFT_INSET, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
 
     lv_obj_t * list = lv_obj_create(scr);
     lv_obj_set_size(list, lv_pct(100),
@@ -16922,6 +17023,10 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(subsonic_albums_download_btn, subsonic_download_artist_btn_cb, LV_EVENT_CLICKED, NULL);
+    /* subsonic_albums_download_btn (see its own comment above) is already
+     * the leftmost of the two right-side buttons this screen can show, so
+     * reserving up to it also clears the search icon further right. */
+    reserve_title_width_before(subsonic_albums_title_label, subsonic_albums_download_btn);
 
     subsonic_songs_download_btn = lv_label_create(subsonic_songs_screen);
     lv_label_set_text(subsonic_songs_download_btn, "Download");
@@ -16931,6 +17036,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(subsonic_songs_download_btn, subsonic_download_songs_btn_cb, LV_EVENT_CLICKED, NULL);
+    reserve_title_width_before(subsonic_songs_title_label, subsonic_songs_download_btn);
 
     /* Same live search as Artists/Albums/Album Artist/All Songs (see the
      * search_binding_t infra above), extended to Subsonic's own Artists and

@@ -295,15 +295,19 @@ silently dropped.
 entries, and `show_settings_list()`'s per-row tables all accept the same
 three optional fields:
 
-- **`icon`** (string) -- a **raw absolute filesystem path**, e.g.
+- **`icon`** (string) -- either a **raw absolute filesystem path**, e.g.
   `plugin.sd_root() .. "/.plugins/my_icon.png"` -- **not** a theme2-relative
   path like `register_stream_media_tile()`'s `icon` argument or
-  `set_icon()`'s first argument use. Any file your plugin can read works,
-  including a file it downloaded itself at runtime. Drawn to the left of
-  the row's label, scaled to a consistent on-screen size regardless of the
-  source file's own resolution. A missing or corrupt file just renders at
-  its native size rather than erroring -- an icon is cosmetic, not worth
-  failing the whole row over.
+  `set_icon()`'s first argument use -- **or** a plain relative filename/path
+  (doesn't start with `/`), e.g. `"my_icon.png"`, resolved against
+  `<SD card>/.plugins/` -- the same folder your plugin's own `.lua` file
+  already lives in, so a relative path just means "a file sitting next to
+  my script." Any file your plugin can read works, including a file it
+  downloaded itself at runtime. Drawn to the left of the row's label,
+  scaled to a consistent on-screen size regardless of the source file's own
+  resolution. A missing or corrupt file just renders at its native size
+  rather than erroring -- an icon is cosmetic, not worth failing the whole
+  row over.
 - **`height`** (number, px) -- resizes the row. Clamped to a fixed range
   (currently 100-220px) rather than erroring if you ask for more or less.
   Not available on a `show_settings_list()` `"slider"` row (see that

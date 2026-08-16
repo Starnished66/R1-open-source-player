@@ -95,4 +95,20 @@ void audio_output_set_usb_requested(bool requested, const char * alsa_device);
  * lazy, process-lifetime tinyalsa mixer handle on first use. */
 void audio_output_set_hw_volume_raw(int raw_left, int raw_right);
 
+/* True only while audio_output_ensure() actually has a USB audio device
+ * open (not local, not Bluetooth) -- audio.c's audio_set_volume() uses
+ * this to fall back to real digital PCM gain for USB specifically, since
+ * audio_output_set_hw_volume_raw() above is a no-op for it (USB PCM is
+ * piped to a separate `aplay -D plughw:<card>,0` process, never touches
+ * this device's own card-0 mixer -- see audio_output.c's own architecture
+ * comment). Deliberately NOT also true for Bluetooth: BT volume is already
+ * handled by a completely separate, working mechanism (AVRCP absolute
+ * volume pushed to the connected accessory, bluetooth_control.c's
+ * bt_source_vol_sync_thread_func()) that has nothing to do with this app's
+ * own PCM gain -- applying digital gain there too was tried and reverted
+ * after a real-device bug report of double-attenuated (too quiet)
+ * Bluetooth audio. Reflects active_target, not requested_target -- what's
+ * actually open right now, not merely asked for. */
+bool audio_output_is_usb_active(void);
+
 #endif /* AUDIO_OUTPUT_H */

@@ -276,3 +276,7 @@ void audio_output_set_hw_volume_raw(int raw_left, int raw_right) {
     if (left) mixer_ctl_set_value(left, 0, raw_left);
     if (right) mixer_ctl_set_value(right, 0, raw_right);
 }
+
+bool audio_output_is_usb_active(void) {
+    return active_target == OUTPUT_TARGET_USB;
+}

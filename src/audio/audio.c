@@ -1138,6 +1138,22 @@ static int volume_db_to_hw_raw(double db) {
  * "boosted" max, and adding digital gain on top of it only brought back
  * the same digital-attenuation-shaped noise this whole redesign exists to
  * avoid, for no worthwhile loudness gain. */
+/* Real-device bug report: volume did nothing with a USB headphone/DAC
+ * connected. Hardware attenuation (audio_output_set_hw_volume_raw() below)
+ * only ever reaches this device's own internal codec -- USB output instead
+ * pipes raw PCM to a separate `aplay -D plughw:<card>,0` process/ALSA card
+ * that never touches that mixer (see audio_output_is_usb_active()'s own
+ * comment in audio_output.h). The hardware write and unity-gain pin below
+ * still run unconditionally first, exactly as before (a harmless no-op for
+ * USB, and for Bluetooth too, and still correct for local output) -- only
+ * for USB specifically is volume_gain then overwritten with a real digital
+ * taper afterward. Deliberately NOT applied for Bluetooth: an earlier
+ * attempt applied this same digital fallback whenever output wasn't local
+ * (Bluetooth included) and was reverted after a real-device report of
+ * double-attenuated (too quiet) Bluetooth audio -- Bluetooth volume is
+ * already handled by a completely separate, working AVRCP-based mechanism
+ * (bluetooth_control.c's bt_source_vol_sync_thread_func()) that has
+ * nothing to do with this app's own PCM gain, so it must be left alone. */
 void audio_set_volume(float new_volume) {
     if (new_volume < 0.0f) new_volume = 0.0f;
     if (new_volume > 1.0f) new_volume = 1.0f;
@@ -1147,6 +1163,9 @@ void audio_set_volume(float new_volume) {
 #ifndef HOST_BUILD
     int raw = (new_volume <= 0.0f) ? HW_VOLUME_MAX_RAW : volume_db_to_hw_raw(plain_taper_db((double) new_volume));
     audio_output_set_hw_volume_raw(raw, raw);
+    if (audio_output_is_usb_active()) {
+        volume_gain = (new_volume <= 0.0f) ? 0.0f : (float) pow(10.0, plain_taper_db((double) new_volume) / 20.0);
+    }
 #endif
     pthread_mutex_unlock(&audio_mutex);
 }

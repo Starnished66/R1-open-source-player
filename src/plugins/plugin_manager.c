@@ -1216,6 +1216,72 @@ static int l_plugin_get_now_playing(lua_State * L) {
     return 4;
 }
 
+/* plugin.get_play_mode() -> "sequential" | "repeat_all" | "repeat_one" |
+ * "shuffle" -- thin wrap of gui_plugin_get_play_mode(), same "no gui-state
+ * code in this file" boundary as is_playing()/get_position() above. */
+static int l_plugin_get_play_mode(lua_State * L) {
+    lua_pushstring(L, gui_plugin_get_play_mode());
+    return 1;
+}
+
+/* plugin.get_current_track_path() -> path | nil, if nothing is loaded. */
+static int l_plugin_get_current_track_path(lua_State * L) {
+    const char * path = gui_plugin_get_current_track_path();
+    if (!path) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushstring(L, path);
+    return 1;
+}
+
+/* Shared tail for get_artist_albums()/get_album_tracks()/
+ * get_next_album_tracks() below -- pushes a malloc'd gui_plugin_* string
+ * array as a 1-indexed Lua table (or nil if it came back empty/NULL) and
+ * frees the C array, since nothing on the Lua side needs it once copied in. */
+static int push_string_array_result(lua_State * L, char ** items, int count) {
+    if (!items || count <= 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_newtable(L);
+    for (int i = 0; i < count; i++) {
+        lua_pushstring(L, items[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    gui_plugin_free_string_array(items, count);
+    return 1;
+}
+
+/* plugin.get_artist_albums(artist) -> { album_name, ... } | nil */
+static int l_plugin_get_artist_albums(lua_State * L) {
+    const char * artist = luaL_checkstring(L, 1);
+    int count = 0;
+    char ** albums = gui_plugin_get_artist_albums(artist, &count);
+    return push_string_array_result(L, albums, count);
+}
+
+/* plugin.get_album_tracks(artist, album) -> { track_path, ... } | nil */
+static int l_plugin_get_album_tracks(lua_State * L) {
+    const char * artist = luaL_checkstring(L, 1);
+    const char * album = luaL_checkstring(L, 2);
+    int count = 0;
+    char ** tracks = gui_plugin_get_album_tracks(artist, album, &count);
+    return push_string_array_result(L, tracks, count);
+}
+
+/* plugin.get_next_album_tracks(artist, current_album) -> { track_path, ... }
+ * | nil -- nil both when current_album isn't found and when it's the
+ * artist's last album (see gui_plugin_get_next_album_tracks()'s own
+ * comment: no wraparound). */
+static int l_plugin_get_next_album_tracks(lua_State * L) {
+    const char * artist = luaL_checkstring(L, 1);
+    const char * current_album = luaL_checkstring(L, 2);
+    int count = 0;
+    char ** tracks = gui_plugin_get_next_album_tracks(artist, current_album, &count);
+    return push_string_array_result(L, tracks, count);
+}
+
 /* ---- plugin.on(event, callback) -- see plugin_manager.h's own
  * PLUGIN_MAX_EVENT_SUBSCRIBERS comment for the design rationale (multiple
  * plugins can subscribe to the same event, unlike register_list_item()'s
@@ -1352,6 +1418,11 @@ static const luaL_Reg plugin_funcs[] = {
     { "md5",                       l_plugin_md5 },
     { "show_text_input",           l_plugin_show_text_input },
     { "get_now_playing",           l_plugin_get_now_playing },
+    { "get_play_mode",             l_plugin_get_play_mode },
+    { "get_current_track_path",    l_plugin_get_current_track_path },
+    { "get_artist_albums",         l_plugin_get_artist_albums },
+    { "get_album_tracks",          l_plugin_get_album_tracks },
+    { "get_next_album_tracks",     l_plugin_get_next_album_tracks },
     { "on",                        l_plugin_on },
     { "set_interval",              l_plugin_set_interval },
     { "clear_interval",            l_plugin_clear_interval },

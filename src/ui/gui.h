@@ -125,6 +125,33 @@ bool gui_plugin_is_paused(void);
 double gui_plugin_get_position_seconds(void);
 double gui_plugin_get_duration_seconds(void);
 
+/* "sequential"/"repeat_all"/"repeat_one"/"shuffle" -- string form of
+ * current_settings.play_mode (see gui.c's own play_mode_t), matching the
+ * order/loop/single/random icon the player screen cycles through. */
+const char * gui_plugin_get_play_mode(void);
+
+/* Absolute path of the track at playlist_index, or NULL if nothing is
+ * loaded (no active playlist yet, or playback stopped and cleared it). */
+const char * gui_plugin_get_current_track_path(void);
+
+/* ---- Library lookups for plugin.get_artist_albums()/get_album_tracks()/
+ * get_next_album_tracks() -- all three match artist (and, for the latter
+ * two, album) by case-insensitive name against gui.c's own whole-library
+ * all_song_tags/artist_groups, the same matching build_groups_by()/
+ * show_artist_albums() already use for the on-device Artists/Albums
+ * screens. Each returns a malloc'd array of malloc'd strings the caller
+ * must free with gui_plugin_free_string_array() -- NULL/0 if the artist (or
+ * album) isn't found. get_album_tracks()/get_next_album_tracks() return
+ * paths in the same order show_group_songs() would display them
+ * (path-sorted); get_artist_albums() returns album names in the same
+ * alphabetical order show_artist_albums()'s own drill-down screen uses.
+ * get_next_album_tracks() returns NULL/0 (not a wraparound to the first
+ * album) once current_album is the artist's last one. ---- */
+char ** gui_plugin_get_artist_albums(const char * artist, int * out_count);
+char ** gui_plugin_get_album_tracks(const char * artist, const char * album, int * out_count);
+char ** gui_plugin_get_next_album_tracks(const char * artist, const char * current_album, int * out_count);
+void gui_plugin_free_string_array(char ** array, int count);
+
 /* ---- Bridges for plugin.get_now_playing()/set_interval()/clear_interval()/
  * show_text_input() -- see plugin_manager.h's own comments on the Lua-facing
  * shape of each. ---- */

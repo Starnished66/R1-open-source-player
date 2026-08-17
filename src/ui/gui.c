@@ -1224,7 +1224,7 @@ static void build_status_bar(void) {
      * fixed band offset, since the group's own width varies with the
      * digit count (1-3) -- LAST, after every child exists, same reasoning
      * as volume_topbar_group's align() below. */
-    lv_obj_align_to(battery_topbar_group, battery_icon_frame, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+    lv_obj_align_to(battery_topbar_group, battery_icon_frame, LV_ALIGN_OUT_LEFT_MID, -5, 0);
 
     wifi_icon = lv_image_create(band);
     lv_image_set_src(wifi_icon, asset_path("topbar/wifi_unconnect.png"));
@@ -1251,15 +1251,39 @@ static void refresh_play_pause_topbar(void) {
     }
 }
 
+/* Defined further down (near wifi_icon/bt_status_icon's own setup) --
+ * forward-declared here so refresh_battery_topbar() below can re-run it
+ * whenever battery_topbar_group's own visibility might have changed
+ * (unknown percent, or Settings > Power > "Battery Percentage" toggling),
+ * since that group is one of the two anchors that logic positions the
+ * wifi/bt topbar icons against. */
+static void sync_topbar_status_icon_positions(void);
+
 static void refresh_battery_topbar(void) {
     int percent = battery_get_percent();
+
+    /* battery_icon_frame (the outline + fill gauge) is always shown --
+     * current_settings.show_battery_percent (Settings > Power > "Battery
+     * Percentage") only ever hides the "NN%" digit readout below, never the
+     * icon itself. Edge-triggered (compares against the group's own current
+     * hidden-flag rather than setting it unconditionally every call) since
+     * this whole function runs every tick the screen is on -- re-syncing
+     * the wifi/bt icon positions that often, on every tick, for a flag that
+     * only ever changes on a battery-unplugged/replugged edge or a Settings
+     * toggle, would be pure churn. */
+    bool percent_should_show = percent >= 0 && current_settings.show_battery_percent;
+    bool percent_was_shown = !lv_obj_has_flag(battery_topbar_group, LV_OBJ_FLAG_HIDDEN);
+    if (percent_should_show != percent_was_shown) {
+        if (percent_should_show) lv_obj_remove_flag(battery_topbar_group, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(battery_topbar_group, LV_OBJ_FLAG_HIDDEN);
+        sync_topbar_status_icon_positions();
+    }
+
     if (percent < 0) {
-        lv_obj_add_flag(battery_topbar_group, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(battery_icon_fill_clip, LV_OBJ_FLAG_HIDDEN);
         lv_image_set_src(battery_icon_frame, asset_path("topbar/battery_bg.png"));
         return;
     }
-    lv_obj_remove_flag(battery_topbar_group, LV_OBJ_FLAG_HIDDEN);
     if (percent > 100) percent = 100;
 
     bool charging = battery_is_charging();
@@ -1355,6 +1379,83 @@ static void refresh_headphone_icon(void) {
 #define WIFI_POLL_TICKS 10
 static int wifi_poll_tick_counter = 0;
 
+/* Real-device bug report: wifi_icon and bt_status_icon originally each sat
+ * at their own hand-tuned fixed offset from battery_icon_frame -- fine when
+ * both or neither were showing, but with only one of the two radios on, the
+ * other's now-hidden slot was left as a dead gap between the visible icon
+ * and the battery percentage instead of the visible one sliding over to sit
+ * right next to it. Fix: track which of the two is CURRENTLY closer to the
+ * battery (order[0], the inner slot) vs. one slot further out (order[1]),
+ * and re-derive it from scratch on every call rather than mutating an
+ * existing arrangement in place -- simpler and can't drift out of sync with
+ * the two icons' own hidden-flag state, the actual source of truth, which
+ * is all this ever reads. Whichever of the two is currently visible AND was
+ * already occupying a slot keeps it; a newly-visible icon takes whichever
+ * slot (if any) is still free. This is what gives "closer to the battery"
+ * its "whichever appeared first" ordering from the bug report: the icon
+ * that was already on when the second one turns on keeps the inner slot
+ * instead of being displaced, and the moment either disappears the survivor
+ * (if any) is pulled into the inner slot so there's never a gap. The two
+ * slots are positioned relative to battery_topbar_group/battery_icon_frame
+ * (not a fixed offset), further down -- see that comment for how Settings >
+ * Power > "Battery Percentage" folds into the same anchor logic. */
+typedef enum {
+    TOPBAR_STATUS_ICON_NONE = 0,
+    TOPBAR_STATUS_ICON_WIFI,
+    TOPBAR_STATUS_ICON_BT,
+} topbar_status_icon_t;
+
+static topbar_status_icon_t topbar_status_icon_order[2] = { TOPBAR_STATUS_ICON_NONE, TOPBAR_STATUS_ICON_NONE };
+
+static void sync_topbar_status_icon_positions(void) {
+    bool wifi_visible = !lv_obj_has_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
+    bool bt_visible = !lv_obj_has_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
+
+    topbar_status_icon_t new_order[2] = { TOPBAR_STATUS_ICON_NONE, TOPBAR_STATUS_ICON_NONE };
+    int slot = 0;
+    /* Existing occupants first, in their current order, so an icon that's
+     * still visible never moves slots just because the other one's
+     * visibility also happened to change on this same call. */
+    for (int i = 0; i < 2 && slot < 2; i++) {
+        topbar_status_icon_t icon = topbar_status_icon_order[i];
+        if ((icon == TOPBAR_STATUS_ICON_WIFI && wifi_visible) || (icon == TOPBAR_STATUS_ICON_BT && bt_visible)) {
+            new_order[slot++] = icon;
+        }
+    }
+    /* Then any newly-visible icon not already placed above, oldest-checked
+     * (wifi) first -- only matters when both go from hidden to visible on
+     * the exact same call, an arbitrary but stable tiebreak. */
+    if (wifi_visible && new_order[0] != TOPBAR_STATUS_ICON_WIFI && new_order[1] != TOPBAR_STATUS_ICON_WIFI && slot < 2) {
+        new_order[slot++] = TOPBAR_STATUS_ICON_WIFI;
+    }
+    if (bt_visible && new_order[0] != TOPBAR_STATUS_ICON_BT && new_order[1] != TOPBAR_STATUS_ICON_BT && slot < 2) {
+        new_order[slot++] = TOPBAR_STATUS_ICON_BT;
+    }
+    topbar_status_icon_order[0] = new_order[0];
+    topbar_status_icon_order[1] = new_order[1];
+
+    /* Chained anchoring, not fixed offsets -- Settings > Power > "Battery
+     * Percentage" (current_settings.show_battery_percent) lets the "NN%"
+     * readout be turned off entirely (battery_topbar_group hidden by
+     * refresh_battery_topbar() in that case, battery_icon_frame itself
+     * always stays visible -- see its own comment). When the percentage is
+     * showing, the inner slot sits left of battery_topbar_group, same gap
+     * that group's own anchor to battery_icon_frame already uses; when it's
+     * off, the inner slot moves in to sit left of battery_icon_frame
+     * directly, closing the gap the percentage would otherwise have left. */
+    lv_obj_t * anchor = (current_settings.show_battery_percent && !lv_obj_has_flag(battery_topbar_group, LV_OBJ_FLAG_HIDDEN))
+                             ? battery_topbar_group
+                             : battery_icon_frame;
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t * widget = topbar_status_icon_order[i] == TOPBAR_STATUS_ICON_WIFI  ? wifi_icon
+                            : topbar_status_icon_order[i] == TOPBAR_STATUS_ICON_BT ? bt_status_icon
+                                                                                    : NULL;
+        if (!widget) continue;
+        lv_obj_align_to(widget, anchor, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+        anchor = widget;
+    }
+}
+
 /* The drawer's own wifi icon just reflects radio-on/off (blue as soon as
  * enabled, real-device feedback: the connected-vs-just-enabled distinction
  * is a top-bar-only thing) -- the top bar icon keeps the finer-grained
@@ -1367,9 +1468,11 @@ static void refresh_wifi_icon(void) {
 
     if (!enabled) {
         lv_obj_add_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
+        sync_topbar_status_icon_positions();
         return;
     }
     lv_obj_remove_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
+    sync_topbar_status_icon_positions();
 
     int level;
     if (wifi_get_status(&level)) {
@@ -1600,6 +1703,7 @@ static void poll_refresh_bt_icon(void) {
     if (!display_powered) {
         lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+        sync_topbar_status_icon_positions();
         /* Bluetooth screen's own toggle row + everything gated on it reads
          * bt_is_powered_cached too -- only actually needs rebuilding while
          * that screen is the one on screen, see the comment below on the
@@ -1611,6 +1715,7 @@ static void poll_refresh_bt_icon(void) {
         return;
     }
     lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
+    sync_topbar_status_icon_positions();
     lv_image_set_src(bt_status_icon, asset_path(refresh_bt_icon_result_connected ? "topbar/bluetooth.png" : "topbar/bluetooth_unconnect.png"));
     if (refresh_bt_icon_result_a2dp_connected) {
         lv_obj_remove_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
@@ -2797,6 +2902,24 @@ static void quick_drawer_wifi_event_cb(lv_event_t * e) {
     bool wifi_will_be_enabled = !wifi_control_is_enabled();
     lv_image_set_src(quick_drawer_wifi_icon, asset_path(wifi_will_be_enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
 
+    /* Real-device bug report: the topbar Wi-Fi icon stayed frozen (hidden,
+     * or showing whatever signal-strength sprite it had before toggling
+     * off) until poll_wifi_toggle()'s own refresh_wifi_icon() call landed --
+     * same delay-to-first-feedback bug already fixed for Bluetooth's own
+     * topbar icon in quick_drawer_bt_event_cb(), same fix here: flip it
+     * optimistically alongside the drawer icon just above. ON shows the
+     * disconnected sprite (a fresh toggle-on can't be associated to an AP
+     * yet); OFF hides it outright. refresh_wifi_icon() overwrites this with
+     * the real, settled state (association status included) once
+     * wifi_control_enable()/disable() actually finishes. */
+    if (wifi_will_be_enabled) {
+        lv_obj_remove_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(wifi_icon, asset_path("topbar/wifi_unconnect.png"));
+    } else {
+        lv_obj_add_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+    sync_topbar_status_icon_positions();
+
     /* Optimistically rebuild the whole Wi-Fi settings screen too (not just
      * the toggle row) when that's the screen showing -- real-device
      * feedback: flipping just the row's own sprite left the Wi-Fi Info/
@@ -2993,6 +3116,29 @@ static void quick_drawer_bt_event_cb(lv_event_t * e) {
      * sitting frozen until poll_bt_toggle() confirms the real state once
      * the thread lands. */
     lv_image_set_src(quick_drawer_bt_icon, asset_path(bt_will_be_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
+
+    /* Real-device bug report: the topbar Bluetooth icon stayed frozen on
+     * whatever it showed pre-toggle (e.g. still the "connected" sprite
+     * after manually turning Bluetooth off) until poll_bt_toggle()'s own
+     * follow-up start_refresh_bt_icon() subprocess round trip finally
+     * landed -- a real, user-visible delay, not just the ~10-13s cold-boot
+     * chip-init case: even turning OFF (bt_control_disable() is D-Bus-only,
+     * no chip op, so the toggle thread itself finishes fast) still waited
+     * on that separate re-check. Flip it here too, same as the drawer icon
+     * just above: OFF hides it outright (nothing to be connected to), ON
+     * shows the disconnected sprite since a fresh toggle-on can't have an
+     * active connection yet -- poll_refresh_bt_icon() overwrites both with
+     * the real, settled state once its own check lands (it already skips
+     * doing so while bt_toggle_active, see its own comment). */
+    if (bt_will_be_powered) {
+        lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(bt_status_icon, asset_path("topbar/bluetooth_unconnect.png"));
+        lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+    sync_topbar_status_icon_positions();
 
     /* Optimistically rebuild the whole Bluetooth settings screen too (not
      * just the toggle row) when that's the screen showing -- same
@@ -4490,6 +4636,18 @@ static void charge_limiter_switch_event_cb(lv_event_t * e) {
     settings_save(&current_settings);
 }
 
+/* refresh_battery_topbar() (defined earlier in this file, topbar setup near
+ * gui_init()'s own layout code) already re-syncs the wifi/bt icon positions
+ * itself whenever battery_topbar_group's hidden flag actually changes --
+ * called here so toggling this switch is reflected immediately, without
+ * waiting for the next battery poll tick. */
+static void battery_percent_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.show_battery_percent = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+    refresh_battery_topbar();
+}
+
 /* Log-scale mapping so the slider gives fine control at low frequencies
  * (where the ear is more sensitive to small Hz changes) instead of wasting
  * most of the slider's travel on the top octave. */
@@ -4794,6 +4952,12 @@ static uint32_t screen_off_since_tick = 0;
 static bool radios_suspended = false;
 static bool wifi_was_on_before_suspend = false;
 static bool bt_was_on_before_suspend = false;
+
+/* Tracks whether audio was playing as of the last tick the screen was off,
+ * so the radio-suspend/idle-shutdown clocks (both anchored on
+ * screen_off_since_tick) can be restarted when playback actually stops --
+ * see the reset logic where this is used, just below. */
+static bool screen_off_playback_active = false;
 
 /* Idle shutdown: a full poweroff (see idle_shutdown.h) after
  * current_settings.idle_shutdown_minutes with the screen off and nothing
@@ -5266,12 +5430,27 @@ static void update_timer_cb(lv_timer_t * timer) {
             radios_suspended = false;
         }
     } else if (!screen_on_now) {
+        bool playing_now_for_idle = audio_is_playing();
         if (screen_was_on) {
             /* Just went to sleep this tick -- the 10-minute countdown starts
              * from here, not from whenever the inactivity that caused it
              * began. */
             screen_off_since_tick = lv_tick_get();
+        } else if (screen_off_playback_active && !playing_now_for_idle) {
+            /* Real-device bug report: playback that continued past the
+             * screen going dark (e.g. a long album) reaching the end of the
+             * queue could suspend/poweroff the device on the very next tick
+             * instead of waiting a full RADIO_SUSPEND_DELAY_MS/
+             * idle_shutdown_minutes window -- because both clocks below are
+             * measured from screen_off_since_tick (when the SCREEN went
+             * off), which had already elapsed past the threshold while
+             * audio_is_playing() was gating them off. Restart the clock the
+             * moment playback actually stops, so the device only sleeps
+             * after being genuinely idle (screen off AND silent) for the
+             * configured duration, not merely screen-off. */
+            screen_off_since_tick = lv_tick_get();
         }
+        screen_off_playback_active = playing_now_for_idle;
         /* bt_is_powered_cached, not bt_control_is_powered(), deliberately --
          * the latter forks a process, and this condition is checked every
          * tick while the screen is off, not throttled like refresh_bt_icon()
@@ -6797,6 +6976,125 @@ static void build_groups_by(const char * (*key_of)(int), int (*cmp)(const void *
 static void free_group_array(group_t * groups, int count) {
     for (int i = 0; i < count; i++) free(groups[i].indices);
     free(groups);
+}
+
+/* Finds an artist_groups[] entry by case-insensitive name -- same matching
+ * artist_row_click_cb()'s own indexing into artist_groups uses, just by name
+ * instead of by row index since a plugin only has the artist's display
+ * name to go on. NULL if no such artist. */
+static const group_t * find_artist_group_by_name(const char * artist) {
+    for (int i = 0; i < artist_group_count; i++) {
+        if (strcasecmp(artist_groups[i].name, artist) == 0) return &artist_groups[i];
+    }
+    return NULL;
+}
+
+/* Shared by gui_plugin_get_album_tracks()/gui_plugin_get_next_album_tracks()
+ * below -- regroups one artist's songs by album (same call
+ * show_artist_albums() itself makes, kept local rather than reusing that
+ * function's own artist_albums_groups/artist_albums_screen globals so a
+ * plugin call can't disturb whatever the Artists screen currently has drilled
+ * into). Caller frees with free_group_array(). */
+static void build_artist_album_groups(const group_t * artist_group, group_t ** out_groups, int * out_count) {
+    build_groups_by_indices(artist_group->indices, artist_group->count, album_key_of, compare_index_by_album,
+                             out_groups, out_count);
+}
+
+/* Turns one group_t's member songs into a malloc'd array of malloc'd path
+ * strings, in the group's own index order (already path-sorted -- see
+ * build_groups_by_indices()'s own comment) -- the common tail of
+ * gui_plugin_get_album_tracks()/gui_plugin_get_next_album_tracks() below. */
+static char ** group_songs_to_path_array(const group_t * album_group, int * out_count) {
+    if (album_group->count <= 0) { *out_count = 0; return NULL; }
+
+    char ** paths = malloc(sizeof(char *) * (size_t) album_group->count);
+    for (int i = 0; i < album_group->count; i++) {
+        paths[i] = strdup(all_songs_paths[album_group->indices[i]]);
+    }
+    *out_count = album_group->count;
+    return paths;
+}
+
+const char * gui_plugin_get_play_mode(void) {
+    switch ((play_mode_t) current_settings.play_mode) {
+        case PLAY_MODE_REPEAT_ALL: return "repeat_all";
+        case PLAY_MODE_REPEAT_ONE: return "repeat_one";
+        case PLAY_MODE_SHUFFLE:    return "shuffle";
+        case PLAY_MODE_SEQUENTIAL:
+        default:                   return "sequential";
+    }
+}
+
+const char * gui_plugin_get_current_track_path(void) {
+    if (playlist_index < 0 || playlist_index >= playlist_count) return NULL;
+    return playlist[playlist_index];
+}
+
+char ** gui_plugin_get_artist_albums(const char * artist, int * out_count) {
+    *out_count = 0;
+    const group_t * artist_group = find_artist_group_by_name(artist);
+    if (!artist_group) return NULL;
+
+    group_t * albums = NULL;
+    int album_count = 0;
+    build_artist_album_groups(artist_group, &albums, &album_count);
+
+    if (album_count <= 0) {
+        free_group_array(albums, album_count);
+        return NULL;
+    }
+
+    char ** names = malloc(sizeof(char *) * (size_t) album_count);
+    for (int i = 0; i < album_count; i++) names[i] = strdup(albums[i].name);
+    free_group_array(albums, album_count);
+
+    *out_count = album_count;
+    return names;
+}
+
+char ** gui_plugin_get_album_tracks(const char * artist, const char * album, int * out_count) {
+    *out_count = 0;
+    const group_t * artist_group = find_artist_group_by_name(artist);
+    if (!artist_group) return NULL;
+
+    group_t * albums = NULL;
+    int album_count = 0;
+    build_artist_album_groups(artist_group, &albums, &album_count);
+
+    char ** paths = NULL;
+    for (int i = 0; i < album_count; i++) {
+        if (strcasecmp(albums[i].name, album) == 0) {
+            paths = group_songs_to_path_array(&albums[i], out_count);
+            break;
+        }
+    }
+    free_group_array(albums, album_count);
+    return paths;
+}
+
+char ** gui_plugin_get_next_album_tracks(const char * artist, const char * current_album, int * out_count) {
+    *out_count = 0;
+    const group_t * artist_group = find_artist_group_by_name(artist);
+    if (!artist_group) return NULL;
+
+    group_t * albums = NULL;
+    int album_count = 0;
+    build_artist_album_groups(artist_group, &albums, &album_count);
+
+    char ** paths = NULL;
+    for (int i = 0; i < album_count; i++) {
+        if (strcasecmp(albums[i].name, current_album) == 0) {
+            if (i + 1 < album_count) paths = group_songs_to_path_array(&albums[i + 1], out_count);
+            break;
+        }
+    }
+    free_group_array(albums, album_count);
+    return paths;
+}
+
+void gui_plugin_free_string_array(char ** array, int count) {
+    for (int i = 0; i < count; i++) free(array[i]);
+    free(array);
 }
 
 /* Undoes everything library_scan_once() below allocates -- needed before a
@@ -14982,11 +15280,11 @@ static lv_obj_t * build_about_screen(void) {
      * but the same "which build is this" question still matters. */
     static char version_line[64];
 #if defined(TEST_BUILD_TAG)
-    snprintf(version_line, sizeof(version_line), "Alpha 2 (%s)", TEST_BUILD_TAG);
+    snprintf(version_line, sizeof(version_line), "Beta 1 (%s)", TEST_BUILD_TAG);
 #elif defined(BUILD_STAMP)
-    snprintf(version_line, sizeof(version_line), "Alpha 2 (%s)", BUILD_STAMP);
+    snprintf(version_line, sizeof(version_line), "Beta 1 (%s)", BUILD_STAMP);
 #else
-    snprintf(version_line, sizeof(version_line), "Alpha 2");
+    snprintf(version_line, sizeof(version_line), "Beta 1");
 #endif
     items[0] = (pill_list_item_t){ "Open Source Player for HiBy OS", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
@@ -15890,14 +16188,16 @@ static void plugin_power_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_settings_power_screen(void) {
-    static pill_list_item_t items[3 + PLUGIN_MAX_POWER_LIST_ITEMS];
+    static pill_list_item_t items[4 + PLUGIN_MAX_POWER_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Charge Limiter (85%)", PILL_ACCESSORY_TOGGLE,
                                     current_settings.charge_limiter_enabled, NULL, charge_limiter_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Idle Shutdown", PILL_ACCESSORY_CHEVRON, false, idle_shutdown_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "LED charge indicator", PILL_ACCESSORY_TOGGLE,
                                     current_settings.led_indicator_enabled, NULL, led_indicator_switch_event_cb, NULL };
+    items[3] = (pill_list_item_t){ "Battery Percentage", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.show_battery_percent, NULL, battery_percent_switch_event_cb, NULL };
 
-    int count = 3;
+    int count = 4;
     int plugin_count = plugin_manager_get_power_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_POWER_LIST_ITEMS; i++) {
         pill_list_item_t item = {

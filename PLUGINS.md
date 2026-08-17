@@ -563,6 +563,43 @@ metadata a `"track_started"` event handler already receives as arguments
 (see "Events" below) -- this is for code that isn't reacting to that event
 directly, e.g. a `set_interval()` tick double-checking what's still playing.
 
+### `plugin.get_play_mode()`
+
+Returns one of `"sequential"`, `"repeat_all"`, `"repeat_one"`, `"shuffle"` --
+the current state of the order/loop/single/random icon on the player
+screen.
+
+### `plugin.get_current_track_path()`
+
+Returns the absolute path of the currently loaded track, or `nil` if
+nothing is loaded (no active playlist yet, or playback was stopped rather
+than paused).
+
+### `plugin.get_artist_albums(artist)`
+
+Returns `{ album_name, ... }` (a plain array, 1-indexed) for every album
+that has at least one song tagged with this artist, in the same
+alphabetical order the on-device Artists screen's own drill-down uses. `nil`
+if `artist` doesn't match any song's artist tag. Matching is
+case-insensitive, same as every other Artists/Albums grouping in this app.
+
+### `plugin.get_album_tracks(artist, album)`
+
+Returns `{ track_path, ... }` for one artist's one album, in the same order
+the on-device album view would display them (path-sorted). `nil` if either
+`artist` or `album` doesn't match. `artist` scopes the lookup so a
+same-named album by a different artist is never returned by mistake.
+
+### `plugin.get_next_album_tracks(artist, current_album)`
+
+Same return shape as `get_album_tracks()` above, for whichever album comes
+immediately after `current_album` in that artist's own alphabetical album
+order. Returns `nil` both when `current_album` doesn't match anything and
+when it's already the artist's last album -- this does **not** wrap around
+to the first album. Meant for auto-continuing playback across an artist's
+discography once an album finishes; pair with `"track_started"` or
+`get_current_track_path()` to detect the album boundary.
+
 ## Events
 
 ### `plugin.on(event, callback)`

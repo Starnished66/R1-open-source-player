@@ -132,6 +132,16 @@ typedef struct {
      * the USB input current limit instead). */
     bool charge_limiter_enabled;
 
+    /* Topbar battery percentage digits next to the battery icon -- the icon
+     * itself (charge outline + fill gauge) is always shown regardless of
+     * this, only the "NN%" readout is optional. When off, gui.c's
+     * sync_topbar_status_icon_positions() lets the Wi-Fi/Bluetooth status
+     * icons slide into the space the percentage would otherwise occupy,
+     * right next to the battery icon, instead of leaving it empty. On by
+     * default, matching the always-on behavior every previous version of
+     * this app had. */
+    bool show_battery_percent;
+
     /* Full poweroff after a long stretch idle (screen off, not playing, not
      * charging) -- see idle_shutdown.h. This is the real standby
      * battery-life lever on this hardware: suspend-to-RAM is available at

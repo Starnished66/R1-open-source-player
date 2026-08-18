@@ -7358,7 +7358,17 @@ static void * scan_range_worker(void * arg) {
  * actual stall, so a large healthy library costs the same as the original
  * unbounded loop. */
 static void scan_songs_range(int start_index) {
+    /* For very large libraries on memory-constrained devices, process in smaller chunks
+     * to avoid memory exhaustion. On devices with only 30MB storage, we limit chunk size
+     * to reduce peak memory usage. */
+    const int CHUNK_SIZE = 500;  /* Process 500 songs at a time to avoid OOM on small devices */
+    
     while (start_index < all_songs_count) {
+        int end_index = start_index + CHUNK_SIZE;
+        if (end_index > all_songs_count) {
+            end_index = all_songs_count;
+        }
+        
         scan_range_work_t * w = calloc(1, sizeof(*w));
         w->start_index = start_index;
 
@@ -7372,7 +7382,11 @@ static void scan_songs_range(int start_index) {
         int last_seen = start_index - 1;
         int waited_ms = 0;
         for (;;) {
-            if (w->done) { free(w); return; }
+            if (w->done) { 
+                free(w); 
+                start_index = end_index;  /* Move to next chunk */
+                break; 
+            }
             int completed = w->completed_index;
             if (completed != last_seen) {
                 last_seen = completed;
@@ -7384,14 +7398,18 @@ static void scan_songs_range(int start_index) {
             usleep(20000);
         }
 
-        int stuck_index = last_seen + 1; /* w is now abandoned -- never touch it again */
-        fprintf(stderr, "Warning: timed out reading tags from %s (possible filesystem corruption) -- skipping\n", all_songs_paths[stuck_index]);
-        all_song_tags[stuck_index].title[0] = '\0';
-        snprintf(all_song_tags[stuck_index].artist, sizeof(all_song_tags[stuck_index].artist), "Unknown Artist");
-        snprintf(all_song_tags[stuck_index].album, sizeof(all_song_tags[stuck_index].album), "Unknown Album");
-        snprintf(all_song_tags[stuck_index].album_artist, sizeof(all_song_tags[stuck_index].album_artist), "Unknown Artist");
-        snprintf(all_song_tags[stuck_index].genre, sizeof(all_song_tags[stuck_index].genre), "Unknown Genre");
-        start_index = stuck_index + 1;
+        if (!w->done) {
+            /* Timeout occurred, abandon this worker */
+            int stuck_index = last_seen + 1; /* w is now abandoned -- never touch it again */
+            fprintf(stderr, "Warning: timed out reading tags from %s (possible filesystem corruption) -- skipping\n", all_songs_paths[stuck_index]);
+            all_song_tags[stuck_index].title[0] = '\0';
+            snprintf(all_song_tags[stuck_index].artist, sizeof(all_song_tags[stuck_index].artist), "Unknown Artist");
+            snprintf(all_song_tags[stuck_index].album, sizeof(all_song_tags[stuck_index].album), "Unknown Album");
+            snprintf(all_song_tags[stuck_index].album_artist, sizeof(all_song_tags[stuck_index].album_artist), "Unknown Artist");
+            snprintf(all_song_tags[stuck_index].genre, sizeof(all_song_tags[stuck_index].genre), "Unknown Genre");
+            start_index = stuck_index + 1;
+            break; /* Break on timeout to prevent infinite loop */
+        }
     }
 }
 

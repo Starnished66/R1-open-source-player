@@ -71,6 +71,18 @@ static struct timespec cached_at;
 static bool cache_valid = false;
 
 #define BATTERY_CACHE_TTL_MS 5000L
+#define BATTERY_DISPLAY_STABLE_MS 15000L
+#define BATTERY_DISPLAY_STEP_MS 60000L
+
+static int display_capacity = -1;
+static int display_candidate = -1;
+static bool display_powered = false;
+static struct timespec display_candidate_since;
+static struct timespec display_last_step;
+
+static long elapsed_ms(struct timespec now, struct timespec then) {
+    return (now.tv_sec - then.tv_sec) * 1000L + (now.tv_nsec - then.tv_nsec) / 1000000L;
+}
 
 static bool discover_battery_device(char * out, size_t out_size) {
     DIR * dir = opendir(POWER_SUPPLY_DIR);
@@ -125,6 +137,67 @@ static bool refresh_battery_cache_locked(void) {
 int battery_get_percent(void) {
     pthread_mutex_lock(&battery_cache_mutex);
     int result = refresh_battery_cache_locked() ? cached_capacity : -1;
+    pthread_mutex_unlock(&battery_cache_mutex);
+    return result;
+}
+
+int battery_get_display_percent(void) {
+    pthread_mutex_lock(&battery_cache_mutex);
+    if (!refresh_battery_cache_locked()) {
+        pthread_mutex_unlock(&battery_cache_mutex);
+        return -1;
+    }
+
+    int raw = cached_capacity;
+    if (raw < 0) raw = 0;
+    if (raw > 100) raw = 100;
+    bool powered = strcmp(cached_status, "Charging") == 0 || strcmp(cached_status, "Full") == 0;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    if (display_capacity < 0) {
+        display_capacity = raw;
+        display_candidate = raw;
+        display_powered = powered;
+        display_candidate_since = now;
+        display_last_step = now;
+    } else {
+        if (powered != display_powered) {
+            /* Do not accept the voltage-relaxation jump commonly emitted
+             * immediately after plugging/unplugging. Start a fresh stable
+             * observation window in the new physical direction. */
+            display_powered = powered;
+            display_candidate = raw;
+            display_candidate_since = now;
+            display_last_step = now;
+        } else if (raw != display_candidate) {
+            display_candidate = raw;
+            display_candidate_since = now;
+        }
+
+        if (!powered && raw <= 5) {
+            /* Never hide a genuinely critical reading behind smoothing. */
+            display_capacity = raw;
+            display_last_step = now;
+        } else if (strcmp(cached_status, "Full") == 0 && raw >= 99) {
+            display_capacity = 100;
+            display_last_step = now;
+        } else if (elapsed_ms(now, display_candidate_since) >= BATTERY_DISPLAY_STABLE_MS &&
+                   elapsed_ms(now, display_last_step) >= BATTERY_DISPLAY_STEP_MS) {
+            if (powered && display_candidate > display_capacity) {
+                display_capacity++;
+                display_last_step = now;
+            } else if (!powered && display_candidate < display_capacity) {
+                display_capacity--;
+                display_last_step = now;
+            }
+            /* Opposite-direction values are deliberately ignored: battery
+             * state cannot physically rise while discharging or fall while
+             * charging, and those reversals are the reported gauge noise. */
+        }
+    }
+
+    int result = display_capacity;
     pthread_mutex_unlock(&battery_cache_mutex);
     return result;
 }

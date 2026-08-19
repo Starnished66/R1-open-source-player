@@ -59,7 +59,7 @@ static bool udc_becomes_bound(const char * udc_path) {
     return false;
 }
 
-/* True if some function directory under <gadget_dir>/functions starts with
+/* True if some function link under <gadget_dir>/configs/c.1 starts with
  * `name_prefix` (e.g. "uac_sa." or "mass_storage.") -- checking for a
  * SPECIFIC expected function, not just "is anything bound", is what catches
  * the case a real device hit: android0's UDC bound but to a mass_storage.N
@@ -67,7 +67,7 @@ static bool udc_becomes_bound(const char * udc_path) {
  * told the user) DAC had succeeded. */
 static bool function_linked(const char * gadget_dir, const char * name_prefix) {
     char path[256];
-    snprintf(path, sizeof(path), "%s/functions", gadget_dir);
+    snprintf(path, sizeof(path), "%s/configs/c.1", gadget_dir);
     DIR * dir = opendir(path);
     if (!dir) return false;
 
@@ -81,7 +81,7 @@ static bool function_linked(const char * gadget_dir, const char * name_prefix) {
     return found;
 }
 
-/* Best-effort, generic teardown of a configfs gadget directory -- doesn't
+/* Generic teardown of a configfs gadget directory -- doesn't
  * assume any particular function name is inside, unlike the stock stop
  * scripts (uac_device_config.sh's uac_stop(), usb_dev_mass_storage.sh's
  * storage_stop()), which each hardcode exactly one function name and
@@ -95,7 +95,7 @@ static bool function_linked(const char * gadget_dir, const char * name_prefix) {
  * after the stock stop scripts as a guarantee, not a replacement for
  * them -- they still do the real process-killing side effects (killall
  * adbd/adbserver.sh) this doesn't attempt to duplicate. */
-static void force_clean_gadget_dir(const char * gadget_dir) {
+static bool force_clean_gadget_dir(const char * gadget_dir) {
     char path[300];
 
     snprintf(path, sizeof(path), "%s/UDC", gadget_dir);
@@ -114,6 +114,17 @@ static void force_clean_gadget_dir(const char * gadget_dir) {
             char link_path[300];
             snprintf(link_path, sizeof(link_path), "%s/configs/c.1/%s", gadget_dir, entry->d_name);
             unlink(link_path);
+            /* A mass-storage function can remain busy even after UDC
+             * unbind until its backing block device is explicitly cleared.
+             * The stock stop script relies on rmdir doing this implicitly,
+             * which is the intermittent stale-function failure reported on
+             * device. */
+            if (strncmp(entry->d_name, "mass_storage.", 13) == 0) {
+                char lun_path[320];
+                snprintf(lun_path, sizeof(lun_path), "%s/functions/%s/lun.0/file", gadget_dir, entry->d_name);
+                FILE * lun_f = fopen(lun_path, "w");
+                if (lun_f) { fputs("\n", lun_f); fclose(lun_f); }
+            }
             char func_path[300];
             snprintf(func_path, sizeof(func_path), "%s/functions/%s", gadget_dir, entry->d_name);
             rmdir(func_path);
@@ -128,6 +139,32 @@ static void force_clean_gadget_dir(const char * gadget_dir) {
     snprintf(path, sizeof(path), "%s/strings/0x409", gadget_dir);
     rmdir(path);
     rmdir(gadget_dir);
+    return !path_exists(gadget_dir);
+}
+
+static bool configfs_has_gadgets(void) {
+    DIR * dir = opendir("/sys/kernel/config/usb_gadget");
+    if (!dir) return false;
+    bool found = false;
+    struct dirent * entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] != '.') { found = true; break; }
+    }
+    closedir(dir);
+    return found;
+}
+
+/* The stock ADB and DAC start scripts both deliberately refuse to run if
+ * configfs is already mounted. Their stop scripts normally unmount it, but
+ * our fallback cleanup previously did not; one imperfect Storage teardown
+ * therefore made every later ADB/DAC attempt fail until reboot. */
+static bool unmount_empty_configfs(void) {
+    if (!path_exists("/sys/kernel/config/usb_gadget")) return true;
+    if (configfs_has_gadgets()) return false;
+    int exit_code = -1;
+    char * argv[] = { (char *) "/bin/umount", (char *) "/sys/kernel/config", NULL };
+    subprocess_run_checked(argv, NULL, 0, 3000, &exit_code);
+    return !path_exists("/sys/kernel/config/usb_gadget");
 }
 
 bool usb_mode_control_apply(usb_mode_t mode) {
@@ -158,13 +195,26 @@ bool usb_mode_control_apply(usb_mode_t mode) {
 
     /* Guarantee a clean slate regardless of whether the stock stop scripts
      * actually finished -- see force_clean_gadget_dir()'s own comment. */
+    bool cleanup_ok = true;
     if (path_exists(ANDROID0_DIR)) {
         fprintf(stderr, "usb_mode_control: android0 survived the stop scripts, force-cleaning\n");
-        force_clean_gadget_dir(ANDROID0_DIR);
+        cleanup_ok = force_clean_gadget_dir(ANDROID0_DIR) && cleanup_ok;
     }
     if (path_exists(ADB_DEMO_DIR)) {
         fprintf(stderr, "usb_mode_control: adb_demo survived the stop scripts, force-cleaning\n");
-        force_clean_gadget_dir(ADB_DEMO_DIR);
+        cleanup_ok = force_clean_gadget_dir(ADB_DEMO_DIR) && cleanup_ok;
+    }
+    if (!cleanup_ok || path_exists(ANDROID0_DIR) || path_exists(ADB_DEMO_DIR)) {
+        fprintf(stderr, "usb_mode_control: cleanup incomplete; refusing to start on stale gadget state\n");
+        return false;
+    }
+
+    /* Storage's start script tolerates an already-mounted empty configfs;
+     * ADB and DAC do not. Restore the exact precondition those scripts
+     * expect after any fallback cleanup. */
+    if (mode != USB_MODE_STORAGE && !unmount_empty_configfs()) {
+        fprintf(stderr, "usb_mode_control: could not unmount empty configfs before mode=%d\n", (int) mode);
+        return false;
     }
 
     int exit_code = -1;

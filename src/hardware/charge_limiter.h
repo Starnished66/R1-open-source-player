@@ -8,8 +8,10 @@
  * "limited" charging -- there is no dedicated state-of-charge cutoff knob on
  * this hardware, so this works by disabling the AXP2101 PMIC's own charger
  * outright (module_en/REG18H bit 1, "chg_en" -- i2c bus 0, address 0x34)
- * once the threshold is reached, and re-enabling it (same bit) once back
- * under the threshold or the feature is turned off.
+ * just before the target is reached, and re-enabling it (same bit) only
+ * after a small discharge hysteresis window or when the feature is turned
+ * off. This prevents noisy 84/85% readings from repeatedly restarting the
+ * charger and overshooting the requested 85% ceiling.
  *
  * This is the SECOND register-level approach this feature has gone through:
  *
@@ -76,5 +78,9 @@
  * turning the feature off could leave charging throttled for up to
  * CHARGE_LIMITER_REEVALUATE_SECONDS after the user expected it to resume. */
 void charge_limiter_poll(bool enabled, bool force);
+
+/* Enforces the 500mA charge-current cap while enabled. Disabled is a no-op
+ * and does not restore or otherwise modify the current PMIC setting. */
+void safe_charging_poll(bool enabled, bool force);
 
 #endif /* CHARGE_LIMITER_H */

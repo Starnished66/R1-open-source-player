@@ -135,6 +135,10 @@ typedef struct {
      * the USB input current limit instead). */
     bool charge_limiter_enabled;
 
+    /* Caps the AXP2101 constant-current charging phase at 500mA. Turning
+     * this off deliberately leaves the PMIC's current setting unchanged. */
+    bool safe_charging_enabled;
+
     /* Topbar battery percentage digits next to the battery icon -- the icon
      * itself (charge outline + fill gauge) is always shown regardless of
      * this, only the "NN%" readout is optional. When off, gui.c's

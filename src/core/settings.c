@@ -95,6 +95,7 @@ static void set_defaults(player_settings_t * out) {
     out->screen_dimming_enabled = true;
     out->led_indicator_enabled = true;
     out->charge_limiter_enabled = false; /* opt-in -- caps max charge at 85%, a real behavior change the user should choose, not a default surprise */
+    out->safe_charging_enabled = false; /* off means leave the PMIC charge-current setting untouched */
     out->show_battery_percent = true; /* on by default -- matches every previous version's always-on behavior */
     out->idle_shutdown_enabled = false; /* opt-in, matches stock's own default */
     out->idle_shutdown_minutes = 30;
@@ -178,6 +179,8 @@ bool settings_load(player_settings_t * out) {
             out->led_indicator_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "charge_limiter_enabled") == 0) {
             out->charge_limiter_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "safe_charging_enabled") == 0) {
+            out->safe_charging_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "show_battery_percent") == 0) {
             out->show_battery_percent = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "idle_shutdown_enabled") == 0) {
@@ -281,6 +284,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "screen_dimming_enabled=%d\n", settings->screen_dimming_enabled ? 1 : 0);
     fprintf(f, "led_indicator_enabled=%d\n", settings->led_indicator_enabled ? 1 : 0);
     fprintf(f, "charge_limiter_enabled=%d\n", settings->charge_limiter_enabled ? 1 : 0);
+    fprintf(f, "safe_charging_enabled=%d\n", settings->safe_charging_enabled ? 1 : 0);
     fprintf(f, "show_battery_percent=%d\n", settings->show_battery_percent ? 1 : 0);
     fprintf(f, "idle_shutdown_enabled=%d\n", settings->idle_shutdown_enabled ? 1 : 0);
     fprintf(f, "idle_shutdown_minutes=%d\n", settings->idle_shutdown_minutes);

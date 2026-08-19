@@ -49,6 +49,12 @@
  * face value. */
 #define AXP2101_REG_CHG_STAT 0x01
 
+/* ICC_CFG (0x62), bits [4:0]. Code 0x08 selects 500mA according to the
+ * AXP2101 register table. Preserve the upper bits with a read-modify-write. */
+#define AXP2101_REG_CHG_CURRENT 0x62
+#define AXP2101_CHG_CURRENT_MASK 0x1Fu
+#define AXP2101_CHG_CURRENT_500MA 0x08u
+
 /* Real-device incident (2026-08-07): charge_limiter previously throttled by
  * zeroing REG62 (ICC / "fast charge current", the constant-CURRENT phase
  * target) instead of this register -- documented at length in
@@ -72,6 +78,8 @@
  * mode) are both described as controls over this exact bit, not REG62. */
 
 #define CHARGE_LIMITER_STOP_PERCENT 85
+#define CHARGE_LIMITER_TRIGGER_PERCENT 84
+#define CHARGE_LIMITER_RESUME_PERCENT 82
 
 /* Re-checks and re-applies at most this often, rather than on every 500ms
  * gui.c timer tick -- the i2c write itself is cheap, but there's no reason
@@ -136,21 +144,26 @@ static void log_chg_stat(const char * when) {
     DBG_LOG("charge_limiter: chg_stat %s = %s (0x%02X)\n", when, names[stat & 0x07], stat & 0x07);
 }
 
-static void disable_charging(void) {
+static bool set_charging_enabled(bool enabled) {
     uint8_t module_en;
-    if (axp2101_read_reg(AXP2101_REG_MODULE_EN, &module_en)) {
-        axp2101_write_reg(AXP2101_REG_MODULE_EN, module_en & (uint8_t) ~AXP2101_MODULE_EN_CHG_BIT);
-    }
-    log_chg_stat("after throttle");
+    if (!axp2101_read_reg(AXP2101_REG_MODULE_EN, &module_en)) return false;
+
+    uint8_t desired = enabled ? (module_en | AXP2101_MODULE_EN_CHG_BIT)
+                              : (module_en & (uint8_t) ~AXP2101_MODULE_EN_CHG_BIT);
+    if (desired != module_en && !axp2101_write_reg(AXP2101_REG_MODULE_EN, desired)) return false;
+
+    uint8_t readback;
+    if (!axp2101_read_reg(AXP2101_REG_MODULE_EN, &readback)) return false;
+    bool confirmed = (readback & AXP2101_MODULE_EN_CHG_BIT) ==
+                     (enabled ? AXP2101_MODULE_EN_CHG_BIT : 0);
+    DBG_LOG("charge_limiter: charger %s readback reg18=0x%02X -> %s\n",
+            enabled ? "enable" : "disable", readback, confirmed ? "confirmed" : "FAILED");
+    log_chg_stat(enabled ? "after restore" : "after throttle");
+    return confirmed;
 }
 
-static void enable_charging(void) {
-    uint8_t module_en;
-    if (axp2101_read_reg(AXP2101_REG_MODULE_EN, &module_en)) {
-        axp2101_write_reg(AXP2101_REG_MODULE_EN, module_en | AXP2101_MODULE_EN_CHG_BIT);
-    }
-    log_chg_stat("after restore");
-}
+static bool disable_charging(void) { return set_charging_enabled(false); }
+static bool enable_charging(void) { return set_charging_enabled(true); }
 #endif
 
 void charge_limiter_poll(bool enabled, bool force) {
@@ -159,14 +172,17 @@ void charge_limiter_poll(bool enabled, bool force) {
     (void) force;
     return;
 #else
-    static time_t last_apply = 0;
+    static struct timespec last_apply;
+    static bool limiter_holding = false;
 
-    time_t now = time(NULL);
-    if (!force && last_apply != 0 && now - last_apply < CHARGE_LIMITER_REEVALUATE_SECONDS) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!force && last_apply.tv_sec != 0 && now.tv_sec - last_apply.tv_sec < CHARGE_LIMITER_REEVALUATE_SECONDS) return;
     last_apply = now;
 
     if (!enabled) {
-        enable_charging();
+        if (enable_charging()) limiter_holding = false;
+        else last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
         return;
     }
 
@@ -179,12 +195,52 @@ void charge_limiter_poll(bool enabled, bool force) {
      * fuel gauge itself later crept up" from "we were late/reading the
      * wrong sensor" -- exactly the ambiguity the 86%-vs-91% two-tester
      * report needed and didn't have visibility into before this. */
-    DBG_LOG("charge_limiter: poll percent=%d (stop threshold=%d)\n", percent, CHARGE_LIMITER_STOP_PERCENT);
+    DBG_LOG("charge_limiter: poll percent=%d (target=%d trigger=%d resume=%d holding=%d)\n",
+            percent, CHARGE_LIMITER_STOP_PERCENT, CHARGE_LIMITER_TRIGGER_PERCENT,
+            CHARGE_LIMITER_RESUME_PERCENT, limiter_holding);
 
-    if (percent >= CHARGE_LIMITER_STOP_PERCENT) {
-        disable_charging();
-    } else {
-        enable_charging();
+    /* Stop one displayed percentage point early to absorb the real gauge's
+     * normal lag, then hold the charger off through 83/84/85% bounce rather
+     * than re-enabling it every time a noisy sample dips below 85. */
+    if (percent >= CHARGE_LIMITER_TRIGGER_PERCENT) limiter_holding = true;
+    else if (percent <= CHARGE_LIMITER_RESUME_PERCENT) limiter_holding = false;
+
+    bool applied = limiter_holding ? disable_charging() : enable_charging();
+    if (!applied) last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+#endif
+}
+
+void safe_charging_poll(bool enabled, bool force) {
+#if !CHARGE_LIMITER_ACTIVE
+    (void) enabled;
+    (void) force;
+#else
+    static struct timespec last_apply;
+    if (!enabled) return; /* Off means leave the PMIC unchanged. */
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!force && last_apply.tv_sec != 0 &&
+        now.tv_sec - last_apply.tv_sec < CHARGE_LIMITER_REEVALUATE_SECONDS) return;
+    last_apply = now;
+
+    uint8_t current;
+    if (!axp2101_read_reg(AXP2101_REG_CHG_CURRENT, &current)) {
+        last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1;
+        return;
     }
+    uint8_t desired = (current & (uint8_t) ~AXP2101_CHG_CURRENT_MASK) |
+                      AXP2101_CHG_CURRENT_500MA;
+    if (desired != current && !axp2101_write_reg(AXP2101_REG_CHG_CURRENT, desired)) {
+        last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1;
+        return;
+    }
+
+    uint8_t readback = 0;
+    bool confirmed = axp2101_read_reg(AXP2101_REG_CHG_CURRENT, &readback) &&
+                     (readback & AXP2101_CHG_CURRENT_MASK) == AXP2101_CHG_CURRENT_500MA;
+    DBG_LOG("safe_charging: 500mA cap reg62 0x%02X -> 0x%02X (%s)\n",
+            current, readback, confirmed ? "confirmed" : "FAILED");
+    if (!confirmed) last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1;
 #endif
 }

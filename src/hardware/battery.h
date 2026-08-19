@@ -8,6 +8,11 @@
  * exist). Never faked -- callers should treat -1 as "no data", not 0%. */
 int battery_get_percent(void);
 
+/* UI-only stabilized percentage. Keeps physically impossible direction
+ * changes and fuel-gauge recalibration jumps out of the top bar while the
+ * raw getter above remains available to safety/charge-limit logic. */
+int battery_get_display_percent(void);
+
 /* True if external power is present -- power_supply "status" reads
  * "Charging" or "Full" (the latter still means plugged in, just topped up;
  * unplugging always reverts it to "Discharging"). False (not true) on the

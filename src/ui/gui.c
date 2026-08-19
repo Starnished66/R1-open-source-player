@@ -1279,7 +1279,7 @@ static void refresh_play_pause_topbar(void) {
 static void sync_topbar_status_icon_positions(void);
 
 static void refresh_battery_topbar(void) {
-    int percent = battery_get_percent();
+    int percent = battery_get_display_percent();
 
     /* battery_icon_frame (the outline + fill gauge) is always shown --
      * current_settings.show_battery_percent (Settings > Power > "Battery
@@ -4825,6 +4825,13 @@ static void charge_limiter_switch_event_cb(lv_event_t * e) {
     settings_save(&current_settings);
 }
 
+static void safe_charging_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.safe_charging_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    safe_charging_poll(current_settings.safe_charging_enabled, true);
+    settings_save(&current_settings);
+}
+
 /* refresh_battery_topbar() (defined earlier in this file, topbar setup near
  * gui_init()'s own layout code) already re-syncs the wifi/bt icon positions
  * itself whenever battery_topbar_group's hidden flag actually changes --
@@ -5814,6 +5821,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * own actual sysfs work internally, so calling it every tick here is
      * cheap. */
     charge_limiter_poll(current_settings.charge_limiter_enabled, false);
+    safe_charging_poll(current_settings.safe_charging_enabled, false);
     led_control_poll(current_settings.led_indicator_enabled);
 
     if (current_settings.remote_control_enabled) {
@@ -14457,7 +14465,14 @@ static void start_usb_mode_switch(usb_mode_t target) {
     usb_mode_switch_target = target;
     usb_mode_switch_active = true;
     usb_mode_switch_done_flag = false;
-    pthread_create(&usb_mode_switch_thread, NULL, usb_mode_switch_thread_func, NULL);
+    int rc = pthread_create(&usb_mode_switch_thread, NULL, usb_mode_switch_thread_func, NULL);
+    if (rc != 0) {
+        /* Without this rollback, a transient low-memory/thread-creation
+         * failure leaves the guard latched forever: every later tap is
+         * ignored until the player or device is restarted. */
+        usb_mode_switch_active = false;
+        show_error_toast("Could not start USB mode switch");
+    }
 }
 
 static void poll_usb_mode_switch(void) {
@@ -16823,16 +16838,18 @@ static void plugin_power_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_settings_power_screen(void) {
-    static pill_list_item_t items[4 + PLUGIN_MAX_POWER_LIST_ITEMS];
+    static pill_list_item_t items[5 + PLUGIN_MAX_POWER_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Charge Limiter (85%)", PILL_ACCESSORY_TOGGLE,
                                     current_settings.charge_limiter_enabled, NULL, charge_limiter_switch_event_cb, NULL };
-    items[1] = (pill_list_item_t){ "Idle Shutdown", PILL_ACCESSORY_CHEVRON, false, idle_shutdown_row_cb, NULL, NULL };
-    items[2] = (pill_list_item_t){ "LED charge indicator", PILL_ACCESSORY_TOGGLE,
+    items[1] = (pill_list_item_t){ "Safe Charging (500mA)", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.safe_charging_enabled, NULL, safe_charging_switch_event_cb, NULL };
+    items[2] = (pill_list_item_t){ "Idle Shutdown", PILL_ACCESSORY_CHEVRON, false, idle_shutdown_row_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "LED charge indicator", PILL_ACCESSORY_TOGGLE,
                                     current_settings.led_indicator_enabled, NULL, led_indicator_switch_event_cb, NULL };
-    items[3] = (pill_list_item_t){ "Battery Percentage", PILL_ACCESSORY_TOGGLE,
+    items[4] = (pill_list_item_t){ "Battery Percentage", PILL_ACCESSORY_TOGGLE,
                                     current_settings.show_battery_percent, NULL, battery_percent_switch_event_cb, NULL };
 
-    int count = 4;
+    int count = 5;
     int plugin_count = plugin_manager_get_power_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_POWER_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -17872,6 +17889,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 
     led_control_apply(current_settings.led_indicator_enabled);
     charge_limiter_poll(current_settings.charge_limiter_enabled, true);
+    safe_charging_poll(current_settings.safe_charging_enabled, true);
     if (current_settings.timezone[0] != '\0') timezone_apply(current_settings.timezone);
 
     /* Reapply persisted external-DAC state -- see

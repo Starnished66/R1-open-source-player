@@ -14,7 +14,7 @@ The player reuses the stock firmware's UI assets, fonts, and existing system ser
 
 # Support the Project
 
-This Open Source Player is developed and tested on real hardware. If you would like to help fund continued development, device testing, and future hardware support(Hiby R3 Pro II for example), donation links can be found here:
+This Open Source Player is developed and tested on real hardware. If you would like to help fund continued development, device testing, and future hardware support (the HiBy R3 Pro II, for example), donation links can be found here:
 
 - **PayPal:** [Donate via PayPal](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=josegarita%40protonmail.com&currency_code=USD)
 
@@ -63,6 +63,7 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - Resume the last track either playing or prepared in a paused state, including its original album context
 - Physical hardware controls for volume, play/pause, next/previous
 - Automatic track advancement
+- Sequential, Repeat All, Repeat One, and Shuffle playback modes
 - Proper playlist-end handling
 - Bluetooth playback support
 - Bluetooth metadata streaming
@@ -118,9 +119,10 @@ The LAN remote-control interface provides a simple way to control the player fro
 ## 🔌 Device & Hardware Integration
 
 - USB DAC support
-- Real battery percentage
+- Smoothed real battery percentage that filters transient fuel-gauge jumps
 - Real Wi-Fi signal strength
-- Charge limiter for improved battery longevity
+- 85% charge limiter for improved battery longevity
+- **Safe Charging (500mA)** mode with immediate, persistent PMIC-level current limiting
 - Configurable idle shutdown or suspend behavior
 - Car mode
 - Improved Bluetooth connection reliability
@@ -130,7 +132,8 @@ The LAN remote-control interface provides a simple way to control the player fro
 - Time Zone picker with immediate application and persistent settings
 - Startup volume
 - Resume-last-track modes with preserved library context
-- Easier ADB access through the USB mode selector
+- Storage, USB DAC, and ADB modes through a recoverable USB mode selector
+- Configurable charge-status LEDs
 
 ## 🎨 Interface
 
@@ -143,6 +146,8 @@ The LAN remote-control interface provides a simple way to control the player fro
 - Configurable screen timeout presets from 15 seconds to 30 minutes
 - Optional idle screen dimming to approximately 5% brightness
 - Configurable font size and battery-percentage display
+- Font-aware row sizing for Medium and BlindMF accessibility text sizes
+- Delayed, speed-normalized marquee scrolling for long row titles instead of wrapping or overlapping adjacent rows
 - Non-Latin text rendering:
   - Cyrillic
   - Japanese kana/kanji
@@ -159,7 +164,11 @@ The LAN remote-control interface provides a simple way to control the player fro
 - Extension rows for Books and the Settings, Display, Playback, Power, and System screens
 - Custom row sizing, icons, text sizing, list screens, settings screens, and text input
 - Playback state/control/events, library access, synchronous and asynchronous HTTP, MD5, theming, and PEQ access
-- Example plugins for Audiobooks, Last.fm scrobbling, themes, network radio, playback tools, and other API capabilities
+- Audiobooks example with per-book/chapter progress, resume, bookmarks, and Continue Listening
+- File-configured Net Radio example that loads station names and URLs from `Radio.txt`
+- Play Through example for continuing through folders or albums
+- Extended Sleep Timer example with durations up to three hours
+- Last.fm scrobbling, themes, sound profiles, playback tools, asynchronous HTTP, and other API examples
 
 ---
 
@@ -347,7 +356,7 @@ Third-party functionality can be added without recompiling the app, as plain Lua
 
 Drop a `.lua` file into `.plugins/` on the SD card and it's picked up automatically at startup. The versioned `plugin.*` API exposes native extension rows and list screens, configurable row layout, text input, themes, SD-card and library access, playback control/events, PEQ, cryptographic helpers, and synchronous or asynchronous HTTP.
 
-An example **Audiobooks** plugin is included (`plugins_examples/Audiobooks.lua`) — a book-folder browser → chapter-list → playback plugin with audiobook-focused progress handling, reachable from **Books → Audio Books**. Additional examples demonstrate Last.fm scrobbling, themes, network radio, playback extensions, and the broader plugin interface.
+An example **Audiobooks** plugin is included (`plugins_examples/Audiobooks.lua`) — a book-folder browser → chapter-list → playback plugin with per-book progress, automatic resume, bookmarks, and Continue Listening, reachable from **Books → Audiobooks**. Other examples include Last.fm scrobbling, file-configured network radio, Play Through folders/albums, a three-hour sleep timer, themes, sound profiles, asynchronous HTTP, playback extensions, and broader plugin-interface demonstrations.
 
 For the full `plugin.*` API reference and instructions on writing and testing your own plugin, see:
 

@@ -1095,14 +1095,25 @@ unsigned int audio_get_sample_rate(void) {
  * without a worthwhile loudness gain on top of that. apply_gain() still
  * hard-clips any sample that would overflow int16 range rather than
  * wrapping, for replaygain or any other gain source that can exceed unity. */
-/* Plain linear-in-dB taper -- see MIN_VOLUME_DB's own comment for why this
- * stays a straight line (equal dB per percent point) rather than a curve:
- * an earlier attempt at a curve here (percent raised to an exponent) fixed
- * absolute loudness at low settings but compressed the dB spacing between
- * adjacent low percents as a side effect, making them hard to tell apart --
- * exactly what a taper is supposed to avoid. */
-static double plain_taper_db(double percent) {
-    return MIN_VOLUME_DB * (1.0 - percent);
+/* Real-device stock-player calibration (2026-08-18): this app's 50% was
+ * reported to match only about 27% on the stock player, and most of the
+ * useful loudness arrived abruptly above 75%. Modeling that measured
+ * mapping as stock = ours^k gives k=log(.27)/log(.50)=1.889; applying its
+ * inverse (1/k ~= .529) before the existing equal-dB taper makes a UI value
+ * represent approximately the same perceived position as stock. Rounded to
+ * 0.53 rather than pretending the ear comparison has laboratory precision.
+ *
+ * Resulting anchors (versus the old linear-dB curve): 25% -36.4dB (was
+ * -52.5), 50% -21.5dB (was -35), 75% -9.9dB (was -17.5), 100% 0dB. This
+ * raises the previously unusable low/mid range while flattening dB spacing
+ * near the top, eliminating the perceived >75% surge. 0% remains handled
+ * separately as true silence, so pow(0, exponent) never compromises mute. */
+#define VOLUME_CURVE_EXPONENT 0.53
+
+static double calibrated_taper_db(double percent) {
+    if (percent <= 0.0) return MIN_VOLUME_DB;
+    if (percent >= 1.0) return 0.0;
+    return MIN_VOLUME_DB * (1.0 - pow(percent, VOLUME_CURVE_EXPONENT));
 }
 
 /* Real-device investigation: applying this entire taper digitally (the only
@@ -1124,11 +1135,15 @@ static double plain_taper_db(double percent) {
  * no TLV, no datasheet, and no SPL meter available. It's derived from a
  * single live A/B: raw ~191 (75% of range) was reported as "barely
  * audible, matching stock's 5-10%", and this taper's own
- * plain_taper_db(0.075) works out to about -64.75dB, giving roughly
+ * the then-current linear taper at 7.5% worked out to about -64.75dB, giving roughly
  * 0.34dB per raw step. Treat this as a first-pass calibration that will
  * very likely need live tuning against real listening feedback, the same
  * way MIN_VOLUME_DB above needed two rounds before it matched
- * expectations. */
+ * expectations. That history predates the later stock-player calibration
+ * implemented by calibrated_taper_db() below; unlike the earlier guessed
+ * exponent, the new exponent is derived from a measured 50%=stock-27%
+ * anchor and deliberately corrects the opposite problem (low/mid range too
+ * quiet, with loudness crowded above 75%). */
 #define HW_VOLUME_DB_PER_STEP 0.34
 #define HW_VOLUME_MAX_RAW 230 /* confirmed live: full silence by here */
 
@@ -1171,10 +1186,10 @@ void audio_set_volume(float new_volume) {
     volume = new_volume;
     volume_gain = (new_volume <= 0.0f) ? 0.0f : 1.0f;
 #ifndef HOST_BUILD
-    int raw = (new_volume <= 0.0f) ? HW_VOLUME_MAX_RAW : volume_db_to_hw_raw(plain_taper_db((double) new_volume));
+    int raw = (new_volume <= 0.0f) ? HW_VOLUME_MAX_RAW : volume_db_to_hw_raw(calibrated_taper_db((double) new_volume));
     audio_output_set_hw_volume_raw(raw, raw);
     if (audio_output_is_usb_active()) {
-        volume_gain = (new_volume <= 0.0f) ? 0.0f : (float) pow(10.0, plain_taper_db((double) new_volume) / 20.0);
+        volume_gain = (new_volume <= 0.0f) ? 0.0f : (float) pow(10.0, calibrated_taper_db((double) new_volume) / 20.0);
     }
 #endif
     pthread_mutex_unlock(&audio_mutex);

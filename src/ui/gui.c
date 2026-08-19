@@ -412,6 +412,16 @@ static int player_source_group_pos = -1; /* row index within the group */
 
 static char player_source_file_browser_dir[PATH_MAX];
 static int player_source_file_browser_row = -1;
+/* Set while the shared Group Songs screen represents an album.  The screen
+ * is reused for artists, favorites and playlists too, so its title alone
+ * cannot identify the source type for persistence. */
+static bool group_songs_source_is_album = false;
+
+/* Resume-but-paused is a true deferred start.  Starting audio and then
+ * immediately pausing races the output open on a headphone-less boot; an
+ * ALSA failure can consume the queue before the pause lands. */
+static bool deferred_resume_pending = false;
+static double deferred_resume_position = 0.0;
 
 /* Queue play mode -- cycled via the order/loop/single/random icon on the
  * player screen (order_icon_event_cb). Persisted as current_settings.play_mode
@@ -3673,6 +3683,8 @@ static void commit_auto_advance(void) {
     if (queued_pending_count > 0) {
         queued_pending_count--;
         if (queued_pending_count == 0) queue_next_insert_index = -1;
+        remote_control_sync_queue(queued_pending_count > 0 ? (const char * const *) &playlist[playlist_index + 2] : NULL,
+                                  queued_pending_count);
         return;
     }
 
@@ -3709,6 +3721,8 @@ static int compute_manual_step_index(int index, int direction) {
     if (direction > 0 && queued_pending_count > 0 && index + 1 < playlist_count) {
         queued_pending_count--;
         if (queued_pending_count == 0) queue_next_insert_index = -1;
+        remote_control_sync_queue(queued_pending_count > 0 ? (const char * const *) &playlist[index + 2] : NULL,
+                                  queued_pending_count);
         return index + 1;
     }
 
@@ -4437,8 +4451,29 @@ static void queue_add_song(const char * path) {
      * have just changed (a brand new queue, or this insert landing exactly
      * there). */
     arm_next_track_for_audio(playlist_index);
+    remote_control_sync_queue((const char * const *) &playlist[playlist_index + 1], queued_pending_count);
 
     show_info_toast("Added to queue");
+}
+
+static void queue_remove_song_at_offset(int offset) {
+    if (offset < 0 || offset >= queued_pending_count || playlist_index < 0) return;
+    int pos = playlist_index + 1 + offset;
+    free(playlist[pos]);
+    memmove(&playlist[pos], &playlist[pos + 1], sizeof(char *) * (size_t) (playlist_count - pos - 1));
+    playlist_count--;
+    queued_pending_count--;
+    queue_next_insert_index = queued_pending_count > 0 ? playlist_index + 1 + queued_pending_count : -1;
+    lv_label_set_text_fmt(song_count_label, "%d/%d", playlist_index + 1, playlist_count);
+    arm_next_track_for_audio(playlist_index);
+    remote_control_sync_queue(queued_pending_count > 0 ? (const char * const *) &playlist[playlist_index + 1] : NULL,
+                              queued_pending_count);
+    show_info_toast("Removed from queue");
+}
+
+static void queue_clear_pending(void) {
+    while (queued_pending_count > 0) queue_remove_song_at_offset(queued_pending_count - 1);
+    show_info_toast("Queue cleared");
 }
 
 /* Bluetooth DAC mode and AirPlay receive mode both feed real-time audio
@@ -4519,7 +4554,10 @@ static void play_track_at_from(int index, double start_seconds) {
     notify_plugin_track_started(&meta);
 
     set_play_button_state(true);
-    nav_push(player_screen);
+    /* Manual next/previous and a deferred startup resume can already be on
+     * the player screen.  Do not stack a duplicate copy of the same screen
+     * just because playback is being (re)started there. */
+    if (lv_screen_active() != player_screen) nav_push(player_screen);
 
     snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist[index]);
     current_settings.last_position = start_seconds;
@@ -4569,6 +4607,7 @@ static void on_file_selected(char ** new_playlist, int count, int selected_index
      * clears "Up Next". */
     queued_pending_count = 0;
     queue_next_insert_index = -1;
+    remote_control_sync_queue(NULL, 0);
     play_track_at(selected_index);
 }
 
@@ -4591,6 +4630,8 @@ static void set_player_source_all_songs(int display_index) {
     clear_player_source();
     player_source_kind = PLAYER_SOURCE_ALL_SONGS;
     player_source_all_songs_index = display_index;
+    current_settings.last_source_kind = 1;
+    current_settings.last_source_name[0] = '\0';
 }
 
 static void set_player_source_file_browser(const char * dir, int row) {
@@ -4598,6 +4639,8 @@ static void set_player_source_file_browser(const char * dir, int row) {
     player_source_kind = PLAYER_SOURCE_FILE_BROWSER;
     snprintf(player_source_file_browser_dir, sizeof(player_source_file_browser_dir), "%s", dir);
     player_source_file_browser_row = row;
+    current_settings.last_source_kind = 0;
+    current_settings.last_source_name[0] = '\0';
 }
 
 /* Wraps on_file_selected() as file_browser_init()'s select_cb, rather than
@@ -4615,6 +4658,13 @@ static void on_file_browser_selected(char ** new_playlist, int count, int select
 
 static void toggle_play_pause(void) {
     if (playlist_index < 0) return; /* nothing loaded yet */
+    if (deferred_resume_pending) {
+        double start_seconds = deferred_resume_position;
+        deferred_resume_pending = false;
+        deferred_resume_position = 0.0;
+        play_track_at_from(playlist_index, start_seconds);
+        return;
+    }
     /* Same DAC-mode exclusion as play_track_at_from() -- only blocks
      * resuming (paused -> playing), pausing an already-playing track always
      * goes through (though bt_dac_toggle_cb()/airplay_toggle_cb() already
@@ -5120,6 +5170,7 @@ static void resume_from_suspend_fixups(void) {
  * forward-declared here since update_timer_cb() (just below) needs it for
  * the remote-control play-by-index consumer. */
 static void all_songs_row_click_cb(int index);
+static char ** all_songs_paths;
 static int all_songs_count;
 static int * all_songs_sort_order;
 /* Defined with the rest of the remote-control scoped-play machinery, much
@@ -5240,6 +5291,15 @@ static void update_timer_cb(lv_timer_t * timer) {
         show_volume_popup(remote_volume_percent);
         refresh_volume_topbar(remote_volume_percent);
     }
+    int remote_queue_index;
+    if (remote_control_consume_queue_index(&remote_queue_index) &&
+        remote_queue_index >= 0 && remote_queue_index < all_songs_count) {
+        queue_add_song(all_songs_paths[remote_queue_index]);
+    }
+    int remote_queue_remove_offset;
+    if (remote_control_consume_queue_remove(&remote_queue_remove_offset))
+        queue_remove_song_at_offset(remote_queue_remove_offset);
+    if (remote_control_consume_queue_clear()) queue_clear_pending();
     int remote_play_index;
     char remote_play_playlist[128], remote_play_artist[128], remote_play_album_artist[128], remote_play_album[128];
     if (remote_control_consume_play_index(&remote_play_index, remote_play_playlist, sizeof(remote_play_playlist),
@@ -7885,6 +7945,9 @@ static void set_player_source_group_songs_direct(const int * indices, int count,
 static void set_player_source_group_songs(int pos) {
     set_player_source_group_songs_direct(group_songs_indices, group_songs_count,
                                           lv_label_get_text(group_songs_title_label), pos);
+    current_settings.last_source_kind = group_songs_source_is_album ? 2 : 0;
+    snprintf(current_settings.last_source_name, sizeof(current_settings.last_source_name), "%s",
+             group_songs_source_is_album ? lv_label_get_text(group_songs_title_label) : "");
 }
 
 /* Playlist design change: user .m3u playlists needed a way to remove a song
@@ -8136,6 +8199,7 @@ static void more_menu_list_cb(lv_event_t * e) {
          * per its own comment) doesn't cover this snapshot anyway. */
         group_songs_edit_m3u_path = NULL;
         group_songs_edit_mode = false;
+        group_songs_source_is_album = current_settings.last_source_kind == 2;
         group_songs_indices = player_source_group_indices;
         group_songs_count = player_source_group_count;
         group_songs_page_start = player_source_group_pos >= 0
@@ -8221,6 +8285,7 @@ static void group_songs_edit_btn_cb(lv_event_t * e) {
 }
 
 static void show_group_songs_editable(const group_t * group, const char * editable_m3u_path) {
+    group_songs_source_is_album = false;
     group_songs_edit_m3u_path = editable_m3u_path;
     group_songs_edit_mode = false;
     group_songs_indices = group->indices;
@@ -10635,6 +10700,7 @@ static void artist_album_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
     show_group_songs(&artist_albums_groups[index]);
+    group_songs_source_is_album = true;
 }
 
 /* Matches by song-index membership (not album NAME, unlike Albums/Album
@@ -10701,6 +10767,7 @@ static void artist_row_click_cb(int index) {
 static void album_row_click_cb(int index) {
     index = search_remap_index(SEARCH_BINDING_ALBUMS, index);
     show_group_songs(&album_groups[index]);
+    group_songs_source_is_album = true;
 }
 
 static lv_obj_t * build_artists_screen(void) {
@@ -11319,11 +11386,23 @@ static void play_remote_control_song(int song_index, const char * playlist_name,
     char scoped_title[128] = "";
 
     if (playlist_name[0] != '\0') {
-        char m3u_path[512];
-        snprintf(m3u_path, sizeof(m3u_path), "%s/%s.m3u", PLAYLISTS_DIR, playlist_name);
         char ** paths = NULL;
         int count = 0;
-        if (file_browser_build_playlist_from_m3u(m3u_path, &paths, &count) && count > 0) {
+        bool loaded = false;
+        if (strcmp(playlist_name, "@favorites") == 0 || strcmp(playlist_name, "Favorites") == 0) {
+            metadata_db_load_favorite_songs(&paths, &count);
+            loaded = true;
+            snprintf(scoped_title, sizeof(scoped_title), "Favorites");
+        } else if (strcmp(playlist_name, "@most_played") == 0 || strcmp(playlist_name, "Most Played") == 0) {
+            metadata_db_load_top_played_songs(MOST_PLAYED_LIMIT, &paths, &count);
+            loaded = true;
+            snprintf(scoped_title, sizeof(scoped_title), "Most Played");
+        } else {
+            char m3u_path[512];
+            snprintf(m3u_path, sizeof(m3u_path), "%s/%s.m3u", PLAYLISTS_DIR, playlist_name);
+            loaded = file_browser_build_playlist_from_m3u(m3u_path, &paths, &count);
+        }
+        if (loaded && count > 0) {
             scoped_indices = malloc(sizeof(int) * (size_t) count);
             for (int i = 0; i < count; i++) {
                 int idx = find_song_index_by_path(paths[i]);
@@ -11331,7 +11410,7 @@ static void play_remote_control_song(int song_index, const char * playlist_name,
             }
             for (int i = 0; i < count; i++) free(paths[i]);
             free(paths);
-            snprintf(scoped_title, sizeof(scoped_title), "%s", playlist_name);
+            if (scoped_title[0] == '\0') snprintf(scoped_title, sizeof(scoped_title), "%s", playlist_name);
         }
     } else if (album_filter[0] != '\0' && (artist_filter[0] != '\0' || album_artist_filter[0] != '\0')) {
         const group_t * parent = artist_filter[0] != '\0'
@@ -16881,6 +16960,19 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
 
 static lv_obj_t * eq_profiles_screen;
 static lv_obj_t * eq_profiles_list;
+/* Name of the named profile whose values are currently loaded.  The PEQ
+ * engine deliberately knows only about values and its always-current
+ * autosave file, so the UI owns this bit of presentation state.  Saving
+ * with this unchanged overwrites that profile; editing it creates a new
+ * profile and makes the new name current. */
+static char eq_current_profile_name[256];
+
+static void eq_set_current_profile_from_path(const char * path) {
+    const char * name = basename_of(path);
+    snprintf(eq_current_profile_name, sizeof(eq_current_profile_name), "%s", name ? name : "");
+    char * dot = strrchr(eq_current_profile_name, '.');
+    if (dot && strcmp(dot, ".peq") == 0) *dot = '\0';
+}
 
 /* Refreshes every widget on the EQ screen from peq.c's current state --
  * shared by the initial build and by "Load Profile" (which changes
@@ -16921,6 +17013,7 @@ static void eq_reset_confirm_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_eq_reset_popup();
     peq_reset_to_defaults();
+    eq_current_profile_name[0] = '\0';
     refresh_all_eq_widgets();
     peq_save();
     show_error_toast("PEQ reset to defaults");
@@ -17213,6 +17306,7 @@ static void eq_profile_row_cb(lv_event_t * e) {
         show_error_toast("Failed to load profile");
         return;
     }
+    eq_set_current_profile_from_path(path);
     refresh_all_eq_widgets();
     peq_save(); /* the loaded profile becomes the new always-current state too */
     nav_pop();
@@ -17277,12 +17371,17 @@ static void eq_save_profile_name_done_cb(const char * text, void * user_data) {
 
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.peq", PEQ_PROFILES_DIR, text);
-    show_error_toast(peq_save_to_path(path) ? "Profile saved" : "Failed to save profile");
+    if (peq_save_to_path(path)) {
+        snprintf(eq_current_profile_name, sizeof(eq_current_profile_name), "%s", text);
+        show_error_toast("Profile saved");
+    } else {
+        show_error_toast("Failed to save profile");
+    }
 }
 
 static void eq_save_profile_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    show_text_entry("Profile Name", "", false, false, eq_save_profile_name_done_cb, NULL);
+    show_text_entry("Profile Name", eq_current_profile_name, false, false, eq_save_profile_name_done_cb, NULL);
 }
 
 static lv_obj_t * build_eq_screen(void) {
@@ -17522,6 +17621,67 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_remove_flag(eq_q_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
     register_swipe_dead_zone(eq_q_card);
     return scr;
+}
+
+/* Rebuild the queue in the same logical context that supplied last_track.
+ * Older settings files have kind 0 and retain the legacy containing-folder
+ * fallback.  Album and All Songs contexts are reconstructed from the
+ * already-loaded metadata index, so the player's List action and next/prev
+ * order survive a reboot instead of silently becoming a different queue. */
+static bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * out_index) {
+    int song_index = find_song_index_by_path(current_settings.last_track);
+
+    if (song_index >= 0 && current_settings.last_source_kind == 2 && current_settings.last_source_name[0]) {
+        for (int g = 0; g < album_group_count; g++) {
+            group_t * group = &album_groups[g];
+            if (strcmp(group->name, current_settings.last_source_name) != 0) continue;
+            int selected = -1;
+            for (int i = 0; i < group->count; i++) {
+                if (group->indices[i] == song_index) { selected = i; break; }
+            }
+            if (selected < 0) continue;
+
+            char ** paths = malloc(sizeof(char *) * (size_t) group->count);
+            for (int i = 0; i < group->count; i++) paths[i] = strdup(all_songs_paths[group->indices[i]]);
+            set_player_source_group_songs_direct(group->indices, group->count, group->name, selected);
+            *out_playlist = paths;
+            *out_count = group->count;
+            *out_index = selected;
+            return true;
+        }
+    }
+
+    if (song_index >= 0 && current_settings.last_source_kind == 1) {
+        int selected = -1;
+        char ** paths = malloc(sizeof(char *) * (size_t) all_songs_count);
+        for (int i = 0; i < all_songs_count; i++) {
+            int idx = all_songs_sort_order[i];
+            paths[i] = strdup(all_songs_paths[idx]);
+            if (idx == song_index) selected = i;
+        }
+        if (selected >= 0) {
+            set_player_source_all_songs(selected);
+            *out_playlist = paths;
+            *out_count = all_songs_count;
+            *out_index = selected;
+            return true;
+        }
+        for (int i = 0; i < all_songs_count; i++) free(paths[i]);
+        free(paths);
+    }
+
+    clear_player_source();
+    return file_browser_build_playlist_for_path(current_settings.last_track, out_playlist, out_count, out_index);
+}
+
+static void prepare_deferred_resume(int index, double start_seconds) {
+    playlist_index = index;
+    track_metadata_t meta;
+    apply_track_metadata_to_ui(index, &meta);
+    set_play_button_state(false);
+    deferred_resume_pending = true;
+    deferred_resume_position = start_seconds;
+    nav_push(player_screen);
 }
 
 void gui_init(uint32_t screen_width, uint32_t screen_height) {
@@ -17991,7 +18151,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
         {
             char ** resume_playlist;
             int resume_count, resume_index;
-            if (file_browser_build_playlist_for_path(current_settings.last_track, &resume_playlist, &resume_count, &resume_index)) {
+            if (build_saved_resume_playlist(&resume_playlist, &resume_count, &resume_index)) {
                 free_playlist();
                 playlist = resume_playlist;
                 playlist_count = resume_count;
@@ -18013,18 +18173,16 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
          * setting up in Settings. */
         char ** resume_playlist;
         int resume_count, resume_index;
-        if (file_browser_build_playlist_for_path(current_settings.last_track, &resume_playlist, &resume_count, &resume_index)) {
+        if (build_saved_resume_playlist(&resume_playlist, &resume_count, &resume_index)) {
             free_playlist();
             playlist = resume_playlist;
             playlist_count = resume_count;
-            play_track_at_from(resume_index, current_settings.last_position);
             if (current_settings.resume_mode == 2) {
-                /* "Resume, but Paused" -- load/seek exactly as resume_mode 1
-                 * does, then immediately pause, same as a user tapping Play
-                 * then Pause right after. No audible auto-play at boot; the
-                 * track is ready the instant the user hits play themselves. */
-                toggle_play_pause();
-            }
+                /* Do not open ALSA at all until the user presses Play.  On
+                 * a headphone-less boot, start-then-pause could lose the
+                 * race to an output-open failure and consume this queue. */
+                prepare_deferred_resume(resume_index, current_settings.last_position);
+            } else play_track_at_from(resume_index, current_settings.last_position);
         }
     }
 #ifndef HOST_BUILD

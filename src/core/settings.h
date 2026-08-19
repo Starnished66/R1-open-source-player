@@ -32,6 +32,8 @@ typedef struct {
     float volume;              /* 0.0 - 1.0 */
     char last_track[512];      /* absolute path, empty if none */
     double last_position;      /* seconds into last_track */
+    int last_source_kind;      /* 0 = unknown/filesystem, 1 = All Songs, 2 = album */
+    char last_source_name[128];/* album title when last_source_kind == 2 */
 
     /* Settings -> Playback -> Resume Last Track. 0 = off (default), 1 =
      * resume and start playing immediately on a cold boot, 2 = resume

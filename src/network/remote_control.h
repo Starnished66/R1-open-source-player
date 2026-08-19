@@ -55,6 +55,17 @@ bool remote_control_consume_mode_cycle(void);
 bool remote_control_consume_seek(int * out_seconds);
 bool remote_control_consume_volume(int * out_percent);
 
+/* POST /api/playback/queue?index=N -- enqueue one library song through
+ * gui.c's normal Up Next splice. out_index uses the same synced-library
+ * index space as remote_control_consume_play_index(). */
+bool remote_control_consume_queue_index(int * out_index);
+bool remote_control_consume_queue_remove(int * out_offset);
+bool remote_control_consume_queue_clear(void);
+
+/* Snapshot the live Up Next run for GET /api/queue. Paths are copied and
+ * translated to synced-library indices while the GUI owns playlist[]. */
+void remote_control_sync_queue(const char * const * paths, int count);
+
 /* Hands remote_control.c its own copy of the library's title/artist
  * strings, indexed exactly the way gui.c's all_songs_paths/all_song_tags
  * are -- GET /api/library returns these same indices, and POST

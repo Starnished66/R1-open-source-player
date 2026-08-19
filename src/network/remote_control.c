@@ -1,5 +1,6 @@
 #include "remote_control.h"
 #include "metadata.h"
+#include "metadata_db.h"
 #include "playlist_files.h"
 
 #include <arpa/inet.h>
@@ -52,6 +53,11 @@ static bool request_has_volume = false;
 static int request_volume_percent = 0;
 static bool request_has_play_index = false;
 static int request_play_index = 0;
+static bool request_has_queue_index = false;
+static int request_queue_index = 0;
+static bool request_has_queue_remove = false;
+static int request_queue_remove_offset = 0;
+static bool request_queue_clear = false;
 /* Real-device bug report: playing a song from the web UI always built the
  * playback queue from the whole library (alphabetical, whatever play_mode
  * happens to be), regardless of which Album/Playlist the song was actually
@@ -80,6 +86,8 @@ static char ** library_album_artists = NULL;
 static char ** library_albums = NULL;
 static char ** library_paths = NULL;
 static int library_count = 0;
+static int * queue_library_indices = NULL;
+static int queue_library_count = 0;
 static char * cached_artists_json = NULL;
 static char * cached_album_artists_json = NULL;
 static char * cached_albums_json = NULL;
@@ -161,6 +169,52 @@ bool remote_control_consume_volume(int * out_percent) {
     return result;
 }
 
+bool remote_control_consume_queue_index(int * out_index) {
+    pthread_mutex_lock(&status_mutex);
+    bool result = request_has_queue_index;
+    if (result) {
+        request_has_queue_index = false;
+        *out_index = request_queue_index;
+    }
+    pthread_mutex_unlock(&status_mutex);
+    return result;
+}
+
+bool remote_control_consume_queue_remove(int * out_offset) {
+    pthread_mutex_lock(&status_mutex);
+    bool result = request_has_queue_remove;
+    if (result) {
+        request_has_queue_remove = false;
+        *out_offset = request_queue_remove_offset;
+    }
+    pthread_mutex_unlock(&status_mutex);
+    return result;
+}
+
+bool remote_control_consume_queue_clear(void) {
+    pthread_mutex_lock(&status_mutex);
+    bool result = request_queue_clear;
+    request_queue_clear = false;
+    pthread_mutex_unlock(&status_mutex);
+    return result;
+}
+
+void remote_control_sync_queue(const char * const * paths, int count) {
+    pthread_mutex_lock(&status_mutex);
+    free(queue_library_indices);
+    queue_library_indices = count > 0 ? malloc(sizeof(int) * (size_t) count) : NULL;
+    queue_library_count = 0;
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < library_count; j++) {
+            if (strcmp(paths[i], library_paths[j]) == 0) {
+                queue_library_indices[queue_library_count++] = j;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&status_mutex);
+}
+
 bool remote_control_consume_play_index(int * out_index, char * out_playlist, size_t playlist_size,
                                         char * out_artist, size_t artist_size, char * out_album_artist,
                                         size_t album_artist_size, char * out_album, size_t album_size) {
@@ -203,6 +257,9 @@ static void free_library(void) {
     cached_artists_json = NULL;
     cached_album_artists_json = NULL;
     cached_albums_json = NULL;
+    free(queue_library_indices);
+    queue_library_indices = NULL;
+    queue_library_count = 0;
 }
 
 void remote_control_sync_library(const char * const * titles, const char * const * artists,
@@ -565,18 +622,38 @@ static void build_playlists_json(char * out, size_t out_size) {
     playlist_files_scan(MUSIC_ROOT_DIR, &paths, &count);
 
     size_t len = 0;
-    len += (size_t) snprintf(out + len, out_size - len, "{\"playlists\":[");
+    len += (size_t) snprintf(out + len, out_size - len,
+                            "{\"playlists\":[{\"name\":\"Favorites\",\"key\":\"@favorites\",\"internal\":true,\"writable\":false},"
+                            "{\"name\":\"Most Played\",\"key\":\"@most_played\",\"internal\":true,\"writable\":false}");
     for (int i = 0; i < count && len + 300 < out_size; i++) {
         const char * slash = strrchr(paths[i], '/');
         const char * base = slash ? slash + 1 : paths[i];
         char name_esc[300] = {0};
         json_escape_append(name_esc, sizeof(name_esc), base);
-        len += (size_t) snprintf(out + len, out_size - len, "%s{\"name\":\"%s\"}", i > 0 ? "," : "", name_esc);
+        len += (size_t) snprintf(out + len, out_size - len,
+                                ",{\"name\":\"%s\",\"internal\":false,\"writable\":true}", name_esc);
     }
     snprintf(out + len, out_size - len, "]}");
 
     for (int i = 0; i < count; i++) free(paths[i]);
     free(paths);
+}
+
+static void build_queue_json(char * out, size_t out_size) {
+    pthread_mutex_lock(&status_mutex);
+    size_t len = (size_t) snprintf(out, out_size, "{\"songs\":[");
+    for (int i = 0; i < queue_library_count && len + 768 < out_size; i++) {
+        int idx = queue_library_indices[i];
+        if (idx < 0 || idx >= library_count) continue;
+        char title[512] = {0}, artist[512] = {0};
+        json_escape_append(title, sizeof(title), library_titles[idx]);
+        json_escape_append(artist, sizeof(artist), library_artists[idx]);
+        len += (size_t) snprintf(out + len, out_size - len,
+                                "%s{\"offset\":%d,\"index\":%d,\"title\":\"%s\",\"artist\":\"%s\"}",
+                                i ? "," : "", i, idx, title, artist);
+    }
+    snprintf(out + len, out_size - len, "]}");
+    pthread_mutex_unlock(&status_mutex);
 }
 
 /* Now Playing page -- polls /api/status every second, transport buttons
@@ -593,7 +670,7 @@ static const char * const NOW_PLAYING_HTML =
     "*{box-sizing:border-box}"
     ":root{--maxw:480px}"
     "body{background:#111;color:#eee;font-family:sans-serif;text-align:center;"
-    "padding:clamp(20px,6vw,40px) 16px;margin:0}"
+    "padding:clamp(20px,6vw,40px) 16px 88px;margin:0}"
     "h1{font-size:1.4em;margin:0 0 4px}"
     "p{color:#aaa;margin:4px 0}"
     "#art{display:none;width:min(55vw,200px);height:min(55vw,200px);object-fit:cover;border-radius:12px;"
@@ -634,8 +711,19 @@ static const char * const NOW_PLAYING_HTML =
     ".row .info{flex:1;min-width:0;cursor:pointer}"
     ".row .t{color:#eee;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
     ".row .a{color:#888;font-size:0.85em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
-    ".row .add{color:#4da3ff;font-size:1.4em;padding:0 10px;cursor:pointer}"
+    ".row .action{color:#4da3ff;font-size:1.1em;padding:8px;cursor:pointer;flex-shrink:0}"
     "#more{color:#888;font-size:0.85em;padding:10px;cursor:pointer}"
+    "#playlistPicker{display:none;position:fixed;inset:0;background:#000b;align-items:center;justify-content:center;z-index:5}"
+    "#playlistPicker .box{background:#1b1b1b;border:1px solid #444;border-radius:12px;padding:18px;width:min(88vw,360px)}"
+    "#playlistPicker select{width:100%;padding:11px;background:#111;color:#eee;border:1px solid #444;border-radius:6px;margin:12px 0}"
+    "#playlistPicker .buttons{display:flex;justify-content:flex-end;gap:10px}"
+    "#playlistPicker button{padding:9px 14px;background:#222;color:#eee;border:1px solid #444;border-radius:6px}"
+    "#toast{position:fixed;left:50%;bottom:76px;transform:translateX(-50%);background:#333;color:#fff;"
+    "padding:10px 16px;border-radius:20px;display:none;z-index:9;max-width:90vw}"
+    "#bottomNav{position:fixed;bottom:0;left:0;right:0;height:64px;background:#181818;border-top:1px solid #333;"
+    "display:flex;z-index:4;padding-bottom:env(safe-area-inset-bottom)}"
+    "#bottomNav button{flex:1;background:none;border:0;color:#999;font-size:.78em;padding:8px 2px}"
+    "#bottomNav button.active{color:#4da3ff}"
     "</style></head><body>"
     "<img id=\"art\" alt=\"\">"
     "<h1 id=\"title\">--</h1><p id=\"artist\"></p><p id=\"album\"></p>"
@@ -658,19 +746,42 @@ static const char * const NOW_PLAYING_HTML =
     "<span id=\"libBack\">&larr; Back</span><span id=\"libTitle\"></span></div>"
     "<input type=\"text\" id=\"search\" placeholder=\"Search library...\" style=\"display:none\">"
     "<div id=\"content\"></div>"
+    "<div id=\"playlistPicker\"><div class=\"box\"><div>Add to playlist</div>"
+    "<select id=\"playlistSelect\"></select><div class=\"buttons\">"
+    "<button onclick=\"closePlaylistPicker()\">Cancel</button>"
+    "<button onclick=\"saveToSelectedPlaylist()\">Add</button></div></div></div>"
+    "<div id=\"toast\" role=\"status\" aria-live=\"polite\"></div>"
+    "<nav id=\"bottomNav\" aria-label=\"Main navigation\">"
+    "<button id=\"navNow\" onclick=\"showNowPlaying()\">Now Playing</button>"
+    "<button id=\"navLibrary\" onclick=\"showMenu()\">Library</button>"
+    "<button id=\"navQueue\" onclick=\"showQueue()\">Queue</button>"
+    "<button id=\"navPlaylists\" onclick=\"showPlaylists()\">Playlists</button></nav>"
     "<script>"
     "var view='menu',artistKind=null,artistName=null,libOffset=0,libQuery='',playContext='';"
     "function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}"
-    "function post(path){fetch(path,{method:'POST'}).catch(()=>{});}"
-    "function addToPlaylist(index){"
-    "var name=prompt('Add to playlist (existing name adds to it, new name creates it):');"
-    "if(!name)return;"
+    "function toast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';"
+    "clearTimeout(t._timer);t._timer=setTimeout(function(){t.style.display='none';},1800);}"
+    "function post(path,okmsg){return fetch(path,{method:'POST'}).then(function(r){if(!r.ok)throw Error();"
+    "if(okmsg)toast(okmsg);return r;}).catch(function(){toast('Device request failed');});}"
+    "function activeNav(id){['navNow','navLibrary','navQueue','navPlaylists'].forEach(function(n){"
+    "document.getElementById(n).classList.toggle('active',n===id);});}"
+    "function showNowPlaying(){view='now';activeNav('navNow');setHeader(false);"
+    "document.getElementById('content').innerHTML='';document.getElementById('content').className='';window.scrollTo(0,0);}"
+    "var pendingPlaylistIndex=-1;"
+    "function addToPlaylist(index){pendingPlaylistIndex=index;"
     "fetch('/api/playlists').then(r=>r.json()).then(function(d){"
-    "var exists=d.playlists.some(function(p){return p.name===(name+'.m3u');});"
-    "var url=(exists?'/api/playlists/add':'/api/playlists')+'?name='+encodeURIComponent(name)+'&index='+index;"
+    "var s=document.getElementById('playlistSelect');s.innerHTML='';"
+    "d.playlists.filter(function(p){return p.writable!==false;}).forEach(function(p){var n=p.name.replace(/\\.m3u8?$/i,'');"
+    "var o=document.createElement('option');o.value=n;o.textContent=n;s.appendChild(o);});"
+    "var o=document.createElement('option');o.value='__new__';o.textContent='Create new playlist...';s.appendChild(o);"
+    "document.getElementById('playlistPicker').style.display='flex';}).catch(()=>{});}"
+    "function closePlaylistPicker(){document.getElementById('playlistPicker').style.display='none';pendingPlaylistIndex=-1;}"
+    "function saveToSelectedPlaylist(){var s=document.getElementById('playlistSelect'),name=s.value;"
+    "var creating=name==='__new__';if(creating){name=prompt('New playlist name:');if(!name)return;}"
+    "var index=pendingPlaylistIndex,url=(creating?'/api/playlists':'/api/playlists/add')+'?name='+encodeURIComponent(name)+'&index='+index;"
     "fetch(url,{method:'POST'}).then(function(r){return r.text().then(function(t){"
-    "alert(r.ok?(exists?'Added to '+name:'Created '+name):('Failed: '+t));});}).catch(()=>{});"
-    "}).catch(()=>{});}"
+    "if(!r.ok)toast('Failed: '+t);else{closePlaylistPicker();toast(creating?'Playlist created':'Added to playlist');}});"
+    "}).catch(function(){toast('Device request failed');});}"
     "function setHeader(visible,title){"
     "document.getElementById('libHeader').style.display=visible?'flex':'none';"
     "document.getElementById('libTitle').textContent=title||'';"
@@ -698,16 +809,18 @@ static const char * const NOW_PLAYING_HTML =
     "var info=document.createElement('div');info.className='info';"
     "info.innerHTML='<div class=\"t\">'+esc(s.title)+'</div><div class=\"a\">'+esc(s.artist)+'</div>';"
     "info.onclick=function(){post('/api/playback/play?index='+s.index+playContext);};"
-    "var add=document.createElement('div');add.className='add';add.textContent='+';"
+    "var queue=document.createElement('div');queue.className='action';queue.title='Add to queue';queue.textContent='Q+';"
+    "queue.onclick=function(e){e.stopPropagation();post('/api/playback/queue?index='+s.index,'Added to queue');};"
+    "var add=document.createElement('div');add.className='action';add.title='Add to playlist';add.textContent='P+';"
     "add.onclick=function(e){e.stopPropagation();addToPlaylist(s.index);};"
-    "row.appendChild(thumb);row.appendChild(info);row.appendChild(add);return row;}"
+    "row.appendChild(thumb);row.appendChild(info);row.appendChild(queue);row.appendChild(add);return row;}"
     "var MENU_ITEMS=["
     "{icon:'all',label:'All Songs',onclick:function(){showAllSongs();}},"
     "{icon:'artist',label:'Artists',onclick:function(){showArtists();}},"
     "{icon:'album_artist',label:'Album Artists',onclick:function(){showAlbumArtists();}},"
     "{icon:'genre',label:'Playlists',onclick:function(){showPlaylists();}}];"
     "function showMenu(){"
-    "view='menu';setHeader(false);"
+    "view='menu';activeNav('navLibrary');setHeader(false);"
     "var el=document.getElementById('content');el.className='menu';el.innerHTML='';"
     "MENU_ITEMS.forEach(function(m){"
     "var tile=document.createElement('div');tile.className='tile';"
@@ -726,10 +839,10 @@ static const char * const NOW_PLAYING_HTML =
     "renderRows(d.artists,function(a){return nameRow(a.name,a.count,"
     "function(){showArtistAlbums('album_artist',a.name);});});}).catch(()=>{});}"
     "function showPlaylists(){"
-    "view='playlists';setHeader(true,'Playlists');"
+    "view='playlists';activeNav('navPlaylists');setHeader(true,'Playlists');"
     "fetch('/api/playlists').then(r=>r.json()).then(function(d){"
-    "renderRows(d.playlists,function(p){var n=p.name.replace(/\\.m3u8?$/i,'');"
-    "return nameRow(n,undefined,function(){showPlaylistSongs(n);});});}).catch(()=>{});}"
+    "renderRows(d.playlists,function(p){var n=p.name.replace(/\\.m3u8?$/i,''),key=p.key||n;"
+    "return nameRow(n,undefined,function(){showPlaylistSongs(key,n);});});}).catch(()=>{});}"
     "function showArtistAlbums(kind,name){"
     "view='artist_albums';artistKind=kind;artistName=name;setHeader(true,name);"
     "var url='/api/library/albums?'+(kind==='artist'?'artist=':'album_artist=')+encodeURIComponent(name);"
@@ -742,15 +855,26 @@ static const char * const NOW_PLAYING_HTML =
     "playContext='&'+kindParam+'&album='+encodeURIComponent(album);"
     "var url='/api/library?limit=200&'+kindParam+'&album='+encodeURIComponent(album);"
     "fetch(url).then(r=>r.json()).then(function(d){renderRows(d.songs,songRow);}).catch(()=>{});}"
-    "function showPlaylistSongs(name){"
-    "view='playlist_songs';setHeader(true,name);"
-    "playContext='&playlist='+encodeURIComponent(name);"
-    "fetch('/api/playlists/songs?name='+encodeURIComponent(name)).then(r=>r.json()).then(function(d){"
+    "function showPlaylistSongs(key,label){"
+    "view='playlist_songs';setHeader(true,label||key);"
+    "playContext='&playlist='+encodeURIComponent(key);"
+    "fetch('/api/playlists/songs?name='+encodeURIComponent(key)).then(r=>r.json()).then(function(d){"
     "renderRows(d.songs,songRow);}).catch(()=>{});}"
     "function showAllSongs(){"
     "view='all_songs';setHeader(true,'All Songs');playContext='';"
     "var s=document.getElementById('search');s.style.display='block';s.value='';libQuery='';"
     "loadLibrary(true);}"
+    "function showQueue(){view='queue';activeNav('navQueue');setHeader(false,'Queue');"
+    "var el=document.getElementById('content');el.className='';el.innerHTML='<p>Loading queue...</p>';"
+    "fetch('/api/queue').then(r=>r.json()).then(function(d){el.innerHTML='';"
+    "if(!d.songs.length){el.innerHTML='<p>Queue is empty</p>';return;}"
+    "d.songs.forEach(function(s){var row=songRow(s);var actions=row.querySelectorAll('.action');"
+    "actions.forEach(function(a){a.remove();});var del=document.createElement('div');del.className='action';"
+    "del.textContent='Remove';del.onclick=function(e){e.stopPropagation();post('/api/queue/remove?offset='+s.offset,'Removed from queue').then(showQueue);};"
+    "row.appendChild(del);el.appendChild(row);});"
+    "var clear=document.createElement('div');clear.id='more';clear.textContent='Clear queue';"
+    "clear.onclick=function(){post('/api/queue/clear','Queue cleared').then(showQueue);};el.appendChild(clear);"
+    "}).catch(function(){el.innerHTML='<p>Could not load queue. Tap to retry.</p>';el.onclick=showQueue;});}"
     "function loadLibrary(reset){"
     "if(reset){libOffset=0;var c=document.getElementById('content');c.className='';c.innerHTML='';}"
     "var url='/api/library?offset='+libOffset+'&limit=50&q='+encodeURIComponent(libQuery);"
@@ -1043,18 +1167,32 @@ static void handle_icon_request(int cfd, const char * path) {
  * rebuild_playlist_m3u_group() (find_song_index_by_path() returning -1 just
  * drops that entry), not an error condition worth surfacing. */
 static void handle_playlist_songs_request(int cfd, const char * path) {
-    char name[128] = {0};
-    if (!query_param_str(path, "name", name, sizeof(name)) || !playlist_name_is_safe(name)) {
+    char raw_name[128] = {0}, name[128] = {0};
+    if (!query_param_str(path, "name", raw_name, sizeof(raw_name))) {
+        send_response(cfd, "400 Bad Request", "text/plain", "Bad Request");
+        return;
+    }
+    url_decode(raw_name, name, sizeof(name));
+    if (!playlist_name_is_safe(name)) {
         send_response(cfd, "400 Bad Request", "text/plain", "Bad Request");
         return;
     }
 
-    char m3u_path[512];
-    snprintf(m3u_path, sizeof(m3u_path), "%s/%s.m3u", PLAYLISTS_DIR, name);
-
     char ** paths = NULL;
     int count = 0;
-    if (!playlist_files_read(m3u_path, &paths, &count)) {
+    bool loaded = false;
+    if (strcmp(name, "@favorites") == 0 || strcmp(name, "Favorites") == 0) {
+        metadata_db_load_favorite_songs(&paths, &count);
+        loaded = true; /* an empty built-in playlist is valid */
+    } else if (strcmp(name, "@most_played") == 0 || strcmp(name, "Most Played") == 0) {
+        metadata_db_load_top_played_songs(20, &paths, &count);
+        loaded = true;
+    } else {
+        char m3u_path[512];
+        snprintf(m3u_path, sizeof(m3u_path), "%s/%s.m3u", PLAYLISTS_DIR, name);
+        loaded = playlist_files_read(m3u_path, &paths, &count);
+    }
+    if (!loaded) {
         send_response(cfd, "404 Not Found", "text/plain", "Playlist not found");
         return;
     }
@@ -1201,6 +1339,10 @@ static void handle_connection(int cfd) {
             send_response(cfd, "200 OK", "application/json", json);
         } else if (strcmp(path_only, "/api/playlists/songs") == 0) {
             handle_playlist_songs_request(cfd, path);
+        } else if (strcmp(path_only, "/api/queue") == 0) {
+            char json[16384];
+            build_queue_json(json, sizeof(json));
+            send_response(cfd, "200 OK", "application/json", json);
         } else if (strcmp(path_only, "/assets/icon") == 0) {
             handle_icon_request(cfd, path);
         } else if (strcmp(path_only, "/") == 0) {
@@ -1304,6 +1446,22 @@ static void handle_connection(int cfd) {
                 } else {
                     ok = false;
                 }
+            } else if (strcmp(path_only, "/api/playback/queue") == 0) {
+                int index;
+                if (query_param_int(path, "index", &index) && index >= 0 && index < library_count) {
+                    request_has_queue_index = true;
+                    request_queue_index = index;
+                } else {
+                    ok = false;
+                }
+            } else if (strcmp(path_only, "/api/queue/remove") == 0) {
+                int offset;
+                if (query_param_int(path, "offset", &offset) && offset >= 0) {
+                    request_has_queue_remove = true;
+                    request_queue_remove_offset = offset;
+                } else ok = false;
+            } else if (strcmp(path_only, "/api/queue/clear") == 0) {
+                request_queue_clear = true;
             } else {
                 ok = false;
             }

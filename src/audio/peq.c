@@ -1,11 +1,13 @@
 #include "peq.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef HOST_BUILD
   #define PEQ_FILE_PATH "./open_hiby_player_peq.txt"
@@ -249,7 +251,7 @@ bool peq_load_from_path(const char * path) {
 }
 
 bool peq_save_to_path(const char * path) {
-    char tmp_path[512];
+    char tmp_path[520];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
 
     FILE * f = fopen(tmp_path, "w");
@@ -265,8 +267,52 @@ bool peq_save_to_path(const char * path) {
         fprintf(f, "band%d_enabled=%d\n", i, bands[i].enabled ? 1 : 0);
     }
 
-    fclose(f);
-    return rename(tmp_path, path) == 0;
+    /* Do not report success until stdio and the underlying SD-card write
+     * have both completed. fclose() errors (card removed/full/read-only)
+     * were previously ignored and could produce a misleading "saved"
+     * toast even though the temp file was incomplete. */
+    bool write_ok = !ferror(f) && fflush(f) == 0 && fsync(fileno(f)) == 0;
+    if (fclose(f) != 0) write_ok = false;
+    if (!write_ok) {
+        fprintf(stderr, "peq: failed writing '%s': %s\n", tmp_path, strerror(errno));
+        unlink(tmp_path);
+        return false;
+    }
+
+    /* rename(temp, target) is atomic and replaces target on normal POSIX
+     * filesystems, so keep that as the fast path. Some FAT/VFAT firmware
+     * combinations reject replacement when the destination already exists,
+     * which made new PEQ profiles save correctly but prevented overwriting
+     * profiles already on the SD card. Fall back to a recoverable two-step
+     * replacement: move the existing profile aside, install the completed
+     * temp file, then remove the backup. If installation fails, restore the
+     * original so an attempted overwrite never destroys the user's preset. */
+    if (rename(tmp_path, path) == 0) return true;
+    int direct_rename_errno = errno;
+    if (access(path, F_OK) != 0) {
+        fprintf(stderr, "peq: rename '%s' -> '%s' failed: %s\n", tmp_path, path, strerror(direct_rename_errno));
+        unlink(tmp_path);
+        return false;
+    }
+
+    char backup_path[520];
+    snprintf(backup_path, sizeof(backup_path), "%s.bak", path);
+    unlink(backup_path); /* stale backup from an interrupted older attempt */
+    if (rename(path, backup_path) != 0) {
+        fprintf(stderr, "peq: could not stage existing profile '%s': %s\n", path, strerror(errno));
+        unlink(tmp_path);
+        return false;
+    }
+    if (rename(tmp_path, path) != 0) {
+        int install_errno = errno;
+        if (rename(backup_path, path) != 0)
+            fprintf(stderr, "peq: CRITICAL: rollback '%s' failed: %s\n", path, strerror(errno));
+        fprintf(stderr, "peq: could not install replacement '%s': %s\n", path, strerror(install_errno));
+        unlink(tmp_path);
+        return false;
+    }
+    unlink(backup_path);
+    return true;
 }
 
 void peq_load(void) {

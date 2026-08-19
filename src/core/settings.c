@@ -76,6 +76,8 @@ static void set_defaults(player_settings_t * out) {
     out->volume = 1.0f;
     out->last_track[0] = '\0';
     out->last_position = 0.0;
+    out->last_source_kind = 0;
+    out->last_source_name[0] = '\0';
     out->resume_mode = 0;
     out->accent_color = 0x2196F3; /* matches the app's existing default blue */
     out->crossfade_enabled = false;
@@ -133,6 +135,10 @@ bool settings_load(player_settings_t * out) {
             snprintf(out->last_track, sizeof(out->last_track), "%s", value);
         } else if (strcmp(key, "last_position") == 0) {
             out->last_position = atof(value);
+        } else if (strcmp(key, "last_source_kind") == 0) {
+            out->last_source_kind = atoi(value);
+        } else if (strcmp(key, "last_source_name") == 0) {
+            snprintf(out->last_source_name, sizeof(out->last_source_name), "%s", value);
         } else if (strcmp(key, "resume_mode") == 0) {
             out->resume_mode = atoi(value);
         } else if (strcmp(key, "accent_color") == 0) {
@@ -253,6 +259,8 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "volume=%.3f\n", (double) settings->volume);
     fprintf(f, "last_track=%s\n", settings->last_track);
     fprintf(f, "last_position=%.3f\n", settings->last_position);
+    fprintf(f, "last_source_kind=%d\n", settings->last_source_kind);
+    fprintf(f, "last_source_name=%s\n", settings->last_source_name);
     fprintf(f, "resume_mode=%d\n", settings->resume_mode);
     fprintf(f, "accent_color=%06X\n", (unsigned int) (settings->accent_color & 0xFFFFFF));
     fprintf(f, "crossfade=%d\n", settings->crossfade_enabled ? 1 : 0);

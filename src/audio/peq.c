@@ -21,13 +21,23 @@
 
 /* Direct Form I biquad: y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2]
  *                              - a1*y[n-1] - a2*y[n-2]
- * (a0 already normalized to 1). */
+ * (a0 already normalized to 1). float, not double -- this is the actual
+ * per-sample hot path (peq_process()'s inner loop below, up to
+ * PEQ_NUM_BANDS cascaded biquads per sample per channel, continuously for
+ * the whole track whenever the user has any band enabled), and single-
+ * precision float's ~144dB dynamic range is already far beyond 16-bit
+ * audio's own ~96dB -- standard practice for audio biquad EQs (e.g. JUCE's
+ * dsp module defaults to float for exactly this filter family), not a real
+ * quality tradeoff on this content. compute_band_coeffs() below still does
+ * its own setup math in double (pow/cos/sin, once per band per change, not
+ * per sample) and only narrows to float in the one assignment into this
+ * struct. */
 typedef struct {
-    double b0, b1, b2, a1, a2;
+    float b0, b1, b2, a1, a2;
 } biquad_coeffs_t;
 
 typedef struct {
-    double x1, x2, y1, y2;
+    float x1, x2, y1, y2;
 } biquad_state_t;
 
 static peq_band_t bands[PEQ_NUM_BANDS];
@@ -180,11 +190,16 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
     if (channels < 1) return;
     if (channels > PEQ_MAX_CHANNELS) channels = PEQ_MAX_CHANNELS;
 
-    double preamp_linear = pow(10.0, preamp_db / 20.0);
+    /* pow() itself stays double (cheap, runs once per call, nowhere near
+     * the per-sample loop below) -- narrowed to float once here rather than
+     * left double and letting every sample's first multiply implicitly
+     * promote back to double, which would silently undo the point of
+     * biquad_coeffs_t/biquad_state_t being float (see their own comment). */
+    float preamp_linear = (float) pow(10.0, preamp_db / 20.0);
 
     for (size_t i = 0; i < frame_count; i++) {
         for (int ch = 0; ch < channels; ch++) {
-            double sample = (double) buf[i * (size_t) channels + (size_t) ch] * preamp_linear;
+            float sample = (float) buf[i * (size_t) channels + (size_t) ch] * preamp_linear;
 
             for (int band = 0; band < PEQ_NUM_BANDS; band++) {
                 if (!bands[band].enabled) continue;
@@ -192,9 +207,9 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
                 biquad_coeffs_t * c = &coeffs[band];
                 biquad_state_t * s = &state[band][ch];
 
-                double x0 = sample;
-                double y0 = c->b0 * x0 + c->b1 * s->x1 + c->b2 * s->x2
-                          - c->a1 * s->y1 - c->a2 * s->y2;
+                float x0 = sample;
+                float y0 = c->b0 * x0 + c->b1 * s->x1 + c->b2 * s->x2
+                         - c->a1 * s->y1 - c->a2 * s->y2;
 
                 s->x2 = s->x1;
                 s->x1 = x0;
@@ -204,8 +219,8 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
                 sample = y0;
             }
 
-            if (sample > 32767.0) sample = 32767.0;
-            if (sample < -32768.0) sample = -32768.0;
+            if (sample > 32767.0f) sample = 32767.0f;
+            if (sample < -32768.0f) sample = -32768.0f;
             buf[i * (size_t) channels + (size_t) ch] = (int16_t) sample;
         }
     }

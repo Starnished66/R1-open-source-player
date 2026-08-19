@@ -2,6 +2,7 @@
 #define AAC_DECODER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* AAC (AAC-LC/HE-AAC) decoding via FAAD2 (github.com/knik0/faad2),
@@ -24,9 +25,14 @@
  *    they're delimited by the container's sample table instead. */
 
 typedef struct aac_decoder aac_decoder_t;
+typedef size_t (*aac_stream_read_cb_t)(void * user_data, void * buf, size_t bytes_to_read);
 
 aac_decoder_t * aac_open_file(const char * path);
 aac_decoder_t * aac_open_file_mp4(const char * path);
+/* Opens an unbounded ADTS-framed AAC source. The callback follows fread's
+ * contract: return fewer than requested bytes only at true end/error. Live
+ * streams have no duration and cannot seek. */
+aac_decoder_t * aac_open_stream(aac_stream_read_cb_t read_cb, void * user_data);
 
 unsigned int aac_get_channels(const aac_decoder_t * dec);
 unsigned int aac_get_sample_rate(const aac_decoder_t * dec);

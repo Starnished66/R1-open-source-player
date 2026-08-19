@@ -1,6 +1,7 @@
 #include "metadata_db.h"
 
 #include <sqlite3.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,9 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <limits.h>
+#include <sys/statvfs.h>
 
 #ifdef HOST_BUILD
   #define METADATA_DB_PATH "./open_hiby_player_music.db"
@@ -62,7 +66,41 @@ static sqlite3_stmt * stmt_put = NULL;
 static sqlite3_stmt * stmt_mark_seen = NULL;
 static int64_t update_generation = 0;
 static int update_ops_since_commit = 0;
+static bool update_failed = false;
 #define METADATA_DB_UPDATE_BATCH 128
+
+/* SQLite's serialized mode protects an individual sqlite3 handle, but it
+ * cannot protect this module's handle/statement pointers while a scan swaps
+ * them from the SD database to the /usr/data scratch copy and back. A
+ * recursive module lock also covers metadata_db_open()'s warm-start import,
+ * which calls metadata_db_put() from inside the already-locked open path. */
+static pthread_once_t metadata_db_mutex_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t metadata_db_mutex;
+
+static void metadata_db_mutex_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&metadata_db_mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+typedef struct { bool locked; } metadata_db_guard_t;
+static void metadata_db_guard_release(metadata_db_guard_t * guard) {
+    if (guard->locked) pthread_mutex_unlock(&metadata_db_mutex);
+}
+#define METADATA_DB_GUARD \
+    pthread_once(&metadata_db_mutex_once, metadata_db_mutex_init); \
+    pthread_mutex_lock(&metadata_db_mutex); \
+    metadata_db_guard_t metadata_db_guard __attribute__((cleanup(metadata_db_guard_release))) = { true }
+
+/* True for the duration of an update pass that's scanning into a scratch
+ * copy on /usr/data rather than writing directly to the SD-resident db --
+ * see metadata_db_begin_update()'s own comment. Always defined (not just
+ * under #ifndef HOST_BUILD) since metadata_db_begin_update() resets it
+ * unconditionally; only ever set true on target, where the scratch-copy
+ * machinery actually exists. */
+static bool update_using_usr_data_scratch = false;
 
 /* NULL is a valid, harmless argument to sqlite3_finalize()/sqlite3_close()
  * -- used freely below instead of guarding every call. */
@@ -233,29 +271,18 @@ static void import_from_stock_player_db(void) {
 #endif
 
 #ifndef HOST_BUILD
-/* One-time migration for anyone updating from before this file moved to the
- * SD card (see METADATA_DB_PATH's own comment) -- without this, a device
- * with an existing database at the old path would silently appear to lose
- * every song_favorite/song_play_count/playlist/subsonic_server row (real
- * user data, not just the rebuildable tag cache) the next time the app
- * opens, since it would just create a fresh empty database at the new path
- * instead. Plain read/copy/write rather than rename() -- the old and new
- * paths are on different filesystems (ubifs vs. the SD card's vfat), and
- * rename(2) can't cross that boundary (EXDEV). Only removes the old copy
- * once every byte of the new one has been written successfully, so a
- * failure partway through (e.g. the SD card filling up) leaves the original
- * still in place to retry from, rather than losing both. */
-#define OLD_METADATA_DB_PATH "/usr/data/open_hiby_player_music.db"
-static void migrate_old_db_if_needed(void) {
-    if (access(METADATA_DB_PATH, F_OK) == 0) return; /* already migrated (or fresh install) */
-    if (access(OLD_METADATA_DB_PATH, F_OK) != 0) return; /* nothing to migrate */
-
-    FILE * in = fopen(OLD_METADATA_DB_PATH, "rb");
-    if (!in) return;
-    FILE * out = fopen(METADATA_DB_PATH, "wb");
+/* Plain read/copy/write rather than rename() -- callers use this across the
+ * ubifs (/usr/data) / SD card (vfat) boundary, and rename(2) can't cross
+ * that (EXDEV). Leaves dst untouched (removes a partial write) on failure,
+ * so a caller that finds this returning false can trust the destination is
+ * either a complete copy or doesn't exist, never a truncated one. */
+static bool copy_file(const char * src, const char * dst) {
+    FILE * in = fopen(src, "rb");
+    if (!in) return false;
+    FILE * out = fopen(dst, "wb");
     if (!out) {
         fclose(in);
-        return;
+        return false;
     }
 
     bool ok = true;
@@ -268,14 +295,31 @@ static void migrate_old_db_if_needed(void) {
         }
     }
     ok = ok && !ferror(in);
-    fclose(in);
-    fclose(out);
+    if (ok && fflush(out) != 0) ok = false;
+    if (ok && fsync(fileno(out)) != 0) ok = false;
+    if (fclose(in) != 0) ok = false;
+    if (fclose(out) != 0) ok = false;
 
-    if (ok) {
-        remove(OLD_METADATA_DB_PATH);
-    } else {
-        remove(METADATA_DB_PATH); /* don't leave a truncated/partial db at the new path */
-    }
+    if (!ok) remove(dst);
+    return ok;
+}
+
+/* One-time migration for anyone updating from before this file moved to the
+ * SD card (see METADATA_DB_PATH's own comment) -- without this, a device
+ * with an existing database at the old path would silently appear to lose
+ * every song_favorite/song_play_count/playlist/subsonic_server row (real
+ * user data, not just the rebuildable tag cache) the next time the app
+ * opens, since it would just create a fresh empty database at the new path
+ * instead. Only removes the old copy once every byte of the new one has
+ * been written successfully (copy_file()'s own contract), so a failure
+ * partway through (e.g. the SD card filling up) leaves the original still
+ * in place to retry from, rather than losing both. */
+#define OLD_METADATA_DB_PATH "/usr/data/open_hiby_player_music.db"
+static void migrate_old_db_if_needed(void) {
+    if (access(METADATA_DB_PATH, F_OK) == 0) return; /* already migrated (or fresh install) */
+    if (access(OLD_METADATA_DB_PATH, F_OK) != 0) return; /* nothing to migrate */
+
+    if (copy_file(OLD_METADATA_DB_PATH, METADATA_DB_PATH)) remove(OLD_METADATA_DB_PATH);
 }
 #endif
 
@@ -312,9 +356,139 @@ static bool music_root_is_mounted(void) {
     if (stat("/data/mnt/sd_0", &root_st) != 0) return false;
     return parent_st.st_dev != root_st.st_dev;
 }
+
+/* Real-device incident: the SD card (FAT32, unjournaled) got its directory/
+ * FAT-table structures corrupted after the device hung under memory
+ * pressure mid-rescan and had to be power-cycled -- confirmed via a
+ * subsequent `fdisk`/filesystem-level recovery off-device. metadata_db_get()/
+ * put() checkpoint (COMMIT+BEGIN) every METADATA_DB_UPDATE_BATCH ops during
+ * a rescan (see metadata_db_update_checkpoint_if_needed()), which bounds
+ * SQLite's own rollback-journal growth but still means dozens of commits
+ * landing directly on the FAT32-backed db file for a large library's whole
+ * scan duration -- exactly the sustained-direct-SD-write pattern an unclean
+ * shutdown mid-scan can corrupt. metadata_db_begin_update() below scans into
+ * a scratch copy on /usr/data instead when there's room (see its own
+ * comment), touching the SD card only twice: one read here, one bounded
+ * copy-back at the end. This is the same OLD_METADATA_DB_PATH partition
+ * that a giant single-transaction rescan once exhausted (see
+ * METADATA_DB_PATH's own comment on why the db moved OFF /usr/data in the
+ * first place) -- safe to use again now specifically because that
+ * transaction is no longer unbounded, just this one scratch copy's
+ * checkpointed growth. Removes every *.db file already there first (stale
+ * pre-migration leftovers, or a previous scan's scratch copy that never got
+ * cleaned up because the app was killed mid-scan) so free-space accounting
+ * isn't skewed by debris this app itself is responsible for, and so nothing
+ * else ever mistakes one of those for a real database. */
+static void remove_stray_usr_data_dbs(void) {
+    DIR * dir = opendir("/usr/data");
+    if (!dir) return;
+
+    struct dirent * de;
+    while ((de = readdir(dir)) != NULL) {
+        const char * ext = strrchr(de->d_name, '.');
+        if (!ext || strcmp(ext, ".db") != 0) continue;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "/usr/data/%s", de->d_name);
+        remove(path);
+    }
+    closedir(dir);
+}
+
+/* needed_bytes should cover the scratch copy itself plus room for it to
+ * grow (new rows added during the scan) -- callers pass roughly 2x the
+ * current SD-resident db's size, which also covers checkpointing's bounded
+ * rollback-journal overhead. f_frsize (not f_bsize) is the correct unit for
+ * f_bavail per statvfs(3); falls back to f_bsize on the rare filesystem that
+ * reports f_frsize as 0. */
+static bool usr_data_has_room_for_scan_copy(int64_t needed_bytes) {
+    struct statvfs vfs;
+    if (statvfs("/usr/data", &vfs) != 0) return false;
+    unsigned long block_size = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+    int64_t free_bytes = (int64_t) vfs.f_bavail * (int64_t) block_size;
+    return free_bytes >= needed_bytes;
+}
+
+#define METADATA_DB_SCAN_TMP_PATH "/usr/data/.open_hiby_player_scan_tmp.db"
+#define METADATA_DB_COPYBACK_TMP_PATH "/data/mnt/sd_0/.open_hiby_player_music.db.tmp"
+#define METADATA_DB_SCAN_MIN_HEADROOM_BYTES (2 * 1024 * 1024)
+
+static bool usr_data_has_scan_headroom(void) {
+    return usr_data_has_room_for_scan_copy(METADATA_DB_SCAN_MIN_HEADROOM_BYTES);
+}
+
+static bool database_quick_check_ok(sqlite3 * handle) {
+    sqlite3_stmt * st = NULL;
+    bool ok = sqlite3_prepare_v2(handle, "PRAGMA quick_check;", -1, &st, NULL) == SQLITE_OK &&
+              sqlite3_step(st) == SQLITE_ROW &&
+              strcmp((const char *) sqlite3_column_text(st, 0), "ok") == 0;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* Closes the scratch connection and reopens `db` against the real SD-
+ * resident file. A successful end-update publishes the verified scratch
+ * database; abort/failure paths discard it and retain the previous SD copy.
+ * Publication copies to a .tmp name on the SD card first, then rename()s it
+ * over the real path -- same filesystem (vfat), so that rename is atomic.
+ * A crash/power-loss during the copy itself leaves stale .tmp debris on the
+ * card but never touches METADATA_DB_PATH, so the previous, still-valid
+ * scan result survives; only a crash during the (fast, local) rename call
+ * itself could lose data, and that's the same irreducible risk any rename()-
+ * based atomic replace carries. If the copy-back fails for any other reason
+ * (SD card unmounted mid-scan, filled up, etc.) the old file is left alone
+ * and this scan's results are lost -- strictly no worse than direct-to-SD
+ * writing's own failure mode here, and better than it in every case where
+ * the SD card was the thing that failed, since direct writing would have
+ * been mid-mutation on the real file when that happened. */
+static void metadata_db_finish_update_scratch_if_needed(bool publish) {
+    if (!update_using_usr_data_scratch) return;
+    update_using_usr_data_scratch = false;
+
+    sqlite3_finalize(stmt_get);
+    sqlite3_finalize(stmt_put);
+    sqlite3_finalize(stmt_mark_seen);
+    stmt_get = stmt_put = stmt_mark_seen = NULL;
+    if (publish && !database_quick_check_ok(db)) publish = false;
+    sqlite3 * scratch_db = db;
+    int close_rc = sqlite3_close(scratch_db);
+    if (close_rc != SQLITE_OK) {
+        publish = false;
+        /* No module-owned statement remains and the module mutex excludes
+         * concurrent API calls. close_v2 is the defensive final release if
+         * SQLite nevertheless reports an unexpected outstanding object. */
+        sqlite3_close_v2(scratch_db);
+    }
+    db = NULL;
+
+    bool replaced = false;
+    if (publish && close_rc == SQLITE_OK && music_root_is_mounted() &&
+        copy_file(METADATA_DB_SCAN_TMP_PATH, METADATA_DB_COPYBACK_TMP_PATH)) {
+        replaced = rename(METADATA_DB_COPYBACK_TMP_PATH, METADATA_DB_PATH) == 0;
+        if (replaced) {
+            int dir_fd = open("/data/mnt/sd_0", O_RDONLY);
+            if (dir_fd >= 0) {
+                fsync(dir_fd); /* best-effort FAT directory-entry durability */
+                close(dir_fd);
+            }
+        }
+    }
+    if (!replaced) {
+        remove(METADATA_DB_COPYBACK_TMP_PATH);
+    }
+    remove(METADATA_DB_SCAN_TMP_PATH);
+
+    if (music_root_is_mounted() && sqlite3_open(METADATA_DB_PATH, &db) == SQLITE_OK) {
+        prepare_statements();
+    } else {
+        sqlite3_close(db);
+        db = NULL;
+    }
+}
 #endif
 
 void metadata_db_open(void) {
+    METADATA_DB_GUARD;
     if (db) return;
 
 #ifndef HOST_BUILD
@@ -398,6 +572,7 @@ void metadata_db_open(void) {
 }
 
 void metadata_db_close(void) {
+    METADATA_DB_GUARD;
     sqlite3_finalize(stmt_get);
     sqlite3_finalize(stmt_put);
     sqlite3_finalize(stmt_mark_seen);
@@ -412,17 +587,80 @@ static void metadata_db_update_checkpoint_if_needed(void) {
     if (!db || update_generation == 0) return;
     if (++update_ops_since_commit < METADATA_DB_UPDATE_BATCH) return;
 
+#ifndef HOST_BUILD
+    if (update_using_usr_data_scratch && !usr_data_has_scan_headroom()) {
+        update_failed = true;
+        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        update_ops_since_commit = 0;
+        return;
+    }
+#endif
+
     /* Bound rollback-journal/WAL growth. Scan-generation marking makes a
      * partially checkpointed scan safe: stale rows are not pruned until
      * metadata_db_end_update(), so a crash or abandoned scan merely leaves
      * a mixture of old/new generations that the next full pass supersedes. */
-    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
-    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    if (sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK ||
+        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) {
+        update_failed = true;
+    }
     update_ops_since_commit = 0;
 }
 
 void metadata_db_begin_update(void) {
+    METADATA_DB_GUARD;
     if (!db) return;
+
+    update_using_usr_data_scratch = false;
+    update_failed = false;
+#ifndef HOST_BUILD
+    /* See remove_stray_usr_data_dbs()'s own comment for the corruption
+     * incident this guards against. Cleans up first (unconditionally) so
+     * the space check right after isn't skewed by debris this app left
+     * behind, then only switches `db` over to the scratch copy if there's
+     * room -- falls through to scanning the SD-resident file directly
+     * (today's only behavior) otherwise, never a hard failure. */
+    remove_stray_usr_data_dbs();
+
+    struct stat sd_st;
+    if (stat(METADATA_DB_PATH, &sd_st) == 0) {
+        int64_t needed = (int64_t) sd_st.st_size * 2 + METADATA_DB_SCAN_MIN_HEADROOM_BYTES;
+        if (usr_data_has_room_for_scan_copy(needed)) {
+            /* Close the SD-resident connection before copying its file --
+             * avoids reading it through a second, independent fd while
+             * SQLite might still hold internal state (e.g. cached pages)
+             * against the first. */
+            sqlite3 * sd_db = db;
+            sqlite3_finalize(stmt_get);
+            sqlite3_finalize(stmt_put);
+            sqlite3_finalize(stmt_mark_seen);
+            stmt_get = stmt_put = stmt_mark_seen = NULL;
+            int close_rc = sqlite3_close(sd_db);
+            db = NULL;
+
+            if (close_rc != SQLITE_OK) {
+                /* Keep the still-live handle usable; never overwrite/leak it
+                 * merely because SQLite refused the close. With the module
+                 * lock this should be unreachable, but it is a safe fallback. */
+                db = sd_db;
+            } else if (copy_file(METADATA_DB_PATH, METADATA_DB_SCAN_TMP_PATH) &&
+                sqlite3_open(METADATA_DB_SCAN_TMP_PATH, &db) == SQLITE_OK) {
+                update_using_usr_data_scratch = true;
+            } else {
+                sqlite3_close(db);
+                db = NULL;
+                remove(METADATA_DB_SCAN_TMP_PATH);
+                if (sqlite3_open(METADATA_DB_PATH, &db) != SQLITE_OK) {
+                    sqlite3_close(db);
+                    db = NULL;
+                }
+            }
+            if (db) prepare_statements();
+        }
+    }
+
+    if (!db) return; /* only reachable if reopening METADATA_DB_PATH itself somehow failed just above -- stay defensive rather than prepare_v2() against a NULL handle below */
+#endif
 
     sqlite3_stmt * st = NULL;
     int64_t max_generation = 0;
@@ -434,19 +672,20 @@ void metadata_db_begin_update(void) {
     update_generation = max_generation + 1;
     if (update_generation <= 0) update_generation = 1; /* overflow/corruption guard */
     update_ops_since_commit = 0;
-    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    if (sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) update_failed = true;
 }
 
 bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags_t * out) {
+    METADATA_DB_GUARD;
     if (!db) return false;
 
     /* Mark as observed without building an O(N) TEMP seen_paths table. */
-    if (update_generation != 0) {
+    if (update_generation != 0 && !update_failed) {
         sqlite3_reset(stmt_mark_seen);
         sqlite3_clear_bindings(stmt_mark_seen);
         sqlite3_bind_int64(stmt_mark_seen, 1, update_generation);
         sqlite3_bind_text(stmt_mark_seen, 2, path, -1, SQLITE_STATIC);
-        sqlite3_step(stmt_mark_seen);
+        if (sqlite3_step(stmt_mark_seen) != SQLITE_DONE) update_failed = true;
         metadata_db_update_checkpoint_if_needed();
     }
 
@@ -468,7 +707,9 @@ bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags
 }
 
 void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cached_tags_t * tags) {
+    METADATA_DB_GUARD;
     if (!db) return;
+    if (update_failed) return;
 
     sqlite3_reset(stmt_put);
     sqlite3_clear_bindings(stmt_put);
@@ -481,36 +722,56 @@ void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cache
     sqlite3_bind_text(stmt_put, 7, tags->album_artist, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt_put, 8, tags->genre, -1, SQLITE_STATIC);
     sqlite3_bind_int64(stmt_put, 9, update_generation);
-    sqlite3_step(stmt_put);
+    if (sqlite3_step(stmt_put) != SQLITE_DONE) update_failed = true;
     metadata_db_update_checkpoint_if_needed();
 }
 
 void metadata_db_end_update(void) {
+    METADATA_DB_GUARD;
     if (!db || update_generation == 0) return;
 
     /* Deletion detection is now an indexed generation comparison rather than
      * NOT IN against an in-memory TEMP table containing every scanned path. */
     sqlite3_stmt * st = NULL;
-    if (sqlite3_prepare_v2(db, "DELETE FROM media WHERE scan_generation <> ?;", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, update_generation);
-        sqlite3_step(st);
+    if (!update_failed) {
+        if (sqlite3_prepare_v2(db, "DELETE FROM media WHERE scan_generation <> ?;", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, update_generation);
+            if (sqlite3_step(st) != SQLITE_DONE) update_failed = true;
+        } else {
+            update_failed = true;
+        }
     }
     sqlite3_finalize(st);
-    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    if (sqlite3_exec(db, update_failed ? "ROLLBACK;" : "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) update_failed = true;
     update_generation = 0;
     update_ops_since_commit = 0;
+
+#ifndef HOST_BUILD
+    metadata_db_finish_update_scratch_if_needed(!update_failed);
+#endif
+    update_failed = false;
 }
 
 void metadata_db_abort_update(void) {
+    METADATA_DB_GUARD;
     if (!db || update_generation == 0) return;
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
     /* Do not prune anything: rows already marked with this generation are
      * harmless. The next complete scan chooses a larger generation. */
     update_generation = 0;
     update_ops_since_commit = 0;
+
+#ifndef HOST_BUILD
+    /* The old SD database is still intact, so an interrupted scratch scan
+     * is safer to discard than publish. Direct-to-SD fallback retains its
+     * historical partial-generation behavior above. */
+    metadata_db_finish_update_scratch_if_needed(false);
+#endif
+    update_failed = false;
 }
 
 void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * out_count) {
+    METADATA_DB_GUARD;
     *out_paths = NULL;
     *out_tags = NULL;
     *out_count = 0;
@@ -551,6 +812,7 @@ void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * o
 }
 
 void metadata_db_book_replace_all(char * const * paths, int count) {
+    METADATA_DB_GUARD;
     if (!db) return;
 
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
@@ -578,6 +840,7 @@ void metadata_db_book_replace_all(char * const * paths, int count) {
 }
 
 void metadata_db_load_all_books(char *** out_paths, int * out_count) {
+    METADATA_DB_GUARD;
     *out_paths = NULL;
     *out_count = 0;
     if (!db) return;
@@ -607,6 +870,7 @@ void metadata_db_load_all_books(char *** out_paths, int * out_count) {
 }
 
 void metadata_db_playlist_replace_all(char * const * paths, int count) {
+    METADATA_DB_GUARD;
     if (!db) return;
 
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
@@ -626,6 +890,7 @@ void metadata_db_playlist_replace_all(char * const * paths, int count) {
 }
 
 void metadata_db_load_all_playlists(char *** out_paths, int * out_count) {
+    METADATA_DB_GUARD;
     *out_paths = NULL;
     *out_count = 0;
     if (!db) return;
@@ -655,6 +920,7 @@ void metadata_db_load_all_playlists(char *** out_paths, int * out_count) {
 }
 
 void metadata_db_playlist_insert_one(const char * path) {
+    METADATA_DB_GUARD;
     if (!db) return;
 
     sqlite3_stmt * st = NULL;
@@ -668,6 +934,7 @@ void metadata_db_playlist_insert_one(const char * path) {
 }
 
 void metadata_db_playlist_delete_one(const char * path) {
+    METADATA_DB_GUARD;
     if (!db) return;
 
     sqlite3_stmt * st = NULL;
@@ -678,6 +945,7 @@ void metadata_db_playlist_delete_one(const char * path) {
 }
 
 bool metadata_db_book_favorite_is_set(const char * path) {
+    METADATA_DB_GUARD;
     if (!db) return false;
 
     sqlite3_stmt * st = NULL;
@@ -689,6 +957,7 @@ bool metadata_db_book_favorite_is_set(const char * path) {
 }
 
 void metadata_db_book_favorite_set(const char * path, bool is_favorite) {
+    METADATA_DB_GUARD;
     if (!db) return;
 
     sqlite3_stmt * st = NULL;
@@ -706,6 +975,7 @@ void metadata_db_book_favorite_set(const char * path, bool is_favorite) {
 }
 
 void metadata_db_load_favorite_books(char *** out_paths, int * out_count) {
+    METADATA_DB_GUARD;
     *out_paths = NULL;
     *out_count = 0;
     if (!db) return;
@@ -750,6 +1020,7 @@ void metadata_db_load_favorite_books(char *** out_paths, int * out_count) {
  * joined against media instead of book. ---- */
 
 bool metadata_db_song_favorite_is_set(const char * path) {
+    METADATA_DB_GUARD;
     if (!db) return false;
 
     sqlite3_stmt * st = NULL;
@@ -761,6 +1032,7 @@ bool metadata_db_song_favorite_is_set(const char * path) {
 }
 
 void metadata_db_song_favorite_set(const char * path, bool is_favorite) {
+    METADATA_DB_GUARD;
     if (!db) return;
 
     sqlite3_stmt * st = NULL;
@@ -778,6 +1050,7 @@ void metadata_db_song_favorite_set(const char * path, bool is_favorite) {
 }
 
 void metadata_db_load_favorite_songs(char *** out_paths, int * out_count) {
+    METADATA_DB_GUARD;
     *out_paths = NULL;
     *out_count = 0;
     if (!db) return;
@@ -819,6 +1092,7 @@ void metadata_db_load_favorite_songs(char *** out_paths, int * out_count) {
 }
 
 void metadata_db_song_play_count_increment(const char * path) {
+    METADATA_DB_GUARD;
     if (!db) return;
 
     sqlite3_stmt * st = NULL;
@@ -833,6 +1107,7 @@ void metadata_db_song_play_count_increment(const char * path) {
 }
 
 void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_count) {
+    METADATA_DB_GUARD;
     *out_paths = NULL;
     *out_count = 0;
     if (!db || limit <= 0) return;
@@ -869,6 +1144,7 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
 }
 
 void metadata_db_subsonic_server_save(const char * url, const char * username, const char * password, bool verify_tls) {
+    METADATA_DB_GUARD;
     if (!db) return;
 
     sqlite3_stmt * st = NULL;
@@ -886,6 +1162,7 @@ void metadata_db_subsonic_server_save(const char * url, const char * username, c
 }
 
 void metadata_db_load_subsonic_servers(subsonic_server_row_t ** out_rows, int * out_count) {
+    METADATA_DB_GUARD;
     *out_rows = NULL;
     *out_count = 0;
     if (!db) return;

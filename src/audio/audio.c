@@ -134,18 +134,34 @@ static bool decoder_open(decoder_t * dec, const char * path) {
     if (is_stream_url(path)) {
         const char * hint = stream_format_hint(path);
         bool is_flac = hint && strcasecmp(hint, ".flac") == 0;
+        bool is_aac = hint && (strcasecmp(hint, ".aac") == 0 || strcasecmp(hint, ".aacp") == 0);
 
-        /* Live network stream -- MP3 and FLAC both have a callback-based
-         * streaming API already available in their vendored decoders (see
-         * flac_stream_seek_cb()'s own comment for FLAC's real seek
-         * requirement, and drmp3_init()'s tolerance of NULL onSeek/onTell
-         * for MP3). Everything else either prescans the whole file up front
-         * (fundamentally incompatible with an infinite/unbounded source) or
-         * has no callback abstraction available at all -- see audio.h's
-         * own top comment. Absent a recognized hint, MP3 is the default
-         * (matches this feature's original internet-radio-only behavior). */
+        /* Live network stream -- MP3/FLAC use their callback-based decoder
+         * APIs, while ADTS AAC uses aac_open_stream()'s incremental framing
+         * path. FLAC's callback seek constraints are documented above;
+         * dr_mp3 tolerates NULL onSeek/onTell, and live AAC never seeks or
+         * prescans. Other formats still require a finite file/container.
+         * Absent a recognized hint or AAC Content-Type, MP3 remains the
+         * default for compatibility with ordinary internet-radio URLs. */
         dec->net_stream = http_stream_open(path, true);
         if (!dec->net_stream) return false;
+
+        const char * content_type = http_stream_content_type(dec->net_stream);
+        if (strncasecmp(content_type, "audio/aac", 9) == 0) is_aac = true;
+
+        if (is_aac) {
+            dec->type = DECODER_AAC;
+            dec->as.aac = aac_open_stream(stream_read_cb, dec->net_stream);
+            if (!dec->as.aac) {
+                http_stream_close(dec->net_stream);
+                dec->net_stream = NULL;
+                return false;
+            }
+            dec->channels = aac_get_channels(dec->as.aac);
+            dec->sample_rate = aac_get_sample_rate(dec->as.aac);
+            dec->total_frames = 0;
+            return true;
+        }
 
         if (is_flac) {
             dec->type = DECODER_FLAC;
@@ -371,6 +387,7 @@ static void decoder_close(decoder_t * dec) {
             break;
         case DECODER_AAC:
             if (dec->as.aac) aac_close(dec->as.aac);
+            if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_ALAC:
             if (dec->as.alac) alac_close(dec->as.alac);
@@ -432,6 +449,12 @@ static bool low_power_mode = false;
 
 /* Set by audio_seek(), consumed by the playback thread. -1 means no pending seek. */
 static int64_t pending_seek_frame = -1;
+/* Tags a seek with the track generation it was calculated against.  A
+ * progress-bar release can race a manual next/previous request: without a
+ * generation, the playback thread may spend several seconds seeking the
+ * decoder that is about to be discarded before it notices the restart. */
+static uint64_t playback_generation = 0;
+static uint64_t pending_seek_generation = 0;
 
 static uint64_t frames_played = 0;
 static uint64_t current_total_frames = 0;
@@ -625,6 +648,7 @@ static void * audio_thread_func(void * arg) {
         cur_path_local = restart_path; restart_path = NULL; /* ownership transferred */
         double start_seconds = restart_start_seconds;
         cur_replaygain_linear = restart_replaygain_linear;
+        uint64_t cur_generation = playback_generation;
         pthread_mutex_unlock(&audio_mutex);
 
         close_decoder_if_open(&nxt_dec, &nxt_open);
@@ -700,8 +724,9 @@ static void * audio_thread_func(void * arg) {
             }
             bool do_stop = stop_requested;
             bool do_restart = restart_requested;
-            int64_t seek_frame = pending_seek_frame;
-            pending_seek_frame = -1;
+            int64_t seek_frame = (pending_seek_generation == cur_generation)
+                ? pending_seek_frame : -1;
+            if (pending_seek_generation == cur_generation) pending_seek_frame = -1;
             bool xfade_on = crossfade_enabled;
             float vol = volume_gain;
             uint64_t chunk_frames = low_power_mode ? LOW_POWER_CHUNK_FRAMES : NORMAL_CHUNK_FRAMES;
@@ -732,6 +757,15 @@ static void * audio_thread_func(void * arg) {
             if (do_stop) { was_stopped = true; break; }
 
             if (seek_frame >= 0) {
+                /* A manual track change may have arrived after the request
+                 * snapshot above.  Decoder seeks (notably MP3/APE on slow
+                 * SD cards) are synchronous and cannot be interrupted once
+                 * entered, so give the newer restart priority immediately
+                 * before making that potentially expensive call. */
+                pthread_mutex_lock(&audio_mutex);
+                bool seek_is_stale = restart_requested || playback_generation != cur_generation;
+                pthread_mutex_unlock(&audio_mutex);
+                if (seek_is_stale) { should_restart = true; break; }
                 decoder_seek(&cur_dec, (uint64_t) seek_frame);
                 cur_frames_played_local = (uint64_t) seek_frame;
                 pthread_mutex_lock(&audio_mutex);
@@ -919,6 +953,7 @@ void audio_play_file_at(const char * path, double start_seconds,
     paused = false;
     track_finished = false;
     track_advanced = false;
+    playback_generation++;
     pending_seek_frame = -1;
     pthread_cond_signal(&audio_cond);
     pthread_mutex_unlock(&audio_mutex);
@@ -1021,6 +1056,7 @@ void audio_seek(double seconds) {
     uint64_t frame = (uint64_t) (seconds * (double) current_sample_rate);
     if (frame > current_total_frames) frame = current_total_frames;
     pending_seek_frame = (int64_t) frame;
+    pending_seek_generation = playback_generation;
     pthread_cond_signal(&audio_cond); /* wake if paused, so the seek applies immediately */
     pthread_mutex_unlock(&audio_mutex);
 }

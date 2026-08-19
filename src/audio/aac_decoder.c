@@ -12,7 +12,8 @@
 
 typedef enum {
     AAC_SOURCE_ADTS,
-    AAC_SOURCE_MP4
+    AAC_SOURCE_MP4,
+    AAC_SOURCE_STREAM
 } aac_source_type_t;
 
 struct aac_decoder {
@@ -22,6 +23,10 @@ struct aac_decoder {
     FILE * f;
     uint64_t * frame_offsets;
     uint64_t frame_count;
+
+    /* AAC_SOURCE_STREAM: incremental ADTS input, owned by the caller. */
+    aac_stream_read_cb_t stream_read_cb;
+    void * stream_user_data;
 
     /* AAC_SOURCE_MP4 */
     mp4_demux_t * demux;
@@ -121,17 +126,30 @@ static unsigned int read_compressed_frame(aac_decoder_t * dec, uint64_t frame_in
         return frame_length;
     }
 
+    if (dec->source_type == AAC_SOURCE_STREAM) {
+        /* A network read may begin between frames after a reconnect or a
+         * malformed packet. Keep a seven-byte sliding window until the
+         * next valid ADTS sync/header rather than ending playback forever
+         * on the first stray byte. The bounded 13-bit ADTS length prevents
+         * an attacker/server error from overflowing frame_buf. */
+        if (dec->stream_read_cb(dec->stream_user_data, buf, 7) != 7) return 0;
+        unsigned int frame_length;
+        while (!parse_adts_header(buf, &frame_length) || frame_length > buf_size) {
+            memmove(buf, buf + 1, 6);
+            if (dec->stream_read_cb(dec->stream_user_data, buf + 6, 1) != 1) return 0;
+        }
+        if (frame_length <= 7) return 0;
+        if (dec->stream_read_cb(dec->stream_user_data, buf + 7, frame_length - 7) != frame_length - 7) return 0;
+        return frame_length;
+    }
+
     /* AAC_SOURCE_MP4: no ADTS header, the container already delimits frames */
     uint32_t size;
     if (!mp4_demux_read_sample(dec->demux, (uint32_t) frame_index, buf, buf_size, &size)) return 0;
     return size;
 }
 
-static bool decode_next_frame(aac_decoder_t * dec) {
-    uint8_t frame_buf[ADTS_MAX_FRAME_BYTES];
-    unsigned int frame_length = read_compressed_frame(dec, dec->current_frame_index, frame_buf, sizeof(frame_buf));
-    if (frame_length == 0) return false;
-
+static bool decode_frame_bytes(aac_decoder_t * dec, uint8_t * frame_buf, unsigned int frame_length) {
     NeAACDecFrameInfo info;
     memset(&info, 0, sizeof(info));
     void * samples = NeAACDecDecode(dec->handle, &info, frame_buf, frame_length);
@@ -149,6 +167,13 @@ static bool decode_next_frame(aac_decoder_t * dec) {
 
     dec->current_frame_index++;
     return true;
+}
+
+static bool decode_next_frame(aac_decoder_t * dec) {
+    uint8_t frame_buf[ADTS_MAX_FRAME_BYTES];
+    unsigned int frame_length = read_compressed_frame(dec, dec->current_frame_index, frame_buf, sizeof(frame_buf));
+    if (frame_length == 0) return false;
+    return decode_frame_bytes(dec, frame_buf, frame_length);
 }
 
 static void configure_decoder(NeAACDecHandle handle) {
@@ -289,6 +314,48 @@ aac_decoder_t * aac_open_file_mp4(const char * path) {
     return dec;
 }
 
+aac_decoder_t * aac_open_stream(aac_stream_read_cb_t read_cb, void * user_data) {
+    if (!read_cb) return NULL;
+
+    aac_decoder_t * dec = calloc(1, sizeof(*dec));
+    if (!dec) return NULL;
+    dec->source_type = AAC_SOURCE_STREAM;
+    dec->stream_read_cb = read_cb;
+    dec->stream_user_data = user_data;
+    dec->handle = NeAACDecOpen();
+    if (!dec->handle) { free(dec); return NULL; }
+    configure_decoder(dec->handle);
+
+    uint8_t first_frame[ADTS_MAX_FRAME_BYTES];
+    unsigned int first_frame_length = read_compressed_frame(dec, 0, first_frame, sizeof(first_frame));
+    if (first_frame_length == 0) { aac_close(dec); return NULL; }
+
+    unsigned long init_sample_rate;
+    unsigned char init_channels;
+    if (NeAACDecInit(dec->handle, first_frame, first_frame_length, &init_sample_rate, &init_channels) < 0 ||
+        init_sample_rate == 0 || init_channels == 0 || init_channels > AAC_MAX_CHANNELS) {
+        aac_close(dec);
+        return NULL;
+    }
+    dec->sample_rate = (unsigned int) init_sample_rate;
+    dec->channels = (unsigned int) init_channels;
+
+    /* The frame used for auto-configuration is still the first compressed
+     * access unit and must also be decoded; NeAACDecInit only inspects it.
+     * AAC priming can yield zero PCM for one or more initial frames, so keep
+     * feeding frames until actual output establishes frame_size. */
+    if (!decode_frame_bytes(dec, first_frame, first_frame_length)) {
+        aac_close(dec);
+        return NULL;
+    }
+    while (dec->carry_frames == 0) {
+        if (!decode_next_frame(dec)) { aac_close(dec); return NULL; }
+    }
+    dec->frame_size = (unsigned int) dec->carry_frames;
+    dec->total_pcm_frames = 0; /* live/unbounded */
+    return dec;
+}
+
 unsigned int aac_get_channels(const aac_decoder_t * dec) {
     return dec->channels;
 }
@@ -326,6 +393,7 @@ uint64_t aac_read_pcm_frames_s16(aac_decoder_t * dec, uint64_t frames_to_read, i
 }
 
 bool aac_seek_to_pcm_frame(aac_decoder_t * dec, uint64_t frame_index) {
+    if (dec->source_type == AAC_SOURCE_STREAM) return false;
     if (frame_index > dec->total_pcm_frames) frame_index = dec->total_pcm_frames;
 
     uint64_t total_frame_count = (dec->source_type == AAC_SOURCE_ADTS) ? dec->frame_count : mp4_demux_get_sample_count(dec->demux);

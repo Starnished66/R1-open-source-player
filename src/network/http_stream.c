@@ -15,6 +15,7 @@
  * provide against a network hiccup. Not tuned against a real device yet;
  * a first-pass sizing, not a measured constant. */
 #define STREAM_RING_CAPACITY (256 * 1024)
+#define STREAM_MAX_REDIRECTS 5
 
 struct http_stream {
     http_conn_t conn;
@@ -133,7 +134,7 @@ static void * stream_thread_func(void * arg) {
     return NULL;
 }
 
-http_stream_t * http_stream_open(const char * url, bool verify_tls) {
+static http_stream_t * http_stream_open_internal(const char * url, bool verify_tls, int redirects_left) {
     bool is_https;
     char host[256], port[16], path[2048];
     if (!http_conn_parse_url(url, &is_https, host, sizeof(host), port, sizeof(port), path, sizeof(path))) {
@@ -194,14 +195,9 @@ http_stream_t * http_stream_open(const char * url, bool verify_tls) {
 
     const char * sp = strchr(status_line, ' ');
     int status = sp ? atoi(sp + 1) : 0;
-    if (status < 200 || status >= 300) {
-        DBG_LOG("http_stream: non-2xx status %d from host='%s'\n", status, host);
-        http_conn_close(&s->conn);
-        free(s);
-        return NULL;
-    }
 
     char header_line[1024];
+    char redirect_url[1024] = "";
     while (http_conn_reader_line(&s->reader, header_line, sizeof(header_line)) && header_line[0] != '\0') {
         char * colon = strchr(header_line, ':');
         if (!colon) continue;
@@ -215,7 +211,38 @@ http_stream_t * http_stream_open(const char * url, bool verify_tls) {
             char * semi = strchr(value, ';');
             if (semi) *semi = '\0';
             snprintf(s->content_type, sizeof(s->content_type), "%s", value);
+        } else if (strcasecmp(header_line, "Location") == 0) {
+            snprintf(redirect_url, sizeof(redirect_url), "%s", value);
         }
+    }
+
+    /* Radio aggregators commonly return a short-lived, signed stream URL
+     * via 301/302/307/308 rather than audio in the first response (Zeno/
+     * SurferNetwork is one real example).  Unlike ordinary finite HTTP
+     * downloads there is no useful stable URL for Radio.txt to substitute:
+     * the Location token expires after about a minute, so redirects must be
+     * followed when playback starts. Keep this bounded to prevent loops.
+     * Location is deliberately required to be absolute http(s) here;
+     * http_conn_parse_url() then applies the same scheme/host validation as
+     * the original request, while ambiguous relative redirects fail cleanly. */
+    if (status >= 300 && status < 400 && redirect_url[0] != '\0') {
+        http_conn_close(&s->conn);
+        free(s);
+        if (redirects_left <= 0 ||
+            (strncasecmp(redirect_url, "http://", 7) != 0 && strncasecmp(redirect_url, "https://", 8) != 0)) {
+            DBG_LOG("http_stream: refused redirect status=%d location='%s' remaining=%d\n",
+                    status, redirect_url, redirects_left);
+            return NULL;
+        }
+        DBG_LOG("http_stream: following redirect status=%d to '%s'\n", status, redirect_url);
+        return http_stream_open_internal(redirect_url, verify_tls, redirects_left - 1);
+    }
+
+    if (status < 200 || status >= 300) {
+        DBG_LOG("http_stream: non-2xx status %d from host='%s'\n", status, host);
+        http_conn_close(&s->conn);
+        free(s);
+        return NULL;
     }
     DBG_LOG("http_stream: status=%d content_type='%s' chunked=%d\n", status, s->content_type, s->is_chunked);
 
@@ -239,6 +266,10 @@ http_stream_t * http_stream_open(const char * url, bool verify_tls) {
     }
 
     return s;
+}
+
+http_stream_t * http_stream_open(const char * url, bool verify_tls) {
+    return http_stream_open_internal(url, verify_tls, STREAM_MAX_REDIRECTS);
 }
 
 size_t http_stream_read(http_stream_t * s, void * buf, size_t n) {

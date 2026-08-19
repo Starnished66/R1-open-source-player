@@ -101,6 +101,13 @@
  * gui.c's own status-bar polling already does more often than this). */
 #define CHARGE_LIMITER_REEVALUATE_SECONDS 5
 
+/* Exported read-only UI state. This tracks a successfully requested hold,
+ * not the kernel power_supply status (confirmed stale on this device: it
+ * can keep saying "Charging" while REG18 chg_en is clear and REG01 says
+ * not_charging). Only the GUI timer/settings callbacks call this module, so
+ * no cross-thread synchronization is needed. */
+static bool limiter_holding = false;
+
 #if CHARGE_LIMITER_ACTIVE
 static bool axp2101_smbus_xfer(uint8_t reg, uint8_t * value, bool write) {
     int fd = open(AXP2101_I2C_BUS, O_RDWR);
@@ -173,8 +180,6 @@ void charge_limiter_poll(bool enabled, bool force) {
     return;
 #else
     static struct timespec last_apply;
-    static bool limiter_holding = false;
-
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     if (!force && last_apply.tv_sec != 0 && now.tv_sec - last_apply.tv_sec < CHARGE_LIMITER_REEVALUATE_SECONDS) return;
@@ -208,6 +213,10 @@ void charge_limiter_poll(bool enabled, bool force) {
     bool applied = limiter_holding ? disable_charging() : enable_charging();
     if (!applied) last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
 #endif
+}
+
+bool charge_limiter_is_holding(void) {
+    return limiter_holding;
 }
 
 void safe_charging_poll(bool enabled, bool force) {

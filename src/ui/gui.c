@@ -448,6 +448,19 @@ static int shuffle_order_count = 0; /* playlist_count this bag was generated for
 static int shuffle_pos = -1;        /* index into shuffle_order such that shuffle_order[shuffle_pos] == playlist_index */
 
 static bool user_seeking = false;
+/* A short debounce keeps a seek followed immediately by next/previous from
+ * entering a slow synchronous decoder seek for a track that is about to be
+ * discarded.  It is imperceptible compared with the 500 ms UI refresh and
+ * is cancelled by play_track_at_from(). */
+static lv_timer_t * pending_progress_seek_timer;
+static double pending_progress_seek_seconds;
+
+static void cancel_pending_progress_seek(void) {
+    if (pending_progress_seek_timer) {
+        lv_timer_delete(pending_progress_seek_timer);
+        pending_progress_seek_timer = NULL;
+    }
+}
 static int32_t displayed_progress_percent = -1;
 static int displayed_position_second = -1;
 static int displayed_duration_second = -1;
@@ -1281,6 +1294,17 @@ static void sync_topbar_status_icon_positions(void);
 static void refresh_battery_topbar(void) {
     int percent = battery_get_display_percent();
 
+    /* The fuel gauge can recalibrate upward after charging is stopped, and
+     * the kernel's preferred battery/status node remains stale at
+     * "Charging" even while AXP2101 REG18 has chg_en cleared and REG01 says
+     * not_charging. Without this limiter-aware presentation, battery.c's
+     * direction filter walks the visible number from 85 toward that stale
+     * raw value, making a working electrical cutoff look broken. Keep the
+     * raw percentage untouched for charge_limiter_poll()'s hysteresis; only
+     * cap what the 85%-limit UI promises to show while a hold is active. */
+    bool charge_limiter_holding = charge_limiter_is_holding();
+    if (charge_limiter_holding && percent > 85) percent = 85;
+
     /* battery_icon_frame (the outline + fill gauge) is always shown --
      * current_settings.show_battery_percent (Settings > Power > "Battery
      * Percentage") only ever hides the "NN%" digit readout below, never the
@@ -1305,7 +1329,7 @@ static void refresh_battery_topbar(void) {
     }
     if (percent > 100) percent = 100;
 
-    bool charging = battery_is_charging();
+    bool charging = !charge_limiter_holding && battery_is_charging();
     bool low = !charging && percent < 5;
 
     lv_image_set_src(battery_icon_frame,
@@ -2332,6 +2356,19 @@ static void close_quick_drawer(void) {
 
 static bool library_rescan_active; /* defined with the rest of the Update Music Database rescan, below -- see poll_quick_drawer_drag()'s own use of it */
 
+/* Handle stashed by gui_init() at creation time -- see poll_quick_drawer_
+ * drag()'s own comment on why this timer runs at LV_DEF_REFR_PERIOD (~60fps)
+ * instead of update_timer_cb's shared 500ms one. Paused by poll_quick_
+ * drawer_drag() itself the instant nothing's pressed (so a ~60fps timer
+ * doesn't sit registered forever, capping how long main()'s own idle
+ * usleep() between lv_timer_handler() calls can ever be -- real cost even
+ * though each individual idle tick barely does anything) and resumed by
+ * resume_fast_gesture_timers_cb() (registered on the pointer indev, next to
+ * this timer's own creation in gui_init()) the instant a new press begins
+ * anywhere -- LV_EVENT_PRESSED is the one indev event LVGL dispatches
+ * regardless of hit target (see poll_quick_drawer_drag()'s own doc comment
+ * on why that's reliable here but LV_EVENT_PRESSING isn't). */
+static lv_timer_t * quick_drawer_drag_timer = NULL;
 static bool quick_drawer_drag_tracking = false;
 static bool quick_drawer_was_pressed = false;
 static int32_t quick_drawer_drag_touch_start_y = 0;
@@ -2519,7 +2556,6 @@ static bool player_swipe_press_excluded(lv_point_t p) {
 }
 
 static void poll_quick_drawer_drag(lv_timer_t * timer) {
-    (void) timer;
     lv_indev_t * indev = find_pointer_indev();
     if (!indev) return;
 
@@ -2816,6 +2852,14 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     }
 
     quick_drawer_was_pressed = pressed;
+
+    /* Every release-handling branch above (drawer snap, player-swipe
+     * settle) has already run by this point in the same call that observed
+     * the release -- nothing left to track until resume_fast_gesture_
+     * timers_cb() wakes this again on the next press-down. See this
+     * timer's own handle comment for why pausing (not just letting the
+     * ~60fps tick keep firing and no-op) is what actually matters here. */
+    if (!pressed) lv_timer_pause(timer);
 }
 
 /* Forward declarations -- defined later in this file (with the player
@@ -4246,16 +4290,6 @@ static void poll_cover_decode(void) {
         current_reflection_dsc.data = current_reflection_bytes;
         current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * REFLECTION_HEIGHT * 2;
         lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
-
-        /* TEMPORARY DIAGNOSTIC -- forcing a full-screen invalidate (not just
-         * cover_img's own, which lv_image_set_src() already does internally)
-         * to test whether this device's custom direct-render/page-flip fbdev
-         * patch (lv_conf.h, search "pan_double_buffer") has a bug specific to
-         * how the dirty region is computed for a single large (480x480)
-         * widget update, vs however a full-screen invalidate's dirty region
-         * ends up differing. Remove once the real album-art corruption bug
-         * is found. */
-        lv_obj_invalidate(lv_screen_active());
     }
 
     cover_decode_result_pixels = NULL;
@@ -4264,6 +4298,22 @@ static void poll_cover_decode(void) {
     if (cover_decode_pending_valid) {
         cover_decode_pending_valid = false;
         launch_cover_decode_req(cover_decode_pending); /* not launch_cover_decode() -- must carry stream_url too, see that field's own comment */
+        /* Real-device incident: ownership of picture_data just passed into
+         * launch_cover_decode_req() above (either into a freshly malloc'd
+         * req, or back into this same cover_decode_pending if a decode was
+         * somehow still active) -- but this struct still holds a copy of
+         * that same pointer. Left as-is, a rapid next track change landing
+         * before the handed-off decode finishes would call
+         * launch_cover_decode_req() again, see cover_decode_active still
+         * true, and free(cover_decode_pending.picture_data) a buffer the
+         * in-flight decode thread already owns and will free itself --
+         * double free, reproduced by rapidly pressing Next/Prev. Clearing
+         * the pointer here (not inside launch_cover_decode_req(), which
+         * can't tell "just consumed" apart from "still needs freeing" for
+         * its own r argument) makes this copy stop looking like it owns
+         * the buffer. */
+        cover_decode_pending.picture_data = NULL;
+        cover_decode_pending.picture_size = 0;
     }
 }
 
@@ -4568,6 +4618,8 @@ static void play_track_at_from(int index, double start_seconds) {
         return;
     }
 
+    cancel_pending_progress_seek();
+    user_seeking = false;
     playlist_index = index;
 
     track_metadata_t meta;
@@ -5077,16 +5129,25 @@ static void eq_q_slider_event_cb(lv_event_t * e) {
     }
 }
 
+static void pending_progress_seek_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    pending_progress_seek_timer = NULL;
+    audio_seek(pending_progress_seek_seconds);
+}
+
 static void progress_slider_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * slider = lv_event_get_target(e);
 
     if (code == LV_EVENT_PRESSED) {
         user_seeking = true;
-    } else if (code == LV_EVENT_RELEASED) {
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
         double duration = audio_get_duration_seconds();
         int32_t percent = lv_slider_get_value(slider);
-        audio_seek(duration * ((double) percent / 100.0));
+        pending_progress_seek_seconds = duration * ((double) percent / 100.0);
+        cancel_pending_progress_seek();
+        pending_progress_seek_timer = lv_timer_create(pending_progress_seek_timer_cb, 150, NULL);
+        lv_timer_set_repeat_count(pending_progress_seek_timer, 1);
         user_seeking = false;
     }
 }
@@ -7598,183 +7659,17 @@ static void scan_one_song_into_db(const char * path) {
     if (have_stat) metadata_db_put(path, mtime, size, &fresh);
 }
 
-/* Runs the original (pre-timeout) stat + cache-lookup + metadata_read body
- * for every file from start_index to all_songs_count, writing straight into
- * the shared all_song_tags array -- exactly like a plain for loop, no
- * per-file thread spawning. An earlier version of this function ran each
- * file's stat()/metadata_read() on its own throwaway thread; that bounded a
- * stuck read correctly, but on this device (single core, 56MB RAM) spawning
- * two threads per file made a real ~2000-song library visibly slow, purely
- * from thread-create overhead on files that were never actually going to
- * hang. completed_index is updated after each file so scan_songs_range()
- * (below) can tell this worker apart from a genuinely stuck one without
- * touching any per-file timing itself. */
-typedef struct {
-    int start_index;
-    volatile int completed_index; /* last index this worker fully finished; written last within each iteration */
-    volatile bool done;
-} scan_range_work_t;
-
 /* Overall scan progress, polled by update_timer_cb while library_rescan_active
  * is true to drive the "Updating music database..." screen's progress bar
  * (Settings > Update Music Database) -- purely cosmetic, for the user's
  * peace of mind that a rescan is actually moving rather than stuck, since
  * the underlying incremental scan (metadata_db.c's mtime/size cache) is
- * already fast on an unchanged library. _total is set once all_songs_count
- * is known (library_scan_once(), before scan_songs_range() starts); _done
- * only ever increases across however many sequential scan_range_worker
- * threads a scan actually uses (see scan_songs_range()'s own comment on
- * why there can be more than one), so a single running total here is safe
- * without needing to know which worker is currently active. */
+ * already fast on an unchanged library. _total is set once discovered_count
+ * is known (library_scan_once(), before its spool-reading loop starts);
+ * _done is advanced by that same loop, one file at a time (see
+ * scan_one_song_into_db()'s own caller in library_scan_once()). */
 static volatile int library_scan_progress_done = 0;
 static int library_scan_progress_total = 0;
-
-static void * scan_range_worker(void * arg) {
-    scan_range_work_t * w = (scan_range_work_t *) arg;
-    w->completed_index = w->start_index - 1;
-
-    for (int i = w->start_index; i < all_songs_count; i++) {
-        struct stat st;
-        bool have_stat = stat(all_songs_paths[i], &st) == 0;
-        int64_t mtime = have_stat ? (int64_t) st.st_mtime : 0;
-        int64_t size = have_stat ? (int64_t) st.st_size : 0;
-
-        cached_tags_t cached;
-        /* cached.title[0] == '\0' also forces a fresh read, not just a
-         * missing/changed cache row -- rows written before the title column
-         * existed got backfilled to '' by metadata_db.c's ALTER TABLE
-         * migration, and would otherwise stay blank forever (mtime/size
-         * still match, so metadata_db_get() would keep "hitting" that same
-         * stale empty title on every future scan too). The ongoing cost for
-         * a file that genuinely has no title tag is one extra
-         * metadata_read() per scan for that file only, not the whole
-         * library -- worth it to self-heal every already-cached library
-         * the first time it's rescanned under the new schema. */
-        if (have_stat && metadata_db_get(all_songs_paths[i], mtime, size, &cached) && cached.title[0] != '\0') {
-            snprintf(all_song_tags[i].title, sizeof(all_song_tags[i].title), "%s", cached.title);
-            snprintf(all_song_tags[i].artist, sizeof(all_song_tags[i].artist), "%s", cached.artist);
-            snprintf(all_song_tags[i].album, sizeof(all_song_tags[i].album), "%s", cached.album);
-            snprintf(all_song_tags[i].album_artist, sizeof(all_song_tags[i].album_artist), "%s", cached.album_artist);
-            snprintf(all_song_tags[i].genre, sizeof(all_song_tags[i].genre), "%s", cached.genre);
-            w->completed_index = i;
-            library_scan_progress_done = i + 1;
-            continue;
-        }
-
-        /* Isolated (forked + hard-killed on timeout), not a plain
-         * metadata_read() call -- real-device incident: a handful of FLAC
-         * files with a malformed leading ID3v2 tag made the underlying
-         * parser (dr_flac, misparsing garbage as fake metadata blocks --
-         * see metadata_read_isolated()'s own comment) pathologically slow
-         * on this single-core device, and since the stuck-worker handling
-         * below can only ever ABANDON a stuck thread (never actually stop
-         * it), several such files in a row each left one more runaway
-         * thread permanently competing for the one core -- which read as
-         * the whole device freezing even though no single file was
-         * technically stuck forever. This still leaves the stuck-worker
-         * handling below in place as a backstop, but it should now rarely
-         * or never trigger, since a single file's parse can no longer
-         * block this worker indefinitely. */
-        track_metadata_t meta;
-        metadata_read_isolated(all_songs_paths[i], &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS);
-        snprintf(all_song_tags[i].title, sizeof(all_song_tags[i].title), "%s", meta.has_title ? meta.title : "");
-        snprintf(all_song_tags[i].artist, sizeof(all_song_tags[i].artist), "%s", meta.has_artist ? meta.artist : "Unknown Artist");
-        snprintf(all_song_tags[i].album, sizeof(all_song_tags[i].album), "%s", meta.has_album ? meta.album : "Unknown Album");
-        /* Album artist falls back to the track artist (not "Unknown") when
-         * there's no explicit ALBUMARTIST/TPE2/aART tag -- for the common
-         * non-compilation case, the album artist genuinely IS the track
-         * artist, and a tagger simply not bothering to write a redundant
-         * second tag shouldn't dump the song into an "Unknown" bucket the
-         * user has to know to check. */
-        const char * album_artist_value = meta.has_album_artist ? meta.album_artist
-                                         : (meta.has_artist ? meta.artist : "Unknown Artist");
-        snprintf(all_song_tags[i].album_artist, sizeof(all_song_tags[i].album_artist), "%s", album_artist_value);
-        snprintf(all_song_tags[i].genre, sizeof(all_song_tags[i].genre), "%s", meta.has_genre ? meta.genre : "Unknown Genre");
-        free(meta.picture_data); /* only the tags were needed, not the art */
-
-        if (have_stat) {
-            cached_tags_t fresh;
-            snprintf(fresh.title, sizeof(fresh.title), "%s", all_song_tags[i].title);
-            snprintf(fresh.artist, sizeof(fresh.artist), "%s", all_song_tags[i].artist);
-            snprintf(fresh.album, sizeof(fresh.album), "%s", all_song_tags[i].album);
-            snprintf(fresh.album_artist, sizeof(fresh.album_artist), "%s", all_song_tags[i].album_artist);
-            snprintf(fresh.genre, sizeof(fresh.genre), "%s", all_song_tags[i].genre);
-            metadata_db_put(all_songs_paths[i], mtime, size, &fresh);
-        }
-        w->completed_index = i; /* written last -- the only field scan_songs_range() polls */
-        library_scan_progress_done = i + 1;
-    }
-
-    w->done = true;
-    return NULL;
-}
-
-/* Covers [start_index, all_songs_count) by handing the whole range to one
- * worker thread -- the common case (a healthy card) pays for exactly one
- * thread for the entire scan, not one per file. If the worker goes
- * LIBRARY_SCAN_FILE_TIMEOUT_MS without finishing another file, it's
- * considered stuck on completed_index+1 (a corrupted block -- see the block
- * comment further up on why this can't be interrupted, only abandoned): that
- * worker is leaked exactly like the timeout cases above, the stuck file's
- * tags are filled with a placeholder, and a fresh worker picks up one file
- * further along. Thread creation only happens once per scan plus once per
- * actual stall, so a large healthy library costs the same as the original
- * unbounded loop. */
-static void scan_songs_range(int start_index) {
-    /* For very large libraries on memory-constrained devices, process in smaller chunks
-     * to avoid memory exhaustion. On devices with only 30MB storage, we limit chunk size
-     * to reduce peak memory usage. */
-    const int CHUNK_SIZE = 500;  /* Process 500 songs at a time to avoid OOM on small devices */
-    
-    while (start_index < all_songs_count) {
-        int end_index = start_index + CHUNK_SIZE;
-        if (end_index > all_songs_count) {
-            end_index = all_songs_count;
-        }
-        
-        scan_range_work_t * w = calloc(1, sizeof(*w));
-        w->start_index = start_index;
-
-        pthread_t thread;
-        if (pthread_create(&thread, NULL, scan_range_worker, w) != 0) {
-            free(w);
-            return; /* can't spawn a thread at all -- remaining tags stay at their malloc'd (garbage) contents, same failure mode as the rest of this call chain already tolerates */
-        }
-        pthread_detach(thread); /* never joined either way -- see block comment above */
-
-        int last_seen = start_index - 1;
-        int waited_ms = 0;
-        for (;;) {
-            if (w->done) { 
-                free(w); 
-                start_index = end_index;  /* Move to next chunk */
-                break; 
-            }
-            int completed = w->completed_index;
-            if (completed != last_seen) {
-                last_seen = completed;
-                waited_ms = 0;
-            } else {
-                waited_ms += 20;
-                if (waited_ms >= LIBRARY_SCAN_FILE_TIMEOUT_MS) break;
-            }
-            usleep(20000);
-        }
-
-        if (!w->done) {
-            /* Timeout occurred, abandon this worker */
-            int stuck_index = last_seen + 1; /* w is now abandoned -- never touch it again */
-            fprintf(stderr, "Warning: timed out reading tags from %s (possible filesystem corruption) -- skipping\n", all_songs_paths[stuck_index]);
-            all_song_tags[stuck_index].title[0] = '\0';
-            snprintf(all_song_tags[stuck_index].artist, sizeof(all_song_tags[stuck_index].artist), "Unknown Artist");
-            snprintf(all_song_tags[stuck_index].album, sizeof(all_song_tags[stuck_index].album), "Unknown Album");
-            snprintf(all_song_tags[stuck_index].album_artist, sizeof(all_song_tags[stuck_index].album_artist), "Unknown Artist");
-            snprintf(all_song_tags[stuck_index].genre, sizeof(all_song_tags[stuck_index].genre), "Unknown Genre");
-            start_index = stuck_index + 1;
-            break; /* Break on timeout to prevent infinite loop */
-        }
-    }
-}
 
 /* Defined later, alongside the rest of the Books screen (needs
  * books_scan_txt_files_with_timeout(), the live-walk fallback it shares
@@ -11086,12 +10981,14 @@ static void build_az_jump_table(az_index_binding_t * b, int * table) {
     }
 }
 
+/* Same pause/resume treatment as quick_drawer_drag_timer above, and for the
+ * same reason -- see its own comment. */
+static lv_timer_t * az_index_drag_timer = NULL;
 static bool az_index_dragging = false;
 static az_index_binding_t * az_index_active_binding = NULL;
 static int az_index_jump_table[27];
 
 static void poll_az_index_drag(lv_timer_t * timer) {
-    (void) timer;
     lv_indev_t * indev = find_pointer_indev();
     if (!indev) return;
 
@@ -11100,7 +10997,17 @@ static void poll_az_index_drag(lv_timer_t * timer) {
     lv_indev_get_point(indev, &p);
 
     if (!az_index_dragging) {
-        if (!pressed) return;
+        /* Only paused here (truly idle -- resumed on the next press-down by
+         * resume_fast_gesture_timers_cb(), see this timer's own handle
+         * comment) and in the just-released branch below, not in either
+         * return just past this one: those happen mid-press (on a screen/
+         * area with no A-Z strip *yet*), and a press can still slide into
+         * the strip's own bounds before it lifts -- pausing there would
+         * stop catching that. */
+        if (!pressed) {
+            lv_timer_pause(timer);
+            return;
+        }
         az_index_binding_t * b = find_az_binding_for_screen(lv_screen_active());
         if (!b) return;
 
@@ -11116,6 +11023,7 @@ static void poll_az_index_drag(lv_timer_t * timer) {
         lv_obj_add_flag(az_index_active_binding->popup, LV_OBJ_FLAG_HIDDEN);
         az_index_dragging = false;
         az_index_active_binding = NULL;
+        lv_timer_pause(timer);
         return;
     }
 
@@ -11976,6 +11884,13 @@ static void * library_rescan_thread_func(void * arg) {
 }
 
 static void start_library_rescan(void) {
+    /* Real-device incident: several call sites below don't already guard on
+     * library_rescan_active themselves, and a second call while a rescan
+     * thread is still running would spawn a second library_rescan_thread_
+     * func() thread stomping the same all_songs_paths/all_song_tags arrays
+     * and the single library_rescan_thread handle -- undefined behavior, not
+     * just wasted work. */
+    if (library_rescan_active) return;
     library_rescan_done_flag = false;
     library_rescan_active = true;
     lv_label_set_text(subsonic_downloading_label, "Updating\nmusic database...");
@@ -12241,10 +12156,17 @@ static void poll_sd_card_hotplug(void) {
      * happened against whatever was mounted by then -- assuming "already
      * mounted" here avoids this poll re-triggering a redundant rescan on
      * its very first tick when the card was present all along. If it
-     * wasn't actually mounted yet at that point, the very next branch
-     * below correctly falls into the "not mounted" case anyway and starts
-     * retrying/rescanning from there. */
+     * wasn't actually mounted yet at that point, this does NOT reliably
+     * fall into the "not mounted" case below (see boot_library_recheck_
+     * done's own comment further down for why -- that used to be this
+     * comment's own claim, and was wrong: a boot-time race that self-heals
+     * within this function's very first tick never confirms as "not
+     * mounted" for long enough to flip this back to false). */
     static bool was_mounted = true;
+    /* See its own comment further down, where it's checked -- separate
+     * one-shot guard for the boot-time-mount-race case was_mounted's own
+     * confirmed-transition logic can silently miss. */
+    static bool boot_library_recheck_done = false;
     static time_t last_check = 0;
     static int mount_fail_streak = 0;
     /* Real-device testing: a plain single-poll "was mounted, now isn't"
@@ -12357,6 +12279,39 @@ static void poll_sd_card_hotplug(void) {
     if (!was_mounted && !library_rescan_active) {
         reload_library_on_sd_reinsert();
         file_browser_reset_to_root();
+    } else if (!boot_library_recheck_done) {
+        /* Real-device bug report: library randomly not loaded after a
+         * reboot (worked around by enabling Resume Last Track, whose own
+         * fallback -- build_saved_resume_playlist()'s file_browser_build_
+         * playlist_for_path() call -- does a live single-folder filesystem
+         * scan independent of the in-memory library, masking this rather
+         * than fixing it). Root cause: mount_sd_card_if_needed() (main.c)
+         * runs once, synchronously, before gui_init() -- if the SD card's
+         * device node hasn't been created by the kernel yet at that exact
+         * point (enumeration timing varies boot to boot), that mount
+         * silently fails with no retry, so library_load_from_cache_only()
+         * (called from gui_init()) finds music_root_is_mounted() false and
+         * leaves the library empty for the rest of the session. This
+         * function's own retry above (mount_sd_card_if_needed() a few
+         * lines up) usually fixes the mount itself within its very first
+         * tick -- but that means was_mounted (which starts true, per its
+         * own comment above) never actually observes a confirmed
+         * not-mounted state (unmount_confirm_streak never reaches
+         * SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD), so it's never flipped to
+         * false, so the !was_mounted branch above never fires either: the
+         * card ends up correctly mounted at the filesystem level, but
+         * nothing ever tells the app's in-memory library to reload. One-
+         * shot (not tied to was_mounted) so this can't fire more than once
+         * per boot even for a card that's mounted but genuinely has no
+         * music -- reload_library_on_sd_reinsert() falls back to a real
+         * start_library_rescan() when the cache load itself comes back
+         * empty too, which would otherwise repeat forever on every poll
+         * for that case. */
+        boot_library_recheck_done = true;
+        if (all_songs_count == 0 && !library_rescan_active) {
+            reload_library_on_sd_reinsert();
+            file_browser_reset_to_root();
+        }
     }
     was_mounted = true;
 }
@@ -17843,6 +17798,23 @@ static void prepare_deferred_resume(int index, double start_seconds) {
     nav_push(player_screen);
 }
 
+/* Wakes quick_drawer_drag_timer/az_index_drag_timer the instant a new press
+ * begins anywhere on screen -- registered on the pointer indev itself
+ * (LV_EVENT_PRESSED, not tied to any one widget) rather than each screen's
+ * own objects, for the same reason poll_quick_drawer_drag()'s own doc
+ * comment gives for polling raw indev state in the first place: this is the
+ * one press-related event LVGL dispatches regardless of which object was
+ * actually hit. Both timers pause themselves the instant they see nothing
+ * left to track (see their own handle comments); without this, a paused
+ * timer would never resume, silently breaking every gesture that relies on
+ * it. lv_timer_resume() on an already-running timer is a harmless no-op, so
+ * this doesn't need to check either timer's current state first. */
+static void resume_fast_gesture_timers_cb(lv_event_t * e) {
+    (void) e;
+    lv_timer_resume(quick_drawer_drag_timer);
+    lv_timer_resume(az_index_drag_timer);
+}
+
 void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("gui_init entered");
@@ -18241,11 +18213,24 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * immediately after (or even during) the splash. Establish the activity
      * baseline at the exact splash -> Home transition, then start runtime
      * polling. The fast gesture timers likewise have no work while the
-     * splash is the only visible screen. */
+     * splash is the only visible screen -- and self-pause again (see their
+     * own handle comments) the moment the very first tick after this finds
+     * nothing pressed, rather than running at ~60fps for the rest of the
+     * app's life regardless of whether anyone's touching the screen: with
+     * no other timer registered below LV_DEF_REFR_PERIOD, these two used to
+     * be the sole reason main()'s own usleep(lv_timer_handler()) could never
+     * sleep longer than one frame, forever, including idle/screen-off
+     * playback. resume_fast_gesture_timers_cb() wakes both again the
+     * instant a new press begins, on whichever indev is the real
+     * touchscreen (find_pointer_indev() is safe to call here -- the target
+     * build's touch indev is already registered by main.c well before
+     * gui_init() runs). */
     gui_reset_interactive_timeout_baseline();
     lv_timer_create(update_timer_cb, 500, NULL);
-    lv_timer_create(poll_quick_drawer_drag, LV_DEF_REFR_PERIOD, NULL);
-    lv_timer_create(poll_az_index_drag, LV_DEF_REFR_PERIOD, NULL);
+    quick_drawer_drag_timer = lv_timer_create(poll_quick_drawer_drag, LV_DEF_REFR_PERIOD, NULL);
+    az_index_drag_timer = lv_timer_create(poll_az_index_drag, LV_DEF_REFR_PERIOD, NULL);
+    lv_indev_t * gesture_indev = find_pointer_indev();
+    if (gesture_indev) lv_indev_add_event_cb(gesture_indev, resume_fast_gesture_timers_cb, LV_EVENT_PRESSED, NULL);
 #ifndef HOST_BUILD
     boot_checkpoint("lv_screen_load(home_screen) done");
 #endif

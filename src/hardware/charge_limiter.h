@@ -79,6 +79,11 @@
  * CHARGE_LIMITER_REEVALUATE_SECONDS after the user expected it to resume. */
 void charge_limiter_poll(bool enabled, bool force);
 
+/* True while the 85% limiter is actively holding the charger disabled.
+ * Used by the UI because this device's kernel battery/status node can stay
+ * stuck on "Charging" even after the PMIC confirms charging has stopped. */
+bool charge_limiter_is_holding(void);
+
 /* Enforces the 500mA charge-current cap while enabled. Disabled is a no-op
  * and does not restore or otherwise modify the current PMIC setting. */
 void safe_charging_poll(bool enabled, bool force);

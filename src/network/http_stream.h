@@ -24,7 +24,8 @@ typedef struct http_stream http_stream_t;
 
 /* Opens url and starts the background pump thread. Returns NULL if the URL
  * can't be parsed, the connection/handshake fails, or the server's response
- * status isn't 2xx -- everything after that (the connection dropping
+ * status isn't 2xx (after following at most five absolute HTTP(S)
+ * redirects) -- everything after that (the connection dropping
  * mid-stream) is instead reported through http_stream_read()'s return
  * value, not here. verify_tls has the same meaning as http_client.c's own
  * (false skips certificate verification -- never the default). */

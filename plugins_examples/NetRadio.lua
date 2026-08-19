@@ -1,4 +1,4 @@
-plugin.define({ id = "example.net_radio", name = "Net Radio", version = "1.1", api_min = 1 })
+plugin.define({ id = "example.net_radio", name = "Net Radio", version = "1.2", api_min = 1 })
 
 -- Net Radio reads its stations from Radio.txt at the root of the SD card:
 --
@@ -10,7 +10,7 @@ plugin.define({ id = "example.net_radio", name = "Net Radio", version = "1.1", a
 -- do not require restarting the player or reloading the plugin.
 --
 -- Current stream limitations:
---   * Streams must serve MP3 audio (AAC/Opus/Ogg are not decoded yet).
+--   * Streams may serve MP3, FLAC, or ADTS-framed AAC/AAC+ audio.
 --   * Streams cannot seek and do not auto-reconnect after a connection loss.
 --   * ICY/stream metadata is not displayed; Radio.txt supplies the title.
 

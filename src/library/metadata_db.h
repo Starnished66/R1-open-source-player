@@ -30,7 +30,16 @@ void metadata_db_close(void);
 /* Starts a scan pass. Rows touched during the pass are stamped with a new
  * persistent scan generation. Writes are committed in small batches, so RAM
  * and rollback-journal growth remain bounded instead of scaling with the
- * library. metadata_db_end_update() prunes rows from older generations. */
+ * library. metadata_db_end_update() prunes rows from older generations.
+ *
+ * On target, if /usr/data (internal storage) has room, the whole pass runs
+ * against a scratch copy there instead of writing directly to the SD-
+ * resident db -- see metadata_db.c's own comment on the SD-card corruption
+ * incident this avoids. Transparent to every other function in this header;
+ * metadata_db_end_update() publishes a verified result back onto the SD
+ * card; metadata_db_abort_update() discards a scratch pass and retains the
+ * last known-good SD database. Falls back to scanning the SD-resident file
+ * directly if there isn't room, same as before this existed. */
 void metadata_db_begin_update(void);
 
 /* Looks up `path`, marking it as seen for this pass either way. Returns

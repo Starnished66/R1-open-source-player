@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,6 +80,11 @@ static char ** library_album_artists = NULL;
 static char ** library_albums = NULL;
 static char ** library_paths = NULL;
 static int library_count = 0;
+static char * cached_artists_json = NULL;
+static char * cached_album_artists_json = NULL;
+static char * cached_albums_json = NULL;
+
+static void refresh_group_json_cache(void);
 
 static bool running = false;
 static int listen_fd = -1;
@@ -191,6 +197,12 @@ static void free_library(void) {
     library_albums = NULL;
     library_paths = NULL;
     library_count = 0;
+    free(cached_artists_json);
+    free(cached_album_artists_json);
+    free(cached_albums_json);
+    cached_artists_json = NULL;
+    cached_album_artists_json = NULL;
+    cached_albums_json = NULL;
 }
 
 void remote_control_sync_library(const char * const * titles, const char * const * artists,
@@ -213,6 +225,7 @@ void remote_control_sync_library(const char * const * titles, const char * const
         }
         library_count = count;
     }
+    refresh_group_json_cache();
     pthread_mutex_unlock(&status_mutex);
 }
 
@@ -234,6 +247,38 @@ static void json_escape_append(char * out, size_t out_size, const char * in) {
         }
     }
     out[len] = '\0';
+}
+
+typedef struct {
+    char * data;
+    size_t capacity;
+    size_t length;
+    bool truncated;
+} json_builder_t;
+
+static void json_builder_init(json_builder_t * b, char * data, size_t capacity) {
+    b->data = data;
+    b->capacity = capacity;
+    b->length = 0;
+    b->truncated = capacity == 0;
+    if (capacity > 0) data[0] = '\0';
+}
+
+static bool json_builder_appendf(json_builder_t * b, const char * format, ...) {
+    if (b->truncated || b->length >= b->capacity) return false;
+    size_t old_length = b->length;
+    va_list ap;
+    va_start(ap, format);
+    int written = vsnprintf(b->data + b->length, b->capacity - b->length, format, ap);
+    va_end(ap);
+    if (written < 0 || (size_t) written >= b->capacity - b->length) {
+        b->length = old_length;
+        b->data[old_length] = '\0';
+        b->truncated = true;
+        return false;
+    }
+    b->length += (size_t) written;
+    return true;
 }
 
 /* Hand-rolled rather than strcasestr(), which isn't confirmed available on
@@ -325,23 +370,26 @@ static void build_library_json(const char * query, const char * artist_filter, c
         if (library_song_matches(i, query, artist_filter, album_artist_filter, album_filter)) total_matches++;
     }
 
-    size_t len = 0;
-    len += (size_t) snprintf(out + len, out_size - len, "{\"total\":%d,\"songs\":[", total_matches);
+    json_builder_t json;
+    json_builder_init(&json, out, out_size);
+    json_builder_appendf(&json, "{\"total\":%d,\"songs\":[", total_matches);
 
     int matched_so_far = 0;
     int emitted = 0;
-    for (int i = 0; i < library_count && emitted < limit && len + 256 < out_size; i++) {
+    for (int i = 0; i < library_count && emitted < limit && !json.truncated &&
+                    json.capacity - json.length >= 700; i++) {
         if (!library_song_matches(i, query, artist_filter, album_artist_filter, album_filter)) continue;
         if (matched_so_far++ < offset) continue;
 
         char title_esc[300] = {0}, artist_esc[300] = {0};
         json_escape_append(title_esc, sizeof(title_esc), library_titles[i]);
         json_escape_append(artist_esc, sizeof(artist_esc), library_artists[i]);
-        len += (size_t) snprintf(out + len, out_size - len, "%s{\"index\":%d,\"title\":\"%s\",\"artist\":\"%s\"}",
-                                  emitted > 0 ? "," : "", i, title_esc, artist_esc);
+        if (!json_builder_appendf(&json, "%s{\"index\":%d,\"title\":\"%s\",\"artist\":\"%s\"}",
+                                  emitted > 0 ? "," : "", i, title_esc, artist_esc)) break;
         emitted++;
     }
-    snprintf(out + len, out_size - len, "]}");
+    json.truncated = false; /* a rejected item left the prior JSON intact */
+    json_builder_appendf(&json, "]}");
 
     pthread_mutex_unlock(&status_mutex);
 }
@@ -415,30 +463,55 @@ static void build_name_counts_json(const char * const * field, const char * filt
         first_index[j + 1] = key_index;
     }
 
-    size_t len = 0;
-    len += (size_t) snprintf(out + len, out_size - len, "{\"%s\":[", json_key);
-    for (int i = 0; i < distinct && len + 256 < out_size; i++) {
+    json_builder_t json;
+    json_builder_init(&json, out, out_size);
+    json_builder_appendf(&json, "{\"%s\":[", json_key);
+    for (int i = 0; i < distinct && !json.truncated && json.capacity - json.length >= 512; i++) {
         char name_esc[300] = {0};
         json_escape_append(name_esc, sizeof(name_esc), names[i]);
-        len += (size_t) snprintf(out + len, out_size - len, "%s{\"name\":\"%s\",\"count\":%d,\"index\":%d}",
-                                  i > 0 ? "," : "", name_esc, counts[i], first_index[i]);
+        if (!json_builder_appendf(&json, "%s{\"name\":\"%s\",\"count\":%d,\"index\":%d}",
+                                  i > 0 ? "," : "", name_esc, counts[i], first_index[i])) break;
     }
-    snprintf(out + len, out_size - len, "]}");
+    json.truncated = false;
+    json_builder_appendf(&json, "]}");
 
     free(names);
     free(counts);
     free(first_index);
 }
 
+/* These three unfiltered groupings change only when the synchronized
+ * library changes. Building them here turns repeated phone browsing from
+ * an O(songs x distinct names) request into a bounded string copy. Filtered
+ * album drill-downs remain request-specific and are derived below. */
+static void refresh_group_json_cache(void) {
+    const size_t capacity = 65536;
+    if (library_count <= 0) return;
+    cached_artists_json = malloc(capacity);
+    cached_album_artists_json = malloc(capacity);
+    cached_albums_json = malloc(capacity);
+    if (cached_artists_json)
+        build_name_counts_json((const char * const *) library_artists, NULL, NULL, "artists",
+                               cached_artists_json, capacity);
+    if (cached_album_artists_json)
+        build_name_counts_json((const char * const *) library_album_artists, NULL, NULL, "artists",
+                               cached_album_artists_json, capacity);
+    if (cached_albums_json)
+        build_name_counts_json((const char * const *) library_albums, NULL, NULL, "albums",
+                               cached_albums_json, capacity);
+}
+
 static void build_artists_json(char * out, size_t out_size) {
     pthread_mutex_lock(&status_mutex);
-    build_name_counts_json((const char * const *) library_artists, NULL, NULL, "artists", out, out_size);
+    if (cached_artists_json) snprintf(out, out_size, "%s", cached_artists_json);
+    else snprintf(out, out_size, "{\"artists\":[]}");
     pthread_mutex_unlock(&status_mutex);
 }
 
 static void build_album_artists_json(char * out, size_t out_size) {
     pthread_mutex_lock(&status_mutex);
-    build_name_counts_json((const char * const *) library_album_artists, NULL, NULL, "artists", out, out_size);
+    if (cached_album_artists_json) snprintf(out, out_size, "%s", cached_album_artists_json);
+    else snprintf(out, out_size, "{\"artists\":[]}");
     pthread_mutex_unlock(&status_mutex);
 }
 
@@ -450,7 +523,8 @@ static void build_albums_json(const char * artist_filter, const char * album_art
                                size_t out_size) {
     const char * filter = artist_filter[0] != '\0' ? artist_filter : album_artist_filter;
     pthread_mutex_lock(&status_mutex);
-    build_name_counts_json((const char * const *) library_albums, filter, NULL, "albums", out, out_size);
+    if (filter[0] == '\0' && cached_albums_json) snprintf(out, out_size, "%s", cached_albums_json);
+    else build_name_counts_json((const char * const *) library_albums, filter, NULL, "albums", out, out_size);
     pthread_mutex_unlock(&status_mutex);
 }
 

@@ -285,7 +285,20 @@ int main(void) {
 #ifndef HOST_BUILD
     boot_checkpoint("entering main loop");
 #endif
+    /* LVGL normally calls its registered tick callback thousands of times
+     * per second. On this old 32-bit kernel, musl implements each call as a
+     * failing clock_gettime64 syscall followed by a legacy clock_gettime
+     * fallback. Switch LVGL to its in-memory tick counter after setup and
+     * advance it once per handler iteration from one real clock read. Timer
+     * semantics remain identical: the tick is stable while one handler pass
+     * runs, just like the conventional interrupt-driven lv_tick_inc model. */
+    uint32_t last_real_tick = custom_tick_get();
+    lv_tick_inc(last_real_tick);
+    lv_tick_set_cb(NULL);
     while(1) {
+        uint32_t real_tick = custom_tick_get();
+        lv_tick_inc(real_tick - last_real_tick);
+        last_real_tick = real_tick;
         uint32_t time_till_next = lv_timer_handler();
         usleep(time_till_next * 1000); /* Convert milliseconds to microseconds */
     }

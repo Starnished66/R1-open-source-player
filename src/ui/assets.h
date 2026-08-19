@@ -1,6 +1,8 @@
 #ifndef ASSETS_H
 #define ASSETS_H
 
+#include "lvgl.h"
+
 /* Real UI assets, straight from the stock HiBy firmware's own theme2 (dark)
  * resource pack -- not ours to redistribute, so nothing is vendored into
  * this repo. On target we just point at the firmware's own copy, already
@@ -22,5 +24,10 @@ void assets_init(void);
  * per image reference -- consistent with other per-widget context structs
  * in this codebase that are likewise never freed. */
 const char * asset_path(const char * relative_path);
+
+/* Loads a small PNG into a process-lifetime variable image descriptor.
+ * This avoids reopening immutable slider artwork on every redraw. Falls
+ * back to NULL if the asset cannot be read. */
+const lv_image_dsc_t * asset_png_memory(const char * relative_path);
 
 #endif /* ASSETS_H */

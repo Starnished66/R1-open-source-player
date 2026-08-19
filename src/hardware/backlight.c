@@ -15,6 +15,11 @@
  * found wins. Returns false (leaving `out` untouched) if the class has no
  * entries at all, normal on host. */
 static bool find_backlight_device(char * out, size_t out_size) {
+    static char cached_device[64];
+    if (cached_device[0]) {
+        snprintf(out, out_size, "%s", cached_device);
+        return true;
+    }
     DIR * dir = opendir(BACKLIGHT_CLASS_DIR);
     if (!dir) return false;
 
@@ -23,6 +28,7 @@ static bool find_backlight_device(char * out, size_t out_size) {
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
         snprintf(out, out_size, "%s", entry->d_name);
+        snprintf(cached_device, sizeof(cached_device), "%s", entry->d_name);
         found = true;
         break;
     }
@@ -120,12 +126,41 @@ void backlight_set_percent(int percent) {
  * function in this file which only the GUI thread ever calls. */
 static pthread_mutex_t screen_power_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool screen_on = true;
+static bool screen_dimmed = false;
 /* Restored on the next turn-on -- seeded to a sensible default matching the
  * old hw_buttons.c hardcoded BACKLIGHT_ON_LEVEL, only actually used if we
  * never captured a real prior brightness (e.g. backlight_get_percent()
  * failed the first time we turned the screen off). Logical percent, same
  * scale as backlight_get_percent()'s own return value. */
 static int restore_percent = 80;
+
+void backlight_set_normal_percent(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    pthread_mutex_lock(&screen_power_mutex);
+    restore_percent = percent;
+    screen_dimmed = false;
+    bool write_now = screen_on;
+    pthread_mutex_unlock(&screen_power_mutex);
+    if (write_now) backlight_set_percent(percent);
+}
+
+void backlight_set_dimmed(bool dimmed) {
+    pthread_mutex_lock(&screen_power_mutex);
+    if (!screen_on || screen_dimmed == dimmed) {
+        pthread_mutex_unlock(&screen_power_mutex);
+        return;
+    }
+    screen_dimmed = dimmed;
+    int normal = restore_percent;
+    pthread_mutex_unlock(&screen_power_mutex);
+
+    /* Forty percent of the selected level is visibly dimmer without making
+     * low user settings unreadable. Logical zero remains the driver's safe
+     * minimum; only full screen-off writes literal zero. */
+    int target = dimmed ? normal * 40 / 100 : normal;
+    backlight_set_percent(target);
+}
 
 bool backlight_screen_is_on(void) {
     pthread_mutex_lock(&screen_power_mutex);
@@ -154,8 +189,11 @@ void backlight_set_screen_on(bool on) {
          * failure sentinel) rejected valid low readings, leaving
          * restore_percent stuck at whatever it was before. >= 0 alone
          * still excludes the real failure case. */
-        int current = backlight_get_percent();
-        if (current >= 0) restore_percent = current;
+        if (!screen_dimmed) {
+            int current = backlight_get_percent();
+            if (current >= 0) restore_percent = current;
+        }
+        screen_dimmed = false;
     }
     int target_percent = restore_percent;
     pthread_mutex_unlock(&screen_power_mutex);

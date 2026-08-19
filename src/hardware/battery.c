@@ -2,9 +2,11 @@
 
 #include <dirent.h>
 #include <stdbool.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define POWER_SUPPLY_DIR "/sys/class/power_supply"
 
@@ -61,105 +63,78 @@ static bool read_sysfs_attr(const char * device_name, const char * attr, char * 
  * nonzero-value heuristic -- falls back to the old best-effort scan only
  * if no entry is literally named "battery", for robustness on any other
  * device/variant where the real gauge might be named differently. */
-int battery_get_percent(void) {
-    DIR * dir = opendir(POWER_SUPPLY_DIR);
-    if (!dir) return -1;
+static pthread_mutex_t battery_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char cached_battery_device[64];
+static int cached_capacity = -1;
+static char cached_status[24];
+static struct timespec cached_at;
+static bool cache_valid = false;
 
-    int named_battery_result = -1;
-    bool found_named_battery = false;
-    int fallback_result = -1;
-    struct dirent * entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
+#define BATTERY_CACHE_TTL_MS 5000L
 
-        char type[32];
-        if (!read_sysfs_attr(entry->d_name, "type", type, sizeof(type))) continue;
-        if (strcmp(type, "Battery") != 0) continue;
-
-        char capacity_str[16];
-        if (!read_sysfs_attr(entry->d_name, "capacity", capacity_str, sizeof(capacity_str))) continue;
-
-        int capacity = atoi(capacity_str);
-        if (strcmp(entry->d_name, "battery") == 0) {
-            named_battery_result = capacity;
-            found_named_battery = true;
-            break; /* the real fuel gauge, unambiguous -- no need to keep scanning */
-        }
-        if (fallback_result < 0 || capacity > 0) fallback_result = capacity;
-    }
-
-    closedir(dir);
-    return found_named_battery ? named_battery_result : fallback_result;
-}
-
-/* Same "Battery"-typed scan and same axp_battery-vs-battery ambiguity as
- * battery_get_percent() (see its own comment for the real-device bug this
- * fixes) -- shared by battery_is_charging() and battery_is_full() below,
- * since both just want this same scan's "status" string rather than a
- * pre-collapsed bool, and duplicating the whole scan a third time isn't
- * worth avoiding one extra fixed-size string copy. The previous "prefer
- * whichever entry reports the highest capacity" tiebreak had the identical
- * failure mode as battery_get_percent()'s old logic: axp_battery's raw,
- * uncalibrated capacity estimate could easily read *higher* than the real
- * gauge's near full charge, silently winning this comparison and handing
- * back axp_battery's own (less trustworthy) status string. Fixed the same
- * way -- deterministically prefer an entry literally named "battery",
- * falling back to the old best-effort comparison only if no such entry
- * exists. Returns false (leaving *out_status untouched) if no Battery-typed
- * device is found at all.
- *
- * Real-device bug report (2026-08-08): after a while of use, the status
- * bar's battery percentage/icon froze AND the UI went white with menus
- * showing text only, no icons -- at the same time. Root cause: the
- * "battery" fast-path below did `return true` directly, skipping the
- * closedir(dir) that only sat after the loop -- leaking the opendir()
- * file descriptor on every single call. This is the *normal* path on real
- * hardware (this device does have an entry literally named "battery", see
- * this function's own history above), so it leaked one fd on essentially
- * every status-bar refresh tick, not just some rare fallback case. A
- * leaked fd or two a second exhausts a typical ~1024 embedded-Linux
- * process fd limit in well under ten minutes -- once that hits, every
- * later open()/fopen() call in the whole process starts failing, not just
- * this one: sysfs battery reads (the frozen icon/percentage) and PNG
- * asset loading via LVGL's posix fs driver (the white UI/text-only menus,
- * since glyphs are baked into the binary and don't need a file open) fail
- * together for exactly that reason. Unrelated to the charge limiter
- * feature (already inert regardless, see charge_limiter.c) -- this leak
- * exists independent of whether that's enabled. */
-static bool read_best_battery_status(char * out_status, size_t out_size) {
+static bool discover_battery_device(char * out, size_t out_size) {
     DIR * dir = opendir(POWER_SUPPLY_DIR);
     if (!dir) return false;
 
-    bool found = false;
-    int best_capacity = -1;
+    char fallback[64] = "";
     struct dirent * entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
-
         char type[32];
         if (!read_sysfs_attr(entry->d_name, "type", type, sizeof(type))) continue;
         if (strcmp(type, "Battery") != 0) continue;
-
-        char capacity_str[16];
-        int capacity = read_sysfs_attr(entry->d_name, "capacity", capacity_str, sizeof(capacity_str)) ? atoi(capacity_str) : -1;
-
-        char status[24];
-        if (!read_sysfs_attr(entry->d_name, "status", status, sizeof(status))) continue;
-
         if (strcmp(entry->d_name, "battery") == 0) {
-            snprintf(out_status, out_size, "%s", status);
-            found = true;
-            break; /* the real fuel gauge, unambiguous -- no need to keep scanning */
+            snprintf(out, out_size, "%s", entry->d_name);
+            closedir(dir);
+            return true;
         }
-        if (!found || capacity > best_capacity) {
-            found = true;
-            best_capacity = capacity;
-            snprintf(out_status, out_size, "%s", status);
-        }
+        if (!fallback[0]) snprintf(fallback, sizeof(fallback), "%s", entry->d_name);
     }
-
     closedir(dir);
-    return found;
+    if (!fallback[0]) return false;
+    snprintf(out, out_size, "%s", fallback);
+    return true;
+}
+
+static bool refresh_battery_cache_locked(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long age_ms = (now.tv_sec - cached_at.tv_sec) * 1000L + (now.tv_nsec - cached_at.tv_nsec) / 1000000L;
+    if (cache_valid && age_ms >= 0 && age_ms < BATTERY_CACHE_TTL_MS) return true;
+
+    if (!cached_battery_device[0] &&
+        !discover_battery_device(cached_battery_device, sizeof(cached_battery_device))) return false;
+
+    char capacity_str[16];
+    char status[24];
+    if (!read_sysfs_attr(cached_battery_device, "capacity", capacity_str, sizeof(capacity_str)) ||
+        !read_sysfs_attr(cached_battery_device, "status", status, sizeof(status))) {
+        /* A driver can disappear/reappear across suspend. Rediscover once
+         * on the next call instead of pinning a stale sysfs name forever. */
+        cached_battery_device[0] = '\0';
+        cache_valid = false;
+        return false;
+    }
+    cached_capacity = atoi(capacity_str);
+    snprintf(cached_status, sizeof(cached_status), "%s", status);
+    cached_at = now;
+    cache_valid = true;
+    return true;
+}
+
+int battery_get_percent(void) {
+    pthread_mutex_lock(&battery_cache_mutex);
+    int result = refresh_battery_cache_locked() ? cached_capacity : -1;
+    pthread_mutex_unlock(&battery_cache_mutex);
+    return result;
+}
+
+static bool read_best_battery_status(char * out_status, size_t out_size) {
+    pthread_mutex_lock(&battery_cache_mutex);
+    bool ok = refresh_battery_cache_locked();
+    if (ok) snprintf(out_status, out_size, "%s", cached_status);
+    pthread_mutex_unlock(&battery_cache_mutex);
+    return ok;
 }
 
 bool battery_is_charging(void) {

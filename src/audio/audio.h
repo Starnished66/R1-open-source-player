@@ -56,6 +56,10 @@ void audio_set_next_track(const char * path, bool has_replaygain, double replayg
  * for same-format tracks). */
 void audio_set_crossfade_enabled(bool enabled);
 
+/* Uses larger decoder/output batches while the display is off, reducing
+ * audio-thread wakeups. Normal batches are restored immediately on wake. */
+void audio_set_low_power_mode(bool enabled);
+
 /* Routes playback to a connected Bluetooth a2dp-source sink (headphones/
  * speaker this device is streaming TO) instead of the local hardware
  * output, or back to local when disabled. Real-device bug: pairing/

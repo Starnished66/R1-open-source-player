@@ -32,7 +32,9 @@
   #include "audio_output.h"
 #endif
 
-#define CHUNK_FRAMES 4096
+#define NORMAL_CHUNK_FRAMES 4096
+#define LOW_POWER_CHUNK_FRAMES 8192
+#define MAX_CHUNK_FRAMES LOW_POWER_CHUNK_FRAMES
 
 /* --- Decoder dispatch: dr_flac/dr_mp3/dr_wav all expose the same shape of
  * API (open, channels/sampleRate, read_pcm_frames_s16, seek_to_pcm_frame,
@@ -426,6 +428,7 @@ static bool crossfade_enabled = false;
 
 static float volume = 1.0f;      /* UI-facing 0.0-1.0 percent, what audio_get_volume() returns */
 static float volume_gain = 1.0f; /* actual linear PCM multiplier the playback thread applies -- see audio_set_volume() */
+static bool low_power_mode = false;
 
 /* Set by audio_seek(), consumed by the playback thread. -1 means no pending seek. */
 static int64_t pending_seek_frame = -1;
@@ -481,7 +484,7 @@ static bool open_device(unsigned int channels, unsigned int sample_rate) {
     want.freq = (int) sample_rate;
     want.format = AUDIO_S16SYS;
     want.channels = (Uint8) channels;
-    want.samples = CHUNK_FRAMES;
+    want.samples = NORMAL_CHUNK_FRAMES;
 
     sdl_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (sdl_dev == 0) {
@@ -579,9 +582,9 @@ static void * audio_thread_func(void * arg) {
     float nxt_replaygain_linear_local = 1.0f;
     uint64_t nxt_frames_consumed = 0;
 
-    int16_t * buf_cur = malloc((size_t) CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
-    int16_t * buf_next = malloc((size_t) CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
-    int16_t * buf_out = malloc((size_t) CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
+    int16_t * buf_cur = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
+    int16_t * buf_next = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
+    int16_t * buf_out = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
 
 #ifndef HOST_BUILD
     /* Real-device bug report: plugging/unplugging headphones or an aux
@@ -701,6 +704,7 @@ static void * audio_thread_func(void * arg) {
             pending_seek_frame = -1;
             bool xfade_on = crossfade_enabled;
             float vol = volume_gain;
+            uint64_t chunk_frames = low_power_mode ? LOW_POWER_CHUNK_FRAMES : NORMAL_CHUNK_FRAMES;
             char * staged_next_path = next_path; /* borrowed -- read only, never freed here */
             float staged_next_replaygain = next_replaygain_linear;
             pthread_mutex_unlock(&audio_mutex);
@@ -760,7 +764,7 @@ static void * audio_thread_func(void * arg) {
 
             if (in_blend_window && nxt_open && nxt_format_matches) {
                 unsigned int channels = cur_dec.channels;
-                uint64_t want = (frames_remaining < CHUNK_FRAMES) ? frames_remaining : CHUNK_FRAMES;
+                uint64_t want = (frames_remaining < chunk_frames) ? frames_remaining : chunk_frames;
                 uint64_t n_cur = decoder_read_s16(&cur_dec, want, buf_cur);
 
                 if (n_cur > 0) {
@@ -810,7 +814,7 @@ static void * audio_thread_func(void * arg) {
 
             /* Not blending (crossfade off, not yet near the end, or the next
              * track's format doesn't match) -- plain single-source playback. */
-            uint64_t n_cur = decoder_read_s16(&cur_dec, CHUNK_FRAMES, buf_cur);
+            uint64_t n_cur = decoder_read_s16(&cur_dec, chunk_frames, buf_cur);
             if (n_cur == 0) {
                 /* True EOF. If a next track is queued, hand off to it --
                  * seamlessly if the format matches (device stays open), or
@@ -932,6 +936,12 @@ void audio_set_next_track(const char * path, bool has_replaygain, double replayg
 void audio_set_crossfade_enabled(bool enabled) {
     pthread_mutex_lock(&audio_mutex);
     crossfade_enabled = enabled;
+    pthread_mutex_unlock(&audio_mutex);
+}
+
+void audio_set_low_power_mode(bool enabled) {
+    pthread_mutex_lock(&audio_mutex);
+    low_power_mode = enabled;
     pthread_mutex_unlock(&audio_mutex);
 }
 

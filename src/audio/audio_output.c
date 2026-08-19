@@ -114,7 +114,13 @@ static bool open_device(unsigned int channels, unsigned int sample_rate) {
         config.channels = channels;
         config.rate = sample_rate;
         config.format = PCM_FORMAT_S16_LE;
-        config.period_size = 1024;
+        /* The original 1024-frame period woke this single-core device about
+         * 43 times/sec at 44.1 kHz even when the decoder supplied 8192-frame
+         * screen-off batches. A 2048-frame period halves kernel/ALSA period
+         * wakeups while retaining ~46 ms period granularity; four periods
+         * provide ~186 ms of underrun protection, still below the app's
+         * existing 500 ms hardware-button dispatch interval. */
+        config.period_size = 2048;
         config.period_count = 4;
         /* Explicit rather than left at the zeroed default -- matches
          * tinyalsa's own usual convention (full buffer size) rather than

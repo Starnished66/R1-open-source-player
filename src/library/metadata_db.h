@@ -27,11 +27,10 @@ typedef struct {
 void metadata_db_open(void);
 void metadata_db_close(void);
 
-/* Starts a scan pass: wraps every metadata_db_get()/put() until the
- * matching metadata_db_end_update() in one transaction (SQLite's default
- * autocommit mode would otherwise fsync once per row, turning a library
- * scan into one disk sync per file) and begins tracking which paths this
- * pass actually saw, for metadata_db_end_update()'s prune step. */
+/* Starts a scan pass. Rows touched during the pass are stamped with a new
+ * persistent scan generation. Writes are committed in small batches, so RAM
+ * and rollback-journal growth remain bounded instead of scaling with the
+ * library. metadata_db_end_update() prunes rows from older generations. */
 void metadata_db_begin_update(void);
 
 /* Looks up `path`, marking it as seen for this pass either way. Returns
@@ -43,10 +42,13 @@ bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags
 /* Inserts or replaces the cached row for `path`. */
 void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cached_tags_t * tags);
 
-/* Ends the current scan pass: deletes every cached row whose path wasn't
- * seen via metadata_db_get() since the matching metadata_db_begin_update()
- * (i.e. files removed or renamed since the last scan) and commits. */
+/* Ends a successful scan pass: deletes rows whose scan generation was not
+ * refreshed by this pass (files removed/renamed), then commits. */
 void metadata_db_end_update(void);
+
+/* Ends an interrupted scan without pruning unseen rows. Already-written rows
+ * remain valid; the next complete pass advances the scan generation. */
+void metadata_db_abort_update(void);
 
 /* Enumerates every cached row as-is, without touching the filesystem or
  * verifying mtime/size against anything live -- for gui_init()'s boot-time
@@ -59,34 +61,12 @@ void metadata_db_end_update(void);
  * unopened -- not an error, just nothing cached yet. */
 void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * out_count);
 
-/* Fast .txt "book" listing sourced from the stock hiby_player's own
- * already-scanned BOOK_TABLE (same stock database as import_from_stock_
- * player_db()'s MEDIA_TABLE read, see metadata_db.c's own comment on where
- * that lives and why its paths need translating) -- a plain indexed SELECT
- * against a small table, instead of a live recursive readdir()+stat() walk
- * of the whole SD card every time the Books screen opens (confirmed the
- * real cause of that screen loading slowly). Each result is verified to
- * still exist (a cheap access() per row, not a directory walk) so a file
- * the user deleted since the stock scanner last ran doesn't show as a dead
- * entry. Returns true and fills *out_paths and *out_count (caller-owned, same
- * convention as text_reader_scan_txt_files(), sorted the same way) only if
- * the stock db was actually readable and had at least one still-valid
- * entry; false (leaving *out_paths untouched) means the caller should fall
- * back to its own live scan -- same tolerant-of-a-missing/corrupt/slow
- * stock db behavior as import_from_stock_player_db(). Always false on
- * HOST_BUILD (no stock db concept there). */
-bool metadata_db_list_books_from_stock(char *** out_paths, int * out_count);
-
 /* Persistent book cache -- the "Books" row in gui.c's Books menu reads from
  * this instead of scanning anything itself, same "load whatever's cached,
  * don't touch the filesystem" boot behavior music's own library already
- * has (see library_load_from_cache_only() in gui.c). Populated two ways:
- * a fast warm-start from the stock db (metadata_db_open() itself, when this
- * table is still empty -- same shape as media's own warm start) and an
- * explicit full replace whenever the user rescans (Settings > Update Music
- * Database, see gui.c's rescan_books() -- folds in both the fast stock-db
- * path and, if that finds nothing, a real live filesystem walk, so a
- * rescan can find books the stock scanner never indexed). */
+ * has (see library_load_from_cache_only() in gui.c). Replaced whenever the
+ * user rescans, using only .txt files found below the dedicated Books
+ * directory on the SD card. */
 void metadata_db_book_replace_all(char * const * paths, int count);
 
 /* Enumerates every cached book path, alphabetically -- caller-owned array,

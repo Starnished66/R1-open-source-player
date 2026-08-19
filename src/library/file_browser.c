@@ -360,6 +360,53 @@ static int compare_paths(const void * a, const void * b) {
     return strcasecmp(*pa, *pb);
 }
 
+
+/* Bounded-memory variant used by the database scanner. It deliberately does not
+ * sort: ordering is a presentation/query concern and belongs in the on-disk DB,
+ * not in the discovery pass. This is the same separation that keeps Rockbox's
+ * tagcache builder from needing an in-RAM representation of the whole library. */
+static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_visit_cb_t cb, void * user,
+                                     int * count, int depth, volatile int * progress) {
+    if (depth > SCAN_ALL_SONGS_MAX_DEPTH) return true;
+
+    DIR * dir = opendir(dir_path);
+    if (!dir) return true;
+
+    bool keep_going = true;
+    struct dirent * de;
+    while (keep_going && (de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+
+        char full_path[PATH_MAX];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, de->d_name);
+
+        struct stat st;
+        bool stat_ok = lstat(full_path, &st) == 0;
+        if (progress) (*progress)++;
+        if (!stat_ok) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            keep_going = walk_all_songs_recursive(full_path, cb, user, count, depth + 1, progress);
+            continue;
+        }
+        if (!is_playable_file(de->d_name)) continue;
+
+        (*count)++;
+        if (cb && !cb(full_path, user)) keep_going = false;
+    }
+
+    closedir(dir);
+    return keep_going;
+}
+
+bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t cb, void * user,
+                                 int * out_count, volatile int * progress) {
+    int count = 0;
+    bool completed = walk_all_songs_recursive(root, cb, user, &count, 0, progress);
+    if (out_count) *out_count = count;
+    return completed;
+}
+
 bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, volatile int * progress) {
     char ** paths = NULL;
     int count = 0;

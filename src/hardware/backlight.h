@@ -34,6 +34,14 @@ int backlight_get_percent(void);
  * is present. */
 void backlight_set_percent(int percent);
 
+/* Sets the user's normal brightness and makes it the level restored after
+ * dimming or a full screen-off cycle. */
+void backlight_set_normal_percent(int percent);
+
+/* Temporarily lowers the lit screen without losing the user's configured
+ * brightness. Passing false restores that normal brightness. */
+void backlight_set_dimmed(bool dimmed);
+
 /* Screen power (fully off, not just dimmed to BACKLIGHT_MIN_PERCENT) -- the
  * single shared source of truth behind both the hardware power button
  * (hw_buttons.c) and the auto screen-timeout (gui.c), so the two can't

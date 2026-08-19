@@ -60,6 +60,9 @@ static sqlite3 * db = NULL;
 static sqlite3_stmt * stmt_get = NULL;
 static sqlite3_stmt * stmt_put = NULL;
 static sqlite3_stmt * stmt_mark_seen = NULL;
+static int64_t update_generation = 0;
+static int update_ops_since_commit = 0;
+#define METADATA_DB_UPDATE_BATCH 128
 
 /* NULL is a valid, harmless argument to sqlite3_finalize()/sqlite3_close()
  * -- used freely below instead of guarding every call. */
@@ -69,15 +72,12 @@ static void prepare_statements(void) {
         "SELECT mtime, size, title, artist, album, album_artist, genre FROM media WHERE path = ?;",
         -1, &stmt_get, NULL);
     sqlite3_prepare_v2(db,
-        "INSERT INTO media (path, mtime, size, title, artist, album, album_artist, genre) VALUES (?,?,?,?,?,?,?,?) "
+        "INSERT INTO media (path, mtime, size, title, artist, album, album_artist, genre, scan_generation) VALUES (?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size, title=excluded.title, "
-        "artist=excluded.artist, album=excluded.album, album_artist=excluded.album_artist, genre=excluded.genre;",
+        "artist=excluded.artist, album=excluded.album, album_artist=excluded.album_artist, genre=excluded.genre, "
+        "scan_generation=excluded.scan_generation;",
         -1, &stmt_put, NULL);
-    /* stmt_mark_seen is deliberately NOT prepared here -- it targets
-     * seen_paths, a TEMP table that doesn't exist yet at this point (it's
-     * only created per scan pass, see metadata_db_begin_update()). Preparing
-     * it early against a nonexistent table would just fail and leave it
-     * permanently NULL. */
+    sqlite3_prepare_v2(db, "UPDATE media SET scan_generation=? WHERE path=?;", -1, &stmt_mark_seen, NULL);
 }
 
 #ifndef HOST_BUILD
@@ -343,7 +343,8 @@ void metadata_db_open(void) {
         "  artist TEXT NOT NULL,"
         "  album TEXT NOT NULL,"
         "  album_artist TEXT NOT NULL,"
-        "  genre TEXT NOT NULL"
+        "  genre TEXT NOT NULL,"
+        "  scan_generation INTEGER NOT NULL DEFAULT 0"
         ");",
         NULL, NULL, NULL);
     /* Migration for a database created before the title column existed --
@@ -354,6 +355,7 @@ void metadata_db_open(void) {
      * IF NOT EXISTS, so "try it and ignore duplicate-column errors" is the
      * standard way to make this idempotent. */
     sqlite3_exec(db, "ALTER TABLE media ADD COLUMN title TEXT NOT NULL DEFAULT '';", NULL, NULL, NULL);
+    sqlite3_exec(db, "ALTER TABLE media ADD COLUMN scan_generation INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
 
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS book (path TEXT PRIMARY KEY);", NULL, NULL, NULL);
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS book_favorite (path TEXT PRIMARY KEY);", NULL, NULL, NULL);
@@ -392,28 +394,6 @@ void metadata_db_open(void) {
     sqlite3_finalize(count_stmt);
     if (row_count == 0) import_from_stock_player_db();
 
-    /* Same warm-start reasoning as media above, just for the book cache --
-     * only the fast stock-db path (a bounded SQLite read, not filesystem
-     * I/O) runs here, never the slow live-walk fallback (see
-     * metadata_db_list_books_from_stock()'s own comment) -- that one's
-     * reserved for gui.c's user-triggered rescan_books(), same as media's
-     * own full scan_all_songs_with_timeout() walk never runs at boot
-     * either. */
-    sqlite3_stmt * book_count_stmt = NULL;
-    long long book_row_count = -1;
-    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM book;", -1, &book_count_stmt, NULL) == SQLITE_OK) {
-        if (sqlite3_step(book_count_stmt) == SQLITE_ROW) book_row_count = sqlite3_column_int64(book_count_stmt, 0);
-    }
-    sqlite3_finalize(book_count_stmt);
-    if (book_row_count == 0) {
-        char ** paths = NULL;
-        int count = 0;
-        if (metadata_db_list_books_from_stock(&paths, &count)) {
-            metadata_db_book_replace_all(paths, count);
-            for (int i = 0; i < count; i++) free(paths[i]);
-            free(paths);
-        }
-    }
 #endif
 }
 
@@ -428,26 +408,50 @@ void metadata_db_close(void) {
     db = NULL;
 }
 
+static void metadata_db_update_checkpoint_if_needed(void) {
+    if (!db || update_generation == 0) return;
+    if (++update_ops_since_commit < METADATA_DB_UPDATE_BATCH) return;
+
+    /* Bound rollback-journal/WAL growth. Scan-generation marking makes a
+     * partially checkpointed scan safe: stale rows are not pruned until
+     * metadata_db_end_update(), so a crash or abandoned scan merely leaves
+     * a mixture of old/new generations that the next full pass supersedes. */
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
+    update_ops_since_commit = 0;
+}
+
 void metadata_db_begin_update(void) {
     if (!db) return;
+
+    sqlite3_stmt * st = NULL;
+    int64_t max_generation = 0;
+    if (sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(scan_generation), 0) FROM media;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        max_generation = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    update_generation = max_generation + 1;
+    if (update_generation <= 0) update_generation = 1; /* overflow/corruption guard */
+    update_ops_since_commit = 0;
     sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
-    /* TEMP tables live in their own always-fresh in-memory schema, so this
-     * never collides with a previous pass's leftovers even if
-     * metadata_db_end_update() was never reached (e.g. the app was killed
-     * mid-scan) -- the temp table simply didn't survive that. */
-    sqlite3_exec(db, "CREATE TEMP TABLE seen_paths (path TEXT PRIMARY KEY);", NULL, NULL, NULL);
-    sqlite3_prepare_v2(db, "INSERT INTO seen_paths (path) VALUES (?) ON CONFLICT(path) DO NOTHING;",
-                        -1, &stmt_mark_seen, NULL);
 }
 
 bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags_t * out) {
     if (!db) return false;
 
-    sqlite3_reset(stmt_mark_seen);
-    sqlite3_bind_text(stmt_mark_seen, 1, path, -1, SQLITE_STATIC);
-    sqlite3_step(stmt_mark_seen);
+    /* Mark as observed without building an O(N) TEMP seen_paths table. */
+    if (update_generation != 0) {
+        sqlite3_reset(stmt_mark_seen);
+        sqlite3_clear_bindings(stmt_mark_seen);
+        sqlite3_bind_int64(stmt_mark_seen, 1, update_generation);
+        sqlite3_bind_text(stmt_mark_seen, 2, path, -1, SQLITE_STATIC);
+        sqlite3_step(stmt_mark_seen);
+        metadata_db_update_checkpoint_if_needed();
+    }
 
     sqlite3_reset(stmt_get);
+    sqlite3_clear_bindings(stmt_get);
     sqlite3_bind_text(stmt_get, 1, path, -1, SQLITE_STATIC);
     if (sqlite3_step(stmt_get) != SQLITE_ROW) return false;
 
@@ -467,6 +471,7 @@ void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cache
     if (!db) return;
 
     sqlite3_reset(stmt_put);
+    sqlite3_clear_bindings(stmt_put);
     sqlite3_bind_text(stmt_put, 1, path, -1, SQLITE_STATIC);
     sqlite3_bind_int64(stmt_put, 2, mtime);
     sqlite3_bind_int64(stmt_put, 3, size);
@@ -475,16 +480,34 @@ void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cache
     sqlite3_bind_text(stmt_put, 6, tags->album, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt_put, 7, tags->album_artist, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt_put, 8, tags->genre, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt_put, 9, update_generation);
     sqlite3_step(stmt_put);
+    metadata_db_update_checkpoint_if_needed();
 }
 
 void metadata_db_end_update(void) {
-    if (!db) return;
-    sqlite3_finalize(stmt_mark_seen);
-    stmt_mark_seen = NULL;
-    sqlite3_exec(db, "DELETE FROM media WHERE path NOT IN (SELECT path FROM seen_paths);", NULL, NULL, NULL);
-    sqlite3_exec(db, "DROP TABLE seen_paths;", NULL, NULL, NULL);
+    if (!db || update_generation == 0) return;
+
+    /* Deletion detection is now an indexed generation comparison rather than
+     * NOT IN against an in-memory TEMP table containing every scanned path. */
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, "DELETE FROM media WHERE scan_generation <> ?;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, update_generation);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
     sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    update_generation = 0;
+    update_ops_since_commit = 0;
+}
+
+void metadata_db_abort_update(void) {
+    if (!db || update_generation == 0) return;
+    sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+    /* Do not prune anything: rows already marked with this generation are
+     * harmless. The next complete scan chooses a larger generation. */
+    update_generation = 0;
+    update_ops_since_commit = 0;
 }
 
 void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * out_count) {
@@ -525,121 +548,6 @@ void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * o
     *out_paths = paths;
     *out_tags = tags;
     *out_count = i;
-}
-
-#ifndef HOST_BUILD
-#define BOOK_STOCK_QUERY_TIMEOUT_MS 5000
-
-typedef struct {
-    char path[600];
-} book_stock_row_t;
-
-typedef struct {
-    volatile bool done;
-    book_stock_row_t * rows;
-    int count;
-    int capacity;
-} book_stock_work_t;
-
-/* Same SD-card-hang risk and same fix shape as import_from_stock_player_db_
- * worker() above (runs on its own throwaway thread, never touches the
- * shared `db` handle, deliberately leaked on timeout) -- see that function's
- * own block comment for the full mechanism. */
-static void * list_books_from_stock_worker(void * arg) {
-    book_stock_work_t * w = (book_stock_work_t *) arg;
-
-    sqlite3 * stock_db = NULL;
-    if (sqlite3_open_v2(STOCK_MEDIA_DB_PATH, &stock_db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        sqlite3_close(stock_db);
-        w->done = true; /* written last -- the only field polled by the caller */
-        return NULL;
-    }
-
-    sqlite3_stmt * st = NULL;
-    if (sqlite3_prepare_v2(stock_db, "SELECT path FROM BOOK_TABLE;", -1, &st, NULL) != SQLITE_OK) {
-        sqlite3_close(stock_db);
-        w->done = true;
-        return NULL;
-    }
-
-    w->capacity = 64;
-    w->rows = malloc(sizeof(book_stock_row_t) * (size_t) w->capacity);
-    w->count = 0;
-
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        const char * raw_path = (const char *) sqlite3_column_text(st, 0);
-        char path[600];
-        if (!translate_stock_path(raw_path, path, sizeof(path))) continue;
-        /* Cheap single-syscall existence check, not a directory walk --
-         * skips any entry the stock scanner indexed but the user has since
-         * deleted/moved, so this never shows a dead row. */
-        if (access(path, R_OK) != 0) continue;
-
-        if (w->count >= w->capacity) {
-            w->capacity *= 2;
-            w->rows = realloc(w->rows, sizeof(book_stock_row_t) * (size_t) w->capacity);
-        }
-        snprintf(w->rows[w->count].path, sizeof(w->rows[w->count].path), "%s", path);
-        w->count++;
-    }
-
-    sqlite3_finalize(st);
-    sqlite3_close(stock_db);
-    w->done = true; /* written last */
-    return NULL;
-}
-
-static int compare_book_paths(const void * a, const void * b) {
-    const char * const * pa = (const char * const *) a;
-    const char * const * pb = (const char * const *) b;
-    return strcasecmp(*pa, *pb);
-}
-#endif
-
-bool metadata_db_list_books_from_stock(char *** out_paths, int * out_count) {
-    *out_paths = NULL;
-    *out_count = 0;
-#ifdef HOST_BUILD
-    return false;
-#else
-    book_stock_work_t * w = calloc(1, sizeof(*w));
-    if (!w) return false;
-
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, list_books_from_stock_worker, w) != 0) {
-        free(w);
-        return false;
-    }
-    pthread_detach(thread); /* never joined either way -- see list_books_from_stock_worker()'s own comment */
-
-    for (int waited_ms = 0; waited_ms < BOOK_STOCK_QUERY_TIMEOUT_MS; waited_ms += 20) {
-        if (w->done) break;
-        usleep(20000);
-    }
-
-    if (!w->done) {
-        fprintf(stderr, "Warning: timed out reading stock player database for books -- falling back to a live scan\n");
-        return false; /* w and its rows deliberately leaked -- see list_books_from_stock_worker()'s own comment */
-    }
-    if (w->count == 0) {
-        free(w->rows);
-        free(w);
-        return false;
-    }
-
-    char ** paths = malloc(sizeof(char *) * (size_t) w->count);
-    for (int i = 0; i < w->count; i++) {
-        paths[i] = strdup(w->rows[i].path);
-    }
-    qsort(paths, (size_t) w->count, sizeof(char *), compare_book_paths);
-
-    *out_paths = paths;
-    *out_count = w->count;
-
-    free(w->rows);
-    free(w);
-    return true;
-#endif
 }
 
 void metadata_db_book_replace_all(char * const * paths, int count) {

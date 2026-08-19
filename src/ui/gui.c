@@ -52,6 +52,7 @@
 #include "src/widgets/image/lv_image.h"
 #include "src/drivers/display/fb/lv_linux_fbdev.h"
 #include <ctype.h>
+#include <dirent.h>
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
@@ -84,6 +85,11 @@
    * gets mounted too, not just the very first insertion main.c catches. */
   extern void mount_sd_card_if_needed(void);
 #endif
+
+/* Books are deliberately isolated from the music-library root. A recursive
+ * .txt search across an entire large SD card is both unexpectedly broad and
+ * slow; only this dedicated directory participates in book discovery. */
+#define BOOKS_ROOT_DIR MUSIC_ROOT_DIR "/Books"
 
 /* ---- UI text size (Settings -> Font Size) ----
  *
@@ -432,6 +438,9 @@ static int shuffle_order_count = 0; /* playlist_count this bag was generated for
 static int shuffle_pos = -1;        /* index into shuffle_order such that shuffle_order[shuffle_pos] == playlist_index */
 
 static bool user_seeking = false;
+static int32_t displayed_progress_percent = -1;
+static int displayed_position_second = -1;
+static int displayed_duration_second = -1;
 
 static player_settings_t current_settings;
 
@@ -2853,10 +2862,11 @@ static void quick_drawer_bt_long_press_cb(lv_event_t * e) {
 static pthread_t wifi_toggle_thread;
 static bool wifi_toggle_active = false;
 static volatile bool wifi_toggle_done_flag = false;
+static bool wifi_toggle_target_enabled = false;
 
 static void * wifi_toggle_thread_func(void * arg) {
     (void) arg;
-    bool turning_on = !wifi_control_is_enabled();
+    bool turning_on = wifi_toggle_target_enabled;
     if (turning_on) wifi_control_enable();
     else wifi_control_disable();
 
@@ -2888,8 +2898,10 @@ static void quick_drawer_wifi_event_cb(lv_event_t * e) {
         return;
     }
     if (wifi_toggle_active) return; /* already toggling -- ignore taps until it lands */
+    bool wifi_will_be_enabled = !wifi_control_is_enabled();
     wifi_toggle_active = true;
     wifi_toggle_done_flag = false;
+    wifi_toggle_target_enabled = wifi_will_be_enabled;
 
     /* Optimistic sprite flip -- wifi_control_is_enabled() is a plain
      * access() check (see its own comment), not a subprocess spawn, so
@@ -2899,7 +2911,6 @@ static void quick_drawer_wifi_event_cb(lv_event_t * e) {
      * is what makes the tap read as instant. poll_wifi_toggle() still
      * re-reads the real state once the thread lands and corrects this if
      * the toggle unexpectedly failed. */
-    bool wifi_will_be_enabled = !wifi_control_is_enabled();
     lv_image_set_src(quick_drawer_wifi_icon, asset_path(wifi_will_be_enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
 
     /* Real-device bug report: the topbar Wi-Fi icon stayed frozen (hidden,
@@ -2934,17 +2945,26 @@ static void quick_drawer_wifi_event_cb(lv_event_t * e) {
      * poll_wifi_toggle() still re-populates with the real, authoritative
      * state once wifi_control_enable()/disable() actually lands, correcting
      * this if the toggle unexpectedly failed. */
-    if (nav_depth > 0 && nav_stack[nav_depth - 1] == wifi_screen) populate_wifi_screen(wifi_will_be_enabled);
-
-    pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL);
+    /* Do not clean/rebuild wifi_list from inside the clicked row's own
+     * event callback: doing so deletes the event target while LVGL is still
+     * dispatching through it. poll_wifi_toggle() performs the authoritative
+     * rebuild as soon as the worker settles. */
+    if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0) {
+        wifi_toggle_active = false;
+        refresh_wifi_icon();
+        if (nav_depth > 0 && nav_stack[nav_depth - 1] == wifi_screen)
+            populate_wifi_screen(wifi_control_is_enabled());
+    }
 }
 
 static void poll_wifi_toggle(void) {
     if (!wifi_toggle_active || !wifi_toggle_done_flag) return;
     wifi_toggle_active = false;
     pthread_join(wifi_toggle_thread, NULL);
+    bool enabled = wifi_control_is_enabled();
     refresh_wifi_icon(); /* re-reads the real state -- updates both the status bar and drawer icons */
-    populate_wifi_screen(wifi_control_is_enabled()); /* the Wi-Fi screen's own toggle row + everything gated on it needs the same refresh */
+    populate_wifi_screen(enabled); /* the Wi-Fi screen's own toggle row + everything gated on it needs the same refresh */
+    if (enabled != wifi_toggle_target_enabled) show_error_toast("Wi-Fi failed to change state");
 }
 
 /* Same real tap-to-toggle treatment for Bluetooth, mirroring the wifi
@@ -3314,7 +3334,7 @@ static void quick_drawer_brightness_changed_cb(lv_event_t * e) {
     lv_obj_t * label = (lv_obj_t *) lv_event_get_user_data(e);
 
     if (code == LV_EVENT_VALUE_CHANGED) {
-        backlight_set_percent((int) percent); /* live feedback while dragging */
+        backlight_set_normal_percent((int) percent); /* live feedback while dragging; also exits inactivity dim */
         lv_label_set_text_fmt(label, "%d%%", (int) percent);
     } else if (code == LV_EVENT_RELEASED) {
         /* Only persist once the drag settles, not on every intermediate
@@ -3939,6 +3959,9 @@ typedef struct {
      * every other caller. */
     char stream_url[1536];
     bool stream_verify_tls;
+    /* Local track whose directory should be searched when embedded art is
+     * absent. The lookup and file read stay on this worker thread. */
+    char local_track_path[PATH_MAX];
 } cover_decode_request_t;
 
 static pthread_t cover_decode_thread;
@@ -3965,6 +3988,55 @@ static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t 
 static bool cover_decode_pending_valid = false;
 static cover_decode_request_t cover_decode_pending;
 
+#define EXTERNAL_COVER_MAX_BYTES (16U * 1024U * 1024U)
+
+static bool load_external_cover(const char * track_path, uint8_t ** out_data, uint32_t * out_size) {
+    static const char * names[] = {
+        "cover.jpg", "cover.jpeg", "cover.png",
+        "folder.jpg", "folder.jpeg", "folder.png",
+        "front.jpg", "front.jpeg", "front.png"
+    };
+    char directory[PATH_MAX];
+    snprintf(directory, sizeof(directory), "%s", track_path);
+    char * slash = strrchr(directory, '/');
+    if (!slash) snprintf(directory, sizeof(directory), ".");
+    else if (slash == directory) slash[1] = '\0';
+    else *slash = '\0';
+
+    DIR * dir = opendir(directory);
+    if (!dir) return false;
+    char matched[NAME_MAX + 1] = "";
+    for (size_t wanted = 0; wanted < sizeof(names) / sizeof(names[0]) && !matched[0]; wanted++) {
+        rewinddir(dir);
+        struct dirent * entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcasecmp(entry->d_name, names[wanted]) == 0) {
+                snprintf(matched, sizeof(matched), "%s", entry->d_name);
+                break;
+            }
+        }
+    }
+    closedir(dir);
+    if (!matched[0]) return false;
+
+    char path[PATH_MAX];
+    int path_len = snprintf(path, sizeof(path), "%s/%s", directory, matched);
+    if (path_len < 0 || (size_t) path_len >= sizeof(path)) return false;
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (uint64_t) st.st_size > EXTERNAL_COVER_MAX_BYTES) return false;
+
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+    uint8_t * data = malloc((size_t) st.st_size);
+    bool ok = data && fread(data, 1, (size_t) st.st_size, f) == (size_t) st.st_size;
+    fclose(f);
+    if (!ok) { free(data); return false; }
+    *out_data = data;
+    *out_size = (uint32_t) st.st_size;
+    return true;
+}
+
 static void * cover_decode_thread_func(void * arg) {
     cover_decode_request_t * req = (cover_decode_request_t *) arg;
 
@@ -3982,6 +4054,8 @@ static void * cover_decode_thread_func(void * arg) {
              * cover-art fetch isn't worth blocking or retrying playback
              * over. */
         }
+    } else if (!req->picture_data && req->local_track_path[0]) {
+        load_external_cover(req->local_track_path, &req->picture_data, &req->picture_size);
     }
 
     uint16_t * pixels = NULL;
@@ -4028,6 +4102,13 @@ static void launch_cover_decode_req(cover_decode_request_t r) {
 static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t picture_size) {
     cover_decode_request_t r = { .for_index = for_index, .picture_data = picture_data, .picture_size = picture_size,
                                   .stream_url = "", .stream_verify_tls = false };
+    launch_cover_decode_req(r);
+}
+
+static void launch_cover_decode_from_track(int for_index, const char * track_path) {
+    cover_decode_request_t r = { .for_index = for_index, .picture_data = NULL, .picture_size = 0,
+                                  .stream_url = "", .stream_verify_tls = false };
+    snprintf(r.local_track_path, sizeof(r.local_track_path), "%s", track_path);
     launch_cover_decode_req(r);
 }
 
@@ -4273,8 +4354,12 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     refresh_format_badge();
     if (is_subsonic_stream && subsonic_stream_meta[index].cover_url[0]) {
         launch_cover_decode_from_url(index, subsonic_stream_meta[index].cover_url, subsonic_stream_meta[index].verify_tls);
+    } else if (out_meta->picture_data && out_meta->picture_size > 0) {
+        launch_cover_decode(index, out_meta->picture_data, out_meta->picture_size); /* embedded art has priority; takes ownership */
     } else {
-        launch_cover_decode(index, out_meta->picture_data, out_meta->picture_size); /* takes ownership, applied async */
+        free(out_meta->picture_data);
+        out_meta->picture_data = NULL;
+        launch_cover_decode_from_track(index, playlist[index]);
     }
 
     favorite_is_set = metadata_db_song_favorite_is_set(playlist[index]);
@@ -4293,6 +4378,9 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     /* The real position/duration come from audio_get_*_seconds() once the
      * decoder's opened -- the timer picks that up within its next tick. */
     lv_slider_set_value(progress_slider, 0, LV_ANIM_OFF);
+    displayed_progress_percent = 0;
+    displayed_position_second = -1;
+    displayed_duration_second = -1;
     lv_label_set_text(pos_label, "0:00");
     lv_label_set_text(dur_label, "0:00");
 
@@ -4313,8 +4401,9 @@ static void arm_next_track_for_audio(int index) {
     }
     track_metadata_t next_meta;
     metadata_read(playlist[next_index], &next_meta);
-    audio_set_next_track(playlist[next_index], next_meta.has_replaygain, next_meta.replaygain_gain_db,
-                          next_meta.has_replaygain_peak, next_meta.replaygain_peak);
+    bool use_replaygain = current_settings.replaygain_enabled;
+    audio_set_next_track(playlist[next_index], use_replaygain && next_meta.has_replaygain, next_meta.replaygain_gain_db,
+                          use_replaygain && next_meta.has_replaygain_peak, next_meta.replaygain_peak);
     free(next_meta.picture_data); /* only needed the gain/peak fields, not the art */
 }
 
@@ -4417,8 +4506,9 @@ static void play_track_at_from(int index, double start_seconds) {
 
     track_metadata_t meta;
     apply_track_metadata_to_ui(index, &meta);
-    audio_play_file_at(playlist[index], start_seconds, meta.has_replaygain, meta.replaygain_gain_db,
-                        meta.has_replaygain_peak, meta.replaygain_peak);
+    bool use_replaygain = current_settings.replaygain_enabled;
+    audio_play_file_at(playlist[index], start_seconds, use_replaygain && meta.has_replaygain, meta.replaygain_gain_db,
+                        use_replaygain && meta.has_replaygain_peak, meta.replaygain_peak);
     arm_next_track_for_audio(index);
 
 #ifndef HOST_BUILD
@@ -4599,6 +4689,15 @@ static void crossfade_switch_event_cb(lv_event_t * e) {
     audio_set_crossfade_enabled(current_settings.crossfade_enabled);
     settings_save(&current_settings);
     refresh_quick_drawer_crossfade_icon(); /* see its own comment -- keeps the drawer icon in sync */
+}
+
+static void replaygain_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.replaygain_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+    /* Avoid a mid-song loudness jump; only the already-queued next track
+     * and subsequent starts adopt the new preference. */
+    if (playlist_index >= 0) arm_next_track_for_audio(playlist_index);
 }
 
 static void car_mode_switch_event_cb(lv_event_t * e) {
@@ -4916,6 +5015,7 @@ static void poll_subsonic_download(void);
 static void poll_subsonic_library_download(void);
 static void poll_dlna_control(void);
 static void poll_subsonic_connect(void);
+static void poll_subsonic_browse(void);
 /* Defined alongside library_scan_once()'s own background-thread wrapper,
  * much further down -- forward-declared here since subsonic_library_
  * download_thread_func() (defined well before that point) needs to trigger
@@ -4949,6 +5049,14 @@ static void poll_import_web_stop(void);
  * the user already had off before sleeping stays off. */
 #define RADIO_SUSPEND_DELAY_MS (10 * 60 * 1000)
 static uint32_t screen_off_since_tick = 0;
+static bool inactivity_dimmed = false;
+static int visible_status_poll_tick_counter = 0;
+
+/* The panel dominates power while lit. Dim well before the configured full
+ * timeout, but keep enough time for reading and never override an explicit
+ * user's screen-off duration. */
+#define SCREEN_DIM_AFTER_MS 10000U
+#define VISIBLE_STATUS_POLL_TICKS 4 /* 2 seconds at the 500 ms control tick */
 static bool radios_suspended = false;
 static bool wifi_was_on_before_suspend = false;
 static bool bt_was_on_before_suspend = false;
@@ -5377,9 +5485,18 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_power_off_countdown();
 
     uint32_t screen_inactive_ms = lv_display_get_inactive_time(NULL);
+    bool screen_on_before_timeout = backlight_screen_is_on();
+    if (screen_on_before_timeout && !inactivity_dimmed && screen_inactive_ms >= SCREEN_DIM_AFTER_MS) {
+        backlight_set_dimmed(true);
+        inactivity_dimmed = true;
+    } else if (screen_on_before_timeout && inactivity_dimmed && screen_inactive_ms < SCREEN_DIM_AFTER_MS) {
+        backlight_set_dimmed(false);
+        inactivity_dimmed = false;
+    }
     if (current_settings.screen_timeout_enabled && backlight_screen_is_on() &&
         screen_inactive_ms >= (uint32_t) current_settings.screen_timeout_seconds * 1000) {
         backlight_set_screen_on(false);
+        inactivity_dimmed = false;
     }
 
     /* Battery: skip every bit of UI-only refresh work below (label updates,
@@ -5406,9 +5523,11 @@ static void update_timer_cb(lv_timer_t * timer) {
      * keep working with the screen dark, matching a normal DAP. */
     if (screen_on_now != screen_was_on) {
         lv_indev_enable(NULL, screen_on_now);
+        audio_set_low_power_mode(!screen_on_now);
     }
 
     if (screen_just_woke) {
+        inactivity_dimmed = false;
         idle_shutdown_attempted = false;
         if (radios_suspended) {
             /* Only resume a radio we actually suspended, and only if it's
@@ -5420,7 +5539,9 @@ static void update_timer_cb(lv_timer_t * timer) {
             if (wifi_was_on_before_suspend && !wifi_control_is_enabled() && !wifi_toggle_active) {
                 wifi_toggle_active = true;
                 wifi_toggle_done_flag = false;
-                pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL);
+                wifi_toggle_target_enabled = true;
+                if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0)
+                    wifi_toggle_active = false;
             }
             if (bt_was_on_before_suspend && !bt_is_powered_cached && !bt_toggle_active) {
                 bt_toggle_active = true;
@@ -5465,7 +5586,9 @@ static void update_timer_cb(lv_timer_t * timer) {
             if (wifi_was_on_before_suspend && !wifi_toggle_active) {
                 wifi_toggle_active = true;
                 wifi_toggle_done_flag = false;
-                pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL);
+                wifi_toggle_target_enabled = false;
+                if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0)
+                    wifi_toggle_active = false;
             }
             if (bt_was_on_before_suspend && !bt_toggle_active) {
                 bt_toggle_active = true;
@@ -5543,10 +5666,16 @@ static void update_timer_cb(lv_timer_t * timer) {
     }
 
     if (screen_on_now) {
-        refresh_clock_label();
-        refresh_battery_topbar();
-        refresh_headphone_icon();
-        poll_usb_audio_output(); /* same cheap direct-file-read class as refresh_headphone_icon() above, safe every tick */
+        /* Hardware/sysfs status does not need the 500 ms latency reserved for
+         * buttons and playback events. Poll it every two seconds and force a
+         * refresh on wake; this removes three quarters of those reads. */
+        if (screen_just_woke || ++visible_status_poll_tick_counter >= VISIBLE_STATUS_POLL_TICKS) {
+            visible_status_poll_tick_counter = 0;
+            refresh_clock_label();
+            refresh_battery_topbar();
+            refresh_headphone_icon();
+            poll_usb_audio_output();
+        }
         refresh_play_pause_topbar(); /* cheap in-process state check, safe to call every tick unlike the BT/wifi subprocess calls below */
         if (screen_just_woke || ++wifi_poll_tick_counter >= WIFI_POLL_TICKS) {
             wifi_poll_tick_counter = 0;
@@ -5591,6 +5720,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_subsonic_library_download();
     poll_dlna_control();
     poll_subsonic_connect();
+    poll_subsonic_browse();
     poll_wifi_scan();
     poll_wifi_connect();
     poll_wifi_connect_saved();
@@ -5642,6 +5772,13 @@ static void update_timer_cb(lv_timer_t * timer) {
         }
     }
 
+    /* All correctness-critical work above (buttons, queue transitions and
+     * completion of requested background operations) still runs at 500 ms.
+     * Everything below only redraws the player screen, so skip it while the
+     * panel is physically off. This preserves hardware-button latency while
+     * eliminating invisible slider/label rendering and asset I/O. */
+    if (!backlight_screen_is_on()) return;
+
     if (playlist_index < 0 || user_seeking) return;
 
     double position = audio_get_position_seconds();
@@ -5649,15 +5786,26 @@ static void update_timer_cb(lv_timer_t * timer) {
 
     if (duration > 0) {
         int32_t percent = (int32_t) ((position / duration) * 100.0);
-        lv_slider_set_value(progress_slider, percent, LV_ANIM_OFF);
+        if (percent != displayed_progress_percent) {
+            displayed_progress_percent = percent;
+            lv_slider_set_value(progress_slider, percent, LV_ANIM_OFF);
+        }
     }
 
-    char pos_str[16];
-    char dur_str[16];
-    format_time(position, pos_str, sizeof(pos_str));
-    format_time(duration, dur_str, sizeof(dur_str));
-    lv_label_set_text(pos_label, pos_str);
-    lv_label_set_text(dur_label, dur_str);
+    int position_second = (int) position;
+    int duration_second = (int) duration;
+    if (position_second != displayed_position_second) {
+        char pos_str[16];
+        displayed_position_second = position_second;
+        format_time(position, pos_str, sizeof(pos_str));
+        lv_label_set_text(pos_label, pos_str);
+    }
+    if (duration_second != displayed_duration_second) {
+        char dur_str[16];
+        displayed_duration_second = duration_second;
+        format_time(duration, dur_str, sizeof(dur_str));
+        lv_label_set_text(dur_label, dur_str);
+    }
 
     refresh_format_badge();
 }
@@ -6583,9 +6731,12 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_align(progress_slider, LV_ALIGN_TOP_MID, 0, 0);
     lv_slider_set_range(progress_slider, 0, 100);
     lv_slider_set_value(progress_slider, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_image_src(progress_slider, asset_path("playing_plane/progress_bg.png"), LV_PART_MAIN);
-    lv_obj_set_style_bg_image_src(progress_slider, asset_path("playing_plane/progress.png"), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_image_src(progress_slider, asset_path("playing_plane/cursor.png"), LV_PART_KNOB);
+    const lv_image_dsc_t * progress_bg_mem = asset_png_memory("playing_plane/progress_bg.png");
+    const lv_image_dsc_t * progress_mem = asset_png_memory("playing_plane/progress.png");
+    const lv_image_dsc_t * cursor_mem = asset_png_memory("playing_plane/cursor.png");
+    lv_obj_set_style_bg_image_src(progress_slider, progress_bg_mem ? (const void *) progress_bg_mem : asset_path("playing_plane/progress_bg.png"), LV_PART_MAIN);
+    lv_obj_set_style_bg_image_src(progress_slider, progress_mem ? (const void *) progress_mem : asset_path("playing_plane/progress.png"), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_image_src(progress_slider, cursor_mem ? (const void *) cursor_mem : asset_path("playing_plane/cursor.png"), LV_PART_KNOB);
     /* Real-device bug report: accent color didn't apply here -- see
      * apply_accent_color()'s own comment on why an image-art slider needs
      * bg_image_recolor, not just bg_color. */
@@ -7159,36 +7310,47 @@ static void library_free_scan_state(void) {
 
 typedef struct {
     char root[600];
+    char spool_path[PATH_MAX];
     volatile bool done;
     bool ok;
-    char ** paths;
     int count;
     volatile int progress;
 } scan_walk_work_t;
 
+/* Binary length-prefixed spool: paths can contain whitespace and, unlike a
+ * newline-delimited temporary file, this remains correct even for odd names.
+ * The spool lives on the SD card, so discovery storage scales with library
+ * size without consuming the device's RAM. */
+static bool scan_spool_visit_cb(const char * path, void * user) {
+    FILE * f = (FILE *) user;
+    size_t n = strlen(path);
+    if (n > UINT32_MAX) return false;
+    uint32_t len = (uint32_t) n;
+    return fwrite(&len, sizeof(len), 1, f) == 1 && fwrite(path, 1, n, f) == n;
+}
+
 static void * scan_walk_worker(void * arg) {
     scan_walk_work_t * w = (scan_walk_work_t *) arg;
-    w->ok = file_browser_scan_all_songs(w->root, &w->paths, &w->count, &w->progress);
+    FILE * spool = fopen(w->spool_path, "wb");
+    if (!spool) {
+        w->ok = false;
+        w->done = true;
+        return NULL;
+    }
+    w->ok = file_browser_walk_all_songs(w->root, scan_spool_visit_cb, spool, &w->count, &w->progress);
+    if (fclose(spool) != 0) w->ok = false;
     w->done = true; /* written last -- the only field polled below */
     return NULL;
 }
 
-/* Real-device incident: scan_walk_worker() recurses into every subdirectory
- * (file_browser.c's scan_all_songs_recursive(), a few KB of stack per level
- * for its own PATH_MAX buffer), and a plain pthread_create() with no
- * explicit attr gets musl's fairly small default stack -- confirmed live as
- * a real crash (stack overflow surfacing as a SIGSEGV inside vsnprintf) even
- * after that function grew its own depth cap and stopped following
- * symlinks. 1MB is cheap on this device for one short-lived worker thread
- * (a rescan finishes long before it would ever hold that memory for long)
- * and leaves enormous headroom over the worst case even at the cap. Falls
- * back to the default stack size if setting this fails, rather than not
- * spawning the scan at all -- attribute setup failing is not itself a
- * reason to skip the whole feature. */
 #define SCAN_WALK_THREAD_STACK_SIZE (1024 * 1024)
-static bool scan_all_songs_with_timeout(const char * root, char *** out_paths, int * out_count) {
+static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path, size_t out_spool_size,
+                                        int * out_count) {
     scan_walk_work_t * w = calloc(1, sizeof(*w));
+    if (!w) return false;
     snprintf(w->root, sizeof(w->root), "%s", root);
+    snprintf(w->spool_path, sizeof(w->spool_path), "%s/.open_hiby_scan_%ld_%p.tmp",
+             root, (long) getpid(), (void *) w);
 
     pthread_attr_t attr;
     pthread_attr_t * attr_ptr = NULL;
@@ -7203,19 +7365,19 @@ static bool scan_all_songs_with_timeout(const char * root, char *** out_paths, i
         free(w);
         return false;
     }
-    pthread_detach(thread); /* never joined either way -- see block comment above */
+    pthread_detach(thread);
 
-    /* Stall detection, not a flat budget -- see LIBRARY_SCAN_WALK_STALL_
-     * TIMEOUT_MS's own comment. Same shape as scan_songs_range()'s own
-     * completed_index polling further down, just watching w->progress
-     * instead. */
     int last_seen_progress = 0;
     int stalled_ms = 0;
     for (;;) {
         if (w->done) {
             bool ok = w->ok;
-            *out_paths = w->paths;
-            *out_count = w->count;
+            if (ok) {
+                snprintf(out_spool_path, out_spool_size, "%s", w->spool_path);
+                *out_count = w->count;
+            } else {
+                remove(w->spool_path);
+            }
             free(w);
             return ok;
         }
@@ -7230,9 +7392,51 @@ static bool scan_all_songs_with_timeout(const char * root, char *** out_paths, i
         usleep(20000);
     }
 
-    fprintf(stderr, "Warning: scan of %s stalled with no progress for %ds (possible filesystem corruption) -- treating library as empty\n",
+    /* The worker may be in uninterruptible I/O. Do not touch/free its state.
+     * Its uniquely named spool can be orphaned safely and removed on a later
+     * maintenance pass; critically, it owns no SQLite handle or GUI memory. */
+    fprintf(stderr, "Warning: scan of %s stalled with no progress for %ds (possible filesystem corruption)\n",
             root, LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS / 1000);
     return false;
+}
+
+static bool scan_spool_read_path(FILE * f, char * path, size_t path_size) {
+    uint32_t len = 0;
+    if (fread(&len, sizeof(len), 1, f) != 1) return false;
+    if (len == 0 || len >= path_size) {
+        if (fseek(f, (long) len, SEEK_CUR) != 0) return false;
+        path[0] = '\0';
+        return true;
+    }
+    if (fread(path, 1, len, f) != len) return false;
+    path[len] = '\0';
+    return true;
+}
+
+static void scan_one_song_into_db(const char * path) {
+    struct stat st;
+    bool have_stat = stat(path, &st) == 0;
+    int64_t mtime = have_stat ? (int64_t) st.st_mtime : 0;
+    int64_t size = have_stat ? (int64_t) st.st_size : 0;
+
+    cached_tags_t cached;
+    if (have_stat && metadata_db_get(path, mtime, size, &cached)) return;
+
+    track_metadata_t meta;
+    metadata_read_isolated(path, &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS);
+
+    cached_tags_t fresh;
+    memset(&fresh, 0, sizeof(fresh));
+    snprintf(fresh.title, sizeof(fresh.title), "%s", meta.has_title ? meta.title : "");
+    snprintf(fresh.artist, sizeof(fresh.artist), "%s", meta.has_artist ? meta.artist : "Unknown Artist");
+    snprintf(fresh.album, sizeof(fresh.album), "%s", meta.has_album ? meta.album : "Unknown Album");
+    const char * album_artist_value = meta.has_album_artist ? meta.album_artist
+                                     : (meta.has_artist ? meta.artist : "Unknown Artist");
+    snprintf(fresh.album_artist, sizeof(fresh.album_artist), "%s", album_artist_value);
+    snprintf(fresh.genre, sizeof(fresh.genre), "%s", meta.has_genre ? meta.genre : "Unknown Genre");
+    free(meta.picture_data);
+
+    if (have_stat) metadata_db_put(path, mtime, size, &fresh);
 }
 
 /* Runs the original (pre-timeout) stat + cache-lookup + metadata_read body
@@ -7440,38 +7644,60 @@ static void rescan_playlists(void) {
     free(paths);
 }
 
+static void library_load_from_cache_only(void);
+
 static void library_scan_once(void) {
-    library_free_scan_state();
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
-    scan_all_songs_with_timeout(MUSIC_ROOT_DIR, &all_songs_paths, &all_songs_count);
 
-    /* metadata_db_open() is idempotent (a no-op once already open, see its
-     * own guard) -- called here, ahead of its other call site below, so
-     * rescan_books() always has a real db handle to write into regardless
-     * of whether any music was found. Unconditional, before the
-     * all_songs_count==0 early return just below -- an empty (or
-     * music-free) library shouldn't skip refreshing the book cache too,
-     * they're independent collections. */
     metadata_db_open();
     rescan_books();
     rescan_playlists();
 
-    if (all_songs_count == 0) return;
+    char spool_path[PATH_MAX] = {0};
+    int discovered_count = 0;
+    if (!scan_all_songs_with_timeout(MUSIC_ROOT_DIR, spool_path, sizeof(spool_path), &discovered_count)) {
+        return; /* preserve the last known-good in-memory + on-disk library */
+    }
 
-    library_scan_progress_total = all_songs_count;
-
+    library_scan_progress_total = discovered_count;
     metadata_db_begin_update();
 
-    all_song_tags = malloc(sizeof(song_tags_t) * (size_t) all_songs_count);
-    scan_songs_range(0);
+    FILE * spool = fopen(spool_path, "rb");
+    if (!spool) {
+        metadata_db_abort_update();
+        remove(spool_path);
+        return;
+    }
+
+    bool complete = true;
+    char path[PATH_MAX];
+    int done = 0;
+    while (done < discovered_count) {
+        if (!scan_spool_read_path(spool, path, sizeof(path))) {
+            complete = false;
+            break;
+        }
+        if (path[0] != '\0') scan_one_song_into_db(path);
+        library_scan_progress_done = ++done;
+    }
+    fclose(spool);
+    remove(spool_path);
+
+    if (!complete) {
+        metadata_db_abort_update();
+        return;
+    }
 
     metadata_db_end_update();
 
-    build_groups_by(artist_key_of, compare_index_by_artist, &artist_groups, &artist_group_count);
-    build_groups_by(album_key_of, compare_index_by_album, &album_groups, &album_group_count);
-    build_groups_by(album_artist_key_of, compare_index_by_album_artist, &album_artist_groups, &album_artist_group_count);
-    rebuild_all_songs_sort_order();
+    /* Only after the on-disk index is complete do we replace the currently
+     * displayed snapshot. This prevents scan-time RAM from being N paths + N
+     * tags + grouping arrays simultaneously. The GUI is still an in-memory
+     * snapshot today; moving its browse/search layer to paged DB cursors is
+     * the next step toward a fully Rockbox-like architecture. */
+    library_free_scan_state();
+    library_load_from_cache_only();
 }
 
 /* Boot-time equivalent of library_scan_once() above (still used verbatim
@@ -7621,6 +7847,13 @@ static lv_obj_t * group_songs_edit_btn;
 static const int * group_songs_indices; /* borrowed from whichever group_t is currently shown */
 static int group_songs_count;
 
+/* A pathological album can contain tens of thousands of tracks. Building one
+ * LVGL object per track caused a large post-scan RSS spike and could make ADB
+ * unresponsive. Keep the backing group intact for playback, but materialize
+ * only one bounded page of rows at a time. */
+#define GROUP_SONGS_PAGE_SIZE 200
+static int group_songs_page_start;
+
 /* Now-playing indicator bar -- recreated fresh every populate_group_songs_
  * rows() call (that function's own lv_obj_clean(group_songs_list) destroys
  * whatever was here before, same as every row), so this pointer is only
@@ -7674,6 +7907,34 @@ static bool group_songs_edit_mode = false;
  * already in scope -- forward-declared here since populate_group_songs_rows()
  * (just below) needs to wire it up as the remove-icon's click handler. */
 static void group_song_remove_row_cb(lv_event_t * e);
+static void populate_group_songs_rows(void);
+
+static void group_songs_prev_page_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || group_songs_page_start <= 0) return;
+    group_songs_page_start -= GROUP_SONGS_PAGE_SIZE;
+    if (group_songs_page_start < 0) group_songs_page_start = 0;
+    populate_group_songs_rows();
+}
+
+static void group_songs_next_page_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int next = group_songs_page_start + GROUP_SONGS_PAGE_SIZE;
+    if (next >= group_songs_count) return;
+    group_songs_page_start = next;
+    populate_group_songs_rows();
+}
+
+static lv_obj_t * add_group_songs_page_row(const char * text, lv_event_cb_t cb) {
+    lv_obj_t * row = lv_label_create(group_songs_list);
+    lv_obj_add_style(row, &list_row_style, 0);
+    lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+    lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_label_set_text(row, text);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, cb, LV_EVENT_CLICKED, NULL);
+    return row;
+}
 
 /* Defined near populate_playlists_screen() further down -- forward-declared
  * here since group_song_remove_row_cb() (below) and playlist_row_click_cb()
@@ -7734,12 +7995,15 @@ static void refresh_group_songs_now_playing_indicator(void) {
         }
     }
 
-    if (match < 0) {
+    int page_end = group_songs_page_start + GROUP_SONGS_PAGE_SIZE;
+    if (page_end > group_songs_count) page_end = group_songs_count;
+    if (match < group_songs_page_start || match >= page_end) {
         lv_obj_add_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
         return;
     }
+    int visible_row = match - group_songs_page_start + (group_songs_page_start > 0 ? 1 : 0);
     lv_obj_remove_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(group_songs_now_playing_bar, 0, 4 + match * (LIST_ROW_HEIGHT + 4));
+    lv_obj_set_pos(group_songs_now_playing_bar, 0, 4 + visible_row * (LIST_ROW_HEIGHT + 4));
 }
 
 /* Rebuilds group_songs_list's rows from whatever group_songs_indices/count
@@ -7764,7 +8028,21 @@ static void populate_group_songs_rows(void) {
 
     bool editing = editable && group_songs_edit_mode;
 
-    for (int i = 0; i < group_songs_count; i++) {
+    if (group_songs_count <= GROUP_SONGS_PAGE_SIZE) group_songs_page_start = 0;
+    if (group_songs_page_start >= group_songs_count && group_songs_count > 0) {
+        group_songs_page_start = ((group_songs_count - 1) / GROUP_SONGS_PAGE_SIZE) * GROUP_SONGS_PAGE_SIZE;
+    }
+    int page_end = group_songs_page_start + GROUP_SONGS_PAGE_SIZE;
+    if (page_end > group_songs_count) page_end = group_songs_count;
+
+    if (group_songs_page_start > 0) {
+        char page_text[96];
+        snprintf(page_text, sizeof(page_text), "Previous  •  %d–%d of %d",
+                 group_songs_page_start + 1, page_end, group_songs_count);
+        add_group_songs_page_row(page_text, group_songs_prev_page_cb);
+    }
+
+    for (int i = group_songs_page_start; i < page_end; i++) {
         if (editing) {
             /* Container row (label + remove icon), same shape as e.g.
              * build_wifi_screen()'s saved/scanned network rows -- unlike the
@@ -7803,6 +8081,13 @@ static void populate_group_songs_rows(void) {
             lv_obj_add_event_cb(row, group_song_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
             lv_obj_add_event_cb(row, group_song_row_long_press_cb, LV_EVENT_LONG_PRESSED, (void *) (intptr_t) i);
         }
+    }
+
+    if (page_end < group_songs_count) {
+        char page_text[96];
+        snprintf(page_text, sizeof(page_text), "Next  •  %d–%d of %d",
+                 group_songs_page_start + 1, page_end, group_songs_count);
+        add_group_songs_page_row(page_text, group_songs_next_page_cb);
     }
 
     /* Recreated fresh here (lv_obj_clean() above just destroyed whatever
@@ -7853,12 +8138,16 @@ static void more_menu_list_cb(lv_event_t * e) {
         group_songs_edit_mode = false;
         group_songs_indices = player_source_group_indices;
         group_songs_count = player_source_group_count;
+        group_songs_page_start = player_source_group_pos >= 0
+                                     ? (player_source_group_pos / GROUP_SONGS_PAGE_SIZE) * GROUP_SONGS_PAGE_SIZE
+                                     : 0;
         lv_label_set_text(group_songs_title_label, player_source_group_title ? player_source_group_title : "");
         populate_group_songs_rows();
         nav_push(group_songs_screen);
         lv_obj_update_layout(group_songs_list);
-        if (player_source_group_pos >= 0 && player_source_group_pos < (int) lv_obj_get_child_count(group_songs_list)) {
-            lv_obj_scroll_to_view(lv_obj_get_child(group_songs_list, player_source_group_pos), LV_ANIM_OFF);
+        int visible_pos = player_source_group_pos - group_songs_page_start + (group_songs_page_start > 0 ? 1 : 0);
+        if (visible_pos >= 0 && visible_pos < (int) lv_obj_get_child_count(group_songs_list)) {
+            lv_obj_scroll_to_view(lv_obj_get_child(group_songs_list, visible_pos), LV_ANIM_OFF);
         }
         break;
     case PLAYER_SOURCE_FILE_BROWSER:
@@ -7936,6 +8225,7 @@ static void show_group_songs_editable(const group_t * group, const char * editab
     group_songs_edit_mode = false;
     group_songs_indices = group->indices;
     group_songs_count = group->count;
+    group_songs_page_start = 0;
 
     lv_label_set_text(group_songs_title_label, group->name);
     populate_group_songs_rows();
@@ -9791,22 +10081,166 @@ static void subsonic_song_row_click_cb(lv_event_t * e) {
     subsonic_play_song_and_queue_rest(index);
 }
 
+static void subsonic_album_row_click_cb(lv_event_t * e);
+static void subsonic_playlist_row_click_cb(lv_event_t * e);
+
+typedef enum {
+    SUBSONIC_BROWSE_ALBUM_SONGS,
+    SUBSONIC_BROWSE_ARTIST_ALBUMS,
+    SUBSONIC_BROWSE_PLAYLIST_SONGS,
+    SUBSONIC_BROWSE_PLAYLISTS,
+    SUBSONIC_BROWSE_ALL_ALBUMS,
+} subsonic_browse_kind_t;
+
+typedef struct {
+    subsonic_browse_kind_t kind;
+    subsonic_server_t server;
+    char id[64];
+    char title[128];
+} subsonic_browse_request_t;
+
+static pthread_t subsonic_browse_thread;
+static bool subsonic_browse_active = false;
+static volatile bool subsonic_browse_done_flag = false;
+static volatile bool subsonic_browse_success_flag = false;
+static subsonic_browse_kind_t subsonic_browse_result_kind;
+static char subsonic_browse_result_title[128];
+static subsonic_song_t * subsonic_browse_result_songs = NULL;
+static subsonic_album_t * subsonic_browse_result_albums = NULL;
+static subsonic_playlist_t * subsonic_browse_result_playlists = NULL;
+static int subsonic_browse_result_count = 0;
+
+static void * subsonic_browse_thread_func(void * arg) {
+    subsonic_browse_request_t * req = (subsonic_browse_request_t *) arg;
+    bool ok = false;
+    int count = 0;
+
+    switch (req->kind) {
+        case SUBSONIC_BROWSE_ALBUM_SONGS:
+            ok = subsonic_get_album_songs(&req->server, req->id, &subsonic_browse_result_songs, &count);
+            break;
+        case SUBSONIC_BROWSE_ARTIST_ALBUMS:
+            ok = subsonic_get_artist_albums(&req->server, req->id, &subsonic_browse_result_albums, &count);
+            break;
+        case SUBSONIC_BROWSE_PLAYLIST_SONGS:
+            ok = subsonic_get_playlist_songs(&req->server, req->id, &subsonic_browse_result_songs, &count);
+            break;
+        case SUBSONIC_BROWSE_PLAYLISTS:
+            ok = subsonic_get_playlists(&req->server, &subsonic_browse_result_playlists, &count);
+            break;
+        case SUBSONIC_BROWSE_ALL_ALBUMS:
+            ok = subsonic_get_all_albums(&req->server, &subsonic_browse_result_albums, &count);
+            break;
+    }
+
+    subsonic_browse_result_kind = req->kind;
+    snprintf(subsonic_browse_result_title, sizeof(subsonic_browse_result_title), "%s", req->title);
+    subsonic_browse_result_count = count;
+    subsonic_browse_success_flag = ok;
+    subsonic_browse_done_flag = true;
+    free(req);
+    return NULL;
+}
+
+static void start_subsonic_browse(subsonic_browse_kind_t kind, const char * id, const char * title) {
+    if (subsonic_browse_active) return;
+
+    subsonic_browse_request_t * req = calloc(1, sizeof(*req));
+    if (!req) return;
+    req->kind = kind;
+    req->server = subsonic_server_from_settings();
+    if (id) snprintf(req->id, sizeof(req->id), "%s", id);
+    if (title) snprintf(req->title, sizeof(req->title), "%s", title);
+
+    subsonic_browse_result_songs = NULL;
+    subsonic_browse_result_albums = NULL;
+    subsonic_browse_result_playlists = NULL;
+    subsonic_browse_result_count = 0;
+    subsonic_browse_done_flag = false;
+    subsonic_browse_success_flag = false;
+    subsonic_browse_active = true;
+
+    lv_label_set_text(subsonic_downloading_label, "Loading from server...");
+    nav_push(subsonic_downloading_screen);
+    if (pthread_create(&subsonic_browse_thread, NULL, subsonic_browse_thread_func, req) != 0) {
+        subsonic_browse_active = false;
+        free(req);
+        nav_pop();
+    }
+}
+
+static void poll_subsonic_browse(void) {
+    if (!subsonic_browse_active || !subsonic_browse_done_flag) return;
+
+    subsonic_browse_active = false;
+    pthread_join(subsonic_browse_thread, NULL);
+    bool success = subsonic_browse_success_flag;
+    int depth_before = nav_depth;
+
+    if (success) {
+        switch (subsonic_browse_result_kind) {
+            case SUBSONIC_BROWSE_ALBUM_SONGS:
+            case SUBSONIC_BROWSE_PLAYLIST_SONGS:
+                free(subsonic_songs_cache);
+                subsonic_songs_cache = subsonic_browse_result_songs;
+                subsonic_songs_count = subsonic_browse_result_count;
+                subsonic_songs_context_is_playlist =
+                    subsonic_browse_result_kind == SUBSONIC_BROWSE_PLAYLIST_SONGS;
+                if (subsonic_songs_context_is_playlist) {
+                    snprintf(subsonic_songs_context_playlist_name, sizeof(subsonic_songs_context_playlist_name), "%s",
+                             subsonic_browse_result_title);
+                }
+                lv_label_set_text(subsonic_songs_title_label, subsonic_browse_result_title);
+                lv_obj_clear_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
+                populate_indexed_list(subsonic_songs_list, subsonic_songs_count, subsonic_song_label_of,
+                                      subsonic_song_row_click_cb);
+                nav_push(subsonic_songs_screen);
+                break;
+            case SUBSONIC_BROWSE_ARTIST_ALBUMS:
+            case SUBSONIC_BROWSE_ALL_ALBUMS:
+                free(subsonic_albums_cache);
+                subsonic_albums_cache = subsonic_browse_result_albums;
+                subsonic_albums_count = subsonic_browse_result_count;
+                if (subsonic_browse_result_kind == SUBSONIC_BROWSE_ARTIST_ALBUMS) {
+                    snprintf(subsonic_albums_context_artist, sizeof(subsonic_albums_context_artist), "%s",
+                             subsonic_browse_result_title);
+                    lv_obj_clear_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    subsonic_albums_context_artist[0] = '\0';
+                    lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
+                }
+                lv_label_set_text(subsonic_albums_title_label, subsonic_browse_result_title);
+                populate_indexed_list(subsonic_albums_list, subsonic_albums_count, subsonic_album_label_of,
+                                      subsonic_album_row_click_cb);
+                nav_push(subsonic_albums_screen);
+                break;
+            case SUBSONIC_BROWSE_PLAYLISTS:
+                free(subsonic_playlists_cache);
+                subsonic_playlists_cache = subsonic_browse_result_playlists;
+                subsonic_playlists_count = subsonic_browse_result_count;
+                populate_indexed_list(subsonic_playlists_list, subsonic_playlists_count, subsonic_playlist_label_of,
+                                      subsonic_playlist_row_click_cb);
+                nav_push(subsonic_playlists_screen);
+                break;
+        }
+    } else {
+        free(subsonic_browse_result_songs);
+        free(subsonic_browse_result_albums);
+        free(subsonic_browse_result_playlists);
+    }
+
+    if (nav_depth > depth_before) nav_remove_stack_slot(depth_before - 1);
+    else nav_pop();
+}
+
 static void subsonic_album_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
     index = search_remap_index(SEARCH_BINDING_SUBSONIC_ALBUMS, index);
 
-    subsonic_server_t server = subsonic_server_from_settings();
-    free(subsonic_songs_cache);
-    subsonic_songs_cache = NULL;
-    subsonic_songs_count = 0;
-    if (!subsonic_get_album_songs(&server, subsonic_albums_cache[index].id, &subsonic_songs_cache, &subsonic_songs_count)) return;
-
-    subsonic_songs_context_is_playlist = false; /* an album's Download button never creates an .m3u -- see subsonic_download_songs_btn_cb() */
-    lv_label_set_text(subsonic_songs_title_label, subsonic_albums_cache[index].name);
-    lv_obj_clear_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
-    populate_indexed_list(subsonic_songs_list, subsonic_songs_count, subsonic_song_label_of, subsonic_song_row_click_cb);
-    nav_push(subsonic_songs_screen);
+    if (index < 0 || index >= subsonic_albums_count) return;
+    start_subsonic_browse(SUBSONIC_BROWSE_ALBUM_SONGS, subsonic_albums_cache[index].id,
+                          subsonic_albums_cache[index].name);
 }
 
 static void subsonic_artist_row_click_cb(lv_event_t * e) {
@@ -9814,20 +10248,9 @@ static void subsonic_artist_row_click_cb(lv_event_t * e) {
     int index = (int) (intptr_t) lv_event_get_user_data(e);
     index = search_remap_index(SEARCH_BINDING_SUBSONIC_ARTISTS, index);
 
-    subsonic_server_t server = subsonic_server_from_settings();
-    free(subsonic_albums_cache);
-    subsonic_albums_cache = NULL;
-    subsonic_albums_count = 0;
-    if (!subsonic_get_artist_albums(&server, subsonic_artists_cache[index].id, &subsonic_albums_cache, &subsonic_albums_count)) return;
-
-    /* Non-empty -- this is "an Artist page" (one artist's albums), so its
-     * Download button (downloads every song across every album shown here)
-     * is meaningful; see subsonic_albums_context_artist's own comment. */
-    snprintf(subsonic_albums_context_artist, sizeof(subsonic_albums_context_artist), "%s", subsonic_artists_cache[index].name);
-    lv_label_set_text(subsonic_albums_title_label, subsonic_artists_cache[index].name);
-    lv_obj_clear_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
-    populate_indexed_list(subsonic_albums_list, subsonic_albums_count, subsonic_album_label_of, subsonic_album_row_click_cb);
-    nav_push(subsonic_albums_screen);
+    if (index < 0 || index >= subsonic_artists_count) return;
+    start_subsonic_browse(SUBSONIC_BROWSE_ARTIST_ALBUMS, subsonic_artists_cache[index].id,
+                          subsonic_artists_cache[index].name);
 }
 
 /* ---- Subsonic screen redesign: Playlists (new top-level menu row) and the
@@ -9841,19 +10264,9 @@ static void subsonic_playlist_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
 
-    subsonic_server_t server = subsonic_server_from_settings();
-    free(subsonic_songs_cache);
-    subsonic_songs_cache = NULL;
-    subsonic_songs_count = 0;
-    if (!subsonic_get_playlist_songs(&server, subsonic_playlists_cache[index].id, &subsonic_songs_cache, &subsonic_songs_count)) return;
-
-    subsonic_songs_context_is_playlist = true; /* this page's Download button also creates a local .m3u -- see subsonic_download_songs_btn_cb() */
-    snprintf(subsonic_songs_context_playlist_name, sizeof(subsonic_songs_context_playlist_name), "%s",
-             subsonic_playlists_cache[index].name);
-    lv_label_set_text(subsonic_songs_title_label, subsonic_playlists_cache[index].name);
-    lv_obj_clear_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
-    populate_indexed_list(subsonic_songs_list, subsonic_songs_count, subsonic_song_label_of, subsonic_song_row_click_cb);
-    nav_push(subsonic_songs_screen);
+    if (index < 0 || index >= subsonic_playlists_count) return;
+    start_subsonic_browse(SUBSONIC_BROWSE_PLAYLIST_SONGS, subsonic_playlists_cache[index].id,
+                          subsonic_playlists_cache[index].name);
 }
 
 static void subsonic_menu_artists_row_cb(lv_event_t * e) {
@@ -9867,34 +10280,13 @@ static void subsonic_menu_artists_row_cb(lv_event_t * e) {
 static void subsonic_menu_playlists_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-    subsonic_server_t server = subsonic_server_from_settings();
-    free(subsonic_playlists_cache);
-    subsonic_playlists_cache = NULL;
-    subsonic_playlists_count = 0;
-    if (!subsonic_get_playlists(&server, &subsonic_playlists_cache, &subsonic_playlists_count)) return;
-
-    populate_indexed_list(subsonic_playlists_list, subsonic_playlists_count, subsonic_playlist_label_of,
-                           subsonic_playlist_row_click_cb);
-    nav_push(subsonic_playlists_screen);
+    start_subsonic_browse(SUBSONIC_BROWSE_PLAYLISTS, NULL, "Playlists");
 }
 
 static void subsonic_menu_albums_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-    subsonic_server_t server = subsonic_server_from_settings();
-    free(subsonic_albums_cache);
-    subsonic_albums_cache = NULL;
-    subsonic_albums_count = 0;
-    if (!subsonic_get_all_albums(&server, &subsonic_albums_cache, &subsonic_albums_count)) return;
-
-    /* Empty -- this is the flat, whole-library album list, not "an Artist
-     * page," so no Download-everything button (see subsonic_albums_context_
-     * artist's own comment for why that distinction matters). */
-    subsonic_albums_context_artist[0] = '\0';
-    lv_label_set_text(subsonic_albums_title_label, "Albums");
-    lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
-    populate_indexed_list(subsonic_albums_list, subsonic_albums_count, subsonic_album_label_of, subsonic_album_row_click_cb);
-    nav_push(subsonic_albums_screen);
+    start_subsonic_browse(SUBSONIC_BROWSE_ALL_ALBUMS, NULL, "Albums");
 }
 
 /* Top-of-screen Download button shared by subsonic_songs_screen (an
@@ -11382,6 +11774,16 @@ static void start_library_rescan(void) {
  * comment on why (still applies verbatim): its content is recomputed fresh
  * on every visit already, never stale to begin with. */
 static void refresh_library_screens_after_reload(void) {
+    /* A hot-insert cache reload can arrive while one of these screens is
+     * the active LVGL screen. Deleting an active screen leaves the display's
+     * act_scr pointer dangling; the next refresh then crashes in
+     * lv_obj_update_layout(). A user-triggered full rescan is different:
+     * its non-library progress screen is active and must remain visible
+     * long enough to show the completion message, so only preserve that
+     * explicitly safe case. Resetting also removes deeper group screens
+     * whose rows reference the library arrays replaced by the reload. */
+    if (lv_screen_active() != subsonic_downloading_screen) nav_reset_to_home();
+
     lv_obj_delete(all_songs_screen);
     lv_obj_delete(artists_screen);
     lv_obj_delete(albums_screen);
@@ -14819,10 +15221,10 @@ static lv_obj_t * build_wireless_screen(void) {
  *
  * "Books" row of the Books menu (originally "Files", folded into this one
  * row and renamed per real-device feedback -- see build_books_screen()):
- * a flat list of every .txt file under MUSIC_ROOT_DIR (there's no separate
- * books partition on this device, same root the music library itself
- * scans), sourced from the persistent book cache (metadata_db.c), tap one
- * to read it. Deliberately basic, matching what was actually asked for --
+ * a flat list of every .txt file under BOOKS_ROOT_DIR, sourced from the
+ * persistent book cache (metadata_db.c), tap one to read it. Keeping book
+ * discovery inside this dedicated directory avoids recursively walking a
+ * large music library just to find text files. Deliberately basic --
  * no per-directory navigation (file_browser.c's UI, built for browsing
  * playable audio and building playlists, doesn't fit this shape of
  * problem), no pagination, just load the whole file into one scrollable
@@ -14898,12 +15300,11 @@ static void books_file_row_cb(lv_event_t * e) {
     open_text_reader(path);
 }
 
-/* Real-device bug report: opening the Files/Books screen visibly slowed
- * the device down and could look like a crash -- text_reader_scan_txt_files()
- * does a full, uncached recursive readdir()+stat() walk of the WHOLE
- * MUSIC_ROOT_DIR (the entire SD card/storage mount, same root the music
- * library itself scans), synchronously on the UI thread, every single time
- * this screen opens. There's no per-file tag-reading here to cache the way
+/* Real-device bug report: recursively looking for books across the whole SD
+ * card visibly slowed the device down and could look like a crash. Book
+ * discovery is now restricted to BOOKS_ROOT_DIR, but remains on a bounded
+ * worker so a damaged card cannot block the database-update worker forever.
+ * There's no per-file tag-reading here to cache the way
  * metadata_db.c caches audio metadata (a .txt file's content is never
  * inspected ahead of time, just its name), so the walk itself -- not
  * missing caching -- is the real cost, and on a large/deep library or a
@@ -14960,24 +15361,17 @@ static bool books_scan_txt_files_with_timeout(const char * root, char *** out_pa
 
 /* Real-device feedback: the Books menu's old separate "Scanning" row was a
  * dead stub, and the actual per-visit scan (in populate_books_files_screen(),
- * before this existed) made that screen slow to open every time -- see
- * metadata_db_list_books_from_stock()'s own comment. Both problems share one
- * fix: a real persistent book cache (metadata_db.c, same shape as media's
+ * before this existed) made that screen slow to open every time. Both
+ * problems share one fix: a real persistent book cache (metadata_db.c, same shape as media's
  * own), refreshed only here -- called from library_scan_once(), i.e. folded
  * into the existing Settings > Update Music Database action, not a separate
- * menu item. Tries the fast stock-db path first (a bounded SQLite read);
- * only falls back to a real live filesystem walk if that finds nothing, so
- * an explicit user-triggered rescan can still discover books the stock
- * scanner never indexed, unlike the boot-time warm-start in metadata_db_
- * open() (fast-path only, deliberately never walks the filesystem, same
- * reasoning as library_load_from_cache_only()'s own comment on why a slow
- * scan can't run before the first frame renders). */
+ * menu item. The stock database is deliberately not consulted here: it can
+ * contain text files from anywhere on the card, while this player's book
+ * contract is now exclusively BOOKS_ROOT_DIR. */
 static void rescan_books(void) {
     char ** paths = NULL;
     int count = 0;
-    if (!metadata_db_list_books_from_stock(&paths, &count)) {
-        books_scan_txt_files_with_timeout(MUSIC_ROOT_DIR, &paths, &count);
-    }
+    books_scan_txt_files_with_timeout(BOOKS_ROOT_DIR, &paths, &count);
 
     metadata_db_book_replace_all(paths, count);
 
@@ -16130,18 +16524,20 @@ static void plugin_playback_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_settings_playback_screen(void) {
-    static pill_list_item_t items[6 + PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
+    static pill_list_item_t items[7 + PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
                                     current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
                                     current_settings.crossfade_enabled, NULL, crossfade_switch_event_cb, NULL,
                                     &settings_crossfade_toggle_img };
     items[2] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
-    items[5] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "ReplayGain", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.replaygain_enabled, NULL, replaygain_switch_event_cb, NULL };
+    items[4] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
+    items[5] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
+    items[6] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
 
-    int count = 6;
+    int count = 7;
     int plugin_count = plugin_manager_get_playback_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_PLAYBACK_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -17169,7 +17565,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * ANY brightness at startup before this, so the screen just came up at
      * whatever raw value the kernel/bootloader itself left the backlight
      * sysfs attribute at. See settings.h's own comment on brightness_percent. */
-    backlight_set_percent(current_settings.brightness_percent);
+    backlight_set_normal_percent(current_settings.brightness_percent);
 
     led_control_apply(current_settings.led_indicator_enabled);
     charge_limiter_poll(current_settings.charge_limiter_enabled, true);

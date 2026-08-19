@@ -12,6 +12,8 @@ typedef struct {
     uint8_t ** out_buffer;
     size_t * out_buffer_size;
     FILE * out_file;
+    size_t buffer_capacity;
+    size_t max_buffer_size; /* 0 for file sinks; buffered API responses are bounded */
 
     http_progress_cb_t progress_cb;
     void * progress_user_data;
@@ -31,10 +33,21 @@ static bool sink_write(body_sink_t * sink, const uint8_t * data, size_t len, uin
         if (len > 0 && fwrite(data, 1, len, sink->out_file) != len) return false;
     } else {
         size_t old_size = *sink->out_buffer_size;
-        uint8_t * grown = realloc(*sink->out_buffer, old_size + len);
-        if (!grown) return false;
-        memcpy(grown + old_size, data, len);
-        *sink->out_buffer = grown;
+        if (len > sink->max_buffer_size || old_size > sink->max_buffer_size - len) return false;
+        size_t needed = old_size + len;
+        if (needed > sink->buffer_capacity) {
+            size_t capacity = sink->buffer_capacity ? sink->buffer_capacity : 4096;
+            while (capacity < needed) {
+                size_t next = capacity <= sink->max_buffer_size / 2 ? capacity * 2 : sink->max_buffer_size;
+                if (next <= capacity) return false;
+                capacity = next;
+            }
+            uint8_t * grown = realloc(*sink->out_buffer, capacity);
+            if (!grown) return false;
+            *sink->out_buffer = grown;
+            sink->buffer_capacity = capacity;
+        }
+        memcpy(*sink->out_buffer + old_size, data, len);
         *sink->out_buffer_size = old_size + len;
     }
     if (sink->progress_cb && !sink->progress_cb(total_written, total_expected, sink->progress_user_data)) return false;
@@ -237,6 +250,12 @@ static bool read_response(http_conn_t * conn, int * out_status, body_sink_t * si
     DBG_LOG("http_client: status=%d content_length=%llu chunked=%d\n", status,
             (unsigned long long) content_length, is_chunked);
 
+    if (sink->out_buffer && !is_chunked && content_length > sink->max_buffer_size) {
+        DBG_LOG("http_client: refusing oversized buffered response (%llu > %zu)\n",
+                (unsigned long long) content_length, sink->max_buffer_size);
+        return false;
+    }
+
     if (!read_body(&reader, is_chunked, content_length, sink)) {
         DBG_LOG("http_client: read_body failed (chunked=%d content_length=%llu)\n", is_chunked,
                 (unsigned long long) content_length);
@@ -252,6 +271,7 @@ bool http_get_to_buffer(const char * url, bool verify_tls, int * out_status, uin
     *out_body_size = 0;
 
     body_sink_t sink = { .out_buffer = out_body, .out_buffer_size = out_body_size, .out_file = NULL,
+                          .buffer_capacity = 0, .max_buffer_size = 8 * 1024 * 1024,
                           .progress_cb = NULL, .progress_user_data = NULL,
                           .out_content_type = NULL, .out_content_type_size = 0 };
     if (!do_get(url, verify_tls, out_status, &sink)) {
@@ -269,6 +289,7 @@ bool http_post_to_buffer(const char * url, bool verify_tls, const char * content
     *out_body_size = 0;
 
     body_sink_t sink = { .out_buffer = out_body, .out_buffer_size = out_body_size, .out_file = NULL,
+                          .buffer_capacity = 0, .max_buffer_size = 8 * 1024 * 1024,
                           .progress_cb = NULL, .progress_user_data = NULL,
                           .out_content_type = NULL, .out_content_type_size = 0 };
     if (!do_post(url, verify_tls, content_type, body, body_size, out_status, &sink)) {
@@ -295,6 +316,7 @@ bool http_get_to_file_ex(const char * url, bool verify_tls, const char * dest_pa
 
     int status = 0;
     body_sink_t sink = { .out_buffer = NULL, .out_buffer_size = NULL, .out_file = f,
+                          .buffer_capacity = 0, .max_buffer_size = 0,
                           .progress_cb = progress_cb, .progress_user_data = progress_user_data,
                           .out_content_type = out_content_type, .out_content_type_size = out_content_type_size };
     bool ok = do_get(url, verify_tls, &status, &sink);

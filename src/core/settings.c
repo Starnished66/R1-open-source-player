@@ -79,6 +79,7 @@ static void set_defaults(player_settings_t * out) {
     out->resume_mode = 0;
     out->accent_color = 0x2196F3; /* matches the app's existing default blue */
     out->crossfade_enabled = false;
+    out->replaygain_enabled = true; /* preserves the pre-setting behavior */
     out->car_mode_enabled = false;
     out->subsonic_url[0] = '\0';
     out->subsonic_username[0] = '\0';
@@ -92,7 +93,7 @@ static void set_defaults(player_settings_t * out) {
     out->dlna_renderer_enabled = false;
     out->remote_control_enabled = false;
     out->screen_timeout_enabled = true;
-    out->screen_timeout_seconds = 60;
+    out->screen_timeout_seconds = 30;
     out->led_indicator_enabled = true;
     out->charge_limiter_enabled = false; /* opt-in -- caps max charge at 85%, a real behavior change the user should choose, not a default surprise */
     out->show_battery_percent = true; /* on by default -- matches every previous version's always-on behavior */
@@ -138,6 +139,8 @@ bool settings_load(player_settings_t * out) {
             out->accent_color = (uint32_t) strtoul(value, NULL, 16);
         } else if (strcmp(key, "crossfade") == 0) {
             out->crossfade_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "replaygain_enabled") == 0) {
+            out->replaygain_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "car_mode_enabled") == 0) {
             out->car_mode_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "subsonic_url") == 0) {
@@ -253,6 +256,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "resume_mode=%d\n", settings->resume_mode);
     fprintf(f, "accent_color=%06X\n", (unsigned int) (settings->accent_color & 0xFFFFFF));
     fprintf(f, "crossfade=%d\n", settings->crossfade_enabled ? 1 : 0);
+    fprintf(f, "replaygain_enabled=%d\n", settings->replaygain_enabled ? 1 : 0);
     fprintf(f, "car_mode_enabled=%d\n", settings->car_mode_enabled ? 1 : 0);
     fprintf(f, "subsonic_url=%s\n", settings->subsonic_url);
     fprintf(f, "subsonic_username=%s\n", settings->subsonic_username);

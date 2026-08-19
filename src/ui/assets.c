@@ -3,7 +3,9 @@
 #include "lvgl.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #ifdef HOST_BUILD
   #define THEME_ROOT "assets/theme2/"
@@ -61,4 +63,26 @@ const char * asset_path(const char * relative_path) {
      * structs, so the bounded, one-time leak per image reference is the
      * same accepted tradeoff already made elsewhere in this codebase. */
     return strdup(buf);
+}
+
+const lv_image_dsc_t * asset_png_memory(const char * relative_path) {
+    const char * resolved = asset_path(relative_path);
+    const char * path = resolved;
+    if (path[0] && path[1] == ':') path += 2; /* strip LVGL's POSIX drive prefix */
+
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0 || st.st_size > 1024 * 1024) return NULL;
+    FILE * f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint8_t * data = malloc((size_t) st.st_size);
+    bool ok = data && fread(data, 1, (size_t) st.st_size, f) == (size_t) st.st_size;
+    fclose(f);
+    if (!ok) { free(data); return NULL; }
+
+    lv_image_dsc_t * dsc = calloc(1, sizeof(*dsc));
+    if (!dsc) { free(data); return NULL; }
+    dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+    dsc->data = data;
+    dsc->data_size = (uint32_t) st.st_size;
+    return dsc;
 }

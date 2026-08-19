@@ -51,6 +51,7 @@ typedef struct {
 
     uint32_t accent_color;     /* packed 0xRRGGBB, applied to sliders/switches app-wide */
     bool crossfade_enabled;    /* if true, fade into the next queued track near the current one's end */
+    bool replaygain_enabled;   /* apply per-track ReplayGain tags during local playback */
 
     /* Car Mode: matches the stock firmware's own real behavior (confirmed
      * by real-device report) -- unplugging power while something is loaded

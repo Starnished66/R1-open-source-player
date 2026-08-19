@@ -92,6 +92,9 @@ extern lv_style_t list_row_style;
  * see screen_builders_init_list_row_style()'s own comment on why this is a
  * separate style rather than folded into list_row_style itself. */
 extern lv_style_t list_row_pressed_style;
+
+/* Enables the shared constant-speed row marquee with a 2-second pause. */
+void row_label_enable_marquee(lv_obj_t * label);
 /* Theming: shared, mutable bg_color styles for the app's other two
  * "background categories" -- attach with lv_obj_add_style(x, &style_theme_screen_bg, 0)
  * on every screen root, or &style_theme_card_bg on every popup/EQ-card/
@@ -208,7 +211,10 @@ typedef struct {
 #define PILL_ROW_HEIGHT_MIN 100
 #define PILL_ROW_HEIGHT_MAX 220
 #define PILL_ROW_WIDTH_MIN 240
-#define PILL_ROW_WIDTH_MAX 464
+#define PILL_ROW_WIDTH_MAX 476
+
+/* Font-tier-aware native width: Small=448, Medium=464, BlindMF=476. */
+int32_t pill_row_default_width(void);
 
 /* On-screen icon footprint (longest edge, in px) a plugin row's icon targets
  * -- same scaling formula as build_icon_grid_screen()'s own

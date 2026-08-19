@@ -1,43 +1,65 @@
-plugin.define({ id = "example.net_radio", name = "Net Radio", version = "1.0", api_min = 1 })
+plugin.define({ id = "example.net_radio", name = "Net Radio", version = "1.1", api_min = 1 })
 
--- Net Radio plugin -- demonstrates plugin.register_stream_media_tile()
--- (appearing as a real icon-grid tile in Stream Media, next to Subsonic)
--- together with live http(s):// stream URL playback.
+-- Net Radio reads its stations from Radio.txt at the root of the SD card:
 --
--- READ BEFORE ADDING YOUR OWN STATIONS -- current real limitations, not
--- just missing polish (see PLUGINS.md's "Live stream URLs" section):
---   * Every http(s):// URL is always decoded as MP3, regardless of what it
---     looks like. A station serving AAC/Opus/Ogg will fail to play.
---   * No duration, no seeking, no auto-advance into or out of a stream --
---     tap a different station (or Prev/Next) to change what's playing.
---   * No reconnect-on-drop -- if the connection is lost mid-stream,
---     playback just stops, same as a local file hitting a read error.
---   * No ICY "now playing" metadata or in-stream ID3 tags are surfaced --
---     only the label given to show_list() below is ever shown.
+--   Station Name | http://example.com/direct-stream.mp3
 --
--- The station URLs below are SomaFM's own published direct-MP3-stream
--- endpoints (see https://somafm.com/listen/) -- a well-known, long-running
--- public internet radio service, used here because they're real, stable,
--- and actually MP3, not because this app has any special relationship with
--- them. SomaFM does periodically add/retire mirrors, so double-check
--- against their own listen page if a station stops responding.
+-- Blank lines and lines beginning with # are ignored. A line containing
+-- only an http(s) URL is also accepted; the URL is then used as its label.
+-- The file is read again every time the tile is opened, so station changes
+-- do not require restarting the player or reloading the plugin.
+--
+-- Current stream limitations:
+--   * Streams must serve MP3 audio (AAC/Opus/Ogg are not decoded yet).
+--   * Streams cannot seek and do not auto-reconnect after a connection loss.
+--   * ICY/stream metadata is not displayed; Radio.txt supplies the title.
 
-local stations = {
-    { name = "SomaFM: Groove Salad (ambient)",  url = "http://ice1.somafm.com/groovesalad-128-mp3" },
-    { name = "SomaFM: Drone Zone (ambient)",     url = "http://ice1.somafm.com/dronezone-128-mp3" },
-    { name = "SomaFM: Secret Agent (lounge)",    url = "http://ice1.somafm.com/secretagent-128-mp3" },
-    { name = "SomaFM: Space Station (electronic)", url = "http://ice1.somafm.com/spacestation-128-mp3" },
-}
+local RADIO_FILE = plugin.sd_root() .. "/Radio.txt"
 
-local function open_stations()
-    local labels, urls = {}, {}
-    for i, s in ipairs(stations) do
-        labels[i] = s.name
-        urls[i] = s.url
+local function trim(value)
+    return (value:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function load_stations()
+    local file = io.open(RADIO_FILE, "r")
+    if not file then
+        return nil, "Radio.txt was not found in the SD card root"
     end
 
-    plugin.show_list("Net Radio", labels, function(index)
-        plugin.play_list(urls, index)
+    local labels, urls = {}, {}
+    for line in file:lines() do
+        line = trim(line:gsub("\r$", ""))
+        if line ~= "" and line:sub(1, 1) ~= "#" then
+            local name, url = line:match("^(.-)%s*|%s*(https?://.+)$")
+            if not url and line:match("^https?://") then
+                name, url = line, line
+            end
+
+            if url then
+                name, url = trim(name), trim(url)
+                if name == "" then name = url end
+                labels[#labels + 1] = name
+                urls[#urls + 1] = url
+            end
+        end
+    end
+    file:close()
+
+    if #urls == 0 then
+        return nil, "Radio.txt contains no valid stations"
+    end
+    return { labels = labels, urls = urls }
+end
+
+local function open_stations()
+    local stations, err = load_stations()
+    if not stations then
+        plugin.show_toast(err)
+        return
+    end
+
+    plugin.show_list("Net Radio", stations.labels, function(index)
+        plugin.play_list(stations.urls, index)
     end)
 end
 

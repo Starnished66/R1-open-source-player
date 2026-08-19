@@ -801,6 +801,7 @@ one will visibly stall the whole UI until it returns, same tradeoff
 | `SoundProfiles.lua` | PEQ profile selection and persistence |
 | `PlaybackExtras.lua` | Native-looking toggles, sliders, and nested settings |
 | `PlayThrough.lua` | Natural-end detection and folder/album continuation |
+| `ExtendedSleepTimer.lua` | Persistent duration, session timer, and delayed playback stop |
 | `LastFmScrobbler.lua` | Events, timers, text input, MD5, async HTTP |
 | `AsyncHttp.lua` | Bounded requests and cancellation |
 | `PluginApiInfo.lua` | Identity, version, and capability discovery |
@@ -821,11 +822,13 @@ Plugins section has the install steps (copy to
 structure).
 
 `plugins_examples/NetRadio.lua` is the reference implementation for both
-`register_stream_media_tile()` and live stream URLs -- a hardcoded list of
-internet radio stations (label + `http(s)://` MP3 stream URL), shown via
-`show_list()`, played with `plugin.play_list()`. Its own header comment
-covers the "Live stream URLs" caveats above (MP3-only, no seeking, no
-auto-advance into or out of it).
+`register_stream_media_tile()` and live stream URLs. It reloads
+`<SD card>/Radio.txt` whenever its tile opens, displays each station through
+`show_list()`, and starts it with `plugin.play_list()`. Use one station per
+line as `Station Name | http(s)://direct-mp3-stream`; blank lines and `#`
+comments are ignored, and URL-only lines are accepted. A ready-to-copy
+`plugins_examples/Radio.txt` is included. The plugin header covers the
+remaining live-stream limitations (MP3-only, no seeking or auto-reconnect).
 
 `plugins_examples/Themes.lua` is the reference implementation for
 `"display"` list items, `set_icon()`, `set_background_color()`, and
@@ -863,6 +866,12 @@ directory browsing, and `play_list()` to continue only after a genuine
 natural playlist end. Album continuation has priority when both options are
 enabled; folder continuation is the fallback. Explicit Stop and non-sequential
 play modes are deliberately respected.
+
+`plugins_examples/ExtendedSleepTimer.lua` adds an **Extended Sleep Timer**
+under Settings → Playback with a 15–180 minute range. It demonstrates a
+persistent preferred duration, session-only armed state, countdown status,
+and a lightweight interval that calls `plugin.stop()` at expiration. Like the
+native timer, an active countdown does not survive restarting the player.
 
 `plugins_examples/LastFmScrobbler.lua` is the reference implementation for
 `plugin.on()`, `set_interval()`/`clear_interval()`, `get_now_playing()`,

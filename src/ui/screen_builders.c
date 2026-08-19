@@ -17,6 +17,8 @@
 
 lv_style_t list_row_style;
 lv_style_t list_row_pressed_style;
+static lv_style_t row_marquee_style;
+static lv_anim_t row_marquee_anim;
 
 /* Theming: three shared, mutable-in-place bg_color styles, one per
  * "background category" the app has -- every screen root
@@ -70,6 +72,17 @@ void screen_builders_init_list_row_style(void) {
     lv_style_init(&list_row_pressed_style);
     lv_style_set_bg_color(&list_row_pressed_style, lv_color_make(60, 60, 64));
 
+    lv_anim_init(&row_marquee_anim);
+    lv_anim_set_delay(&row_marquee_anim, 2000);
+    lv_anim_set_repeat_delay(&row_marquee_anim, 2000);
+    lv_style_init(&row_marquee_style);
+    lv_style_set_anim(&row_marquee_style, &row_marquee_anim);
+    /* LVGL's label default is 40px/s capped at 10 seconds. That cap makes
+     * very long titles accelerate while modest overflows remain slower.
+     * A lower constant speed with a much larger cap keeps the perceived
+     * rate uniform across both cases. */
+    lv_style_set_anim_duration(&row_marquee_style, lv_anim_speed_clamped(30, 600, 30000));
+
     /* Default values match this app's own existing look before theming
      * existed: true black for screens (every icon-grid/pill-list tile has
      * a transparent background, bg_opa=0, so this color always shows
@@ -95,6 +108,11 @@ void screen_builders_init_list_row_style(void) {
     lv_style_set_text_color(&style_theme_text_primary, lv_color_make(230, 230, 230));
     lv_style_init(&style_theme_text_muted);
     lv_style_set_text_color(&style_theme_text_muted, lv_color_make(160, 160, 160));
+}
+
+void row_label_enable_marquee(lv_obj_t * label) {
+    lv_obj_add_style(label, &row_marquee_style, LV_PART_MAIN);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
 }
 
 /* Generous upper bound on rows for a 2-column icon grid -- every real
@@ -522,6 +540,13 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size) {
     return ui_size_20;
 }
 
+int32_t pill_row_default_width(void) {
+    int32_t line_height = lv_font_get_line_height(ui_size_20);
+    if (line_height >= 30) return 476;
+    if (line_height >= 24) return 464;
+    return 448;
+}
+
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
                                    lv_style_t * toggle_accent_style) {
@@ -557,8 +582,8 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
          * -- see PILL_ROW_HEIGHT_MIN's own comment in screen_builders.h for
          * why the PNG sprite can't just stretch to a new height. */
         int32_t height = 124;
-        int32_t width = 448;
-        bool resized = item->row_height > 0 || item->row_width > 0;
+        int32_t width = pill_row_default_width();
+        bool resized = width != 448 || item->row_height > 0 || item->row_width > 0;
         if (item->row_height > 0) {
             height = item->row_height;
             if (height < PILL_ROW_HEIGHT_MIN) height = PILL_ROW_HEIGHT_MIN;
@@ -599,6 +624,21 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_obj_set_style_text_font(label, pill_row_resolve_text_size(item->text_size), 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
         pill_row_apply_icon(row, label, item->icon_asset, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
+
+        /* Keep long labels inside their own row instead of letting the
+         * label's content-sized box extend over the accessory or following
+         * row. LV_LABEL_LONG_SCROLL_CIRCULAR is inert when the text fits and
+         * becomes a single-line marquee only when it does not. */
+        int32_t label_left = 24 + (item->icon_asset ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0);
+        int32_t accessory_space = item->accessory == PILL_ACCESSORY_TOGGLE ? 112
+                                  : item->accessory == PILL_ACCESSORY_CHEVRON ? 60 : 24;
+        int32_t label_width = width - label_left - accessory_space;
+        if (label_width < 40) label_width = 40;
+        lv_obj_set_width(label, label_width);
+        const lv_font_t * label_font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
+        lv_obj_set_height(label, label_font ? lv_font_get_line_height(label_font) : 24);
+        row_label_enable_marquee(label);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
 
         if (item->accessory == PILL_ACCESSORY_TOGGLE) {
             lv_obj_t * toggle_img = lv_image_create(row);
@@ -868,6 +908,10 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
         lv_obj_add_style(row, &list_row_style, 0);
         lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
         if (row_width != LIST_ROW_WIDTH) lv_obj_set_style_width(row, row_width, 0); /* local override -- see this param's own doc comment (screen_builders.h) */
+        /* This label is also the fixed-size row/card. Explicit scroll long
+         * mode prevents LVGL's default wrapping while preserving the full
+         * LIST_ROW_HEIGHT background and touch target. */
+        row_label_enable_marquee(row);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_pos(row, row_x, COMPACT_LIST_TOP_PAD + slot * COMPACT_LIST_ROW_STRIDE);
         lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN); /* shown by the initial window update below once it has real content */

@@ -6107,6 +6107,7 @@ static void populate_queue_screen(void) {
         lv_obj_t * row = lv_label_create(queue_list);
         lv_obj_add_style(row, &list_row_style, 0);
         lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+        row_label_enable_marquee(row);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
         char title[128], folder[128];
@@ -6151,6 +6152,18 @@ static void plugin_list_row_click_cb(lv_event_t * e) {
     int slot = (int) (packed >> 16);
     int index = (int) (packed & 0xFFFF);
     plugin_manager_list_item_selected(slot, index);
+}
+
+/* A fixed single-line box is what makes LVGL's circular long mode a marquee
+ * rather than allowing the label itself to grow over adjacent UI. The mode
+ * has no visible effect when the text already fits. */
+static void configure_scrolling_row_label(lv_obj_t * label, int32_t width) {
+    if (width < 40) width = 40;
+    lv_obj_set_width(label, width);
+    const lv_font_t * font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
+    lv_obj_set_height(label, font ? lv_font_get_line_height(font) : 24);
+    row_label_enable_marquee(label);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
 }
 
 int gui_plugin_show_list(const char * title, const char * const * labels, const char * const * icon_paths,
@@ -6207,6 +6220,8 @@ int gui_plugin_show_list(const char * title, const char * const * labels, const 
              * pill_row_resolve_text_size()'s own comment on why a genuine
              * NULL only ever reaches it from a truly-unset call like this. */
             if (text_size) lv_obj_set_style_text_font(row, pill_row_resolve_text_size(text_size), 0);
+            configure_scrolling_row_label(row, row_w - 2 * LIST_ROW_LABEL_INSET);
+            lv_obj_set_height(row, row_h);
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             intptr_t packed = ((intptr_t) slot << 16) | (intptr_t) (i & 0xFFFF);
             lv_obj_add_event_cb(row, plugin_list_row_click_cb, LV_EVENT_CLICKED, (void *) packed);
@@ -6231,6 +6246,8 @@ int gui_plugin_show_list(const char * title, const char * const * labels, const 
         lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size ? text_size : "medium"), 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
         pill_row_apply_icon(row, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+        int32_t label_left = LIST_ROW_LABEL_INSET + (icon ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0);
+        configure_scrolling_row_label(label, row_w - label_left - LIST_ROW_LABEL_INSET);
 
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         intptr_t packed = ((intptr_t) slot << 16) | (intptr_t) (i & 0xFFFF);
@@ -8065,6 +8082,7 @@ static lv_obj_t * add_group_songs_page_row(const char * text, lv_event_cb_t cb) 
     lv_obj_t * row = lv_label_create(group_songs_list);
     lv_obj_add_style(row, &list_row_style, 0);
     lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+    row_label_enable_marquee(row);
     lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_label_set_text(row, text);
@@ -8198,6 +8216,7 @@ static void populate_group_songs_rows(void) {
             lv_obj_add_style(label, &style_theme_text_primary, 0);
             lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
             lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+            configure_scrolling_row_label(label, LIST_ROW_WIDTH - LIST_ROW_LABEL_INSET - 84);
 
             lv_obj_t * remove_icon = lv_image_create(row);
             lv_image_set_src(remove_icon, asset_path("touch_list/del.png"));
@@ -8211,6 +8230,7 @@ static void populate_group_songs_rows(void) {
             lv_obj_t * row = lv_label_create(group_songs_list);
             lv_obj_add_style(row, &list_row_style, 0);
             lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+            row_label_enable_marquee(row);
             lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
             lv_label_set_text(row, song_display_title_of(group_songs_indices[i]));
 
@@ -9633,6 +9653,7 @@ static void populate_indexed_list(lv_obj_t * list, int count, const char * (*lab
         lv_obj_t * row = lv_label_create(list);
         lv_obj_add_style(row, &list_row_style, 0);
         lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+        row_label_enable_marquee(row);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_label_set_text(row, label_of(i));
 
@@ -9654,6 +9675,7 @@ static void populate_indexed_list_from_items(lv_obj_t * list, const compact_list
         lv_obj_t * row = lv_label_create(list);
         lv_obj_add_style(row, &list_row_style, 0);
         lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+        row_label_enable_marquee(row);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_label_set_text(row, items[i].label);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -9725,9 +9747,15 @@ static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_
  * "and also whatever these dynamic sections need appended after"). */
 static lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) {
     lv_obj_t * row = lv_obj_create(parent);
-    lv_obj_set_size(row, 448, 124);
+    int32_t row_width = pill_row_default_width();
+    lv_obj_set_size(row, row_width, 124);
     lv_obj_add_style(row, &style_theme_screen_bg, 0);
-    lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
+    if (row_width == 448) {
+        lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
+    } else {
+        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+    }
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
@@ -9737,6 +9765,7 @@ static lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) 
     lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, ui_size_16, 0);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
+    configure_scrolling_row_label(label, row_width - 136);
     return row;
 }
 
@@ -9855,9 +9884,10 @@ static int plugin_settings_list_slider_card_count[PLUGIN_SETTINGS_LIST_SCREEN_PO
  * responsibility screen_timeout_slider_card's own construction uses. */
 static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text, int min, int max, int value,
                                        lv_event_cb_t slider_event_cb, void * user_data, const char * icon_path,
-                                       const char * text_size) {
+    const char * text_size) {
     lv_obj_t * card = lv_obj_create(parent);
-    lv_obj_set_size(card, 448, 130);
+    int32_t row_width = pill_row_default_width();
+    lv_obj_set_size(card, row_width, 130);
     lv_obj_add_style(card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_radius(card, 10, 0);
@@ -9872,6 +9902,7 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, 20, 12);
     lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
     pill_row_apply_icon(card, label, icon_path, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_TOP_LEFT, 20, 12);
+    configure_scrolling_row_label(label, row_width - (icon_path ? 212 : 136));
 
     lv_obj_t * value_label = lv_label_create(card); /* child 1 -- see plugin_settings_slider_event_cb()'s lookup */
     lv_obj_add_style(value_label, &style_theme_text_muted, 0);
@@ -10017,10 +10048,19 @@ static void populate_plugin_settings_list_screen(int slot) {
             lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
             pill_row_apply_icon(row_obj, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
             apply_plugin_pill_row_resize(row_obj, st->row_height, st->row_width);
+            int32_t row_width = st->row_width > 0 ? st->row_width : pill_row_default_width();
+            if (row_width < PILL_ROW_WIDTH_MIN) row_width = PILL_ROW_WIDTH_MIN;
+            if (row_width > PILL_ROW_WIDTH_MAX) row_width = PILL_ROW_WIDTH_MAX;
+            configure_scrolling_row_label(label, row_width - 24 - (icon ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0) - 112);
         } else if (st->type == PLUGIN_SETTINGS_ROW_SLIDER) {
             lv_obj_t * card = add_pill_slider_row(list, st->label, st->slider_min, st->slider_max, st->slider_value,
                                                    plugin_settings_slider_event_cb, packed, icon, text_size);
             apply_plugin_pill_row_resize(card, 0, st->row_width);
+            int32_t row_width = st->row_width > 0 ? st->row_width : pill_row_default_width();
+            if (row_width < PILL_ROW_WIDTH_MIN) row_width = PILL_ROW_WIDTH_MIN;
+            if (row_width > PILL_ROW_WIDTH_MAX) row_width = PILL_ROW_WIDTH_MAX;
+            lv_obj_t * label = lv_obj_get_child(card, 0);
+            configure_scrolling_row_label(label, row_width - 20 - (icon ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0) - 96);
             /* Same reasoning as every native slider card's own identical
              * pair of calls -- see register_swipe_dead_zone()'s own
              * top-of-block comment. */
@@ -10036,6 +10076,10 @@ static void populate_plugin_settings_list_screen(int slot) {
             lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
             pill_row_apply_icon(row_obj, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
             apply_plugin_pill_row_resize(row_obj, st->row_height, st->row_width);
+            int32_t row_width = st->row_width > 0 ? st->row_width : pill_row_default_width();
+            if (row_width < PILL_ROW_WIDTH_MIN) row_width = PILL_ROW_WIDTH_MIN;
+            if (row_width > PILL_ROW_WIDTH_MAX) row_width = PILL_ROW_WIDTH_MAX;
+            configure_scrolling_row_label(label, row_width - 24 - (icon ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0) - 60);
         }
     }
 }
@@ -15277,15 +15321,21 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
-    /* Same 448x124/item_bg.png pill look as add_pill_row_base(), built
+    /* Same font-tier-aware pill geometry as add_pill_row_base(), built
      * directly here (not via that helper) since it needs to sit above the
      * absolutely-positioned Import-Wi-Fi-style fields below rather than
      * inside a flex-column list. */
     lv_obj_t * toggle_row = lv_obj_create(scr);
-    lv_obj_set_size(toggle_row, 448, 124);
+    int32_t toggle_row_width = pill_row_default_width();
+    lv_obj_set_size(toggle_row, toggle_row_width, 124);
     lv_obj_align(toggle_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 10);
     lv_obj_add_style(toggle_row, &style_theme_screen_bg, 0);
-    lv_obj_set_style_bg_image_src(toggle_row, asset_path("touch_list/item_bg.png"), 0);
+    if (toggle_row_width == 448) {
+        lv_obj_set_style_bg_image_src(toggle_row, asset_path("touch_list/item_bg.png"), 0);
+    } else {
+        lv_obj_set_style_radius(toggle_row, LIST_ROW_RADIUS, 0);
+        lv_obj_set_style_bg_color(toggle_row, LIST_ROW_BG_COLOR, 0);
+    }
     lv_obj_set_style_bg_opa(toggle_row, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(toggle_row, 0, 0);
     lv_obj_remove_flag(toggle_row, LV_OBJ_FLAG_SCROLLABLE);

@@ -292,9 +292,20 @@ int main(void) {
      * advance it once per handler iteration from one real clock read. Timer
      * semantics remain identical: the tick is stable while one handler pass
      * runs, just like the conventional interrupt-driven lv_tick_inc model. */
+    /* Preserve LVGL's exact clock domain across the handoff. Using a second
+     * custom_tick_get() value as the internal-clock seed looked equivalent,
+     * but real-device tracing showed the display's last_activity_time and
+     * the newly seeded clock separated by ~3.88 billion ms (wraparound),
+     * making screen timeout fire on the first runtime timer callback. */
+    uint32_t lvgl_handoff_tick = lv_tick_get();
     uint32_t last_real_tick = custom_tick_get();
-    lv_tick_inc(last_real_tick);
+    lv_tick_inc(lvgl_handoff_tick);
     lv_tick_set_cb(NULL);
+#ifndef HOST_BUILD
+    /* Must be after lv_tick_set_cb(NULL): this baseline must belong to the
+     * runtime clock that update_timer_cb will read, not the boot clock. */
+    gui_reset_interactive_timeout_baseline();
+#endif
     while(1) {
         uint32_t real_tick = custom_tick_get();
         lv_tick_inc(real_tick - last_real_tick);

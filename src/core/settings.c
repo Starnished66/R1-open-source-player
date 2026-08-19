@@ -22,15 +22,11 @@
 
 #define SETTINGS_TMP_FILE_PATH SETTINGS_FILE_PATH ".tmp"
 
-const int SCREEN_TIMEOUT_STEPS[SCREEN_TIMEOUT_STEP_COUNT] = { 30, 60, 120, 300, 600, 1800 };
+const int SCREEN_TIMEOUT_STEPS[SCREEN_TIMEOUT_STEP_COUNT] = { 15, 30, 60, 120, 300, 600, 1800 };
 const int IDLE_SHUTDOWN_STEPS[IDLE_SHUTDOWN_STEP_COUNT] = { 10, 15, 30, 60, 120 };
 const int SLEEP_TIMER_STEPS[SLEEP_TIMER_STEP_COUNT] = { 5, 10, 15, 20, 30 };
 
-/* Nearest entry in SCREEN_TIMEOUT_STEPS to `seconds` -- used to snap a
- * hand-edited or pre-existing settings file value onto the slider's actual
- * choices rather than just clamping into [MIN, MAX], since an in-range but
- * off-step value (e.g. a leftover "81" from before the slider had discrete
- * steps) would otherwise never match any step the UI can display. */
+/* Snap hand-edited and legacy values onto the same presets used by the UI. */
 static int nearest_screen_timeout_step(int seconds) {
     int best = SCREEN_TIMEOUT_STEPS[0];
     int best_diff = abs(seconds - best);
@@ -96,6 +92,7 @@ static void set_defaults(player_settings_t * out) {
     out->remote_control_enabled = false;
     out->screen_timeout_enabled = true;
     out->screen_timeout_seconds = 30;
+    out->screen_dimming_enabled = true;
     out->led_indicator_enabled = true;
     out->charge_limiter_enabled = false; /* opt-in -- caps max charge at 85%, a real behavior change the user should choose, not a default surprise */
     out->show_battery_percent = true; /* on by default -- matches every previous version's always-on behavior */
@@ -175,6 +172,8 @@ bool settings_load(player_settings_t * out) {
             out->screen_timeout_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "screen_timeout_seconds") == 0) {
             out->screen_timeout_seconds = atoi(value);
+        } else if (strcmp(key, "screen_dimming_enabled") == 0) {
+            out->screen_dimming_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "led_indicator_enabled") == 0) {
             out->led_indicator_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "charge_limiter_enabled") == 0) {
@@ -279,6 +278,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "remote_control_enabled=%d\n", settings->remote_control_enabled ? 1 : 0);
     fprintf(f, "screen_timeout_enabled=%d\n", settings->screen_timeout_enabled ? 1 : 0);
     fprintf(f, "screen_timeout_seconds=%d\n", settings->screen_timeout_seconds);
+    fprintf(f, "screen_dimming_enabled=%d\n", settings->screen_dimming_enabled ? 1 : 0);
     fprintf(f, "led_indicator_enabled=%d\n", settings->led_indicator_enabled ? 1 : 0);
     fprintf(f, "charge_limiter_enabled=%d\n", settings->charge_limiter_enabled ? 1 : 0);
     fprintf(f, "show_battery_percent=%d\n", settings->show_battery_percent ? 1 : 0);

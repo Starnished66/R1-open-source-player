@@ -155,10 +155,11 @@ void backlight_set_dimmed(bool dimmed) {
     int normal = restore_percent;
     pthread_mutex_unlock(&screen_power_mutex);
 
-    /* Forty percent of the selected level is visibly dimmer without making
-     * low user settings unreadable. Logical zero remains the driver's safe
-     * minimum; only full screen-off writes literal zero. */
-    int target = dimmed ? normal * 40 / 100 : normal;
+    /* Use an absolute ~5% ceiling rather than a fraction of the selected
+     * brightness. Forty percent of a high normal setting was still far too
+     * bright for the intended low-power/read-asleep state. Never brighten a
+     * user-selected level that is already below the dim target. */
+    int target = dimmed ? (normal < 5 ? normal : 5) : normal;
     backlight_set_percent(target);
 }
 

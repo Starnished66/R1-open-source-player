@@ -14,6 +14,10 @@ void gui_init(uint32_t screen_width, uint32_t screen_height);
  * don't have a real cold-boot race to guard against. */
 #ifndef HOST_BUILD
 void gui_show_boot_splash(void);
+
+/* Re-anchor screen inactivity after main.c switches LVGL from the boot-time
+ * clock callback to its low-overhead incremented runtime clock. */
+void gui_reset_interactive_timeout_baseline(void);
 #endif
 
 /* ---- Bridge for src/plugins/plugin_manager.c ----

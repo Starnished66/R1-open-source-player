@@ -1545,24 +1545,15 @@ static char bt_connected_codec_cached[32] = "";
  * after the window closed instead -- not an actual fix, just relocating
  * when the flicker becomes visible.
  *
- * Reintroduced with a real difference this time: rather than a fixed
- * window a slow boot can simply outlast, this suppresses the display
- * (forces "off", regardless of the real polled state -- see
- * poll_refresh_bt_icon()'s own use of this) until EITHER a generous
- * safety cap elapses OR the user manually taps the Bluetooth toggle
- * themselves (quick_drawer_bt_event_cb() ends it immediately on tap) --
- * whichever comes first. A manual tap ending it immediately is the part
- * the 2026-08-13 attempt didn't have: it means a user who taps to turn
- * Bluetooth on isn't fighting a suppression window that doesn't know
- * they've acted, and from that point on this app shows real state
- * honestly, including if S80_bt_init's own still-in-flight script later
- * reverts that tap -- at least that's now visible as what it is (a real
- * state change) instead of unexplained UI noise. Doesn't fix the
- * underlying transient itself (still S80_bt_init/bluetoothd startup, still
- * outside this app), just stops this app's own display from being
- * confusing about it. */
-static uint32_t bt_boot_suppress_start_tick = 0; /* 0 once suppression has ended (cap elapsed or a manual tap) */
-#define BT_BOOT_SUPPRESS_MS 20000
+ * The mask is now state-based rather than time-based: it remains active
+ * until bt_init has written its tmpfs completion marker AND two subsequent
+ * polls agree the adapter is off. A manual toggle ends it immediately, so
+ * explicit user intent always wins. Starting the player later in the same
+ * boot does not enable the mask because bt_init_ok already exists; resume
+ * likewise never re-enters gui_init(). */
+static bool bt_boot_suppress_enabled = false;
+static unsigned int bt_boot_off_observations = 0;
+#define BT_BOOT_OFF_OBSERVATIONS_REQUIRED 2
 
 /* /usr/bin/bt_init's (stock, unmodified) very last line is
  * `mkdir -p /tmp; echo > /tmp/bt_init_ok`, right after its own real UART
@@ -1585,8 +1576,7 @@ static uint32_t bt_boot_suppress_start_tick = 0; /* 0 once suppression has ended
 #define BT_INIT_OK_FLAG_PATH "/tmp/bt_init_ok"
 
 static bool bt_boot_suppress_active(void) {
-    if (bt_boot_suppress_start_tick == 0) return false;
-    return lv_tick_get() - bt_boot_suppress_start_tick < BT_BOOT_SUPPRESS_MS;
+    return bt_boot_suppress_enabled;
 }
 
 /* Moved up from the Bluetooth settings screen section further down (still
@@ -1709,8 +1699,26 @@ static void poll_refresh_bt_icon(void) {
      * settled state once the in-flight toggle actually completes. */
     if (bt_toggle_active) return;
 
+    /* Do not graduate based on elapsed time. A worker can start its
+     * bluetoothctl query during bt_init's transient powered interval and
+     * deliver that stale "on" result after a timer expires, which is the
+     * exact cold-boot flash this mask exists to prevent. Instead require
+     * bt_init's tmpfs completion marker plus two settled "off" results.
+     * Resume never enters this state, and a deliberate user tap clears it
+     * immediately in quick_drawer_bt_event_cb(). */
+    if (bt_boot_suppress_active()) {
+        if (access(BT_INIT_OK_FLAG_PATH, F_OK) == 0 && !refresh_bt_icon_result_powered) {
+            bt_boot_off_observations++;
+            if (bt_boot_off_observations >= BT_BOOT_OFF_OBSERVATIONS_REQUIRED) {
+                bt_boot_suppress_enabled = false;
+            }
+        } else {
+            bt_boot_off_observations = 0;
+        }
+    }
+
     bool display_powered = refresh_bt_icon_result_powered;
-    if (bt_boot_suppress_active()) display_powered = false; /* see bt_boot_suppress_active()'s own comment */
+    if (bt_boot_suppress_active()) display_powered = false;
 
     bt_is_powered_cached = display_powered;
     snprintf(bt_connected_mac_cached, sizeof(bt_connected_mac_cached), "%s", refresh_bt_icon_result_mac);
@@ -3067,9 +3075,13 @@ static void * bt_toggle_thread_func(void * arg) {
  * themselves once it settled, AND gave no visual feedback at all that
  * anything had registered (the drawer's own icon never flipped, unlike a
  * normal toggle). This queues the intent properly instead: waits for
- * BT_INIT_OK_FLAG_PATH (cheap access() polling, no subprocess spawn), then
- * performs the exact same turn-on sequence bt_toggle_thread_func()'s own
- * turning-on path uses, automatically, no second tap needed. Deliberately
+ * BT_INIT_OK_FLAG_PATH, then waits for two real powered-off observations
+ * before performing the exact same turn-on sequence bt_toggle_thread_func()'s
+ * own turning-on path uses, automatically, no second tap needed. Waiting
+ * for the settled-off state matters: bt_init_ok can become visible just
+ * before the boot sequence's final disable propagates through bluetoothd,
+ * and enabling in that gap lets the final disable erase the user's intent.
+ * Deliberately
  * NOT the same thing as the unconditional-auto-enable-at-boot approach
  * tried and reverted earlier -- this only ever fires because the user
  * explicitly asked to turn Bluetooth on, just before it was safe to.
@@ -3086,17 +3098,35 @@ static void * bt_toggle_thread_func(void * arg) {
  * finishing bt_init doesn't leave this polling forever. */
 #define BT_BOOT_ENABLE_MAX_WAIT_MS 30000
 #define BT_BOOT_ENABLE_POLL_INTERVAL_MS 300
+#define BT_BOOT_ENABLE_OFF_OBSERVATIONS_REQUIRED 2
 
 static void * bt_pending_enable_thread_func(void * arg) {
     (void) arg;
     uint32_t waited_ms = 0;
+    unsigned int off_observations = 0;
+    bool init_finished = false;
     while (waited_ms < BT_BOOT_ENABLE_MAX_WAIT_MS) {
         if (access(BT_INIT_OK_FLAG_PATH, F_OK) == 0) {
-            if (bt_control_init_chip()) bt_control_enable();
-            break;
+            init_finished = true;
+            if (!bt_control_is_powered()) {
+                off_observations++;
+                if (off_observations >= BT_BOOT_ENABLE_OFF_OBSERVATIONS_REQUIRED) {
+                    if (bt_control_init_chip()) bt_control_enable();
+                    break;
+                }
+            } else {
+                off_observations = 0;
+            }
         }
         usleep(BT_BOOT_ENABLE_POLL_INTERVAL_MS * 1000);
         waited_ms += BT_BOOT_ENABLE_POLL_INTERVAL_MS;
+    }
+    /* If initialization finished but its state never produced two clean
+     * off samples before the bounded wait elapsed, assert the requested
+     * final state once anyway. Never do this without bt_init_ok: that would
+     * reintroduce the unsafe concurrent UART initialization race. */
+    if (init_finished && off_observations < BT_BOOT_ENABLE_OFF_OBSERVATIONS_REQUIRED) {
+        if (bt_control_init_chip()) bt_control_enable();
     }
     bt_toggle_done_flag = true; /* written last -- poll_bt_toggle only checks this flag */
     return NULL;
@@ -3131,7 +3161,8 @@ static void quick_drawer_bt_event_cb(lv_event_t * e) {
      * matters (a manual tap shouldn't be fighting a window that doesn't
      * know the user has acted). No-op once suppression has already ended
      * on its own. */
-    bt_boot_suppress_start_tick = 0;
+    bt_boot_suppress_enabled = false;
+    bt_boot_off_observations = 0;
 
     bt_toggle_active = true;
     bt_toggle_done_flag = false;
@@ -4771,6 +4802,15 @@ static void swipe_up_home_switch_event_cb(lv_event_t * e) {
     settings_save(&current_settings);
 }
 
+static void screen_dimming_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.screen_dimming_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    if (!current_settings.screen_dimming_enabled) {
+        backlight_set_dimmed(false);
+    }
+    settings_save(&current_settings);
+}
+
 static void led_indicator_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.led_indicator_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
@@ -5101,6 +5141,23 @@ static void poll_import_web_stop(void);
 static uint32_t screen_off_since_tick = 0;
 static bool inactivity_dimmed = false;
 static int visible_status_poll_tick_counter = 0;
+
+/* Earliest possible inactivity age for the interactive UI. LVGL's display
+ * inactivity timestamp can predate gui_init()'s splash -> Home transition
+ * (and, on the target, lv_display_trigger_activity() alone has now been
+ * observed not to reliably discard that startup age). Clamp the value used
+ * by dimming/timeout to elapsed interactive time so startup can never spend
+ * the user's timeout budget. After this age grows past LVGL's normally-reset
+ * inactivity value the clamp becomes a no-op, preserving ordinary touch and
+ * hardware-button timeout behavior. */
+static uint32_t interactive_ui_start_tick = 0;
+static bool interactive_ui_started = false;
+
+void gui_reset_interactive_timeout_baseline(void) {
+    interactive_ui_start_tick = lv_tick_get();
+    interactive_ui_started = true;
+    lv_display_trigger_activity(NULL);
+}
 
 /* The panel dominates power while lit. Dim well before the configured full
  * timeout, but keep enough time for reading and never override an explicit
@@ -5545,11 +5602,17 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_power_off_countdown();
 
     uint32_t screen_inactive_ms = lv_display_get_inactive_time(NULL);
+    if (interactive_ui_started) {
+        uint32_t interactive_age_ms = lv_tick_elaps(interactive_ui_start_tick);
+        if (screen_inactive_ms > interactive_age_ms) screen_inactive_ms = interactive_age_ms;
+    }
     bool screen_on_before_timeout = backlight_screen_is_on();
-    if (screen_on_before_timeout && !inactivity_dimmed && screen_inactive_ms >= SCREEN_DIM_AFTER_MS) {
+    if (current_settings.screen_dimming_enabled && screen_on_before_timeout &&
+        !inactivity_dimmed && screen_inactive_ms >= SCREEN_DIM_AFTER_MS) {
         backlight_set_dimmed(true);
         inactivity_dimmed = true;
-    } else if (screen_on_before_timeout && inactivity_dimmed && screen_inactive_ms < SCREEN_DIM_AFTER_MS) {
+    } else if (screen_on_before_timeout && inactivity_dimmed &&
+               (!current_settings.screen_dimming_enabled || screen_inactive_ms < SCREEN_DIM_AFTER_MS)) {
         backlight_set_dimmed(false);
         inactivity_dimmed = false;
     }
@@ -15894,10 +15957,7 @@ static void format_screen_timeout(char * buf, size_t buf_size, int seconds) {
     else snprintf(buf, buf_size, "%dm %ds", minutes, remainder);
 }
 
-/* Index into SCREEN_TIMEOUT_STEPS closest to `seconds` -- settings_load()
- * already snaps stored values onto a step, so this normally finds an exact
- * match; the nearest-match fallback just keeps the slider from landing on a
- * bogus index if it's ever called before that snapping has happened. */
+/* Index of the closest shared timeout preset. */
 static int screen_timeout_seconds_to_step_index(int seconds) {
     int best = 0;
     int best_diff = abs(seconds - SCREEN_TIMEOUT_STEPS[0]);
@@ -15927,9 +15987,7 @@ static void screen_timeout_switch_event_cb(lv_event_t * e) {
  * (eq_preamp_slider_event_cb etc.) -- writing settings.c's file on every
  * drag tick would be needless disk I/O for a value that only matters once
  * the user lets go. The slider itself moves over step indices (0..
- * SCREEN_TIMEOUT_STEP_COUNT-1), not raw seconds, so it can only ever land on
- * one of the fixed presets (30s/1m/2m/5m/10m/30m) rather than an arbitrary
- * linear value. */
+ * SCREEN_TIMEOUT_STEP_COUNT-1), mapped onto the shared preset table. */
 static void screen_timeout_slider_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     int32_t index = lv_slider_get_value(lv_event_get_target(e));
@@ -16678,14 +16736,16 @@ static void plugin_display_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_settings_display_screen(void) {
-    static pill_list_item_t items[4 + PLUGIN_MAX_DISPLAY_LIST_ITEMS];
+    static pill_list_item_t items[5 + PLUGIN_MAX_DISPLAY_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Accent Color", PILL_ACCESSORY_CHEVRON, false, accent_color_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Font Size", PILL_ACCESSORY_CHEVRON, false, font_size_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Screen Timeout", PILL_ACCESSORY_CHEVRON, false, screen_timeout_row_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
+    items[3] = (pill_list_item_t){ "Screen Dimming", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.screen_dimming_enabled, NULL, screen_dimming_switch_event_cb, NULL };
+    items[4] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
                                     current_settings.swipe_up_home_enabled, NULL, swipe_up_home_switch_event_cb, NULL };
 
-    int count = 4;
+    int count = 5;
     int plugin_count = plugin_manager_get_display_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_DISPLAY_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -17719,7 +17779,8 @@ static void prepare_deferred_resume(int index, double start_seconds) {
 void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("gui_init entered");
-    bt_boot_suppress_start_tick = lv_tick_get(); /* see bt_boot_suppress_active()'s own comment */
+    bt_boot_suppress_enabled = access(BT_INIT_OK_FLAG_PATH, F_OK) != 0;
+    bt_boot_off_observations = 0;
 #endif
     settings_load(&current_settings);
 #ifndef HOST_BUILD
@@ -18069,11 +18130,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
         volume_warn_threshold_percent = -1;
     }
     refresh_volume_topbar((int32_t) (audio_get_volume() * 100.0f));
-    lv_timer_create(update_timer_cb, 500, NULL);
-    /* Its own fast timer -- see poll_quick_drawer_drag()'s comment for why
-     * update_timer_cb's 500ms period is too slow to track a swipe with. */
-    lv_timer_create(poll_quick_drawer_drag, LV_DEF_REFR_PERIOD, NULL);
-    lv_timer_create(poll_az_index_drag, LV_DEF_REFR_PERIOD, NULL);
 
 #ifndef HOST_BUILD
     /* Holds the boot splash (gui_show_boot_splash(), called from main.c
@@ -18109,6 +18165,19 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     nav_stack[0] = home_screen;
     nav_depth = 1;
     lv_screen_load(home_screen);
+
+    /* The screen-timeout clock belongs to the interactive UI, not startup.
+     * update_timer_cb used to be created before the splash settle loop, so
+     * LVGL counted library/screen construction and the visible splash as
+     * user inactivity; with a short timeout it could switch the panel off
+     * immediately after (or even during) the splash. Establish the activity
+     * baseline at the exact splash -> Home transition, then start runtime
+     * polling. The fast gesture timers likewise have no work while the
+     * splash is the only visible screen. */
+    gui_reset_interactive_timeout_baseline();
+    lv_timer_create(update_timer_cb, 500, NULL);
+    lv_timer_create(poll_quick_drawer_drag, LV_DEF_REFR_PERIOD, NULL);
+    lv_timer_create(poll_az_index_drag, LV_DEF_REFR_PERIOD, NULL);
 #ifndef HOST_BUILD
     boot_checkpoint("lv_screen_load(home_screen) done");
 #endif

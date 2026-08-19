@@ -12,6 +12,16 @@ The player reuses the stock firmware's UI assets, fonts, and existing system ser
 
 ---
 
+# Support the Project
+
+This Open Source Player is developed and tested on real hardware. If you would like to help fund continued development, device testing, and future hardware support(Hiby R3 Pro II for example), donation links can be found here:
+
+- **PayPal:** [Donate via PayPal](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=josegarita%40protonmail.com&currency_code=USD)
+
+Contributing code, testing builds, documenting hardware behavior, and reporting reproducible bugs are equally valuable ways to support the project.
+
+---
+
 ## Why?
 
 HiBy's stock player is closed source and tightly integrated with the firmware. That makes fixing bugs, adding features, or changing how the device behaves difficult.
@@ -49,6 +59,8 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - 10-band parametric EQ (PEQ)
 - Per-band filter type, gain, and Q
 - Pre-amp control
+- Save, overwrite, and reuse PEQ presets stored on the SD card
+- Resume the last track either playing or prepared in a paused state, including its original album context
 - Physical hardware controls for volume, play/pause, next/previous
 - Automatic track advancement
 - Proper playlist-end handling
@@ -56,7 +68,8 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - Bluetooth metadata streaming
 - Bluetooth DAC finally works
 - Album art downscaling, supporting up to 1200x1200 resolutions
-- Queue / "Up Next" — long-press a song to play it next, independent of shuffle or repeat mode
+- Embedded and external album artwork (`cover.*` and `folder.*`)
+- Queue / "Up Next" — add, inspect, remove, and clear queued songs independently of shuffle or repeat mode
 
 ## 📚 Music Library
 
@@ -75,8 +88,10 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - M3U / M3U8 playlists
 - Dynamic playlist loading directly from the SD card
 - Incremental music database updates instead of rescanning the entire library
+- Paged/virtualized song lists for very large albums and libraries
 - SD card hotplug support
-- Built-in plain-text (`.txt`) book reader, with Favorites
+- Built-in plain-text (`.txt`) book reader with Favorites, scoped to `Books/` on the SD card
+- Audiobook browsing and playback through the included Audiobooks plugin
 
 ## 🌐 Network & Streaming
 
@@ -91,6 +106,10 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - AirPlay support using the existing stock protocols where possible
 - Remote control over LAN
 - Built-in lightweight web server
+- Responsive browser-based remote-control interface
+- Browse Artists, Albums, Favorites, Most Played, and SD-card playlists remotely
+- Add songs to the queue and manage the current queue from the web interface
+- Add songs to existing playlists from the web interface
 - Wi-Fi music import with the stock limitations removed
 - Import support for all supported file types
 
@@ -102,7 +121,7 @@ The LAN remote-control interface provides a simple way to control the player fro
 - Real battery percentage
 - Real Wi-Fi signal strength
 - Charge limiter for improved battery longevity
-- Suspend-to-RAM instead of the default standby behavior
+- Configurable idle shutdown or suspend behavior
 - Car mode
 - Improved Bluetooth connection reliability
 - Bluetooth A2DP status in the top bar
@@ -110,6 +129,7 @@ The LAN remote-control interface provides a simple way to control the player fro
 - Physical hardware button support
 - Time Zone picker with immediate application and persistent settings
 - Startup volume
+- Resume-last-track modes with preserved library context
 - Easier ADB access through the USB mode selector
 
 ## 🎨 Interface
@@ -120,20 +140,26 @@ The LAN remote-control interface provides a simple way to control the player fro
 - Pull-down quick controls
 - Sleep timer
 - Crossfade quick toggle
+- Configurable screen timeout presets from 15 seconds to 30 minutes
+- Optional idle screen dimming to approximately 5% brightness
+- Configurable font size and battery-percentage display
 - Non-Latin text rendering:
   - Cyrillic
   - Japanese kana/kanji
   - Korean Hangul
   - Thai
 - App-wide accent color theming
-- No unnecessary "books" functionality from the stock player
+- Focused Books section for plain-text reading and plugin-provided audiobook tools
 
 ## 🧩 Plugins
 
 - Third-party Lua plugins — no rebuild or reflash needed
 - Drop a `.lua` file in `.plugins/` on the SD card, it's picked up automatically
-- Small `plugin.*` API: list screens, SD card browsing, playback control
-- Example **Audiobooks** plugin included, reachable from Books → Audio Books
+- Versioned `plugin.*` API with capability discovery
+- Extension rows for Books and the Settings, Display, Playback, Power, and System screens
+- Custom row sizing, icons, text sizing, list screens, settings screens, and text input
+- Playback state/control/events, library access, synchronous and asynchronous HTTP, MD5, theming, and PEQ access
+- Example plugins for Audiobooks, Last.fm scrobbling, themes, network radio, playback tools, and other API capabilities
 
 ---
 
@@ -145,7 +171,6 @@ The following features are planned or currently incomplete:
 - Background image/color customization
 - Full theme support
 - Lyrics support
-- A picker UI for choosing among multiple installed plugins (currently only the first-registered plugin is reachable)
 - Additional community-requested features
 
 This list will evolve as development continues.
@@ -174,6 +199,7 @@ Additional work is required before it can be properly supported:
 - Add support for the device's **additional hardware buttons**
 - Test and adjust **UI scaling** for the R3 Pro II's display resolution
 - Perform full real-device testing
+- Me actually getting one of these devices on hand to do a full testing.
 
 Support for other HiBy devices may also be possible, but should not be assumed without hardware testing.
 
@@ -319,15 +345,14 @@ If you're modifying the code, debugging hardware behavior, or working on HiBy OS
 
 Third-party functionality can be added without recompiling the app, as plain Lua scripts — no toolchain, no C, no rebuild/reflash cycle.
 
-Drop a `.lua` file into `.plugins/` on the SD card and it's picked up automatically at startup, with a small `plugin.*` API for showing list screens, browsing the SD card, and controlling playback.
+Drop a `.lua` file into `.plugins/` on the SD card and it's picked up automatically at startup. The versioned `plugin.*` API exposes native extension rows and list screens, configurable row layout, text input, themes, SD-card and library access, playback control/events, PEQ, cryptographic helpers, and synchronous or asynchronous HTTP.
 
-An example **Audiobooks** plugin is included (`plugins_examples/Audiobooks.lua`) — a book-folder browser → chapter-list → playback plugin, reachable from **Books → Audio Books**.
+An example **Audiobooks** plugin is included (`plugins_examples/Audiobooks.lua`) — a book-folder browser → chapter-list → playback plugin with audiobook-focused progress handling, reachable from **Books → Audio Books**. Additional examples demonstrate Last.fm scrobbling, themes, network radio, playback extensions, and the broader plugin interface.
 
 For the full `plugin.*` API reference and instructions on writing and testing your own plugin, see:
 
 **[PLUGINS.md](PLUGINS.md)**
 
----
 
 # Acknowledgments
 

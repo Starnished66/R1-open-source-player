@@ -4,15 +4,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Discrete screen-timeout choices, in seconds -- the slider (gui.c) steps
- * through these rather than offering a raw linear seconds range, since e.g.
- * "247s" isn't a meaningful choice (real-device feedback: should snap to
- * sensible presets: 30s, 1m, 2m, 5m, 10m, 30m). settings_load() snaps any
- * hand-edited or legacy value to the nearest one of these, so this is the
- * single place that defines what a "valid" timeout duration is. */
+/* Discrete screen-timeout presets. The original useful coarse progression
+ * is preserved, with a new 15-second choice added at the beginning. */
 extern const int SCREEN_TIMEOUT_STEPS[];
-#define SCREEN_TIMEOUT_STEP_COUNT 6
-#define SCREEN_TIMEOUT_MIN_SECONDS 30
+#define SCREEN_TIMEOUT_STEP_COUNT 7
+#define SCREEN_TIMEOUT_MIN_SECONDS 15
 #define SCREEN_TIMEOUT_MAX_SECONDS 1800
 
 /* Idle-shutdown choices, in minutes -- same discrete-steps reasoning as
@@ -118,11 +114,15 @@ typedef struct {
      * backlight_set_screen_on()) -- screen_timeout_enabled=false means never
      * auto-off, screen stays on until the power button is pressed.
      * screen_timeout_seconds is meaningful only when enabled, always one of
-     * SCREEN_TIMEOUT_STEPS (see settings_load(), which snaps any
+     * SCREEN_TIMEOUT_STEPS above (see settings_load(), which snaps any
      * hand-edited or legacy value to the nearest step, since the settings
      * file is plaintext and could be hand-edited out of range). */
     bool screen_timeout_enabled;
     int screen_timeout_seconds;
+
+    /* Pre-timeout low-brightness stage. When enabled, gui.c dims an idle
+     * screen to approximately 5% before the full screen timeout. */
+    bool screen_dimming_enabled;
 
     /* Charge-status LEDs (/sys/class/leds/{red,blue}, see led_control.h) --
      * false forces both off regardless of charge state, for e.g. leaving the

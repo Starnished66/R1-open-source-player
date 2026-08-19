@@ -1,11 +1,66 @@
-# Writing plugins
+# 🧩 Writing Plugins
 
-Reference for authoring a third-party Lua plugin. Everything here is
-derived directly from `src/plugins/plugin_manager.c` (the C side) and
-`plugins_examples/Audiobooks.lua` (a complete real example) -- if this
-document and the source ever disagree, the source is right.
+Build third-party features for Open Source Player with plain Lua
+— no C toolchain, player rebuild, or firmware reflash required.
 
-## How a plugin gets loaded
+This guide is derived from `src/plugins/plugin_manager.c` and the scripts in
+`plugins_examples/`. If the guide and source ever disagree, the source is
+authoritative.
+
+## 🧭 Start Here
+
+1. Create a `.lua` file.
+2. Give the plugin an identity with `plugin.define()`.
+3. Register a row or Stream Media tile so users can open it.
+4. Copy it to `<SD card>/.plugins/`.
+5. Restart the player. Plugins are scanned only during startup.
+
+### Minimal plugin
+
+```lua
+plugin.define({
+    id = "org.example.hello",
+    name = "Hello Player",
+    version = "1.0.0",
+    api_min = 1,
+})
+
+plugin.register_list_item("settings", "Hello Player", function()
+    plugin.show_list("Hello Player", {
+        "The plugin is working!",
+        "Lua says hello 👋",
+    }, function(index)
+        plugin.show_toast("Selected row " .. index)
+    end)
+end)
+```
+
+Install it as:
+
+```text
+<SD card>/.plugins/HelloPlayer.lua
+```
+
+> [!TIP]
+> Start with an example close to what you want to build. `Audiobooks.lua`,
+> `NetRadio.lua`, `Themes.lua`, and `LastFmScrobbler.lua` cover most common
+> plugin shapes.
+
+## 📖 Guide Map
+
+- [Loading and isolation](#loading)
+- [Adding a plugin to the UI](#ui-entry-points)
+- [Identity and capability checks](#identity)
+- [Lists and settings screens](#plugin-ui)
+- [Files and playback](#files-playback)
+- [Networking](#networking)
+- [Playback events and timers](#events)
+- [Complete examples](#examples)
+- [Testing your plugin](#testing)
+
+<a id="loading"></a>
+
+## ⚙️ How Plugins Load
 
 At startup (`plugin_manager_init()`, called early in `gui_init()`, well
 before anything could tap into one), every `*.lua` file directly under
@@ -26,60 +81,60 @@ If a file fails to load or errors while running its top-level code
 to stderr as `[plugins] failed to load <path>: <error>` -- without
 affecting any other `.lua` file in the folder.
 
-## Reaching a plugin from the UI
+<a id="ui-entry-points"></a>
 
-There are two separate registries, reached two different ways -- pick
-whichever fits your plugin's own subject matter:
+## 🧭 Adding Your Plugin to the UI
 
-**`plugin.register_list_item(list_id, ...)`** -- every plugin that calls
-this gets its own row, appended to whichever native list screen `list_id`
-names, after that screen's own built-in rows. Six recognized values --
-every one of Settings' own screens, plus Books:
+Choose the entry point that best matches the plugin:
 
-- `"books"` -- the **Books** screen, after "Books"/"Favorites", up to
-  `PLUGIN_MAX_BOOKS_LIST_ITEMS` (currently 8) combined across plugins.
-- `"settings"` -- the top-level **Settings** screen, after "Playback"/
-  "Display"/"Power"/"System"/"About", up to `PLUGIN_MAX_SETTINGS_LIST_ITEMS`
-  (currently 8).
-- `"display"` -- the **Settings -> Display** sub-screen, after "Accent
-  Color"/"Font Size"/"Screen Timeout"/"Swipe Up for Home", up to
-  `PLUGIN_MAX_DISPLAY_LIST_ITEMS` (currently 8). This is where a
-  display-theming plugin's own entry point belongs -- see
-  `plugins_examples/Themes.lua`.
-- `"playback"` -- the **Settings -> Playback** sub-screen, after "Car
-  Mode"/"Crossfade"/"Equalizer"/"Resume Last Track"/"Sleep Timer"/"Startup
-  Volume", up to `PLUGIN_MAX_PLAYBACK_LIST_ITEMS` (currently 8). See
-  `plugins_examples/PlaybackExtras.lua`.
-- `"power"` -- the **Settings -> Power** sub-screen, after "Charge Limiter"/
-  "Idle Shutdown"/"LED charge indicator", up to `PLUGIN_MAX_POWER_LIST_ITEMS`
-  (currently 8).
-- `"system"` -- the **Settings -> System** sub-screen, after "Time Zone"/
-  "USB Mode"/"Update Music Database"/"Factory Reset", up to
-  `PLUGIN_MAX_SYSTEM_LIST_ITEMS` (currently 8).
+`plugin.register_list_item(list_id, ...)` adds a row after the native rows
+on one of these screens:
+
+| `list_id` | Location | Good fit | Shared limit |
+|---|---|---|---:|
+| `"books"` | Books | Readers, audiobooks, reference tools | 8 |
+| `"settings"` | Settings | General plugin configuration | 8 |
+| `"display"` | Settings → Display | Themes and visual tools | 8 |
+| `"playback"` | Settings → Playback | Audio and playback tools | 8 |
+| `"power"` | Settings → Power | Battery and power tools | 8 |
+| `"system"` | Settings → System | Device and maintenance tools | 8 |
 
 Passing anything else raises a Lua error at load time rather than silently
 registering into nothing. If no plugin registers a row for a given
 `list_id`, that screen just shows its native rows, no placeholder.
-`build_pill_list_screen()`'s rows genuinely scroll (real-device confirmed),
-unlike the icon grid below, so there's no "only the first plugin wins"
-limitation here the way the icon-grid registry has to work around.
+`build_pill_list_screen()` rows scroll, so every registered row remains
+reachable even when several plugins target the same screen.
 
-**`plugin.register_stream_media_tile()`** -- every plugin that calls this
-gets a real, visible icon-grid tile, appended to **Stream Media** after the
-built-in Subsonic tile (up to `PLUGIN_MAX_STREAM_TILES`, currently 5, so 6
-total). Unlike the Books list above, `build_icon_grid_screen()`'s grid
+`plugin.register_stream_media_tile()` gives a streaming plugin a visible
+icon-grid tile in **Stream Media**, after the built-in Subsonic tile. Up to
+`PLUGIN_MAX_STREAM_TILES` plugin tiles are supported (currently 5, for 6
+tiles total). Unlike the Books list above, `build_icon_grid_screen()`'s grid
 **cannot be scrolled** (real-device testing confirmed) -- Stream Media
 happens to have room for this cap because it only has 1 built-in tile,
 unlike Home, which is already full at 6 and has no room for plugin tiles
 of its own at all.
 
-## The `plugin` API
+## 🧰 API Reference
 
 Every function below is a field on the global `plugin` table, available
 from the moment your script starts running (injected before
 `luaL_dofile()`). All of it is implemented in `src/plugins/plugin_manager.c`.
 
-### Identity, API version, and capability discovery
+| Area | Main APIs |
+|---|---|
+| Identity | `define`, `api_version`, `has_capability`, `get_app_info` |
+| UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
+| Theme | `set_icon`, `set_background_color`, `set_text_color` |
+| Files | `sd_root`, `list_dir` |
+| Playback | `play_file`, `play_list`, transport controls, playback state |
+| Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks` |
+| Audio | `eq_load_profile`, `eq_save_profile`, `eq_set_*`, `eq_reset` |
+| Network | `http_request`, `cancel`, legacy `http_get`/`http_post` |
+| Automation | `on`, `set_interval`, `clear_interval` |
+
+<a id="identity"></a>
+
+### 🪪 Identity, API Version, and Capabilities
 
 New plugins should declare identity once, at the start of their top-level
 script:
@@ -107,13 +162,17 @@ as legacy plugins using an identity derived from their filename.
 - `plugin.get_app_info()` returns `version`, `build`, `platform`, and
   `plugin_api` fields.
 
+<a id="plugin-ui"></a>
+
+## 🖥️ Lists and Settings UI
+
 ### `plugin.register_list_item(list_id, label, on_open [, options])`
 
 Adds a row to an existing native list screen.
 
 - `list_id` (string): which screen to add to -- `"books"`, `"settings"`,
-  `"display"`, `"playback"`, `"power"`, or `"system"` (see "Reaching a
-  plugin from the UI" above for what each targets) -- anything else raises
+  `"display"`, `"playback"`, `"power"`, or `"system"` (see "Adding Your
+  Plugin to the UI" above for what each targets) -- anything else raises
   a Lua error immediately, rather than silently registering into nothing.
 - `label` (string): the row's visible text.
 - `on_open` (function): called with zero arguments when the row is tapped.
@@ -312,7 +371,7 @@ cap above exists and isn't just an arbitrary round number.
 Items beyond the first 500 (`PLUGIN_MAX_LIST_ITEMS`) in a single call are
 silently dropped.
 
-### Row images, resizing, and text size
+### 🎛️ Row Images, Resizing, and Text Size
 
 `register_list_item()`'s `options` table, `show_list()`'s per-row table
 entries, and `show_settings_list()`'s per-row tables support these optional
@@ -355,6 +414,10 @@ None of the three affect a row that doesn't set them -- a plugin that
 never uses this section's fields renders exactly as it did before they
 existed.
 
+<a id="files-playback"></a>
+
+## 💾 Files and Playback
+
 ### `plugin.list_dir(path)`
 
 Lists a directory's immediate children.
@@ -393,7 +456,7 @@ if this were any other playlist. Paths beyond the first 500 are silently
 dropped; `start_index` is clamped into range if out-of-bounds rather than
 erroring.
 
-#### Live stream URLs
+#### 📻 Live Stream URLs
 
 `path`/`paths` entries starting with `http://` or `https://` are treated as
 a live network stream rather than a local file. A dedicated network thread
@@ -445,7 +508,7 @@ queue"). Useful for "nothing found" / error feedback -- see
 `Audiobooks.lua`'s use of this when a book folder has no playable chapter
 files in it.
 
-### EQ / sound profiles
+### 🎚️ EQ and Sound Profiles
 
 This app has its own 10-band parametric EQ (`src/audio/peq.c`) -- these
 functions expose it directly, `luaL_check*`-validated wrappers straight over
@@ -492,7 +555,7 @@ already re-reads `peq_get_*()` fresh every time it's opened, so it stays
 correct regardless of what a plugin changed. See
 `plugins_examples/SoundProfiles.lua`.
 
-### Playback control
+### ⏯️ Playback Control
 
 Unlike the EQ functions above, these **do** go through `gui.c` bridges
 (`gui_plugin_toggle_pause()` and neighbors, declared in `gui.h`) rather than
@@ -523,6 +586,14 @@ These are always called from inside a plugin callback (`on_open`,
 on the main UI thread from an LVGL click event -- the same thread every
 native playback control already runs on, so there's nothing new to worry
 about thread-safety-wise.
+
+<a id="networking"></a>
+
+## 🌐 Networking
+
+> [!IMPORTANT]
+> New plugins should use asynchronous `plugin.http_request()`. The older
+> `http_get()` and `http_post()` functions block the UI thread while waiting.
 
 ### `plugin.http_get(url [, verify_tls])`
 
@@ -667,7 +738,9 @@ to the first album. Meant for auto-continuing playback across an artist's
 discography once an album finishes; pair with `"track_started"` or
 `get_current_track_path()` to detect the album boundary.
 
-## Events
+<a id="events"></a>
+
+## 🔔 Events and Timers
 
 ### `plugin.on(event, callback)`
 
@@ -716,7 +789,24 @@ every other `plugin.*` callback -- a slow `http_get()`/`http_post()` inside
 one will visibly stall the whole UI until it returns, same tradeoff
 `http_get()` itself already documents.
 
-## Complete examples
+<a id="examples"></a>
+
+## 🧪 Complete Examples
+
+| Example | What it demonstrates |
+|---|---|
+| `Audiobooks.lua` | SD browsing, nested lists, chapter playback, progress |
+| `NetRadio.lua` | Stream Media tile and live MP3 streams |
+| `Themes.lua` | Display row, icon overrides, background/text colors |
+| `SoundProfiles.lua` | PEQ profile selection and persistence |
+| `PlaybackExtras.lua` | Native-looking toggles, sliders, and nested settings |
+| `LastFmScrobbler.lua` | Events, timers, text input, MD5, async HTTP |
+| `AsyncHttp.lua` | Bounded requests and cancellation |
+| `PluginApiInfo.lua` | Identity, version, and capability discovery |
+| `NestedLists.lua` | Nested callback ownership and text-input busy handling |
+
+The summaries below explain when each example is useful and call out its
+important implementation details.
 
 `plugins_examples/Audiobooks.lua` uses most of the API: `sd_root()`/
 `list_dir()` to browse `Audiobooks/<book>/` folders on the SD card,
@@ -724,8 +814,8 @@ one will visibly stall the whole UI until it returns, same tradeoff
 first's `on_select` into the second), `play_list()` to start playback from
 whichever chapter was tapped, and `show_toast()` for the "no chapters
 found" / "no audiobooks found" empty states. Read it top to bottom as the
-reference implementation for `register_list_item()`; the `README.md`'s own
-Plugins section (section 5) has the install steps (copy to
+reference implementation for `register_list_item()`; the `README.md`'s
+Plugins section has the install steps (copy to
 `.plugins/Audiobooks.lua`, create an `Audiobooks/<book>/` folder
 structure).
 
@@ -791,35 +881,36 @@ few optional interfaces in a list.
 ownership: open a child list, go Back, and the parent callback remains active.
 It also demonstrates the success/busy return contract of `show_text_input()`.
 
-## Writing and testing your own plugin
+<a id="testing"></a>
 
-1. No toolchain needed -- a plugin is a plain text `.lua` file. Any editor
-   works; there's no separate build step for the script itself (the *app*
-   binary that runs it does need Lua vendored in, see below, but that's a
-   one-time thing already done in this repo).
-2. Copy your `.lua` file to `<SD card>/.plugins/` (create the folder if it
-   doesn't exist yet) and (re)launch the app -- plugins are only scanned at
-   startup, there's no hot-reload.
-3. Watch stderr for `[plugins] failed to load <path>: <error>` (a load-time
-   error -- syntax error, or an API call failing during your script's
-   top-level code) or `[plugins] <context> error: <error>` (a runtime error
-   inside one of your own callbacks -- `<context>` names which one:
-   `<list_id> list item '<label>' on_open` for a `register_list_item()` row
-   (`books`/`settings`/`display`/`playback`/`power`/`system`), `tile
-   '<label>' on_open` for a `register_stream_media_tile()` tile, `show_list
-   on_select`, `show_settings_list on_select`/`on_change`, `<event>
-   handler` for a `plugin.on()` subscriber (`track_started`/`paused`/
-   `resumed`/`stopped`), `set_interval callback`, or `show_text_input
-   on_submit`). Per [TESTING.md](TESTING.md)'s launch method, this shows up
-   directly in the foreground `adb shell` output. None of these crash the
-   app or disable your plugin -- one bad callback just logs and moves on,
-   the same tolerance a load-time failure gets.
-4. Both `plugin.register_list_item()` and `plugin.register_stream_media_tile()`
-   let every installed plugin have its own row/tile -- no "only the first
-   one wins" limitation on either, so testing multiple plugins side by
-   side works normally.
+## 🚀 Writing and Testing Your Plugin
 
-## Extending the `plugin.*` API itself
+1. Write the plugin in any text editor—there is no separate plugin build.
+2. Optionally run `luac -p MyPlugin.lua` to catch syntax errors locally.
+3. Copy it to `<SD card>/.plugins/`.
+4. Restart the player; there is currently no hot reload.
+5. Follow [TESTING.md](TESTING.md) when launching through ADB and watch the
+   foreground output.
+
+### Reading plugin errors
+
+| Log shape | Meaning |
+|---|---|
+| `[plugins] failed to load <path>: <error>` | Syntax error or failure in top-level plugin code |
+| `[plugins] <context> error: <error>` | A callback failed after the plugin loaded |
+
+The context identifies the failing callback, such as a list item's
+`on_open`, `show_list on_select`, a settings `on_change`, an event handler,
+an interval callback, or text-input submission.
+
+> [!NOTE]
+> A broken plugin or callback is isolated. It is logged and skipped without
+> crashing the player or disabling other plugins.
+
+Multiple plugins can register rows and Stream Media tiles at the same time;
+there is no “first plugin wins” limitation.
+
+## 🛠️ Extending the `plugin.*` API Itself
 
 If you're modifying `plugin_manager.c` to add a new function (not writing
 a plugin script, but adding to what plugins *can* call): follow the

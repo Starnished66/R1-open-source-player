@@ -800,6 +800,7 @@ one will visibly stall the whole UI until it returns, same tradeoff
 | `Themes.lua` | Display row, icon overrides, background/text colors |
 | `SoundProfiles.lua` | PEQ profile selection and persistence |
 | `PlaybackExtras.lua` | Native-looking toggles, sliders, and nested settings |
+| `PlayThrough.lua` | Natural-end detection and folder/album continuation |
 | `LastFmScrobbler.lua` | Events, timers, text input, MD5, async HTTP |
 | `AsyncHttp.lua` | Bounded requests and cancellation |
 | `PluginApiInfo.lua` | Identity, version, and capability discovery |
@@ -854,6 +855,14 @@ on top of the first, demonstrating submenu-inside-a-submenu nesting -- and,
 since this session's row-images/resizing/text-size work, the toggle row's
 own `icon` (pointed at a real stock theme2 asset by its raw filesystem
 path) and the "About" row's `text_size = "large"`.
+
+`plugins_examples/PlayThrough.lua` adds persistent **Play Through Folders**
+and **Play Through Albums** controls under Settings → Playback. It combines
+playback events, a short polling interval, library album queries, SD-card
+directory browsing, and `play_list()` to continue only after a genuine
+natural playlist end. Album continuation has priority when both options are
+enabled; folder continuation is the fallback. Explicit Stop and non-sequential
+play modes are deliberately respected.
 
 `plugins_examples/LastFmScrobbler.lua` is the reference implementation for
 `plugin.on()`, `set_interval()`/`clear_interval()`, `get_now_playing()`,

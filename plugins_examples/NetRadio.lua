@@ -28,11 +28,13 @@ local function load_stations()
 
     local labels, urls = {}, {}
     for line in file:lines() do
-        line = trim(line:gsub("\r$", ""))
-        if line ~= "" and line:sub(1, 1) ~= "#" then
-            local name, url = line:match("^(.-)%s*|%s*(https?://.+)$")
-            if not url and line:match("^https?://") then
-                name, url = line, line
+        -- Lua 5.4 treats a generic-for control variable as const. Normalize
+        -- into a separate local instead of assigning back into `line`.
+        local text = trim(line:gsub("\r$", ""))
+        if text ~= "" and text:sub(1, 1) ~= "#" then
+            local name, url = text:match("^(.-)%s*|%s*(https?://.+)$")
+            if not url and text:match("^https?://") then
+                name, url = text, text
             end
 
             if url then

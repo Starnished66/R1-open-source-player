@@ -266,12 +266,13 @@ static bool read_response(http_conn_t * conn, int * out_status, body_sink_t * si
     return true;
 }
 
-bool http_get_to_buffer(const char * url, bool verify_tls, int * out_status, uint8_t ** out_body, size_t * out_body_size) {
+bool http_get_to_buffer_limited(const char * url, bool verify_tls, size_t max_body_size, int * out_status,
+                                uint8_t ** out_body, size_t * out_body_size) {
     *out_body = NULL;
     *out_body_size = 0;
 
     body_sink_t sink = { .out_buffer = out_body, .out_buffer_size = out_body_size, .out_file = NULL,
-                          .buffer_capacity = 0, .max_buffer_size = 8 * 1024 * 1024,
+                          .buffer_capacity = 0, .max_buffer_size = max_body_size,
                           .progress_cb = NULL, .progress_user_data = NULL,
                           .out_content_type = NULL, .out_content_type_size = 0 };
     if (!do_get(url, verify_tls, out_status, &sink)) {
@@ -283,13 +284,19 @@ bool http_get_to_buffer(const char * url, bool verify_tls, int * out_status, uin
     return true;
 }
 
-bool http_post_to_buffer(const char * url, bool verify_tls, const char * content_type, const uint8_t * body,
-                          size_t body_size, int * out_status, uint8_t ** out_body, size_t * out_body_size) {
+bool http_get_to_buffer(const char * url, bool verify_tls, int * out_status, uint8_t ** out_body,
+                         size_t * out_body_size) {
+    return http_get_to_buffer_limited(url, verify_tls, 8 * 1024 * 1024, out_status, out_body, out_body_size);
+}
+
+bool http_post_to_buffer_limited(const char * url, bool verify_tls, const char * content_type, const uint8_t * body,
+                                  size_t body_size, size_t max_body_size, int * out_status, uint8_t ** out_body,
+                                  size_t * out_body_size) {
     *out_body = NULL;
     *out_body_size = 0;
 
     body_sink_t sink = { .out_buffer = out_body, .out_buffer_size = out_body_size, .out_file = NULL,
-                          .buffer_capacity = 0, .max_buffer_size = 8 * 1024 * 1024,
+                          .buffer_capacity = 0, .max_buffer_size = max_body_size,
                           .progress_cb = NULL, .progress_user_data = NULL,
                           .out_content_type = NULL, .out_content_type_size = 0 };
     if (!do_post(url, verify_tls, content_type, body, body_size, out_status, &sink)) {
@@ -299,6 +306,12 @@ bool http_post_to_buffer(const char * url, bool verify_tls, const char * content
         return false;
     }
     return true;
+}
+
+bool http_post_to_buffer(const char * url, bool verify_tls, const char * content_type, const uint8_t * body,
+                          size_t body_size, int * out_status, uint8_t ** out_body, size_t * out_body_size) {
+    return http_post_to_buffer_limited(url, verify_tls, content_type, body, body_size, 8 * 1024 * 1024, out_status,
+                                        out_body, out_body_size);
 }
 
 bool http_get_to_file(const char * url, bool verify_tls, const char * dest_path,

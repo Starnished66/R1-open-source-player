@@ -1,5 +1,7 @@
+plugin.define({ id = "example.lastfm_scrobbler", name = "Last.fm Scrobbler", version = "1.1", api_min = 1 })
+
 -- Last.fm scrobbler. Reference implementation for plugin.on(), set_interval()/
--- clear_interval(), get_now_playing(), http_post(), md5(), and
+-- clear_interval(), get_now_playing(), async http_request(), md5(), and
 -- show_text_input() together (see PLUGINS.md).
 --
 -- Requires a free Last.fm API account: https://www.last.fm/api/account/create
@@ -77,37 +79,65 @@ end
 -- Adds api_key + api_sig to params (nil-valued fields, like an empty album,
 -- are simply absent from a Lua table and get skipped by both sign() and
 -- build_query() automatically) and POSTs to the Last.fm REST endpoint.
-local function api_call(params)
+local function api_call(params, callback)
     params.api_key = API_KEY
     params.api_sig = sign(params)
-    return plugin.http_post(API_URL, build_query(params))
+    return plugin.http_request({
+        url = API_URL,
+        method = "POST",
+        body = build_query(params),
+        content_type = "application/x-www-form-urlencoded",
+        verify_tls = true,
+        max_response_bytes = 262144,
+    }, callback)
 end
 
+local login_in_flight = false
+
 local function do_login(username, password)
-    local status, body = api_call({ method = "auth.getMobileSession", username = username, password = password })
+    if login_in_flight then return end
+    login_in_flight = true
+    plugin.show_toast("Logging in to Last.fm...")
+    local handle, start_error = api_call(
+        { method = "auth.getMobileSession", username = username, password = password },
+        function(status, body, request_error)
+            login_in_flight = false
+            if not request_error and status == 200 and body and body:match('status="ok"') then
+                local key = body:match("<key>([^<]+)</key>")
+                if key then
+                    state.session_key = key
+                    state.username = username
+                    write_state(state)
+                    plugin.show_toast("Logged in to Last.fm as " .. username)
+                    return
+                end
+            end
 
-    if status == 200 and body and body:match('status="ok"') then
-        local key = body:match("<key>([^<]+)</key>")
-        if key then
-            state.session_key = key
-            state.username = username
-            write_state(state)
-            plugin.show_toast("Logged in to Last.fm as " .. username)
-            return
+            local api_error = body and body:match("<error[^>]*>([^<]+)</error>")
+            local detail = api_error or request_error or (status and ("HTTP " .. status))
+            plugin.show_toast("Last.fm login failed" .. (detail and (": " .. detail) or ""))
         end
+    )
+    if not handle then
+        login_in_flight = false
+        plugin.show_toast("Could not start Last.fm login: " .. (start_error or "unknown error"))
     end
-
-    local err = body and body:match("<error[^>]*>([^<]+)</error>")
-    plugin.show_toast("Last.fm login failed" .. (err and (": " .. err) or ""))
 end
 
 local function start_login()
-    plugin.show_text_input("Last.fm Username", nil, false, function(username)
+    if API_KEY == "YOUR_LASTFM_API_KEY" or API_SECRET == "YOUR_LASTFM_API_SECRET" then
+        plugin.show_toast("Configure API_KEY and API_SECRET first")
+        return
+    end
+    local ok, input_error = plugin.show_text_input("Last.fm Username", state.username, false, function(username)
         if username == "" then return end
-        plugin.show_text_input("Last.fm Password", nil, true, function(password)
+        local password_ok, password_error = plugin.show_text_input("Last.fm Password", nil, true, function(password)
+            if password == "" then return end
             do_login(username, password)
         end)
+        if not password_ok then plugin.show_toast(password_error or "Text input unavailable") end
     end)
+    if not ok then plugin.show_toast(input_error or "Text input unavailable") end
 end
 
 -- Current-track bookkeeping, refreshed on every "track_started" event --
@@ -115,20 +145,29 @@ end
 local current_title, current_artist, current_album, current_duration = nil, nil, nil, 0
 local track_start_time = 0
 local scrobbled_this_track = false
+local scrobble_in_flight = false
+local track_generation = 0
 
 local function update_now_playing()
-    api_call({
+    local handle, start_error = api_call({
         method = "track.updateNowPlaying",
         sk = state.session_key,
         track = current_title,
         artist = current_artist,
         album = (current_album ~= "" and current_album) or nil,
         duration = tostring(math.floor(current_duration)),
-    })
+    }, function(status, body, request_error)
+        -- Now-playing is advisory. Avoid interrupting playback with transient
+        -- network errors, but surface an immediate pool/start failure below.
+    end)
+    if not handle then plugin.show_toast("Last.fm update failed: " .. (start_error or "request busy")) end
 end
 
 local function scrobble()
-    api_call({
+    if scrobble_in_flight then return end
+    scrobble_in_flight = true
+    local generation = track_generation
+    local handle, start_error = api_call({
         method = "track.scrobble",
         sk = state.session_key,
         track = current_title,
@@ -136,13 +175,27 @@ local function scrobble()
         album = (current_album ~= "" and current_album) or nil,
         timestamp = tostring(track_start_time),
         duration = tostring(math.floor(current_duration)),
-    })
+    }, function(status, body, request_error)
+        if generation ~= track_generation then return end
+        scrobble_in_flight = false
+        if not request_error and status == 200 and body and body:match('status="ok"') then
+            scrobbled_this_track = true
+        end
+        -- A failure deliberately leaves scrobbled_this_track false, allowing
+        -- the 15-second timer to retry instead of silently losing the play.
+    end)
+    if not handle then
+        scrobble_in_flight = false
+        plugin.show_toast("Could not scrobble: " .. (start_error or "request busy"))
+    end
 end
 
 plugin.on("track_started", function(title, artist, album, duration_seconds)
     current_title, current_artist, current_album, current_duration = title, artist, album, duration_seconds
     track_start_time = os.time()
     scrobbled_this_track = false
+    scrobble_in_flight = false
+    track_generation = track_generation + 1
 
     if state.enabled and state.session_key then
         update_now_playing()
@@ -164,7 +217,6 @@ plugin.set_interval(15, function()
     local threshold = math.min(current_duration / 2, 240)
     if plugin.get_position() >= threshold then
         scrobble()
-        scrobbled_this_track = true
     end
 end)
 

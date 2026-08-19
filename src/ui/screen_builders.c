@@ -544,6 +544,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
     /* Vertical-only -- see the matching comment in build_icon_grid_screen. */
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_gap(list, 6, 0);
     lv_obj_set_style_pad_top(list, 4, 0);
 
@@ -556,15 +557,21 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
          * -- see PILL_ROW_HEIGHT_MIN's own comment in screen_builders.h for
          * why the PNG sprite can't just stretch to a new height. */
         int32_t height = 124;
-        bool resized = item->row_height > 0;
-        if (resized) {
+        int32_t width = 448;
+        bool resized = item->row_height > 0 || item->row_width > 0;
+        if (item->row_height > 0) {
             height = item->row_height;
             if (height < PILL_ROW_HEIGHT_MIN) height = PILL_ROW_HEIGHT_MIN;
             if (height > PILL_ROW_HEIGHT_MAX) height = PILL_ROW_HEIGHT_MAX;
         }
+        if (item->row_width > 0) {
+            width = item->row_width;
+            if (width < PILL_ROW_WIDTH_MIN) width = PILL_ROW_WIDTH_MIN;
+            if (width > PILL_ROW_WIDTH_MAX) width = PILL_ROW_WIDTH_MAX;
+        }
 
         lv_obj_t * row = lv_obj_create(list);
-        lv_obj_set_size(row, 448, height);
+        lv_obj_set_size(row, width, height);
         /* item_bg.png is a rounded-rect sprite with transparent corners --
          * without an explicit black bg_color here, LVGL's own default
          * object background (light gray/white) shows through at those

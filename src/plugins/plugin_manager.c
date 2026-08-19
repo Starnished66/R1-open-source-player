@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -36,6 +37,10 @@
 
 #define PLUGIN_MAX_FILES 16
 #define PLUGIN_MAX_LIST_ITEMS 500
+#define PLUGIN_MAX_ASYNC_HTTP 4
+#define PLUGIN_ASYNC_HTTP_DEFAULT_MAX (512U * 1024U)
+#define PLUGIN_ASYNC_HTTP_MAX_RESPONSE (2U * 1024U * 1024U)
+#define PLUGIN_ASYNC_HTTP_MAX_REQUEST (1024U * 1024U)
 
 typedef struct {
     lua_State * L;
@@ -47,7 +52,7 @@ typedef struct {
 
 /* Leaner sibling of plugin_tile_t for plugin.register_list_item() -- pill-
  * list rows (screen_builders.h's pill_list_item_t) now DO have an icon/
- * height/text_size slot (this session's row-images/resize/text-size work),
+ * height/width/text_size slot (this session's row-layout work),
  * populated from this call's optional 4th `options` table -- see
  * append_list_item()'s own comment. Empty string ("") means "unset" for
  * icon_path/text_size, matching pill_list_item_t's own NULL convention one
@@ -59,11 +64,21 @@ typedef struct {
     char label[64];
     char icon_path[256];
     int32_t row_height;
+    int32_t row_width;
     char text_size[8];
 } plugin_list_item_t;
 
-static lua_State * plugin_instances[PLUGIN_MAX_FILES];
+typedef struct {
+    lua_State * L;
+    char id[64];
+    char name[96];
+    char version[32];
+    bool defined;
+} plugin_instance_t;
+
+static plugin_instance_t plugin_instances[PLUGIN_MAX_FILES];
 static int plugin_instance_count = 0;
+static int loading_plugin_slot = -1;
 
 /* Registry for plugin.register_list_item("books", ...) -- gui.c's
  * build_books_screen() appends these after its own 2 built-in rows. See
@@ -117,17 +132,18 @@ static int plugin_system_list_item_count = 0;
 static plugin_tile_t plugin_stream_tiles[PLUGIN_MAX_STREAM_TILES];
 static int plugin_stream_tile_count = 0;
 
-/* The most recent plugin.show_list() call's on_select function -- only one
- * plugin list screen is ever the front-most one at a time (see gui.c's
- * gui_plugin_show_list() pool comment), so a single "current" ref is
- * enough; a later show_list() call replaces it and releases the old ref. */
-static lua_State * current_list_L = NULL;
-static int current_list_select_ref = LUA_NOREF;
+/* Each reusable plugin.show_list() screen owns its on_select callback. This
+ * matters after Back returns from a nested list: the older screen must route
+ * through its original callback, not whichever list was opened most recently. */
+typedef struct {
+    lua_State * L;
+    int select_ref;
+} plugin_list_callback_t;
+
+static plugin_list_callback_t plugin_list_callbacks[PLUGIN_LIST_SCREEN_POOL_SIZE];
 
 /* Per-(pool slot, row) Lua callback ref storage for plugin.show_settings_list()
- * -- unlike current_list_select_ref above (one shared "current" ref, fine for
- * show_list() since only the front-most plugin list screen can ever be
- * clicked), a settings-list screen carries per-row toggle/slider state that
+ * -- a settings-list screen carries per-row toggle/slider state that
  * needs to survive being navigated away from and back to, so storage is
  * keyed by the actual gui.c pool slot instead of "whichever call was most
  * recent". L is NULL for a row that's never been populated (both the
@@ -384,7 +400,7 @@ static bool is_valid_text_size(const char * text_size) {
 /* Shared by l_plugin_register_list_item() below, once its capacity check
  * for the target array has already passed -- pushes on_open (Lua stack
  * index 3 in the caller) into the registry and appends {L, ref, label}, plus
- * this call's optional 4th `options` table ({ icon, height, text_size },
+ * this call's optional 4th `options` table ({ icon, height, width, text_size },
  * PLUGINS.md) if present. icon_path/text_size are left as empty strings
  * (not touched at all here, matching the struct's already-zero-initialized
  * static-array storage) when `options` is absent or doesn't set that field
@@ -400,6 +416,7 @@ static void append_list_item(plugin_list_item_t * array, int * count, lua_State 
     snprintf(item->label, sizeof(item->label), "%s", label);
     item->icon_path[0] = '\0';
     item->row_height = 0;
+    item->row_width = 0;
     item->text_size[0] = '\0';
 
     if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
@@ -410,6 +427,10 @@ static void append_list_item(plugin_list_item_t * array, int * count, lua_State 
 
         lua_getfield(L, 4, "height");
         item->row_height = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 4, "width");
+        item->row_width = (int32_t) luaL_optinteger(L, -1, 0);
         lua_pop(L, 1);
 
         lua_getfield(L, 4, "text_size");
@@ -511,7 +532,7 @@ static int l_plugin_register_stream_media_tile(lua_State * L) {
  * unchanged) or a table { label = "...", icon = "...", text_size = "..." }
  * for a row that wants its own icon/text size -- see this function's own
  * doc comment. An optional trailing `options` table (4th arg) carries
- * `height`, applying to every row in this call (a call-level, not per-row,
+ * `height` and `width`, applying to every row in this call (call-level,
  * setting -- a plain browsing list mixing wildly different row heights
  * would look broken in a way an occasional taller settings-submenu row
  * doesn't, see PLUGINS.md). */
@@ -571,20 +592,23 @@ static int l_plugin_show_list(lua_State * L) {
     }
 
     int32_t height = 0;
+    int32_t width = 0;
     if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
         lua_getfield(L, 4, "height");
         height = (int32_t) luaL_optinteger(L, -1, 0);
         lua_pop(L, 1);
+        lua_getfield(L, 4, "width");
+        width = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
     }
 
-    if (current_list_L && current_list_select_ref != LUA_NOREF) {
-        luaL_unref(current_list_L, LUA_REGISTRYINDEX, current_list_select_ref);
-    }
     lua_pushvalue(L, 3);
-    current_list_select_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    current_list_L = L;
-
-    gui_plugin_show_list(title, labels, icon_paths, text_sizes, height, n);
+    int new_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    int slot = gui_plugin_show_list(title, labels, icon_paths, text_sizes, height, width, n);
+    plugin_list_callback_t * cb = &plugin_list_callbacks[slot];
+    if (cb->L && cb->select_ref != LUA_NOREF) luaL_unref(cb->L, LUA_REGISTRYINDEX, cb->select_ref);
+    cb->L = L;
+    cb->select_ref = new_ref;
     return 0;
 }
 
@@ -621,6 +645,7 @@ static int l_plugin_show_settings_list(lua_State * L) {
     static char icon_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][256];
     static const char * icon_paths[PLUGIN_SETTINGS_LIST_MAX_ROWS];
     static int32_t heights[PLUGIN_SETTINGS_LIST_MAX_ROWS];
+    static int32_t widths[PLUGIN_SETTINGS_LIST_MAX_ROWS];
     static char text_size_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][8];
     static const char * text_sizes[PLUGIN_SETTINGS_LIST_MAX_ROWS];
     int new_refs[PLUGIN_SETTINGS_LIST_MAX_ROWS];
@@ -698,6 +723,10 @@ static int l_plugin_show_settings_list(lua_State * L) {
         heights[count] = (int32_t) luaL_optinteger(L, -1, 0);
         lua_pop(L, 1);
 
+        lua_getfield(L, -1, "width");
+        widths[count] = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
         text_size_bufs[count][0] = '\0';
         text_sizes[count] = NULL;
         lua_getfield(L, -1, "text_size");
@@ -721,7 +750,7 @@ static int l_plugin_show_settings_list(lua_State * L) {
     }
 
     int slot = gui_plugin_show_settings_list(title, row_types, labels, toggle_initial, slider_min, slider_max,
-                                              slider_value, icon_paths, heights, text_sizes, count);
+                                              slider_value, icon_paths, heights, widths, text_sizes, count);
     if (slot < 0 || slot >= PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE) return 0; /* defensive -- shouldn't happen */
 
     /* Release whatever the reused slot held from its previous population
@@ -1148,6 +1177,160 @@ static int l_plugin_http_post(lua_State * L) {
     return 2;
 }
 
+typedef struct {
+    bool active;
+    volatile bool done;
+    bool cancelled;
+    uint16_t generation;
+    pthread_t thread;
+    lua_State * L;
+    int callback_ref;
+    bool is_post;
+    bool verify_tls;
+    char url[2048];
+    char content_type[128];
+    uint8_t * request_body;
+    size_t request_body_size;
+    size_t max_response_size;
+    bool ok;
+    int status;
+    uint8_t * response_body;
+    size_t response_body_size;
+} plugin_async_http_t;
+
+static plugin_async_http_t plugin_async_http[PLUGIN_MAX_ASYNC_HTTP];
+
+static void * plugin_async_http_thread_func(void * arg) {
+    plugin_async_http_t * req = (plugin_async_http_t *) arg;
+    if (req->is_post) {
+        req->ok = http_post_to_buffer_limited(req->url, req->verify_tls, req->content_type, req->request_body,
+                                               req->request_body_size, req->max_response_size, &req->status,
+                                               &req->response_body, &req->response_body_size);
+    } else {
+        req->ok = http_get_to_buffer_limited(req->url, req->verify_tls, req->max_response_size, &req->status,
+                                              &req->response_body, &req->response_body_size);
+    }
+    free(req->request_body);
+    req->request_body = NULL;
+    req->request_body_size = 0;
+    req->done = true;
+    return NULL;
+}
+
+/* plugin.http_request(options, callback) -> handle | nil, error. Network
+ * work happens on a native worker and the callback is invoked only later by
+ * plugin_manager_poll() on the UI/Lua thread. callback(status, body, error):
+ * status/body are nil on failure; error is nil on success. */
+static int l_plugin_http_request(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+
+    int slot = -1;
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        if (!plugin_async_http[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "too many active HTTP requests");
+        return 2;
+    }
+
+    lua_getfield(L, 1, "url");
+    const char * url = luaL_checkstring(L, -1);
+    if (strlen(url) >= sizeof(plugin_async_http[slot].url)) {
+        return luaL_error(L, "plugin.http_request: URL is too long");
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "method");
+    const char * method = luaL_optstring(L, -1, "GET");
+    bool is_post;
+    if (strcasecmp(method, "GET") == 0) is_post = false;
+    else if (strcasecmp(method, "POST") == 0) is_post = true;
+    else return luaL_error(L, "plugin.http_request: method must be GET or POST");
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "body");
+    size_t body_size = 0;
+    const char * body = lua_isnil(L, -1) ? NULL : luaL_checklstring(L, -1, &body_size);
+    if (body_size > PLUGIN_ASYNC_HTTP_MAX_REQUEST) {
+        return luaL_error(L, "plugin.http_request: request body exceeds %u bytes", PLUGIN_ASYNC_HTTP_MAX_REQUEST);
+    }
+    uint8_t * body_copy = NULL;
+    if (body_size > 0) {
+        body_copy = malloc(body_size);
+        if (!body_copy) return luaL_error(L, "plugin.http_request: out of memory");
+        memcpy(body_copy, body, body_size);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "content_type");
+    const char * content_type = luaL_optstring(L, -1, "application/x-www-form-urlencoded");
+    if (strlen(content_type) >= sizeof(plugin_async_http[slot].content_type)) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: content_type is too long");
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "verify_tls");
+    bool verify_tls = lua_isnil(L, -1) ? true : lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "max_response_bytes");
+    lua_Integer requested_max = luaL_optinteger(L, -1, PLUGIN_ASYNC_HTTP_DEFAULT_MAX);
+    lua_pop(L, 1);
+    if (requested_max < 1 || requested_max > PLUGIN_ASYNC_HTTP_MAX_RESPONSE) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: max_response_bytes must be 1..%u",
+                          PLUGIN_ASYNC_HTTP_MAX_RESPONSE);
+    }
+
+    plugin_async_http_t * req = &plugin_async_http[slot];
+    uint16_t generation = (uint16_t) (req->generation + 1);
+    if (generation == 0) generation = 1;
+    memset(req, 0, sizeof(*req));
+    req->generation = generation;
+    req->active = true;
+    req->L = L;
+    req->is_post = is_post;
+    req->verify_tls = verify_tls;
+    req->request_body = body_copy;
+    req->request_body_size = body_size;
+    req->max_response_size = (size_t) requested_max;
+    snprintf(req->url, sizeof(req->url), "%s", url);
+    snprintf(req->content_type, sizeof(req->content_type), "%s", content_type);
+    lua_pushvalue(L, 2);
+    req->callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    if (pthread_create(&req->thread, NULL, plugin_async_http_thread_func, req) != 0) {
+        luaL_unref(L, LUA_REGISTRYINDEX, req->callback_ref);
+        free(req->request_body);
+        req->request_body = NULL;
+        req->active = false;
+        lua_pushnil(L);
+        lua_pushstring(L, "could not start HTTP worker");
+        return 2;
+    }
+
+    int handle = ((int) generation << 8) | (slot + 1);
+    lua_pushinteger(L, handle);
+    return 1;
+}
+
+static int l_plugin_cancel(lua_State * L) {
+    int handle = (int) luaL_checkinteger(L, 1);
+    int slot = (handle & 0xFF) - 1;
+    uint16_t generation = (uint16_t) ((unsigned int) handle >> 8);
+    bool cancelled = false;
+    if (slot >= 0 && slot < PLUGIN_MAX_ASYNC_HTTP) {
+        plugin_async_http_t * req = &plugin_async_http[slot];
+        if (req->active && req->generation == generation) {
+            req->cancelled = true;
+            cancelled = true;
+        }
+    }
+    lua_pushboolean(L, cancelled);
+    return 1;
+}
+
 /* plugin.md5(text) -> lowercase hex string -- thin wrapper around
  * mbedtls_md5(), already vendored and already used exactly this way in
  * subsonic_client.c's own token-auth code, so no new dependency. Needed for
@@ -1167,10 +1350,9 @@ static int l_plugin_md5(lua_State * L) {
 }
 
 /* The single pending plugin.show_text_input() call's on_submit function --
- * mirrors current_list_select_ref's own single-"current"-ref shape, since
- * show_text_entry() (gui.c) is itself a true singleton screen: calling it
- * again before the previous call resolves silently overwrites whichever
- * callback was pending, and on_submit only ever fires on an actual T9
+ * show_text_entry() (gui.c) is itself a true singleton screen. A second
+ * plugin request now returns "text input busy" rather than overwriting this
+ * callback, and Back explicitly releases it. on_submit only fires on a T9
  * keypad Enter, never on the screen's own back button. Documented in
  * PLUGINS.md rather than engineered away, matching this codebase's existing
  * tolerance for show_list()'s own analogous single-ref caveat. */
@@ -1184,14 +1366,17 @@ static int l_plugin_show_text_input(lua_State * L) {
     luaL_checktype(L, 4, LUA_TFUNCTION);
 
     if (pending_text_input_L && pending_text_input_ref != LUA_NOREF) {
-        luaL_unref(pending_text_input_L, LUA_REGISTRYINDEX, pending_text_input_ref);
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "text input busy");
+        return 2;
     }
     lua_pushvalue(L, 4);
     pending_text_input_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     pending_text_input_L = L;
 
     gui_plugin_show_text_input(title, initial_text, is_password);
-    return 0;
+    lua_pushboolean(L, true);
+    return 1;
 }
 
 /* plugin.get_now_playing() -> title, artist, album, duration_seconds, or a
@@ -1382,7 +1567,107 @@ static int l_plugin_clear_interval(lua_State * L) {
     return 0;
 }
 
+static bool plugin_id_is_valid(const char * id) {
+    if (!id || !id[0]) return false;
+    for (const unsigned char * p = (const unsigned char *) id; *p; p++) {
+        if (!( (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+               (*p >= '0' && *p <= '9') || *p == '.' || *p == '_' || *p == '-')) return false;
+    }
+    return true;
+}
+
+/* plugin.define({ id=..., name=..., version=..., api_min=... }) establishes
+ * stable identity before future storage/permission APIs are added. It is
+ * deliberately legal only while this file is executing its top-level code:
+ * identity cannot change after callbacks and resources have been registered. */
+static int l_plugin_define(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    if (loading_plugin_slot < 0 || loading_plugin_slot >= PLUGIN_MAX_FILES ||
+        plugin_instances[loading_plugin_slot].L != L) {
+        return luaL_error(L, "plugin.define may only be called once during plugin loading");
+    }
+    plugin_instance_t * inst = &plugin_instances[loading_plugin_slot];
+    if (inst->defined) return luaL_error(L, "plugin.define may only be called once");
+
+    lua_getfield(L, 1, "id");
+    const char * id = luaL_checkstring(L, -1);
+    if (!plugin_id_is_valid(id) || strlen(id) >= sizeof(inst->id)) {
+        return luaL_error(L, "plugin.define: id must be 1-%zu characters using letters, digits, '.', '_' or '-'",
+                          sizeof(inst->id) - 1);
+    }
+    for (int i = 0; i < plugin_instance_count; i++) {
+        if (i != loading_plugin_slot && plugin_instances[i].defined && strcmp(plugin_instances[i].id, id) == 0) {
+            return luaL_error(L, "plugin.define: duplicate plugin id '%s'", id);
+        }
+    }
+    snprintf(inst->id, sizeof(inst->id), "%s", id);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "name");
+    const char * name = luaL_optstring(L, -1, id);
+    snprintf(inst->name, sizeof(inst->name), "%s", name);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "version");
+    const char * version = luaL_optstring(L, -1, "0");
+    snprintf(inst->version, sizeof(inst->version), "%s", version);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "api_min");
+    lua_Integer api_min = luaL_optinteger(L, -1, 1);
+    lua_pop(L, 1);
+    if (api_min > PLUGIN_API_VERSION) {
+        return luaL_error(L, "plugin '%s' requires API %lld, player provides API %d", id,
+                          (long long) api_min, PLUGIN_API_VERSION);
+    }
+    inst->defined = true;
+    return 0;
+}
+
+static int l_plugin_api_version(lua_State * L) {
+    lua_pushinteger(L, PLUGIN_API_VERSION);
+    return 1;
+}
+
+static const char * const plugin_capabilities[] = {
+    "ui.list", "ui.settings", "ui.row_width", "ui.text_input", "ui.toast", "ui.theme",
+    "filesystem.sd", "playback.control", "playback.state", "playback.events",
+    "library.artist_albums", "network.http.sync", "network.http.async", "crypto.md5", "audio.peq"
+};
+
+static int l_plugin_has_capability(lua_State * L) {
+    const char * requested = luaL_checkstring(L, 1);
+    bool found = false;
+    for (size_t i = 0; i < sizeof(plugin_capabilities) / sizeof(plugin_capabilities[0]); i++) {
+        if (strcmp(requested, plugin_capabilities[i]) == 0) { found = true; break; }
+    }
+    lua_pushboolean(L, found);
+    return 1;
+}
+
+static int l_plugin_get_app_info(lua_State * L) {
+    lua_newtable(L);
+    lua_pushstring(L, "Beta 1"); lua_setfield(L, -2, "version");
+#if defined(TEST_BUILD_TAG)
+    lua_pushstring(L, TEST_BUILD_TAG); lua_setfield(L, -2, "build");
+#elif defined(BUILD_STAMP)
+    lua_pushstring(L, BUILD_STAMP); lua_setfield(L, -2, "build");
+#else
+    lua_pushstring(L, "unknown"); lua_setfield(L, -2, "build");
+#endif
+#ifdef HOST_BUILD
+    lua_pushstring(L, "host");
+#else
+    lua_pushstring(L, "hiby-r1");
+#endif
+    lua_setfield(L, -2, "platform");
+    lua_pushinteger(L, PLUGIN_API_VERSION); lua_setfield(L, -2, "plugin_api");
+    return 1;
+}
+
 static const luaL_Reg plugin_funcs[] = {
+    { "define",                    l_plugin_define },
+    { "api_version",               l_plugin_api_version },
+    { "has_capability",            l_plugin_has_capability },
+    { "get_app_info",              l_plugin_get_app_info },
     { "register_list_item",        l_plugin_register_list_item },
     { "register_stream_media_tile", l_plugin_register_stream_media_tile },
     { "show_list",                 l_plugin_show_list },
@@ -1415,6 +1700,8 @@ static const luaL_Reg plugin_funcs[] = {
     { "get_duration",              l_plugin_get_duration },
     { "http_get",                  l_plugin_http_get },
     { "http_post",                 l_plugin_http_post },
+    { "http_request",              l_plugin_http_request },
+    { "cancel",                    l_plugin_cancel },
     { "md5",                       l_plugin_md5 },
     { "show_text_input",           l_plugin_show_text_input },
     { "get_now_playing",           l_plugin_get_now_playing },
@@ -1437,6 +1724,11 @@ static void register_plugin_api(lua_State * L) {
 static void load_plugin_file(const char * path) {
     lua_State * L = luaL_newstate();
     if (!L) return;
+    int slot = plugin_instance_count;
+    plugin_instance_t * inst = &plugin_instances[slot];
+    memset(inst, 0, sizeof(*inst));
+    inst->L = L;
+    loading_plugin_slot = slot;
     luaL_openlibs(L);
     register_plugin_api(L);
 
@@ -1444,10 +1736,23 @@ static void load_plugin_file(const char * path) {
         const char * err = lua_tostring(L, -1);
         fprintf(stderr, "[plugins] failed to load %s: %s\n", path, err ? err : "unknown error");
         lua_close(L);
+        memset(inst, 0, sizeof(*inst));
+        loading_plugin_slot = -1;
         return;
     }
 
-    plugin_instances[plugin_instance_count++] = L;
+    if (!inst->defined) {
+        const char * base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        snprintf(inst->id, sizeof(inst->id), "legacy.%.*s", (int) sizeof(inst->id) - 8, base);
+        char * dot = strrchr(inst->id, '.');
+        if (dot && strcasecmp(dot, ".lua") == 0) *dot = '\0';
+        snprintf(inst->name, sizeof(inst->name), "%.*s", (int) sizeof(inst->name) - 1, base);
+        snprintf(inst->version, sizeof(inst->version), "0");
+        inst->defined = true;
+    }
+    loading_plugin_slot = -1;
+    plugin_instance_count++;
 }
 
 void plugin_manager_init(void) {
@@ -1470,6 +1775,43 @@ void plugin_manager_init(void) {
     closedir(d);
 }
 
+void plugin_manager_poll(void) {
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        plugin_async_http_t * req = &plugin_async_http[i];
+        if (!req->active || !req->done) continue;
+        pthread_join(req->thread, NULL);
+
+        if (!req->cancelled) {
+            lua_rawgeti(req->L, LUA_REGISTRYINDEX, req->callback_ref);
+            if (req->ok) {
+                lua_pushinteger(req->L, req->status);
+                lua_pushlstring(req->L, req->response_body ? (const char *) req->response_body : "",
+                                req->response_body_size);
+                lua_pushnil(req->L);
+            } else {
+                lua_pushnil(req->L);
+                lua_pushnil(req->L);
+                lua_pushstring(req->L, "network error or response limit exceeded");
+            }
+            if (lua_pcall(req->L, 3, 0, 0) != LUA_OK) {
+                const char * err = lua_tostring(req->L, -1);
+                fprintf(stderr, "[plugins] http_request callback error: %s\n", err ? err : "unknown error");
+                lua_pop(req->L, 1);
+            }
+        }
+
+        luaL_unref(req->L, LUA_REGISTRYINDEX, req->callback_ref);
+        free(req->response_body);
+        req->response_body = NULL;
+        req->response_body_size = 0;
+        req->active = false;
+        req->done = false;
+        req->cancelled = false;
+        req->L = NULL;
+        req->callback_ref = LUA_NOREF;
+    }
+}
+
 /* Shared by plugin_manager_books_list_item_clicked()/_settings_list_item_
  * clicked() below -- kind is just for the stderr message ("books list
  * item"/"settings list item"), so a load-time error in one plugin's row is
@@ -1490,15 +1832,17 @@ static void dispatch_list_item_open(plugin_list_item_t * item, const char * kind
  * every out param at its "unset" value, same tolerance every other
  * out-of-range accessor in this family already has. */
 static void get_list_item_options(const plugin_list_item_t * array, int count, int index, const char ** out_icon,
-                                   int32_t * out_height, const char ** out_text_size) {
+                                   int32_t * out_height, int32_t * out_width, const char ** out_text_size) {
     *out_icon = NULL;
     *out_height = 0;
+    *out_width = 0;
     *out_text_size = NULL;
     if (index < 0 || index >= count) return;
 
     const plugin_list_item_t * item = &array[index];
     if (item->icon_path[0]) *out_icon = item->icon_path;
     *out_height = item->row_height;
+    *out_width = item->row_width;
     if (item->text_size[0]) *out_text_size = item->text_size;
 }
 
@@ -1517,9 +1861,9 @@ void plugin_manager_books_list_item_clicked(int index) {
 }
 
 void plugin_manager_get_books_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                 const char ** out_text_size) {
+                                                 int32_t * out_width, const char ** out_text_size) {
     get_list_item_options(plugin_books_list_items, plugin_books_list_item_count, index, out_icon, out_height,
-                           out_text_size);
+                           out_width, out_text_size);
 }
 
 int plugin_manager_get_settings_list_item_count(void) {
@@ -1537,9 +1881,9 @@ void plugin_manager_settings_list_item_clicked(int index) {
 }
 
 void plugin_manager_get_settings_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                    const char ** out_text_size) {
+                                                    int32_t * out_width, const char ** out_text_size) {
     get_list_item_options(plugin_settings_list_items, plugin_settings_list_item_count, index, out_icon, out_height,
-                           out_text_size);
+                           out_width, out_text_size);
 }
 
 int plugin_manager_get_display_list_item_count(void) {
@@ -1557,9 +1901,9 @@ void plugin_manager_display_list_item_clicked(int index) {
 }
 
 void plugin_manager_get_display_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                   const char ** out_text_size) {
+                                                   int32_t * out_width, const char ** out_text_size) {
     get_list_item_options(plugin_display_list_items, plugin_display_list_item_count, index, out_icon, out_height,
-                           out_text_size);
+                           out_width, out_text_size);
 }
 
 int plugin_manager_get_playback_list_item_count(void) {
@@ -1577,9 +1921,9 @@ void plugin_manager_playback_list_item_clicked(int index) {
 }
 
 void plugin_manager_get_playback_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                    const char ** out_text_size) {
+                                                    int32_t * out_width, const char ** out_text_size) {
     get_list_item_options(plugin_playback_list_items, plugin_playback_list_item_count, index, out_icon, out_height,
-                           out_text_size);
+                           out_width, out_text_size);
 }
 
 int plugin_manager_get_power_list_item_count(void) {
@@ -1597,9 +1941,9 @@ void plugin_manager_power_list_item_clicked(int index) {
 }
 
 void plugin_manager_get_power_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                 const char ** out_text_size) {
+                                                 int32_t * out_width, const char ** out_text_size) {
     get_list_item_options(plugin_power_list_items, plugin_power_list_item_count, index, out_icon, out_height,
-                           out_text_size);
+                           out_width, out_text_size);
 }
 
 int plugin_manager_get_system_list_item_count(void) {
@@ -1617,9 +1961,9 @@ void plugin_manager_system_list_item_clicked(int index) {
 }
 
 void plugin_manager_get_system_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                  const char ** out_text_size) {
+                                                  int32_t * out_width, const char ** out_text_size) {
     get_list_item_options(plugin_system_list_items, plugin_system_list_item_count, index, out_icon, out_height,
-                           out_text_size);
+                           out_width, out_text_size);
 }
 
 /* Shared by plugin_manager_stream_tile_clicked() below (the only remaining
@@ -1659,15 +2003,17 @@ void plugin_manager_stream_tile_clicked(int index) {
     dispatch_tile_open(&plugin_stream_tiles[index]);
 }
 
-void plugin_manager_list_item_selected(int index) {
-    if (!current_list_L || current_list_select_ref == LUA_NOREF) return;
+void plugin_manager_list_item_selected(int slot, int index) {
+    if (slot < 0 || slot >= PLUGIN_LIST_SCREEN_POOL_SIZE) return;
+    plugin_list_callback_t * cb = &plugin_list_callbacks[slot];
+    if (!cb->L || cb->select_ref == LUA_NOREF) return;
 
-    lua_rawgeti(current_list_L, LUA_REGISTRYINDEX, current_list_select_ref);
-    lua_pushinteger(current_list_L, index + 1);
-    if (lua_pcall(current_list_L, 1, 0, 0) != LUA_OK) {
-        const char * err = lua_tostring(current_list_L, -1);
+    lua_rawgeti(cb->L, LUA_REGISTRYINDEX, cb->select_ref);
+    lua_pushinteger(cb->L, index + 1);
+    if (lua_pcall(cb->L, 1, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(cb->L, -1);
         fprintf(stderr, "[plugins] show_list on_select error: %s\n", err ? err : "unknown error");
-        lua_pop(current_list_L, 1);
+        lua_pop(cb->L, 1);
     }
 }
 
@@ -1797,4 +2143,11 @@ void plugin_manager_text_input_submitted(const char * text) {
         lua_pop(L, 1);
     }
     luaL_unref(L, LUA_REGISTRYINDEX, ref);
+}
+
+void plugin_manager_text_input_cancelled(void) {
+    if (!pending_text_input_L || pending_text_input_ref == LUA_NOREF) return;
+    luaL_unref(pending_text_input_L, LUA_REGISTRYINDEX, pending_text_input_ref);
+    pending_text_input_L = NULL;
+    pending_text_input_ref = LUA_NOREF;
 }

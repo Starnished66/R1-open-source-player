@@ -1,3 +1,5 @@
+plugin.define({ id = "example.sound_profiles", name = "Sound Profiles", version = "1.0", api_min = 1 })
+
 -- Sound profile switcher, adds a "Sound Profile" row to Settings -> Playback.
 -- Reference implementation for the plugin.eq_*() API (see PLUGINS.md):
 -- ships a few curated EQ presets on top of this app's own 10-band

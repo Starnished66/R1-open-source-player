@@ -4,6 +4,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#define PLUGIN_API_VERSION 1
+#define PLUGIN_LIST_SCREEN_POOL_SIZE 4
+
 /* Third-party Lua plugin support. Every *.lua file under
  * <SD card>/.plugins/ is loaded into its own lua_State at startup, with a
  * small C API (the `plugin` global table, see plugin_manager.c's own
@@ -161,6 +164,7 @@
  * or empty .plugins folder is not an error; a script that fails to
  * load/run is skipped (logged to stderr) without aborting the others. */
 void plugin_manager_init(void);
+void plugin_manager_poll(void);
 
 /* Rows registered via plugin.register_list_item("books", label, on_open) --
  * gui.c's build_books_screen() appends these after its own 2 built-in rows
@@ -176,9 +180,9 @@ const char * plugin_manager_get_books_list_item_label(int index);
  * offset past the 2 built-in rows by the caller). */
 void plugin_manager_books_list_item_clicked(int index);
 
-/* Reads back row `index`'s optional icon/height/text_size (plugin.
+/* Reads back row `index`'s optional icon/height/width/text_size (plugin.
  * register_list_item()'s 4th `options` arg, PLUGINS.md) -- *out_icon and
- * *out_text_size are set to NULL, *out_height to 0, when index is out of
+ * *out_text_size are set to NULL, and both numeric outputs to 0, when index is out of
  * range or that field was never set, matching "unset" all the way through
  * to screen_builders.c's pill_row_apply_icon()/pill_row_resolve_text_size()
  * (both already treat NULL/0 as "default, don't touch today's look"). One
@@ -186,7 +190,7 @@ void plugin_manager_books_list_item_clicked(int index);
  * data, just avoids tripling the already-6-way repetition of this family's
  * own count/label/clicked trio. */
 void plugin_manager_get_books_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                 const char ** out_text_size);
+                                                 int32_t * out_width, const char ** out_text_size);
 
 /* Same shape as the plugin_manager_*_books_list_item_* family above, for
  * plugin.register_list_item("settings", ...) -- gui.c's build_settings_
@@ -195,7 +199,7 @@ int plugin_manager_get_settings_list_item_count(void);
 const char * plugin_manager_get_settings_list_item_label(int index);
 void plugin_manager_settings_list_item_clicked(int index);
 void plugin_manager_get_settings_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                    const char ** out_text_size);
+                                                    int32_t * out_width, const char ** out_text_size);
 
 /* Same shape again, for plugin.register_list_item("display", ...) -- gui.c's
  * build_settings_display_screen() appends these after its own 4 built-in
@@ -204,7 +208,7 @@ int plugin_manager_get_display_list_item_count(void);
 const char * plugin_manager_get_display_list_item_label(int index);
 void plugin_manager_display_list_item_clicked(int index);
 void plugin_manager_get_display_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                   const char ** out_text_size);
+                                                   int32_t * out_width, const char ** out_text_size);
 
 /* Same shape again, for plugin.register_list_item("playback", ...) -- gui.c's
  * build_settings_playback_screen() appends these after its own 6 built-in
@@ -213,7 +217,7 @@ int plugin_manager_get_playback_list_item_count(void);
 const char * plugin_manager_get_playback_list_item_label(int index);
 void plugin_manager_playback_list_item_clicked(int index);
 void plugin_manager_get_playback_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                    const char ** out_text_size);
+                                                    int32_t * out_width, const char ** out_text_size);
 
 /* Same shape again, for plugin.register_list_item("power", ...) -- gui.c's
  * build_settings_power_screen() appends these after its own built-in rows. */
@@ -221,7 +225,7 @@ int plugin_manager_get_power_list_item_count(void);
 const char * plugin_manager_get_power_list_item_label(int index);
 void plugin_manager_power_list_item_clicked(int index);
 void plugin_manager_get_power_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                 const char ** out_text_size);
+                                                 int32_t * out_width, const char ** out_text_size);
 
 /* Same shape again, for plugin.register_list_item("system", ...) -- gui.c's
  * build_settings_system_screen() appends these after its own built-in rows. */
@@ -229,14 +233,14 @@ int plugin_manager_get_system_list_item_count(void);
 const char * plugin_manager_get_system_list_item_label(int index);
 void plugin_manager_system_list_item_clicked(int index);
 void plugin_manager_get_system_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                  const char ** out_text_size);
+                                                  int32_t * out_width, const char ** out_text_size);
 
 /* Invoked by gui.c's plugin-list-screen row click handler when row `index`
  * (into whatever items table the most recent plugin.show_list() call
  * passed) is tapped -- calls back into that call's on_select Lua function
  * with a 1-based Lua index. No-op if no plugin.show_list() call is still
  * "current" (i.e. none has ever been made yet). */
-void plugin_manager_list_item_selected(int index);
+void plugin_manager_list_item_selected(int slot, int index);
 
 /* Same shape as the plugin_manager_get_tile_* / plugin_manager_tile_clicked
  * family above, but for the separate plugin.register_stream_media_tile()
@@ -290,6 +294,6 @@ void plugin_manager_interval_fired(int slot);
  * plugin_manager.c's l_plugin_show_text_input() for the caveat this
  * inherits from the native singleton screen). */
 void plugin_manager_text_input_submitted(const char * text);
+void plugin_manager_text_input_cancelled(void);
 
 #endif /* PLUGIN_MANAGER_H */
-

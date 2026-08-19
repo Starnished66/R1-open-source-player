@@ -16,6 +16,8 @@
  * self-signed servers the user has explicitly opted to trust (see
  * subsonic_client.h) -- never the default. */
 bool http_get_to_buffer(const char * url, bool verify_tls, int * out_status, uint8_t ** out_body, size_t * out_body_size);
+bool http_get_to_buffer_limited(const char * url, bool verify_tls, size_t max_body_size, int * out_status,
+                                uint8_t ** out_body, size_t * out_body_size);
 
 /* Same contract as http_get_to_buffer() above (false on network/TLS-level
  * failure, true with *out_status set otherwise -- a 4xx/5xx is still a
@@ -28,6 +30,9 @@ bool http_get_to_buffer(const char * url, bool verify_tls, int * out_status, uin
  * Content-Length they imply. *out_body is malloc'd; caller must free() it. */
 bool http_post_to_buffer(const char * url, bool verify_tls, const char * content_type, const uint8_t * body,
                           size_t body_size, int * out_status, uint8_t ** out_body, size_t * out_body_size);
+bool http_post_to_buffer_limited(const char * url, bool verify_tls, const char * content_type, const uint8_t * body,
+                                  size_t body_size, size_t max_body_size, int * out_status, uint8_t ** out_body,
+                                  size_t * out_body_size);
 
 /* Optional progress callback for http_get_to_file: bytes_downloaded so far,
  * and total_bytes from the response's Content-Length header (0 if the

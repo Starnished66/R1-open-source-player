@@ -183,6 +183,10 @@ typedef struct {
      * PILL_ROW_HEIGHT_MIN's own comment for why the PNG can't just stretch. */
     int32_t row_height;
 
+    /* 0 = the native 448px width. Non-zero values are clamped to the
+     * plugin-safe range below and keep the row centered in its list. */
+    int32_t row_width;
+
     /* NULL = this call site's own default (native rows: ui_size_20,
      * unchanged; plugin rows: gui.c always supplies a non-NULL default
      * before this reaches here -- see pill_row_resolve_text_size()'s own
@@ -203,6 +207,8 @@ typedef struct {
  * screen. */
 #define PILL_ROW_HEIGHT_MIN 100
 #define PILL_ROW_HEIGHT_MAX 220
+#define PILL_ROW_WIDTH_MIN 240
+#define PILL_ROW_WIDTH_MAX 464
 
 /* On-screen icon footprint (longest edge, in px) a plugin row's icon targets
  * -- same scaling formula as build_icon_grid_screen()'s own

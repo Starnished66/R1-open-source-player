@@ -1,3 +1,5 @@
+plugin.define({ id = "example.net_radio", name = "Net Radio", version = "1.0", api_min = 1 })
+
 -- Net Radio plugin -- demonstrates plugin.register_stream_media_tile()
 -- (appearing as a real icon-grid tile in Stream Media, next to Subsonic)
 -- together with live http(s):// stream URL playback.

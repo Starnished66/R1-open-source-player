@@ -25,15 +25,16 @@ void gui_show_boot_splash(void);
 /* Repopulates and pushes a shared plugin-list screen (one of a small
  * reusable pool -- see gui.c's own comment on why a pool rather than a
  * single shared screen) showing `labels[0..count)` as plain tappable rows.
- * Tapping row i calls plugin_manager_list_item_selected(i). icon_paths[i]/
+ * Tapping row i calls plugin_manager_list_item_selected(slot, i). icon_paths[i]/
  * text_sizes[i] (either may be NULL wholesale, or contain per-row NULLs) are
  * optional per-row icon (raw absolute filesystem path, see
  * screen_builders.h's pill_row_apply_icon())/text-size ("small"/"medium"/
  * "large", already validated by plugin_manager.c) -- a row with neither set
  * anywhere in this call keeps today's exact plain-label rendering. height
- * (0 = default 84px) applies to every row in this call, not per-row. */
-void gui_plugin_show_list(const char * title, const char * const * labels, const char * const * icon_paths,
-                           const char * const * text_sizes, int32_t height, int count);
+ * (0 = default 84px) applies to every row in this call, not per-row. Returns
+ * the selected screen-pool slot so callbacks can be stored per slot. */
+int gui_plugin_show_list(const char * title, const char * const * labels, const char * const * icon_paths,
+                          const char * const * text_sizes, int32_t height, int32_t width, int count);
 
 /* Repopulates and pushes a shared plugin-settings-list screen -- a SEPARATE
  * pool from gui_plugin_show_list()'s own (PLUGIN_SETTINGS_LIST_SCREEN_POOL_
@@ -42,7 +43,7 @@ void gui_plugin_show_list(const char * title, const char * const * labels, const
  * arrays, row_types[i] one of PLUGIN_SETTINGS_ROW_TAP/_TOGGLE/_SLIDER
  * (plugin_manager.h) -- toggle_initial[]/slider_min[]/slider_max[]/
  * slider_value[] are read only for the matching row type, ignored (may be
- * garbage) otherwise. icon_paths[i]/heights[i]/text_sizes[i] are the same
+ * garbage) otherwise. icon_paths[i]/heights[i]/widths[i]/text_sizes[i] are the same
  * per-row options as gui_plugin_show_list() above, except height IS per-row
  * here (ignored for a "slider" row -- see screen_builders.h's PILL_ROW_
  * HEIGHT_MIN comment for why a resized row needs a different background,
@@ -52,7 +53,7 @@ void gui_plugin_show_list(const char * title, const char * const * labels, const
 int gui_plugin_show_settings_list(const char * title, const int * row_types, const char * const * labels,
                                    const bool * toggle_initial, const int * slider_min, const int * slider_max,
                                    const int * slider_value, const char * const * icon_paths, const int32_t * heights,
-                                   const char * const * text_sizes, int count);
+                                   const int32_t * widths, const char * const * text_sizes, int count);
 
 /* Starts playback of a brand-new playlist built from `paths[0..count)`,
  * starting at paths[start_index] -- same "starting something new clears

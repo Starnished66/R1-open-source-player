@@ -1,3 +1,5 @@
+plugin.define({ id = "example.themes", name = "Themes", version = "1.0", api_min = 1 })
+
 -- Light/Dark theme switcher, adds a "Theme" row to Settings -> Display.
 -- White reskins the app with the stock firmware's own theme1 icon set
 -- (theme1 is the light variant of the same litegui asset pack this app's

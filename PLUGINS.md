@@ -79,6 +79,34 @@ Every function below is a field on the global `plugin` table, available
 from the moment your script starts running (injected before
 `luaL_dofile()`). All of it is implemented in `src/plugins/plugin_manager.c`.
 
+### Identity, API version, and capability discovery
+
+New plugins should declare identity once, at the start of their top-level
+script:
+
+```lua
+plugin.define({
+    id = "org.example.my_plugin",
+    name = "My Plugin",
+    version = "1.0.0",
+    api_min = 1,
+})
+```
+
+`id` is a stable identifier using letters, digits, `.`, `_`, and `-`; it must
+be unique among loaded plugins. `api_min` rejects the plugin at load time when
+the player API is too old. Existing plugins without `define()` remain supported
+as legacy plugins using an identity derived from their filename.
+
+- `plugin.api_version()` returns the current integer plugin API version.
+- `plugin.has_capability(name)` reports whether an optional interface exists.
+  API 1 includes `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`,
+  `ui.theme`, `filesystem.sd`, `playback.control`, `playback.state`,
+  `playback.events`, `library.artist_albums`, `network.http.sync`, `network.http.async`,
+  `crypto.md5`, and `audio.peq`.
+- `plugin.get_app_info()` returns `version`, `build`, `platform`, and
+  `plugin_api` fields.
+
 ### `plugin.register_list_item(list_id, label, on_open [, options])`
 
 Adds a row to an existing native list screen.
@@ -91,7 +119,7 @@ Adds a row to an existing native list screen.
 - `on_open` (function): called with zero arguments when the row is tapped.
   This is where you'd call `plugin.show_list()` or
   `plugin.show_settings_list()` to show your first screen.
-- `options` (table, optional): `{ icon = "...", height = n, text_size =
+- `options` (table, optional): `{ icon = "...", height = n, width = n, text_size =
   "..." }` -- see "Row images, resizing, and text size" below for all
   three.
 
@@ -207,7 +235,7 @@ Opens a list screen.
 - `on_select` (function): called with the **1-based** index of whichever
   row was tapped (Lua array convention, not C's 0-based one) when the user
   taps a row. Not called if the user backs out without tapping anything.
-- `options` (table, optional): `{ height = n }` -- resizes every row in
+- `options` (table, optional): `{ height = n, width = n }` -- resizes every row in
   this call (not per-row -- a plain browsing list mixing wildly different
   row heights would look broken in a way an occasional taller settings-
   submenu row doesn't).
@@ -221,14 +249,9 @@ Nesting more than 4 levels deep reuses an earlier pool slot and will
 corrupt back-navigation at that depth; no real plugin should need to nest
 that far.
 
-Only the **most recently opened** `show_list` call's `on_select` is
-"live" -- if your plugin has two list screens open at once (one pushed on
-top of the other) and the user backs out to the first, tapping a row there
-will still route through this most-recent registration until that first
-screen calls `show_list` again itself. In practice, structuring your
-plugin as "each screen's `on_select` immediately calls `show_list` again
-for the next screen" (exactly what `Audiobooks.lua` does) avoids ever
-hitting this.
+Each pool slot owns its own `on_select` callback. Backing out of a nested list
+therefore restores the earlier screen and its correct callback. Reusing a slot
+beyond four simultaneously stacked plugin lists remains unsupported.
 
 ### `plugin.show_settings_list(title, items)`
 
@@ -256,7 +279,7 @@ itself a small settings panel (see `plugins_examples/PlaybackExtras.lua`).
     Volume, the EQ bands) already uses, so a callback that writes to disk
     isn't hammered mid-drag.
 
-  Every row type also accepts `icon`, `height`, and `text_size` (see "Row
+  Every row type also accepts `icon`, `height`, `width`, and `text_size` (see "Row
   images, resizing, and text size" below) -- except `height` on a
   `"slider"` row, which is ignored (its card has its own fixed layout with
   no spare room to grow into).
@@ -292,8 +315,9 @@ silently dropped.
 ### Row images, resizing, and text size
 
 `register_list_item()`'s `options` table, `show_list()`'s per-row table
-entries, and `show_settings_list()`'s per-row tables all accept the same
-three optional fields:
+entries, and `show_settings_list()`'s per-row tables support these optional
+layout fields. For `show_list()`, width and height live in the call-level
+`options` table so every browsing row stays uniform:
 
 - **`icon`** (string) -- either a **raw absolute filesystem path**, e.g.
   `plugin.sd_root() .. "/.plugins/my_icon.png"` -- **not** a theme2-relative
@@ -314,6 +338,12 @@ three optional fields:
   function's own section above) -- everywhere else, an unset/zero height
   keeps that row type's own default (124px for a pill/`register_list_item`
   row, 84px for a plain `show_list` row).
+- **`width`** (number, px) -- resizes and keeps the row centered. It is
+  available for native-list plugin rows, `show_list()` rows, and every
+  `show_settings_list()` row including sliders. Values are clamped to
+  240-464px; unset/zero keeps the native width. Resizing a pill row replaces
+  its fixed-size background sprite with the matching rounded fill so the
+  artwork is never stretched.
 - **`text_size`** (string) -- `"small"`, `"medium"`, or `"large"`. Every
   size uses a font with full non-Latin fallback (Cyrillic, CJK, Korean,
   Thai) -- correct for plugin-authored text, which (unlike this app's own
@@ -524,6 +554,46 @@ pass `"application/json"` or anything else your target API needs. `body` is
 sent as-is, byte for byte -- this function doesn't URL-encode or otherwise
 transform it, so build the string yourself first.
 
+### `plugin.http_request(options, callback)` / `plugin.cancel(handle)`
+
+Preferred non-blocking HTTP interface. It returns a request handle immediately;
+DNS, connection, TLS, upload, and response reads happen on a native worker.
+`callback(status, body, error)` is later invoked on the main Lua/UI thread.
+On success, `status` and the binary-safe `body` are set and `error` is `nil`.
+On failure, `status` and `body` are `nil` and `error` describes the failure.
+
+```lua
+local handle, err = plugin.http_request({
+    url = "https://example.com/api",
+    method = "POST", -- GET or POST; GET is the default
+    body = '{"hello":"world"}',
+    content_type = "application/json",
+    verify_tls = true,
+    max_response_bytes = 262144,
+}, function(status, body, request_error)
+    if request_error then
+        plugin.show_toast(request_error)
+        return
+    end
+    plugin.show_toast("HTTP " .. status .. ", " .. #body .. " bytes")
+end)
+```
+
+`max_response_bytes` defaults to 512 KiB and may be 1 byte through 2 MiB.
+Request bodies are capped at 1 MiB. At most four asynchronous requests may be
+active across all plugins. The returned handle includes a generation number,
+so a stale handle cannot affect a newer request that reused the pool slot.
+
+`plugin.cancel(handle)` returns whether it matched an active request. It
+suppresses that request's callback and releases its resources when the native
+operation returns. Cancellation is currently logical rather than a forced
+socket close, so the occupied worker slot is not reusable until the underlying
+connection finishes or times out.
+
+The older `http_get()` and `http_post()` remain available for compatibility,
+but run synchronously on the UI thread. New plugins should use
+`http_request()`.
+
 ### `plugin.md5(text)`
 
 Returns the MD5 hash of `text` as a lowercase hex string. Bridges
@@ -546,14 +616,11 @@ used for Wi-Fi passwords and Subsonic server login.
 **`on_submit` is not called if the user backs out instead of submitting** --
 not with an empty string, not at all. Don't assume it always fires.
 
-This is a **true singleton screen**: calling `show_text_input()` again
-before a previous call's `on_submit` has fired silently replaces the
-pending callback. Chaining calls from within `on_submit` itself (e.g. "ask
-for a username, then in that callback ask for a password") is exactly what
-this is for and works fine, since each call resolves before the next one
-happens. Two unrelated plugins racing to show text input at the same moment
-would stomp each other, same as any two native callers of this same screen
-already would.
+This is a **true singleton screen**. The call returns `true` when it opens, or
+`false, "text input busy"` if another plugin request is pending. Cancelling
+with Back releases ownership. Chaining calls from within `on_submit` itself
+(for example username followed by password) works because the first request is
+released before its callback runs.
 
 ### `plugin.get_now_playing()`
 
@@ -700,14 +767,29 @@ path) and the "About" row's `text_size = "large"`.
 
 `plugins_examples/LastFmScrobbler.lua` is the reference implementation for
 `plugin.on()`, `set_interval()`/`clear_interval()`, `get_now_playing()`,
-`http_post()`, `md5()`, and `show_text_input()` together -- a real Last.fm
+`http_request()`, `md5()`, and `show_text_input()` together -- a real Last.fm
 scrobbler. Logs in via `show_text_input()` (username, then password,
 chained), signs and POSTs `auth.getMobileSession` to obtain a session key
 (persisted; the password itself isn't), sends `track.updateNowPlaying` on
 every `"track_started"` event, and uses a 15-second `set_interval()` to
 POST `track.scrobble` once `get_position()` crosses Last.fm's own "50% or 4
-minutes played" threshold. Requires a free Last.fm API account -- see the
-plugin's own header comment for where to get one and where to put the key.
+minutes played" threshold. Every request is asynchronous, so a slow Last.fm
+connection cannot freeze touch input. A scrobble is marked complete only after
+Last.fm accepts it; failures remain eligible for retry. Requires a free Last.fm
+API account -- see the plugin's own header comment for where to get one and
+where to put the key.
+
+`plugins_examples/AsyncHttp.lua` is a compact `http_request()` and `cancel()`
+example. It starts a bounded HTTPS GET, demonstrates that the UI remains
+responsive, reports its completion callback, and offers a separate cancel row.
+
+`plugins_examples/PluginApiInfo.lua` demonstrates `define()`, `api_version()`,
+`get_app_info()`, and `has_capability()` by presenting the current build and a
+few optional interfaces in a list.
+
+`plugins_examples/NestedLists.lua` exercises the corrected per-screen callback
+ownership: open a child list, go Back, and the parent callback remains active.
+It also demonstrates the success/busy return contract of `show_text_input()`.
 
 ## Writing and testing your own plugin
 

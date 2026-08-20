@@ -74,6 +74,10 @@ static bool cache_valid = false;
 #define BATTERY_DISPLAY_STABLE_MS 15000L
 #define BATTERY_DISPLAY_STEP_MS 60000L
 
+/* A gap this large or bigger, once stable, is treated as a real change
+ * rather than gauge jitter -- see its own use below. */
+#define BATTERY_DISPLAY_JUMP_THRESHOLD 5
+
 static int display_capacity = -1;
 static int display_candidate = -1;
 static bool display_powered = false;
@@ -182,18 +186,37 @@ int battery_get_display_percent(void) {
         } else if (strcmp(cached_status, "Full") == 0 && raw >= 99) {
             display_capacity = 100;
             display_last_step = now;
-        } else if (elapsed_ms(now, display_candidate_since) >= BATTERY_DISPLAY_STABLE_MS &&
-                   elapsed_ms(now, display_last_step) >= BATTERY_DISPLAY_STEP_MS) {
-            if (powered && display_candidate > display_capacity) {
-                display_capacity++;
+        } else if (elapsed_ms(now, display_candidate_since) >= BATTERY_DISPLAY_STABLE_MS) {
+            /* Opposite-direction candidates are deliberately ignored below:
+             * battery state cannot physically rise while discharging or
+             * fall while charging, and those reversals are the reported
+             * gauge noise. */
+            bool valid_direction = (powered && display_candidate > display_capacity) ||
+                                   (!powered && display_candidate < display_capacity);
+            int gap = powered ? display_candidate - display_capacity : display_capacity - display_candidate;
+
+            if (valid_direction && gap >= BATTERY_DISPLAY_JUMP_THRESHOLD) {
+                /* Real-device bug report: the displayed percent stayed
+                 * stuck (e.g. showing 74% with the real battery already at
+                 * 85%) for many minutes -- confirmed only correcting itself
+                 * on an app restart, which resets this whole static state
+                 * and snaps straight to the real reading (the
+                 * display_capacity < 0 branch above). Root cause: a gap
+                 * this size, once stable, is a real change (a long charge
+                 * session, or the battery moving while asleep and this
+                 * simply not being polled to catch it as it happened) --
+                 * but the 1-point-per-BATTERY_DISPLAY_STEP_MS climb below
+                 * would take many minutes to catch up to it regardless.
+                 * Snap straight to the real reading once it's been stable
+                 * this long (still filters a single noisy sample, just not
+                 * a genuinely sustained gap this large). */
+                display_capacity = raw;
                 display_last_step = now;
-            } else if (!powered && display_candidate < display_capacity) {
-                display_capacity--;
+            } else if (valid_direction && elapsed_ms(now, display_last_step) >= BATTERY_DISPLAY_STEP_MS) {
+                if (powered) display_capacity++;
+                else display_capacity--;
                 display_last_step = now;
             }
-            /* Opposite-direction values are deliberately ignored: battery
-             * state cannot physically rise while discharging or fall while
-             * charging, and those reversals are the reported gauge noise. */
         }
     }
 

@@ -20,6 +20,7 @@
 #include "subsonic_client.h"
 #include "http_client.h"
 #include "cover_decode.h"
+#include "lyrics.h"
 #include "wifi_control.h"
 #include "bluetooth_control.h"
 #include "hiby_sys_server.h"
@@ -182,6 +183,7 @@ static lv_obj_t * books_screen;
 static lv_obj_t * about_screen;
 static lv_obj_t * accent_color_screen;
 static lv_obj_t * player_screen;
+static lv_obj_t * lyrics_screen;
 static lv_obj_t * settings_screen;
 static lv_obj_t * settings_playback_screen;
 static lv_obj_t * settings_display_screen;
@@ -272,6 +274,27 @@ static lv_image_dsc_t current_cover_dsc;
  * player_overlay_panel's background. */
 static uint8_t * current_reflection_bytes;
 static lv_image_dsc_t current_reflection_dsc;
+
+/* ---- Fullscreen lyrics view state -- see build_lyrics_screen() and the
+ * async .lrc load / backdrop generation just above poll_cover_decode()'s
+ * own section. All declared here (rather than local to whichever function
+ * first uses them) for the same reason cover_img/current_cover_bytes above
+ * are: the async load/poll functions and the screen builder that actually
+ * creates the LVGL objects live in different parts of this file, and every
+ * static in this file is visible to all of them regardless of definition
+ * order. ---- */
+static lyrics_doc_t current_lyrics_doc;
+static bool current_lyrics_doc_valid = false;
+static int current_lyrics_doc_for_index = -1; /* playlist_index current_lyrics_doc was loaded for */
+
+static lv_obj_t * lyrics_backdrop_img;
+static lv_obj_t * lyrics_list;
+static lv_obj_t * lyrics_spacer;
+static lv_obj_t * lyrics_empty_label;
+static lv_timer_t * lyrics_timer;
+static uint8_t * current_lyrics_backdrop_bytes;
+static lv_image_dsc_t current_lyrics_backdrop_dsc;
+
 static bool favorite_is_set = false;
 static lv_obj_t * volume_slider;
 /* Clock, top bar center: real topbar/N.png digit + topbar/colon.png
@@ -353,11 +376,11 @@ static int playlist_index = -1;
 
 /* Non-NULL only while playing from the whole, unfiltered All Songs list --
  * see on_file_selected_lazy_all_songs()'s own comment for why. playlist[i]
- * == NULL means "not resolved yet"; playlist_path_at() (defined once
- * all_songs_paths/all_songs_sort_order are in scope, forward-declared
- * below) resolves it to playlist_lazy_sort_order[i]'s position in
- * all_songs_sort_order, strdup()s it into playlist[i], and from then on
- * that slot is a completely ordinary owned entry. Kept the same length as
+ * == NULL means "not resolved yet"; playlist_path_at() (forward-declared
+ * below) resolves playlist_lazy_sort_order[i] to a real path via a single-
+ * row DB query (the DB's own title-sorted order, offset by that value),
+ * strdup()s it into playlist[i], and from then on that slot is a
+ * completely ordinary owned entry. Kept the same length as
  * playlist[] itself by queue_add_song()/queue_remove_song_at_offset()/
  * delete_song_confirm_cb() -- the only three places that resize or shift
  * playlist[] after creation -- so every still-unresolved slot keeps
@@ -383,26 +406,16 @@ static int * playlist_lazy_sort_order = NULL;
 static int queued_pending_count = 0;
 static int queue_next_insert_index = -1; /* -1 = nothing pending, next add goes right after playlist_index */
 
-/* Index into all_songs_paths/all_song_tags (NOT playlist[]/playlist_index --
- * those track the CURRENT PLAYBACK QUEUE's own position, which for Group
- * Songs/Files/Subsonic playback isn't an index into the whole-library
- * arrays at all) for whichever song is currently playing, or -1 if nothing
- * is (or the current track isn't part of the local library, e.g. an
- * Airplay/DLNA source). Set once per real track-start in apply_track_
- * metadata_to_ui(). This is the single source of truth every now-playing
- * indicator (Artists/Albums/All Songs/group-songs rows) reads from --
- * see refresh_now_playing_indicators() below. */
-static int now_playing_song_index = -1;
-
-/* The same "currently playing" identity as now_playing_song_index above,
- * but by path instead of an all_songs_paths array index -- set at the same
- * place (apply_track_metadata_to_ui()), from the same local `path`, so it's
- * available even when all_songs_paths/all_song_tags haven't been loaded
- * (empty string, never matches anything, same graceful-degradation shape
- * now_playing_song_index's own -1 already has). group_songs_screen's own
- * now-playing indicator uses this instead of the array-index version, since
- * its rows are group_song_entry_t (owned paths) now, not array indices --
- * see that struct's own comment. */
+/* Path of whichever song is currently playing, or an empty string if
+ * nothing is (or the current track isn't part of the local library, e.g.
+ * an Airplay/DLNA source). Set once per real track-start in apply_track_
+ * metadata_to_ui(), from that function's own local `path`. This is the
+ * single source of truth every now-playing indicator (Artists/Albums/All
+ * Songs/group-songs rows) reads from -- each resolves it to a display
+ * position via its own DB query (metadata_db_get_group_offset()/
+ * metadata_db_get_song_title_offset()/a direct path comparison), rather
+ * than an in-memory array index -- see refresh_now_playing_indicators()
+ * below. */
 static char now_playing_path[600] = "";
 
 /* Where the current playlist came from -- the player screen's "List" menu
@@ -425,7 +438,7 @@ typedef enum {
 
 static player_source_kind_t player_source_kind = PLAYER_SOURCE_NONE;
 
-static int player_source_all_songs_index = -1; /* row index into all_songs_list / all_songs_sort_order */
+static int player_source_all_songs_index = -1; /* row index into all_songs_list -- the DB's own title-sorted order */
 
 /* Own copy of the group's song entries at the moment playback started --
  * group_songs_entries/count/title_label themselves just describe
@@ -1360,7 +1373,21 @@ static void refresh_battery_topbar(void) {
     }
     if (percent > 100) percent = 100;
 
-    bool charging = !charge_limiter_holding && battery_is_charging();
+    /* Real-device bug report: the charging bolt disappeared as soon as the
+     * 85% limiter was enabled, well before the battery actually got there.
+     * Root cause: charge_limiter_holding tracks charge_limiter.c's own
+     * hysteresis state, which flips true one point EARLY (at 84%, see
+     * CHARGE_LIMITER_TRIGGER_PERCENT's own comment -- deliberate, to absorb
+     * fuel-gauge lag before the real 85% cutoff) and, being sticky
+     * hysteresis, can stay true from a previous session even once the
+     * displayed percent has since dropped a little without crossing the
+     * lower CHARGE_LIMITER_RESUME_PERCENT reset point. Neither case means
+     * the battery has actually reached the 85% this UI promises -- only
+     * suppress the charging icon once the displayed percent has genuinely
+     * gotten there too, matching what's on screen rather than the internal
+     * hysteresis flag alone. */
+    bool limiter_capped_now = charge_limiter_holding && percent >= 85;
+    bool charging = !limiter_capped_now && battery_is_charging();
     bool low = !charging && percent < 5;
 
     lv_image_set_src(battery_icon_frame,
@@ -2620,15 +2647,12 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
             quick_drawer_drag_tracking = true;
             quick_drawer_drag_panel_start_y = lv_obj_get_y(quick_drawer);
         } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !library_rescan_active) {
-            /* !library_rescan_active -- opening the drawer mid-rescan reads
-             * now-playing song state (quick_drawer_title_label/_artist_label
-             * etc.) from the same all_songs/all_song_tags arrays
-             * library_scan_once() frees and reallocates while a rescan runs
-             * (see free_library_scan_state()'s own comment) -- confirmed
-             * live as a crash. Only blocks starting a NEW open-drag; if the
-             * drawer somehow got dragged open right as a rescan started, the
-             * quick_drawer_open branch above still lets it be dragged closed
-             * again, which touches none of that data. */
+            /* !library_rescan_active -- same exclusion as the other rescan-
+             * time guards below (search this file for library_rescan_active
+             * for the rest of them); only blocks starting a NEW open-drag,
+             * if the drawer somehow got dragged open right as a rescan
+             * started, the quick_drawer_open branch above still lets it be
+             * dragged closed again. */
             quick_drawer_drag_tracking = true;
             quick_drawer_drag_panel_start_y = lv_obj_get_y(quick_drawer);
             lv_obj_move_foreground(quick_drawer); /* above regular screens/volume popup while dragging into view */
@@ -2672,6 +2696,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         home_swipe_tracking = current_settings.swipe_up_home_enabled && !quick_drawer_open &&
                                lv_screen_active() != bt_dac_overlay_screen &&
                                lv_screen_active() != usb_dac_overlay_screen &&
+                               lv_screen_active() != lyrics_screen &&
                                !library_rescan_active &&
                                p.y >= h - HOME_INDICATOR_BAND_HEIGHT;
         home_swipe_start_y = p.y;
@@ -2691,9 +2716,14 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * CANDIDATE, not yet a confirmed drag. Also excluded while
          * library_rescan_active, same reasoning as the quick-drawer/
          * home-swipe exclusions above -- this is the last remaining swipe
-         * gesture that could navigate off the rescan's busy screen. */
+         * gesture that could navigate off the rescan's busy screen. Also
+         * excluded on lyrics_screen -- real-device feedback: triggering
+         * this gesture from a screen that's already reached FROM the
+         * player screen looked like a broken, looping transition; lyrics_
+         * gesture_event_cb() is the only swipe this screen responds to. */
         player_swipe_candidate = !quick_drawer_drag_tracking && !quick_drawer_open &&
                                   lv_screen_active() != player_screen &&
+                                  lv_screen_active() != lyrics_screen &&
                                   !library_rescan_active &&
                                   !player_swipe_press_excluded(p);
         player_swipe_touch_start_x = p.x;
@@ -3675,9 +3705,9 @@ static void free_playlist(void) {
     playlist_lazy_sort_order = NULL;
 }
 
-/* Defined with the rest of the All Songs screen, much further down (needs
- * all_songs_paths/all_songs_sort_order already in scope) -- forward-
- * declared here since every reader of playlist[]'s actual STRING CONTENT
+/* Defined further down, with the rest of the lazy-All-Songs-queue
+ * machinery -- forward-declared here since every reader of playlist[]'s
+ * actual STRING CONTENT
  * between here and there (favorite toggle, gapless preload, play_track_at_
  * from, ...) must resolve through it rather than indexing playlist[]
  * directly, or a lazy All-Songs queue's unresolved NULL slots would crash
@@ -4255,6 +4285,8 @@ static void launch_cover_decode_from_url(int for_index, const char * url, bool v
     launch_cover_decode_req(r);
 }
 
+static void launch_lyrics_backdrop_decode(void); /* defined alongside build_lyrics_screen() below -- see poll_cover_decode()'s own use of it */
+
 /* Called every tick from update_timer_cb. Applies the finished decode to
  * cover_img/player_overlay_panel -- unless playlist_index has already moved
  * on to a different track by the time this lands (another launch_cover_
@@ -4332,6 +4364,23 @@ static void poll_cover_decode(void) {
         current_reflection_dsc.data = current_reflection_bytes;
         current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * REFLECTION_HEIGHT * 2;
         lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
+
+        /* Bug report: the lyrics screen's blurred backdrop could still show
+         * the PREVIOUS track's art even after its own regenerate-pending
+         * retry ran, because that retry read whatever current_cover_bytes
+         * held at that moment -- and this decode (the one that actually
+         * updates current_cover_bytes for the new track) can easily still
+         * be in flight when the retry fires, since the two run on
+         * independent async pipelines with no ordering between them. This
+         * is the one place current_cover_bytes is ever updated for a new
+         * track, so triggering the refresh from here (rather than from
+         * lyrics_timer_cb()'s own earlier, opportunistic attempt) is the
+         * only way to guarantee it always runs against the CORRECT art.
+         * launch_lyrics_backdrop_decode() itself already no-ops if a
+         * generation happens to already be running (marking it pending
+         * instead, same as any other caller), so this is safe to call
+         * unconditionally whenever the lyrics screen is open. */
+        if (lv_screen_active() == lyrics_screen) launch_lyrics_backdrop_decode();
     }
 
     cover_decode_result_pixels = NULL;
@@ -4356,6 +4405,290 @@ static void poll_cover_decode(void) {
          * the buffer. */
         cover_decode_pending.picture_data = NULL;
         cover_decode_pending.picture_size = 0;
+    }
+}
+
+/* ---- Lyrics: async .lrc load ------------------------------------------
+ * Deliberately independent from the cover-decode pipeline above, despite
+ * both running off the UI thread and both being triggered from the same
+ * track-change call site (apply_track_metadata_to_ui() below): this job
+ * only reads a small text sidecar (lyrics_load_sidecar(), bounded at
+ * LYRICS_MAX_FILE_BYTES) rather than decoding/blurring image data, and
+ * runs eagerly on every track change (not lazily like the backdrop below)
+ * so lyrics are already parsed by the time the user taps the album art.
+ * Same "background thread writes then sets a volatile done flag last, poll
+ * function on the UI thread only reads after seeing it" contract as
+ * cover_decode_done_flag above, and the same "at most one job in flight,
+ * a track change arriving mid-load replaces the pending request rather
+ * than queuing" shape as launch_cover_decode_req()'s cover_decode_pending. ---- */
+
+typedef struct {
+    int generation;
+    int for_index;
+    char track_path[PATH_MAX];
+} lyrics_load_request_t;
+
+static pthread_t lyrics_load_thread;
+static bool lyrics_load_active = false;
+static volatile bool lyrics_load_done_flag = false;
+static int lyrics_load_result_generation;
+static int lyrics_load_result_for_index;
+static bool lyrics_load_result_ok;
+static lyrics_doc_t lyrics_load_result_doc;
+
+/* Bumped on every launch_lyrics_load() call (both a real track change and
+ * the internal pending-relaunch below) -- the identity a finished result is
+ * checked against in poll_lyrics_load(), not playlist_index. playlist_index
+ * is a numeric SLOT, not a track identity: if the whole playlist is
+ * replaced (a different album/Subsonic queue/etc. loaded) while a load is
+ * still in flight, the new playlist's own track at that same slot number
+ * can easily be a completely different song, and an index-only check would
+ * wrongly accept the stale result for it. A strictly increasing counter
+ * has no such collision. */
+static int lyrics_load_generation = 0;
+
+static bool lyrics_load_pending_valid = false;
+static int lyrics_load_pending_for_index;
+static char lyrics_load_pending_path[PATH_MAX];
+
+static void * lyrics_load_thread_func(void * arg) {
+    lyrics_load_request_t * req = (lyrics_load_request_t *) arg;
+    lyrics_doc_t doc;
+    bool ok = lyrics_load_sidecar(req->track_path, &doc);
+
+    lyrics_load_result_generation = req->generation;
+    lyrics_load_result_for_index = req->for_index;
+    lyrics_load_result_ok = ok;
+    if (ok) lyrics_load_result_doc = doc;
+    free(req);
+    lyrics_load_done_flag = true; /* written last -- poll_lyrics_load() only checks this flag */
+    return NULL;
+}
+
+static void launch_lyrics_load(int for_index, const char * track_path) {
+    lyrics_load_generation++;
+    if (lyrics_load_active) {
+        lyrics_load_pending_for_index = for_index;
+        snprintf(lyrics_load_pending_path, sizeof(lyrics_load_pending_path), "%s", track_path);
+        lyrics_load_pending_valid = true;
+        return;
+    }
+
+    lyrics_load_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
+    req->generation = lyrics_load_generation;
+    req->for_index = for_index;
+    snprintf(req->track_path, sizeof(req->track_path), "%s", track_path);
+    lyrics_load_done_flag = false;
+    lyrics_load_active = true;
+    if (pthread_create(&lyrics_load_thread, NULL, lyrics_load_thread_func, req) != 0) {
+        free(req);
+        lyrics_load_active = false;
+    }
+}
+
+/* Called every tick from update_timer_cb, same as poll_cover_decode() --
+ * regardless of whether the lyrics screen is actually open, so a load
+ * finishes well before the user ever taps the album art. Deliberately does
+ * not touch any lyrics-screen LVGL object directly (unlike poll_cover_
+ * decode(), which owns cover_img/player_overlay_panel outright) -- open_
+ * lyrics_screen() and lyrics_timer_cb() below independently notice when
+ * current_lyrics_doc_for_index no longer matches what the pool was last
+ * built from and resync from scratch at that point, so there is exactly
+ * one place that reconciles the parsed doc with the on-screen pool. */
+static void poll_lyrics_load(void) {
+    if (!lyrics_load_active || !lyrics_load_done_flag) return;
+    lyrics_load_active = false;
+    pthread_join(lyrics_load_thread, NULL);
+
+    if (lyrics_load_result_generation == lyrics_load_generation) {
+        if (current_lyrics_doc_valid) lyrics_doc_free(&current_lyrics_doc);
+        current_lyrics_doc_valid = lyrics_load_result_ok;
+        if (lyrics_load_result_ok) current_lyrics_doc = lyrics_load_result_doc;
+        current_lyrics_doc_for_index = lyrics_load_result_for_index;
+    } else if (lyrics_load_result_ok) {
+        lyrics_doc_free(&lyrics_load_result_doc); /* stale -- superseded by a later launch before this landed */
+    }
+
+    if (lyrics_load_pending_valid) {
+        lyrics_load_pending_valid = false;
+        launch_lyrics_load(lyrics_load_pending_for_index, lyrics_load_pending_path);
+    }
+}
+
+/* ---- Lyrics: fullscreen blurred backdrop ------------------------------
+ * Generated lazily -- only when the lyrics screen actually opens (see
+ * open_lyrics_screen()) -- rather than eagerly per track change like cover
+ * art/reflection above: most tracks' lyrics view is never opened, and this
+ * needs nothing the async load above produces, just the already-decoded
+ * current_cover_bytes. A private copy is taken up front (cover_copy below)
+ * rather than reading current_cover_bytes directly from the background
+ * thread, since poll_cover_decode() can free and replace that pointer out
+ * from under a still-running backdrop job on a rapid track change. ---- */
+
+#define LYRICS_BACKDROP_WIDTH 480
+#define LYRICS_BACKDROP_HEIGHT 800
+/* Lighter than REFLECTION_DARKEN_NUM/DEN (1/4) -- build_lyrics_screen()
+ * layers a flat semi-transparent dark overlay on top of this at composite
+ * time for readable text contrast regardless of the source art, so
+ * darkening heavily here too would just make the backdrop needlessly
+ * murky underneath it. */
+#define LYRICS_BACKDROP_DARKEN_NUM 1
+#define LYRICS_BACKDROP_DARKEN_DEN 2
+
+typedef struct {
+    uint8_t * cover_copy; /* owned COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565 copy */
+} lyrics_backdrop_request_t;
+
+static pthread_t lyrics_backdrop_thread;
+static bool lyrics_backdrop_active = false;
+static volatile bool lyrics_backdrop_done_flag = false;
+static uint8_t * lyrics_backdrop_result_bytes;
+
+/* Same pixel-math shape as compute_reflection_bytes() above (unpack RGB565
+ * to 8-bit planes, separable box blur via box_blur_1d(), darken, repack) --
+ * pure, no LVGL/shared-state touch, safe on a background thread -- but
+ * sized for the full screen and built by a nearest-neighbor vertical
+ * stretch of the COVER_ART_WIDTH x COVER_ART_HEIGHT source rather than a
+ * crop, since cover art is square and the screen isn't. */
+static uint8_t * compute_lyrics_backdrop_bytes(const uint8_t * cover_bytes) {
+    int w = LYRICS_BACKDROP_WIDTH, h = LYRICS_BACKDROP_HEIGHT;
+    uint8_t * r = malloc((size_t) w * h);
+    uint8_t * g = malloc((size_t) w * h);
+    uint8_t * b = malloc((size_t) w * h);
+    uint8_t * tmp = malloc((size_t) w * h);
+    if (!r || !g || !b || !tmp) {
+        free(r); free(g); free(b); free(tmp);
+        return NULL;
+    }
+
+    for (int y = 0; y < h; y++) {
+        int src_y = y * COVER_ART_HEIGHT / h;
+        const uint16_t * src_row = (const uint16_t *) (cover_bytes + (size_t) src_y * COVER_ART_WIDTH * 2);
+        for (int x = 0; x < w; x++) {
+            uint16_t px = src_row[x];
+            r[y * w + x] = (uint8_t) ((px >> 11) & 0x1F);
+            g[y * w + x] = (uint8_t) ((px >> 5) & 0x3F);
+            b[y * w + x] = (uint8_t) (px & 0x1F);
+        }
+    }
+
+    for (int y = 0; y < h; y++) {
+        box_blur_1d(r + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+        memcpy(r + y * w, tmp + y * w, (size_t) w);
+        box_blur_1d(g + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+        memcpy(g + y * w, tmp + y * w, (size_t) w);
+        box_blur_1d(b + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+        memcpy(b + y * w, tmp + y * w, (size_t) w);
+    }
+    for (int x = 0; x < w; x++) box_blur_1d(r + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+    memcpy(r, tmp, (size_t) w * h);
+    for (int x = 0; x < w; x++) box_blur_1d(g + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+    memcpy(g, tmp, (size_t) w * h);
+    for (int x = 0; x < w; x++) box_blur_1d(b + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+    memcpy(b, tmp, (size_t) w * h);
+
+    uint8_t * out_bytes = malloc((size_t) w * h * 2);
+    if (!out_bytes) {
+        free(r); free(g); free(b); free(tmp);
+        return NULL;
+    }
+    uint16_t * out = (uint16_t *) out_bytes;
+    for (int i = 0; i < w * h; i++) {
+        int rv = (r[i] * LYRICS_BACKDROP_DARKEN_NUM) / LYRICS_BACKDROP_DARKEN_DEN;
+        int gv = (g[i] * LYRICS_BACKDROP_DARKEN_NUM) / LYRICS_BACKDROP_DARKEN_DEN;
+        int bv = (b[i] * LYRICS_BACKDROP_DARKEN_NUM) / LYRICS_BACKDROP_DARKEN_DEN;
+        out[i] = (uint16_t) ((rv << 11) | (gv << 5) | bv);
+    }
+    free(r); free(g); free(b); free(tmp);
+    return out_bytes;
+}
+
+static void * lyrics_backdrop_thread_func(void * arg) {
+    lyrics_backdrop_request_t * req = (lyrics_backdrop_request_t *) arg;
+    lyrics_backdrop_result_bytes = compute_lyrics_backdrop_bytes(req->cover_copy);
+    free(req->cover_copy);
+    free(req);
+    lyrics_backdrop_done_flag = true; /* written last, same contract as every other _done_flag in this file */
+    return NULL;
+}
+
+/* Set by launch_lyrics_backdrop_decode() when a request arrives while a
+ * generation is already running for a since-superseded track -- real bug
+ * report: silently dropping that request (the old behavior) left the OLD
+ * track's backdrop permanently stuck once the in-flight job's stale result
+ * was applied by poll_lyrics_backdrop(), since nothing else ever retried
+ * for the track actually playing now. poll_lyrics_backdrop() checks this
+ * once the in-flight job lands and immediately kicks off a fresh
+ * generation for whatever's current at that point. */
+static bool lyrics_backdrop_regenerate_pending = false;
+
+/* No queuing beyond the single pending flag above (never more than one
+ * generation queued behind the active one) -- unlike cover art's own
+ * cover_decode_pending, a slightly-stale intermediate backdrop for a
+ * moment isn't a visible correctness bug, and this is called far less
+ * often (screen-open/track-change-while-open, not every track change).
+ * Also skips if current_cover_bytes isn't ready yet (rare: tapped during
+ * the brief cover-decode window) -- open_lyrics_screen() falls back to a
+ * plain dark background for that one instance rather than blocking the
+ * tap. */
+static void launch_lyrics_backdrop_decode(void) {
+    if (lyrics_backdrop_active) {
+        lyrics_backdrop_regenerate_pending = true;
+        return;
+    }
+    if (!current_cover_bytes) return;
+    lyrics_backdrop_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
+    req->cover_copy = malloc((size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
+    if (!req->cover_copy) { free(req); return; }
+    memcpy(req->cover_copy, current_cover_bytes, (size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
+
+    lyrics_backdrop_done_flag = false;
+    lyrics_backdrop_active = true;
+    if (pthread_create(&lyrics_backdrop_thread, NULL, lyrics_backdrop_thread_func, req) != 0) {
+        free(req->cover_copy);
+        free(req);
+        lyrics_backdrop_active = false;
+    }
+}
+
+/* Applies a finished backdrop generation to lyrics_backdrop_img -- called
+ * from lyrics_timer_cb() (only ticking while the lyrics screen is open)
+ * rather than update_timer_cb(), so it resolves within one 150 ms tick of
+ * becoming ready instead of waiting up to 500 ms. Same lv_image_dsc_t
+ * construction care as current_cover_dsc/current_reflection_dsc in poll_
+ * cover_decode() above -- memset to 0 first, then explicitly set header.
+ * magic, or LVGL's bin decoder silently corrupts the color format (see that
+ * function's own real-device-incident comment for the full story). */
+static void poll_lyrics_backdrop(void) {
+    if (!lyrics_backdrop_active || !lyrics_backdrop_done_flag) return;
+    lyrics_backdrop_active = false;
+    pthread_join(lyrics_backdrop_thread, NULL);
+
+    if (lyrics_backdrop_result_bytes) { /* NULL = allocation failure -- keep whatever backdrop (or plain black) is already showing */
+        free(current_lyrics_backdrop_bytes);
+        current_lyrics_backdrop_bytes = lyrics_backdrop_result_bytes;
+        lyrics_backdrop_result_bytes = NULL;
+
+        memset(&current_lyrics_backdrop_dsc, 0, sizeof(current_lyrics_backdrop_dsc));
+        current_lyrics_backdrop_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        current_lyrics_backdrop_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        current_lyrics_backdrop_dsc.header.w = LYRICS_BACKDROP_WIDTH;
+        current_lyrics_backdrop_dsc.header.h = LYRICS_BACKDROP_HEIGHT;
+        current_lyrics_backdrop_dsc.header.stride = LYRICS_BACKDROP_WIDTH * 2;
+        current_lyrics_backdrop_dsc.data = current_lyrics_backdrop_bytes;
+        current_lyrics_backdrop_dsc.data_size = (uint32_t) LYRICS_BACKDROP_WIDTH * LYRICS_BACKDROP_HEIGHT * 2;
+        lv_image_set_src(lyrics_backdrop_img, &current_lyrics_backdrop_dsc);
+        lv_obj_remove_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* Checked regardless of the success/failure branch above -- see this
+     * flag's own doc comment; a request that arrived while the job that
+     * just landed was still running must not be lost either way. */
+    if (lyrics_backdrop_regenerate_pending) {
+        lyrics_backdrop_regenerate_pending = false;
+        launch_lyrics_backdrop_decode();
     }
 }
 
@@ -4399,17 +4732,13 @@ static void order_icon_event_cb(lv_event_t * e) {
     cycle_play_mode();
 }
 
-/* find_song_index_by_path() is defined down with the rest of the Favorites/
- * Most Played machinery (needs all_songs_paths already in scope there);
- * refresh_now_playing_indicators() is defined down with the compact-list
- * screens it updates (Artists/Albums/All Songs/group songs). Both are
- * forward-declared here since apply_track_metadata_to_ui() below is the
- * single place a real "this track started playing" event is known to have
+/* refresh_now_playing_indicators() is defined down with the compact-list
+ * screens it updates (Artists/Albums/All Songs/group songs) -- forward-
+ * declared here since apply_track_metadata_to_ui() below is the single
+ * place a real "this track started playing" event is known to have
  * happened, for every playback source (local library, Group Songs, Files,
  * .m3u playlists). */
-static int find_song_index_by_path(const char * path);
 static void refresh_now_playing_indicators(void);
-static void ensure_library_arrays_loaded(void);
 
 /* Shared by both an explicit track pick (play_track_at_from) and the audio
  * thread autonomously advancing into a queued next track on its own
@@ -4481,12 +4810,6 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
         metadata_read(path, out_meta);
     }
 
-    /* -1 (not found) is a real, expected outcome, not just "library not
-     * scanned yet" -- Group Songs/Files/.m3u playback can hand play_track_
-     * at_from() a path outside MUSIC_ROOT_DIR, or the library scan simply
-     * hasn't indexed this file for some other reason. refresh_now_playing_
-     * indicators() below treats -1 as "clear every indicator". */
-    now_playing_song_index = find_song_index_by_path(path);
     snprintf(now_playing_path, sizeof(now_playing_path), "%s", path);
     refresh_now_playing_indicators();
 
@@ -4508,6 +4831,18 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
         free(out_meta->picture_data);
         out_meta->picture_data = NULL;
         launch_cover_decode_from_track(index, path);
+    }
+
+    /* No local sidecar makes sense for a Subsonic stream URL -- same
+     * reasoning cover art uses subsonic_stream_meta[].cover_url instead of
+     * a local-file lookup for that case. A streamed track just never gets
+     * lyrics in this first release. */
+    if (!is_subsonic_stream) {
+        launch_lyrics_load(index, path);
+    } else if (current_lyrics_doc_valid) {
+        lyrics_doc_free(&current_lyrics_doc);
+        current_lyrics_doc_valid = false;
+        current_lyrics_doc_for_index = index;
     }
 
     favorite_is_set = metadata_db_song_favorite_is_set(path);
@@ -5367,13 +5702,9 @@ static void resume_from_suspend_fixups(void) {
  * forward-declared here since update_timer_cb() (just below) needs it for
  * the remote-control play-by-index consumer. */
 static void all_songs_row_click_cb(int index);
-static char ** all_songs_paths;
-static int all_songs_count;
-static int * all_songs_sort_order;
 /* Defined with the rest of the remote-control scoped-play machinery, much
- * further down (needs find_song_index_by_path()/artist_groups/etc. already
- * in scope) -- forward-declared here since update_timer_cb() (just below)
- * needs it for the remote-control play-by-index consumer. */
+ * further down -- forward-declared here since update_timer_cb() (just
+ * below) needs it for the remote-control play-by-index consumer. */
 static void play_remote_control_song(const char * song_path, const char * playlist_name, const char * artist_filter,
                                       const char * album_artist_filter, const char * album_filter);
 
@@ -5504,15 +5835,13 @@ static void update_timer_cb(lv_timer_t * timer) {
                                            sizeof(remote_play_album_artist), remote_play_album,
                                            sizeof(remote_play_album))) {
         /* remote_play_id is a song id (metadata_db.c's rowid-based
-         * song_row_t.id), not an array index -- resolve it to a path, make
-         * sure the lazily-loaded all_songs_paths/artist_groups/etc. arrays
-         * play_remote_control_song() itself needs actually exist yet, then
-         * translate to the all_songs_paths index that function expects.
+         * song_row_t.id) -- resolve it to a path, then hand that straight to
          * play_remote_control_song() (defined with the rest of the
-         * remote-control scoped-play machinery, much further down) resolves
-         * that index plus the playlist/artist/album context into the right
-         * playlist and position, falling back to the whole library (same
-         * translation this used to do inline) when no scope applies. */
+         * remote-control scoped-play machinery, much further down), which
+         * resolves the path plus the playlist/artist/album context into the
+         * right playlist and position via its own DB queries, falling back
+         * to the whole library (All Songs, by title offset) when no scope
+         * applies. */
         song_row_t remote_play_row;
         if (metadata_db_get_song_by_id(remote_play_id, &remote_play_row)) {
             play_remote_control_song(remote_play_row.path, remote_play_playlist, remote_play_artist,
@@ -5752,16 +6081,31 @@ static void update_timer_cb(lv_timer_t * timer) {
         if (screen_inactive_ms > interactive_age_ms) screen_inactive_ms = interactive_age_ms;
     }
     bool screen_on_before_timeout = backlight_screen_is_on();
+    /* Reading lyrics while a track is actually playing is real, continuous
+     * screen use with little or no touch activity to keep resetting LVGL's
+     * own indev-driven inactivity clock (screen_inactive_ms above) --
+     * exempt this screen from both dimming and the full auto-timeout
+     * entirely, the same lv_screen_active()-gated exclusion shape already
+     * used for bt_dac_overlay_screen/usb_dac_overlay_screen elsewhere in
+     * this file (e.g. poll_quick_drawer_drag()'s own gesture exclusions),
+     * rather than trying to synthesize fake touch activity to fool the
+     * shared clock. Paused, though, is no different from sitting on any
+     * other screen not actively being read/watched -- real-device feedback
+     * was explicit that timeout/dim/suspend should behave normally then,
+     * not stay suppressed just because the lyrics view happens to still be
+     * open. */
+    bool lyrics_screen_active = lv_screen_active() == lyrics_screen && audio_is_playing();
     if (current_settings.screen_dimming_enabled && screen_on_before_timeout &&
-        !inactivity_dimmed && screen_inactive_ms >= SCREEN_DIM_AFTER_MS) {
+        !inactivity_dimmed && !lyrics_screen_active && screen_inactive_ms >= SCREEN_DIM_AFTER_MS) {
         backlight_set_dimmed(true);
         inactivity_dimmed = true;
     } else if (screen_on_before_timeout && inactivity_dimmed &&
-               (!current_settings.screen_dimming_enabled || screen_inactive_ms < SCREEN_DIM_AFTER_MS)) {
+               (!current_settings.screen_dimming_enabled || lyrics_screen_active || screen_inactive_ms < SCREEN_DIM_AFTER_MS)) {
         backlight_set_dimmed(false);
         inactivity_dimmed = false;
     }
     if (current_settings.screen_timeout_enabled && backlight_screen_is_on() &&
+        !lyrics_screen_active &&
         screen_inactive_ms >= (uint32_t) current_settings.screen_timeout_seconds * 1000) {
         backlight_set_screen_on(false);
         inactivity_dimmed = false;
@@ -6012,6 +6356,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_usb_mode_switch();
     poll_sd_card_hotplug();
     poll_cover_decode();
+    poll_lyrics_load();
 
     if (audio_consume_track_advanced()) {
         /* The playback thread already moved on to the queued next track by
@@ -6919,6 +7264,13 @@ static void build_song_context_menu_popup(void) {
     }
 }
 
+static void open_lyrics_screen(void); /* defined alongside build_lyrics_screen() below */
+
+static void cover_img_tap_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_lyrics_screen();
+}
+
 static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_height) {
     (void) screen_width;
     (void) screen_height;
@@ -6934,6 +7286,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     cover_img = lv_image_create(scr);
     lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
     lv_obj_align(cover_img, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_add_flag(cover_img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cover_img, cover_img_tap_cb, LV_EVENT_CLICKED, NULL);
 
     player_overlay_panel = lv_obj_create(scr);
     lv_obj_t * overlay = player_overlay_panel; /* short local alias, rest of this function was written against this name */
@@ -7145,6 +7499,336 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     return scr;
 }
 
+/* ---- Fullscreen lyrics view --------------------------------------------
+ * Tap the album art (cover_img_tap_cb above) to open, no animation -- a
+ * nav_push()ed screen like any other (not a layered overlay on the player
+ * screen), so it gets its own gesture handling for free instead of
+ * fighting the player screen's own transport/seek touch handling
+ * underneath. Exit is a right-swipe (the standard back gesture) ONLY --
+ * real-device feedback: a tap-anywhere-to-dismiss made an ordinary tap
+ * while reading (e.g. to pause the auto-follow idle countdown) too easy to
+ * fire by accident, and the app-wide left-swipe-to-player-screen gesture
+ * (poll_quick_drawer_drag()'s player_swipe_* state) looked like a broken,
+ * looping transition when triggered from a screen that's already reached
+ * FROM the player screen -- see the lv_screen_active() != lyrics_screen
+ * exclusions added to that function, and player_swipe_press_excluded()'s
+ * own doc comment for the general shape of this kind of exclusion.
+ * lyrics_gesture_event_cb() below is deliberately NOT the shared
+ * screen_gesture_event_cb() (which pops via the animated screen_
+ * transition_slide()) -- real-device feedback asked for no animation
+ * entering OR exiting this screen, so this pops with a plain lv_screen_
+ * load() instead, the same instant-cut nav_push() already uses.
+ *
+ * Virtualization follows the same "a spacer object establishes the real
+ * scroll range, a small pool of reused objects is repositioned/relabeled
+ * as the view scrolls" mechanic screen_builders.c's compact_list already
+ * uses (see compact_list_update_window()) -- just purpose-built and
+ * simpler, since the whole parsed lyrics_doc_t is already resident in
+ * memory (capped at LYRICS_MAX_LINES) with nothing to page in from disk. ---- */
+
+#define LYRICS_POOL_SIZE 20
+#define LYRICS_ROW_STRIDE 76
+/* Fixed on-screen y where the active line always sits, in the viewport's
+ * own coordinates (25% of the 800px screen) -- real-device feedback: the
+ * active line must stay in the same place while the rest of the text
+ * scrolls past it (the familiar Spotify/Apple-Music-style fullscreen
+ * lyrics behavior), not drift to wherever a viewport-centering formula
+ * happens to land it, and the very first line must already start there
+ * rather than flush against the top edge. See lyrics_timer_cb()'s own
+ * target calculation. */
+#define LYRICS_ACTIVE_LINE_ANCHOR_Y 200
+/* Equal to the anchor above, not an independent value -- this is what
+ * makes target = TOP_PAD + index*STRIDE - ANCHOR_Y land at exactly 0 (no
+ * clamping needed) for index 0, so the very first line already renders at
+ * the anchor position instead of the clamp-to-0 fallback leaving it at the
+ * top edge. */
+#define LYRICS_TOP_PAD LYRICS_ACTIVE_LINE_ANCHOR_Y
+#define LYRICS_TIMER_PERIOD_MS 150
+/* "A few seconds of no further manual scrolling" per LYRICS_SUPPORT_DRAFT.md. */
+#define LYRICS_AUTO_FOLLOW_RESUME_MS 3000L
+
+static lv_obj_t * lyrics_rows[LYRICS_POOL_SIZE];
+static int lyrics_window_start = -1; /* index currently shown by lyrics_rows[0]; -1 forces the first update to actually run */
+static int lyrics_pool_synced_for_index = -1; /* current_lyrics_doc_for_index the pool/spacer were last built from */
+static bool lyrics_auto_follow = true;
+static int lyrics_last_centered_index = -2; /* -2 = "never centered yet", distinct from -1 (a real "before the first line" position) */
+static struct timespec lyrics_last_manual_scroll_at;
+
+/* Only current_lyrics_doc_for_index == playlist_index counts as "this
+ * doc is for the track actually playing" -- a load still in flight, one
+ * that finished for a since-superseded track, or simply having no track
+ * playing at all, are all "no active line" here, matching poll_lyrics_
+ * load()'s own staleness check above. */
+static int lyrics_current_active_index(void) {
+    if (!current_lyrics_doc_valid || current_lyrics_doc_for_index != playlist_index || playlist_index < 0) return -1;
+    return lyrics_find_line_at(&current_lyrics_doc, audio_get_position_seconds());
+}
+
+/* Re-syncs the row pool/spacer/empty-state to whatever current_lyrics_doc
+ * currently holds -- called on every open (open_lyrics_screen() below) and
+ * whenever lyrics_timer_cb() notices the doc changed while already open
+ * (a track change while the user is looking at this screen). Always resets
+ * scroll to the top and re-enables auto-follow, so both a fresh open and a
+ * new track start from the same, predictable state rather than wherever a
+ * previous track's manual scroll happened to leave it. */
+static void lyrics_reset_pool(void) {
+    int count = current_lyrics_doc_valid ? current_lyrics_doc.count : 0;
+
+    if (count == 0) {
+        lv_obj_remove_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
+        for (int slot = 0; slot < LYRICS_POOL_SIZE; slot++) lv_obj_add_flag(lyrics_rows[slot], LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    int32_t total_height = LYRICS_TOP_PAD + count * LYRICS_ROW_STRIDE;
+    lv_obj_set_pos(lyrics_spacer, 0, total_height > 0 ? total_height - 1 : 0);
+
+    lv_obj_scroll_to_y(lyrics_list, 0, LV_ANIM_OFF);
+    lyrics_window_start = -1;
+    lyrics_pool_synced_for_index = current_lyrics_doc_for_index;
+    lyrics_auto_follow = true;
+    lyrics_last_centered_index = -2;
+}
+
+/* Repositions/relabels the row pool to cover the range of lines actually
+ * scrolled into (or near) view, and recolors every visible row for the
+ * current active_index -- called on every scroll event and every lyrics_
+ * timer_cb() tick. Unlike compact_list_update_window(), this can't early-
+ * return purely on "the window hasn't moved": the active line's highlight
+ * can change (playback advancing) with the view sitting perfectly still. */
+static void lyrics_update_window(int active_index) {
+    int count = current_lyrics_doc_valid ? current_lyrics_doc.count : 0;
+    if (count == 0) return; /* nothing to position -- empty state already shown by lyrics_reset_pool() */
+
+    int32_t scroll_y = lv_obj_get_scroll_y(lyrics_list);
+    if (scroll_y < 0) scroll_y = 0;
+    int first = (int) (scroll_y / LYRICS_ROW_STRIDE) - LYRICS_POOL_SIZE / 4;
+    if (first < 0) first = 0;
+    int max_first = count - LYRICS_POOL_SIZE;
+    if (max_first < 0) max_first = 0;
+    if (first > max_first) first = max_first;
+
+    bool window_moved = first != lyrics_window_start;
+    if (window_moved) lyrics_window_start = first;
+
+    for (int slot = 0; slot < LYRICS_POOL_SIZE; slot++) {
+        int index = first + slot;
+        lv_obj_t * row = lyrics_rows[slot];
+        if (index >= count) {
+            lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
+        if (window_moved) {
+            lv_obj_set_y(row, LYRICS_TOP_PAD + index * LYRICS_ROW_STRIDE);
+            lv_label_set_text(row, current_lyrics_doc.lines[index].text);
+        }
+        lv_obj_set_style_text_color(row, index == active_index ? accent_lv_color() : lv_color_make(150, 150, 150), 0);
+    }
+}
+
+/* Tap a line to seek playback to it -- pool_slot (this row's fixed slot in
+ * lyrics_rows[], passed as the event's user_data, same (void *)(intptr_t)
+ * idiom plugin_interval_timer_cb uses elsewhere in this file) plus lyrics_
+ * window_start resolves to the actual doc line index, same as compact_
+ * list_row_click_cb()'s own index resolution. Re-enables auto-follow (in
+ * case it was suspended) and forces an immediate recenter on the next
+ * lyrics_timer_cb() tick, so the view snaps straight to the tapped line
+ * and keeps following from there rather than leaving the old scroll
+ * position sitting stale until audio_get_position_seconds() catches up. */
+static void lyrics_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int slot = (int) (intptr_t) lv_event_get_user_data(e);
+    int index = lyrics_window_start + slot;
+    if (!current_lyrics_doc_valid || index < 0 || index >= current_lyrics_doc.count) return;
+
+    audio_seek(current_lyrics_doc.lines[index].time_ms / 1000.0);
+    lyrics_auto_follow = true;
+    lyrics_last_centered_index = -2;
+}
+
+/* The ONLY way out of this screen -- see build_lyrics_screen()'s own header
+ * comment for why this isn't the shared screen_gesture_event_cb() (no
+ * animation here, and no left-swipe-to-player handling to speak of since
+ * poll_quick_drawer_drag() already excludes lyrics_screen from that
+ * gesture entirely). Manipulates nav_depth/nav_stack directly, the same
+ * bookkeeping nav_pop() itself does, just finishing with a plain
+ * lv_screen_load() instead of the animated screen_transition_slide(). */
+static void lyrics_gesture_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+    lv_indev_t * indev = lv_indev_active();
+    if (!indev || lv_indev_get_gesture_dir(indev) != LV_DIR_RIGHT) return;
+
+    lv_indev_wait_release(indev); /* same reasoning as screen_gesture_event_cb's own comment -- avoid a phantom tap landing on the player screen under the still-down finger */
+    lv_timer_pause(lyrics_timer);
+    if (nav_depth > 1) nav_depth--;
+    lv_screen_load(nav_stack[nav_depth - 1]);
+}
+
+/* Records a manual scroll only when driven by an actual finger-press (same
+ * lv_indev_get_state()==LV_INDEV_STATE_PRESSED precedent used elsewhere in
+ * this file), not the programmatic lv_obj_scroll_to_y() call lyrics_timer_
+ * cb() itself makes to re-center on the active line -- otherwise every
+ * auto-follow re-center would immediately look like a manual scroll and
+ * suspend itself. */
+static void lyrics_scroll_event_cb(lv_event_t * e) {
+    (void) e;
+    lv_indev_t * indev = lv_indev_active();
+    if (indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
+        lyrics_auto_follow = false;
+        clock_gettime(CLOCK_MONOTONIC, &lyrics_last_manual_scroll_at);
+    }
+    lyrics_update_window(lyrics_current_active_index());
+}
+
+static void lyrics_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    poll_lyrics_backdrop();
+
+    if (current_lyrics_doc_for_index != lyrics_pool_synced_for_index) {
+        lyrics_reset_pool();
+        launch_lyrics_backdrop_decode(); /* track changed while this screen is open -- refresh the backdrop too */
+    }
+
+    bool was_auto_follow = lyrics_auto_follow;
+    lv_indev_t * indev = lv_indev_active();
+    bool pressed = indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED;
+    if (pressed) {
+        lyrics_auto_follow = false;
+    } else if (!lyrics_auto_follow) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long idle_ms = (now.tv_sec - lyrics_last_manual_scroll_at.tv_sec) * 1000L +
+                       (now.tv_nsec - lyrics_last_manual_scroll_at.tv_nsec) / 1000000L;
+        if (idle_ms >= LYRICS_AUTO_FOLLOW_RESUME_MS) lyrics_auto_follow = true;
+    }
+    /* Auto-follow just resumed after being suspended -- force a recenter
+     * below even if active_index hasn't changed since the view may have
+     * drifted away from it while suspended. */
+    if (lyrics_auto_follow && !was_auto_follow) lyrics_last_centered_index = -2;
+
+    int active_index = lyrics_current_active_index();
+
+    if (lyrics_auto_follow && active_index >= 0 && active_index != lyrics_last_centered_index) {
+        int32_t target = LYRICS_TOP_PAD + active_index * LYRICS_ROW_STRIDE - LYRICS_ACTIVE_LINE_ANCHOR_Y;
+        if (target < 0) target = 0;
+        lv_obj_scroll_to_y(lyrics_list, target, LV_ANIM_ON);
+        lyrics_last_centered_index = active_index;
+    }
+
+    lyrics_update_window(active_index);
+}
+
+static void open_lyrics_screen(void) {
+    launch_lyrics_backdrop_decode();
+    lyrics_reset_pool();
+    lv_timer_resume(lyrics_timer);
+    nav_push(lyrics_screen);
+    lyrics_timer_cb(NULL); /* one immediate tick so the view isn't blank for up to LYRICS_TIMER_PERIOD_MS after opening */
+}
+
+static lv_obj_t * build_lyrics_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_make(0, 0, 0), 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lyrics_backdrop_img = lv_image_create(scr);
+    lv_obj_set_size(lyrics_backdrop_img, LYRICS_BACKDROP_WIDTH, LYRICS_BACKDROP_HEIGHT);
+    lv_obj_align(lyrics_backdrop_img, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN); /* shown by poll_lyrics_backdrop() once a real backdrop exists */
+    lv_obj_remove_flag(lyrics_backdrop_img, LV_OBJ_FLAG_CLICKABLE);
+
+    /* Flat dark overlay for consistent text contrast regardless of how
+     * bright the source cover art is -- see LYRICS_BACKDROP_DARKEN_NUM/
+     * DEN's own comment on why the backdrop pixels themselves aren't
+     * darkened this much on their own. */
+    lv_obj_t * dark_overlay = lv_obj_create(scr);
+    lv_obj_set_size(dark_overlay, 480, 800);
+    lv_obj_align(dark_overlay, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(dark_overlay, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_opa(dark_overlay, LV_OPA_40, 0);
+    lv_obj_set_style_border_width(dark_overlay, 0, 0);
+    lv_obj_set_style_radius(dark_overlay, 0, 0);
+    lv_obj_remove_flag(dark_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(dark_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lyrics_empty_label = lv_label_create(scr);
+    lv_label_set_text(lyrics_empty_label, "No synchronized lyrics found");
+    lv_obj_set_style_text_font(lyrics_empty_label, &app_font_22, 0);
+    lv_obj_set_style_text_color(lyrics_empty_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_center(lyrics_empty_label);
+    lv_obj_add_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(lyrics_empty_label, LV_OBJ_FLAG_CLICKABLE);
+
+    /* The scrollable content object itself -- transparent so the backdrop/
+     * overlay behind it show through. The pooled row labels below each get
+     * their own LV_EVENT_CLICKED handler (lyrics_row_click_cb -- tap a
+     * line to seek to it); this object only listens for LV_EVENT_SCROLL,
+     * to track manual-scroll-vs-auto-follow. */
+    lyrics_list = lv_obj_create(scr);
+    lv_obj_set_size(lyrics_list, 480, 800);
+    lv_obj_align(lyrics_list, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_opa(lyrics_list, 0, 0);
+    lv_obj_set_style_border_width(lyrics_list, 0, 0);
+    lv_obj_set_style_radius(lyrics_list, 0, 0);
+    lv_obj_set_style_pad_all(lyrics_list, 0, 0);
+    lv_obj_set_scroll_dir(lyrics_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(lyrics_list, LV_SCROLLBAR_MODE_OFF);
+
+    for (int slot = 0; slot < LYRICS_POOL_SIZE; slot++) {
+        lv_obj_t * row = lv_label_create(lyrics_list);
+        lv_obj_set_width(row, 440);
+        lv_obj_set_height(row, LYRICS_ROW_STRIDE - 8);
+        lv_label_set_long_mode(row, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(row, &app_font_28, 0); /* metadata-derived lyric text -- see fallback_font.h */
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_pos(row, 20, LYRICS_TOP_PAD + slot * LYRICS_ROW_STRIDE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN); /* shown by lyrics_update_window() once it has real content */
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE); /* tap to seek -- lyrics_row_click_cb() */
+        lv_obj_add_event_cb(row, lyrics_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) slot);
+        lyrics_rows[slot] = row;
+    }
+
+    /* 1x1 invisible spacer at the bottom of the FULL virtual list -- not
+     * hidden (a hidden object doesn't count toward scrollable content
+     * size), just visually imperceptible. Same technique as compact_list's
+     * own spacer (screen_builders.c). */
+    lyrics_spacer = lv_obj_create(lyrics_list);
+    lv_obj_set_size(lyrics_spacer, 1, 1);
+    lv_obj_set_style_bg_opa(lyrics_spacer, 0, 0);
+    lv_obj_set_style_border_width(lyrics_spacer, 0, 0);
+    lv_obj_remove_flag(lyrics_spacer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(lyrics_spacer, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_pos(lyrics_spacer, 0, 0);
+
+    lv_obj_add_event_cb(lyrics_list, lyrics_scroll_event_cb, LV_EVENT_SCROLL, NULL);
+
+    /* Right-swipe-to-exit -- see lyrics_gesture_event_cb()'s own doc
+     * comment for why this is a dedicated handler rather than finalize_
+     * screen_navigation()'s shared one. Attached to scr (not lyrics_list)
+     * and bubbled up the same way finalize_screen_navigation() does for
+     * every other screen, via enable_gesture_bubble_recursive() -- a drag
+     * starting on lyrics_list (or one of its pooled row labels) still needs
+     * to reach this handler once LVGL judges it a horizontal gesture rather
+     * than a vertical scroll. */
+    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
+    enable_gesture_bubble_recursive(scr);
+    lv_obj_add_event_cb(scr, lyrics_gesture_event_cb, LV_EVENT_GESTURE, NULL);
+
+    /* Created paused -- only ticks while this screen is actually open
+     * (resumed by open_lyrics_screen(), paused by lyrics_gesture_event_cb()),
+     * so it costs nothing the rest of the time. Not the existing 500 ms
+     * update_timer_cb: that one must keep running at its own cadence
+     * regardless of whether this screen is open, and 150 ms is needed here
+     * for a scroll/highlight cadence that actually looks smooth. */
+    lyrics_timer = lv_timer_create(lyrics_timer_cb, LYRICS_TIMER_PERIOD_MS, NULL);
+    lv_timer_pause(lyrics_timer);
+
+    return scr;
+}
+
 /* Same true-black default screen_builders.c's own style_theme_screen_bg is
  * initialized with. Kept as a separate plain literal (not that shared
  * style) specifically for gui_show_boot_splash() below -- that function
@@ -7268,68 +7952,20 @@ static void music_files_tile_cb(lv_event_t * e) {
     nav_push(files_screen);
 }
 
-/* Library-wide (not one-directory) views -- All Songs, Artists, Albums --
- * all built from one scan-and-tag-read pass over the whole music root,
- * done once at startup (library_scan_once(), called from gui_init before
- * any of these screens are built) rather than every time a screen is
- * entered: simpler, and a personal music library isn't expected to change
- * shape mid-session the way a single directory being actively browsed
- * might. */
-static char ** all_songs_paths = NULL;
-static int all_songs_count = 0;
-
 static const char * basename_of(const char * path) {
     const char * slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
 }
 
-/* Parallel array to all_songs_paths -- title/artist/album tag per song
- * (reading all of them from the same metadata_read() call, rather than once
- * per grouping, since that's the expensive part of indexing a whole
- * library). Untagged artist/album/album_artist/genre fall back to an
- * explicit "Unknown" bucket rather than silently dropping the song from
- * these views the way a missing group would -- title is the odd one out: it
- * isn't a grouping key, just a display string, so it's left empty on a
- * missing tag and show_group_songs() falls back to the filename itself at
- * render time instead of baking a fake title into the cache. */
-typedef struct {
-    char title[128];
-    char artist[128];
-    char album[128];
-    char album_artist[128];
-    char genre[128];
-} song_tags_t;
-
-static song_tags_t * all_song_tags = NULL;
-
-/* Real song title (from tags) everywhere navigation is metadata-driven
- * (Artists/Albums/Album Artist/Genre drill-downs, All Songs) -- falls back
- * to the filename only when the file genuinely has no title tag, never as
- * the default. The plain file/folder browser (file_browser.c) is a
- * different, deliberately filename-based view and does NOT go through this
- * -- browsing raw files on the card needs to show what's actually on disk. */
-static const char * song_display_title_of(int index) {
-    if (all_song_tags[index].title[0] != '\0') return all_song_tags[index].title;
-    return basename_of(all_songs_paths[index]);
-}
-
-/* One artist/album/album-artist/genre's songs, as indices into
- * all_songs_paths/all_song_tags (not owned copies -- those arrays already
- * own the strings and outlive every group). */
-typedef struct {
-    char name[128];
-    int * indices;
-    int count;
-} group_t;
-
 /* One song within a group_songs_screen listing (Artist/Album Artist's own
  * albums, one album, Favorites, Most Played, a user .m3u playlist) -- an
- * owned path + precomputed display title, not an index into all_songs_
- * paths/all_song_tags like group_t.indices above. Every one of those
- * screens is inherently small (one album's tracks, a hand-curated playlist,
- * MOST_PLAYED_LIMIT), so a DB query per screen-open plus a handful of owned
- * strings costs nothing next to what ensure_library_arrays_loaded() used to
- * cost just to hand this screen a few dozen indices. */
+ * owned path + precomputed display title, resolved via a targeted DB query
+ * per screen-open rather than an index into any whole-library array. Every
+ * one of those screens is inherently small (one album's tracks, a hand-
+ * curated playlist, MOST_PLAYED_LIMIT), so a DB query plus a handful of
+ * owned strings costs nothing next to what this app used to spend loading
+ * the whole library into memory just to hand this screen a few dozen
+ * entries. */
 struct group_song_entry_s {
     char * path;
     char * title;
@@ -7361,77 +7997,6 @@ static bool copy_group_song_entries(group_song_entry_t ** out, const group_song_
     return true;
 }
 
-/* Bridge the few drill-downs that still operate on the already-loaded
- * in-memory group_t indexes into the owned representation used by the
- * group-songs screen.  The screen copies these entries, so callers may
- * free the returned array immediately after show/set completes. */
-static group_song_entry_t * build_group_song_entries_from_indices(const int * indices, int count) {
-    group_song_entry_t * entries = calloc((size_t) (count > 0 ? count : 1), sizeof(*entries));
-    if (!entries) return NULL;
-    for (int i = 0; i < count; i++) {
-        int song_index = indices[i];
-        entries[i].path = strdup(all_songs_paths[song_index]);
-        entries[i].title = strdup(song_display_title_of(song_index));
-        if (!entries[i].path || !entries[i].title) {
-            free_group_song_entries(entries, count);
-            return NULL;
-        }
-    }
-    return entries;
-}
-
-static group_t * artist_groups = NULL;
-static int artist_group_count = 0;
-static group_t * album_groups = NULL;
-static int album_group_count = 0;
-static group_t * album_artist_groups = NULL;
-static int album_artist_group_count = 0;
-
-static const char * artist_key_of(int index) { return all_song_tags[index].artist; }
-static const char * album_key_of(int index) { return all_song_tags[index].album; }
-static const char * album_artist_key_of(int index) { return all_song_tags[index].album_artist; }
-
-static int compare_index_by_artist(const void * a, const void * b) {
-    int ia = *(const int *) a, ib = *(const int *) b;
-    int cmp = strcasecmp(artist_key_of(ia), artist_key_of(ib));
-    return cmp != 0 ? cmp : strcasecmp(all_songs_paths[ia], all_songs_paths[ib]);
-}
-
-static int compare_index_by_album(const void * a, const void * b) {
-    int ia = *(const int *) a, ib = *(const int *) b;
-    int cmp = strcasecmp(album_key_of(ia), album_key_of(ib));
-    return cmp != 0 ? cmp : strcasecmp(all_songs_paths[ia], all_songs_paths[ib]);
-}
-
-static int compare_index_by_album_artist(const void * a, const void * b) {
-    int ia = *(const int *) a, ib = *(const int *) b;
-    int cmp = strcasecmp(album_artist_key_of(ia), album_artist_key_of(ib));
-    return cmp != 0 ? cmp : strcasecmp(all_songs_paths[ia], all_songs_paths[ib]);
-}
-
-/* All Songs' own display order -- indices into all_songs_paths/all_song_tags
- * sorted by display title, unlike artist_groups/album_groups/
- * album_artist_groups this isn't a group_t array (nothing to collapse:
- * every song is its own row, including duplicate titles) so a plain sorted
- * index array is all that's needed. Powers both build_all_songs_screen()'s
- * display order and its A-Z browse index. */
-static int * all_songs_sort_order = NULL;
-
-static int compare_index_by_title(const void * a, const void * b) {
-    int ia = *(const int *) a, ib = *(const int *) b;
-    int cmp = strcasecmp(song_display_title_of(ia), song_display_title_of(ib));
-    return cmp != 0 ? cmp : strcasecmp(all_songs_paths[ia], all_songs_paths[ib]);
-}
-
-static void rebuild_all_songs_sort_order(void) {
-    free(all_songs_sort_order);
-    all_songs_sort_order = NULL;
-    if (all_songs_count <= 0) return;
-    all_songs_sort_order = malloc(sizeof(int) * (size_t) all_songs_count);
-    for (int i = 0; i < all_songs_count; i++) all_songs_sort_order[i] = i;
-    qsort(all_songs_sort_order, (size_t) all_songs_count, sizeof(int), compare_index_by_title);
-}
-
 /* Real definition of the forward declaration right after free_playlist() --
  * see playlist_lazy_sort_order's own comment for the full design. Resolves
  * playlist[index] to a real, owned path, the first time anything actually
@@ -7445,17 +8010,9 @@ static void rebuild_all_songs_sort_order(void) {
  *
  * Resolves via metadata_db_get_songs_filtered_page() (a single-row page at
  * offset playlist_lazy_sort_order[index], its own METADATA_DB_GUARD) --
- * DB-backed rather than indexing all_songs_paths/all_songs_sort_order
- * directly, so a lazy All-Songs queue never needs those arrays loaded at
- * all (ensure_library_arrays_loaded() is no longer a prerequisite for
- * tap-to-play from All Songs -- see all_songs_tile_cb()'s own comment).
- * This also means resolution is safe at any time, including while a
- * rescan is running on its own background thread: metadata_db.c's own
- * mutex already serializes that, unlike the in-memory arrays this used to
- * read directly (which were never mutex-protected, and could be freed out
- * from under a resolving slot mid-rescan -- the real hazard playlist_
- * detach_from_all_songs() used to exist to close; removed now that
- * resolution no longer touches those arrays at all). A rescan changing the
+ * DB-backed, not an in-memory array index, so this is safe at any time,
+ * including while a rescan is running on its own background thread:
+ * metadata_db.c's own mutex already serializes that. A rescan changing the
  * sort order between tap and resolution can still make a not-yet-resolved
  * slot land on a logically different song than what was on screen at tap
  * time -- a stale-reference class of bug this app already tolerates
@@ -7478,8 +8035,7 @@ static const char * playlist_path_at(int index) {
  * comment for why eagerly strdup'ing every one of the library's paths on
  * every single tap was a real, measured cost. Builds an all-NULL playlist[]
  * the same size as the library (metadata_db_get_song_count(), a cheap
- * COUNT(*) -- no need for all_songs_count/ensure_library_arrays_loaded()
- * here at all) and marks it lazy, identity-mapped into the DB's own
+ * COUNT(*)) and marks it lazy, identity-mapped into the DB's own
  * title-sorted order (the exact order build_all_songs_screen()'s paged
  * provider also uses -- see its own comment); playlist_path_at() resolves
  * each slot to a real, owned path the first time anything actually needs
@@ -7500,69 +8056,6 @@ static void on_file_selected_lazy_all_songs(int selected_index) {
     play_track_at(selected_index);
 }
 
-/* Sorts the given song indices by key_of (via cmp, which also tie-breaks by
- * path so each resulting group's members come out path-sorted for free) and
- * slices the sorted run into one group_t per distinct key. Used both for
- * whole-library grouping (build_groups_by, below) and for regrouping a
- * single group's members by a second key -- e.g. an artist's songs by
- * album, for show_artist_albums(). */
-static void build_groups_by_indices(const int * indices, int count,
-                                     const char * (*key_of)(int), int (*cmp)(const void *, const void *),
-                                     group_t ** out_groups, int * out_count) {
-    if (count <= 0) { *out_groups = NULL; *out_count = 0; return; }
-
-    int * order = malloc(sizeof(int) * (size_t) count);
-    memcpy(order, indices, sizeof(int) * (size_t) count);
-    qsort(order, (size_t) count, sizeof(int), cmp);
-
-    group_t * groups = NULL;
-    int group_count = 0;
-    int group_capacity = 0;
-
-    int i = 0;
-    while (i < count) {
-        const char * key = key_of(order[i]);
-        int j = i;
-        while (j < count && strcasecmp(key_of(order[j]), key) == 0) j++;
-        int member_count = j - i;
-
-        if (group_count == group_capacity) {
-            group_capacity = group_capacity ? group_capacity * 2 : 16;
-            groups = realloc(groups, sizeof(group_t) * (size_t) group_capacity);
-        }
-        group_t * g = &groups[group_count++];
-        snprintf(g->name, sizeof(g->name), "%s", key);
-        g->count = member_count;
-        g->indices = malloc(sizeof(int) * (size_t) member_count);
-        memcpy(g->indices, &order[i], sizeof(int) * (size_t) member_count);
-
-        i = j;
-    }
-
-    free(order);
-    *out_groups = groups;
-    *out_count = group_count;
-}
-
-static void build_groups_by(const char * (*key_of)(int), int (*cmp)(const void *, const void *),
-                             group_t ** out_groups, int * out_count) {
-    if (all_songs_count <= 0) { *out_groups = NULL; *out_count = 0; return; }
-
-    int * order = malloc(sizeof(int) * (size_t) all_songs_count);
-    for (int i = 0; i < all_songs_count; i++) order[i] = i;
-    build_groups_by_indices(order, all_songs_count, key_of, cmp, out_groups, out_count);
-    free(order);
-}
-
-static void free_group_array(group_t * groups, int count) {
-    for (int i = 0; i < count; i++) free(groups[i].indices);
-    free(groups);
-}
-
-/* Finds an artist_groups[] entry by case-insensitive name -- same matching
- * artist_row_click_cb()'s own indexing into artist_groups uses, just by name
- * instead of by row index since a plugin only has the artist's display
- * name to go on. NULL if no such artist. */
 const char * gui_plugin_get_play_mode(void) {
     switch ((play_mode_t) current_settings.play_mode) {
         case PLAY_MODE_REPEAT_ALL: return "repeat_all";
@@ -7667,10 +8160,9 @@ void gui_plugin_free_string_array(char ** array, int count) {
 
 /* ---- plugin.library_* -- see gui.h's own comment for the design intent.
  * Every one of these goes straight to metadata_db.c (its own METADATA_DB_
- * GUARD), never touching all_songs_paths/artist_groups/etc. or ensure_
- * library_arrays_loaded() -- unlike gui_plugin_get_artist_albums() and
- * friends above, a plugin using only this block never forces gui.c's
- * whole-library lazy load just because it looked at the library first. ---- */
+ * GUARD), same as gui_plugin_get_artist_albums() and friends above -- no
+ * plugin call in this file forces any whole-library load just because it
+ * looked at the library first. ---- */
 
 static int gui_plugin_library_clamp_limit(int limit) {
     if (limit <= 0 || limit > GUI_PLUGIN_LIBRARY_MAX_PAGE) return GUI_PLUGIN_LIBRARY_MAX_PAGE;
@@ -7719,39 +8211,6 @@ int gui_plugin_library_get_albums(int offset, int limit, const char * artist_fil
     if (offset < 0) offset = 0;
     limit = gui_plugin_library_clamp_limit(limit);
     return metadata_db_get_albums_page_filtered(artist_filter, offset, limit, out_rows);
-}
-
-/* True once ensure_library_arrays_loaded() (below) has actually populated
- * all_songs_paths/all_song_tags/the three group arrays -- distinct from
- * all_songs_count == 0, which is also the correct state for a genuinely
- * empty library (nothing to load, arrays legitimately stay NULL/0 either
- * way, so that alone can't tell "not loaded yet" apart from "loaded, and
- * empty"). Reset to false below so a rescan forces a fresh lazy load next
- * time something actually needs the full arrays, rather than serving a
- * stale pre-rescan copy. */
-static bool library_arrays_loaded = false;
-
-/* Undoes everything library_scan_once() below allocates -- needed before a
- * rescan (Settings > Update Music Database) can safely repopulate these from
- * scratch, not just on first run. */
-static void library_free_scan_state(void) {
-    for (int i = 0; i < all_songs_count; i++) free(all_songs_paths[i]);
-    free(all_songs_paths);
-    all_songs_paths = NULL;
-    free(all_song_tags);
-    all_song_tags = NULL;
-    all_songs_count = 0;
-    library_arrays_loaded = false;
-
-    free_group_array(artist_groups, artist_group_count);
-    artist_groups = NULL;
-    artist_group_count = 0;
-    free_group_array(album_groups, album_group_count);
-    album_groups = NULL;
-    album_group_count = 0;
-    free_group_array(album_artist_groups, album_artist_group_count);
-    album_artist_groups = NULL;
-    album_artist_group_count = 0;
 }
 
 /* A stuck read on a corrupted SD card block (confirmed on a real device via
@@ -8009,12 +8468,6 @@ static void library_scan_once(void) {
 
     metadata_db_end_update();
 
-    /* Only after the on-disk index is complete do we replace the currently
-     * displayed snapshot. This prevents scan-time RAM from being N paths + N
-     * tags + grouping arrays simultaneously. The GUI is still an in-memory
-     * snapshot today; moving its browse/search layer to paged DB cursors is
-     * the next step toward a fully Rockbox-like architecture. */
-    library_free_scan_state();
     library_load_from_cache_only();
 }
 
@@ -8033,72 +8486,15 @@ static void library_scan_once(void) {
  * is plain bounded SQLite row reads, not per-file filesystem I/O, and
  * finishes in well under a second even for a large library -- it's
  * specifically the filesystem walk + per-file tag-parsing pass that had to
- * move to the user-triggered-only path. */
-/* The actual fix for this app's boot-time OOM on a large library: boot
- * (library_load_from_cache_only(), below) no longer touches all_songs_paths/
- * all_song_tags/the group arrays at all -- not even to read a count, since
- * setting all_songs_count from a cheap COUNT(*) query while these arrays
- * are still NULL would just move the crash from "boot always allocates
- * everything" to "the first thing that trusts all_songs_count > 0 as proof
- * the arrays are populated dereferences NULL" (caught in review before this
- * ever ran on-device -- every one of this app's ~200 existing call sites
- * makes exactly that assumption). This function is the deliberate escape
- * hatch for the handful of features not yet converted to their own paged
- * queries (Search's whole-library fallback, Shuffle All, remote-control
- * sync) -- called lazily, the first time one of them actually needs the
- * full arrays to be real, not eagerly at boot. Real-device incident
- * (today): eagerly building these same arrays for every song at boot,
- * unconditionally, is exactly what turned a completed 32,000-song scan into
- * a boot loop -- moving that cost here, gated on actual use, means a huge
- * library only ever pays it if a feature that genuinely still needs the
- * whole thing in memory gets used, not on every single boot. A future pass
- * converting those remaining callers to their own paged/on-demand queries
- * (see this session's own scoping notes) would let this function -- and
- * the four full-library arrays it fills -- be deleted outright. */
-/* All four library screens are paged now (All Songs, Artists, Albums,
- * Album Artist -- see build_all_songs_screen()'s/build_artists_screen()'s
- * own comments), so this function no longer pushes anything into any
- * compact_list widget -- it only rebuilds the raw in-memory arrays/groups
- * that drill-down, search, and the A-Z index still read directly (not yet
- * converted to their own paged queries). Populating a compact_list here
- * used to be necessary because build_*_screen() ran at boot against a
- * still-empty library; now those screens are self-sufficient (paged
- * against the DB from the moment they're built), so there's nothing left
- * for this function to hand them. */
-static void ensure_library_arrays_loaded(void) {
-    if (library_arrays_loaded) return;
-    library_arrays_loaded = true;
-
-    /* all_songs_count (and the three group counts) are set here, together
-     * with the arrays they index into, never before -- every one of this
-     * app's ~200 existing call sites treats all_songs_count > 0 as proof
-     * all_songs_paths/all_song_tags are safe to index, so those two must
-     * become valid atomically. Boot (library_load_from_cache_only() below)
-     * deliberately leaves both at their library_free_scan_state() default
-     * of 0/NULL rather than pre-setting a "real" count against still-NULL
-     * arrays, which would crash the first thing that trusted it. */
-    cached_tags_t * tags = NULL;
-    metadata_db_load_all(&all_songs_paths, &tags, &all_songs_count);
-    all_song_tags = (song_tags_t *) tags;
-    if (all_songs_count == 0) return;
-
-    build_groups_by(artist_key_of, compare_index_by_artist, &artist_groups, &artist_group_count);
-    build_groups_by(album_key_of, compare_index_by_album, &album_groups, &album_group_count);
-    build_groups_by(album_artist_key_of, compare_index_by_album_artist, &album_artist_groups, &album_artist_group_count);
-    rebuild_all_songs_sort_order();
-}
-
-/* Real-device incident: this used to eagerly load every song's tags into
- * all_songs_paths/all_song_tags (via the now-lazy ensure_library_arrays_
- * loaded() above) unconditionally on every boot -- fine for a library in
- * the low thousands, but a 32,000-song library's worth of 640-byte-per-song
- * structs, plus the widget-per-row cost every list screen built from them,
- * was enough to turn a completed scan into a boot loop on this device's 55MB
- * RAM. Boot now only reads the counts it needs to show something reasonable
- * before the first real screen is even visited; the full arrays are built
- * lazily, on whichever screen/feature first actually needs them. */
+ * move to the user-triggered-only path. All four library screens (All
+ * Songs, Artists, Albums, Album Artist) and every drill-down/search/A-Z
+ * feature reachable from them are DB-paged from the moment they're built,
+ * so boot never needs to build any whole-library in-memory snapshot at
+ * all -- the boot-time OOM this function exists to avoid (a 32,000-song
+ * library's worth of per-song structs, plus a widget-per-row cost, turning
+ * a completed scan into a boot loop on this device's 55MB RAM) simply has
+ * nothing left to trigger it. */
 static void library_load_from_cache_only(void) {
-    library_free_scan_state();
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
 
@@ -8107,8 +8503,7 @@ static void library_load_from_cache_only(void) {
 
 /* Search binding IDs -- indices into search_bindings[], defined together
  * with the rest of the live-search infrastructure much further down (near
- * the A-Z index section, since it needs artist_groups/album_groups/etc.
- * already declared). Declared this early only because
+ * the A-Z index section). Declared this early only because
  * all_songs_row_click_cb below (used by build_all_songs_screen(), itself
  * earlier in the file than the other three screens' own row-click
  * callbacks) needs to remap a filtered display index back to the real one
@@ -8162,8 +8557,7 @@ static void all_songs_row_click_cb(int display_index) {
      * mapped into the DB's own title-sorted order (the same display order
      * this screen's paged provider uses) instead of eagerly strdup'ing
      * every one of the library's paths on every tap -- see its own
-     * comment. Needs neither all_songs_count nor ensure_library_arrays_
-     * loaded() -- tap-to-play from All Songs is DB-driven end to end now. */
+     * comment. Tap-to-play from All Songs is DB-driven end to end now. */
     set_player_source_all_songs(display_index);
     on_file_selected_lazy_all_songs(display_index);
 }
@@ -8359,7 +8753,7 @@ static void group_song_row_long_press_cb(lv_event_t * e) {
 
 /* Positions/shows or hides group_songs_now_playing_bar against the CURRENT
  * group_songs_entries/count -- callable standalone (no row rebuild, no
- * scroll reset) whenever now_playing_song_index changes while this screen
+ * scroll reset) whenever now_playing_path changes while this screen
  * is open, and also called once at the end of populate_group_songs_rows()
  * itself so a freshly opened group (or an edit-mode toggle, which also goes
  * through a full repopulate) starts with the right state. Row height/gap
@@ -8483,7 +8877,7 @@ static void populate_group_songs_rows(void) {
      * as another row, same trick build_icon_grid_screen() uses for its
      * divider lines. Positioned/shown by refresh_group_songs_now_playing_
      * indicator() below, not here -- that also runs standalone (no rebuild)
-     * whenever now_playing_song_index changes while this screen stays
+     * whenever now_playing_path changes while this screen stays
      * open, e.g. a gapless auto-advance to the next track in the group. */
     group_songs_now_playing_bar = lv_obj_create(group_songs_list);
     lv_obj_remove_style_all(group_songs_now_playing_bar);
@@ -11165,10 +11559,10 @@ static void show_artist_albums(const char * name, metadata_db_group_kind_t kind)
 
 /* Paged Artists/Album Artist -- see build_artists_screen()'s own comment.
  * offset is a position in the DB's own name-sorted order (ORDER BY artist/
- * album_artist COLLATE NOCASE), the exact same order artist_groups/album_
- * artist_groups (built via strcasecmp on the same raw, never-blank tag --
- * see this file's own "Unknown Artist" fallback comment) already produce,
- * so a row tapped here safely indexes straight into that array below. */
+ * album_artist COLLATE NOCASE) -- a row tapped here (artist_row_click_cb()/
+ * album_artist_row_click_cb() below) re-resolves that same offset via
+ * metadata_db_get_groups_page() itself to get the tapped name, rather than
+ * caching anything from this page fetch. */
 static int artists_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
     (void) ctx;
     group_row_t * rows = malloc(sizeof(group_row_t) * (size_t) count);
@@ -11213,20 +11607,15 @@ static void album_row_click_cb(int index) {
 
     /* Resolve this specific (album, album_artist) pair at its current
      * display position via a single-row offset lookup (same pattern as All
-     * Songs' own row-click resolution) -- NOT album_groups[index]: that
-     * array still groups by album name alone (see build_albums_screen()'s
-     * own comment on why), so its indexing no longer agrees with this
-     * screen's own paged, correctly-disambiguated display the moment any
-     * two different artists share an album title. */
+     * Songs' own row-click resolution) -- disambiguated by album_artist too,
+     * so two different artists sharing an album title never collide. */
     group_row_t group;
     if (metadata_db_get_albums_page_filtered(NULL, index, 1, &group) != 1) return;
     if (group.song_count <= 0) return;
 
     /* metadata_db_get_album_songs() gives the real, disambiguated song list
      * directly as owned paths -- show_group_songs() takes those straight
-     * through as group_song_entry_t now, no bridge through all_songs_paths/
-     * find_song_index_by_path() (and so no ensure_library_arrays_loaded())
-     * needed at all. */
+     * through as group_song_entry_t, no whole-library array involved. */
     group_song_entry_t * entries = calloc((size_t) group.song_count, sizeof(*entries));
     int n = 0;
     song_row_t page[64];
@@ -11341,10 +11730,6 @@ typedef struct {
 static az_index_binding_t az_index_bindings[AZ_INDEX_BINDING_COUNT];
 static int az_index_registered_count = 0;
 
-static const char * artist_group_name_of(int i) { return artist_groups[i].name; }
-static const char * album_group_name_of(int i) { return album_groups[i].name; }
-static const char * album_artist_group_name_of(int i) { return album_artist_groups[i].name; }
-static const char * all_songs_sorted_name_of(int i) { return song_display_title_of(all_songs_sort_order[i]); }
 
 /* Called once per screen right after that screen (and its list) is built,
  * at both gui_init()'s boot-time build and the post-library-rescan rebuild
@@ -11445,8 +11830,8 @@ static void poll_az_index_drag(lv_timer_t * timer) {
          * has no entries ("jump forward to nearest match"). Computed fresh
          * on every touch-down via indexed boundary COUNT(*) queries
          * (metadata_db_get_az_table()) rather than a linear scan of an
-         * in-memory array, so dragging the A-Z strip never needs
-         * ensure_library_arrays_loaded(). */
+         * in-memory array, so dragging the A-Z strip never needs to load
+         * one. */
         metadata_db_get_az_table(b->db_kind, az_index_jump_table);
         lv_obj_remove_flag(b->popup, LV_OBJ_FLAG_HIDDEN);
     } else if (!pressed) {
@@ -11506,9 +11891,9 @@ typedef struct {
                               * file_browser.c's own folder-browsing UI (opaque, its own screen-colored background),
                               * hidden except while search is active, rather than the screen's one-and-only list
                               * the other four bindings resize in place. */
-    bool db_backed; /* true for Artists/Albums/Album Artist/All Songs -- search_apply_filter() below queries
-                      * metadata_db_search_names() directly instead of scanning name_of/count_ptr, and search_open()
-                      * skips ensure_library_arrays_loaded() entirely. false for Files/Subsonic (no DB-backed path). */
+    bool db_backed; /* true for Artists/Albums/Album Artist/All Songs/Files -- search_apply_filter() below queries
+                      * metadata_db_search_names() directly instead of scanning name_of/count_ptr. false only for
+                      * the two Subsonic bindings (their own remote-fetched arrays, not this DB). */
     metadata_db_az_kind_t db_kind;              /* only meaningful when db_backed */
     compact_list_fetch_page_cb_t restore_fetch_page; /* re-applied on search_close() to switch the list back to paged
                                                         * mode -- the exact same provider build_*_screen() set up,
@@ -11575,12 +11960,12 @@ static bool search_matches(const char * haystack, const char * needle) {
  * for the row-click callbacks' search_remap_index() calls. Stops once
  * SEARCH_RESULTS_MAX matches are found -- see that constant's own comment.
  *
- * db_backed bindings (Artists/Albums/Album Artist/All Songs) query metadata_
- * db_search_names() directly instead of scanning name_of/count_ptr -- no
- * ensure_library_arrays_loaded() dependency at all, matching the A-Z index's
- * own conversion. filtered_labels owns the label strings compact_list_item_t
- * points at in this path, since a DB query's results (unlike name_of()'s
- * pointers into persistent in-memory arrays) have no other long-lived home. */
+ * db_backed bindings (Artists/Albums/Album Artist/All Songs/Files) query
+ * metadata_db_search_names() directly instead of scanning name_of/count_ptr
+ * -- no whole-library array dependency at all, matching the A-Z index's own
+ * conversion. filtered_labels owns the label strings compact_list_item_t
+ * points at in this path, since a DB query's results have no other long-
+ * lived home to point into. */
 static void search_apply_filter(search_binding_t * b, const char * query) {
     bool have_query = query && query[0];
 
@@ -11861,15 +12246,14 @@ static void files_search_row_click_cb(int display_index) {
  * libraries, unlike play history/manual curation) --
  *
  * Favorites and Most Played (top 20 by play count, see metadata_db's
- * song_play_count table) are synthesized as group_t's and shown through
- * show_group_songs() -- the exact same drill-down screen Artists/Albums/
- * Album Artist already use -- rather than a screen of their own. Unlike
- * those groups (fixed at library-scan time), favorite/play-count
- * membership can change between visits, so these two are recomputed fresh
- * every time their row is tapped instead of once at scan time; the backing
- * indices arrays are freed+realloc'd on each tap rather than per screen
- * object. show_group_songs() takes an owned copy of the small result set,
- * so the DB-returned path array can be released immediately.
+ * song_play_count table) are resolved fresh from the DB on every tap and
+ * shown through show_group_songs() -- the exact same drill-down screen
+ * Artists/Albums/Album Artist already use -- rather than a screen of their
+ * own. Membership can change between visits (unlike Artists/Albums/Album
+ * Artist, fixed at scan time), so these two are recomputed fresh every
+ * time their row is tapped rather than cached. show_group_songs() takes an
+ * owned copy of the small result set, so the DB-returned path array can be
+ * released immediately.
  *
  * User-created .m3u playlists (Player screen's "Add to Playlist", or
  * dropped onto the SD card by hand) are listed below those two via
@@ -11883,12 +12267,10 @@ static void files_search_row_click_cb(int display_index) {
  * basename if a path somehow isn't in the library anymore (a stale
  * favorite/playlist entry that outlived a rescan). Caller owns the
  * returned array (free() it); paths[] itself is untouched. Shared by
- * show_favorites()/show_most_played()/show_m3u_playlist() below,
- * all three of which used to bridge through find_song_index_by_path() (and
- * so needed all_songs_paths/all_song_tags loaded) purely to get a display
- * title -- these lists are small (a hand-curated favorites list,
- * MOST_PLAYED_LIMIT, one playlist), so a DB lookup per song costs nothing
- * next to what loading the whole library used to. */
+ * show_favorites()/show_most_played()/show_m3u_playlist() below -- these
+ * lists are small (a hand-curated favorites list, MOST_PLAYED_LIMIT, one
+ * playlist), so a DB lookup per song costs nothing next to loading the
+ * whole library just to resolve a title. */
 static group_song_entry_t * build_group_song_entries_from_paths(char ** paths, int count) {
     group_song_entry_t * entries = calloc((size_t) (count > 0 ? count : 1), sizeof(*entries));
     if (!entries) return NULL;
@@ -11910,31 +12292,18 @@ static group_song_entry_t * build_group_song_entries_from_paths(char ** paths, i
     return entries;
 }
 
-/* all_songs_paths has no path->index map -- this only runs on the rare
- * "user tapped Favorites/Most Played" event, not a hot path, so a linear
- * scan is fine (same tradeoff metadata_db's own favorite/play-count tables
- * make by keying on path rather than this array's index). */
-static int find_song_index_by_path(const char * path) {
-    for (int i = 0; i < all_songs_count; i++) {
-        if (strcmp(all_songs_paths[i], path) == 0) return i;
-    }
-    return -1;
-}
-
 /* Real-device bug report: playing a song from the remote-control web UI
  * always queued the entire library (alphabetical order, whatever play_mode
  * happened to be) instead of just the Album/Playlist the song was actually
  * tapped from -- see remote_control.c's own request_play_playlist_name
  * comment for the full story. playlist_name/artist_filter/album_artist_
  * filter/album_filter are remote_control_consume_play_index()'s own
- * context, empty string meaning "not provided". song_index is a raw
- * all_songs_paths/all_song_tags index (the caller has already resolved
- * remote_control.c's song id into a path and looked that path up via
- * find_song_index_by_path()). Falls back to the
- * existing whole-library behavior whenever no usable scope resolves --
- * both the plain "no filters at all" case (someone playing from All
- * Songs/search) and a stale reference (e.g. a playlist renamed/deleted
- * since the phone last loaded its song list). */
+ * context, empty string meaning "not provided". song_path is the caller's
+ * own DB resolution of remote_control.c's song id (metadata_db_get_song_
+ * by_id()). Falls back to the existing whole-library behavior whenever no
+ * usable scope resolves -- both the plain "no filters at all" case (someone
+ * playing from All Songs/search) and a stale reference (e.g. a playlist
+ * renamed/deleted since the phone last loaded its song list). */
 static void play_remote_control_song(const char * song_path, const char * playlist_name, const char * artist_filter,
                                       const char * album_artist_filter, const char * album_filter) {
     if (!song_path || !song_path[0]) return;
@@ -12023,21 +12392,20 @@ static void play_remote_control_song(const char * song_path, const char * playli
     }
 }
 
-/* Called from apply_track_metadata_to_ui() right after now_playing_song_
- * index is updated -- the single dispatch point that pushes it out to
- * every now-playing-aware list. Artists/Albums/Album Artist match by name
- * (a whole group's songs share one row, so the indicator lights up
- * whichever artist/album/album-artist the CURRENT TRACK belongs to, not
- * just an exact-index match); All Songs matches by exact song identity,
- * reverse-mapped through all_songs_sort_order since row i displays
- * all_songs_sort_order[i], not song index i directly (see all_songs_row_
- * click_cb()'s own comment). Skips (rather than asserts on) any list
- * that's NULL -- Artists/Albums/Album Artist/All Songs are all built once
- * at startup so in practice this only ever matters before gui_init()
- * finishes building them, but there's no reason to depend on call-order
- * here when a simple guard covers it. Not a hot path (once per real
- * track-start event, matching find_song_index_by_path()'s own linear-scan
- * tradeoff above), so four more linear scans are fine. */
+/* Called from apply_track_metadata_to_ui() right after now_playing_path is
+ * updated -- the single dispatch point that pushes it out to every now-
+ * playing-aware list. Resolves the playing path's own tags via a single DB
+ * lookup (metadata_db_get_song_by_path()), then each of Artists/Albums/
+ * Album Artist/All Songs gets its own display offset via metadata_db_get_
+ * group_offset()/metadata_db_get_song_title_offset() -- Artists/Albums/
+ * Album Artist match by name (a whole group's songs share one row, so the
+ * indicator lights up whichever artist/album/album-artist the CURRENT
+ * TRACK belongs to, not just an exact-song match); All Songs matches by
+ * exact song identity. Skips (rather than asserts on) any list that's
+ * NULL -- Artists/Albums/Album Artist/All Songs are all built once at
+ * startup so in practice this only ever matters before gui_init() finishes
+ * building them, but there's no reason to depend on call-order here when a
+ * simple guard covers it. */
 static void refresh_now_playing_indicators(void) {
     int artist_row = -1, album_row = -1, album_artist_row = -1, all_songs_row = -1;
 
@@ -12340,10 +12708,13 @@ static lv_obj_t * build_playlists_screen(void) {
  * file -- then rebuilds the four prebuilt library screens (All Songs,
  * Artists, Albums, Album Artist), since unlike group_songs_screen/
  * artist_albums_screen (which rebuild their rows on every visit) these are
- * only ever built once at startup and would otherwise keep showing rows
- * bound to indices into the now-freed pre-rescan arrays. Playlists isn't
- * one of these four -- see its own build_playlists_screen()/populate_
- * playlists_screen() comment for why it doesn't need rebuilding here. */
+ * only ever built once at startup: each one's compact_list_set_paged_
+ * provider() call captured a total_count at that build time, which a
+ * rescan can make stale (more/fewer songs, artists, albums), so the whole
+ * screen is rebuilt to pick up a fresh count rather than trying to patch
+ * one in place. Playlists isn't one of these four -- see its own build_
+ * playlists_screen()/populate_playlists_screen() comment for why it
+ * doesn't need rebuilding here. */
 static pthread_t library_rescan_thread;
 static bool library_rescan_active = false;
 static volatile bool library_rescan_done_flag = false;
@@ -12359,9 +12730,10 @@ static void start_library_rescan(void) {
     /* Real-device incident: several call sites below don't already guard on
      * library_rescan_active themselves, and a second call while a rescan
      * thread is still running would spawn a second library_rescan_thread_
-     * func() thread stomping the same all_songs_paths/all_song_tags arrays
-     * and the single library_rescan_thread handle -- undefined behavior, not
-     * just wasted work. */
+     * func() thread racing the first over metadata_db.c's own scan-
+     * generation state (metadata_db_begin_update()/end_update()) and
+     * stomping the single library_rescan_thread handle -- undefined
+     * behavior, not just wasted work. */
     if (library_rescan_active) return;
     library_rescan_done_flag = false;
     library_rescan_active = true;
@@ -12373,12 +12745,12 @@ static void start_library_rescan(void) {
 }
 
 /* Rebuilds the four prebuilt library screens (All Songs, Artists, Albums,
- * Album Artist) against whatever's now in all_songs_paths/artist_groups/
- * album_groups/album_artist_groups -- unlike group_songs_screen/
- * artist_albums_screen (which rebuild their rows on every visit) these are
- * only ever built once at startup and would otherwise keep showing rows
- * bound to indices into freed arrays after ANY reload of the underlying
- * data, not just a full rescan -- shared by poll_library_rescan()'s
+ * Album Artist) so each one's compact_list_set_paged_provider() call
+ * recaptures a fresh total_count against the just-reloaded library --
+ * unlike group_songs_screen/artist_albums_screen (which rebuild their rows
+ * on every visit) these are only ever built once at startup, so a stale
+ * cached count would otherwise persist after ANY reload of the underlying
+ * data, not just a full rescan. Shared by poll_library_rescan()'s
  * background-scan-completion path below and reload_library_on_sd_reinsert()'s
  * fast-cache-load path further down, both of which replace that data via a
  * different route (library_scan_once() vs library_load_from_cache_only())
@@ -12403,12 +12775,10 @@ static void refresh_library_screens_after_reload(void) {
     lv_obj_delete(album_artist_screen);
     /* Each build_*_screen() below activates its own paged provider against
      * the current (fresh, post-reload) library internally -- no separate
-     * ensure_library_arrays_loaded()/populate step needed here anymore, and
-     * deliberately not added back: the same lazy-loading benefit gui_init()
-     * gets at boot (drill-down/search/A-Z index still pay the full-array
-     * cost, but only when actually used, not just because a rescan/SD-
-     * reinsert reload happened) now applies consistently after a reload
-     * too, not only at first boot. */
+     * populate step needed here, and no whole-library load either: drill-
+     * down, search, and the A-Z index are all DB-backed end to end now, so
+     * a rescan/SD-reinsert reload costs exactly what a fresh boot does,
+     * nothing more. */
     all_songs_screen = build_all_songs_screen();
     artists_screen = build_artists_screen();
     albums_screen = build_albums_screen();
@@ -12423,13 +12793,13 @@ static void refresh_library_screens_after_reload(void) {
     register_az_index(album_artist_screen, album_artist_list, METADATA_DB_AZ_ALBUM_ARTIST);
     register_az_index(all_songs_screen, all_songs_list, METADATA_DB_AZ_ALL_SONGS);
 
-    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, artist_group_name_of, &artist_group_count, false,
+    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, NULL, NULL, false,
                      true, METADATA_DB_AZ_ARTIST, artists_fetch_page);
-    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, album_group_name_of, &album_group_count, false,
+    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, NULL, NULL, false,
                      true, METADATA_DB_AZ_ALBUM, albums_fetch_page);
-    register_search(SEARCH_BINDING_ALBUM_ARTIST, album_artist_screen, album_artist_list, album_artist_group_name_of,
-                     &album_artist_group_count, false, true, METADATA_DB_AZ_ALBUM_ARTIST, album_artists_fetch_page);
-    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count, false,
+    register_search(SEARCH_BINDING_ALBUM_ARTIST, album_artist_screen, album_artist_list, NULL,
+                     NULL, false, true, METADATA_DB_AZ_ALBUM_ARTIST, album_artists_fetch_page);
+    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, NULL, NULL, false,
                      true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 }
 
@@ -12456,14 +12826,10 @@ static void refresh_library_screens_after_reload(void) {
  * reason. */
 static void reload_library_on_sd_reinsert(void) {
     library_load_from_cache_only();
-    /* metadata_db_get_song_count() (a cheap COUNT(*), not all_songs_count --
-     * library_load_from_cache_only() deliberately no longer sets that; see
-     * its own comment) is what actually decides "does this card have a
-     * usable cache" here: checking all_songs_count instead would read 0
-     * regardless of the real database, since nothing has called
-     * ensure_library_arrays_loaded() yet at this point -- always falling
-     * through to a full, unnecessary start_library_rescan() on every single
-     * reinsertion, even a card with a perfectly good existing cache. */
+    /* metadata_db_get_song_count() (a cheap COUNT(*) against the freshly
+     * opened DB) is what decides "does this card have a usable cache"
+     * here -- a real, live read of the reopened database, not a cached
+     * in-memory count that could be stale or unset at this point. */
     if (metadata_db_get_song_count() > 0) {
         refresh_library_screens_after_reload();
         show_info_toast("Library updated");
@@ -13266,11 +13632,11 @@ static void update_music_database_row_cb(lv_event_t * e) {
     start_library_rescan();
 }
 
-/* No ensure_library_arrays_loaded() calls in these three -- all paged now,
- * see build_artists_screen()'s own comment. Loading still happens lazily
- * where it's actually needed: drilling into an artist/album-artist's own
- * albums (artist_row_click_cb()/album_artist_row_click_cb()), an album's
- * own songs (album_row_click_cb()), search, or the A-Z index. */
+/* No whole-library load anywhere in this app anymore -- all paged/DB-
+ * backed now, see build_artists_screen()'s own comment. Drilling into an
+ * artist/album-artist's own albums (artist_row_click_cb()/album_artist_
+ * row_click_cb()), an album's own songs (album_row_click_cb()), search,
+ * and the A-Z index are all direct, targeted DB queries. */
 static void artists_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_push(artists_screen);
@@ -18250,20 +18616,16 @@ static lv_obj_t * build_eq_screen(void) {
 
 /* Rebuild the queue in the same logical context that supplied last_track.
  * Older settings files have kind 0 and retain the legacy containing-folder
- * fallback.  Album and All Songs contexts are reconstructed from the
- * metadata index -- so the player's List action and next/prev order survive
- * a reboot instead of silently becoming a different queue -- IF that index
- * happens to already be loaded (ensure_library_arrays_loaded() deliberately
- * not called here: this runs from gui_init()'s own auto-resume path for
- * every user with Resume Last Track enabled, and forcing a full library
- * load right here would reintroduce this rework's whole reason for
- * existing, just for a different subset of boots). When it isn't,
- * find_song_index_by_path() below returns -1, every kind-1/kind-2 branch
- * below correctly falls through, and this ends at the same live-filesystem-
- * walk fallback (file_browser_build_playlist_for_path()) that already
- * handles kind 0 -- resume still works, just reconstructing a plain-folder
- * queue instead of the exact All-Songs/album context, until the user visits
- * one of the four library screens for some other reason. */
+ * fallback. Album and All Songs contexts are reconstructed via direct DB
+ * queries (metadata_db_count_songs_filtered()/get_songs_filtered_page()/
+ * get_song_title_offset()) -- so the player's List action and next/prev
+ * order survive a reboot instead of silently becoming a different queue --
+ * with no dependency on any in-memory library array being loaded. If
+ * last_track no longer resolves in the DB (metadata_db_get_song_by_path()
+ * fails, e.g. the file was removed since the last scan) or its saved kind's
+ * own DB lookup comes up empty, every kind-1/kind-2 branch below falls
+ * through to the same live-filesystem-walk fallback (file_browser_build_
+ * playlist_for_path()) that already handles kind 0. */
 static bool resume_playlist_needs_lazy_order = false;
 
 static bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * out_index) {
@@ -18476,6 +18838,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("build_player_screen done");
 #endif
+    lyrics_screen = build_lyrics_screen();
     /* Converts any pre-existing absolute-path playlist entries (everything
      * written before playlist_files_append()/_create() started writing
      * relative ones) to relative -- see playlist_files_migrate_to_relative()'s
@@ -18494,26 +18857,26 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     artists_screen = build_artists_screen();
     albums_screen = build_albums_screen();
     album_artist_screen = build_album_artist_screen();
-    /* No eager ensure_library_arrays_loaded() call here on purpose --
-     * remote_control.c now queries metadata_db.c directly (its own
-     * METADATA_DB_GUARD) rather than needing a synced copy of the library,
-     * so there's nothing left that needs the arrays loaded at boot just
-     * because Remote Control is enabled. The four screens above start
-     * empty and get populated lazily the first time a real UI entry point
-     * (a tile tap, etc.) calls ensure_library_arrays_loaded() -- exactly
-     * the boot-cost-avoidance this whole rework exists for. */
+    /* No whole-library load anywhere in this boot path, on purpose --
+     * remote_control.c queries metadata_db.c directly (its own METADATA_DB_
+     * GUARD) rather than needing a synced copy of the library, and each of
+     * the four build_*_screen() calls above already activates its own
+     * paged provider against the DB internally (see build_all_songs_
+     * screen()'s own comment), so there's nothing left that would need a
+     * whole-library array at boot for any reason, Remote Control enabled
+     * or not. */
     register_az_index(artists_screen, artists_list, METADATA_DB_AZ_ARTIST);
     register_az_index(albums_screen, albums_list, METADATA_DB_AZ_ALBUM);
     register_az_index(album_artist_screen, album_artist_list, METADATA_DB_AZ_ALBUM_ARTIST);
     register_az_index(all_songs_screen, all_songs_list, METADATA_DB_AZ_ALL_SONGS);
 
-    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, artist_group_name_of, &artist_group_count, false,
+    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, NULL, NULL, false,
                      true, METADATA_DB_AZ_ARTIST, artists_fetch_page);
-    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, album_group_name_of, &album_group_count, false,
+    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, NULL, NULL, false,
                      true, METADATA_DB_AZ_ALBUM, albums_fetch_page);
-    register_search(SEARCH_BINDING_ALBUM_ARTIST, album_artist_screen, album_artist_list, album_artist_group_name_of,
-                     &album_artist_group_count, false, true, METADATA_DB_AZ_ALBUM_ARTIST, album_artists_fetch_page);
-    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count, false,
+    register_search(SEARCH_BINDING_ALBUM_ARTIST, album_artist_screen, album_artist_list, NULL,
+                     NULL, false, true, METADATA_DB_AZ_ALBUM_ARTIST, album_artists_fetch_page);
+    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, NULL, NULL, false,
                      true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 
     /* Files' search-results overlay: a compact-list widget layered on top
@@ -18539,7 +18902,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * own -- needs the same explicit gesture-bubble treatment. */
     lv_obj_add_flag(files_search_list, LV_OBJ_FLAG_GESTURE_BUBBLE);
     enable_gesture_bubble_recursive(files_search_list);
-    register_search(SEARCH_BINDING_FILES, files_screen, files_search_list, all_songs_sorted_name_of, &all_songs_count, true,
+    register_search(SEARCH_BINDING_FILES, files_screen, files_search_list, NULL, NULL, true,
                      true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 
     playlists_screen = build_playlists_screen();

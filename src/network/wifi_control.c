@@ -15,9 +15,50 @@ bool wifi_control_is_enabled(void) {
     return access("/var/run/wpa_supplicant/" WIFI_INTERFACE, F_OK) == 0;
 }
 
+/* Real-device bug report: WiFi wasn't automatically reconnecting to saved
+ * networks (most visibly after suspend/resume, which tears the radio down
+ * and calls this to bring it back -- see power_suspend.c's own
+ * radio_restore_thread_func()). Root cause, confirmed live: /usr/bin/
+ * wifi_on.sh (stock firmware script, not this project's own -- not
+ * something this build ships or can patch) starts wpa_supplicant, waits a
+ * hardcoded 1.3s, then fires udhcpc once with -q (exit once it gets a
+ * lease, or gives up). A real AP's association + WPA handshake can easily
+ * take longer than 1.3s, especially right after a radio power-cycle --
+ * when it does, udhcpc's one DHCPDISCOVER attempt goes out before the
+ * interface has any real L2 connectivity, gets no response, and udhcpc
+ * just exits instead of retrying. Reproduced directly on-device: wpa_cli
+ * status read wpa_state=COMPLETED (fully associated) with no ip_address=
+ * line at all, udhcpc no longer even in the process list -- the radio was
+ * genuinely connected and would stay that way forever with no IP, since
+ * nothing else ever re-kicks DHCP.
+ *
+ * Fixed here, not in wifi_on.sh (can't patch stock firmware, and this is
+ * the one place already treated as "slow, call from a background thread"
+ * by every caller -- see wifi_toggle_thread_func()'s own comment): poll
+ * wpa_cli status for up to ~10s for either an IP to show up on its own (the
+ * script's own udhcpc call winning the race, the common case) or
+ * association to complete; if it associated but still has no IP once that
+ * window closes, re-run udhcpc ourselves once, the same invocation
+ * wifi_on.sh's own last line uses. */
 void wifi_control_enable(void) {
     char * argv[] = { (char *) "/usr/bin/wifi_on.sh", NULL };
     subprocess_run(argv, NULL, 0);
+
+    bool associated = false, got_ip = false;
+    for (int i = 0; i < 20 && !got_ip; i++) {
+        usleep(500000);
+        char status_buf[512];
+        char * status_argv[] = { (char *) "wpa_cli", (char *) "-i", (char *) WIFI_INTERFACE, (char *) "status",
+                                 NULL };
+        if (!subprocess_run(status_argv, status_buf, sizeof(status_buf))) continue;
+        associated = strstr(status_buf, "wpa_state=COMPLETED") != NULL;
+        got_ip = strstr(status_buf, "\nip_address=") != NULL;
+    }
+    if (associated && !got_ip) {
+        char * dhcp_argv[] = { (char *) "udhcpc", (char *) "-b", (char *) "-i", (char *) WIFI_INTERFACE,
+                               (char *) "-q", NULL };
+        subprocess_run(dhcp_argv, NULL, 0);
+    }
 }
 
 void wifi_control_disable(void) {

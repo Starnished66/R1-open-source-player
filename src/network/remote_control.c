@@ -539,17 +539,22 @@ static void build_queue_json(char * out, size_t out_size) {
     free(ids);
 }
 
-/* Now Playing page -- polls /api/status every second, transport buttons
- * and a volume slider post to the Phase 2 endpoints below. Plain vanilla
- * HTML/CSS/JS, no framework or build step, matching this project's own
- * "no build tooling beyond what's already here" approach everywhere
- * else. The volume slider deliberately doesn't post on every drag tick
- * (see its own oninput/onchange split) -- only on release, so dragging it
- * doesn't flood the device with a request per pixel of movement. */
-static const char * const NOW_PLAYING_HTML =
+/* The whole remote-control web app: a persistent playback header (art/
+ * title/transport/volume, polling /api/status every second) always shown
+ * above whichever of Library/Queue/Playlists is the active bottom-nav tab
+ * -- there's no separate "Now Playing" tab (removed: with the header
+ * always visible regardless of tab, a tab that just cleared the content
+ * area to blank had nothing of its own to show). Transport buttons and the
+ * volume slider post to the Phase 2 endpoints below. Plain vanilla HTML/
+ * CSS/JS, no framework or build step, matching this project's own "no
+ * build tooling beyond what's already here" approach everywhere else. The
+ * volume slider deliberately doesn't post on every drag tick (see its own
+ * oninput/onchange split) -- only on release, so dragging it doesn't flood
+ * the device with a request per pixel of movement. */
+static const char * const REMOTE_CONTROL_APP_HTML =
     "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>Now Playing</title><style>"
+    "<title>Remote Control</title><style>"
     "*{box-sizing:border-box}"
     ":root{--maxw:480px}"
     "body{background:#111;color:#eee;font-family:sans-serif;text-align:center;"
@@ -635,7 +640,6 @@ static const char * const NOW_PLAYING_HTML =
     "<button onclick=\"saveToSelectedPlaylist()\">Add</button></div></div></div>"
     "<div id=\"toast\" role=\"status\" aria-live=\"polite\"></div>"
     "<nav id=\"bottomNav\" aria-label=\"Main navigation\">"
-    "<button id=\"navNow\" onclick=\"showNowPlaying()\">Now Playing</button>"
     "<button id=\"navLibrary\" onclick=\"showMenu()\">Library</button>"
     "<button id=\"navQueue\" onclick=\"showQueue()\">Queue</button>"
     "<button id=\"navPlaylists\" onclick=\"showPlaylists()\">Playlists</button></nav>"
@@ -646,10 +650,8 @@ static const char * const NOW_PLAYING_HTML =
     "clearTimeout(t._timer);t._timer=setTimeout(function(){t.style.display='none';},1800);}"
     "function post(path,okmsg){return fetch(path,{method:'POST'}).then(function(r){if(!r.ok)throw Error();"
     "if(okmsg)toast(okmsg);return r;}).catch(function(){toast('Device request failed');});}"
-    "function activeNav(id){['navNow','navLibrary','navQueue','navPlaylists'].forEach(function(n){"
+    "function activeNav(id){['navLibrary','navQueue','navPlaylists'].forEach(function(n){"
     "document.getElementById(n).classList.toggle('active',n===id);});}"
-    "function showNowPlaying(){view='now';activeNav('navNow');setHeader(false);"
-    "document.getElementById('content').innerHTML='';document.getElementById('content').className='';window.scrollTo(0,0);}"
     "var pendingPlaylistIndex=-1;"
     "function addToPlaylist(index){pendingPlaylistIndex=index;"
     "fetch('/api/playlists').then(r=>r.json()).then(function(d){"
@@ -1257,7 +1259,7 @@ static void handle_connection(int cfd) {
         } else if (strcmp(path_only, "/assets/icon") == 0) {
             handle_icon_request(cfd, path);
         } else if (strcmp(path_only, "/") == 0) {
-            send_response(cfd, "200 OK", "text/html", NOW_PLAYING_HTML);
+            send_response(cfd, "200 OK", "text/html", REMOTE_CONTROL_APP_HTML);
         } else {
             send_response(cfd, "404 Not Found", "text/plain", "Not Found");
         }

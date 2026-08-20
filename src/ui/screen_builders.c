@@ -1,9 +1,14 @@
 #include "screen_builders.h"
 #include "assets.h"
+#include "debug_log.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -742,6 +747,17 @@ typedef struct {
     int cache_start; /* logical offset of cache_labels[0]; -1 = cache empty/invalid, forces a fetch on next window update */
     int cache_count; /* how many of cache_labels[] are valid (less than COMPACT_LIST_PAGE_CACHE_SIZE only at the tail of the list) */
     char cache_labels[COMPACT_LIST_PAGE_CACHE_SIZE][COMPACT_LIST_LABEL_MAX];
+
+    /* Background page fetch -- see compact_list_ensure_cache()'s own
+     * comment for why this moved off the scroll-event/UI thread. NULL
+     * when no fetch is currently in flight for this list; at most one at a
+     * time (see that function's own reasoning). pending_job_started_at is
+     * only meaningful while pending_job is non-NULL. poll_timer is created
+     * once per list (build_compact_list_widget()) and paused whenever
+     * nothing is pending, so it costs nothing while idle. */
+    struct compact_list_fetch_job_s * pending_job;
+    struct timespec pending_job_started_at;
+    lv_timer_t * poll_timer;
 } compact_list_virtual_data_t;
 
 /* Bar width only -- height always matches LIST_ROW_HEIGHT (see
@@ -780,18 +796,164 @@ static void compact_list_row_long_press_cb(lv_event_t * e) {
     ctx->data->on_long_press(index);
 }
 
-/* Paged mode only -- refetches cache_labels[] from fetch_page() if the
- * current cache doesn't already fully cover [first, first+POOL_SIZE).
+/* How often compact_list_poll_fetch_cb() below checks a pending job for
+ * completion -- a DB fetch takes at least several ms, so polling every
+ * frame (like the 60fps drag timers elsewhere in this file's sibling gui.c)
+ * would be pure waste; this is still fast enough that the delay between a
+ * fetch actually landing and the list repainting is imperceptible. */
+#define COMPACT_LIST_FETCH_POLL_MS 50
+
+/* Real-device precedent: a stuck SD-card read can land in an uninterruptible
+ * kernel wait that nothing but abandoning it escapes -- see gui.c's own
+ * LIBRARY_SCAN_FILE_TIMEOUT_MS comment for the same class of fault on this
+ * hardware (confirmed there via /proc/<pid>/task/<tid>/status+wchan showing
+ * the thread parked in __bread_gfp after a card came back from an unclean
+ * unmount). Same budget here, same tolerance: past this, compact_list_poll_
+ * fetch_cb() stops waiting on the job and detaches it instead of joining,
+ * leaking one thread and one small allocation for the rare, genuinely-
+ * corrupted-card case rather than ever blocking scrolling on it. */
+#define COMPACT_LIST_FETCH_TIMEOUT_MS 5000L
+
+/* One in-flight background page fetch -- heap-allocated separately from
+ * compact_list_virtual_data_t (not embedded in it) so it can safely outlive
+ * the list/data if the read is still running when the list is deleted, or
+ * handed a new provider, before this one finishes (see compact_list_set_
+ * paged_provider()'s/compact_list_set_items()'s own handling, and compact_
+ * list_delete_event_cb()'s). The worker thread below touches only its own
+ * fields here via fetch_page()'s own metadata_db.c call (thread-safe on its
+ * own METADATA_DB_GUARD) -- never any LVGL object or compact_list_virtual_
+ * data_t field -- so there is no cross-thread UI-safety concern; the poll
+ * timer is the only place a finished job's result is ever applied, and it
+ * always runs on the UI thread like every other LVGL timer callback. */
+typedef struct compact_list_fetch_job_s {
+    pthread_t thread;
+    compact_list_fetch_page_cb_t fetch_page;
+    void * provider_ctx;
+    int offset;
+    int count;
+    char labels[COMPACT_LIST_PAGE_CACHE_SIZE][COMPACT_LIST_LABEL_MAX];
+    /* -1 until the worker thread finishes; written last, the only field the
+     * poll timer reads to decide the job is done. atomic_int rather than a
+     * plain volatile int -- analyzer finding: pthread_join() (called once
+     * result_count>=0 is observed) already makes everything AFTER that
+     * observation fully synchronized, including labels[]/refs, but the
+     * read/write of result_count ITSELF has no C11-recognized ordering
+     * between the two threads otherwise, which is formally a data race
+     * regardless of what happens later. A plain int (word-sized, written
+     * once, no read-modify-write) is safe in practice on real hardware
+     * either way -- this is the exact same poll-a-flag idiom used
+     * throughout the rest of this codebase (cover_decode_done_flag,
+     * lyrics_load_done_flag, etc.) -- but atomic_int makes this specific,
+     * already-flagged instance formally correct at no behavioral cost:
+     * plain assignment/comparison on an _Atomic-qualified object already
+     * uses sequentially consistent ordering by default in C11, so every
+     * existing read/write site below is unchanged syntactically. */
+    atomic_int result_count;
+    /* Two owners share this job's lifetime: the worker thread's own
+     * execution, and whichever UI-thread path eventually resolves it
+     * (compact_list_poll_fetch_cb()'s normal completion, or compact_list_
+     * abandon_job() below). Each releases its own reference exactly once
+     * via compact_list_job_release(); whichever release brings this to 0
+     * -- which one that is depends on real timing and isn't knowable in
+     * advance -- does the actual free(). A plain bool flag here (an
+     * earlier version of this fix used one) is NOT safe for this: the
+     * worker's check-then-free and the UI thread's write-then-detach are
+     * two independent read/write pairs on the SAME field with no ordering
+     * between them, so either side could free the job while the other is
+     * still about to touch it (real analyzer-caught bug, not just a
+     * theoretical concern -- pthread_detach(job->thread) reading `job`
+     * after the worker had already freed it, or the opposite: worker sees
+     * `false` and returns without freeing at all, leaking it anyway).
+     * An atomic refcount makes "who does the free" an unambiguous, race-
+     * free question. */
+    atomic_int refs;
+} compact_list_fetch_job_t;
+
+/* Releases one of a job's two references -- see compact_list_fetch_job_s's
+ * own doc comment. atomic_fetch_sub() returns the value from BEFORE the
+ * decrement, so `== 1` means this call just brought it from 1 to 0: the
+ * other side already released, and this call is the second/last one, so
+ * it's the one responsible for the actual free(). */
+static void compact_list_job_release(compact_list_fetch_job_t * job) {
+    if (atomic_fetch_sub(&job->refs, 1) == 1) free(job);
+}
+
+static void * compact_list_fetch_worker(void * arg) {
+    compact_list_fetch_job_t * job = (compact_list_fetch_job_t *) arg;
+    job->result_count = job->fetch_page(job->provider_ctx, job->offset, job->count, job->labels);
+    compact_list_job_release(job); /* the worker's own reference -- job may already be freed by the other side by the time this call returns */
+    return NULL;
+}
+
+/* Abandons a job without waiting on it -- pthread_join() would block for as
+ * long as the underlying read takes, which is exactly what this whole
+ * background-fetch scheme exists to never do again on the UI/scroll
+ * thread. Real-device/analyzer finding: every abandon path used to just
+ * detach and never free the job struct at all, tolerated as a "rare,
+ * bounded" leak for the original 5s-stuck-read timeout case -- but this is
+ * also called from compact_list_cancel_pending_job() below on every
+ * ordinary list/search switch, not just that rare case, so the leak was
+ * far from rare in practice. Two paths now: if the job has ALREADY
+ * finished (result_count landed) but just hasn't been polled/applied yet,
+ * join it directly -- pthread_join() is effectively instant once
+ * result_count is set, the same reasoning compact_list_poll_fetch_cb()'s
+ * own normal-completion path already relies on. Only a job that's
+ * genuinely still running falls through to detach; either way, this
+ * releases the UI-side reference afterward, safe to do unconditionally
+ * since pthread_detach()/pthread_join() above already ran while this
+ * thread's own reference was still guaranteed outstanding (the refcount
+ * can't have reached 0 without this release, so job->thread was still
+ * valid to read either way). */
+static void compact_list_abandon_job(compact_list_fetch_job_t * job) {
+    if (job->result_count >= 0) {
+        pthread_join(job->thread, NULL);
+    } else {
+        pthread_detach(job->thread);
+    }
+    compact_list_job_release(job);
+}
+
+/* Abandons data->pending_job (if any) and clears it -- called whenever a
+ * list is about to point at a different provider/items[] entirely (compact_
+ * list_set_items()/compact_list_set_paged_provider() below), so a fetch
+ * still running against the OLD provider can never land later and overwrite
+ * cache_labels[] with data for a list the caller has already replaced. The
+ * abandoned job's result, if it ever arrives, is simply never looked at
+ * again, but the allocation itself is still safely reclaimed via
+ * compact_list_job_release() -- see compact_list_abandon_job()'s own
+ * comment -- just triggered by "provider changed" instead of a timeout. */
+static void compact_list_cancel_pending_job(compact_list_virtual_data_t * data) {
+    if (!data->pending_job) return;
+    compact_list_abandon_job(data->pending_job);
+    data->pending_job = NULL;
+    if (data->poll_timer) lv_timer_pause(data->poll_timer);
+}
+
+/* Paged mode only -- kicks off a background refetch of cache_labels[] via
+ * fetch_page() if the current cache doesn't already cover [first,
+ * first+POOL_SIZE) AND no fetch is currently in flight for this list.
  * Centers the new cache page around `first` with generous overscan on both
  * sides so a scroll continuing in the same direction doesn't immediately
  * fall back out of the cached range and re-fetch again next frame. One
- * fetch_page() call, not one per row -- COMPACT_LIST_PAGE_CACHE_SIZE rows
- * at once. */
-static void compact_list_ensure_cache(compact_list_virtual_data_t * data, int first) {
+ * fetch_page() call, not one per row -- COMPACT_LIST_PAGE_CACHE_SIZE rows at
+ * once.
+ *
+ * Real-device concern this replaces a synchronous version of: fetch_page()
+ * ultimately reads the on-disk DB (metadata_db.c) on the SD card -- calling
+ * it directly from here (compact_list_update_window(), itself called from
+ * the LV_EVENT_SCROLL handler) blocked the whole UI/render thread for
+ * however long that read took, on every single cache miss. At most one
+ * fetch is ever in flight per list (the `pending_job` check below) --
+ * a second cache miss arriving while one's already running just waits for
+ * it, rather than piling up concurrent reads against the same list; the
+ * next scroll tick (or compact_list_poll_fetch_cb() once it lands) tries
+ * again if the window has moved further since. */
+static void compact_list_ensure_cache(lv_obj_t * list, compact_list_virtual_data_t * data, int first) {
     int window_end = first + COMPACT_LIST_POOL_SIZE;
     bool covered = data->cache_start >= 0 && first >= data->cache_start &&
                     window_end <= data->cache_start + data->cache_count;
     if (covered) return;
+    if (data->pending_job) return;
 
     int fetch_start = first - (COMPACT_LIST_PAGE_CACHE_SIZE - COMPACT_LIST_POOL_SIZE) / 2;
     if (fetch_start < 0) fetch_start = 0;
@@ -803,8 +965,29 @@ static void compact_list_ensure_cache(compact_list_virtual_data_t * data, int fi
     if (fetch_start + want > data->item_count) want = data->item_count - fetch_start;
     if (want < 0) want = 0;
 
-    data->cache_count = want > 0 ? data->fetch_page(data->provider_ctx, fetch_start, want, data->cache_labels) : 0;
-    data->cache_start = fetch_start;
+    if (want == 0) {
+        data->cache_count = 0;
+        data->cache_start = fetch_start;
+        return;
+    }
+
+    compact_list_fetch_job_t * job = malloc(sizeof(*job));
+    if (!job) return; /* next scroll tick retries */
+    job->fetch_page = data->fetch_page;
+    job->provider_ctx = data->provider_ctx;
+    job->offset = fetch_start;
+    job->count = want;
+    atomic_init(&job->result_count, -1);
+    atomic_init(&job->refs, 2); /* worker's own reference + whichever UI-side path resolves it -- see compact_list_fetch_job_s's own doc comment */
+    if (pthread_create(&job->thread, NULL, compact_list_fetch_worker, job) != 0) {
+        DBG_LOG("compact_list: pthread_create FAILED offset=%d want=%d\n", fetch_start, want);
+        free(job);
+        return; /* next scroll tick retries */
+    }
+
+    data->pending_job = job;
+    clock_gettime(CLOCK_MONOTONIC, &data->pending_job_started_at);
+    if (data->poll_timer) lv_timer_resume(data->poll_timer);
 }
 
 /* Repositions/relabels the row pool so it covers the range of items
@@ -828,7 +1011,7 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
     if (max_first < 0) max_first = 0;
     if (first > max_first) first = max_first;
 
-    if (data->fetch_page) compact_list_ensure_cache(data, first);
+    if (data->fetch_page) compact_list_ensure_cache(list, data, first);
 
     if (first == data->window_start) return;
     data->window_start = first;
@@ -851,6 +1034,58 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
     }
 }
 
+/* Checks data->pending_job (set by compact_list_ensure_cache() above) for
+ * completion, applies the result and repaints once it lands, and pauses
+ * itself again once there's nothing left to watch -- see this timer's own
+ * creation comment (build_compact_list_widget()) for why it's per-list and
+ * starts paused rather than a single always-on global timer. */
+static void compact_list_poll_fetch_cb(lv_timer_t * timer) {
+    lv_obj_t * list = (lv_obj_t *) lv_timer_get_user_data(timer);
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    compact_list_fetch_job_t * job = data->pending_job;
+    if (!job) {
+        lv_timer_pause(timer);
+        return;
+    }
+
+    if (job->result_count >= 0) {
+        pthread_join(job->thread, NULL); /* already returned by the time result_count landed -- instant, not a real wait */
+        data->pending_job = NULL;
+        memcpy(data->cache_labels, job->labels, sizeof(data->cache_labels));
+        data->cache_count = job->result_count;
+        data->cache_start = job->offset;
+        compact_list_job_release(job); /* the UI-side reference -- see compact_list_fetch_job_s's own doc comment */
+
+        data->window_start = -1; /* force a repaint even if the visible offset didn't move meanwhile */
+        compact_list_update_window(list, data);
+        /* Real bug caught here: compact_list_update_window() above calls
+         * compact_list_ensure_cache() against the list's CURRENT live
+         * scroll position, not the one this job was fetched for -- if the
+         * user kept scrolling while this fetch was in flight, that call
+         * can itself spawn a brand-new pending_job and resume this exact
+         * timer for it, right before this line would unconditionally pause
+         * it again -- silently orphaning the new job forever (it finishes,
+         * but nothing is left polling it). Only pause if nothing new got
+         * queued during that repaint. */
+        if (!data->pending_job) lv_timer_pause(timer);
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - data->pending_job_started_at.tv_sec) * 1000L +
+                      (now.tv_nsec - data->pending_job_started_at.tv_nsec) / 1000000L;
+    if (elapsed_ms >= COMPACT_LIST_FETCH_TIMEOUT_MS) {
+        /* See COMPACT_LIST_FETCH_TIMEOUT_MS's own comment -- a genuinely
+         * stuck read, not just a slow one. Give up waiting; the next scroll
+         * tick starts a fresh job once this is cleared. Rows stay blank for
+         * whatever range this would have filled until then. */
+        compact_list_abandon_job(job);
+        data->pending_job = NULL;
+        lv_timer_pause(timer);
+    }
+}
+
 static void compact_list_scroll_event_cb(lv_event_t * e) {
     lv_obj_t * list = lv_event_get_target(e);
     compact_list_update_window(list, (compact_list_virtual_data_t *) lv_obj_get_user_data(list));
@@ -858,6 +1093,23 @@ static void compact_list_scroll_event_cb(lv_event_t * e) {
 
 static void compact_list_delete_event_cb(lv_event_t * e) {
     compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(lv_event_get_target(e));
+    if (data->poll_timer) lv_timer_delete(data->poll_timer);
+    if (data->pending_job) {
+        /* Short bounded wait, not indefinite -- the overwhelmingly common
+         * case is a fetch that's already done or lands within a handful of
+         * ms, in which case this joins and frees normally below; a
+         * genuinely slow/stuck one falls through to the same detach-and-
+         * abandon tolerance compact_list_poll_fetch_cb()'s own timeout
+         * uses, rather than blocking screen teardown/navigation on it. */
+        compact_list_fetch_job_t * job = data->pending_job;
+        for (int i = 0; i < 20 && job->result_count < 0; i++) usleep(10000);
+        if (job->result_count >= 0) {
+            pthread_join(job->thread, NULL);
+            compact_list_job_release(job); /* the UI-side reference -- see compact_list_fetch_job_s's own doc comment */
+        } else {
+            compact_list_abandon_job(job);
+        }
+    }
     for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) free(data->row_ctx[slot]);
     free(data->items);
     free(data);
@@ -899,6 +1151,7 @@ void compact_list_set_now_playing(lv_obj_t * list, int item_index) {
 void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, int item_count) {
     compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
 
+    compact_list_cancel_pending_job(data);
     data->fetch_page = NULL; /* switch back to eager mode -- see this field's own doc comment */
     data->provider_ctx = NULL;
     data->cache_start = -1;
@@ -936,6 +1189,7 @@ void compact_list_set_paged_provider(lv_obj_t * list, compact_list_fetch_page_cb
                                       int total_count) {
     compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
 
+    compact_list_cancel_pending_job(data);
     data->fetch_page = fetch_page;
     data->provider_ctx = ctx;
     data->cache_start = -1; /* forces compact_list_ensure_cache() to actually fetch on next window update */
@@ -988,6 +1242,8 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     data->provider_ctx = NULL;
     data->cache_start = -1;
     data->cache_count = 0;
+    data->pending_job = NULL;
+    data->poll_timer = NULL; /* created below, once `list` itself exists */
 
     /* Rows are pinned at x=0 by default (LIST_ROW_WIDTH already leaves an
      * unused right-side margin at this screen's width) -- only centered
@@ -1066,6 +1322,13 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     lv_obj_set_user_data(list, data);
     lv_obj_add_event_cb(list, compact_list_scroll_event_cb, LV_EVENT_SCROLL, NULL);
     lv_obj_add_event_cb(list, compact_list_delete_event_cb, LV_EVENT_DELETE, NULL);
+
+    /* Paged mode only ever needs this once a background fetch is actually
+     * in flight (compact_list_ensure_cache() resumes it) -- created paused
+     * so it costs nothing for the lifetime of an eager-mode list, or a
+     * paged list between fetches. */
+    data->poll_timer = lv_timer_create(compact_list_poll_fetch_cb, COMPACT_LIST_FETCH_POLL_MS, list);
+    lv_timer_pause(data->poll_timer);
 
     compact_list_update_window(list, data); /* populate the initially-visible rows */
 

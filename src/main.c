@@ -317,6 +317,24 @@ int main(void) {
         lv_tick_inc(real_tick - last_real_tick);
         last_real_tick = real_tick;
         uint32_t time_till_next = lv_timer_handler();
+        /* Real-device bug report: a screen (compact_list's own background-
+         * fetch poll timer, screen_builders.c) went permanently blank after
+         * scrolling -- confirmed via direct tracing that its fetch actually
+         * completed, but the timer polling for that completion never fired
+         * again. Root cause: lv_timer_handler() returns LV_NO_TIMER_READY
+         * (0xFFFFFFFF, lv_timer.h) when no *currently unpaused* timer has
+         * work due -- true here for a brief window whenever every other
+         * active timer happens to be paused/idle at the same moment as this
+         * one (e.g. right after a fetch completes and its own poll timer
+         * re-pauses itself). `time_till_next * 1000` then silently
+         * overflows this uint32_t, producing a ~71-minute usleep() instead
+         * of the intended "sleep only until the next timer needs it" --
+         * indistinguishable from a permanent freeze in normal testing.
+         * Capping the sleep bounds the worst case to this constant instead,
+         * while still being long enough that a genuinely idle app burns
+         * negligible CPU -- and covers any future timer hitting the same
+         * window, not just this one. */
+        if (time_till_next > 100) time_till_next = 100;
         usleep(time_till_next * 1000); /* Convert milliseconds to microseconds */
     }
 

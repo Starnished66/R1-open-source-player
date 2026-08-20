@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <time.h>
 
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -899,6 +900,23 @@ static int l_plugin_set_icon(lua_State * L) {
     const char * source_path = luaL_checkstring(L, 2);
 
 #ifndef HOST_BUILD
+    /* Audit finding: relative_path is fully plugin-controlled and used to
+     * be concatenated straight onto PLUGIN_THEME_OVERRIDE_ROOT below with
+     * no sanitization -- "../../../../data/some/file" walks the resulting
+     * dst_path outside that root entirely, and copy_file() then overwrites
+     * whatever it lands on with attacker-controlled bytes: an arbitrary
+     * file WRITE, independent of (and not covered by) the Lua stdlib
+     * sandboxing in sandbox_plugin_lua_state() above, since this is a
+     * native C function reachable straight through the vetted plugin.*
+     * API. Every real caller only ever needs a plain "dir/name.ext" shape
+     * (see this function's own doc comment above) -- reject anything
+     * containing a ".." component or starting with '/' outright, rather
+     * than trying to canonicalize and re-check. */
+    if (relative_path[0] == '/' || strstr(relative_path, "..") != NULL) {
+        return luaL_error(L, "plugin.set_icon: relative_path must be a plain path under the theme root, got '%s'",
+                           relative_path);
+    }
+
     char dst_path[600];
     snprintf(dst_path, sizeof(dst_path), "%s%s", PLUGIN_THEME_OVERRIDE_ROOT, relative_path);
 
@@ -1875,6 +1893,97 @@ static void register_plugin_api(lua_State * L) {
     lua_setglobal(L, "plugin");
 }
 
+/* Audit finding: luaL_openlibs() grants every plugin's lua_State the full,
+ * unrestricted standard library -- os.execute()/io.popen() for arbitrary
+ * shell commands, load()/loadstring()/dofile()/require() to pull in and
+ * run further arbitrary code, and debug.* (powerful enough to defeat any
+ * of the other restrictions below via metatable manipulation). A plugin is
+ * just a .lua file dropped into <MUSIC_ROOT_DIR>/.plugins/, no different in
+ * trust level from any other file an SD card author could place there, and
+ * this codebase already treats SD-card-supplied content as untrusted
+ * everywhere else (see the ID3v2/M4A parser hardening and file_browser.c's
+ * symlink rejection elsewhere in this same audit).
+ *
+ * Real-device correction: an earlier version of this function also removed
+ * the whole `io` table and os.remove()/os.rename(), reasoning that
+ * plugin_funcs' own filesystem API (list_dir()/sd_root()) covered
+ * everything a plugin should need -- live testing against the actual
+ * installed plugins proved that wrong: all 7 (Audiobooks, Themes,
+ * SoundProfiles, PlaybackExtras, LastFmScrobbler, ExtendedSleepTimer,
+ * PlayThrough) use io.open() to persist their own small state file under
+ * plugin.sd_root() .. "/.plugins/...", and 3 of them use os.remove()+
+ * os.rename() for an atomic write-to-.tmp-then-rename -- the exact same
+ * pattern this project's own C code uses (see playlist_files.c). Zero
+ * installed plugins use os.execute(), io.popen(), load()/dofile()/
+ * require(), or debug.* -- only the genuinely dangerous, actually-unused
+ * primitives are removed below now: arbitrary shell execution and
+ * arbitrary code loading. Plain file I/O and os.remove()/os.rename() stay,
+ * since real plugins depend on them and they can't run a shell command or
+ * load further code, just read/write/delete/rename whatever path the
+ * plugin already had permission to name (same risk class as this app's own
+ * file I/O, not a privilege escalation). */
+static void sandbox_plugin_lua_state(lua_State * L) {
+    lua_pushnil(L); lua_setglobal(L, "load");
+    lua_pushnil(L); lua_setglobal(L, "loadstring");
+    lua_pushnil(L); lua_setglobal(L, "loadfile");
+    lua_pushnil(L); lua_setglobal(L, "dofile");
+    lua_pushnil(L); lua_setglobal(L, "require");
+    lua_pushnil(L); lua_setglobal(L, "package");
+    lua_pushnil(L); lua_setglobal(L, "debug");
+
+    lua_getglobal(L, "os");
+    if (lua_istable(L, -1)) {
+        static const char * dangerous_os[] = { "execute", "getenv", "exit", "tmpname" };
+        for (size_t i = 0; i < sizeof(dangerous_os) / sizeof(dangerous_os[0]); i++) {
+            lua_pushnil(L);
+            lua_setfield(L, -2, dangerous_os[i]);
+        }
+    }
+    lua_pop(L, 1);
+
+    lua_getglobal(L, "io");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        lua_setfield(L, -2, "popen"); /* the one io.* function that's a shell-exec primitive, not file I/O */
+    }
+    lua_pop(L, 1);
+}
+
+#define PLUGIN_CALL_MAX_MS 2000 /* generous margin above any legitimate plugin operation observed; still short enough that a runaway loop doesn't hang the UI for long */
+
+static struct timespec plugin_call_deadline_start;
+
+static void plugin_call_timeout_hook(lua_State * L, lua_Debug * ar) {
+    (void) ar;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - plugin_call_deadline_start.tv_sec) * 1000L +
+                      (now.tv_nsec - plugin_call_deadline_start.tv_nsec) / 1000000L;
+    if (elapsed_ms > PLUGIN_CALL_MAX_MS) {
+        luaL_error(L, "plugin call exceeded %dms time budget -- aborted to keep the UI responsive", PLUGIN_CALL_MAX_MS);
+    }
+}
+
+/* Audit finding: no execution-time limit was ever installed on any plugin
+ * lua_State, and every plugin callback (on_open/on_select/timers/event
+ * handlers, all 11 lua_pcall() call sites in this file) runs synchronously
+ * on the single UI thread -- a plugin containing `while true do end`
+ * freezes the whole player indefinitely, needing a hard power-cycle.
+ * Wraps lua_pcall() with a wall-clock budget checked every LUA_MASKCOUNT
+ * instructions via a debug hook, installed/torn down around each call.
+ * This whole plugin system only ever runs on the UI thread (every
+ * lua_State is only ever touched from here), so a single file-static
+ * deadline-start variable, reset immediately before each call, is safe --
+ * no locking needed. Same signature as lua_pcall() itself, so every
+ * existing call site needed only a mechanical rename. */
+static int plugin_call(lua_State * L, int nargs, int nresults, int errfunc) {
+    clock_gettime(CLOCK_MONOTONIC, &plugin_call_deadline_start);
+    lua_sethook(L, plugin_call_timeout_hook, LUA_MASKCOUNT, 10000);
+    int result = lua_pcall(L, nargs, nresults, errfunc);
+    lua_sethook(L, NULL, 0, 0); /* stop checking between plugin calls -- no cost while idle */
+    return result;
+}
+
 static void load_plugin_file(const char * path) {
     lua_State * L = luaL_newstate();
     if (!L) return;
@@ -1884,9 +1993,14 @@ static void load_plugin_file(const char * path) {
     inst->L = L;
     loading_plugin_slot = slot;
     luaL_openlibs(L);
+    sandbox_plugin_lua_state(L);
     register_plugin_api(L);
 
-    if (luaL_dofile(L, path) != LUA_OK) {
+    /* luaL_dofile(L, path)'s own expansion, with plugin_call() in place of
+     * a bare lua_pcall() -- top-level plugin code runs once here too, on
+     * the same UI thread as every other plugin_call() site, so it needs
+     * the same time budget (see plugin_call()'s own comment). */
+    if ((luaL_loadfile(L, path) || plugin_call(L, 0, LUA_MULTRET, 0)) != LUA_OK) {
         const char * err = lua_tostring(L, -1);
         fprintf(stderr, "[plugins] failed to load %s: %s\n", path, err ? err : "unknown error");
         lua_close(L);
@@ -1947,7 +2061,7 @@ void plugin_manager_poll(void) {
                 lua_pushnil(req->L);
                 lua_pushstring(req->L, "network error or response limit exceeded");
             }
-            if (lua_pcall(req->L, 3, 0, 0) != LUA_OK) {
+            if (plugin_call(req->L, 3, 0, 0) != LUA_OK) {
                 const char * err = lua_tostring(req->L, -1);
                 fprintf(stderr, "[plugins] http_request callback error: %s\n", err ? err : "unknown error");
                 lua_pop(req->L, 1);
@@ -1972,7 +2086,7 @@ void plugin_manager_poll(void) {
  * distinguishable from another's in the log. */
 static void dispatch_list_item_open(plugin_list_item_t * item, const char * kind) {
     lua_rawgeti(item->L, LUA_REGISTRYINDEX, item->open_ref);
-    if (lua_pcall(item->L, 0, 0, 0) != LUA_OK) {
+    if (plugin_call(item->L, 0, 0, 0) != LUA_OK) {
         const char * err = lua_tostring(item->L, -1);
         fprintf(stderr, "[plugins] %s '%s' on_open error: %s\n", kind, item->label, err ? err : "unknown error");
         lua_pop(item->L, 1);
@@ -2126,7 +2240,7 @@ void plugin_manager_get_system_list_item_options(int index, const char ** out_ic
  * registry above). */
 static void dispatch_tile_open(plugin_tile_t * t) {
     lua_rawgeti(t->L, LUA_REGISTRYINDEX, t->open_ref);
-    if (lua_pcall(t->L, 0, 0, 0) != LUA_OK) {
+    if (plugin_call(t->L, 0, 0, 0) != LUA_OK) {
         const char * err = lua_tostring(t->L, -1);
         fprintf(stderr, "[plugins] tile '%s' on_open error: %s\n", t->label, err ? err : "unknown error");
         lua_pop(t->L, 1);
@@ -2164,7 +2278,7 @@ void plugin_manager_list_item_selected(int slot, int index) {
 
     lua_rawgeti(cb->L, LUA_REGISTRYINDEX, cb->select_ref);
     lua_pushinteger(cb->L, index + 1);
-    if (lua_pcall(cb->L, 1, 0, 0) != LUA_OK) {
+    if (plugin_call(cb->L, 1, 0, 0) != LUA_OK) {
         const char * err = lua_tostring(cb->L, -1);
         fprintf(stderr, "[plugins] show_list on_select error: %s\n", err ? err : "unknown error");
         lua_pop(cb->L, 1);
@@ -2191,7 +2305,7 @@ void plugin_manager_settings_list_row_selected(int slot, int row) {
     if (!settings_list_row_ref(slot, row, &L, &ref)) return;
 
     lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+    if (plugin_call(L, 0, 0, 0) != LUA_OK) {
         const char * err = lua_tostring(L, -1);
         fprintf(stderr, "[plugins] show_settings_list on_select error: %s\n", err ? err : "unknown error");
         lua_pop(L, 1);
@@ -2205,7 +2319,7 @@ void plugin_manager_settings_list_toggled(int slot, int row, bool new_value) {
 
     lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
     lua_pushboolean(L, new_value);
-    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
         const char * err = lua_tostring(L, -1);
         fprintf(stderr, "[plugins] show_settings_list on_change error: %s\n", err ? err : "unknown error");
         lua_pop(L, 1);
@@ -2219,7 +2333,7 @@ void plugin_manager_settings_list_slid(int slot, int row, int new_value) {
 
     lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
     lua_pushinteger(L, new_value);
-    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
         const char * err = lua_tostring(L, -1);
         fprintf(stderr, "[plugins] show_settings_list on_change error: %s\n", err ? err : "unknown error");
         lua_pop(L, 1);
@@ -2235,7 +2349,7 @@ void plugin_manager_notify_track_started(const char * title, const char * artist
         lua_pushstring(sub->L, artist ? artist : "");
         lua_pushstring(sub->L, album ? album : "");
         lua_pushnumber(sub->L, duration_seconds);
-        if (lua_pcall(sub->L, 4, 0, 0) != LUA_OK) {
+        if (plugin_call(sub->L, 4, 0, 0) != LUA_OK) {
             const char * err = lua_tostring(sub->L, -1);
             fprintf(stderr, "[plugins] track_started handler error: %s\n", err ? err : "unknown error");
             lua_pop(sub->L, 1);
@@ -2249,7 +2363,7 @@ static void notify_event_no_args(plugin_event_t idx, const char * kind) {
     for (int i = 0; i < plugin_event_subscriber_count[idx]; i++) {
         plugin_event_subscriber_t * sub = &plugin_event_subscribers[idx][i];
         lua_rawgeti(sub->L, LUA_REGISTRYINDEX, sub->ref);
-        if (lua_pcall(sub->L, 0, 0, 0) != LUA_OK) {
+        if (plugin_call(sub->L, 0, 0, 0) != LUA_OK) {
             const char * err = lua_tostring(sub->L, -1);
             fprintf(stderr, "[plugins] %s handler error: %s\n", kind, err ? err : "unknown error");
             lua_pop(sub->L, 1);
@@ -2274,7 +2388,7 @@ void plugin_manager_interval_fired(int slot) {
 
     lua_State * L = plugin_intervals[slot].L;
     lua_rawgeti(L, LUA_REGISTRYINDEX, plugin_intervals[slot].ref);
-    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+    if (plugin_call(L, 0, 0, 0) != LUA_OK) {
         const char * err = lua_tostring(L, -1);
         fprintf(stderr, "[plugins] set_interval callback error: %s\n", err ? err : "unknown error");
         lua_pop(L, 1);
@@ -2291,7 +2405,7 @@ void plugin_manager_text_input_submitted(const char * text) {
 
     lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
     lua_pushstring(L, text ? text : "");
-    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
         const char * err = lua_tostring(L, -1);
         fprintf(stderr, "[plugins] show_text_input on_submit error: %s\n", err ? err : "unknown error");
         lua_pop(L, 1);

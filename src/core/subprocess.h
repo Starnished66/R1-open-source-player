@@ -79,4 +79,15 @@ bool subprocess_popen_stdin(char * const argv[], pid_t * out_pid, int * out_writ
  * waitpid(). */
 void subprocess_terminate(pid_t pid);
 
+/* Finds every process whose `ps` command line contains `needle` (a plain
+ * substring match, not a pattern) and SIGKILLs them all -- for a daemon/
+ * script this app doesn't itself own the pid of (started detached via
+ * subprocess_spawn_daemon(), by a stock shell script, or otherwise outside
+ * this process's own child list), where subprocess_terminate()'s pid-based
+ * approach doesn't apply. Originally private to bluetooth_control.c (its
+ * own bt-agent/bluealsa/dbus-daemon cleanup); shared here once wifi_control.c
+ * needed the identical "kill any stray instance before starting a fresh
+ * one" shape for udhcpc. Capped at 16 matches with margin to spare. */
+void subprocess_kill_all_matching(const char * needle);
+
 #endif /* SUBPROCESS_H */

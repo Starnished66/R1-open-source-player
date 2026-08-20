@@ -293,3 +293,22 @@ void subprocess_terminate(pid_t pid) {
     kill(pid, SIGKILL);
     waitpid(pid, NULL, 0);
 }
+
+void subprocess_kill_all_matching(const char * needle) {
+    char out[4096];
+    char * argv[] = { (char *) "ps", NULL };
+    if (!subprocess_run(argv, out, sizeof(out))) return;
+
+    int pids[16];
+    int pid_count = 0;
+    char * line_save = NULL;
+    char * line = strtok_r(out, "\n", &line_save);
+    while (line && pid_count < 16) {
+        if (strstr(line, needle)) {
+            int pid = atoi(line);
+            if (pid > 0) pids[pid_count++] = pid;
+        }
+        line = strtok_r(NULL, "\n", &line_save);
+    }
+    for (int i = 0; i < pid_count; i++) kill(pids[i], SIGKILL);
+}

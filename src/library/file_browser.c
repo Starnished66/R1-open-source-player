@@ -86,6 +86,11 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
     int capacity = 32;
     int count = 0;
     dir_entry_t * result = malloc(sizeof(dir_entry_t) * (size_t) capacity);
+    if (!result) {
+        closedir(dir);
+        *out_entries = NULL;
+        return 0;
+    }
 
     struct dirent * de;
     while ((de = readdir(dir)) != NULL) {
@@ -102,8 +107,16 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
         if (!is_dir && !is_playlist && !is_playable_file(de->d_name)) continue;
 
         if (count == capacity) {
+            /* Audit finding: the previous version overwrote `result` with
+             * realloc()'s return value unconditionally -- on allocation
+             * failure that's NULL, leaking the existing buffer and crashing
+             * on the very next write below. Stop growing and return
+             * whatever was collected so far instead; a failed grow shouldn't
+             * lose (or crash on) the entries already found. */
+            dir_entry_t * grown = realloc(result, sizeof(dir_entry_t) * (size_t) (capacity * 2));
+            if (!grown) break;
+            result = grown;
             capacity *= 2;
-            result = realloc(result, sizeof(dir_entry_t) * (size_t) capacity);
         }
 
         snprintf(result[count].name, sizeof(result[count].name), "%s", de->d_name);
@@ -174,8 +187,14 @@ bool file_browser_build_playlist_from_m3u(const char * m3u_path, char *** out_pl
         playlist_files_resolve_path(m3u_path, line, full_path, sizeof(full_path));
 
         if (count == capacity) {
-            capacity = capacity ? capacity * 2 : 8;
-            playlist = realloc(playlist, sizeof(char *) * (size_t) capacity);
+            /* Audit finding: same unguarded-realloc-plus-early-capacity-
+             * update issue as scan_all_songs_recursive()'s own fix -- see
+             * its comment for the full reasoning. */
+            int new_capacity = capacity ? capacity * 2 : 8;
+            char ** grown = realloc(playlist, sizeof(char *) * (size_t) new_capacity);
+            if (!grown) break;
+            playlist = grown;
+            capacity = new_capacity;
         }
         playlist[count++] = strdup(full_path);
     }
@@ -298,9 +317,13 @@ static void rebuild_list(void) {
  * no legitimate reason for a scan of the music root to leave it via a
  * symlink), and a hard depth cap as defense-in-depth against any other
  * pathologically deep tree, symlink-related or not. A symlinked individual
- * song file (unusual, but not attempted here) is still picked up --
- * lstat()'s S_ISDIR is only false for it, same as for a plain file, so it
- * falls through to the ordinary is_playable_file() check below.
+ * file is rejected the same way (S_ISLNK check right after lstat(), below)
+ * -- an earlier version of this fix let it through, since lstat()'s
+ * S_ISDIR is only false for it, same as for a plain file, so it fell
+ * through to the ordinary is_playable_file() check; a later audit flagged
+ * that as a real path-traversal gap (a playable-extension symlink can
+ * point anywhere on the filesystem, feeding arbitrary on-device file
+ * content into the tag parsers below).
  *
  * Directories are visited in readdir() order (not sorted) since the whole
  * result gets one final sort by full path anyway -- sorting each
@@ -336,6 +359,18 @@ static void scan_all_songs_recursive(const char * dir_path, char *** paths, int 
          * parameter's own doc comment in file_browser.h. */
         if (progress) (*progress)++;
         if (!stat_ok) continue;
+        /* Audit finding: a symlinked directory is already excluded by
+         * lstat() above (S_ISDIR is false for it, matching this file's own
+         * "no legitimate reason for a scan of the music root to leave it
+         * via a symlink" reasoning) -- but per this function's own header
+         * comment, a symlinked individual FILE was deliberately still
+         * followed. That lets a crafted SD card point a playable-extension
+         * symlink at an arbitrary on-device path (e.g. /usr/data/
+         * wpa_supplicant.conf), feeding attacker-chosen file content into
+         * the tag parsers this same audit found multiple crash bugs in
+         * (ID3v2/M4A) -- reject every symlink outright, not just directory
+         * ones. */
+        if (S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
             scan_all_songs_recursive(full_path, paths, count, capacity, depth + 1, progress);
@@ -344,8 +379,22 @@ static void scan_all_songs_recursive(const char * dir_path, char *** paths, int 
         if (!is_playable_file(de->d_name)) continue;
 
         if (*count == *capacity) {
-            *capacity = *capacity ? *capacity * 2 : 64;
-            *paths = realloc(*paths, sizeof(char *) * (size_t) *capacity);
+            /* Audit finding: same unguarded-realloc crash risk as scan_
+             * directory() above, plus a second bug specific to this one --
+             * *capacity was doubled BEFORE the realloc even ran, so a
+             * failure left *paths NULL while *capacity already reflected
+             * the bigger size, meaning the very next growth check wouldn't
+             * even fire again and every recursive call would keep writing
+             * through the NULL pointer. Compute the new size into a local
+             * first and only commit *paths and *capacity once realloc
+             * actually succeeds; on failure, stop collecting more entries at this
+             * recursion level (every other in-flight/future call converges
+             * the same way once real OOM is reached) rather than crash. */
+            int new_capacity = *capacity ? *capacity * 2 : 64;
+            char ** grown = realloc(*paths, sizeof(char *) * (size_t) new_capacity);
+            if (!grown) break;
+            *paths = grown;
+            *capacity = new_capacity;
         }
         (*paths)[*count] = strdup(full_path);
         (*count)++;
@@ -384,6 +433,9 @@ static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_vi
         bool stat_ok = lstat(full_path, &st) == 0;
         if (progress) (*progress)++;
         if (!stat_ok) continue;
+        /* Audit finding -- see scan_all_songs_recursive()'s own comment,
+         * the sibling walker this mirrors. */
+        if (S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
             keep_going = walk_all_songs_recursive(full_path, cb, user, count, depth + 1, progress);

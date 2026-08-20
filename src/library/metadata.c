@@ -508,8 +508,23 @@ static bool read_id3v2(FILE * f, track_metadata_t * out) {
         uint32_t frame_size = read_be32(tag_data + pos + 4, frame_size_synchsafe);
         uint8_t frame_flags2 = tag_data[pos + 9];
         pos += 10;
-        if (pos + frame_size > tag_size) break;
-        uint32_t next_pos = pos + frame_size; /* captured now -- frame_size may still be adjusted below */
+        /* Audit finding: a v2.3 tag (frame_size_synchsafe == false) stores
+         * frame_size as a plain, fully attacker-controlled 32-bit value --
+         * unlike v2.4's synchsafe encoding, which caps it at 0x0FFFFFFF and
+         * can never overflow this addition for any realistic tag_size. The
+         * previous `pos + frame_size > tag_size` check computed that sum in
+         * uint32_t before comparing, so a frame_size near UINT32_MAX wraps
+         * the sum back under tag_size and passes -- after which the RAW,
+         * unwrapped frame_size (not the wrapped sum) is used as frame_
+         * data_size below and handed straight to decode_id3v2_text_frame()/
+         * decode_id3v2_apic_frame(), reading up to ~4GB past the malloc()'d
+         * tag_data buffer. Subtracting instead of adding avoids the
+         * overflow entirely: pos <= tag_size is already guaranteed by this
+         * loop's own `pos + 10 <= tag_size` condition above, so tag_size -
+         * pos can't underflow, and this comparison is exact for any
+         * frame_size value up to UINT32_MAX. */
+        if (frame_size > tag_size - pos) break;
+        uint32_t next_pos = pos + frame_size; /* safe now -- frame_size <= tag_size - pos, just proven above; may still be adjusted below */
 
         /* Real-device bug report (persisting after the tag-level unsync fix
          * above): the two per-frame flag bytes were read but never
@@ -704,6 +719,22 @@ static bool m4a_read_box_header(FILE * f, m4a_box_t * out) {
         out->size = size32;
         out->header_size = 8;
     }
+
+    /* Audit finding: a malformed/malicious box whose declared size32 is
+     * less than its own 8-byte header (e.g. 2-7) was accepted as-is here.
+     * m4a_find_child()'s `next = (data_start - header_size) + size` then
+     * seeks BACKWARD, behind the header it just read -- and since the
+     * attacker fully controls the bytes there, the re-read header can be
+     * forced to keep producing the same tiny size indefinitely, taking
+     * m4a_find_child()'s `while (ftell(f) < end)` loop a very long time (in
+     * the worst case, effectively forever for a large enough container) to
+     * naturally walk past `end` two bytes at a time. metadata_read() (not
+     * the fork-isolated metadata_read_isolated()) reaches this directly on
+     * the tap-to-play path, so a single malicious .m4a file hangs the UI
+     * thread. A box this small can never legitimately exist (it can't even
+     * fit its own header), so reject it here at the source rather than
+     * patching every walker that calls this. */
+    if (out->size < (uint64_t) out->header_size) return false;
 
     out->data_start = start + out->header_size;
     return true;

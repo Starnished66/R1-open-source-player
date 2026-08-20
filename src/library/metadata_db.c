@@ -9,6 +9,24 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Audit finding: sqlite3_column_text() returns NULL for a genuinely NULL
+ * column value (not just on allocation failure) -- every call site in this
+ * file used to cast its result straight to `const char *` and hand it to
+ * snprintf("%s", ...)/strdup() with no NULL check. glibc's printf family
+ * tolerates a NULL %s argument (prints "(null)"), but this target's actual
+ * libc (musl, per every mipsel-linux-musl-gcc build in this project) does
+ * not special-case it -- a NULL column value crashes immediately. The
+ * import path from the stock player's own recovered database is the
+ * highest-risk caller (see this file's own "database disk image is
+ * malformed" comment just below -- a real, already-observed corruption
+ * case), but the same unguarded pattern existed at every other query site
+ * in this file too, including ones reading from this app's own schema;
+ * fixed once, everywhere, rather than only at the one flagged call site. */
+static const char * col_text(sqlite3_stmt * stmt, int col) {
+    const unsigned char * text = sqlite3_column_text(stmt, col);
+    return text ? (const char *) text : "";
+}
+
 #ifdef HOST_BUILD
   #define METADATA_DB_PATH "./open_hiby_player_music.db"
 #else
@@ -191,7 +209,7 @@ static void * import_from_stock_player_db_worker(void * arg) {
     w->count = 0;
 
     while (sqlite3_step(st) == SQLITE_ROW) {
-        const char * raw_path = (const char *) sqlite3_column_text(st, 0);
+        const char * raw_path = col_text(st, 0);
         char path[600];
         if (!translate_stock_path(raw_path, path, sizeof(path))) continue;
 
@@ -204,11 +222,11 @@ static void * import_from_stock_player_db_worker(void * arg) {
         snprintf(row->path, sizeof(row->path), "%s", path);
         row->mtime = sqlite3_column_int64(st, 6);
         row->size = sqlite3_column_int64(st, 7);
-        snprintf(row->tags.title, sizeof(row->tags.title), "%s", (const char *) sqlite3_column_text(st, 1));
-        snprintf(row->tags.artist, sizeof(row->tags.artist), "%s", (const char *) sqlite3_column_text(st, 2));
-        snprintf(row->tags.album, sizeof(row->tags.album), "%s", (const char *) sqlite3_column_text(st, 3));
-        snprintf(row->tags.album_artist, sizeof(row->tags.album_artist), "%s", (const char *) sqlite3_column_text(st, 4));
-        snprintf(row->tags.genre, sizeof(row->tags.genre), "%s", (const char *) sqlite3_column_text(st, 5));
+        snprintf(row->tags.title, sizeof(row->tags.title), "%s", col_text(st, 1));
+        snprintf(row->tags.artist, sizeof(row->tags.artist), "%s", col_text(st, 2));
+        snprintf(row->tags.album, sizeof(row->tags.album), "%s", col_text(st, 3));
+        snprintf(row->tags.album_artist, sizeof(row->tags.album_artist), "%s", col_text(st, 4));
+        snprintf(row->tags.genre, sizeof(row->tags.genre), "%s", col_text(st, 5));
         w->count++;
     }
 
@@ -556,11 +574,11 @@ bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags
     int64_t cached_size = sqlite3_column_int64(stmt_get, 1);
     if (cached_mtime != mtime || cached_size != size) return false;
 
-    snprintf(out->title, sizeof(out->title), "%s", (const char *) sqlite3_column_text(stmt_get, 2));
-    snprintf(out->artist, sizeof(out->artist), "%s", (const char *) sqlite3_column_text(stmt_get, 3));
-    snprintf(out->album, sizeof(out->album), "%s", (const char *) sqlite3_column_text(stmt_get, 4));
-    snprintf(out->album_artist, sizeof(out->album_artist), "%s", (const char *) sqlite3_column_text(stmt_get, 5));
-    snprintf(out->genre, sizeof(out->genre), "%s", (const char *) sqlite3_column_text(stmt_get, 6));
+    snprintf(out->title, sizeof(out->title), "%s", col_text(stmt_get, 2));
+    snprintf(out->artist, sizeof(out->artist), "%s", col_text(stmt_get, 3));
+    snprintf(out->album, sizeof(out->album), "%s", col_text(stmt_get, 4));
+    snprintf(out->album_artist, sizeof(out->album_artist), "%s", col_text(stmt_get, 5));
+    snprintf(out->genre, sizeof(out->genre), "%s", col_text(stmt_get, 6));
     return true;
 }
 
@@ -666,17 +684,17 @@ static int fill_song_rows(sqlite3_stmt * st, int id_col, int path_col, int title
     int i = 0;
     while (i < max_rows && sqlite3_step(st) == SQLITE_ROW) {
         out_rows[i].id = sqlite3_column_int64(st, id_col);
-        snprintf(out_rows[i].path, sizeof(out_rows[i].path), "%s", (const char *) sqlite3_column_text(st, path_col));
+        snprintf(out_rows[i].path, sizeof(out_rows[i].path), "%s", col_text(st, path_col));
         snprintf(out_rows[i].tags.title, sizeof(out_rows[i].tags.title), "%s",
-                 (const char *) sqlite3_column_text(st, title_col));
+                 col_text(st, title_col));
         snprintf(out_rows[i].tags.artist, sizeof(out_rows[i].tags.artist), "%s",
-                 (const char *) sqlite3_column_text(st, artist_col));
+                 col_text(st, artist_col));
         snprintf(out_rows[i].tags.album, sizeof(out_rows[i].tags.album), "%s",
-                 (const char *) sqlite3_column_text(st, album_col));
+                 col_text(st, album_col));
         snprintf(out_rows[i].tags.album_artist, sizeof(out_rows[i].tags.album_artist), "%s",
-                 (const char *) sqlite3_column_text(st, album_artist_col));
+                 col_text(st, album_artist_col));
         snprintf(out_rows[i].tags.genre, sizeof(out_rows[i].tags.genre), "%s",
-                 (const char *) sqlite3_column_text(st, genre_col));
+                 col_text(st, genre_col));
         i++;
     }
     return i;
@@ -741,7 +759,7 @@ int metadata_db_get_groups_page(metadata_db_group_kind_t kind, int offset, int m
 
     int i = 0;
     while (i < max_rows && sqlite3_step(st) == SQLITE_ROW) {
-        snprintf(out_rows[i].name, sizeof(out_rows[i].name), "%s", (const char *) sqlite3_column_text(st, 0));
+        snprintf(out_rows[i].name, sizeof(out_rows[i].name), "%s", col_text(st, 0));
         out_rows[i].song_count = sqlite3_column_int(st, 1);
         out_rows[i].first_song_id = sqlite3_column_int64(st, 2);
         out_rows[i].album_artist[0] = '\0'; /* see this field's own comment (metadata_db.h) -- only ever meaningful from metadata_db_get_albums_page_filtered() */
@@ -962,9 +980,9 @@ int metadata_db_get_albums_page_filtered(const char * artist_or_album_artist_fil
 
     int i = 0;
     while (i < max_rows && sqlite3_step(st) == SQLITE_ROW) {
-        snprintf(out_rows[i].name, sizeof(out_rows[i].name), "%s", (const char *) sqlite3_column_text(st, 0));
+        snprintf(out_rows[i].name, sizeof(out_rows[i].name), "%s", col_text(st, 0));
         snprintf(out_rows[i].album_artist, sizeof(out_rows[i].album_artist), "%s",
-                 (const char *) sqlite3_column_text(st, 1));
+                 col_text(st, 1));
         out_rows[i].song_count = sqlite3_column_int(st, 2);
         out_rows[i].first_song_id = sqlite3_column_int64(st, 3);
         i++;
@@ -1010,9 +1028,9 @@ int metadata_db_get_albums_for_group(metadata_db_group_kind_t kind, const char *
     sqlite3_bind_int(st, 3, offset);
     int i = 0;
     while (i < max_rows && sqlite3_step(st) == SQLITE_ROW) {
-        snprintf(out_rows[i].name, sizeof(out_rows[i].name), "%s", (const char *) sqlite3_column_text(st, 0));
+        snprintf(out_rows[i].name, sizeof(out_rows[i].name), "%s", col_text(st, 0));
         snprintf(out_rows[i].album_artist, sizeof(out_rows[i].album_artist), "%s",
-                 (const char *) sqlite3_column_text(st, 1));
+                 col_text(st, 1));
         out_rows[i].song_count = sqlite3_column_int(st, 2);
         out_rows[i].first_song_id = sqlite3_column_int64(st, 3);
         i++;
@@ -1047,6 +1065,49 @@ bool metadata_db_get_song_by_path(const char * path, song_row_t * out_row) {
     int count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_row, 1);
     sqlite3_finalize(st);
     return count == 1;
+}
+
+/* Efficiency finding: build_queue_json()/remote_control_sync_queue()
+ * (remote_control.c) used to call metadata_db_get_song_by_id()/_by_path()
+ * once per song in the play queue, each its own sqlite3_prepare_v2()/
+ * sqlite3_finalize() round trip -- wasted re-parsing/re-planning of the
+ * identical query for every entry. One prepared statement, reused via
+ * bind+step+reset across all `count` lookups, does the same job without
+ * the repeated parse/plan cost. */
+void metadata_db_get_songs_by_ids(const int64_t * ids, int count, song_row_t * out_rows) {
+    METADATA_DB_GUARD;
+    for (int i = 0; i < count; i++) out_rows[i].id = -1;
+    if (!db || count <= 0) return;
+
+    static const char * const query =
+        "SELECT rowid, path, title, artist, album, album_artist, genre FROM media WHERE rowid = ?;";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return;
+    for (int i = 0; i < count; i++) {
+        sqlite3_bind_int64(st, 1, ids[i]);
+        fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, &out_rows[i], 1);
+        sqlite3_reset(st);
+        sqlite3_clear_bindings(st);
+    }
+    sqlite3_finalize(st);
+}
+
+void metadata_db_get_songs_by_paths(const char * const * paths, int count, song_row_t * out_rows) {
+    METADATA_DB_GUARD;
+    for (int i = 0; i < count; i++) out_rows[i].id = -1;
+    if (!db || count <= 0) return;
+
+    static const char * const query =
+        "SELECT rowid, path, title, artist, album, album_artist, genre FROM media WHERE path = ?;";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return;
+    for (int i = 0; i < count; i++) {
+        sqlite3_bind_text(st, 1, paths[i], -1, SQLITE_STATIC);
+        fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, &out_rows[i], 1);
+        sqlite3_reset(st);
+        sqlite3_clear_bindings(st);
+    }
+    sqlite3_finalize(st);
 }
 
 int64_t metadata_db_get_song_title_offset(const char * path) {
@@ -1120,62 +1181,75 @@ void metadata_db_get_az_table(metadata_db_az_kind_t kind, int out_table[27]) {
         case METADATA_DB_AZ_ALL_SONGS: sort_col = "title"; group_cols = NULL; break;
     }
 
+    /* Efficiency finding: this used to run 26 separate `WHERE sort_col <
+     * 'X'` boundary-count queries (one per letter) plus a 27th total-count
+     * query -- letter 'Y' rescans almost everything letter 'X' already
+     * scanned, roughly O(13n) row visits instead of O(n). A single ordered
+     * (grouped, for the grouped kinds) pass gets the same per-letter
+     * boundary positions from one sequential scan: stream through every
+     * row/group in sort_col order, and the position at which each letter
+     * is FIRST seen is exactly the count of rows/groups strictly before
+     * it -- the same value the old per-letter COUNT(*) query computed,
+     * just derived from one pass instead of 26. The running position after
+     * the last row IS the total, so the separate total-count query (and
+     * the clamp that used to depend on it) isn't needed either -- a letter
+     * genuinely absent from the library just never gets touched here and
+     * correctly stays at its initial -1. */
     char query[384];
     if (group_cols) {
-        snprintf(query, sizeof(query),
-                  "SELECT COUNT(*) FROM (SELECT 1 FROM media WHERE %s COLLATE NOCASE < ? GROUP BY %s);", sort_col,
-                  group_cols);
+        snprintf(query, sizeof(query), "SELECT %s FROM media GROUP BY %s ORDER BY %s COLLATE NOCASE;", sort_col,
+                  group_cols, sort_col);
     } else {
-        snprintf(query, sizeof(query), "SELECT COUNT(*) FROM media WHERE %s COLLATE NOCASE < ?;", sort_col);
+        snprintf(query, sizeof(query), "SELECT %s FROM media ORDER BY %s COLLATE NOCASE;", sort_col, sort_col);
     }
     sqlite3_stmt * st = NULL;
     if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return;
 
-    char letter[2] = { 0, 0 };
-    for (int i = 0; i < 26; i++) {
-        letter[0] = (char) ('A' + i);
-        sqlite3_bind_text(st, 1, letter, -1, SQLITE_STATIC);
-        int64_t count = 0;
-        if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int64(st, 0);
-        sqlite3_reset(st);
-        out_table[i] = (int) count;
+    bool seen[26] = { false };
+    int position = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char * text = sqlite3_column_text(st, 0);
+        if (text && text[0]) {
+            unsigned char c = text[0];
+            if (c >= 'a' && c <= 'z') c = (unsigned char) (c - ('a' - 'A'));
+            if (c >= 'A' && c <= 'Z' && !seen[c - 'A']) {
+                seen[c - 'A'] = true;
+                out_table[c - 'A'] = position;
+            }
+        }
+        position++;
     }
     sqlite3_finalize(st);
 
-    /* '#' bucket before the A-Z entries get clamped below: SQLite's
-     * default (post-NOCASE-folding) comparison is plain ASCII byte order,
-     * where every digit/symbol code point sorts strictly before every
-     * letter -- so anything not starting with A-Z clusters at the very
-     * front of the sorted list (offset 0) in the overwhelmingly common
-     * case, never interspersed among lettered entries the way an arbitrary
-     * Unicode collation might allow. A name starting with an accented or
-     * non-Latin character sorts *after* 'Z' instead (untested edge case,
-     * not reproduced in this library) and lands in the 'Z' bucket rather
-     * than here -- same divergence class already accepted for the title
-     * fallback elsewhere in this file, not worth a second query shape for. */
+    /* A letter genuinely absent from the library (no row/group starts with
+     * it) must still jump to the nearest FOLLOWING letter that has content,
+     * matching the old per-letter "count of items strictly less than X"
+     * query's own natural behavior (an empty 'B' bucket's boundary count
+     * equals 'C''s, whenever nothing starts with exactly 'B') -- verified
+     * against this app's own real on-device library.db that this backward
+     * fill reproduces the old query's output exactly. Only a genuinely
+     * empty trailing run (nothing at or after that letter, all the way to
+     * 'Z') stays -1, which happens naturally here since there's nothing
+     * for 'Z' itself to inherit from. */
+    for (int i = 24; i >= 0; i--) {
+        if (out_table[i] == -1) out_table[i] = out_table[i + 1];
+    }
+
+    /* '#' bucket: SQLite's default (post-NOCASE-folding) comparison is
+     * plain ASCII byte order, where every digit/symbol code point sorts
+     * strictly before every letter -- so anything not starting with A-Z
+     * clusters at the very front of the sorted list (offset 0) in the
+     * overwhelmingly common case, never interspersed among lettered
+     * entries the way an arbitrary Unicode collation might allow. A name
+     * starting with an accented or non-Latin character sorts *after* 'Z'
+     * instead (untested edge case, not reproduced in this library) and
+     * lands in the 'Z' bucket rather than here -- same divergence class
+     * already accepted for the title fallback elsewhere in this file, not
+     * worth a second query shape for. Read AFTER the backward fill above
+     * (not the raw, possibly-still--1 position 'A' itself was set to) --
+     * otherwise a library with '#' content but nothing starting with 'A'
+     * specifically would miss its own '#' bucket entirely. */
     out_table[26] = out_table[0] > 0 ? 0 : -1;
-
-    int64_t total;
-    if (group_cols) {
-        char tq[256];
-        snprintf(tq, sizeof(tq), "SELECT COUNT(*) FROM (SELECT 1 FROM media GROUP BY %s);", group_cols);
-        sqlite3_stmt * ts = NULL;
-        total = 0;
-        if (sqlite3_prepare_v2(db, tq, -1, &ts, NULL) == SQLITE_OK) {
-            if (sqlite3_step(ts) == SQLITE_ROW) total = sqlite3_column_int64(ts, 0);
-            sqlite3_finalize(ts);
-        }
-    } else {
-        total = metadata_db_get_song_count();
-    }
-
-    /* A letter with nothing at or after it (COUNT == total) must stay -1,
-     * not point one-past-the-end -- matches build_az_jump_table()'s own
-     * backward-fill only ever propagating from a real entry, never
-     * fabricating a target past the last one. */
-    for (int i = 0; i < 26; i++) {
-        if (out_table[i] >= total) out_table[i] = -1;
-    }
 }
 
 int metadata_db_search_names(metadata_db_az_kind_t kind, const char * needle, int max_rows,
@@ -1239,12 +1313,12 @@ int metadata_db_search_names(metadata_db_az_kind_t kind, const char * needle, in
         if (is_song) {
             song_row_t row = { 0 };
             row.id = sqlite3_column_int64(st, 0);
-            snprintf(row.path, sizeof(row.path), "%s", (const char *) sqlite3_column_text(st, 1));
-            snprintf(row.tags.title, sizeof(row.tags.title), "%s", (const char *) sqlite3_column_text(st, 2));
+            snprintf(row.path, sizeof(row.path), "%s", col_text(st, 1));
+            snprintf(row.tags.title, sizeof(row.tags.title), "%s", col_text(st, 2));
             metadata_db_song_display_title(&row, out_hits[i].label, sizeof(out_hits[i].label));
             out_hits[i].offset = sqlite3_column_int(st, 3);
         } else {
-            snprintf(out_hits[i].label, sizeof(out_hits[i].label), "%s", (const char *) sqlite3_column_text(st, 0));
+            snprintf(out_hits[i].label, sizeof(out_hits[i].label), "%s", col_text(st, 0));
             out_hits[i].offset = sqlite3_column_int(st, 1);
         }
         i++;
@@ -1348,13 +1422,13 @@ void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * o
 
     int i = 0;
     while (i < row_count && sqlite3_step(st) == SQLITE_ROW) {
-        paths[i] = strdup((const char *) sqlite3_column_text(st, 0));
+        paths[i] = strdup(col_text(st, 0));
         if (!paths[i]) break;
-        snprintf(tags[i].title, sizeof(tags[i].title), "%s", (const char *) sqlite3_column_text(st, 1));
-        snprintf(tags[i].artist, sizeof(tags[i].artist), "%s", (const char *) sqlite3_column_text(st, 2));
-        snprintf(tags[i].album, sizeof(tags[i].album), "%s", (const char *) sqlite3_column_text(st, 3));
-        snprintf(tags[i].album_artist, sizeof(tags[i].album_artist), "%s", (const char *) sqlite3_column_text(st, 4));
-        snprintf(tags[i].genre, sizeof(tags[i].genre), "%s", (const char *) sqlite3_column_text(st, 5));
+        snprintf(tags[i].title, sizeof(tags[i].title), "%s", col_text(st, 1));
+        snprintf(tags[i].artist, sizeof(tags[i].artist), "%s", col_text(st, 2));
+        snprintf(tags[i].album, sizeof(tags[i].album), "%s", col_text(st, 3));
+        snprintf(tags[i].album_artist, sizeof(tags[i].album_artist), "%s", col_text(st, 4));
+        snprintf(tags[i].genre, sizeof(tags[i].genre), "%s", col_text(st, 5));
         i++;
     }
     sqlite3_finalize(st);
@@ -1420,7 +1494,7 @@ void metadata_db_load_all_books(char *** out_paths, int * out_count) {
 
     int i = 0;
     while (i < row_count && sqlite3_step(st) == SQLITE_ROW) {
-        paths[i] = strdup((const char *) sqlite3_column_text(st, 0));
+        paths[i] = strdup(col_text(st, 0));
         i++;
     }
     sqlite3_finalize(st);
@@ -1470,7 +1544,7 @@ void metadata_db_load_all_playlists(char *** out_paths, int * out_count) {
 
     int i = 0;
     while (i < row_count && sqlite3_step(st) == SQLITE_ROW) {
-        paths[i] = strdup((const char *) sqlite3_column_text(st, 0));
+        paths[i] = strdup(col_text(st, 0));
         i++;
     }
     sqlite3_finalize(st);
@@ -1566,7 +1640,7 @@ void metadata_db_load_favorite_books(char *** out_paths, int * out_count) {
 
     int i = 0;
     while (i < row_count && sqlite3_step(st) == SQLITE_ROW) {
-        paths[i] = strdup((const char *) sqlite3_column_text(st, 0));
+        paths[i] = strdup(col_text(st, 0));
         i++;
     }
     sqlite3_finalize(st);
@@ -1642,7 +1716,7 @@ void metadata_db_load_favorite_songs(char *** out_paths, int * out_count) {
 
     int i = 0;
     while (i < row_count && sqlite3_step(st) == SQLITE_ROW) {
-        paths[i] = strdup((const char *) sqlite3_column_text(st, 0));
+        paths[i] = strdup(col_text(st, 0));
         i++;
     }
     sqlite3_finalize(st);
@@ -1689,7 +1763,7 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
     char ** paths = malloc(sizeof(char *) * (size_t) limit);
     int i = 0;
     while (i < limit && sqlite3_step(st) == SQLITE_ROW) {
-        paths[i] = strdup((const char *) sqlite3_column_text(st, 0));
+        paths[i] = strdup(col_text(st, 0));
         i++;
     }
     sqlite3_finalize(st);
@@ -1744,9 +1818,9 @@ void metadata_db_load_subsonic_servers(subsonic_server_row_t ** out_rows, int * 
 
     int i = 0;
     while (i < row_count && sqlite3_step(st) == SQLITE_ROW) {
-        snprintf(rows[i].url, sizeof(rows[i].url), "%s", (const char *) sqlite3_column_text(st, 0));
-        snprintf(rows[i].username, sizeof(rows[i].username), "%s", (const char *) sqlite3_column_text(st, 1));
-        snprintf(rows[i].password, sizeof(rows[i].password), "%s", (const char *) sqlite3_column_text(st, 2));
+        snprintf(rows[i].url, sizeof(rows[i].url), "%s", col_text(st, 0));
+        snprintf(rows[i].username, sizeof(rows[i].username), "%s", col_text(st, 1));
+        snprintf(rows[i].password, sizeof(rows[i].password), "%s", col_text(st, 2));
         rows[i].verify_tls = sqlite3_column_int(st, 3) != 0;
         i++;
     }

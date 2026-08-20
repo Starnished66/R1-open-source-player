@@ -125,12 +125,21 @@ static void * stream_thread_func(void * arg) {
         }
     }
 
+    /* Audit finding: http_conn_close() (which frees s->conn.net.fd via
+     * mbedtls_net_free() -- closing the real fd and setting net.fd = -1)
+     * used to run outside this lock, while http_stream_close() read that
+     * same net.fd with no lock at all. A close()'d fd number can be
+     * reused by an unrelated socket/file elsewhere in this multi-socket
+     * app (DLNA, remote control, Wi-Fi) almost immediately, so a stale
+     * read here could shutdown() the wrong connection entirely. Closing
+     * inside the same lock http_stream_close() now also holds (see that
+     * function's own comment) makes the two properly mutually exclusive. */
     pthread_mutex_lock(&s->mutex);
     s->ended = true;
     pthread_cond_broadcast(&s->cond);
+    http_conn_close(&s->conn);
     pthread_mutex_unlock(&s->mutex);
 
-    http_conn_close(&s->conn);
     return NULL;
 }
 
@@ -315,8 +324,20 @@ void http_stream_close(http_stream_t * s) {
      * recv()), which push_to_ring()'s stop_requested check can't reach --
      * shutdown() forces that recv() to return immediately instead of
      * waiting indefinitely for the server to send more data. The thread's
-     * own http_conn_close() still runs, right before it exits. */
-    if (s->conn.net.fd >= 0) shutdown(s->conn.net.fd, SHUT_RDWR);
+     * own http_conn_close() still runs, right before it exits.
+     *
+     * Audit finding: reading s->conn.net.fd here used to happen with no
+     * lock held at all, racing stream_thread_func()'s own http_conn_close()
+     * (which frees/invalidates that same field via mbedtls_net_free()) at
+     * natural end-of-stream -- see that function's own comment for the
+     * stale-fd-reuse consequence. Locked here too now, matching where it
+     * closes; if the pump thread already finished and closed on its own,
+     * net.fd already reads -1 under this same lock and shutdown() is
+     * correctly skipped instead of acting on a stale/reused fd number. */
+    pthread_mutex_lock(&s->mutex);
+    int fd = s->conn.net.fd;
+    pthread_mutex_unlock(&s->mutex);
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
 
     pthread_join(s->thread, NULL);
     pthread_mutex_destroy(&s->mutex);

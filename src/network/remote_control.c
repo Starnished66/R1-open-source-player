@@ -202,17 +202,26 @@ bool remote_control_consume_queue_clear(void) {
 }
 
 void remote_control_sync_queue(const char * const * paths, int count) {
-    /* metadata_db_get_song_by_path() takes its own METADATA_DB_GUARD lock
+    /* metadata_db_get_songs_by_paths() takes its own METADATA_DB_GUARD lock
      * internally -- must not be called while already holding status_mutex,
      * or a UI-thread caller blocked on METADATA_DB_GUARD (e.g. a rescan)
      * while THIS thread holds status_mutex waiting on that same lock could
      * deadlock against gui.c's own status_mutex use elsewhere. Resolved
-     * before, not during, the locked section below. */
+     * before, not during, the locked section below. Batched (one prepared
+     * statement reused across all `count` lookups) rather than a fresh
+     * metadata_db_get_song_by_path() prepare/finalize per song -- see that
+     * function's own doc comment. */
     int64_t * ids = count > 0 ? malloc(sizeof(int64_t) * (size_t) count) : NULL;
     int id_count = 0;
-    for (int i = 0; i < count; i++) {
-        song_row_t row;
-        if (metadata_db_get_song_by_path(paths[i], &row)) ids[id_count++] = row.id;
+    if (ids) {
+        song_row_t * rows = malloc(sizeof(song_row_t) * (size_t) count);
+        if (rows) {
+            metadata_db_get_songs_by_paths(paths, count, rows);
+            for (int i = 0; i < count; i++) {
+                if (rows[i].id != -1) ids[id_count++] = rows[i].id;
+            }
+            free(rows);
+        }
     }
 
     pthread_mutex_lock(&status_mutex);
@@ -488,19 +497,30 @@ static void build_playlists_json(char * out, size_t out_size) {
     int count = 0;
     playlist_files_scan(MUSIC_ROOT_DIR, &paths, &count);
 
-    size_t len = 0;
-    len += (size_t) snprintf(out + len, out_size - len,
+    /* Audit finding: the loop guard's 300-byte margin doesn't actually
+     * cover this entry's own worst case (10 bytes of literal JSON +
+     * up to 299 bytes of escaped name + 36 more bytes of literal JSON =
+     * up to 345 bytes) -- the exact same snprintf-return-value-outruns-
+     * the-margin heap overflow already found and fixed in remote_control.c's
+     * handle_playlist_songs_request(), just not flagged by that pass since
+     * the entry shape differs. json_builder_t/json_builder_appendf()
+     * (same fix already applied there) can't overrun by construction: it
+     * rolls back a would-be-truncated append instead of ever accepting a
+     * partial write. */
+    json_builder_t json;
+    json_builder_init(&json, out, out_size);
+    json_builder_appendf(&json,
                             "{\"playlists\":[{\"name\":\"Favorites\",\"key\":\"@favorites\",\"internal\":true,\"writable\":false},"
                             "{\"name\":\"Most Played\",\"key\":\"@most_played\",\"internal\":true,\"writable\":false}");
-    for (int i = 0; i < count && len + 300 < out_size; i++) {
+    for (int i = 0; i < count && !json.truncated; i++) {
         const char * slash = strrchr(paths[i], '/');
         const char * base = slash ? slash + 1 : paths[i];
         char name_esc[300] = {0};
         json_escape_append(name_esc, sizeof(name_esc), base);
-        len += (size_t) snprintf(out + len, out_size - len,
-                                ",{\"name\":\"%s\",\"internal\":false,\"writable\":true}", name_esc);
+        if (!json_builder_appendf(&json, ",{\"name\":\"%s\",\"internal\":false,\"writable\":true}", name_esc)) break;
     }
-    snprintf(out + len, out_size - len, "]}");
+    json.truncated = false; /* a rejected item left the prior JSON intact -- see build_library_songs_json()'s own use of this pattern */
+    json_builder_appendf(&json, "]}");
 
     for (int i = 0; i < count; i++) free(paths[i]);
     free(paths);
@@ -509,10 +529,13 @@ static void build_playlists_json(char * out, size_t out_size) {
 static void build_queue_json(char * out, size_t out_size) {
     /* queue_song_ids is only ever written by remote_control_sync_queue()
      * under status_mutex, so read it under the same lock -- but resolve
-     * each id via metadata_db_get_song_by_id() (its own METADATA_DB_GUARD)
+     * ids via metadata_db_get_songs_by_ids() (its own METADATA_DB_GUARD)
      * only after taking a private snapshot, never while status_mutex is
      * still held, for the same lock-ordering reason documented on
-     * remote_control_sync_queue() itself. */
+     * remote_control_sync_queue() itself. Resolved in one batched call
+     * (one prepared statement reused across every id) rather than a fresh
+     * metadata_db_get_song_by_id() prepare/finalize per song in the loop
+     * below -- see that function's own doc comment. */
     pthread_mutex_lock(&status_mutex);
     int count = queue_song_id_count;
     int64_t * ids = NULL;
@@ -523,19 +546,34 @@ static void build_queue_json(char * out, size_t out_size) {
     }
     pthread_mutex_unlock(&status_mutex);
 
-    size_t len = (size_t) snprintf(out, out_size, "{\"songs\":[");
-    for (int i = 0; i < count && len + 768 < out_size; i++) {
-        song_row_t row;
-        if (!metadata_db_get_song_by_id(ids[i], &row)) continue;
+    song_row_t * rows = count > 0 ? malloc(sizeof(song_row_t) * (size_t) count) : NULL;
+    if (count > 0 && !rows) count = 0;
+    if (rows) metadata_db_get_songs_by_ids(ids, count, rows);
+
+    /* Audit finding: the loop guard's 768-byte margin doesn't cover this
+     * entry's own worst case (title/artist can each hold up to 511 escaped
+     * bytes, well over 1000 bytes total with the surrounding JSON) -- the
+     * exact same snprintf-return-value-outruns-the-margin heap overflow
+     * already found and fixed in handle_playlist_songs_request() (and just
+     * above in build_playlists_json()), just not flagged by that pass
+     * since this entry shape differs. json_builder_t/json_builder_appendf()
+     * can't overrun by construction: it rolls back a would-be-truncated
+     * append instead of ever accepting a partial write. */
+    json_builder_t json;
+    json_builder_init(&json, out, out_size);
+    json_builder_appendf(&json, "{\"songs\":[");
+    for (int i = 0; i < count && !json.truncated; i++) {
+        if (rows[i].id == -1) continue;
         char display_title[128], title[512] = {0}, artist[512] = {0};
-        metadata_db_song_display_title(&row, display_title, sizeof(display_title));
+        metadata_db_song_display_title(&rows[i], display_title, sizeof(display_title));
         json_escape_append(title, sizeof(title), display_title);
-        json_escape_append(artist, sizeof(artist), row.tags.artist);
-        len += (size_t) snprintf(out + len, out_size - len,
-                                "%s{\"offset\":%d,\"index\":%lld,\"title\":\"%s\",\"artist\":\"%s\"}",
-                                i ? "," : "", i, (long long) row.id, title, artist);
+        json_escape_append(artist, sizeof(artist), rows[i].tags.artist);
+        if (!json_builder_appendf(&json, "%s{\"offset\":%d,\"index\":%lld,\"title\":\"%s\",\"artist\":\"%s\"}",
+                                  i ? "," : "", i, (long long) rows[i].id, title, artist)) break;
     }
-    snprintf(out + len, out_size - len, "]}");
+    json.truncated = false; /* a rejected item left the prior JSON intact -- see build_library_songs_json()'s own use of this pattern */
+    json_builder_appendf(&json, "]}");
+    free(rows);
     free(ids);
 }
 
@@ -1110,8 +1148,8 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
         return;
     }
 
-    char * json = malloc(65536);
-    if (!json) {
+    char * json_buf = malloc(65536);
+    if (!json_buf) {
         for (int i = 0; i < count; i++) free(paths[i]);
         free(paths);
         send_response(cfd, "500 Internal Server Error", "text/plain", "Out of memory");
@@ -1121,11 +1159,30 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
     /* Playlist files store paths, not ids -- metadata_db_get_song_by_path()
      * resolves each one against the DB (its own METADATA_DB_GUARD); no
      * status_mutex needed since nothing here touches status_mutex-guarded
-     * state. */
-    size_t len = 0;
-    len += (size_t) snprintf(json + len, 65536 - len, "{\"songs\":[");
+     * state.
+     *
+     * Audit finding: this used to hand-roll its own snprintf+len-tracking
+     * loop with a fixed 256-byte safety margin, but a single entry's true
+     * worst case (comma + `{"index":` + up to 20 digits for a 64-bit id +
+     * `,"title":"` + up to 299 bytes of escaped title + `","artist":"` +
+     * up to 299 bytes of escaped artist + `"}`) is ~650 bytes -- more than
+     * the margin covered. snprintf() returns the length it WOULD have
+     * written even when truncated, so `len` could end up past 65536, and
+     * the trailing `snprintf(json + len, 65536 - len, "]}")` then computed
+     * an out-of-bounds pointer with an underflowed (huge, unsigned) size --
+     * a real heap overflow reachable by any playlist with a long enough
+     * title/artist, over the remote-control HTTP API. json_builder_t/
+     * json_builder_appendf() (used by every sibling JSON-array endpoint in
+     * this file, e.g. build_library_songs_json() just above) already
+     * solves this properly: it rolls back a would-be-truncated append
+     * instead of accepting a partial write, so `length` can never exceed
+     * `capacity`. Matches that same established loop shape here instead
+     * of re-deriving a safe margin by hand. */
+    json_builder_t json;
+    json_builder_init(&json, json_buf, 65536);
+    json_builder_appendf(&json, "{\"songs\":[");
     int emitted = 0;
-    for (int i = 0; i < count && len + 256 < 65536; i++) {
+    for (int i = 0; i < count && !json.truncated; i++) {
         song_row_t row;
         if (!metadata_db_get_song_by_path(paths[i], &row)) continue;
 
@@ -1133,15 +1190,16 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
         metadata_db_song_display_title(&row, display_title, sizeof(display_title));
         json_escape_append(title_esc, sizeof(title_esc), display_title);
         json_escape_append(artist_esc, sizeof(artist_esc), row.tags.artist);
-        len += (size_t) snprintf(json + len, 65536 - len, "%s{\"index\":%lld,\"title\":\"%s\",\"artist\":\"%s\"}",
-                                  emitted > 0 ? "," : "", (long long) row.id, title_esc, artist_esc);
+        if (!json_builder_appendf(&json, "%s{\"index\":%lld,\"title\":\"%s\",\"artist\":\"%s\"}",
+                                  emitted > 0 ? "," : "", (long long) row.id, title_esc, artist_esc)) break;
         emitted++;
     }
-    snprintf(json + len, 65536 - len, "]}");
+    json.truncated = false; /* a rejected item left the prior JSON intact -- see build_library_songs_json()'s own use of this pattern */
+    json_builder_appendf(&json, "]}");
 
-    send_response(cfd, "200 OK", "application/json", json);
+    send_response(cfd, "200 OK", "application/json", json_buf);
 
-    free(json);
+    free(json_buf);
     for (int i = 0; i < count; i++) free(paths[i]);
     free(paths);
 }

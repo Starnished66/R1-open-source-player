@@ -130,6 +130,19 @@ int metadata_db_get_album_songs(const char * album, const char * album_artist, i
 
 bool metadata_db_get_song_by_id(int64_t id, song_row_t * out_row);
 bool metadata_db_get_song_by_path(const char * path, song_row_t * out_row);
+
+/* Batched equivalents of the two functions above -- one prepared statement
+ * reused via bind+step+reset across all `count` lookups instead of a fresh
+ * prepare/finalize per song (remote_control.c's own build_queue_json()/
+ * remote_control_sync_queue() used to do that in a loop, re-parsing and
+ * re-planning the identical query on every single song in the play
+ * queue). out_rows must have room for `count` entries; out_rows[i].id is
+ * set to -1 for any ids[i]/paths[i] that doesn't match a real song, so a
+ * caller that needs to skip missing ones just checks that field -- every
+ * other field of a -1 entry is left untouched (whatever out_rows[i]
+ * already held), not zeroed. */
+void metadata_db_get_songs_by_ids(const int64_t * ids, int count, song_row_t * out_rows);
+void metadata_db_get_songs_by_paths(const char * const * paths, int count, song_row_t * out_rows);
 int64_t metadata_db_get_song_title_offset(const char * path);
 int64_t metadata_db_get_group_offset(metadata_db_group_kind_t kind, const char * name, const char * album_artist);
 

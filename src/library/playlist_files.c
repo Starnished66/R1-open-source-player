@@ -3,11 +3,30 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* Audit finding: playlist_files_append() writes directly into the live
+ * .m3u file, while playlist_files_remove() reads the whole file, writes a
+ * filtered copy to a temp file, and atomically rename()s it over the
+ * original -- with nothing serializing the two. The GUI thread and the
+ * remote-control HTTP server thread (see remote_control.c) both reach
+ * these functions, so a remove() that started reading before a concurrent
+ * append()'s write lands can rename its own (now-stale) snapshot over the
+ * file afterward, silently discarding the just-appended line with no error
+ * surfaced to either caller -- a real, reachable lost update, not just a
+ * theoretical one. One process-wide mutex around every mutating operation
+ * (append/remove/create/delete) is simple and correct: these are rare,
+ * user-initiated edits, not a hot path, so serializing across all
+ * playlists rather than per-file is a fine trade for not having to manage
+ * per-path lock lifetimes. playlist_files_migrate_to_relative() doesn't
+ * need it -- its own doc comment guarantees it only ever runs once, before
+ * any other thread could be touching playlists. */
+static pthread_mutex_t playlist_files_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static bool is_m3u_file(const char * name) {
     const char * ext = strrchr(name, '.');
@@ -206,8 +225,12 @@ bool playlist_files_scan(const char * root, char *** out_paths, int * out_count)
 }
 
 bool playlist_files_append(const char * m3u_path, const char * song_path) {
+    pthread_mutex_lock(&playlist_files_mutex);
     FILE * f = fopen(m3u_path, "a");
-    if (!f) return false;
+    if (!f) {
+        pthread_mutex_unlock(&playlist_files_mutex);
+        return false;
+    }
 
     char dir_path[PATH_MAX];
     dir_of(m3u_path, dir_path, sizeof(dir_path));
@@ -217,6 +240,7 @@ bool playlist_files_append(const char * m3u_path, const char * song_path) {
 
     fprintf(f, "%s\n", line_to_write);
     fclose(f);
+    pthread_mutex_unlock(&playlist_files_mutex);
     return true;
 }
 
@@ -256,14 +280,19 @@ bool playlist_files_contains(const char * m3u_path, const char * song_path) {
 }
 
 bool playlist_files_remove(const char * m3u_path, const char * song_path) {
+    pthread_mutex_lock(&playlist_files_mutex);
     FILE * f = fopen(m3u_path, "r");
-    if (!f) return false;
+    if (!f) {
+        pthread_mutex_unlock(&playlist_files_mutex);
+        return false;
+    }
 
     char tmp_path[PATH_MAX + 8];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", m3u_path);
     FILE * out = fopen(tmp_path, "w");
     if (!out) {
         fclose(f);
+        pthread_mutex_unlock(&playlist_files_mutex);
         return false;
     }
 
@@ -285,6 +314,7 @@ bool playlist_files_remove(const char * m3u_path, const char * song_path) {
     fclose(out);
 
     rename(tmp_path, m3u_path); /* atomic replace on POSIX -- no window where m3u_path is missing or half-written */
+    pthread_mutex_unlock(&playlist_files_mutex);
     return true;
 }
 
@@ -292,25 +322,34 @@ bool playlist_files_create(const char * dir, const char * name, const char * son
                             size_t out_path_size) {
     if (name[0] == '\0') return false;
 
+    pthread_mutex_lock(&playlist_files_mutex);
+
     mkdir(dir, 0755); /* ignore EEXIST -- same "best effort, check the open" pattern as peq.c's profiles dir */
 
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.m3u", dir, name);
 
     FILE * f = fopen(path, "w");
-    if (!f) return false;
+    if (!f) {
+        pthread_mutex_unlock(&playlist_files_mutex);
+        return false;
+    }
 
     char rel[PATH_MAX];
     const char * line_to_write = make_relative_path(dir, song_path, rel, sizeof(rel)) ? rel : song_path;
     fprintf(f, "%s\n", line_to_write);
     fclose(f);
+    pthread_mutex_unlock(&playlist_files_mutex);
 
     if (out_path) snprintf(out_path, out_path_size, "%s", path);
     return true;
 }
 
 bool playlist_files_delete(const char * m3u_path) {
-    return remove(m3u_path) == 0;
+    pthread_mutex_lock(&playlist_files_mutex);
+    bool ok = remove(m3u_path) == 0;
+    pthread_mutex_unlock(&playlist_files_mutex);
+    return ok;
 }
 
 void playlist_files_resolve_path(const char * m3u_path, const char * line, char * out_full_path, size_t out_size) {

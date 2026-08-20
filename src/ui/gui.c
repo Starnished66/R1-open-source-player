@@ -57,6 +57,7 @@
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -490,6 +491,14 @@ static lv_obj_t * order_icon;
 static int * shuffle_order = NULL;
 static int shuffle_order_count = 0; /* playlist_count this bag was generated for -- staleness check */
 static int shuffle_pos = -1;        /* index into shuffle_order such that shuffle_order[shuffle_pos] == playlist_index */
+
+/* Set only when compute_auto_advance_index() has to precompute a reshuffled
+ * continuation bag for the shuffle-wrap case -- see both that function's
+ * and commit_auto_advance()'s own comments. Declared here (rather than
+ * just above compute_auto_advance_index(), where it used to live) since
+ * ensure_shuffle_order_current() -- defined earlier in this file -- also
+ * needs to invalidate it on a playlist change. */
+static int * pending_shuffle_order = NULL;
 
 static bool user_seeking = false;
 /* A short debounce keeps a seek followed immediately by next/previous from
@@ -3753,6 +3762,16 @@ static void ensure_shuffle_order_current(void) {
     fisher_yates_shuffle(shuffle_order, playlist_count);
     shuffle_order_count = playlist_count;
 
+    /* A pending wrap-continuation order (see compute_auto_advance_index()'s
+     * own comment) sized for whatever playlist_count was true when it was
+     * generated is no longer valid once the playlist itself has changed --
+     * without this, a stale pending_shuffle_order could later get promoted
+     * by commit_auto_advance() and paired with the NEW (different)
+     * playlist_count, a real out-of-bounds read the first time shuffle_pos
+     * advances past the old, smaller array's real size. */
+    free(pending_shuffle_order);
+    pending_shuffle_order = NULL;
+
     shuffle_pos = 0;
     if (playlist_index >= 0) {
         for (int i = 0; i < playlist_count; i++) {
@@ -3764,10 +3783,6 @@ static void ensure_shuffle_order_current(void) {
     }
 }
 
-/* Set only when compute_auto_advance_index() has to precompute a reshuffled
- * continuation bag for the shuffle-wrap case -- see both functions' own
- * comments. */
-static int * pending_shuffle_order = NULL;
 
 /* What track to move to when the current one finishes naturally (auto-
  * advance) -- as opposed to compute_manual_step_index() below, for an
@@ -3803,11 +3818,26 @@ static int compute_auto_advance_index(int index) {
             /* Bag exhausted -- precompute the reshuffled continuation now
              * rather than waiting for commit_auto_advance(), so whatever
              * gets armed for gapless preload here and whatever that commit
-             * later confirms are guaranteed to be the same track. */
-            free(pending_shuffle_order);
-            pending_shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
-            memcpy(pending_shuffle_order, shuffle_order, sizeof(int) * (size_t) playlist_count);
-            fisher_yates_shuffle(pending_shuffle_order, playlist_count);
+             * later confirms are guaranteed to be the same track.
+             *
+             * Audit finding: this used to regenerate pending_shuffle_order
+             * unconditionally on every call, directly violating this
+             * function's own documented contract just above ("must be safe
+             * to call more than once for the same index and always get the
+             * same answer") -- arm_next_track_for_audio() calls this
+             * speculatively and can call it again for the same pending
+             * transition (e.g. a crossfade/ReplayGain setting change
+             * re-arming before the track actually finishes), and each call
+             * was drawing a brand-new random order, silently discarding
+             * whichever track audio.c had already been armed with. Only
+             * generate once per wrap; commit_auto_advance() consumes and
+             * NULLs this when the wrap is actually confirmed, so the next
+             * genuinely new wrap still gets a fresh shuffle. */
+            if (!pending_shuffle_order) {
+                pending_shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
+                memcpy(pending_shuffle_order, shuffle_order, sizeof(int) * (size_t) playlist_count);
+                fisher_yates_shuffle(pending_shuffle_order, playlist_count);
+            }
             return pending_shuffle_order[0];
         }
         case PLAY_MODE_SEQUENTIAL:
@@ -4254,10 +4284,27 @@ static void launch_cover_decode_req(cover_decode_request_t r) {
     }
 
     cover_decode_request_t * req = malloc(sizeof(*req));
+    if (!req) {
+        /* Audit finding: this used to dereference req unconditionally --
+         * on this RAM-constrained device, a malloc() this size (the
+         * struct embeds a 1536-byte stream_url and a PATH_MAX local_track_
+         * path) can genuinely fail under memory pressure, and this runs on
+         * essentially every track change, not just a deliberate low-memory
+         * test. Free the request's own owned picture_data (same ownership
+         * contract every other caller relies on) and just skip this
+         * decode -- cover art staying stale for one track is a far better
+         * outcome than crashing the whole app. */
+        free(r.picture_data);
+        return;
+    }
     *req = r;
     cover_decode_done_flag = false;
     cover_decode_active = true;
-    pthread_create(&cover_decode_thread, NULL, cover_decode_thread_func, req);
+    if (pthread_create(&cover_decode_thread, NULL, cover_decode_thread_func, req) != 0) {
+        free(req->picture_data);
+        free(req);
+        cover_decode_active = false;
+    }
 }
 
 static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t picture_size) {
@@ -4430,7 +4477,15 @@ typedef struct {
 
 static pthread_t lyrics_load_thread;
 static bool lyrics_load_active = false;
-static volatile bool lyrics_load_done_flag = false;
+/* atomic_bool rather than a plain volatile bool -- audit finding: a plain
+ * bool has no C11-recognized ordering between the worker thread's write
+ * here and the UI thread's poll read, the same formally-a-data-race
+ * pattern already fixed for compact_list_fetch_job_t.result_count
+ * (screen_builders.c) elsewhere in this session's diff. Cost-free to make
+ * consistent: plain assignment/comparison on an _Atomic-qualified object
+ * already uses sequentially consistent ordering by default in C11, so
+ * every read/write site below is unchanged syntactically. */
+static atomic_bool lyrics_load_done_flag = false;
 static int lyrics_load_result_generation;
 static int lyrics_load_result_for_index;
 static bool lyrics_load_result_ok;
@@ -4542,7 +4597,7 @@ typedef struct {
 
 static pthread_t lyrics_backdrop_thread;
 static bool lyrics_backdrop_active = false;
-static volatile bool lyrics_backdrop_done_flag = false;
+static atomic_bool lyrics_backdrop_done_flag = false; /* atomic_bool, not volatile -- see lyrics_load_done_flag's own doc comment */
 static uint8_t * lyrics_backdrop_result_bytes;
 
 /* Same pixel-math shape as compute_reflection_bytes() above (unpack RGB565
@@ -5714,6 +5769,11 @@ static void play_remote_control_song(const char * song_path, const char * playli
 static void start_power_off_countdown(void);
 static void poll_power_off_countdown(void);
 
+/* Defined alongside the rest of live search's async DB query, much further
+ * down -- forward-declared here since update_timer_cb() (just below) polls
+ * it every tick, same as poll_cover_decode()/poll_lyrics_load(). */
+static void poll_search_job(void);
+
 static void update_timer_cb(lv_timer_t * timer) {
     (void) timer;
 
@@ -6357,6 +6417,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_sd_card_hotplug();
     poll_cover_decode();
     poll_lyrics_load();
+    poll_search_job();
 
     if (audio_consume_track_advanced()) {
         /* The playback thread already moved on to the queued next track by
@@ -11950,6 +12011,122 @@ static bool search_matches(const char * haystack, const char * needle) {
  * on every single character typed. */
 #define SEARCH_RESULTS_MAX 200
 
+/* ---- Live search: async DB query for db_backed bindings -------------
+ * Efficiency finding: metadata_db_search_names()'s query shape (a
+ * ROW_NUMBER() window function wrapped in a leading-wildcard LIKE) can't be
+ * pushed down by SQLite -- it's a full table/GROUP BY scan every time this
+ * runs. Used to run synchronously, directly on the UI thread, once per
+ * keystroke; now debounced (search_debounce_timer below, same one-shot-
+ * timer idiom as pending_progress_seek_timer above) so a burst of
+ * keystrokes collapses into one query, and that one query runs on a
+ * background thread -- same shape as poll_lyrics_load()/poll_cover_decode()
+ * elsewhere in this file -- so even a single slow scan on a large library
+ * never blocks a frame. Non-db_backed bindings (the two Subsonic ones)
+ * still scan their in-memory arrays synchronously inside search_apply_
+ * filter() below -- cheap and already bounded at SEARCH_RESULTS_MAX, not
+ * what this finding was about. */
+#define SEARCH_DEBOUNCE_MS 200
+
+static lv_timer_t * search_debounce_timer;
+
+typedef struct {
+    metadata_db_az_kind_t db_kind;
+    char query[256];
+} search_job_request_t;
+
+static pthread_t search_job_thread;
+static bool search_job_active = false;
+static atomic_bool search_job_done_flag = false;
+static search_binding_t * search_job_for_binding;
+static int search_job_result_count;
+static metadata_db_search_hit_t search_job_result_hits[SEARCH_RESULTS_MAX];
+
+static bool search_job_pending_valid = false;
+static search_job_request_t search_job_pending_request;
+static search_binding_t * search_job_pending_binding;
+
+static void * search_job_thread_func(void * arg) {
+    search_job_request_t * req = (search_job_request_t *) arg;
+    search_job_result_count = metadata_db_search_names(req->db_kind, req->query, SEARCH_RESULTS_MAX, search_job_result_hits);
+    free(req);
+    search_job_done_flag = true; /* written last -- poll_search_job() only checks this flag */
+    return NULL;
+}
+
+/* At most one job in flight -- a debounce fire arriving while the previous
+ * one is still running replaces the pending request rather than queuing,
+ * same "only the latest ever matters" shape as launch_cover_decode_req()'s
+ * cover_decode_pending. */
+static void launch_search_job(search_binding_t * b, const char * query) {
+    if (search_job_active) {
+        search_job_pending_binding = b;
+        search_job_pending_request.db_kind = b->db_kind;
+        snprintf(search_job_pending_request.query, sizeof(search_job_pending_request.query), "%s", query);
+        search_job_pending_valid = true;
+        return;
+    }
+
+    search_job_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
+    req->db_kind = b->db_kind;
+    snprintf(req->query, sizeof(req->query), "%s", query);
+
+    search_job_for_binding = b;
+    search_job_done_flag = false;
+    search_job_active = true;
+    if (pthread_create(&search_job_thread, NULL, search_job_thread_func, req) != 0) {
+        free(req);
+        search_job_active = false;
+    }
+}
+
+/* Builds compact_list_item_t/filtered_indices/filtered_labels from a
+ * finished search job's hits and applies them to b->list -- the same tail
+ * search_apply_filter()'s own db_backed branch used to do synchronously
+ * right after the query, now split out so poll_search_job() below can call
+ * it once the background query actually finishes. Old filtered_indices/
+ * filtered_labels are freed and replaced atomically here (the list only
+ * ever shows one complete result set, never a stale-then-fresh flash). */
+static void search_apply_results_to_list(search_binding_t * b, const metadata_db_search_hit_t * hits, int matched) {
+    compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) (matched > 0 ? matched : 1));
+    int * indices = malloc(sizeof(int) * (size_t) (matched > 0 ? matched : 1));
+    char(*labels)[128] = malloc(sizeof(*labels) * (size_t) (matched > 0 ? matched : 1));
+    for (int i = 0; i < matched; i++) {
+        snprintf(labels[i], sizeof(labels[i]), "%s", hits[i].label);
+        items[i] = (compact_list_item_t){ labels[i] };
+        indices[i] = hits[i].offset;
+    }
+
+    compact_list_set_items(b->list, items, matched);
+    free(items);
+
+    free(b->filtered_indices);
+    free(b->filtered_labels);
+    b->filtered_indices = indices;
+    b->filtered_labels = labels;
+    b->filtered_count = matched;
+}
+
+/* Called every tick from update_timer_cb, same as poll_cover_decode()/poll_
+ * lyrics_load(). Discards the result (never applies it) if the binding it
+ * was for is no longer the active search -- the user may have closed
+ * search, or switched to a different search-active screen, while the query
+ * was in flight. */
+static void poll_search_job(void) {
+    if (!search_job_active || !search_job_done_flag) return;
+    search_job_active = false;
+    pthread_join(search_job_thread, NULL);
+
+    if (search_job_for_binding->active && find_search_binding_for_screen(lv_screen_active()) == search_job_for_binding) {
+        search_apply_results_to_list(search_job_for_binding, search_job_result_hits, search_job_result_count);
+    }
+
+    if (search_job_pending_valid) {
+        search_job_pending_valid = false;
+        launch_search_job(search_job_pending_binding, search_job_pending_request.query);
+    }
+}
+
 /* Rebuilds binding->list's contents to only entries matching `query`, via
  * compact_list_set_items() rather than a screen rebuild. An empty query
  * shows NOTHING (not the full library) -- real-device feedback: search
@@ -11965,42 +12142,37 @@ static bool search_matches(const char * haystack, const char * needle) {
  * -- no whole-library array dependency at all, matching the A-Z index's own
  * conversion. filtered_labels owns the label strings compact_list_item_t
  * points at in this path, since a DB query's results have no other long-
- * lived home to point into. */
+ * lived home to point into. As of the async rework above, the query itself
+ * runs on a background thread (launch_search_job()) -- this function only
+ * ever handles the immediate "query cleared" case for db_backed bindings
+ * synchronously now. */
 static void search_apply_filter(search_binding_t * b, const char * query) {
     bool have_query = query && query[0];
+
+    if (b->db_backed) {
+        if (!have_query) {
+            free(b->filtered_indices);
+            b->filtered_indices = NULL;
+            b->filtered_count = 0;
+            free(b->filtered_labels);
+            b->filtered_labels = NULL;
+            compact_list_set_items(b->list, NULL, 0);
+            return;
+        }
+        /* Deliberately does NOT clear filtered_indices/filtered_labels
+         * here -- the previous result set stays on screen until the new
+         * one actually lands (search_apply_results_to_list(), above),
+         * rather than flashing to empty for however long the background
+         * query takes. */
+        launch_search_job(b, query);
+        return;
+    }
 
     free(b->filtered_indices);
     b->filtered_indices = NULL;
     b->filtered_count = 0;
     free(b->filtered_labels);
     b->filtered_labels = NULL;
-
-    if (b->db_backed) {
-        if (!have_query) {
-            compact_list_set_items(b->list, NULL, 0);
-            return;
-        }
-        metadata_db_search_hit_t * hits = malloc(sizeof(metadata_db_search_hit_t) * SEARCH_RESULTS_MAX);
-        int matched = hits ? metadata_db_search_names(b->db_kind, query, SEARCH_RESULTS_MAX, hits) : 0;
-
-        compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) (matched > 0 ? matched : 1));
-        int * indices = malloc(sizeof(int) * (size_t) (matched > 0 ? matched : 1));
-        char(*labels)[128] = malloc(sizeof(*labels) * (size_t) (matched > 0 ? matched : 1));
-        for (int i = 0; i < matched; i++) {
-            snprintf(labels[i], sizeof(labels[i]), "%s", hits[i].label);
-            items[i] = (compact_list_item_t){ labels[i] };
-            indices[i] = hits[i].offset;
-        }
-        free(hits);
-
-        compact_list_set_items(b->list, items, matched);
-        free(items);
-
-        b->filtered_indices = indices;
-        b->filtered_labels = labels;
-        b->filtered_count = matched;
-        return;
-    }
 
     int count = have_query ? *b->count_ptr : 0;
     int cap = count < SEARCH_RESULTS_MAX ? count : SEARCH_RESULTS_MAX;
@@ -12029,12 +12201,28 @@ static void search_apply_filter(search_binding_t * b, const char * query) {
     }
 }
 
-static void search_textarea_value_changed_cb(lv_event_t * e) {
-    (void) e;
+/* Fires once SEARCH_DEBOUNCE_MS after the last keystroke -- re-checks
+ * everything fresh (not captured at keystroke time) since by definition no
+ * newer keystroke has arrived without cancelling and recreating this timer
+ * first (see search_textarea_value_changed_cb() below). */
+static void search_debounce_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    search_debounce_timer = NULL;
     if (!text_entry_inline_mode_active) return;
     search_binding_t * b = find_search_binding_for_screen(lv_screen_active());
     if (!b) return;
     search_apply_filter(b, lv_textarea_get_text(text_entry_textarea));
+}
+
+static void search_textarea_value_changed_cb(lv_event_t * e) {
+    (void) e;
+    if (!text_entry_inline_mode_active) return;
+    if (search_debounce_timer) {
+        lv_timer_delete(search_debounce_timer);
+        search_debounce_timer = NULL;
+    }
+    search_debounce_timer = lv_timer_create(search_debounce_timer_cb, SEARCH_DEBOUNCE_MS, NULL);
+    lv_timer_set_repeat_count(search_debounce_timer, 1);
 }
 
 /* Restores a binding's list to its normal full-height, bottom-anchored
@@ -12090,6 +12278,16 @@ static void search_open(search_binding_t * b) {
 
 static void search_close(search_binding_t * b) {
     t9_keypad_release();
+
+    /* Not strictly required for correctness -- poll_search_job()/search_
+     * debounce_timer_cb() both already re-check b->active/find_search_
+     * binding_for_screen() at fire time and no-op harmlessly if this
+     * binding is no longer the active search -- but cancelling outright
+     * avoids a pointless wait for a query result nobody will ever see. */
+    if (search_debounce_timer) {
+        lv_timer_delete(search_debounce_timer);
+        search_debounce_timer = NULL;
+    }
 
     lv_obj_add_flag(b->search_bar, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(b->search_btn, LV_OBJ_FLAG_HIDDEN);
@@ -12767,7 +12965,32 @@ static void refresh_library_screens_after_reload(void) {
      * long enough to show the completion message, so only preserve that
      * explicitly safe case. Resetting also removes deeper group screens
      * whose rows reference the library arrays replaced by the reload. */
-    if (lv_screen_active() != subsonic_downloading_screen) nav_reset_to_home();
+    if (lv_screen_active() != subsonic_downloading_screen) {
+        nav_reset_to_home();
+    } else {
+        /* Audit finding: this exception only skipped nav_reset_to_home()
+         * -- the lv_obj_delete() calls below always run regardless. Real
+         * bug: subsonic_downloading_screen is a shared singleton (Wi-Fi
+         * "Connecting...", Subsonic connect, SD format, and library
+         * rescan all reuse it), not exclusive to the rescan flow this
+         * exception was written for. If the user reached one of these
+         * four screens via some other in-progress navigation (e.g. All
+         * Songs -> Wi-Fi settings -> "Connecting...") and a reload lands
+         * while that shared screen is active, its stack slot goes stale
+         * the instant lv_obj_delete() runs below -- and a later nav_pop()
+         * back through it loads a freed screen. Purge any of the four
+         * from nav_stack before deleting them, even though the active
+         * screen itself is deliberately left alone. */
+        lv_obj_t * being_replaced[] = { all_songs_screen, artists_screen, albums_screen, album_artist_screen };
+        for (int i = nav_depth - 1; i >= 0; i--) {
+            for (size_t j = 0; j < sizeof(being_replaced) / sizeof(being_replaced[0]); j++) {
+                if (nav_stack[i] == being_replaced[j]) {
+                    nav_remove_stack_slot(i);
+                    break;
+                }
+            }
+        }
+    }
 
     lv_obj_delete(all_songs_screen);
     lv_obj_delete(artists_screen);

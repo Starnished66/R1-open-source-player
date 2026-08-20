@@ -81,6 +81,40 @@ If a file fails to load or errors while running its top-level code
 to stderr as `[plugins] failed to load <path>: <error>` -- without
 affecting any other `.lua` file in the folder.
 
+### Sandboxing
+
+A plugin is just a `.lua` file dropped into `.plugins/` -- this app treats
+that the same as any other SD-card-supplied content, not as fully trusted
+code, so `luaL_openlibs()`'s full standard library is trimmed right after
+each `lua_State` is created (`sandbox_plugin_lua_state()`):
+
+- **Removed entirely**: `load`, `loadstring`, `loadfile`, `dofile`,
+  `require`, `package`, `debug`, `collectgarbage`. Every documented plugin
+  here is a single self-contained file (see above) with no multi-file/
+  `require()` pattern, so this doesn't take away anything a real plugin
+  needs.
+- **Removed from `os`**: `execute`, `remove`, `rename`, `tmpname`,
+  `getenv`, `exit`. `os.time`/`os.date`/`os.clock`/`os.difftime` are still
+  available.
+- **Removed entirely**: the whole `io` table. File access goes through
+  `plugin.list_dir()`/`plugin.sd_root()` instead, scoped to the SD card
+  root rather than the whole filesystem.
+
+Everything a plugin legitimately needs -- file browsing, HTTP, playback
+control, library queries, theme overrides -- has a purpose-built `plugin.*`
+function below; none of it depends on the stdlib pieces above.
+
+Every plugin call (a UI callback, a timer tick, an event handler, and the
+file's own top-level code on load) also runs under a wall-clock time
+budget -- 2 seconds, checked periodically via a Lua instruction-count hook
+(`plugin_call()`, wrapping every `lua_pcall()` in `plugin_manager.c`). A
+callback that runs long doing real work (an HTTP request via
+`plugin.http_get()`/`http_post()`/`http_request()`, for instance) is
+**not** affected -- the budget only ever fires between Lua bytecode
+instructions, never while blocked inside a native call, so it only catches
+a genuine runaway loop in Lua code itself (e.g. an accidental `while true
+do end`), not a slow network response.
+
 <a id="ui-entry-points"></a>
 
 ## 🧭 Adding Your Plugin to the UI

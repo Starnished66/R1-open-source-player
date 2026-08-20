@@ -195,6 +195,7 @@ static void * dlna_download_thread_func(void * arg) {
 
 static void handle_play(void) {
     dlna_download_request_t * req = malloc(sizeof(*req));
+    if (!req) return; /* audit finding: this used to dereference req unconditionally right below -- on this ~57MB-RAM device, malloc() can genuinely fail under memory pressure, and this is reachable by any DLNA controller on the LAN */
     pthread_mutex_lock(&dlna_mutex);
     snprintf(req->uri, sizeof(req->uri), "%s", pending_uri);
     snprintf(req->title, sizeof(req->title), "%s", pending_title);

@@ -30,30 +30,6 @@
  * another thread. */
 static pthread_mutex_t bt_chip_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Finds PIDs whose `ps` command line contains needle and kills them all
- * together. Shared by this file's wedge-recovery cleanup and
- * bt_control_apply_output_settings()'s bt-agent cleanup. Capped at 16 with
- * margin to spare: repeated toggles before this cleanup existed could leave
- * several stray bt-agent processes accumulated at once. */
-static void kill_all_matching(const char * needle) {
-    char out[4096];
-    char * argv[] = { (char *) "ps", NULL };
-    if (!subprocess_run(argv, out, sizeof(out))) return;
-
-    int pids[16];
-    int pid_count = 0;
-    char * line_save = NULL;
-    char * line = strtok_r(out, "\n", &line_save);
-    while (line && pid_count < 16) {
-        if (strstr(line, needle)) {
-            int pid = atoi(line);
-            if (pid > 0) pids[pid_count++] = pid;
-        }
-        line = strtok_r(NULL, "\n", &line_save);
-    }
-    for (int i = 0; i < pid_count; i++) kill(pids[i], SIGKILL);
-}
-
 /* /etc/init.d/S80_bt_init always starts a second, independent dbus-daemon
  * (`--config-file=/usr/share/dbus-1/system.conf`) alongside the one
  * S30dbus already started at boot (`--system`), regardless of anything
@@ -93,7 +69,7 @@ static bool dbus_system_bus_reachable(void) {
 static void ensure_single_dbus_daemon(void) {
     if (count_matching("dbus-daemon") <= 1 && dbus_system_bus_reachable()) return;
 
-    kill_all_matching("dbus-daemon");
+    subprocess_kill_all_matching("dbus-daemon");
     remove("/var/run/messagebus.pid"); /* stale pidfile blocks a fresh start otherwise */
     usleep(300000);
 
@@ -175,7 +151,7 @@ static void bt_control_recover_wedged_daemon(void) {
      * recurring mid-session, not only on a fresh boot. */
     ensure_single_dbus_daemon();
 
-    kill_all_matching("bluetoothd");
+    subprocess_kill_all_matching("bluetoothd");
     usleep(500000);
 
     char * reset_argv[] = { (char *) "hciconfig", (char *) "hci0", (char *) "reset", NULL };
@@ -1100,10 +1076,6 @@ static bool spawn_bluealsa_and_verify(char * const argv[]) {
 }
 
 bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled) {
-    last_applied_dac_mode_enabled = dac_mode_enabled;
-    last_applied_volume_sync_enabled = volume_sync_enabled;
-    output_settings_ever_applied = true;
-
     /* Real-device concurrency finding: this function and bt_control_recover_
      * wedged_daemon() (via bt_control_reapply_last_output_settings() at the
      * end of its own recovery sequence) each independently kill-then-respawn
@@ -1111,7 +1083,7 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
      * at once -- e.g. a wedge detected on the ~5s connection poll at the
      * same moment the user (or a BT disconnect's own auto-stop path) touches
      * a DAC-mode/output-setting toggle. That's the exact "9 accumulated
-     * bt-agent processes" failure mode kill_all_matching() below was
+     * bt-agent processes" failure mode subprocess_kill_all_matching() below was
      * originally added to fix (see its own comment), just reachable through
      * two separate call sites racing instead of one call site respawning
      * without cleanup. bt_daemon_respawn_mutex below serializes them.
@@ -1120,8 +1092,20 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
      * refresh_bt_icon_thread_func() for the wedge-recovery path), never the
      * UI thread, so blocking here on the other one finishing can't freeze
      * the UI -- it just makes one wait briefly instead of interleaving with
-     * the other's kill/respawn sequence. */
+     * the other's kill/respawn sequence.
+     *
+     * Audit finding: last_applied_dac_mode_enabled/last_applied_volume_
+     * sync_enabled/output_settings_ever_applied used to be written BEFORE
+     * this lock, while bt_control_reapply_last_output_settings() (the
+     * wedge-recovery path mentioned above) read them with no lock at all.
+     * A toggle landing at the same moment as a wedge-triggered reapply
+     * could observe an inconsistent combination of the two flags. Writing
+     * them under the same mutex that already serializes the two call
+     * sites' actual daemon respawns closes this with no new lock needed. */
     pthread_mutex_lock(&bt_daemon_respawn_mutex);
+    last_applied_dac_mode_enabled = dac_mode_enabled;
+    last_applied_volume_sync_enabled = volume_sync_enabled;
+    output_settings_ever_applied = true;
 
     /* Sink and source are mutually exclusive here, matching the real
      * firmware's own /usr/bin/bluealsa_profile script exactly (confirmed by
@@ -1150,7 +1134,7 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
      * spawning yet another on top. Nine agents simultaneously fighting to
      * register with bluetoothd over D-Bus is a real, confirmed cause of
      * broader Bluetooth instability (agent registration churn, D-Bus
-     * congestion), not just leaked processes. kill_all_matching() (see its
+     * congestion), not just leaked processes. subprocess_kill_all_matching() (see its
      * own comment) is the same ps-output-based approach already proven
      * reliable for hiby_player/dbus-daemon cleanup. "bluealsa" as the
      * search string also matches bluealsa-aplay (it contains "bluealsa" as
@@ -1161,9 +1145,9 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
      * called again further down when relevant. */
     bt_volume_curve_stop();
 
-    kill_all_matching("bluealsa");
-    kill_all_matching("aplay");
-    kill_all_matching("bt-agent");
+    subprocess_kill_all_matching("bluealsa");
+    subprocess_kill_all_matching("aplay");
+    subprocess_kill_all_matching("bt-agent");
     /* usleep(500000) delay TEMPORARILY REMOVED for the same live A/B test
      * as the codec restriction and bluealsa-aplay below -- the stock
      * player's own bluealsa_profile script has zero delay between the
@@ -1301,8 +1285,20 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
 }
 
 static void bt_control_reapply_last_output_settings(void) {
-    if (!output_settings_ever_applied) return; /* this session never asked for a particular profile -- nothing to restore */
-    bt_control_apply_output_settings(last_applied_dac_mode_enabled, last_applied_volume_sync_enabled);
+    /* Audit finding: these three globals used to be read here with no lock
+     * at all -- see bt_control_apply_output_settings()'s own comment on
+     * the write side of this same race. Snapshot under the lock, then call
+     * outside it (bt_control_apply_output_settings() acquires this same
+     * mutex itself -- calling it while still holding the lock here would
+     * self-deadlock). */
+    pthread_mutex_lock(&bt_daemon_respawn_mutex);
+    bool ever_applied = output_settings_ever_applied;
+    bool dac_mode = last_applied_dac_mode_enabled;
+    bool volume_sync = last_applied_volume_sync_enabled;
+    pthread_mutex_unlock(&bt_daemon_respawn_mutex);
+
+    if (!ever_applied) return; /* this session never asked for a particular profile -- nothing to restore */
+    bt_control_apply_output_settings(dac_mode, volume_sync);
 }
 
 bool bt_control_set_codec(const char * codec) {

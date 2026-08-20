@@ -351,6 +351,22 @@ static char ** playlist = NULL;
 static int playlist_count = 0;
 static int playlist_index = -1;
 
+/* Non-NULL only while playing from the whole, unfiltered All Songs list --
+ * see on_file_selected_lazy_all_songs()'s own comment for why. playlist[i]
+ * == NULL means "not resolved yet"; playlist_path_at() (defined once
+ * all_songs_paths/all_songs_sort_order are in scope, forward-declared
+ * below) resolves it to playlist_lazy_sort_order[i]'s position in
+ * all_songs_sort_order, strdup()s it into playlist[i], and from then on
+ * that slot is a completely ordinary owned entry. Kept the same length as
+ * playlist[] itself by queue_add_song()/queue_remove_song_at_offset()/
+ * delete_song_confirm_cb() -- the only three places that resize or shift
+ * playlist[] after creation -- so every still-unresolved slot keeps
+ * pointing at the right song after a splice. Real-device cost this exists
+ * to avoid: tapping any song in a 32K-song library used to strdup() all
+ * 32,000 paths just to play one of them, the same O(library)-per-action
+ * failure class as this whole session's boot-scale incidents. */
+static int * playlist_lazy_sort_order = NULL;
+
 /* "Up Next" queue (long-press a song -> Add to Queue): how many playlist[]
  * slots starting right at playlist_index+1 are still-unplayed queue
  * insertions, and where the NEXT "Add to Queue" tap should splice one in.
@@ -378,6 +394,17 @@ static int queue_next_insert_index = -1; /* -1 = nothing pending, next add goes 
  * see refresh_now_playing_indicators() below. */
 static int now_playing_song_index = -1;
 
+/* The same "currently playing" identity as now_playing_song_index above,
+ * but by path instead of an all_songs_paths array index -- set at the same
+ * place (apply_track_metadata_to_ui()), from the same local `path`, so it's
+ * available even when all_songs_paths/all_song_tags haven't been loaded
+ * (empty string, never matches anything, same graceful-degradation shape
+ * now_playing_song_index's own -1 already has). group_songs_screen's own
+ * now-playing indicator uses this instead of the array-index version, since
+ * its rows are group_song_entry_t (owned paths) now, not array indices --
+ * see that struct's own comment. */
+static char now_playing_path[600] = "";
+
 /* Where the current playlist came from -- the player screen's "List" menu
  * option (more_menu_list_cb) uses this to reopen the screen the current
  * track was tapped from, scrolled back to it. Deliberately NOT derived
@@ -400,13 +427,17 @@ static player_source_kind_t player_source_kind = PLAYER_SOURCE_NONE;
 
 static int player_source_all_songs_index = -1; /* row index into all_songs_list / all_songs_sort_order */
 
-/* Own copy of the group's song indices at the moment playback started --
- * group_songs_indices/count/title_label themselves just describe
+/* Own copy of the group's song entries at the moment playback started --
+ * group_songs_entries/count/title_label themselves just describe
  * whichever group group_songs_screen CURRENTLY shows, which can change
  * (browsing to a different artist/album, or a library rescan) before the
- * user ever opens "List". */
+ * user ever opens "List". group_song_entry_t (gui.c further down) is
+ * declared after this point in the file -- forward-declared here since
+ * this struct only needs a pointer to it, not its layout. */
+typedef struct group_song_entry_s group_song_entry_t;
+static void free_group_song_entries(group_song_entry_t * entries, int count);
 static char * player_source_group_title = NULL;
-static int * player_source_group_indices = NULL;
+static group_song_entry_t * player_source_group_entries = NULL;
 static int player_source_group_count = 0;
 static int player_source_group_pos = -1; /* row index within the group */
 
@@ -3635,12 +3666,23 @@ static void refresh_clock_label(void) {
 }
 
 static void free_playlist(void) {
-    for (int i = 0; i < playlist_count; i++) free(playlist[i]);
+    for (int i = 0; i < playlist_count; i++) free(playlist[i]); /* free(NULL) (an unresolved lazy slot) is a safe no-op */
     free(playlist);
     playlist = NULL;
     playlist_count = 0;
     playlist_index = -1;
+    free(playlist_lazy_sort_order);
+    playlist_lazy_sort_order = NULL;
 }
+
+/* Defined with the rest of the All Songs screen, much further down (needs
+ * all_songs_paths/all_songs_sort_order already in scope) -- forward-
+ * declared here since every reader of playlist[]'s actual STRING CONTENT
+ * between here and there (favorite toggle, gapless preload, play_track_at_
+ * from, ...) must resolve through it rather than indexing playlist[]
+ * directly, or a lazy All-Songs queue's unresolved NULL slots would crash
+ * them. See playlist_lazy_sort_order's own comment for the full picture. */
+static const char * playlist_path_at(int index);
 
 static const char * play_mode_icon_asset(play_mode_t mode) {
     switch (mode) {
@@ -3873,7 +3915,7 @@ static void refresh_format_badge(void) {
         return;
     }
 
-    const char * path = playlist[playlist_index];
+    const char * path = playlist_path_at(playlist_index);
     const char * dot = strrchr(path, '.');
     char ext[16] = "";
     if (dot) {
@@ -4322,7 +4364,7 @@ static void favorite_icon_event_cb(lv_event_t * e) {
     if (playlist_index < 0 || playlist_index >= playlist_count) return;
 
     favorite_is_set = !favorite_is_set;
-    metadata_db_song_favorite_set(playlist[playlist_index], favorite_is_set);
+    metadata_db_song_favorite_set(playlist_path_at(playlist_index), favorite_is_set);
     lv_image_set_src(favorite_icon, asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
     if (quick_drawer_favorite_icon) {
         lv_image_set_src(quick_drawer_favorite_icon,
@@ -4367,6 +4409,7 @@ static void order_icon_event_cb(lv_event_t * e) {
  * .m3u playlists). */
 static int find_song_index_by_path(const char * path);
 static void refresh_now_playing_indicators(void);
+static void ensure_library_arrays_loaded(void);
 
 /* Shared by both an explicit track pick (play_track_at_from) and the audio
  * thread autonomously advancing into a queued next track on its own
@@ -4404,12 +4447,21 @@ static subsonic_stream_song_meta_t * subsonic_stream_meta = NULL; /* parallel ar
 static int subsonic_stream_meta_count = 0;
 
 static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
+    /* Resolved once -- this is playlist_index's first real touch on every
+     * track-start (play_track_at_from()/on_track_auto_advanced() both call
+     * this immediately after setting playlist_index), so it's also where a
+     * lazy All-Songs slot actually gets strdup'd. Every other playlist[index]
+     * use below reuses this same resolved pointer rather than re-deriving
+     * it (playlist_path_at() is idempotent/cheap on a re-call either way,
+     * but there's no reason to). */
+    const char * path = playlist_path_at(index);
+
     char title[128];
     char folder[128];
-    get_display_names(playlist[index], title, sizeof(title), folder, sizeof(folder));
+    get_display_names(path, title, sizeof(title), folder, sizeof(folder));
 
     bool is_subsonic_stream = subsonic_stream_meta && index < subsonic_stream_meta_count &&
-                               strcmp(playlist[index], subsonic_stream_meta[index].url) == 0;
+                               strcmp(path, subsonic_stream_meta[index].url) == 0;
 
     if (is_subsonic_stream) {
         memset(out_meta, 0, sizeof(*out_meta));
@@ -4426,7 +4478,7 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
             out_meta->has_album = true;
         }
     } else {
-        metadata_read(playlist[index], out_meta);
+        metadata_read(path, out_meta);
     }
 
     /* -1 (not found) is a real, expected outcome, not just "library not
@@ -4434,7 +4486,8 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
      * at_from() a path outside MUSIC_ROOT_DIR, or the library scan simply
      * hasn't indexed this file for some other reason. refresh_now_playing_
      * indicators() below treats -1 as "clear every indicator". */
-    now_playing_song_index = find_song_index_by_path(playlist[index]);
+    now_playing_song_index = find_song_index_by_path(path);
+    snprintf(now_playing_path, sizeof(now_playing_path), "%s", path);
     refresh_now_playing_indicators();
 
     const char * title_text = out_meta->has_title ? out_meta->title : title;
@@ -4454,10 +4507,10 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     } else {
         free(out_meta->picture_data);
         out_meta->picture_data = NULL;
-        launch_cover_decode_from_track(index, playlist[index]);
+        launch_cover_decode_from_track(index, path);
     }
 
-    favorite_is_set = metadata_db_song_favorite_is_set(playlist[index]);
+    favorite_is_set = metadata_db_song_favorite_is_set(path);
     const char * favorite_icon_asset = favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png";
     lv_image_set_src(favorite_icon, asset_path(favorite_icon_asset));
     if (quick_drawer_favorite_icon) lv_image_set_src(quick_drawer_favorite_icon, asset_path(favorite_icon_asset));
@@ -4468,7 +4521,7 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
      * auto_advanced), never on a repeat UI refresh of the same still-
      * playing track, so this can't double-count. Backs the Most Played
      * auto-generated playlist (Music > Playlists). */
-    metadata_db_song_play_count_increment(playlist[index]);
+    metadata_db_song_play_count_increment(path);
 
     /* The real position/duration come from audio_get_*_seconds() once the
      * decoder's opened -- the timer picks that up within its next tick. */
@@ -4494,10 +4547,11 @@ static void arm_next_track_for_audio(int index) {
         audio_set_next_track(NULL, false, 0.0, false, 0.0);
         return;
     }
+    const char * next_path = playlist_path_at(next_index);
     track_metadata_t next_meta;
-    metadata_read(playlist[next_index], &next_meta);
+    metadata_read(next_path, &next_meta);
     bool use_replaygain = current_settings.replaygain_enabled;
-    audio_set_next_track(playlist[next_index], use_replaygain && next_meta.has_replaygain, next_meta.replaygain_gain_db,
+    audio_set_next_track(next_path, use_replaygain && next_meta.has_replaygain, next_meta.replaygain_gain_db,
                           use_replaygain && next_meta.has_replaygain_peak, next_meta.replaygain_peak);
     free(next_meta.picture_data); /* only needed the gain/peak fields, not the art */
 }
@@ -4523,6 +4577,19 @@ static void queue_add_song(const char * path) {
     playlist = grown;
     memmove(&playlist[pos + 1], &playlist[pos], sizeof(char *) * (size_t) (playlist_count - pos));
     playlist[pos] = strdup(path);
+
+    /* Kept in lockstep so any still-unresolved lazy slot after `pos` keeps
+     * mapping to the right song once shifted -- see playlist_lazy_sort_
+     * order's own comment. playlist[pos] is already resolved/owned (just
+     * strdup'd above), so its own new slot here is never read; the value
+     * doesn't matter. */
+    if (playlist_lazy_sort_order) {
+        int * grown_order = realloc(playlist_lazy_sort_order, sizeof(int) * (size_t) (playlist_count + 1));
+        playlist_lazy_sort_order = grown_order;
+        memmove(&playlist_lazy_sort_order[pos + 1], &playlist_lazy_sort_order[pos],
+                sizeof(int) * (size_t) (playlist_count - pos));
+        playlist_lazy_sort_order[pos] = -1;
+    }
     playlist_count++;
     queued_pending_count++;
     queue_next_insert_index = pos + 1;
@@ -4542,6 +4609,10 @@ static void queue_remove_song_at_offset(int offset) {
     int pos = playlist_index + 1 + offset;
     free(playlist[pos]);
     memmove(&playlist[pos], &playlist[pos + 1], sizeof(char *) * (size_t) (playlist_count - pos - 1));
+    if (playlist_lazy_sort_order) {
+        memmove(&playlist_lazy_sort_order[pos], &playlist_lazy_sort_order[pos + 1],
+                sizeof(int) * (size_t) (playlist_count - pos - 1));
+    }
     playlist_count--;
     queued_pending_count--;
     queue_next_insert_index = queued_pending_count > 0 ? playlist_index + 1 + queued_pending_count : -1;
@@ -4623,9 +4694,10 @@ static void play_track_at_from(int index, double start_seconds) {
     playlist_index = index;
 
     track_metadata_t meta;
-    apply_track_metadata_to_ui(index, &meta);
+    apply_track_metadata_to_ui(index, &meta); /* resolves this slot if it's a still-lazy All Songs entry */
+    const char * path = playlist_path_at(index);
     bool use_replaygain = current_settings.replaygain_enabled;
-    audio_play_file_at(playlist[index], start_seconds, use_replaygain && meta.has_replaygain, meta.replaygain_gain_db,
+    audio_play_file_at(path, start_seconds, use_replaygain && meta.has_replaygain, meta.replaygain_gain_db,
                         use_replaygain && meta.has_replaygain_peak, meta.replaygain_peak);
     arm_next_track_for_audio(index);
 
@@ -4642,7 +4714,7 @@ static void play_track_at_from(int index, double start_seconds) {
      * just because playback is being (re)started there. */
     if (lv_screen_active() != player_screen) nav_push(player_screen);
 
-    snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist[index]);
+    snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", path);
     current_settings.last_position = start_seconds;
     settings_save(&current_settings);
 }
@@ -4670,7 +4742,7 @@ static void on_track_auto_advanced(int index) {
 
     set_play_button_state(true);
 
-    snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist[index]);
+    snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist_path_at(index));
     current_settings.last_position = 0.0;
     settings_save(&current_settings);
 }
@@ -4695,15 +4767,15 @@ static void on_file_selected(char ** new_playlist, int count, int selected_index
 }
 
 /* set_player_source_group_songs() is defined further down, right after
- * group_songs_indices/count/title_label -- it needs those already in
+ * group_songs_entries/count/title_label -- it needs those already in
  * scope. These three don't. */
 static void clear_player_source(void) {
     player_source_kind = PLAYER_SOURCE_NONE;
     player_source_all_songs_index = -1;
     free(player_source_group_title);
     player_source_group_title = NULL;
-    free(player_source_group_indices);
-    player_source_group_indices = NULL;
+    free_group_song_entries(player_source_group_entries, player_source_group_count);
+    player_source_group_entries = NULL;
     player_source_group_count = 0;
     player_source_group_pos = -1;
     player_source_file_browser_row = -1;
@@ -5302,7 +5374,7 @@ static int * all_songs_sort_order;
  * further down (needs find_song_index_by_path()/artist_groups/etc. already
  * in scope) -- forward-declared here since update_timer_cb() (just below)
  * needs it for the remote-control play-by-index consumer. */
-static void play_remote_control_song(int song_index, const char * playlist_name, const char * artist_filter,
+static void play_remote_control_song(const char * song_path, const char * playlist_name, const char * artist_filter,
                                       const char * album_artist_filter, const char * album_filter);
 
 /* Defined with the rest of the power-off countdown popup, much further
@@ -5416,31 +5488,36 @@ static void update_timer_cb(lv_timer_t * timer) {
         show_volume_popup(remote_volume_percent);
         refresh_volume_topbar(remote_volume_percent);
     }
-    int remote_queue_index;
-    if (remote_control_consume_queue_index(&remote_queue_index) &&
-        remote_queue_index >= 0 && remote_queue_index < all_songs_count) {
-        queue_add_song(all_songs_paths[remote_queue_index]);
+    int64_t remote_queue_id;
+    if (remote_control_consume_queue_index(&remote_queue_id)) {
+        song_row_t remote_queue_row;
+        if (metadata_db_get_song_by_id(remote_queue_id, &remote_queue_row)) queue_add_song(remote_queue_row.path);
     }
     int remote_queue_remove_offset;
     if (remote_control_consume_queue_remove(&remote_queue_remove_offset))
         queue_remove_song_at_offset(remote_queue_remove_offset);
     if (remote_control_consume_queue_clear()) queue_clear_pending();
-    int remote_play_index;
+    int64_t remote_play_id;
     char remote_play_playlist[128], remote_play_artist[128], remote_play_album_artist[128], remote_play_album[128];
-    if (remote_control_consume_play_index(&remote_play_index, remote_play_playlist, sizeof(remote_play_playlist),
+    if (remote_control_consume_play_index(&remote_play_id, remote_play_playlist, sizeof(remote_play_playlist),
                                            remote_play_artist, sizeof(remote_play_artist), remote_play_album_artist,
                                            sizeof(remote_play_album_artist), remote_play_album,
                                            sizeof(remote_play_album))) {
-        /* remote_play_index is a raw scan-order index into all_songs_paths/
-         * all_song_tags (remote_control.c's own library index space -- see
-         * remote_control_sync_library()'s doc comment). play_remote_control_
-         * song() (defined with the rest of the remote-control scoped-play
-         * machinery, much further down) resolves both this and the
-         * playlist/artist/album context into the right playlist and
-         * position, falling back to the whole library (same translation
-         * this used to do inline) when no scope applies. */
-        play_remote_control_song(remote_play_index, remote_play_playlist, remote_play_artist,
-                                  remote_play_album_artist, remote_play_album);
+        /* remote_play_id is a song id (metadata_db.c's rowid-based
+         * song_row_t.id), not an array index -- resolve it to a path, make
+         * sure the lazily-loaded all_songs_paths/artist_groups/etc. arrays
+         * play_remote_control_song() itself needs actually exist yet, then
+         * translate to the all_songs_paths index that function expects.
+         * play_remote_control_song() (defined with the rest of the
+         * remote-control scoped-play machinery, much further down) resolves
+         * that index plus the playlist/artist/album context into the right
+         * playlist and position, falling back to the whole library (same
+         * translation this used to do inline) when no scope applies. */
+        song_row_t remote_play_row;
+        if (metadata_db_get_song_by_id(remote_play_id, &remote_play_row)) {
+            play_remote_control_song(remote_play_row.path, remote_play_playlist, remote_play_artist,
+                                      remote_play_album_artist, remote_play_album);
+        }
     }
 
     /* Auto-stop on headphone-output loss: this hardware has no built-in
@@ -5895,8 +5972,9 @@ static void update_timer_cb(lv_timer_t * timer) {
          * call, so it's left blank here -- a real gap, not an oversight,
          * see remote_control.h's own Phase 1 scope note. */
         const char * now_playing_path =
-            (playlist_count > 0 && playlist_index >= 0 && playlist_index < playlist_count) ? playlist[playlist_index]
-                                                                                             : NULL;
+            (playlist_count > 0 && playlist_index >= 0 && playlist_index < playlist_count)
+                ? playlist_path_at(playlist_index)
+                : NULL;
         remote_control_notify_status(audio_is_playing(), audio_is_paused(), lv_label_get_text(song_title_label),
                                       lv_label_get_text(song_folder_label), "", now_playing_path,
                                       (int) audio_get_position_seconds(), (int) audio_get_duration_seconds(),
@@ -6034,7 +6112,7 @@ static lv_obj_t * add_to_playlist_list;
  * currently-playing track anymore (see that function's own comment: the
  * song long-press context menu reaches this same screen for an arbitrary
  * row, not just the player's own "..." menu). */
-static char add_to_playlist_target_path[512] = "";
+static char add_to_playlist_target_path[600] = ""; /* 600, matching song_row_t.path's own bound (metadata_db.h) */
 
 static void new_playlist_name_done_cb(const char * text, void * user_data) {
     (void) user_data;
@@ -6520,7 +6598,7 @@ static void delete_song_confirm_cb(lv_event_t * e) {
     hide_delete_song_popup();
     if (playlist_index < 0 || playlist_index >= playlist_count) return;
 
-    char * to_delete = strdup(playlist[playlist_index]);
+    char * to_delete = strdup(playlist_path_at(playlist_index));
     int del_index = playlist_index;
 
     /* What to play next is decided BEFORE touching the file or the array --
@@ -6531,6 +6609,10 @@ static void delete_song_confirm_cb(lv_event_t * e) {
      * "what's next" playback decision. */
     free(playlist[del_index]);
     for (int i = del_index; i < playlist_count - 1; i++) playlist[i] = playlist[i + 1];
+    /* Kept in lockstep -- see playlist_lazy_sort_order's own comment. */
+    if (playlist_lazy_sort_order) {
+        for (int i = del_index; i < playlist_count - 1; i++) playlist_lazy_sort_order[i] = playlist_lazy_sort_order[i + 1];
+    }
     playlist_count--;
 
     if (playlist_count == 0) {
@@ -6539,6 +6621,8 @@ static void delete_song_confirm_cb(lv_event_t * e) {
         free(playlist);
         playlist = NULL;
         playlist_index = -1;
+        free(playlist_lazy_sort_order);
+        playlist_lazy_sort_order = NULL;
         clear_player_source();
         set_play_button_state(false);
         lv_label_set_text(song_title_label, "No track loaded");
@@ -6641,7 +6725,7 @@ static void more_menu_add_to_playlist_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_more_menu_popup();
     if (playlist_index < 0) return;
-    open_add_to_playlist_for(playlist[playlist_index]);
+    open_add_to_playlist_for(playlist_path_at(playlist_index));
 }
 
 static void more_menu_queue_cb(lv_event_t * e) {
@@ -6661,7 +6745,7 @@ static void more_menu_delete_cb(lv_event_t * e) {
     hide_more_menu_popup();
     if (playlist_index < 0 || playlist_index >= playlist_count) return;
 
-    lv_label_set_text_fmt(delete_song_popup_title, "Delete %s?\nThis cannot be undone.", basename_of(playlist[playlist_index]));
+    lv_label_set_text_fmt(delete_song_popup_title, "Delete %s?\nThis cannot be undone.", basename_of(playlist_path_at(playlist_index)));
     lv_obj_remove_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(delete_song_popup, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(delete_song_popup_backdrop);
@@ -6743,7 +6827,7 @@ static lv_obj_t * song_context_menu_popup_backdrop;
 /* Set right before showing the popup (open_song_context_menu()) -- which
  * song "Add to Queue"/"Add to Playlist" act on, since a long-pressed row
  * isn't necessarily the currently-playing track. */
-static char song_context_menu_target_path[512] = "";
+static char song_context_menu_target_path[600] = ""; /* 600, matching song_row_t.path's own bound (metadata_db.h) */
 
 static void hide_song_context_menu_popup(void) {
     lv_obj_add_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
@@ -7238,6 +7322,64 @@ typedef struct {
     int count;
 } group_t;
 
+/* One song within a group_songs_screen listing (Artist/Album Artist's own
+ * albums, one album, Favorites, Most Played, a user .m3u playlist) -- an
+ * owned path + precomputed display title, not an index into all_songs_
+ * paths/all_song_tags like group_t.indices above. Every one of those
+ * screens is inherently small (one album's tracks, a hand-curated playlist,
+ * MOST_PLAYED_LIMIT), so a DB query per screen-open plus a handful of owned
+ * strings costs nothing next to what ensure_library_arrays_loaded() used to
+ * cost just to hand this screen a few dozen indices. */
+struct group_song_entry_s {
+    char * path;
+    char * title;
+};
+
+static void free_group_song_entries(group_song_entry_t * entries, int count) {
+    if (!entries) return;
+    for (int i = 0; i < count; i++) {
+        free(entries[i].path);
+        free(entries[i].title);
+    }
+    free(entries);
+}
+
+static bool copy_group_song_entries(group_song_entry_t ** out, const group_song_entry_t * entries, int count) {
+    *out = NULL;
+    if (count <= 0) return true;
+    group_song_entry_t * copy = calloc((size_t) count, sizeof(*copy));
+    if (!copy) return false;
+    for (int i = 0; i < count; i++) {
+        copy[i].path = strdup(entries[i].path ? entries[i].path : "");
+        copy[i].title = strdup(entries[i].title ? entries[i].title : "");
+        if (!copy[i].path || !copy[i].title) {
+            free_group_song_entries(copy, count);
+            return false;
+        }
+    }
+    *out = copy;
+    return true;
+}
+
+/* Bridge the few drill-downs that still operate on the already-loaded
+ * in-memory group_t indexes into the owned representation used by the
+ * group-songs screen.  The screen copies these entries, so callers may
+ * free the returned array immediately after show/set completes. */
+static group_song_entry_t * build_group_song_entries_from_indices(const int * indices, int count) {
+    group_song_entry_t * entries = calloc((size_t) (count > 0 ? count : 1), sizeof(*entries));
+    if (!entries) return NULL;
+    for (int i = 0; i < count; i++) {
+        int song_index = indices[i];
+        entries[i].path = strdup(all_songs_paths[song_index]);
+        entries[i].title = strdup(song_display_title_of(song_index));
+        if (!entries[i].path || !entries[i].title) {
+            free_group_song_entries(entries, count);
+            return NULL;
+        }
+    }
+    return entries;
+}
+
 static group_t * artist_groups = NULL;
 static int artist_group_count = 0;
 static group_t * album_groups = NULL;
@@ -7288,6 +7430,74 @@ static void rebuild_all_songs_sort_order(void) {
     all_songs_sort_order = malloc(sizeof(int) * (size_t) all_songs_count);
     for (int i = 0; i < all_songs_count; i++) all_songs_sort_order[i] = i;
     qsort(all_songs_sort_order, (size_t) all_songs_count, sizeof(int), compare_index_by_title);
+}
+
+/* Real definition of the forward declaration right after free_playlist() --
+ * see playlist_lazy_sort_order's own comment for the full design. Resolves
+ * playlist[index] to a real, owned path, the first time anything actually
+ * needs it. Every reader of playlist[]'s actual string content (not just
+ * playlist_count/playlist_index bookkeeping) must call this rather than
+ * indexing playlist[] directly. A non-lazy playlist (every source except
+ * the whole, unfiltered All Songs list) never has a NULL entry in the
+ * first place, so this is a plain array read for those -- the lazy
+ * resolution path only ever triggers for an All-Songs-sourced slot nothing
+ * has touched yet.
+ *
+ * Resolves via metadata_db_get_songs_filtered_page() (a single-row page at
+ * offset playlist_lazy_sort_order[index], its own METADATA_DB_GUARD) --
+ * DB-backed rather than indexing all_songs_paths/all_songs_sort_order
+ * directly, so a lazy All-Songs queue never needs those arrays loaded at
+ * all (ensure_library_arrays_loaded() is no longer a prerequisite for
+ * tap-to-play from All Songs -- see all_songs_tile_cb()'s own comment).
+ * This also means resolution is safe at any time, including while a
+ * rescan is running on its own background thread: metadata_db.c's own
+ * mutex already serializes that, unlike the in-memory arrays this used to
+ * read directly (which were never mutex-protected, and could be freed out
+ * from under a resolving slot mid-rescan -- the real hazard playlist_
+ * detach_from_all_songs() used to exist to close; removed now that
+ * resolution no longer touches those arrays at all). A rescan changing the
+ * sort order between tap and resolution can still make a not-yet-resolved
+ * slot land on a logically different song than what was on screen at tap
+ * time -- a stale-reference class of bug this app already tolerates
+ * elsewhere (e.g. a renamed/deleted playlist), not a memory-safety one. */
+static const char * playlist_path_at(int index) {
+    if (playlist[index]) return playlist[index];
+    int sort_pos = playlist_lazy_sort_order[index];
+    song_row_t row;
+    if (metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, sort_pos, 1, &row) == 1) {
+        playlist[index] = strdup(row.path);
+    } else {
+        playlist[index] = strdup(""); /* sort_pos outran the library (raced a rescan shrinking it) -- empty path is a safe, inert placeholder; playback of it simply fails like any other missing file */
+    }
+    return playlist[index];
+}
+
+/* Same role as on_file_selected() above but for tap-to-play from the
+ * whole, unfiltered All Songs list (all_songs_row_click_cb()/files_search_
+ * row_click_cb()'s unfiltered case) -- see playlist_lazy_sort_order's own
+ * comment for why eagerly strdup'ing every one of the library's paths on
+ * every single tap was a real, measured cost. Builds an all-NULL playlist[]
+ * the same size as the library (metadata_db_get_song_count(), a cheap
+ * COUNT(*) -- no need for all_songs_count/ensure_library_arrays_loaded()
+ * here at all) and marks it lazy, identity-mapped into the DB's own
+ * title-sorted order (the exact order build_all_songs_screen()'s paged
+ * provider also uses -- see its own comment); playlist_path_at() resolves
+ * each slot to a real, owned path the first time anything actually needs
+ * it (current track, next/prev, gapless preload, favorite toggle, ...), so
+ * a tap now costs one calloc() instead of a library's worth of strdup()s. */
+static void on_file_selected_lazy_all_songs(int selected_index) {
+    int64_t count64 = metadata_db_get_song_count();
+    int count = count64 > 0 ? (int) count64 : 0;
+
+    free_playlist();
+    playlist = calloc((size_t) count, sizeof(char *));
+    playlist_count = count;
+    playlist_lazy_sort_order = malloc(sizeof(int) * (size_t) count);
+    for (int i = 0; i < count; i++) playlist_lazy_sort_order[i] = i;
+    queued_pending_count = 0;
+    queue_next_insert_index = -1;
+    remote_control_sync_queue(NULL, 0);
+    play_track_at(selected_index);
 }
 
 /* Sorts the given song indices by key_of (via cmp, which also tie-breaks by
@@ -7353,39 +7563,6 @@ static void free_group_array(group_t * groups, int count) {
  * artist_row_click_cb()'s own indexing into artist_groups uses, just by name
  * instead of by row index since a plugin only has the artist's display
  * name to go on. NULL if no such artist. */
-static const group_t * find_artist_group_by_name(const char * artist) {
-    for (int i = 0; i < artist_group_count; i++) {
-        if (strcasecmp(artist_groups[i].name, artist) == 0) return &artist_groups[i];
-    }
-    return NULL;
-}
-
-/* Shared by gui_plugin_get_album_tracks()/gui_plugin_get_next_album_tracks()
- * below -- regroups one artist's songs by album (same call
- * show_artist_albums() itself makes, kept local rather than reusing that
- * function's own artist_albums_groups/artist_albums_screen globals so a
- * plugin call can't disturb whatever the Artists screen currently has drilled
- * into). Caller frees with free_group_array(). */
-static void build_artist_album_groups(const group_t * artist_group, group_t ** out_groups, int * out_count) {
-    build_groups_by_indices(artist_group->indices, artist_group->count, album_key_of, compare_index_by_album,
-                             out_groups, out_count);
-}
-
-/* Turns one group_t's member songs into a malloc'd array of malloc'd path
- * strings, in the group's own index order (already path-sorted -- see
- * build_groups_by_indices()'s own comment) -- the common tail of
- * gui_plugin_get_album_tracks()/gui_plugin_get_next_album_tracks() below. */
-static char ** group_songs_to_path_array(const group_t * album_group, int * out_count) {
-    if (album_group->count <= 0) { *out_count = 0; return NULL; }
-
-    char ** paths = malloc(sizeof(char *) * (size_t) album_group->count);
-    for (int i = 0; i < album_group->count; i++) {
-        paths[i] = strdup(all_songs_paths[album_group->indices[i]]);
-    }
-    *out_count = album_group->count;
-    return paths;
-}
-
 const char * gui_plugin_get_play_mode(void) {
     switch ((play_mode_t) current_settings.play_mode) {
         case PLAY_MODE_REPEAT_ALL: return "repeat_all";
@@ -7398,75 +7575,161 @@ const char * gui_plugin_get_play_mode(void) {
 
 const char * gui_plugin_get_current_track_path(void) {
     if (playlist_index < 0 || playlist_index >= playlist_count) return NULL;
-    return playlist[playlist_index];
+    return playlist_path_at(playlist_index);
 }
 
 char ** gui_plugin_get_artist_albums(const char * artist, int * out_count) {
     *out_count = 0;
-    const group_t * artist_group = find_artist_group_by_name(artist);
-    if (!artist_group) return NULL;
-
-    group_t * albums = NULL;
-    int album_count = 0;
-    build_artist_album_groups(artist_group, &albums, &album_count);
-
-    if (album_count <= 0) {
-        free_group_array(albums, album_count);
-        return NULL;
+    int64_t count64 = metadata_db_count_albums_for_group(METADATA_DB_GROUP_ARTIST, artist);
+    if (count64 <= 0 || count64 > INT_MAX) return NULL;
+    int album_count = (int) count64;
+    group_row_t * rows = malloc(sizeof(*rows) * (size_t) album_count);
+    char ** names = calloc((size_t) album_count, sizeof(*names));
+    if (!rows || !names) { free(rows); free(names); return NULL; }
+    int n = metadata_db_get_albums_for_group(METADATA_DB_GROUP_ARTIST, artist, 0, album_count, rows);
+    for (int i = 0; i < n; i++) {
+        names[i] = strdup(rows[i].name);
+        if (!names[i]) {
+            for (int j = 0; j < i; j++) free(names[j]);
+            free(names);
+            free(rows);
+            return NULL;
+        }
     }
-
-    char ** names = malloc(sizeof(char *) * (size_t) album_count);
-    for (int i = 0; i < album_count; i++) names[i] = strdup(albums[i].name);
-    free_group_array(albums, album_count);
-
-    *out_count = album_count;
+    free(rows);
+    *out_count = n;
     return names;
+}
+
+static char ** load_plugin_album_paths(const char * artist, const char * album, int * out_count) {
+    *out_count = 0;
+    int64_t count64 = metadata_db_count_songs_filtered(NULL, artist, NULL, album);
+    if (count64 <= 0 || count64 > INT_MAX) return NULL;
+    int count = (int) count64;
+    char ** paths = calloc((size_t) count, sizeof(*paths));
+    if (!paths) return NULL;
+    song_row_t rows[64];
+    int loaded = 0;
+    while (loaded < count) {
+        int want = count - loaded;
+        if (want > 64) want = 64;
+        int got = metadata_db_get_songs_filtered_page(NULL, artist, NULL, album, loaded, want, rows);
+        if (got <= 0) break;
+        for (int i = 0; i < got; i++) {
+            paths[loaded + i] = strdup(rows[i].path);
+            if (!paths[loaded + i]) {
+                for (int j = 0; j < loaded + i; j++) free(paths[j]);
+                free(paths);
+                return NULL;
+            }
+        }
+        loaded += got;
+        if (got < want) break;
+    }
+    *out_count = loaded;
+    return paths;
 }
 
 char ** gui_plugin_get_album_tracks(const char * artist, const char * album, int * out_count) {
     *out_count = 0;
-    const group_t * artist_group = find_artist_group_by_name(artist);
-    if (!artist_group) return NULL;
-
-    group_t * albums = NULL;
-    int album_count = 0;
-    build_artist_album_groups(artist_group, &albums, &album_count);
-
-    char ** paths = NULL;
-    for (int i = 0; i < album_count; i++) {
-        if (strcasecmp(albums[i].name, album) == 0) {
-            paths = group_songs_to_path_array(&albums[i], out_count);
-            break;
-        }
-    }
-    free_group_array(albums, album_count);
-    return paths;
+    return load_plugin_album_paths(artist, album, out_count);
 }
 
 char ** gui_plugin_get_next_album_tracks(const char * artist, const char * current_album, int * out_count) {
     *out_count = 0;
-    const group_t * artist_group = find_artist_group_by_name(artist);
-    if (!artist_group) return NULL;
-
-    group_t * albums = NULL;
-    int album_count = 0;
-    build_artist_album_groups(artist_group, &albums, &album_count);
-
-    char ** paths = NULL;
-    for (int i = 0; i < album_count; i++) {
-        if (strcasecmp(albums[i].name, current_album) == 0) {
-            if (i + 1 < album_count) paths = group_songs_to_path_array(&albums[i + 1], out_count);
-            break;
+    int64_t count64 = metadata_db_count_albums_for_group(METADATA_DB_GROUP_ARTIST, artist);
+    if (count64 <= 1 || count64 > INT_MAX) return NULL;
+    group_row_t rows[32];
+    int offset = 0;
+    while (offset < count64) {
+        int want = (int) (count64 - offset);
+        if (want > 32) want = 32;
+        int got = metadata_db_get_albums_for_group(METADATA_DB_GROUP_ARTIST, artist, offset, want, rows);
+        if (got <= 0) break;
+        for (int i = 0; i < got; i++) {
+            if (strcasecmp(rows[i].name, current_album) != 0) continue;
+            if (i + 1 < got) return load_plugin_album_paths(artist, rows[i + 1].name, out_count);
+            group_row_t next;
+            if (metadata_db_get_albums_for_group(METADATA_DB_GROUP_ARTIST, artist, offset + got, 1, &next) == 1)
+                return load_plugin_album_paths(artist, next.name, out_count);
+            return NULL;
         }
+        offset += got;
+        if (got < want) break;
     }
-    free_group_array(albums, album_count);
-    return paths;
+    return NULL;
 }
 
 void gui_plugin_free_string_array(char ** array, int count) {
     for (int i = 0; i < count; i++) free(array[i]);
     free(array);
 }
+
+/* ---- plugin.library_* -- see gui.h's own comment for the design intent.
+ * Every one of these goes straight to metadata_db.c (its own METADATA_DB_
+ * GUARD), never touching all_songs_paths/artist_groups/etc. or ensure_
+ * library_arrays_loaded() -- unlike gui_plugin_get_artist_albums() and
+ * friends above, a plugin using only this block never forces gui.c's
+ * whole-library lazy load just because it looked at the library first. ---- */
+
+static int gui_plugin_library_clamp_limit(int limit) {
+    if (limit <= 0 || limit > GUI_PLUGIN_LIBRARY_MAX_PAGE) return GUI_PLUGIN_LIBRARY_MAX_PAGE;
+    return limit;
+}
+
+int64_t gui_plugin_library_song_count(void) {
+    return metadata_db_get_song_count();
+}
+
+int gui_plugin_library_get_songs(const char * query, const char * artist, const char * album_artist,
+                                  const char * album, int offset, int limit, song_row_t * out_rows,
+                                  int64_t * out_total) {
+    if (offset < 0) offset = 0;
+    limit = gui_plugin_library_clamp_limit(limit);
+    if (out_total) *out_total = metadata_db_count_songs_filtered(query, artist, album_artist, album);
+    return metadata_db_get_songs_filtered_page(query, artist, album_artist, album, offset, limit, out_rows);
+}
+
+int gui_plugin_library_search(const char * query, int limit, song_row_t * out_rows) {
+    limit = gui_plugin_library_clamp_limit(limit);
+    return metadata_db_search_songs(query, out_rows, limit);
+}
+
+bool gui_plugin_library_get_song(int64_t id, song_row_t * out_row) {
+    return metadata_db_get_song_by_id(id, out_row);
+}
+
+/* Real bug caught in review, now moot: metadata_db_get_groups_page()/
+ * get_albums_page_filtered() used to only support a keyset "after_name"
+ * cursor (never actually continued by any real caller), so this used to
+ * fetch offset+limit rows in one shot and slice out [offset, offset+limit)
+ * in C, capped at a generous-but-still-finite ceiling -- confirmed against
+ * this device's real library (210 distinct albums) to silently truncate
+ * offsets past that ceiling with no way for a plugin to detect it. Both
+ * functions take a real offset now (see their own metadata_db.h comments),
+ * so this is a direct pass-through with no cap beyond GUI_PLUGIN_LIBRARY_
+ * MAX_PAGE itself. */
+int gui_plugin_library_get_artists(int offset, int limit, group_row_t * out_rows) {
+    if (offset < 0) offset = 0;
+    limit = gui_plugin_library_clamp_limit(limit);
+    return metadata_db_get_groups_page(METADATA_DB_GROUP_ARTIST, offset, limit, out_rows);
+}
+
+int gui_plugin_library_get_albums(int offset, int limit, const char * artist_filter, group_row_t * out_rows) {
+    if (offset < 0) offset = 0;
+    limit = gui_plugin_library_clamp_limit(limit);
+    return metadata_db_get_albums_page_filtered(artist_filter, offset, limit, out_rows);
+}
+
+/* True once ensure_library_arrays_loaded() (below) has actually populated
+ * all_songs_paths/all_song_tags/the three group arrays -- distinct from
+ * all_songs_count == 0, which is also the correct state for a genuinely
+ * empty library (nothing to load, arrays legitimately stay NULL/0 either
+ * way, so that alone can't tell "not loaded yet" apart from "loaded, and
+ * empty"). Reset to false below so a rescan forces a fresh lazy load next
+ * time something actually needs the full arrays, rather than serving a
+ * stale pre-rescan copy. */
+static bool library_arrays_loaded = false;
 
 /* Undoes everything library_scan_once() below allocates -- needed before a
  * rescan (Settings > Update Music Database) can safely repopulate these from
@@ -7478,6 +7741,7 @@ static void library_free_scan_state(void) {
     free(all_song_tags);
     all_song_tags = NULL;
     all_songs_count = 0;
+    library_arrays_loaded = false;
 
     free_group_array(artist_groups, artist_group_count);
     artist_groups = NULL;
@@ -7770,19 +8034,49 @@ static void library_scan_once(void) {
  * finishes in well under a second even for a large library -- it's
  * specifically the filesystem walk + per-file tag-parsing pass that had to
  * move to the user-triggered-only path. */
-static void library_load_from_cache_only(void) {
-    library_free_scan_state();
-    library_scan_progress_done = 0;
-    library_scan_progress_total = 0;
+/* The actual fix for this app's boot-time OOM on a large library: boot
+ * (library_load_from_cache_only(), below) no longer touches all_songs_paths/
+ * all_song_tags/the group arrays at all -- not even to read a count, since
+ * setting all_songs_count from a cheap COUNT(*) query while these arrays
+ * are still NULL would just move the crash from "boot always allocates
+ * everything" to "the first thing that trusts all_songs_count > 0 as proof
+ * the arrays are populated dereferences NULL" (caught in review before this
+ * ever ran on-device -- every one of this app's ~200 existing call sites
+ * makes exactly that assumption). This function is the deliberate escape
+ * hatch for the handful of features not yet converted to their own paged
+ * queries (Search's whole-library fallback, Shuffle All, remote-control
+ * sync) -- called lazily, the first time one of them actually needs the
+ * full arrays to be real, not eagerly at boot. Real-device incident
+ * (today): eagerly building these same arrays for every song at boot,
+ * unconditionally, is exactly what turned a completed 32,000-song scan into
+ * a boot loop -- moving that cost here, gated on actual use, means a huge
+ * library only ever pays it if a feature that genuinely still needs the
+ * whole thing in memory gets used, not on every single boot. A future pass
+ * converting those remaining callers to their own paged/on-demand queries
+ * (see this session's own scoping notes) would let this function -- and
+ * the four full-library arrays it fills -- be deleted outright. */
+/* All four library screens are paged now (All Songs, Artists, Albums,
+ * Album Artist -- see build_all_songs_screen()'s/build_artists_screen()'s
+ * own comments), so this function no longer pushes anything into any
+ * compact_list widget -- it only rebuilds the raw in-memory arrays/groups
+ * that drill-down, search, and the A-Z index still read directly (not yet
+ * converted to their own paged queries). Populating a compact_list here
+ * used to be necessary because build_*_screen() ran at boot against a
+ * still-empty library; now those screens are self-sufficient (paged
+ * against the DB from the moment they're built), so there's nothing left
+ * for this function to hand them. */
+static void ensure_library_arrays_loaded(void) {
+    if (library_arrays_loaded) return;
+    library_arrays_loaded = true;
 
-    metadata_db_open();
-
-    /* metadata_db_load_all() fills a cached_tags_t array (metadata_db.h);
-     * all_song_tags is declared song_tags_t -- a separately-named struct
-     * with an identical field layout (see song_tags_t's own comment), kept
-     * distinct because gui.c's copy predates metadata_db.h and this is the
-     * only place the two ever need to cross paths. Safe to reinterpret the
-     * pointer rather than copy field-by-field. */
+    /* all_songs_count (and the three group counts) are set here, together
+     * with the arrays they index into, never before -- every one of this
+     * app's ~200 existing call sites treats all_songs_count > 0 as proof
+     * all_songs_paths/all_song_tags are safe to index, so those two must
+     * become valid atomically. Boot (library_load_from_cache_only() below)
+     * deliberately leaves both at their library_free_scan_state() default
+     * of 0/NULL rather than pre-setting a "real" count against still-NULL
+     * arrays, which would crash the first thing that trusted it. */
     cached_tags_t * tags = NULL;
     metadata_db_load_all(&all_songs_paths, &tags, &all_songs_count);
     all_song_tags = (song_tags_t *) tags;
@@ -7792,6 +8086,23 @@ static void library_load_from_cache_only(void) {
     build_groups_by(album_key_of, compare_index_by_album, &album_groups, &album_group_count);
     build_groups_by(album_artist_key_of, compare_index_by_album_artist, &album_artist_groups, &album_artist_group_count);
     rebuild_all_songs_sort_order();
+}
+
+/* Real-device incident: this used to eagerly load every song's tags into
+ * all_songs_paths/all_song_tags (via the now-lazy ensure_library_arrays_
+ * loaded() above) unconditionally on every boot -- fine for a library in
+ * the low thousands, but a 32,000-song library's worth of 640-byte-per-song
+ * structs, plus the widget-per-row cost every list screen built from them,
+ * was enough to turn a completed scan into a boot loop on this device's 55MB
+ * RAM. Boot now only reads the counts it needs to show something reasonable
+ * before the first real screen is even visited; the full arrays are built
+ * lazily, on whichever screen/feature first actually needs them. */
+static void library_load_from_cache_only(void) {
+    library_free_scan_state();
+    library_scan_progress_done = 0;
+    library_scan_progress_total = 0;
+
+    metadata_db_open();
 }
 
 /* Search binding IDs -- indices into search_bindings[], defined together
@@ -7815,73 +8126,76 @@ typedef enum {
 
 static int search_remap_index(search_binding_id_t binding_id, int display_index);
 
+/* Paged All Songs -- see build_all_songs_screen()'s own comment. offset is
+ * a position in the DB's own title-sorted order (metadata_db_get_songs_
+ * filtered_page() with every filter NULL), the exact same order playlist_
+ * lazy_sort_order/on_file_selected_lazy_all_songs() already assume, so a
+ * row tapped here and the playback queue it starts always agree on what
+ * comes next. Heap-allocated, not a stack array -- see remote_control.c's
+ * own build_library_json() comment on why a COMPACT_LIST_PAGE_CACHE_SIZE-
+ * sized array of song_row_t (~1.25KB each) has no business on a stack. */
+static int all_songs_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+    (void) ctx;
+    song_row_t * rows = malloc(sizeof(song_row_t) * (size_t) count);
+    int n = rows ? metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, offset, count, rows) : 0;
+    for (int i = 0; i < n; i++) metadata_db_song_display_title(&rows[i], out_labels[i], COMPACT_LIST_LABEL_MAX);
+    free(rows);
+    return n;
+}
+
+/* Resolves one All-Songs display position to a real path -- for the
+ * long-press context menu, which needs a path directly (unlike the click
+ * handler, which goes through play_track_at_from() -> playlist_path_at()'s
+ * own resolution instead). false if display_index is out of range (e.g.
+ * raced a rescan shrinking the library between the tap and this lookup --
+ * same stale-reference tolerance as playlist_path_at()'s own comment). */
+static bool all_songs_resolve_path_at(int display_index, char * out, size_t out_size) {
+    song_row_t row;
+    if (metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, display_index, 1, &row) != 1) return false;
+    snprintf(out, out_size, "%s", row.path);
+    return true;
+}
+
 static void all_songs_row_click_cb(int display_index) {
     display_index = search_remap_index(SEARCH_BINDING_ALL_SONGS, display_index);
-    /* on_file_selected() takes ownership of (and eventually frees) the
-     * playlist it's given, but all_songs_paths must survive for the next
-     * tap too -- hand it a fresh copy rather than the persistent array
-     * itself. Built in all_songs_sort_order (display order, the same
-     * alphabetical order the A-Z index navigates) rather than raw scan
-     * order, so next/prev during playback matches what's on screen. */
-    char ** playlist_copy = malloc(sizeof(char *) * (size_t) all_songs_count);
-    for (int i = 0; i < all_songs_count; i++) playlist_copy[i] = strdup(all_songs_paths[all_songs_sort_order[i]]);
+    /* on_file_selected_lazy_all_songs() builds the queue lazily, identity-
+     * mapped into the DB's own title-sorted order (the same display order
+     * this screen's paged provider uses) instead of eagerly strdup'ing
+     * every one of the library's paths on every tap -- see its own
+     * comment. Needs neither all_songs_count nor ensure_library_arrays_
+     * loaded() -- tap-to-play from All Songs is DB-driven end to end now. */
     set_player_source_all_songs(display_index);
-    on_file_selected(playlist_copy, all_songs_count, display_index);
+    on_file_selected_lazy_all_songs(display_index);
 }
 
 static void all_songs_row_long_press_cb(int display_index) {
     display_index = search_remap_index(SEARCH_BINDING_ALL_SONGS, display_index);
-    open_song_context_menu(all_songs_paths[all_songs_sort_order[display_index]]);
+    char path[600];
+    if (all_songs_resolve_path_at(display_index, path, sizeof(path))) open_song_context_menu(path);
 }
 
+/* Real-device fix: this used to build items[] eagerly from all_songs_
+ * paths/all_songs_sort_order (all_songs_count of them), which meant every
+ * tap-to-play (via ensure_library_arrays_loaded(), a prerequisite for that
+ * array to even exist) cost O(library) memory and CPU regardless of which
+ * one song was actually wanted -- confirmed at real risk of exhausting
+ * this device's 55MB RAM for a large enough library (see this session's
+ * own measurements). Now paged (compact_list_set_paged_provider()): built
+ * and immediately activated against the current library, populated a
+ * bounded page at a time as the list scrolls, regardless of library size.
+ * Both call sites (gui_init(), refresh_library_screens_after_reload()) run
+ * this after metadata_db.c is already open (library_load_from_cache_only()
+ * always precedes the first, and the DB has been open since boot by the
+ * time the second's rescan/reinsert-triggered rebuild can happen), so
+ * metadata_db_get_song_count() here always reflects the real library, not
+ * an unopened DB's 0. */
 static lv_obj_t * build_all_songs_screen(void) {
-    compact_list_item_t * items = NULL;
-    if (all_songs_count > 0) {
-        items = malloc(sizeof(compact_list_item_t) * (size_t) all_songs_count);
-        for (int i = 0; i < all_songs_count; i++) {
-            items[i] = (compact_list_item_t){ song_display_title_of(all_songs_sort_order[i]) };
-        }
-    }
-
-    lv_obj_t * scr = build_compact_list_screen("All Songs", generic_back_cb, items, all_songs_count, all_songs_row_click_cb, all_songs_row_long_press_cb, &all_songs_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
-    free(items);
+    lv_obj_t * scr = build_compact_list_screen("All Songs", generic_back_cb, NULL, 0, all_songs_row_click_cb,
+                                                all_songs_row_long_press_cb, &all_songs_list, NULL,
+                                                LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    compact_list_set_paged_provider(all_songs_list, all_songs_fetch_page, NULL, (int) metadata_db_get_song_count());
     finalize_screen_navigation(scr);
     return scr;
-}
-
-/* Hands remote_control.c its own copy of the library for GET /api/library
- * and playlist mutation (see remote_control_sync_library()'s own doc
- * comment on why the index ordering must exactly match all_songs_paths/
- * all_song_tags) -- call every time those are rebuilt, same call sites as
- * build_all_songs_screen() itself. Builds three plain arrays rather than
- * passing all_song_tags directly since that struct also carries album/
- * album_artist/genre this doesn't need, and song_display_title_of()'s
- * filename-fallback logic isn't something remote_control.c should have to
- * duplicate. Paths are needed (not just for display) because playlist
- * creation/add-to-playlist reference a song by this same library index. */
-static void sync_remote_control_library(void) {
-    if (all_songs_count == 0) {
-        remote_control_sync_library(NULL, NULL, NULL, NULL, NULL, 0);
-        return;
-    }
-    const char ** titles = malloc(sizeof(char *) * (size_t) all_songs_count);
-    const char ** artists = malloc(sizeof(char *) * (size_t) all_songs_count);
-    const char ** album_artists = malloc(sizeof(char *) * (size_t) all_songs_count);
-    const char ** albums = malloc(sizeof(char *) * (size_t) all_songs_count);
-    const char ** paths = malloc(sizeof(char *) * (size_t) all_songs_count);
-    for (int i = 0; i < all_songs_count; i++) {
-        titles[i] = song_display_title_of(i);
-        artists[i] = all_song_tags[i].artist;
-        album_artists[i] = all_song_tags[i].album_artist;
-        albums[i] = all_song_tags[i].album;
-        paths[i] = all_songs_paths[i];
-    }
-    remote_control_sync_library(titles, artists, album_artists, albums, paths, all_songs_count);
-    free(titles);
-    free(artists);
-    free(album_artists);
-    free(albums);
-    free(paths);
 }
 
 static void all_songs_tile_cb(lv_event_t * e) {
@@ -7898,8 +8212,20 @@ static lv_obj_t * group_songs_screen;
 static lv_obj_t * group_songs_title_label;
 static lv_obj_t * group_songs_list;
 static lv_obj_t * group_songs_edit_btn;
-static const int * group_songs_indices; /* borrowed from whichever group_t is currently shown */
+static group_song_entry_t * group_songs_entries; /* owned -- see set_group_songs_entries() */
 static int group_songs_count;
+
+/* Frees the previous group_songs_entries (if any) and replaces it with an
+ * owned copy of entries[0..count) -- every show_group_songs_editable() call
+ * and every "Removed from playlist" refresh goes through this single choke
+ * point so the ownership rule (group_songs_entries is always either NULL or
+ * a malloc'd copy this screen owns outright) never has to be re-derived at
+ * each call site. Caller's own entries[] can be freed immediately after. */
+static void set_group_songs_entries(const group_song_entry_t * entries, int count) {
+    free_group_song_entries(group_songs_entries, group_songs_count);
+    group_songs_entries = NULL;
+    group_songs_count = copy_group_song_entries(&group_songs_entries, entries, count) ? count : 0;
+}
 
 /* A pathological album can contain tens of thousands of tracks. Building one
  * LVGL object per track caused a large post-scan RSS spike and could make ADB
@@ -7916,28 +8242,27 @@ static int group_songs_page_start;
 static lv_obj_t * group_songs_now_playing_bar;
 
 /* clear_player_source()/set_player_source_all_songs() etc. are defined
- * right after on_file_selected() -- this one needs group_songs_indices/
+ * right after on_file_selected() -- this one needs group_songs_entries/
  * count/title_label above already in scope, which those didn't. */
 /* Split out of set_player_source_group_songs() below so a caller that has
- * its own indices/title -- not the on-device Group Songs screen's own
- * group_songs_indices/title_label -- can set the same source kind without
+ * its own entries/title -- not the on-device Group Songs screen's own
+ * group_songs_entries/title_label -- can set the same source kind without
  * touching that screen's shared, mutable display state. Used by remote
  * control's scoped play (play_remote_control_song()), which deliberately
  * never nav_pushes group_songs_screen and so must not reuse (and risk
- * corrupting, via rebuild_playlist_m3u_group()'s free()+realloc, out from
- * under whatever that screen currently has on-device) its live globals. */
-static void set_player_source_group_songs_direct(const int * indices, int count, const char * title, int pos) {
+ * replacing, via set_group_songs_entries(), out from under whatever that
+ * screen currently has on-device) its live globals. */
+static void set_player_source_group_songs_direct(const group_song_entry_t * entries, int count, const char * title,
+                                                   int pos) {
     clear_player_source();
     player_source_kind = PLAYER_SOURCE_GROUP_SONGS;
     player_source_group_title = strdup(title);
-    player_source_group_indices = malloc(sizeof(int) * (size_t) count);
-    memcpy(player_source_group_indices, indices, sizeof(int) * (size_t) count);
-    player_source_group_count = count;
+    player_source_group_count = copy_group_song_entries(&player_source_group_entries, entries, count) ? count : 0;
     player_source_group_pos = pos;
 }
 
 static void set_player_source_group_songs(int pos) {
-    set_player_source_group_songs_direct(group_songs_indices, group_songs_count,
+    set_player_source_group_songs_direct(group_songs_entries, group_songs_count,
                                           lv_label_get_text(group_songs_title_label), pos);
     current_settings.last_source_kind = group_songs_source_is_album ? 2 : 0;
     snprintf(current_settings.last_source_name, sizeof(current_settings.last_source_name), "%s",
@@ -7959,10 +8284,10 @@ static void set_player_source_group_songs(int pos) {
 static const char * group_songs_edit_m3u_path = NULL;
 static bool group_songs_edit_mode = false;
 
-/* Defined near show_m3u_playlist() further down, where playlist_m3u_group/
- * playlist_m3u_song_indices and file_browser_build_playlist_from_m3u() are
- * already in scope -- forward-declared here since populate_group_songs_rows()
- * (just below) needs to wire it up as the remove-icon's click handler. */
+/* Defined near show_m3u_playlist() further down, where the playlist file
+ * helpers are in scope -- forward-declared here since
+ * populate_group_songs_rows() needs to wire it up as the remove icon's
+ * click handler. */
 static void group_song_remove_row_cb(lv_event_t * e);
 static void populate_group_songs_rows(void);
 
@@ -8020,7 +8345,7 @@ static void group_song_row_click_cb(lv_event_t * e) {
     int pos = (int) (intptr_t) lv_event_get_user_data(e); /* position within the CURRENT group, not the whole library */
 
     char ** playlist_copy = malloc(sizeof(char *) * (size_t) group_songs_count);
-    for (int i = 0; i < group_songs_count; i++) playlist_copy[i] = strdup(all_songs_paths[group_songs_indices[i]]);
+    for (int i = 0; i < group_songs_count; i++) playlist_copy[i] = strdup(group_songs_entries[i].path);
     set_player_source_group_songs(pos);
     on_file_selected(playlist_copy, group_songs_count, pos);
 }
@@ -8029,11 +8354,11 @@ static void group_song_row_long_press_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
     group_song_row_long_press_fired = true;
     int pos = (int) (intptr_t) lv_event_get_user_data(e);
-    open_song_context_menu(all_songs_paths[group_songs_indices[pos]]);
+    open_song_context_menu(group_songs_entries[pos].path);
 }
 
 /* Positions/shows or hides group_songs_now_playing_bar against the CURRENT
- * group_songs_indices/count -- callable standalone (no row rebuild, no
+ * group_songs_entries/count -- callable standalone (no row rebuild, no
  * scroll reset) whenever now_playing_song_index changes while this screen
  * is open, and also called once at the end of populate_group_songs_rows()
  * itself so a freshly opened group (or an edit-mode toggle, which also goes
@@ -8047,9 +8372,9 @@ static void refresh_group_songs_now_playing_indicator(void) {
     if (!group_songs_now_playing_bar) return;
 
     int match = -1;
-    if (now_playing_song_index >= 0) {
+    if (now_playing_path[0]) {
         for (int i = 0; i < group_songs_count; i++) {
-            if (group_songs_indices[i] == now_playing_song_index) { match = i; break; }
+            if (strcmp(group_songs_entries[i].path, now_playing_path) == 0) { match = i; break; }
         }
     }
 
@@ -8064,7 +8389,7 @@ static void refresh_group_songs_now_playing_indicator(void) {
     lv_obj_set_pos(group_songs_now_playing_bar, 0, 4 + visible_row * (LIST_ROW_HEIGHT + 4));
 }
 
-/* Rebuilds group_songs_list's rows from whatever group_songs_indices/count
+/* Rebuilds group_songs_list's rows from whatever group_songs_entries/count
  * currently hold, in either of two shapes: a plain tappable-to-play label
  * (list_row_style, same as every other group -- Artists/Albums/Favorites/
  * Most Played always use this one) when not actively editing a playlist, or
@@ -8115,7 +8440,7 @@ static void populate_group_songs_rows(void) {
             lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
             lv_obj_t * label = lv_label_create(row);
-            lv_label_set_text(label, song_display_title_of(group_songs_indices[i]));
+            lv_label_set_text(label, group_songs_entries[i].title);
             lv_obj_add_style(label, &style_theme_text_primary, 0);
             lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
             lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
@@ -8135,7 +8460,7 @@ static void populate_group_songs_rows(void) {
             lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
             row_label_enable_marquee(row);
             lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            lv_label_set_text(row, song_display_title_of(group_songs_indices[i]));
+            lv_label_set_text(row, group_songs_entries[i].title);
 
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(row, group_song_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
@@ -8177,7 +8502,7 @@ static void populate_group_songs_rows(void) {
  * current track was tapped from, scrolled back to it. Forward-declared
  * near the other more_menu_*_cb functions (build_more_menu_popup() wires
  * it up there); defined here instead since PLAYER_SOURCE_GROUP_SONGS
- * needs group_songs_screen/list/indices/count/title_label and
+ * needs group_songs_screen/list/entries/count/title_label and
  * populate_group_songs_rows() all already in scope. */
 static void more_menu_list_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -8197,8 +8522,7 @@ static void more_menu_list_cb(lv_event_t * e) {
         group_songs_edit_m3u_path = NULL;
         group_songs_edit_mode = false;
         group_songs_source_is_album = current_settings.last_source_kind == 2;
-        group_songs_indices = player_source_group_indices;
-        group_songs_count = player_source_group_count;
+        set_group_songs_entries(player_source_group_entries, player_source_group_count);
         group_songs_page_start = player_source_group_pos >= 0
                                      ? (player_source_group_pos / GROUP_SONGS_PAGE_SIZE) * GROUP_SONGS_PAGE_SIZE
                                      : 0;
@@ -8281,22 +8605,26 @@ static void group_songs_edit_btn_cb(lv_event_t * e) {
     populate_group_songs_rows();
 }
 
-static void show_group_songs_editable(const group_t * group, const char * editable_m3u_path) {
+/* entries[0..count) is copied into group_songs_entries (see set_group_songs_
+ * entries()) -- the caller's own array/buffer can be freed immediately after
+ * this call returns, unlike the old group_t-based API where the group_t's
+ * .indices had to stay valid for as long as this screen kept showing it. */
+static void show_group_songs_editable(const char * name, const group_song_entry_t * entries, int count,
+                                       const char * editable_m3u_path) {
     group_songs_source_is_album = false;
     group_songs_edit_m3u_path = editable_m3u_path;
     group_songs_edit_mode = false;
-    group_songs_indices = group->indices;
-    group_songs_count = group->count;
+    set_group_songs_entries(entries, count);
     group_songs_page_start = 0;
 
-    lv_label_set_text(group_songs_title_label, group->name);
+    lv_label_set_text(group_songs_title_label, name);
     populate_group_songs_rows();
 
     nav_push(group_songs_screen);
 }
 
-static void show_group_songs(const group_t * group) {
-    show_group_songs_editable(group, NULL);
+static void show_group_songs(const char * name, const group_song_entry_t * entries, int count) {
+    show_group_songs_editable(name, entries, count, NULL);
 }
 
 static lv_obj_t * build_group_songs_screen(void) {
@@ -9565,27 +9893,6 @@ static void populate_indexed_list(lv_obj_t * list, int count, const char * (*lab
     }
 }
 
-/* Same row construction as populate_indexed_list() above, but from an
- * already-built label array rather than an index-based label_of()
- * callback -- used by search_apply_filter()/search_close() (see the
- * search_binding_t infra further down) to repopulate a non-virtualized
- * build_subsonic_list_screen() list under an active filter, where each
- * row's position no longer corresponds to 0..count-1 into the backing
- * cache array. */
-static void populate_indexed_list_from_items(lv_obj_t * list, const compact_list_item_t * items, int count, lv_event_cb_t click_cb) {
-    lv_obj_clean(list);
-    for (int i = 0; i < count; i++) {
-        lv_obj_t * row = lv_label_create(list);
-        lv_obj_add_style(row, &list_row_style, 0);
-        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
-        row_label_enable_marquee(row);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_label_set_text(row, items[i].label);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
-    }
-}
-
 static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
@@ -10188,7 +10495,7 @@ static void subsonic_song_row_click_cb(lv_event_t * e) {
     subsonic_play_song_and_queue_rest(index);
 }
 
-static void subsonic_album_row_click_cb(lv_event_t * e);
+static void subsonic_album_row_click_cb(int index);
 static void subsonic_playlist_row_click_cb(lv_event_t * e);
 
 typedef enum {
@@ -10317,8 +10624,18 @@ static void poll_subsonic_browse(void) {
                     lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
                 }
                 lv_label_set_text(subsonic_albums_title_label, subsonic_browse_result_title);
-                populate_indexed_list(subsonic_albums_list, subsonic_albums_count, subsonic_album_label_of,
-                                      subsonic_album_row_click_cb);
+                {
+                    /* getAlbumList2.view's own "every album" browse can return
+                     * up to 500 rows (see subsonic_client.c's own size=500) --
+                     * real widget-explosion risk populate_indexed_list() used
+                     * to hit here, same class as the local library's pre-
+                     * virtualization All Songs/Artists/Albums screens. */
+                    compact_list_item_t * items =
+                        malloc(sizeof(compact_list_item_t) * (size_t) (subsonic_albums_count > 0 ? subsonic_albums_count : 1));
+                    for (int i = 0; i < subsonic_albums_count; i++) items[i] = (compact_list_item_t){ subsonic_album_label_of(i) };
+                    compact_list_set_items(subsonic_albums_list, items, subsonic_albums_count);
+                    free(items);
+                }
                 nav_push(subsonic_albums_screen);
                 break;
             case SUBSONIC_BROWSE_PLAYLISTS:
@@ -10340,9 +10657,7 @@ static void poll_subsonic_browse(void) {
     else nav_pop();
 }
 
-static void subsonic_album_row_click_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int index = (int) (intptr_t) lv_event_get_user_data(e);
+static void subsonic_album_row_click_cb(int index) {
     index = search_remap_index(SEARCH_BINDING_SUBSONIC_ALBUMS, index);
 
     if (index < 0 || index >= subsonic_albums_count) return;
@@ -10350,9 +10665,7 @@ static void subsonic_album_row_click_cb(lv_event_t * e) {
                           subsonic_albums_cache[index].name);
 }
 
-static void subsonic_artist_row_click_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int index = (int) (intptr_t) lv_event_get_user_data(e);
+static void subsonic_artist_row_click_cb(int index) {
     index = search_remap_index(SEARCH_BINDING_SUBSONIC_ARTISTS, index);
 
     if (index < 0 || index >= subsonic_artists_count) return;
@@ -10518,8 +10831,19 @@ static void poll_subsonic_connect(void) {
          * getArtists is still fetched right here as part of connecting
          * (below), so tapping Artists from the menu is instant with no
          * extra round trip; Playlists/Albums fetch lazily on their own tap,
-         * same as every other drill-down in this screen already does. */
-        populate_indexed_list(subsonic_artists_list, subsonic_artists_count, subsonic_artist_label_of, subsonic_artist_row_click_cb);
+         * same as every other drill-down in this screen already does.
+         * getArtists.view has no size cap (unlike getAlbumList2's own
+         * size=500) -- a large self-hosted server's whole artist list is a
+         * real widget-explosion risk populate_indexed_list() used to hit
+         * here, same class as the local library's pre-virtualization All
+         * Songs/Artists/Albums screens. */
+        {
+            compact_list_item_t * items =
+                malloc(sizeof(compact_list_item_t) * (size_t) (subsonic_artists_count > 0 ? subsonic_artists_count : 1));
+            for (int i = 0; i < subsonic_artists_count; i++) items[i] = (compact_list_item_t){ subsonic_artist_label_of(i) };
+            compact_list_set_items(subsonic_artists_list, items, subsonic_artists_count);
+            free(items);
+        }
         nav_push(subsonic_menu_screen);
     }
     if (nav_depth > depth_before) {
@@ -10727,7 +11051,7 @@ static lv_obj_t * build_subsonic_entry_screen(void) {
  * same rebuild-in-place approach as group_songs_screen. */
 static lv_obj_t * artist_albums_title_label;
 static lv_obj_t * artist_albums_list;
-static group_t * artist_albums_groups;
+static group_row_t * artist_albums_groups;
 static int artist_albums_group_count;
 
 /* Now-playing indicator bar -- same "recreated fresh every populate call"
@@ -10741,7 +11065,35 @@ static const char * artist_album_label_of(int i) { return artist_albums_groups[i
 static void artist_album_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
-    show_group_songs(&artist_albums_groups[index]);
+    if (index < 0 || index >= artist_albums_group_count) return;
+    group_row_t * group = &artist_albums_groups[index];
+    group_song_entry_t * entries = calloc((size_t) group->song_count, sizeof(*entries));
+    int n = 0;
+    song_row_t page[64];
+    while (entries && n < group->song_count) {
+        int want = group->song_count - n;
+        if (want > 64) want = 64;
+        int got = metadata_db_get_album_songs(group->name, group->album_artist, n, page, want);
+        if (got <= 0) break;
+        for (int i = 0; i < got; i++) {
+            char title[128];
+            metadata_db_song_display_title(&page[i], title, sizeof(title));
+            entries[n + i].path = strdup(page[i].path);
+            entries[n + i].title = strdup(title);
+            if (!entries[n + i].path || !entries[n + i].title) {
+                free_group_song_entries(entries, group->song_count);
+                entries = NULL;
+                n = 0;
+                break;
+            }
+        }
+        if (!entries) break;
+        n += got;
+        if (got < want) break;
+    }
+    if (!entries) return;
+    show_group_songs(group->name, entries, n);
+    free_group_song_entries(entries, n);
     group_songs_source_is_album = true;
 }
 
@@ -10758,10 +11110,13 @@ static void refresh_artist_albums_now_playing_indicator(void) {
     if (!artist_albums_now_playing_bar) return;
 
     int match = -1;
-    if (now_playing_song_index >= 0) {
-        for (int i = 0; i < artist_albums_group_count && match < 0; i++) {
-            for (int j = 0; j < artist_albums_groups[i].count; j++) {
-                if (artist_albums_groups[i].indices[j] == now_playing_song_index) { match = i; break; }
+    song_row_t playing;
+    if (now_playing_path[0] && metadata_db_get_song_by_path(now_playing_path, &playing)) {
+        for (int i = 0; i < artist_albums_group_count; i++) {
+            if (strcasecmp(artist_albums_groups[i].name, playing.tags.album) == 0 &&
+                strcasecmp(artist_albums_groups[i].album_artist, playing.tags.album_artist) == 0) {
+                match = i;
+                break;
             }
         }
     }
@@ -10774,12 +11129,19 @@ static void refresh_artist_albums_now_playing_indicator(void) {
     lv_obj_set_pos(artist_albums_now_playing_bar, 0, 4 + match * (LIST_ROW_HEIGHT + 4));
 }
 
-static void show_artist_albums(const group_t * artist_group) {
-    free_group_array(artist_albums_groups, artist_albums_group_count);
-    build_groups_by_indices(artist_group->indices, artist_group->count, album_key_of, compare_index_by_album,
-                             &artist_albums_groups, &artist_albums_group_count);
+static void show_artist_albums(const char * name, metadata_db_group_kind_t kind) {
+    free(artist_albums_groups);
+    artist_albums_groups = NULL;
+    int64_t count64 = metadata_db_count_albums_for_group(kind, name);
+    artist_albums_group_count = count64 > 0 && count64 <= INT_MAX ? (int) count64 : 0;
+    if (artist_albums_group_count > 0) {
+        artist_albums_groups = malloc(sizeof(*artist_albums_groups) * (size_t) artist_albums_group_count);
+        if (!artist_albums_groups) artist_albums_group_count = 0;
+        else artist_albums_group_count = metadata_db_get_albums_for_group(kind, name, 0, artist_albums_group_count,
+                                                                           artist_albums_groups);
+    }
 
-    lv_label_set_text(artist_albums_title_label, artist_group->name);
+    lv_label_set_text(artist_albums_title_label, name);
     populate_indexed_list(artist_albums_list, artist_albums_group_count, artist_album_label_of, artist_album_row_click_cb);
 
     /* Recreated fresh here, same reasoning as group_songs_now_playing_bar's
@@ -10801,60 +11163,147 @@ static void show_artist_albums(const group_t * artist_group) {
     nav_push(artist_albums_screen);
 }
 
+/* Paged Artists/Album Artist -- see build_artists_screen()'s own comment.
+ * offset is a position in the DB's own name-sorted order (ORDER BY artist/
+ * album_artist COLLATE NOCASE), the exact same order artist_groups/album_
+ * artist_groups (built via strcasecmp on the same raw, never-blank tag --
+ * see this file's own "Unknown Artist" fallback comment) already produce,
+ * so a row tapped here safely indexes straight into that array below. */
+static int artists_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+    (void) ctx;
+    group_row_t * rows = malloc(sizeof(group_row_t) * (size_t) count);
+    int n = rows ? metadata_db_get_groups_page(METADATA_DB_GROUP_ARTIST, offset, count, rows) : 0;
+    for (int i = 0; i < n; i++) snprintf(out_labels[i], COMPACT_LIST_LABEL_MAX, "%s", rows[i].name);
+    free(rows);
+    return n;
+}
+
+static int album_artists_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+    (void) ctx;
+    group_row_t * rows = malloc(sizeof(group_row_t) * (size_t) count);
+    int n = rows ? metadata_db_get_groups_page(METADATA_DB_GROUP_ALBUM_ARTIST, offset, count, rows) : 0;
+    for (int i = 0; i < n; i++) snprintf(out_labels[i], COMPACT_LIST_LABEL_MAX, "%s", rows[i].name);
+    free(rows);
+    return n;
+}
+
+/* Unfiltered (NULL filter, "every album in the library") -- uses metadata_
+ * db_get_albums_page_filtered() rather than metadata_db_get_groups_page(
+ * METADATA_DB_GROUP_ALBUM, ...), since the latter groups by album name
+ * alone (the exact bug this session fixed) and this screen must show the
+ * corrected (album, album_artist) grouping. */
+static int albums_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+    (void) ctx;
+    group_row_t * rows = malloc(sizeof(group_row_t) * (size_t) count);
+    int n = rows ? metadata_db_get_albums_page_filtered(NULL, offset, count, rows) : 0;
+    for (int i = 0; i < n; i++) snprintf(out_labels[i], COMPACT_LIST_LABEL_MAX, "%s", rows[i].name);
+    free(rows);
+    return n;
+}
+
 static void artist_row_click_cb(int index) {
     index = search_remap_index(SEARCH_BINDING_ARTISTS, index);
-    show_artist_albums(&artist_groups[index]);
+    group_row_t group;
+    if (metadata_db_get_groups_page(METADATA_DB_GROUP_ARTIST, index, 1, &group) != 1) return;
+    show_artist_albums(group.name, METADATA_DB_GROUP_ARTIST);
 }
 
 static void album_row_click_cb(int index) {
     index = search_remap_index(SEARCH_BINDING_ALBUMS, index);
-    show_group_songs(&album_groups[index]);
+
+    /* Resolve this specific (album, album_artist) pair at its current
+     * display position via a single-row offset lookup (same pattern as All
+     * Songs' own row-click resolution) -- NOT album_groups[index]: that
+     * array still groups by album name alone (see build_albums_screen()'s
+     * own comment on why), so its indexing no longer agrees with this
+     * screen's own paged, correctly-disambiguated display the moment any
+     * two different artists share an album title. */
+    group_row_t group;
+    if (metadata_db_get_albums_page_filtered(NULL, index, 1, &group) != 1) return;
+    if (group.song_count <= 0) return;
+
+    /* metadata_db_get_album_songs() gives the real, disambiguated song list
+     * directly as owned paths -- show_group_songs() takes those straight
+     * through as group_song_entry_t now, no bridge through all_songs_paths/
+     * find_song_index_by_path() (and so no ensure_library_arrays_loaded())
+     * needed at all. */
+    group_song_entry_t * entries = calloc((size_t) group.song_count, sizeof(*entries));
+    int n = 0;
+    song_row_t page[64];
+    while (entries && n < group.song_count) {
+        int want = group.song_count - n;
+        if (want > 64) want = 64;
+        int got = metadata_db_get_album_songs(group.name, group.album_artist, n, page, want);
+        if (got <= 0) break;
+        for (int i = 0; i < got; i++) {
+            char title[128];
+            metadata_db_song_display_title(&page[i], title, sizeof(title));
+            entries[n + i].path = strdup(page[i].path);
+            entries[n + i].title = strdup(title);
+            if (!entries[n + i].path || !entries[n + i].title) {
+                free_group_song_entries(entries, group.song_count);
+                entries = NULL;
+                n = 0;
+                break;
+            }
+        }
+        if (!entries) break;
+        n += got;
+        if (got < want) break;
+    }
+
+    show_group_songs(group.name, entries, n);
+    free_group_song_entries(entries, n);
     group_songs_source_is_album = true;
 }
 
+/* Real-device fix: these three screens used to build items[] eagerly from
+ * artist_groups/album_groups/album_artist_groups (all_songs_count-scale
+ * arrays), which meant every tile tap cost O(library) memory and CPU --
+ * confirmed at real risk of exhausting this device's 55MB RAM for a large
+ * enough library, same class as All Songs' own pre-paging cost (see build_
+ * all_songs_screen()'s own comment). Artists/Album Artist are paged now
+ * (compact_list_set_paged_provider()); Albums additionally fixes the real
+ * album-identity bug found in review (see metadata_db_get_albums_page_
+ * filtered()'s own comment) as part of the same conversion, since that's
+ * exactly where the bug lived. Built and immediately activated against the
+ * current library -- both call sites (gui_init(), refresh_library_screens_
+ * after_reload()) run this after metadata_db.c is already open, same
+ * reasoning as build_all_songs_screen()'s own comment. */
 static lv_obj_t * build_artists_screen(void) {
-    compact_list_item_t * items = NULL;
-    if (artist_group_count > 0) {
-        items = malloc(sizeof(compact_list_item_t) * (size_t) artist_group_count);
-        for (int i = 0; i < artist_group_count; i++) {
-            items[i] = (compact_list_item_t){ artist_groups[i].name };
-        }
-    }
-    lv_obj_t * scr = build_compact_list_screen("Artists", generic_back_cb, items, artist_group_count, artist_row_click_cb, NULL, &artists_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
-    free(items);
+    lv_obj_t * scr = build_compact_list_screen("Artists", generic_back_cb, NULL, 0, artist_row_click_cb, NULL,
+                                                &artists_list, NULL, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    int artist_count = 0, album_artist_count = 0, album_count = 0;
+    metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
+    compact_list_set_paged_provider(artists_list, artists_fetch_page, NULL, artist_count);
     finalize_screen_navigation(scr);
     return scr;
 }
 
 static lv_obj_t * build_albums_screen(void) {
-    compact_list_item_t * items = NULL;
-    if (album_group_count > 0) {
-        items = malloc(sizeof(compact_list_item_t) * (size_t) album_group_count);
-        for (int i = 0; i < album_group_count; i++) {
-            items[i] = (compact_list_item_t){ album_groups[i].name };
-        }
-    }
-    lv_obj_t * scr = build_compact_list_screen("Albums", generic_back_cb, items, album_group_count, album_row_click_cb, NULL, &albums_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
-    free(items);
+    lv_obj_t * scr = build_compact_list_screen("Albums", generic_back_cb, NULL, 0, album_row_click_cb, NULL,
+                                                &albums_list, NULL, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    int artist_count = 0, album_artist_count = 0, album_count = 0;
+    metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
+    compact_list_set_paged_provider(albums_list, albums_fetch_page, NULL, album_count);
     finalize_screen_navigation(scr);
     return scr;
 }
 
 static void album_artist_row_click_cb(int index) {
     index = search_remap_index(SEARCH_BINDING_ALBUM_ARTIST, index);
-    show_artist_albums(&album_artist_groups[index]);
+    group_row_t group;
+    if (metadata_db_get_groups_page(METADATA_DB_GROUP_ALBUM_ARTIST, index, 1, &group) != 1) return;
+    show_artist_albums(group.name, METADATA_DB_GROUP_ALBUM_ARTIST);
 }
 
 static lv_obj_t * build_album_artist_screen(void) {
-    compact_list_item_t * items = NULL;
-    if (album_artist_group_count > 0) {
-        items = malloc(sizeof(compact_list_item_t) * (size_t) album_artist_group_count);
-        for (int i = 0; i < album_artist_group_count; i++) {
-            items[i] = (compact_list_item_t){ album_artist_groups[i].name };
-        }
-    }
-    lv_obj_t * scr = build_compact_list_screen("Album Artist", generic_back_cb, items, album_artist_group_count, album_artist_row_click_cb, NULL, &album_artist_list, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
-    free(items);
+    lv_obj_t * scr = build_compact_list_screen("Album Artist", generic_back_cb, NULL, 0, album_artist_row_click_cb,
+                                                NULL, &album_artist_list, NULL, LIST_ROW_WIDTH_WIDE, true,
+                                                accent_lv_color());
+    int artist_count = 0, album_artist_count = 0, album_count = 0;
+    metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
+    compact_list_set_paged_provider(album_artist_list, album_artists_fetch_page, NULL, album_artist_count);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -10885,8 +11334,7 @@ typedef struct {
     lv_obj_t * strip;       /* the a_z.png touch strip */
     lv_obj_t * popup;       /* the a_z_result_bg.png bubble, hidden except while dragging */
     lv_obj_t * popup_label; /* big current-letter text inside popup */
-    az_index_name_of_t name_of;
-    const int * count_ptr;  /* address of artist_group_count/album_artist_group_count/all_songs_count -- read fresh on every drag, so a library rescan's new counts are picked up automatically */
+    metadata_db_az_kind_t db_kind; /* DB-backed jump table for this screen -- see poll_az_index_drag() */
 } az_index_binding_t;
 
 #define AZ_INDEX_BINDING_COUNT 4
@@ -10903,7 +11351,7 @@ static const char * all_songs_sorted_name_of(int i) { return song_display_title_
  * -- az_index_registered_count is reset to 0 before the latter, since the
  * old screen/list/strip/popup pointers this table holds become dangling
  * the moment lv_obj_delete() runs on the old screens there. */
-static void register_az_index(lv_obj_t * screen, lv_obj_t * list, az_index_name_of_t name_of, const int * count_ptr) {
+static void register_az_index(lv_obj_t * screen, lv_obj_t * list, metadata_db_az_kind_t db_kind) {
     /* Not touch_list/a_z.png -- confirmed via pixel sampling that stock
      * asset is a fully opaque solid-black rectangle with the letters
      * painted in (alpha=255 everywhere, RGB (0,0,0) in the "empty" areas),
@@ -10945,8 +11393,7 @@ static void register_az_index(lv_obj_t * screen, lv_obj_t * list, az_index_name_
     lv_obj_add_style(popup_label, &style_theme_text_primary, 0);
     lv_obj_center(popup_label);
 
-    az_index_bindings[az_index_registered_count++] =
-        (az_index_binding_t){ screen, list, strip, popup, popup_label, name_of, count_ptr };
+    az_index_bindings[az_index_registered_count++] = (az_index_binding_t){ screen, list, strip, popup, popup_label, db_kind };
 }
 
 static az_index_binding_t * find_az_binding_for_screen(lv_obj_t * screen) {
@@ -10954,31 +11401,6 @@ static az_index_binding_t * find_az_binding_for_screen(lv_obj_t * screen) {
         if (az_index_bindings[i].screen == screen) return &az_index_bindings[i];
     }
     return NULL;
-}
-
-/* One entry per letter A-Z plus '#' (index 26) for anything not starting
- * with a letter -- the display index of the first matching entry, or the
- * nearest one after it if that exact letter has no entries (standard
- * "jump forward to nearest match" A-Z index behavior). Rebuilt fresh on
- * every touch-down rather than cached/invalidated on rescan -- a single
- * linear pass over at most a few thousand names is negligible next to a
- * 60fps timer's own budget, and this avoids needing any rescan-invalidation
- * hook at all. */
-static void build_az_jump_table(az_index_binding_t * b, int * table) {
-    for (int i = 0; i < 27; i++) table[i] = -1;
-
-    int count = *b->count_ptr;
-    for (int i = 0; i < count; i++) {
-        const char * name = b->name_of(i);
-        if (!name || !name[0]) continue;
-        char c = (char) toupper((unsigned char) name[0]);
-        int idx = (c >= 'A' && c <= 'Z') ? (c - 'A') : 26;
-        if (table[idx] == -1) table[idx] = i;
-    }
-
-    for (int i = 25; i >= 0; i--) {
-        if (table[i] == -1) table[i] = table[i + 1];
-    }
 }
 
 /* Same pause/resume treatment as quick_drawer_drag_timer above, and for the
@@ -11017,7 +11439,15 @@ static void poll_az_index_drag(lv_timer_t * timer) {
 
         az_index_dragging = true;
         az_index_active_binding = b;
-        build_az_jump_table(b, az_index_jump_table);
+        /* One entry per letter A-Z plus '#' (index 26) for anything not
+         * starting with a letter -- the display offset of the first
+         * matching entry, or the nearest one after it if that exact letter
+         * has no entries ("jump forward to nearest match"). Computed fresh
+         * on every touch-down via indexed boundary COUNT(*) queries
+         * (metadata_db_get_az_table()) rather than a linear scan of an
+         * in-memory array, so dragging the A-Z strip never needs
+         * ensure_library_arrays_loaded(). */
+        metadata_db_get_az_table(b->db_kind, az_index_jump_table);
         lv_obj_remove_flag(b->popup, LV_OBJ_FLAG_HIDDEN);
     } else if (!pressed) {
         lv_obj_add_flag(az_index_active_binding->popup, LV_OBJ_FLAG_HIDDEN);
@@ -11067,8 +11497,8 @@ typedef struct {
     lv_obj_t * list;
     lv_obj_t * search_btn;
     lv_obj_t * search_bar;
-    az_index_name_of_t name_of; /* same "label for display index i" shape the A-Z index already uses */
-    const int * count_ptr;
+    az_index_name_of_t name_of; /* "label for display index i" -- in-memory fallback, only actually used when db_backed is false (Files/Subsonic) */
+    const int * count_ptr;      /* likewise -- only read when db_backed is false */
     bool active;
     int * filtered_indices; /* display index -> real index; NULL when not filtering (full list shown) */
     int filtered_count;     /* only meaningful while filtered_indices != NULL */
@@ -11076,13 +11506,19 @@ typedef struct {
                               * file_browser.c's own folder-browsing UI (opaque, its own screen-colored background),
                               * hidden except while search is active, rather than the screen's one-and-only list
                               * the other four bindings resize in place. */
-    lv_event_cb_t flex_click_cb; /* non-NULL only for the Subsonic Artists/Albums bindings -- `list` is a plain
-                              * build_subsonic_list_screen() flex-column list (populate_indexed_list()'s one-real-
-                              * object-per-row shape, not the virtualized compact_list_widget the other bindings
-                              * assume), so filtering repopulates it via populate_indexed_list_from_items() instead
-                              * of compact_list_set_items(). NULL leaves the existing compact-list path unchanged --
-                              * set by hand right after register_search() returns, since register_search()'s own
-                              * struct-literal assignment doesn't take it as a parameter. */
+    bool db_backed; /* true for Artists/Albums/Album Artist/All Songs -- search_apply_filter() below queries
+                      * metadata_db_search_names() directly instead of scanning name_of/count_ptr, and search_open()
+                      * skips ensure_library_arrays_loaded() entirely. false for Files/Subsonic (no DB-backed path). */
+    metadata_db_az_kind_t db_kind;              /* only meaningful when db_backed */
+    compact_list_fetch_page_cb_t restore_fetch_page; /* re-applied on search_close() to switch the list back to paged
+                                                        * mode -- the exact same provider build_*_screen() set up,
+                                                        * matching its own compact_list_set_paged_provider() call.
+                                                        * Only meaningful when db_backed. */
+    char (*filtered_labels)[128]; /* owned label storage backing filtered compact_list_item_t.label pointers, since
+                                    * a DB query's result strings (unlike name_of()'s pointers into persistent
+                                    * in-memory arrays) have no other long-lived home -- see compact_list_set_items()'s
+                                    * own doc comment on why the strings must outlive that call. Only used when
+                                    * db_backed; NULL otherwise. */
 } search_binding_t;
 
 static search_binding_t search_bindings[SEARCH_BINDING_COUNT];
@@ -11116,21 +11552,78 @@ static bool search_matches(const char * haystack, const char * needle) {
     return false;
 }
 
+/* Real, live results a search box could plausibly need to show at once --
+ * matches this app's own bounded-search-cache convention (metadata_db_
+ * search_songs()'s own cap, remote_control.c's LIBRARY_JSON_MAX_LIMIT).
+ * Without this, typing a common single letter against a 30k+-song library
+ * linearly scans the whole array and mallocs/copies a match-sized buffer on
+ * every keystroke. compact_list_set_items() itself stays cheap at any
+ * item_count (only ~20 real row widgets ever exist regardless, unlike
+ * populate_indexed_list()'s one-widget-per-row cost), so this isn't a
+ * crash risk -- but scrolling through thousands of results nobody will
+ * ever reach the end of is a wasted allocation and a bad live-search feel
+ * on every single character typed. */
+#define SEARCH_RESULTS_MAX 200
+
 /* Rebuilds binding->list's contents to only entries matching `query`, via
  * compact_list_set_items() rather than a screen rebuild. An empty query
  * shows NOTHING (not the full library) -- real-device feedback: search
  * should be an overlay that only shows something once you've actually
- * typed something, not the whole list up front. filtered_indices maps
- * each surviving display row back to its real artist_groups/album_groups/
- * album_artist_groups/all_songs_sort_order index, for the row-click
- * callbacks' search_remap_index() calls. */
+ * typed something, not the whole list up front. filtered_indices maps each
+ * surviving display row back to its real index (an offset into the same
+ * unfiltered sequence the screen's own paged provider/click handlers use),
+ * for the row-click callbacks' search_remap_index() calls. Stops once
+ * SEARCH_RESULTS_MAX matches are found -- see that constant's own comment.
+ *
+ * db_backed bindings (Artists/Albums/Album Artist/All Songs) query metadata_
+ * db_search_names() directly instead of scanning name_of/count_ptr -- no
+ * ensure_library_arrays_loaded() dependency at all, matching the A-Z index's
+ * own conversion. filtered_labels owns the label strings compact_list_item_t
+ * points at in this path, since a DB query's results (unlike name_of()'s
+ * pointers into persistent in-memory arrays) have no other long-lived home. */
 static void search_apply_filter(search_binding_t * b, const char * query) {
-    int count = (query && query[0]) ? *b->count_ptr : 0;
-    compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) (count > 0 ? count : 1));
-    int * indices = malloc(sizeof(int) * (size_t) (count > 0 ? count : 1));
+    bool have_query = query && query[0];
+
+    free(b->filtered_indices);
+    b->filtered_indices = NULL;
+    b->filtered_count = 0;
+    free(b->filtered_labels);
+    b->filtered_labels = NULL;
+
+    if (b->db_backed) {
+        if (!have_query) {
+            compact_list_set_items(b->list, NULL, 0);
+            return;
+        }
+        metadata_db_search_hit_t * hits = malloc(sizeof(metadata_db_search_hit_t) * SEARCH_RESULTS_MAX);
+        int matched = hits ? metadata_db_search_names(b->db_kind, query, SEARCH_RESULTS_MAX, hits) : 0;
+
+        compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) (matched > 0 ? matched : 1));
+        int * indices = malloc(sizeof(int) * (size_t) (matched > 0 ? matched : 1));
+        char(*labels)[128] = malloc(sizeof(*labels) * (size_t) (matched > 0 ? matched : 1));
+        for (int i = 0; i < matched; i++) {
+            snprintf(labels[i], sizeof(labels[i]), "%s", hits[i].label);
+            items[i] = (compact_list_item_t){ labels[i] };
+            indices[i] = hits[i].offset;
+        }
+        free(hits);
+
+        compact_list_set_items(b->list, items, matched);
+        free(items);
+
+        b->filtered_indices = indices;
+        b->filtered_labels = labels;
+        b->filtered_count = matched;
+        return;
+    }
+
+    int count = have_query ? *b->count_ptr : 0;
+    int cap = count < SEARCH_RESULTS_MAX ? count : SEARCH_RESULTS_MAX;
+    compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) (cap > 0 ? cap : 1));
+    int * indices = malloc(sizeof(int) * (size_t) (cap > 0 ? cap : 1));
     int matched = 0;
 
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < count && matched < cap; i++) {
         const char * name = b->name_of(i);
         if (!search_matches(name, query)) continue;
         items[matched] = (compact_list_item_t){ name };
@@ -11138,23 +11631,16 @@ static void search_apply_filter(search_binding_t * b, const char * query) {
         matched++;
     }
 
-    if (b->flex_click_cb) {
-        populate_indexed_list_from_items(b->list, items, matched, b->flex_click_cb);
-    } else {
-        compact_list_set_items(b->list, items, matched);
-    }
+    compact_list_set_items(b->list, items, matched);
     free(items);
 
-    free(b->filtered_indices);
-    if (query && query[0]) {
+    if (have_query) {
         b->filtered_indices = indices;
         b->filtered_count = matched;
     } else {
         /* Unfiltered -- display index already equals the real index, no
          * remap table needed (also covers count == 0 cleanly). */
         free(indices);
-        b->filtered_indices = NULL;
-        b->filtered_count = 0;
     }
 }
 
@@ -11191,6 +11677,10 @@ static void search_dismiss_active_keypad(void) {
 }
 
 static void search_open(search_binding_t * b) {
+    /* db_backed bindings (Artists/Albums/Album Artist/All Songs) query
+     * metadata_db_search_names() directly -- see search_apply_filter()'s own
+     * comment -- so opening search on any of them never needs this. Only
+     * Files/Subsonic still scan the in-memory name_of/count_ptr arrays. */
     lv_obj_add_flag(b->search_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(b->search_bar, LV_OBJ_FLAG_HIDDEN);
 
@@ -11230,18 +11720,35 @@ static void search_close(search_binding_t * b) {
 
     free(b->filtered_indices);
     b->filtered_indices = NULL;
-    compact_list_item_t * items = NULL;
-    int count = *b->count_ptr;
-    if (count > 0) {
-        items = malloc(sizeof(compact_list_item_t) * (size_t) count);
-        for (int i = 0; i < count; i++) items[i] = (compact_list_item_t){ b->name_of(i) };
-    }
-    if (b->flex_click_cb) {
-        populate_indexed_list_from_items(b->list, items, count, b->flex_click_cb);
+    free(b->filtered_labels);
+    b->filtered_labels = NULL;
+
+    if (b->db_backed) {
+        /* Switches the list back to paged mode instead of rebuilding a
+         * static items[] array -- the exact same provider/total_count
+         * build_*_screen() set up originally (see its own compact_list_set_
+         * paged_provider() call), recomputed fresh here in case a rescan
+         * changed the library while search was open. */
+        int artist_count = 0, album_artist_count = 0, album_count = 0;
+        metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
+        int total = 0;
+        switch (b->db_kind) {
+            case METADATA_DB_AZ_ARTIST: total = artist_count; break;
+            case METADATA_DB_AZ_ALBUM_ARTIST: total = album_artist_count; break;
+            case METADATA_DB_AZ_ALBUM: total = album_count; break;
+            case METADATA_DB_AZ_ALL_SONGS: total = (int) metadata_db_get_song_count(); break;
+        }
+        compact_list_set_paged_provider(b->list, b->restore_fetch_page, NULL, total);
     } else {
+        compact_list_item_t * items = NULL;
+        int count = *b->count_ptr;
+        if (count > 0) {
+            items = malloc(sizeof(compact_list_item_t) * (size_t) count);
+            for (int i = 0; i < count; i++) items[i] = (compact_list_item_t){ b->name_of(i) };
+        }
         compact_list_set_items(b->list, items, count);
+        free(items);
     }
-    free(items);
 
     b->active = false;
 }
@@ -11273,9 +11780,11 @@ static void search_close_btn_click_cb(lv_event_t * e) {
  * right of the title row, same position/pattern playlists_edit_btn
  * already uses) and the search bar (hidden until search_btn is tapped). */
 static void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list, az_index_name_of_t name_of,
-                             const int * count_ptr, bool is_overlay_list) {
+                             const int * count_ptr, bool is_overlay_list, bool db_backed, metadata_db_az_kind_t db_kind,
+                             compact_list_fetch_page_cb_t restore_fetch_page) {
     search_binding_t * b = &search_bindings[id];
     free(b->filtered_indices); /* re-registering (post-rescan rebuild) over a binding left mid-filter would otherwise leak this */
+    free(b->filtered_labels);
 
     lv_obj_t * search_btn = lv_image_create(screen);
     lv_image_set_src(search_btn, asset_path("sub_back/btn_search.png"));
@@ -11328,7 +11837,9 @@ static void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t 
     lv_obj_add_flag(bar, LV_OBJ_FLAG_GESTURE_BUBBLE);
     enable_gesture_bubble_recursive(bar);
 
-    *b = (search_binding_t){ screen, list, search_btn, bar, name_of, count_ptr, false, NULL, 0, is_overlay_list };
+    *b = (search_binding_t){ screen,     list,    search_btn,        bar,      name_of, count_ptr,
+                              false,      NULL,    0,                 is_overlay_list, db_backed, db_kind,
+                              restore_fetch_page, NULL };
 }
 
 /* Files' search (SEARCH_BINDING_FILES) is the one binding with no per-
@@ -11340,20 +11851,9 @@ static void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t 
  * straight through" shape), so display_index never needs remapping here. */
 static void files_search_row_click_cb(int display_index) {
     search_binding_t * b = &search_bindings[SEARCH_BINDING_FILES];
-    int count = b->filtered_indices ? b->filtered_count : all_songs_count;
-
-    char ** playlist_copy = malloc(sizeof(char *) * (size_t) count);
-    for (int i = 0; i < count; i++) {
-        int sorted_index = b->filtered_indices ? b->filtered_indices[i] : i;
-        playlist_copy[i] = strdup(all_songs_paths[all_songs_sort_order[sorted_index]]);
-    }
-    /* Same underlying all_songs_sort_order data as All Songs itself (just
-     * possibly filtered down), so the "List" option can just reopen the
-     * (always unfiltered) All Songs screen -- remap the tapped result back
-     * to its real position there. */
     int all_songs_display_index = b->filtered_indices ? b->filtered_indices[display_index] : display_index;
     set_player_source_all_songs(all_songs_display_index);
-    on_file_selected(playlist_copy, count, display_index);
+    on_file_selected_lazy_all_songs(all_songs_display_index);
 }
 
 /* ---- Playlists (Music submenu, replacing the old Genres tile -- real-
@@ -11368,8 +11868,8 @@ static void files_search_row_click_cb(int display_index) {
  * membership can change between visits, so these two are recomputed fresh
  * every time their row is tapped instead of once at scan time; the backing
  * indices arrays are freed+realloc'd on each tap rather than per screen
- * object, same lifetime as show_group_songs()'s own group_songs_indices
- * (borrowed, must outlive the group_songs_screen it's currently showing).
+ * object. show_group_songs() takes an owned copy of the small result set,
+ * so the DB-returned path array can be released immediately.
  *
  * User-created .m3u playlists (Player screen's "Add to Playlist", or
  * dropped onto the SD card by hand) are listed below those two via
@@ -11378,10 +11878,37 @@ static void files_search_row_click_cb(int display_index) {
 
 #define MOST_PLAYED_LIMIT 20
 
-static int * favorites_indices = NULL;
-static group_t favorites_group;
-static int * most_played_indices = NULL;
-static group_t most_played_group;
+/* Resolves each of paths[0..count) to a display title via a single-row DB
+ * lookup (metadata_db_get_song_by_path()) -- falls back to the raw
+ * basename if a path somehow isn't in the library anymore (a stale
+ * favorite/playlist entry that outlived a rescan). Caller owns the
+ * returned array (free() it); paths[] itself is untouched. Shared by
+ * show_favorites()/show_most_played()/show_m3u_playlist() below,
+ * all three of which used to bridge through find_song_index_by_path() (and
+ * so needed all_songs_paths/all_song_tags loaded) purely to get a display
+ * title -- these lists are small (a hand-curated favorites list,
+ * MOST_PLAYED_LIMIT, one playlist), so a DB lookup per song costs nothing
+ * next to what loading the whole library used to. */
+static group_song_entry_t * build_group_song_entries_from_paths(char ** paths, int count) {
+    group_song_entry_t * entries = calloc((size_t) (count > 0 ? count : 1), sizeof(*entries));
+    if (!entries) return NULL;
+    for (int i = 0; i < count; i++) {
+        entries[i].path = strdup(paths[i]);
+        song_row_t row;
+        char title[128];
+        if (metadata_db_get_song_by_path(paths[i], &row)) {
+            metadata_db_song_display_title(&row, title, sizeof(title));
+        } else {
+            snprintf(title, sizeof(title), "%s", basename_of(paths[i]));
+        }
+        entries[i].title = strdup(title);
+        if (!entries[i].path || !entries[i].title) {
+            free_group_song_entries(entries, count);
+            return NULL;
+        }
+    }
+    return entries;
+}
 
 /* all_songs_paths has no path->index map -- this only runs on the rare
  * "user tapped Favorites/Most Played" event, not a hot path, so a linear
@@ -11394,31 +11921,6 @@ static int find_song_index_by_path(const char * path) {
     return -1;
 }
 
-static const group_t * find_group_by_name(const group_t * groups, int group_count, const char * name) {
-    for (int i = 0; i < group_count; i++) {
-        if (strcasecmp(groups[i].name, name) == 0) return &groups[i];
-    }
-    return NULL;
-}
-
-/* One specific album within one artist/album-artist's own songs -- same
- * scoping build_groups_by_indices() does for the on-device Artist ->
- * Albums drill-down (see artist_album_row_click_cb()), just resolving the
- * one album a remote play actually needs instead of materializing every
- * other album of that artist's too. Order-preserving: parent->indices is
- * already path-sorted within a shared artist (build_groups_by()'s own
- * tie-break), so this comes out in the same track order the on-device
- * Album Songs screen would show. Caller owns *out_indices (free() it). */
-static void filter_group_by_album(const group_t * parent, const char * album, int ** out_indices, int * out_count) {
-    int * indices = malloc(sizeof(int) * (size_t) parent->count);
-    int count = 0;
-    for (int i = 0; i < parent->count; i++) {
-        if (strcasecmp(all_song_tags[parent->indices[i]].album, album) == 0) indices[count++] = parent->indices[i];
-    }
-    *out_indices = indices;
-    *out_count = count;
-}
-
 /* Real-device bug report: playing a song from the remote-control web UI
  * always queued the entire library (alphabetical order, whatever play_mode
  * happened to be) instead of just the Album/Playlist the song was actually
@@ -11426,17 +11928,17 @@ static void filter_group_by_album(const group_t * parent, const char * album, in
  * comment for the full story. playlist_name/artist_filter/album_artist_
  * filter/album_filter are remote_control_consume_play_index()'s own
  * context, empty string meaning "not provided". song_index is a raw
- * all_songs_paths/all_song_tags index (already translated from remote_
- * control.c's library index space by the caller). Falls back to the
+ * all_songs_paths/all_song_tags index (the caller has already resolved
+ * remote_control.c's song id into a path and looked that path up via
+ * find_song_index_by_path()). Falls back to the
  * existing whole-library behavior whenever no usable scope resolves --
  * both the plain "no filters at all" case (someone playing from All
  * Songs/search) and a stale reference (e.g. a playlist renamed/deleted
  * since the phone last loaded its song list). */
-static void play_remote_control_song(int song_index, const char * playlist_name, const char * artist_filter,
+static void play_remote_control_song(const char * song_path, const char * playlist_name, const char * artist_filter,
                                       const char * album_artist_filter, const char * album_filter) {
-    if (song_index < 0 || song_index >= all_songs_count) return;
-
-    int * scoped_indices = NULL;
+    if (!song_path || !song_path[0]) return;
+    group_song_entry_t * scoped_entries = NULL;
     int scoped_count = 0;
     char scoped_title[128] = "";
 
@@ -11458,52 +11960,67 @@ static void play_remote_control_song(int song_index, const char * playlist_name,
             loaded = file_browser_build_playlist_from_m3u(m3u_path, &paths, &count);
         }
         if (loaded && count > 0) {
-            scoped_indices = malloc(sizeof(int) * (size_t) count);
-            for (int i = 0; i < count; i++) {
-                int idx = find_song_index_by_path(paths[i]);
-                if (idx >= 0) scoped_indices[scoped_count++] = idx;
-            }
+            scoped_entries = build_group_song_entries_from_paths(paths, count);
+            scoped_count = scoped_entries ? count : 0;
             for (int i = 0; i < count; i++) free(paths[i]);
             free(paths);
             if (scoped_title[0] == '\0') snprintf(scoped_title, sizeof(scoped_title), "%s", playlist_name);
         }
     } else if (album_filter[0] != '\0' && (artist_filter[0] != '\0' || album_artist_filter[0] != '\0')) {
-        const group_t * parent = artist_filter[0] != '\0'
-                                      ? find_group_by_name(artist_groups, artist_group_count, artist_filter)
-                                      : find_group_by_name(album_artist_groups, album_artist_group_count, album_artist_filter);
-        if (parent) {
-            filter_group_by_album(parent, album_filter, &scoped_indices, &scoped_count);
+        int64_t count64 = metadata_db_count_songs_filtered(NULL, artist_filter, album_artist_filter, album_filter);
+        if (count64 > 0 && count64 <= INT_MAX) {
+            scoped_entries = calloc((size_t) count64, sizeof(*scoped_entries));
+            song_row_t rows[64];
+            while (scoped_entries && scoped_count < count64) {
+                int want = (int) (count64 - scoped_count);
+                if (want > 64) want = 64;
+                int got = metadata_db_get_songs_filtered_page(NULL, artist_filter, album_artist_filter, album_filter,
+                                                               scoped_count, want, rows);
+                if (got <= 0) break;
+                for (int i = 0; i < got; i++) {
+                    char title[128];
+                    metadata_db_song_display_title(&rows[i], title, sizeof(title));
+                    scoped_entries[scoped_count + i].path = strdup(rows[i].path);
+                    scoped_entries[scoped_count + i].title = strdup(title);
+                    if (!scoped_entries[scoped_count + i].path || !scoped_entries[scoped_count + i].title) {
+                        free_group_song_entries(scoped_entries, (int) count64);
+                        scoped_entries = NULL;
+                        scoped_count = 0;
+                        break;
+                    }
+                }
+                if (!scoped_entries) break;
+                scoped_count += got;
+                if (got < want) break;
+            }
             snprintf(scoped_title, sizeof(scoped_title), "%s", album_filter);
         }
     }
 
-    if (scoped_indices && scoped_count > 0) {
+    if (scoped_entries && scoped_count > 0) {
         int pos = -1;
         for (int i = 0; i < scoped_count; i++) {
-            if (scoped_indices[i] == song_index) {
+            if (strcmp(scoped_entries[i].path, song_path) == 0) {
                 pos = i;
                 break;
             }
         }
         if (pos >= 0) {
             char ** playlist_copy = malloc(sizeof(char *) * (size_t) scoped_count);
-            for (int i = 0; i < scoped_count; i++) playlist_copy[i] = strdup(all_songs_paths[scoped_indices[i]]);
-            set_player_source_group_songs_direct(scoped_indices, scoped_count, scoped_title, pos);
+            for (int i = 0; i < scoped_count; i++) playlist_copy[i] = strdup(scoped_entries[i].path);
+            set_player_source_group_songs_direct(scoped_entries, scoped_count, scoped_title, pos);
             on_file_selected(playlist_copy, scoped_count, pos);
-            free(scoped_indices);
+            free_group_song_entries(scoped_entries, scoped_count);
             return;
         }
     }
-    free(scoped_indices);
+    free_group_song_entries(scoped_entries, scoped_count);
 
-    int display_index = -1;
-    for (int i = 0; i < all_songs_count; i++) {
-        if (all_songs_sort_order[i] == song_index) {
-            display_index = i;
-            break;
-        }
+    int64_t offset = metadata_db_get_song_title_offset(song_path);
+    if (offset >= 0 && offset <= INT_MAX) {
+        set_player_source_all_songs((int) offset);
+        on_file_selected_lazy_all_songs((int) offset);
     }
-    if (display_index >= 0) all_songs_row_click_cb(display_index);
 }
 
 /* Called from apply_track_metadata_to_ui() right after now_playing_song_
@@ -11524,23 +12041,16 @@ static void play_remote_control_song(int song_index, const char * playlist_name,
 static void refresh_now_playing_indicators(void) {
     int artist_row = -1, album_row = -1, album_artist_row = -1, all_songs_row = -1;
 
-    if (now_playing_song_index >= 0) {
-        const char * artist = all_song_tags[now_playing_song_index].artist;
-        const char * album = all_song_tags[now_playing_song_index].album;
-        const char * album_artist = all_song_tags[now_playing_song_index].album_artist;
-
-        for (int i = 0; i < artist_group_count; i++) {
-            if (strcmp(artist_groups[i].name, artist) == 0) { artist_row = i; break; }
-        }
-        for (int i = 0; i < album_group_count; i++) {
-            if (strcmp(album_groups[i].name, album) == 0) { album_row = i; break; }
-        }
-        for (int i = 0; i < album_artist_group_count; i++) {
-            if (strcmp(album_artist_groups[i].name, album_artist) == 0) { album_artist_row = i; break; }
-        }
-        for (int i = 0; i < all_songs_count; i++) {
-            if (all_songs_sort_order[i] == now_playing_song_index) { all_songs_row = i; break; }
-        }
+    song_row_t row;
+    if (now_playing_path[0] && metadata_db_get_song_by_path(now_playing_path, &row)) {
+        int64_t v = metadata_db_get_group_offset(METADATA_DB_GROUP_ARTIST, row.tags.artist, NULL);
+        if (v >= 0 && v <= INT_MAX) artist_row = (int) v;
+        v = metadata_db_get_group_offset(METADATA_DB_GROUP_ALBUM, row.tags.album, row.tags.album_artist);
+        if (v >= 0 && v <= INT_MAX) album_row = (int) v;
+        v = metadata_db_get_group_offset(METADATA_DB_GROUP_ALBUM_ARTIST, row.tags.album_artist, NULL);
+        if (v >= 0 && v <= INT_MAX) album_artist_row = (int) v;
+        v = metadata_db_get_song_title_offset(now_playing_path);
+        if (v >= 0 && v <= INT_MAX) all_songs_row = (int) v;
     }
 
     if (artists_list) compact_list_set_now_playing(artists_list, artist_row);
@@ -11557,20 +12067,11 @@ static void show_favorites(void) {
     int count;
     metadata_db_load_favorite_songs(&paths, &count);
 
-    free(favorites_indices);
-    favorites_indices = count > 0 ? malloc(sizeof(int) * (size_t) count) : NULL;
-    int found = 0;
-    for (int i = 0; i < count; i++) {
-        int idx = find_song_index_by_path(paths[i]);
-        if (idx >= 0) favorites_indices[found++] = idx; /* skip a favorite not in the currently-loaded library */
-        free(paths[i]);
-    }
+    group_song_entry_t * entries = build_group_song_entries_from_paths(paths, count);
+    if (entries) show_group_songs("Favorites", entries, count);
+    free_group_song_entries(entries, count);
+    for (int i = 0; i < count; i++) free(paths[i]);
     free(paths);
-
-    snprintf(favorites_group.name, sizeof(favorites_group.name), "Favorites");
-    favorites_group.indices = favorites_indices;
-    favorites_group.count = found;
-    show_group_songs(&favorites_group);
 }
 
 static void show_most_played(void) {
@@ -11578,54 +12079,22 @@ static void show_most_played(void) {
     int count;
     metadata_db_load_top_played_songs(MOST_PLAYED_LIMIT, &paths, &count);
 
-    free(most_played_indices);
-    most_played_indices = count > 0 ? malloc(sizeof(int) * (size_t) count) : NULL;
-    int found = 0;
-    for (int i = 0; i < count; i++) {
-        int idx = find_song_index_by_path(paths[i]);
-        if (idx >= 0) most_played_indices[found++] = idx;
-        free(paths[i]);
-    }
+    group_song_entry_t * entries = build_group_song_entries_from_paths(paths, count);
+    if (entries) show_group_songs("Most Played", entries, count);
+    free_group_song_entries(entries, count);
+    for (int i = 0; i < count; i++) free(paths[i]);
     free(paths);
-
-    snprintf(most_played_group.name, sizeof(most_played_group.name), "Most Played");
-    most_played_group.indices = most_played_indices;
-    most_played_group.count = found;
-    show_group_songs(&most_played_group);
 }
 
 static lv_obj_t * playlists_list;
 static char ** playlists_m3u_paths = NULL;
 static int playlists_m3u_count = 0;
 
-static int * playlist_m3u_song_indices = NULL;
-static group_t playlist_m3u_group;
+static char playlist_m3u_name[128];
 
-/* Maps paths/count (an m3u's contents, straight from file_browser_build_
- * playlist_from_m3u()) onto playlist_m3u_group.indices/count -- the same
- * path-to-library-index resolution show_favorites()/show_most_played() do,
- * since show_group_songs()/show_group_songs_editable() operate on library
- * indices, not raw paths. An m3u entry that isn't part of the currently-
- * scanned library (stale entry, or added since the last rescan) is silently
- * skipped, same tolerance those two already have. name is optional (NULL
- * leaves playlist_m3u_group.name as whatever it already was) -- the remove
- * callback below reuses this after a removal without needing to re-pass the
- * still-unchanged display name. Shared by show_m3u_playlist() (initial
- * entry) and group_song_remove_row_cb() (refresh in place after a removal). */
-static void rebuild_playlist_m3u_group(const char * name, char ** paths, int count) {
-    free(playlist_m3u_song_indices);
-    playlist_m3u_song_indices = count > 0 ? malloc(sizeof(int) * (size_t) count) : NULL;
-    int found = 0;
-    for (int i = 0; i < count; i++) {
-        int idx = find_song_index_by_path(paths[i]);
-        if (idx >= 0) playlist_m3u_song_indices[found++] = idx;
-    }
-
-    if (name) snprintf(playlist_m3u_group.name, sizeof(playlist_m3u_group.name), "%s", name);
-    playlist_m3u_group.indices = playlist_m3u_song_indices;
-    playlist_m3u_group.count = found;
-}
-
+/* The currently open M3U's title survives an in-place row removal. Song
+ * paths and titles themselves live in group_songs_entries, independent of
+ * the full-library arrays. */
 /* Shows an .m3u's contents the same way Favorites/Most Played do -- a
  * tappable song list (show_group_songs_editable()), not straight into
  * playback -- rather than the old behavior of jumping directly to track 0
@@ -11636,8 +12105,11 @@ static void rebuild_playlist_m3u_group(const char * name, char ** paths, int cou
  * see its own comment) only ever shows up here, not for Favorites/Most
  * Played/Artists/Albums. */
 static void show_m3u_playlist(const char * name, const char * m3u_path, char ** paths, int count) {
-    rebuild_playlist_m3u_group(name, paths, count);
-    show_group_songs_editable(&playlist_m3u_group, m3u_path);
+    group_song_entry_t * entries = build_group_song_entries_from_paths(paths, count);
+    if (!entries) return;
+    snprintf(playlist_m3u_name, sizeof(playlist_m3u_name), "%s", name);
+    show_group_songs_editable(playlist_m3u_name, entries, count, m3u_path);
+    free_group_song_entries(entries, count);
 }
 
 /* Remove-icon handler for an editable playlist's rows (see
@@ -11653,7 +12125,7 @@ static void group_song_remove_row_cb(lv_event_t * e) {
     if (!group_songs_edit_m3u_path || pos < 0 || pos >= group_songs_count) return;
 
     const char * m3u_path = group_songs_edit_m3u_path;
-    playlist_files_remove(m3u_path, all_songs_paths[group_songs_indices[pos]]);
+    playlist_files_remove(m3u_path, group_songs_entries[pos].path);
 
     char ** songs = NULL;
     int count = 0;
@@ -11674,12 +12146,12 @@ static void group_song_remove_row_cb(lv_event_t * e) {
         return;
     }
 
-    rebuild_playlist_m3u_group(NULL, songs, count);
+    group_song_entry_t * entries = build_group_song_entries_from_paths(songs, count);
     for (int i = 0; i < count; i++) free(songs[i]);
     free(songs);
-
-    group_songs_indices = playlist_m3u_group.indices;
-    group_songs_count = playlist_m3u_group.count;
+    if (!entries) return;
+    set_group_songs_entries(entries, count);
+    free_group_song_entries(entries, count);
     populate_group_songs_rows();
     show_error_toast("Removed from playlist");
 }
@@ -11929,8 +12401,15 @@ static void refresh_library_screens_after_reload(void) {
     lv_obj_delete(artists_screen);
     lv_obj_delete(albums_screen);
     lv_obj_delete(album_artist_screen);
+    /* Each build_*_screen() below activates its own paged provider against
+     * the current (fresh, post-reload) library internally -- no separate
+     * ensure_library_arrays_loaded()/populate step needed here anymore, and
+     * deliberately not added back: the same lazy-loading benefit gui_init()
+     * gets at boot (drill-down/search/A-Z index still pay the full-array
+     * cost, but only when actually used, not just because a rescan/SD-
+     * reinsert reload happened) now applies consistently after a reload
+     * too, not only at first boot. */
     all_songs_screen = build_all_songs_screen();
-    sync_remote_control_library();
     artists_screen = build_artists_screen();
     albums_screen = build_albums_screen();
     album_artist_screen = build_album_artist_screen();
@@ -11939,16 +12418,19 @@ static void refresh_library_screens_after_reload(void) {
      * just went dangling along with the lv_obj_delete()s above -- re-register
      * against the freshly rebuilt screens/lists before anything can poll them. */
     az_index_registered_count = 0;
-    register_az_index(artists_screen, artists_list, artist_group_name_of, &artist_group_count);
-    register_az_index(albums_screen, albums_list, album_group_name_of, &album_group_count);
-    register_az_index(album_artist_screen, album_artist_list, album_artist_group_name_of, &album_artist_group_count);
-    register_az_index(all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count);
+    register_az_index(artists_screen, artists_list, METADATA_DB_AZ_ARTIST);
+    register_az_index(albums_screen, albums_list, METADATA_DB_AZ_ALBUM);
+    register_az_index(album_artist_screen, album_artist_list, METADATA_DB_AZ_ALBUM_ARTIST);
+    register_az_index(all_songs_screen, all_songs_list, METADATA_DB_AZ_ALL_SONGS);
 
-    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, artist_group_name_of, &artist_group_count, false);
-    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, album_group_name_of, &album_group_count, false);
+    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, artist_group_name_of, &artist_group_count, false,
+                     true, METADATA_DB_AZ_ARTIST, artists_fetch_page);
+    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, album_group_name_of, &album_group_count, false,
+                     true, METADATA_DB_AZ_ALBUM, albums_fetch_page);
     register_search(SEARCH_BINDING_ALBUM_ARTIST, album_artist_screen, album_artist_list, album_artist_group_name_of,
-                     &album_artist_group_count, false);
-    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count, false);
+                     &album_artist_group_count, false, true, METADATA_DB_AZ_ALBUM_ARTIST, album_artists_fetch_page);
+    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count, false,
+                     true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 }
 
 /* SD-card-reinsertion fast path -- see poll_sd_card_hotplug()'s own call
@@ -11974,7 +12456,15 @@ static void refresh_library_screens_after_reload(void) {
  * reason. */
 static void reload_library_on_sd_reinsert(void) {
     library_load_from_cache_only();
-    if (all_songs_count > 0) {
+    /* metadata_db_get_song_count() (a cheap COUNT(*), not all_songs_count --
+     * library_load_from_cache_only() deliberately no longer sets that; see
+     * its own comment) is what actually decides "does this card have a
+     * usable cache" here: checking all_songs_count instead would read 0
+     * regardless of the real database, since nothing has called
+     * ensure_library_arrays_loaded() yet at this point -- always falling
+     * through to a full, unnecessary start_library_rescan() on every single
+     * reinsertion, even a card with a perfectly good existing cache. */
+    if (metadata_db_get_song_count() > 0) {
         refresh_library_screens_after_reload();
         show_info_toast("Library updated");
     } else {
@@ -12035,7 +12525,15 @@ static void poll_library_rescan(void) {
     refresh_library_screens_after_reload();
 
     lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text_fmt(subsonic_downloading_label, "Library updated\n%d songs", all_songs_count);
+    /* Real bug caught in review: all_songs_count stays 0 here now --
+     * refresh_library_screens_after_reload() above no longer eagerly loads
+     * the arrays (see its own comment), so this used to always report
+     * "Library updated, 0 songs" right after a real, successful scan.
+     * metadata_db_get_song_count() (a cheap COUNT(*)) reflects the real
+     * total regardless of whether anything has triggered the lazy array
+     * load yet. */
+    lv_label_set_text_fmt(subsonic_downloading_label, "Library updated\n%lld songs",
+                           (long long) metadata_db_get_song_count());
     library_rescan_success_pending = true;
     library_rescan_success_since_tick = lv_tick_get();
 }
@@ -12308,7 +12806,15 @@ static void poll_sd_card_hotplug(void) {
          * empty too, which would otherwise repeat forever on every poll
          * for that case. */
         boot_library_recheck_done = true;
-        if (all_songs_count == 0 && !library_rescan_active) {
+        /* metadata_db_get_song_count() (the real database), not
+         * all_songs_count -- that's deliberately never populated at boot
+         * anymore (see library_load_from_cache_only()'s own comment), so
+         * checking it here would read 0 on literally every single boot
+         * regardless of whether the SD-mount race this guards against
+         * actually happened, forcing reload_library_on_sd_reinsert()'s own
+         * full eager load every time and defeating this rework's entire
+         * point. */
+        if (metadata_db_get_song_count() == 0 && !library_rescan_active) {
             reload_library_on_sd_reinsert();
             file_browser_reset_to_root();
         }
@@ -12760,6 +13266,11 @@ static void update_music_database_row_cb(lv_event_t * e) {
     start_library_rescan();
 }
 
+/* No ensure_library_arrays_loaded() calls in these three -- all paged now,
+ * see build_artists_screen()'s own comment. Loading still happens lazily
+ * where it's actually needed: drilling into an artist/album-artist's own
+ * albums (artist_row_click_cb()/album_artist_row_click_cb()), an album's
+ * own songs (album_row_click_cb()), search, or the A-Z index. */
 static void artists_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_push(artists_screen);
@@ -16653,7 +17164,7 @@ static void build_timezone_city_screen_items(compact_list_item_t * items, const 
 static lv_obj_t * build_timezone_city_screen(const char * region) {
     compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) TIMEZONE_TABLE_COUNT);
     build_timezone_city_screen_items(items, region);
-    lv_obj_t * scr = build_compact_list_screen(region, generic_back_cb, items, timezone_city_count, timezone_city_row_click_cb, NULL, NULL, LIST_ROW_WIDTH, false, lv_color_black());
+    lv_obj_t * scr = build_compact_list_screen(region, generic_back_cb, items, timezone_city_count, timezone_city_row_click_cb, NULL, NULL, NULL, LIST_ROW_WIDTH, false, lv_color_black());
     free(items);
     finalize_screen_navigation(scr);
     return scr;
@@ -17740,52 +18251,99 @@ static lv_obj_t * build_eq_screen(void) {
 /* Rebuild the queue in the same logical context that supplied last_track.
  * Older settings files have kind 0 and retain the legacy containing-folder
  * fallback.  Album and All Songs contexts are reconstructed from the
- * already-loaded metadata index, so the player's List action and next/prev
- * order survive a reboot instead of silently becoming a different queue. */
+ * metadata index -- so the player's List action and next/prev order survive
+ * a reboot instead of silently becoming a different queue -- IF that index
+ * happens to already be loaded (ensure_library_arrays_loaded() deliberately
+ * not called here: this runs from gui_init()'s own auto-resume path for
+ * every user with Resume Last Track enabled, and forcing a full library
+ * load right here would reintroduce this rework's whole reason for
+ * existing, just for a different subset of boots). When it isn't,
+ * find_song_index_by_path() below returns -1, every kind-1/kind-2 branch
+ * below correctly falls through, and this ends at the same live-filesystem-
+ * walk fallback (file_browser_build_playlist_for_path()) that already
+ * handles kind 0 -- resume still works, just reconstructing a plain-folder
+ * queue instead of the exact All-Songs/album context, until the user visits
+ * one of the four library screens for some other reason. */
+static bool resume_playlist_needs_lazy_order = false;
+
 static bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * out_index) {
-    int song_index = find_song_index_by_path(current_settings.last_track);
+    resume_playlist_needs_lazy_order = false;
+    song_row_t current;
+    bool indexed = metadata_db_get_song_by_path(current_settings.last_track, &current);
 
-    if (song_index >= 0 && current_settings.last_source_kind == 2 && current_settings.last_source_name[0]) {
-        for (int g = 0; g < album_group_count; g++) {
-            group_t * group = &album_groups[g];
-            if (strcmp(group->name, current_settings.last_source_name) != 0) continue;
-            int selected = -1;
-            for (int i = 0; i < group->count; i++) {
-                if (group->indices[i] == song_index) { selected = i; break; }
+    if (indexed && current_settings.last_source_kind == 2 && current_settings.last_source_name[0] &&
+        strcasecmp(current.tags.album, current_settings.last_source_name) == 0) {
+        int64_t count64 = metadata_db_count_songs_filtered(NULL, NULL, current.tags.album_artist, current.tags.album);
+        if (count64 > 0 && count64 <= INT_MAX) {
+            int count = (int) count64;
+            group_song_entry_t * entries = calloc((size_t) count, sizeof(*entries));
+            char ** paths = calloc((size_t) count, sizeof(*paths));
+            song_row_t rows[64];
+            int loaded = 0, selected = -1;
+            while (entries && paths && loaded < count) {
+                int want = count - loaded;
+                if (want > 64) want = 64;
+                int got = metadata_db_get_songs_filtered_page(NULL, NULL, current.tags.album_artist,
+                                                               current.tags.album, loaded, want, rows);
+                if (got <= 0) break;
+                for (int i = 0; i < got; i++) {
+                    char title[128];
+                    metadata_db_song_display_title(&rows[i], title, sizeof(title));
+                    entries[loaded + i].path = strdup(rows[i].path);
+                    entries[loaded + i].title = strdup(title);
+                    paths[loaded + i] = strdup(rows[i].path);
+                    if (strcmp(rows[i].path, current_settings.last_track) == 0) selected = loaded + i;
+                    if (!entries[loaded + i].path || !entries[loaded + i].title || !paths[loaded + i]) {
+                        got = 0;
+                        break;
+                    }
+                }
+                if (got <= 0) break;
+                loaded += got;
+                if (got < want) break;
             }
-            if (selected < 0) continue;
-
-            char ** paths = malloc(sizeof(char *) * (size_t) group->count);
-            for (int i = 0; i < group->count; i++) paths[i] = strdup(all_songs_paths[group->indices[i]]);
-            set_player_source_group_songs_direct(group->indices, group->count, group->name, selected);
-            *out_playlist = paths;
-            *out_count = group->count;
-            *out_index = selected;
-            return true;
+            if (loaded == count && selected >= 0) {
+                set_player_source_group_songs_direct(entries, count, current.tags.album, selected);
+                free_group_song_entries(entries, count);
+                *out_playlist = paths;
+                *out_count = count;
+                *out_index = selected;
+                return true;
+            }
+            free_group_song_entries(entries, count);
+            for (int i = 0; i < count; i++) free(paths ? paths[i] : NULL);
+            free(paths);
         }
     }
 
-    if (song_index >= 0 && current_settings.last_source_kind == 1) {
-        int selected = -1;
-        char ** paths = malloc(sizeof(char *) * (size_t) all_songs_count);
-        for (int i = 0; i < all_songs_count; i++) {
-            int idx = all_songs_sort_order[i];
-            paths[i] = strdup(all_songs_paths[idx]);
-            if (idx == song_index) selected = i;
-        }
-        if (selected >= 0) {
-            set_player_source_all_songs(selected);
-            *out_playlist = paths;
-            *out_count = all_songs_count;
-            *out_index = selected;
+    if (indexed && current_settings.last_source_kind == 1) {
+        int64_t count64 = metadata_db_get_song_count();
+        int64_t selected64 = metadata_db_get_song_title_offset(current_settings.last_track);
+        if (count64 > 0 && count64 <= INT_MAX && selected64 >= 0 && selected64 < count64) {
+            *out_playlist = calloc((size_t) count64, sizeof(char *));
+            if (!*out_playlist) return false;
+            *out_count = (int) count64;
+            *out_index = (int) selected64;
+            resume_playlist_needs_lazy_order = true;
+            set_player_source_all_songs(*out_index);
             return true;
         }
-        for (int i = 0; i < all_songs_count; i++) free(paths[i]);
-        free(paths);
     }
 
     clear_player_source();
     return file_browser_build_playlist_for_path(current_settings.last_track, out_playlist, out_count, out_index);
+}
+
+static void install_saved_resume_playlist(char ** resume_playlist, int resume_count) {
+    free_playlist();
+    playlist = resume_playlist;
+    playlist_count = resume_count;
+    if (resume_playlist_needs_lazy_order) {
+        playlist_lazy_sort_order = malloc(sizeof(int) * (size_t) resume_count);
+        if (playlist_lazy_sort_order) {
+            for (int i = 0; i < resume_count; i++) playlist_lazy_sort_order[i] = i;
+        }
+    }
 }
 
 static void prepare_deferred_resume(int index, double start_seconds) {
@@ -17933,20 +18491,30 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #endif
     files_screen = build_files_screen();
     all_songs_screen = build_all_songs_screen();
-    sync_remote_control_library();
     artists_screen = build_artists_screen();
     albums_screen = build_albums_screen();
     album_artist_screen = build_album_artist_screen();
-    register_az_index(artists_screen, artists_list, artist_group_name_of, &artist_group_count);
-    register_az_index(albums_screen, albums_list, album_group_name_of, &album_group_count);
-    register_az_index(album_artist_screen, album_artist_list, album_artist_group_name_of, &album_artist_group_count);
-    register_az_index(all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count);
+    /* No eager ensure_library_arrays_loaded() call here on purpose --
+     * remote_control.c now queries metadata_db.c directly (its own
+     * METADATA_DB_GUARD) rather than needing a synced copy of the library,
+     * so there's nothing left that needs the arrays loaded at boot just
+     * because Remote Control is enabled. The four screens above start
+     * empty and get populated lazily the first time a real UI entry point
+     * (a tile tap, etc.) calls ensure_library_arrays_loaded() -- exactly
+     * the boot-cost-avoidance this whole rework exists for. */
+    register_az_index(artists_screen, artists_list, METADATA_DB_AZ_ARTIST);
+    register_az_index(albums_screen, albums_list, METADATA_DB_AZ_ALBUM);
+    register_az_index(album_artist_screen, album_artist_list, METADATA_DB_AZ_ALBUM_ARTIST);
+    register_az_index(all_songs_screen, all_songs_list, METADATA_DB_AZ_ALL_SONGS);
 
-    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, artist_group_name_of, &artist_group_count, false);
-    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, album_group_name_of, &album_group_count, false);
+    register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, artist_group_name_of, &artist_group_count, false,
+                     true, METADATA_DB_AZ_ARTIST, artists_fetch_page);
+    register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, album_group_name_of, &album_group_count, false,
+                     true, METADATA_DB_AZ_ALBUM, albums_fetch_page);
     register_search(SEARCH_BINDING_ALBUM_ARTIST, album_artist_screen, album_artist_list, album_artist_group_name_of,
-                     &album_artist_group_count, false);
-    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count, false);
+                     &album_artist_group_count, false, true, METADATA_DB_AZ_ALBUM_ARTIST, album_artists_fetch_page);
+    register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, all_songs_sorted_name_of, &all_songs_count, false,
+                     true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 
     /* Files' search-results overlay: a compact-list widget layered on top
      * of file_browser.c's own folder-browsing UI (already built by
@@ -17971,7 +18539,8 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * own -- needs the same explicit gesture-bubble treatment. */
     lv_obj_add_flag(files_search_list, LV_OBJ_FLAG_GESTURE_BUBBLE);
     enable_gesture_bubble_recursive(files_search_list);
-    register_search(SEARCH_BINDING_FILES, files_screen, files_search_list, all_songs_sorted_name_of, &all_songs_count, true);
+    register_search(SEARCH_BINDING_FILES, files_screen, files_search_list, all_songs_sorted_name_of, &all_songs_count, true,
+                     true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 
     playlists_screen = build_playlists_screen();
     group_songs_screen = build_group_songs_screen();
@@ -18003,8 +18572,25 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
         lv_obj_add_event_cb(albums_row, subsonic_menu_albums_row_cb, LV_EVENT_CLICKED, NULL);
     }
 
-    subsonic_artists_screen = build_subsonic_list_screen("Artists", &subsonic_artists_title_label, &subsonic_artists_list);
-    subsonic_albums_screen = build_subsonic_list_screen("Albums", &subsonic_albums_title_label, &subsonic_albums_list);
+    /* Artists/Albums, unlike the rest of this file's ~25 build_subsonic_
+     * list_screen() screens, can genuinely scale with library size --
+     * getArtists.view has no size cap and getAlbumList2.view's own "every
+     * album" browse returns up to 500 (see subsonic_client.c) -- so these
+     * two use the same virtualized compact_list build_all_songs_screen()/
+     * build_artists_screen()/etc. already do, not the plain flex list every
+     * other (inherently small/bounded) settings/browse screen in this file
+     * shares. Built empty (item_count 0); populated later via compact_list_
+     * set_items() once a real fetch actually completes (poll_subsonic_
+     * connect()/poll_subsonic_browse()), same lazy-population shape as the
+     * local library screens. enable_now_playing is false for both -- a
+     * Subsonic artist/album row has no local playlist_index to highlight
+     * against. */
+    subsonic_artists_screen = build_compact_list_screen("Artists", generic_back_cb, NULL, 0, subsonic_artist_row_click_cb,
+                                                          NULL, &subsonic_artists_list, &subsonic_artists_title_label,
+                                                          LIST_ROW_WIDTH_WIDE, false, lv_color_black());
+    subsonic_albums_screen = build_compact_list_screen("Albums", generic_back_cb, NULL, 0, subsonic_album_row_click_cb,
+                                                         NULL, &subsonic_albums_list, &subsonic_albums_title_label,
+                                                         LIST_ROW_WIDTH_WIDE, false, lv_color_black());
     subsonic_songs_screen = build_subsonic_list_screen("Songs", &subsonic_songs_title_label, &subsonic_songs_list);
     subsonic_playlists_screen = build_subsonic_list_screen("Playlists", &subsonic_playlists_title_label, &subsonic_playlists_list);
 
@@ -18047,22 +18633,19 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 
     /* Same live search as Artists/Albums/Album Artist/All Songs (see the
      * search_binding_t infra above), extended to Subsonic's own Artists and
-     * Albums lists -- these are non-virtualized build_subsonic_list_screen()
-     * flex lists (populate_indexed_list()'s one-object-per-row shape), not
-     * the virtualized compact_list_widget the other bindings assume, hence
-     * flex_click_cb: search_apply_filter()/search_close() detect it and
-     * repopulate via populate_indexed_list_from_items() instead of
-     * compact_list_set_items(). No A-Z index -- same reasoning as Files
-     * (search-only), and unlike Files this isn't even alphabetically sorted
-     * (server order). Registered once here only -- unlike the local-library
-     * bindings, these screens are never rebuilt (no equivalent of a library
-     * rescan), so there's no second registration site to mirror this at. */
+     * Albums lists -- now virtualized compact_lists too (see their own
+     * build_compact_list_screen() comment above), so search_apply_filter()
+     * repopulates them via compact_list_set_items() same as every other
+     * binding, no special-casing needed here anymore. No A-Z index -- same
+     * reasoning as Files (search-only), and unlike Files this isn't even
+     * alphabetically sorted (server order). Registered once here only --
+     * unlike the local-library bindings, these screens are never rebuilt (no
+     * equivalent of a library rescan), so there's no second registration
+     * site to mirror this at. */
     register_search(SEARCH_BINDING_SUBSONIC_ARTISTS, subsonic_artists_screen, subsonic_artists_list, subsonic_artist_label_of,
-                     &subsonic_artists_count, false);
-    search_bindings[SEARCH_BINDING_SUBSONIC_ARTISTS].flex_click_cb = subsonic_artist_row_click_cb;
+                     &subsonic_artists_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
     register_search(SEARCH_BINDING_SUBSONIC_ALBUMS, subsonic_albums_screen, subsonic_albums_list, subsonic_album_label_of,
-                     &subsonic_albums_count, false);
-    search_bindings[SEARCH_BINDING_SUBSONIC_ALBUMS].flex_click_cb = subsonic_album_row_click_cb;
+                     &subsonic_albums_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
     wifi_screen = build_wifi_screen();
     wifi_info_screen = build_wifi_info_screen();
     wifi_dns_screen = build_wifi_dns_screen();
@@ -18306,9 +18889,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
             char ** resume_playlist;
             int resume_count, resume_index;
             if (build_saved_resume_playlist(&resume_playlist, &resume_count, &resume_index)) {
-                free_playlist();
-                playlist = resume_playlist;
-                playlist_count = resume_count;
+                install_saved_resume_playlist(resume_playlist, resume_count);
                 /* play_track_at_from() itself nav_push()es player_screen on top
                  * of the seeded root, so a back-swipe from the resumed player
                  * correctly lands back on the home screen. */
@@ -18328,9 +18909,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
         char ** resume_playlist;
         int resume_count, resume_index;
         if (build_saved_resume_playlist(&resume_playlist, &resume_count, &resume_index)) {
-            free_playlist();
-            playlist = resume_playlist;
-            playlist_count = resume_count;
+            install_saved_resume_playlist(resume_playlist, resume_count);
             if (current_settings.resume_mode == 2) {
                 /* Do not open ALSA at all until the user presses Play.  On
                  * a headphone-less boot, start-then-pause could lose the

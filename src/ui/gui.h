@@ -2,6 +2,7 @@
 #define GUI_H
 
 #include "lvgl/lvgl.h"
+#include "metadata_db.h" /* song_row_t/group_row_t, reused as-is by the gui_plugin_library_* declarations below */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -156,6 +157,59 @@ char ** gui_plugin_get_artist_albums(const char * artist, int * out_count);
 char ** gui_plugin_get_album_tracks(const char * artist, const char * album, int * out_count);
 char ** gui_plugin_get_next_album_tracks(const char * artist, const char * current_album, int * out_count);
 void gui_plugin_free_string_array(char ** array, int count);
+
+/* ---- Paged/cursor library access for plugin.library_* -- unlike the
+ * get_artist_albums()/get_album_tracks() block above (already scoped to one
+ * artist/album, never a library-wide dump), these route straight through
+ * metadata_db.c's own METADATA_DB_GUARD-protected paged queries -- the same
+ * functions remote_control.c's HTTP API uses -- rather than gui.c's lazily-
+ * loaded, whole-library-resident all_songs_paths/all_song_tags/artist_
+ * groups/album_groups/album_artist_groups arrays. A plugin asking for
+ * "songs 500-600" or one artist's page of
+ * albums never costs more than that page, regardless of library size, and
+ * never forces ensure_library_arrays_loaded()'s one-time whole-library load
+ * just because a plugin touched the library first. GUI_PLUGIN_LIBRARY_MAX_
+ * PAGE caps every *_rows out-buffer a caller must provide, and every limit
+ * argument below -- a plugin can't force an unbounded allocation by passing
+ * a huge limit. get_songs()/get_song()/search() rows carry a stable id
+ * (song_row_t.id, metadata_db.c's own rowid-based identity) a plugin can
+ * hand back to get_song() or to play_list()-style paths later; get_artists()/
+ * get_albums() rows carry a representative first_song_id for the same
+ * reason remote_control.c's own group JSON does (e.g. cover art). ---- */
+#define GUI_PLUGIN_LIBRARY_MAX_PAGE 200
+
+int64_t gui_plugin_library_song_count(void);
+
+/* query/artist/album_artist/album each optional (NULL or "" skips that
+ * filter) -- query is a title/artist substring match, the other three are
+ * exact (case-insensitive). out_total, if non-NULL, receives the total
+ * match count (for a plugin's own "page N of M" UI) via one extra COUNT(*)
+ * query -- pass NULL to skip it if the caller doesn't need it. Returns the
+ * number of rows written into out_rows (a caller-owned buffer of at least
+ * min(limit, GUI_PLUGIN_LIBRARY_MAX_PAGE) entries); fewer than requested
+ * (including 0) means this was the last page. */
+int gui_plugin_library_get_songs(const char * query, const char * artist, const char * album_artist,
+                                  const char * album, int offset, int limit, song_row_t * out_rows,
+                                  int64_t * out_total);
+
+/* Title/artist substring search, capped at GUI_PLUGIN_LIBRARY_MAX_PAGE --
+ * no offset (see metadata_db_search_songs()'s own comment: always replace-
+ * not-append the caller's previous result set, same convention this app's
+ * own on-device search already follows). */
+int gui_plugin_library_search(const char * query, int limit, song_row_t * out_rows);
+
+bool gui_plugin_library_get_song(int64_t id, song_row_t * out_row);
+
+/* offset/limit here are a plain slice over metadata_db_get_groups_page()'s
+ * own keyset-paginated result (fetched internally up to offset+limit,
+ * capped at a much higher ceiling than the per-call page size -- see
+ * GUI_PLUGIN_LIBRARY_GROUP_FETCH_CEILING in gui.c) -- simpler for a plugin
+ * author than a keyset cursor, and a real library's distinct artist/album
+ * count is small enough that this costs nothing extra in practice.
+ * artist_filter (albums only) restricts to one artist or album_artist's
+ * own albums, same as remote_control.c's GET /api/library/albums?artist=. */
+int gui_plugin_library_get_artists(int offset, int limit, group_row_t * out_rows);
+int gui_plugin_library_get_albums(int offset, int limit, const char * artist_filter, group_row_t * out_rows);
 
 /* ---- Bridges for plugin.get_now_playing()/set_interval()/clear_interval()/
  * show_text_input() -- see plugin_manager.h's own comments on the Lua-facing

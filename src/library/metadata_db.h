@@ -2,6 +2,7 @@
 #define METADATA_DB_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* On-disk cache of every scanned song's title/artist/album/album_artist/
@@ -22,24 +23,21 @@ typedef struct {
 } cached_tags_t;
 
 /* Opens (creating and migrating the schema if needed) the on-disk cache at
- * its fixed path (/usr/data on target, ./ on host -- same convention as
- * settings.c). Safe to call more than once; a no-op if already open. */
+ * its fixed path (the SD-card root on target, ./ on host). Safe to call
+ * more than once; a no-op if already open. */
 void metadata_db_open(void);
 void metadata_db_close(void);
 
-/* Starts a scan pass. Rows touched during the pass are stamped with a new
- * persistent scan generation. Writes are committed in small batches, so RAM
+/* Starts a scan pass, writing directly against the SD-resident db (same as
+ * Rockbox's own tagcache) -- see metadata_db.c's own comment on this
+ * function for why an intermediate /usr/data-scratch-copy design was tried
+ * and reverted. Rows touched during the pass are stamped with a new
+ * persistent scan generation; writes are committed in small batches, so RAM
  * and rollback-journal growth remain bounded instead of scaling with the
- * library. metadata_db_end_update() prunes rows from older generations.
- *
- * On target, if /usr/data (internal storage) has room, the whole pass runs
- * against a scratch copy there instead of writing directly to the SD-
- * resident db -- see metadata_db.c's own comment on the SD-card corruption
- * incident this avoids. Transparent to every other function in this header;
- * metadata_db_end_update() publishes a verified result back onto the SD
- * card; metadata_db_abort_update() discards a scratch pass and retains the
- * last known-good SD database. Falls back to scanning the SD-resident file
- * directly if there isn't room, same as before this existed. */
+ * library, and generation stamping keeps a checkpointed partial pass
+ * harmless (a crash or abandoned scan just leaves a mixture of old/new
+ * generations for the next full pass to supersede). metadata_db_end_update()
+ * prunes rows from older generations only after a complete pass. */
 void metadata_db_begin_update(void);
 
 /* Looks up `path`, marking it as seen for this pass either way. Returns
@@ -59,15 +57,188 @@ void metadata_db_end_update(void);
  * remain valid; the next complete pass advances the scan generation. */
 void metadata_db_abort_update(void);
 
-/* Enumerates every cached row as-is, without touching the filesystem or
- * verifying mtime/size against anything live -- for gui_init()'s boot-time
- * library load (see its own comment), which needs to match the stock
- * player's own boot behavior (load the db, don't rescan) rather than
- * walking the whole music root and re-reading every file's tags before the
- * first frame can render. *out_paths and *out_tags are freshly malloc'd
- * parallel arrays the caller owns (including each out_paths[i] string);
- * both are set to NULL and *out_count to 0 if the cache is empty or
- * unopened -- not an error, just nothing cached yet. */
+/* ---- Bounded, paged access to the media table -- Rockbox-style: SQLite is
+ * the index, nothing beyond the rows a caller actually asks for is ever
+ * materialized. Replaces the old "load every song into one big array"
+ * boot-time model for the paged/on-demand queries below -- metadata_db_
+ * load_all() itself is NOT unused, though: gui.c's own ensure_library_
+ * arrays_loaded() still calls it as a deliberate lazy-fallback full load
+ * (see that function's own doc comment there, and metadata_db_load_all()'s
+ * own comment here, for why). `id` in every row below is the song's SQLite rowid -- this table
+ * has no WITHOUT ROWID clause, so every row already has one; DELETE never
+ * renumbers a surviving row's rowid (confirmed: the generation-based prune
+ * in metadata_db_end_update() is a plain DELETE), so it stays stable across
+ * every rescan. Only a VACUUM can renumber rowids, and this app never calls
+ * one in normal operation. ---- */
+
+typedef struct {
+    int64_t id;
+    char path[600]; /* same bound as this file's other on-disk path buffers, e.g. stock_import_row_t */
+    cached_tags_t tags;
+} song_row_t;
+
+typedef struct {
+    char name[128];
+    int song_count;
+    int64_t first_song_id; /* one representative song, e.g. for cover art -- not a full song_row_t, callers query that separately if needed */
+    /* Only populated by metadata_db_get_albums_page_filtered() below (empty
+     * string from metadata_db_get_groups_page(), whose ARTIST/ALBUM_ARTIST
+     * kinds have no second identity component) -- see that function's own
+     * comment on why an album's real identity is (album, album_artist), not
+     * album name alone. */
+    char album_artist[128];
+} group_row_t;
+
+int64_t metadata_db_get_song_count(void);
+
+/* Distinct artist / album_artist / album counts -- for the group screens'
+ * own paging math (total row count) without materializing the groups
+ * themselves. */
+void metadata_db_get_group_counts(int * out_artist_count, int * out_album_artist_count, int * out_album_count);
+
+/* Keyset-paginated page of songs ordered by title. First page: pass
+ * after_title = NULL, after_id = 0. Next page: pass the last row's own
+ * title/id from the previous call. Returns the number of rows written into
+ * out_rows (a caller-owned buffer of at least max_rows entries) -- less
+ * than max_rows (including 0) means this was the last page. */
+int metadata_db_get_songs_page(const char * after_title, int64_t after_id, int max_rows, song_row_t * out_rows);
+
+/* Offset-paginated page of distinct values of the named column, ordered
+ * alphabetically (COLLATE NOCASE) -- ARTIST/ALBUM_ARTIST kinds only in
+ * practice (every real caller wants "all albums" grouped by the *pair*
+ * (album, album_artist) instead, which is what metadata_db_get_albums_
+ * page_filtered() below does -- ALBUM here would just group by album name
+ * alone, merging different artists' same-titled albums, so nothing calls
+ * it that way). Returns the number of rows written into out_rows (a
+ * caller-owned buffer of at least max_rows entries) -- fewer than max_rows
+ * (including 0) means this was the last page. */
+typedef enum { METADATA_DB_GROUP_ARTIST, METADATA_DB_GROUP_ALBUM_ARTIST, METADATA_DB_GROUP_ALBUM } metadata_db_group_kind_t;
+int metadata_db_get_groups_page(metadata_db_group_kind_t kind, int offset, int max_rows, group_row_t * out_rows);
+
+/* Every song credited to one artist, across all their albums -- Artist ->
+ * (their own songs) drill-down. Caller-owned out_rows buffer; returns the
+ * number of rows written, capped at max_rows (if a real artist somehow has
+ * more songs than max_rows, load_from_cache_only()'s own boot totals
+ * already bound how large this can plausibly get -- see its own comment). */
+int metadata_db_get_artist_songs(const char * artist, int offset, song_row_t * out_rows, int max_rows);
+
+/* Every song in one album -- keyed by (album, album_artist) together, not
+ * album name alone, so two different artists' same-titled albums ("Greatest
+ * Hits", a self-titled album) don't collide. */
+int metadata_db_get_album_songs(const char * album, const char * album_artist, int offset, song_row_t * out_rows,
+                                 int max_rows);
+
+bool metadata_db_get_song_by_id(int64_t id, song_row_t * out_row);
+bool metadata_db_get_song_by_path(const char * path, song_row_t * out_row);
+int64_t metadata_db_get_song_title_offset(const char * path);
+int64_t metadata_db_get_group_offset(metadata_db_group_kind_t kind, const char * name, const char * album_artist);
+
+/* 27-entry (A-Z, then '#') table of "display offset of the first entry at
+ * or after this letter", matching gui.c's own build_az_jump_table()'s
+ * "jump forward to nearest match" semantics but computed via indexed
+ * boundary COUNT(*) queries instead of a linear scan -- out_table[i] for
+ * i in 0..25 is a letter's offset (-1 if nothing sorts at/after it);
+ * out_table[26] is 0 if any row sorts before 'A' (digits/symbols), else -1.
+ * kind selects which of the four top-level library screens' own ORDER BY
+ * to match: ARTIST/ALBUM_ARTIST/ALBUM as in metadata_db_get_groups_page()/
+ * metadata_db_get_albums_page_filtered() (offsets are into that GROUPED
+ * list), or METADATA_DB_AZ_ALL_SONGS for the ungrouped All Songs screen's
+ * own title-ordered list. */
+typedef enum {
+    METADATA_DB_AZ_ARTIST,
+    METADATA_DB_AZ_ALBUM_ARTIST,
+    METADATA_DB_AZ_ALBUM,
+    METADATA_DB_AZ_ALL_SONGS
+} metadata_db_az_kind_t;
+void metadata_db_get_az_table(metadata_db_az_kind_t kind, int out_table[27]);
+
+typedef struct {
+    char label[128];
+    int offset; /* position in the same unfiltered sequence metadata_db_get_groups_page()/
+                 * get_albums_page_filtered()/get_songs_filtered_page() themselves page
+                 * through for this kind -- a clicked hit means the same thing as an
+                 * ordinary unfiltered row tap at that offset. */
+} metadata_db_search_hit_t;
+
+/* Case-insensitive substring search (matching gui.c's own former in-memory
+ * search_matches() semantics -- plain substring, not a raw LIKE pattern, so
+ * the needle's own '%'/'_'/'\' are escaped first) against the column each
+ * screen's own paged display leads its ORDER BY with, capped at max_rows
+ * results (same bounded-search-cache convention as metadata_db_search_
+ * songs()'s own cap) and returned in that same alphabetical order. An empty
+ * needle always returns 0 (gui.c's search shows nothing until you've
+ * actually typed something, not the unfiltered list). METADATA_DB_AZ_ALL_
+ * SONGS matches against the raw title column only, not the basename
+ * fallback metadata_db_song_display_title() shows for an untagged file (no
+ * embedded title) -- same accepted divergence class as metadata_db_get_az_
+ * table()'s own Unicode-ordering caveat, not worth a second query pass for
+ * what's normally a small minority of a library. */
+int metadata_db_search_names(metadata_db_az_kind_t kind, const char * needle, int max_rows,
+                              metadata_db_search_hit_t * out_hits);
+
+/* row->tags.title verbatim, or the file's own basename (with extension) if
+ * title is empty (no embedded title tag) -- matches gui.c's own
+ * song_display_title_of() fallback for the local on-device list screens,
+ * so every song_row_t consumer (remote_control.c, plugin.library_*) shows
+ * the same thing for an untagged file instead of a blank title. */
+void metadata_db_song_display_title(const song_row_t * row, char * out, size_t out_size);
+
+/* Title/artist substring search (case-insensitive), most relevant match
+ * order left to SQLite's own title-then-artist ORDER BY -- capped at
+ * max_rows, always replace-not-append the caller's previous result set
+ * (see this app's own bounded-search-cache convention). */
+int metadata_db_search_songs(const char * query, song_row_t * out_rows, int max_rows);
+
+/* remote_control.c's GET /api/library: query (title/artist substring) and
+ * the three exact-match filters (artist/album_artist/album) are each
+ * independently optional -- NULL or "" skips that condition. Offset-based
+ * (not keyset) since a remote HTTP client passes an arbitrary offset it
+ * doesn't control the shape of, same paging contract that endpoint already
+ * had against remote_control.c's own now-removed in-memory copy. Query the
+ * count first (metadata_db_count_songs_filtered()) for the response's own
+ * "total" field, then the page. */
+int64_t metadata_db_count_songs_filtered(const char * query, const char * artist_filter,
+                                          const char * album_artist_filter, const char * album_filter);
+int metadata_db_get_songs_filtered_page(const char * query, const char * artist_filter,
+                                         const char * album_artist_filter, const char * album_filter, int offset,
+                                         int max_rows, song_row_t * out_rows);
+
+/* Albums grouped and filtered by artist OR album_artist matching one name
+ * -- remote_control.c's GET /api/library/albums?artist=X, gui.c's own
+ * Albums screen (unfiltered). filter may be NULL/"" for every album,
+ * unfiltered. Real bug caught in review: an earlier version of this
+ * grouped by album name alone, so two different artists' same-titled
+ * albums ("Greatest Hits", a self-titled album, a "Various Artists"
+ * compilation reissued under different album_artist tags) silently merged
+ * into one row -- disagreeing with metadata_db_get_group_counts()'s own
+ * album count (which already correctly counted distinct (album,
+ * album_artist) pairs) and combining unrelated albums' song counts/cover
+ * art. Groups by the pair now, matching get_group_counts(); out_rows[i].
+ * album_artist carries the second half of that identity (empty from every
+ * other group-returning function here, which have no such ambiguity) --
+ * needed by metadata_db_get_album_songs() below to fetch the right
+ * album's songs, not just a same-named one. Offset-paginated (not
+ * keyset) -- no real caller here ever continued a keyset cursor anyway
+ * (every existing call passed after_name/NULL, i.e. "just the first
+ * page"), and offset is what a virtualized UI list actually needs
+ * (arbitrary scroll-driven jumps, not just "next page"). */
+int metadata_db_get_albums_page_filtered(const char * artist_or_album_artist_filter, int offset, int max_rows,
+                                          group_row_t * out_rows);
+
+/* Exact Artist/Album-Artist drill-down variants. Unlike the legacy remote
+ * helper above, these filter only the requested tag column. */
+int64_t metadata_db_count_albums_for_group(metadata_db_group_kind_t kind, const char * name);
+int metadata_db_get_albums_for_group(metadata_db_group_kind_t kind, const char * name, int offset, int max_rows,
+                                      group_row_t * out_rows);
+
+/* Deliberate full-library load, for the handful of consumers not yet
+ * converted to the paged/on-demand queries above (gui.c's own
+ * ensure_library_arrays_loaded(), called lazily on first actual need --
+ * never from the boot path). See metadata_db.c's own comment on this
+ * function for why it still exists rather than being deleted outright.
+ * *out_paths and *out_tags are freshly malloc'd parallel arrays the caller
+ * owns (including each out_paths[i] string); both are set to NULL and
+ * *out_count to 0 if the cache is empty or unopened. */
 void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * out_count);
 
 /* Persistent book cache -- the "Books" row in gui.c's Books menu reads from

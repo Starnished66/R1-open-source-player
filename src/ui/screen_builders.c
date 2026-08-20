@@ -700,8 +700,19 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
  * objects cost this whole scheme exists to avoid. */
 #define COMPACT_LIST_POOL_SIZE 20
 
+/* Paged mode -- see compact_list_set_paged_provider()'s own doc comment
+ * (screen_builders.h, also where compact_list_fetch_page_cb_t/COMPACT_LIST_
+ * LABEL_MAX are declared). One cached page comfortably covers the visible
+ * pool plus generous overscan without re-fetching on every single-row
+ * scroll -- matches the original DB-load scoping doc's own "64-128 records
+ * per cached page" recommendation. Labels are copied here (fixed-size
+ * buffers, not pointers) since a paged fetch's source rows (song_row_t/
+ * group_row_t) are only ever short-lived stack values -- there is no
+ * long-lived backing array to point into the way eager mode's items[] can. */
+#define COMPACT_LIST_PAGE_CACHE_SIZE 128
+
 typedef struct {
-    compact_list_item_t * items; /* owned copy -- see build_compact_list_screen()'s own doc comment */
+    compact_list_item_t * items; /* owned copy -- see build_compact_list_screen()'s own doc comment. Eager mode only (fetch_page == NULL); untouched/stale in paged mode. */
     int item_count;
     compact_list_click_cb_t on_click;
     compact_list_click_cb_t on_long_press; /* NULL for a list with no long-press action (e.g. Artists/Albums name rows) */
@@ -720,6 +731,17 @@ typedef struct {
     lv_obj_t * spacer; /* repositioned by compact_list_set_items() when item_count changes */
     lv_obj_t * now_playing_bar; /* NULL if this list wasn't built with enable_now_playing -- see compact_list_set_now_playing() */
     int now_playing_index; /* -1 = nothing playing/matching in this list */
+
+    /* NULL fetch_page = eager mode (default, existing behavior above
+     * unchanged). Non-NULL = paged mode: item_count still holds the
+     * logical total (from compact_list_set_paged_provider()'s own
+     * total_count arg), but rows are fetched into cache_labels[] on demand
+     * as the list scrolls, never all materialized at once. */
+    compact_list_fetch_page_cb_t fetch_page;
+    void * provider_ctx;
+    int cache_start; /* logical offset of cache_labels[0]; -1 = cache empty/invalid, forces a fetch on next window update */
+    int cache_count; /* how many of cache_labels[] are valid (less than COMPACT_LIST_PAGE_CACHE_SIZE only at the tail of the list) */
+    char cache_labels[COMPACT_LIST_PAGE_CACHE_SIZE][COMPACT_LIST_LABEL_MAX];
 } compact_list_virtual_data_t;
 
 /* Bar width only -- height always matches LIST_ROW_HEIGHT (see
@@ -758,6 +780,33 @@ static void compact_list_row_long_press_cb(lv_event_t * e) {
     ctx->data->on_long_press(index);
 }
 
+/* Paged mode only -- refetches cache_labels[] from fetch_page() if the
+ * current cache doesn't already fully cover [first, first+POOL_SIZE).
+ * Centers the new cache page around `first` with generous overscan on both
+ * sides so a scroll continuing in the same direction doesn't immediately
+ * fall back out of the cached range and re-fetch again next frame. One
+ * fetch_page() call, not one per row -- COMPACT_LIST_PAGE_CACHE_SIZE rows
+ * at once. */
+static void compact_list_ensure_cache(compact_list_virtual_data_t * data, int first) {
+    int window_end = first + COMPACT_LIST_POOL_SIZE;
+    bool covered = data->cache_start >= 0 && first >= data->cache_start &&
+                    window_end <= data->cache_start + data->cache_count;
+    if (covered) return;
+
+    int fetch_start = first - (COMPACT_LIST_PAGE_CACHE_SIZE - COMPACT_LIST_POOL_SIZE) / 2;
+    if (fetch_start < 0) fetch_start = 0;
+    int max_start = data->item_count - COMPACT_LIST_PAGE_CACHE_SIZE;
+    if (max_start < 0) max_start = 0;
+    if (fetch_start > max_start) fetch_start = max_start;
+
+    int want = COMPACT_LIST_PAGE_CACHE_SIZE;
+    if (fetch_start + want > data->item_count) want = data->item_count - fetch_start;
+    if (want < 0) want = 0;
+
+    data->cache_count = want > 0 ? data->fetch_page(data->provider_ctx, fetch_start, want, data->cache_labels) : 0;
+    data->cache_start = fetch_start;
+}
+
 /* Repositions/relabels the row pool so it covers the range of items
  * actually scrolled into (or near) view -- called once up front to
  * populate the initial view, then again on every LV_EVENT_SCROLL. Cheap
@@ -765,7 +814,11 @@ static void compact_list_row_long_press_cb(lv_event_t * e) {
  * label-text-and-position updates is nothing like the cost of the
  * thousands of real LVGL objects this replaces, and the early return when
  * the window hasn't actually moved (the overwhelmingly common case between
- * scroll events on this device's touch sampling rate) skips even that. */
+ * scroll events on this device's touch sampling rate) skips even that --
+ * except in paged mode, where a stale cache (e.g. right after compact_
+ * list_set_paged_provider() refreshes the data with window_start reset to
+ * -1) must still be checked even if the visible window itself hasn't
+ * moved, so the cache check runs before that early return. */
 static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_data_t * data) {
     int32_t scroll_y = lv_obj_get_scroll_y(list);
     if (scroll_y < 0) scroll_y = 0;
@@ -774,6 +827,8 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
     int max_first = data->item_count - COMPACT_LIST_POOL_SIZE;
     if (max_first < 0) max_first = 0;
     if (first > max_first) first = max_first;
+
+    if (data->fetch_page) compact_list_ensure_cache(data, first);
 
     if (first == data->window_start) return;
     data->window_start = first;
@@ -787,7 +842,12 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
         }
         lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_y(row, COMPACT_LIST_TOP_PAD + index * COMPACT_LIST_ROW_STRIDE);
-        lv_label_set_text(row, data->items[index].label);
+        if (data->fetch_page) {
+            int cache_idx = index - data->cache_start;
+            lv_label_set_text(row, (cache_idx >= 0 && cache_idx < data->cache_count) ? data->cache_labels[cache_idx] : "");
+        } else {
+            lv_label_set_text(row, data->items[index].label);
+        }
     }
 }
 
@@ -839,6 +899,11 @@ void compact_list_set_now_playing(lv_obj_t * list, int item_index) {
 void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, int item_count) {
     compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
 
+    data->fetch_page = NULL; /* switch back to eager mode -- see this field's own doc comment */
+    data->provider_ctx = NULL;
+    data->cache_start = -1;
+    data->cache_count = 0;
+
     free(data->items);
     data->items = NULL;
     if (item_count > 0) {
@@ -854,6 +919,35 @@ void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, 
     /* A shorter result set than the previous scroll position would
      * otherwise leave the view showing blank space past the new (shorter)
      * scrollable range. */
+    lv_obj_scroll_to_y(list, 0, LV_ANIM_OFF);
+    compact_list_update_window(list, data);
+}
+
+/* Switches a list to (or refreshes) paged mode -- see this function's own
+ * declaration (screen_builders.h) for the full contract. Mirrors compact_
+ * list_set_items() above (same window_start reset / spacer resize / scroll-
+ * to-top / repaint shape), but points the list at a fetch_page() provider
+ * instead of copying a caller-owned items[] array -- rows are cached and
+ * fetched on demand from compact_list_update_window() as the list scrolls,
+ * never all materialized at once. Pass fetch_page == NULL to switch back to
+ * eager mode (the list then shows whatever compact_list_set_items() last
+ * gave it, defaulting to empty if that was never called). */
+void compact_list_set_paged_provider(lv_obj_t * list, compact_list_fetch_page_cb_t fetch_page, void * ctx,
+                                      int total_count) {
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+
+    data->fetch_page = fetch_page;
+    data->provider_ctx = ctx;
+    data->cache_start = -1; /* forces compact_list_ensure_cache() to actually fetch on next window update */
+    data->cache_count = 0;
+    /* NULL fetch_page: leave item_count as whatever compact_list_set_items()
+     * last set (0 if never called) -- don't clobber it here. */
+    if (fetch_page) data->item_count = total_count;
+    data->window_start = -1; /* force compact_list_update_window() below to actually repaint */
+
+    int32_t total_height = COMPACT_LIST_TOP_PAD + data->item_count * COMPACT_LIST_ROW_STRIDE;
+    lv_obj_set_pos(data->spacer, 0, total_height > 0 ? total_height - 1 : 0);
+
     lv_obj_scroll_to_y(list, 0, LV_ANIM_OFF);
     compact_list_update_window(list, data);
 }
@@ -890,6 +984,10 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
         data->items = malloc(sizeof(compact_list_item_t) * (size_t) item_count);
         memcpy(data->items, items, sizeof(compact_list_item_t) * (size_t) item_count);
     }
+    data->fetch_page = NULL;
+    data->provider_ctx = NULL;
+    data->cache_start = -1;
+    data->cache_count = 0;
 
     /* Rows are pinned at x=0 by default (LIST_ROW_WIDTH already leaves an
      * unused right-side margin at this screen's width) -- only centered
@@ -977,13 +1075,14 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
 lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                       const compact_list_item_t * items, int item_count,
                                       compact_list_click_cb_t on_click, compact_list_click_cb_t on_long_press,
-                                      lv_obj_t ** out_list, int32_t row_width, bool enable_now_playing,
-                                      lv_color_t now_playing_color) {
+                                      lv_obj_t ** out_list, lv_obj_t ** out_title_label, int32_t row_width,
+                                      bool enable_now_playing, lv_color_t now_playing_color) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     if (back_btn_cb) build_back_button(scr, back_btn_cb);
-    build_title(scr, title);
+    lv_obj_t * title_label = build_title(scr, title);
+    if (out_title_label) *out_title_label = title_label;
 
     lv_obj_t * list = build_compact_list_widget(scr, items, item_count, on_click, on_long_press, row_width,
                                                  enable_now_playing, now_playing_color);

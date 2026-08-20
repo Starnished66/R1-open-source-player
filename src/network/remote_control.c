@@ -4,7 +4,6 @@
 #include "playlist_files.h"
 
 #include <arpa/inet.h>
-#include <ctype.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -52,9 +51,9 @@ static int request_seek_seconds = 0;
 static bool request_has_volume = false;
 static int request_volume_percent = 0;
 static bool request_has_play_index = false;
-static int request_play_index = 0;
+static int64_t request_play_index = 0;
 static bool request_has_queue_index = false;
-static int request_queue_index = 0;
+static int64_t request_queue_index = 0;
 static bool request_has_queue_remove = false;
 static int request_queue_remove_offset = 0;
 static bool request_queue_clear = false;
@@ -77,22 +76,25 @@ static char request_play_artist_filter[128] = "";
 static char request_play_album_artist_filter[128] = "";
 static char request_play_album_filter[128] = "";
 
-/* This server's own copy of gui.c's library title/artist strings, kept in
- * the exact same index order (see remote_control_sync_library() in the
- * header). Guarded by status_mutex. */
-static char ** library_titles = NULL;
-static char ** library_artists = NULL;
-static char ** library_album_artists = NULL;
-static char ** library_albums = NULL;
-static char ** library_paths = NULL;
-static int library_count = 0;
-static int * queue_library_indices = NULL;
-static int queue_library_count = 0;
-static char * cached_artists_json = NULL;
-static char * cached_album_artists_json = NULL;
-static char * cached_albums_json = NULL;
-
-static void refresh_group_json_cache(void);
+/* Real-device rework: this used to be a second, independent full-library
+ * copy (five strdup'd-per-song arrays plus pre-rendered artist/album JSON
+ * caches, all rebuilt from scratch on every gui.c-side library change),
+ * specifically because the HTTP handler thread can't safely touch gui.c's
+ * own all_songs_paths/all_song_tags (not mutex-protected, assumed UI-thread-
+ * only). For a library sized in the tens of thousands that duplication was
+ * its own multi-megabyte cost, unconditionally paid the moment Remote
+ * Control was turned on -- the same failure shape as this whole session's
+ * boot-time incident, just reached through a different door. Every function
+ * below now queries metadata_db.c directly instead: METADATA_DB_GUARD
+ * already provides the exact thread-safety boundary this used to build by
+ * hand, so there's no duplication left to keep in sync, and every response
+ * reflects the live database instead of whatever gui.c last pushed. Only
+ * the queue itself still needs a small array here -- it's server-side
+ * state (what's queued), not a library copy -- storing each entry's song
+ * id (metadata_db.c's own stable rowid-based identity, not an array
+ * position) instead of an index into a now-nonexistent local copy. */
+static int64_t * queue_song_ids = NULL;
+static int queue_song_id_count = 0;
 
 static bool running = false;
 static int listen_fd = -1;
@@ -169,7 +171,7 @@ bool remote_control_consume_volume(int * out_percent) {
     return result;
 }
 
-bool remote_control_consume_queue_index(int * out_index) {
+bool remote_control_consume_queue_index(int64_t * out_index) {
     pthread_mutex_lock(&status_mutex);
     bool result = request_has_queue_index;
     if (result) {
@@ -200,22 +202,27 @@ bool remote_control_consume_queue_clear(void) {
 }
 
 void remote_control_sync_queue(const char * const * paths, int count) {
-    pthread_mutex_lock(&status_mutex);
-    free(queue_library_indices);
-    queue_library_indices = count > 0 ? malloc(sizeof(int) * (size_t) count) : NULL;
-    queue_library_count = 0;
+    /* metadata_db_get_song_by_path() takes its own METADATA_DB_GUARD lock
+     * internally -- must not be called while already holding status_mutex,
+     * or a UI-thread caller blocked on METADATA_DB_GUARD (e.g. a rescan)
+     * while THIS thread holds status_mutex waiting on that same lock could
+     * deadlock against gui.c's own status_mutex use elsewhere. Resolved
+     * before, not during, the locked section below. */
+    int64_t * ids = count > 0 ? malloc(sizeof(int64_t) * (size_t) count) : NULL;
+    int id_count = 0;
     for (int i = 0; i < count; i++) {
-        for (int j = 0; j < library_count; j++) {
-            if (strcmp(paths[i], library_paths[j]) == 0) {
-                queue_library_indices[queue_library_count++] = j;
-                break;
-            }
-        }
+        song_row_t row;
+        if (metadata_db_get_song_by_path(paths[i], &row)) ids[id_count++] = row.id;
     }
+
+    pthread_mutex_lock(&status_mutex);
+    free(queue_song_ids);
+    queue_song_ids = ids;
+    queue_song_id_count = id_count;
     pthread_mutex_unlock(&status_mutex);
 }
 
-bool remote_control_consume_play_index(int * out_index, char * out_playlist, size_t playlist_size,
+bool remote_control_consume_play_index(int64_t * out_index, char * out_playlist, size_t playlist_size,
                                         char * out_artist, size_t artist_size, char * out_album_artist,
                                         size_t album_artist_size, char * out_album, size_t album_size) {
     pthread_mutex_lock(&status_mutex);
@@ -230,60 +237,6 @@ bool remote_control_consume_play_index(int * out_index, char * out_playlist, siz
     }
     pthread_mutex_unlock(&status_mutex);
     return result;
-}
-
-static void free_library(void) {
-    for (int i = 0; i < library_count; i++) {
-        free(library_titles[i]);
-        free(library_artists[i]);
-        free(library_album_artists[i]);
-        free(library_albums[i]);
-        free(library_paths[i]);
-    }
-    free(library_titles);
-    free(library_artists);
-    free(library_album_artists);
-    free(library_albums);
-    free(library_paths);
-    library_titles = NULL;
-    library_artists = NULL;
-    library_album_artists = NULL;
-    library_albums = NULL;
-    library_paths = NULL;
-    library_count = 0;
-    free(cached_artists_json);
-    free(cached_album_artists_json);
-    free(cached_albums_json);
-    cached_artists_json = NULL;
-    cached_album_artists_json = NULL;
-    cached_albums_json = NULL;
-    free(queue_library_indices);
-    queue_library_indices = NULL;
-    queue_library_count = 0;
-}
-
-void remote_control_sync_library(const char * const * titles, const char * const * artists,
-                                  const char * const * album_artists, const char * const * albums,
-                                  const char * const * paths, int count) {
-    pthread_mutex_lock(&status_mutex);
-    free_library();
-    if (count > 0) {
-        library_titles = malloc(sizeof(char *) * (size_t) count);
-        library_artists = malloc(sizeof(char *) * (size_t) count);
-        library_album_artists = malloc(sizeof(char *) * (size_t) count);
-        library_albums = malloc(sizeof(char *) * (size_t) count);
-        library_paths = malloc(sizeof(char *) * (size_t) count);
-        for (int i = 0; i < count; i++) {
-            library_titles[i] = strdup(titles[i] ? titles[i] : "");
-            library_artists[i] = strdup(artists[i] && artists[i][0] ? artists[i] : "Unknown Artist");
-            library_album_artists[i] = strdup(album_artists[i] && album_artists[i][0] ? album_artists[i] : "Unknown Artist");
-            library_albums[i] = strdup(albums[i] && albums[i][0] ? albums[i] : "Unknown Album");
-            library_paths[i] = strdup(paths[i] ? paths[i] : "");
-        }
-        library_count = count;
-    }
-    refresh_group_json_cache();
-    pthread_mutex_unlock(&status_mutex);
 }
 
 /* Minimal JSON string escaping -- handles quote, backslash, and control
@@ -338,19 +291,6 @@ static bool json_builder_appendf(json_builder_t * b, const char * format, ...) {
     return true;
 }
 
-/* Hand-rolled rather than strcasestr(), which isn't confirmed available on
- * this project's musl target libc. */
-static bool contains_case_insensitive(const char * haystack, const char * needle) {
-    if (!*needle) return true;
-    size_t needle_len = strlen(needle);
-    for (const char * h = haystack; *h; h++) {
-        size_t i = 0;
-        while (i < needle_len && h[i] && tolower((unsigned char) h[i]) == tolower((unsigned char) needle[i])) i++;
-        if (i == needle_len) return true;
-    }
-    return false;
-}
-
 /* Decodes application/x-www-form-urlencoded query-string bytes (%XX and
  * "+" for space; both %20 and "+" are accepted for space). Bounded,
  * truncates rather than overflowing if the decoded result wouldn't fit. */
@@ -402,187 +342,114 @@ static bool query_param_str(const char * path, const char * key, char * out, siz
  * response size. */
 #define LIBRARY_JSON_MAX_LIMIT 100
 
-/* artist_filter/album_artist_filter/album_filter, each if non-empty,
- * restrict to songs whose corresponding tag exactly matches
- * (case-insensitive); query is still a substring match against
- * title/artist on top of whichever exact filters are active. */
-static bool library_song_matches(int i, const char * query, const char * artist_filter,
-                                  const char * album_artist_filter, const char * album_filter) {
-    if (artist_filter[0] != '\0' && strcasecmp(library_artists[i], artist_filter) != 0) return false;
-    if (album_artist_filter[0] != '\0' && strcasecmp(library_album_artists[i], album_artist_filter) != 0) return false;
-    if (album_filter[0] != '\0' && strcasecmp(library_albums[i], album_filter) != 0) return false;
-    if (query[0] == '\0') return true;
-    return contains_case_insensitive(library_titles[i], query) || contains_case_insensitive(library_artists[i], query);
-}
-
 static void build_library_json(const char * query, const char * artist_filter, const char * album_artist_filter,
                                 const char * album_filter, int offset, int limit, char * out, size_t out_size) {
     if (limit <= 0 || limit > LIBRARY_JSON_MAX_LIMIT) limit = LIBRARY_JSON_MAX_LIMIT;
     if (offset < 0) offset = 0;
 
-    pthread_mutex_lock(&status_mutex);
-
-    int total_matches = 0;
-    for (int i = 0; i < library_count; i++) {
-        if (library_song_matches(i, query, artist_filter, album_artist_filter, album_filter)) total_matches++;
-    }
+    /* Both queries go straight to SQLite (metadata_db_count_songs_filtered()/
+     * get_songs_filtered_page(), each METADATA_DB_GUARD-protected on their
+     * own) -- no status_mutex needed here at all, since nothing in this
+     * function touches status_mutex-guarded state anymore. "index" in the
+     * response is the song's stable rowid-based id (metadata_db.c's own
+     * song_row_t.id), not a position in any array -- every other endpoint
+     * that accepts an "index" back (playback/play, playback/queue,
+     * playlists) resolves it the same way, via metadata_db_get_song_by_id(). */
+    int64_t total_matches = metadata_db_count_songs_filtered(query, artist_filter, album_artist_filter, album_filter);
 
     json_builder_t json;
     json_builder_init(&json, out, out_size);
-    json_builder_appendf(&json, "{\"total\":%d,\"songs\":[", total_matches);
+    json_builder_appendf(&json, "{\"total\":%lld,\"songs\":[", (long long) total_matches);
 
-    int matched_so_far = 0;
-    int emitted = 0;
-    for (int i = 0; i < library_count && emitted < limit && !json.truncated &&
-                    json.capacity - json.length >= 700; i++) {
-        if (!library_song_matches(i, query, artist_filter, album_artist_filter, album_filter)) continue;
-        if (matched_so_far++ < offset) continue;
-
-        char title_esc[300] = {0}, artist_esc[300] = {0};
-        json_escape_append(title_esc, sizeof(title_esc), library_titles[i]);
-        json_escape_append(artist_esc, sizeof(artist_esc), library_artists[i]);
-        if (!json_builder_appendf(&json, "%s{\"index\":%d,\"title\":\"%s\",\"artist\":\"%s\"}",
-                                  emitted > 0 ? "," : "", i, title_esc, artist_esc)) break;
-        emitted++;
+    /* Real-device crash, caught live: song_row_t is ~1.25KB (a 600-byte
+     * path plus a 640-byte cached_tags_t) -- a LIBRARY_JSON_MAX_LIMIT-
+     * element array of those is ~125KB, which overflowed listener_thread_
+     * func()'s default pthread stack the first time a client actually hit
+     * this endpoint (SIGSEGV in a stack-adjacent LVGL function, not this
+     * one -- classic stack-smash symptom). Heap-allocated instead, matching
+     * every other multi-row buffer in this file (build_playlists_json's
+     * malloc(65536), the GROUPS_JSON_MAX group arrays below). */
+    song_row_t * rows = malloc(sizeof(song_row_t) * LIBRARY_JSON_MAX_LIMIT);
+    int n = rows ? metadata_db_get_songs_filtered_page(query, artist_filter, album_artist_filter, album_filter,
+                                                         offset, limit, rows)
+                 : 0;
+    for (int i = 0; i < n && !json.truncated; i++) {
+        char display_title[128], title_esc[300] = {0}, artist_esc[300] = {0};
+        metadata_db_song_display_title(&rows[i], display_title, sizeof(display_title));
+        json_escape_append(title_esc, sizeof(title_esc), display_title);
+        json_escape_append(artist_esc, sizeof(artist_esc), rows[i].tags.artist);
+        if (!json_builder_appendf(&json, "%s{\"index\":%lld,\"title\":\"%s\",\"artist\":\"%s\"}", i > 0 ? "," : "",
+                                  (long long) rows[i].id, title_esc, artist_esc)) break;
     }
     json.truncated = false; /* a rejected item left the prior JSON intact */
     json_builder_appendf(&json, "]}");
-
-    pthread_mutex_unlock(&status_mutex);
+    free(rows);
 }
 
 /* Shared by /api/library/artists, /api/library/album_artists and
- * /api/library/albums below -- counts distinct values of a per-song string
- * field (optionally restricted to songs matching one or two exact filters
- * first, for the albums case), sorts by name, and emits {"name":...,
- * "count":...,"index":...} triples under the given JSON array key. index is
- * the library index of the first song seen with that value -- only the
- * albums list actually uses it (as a representative song to pull /api/art
- * thumbnail bytes from for that album), but it's cheap to always compute so
- * artists/album_artists just carry an unused field rather than needing a
- * second, near-identical function. O(n^2) in the number of distinct values
- * (linear scan to find-or-add each song's value) -- fine for a personal
- * library's artist/album count, and these endpoints are only hit when the
- * phone UI opens a browse view, not every tick. Recomputed per request
- * rather than mirroring gui.c's own artist_groups/album_groups/
- * album_artist_groups -- avoids a second cross-file array whose indexing
- * would have to be kept in sync with remote_control_sync_library()'s own
- * ordering guarantee, for a value (just names + counts + one index) cheap
- * enough to derive fresh every time. Caller already holds status_mutex. */
-#define NAME_COUNTS_JSON_MAX 2000
-
-static void build_name_counts_json(const char * const * field, const char * filter_a, const char * filter_b,
-                                    const char * json_key, char * out, size_t out_size) {
-    char (*names)[128] = malloc(sizeof(char[128]) * NAME_COUNTS_JSON_MAX);
-    int * counts = malloc(sizeof(int) * NAME_COUNTS_JSON_MAX);
-    int * first_index = malloc(sizeof(int) * NAME_COUNTS_JSON_MAX);
-    int distinct = 0;
-
-    for (int i = 0; i < library_count; i++) {
-        if (filter_a && filter_a[0] != '\0' && strcasecmp(library_artists[i], filter_a) != 0 &&
-            strcasecmp(library_album_artists[i], filter_a) != 0) {
-            continue;
-        }
-        if (filter_b && filter_b[0] != '\0' && strcasecmp(library_albums[i], filter_b) != 0) continue;
-
-        const char * name = field[i];
-        int found = -1;
-        for (int j = 0; j < distinct; j++) {
-            if (strcasecmp(names[j], name) == 0) { found = j; break; }
-        }
-        if (found >= 0) {
-            counts[found]++;
-        } else if (distinct < NAME_COUNTS_JSON_MAX) {
-            snprintf(names[distinct], sizeof(names[0]), "%s", name);
-            counts[distinct] = 1;
-            first_index[distinct] = i;
-            distinct++;
-        }
-    }
-
-    /* Simple insertion sort by name -- distinct is bounded by
-     * NAME_COUNTS_JSON_MAX, not library_count, so this stays cheap even for
-     * a large library. */
-    for (int i = 1; i < distinct; i++) {
-        char key_name[128];
-        snprintf(key_name, sizeof(key_name), "%s", names[i]);
-        int key_count = counts[i];
-        int key_index = first_index[i];
-        int j = i - 1;
-        while (j >= 0 && strcasecmp(names[j], key_name) > 0) {
-            memcpy(names[j + 1], names[j], sizeof(names[0]));
-            counts[j + 1] = counts[j];
-            first_index[j + 1] = first_index[j];
-            j--;
-        }
-        snprintf(names[j + 1], sizeof(names[0]), "%s", key_name);
-        counts[j + 1] = key_count;
-        first_index[j + 1] = key_index;
-    }
-
+ * /api/library/albums below -- renders an already-computed group_row_t[]
+ * (metadata_db_get_groups_page()/get_albums_page_filtered(), each already
+ * sorted by name and already the exact "distinct value + count" shape this
+ * used to compute by hand from a raw per-song array) into the same
+ * {"name":...,"count":...,"index":...} JSON shape those endpoints have
+ * always returned. index is a representative song id for that group (only
+ * the albums list's phone UI actually uses it, to pull /api/art thumbnail
+ * bytes for that album) -- metadata_db.c's own group_row_t.first_song_id,
+ * a rowid-based song id like every other "index" this file emits now, not
+ * a position into anything. */
+static void render_name_counts_json(const group_row_t * groups, int count, const char * json_key, char * out,
+                                     size_t out_size) {
     json_builder_t json;
     json_builder_init(&json, out, out_size);
     json_builder_appendf(&json, "{\"%s\":[", json_key);
-    for (int i = 0; i < distinct && !json.truncated && json.capacity - json.length >= 512; i++) {
-        char name_esc[300] = {0};
-        json_escape_append(name_esc, sizeof(name_esc), names[i]);
-        if (!json_builder_appendf(&json, "%s{\"name\":\"%s\",\"count\":%d,\"index\":%d}",
-                                  i > 0 ? "," : "", name_esc, counts[i], first_index[i])) break;
+    for (int i = 0; i < count && !json.truncated && json.capacity - json.length >= 512; i++) {
+        char name_esc[300] = {0}, album_artist_esc[300] = {0};
+        json_escape_append(name_esc, sizeof(name_esc), groups[i].name);
+        /* Empty for artists/album_artists (group_row_t.album_artist is only
+         * ever populated by metadata_db_get_albums_page_filtered() -- see
+         * its own comment) -- harmless extra field for those, and lets the
+         * albums list disambiguate two different artists' same-titled
+         * albums, which now show as separate rows (see that same comment
+         * on why merging them was a real bug). */
+        json_escape_append(album_artist_esc, sizeof(album_artist_esc), groups[i].album_artist);
+        if (!json_builder_appendf(&json, "%s{\"name\":\"%s\",\"count\":%d,\"index\":%lld,\"album_artist\":\"%s\"}",
+                                  i > 0 ? "," : "", name_esc, groups[i].song_count,
+                                  (long long) groups[i].first_song_id, album_artist_esc)) break;
     }
     json.truncated = false;
     json_builder_appendf(&json, "]}");
-
-    free(names);
-    free(counts);
-    free(first_index);
 }
 
-/* These three unfiltered groupings change only when the synchronized
- * library changes. Building them here turns repeated phone browsing from
- * an O(songs x distinct names) request into a bounded string copy. Filtered
- * album drill-downs remain request-specific and are derived below. */
-static void refresh_group_json_cache(void) {
-    const size_t capacity = 65536;
-    if (library_count <= 0) return;
-    cached_artists_json = malloc(capacity);
-    cached_album_artists_json = malloc(capacity);
-    cached_albums_json = malloc(capacity);
-    if (cached_artists_json)
-        build_name_counts_json((const char * const *) library_artists, NULL, NULL, "artists",
-                               cached_artists_json, capacity);
-    if (cached_album_artists_json)
-        build_name_counts_json((const char * const *) library_album_artists, NULL, NULL, "artists",
-                               cached_album_artists_json, capacity);
-    if (cached_albums_json)
-        build_name_counts_json((const char * const *) library_albums, NULL, NULL, "albums",
-                               cached_albums_json, capacity);
-}
+/* Same bound the old in-memory version used (NAME_COUNTS_JSON_MAX) -- a
+ * personal library's distinct artist/album count is nowhere near this, kept
+ * as a sanity ceiling rather than a real limit. */
+#define GROUPS_JSON_MAX 2000
 
 static void build_artists_json(char * out, size_t out_size) {
-    pthread_mutex_lock(&status_mutex);
-    if (cached_artists_json) snprintf(out, out_size, "%s", cached_artists_json);
-    else snprintf(out, out_size, "{\"artists\":[]}");
-    pthread_mutex_unlock(&status_mutex);
+    group_row_t * groups = malloc(sizeof(group_row_t) * GROUPS_JSON_MAX);
+    int n = groups ? metadata_db_get_groups_page(METADATA_DB_GROUP_ARTIST, 0, GROUPS_JSON_MAX, groups) : 0;
+    render_name_counts_json(groups, n, "artists", out, out_size);
+    free(groups);
 }
 
 static void build_album_artists_json(char * out, size_t out_size) {
-    pthread_mutex_lock(&status_mutex);
-    if (cached_album_artists_json) snprintf(out, out_size, "%s", cached_album_artists_json);
-    else snprintf(out, out_size, "{\"artists\":[]}");
-    pthread_mutex_unlock(&status_mutex);
+    group_row_t * groups = malloc(sizeof(group_row_t) * GROUPS_JSON_MAX);
+    int n = groups ? metadata_db_get_groups_page(METADATA_DB_GROUP_ALBUM_ARTIST, 0, GROUPS_JSON_MAX, groups) : 0;
+    render_name_counts_json(groups, n, "artists", out, out_size);
+    free(groups);
 }
 
 /* artist_filter and album_artist_filter are mutually exclusive in practice
  * (GET /api/library/albums passes exactly one, matching the browse path the
- * request came from), but build_name_counts_json() treats filter_a as
- * "matches artist OR album_artist" so either works the same way. */
+ * request came from), but metadata_db_get_albums_page_filtered() treats
+ * either as "matches artist OR album_artist" so either works the same way. */
 static void build_albums_json(const char * artist_filter, const char * album_artist_filter, char * out,
                                size_t out_size) {
     const char * filter = artist_filter[0] != '\0' ? artist_filter : album_artist_filter;
-    pthread_mutex_lock(&status_mutex);
-    if (filter[0] == '\0' && cached_albums_json) snprintf(out, out_size, "%s", cached_albums_json);
-    else build_name_counts_json((const char * const *) library_albums, filter, NULL, "albums", out, out_size);
-    pthread_mutex_unlock(&status_mutex);
+    group_row_t * groups = malloc(sizeof(group_row_t) * GROUPS_JSON_MAX);
+    int n = groups ? metadata_db_get_albums_page_filtered(filter, 0, GROUPS_JSON_MAX, groups) : 0;
+    render_name_counts_json(groups, n, "albums", out, out_size);
+    free(groups);
 }
 
 static void build_status_json(char * out, size_t out_size) {
@@ -640,20 +507,36 @@ static void build_playlists_json(char * out, size_t out_size) {
 }
 
 static void build_queue_json(char * out, size_t out_size) {
+    /* queue_song_ids is only ever written by remote_control_sync_queue()
+     * under status_mutex, so read it under the same lock -- but resolve
+     * each id via metadata_db_get_song_by_id() (its own METADATA_DB_GUARD)
+     * only after taking a private snapshot, never while status_mutex is
+     * still held, for the same lock-ordering reason documented on
+     * remote_control_sync_queue() itself. */
     pthread_mutex_lock(&status_mutex);
+    int count = queue_song_id_count;
+    int64_t * ids = NULL;
+    if (count > 0) {
+        ids = malloc(sizeof(int64_t) * (size_t) count);
+        if (ids) memcpy(ids, queue_song_ids, sizeof(int64_t) * (size_t) count);
+        else count = 0;
+    }
+    pthread_mutex_unlock(&status_mutex);
+
     size_t len = (size_t) snprintf(out, out_size, "{\"songs\":[");
-    for (int i = 0; i < queue_library_count && len + 768 < out_size; i++) {
-        int idx = queue_library_indices[i];
-        if (idx < 0 || idx >= library_count) continue;
-        char title[512] = {0}, artist[512] = {0};
-        json_escape_append(title, sizeof(title), library_titles[idx]);
-        json_escape_append(artist, sizeof(artist), library_artists[idx]);
+    for (int i = 0; i < count && len + 768 < out_size; i++) {
+        song_row_t row;
+        if (!metadata_db_get_song_by_id(ids[i], &row)) continue;
+        char display_title[128], title[512] = {0}, artist[512] = {0};
+        metadata_db_song_display_title(&row, display_title, sizeof(display_title));
+        json_escape_append(title, sizeof(title), display_title);
+        json_escape_append(artist, sizeof(artist), row.tags.artist);
         len += (size_t) snprintf(out + len, out_size - len,
-                                "%s{\"offset\":%d,\"index\":%d,\"title\":\"%s\",\"artist\":\"%s\"}",
-                                i ? "," : "", i, idx, title, artist);
+                                "%s{\"offset\":%d,\"index\":%lld,\"title\":\"%s\",\"artist\":\"%s\"}",
+                                i ? "," : "", i, (long long) row.id, title, artist);
     }
     snprintf(out + len, out_size - len, "]}");
-    pthread_mutex_unlock(&status_mutex);
+    free(ids);
 }
 
 /* Now Playing page -- polls /api/status every second, transport buttons
@@ -1004,6 +887,31 @@ static bool query_param_int(const char * path, const char * key, int * out_value
     return false;
 }
 
+/* Same as query_param_int() above but for "index" query params, which are
+ * now song ids (metadata_db.c's rowid-based song_row_t.id, an int64_t) --
+ * a plain int would silently truncate a valid id on the rare library where
+ * rowids have climbed past INT_MAX. */
+static bool query_param_int64(const char * path, const char * key, int64_t * out_value) {
+    const char * q = strchr(path, '?');
+    if (!q) return false;
+    q++;
+
+    size_t key_len = strlen(key);
+    while (*q) {
+        if (strncmp(q, key, key_len) == 0 && q[key_len] == '=') {
+            char * end;
+            long long v = strtoll(q + key_len + 1, &end, 10);
+            if (end == q + key_len + 1) return false; /* no digits at all */
+            *out_value = (int64_t) v;
+            return true;
+        }
+        const char * amp = strchr(q, '&');
+        if (!amp) break;
+        q = amp + 1;
+    }
+    return false;
+}
+
 /* GET /api/art (optionally ?index=N) -- serves a song's embedded cover art
  * as a raw image, re-extracted straight from the file on disk via the same
  * metadata_read() gui.c itself uses for cover_decode.c's LVGL image (not a
@@ -1015,18 +923,21 @@ static bool query_param_int(const char * path, const char * key, int * out_value
  * playlist mutation's own file I/O in handle_connection() -- the lookup of
  * which path to read is done under a short status_mutex lock, then
  * unlocked before the (slower) metadata_read() call. Resolves the path
- * either from a library index or (no index given) status_path, the
- * currently-playing file remote_control_notify_status() was last called
- * with. */
-static bool resolve_art_source_path(bool have_index, int index, char * out_path, size_t out_path_size) {
+ * either from a song id (metadata_db_get_song_by_id(), its own
+ * METADATA_DB_GUARD, taken without status_mutex held at all since this
+ * branch touches no status_mutex-guarded state) or (no index given)
+ * status_path, the currently-playing file remote_control_notify_status()
+ * was last called with. */
+static bool resolve_art_source_path(bool have_index, int64_t index, char * out_path, size_t out_path_size) {
+    if (have_index) {
+        song_row_t row;
+        if (!metadata_db_get_song_by_id(index, &row)) return false;
+        snprintf(out_path, out_path_size, "%s", row.path);
+        return true;
+    }
     pthread_mutex_lock(&status_mutex);
     bool ok = false;
-    if (have_index) {
-        if (index >= 0 && index < library_count) {
-            snprintf(out_path, out_path_size, "%s", library_paths[index]);
-            ok = true;
-        }
-    } else if (status_path[0] != '\0') {
+    if (status_path[0] != '\0') {
         snprintf(out_path, out_path_size, "%s", status_path);
         ok = true;
     }
@@ -1059,10 +970,10 @@ static const char * sniff_image_content_type(const uint8_t * data, uint32_t size
 }
 
 static void handle_art_request(int cfd, const char * path) {
-    int index = -1;
-    bool have_index = query_param_int(path, "index", &index);
+    int64_t index = -1;
+    bool have_index = query_param_int64(path, "index", &index);
 
-    char song_path[512] = {0};
+    char song_path[600] = {0};
     if (!resolve_art_source_path(have_index, index, song_path, sizeof(song_path))) {
         send_response(cfd, "404 Not Found", "text/plain", "No track");
         return;
@@ -1205,26 +1116,26 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
         return;
     }
 
-    pthread_mutex_lock(&status_mutex);
+    /* Playlist files store paths, not ids -- metadata_db_get_song_by_path()
+     * resolves each one against the DB (its own METADATA_DB_GUARD); no
+     * status_mutex needed since nothing here touches status_mutex-guarded
+     * state. */
     size_t len = 0;
     len += (size_t) snprintf(json + len, 65536 - len, "{\"songs\":[");
     int emitted = 0;
     for (int i = 0; i < count && len + 256 < 65536; i++) {
-        int found = -1;
-        for (int j = 0; j < library_count; j++) {
-            if (strcmp(library_paths[j], paths[i]) == 0) { found = j; break; }
-        }
-        if (found < 0) continue;
+        song_row_t row;
+        if (!metadata_db_get_song_by_path(paths[i], &row)) continue;
 
-        char title_esc[300] = {0}, artist_esc[300] = {0};
-        json_escape_append(title_esc, sizeof(title_esc), library_titles[found]);
-        json_escape_append(artist_esc, sizeof(artist_esc), library_artists[found]);
-        len += (size_t) snprintf(json + len, 65536 - len, "%s{\"index\":%d,\"title\":\"%s\",\"artist\":\"%s\"}",
-                                  emitted > 0 ? "," : "", found, title_esc, artist_esc);
+        char display_title[128], title_esc[300] = {0}, artist_esc[300] = {0};
+        metadata_db_song_display_title(&row, display_title, sizeof(display_title));
+        json_escape_append(title_esc, sizeof(title_esc), display_title);
+        json_escape_append(artist_esc, sizeof(artist_esc), row.tags.artist);
+        len += (size_t) snprintf(json + len, 65536 - len, "%s{\"index\":%lld,\"title\":\"%s\",\"artist\":\"%s\"}",
+                                  emitted > 0 ? "," : "", (long long) row.id, title_esc, artist_esc);
         emitted++;
     }
     snprintf(json + len, 65536 - len, "]}");
-    pthread_mutex_unlock(&status_mutex);
 
     send_response(cfd, "200 OK", "application/json", json);
 
@@ -1360,19 +1271,18 @@ static void handle_connection(int cfd) {
          * Only the small "which song, by index" lookup needs the lock. */
         if (strcmp(path_only, "/api/playlists") == 0 || strcmp(path_only, "/api/playlists/add") == 0) {
             char name[128] = {0};
-            int index = -1;
+            int64_t index = -1;
             bool have_name = query_param_str(path, "name", name, sizeof(name));
-            bool have_index = query_param_int(path, "index", &index);
+            bool have_index = query_param_int64(path, "index", &index);
 
-            char song_path[512] = {0};
+            char song_path[600] = {0};
             bool have_song = false;
             if (have_index) {
-                pthread_mutex_lock(&status_mutex);
-                if (index >= 0 && index < library_count) {
-                    snprintf(song_path, sizeof(song_path), "%s", library_paths[index]);
+                song_row_t row;
+                if (metadata_db_get_song_by_id(index, &row)) {
+                    snprintf(song_path, sizeof(song_path), "%s", row.path);
                     have_song = true;
                 }
-                pthread_mutex_unlock(&status_mutex);
             }
 
             if (!have_name || !playlist_name_is_safe(name) || !have_song) {
@@ -1421,8 +1331,8 @@ static void handle_connection(int cfd) {
                     ok = false;
                 }
             } else if (strcmp(path_only, "/api/playback/play") == 0) {
-                int index;
-                if (query_param_int(path, "index", &index) && index >= 0 && index < library_count) {
+                int64_t index;
+                if (query_param_int64(path, "index", &index) && index >= 0) {
                     request_has_play_index = true;
                     request_play_index = index;
 
@@ -1447,8 +1357,8 @@ static void handle_connection(int cfd) {
                     ok = false;
                 }
             } else if (strcmp(path_only, "/api/playback/queue") == 0) {
-                int index;
-                if (query_param_int(path, "index", &index) && index >= 0 && index < library_count) {
+                int64_t index;
+                if (query_param_int64(path, "index", &index) && index >= 0) {
                     request_has_queue_index = true;
                     request_queue_index = index;
                 } else {

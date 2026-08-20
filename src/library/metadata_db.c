@@ -1,7 +1,6 @@
 #include "metadata_db.h"
 
 #include <sqlite3.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,9 +8,6 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#include <dirent.h>
-#include <limits.h>
-#include <sys/statvfs.h>
 
 #ifdef HOST_BUILD
   #define METADATA_DB_PATH "./open_hiby_player_music.db"
@@ -69,11 +65,13 @@ static int update_ops_since_commit = 0;
 static bool update_failed = false;
 #define METADATA_DB_UPDATE_BATCH 128
 
-/* SQLite's serialized mode protects an individual sqlite3 handle, but it
- * cannot protect this module's handle/statement pointers while a scan swaps
- * them from the SD database to the /usr/data scratch copy and back. A
- * recursive module lock also covers metadata_db_open()'s warm-start import,
- * which calls metadata_db_put() from inside the already-locked open path. */
+/* SQLite's serialized mode protects an individual sqlite3 handle itself, but
+ * not this module's own plain-C globals above (the prepared statements,
+ * update_generation/update_ops_since_commit/update_failed) shared between
+ * the background rescan thread and the UI thread's own favorite/playlist/
+ * subsonic-server call sites -- a recursive module lock covers those. Also
+ * covers metadata_db_open()'s warm-start import, which calls
+ * metadata_db_put() from inside the already-locked open path. */
 static pthread_once_t metadata_db_mutex_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t metadata_db_mutex;
 
@@ -93,14 +91,6 @@ static void metadata_db_guard_release(metadata_db_guard_t * guard) {
     pthread_once(&metadata_db_mutex_once, metadata_db_mutex_init); \
     pthread_mutex_lock(&metadata_db_mutex); \
     metadata_db_guard_t metadata_db_guard __attribute__((cleanup(metadata_db_guard_release))) = { true }
-
-/* True for the duration of an update pass that's scanning into a scratch
- * copy on /usr/data rather than writing directly to the SD-resident db --
- * see metadata_db_begin_update()'s own comment. Always defined (not just
- * under #ifndef HOST_BUILD) since metadata_db_begin_update() resets it
- * unconditionally; only ever set true on target, where the scratch-copy
- * machinery actually exists. */
-static bool update_using_usr_data_scratch = false;
 
 /* NULL is a valid, harmless argument to sqlite3_finalize()/sqlite3_close()
  * -- used freely below instead of guarding every call. */
@@ -357,134 +347,6 @@ static bool music_root_is_mounted(void) {
     return parent_st.st_dev != root_st.st_dev;
 }
 
-/* Real-device incident: the SD card (FAT32, unjournaled) got its directory/
- * FAT-table structures corrupted after the device hung under memory
- * pressure mid-rescan and had to be power-cycled -- confirmed via a
- * subsequent `fdisk`/filesystem-level recovery off-device. metadata_db_get()/
- * put() checkpoint (COMMIT+BEGIN) every METADATA_DB_UPDATE_BATCH ops during
- * a rescan (see metadata_db_update_checkpoint_if_needed()), which bounds
- * SQLite's own rollback-journal growth but still means dozens of commits
- * landing directly on the FAT32-backed db file for a large library's whole
- * scan duration -- exactly the sustained-direct-SD-write pattern an unclean
- * shutdown mid-scan can corrupt. metadata_db_begin_update() below scans into
- * a scratch copy on /usr/data instead when there's room (see its own
- * comment), touching the SD card only twice: one read here, one bounded
- * copy-back at the end. This is the same OLD_METADATA_DB_PATH partition
- * that a giant single-transaction rescan once exhausted (see
- * METADATA_DB_PATH's own comment on why the db moved OFF /usr/data in the
- * first place) -- safe to use again now specifically because that
- * transaction is no longer unbounded, just this one scratch copy's
- * checkpointed growth. Removes every *.db file already there first (stale
- * pre-migration leftovers, or a previous scan's scratch copy that never got
- * cleaned up because the app was killed mid-scan) so free-space accounting
- * isn't skewed by debris this app itself is responsible for, and so nothing
- * else ever mistakes one of those for a real database. */
-static void remove_stray_usr_data_dbs(void) {
-    DIR * dir = opendir("/usr/data");
-    if (!dir) return;
-
-    struct dirent * de;
-    while ((de = readdir(dir)) != NULL) {
-        const char * ext = strrchr(de->d_name, '.');
-        if (!ext || strcmp(ext, ".db") != 0) continue;
-
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "/usr/data/%s", de->d_name);
-        remove(path);
-    }
-    closedir(dir);
-}
-
-/* needed_bytes should cover the scratch copy itself plus room for it to
- * grow (new rows added during the scan) -- callers pass roughly 2x the
- * current SD-resident db's size, which also covers checkpointing's bounded
- * rollback-journal overhead. f_frsize (not f_bsize) is the correct unit for
- * f_bavail per statvfs(3); falls back to f_bsize on the rare filesystem that
- * reports f_frsize as 0. */
-static bool usr_data_has_room_for_scan_copy(int64_t needed_bytes) {
-    struct statvfs vfs;
-    if (statvfs("/usr/data", &vfs) != 0) return false;
-    unsigned long block_size = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
-    int64_t free_bytes = (int64_t) vfs.f_bavail * (int64_t) block_size;
-    return free_bytes >= needed_bytes;
-}
-
-#define METADATA_DB_SCAN_TMP_PATH "/usr/data/.open_hiby_player_scan_tmp.db"
-#define METADATA_DB_COPYBACK_TMP_PATH "/data/mnt/sd_0/.open_hiby_player_music.db.tmp"
-#define METADATA_DB_SCAN_MIN_HEADROOM_BYTES (2 * 1024 * 1024)
-
-static bool usr_data_has_scan_headroom(void) {
-    return usr_data_has_room_for_scan_copy(METADATA_DB_SCAN_MIN_HEADROOM_BYTES);
-}
-
-static bool database_quick_check_ok(sqlite3 * handle) {
-    sqlite3_stmt * st = NULL;
-    bool ok = sqlite3_prepare_v2(handle, "PRAGMA quick_check;", -1, &st, NULL) == SQLITE_OK &&
-              sqlite3_step(st) == SQLITE_ROW &&
-              strcmp((const char *) sqlite3_column_text(st, 0), "ok") == 0;
-    sqlite3_finalize(st);
-    return ok;
-}
-
-/* Closes the scratch connection and reopens `db` against the real SD-
- * resident file. A successful end-update publishes the verified scratch
- * database; abort/failure paths discard it and retain the previous SD copy.
- * Publication copies to a .tmp name on the SD card first, then rename()s it
- * over the real path -- same filesystem (vfat), so that rename is atomic.
- * A crash/power-loss during the copy itself leaves stale .tmp debris on the
- * card but never touches METADATA_DB_PATH, so the previous, still-valid
- * scan result survives; only a crash during the (fast, local) rename call
- * itself could lose data, and that's the same irreducible risk any rename()-
- * based atomic replace carries. If the copy-back fails for any other reason
- * (SD card unmounted mid-scan, filled up, etc.) the old file is left alone
- * and this scan's results are lost -- strictly no worse than direct-to-SD
- * writing's own failure mode here, and better than it in every case where
- * the SD card was the thing that failed, since direct writing would have
- * been mid-mutation on the real file when that happened. */
-static void metadata_db_finish_update_scratch_if_needed(bool publish) {
-    if (!update_using_usr_data_scratch) return;
-    update_using_usr_data_scratch = false;
-
-    sqlite3_finalize(stmt_get);
-    sqlite3_finalize(stmt_put);
-    sqlite3_finalize(stmt_mark_seen);
-    stmt_get = stmt_put = stmt_mark_seen = NULL;
-    if (publish && !database_quick_check_ok(db)) publish = false;
-    sqlite3 * scratch_db = db;
-    int close_rc = sqlite3_close(scratch_db);
-    if (close_rc != SQLITE_OK) {
-        publish = false;
-        /* No module-owned statement remains and the module mutex excludes
-         * concurrent API calls. close_v2 is the defensive final release if
-         * SQLite nevertheless reports an unexpected outstanding object. */
-        sqlite3_close_v2(scratch_db);
-    }
-    db = NULL;
-
-    bool replaced = false;
-    if (publish && close_rc == SQLITE_OK && music_root_is_mounted() &&
-        copy_file(METADATA_DB_SCAN_TMP_PATH, METADATA_DB_COPYBACK_TMP_PATH)) {
-        replaced = rename(METADATA_DB_COPYBACK_TMP_PATH, METADATA_DB_PATH) == 0;
-        if (replaced) {
-            int dir_fd = open("/data/mnt/sd_0", O_RDONLY);
-            if (dir_fd >= 0) {
-                fsync(dir_fd); /* best-effort FAT directory-entry durability */
-                close(dir_fd);
-            }
-        }
-    }
-    if (!replaced) {
-        remove(METADATA_DB_COPYBACK_TMP_PATH);
-    }
-    remove(METADATA_DB_SCAN_TMP_PATH);
-
-    if (music_root_is_mounted() && sqlite3_open(METADATA_DB_PATH, &db) == SQLITE_OK) {
-        prepare_statements();
-    } else {
-        sqlite3_close(db);
-        db = NULL;
-    }
-}
 #endif
 
 void metadata_db_open(void) {
@@ -530,6 +392,40 @@ void metadata_db_open(void) {
      * standard way to make this idempotent. */
     sqlite3_exec(db, "ALTER TABLE media ADD COLUMN title TEXT NOT NULL DEFAULT '';", NULL, NULL, NULL);
     sqlite3_exec(db, "ALTER TABLE media ADD COLUMN scan_generation INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
+
+    /* Covering indexes for every paged browse order the metadata_db_get_*_page()
+     * functions below use -- CREATE INDEX IF NOT EXISTS is safe to run on
+     * every open, no migration flag needed. Real bug caught in review: an
+     * earlier version of each of these named `rowid` explicitly as a
+     * trailing column ("... COLLATE NOCASE, rowid)"), on the theory that
+     * this would let a keyset page's tiebreaker comparison be satisfied by
+     * the index alone -- SQLite rejects that outright ("no such column:
+     * rowid"), confirmed independently against this exact schema. Every one
+     * of these CREATE INDEX calls was silently failing (sqlite3_exec()'s
+     * return value was never checked), so the app has been running without
+     * any of these indexes the whole time, falling back to a full table
+     * scan + temporary sort for every title/artist/album/album_artist-
+     * ordered query -- invisible against this device's real ~2,200-song
+     * library, but exactly the cost this covering-index work exists to
+     * avoid at real scale. Fixed two ways: dropped the invalid trailing
+     * `rowid` column (unnecessary in the first place -- every index on a
+     * rowid table already carries rowid as an implicit final tiebreaker,
+     * per SQLite's own documented behavior), and added error logging so a
+     * future mistake here fails loudly instead of silently. */
+    const char * const index_sql[] = {
+        "CREATE INDEX IF NOT EXISTS idx_media_title ON media(title COLLATE NOCASE);",
+        "CREATE INDEX IF NOT EXISTS idx_media_artist ON media(artist COLLATE NOCASE, album COLLATE NOCASE);",
+        "CREATE INDEX IF NOT EXISTS idx_media_album ON media(album COLLATE NOCASE, album_artist COLLATE NOCASE);",
+        "CREATE INDEX IF NOT EXISTS idx_media_album_artist ON media(album_artist COLLATE NOCASE, album COLLATE NOCASE);",
+        "CREATE INDEX IF NOT EXISTS idx_media_generation ON media(scan_generation);",
+    };
+    for (size_t i = 0; i < sizeof(index_sql) / sizeof(index_sql[0]); i++) {
+        char * err = NULL;
+        if (sqlite3_exec(db, index_sql[i], NULL, NULL, &err) != SQLITE_OK) {
+            fprintf(stderr, "Warning: failed to create index (%s): %s\n", index_sql[i], err ? err : "unknown error");
+            sqlite3_free(err);
+        }
+    }
 
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS book (path TEXT PRIMARY KEY);", NULL, NULL, NULL);
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS book_favorite (path TEXT PRIMARY KEY);", NULL, NULL, NULL);
@@ -587,15 +483,6 @@ static void metadata_db_update_checkpoint_if_needed(void) {
     if (!db || update_generation == 0) return;
     if (++update_ops_since_commit < METADATA_DB_UPDATE_BATCH) return;
 
-#ifndef HOST_BUILD
-    if (update_using_usr_data_scratch && !usr_data_has_scan_headroom()) {
-        update_failed = true;
-        sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
-        update_ops_since_commit = 0;
-        return;
-    }
-#endif
-
     /* Bound rollback-journal/WAL growth. Scan-generation marking makes a
      * partially checkpointed scan safe: stale rows are not pruned until
      * metadata_db_end_update(), so a crash or abandoned scan merely leaves
@@ -607,60 +494,31 @@ static void metadata_db_update_checkpoint_if_needed(void) {
     update_ops_since_commit = 0;
 }
 
+/* Writes directly against the SD-resident `db` for the whole scan, same as
+ * Rockbox's own tagcache -- an earlier version of this function instead
+ * scanned into a scratch copy on /usr/data and copied the finished result
+ * back to the SD card in one shot at the end (metadata_db_end_update()),
+ * specifically to avoid sustained direct writes to this device's FAT32 SD
+ * card (see METADATA_DB_PATH's own comment on the corruption incident that
+ * motivated it). Real-device testing of that approach against a 32,000-song
+ * library found a worse failure: the end-of-scan verify-and-copy-back step
+ * (a PRAGMA quick_check plus a whole-file read+write+fsync of the ~15MB
+ * scratch database) itself starved the whole device of CPU/scheduling for
+ * long enough to look and behave like a hang -- confirmed live (a second
+ * concurrent ADB shell was itself unable to run even trivial commands) --
+ * which is a worse outcome than the sustained-small-writes risk it was
+ * meant to avoid. Reverted back to direct-to-SD: metadata_db_get()/put()'s
+ * own periodic checkpointing (metadata_db_update_checkpoint_if_needed(),
+ * every METADATA_DB_UPDATE_BATCH ops) already replaced the original bug's
+ * actual cause (one giant unbounded transaction) with small, frequent
+ * commits -- the same shape of write pattern Rockbox's own tagcache uses
+ * against real SD cards -- without ever needing to hold the whole database
+ * in memory or copy it wholesale. */
 void metadata_db_begin_update(void) {
     METADATA_DB_GUARD;
     if (!db) return;
 
-    update_using_usr_data_scratch = false;
     update_failed = false;
-#ifndef HOST_BUILD
-    /* See remove_stray_usr_data_dbs()'s own comment for the corruption
-     * incident this guards against. Cleans up first (unconditionally) so
-     * the space check right after isn't skewed by debris this app left
-     * behind, then only switches `db` over to the scratch copy if there's
-     * room -- falls through to scanning the SD-resident file directly
-     * (today's only behavior) otherwise, never a hard failure. */
-    remove_stray_usr_data_dbs();
-
-    struct stat sd_st;
-    if (stat(METADATA_DB_PATH, &sd_st) == 0) {
-        int64_t needed = (int64_t) sd_st.st_size * 2 + METADATA_DB_SCAN_MIN_HEADROOM_BYTES;
-        if (usr_data_has_room_for_scan_copy(needed)) {
-            /* Close the SD-resident connection before copying its file --
-             * avoids reading it through a second, independent fd while
-             * SQLite might still hold internal state (e.g. cached pages)
-             * against the first. */
-            sqlite3 * sd_db = db;
-            sqlite3_finalize(stmt_get);
-            sqlite3_finalize(stmt_put);
-            sqlite3_finalize(stmt_mark_seen);
-            stmt_get = stmt_put = stmt_mark_seen = NULL;
-            int close_rc = sqlite3_close(sd_db);
-            db = NULL;
-
-            if (close_rc != SQLITE_OK) {
-                /* Keep the still-live handle usable; never overwrite/leak it
-                 * merely because SQLite refused the close. With the module
-                 * lock this should be unreachable, but it is a safe fallback. */
-                db = sd_db;
-            } else if (copy_file(METADATA_DB_PATH, METADATA_DB_SCAN_TMP_PATH) &&
-                sqlite3_open(METADATA_DB_SCAN_TMP_PATH, &db) == SQLITE_OK) {
-                update_using_usr_data_scratch = true;
-            } else {
-                sqlite3_close(db);
-                db = NULL;
-                remove(METADATA_DB_SCAN_TMP_PATH);
-                if (sqlite3_open(METADATA_DB_PATH, &db) != SQLITE_OK) {
-                    sqlite3_close(db);
-                    db = NULL;
-                }
-            }
-            if (db) prepare_statements();
-        }
-    }
-
-    if (!db) return; /* only reachable if reopening METADATA_DB_PATH itself somehow failed just above -- stay defensive rather than prepare_v2() against a NULL handle below */
-#endif
 
     sqlite3_stmt * st = NULL;
     int64_t max_generation = 0;
@@ -745,10 +603,6 @@ void metadata_db_end_update(void) {
     if (sqlite3_exec(db, update_failed ? "ROLLBACK;" : "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) update_failed = true;
     update_generation = 0;
     update_ops_since_commit = 0;
-
-#ifndef HOST_BUILD
-    metadata_db_finish_update_scratch_if_needed(!update_failed);
-#endif
     update_failed = false;
 }
 
@@ -760,16 +614,709 @@ void metadata_db_abort_update(void) {
      * harmless. The next complete scan chooses a larger generation. */
     update_generation = 0;
     update_ops_since_commit = 0;
-
-#ifndef HOST_BUILD
-    /* The old SD database is still intact, so an interrupted scratch scan
-     * is safer to discard than publish. Direct-to-SD fallback retains its
-     * historical partial-generation behavior above. */
-    metadata_db_finish_update_scratch_if_needed(false);
-#endif
     update_failed = false;
 }
 
+int64_t metadata_db_get_song_count(void) {
+    METADATA_DB_GUARD;
+    if (!db) return 0;
+
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM media;", -1, &st, NULL) != SQLITE_OK) return 0;
+    int64_t count = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return count;
+}
+
+void metadata_db_get_group_counts(int * out_artist_count, int * out_album_artist_count, int * out_album_count) {
+    METADATA_DB_GUARD;
+    *out_artist_count = 0;
+    *out_album_artist_count = 0;
+    *out_album_count = 0;
+    if (!db) return;
+
+    /* Three independent scalar subqueries in one statement -- cheaper than
+     * three separate prepare/step/finalize round trips for what's ultimately
+     * three small COUNT(DISTINCT ...) scans against the same table. The
+     * album count's DISTINCT key is LOWER(album)||sep||LOWER(album_artist),
+     * not a COLLATE NOCASE suffix -- COLLATE binds to its one immediately
+     * preceding operand, not a whole `a || b` expression, so a trailing
+     * COLLATE NOCASE here would silently leave album's own case sensitive
+     * while only normalizing album_artist. LOWER() folds both sides before
+     * concatenation instead, sidestepping that entirely (and matches NOCASE's
+     * own ASCII-only case folding, so this stays consistent with
+     * metadata_db_get_groups_page()'s real GROUP BY ... COLLATE NOCASE). */
+    static const char * const query =
+        "SELECT (SELECT COUNT(DISTINCT artist COLLATE NOCASE) FROM media), "
+        "       (SELECT COUNT(DISTINCT album_artist COLLATE NOCASE) FROM media), "
+        "       (SELECT COUNT(DISTINCT LOWER(album) || '\x01' || LOWER(album_artist)) FROM media);";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        *out_artist_count = sqlite3_column_int(st, 0);
+        *out_album_artist_count = sqlite3_column_int(st, 1);
+        *out_album_count = sqlite3_column_int(st, 2);
+    }
+    sqlite3_finalize(st);
+}
+
+static int fill_song_rows(sqlite3_stmt * st, int id_col, int path_col, int title_col, int artist_col, int album_col,
+                           int album_artist_col, int genre_col, song_row_t * out_rows, int max_rows) {
+    int i = 0;
+    while (i < max_rows && sqlite3_step(st) == SQLITE_ROW) {
+        out_rows[i].id = sqlite3_column_int64(st, id_col);
+        snprintf(out_rows[i].path, sizeof(out_rows[i].path), "%s", (const char *) sqlite3_column_text(st, path_col));
+        snprintf(out_rows[i].tags.title, sizeof(out_rows[i].tags.title), "%s",
+                 (const char *) sqlite3_column_text(st, title_col));
+        snprintf(out_rows[i].tags.artist, sizeof(out_rows[i].tags.artist), "%s",
+                 (const char *) sqlite3_column_text(st, artist_col));
+        snprintf(out_rows[i].tags.album, sizeof(out_rows[i].tags.album), "%s",
+                 (const char *) sqlite3_column_text(st, album_col));
+        snprintf(out_rows[i].tags.album_artist, sizeof(out_rows[i].tags.album_artist), "%s",
+                 (const char *) sqlite3_column_text(st, album_artist_col));
+        snprintf(out_rows[i].tags.genre, sizeof(out_rows[i].tags.genre), "%s",
+                 (const char *) sqlite3_column_text(st, genre_col));
+        i++;
+    }
+    return i;
+}
+
+int metadata_db_get_songs_page(const char * after_title, int64_t after_id, int max_rows, song_row_t * out_rows) {
+    METADATA_DB_GUARD;
+    if (!db || max_rows <= 0) return 0;
+
+    sqlite3_stmt * st = NULL;
+    int count;
+    if (after_title) {
+        static const char * const query =
+            "SELECT rowid, path, title, artist, album, album_artist, genre FROM media "
+            "WHERE title COLLATE NOCASE > ? OR (title COLLATE NOCASE = ? AND rowid > ?) "
+            "ORDER BY title COLLATE NOCASE, rowid LIMIT ?;";
+        if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_text(st, 1, after_title, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, after_title, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 3, after_id);
+        sqlite3_bind_int(st, 4, max_rows);
+    } else {
+        static const char * const query =
+            "SELECT rowid, path, title, artist, album, album_artist, genre FROM media "
+            "ORDER BY title COLLATE NOCASE, rowid LIMIT ?;";
+        if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_int(st, 1, max_rows);
+    }
+    count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_rows, max_rows);
+    sqlite3_finalize(st);
+    return count;
+}
+
+static const char * group_kind_column(metadata_db_group_kind_t kind) {
+    switch (kind) {
+        case METADATA_DB_GROUP_ARTIST: return "artist";
+        case METADATA_DB_GROUP_ALBUM_ARTIST: return "album_artist";
+        case METADATA_DB_GROUP_ALBUM: return "album";
+    }
+    return "artist";
+}
+
+int metadata_db_get_groups_page(metadata_db_group_kind_t kind, int offset, int max_rows, group_row_t * out_rows) {
+    METADATA_DB_GUARD;
+    if (!db || max_rows <= 0) return 0;
+    if (offset < 0) offset = 0;
+
+    const char * col = group_kind_column(kind);
+    char query[512];
+    /* col comes only from group_kind_column()'s own fixed set above, never
+     * from external input -- safe to interpolate directly, same as this
+     * file's other internally-constant query fragments. */
+    snprintf(query, sizeof(query),
+              "SELECT %s, COUNT(*), MIN(rowid) FROM media "
+              "GROUP BY %s COLLATE NOCASE ORDER BY %s COLLATE NOCASE LIMIT ? OFFSET ?;",
+              col, col, col);
+
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, max_rows);
+    sqlite3_bind_int(st, 2, offset);
+
+    int i = 0;
+    while (i < max_rows && sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(out_rows[i].name, sizeof(out_rows[i].name), "%s", (const char *) sqlite3_column_text(st, 0));
+        out_rows[i].song_count = sqlite3_column_int(st, 1);
+        out_rows[i].first_song_id = sqlite3_column_int64(st, 2);
+        out_rows[i].album_artist[0] = '\0'; /* see this field's own comment (metadata_db.h) -- only ever meaningful from metadata_db_get_albums_page_filtered() */
+        i++;
+    }
+    sqlite3_finalize(st);
+    return i;
+}
+
+int metadata_db_get_artist_songs(const char * artist, int offset, song_row_t * out_rows, int max_rows) {
+    METADATA_DB_GUARD;
+    if (!db || max_rows <= 0) return 0;
+    if (offset < 0) offset = 0;
+
+    static const char * const query =
+        "SELECT rowid, path, title, artist, album, album_artist, genre FROM media "
+        "WHERE artist = ? COLLATE NOCASE "
+        "ORDER BY album COLLATE NOCASE, path COLLATE NOCASE LIMIT ? OFFSET ?;";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, artist, -1, SQLITE_STATIC);
+    sqlite3_bind_int(st, 2, max_rows);
+    sqlite3_bind_int(st, 3, offset);
+    int count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_rows, max_rows);
+    sqlite3_finalize(st);
+    return count;
+}
+
+int metadata_db_get_album_songs(const char * album, const char * album_artist, int offset, song_row_t * out_rows,
+                                 int max_rows) {
+    METADATA_DB_GUARD;
+    if (!db || max_rows <= 0) return 0;
+    if (offset < 0) offset = 0;
+
+    static const char * const query =
+        "SELECT rowid, path, title, artist, album, album_artist, genre FROM media "
+        "WHERE album = ? COLLATE NOCASE AND album_artist = ? COLLATE NOCASE "
+        "ORDER BY path COLLATE NOCASE LIMIT ? OFFSET ?;";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, album, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, album_artist, -1, SQLITE_STATIC);
+    sqlite3_bind_int(st, 3, max_rows);
+    sqlite3_bind_int(st, 4, offset);
+    int count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_rows, max_rows);
+    sqlite3_finalize(st);
+    return count;
+}
+
+/* Builds the shared WHERE clause for metadata_db_count_songs_filtered()/
+ * metadata_db_get_songs_filtered_page() below -- query (title/artist
+ * substring, case-insensitive) and the three exact-match filters are each
+ * independently optional (NULL or "" skips that condition entirely), same
+ * semantics remote_control.c's own library_song_matches() used against its
+ * in-memory array copy. Binds in the fixed order: query (x2, for title OR
+ * artist), artist, album_artist, album -- caller must bind in that same
+ * order, skipping any placeholder whose condition wasn't included. Returns
+ * the number of placeholders appended (0-5), so the caller knows how many
+ * binds to actually perform. */
+static int append_song_filter_where(char * sql, size_t sql_size, const char * query, const char * artist_filter,
+                                     const char * album_artist_filter, const char * album_filter) {
+    size_t len = strlen(sql);
+    int placeholders = 0;
+    bool have_query = query && query[0];
+    bool have_artist = artist_filter && artist_filter[0];
+    bool have_album_artist = album_artist_filter && album_artist_filter[0];
+    bool have_album = album_filter && album_filter[0];
+    if (!have_query && !have_artist && !have_album_artist && !have_album) return 0;
+
+    len += (size_t) snprintf(sql + len, sql_size - len, " WHERE ");
+    bool first = true;
+    if (have_query) {
+        len += (size_t) snprintf(sql + len, sql_size - len,
+                                  "%s(title LIKE ? ESCAPE '\\' OR artist LIKE ? ESCAPE '\\')", first ? "" : " AND ");
+        placeholders += 2;
+        first = false;
+    }
+    if (have_artist) {
+        len += (size_t) snprintf(sql + len, sql_size - len, "%sartist = ? COLLATE NOCASE", first ? "" : " AND ");
+        placeholders += 1;
+        first = false;
+    }
+    if (have_album_artist) {
+        len += (size_t) snprintf(sql + len, sql_size - len, "%salbum_artist = ? COLLATE NOCASE", first ? "" : " AND ");
+        placeholders += 1;
+        first = false;
+    }
+    if (have_album) {
+        len += (size_t) snprintf(sql + len, sql_size - len, "%salbum = ? COLLATE NOCASE", first ? "" : " AND ");
+        placeholders += 1;
+    }
+    (void) len;
+    return placeholders;
+}
+
+/* query_text's LIKE metacharacters are escaped the same way metadata_db_
+ * search_songs() escapes them -- shared here since both build a %...%
+ * pattern from untrusted user text. out_pattern must be at least 260 bytes. */
+static void build_like_pattern(const char * query_text, char * out_pattern, size_t out_pattern_size) {
+    char escaped[256];
+    size_t out_len = 0;
+    for (const char * p = query_text; *p && out_len + 2 < sizeof(escaped) - 2; p++) {
+        if (*p == '%' || *p == '_' || *p == '\\') escaped[out_len++] = '\\';
+        escaped[out_len++] = *p;
+    }
+    escaped[out_len] = '\0';
+    snprintf(out_pattern, out_pattern_size, "%%%s%%", escaped);
+}
+
+static int bind_song_filters(sqlite3_stmt * st, int start_index, const char * query, const char * pattern,
+                              const char * artist_filter, const char * album_artist_filter,
+                              const char * album_filter) {
+    int idx = start_index;
+    if (query && query[0]) {
+        sqlite3_bind_text(st, idx++, pattern, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, idx++, pattern, -1, SQLITE_STATIC);
+    }
+    if (artist_filter && artist_filter[0]) sqlite3_bind_text(st, idx++, artist_filter, -1, SQLITE_STATIC);
+    if (album_artist_filter && album_artist_filter[0]) sqlite3_bind_text(st, idx++, album_artist_filter, -1, SQLITE_STATIC);
+    if (album_filter && album_filter[0]) sqlite3_bind_text(st, idx++, album_filter, -1, SQLITE_STATIC);
+    return idx;
+}
+
+/* Remote-control's GET /api/library: a text search (title/artist substring)
+ * optionally narrowed by exact artist/album_artist/album filters, same
+ * combined semantics remote_control.c used to apply by hand against its own
+ * full in-memory library copy -- this is the query that copy existed to
+ * make cheap; querying SQLite directly here removes the need for that copy
+ * to exist at all. */
+int64_t metadata_db_count_songs_filtered(const char * query, const char * artist_filter,
+                                          const char * album_artist_filter, const char * album_filter) {
+    METADATA_DB_GUARD;
+    if (!db) return 0;
+
+    char sql[512] = "SELECT COUNT(*) FROM media";
+    int placeholders = append_song_filter_where(sql, sizeof(sql), query, artist_filter, album_artist_filter, album_filter);
+    strncat(sql, ";", sizeof(sql) - strlen(sql) - 1);
+
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    char pattern[260];
+    if (placeholders > 0 && query && query[0]) build_like_pattern(query, pattern, sizeof(pattern));
+    bind_song_filters(st, 1, query, pattern, artist_filter, album_artist_filter, album_filter);
+
+    int64_t count = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return count;
+}
+
+int metadata_db_get_songs_filtered_page(const char * query, const char * artist_filter,
+                                         const char * album_artist_filter, const char * album_filter, int offset,
+                                         int max_rows, song_row_t * out_rows) {
+    METADATA_DB_GUARD;
+    if (!db || max_rows <= 0) return 0;
+    if (offset < 0) offset = 0;
+
+    char sql[600] = "SELECT rowid, path, title, artist, album, album_artist, genre FROM media";
+    append_song_filter_where(sql, sizeof(sql), query, artist_filter, album_artist_filter, album_filter);
+    strncat(sql, " ORDER BY title COLLATE NOCASE, rowid LIMIT ? OFFSET ?;", sizeof(sql) - strlen(sql) - 1);
+
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    char pattern[260];
+    if (query && query[0]) build_like_pattern(query, pattern, sizeof(pattern));
+    int next = bind_song_filters(st, 1, query, pattern, artist_filter, album_artist_filter, album_filter);
+    sqlite3_bind_int(st, next++, max_rows);
+    sqlite3_bind_int(st, next, offset);
+
+    int count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_rows, max_rows);
+    sqlite3_finalize(st);
+    return count;
+}
+
+/* Albums grouped and filtered by artist OR album_artist matching one name
+ * -- GET /api/library/albums?artist=X (or ?album_artist=X), gui.c's own
+ * Albums screen (unfiltered). filter may be NULL/"" for the unfiltered
+ * "every album in the library" case. Real bug caught in review: this used
+ * to group by album name alone, silently merging two different artists'
+ * same-titled albums into one row -- disagreeing with metadata_db_get_
+ * group_counts()'s own album count (already correctly counted as distinct
+ * (album, album_artist) pairs) and combining unrelated albums' song
+ * counts/cover art. Groups by the pair now; out_rows[i].album_artist
+ * carries the second half of that identity, needed by metadata_db_get_
+ * album_songs() below to fetch the right album's songs. Offset-paginated,
+ * not the keyset "after_name" this used to take -- no real caller ever
+ * continued a keyset cursor here anyway (every one passed NULL, i.e. "just
+ * the first page"), and offset is what a virtualized UI list actually
+ * needs (arbitrary scroll-driven jumps, not just "next page"). */
+int metadata_db_get_albums_page_filtered(const char * artist_or_album_artist_filter, int offset, int max_rows,
+                                          group_row_t * out_rows) {
+    METADATA_DB_GUARD;
+    if (!db || max_rows <= 0) return 0;
+    if (offset < 0) offset = 0;
+
+    sqlite3_stmt * st = NULL;
+    bool have_filter = artist_or_album_artist_filter && artist_or_album_artist_filter[0];
+    if (have_filter) {
+        static const char * const query =
+            "SELECT album, album_artist, COUNT(*), MIN(rowid) FROM media "
+            "WHERE artist = ? COLLATE NOCASE OR album_artist = ? COLLATE NOCASE "
+            "GROUP BY album COLLATE NOCASE, album_artist COLLATE NOCASE "
+            "ORDER BY album COLLATE NOCASE, album_artist COLLATE NOCASE LIMIT ? OFFSET ?;";
+        if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_text(st, 1, artist_or_album_artist_filter, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, artist_or_album_artist_filter, -1, SQLITE_STATIC);
+        sqlite3_bind_int(st, 3, max_rows);
+        sqlite3_bind_int(st, 4, offset);
+    } else {
+        static const char * const query =
+            "SELECT album, album_artist, COUNT(*), MIN(rowid) FROM media "
+            "GROUP BY album COLLATE NOCASE, album_artist COLLATE NOCASE "
+            "ORDER BY album COLLATE NOCASE, album_artist COLLATE NOCASE LIMIT ? OFFSET ?;";
+        if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_int(st, 1, max_rows);
+        sqlite3_bind_int(st, 2, offset);
+    }
+
+    int i = 0;
+    while (i < max_rows && sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(out_rows[i].name, sizeof(out_rows[i].name), "%s", (const char *) sqlite3_column_text(st, 0));
+        snprintf(out_rows[i].album_artist, sizeof(out_rows[i].album_artist), "%s",
+                 (const char *) sqlite3_column_text(st, 1));
+        out_rows[i].song_count = sqlite3_column_int(st, 2);
+        out_rows[i].first_song_id = sqlite3_column_int64(st, 3);
+        i++;
+    }
+    sqlite3_finalize(st);
+    return i;
+}
+
+int64_t metadata_db_count_albums_for_group(metadata_db_group_kind_t kind, const char * name) {
+    METADATA_DB_GUARD;
+    if (!db || !name || (kind != METADATA_DB_GROUP_ARTIST && kind != METADATA_DB_GROUP_ALBUM_ARTIST)) return 0;
+    const char * column = kind == METADATA_DB_GROUP_ARTIST ? "artist" : "album_artist";
+    char query[256];
+    snprintf(query, sizeof(query),
+             "SELECT COUNT(*) FROM (SELECT 1 FROM media WHERE %s = ? COLLATE NOCASE "
+             "GROUP BY album COLLATE NOCASE, album_artist COLLATE NOCASE);", column);
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+    int64_t count = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return count;
+}
+
+int metadata_db_get_albums_for_group(metadata_db_group_kind_t kind, const char * name, int offset, int max_rows,
+                                      group_row_t * out_rows) {
+    METADATA_DB_GUARD;
+    if (!db || !name || max_rows <= 0 ||
+        (kind != METADATA_DB_GROUP_ARTIST && kind != METADATA_DB_GROUP_ALBUM_ARTIST)) return 0;
+    if (offset < 0) offset = 0;
+    const char * column = kind == METADATA_DB_GROUP_ARTIST ? "artist" : "album_artist";
+    char query[384];
+    snprintf(query, sizeof(query),
+             "SELECT album, album_artist, COUNT(*), MIN(rowid) FROM media "
+             "WHERE %s = ? COLLATE NOCASE "
+             "GROUP BY album COLLATE NOCASE, album_artist COLLATE NOCASE "
+             "ORDER BY album COLLATE NOCASE, album_artist COLLATE NOCASE LIMIT ? OFFSET ?;", column);
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+    sqlite3_bind_int(st, 2, max_rows);
+    sqlite3_bind_int(st, 3, offset);
+    int i = 0;
+    while (i < max_rows && sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(out_rows[i].name, sizeof(out_rows[i].name), "%s", (const char *) sqlite3_column_text(st, 0));
+        snprintf(out_rows[i].album_artist, sizeof(out_rows[i].album_artist), "%s",
+                 (const char *) sqlite3_column_text(st, 1));
+        out_rows[i].song_count = sqlite3_column_int(st, 2);
+        out_rows[i].first_song_id = sqlite3_column_int64(st, 3);
+        i++;
+    }
+    sqlite3_finalize(st);
+    return i;
+}
+
+bool metadata_db_get_song_by_id(int64_t id, song_row_t * out_row) {
+    METADATA_DB_GUARD;
+    if (!db) return false;
+
+    static const char * const query =
+        "SELECT rowid, path, title, artist, album, album_artist, genre FROM media WHERE rowid = ?;";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return false;
+    sqlite3_bind_int64(st, 1, id);
+    int count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_row, 1);
+    sqlite3_finalize(st);
+    return count == 1;
+}
+
+bool metadata_db_get_song_by_path(const char * path, song_row_t * out_row) {
+    METADATA_DB_GUARD;
+    if (!db) return false;
+
+    static const char * const query =
+        "SELECT rowid, path, title, artist, album, album_artist, genre FROM media WHERE path = ?;";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return false;
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+    int count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_row, 1);
+    sqlite3_finalize(st);
+    return count == 1;
+}
+
+int64_t metadata_db_get_song_title_offset(const char * path) {
+    METADATA_DB_GUARD;
+    if (!db || !path) return -1;
+    static const char * const query =
+        "SELECT COUNT(*) FROM media AS preceding, media AS target "
+        "WHERE target.path = ? AND (preceding.title COLLATE NOCASE < target.title COLLATE NOCASE "
+        "OR (preceding.title COLLATE NOCASE = target.title COLLATE NOCASE AND preceding.rowid < target.rowid));";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+    int64_t offset = -1;
+    if (sqlite3_step(st) == SQLITE_ROW) offset = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return offset;
+}
+
+int64_t metadata_db_get_group_offset(metadata_db_group_kind_t kind, const char * name, const char * album_artist) {
+    METADATA_DB_GUARD;
+    if (!db || !name) return -1;
+    sqlite3_stmt * st = NULL;
+    if (kind == METADATA_DB_GROUP_ALBUM) {
+        static const char * const query =
+            "SELECT COUNT(*) FROM (SELECT 1 FROM media WHERE album COLLATE NOCASE < ? "
+            "OR (album COLLATE NOCASE = ? AND album_artist COLLATE NOCASE < ?) "
+            "GROUP BY album COLLATE NOCASE, album_artist COLLATE NOCASE);";
+        if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return -1;
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 3, album_artist ? album_artist : "", -1, SQLITE_STATIC);
+    } else {
+        const char * column = kind == METADATA_DB_GROUP_ALBUM_ARTIST ? "album_artist" : "artist";
+        char query[256];
+        snprintf(query, sizeof(query),
+                 "SELECT COUNT(*) FROM (SELECT 1 FROM media WHERE %s COLLATE NOCASE < ? "
+                 "GROUP BY %s COLLATE NOCASE);", column, column);
+        if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return -1;
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+    }
+    int64_t offset = -1;
+    if (sqlite3_step(st) == SQLITE_ROW) offset = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return offset;
+}
+
+void metadata_db_get_az_table(metadata_db_az_kind_t kind, int out_table[27]) {
+    METADATA_DB_GUARD;
+    for (int i = 0; i < 27; i++) out_table[i] = -1;
+    if (!db) return;
+
+    /* sort_col is the column each screen's own query leads its ORDER BY
+     * with; group_cols is NULL for the ungrouped All Songs screen (plain
+     * per-row COUNT(*)) or the exact GROUP BY column list the grouped
+     * screens' own metadata_db_get_groups_page()/get_albums_page_filtered()
+     * use, so a boundary count here lines up with what's actually displayed
+     * at that offset. Album is keyed on the (album, album_artist) pair, not
+     * album name alone -- same identity fix as get_albums_page_filtered(). */
+    const char * sort_col = "title";
+    const char * group_cols = NULL;
+    switch (kind) {
+        case METADATA_DB_AZ_ARTIST: sort_col = "artist"; group_cols = "artist COLLATE NOCASE"; break;
+        case METADATA_DB_AZ_ALBUM_ARTIST:
+            sort_col = "album_artist";
+            group_cols = "album_artist COLLATE NOCASE";
+            break;
+        case METADATA_DB_AZ_ALBUM:
+            sort_col = "album";
+            group_cols = "album COLLATE NOCASE, album_artist COLLATE NOCASE";
+            break;
+        case METADATA_DB_AZ_ALL_SONGS: sort_col = "title"; group_cols = NULL; break;
+    }
+
+    char query[384];
+    if (group_cols) {
+        snprintf(query, sizeof(query),
+                  "SELECT COUNT(*) FROM (SELECT 1 FROM media WHERE %s COLLATE NOCASE < ? GROUP BY %s);", sort_col,
+                  group_cols);
+    } else {
+        snprintf(query, sizeof(query), "SELECT COUNT(*) FROM media WHERE %s COLLATE NOCASE < ?;", sort_col);
+    }
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return;
+
+    char letter[2] = { 0, 0 };
+    for (int i = 0; i < 26; i++) {
+        letter[0] = (char) ('A' + i);
+        sqlite3_bind_text(st, 1, letter, -1, SQLITE_STATIC);
+        int64_t count = 0;
+        if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int64(st, 0);
+        sqlite3_reset(st);
+        out_table[i] = (int) count;
+    }
+    sqlite3_finalize(st);
+
+    /* '#' bucket before the A-Z entries get clamped below: SQLite's
+     * default (post-NOCASE-folding) comparison is plain ASCII byte order,
+     * where every digit/symbol code point sorts strictly before every
+     * letter -- so anything not starting with A-Z clusters at the very
+     * front of the sorted list (offset 0) in the overwhelmingly common
+     * case, never interspersed among lettered entries the way an arbitrary
+     * Unicode collation might allow. A name starting with an accented or
+     * non-Latin character sorts *after* 'Z' instead (untested edge case,
+     * not reproduced in this library) and lands in the 'Z' bucket rather
+     * than here -- same divergence class already accepted for the title
+     * fallback elsewhere in this file, not worth a second query shape for. */
+    out_table[26] = out_table[0] > 0 ? 0 : -1;
+
+    int64_t total;
+    if (group_cols) {
+        char tq[256];
+        snprintf(tq, sizeof(tq), "SELECT COUNT(*) FROM (SELECT 1 FROM media GROUP BY %s);", group_cols);
+        sqlite3_stmt * ts = NULL;
+        total = 0;
+        if (sqlite3_prepare_v2(db, tq, -1, &ts, NULL) == SQLITE_OK) {
+            if (sqlite3_step(ts) == SQLITE_ROW) total = sqlite3_column_int64(ts, 0);
+            sqlite3_finalize(ts);
+        }
+    } else {
+        total = metadata_db_get_song_count();
+    }
+
+    /* A letter with nothing at or after it (COUNT == total) must stay -1,
+     * not point one-past-the-end -- matches build_az_jump_table()'s own
+     * backward-fill only ever propagating from a real entry, never
+     * fabricating a target past the last one. */
+    for (int i = 0; i < 26; i++) {
+        if (out_table[i] >= total) out_table[i] = -1;
+    }
+}
+
+int metadata_db_search_names(metadata_db_az_kind_t kind, const char * needle, int max_rows,
+                              metadata_db_search_hit_t * out_hits) {
+    METADATA_DB_GUARD;
+    if (!db || max_rows <= 0 || !needle || !needle[0]) return 0;
+
+    /* Same escaping approach as metadata_db_search_songs() -- see its own
+     * comment. */
+    char escaped[256];
+    size_t out_len = 0;
+    for (const char * p = needle; *p && out_len + 2 < sizeof(escaped) - 2; p++) {
+        if (*p == '%' || *p == '_' || *p == '\\') escaped[out_len++] = '\\';
+        escaped[out_len++] = *p;
+    }
+    escaped[out_len] = '\0';
+    char pattern[260];
+    snprintf(pattern, sizeof(pattern), "%%%s%%", escaped);
+
+    char query[512];
+    bool is_song = (kind == METADATA_DB_AZ_ALL_SONGS);
+    switch (kind) {
+        case METADATA_DB_AZ_ARTIST:
+            snprintf(query, sizeof(query),
+                      "SELECT artist, offs FROM "
+                      "(SELECT artist, ROW_NUMBER() OVER (ORDER BY artist COLLATE NOCASE) - 1 AS offs "
+                      " FROM media GROUP BY artist COLLATE NOCASE) "
+                      "WHERE artist LIKE ? ESCAPE '\\' ORDER BY offs LIMIT ?;");
+            break;
+        case METADATA_DB_AZ_ALBUM_ARTIST:
+            snprintf(query, sizeof(query),
+                      "SELECT album_artist, offs FROM "
+                      "(SELECT album_artist, ROW_NUMBER() OVER (ORDER BY album_artist COLLATE NOCASE) - 1 AS offs "
+                      " FROM media GROUP BY album_artist COLLATE NOCASE) "
+                      "WHERE album_artist LIKE ? ESCAPE '\\' ORDER BY offs LIMIT ?;");
+            break;
+        case METADATA_DB_AZ_ALBUM:
+            snprintf(query, sizeof(query),
+                      "SELECT album, offs FROM "
+                      "(SELECT album, ROW_NUMBER() OVER (ORDER BY album COLLATE NOCASE, album_artist COLLATE NOCASE) - 1 AS offs "
+                      " FROM media GROUP BY album COLLATE NOCASE, album_artist COLLATE NOCASE) "
+                      "WHERE album LIKE ? ESCAPE '\\' ORDER BY offs LIMIT ?;");
+            break;
+        case METADATA_DB_AZ_ALL_SONGS:
+            snprintf(query, sizeof(query),
+                      "SELECT rowid, path, title, offs FROM "
+                      "(SELECT rowid, path, title, ROW_NUMBER() OVER (ORDER BY title COLLATE NOCASE, rowid) - 1 AS offs "
+                      " FROM media) "
+                      "WHERE title LIKE ? ESCAPE '\\' ORDER BY offs LIMIT ?;");
+            break;
+        default: return 0;
+    }
+
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, pattern, -1, SQLITE_STATIC);
+    sqlite3_bind_int(st, 2, max_rows);
+
+    int i = 0;
+    while (i < max_rows && sqlite3_step(st) == SQLITE_ROW) {
+        if (is_song) {
+            song_row_t row = { 0 };
+            row.id = sqlite3_column_int64(st, 0);
+            snprintf(row.path, sizeof(row.path), "%s", (const char *) sqlite3_column_text(st, 1));
+            snprintf(row.tags.title, sizeof(row.tags.title), "%s", (const char *) sqlite3_column_text(st, 2));
+            metadata_db_song_display_title(&row, out_hits[i].label, sizeof(out_hits[i].label));
+            out_hits[i].offset = sqlite3_column_int(st, 3);
+        } else {
+            snprintf(out_hits[i].label, sizeof(out_hits[i].label), "%s", (const char *) sqlite3_column_text(st, 0));
+            out_hits[i].offset = sqlite3_column_int(st, 1);
+        }
+        i++;
+    }
+    sqlite3_finalize(st);
+    return i;
+}
+
+/* Real bug caught in review: every song_row_t consumer outside gui.c
+ * (remote_control.c's JSON responses, plugin.library_*) was emitting
+ * row->tags.title verbatim -- blank for any untagged file (confirmed live
+ * against this device's own library: several WAV tracks with no embedded
+ * title tag). gui.c's own on-device list screens never show this, because
+ * song_display_title_of() (gui.c) already falls back to the file's own
+ * basename when title is empty -- this is that same fallback, shared here
+ * so every song_row_t consumer gets it instead of each reimplementing (or
+ * forgetting) it. Basename keeps its extension (e.g. "Track 09.wav"),
+ * matching song_display_title_of()'s own fallback exactly. */
+void metadata_db_song_display_title(const song_row_t * row, char * out, size_t out_size) {
+    if (row->tags.title[0] != '\0') {
+        snprintf(out, out_size, "%s", row->tags.title);
+        return;
+    }
+    const char * slash = strrchr(row->path, '/');
+    snprintf(out, out_size, "%s", slash ? slash + 1 : row->path);
+}
+
+int metadata_db_search_songs(const char * query_text, song_row_t * out_rows, int max_rows) {
+    METADATA_DB_GUARD;
+    if (!db || max_rows <= 0 || !query_text || !query_text[0]) return 0;
+
+    static const char * const query =
+        "SELECT rowid, path, title, artist, album, album_artist, genre FROM media "
+        "WHERE title LIKE ? ESCAPE '\\' OR artist LIKE ? ESCAPE '\\' "
+        "ORDER BY title COLLATE NOCASE LIMIT ?;";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+
+    /* Escape the three LIKE metacharacters in the user's own query text
+     * before wrapping it in %...% -- otherwise a search for e.g. "50%" would
+     * silently become a wildcard instead of a literal percent sign. */
+    char escaped[256];
+    size_t out_len = 0;
+    for (const char * p = query_text; *p && out_len + 2 < sizeof(escaped) - 2; p++) {
+        if (*p == '%' || *p == '_' || *p == '\\') escaped[out_len++] = '\\';
+        escaped[out_len++] = *p;
+    }
+    escaped[out_len] = '\0';
+
+    char pattern[260];
+    snprintf(pattern, sizeof(pattern), "%%%s%%", escaped);
+    sqlite3_bind_text(st, 1, pattern, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, pattern, -1, SQLITE_STATIC);
+    sqlite3_bind_int(st, 3, max_rows);
+    int count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_rows, max_rows);
+    sqlite3_finalize(st);
+    return count;
+}
+
+/* Deliberate full-library load -- everything above (metadata_db_get_songs_
+ * page() etc.) exists specifically so gui.c's boot path and the four core
+ * list screens never need this, but a few lower-traffic consumers (Search's
+ * own filter-the-whole-library fallback, Shuffle All, remote-control sync)
+ * still work against one big resident array for now rather than being
+ * converted to their own paged/on-demand queries yet -- see this session's
+ * own scoping notes on why that conversion is sequenced later, not skipped.
+ * Called lazily, once, on first actual need (gui.c's ensure_library_arrays_
+ * loaded()), not unconditionally at boot -- that's the actual fix for the
+ * boot-time OOM this whole rework exists to close. *out_paths and *out_tags
+ * are freshly malloc'd parallel arrays the caller owns (including each
+ * out_paths[i] string); both are set to NULL and *out_count to 0 if the
+ * cache is empty or unopened. */
 void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * out_count) {
     METADATA_DB_GUARD;
     *out_paths = NULL;
@@ -784,8 +1331,13 @@ void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * o
     sqlite3_finalize(st);
     if (row_count <= 0) return;
 
-    char ** paths = malloc(sizeof(char *) * (size_t) row_count);
-    cached_tags_t * tags = malloc(sizeof(cached_tags_t) * (size_t) row_count);
+    char ** paths = calloc((size_t) row_count, sizeof(*paths));
+    cached_tags_t * tags = malloc(sizeof(*tags) * (size_t) row_count);
+    if (!paths || !tags) {
+        free(paths);
+        free(tags);
+        return;
+    }
 
     if (sqlite3_prepare_v2(db, "SELECT path, title, artist, album, album_artist, genre FROM media;", -1, &st, NULL) !=
         SQLITE_OK) {
@@ -797,6 +1349,7 @@ void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * o
     int i = 0;
     while (i < row_count && sqlite3_step(st) == SQLITE_ROW) {
         paths[i] = strdup((const char *) sqlite3_column_text(st, 0));
+        if (!paths[i]) break;
         snprintf(tags[i].title, sizeof(tags[i].title), "%s", (const char *) sqlite3_column_text(st, 1));
         snprintf(tags[i].artist, sizeof(tags[i].artist), "%s", (const char *) sqlite3_column_text(st, 2));
         snprintf(tags[i].album, sizeof(tags[i].album), "%s", (const char *) sqlite3_column_text(st, 3));
@@ -805,6 +1358,13 @@ void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * o
         i++;
     }
     sqlite3_finalize(st);
+
+    if (i != row_count) {
+        for (int j = 0; j < i; j++) free(paths[j]);
+        free(paths);
+        free(tags);
+        return;
+    }
 
     *out_paths = paths;
     *out_tags = tags;

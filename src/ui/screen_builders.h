@@ -277,6 +277,11 @@ typedef struct {
     const char * label;
 } compact_list_item_t;
 
+/* Fixed size of a paged-mode row label buffer (compact_list_fetch_page_cb_t
+ * below) -- matches cached_tags_t.title's own size (metadata_db.h), the
+ * largest display string a paged provider actually needs to carry. */
+#define COMPACT_LIST_LABEL_MAX 128
+
 /* Fired when a row is tapped, with the index into the `items` array passed
  * to build_compact_list_screen() -- not an lv_event_cb_t, since the
  * virtualized row widgets underneath (see screen_builders.c) are reused
@@ -306,11 +311,16 @@ typedef void (*compact_list_click_cb_t)(int index);
  * (Artists/Albums/Album Artist name rows, the Time Zone city list), so
  * there's nothing sensible to long-press into a context menu. Passed
  * straight through to build_compact_list_widget() below. */
+/* out_title_label: NULL if the caller never needs to change the title text
+ * after construction (every existing caller so far) -- pass a real pointer
+ * only when the screen's title changes at runtime (e.g. a Subsonic list
+ * screen reused for different artists/albums, whose title reflects
+ * whichever one is currently shown). */
 lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                       const compact_list_item_t * items, int item_count,
                                       compact_list_click_cb_t on_click, compact_list_click_cb_t on_long_press,
-                                      lv_obj_t ** out_list, int32_t row_width, bool enable_now_playing,
-                                      lv_color_t now_playing_color);
+                                      lv_obj_t ** out_list, lv_obj_t ** out_title_label, int32_t row_width,
+                                      bool enable_now_playing, lv_color_t now_playing_color);
 
 /* The virtualized list widget itself (what build_compact_list_screen()
  * builds internally), with no screen/back-button/title wrapper -- for a
@@ -353,5 +363,40 @@ void compact_list_scroll_to_index(lv_obj_t * list, int index);
  * live search filtering -- without the delete()+rebuild this project
  * otherwise uses for changing a screen's list contents. */
 void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, int item_count);
+
+/* ---- Paged mode -- Rockbox-style DB-backed lists. An alternative to
+ * compact_list_set_items() for a list whose full content is too large to
+ * ever materialize at once (the local library's own All Songs/Artists/
+ * Albums/Album Artist screens): instead of a caller-owned items[] array,
+ * rows are fetched on demand, a bounded page at a time, from a callback --
+ * the list still only ever holds ~20 real LVGL row objects (same
+ * virtualization as eager mode), but now the underlying DATA is bounded
+ * too, not just the widget count. ---- */
+
+/* Fills out_labels[0..count) with the display label for logical rows
+ * [offset, offset+count) (0-indexed into the full, currently-sorted/
+ * filtered result set) -- e.g. a thin wrapper around metadata_db_get_
+ * songs_page()/get_groups_page() that formats each row's own display
+ * title/name into the fixed COMPACT_LIST_LABEL_MAX-sized buffer. Returns
+ * the number of rows actually written (less than `count` only at the very
+ * end of the result set -- ctx knows its own real total already via
+ * whatever populated it, this isn't how the list learns the total; see
+ * compact_list_set_paged_provider()'s own total_count argument for that).
+ * Called from the LVGL/main thread only (same thread every other compact_
+ * list callback runs on), so it's safe to call straight into metadata_db.c
+ * (its own METADATA_DB_GUARD) or any other main-thread-only state. */
+typedef int (*compact_list_fetch_page_cb_t)(void * ctx, int offset, int count,
+                                             char out_labels[][COMPACT_LIST_LABEL_MAX]);
+
+/* Switches list to (or refreshes) paged mode: total_count is the logical
+ * row count (drives the scrollbar range and every fetch_page() bound
+ * above) -- call again (passing the same fetch_page/ctx) after the
+ * underlying data changes (e.g. a library rescan, or a live search's
+ * filter changing) to refresh the count and invalidate the row cache.
+ * Pass fetch_page == NULL to switch back to eager mode -- the list then
+ * shows whatever compact_list_set_items() last gave it (empty if that was
+ * never called); total_count/ctx are ignored in that case. */
+void compact_list_set_paged_provider(lv_obj_t * list, compact_list_fetch_page_cb_t fetch_page, void * ctx,
+                                      int total_count);
 
 #endif /* SCREEN_BUILDERS_H */

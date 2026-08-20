@@ -127,7 +127,7 @@ from the moment your script starts running (injected before
 | Theme | `set_icon`, `set_background_color`, `set_text_color` |
 | Files | `sd_root`, `list_dir` |
 | Playback | `play_file`, `play_list`, transport controls, playback state |
-| Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks` |
+| Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
 | Audio | `eq_load_profile`, `eq_save_profile`, `eq_set_*`, `eq_reset` |
 | Network | `http_request`, `cancel`, legacy `http_get`/`http_post` |
 | Automation | `on`, `set_interval`, `clear_interval` |
@@ -737,6 +737,58 @@ when it's already the artist's last album -- this does **not** wrap around
 to the first album. Meant for auto-continuing playback across an artist's
 discography once an album finishes; pair with `"track_started"` or
 `get_current_track_path()` to detect the album boundary.
+
+### Paged library access (`library_*`)
+
+Unlike `get_artist_albums()`/`get_album_tracks()`/`get_next_album_tracks()`
+above (already scoped to one artist or album), these query the on-disk
+library database directly and are bounded per call -- none of them ever
+materializes the whole library, regardless of how many songs it has. Every
+call accepts `offset`/`limit`; `limit` is silently clamped to 200 (songs) or
+200 (artist/album groups) if omitted or too large. Check
+`plugin.has_capability("library.paged")` before relying on this group if you
+need to support older player builds.
+
+A **song** table has the fields `id`, `path`, `title`, `artist`, `album`,
+`album_artist`. `id` is a stable identifier for that song (survives a
+re-scan) -- hand it back to `library_get_song(id)` later rather than storing
+a path if you need to look the same song up again. A **group** table (from
+`library_get_artists`/`library_get_albums`) has `name`, `count` (song
+count), `first_song_id` (a representative song, e.g. for cover art), and
+`album_artist` (only meaningful from `library_get_albums` -- an album's
+real identity is the *pair* of its name and album artist, so two different
+artists' same-titled albums show as separate rows with this field set to
+tell them apart; empty from `library_get_artists`).
+
+- `plugin.library_song_count()` -- total number of songs in the library.
+- `plugin.library_get_songs([offset], [limit], [filters])` -- returns
+  `{ song, ... }, total`. `filters` is an optional table with any of
+  `query` (title/artist substring match), `artist`, `album_artist`, `album`
+  (each an exact, case-insensitive match) -- every field is optional.
+  `total` is the match count across every page, useful for a "page N of M"
+  UI.
+- `plugin.library_search(query, [limit])` -- `{ song, ... }`, a plain
+  title/artist substring search with no offset (always replace, not append,
+  your previous result set, same convention this app's own on-device search
+  follows).
+- `plugin.library_get_song(id)` -- one song table, or `nil` if `id` doesn't
+  match any song (e.g. it was deleted in a later re-scan).
+- `plugin.library_get_artists([offset], [limit])` -- `{ group, ... }`.
+- `plugin.library_get_albums([offset], [limit], [artist])` -- `{ group,
+  ... }`. `artist` restricts to one artist or album\_artist's own albums;
+  omit it for every album, unfiltered.
+
+```lua
+plugin.define({ id = "org.example.library_browser", api_min = 1 })
+
+local songs, total = plugin.library_get_songs(0, 50, { artist = "Boards of Canada" })
+plugin.show_toast(("Found %d songs (%d shown)"):format(total, #songs))
+
+local artists = plugin.library_get_artists(0, 100)
+for _, a in ipairs(artists) do
+    print(a.name, a.count)
+end
+```
 
 <a id="events"></a>
 

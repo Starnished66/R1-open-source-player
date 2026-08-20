@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Phone remote-control feature: a small hand-rolled HTTP/1.1 server
  * serving a static Now Playing web page and a JSON API (status polling,
@@ -56,38 +57,30 @@ bool remote_control_consume_seek(int * out_seconds);
 bool remote_control_consume_volume(int * out_percent);
 
 /* POST /api/playback/queue?index=N -- enqueue one library song through
- * gui.c's normal Up Next splice. out_index uses the same synced-library
- * index space as remote_control_consume_play_index(). */
-bool remote_control_consume_queue_index(int * out_index);
+ * gui.c's normal Up Next splice. out_index is a song id (metadata_db.c's
+ * stable rowid-based song_row_t.id, not an array position) -- same id
+ * space as remote_control_consume_play_index() and every "index" field
+ * this file's JSON responses emit. Caller resolves it via
+ * metadata_db_get_song_by_id(). */
+bool remote_control_consume_queue_index(int64_t * out_index);
 bool remote_control_consume_queue_remove(int * out_offset);
 bool remote_control_consume_queue_clear(void);
 
-/* Snapshot the live Up Next run for GET /api/queue. Paths are copied and
- * translated to synced-library indices while the GUI owns playlist[]. */
+/* Snapshot the live Up Next run for GET /api/queue. Paths are resolved to
+ * song ids (metadata_db_get_song_by_path()) before being copied. */
 void remote_control_sync_queue(const char * const * paths, int count);
 
-/* Hands remote_control.c its own copy of the library's title/artist
- * strings, indexed exactly the way gui.c's all_songs_paths/all_song_tags
- * are -- GET /api/library returns these same indices, and POST
- * /api/playback/play?index=N is interpreted against this same indexing,
- * so the two must never drift apart. Call once after gui_init()'s startup
- * scan and again after every library rescan. Copies the strings rather
- * than taking ownership, since gui.c frees and reallocates its own arrays
- * on every rescan. */
-void remote_control_sync_library(const char * const * titles, const char * const * artists,
-                                  const char * const * album_artists, const char * const * albums,
-                                  const char * const * paths, int count);
-
 /* Same edge-triggered convention as remote_control_consume_seek() --
- * out_index is an index into the array remote_control_sync_library() was
- * last called with. out_playlist/out_artist/out_album_artist/out_album are
- * always written (empty string if the request carried no such context, the
- * "whole library" case) -- see request_play_playlist_name's own comment in
- * remote_control.c for why these exist: they let the caller scope the
- * playback queue to whichever Album/Playlist/Artist view the song was
- * actually tapped from, matching the on-device Group Songs/Playlist
- * screens, instead of always queuing the entire library. */
-bool remote_control_consume_play_index(int * out_index, char * out_playlist, size_t playlist_size,
+ * out_index is a song id (metadata_db.c's rowid-based song_row_t.id),
+ * resolved by the caller via metadata_db_get_song_by_id(). out_playlist/
+ * out_artist/out_album_artist/out_album are always written (empty string
+ * if the request carried no such context, the "whole library" case) --
+ * see request_play_playlist_name's own comment in remote_control.c for why
+ * these exist: they let the caller scope the playback queue to whichever
+ * Album/Playlist/Artist view the song was actually tapped from, matching
+ * the on-device Group Songs/Playlist screens, instead of always queuing
+ * the entire library. */
+bool remote_control_consume_play_index(int64_t * out_index, char * out_playlist, size_t playlist_size,
                                         char * out_artist, size_t artist_size, char * out_album_artist,
                                         size_t album_artist_size, char * out_album, size_t album_size);
 

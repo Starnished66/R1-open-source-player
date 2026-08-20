@@ -73,8 +73,13 @@ static bool sd_mount_point_mounted(void) {
     return parent_st.st_dev != mnt_st.st_dev;
 }
 
-/* Tries each supported filesystem type (vfat, exfat, ntfs) against one
- * device node in turn, stopping at the first that actually mounts. */
+/* Tries each supported filesystem type (vfat, exfat, NTFS) against one
+ * device node in turn, stopping at the first that actually mounts.
+ *
+ * NTFS is intentionally mounted through the ntfs-3g binary included in the
+ * firmware image.  This kernel/BusyBox combination has no usable in-kernel
+ * `ntfs` mount path (and no mount.ntfs helper), so `mount -t ntfs` never
+ * reached the driver that is actually shipped on the device. */
 static void try_mount_sd_device_node(const char * device_node) {
     char * vfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "vfat", (char *) "-o",
                             (char *) "rw,relatime,fmask=0022,dmask=0022,codepage=936,iocharset=utf8,shortname=mixed",
@@ -87,8 +92,9 @@ static void try_mount_sd_device_node(const char * device_node) {
     subprocess_run(exfat_argv, NULL, 0);
     if (sd_mount_point_mounted()) return;
 
-    char * ntfs_argv[] = { (char *) "mount", (char *) "-t", (char *) "ntfs", (char *) "-o",
-                            (char *) "rw,relatime", (char *) device_node, (char *) "/data/mnt/sd_0", NULL };
+    char * ntfs_argv[] = { (char *) "/usr/bin/ntfs-3g", (char *) "-o",
+                            (char *) "rw,relatime,big_writes,umask=0022",
+                            (char *) device_node, (char *) "/data/mnt/sd_0", NULL };
     subprocess_run(ntfs_argv, NULL, 0);
 }
 

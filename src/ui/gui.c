@@ -5774,6 +5774,53 @@ static void poll_power_off_countdown(void);
  * it every tick, same as poll_cover_decode()/poll_lyrics_load(). */
 static void poll_search_job(void);
 
+/* Settings -> Playback -> Play/Pause Button (current_settings.
+ * play_pause_button_mode). Mode 2 needs to tell a single press apart from
+ * the first half of a double-click, so it defers the decision behind a
+ * short timer -- same reset-then-resume idiom as TEXT_ENTRY_MULTITAP_MS
+ * further down in this file -- rather than acting immediately; modes 0 and
+ * 1 fire with zero added latency since there's nothing to disambiguate. */
+#define PLAY_PAUSE_DOUBLE_CLICK_MS 350
+static lv_timer_t * play_pause_click_timer = NULL;
+static int play_pause_click_count = 0;
+
+static void physical_skip_prev_track(void) {
+    int prev_index = compute_manual_step_index(playlist_index, -1);
+    if (prev_index >= 0) play_track_at(prev_index);
+}
+
+static void play_pause_click_timeout_cb(lv_timer_t * timer) {
+    (void) timer;
+    lv_timer_pause(play_pause_click_timer);
+    play_pause_click_count = 0;
+    toggle_play_pause();
+}
+
+static void handle_physical_play_pause_press(void) {
+    int mode = current_settings.play_pause_button_mode;
+    if (mode == 1) {
+        physical_skip_prev_track();
+        return;
+    }
+    if (mode == 2) {
+        if (!play_pause_click_timer) {
+            play_pause_click_timer = lv_timer_create(play_pause_click_timeout_cb, PLAY_PAUSE_DOUBLE_CLICK_MS, NULL);
+            lv_timer_pause(play_pause_click_timer);
+        }
+        play_pause_click_count++;
+        if (play_pause_click_count >= 2) {
+            lv_timer_pause(play_pause_click_timer);
+            play_pause_click_count = 0;
+            physical_skip_prev_track();
+        } else {
+            lv_timer_reset(play_pause_click_timer);
+            lv_timer_resume(play_pause_click_timer);
+        }
+        return;
+    }
+    toggle_play_pause();
+}
+
 static void update_timer_cb(lv_timer_t * timer) {
     (void) timer;
 
@@ -5781,7 +5828,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * thread allowed to touch LVGL widgets (see hw_buttons.h). */
     bool played_paused = hw_buttons_consume_play_pause();
     if (played_paused) {
-        toggle_play_pause();
+        handle_physical_play_pause_press();
     }
     /* Real-device bug report: shuffle "sometimes shuffles, sometimes just
      * plays the next song," and physical-button skip never shuffled at all.
@@ -15376,6 +15423,66 @@ static void resume_mode_settings_row_cb(lv_event_t * e) {
     open_resume_mode_screen();
 }
 
+/* ---- Play/Pause button behavior selection screen (Settings > Playback >
+ * Play/Pause Button) -- same accent-colored-border single-select shape as
+ * Resume Last Track just above. Feature request: the physical play/pause
+ * button can act as Previous Track instead, or combine both via a short
+ * double-click window -- see handle_physical_play_pause_press() near
+ * update_timer_cb for the actual dispatch. Unlike Resume Last Track, this
+ * takes effect on the very next physical button press, not just at next
+ * boot. ---- */
+
+typedef struct {
+    int mode; /* matches player_settings_t.play_pause_button_mode */
+    const char * label;
+} play_pause_button_mode_option_t;
+
+static const play_pause_button_mode_option_t play_pause_button_mode_options[] = {
+    { 0, "Play/Pause" }, { 1, "Previous Track" }, { 2, "Play/Pause + Previous Track (Double-Click)" },
+};
+#define PLAY_PAUSE_BUTTON_MODE_OPTION_COUNT (sizeof(play_pause_button_mode_options) / sizeof(play_pause_button_mode_options[0]))
+
+static lv_obj_t * play_pause_button_mode_screen;
+static lv_obj_t * play_pause_button_mode_list;
+
+static void play_pause_button_mode_option_row_cb(lv_event_t * e);
+
+static void populate_play_pause_button_mode_screen(void) {
+    lv_obj_clean(play_pause_button_mode_list);
+    for (size_t i = 0; i < PLAY_PAUSE_BUTTON_MODE_OPTION_COUNT; i++) {
+        bool selected = current_settings.play_pause_button_mode == play_pause_button_mode_options[i].mode;
+        lv_obj_t * row = add_pill_row_base(play_pause_button_mode_list, play_pause_button_mode_options[i].label);
+        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
+        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, play_pause_button_mode_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static void play_pause_button_mode_option_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    current_settings.play_pause_button_mode = play_pause_button_mode_options[index].mode;
+    settings_save(&current_settings);
+    populate_play_pause_button_mode_screen();
+    show_info_toast("Applies immediately");
+}
+
+static lv_obj_t * build_play_pause_button_mode_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("Play/Pause Button", &title_label, &play_pause_button_mode_list);
+}
+
+static void open_play_pause_button_mode_screen(void) {
+    populate_play_pause_button_mode_screen();
+    nav_push(play_pause_button_mode_screen);
+}
+
+static void play_pause_button_mode_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_play_pause_button_mode_screen();
+}
+
 /* ---- Font size selection screen (Settings > Font Size) -- same
  * accent-colored-border single-select shape as the Bluetooth codec screen
  * just above, but selecting a row only saves the setting and shows a
@@ -17813,20 +17920,21 @@ static void plugin_playback_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_settings_playback_screen(void) {
-    static pill_list_item_t items[7 + PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
+    static pill_list_item_t items[8 + PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
                                     current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
                                     current_settings.crossfade_enabled, NULL, crossfade_switch_event_cb, NULL,
                                     &settings_crossfade_toggle_img };
     items[2] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "ReplayGain", PILL_ACCESSORY_TOGGLE,
+    items[3] = (pill_list_item_t){ "Play/Pause Button", PILL_ACCESSORY_CHEVRON, false, play_pause_button_mode_settings_row_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "ReplayGain", PILL_ACCESSORY_TOGGLE,
                                     current_settings.replaygain_enabled, NULL, replaygain_switch_event_cb, NULL };
-    items[4] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
-    items[5] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
-    items[6] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
+    items[5] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
+    items[6] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
+    items[7] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
 
-    int count = 7;
+    int count = 8;
     int plugin_count = plugin_manager_get_playback_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_PLAYBACK_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -19241,6 +19349,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     bt_codec_screen = build_bt_codec_screen();
     font_size_screen = build_font_size_screen();
     resume_mode_screen = build_resume_mode_screen();
+    play_pause_button_mode_screen = build_play_pause_button_mode_screen();
     usb_mode_screen = build_usb_mode_screen();
     usb_dac_overlay_screen = build_usb_dac_overlay_screen();
     build_import_rescan_popup(); /* must exist before import_wifi_back_cb (wired below) can show it */

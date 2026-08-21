@@ -75,6 +75,7 @@ static void set_defaults(player_settings_t * out) {
     out->last_source_kind = 0;
     out->last_source_name[0] = '\0';
     out->resume_mode = 0;
+    out->play_pause_button_mode = 0;
     out->accent_color = 0x2196F3; /* matches the app's existing default blue */
     out->crossfade_enabled = false;
     out->replaygain_enabled = true; /* preserves the pre-setting behavior */
@@ -139,6 +140,8 @@ bool settings_load(player_settings_t * out) {
             snprintf(out->last_source_name, sizeof(out->last_source_name), "%s", value);
         } else if (strcmp(key, "resume_mode") == 0) {
             out->resume_mode = atoi(value);
+        } else if (strcmp(key, "play_pause_button_mode") == 0) {
+            out->play_pause_button_mode = atoi(value);
         } else if (strcmp(key, "accent_color") == 0) {
             out->accent_color = (uint32_t) strtoul(value, NULL, 16);
         } else if (strcmp(key, "crossfade") == 0) {
@@ -216,6 +219,7 @@ bool settings_load(player_settings_t * out) {
     if (out->startup_volume_fixed_percent < 0 || out->startup_volume_fixed_percent > 100) out->startup_volume_fixed_percent = 20;
     if (out->brightness_percent < 0 || out->brightness_percent > 100) out->brightness_percent = 80;
     if (out->resume_mode < 0 || out->resume_mode > 2) out->resume_mode = 0;
+    if (out->play_pause_button_mode < 0 || out->play_pause_button_mode > 2) out->play_pause_button_mode = 0;
 
     out->screen_timeout_seconds = nearest_screen_timeout_step(out->screen_timeout_seconds);
     out->idle_shutdown_minutes = nearest_idle_shutdown_step(out->idle_shutdown_minutes);
@@ -264,6 +268,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "last_source_kind=%d\n", settings->last_source_kind);
     fprintf(f, "last_source_name=%s\n", settings->last_source_name);
     fprintf(f, "resume_mode=%d\n", settings->resume_mode);
+    fprintf(f, "play_pause_button_mode=%d\n", settings->play_pause_button_mode);
     fprintf(f, "accent_color=%06X\n", (unsigned int) (settings->accent_color & 0xFFFFFF));
     fprintf(f, "crossfade=%d\n", settings->crossfade_enabled ? 1 : 0);
     fprintf(f, "replaygain_enabled=%d\n", settings->replaygain_enabled ? 1 : 0);

@@ -47,6 +47,14 @@ typedef struct {
      * opts into by hand. */
     int resume_mode;
 
+    /* Settings -> Playback -> Play/Pause Button. What the physical
+     * play/pause button does: 0 = Play/Pause (default, matches the
+     * button's own label), 1 = Previous Track, 2 = Play/Pause on a single
+     * press, but Previous Track if a second press follows within
+     * PLAY_PAUSE_DOUBLE_CLICK_MS (gui.c) -- lets one physical button cover
+     * both without a dedicated previous-track button. */
+    int play_pause_button_mode;
+
     uint32_t accent_color;     /* packed 0xRRGGBB, applied to sliders/switches app-wide */
     bool crossfade_enabled;    /* if true, fade into the next queued track near the current one's end */
     bool replaygain_enabled;   /* apply per-track ReplayGain tags during local playback */

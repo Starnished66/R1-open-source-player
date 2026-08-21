@@ -87,6 +87,7 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - WAV RIFF metadata
 - M4A metadata
 - M3U / M3U8 playlists
+- Full screen synced Lyrics support. 
 - Dynamic playlist loading directly from the SD card
 - Incremental music database updates instead of rescanning the entire library
 - Paged/virtualized song lists for very large albums and libraries
@@ -178,8 +179,7 @@ The following features are planned or currently incomplete:
 
 - Native audiobook support (currently available via the example Audiobooks plugin — see [PLUGINS.md](PLUGINS.md))
 - Background image/color customization
-- Full theme support
-- Lyrics support
+- Full theme support (Base is already done with a plugin interface)
 - Additional community-requested features
 
 This list will evolve as development continues.

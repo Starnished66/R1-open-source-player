@@ -48,6 +48,37 @@ static double preamp_db = 0.0;
 static unsigned int coeffs_sample_rate = 0;
 static bool coeffs_dirty = true;
 
+/* Peak limiter -- stereo-linked (one shared gain-reduction envelope across
+ * channels, rather than independent per-channel), so a loud transient
+ * doesn't shift the stereo image the way independent per-channel gain
+ * reduction would. Engages only when the preamp/EQ stage's own output would
+ * exceed full scale -- unboosted material never pulls limiter_gain below
+ * 1.0, so normal EQ use (cuts, or boosts that stay within headroom) sounds
+ * completely unaffected. Real-device bug report: the "Loudness Boost"
+ * example plugin (raises this same preamp via plugin.eq_set_preamp())
+ * distorted audibly at anything above a few dB of boost -- a bare linear-
+ * gain-then-hard-clip signal chain (peq_process()'s previous behavior)
+ * clips almost any normally-mastered track well before +12dB, the plugin's
+ * own max. This replaces that flat clamp with real gain reduction; the
+ * int16 clamp still in peq_process() below is now just a belt-and-
+ * suspenders safety net for the one sample a no-lookahead limiter can't
+ * react in time for (e.g. a sudden transient's very first sample), not the
+ * primary anti-clipping mechanism. */
+static float limiter_gain = 1.0f; /* current linear gain reduction, 1.0 = none */
+
+/* One-pole envelope-follower time constants -- attack fast enough to catch
+ * a sustained loud passage within a few samples (avoiding an audible "over"
+ * before the limiter reacts), release slow enough that gain recovers
+ * smoothly after the loud passage ends instead of audibly "pumping" on
+ * every transient. Standard limiter defaults; protects manual EQ band
+ * boosts too, not just the preamp slider a plugin might drive. Ceiling sits
+ * a hair under true full scale (32767) so the envelope's own smoothing lag
+ * has a small margin before the belt-and-suspenders clamp would ever need
+ * to actually bite in normal operation. */
+#define LIMITER_ATTACK_SEC 0.001
+#define LIMITER_RELEASE_SEC 0.050
+#define LIMITER_CEILING 32760.0f
+
 /* ISO-standard 10-band graphic EQ center frequencies -- matches the layout
  * of typical hardware DAP PEQ screens (band 0 a low shelf, band 9 a high
  * shelf, the rest peaking bells). */
@@ -215,7 +246,17 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
      * biquad_coeffs_t/biquad_state_t being float (see their own comment). */
     float preamp_linear = (float) pow(10.0, preamp_db / 20.0);
 
+    /* Recomputed every call (cheap -- two exp() calls, not per-sample) --
+     * sample_rate can change between calls (a new track, or DSD's own
+     * decimated output rate), same reasoning recompute_all_coeffs() already
+     * has for the biquad coefficients above. */
+    float attack_coeff = (float) exp(-1.0 / (LIMITER_ATTACK_SEC * (double) sample_rate));
+    float release_coeff = (float) exp(-1.0 / (LIMITER_RELEASE_SEC * (double) sample_rate));
+
     for (size_t i = 0; i < frame_count; i++) {
+        float frame_samples[PEQ_MAX_CHANNELS];
+        float frame_peak = 0.0f;
+
         for (int ch = 0; ch < channels; ch++) {
             float sample = (float) buf[i * (size_t) channels + (size_t) ch] * preamp_linear;
 
@@ -237,14 +278,34 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
                 sample = y0;
             }
 
-            /* Belt-and-suspenders alongside the shelf-filter sqrt() clamp
-             * above: NaN fails every comparison (including the clamps just
-             * below), so it would otherwise reach the int16_t cast
-             * unclamped -- undefined behavior in C, and on real hardware
-             * this session's own root-caused bug showed it as a full,
-             * sticky device mute. Any future bad coefficient (this band
-             * type or another) hits silence for that one sample instead. */
+            /* NaN fails every comparison (including the clamps below), so
+             * it would otherwise poison frame_peak/limiter_gain permanently
+             * (both just track whatever's handed to them, with no clamp of
+             * their own) -- real-device bug this session already root-
+             * caused once for the shelf-filter sqrt() above: a bad
+             * coefficient produced NaN that stuck around as a full, sticky
+             * device mute. Caught here, before it can spread. */
             if (!isfinite(sample)) sample = 0.0f;
+            frame_samples[ch] = sample;
+            float abs_sample = sample < 0.0f ? -sample : sample;
+            if (abs_sample > frame_peak) frame_peak = abs_sample;
+        }
+
+        /* Stereo-linked gain reduction: both channels of this frame share
+         * one envelope, driven by whichever channel is louder, so a hard-
+         * panned transient doesn't tug the gain (and therefore the
+         * perceived stereo image) unevenly between L/R. */
+        float desired_gain = frame_peak > LIMITER_CEILING ? LIMITER_CEILING / frame_peak : 1.0f;
+        float coeff = desired_gain < limiter_gain ? attack_coeff : release_coeff;
+        limiter_gain = coeff * limiter_gain + (1.0f - coeff) * desired_gain;
+
+        for (int ch = 0; ch < channels; ch++) {
+            float sample = frame_samples[ch] * limiter_gain;
+            /* Belt-and-suspenders, not the primary anti-clipping mechanism
+             * anymore -- see limiter_gain's own comment. A no-lookahead
+             * limiter can't fully react to a single-sample transient before
+             * it happens, so this is the real last line of defense for
+             * that one edge case. */
             if (sample > 32767.0f) sample = 32767.0f;
             if (sample < -32768.0f) sample = -32768.0f;
             buf[i * (size_t) channels + (size_t) ch] = (int16_t) sample;

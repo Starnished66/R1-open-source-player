@@ -48,6 +48,24 @@ static double preamp_db = 0.0;
 static unsigned int coeffs_sample_rate = 0;
 static bool coeffs_dirty = true;
 
+/* Real bug caught in a third review pass: preamp_linear was still
+ * recomputed via pow() on every single peq_process() call, unlike the
+ * limiter's own attack/release coefficients right below (which got the
+ * cached-and-invalidated treatment in the previous pass). Cached here and
+ * kept in sync by every one of preamp_db's own write sites (peq_set_
+ * preamp_db(), set_defaults(), and peq_load_from_path()'s profile-loading
+ * parse loop -- that last one writes preamp_db directly rather than through
+ * the setter, which is exactly why an earlier pass left this one
+ * uncached: a cache only keyed off "did the setter run" would go stale on
+ * every profile load. update_preamp_linear_cache() is the one recompute
+ * point every write site calls afterward instead, so there's no unguarded
+ * write path left. */
+static float cached_preamp_linear = 1.0f;
+
+static void update_preamp_linear_cache(void) {
+    cached_preamp_linear = (float) pow(10.0, preamp_db / 20.0);
+}
+
 /* Peak limiter -- stereo-linked (one shared gain-reduction envelope across
  * channels, rather than independent per-channel), so a loud transient
  * doesn't shift the stereo image the way independent per-channel gain
@@ -110,6 +128,7 @@ static void set_defaults(void) {
     }
     bypass = false;
     preamp_db = 0.0;
+    update_preamp_linear_cache();
 }
 
 static void compute_band_coeffs(int index, unsigned int sample_rate) {
@@ -213,7 +232,10 @@ bool peq_get_bypass(void) { return bypass; }
 void peq_set_bypass(bool b) { bypass = b; }
 
 double peq_get_preamp_db(void) { return preamp_db; }
-void peq_set_preamp_db(double db) { preamp_db = db; }
+void peq_set_preamp_db(double db) {
+    preamp_db = db;
+    update_preamp_linear_cache();
+}
 
 const peq_band_t * peq_get_band(int index) {
     if (index < 0 || index >= PEQ_NUM_BANDS) return NULL;
@@ -271,18 +293,12 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
     if (channels < 1) return;
     if (channels > PEQ_MAX_CHANNELS) channels = PEQ_MAX_CHANNELS;
 
-    /* pow() itself stays double (cheap, runs once per call, nowhere near
-     * the per-sample loop below) -- narrowed to float once here rather than
-     * left double and letting every sample's first multiply implicitly
-     * promote back to double, which would silently undo the point of
-     * biquad_coeffs_t/biquad_state_t being float (see their own comment).
-     * Recomputed fresh every call rather than cached against preamp_db,
-     * unlike the attack/release coefficients below -- peq_load_from_path()
-     * (further down) writes preamp_db directly rather than through peq_set_
-     * preamp_db(), so a cache keyed off "did the setter run" would go stale
-     * on every profile load; one pow() call per buffer is cheap enough that
-     * it isn't worth chasing every write site to keep a cache correct. */
-    float preamp_linear = (float) pow(10.0, preamp_db / 20.0);
+    /* Cached (update_preamp_linear_cache(), kept in sync by every one of
+     * preamp_db's own write sites -- see that function's own comment for
+     * why an earlier pass left this uncached and why that reasoning didn't
+     * hold up). float, not double, for the same reason biquad_coeffs_t/
+     * biquad_state_t are float -- see their own comment. */
+    float preamp_linear = cached_preamp_linear;
 
     float attack_coeff = cached_attack_coeff;
     float release_coeff = cached_release_coeff;
@@ -367,6 +383,7 @@ bool peq_load_from_path(const char * path) {
         }
         if (strcmp(key, "preamp") == 0) {
             preamp_db = atof(value);
+            update_preamp_linear_cache();
             continue;
         }
 

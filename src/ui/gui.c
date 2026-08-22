@@ -8012,6 +8012,23 @@ static void lyrics_gesture_event_cb(lv_event_t * e) {
 
     lv_indev_wait_release(indev); /* same reasoning as screen_gesture_event_cb's own comment -- avoid a phantom tap landing on the player screen under the still-down finger */
     lv_timer_pause(lyrics_timer);
+    /* Real bug caught in review: the backdrop (~768KB RGB565, LYRICS_
+     * BACKDROP_WIDTH x HEIGHT x 2) stayed allocated for the rest of the
+     * app's runtime after leaving this screen -- not a leak (poll_lyrics_
+     * backdrop() already frees the previous one before replacing it on the
+     * NEXT open), but a needless standing hold on a device with ~56MB total
+     * RAM. Freed here instead, on the one confirmed way out of this screen
+     * (see this function's own header comment). lyrics_backdrop_img is
+     * re-hidden so a stale freed pointer in current_lyrics_backdrop_dsc
+     * can't get redrawn before the next open's own launch_lyrics_backdrop_
+     * decode() lands a fresh one -- open_lyrics_screen() already falls back
+     * to a plain dark background for that brief window regardless (see
+     * launch_lyrics_backdrop_decode()'s own comment), so this costs nothing
+     * new on re-entry beyond that already-accepted, already-documented gap. */
+    free(current_lyrics_backdrop_bytes);
+    current_lyrics_backdrop_bytes = NULL;
+    current_lyrics_backdrop_dsc.data = NULL;
+    lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
     if (nav_depth > 1) nav_depth--;
     lv_screen_load(nav_stack[nav_depth - 1]);
 }

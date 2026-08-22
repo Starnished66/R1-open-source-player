@@ -5,6 +5,7 @@
 #include "ogg_demux.h"
 #include "mbedtls/base64.h"
 
+#include <limits.h>
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
@@ -15,6 +16,32 @@
 #include <strings.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* Real bug caught in a second review pass: the WMA/DFF/WAV-ID3-fallback
+ * chunk walkers below used to compute their own `next` seek target as
+ * `chunk_start + (long) size + pad` -- a raw uint64_t `size` straight off
+ * disk, cast then added with no bound checking first. A forward-progress
+ * check (`next <= chunk_start`) was already added after that computation to
+ * stop a corrupted file from looping forever, but the computation itself
+ * could already have invoked undefined behavior (signed overflow in the
+ * addition -- not just the implementation-defined truncation the cast
+ * alone would be) before that check ever runs; a post-hoc sanity check
+ * can't retroactively make an already-UB expression's result trustworthy.
+ * This validates the raw, still-unsigned `size` against a safe bound
+ * BEFORE any cast or addition touches it, so the arithmetic that actually
+ * produces `next` can never overflow in the first place. Returns false
+ * (leaving *out_next untouched) if `size` is too large to safely add to
+ * `chunk_start` at all -- every call site below already treats "can't
+ * compute a valid next position" the same as "doesn't advance", i.e. stop
+ * walking this chunk list. */
+static bool safe_chunk_advance(long chunk_start, uint64_t size, long pad, long * out_next) {
+    if (chunk_start < 0 || pad < 0) return false;
+    if (size > (uint64_t) (LONG_MAX - pad)) return false;
+    long size_l = (long) size; /* provably in-range now -- no implementation-defined truncation */
+    if (chunk_start > LONG_MAX - size_l - pad) return false; /* would overflow the addition below */
+    *out_next = chunk_start + size_l + pad;
+    return true;
+}
 
 static void copy_bounded(char * dst, size_t dst_size, const char * src, size_t src_len) {
     if (src_len >= dst_size) src_len = dst_size - 1;
@@ -50,6 +77,35 @@ static bool parse_finite_double(const char * str, double * out) {
  * keys too, so this tag family isn't actually Vorbis-specific despite the
  * name). value is bounded-copied into a small stack buffer first since
  * neither caller's value buffer is guaranteed NUL-terminated. */
+/* Real bug caught in a second review pass: parse_finite_double() rejects
+ * non-finite text (literal "nan"/"inf") but happily accepts an absurd-but-
+ * finite value like "1e308" -- gain_db that large overflows pow(10.0,
+ * gain_db/20.0) in audio.c's replaygain_to_linear() to +/-infinity, which
+ * (absent a peak tag to clamp it, not every tagger writes one) reaches
+ * apply_gain()'s lrintf() call on a non-finite float, the same unspecified-
+ * result class of bug the finite check was meant to close in the first
+ * place. Real-world ReplayGain gain values sit within a few dB of 0 (loud-
+ * to-quiet mastering differences rarely exceed +-20dB); real peak values
+ * are a linear ratio a bit above or below 1.0. These bounds are already
+ * generous by an order of magnitude or more on both sides -- anything
+ * outside them is corrupted, not just unusually mastered. */
+#define REPLAYGAIN_GAIN_DB_LIMIT 100.0
+#define REPLAYGAIN_PEAK_LIMIT 100.0
+
+static bool parse_replaygain_gain(const char * str, double * out) {
+    double v;
+    if (!parse_finite_double(str, &v) || v < -REPLAYGAIN_GAIN_DB_LIMIT || v > REPLAYGAIN_GAIN_DB_LIMIT) return false;
+    *out = v;
+    return true;
+}
+
+static bool parse_replaygain_peak(const char * str, double * out) {
+    double v;
+    if (!parse_finite_double(str, &v) || v <= 0.0 || v > REPLAYGAIN_PEAK_LIMIT) return false;
+    *out = v;
+    return true;
+}
+
 static void apply_replaygain_field(track_metadata_t * out, const char * key, size_t key_len, const char * value,
                                     size_t value_len) {
     if (key_len != 21) return; /* every one of the four keys below is exactly 21 characters */
@@ -57,22 +113,22 @@ static void apply_replaygain_field(track_metadata_t * out, const char * key, siz
     copy_bounded(value_buf, sizeof(value_buf), value, value_len);
     double v;
     if (strncasecmp(key, "REPLAYGAIN_TRACK_GAIN", 21) == 0) {
-        if (parse_finite_double(value_buf, &v)) {
+        if (parse_replaygain_gain(value_buf, &v)) {
             out->replaygain_gain_db = v;
             out->has_replaygain = true;
         }
     } else if (strncasecmp(key, "REPLAYGAIN_TRACK_PEAK", 21) == 0) {
-        if (parse_finite_double(value_buf, &v)) {
+        if (parse_replaygain_peak(value_buf, &v)) {
             out->replaygain_peak = v;
             out->has_replaygain_peak = true;
         }
     } else if (strncasecmp(key, "REPLAYGAIN_ALBUM_GAIN", 21) == 0) {
-        if (parse_finite_double(value_buf, &v)) {
+        if (parse_replaygain_gain(value_buf, &v)) {
             out->replaygain_album_gain_db = v;
             out->has_replaygain_album = true;
         }
     } else if (strncasecmp(key, "REPLAYGAIN_ALBUM_PEAK", 21) == 0) {
-        if (parse_finite_double(value_buf, &v)) {
+        if (parse_replaygain_peak(value_buf, &v)) {
             out->replaygain_album_peak = v;
             out->has_replaygain_album_peak = true;
         }
@@ -1063,6 +1119,7 @@ static void read_aiff_metadata(const char * path, track_metadata_t * out) {
     }
 
     while (1) {
+        long chunk_start = ftell(f); /* before this iteration's own header read -- see safe_chunk_advance()'s own comment */
         uint8_t chunk_header[8];
         if (fread(chunk_header, 1, sizeof(chunk_header), f) != sizeof(chunk_header)) break;
 
@@ -1076,9 +1133,16 @@ static void read_aiff_metadata(const char * path, track_metadata_t * out) {
             break;
         }
 
-        /* Chunks are padded to an even number of bytes, same as aiff_decoder.c's own walk. */
-        long next = chunk_data_start + (long) chunk_size + (long) (chunk_size & 1);
-        if (fseek(f, next, SEEK_SET) != 0) break;
+        /* Chunks are padded to an even number of bytes, same as
+         * aiff_decoder.c's own walk. Real bug caught in review: this loop
+         * had no bound at all (not even a forward-progress check) -- a
+         * corrupted chunk_size could seek back to chunk_start and loop
+         * here forever, reachable via plain metadata_read() (not just the
+         * isolated/timeout variant) whenever a user taps to play a
+         * corrupted AIFF file. */
+        long next;
+        if (!safe_chunk_advance(chunk_data_start, chunk_size, (long) (chunk_size & 1), &next) ||
+            next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
     }
 
     fclose(f);
@@ -1131,13 +1195,15 @@ static void read_wav_id3_fallback(const char * path, track_metadata_t * out) {
         }
 
         /* Chunks are padded to an even number of bytes, same RIFF convention as every other chunk here.
-         * Real bug caught in review: chunk_size >= 0x80000000 (a corrupted
-         * file) narrows to a negative `long` on this 32-bit target's
-         * implementation-defined unsigned->signed conversion, which could
-         * make `next` land at or before chunk_start and re-read the same
-         * bytes forever -- this loop has no other bound at all. */
-        long next = chunk_data_start + (long) chunk_size + (long) (chunk_size & 1);
-        if (next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
+         * Real bug caught in review, hardened in a second pass: validating
+         * `size` before any cast/add (safe_chunk_advance()) rather than
+         * just sanity-checking `next` after computing it -- a post-hoc
+         * check can't undo an already-UB signed-overflow addition that ran
+         * to produce a bad `next` in the first place. This loop has no
+         * other bound at all besides forward progress. */
+        long next;
+        if (!safe_chunk_advance(chunk_data_start, chunk_size, (long) (chunk_size & 1), &next) ||
+            next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
     }
 
     fclose(f);
@@ -1352,23 +1418,33 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
             return;
         }
         if (strcmp(id, "DIIN") == 0 && diin_data_start < 0) {
-            diin_data_start = chunk_data_start;
-            diin_end = chunk_data_start + (long) size;
+            /* Real bug caught in a second review pass: this used to
+             * compute diin_end unconditionally, the same raw cast-and-add
+             * every other `next` here was already hardened against below
+             * -- a corrupted `size` could make it overflow just the same.
+             * Only recorded when it can be computed safely; otherwise
+             * diin_data_start stays -1, and the DIIN fallback below simply
+             * never runs for this (corrupted) chunk, same as if no DIIN
+             * chunk had been seen at all. */
+            long candidate_end;
+            if (safe_chunk_advance(chunk_data_start, size, 0, &candidate_end)) {
+                diin_data_start = chunk_data_start;
+                diin_end = candidate_end;
+            }
         }
 
-        /* Real bug caught in review: `size` is a raw uint64_t straight off
-         * disk with no validation -- a corrupted or malicious file's huge
-         * or specially-crafted value can make `next` land at or before
-         * chunk_start once narrowed to `long` (implementation-defined
-         * truncation/sign conversion on this 32-bit target), which would
-         * otherwise re-read the exact same bytes and loop here forever
-         * with no other bound at all (unlike, say, read_wma_metadata()'s
-         * own chunk walk, which is at least capped by a finite object
-         * count). Requiring forward progress catches every such case
-         * without needing to individually validate every possible overflow
-         * in the arithmetic above. */
-        long next = chunk_data_start + (long) size + (long) (size & 1);
-        if (next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
+        /* Real bug caught in review, hardened in a second pass: `size` is a
+         * raw uint64_t straight off disk with no validation -- validating
+         * it before any cast/add (safe_chunk_advance()) rather than only
+         * sanity-checking `next` afterward, since a post-hoc check can't
+         * undo an already-UB signed-overflow addition that ran to produce
+         * a bad `next` in the first place. Forward progress is still
+         * required on top of that -- this loop has no other bound at all
+         * (unlike, say, read_wma_metadata()'s own chunk walk, which is at
+         * least capped by a finite object count). */
+        long next;
+        if (!safe_chunk_advance(chunk_data_start, size, (long) (size & 1), &next) ||
+            next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
     }
 
     /* No "ID3 " chunk anywhere -- fall back to the spec-native DIIN
@@ -1396,14 +1472,15 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
                 }
             }
 
-            long next = sub_data_start + (long) sub_size + (long) (sub_size & 1);
             /* This loop's own `while (ftell(f) < diin_end)` bound only
              * protects against a NEVER-arriving end position -- it doesn't
              * stop a non-advancing `next` from re-reading the same bytes
              * forever, since ftell(f) would never move past diin_end in
-             * that case either. Same forward-progress requirement as the
-             * outer chunk walk above. */
-            if (next <= sub_chunk_start || fseek(f, next, SEEK_SET) != 0) break;
+             * that case either. Same safe-advance-then-forward-progress
+             * requirement as the outer chunk walk above. */
+            long next;
+            if (!safe_chunk_advance(sub_data_start, sub_size, (long) (sub_size & 1), &next) ||
+                next <= sub_chunk_start || fseek(f, next, SEEK_SET) != 0) break;
         }
     }
 
@@ -1479,17 +1556,22 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
         if (fread(sub_guid, 1, 16, f) != 16 || fread(sub_size_buf, 1, 8, f) != 8) break;
         uint64_t sub_size = read_u64le(sub_size_buf);
         long data_start = ftell(f);
-        /* Real bug caught in review: sub_size is raw off disk -- if a
-         * corrupted file has sub_size < 24 (smaller than the guid+size
-         * header this object's own data is supposed to start after), this
-         * subtraction underflows (uint64_t wraps), and the (long) cast of
-         * that huge wrapped value is implementation-defined on this 32-bit
-         * target. The num_objects loop bound above still caps the total
-         * iteration count, but a non-advancing/backward `next` can still
-         * make it re-read (and effectively hang on) the same bytes for
-         * every remaining one of a corrupted, possibly huge num_objects --
-         * checked below alongside the actual seek. */
-        long next = data_start + (long) (sub_size - 24);
+        /* Real bug caught in review, hardened in a second pass: sub_size is
+         * raw off disk -- a corrupted file with sub_size < 24 (smaller than
+         * the guid+size header this object's own data is supposed to start
+         * after) used to underflow this subtraction before anything ever
+         * checked it, then feed the wrapped huge value into a cast/add that
+         * could itself already be UB (signed overflow) by the time any
+         * post-hoc sanity check on `next` ran. Rejected outright, before
+         * any arithmetic touches sub_size at all, rather than validated
+         * after the fact. The num_objects loop bound above still caps the
+         * total iteration count on its own, but a non-advancing/backward
+         * `next` could still make this re-read (and effectively hang on)
+         * the same bytes for every remaining one of a corrupted, possibly
+         * huge num_objects -- checked below alongside the actual seek. */
+        if (sub_size < 24) break;
+        long next;
+        if (!safe_chunk_advance(data_start, sub_size - 24, 0, &next)) break;
 
         if (memcmp(sub_guid, GUID_CONTENT_DESCRIPTION, 16) == 0) {
             uint8_t lens[10]; /* 5 x u16LE lengths: title, author, copyright, description, rating */

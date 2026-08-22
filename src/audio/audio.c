@@ -487,6 +487,16 @@ static double replaygain_to_linear(bool has_gain, double gain_db, bool has_peak,
         double max_linear = 1.0 / peak; /* clamp so the loudest sample can't clip */
         if (linear > max_linear) linear = max_linear;
     }
+    /* Belt-and-suspenders alongside metadata.c's own parse_replaygain_gain()/
+     * _peak() range limits: those already reject an absurd-but-finite
+     * gain_db (e.g. a corrupted "1e308" tag) before it ever reaches this
+     * function, but this is the one real choke point every gain value from
+     * every tag format/call site funnels through before apply_gain()'s
+     * lrintf() -- cheap enough to guard here too rather than trust every
+     * current and future caller to have validated its own inputs. Falls
+     * back to unity (no gain change) rather than propagating a non-finite
+     * value into raw sample math. */
+    if (!isfinite(linear)) linear = 1.0;
     return linear;
 }
 

@@ -103,8 +103,8 @@ void metadata_db_get_group_counts(int * out_artist_count, int * out_album_artist
  * than max_rows (including 0) means this was the last page. */
 int metadata_db_get_songs_page(const char * after_title, int64_t after_id, int max_rows, song_row_t * out_rows);
 
-/* Offset-paginated page of songs ordered by first_seen DESC (rowid DESC
- * tiebreak) -- backs the Recently Added screen's compact_list_set_paged_
+/* Offset-paginated page of songs ordered by first_seen DESC (path COLLATE
+ * NOCASE tiebreak) -- backs the Recently Added screen's compact_list_set_paged_
  * provider(), the same bounded-page-at-a-time shape metadata_db_get_songs_
  * filtered_page() gives All Songs, rather than loading the whole library
  * into RAM. Pair with metadata_db_get_song_recency_offset() below for a

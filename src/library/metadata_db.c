@@ -452,22 +452,71 @@ void metadata_db_open(void) {
         "CREATE INDEX IF NOT EXISTS idx_media_album ON media(album COLLATE NOCASE, album_artist COLLATE NOCASE);",
         "CREATE INDEX IF NOT EXISTS idx_media_album_artist ON media(album_artist COLLATE NOCASE, album COLLATE NOCASE);",
         "CREATE INDEX IF NOT EXISTS idx_media_generation ON media(scan_generation);",
-        /* Backs metadata_db_get_songs_page_by_recency()'s own "ORDER BY
-         * first_seen DESC, rowid DESC" (Recently Added's paged provider) --
-         * DESC here so the index is already in the exact order that query
-         * wants, rather than SQLite needing to walk an ascending index
-         * backwards (which it CAN do, but a matching-direction index is the
-         * more conservative choice given this table's real-world size --
-         * see this block's own comment on how invisible a missing index
-         * stays against a small library vs. a real one). No explicit
-         * trailing rowid column, same reasoning as every index above. */
-        "CREATE INDEX IF NOT EXISTS idx_media_first_seen ON media(first_seen DESC);",
     };
     for (size_t i = 0; i < sizeof(index_sql) / sizeof(index_sql[0]); i++) {
         char * err = NULL;
         if (sqlite3_exec(db, index_sql[i], NULL, NULL, &err) != SQLITE_OK) {
             fprintf(stderr, "Warning: failed to create index (%s): %s\n", index_sql[i], err ? err : "unknown error");
             sqlite3_free(err);
+        }
+    }
+
+    /* idx_media_first_seen backs metadata_db_get_songs_page_by_recency()'s
+     * own "ORDER BY first_seen DESC, path COLLATE NOCASE" (Recently Added's
+     * paged provider) -- handled separately from the CREATE-IF-NOT-EXISTS
+     * loop above rather than folded into it, because this one's own
+     * definition already changed once (first_seen DESC alone, no path
+     * column) before this exact fix. CREATE INDEX IF NOT EXISTS is a
+     * SILENT NO-OP when an index with that name already exists, even if
+     * its actual column list differs -- a device that already ran an
+     * earlier build with the narrower version would keep it forever,
+     * permanently missing the fix below, since nothing would ever detect
+     * or replace it. Compares against sqlite_master's own stored SQL text
+     * for this exact index name first, only dropping and recreating when
+     * it's missing or doesn't already match -- avoids paying a drop+
+     * rebuild cost on every single boot once this has migrated once,
+     * unlike an unconditional DROP+CREATE pair would.
+     *
+     * path COLLATE NOCASE as a real trailing column -- NOT the bare
+     * rowid-as-implicit-tiebreaker every index in the loop above relies
+     * on. Real bug caught in a second review pass, confirmed empirically
+     * with a real sqlite3 EXPLAIN QUERY PLAN against this exact schema: a
+     * bulk scan can insert many rows with the identical first_seen second-
+     * granularity timestamp, and SQLite still needed `ORDER BY first_seen
+     * DESC, rowid DESC` to pick a "USE TEMP B-TREE FOR LAST TERM OF ORDER
+     * BY" plan for THOSE ties, since rowid isn't actually a column this
+     * index carries -- it's only usable as a tiebreaker when it's the
+     * query's own very last ORDER BY term, and here it wasn't. Matching
+     * the query's own secondary key to a column the index actually
+     * contains (verified this way removes the temp b-tree entirely) fixes
+     * it. path also matches metadata_db_load_recently_added_songs()'s own
+     * tiebreak already (a happy consistency side effect, not the primary
+     * motivation) -- see metadata_db_get_songs_page_by_recency()'s own
+     * comment for why path over rowid doesn't lose anything meaningful
+     * within a same-second tie either way. */
+    {
+        static const char * const first_seen_index_name = "idx_media_first_seen";
+        static const char * const first_seen_index_sql =
+            "CREATE INDEX idx_media_first_seen ON media(first_seen DESC, path COLLATE NOCASE)";
+        bool matches = false;
+        sqlite3_stmt * check_st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT sql FROM sqlite_master WHERE type='index' AND name=?;", -1, &check_st,
+                                NULL) == SQLITE_OK) {
+            sqlite3_bind_text(check_st, 1, first_seen_index_name, -1, SQLITE_STATIC);
+            if (sqlite3_step(check_st) == SQLITE_ROW) {
+                const unsigned char * existing_sql = sqlite3_column_text(check_st, 0);
+                matches = existing_sql && strcmp((const char *) existing_sql, first_seen_index_sql) == 0;
+            }
+            sqlite3_finalize(check_st);
+        }
+        if (!matches) {
+            sqlite3_exec(db, "DROP INDEX IF EXISTS idx_media_first_seen;", NULL, NULL, NULL);
+            char * err = NULL;
+            if (sqlite3_exec(db, first_seen_index_sql, NULL, NULL, &err) != SQLITE_OK) {
+                fprintf(stderr, "Warning: failed to create index (%s): %s\n", first_seen_index_sql,
+                        err ? err : "unknown error");
+                sqlite3_free(err);
+            }
         }
     }
 
@@ -755,16 +804,30 @@ int metadata_db_get_songs_page(const char * after_title, int64_t after_id, int m
     return count;
 }
 
-/* Offset-paginated page of songs ordered by first_seen DESC (rowid DESC
- * tiebreak) -- backs the Recently Added screen's own compact_list_set_
- * paged_provider(), same "bounded page at a time, regardless of library
+/* Offset-paginated page of songs ordered by first_seen DESC (path COLLATE
+ * NOCASE tiebreak) -- backs the Recently Added screen's own compact_list_
+ * set_paged_provider(), same "bounded page at a time, regardless of library
  * size" shape as metadata_db_get_songs_filtered_page() (used by All Songs)
  * rather than metadata_db_load_recently_added_songs() above (deliberately
  * capped at a small limit, for the scoped-playlist/remote-control case
  * only -- see its own comment). Offset-based, not keyset, matching every
  * other compact_list-paged provider's own query (Artists/Albums/Album
  * Artist/All Songs) -- a virtualized UI list needs arbitrary scroll-driven
- * jumps, not just "next page". */
+ * jumps, not just "next page".
+ *
+ * path, not rowid, as the tiebreak -- real bug caught in a second review
+ * pass: a bulk scan can insert many rows sharing the exact same first_seen
+ * second-granularity timestamp, and `rowid DESC` as a tiebreak isn't a
+ * column idx_media_first_seen actually carries, forcing SQLite into a temp-
+ * b-tree sort for every one of those ties (confirmed empirically with a
+ * real sqlite3 EXPLAIN QUERY PLAN against this exact schema -- see that
+ * index's own prepare_statements() comment). path COLLATE NOCASE IS a
+ * column that index carries, so matching the query to it removes the temp
+ * sort entirely; a same-second tie has no other meaningful order to begin
+ * with, so alphabetical is as good a tiebreak as insertion order was. Keep
+ * this in sync with metadata_db_get_song_recency_offset()'s own tiebreak
+ * logic below -- both must agree on the exact same order or a "now
+ * playing" offset from one won't land on the right row of the other. */
 int metadata_db_get_songs_page_by_recency(int offset, int max_rows, song_row_t * out_rows) {
     METADATA_DB_GUARD;
     if (!db || max_rows <= 0) return 0;
@@ -772,7 +835,7 @@ int metadata_db_get_songs_page_by_recency(int offset, int max_rows, song_row_t *
 
     static const char * const query =
         "SELECT rowid, path, title, artist, album, album_artist, genre FROM media "
-        "ORDER BY first_seen DESC, rowid DESC LIMIT ? OFFSET ?;";
+        "ORDER BY first_seen DESC, path COLLATE NOCASE LIMIT ? OFFSET ?;";
     sqlite3_stmt * st = NULL;
     if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_int(st, 1, max_rows);
@@ -1181,17 +1244,19 @@ int64_t metadata_db_get_song_title_offset(const char * path) {
 }
 
 /* Same role as metadata_db_get_song_title_offset() above, but resolving a
- * position in the Recently Added screen's own order (first_seen DESC, rowid
- * DESC tiebreak -- matching metadata_db_get_songs_page_by_recency()'s own
- * ORDER BY exactly, so a "now playing" offset from here always lands on the
- * right row of that screen's paged provider) rather than title order. */
+ * position in the Recently Added screen's own order (first_seen DESC, path
+ * COLLATE NOCASE tiebreak -- matching metadata_db_get_songs_page_by_
+ * recency()'s own ORDER BY exactly, so a "now playing" offset from here
+ * always lands on the right row of that screen's paged provider) rather
+ * than title order. path ascending for ties, so a row "precedes" target
+ * when its path sorts lexically before target's own. */
 int64_t metadata_db_get_song_recency_offset(const char * path) {
     METADATA_DB_GUARD;
     if (!db || !path) return -1;
     static const char * const query =
         "SELECT COUNT(*) FROM media AS preceding, media AS target "
         "WHERE target.path = ? AND (preceding.first_seen > target.first_seen "
-        "OR (preceding.first_seen = target.first_seen AND preceding.rowid > target.rowid));";
+        "OR (preceding.first_seen = target.first_seen AND preceding.path COLLATE NOCASE < target.path COLLATE NOCASE));";
     sqlite3_stmt * st = NULL;
     if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);

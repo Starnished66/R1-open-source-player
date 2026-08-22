@@ -1,5 +1,6 @@
 #include "lvgl/lvgl.h"
 #include "audio.h"
+#include "backlight.h"
 #include <stdint.h>
 #include <unistd.h>
 #include <signal.h>
@@ -364,10 +365,11 @@ int main(void) {
         perf_handler_calls++;
         if (perf_handler_us >= 16000) perf_handler_over_16ms++;
         if ((uint32_t) (real_tick - perf_report_tick) >= 1000) {
-            printf("PERF main handler calls=%u avg_us=%llu max_us=%llu over16=%u next_ms=%u\n",
+            printf("PERF main handler calls=%u avg_us=%llu max_us=%llu over16=%u next_ms=%u screen_on=%d\n",
                    perf_handler_calls,
                    (unsigned long long) (perf_handler_calls ? perf_handler_total_us / perf_handler_calls : 0),
-                   (unsigned long long) perf_handler_max_us, perf_handler_over_16ms, time_till_next);
+                   (unsigned long long) perf_handler_max_us, perf_handler_over_16ms, time_till_next,
+                   backlight_screen_is_on());
             perf_report_tick = real_tick;
             perf_handler_total_us = 0;
             perf_handler_max_us = 0;
@@ -392,7 +394,20 @@ int main(void) {
          * while still being long enough that a genuinely idle app burns
          * negligible CPU -- and covers any future timer hitting the same
          * window, not just this one. */
-        if (time_till_next > 100) time_till_next = 100;
+        /* Screen-off CPU/battery optimization: while the backlight is off,
+         * gui.c's own update_timer_cb() (still running every 500ms -- see
+         * its own comment on why that keeps going regardless) is the only
+         * timer that still needs prompt service; LVGL's display-refresh
+         * timer is paused for the same duration (see gui.c's screen_just_
+         * woke/screen_on_now handling), so there's nothing display-related
+         * this loop needs to wake up quickly for. Raising the idle cap to
+         * match that 500ms cadence while off (kept at 100ms while on, for
+         * touch/animation responsiveness) is what actually cuts main-loop
+         * wakeups -- backlight_screen_is_on() is the same shared source of
+         * truth gui.c itself uses, so this can never disagree with the
+         * paused/resumed state of the refresh timer. */
+        uint32_t idle_cap_ms = backlight_screen_is_on() ? 100 : 500;
+        if (time_till_next > idle_cap_ms) time_till_next = idle_cap_ms;
         usleep(time_till_next * 1000); /* Convert milliseconds to microseconds */
     }
 

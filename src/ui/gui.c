@@ -22,6 +22,7 @@
 #include "cover_decode.h"
 #include "lyrics.h"
 #include "lyrics_layout.h"
+#include "transition_compositor.h"
 #include "wifi_control.h"
 #include "bluetooth_control.h"
 #include "hiby_sys_server.h"
@@ -53,6 +54,7 @@
 #include "src/misc/lv_area.h"
 #include "src/draw/lv_draw_buf.h"
 #include "src/others/snapshot/lv_snapshot.h"
+#include "src/core/lv_refr.h"
 #include "src/widgets/image/lv_image.h"
 #include "src/drivers/display/fb/lv_linux_fbdev.h"
 #include <ctype.h>
@@ -599,6 +601,13 @@ static lv_color_t accent_lv_color(void) {
     return lv_color_hex(current_settings.accent_color);
 }
 
+/* Defined further down alongside the rest of the player-screen transition
+ * cache (register_static_snapshot()'s own neighborhood) -- forward-declared
+ * here since apply_accent_color() below needs to invalidate that cache
+ * (accent color repaints the player screen's own progress-slider styling)
+ * but is itself defined earlier in the file. */
+static void player_transition_mark_dirty(void);
+
 static void apply_accent_color(uint32_t rgb) {
     current_settings.accent_color = rgb;
     lv_style_set_bg_color(&style_accent, lv_color_hex(rgb));
@@ -648,6 +657,7 @@ static void apply_accent_color(uint32_t rgb) {
      * refresh whoever uses it", and safely walks every screen itself. */
     lv_obj_report_style_change(&style_accent);
     settings_save(&current_settings);
+    player_transition_mark_dirty(); /* progress_slider's own style_accent usage on player_screen just repainted -- see the cache's own doc comment */
 }
 
 static const uint32_t accent_palette[] = {
@@ -707,16 +717,188 @@ static int nav_depth = 0;
  * becomes "2 renders + N cheap bitmap blits". The real target screen is
  * only actually made active once the slide finishes. */
 
+/* Forward declarations -- real (first) tentative definitions further down
+ * this file, alongside the code that actually builds/positions each of
+ * these. A plain `static T * x;` with no initializer is a tentative
+ * definition in C; declaring the same one twice in one translation unit is
+ * fine and merges into a single variable, so this is just an ordering fix,
+ * not a second/shadow copy -- build_flattened_transition_frame() below
+ * needs all three, and is used by register_static_snapshot() just below
+ * it, which is itself defined earlier in the file than any of the real
+ * declarations. */
+static lv_obj_t * status_bar_band;
+static lv_obj_t * home_indicator_band;
+
+/* Alpha-blends one row of an ARGB8888 source over an RGB565 destination
+ * row, `count` pixels wide -- shared by build_flattened_transition_frame()
+ * below for compositing a persistent lv_layer_top() band (status bar,
+ * home indicator) onto a screen-only RGB565 base. LVGL's ARGB8888 memory
+ * layout is B,G,R,A per pixel (see lv_color32_t in lv_color.h), not the
+ * A,R,G,B its name suggests. */
+static void blend_argb8888_row_over_rgb565(uint16_t * dst, const uint8_t * src_argb, int32_t count) {
+    for (int32_t x = 0; x < count; x++) {
+        uint8_t b = src_argb[x * 4 + 0];
+        uint8_t g = src_argb[x * 4 + 1];
+        uint8_t r = src_argb[x * 4 + 2];
+        uint8_t a = src_argb[x * 4 + 3];
+        if (a == 0) continue; /* fully transparent -- leave the destination pixel untouched */
+        if (a == 255) {
+            dst[x] = (uint16_t) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            continue;
+        }
+        uint16_t old = dst[x];
+        uint8_t old_r = (uint8_t) (((old >> 11) & 0x1F) << 3);
+        uint8_t old_g = (uint8_t) (((old >> 5) & 0x3F) << 2);
+        uint8_t old_b = (uint8_t) ((old & 0x1F) << 3);
+        uint8_t nr = (uint8_t) (((uint32_t) r * a + (uint32_t) old_r * (255 - a)) / 255);
+        uint8_t ng = (uint8_t) (((uint32_t) g * a + (uint32_t) old_g * (255 - a)) / 255);
+        uint8_t nb = (uint8_t) (((uint32_t) b * a + (uint32_t) old_b * (255 - a)) / 255);
+        dst[x] = (uint16_t) (((nr >> 3) << 11) | ((ng >> 2) << 5) | (nb >> 3));
+    }
+}
+
+/* Snapshots `overlay_obj` (an lv_layer_top() child -- status_bar_band or
+ * home_indicator_band, never a whole layer, see build_flattened_transition_
+ * frame()'s own comment on why) as ARGB8888 and alpha-blends it onto
+ * `base` at overlay_obj's own real on-screen coordinates. No-op (leaves
+ * base untouched) if the snapshot itself fails -- caller still gets a
+ * usable, if incomplete, frame rather than none at all. */
+static void blend_overlay_onto_base(lv_draw_buf_t * base, lv_obj_t * overlay_obj) {
+    lv_area_t coords;
+    lv_obj_get_coords(overlay_obj, &coords);
+    int32_t ow = lv_area_get_width(&coords);
+    int32_t oh = lv_area_get_height(&coords);
+    if (ow <= 0 || oh <= 0) return;
+
+    lv_draw_buf_t * overlay = lv_snapshot_take(overlay_obj, LV_COLOR_FORMAT_ARGB8888);
+    if (!overlay) return;
+
+    int32_t base_w = (int32_t) base->header.w;
+    int32_t base_h = (int32_t) base->header.h;
+    for (int32_t y = 0; y < oh; y++) {
+        int32_t dy = coords.y1 + y;
+        if (dy < 0 || dy >= base_h) continue;
+        int32_t dx0 = coords.x1;
+        int32_t count = ow;
+        int32_t sx0 = 0;
+        if (dx0 < 0) { sx0 = -dx0; count += dx0; dx0 = 0; }
+        if (dx0 + count > base_w) count = base_w - dx0;
+        if (count <= 0) continue;
+        const uint8_t * srow = (const uint8_t *) lv_draw_buf_goto_xy(overlay, (uint32_t) sx0, (uint32_t) y);
+        uint16_t * drow = (uint16_t *) lv_draw_buf_goto_xy(base, (uint32_t) dx0, (uint32_t) dy);
+        blend_argb8888_row_over_rgb565(drow, srow, count);
+    }
+    lv_draw_buf_destroy(overlay);
+}
+
+/* Screen-only RGB565 base for target_screen -- player_dismiss_btn's hidden
+ * flag (Player's own standalone back arrow, part of player_screen's own
+ * subtree, not a separate layer) is temporarily forced to its TARGET-state
+ * value (based on current_settings.hide_player_topbar, never on whichever
+ * live screen happens to be active right now) before snapshotting, then
+ * restored immediately after -- safe because nothing here ever yields to a
+ * real lv_timer_handler()/lv_refr_now() refresh pass in between, so the
+ * live UI never actually renders the temporary state to the real screen.
+ * Deliberately does NOT include the persistent status bar / home-indicator
+ * content -- see blend_persistent_bars() below for why that's kept
+ * separate rather than baked in here. Caller owns the returned buffer;
+ * returns NULL on snapshot failure. */
+static lv_draw_buf_t * snapshot_screen_base(lv_obj_t * target_screen) {
+    if (!target_screen) return NULL;
+
+    bool dismiss_target_hidden = current_settings.hide_player_topbar && target_screen == player_screen;
+    bool dismiss_touched = (player_dismiss_btn != NULL && target_screen == player_screen);
+    bool dismiss_was_hidden = false;
+    if (dismiss_touched) {
+        dismiss_was_hidden = lv_obj_has_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        if (dismiss_target_hidden) lv_obj_add_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_draw_buf_t * base = lv_snapshot_take(target_screen, LV_COLOR_FORMAT_RGB565);
+
+    if (dismiss_touched) {
+        if (dismiss_was_hidden) lv_obj_add_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    return base;
+}
+
+/* Blends whichever persistent lv_layer_top() bands would actually be
+ * visible on target_screen (status_bar_band per Settings > Display > "Hide
+ * Player/Lyrics Top Bar", home_indicator_band per Settings > Display >
+ * "Swipe Up for Home") onto an existing owned RGB565 base, mutating it in
+ * place. TRANSITION_PERFORMANCE_PLAN.md Phase 3 target architecture,
+ * section B -- kept as a separate, cheap, always-fresh step from the base
+ * snapshot itself (snapshot_screen_base() above) specifically so a CACHED
+ * base (the static-screen cache or the Phase 2 player cache, both below)
+ * never bakes in stale clock/battery/wifi/home-indicator content: real-
+ * device review finding -- baking bars into a snapshot taken once (the
+ * static cache, built at startup) or infrequently (the player cache, only
+ * rebuilt on track/art/play-state changes, not every second) meant a
+ * transition could show a visibly wrong/outdated clock or a home-indicator
+ * bar whose visibility had since been toggled off. Blending fresh at
+ * transition time instead means the persistent-bar content is never more
+ * than a few lines of code away from what a real, current LVGL render of
+ * lv_layer_top() would show. Deliberately does NOT snapshot lv_layer_top()
+ * as a whole: that would also capture transient overlays (the volume
+ * popup, quick-drawer motion image, a DAC overlay) that may happen to be
+ * present at the wrong moment -- only these two named, permanent bands are
+ * ever composited in. status_bar_band's hidden flag is temporarily forced
+ * to its target-state value (same reasoning/safety as snapshot_screen_
+ * base()'s own comment on player_dismiss_btn); home_indicator_band's
+ * current live flag already IS its correct target-state value (its
+ * visibility is unrelated to which screen is active), so it needs no such
+ * forcing. */
+static void blend_persistent_bars(lv_draw_buf_t * base, lv_obj_t * target_screen) {
+    bool topbar_target_hidden = current_settings.hide_player_topbar &&
+                                 (target_screen == player_screen || target_screen == lyrics_screen);
+    if (status_bar_band) {
+        bool status_was_hidden = lv_obj_has_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+        if (!topbar_target_hidden) {
+            if (status_was_hidden) lv_obj_remove_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+            blend_overlay_onto_base(base, status_bar_band);
+        }
+        if (status_was_hidden) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (home_indicator_band && !lv_obj_has_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN)) {
+        blend_overlay_onto_base(base, home_indicator_band);
+    }
+}
+
+/* Builds a complete, opaque, full-screen RGB565 frame representing exactly
+ * what the display should look like once target_screen is the active
+ * screen -- a fresh screen-only base (snapshot_screen_base()) with the
+ * persistent bars blended fresh on top (blend_persistent_bars()). Used as
+ * begin_slide_transition()'s synchronous fallback when neither the static-
+ * screen cache nor the Phase 2 player cache has a base available -- the
+ * cached-base cases dup their own cached base and call
+ * blend_persistent_bars() directly instead of going through this, so the
+ * bars are still always fresh even when the (comparatively expensive)
+ * screen content itself comes from a cache. Caller owns the returned
+ * buffer (lv_draw_buf_destroy() it when done); returns NULL on allocation/
+ * snapshot failure. */
+static lv_draw_buf_t * build_flattened_transition_frame(lv_obj_t * target_screen) {
+    lv_draw_buf_t * base = snapshot_screen_base(target_screen);
+    if (!base) return NULL;
+    blend_persistent_bars(base, target_screen);
+    return base;
+}
+
 /* A deliberately narrow set of screens are pure static content -- fixed
  * icon-grid/pill-list items baked in at build time, no toggles, no
- * per-item state, nothing a timer ever touches (the clock/battery/wifi
- * live on lv_layer_top(), outside every screen's own snapshot). Their
- * transition bitmap is rendered ONCE at startup and reused forever,
- * since re-rendering them before every single visit was the last
- * remaining cost in an otherwise-cheap transition. Anything with actual
- * dynamic content (player screen, file/song lists, Settings' toggles,
- * the accent-color picker's selection ring, Subsonic status screens) is
- * deliberately left out and always rendered fresh. */
+ * per-item state, nothing a timer ever touches. Their screen-only content
+ * is rendered ONCE at startup and reused forever, since re-rendering it
+ * before every single visit was the last remaining cost in an otherwise-
+ * cheap transition -- the persistent status bar/home-indicator content is
+ * deliberately NOT part of this cached base (see blend_persistent_bars()'s
+ * own comment on why baking bars into a cache built once at startup goes
+ * stale); begin_slide_transition() blends them in fresh every time it uses
+ * this cache. Anything with actual dynamic content (player screen, file/
+ * song lists, Settings' toggles, the accent-color picker's selection ring,
+ * Subsonic status screens) is deliberately left out and always rendered
+ * fresh. */
 #define STATIC_SNAPSHOT_SCREEN_COUNT 9
 static lv_obj_t * static_snapshot_screen[STATIC_SNAPSHOT_SCREEN_COUNT];
 static lv_draw_buf_t * static_snapshot_buf[STATIC_SNAPSHOT_SCREEN_COUNT];
@@ -730,7 +912,77 @@ static lv_draw_buf_t * get_static_snapshot(lv_obj_t * scr) {
 
 static void register_static_snapshot(int index, lv_obj_t * scr) {
     static_snapshot_screen[index] = scr;
-    static_snapshot_buf[index] = lv_snapshot_take(scr, LV_COLOR_FORMAT_RGB565);
+    static_snapshot_buf[index] = snapshot_screen_base(scr);
+}
+
+/* Player-screen transition-frame cache -- TRANSITION_PERFORMANCE_PLAN.md
+ * Phase 2. player_screen is dynamic (track metadata/art/play-state, so it
+ * can't just be baked in once like the STATIC_SNAPSHOT_SCREEN_COUNT screens
+ * above), but it's also the single most common transition target (every
+ * player-swipe and most Home/Now-Playing navigations) and the one whose
+ * on-demand lv_snapshot_take() cost is actually visible: confirmed via
+ * on-device UI_PERF_TRACE profiling, that snapshot alone typically costs
+ * 10-14ms and spiked to ~84ms on a cold cache the first time it ran. This
+ * mirrors quick_drawer_mark_snapshot_dirty()/quick_drawer_rebuild_snapshot()
+ * above -- the exact same "own an independent bitmap, invalidate lazily,
+ * rebuild once via lv_async_call() during the next idle pass instead of on
+ * the touch-down path" shape, just for a full-screen target instead of the
+ * drawer panel. Rebuilt off the gesture path entirely: at track start, once
+ * cover art actually finishes decoding, on play/pause icon changes, on
+ * accent-color changes, and when the hide-topbar setting changes -- NOT on
+ * every per-second progress-bar tick (deliberately -- see the plan's own
+ * Phase 2 requirement 2), so the cached frame's progress fill can be up to
+ * a few seconds stale. Always safe to use regardless of staleness: this is
+ * an independent owned copy, never aliased to any live widget's own memory,
+ * so nothing about "how stale" it is can make it unsafe to display, only
+ * slightly out of date -- see begin_slide_transition()'s own use of it.
+ * Screen-only base -- deliberately does NOT include the persistent status
+ * bar/home-indicator content, for the same staleness reason
+ * blend_persistent_bars() explains: this cache is only rebuilt on the
+ * dirty triggers above, not every second, so baking in the clock/battery/
+ * wifi here would go visibly stale between rebuilds. begin_slide_
+ * transition() blends those bars in fresh from this cached base every
+ * time it's used. */
+static lv_draw_buf_t * player_transition_cache_buf = NULL;
+static bool player_transition_cache_dirty = true;
+
+static void player_transition_rebuild_cache(void) {
+    /* Nothing to gain while player_screen is already the live screen --
+     * no transition can ever target the screen already on display, and
+     * re-snapshotting it here would just be wasted work on every one of
+     * its own dynamic updates (track change, progress tick via the other
+     * dirty triggers, etc.) while the user is actually looking at it. */
+    if (!player_screen || lv_screen_active() == player_screen) return;
+#ifdef UI_PERF_TRACE
+    uint64_t perf_start_us = ui_perf_now_us();
+#endif
+    lv_draw_buf_t * fresh = snapshot_screen_base(player_screen);
+    if (!fresh) return; /* OOM -- keep whatever's cached (stale beats nothing); still tried again on the next dirty notification */
+    if (player_transition_cache_buf) lv_draw_buf_destroy(player_transition_cache_buf);
+    player_transition_cache_buf = fresh;
+    player_transition_cache_dirty = false;
+#ifdef UI_PERF_TRACE
+    printf("PERF player_cache rebuild_us=%llu\n", (unsigned long long) (ui_perf_now_us() - perf_start_us));
+#endif
+}
+
+static void player_transition_cache_async_cb(void * unused) {
+    (void) unused;
+    /* Re-checked here, not just at the mark_dirty() call site: several
+     * dirty notifications can each schedule their own async callback
+     * before the first one runs (lv_async_call() doesn't dedupe by
+     * callback/data), so every call after the first one that actually
+     * rebuilds is a cheap no-op instead of a redundant re-snapshot. */
+    if (player_transition_cache_dirty) player_transition_rebuild_cache();
+}
+
+/* Called from every site where something visible on player_screen's own
+ * subtree changes -- see this function's own doc comment on the cache
+ * above for the current full list of call sites. Deliberately NOT called
+ * from the routine per-second progress-bar update. */
+static void player_transition_mark_dirty(void) {
+    player_transition_cache_dirty = true;
+    if (player_screen) lv_async_call(player_transition_cache_async_cb, NULL);
 }
 
 typedef struct {
@@ -741,6 +993,9 @@ typedef struct {
     lv_draw_buf_t * buf_to;
     bool buf_from_owned;
     bool buf_to_owned;
+    bool fallback_bands_suppressed;
+    bool home_indicator_was_hidden;
+    lv_obj_t * from_scr;
     lv_obj_t * to_scr;
     int32_t to_offset;
     /* Only meaningful for the interactive (finger-driven) player-swipe
@@ -755,24 +1010,110 @@ typedef struct {
 
 static bool slide_transition_active = false;
 
+/* Forward declarations -- real (first) tentative/actual definitions
+ * further down this file, alongside poll_quick_drawer_drag()'s own
+ * player-swipe state. slide_transition_anim_x_cb()'s compositor-failure
+ * abort path below needs to clear these directly: a hard compositor
+ * failure can happen mid-drag, and by the time it's detected, transition_
+ * compositor_frame() has already torn down the compositor session itself
+ * (LVGL invalidation restored, buf_act re-synced) -- what's left is purely
+ * this file's OWN gesture-tracking bookkeeping, which only these three
+ * variables (plus the ctx/anim cleanup already shared with the normal
+ * commit/cancel path) actually hold. */
+static bool player_swipe_candidate;
+static bool player_swipe_tracking;
+static slide_transition_ctx_t * player_swipe_ctx;
+
+/* Shared by two unrelated callers -- both need "the next real
+ * lv_timer_handler() pass redraws literally everything" without calling
+ * lv_refr_now() synchronously from inside a callback that's itself already
+ * running from within an lv_timer_handler() pass (a real reentrancy risk,
+ * not just a style preference): slide_transition_anim_x_cb()'s compositor-
+ * failure recovery (see its own comment), and update_timer_cb()'s screen-
+ * wake handling (NEXT_TODO_IMPLEMENTATION_PROMPT.md Task 1) -- the async
+ * call runs within that same lv_timer_handler() invocation, just after all
+ * timers finish, which is still effectively immediate either way. */
+static void full_redraw_async_cb(void * unused) {
+    (void) unused;
+    lv_obj_invalidate(lv_screen_active());
+    lv_obj_invalidate(lv_layer_top());
+    lv_obj_invalidate(lv_layer_sys());
+}
+
 static void slide_transition_anim_x_cb(void * var, int32_t v) {
     slide_transition_ctx_t * ctx = (slide_transition_ctx_t *) var;
+    /* TRANSITION_PERFORMANCE_PLAN.md Phase 3 -- when begin_slide_transition()
+     * below handed this transition off to the direct-framebuffer compositor,
+     * img_from/img_to are never drawn at all (LVGL invalidation is disabled
+     * for the whole session), so driving them with lv_obj_set_x() here would
+     * be pure wasted work: skip straight to compositing this frame instead.
+     * Every caller of this function (screen_transition_slide()'s own
+     * lv_anim_t, poll_quick_drawer_drag()'s per-tick interactive drag, and
+     * its release settle animation) goes through this one shared path, so
+     * all three get compositor support with no changes of their own. */
+    if (transition_compositor_is_active()) {
+        if (!transition_compositor_frame(v)) {
+            /* Hard presentation failure. transition_compositor_frame()
+             * already restored normal fbdev/LVGL ownership. Recover to a
+             * deterministic logical screen: a fixed transition or a
+             * released/committed gesture keeps its destination (the nav
+             * stack has already been updated); an in-progress or cancelled
+             * gesture returns to the source (and has made no stack change).
+             * The deferred invalidation avoids a re-entrant lv_refr_now()
+             * from inside an animation/timer callback. */
+            lv_anim_delete(ctx, slide_transition_anim_x_cb); /* safe no-op if ctx isn't driven by a real lv_anim_t (the raw per-tick interactive-drag path isn't) */
+            lv_obj_t * recovery_scr = ctx->commit ? ctx->to_scr : ctx->from_scr;
+            lv_screen_load(recovery_scr);
+            sync_player_topbar_visibility(recovery_scr);
+            lv_async_call(full_redraw_async_cb, NULL);
+            if (ctx->overlay) lv_obj_delete(ctx->overlay);
+            if (ctx->buf_from_owned) lv_draw_buf_destroy(ctx->buf_from);
+            if (ctx->buf_to_owned) lv_draw_buf_destroy(ctx->buf_to);
+            if (player_swipe_ctx == ctx) player_swipe_ctx = NULL;
+            player_swipe_tracking = false;
+            player_swipe_candidate = false;
+            lv_free(ctx);
+            slide_transition_active = false;
+        }
+        return;
+    }
     lv_obj_set_x(ctx->img_from, v);
     lv_obj_set_x(ctx->img_to, v + ctx->to_offset);
 }
 
 static void slide_transition_done_cb(lv_anim_t * a) {
     slide_transition_ctx_t * ctx = (slide_transition_ctx_t *) lv_anim_get_user_data(a);
+    lv_obj_t * final_scr = ctx->commit ? ctx->to_scr : ctx->from_scr;
     if (ctx->commit) {
         lv_screen_load(ctx->to_scr);
-        sync_player_topbar_visibility(ctx->to_scr);
     }
-    lv_obj_delete(ctx->overlay); /* deletes img_from/img_to too */
+    /* The fallback owns flattened full-screen images, including both
+     * persistent bands, so their live layer objects stay hidden throughout
+     * the slide. Restore the status bar for the screen actually selected
+     * and restore the screen-independent home-indicator setting now. */
+    sync_player_topbar_visibility(final_scr);
+    if (ctx->fallback_bands_suppressed && home_indicator_band) {
+        if (ctx->home_indicator_was_hidden)
+            lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_remove_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx->overlay) lv_obj_delete(ctx->overlay); /* deletes img_from/img_to too -- NULL when this transition was handed to the compositor instead (see begin_slide_transition()'s own comment on why the overlay is skipped entirely there, not just left undrawn) */
     if (ctx->buf_from_owned) lv_draw_buf_destroy(ctx->buf_from);
     if (ctx->buf_to_owned) lv_draw_buf_destroy(ctx->buf_to);
+    transition_compositor_end(); /* no-op if the compositor was never activated for this transition */
     lv_free(ctx);
     slide_transition_active = false;
 }
+
+/* Moved up from its own neighborhood further down (build_home_indicator_bar())
+ * -- a plain #define has no location dependency on where home_indicator_band
+ * itself is built, and blend_overlay_onto_base() (used by
+ * build_flattened_transition_frame() above) reads that object's own real
+ * on-screen coordinates directly rather than this constant, so nothing
+ * below actually requires this specific placement anymore; left here since
+ * moving it back offers no benefit either. */
+#define HOME_INDICATOR_BAND_HEIGHT 34
 
 /* Shared setup for both screen_transition_slide()'s own fixed-duration
  * path and the interactive (finger-driven) player-swipe further down
@@ -790,103 +1131,129 @@ static void slide_transition_done_cb(lv_anim_t * a) {
  * drag). ctx->commit defaults to true, matching every existing caller
  * (only the interactive path ever sets it false, on a cancelled drag).
  *
- * force_snapshot skips the live-framebuffer-aliasing fast path below for
- * img_from, always taking an independent copy instead -- see that
- * code's own comment for why the fast path is normally preferred, and
- * player_swipe_tracking's own call site (poll_quick_drawer_drag()) for why
- * it can't be used there: that comment accepts the live-alias's one
- * known downside ("the outgoing bitmap could show that change a frame
- * early") as a fine trade specifically because the ORIGINAL fixed-duration
- * transition finishes in ~200ms, far too short for anything to visibly
- * redraw. An interactive drag has no such bound -- it lasts exactly as
- * long as the finger stays down, which can be seconds -- so from_scr
- * stays the real lv_screen_active() (never swapped out until commit) and
- * keeps getting its own completely normal LVGL redraws the whole time.
- * Since the live-alias path makes img_from literally the same memory as
- * the real framebuffer, every one of those redraws (the topbar clock
- * ticking over, anything else on Home invalidating) bled through into the
- * SLIDING overlay in real time -- confirmed as a real-device bug report
- * ("swiping to enter the player causes the main menu to flicker"), not
- * just a theoretical risk. A real snapshot is immune to that: whatever
- * from_scr does afterward, img_from stays exactly what it looked like the
- * instant this was called.  Copying the already-rendered active display
- * buffer provides that stability without asking LVGL to render the whole
- * outgoing object tree again.  The latter cost 25-47 ms on this device;
- * a linear RGB565 copy is both substantially cheaper and pixel-identical
- * to what the user was looking at when the gesture began. */
-static slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward, bool force_snapshot) {
+ * Both transition sources are always OWNED, independent copies now
+ * (TRANSITION_PERFORMANCE_PLAN.md Phase 3) -- never a live alias of real
+ * framebuffer memory, and never a direct reference to a cache buffer that
+ * something else could destroy out from under this transition. See this
+ * function's own body for the two separate real-device reasons: (1) a
+ * live-aliased outgoing frame bled through live redraws happening on
+ * from_scr during a held drag ("swiping to enter the player causes the
+ * main menu to flicker"); (2) once the direct-framebuffer compositor is
+ * involved, an aliased source becomes the compositor's OWN write target
+ * again a couple of frames later (the two physical pages ping-pong every
+ * frame), an overlapping-memcpy hazard, not just a staleness question. */
+static slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward) {
 #ifdef UI_PERF_TRACE
     uint64_t perf_begin_us = ui_perf_now_us();
-    uint64_t perf_from_done_us;
     uint64_t perf_to_done_us;
+    uint64_t perf_drain_done_us;
+    uint64_t perf_from_done_us;
 #endif
     lv_obj_t * from_scr = lv_screen_active();
     if (from_scr == to_scr || slide_transition_active) return NULL;
 
     lv_display_t * disp = lv_display_get_default();
     int32_t w = lv_display_get_horizontal_resolution(disp);
+    int32_t h = lv_display_get_vertical_resolution(disp);
 
     slide_transition_ctx_t * ctx = lv_malloc(sizeof(*ctx));
+    if (!ctx) return NULL;
     ctx->commit = true;
-    ctx->buf_from_owned = false;
-    ctx->buf_to_owned = false;
+    ctx->buf_from_owned = true;
+    ctx->buf_to_owned = true;
+    ctx->fallback_bands_suppressed = false;
+    ctx->home_indicator_was_hidden = true;
 
-    /* from_scr is, by definition, exactly what's on screen right now -- if
-     * the display driver can hand us that page directly (real double
-     * buffering via panning), reuse it instead of paying for a whole extra
-     * render pass. This is what actually made touch-to-slide-start latency
-     * noticeable: two full-screen snapshots taken synchronously in the
-     * touch handler, before the very first animation frame. Halving that
-     * to one is the single biggest lever available without a caching
-     * scheme. (This aliases live fb memory rather than an independent
-     * copy, so in the rare case something on from_scr redraws during the
-     * ~200ms slide -- e.g. the clock ticking over -- the outgoing bitmap
-     * could show that change a frame early; a fine trade for consistently
-     * lower latency.) */
-    /* lv_display_get_buf_active() -- the real LVGL 9.x API for this, not
-     * the fbdev-driver-specific function this used to call, which doesn't
-     * actually exist anywhere in the vendored lv_linux_fbdev.h (confirmed
-     * by grepping the whole vendored lvgl/ tree for it -- nothing, not
-     * even an unexported definition). That made every target build fail
-     * outright (implicit-declaration + pointer-from-int errors), so this
-     * optimization was never actually exercised on real hardware despite
-     * the comment above describing real touch-latency profiling -- either
-     * written against a different LVGL checkout that once had a custom
-     * fbdev patch, or the profiling was done before this line regressed.
-     * lv_display_get_buf_active() returns the same live-fb-aliased
-     * lv_draw_buf_t the display driver itself is using -- works on host
-     * (SDL) too, so the separate HOST_BUILD/LV_USE_LINUX_FBDEV branch
-     * this used to need is gone; NULL there just means no frame has
-     * flushed yet, same fallback-to-snapshot reasoning as below. */
-    lv_draw_buf_t * active_buf = lv_display_get_buf_active(disp);
-    lv_draw_buf_t * buf_from;
-    if (active_buf && force_snapshot) {
-        /* Interactive swipes can remain under the finger indefinitely, so
-         * freeze the currently displayed pixels.  lv_draw_buf_dup() keeps
-         * the source format/stride and performs a straight buffer copy;
-         * unlike lv_snapshot_take(from_scr), it does no widget traversal,
-         * layout, style evaluation, or software rendering. */
-        buf_from = lv_draw_buf_dup(active_buf);
-        ctx->buf_from_owned = true;
-    } else if (active_buf) {
-        buf_from = active_buf;
-        ctx->buf_from_owned = false;
-    } else {
-        buf_from = lv_snapshot_take(from_scr, LV_COLOR_FORMAT_RGB565);
-        ctx->buf_from_owned = true;
-    }
+    /* Incoming source prepared FIRST, before the outgoing physical-page
+     * capture below -- TRANSITION_PERFORMANCE_PLAN.md Phase 3 real-device
+     * review finding. Always a COMPLETE flattened frame -- screen content
+     * plus whichever persistent bars would really be visible there, never
+     * a bare screen-only snapshot. The (comparatively expensive) screen
+     * content itself is pre-baked for the fixed STATIC_SNAPSHOT_SCREEN_COUNT
+     * screens or the Phase 2 player-transition cache when available (each
+     * DUPLICATED here, never referenced directly -- the player cache can
+     * be destroyed and replaced by an lv_async_call() rebuild firing mid-
+     * gesture, a real use-after-free risk if referenced instead of
+     * copied), else captured fresh synchronously; the persistent bars
+     * (status bar/home indicator) are always blended in fresh right here,
+     * regardless of which base was used -- see blend_persistent_bars()'s
+     * own comment on why baking them into either cache would go stale. */
+    lv_draw_buf_t * buf_to;
 #ifdef UI_PERF_TRACE
-    perf_from_done_us = ui_perf_now_us();
+    bool used_player_cache = false;
 #endif
-    lv_draw_buf_t * buf_to = get_static_snapshot(to_scr);
-    if (buf_to) {
-        ctx->buf_to_owned = false;
+    lv_draw_buf_t * cached_base = get_static_snapshot(to_scr);
+    if (!cached_base && to_scr == player_screen && player_transition_cache_buf) {
+        cached_base = player_transition_cache_buf;
+#ifdef UI_PERF_TRACE
+        used_player_cache = true;
+#endif
+    }
+    if (cached_base) {
+        buf_to = lv_draw_buf_dup(cached_base);
+        if (buf_to) blend_persistent_bars(buf_to, to_scr);
     } else {
-        buf_to = lv_snapshot_take(to_scr, LV_COLOR_FORMAT_RGB565);
-        ctx->buf_to_owned = true;
+        buf_to = build_flattened_transition_frame(to_scr);
     }
 #ifdef UI_PERF_TRACE
     perf_to_done_us = ui_perf_now_us();
+#endif
+
+    /* Drain any already-queued LVGL rendering NOW, before capturing the
+     * outgoing physical page -- TRANSITION_PERFORMANCE_PLAN.md Phase 3
+     * real-device review finding: capturing the physical page first and
+     * draining afterward (the earlier design, inside transition_
+     * compositor_begin()) meant a pending redraw could still pan to a
+     * DIFFERENT physical page after the capture, leaving frame zero of the
+     * animation showing an already-stale image that visibly jumped
+     * backward once the real (post-drain) state caught up. This driver's
+     * flush_cb() is fully synchronous (no deferred/async flush
+     * completion), so one lv_refr_now() call is guaranteed to fully
+     * render AND flush everything pending before returning -- nothing can
+     * still be "in flight" by the time the capture below runs.
+     * transition_compositor_begin() itself no longer does this drain --
+     * doing it here, before capture, is what actually matters; doing it
+     * again inside begin() (after capture) would be too late. */
+    lv_refr_now(disp);
+#ifdef UI_PERF_TRACE
+    perf_drain_done_us = ui_perf_now_us();
+#endif
+
+    /* Outgoing source: an owned copy of the REAL physical scanout page,
+     * captured AFTER the drain above -- TRANSITION_PERFORMANCE_PLAN.md
+     * Phase 3 fix. lv_linux_fbdev_get_active_page() is the fbdev driver's
+     * own accessor for whichever physical half is actually being scanned
+     * out right now; LVGL's generic lv_display_get_buf_active() (disp->
+     * buf_act) is simply whichever buffer LVGL itself last rendered into
+     * -- normally the same thing, but not a driver-level guarantee in
+     * DIRECT double-buffered mode, so it's only the fallback here (host/
+     * SDL builds, or if fbdev pan-based double buffering isn't active on
+     * this display). */
+    lv_draw_buf_t * buf_from = NULL;
+#if LV_USE_LINUX_FBDEV
+    {
+        const void * phys_active = lv_linux_fbdev_get_active_page(disp);
+        uint32_t fb_stride = lv_linux_fbdev_get_stride(disp);
+        if (phys_active && fb_stride != 0) {
+            lv_draw_buf_t phys_desc;
+            memset(&phys_desc, 0, sizeof(phys_desc));
+            phys_desc.header.magic = LV_IMAGE_HEADER_MAGIC;
+            phys_desc.header.cf = LV_COLOR_FORMAT_RGB565;
+            phys_desc.header.w = (uint32_t) w;
+            phys_desc.header.h = (uint32_t) h;
+            phys_desc.header.stride = fb_stride;
+            phys_desc.data = (uint8_t *) phys_active; /* lv_draw_buf_dup() below only reads this -- never written through phys_desc itself */
+            phys_desc.data_size = fb_stride * (uint32_t) h;
+            buf_from = lv_draw_buf_dup(&phys_desc);
+        }
+    }
+#endif
+    if (!buf_from) {
+        lv_draw_buf_t * active_buf = lv_display_get_buf_active(disp);
+        buf_from = active_buf ? lv_draw_buf_dup(active_buf) : lv_snapshot_take(from_scr, LV_COLOR_FORMAT_RGB565);
+    }
+#ifdef UI_PERF_TRACE
+    perf_from_done_us = ui_perf_now_us();
 #endif
     if (!buf_from || !buf_to) {
         /* Snapshot failed (e.g. OOM) -- caller falls back to an instant cut
@@ -897,54 +1264,84 @@ static slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool f
         return NULL;
     }
 
-    lv_obj_t * overlay = lv_obj_create(lv_layer_top());
-    lv_obj_remove_style_all(overlay);
-    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_pos(overlay, 0, 0);
-    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE); /* swallow touches while the slide is in flight */
-    /* The persistent status bar (clock/battery/wifi) and the volume popup
-     * both live on this same top layer, created once in gui_init() and
-     * meant to stay fixed on every screen, Android-status-bar style. Since
-     * this overlay is a sibling created fresh on every transition, it would
-     * otherwise draw ON TOP of them (later-added siblings draw over
-     * earlier ones) and briefly cover the status bar during every slide --
-     * push it to the back of the layer instead so those stay visibly on
-     * top throughout. */
-    lv_obj_move_to_index(overlay, 0);
-
-    lv_obj_t * img_from = lv_image_create(overlay);
-    lv_image_set_src(img_from, buf_from);
-    lv_obj_set_pos(img_from, 0, 0);
-
     int32_t to_offset = forward ? w : -w;
-    lv_obj_t * img_to = lv_image_create(overlay);
-    lv_image_set_src(img_to, buf_to);
-    lv_obj_set_pos(img_to, to_offset, 0);
-
-    ctx->overlay = overlay;
-    ctx->img_from = img_from;
-    ctx->img_to = img_to;
     ctx->buf_from = buf_from;
     ctx->buf_to = buf_to;
+    ctx->from_scr = from_scr;
     ctx->to_scr = to_scr;
     ctx->to_offset = to_offset;
 
     slide_transition_active = true;
+
+    /* TRANSITION_PERFORMANCE_PLAN.md Phase 3 -- try to hand this transition
+     * off to the direct-framebuffer compositor BEFORE creating any LVGL
+     * overlay/image objects, not after. Real-device bug (earlier design):
+     * creating those objects first queued their own initial-draw
+     * invalidation via the normal, still-enabled path, which then got
+     * rendered and flushed for real on the next lv_timer_handler() tick
+     * regardless of disabling invalidation moments later -- visible as a
+     * leftover static image flashing on top of the compositor's own
+     * correctly-sliding frames. Skipping the overlay entirely when the
+     * compositor takes over removes the problem at its root; transition_
+     * compositor_begin() itself also drains any OTHER already-queued LVGL
+     * rendering (lv_refr_now()) before disabling invalidation, so nothing
+     * unrelated is left stranded in the queue either. */
+    if (transition_compositor_begin(buf_from, buf_to, to_offset)) {
+        ctx->overlay = NULL;
+        ctx->img_from = NULL;
+        ctx->img_to = NULL;
+    } else {
+        /* buf_from/buf_to already contain the persistent bands. Hide the
+         * live layer copies for the whole fallback animation so they move
+         * exactly once as part of those flattened frames instead of being
+         * drawn a second time, stationary, above the sliding images. */
+        ctx->fallback_bands_suppressed = true;
+        if (home_indicator_band) {
+            ctx->home_indicator_was_hidden =
+                lv_obj_has_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (status_bar_band)
+            lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t * overlay = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(overlay);
+        lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+        lv_obj_set_pos(overlay, 0, 0);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE); /* swallow touches while the slide is in flight */
+        /* Keep transient top-layer UI such as the volume popup above the
+         * transition. The persistent bands themselves are hidden above. */
+        lv_obj_move_to_index(overlay, 0);
+
+        lv_obj_t * img_from = lv_image_create(overlay);
+        lv_image_set_src(img_from, buf_from);
+        lv_obj_set_pos(img_from, 0, 0);
+
+        lv_obj_t * img_to = lv_image_create(overlay);
+        lv_image_set_src(img_to, buf_to);
+        lv_obj_set_pos(img_to, to_offset, 0);
+
+        ctx->overlay = overlay;
+        ctx->img_from = img_from;
+        ctx->img_to = img_to;
+    }
 #ifdef UI_PERF_TRACE
     uint64_t perf_end_us = ui_perf_now_us();
-    printf("PERF transition begin_us=%llu from_us=%llu to_us=%llu setup_us=%llu from_owned=%d to_owned=%d force=%d\n",
+    printf("PERF transition begin_us=%llu to_us=%llu drain_us=%llu from_us=%llu setup_us=%llu from_owned=%d to_owned=%d player_cache=%d cache_dirty=%d compositor=%d\n",
            (unsigned long long) (perf_end_us - perf_begin_us),
-           (unsigned long long) (perf_from_done_us - perf_begin_us),
-           (unsigned long long) (perf_to_done_us - perf_from_done_us),
-           (unsigned long long) (perf_end_us - perf_to_done_us),
-           ctx->buf_from_owned, ctx->buf_to_owned, force_snapshot);
+           (unsigned long long) (perf_to_done_us - perf_begin_us),
+           (unsigned long long) (perf_drain_done_us - perf_to_done_us),
+           (unsigned long long) (perf_from_done_us - perf_drain_done_us),
+           (unsigned long long) (perf_end_us - perf_from_done_us),
+           ctx->buf_from_owned, ctx->buf_to_owned,
+           used_player_cache, player_transition_cache_dirty, transition_compositor_is_active());
 #endif
     return ctx;
 }
 
 static void screen_transition_slide(lv_obj_t * to_scr, bool forward) {
-    slide_transition_ctx_t * ctx = begin_slide_transition(to_scr, forward, false); /* fast live-alias path -- fine here, this transition always finishes in NAV_ANIM_TIME_MS */
+    slide_transition_ctx_t * ctx = begin_slide_transition(to_scr, forward);
     if (!ctx) {
         lv_screen_load(to_scr);
         sync_player_topbar_visibility(to_scr);
@@ -988,7 +1385,9 @@ static void nav_push(lv_obj_t * scr) {
 
 static void nav_pop(void) {
     if (nav_depth > 1) nav_depth--;
-    sync_player_topbar_visibility(nav_stack[nav_depth - 1]);
+    /* Keep the outgoing screen's bars untouched until its physical frame
+     * has been captured. The transition completion/cut-fallback path
+     * applies the destination state at the actual screen handoff. */
     screen_transition_slide(nav_stack[nav_depth - 1], false);
 }
 
@@ -1223,6 +1622,20 @@ static lv_obj_t * play_pause_status_icon;
 static lv_obj_t * status_bar_band;
 
 static void sync_player_topbar_visibility(lv_obj_t * screen) {
+    /* Settings > Display > "Hide Player/Lyrics Top Bar" -- hides the global
+     * status bar while the Player or its fullscreen Lyrics view is active;
+     * every other screen keeps its status bar as normal regardless of this
+     * setting. player_dismiss_btn (Player's own standalone back arrow) is
+     * additionally tied to the same setting, Player-only -- when the
+     * status bar is hidden there's no other visible way back short of the
+     * swipe/hardware-button gesture, matching the immersive intent; Lyrics
+     * has no equivalent standalone back button of its own. Real, live
+     * object state here is allowed to reflect "whatever the user last
+     * navigated to" -- correctness for the Phase 2 transition CACHE (built
+     * while Player is inactive, so this function's own object-flag state
+     * can't be trusted for it) is handled independently by
+     * build_flattened_transition_frame()'s own temporary-flag-then-restore
+     * approach, not by this function. */
     bool hide = current_settings.hide_player_topbar && (screen == player_screen || screen == lyrics_screen);
     if (status_bar_band) {
         if (hide) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
@@ -1234,6 +1647,23 @@ static void sync_player_topbar_visibility(lv_obj_t * screen) {
         else
             lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
     }
+
+    /* player_transition_rebuild_cache() (see its own doc comment) refuses to
+     * run while player_screen is still the active one -- which, since
+     * whatever marked the cache dirty (track change, cover art, play/pause,
+     * accent color) almost always happens WHILE the user is looking at the
+     * Player screen, is exactly the state the cache is usually dirtied in.
+     * Its own lv_async_call() only ever fires once, right after being
+     * scheduled, so without this it would stay permanently dirty from that
+     * point on -- confirmed on-device (every "PERF transition" line showing
+     * player_cache=0 cache_dirty=1, never once actually using the cache).
+     * This function already runs as the last step of every real navigation
+     * (nav_push/nav_pop/screen_transition_slide's cut fallback/
+     * slide_transition_done_cb's commit/nav_reset_to_home), i.e. exactly
+     * "after the Player has settled" -- so retrying here, once per actual
+     * screen change away from Player, is the natural moment. */
+    if (screen != player_screen && player_transition_cache_dirty)
+        lv_async_call(player_transition_cache_async_cb, NULL);
 }
 
 static void build_status_bar(void) {
@@ -2273,7 +2703,6 @@ static void build_volume_popup(void) {
  * declared there) -- sidesteps LVGL's hit-testing/gesture-escalation
  * machinery entirely, the same fix that made the drawer's own swipe
  * reliable. */
-#define HOME_INDICATOR_BAND_HEIGHT 34
 static lv_obj_t * home_indicator_band;
 
 static void build_home_indicator_bar(void) {
@@ -3004,8 +3433,12 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
              * confirms it; anything else (vertical, or rightward) rules it
              * out for good -- either way, stop re-checking every tick. */
             if (dx < 0 && adx > ady) {
-                player_swipe_ctx = begin_slide_transition(player_screen, true, true); /* force a real snapshot -- see begin_slide_transition()'s own comment on why the live-alias path flickers here */
+                player_swipe_ctx = begin_slide_transition(player_screen, true); /* see begin_slide_transition()'s own comment -- both sources are always owned copies now */
                 if (player_swipe_ctx) {
+                    /* No navigation decision exists until release. A
+                     * compositor failure during the live drag therefore
+                     * recovers to from_scr and leaves the stack untouched. */
+                    player_swipe_ctx->commit = false;
                     player_swipe_tracking = true;
                     player_swipe_last_v = 0;
                     player_swipe_last_velocity = 0;
@@ -3138,7 +3571,18 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * drawer's own release logic just above, just horizontal. */
         player_swipe_tracking = false;
         int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
-        int32_t current_v = lv_obj_get_x(player_swipe_ctx->img_from);
+        /* player_swipe_last_v already holds exactly this value -- it's set
+         * to the same v applied via slide_transition_anim_x_cb() every tick
+         * just above, before either the LVGL-object or compositor path
+         * consumes it. Reading it back here directly (instead of
+         * lv_obj_get_x(player_swipe_ctx->img_from)) is required, not just
+         * simpler, now that img_from can be NULL -- TRANSITION_PERFORMANCE_
+         * PLAN.md Phase 3's compositor path skips creating it entirely (see
+         * begin_slide_transition()'s own comment); real-device crash log
+         * confirmed lv_obj_get_x(NULL) -> SIGSEGV (invalid read from 0x14,
+         * lv_obj_get_x()'s own offset into a null lv_obj_t) the first time
+         * this was reached under compositor mode. */
+        int32_t current_v = player_swipe_last_v;
         bool commit;
         if (player_swipe_last_velocity < -PLAYER_SWIPE_FLICK_VELOCITY) {
             commit = true; /* still moving left fast at release */
@@ -4243,6 +4687,7 @@ static void format_time(double seconds, char * buf, size_t buf_size) {
 
 static void set_play_button_state(bool is_playing) {
     lv_image_set_src(play_btn, asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
+    player_transition_mark_dirty(); /* play_btn lives on player_screen -- see the cache's own doc comment */
     if (quick_drawer_play_btn) {
         lv_image_set_src(quick_drawer_play_btn,
                          asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
@@ -4668,6 +5113,7 @@ static void poll_cover_decode(void) {
         free(current_reflection_bytes);
         current_reflection_bytes = NULL;
         lv_obj_set_style_bg_image_src(player_overlay_panel, asset_path("playing_plane/buttom.png"), 0);
+        player_transition_mark_dirty(); /* cover_img just changed to the placeholder -- see the cache's own doc comment */
     } else {
         free(current_cover_bytes);
         current_cover_bytes = (uint8_t *) cover_decode_result_pixels;
@@ -4741,6 +5187,7 @@ static void poll_cover_decode(void) {
             current_lyrics_doc_for_index == playlist_index &&
             (current_lyrics_doc_valid || current_lyrics_plain_mode))
             launch_lyrics_backdrop_decode();
+        player_transition_mark_dirty(); /* cover_img/player_overlay_panel's reflection just changed -- see the cache's own doc comment */
     }
 
     cover_decode_result_pixels = NULL;
@@ -5384,6 +5831,7 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     lv_label_set_text(dur_label, "0:00");
 
     lv_label_set_text_fmt(song_count_label, "%d/%d", index + 1, playlist_count);
+    player_transition_mark_dirty(); /* title/artist/format badge/progress reset above all just changed player_screen's own content -- see the cache's own doc comment */
 }
 
 /* Resolves which of a track's own ReplayGain fields to actually hand to
@@ -5855,6 +6303,7 @@ static void hide_player_topbar_switch_event_cb(lv_event_t * e) {
     current_settings.hide_player_topbar = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     settings_save(&current_settings);
     sync_player_topbar_visibility(lv_screen_active());
+    player_transition_mark_dirty(); /* topbar/back-button target-state visibility just changed -- see the cache's own doc comment */
 }
 
 static void led_indicator_switch_event_cb(lv_event_t * e) {
@@ -6806,6 +7255,65 @@ static void update_timer_cb(lv_timer_t * timer) {
     if (screen_on_now != screen_was_on) {
         lv_indev_enable(NULL, screen_on_now);
         audio_set_low_power_mode(!screen_on_now);
+
+        /* NEXT_TODO_IMPLEMENTATION_PROMPT.md Task 1 -- pause LVGL's own
+         * display-refresh timer while the backlight is off: nothing on
+         * screen can be seen, so there is no reason to keep re-rendering
+         * (or even re-checking for invalidated areas) at anywhere near its
+         * normal cadence. update_timer_cb() (this very function) is NOT
+         * this timer -- it's registered completely separately in
+         * gui_init() and keeps running every 500ms regardless of this,
+         * which is what still services hardware buttons, charging,
+         * hotplug, and async-job completion while dark (see this
+         * function's own body for the full list). Resumed the moment the
+         * screen comes back on, together with invalidating the active
+         * screen and both persistent layers so the very first visible
+         * frame after waking is already fully correct (current track/
+         * position, battery/charge, Wi-Fi/BT, volume, album art, topbar
+         * visibility) rather than showing whatever was on screen right
+         * before it went dark. The invalidation itself is deferred one
+         * async tick (full_redraw_async_cb, shared with slide_transition_
+         * anim_x_cb()'s own compositor-failure recovery -- see its own
+         * comment), not called inline here -- this function is itself
+         * already running from inside the SAME lv_timer_handler() pass
+         * that would need to service that redraw, and forcing a
+         * synchronous re-entrant refresh from inside a timer callback is
+         * exactly the kind of reentrancy this codebase has already hit
+         * real bugs from elsewhere -- lv_async_call() runs within this
+         * same lv_timer_handler() invocation, just after all timers
+         * finish, which is still effectively immediate. */
+        lv_timer_t * refr_timer = lv_display_get_refr_timer(lv_display_get_default());
+        if (refr_timer) {
+            if (screen_on_now) {
+                lv_timer_resume(refr_timer);
+                lv_async_call(full_redraw_async_cb, NULL);
+            } else {
+                lv_timer_pause(refr_timer);
+            }
+        }
+        /* Real-device finding: pausing the display-refresh timer alone did
+         * NOT reduce main-loop wakeup frequency at all -- confirmed via
+         * UI_PERF_TRACE, the loop kept waking ~65 times/second with the
+         * screen off, just doing far less work per wakeup (avg handler time
+         * dropped from ~250-500us to ~15-45us, but the WAKEUP ITSELF still
+         * costs power regardless of how little work it does once awake).
+         * Root cause: lv_indev_enable(NULL, false) above only suppresses
+         * event dispatch -- each registered indev (the touchscreen here)
+         * has its OWN separate periodic read timer (lv_indev_get_read_
+         * timer(), created internally by LVGL alongside the indev itself)
+         * that keeps polling on its own default ~16-33ms period regardless
+         * of whether the indev is enabled. Pausing that too, for every
+         * registered indev, is what actually lets the idle-cap change in
+         * main.c matter. */
+        for (lv_indev_t * indev = lv_indev_get_next(NULL); indev; indev = lv_indev_get_next(indev)) {
+            lv_timer_t * read_timer = lv_indev_get_read_timer(indev);
+            if (!read_timer) continue;
+            if (screen_on_now) lv_timer_resume(read_timer);
+            else lv_timer_pause(read_timer);
+        }
+#ifdef UI_PERF_TRACE
+        printf("PERF screen_refr_timer paused=%d\n", !screen_on_now);
+#endif
     }
 
     if (screen_just_woke) {
@@ -7896,6 +8404,13 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_border_width(dismiss_btn, 0, 0);
     lv_obj_remove_flag(dismiss_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(dismiss_btn, LV_OBJ_FLAG_CLICKABLE);
+    /* Visibility toggled dynamically by sync_player_topbar_visibility() per
+     * Settings > Display > "Hide Player/Lyrics Top Bar" -- visible here by
+     * default (its normal, initial-build state) whenever the setting is
+     * off. See build_flattened_transition_frame() for how the Phase 2
+     * transition cache captures this button's TARGET-state visibility
+     * correctly even while Player is inactive, without relying on this
+     * live object's own current flag value. */
     lv_obj_add_event_cb(dismiss_btn, library_btn_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * dismiss_arrow = lv_image_create(dismiss_btn);
     lv_image_set_src(dismiss_arrow, asset_path("sub_back/btn_back.png"));

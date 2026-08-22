@@ -141,7 +141,8 @@ typedef struct {
      * screen to approximately 5% before the full screen timeout. */
     bool screen_dimming_enabled;
 
-    /* Hide the global status bar while the Player or its fullscreen Lyrics
+    /* Hide the global status bar (and, on the Player specifically, the
+     * standalone back arrow) while the Player or its fullscreen Lyrics
      * view is active. Other screens retain their status information. */
     bool hide_player_topbar;
 

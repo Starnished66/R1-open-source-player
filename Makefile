@@ -22,6 +22,12 @@ CJSON_DIR = cJSON
 SQLITE_DIR = sqlite3
 DBUS_DIR = dbus
 LUA_DIR = lua
+# stb_vorbis (public domain, github.com/nothings/stb) -- a single 192KB file
+# rather than a whole cloned tree like every other dependency above, so it's
+# just committed directly here instead of getting its own bootstrap-clone
+# block (which would need to sparse-clone one file out of the much larger,
+# otherwise-unrelated stb monorepo for no real benefit over committing it).
+STB_VORBIS_DIR = stb_vorbis
 
 # Self-bootstrap: clone dependencies if they don't exist yet before evaluating variables
 ifeq ($(wildcard $(LVGL_DIR)),)
@@ -169,7 +175,7 @@ endif
 # including "audio.h") still resolves via the compiler's -I fallback search
 # even though foo.h now lives in a different category folder -- no #include
 # statements needed changing when src/ was reorganized into subfolders.
-CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(SQLITE_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -DLV_CONF_INCLUDE_SIMPLE=1
+CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(SQLITE_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
 HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
 HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
@@ -254,8 +260,9 @@ TARGET_LDFLAGS = -static -no-pie -lpthread -lm
 # streaming), library/ (metadata/file browsing/playlists), hardware/ (device
 # control), ui/ (gui/screens/assets/fonts), core/ (settings, subprocess,
 # misc). main.c stays at src/ root as the entry point.
-APP_SRCS = src/main.c src/ui/gui.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_conn.c src/network/http_client.c src/network/http_stream.c src/network/subsonic_client.c src/library/cover_decode.c src/library/lyrics.c src/audio/asf_demux.c src/audio/wma_decoder.c src/audio/ogg_demux.c src/audio/opus_decoder.c src/ui/fallback_font.c \
+APP_SRCS = src/main.c src/ui/gui.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_conn.c src/network/http_client.c src/network/http_stream.c src/network/subsonic_client.c src/library/cover_decode.c src/library/lyrics.c src/audio/asf_demux.c src/audio/wma_decoder.c src/audio/ogg_demux.c src/audio/opus_decoder.c src/audio/vorbis_decoder.c src/library/cue_parser.c src/ui/fallback_font.c \
 src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/hardware/usb_audio_output.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/core/hostname_apply.c src/network/dlna_control.c src/network/remote_control.c src/plugins/plugin_manager.c
+APP_SRCS += src/ui/lyrics_layout.c
 APP_CXX_SRCS = src/audio/alac_decoder.cpp
 LVGL_SRCS = $(shell find $(LVGL_DIR)/src -type f -name '*.c')
 TINYALSA_SRCS = $(shell find $(TINYALSA_DIR)/src -type f -name '*.c')
@@ -282,6 +289,10 @@ OPUS_SRCS = $(filter-out %/repacketizer_demo.c %/opus_demo.c %/opus_compare.c %/
 MBEDTLS_SRCS = $(shell find $(MBEDTLS_DIR)/library -type f -name '*.c')
 CJSON_SRCS = $(CJSON_DIR)/cJSON.c
 SQLITE_SRCS = $(SQLITE_DIR)/sqlite3.c
+# stb_vorbis.c is its own complete translation unit (the real implementation,
+# compiled exactly once here); stb_vorbis.h is a header-only shim other .c
+# files include instead -- see that file's own comment.
+STB_VORBIS_SRCS = $(STB_VORBIS_DIR)/stb_vorbis.c
 # Library sources only (verified against this checkout's own doc/readme.html
 # file list) -- excludes lua.c/luac.c, the standalone interpreter/compiler
 # CLI mains, since this is an embedded library build.
@@ -322,6 +333,7 @@ HOST_OBJS = $(APP_SRCS:src/%.c=build_host/%.o) $(APP_CXX_SRCS:src/%.cpp=build_ho
             $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=build_host/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=build_host/cjson/%.o) \
             $(SQLITE_SRCS:$(SQLITE_DIR)/%.c=build_host/sqlite3/%.o) \
             $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_host/opus/%.o) \
+            $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_host/stb_vorbis/%.o) \
             $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_host/lua/%.o)
 TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=build_target/%.o) \
               $(TARGET_ONLY_APP_SRCS:src/%.c=build_target/%.o) \
@@ -332,6 +344,7 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=buil
               $(SQLITE_SRCS:$(SQLITE_DIR)/%.c=build_target/sqlite3/%.o) \
               $(DBUS_SRCS:$(DBUS_DIR)/dbus/%.c=build_target/dbus/%.o) \
               $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_target/opus/%.o) \
+              $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_target/stb_vorbis/%.o) \
               $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_target/lua/%.o)
 
 .PHONY: all host target clean compile_commands.json
@@ -381,6 +394,10 @@ build_host/cjson/%.o: $(CJSON_DIR)/%.c
 build_host/sqlite3/%.o: $(SQLITE_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(SQLITE_CFLAGS) -DHOST_BUILD=1 -c $< -o $@
+
+build_host/stb_vorbis/%.o: $(STB_VORBIS_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
 build_host/opus/%.o: $(OPUS_DIR)/%.c
 	@mkdir -p $(dir $@)
@@ -436,6 +453,10 @@ build_target/cjson/%.o: $(CJSON_DIR)/%.c
 build_target/sqlite3/%.o: $(SQLITE_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(SQLITE_CFLAGS) -c $< -o $@
+
+build_target/stb_vorbis/%.o: $(STB_VORBIS_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
 build_target/dbus/%.o: $(DBUS_DIR)/dbus/%.c
 	@mkdir -p $(dir $@)

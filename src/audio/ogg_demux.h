@@ -20,6 +20,17 @@
 
 typedef struct ogg_demux ogg_demux_t;
 
+typedef enum {
+    OGG_CODEC_UNKNOWN = 0,
+    OGG_CODEC_OPUS,
+    OGG_CODEC_VORBIS,
+} ogg_codec_t;
+
+/* Identifies the codec from the first packet of an Ogg logical stream.
+ * This is intentionally a small header probe, not a decoder open, so callers
+ * can route generic .ogg files without paying for two decoder attempts. */
+ogg_codec_t ogg_detect_codec(const char * path);
+
 ogg_demux_t * ogg_demux_open(const char * path);
 
 /* OpusHead fields (RFC 7845 Section 5.1). Channel Mapping Family must be 0

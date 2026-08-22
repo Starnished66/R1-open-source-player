@@ -137,8 +137,19 @@ static const char * extension_for_content_type(const char * content_type) {
         strcasecmp(content_type, "audio/m4a") == 0) return ".m4a";
     if (strcasecmp(content_type, "audio/x-ape") == 0 || strcasecmp(content_type, "audio/ape") == 0) return ".ape";
     if (strcasecmp(content_type, "audio/x-ms-wma") == 0) return ".wma";
-    if (strcasecmp(content_type, "audio/opus") == 0 || strcasecmp(content_type, "audio/ogg") == 0 ||
-        strcasecmp(content_type, "application/ogg") == 0) return ".opus";
+    if (strcasecmp(content_type, "audio/opus") == 0) return ".opus";
+    /* audio/ogg and application/ogg are generic Ogg-container MIME types --
+     * genuinely ambiguous between Vorbis and Opus payloads, unlike audio/
+     * opus (RFC 7845, Opus-specific) above. Real bug caught in review: both
+     * used to map to .opus unconditionally, so a real Ogg Vorbis cast (now
+     * supported, see vorbis_decoder.h) would download fine but fail to open
+     * -- audio.c's own extension dispatch would hand Vorbis-encoded bytes
+     * to opus_open_file(), the wrong codec entirely. Mapped to .ogg instead:
+     * a server correctly following RFC 7845 for Opus already sends the more
+     * specific audio/opus type (handled above), so anything landing on
+     * these two generic types is more likely classic Ogg Vorbis in
+     * practice. */
+    if (strcasecmp(content_type, "audio/ogg") == 0 || strcasecmp(content_type, "application/ogg") == 0) return ".ogg";
     return NULL;
 }
 

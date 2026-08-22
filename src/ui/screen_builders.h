@@ -46,26 +46,13 @@ extern const lv_font_t * ui_size_28;
  * original small pill inside a bigger empty box. LIST_ROW_BG_COLOR matches
  * that PNG's own fill color (sampled directly from the asset) so the look
  * carries over despite the switch. */
-#define LIST_ROW_WIDTH 464
-/* Wider rows for Files/Artists/Album Artist/Albums/All Songs/Playlists --
- * explicit user request for a bigger tap target (real-device feedback: the
- * default width read as cramped). NOT a flat +15%: this device's screen is
- * only 480px wide (SCREEN_WIDTH, main.c), and LIST_ROW_WIDTH already uses
- * 464 of those, so a literal 15% bump (533px) would overflow the physical
- * display by 53px. 476px is the practical max -- edge-to-edge minus a thin
- * 4px total margin (2px/side) -- confirmed with the user after flagging
- * the overflow, and reconfirmed again after the build_compact_list_widget()
- * padding bug (see that function's own comment) that had been silently
- * offsetting every row was fixed and this width's real on-screen margins
- * were visible for the first time. Rows still use the shared plain-
- * rounded-rect list_row_style (see build_compact_list_widget()'s per-row
- * width override) rather than a new style, so height/radius/color/font
- * stay identical -- only the box widens, and callers passing this must
- * also make sure their row is horizontally centered/positioned so it
- * doesn't clip past the container's own edge (see
- * build_compact_list_widget()'s row_x and file_browser.c's/
- * build_playlists_screen()'s explicit flex-center alignment). */
-#define LIST_ROW_WIDTH_WIDE 476
+int32_t ui_list_row_width(void);
+int32_t ui_list_row_width_wide(void);
+#define LIST_ROW_WIDTH (ui_list_row_width())
+/* Wider rows for the main library lists. Both widths are calculated from
+ * the active panel: ordinary rows retain a 4px/side gutter at 480px while
+ * wide rows retain 2px/side. The gutter grows gently on larger panels. */
+#define LIST_ROW_WIDTH_WIDE (ui_list_row_width_wide())
 #define LIST_ROW_HEIGHT 84
 #define LIST_ROW_RADIUS 16
 #define LIST_ROW_BG_COLOR lv_color_make(28, 28, 30)
@@ -237,9 +224,9 @@ typedef struct {
 #define PILL_ROW_HEIGHT_MIN 100
 #define PILL_ROW_HEIGHT_MAX 220
 #define PILL_ROW_WIDTH_MIN 240
-#define PILL_ROW_WIDTH_MAX 476
+#define PILL_ROW_WIDTH_MAX (ui_list_row_width_wide())
 
-/* Font-tier-aware native width: Small=448, Medium=464, BlindMF=476. */
+/* Native width derived from the active display. */
 int32_t pill_row_default_width(void);
 
 /* On-screen icon footprint (longest edge, in px) a plugin row's icon targets

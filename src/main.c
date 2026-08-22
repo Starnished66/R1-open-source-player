@@ -113,6 +113,25 @@ void mount_sd_card_if_needed(void) {
     try_mount_sd_device_node("/dev/mmcblk0");
 }
 
+/* A software-triggered reboot can start this S92 process before the SD
+ * block node has reappeared. The one early mount attempt above then misses
+ * it, and plugin_manager_init() later sees no .plugins directory; unlike the
+ * library, plugin-backed screens are built only once and cannot recover on
+ * the later hotplug poll. Called immediately after painting the splash, so
+ * this bounded wait overlaps its existing 3-second minimum display time.
+ * Avoid running mount helpers until a real node exists. */
+static void settle_sd_mount_during_splash(void) {
+    const int attempts = 25;
+    for (int i = 0; i < attempts; i++) {
+        if (sd_mount_point_mounted()) return;
+        if (access("/dev/mmcblk0p1", F_OK) == 0 || access("/dev/mmcblk0", F_OK) == 0) {
+            mount_sd_card_if_needed();
+            if (sd_mount_point_mounted()) return;
+        }
+        usleep(100000);
+    }
+}
+
 /* Lightweight boot-time diagnostic log at /usr/data/boot_debug.log, readable
  * via adb even after a crash/reboot loop (hiby_player.sh reboots
  * unconditionally on any exit). Not static: gui_init() (gui.c) also calls
@@ -239,6 +258,9 @@ int main(void) {
      * further down uses the tick recorded here. */
     gui_show_boot_splash();
     boot_checkpoint("gui_show_boot_splash done");
+
+    settle_sd_mount_during_splash();
+    boot_checkpoint("settle_sd_mount_during_splash done");
 
     /* Create Touch Input device via evdev. Auto-detect the touch controller
      * by name first (works on the R1's Hynitron "hyn_ts"); fall back to

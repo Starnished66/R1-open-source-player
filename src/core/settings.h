@@ -141,6 +141,10 @@ typedef struct {
      * screen to approximately 5% before the full screen timeout. */
     bool screen_dimming_enabled;
 
+    /* Hide the global status bar only while the main Player screen is
+     * active. Other screens retain their status information. */
+    bool hide_player_topbar;
+
     /* Charge-status LEDs (/sys/class/leds/{red,blue}, see led_control.h) --
      * false forces both off regardless of charge state, for e.g. leaving the
      * device charging overnight in a dark room. */

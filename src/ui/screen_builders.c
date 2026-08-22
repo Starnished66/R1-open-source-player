@@ -51,6 +51,31 @@ lv_style_t style_theme_card_bg;
 lv_style_t style_theme_text_primary;
 lv_style_t style_theme_text_muted;
 
+/* Runtime geometry replaces the original panel-specific 448/464/476px
+ * constants.  Small symmetric edge gutters preserve the pill silhouette
+ * while allowing the same screens to fill a wider sibling device. */
+static int32_t active_display_width(void) {
+    lv_display_t * display = lv_display_get_default();
+    int32_t width = display ? lv_display_get_horizontal_resolution(display) : 480;
+    return width > 0 ? width : 480;
+}
+
+int32_t ui_list_row_width(void) {
+    int32_t width = active_display_width();
+    int32_t gutter = width / 120;
+    if (gutter < 4) gutter = 4;
+    if (gutter > 12) gutter = 12;
+    return width > gutter * 2 ? width - gutter * 2 : width;
+}
+
+int32_t ui_list_row_width_wide(void) {
+    int32_t width = active_display_width();
+    int32_t gutter = width / 240;
+    if (gutter < 2) gutter = 2;
+    if (gutter > 8) gutter = 8;
+    return width > gutter * 2 ? width - gutter * 2 : width;
+}
+
 void screen_builders_init_list_row_style(void) {
     lv_style_init(&list_row_style);
     lv_style_set_width(&list_row_style, LIST_ROW_WIDTH);
@@ -626,10 +651,7 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size) {
 }
 
 int32_t pill_row_default_width(void) {
-    int32_t line_height = lv_font_get_line_height(ui_size_20);
-    if (line_height >= 30) return 476;
-    if (line_height >= 24) return 464;
-    return 448;
+    return ui_list_row_width();
 }
 
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
@@ -1346,17 +1368,10 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     data->pending_job = NULL;
     data->poll_timer = NULL; /* created below, once `list` itself exists */
 
-    /* Rows are pinned at x=0 by default (LIST_ROW_WIDTH already leaves an
-     * unused right-side margin at this screen's width) -- only centered
-     * when a caller overrides row_width, so a widened row can't overhang
-     * past the list's own right edge instead of just eating into that
-     * margin. Left at 0 for the default width so every existing caller's
-     * layout (e.g. the timezone city list) is untouched. */
-    int32_t row_x = 0;
-    if (row_width != LIST_ROW_WIDTH) {
-        row_x = (lv_display_get_horizontal_resolution(lv_display_get_default()) - row_width) / 2;
-        if (row_x < 0) row_x = 0;
-    }
+    /* Virtual rows are positioned absolutely, so flex cross alignment does
+     * not center them.  Center every width explicitly. */
+    int32_t row_x = (lv_display_get_horizontal_resolution(lv_display_get_default()) - row_width) / 2;
+    if (row_x < 0) row_x = 0;
 
     for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) {
         lv_obj_t * row = lv_label_create(list);

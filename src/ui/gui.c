@@ -21,6 +21,7 @@
 #include "http_client.h"
 #include "cover_decode.h"
 #include "lyrics.h"
+#include "lyrics_layout.h"
 #include "wifi_control.h"
 #include "bluetooth_control.h"
 #include "hiby_sys_server.h"
@@ -39,6 +40,7 @@
 #include "usb_dac_bridge.h"
 #include "firmware_update.h"
 #include "playlist_files.h"
+#include "cue_parser.h"
 #include "subprocess.h"
 #include "timezone_data.h"
 #include "timezone_apply.h"
@@ -188,6 +190,7 @@ static lv_obj_t * about_screen;
 static lv_obj_t * accent_color_screen;
 static lv_obj_t * player_screen;
 static lv_obj_t * lyrics_screen;
+static void sync_player_topbar_visibility(lv_obj_t * screen);
 static lv_obj_t * settings_screen;
 static lv_obj_t * settings_playback_screen;
 static lv_obj_t * settings_display_screen;
@@ -734,7 +737,10 @@ static void slide_transition_anim_x_cb(void * var, int32_t v) {
 
 static void slide_transition_done_cb(lv_anim_t * a) {
     slide_transition_ctx_t * ctx = (slide_transition_ctx_t *) lv_anim_get_user_data(a);
-    if (ctx->commit) lv_screen_load(ctx->to_scr); /* skipped on a cancelled interactive drag -- from_scr was never actually replaced, nothing to load */
+    if (ctx->commit) {
+        lv_screen_load(ctx->to_scr); /* skipped on a cancelled interactive drag -- from_scr was never actually replaced, nothing to load */
+        sync_player_topbar_visibility(ctx->to_scr);
+    }
     lv_obj_delete(ctx->overlay); /* deletes img_from/img_to too */
     if (ctx->buf_from_owned) lv_draw_buf_destroy(ctx->buf_from);
     if (ctx->buf_to_owned) lv_draw_buf_destroy(ctx->buf_to);
@@ -881,6 +887,7 @@ static void screen_transition_slide(lv_obj_t * to_scr, bool forward) {
     slide_transition_ctx_t * ctx = begin_slide_transition(to_scr, forward, false); /* fast live-alias path -- fine here, this transition always finishes in NAV_ANIM_TIME_MS */
     if (!ctx) {
         lv_screen_load(to_scr);
+        sync_player_topbar_visibility(to_scr);
         return;
     }
 
@@ -899,6 +906,7 @@ static void screen_transition_slide(lv_obj_t * to_scr, bool forward) {
 static void nav_push(lv_obj_t * scr) {
     if (nav_depth > 0 && nav_stack[nav_depth - 1] == scr) {
         lv_screen_load(scr); /* already the active screen -- nothing to push */
+        sync_player_topbar_visibility(scr);
         return;
     }
     if (nav_depth < NAV_STACK_MAX) {
@@ -908,10 +916,12 @@ static void nav_push(lv_obj_t * scr) {
      * instantly instead of sliding -- screen_transition_slide() is still
      * used by nav_pop() below, so backing out still animates. */
     lv_screen_load(scr);
+    sync_player_topbar_visibility(scr);
 }
 
 static void nav_pop(void) {
     if (nav_depth > 1) nav_depth--;
+    sync_player_topbar_visibility(nav_stack[nav_depth - 1]);
     screen_transition_slide(nav_stack[nav_depth - 1], false);
 }
 
@@ -947,6 +957,7 @@ static void nav_reset_to_home(void) {
     nav_depth = 1;
     nav_stack[0] = home_screen;
     lv_screen_load(home_screen);
+    sync_player_topbar_visibility(home_screen);
 }
 
 /* Shared back-button handler for every screen built via the reusable
@@ -1143,6 +1154,13 @@ static lv_obj_t * a2dp_status_icon;
 static lv_obj_t * usb_audio_status_icon;
 static lv_obj_t * play_pause_status_icon;
 static lv_obj_t * status_bar_band;
+
+static void sync_player_topbar_visibility(lv_obj_t * screen) {
+    if (!status_bar_band) return;
+    bool hide = current_settings.hide_player_topbar && screen == player_screen;
+    if (hide) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+}
 
 static void build_status_bar(void) {
     lv_obj_t * bar = lv_layer_top();
@@ -4739,6 +4757,10 @@ static void poll_lyrics_load(void) {
 
 #define LYRICS_BACKDROP_WIDTH 480
 #define LYRICS_BACKDROP_HEIGHT 800
+#define LYRICS_BACKDROP_WORK_WIDTH 240
+#define LYRICS_BACKDROP_WORK_HEIGHT 400
+#define LYRICS_BACKDROP_BLUR_RADIUS 8
+#define LYRICS_BACKDROP_BLUR_PASSES 3
 /* Lighter than REFLECTION_DARKEN_NUM/DEN (1/4) -- build_lyrics_screen()
  * layers a flat semi-transparent dark overlay on top of this at composite
  * time for readable text contrast regardless of the source art, so
@@ -4756,14 +4778,39 @@ static bool lyrics_backdrop_active = false;
 static atomic_bool lyrics_backdrop_done_flag = false; /* atomic_bool, not volatile -- see lyrics_load_done_flag's own doc comment */
 static uint8_t * lyrics_backdrop_result_bytes;
 
-/* Same pixel-math shape as compute_reflection_bytes() above (unpack RGB565
- * to 8-bit planes, separable box blur via box_blur_1d(), darken, repack) --
- * pure, no LVGL/shared-state touch, safe on a background thread -- but
- * sized for the full screen and built by a nearest-neighbor vertical
- * stretch of the COVER_ART_WIDTH x COVER_ART_HEIGHT source rather than a
- * crop, since cover art is square and the screen isn't. */
+static uint8_t bilerp_plane(const uint8_t * plane, int width, int height, uint32_t x_fp, uint32_t y_fp) {
+    int x0 = (int) (x_fp >> 16), y0 = (int) (y_fp >> 16);
+    int x1 = x0 + 1 < width ? x0 + 1 : x0;
+    int y1 = y0 + 1 < height ? y0 + 1 : y0;
+    uint32_t fx = x_fp & 0xffffu, fy = y_fp & 0xffffu;
+    uint32_t top = ((uint32_t) plane[y0 * width + x0] * (65536u - fx) +
+                    (uint32_t) plane[y0 * width + x1] * fx) >> 16;
+    uint32_t bottom = ((uint32_t) plane[y1 * width + x0] * (65536u - fx) +
+                       (uint32_t) plane[y1 * width + x1] * fx) >> 16;
+    return (uint8_t) ((top * (65536u - fy) + bottom * fy) >> 16);
+}
+
+static void blur_plane_three_passes(uint8_t * plane, uint8_t * tmp, int width, int height) {
+    for (int pass = 0; pass < LYRICS_BACKDROP_BLUR_PASSES; pass++) {
+        for (int y = 0; y < height; y++) {
+            box_blur_1d(plane + y * width, tmp + y * width, width, 1, LYRICS_BACKDROP_BLUR_RADIUS);
+        }
+        memcpy(plane, tmp, (size_t) width * height);
+        for (int x = 0; x < width; x++) {
+            box_blur_1d(plane + x, tmp + x, height, width, LYRICS_BACKDROP_BLUR_RADIUS);
+        }
+        memcpy(plane, tmp, (size_t) width * height);
+    }
+}
+
+/* Center-crop the square cover to the display's portrait aspect ratio,
+ * sample it bilinearly into a half-resolution work image, apply three box
+ * passes (a close bounded approximation of a Gaussian blur), then bilinear-
+ * upscale while repacking.  This removes the old nearest-neighbor vertical
+ * stretch and is both smoother and cheaper in RAM/CPU than blurring 480x800
+ * directly. Pure pixel math: safe on the backdrop worker thread. */
 static uint8_t * compute_lyrics_backdrop_bytes(const uint8_t * cover_bytes) {
-    int w = LYRICS_BACKDROP_WIDTH, h = LYRICS_BACKDROP_HEIGHT;
+    int w = LYRICS_BACKDROP_WORK_WIDTH, h = LYRICS_BACKDROP_WORK_HEIGHT;
     uint8_t * r = malloc((size_t) w * h);
     uint8_t * g = malloc((size_t) w * h);
     uint8_t * b = malloc((size_t) w * h);
@@ -4773,43 +4820,59 @@ static uint8_t * compute_lyrics_backdrop_bytes(const uint8_t * cover_bytes) {
         return NULL;
     }
 
+    const uint16_t * source = (const uint16_t *) cover_bytes;
+    int crop_w = COVER_ART_HEIGHT * LYRICS_BACKDROP_WIDTH / LYRICS_BACKDROP_HEIGHT;
+    int crop_x = (COVER_ART_WIDTH - crop_w) / 2;
     for (int y = 0; y < h; y++) {
-        int src_y = y * COVER_ART_HEIGHT / h;
-        const uint16_t * src_row = (const uint16_t *) (cover_bytes + (size_t) src_y * COVER_ART_WIDTH * 2);
+        uint32_t sy_fp = h > 1 ? (uint32_t) (((uint64_t) y * (COVER_ART_HEIGHT - 1) << 16) / (h - 1)) : 0;
+        int sy = (int) (sy_fp >> 16);
+        int sy1 = sy + 1 < COVER_ART_HEIGHT ? sy + 1 : sy;
+        uint32_t fy = sy_fp & 0xffffu;
         for (int x = 0; x < w; x++) {
-            uint16_t px = src_row[x];
-            r[y * w + x] = (uint8_t) ((px >> 11) & 0x1F);
-            g[y * w + x] = (uint8_t) ((px >> 5) & 0x3F);
-            b[y * w + x] = (uint8_t) (px & 0x1F);
+            uint32_t sx_fp = (uint32_t) crop_x << 16;
+            if (w > 1) sx_fp += (uint32_t) (((uint64_t) x * (crop_w - 1) << 16) / (w - 1));
+            int sx = (int) (sx_fp >> 16);
+            int sx1 = sx + 1 < COVER_ART_WIDTH ? sx + 1 : sx;
+            uint32_t fx = sx_fp & 0xffffu;
+            uint16_t pixels[4] = {
+                source[sy * COVER_ART_WIDTH + sx], source[sy * COVER_ART_WIDTH + sx1],
+                source[sy1 * COVER_ART_WIDTH + sx], source[sy1 * COVER_ART_WIDTH + sx1]
+            };
+            uint8_t * channels[3] = { r, g, b };
+            for (int c = 0; c < 3; c++) {
+                uint32_t values[4];
+                for (int p = 0; p < 4; p++) {
+                    if (c == 0) values[p] = ((pixels[p] >> 11) & 31) * 255 / 31;
+                    else if (c == 1) values[p] = ((pixels[p] >> 5) & 63) * 255 / 63;
+                    else values[p] = (pixels[p] & 31) * 255 / 31;
+                }
+                uint32_t top = (values[0] * (65536u - fx) + values[1] * fx) >> 16;
+                uint32_t bottom = (values[2] * (65536u - fx) + values[3] * fx) >> 16;
+                channels[c][y * w + x] = (uint8_t) ((top * (65536u - fy) + bottom * fy) >> 16);
+            }
         }
     }
 
-    for (int y = 0; y < h; y++) {
-        box_blur_1d(r + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
-        memcpy(r + y * w, tmp + y * w, (size_t) w);
-        box_blur_1d(g + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
-        memcpy(g + y * w, tmp + y * w, (size_t) w);
-        box_blur_1d(b + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
-        memcpy(b + y * w, tmp + y * w, (size_t) w);
-    }
-    for (int x = 0; x < w; x++) box_blur_1d(r + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
-    memcpy(r, tmp, (size_t) w * h);
-    for (int x = 0; x < w; x++) box_blur_1d(g + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
-    memcpy(g, tmp, (size_t) w * h);
-    for (int x = 0; x < w; x++) box_blur_1d(b + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
-    memcpy(b, tmp, (size_t) w * h);
+    blur_plane_three_passes(r, tmp, w, h);
+    blur_plane_three_passes(g, tmp, w, h);
+    blur_plane_three_passes(b, tmp, w, h);
 
-    uint8_t * out_bytes = malloc((size_t) w * h * 2);
+    uint8_t * out_bytes = malloc((size_t) LYRICS_BACKDROP_WIDTH * LYRICS_BACKDROP_HEIGHT * 2);
     if (!out_bytes) {
         free(r); free(g); free(b); free(tmp);
         return NULL;
     }
     uint16_t * out = (uint16_t *) out_bytes;
-    for (int i = 0; i < w * h; i++) {
-        int rv = (r[i] * LYRICS_BACKDROP_DARKEN_NUM) / LYRICS_BACKDROP_DARKEN_DEN;
-        int gv = (g[i] * LYRICS_BACKDROP_DARKEN_NUM) / LYRICS_BACKDROP_DARKEN_DEN;
-        int bv = (b[i] * LYRICS_BACKDROP_DARKEN_NUM) / LYRICS_BACKDROP_DARKEN_DEN;
-        out[i] = (uint16_t) ((rv << 11) | (gv << 5) | bv);
+    for (int y = 0; y < LYRICS_BACKDROP_HEIGHT; y++) {
+        uint32_t y_fp = (uint32_t) (((uint64_t) y * (h - 1) << 16) / (LYRICS_BACKDROP_HEIGHT - 1));
+        for (int x = 0; x < LYRICS_BACKDROP_WIDTH; x++) {
+            uint32_t x_fp = (uint32_t) (((uint64_t) x * (w - 1) << 16) / (LYRICS_BACKDROP_WIDTH - 1));
+            int rv = bilerp_plane(r, w, h, x_fp, y_fp) * LYRICS_BACKDROP_DARKEN_NUM / LYRICS_BACKDROP_DARKEN_DEN;
+            int gv = bilerp_plane(g, w, h, x_fp, y_fp) * LYRICS_BACKDROP_DARKEN_NUM / LYRICS_BACKDROP_DARKEN_DEN;
+            int bv = bilerp_plane(b, w, h, x_fp, y_fp) * LYRICS_BACKDROP_DARKEN_NUM / LYRICS_BACKDROP_DARKEN_DEN;
+            out[y * LYRICS_BACKDROP_WIDTH + x] =
+                (uint16_t) (((rv >> 3) << 11) | ((gv >> 2) << 5) | (bv >> 3));
+        }
     }
     free(r); free(g); free(b); free(tmp);
     return out_bytes;
@@ -5375,6 +5438,21 @@ static void on_file_selected(char ** new_playlist, int count, int selected_index
     play_track_at(selected_index);
 }
 
+/* Same as on_file_selected() above, but for a tap that needs to start
+ * partway into the track rather than at 0:00 -- currently only CUE track
+ * playback (see cue_track_row_click_cb()): each of new_playlist's entries
+ * is the SAME physical audio file repeated once per CUE track, and
+ * start_seconds is the tapped track's own INDEX 01 offset within it. */
+static void on_file_selected_at(char ** new_playlist, int count, int selected_index, double start_seconds) {
+    free_playlist();
+    playlist = new_playlist;
+    playlist_count = count;
+    queued_pending_count = 0;
+    queue_next_insert_index = -1;
+    remote_control_sync_queue(NULL, 0);
+    play_track_at_from(selected_index, start_seconds);
+}
+
 /* set_player_source_group_songs() is defined further down, right after
  * group_songs_entries/count/title_label -- it needs those already in
  * scope. These three don't. */
@@ -5547,6 +5625,13 @@ static void screen_dimming_switch_event_cb(lv_event_t * e) {
         backlight_set_dimmed(false);
     }
     settings_save(&current_settings);
+}
+
+static void hide_player_topbar_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.hide_player_topbar = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+    sync_player_topbar_visibility(lv_screen_active());
 }
 
 static void led_indicator_switch_event_cb(lv_event_t * e) {
@@ -7825,34 +7910,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
  * memory (capped at LYRICS_MAX_LINES) with nothing to page in from disk. ---- */
 
 #define LYRICS_POOL_SIZE 20
-/* Real-device bug report: lyric lines read as too cramped, not enough
- * breathing room between them -- was a flat 76px (row height 68px, 8px gap)
- * regardless of font size. Two bugs, not one: the cramped spacing itself,
- * and -- caught while fixing it -- this being a #define at all meant it
- * could only ever reflect ONE font size baked in at compile time, so even
- * a fix here would still clip/overlap wrapped lyric lines at the Medium/
- * BlindMF tiers (app_font_28 -- see fallback_font.h -- renders considerably
- * taller there; row text uses that font, but the row's own fixed height
- * never accounted for it). Now a function: room for 2 wrapped lines of
- * app_font_28's real, currently-selected line height, plus a fixed 20px
- * gap to the next row -- both scale together, at every tier, instead of
- * silently falling out of sync as soon as a lyric line wraps to 2 lines on
- * a bigger font. Every other lyrics_* constant below is either independent
- * of this (LYRICS_ACTIVE_LINE_ANCHOR_Y, a fixed viewport position) or
- * derived from it (LYRICS_TOP_PAD, every row/scroll position calculation
- * throughout this screen), so this is the only value that needed to
- * change. */
-static int32_t lyrics_row_stride(void) {
-    /* Real-device bug report (round 2): still not enough room -- some
-     * longer lines wrap to 3 lines, not just 2, and folded into the next
-     * row. Bumped from 2 to 3 lines of headroom, gap from 20 to 24 for a
-     * bit more breathing room between rows generally. &app_font_lyrics
-     * (not &app_font_28) -- see its own doc comment (fallback_font.h): the
-     * lyrics view has its own separate, user-adjustable text size now
-     * (Settings -> Lyrics Text Size), decoupled from the rest of the app's
-     * own Font Size setting. */
-    return lv_font_get_line_height(&app_font_lyrics) * 3 + 24;
-}
+#define LYRICS_ROW_WIDTH 440
+#define LYRICS_ROW_GAP 24
 /* Fixed on-screen y where the active line always sits, in the viewport's
  * own coordinates (25% of the 800px screen) -- real-device feedback: the
  * active line must stay in the same place while the rest of the text
@@ -7873,6 +7932,14 @@ static int32_t lyrics_row_stride(void) {
 #define LYRICS_AUTO_FOLLOW_RESUME_MS 3000L
 
 static lv_obj_t * lyrics_rows[LYRICS_POOL_SIZE];
+/* Prefix positions for the current document: offsets[i] is row i's Y and
+ * offsets[count] is the bottom after its final gap. Long lines can wrap to
+ * an arbitrary number of visual lines (up to LYRICS_MAX_LINE_BYTES), so a
+ * fixed "three lines ought to fit" stride still allowed real text to paint
+ * into its neighbor. This table costs at most ~16KB for 4000 lines and
+ * makes rendering, hit mapping and auto-follow share the exact measured
+ * geometry. */
+static lyrics_layout_t lyrics_layout;
 static int lyrics_window_start = -1; /* index currently shown by lyrics_rows[0]; -1 forces the first update to actually run */
 static int lyrics_pool_synced_for_index = -1; /* current_lyrics_doc_for_index the pool/spacer were last built from */
 static bool lyrics_auto_follow = true;
@@ -7889,6 +7956,23 @@ static int lyrics_current_active_index(void) {
     return lyrics_find_line_at(&current_lyrics_doc, audio_get_position_seconds());
 }
 
+static int32_t lyrics_line_y(int index) {
+    return lyrics_layout_y(&lyrics_layout, index);
+}
+
+static int32_t lyrics_line_height(int index) {
+    return lyrics_layout_height(&lyrics_layout, index);
+}
+
+static void lyrics_build_line_offsets(void) {
+    lyrics_layout_build(&lyrics_layout, current_lyrics_doc_valid ? &current_lyrics_doc : NULL,
+                        &app_font_lyrics, LYRICS_ROW_WIDTH, LYRICS_ROW_GAP, LYRICS_TOP_PAD);
+}
+
+static int lyrics_first_line_at_y(int32_t y, int count) {
+    return lyrics_layout_first_at_y(&lyrics_layout, y, count);
+}
+
 /* Re-syncs the row pool/spacer/empty-state to whatever current_lyrics_doc
  * currently holds -- called on every open (open_lyrics_screen() below) and
  * whenever lyrics_timer_cb() notices the doc changed while already open
@@ -7898,6 +7982,7 @@ static int lyrics_current_active_index(void) {
  * previous track's manual scroll happened to leave it. */
 static void lyrics_reset_pool(void) {
     int count = current_lyrics_doc_valid ? current_lyrics_doc.count : 0;
+    lyrics_build_line_offsets();
 
     /* current_lyrics_plain_mode -- see its own doc comment: a single static
      * text block, no per-line pool/highlight/auto-follow at all. Handled as
@@ -7930,7 +8015,7 @@ static void lyrics_reset_pool(void) {
             lv_obj_add_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
         }
 
-        int32_t total_height = LYRICS_TOP_PAD + count * lyrics_row_stride();
+        int32_t total_height = count > 0 ? lyrics_line_y(count) + LYRICS_TOP_PAD : LYRICS_TOP_PAD;
         lv_obj_set_pos(lyrics_spacer, 0, total_height > 0 ? total_height - 1 : 0);
     }
 
@@ -7953,7 +8038,7 @@ static void lyrics_update_window(int active_index) {
 
     int32_t scroll_y = lv_obj_get_scroll_y(lyrics_list);
     if (scroll_y < 0) scroll_y = 0;
-    int first = (int) (scroll_y / lyrics_row_stride()) - LYRICS_POOL_SIZE / 4;
+    int first = lyrics_first_line_at_y(scroll_y, count) - LYRICS_POOL_SIZE / 4;
     if (first < 0) first = 0;
     int max_first = count - LYRICS_POOL_SIZE;
     if (max_first < 0) max_first = 0;
@@ -7971,7 +8056,8 @@ static void lyrics_update_window(int active_index) {
         }
         lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
         if (window_moved) {
-            lv_obj_set_y(row, LYRICS_TOP_PAD + index * lyrics_row_stride());
+            lv_obj_set_y(row, lyrics_line_y(index));
+            lv_obj_set_height(row, lyrics_line_height(index));
             lv_label_set_text(row, current_lyrics_doc.lines[index].text);
         }
         lv_obj_set_style_text_color(row, index == active_index ? accent_lv_color() : lv_color_make(150, 150, 150), 0);
@@ -8031,6 +8117,7 @@ static void lyrics_gesture_event_cb(lv_event_t * e) {
     lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
     if (nav_depth > 1) nav_depth--;
     lv_screen_load(nav_stack[nav_depth - 1]);
+    sync_player_topbar_visibility(nav_stack[nav_depth - 1]);
 }
 
 /* Records a manual scroll only when driven by an actual finger-press (same
@@ -8084,7 +8171,7 @@ static void lyrics_timer_cb(lv_timer_t * timer) {
     int active_index = lyrics_current_active_index();
 
     if (lyrics_auto_follow && active_index >= 0 && active_index != lyrics_last_centered_index) {
-        int32_t target = LYRICS_TOP_PAD + active_index * lyrics_row_stride() - LYRICS_ACTIVE_LINE_ANCHOR_Y;
+        int32_t target = lyrics_line_y(active_index) - LYRICS_ACTIVE_LINE_ANCHOR_Y;
         if (target < 0) target = 0;
         lv_obj_scroll_to_y(lyrics_list, target, LV_ANIM_ON);
         lyrics_last_centered_index = active_index;
@@ -8151,13 +8238,13 @@ static lv_obj_t * build_lyrics_screen(void) {
 
     for (int slot = 0; slot < LYRICS_POOL_SIZE; slot++) {
         lv_obj_t * row = lv_label_create(lyrics_list);
-        lv_obj_set_width(row, 440);
-        lv_obj_set_height(row, lyrics_row_stride() - 24); /* stride minus its own baked-in gap, see lyrics_row_stride()'s own comment */
+        lv_obj_set_width(row, LYRICS_ROW_WIDTH);
+        lv_obj_set_height(row, lv_font_get_line_height(&app_font_lyrics));
         lv_label_set_long_mode(row, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_font(row, &app_font_lyrics, 0); /* own separate size, not app_font_28 -- see fallback_font.h */
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(row, 20, LYRICS_TOP_PAD + slot * lyrics_row_stride());
+        lv_obj_set_pos(row, 20, LYRICS_TOP_PAD);
         lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN); /* shown by lyrics_update_window() once it has real content */
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE); /* tap to seek -- lyrics_row_click_cb() */
         lv_obj_add_event_cb(row, lyrics_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) slot);
@@ -8310,6 +8397,8 @@ void gui_show_boot_splash(void) {
     lv_timer_handler(); /* force an immediate render -- nothing else pumps the loop until main.c's own main loop starts */
 }
 
+static void on_cue_file_selected(const char * cue_path); /* defined later, alongside build_cue_tracks_screen() -- needs add_playlist_row_base()/build_subsonic_list_screen() already in scope */
+
 static lv_obj_t * build_files_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
@@ -8332,7 +8421,7 @@ static lv_obj_t * build_files_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
-    file_browser_init(scr, MUSIC_ROOT_DIR, on_file_browser_selected);
+    file_browser_init(scr, MUSIC_ROOT_DIR, on_file_browser_selected, on_cue_file_selected);
 
     finalize_screen_navigation(scr);
     return scr;
@@ -13460,6 +13549,96 @@ static lv_obj_t * build_playlists_screen(void) {
     return scr;
 }
 
+/* ---- CUE sheet track list (File Browser -> tap a .cue) -- MVP scope, real
+ * bug report/ISSUES.md to-do item: browse and jump straight to any track
+ * within a single large lossless rip (album.flac + album.cue), rather than
+ * only being able to play/scrub the one giant file with no idea where each
+ * song actually starts. Tapping a track seeks the shared physical file to
+ * that track's own INDEX 01 offset (on_file_selected_at() -- see its own
+ * comment) and plays from there.
+ *
+ * Deliberately NOT wired into gapless next/prev-across-track-boundaries in
+ * this pass: playlist[] here holds the SAME file path once per CUE track
+ * (so the row tapped and the "Track N of M" label at least make sense), but
+ * skip-next/skip-prev between two of them just restarts the same physical
+ * file at 0:00 rather than seeking to the next track's own start -- doing
+ * that correctly needs a per-playlist-slot start-offset the core playback
+ * model doesn't carry today (every other source in this app is genuinely
+ * one file per slot). Browsing back to this screen and tapping a different
+ * track directly still works correctly either way. */
+static lv_obj_t * cue_tracks_screen;
+static lv_obj_t * cue_tracks_list;
+static lv_obj_t * cue_tracks_title_label;
+static cue_sheet_t current_cue_sheet;
+static bool current_cue_sheet_valid = false;
+static char current_cue_source_dir[PATH_MAX];
+static int current_cue_source_row = -1;
+
+static void cue_track_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    if (!current_cue_sheet_valid || index < 0 || index >= current_cue_sheet.track_count) return;
+
+    int count = current_cue_sheet.track_count;
+    char ** paths = malloc(sizeof(char *) * (size_t) count);
+    if (!paths) return;
+    int copied = 0;
+    for (; copied < count; copied++) {
+        paths[copied] = strdup(current_cue_sheet.audio_path);
+        if (!paths[copied]) break;
+    }
+    if (copied != count) {
+        for (int i = 0; i < copied; i++) free(paths[i]);
+        free(paths);
+        show_error_toast("Not enough memory to load CUE tracks");
+        return;
+    }
+    set_player_source_file_browser(current_cue_source_dir, current_cue_source_row);
+    on_file_selected_at(paths, count, index, current_cue_sheet.tracks[index].start_seconds);
+}
+
+static void populate_cue_tracks_screen(void) {
+    lv_obj_clean(cue_tracks_list);
+    for (int i = 0; i < current_cue_sheet.track_count; i++) {
+        cue_track_t * t = &current_cue_sheet.tracks[i];
+        char label[160];
+        /* Falls back to the plain track number when a sheet doesn't set
+         * TITLE for a track (rare but real -- some auto-generated sheets
+         * only carry INDEX times) rather than showing an empty row. */
+        if (t->title[0]) {
+            snprintf(label, sizeof(label), "%d. %s", t->number, t->title);
+        } else {
+            snprintf(label, sizeof(label), "Track %d", t->number);
+        }
+        lv_obj_t * row = add_playlist_row_base(cue_tracks_list, label);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, cue_track_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static lv_obj_t * build_cue_tracks_screen(void) {
+    lv_obj_t * scr = build_subsonic_list_screen("Tracks", &cue_tracks_title_label, &cue_tracks_list);
+    lv_obj_set_flex_align(cue_tracks_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    return scr;
+}
+
+/* file_browser.h's on_cue_select callback -- see file_browser_init()'s own
+ * comment. Parses fresh on every tap (a .cue sheet is tiny, no reason to
+ * cache) and replaces whatever sheet this screen was last showing. */
+static void on_cue_file_selected(const char * cue_path) {
+    cue_sheet_free(&current_cue_sheet);
+    current_cue_sheet_valid = cue_parse_file(cue_path, &current_cue_sheet);
+    if (!current_cue_sheet_valid) {
+        show_error_toast("Couldn't read this .cue file");
+        return;
+    }
+    snprintf(current_cue_source_dir, sizeof(current_cue_source_dir), "%s", file_browser_get_last_selected_dir());
+    current_cue_source_row = file_browser_get_last_selected_row();
+    lv_label_set_text(cue_tracks_title_label, basename_of(current_cue_sheet.audio_path));
+    populate_cue_tracks_screen();
+    nav_push(cue_tracks_screen);
+}
+
 /* Settings > Update Music Database: reruns library_scan_once() (a full
  * rescan + tag re-read of MUSIC_ROOT_DIR, same as gui_init's startup call)
  * on a background thread -- a real library's tag reads are too slow to do
@@ -18393,7 +18572,7 @@ static void plugin_display_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_settings_display_screen(void) {
-    static pill_list_item_t items[6 + PLUGIN_MAX_DISPLAY_LIST_ITEMS];
+    static pill_list_item_t items[7 + PLUGIN_MAX_DISPLAY_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Accent Color", PILL_ACCESSORY_CHEVRON, false, accent_color_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Font Size", PILL_ACCESSORY_CHEVRON, false, font_size_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Lyrics Text Size", PILL_ACCESSORY_CHEVRON, false, lyrics_font_size_settings_row_cb, NULL, NULL };
@@ -18402,8 +18581,11 @@ static lv_obj_t * build_settings_display_screen(void) {
                                     current_settings.screen_dimming_enabled, NULL, screen_dimming_switch_event_cb, NULL };
     items[5] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
                                     current_settings.swipe_up_home_enabled, NULL, swipe_up_home_switch_event_cb, NULL };
+    items[6] = (pill_list_item_t){ "Hide Player Top Bar", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.hide_player_topbar, NULL,
+                                    hide_player_topbar_switch_event_cb, NULL };
 
-    int count = 6;
+    int count = 7;
     int plugin_count = plugin_manager_get_display_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_DISPLAY_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -19678,6 +19860,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
                      true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 
     playlists_screen = build_playlists_screen();
+    cue_tracks_screen = build_cue_tracks_screen();
     group_songs_screen = build_group_songs_screen();
     artist_albums_screen = build_subsonic_list_screen("Albums", &artist_albums_title_label, &artist_albums_list);
     text_entry_screen = build_text_entry_screen();

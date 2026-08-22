@@ -16,6 +16,7 @@ typedef struct {
     char name[256];
     bool is_dir;
     bool is_playlist;
+    bool is_cue;
 } dir_entry_t;
 
 static char root_dir[PATH_MAX];
@@ -26,6 +27,7 @@ static int entry_count = 0;
 static lv_obj_t * path_label;
 static lv_obj_t * list;
 static file_browser_select_cb_t select_cb;
+static file_browser_cue_select_cb_t cue_select_cb;
 
 /* Snapshot of the directory + raw on-screen row (entries[] index, not the
  * file-only position select_cb receives) a file/playlist was last tapped
@@ -39,7 +41,7 @@ static void rebuild_list(void);
 
 /* Kept in sync with audio.c's decoder dispatch. */
 static const char * const PLAYABLE_EXTENSIONS[] = {
-    ".flac", ".mp3", ".wav", ".aiff", ".aif", ".dsf", ".dff", ".aac", ".m4a", ".ape", ".wma", ".opus",
+    ".flac", ".mp3", ".wav", ".aiff", ".aif", ".dsf", ".dff", ".aac", ".m4a", ".ape", ".wma", ".opus", ".ogg",
 };
 
 static bool is_playable_file(const char * name) {
@@ -55,6 +57,12 @@ static bool is_m3u_file(const char * name) {
     const char * ext = strrchr(name, '.');
     if (!ext) return false;
     return strcasecmp(ext, ".m3u") == 0 || strcasecmp(ext, ".m3u8") == 0;
+}
+
+static bool is_cue_file(const char * name) {
+    const char * ext = strrchr(name, '.');
+    if (!ext) return false;
+    return strcasecmp(ext, ".cue") == 0;
 }
 
 static int compare_entries(const void * a, const void * b) {
@@ -104,7 +112,12 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
 
         bool is_dir = S_ISDIR(st.st_mode);
         bool is_playlist = !is_dir && is_m3u_file(de->d_name);
-        if (!is_dir && !is_playlist && !is_playable_file(de->d_name)) continue;
+        /* Only shown at all if a caller actually wants .cue sheets (see
+         * file_browser_init()'s own comment) -- a caller with cue_select_cb
+         * == NULL never sees them, same as any other file type this
+         * browser doesn't recognize. */
+        bool is_cue = !is_dir && cue_select_cb && is_cue_file(de->d_name);
+        if (!is_dir && !is_playlist && !is_cue && !is_playable_file(de->d_name)) continue;
 
         if (count == capacity) {
             /* Audit finding: the previous version overwrote `result` with
@@ -122,6 +135,7 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
         snprintf(result[count].name, sizeof(result[count].name), "%s", de->d_name);
         result[count].is_dir = is_dir;
         result[count].is_playlist = is_playlist;
+        result[count].is_cue = is_cue;
         count++;
     }
 
@@ -146,7 +160,7 @@ static void build_playlist_and_select(int file_display_index) {
     int selected = -1;
 
     for (int i = 0; i < entry_count; i++) {
-        if (entries[i].is_dir || entries[i].is_playlist) continue;
+        if (entries[i].is_dir || entries[i].is_playlist || entries[i].is_cue) continue;
         if (i == file_display_index) selected = count;
 
         char full_path[PATH_MAX];
@@ -244,6 +258,12 @@ static void entry_click_cb(lv_event_t * e) {
             last_selected_row = index;
             select_cb(playlist, count, 0);
         }
+    } else if (entries[index].is_cue) {
+        char cue_path[PATH_MAX];
+        snprintf(cue_path, sizeof(cue_path), "%s/%s", current_dir, entries[index].name);
+        snprintf(last_selected_dir, sizeof(last_selected_dir), "%s", current_dir);
+        last_selected_row = index;
+        cue_select_cb(cue_path);
     } else {
         snprintf(last_selected_dir, sizeof(last_selected_dir), "%s", current_dir);
         last_selected_row = index;
@@ -297,6 +317,10 @@ static void rebuild_list(void) {
         const char * icon_asset = NULL;
         if (entries[i].is_dir) icon_asset = "touch_list/list_folder.png";
         else if (entries[i].is_playlist) icon_asset = "sub_back/btn_playlist.png";
+        /* No dedicated cue-sheet icon asset exists in this theme -- reuses
+         * the playlist one, the closest existing match semantically (both
+         * represent "tap to see a list of tracks", not a single song). */
+        else if (entries[i].is_cue) icon_asset = "sub_back/btn_playlist.png";
         add_file_row(entries[i].name, icon_asset, entry_click_cb, (void *) (intptr_t) i);
     }
 }
@@ -477,8 +501,10 @@ bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * ou
     return true;
 }
 
-void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select_cb_t on_select) {
+void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select_cb_t on_select,
+                        file_browser_cue_select_cb_t on_cue_select) {
     select_cb = on_select;
+    cue_select_cb = on_cue_select;
     snprintf(root_dir, sizeof(root_dir), "%s", root);
     snprintf(current_dir, sizeof(current_dir), "%s", root);
 
@@ -587,7 +613,7 @@ bool file_browser_build_playlist_for_path(const char * path, char *** out_playli
     int selected = -1;
 
     for (int i = 0; i < scanned_count; i++) {
-        if (scanned[i].is_dir || scanned[i].is_playlist) continue;
+        if (scanned[i].is_dir || scanned[i].is_playlist || scanned[i].is_cue) continue;
 
         char full_path[PATH_MAX];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, scanned[i].name);

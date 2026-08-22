@@ -3,6 +3,7 @@
 #include "dr_flac.h"
 #include "dr_wav.h"
 #include "ogg_demux.h"
+#include "stb_vorbis.h"
 #include "mbedtls/base64.h"
 
 #include <limits.h>
@@ -1098,6 +1099,59 @@ static void read_opus_metadata(const char * path, track_metadata_t * out) {
     ogg_demux_close(demux);
 }
 
+/* ---- Ogg Vorbis (.ogg): comment header, same RFC-ish "vendor string +
+ * KEY=VALUE list" layout as Opus's own OpusTags above (Vorbis comments are
+ * in fact where that layout originated -- RFC 7845 5.2 explicitly reuses
+ * the Vorbis I spec's own comment format). Reuses vorbis_decoder.h's stb_
+ * vorbis wrapper's underlying library directly (stb_vorbis_get_comment())
+ * rather than ogg_demux.h, which is hardcoded to Opus's own OpusHead/
+ * OpusTags packet names (see its own header comment) -- stb_vorbis already
+ * does its own complete Ogg demux internally, so there's no reason to
+ * duplicate that here. Heavier than ogg_demux's lightweight header-only
+ * scan (this opens a full decoder, not just a comment reader), same
+ * pragmatic tradeoff class as other formats in this file that reuse a full
+ * decoder-open for a metadata-only read. */
+static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out) {
+    int error = 0;
+    stb_vorbis * f = stb_vorbis_open_filename(path, &error, NULL);
+    if (!f) return;
+
+    stb_vorbis_comment comment = stb_vorbis_get_comment(f);
+    for (int i = 0; i < comment.comment_list_length; i++) {
+        const char * field = comment.comment_list[i];
+        if (!field) continue;
+        size_t field_len = strlen(field);
+
+        /* Same METADATA_BLOCK_PICTURE special case as read_opus_metadata()
+         * above -- see its own comment for why this stays out of
+         * apply_vorbis_comment_field() itself. */
+        static const char picture_key[] = "METADATA_BLOCK_PICTURE=";
+        size_t picture_key_len = sizeof(picture_key) - 1;
+        if (field_len > picture_key_len && strncasecmp(field, picture_key, picture_key_len) == 0) {
+            const char * b64 = field + picture_key_len;
+            size_t b64_len = field_len - picture_key_len;
+
+            size_t decoded_len = 0;
+            int size_err = mbedtls_base64_decode(NULL, 0, &decoded_len, (const unsigned char *) b64, b64_len);
+            if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) && decoded_len > 0) {
+                uint8_t * decoded = malloc(decoded_len);
+                if (decoded) {
+                    size_t actual_len = 0;
+                    if (mbedtls_base64_decode(decoded, decoded_len, &actual_len, (const unsigned char *) b64, b64_len) == 0) {
+                        parse_flac_picture_block(decoded, actual_len, out);
+                    }
+                    free(decoded);
+                }
+            }
+            continue;
+        }
+
+        apply_vorbis_comment_field(out, field, field_len);
+    }
+
+    stb_vorbis_close(f);
+}
+
 /* ---- AIFF/AIFC: metadata_read() previously had no branch for this
  * extension at all -- same silently-fully-zeroed track_metadata_t bug as
  * AAC's own, above. AIFF's real-world tagging convention (iTunes and most
@@ -1649,6 +1703,10 @@ void metadata_read(const char * path, track_metadata_t * out) {
         read_m4a_metadata(path, out);
     } else if (strcasecmp(ext, ".opus") == 0) {
         read_opus_metadata(path, out);
+    } else if (strcasecmp(ext, ".ogg") == 0) {
+        ogg_codec_t codec = ogg_detect_codec(path);
+        if (codec == OGG_CODEC_OPUS) read_opus_metadata(path, out);
+        else if (codec == OGG_CODEC_VORBIS) read_ogg_vorbis_metadata(path, out);
     } else if (strcasecmp(ext, ".aiff") == 0 || strcasecmp(ext, ".aif") == 0) {
         read_aiff_metadata(path, out);
     } else if (strcasecmp(ext, ".dsf") == 0) {

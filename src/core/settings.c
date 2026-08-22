@@ -95,6 +95,7 @@ static void set_defaults(player_settings_t * out) {
     out->screen_timeout_enabled = true;
     out->screen_timeout_seconds = 30;
     out->screen_dimming_enabled = true;
+    out->hide_player_topbar = false;
     out->led_indicator_enabled = true;
     out->charge_limiter_enabled = false; /* opt-in -- caps max charge at 85%, a real behavior change the user should choose, not a default surprise */
     out->safe_charging_enabled = false; /* off means leave the PMIC charge-current setting untouched */
@@ -202,6 +203,8 @@ bool settings_load(player_settings_t * out) {
             out->screen_timeout_seconds = atoi(value);
         } else if (strcmp(key, "screen_dimming_enabled") == 0) {
             out->screen_dimming_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "hide_player_topbar") == 0) {
+            out->hide_player_topbar = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "led_indicator_enabled") == 0) {
             out->led_indicator_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "charge_limiter_enabled") == 0) {
@@ -342,6 +345,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "screen_timeout_enabled=%d\n", settings->screen_timeout_enabled ? 1 : 0);
     fprintf(f, "screen_timeout_seconds=%d\n", settings->screen_timeout_seconds);
     fprintf(f, "screen_dimming_enabled=%d\n", settings->screen_dimming_enabled ? 1 : 0);
+    fprintf(f, "hide_player_topbar=%d\n", settings->hide_player_topbar ? 1 : 0);
     fprintf(f, "led_indicator_enabled=%d\n", settings->led_indicator_enabled ? 1 : 0);
     fprintf(f, "charge_limiter_enabled=%d\n", settings->charge_limiter_enabled ? 1 : 0);
     fprintf(f, "safe_charging_enabled=%d\n", settings->safe_charging_enabled ? 1 : 0);

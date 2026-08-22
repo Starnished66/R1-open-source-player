@@ -11,10 +11,24 @@
  * takes ownership: free each entry and then the array itself. */
 typedef void (*file_browser_select_cb_t)(char ** playlist, int count, int selected_index);
 
+/* Called when the user taps a .cue sheet -- unlike a playable file or .m3u
+ * playlist above, a cue sheet doesn't get played directly (it describes
+ * track boundaries within one ALREADY-listed audio file, not a file of its
+ * own to hand to a decoder); the callee is expected to parse it (cue_parser.h)
+ * and open its own track-list screen. cue_path is the tapped file's full
+ * path, valid only for the duration of the callback (same convention as
+ * file_browser_select_cb_t's own playlist array -- copy it if needed past
+ * this call). */
+typedef void (*file_browser_cue_select_cb_t)(const char * cue_path);
+
 /* Builds the file browser UI (current-path label + scrollable list) as a
  * child of `parent`, starting at `root_dir`. The user can descend into
- * subdirectories and back up, but never above `root_dir`. */
-void file_browser_init(lv_obj_t * parent, const char * root_dir, file_browser_select_cb_t on_select);
+ * subdirectories and back up, but never above `root_dir`. on_cue_select may
+ * be NULL (a caller that doesn't care about .cue sheets at all -- they're
+ * then just hidden from the listing entirely, same as any other
+ * unrecognized file, rather than shown with nothing wired up to tap). */
+void file_browser_init(lv_obj_t * parent, const char * root_dir, file_browser_select_cb_t on_select,
+                        file_browser_cue_select_cb_t on_cue_select);
 
 /* Resets the browser back to its root directory and re-scans it from disk,
  * discarding whatever subdirectory the user was previously browsing. For

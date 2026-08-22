@@ -452,6 +452,16 @@ void metadata_db_open(void) {
         "CREATE INDEX IF NOT EXISTS idx_media_album ON media(album COLLATE NOCASE, album_artist COLLATE NOCASE);",
         "CREATE INDEX IF NOT EXISTS idx_media_album_artist ON media(album_artist COLLATE NOCASE, album COLLATE NOCASE);",
         "CREATE INDEX IF NOT EXISTS idx_media_generation ON media(scan_generation);",
+        /* Backs metadata_db_get_songs_page_by_recency()'s own "ORDER BY
+         * first_seen DESC, rowid DESC" (Recently Added's paged provider) --
+         * DESC here so the index is already in the exact order that query
+         * wants, rather than SQLite needing to walk an ascending index
+         * backwards (which it CAN do, but a matching-direction index is the
+         * more conservative choice given this table's real-world size --
+         * see this block's own comment on how invisible a missing index
+         * stays against a small library vs. a real one). No explicit
+         * trailing rowid column, same reasoning as every index above. */
+        "CREATE INDEX IF NOT EXISTS idx_media_first_seen ON media(first_seen DESC);",
     };
     for (size_t i = 0; i < sizeof(index_sql) / sizeof(index_sql[0]); i++) {
         char * err = NULL;

@@ -57,7 +57,16 @@ typedef struct {
 
     uint32_t accent_color;     /* packed 0xRRGGBB, applied to sliders/switches app-wide */
     bool crossfade_enabled;    /* if true, fade into the next queued track near the current one's end */
-    bool replaygain_enabled;   /* apply per-track ReplayGain tags during local playback */
+
+    /* Settings -> Playback -> ReplayGain. 0 = Off (no gain applied), 1 = Per
+     * Track (default -- normalizes every track to the same perceived
+     * loudness), 2 = Per Album (preserves intentional relative loudness
+     * differences between tracks on the same album, falling back to track
+     * gain for any track whose file has no album-level tag -- see gui.c's
+     * own resolve_replaygain()). Replaced the old plain on/off replaygain_
+     * enabled bool -- see settings.c's load path for the migration from
+     * that field's old on-disk key. */
+    int replaygain_mode;
 
     /* Car Mode: matches the stock firmware's own real behavior (confirmed
      * by real-device report) -- unplugging power while something is loaded
@@ -333,20 +342,31 @@ bool settings_load(player_settings_t * out);
  * mid-write can't corrupt the settings file. */
 void settings_save(const player_settings_t * settings);
 
-/* Settings > System > Factory Reset: deletes the persisted settings file
- * (and any stray .tmp left behind by an interrupted settings_save()) so the
- * next boot's settings_load() falls through to plain defaults, same as a
- * genuinely fresh install. Scoped to just this file -- the music/book
- * library cache (metadata_db.c), saved PEQ profiles, and playlists are
- * user *data*, not settings, and a "factory settings reset" deleting a
- * user's actual library/profiles/playlists out from under them would be a
- * much more destructive action than what was asked for. Doesn't touch
- * *out or re-apply anything live -- the caller is expected to reboot right
- * after (see gui.c's factory_reset_confirm_cb()), since re-syncing every
- * individual subsystem's live state (accent color, screen timeout, BT/
- * Wi-Fi power, LEDs, ...) by hand is exactly what a fresh boot already does
- * for free, the same reasoning a firmware update reboots rather than
- * trying to hot-swap itself. */
+/* Settings > System > Factory Reset: wipes every direct child of /usr/data
+ * EXCEPT "mnt" (real bug report: an earlier version of this only deleted
+ * the settings file, leaving the active PEQ, hostname override, Bluetooth
+ * pairings, ALSA config, theme overrides, etc. all still in effect after a
+ * "reset"), then reboots so the next boot's settings_load() falls through
+ * to plain defaults, same as a genuinely fresh install.
+ *
+ * "mnt" is not an ordinary subdirectory -- it's the live SD card mount
+ * (/usr/data/mnt/sd_0, confirmed on-device: /data is a symlink to usr/data,
+ * and /dev/mmcblk0p1 is mounted there). Every one of this app's own
+ * MUSIC_ROOT_DIR/PLAYLISTS_DIR/METADATA_DB_PATH references elsewhere point
+ * at that same path -- the music/book library cache, saved PEQ profiles,
+ * and playlists all already live there, so skipping "mnt" both protects the
+ * user's actual SD card from ever being touched and, as a direct
+ * consequence, already preserves all of that real user *data* without
+ * needing its own separate carve-out. See settings.c's own implementation
+ * comment for exactly how "mnt" is skipped (never even descended into, not
+ * merely excluded by a flag/pattern).
+ *
+ * Doesn't touch *out or re-apply anything live -- the caller is expected to
+ * reboot right after (see gui.c's factory_reset_confirm_cb()), since re-
+ * syncing every individual subsystem's live state (accent color, screen
+ * timeout, BT/Wi-Fi power, LEDs, ...) by hand is exactly what a fresh boot
+ * already does for free, the same reasoning a firmware update reboots
+ * rather than trying to hot-swap itself. */
 void settings_factory_reset(void);
 
 #endif /* SETTINGS_H */

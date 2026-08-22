@@ -2064,42 +2064,18 @@ static void volume_popup_track_event_cb(lv_event_t * e) {
     }
 }
 
-/* Real-device bug report: both this popup's own volume slider and the quick
- * drawer's brightness slider showed a persistent, precisely 13px-wide gray
- * sliver flanking BOTH ends of the track (confirmed via direct pixel
- * analysis of a pulled framebuffer, and independently reproduced with the
- * MAIN/INDICATOR/KNOB parts each swapped to solid debug colors -- the
- * sliver is neither vol_bg.png/vol_progress.png's own art, nor the
- * pull_down/bg.png backdrop showing through, but some further LVGL-internal
- * knob-radius-sized overshoot on the object's own MAIN/INDICATOR draw that
- * persisted even with LV_PART_INDICATOR's radius already flattened to 0 --
- * 13px matches this slider's own 26px KNOB radius exactly, and the same
- * sliver reappears symmetrically past the track's right edge too, not just
- * "only covered when the slider is at 0" as first reported (that's simply
- * the one value where the real knob happens to sit on top of the left-side
- * sliver and hide it). Rather than keep chasing the exact internal LVGL
- * mechanism, this covers both slivers with two small opaque patches in the
- * exact flanking color -- effective regardless of the underlying cause.
- * Only safe to use where the slider sits on a FLAT, known background color
- * (this popup's volume/bg.png and the quick drawer's pull_down/bg.png both
- * qualify, confirmed by direct pixel sampling of each asset) -- NOT used for
- * the player screen's own progress_slider, which sits over the (non-flat)
- * blurred album art. */
-static void mask_slider_knob_overshoot(lv_obj_t * parent, lv_obj_t * slider, int32_t knob_size, lv_color_t bg_color) {
-    int32_t mask_w = 16;
-    for (int side = 0; side < 2; side++) {
-        lv_obj_t * mask = lv_obj_create(parent);
-        lv_obj_remove_style_all(mask);
-        lv_obj_set_size(mask, mask_w, knob_size);
-        lv_obj_set_style_bg_color(mask, bg_color, 0);
-        lv_obj_set_style_bg_opa(mask, LV_OPA_COVER, 0);
-        lv_obj_remove_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(mask, LV_OBJ_FLAG_CLICKABLE);
-        /* 4px overlap into the slider's own edge so there's no seam between
-         * the mask and wherever the slider's real track color starts. */
-        lv_obj_align_to(mask, slider, side == 0 ? LV_ALIGN_OUT_LEFT_MID : LV_ALIGN_OUT_RIGHT_MID,
-                         side == 0 ? 4 : -4, 0);
-    }
+/* The stock rail sprites are 360 px wide. LVGL centers a background image
+ * at its native size instead of scaling it to the part, so they protrude
+ * from the 340 px volume rail and the dynamically narrower brightness rail.
+ * Paint those two rails natively; keep cursor.png only for the knob. */
+static void configure_native_slider_rail(lv_obj_t * slider) {
+    lv_obj_set_style_bg_image_src(slider, NULL, LV_PART_MAIN);
+    lv_obj_set_style_bg_image_src(slider, NULL, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, lv_color_make(132, 134, 132), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
 }
 
 static void build_volume_popup(void) {
@@ -2149,8 +2125,6 @@ static void build_volume_popup(void) {
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_KNOB);
-    lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/vol_bg.png"), LV_PART_MAIN);
-    lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/vol_progress.png"), LV_PART_INDICATOR);
     lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
     /* Real-device bug report: accent color didn't apply here -- see
      * apply_accent_color()'s own comment on why an image-art slider needs
@@ -2162,17 +2136,14 @@ static void build_volume_popup(void) {
      * as a reasonable belt-and-suspenders choice even though real-device
      * testing (and a debug build with each part painted a distinct solid
      * color) showed this alone does NOT explain the actual gray-sliver bug
-     * here -- see mask_slider_knob_overshoot()'s own comment for what
-     * turned out to be going on and the fix actually used, right below. */
-    lv_obj_set_style_radius(volume_popup_track, 0, LV_PART_INDICATOR);
+     * here. The bounded native rail below fixes the actual image-width
+     * mismatch. */
+    configure_native_slider_rail(volume_popup_track);
     lv_obj_set_style_width(volume_popup_track, 30, LV_PART_KNOB);
     lv_obj_set_style_height(volume_popup_track, 30, LV_PART_KNOB);
     /* Clickable by default (lv_slider_create()) -- drag/touch-able, not
      * just driven by the hw volume buttons, see volume_popup_track_event_cb. */
     lv_obj_add_event_cb(volume_popup_track, volume_popup_track_event_cb, LV_EVENT_ALL, NULL);
-    /* (87,87,91) -- volume/bg.png's own flat color, sampled directly from
-     * the asset. See mask_slider_knob_overshoot()'s own comment. */
-    mask_slider_knob_overshoot(volume_popup, volume_popup_track, 30, lv_color_make(87, 87, 91));
 
     volume_popup_hide_timer = lv_timer_create(volume_popup_hide_timer_cb, 1500, NULL);
     lv_timer_pause(volume_popup_hide_timer);
@@ -3714,10 +3685,7 @@ static void build_quick_drawer(void) {
      * defined here just so it runs once at build time too, same as
      * every other quick-drawer widget's own initial state. */
     lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_KNOB);
-    lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/vol_bg.png"), LV_PART_MAIN);
-    lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/vol_progress.png"), LV_PART_INDICATOR);
     lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
     /* Real-device bug report: accent color didn't apply here -- see
      * apply_accent_color()'s own comment on why an image-art slider needs
@@ -3726,18 +3694,12 @@ static void build_quick_drawer(void) {
     lv_obj_add_style(quick_drawer_brightness_track, &style_accent, LV_PART_KNOB);
     /* Real-device bug report: same left-edge gray sliver/root cause as
      * volume_popup_track's own fix -- see its comment. */
-    lv_obj_set_style_radius(quick_drawer_brightness_track, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_INDICATOR);
+    configure_native_slider_rail(quick_drawer_brightness_track);
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_width(quick_drawer_brightness_track, 26, LV_PART_KNOB);
     lv_obj_set_style_height(quick_drawer_brightness_track, 26, LV_PART_KNOB);
     lv_obj_add_event_cb(quick_drawer_brightness_track, quick_drawer_brightness_changed_cb, LV_EVENT_ALL,
                          quick_drawer_brightness_label);
-    /* (23,23,23) -- pull_down/bg.png's own flat color at this row, sampled
-     * directly from the asset. See mask_slider_knob_overshoot()'s own
-     * comment. */
-    mask_slider_knob_overshoot(quick_drawer, quick_drawer_brightness_track, 26, lv_color_make(23, 23, 23));
     refresh_quick_drawer_brightness();
 
     /* Mini now-playing card: real track title/artist/transport, reusing the
@@ -5138,6 +5100,47 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     lv_label_set_text_fmt(song_count_label, "%d/%d", index + 1, playlist_count);
 }
 
+/* Resolves which of a track's own ReplayGain fields to actually hand to
+ * audio.c, per Settings -> Playback -> ReplayGain's mode: Off (no gain at
+ * all), Per Track (the default -- normalizes every track to the same
+ * perceived loudness), or Per Album (preserves intentional relative
+ * loudness differences between tracks on the same album). Falls back to
+ * track gain when Per Album is selected but this particular file has no
+ * album-level tag -- most taggers only write one or the other depending on
+ * whether the rip was tagged as a whole album or track-at-a-time, and
+ * silently playing unnormalized instead of falling back to whatever IS
+ * available would be a worse outcome than just using track gain here. */
+static void resolve_replaygain(const track_metadata_t * meta, bool * out_has_gain, double * out_gain_db,
+                                bool * out_has_peak, double * out_peak) {
+    int mode = current_settings.replaygain_mode;
+    if (mode == 2 && meta->has_replaygain_album) {
+        *out_has_gain = true;
+        *out_gain_db = meta->replaygain_album_gain_db;
+        /* Prefer the album's own peak for clipping protection, but fall
+         * back to the track's peak when the file has album gain without
+         * album peak (not every tagger writes both) -- audio.c's
+         * replaygain_to_linear() treats has_peak=false as "no clamp at
+         * all", so leaving this unconditionally false whenever album peak
+         * is absent would silently drop clipping protection even though a
+         * real, usable peak value (the track's own) was sitting right
+         * there. Track peak describes this specific file, so it's a safe,
+         * if slightly more conservative, stand-in for the whole album's. */
+        if (meta->has_replaygain_album_peak) {
+            *out_has_peak = true;
+            *out_peak = meta->replaygain_album_peak;
+        } else {
+            *out_has_peak = meta->has_replaygain_peak;
+            *out_peak = meta->replaygain_peak;
+        }
+        return;
+    }
+    bool use_track = mode != 0;
+    *out_has_gain = use_track && meta->has_replaygain;
+    *out_gain_db = meta->replaygain_gain_db;
+    *out_has_peak = use_track && meta->has_replaygain_peak;
+    *out_peak = meta->replaygain_peak;
+}
+
 /* Tells audio.c what comes after `index` (per the current play mode -- see
  * compute_auto_advance_index()) so its playback thread can gapless-handoff
  * or crossfade into it near `index`'s natural end without a GUI round-trip.
@@ -5153,9 +5156,10 @@ static void arm_next_track_for_audio(int index) {
     const char * next_path = playlist_path_at(next_index);
     track_metadata_t next_meta;
     metadata_read(next_path, &next_meta);
-    bool use_replaygain = current_settings.replaygain_enabled;
-    audio_set_next_track(next_path, use_replaygain && next_meta.has_replaygain, next_meta.replaygain_gain_db,
-                          use_replaygain && next_meta.has_replaygain_peak, next_meta.replaygain_peak);
+    bool has_gain, has_peak;
+    double gain_db, peak;
+    resolve_replaygain(&next_meta, &has_gain, &gain_db, &has_peak, &peak);
+    audio_set_next_track(next_path, has_gain, gain_db, has_peak, peak);
     free(next_meta.picture_data); /* only needed the gain/peak fields, not the art or lyrics */
     free(next_meta.lyrics);
 }
@@ -5300,9 +5304,10 @@ static void play_track_at_from(int index, double start_seconds) {
     track_metadata_t meta;
     apply_track_metadata_to_ui(index, &meta); /* resolves this slot if it's a still-lazy All Songs entry */
     const char * path = playlist_path_at(index);
-    bool use_replaygain = current_settings.replaygain_enabled;
-    audio_play_file_at(path, start_seconds, use_replaygain && meta.has_replaygain, meta.replaygain_gain_db,
-                        use_replaygain && meta.has_replaygain_peak, meta.replaygain_peak);
+    bool has_gain, has_peak;
+    double gain_db, peak;
+    resolve_replaygain(&meta, &has_gain, &gain_db, &has_peak, &peak);
+    audio_play_file_at(path, start_seconds, has_gain, gain_db, has_peak, peak);
     arm_next_track_for_audio(index);
 
 #ifndef HOST_BUILD
@@ -5512,15 +5517,6 @@ static void crossfade_switch_event_cb(lv_event_t * e) {
     audio_set_crossfade_enabled(current_settings.crossfade_enabled);
     settings_save(&current_settings);
     refresh_quick_drawer_crossfade_icon(); /* see its own comment -- keeps the drawer icon in sync */
-}
-
-static void replaygain_switch_event_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-    current_settings.replaygain_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    settings_save(&current_settings);
-    /* Avoid a mid-song loudness jump; only the already-queued next track
-     * and subsequent starts adopt the new preference. */
-    if (playlist_index >= 0) arm_next_track_for_audio(playlist_index);
 }
 
 static void car_mode_switch_event_cb(lv_event_t * e) {
@@ -7672,13 +7668,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * bg_image_recolor, not just bg_color. */
     lv_obj_add_style(progress_slider, &style_accent, LV_PART_INDICATOR);
     lv_obj_add_style(progress_slider, &style_accent, LV_PART_KNOB);
-    /* Same class of gray-sliver bug as volume_popup_track/quick_drawer_
-     * brightness_track (see volume_popup_track's own comment for what it
-     * actually is and why this radius alone doesn't fix it) -- but NOT
-     * masked with mask_slider_knob_overshoot() the way those two are: this
-     * slider sits over the player screen's own blurred album art, not a
-     * flat known color, so an opaque patch here would itself look like a
-     * visible defect. Left as a known, accepted gap for now. */
+    /* Keep the dedicated playing-plane art here: unlike the reused 360px
+     * volume rail sprites, these assets match this progress rail's design. */
     lv_obj_set_style_radius(progress_slider, 0, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_INDICATOR);
@@ -15822,6 +15813,68 @@ static void lyrics_font_size_settings_row_cb(lv_event_t * e) {
     open_lyrics_font_size_screen();
 }
 
+/* ---- ReplayGain mode (Settings -> Playback) -- same single-select,
+ * accent-border shape as Lyrics Text Size/Font Size above, but live-apply
+ * rather than reboot-to-apply: the setting itself is just which of a
+ * track's own already-parsed gain fields resolve_replaygain() picks, no
+ * font atlas or anything else expensive to reload, so the change can take
+ * effect as soon as the next track starts (same "avoid a mid-song loudness
+ * jump" reasoning the old on/off toggle already had -- only the already-
+ * queued next track and subsequent starts adopt the new preference, not
+ * the one playing right now). Replaces that old plain toggle with a real
+ * 3-way choice. ---- */
+
+typedef struct {
+    int mode; /* matches player_settings_t.replaygain_mode */
+    const char * label;
+} replaygain_mode_option_t;
+
+static const replaygain_mode_option_t replaygain_mode_options[] = {
+    { 0, "Off" }, { 1, "Per Track" }, { 2, "Per Album" },
+};
+#define REPLAYGAIN_MODE_OPTION_COUNT (sizeof(replaygain_mode_options) / sizeof(replaygain_mode_options[0]))
+
+static lv_obj_t * replaygain_mode_screen;
+static lv_obj_t * replaygain_mode_list;
+
+static void replaygain_mode_option_row_cb(lv_event_t * e);
+
+static void populate_replaygain_mode_screen(void) {
+    lv_obj_clean(replaygain_mode_list);
+    for (size_t i = 0; i < REPLAYGAIN_MODE_OPTION_COUNT; i++) {
+        bool selected = current_settings.replaygain_mode == replaygain_mode_options[i].mode;
+        lv_obj_t * row = add_pill_row_base(replaygain_mode_list, replaygain_mode_options[i].label);
+        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
+        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, replaygain_mode_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static void replaygain_mode_option_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    current_settings.replaygain_mode = replaygain_mode_options[index].mode;
+    settings_save(&current_settings);
+    populate_replaygain_mode_screen();
+    if (playlist_index >= 0) arm_next_track_for_audio(playlist_index);
+}
+
+static lv_obj_t * build_replaygain_mode_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("ReplayGain", &title_label, &replaygain_mode_list);
+}
+
+static void open_replaygain_mode_screen(void) {
+    populate_replaygain_mode_screen();
+    nav_push(replaygain_mode_screen);
+}
+
+static void replaygain_mode_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_replaygain_mode_screen();
+}
+
 /* ---- USB device mode (Settings > USB Mode) -- single-select list, same
  * shape as the Bluetooth codec screen just above (accent-colored border on
  * the current choice). Applying a mode is real configfs/sysfs work (see
@@ -18288,8 +18341,7 @@ static lv_obj_t * build_settings_playback_screen(void) {
                                     &settings_crossfade_toggle_img };
     items[2] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Play/Pause Button", PILL_ACCESSORY_CHEVRON, false, play_pause_button_mode_settings_row_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "ReplayGain", PILL_ACCESSORY_TOGGLE,
-                                    current_settings.replaygain_enabled, NULL, replaygain_switch_event_cb, NULL };
+    items[4] = (pill_list_item_t){ "ReplayGain", PILL_ACCESSORY_CHEVRON, false, replaygain_mode_settings_row_cb, NULL, NULL };
     items[5] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
     items[6] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
     items[7] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
@@ -18888,8 +18940,33 @@ static void build_hostname_reboot_popup(void) {
         hostname_reboot_popup_backdrop_cb, &hostname_reboot_popup_backdrop);
 }
 
+/* RFC 952/1123 hostname-label charset -- letters/digits/hyphen only, no
+ * leading/trailing hyphen. Real bug caught in review: nothing validated
+ * this before it was written straight to /usr/data/hostname_override.txt
+ * and handed to sethostname() (see hostname_apply.c) -- a space or
+ * punctuation typed on the on-screen keyboard would produce an invalid
+ * WiFi/BT broadcast name, or corrupt whatever naive parsing a downstream
+ * consumer of those two bind-mounted files does. Empty is exempted --
+ * that's hostname_entry_done_cb()'s own "reset to stock" sentinel below,
+ * not a real hostname. */
+static bool hostname_is_valid(const char * text) {
+    size_t len = strlen(text);
+    if (len == 0) return true;
+    if (len > 63) return false;
+    if (text[0] == '-' || text[len - 1] == '-') return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = text[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')) return false;
+    }
+    return true;
+}
+
 static void hostname_entry_done_cb(const char * text, void * user_data) {
     (void) user_data;
+    if (!hostname_is_valid(text)) {
+        show_error_toast("Hostname can only use letters, numbers, and hyphens");
+        return;
+    }
     /* Empty submission means "reset to the stock name" -- hostname_apply()
      * itself treats an empty string as a no-op (leaves whatever's already
      * in effect from a previous boot alone), so resetting to stock also
@@ -19723,6 +19800,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     bt_codec_screen = build_bt_codec_screen();
     font_size_screen = build_font_size_screen();
     lyrics_font_size_screen = build_lyrics_font_size_screen();
+    replaygain_mode_screen = build_replaygain_mode_screen();
     resume_mode_screen = build_resume_mode_screen();
     play_pause_button_mode_screen = build_play_pause_button_mode_screen();
     usb_mode_screen = build_usb_mode_screen();

@@ -432,7 +432,20 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
             int32_t label_cy = top_offset + (int32_t) (((int64_t) target_icon_h * 83) / 100);
             lv_obj_align(label, LV_ALIGN_TOP_MID, 0, label_cy - lv_font_get_line_height(ui_size_20) / 2);
         } else {
-            int32_t label_h = lv_font_get_line_height(ui_size_20);
+            /* Real bug caught in review: the label above is LV_LABEL_LONG_
+             * WRAP (genuinely multi-line capable, see its own comment), but
+             * this layout budgeted only a single line_h -- a caption long
+             * enough to actually wrap (more likely at a bigger font tier,
+             * or just a longer label like "Remote Control" at a narrow
+             * tile width) extended past its own reserved band and could
+             * overlap the next tile below it. Bounding the label's own
+             * height at exactly 2 lines (rather than leaving it auto-size
+             * to however much text it holds) means a 3rd line clips
+             * instead of pushing the overlap even further -- two lines
+             * comfortably covers every real label this screen shows. */
+            int32_t line_h = lv_font_get_line_height(ui_size_20);
+            int32_t label_h = line_h * 2;
+            lv_obj_set_height(label, label_h);
             int32_t content_h = target_icon_h + ICON_GRID_ICON_LABEL_GAP + label_h;
             int32_t top_offset = (available_h - content_h) / 2;
             if (top_offset < 0) top_offset = 0;

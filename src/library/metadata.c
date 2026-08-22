@@ -5,6 +5,7 @@
 #include "ogg_demux.h"
 #include "mbedtls/base64.h"
 
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -19,6 +20,63 @@ static void copy_bounded(char * dst, size_t dst_size, const char * src, size_t s
     if (src_len >= dst_size) src_len = dst_size - 1;
     memcpy(dst, src, src_len);
     dst[src_len] = '\0';
+}
+
+/* strtod() wrapper used by every REPLAYGAIN_* field below -- only reports
+ * success when at least one digit was actually consumed (an empty or
+ * garbage value silently returns 0.0 from plain strtod, which would
+ * otherwise be accepted as a spurious valid 0dB tag) and the result is
+ * finite. NaN/Infinity is the dangerous case, not garbage: strtod() itself
+ * accepts literal "nan"/"inf"/"infinity" text per C99, and either one
+ * reaching audio.c's apply_gain() would hit lrintf() on a non-finite value
+ * -- undefined behavior in C. This codebase already had one real incident
+ * from an unguarded NaN reaching raw sample math (peq.c's shelf-filter
+ * sqrt(), see its own comment) from a bad but well-formed-looking input;
+ * closing the same class of bug here rather than trusting every tagger (or
+ * a hand-edited/corrupted file) to only ever write sane numbers. */
+static bool parse_finite_double(const char * str, double * out) {
+    char * end = NULL;
+    double v = strtod(str, &end);
+    if (end == str || !isfinite(v)) return false;
+    *out = v;
+    return true;
+}
+
+/* REPLAYGAIN_TRACK_GAIN/_PEAK/_ALBUM_GAIN/_ALBUM_PEAK key matching, shared
+ * by any format that hands over an already-split key/value pair: Vorbis
+ * comments (apply_vorbis_comment_field() below, after splitting on '='),
+ * and APEv2 items (read_ape_metadata() further down -- already split on
+ * disk, no '=' to strip, but real-world APEv2 taggers write these same four
+ * keys too, so this tag family isn't actually Vorbis-specific despite the
+ * name). value is bounded-copied into a small stack buffer first since
+ * neither caller's value buffer is guaranteed NUL-terminated. */
+static void apply_replaygain_field(track_metadata_t * out, const char * key, size_t key_len, const char * value,
+                                    size_t value_len) {
+    if (key_len != 21) return; /* every one of the four keys below is exactly 21 characters */
+    char value_buf[32];
+    copy_bounded(value_buf, sizeof(value_buf), value, value_len);
+    double v;
+    if (strncasecmp(key, "REPLAYGAIN_TRACK_GAIN", 21) == 0) {
+        if (parse_finite_double(value_buf, &v)) {
+            out->replaygain_gain_db = v;
+            out->has_replaygain = true;
+        }
+    } else if (strncasecmp(key, "REPLAYGAIN_TRACK_PEAK", 21) == 0) {
+        if (parse_finite_double(value_buf, &v)) {
+            out->replaygain_peak = v;
+            out->has_replaygain_peak = true;
+        }
+    } else if (strncasecmp(key, "REPLAYGAIN_ALBUM_GAIN", 21) == 0) {
+        if (parse_finite_double(value_buf, &v)) {
+            out->replaygain_album_gain_db = v;
+            out->has_replaygain_album = true;
+        }
+    } else if (strncasecmp(key, "REPLAYGAIN_ALBUM_PEAK", 21) == 0) {
+        if (parse_finite_double(value_buf, &v)) {
+            out->replaygain_album_peak = v;
+            out->has_replaygain_album_peak = true;
+        }
+    }
 }
 
 /* Generic Vorbis-Comment "KEY=VALUE" field matching -- shared by FLAC's
@@ -49,16 +107,11 @@ static void apply_vorbis_comment_field(track_metadata_t * out, const char * comm
     } else if (key_len == 5 && strncasecmp(comment, "GENRE", 5) == 0) {
         copy_bounded(out->genre, sizeof(out->genre), value, value_len);
         out->has_genre = true;
-    } else if (key_len == 21 && strncasecmp(comment, "REPLAYGAIN_TRACK_GAIN", 21) == 0) {
-        char value_buf[32];
-        copy_bounded(value_buf, sizeof(value_buf), value, value_len);
-        out->replaygain_gain_db = strtod(value_buf, NULL); /* strtod stops at the trailing " dB", no need to strip it */
-        out->has_replaygain = true;
-    } else if (key_len == 21 && strncasecmp(comment, "REPLAYGAIN_TRACK_PEAK", 21) == 0) {
-        char value_buf[32];
-        copy_bounded(value_buf, sizeof(value_buf), value, value_len);
-        out->replaygain_peak = strtod(value_buf, NULL);
-        out->has_replaygain_peak = true;
+    } else if (key_len == 21 && strncasecmp(comment, "REPLAYGAIN_", 11) == 0) {
+        /* strtod() stops at a trailing " dB" on gain fields, no need to
+         * strip it -- apply_replaygain_field() re-checks the full key
+         * against each of the four exact REPLAYGAIN_* names itself. */
+        apply_replaygain_field(out, comment, key_len, value, value_len);
     } else if (out->lyrics == NULL && value_len > 0 &&
                ((key_len == 6 && strncasecmp(comment, "LYRICS", 6) == 0) ||
                 (key_len == 14 && strncasecmp(comment, "UNSYNCEDLYRICS", 14) == 0))) {
@@ -311,7 +364,8 @@ static void decode_id3v2_apic_frame(const uint8_t * data, uint32_t size, track_m
  * per the encoding byte, then a value string (encoded the same way) running
  * to the end of the frame with no terminator required. Taggers that write
  * ReplayGain into ID3v2 (rather than APEv2 or the binary RVA2 frame) use
- * this with descriptions "REPLAYGAIN_TRACK_GAIN"/"REPLAYGAIN_TRACK_PEAK". */
+ * this with descriptions "REPLAYGAIN_TRACK_GAIN"/"REPLAYGAIN_TRACK_PEAK", or
+ * the ALBUM_ variants for whole-album gain/peak. */
 static void decode_id3v2_txxx_frame(const uint8_t * data, uint32_t size, track_metadata_t * out) {
     if (size < 2) return;
 
@@ -332,10 +386,6 @@ static void decode_id3v2_txxx_frame(const uint8_t * data, uint32_t size, track_m
     char description[64];
     decode_id3v2_text_frame(desc_buf, desc_len + 1, description, sizeof(description));
 
-    bool is_gain = strcasecmp(description, "REPLAYGAIN_TRACK_GAIN") == 0;
-    bool is_peak = strcasecmp(description, "REPLAYGAIN_TRACK_PEAK") == 0;
-    if (!is_gain && !is_peak) return;
-
     uint32_t value_len = size - value_start;
     uint8_t value_buf[40];
     uint32_t copy_len = value_len;
@@ -346,13 +396,14 @@ static void decode_id3v2_txxx_frame(const uint8_t * data, uint32_t size, track_m
     char value_str[40];
     decode_id3v2_text_frame(value_buf, copy_len + 1, value_str, sizeof(value_str));
 
-    if (is_gain) {
-        out->replaygain_gain_db = strtod(value_str, NULL);
-        out->has_replaygain = true;
-    } else {
-        out->replaygain_peak = strtod(value_str, NULL);
-        out->has_replaygain_peak = true;
-    }
+    /* description/value_str are both already fully decoded, NUL-terminated
+     * C strings at this point -- apply_replaygain_field() (metadata.c, near
+     * apply_vorbis_comment_field()) does its own exact-name matching and
+     * finite-number validation, same as it does for Vorbis/APEv2, so this
+     * is a plain delegation rather than re-implementing that matching here
+     * a third time. A no-op for any TXXX description that isn't one of the
+     * four REPLAYGAIN_* names. */
+    apply_replaygain_field(out, description, strlen(description), value_str, strlen(value_str));
 }
 
 /* v2.2 PIC frame body: 1 byte text encoding, a FIXED 3-character image
@@ -1064,6 +1115,7 @@ static void read_wav_id3_fallback(const char * path, track_metadata_t * out) {
     }
 
     while (1) {
+        long chunk_start = ftell(f); /* before this iteration's own header read -- see the forward-progress comment below */
         uint8_t chunk_header[8];
         if (fread(chunk_header, 1, sizeof(chunk_header), f) != sizeof(chunk_header)) break;
 
@@ -1078,9 +1130,14 @@ static void read_wav_id3_fallback(const char * path, track_metadata_t * out) {
             break;
         }
 
-        /* Chunks are padded to an even number of bytes, same RIFF convention as every other chunk here. */
+        /* Chunks are padded to an even number of bytes, same RIFF convention as every other chunk here.
+         * Real bug caught in review: chunk_size >= 0x80000000 (a corrupted
+         * file) narrows to a negative `long` on this 32-bit target's
+         * implementation-defined unsigned->signed conversion, which could
+         * make `next` land at or before chunk_start and re-read the same
+         * bytes forever -- this loop has no other bound at all. */
         long next = chunk_data_start + (long) chunk_size + (long) (chunk_size & 1);
-        if (fseek(f, next, SEEK_SET) != 0) break;
+        if (next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
     }
 
     fclose(f);
@@ -1223,6 +1280,15 @@ static void read_ape_metadata(const char * path, track_metadata_t * out) {
             if (value && fread(value, 1, value_length, f) == value_length) {
                 if ((item_flags & 0x6) == 0) { /* bits 1-2 of item_flags: 0 = UTF-8 text */
                     apply_title_artist_album_field(out, key, key_len, value, value_length);
+                    /* APEv2 is Monkey's Audio's native tag format -- real
+                     * taggers write the same REPLAYGAIN_TRACK_GAIN/_PEAK/
+                     * _ALBUM_GAIN/_ALBUM_PEAK keys here as Vorbis comments
+                     * use, just via APEv2's own already-split key/value
+                     * item framing instead of a "KEY=VALUE" string. Real
+                     * gap this session's own bug-analyzer review caught:
+                     * .ape files got zero ReplayGain support (neither Per
+                     * Track nor Per Album) before this. */
+                    apply_replaygain_field(out, key, key_len, value, value_length);
                 }
             }
             free(value);
@@ -1275,6 +1341,7 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
     while (1) {
         char id[5];
         uint64_t size;
+        long chunk_start = ftell(f); /* position BEFORE this iteration's own header read -- next must clear this, or a corrupted size could seek back here and loop forever */
         long chunk_data_start = ftell(f);
         if (!dff_read_chunk_header(f, id, &size)) break;
         chunk_data_start = ftell(f);
@@ -1289,8 +1356,19 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
             diin_end = chunk_data_start + (long) size;
         }
 
+        /* Real bug caught in review: `size` is a raw uint64_t straight off
+         * disk with no validation -- a corrupted or malicious file's huge
+         * or specially-crafted value can make `next` land at or before
+         * chunk_start once narrowed to `long` (implementation-defined
+         * truncation/sign conversion on this 32-bit target), which would
+         * otherwise re-read the exact same bytes and loop here forever
+         * with no other bound at all (unlike, say, read_wma_metadata()'s
+         * own chunk walk, which is at least capped by a finite object
+         * count). Requiring forward progress catches every such case
+         * without needing to individually validate every possible overflow
+         * in the arithmetic above. */
         long next = chunk_data_start + (long) size + (long) (size & 1);
-        if (fseek(f, next, SEEK_SET) != 0) break;
+        if (next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
     }
 
     /* No "ID3 " chunk anywhere -- fall back to the spec-native DIIN
@@ -1299,6 +1377,7 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
         while (ftell(f) < diin_end) {
             char sub_id[5];
             uint64_t sub_size;
+            long sub_chunk_start = ftell(f); /* see the outer chunk walk's own forward-progress comment above */
             long sub_data_start = ftell(f);
             if (!dff_read_chunk_header(f, sub_id, &sub_size)) break;
             sub_data_start = ftell(f);
@@ -1318,7 +1397,13 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
             }
 
             long next = sub_data_start + (long) sub_size + (long) (sub_size & 1);
-            if (fseek(f, next, SEEK_SET) != 0) break;
+            /* This loop's own `while (ftell(f) < diin_end)` bound only
+             * protects against a NEVER-arriving end position -- it doesn't
+             * stop a non-advancing `next` from re-reading the same bytes
+             * forever, since ftell(f) would never move past diin_end in
+             * that case either. Same forward-progress requirement as the
+             * outer chunk walk above. */
+            if (next <= sub_chunk_start || fseek(f, next, SEEK_SET) != 0) break;
         }
     }
 
@@ -1394,6 +1479,16 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
         if (fread(sub_guid, 1, 16, f) != 16 || fread(sub_size_buf, 1, 8, f) != 8) break;
         uint64_t sub_size = read_u64le(sub_size_buf);
         long data_start = ftell(f);
+        /* Real bug caught in review: sub_size is raw off disk -- if a
+         * corrupted file has sub_size < 24 (smaller than the guid+size
+         * header this object's own data is supposed to start after), this
+         * subtraction underflows (uint64_t wraps), and the (long) cast of
+         * that huge wrapped value is implementation-defined on this 32-bit
+         * target. The num_objects loop bound above still caps the total
+         * iteration count, but a non-advancing/backward `next` can still
+         * make it re-read (and effectively hang on) the same bytes for
+         * every remaining one of a corrupted, possibly huge num_objects --
+         * checked below alongside the actual seek. */
         long next = data_start + (long) (sub_size - 24);
 
         if (memcmp(sub_guid, GUID_CONTENT_DESCRIPTION, 16) == 0) {
@@ -1446,6 +1541,7 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
             }
         }
 
+        if (next <= pos) break; /* forward-progress guard -- see `next`'s own comment above */
         pos = next;
     }
 

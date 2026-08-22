@@ -64,10 +64,25 @@ typedef struct {
     double replaygain_gain_db;
     bool has_replaygain_peak;
     double replaygain_peak;
+
+    /* ReplayGain ALBUM gain/peak -- same tag families as track gain/peak
+     * above, just the ALBUM_ variant (VORBIS_COMMENT REPLAYGAIN_ALBUM_GAIN/
+     * _PEAK, ID3v2 TXXX "REPLAYGAIN_ALBUM_GAIN"/"REPLAYGAIN_ALBUM_PEAK").
+     * Lets Settings -> Playback -> ReplayGain's "Per Album" mode preserve
+     * intentional relative loudness differences between tracks on the same
+     * album, rather than normalizing every track to the same perceived
+     * loudness like Per Track mode does. Not every tagger writes album-
+     * level tags (most single/track-at-a-time rips only ever get track
+     * tags) -- has_replaygain_album false in that case, callers should fall
+     * back to track gain (see gui.c's own resolve_replaygain()). */
+    bool has_replaygain_album;
+    double replaygain_album_gain_db;
+    bool has_replaygain_album_peak;
+    double replaygain_album_peak;
 } track_metadata_t;
 
 /* Reads title/artist/album/album_artist/genre tags, embedded cover art,
- * embedded lyrics, and ReplayGain track gain (if present) from a FLAC
+ * embedded lyrics, and ReplayGain track/album gain (if present) from a FLAC
  * (VORBIS_COMMENT + METADATA_BLOCK_PICTURE), MP3 (ID3v2 APIC/USLT/TXXX/TPE2/
  * TCON, falling back to ID3v1 which has none of those), M4A (moov/udta/meta/
  * ilst atoms), or WAV (RIFF LIST/INFO, title/artist/album only, plus an ID3v2

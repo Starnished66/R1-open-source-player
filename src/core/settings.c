@@ -2,6 +2,7 @@
 #include "debug_log.h"
 #include "subprocess.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -78,7 +79,7 @@ static void set_defaults(player_settings_t * out) {
     out->play_pause_button_mode = 0;
     out->accent_color = 0x2196F3; /* matches the app's existing default blue */
     out->crossfade_enabled = false;
-    out->replaygain_enabled = true; /* preserves the pre-setting behavior */
+    out->replaygain_mode = 1; /* Per Track -- preserves the old replaygain_enabled=true default */
     out->car_mode_enabled = false;
     out->subsonic_url[0] = '\0';
     out->subsonic_username[0] = '\0';
@@ -162,7 +163,15 @@ bool settings_load(player_settings_t * out) {
         } else if (strcmp(key, "crossfade") == 0) {
             out->crossfade_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "replaygain_enabled") == 0) {
-            out->replaygain_enabled = (strcmp(value, "1") == 0);
+            /* Legacy on/off key, from before the Off/Per Track/Per Album
+             * mode selector -- settings_save() only ever writes the new
+             * "replaygain_mode" key going forward, so an old config file has
+             * this one but never both; if both somehow appear, whichever
+             * comes later in the file wins (plain sequential key parsing),
+             * same as every other key here. */
+            out->replaygain_mode = (strcmp(value, "1") == 0) ? 1 : 0;
+        } else if (strcmp(key, "replaygain_mode") == 0) {
+            out->replaygain_mode = atoi(value);
         } else if (strcmp(key, "car_mode_enabled") == 0) {
             out->car_mode_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "subsonic_url") == 0) {
@@ -240,6 +249,7 @@ bool settings_load(player_settings_t * out) {
     if (out->play_mode < 0 || out->play_mode > 3) out->play_mode = 0;
     if (out->font_size_tier < 0 || out->font_size_tier > 2) out->font_size_tier = 0;
     if (out->lyrics_font_size_tier != 1 && out->lyrics_font_size_tier != 2) out->lyrics_font_size_tier = 2; /* Medium/Large only, see settings.h */
+    if (out->replaygain_mode < 0 || out->replaygain_mode > 2) out->replaygain_mode = 1; /* Off/Per Track/Per Album only, see settings.h */
     if (out->startup_volume_fixed_percent < 0 || out->startup_volume_fixed_percent > 100) out->startup_volume_fixed_percent = 20;
     if (out->brightness_percent < 0 || out->brightness_percent > 100) out->brightness_percent = 80;
     if (out->resume_mode < 0 || out->resume_mode > 2) out->resume_mode = 0;
@@ -316,7 +326,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "play_pause_button_mode=%d\n", settings->play_pause_button_mode);
     fprintf(f, "accent_color=%06X\n", (unsigned int) (settings->accent_color & 0xFFFFFF));
     fprintf(f, "crossfade=%d\n", settings->crossfade_enabled ? 1 : 0);
-    fprintf(f, "replaygain_enabled=%d\n", settings->replaygain_enabled ? 1 : 0);
+    fprintf(f, "replaygain_mode=%d\n", settings->replaygain_mode);
     fprintf(f, "car_mode_enabled=%d\n", settings->car_mode_enabled ? 1 : 0);
     fprintf(f, "subsonic_url=%s\n", settings->subsonic_url);
     fprintf(f, "subsonic_username=%s\n", settings->subsonic_username);
@@ -362,15 +372,58 @@ void settings_save(const player_settings_t * settings) {
 
 void settings_factory_reset(void) {
     DBG_LOG("settings_factory_reset: called\n");
-#if defined(TEST_BUILD_TAG)
-    int rc1 = remove(SETTINGS_FILE_PATH);
-    DBG_LOG("settings_factory_reset: remove(%s) rc=%d errno=%d\n", SETTINGS_FILE_PATH, rc1, rc1 == 0 ? 0 : errno);
-    int rc2 = remove(SETTINGS_TMP_FILE_PATH); /* stray leftover from an interrupted settings_save(), if any -- harmless to attempt even when it doesn't exist */
-    DBG_LOG("settings_factory_reset: remove(%s) rc=%d errno=%d\n", SETTINGS_TMP_FILE_PATH, rc2, rc2 == 0 ? 0 : errno);
-#else
+#ifndef HOST_BUILD
+    /* Real bug report: this used to delete only the settings file, leaving
+     * every OTHER piece of device/app state (the active PEQ, hostname
+     * override, Bluetooth pairings, ALSA config, theme overrides, ...)
+     * still in effect after a "reset" -- not what Factory Reset is supposed
+     * to mean. Wipes every direct child of /usr/data EXCEPT "mnt", which is
+     * left completely undescended-into.
+     *
+     * "mnt" is not an ordinary subdirectory to be careful with -- it's the
+     * live SD card mount. Confirmed directly on-device: /data is a symlink
+     * to usr/data (`readlink /data` -> "usr/data"), and /usr/data/mnt/sd_0
+     * is where /dev/mmcblk0p1 (the physical SD card) is actually mounted
+     * (confirmed via `mount`). Every MUSIC_ROOT_DIR/PLAYLISTS_DIR/
+     * METADATA_DB_PATH reference elsewhere in this app that reads "/data/
+     * mnt/sd_0" is this exact same path. A wipe that didn't skip "mnt"
+     * wouldn't just risk "issues with the SD card" -- rm -rf recurses
+     * through a mount point same as any other directory, so it would
+     * delete the user's entire music library and every real file on the
+     * card, not just this app's own state.
+     *
+     * Each surviving top-level entry is deleted by its own explicit path,
+     * one subprocess_run() per entry, rather than one command referencing
+     * /usr/data as a whole with an exclude pattern -- this way "mnt" is
+     * never passed to rm at all, not merely excluded by a flag/pattern that
+     * would need to be trusted to work correctly. */
+    DIR * dir = opendir(SETTINGS_DIR_PATH);
+    if (dir) {
+        struct dirent * entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
+                strcmp(entry->d_name, "mnt") == 0) {
+                continue;
+            }
+            char path[600];
+            snprintf(path, sizeof(path), "%s/%s", SETTINGS_DIR_PATH, entry->d_name);
+            DBG_LOG("settings_factory_reset: rm -rf %s\n", path);
+            char * rm_argv[] = { (char *) "/bin/rm", (char *) "-rf", path, NULL };
+            subprocess_run(rm_argv, NULL, 0);
+        }
+        closedir(dir);
+    } else {
+        DBG_LOG("settings_factory_reset: opendir(%s) failed, errno=%d\n", SETTINGS_DIR_PATH, errno);
+    }
+#endif
+    /* Belt-and-suspenders: the loop above already covers these two (both
+     * direct children of SETTINGS_DIR_PATH), but keeping the explicit
+     * removes means this function still does SOMETHING sane on a host
+     * build (SETTINGS_DIR_PATH is "." there, deliberately not wiped
+     * wholesale -- see #ifndef HOST_BUILD above) and if opendir() above
+     * ever failed. */
     remove(SETTINGS_FILE_PATH);
     remove(SETTINGS_TMP_FILE_PATH); /* stray leftover from an interrupted settings_save(), if any -- harmless to attempt even when it doesn't exist */
-#endif
 
     /* Reboots immediately, same as idle_shutdown_now()'s /sbin/poweroff and
      * firmware_update_enter_recovery()'s /sbin/reboot -- this function owns

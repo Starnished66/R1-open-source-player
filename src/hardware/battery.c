@@ -96,6 +96,30 @@ static long elapsed_ms(struct timespec now, struct timespec then) {
     return (now.tv_sec - then.tv_sec) * 1000L + (now.tv_nsec - then.tv_nsec) / 1000000L;
 }
 
+/* CLOCK_MONOTONIC does not advance across Linux suspend-to-RAM (confirmed
+ * kernel/POSIX behavior, not device-specific); CLOCK_BOOTTIME is identical
+ * except it DOES. battery_get_display_percent()'s own long_gap detection
+ * (below) exists specifically to notice "the screen/app was asleep for a
+ * while" and trust the fresh reading immediately instead of applying its
+ * usual jitter-smoothing -- using CLOCK_MONOTONIC there would silently
+ * defeat that: elapsed_ms() across an 8-hour real suspend would report only
+ * the handful of milliseconds the CPU was actually awake around the call,
+ * never crossing BATTERY_DISPLAY_RESYNC_GAP_MS. Present in the Linux kernel
+ * since 2.6.39 (2011) -- expected on any kernel this device could plausibly
+ * run -- but probed once and cached rather than assumed, falling back to
+ * CLOCK_MONOTONIC (the previous behavior) if it's ever unavailable, so a
+ * call site here can't hard-fail either way. */
+static clockid_t battery_clock_id(void) {
+    static clockid_t cached = CLOCK_MONOTONIC;
+    static bool probed = false;
+    if (!probed) {
+        struct timespec ts;
+        cached = (clock_gettime(CLOCK_BOOTTIME, &ts) == 0) ? CLOCK_BOOTTIME : CLOCK_MONOTONIC;
+        probed = true;
+    }
+    return cached;
+}
+
 static bool discover_battery_device(char * out, size_t out_size) {
     DIR * dir = opendir(POWER_SUPPLY_DIR);
     if (!dir) return false;
@@ -122,7 +146,7 @@ static bool discover_battery_device(char * out, size_t out_size) {
 
 static bool refresh_battery_cache_locked(void) {
     struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    clock_gettime(battery_clock_id(), &now);
     long age_ms = (now.tv_sec - cached_at.tv_sec) * 1000L + (now.tv_nsec - cached_at.tv_nsec) / 1000000L;
     if (cache_valid && age_ms >= 0 && age_ms < BATTERY_CACHE_TTL_MS) return true;
 
@@ -165,7 +189,7 @@ int battery_get_display_percent(void) {
     if (raw > 100) raw = 100;
     bool powered = strcmp(cached_status, "Charging") == 0 || strcmp(cached_status, "Full") == 0;
     struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    clock_gettime(battery_clock_id(), &now);
 
     /* Real-device bug report: the displayed percent stayed pinned at a
      * pre-sleep reading (e.g. 71%) across an entire ~8-hour overnight

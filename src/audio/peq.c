@@ -79,6 +79,18 @@ static float limiter_gain = 1.0f; /* current linear gain reduction, 1.0 = none *
 #define LIMITER_RELEASE_SEC 0.050
 #define LIMITER_CEILING 32760.0f
 
+/* attack/release coefficients only actually depend on sample_rate (the two
+ * time constants above are fixed), so they're computed alongside the biquad
+ * coefficients in recompute_all_coeffs() below -- gated by the exact same
+ * coeffs_dirty/coeffs_sample_rate check that function already correctly
+ * maintains -- rather than via two fresh exp() calls on every single
+ * peq_process() invocation regardless of whether anything actually changed
+ * since the last one. Real-device concern caught in review: this is a
+ * single-core MIPS target, and peq_process() runs on every decoded audio
+ * buffer for as long as any EQ/preamp is active, not just once per track. */
+static float cached_attack_coeff = 0.0f;
+static float cached_release_coeff = 0.0f;
+
 /* ISO-standard 10-band graphic EQ center frequencies -- matches the layout
  * of typical hardware DAP PEQ screens (band 0 a low shelf, band 9 a high
  * shelf, the rest peaking bells). */
@@ -180,6 +192,8 @@ static void compute_band_coeffs(int index, unsigned int sample_rate) {
 
 static void recompute_all_coeffs(unsigned int sample_rate) {
     for (int i = 0; i < PEQ_NUM_BANDS; i++) compute_band_coeffs(i, sample_rate);
+    cached_attack_coeff = (float) exp(-1.0 / (LIMITER_ATTACK_SEC * (double) sample_rate));
+    cached_release_coeff = (float) exp(-1.0 / (LIMITER_RELEASE_SEC * (double) sample_rate));
     coeffs_sample_rate = sample_rate;
     coeffs_dirty = false;
 }
@@ -226,13 +240,31 @@ void peq_set_band_enabled(int index, bool enabled) {
 }
 
 void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int sample_rate) {
-    if (bypass) return;
+    /* Real bug caught in review: limiter_gain is continuous smoothing state
+     * (same idea as the biquad state[] below), but neither of the two
+     * inactivity paths reset it -- so a limiter that was mid-gain-reduction
+     * (e.g. from a loud, heavily-boosted track) stayed frozen at that
+     * reduced value across a bypass toggle or a preamp/all-bands-off period
+     * with NO chance to recover toward unity (this function returns before
+     * ever reaching the envelope-follower code below). Re-enabling
+     * processing later would then start audibly quieter than intended until
+     * the release envelope caught back up. Resetting here, at every path
+     * that skips real processing, means the limiter always starts fresh
+     * from unity the next time it's actually needed, regardless of what
+     * state it was left in before. */
+    if (bypass) {
+        limiter_gain = 1.0f;
+        return;
+    }
 
     bool any_enabled = false;
     for (int i = 0; i < PEQ_NUM_BANDS; i++) {
         if (bands[i].enabled) { any_enabled = true; break; }
     }
-    if (!any_enabled && preamp_db == 0.0) return;
+    if (!any_enabled && preamp_db == 0.0) {
+        limiter_gain = 1.0f;
+        return;
+    }
 
     if (coeffs_dirty || sample_rate != coeffs_sample_rate) recompute_all_coeffs(sample_rate);
 
@@ -243,15 +275,17 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
      * the per-sample loop below) -- narrowed to float once here rather than
      * left double and letting every sample's first multiply implicitly
      * promote back to double, which would silently undo the point of
-     * biquad_coeffs_t/biquad_state_t being float (see their own comment). */
+     * biquad_coeffs_t/biquad_state_t being float (see their own comment).
+     * Recomputed fresh every call rather than cached against preamp_db,
+     * unlike the attack/release coefficients below -- peq_load_from_path()
+     * (further down) writes preamp_db directly rather than through peq_set_
+     * preamp_db(), so a cache keyed off "did the setter run" would go stale
+     * on every profile load; one pow() call per buffer is cheap enough that
+     * it isn't worth chasing every write site to keep a cache correct. */
     float preamp_linear = (float) pow(10.0, preamp_db / 20.0);
 
-    /* Recomputed every call (cheap -- two exp() calls, not per-sample) --
-     * sample_rate can change between calls (a new track, or DSD's own
-     * decimated output rate), same reasoning recompute_all_coeffs() already
-     * has for the biquad coefficients above. */
-    float attack_coeff = (float) exp(-1.0 / (LIMITER_ATTACK_SEC * (double) sample_rate));
-    float release_coeff = (float) exp(-1.0 / (LIMITER_RELEASE_SEC * (double) sample_rate));
+    float attack_coeff = cached_attack_coeff;
+    float release_coeff = cached_release_coeff;
 
     for (size_t i = 0; i < frame_count; i++) {
         float frame_samples[PEQ_MAX_CHANNELS];

@@ -141,8 +141,8 @@ typedef struct {
      * screen to approximately 5% before the full screen timeout. */
     bool screen_dimming_enabled;
 
-    /* Hide the global status bar only while the main Player screen is
-     * active. Other screens retain their status information. */
+    /* Hide the global status bar while the Player or its fullscreen Lyrics
+     * view is active. Other screens retain their status information. */
     bool hide_player_topbar;
 
     /* Charge-status LEDs (/sys/class/leds/{red,blue}, see led_control.h) --

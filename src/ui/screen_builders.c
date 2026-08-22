@@ -842,8 +842,12 @@ typedef struct {
      * flag for the whole list, not per-row -- this is a single-touch
      * device, only one row can plausibly be mid-press at a time. */
     bool long_press_fired;
+    int32_t row_height;
+    int32_t row_stride;
     int window_start; /* index currently shown by rows[0]; -1 forces the first update to actually run */
     lv_obj_t * rows[COMPACT_LIST_POOL_SIZE];
+    lv_obj_t * leading_images[COMPACT_LIST_POOL_SIZE];
+    lv_obj_t * trailing_images[COMPACT_LIST_POOL_SIZE];
     void * row_ctx[COMPACT_LIST_POOL_SIZE]; /* opaque to this struct, freed alongside it -- see compact_list_row_ctx_t below */
     lv_obj_t * spacer; /* repositioned by compact_list_set_items() when item_count changes */
     lv_obj_t * now_playing_bar; /* NULL if this list wasn't built with enable_now_playing -- see compact_list_set_now_playing() */
@@ -858,7 +862,9 @@ typedef struct {
     void * provider_ctx;
     int cache_start; /* logical offset of cache_labels[0]; -1 = cache empty/invalid, forces a fetch on next window update */
     int cache_count; /* how many of cache_labels[] are valid (less than COMPACT_LIST_PAGE_CACHE_SIZE only at the tail of the list) */
-    char cache_labels[COMPACT_LIST_PAGE_CACHE_SIZE][COMPACT_LIST_LABEL_MAX];
+    compact_list_page_row_t cache_rows[COMPACT_LIST_PAGE_CACHE_SIZE];
+    compact_list_row_decorator_cb_t row_decorator;
+    void * row_decorator_ctx;
 
     /* Background page fetch -- see compact_list_ensure_cache()'s own
      * comment for why this moved off the scroll-event/UI thread. NULL
@@ -943,7 +949,7 @@ typedef struct compact_list_fetch_job_s {
     void * provider_ctx;
     int offset;
     int count;
-    char labels[COMPACT_LIST_PAGE_CACHE_SIZE][COMPACT_LIST_LABEL_MAX];
+    compact_list_page_row_t rows[COMPACT_LIST_PAGE_CACHE_SIZE];
     /* -1 until the worker thread finishes; written last, the only field the
      * poll timer reads to decide the job is done. atomic_int rather than a
      * plain volatile int -- analyzer finding: pthread_join() (called once
@@ -992,7 +998,7 @@ static void compact_list_job_release(compact_list_fetch_job_t * job) {
 
 static void * compact_list_fetch_worker(void * arg) {
     compact_list_fetch_job_t * job = (compact_list_fetch_job_t *) arg;
-    job->result_count = job->fetch_page(job->provider_ctx, job->offset, job->count, job->labels);
+    job->result_count = job->fetch_page(job->provider_ctx, job->offset, job->count, job->rows);
     compact_list_job_release(job); /* the worker's own reference -- job may already be freed by the other side by the time this call returns */
     return NULL;
 }
@@ -1117,7 +1123,7 @@ static void compact_list_ensure_cache(lv_obj_t * list, compact_list_virtual_data
 static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_data_t * data) {
     int32_t scroll_y = lv_obj_get_scroll_y(list);
     if (scroll_y < 0) scroll_y = 0;
-    int first = (int) (scroll_y / COMPACT_LIST_ROW_STRIDE) - COMPACT_LIST_POOL_SIZE / 4;
+    int first = (int) (scroll_y / data->row_stride) - COMPACT_LIST_POOL_SIZE / 4;
     if (first < 0) first = 0;
     int max_first = data->item_count - COMPACT_LIST_POOL_SIZE;
     if (max_first < 0) max_first = 0;
@@ -1136,13 +1142,56 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
             continue;
         }
         lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_y(row, COMPACT_LIST_TOP_PAD + index * COMPACT_LIST_ROW_STRIDE);
+        lv_obj_set_y(row, COMPACT_LIST_TOP_PAD + index * data->row_stride);
         if (data->fetch_page) {
             int cache_idx = index - data->cache_start;
-            lv_label_set_text(row, (cache_idx >= 0 && cache_idx < data->cache_count) ? data->cache_labels[cache_idx] : "");
+            bool cached = cache_idx >= 0 && cache_idx < data->cache_count;
+            compact_list_page_row_t * info = cached ? &data->cache_rows[cache_idx] : NULL;
+            lv_label_set_text(row, info ? info->label : "");
+            lv_obj_t * trailing = data->trailing_images[slot];
+            if (info && info->trailing_asset[0]) {
+                lv_image_set_src(trailing, asset_path(info->trailing_asset));
+                lv_obj_remove_flag(trailing, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_pad_right(row, 70, 0);
+            } else {
+                lv_obj_add_flag(trailing, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_pad_right(row, LIST_ROW_LABEL_INSET, 0);
+            }
+            if (data->row_decorator)
+                data->row_decorator(list, row, data->leading_images[slot], index, slot,
+                                    info ? info->identity : 0, data->row_decorator_ctx);
         } else {
             lv_label_set_text(row, data->items[index].label);
+            lv_obj_t * trailing = data->trailing_images[slot];
+            if (data->items[index].trailing_asset) {
+                lv_image_set_src(trailing, asset_path(data->items[index].trailing_asset));
+                lv_obj_remove_flag(trailing, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_pad_right(row, 70, 0);
+            } else {
+                lv_obj_add_flag(trailing, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_pad_right(row, LIST_ROW_LABEL_INSET, 0);
+            }
+            if (data->row_decorator)
+                data->row_decorator(list, row, data->leading_images[slot], index, slot,
+                                    data->items[index].identity, data->row_decorator_ctx);
         }
+
+        /* The row itself is a label, so LVGL aligns child images against
+         * its padded content box rather than against the visible card.
+         * Accessory padding changes per row (84px for album art, 70px for
+         * a quality badge); without compensating for it the image is
+         * shifted inward by that same amount and overlaps the text. Keep
+         * the visual insets relative to the physical row instead. The Y
+         * correction likewise cancels list_row_style's asymmetric text
+         * padding so both images remain vertically centred in the card. */
+        int32_t pad_left = lv_obj_get_style_pad_left(row, LV_PART_MAIN);
+        int32_t pad_right = lv_obj_get_style_pad_right(row, LV_PART_MAIN);
+        int32_t pad_top = lv_obj_get_style_pad_top(row, LV_PART_MAIN);
+        int32_t pad_bottom = lv_obj_get_style_pad_bottom(row, LV_PART_MAIN);
+        lv_obj_align(data->leading_images[slot], LV_ALIGN_LEFT_MID,
+                     14 - pad_left, (pad_top - pad_bottom) / -2);
+        lv_obj_align(data->trailing_images[slot], LV_ALIGN_RIGHT_MID,
+                     pad_right - 14, (pad_top - pad_bottom) / -2);
     }
 }
 
@@ -1163,7 +1212,7 @@ static void compact_list_poll_fetch_cb(lv_timer_t * timer) {
     if (job->result_count >= 0) {
         pthread_join(job->thread, NULL); /* already returned by the time result_count landed -- instant, not a real wait */
         data->pending_job = NULL;
-        memcpy(data->cache_labels, job->labels, sizeof(data->cache_labels));
+    memcpy(data->cache_rows, job->rows, sizeof(data->cache_rows));
         data->cache_count = job->result_count;
         data->cache_start = job->offset;
         compact_list_job_release(job); /* the UI-side reference -- see compact_list_fetch_job_s's own doc comment */
@@ -1228,7 +1277,8 @@ static void compact_list_delete_event_cb(lv_event_t * e) {
 }
 
 void compact_list_scroll_to_index(lv_obj_t * list, int index) {
-    lv_obj_scroll_to_y(list, COMPACT_LIST_TOP_PAD + index * COMPACT_LIST_ROW_STRIDE, LV_ANIM_OFF);
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    lv_obj_scroll_to_y(list, COMPACT_LIST_TOP_PAD + index * data->row_stride, LV_ANIM_OFF);
 }
 
 void compact_list_set_now_playing(lv_obj_t * list, int item_index) {
@@ -1249,7 +1299,7 @@ void compact_list_set_now_playing(lv_obj_t * list, int item_index) {
      * position. LVGL's own scroll clipping hides it exactly like any other
      * child once it scrolls out of the visible viewport -- no need to track
      * the pool's current window here at all. */
-    lv_obj_set_y(data->now_playing_bar, COMPACT_LIST_TOP_PAD + item_index * COMPACT_LIST_ROW_STRIDE);
+    lv_obj_set_y(data->now_playing_bar, COMPACT_LIST_TOP_PAD + item_index * data->row_stride);
 }
 
 /* Swaps a build_compact_list_screen() list's contents in place -- e.g. a
@@ -1278,7 +1328,7 @@ void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, 
     data->item_count = item_count;
     data->window_start = -1; /* force compact_list_update_window() below to actually repaint */
 
-    int32_t total_height = COMPACT_LIST_TOP_PAD + item_count * COMPACT_LIST_ROW_STRIDE;
+    int32_t total_height = COMPACT_LIST_TOP_PAD + item_count * data->row_stride;
     lv_obj_set_pos(data->spacer, 0, total_height > 0 ? total_height - 1 : 0);
 
     /* A shorter result set than the previous scroll position would
@@ -1311,7 +1361,7 @@ void compact_list_set_paged_provider(lv_obj_t * list, compact_list_fetch_page_cb
     if (fetch_page) data->item_count = total_count;
     data->window_start = -1; /* force compact_list_update_window() below to actually repaint */
 
-    int32_t total_height = COMPACT_LIST_TOP_PAD + data->item_count * COMPACT_LIST_ROW_STRIDE;
+    int32_t total_height = COMPACT_LIST_TOP_PAD + data->item_count * data->row_stride;
     lv_obj_set_pos(data->spacer, 0, total_height > 0 ? total_height - 1 : 0);
 
     lv_obj_scroll_to_y(list, 0, LV_ANIM_OFF);
@@ -1355,6 +1405,8 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     data->on_click = on_click;
     data->on_long_press = on_long_press;
     data->long_press_fired = false;
+    data->row_height = LIST_ROW_HEIGHT;
+    data->row_stride = COMPACT_LIST_ROW_STRIDE;
     data->window_start = -1;
     data->items = NULL;
     if (item_count > 0) {
@@ -1367,6 +1419,8 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     data->cache_count = 0;
     data->pending_job = NULL;
     data->poll_timer = NULL; /* created below, once `list` itself exists */
+    data->row_decorator = NULL;
+    data->row_decorator_ctx = NULL;
 
     /* Virtual rows are positioned absolutely, so flex cross alignment does
      * not center them.  Center every width explicitly. */
@@ -1383,10 +1437,22 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
          * LIST_ROW_HEIGHT background and touch target. */
         row_label_enable_marquee(row);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(row, row_x, COMPACT_LIST_TOP_PAD + slot * COMPACT_LIST_ROW_STRIDE);
+        lv_obj_set_pos(row, row_x, COMPACT_LIST_TOP_PAD + slot * data->row_stride);
         lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN); /* shown by the initial window update below once it has real content */
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         data->rows[slot] = row;
+
+        lv_obj_t * leading = lv_image_create(row);
+        lv_obj_align(leading, LV_ALIGN_LEFT_MID, 14, 0);
+        lv_obj_remove_flag(leading, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(leading, LV_OBJ_FLAG_HIDDEN);
+        data->leading_images[slot] = leading;
+
+        lv_obj_t * trailing = lv_image_create(row);
+        lv_obj_align(trailing, LV_ALIGN_RIGHT_MID, -14, 0);
+        lv_obj_remove_flag(trailing, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(trailing, LV_OBJ_FLAG_HIDDEN);
+        data->trailing_images[slot] = trailing;
 
         compact_list_row_ctx_t * ctx = malloc(sizeof(*ctx));
         ctx->data = data;
@@ -1408,7 +1474,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     lv_obj_set_style_border_width(spacer, 0, 0);
     lv_obj_remove_flag(spacer, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(spacer, LV_OBJ_FLAG_CLICKABLE);
-    int32_t total_height = COMPACT_LIST_TOP_PAD + item_count * COMPACT_LIST_ROW_STRIDE;
+    int32_t total_height = COMPACT_LIST_TOP_PAD + item_count * data->row_stride;
     lv_obj_set_pos(spacer, 0, total_height > 0 ? total_height - 1 : 0);
     data->spacer = spacer;
 
@@ -1424,7 +1490,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     if (enable_now_playing) {
         lv_obj_t * bar = lv_obj_create(list);
         lv_obj_remove_style_all(bar);
-        lv_obj_set_size(bar, COMPACT_LIST_NOW_PLAYING_BAR_WIDTH, LIST_ROW_HEIGHT);
+        lv_obj_set_size(bar, COMPACT_LIST_NOW_PLAYING_BAR_WIDTH, data->row_height);
         lv_obj_set_style_bg_color(bar, now_playing_color, 0);
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(bar, COMPACT_LIST_NOW_PLAYING_BAR_WIDTH / 2, 0);
@@ -1449,6 +1515,42 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     compact_list_update_window(list, data); /* populate the initially-visible rows */
 
     return list;
+}
+
+void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx) {
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    data->row_decorator = cb;
+    data->row_decorator_ctx = ctx;
+    compact_list_refresh_visible(list);
+}
+
+void compact_list_refresh_visible(lv_obj_t * list) {
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    data->window_start = -1;
+    compact_list_update_window(list, data);
+}
+
+void compact_list_set_row_height(lv_obj_t * list, int32_t row_height) {
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    if (!data || row_height < 48 || row_height == data->row_height) return;
+
+    data->row_height = row_height;
+    data->row_stride = row_height + 4;
+    int32_t text_pad_top = (row_height - lv_font_get_line_height(&LIST_ROW_FONT)) / 2;
+    if (text_pad_top < 0) text_pad_top = 0;
+    for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) {
+        lv_obj_set_style_height(data->rows[slot], row_height, LV_PART_MAIN);
+        lv_obj_set_style_pad_top(data->rows[slot], text_pad_top, LV_PART_MAIN);
+        lv_obj_set_y(data->rows[slot], COMPACT_LIST_TOP_PAD + slot * data->row_stride);
+    }
+    if (data->now_playing_bar) lv_obj_set_height(data->now_playing_bar, row_height);
+    int32_t total_height = COMPACT_LIST_TOP_PAD + data->item_count * data->row_stride;
+    lv_obj_set_pos(data->spacer, 0, total_height > 0 ? total_height - 1 : 0);
+    if (data->now_playing_bar && data->now_playing_index >= 0)
+        lv_obj_set_y(data->now_playing_bar,
+                     COMPACT_LIST_TOP_PAD + data->now_playing_index * data->row_stride);
+    data->window_start = -1;
+    compact_list_update_window(list, data);
 }
 
 lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_cb,

@@ -277,7 +277,10 @@ static void entry_click_cb(lv_event_t * e) {
  * their own real icon. */
 static lv_obj_t * add_file_row(const char * label_text, const char * icon_asset, lv_event_cb_t cb, void * user_data) {
     lv_obj_t * row = lv_obj_create(list);
-    lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, LIST_ROW_HEIGHT); /* 15% wider than the shared default -- explicit user request */
+    /* Files is a Music submenu, so it shares the roomier 100px browsing
+     * density used by Artists/Albums/All Songs; Settings stays at the
+     * shared 84px default. */
+    lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, MUSIC_LIST_ROW_HEIGHT); /* 15% wider than the shared default -- explicit user request */
     lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
     lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -439,7 +442,8 @@ static int compare_paths(const void * a, const void * b) {
  * not in the discovery pass. This is the same separation that keeps Rockbox's
  * tagcache builder from needing an in-RAM representation of the whole library. */
 static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_visit_cb_t cb, void * user,
-                                     int * count, int depth, volatile int * progress) {
+                                     int * count, int depth, volatile int * progress,
+                                     const char * excluded_top_level_dir) {
     if (depth > SCAN_ALL_SONGS_MAX_DEPTH) return true;
 
     DIR * dir = opendir(dir_path);
@@ -462,7 +466,16 @@ static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_vi
         if (S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            keep_going = walk_all_songs_recursive(full_path, cb, user, count, depth + 1, progress);
+            /* Music-library scans may reserve one root-level tree for a
+             * different media domain (currently Audiobooks).  Prune it
+             * before recursion so its files incur no metadata I/O at all;
+             * depth==0 is essential, since an album legitimately named
+             * "Audiobooks" deeper inside Music must remain discoverable. */
+            if (depth == 0 && excluded_top_level_dir &&
+                strcasecmp(de->d_name, excluded_top_level_dir) == 0)
+                continue;
+            keep_going = walk_all_songs_recursive(full_path, cb, user, count, depth + 1, progress,
+                                                  excluded_top_level_dir);
             continue;
         }
         if (!is_playable_file(de->d_name)) continue;
@@ -477,8 +490,14 @@ static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_vi
 
 bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t cb, void * user,
                                  int * out_count, volatile int * progress) {
+    return file_browser_walk_all_songs_excluding_top_level(root, NULL, cb, user, out_count, progress);
+}
+
+bool file_browser_walk_all_songs_excluding_top_level(const char * root, const char * excluded_dir,
+                                                     file_browser_song_visit_cb_t cb, void * user,
+                                                     int * out_count, volatile int * progress) {
     int count = 0;
-    bool completed = walk_all_songs_recursive(root, cb, user, &count, 0, progress);
+    bool completed = walk_all_songs_recursive(root, cb, user, &count, 0, progress, excluded_dir);
     if (out_count) *out_count = count;
     return completed;
 }

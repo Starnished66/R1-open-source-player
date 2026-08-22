@@ -54,6 +54,7 @@ int32_t ui_list_row_width_wide(void);
  * wide rows retain 2px/side. The gutter grows gently on larger panels. */
 #define LIST_ROW_WIDTH_WIDE (ui_list_row_width_wide())
 #define LIST_ROW_HEIGHT 84
+#define MUSIC_LIST_ROW_HEIGHT 100
 #define LIST_ROW_RADIUS 16
 #define LIST_ROW_BG_COLOR lv_color_make(28, 28, 30)
 #define LIST_ROW_FONT app_font_22 /* see fallback_font.h -- same metrics as lv_font_montserrat_22, plus a non-Latin fallback */
@@ -288,12 +289,20 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
 
 typedef struct {
     const char * label;
+    int64_t identity;              /* optional stable DB/item identity for row decorators */
+    const char * trailing_asset;   /* optional theme-relative badge asset */
 } compact_list_item_t;
 
 /* Fixed size of a paged-mode row label buffer (compact_list_fetch_page_cb_t
  * below) -- matches cached_tags_t.title's own size (metadata_db.h), the
  * largest display string a paged provider actually needs to carry. */
 #define COMPACT_LIST_LABEL_MAX 128
+
+typedef struct {
+    char label[COMPACT_LIST_LABEL_MAX];
+    int64_t identity;
+    char trailing_asset[64];
+} compact_list_page_row_t;
 
 /* Fired when a row is tapped, with the index into the `items` array passed
  * to build_compact_list_screen() -- not an lv_event_cb_t, since the
@@ -399,7 +408,21 @@ void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, 
  * list callback runs on), so it's safe to call straight into metadata_db.c
  * (its own METADATA_DB_GUARD) or any other main-thread-only state. */
 typedef int (*compact_list_fetch_page_cb_t)(void * ctx, int offset, int count,
-                                             char out_labels[][COMPACT_LIST_LABEL_MAX]);
+                                             compact_list_page_row_t out_rows[]);
+
+/* Optional visible-row decoration hook. Called only on the LVGL thread for
+ * the fixed recycled row pool. `leading_image` is owned by the list and may
+ * be assigned a static asset or a caller-owned descriptor whose lifetime
+ * exceeds the assignment. */
+typedef void (*compact_list_row_decorator_cb_t)(lv_obj_t * list, lv_obj_t * row,
+                                                lv_obj_t * leading_image, int logical_index,
+                                                int pool_slot, int64_t identity, void * ctx);
+void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx);
+void compact_list_refresh_visible(lv_obj_t * list);
+
+/* Changes only this compact list's row height. Useful for denser/roomier
+ * feature areas without changing Settings and every other shared row. */
+void compact_list_set_row_height(lv_obj_t * list, int32_t row_height);
 
 /* Switches list to (or refreshes) paged mode: total_count is the logical
  * row count (drives the scrollbar range and every fetch_page() bound

@@ -72,6 +72,15 @@ typedef bool (*file_browser_song_visit_cb_t)(const char * path, void * user);
 bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t cb, void * user,
                                  int * out_count, volatile int * progress);
 
+/* Database-oriented variant which prunes one immediate child directory of
+ * root, case-insensitively.  Descendants with the same name elsewhere are
+ * not skipped.  The ordinary walker above intentionally remains unfiltered
+ * so Files, folder playback, and plugins retain Rockbox-like access to every
+ * playable file on the card. */
+bool file_browser_walk_all_songs_excluding_top_level(const char * root, const char * excluded_dir,
+                                                     file_browser_song_visit_cb_t cb, void * user,
+                                                     int * out_count, volatile int * progress);
+
 /* Snapshot of the directory + on-screen row a file/playlist was last
  * tapped from, and a way to jump the browser back there -- for the
  * player's "List" option to reopen the folder a track was played from.

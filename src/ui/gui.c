@@ -95,6 +95,10 @@
  * .txt search across an entire large SD card is both unexpectedly broad and
  * slow; only this dedicated directory participates in book discovery. */
 #define BOOKS_ROOT_DIR MUSIC_ROOT_DIR "/Books"
+#define AUDIOBOOKS_LIBRARY_DIR_NAME "Audiobooks"
+
+/* Music browsing benefits from roomier touch targets and artwork, while
+ * Settings and the rest of the app retain the denser shared 84px rows. */
 
 /* ---- UI text size (Settings -> Font Size) ----
  *
@@ -190,6 +194,7 @@ static lv_obj_t * about_screen;
 static lv_obj_t * accent_color_screen;
 static lv_obj_t * player_screen;
 static lv_obj_t * lyrics_screen;
+static lv_obj_t * player_dismiss_btn;
 static void sync_player_topbar_visibility(lv_obj_t * screen);
 static lv_obj_t * settings_screen;
 static lv_obj_t * settings_playback_screen;
@@ -275,6 +280,7 @@ static lv_obj_t * player_overlay_panel;
  * file path. */
 static uint8_t * current_cover_bytes;
 static lv_image_dsc_t current_cover_dsc;
+static int current_cover_for_index = -1;
 /* Same idea as current_cover_bytes/current_cover_dsc above, for the
  * generated reflection (see generate_reflection()) shown as
  * player_overlay_panel's background. */
@@ -292,6 +298,8 @@ static lv_image_dsc_t current_reflection_dsc;
 static lyrics_doc_t current_lyrics_doc;
 static bool current_lyrics_doc_valid = false;
 static int current_lyrics_doc_for_index = -1; /* playlist_index current_lyrics_doc was loaded for */
+static int current_lyrics_doc_generation = -1;
+static int lyrics_load_generation = 0;
 /* Real-device request: embedded lyrics tags (ID3 USLT, FLAC/Opus LYRICS/
  * UNSYNCEDLYRICS, M4A "\xA9lyr") are usually plain unsynced text with no
  * [mm:ss.xx] timestamps -- despite the name, that's what "unsynced" means
@@ -1156,10 +1164,17 @@ static lv_obj_t * play_pause_status_icon;
 static lv_obj_t * status_bar_band;
 
 static void sync_player_topbar_visibility(lv_obj_t * screen) {
-    if (!status_bar_band) return;
-    bool hide = current_settings.hide_player_topbar && screen == player_screen;
-    if (hide) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
-    else lv_obj_remove_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+    bool hide = current_settings.hide_player_topbar && (screen == player_screen || screen == lyrics_screen);
+    if (status_bar_band) {
+        if (hide) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (player_dismiss_btn) {
+        if (current_settings.hide_player_topbar && screen == player_screen)
+            lv_obj_add_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void build_status_bar(void) {
@@ -4139,14 +4154,15 @@ static void refresh_format_badge(void) {
  * from an asset that doesn't exist in this codebase's copy of the firmware. */
 #define REFLECTION_WIDTH 480
 #define REFLECTION_HEIGHT 320
-#define REFLECTION_BLUR_RADIUS 16
+#define REFLECTION_BLUR_RADIUS 32
+#define REFLECTION_BLUR_PASSES 5
 /* Kept as an integer ratio (channel * NUM / DEN) rather than a float --
  * matches this codebase's general preference for integer arithmetic on the
  * embedded target, and there's no accuracy need here that would justify a
  * float. 1/4 reads as "mostly faded into black" without the panel going
  * fully flat. */
 #define REFLECTION_DARKEN_NUM 1
-#define REFLECTION_DARKEN_DEN 4
+#define REFLECTION_DARKEN_DEN 2
 
 /* 1D box blur via a sliding running sum -- O(length) regardless of radius,
  * rather than O(length * radius) from re-summing the whole window at every
@@ -4173,6 +4189,28 @@ static void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stri
     }
 }
 
+/* RGB565 has only 32 red/blue and 64 green levels, so a strong blur exposes
+ * broad contour bands even though all filtering above is done in 8-bit
+ * planes. Ordered 8x8 dithering trades those coherent bands for a tiny,
+ * stable sub-pixel texture. Stable (not random) matters because a changing
+ * noise field would shimmer on every redraw. */
+static uint16_t rgb888_to_565_dithered(int r, int g, int b, int x, int y) {
+    static const uint8_t bayer8[8][8] = {
+        { 0,48,12,60, 3,51,15,63 }, { 32,16,44,28,35,19,47,31 },
+        { 8,56, 4,52,11,59, 7,55 }, { 40,24,36,20,43,27,39,23 },
+        { 2,50,14,62, 1,49,13,61 }, { 34,18,46,30,33,17,45,29 },
+        { 10,58, 6,54, 9,57, 5,53 }, { 42,26,38,22,41,25,37,21 }
+    };
+    int threshold = bayer8[y & 7][x & 7];
+    r += threshold / 8 - 4;
+    g += threshold / 16 - 2;
+    b += threshold / 8 - 4;
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+    return (uint16_t) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
 /* Pure pixel math -- no LVGL/shared-state touch, so it's safe to call from
  * a background thread (see the async cover-decode pipeline below). Builds
  * the reflection from a given COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565
@@ -4189,21 +4227,17 @@ static uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
         return NULL;
     }
 
-    /* Unpack RGB565 -> separate 8-bit-per-channel planes (blurring packed
-     * 5/6/5 values directly isn't meaningful -- each channel needs its own
-     * running sum), cropping to the source's bottom `h` rows and flipping
-     * them vertically at the same time: source row (COVER_ART_HEIGHT-1-y)
-     * becomes reflection row y, so the real album art's very last row
-     * (right at the seam with this panel) becomes the reflection's first
-     * row, mirroring exactly at the boundary between the two. */
+    /* Center-crop the square cover to this wide panel. The previous bottom-
+     * strip mirror preserved recognizable hard shapes even after blurring,
+     * which looked like a smeared reflection rather than frosted glass. */
     for (int y = 0; y < h; y++) {
-        int src_y = COVER_ART_HEIGHT - 1 - y;
+        int src_y = (COVER_ART_HEIGHT - h) / 2 + y;
         const uint16_t * src_row = (const uint16_t *) (cover_bytes + (size_t) src_y * COVER_ART_WIDTH * 2);
         for (int x = 0; x < w; x++) {
             uint16_t px = src_row[x];
-            r[y * w + x] = (uint8_t) ((px >> 11) & 0x1F);
-            g[y * w + x] = (uint8_t) ((px >> 5) & 0x3F);
-            b[y * w + x] = (uint8_t) (px & 0x1F);
+            r[y * w + x] = (uint8_t) (((px >> 11) & 0x1F) * 255 / 31);
+            g[y * w + x] = (uint8_t) (((px >> 5) & 0x3F) * 255 / 63);
+            b[y * w + x] = (uint8_t) ((px & 0x1F) * 255 / 31);
         }
     }
 
@@ -4212,20 +4246,24 @@ static uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
      * at a fraction of the cost of a real 2D kernel. Heavy (radius 16)
      * deliberately, per the "frosted glass" look this is going for rather
      * than a sharp mirror image. */
-    for (int y = 0; y < h; y++) {
-        box_blur_1d(r + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
-        memcpy(r + y * w, tmp + y * w, (size_t) w);
-        box_blur_1d(g + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
-        memcpy(g + y * w, tmp + y * w, (size_t) w);
-        box_blur_1d(b + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
-        memcpy(b + y * w, tmp + y * w, (size_t) w);
+    for (int pass = 0; pass < REFLECTION_BLUR_PASSES; pass++) {
+        for (int y = 0; y < h; y++) box_blur_1d(r + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+        memcpy(r, tmp, (size_t) w * h);
+        for (int x = 0; x < w; x++) box_blur_1d(r + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+        memcpy(r, tmp, (size_t) w * h);
     }
-    for (int x = 0; x < w; x++) box_blur_1d(r + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
-    memcpy(r, tmp, (size_t) w * h);
-    for (int x = 0; x < w; x++) box_blur_1d(g + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
-    memcpy(g, tmp, (size_t) w * h);
-    for (int x = 0; x < w; x++) box_blur_1d(b + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
-    memcpy(b, tmp, (size_t) w * h);
+    for (int pass = 0; pass < REFLECTION_BLUR_PASSES; pass++) {
+        for (int y = 0; y < h; y++) box_blur_1d(g + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+        memcpy(g, tmp, (size_t) w * h);
+        for (int x = 0; x < w; x++) box_blur_1d(g + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+        memcpy(g, tmp, (size_t) w * h);
+    }
+    for (int pass = 0; pass < REFLECTION_BLUR_PASSES; pass++) {
+        for (int y = 0; y < h; y++) box_blur_1d(b + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+        memcpy(b, tmp, (size_t) w * h);
+        for (int x = 0; x < w; x++) box_blur_1d(b + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+        memcpy(b, tmp, (size_t) w * h);
+    }
 
     uint8_t * out_bytes = malloc((size_t) w * h * 2);
     if (!out_bytes) {
@@ -4240,7 +4278,7 @@ static uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
         int rv = (r[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
         int gv = (g[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
         int bv = (b[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
-        out[i] = (uint16_t) ((rv << 11) | (gv << 5) | bv);
+        out[i] = rgb888_to_565_dithered(rv, gv, bv, i % w, i / w);
     }
     free(r); free(g); free(b); free(tmp);
     return out_bytes;
@@ -4480,6 +4518,7 @@ static void poll_cover_decode(void) {
     } else if (!cover_decode_result_ok) {
         free(current_cover_bytes);
         current_cover_bytes = NULL;
+        current_cover_for_index = -1;
         lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
         /* No in-memory raw bitmap to reflect for the static placeholder
          * cover -- reset the panel back to its plain background rather
@@ -4491,6 +4530,7 @@ static void poll_cover_decode(void) {
     } else {
         free(current_cover_bytes);
         current_cover_bytes = (uint8_t *) cover_decode_result_pixels;
+        current_cover_for_index = cover_decode_result_for_index;
         free(current_reflection_bytes);
         current_reflection_bytes = cover_decode_result_reflection;
 
@@ -4556,7 +4596,10 @@ static void poll_cover_decode(void) {
          * generation happens to already be running (marking it pending
          * instead, same as any other caller), so this is safe to call
          * unconditionally whenever the lyrics screen is open. */
-        if (lv_screen_active() == lyrics_screen) launch_lyrics_backdrop_decode();
+        if (current_lyrics_doc_generation == lyrics_load_generation &&
+            current_lyrics_doc_for_index == playlist_index &&
+            (current_lyrics_doc_valid || current_lyrics_plain_mode))
+            launch_lyrics_backdrop_decode();
     }
 
     cover_decode_result_pixels = NULL;
@@ -4637,8 +4680,6 @@ static char * lyrics_load_result_plain_text; /* malloc'd, only meaningful when l
  * can easily be a completely different song, and an index-only check would
  * wrongly accept the stale result for it. A strictly increasing counter
  * has no such collision. */
-static int lyrics_load_generation = 0;
-
 static bool lyrics_load_pending_valid = false;
 static int lyrics_load_pending_for_index;
 static char lyrics_load_pending_path[PATH_MAX];
@@ -4730,10 +4771,15 @@ static void poll_lyrics_load(void) {
         current_lyrics_doc_valid = lyrics_load_result_ok;
         if (lyrics_load_result_ok) current_lyrics_doc = lyrics_load_result_doc;
         current_lyrics_doc_for_index = lyrics_load_result_for_index;
+        current_lyrics_doc_generation = lyrics_load_result_generation;
 
         free(current_lyrics_plain_text);
         current_lyrics_plain_mode = lyrics_load_result_plain_mode;
         current_lyrics_plain_text = lyrics_load_result_plain_text;
+
+        if ((current_lyrics_doc_valid || current_lyrics_plain_mode) &&
+            current_cover_bytes && current_cover_for_index == playlist_index)
+            launch_lyrics_backdrop_decode();
     } else {
         if (lyrics_load_result_ok) lyrics_doc_free(&lyrics_load_result_doc); /* stale -- superseded by a later launch before this landed */
         free(lyrics_load_result_plain_text);
@@ -4757,26 +4803,34 @@ static void poll_lyrics_load(void) {
 
 #define LYRICS_BACKDROP_WIDTH 480
 #define LYRICS_BACKDROP_HEIGHT 800
-#define LYRICS_BACKDROP_WORK_WIDTH 240
-#define LYRICS_BACKDROP_WORK_HEIGHT 400
-#define LYRICS_BACKDROP_BLUR_RADIUS 8
+#define LYRICS_BACKDROP_WORK_WIDTH 60
+#define LYRICS_BACKDROP_WORK_HEIGHT 100
+#define LYRICS_BACKDROP_BLUR_RADIUS 5
 #define LYRICS_BACKDROP_BLUR_PASSES 3
-/* Lighter than REFLECTION_DARKEN_NUM/DEN (1/4) -- build_lyrics_screen()
- * layers a flat semi-transparent dark overlay on top of this at composite
- * time for readable text contrast regardless of the source art, so
- * darkening heavily here too would just make the backdrop needlessly
- * murky underneath it. */
-#define LYRICS_BACKDROP_DARKEN_NUM 1
-#define LYRICS_BACKDROP_DARKEN_DEN 2
+/* Final brightness is baked in before RGB565 dithering. This used to be a
+ * 3/4-bright backdrop followed by LVGL's 40%-black alpha overlay (net 45%),
+ * but that second RGB565 blend re-quantized the already-dithered image and
+ * brought visible bands back. 9/20 preserves the same net brightness in a
+ * single quantization step. */
+#define LYRICS_BACKDROP_DARKEN_NUM 9
+#define LYRICS_BACKDROP_DARKEN_DEN 20
 
 typedef struct {
     uint8_t * cover_copy; /* owned COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565 copy */
+    int for_index;
+    int lyrics_generation;
 } lyrics_backdrop_request_t;
 
 static pthread_t lyrics_backdrop_thread;
 static bool lyrics_backdrop_active = false;
 static atomic_bool lyrics_backdrop_done_flag = false; /* atomic_bool, not volatile -- see lyrics_load_done_flag's own doc comment */
 static uint8_t * lyrics_backdrop_result_bytes;
+static int lyrics_backdrop_result_for_index = -1;
+static int lyrics_backdrop_result_generation = -1;
+static int lyrics_backdrop_active_for_index = -1;
+static int lyrics_backdrop_active_generation = -1;
+static int current_lyrics_backdrop_for_index = -1;
+static int current_lyrics_backdrop_generation = -1;
 
 static uint8_t bilerp_plane(const uint8_t * plane, int width, int height, uint32_t x_fp, uint32_t y_fp) {
     int x0 = (int) (x_fp >> 16), y0 = (int) (y_fp >> 16);
@@ -4870,8 +4924,7 @@ static uint8_t * compute_lyrics_backdrop_bytes(const uint8_t * cover_bytes) {
             int rv = bilerp_plane(r, w, h, x_fp, y_fp) * LYRICS_BACKDROP_DARKEN_NUM / LYRICS_BACKDROP_DARKEN_DEN;
             int gv = bilerp_plane(g, w, h, x_fp, y_fp) * LYRICS_BACKDROP_DARKEN_NUM / LYRICS_BACKDROP_DARKEN_DEN;
             int bv = bilerp_plane(b, w, h, x_fp, y_fp) * LYRICS_BACKDROP_DARKEN_NUM / LYRICS_BACKDROP_DARKEN_DEN;
-            out[y * LYRICS_BACKDROP_WIDTH + x] =
-                (uint16_t) (((rv >> 3) << 11) | ((gv >> 2) << 5) | (bv >> 3));
+            out[y * LYRICS_BACKDROP_WIDTH + x] = rgb888_to_565_dithered(rv, gv, bv, x, y);
         }
     }
     free(r); free(g); free(b); free(tmp);
@@ -4881,6 +4934,8 @@ static uint8_t * compute_lyrics_backdrop_bytes(const uint8_t * cover_bytes) {
 static void * lyrics_backdrop_thread_func(void * arg) {
     lyrics_backdrop_request_t * req = (lyrics_backdrop_request_t *) arg;
     lyrics_backdrop_result_bytes = compute_lyrics_backdrop_bytes(req->cover_copy);
+    lyrics_backdrop_result_for_index = req->for_index;
+    lyrics_backdrop_result_generation = req->lyrics_generation;
     free(req->cover_copy);
     free(req);
     lyrics_backdrop_done_flag = true; /* written last, same contract as every other _done_flag in this file */
@@ -4907,19 +4962,30 @@ static bool lyrics_backdrop_regenerate_pending = false;
  * plain dark background for that one instance rather than blocking the
  * tap. */
 static void launch_lyrics_backdrop_decode(void) {
+    if (!current_cover_bytes || current_cover_for_index != playlist_index ||
+        current_lyrics_doc_generation != lyrics_load_generation ||
+        current_lyrics_doc_for_index != playlist_index ||
+        (!current_lyrics_doc_valid && !current_lyrics_plain_mode)) return;
+    if (current_lyrics_backdrop_for_index == playlist_index &&
+        current_lyrics_backdrop_generation == lyrics_load_generation) return;
     if (lyrics_backdrop_active) {
+        if (lyrics_backdrop_active_for_index == playlist_index &&
+            lyrics_backdrop_active_generation == lyrics_load_generation) return;
         lyrics_backdrop_regenerate_pending = true;
         return;
     }
-    if (!current_cover_bytes) return;
     lyrics_backdrop_request_t * req = malloc(sizeof(*req));
     if (!req) return;
     req->cover_copy = malloc((size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
     if (!req->cover_copy) { free(req); return; }
     memcpy(req->cover_copy, current_cover_bytes, (size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
+    req->for_index = playlist_index;
+    req->lyrics_generation = lyrics_load_generation;
 
     lyrics_backdrop_done_flag = false;
     lyrics_backdrop_active = true;
+    lyrics_backdrop_active_for_index = req->for_index;
+    lyrics_backdrop_active_generation = req->lyrics_generation;
     if (pthread_create(&lyrics_backdrop_thread, NULL, lyrics_backdrop_thread_func, req) != 0) {
         free(req->cover_copy);
         free(req);
@@ -4940,10 +5006,14 @@ static void poll_lyrics_backdrop(void) {
     lyrics_backdrop_active = false;
     pthread_join(lyrics_backdrop_thread, NULL);
 
-    if (lyrics_backdrop_result_bytes) { /* NULL = allocation failure -- keep whatever backdrop (or plain black) is already showing */
+    bool result_current = lyrics_backdrop_result_for_index == playlist_index &&
+                          lyrics_backdrop_result_generation == lyrics_load_generation;
+    if (lyrics_backdrop_result_bytes && result_current) { /* NULL = allocation failure -- keep whatever backdrop (or plain black) is already showing */
         free(current_lyrics_backdrop_bytes);
         current_lyrics_backdrop_bytes = lyrics_backdrop_result_bytes;
         lyrics_backdrop_result_bytes = NULL;
+        current_lyrics_backdrop_for_index = lyrics_backdrop_result_for_index;
+        current_lyrics_backdrop_generation = lyrics_backdrop_result_generation;
 
         memset(&current_lyrics_backdrop_dsc, 0, sizeof(current_lyrics_backdrop_dsc));
         current_lyrics_backdrop_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
@@ -4954,7 +5024,11 @@ static void poll_lyrics_backdrop(void) {
         current_lyrics_backdrop_dsc.data = current_lyrics_backdrop_bytes;
         current_lyrics_backdrop_dsc.data_size = (uint32_t) LYRICS_BACKDROP_WIDTH * LYRICS_BACKDROP_HEIGHT * 2;
         lv_image_set_src(lyrics_backdrop_img, &current_lyrics_backdrop_dsc);
-        lv_obj_remove_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
+        if (lv_screen_active() == lyrics_screen)
+            lv_obj_remove_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        free(lyrics_backdrop_result_bytes);
+        lyrics_backdrop_result_bytes = NULL;
     }
 
     /* Checked regardless of the success/failure branch above -- see this
@@ -6808,6 +6882,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_sd_card_hotplug();
     poll_cover_decode();
     poll_lyrics_load();
+    poll_lyrics_backdrop();
     poll_search_job();
 
     if (audio_consume_track_advanced()) {
@@ -7665,6 +7740,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * imprecision on a small corner target), so the touch area is padded out
      * generously while the icon itself stays centered at its normal size. */
     lv_obj_t * dismiss_btn = lv_obj_create(scr);
+    player_dismiss_btn = dismiss_btn;
     lv_obj_set_size(dismiss_btn, 64, 64);
     lv_obj_align(dismiss_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
     lv_obj_set_style_bg_opa(dismiss_btn, 0, 0);
@@ -8111,9 +8187,6 @@ static void lyrics_gesture_event_cb(lv_event_t * e) {
      * to a plain dark background for that brief window regardless (see
      * launch_lyrics_backdrop_decode()'s own comment), so this costs nothing
      * new on re-entry beyond that already-accepted, already-documented gap. */
-    free(current_lyrics_backdrop_bytes);
-    current_lyrics_backdrop_bytes = NULL;
-    current_lyrics_backdrop_dsc.data = NULL;
     lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
     if (nav_depth > 1) nav_depth--;
     lv_screen_load(nav_stack[nav_depth - 1]);
@@ -8182,6 +8255,10 @@ static void lyrics_timer_cb(lv_timer_t * timer) {
 
 static void open_lyrics_screen(void) {
     launch_lyrics_backdrop_decode();
+    if (current_lyrics_backdrop_bytes &&
+        current_lyrics_backdrop_for_index == playlist_index &&
+        current_lyrics_backdrop_generation == lyrics_load_generation)
+        lv_obj_remove_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
     lyrics_reset_pool();
     lv_timer_resume(lyrics_timer);
     nav_push(lyrics_screen);
@@ -8199,15 +8276,15 @@ static lv_obj_t * build_lyrics_screen(void) {
     lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN); /* shown by poll_lyrics_backdrop() once a real backdrop exists */
     lv_obj_remove_flag(lyrics_backdrop_img, LV_OBJ_FLAG_CLICKABLE);
 
-    /* Flat dark overlay for consistent text contrast regardless of how
-     * bright the source cover art is -- see LYRICS_BACKDROP_DARKEN_NUM/
-     * DEN's own comment on why the backdrop pixels themselves aren't
-     * darkened this much on their own. */
+    /* Kept as a transparent stacking/click-through layer for layout
+     * compatibility. Darkness is baked into the backdrop before its final
+     * dithered RGB565 conversion; alpha-blending black here would quantize
+     * it a second time and recreate visible color bands. */
     lv_obj_t * dark_overlay = lv_obj_create(scr);
     lv_obj_set_size(dark_overlay, 480, 800);
     lv_obj_align(dark_overlay, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_bg_color(dark_overlay, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_bg_opa(dark_overlay, LV_OPA_40, 0);
+    lv_obj_set_style_bg_opa(dark_overlay, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(dark_overlay, 0, 0);
     lv_obj_set_style_radius(dark_overlay, 0, 0);
     lv_obj_remove_flag(dark_overlay, LV_OBJ_FLAG_SCROLLABLE);
@@ -8786,7 +8863,8 @@ static void * scan_walk_worker(void * arg) {
         w->done = true;
         return NULL;
     }
-    w->ok = file_browser_walk_all_songs(w->root, scan_spool_visit_cb, spool, &w->count, &w->progress);
+    w->ok = file_browser_walk_all_songs_excluding_top_level(
+        w->root, AUDIOBOOKS_LIBRARY_DIR_NAME, scan_spool_visit_cb, spool, &w->count, &w->progress);
     if (fclose(spool) != 0) w->ok = false;
     w->done = true; /* written last -- the only field polled below */
     return NULL;
@@ -9036,11 +9114,28 @@ static int search_remap_index(search_binding_id_t binding_id, int display_index)
  * comes next. Heap-allocated, not a stack array -- see remote_control.c's
  * own build_library_json() comment on why a COMPACT_LIST_PAGE_CACHE_SIZE-
  * sized array of song_row_t (~1.25KB each) has no business on a stack. */
-static int all_songs_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+static const char * song_quality_asset_for_path(const char * path) {
+    const char * ext = strrchr(path ? path : "", '.');
+    if (!ext) return "";
+    if (!strcasecmp(ext, ".dsf") || !strcasecmp(ext, ".dff"))
+        return "touch_list/quality_hr.png";
+    if (!strcasecmp(ext, ".flac") || !strcasecmp(ext, ".wav") || !strcasecmp(ext, ".aif") ||
+        !strcasecmp(ext, ".aiff") || !strcasecmp(ext, ".ape") || !strcasecmp(ext, ".alac"))
+        return "touch_list/quality_high.png";
+    return "touch_list/quality_nomal.png";
+}
+
+static void fill_song_page_visual(compact_list_page_row_t * out, const song_row_t * row) {
+    metadata_db_song_display_title(row, out->label, sizeof(out->label));
+    out->identity = row->id;
+    snprintf(out->trailing_asset, sizeof(out->trailing_asset), "%s", song_quality_asset_for_path(row->path));
+}
+
+static int all_songs_fetch_page(void * ctx, int offset, int count, compact_list_page_row_t out_rows[]) {
     (void) ctx;
     song_row_t * rows = malloc(sizeof(song_row_t) * (size_t) count);
     int n = rows ? metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, offset, count, rows) : 0;
-    for (int i = 0; i < n; i++) metadata_db_song_display_title(&rows[i], out_labels[i], COMPACT_LIST_LABEL_MAX);
+    for (int i = 0; i < n; i++) fill_song_page_visual(&out_rows[i], &rows[i]);
     free(rows);
     return n;
 }
@@ -9094,6 +9189,7 @@ static lv_obj_t * build_all_songs_screen(void) {
     lv_obj_t * scr = build_compact_list_screen("All Songs", generic_back_cb, NULL, 0, all_songs_row_click_cb,
                                                 all_songs_row_long_press_cb, &all_songs_list, NULL,
                                                 LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    compact_list_set_row_height(all_songs_list, MUSIC_LIST_ROW_HEIGHT);
     compact_list_set_paged_provider(all_songs_list, all_songs_fetch_page, NULL, (int) metadata_db_get_song_count());
     finalize_screen_navigation(scr);
     return scr;
@@ -9110,11 +9206,11 @@ static lv_obj_t * build_all_songs_screen(void) {
  * get_songs_page_by_recency() instead of title via metadata_db_get_songs_
  * filtered_page()) -- no search/A-Z index wired up here, unlike All Songs,
  * since neither makes as much sense against a recency-ordered list. */
-static int recently_added_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+static int recently_added_fetch_page(void * ctx, int offset, int count, compact_list_page_row_t out_rows[]) {
     (void) ctx;
     song_row_t * rows = malloc(sizeof(song_row_t) * (size_t) count);
     int n = rows ? metadata_db_get_songs_page_by_recency(offset, count, rows) : 0;
-    for (int i = 0; i < n; i++) metadata_db_song_display_title(&rows[i], out_labels[i], COMPACT_LIST_LABEL_MAX);
+    for (int i = 0; i < n; i++) fill_song_page_visual(&out_rows[i], &rows[i]);
     free(rows);
     return n;
 }
@@ -9145,6 +9241,7 @@ static lv_obj_t * build_recently_added_screen(void) {
     lv_obj_t * scr = build_compact_list_screen("Recently Added", generic_back_cb, NULL, 0, recently_added_row_click_cb,
                                                 recently_added_row_long_press_cb, &recently_added_list, NULL,
                                                 LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    compact_list_set_row_height(recently_added_list, MUSIC_LIST_ROW_HEIGHT);
     compact_list_set_paged_provider(recently_added_list, recently_added_fetch_page, NULL,
                                      (int) metadata_db_get_song_count());
     finalize_screen_navigation(scr);
@@ -9264,6 +9361,9 @@ static lv_obj_t * add_group_songs_page_row(const char * text, lv_event_cb_t cb) 
     lv_obj_add_style(row, &list_row_style, 0);
     lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
     row_label_enable_marquee(row);
+    lv_obj_set_style_height(row, MUSIC_LIST_ROW_HEIGHT, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(row,
+        (MUSIC_LIST_ROW_HEIGHT - lv_font_get_line_height(&LIST_ROW_FONT)) / 2, LV_PART_MAIN);
     lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_label_set_text(row, text);
@@ -9339,7 +9439,7 @@ static void refresh_group_songs_now_playing_indicator(void) {
     }
     int visible_row = match - group_songs_page_start + (group_songs_page_start > 0 ? 1 : 0);
     lv_obj_remove_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(group_songs_now_playing_bar, 0, 4 + visible_row * (LIST_ROW_HEIGHT + 4));
+    lv_obj_set_pos(group_songs_now_playing_bar, 0, 4 + visible_row * (MUSIC_LIST_ROW_HEIGHT + 4));
 }
 
 /* Rebuilds group_songs_list's rows from whatever group_songs_entries/count
@@ -9385,7 +9485,7 @@ static void populate_group_songs_rows(void) {
              * plain-label rows below, this needs a second child so it can't
              * reuse list_row_style as-is. */
             lv_obj_t * row = lv_obj_create(group_songs_list);
-            lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
+            lv_obj_set_size(row, LIST_ROW_WIDTH, MUSIC_LIST_ROW_HEIGHT);
             lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
             lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
             lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -9412,8 +9512,23 @@ static void populate_group_songs_rows(void) {
             lv_obj_add_style(row, &list_row_style, 0);
             lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
             row_label_enable_marquee(row);
+            lv_obj_set_style_height(row, MUSIC_LIST_ROW_HEIGHT, LV_PART_MAIN);
+            lv_obj_set_style_pad_top(row,
+                (MUSIC_LIST_ROW_HEIGHT - lv_font_get_line_height(&LIST_ROW_FONT)) / 2, LV_PART_MAIN);
+            lv_obj_set_style_pad_right(row, 70, 0);
             lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
             lv_label_set_text(row, group_songs_entries[i].title);
+
+            lv_obj_t * quality = lv_image_create(row);
+            lv_image_set_src(quality, asset_path(song_quality_asset_for_path(group_songs_entries[i].path)));
+            /* Child alignment is relative to the label's padded content
+             * box. Cancel the 70px text reserve so the badge is physically
+             * 14px from the card edge (same rule as compact-list rows). */
+            int32_t quality_pad_top = lv_obj_get_style_pad_top(row, LV_PART_MAIN);
+            int32_t quality_pad_bottom = lv_obj_get_style_pad_bottom(row, LV_PART_MAIN);
+            lv_obj_align(quality, LV_ALIGN_RIGHT_MID, 70 - 14,
+                         (quality_pad_top - quality_pad_bottom) / -2);
+            lv_obj_remove_flag(quality, LV_OBJ_FLAG_CLICKABLE);
 
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(row, group_song_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
@@ -9440,7 +9555,7 @@ static void populate_group_songs_rows(void) {
      * open, e.g. a gapless auto-advance to the next track in the group. */
     group_songs_now_playing_bar = lv_obj_create(group_songs_list);
     lv_obj_remove_style_all(group_songs_now_playing_bar);
-    lv_obj_set_size(group_songs_now_playing_bar, 5, LIST_ROW_HEIGHT);
+    lv_obj_set_size(group_songs_now_playing_bar, 5, MUSIC_LIST_ROW_HEIGHT);
     lv_obj_set_style_bg_color(group_songs_now_playing_bar, accent_lv_color(), 0);
     lv_obj_set_style_bg_opa(group_songs_now_playing_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(group_songs_now_playing_bar, 2, 0);
@@ -12129,17 +12244,18 @@ static lv_obj_t * artist_albums_list;
 static group_row_t * artist_albums_groups;
 static int artist_albums_group_count;
 
+/* Defined with the shared bounded artwork cache below. */
+static void album_row_thumbnail_decorator(lv_obj_t * list, lv_obj_t * row, lv_obj_t * image,
+                                           int logical_index, int pool_slot, int64_t song_id, void * ctx);
+
 /* Now-playing indicator bar -- same "recreated fresh every populate call"
  * lifecycle as group_songs_now_playing_bar (see its own comment):
  * populate_indexed_list()'s lv_obj_clean(artist_albums_list) destroys
  * whatever was here before, same as every row. */
-static lv_obj_t * artist_albums_now_playing_bar;
-
-static const char * artist_album_label_of(int i) { return artist_albums_groups[i].name; }
-
-static void artist_album_row_click_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int index = (int) (intptr_t) lv_event_get_user_data(e);
+/* This drill-down is a compact list too: fixed row count regardless of how
+ * many albums one artist owns, and therefore able to share the exact album
+ * artwork decorator/cache used by Music -> Albums. */
+static void artist_album_row_click_cb(int index) {
     if (index < 0 || index >= artist_albums_group_count) return;
     group_row_t * group = &artist_albums_groups[index];
     group_song_entry_t * entries = calloc((size_t) group->song_count, sizeof(*entries));
@@ -12172,6 +12288,16 @@ static void artist_album_row_click_cb(lv_event_t * e) {
     group_songs_source_is_album = true;
 }
 
+/* A direct lv_image_dsc_t points into the bounded LRU's pixel allocation.
+ * Refresh on every screen load so a list that was hidden while the other
+ * album screen populated/evicted cache entries never redraws an old row
+ * against an evicted descriptor. This also immediately picks up artwork
+ * decoded while the list was off-screen. */
+static void album_thumbnail_screen_loaded_cb(lv_event_t * e) {
+    lv_obj_t * list = (lv_obj_t *) lv_event_get_user_data(e);
+    if (list) compact_list_refresh_visible(list);
+}
+
 /* Matches by song-index membership (not album NAME, unlike Albums/Album
  * Artist's own name-based match) -- this screen already only ever holds
  * albums belonging to the ONE artist just tapped into (artist_albums_
@@ -12182,7 +12308,7 @@ static void artist_album_row_click_cb(lv_event_t * e) {
  * indicator() -- callable without rebuilding rows, e.g. on a live playback
  * change while this screen stays open. */
 static void refresh_artist_albums_now_playing_indicator(void) {
-    if (!artist_albums_now_playing_bar) return;
+    if (!artist_albums_list) return;
 
     int match = -1;
     song_row_t playing;
@@ -12196,12 +12322,7 @@ static void refresh_artist_albums_now_playing_indicator(void) {
         }
     }
 
-    if (match < 0) {
-        lv_obj_add_flag(artist_albums_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-    lv_obj_remove_flag(artist_albums_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(artist_albums_now_playing_bar, 0, 4 + match * (LIST_ROW_HEIGHT + 4));
+    compact_list_set_now_playing(artist_albums_list, match);
 }
 
 static void show_artist_albums(const char * name, metadata_db_group_kind_t kind) {
@@ -12217,22 +12338,22 @@ static void show_artist_albums(const char * name, metadata_db_group_kind_t kind)
     }
 
     lv_label_set_text(artist_albums_title_label, name);
-    populate_indexed_list(artist_albums_list, artist_albums_group_count, artist_album_label_of, artist_album_row_click_cb);
-
-    /* Recreated fresh here, same reasoning as group_songs_now_playing_bar's
-     * own comment -- populate_indexed_list() just destroyed whatever was
-     * here before. LV_OBJ_FLAG_IGNORE_LAYOUT keeps this list's own flex
-     * column layout from stacking it in as another row. */
-    artist_albums_now_playing_bar = lv_obj_create(artist_albums_list);
-    lv_obj_remove_style_all(artist_albums_now_playing_bar);
-    lv_obj_set_size(artist_albums_now_playing_bar, 5, LIST_ROW_HEIGHT);
-    lv_obj_set_style_bg_color(artist_albums_now_playing_bar, accent_lv_color(), 0);
-    lv_obj_set_style_bg_opa(artist_albums_now_playing_bar, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(artist_albums_now_playing_bar, 2, 0);
-    lv_obj_add_flag(artist_albums_now_playing_bar, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_obj_remove_flag(artist_albums_now_playing_bar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(artist_albums_now_playing_bar, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(artist_albums_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
+    compact_list_item_t * items = artist_albums_group_count > 0
+        ? malloc(sizeof(*items) * (size_t) artist_albums_group_count) : NULL;
+    if (items) {
+        for (int i = 0; i < artist_albums_group_count; i++) {
+            items[i] = (compact_list_item_t){
+                .label = artist_albums_groups[i].name,
+                .identity = artist_albums_groups[i].first_song_id,
+                .trailing_asset = NULL
+            };
+        }
+        compact_list_set_items(artist_albums_list, items, artist_albums_group_count);
+        free(items);
+    } else {
+        compact_list_set_items(artist_albums_list, NULL, 0);
+    }
+    compact_list_set_row_decorator(artist_albums_list, album_row_thumbnail_decorator, NULL);
     refresh_artist_albums_now_playing_indicator();
 
     nav_push(artist_albums_screen);
@@ -12244,22 +12365,180 @@ static void show_artist_albums(const char * name, metadata_db_group_kind_t kind)
  * album_artist_row_click_cb() below) re-resolves that same offset via
  * metadata_db_get_groups_page() itself to get the tapped name, rather than
  * caching anything from this page fetch. */
-static int artists_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+static int artists_fetch_page(void * ctx, int offset, int count, compact_list_page_row_t out_rows[]) {
     (void) ctx;
     group_row_t * rows = malloc(sizeof(group_row_t) * (size_t) count);
     int n = rows ? metadata_db_get_groups_page(METADATA_DB_GROUP_ARTIST, offset, count, rows) : 0;
-    for (int i = 0; i < n; i++) snprintf(out_labels[i], COMPACT_LIST_LABEL_MAX, "%s", rows[i].name);
+    for (int i = 0; i < n; i++) {
+        snprintf(out_rows[i].label, sizeof(out_rows[i].label), "%s", rows[i].name);
+        out_rows[i].identity = rows[i].first_song_id;
+        out_rows[i].trailing_asset[0] = '\0';
+    }
     free(rows);
     return n;
 }
 
-static int album_artists_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+static int album_artists_fetch_page(void * ctx, int offset, int count, compact_list_page_row_t out_rows[]) {
     (void) ctx;
     group_row_t * rows = malloc(sizeof(group_row_t) * (size_t) count);
     int n = rows ? metadata_db_get_groups_page(METADATA_DB_GROUP_ALBUM_ARTIST, offset, count, rows) : 0;
-    for (int i = 0; i < n; i++) snprintf(out_labels[i], COMPACT_LIST_LABEL_MAX, "%s", rows[i].name);
+    for (int i = 0; i < n; i++) {
+        snprintf(out_rows[i].label, sizeof(out_rows[i].label), "%s", rows[i].name);
+        out_rows[i].identity = rows[i].first_song_id;
+        out_rows[i].trailing_asset[0] = '\0';
+    }
     free(rows);
     return n;
+}
+
+/* ---- Virtualized local-album thumbnails -------------------------------
+ * Only the 20 recycled compact-list rows can request artwork. One worker at
+ * a time reads/decodes a representative song's embedded or external cover,
+ * while a 32-entry RGB565 LRU cache keeps the visible window plus scroll
+ * headroom bounded at ~324 KiB. */
+#define ALBUM_THUMBNAIL_PX 72
+#define ALBUM_THUMBNAIL_CACHE_SIZE 32
+
+typedef struct {
+    int64_t song_id;
+    bool known; /* true even when pixels==NULL: negative cache for albums without art */
+    uint8_t * pixels;
+    lv_image_dsc_t dsc;
+    uint32_t last_use;
+} album_thumbnail_cache_entry_t;
+
+typedef struct {
+    int64_t song_id;
+    int generation;
+} album_thumbnail_request_t;
+
+static album_thumbnail_cache_entry_t album_thumbnail_cache[ALBUM_THUMBNAIL_CACHE_SIZE];
+static uint32_t album_thumbnail_use_counter;
+static pthread_t album_thumbnail_thread;
+static bool album_thumbnail_active;
+static atomic_bool album_thumbnail_done;
+static int64_t album_thumbnail_result_song_id;
+static int album_thumbnail_result_generation;
+static uint8_t * album_thumbnail_result_pixels;
+static int album_thumbnail_generation;
+static lv_timer_t * album_thumbnail_poll_timer;
+
+static album_thumbnail_cache_entry_t * album_thumbnail_cache_find(int64_t song_id) {
+    for (int i = 0; i < ALBUM_THUMBNAIL_CACHE_SIZE; i++) {
+        if (album_thumbnail_cache[i].known && album_thumbnail_cache[i].song_id == song_id) {
+            album_thumbnail_cache[i].last_use = ++album_thumbnail_use_counter;
+            return &album_thumbnail_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static void album_thumbnail_cache_clear(void) {
+    for (int i = 0; i < ALBUM_THUMBNAIL_CACHE_SIZE; i++) {
+        free(album_thumbnail_cache[i].pixels);
+        memset(&album_thumbnail_cache[i], 0, sizeof(album_thumbnail_cache[i]));
+    }
+    album_thumbnail_use_counter = 0;
+}
+
+static void * album_thumbnail_thread_func(void * arg) {
+    album_thumbnail_request_t * req = (album_thumbnail_request_t *) arg;
+    uint16_t * pixels = NULL;
+    song_row_t song;
+    if (metadata_db_get_song_by_id(req->song_id, &song)) {
+        track_metadata_t meta;
+        metadata_read(song.path, &meta);
+        if ((!meta.picture_data || meta.picture_size == 0)) {
+            free(meta.picture_data);
+            meta.picture_data = NULL;
+            load_external_cover(song.path, &meta.picture_data, &meta.picture_size);
+        }
+        if (meta.picture_data && meta.picture_size)
+            cover_decode_to_rgb565(meta.picture_data, meta.picture_size,
+                                   ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, &pixels);
+        free(meta.picture_data);
+        free(meta.lyrics);
+    }
+    album_thumbnail_result_song_id = req->song_id;
+    album_thumbnail_result_generation = req->generation;
+    album_thumbnail_result_pixels = (uint8_t *) pixels;
+    free(req);
+    album_thumbnail_done = true;
+    return NULL;
+}
+
+static void launch_album_thumbnail(int64_t song_id) {
+    if (album_thumbnail_active || song_id <= 0 || album_thumbnail_cache_find(song_id)) return;
+    album_thumbnail_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
+    req->song_id = song_id;
+    req->generation = album_thumbnail_generation;
+    album_thumbnail_done = false;
+    album_thumbnail_active = true;
+    if (pthread_create(&album_thumbnail_thread, NULL, album_thumbnail_thread_func, req) != 0) {
+        album_thumbnail_active = false;
+        free(req);
+        return;
+    }
+    if (album_thumbnail_poll_timer) lv_timer_resume(album_thumbnail_poll_timer);
+}
+
+static void album_thumbnail_poll_cb(lv_timer_t * timer) {
+    if (!album_thumbnail_active || !album_thumbnail_done) return;
+    pthread_join(album_thumbnail_thread, NULL);
+    album_thumbnail_active = false;
+
+    if (album_thumbnail_result_generation == album_thumbnail_generation) {
+        int victim = -1;
+        uint32_t oldest = UINT32_MAX;
+        for (int i = 0; i < ALBUM_THUMBNAIL_CACHE_SIZE; i++) {
+            if (!album_thumbnail_cache[i].known) { victim = i; break; }
+            if (album_thumbnail_cache[i].last_use < oldest) {
+                oldest = album_thumbnail_cache[i].last_use;
+                victim = i;
+            }
+        }
+        album_thumbnail_cache_entry_t * e = &album_thumbnail_cache[victim];
+        free(e->pixels);
+        memset(e, 0, sizeof(*e));
+        e->song_id = album_thumbnail_result_song_id;
+        e->known = true;
+        e->pixels = album_thumbnail_result_pixels;
+        e->last_use = ++album_thumbnail_use_counter;
+        if (e->pixels) {
+            e->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+            e->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+            e->dsc.header.w = ALBUM_THUMBNAIL_PX;
+            e->dsc.header.h = ALBUM_THUMBNAIL_PX;
+            e->dsc.header.stride = ALBUM_THUMBNAIL_PX * 2;
+            e->dsc.data = e->pixels;
+            e->dsc.data_size = ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2;
+        }
+        album_thumbnail_result_pixels = NULL;
+    }
+    free(album_thumbnail_result_pixels);
+    album_thumbnail_result_pixels = NULL;
+    if (albums_list) compact_list_refresh_visible(albums_list);
+    if (artist_albums_list) compact_list_refresh_visible(artist_albums_list);
+    if (!album_thumbnail_active) lv_timer_pause(timer);
+}
+
+static void album_row_thumbnail_decorator(lv_obj_t * list, lv_obj_t * row, lv_obj_t * image,
+                                           int logical_index, int pool_slot, int64_t song_id, void * ctx) {
+    (void) list; (void) logical_index; (void) pool_slot; (void) ctx;
+    /* 14px card inset + 72px cover + 14px breathing room before text. */
+    lv_obj_set_style_pad_left(row, 100, 0);
+    album_thumbnail_cache_entry_t * cached = album_thumbnail_cache_find(song_id);
+    if (cached && cached->pixels) {
+        lv_image_set_src(image, &cached->dsc);
+        lv_image_set_scale(image, LV_SCALE_NONE);
+        lv_obj_remove_flag(image, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_image_set_src(image, asset_path("touch_list/list_default_album.png"));
+        lv_image_set_scale(image, (ALBUM_THUMBNAIL_PX * LV_SCALE_NONE) / 72);
+        lv_obj_remove_flag(image, LV_OBJ_FLAG_HIDDEN);
+        if (!cached) launch_album_thumbnail(song_id);
+    }
 }
 
 /* Unfiltered (NULL filter, "every album in the library") -- uses metadata_
@@ -12267,11 +12546,15 @@ static int album_artists_fetch_page(void * ctx, int offset, int count, char out_
  * METADATA_DB_GROUP_ALBUM, ...), since the latter groups by album name
  * alone (the exact bug this session fixed) and this screen must show the
  * corrected (album, album_artist) grouping. */
-static int albums_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+static int albums_fetch_page(void * ctx, int offset, int count, compact_list_page_row_t out_rows[]) {
     (void) ctx;
     group_row_t * rows = malloc(sizeof(group_row_t) * (size_t) count);
     int n = rows ? metadata_db_get_albums_page_filtered(NULL, offset, count, rows) : 0;
-    for (int i = 0; i < n; i++) snprintf(out_labels[i], COMPACT_LIST_LABEL_MAX, "%s", rows[i].name);
+    for (int i = 0; i < n; i++) {
+        snprintf(out_rows[i].label, sizeof(out_rows[i].label), "%s", rows[i].name);
+        out_rows[i].identity = rows[i].first_song_id;
+        out_rows[i].trailing_asset[0] = '\0';
+    }
     free(rows);
     return n;
 }
@@ -12343,6 +12626,7 @@ static void album_row_click_cb(int index) {
 static lv_obj_t * build_artists_screen(void) {
     lv_obj_t * scr = build_compact_list_screen("Artists", generic_back_cb, NULL, 0, artist_row_click_cb, NULL,
                                                 &artists_list, NULL, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    compact_list_set_row_height(artists_list, MUSIC_LIST_ROW_HEIGHT);
     int artist_count = 0, album_artist_count = 0, album_count = 0;
     metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
     compact_list_set_paged_provider(artists_list, artists_fetch_page, NULL, artist_count);
@@ -12353,9 +12637,18 @@ static lv_obj_t * build_artists_screen(void) {
 static lv_obj_t * build_albums_screen(void) {
     lv_obj_t * scr = build_compact_list_screen("Albums", generic_back_cb, NULL, 0, album_row_click_cb, NULL,
                                                 &albums_list, NULL, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    compact_list_set_row_height(albums_list, MUSIC_LIST_ROW_HEIGHT);
     int artist_count = 0, album_artist_count = 0, album_count = 0;
     metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
     compact_list_set_paged_provider(albums_list, albums_fetch_page, NULL, album_count);
+    album_thumbnail_generation++;
+    album_thumbnail_cache_clear();
+    if (!album_thumbnail_poll_timer) {
+        album_thumbnail_poll_timer = lv_timer_create(album_thumbnail_poll_cb, 50, NULL);
+        lv_timer_pause(album_thumbnail_poll_timer);
+    }
+    compact_list_set_row_decorator(albums_list, album_row_thumbnail_decorator, NULL);
+    lv_obj_add_event_cb(scr, album_thumbnail_screen_loaded_cb, LV_EVENT_SCREEN_LOADED, albums_list);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -12371,6 +12664,7 @@ static lv_obj_t * build_album_artist_screen(void) {
     lv_obj_t * scr = build_compact_list_screen("Album Artist", generic_back_cb, NULL, 0, album_artist_row_click_cb,
                                                 NULL, &album_artist_list, NULL, LIST_ROW_WIDTH_WIDE, true,
                                                 accent_lv_color());
+    compact_list_set_row_height(album_artist_list, MUSIC_LIST_ROW_HEIGHT);
     int artist_count = 0, album_artist_count = 0, album_count = 0;
     metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
     compact_list_set_paged_provider(album_artist_list, album_artists_fetch_page, NULL, album_artist_count);
@@ -13253,7 +13547,7 @@ static void refresh_now_playing_indicators(void) {
     if (recently_added_list) compact_list_set_now_playing(recently_added_list, recently_added_row);
 
     refresh_group_songs_now_playing_indicator(); /* group_songs isn't compact_list-based -- see its own comment */
-    refresh_artist_albums_now_playing_indicator(); /* Artists/Album Artist's shared albums drill-down -- also not compact_list-based */
+    refresh_artist_albums_now_playing_indicator(); /* Artists/Album Artist's shared compact album drill-down */
 }
 
 static void show_favorites(void) {
@@ -13422,7 +13716,7 @@ static void playlist_row_click_cb(lv_event_t * e) {
  * ...) not part of this request. */
 static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_text) {
     lv_obj_t * row = lv_obj_create(parent);
-    lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, LIST_ROW_HEIGHT);
+    lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, MUSIC_LIST_ROW_HEIGHT);
     lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
     lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -18581,7 +18875,7 @@ static lv_obj_t * build_settings_display_screen(void) {
                                     current_settings.screen_dimming_enabled, NULL, screen_dimming_switch_event_cb, NULL };
     items[5] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
                                     current_settings.swipe_up_home_enabled, NULL, swipe_up_home_switch_event_cb, NULL };
-    items[6] = (pill_list_item_t){ "Hide Player Top Bar", PILL_ACCESSORY_TOGGLE,
+    items[6] = (pill_list_item_t){ "Hide Player/Lyrics Top Bar", PILL_ACCESSORY_TOGGLE,
                                     current_settings.hide_player_topbar, NULL,
                                     hide_player_topbar_switch_event_cb, NULL };
 
@@ -19862,7 +20156,14 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     playlists_screen = build_playlists_screen();
     cue_tracks_screen = build_cue_tracks_screen();
     group_songs_screen = build_group_songs_screen();
-    artist_albums_screen = build_subsonic_list_screen("Albums", &artist_albums_title_label, &artist_albums_list);
+    artist_albums_screen = build_compact_list_screen("Albums", generic_back_cb, NULL, 0,
+                                                      artist_album_row_click_cb, NULL,
+                                                      &artist_albums_list, &artist_albums_title_label,
+                                                      LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    compact_list_set_row_height(artist_albums_list, MUSIC_LIST_ROW_HEIGHT);
+    lv_obj_add_event_cb(artist_albums_screen, album_thumbnail_screen_loaded_cb,
+                        LV_EVENT_SCREEN_LOADED, artist_albums_list);
+    finalize_screen_navigation(artist_albums_screen);
     text_entry_screen = build_text_entry_screen();
     music_screen = build_music_screen();
     stream_media_screen = build_stream_media_screen();

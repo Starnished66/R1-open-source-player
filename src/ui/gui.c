@@ -6731,6 +6731,43 @@ static bool idle_shutdown_attempted = false;
 #define RESUME_POWER_DRAIN_WINDOW_MS 3000
 static uint32_t resumed_from_suspend_tick = 0;
 static bool resumed_from_suspend_pending = false;
+/* power_suspend_now() returns from inside update_timer_cb(), after that
+ * callback already sampled screen_was_on/screen_on_now. Remember that
+ * out-of-band wake so the next control tick still runs every ordinary
+ * screen_just_woke refresh/status/radio-reset action. */
+static bool force_screen_just_woke = false;
+
+/* Keeps the three pieces of screen runtime state inseparable. Merely
+ * enabling an indev does not restart its paused LVGL read timer, and merely
+ * lighting the panel does not restart LVGL's paused refresh timer. Used by
+ * both the ordinary on/off edge below and the special suspend-return path,
+ * which changes backlight state too late in the current timer callback for
+ * that ordinary edge detector to observe it. */
+static void apply_screen_runtime_state(bool screen_on) {
+    lv_indev_enable(NULL, screen_on);
+    audio_set_low_power_mode(!screen_on);
+
+    lv_timer_t * refr_timer = lv_display_get_refr_timer(lv_display_get_default());
+    if (refr_timer) {
+        if (screen_on) lv_timer_resume(refr_timer);
+        else lv_timer_pause(refr_timer);
+    }
+
+    int indev_timer_count = 0;
+    for (lv_indev_t * indev = lv_indev_get_next(NULL); indev; indev = lv_indev_get_next(indev)) {
+        lv_timer_t * read_timer = lv_indev_get_read_timer(indev);
+        if (!read_timer) continue;
+        if (screen_on) lv_timer_resume(read_timer);
+        else lv_timer_pause(read_timer);
+        indev_timer_count++;
+    }
+
+    if (screen_on) lv_async_call(full_redraw_async_cb, NULL);
+#ifdef UI_PERF_TRACE
+    printf("PERF screen_runtime screen_on=%d refr_timer=%d indev_timers=%d\n",
+           screen_on, refr_timer != NULL, indev_timer_count);
+#endif
+}
 
 /* Everything a caller of power_suspend_now() needs to do immediately after
  * it returns, factored out so Car Mode (below) can share it with the
@@ -6743,8 +6780,8 @@ static bool resumed_from_suspend_pending = false;
  * each still makes that call directly, right before calling this. */
 static void resume_from_suspend_fixups(void) {
     backlight_set_screen_on(true);
-    lv_indev_enable(NULL, true);
-    lv_obj_invalidate(lv_screen_active());
+    apply_screen_runtime_state(true);
+    force_screen_just_woke = true;
     lv_display_trigger_activity(NULL);
     resumed_from_suspend_tick = lv_tick_get();
     resumed_from_suspend_pending = true;
@@ -7239,7 +7276,8 @@ static void update_timer_cb(lv_timer_t * timer) {
      * refresh right on wake so nothing looks stale afterwards instead of
      * waiting up to WIFI_POLL_TICKS ticks to catch up. */
     bool screen_on_now = backlight_screen_is_on();
-    bool screen_just_woke = screen_on_now && !screen_was_on;
+    bool screen_just_woke = screen_on_now && (!screen_was_on || force_screen_just_woke);
+    if (screen_just_woke) force_screen_just_woke = false;
 
     /* Touch input, not just the backlight, needs to follow screen on/off --
      * real-device feedback: a touch on a screen that's meant to be off was
@@ -7253,8 +7291,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * outside LVGL's indev system entirely, so play/pause/skip/volume/power
      * keep working with the screen dark, matching a normal DAP. */
     if (screen_on_now != screen_was_on) {
-        lv_indev_enable(NULL, screen_on_now);
-        audio_set_low_power_mode(!screen_on_now);
+        apply_screen_runtime_state(screen_on_now);
 
         /* NEXT_TODO_IMPLEMENTATION_PROMPT.md Task 1 -- pause LVGL's own
          * display-refresh timer while the backlight is off: nothing on
@@ -7282,15 +7319,6 @@ static void update_timer_cb(lv_timer_t * timer) {
          * real bugs from elsewhere -- lv_async_call() runs within this
          * same lv_timer_handler() invocation, just after all timers
          * finish, which is still effectively immediate. */
-        lv_timer_t * refr_timer = lv_display_get_refr_timer(lv_display_get_default());
-        if (refr_timer) {
-            if (screen_on_now) {
-                lv_timer_resume(refr_timer);
-                lv_async_call(full_redraw_async_cb, NULL);
-            } else {
-                lv_timer_pause(refr_timer);
-            }
-        }
         /* Real-device finding: pausing the display-refresh timer alone did
          * NOT reduce main-loop wakeup frequency at all -- confirmed via
          * UI_PERF_TRACE, the loop kept waking ~65 times/second with the
@@ -7305,15 +7333,6 @@ static void update_timer_cb(lv_timer_t * timer) {
          * of whether the indev is enabled. Pausing that too, for every
          * registered indev, is what actually lets the idle-cap change in
          * main.c matter. */
-        for (lv_indev_t * indev = lv_indev_get_next(NULL); indev; indev = lv_indev_get_next(indev)) {
-            lv_timer_t * read_timer = lv_indev_get_read_timer(indev);
-            if (!read_timer) continue;
-            if (screen_on_now) lv_timer_resume(read_timer);
-            else lv_timer_pause(read_timer);
-        }
-#ifdef UI_PERF_TRACE
-        printf("PERF screen_refr_timer paused=%d\n", !screen_on_now);
-#endif
     }
 
     if (screen_just_woke) {
@@ -13191,10 +13210,23 @@ static void album_thumbnail_disk_store(const char * song_path, const uint16_t * 
     char path[PATH_MAX], temp_path[PATH_MAX];
     uint64_t hash;
     album_thumbnail_disk_path(song_path, path, sizeof(path), &hash);
-    snprintf(temp_path, sizeof(temp_path), ALBUM_THUMBNAIL_DISK_DIR "/%016llx.tmp",
+    /* The persistent post-scan generator and the visible-row lazy worker
+     * are intentionally allowed to overlap. A single <hash>.tmp name lets
+     * those two writers truncate/write/rename the same inode concurrently,
+     * which can expose a file while the other writer is still modifying it.
+     * Give every attempt its own file; rename() then publishes only a fully
+     * closed cache entry, while a losing concurrent writer merely replaces
+     * it with another complete entry for the same source. */
+    snprintf(temp_path, sizeof(temp_path), ALBUM_THUMBNAIL_DISK_DIR "/%016llx.tmp.XXXXXX",
              (unsigned long long) hash);
-    FILE * f = fopen(temp_path, "wb");
-    if (!f) return;
+    int temp_fd = mkstemp(temp_path);
+    if (temp_fd < 0) return;
+    FILE * f = fdopen(temp_fd, "wb");
+    if (!f) {
+        close(temp_fd);
+        unlink(temp_path);
+        return;
+    }
     album_thumbnail_disk_header_t hdr = {
         .magic = ALBUM_THUMBNAIL_DISK_MAGIC,
         .width = ALBUM_THUMBNAIL_PX,
@@ -13251,6 +13283,167 @@ static void * album_thumbnail_thread_func(void * arg) {
            album_thumbnail_result_pixels != NULL);
 #endif
     return NULL;
+}
+
+/* ---- Persistent (post-scan) album thumbnail generation ----------------
+ * NEXT_TODO_IMPLEMENTATION_PROMPT.md Task 2. Runs once after Update Music
+ * Database completes (never before -- see this file's own call site,
+ * placed right after the scan thread is joined and the database is
+ * already fully committed), generating the SAME 72x72 RGB565 disk cache
+ * entries (album_thumbnail_disk_load()/_disk_store() above) the existing
+ * LAZY per-row generation already produces one row at a time -- so
+ * browsing Albums right after a scan shows artwork immediately instead of
+ * only as each row happens to scroll into view. Reuses metadata_db_get_
+ * albums_page_filtered(NULL, ...) (streamed/paged, never the whole table
+ * at once) grouped by (album, album_artist) -- the same grouping and
+ * first_song_id the Album Artist -> Albums drill-down's own query
+ * produces for the same pair, so that screen automatically gets the same
+ * cached thumbnails with no extra work here. Entirely worker-thread-side:
+ * metadata_db_get_albums_page_filtered()/metadata_db_get_song_by_id()/
+ * metadata_read()/load_external_cover()/cover_decode_to_rgb565()/
+ * album_thumbnail_disk_load()/_disk_store() never touch LVGL. Lazy
+ * generation stays exactly as it was, as the fallback for whatever this
+ * pass didn't reach (interrupted by a newer scan, artwork missing/changed
+ * since, or simply never run). */
+static pthread_t album_thumb_gen_thread;
+/* active/cancel/generation cross the UI/worker boundary and therefore must
+ * be real atomics, not volatile. thread_joinable is owned by the UI thread:
+ * it remains true after a worker naturally exits until that worker is
+ * joined, preventing one joinable-thread resource leak per database scan. */
+static atomic_bool album_thumb_gen_active;
+static atomic_bool album_thumb_gen_cancel;
+static atomic_int album_thumb_gen_generation;
+static bool album_thumb_gen_thread_joinable;
+static atomic_int album_thumb_gen_done_count;
+static atomic_int album_thumb_gen_total_count;
+static bool album_thumb_gen_progress_pending;
+static bool album_thumb_gen_progress_abandoned;
+
+static bool album_thumb_gen_should_cancel(int my_generation) {
+    return atomic_load(&album_thumb_gen_cancel) ||
+           atomic_load(&album_thumb_gen_generation) != my_generation;
+}
+
+static void cancel_album_thumbnail_generation(void) {
+    if (!album_thumb_gen_thread_joinable || !atomic_load(&album_thumb_gen_active)) return;
+    atomic_store(&album_thumb_gen_cancel, true);
+    atomic_fetch_add(&album_thumb_gen_generation, 1);
+}
+
+static void reap_album_thumbnail_generation(void) {
+    if (!album_thumb_gen_thread_joinable) return;
+    pthread_join(album_thumb_gen_thread, NULL);
+    album_thumb_gen_thread_joinable = false;
+}
+
+static void * album_thumb_gen_thread_func(void * arg) {
+    int my_generation = (int) (intptr_t) arg;
+#ifdef UI_PERF_TRACE
+    uint64_t perf_start_us = ui_perf_now_us();
+    int perf_generated = 0, perf_skipped = 0, perf_missing = 0, perf_failed = 0;
+#endif
+    atomic_store(&album_thumb_gen_done_count, 0);
+
+#define ALBUM_THUMB_GEN_BATCH 64
+    group_row_t rows[ALBUM_THUMB_GEN_BATCH];
+    int offset = 0;
+    for (;;) {
+        if (album_thumb_gen_should_cancel(my_generation)) break;
+        /* Streamed/paged, per requirement -- never the whole album table
+         * (which can be tens of thousands of rows on a large library) held
+         * in memory at once, just ALBUM_THUMB_GEN_BATCH group_row_t at a
+         * time (a few hundred bytes each). */
+        int n = metadata_db_get_albums_page_filtered(NULL, offset, ALBUM_THUMB_GEN_BATCH, rows);
+        if (n <= 0) break;
+        for (int i = 0; i < n; i++) {
+            if (album_thumb_gen_should_cancel(my_generation)) goto done;
+            song_row_t song;
+            if (!metadata_db_get_song_by_id(rows[i].first_song_id, &song)) {
+#ifdef UI_PERF_TRACE
+                perf_missing++;
+#endif
+                atomic_fetch_add(&album_thumb_gen_done_count, 1);
+                continue;
+            }
+            /* Do not regenerate a valid cache entry -- same validation
+             * (path hash + source size + mtime) the lazy path itself
+             * checks, so an interrupted-then-resumed pass, or a re-run
+             * over an already-fully-generated library, does no wasted
+             * decode work at all. */
+            uint16_t * existing = NULL;
+            if (album_thumbnail_disk_load(song.path, &existing)) {
+                free(existing);
+#ifdef UI_PERF_TRACE
+                perf_skipped++;
+#endif
+                atomic_fetch_add(&album_thumb_gen_done_count, 1);
+                continue;
+            }
+            track_metadata_t meta;
+            memset(&meta, 0, sizeof(meta));
+            metadata_read(song.path, &meta);
+            if (!meta.picture_data || meta.picture_size == 0) {
+                free(meta.picture_data);
+                meta.picture_data = NULL;
+                load_external_cover(song.path, &meta.picture_data, &meta.picture_size);
+            }
+            uint16_t * pixels = NULL;
+            if (meta.picture_data && meta.picture_size) {
+                cover_decode_to_rgb565(meta.picture_data, meta.picture_size,
+                                       ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, &pixels);
+            }
+            free(meta.picture_data);
+            free(meta.lyrics);
+            /* No-op (per its own guard) when pixels is NULL -- an album
+             * with no resolvable art stays a lazy negative-cache case
+             * (album_thumbnail_cache_find()'s own known-but-NULL entry),
+             * never persisted to disk as a permanent "no art" result, so
+             * artwork added later is picked up normally. */
+            album_thumbnail_disk_store(song.path, pixels);
+#ifdef UI_PERF_TRACE
+            if (pixels) perf_generated++; else perf_failed++;
+#endif
+            free(pixels);
+            atomic_fetch_add(&album_thumb_gen_done_count, 1);
+        }
+        offset += n;
+        if (n < ALBUM_THUMB_GEN_BATCH) break;
+    }
+done:
+#ifdef UI_PERF_TRACE
+    printf("PERF album_thumb_gen done=%d generated=%d skipped=%d missing=%d failed=%d us=%llu cancelled=%d\n",
+           atomic_load(&album_thumb_gen_done_count), perf_generated, perf_skipped, perf_missing, perf_failed,
+           (unsigned long long) (ui_perf_now_us() - perf_start_us),
+           (int) album_thumb_gen_should_cancel(my_generation));
+#endif
+    atomic_store(&album_thumb_gen_active, false);
+    return NULL;
+}
+
+/* Called once, right after Update Music Database's own scan thread is
+ * joined and the database is already fully committed (see this function's
+ * own call site) -- never blocks the caller waiting for generation itself
+ * to finish, only (briefly) for a STILL-RUNNING previous pass to notice
+ * it's been superseded and exit, which happens within roughly one album's
+ * worth of decode work given the cancellation check at the top of every
+ * iteration. */
+static void start_album_thumbnail_generation(void) {
+    cancel_album_thumbnail_generation();
+    reap_album_thumbnail_generation();
+
+    int artist_count = 0, album_artist_count = 0, album_count = 0;
+    metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
+    atomic_store(&album_thumb_gen_done_count, 0);
+    atomic_store(&album_thumb_gen_total_count, album_count);
+    atomic_store(&album_thumb_gen_cancel, false);
+    int generation = atomic_fetch_add(&album_thumb_gen_generation, 1) + 1;
+    atomic_store(&album_thumb_gen_active, true);
+    if (pthread_create(&album_thumb_gen_thread, NULL, album_thumb_gen_thread_func,
+                        (void *) (intptr_t) generation) != 0) {
+        atomic_store(&album_thumb_gen_active, false);
+    } else {
+        album_thumb_gen_thread_joinable = true;
+    }
 }
 
 static void start_next_album_thumbnail(void) {
@@ -14812,6 +15005,20 @@ static void start_library_rescan(void) {
      * stomping the single library_rescan_thread handle -- undefined
      * behavior, not just wasted work. */
     if (library_rescan_active) return;
+    /* A previous scan's own post-scan thumbnail-generation pass (Task 2)
+     * might still be running -- signal it to stop now rather than let it
+     * keep working against data this new scan is about to make stale.
+     * Non-blocking: whichever call eventually starts the NEXT generation
+     * pass (including this new scan's own completion, a few seconds from
+     * now) is what actually pthread_join()s it -- see start_album_
+     * thumbnail_generation()'s own comment. */
+    cancel_album_thumbnail_generation();
+    /* If this replaces a still-visible post-scan thumbnail phase, ownership
+     * of the shared progress screen immediately returns to the new database
+     * scan. The cancelled worker is joined when the new post-scan pass is
+     * started, before its pthread_t can be reused. */
+    album_thumb_gen_progress_pending = false;
+    album_thumb_gen_progress_abandoned = true;
     library_rescan_done_flag = false;
     library_rescan_active = true;
     lv_label_set_text(subsonic_downloading_label, "Updating\nmusic database...");
@@ -14939,6 +15146,7 @@ static void reload_library_on_sd_reinsert(void) {
     if (metadata_db_get_song_count() > 0) {
         refresh_library_screens_after_reload();
         show_info_toast("Library updated");
+        start_album_thumbnail_generation(); /* database already known-good here -- see this function's own comment */
     } else {
         start_library_rescan();
     }
@@ -14950,8 +15158,15 @@ static void reload_library_on_sd_reinsert(void) {
 #define LIBRARY_RESCAN_SUCCESS_MS 1500
 static bool library_rescan_success_pending = false;
 static uint32_t library_rescan_success_since_tick = 0;
-
 static void poll_library_rescan(void) {
+    /* Cache-only SD reinsertion also starts a generation pass, but has no
+     * progress phase of its own. Reap that naturally completed worker here
+     * instead of retaining one joinable thread until some future scan. */
+    if (album_thumb_gen_thread_joinable && !album_thumb_gen_progress_pending &&
+        !atomic_load(&album_thumb_gen_active)) {
+        reap_album_thumbnail_generation();
+    }
+
     /* Keep the screen awake for the whole "Updating music database..."/
      * "Library updated" window -- label and progress-bar text updates
      * don't touch LVGL's own indev-driven inactivity clock (no touch, no
@@ -14962,8 +15177,45 @@ static void poll_library_rescan(void) {
      * does now), that read as the whole device freezing -- a dark,
      * touch-unresponsive screen mid-rescan looks identical to a genuine
      * hang from the outside. */
-    if (library_rescan_active || library_rescan_success_pending) {
+    if (library_rescan_active || library_rescan_success_pending ||
+        (album_thumb_gen_progress_pending && !album_thumb_gen_progress_abandoned &&
+         lv_screen_active() == subsonic_downloading_screen)) {
         lv_display_trigger_activity(NULL);
+    }
+
+    /* Thumbnail generation is a separate, optional post-scan phase. The
+     * scan has already committed successfully before this state is entered.
+     * The home gesture is enabled because library_rescan_active is false;
+     * once the user leaves, keep generating in the background but never
+     * pull them back to this shared interstitial on completion. */
+    if (album_thumb_gen_progress_pending) {
+        bool showing_progress = lv_screen_active() == subsonic_downloading_screen &&
+                                !album_thumb_gen_progress_abandoned;
+        if (!showing_progress) album_thumb_gen_progress_abandoned = true;
+
+        int done = atomic_load(&album_thumb_gen_done_count);
+        int total = atomic_load(&album_thumb_gen_total_count);
+        if (showing_progress) {
+            lv_label_set_text_fmt(subsonic_downloading_label,
+                                  "Generating album thumbnails...\n%d / %d", done, total);
+            lv_bar_set_value(subsonic_downloading_progress_bar,
+                             total > 0 ? (int32_t) ((int64_t) done * 100 / total) : 0,
+                             LV_ANIM_OFF);
+        }
+
+        if (atomic_load(&album_thumb_gen_active)) return;
+        reap_album_thumbnail_generation();
+        album_thumb_gen_progress_pending = false;
+        if (showing_progress) {
+            lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text_fmt(subsonic_downloading_label, "Library updated\n%lld songs",
+                                  (long long) metadata_db_get_song_count());
+            library_rescan_success_pending = true;
+            library_rescan_success_since_tick = lv_tick_get();
+        } else {
+            show_info_toast("Album thumbnails updated");
+        }
+        return;
     }
 
     if (library_rescan_success_pending) {
@@ -14995,19 +15247,18 @@ static void poll_library_rescan(void) {
     pthread_join(library_rescan_thread, NULL);
 
     refresh_library_screens_after_reload();
-
-    lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
-    /* Real bug caught in review: all_songs_count stays 0 here now --
-     * refresh_library_screens_after_reload() above no longer eagerly loads
-     * the arrays (see its own comment), so this used to always report
-     * "Library updated, 0 songs" right after a real, successful scan.
-     * metadata_db_get_song_count() (a cheap COUNT(*)) reflects the real
-     * total regardless of whether anything has triggered the lazy array
-     * load yet. */
-    lv_label_set_text_fmt(subsonic_downloading_label, "Library updated\n%lld songs",
-                           (long long) metadata_db_get_song_count());
-    library_rescan_success_pending = true;
-    library_rescan_success_since_tick = lv_tick_get();
+    /* NEXT_TODO_IMPLEMENTATION_PROMPT.md Task 2 -- the database is fully
+     * committed at this point (the scan thread has already been joined),
+     * so it's safe to start the optional post-scan thumbnail-generation
+     * pass now; database success above never depended on this, and never
+     * will -- see start_album_thumbnail_generation()'s own comment. */
+    start_album_thumbnail_generation();
+    album_thumb_gen_progress_pending = true;
+    album_thumb_gen_progress_abandoned = false;
+    lv_obj_remove_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text_fmt(subsonic_downloading_label, "Generating album thumbnails...\n0 / %d",
+                          atomic_load(&album_thumb_gen_total_count));
+    lv_bar_set_value(subsonic_downloading_progress_bar, 0, LV_ANIM_OFF);
 }
 
 /* SD mount-failure detection + Format SD Card -- see poll_sd_card_hotplug()
@@ -15179,6 +15430,11 @@ static void poll_sd_card_hotplug(void) {
     if (!mounted) {
         mount_sd_card_if_needed();
         if (was_mounted) {
+            /* Stop post-scan artwork reads/writes as soon as removal is
+             * observed. Joining is deliberately deferred to the next
+             * generator start/reap poll so this hotplug callback never
+             * blocks the UI on an in-progress image decode. */
+            cancel_album_thumbnail_generation();
             unmount_confirm_streak++;
             if (unmount_confirm_streak >= SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD && !library_rescan_active) {
                 /* Real-device bug report: metadata_db_open() only ever

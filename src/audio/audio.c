@@ -609,7 +609,32 @@ static void write_device(const int16_t * buf, uint64_t frames, unsigned int chan
  * that used to live here directly now lives there instead, shared with
  * usb_dac_bridge.c's own separate output stream. */
 static bool ensure_device(unsigned int channels, unsigned int sample_rate) {
-    return audio_output_ensure(channels, sample_rate);
+    bool ok = audio_output_ensure(channels, sample_rate);
+    if (ok) {
+        /* Real-device bug report: USB headphones had volume maxed out on
+         * first boot no matter what the UI showed, only "fixed" by
+         * pressing vol+/-. Root cause: audio_set_volume()'s USB
+         * digital-taper branch (see its own comment) depends on
+         * audio_output_is_usb_active(), which only reflects the truth once
+         * open_device() has actually run for the current track -- any
+         * audio_set_volume() call made before that (e.g. applying the
+         * saved volume right after boot, before anything has ever played)
+         * always sees it as false, pinning volume_gain at unity even
+         * though the eventual real target is USB. Nothing re-derived it
+         * once the real target became known. Re-checking here, right after
+         * every ensure_device() call (already invoked every decode chunk
+         * for the same class of target-changed-mid-stream reason -- see
+         * this function's own caller comment on Bluetooth), and only
+         * re-deriving on an actual change costs nothing extra the rest of
+         * the time. */
+        static bool last_gain_for_usb = false;
+        bool now_usb = audio_output_is_usb_active();
+        if (now_usb != last_gain_for_usb) {
+            audio_set_volume(audio_get_volume());
+            last_gain_for_usb = now_usb;
+        }
+    }
+    return ok;
 }
 
 static void close_device(void) {

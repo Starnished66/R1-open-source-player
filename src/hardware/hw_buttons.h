@@ -15,7 +15,11 @@
  * and applies them via the consume_* functions below. */
 void hw_buttons_init(void);
 
-bool hw_buttons_consume_play_pause(void);
+/* Returns the number of physical play/pause presses since the last consume
+ * (usually 0 or 1, but can be 2+ if two presses land inside one 500ms poll
+ * window -- see hw_buttons.c's play_pause_press_count for why this is a
+ * count rather than a bool), and resets it to 0. */
+int hw_buttons_consume_play_pause(void);
 bool hw_buttons_consume_next(void);
 bool hw_buttons_consume_prev(void);
 

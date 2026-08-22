@@ -157,25 +157,42 @@ typedef struct {
      * this app had. */
     bool show_battery_percent;
 
-    /* Full poweroff after a long stretch idle (screen off, not playing, not
-     * charging) -- see idle_shutdown.h. This is the real standby
-     * battery-life lever on this hardware: suspend-to-RAM is available at
-     * the kernel level but its display/WiFi resume path is broken
-     * (confirmed on real hardware), so a full poweroff -- the same thing
-     * the stock firmware's own "Idle shutdown" setting does (confirmed via
-     * strings on the stock binary: /sbin/poweroff, power_save_shutdown_timer)
-     * -- is the only reliable option. Off by default, matching stock's own
-     * default. */
+    /* Idle action after a long stretch idle (screen off, not playing, not
+     * charging) -- either power_suspend_now() (suspend-to-RAM, see
+     * idle_suspend_enabled below) or a full poweroff (idle_shutdown.h; the
+     * same thing the stock firmware's own "Idle shutdown" setting does,
+     * confirmed via strings on the stock binary: /sbin/poweroff,
+     * power_save_shutdown_timer). On by default (10 minutes): real-world
+     * feedback found users who never open Settings at all reporting
+     * overnight battery drain, since a device left screen-off otherwise
+     * just sits at full power indefinitely with nothing opted in. Existing
+     * installs' saved settings are untouched by this default -- only a
+     * fresh settings.txt (settings_load() finding none, see set_defaults())
+     * picks it up. */
     bool idle_shutdown_enabled;
     int idle_shutdown_minutes;
 
     /* When true, the idle action above is power_suspend_now() (quick
      * resume) instead of idle_shutdown_now() (full poweroff) -- see
      * power_suspend.h for how real suspend was made to actually work on
-     * this hardware. Only meaningful when idle_shutdown_enabled is true.
-     * Off by default: a full poweroff is the safer, better-tested default
-     * (matches stock's own default too), suspend is the newer opt-in. */
+     * this hardware. Only meaningful when idle_shutdown_enabled is true. On
+     * by default alongside it: a full poweroff would cost the in-progress
+     * queue/position and mean a real boot on every wake, exactly the "why
+     * did my music reset" complaint a battery-drain fix shouldn't trade
+     * for. */
     bool idle_suspend_enabled;
+
+    /* Internal bookkeeping, not exposed in any UI: whether this install has
+     * already gone through settings_load()'s one-time forced migration of
+     * the three fields above to their new (on) defaults. Lets an existing
+     * settings.txt saved by a version predating that default flip -- which
+     * would otherwise keep pinning idle_shutdown_enabled/idle_suspend_enabled/
+     * idle_shutdown_minutes back to their old off/off/30 values forever,
+     * since settings_save() always writes every field -- get force-migrated
+     * exactly once, the same way a brand new install already gets the new
+     * defaults from set_defaults(). A user who deliberately turns any of
+     * the three back off afterward is not touched again. */
+    bool idle_suspend_default_migrated;
 
     /* USB gadget mode (Storage/USB DAC/ADB) -- see usb_mode_control.h for
      * usb_mode_t and how each is actually applied. Plain int here (values
@@ -263,6 +280,15 @@ typedef struct {
      * is. Default 80 matches backlight.c's own restore_percent fallback
      * default, for consistency. */
     int brightness_percent;
+
+    /* Settings -> System -> "24-Hour Clock". Controls the topbar clock's
+     * format (refresh_clock_label() in gui.c): true renders "%H:%M" (the
+     * app's original, only-ever behavior, so this is the default -- an
+     * existing install's clock does not change format on its own), false
+     * renders "%I:%M" plus an AM/PM sprite next to it (topbar/am.png,
+     * topbar/pm.png -- already-present theme assets, previously unused by
+     * any code in this app). */
+    bool clock_24h;
 } player_settings_t;
 
 /* Loads settings from disk into *out. If the settings file doesn't exist or

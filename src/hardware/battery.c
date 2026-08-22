@@ -78,11 +78,19 @@ static bool cache_valid = false;
  * rather than gauge jitter -- see its own use below. */
 #define BATTERY_DISPLAY_JUMP_THRESHOLD 5
 
+/* gui.c only calls battery_get_display_percent() while the screen is on
+ * (every ~2s -- see refresh_battery_topbar()'s own caller), so a gap this
+ * much larger than that between two calls can only mean the screen/app was
+ * asleep in between, not a slow tick. */
+#define BATTERY_DISPLAY_RESYNC_GAP_MS 60000L
+
 static int display_capacity = -1;
 static int display_candidate = -1;
 static bool display_powered = false;
 static struct timespec display_candidate_since;
 static struct timespec display_last_step;
+static struct timespec display_last_poll;
+static bool display_last_poll_valid = false;
 
 static long elapsed_ms(struct timespec now, struct timespec then) {
     return (now.tv_sec - then.tv_sec) * 1000L + (now.tv_nsec - then.tv_nsec) / 1000000L;
@@ -159,7 +167,28 @@ int battery_get_display_percent(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    if (display_capacity < 0) {
+    /* Real-device bug report: the displayed percent stayed pinned at a
+     * pre-sleep reading (e.g. 71%) across an entire ~8-hour overnight
+     * suspend, only to suddenly jump straight to the real value (e.g. 63%)
+     * within a couple of minutes of the screen actually being kept on --
+     * looking like a random stall-then-jump rather than a steady drain.
+     * Root cause: nothing calls this function at all while the screen is
+     * off, so the very first poll after waking sees a raw value that's
+     * already stale by the entire sleep duration, but this smoothing logic
+     * treated it exactly like routine gauge jitter -- starting a fresh
+     * BATTERY_DISPLAY_STABLE_MS observation window before trusting it. A
+     * brief look at the screen (long enough to notice the stale number, not
+     * long enough for that window to elapse) put it right back to sleep
+     * with display_capacity never corrected; the "jump" only happened once
+     * the screen was later left on continuously past the stability window.
+     * A gap this large between polls isn't gauge noise to filter -- it's
+     * confirmation nothing has been observed for a while, so the fresh
+     * reading should be trusted immediately, the same as a cold start. */
+    bool long_gap = display_last_poll_valid && elapsed_ms(now, display_last_poll) >= BATTERY_DISPLAY_RESYNC_GAP_MS;
+    display_last_poll = now;
+    display_last_poll_valid = true;
+
+    if (display_capacity < 0 || long_gap) {
         display_capacity = raw;
         display_candidate = raw;
         display_powered = powered;

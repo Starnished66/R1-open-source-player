@@ -53,13 +53,17 @@ extern const lv_font_t * ui_size_28;
  * only 480px wide (SCREEN_WIDTH, main.c), and LIST_ROW_WIDTH already uses
  * 464 of those, so a literal 15% bump (533px) would overflow the physical
  * display by 53px. 476px is the practical max -- edge-to-edge minus a thin
- * 4px total margin -- confirmed with the user after flagging the overflow.
- * Rows still use the shared plain-rounded-rect list_row_style (see
- * build_compact_list_widget()'s per-row width override) rather than a new
- * style, so height/radius/color/font stay identical -- only the box widens,
- * and callers passing this must also make sure their row is horizontally
- * centered/positioned so it doesn't clip past the container's own edge
- * (see build_compact_list_widget()'s row_x and file_browser.c's/
+ * 4px total margin (2px/side) -- confirmed with the user after flagging
+ * the overflow, and reconfirmed again after the build_compact_list_widget()
+ * padding bug (see that function's own comment) that had been silently
+ * offsetting every row was fixed and this width's real on-screen margins
+ * were visible for the first time. Rows still use the shared plain-
+ * rounded-rect list_row_style (see build_compact_list_widget()'s per-row
+ * width override) rather than a new style, so height/radius/color/font
+ * stay identical -- only the box widens, and callers passing this must
+ * also make sure their row is horizontally centered/positioned so it
+ * doesn't clip past the container's own edge (see
+ * build_compact_list_widget()'s row_x and file_browser.c's/
  * build_playlists_screen()'s explicit flex-center alignment). */
 #define LIST_ROW_WIDTH_WIDE 476
 #define LIST_ROW_HEIGHT 84
@@ -92,6 +96,16 @@ extern lv_style_t list_row_style;
  * see screen_builders_init_list_row_style()'s own comment on why this is a
  * separate style rather than folded into list_row_style itself. */
 extern lv_style_t list_row_pressed_style;
+/* LV_STATE_PRESSED-only tap indicator for a bare lv_image icon button (no
+ * background to recolor the way list_row_pressed_style does) -- dims the
+ * icon via image_recolor/image_recolor_opa rather than swapping to a
+ * "_s" pressed-state asset, so it works uniformly regardless of which of an
+ * icon's several possible source images (play/pause, loop/random/single,
+ * favorited/not) happens to be showing right now. Attach with
+ * lv_obj_add_style(icon, &icon_press_style, LV_STATE_PRESSED) to any
+ * LV_OBJ_FLAG_CLICKABLE image -- LVGL enters/exits LV_STATE_PRESSED on its
+ * own during a touch, no event callback needed. */
+extern lv_style_t icon_press_style;
 
 /* Enables the shared constant-speed row marquee with a 2-second pause. */
 void row_label_enable_marquee(lv_obj_t * label);
@@ -136,10 +150,22 @@ typedef struct {
  * this returns. icon_scale_percent scales ICON_GRID_TARGET_ICON_PX for this
  * screen only (100 = the shared default every other icon-grid screen uses;
  * pass a value above/below 100 to make just this screen's icons bigger or
- * smaller without affecting the others). */
+ * smaller without affecting the others).
+ *
+ * label_inside_icon: false (every icon set except Wireless's) draws the
+ * caption below the icon, in its own reserved row -- the right choice for
+ * plain glyph-on-transparent assets (category/launcher/stream_media). true
+ * (Wireless only) instead draws the caption inside the icon's own image,
+ * near its bottom -- the wireless/*.png assets are themselves pre-baked
+ * "card + glyph + reserved caption band" graphics (confirmed by scanning
+ * their actual pixels: every one of them has its glyph content end around
+ * 65% down a much taller canvas, with flat card background filling the
+ * rest), so drawing a second, separate caption below them left that
+ * reserved band sitting empty -- real-device bug report: "black space in
+ * the bottom that was meant for the Text to fit inside". */
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const icon_grid_item_t * items, int item_count,
-                                   int32_t icon_scale_percent);
+                                   int32_t icon_scale_percent, bool label_inside_icon);
 
 typedef enum {
     PILL_ACCESSORY_NONE = 0,

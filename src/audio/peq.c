@@ -93,7 +93,25 @@ static void compute_band_coeffs(int index, unsigned int sample_rate) {
          * Web Audio API's BiquadFilterNode uses for lowshelf/highshelf)
          * rather than the RBJ cookbook's alternate S/slope parameter, so
          * every band type shares the same Q control in the UI. */
-        double alpha = (sin_w0 / 2.0) * sqrt((A + 1.0 / A) * (1.0 / q - 1.0) + 2.0);
+        /* Real-device bug report: enabling the high-shelf band (or the
+         * low-shelf band -- both use this same formula) with a boosted/cut
+         * gain and a high enough Q muted the entire device, not just this
+         * band, surviving even a disable until a full settings reset.
+         * Root cause: this term goes negative for any gain != 0dB once Q is
+         * large enough (e.g. +12dB with Q >= ~5, both reachable on the real
+         * gain -12..+12dB / Q 0.1..10.0 sliders) -- sqrt() of a negative
+         * number is NaN, and NaN in one band's biquad state poisons every
+         * later band in the cascade and the final output permanently until
+         * that state is reset, matching "disabling didn't visibly help
+         * until a broader reset." Clamped to 0 (the RBJ cookbook shelf
+         * formula's own well-defined floor -- alpha simply saturates
+         * rather than going complex) rather than restricting the Q/gain
+         * sliders themselves, so no currently-valid slider combination
+         * changes behavior, only the ones that were already silently
+         * broken. */
+        double under_sqrt = (A + 1.0 / A) * (1.0 / q - 1.0) + 2.0;
+        if (under_sqrt < 0.0) under_sqrt = 0.0;
+        double alpha = (sin_w0 / 2.0) * sqrt(under_sqrt);
         double sqrt_A_2alpha = 2.0 * sqrt(A) * alpha;
 
         if (band->type == PEQ_TYPE_LOW_SHELF) {
@@ -219,6 +237,14 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
                 sample = y0;
             }
 
+            /* Belt-and-suspenders alongside the shelf-filter sqrt() clamp
+             * above: NaN fails every comparison (including the clamps just
+             * below), so it would otherwise reach the int16_t cast
+             * unclamped -- undefined behavior in C, and on real hardware
+             * this session's own root-caused bug showed it as a full,
+             * sticky device mute. Any future bad coefficient (this band
+             * type or another) hits silence for that one sample instead. */
+            if (!isfinite(sample)) sample = 0.0f;
             if (sample > 32767.0f) sample = 32767.0f;
             if (sample < -32768.0f) sample = -32768.0f;
             buf[i * (size_t) channels + (size_t) ch] = (int16_t) sample;

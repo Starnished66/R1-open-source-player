@@ -37,7 +37,14 @@
 #define POWER_LONG_PRESS_MS 700
 
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
-static bool play_pause_requested = false;
+/* A count, not a bool: update_timer_cb (gui.c) only polls every 500ms, and a
+ * real double-click's two presses routinely land inside a single poll
+ * window -- a plain "was it pressed" flag would collapse them into one
+ * consumed press, making Settings -> Playback -> Play/Pause Button's
+ * double-click mode silently undetectable. Real-device measurement: a fast
+ * double-tap produced two clean, ~100-200ms-apart down/up pairs at this
+ * layer, but only ever a single gui.c-side dispatch under the old bool. */
+static int play_pause_press_count = 0;
 static bool next_requested = false;
 static bool prev_requested = false;
 static bool power_requested = false;
@@ -84,7 +91,7 @@ static void handle_key_event(unsigned short code, int value) {
                 DBG_LOG("hw_buttons: KEY_POWER down at t=%u\n", now);
                 break;
             }
-            case KEY_PLAYPAUSE:      play_pause_requested = true; break;
+            case KEY_PLAYPAUSE:      play_pause_press_count++; break;
             case KEY_NEXTSONG:       next_requested = true; break;
             case KEY_PREVIOUSSONG:   prev_requested = true; break;
             case KEY_VOLUMEUP:
@@ -158,10 +165,24 @@ static void * hw_buttons_thread_func(void * arg) {
 
     char gpio_keys_path[64];
     char adc_keyboard_path[64];
+    char earpods_path[64];
     bool have_gpio_keys = find_input_device_by_name("md-gpio-keys", gpio_keys_path, sizeof(gpio_keys_path));
     bool have_adc_keyboard = find_input_device_by_name("jz adc keyboard", adc_keyboard_path, sizeof(adc_keyboard_path));
+    /* Wired headphone inline remote (play/pause, vol+/-): the R1's
+     * headphone jack has its own ADC-ladder remote-detection circuit,
+     * exposed as a separate evdev device -- confirmed live via
+     * /sys/class/input/eventN/device/uevent: NAME="earpods_adc",
+     * MODALIAS=...k72,73,A3,A4,A5,A8,D0... i.e. KEY_VOLUMEDOWN,
+     * KEY_VOLUMEUP, KEY_NEXTSONG, KEY_PLAYPAUSE, KEY_PREVIOUSSONG,
+     * KEY_REWIND, KEY_FASTFORWARD. The first five are exactly the codes
+     * handle_key_event() below already handles for the device's own
+     * physical buttons, which switches purely on the key code, not which
+     * of these three fds it arrived on -- REWIND/FASTFORWARD fall through
+     * to its existing default no-op, same as the front panel not having
+     * those either. */
+    bool have_earpods = find_input_device_by_name("earpods_adc", earpods_path, sizeof(earpods_path));
 
-    if (!have_gpio_keys && !have_adc_keyboard) {
+    if (!have_gpio_keys && !have_adc_keyboard && !have_earpods) {
         fprintf(stderr, "hw_buttons: no physical button input devices found, hardware keys disabled\n");
         return NULL;
     }
@@ -175,12 +196,13 @@ static void * hw_buttons_thread_func(void * arg) {
      * adc keyboard", and without this, the very first gpio-keys press parked
      * the thread in a blocking read on that fd forever, silently starving
      * every subsequent volume/play-pause press on the other device. */
-    struct pollfd fds[2];
+    struct pollfd fds[3];
     int nfds = 0;
     if (have_gpio_keys) {
         fds[nfds].fd = open(gpio_keys_path, O_RDONLY | O_NONBLOCK);
         if (fds[nfds].fd >= 0) {
             fds[nfds].events = POLLIN;
+            DBG_LOG("hw_buttons: fd_index=%d -> %s (md-gpio-keys)\n", nfds, gpio_keys_path);
             nfds++;
         } else {
             fprintf(stderr, "hw_buttons: failed to open %s\n", gpio_keys_path);
@@ -190,9 +212,20 @@ static void * hw_buttons_thread_func(void * arg) {
         fds[nfds].fd = open(adc_keyboard_path, O_RDONLY | O_NONBLOCK);
         if (fds[nfds].fd >= 0) {
             fds[nfds].events = POLLIN;
+            DBG_LOG("hw_buttons: fd_index=%d -> %s (jz adc keyboard)\n", nfds, adc_keyboard_path);
             nfds++;
         } else {
             fprintf(stderr, "hw_buttons: failed to open %s\n", adc_keyboard_path);
+        }
+    }
+    if (have_earpods) {
+        fds[nfds].fd = open(earpods_path, O_RDONLY | O_NONBLOCK);
+        if (fds[nfds].fd >= 0) {
+            fds[nfds].events = POLLIN;
+            DBG_LOG("hw_buttons: fd_index=%d -> %s (earpods_adc)\n", nfds, earpods_path);
+            nfds++;
+        } else {
+            fprintf(stderr, "hw_buttons: failed to open %s\n", earpods_path);
         }
     }
 
@@ -226,6 +259,7 @@ static void * hw_buttons_thread_func(void * arg) {
 
             struct input_event ev;
             while (read(fds[i].fd, &ev, sizeof(ev)) == (ssize_t) sizeof(ev)) {
+                DBG_LOG("hw_buttons: raw event fd_index=%d type=%u code=%u value=%d\n", i, ev.type, ev.code, ev.value);
                 if (ev.type == EV_KEY && ev.value != 2) { /* key down/up, ignore kernel autorepeat */
                     handle_key_event(ev.code, ev.value);
                 }
@@ -258,10 +292,10 @@ bool hw_buttons_consume_power_long_press(void) {
     return result;
 }
 
-bool hw_buttons_consume_play_pause(void) {
+int hw_buttons_consume_play_pause(void) {
     pthread_mutex_lock(&state_mutex);
-    bool result = play_pause_requested;
-    play_pause_requested = false;
+    int result = play_pause_press_count;
+    play_pause_press_count = 0;
     pthread_mutex_unlock(&state_mutex);
     return result;
 }

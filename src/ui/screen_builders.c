@@ -22,6 +22,7 @@
 
 lv_style_t list_row_style;
 lv_style_t list_row_pressed_style;
+lv_style_t icon_press_style;
 static lv_style_t row_marquee_style;
 static lv_anim_t row_marquee_anim;
 
@@ -76,6 +77,17 @@ void screen_builders_init_list_row_style(void) {
      * quick tap, not just a held press. */
     lv_style_init(&list_row_pressed_style);
     lv_style_set_bg_color(&list_row_pressed_style, lv_color_make(60, 60, 64));
+
+    /* Real-device bug report: the player screen's icon buttons (favorite,
+     * play mode order, more-menu) gave no feedback at all on touch, unlike
+     * every list row (list_row_pressed_style above) and the prev/next
+     * transport buttons (their own pressed-asset swap). Recolor-toward-black
+     * at partial opacity darkens whatever's currently drawn without needing
+     * a dedicated "_s" asset for every possible source image an icon might
+     * be showing. */
+    lv_style_init(&icon_press_style);
+    lv_style_set_image_recolor(&icon_press_style, lv_color_make(0, 0, 0));
+    lv_style_set_image_recolor_opa(&icon_press_style, LV_OPA_40);
 
     lv_anim_init(&row_marquee_anim);
     lv_anim_set_delay(&row_marquee_anim, 2000);
@@ -208,7 +220,7 @@ static void icon_tile_press_event_cb(lv_event_t * e) {
 
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const icon_grid_item_t * items, int item_count,
-                                   int32_t icon_scale_percent) {
+                                   int32_t icon_scale_percent, bool label_inside_icon) {
     int32_t target_icon_px = (ICON_GRID_TARGET_ICON_PX * icon_scale_percent) / 100;
 
     lv_obj_t * scr = lv_obj_create(NULL);
@@ -364,14 +376,45 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
          * matches the top bar's own text size rather than inventing a new
          * in-between size. */
         lv_obj_set_style_text_font(label, ui_size_20, 0);
+        /* Real-device bug report: a caption longer than a tile's own width
+         * ("Remote Control", "Import via Wi-Fi") had no width/wrap set at
+         * all, so it just overflowed straight across into the next tile
+         * (or off the right edge of the screen) instead of wrapping or
+         * clipping. lv_pct(100) resolves against `label`'s own parent
+         * (`tile`), matching whatever width the grid layout actually gave
+         * this cell. */
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
 
-        int32_t label_h = lv_font_get_line_height(ui_size_20);
-        int32_t content_h = target_icon_h + ICON_GRID_ICON_LABEL_GAP + label_h;
         int32_t available_h = row_h - 2 * ICON_GRID_TILE_PAD;
-        int32_t top_offset = (available_h - content_h) / 2;
-        if (top_offset < 0) top_offset = 0;
-        lv_obj_align(img_wrap, LV_ALIGN_TOP_MID, 0, top_offset);
-        lv_obj_align(label, LV_ALIGN_TOP_MID, 0, top_offset + target_icon_h + ICON_GRID_ICON_LABEL_GAP);
+        if (label_inside_icon) {
+            /* See this function's own header comment (screen_builders.h) --
+             * these assets already reserve their own caption band near the
+             * bottom of the image, so there's no separate label row to
+             * budget space for: the icon alone gets centered in the full
+             * available height, bigger than the below-icon layout would
+             * allow. */
+            int32_t top_offset = (available_h - target_icon_h) / 2;
+            if (top_offset < 0) top_offset = 0;
+            lv_obj_align(img_wrap, LV_ALIGN_TOP_MID, 0, top_offset);
+            /* ~83% down the icon's own scaled height -- matches where the
+             * reserved band actually starts, per a pixel scan of every
+             * wireless/*.png asset (glyph content ends around 60-68% down
+             * their shared 190px-tall native canvas; centering the label a
+             * bit past that, within the remaining flat-background band,
+             * comfortably clears every icon's glyph regardless of its
+             * exact bottom edge). */
+            int32_t label_cy = top_offset + (int32_t) (((int64_t) target_icon_h * 83) / 100);
+            lv_obj_align(label, LV_ALIGN_TOP_MID, 0, label_cy - lv_font_get_line_height(ui_size_20) / 2);
+        } else {
+            int32_t label_h = lv_font_get_line_height(ui_size_20);
+            int32_t content_h = target_icon_h + ICON_GRID_ICON_LABEL_GAP + label_h;
+            int32_t top_offset = (available_h - content_h) / 2;
+            if (top_offset < 0) top_offset = 0;
+            lv_obj_align(img_wrap, LV_ALIGN_TOP_MID, 0, top_offset);
+            lv_obj_align(label, LV_ALIGN_TOP_MID, 0, top_offset + target_icon_h + ICON_GRID_ICON_LABEL_GAP);
+        }
 
         if (item->icon_asset_selected) {
             icon_tile_press_ctx_t * ctx = malloc(sizeof(icon_tile_press_ctx_t));
@@ -571,6 +614,16 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(list, 0, 0);
     lv_obj_set_style_border_width(list, 0, 0);
+    /* Real-device bug report: same root cause as build_compact_list_widget()'s
+     * own fix (see that function's comment) -- this container never zeroed
+     * its own left/right padding either, so every row (already close to
+     * full screen width at the wider font tiers) rendered visibly shifted
+     * right, clipping against the screen edge with a gap on the left. Flex
+     * centering alone doesn't cancel this out: the row is centered within
+     * the padded content box, not the screen, so asymmetric slack left
+     * after that centering (this box is narrower than the screen once
+     * padding is subtracted) still reads as an off-center row. */
+    lv_obj_set_style_pad_all(list, 0, 0);
     /* Vertical-only -- see the matching comment in build_icon_grid_screen. */
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
@@ -1222,6 +1275,17 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(list, 0, 0);
     lv_obj_set_style_border_width(list, 0, 0);
+    /* Real-device bug report: every row in every compact-list screen
+     * (Artists/Album Artist/All Songs, the Files search overlay, the
+     * timezone city list, ...) sat shifted well to the right, leaving a
+     * large gap on the left and clipping against the right edge. Root
+     * cause: rows below are positioned with an absolute lv_obj_set_pos(row,
+     * row_x, ...), which places them relative to this container's own
+     * CONTENT area -- but `list` never zeroed its padding, so it was still
+     * carrying LVGL's default object theme padding on all four sides,
+     * silently offsetting every row_x (computed assuming zero padding) by
+     * that same amount on top of its own value. */
+    lv_obj_set_style_pad_all(list, 0, 0);
     /* Vertical-only -- see the matching comment in build_icon_grid_screen.
      * No flex flow here (unlike the old implementation) -- every row is
      * positioned by hand as part of the virtualization scheme below. */

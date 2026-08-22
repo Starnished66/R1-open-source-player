@@ -98,9 +98,21 @@ static void set_defaults(player_settings_t * out) {
     out->charge_limiter_enabled = false; /* opt-in -- caps max charge at 85%, a real behavior change the user should choose, not a default surprise */
     out->safe_charging_enabled = false; /* off means leave the PMIC charge-current setting untouched */
     out->show_battery_percent = true; /* on by default -- matches every previous version's always-on behavior */
-    out->idle_shutdown_enabled = false; /* opt-in, matches stock's own default */
-    out->idle_shutdown_minutes = 30;
-    out->idle_suspend_enabled = false;
+    /* Real-world feedback: users who never open Settings at all were
+     * reporting overnight battery drain -- with idle_shutdown_enabled
+     * defaulting off (matching stock), a device left screen-off just sits
+     * at full power indefinitely unless someone opts in by hand. Defaulting
+     * this on, with suspend-to-RAM (not a full poweroff) as the idle
+     * action, fixes that drain for exactly the users who'd never find the
+     * toggle, without the "why did my music/queue reset" complaint a
+     * default poweroff would cause. 10 minutes (the shortest step in
+     * IDLE_SHUTDOWN_STEPS) rather than the old 30-minute value, since this
+     * now needs to actually catch a device left idle, not just sit as a
+     * rarely-hit opt-in backstop. */
+    out->idle_shutdown_enabled = true;
+    out->idle_shutdown_minutes = 10;
+    out->idle_suspend_enabled = true;
+    out->idle_suspend_default_migrated = false; /* settings_load()'s own one-time migration sets this true */
     out->usb_mode = 0; /* USB_MODE_STORAGE -- see settings.h's own comment on why this is a plain int */
     out->play_mode = 0; /* PLAY_MODE_SEQUENTIAL */
     out->swipe_up_home_enabled = true;
@@ -110,6 +122,7 @@ static void set_defaults(player_settings_t * out) {
     out->timezone[0] = '\0';
     out->font_size_tier = 0;
     out->brightness_percent = 80;
+    out->clock_24h = true; /* matches the app's original, only-ever clock format -- existing installs see no change */
 }
 
 bool settings_load(player_settings_t * out) {
@@ -192,6 +205,8 @@ bool settings_load(player_settings_t * out) {
             out->idle_shutdown_minutes = atoi(value);
         } else if (strcmp(key, "idle_suspend_enabled") == 0) {
             out->idle_suspend_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "idle_suspend_default_migrated") == 0) {
+            out->idle_suspend_default_migrated = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "usb_mode") == 0) {
             out->usb_mode = atoi(value);
         } else if (strcmp(key, "play_mode") == 0) {
@@ -210,6 +225,8 @@ bool settings_load(player_settings_t * out) {
             out->font_size_tier = atoi(value);
         } else if (strcmp(key, "brightness_percent") == 0) {
             out->brightness_percent = atoi(value);
+        } else if (strcmp(key, "clock_24h") == 0) {
+            out->clock_24h = (strcmp(value, "1") == 0);
         }
     }
 
@@ -220,6 +237,27 @@ bool settings_load(player_settings_t * out) {
     if (out->brightness_percent < 0 || out->brightness_percent > 100) out->brightness_percent = 80;
     if (out->resume_mode < 0 || out->resume_mode > 2) out->resume_mode = 0;
     if (out->play_pause_button_mode < 0 || out->play_pause_button_mode > 2) out->play_pause_button_mode = 0;
+
+    /* One-time forced migration for installs that already have a
+     * settings.txt predating idle_suspend_enabled's default flip (see
+     * set_defaults() above) -- settings_save() always writes every field,
+     * so an existing file already pins idle_shutdown_enabled/
+     * idle_suspend_enabled/idle_shutdown_minutes back to their old
+     * false/false/30 values, silently defeating the new default for every
+     * existing user rather than just new installs. Same
+     * marker-key-in-the-file idiom as playlist_files.c's own
+     * PLAYLIST_MIGRATION_MARKER_NAME, just inline here instead of a
+     * separate marker file since settings.txt is already a single
+     * key=value blob rewritten in full on every save. Runs once: after
+     * this, idle_suspend_default_migrated=1 is itself persisted on the next
+     * settings_save(), so a user who deliberately turns any of these back
+     * off afterward stays off. */
+    if (!out->idle_suspend_default_migrated) {
+        out->idle_shutdown_enabled = true;
+        out->idle_shutdown_minutes = 10;
+        out->idle_suspend_enabled = true;
+        out->idle_suspend_default_migrated = true;
+    }
 
     out->screen_timeout_seconds = nearest_screen_timeout_step(out->screen_timeout_seconds);
     out->idle_shutdown_minutes = nearest_idle_shutdown_step(out->idle_shutdown_minutes);
@@ -294,6 +332,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "idle_shutdown_enabled=%d\n", settings->idle_shutdown_enabled ? 1 : 0);
     fprintf(f, "idle_shutdown_minutes=%d\n", settings->idle_shutdown_minutes);
     fprintf(f, "idle_suspend_enabled=%d\n", settings->idle_suspend_enabled ? 1 : 0);
+    fprintf(f, "idle_suspend_default_migrated=%d\n", settings->idle_suspend_default_migrated ? 1 : 0);
     fprintf(f, "usb_mode=%d\n", settings->usb_mode);
     fprintf(f, "play_mode=%d\n", settings->play_mode);
     fprintf(f, "swipe_up_home_enabled=%d\n", settings->swipe_up_home_enabled ? 1 : 0);
@@ -303,6 +342,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "timezone=%s\n", settings->timezone);
     fprintf(f, "font_size_tier=%d\n", settings->font_size_tier);
     fprintf(f, "brightness_percent=%d\n", settings->brightness_percent);
+    fprintf(f, "clock_24h=%d\n", settings->clock_24h ? 1 : 0);
 
     fflush(f);
     fsync(fileno(f));

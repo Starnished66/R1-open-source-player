@@ -502,14 +502,21 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
      * letting it escalate to LV_EVENT_GESTURE. Still scrolls vertically
      * fine for a directory with more files than fit on screen. */
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    /* Real-device bug report: same root cause as build_compact_list_widget()'s
+     * own fix in screen_builders.c (see that function's comment) -- this
+     * container never zeroed its own padding, so it carried LVGL's default
+     * object theme padding on top of every row's own centering math, shifting
+     * the whole Files screen's rows right and clipping them against the
+     * screen edge. Flex CENTER cross-axis alignment does NOT compensate for
+     * this on its own -- confirmed the hard way on build_pill_list_screen(),
+     * which had the identical bug despite also using CENTER alignment. */
+    lv_obj_set_style_pad_all(list, 0, 0);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(list, 4, 0);
     lv_obj_set_style_pad_top(list, 4, 0);
     /* Rows are LIST_ROW_WIDTH_WIDE (476px, this device's 480px-wide screen
      * minus a thin 4px margin) -- explicit cross-axis centering so that
-     * width is guaranteed to sit centered within this full-width container
-     * regardless of the default theme's own flex padding, rather than
-     * risking an unverified assumption about it clipping past the edge. */
+     * width is guaranteed to sit centered within this full-width container. */
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
 
     scan_current_dir();

@@ -227,8 +227,7 @@ static lv_obj_t * idle_action_suspend_row;
 
 static lv_obj_t * eq_screen;
 static lv_obj_t * eq_bypass_switch;
-static lv_obj_t * eq_band_buttons[PEQ_NUM_BANDS];
-static lv_obj_t * eq_band_button_labels[PEQ_NUM_BANDS];
+static lv_obj_t * eq_band_dropdown;
 static lv_obj_t * eq_band_enabled_switch;
 static lv_obj_t * eq_preamp_slider;
 static lv_obj_t * eq_preamp_value_label;
@@ -308,6 +307,14 @@ static lv_obj_t * volume_slider;
  * a clock always shows both digits of the hour). */
 static lv_obj_t * clock_topbar_group;
 static lv_obj_t * clock_topbar_digit[5]; /* H, H, :, M, M */
+/* Settings -> System -> "24-Hour Clock" (current_settings.clock_24h). Extra
+ * flex-row child after the 5 digit slots, hidden entirely in 24h mode --
+ * topbar/am.png and topbar/pm.png are pre-existing theme assets, unused by
+ * any code before this setting. clock_topbar_group is LV_SIZE_CONTENT and
+ * center-aligned to the status bar band, so hiding/showing this slot
+ * reflows and re-centers the whole clock automatically, same as any other
+ * flex child visibility change in this file. */
+static lv_obj_t * clock_topbar_ampm;
 /* Volume readout, far left of the status bar: real topbar/N.png digit
  * sprites (theme2 asset set) plus topbar/speaker.png and topbar/po.png
  * (headphone-out glyph), not a text label -- matches the stock player's own
@@ -948,6 +955,11 @@ static void enable_gesture_bubble_recursive(lv_obj_t * obj) {
 /* Defined later alongside the rest of the quick-access drawer, but needed
  * here for the swipe-down-from-the-top-edge trigger below. */
 static void open_quick_drawer(void);
+/* Defined later alongside player_swipe_press_excluded()'s own raw-polling
+ * dead-zone machinery -- needed here too, by screen_gesture_event_cb()
+ * below, see its own comment. */
+static bool active_press_is_over_drag_adjust_widget(void);
+static bool point_in_swipe_dead_zone(lv_point_t p);
 #define QUICK_DRAWER_ANIM_MS 120 /* real-hardware feedback: 200 felt slow for the post-release snap */
 #define QUICK_DRAWER_TRIGGER_ZONE 140 /* swipe-down must start within this many px of the top edge to open it */
 
@@ -977,6 +989,29 @@ static void screen_gesture_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
     lv_indev_t * indev = lv_indev_active();
     if (!indev) return;
+
+    /* Real-device bug report: dragging the player screen's own seek bar
+     * (progress_slider) still triggered the back-swipe. Widening its
+     * ext_click_area (see progress_slider's own comment) wasn't enough on
+     * its own -- LVGL's gesture recognition runs throughout a slider drag
+     * regardless (sliders clear LV_OBJ_FLAG_SCROLLABLE in their
+     * constructor, so the generic scroll_obj early-exit indev_gesture()
+     * relies on elsewhere never applies to one), and real-device testing
+     * showed this still reaching here rather than staying resolved to the
+     * slider itself the way GESTURE_BUBBLE exclusion (enable_gesture_
+     * bubble_recursive()) was expected to guarantee. Reusing the same two
+     * checks player_swipe_press_excluded() already combines for the
+     * separate raw-polling player-swipe path: active_press_is_over_drag_
+     * adjust_widget() (hit-tested object identity -- covers a press that
+     * lands squarely on progress_slider) plus point_in_swipe_dead_zone()
+     * (raw point-in-rect against the registered dead-zone list --
+     * progress_slider is registered there too, see its own
+     * register_swipe_dead_zone() call, covering a press that lands just
+     * off it) closes the gap regardless of exactly which part of LVGL's
+     * own gesture-bubbling chain let it through. */
+    lv_point_t gesture_press_point;
+    lv_indev_get_point(indev, &gesture_press_point);
+    if (active_press_is_over_drag_adjust_widget() || point_in_swipe_dead_zone(gesture_press_point)) return;
 
     lv_dir_t dir = lv_indev_get_gesture_dir(indev);
     if (dir == LV_DIR_RIGHT) {
@@ -1137,6 +1172,10 @@ static void build_status_bar(void) {
         lv_image_set_src(clock_topbar_digit[i], asset_path(i == 2 ? "topbar/colon.png" : "topbar/0.png"));
         lv_image_set_scale(clock_topbar_digit[i], LV_SCALE_NONE);
     }
+    clock_topbar_ampm = lv_image_create(clock_topbar_group);
+    lv_image_set_src(clock_topbar_ampm, asset_path("topbar/am.png"));
+    lv_image_set_scale(clock_topbar_ampm, LV_SCALE_NONE);
+    lv_obj_add_flag(clock_topbar_ampm, LV_OBJ_FLAG_HIDDEN); /* refresh_clock_label() unhides this if clock_24h is off */
 
     /* LAST, after every child exists -- see the matching comment on
      * volume_topbar_group's own align() call below for why (LV_SIZE_CONTENT
@@ -1999,6 +2038,44 @@ static void volume_popup_track_event_cb(lv_event_t * e) {
     }
 }
 
+/* Real-device bug report: both this popup's own volume slider and the quick
+ * drawer's brightness slider showed a persistent, precisely 13px-wide gray
+ * sliver flanking BOTH ends of the track (confirmed via direct pixel
+ * analysis of a pulled framebuffer, and independently reproduced with the
+ * MAIN/INDICATOR/KNOB parts each swapped to solid debug colors -- the
+ * sliver is neither vol_bg.png/vol_progress.png's own art, nor the
+ * pull_down/bg.png backdrop showing through, but some further LVGL-internal
+ * knob-radius-sized overshoot on the object's own MAIN/INDICATOR draw that
+ * persisted even with LV_PART_INDICATOR's radius already flattened to 0 --
+ * 13px matches this slider's own 26px KNOB radius exactly, and the same
+ * sliver reappears symmetrically past the track's right edge too, not just
+ * "only covered when the slider is at 0" as first reported (that's simply
+ * the one value where the real knob happens to sit on top of the left-side
+ * sliver and hide it). Rather than keep chasing the exact internal LVGL
+ * mechanism, this covers both slivers with two small opaque patches in the
+ * exact flanking color -- effective regardless of the underlying cause.
+ * Only safe to use where the slider sits on a FLAT, known background color
+ * (this popup's volume/bg.png and the quick drawer's pull_down/bg.png both
+ * qualify, confirmed by direct pixel sampling of each asset) -- NOT used for
+ * the player screen's own progress_slider, which sits over the (non-flat)
+ * blurred album art. */
+static void mask_slider_knob_overshoot(lv_obj_t * parent, lv_obj_t * slider, int32_t knob_size, lv_color_t bg_color) {
+    int32_t mask_w = 16;
+    for (int side = 0; side < 2; side++) {
+        lv_obj_t * mask = lv_obj_create(parent);
+        lv_obj_remove_style_all(mask);
+        lv_obj_set_size(mask, mask_w, knob_size);
+        lv_obj_set_style_bg_color(mask, bg_color, 0);
+        lv_obj_set_style_bg_opa(mask, LV_OPA_COVER, 0);
+        lv_obj_remove_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(mask, LV_OBJ_FLAG_CLICKABLE);
+        /* 4px overlap into the slider's own edge so there's no seam between
+         * the mask and wherever the slider's real track color starts. */
+        lv_obj_align_to(mask, slider, side == 0 ? LV_ALIGN_OUT_LEFT_MID : LV_ALIGN_OUT_RIGHT_MID,
+                         side == 0 ? 4 : -4, 0);
+    }
+}
+
 static void build_volume_popup(void) {
     lv_obj_t * top = lv_layer_top();
 
@@ -2054,11 +2131,22 @@ static void build_volume_popup(void) {
      * bg_image_recolor, not just bg_color. */
     lv_obj_add_style(volume_popup_track, &style_accent, LV_PART_INDICATOR);
     lv_obj_add_style(volume_popup_track, &style_accent, LV_PART_KNOB);
+    /* Flat (0), not this app's usual default, on the theory a rounded
+     * corner might be receding from the indicator's own true edge -- kept
+     * as a reasonable belt-and-suspenders choice even though real-device
+     * testing (and a debug build with each part painted a distinct solid
+     * color) showed this alone does NOT explain the actual gray-sliver bug
+     * here -- see mask_slider_knob_overshoot()'s own comment for what
+     * turned out to be going on and the fix actually used, right below. */
+    lv_obj_set_style_radius(volume_popup_track, 0, LV_PART_INDICATOR);
     lv_obj_set_style_width(volume_popup_track, 30, LV_PART_KNOB);
     lv_obj_set_style_height(volume_popup_track, 30, LV_PART_KNOB);
     /* Clickable by default (lv_slider_create()) -- drag/touch-able, not
      * just driven by the hw volume buttons, see volume_popup_track_event_cb. */
     lv_obj_add_event_cb(volume_popup_track, volume_popup_track_event_cb, LV_EVENT_ALL, NULL);
+    /* (87,87,91) -- volume/bg.png's own flat color, sampled directly from
+     * the asset. See mask_slider_knob_overshoot()'s own comment. */
+    mask_slider_knob_overshoot(volume_popup, volume_popup_track, 30, lv_color_make(87, 87, 91));
 
     volume_popup_hide_timer = lv_timer_create(volume_popup_hide_timer_cb, 1500, NULL);
     lv_timer_pause(volume_popup_hide_timer);
@@ -3568,8 +3656,28 @@ static void build_quick_drawer(void) {
     lv_obj_set_style_text_font(quick_drawer_brightness_label, ui_size_20, 0);
     lv_obj_align(quick_drawer_brightness_label, LV_ALIGN_TOP_RIGHT, -20, QUICK_DRAWER_PANEL1_TOP + 177);
 
+    /* Real-device bug report: the "NN%" label overlapped the slider --
+     * first attempted by pushing the slider's own Y down to clear the
+     * label's line height, but real-device feedback rejected that ("the
+     * slider can't be lower than the icon, restore it to its default
+     * position") -- brightness_icon (row 2's own visual anchor) sits at a
+     * fixed Y, and the slider is meant to sit at a fixed, small offset
+     * below it, not drift down with text size. The actual overlap was
+     * horizontal, not vertical: the label is right-anchored and grows
+     * LEFTWARD as its rendered text widens at bigger font tiers (BlindMF),
+     * eventually reaching past the slider's fixed 300px-wide right edge.
+     * Shrinking the slider's own WIDTH -- explicitly OK per that same
+     * feedback ("it's ok to make the slider smaller") -- to always leave
+     * room for the widest this label could ever render ("100%") fixes the
+     * real, horizontal overlap while leaving both elements' Y positions
+     * exactly as originally designed. */
+    int32_t brightness_label_max_w = lv_text_get_width("100%", 4, ui_size_20, 0);
+    int32_t brightness_track_w = (w - 20 - brightness_label_max_w - 20) - 90;
+    if (brightness_track_w > 300) brightness_track_w = 300; /* never wider than the original design */
+    if (brightness_track_w < 120) brightness_track_w = 120; /* sane floor so the track never collapses to nothing */
+
     quick_drawer_brightness_track = lv_slider_create(quick_drawer);
-    lv_obj_set_size(quick_drawer_brightness_track, 300, 12);
+    lv_obj_set_size(quick_drawer_brightness_track, brightness_track_w, 12);
     lv_obj_align(quick_drawer_brightness_track, LV_ALIGN_TOP_LEFT, 90, QUICK_DRAWER_PANEL1_TOP + 185);
     /* Full 0-100 -- backlight.c now maps this logical range to its own safe
      * raw range internally (see backlight.h's own comment), so the slider
@@ -3590,6 +3698,9 @@ static void build_quick_drawer(void) {
      * bg_image_recolor, not just bg_color. */
     lv_obj_add_style(quick_drawer_brightness_track, &style_accent, LV_PART_INDICATOR);
     lv_obj_add_style(quick_drawer_brightness_track, &style_accent, LV_PART_KNOB);
+    /* Real-device bug report: same left-edge gray sliver/root cause as
+     * volume_popup_track's own fix -- see its comment. */
+    lv_obj_set_style_radius(quick_drawer_brightness_track, 0, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_KNOB);
@@ -3597,6 +3708,10 @@ static void build_quick_drawer(void) {
     lv_obj_set_style_height(quick_drawer_brightness_track, 26, LV_PART_KNOB);
     lv_obj_add_event_cb(quick_drawer_brightness_track, quick_drawer_brightness_changed_cb, LV_EVENT_ALL,
                          quick_drawer_brightness_label);
+    /* (23,23,23) -- pull_down/bg.png's own flat color at this row, sampled
+     * directly from the asset. See mask_slider_knob_overshoot()'s own
+     * comment. */
+    mask_slider_knob_overshoot(quick_drawer, quick_drawer_brightness_track, 26, lv_color_make(23, 23, 23));
     refresh_quick_drawer_brightness();
 
     /* Mini now-playing card: real track title/artist/transport, reusing the
@@ -3688,11 +3803,12 @@ static void refresh_clock_label(void) {
     struct tm tm_info;
     localtime_r(&now, &tm_info);
     char buf[8];
-    strftime(buf, sizeof(buf), "%H:%M", &tm_info);
+    /* %I (12h) zero-pads to 2 digits just like %H (24h) does -- "01".."12",
+     * never a single digit -- so buf is always "HH:MM" (5 chars) either
+     * way, mapping 1:1 onto the 5 fixed slots with no leading-slot-hiding
+     * needed here, unlike the volume/battery readouts. */
+    strftime(buf, sizeof(buf), current_settings.clock_24h ? "%H:%M" : "%I:%M", &tm_info);
 
-    /* buf is always "HH:MM" (5 chars) from strftime's %H/%M, so this maps
-     * 1:1 onto the 5 fixed slots -- no leading-slot-hiding needed here,
-     * unlike the volume/battery readouts. */
     for (int i = 0; i < 5; i++) {
         char asset[24];
         if (buf[i] == ':') {
@@ -3701,6 +3817,13 @@ static void refresh_clock_label(void) {
             snprintf(asset, sizeof(asset), "topbar/%c.png", buf[i]);
         }
         lv_image_set_src(clock_topbar_digit[i], asset_path(asset));
+    }
+
+    if (current_settings.clock_24h) {
+        lv_obj_add_flag(clock_topbar_ampm, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_image_set_src(clock_topbar_ampm, asset_path(tm_info.tm_hour < 12 ? "topbar/am.png" : "topbar/pm.png"));
+        lv_obj_remove_flag(clock_topbar_ampm, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -5358,6 +5481,16 @@ static void battery_percent_switch_event_cb(lv_event_t * e) {
     refresh_battery_topbar();
 }
 
+/* refresh_clock_label() re-syncs the AM/PM sprite's own hidden flag itself
+ * -- called here so toggling this switch is reflected immediately, same
+ * reasoning as battery_percent_switch_event_cb() just above. */
+static void clock_24h_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.clock_24h = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+    refresh_clock_label();
+}
+
 /* Log-scale mapping so the slider gives fine control at low frequencies
  * (where the ear is more sensitive to small Hz changes) instead of wasting
  * most of the slider's travel on the top octave. */
@@ -5492,18 +5625,7 @@ static void refresh_eq_band_widgets(void) {
     const peq_band_t * band = peq_get_band(current_eq_band);
     if (!band) return;
 
-    for (int i = 0; i < PEQ_NUM_BANDS; i++) {
-        bool selected = (i == current_eq_band);
-        /* Toggling which SHARED style is attached (rather than setting a
-         * one-off direct color) so this keeps tracking the accent color
-         * live if the user changes it later -- a direct
-         * lv_obj_set_style_text_color() would sit in the object's local
-         * style, which takes priority over any added style and would
-         * silently defeat style_accent. */
-        lv_obj_remove_style(eq_band_button_labels[i], &style_accent, 0);
-        lv_obj_remove_style(eq_band_button_labels[i], &style_muted_text, 0);
-        lv_obj_add_style(eq_band_button_labels[i], selected ? &style_accent : &style_muted_text, 0);
-    }
+    lv_dropdown_set_selected(eq_band_dropdown, (uint32_t) current_eq_band);
 
     if (band->enabled) lv_obj_add_state(eq_band_enabled_switch, LV_STATE_CHECKED);
     else lv_obj_clear_state(eq_band_enabled_switch, LV_STATE_CHECKED);
@@ -5519,9 +5641,9 @@ static void refresh_eq_band_widgets(void) {
     lv_label_set_text_fmt(eq_q_value_label, "Q: %.2f", band->q);
 }
 
-static void eq_band_button_event_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    current_eq_band = (int) (intptr_t) lv_event_get_user_data(e);
+static void eq_band_dropdown_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_eq_band = (int) lv_dropdown_get_selected(lv_event_get_target(e));
     refresh_eq_band_widgets();
 }
 
@@ -5555,9 +5677,14 @@ static void eq_freq_slider_event_cb(lv_event_t * e) {
     if (!band) return;
     double freq = slider_to_freq(lv_slider_get_value(lv_event_get_target(e)));
 
+    /* Real-device bug report: this used to switch to a shorter, unlabeled
+     * "228 Hz" format while actively dragging, only showing the full
+     * "Frequency: 228 Hz" once released -- read as the label "hiding" its
+     * name mid-drag. Same full format at all times now, matching
+     * refresh_eq_band_widgets()'s own resting-state format exactly. */
     if (code == LV_EVENT_VALUE_CHANGED) {
         peq_set_band(current_eq_band, freq, band->gain_db, band->q);
-        lv_label_set_text_fmt(eq_freq_value_label, "%.0f Hz", freq);
+        lv_label_set_text_fmt(eq_freq_value_label, "Frequency: %.0f Hz", freq);
     } else if (code == LV_EVENT_RELEASED) {
         peq_save();
     }
@@ -5571,7 +5698,7 @@ static void eq_gain_slider_event_cb(lv_event_t * e) {
 
     if (code == LV_EVENT_VALUE_CHANGED) {
         peq_set_band(current_eq_band, band->freq_hz, gain, band->q);
-        lv_label_set_text_fmt(eq_gain_value_label, "%+.1f dB", gain);
+        lv_label_set_text_fmt(eq_gain_value_label, "Gain: %+.2f dB", gain);
     } else if (code == LV_EVENT_RELEASED) {
         peq_save();
     }
@@ -5585,7 +5712,7 @@ static void eq_q_slider_event_cb(lv_event_t * e) {
 
     if (code == LV_EVENT_VALUE_CHANGED) {
         peq_set_band(current_eq_band, band->freq_hz, band->gain_db, q);
-        lv_label_set_text_fmt(eq_q_value_label, "Q %.2f", q);
+        lv_label_set_text_fmt(eq_q_value_label, "Q: %.2f", q);
     } else if (code == LV_EVENT_RELEASED) {
         peq_save();
     }
@@ -5717,20 +5844,33 @@ static bool idle_shutdown_attempted = false;
 
 /* Real-device bug report: waking from suspend needed two power-button
  * presses -- see the resume fixup below (right after power_suspend_now())
- * for the full mechanism, and its own comment for the actual confirmed
- * root cause (an unreset LVGL inactivity clock, not this grace window --
- * this window handles a separate, secondary race only). Short grace
- * window, not a one-shot drain: the physical press that wakes the kernel
- * is captured by hw_buttons.c's own independent evdev reader thread, whose
- * timing relative to this (main) thread's own resume handling isn't
- * guaranteed -- a drain attempted too early could miss a flag that thread
- * hadn't set yet. Any power-button press consumed within this window of a
- * resume is treated as an echo of the wake press and silently discarded
- * rather than toggling the screen; long enough to comfortably cover
- * realistic evdev delivery latency, short enough that a genuinely
- * deliberate second press to go back to sleep right after waking is a rare
- * enough tradeoff to accept. */
-#define RESUME_POWER_DRAIN_WINDOW_MS 1000
+ * for the full mechanism. An earlier version of this comment attributed the
+ * bug entirely to an unreset LVGL inactivity clock (now fixed by
+ * resume_from_suspend_fixups()'s own lv_display_trigger_activity() call)
+ * and treated this window as covering only a rare, secondary race -- real
+ * diagnostic logging during a live repro instead found this window itself
+ * to be the actual remaining cause. hw_buttons.c only sets its
+ * short-tap-consumed flag on the button's RELEASE, not the initial press
+ * that wakes the kernel (see its own handle_key_event(), value==0 branch) --
+ * and a real capture measured 2350ms between this window being armed (right
+ * as power_suspend_now() returns, at/near the press that woke the kernel)
+ * and that same press's release finally being consumed, comfortably past
+ * the old 1000ms budget. Once the window auto-expires "unused," that
+ * release is read as a brand new deliberate toggle-off press instead of
+ * being recognized as the wake press's own echo -- exactly the "press 1
+ * wakes then immediately goes dark, press 2 actually wakes it" report.
+ * Raised with real margin above that measured gap. Short grace window, not
+ * a one-shot drain: the physical press that wakes the kernel is captured by
+ * hw_buttons.c's own independent evdev reader thread, whose timing relative
+ * to this (main) thread's own resume handling isn't guaranteed -- a drain
+ * attempted too early could miss a flag that thread hadn't set yet. Any
+ * power-button press consumed within this window of a resume is treated as
+ * an echo of the wake press and silently discarded rather than toggling the
+ * screen; a genuinely deliberate second press to go back to sleep right
+ * after waking landing inside this now-longer window is a rarer, but
+ * real, tradeoff accepted in exchange for the wake press itself no longer
+ * routinely misfiring. */
+#define RESUME_POWER_DRAIN_WINDOW_MS 3000
 static uint32_t resumed_from_suspend_tick = 0;
 static bool resumed_from_suspend_pending = false;
 
@@ -5779,8 +5919,17 @@ static void poll_search_job(void);
  * the first half of a double-click, so it defers the decision behind a
  * short timer -- same reset-then-resume idiom as TEXT_ENTRY_MULTITAP_MS
  * further down in this file -- rather than acting immediately; modes 0 and
- * 1 fire with zero added latency since there's nothing to disambiguate. */
-#define PLAY_PAUSE_DOUBLE_CLICK_MS 350
+ * 1 fire with zero added latency since there's nothing to disambiguate.
+ * Real-device incident: update_timer_cb only polls hw_buttons every 500ms
+ * (see its own lv_timer_create() call), so a click that straddles two poll
+ * windows can show up here up to ~500ms later than the physical press that
+ * caused it -- on top of the real gap between the two clicks themselves.
+ * hw_buttons_consume_play_pause() returning a count instead of a bool
+ * (see hw_buttons.c) already makes a double-click landing inside a single
+ * poll window resolve immediately with no timer involved at all; this
+ * window only needs to cover the slower, poll-straddling case, hence the
+ * headroom above the 500ms poll period itself. */
+#define PLAY_PAUSE_DOUBLE_CLICK_MS 700
 static lv_timer_t * play_pause_click_timer = NULL;
 static int play_pause_click_count = 0;
 
@@ -5825,9 +5974,14 @@ static void update_timer_cb(lv_timer_t * timer) {
     (void) timer;
 
     /* Physical volume/skip/play-pause buttons: applied here, on the one
-     * thread allowed to touch LVGL widgets (see hw_buttons.h). */
-    bool played_paused = hw_buttons_consume_play_pause();
-    if (played_paused) {
+     * thread allowed to touch LVGL widgets (see hw_buttons.h). Play/pause
+     * is a count, not a bool -- this poll only runs every 500ms, and a real
+     * double-click's two presses routinely land inside one poll window; a
+     * count of 2 here dispatches immediately, twice in a row, letting
+     * handle_physical_play_pause_press()'s own click-count state (mode 2)
+     * see it as a same-tick double-click without waiting on its timer. */
+    int played_paused_count = hw_buttons_consume_play_pause();
+    for (int i = 0; i < played_paused_count; i++) {
         handle_physical_play_pause_press();
     }
     /* Real-device bug report: shuffle "sometimes shuffles, sometimes just
@@ -6112,7 +6266,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * why: touches don't either, real-device feedback was that a screen
      * meant to be off shouldn't relight itself from a pocket touch/bump,
      * only a deliberate power-button press should turn it back on). */
-    if (played_paused || skipped_next || skipped_prev || volume_delta != 0) {
+    if (played_paused_count > 0 || skipped_next || skipped_prev || volume_delta != 0) {
         lv_display_trigger_activity(NULL);
     }
 
@@ -6348,21 +6502,25 @@ static void update_timer_cb(lv_timer_t * timer) {
                  * to be observed across two separate ticks) would never be
                  * seen as an "edge" and that logic would never fire again.
                  *
-                 * Also folds in the fix for a related real-device report --
-                 * waking from suspend needed two power-button presses, the
-                 * first visibly flashing the backlight on then straight back
-                 * off. Root cause: lv_display_get_inactive_time(NULL), read
-                 * by the auto-screen-timeout check just below, is fed only
-                 * by lv_display_trigger_activity() calls, none of which
+                 * Also folds in one of two fixes for a related real-device
+                 * report -- waking from suspend needed two power-button
+                 * presses, the first visibly flashing the backlight on then
+                 * straight back off. First cause: lv_display_get_inactive_time(NULL),
+                 * read by the auto-screen-timeout check just below, is fed
+                 * only by lv_display_trigger_activity() calls, none of which
                  * happen anywhere during the entire suspend duration (the
                  * whole app, including this timer, is frozen) -- so the
-                 * instant the screen is force-enabled, that check sees an
-                 * inactivity duration spanning the ENTIRE sleep, always over
-                 * screen_timeout_seconds, and immediately flips the screen
-                 * back off again on this same tick. The second press only
-                 * "fixed" it as a side effect (a genuine press resets that
-                 * clock in the toggle branch below) -- resetting it
-                 * explicitly here is the real fix.
+                 * instant the screen is force-enabled, that check could see
+                 * an inactivity duration spanning the sleep and immediately
+                 * flip the screen back off again on this same tick.
+                 * Resetting it explicitly here (lv_display_trigger_activity()
+                 * below) fixes that half. A second, independent cause
+                 * remained even with that fix: RESUME_POWER_DRAIN_WINDOW_MS's
+                 * own grace window (see its comment, right above
+                 * resume_from_suspend_fixups()) was too short relative to
+                 * how late the wake press's own RELEASE (not its down edge)
+                 * gets consumed -- confirmed by real diagnostic logging
+                 * during a live repro, not by inspection alone.
                  *
                  * See resume_from_suspend_fixups()'s own comment for why
                  * this is shared with Car Mode's own suspend call below. */
@@ -7090,66 +7248,37 @@ static void delete_song_confirm_cb(lv_event_t * e) {
     show_error_toast("Song deleted");
 }
 
+/* Defined much further down, alongside build_import_rescan_popup() (the
+ * shared "are you sure?" 2-button popup shape's own doc comment) --
+ * forward-declared here since this and every other popup builder before
+ * that point in the file needs it. */
+static lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
+                                       lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
+                                       lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
+                                       const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
+                                       lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
+
+/* Defined alongside build_confirm_popup() above -- see its own doc comment
+ * for why this is a separate shared shape (an N-row menu, not a yes/no
+ * confirmation) and why both are forward-declared here. */
+typedef struct {
+    const char * label;
+    lv_event_cb_t cb;
+    bool destructive;
+} menu_popup_row_t;
+
+static lv_obj_t * build_menu_popup(const menu_popup_row_t * rows, int row_count, lv_event_cb_t backdrop_cb,
+                                    lv_obj_t ** out_backdrop);
+
 static void build_delete_song_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    delete_song_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(delete_song_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(delete_song_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(delete_song_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(delete_song_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(delete_song_popup_backdrop, delete_song_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    delete_song_popup = lv_obj_create(top);
-    lv_obj_set_size(delete_song_popup, 420, 220);
-    lv_obj_align(delete_song_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(delete_song_popup, 16, 0);
-    lv_obj_add_style(delete_song_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(delete_song_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(delete_song_popup, 0, 0);
-    lv_obj_remove_flag(delete_song_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(delete_song_popup, LV_OBJ_FLAG_HIDDEN);
-
-    delete_song_popup_title = lv_label_create(delete_song_popup);
-    lv_obj_set_width(delete_song_popup_title, lv_pct(90));
-    lv_label_set_long_mode(delete_song_popup_title, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(delete_song_popup_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(delete_song_popup_title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(delete_song_popup_title, ui_size_22, 0);
-    lv_obj_align(delete_song_popup_title, LV_ALIGN_TOP_MID, 0, 20);
-
-    lv_obj_t * delete_row = lv_obj_create(delete_song_popup);
-    lv_obj_set_size(delete_row, lv_pct(90), 56);
-    lv_obj_align(delete_row, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_set_style_radius(delete_row, 12, 0);
-    lv_obj_set_style_bg_opa(delete_row, 0, 0);
-    lv_obj_set_style_border_width(delete_row, 0, 0);
-    lv_obj_remove_flag(delete_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(delete_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(delete_row, delete_song_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * delete_label = lv_label_create(delete_row);
-    lv_label_set_text(delete_label, "Delete");
-    lv_obj_set_style_text_color(delete_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(delete_label, ui_size_20, 0);
-    lv_obj_center(delete_label);
-
-    lv_obj_t * cancel_row = lv_obj_create(delete_song_popup);
-    lv_obj_set_size(cancel_row, lv_pct(90), 56);
-    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
-    lv_obj_set_style_radius(cancel_row, 12, 0);
-    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
-    lv_obj_set_style_border_width(cancel_row, 0, 0);
-    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(cancel_row, delete_song_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * cancel_label = lv_label_create(cancel_row);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
-    lv_obj_center(cancel_label);
+    /* LV_LABEL_LONG_DOT, not WRAP -- this title's text is set later
+     * (delete_song_confirm_prompt() below) to "Delete <filename>?..." with
+     * an arbitrary-length real filename spliced in, so it needs to
+     * truncate rather than potentially wrap across several lines. */
+    delete_song_popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &delete_song_popup_title, NULL, "Delete",
+                                             lv_color_make(255, 120, 120), delete_song_confirm_cb, NULL, "Cancel",
+                                             accent_lv_color(), delete_song_cancel_cb, NULL,
+                                             delete_song_popup_backdrop_cb, &delete_song_popup_backdrop);
 }
 
 /* ---- The "more" 3-row menu itself ---- */
@@ -7216,57 +7345,15 @@ static void more_icon_event_cb(lv_event_t * e) {
 }
 
 static void build_more_menu_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    more_menu_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(more_menu_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(more_menu_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(more_menu_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(more_menu_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(more_menu_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(more_menu_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(more_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(more_menu_popup_backdrop, more_menu_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    more_menu_popup = lv_obj_create(top);
-    lv_obj_set_size(more_menu_popup, 400, 376); /* +66 over the old 310 -- one more row, same per-row spacing */
-    lv_obj_align(more_menu_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(more_menu_popup, 16, 0);
-    lv_obj_add_style(more_menu_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(more_menu_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(more_menu_popup, 0, 0);
-    lv_obj_remove_flag(more_menu_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(more_menu_popup, LV_OBJ_FLAG_HIDDEN);
-
-    static const struct {
-        const char * label;
-        lv_event_cb_t cb;
-        bool destructive;
-    } rows[] = {
+    static const menu_popup_row_t rows[] = {
         { "List", more_menu_list_cb, false },
         { "Queue", more_menu_queue_cb, false },
         { "Add to Playlist", more_menu_add_to_playlist_cb, false },
         { "EQ", more_menu_eq_cb, false },
         { "Delete", more_menu_delete_cb, true },
     };
-
-    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
-        lv_obj_t * row = lv_obj_create(more_menu_popup);
-        lv_obj_set_size(row, lv_pct(90), 56);
-        lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 20 + (int) i * 66);
-        lv_obj_set_style_radius(row, 12, 0);
-        lv_obj_set_style_bg_opa(row, 0, 0);
-        lv_obj_set_style_border_width(row, 0, 0);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, rows[i].cb, LV_EVENT_CLICKED, NULL);
-
-        lv_obj_t * label = lv_label_create(row);
-        lv_label_set_text(label, rows[i].label);
-        lv_obj_set_style_text_color(label, rows[i].destructive ? lv_color_make(255, 120, 120) : accent_lv_color(), 0);
-        lv_obj_set_style_text_font(label, ui_size_20, 0);
-        lv_obj_center(label);
-    }
+    more_menu_popup = build_menu_popup(rows, (int) (sizeof(rows) / sizeof(rows[0])), more_menu_popup_backdrop_cb,
+                                        &more_menu_popup_backdrop);
 }
 
 /* ---- Song long-press context menu: Add to Queue / Add to Playlist / Cancel
@@ -7321,55 +7408,14 @@ static void open_song_context_menu(const char * path) {
 }
 
 static void build_song_context_menu_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    song_context_menu_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(song_context_menu_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(song_context_menu_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(song_context_menu_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(song_context_menu_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(song_context_menu_popup_backdrop, song_context_menu_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    song_context_menu_popup = lv_obj_create(top);
-    lv_obj_set_size(song_context_menu_popup, 400, 244);
-    lv_obj_align(song_context_menu_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(song_context_menu_popup, 16, 0);
-    lv_obj_add_style(song_context_menu_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(song_context_menu_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(song_context_menu_popup, 0, 0);
-    lv_obj_remove_flag(song_context_menu_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(song_context_menu_popup, LV_OBJ_FLAG_HIDDEN);
-
-    static const struct {
-        const char * label;
-        lv_event_cb_t cb;
-        bool destructive;
-    } rows[] = {
+    static const menu_popup_row_t rows[] = {
         { "Add to Queue", song_context_menu_add_to_queue_cb, false },
         { "Add to Playlist", song_context_menu_add_to_playlist_cb, false },
         { "Cancel", song_context_menu_cancel_cb, false },
     };
-
-    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
-        lv_obj_t * row = lv_obj_create(song_context_menu_popup);
-        lv_obj_set_size(row, lv_pct(90), 56);
-        lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 20 + (int) i * 66);
-        lv_obj_set_style_radius(row, 12, 0);
-        lv_obj_set_style_bg_opa(row, 0, 0);
-        lv_obj_set_style_border_width(row, 0, 0);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, rows[i].cb, LV_EVENT_CLICKED, NULL);
-
-        lv_obj_t * label = lv_label_create(row);
-        lv_label_set_text(label, rows[i].label);
-        lv_obj_set_style_text_color(label, rows[i].destructive ? lv_color_make(255, 120, 120) : accent_lv_color(), 0);
-        lv_obj_set_style_text_font(label, ui_size_20, 0);
-        lv_obj_center(label);
-    }
+    song_context_menu_popup = build_menu_popup(rows, (int) (sizeof(rows) / sizeof(rows[0])),
+                                                song_context_menu_popup_backdrop_cb,
+                                                &song_context_menu_popup_backdrop);
 }
 
 static void open_lyrics_screen(void); /* defined alongside build_lyrics_screen() below */
@@ -7463,11 +7509,24 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * this is one of the handful of labels that needs the non-Latin
      * fallback but was never otherwise styled. */
     lv_obj_set_style_text_font(song_title_label, &app_font_16, 0);
+    /* Real-device bug report: a long song title just grew title_row's flex
+     * child past the favorite icon instead of stopping at it -- unlike
+     * row_label_enable_marquee()'s usual callers (list rows), this label had
+     * no bounded width for LVGL's circular long mode to scroll within, so it
+     * rendered at its full unclipped text width and overlapped the icon
+     * next to it. flex_grow gives it exactly the row's remaining width
+     * (title_row's width minus the icon), same as any other flex-grow
+     * child, which is all LV_LABEL_LONG_SCROLL_CIRCULAR needs to know it
+     * overflows and should marquee -- same shared style/2s pause as every
+     * other scrolling row label in the app (row_marquee_anim). */
+    lv_obj_set_flex_grow(song_title_label, 1);
+    row_label_enable_marquee(song_title_label);
 
     favorite_icon = lv_image_create(title_row);
     lv_image_set_src(favorite_icon, asset_path("playing_plane/collect_out.png"));
     lv_obj_add_flag(favorite_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(favorite_icon, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_style(favorite_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
 
     /* Artist row: artist (left) + format/quality badge (right). */
     lv_obj_t * artist_row = lv_obj_create(overlay);
@@ -7508,12 +7567,38 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * bg_image_recolor, not just bg_color. */
     lv_obj_add_style(progress_slider, &style_accent, LV_PART_INDICATOR);
     lv_obj_add_style(progress_slider, &style_accent, LV_PART_KNOB);
+    /* Same class of gray-sliver bug as volume_popup_track/quick_drawer_
+     * brightness_track (see volume_popup_track's own comment for what it
+     * actually is and why this radius alone doesn't fix it) -- but NOT
+     * masked with mask_slider_knob_overshoot() the way those two are: this
+     * slider sits over the player screen's own blurred album art, not a
+     * flat known color, so an opaque patch here would itself look like a
+     * visible defect. Left as a known, accepted gap for now. */
+    lv_obj_set_style_radius(progress_slider, 0, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_width(progress_slider, 30, LV_PART_KNOB);
     lv_obj_set_style_height(progress_slider, 30, LV_PART_KNOB);
+    /* Real-device bug report: seeking (swiping across the bar) sometimes
+     * triggered the app-wide back-swipe gesture instead. Root cause: unlike
+     * every other draggable slider in this file (screen_timeout_slider,
+     * startup_volume_slider, sleep_timer_slider, idle_shutdown_slider, ...,
+     * all of which call this with 20), this 12px-tall bar never widened its
+     * touch target past LVGL's tiny built-in default (LV_DPX(8), set in
+     * lv_slider_constructor). A touch landing just off that thin band missed
+     * the slider's hit-test area entirely and fell through to `overlay`
+     * behind it, which -- unlike the slider -- does carry
+     * LV_OBJ_FLAG_GESTURE_BUBBLE (see enable_gesture_bubble_recursive()), so
+     * the drag bubbled up to screen_gesture_event_cb() as a real navigation
+     * swipe. */
+    lv_obj_set_ext_click_area(progress_slider, 20);
     lv_obj_add_event_cb(progress_slider, progress_slider_event_cb, LV_EVENT_ALL, NULL);
+    /* See screen_gesture_event_cb()'s own comment -- covers a press that
+     * lands just off the slider's own hit-test box (still within
+     * ext_click_area's reach for a tap, but a fast swipe's start point can
+     * land outside even that) from being hijacked into a back-swipe. */
+    register_swipe_dead_zone(progress_slider);
 
     lv_obj_t * time_row = lv_obj_create(overlay);
     lv_obj_set_size(time_row, lv_pct(100), LV_SIZE_CONTENT);
@@ -7558,6 +7643,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_flag(order_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(order_icon, 16);
     lv_obj_add_event_cb(order_icon, order_icon_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_style(order_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
 
     lv_obj_t * prev_btn = lv_image_create(controls_row);
     lv_image_set_src(prev_btn, asset_path("playing_plane/btn_prev.png"));
@@ -7573,6 +7659,13 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_image_set_src(play_btn, asset_path("playing_plane/btn_play.png"));
     lv_obj_add_flag(play_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(play_btn, play_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    /* Not transport_btn_ctx_t's fixed normal/pressed asset-swap -- this
+     * icon's own "normal" image already alternates between btn_play.png and
+     * btn_pause.png depending on playback state (set_play_button_state()),
+     * so a fixed pressed_path would flash the wrong artwork half the time.
+     * icon_press_style dims whichever of the two is currently showing
+     * instead. */
+    lv_obj_add_style(play_btn, &icon_press_style, LV_STATE_PRESSED);
 
     lv_obj_t * next_btn = lv_image_create(controls_row);
     lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
@@ -7591,6 +7684,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_flag(more_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(more_icon, 16);
     lv_obj_add_event_cb(more_icon, more_icon_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_style(more_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
 
     /* Volume is controlled via hardware buttons (see update_timer_cb) and,
      * per the real device, shown only as a transient overlay rather than a
@@ -9186,6 +9280,11 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_obj_align(group_songs_list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(group_songs_list, 0, 0);
     lv_obj_set_style_border_width(group_songs_list, 0, 0);
+    /* Real-device bug report: same root cause as build_compact_list_widget()'s
+     * own fix (see that function's comment) -- rows here (Artist/Album
+     * Artist's own song/album drill-down list) were shifted right, clipped
+     * against the screen edge with a gap on the left. */
+    lv_obj_set_style_pad_all(group_songs_list, 0, 0);
     lv_obj_set_scroll_dir(group_songs_list, LV_DIR_VER); /* see build_icon_grid_screen's comment */
     lv_obj_set_flex_flow(group_songs_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(group_songs_list, 4, 0);
@@ -10437,6 +10536,13 @@ static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(list, 0, 0);
     lv_obj_set_style_border_width(list, 0, 0);
+    /* Real-device bug report: same root cause as build_compact_list_widget()/
+     * build_pill_list_screen()'s own fix (see build_compact_list_widget()'s
+     * comment) -- every screen built through this shared function (resume
+     * mode, font size, USB mode, play/pause button mode, sleep timer,
+     * startup volume, the timezone city list, ...) had its rows shifted
+     * right, clipped against the screen edge with a gap on the left. */
+    lv_obj_set_style_pad_all(list, 0, 0);
     lv_obj_set_scroll_dir(list, LV_DIR_VER); /* see build_icon_grid_screen's comment in screen_builders.c */
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
@@ -13630,149 +13736,21 @@ static void show_sd_mount_failed_popup(void) {
 }
 
 static void build_sd_mount_failed_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    sd_mount_failed_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(sd_mount_failed_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(sd_mount_failed_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(sd_mount_failed_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(sd_mount_failed_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(sd_mount_failed_popup_backdrop, sd_mount_failed_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    sd_mount_failed_popup = lv_obj_create(top);
-    lv_obj_set_size(sd_mount_failed_popup, 400, 300);
-    lv_obj_align(sd_mount_failed_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(sd_mount_failed_popup, 16, 0);
-    lv_obj_add_style(sd_mount_failed_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(sd_mount_failed_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(sd_mount_failed_popup, 0, 0);
-    lv_obj_remove_flag(sd_mount_failed_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(sd_mount_failed_popup, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t * title = lv_label_create(sd_mount_failed_popup);
-    lv_obj_set_width(title, lv_pct(90));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_22, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-    lv_label_set_text(title, "SD card couldn't be read");
-
-    lv_obj_t * body = lv_label_create(sd_mount_failed_popup);
-    lv_obj_set_width(body, lv_pct(90));
-    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(body, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(body, ui_size_16, 0);
-    lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 58);
-    lv_label_set_text(body,
+    sd_mount_failed_popup = build_confirm_popup(
+        "SD card couldn't be read", LV_LABEL_LONG_WRAP, NULL,
         "It may have no partition table or a file system this player can't use. "
-        "Formatting will erase it and set it up for this player.");
-
-    lv_obj_t * format_row = lv_obj_create(sd_mount_failed_popup);
-    lv_obj_set_size(format_row, lv_pct(90), 56);
-    lv_obj_align(format_row, LV_ALIGN_TOP_MID, 0, 156);
-    lv_obj_set_style_radius(format_row, 12, 0);
-    lv_obj_set_style_bg_opa(format_row, 0, 0);
-    lv_obj_set_style_border_width(format_row, 0, 0);
-    lv_obj_remove_flag(format_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(format_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(format_row, sd_mount_failed_format_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * format_label = lv_label_create(format_row);
-    lv_label_set_text(format_label, "Format SD Card");
-    lv_obj_set_style_text_color(format_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(format_label, ui_size_20, 0);
-    lv_obj_center(format_label);
-
-    lv_obj_t * dismiss_row = lv_obj_create(sd_mount_failed_popup);
-    lv_obj_set_size(dismiss_row, lv_pct(90), 56);
-    lv_obj_align(dismiss_row, LV_ALIGN_TOP_MID, 0, 222);
-    lv_obj_set_style_radius(dismiss_row, 12, 0);
-    lv_obj_set_style_bg_opa(dismiss_row, 0, 0);
-    lv_obj_set_style_border_width(dismiss_row, 0, 0);
-    lv_obj_remove_flag(dismiss_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(dismiss_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(dismiss_row, sd_mount_failed_dismiss_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * dismiss_label = lv_label_create(dismiss_row);
-    lv_label_set_text(dismiss_label, "Dismiss");
-    lv_obj_set_style_text_color(dismiss_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(dismiss_label, ui_size_20, 0);
-    lv_obj_center(dismiss_label);
+        "Formatting will erase it and set it up for this player.",
+        "Format SD Card", lv_color_make(255, 120, 120), sd_mount_failed_format_btn_cb, NULL, "Dismiss",
+        accent_lv_color(), sd_mount_failed_dismiss_cb, NULL, sd_mount_failed_popup_backdrop_cb,
+        &sd_mount_failed_popup_backdrop);
 }
 
 static void build_sd_format_confirm_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    sd_format_confirm_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(sd_format_confirm_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(sd_format_confirm_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(sd_format_confirm_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(sd_format_confirm_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(sd_format_confirm_popup_backdrop, sd_format_confirm_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    sd_format_confirm_popup = lv_obj_create(top);
-    lv_obj_set_size(sd_format_confirm_popup, 400, 260);
-    lv_obj_align(sd_format_confirm_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(sd_format_confirm_popup, 16, 0);
-    lv_obj_add_style(sd_format_confirm_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(sd_format_confirm_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(sd_format_confirm_popup, 0, 0);
-    lv_obj_remove_flag(sd_format_confirm_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(sd_format_confirm_popup, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t * title = lv_label_create(sd_format_confirm_popup);
-    lv_obj_set_width(title, lv_pct(90));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_22, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-    lv_label_set_text(title, "Erase and format SD card?");
-
-    lv_obj_t * body = lv_label_create(sd_format_confirm_popup);
-    lv_obj_set_width(body, lv_pct(90));
-    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(body, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(body, ui_size_16, 0);
-    lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 58);
-    lv_label_set_text(body, "This permanently deletes everything on the card. This cannot be undone.");
-
-    lv_obj_t * confirm_row = lv_obj_create(sd_format_confirm_popup);
-    lv_obj_set_size(confirm_row, lv_pct(90), 56);
-    lv_obj_align(confirm_row, LV_ALIGN_TOP_MID, 0, 116);
-    lv_obj_set_style_radius(confirm_row, 12, 0);
-    lv_obj_set_style_bg_opa(confirm_row, 0, 0);
-    lv_obj_set_style_border_width(confirm_row, 0, 0);
-    lv_obj_remove_flag(confirm_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(confirm_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(confirm_row, sd_format_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * confirm_label = lv_label_create(confirm_row);
-    lv_label_set_text(confirm_label, "Format");
-    lv_obj_set_style_text_color(confirm_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(confirm_label, ui_size_20, 0);
-    lv_obj_center(confirm_label);
-
-    lv_obj_t * cancel_row = lv_obj_create(sd_format_confirm_popup);
-    lv_obj_set_size(cancel_row, lv_pct(90), 56);
-    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 182);
-    lv_obj_set_style_radius(cancel_row, 12, 0);
-    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
-    lv_obj_set_style_border_width(cancel_row, 0, 0);
-    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(cancel_row, sd_format_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * cancel_label = lv_label_create(cancel_row);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
-    lv_obj_center(cancel_label);
+    sd_format_confirm_popup = build_confirm_popup(
+        "Erase and format SD card?", LV_LABEL_LONG_WRAP, NULL,
+        "This permanently deletes everything on the card. This cannot be undone.", "Format",
+        lv_color_make(255, 120, 120), sd_format_confirm_cb, NULL, "Cancel", accent_lv_color(), sd_format_cancel_cb,
+        NULL, sd_format_confirm_popup_backdrop_cb, &sd_format_confirm_popup_backdrop);
 }
 
 /* Power-off countdown -- shown when hw_buttons_consume_power_long_press()
@@ -13942,7 +13920,7 @@ static lv_obj_t * build_music_screen(void) {
      * genre.png/genre_s.png here since Genres no longer has a tile of its
      * own to need it. */
     items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
-    lv_obj_t * scr = build_icon_grid_screen("Music", generic_back_cb, items, 6, 100);
+    lv_obj_t * scr = build_icon_grid_screen("Music", generic_back_cb, items, 6, 100, false);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -13990,7 +13968,7 @@ static lv_obj_t * build_stream_media_screen(void) {
         };
     }
 
-    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100);
+    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100, false);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -14278,8 +14256,6 @@ static void poll_wifi_forget(void) {
 static lv_obj_t * wifi_action_popup;
 static lv_obj_t * wifi_action_popup_backdrop;
 static lv_obj_t * wifi_action_popup_title;
-static lv_obj_t * wifi_action_connect_row;
-static lv_obj_t * wifi_action_forget_row;
 static int wifi_action_popup_network_index = -1;
 
 static void hide_wifi_action_popup(void) {
@@ -14319,65 +14295,10 @@ static void wifi_action_forget_cb(lv_event_t * e) {
 }
 
 static void build_wifi_action_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    wifi_action_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(wifi_action_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(wifi_action_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(wifi_action_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(wifi_action_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(wifi_action_popup_backdrop, wifi_action_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    wifi_action_popup = lv_obj_create(top);
-    lv_obj_set_size(wifi_action_popup, 400, 220);
-    lv_obj_align(wifi_action_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(wifi_action_popup, 16, 0);
-    lv_obj_add_style(wifi_action_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(wifi_action_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(wifi_action_popup, 0, 0);
-    lv_obj_remove_flag(wifi_action_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(wifi_action_popup, LV_OBJ_FLAG_HIDDEN);
-
-    wifi_action_popup_title = lv_label_create(wifi_action_popup);
-    lv_obj_set_width(wifi_action_popup_title, lv_pct(90));
-    lv_label_set_long_mode(wifi_action_popup_title, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(wifi_action_popup_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(wifi_action_popup_title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(wifi_action_popup_title, ui_size_22, 0);
-    lv_obj_align(wifi_action_popup_title, LV_ALIGN_TOP_MID, 0, 20);
-
-    wifi_action_connect_row = lv_obj_create(wifi_action_popup);
-    lv_obj_set_size(wifi_action_connect_row, lv_pct(90), 56);
-    lv_obj_set_style_radius(wifi_action_connect_row, 12, 0);
-    lv_obj_set_style_bg_opa(wifi_action_connect_row, 0, 0);
-    lv_obj_set_style_border_width(wifi_action_connect_row, 0, 0);
-    lv_obj_remove_flag(wifi_action_connect_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(wifi_action_connect_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(wifi_action_connect_row, wifi_action_connect_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_align(wifi_action_connect_row, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_t * connect_label = lv_label_create(wifi_action_connect_row);
-    lv_label_set_text(connect_label, "Connect");
-    lv_obj_set_style_text_color(connect_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(connect_label, ui_size_20, 0);
-    lv_obj_center(connect_label);
-
-    wifi_action_forget_row = lv_obj_create(wifi_action_popup);
-    lv_obj_set_size(wifi_action_forget_row, lv_pct(90), 56);
-    lv_obj_set_style_radius(wifi_action_forget_row, 12, 0);
-    lv_obj_set_style_bg_opa(wifi_action_forget_row, 0, 0);
-    lv_obj_set_style_border_width(wifi_action_forget_row, 0, 0);
-    lv_obj_remove_flag(wifi_action_forget_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(wifi_action_forget_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(wifi_action_forget_row, wifi_action_forget_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_align(wifi_action_forget_row, LV_ALIGN_TOP_MID, 0, 136);
-    lv_obj_t * forget_label = lv_label_create(wifi_action_forget_row);
-    lv_label_set_text(forget_label, "Forget");
-    lv_obj_set_style_text_color(forget_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(forget_label, ui_size_20, 0);
-    lv_obj_center(forget_label);
+    wifi_action_popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &wifi_action_popup_title, NULL, "Connect",
+                                             accent_lv_color(), wifi_action_connect_cb, NULL, "Forget",
+                                             lv_color_make(255, 120, 120), wifi_action_forget_cb, NULL,
+                                             wifi_action_popup_backdrop_cb, &wifi_action_popup_backdrop);
 }
 
 static void show_wifi_action_popup(int index) {
@@ -14836,63 +14757,10 @@ static void bt_action_forget_cb(lv_event_t * e) {
 }
 
 static void build_bt_action_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    bt_action_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(bt_action_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(bt_action_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(bt_action_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(bt_action_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(bt_action_popup_backdrop, bt_action_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    bt_action_popup = lv_obj_create(top);
-    lv_obj_set_size(bt_action_popup, 400, 220);
-    lv_obj_align(bt_action_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(bt_action_popup, 16, 0);
-    lv_obj_add_style(bt_action_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(bt_action_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(bt_action_popup, 0, 0);
-    lv_obj_remove_flag(bt_action_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(bt_action_popup, LV_OBJ_FLAG_HIDDEN);
-
-    bt_action_popup_title = lv_label_create(bt_action_popup);
-    lv_obj_set_width(bt_action_popup_title, lv_pct(90));
-    lv_label_set_long_mode(bt_action_popup_title, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(bt_action_popup_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(bt_action_popup_title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(bt_action_popup_title, ui_size_22, 0);
-    lv_obj_align(bt_action_popup_title, LV_ALIGN_TOP_MID, 0, 20);
-
-    bt_action_connect_row = lv_obj_create(bt_action_popup);
-    lv_obj_set_size(bt_action_connect_row, lv_pct(90), 56);
-    lv_obj_set_style_radius(bt_action_connect_row, 12, 0);
-    lv_obj_set_style_bg_opa(bt_action_connect_row, 0, 0);
-    lv_obj_set_style_border_width(bt_action_connect_row, 0, 0);
-    lv_obj_remove_flag(bt_action_connect_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(bt_action_connect_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(bt_action_connect_row, bt_action_connect_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * connect_label = lv_label_create(bt_action_connect_row);
-    lv_label_set_text(connect_label, "Connect");
-    lv_obj_set_style_text_color(connect_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(connect_label, ui_size_20, 0);
-    lv_obj_center(connect_label);
-
-    bt_action_forget_row = lv_obj_create(bt_action_popup);
-    lv_obj_set_size(bt_action_forget_row, lv_pct(90), 56);
-    lv_obj_set_style_radius(bt_action_forget_row, 12, 0);
-    lv_obj_set_style_bg_opa(bt_action_forget_row, 0, 0);
-    lv_obj_set_style_border_width(bt_action_forget_row, 0, 0);
-    lv_obj_remove_flag(bt_action_forget_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(bt_action_forget_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(bt_action_forget_row, bt_action_forget_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * forget_label = lv_label_create(bt_action_forget_row);
-    lv_label_set_text(forget_label, "Forget");
-    lv_obj_set_style_text_color(forget_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(forget_label, ui_size_20, 0);
-    lv_obj_center(forget_label);
+    bt_action_popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &bt_action_popup_title, NULL, "Connect",
+                                           accent_lv_color(), bt_action_connect_cb, &bt_action_connect_row, "Forget",
+                                           lv_color_make(255, 120, 120), bt_action_forget_cb, &bt_action_forget_row,
+                                           bt_action_popup_backdrop_cb, &bt_action_popup_backdrop);
 }
 
 static void show_bt_action_popup(int index) {
@@ -14907,13 +14775,13 @@ static void show_bt_action_popup(int index) {
      * on a popup with neither action available). */
     bool show_connect = !dev->connected;
     bool show_forget = dev->paired || dev->connected;
+    /* No manual reposition needed -- bt_action_popup's rows are flex-column
+     * children now (build_confirm_popup()), so hiding one lets the other
+     * reflow up to take its place automatically. */
     if (show_connect) lv_obj_remove_flag(bt_action_connect_row, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(bt_action_connect_row, LV_OBJ_FLAG_HIDDEN);
     if (show_forget) lv_obj_remove_flag(bt_action_forget_row, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(bt_action_forget_row, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_align(bt_action_connect_row, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_align(bt_action_forget_row, LV_ALIGN_TOP_MID, 0, show_connect ? 136 : 70);
 
     lv_obj_remove_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(bt_action_popup, LV_OBJ_FLAG_HIDDEN);
@@ -15210,66 +15078,10 @@ static void bt_dac_overlay_back_cb(lv_event_t * e) {
 }
 
 static void build_bt_dac_leave_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    bt_dac_leave_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(bt_dac_leave_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(bt_dac_leave_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(bt_dac_leave_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(bt_dac_leave_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(bt_dac_leave_popup_backdrop, bt_dac_leave_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    bt_dac_leave_popup = lv_obj_create(top);
-    lv_obj_set_size(bt_dac_leave_popup, 400, 220);
-    lv_obj_align(bt_dac_leave_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(bt_dac_leave_popup, 16, 0);
-    lv_obj_add_style(bt_dac_leave_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(bt_dac_leave_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(bt_dac_leave_popup, 0, 0);
-    lv_obj_remove_flag(bt_dac_leave_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(bt_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t * title = lv_label_create(bt_dac_leave_popup);
-    lv_obj_set_width(title, lv_pct(90));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_22, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-    lv_label_set_text(title, "Leave Bluetooth DAC mode?");
-
-    lv_obj_t * leave_row = lv_obj_create(bt_dac_leave_popup);
-    lv_obj_set_size(leave_row, lv_pct(90), 56);
-    lv_obj_align(leave_row, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_set_style_radius(leave_row, 12, 0);
-    lv_obj_set_style_bg_opa(leave_row, 0, 0);
-    lv_obj_set_style_border_width(leave_row, 0, 0);
-    lv_obj_remove_flag(leave_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(leave_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(leave_row, bt_dac_leave_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * leave_label = lv_label_create(leave_row);
-    lv_label_set_text(leave_label, "Leave");
-    lv_obj_set_style_text_color(leave_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(leave_label, ui_size_20, 0);
-    lv_obj_center(leave_label);
-
-    lv_obj_t * cancel_row = lv_obj_create(bt_dac_leave_popup);
-    lv_obj_set_size(cancel_row, lv_pct(90), 56);
-    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
-    lv_obj_set_style_radius(cancel_row, 12, 0);
-    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
-    lv_obj_set_style_border_width(cancel_row, 0, 0);
-    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(cancel_row, bt_dac_leave_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * cancel_label = lv_label_create(cancel_row);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
-    lv_obj_center(cancel_label);
+    bt_dac_leave_popup = build_confirm_popup("Leave Bluetooth DAC mode?", LV_LABEL_LONG_WRAP, NULL, NULL, "Leave",
+                                              lv_color_make(255, 120, 120), bt_dac_leave_confirm_cb, NULL, "Cancel",
+                                              accent_lv_color(), bt_dac_leave_cancel_cb, NULL,
+                                              bt_dac_leave_popup_backdrop_cb, &bt_dac_leave_popup_backdrop);
 }
 
 static lv_obj_t * build_bt_dac_overlay_screen(void) {
@@ -15787,66 +15599,10 @@ static void usb_dac_overlay_back_cb(lv_event_t * e) {
 }
 
 static void build_usb_dac_leave_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    usb_dac_leave_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(usb_dac_leave_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(usb_dac_leave_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(usb_dac_leave_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(usb_dac_leave_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(usb_dac_leave_popup_backdrop, usb_dac_leave_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    usb_dac_leave_popup = lv_obj_create(top);
-    lv_obj_set_size(usb_dac_leave_popup, 400, 220);
-    lv_obj_align(usb_dac_leave_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(usb_dac_leave_popup, 16, 0);
-    lv_obj_add_style(usb_dac_leave_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(usb_dac_leave_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(usb_dac_leave_popup, 0, 0);
-    lv_obj_remove_flag(usb_dac_leave_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(usb_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t * title = lv_label_create(usb_dac_leave_popup);
-    lv_obj_set_width(title, lv_pct(90));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_22, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-    lv_label_set_text(title, "Leave USB DAC mode?");
-
-    lv_obj_t * leave_row = lv_obj_create(usb_dac_leave_popup);
-    lv_obj_set_size(leave_row, lv_pct(90), 56);
-    lv_obj_align(leave_row, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_set_style_radius(leave_row, 12, 0);
-    lv_obj_set_style_bg_opa(leave_row, 0, 0);
-    lv_obj_set_style_border_width(leave_row, 0, 0);
-    lv_obj_remove_flag(leave_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(leave_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(leave_row, usb_dac_leave_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * leave_label = lv_label_create(leave_row);
-    lv_label_set_text(leave_label, "Leave");
-    lv_obj_set_style_text_color(leave_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(leave_label, ui_size_20, 0);
-    lv_obj_center(leave_label);
-
-    lv_obj_t * cancel_row = lv_obj_create(usb_dac_leave_popup);
-    lv_obj_set_size(cancel_row, lv_pct(90), 56);
-    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
-    lv_obj_set_style_radius(cancel_row, 12, 0);
-    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
-    lv_obj_set_style_border_width(cancel_row, 0, 0);
-    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(cancel_row, usb_dac_leave_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * cancel_label = lv_label_create(cancel_row);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
-    lv_obj_center(cancel_label);
+    usb_dac_leave_popup = build_confirm_popup("Leave USB DAC mode?", LV_LABEL_LONG_WRAP, NULL, NULL, "Leave",
+                                               lv_color_make(255, 120, 120), usb_dac_leave_confirm_cb, NULL, "Cancel",
+                                               accent_lv_color(), usb_dac_leave_cancel_cb, NULL,
+                                               usb_dac_leave_popup_backdrop_cb, &usb_dac_leave_popup_backdrop);
 }
 
 static lv_obj_t * build_usb_dac_overlay_screen(void) {
@@ -16080,67 +15836,185 @@ static void import_rescan_confirm_cb(lv_event_t * e) {
     start_library_rescan();
 }
 
-static void build_import_rescan_popup(void) {
+/* Shared "are you sure?" 2-button confirmation popup shape -- backdrop +
+ * centered card + wrapped title + two full-width buttons. Real-device bug
+ * report: this exact shape was independently hand-duplicated (fixed 400-
+ * 420px-wide, ~220px-tall popup, title/buttons at fixed pixel y-offsets)
+ * across roughly 15 different popups in this file, all tuned for the
+ * small/medium font tiers -- BlindMF's much bigger text broke each one
+ * the same way (title/button text overflowing those fixed offsets), first
+ * caught here on the EQ reset and "Update music database?" popups.
+ * LV_SIZE_CONTENT + flex column throughout, same structural fix already
+ * proven on the PEQ screen's own cards, so the popup's height (and the
+ * gap between its title and buttons) follows however tall the rendered
+ * text actually is at whatever tier is active, instead of a number that
+ * only happened to be enough for the original tier. Returns the popup
+ * object and writes the backdrop to *out_backdrop; the caller wires up
+ * its own show/hide functions and owns both objects same as before --
+ * this only replaces how each popup's insides get built, not the
+ * hide/show/backdrop-tap machinery already established per popup. */
+static lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
+                                       lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
+                                       lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
+                                       const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
+                                       lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop) {
     lv_obj_t * top = lv_layer_top();
 
-    import_rescan_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(import_rescan_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(import_rescan_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(import_rescan_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(import_rescan_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(import_rescan_popup_backdrop, import_rescan_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * backdrop = lv_obj_create(top);
+    lv_obj_set_size(backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(backdrop, 0, 0);
+    lv_obj_remove_flag(backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(backdrop, backdrop_cb, LV_EVENT_CLICKED, NULL);
 
-    import_rescan_popup = lv_obj_create(top);
-    lv_obj_set_size(import_rescan_popup, 420, 220);
-    lv_obj_align(import_rescan_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(import_rescan_popup, 16, 0);
-    lv_obj_add_style(import_rescan_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(import_rescan_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(import_rescan_popup, 0, 0);
-    lv_obj_remove_flag(import_rescan_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(import_rescan_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t * popup = lv_obj_create(top);
+    lv_obj_set_width(popup, lv_pct(84));
+    lv_obj_set_height(popup, LV_SIZE_CONTENT);
+    lv_obj_align(popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_add_style(popup, &style_theme_card_bg, 0);
+    lv_obj_set_style_bg_opa(popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(popup, 0, 0);
+    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_style_pad_row(popup, 14, 0);
+    lv_obj_remove_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_t * title = lv_label_create(import_rescan_popup);
-    lv_label_set_text(title, "Update music database?");
-    lv_obj_set_width(title, lv_pct(90));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+    lv_obj_t * title = lv_label_create(popup);
+    lv_label_set_text(title, title_text);
+    lv_obj_set_width(title, lv_pct(100));
+    lv_label_set_long_mode(title, title_long_mode);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_22, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    if (out_title) *out_title = title;
 
-    lv_obj_t * update_row = lv_obj_create(import_rescan_popup);
-    lv_obj_set_size(update_row, lv_pct(90), 56);
-    lv_obj_align(update_row, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_set_style_radius(update_row, 12, 0);
-    lv_obj_set_style_bg_opa(update_row, 0, 0);
-    lv_obj_set_style_border_width(update_row, 0, 0);
-    lv_obj_remove_flag(update_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(update_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(update_row, import_rescan_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * update_label = lv_label_create(update_row);
-    lv_label_set_text(update_label, "Update");
-    lv_obj_set_style_text_color(update_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(update_label, ui_size_20, 0);
-    lv_obj_center(update_label);
+    if (body_text) {
+        lv_obj_t * body = lv_label_create(popup);
+        lv_label_set_text(body, body_text);
+        lv_obj_set_width(body, lv_pct(100));
+        lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_add_style(body, &style_theme_text_muted, 0);
+        lv_obj_set_style_text_font(body, ui_size_16, 0);
+    }
 
-    lv_obj_t * not_now_row = lv_obj_create(import_rescan_popup);
-    lv_obj_set_size(not_now_row, lv_pct(90), 56);
-    lv_obj_align(not_now_row, LV_ALIGN_TOP_MID, 0, 136);
-    lv_obj_set_style_radius(not_now_row, 12, 0);
-    lv_obj_set_style_bg_opa(not_now_row, 0, 0);
-    lv_obj_set_style_border_width(not_now_row, 0, 0);
-    lv_obj_remove_flag(not_now_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(not_now_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(not_now_row, import_rescan_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * not_now_label = lv_label_create(not_now_row);
-    lv_label_set_text(not_now_label, "Not now");
-    lv_obj_add_style(not_now_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(not_now_label, ui_size_20, 0);
-    lv_obj_center(not_now_label);
+    lv_obj_t * confirm_row = lv_obj_create(popup);
+    lv_obj_set_width(confirm_row, lv_pct(100));
+    lv_obj_set_height(confirm_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(confirm_row, 14, 0);
+    lv_obj_set_style_radius(confirm_row, 12, 0);
+    lv_obj_set_style_bg_opa(confirm_row, 0, 0);
+    lv_obj_set_style_border_width(confirm_row, 0, 0);
+    lv_obj_remove_flag(confirm_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(confirm_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(confirm_row, confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * confirm_label = lv_label_create(confirm_row);
+    lv_label_set_text(confirm_label, confirm_text);
+    lv_obj_set_style_text_color(confirm_label, confirm_color, 0);
+    lv_obj_set_style_text_font(confirm_label, ui_size_20, 0);
+    lv_obj_center(confirm_label);
+    if (out_confirm_row) *out_confirm_row = confirm_row;
+
+    lv_obj_t * cancel_row = lv_obj_create(popup);
+    lv_obj_set_width(cancel_row, lv_pct(100));
+    lv_obj_set_height(cancel_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(cancel_row, 14, 0);
+    lv_obj_set_style_radius(cancel_row, 12, 0);
+    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
+    lv_obj_set_style_border_width(cancel_row, 0, 0);
+    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(cancel_row, cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * cancel_label = lv_label_create(cancel_row);
+    lv_label_set_text(cancel_label, cancel_text);
+    lv_obj_set_style_text_color(cancel_label, cancel_color, 0);
+    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_center(cancel_label);
+    if (out_cancel_row) *out_cancel_row = cancel_row;
+
+    *out_backdrop = backdrop;
+    return popup;
+}
+
+/* Shared N-row action-menu popup shape -- backdrop + centered card + a
+ * column of tappable text rows (e.g. "List"/"Queue"/"Add to Playlist"/
+ * "EQ"/"Delete"). Same real-device bug and same structural fix as
+ * build_confirm_popup() just above (LV_SIZE_CONTENT/flex column instead of
+ * a fixed-pixel box with rows at fixed y-offsets, tuned only for the
+ * small/medium font tiers) -- this is the OTHER hand-duplicated popup
+ * shape in this file, used by menus rather than yes/no confirmations.
+ * Returns the popup object and writes the backdrop to *out_backdrop, same
+ * ownership split as build_confirm_popup(). */
+static lv_obj_t * build_menu_popup(const menu_popup_row_t * rows, int row_count, lv_event_cb_t backdrop_cb,
+                                    lv_obj_t ** out_backdrop) {
+    lv_obj_t * top = lv_layer_top();
+
+    lv_obj_t * backdrop = lv_obj_create(top);
+    lv_obj_set_size(backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(backdrop, 0, 0);
+    lv_obj_remove_flag(backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(backdrop, backdrop_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t * popup = lv_obj_create(top);
+    lv_obj_set_width(popup, lv_pct(84));
+    lv_obj_set_height(popup, LV_SIZE_CONTENT);
+    lv_obj_align(popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_add_style(popup, &style_theme_card_bg, 0);
+    lv_obj_set_style_bg_opa(popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(popup, 0, 0);
+    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_remove_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    for (int i = 0; i < row_count; i++) {
+        lv_obj_t * row = lv_obj_create(popup);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(row, 14, 0);
+        lv_obj_set_style_radius(row, 12, 0);
+        lv_obj_set_style_bg_opa(row, 0, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, rows[i].cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t * label = lv_label_create(row);
+        lv_label_set_text(label, rows[i].label);
+        lv_obj_set_style_text_color(label, rows[i].destructive ? lv_color_make(255, 120, 120) : accent_lv_color(), 0);
+        lv_obj_set_style_text_font(label, ui_size_20, 0);
+        lv_obj_center(label);
+    }
+
+    *out_backdrop = backdrop;
+    return popup;
+}
+
+static void build_import_rescan_popup(void) {
+    /* lv_color_make(160,160,160) matches style_theme_text_muted's own
+     * default (screen_builders.c) verbatim -- a raw color snapshot here
+     * rather than lv_obj_add_style(&style_theme_text_muted), same
+     * build-time-snapshot tradeoff the accent-colored "Update" button
+     * right next to it already had before this popup was ever migrated to
+     * build_confirm_popup() (accent_lv_color() below is also just read
+     * once, at build time, not a live-tracking style). */
+    import_rescan_popup = build_confirm_popup("Update music database?", LV_LABEL_LONG_WRAP, NULL, NULL, "Update",
+                                               accent_lv_color(), import_rescan_confirm_cb, NULL, "Not now",
+                                               lv_color_make(160, 160, 160), import_rescan_cancel_cb, NULL,
+                                               import_rescan_popup_backdrop_cb, &import_rescan_popup_backdrop);
 }
 
 /* Real-device feedback: leaving Import via Wi-Fi used to just hang -- no
@@ -16610,10 +16484,21 @@ static lv_obj_t * build_wireless_screen(void) {
      * against HiBy's own closed-source app). This is that plan's own Phase 1
      * (read-only Now Playing web page) now wired up -- see
      * build_remote_control_screen(). */
-    items[4] =
-        (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "Remote Control", remote_control_tile_cb, NULL };
-    items[5] = (icon_grid_item_t){ "wireless/via.png", "wireless/via_s.png", "Import via Wi-Fi", import_wifi_tile_cb, NULL };
-    lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6, 120); /* bigger than the shared 100% default -- explicit user request */
+    /* Shortened from "Remote Control"/"Import via Wi-Fi" -- real-device
+     * feedback: the full names overflowed this tile's caption width. The
+     * screens these tiles open keep their own full titles (build_remote_
+     * control_screen()/Import via Wi-Fi's own title label) -- only the grid
+     * caption is shortened. */
+    items[4] = (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "Remote", remote_control_tile_cb, NULL };
+    items[5] = (icon_grid_item_t){ "wireless/via.png", "wireless/via_s.png", "Import", import_wifi_tile_cb, NULL };
+    /* 160: bigger than the shared 100% default -- explicit user request.
+     * Bumped again from an earlier 120 once label_inside_icon (see
+     * build_icon_grid_screen()'s own comment) stopped reserving a separate
+     * below-icon label row, freeing up the room to grow the icon itself
+     * rather than just its surrounding whitespace -- lands at very close to
+     * these assets' own native 212x190 resolution within this screen's
+     * available cell height. */
+    lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6, 160, true);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -17000,65 +16885,10 @@ static void firmware_update_confirm_cb(lv_event_t * e) {
 }
 
 static void build_firmware_update_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    firmware_update_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(firmware_update_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(firmware_update_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(firmware_update_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(firmware_update_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(firmware_update_popup_backdrop, firmware_update_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    firmware_update_popup = lv_obj_create(top);
-    lv_obj_set_size(firmware_update_popup, 420, 260);
-    lv_obj_align(firmware_update_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(firmware_update_popup, 16, 0);
-    lv_obj_add_style(firmware_update_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(firmware_update_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(firmware_update_popup, 0, 0);
-    lv_obj_remove_flag(firmware_update_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(firmware_update_popup, LV_OBJ_FLAG_HIDDEN);
-
-    firmware_update_popup_title = lv_label_create(firmware_update_popup);
-    lv_obj_set_width(firmware_update_popup_title, lv_pct(90));
-    lv_label_set_long_mode(firmware_update_popup_title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(firmware_update_popup_title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(firmware_update_popup_title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(firmware_update_popup_title, ui_size_22, 0);
-    lv_obj_align(firmware_update_popup_title, LV_ALIGN_TOP_MID, 0, 20);
-
-    lv_obj_t * update_row = lv_obj_create(firmware_update_popup);
-    lv_obj_set_size(update_row, lv_pct(90), 56);
-    lv_obj_align(update_row, LV_ALIGN_TOP_MID, 0, 110);
-    lv_obj_set_style_radius(update_row, 12, 0);
-    lv_obj_set_style_bg_opa(update_row, 0, 0);
-    lv_obj_set_style_border_width(update_row, 0, 0);
-    lv_obj_remove_flag(update_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(update_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(update_row, firmware_update_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * update_label = lv_label_create(update_row);
-    lv_label_set_text(update_label, "Update & Reboot");
-    lv_obj_set_style_text_color(update_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(update_label, ui_size_20, 0);
-    lv_obj_center(update_label);
-
-    lv_obj_t * cancel_row = lv_obj_create(firmware_update_popup);
-    lv_obj_set_size(cancel_row, lv_pct(90), 56);
-    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 176);
-    lv_obj_set_style_radius(cancel_row, 12, 0);
-    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
-    lv_obj_set_style_border_width(cancel_row, 0, 0);
-    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(cancel_row, firmware_update_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * cancel_label = lv_label_create(cancel_row);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
-    lv_obj_center(cancel_label);
+    firmware_update_popup = build_confirm_popup(
+        "", LV_LABEL_LONG_WRAP, &firmware_update_popup_title, NULL, "Update & Reboot", lv_color_make(255, 120, 120),
+        firmware_update_confirm_cb, NULL, "Cancel", accent_lv_color(), firmware_update_cancel_cb, NULL,
+        firmware_update_popup_backdrop_cb, &firmware_update_popup_backdrop);
 }
 
 static void firmware_update_row_cb(lv_event_t * e) {
@@ -17252,21 +17082,37 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
+    /* Real-device bug report: at bigger system text sizes, "Turn off screen
+     * automatically" overlapped the switch -- the row was a fixed 50px-tall
+     * box with both children absolute-positioned (label pinned LEFT_MID,
+     * switch pinned RIGHT_MID), so nothing reserved space for the switch or
+     * let the label wrap when its rendered width grew with the font. Same
+     * fix as eq_band_enabled_switch's own row in build_eq_screen(): flex row
+     * + SPACE_BETWEEN with the label given flex_grow so it wraps within
+     * whatever width is left after the switch instead of running under it,
+     * and SIZE_CONTENT height so a wrapped 2nd line still fits. The card
+     * below is repositioned relative to this row's actual (now variable)
+     * bottom edge rather than a hardcoded offset, so it can't end up
+     * overlapping a taller wrapped row either. */
     lv_obj_t * enable_row = lv_obj_create(scr);
-    lv_obj_set_size(enable_row, lv_pct(90), 50);
+    lv_obj_set_width(enable_row, lv_pct(90));
+    lv_obj_set_height(enable_row, LV_SIZE_CONTENT);
     lv_obj_align(enable_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
     lv_obj_set_style_bg_opa(enable_row, 0, 0);
     lv_obj_set_style_border_width(enable_row, 0, 0);
     lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(enable_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(enable_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(enable_row, 12, 0);
 
     lv_obj_t * enable_label = lv_label_create(enable_row);
     lv_label_set_text(enable_label, "Turn off screen automatically");
     lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
-    lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_label_set_long_mode(enable_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(enable_label, 1);
 
     screen_timeout_switch = lv_switch_create(enable_row);
-    lv_obj_align(screen_timeout_switch, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_add_style(screen_timeout_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (current_settings.screen_timeout_enabled) lv_obj_add_state(screen_timeout_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(screen_timeout_switch, screen_timeout_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
@@ -17285,7 +17131,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
      * slider rather than just under it. */
     screen_timeout_slider_card = lv_obj_create(scr);
     lv_obj_set_size(screen_timeout_slider_card, lv_pct(90), 170);
-    lv_obj_align(screen_timeout_slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90);
+    lv_obj_align_to(screen_timeout_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_add_style(screen_timeout_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(screen_timeout_slider_card, 0, 0);
     lv_obj_set_style_radius(screen_timeout_slider_card, 10, 0);
@@ -17390,28 +17236,34 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
+    /* Same real-device overlap bug/fix as build_screen_timeout_screen()'s
+     * own enable_row -- see its comment. */
     lv_obj_t * enable_row = lv_obj_create(scr);
-    lv_obj_set_size(enable_row, lv_pct(90), 50);
+    lv_obj_set_width(enable_row, lv_pct(90));
+    lv_obj_set_height(enable_row, LV_SIZE_CONTENT);
     lv_obj_align(enable_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
     lv_obj_set_style_bg_opa(enable_row, 0, 0);
     lv_obj_set_style_border_width(enable_row, 0, 0);
     lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(enable_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(enable_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(enable_row, 12, 0);
 
     lv_obj_t * enable_label = lv_label_create(enable_row);
     lv_label_set_text(enable_label, "Launch at a fixed volume");
     lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
-    lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_label_set_long_mode(enable_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(enable_label, 1);
 
     startup_volume_switch = lv_switch_create(enable_row);
-    lv_obj_align(startup_volume_switch, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_add_style(startup_volume_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (current_settings.startup_volume_fixed_enabled) lv_obj_add_state(startup_volume_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(startup_volume_switch, startup_volume_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     startup_volume_slider_card = lv_obj_create(scr);
     lv_obj_set_size(startup_volume_slider_card, lv_pct(90), 170);
-    lv_obj_align(startup_volume_slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90);
+    lv_obj_align_to(startup_volume_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_add_style(startup_volume_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(startup_volume_slider_card, 0, 0);
     lv_obj_set_style_radius(startup_volume_slider_card, 10, 0);
@@ -17638,21 +17490,27 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, ui_size_28, 0);
 
+    /* Same real-device overlap bug/fix as build_screen_timeout_screen()'s
+     * own enable_row -- see its comment. */
     lv_obj_t * enable_row = lv_obj_create(scr);
-    lv_obj_set_size(enable_row, lv_pct(90), 50);
+    lv_obj_set_width(enable_row, lv_pct(90));
+    lv_obj_set_height(enable_row, LV_SIZE_CONTENT);
     lv_obj_align(enable_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
     lv_obj_set_style_bg_opa(enable_row, 0, 0);
     lv_obj_set_style_border_width(enable_row, 0, 0);
     lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(enable_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(enable_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(enable_row, 12, 0);
 
     lv_obj_t * enable_label = lv_label_create(enable_row);
     lv_label_set_text(enable_label, "Automatically go idle");
     lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
-    lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_label_set_long_mode(enable_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(enable_label, 1);
 
     idle_shutdown_switch = lv_switch_create(enable_row);
-    lv_obj_align(idle_shutdown_switch, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_add_style(idle_shutdown_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (current_settings.idle_shutdown_enabled) lv_obj_add_state(idle_shutdown_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(idle_shutdown_switch, idle_shutdown_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
@@ -17684,7 +17542,11 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
      * vertical overflow. */
     idle_action_section = lv_obj_create(scr);
     lv_obj_set_size(idle_action_section, lv_pct(100), 292);
-    lv_obj_align(idle_action_section, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90);
+    /* Relative to enable_row's actual (now variable, see its own comment)
+     * bottom edge rather than a hardcoded offset from the title, so a
+     * wrapped 2nd line in enable_row at bigger text sizes can't push this
+     * section up into overlapping it. */
+    lv_obj_align_to(idle_action_section, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_set_style_bg_opa(idle_action_section, 0, 0);
     lv_obj_set_style_border_width(idle_action_section, 0, 0);
     lv_obj_set_style_pad_top(idle_action_section, 0, 0);
@@ -17727,7 +17589,9 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
      * screen title. */
     idle_shutdown_slider_card = lv_obj_create(scr);
     lv_obj_set_size(idle_shutdown_slider_card, lv_pct(90), 200);
-    lv_obj_align(idle_shutdown_slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 90 + 292 + 20);
+    /* Relative to idle_action_section's own (now possibly-shifted, see its
+     * comment) position rather than a hardcoded offset from the title. */
+    lv_obj_align_to(idle_shutdown_slider_card, idle_action_section, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_add_style(idle_shutdown_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(idle_shutdown_slider_card, 0, 0);
     lv_obj_set_style_radius(idle_shutdown_slider_card, 10, 0);
@@ -18040,13 +17904,15 @@ static void plugin_system_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_settings_system_screen(void) {
-    static pill_list_item_t items[4 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "Time Zone", PILL_ACCESSORY_CHEVRON, false, timezone_settings_row_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
-    items[2] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
+    static pill_list_item_t items[5 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
+    items[0] = (pill_list_item_t){ "24-Hour Clock", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.clock_24h, NULL, clock_24h_switch_event_cb, NULL };
+    items[1] = (pill_list_item_t){ "Time Zone", PILL_ACCESSORY_CHEVRON, false, timezone_settings_row_cb, NULL, NULL };
+    items[2] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
 
-    int count = 4;
+    int count = 5;
     int plugin_count = plugin_manager_get_system_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SYSTEM_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -18221,7 +18087,7 @@ static lv_obj_t * build_home_screen(void) {
     /* No back_btn_cb -- this is the true root, nothing to go back to. No
      * title either -- matches the real stock launcher, which has no header
      * text above its icon grid. */
-    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, 6, 100);
+    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, 6, 100, false);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -18237,11 +18103,33 @@ static lv_obj_t * build_home_screen(void) {
 static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_obj_t ** out_value_label,
                                         lv_obj_t ** out_slider, int32_t range_min, int32_t range_max) {
     lv_obj_t * card = lv_obj_create(parent);
-    lv_obj_set_size(card, lv_pct(92), 132);
+    /* 96%, not the original 92% -- real-device bug report: with wider
+     * dropdowns and bigger BlindMF text now needing the room, the old
+     * side margin looked like unused wasted space. Widened here and on
+     * every other row/card in this screen (band_row/type_row/enable_row/
+     * profile_row) for consistency. */
+    lv_obj_set_width(card, lv_pct(96));
+    /* Real-device bug report: at the BlindMF font tier, ui_size_22's much
+     * taller glyphs (34px vs 22px at Small) pushed the value label's own
+     * rendered height past where the slider below it was fixed-positioned
+     * (card height 132px, slider anchored 18px off the card's bottom --
+     * both tuned for the small/medium tiers' shorter label, with no
+     * margin against a bigger one), overlapping them. Flex column with
+     * LV_SIZE_CONTENT height fixes this structurally instead of just
+     * re-tuning the fixed offsets for one more tier: the card's own height
+     * -- and the gap between label and slider -- now follows the label's
+     * actual rendered height at whatever font tier is active, so there's
+     * no fixed number left to go stale if a future tier adds an even
+     * bigger font. */
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
     lv_obj_add_style(card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_set_style_pad_row(card, 10, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
 
     /* Clickable (tap-to-edit, see eq_field_label_click_cb()) -- the whole
      * label area is the tap target, not just the text glyphs, via
@@ -18249,19 +18137,19 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
     lv_obj_t * value_label = lv_label_create(card);
     lv_obj_add_style(value_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(value_label, ui_size_22, 0);
-    /* y=6, not the original 14 -- real-device feedback: the value text
-     * needed more separation from the slider below it, so it moves up a
-     * little rather than the slider moving down (slider stays anchored to
-     * the card bottom). */
-    lv_obj_align(value_label, LV_ALIGN_TOP_LEFT, 14, 6);
     lv_obj_add_flag(value_label, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(value_label, 16);
     lv_obj_add_event_cb(value_label, eq_field_label_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) field);
 
+    /* Real-device bug report: at lv_pct(100), the knob's own radius
+     * overshoots past the slider's nominal track bounds at the min/max
+     * ends -- with the track already flush against the card's 14px
+     * padding, the knob there touched/clipped against the card's own
+     * rounded corners. Inset instead of full-width so the knob has room
+     * to sit fully inside the card at both extremes. */
     lv_obj_t * slider = lv_slider_create(card);
-    lv_obj_set_width(slider, lv_pct(90));
+    lv_obj_set_width(slider, lv_pct(88));
     lv_obj_set_height(slider, 34);
-    lv_obj_align(slider, LV_ALIGN_BOTTOM_MID, 0, -18);
     lv_slider_set_range(slider, range_min, range_max);
     lv_obj_add_style(slider, &style_accent, LV_PART_INDICATOR);
     lv_obj_add_style(slider, &style_accent, LV_PART_KNOB);
@@ -18350,66 +18238,10 @@ static void eq_reset_btn_cb(lv_event_t * e) {
 }
 
 static void build_eq_reset_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    eq_reset_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(eq_reset_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(eq_reset_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(eq_reset_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(eq_reset_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(eq_reset_popup_backdrop, eq_reset_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    eq_reset_popup = lv_obj_create(top);
-    lv_obj_set_size(eq_reset_popup, 400, 220);
-    lv_obj_align(eq_reset_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(eq_reset_popup, 16, 0);
-    lv_obj_add_style(eq_reset_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(eq_reset_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(eq_reset_popup, 0, 0);
-    lv_obj_remove_flag(eq_reset_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(eq_reset_popup, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t * title = lv_label_create(eq_reset_popup);
-    lv_obj_set_width(title, lv_pct(90));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_22, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-    lv_label_set_text(title, "Reset PEQ to defaults?");
-
-    lv_obj_t * reset_row = lv_obj_create(eq_reset_popup);
-    lv_obj_set_size(reset_row, lv_pct(90), 56);
-    lv_obj_align(reset_row, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_set_style_radius(reset_row, 12, 0);
-    lv_obj_set_style_bg_opa(reset_row, 0, 0);
-    lv_obj_set_style_border_width(reset_row, 0, 0);
-    lv_obj_remove_flag(reset_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(reset_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(reset_row, eq_reset_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * reset_label = lv_label_create(reset_row);
-    lv_label_set_text(reset_label, "Reset");
-    lv_obj_set_style_text_color(reset_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(reset_label, ui_size_20, 0);
-    lv_obj_center(reset_label);
-
-    lv_obj_t * cancel_row = lv_obj_create(eq_reset_popup);
-    lv_obj_set_size(cancel_row, lv_pct(90), 56);
-    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
-    lv_obj_set_style_radius(cancel_row, 12, 0);
-    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
-    lv_obj_set_style_border_width(cancel_row, 0, 0);
-    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(cancel_row, eq_reset_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * cancel_label = lv_label_create(cancel_row);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
-    lv_obj_center(cancel_label);
+    eq_reset_popup = build_confirm_popup("Reset PEQ to defaults?", LV_LABEL_LONG_WRAP, NULL, NULL, "Reset",
+                                          lv_color_make(255, 120, 120), eq_reset_confirm_cb, NULL, "Cancel",
+                                          accent_lv_color(), eq_reset_cancel_cb, NULL, eq_reset_popup_backdrop_cb,
+                                          &eq_reset_popup_backdrop);
 }
 
 /* ---- Factory Reset, with a confirmation popup -- same hand-built
@@ -18453,66 +18285,10 @@ static void factory_reset_btn_cb(lv_event_t * e) {
 }
 
 static void build_factory_reset_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    factory_reset_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(factory_reset_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(factory_reset_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(factory_reset_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(factory_reset_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(factory_reset_popup_backdrop, factory_reset_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    factory_reset_popup = lv_obj_create(top);
-    lv_obj_set_size(factory_reset_popup, 400, 220);
-    lv_obj_align(factory_reset_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(factory_reset_popup, 16, 0);
-    lv_obj_add_style(factory_reset_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(factory_reset_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(factory_reset_popup, 0, 0);
-    lv_obj_remove_flag(factory_reset_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(factory_reset_popup, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t * title = lv_label_create(factory_reset_popup);
-    lv_obj_set_width(title, lv_pct(90));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_22, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-    lv_label_set_text(title, "Reset all settings and reboot?");
-
-    lv_obj_t * reset_row = lv_obj_create(factory_reset_popup);
-    lv_obj_set_size(reset_row, lv_pct(90), 56);
-    lv_obj_align(reset_row, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_set_style_radius(reset_row, 12, 0);
-    lv_obj_set_style_bg_opa(reset_row, 0, 0);
-    lv_obj_set_style_border_width(reset_row, 0, 0);
-    lv_obj_remove_flag(reset_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(reset_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(reset_row, factory_reset_confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * reset_label = lv_label_create(reset_row);
-    lv_label_set_text(reset_label, "Reset");
-    lv_obj_set_style_text_color(reset_label, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(reset_label, ui_size_20, 0);
-    lv_obj_center(reset_label);
-
-    lv_obj_t * cancel_row = lv_obj_create(factory_reset_popup);
-    lv_obj_set_size(cancel_row, lv_pct(90), 56);
-    lv_obj_align(cancel_row, LV_ALIGN_TOP_MID, 0, 136);
-    lv_obj_set_style_radius(cancel_row, 12, 0);
-    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
-    lv_obj_set_style_border_width(cancel_row, 0, 0);
-    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(cancel_row, factory_reset_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * cancel_label = lv_label_create(cancel_row);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
-    lv_obj_center(cancel_label);
+    factory_reset_popup = build_confirm_popup(
+        "Reset all settings and reboot?", LV_LABEL_LONG_WRAP, NULL, NULL, "Reset", lv_color_make(255, 120, 120),
+        factory_reset_confirm_cb, NULL, "Cancel", accent_lv_color(), factory_reset_cancel_cb, NULL,
+        factory_reset_popup_backdrop_cb, &factory_reset_popup_backdrop);
 }
 
 /* ---- Font Size restart prompt, same hand-built confirmation-popup shape
@@ -18560,66 +18336,10 @@ static void show_font_size_reboot_popup(void) {
 }
 
 static void build_font_size_reboot_popup(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    font_size_reboot_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(font_size_reboot_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(font_size_reboot_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(font_size_reboot_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(font_size_reboot_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(font_size_reboot_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(font_size_reboot_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(font_size_reboot_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(font_size_reboot_popup_backdrop, font_size_reboot_popup_backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    font_size_reboot_popup = lv_obj_create(top);
-    lv_obj_set_size(font_size_reboot_popup, 400, 220);
-    lv_obj_align(font_size_reboot_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(font_size_reboot_popup, 16, 0);
-    lv_obj_add_style(font_size_reboot_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(font_size_reboot_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(font_size_reboot_popup, 0, 0);
-    lv_obj_remove_flag(font_size_reboot_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(font_size_reboot_popup, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_t * title = lv_label_create(font_size_reboot_popup);
-    lv_obj_set_width(title, lv_pct(90));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_22, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-    lv_label_set_text(title, "Restart now to apply the new font size?");
-
-    lv_obj_t * now_row = lv_obj_create(font_size_reboot_popup);
-    lv_obj_set_size(now_row, lv_pct(90), 56);
-    lv_obj_align(now_row, LV_ALIGN_TOP_MID, 0, 70);
-    lv_obj_set_style_radius(now_row, 12, 0);
-    lv_obj_set_style_bg_opa(now_row, 0, 0);
-    lv_obj_set_style_border_width(now_row, 0, 0);
-    lv_obj_remove_flag(now_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(now_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(now_row, font_size_reboot_now_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * now_label = lv_label_create(now_row);
-    lv_label_set_text(now_label, "Restart Now");
-    lv_obj_set_style_text_color(now_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(now_label, ui_size_20, 0);
-    lv_obj_center(now_label);
-
-    lv_obj_t * later_row = lv_obj_create(font_size_reboot_popup);
-    lv_obj_set_size(later_row, lv_pct(90), 56);
-    lv_obj_align(later_row, LV_ALIGN_TOP_MID, 0, 136);
-    lv_obj_set_style_radius(later_row, 12, 0);
-    lv_obj_set_style_bg_opa(later_row, 0, 0);
-    lv_obj_set_style_border_width(later_row, 0, 0);
-    lv_obj_remove_flag(later_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(later_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(later_row, font_size_reboot_later_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * later_label = lv_label_create(later_row);
-    lv_label_set_text(later_label, "Later");
-    lv_obj_add_style(later_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(later_label, ui_size_20, 0);
-    lv_obj_center(later_label);
+    font_size_reboot_popup = build_confirm_popup(
+        "Restart now to apply the new font size?", LV_LABEL_LONG_WRAP, NULL, NULL, "Restart Now", accent_lv_color(),
+        font_size_reboot_now_cb, NULL, "Later", lv_color_make(160, 160, 160), font_size_reboot_later_cb, NULL,
+        font_size_reboot_popup_backdrop_cb, &font_size_reboot_popup_backdrop);
 }
 
 static void eq_profile_row_cb(lv_event_t * e) {
@@ -18765,6 +18485,12 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(content, 0, 0);
     lv_obj_set_style_border_width(content, 0, 0);
+    /* Real-device bug report: same root cause as build_compact_list_widget()'s
+     * own fix (see that function's comment) -- this container never zeroed
+     * its own padding, so it carried LVGL's default object theme padding on
+     * top of every child's own pct-width/pad math, shifting the whole PEQ
+     * screen's cards right and clipping them against the screen edge. */
+    lv_obj_set_style_pad_all(content, 0, 0);
     lv_obj_set_scroll_dir(content, LV_DIR_VER);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     /* Main-place (1st arg) must be START, not CENTER -- this column's
@@ -18787,85 +18513,127 @@ static lv_obj_t * build_eq_screen(void) {
      * own gain -- same role as the reference DAP's "Pre AMP" control. */
     lv_obj_t * eq_preamp_card = create_eq_slider_card(content, EQ_FIELD_PREAMP, &eq_preamp_value_label, &eq_preamp_slider, -120, 120);
 
-    /* Band picker: a 5x2 grid of tappable band numbers -- edit one band's
-     * freq/Q/gain/type at a time rather than showing 10 bands' worth of
-     * controls simultaneously. Bigger buttons than before (80x44 vs
-     * 60x28) for the same "bigger, not overlapping" reasoning as the
-     * slider cards; LV_SIZE_CONTENT height so it's never a guess at
-     * exactly how tall two rows of these need to be. */
-    lv_obj_t * band_grid = lv_obj_create(content);
-    lv_obj_set_width(band_grid, lv_pct(92));
-    lv_obj_set_height(band_grid, LV_SIZE_CONTENT);
-    lv_obj_add_style(band_grid, &style_theme_card_bg, 0);
-    lv_obj_set_style_border_width(band_grid, 0, 0);
-    lv_obj_set_style_radius(band_grid, 12, 0);
-    lv_obj_set_style_pad_all(band_grid, 10, 0);
-    lv_obj_remove_flag(band_grid, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(band_grid, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(band_grid, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    /* Band picker: a dropdown rather than the original 5x2 grid of
+     * tappable band-number buttons -- real-device bug report, the grid's
+     * buttons were a fixed 80x44 with no allowance for a bigger font tier
+     * (Settings > System > Font Size), so BlindMF's much larger glyphs
+     * overlapped both within a button and between adjacent buttons. A
+     * dropdown sidesteps this entirely (only ever renders one band's
+     * label at a time, closed or open) and matches eq_type_dropdown's own
+     * already-working shape just below, including its explicit ui_size_20
+     * font so this one also actually scales with the font tier setting,
+     * unlike eq_type_dropdown which was never explicitly given one. */
+    /* Dropdown width scales with the font tier -- real-device bug report:
+     * fixed at 170px regardless of tier, BlindMF's much wider "Low Shelf"/
+     * "High Shelf" text ran into the dropdown's own arrow glyph, which
+     * occupies a roughly fixed pixel area on the right regardless of font
+     * size. Shared by both dropdowns below rather than computed via
+     * LV_SIZE_CONTENT, which would resize the box to whichever option is
+     * currently selected and make it visibly jump width every time the
+     * user picks a different one. */
+    int32_t eq_dropdown_width = 170;
+    if (current_settings.font_size_tier == 1) eq_dropdown_width = 200;
+    else if (current_settings.font_size_tier == 2) eq_dropdown_width = 240;
 
-    for (int i = 0; i < PEQ_NUM_BANDS; i++) {
-        lv_obj_t * btn = lv_obj_create(band_grid);
-        lv_obj_set_size(btn, 80, 44);
-        lv_obj_set_style_bg_opa(btn, 0, 0);
-        lv_obj_set_style_border_width(btn, 0, 0);
-        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(btn, eq_band_button_event_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    /* Band picker: a dropdown rather than the original 5x2 grid of
+     * tappable band-number buttons -- real-device bug report, the grid's
+     * buttons were a fixed 80x44 with no allowance for a bigger font tier
+     * (Settings > System > Font Size), so BlindMF's much larger glyphs
+     * overlapped both within a button and between adjacent buttons. This
+     * row (and type_row/enable_row just below) is now LV_SIZE_CONTENT-
+     * height and flex-laid-out rather than a fixed 64px with hand-placed
+     * children, same "structural, not hand-tuned-per-tier" reasoning as
+     * create_eq_slider_card's own redesign above -- a fixed 64px row could
+     * still clip a dropdown/switch whose own natural height grows with a
+     * bigger font. */
+    lv_obj_t * band_row = lv_obj_create(content);
+    lv_obj_set_width(band_row, lv_pct(96));
+    lv_obj_set_height(band_row, LV_SIZE_CONTENT);
+    lv_obj_add_style(band_row, &style_theme_card_bg, 0);
+    lv_obj_set_style_border_width(band_row, 0, 0);
+    lv_obj_set_style_radius(band_row, 12, 0);
+    lv_obj_set_style_pad_all(band_row, 14, 0);
+    lv_obj_remove_flag(band_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(band_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(band_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-        lv_obj_t * label = lv_label_create(btn);
-        lv_label_set_text_fmt(label, "Band%d", i);
-        lv_obj_set_style_text_font(label, ui_size_20, 0);
-        lv_obj_add_style(label, &style_muted_text, 0);
-        lv_obj_center(label);
+    lv_obj_t * band_label = lv_label_create(band_row);
+    lv_label_set_text(band_label, "Band");
+    lv_obj_add_style(band_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(band_label, ui_size_20, 0);
 
-        eq_band_buttons[i] = btn;
-        eq_band_button_labels[i] = label;
-    }
+    eq_band_dropdown = lv_dropdown_create(band_row);
+    lv_dropdown_set_options(eq_band_dropdown, "Band0\nBand1\nBand2\nBand3\nBand4\nBand5\nBand6\nBand7\nBand8\nBand9");
+    lv_obj_set_style_text_font(eq_band_dropdown, ui_size_20, 0);
+    /* The closed box and the opened list are two separate LVGL objects
+     * (lv_dropdown_create() builds dropdown->list eagerly, as a child of
+     * the screen, not of this dropdown) -- styling only the box above left
+     * the opened list's text at LVGL's own default (unscaled) font. */
+    lv_obj_set_style_text_font(lv_dropdown_get_list(eq_band_dropdown), ui_size_20, 0);
+    lv_obj_set_width(eq_band_dropdown, eq_dropdown_width);
 
     lv_obj_t * eq_freq_card = create_eq_slider_card(content, EQ_FIELD_FREQ, &eq_freq_value_label, &eq_freq_slider, 0, EQ_FREQ_SLIDER_MAX);
     lv_obj_t * eq_gain_card = create_eq_slider_card(content, EQ_FIELD_GAIN, &eq_gain_value_label, &eq_gain_slider, -120, 120);
     lv_obj_t * eq_q_card = create_eq_slider_card(content, EQ_FIELD_Q, &eq_q_value_label, &eq_q_slider, 1, 100);
 
     lv_obj_t * type_row = lv_obj_create(content);
-    lv_obj_set_size(type_row, lv_pct(92), 64);
+    lv_obj_set_width(type_row, lv_pct(96));
+    lv_obj_set_height(type_row, LV_SIZE_CONTENT);
     lv_obj_add_style(type_row, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(type_row, 0, 0);
     lv_obj_set_style_radius(type_row, 12, 0);
+    lv_obj_set_style_pad_all(type_row, 14, 0);
     lv_obj_remove_flag(type_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(type_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(type_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t * type_label = lv_label_create(type_row);
     lv_label_set_text(type_label, "Type");
     lv_obj_add_style(type_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(type_label, ui_size_20, 0);
-    lv_obj_align(type_label, LV_ALIGN_LEFT_MID, 16, 0);
 
     eq_type_dropdown = lv_dropdown_create(type_row);
     lv_dropdown_set_options(eq_type_dropdown, "Peaking\nLow Shelf\nHigh Shelf");
-    lv_obj_set_width(eq_type_dropdown, 170);
-    lv_obj_align(eq_type_dropdown, LV_ALIGN_RIGHT_MID, -14, 0);
+    /* Same gap as eq_band_dropdown just above -- box and opened list both
+     * need the tier-aware font explicitly, LVGL's own default isn't. */
+    lv_obj_set_style_text_font(eq_type_dropdown, ui_size_20, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(eq_type_dropdown), ui_size_20, 0);
+    lv_obj_set_width(eq_type_dropdown, eq_dropdown_width);
 
     lv_obj_t * enable_row = lv_obj_create(content);
-    lv_obj_set_size(enable_row, lv_pct(92), 64);
+    lv_obj_set_width(enable_row, lv_pct(96));
+    lv_obj_set_height(enable_row, LV_SIZE_CONTENT);
     lv_obj_add_style(enable_row, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(enable_row, 0, 0);
     lv_obj_set_style_radius(enable_row, 12, 0);
+    lv_obj_set_style_pad_all(enable_row, 14, 0);
     lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(enable_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(enable_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t * enabled_label = lv_label_create(enable_row);
     lv_label_set_text(enabled_label, "Enable");
     lv_obj_add_style(enabled_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(enabled_label, ui_size_20, 0);
-    lv_obj_align(enabled_label, LV_ALIGN_LEFT_MID, 16, 0);
 
     eq_band_enabled_switch = lv_switch_create(enable_row);
-    lv_obj_align(eq_band_enabled_switch, LV_ALIGN_RIGHT_MID, -14, 0);
     lv_obj_add_style(eq_band_enabled_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
 
     /* Save/Load Profile row -- the new SD card persistence ask, sitting at
      * the end of the same scrollable list as everything else rather than
      * a separate screen of its own. */
+    /* Real-device bug report: at BlindMF, "Save Profile"/"Load Profile"
+     * didn't fit their fixed lv_pct(46) x 56 buttons -- same class of bug
+     * as create_eq_slider_card's above, fixed the same structural way:
+     * LV_SIZE_CONTENT height (grows to fit however many lines the label
+     * needs) and the label itself set to wrap within its button's width
+     * rather than overflow it, instead of a fixed pixel box sized for the
+     * small/medium tiers' shorter rendered text. flex_grow(1) on both
+     * buttons (rather than the old fixed lv_pct(46) each) keeps them
+     * evenly split regardless of how wide either one's content ends up. */
     lv_obj_t * profile_row = lv_obj_create(content);
-    lv_obj_set_size(profile_row, lv_pct(92), 64);
+    lv_obj_set_width(profile_row, lv_pct(96));
+    lv_obj_set_height(profile_row, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(profile_row, 0, 0);
     lv_obj_set_style_border_width(profile_row, 0, 0);
     lv_obj_remove_flag(profile_row, LV_OBJ_FLAG_SCROLLABLE);
@@ -18874,10 +18642,12 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_set_style_pad_column(profile_row, 12, 0);
 
     lv_obj_t * save_btn = lv_obj_create(profile_row);
-    lv_obj_set_size(save_btn, lv_pct(46), 56);
+    lv_obj_set_flex_grow(save_btn, 1);
+    lv_obj_set_height(save_btn, LV_SIZE_CONTENT);
     lv_obj_add_style(save_btn, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(save_btn, 0, 0);
     lv_obj_set_style_radius(save_btn, 12, 0);
+    lv_obj_set_style_pad_all(save_btn, 14, 0);
     lv_obj_remove_flag(save_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(save_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(save_btn, eq_save_profile_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -18885,13 +18655,18 @@ static lv_obj_t * build_eq_screen(void) {
     lv_label_set_text(save_label, "Save Profile");
     lv_obj_set_style_text_font(save_label, ui_size_20, 0);
     lv_obj_add_style(save_label, &style_accent, 0);
+    lv_label_set_long_mode(save_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(save_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(save_label, lv_pct(100));
     lv_obj_center(save_label);
 
     lv_obj_t * load_btn = lv_obj_create(profile_row);
-    lv_obj_set_size(load_btn, lv_pct(46), 56);
+    lv_obj_set_flex_grow(load_btn, 1);
+    lv_obj_set_height(load_btn, LV_SIZE_CONTENT);
     lv_obj_add_style(load_btn, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(load_btn, 0, 0);
     lv_obj_set_style_radius(load_btn, 12, 0);
+    lv_obj_set_style_pad_all(load_btn, 14, 0);
     lv_obj_remove_flag(load_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(load_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(load_btn, eq_load_profile_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -18899,6 +18674,9 @@ static lv_obj_t * build_eq_screen(void) {
     lv_label_set_text(load_label, "Load Profile");
     lv_obj_set_style_text_font(load_label, ui_size_20, 0);
     lv_obj_add_style(load_label, &style_accent, 0);
+    lv_label_set_long_mode(load_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(load_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(load_label, lv_pct(100));
     lv_obj_center(load_label);
 
     /* Establish correct initial visual state for every widget BEFORE
@@ -18910,6 +18688,7 @@ static lv_obj_t * build_eq_screen(void) {
     refresh_all_eq_widgets();
 
     lv_obj_add_event_cb(eq_bypass_switch, eq_bypass_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(eq_band_dropdown, eq_band_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(eq_preamp_slider, eq_preamp_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(eq_band_enabled_switch, eq_band_enabled_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(eq_type_dropdown, eq_type_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);

@@ -70,6 +70,14 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef UI_PERF_TRACE
+static uint64_t ui_perf_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t) ts.tv_nsec / 1000ULL;
+}
+#endif
+
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
 #else
@@ -184,6 +192,10 @@ static lv_obj_t * playlists_screen;
 static lv_obj_t * playlists_edit_btn;
 static bool playlists_edit_mode = false;
 static lv_obj_t * artist_albums_screen;
+static lv_obj_t * album_thumbnail_active_list;
+static int album_thumbnail_generation;
+static void album_thumbnail_begin_screen(lv_obj_t * list);
+static void album_thumbnail_end_screen(lv_obj_t * list);
 static lv_obj_t * stream_media_screen;
 static lv_obj_t * subsonic_entry_screen;
 static lv_obj_t * wireless_screen;
@@ -386,6 +398,11 @@ static lv_obj_t * quick_drawer_order_icon; /* visual-only mirror of order_icon's
 static lv_obj_t * quick_drawer_brightness_track;
 static lv_obj_t * quick_drawer_brightness_label;
 static bool quick_drawer_open = false;
+static lv_obj_t * quick_drawer_motion_image;
+static lv_draw_buf_t * quick_drawer_motion_buf;
+static bool quick_drawer_bitmap_motion;
+static bool quick_drawer_snapshot_dirty = true;
+static void quick_drawer_mark_snapshot_dirty(void);
 
 /* Real-device bug report: the drawer's brightness slider/label only ever
  * reflected whatever backlight_get_percent() read back at build_quick_
@@ -405,6 +422,7 @@ static void refresh_quick_drawer_brightness(void) {
     if (brightness < 0) brightness = 100;
     lv_slider_set_value(quick_drawer_brightness_track, brightness, LV_ANIM_OFF);
     lv_label_set_text_fmt(quick_drawer_brightness_label, "%d%%", brightness);
+    quick_drawer_mark_snapshot_dirty();
 }
 
 static char ** playlist = NULL;
@@ -746,7 +764,7 @@ static void slide_transition_anim_x_cb(void * var, int32_t v) {
 static void slide_transition_done_cb(lv_anim_t * a) {
     slide_transition_ctx_t * ctx = (slide_transition_ctx_t *) lv_anim_get_user_data(a);
     if (ctx->commit) {
-        lv_screen_load(ctx->to_scr); /* skipped on a cancelled interactive drag -- from_scr was never actually replaced, nothing to load */
+        lv_screen_load(ctx->to_scr);
         sync_player_topbar_visibility(ctx->to_scr);
     }
     lv_obj_delete(ctx->overlay); /* deletes img_from/img_to too */
@@ -773,7 +791,7 @@ static void slide_transition_done_cb(lv_anim_t * a) {
  * (only the interactive path ever sets it false, on a cancelled drag).
  *
  * force_snapshot skips the live-framebuffer-aliasing fast path below for
- * img_from, always taking a real independent copy instead -- see that
+ * img_from, always taking an independent copy instead -- see that
  * code's own comment for why the fast path is normally preferred, and
  * player_swipe_tracking's own call site (poll_quick_drawer_drag()) for why
  * it can't be used there: that comment accepts the live-alias's one
@@ -791,8 +809,17 @@ static void slide_transition_done_cb(lv_anim_t * a) {
  * ("swiping to enter the player causes the main menu to flicker"), not
  * just a theoretical risk. A real snapshot is immune to that: whatever
  * from_scr does afterward, img_from stays exactly what it looked like the
- * instant this was called. */
+ * instant this was called.  Copying the already-rendered active display
+ * buffer provides that stability without asking LVGL to render the whole
+ * outgoing object tree again.  The latter cost 25-47 ms on this device;
+ * a linear RGB565 copy is both substantially cheaper and pixel-identical
+ * to what the user was looking at when the gesture began. */
 static slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward, bool force_snapshot) {
+#ifdef UI_PERF_TRACE
+    uint64_t perf_begin_us = ui_perf_now_us();
+    uint64_t perf_from_done_us;
+    uint64_t perf_to_done_us;
+#endif
     lv_obj_t * from_scr = lv_screen_active();
     if (from_scr == to_scr || slide_transition_active) return NULL;
 
@@ -801,6 +828,8 @@ static slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool f
 
     slide_transition_ctx_t * ctx = lv_malloc(sizeof(*ctx));
     ctx->commit = true;
+    ctx->buf_from_owned = false;
+    ctx->buf_to_owned = false;
 
     /* from_scr is, by definition, exactly what's on screen right now -- if
      * the display driver can hand us that page directly (real double
@@ -829,15 +858,26 @@ static slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool f
      * (SDL) too, so the separate HOST_BUILD/LV_USE_LINUX_FBDEV branch
      * this used to need is gone; NULL there just means no frame has
      * flushed yet, same fallback-to-snapshot reasoning as below. */
-    lv_draw_buf_t * active_buf = force_snapshot ? NULL : lv_display_get_buf_active(disp);
+    lv_draw_buf_t * active_buf = lv_display_get_buf_active(disp);
     lv_draw_buf_t * buf_from;
-    if (active_buf) {
+    if (active_buf && force_snapshot) {
+        /* Interactive swipes can remain under the finger indefinitely, so
+         * freeze the currently displayed pixels.  lv_draw_buf_dup() keeps
+         * the source format/stride and performs a straight buffer copy;
+         * unlike lv_snapshot_take(from_scr), it does no widget traversal,
+         * layout, style evaluation, or software rendering. */
+        buf_from = lv_draw_buf_dup(active_buf);
+        ctx->buf_from_owned = true;
+    } else if (active_buf) {
         buf_from = active_buf;
         ctx->buf_from_owned = false;
     } else {
         buf_from = lv_snapshot_take(from_scr, LV_COLOR_FORMAT_RGB565);
         ctx->buf_from_owned = true;
     }
+#ifdef UI_PERF_TRACE
+    perf_from_done_us = ui_perf_now_us();
+#endif
     lv_draw_buf_t * buf_to = get_static_snapshot(to_scr);
     if (buf_to) {
         ctx->buf_to_owned = false;
@@ -845,6 +885,9 @@ static slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool f
         buf_to = lv_snapshot_take(to_scr, LV_COLOR_FORMAT_RGB565);
         ctx->buf_to_owned = true;
     }
+#ifdef UI_PERF_TRACE
+    perf_to_done_us = ui_perf_now_us();
+#endif
     if (!buf_from || !buf_to) {
         /* Snapshot failed (e.g. OOM) -- caller falls back to an instant cut
          * rather than crash or get stuck mid-navigation/mid-drag. */
@@ -888,6 +931,15 @@ static slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool f
     ctx->to_offset = to_offset;
 
     slide_transition_active = true;
+#ifdef UI_PERF_TRACE
+    uint64_t perf_end_us = ui_perf_now_us();
+    printf("PERF transition begin_us=%llu from_us=%llu to_us=%llu setup_us=%llu from_owned=%d to_owned=%d force=%d\n",
+           (unsigned long long) (perf_end_us - perf_begin_us),
+           (unsigned long long) (perf_from_done_us - perf_begin_us),
+           (unsigned long long) (perf_to_done_us - perf_from_done_us),
+           (unsigned long long) (perf_end_us - perf_to_done_us),
+           ctx->buf_from_owned, ctx->buf_to_owned, force_snapshot);
+#endif
     return ctx;
 }
 
@@ -912,6 +964,9 @@ static void screen_transition_slide(lv_obj_t * to_scr, bool forward) {
 }
 
 static void nav_push(lv_obj_t * scr) {
+#ifdef UI_PERF_TRACE
+    uint64_t perf_start_us = ui_perf_now_us();
+#endif
     if (nav_depth > 0 && nav_stack[nav_depth - 1] == scr) {
         lv_screen_load(scr); /* already the active screen -- nothing to push */
         sync_player_topbar_visibility(scr);
@@ -925,6 +980,10 @@ static void nav_push(lv_obj_t * scr) {
      * used by nav_pop() below, so backing out still animates. */
     lv_screen_load(scr);
     sync_player_topbar_visibility(scr);
+#ifdef UI_PERF_TRACE
+    printf("PERF nav_push load_us=%llu depth=%d\n",
+           (unsigned long long) (ui_perf_now_us() - perf_start_us), nav_depth);
+#endif
 }
 
 static void nav_pop(void) {
@@ -1672,6 +1731,7 @@ static void refresh_wifi_icon(void) {
     bool enabled = wifi_control_is_enabled();
     if (quick_drawer_wifi_icon) {
         lv_image_set_src(quick_drawer_wifi_icon, asset_path(enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
+        quick_drawer_mark_snapshot_dirty();
     }
 
     if (!enabled) {
@@ -1914,6 +1974,7 @@ static void poll_refresh_bt_icon(void) {
     snprintf(bt_connected_codec_cached, sizeof(bt_connected_codec_cached), "%s", refresh_bt_icon_result_codec);
     if (quick_drawer_bt_icon) {
         lv_image_set_src(quick_drawer_bt_icon, asset_path(display_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
+        quick_drawer_mark_snapshot_dirty();
     }
 
     if (!display_powered) {
@@ -2399,6 +2460,7 @@ static void refresh_quick_drawer_crossfade_icon(void) {
     if (!quick_drawer_crossfade_icon) return;
     lv_image_set_src(quick_drawer_crossfade_icon,
                      asset_path(current_settings.crossfade_enabled ? "pull_down/fade_s.png" : "pull_down/fade.png"));
+    quick_drawer_mark_snapshot_dirty();
 }
 
 /* Settings > Playback's own Crossfade toggle row (build_settings_playback_screen(),
@@ -2459,6 +2521,7 @@ static void quick_drawer_sleep_event_cb(lv_event_t * e) {
         lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
         lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
     }
+    quick_drawer_mark_snapshot_dirty();
 }
 
 /* Called every update_timer_cb tick (500ms). Cheap no-op when not armed. */
@@ -2473,6 +2536,7 @@ static void poll_sleep_timer(void) {
         if (audio_is_playing()) toggle_play_pause(); /* pause, not stop -- resumable, same as any other pause */
         lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
         lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
+        quick_drawer_mark_snapshot_dirty();
         return;
     }
 
@@ -2481,16 +2545,80 @@ static void poll_sleep_timer(void) {
      * rather than ever displaying a misleading zero. */
     int remaining_min = (int) ((total_ms - elapsed_ms + 59999) / 60000);
     lv_label_set_text_fmt(quick_drawer_sleep_label, "%dm", remaining_min);
+    quick_drawer_mark_snapshot_dirty();
 }
 
 static void quick_drawer_anim_y_cb(void * var, int32_t v) {
-    lv_obj_set_y((lv_obj_t *) var, v);
+    (void) var;
+    lv_obj_set_y(quick_drawer_bitmap_motion ? quick_drawer_motion_image : quick_drawer, v);
+}
+
+static int32_t quick_drawer_motion_y(void) {
+    return lv_obj_get_y(quick_drawer_bitmap_motion ? quick_drawer_motion_image : quick_drawer);
+}
+
+static void quick_drawer_rebuild_snapshot(void) {
+    if (!quick_drawer || quick_drawer_bitmap_motion) return;
+    lv_draw_buf_t * fresh = lv_snapshot_take(quick_drawer, LV_COLOR_FORMAT_RGB565);
+    if (!fresh) return;
+    if (!quick_drawer_motion_image) {
+        quick_drawer_motion_image = lv_image_create(lv_layer_top());
+        lv_obj_remove_flag(quick_drawer_motion_image, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_image_set_src(quick_drawer_motion_image, NULL);
+    }
+    if (quick_drawer_motion_buf) lv_draw_buf_destroy(quick_drawer_motion_buf);
+    quick_drawer_motion_buf = fresh;
+    lv_image_set_src(quick_drawer_motion_image, quick_drawer_motion_buf);
+    quick_drawer_snapshot_dirty = false;
+}
+
+static void quick_drawer_snapshot_async_cb(void * unused) {
+    (void) unused;
+    if (quick_drawer_snapshot_dirty && !quick_drawer_open && !quick_drawer_bitmap_motion)
+        quick_drawer_rebuild_snapshot();
+}
+
+static void quick_drawer_mark_snapshot_dirty(void) {
+    quick_drawer_snapshot_dirty = true;
+    if (quick_drawer && !quick_drawer_open && !quick_drawer_bitmap_motion)
+        lv_async_call(quick_drawer_snapshot_async_cb, NULL);
+}
+
+static bool quick_drawer_begin_bitmap_motion(void) {
+    if (quick_drawer_bitmap_motion) return true;
+    if (quick_drawer_snapshot_dirty || !quick_drawer_motion_buf) quick_drawer_rebuild_snapshot();
+    if (!quick_drawer_motion_buf || !quick_drawer_motion_image) return false;
+    lv_obj_set_y(quick_drawer_motion_image, lv_obj_get_y(quick_drawer));
+    lv_obj_remove_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(quick_drawer_motion_image);
+    lv_obj_move_foreground(status_bar_band);
+    lv_obj_add_flag(quick_drawer, LV_OBJ_FLAG_HIDDEN);
+    quick_drawer_bitmap_motion = true;
+    return true;
+}
+
+static void quick_drawer_finish_bitmap_motion(void) {
+    int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
+    lv_obj_set_y(quick_drawer, quick_drawer_open ? 0 : -h);
+    lv_obj_remove_flag(quick_drawer, LV_OBJ_FLAG_HIDDEN);
+    if (quick_drawer_motion_image) lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
+    quick_drawer_bitmap_motion = false;
+    if (!quick_drawer_open && quick_drawer_snapshot_dirty)
+        lv_async_call(quick_drawer_snapshot_async_cb, NULL);
+}
+
+static void quick_drawer_anim_done_cb(lv_anim_t * a) {
+    (void) a;
+    quick_drawer_finish_bitmap_motion();
 }
 
 static void open_quick_drawer(void) {
     if (quick_drawer_open) return;
     quick_drawer_open = true;
     refresh_quick_drawer_brightness(); /* see its own comment -- keeps the slider from showing a stale pre-screen-off value */
+    quick_drawer_begin_bitmap_motion();
     lv_obj_move_foreground(quick_drawer); /* above regular screens/volume popup while showing */
     /* ...but the status bar (clock/battery/wifi/bt) stays above THAT --
      * real-hardware feedback wanted it to stay visible/readable the whole
@@ -2517,10 +2645,11 @@ static void open_quick_drawer(void) {
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, quick_drawer);
-    lv_anim_set_values(&a, lv_obj_get_y(quick_drawer), 0);
+    lv_anim_set_values(&a, quick_drawer_motion_y(), 0);
     lv_anim_set_duration(&a, QUICK_DRAWER_ANIM_MS);
     lv_anim_set_exec_cb(&a, quick_drawer_anim_y_cb);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_completed_cb(&a, quick_drawer_anim_done_cb);
     lv_anim_start(&a);
 }
 
@@ -2532,10 +2661,12 @@ static void close_quick_drawer(void) {
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, quick_drawer);
-    lv_anim_set_values(&a, lv_obj_get_y(quick_drawer), -h);
+    quick_drawer_begin_bitmap_motion();
+    lv_anim_set_values(&a, quick_drawer_motion_y(), -h);
     lv_anim_set_duration(&a, QUICK_DRAWER_ANIM_MS);
     lv_anim_set_exec_cb(&a, quick_drawer_anim_y_cb);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_completed_cb(&a, quick_drawer_anim_done_cb);
     lv_anim_start(&a);
 }
 
@@ -2772,7 +2903,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * endpoints. */
         if (quick_drawer_open) {
             quick_drawer_drag_tracking = true;
-            quick_drawer_drag_panel_start_y = lv_obj_get_y(quick_drawer);
+            quick_drawer_drag_panel_start_y = quick_drawer_motion_y();
         } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !library_rescan_active) {
             /* !library_rescan_active -- same exclusion as the other rescan-
              * time guards below (search this file for library_rescan_active
@@ -2781,7 +2912,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
              * started, the quick_drawer_open branch above still lets it be
              * dragged closed again. */
             quick_drawer_drag_tracking = true;
-            quick_drawer_drag_panel_start_y = lv_obj_get_y(quick_drawer);
+            quick_drawer_drag_panel_start_y = quick_drawer_motion_y();
             lv_obj_move_foreground(quick_drawer); /* above regular screens/volume popup while dragging into view */
             lv_obj_move_foreground(status_bar_band); /* but the status bar stays above THAT -- see open_quick_drawer()'s comment */
         } else {
@@ -2965,8 +3096,9 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
              * lv_indev_get_vect() so it's driven by the exact same samples
              * this function already reads, not a second/possibly-
              * differently-timed source. */
-            quick_drawer_last_velocity = new_y - lv_obj_get_y(quick_drawer);
-            lv_obj_set_y(quick_drawer, new_y);
+            if (!quick_drawer_bitmap_motion) quick_drawer_begin_bitmap_motion();
+            quick_drawer_last_velocity = new_y - quick_drawer_motion_y();
+            quick_drawer_anim_y_cb(quick_drawer, new_y);
         } else {
             quick_drawer_last_velocity = 0;
         }
@@ -2986,7 +3118,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         } else if (quick_drawer_last_velocity < -QUICK_DRAWER_FLICK_VELOCITY) {
             snap_open = false; /* still moving up at release */
         } else {
-            snap_open = lv_obj_get_y(quick_drawer) > -h / 2;
+            snap_open = quick_drawer_motion_y() > -h / 2;
         }
         /* open_quick_drawer()/close_quick_drawer() animate from the
          * drawer's CURRENT (mid-drag) position, so forcing quick_drawer_open
@@ -3088,7 +3220,7 @@ static void quick_drawer_wifi_long_press_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
     quick_drawer_wifi_long_press_fired = true;
     quick_drawer_open = false;
-    lv_obj_set_y(quick_drawer, -lv_display_get_vertical_resolution(lv_display_get_default()));
+    quick_drawer_finish_bitmap_motion();
     open_wifi_screen();
 }
 
@@ -3096,7 +3228,7 @@ static void quick_drawer_bt_long_press_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
     quick_drawer_bt_long_press_fired = true;
     quick_drawer_open = false;
-    lv_obj_set_y(quick_drawer, -lv_display_get_vertical_resolution(lv_display_get_default()));
+    quick_drawer_finish_bitmap_motion();
     open_bluetooth_screen();
 }
 
@@ -3162,6 +3294,7 @@ static void quick_drawer_wifi_event_cb(lv_event_t * e) {
      * re-reads the real state once the thread lands and corrects this if
      * the toggle unexpectedly failed. */
     lv_image_set_src(quick_drawer_wifi_icon, asset_path(wifi_will_be_enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
+    quick_drawer_mark_snapshot_dirty();
 
     /* Real-device bug report: the topbar Wi-Fi icon stayed frozen (hidden,
      * or showing whatever signal-strength sprite it had before toggling
@@ -3409,6 +3542,7 @@ static void quick_drawer_bt_event_cb(lv_event_t * e) {
      * sitting frozen until poll_bt_toggle() confirms the real state once
      * the thread lands. */
     lv_image_set_src(quick_drawer_bt_icon, asset_path(bt_will_be_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
+    quick_drawer_mark_snapshot_dirty();
 
     /* Real-device bug report: the topbar Bluetooth icon stayed frozen on
      * whatever it showed pre-toggle (e.g. still the "connected" sprite
@@ -3609,6 +3743,7 @@ static void quick_drawer_brightness_changed_cb(lv_event_t * e) {
     if (code == LV_EVENT_VALUE_CHANGED) {
         backlight_set_normal_percent((int) percent); /* live feedback while dragging; also exits inactivity dim */
         lv_label_set_text_fmt(label, "%d%%", (int) percent);
+        quick_drawer_mark_snapshot_dirty();
     } else if (code == LV_EVENT_RELEASED) {
         /* Only persist once the drag settles, not on every intermediate
          * tick -- same as volume_popup_track_event_cb/volume_slider_event_cb. */
@@ -3817,6 +3952,11 @@ static void build_quick_drawer(void) {
     lv_image_set_src(quick_drawer_favorite_icon, asset_path("playing_plane/collect_out.png"));
     lv_obj_add_flag(quick_drawer_favorite_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_favorite_icon, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Render the complex live control tree once while still under the boot
+     * splash. Drag/snap motion uses this one opaque RGB565 image; controls
+     * become live again the instant the motion settles. */
+    quick_drawer_rebuild_snapshot();
 }
 
 static void refresh_clock_label(void) {
@@ -4106,6 +4246,7 @@ static void set_play_button_state(bool is_playing) {
     if (quick_drawer_play_btn) {
         lv_image_set_src(quick_drawer_play_btn,
                          asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
+        quick_drawer_mark_snapshot_dirty();
     }
 }
 
@@ -5050,6 +5191,7 @@ static void favorite_icon_event_cb(lv_event_t * e) {
     if (quick_drawer_favorite_icon) {
         lv_image_set_src(quick_drawer_favorite_icon,
                          asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
+        quick_drawer_mark_snapshot_dirty();
     }
 }
 
@@ -5066,7 +5208,10 @@ static void cycle_play_mode(void) {
     settings_save(&current_settings);
 
     lv_image_set_src(order_icon, asset_path(play_mode_icon_asset(mode)));
-    if (quick_drawer_order_icon) lv_image_set_src(quick_drawer_order_icon, asset_path(play_mode_icon_asset(mode)));
+    if (quick_drawer_order_icon) {
+        lv_image_set_src(quick_drawer_order_icon, asset_path(play_mode_icon_asset(mode)));
+        quick_drawer_mark_snapshot_dirty();
+    }
 
     /* What comes after the current track changes with the mode (e.g.
      * entering Shuffle picks a random next instead of index+1) -- re-arm the
@@ -5169,6 +5314,7 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     if (quick_drawer_title_label) {
         lv_label_set_text(quick_drawer_title_label, title_text);
         lv_label_set_text(quick_drawer_artist_label, folder_text);
+        quick_drawer_mark_snapshot_dirty();
     }
     refresh_format_badge();
     if (is_subsonic_stream && subsonic_stream_meta[index].cover_url[0]) {
@@ -5215,7 +5361,10 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     favorite_is_set = metadata_db_song_favorite_is_set(path);
     const char * favorite_icon_asset = favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png";
     lv_image_set_src(favorite_icon, asset_path(favorite_icon_asset));
-    if (quick_drawer_favorite_icon) lv_image_set_src(quick_drawer_favorite_icon, asset_path(favorite_icon_asset));
+    if (quick_drawer_favorite_icon) {
+        lv_image_set_src(quick_drawer_favorite_icon, asset_path(favorite_icon_asset));
+        quick_drawer_mark_snapshot_dirty();
+    }
 
     /* Once per real "this track started playing" event -- apply_track_
      * metadata_to_ui() is called exactly here for both an explicit pick
@@ -12295,7 +12444,12 @@ static void artist_album_row_click_cb(int index) {
  * decoded while the list was off-screen. */
 static void album_thumbnail_screen_loaded_cb(lv_event_t * e) {
     lv_obj_t * list = (lv_obj_t *) lv_event_get_user_data(e);
-    if (list) compact_list_refresh_visible(list);
+    album_thumbnail_begin_screen(list);
+}
+
+static void album_thumbnail_screen_unloaded_cb(lv_event_t * e) {
+    lv_obj_t * list = (lv_obj_t *) lv_event_get_user_data(e);
+    album_thumbnail_end_screen(list);
 }
 
 /* Matches by song-index membership (not album NAME, unlike Albums/Album
@@ -12398,6 +12552,8 @@ static int album_artists_fetch_page(void * ctx, int offset, int count, compact_l
  * headroom bounded at ~324 KiB. */
 #define ALBUM_THUMBNAIL_PX 72
 #define ALBUM_THUMBNAIL_CACHE_SIZE 32
+#define ALBUM_THUMBNAIL_DISK_MAGIC 0x48415431u /* "HAT1" */
+#define ALBUM_THUMBNAIL_DISK_DIR MUSIC_ROOT_DIR "/.open_hiby_player_thumbnails"
 
 typedef struct {
     int64_t song_id;
@@ -12410,7 +12566,11 @@ typedef struct {
 typedef struct {
     int64_t song_id;
     int generation;
+    int logical_index;
+    lv_obj_t * list;
 } album_thumbnail_request_t;
+
+#define ALBUM_THUMBNAIL_QUEUE_SIZE 20
 
 static album_thumbnail_cache_entry_t album_thumbnail_cache[ALBUM_THUMBNAIL_CACHE_SIZE];
 static uint32_t album_thumbnail_use_counter;
@@ -12419,9 +12579,19 @@ static bool album_thumbnail_active;
 static atomic_bool album_thumbnail_done;
 static int64_t album_thumbnail_result_song_id;
 static int album_thumbnail_result_generation;
+static int album_thumbnail_result_logical_index;
+static lv_obj_t * album_thumbnail_result_list;
 static uint8_t * album_thumbnail_result_pixels;
-static int album_thumbnail_generation;
 static lv_timer_t * album_thumbnail_poll_timer;
+static album_thumbnail_request_t album_thumbnail_queue[ALBUM_THUMBNAIL_QUEUE_SIZE];
+static int album_thumbnail_queue_count;
+static bool album_thumbnail_scrolling;
+static bool album_thumbnail_list_is_visible(lv_obj_t * list) {
+    if (!list) return false;
+    lv_obj_t * active = lv_screen_active();
+    return (list == albums_list && active == albums_screen) ||
+           (list == artist_albums_list && active == artist_albums_screen);
+}
 
 static album_thumbnail_cache_entry_t * album_thumbnail_cache_find(int64_t song_id) {
     for (int i = 0; i < ALBUM_THUMBNAIL_CACHE_SIZE; i++) {
@@ -12441,38 +12611,142 @@ static void album_thumbnail_cache_clear(void) {
     album_thumbnail_use_counter = 0;
 }
 
+typedef struct {
+    uint32_t magic;
+    uint16_t width;
+    uint16_t height;
+    uint64_t path_hash;
+    uint64_t source_size;
+    int64_t source_mtime;
+    uint32_t pixel_bytes;
+} album_thumbnail_disk_header_t;
+
+static uint64_t album_thumbnail_path_hash(const char * path) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char * p = (const unsigned char *) path; *p; p++) {
+        h ^= *p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void album_thumbnail_disk_path(const char * song_path, char * out, size_t out_size,
+                                      uint64_t * out_hash) {
+    uint64_t hash = album_thumbnail_path_hash(song_path);
+    if (out_hash) *out_hash = hash;
+    snprintf(out, out_size, ALBUM_THUMBNAIL_DISK_DIR "/%016llx.rgb565",
+             (unsigned long long) hash);
+}
+
+/* Cache files are disposable derived data. A truncated file (SD removal or
+ * power loss during a write) simply fails validation and is decoded again;
+ * the temp+rename write prevents a partial file replacing a prior good one. */
+static bool album_thumbnail_disk_load(const char * song_path, uint16_t ** out_pixels) {
+    *out_pixels = NULL;
+    struct stat source_st;
+    if (stat(song_path, &source_st) != 0) return false;
+    char path[PATH_MAX];
+    uint64_t hash;
+    album_thumbnail_disk_path(song_path, path, sizeof(path), &hash);
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+    album_thumbnail_disk_header_t hdr;
+    bool valid = fread(&hdr, sizeof(hdr), 1, f) == 1 &&
+                 hdr.magic == ALBUM_THUMBNAIL_DISK_MAGIC &&
+                 hdr.width == ALBUM_THUMBNAIL_PX && hdr.height == ALBUM_THUMBNAIL_PX &&
+                 hdr.path_hash == hash && hdr.source_size == (uint64_t) source_st.st_size &&
+                 hdr.source_mtime == (int64_t) source_st.st_mtime &&
+                 hdr.pixel_bytes == ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2;
+    uint16_t * pixels = valid ? malloc(hdr.pixel_bytes) : NULL;
+    if (!pixels || fread(pixels, hdr.pixel_bytes, 1, f) != 1) {
+        free(pixels);
+        pixels = NULL;
+        valid = false;
+    }
+    fclose(f);
+    *out_pixels = pixels;
+    return valid;
+}
+
+static void album_thumbnail_disk_store(const char * song_path, const uint16_t * pixels) {
+    if (!pixels) return; /* don't make newly-added external artwork stale behind a negative disk entry */
+    struct stat source_st;
+    if (stat(song_path, &source_st) != 0) return;
+    mkdir(ALBUM_THUMBNAIL_DISK_DIR, 0755); /* best effort; fopen below is the real check */
+    char path[PATH_MAX], temp_path[PATH_MAX];
+    uint64_t hash;
+    album_thumbnail_disk_path(song_path, path, sizeof(path), &hash);
+    snprintf(temp_path, sizeof(temp_path), ALBUM_THUMBNAIL_DISK_DIR "/%016llx.tmp",
+             (unsigned long long) hash);
+    FILE * f = fopen(temp_path, "wb");
+    if (!f) return;
+    album_thumbnail_disk_header_t hdr = {
+        .magic = ALBUM_THUMBNAIL_DISK_MAGIC,
+        .width = ALBUM_THUMBNAIL_PX,
+        .height = ALBUM_THUMBNAIL_PX,
+        .path_hash = hash,
+        .source_size = (uint64_t) source_st.st_size,
+        .source_mtime = (int64_t) source_st.st_mtime,
+        .pixel_bytes = ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2
+    };
+    bool ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1 &&
+              fwrite(pixels, hdr.pixel_bytes, 1, f) == 1;
+    if (fclose(f) != 0) ok = false;
+    if (ok) rename(temp_path, path);
+    else {
+        unlink(temp_path);
+    }
+}
+
 static void * album_thumbnail_thread_func(void * arg) {
+#ifdef UI_PERF_TRACE
+    uint64_t perf_start_us = ui_perf_now_us();
+#endif
     album_thumbnail_request_t * req = (album_thumbnail_request_t *) arg;
     uint16_t * pixels = NULL;
     song_row_t song;
     if (metadata_db_get_song_by_id(req->song_id, &song)) {
-        track_metadata_t meta;
-        metadata_read(song.path, &meta);
-        if ((!meta.picture_data || meta.picture_size == 0)) {
+        if (!album_thumbnail_disk_load(song.path, &pixels)) {
+            track_metadata_t meta;
+            metadata_read(song.path, &meta);
+            if ((!meta.picture_data || meta.picture_size == 0)) {
+                free(meta.picture_data);
+                meta.picture_data = NULL;
+                load_external_cover(song.path, &meta.picture_data, &meta.picture_size);
+            }
+            if (meta.picture_data && meta.picture_size)
+                cover_decode_to_rgb565(meta.picture_data, meta.picture_size,
+                                       ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, &pixels);
             free(meta.picture_data);
-            meta.picture_data = NULL;
-            load_external_cover(song.path, &meta.picture_data, &meta.picture_size);
+            free(meta.lyrics);
+            album_thumbnail_disk_store(song.path, pixels);
         }
-        if (meta.picture_data && meta.picture_size)
-            cover_decode_to_rgb565(meta.picture_data, meta.picture_size,
-                                   ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, &pixels);
-        free(meta.picture_data);
-        free(meta.lyrics);
     }
     album_thumbnail_result_song_id = req->song_id;
     album_thumbnail_result_generation = req->generation;
+    album_thumbnail_result_logical_index = req->logical_index;
+    album_thumbnail_result_list = req->list;
     album_thumbnail_result_pixels = (uint8_t *) pixels;
     free(req);
     album_thumbnail_done = true;
+#ifdef UI_PERF_TRACE
+    printf("PERF album_thumb song=%lld total_us=%llu pixels=%d\n",
+           (long long) album_thumbnail_result_song_id,
+           (unsigned long long) (ui_perf_now_us() - perf_start_us),
+           album_thumbnail_result_pixels != NULL);
+#endif
     return NULL;
 }
 
-static void launch_album_thumbnail(int64_t song_id) {
-    if (album_thumbnail_active || song_id <= 0 || album_thumbnail_cache_find(song_id)) return;
+static void start_next_album_thumbnail(void) {
+    if (!album_thumbnail_active_list ||
+        !album_thumbnail_list_is_visible(album_thumbnail_active_list) ||
+        album_thumbnail_scrolling || album_thumbnail_active || album_thumbnail_queue_count <= 0) return;
     album_thumbnail_request_t * req = malloc(sizeof(*req));
     if (!req) return;
-    req->song_id = song_id;
-    req->generation = album_thumbnail_generation;
+    *req = album_thumbnail_queue[0];
+    memmove(&album_thumbnail_queue[0], &album_thumbnail_queue[1],
+            sizeof(album_thumbnail_queue[0]) * (size_t) (--album_thumbnail_queue_count));
     album_thumbnail_done = false;
     album_thumbnail_active = true;
     if (pthread_create(&album_thumbnail_thread, NULL, album_thumbnail_thread_func, req) != 0) {
@@ -12483,12 +12757,59 @@ static void launch_album_thumbnail(int64_t song_id) {
     if (album_thumbnail_poll_timer) lv_timer_resume(album_thumbnail_poll_timer);
 }
 
+static void queue_album_thumbnail(lv_obj_t * list, int logical_index, int64_t song_id) {
+    if (song_id <= 0 || album_thumbnail_scrolling || list != album_thumbnail_active_list ||
+        !album_thumbnail_list_is_visible(list) || album_thumbnail_cache_find(song_id)) return;
+    for (int i = 0; i < album_thumbnail_queue_count; i++)
+        if (album_thumbnail_queue[i].song_id == song_id) return;
+    if (album_thumbnail_queue_count >= ALBUM_THUMBNAIL_QUEUE_SIZE) return;
+    album_thumbnail_queue[album_thumbnail_queue_count++] = (album_thumbnail_request_t) {
+        .song_id = song_id,
+        .generation = album_thumbnail_generation,
+        .logical_index = logical_index,
+        .list = list
+    };
+    start_next_album_thumbnail();
+}
+
+static void album_thumbnail_scroll_cb(lv_event_t * e) {
+    lv_obj_t * list = lv_event_get_target(e);
+    if (list != album_thumbnail_active_list) return;
+    if (lv_event_get_code(e) == LV_EVENT_SCROLL_BEGIN) {
+        album_thumbnail_scrolling = true;
+        album_thumbnail_queue_count = 0;
+        album_thumbnail_generation++; /* discard a decode that was already in flight */
+    } else if (lv_event_get_code(e) == LV_EVENT_SCROLL_END) {
+        album_thumbnail_scrolling = false;
+        compact_list_refresh_visible(list); /* queues the newly settled visible window */
+    }
+}
+
+static void album_thumbnail_begin_screen(lv_obj_t * list) {
+    album_thumbnail_active_list = list;
+    album_thumbnail_scrolling = false;
+    album_thumbnail_queue_count = 0;
+    if (list) compact_list_refresh_visible(list);
+}
+
+static void album_thumbnail_end_screen(lv_obj_t * list) {
+    if (album_thumbnail_active_list != list) return;
+    album_thumbnail_active_list = NULL;
+    album_thumbnail_scrolling = false;
+    album_thumbnail_queue_count = 0;
+    /* Codec work cannot safely be cancelled. Invalidate and discard it
+     * when it completes rather than ever repainting a hidden screen. */
+    album_thumbnail_generation++;
+}
+
 static void album_thumbnail_poll_cb(lv_timer_t * timer) {
     if (!album_thumbnail_active || !album_thumbnail_done) return;
     pthread_join(album_thumbnail_thread, NULL);
     album_thumbnail_active = false;
 
-    if (album_thumbnail_result_generation == album_thumbnail_generation) {
+    bool result_applied = false;
+    if (album_thumbnail_result_generation == album_thumbnail_generation &&
+        album_thumbnail_active_list && album_thumbnail_list_is_visible(album_thumbnail_active_list)) {
         int victim = -1;
         uint32_t oldest = UINT32_MAX;
         for (int i = 0; i < ALBUM_THUMBNAIL_CACHE_SIZE; i++) {
@@ -12515,17 +12836,19 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
             e->dsc.data_size = ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2;
         }
         album_thumbnail_result_pixels = NULL;
+        result_applied = true;
     }
     free(album_thumbnail_result_pixels);
     album_thumbnail_result_pixels = NULL;
-    if (albums_list) compact_list_refresh_visible(albums_list);
-    if (artist_albums_list) compact_list_refresh_visible(artist_albums_list);
+    if (result_applied && album_thumbnail_result_list == album_thumbnail_active_list)
+        compact_list_refresh_item(album_thumbnail_result_list, album_thumbnail_result_logical_index);
+    start_next_album_thumbnail();
     if (!album_thumbnail_active) lv_timer_pause(timer);
 }
 
 static void album_row_thumbnail_decorator(lv_obj_t * list, lv_obj_t * row, lv_obj_t * image,
                                            int logical_index, int pool_slot, int64_t song_id, void * ctx) {
-    (void) list; (void) logical_index; (void) pool_slot; (void) ctx;
+    (void) logical_index; (void) pool_slot; (void) ctx;
     /* 14px card inset + 72px cover + 14px breathing room before text. */
     lv_obj_set_style_pad_left(row, 100, 0);
     album_thumbnail_cache_entry_t * cached = album_thumbnail_cache_find(song_id);
@@ -12537,7 +12860,11 @@ static void album_row_thumbnail_decorator(lv_obj_t * list, lv_obj_t * row, lv_ob
         lv_image_set_src(image, asset_path("touch_list/list_default_album.png"));
         lv_image_set_scale(image, (ALBUM_THUMBNAIL_PX * LV_SCALE_NONE) / 72);
         lv_obj_remove_flag(image, LV_OBJ_FLAG_HIDDEN);
-        if (!cached) launch_album_thumbnail(song_id);
+        int32_t scroll_y = lv_obj_get_scroll_y(list);
+        int32_t row_y = lv_obj_get_y(row);
+        bool in_viewport = row_y + lv_obj_get_height(row) >= scroll_y &&
+                           row_y <= scroll_y + lv_obj_get_height(list);
+        if (!cached && in_viewport) queue_album_thumbnail(list, logical_index, song_id);
     }
 }
 
@@ -12649,6 +12976,9 @@ static lv_obj_t * build_albums_screen(void) {
     }
     compact_list_set_row_decorator(albums_list, album_row_thumbnail_decorator, NULL);
     lv_obj_add_event_cb(scr, album_thumbnail_screen_loaded_cb, LV_EVENT_SCREEN_LOADED, albums_list);
+    lv_obj_add_event_cb(scr, album_thumbnail_screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, albums_list);
+    lv_obj_add_event_cb(albums_list, album_thumbnail_scroll_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(albums_list, album_thumbnail_scroll_cb, LV_EVENT_SCROLL_END, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20163,6 +20493,10 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     compact_list_set_row_height(artist_albums_list, MUSIC_LIST_ROW_HEIGHT);
     lv_obj_add_event_cb(artist_albums_screen, album_thumbnail_screen_loaded_cb,
                         LV_EVENT_SCREEN_LOADED, artist_albums_list);
+    lv_obj_add_event_cb(artist_albums_screen, album_thumbnail_screen_unloaded_cb,
+                        LV_EVENT_SCREEN_UNLOADED, artist_albums_list);
+    lv_obj_add_event_cb(artist_albums_list, album_thumbnail_scroll_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(artist_albums_list, album_thumbnail_scroll_cb, LV_EVENT_SCROLL_END, NULL);
     finalize_screen_navigation(artist_albums_screen);
     text_entry_screen = build_text_entry_screen();
     music_screen = build_music_screen();

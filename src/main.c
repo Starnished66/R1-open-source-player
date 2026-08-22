@@ -38,6 +38,14 @@ static uint32_t custom_tick_get(void) {
     return (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
 }
 
+#ifdef UI_PERF_TRACE
+static uint64_t perf_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t) ts.tv_nsec / 1000ULL;
+}
+#endif
+
 #ifdef HOST_BUILD
 /* gui.h isn't included in the HOST_BUILD branch above (it pulls in
  * target-only headers transitively), so this is the only declaration
@@ -334,11 +342,39 @@ int main(void) {
      * runtime clock that update_timer_cb will read, not the boot clock. */
     gui_reset_interactive_timeout_baseline();
 #endif
+#ifdef UI_PERF_TRACE
+    uint32_t perf_report_tick = last_real_tick;
+    uint64_t perf_handler_total_us = 0;
+    uint64_t perf_handler_max_us = 0;
+    unsigned perf_handler_calls = 0;
+    unsigned perf_handler_over_16ms = 0;
+#endif
     while(1) {
         uint32_t real_tick = custom_tick_get();
         lv_tick_inc(real_tick - last_real_tick);
         last_real_tick = real_tick;
+#ifdef UI_PERF_TRACE
+        uint64_t perf_handler_start_us = perf_now_us();
+#endif
         uint32_t time_till_next = lv_timer_handler();
+#ifdef UI_PERF_TRACE
+        uint64_t perf_handler_us = perf_now_us() - perf_handler_start_us;
+        perf_handler_total_us += perf_handler_us;
+        if (perf_handler_us > perf_handler_max_us) perf_handler_max_us = perf_handler_us;
+        perf_handler_calls++;
+        if (perf_handler_us >= 16000) perf_handler_over_16ms++;
+        if ((uint32_t) (real_tick - perf_report_tick) >= 1000) {
+            printf("PERF main handler calls=%u avg_us=%llu max_us=%llu over16=%u next_ms=%u\n",
+                   perf_handler_calls,
+                   (unsigned long long) (perf_handler_calls ? perf_handler_total_us / perf_handler_calls : 0),
+                   (unsigned long long) perf_handler_max_us, perf_handler_over_16ms, time_till_next);
+            perf_report_tick = real_tick;
+            perf_handler_total_us = 0;
+            perf_handler_max_us = 0;
+            perf_handler_calls = 0;
+            perf_handler_over_16ms = 0;
+        }
+#endif
         /* Real-device bug report: a screen (compact_list's own background-
          * fetch poll timer, screen_builders.c) went permanently blank after
          * scrolling -- confirmed via direct tracing that its fetch actually

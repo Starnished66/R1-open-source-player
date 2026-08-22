@@ -419,6 +419,9 @@ typedef void (*compact_list_row_decorator_cb_t)(lv_obj_t * list, lv_obj_t * row,
                                                 int pool_slot, int64_t identity, void * ctx);
 void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx);
 void compact_list_refresh_visible(lv_obj_t * list);
+/* Re-runs label/accessory decoration for one currently visible logical row.
+ * A row that has already scrolled out is intentionally ignored. */
+void compact_list_refresh_item(lv_obj_t * list, int logical_index);
 
 /* Changes only this compact list's row height. Useful for denser/roomier
  * feature areas without changing Settings and every other shared row. */

@@ -845,10 +845,12 @@ typedef struct {
     int32_t row_height;
     int32_t row_stride;
     int window_start; /* index currently shown by rows[0]; -1 forces the first update to actually run */
+    int refresh_index; /* >=0 requests a targeted repaint without disturbing the recycled window */
     lv_obj_t * rows[COMPACT_LIST_POOL_SIZE];
     lv_obj_t * leading_images[COMPACT_LIST_POOL_SIZE];
     lv_obj_t * trailing_images[COMPACT_LIST_POOL_SIZE];
     void * row_ctx[COMPACT_LIST_POOL_SIZE]; /* opaque to this struct, freed alongside it -- see compact_list_row_ctx_t below */
+    int row_logical_index[COMPACT_LIST_POOL_SIZE]; /* item currently represented by each recycled slot; -1 when unused */
     lv_obj_t * spacer; /* repositioned by compact_list_set_items() when item_count changes */
     lv_obj_t * now_playing_bar; /* NULL if this list wasn't built with enable_now_playing -- see compact_list_set_now_playing() */
     int now_playing_index; /* -1 = nothing playing/matching in this list */
@@ -886,6 +888,7 @@ typedef struct {
 typedef struct {
     compact_list_virtual_data_t * data;
     int pool_slot;
+    int logical_index;
 } compact_list_row_ctx_t;
 
 static void compact_list_row_click_cb(lv_event_t * e) {
@@ -895,7 +898,7 @@ static void compact_list_row_click_cb(lv_event_t * e) {
         ctx->data->long_press_fired = false;
         return;
     }
-    int index = ctx->data->window_start + ctx->pool_slot;
+    int index = ctx->logical_index;
     if (index < 0 || index >= ctx->data->item_count) return; /* this pool slot is currently a hidden, contentless row (list shorter than the pool) -- shouldn't be reachable, guarded anyway */
     ctx->data->on_click(index);
 }
@@ -909,7 +912,7 @@ static void compact_list_row_long_press_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
     compact_list_row_ctx_t * ctx = (compact_list_row_ctx_t *) lv_event_get_user_data(e);
     ctx->data->long_press_fired = true;
-    int index = ctx->data->window_start + ctx->pool_slot;
+    int index = ctx->logical_index;
     if (index < 0 || index >= ctx->data->item_count) return;
     ctx->data->on_long_press(index);
 }
@@ -1121,6 +1124,10 @@ static void compact_list_ensure_cache(lv_obj_t * list, compact_list_virtual_data
  * -1) must still be checked even if the visible window itself hasn't
  * moved, so the cache check runs before that early return. */
 static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_data_t * data) {
+#ifdef UI_PERF_TRACE
+    struct timespec perf_start_ts;
+    clock_gettime(CLOCK_MONOTONIC, &perf_start_ts);
+#endif
     int32_t scroll_y = lv_obj_get_scroll_y(list);
     if (scroll_y < 0) scroll_y = 0;
     int first = (int) (scroll_y / data->row_stride) - COMPACT_LIST_POOL_SIZE / 4;
@@ -1131,16 +1138,33 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
 
     if (data->fetch_page) compact_list_ensure_cache(list, data, first);
 
-    if (first == data->window_start) return;
+    int targeted_index = data->refresh_index;
+    data->refresh_index = -1;
+    if (first == data->window_start && targeted_index < 0) return;
+    bool force_repaint = data->window_start < 0;
     data->window_start = first;
 
+    /* Keep rows tied to logical_index % POOL_SIZE.  Advancing the window by
+     * one row then repaints only the one slot entering at the far edge,
+     * instead of relabelling/redecorating all 20 rows on every scroll tick.
+     * A forced refresh (window_start == -1) still repaints the whole window
+     * after a page fetch, theme change, or explicit refresh request. */
+    int window_end = first + COMPACT_LIST_POOL_SIZE;
     for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) {
-        int index = first + slot;
-        lv_obj_t * row = data->rows[slot];
-        if (index >= data->item_count) {
-            lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
-            continue;
+        int old_index = data->row_logical_index[slot];
+        if (old_index < first || old_index >= window_end || old_index >= data->item_count) {
+            lv_obj_add_flag(data->rows[slot], LV_OBJ_FLAG_HIDDEN);
+            data->row_logical_index[slot] = -1;
+            ((compact_list_row_ctx_t *) data->row_ctx[slot])->logical_index = -1;
         }
+    }
+
+    for (int index = first; index < window_end && index < data->item_count; index++) {
+        int slot = index % COMPACT_LIST_POOL_SIZE;
+        lv_obj_t * row = data->rows[slot];
+        if (!force_repaint && data->row_logical_index[slot] == index && index != targeted_index) continue;
+        data->row_logical_index[slot] = index;
+        ((compact_list_row_ctx_t *) data->row_ctx[slot])->logical_index = index;
         lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_y(row, COMPACT_LIST_TOP_PAD + index * data->row_stride);
         if (data->fetch_page) {
@@ -1193,6 +1217,16 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
         lv_obj_align(data->trailing_images[slot], LV_ALIGN_RIGHT_MID,
                      pad_right - 14, (pad_top - pad_bottom) / -2);
     }
+#ifdef UI_PERF_TRACE
+    struct timespec perf_end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &perf_end_ts);
+    long perf_us = (perf_end_ts.tv_sec - perf_start_ts.tv_sec) * 1000000L +
+                   (perf_end_ts.tv_nsec - perf_start_ts.tv_nsec) / 1000L;
+    if (perf_us >= 1000) {
+        printf("PERF compact_window us=%ld first=%d paged=%d items=%d\n",
+               perf_us, first, data->fetch_page != NULL, data->item_count);
+    }
+#endif
 }
 
 /* Checks data->pending_job (set by compact_list_ensure_cache() above) for
@@ -1408,6 +1442,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     data->row_height = LIST_ROW_HEIGHT;
     data->row_stride = COMPACT_LIST_ROW_STRIDE;
     data->window_start = -1;
+    data->refresh_index = -1;
     data->items = NULL;
     if (item_count > 0) {
         data->items = malloc(sizeof(compact_list_item_t) * (size_t) item_count);
@@ -1441,6 +1476,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
         lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN); /* shown by the initial window update below once it has real content */
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         data->rows[slot] = row;
+        data->row_logical_index[slot] = -1;
 
         lv_obj_t * leading = lv_image_create(row);
         lv_obj_align(leading, LV_ALIGN_LEFT_MID, 14, 0);
@@ -1457,6 +1493,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
         compact_list_row_ctx_t * ctx = malloc(sizeof(*ctx));
         ctx->data = data;
         ctx->pool_slot = slot;
+        ctx->logical_index = -1;
         data->row_ctx[slot] = ctx;
         lv_obj_add_event_cb(row, compact_list_row_click_cb, LV_EVENT_CLICKED, ctx);
         if (on_long_press) lv_obj_add_event_cb(row, compact_list_row_long_press_cb, LV_EVENT_LONG_PRESSED, ctx);
@@ -1527,6 +1564,15 @@ void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_
 void compact_list_refresh_visible(lv_obj_t * list) {
     compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
     data->window_start = -1;
+    compact_list_update_window(list, data);
+}
+
+void compact_list_refresh_item(lv_obj_t * list, int logical_index) {
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    if (!data || logical_index < 0 || logical_index >= data->item_count) return;
+    int slot = logical_index % COMPACT_LIST_POOL_SIZE;
+    if (data->row_logical_index[slot] != logical_index) return; /* no longer visible */
+    data->refresh_index = logical_index;
     compact_list_update_window(list, data);
 }
 

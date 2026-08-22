@@ -188,6 +188,13 @@ ifneq ($(TEST_BUILD_TAG),)
 TEST_BUILD_TAG_DEFINE = -DTEST_BUILD_TAG=\"$(TEST_BUILD_TAG)\"
 endif
 
+# Optional low-overhead timing diagnostics for real-device UI profiling.
+# Kept out of normal/release builds unless explicitly requested with
+# `make target UI_PERF_TRACE=1`.
+ifneq ($(UI_PERF_TRACE),)
+UI_PERF_TRACE_DEFINE = -DUI_PERF_TRACE=1
+endif
+
 # Always defined (no flag needed) -- the fallback the About screen's
 # version line uses when TEST_BUILD_TAG isn't set, e.g. a real flashed
 # deployment via the user's own repack process rather than an adb-pushed
@@ -196,8 +203,8 @@ endif
 # built, not when the Makefile was last edited.
 BUILD_STAMP_DEFINE = -DBUILD_STAMP=\"$(shell date +%Y-%m-%d_%H:%M)\"
 
-TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(BUILD_STAMP_DEFINE)
-TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(BUILD_STAMP_DEFINE)
 TINYALSA_CFLAGS = -O3 -g -Wall -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 # DBUS_COMPILATION/DBUS_STATIC_BUILD: libdbus's own headers gate some
 # declarations on these (matching how its own build always defines them

@@ -103,6 +103,14 @@ void metadata_db_get_group_counts(int * out_artist_count, int * out_album_artist
  * than max_rows (including 0) means this was the last page. */
 int metadata_db_get_songs_page(const char * after_title, int64_t after_id, int max_rows, song_row_t * out_rows);
 
+/* Offset-paginated page of songs ordered by first_seen DESC (rowid DESC
+ * tiebreak) -- backs the Recently Added screen's compact_list_set_paged_
+ * provider(), the same bounded-page-at-a-time shape metadata_db_get_songs_
+ * filtered_page() gives All Songs, rather than loading the whole library
+ * into RAM. Pair with metadata_db_get_song_recency_offset() below for a
+ * "now playing" position in this same order. */
+int metadata_db_get_songs_page_by_recency(int offset, int max_rows, song_row_t * out_rows);
+
 /* Offset-paginated page of distinct values of the named column, ordered
  * alphabetically (COLLATE NOCASE) -- ARTIST/ALBUM_ARTIST kinds only in
  * practice (every real caller wants "all albums" grouped by the *pair*
@@ -144,6 +152,11 @@ bool metadata_db_get_song_by_path(const char * path, song_row_t * out_row);
 void metadata_db_get_songs_by_ids(const int64_t * ids, int count, song_row_t * out_rows);
 void metadata_db_get_songs_by_paths(const char * const * paths, int count, song_row_t * out_rows);
 int64_t metadata_db_get_song_title_offset(const char * path);
+
+/* Same role as metadata_db_get_song_title_offset() above, but for the
+ * Recently Added screen's own order -- see metadata_db_get_songs_page_by_
+ * recency()'s own comment for the exact ORDER BY this matches. */
+int64_t metadata_db_get_song_recency_offset(const char * path);
 int64_t metadata_db_get_group_offset(metadata_db_group_kind_t kind, const char * name, const char * album_artist);
 
 /* 27-entry (A-Z, then '#') table of "display offset of the first entry at
@@ -333,6 +346,17 @@ void metadata_db_song_play_count_increment(const char * path);
  * auto-generated playlist. Caller-owned array; *out_paths is NULL and
  * *out_count is 0 if there's no play history yet. */
 void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_count);
+
+/* Enumerates up to `limit` paths, most-recently-added first (by first_seen,
+ * a dedicated column set only on a row's original INSERT -- see this file's
+ * own CREATE TABLE/metadata_db_put() comments for why mtime alone isn't used:
+ * a legitimate retag of an existing file bumps mtime but must NOT resurface
+ * it at the top of this list). Unlike metadata_db_load_favorite_songs()/
+ * metadata_db_load_top_played_songs() there's no separate side table to
+ * filter staleness against -- this queries `media` directly. Caller-owned
+ * array; *out_paths is NULL and *out_count is 0 if the cache is empty or
+ * unopened. */
+void metadata_db_load_recently_added_songs(int limit, char *** out_paths, int * out_count);
 
 /* Saved Subsonic server profiles -- the "Saved Servers" list in gui.c's
  * Subsonic setup flow reads/writes this instead of the single-connection

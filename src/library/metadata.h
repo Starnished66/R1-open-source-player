@@ -41,6 +41,17 @@ typedef struct {
     uint8_t * picture_data;
     uint32_t picture_size;
 
+    /* Embedded lyrics text (MP3/AAC/AIFF/WAV/DSF/DFF ID3v2 USLT, FLAC/Opus
+     * VORBIS_COMMENT LYRICS/UNSYNCEDLYRICS, M4A "\xA9lyr" atom) -- raw text
+     * exactly as embedded, NUL-terminated, UTF-8. May or may not contain
+     * [mm:ss.xx]-style LRC timestamps; callers should try lyrics_parse_buffer()
+     * (lyrics.h) first and fall back to displaying it as a plain unsynced
+     * block if that yields no lines, same as an external .lrc sidecar's own
+     * content would need. NULL if the file has none or isn't a supported
+     * container. malloc'd by metadata_read(); caller takes ownership and
+     * must free() it -- same ownership contract as picture_data above. */
+    char * lyrics;
+
     /* ReplayGain track gain/peak -- FLAC VORBIS_COMMENT REPLAYGAIN_TRACK_GAIN
      * / _PEAK, or MP3 ID3v2 TXXX frames with those same description names
      * (the RVA2 binary frame some taggers write instead isn't parsed).
@@ -55,15 +66,15 @@ typedef struct {
     double replaygain_peak;
 } track_metadata_t;
 
-/* Reads title/artist/album/album_artist/genre tags, embedded cover art, and
- * ReplayGain track gain (if present) from a FLAC (VORBIS_COMMENT +
- * METADATA_BLOCK_PICTURE), MP3 (ID3v2 APIC/TXXX/TPE2/TCON, falling back to
- * ID3v1 which has none of those), M4A (moov/udta/meta/ilst atoms), or WAV
- * (RIFF LIST/INFO, title/artist/album only) file. Fields that aren't
- * present or can't be parsed are left as empty/NULL with the corresponding
- * has_* flag (or a NULL check, for the picture) false -- callers should
- * fall back to the filename, a placeholder image, or no gain adjustment in
- * that case. */
+/* Reads title/artist/album/album_artist/genre tags, embedded cover art,
+ * embedded lyrics, and ReplayGain track gain (if present) from a FLAC
+ * (VORBIS_COMMENT + METADATA_BLOCK_PICTURE), MP3 (ID3v2 APIC/USLT/TXXX/TPE2/
+ * TCON, falling back to ID3v1 which has none of those), M4A (moov/udta/meta/
+ * ilst atoms), or WAV (RIFF LIST/INFO, title/artist/album only, plus an ID3v2
+ * USLT fallback for lyrics) file. Fields that aren't present or can't be
+ * parsed are left as empty/NULL with the corresponding has_* flag (or a NULL
+ * check, for the picture/lyrics) false -- callers should fall back to the
+ * filename, a placeholder image, or no gain adjustment in that case. */
 void metadata_read(const char * path, track_metadata_t * out);
 
 /* Same as metadata_read(), but the actual parse runs in a short-lived
@@ -74,7 +85,7 @@ void metadata_read(const char * path, track_metadata_t * out);
  * metadata_read() alone. On timeout (or if the child crashes before
  * finishing), *out is left the same as metadata_read()'s own "couldn't
  * read tags" case: zeroed, every has_* flag false. picture_data/
- * picture_size always come back NULL/0 regardless of what the file
+ * picture_size/lyrics always come back NULL/0 regardless of what the file
  * actually has -- see the .c file's own comment for why. */
 void metadata_read_isolated(const char * path, track_metadata_t * out, int timeout_ms);
 

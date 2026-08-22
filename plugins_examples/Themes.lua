@@ -102,18 +102,36 @@ local COLORS = {
               text_primary = 0x1A1A1A, text_muted = 0x6E6E6E },
 }
 
+-- Real-device bug report: booting straight into the open player with this
+-- plugin already set to "white" left the UI in a half-and-half state --
+-- e.g. the screen background switched to white but list rows stayed dark,
+-- with text unreadable against whichever background it landed on -- and
+-- the only fix that stuck was reflashing stock, factory-resetting, and
+-- reflashing the open player again. Root cause: this function used to do
+-- the ~90-icon copy loop FIRST and the 5 color calls LAST, so any single
+-- color call failing partway through (or something interrupting the script
+-- between them) left an inconsistent mix of old/new colors -- and neither
+-- pcall'd loop iteration nor an uncaught error in one call protected the
+-- calls after it. Colors now go FIRST, each individually pcall'd so one
+-- failure can't skip the rest, and are applied in a fixed "backgrounds
+-- before text" order so if something still does interrupt this mid-way,
+-- the worst case is unstyled text on a correctly-recolored background
+-- (readable, if plain) rather than text and background from two different
+-- themes (unreadable). The icon loop -- slower, more failure-prone (each
+-- one's own file copy), and merely cosmetic if some icons stay stale --
+-- runs after, unchanged in shape.
 local function apply_theme(state)
+    local c = COLORS[state]
+    pcall(plugin.set_background_color, "screen", c.screen)
+    pcall(plugin.set_background_color, "card", c.card)
+    pcall(plugin.set_background_color, "list_row", c.list_row)
+    pcall(plugin.set_text_color, "primary", c.text_primary)
+    pcall(plugin.set_text_color, "muted", c.text_muted)
+
     local source_root = (state == "white") and THEME1_ROOT or THEME2_ROOT
     for _, rel in ipairs(ASSETS) do
         pcall(plugin.set_icon, rel, source_root .. rel)
     end
-
-    local c = COLORS[state]
-    plugin.set_background_color("screen", c.screen)
-    plugin.set_background_color("card", c.card)
-    plugin.set_background_color("list_row", c.list_row)
-    plugin.set_text_color("primary", c.text_primary)
-    plugin.set_text_color("muted", c.text_muted)
 end
 
 local current_state = read_state()

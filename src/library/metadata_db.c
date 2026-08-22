@@ -117,8 +117,13 @@ static void prepare_statements(void) {
     sqlite3_prepare_v2(db,
         "SELECT mtime, size, title, artist, album, album_artist, genre FROM media WHERE path = ?;",
         -1, &stmt_get, NULL);
+    /* first_seen is bound only for the INSERT branch (a fresh row, see
+     * metadata_db_put() below) and deliberately absent from the ON CONFLICT
+     * DO UPDATE SET clause -- an update to an already-tracked row must never
+     * touch it, see the column's own migration comment above for why. */
     sqlite3_prepare_v2(db,
-        "INSERT INTO media (path, mtime, size, title, artist, album, album_artist, genre, scan_generation) VALUES (?,?,?,?,?,?,?,?,?) "
+        "INSERT INTO media (path, mtime, size, title, artist, album, album_artist, genre, scan_generation, first_seen) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size, title=excluded.title, "
         "artist=excluded.artist, album=excluded.album, album_artist=excluded.album_artist, genre=excluded.genre, "
         "scan_generation=excluded.scan_generation;",
@@ -398,7 +403,8 @@ void metadata_db_open(void) {
         "  album TEXT NOT NULL,"
         "  album_artist TEXT NOT NULL,"
         "  genre TEXT NOT NULL,"
-        "  scan_generation INTEGER NOT NULL DEFAULT 0"
+        "  scan_generation INTEGER NOT NULL DEFAULT 0,"
+        "  first_seen INTEGER NOT NULL DEFAULT 0"
         ");",
         NULL, NULL, NULL);
     /* Migration for a database created before the title column existed --
@@ -410,6 +416,16 @@ void metadata_db_open(void) {
      * standard way to make this idempotent. */
     sqlite3_exec(db, "ALTER TABLE media ADD COLUMN title TEXT NOT NULL DEFAULT '';", NULL, NULL, NULL);
     sqlite3_exec(db, "ALTER TABLE media ADD COLUMN scan_generation INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
+    /* first_seen backs the Recently Added smart playlist (Music -> Playlists)
+     * -- deliberately NOT mtime (the file's own filesystem last-modified
+     * time, already tracked above): mtime gets legitimately bumped by a
+     * later retag/edit of a song already in the library, which would
+     * incorrectly resurface it at the top of Recently Added. first_seen is
+     * set once, only on a row's very first INSERT (see metadata_db_put()
+     * below) -- 0 for any row that predates this migration, which just
+     * sorts old rows to the bottom of Recently Added rather than the top,
+     * a reasonable default (nothing false-positives as "newly added"). */
+    sqlite3_exec(db, "ALTER TABLE media ADD COLUMN first_seen INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
 
     /* Covering indexes for every paged browse order the metadata_db_get_*_page()
      * functions below use -- CREATE INDEX IF NOT EXISTS is safe to run on
@@ -598,6 +614,7 @@ void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cache
     sqlite3_bind_text(stmt_put, 7, tags->album_artist, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt_put, 8, tags->genre, -1, SQLITE_STATIC);
     sqlite3_bind_int64(stmt_put, 9, update_generation);
+    sqlite3_bind_int64(stmt_put, 10, (int64_t) time(NULL)); /* only takes effect on a fresh INSERT -- see stmt_put's own comment */
     if (sqlite3_step(stmt_put) != SQLITE_DONE) update_failed = true;
     metadata_db_update_checkpoint_if_needed();
 }
@@ -724,6 +741,33 @@ int metadata_db_get_songs_page(const char * after_title, int64_t after_id, int m
         sqlite3_bind_int(st, 1, max_rows);
     }
     count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_rows, max_rows);
+    sqlite3_finalize(st);
+    return count;
+}
+
+/* Offset-paginated page of songs ordered by first_seen DESC (rowid DESC
+ * tiebreak) -- backs the Recently Added screen's own compact_list_set_
+ * paged_provider(), same "bounded page at a time, regardless of library
+ * size" shape as metadata_db_get_songs_filtered_page() (used by All Songs)
+ * rather than metadata_db_load_recently_added_songs() above (deliberately
+ * capped at a small limit, for the scoped-playlist/remote-control case
+ * only -- see its own comment). Offset-based, not keyset, matching every
+ * other compact_list-paged provider's own query (Artists/Albums/Album
+ * Artist/All Songs) -- a virtualized UI list needs arbitrary scroll-driven
+ * jumps, not just "next page". */
+int metadata_db_get_songs_page_by_recency(int offset, int max_rows, song_row_t * out_rows) {
+    METADATA_DB_GUARD;
+    if (!db || max_rows <= 0) return 0;
+    if (offset < 0) offset = 0;
+
+    static const char * const query =
+        "SELECT rowid, path, title, artist, album, album_artist, genre FROM media "
+        "ORDER BY first_seen DESC, rowid DESC LIMIT ? OFFSET ?;";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, max_rows);
+    sqlite3_bind_int(st, 2, offset);
+    int count = fill_song_rows(st, 0, 1, 2, 3, 4, 5, 6, out_rows, max_rows);
     sqlite3_finalize(st);
     return count;
 }
@@ -1117,6 +1161,27 @@ int64_t metadata_db_get_song_title_offset(const char * path) {
         "SELECT COUNT(*) FROM media AS preceding, media AS target "
         "WHERE target.path = ? AND (preceding.title COLLATE NOCASE < target.title COLLATE NOCASE "
         "OR (preceding.title COLLATE NOCASE = target.title COLLATE NOCASE AND preceding.rowid < target.rowid));";
+    sqlite3_stmt * st = NULL;
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+    int64_t offset = -1;
+    if (sqlite3_step(st) == SQLITE_ROW) offset = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return offset;
+}
+
+/* Same role as metadata_db_get_song_title_offset() above, but resolving a
+ * position in the Recently Added screen's own order (first_seen DESC, rowid
+ * DESC tiebreak -- matching metadata_db_get_songs_page_by_recency()'s own
+ * ORDER BY exactly, so a "now playing" offset from here always lands on the
+ * right row of that screen's paged provider) rather than title order. */
+int64_t metadata_db_get_song_recency_offset(const char * path) {
+    METADATA_DB_GUARD;
+    if (!db || !path) return -1;
+    static const char * const query =
+        "SELECT COUNT(*) FROM media AS preceding, media AS target "
+        "WHERE target.path = ? AND (preceding.first_seen > target.first_seen "
+        "OR (preceding.first_seen = target.first_seen AND preceding.rowid > target.rowid));";
     sqlite3_stmt * st = NULL;
     if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
@@ -1757,6 +1822,43 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
         "INNER JOIN media ON media.path = song_play_count.path "
         "ORDER BY song_play_count.count DESC, song_play_count.last_played DESC "
         "LIMIT ?;";
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int(st, 1, limit);
+
+    char ** paths = malloc(sizeof(char *) * (size_t) limit);
+    int i = 0;
+    while (i < limit && sqlite3_step(st) == SQLITE_ROW) {
+        paths[i] = strdup(col_text(st, 0));
+        i++;
+    }
+    sqlite3_finalize(st);
+
+    if (i == 0) {
+        free(paths);
+        return;
+    }
+
+    *out_paths = paths;
+    *out_count = i;
+}
+
+void metadata_db_load_recently_added_songs(int limit, char *** out_paths, int * out_count) {
+    METADATA_DB_GUARD;
+    *out_paths = NULL;
+    *out_count = 0;
+    if (!db || limit <= 0) return;
+
+    sqlite3_stmt * st = NULL;
+    /* No INNER JOIN needed, unlike metadata_db_load_favorite_songs()/
+     * metadata_db_load_top_played_songs() above -- this queries `media`
+     * directly (first_seen lives there, not a separate side table), so
+     * there's no separate table that could reference a since-removed path
+     * to filter staleness against in the first place. path COLLATE NOCASE
+     * as the tiebreaker for two rows sharing the same first_seen value
+     * (e.g. a whole album's worth of files scanned in the same pass) gives
+     * a stable, deterministic order rather than an unspecified one. */
+    static const char * const query =
+        "SELECT path FROM media ORDER BY first_seen DESC, path COLLATE NOCASE LIMIT ?;";
     if (sqlite3_prepare_v2(db, query, -1, &st, NULL) != SQLITE_OK) return;
     sqlite3_bind_int(st, 1, limit);
 

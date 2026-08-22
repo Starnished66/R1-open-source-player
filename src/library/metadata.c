@@ -59,6 +59,21 @@ static void apply_vorbis_comment_field(track_metadata_t * out, const char * comm
         copy_bounded(value_buf, sizeof(value_buf), value, value_len);
         out->replaygain_peak = strtod(value_buf, NULL);
         out->has_replaygain_peak = true;
+    } else if (out->lyrics == NULL && value_len > 0 &&
+               ((key_len == 6 && strncasecmp(comment, "LYRICS", 6) == 0) ||
+                (key_len == 14 && strncasecmp(comment, "UNSYNCEDLYRICS", 14) == 0))) {
+        /* Plain UTF-8 text, no ID3v2-style encoding byte to strip -- unlike
+         * decode_id3v2_uslt_frame()'s own malloc'd buffer, this is just a
+         * straight copy. Keeps the first of either key found, same
+         * first-wins precedent as picture_data. May or may not contain
+         * [mm:ss.xx] LRC timestamps -- see track_metadata_t's own lyrics
+         * field comment. */
+        char * lyrics = malloc(value_len + 1);
+        if (lyrics) {
+            memcpy(lyrics, value, value_len);
+            lyrics[value_len] = '\0';
+            out->lyrics = lyrics;
+        }
     }
 }
 
@@ -367,6 +382,53 @@ static void decode_id3v2_pic_frame(const uint8_t * data, uint32_t size, track_me
     }
 }
 
+/* USLT (Unsynchronised lyrics/text transcription) frame body: 1 byte text
+ * encoding, a FIXED 3-byte language code (not null-terminated -- e.g. "eng",
+ * always exactly 3 bytes), a short content-descriptor string terminated per
+ * the encoding byte (almost always empty in practice), then the actual
+ * lyrics text (encoded the same way as the description) running to the end
+ * of the frame with no terminator required -- same overall shape as TXXX's
+ * own description+value pair above, just with a fixed-width field first
+ * instead of another terminated one. Despite the "Unsynchronised" name, some
+ * taggers embed real [mm:ss.xx]-tagged LRC text here anyway -- the caller
+ * (lyrics_load_thread_func(), gui.c) tries lrc parsing first and falls back
+ * to a plain unsynced display otherwise, same treatment an external .lrc
+ * sidecar's own content would need if it turned out to have no timestamps. */
+static void decode_id3v2_uslt_frame(const uint8_t * data, uint32_t size, track_metadata_t * out) {
+    if (out->lyrics != NULL || size < 5) return; /* keep the first lyrics frame found, same as APIC's picture */
+
+    uint8_t encoding = data[0];
+    uint32_t desc_start = 1 + 3; /* encoding byte + fixed 3-byte language code */
+
+    uint32_t text_start = id3v2_terminated_field_end(data, size, desc_start, encoding);
+    if (text_start == 0 || text_start > size) return; /* malformed -- no terminator found */
+
+    uint32_t text_len = size - text_start;
+    if (text_len == 0) return;
+
+    /* decode_id3v2_text_frame() expects data[0] to be the encoding byte, so
+     * re-prefix the text into a malloc'd buffer the same way decode_id3v2_
+     * txxx_frame() does for its own (much smaller) fields -- lyrics can run
+     * several KB, so this can't reuse a small stack buffer. text_len*2+16 is
+     * a generous worst-case UTF-16-source-to-UTF-8 expansion bound (see
+     * decode_id3v2_text_frame()'s own 4-bytes-out-per-2-bytes-in surrogate
+     * pair handling), plenty for Latin-1/UTF-8 source (1 byte in, at most 1
+     * byte out) too. */
+    uint8_t * prefixed = malloc((size_t) text_len + 1);
+    if (!prefixed) return;
+    prefixed[0] = encoding;
+    memcpy(prefixed + 1, data + text_start, text_len);
+
+    size_t out_size = (size_t) text_len * 2 + 16;
+    char * lyrics = malloc(out_size);
+    if (lyrics) {
+        decode_id3v2_text_frame(prefixed, text_len + 1, lyrics, out_size);
+        if (lyrics[0] != '\0') out->lyrics = lyrics;
+        else free(lyrics);
+    }
+    free(prefixed);
+}
+
 static bool read_id3v2(FILE * f, track_metadata_t * out) {
     uint8_t header[10];
     if (fread(header, 1, sizeof(header), f) != sizeof(header)) return false;
@@ -611,6 +673,9 @@ static bool read_id3v2(FILE * f, track_metadata_t * out) {
             } else if (strcmp(frame_id, "TXXX") == 0) {
                 decode_id3v2_txxx_frame(frame_data, frame_data_size, out);
                 found_any = true;
+            } else if (strcmp(frame_id, "USLT") == 0) {
+                decode_id3v2_uslt_frame(frame_data, frame_data_size, out);
+                found_any = true;
             }
         }
 
@@ -800,6 +865,29 @@ static void m4a_read_cover_art(FILE * f, m4a_box_t item, track_metadata_t * out)
     }
 }
 
+/* "\xA9lyr" atom -- same nested "data" box shape as every other ilst item,
+ * plain UTF-8 text (no encoding byte, unlike ID3v2's USLT) -- same malloc'd-
+ * buffer-plus-NUL-terminator shape as m4a_read_cover_art() just above, text
+ * instead of binary. May or may not contain [mm:ss.xx] LRC timestamps -- see
+ * track_metadata_t's own lyrics field comment. */
+static void m4a_read_lyrics_tag(FILE * f, m4a_box_t item, track_metadata_t * out) {
+    if (out->lyrics != NULL) return; /* keep the first found, same as cover art */
+
+    long payload_offset;
+    uint32_t payload_size;
+    if (!m4a_find_data_payload(f, item, &payload_offset, &payload_size) || payload_size == 0) return;
+
+    char * data = malloc((size_t) payload_size + 1);
+    if (!data) return;
+    fseek(f, payload_offset, SEEK_SET);
+    if (fread(data, 1, payload_size, f) == payload_size) {
+        data[payload_size] = '\0';
+        out->lyrics = data;
+    } else {
+        free(data);
+    }
+}
+
 static void read_m4a_metadata(const char * path, track_metadata_t * out) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
@@ -848,6 +936,8 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out) {
             m4a_read_text_tag(f, item, out->genre, sizeof(out->genre), &out->has_genre);
         } else if (strcmp(item.type, "covr") == 0) {
             m4a_read_cover_art(f, item, out);
+        } else if (strcmp(item.type, "\xA9" "lyr") == 0) {
+            m4a_read_lyrics_tag(f, item, out);
         }
 
         long next = (long) (item.data_start - item.header_size) + (long) item.size;
@@ -1416,11 +1506,12 @@ void metadata_read(const char * path, track_metadata_t * out) {
  * thread, the OS fully reclaims a killed process's CPU and memory
  * immediately, and a hard crash inside the decoder (a plausible cause
  * given garbage data is being parsed as if it were valid) is contained to
- * that one child instead of taking down the whole app. picture_data is
- * always dropped (freed in the child, never sent back) -- getting a
+ * that one child instead of taking down the whole app. picture_data/lyrics
+ * are always dropped (freed in the child, never sent back) -- getting a
  * variable-length buffer across a fork boundary isn't worth the
  * complexity for the one caller (a bulk library scan) that needs this,
- * which already discards the picture right after this call anyway. */
+ * which already discards the picture/lyrics right after this call anyway
+ * (a rescan only cares about title/artist/album for the DB). */
 void metadata_read_isolated(const char * path, track_metadata_t * out, int timeout_ms) {
     memset(out, 0, sizeof(*out));
 
@@ -1445,6 +1536,8 @@ void metadata_read_isolated(const char * path, track_metadata_t * out, int timeo
         free(result.picture_data);
         result.picture_data = NULL;
         result.picture_size = 0;
+        free(result.lyrics);
+        result.lyrics = NULL;
         size_t written = 0;
         while (written < sizeof(result)) {
             ssize_t n = write(pipefd[1], (const char *) &result + written, sizeof(result) - written);

@@ -34,30 +34,45 @@
 extern lv_font_t app_font_16;
 extern lv_font_t app_font_22;
 extern lv_font_t app_font_28;
+/* Real-device request: the fullscreen lyrics view needs its own, separate
+ * text-size control (Settings -> Lyrics Text Size, player_settings_t.
+ * lyrics_font_size_tier) rather than following font_size_tier like every
+ * other app_font_* above -- scaling lyrics down along with a smaller
+ * general text-size choice made them hard to read. Only Medium (1) and
+ * Large (2, the default) are offered, both mapped to the exact same pixel
+ * sizes font_size_tier's own Medium/BlindMF tiers already use for their
+ * 28px slot (32px/40px) -- no new sizes invented, just a size CHOICE
+ * decoupled from the rest of the UI's own tier. Same non-Latin (Cyrillic/
+ * Japanese/Korean/Thai) fallback chain as the three tier-following fonts
+ * above. */
+extern lv_font_t app_font_lyrics;
 
 /* Copies the three Montserrat fonts' own metrics into the globals above,
  * with .fallback left NULL (identical rendering to plain Montserrat until
  * fallback_font_load_deferred() below runs) -- and sizes them per
  * font_size_tier (0=Small/1=Medium/2=BlindMF, see settings.h): Small uses
- * the original 16/22/28, Medium 20/26/32, BlindMF 24/34/40. Call once,
- * before gui_init() builds any screen -- every label/style that captures
- * &app_font_16/&app_font_22/&app_font_28 at construction time keeps that
- * same address for the app's whole lifetime, so filling in .fallback later
- * is enough to make already-built screens pick up the change on their next
- * redraw. The tier passed here is also remembered for
- * fallback_font_schedule_deferred_load() below, so the CJK/Korean/Thai
- * fallback fonts it loads match whatever size Montserrat itself was just
+ * the original 16/22/28, Medium 20/26/32, BlindMF 24/34/40.
+ * lyrics_font_size_tier (1=Medium/2=Large only, see settings.h) separately
+ * sizes app_font_lyrics -- see its own comment above. Call once, before
+ * gui_init() builds any screen -- every label/style that captures
+ * &app_font_16/&app_font_22/&app_font_28/&app_font_lyrics at construction
+ * time keeps that same address for the app's whole lifetime, so filling in
+ * .fallback later is enough to make already-built screens pick up the
+ * change on their next redraw. Both tiers passed here are also remembered
+ * for fallback_font_schedule_deferred_load() below, so the CJK/Korean/Thai
+ * fallback fonts it loads match whatever sizes Montserrat itself was just
  * set to, instead of being hardcoded back to the Small sizes. */
-void fallback_font_init_early(int font_size_tier);
+void fallback_font_init_early(int font_size_tier, int lyrics_font_size_tier);
 
 /* Schedules the actual (heavier, and historically the risky part) font
  * load -- opens and rasterizes-on-demand from assets/fonts/cjk_cyrillic.ttf
  * via LVGL's tiny_ttf renderer, then wires the result into app_font_16/
- * app_font_22/app_font_28's own .fallback field -- on a one-shot lv_timer
- * instead of running it directly. Call once, as the very last thing
- * gui_init() does (after the screen is already showing and any auto-resume
- * playback has already started) -- see fallback_font.c's own comment on
- * why this can't be reachable from anywhere earlier on the startup path. */
+ * app_font_22/app_font_28/app_font_lyrics's own .fallback field -- on a
+ * one-shot lv_timer instead of running it directly. Call once, as the very
+ * last thing gui_init() does (after the screen is already showing and any
+ * auto-resume playback has already started) -- see fallback_font.c's own
+ * comment on why this can't be reachable from anywhere earlier on the
+ * startup path. */
 void fallback_font_schedule_deferred_load(void);
 
 #endif /* FALLBACK_FONT_H */

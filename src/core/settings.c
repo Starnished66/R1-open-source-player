@@ -120,7 +120,9 @@ static void set_defaults(player_settings_t * out) {
     out->startup_volume_fixed_percent = 20;
     out->sleep_timer_minutes = 15;
     out->timezone[0] = '\0';
+    out->hostname[0] = '\0'; /* empty -- stock's own /usr/resource/hostname stays in effect */
     out->font_size_tier = 0;
+    out->lyrics_font_size_tier = 2; /* Large -- see settings.h's own comment */
     out->brightness_percent = 80;
     out->clock_24h = true; /* matches the app's original, only-ever clock format -- existing installs see no change */
 }
@@ -221,8 +223,12 @@ bool settings_load(player_settings_t * out) {
             out->sleep_timer_minutes = atoi(value);
         } else if (strcmp(key, "timezone") == 0) {
             snprintf(out->timezone, sizeof(out->timezone), "%s", value);
+        } else if (strcmp(key, "hostname") == 0) {
+            snprintf(out->hostname, sizeof(out->hostname), "%s", value);
         } else if (strcmp(key, "font_size_tier") == 0) {
             out->font_size_tier = atoi(value);
+        } else if (strcmp(key, "lyrics_font_size_tier") == 0) {
+            out->lyrics_font_size_tier = atoi(value);
         } else if (strcmp(key, "brightness_percent") == 0) {
             out->brightness_percent = atoi(value);
         } else if (strcmp(key, "clock_24h") == 0) {
@@ -233,6 +239,7 @@ bool settings_load(player_settings_t * out) {
     if (out->usb_mode < 0 || out->usb_mode > 2) out->usb_mode = 0; /* defensive re-clamp, same reasoning as screen_timeout_seconds -- the settings file is plaintext and could be hand-edited out of range */
     if (out->play_mode < 0 || out->play_mode > 3) out->play_mode = 0;
     if (out->font_size_tier < 0 || out->font_size_tier > 2) out->font_size_tier = 0;
+    if (out->lyrics_font_size_tier != 1 && out->lyrics_font_size_tier != 2) out->lyrics_font_size_tier = 2; /* Medium/Large only, see settings.h */
     if (out->startup_volume_fixed_percent < 0 || out->startup_volume_fixed_percent > 100) out->startup_volume_fixed_percent = 20;
     if (out->brightness_percent < 0 || out->brightness_percent > 100) out->brightness_percent = 80;
     if (out->resume_mode < 0 || out->resume_mode > 2) out->resume_mode = 0;
@@ -340,7 +347,9 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "startup_volume_fixed_percent=%d\n", settings->startup_volume_fixed_percent);
     fprintf(f, "sleep_timer_minutes=%d\n", settings->sleep_timer_minutes);
     fprintf(f, "timezone=%s\n", settings->timezone);
+    fprintf(f, "hostname=%s\n", settings->hostname);
     fprintf(f, "font_size_tier=%d\n", settings->font_size_tier);
+    fprintf(f, "lyrics_font_size_tier=%d\n", settings->lyrics_font_size_tier);
     fprintf(f, "brightness_percent=%d\n", settings->brightness_percent);
     fprintf(f, "clock_24h=%d\n", settings->clock_24h ? 1 : 0);
 

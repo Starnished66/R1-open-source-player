@@ -256,6 +256,23 @@ typedef struct {
      * the box), so time displays in UTC until a zone is chosen. */
     char timezone[64];
 
+    /* Settings -> System -> Hostname. Empty means "use the stock device
+     * name" (/usr/resource/hostname, baked into the read-only squashfs at
+     * build time -- this app has no write access there). When non-empty,
+     * applied at every boot by apply_custom_hostname() (main.c), which
+     * bind-mounts a writable copy over BOTH /usr/resource/hostname and
+     * /usr/resource/bt_name (the same file already drives the DHCP
+     * hostname wifi_on.sh advertises and the Bluetooth alias bt_init sets
+     * -- see apply_custom_hostname()'s own comment) and calls sethostname()
+     * for the kernel's own copy. Requires a reboot to take effect since
+     * both wifi_on.sh and bt_init only ever read their file once, at the
+     * point something turns Wi-Fi/Bluetooth on -- matches the explicit
+     * real-device request ("reboot and have it applied") rather than
+     * trying to force a live re-apply into two scripts this app doesn't
+     * own. RFC 1123 caps a hostname label at 63 characters; 64 leaves room
+     * for the NUL. */
+    char hostname[64];
+
     /* UI text size (Settings -> Font Size): 0 = Small (the original,
      * unchanged default sizing), 1 = Medium, 2 = "BlindMF" (largest --
      * literal feature name, requested verbatim). Applied once at startup,
@@ -267,6 +284,21 @@ typedef struct {
      * worth of already-built widgets live. Changing this setting takes
      * effect on the next launch, same as usb_mode above. */
     int font_size_tier;
+
+    /* Settings -> Lyrics Text Size: a SEPARATE size control just for the
+     * fullscreen synchronized lyrics view, independent of font_size_tier
+     * above. Real-device request: lyrics need to stay large/readable
+     * regardless of whatever the user picked for the rest of the app's UI
+     * chrome, since scaling them down with a smaller general text-size
+     * choice made them hard to read. Only 2 of the 3 usual tiers apply here
+     * (1 = Medium, 2 = Large, matching the same tier numbering/pixel sizes
+     * font_size_tier's own Medium/BlindMF already use for their 28px slot --
+     * see fallback_font.h's app_font_lyrics) -- there's no "Small" option,
+     * since a small lyrics view was the exact complaint that prompted this
+     * separate control to exist. Defaults to 2 (Large) rather than 1, for
+     * the same readability-first reasoning. Same "next launch, not live"
+     * timing as font_size_tier -- see that field's own comment for why. */
+    int lyrics_font_size_tier;
 
     /* Screen brightness, logical 0-100 (same scale as backlight.h's
      * backlight_get_percent()/backlight_set_percent()). Real-device bug

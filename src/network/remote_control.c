@@ -1030,6 +1030,7 @@ static void handle_art_request(int cfd, const char * path) {
         send_response(cfd, "404 Not Found", "text/plain", "No art");
     }
     free(meta.picture_data);
+    free(meta.lyrics); /* only needed picture_data here */
 }
 
 /* Same definition as gui.c's own assets.c THEME_ROOT -- duplicated for the

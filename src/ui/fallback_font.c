@@ -4,14 +4,16 @@
 lv_font_t app_font_16;
 lv_font_t app_font_22;
 lv_font_t app_font_28;
+lv_font_t app_font_lyrics;
 
-/* Remembered from fallback_font_init_early()'s own argument so
+/* Remembered from fallback_font_init_early()'s own arguments so
  * fallback_font_load_deferred() (called later, from a timer with no
  * arguments of its own -- see fallback_font_schedule_deferred_load())
  * knows which pixel sizes to rasterize the CJK/Korean/Thai TTFs at,
  * instead of the fixed 16/22/28 this used before the Font Size feature
  * existed. */
 static int s_font_size_tier = 0;
+static int s_lyrics_font_size_tier = 2;
 
 /* Same three-tier mapping as gui.c's apply_font_size_tier(), restricted to
  * the three slots this file actually needs (there is no fallback-aware
@@ -110,8 +112,9 @@ static void tier_pixel_sizes(int tier, int * out_16_slot, int * out_22_slot, int
  * walks the whole f->fallback chain with no depth limit, so separate files
  * chain just as well as one merged one. */
 
-void fallback_font_init_early(int font_size_tier) {
+void fallback_font_init_early(int font_size_tier, int lyrics_font_size_tier) {
     s_font_size_tier = font_size_tier;
+    s_lyrics_font_size_tier = lyrics_font_size_tier;
 
     /* lv_font_montserrat_NN are const bitmap fonts pre-rasterized at a
      * fixed size each -- unlike the TTF fallbacks below, there's no
@@ -135,6 +138,12 @@ void fallback_font_init_early(int font_size_tier) {
             app_font_28 = lv_font_montserrat_28;
             break;
     }
+
+    /* Medium/Large only (1/2) -- see app_font_lyrics's own doc comment on
+     * why these reuse font_size_tier's existing 32px/40px 28-slot values
+     * rather than inventing new sizes. Defensive default to Large for
+     * anything else (e.g. 0), matching settings.c's own re-clamp. */
+    app_font_lyrics = (lyrics_font_size_tier == 1) ? lv_font_montserrat_32 : lv_font_montserrat_40;
 }
 
 #ifndef HOST_BUILD
@@ -170,6 +179,7 @@ static void fallback_font_load_deferred(lv_timer_t * timer) {
 
     int size_16, size_22, size_28;
     tier_pixel_sizes(s_font_size_tier, &size_16, &size_22, &size_28);
+    int size_lyrics = (s_lyrics_font_size_tier == 1) ? 32 : 40; /* Medium/Large -- see app_font_lyrics's own doc comment */
 
     lv_font_t * cjk_16 = lv_tiny_ttf_create_file("S:" FALLBACK_FONT_FILE, size_16);
     if (cjk_16) {
@@ -202,6 +212,21 @@ static void fallback_font_load_deferred(lv_timer_t * timer) {
     }
 #ifndef HOST_BUILD
     boot_checkpoint("fallback_font: 28px done");
+#endif
+
+    /* size_lyrics is independent of size_28 -- often the same 40px value
+     * (the default Large tier), but can differ if the user picked Medium
+     * here while font_size_tier itself is Small/BlindMF, so this needs its
+     * own separate rasterize call rather than reusing cjk_28. */
+    lv_font_t * cjk_lyrics = lv_tiny_ttf_create_file("S:" FALLBACK_FONT_FILE, size_lyrics);
+    if (cjk_lyrics) {
+        app_font_lyrics.fallback = cjk_lyrics;
+        DBG_LOG("fallback_font: lyrics %dpx loaded\n", size_lyrics);
+    } else {
+        DBG_LOG("fallback_font: lyrics %dpx load failed\n", size_lyrics);
+    }
+#ifndef HOST_BUILD
+    boot_checkpoint("fallback_font: lyrics px done");
 #endif
 
     /* Chained behind whichever cjk_* font actually loaded above (cjk_16/22/28
@@ -240,6 +265,19 @@ static void fallback_font_load_deferred(lv_timer_t * timer) {
     else if (kr_28) app_font_28.fallback = kr_28;
 #ifndef HOST_BUILD
     boot_checkpoint("fallback_font: korean/thai 28px done");
+#endif
+
+    lv_font_t * kr_lyrics = lv_tiny_ttf_create_file("S:" KOREAN_FONT_FILE, size_lyrics);
+    lv_font_t * th_lyrics = lv_tiny_ttf_create_file("S:" THAI_FONT_FILE, size_lyrics);
+    if (kr_lyrics) DBG_LOG("fallback_font: korean lyrics %dpx loaded\n", size_lyrics);
+    else DBG_LOG("fallback_font: korean lyrics %dpx load failed\n", size_lyrics);
+    if (th_lyrics) DBG_LOG("fallback_font: thai lyrics %dpx loaded\n", size_lyrics);
+    else DBG_LOG("fallback_font: thai lyrics %dpx load failed\n", size_lyrics);
+    if (kr_lyrics) kr_lyrics->fallback = th_lyrics;
+    if (cjk_lyrics) cjk_lyrics->fallback = kr_lyrics;
+    else if (kr_lyrics) app_font_lyrics.fallback = kr_lyrics;
+#ifndef HOST_BUILD
+    boot_checkpoint("fallback_font: korean/thai lyrics px done");
 #endif
 }
 

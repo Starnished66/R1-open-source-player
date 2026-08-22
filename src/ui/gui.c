@@ -42,6 +42,7 @@
 #include "subprocess.h"
 #include "timezone_data.h"
 #include "timezone_apply.h"
+#include "hostname_apply.h"
 #include "src/core/lv_obj.h"
 #include "src/core/lv_obj_pos.h"
 #include "src/core/lv_obj_style.h"
@@ -165,6 +166,8 @@ static lv_obj_t * files_screen;
 static lv_obj_t * files_search_list; /* search-results overlay, see search_binding_t's is_overlay_list comment */
 static lv_obj_t * all_songs_screen;
 static lv_obj_t * all_songs_list; /* inner scrollable list, for the A-Z browse index -- see build_compact_list_screen()'s out_list param */
+static lv_obj_t * recently_added_screen;
+static lv_obj_t * recently_added_list; /* same paged compact_list architecture as all_songs_list, ordered by first_seen DESC instead of title -- see build_recently_added_screen()'s own comment */
 static lv_obj_t * artists_screen;
 static lv_obj_t * artists_list;
 static lv_obj_t * albums_screen;
@@ -286,11 +289,26 @@ static lv_image_dsc_t current_reflection_dsc;
 static lyrics_doc_t current_lyrics_doc;
 static bool current_lyrics_doc_valid = false;
 static int current_lyrics_doc_for_index = -1; /* playlist_index current_lyrics_doc was loaded for */
+/* Real-device request: embedded lyrics tags (ID3 USLT, FLAC/Opus LYRICS/
+ * UNSYNCEDLYRICS, M4A "\xA9lyr") are usually plain unsynced text with no
+ * [mm:ss.xx] timestamps -- despite the name, that's what "unsynced" means
+ * for 3 of those 4 tag names. current_lyrics_doc_valid/current_lyrics_doc
+ * above stay reserved for the synced case (an .lrc sidecar, or the less
+ * common tagger that does embed real LRC text in one of those fields);
+ * this is the parallel "just show the raw text as a static block, no
+ * per-line highlight or auto-follow" case -- mutually exclusive with
+ * current_lyrics_doc_valid, same as their lyrics_load_result_* counterparts
+ * above. current_lyrics_plain_text is malloc'd, owned by these globals
+ * once poll_lyrics_load() transfers it; freed there on the next load and
+ * whenever current_lyrics_plain_mode is cleared. */
+static bool current_lyrics_plain_mode = false;
+static char * current_lyrics_plain_text = NULL;
 
 static lv_obj_t * lyrics_backdrop_img;
 static lv_obj_t * lyrics_list;
 static lv_obj_t * lyrics_spacer;
 static lv_obj_t * lyrics_empty_label;
+static lv_obj_t * lyrics_plain_label; /* current_lyrics_plain_mode's own display -- see its own comment */
 static lv_timer_t * lyrics_timer;
 static uint8_t * current_lyrics_backdrop_bytes;
 static lv_image_dsc_t current_lyrics_backdrop_dsc;
@@ -382,12 +400,14 @@ static char ** playlist = NULL;
 static int playlist_count = 0;
 static int playlist_index = -1;
 
-/* Non-NULL only while playing from the whole, unfiltered All Songs list --
- * see on_file_selected_lazy_all_songs()'s own comment for why. playlist[i]
+/* Non-NULL only while playing from the whole, unfiltered All Songs list OR
+ * the whole Recently Added list -- see on_file_selected_lazy_all_songs()'s/
+ * on_file_selected_lazy_recently_added()'s own comments for why. playlist[i]
  * == NULL means "not resolved yet"; playlist_path_at() (forward-declared
  * below) resolves playlist_lazy_sort_order[i] to a real path via a single-
- * row DB query (the DB's own title-sorted order, offset by that value),
- * strdup()s it into playlist[i], and from then on that slot is a
+ * row DB query (the DB's own title-sorted order by default, or first_seen-
+ * DESC order when playlist_lazy_order_is_recency is set, offset by that
+ * value), strdup()s it into playlist[i], and from then on that slot is a
  * completely ordinary owned entry. Kept the same length as
  * playlist[] itself by queue_add_song()/queue_remove_song_at_offset()/
  * delete_song_confirm_cb() -- the only three places that resize or shift
@@ -397,6 +417,10 @@ static int playlist_index = -1;
  * 32,000 paths just to play one of them, the same O(library)-per-action
  * failure class as this whole session's boot-scale incidents. */
 static int * playlist_lazy_sort_order = NULL;
+/* Which DB order playlist_lazy_sort_order[]'s identity mapping refers to --
+ * see playlist_path_at()'s own comment. Only meaningful while playlist_
+ * lazy_sort_order is non-NULL. */
+static bool playlist_lazy_order_is_recency = false;
 
 /* "Up Next" queue (long-press a song -> Add to Queue): how many playlist[]
  * slots starting right at playlist_index+1 are still-unplayed queue
@@ -442,11 +466,13 @@ typedef enum {
     PLAYER_SOURCE_ALL_SONGS,
     PLAYER_SOURCE_GROUP_SONGS,
     PLAYER_SOURCE_FILE_BROWSER,
+    PLAYER_SOURCE_RECENTLY_ADDED,
 } player_source_kind_t;
 
 static player_source_kind_t player_source_kind = PLAYER_SOURCE_NONE;
 
 static int player_source_all_songs_index = -1; /* row index into all_songs_list -- the DB's own title-sorted order */
+static int player_source_recently_added_index = -1; /* row index into recently_added_list -- the DB's own first_seen-DESC order */
 
 /* Own copy of the group's song entries at the moment playback started --
  * group_songs_entries/count/title_label themselves just describe
@@ -4613,6 +4639,14 @@ static int lyrics_load_result_generation;
 static int lyrics_load_result_for_index;
 static bool lyrics_load_result_ok;
 static lyrics_doc_t lyrics_load_result_doc;
+/* Set alongside lyrics_load_result_ok when a source (sidecar or embedded
+ * tag) had text but no [mm:ss.xx] timestamps to parse into lyrics_load_
+ * result_doc -- see lyrics_load_thread_func()'s own comment. Mutually
+ * exclusive with lyrics_load_result_ok: exactly one of the two, or neither
+ * (no lyrics found anywhere), is ever true for a given load. Owned by the
+ * worker thread until the done flag flips, same as lyrics_load_result_doc. */
+static bool lyrics_load_result_plain_mode;
+static char * lyrics_load_result_plain_text; /* malloc'd, only meaningful when lyrics_load_result_plain_mode */
 
 /* Bumped on every launch_lyrics_load() call (both a real track change and
  * the internal pending-relaunch below) -- the identity a finished result is
@@ -4633,11 +4667,43 @@ static void * lyrics_load_thread_func(void * arg) {
     lyrics_load_request_t * req = (lyrics_load_request_t *) arg;
     lyrics_doc_t doc;
     bool ok = lyrics_load_sidecar(req->track_path, &doc);
+    bool plain_mode = false;
+    char * plain_text = NULL;
+
+    /* Real-device request: fall back to the track's own embedded lyrics tag
+     * (ID3 USLT, FLAC/Opus LYRICS/UNSYNCEDLYRICS, M4A "\xA9lyr" -- see
+     * metadata_read()'s own doc comment) when there's no .lrc sidecar.
+     * Independent metadata_read() call rather than sharing apply_track_
+     * metadata_to_ui()'s own -- see that function's comment on why (this
+     * thread already does its own file I/O regardless, so re-parsing tags
+     * here is cheaper than plumbing a pointer through two independent async
+     * paths that don't otherwise share state). Tries lrc parsing first
+     * (some taggers do embed real [mm:ss.xx] text in these fields despite
+     * "unsynced" being right there in 3 of the 4 tag names); anything with
+     * text but no usable timestamp lines falls back to plain_mode, a static
+     * unsynced block, rather than showing nothing. */
+    if (!ok) {
+        track_metadata_t meta;
+        metadata_read(req->track_path, &meta);
+        if (meta.lyrics) {
+            if (lyrics_parse_buffer(meta.lyrics, strlen(meta.lyrics), &doc)) {
+                ok = true;
+            } else {
+                plain_mode = true;
+                plain_text = meta.lyrics;
+                meta.lyrics = NULL; /* ownership transferred to plain_text -- don't free it below */
+            }
+        }
+        free(meta.picture_data);
+        free(meta.lyrics);
+    }
 
     lyrics_load_result_generation = req->generation;
     lyrics_load_result_for_index = req->for_index;
     lyrics_load_result_ok = ok;
     if (ok) lyrics_load_result_doc = doc;
+    lyrics_load_result_plain_mode = plain_mode;
+    lyrics_load_result_plain_text = plain_text;
     free(req);
     lyrics_load_done_flag = true; /* written last -- poll_lyrics_load() only checks this flag */
     return NULL;
@@ -4684,8 +4750,13 @@ static void poll_lyrics_load(void) {
         current_lyrics_doc_valid = lyrics_load_result_ok;
         if (lyrics_load_result_ok) current_lyrics_doc = lyrics_load_result_doc;
         current_lyrics_doc_for_index = lyrics_load_result_for_index;
-    } else if (lyrics_load_result_ok) {
-        lyrics_doc_free(&lyrics_load_result_doc); /* stale -- superseded by a later launch before this landed */
+
+        free(current_lyrics_plain_text);
+        current_lyrics_plain_mode = lyrics_load_result_plain_mode;
+        current_lyrics_plain_text = lyrics_load_result_plain_text;
+    } else {
+        if (lyrics_load_result_ok) lyrics_doc_free(&lyrics_load_result_doc); /* stale -- superseded by a later launch before this landed */
+        free(lyrics_load_result_plain_text);
     }
 
     if (lyrics_load_pending_valid) {
@@ -5011,17 +5082,36 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
         launch_cover_decode_from_track(index, path);
     }
 
-    /* No local sidecar makes sense for a Subsonic stream URL -- same
-     * reasoning cover art uses subsonic_stream_meta[].cover_url instead of
-     * a local-file lookup for that case. A streamed track just never gets
-     * lyrics in this first release. */
+    /* No local sidecar (or embedded tag) makes sense for a Subsonic stream
+     * URL -- same reasoning cover art uses subsonic_stream_meta[].cover_url
+     * instead of a local-file lookup for that case. A streamed track just
+     * never gets lyrics in this first release. */
     if (!is_subsonic_stream) {
         launch_lyrics_load(index, path);
-    } else if (current_lyrics_doc_valid) {
-        lyrics_doc_free(&current_lyrics_doc);
-        current_lyrics_doc_valid = false;
+    } else {
+        if (current_lyrics_doc_valid) {
+            lyrics_doc_free(&current_lyrics_doc);
+            current_lyrics_doc_valid = false;
+        }
+        if (current_lyrics_plain_mode) {
+            free(current_lyrics_plain_text);
+            current_lyrics_plain_text = NULL;
+            current_lyrics_plain_mode = false;
+        }
         current_lyrics_doc_for_index = index;
     }
+    /* out_meta->lyrics (populated by the metadata_read() call above, if this
+     * track has embedded lyrics) is never read here -- launch_lyrics_load()
+     * just above does its own independent metadata_read() on a background
+     * thread instead of sharing this one (see lyrics_load_thread_func()'s
+     * own comment for why: this function runs synchronously on the UI
+     * thread at every track change, and re-parsing tags a second time in
+     * the background is cheaper than plumbing a malloc'd pointer through a
+     * separate async load path that already does its own file I/O anyway).
+     * Always free it here so every caller's stack-local track_metadata_t
+     * doesn't leak it. */
+    free(out_meta->lyrics);
+    out_meta->lyrics = NULL;
 
     favorite_is_set = metadata_db_song_favorite_is_set(path);
     const char * favorite_icon_asset = favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png";
@@ -5066,7 +5156,8 @@ static void arm_next_track_for_audio(int index) {
     bool use_replaygain = current_settings.replaygain_enabled;
     audio_set_next_track(next_path, use_replaygain && next_meta.has_replaygain, next_meta.replaygain_gain_db,
                           use_replaygain && next_meta.has_replaygain_peak, next_meta.replaygain_peak);
-    free(next_meta.picture_data); /* only needed the gain/peak fields, not the art */
+    free(next_meta.picture_data); /* only needed the gain/peak fields, not the art or lyrics */
+    free(next_meta.lyrics);
 }
 
 /* Song long-press context menu's "Add to Queue" -- splices `path` into the
@@ -5285,6 +5376,7 @@ static void on_file_selected(char ** new_playlist, int count, int selected_index
 static void clear_player_source(void) {
     player_source_kind = PLAYER_SOURCE_NONE;
     player_source_all_songs_index = -1;
+    player_source_recently_added_index = -1;
     free(player_source_group_title);
     player_source_group_title = NULL;
     free_group_song_entries(player_source_group_entries, player_source_group_count);
@@ -5299,6 +5391,19 @@ static void set_player_source_all_songs(int display_index) {
     player_source_kind = PLAYER_SOURCE_ALL_SONGS;
     player_source_all_songs_index = display_index;
     current_settings.last_source_kind = 1;
+    current_settings.last_source_name[0] = '\0';
+}
+
+static void set_player_source_recently_added(int display_index) {
+    clear_player_source();
+    player_source_kind = PLAYER_SOURCE_RECENTLY_ADDED;
+    player_source_recently_added_index = display_index;
+    /* No dedicated resume kind for this source -- falls back to "unknown",
+     * same as Favorites/Most Played/user playlists (see group_song_row_
+     * click_cb's own last_source_kind assignment); only All Songs and Album
+     * get a real boot-resume slot (settings.h's own last_source_kind
+     * comment). */
+    current_settings.last_source_kind = 0;
     current_settings.last_source_name[0] = '\0';
 }
 
@@ -7729,7 +7834,34 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
  * memory (capped at LYRICS_MAX_LINES) with nothing to page in from disk. ---- */
 
 #define LYRICS_POOL_SIZE 20
-#define LYRICS_ROW_STRIDE 76
+/* Real-device bug report: lyric lines read as too cramped, not enough
+ * breathing room between them -- was a flat 76px (row height 68px, 8px gap)
+ * regardless of font size. Two bugs, not one: the cramped spacing itself,
+ * and -- caught while fixing it -- this being a #define at all meant it
+ * could only ever reflect ONE font size baked in at compile time, so even
+ * a fix here would still clip/overlap wrapped lyric lines at the Medium/
+ * BlindMF tiers (app_font_28 -- see fallback_font.h -- renders considerably
+ * taller there; row text uses that font, but the row's own fixed height
+ * never accounted for it). Now a function: room for 2 wrapped lines of
+ * app_font_28's real, currently-selected line height, plus a fixed 20px
+ * gap to the next row -- both scale together, at every tier, instead of
+ * silently falling out of sync as soon as a lyric line wraps to 2 lines on
+ * a bigger font. Every other lyrics_* constant below is either independent
+ * of this (LYRICS_ACTIVE_LINE_ANCHOR_Y, a fixed viewport position) or
+ * derived from it (LYRICS_TOP_PAD, every row/scroll position calculation
+ * throughout this screen), so this is the only value that needed to
+ * change. */
+static int32_t lyrics_row_stride(void) {
+    /* Real-device bug report (round 2): still not enough room -- some
+     * longer lines wrap to 3 lines, not just 2, and folded into the next
+     * row. Bumped from 2 to 3 lines of headroom, gap from 20 to 24 for a
+     * bit more breathing room between rows generally. &app_font_lyrics
+     * (not &app_font_28) -- see its own doc comment (fallback_font.h): the
+     * lyrics view has its own separate, user-adjustable text size now
+     * (Settings -> Lyrics Text Size), decoupled from the rest of the app's
+     * own Font Size setting. */
+    return lv_font_get_line_height(&app_font_lyrics) * 3 + 24;
+}
 /* Fixed on-screen y where the active line always sits, in the viewport's
  * own coordinates (25% of the 800px screen) -- real-device feedback: the
  * active line must stay in the same place while the rest of the text
@@ -7776,15 +7908,40 @@ static int lyrics_current_active_index(void) {
 static void lyrics_reset_pool(void) {
     int count = current_lyrics_doc_valid ? current_lyrics_doc.count : 0;
 
-    if (count == 0) {
-        lv_obj_remove_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
-        for (int slot = 0; slot < LYRICS_POOL_SIZE; slot++) lv_obj_add_flag(lyrics_rows[slot], LV_OBJ_FLAG_HIDDEN);
-    } else {
+    /* current_lyrics_plain_mode -- see its own doc comment: a single static
+     * text block, no per-line pool/highlight/auto-follow at all. Handled as
+     * its own branch, entirely separate from the synced count==0/count>0
+     * cases below, since "0 synced lines" (count==0) still needs the
+     * "No synchronized lyrics found" empty state when plain mode ISN'T
+     * active either (genuinely no lyrics anywhere). */
+    if (current_lyrics_plain_mode && current_lyrics_plain_text) {
         lv_obj_add_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
-    }
+        for (int slot = 0; slot < LYRICS_POOL_SIZE; slot++) lv_obj_add_flag(lyrics_rows[slot], LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lyrics_plain_label, current_lyrics_plain_text);
+        lv_obj_remove_flag(lyrics_plain_label, LV_OBJ_FLAG_HIDDEN);
 
-    int32_t total_height = LYRICS_TOP_PAD + count * LYRICS_ROW_STRIDE;
-    lv_obj_set_pos(lyrics_spacer, 0, total_height > 0 ? total_height - 1 : 0);
+        /* LV_LABEL_LONG_WRAP's real rendered height depends on the text
+         * just set and isn't known until a layout pass runs -- unlike the
+         * synced case's fixed per-line stride, this can't be computed from
+         * a line count. lv_obj_update_layout() forces that pass immediately
+         * so lv_obj_get_height() below reflects the real wrapped height,
+         * not a stale one from whatever text was showing before. */
+        lv_obj_update_layout(lyrics_plain_label);
+        int32_t total_height = LYRICS_TOP_PAD + lv_obj_get_height(lyrics_plain_label) + LYRICS_TOP_PAD;
+        lv_obj_set_pos(lyrics_spacer, 0, total_height > 0 ? total_height - 1 : 0);
+    } else {
+        lv_obj_add_flag(lyrics_plain_label, LV_OBJ_FLAG_HIDDEN);
+
+        if (count == 0) {
+            lv_obj_remove_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
+            for (int slot = 0; slot < LYRICS_POOL_SIZE; slot++) lv_obj_add_flag(lyrics_rows[slot], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        int32_t total_height = LYRICS_TOP_PAD + count * lyrics_row_stride();
+        lv_obj_set_pos(lyrics_spacer, 0, total_height > 0 ? total_height - 1 : 0);
+    }
 
     lv_obj_scroll_to_y(lyrics_list, 0, LV_ANIM_OFF);
     lyrics_window_start = -1;
@@ -7805,7 +7962,7 @@ static void lyrics_update_window(int active_index) {
 
     int32_t scroll_y = lv_obj_get_scroll_y(lyrics_list);
     if (scroll_y < 0) scroll_y = 0;
-    int first = (int) (scroll_y / LYRICS_ROW_STRIDE) - LYRICS_POOL_SIZE / 4;
+    int first = (int) (scroll_y / lyrics_row_stride()) - LYRICS_POOL_SIZE / 4;
     if (first < 0) first = 0;
     int max_first = count - LYRICS_POOL_SIZE;
     if (max_first < 0) max_first = 0;
@@ -7823,7 +7980,7 @@ static void lyrics_update_window(int active_index) {
         }
         lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
         if (window_moved) {
-            lv_obj_set_y(row, LYRICS_TOP_PAD + index * LYRICS_ROW_STRIDE);
+            lv_obj_set_y(row, LYRICS_TOP_PAD + index * lyrics_row_stride());
             lv_label_set_text(row, current_lyrics_doc.lines[index].text);
         }
         lv_obj_set_style_text_color(row, index == active_index ? accent_lv_color() : lv_color_make(150, 150, 150), 0);
@@ -7893,6 +8050,12 @@ static void lyrics_timer_cb(lv_timer_t * timer) {
         launch_lyrics_backdrop_decode(); /* track changed while this screen is open -- refresh the backdrop too */
     }
 
+    /* current_lyrics_plain_mode -- see its own doc comment: a static text
+     * block has no active line to track, no auto-follow-with-playback to
+     * suspend/resume, and no per-line pool to reposition. lyrics_reset_
+     * pool() above already did everything this screen needs for it. */
+    if (current_lyrics_plain_mode) return;
+
     bool was_auto_follow = lyrics_auto_follow;
     lv_indev_t * indev = lv_indev_active();
     bool pressed = indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED;
@@ -7913,7 +8076,7 @@ static void lyrics_timer_cb(lv_timer_t * timer) {
     int active_index = lyrics_current_active_index();
 
     if (lyrics_auto_follow && active_index >= 0 && active_index != lyrics_last_centered_index) {
-        int32_t target = LYRICS_TOP_PAD + active_index * LYRICS_ROW_STRIDE - LYRICS_ACTIVE_LINE_ANCHOR_Y;
+        int32_t target = LYRICS_TOP_PAD + active_index * lyrics_row_stride() - LYRICS_ACTIVE_LINE_ANCHOR_Y;
         if (target < 0) target = 0;
         lv_obj_scroll_to_y(lyrics_list, target, LV_ANIM_ON);
         lyrics_last_centered_index = active_index;
@@ -7981,17 +8144,35 @@ static lv_obj_t * build_lyrics_screen(void) {
     for (int slot = 0; slot < LYRICS_POOL_SIZE; slot++) {
         lv_obj_t * row = lv_label_create(lyrics_list);
         lv_obj_set_width(row, 440);
-        lv_obj_set_height(row, LYRICS_ROW_STRIDE - 8);
+        lv_obj_set_height(row, lyrics_row_stride() - 24); /* stride minus its own baked-in gap, see lyrics_row_stride()'s own comment */
         lv_label_set_long_mode(row, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_font(row, &app_font_28, 0); /* metadata-derived lyric text -- see fallback_font.h */
+        lv_obj_set_style_text_font(row, &app_font_lyrics, 0); /* own separate size, not app_font_28 -- see fallback_font.h */
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(row, 20, LYRICS_TOP_PAD + slot * LYRICS_ROW_STRIDE);
+        lv_obj_set_pos(row, 20, LYRICS_TOP_PAD + slot * lyrics_row_stride());
         lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN); /* shown by lyrics_update_window() once it has real content */
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE); /* tap to seek -- lyrics_row_click_cb() */
         lv_obj_add_event_cb(row, lyrics_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) slot);
         lyrics_rows[slot] = row;
     }
+
+    /* current_lyrics_plain_mode's own display -- a single wrapped label
+     * showing the whole embedded-tag text as a static block (no per-line
+     * highlight, no auto-follow-with-playback), for the common case where
+     * an embedded lyrics tag has no [mm:ss.xx] timestamps to drive the
+     * synced view above. Plain LVGL scrolling on lyrics_list (already
+     * scrollable) is enough here -- unlike the synced rows, there's no
+     * windowing/virtualization needed for a single object. */
+    lyrics_plain_label = lv_label_create(lyrics_list);
+    lv_obj_set_width(lyrics_plain_label, 440);
+    lv_label_set_long_mode(lyrics_plain_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(lyrics_plain_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(lyrics_plain_label, &app_font_lyrics, 0);
+    lv_obj_set_style_text_color(lyrics_plain_label, lv_color_make(230, 230, 230), 0);
+    lv_obj_remove_flag(lyrics_plain_label, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(lyrics_plain_label, LV_OBJ_FLAG_CLICKABLE); /* static text -- no tap-to-seek, there's no timing to seek to */
+    lv_obj_set_pos(lyrics_plain_label, 20, LYRICS_TOP_PAD);
+    lv_obj_add_flag(lyrics_plain_label, LV_OBJ_FLAG_HIDDEN); /* shown by lyrics_reset_pool() when current_lyrics_plain_mode */
 
     /* 1x1 invisible spacer at the bottom of the FULL virtual list -- not
      * hidden (a hidden object doesn't count toward scrollable content
@@ -8223,7 +8404,9 @@ static const char * playlist_path_at(int index) {
     if (playlist[index]) return playlist[index];
     int sort_pos = playlist_lazy_sort_order[index];
     song_row_t row;
-    if (metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, sort_pos, 1, &row) == 1) {
+    int got = playlist_lazy_order_is_recency ? metadata_db_get_songs_page_by_recency(sort_pos, 1, &row)
+                                              : metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, sort_pos, 1, &row);
+    if (got == 1) {
         playlist[index] = strdup(row.path);
     } else {
         playlist[index] = strdup(""); /* sort_pos outran the library (raced a rescan shrinking it) -- empty path is a safe, inert placeholder; playback of it simply fails like any other missing file */
@@ -8252,6 +8435,30 @@ static void on_file_selected_lazy_all_songs(int selected_index) {
     playlist_count = count;
     playlist_lazy_sort_order = malloc(sizeof(int) * (size_t) count);
     for (int i = 0; i < count; i++) playlist_lazy_sort_order[i] = i;
+    playlist_lazy_order_is_recency = false;
+    queued_pending_count = 0;
+    queue_next_insert_index = -1;
+    remote_control_sync_queue(NULL, 0);
+    play_track_at(selected_index);
+}
+
+/* Same role as on_file_selected_lazy_all_songs() above but for tap-to-play
+ * from the whole Recently Added list -- identity-mapped into the DB's own
+ * first_seen-DESC order instead (the exact order build_recently_added_
+ * screen()'s paged provider also uses), via playlist_lazy_order_is_recency
+ * so playlist_path_at() resolves each slot with the matching query. Same
+ * bounded-memory reasoning: a tap costs one calloc() regardless of library
+ * size, never a full strdup() of every recently-added path up front. */
+static void on_file_selected_lazy_recently_added(int selected_index) {
+    int64_t count64 = metadata_db_get_song_count();
+    int count = count64 > 0 ? (int) count64 : 0;
+
+    free_playlist();
+    playlist = calloc((size_t) count, sizeof(char *));
+    playlist_count = count;
+    playlist_lazy_sort_order = malloc(sizeof(int) * (size_t) count);
+    for (int i = 0; i < count; i++) playlist_lazy_sort_order[i] = i;
+    playlist_lazy_order_is_recency = true;
     queued_pending_count = 0;
     queue_next_insert_index = -1;
     remote_control_sync_queue(NULL, 0);
@@ -8580,6 +8787,7 @@ static void scan_one_song_into_db(const char * path) {
     snprintf(fresh.album_artist, sizeof(fresh.album_artist), "%s", album_artist_value);
     snprintf(fresh.genre, sizeof(fresh.genre), "%s", meta.has_genre ? meta.genre : "Unknown Genre");
     free(meta.picture_data);
+    free(meta.lyrics); /* always NULL here (metadata_read_isolated() itself already frees/NULLs it before the pipe write), freeing defensively for symmetry */
 
     if (have_stat) metadata_db_put(path, mtime, size, &fresh);
 }
@@ -8790,6 +8998,58 @@ static lv_obj_t * build_all_songs_screen(void) {
                                                 all_songs_row_long_press_cb, &all_songs_list, NULL,
                                                 LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
     compact_list_set_paged_provider(all_songs_list, all_songs_fetch_page, NULL, (int) metadata_db_get_song_count());
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+/* Recently Added -- same paged compact_list architecture as All Songs above
+ * (see build_all_songs_screen()'s own comment on why: a bounded page at a
+ * time regardless of library size, not the show_group_songs()/group_song_
+ * entry_t path Favorites/Most Played use, which loads its whole, small,
+ * deliberately-capped result set into RAM up front -- Recently Added has no
+ * such cap, it's every song in the library just reordered by first_seen, so
+ * it needs the same scale guarantee All Songs has). Only difference from
+ * All Songs is the ORDER BY (first_seen DESC, rowid DESC via metadata_db_
+ * get_songs_page_by_recency() instead of title via metadata_db_get_songs_
+ * filtered_page()) -- no search/A-Z index wired up here, unlike All Songs,
+ * since neither makes as much sense against a recency-ordered list. */
+static int recently_added_fetch_page(void * ctx, int offset, int count, char out_labels[][COMPACT_LIST_LABEL_MAX]) {
+    (void) ctx;
+    song_row_t * rows = malloc(sizeof(song_row_t) * (size_t) count);
+    int n = rows ? metadata_db_get_songs_page_by_recency(offset, count, rows) : 0;
+    for (int i = 0; i < n; i++) metadata_db_song_display_title(&rows[i], out_labels[i], COMPACT_LIST_LABEL_MAX);
+    free(rows);
+    return n;
+}
+
+/* Same role as all_songs_resolve_path_at() above, against the recency order. */
+static bool recently_added_resolve_path_at(int display_index, char * out, size_t out_size) {
+    song_row_t row;
+    if (metadata_db_get_songs_page_by_recency(display_index, 1, &row) != 1) return false;
+    snprintf(out, out_size, "%s", row.path);
+    return true;
+}
+
+static void recently_added_row_click_cb(int display_index) {
+    /* on_file_selected_lazy_recently_added() builds the queue lazily,
+     * identity-mapped into the DB's own first_seen-DESC order (the same
+     * display order this screen's paged provider uses) -- see its own
+     * comment. Tap-to-play here is DB-driven end to end, same as All Songs. */
+    set_player_source_recently_added(display_index);
+    on_file_selected_lazy_recently_added(display_index);
+}
+
+static void recently_added_row_long_press_cb(int display_index) {
+    char path[600];
+    if (recently_added_resolve_path_at(display_index, path, sizeof(path))) open_song_context_menu(path);
+}
+
+static lv_obj_t * build_recently_added_screen(void) {
+    lv_obj_t * scr = build_compact_list_screen("Recently Added", generic_back_cb, NULL, 0, recently_added_row_click_cb,
+                                                recently_added_row_long_press_cb, &recently_added_list, NULL,
+                                                LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    compact_list_set_paged_provider(recently_added_list, recently_added_fetch_page, NULL,
+                                     (int) metadata_db_get_song_count());
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -9109,6 +9369,10 @@ static void more_menu_list_cb(lv_event_t * e) {
         nav_push(all_songs_screen);
         compact_list_scroll_to_index(all_songs_list, player_source_all_songs_index);
         break;
+    case PLAYER_SOURCE_RECENTLY_ADDED:
+        nav_push(recently_added_screen);
+        compact_list_scroll_to_index(recently_added_list, player_source_recently_added_index);
+        break;
     case PLAYER_SOURCE_GROUP_SONGS:
         /* View-only when reached via List, even if the source group was
          * an editable .m3u playlist -- this is for orientation/navigation,
@@ -9253,7 +9517,15 @@ static lv_obj_t * build_group_songs_screen(void) {
      * title. */
     int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
     lv_obj_set_width(group_songs_title_label, scr_w - TITLE_LABEL_LEFT_INSET - TITLE_LABEL_DEFAULT_RIGHT_MARGIN);
-    lv_label_set_long_mode(group_songs_title_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    /* Real-device bug report: this title scrolled immediately, with none of
+     * the 2s-pause-before-scrolling every other marquee in the app has --
+     * root cause: setting LV_LABEL_LONG_SCROLL_CIRCULAR directly here never
+     * attached row_marquee_style (the shared style carrying that 2s delay/
+     * repeat-delay), so it fell back to LVGL's own built-in default
+     * animation timing instead. row_label_enable_marquee() sets the long
+     * mode AND attaches that style in one call -- same fix as
+     * build_subsonic_list_screen()'s own title label just below. */
+    row_label_enable_marquee(group_songs_title_label);
     lv_obj_align(group_songs_title_label, LV_ALIGN_TOP_LEFT, TITLE_LABEL_LEFT_INSET,
                  STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
 
@@ -9950,6 +10222,22 @@ static void t9_keypad_attach(lv_obj_t * target_screen, lv_obj_t * textarea_paren
     text_entry_inline_mode_active = true;
 }
 
+/* text_entry_textarea's own resting height -- derived from ui_size_20's
+ * real line height (bigger at the Medium/BlindMF font tiers) plus fixed
+ * vertical padding, rather than a flat pixel value sized for the smallest
+ * tier only. Recomputed on demand (not cached) since ui_size_20 is itself a
+ * mutable pointer apply_font_size_tier() only ever reassigns once at boot,
+ * but reading it fresh here costs nothing and avoids any ordering
+ * assumption about when that reassignment has happened. Shared by both
+ * text_entry_textarea's own creation site and t9_keypad_release()'s reset
+ * below -- real-device bug report: text started scaling correctly but the
+ * field's own box didn't, because the reset below still had the old flat
+ * 50px baked in as a separate literal and silently overwrote the creation
+ * site's own (correct) height on every single show_text_entry() call. */
+static int32_t text_entry_field_height(void) {
+    return lv_font_get_line_height(ui_size_20) + 26;
+}
+
 /* Returns keypad_group + text_entry_textarea to text_entry_screen, their
  * resting parent when neither the modal flow nor inline search is using
  * them -- called both when inline search fully closes and defensively at
@@ -9959,7 +10247,7 @@ static void t9_keypad_attach(lv_obj_t * target_screen, lv_obj_t * textarea_paren
 static void t9_keypad_release(void) {
     lv_obj_set_parent(text_entry_keypad_group, text_entry_screen);
     lv_obj_set_parent(text_entry_textarea, text_entry_screen);
-    lv_obj_set_size(text_entry_textarea, lv_pct(78), 50);
+    lv_obj_set_size(text_entry_textarea, lv_pct(78), text_entry_field_height());
     lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 40);
     text_entry_inline_mode_active = false;
 }
@@ -10000,7 +10288,14 @@ static lv_obj_t * build_text_entry_screen(void) {
     lv_obj_set_style_text_font(text_entry_title_label, ui_size_16, 0);
 
     text_entry_textarea = lv_textarea_create(scr);
-    lv_obj_set_size(text_entry_textarea, lv_pct(78), 50);
+    /* Real-device bug report: this field's typed text stayed at LVGL's own
+     * unscaled default font regardless of Settings -> Font Size -- unlike
+     * every other body-text label in the app, nothing here ever set an
+     * explicit ui_size_* font, so it never participated in apply_font_size_
+     * tier()'s own scaling at all. ui_size_20 matches most other body text;
+     * see text_entry_field_height()'s own comment for the field's height. */
+    lv_obj_set_style_text_font(text_entry_textarea, ui_size_20, 0);
+    lv_obj_set_size(text_entry_textarea, lv_pct(78), text_entry_field_height());
     lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 40);
     lv_textarea_set_one_line(text_entry_textarea, true);
     /* Built once here, so it persists across every future t9_keypad_attach()
@@ -10526,7 +10821,9 @@ static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_
      * -- same fix as group_songs_screen's own title (build_group_songs_screen()). */
     int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
     lv_obj_set_width(title_label, scr_w - TITLE_LABEL_LEFT_INSET - TITLE_LABEL_DEFAULT_RIGHT_MARGIN);
-    lv_label_set_long_mode(title_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    /* Real-device bug report: same missing-2s-pause bug/fix as group_songs_
+     * screen's own title -- see build_group_songs_screen()'s comment. */
+    row_label_enable_marquee(title_label);
     lv_obj_align(title_label, LV_ALIGN_TOP_LEFT, TITLE_LABEL_LEFT_INSET, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
 
     lv_obj_t * list = lv_obj_create(scr);
@@ -11317,11 +11614,52 @@ static void subsonic_menu_albums_row_cb(lv_event_t * e) {
     start_subsonic_browse(SUBSONIC_BROWSE_ALL_ALBUMS, NULL, "Albums");
 }
 
+/* Real-device bug report: both Download buttons started the actual download
+ * the instant they were tapped, no confirmation -- easy to hit by accident
+ * (e.g. reaching for the search icon right next to the songs one) with no
+ * way to back out once a possibly-large download had already started.
+ * Split each into "show a confirm popup" (the icon's own click handler,
+ * below) + "the actual download" (run only from the popup's own Download
+ * button) -- same confirm/cancel popup shape as every other destructive-ish
+ * action in this file (build_confirm_popup()). One shared popup for both
+ * buttons (same as wifi_action_popup/bt_action_popup's own "one popup, a
+ * pending-kind flag picks what Confirm actually does" shape) rather than
+ * two near-identical popup instances. */
+typedef enum { SUBSONIC_DOWNLOAD_PENDING_NONE, SUBSONIC_DOWNLOAD_PENDING_SONGS, SUBSONIC_DOWNLOAD_PENDING_ARTIST } subsonic_download_pending_t;
+static subsonic_download_pending_t subsonic_download_pending = SUBSONIC_DOWNLOAD_PENDING_NONE;
+static lv_obj_t * subsonic_download_confirm_popup;
+static lv_obj_t * subsonic_download_confirm_popup_backdrop;
+static lv_obj_t * subsonic_download_confirm_title;
+
+static void hide_subsonic_download_confirm_popup(void) {
+    lv_obj_add_flag(subsonic_download_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(subsonic_download_confirm_popup, LV_OBJ_FLAG_HIDDEN);
+    subsonic_download_pending = SUBSONIC_DOWNLOAD_PENDING_NONE;
+}
+
+static void subsonic_download_confirm_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_subsonic_download_confirm_popup();
+}
+
+static void subsonic_download_confirm_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_subsonic_download_confirm_popup();
+}
+
+static void show_subsonic_download_confirm_popup(subsonic_download_pending_t kind, const char * msg) {
+    subsonic_download_pending = kind;
+    lv_label_set_text(subsonic_download_confirm_title, msg);
+    lv_obj_remove_flag(subsonic_download_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(subsonic_download_confirm_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(subsonic_download_confirm_popup_backdrop);
+    lv_obj_move_foreground(subsonic_download_confirm_popup);
+}
+
 /* Top-of-screen Download button shared by subsonic_songs_screen (an
  * album's or a playlist's songs -- see subsonic_songs_context_is_playlist)
  * -- downloads exactly what's currently shown, into the local library. */
-static void subsonic_download_songs_btn_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+static void subsonic_download_songs_now(void) {
     if (subsonic_songs_count == 0) return;
 
     subsonic_song_t * songs_copy = malloc(sizeof(subsonic_song_t) * (size_t) subsonic_songs_count);
@@ -11333,6 +11671,15 @@ static void subsonic_download_songs_btn_cb(lv_event_t * e) {
     start_subsonic_library_download(songs_copy, subsonic_songs_count, NULL, 0, playlist_name, label);
 }
 
+static void subsonic_download_songs_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (subsonic_songs_count == 0) return;
+
+    char msg[224];
+    snprintf(msg, sizeof(msg), "Download \"%s\"?", lv_label_get_text(subsonic_songs_title_label));
+    show_subsonic_download_confirm_popup(SUBSONIC_DOWNLOAD_PENDING_SONGS, msg);
+}
+
 /* Top-of-screen Download button on subsonic_albums_screen, active only when
  * it's showing "an Artist page" (see subsonic_albums_context_artist) --
  * downloads every song across every album currently listed. Hands the
@@ -11340,8 +11687,7 @@ static void subsonic_download_songs_btn_cb(lv_event_t * e) {
  * request_t's own comment) rather than pre-fetching every album's songs
  * here on the UI thread first, since that could be a lot of sequential
  * network round trips for an artist with many albums. */
-static void subsonic_download_artist_btn_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+static void subsonic_download_artist_now(void) {
     if (subsonic_albums_context_artist[0] == '\0' || subsonic_albums_count == 0) return;
 
     subsonic_album_t * albums_copy = malloc(sizeof(subsonic_album_t) * (size_t) subsonic_albums_count);
@@ -11350,6 +11696,30 @@ static void subsonic_download_artist_btn_cb(lv_event_t * e) {
     char label[192];
     snprintf(label, sizeof(label), "Downloading\n%s...", subsonic_albums_context_artist);
     start_subsonic_library_download(NULL, 0, albums_copy, subsonic_albums_count, NULL, label);
+}
+
+static void subsonic_download_artist_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (subsonic_albums_context_artist[0] == '\0' || subsonic_albums_count == 0) return;
+
+    char msg[224];
+    snprintf(msg, sizeof(msg), "Download every album from \"%s\"?", subsonic_albums_context_artist);
+    show_subsonic_download_confirm_popup(SUBSONIC_DOWNLOAD_PENDING_ARTIST, msg);
+}
+
+static void subsonic_download_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    subsonic_download_pending_t kind = subsonic_download_pending;
+    hide_subsonic_download_confirm_popup();
+    if (kind == SUBSONIC_DOWNLOAD_PENDING_SONGS) subsonic_download_songs_now();
+    else if (kind == SUBSONIC_DOWNLOAD_PENDING_ARTIST) subsonic_download_artist_now();
+}
+
+static void build_subsonic_download_confirm_popup(void) {
+    subsonic_download_confirm_popup = build_confirm_popup(
+        "", LV_LABEL_LONG_WRAP, &subsonic_download_confirm_title, NULL, "Download", accent_lv_color(),
+        subsonic_download_confirm_cb, NULL, "Cancel", lv_color_make(160, 160, 160), subsonic_download_confirm_cancel_cb,
+        NULL, subsonic_download_confirm_backdrop_cb, &subsonic_download_confirm_popup_backdrop);
 }
 
 /* Ping + getArtists run on the same background-thread-plus-polled-flag
@@ -12612,6 +12982,7 @@ static void files_search_row_click_cb(int display_index) {
  * just not previously surfaced anywhere for actually playing one. ---- */
 
 #define MOST_PLAYED_LIMIT 20
+#define RECENTLY_ADDED_LIMIT 50
 
 /* Resolves each of paths[0..count) to a display title via a single-row DB
  * lookup (metadata_db_get_song_by_path()) -- falls back to the raw
@@ -12674,6 +13045,10 @@ static void play_remote_control_song(const char * song_path, const char * playli
             metadata_db_load_top_played_songs(MOST_PLAYED_LIMIT, &paths, &count);
             loaded = true;
             snprintf(scoped_title, sizeof(scoped_title), "Most Played");
+        } else if (strcmp(playlist_name, "@recently_added") == 0 || strcmp(playlist_name, "Recently Added") == 0) {
+            metadata_db_load_recently_added_songs(RECENTLY_ADDED_LIMIT, &paths, &count);
+            loaded = true;
+            snprintf(scoped_title, sizeof(scoped_title), "Recently Added");
         } else {
             char m3u_path[512];
             snprintf(m3u_path, sizeof(m3u_path), "%s/%s.m3u", PLAYLISTS_DIR, playlist_name);
@@ -12758,7 +13133,7 @@ static void play_remote_control_song(const char * song_path, const char * playli
  * building them, but there's no reason to depend on call-order here when a
  * simple guard covers it. */
 static void refresh_now_playing_indicators(void) {
-    int artist_row = -1, album_row = -1, album_artist_row = -1, all_songs_row = -1;
+    int artist_row = -1, album_row = -1, album_artist_row = -1, all_songs_row = -1, recently_added_row = -1;
 
     song_row_t row;
     if (now_playing_path[0] && metadata_db_get_song_by_path(now_playing_path, &row)) {
@@ -12770,12 +13145,15 @@ static void refresh_now_playing_indicators(void) {
         if (v >= 0 && v <= INT_MAX) album_artist_row = (int) v;
         v = metadata_db_get_song_title_offset(now_playing_path);
         if (v >= 0 && v <= INT_MAX) all_songs_row = (int) v;
+        v = metadata_db_get_song_recency_offset(now_playing_path);
+        if (v >= 0 && v <= INT_MAX) recently_added_row = (int) v;
     }
 
     if (artists_list) compact_list_set_now_playing(artists_list, artist_row);
     if (albums_list) compact_list_set_now_playing(albums_list, album_row);
     if (album_artist_list) compact_list_set_now_playing(album_artist_list, album_artist_row);
     if (all_songs_list) compact_list_set_now_playing(all_songs_list, all_songs_row);
+    if (recently_added_list) compact_list_set_now_playing(recently_added_list, recently_added_row);
 
     refresh_group_songs_now_playing_indicator(); /* group_songs isn't compact_list-based -- see its own comment */
     refresh_artist_albums_now_playing_indicator(); /* Artists/Album Artist's shared albums drill-down -- also not compact_list-based */
@@ -12803,6 +13181,16 @@ static void show_most_played(void) {
     free_group_song_entries(entries, count);
     for (int i = 0; i < count; i++) free(paths[i]);
     free(paths);
+}
+
+/* Unlike Favorites/Most Played above, Recently Added is not built through
+ * show_group_songs() -- it's the whole library just reordered, potentially
+ * far larger than either of those two's own small deliberately-capped
+ * result sets, so it needs recently_added_screen's own paged compact_list
+ * (build_recently_added_screen()) instead. Same "prebuilt screen, just
+ * nav_push it" shape as open_queue_screen(). */
+static void open_recently_added_screen(void) {
+    nav_push(recently_added_screen);
 }
 
 static lv_obj_t * playlists_list;
@@ -12891,8 +13279,12 @@ static void playlist_row_click_cb(lv_event_t * e) {
         open_queue_screen();
         return;
     }
+    if (index == 3) {
+        open_recently_added_screen();
+        return;
+    }
 
-    int m3u_index = index - 3;
+    int m3u_index = index - 4;
     if (m3u_index < 0 || m3u_index >= playlists_m3u_count) return;
 
     char ** songs;
@@ -12983,12 +13375,12 @@ static void populate_playlists_screen(void) {
 
     lv_label_set_text(playlists_edit_btn, playlists_edit_mode ? "Done" : "Edit");
 
-    /* Favorites/Most Played are never deletable (neither is a real .m3u
-     * file -- see playlist_row_click_cb()'s index==0/1 special cases), so
-     * edit mode just makes them inert instead of showing a delete icon
-     * that would have nothing to act on. Same "row does nothing, only the
-     * per-row action works" convention as populate_group_songs_rows()'s
-     * own edit mode. */
+    /* Favorites/Most Played/Queue/Recently Added are never deletable (none
+     * is a real .m3u file -- see playlist_row_click_cb()'s index==0..3
+     * special cases), so edit mode just makes them inert instead of showing
+     * a delete icon that would have nothing to act on. Same "row does
+     * nothing, only the per-row action works" convention as
+     * populate_group_songs_rows()'s own edit mode. */
     lv_obj_t * favorites_row = add_playlist_row_base(playlists_list, "Favorites");
     if (!playlists_edit_mode) {
         lv_obj_add_flag(favorites_row, LV_OBJ_FLAG_CLICKABLE);
@@ -13009,6 +13401,14 @@ static void populate_playlists_screen(void) {
         lv_obj_add_event_cb(queue_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 2);
     }
 
+    /* Never deletable either -- same treatment as Favorites/Most Played/Queue
+     * above, see playlist_row_click_cb()'s index==3 case. */
+    lv_obj_t * recently_added_row = add_playlist_row_base(playlists_list, "Recently Added");
+    if (!playlists_edit_mode) {
+        lv_obj_add_flag(recently_added_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(recently_added_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 3);
+    }
+
     for (int i = 0; i < playlists_m3u_count; i++) {
         lv_obj_t * row = add_playlist_row_base(playlists_list, basename_of(playlists_m3u_paths[i]));
         if (playlists_edit_mode) {
@@ -13019,7 +13419,7 @@ static void populate_playlists_screen(void) {
             lv_obj_add_event_cb(delete_icon, playlist_delete_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
         } else {
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (3 + i));
+            lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (4 + i));
         }
     }
 }
@@ -13095,9 +13495,10 @@ static void start_library_rescan(void) {
     pthread_create(&library_rescan_thread, NULL, library_rescan_thread_func, NULL);
 }
 
-/* Rebuilds the four prebuilt library screens (All Songs, Artists, Albums,
- * Album Artist) so each one's compact_list_set_paged_provider() call
- * recaptures a fresh total_count against the just-reloaded library --
+/* Rebuilds the five prebuilt library screens (All Songs, Artists, Albums,
+ * Album Artist, Recently Added) so each one's compact_list_set_paged_
+ * provider() call recaptures a fresh total_count against the just-reloaded
+ * library --
  * unlike group_songs_screen/artist_albums_screen (which rebuild their rows
  * on every visit) these are only ever built once at startup, so a stale
  * cached count would otherwise persist after ANY reload of the underlying
@@ -13134,7 +13535,8 @@ static void refresh_library_screens_after_reload(void) {
          * back through it loads a freed screen. Purge any of the four
          * from nav_stack before deleting them, even though the active
          * screen itself is deliberately left alone. */
-        lv_obj_t * being_replaced[] = { all_songs_screen, artists_screen, albums_screen, album_artist_screen };
+        lv_obj_t * being_replaced[] = { all_songs_screen, artists_screen, albums_screen, album_artist_screen,
+                                         recently_added_screen };
         for (int i = nav_depth - 1; i >= 0; i--) {
             for (size_t j = 0; j < sizeof(being_replaced) / sizeof(being_replaced[0]); j++) {
                 if (nav_stack[i] == being_replaced[j]) {
@@ -13149,6 +13551,7 @@ static void refresh_library_screens_after_reload(void) {
     lv_obj_delete(artists_screen);
     lv_obj_delete(albums_screen);
     lv_obj_delete(album_artist_screen);
+    lv_obj_delete(recently_added_screen);
     /* Each build_*_screen() below activates its own paged provider against
      * the current (fresh, post-reload) library internally -- no separate
      * populate step needed here, and no whole-library load either: drill-
@@ -13159,6 +13562,7 @@ static void refresh_library_screens_after_reload(void) {
     artists_screen = build_artists_screen();
     albums_screen = build_albums_screen();
     album_artist_screen = build_album_artist_screen();
+    recently_added_screen = build_recently_added_screen();
 
     /* The four old screens' A-Z index bindings (strip/popup/list pointers)
      * just went dangling along with the lv_obj_delete()s above -- re-register
@@ -15360,6 +15764,64 @@ static void font_size_settings_row_cb(lv_event_t * e) {
     open_font_size_screen();
 }
 
+/* ---- Lyrics Text Size (Settings -> Display) -- real-device request: the
+ * fullscreen lyrics view needed its own separate size control, decoupled
+ * from the rest of the app's own Font Size above (see settings.h's own
+ * lyrics_font_size_tier comment and fallback_font.h's app_font_lyrics for
+ * why). Same single-select, accent-border, reboot-to-apply shape as Font
+ * Size itself, just 2 options (Medium/Large) instead of 3. ---- */
+
+typedef struct {
+    int tier; /* matches player_settings_t.lyrics_font_size_tier -- 1 or 2 only */
+    const char * label;
+} lyrics_font_size_option_t;
+
+static const lyrics_font_size_option_t lyrics_font_size_options[] = {
+    { 1, "Medium" }, { 2, "Large" },
+};
+#define LYRICS_FONT_SIZE_OPTION_COUNT (sizeof(lyrics_font_size_options) / sizeof(lyrics_font_size_options[0]))
+
+static lv_obj_t * lyrics_font_size_screen;
+static lv_obj_t * lyrics_font_size_list;
+
+static void lyrics_font_size_option_row_cb(lv_event_t * e);
+
+static void populate_lyrics_font_size_screen(void) {
+    lv_obj_clean(lyrics_font_size_list);
+    for (size_t i = 0; i < LYRICS_FONT_SIZE_OPTION_COUNT; i++) {
+        bool selected = current_settings.lyrics_font_size_tier == lyrics_font_size_options[i].tier;
+        lv_obj_t * row = add_pill_row_base(lyrics_font_size_list, lyrics_font_size_options[i].label);
+        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
+        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, lyrics_font_size_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+}
+
+static void lyrics_font_size_option_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    current_settings.lyrics_font_size_tier = lyrics_font_size_options[index].tier;
+    settings_save(&current_settings);
+    populate_lyrics_font_size_screen();
+    show_font_size_reboot_popup(); /* same reboot-to-apply popup as Font Size itself -- generic enough text, no need for a second copy */
+}
+
+static lv_obj_t * build_lyrics_font_size_screen(void) {
+    lv_obj_t * title_label; /* unused after build -- title never changes */
+    return build_subsonic_list_screen("Lyrics Text Size", &title_label, &lyrics_font_size_list);
+}
+
+static void open_lyrics_font_size_screen(void) {
+    populate_lyrics_font_size_screen();
+    nav_push(lyrics_font_size_screen);
+}
+
+static void lyrics_font_size_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    open_lyrics_font_size_screen();
+}
+
 /* ---- USB device mode (Settings > USB Mode) -- single-select list, same
  * shape as the Bluetooth codec screen just above (accent-colored border on
  * the current choice). Applying a mode is real configfs/sysfs work (see
@@ -16297,6 +16759,25 @@ static lv_obj_t * remote_control_url_label;
 static lv_obj_t * remote_control_qrcode;
 #endif
 
+/* Re-chains remote_control_qrcode/remote_control_url_label below
+ * remote_control_status_label's own CURRENT bottom edge -- must be called
+ * again every time that label's text changes (all 3 branches below), not
+ * just once at screen-build time: lv_obj_align_to() computes an absolute
+ * position from the base object's size at the moment it's called, it does
+ * NOT track the base object live, so a later lv_label_set_text() on a
+ * differently-sized string (the whole point of this label -- it cycles
+ * between "Turn this on...", "Connect to Wi-Fi first", and "Open this
+ * address...", three different lengths) would otherwise leave the chain
+ * still positioned for whatever text happened to be showing at build time. */
+static void remote_control_relayout_below_status(void) {
+    lv_obj_t * last = remote_control_status_label;
+#if LV_USE_QRCODE
+    lv_obj_align_to(remote_control_qrcode, last, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
+    last = remote_control_qrcode;
+#endif
+    lv_obj_align_to(remote_control_url_label, last, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
+}
+
 static void remote_control_refresh_address(void) {
     if (!current_settings.remote_control_enabled) {
         lv_label_set_text(remote_control_status_label,
@@ -16305,6 +16786,7 @@ static void remote_control_refresh_address(void) {
 #if LV_USE_QRCODE
         lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
 #endif
+        remote_control_relayout_below_status();
         return;
     }
 
@@ -16315,6 +16797,7 @@ static void remote_control_refresh_address(void) {
 #if LV_USE_QRCODE
         lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
 #endif
+        remote_control_relayout_below_status();
         return;
     }
 
@@ -16326,6 +16809,7 @@ static void remote_control_refresh_address(void) {
     lv_obj_remove_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
     lv_qrcode_update(remote_control_qrcode, url, strlen(url));
 #endif
+    remote_control_relayout_below_status();
 }
 
 static void remote_control_toggle_cb(lv_event_t * e) {
@@ -16436,7 +16920,15 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_set_style_text_align(remote_control_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(remote_control_status_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(remote_control_status_label, ui_size_20, 0);
-    lv_obj_align(remote_control_status_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 270);
+    /* Real-device bug report: "Connect to Wi-Fi first" overlapped the
+     * explanation text above it at bigger font tiers -- `explanation`
+     * above wraps across more/taller lines as ui_size_16 grows (BlindMF),
+     * but this label's own Y was a hardcoded absolute offset from the
+     * title, sized assuming `explanation` always stayed within its
+     * smallest-tier height. Anchored to `explanation`'s own actual bottom
+     * edge instead, so it always clears however tall that text really
+     * rendered. */
+    lv_obj_align_to(remote_control_status_label, explanation, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
 
 #if LV_USE_QRCODE
     remote_control_qrcode = lv_qrcode_create(scr);
@@ -16445,13 +16937,17 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_qrcode_set_light_color(remote_control_qrcode, lv_color_white());
     lv_obj_set_style_border_width(remote_control_qrcode, 4, 0);
     lv_obj_set_style_border_color(remote_control_qrcode, lv_color_white(), 0);
-    lv_obj_align(remote_control_qrcode, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 340);
 #endif
 
     remote_control_url_label = lv_label_create(scr);
     lv_obj_set_style_text_color(remote_control_url_label, accent_lv_color(), 0);
     lv_obj_set_style_text_font(remote_control_url_label, ui_size_22, 0);
-    lv_obj_align(remote_control_url_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 592);
+    /* Positions qrcode/url_label below remote_control_status_label for the
+     * first time -- open_remote_control_screen() calls remote_control_
+     * refresh_address() (which calls this same helper again) every time
+     * this screen opens, so this initial call just avoids either object
+     * sitting at LVGL's own default (0,0) for one frame before that. */
+    remote_control_relayout_below_status();
 
     finalize_screen_navigation(scr);
     return scr;
@@ -17828,16 +18324,17 @@ static void plugin_display_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_settings_display_screen(void) {
-    static pill_list_item_t items[5 + PLUGIN_MAX_DISPLAY_LIST_ITEMS];
+    static pill_list_item_t items[6 + PLUGIN_MAX_DISPLAY_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Accent Color", PILL_ACCESSORY_CHEVRON, false, accent_color_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Font Size", PILL_ACCESSORY_CHEVRON, false, font_size_settings_row_cb, NULL, NULL };
-    items[2] = (pill_list_item_t){ "Screen Timeout", PILL_ACCESSORY_CHEVRON, false, screen_timeout_row_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Screen Dimming", PILL_ACCESSORY_TOGGLE,
+    items[2] = (pill_list_item_t){ "Lyrics Text Size", PILL_ACCESSORY_CHEVRON, false, lyrics_font_size_settings_row_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "Screen Timeout", PILL_ACCESSORY_CHEVRON, false, screen_timeout_row_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Screen Dimming", PILL_ACCESSORY_TOGGLE,
                                     current_settings.screen_dimming_enabled, NULL, screen_dimming_switch_event_cb, NULL };
-    items[4] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
+    items[5] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
                                     current_settings.swipe_up_home_enabled, NULL, swipe_up_home_switch_event_cb, NULL };
 
-    int count = 5;
+    int count = 6;
     int plugin_count = plugin_manager_get_display_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_DISPLAY_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -17903,16 +18400,22 @@ static void plugin_system_list_item_click_cb(lv_event_t * e) {
     plugin_manager_system_list_item_clicked(index);
 }
 
+/* Defined later, alongside the reboot-confirm popup this opens into (see
+ * hostname_entry_done_cb()) -- needed here first, for build_settings_
+ * system_screen()'s own row list below. */
+static void hostname_row_cb(lv_event_t * e);
+
 static lv_obj_t * build_settings_system_screen(void) {
-    static pill_list_item_t items[5 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
+    static pill_list_item_t items[6 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "24-Hour Clock", PILL_ACCESSORY_TOGGLE,
                                     current_settings.clock_24h, NULL, clock_24h_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Time Zone", PILL_ACCESSORY_CHEVRON, false, timezone_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "Hostname", PILL_ACCESSORY_CHEVRON, false, hostname_row_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
+    items[5] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
 
-    int count = 5;
+    int count = 6;
     int plugin_count = plugin_manager_get_system_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SYSTEM_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -18340,6 +18843,66 @@ static void build_font_size_reboot_popup(void) {
         "Restart now to apply the new font size?", LV_LABEL_LONG_WRAP, NULL, NULL, "Restart Now", accent_lv_color(),
         font_size_reboot_now_cb, NULL, "Later", lv_color_make(160, 160, 160), font_size_reboot_later_cb, NULL,
         font_size_reboot_popup_backdrop_cb, &font_size_reboot_popup_backdrop);
+}
+
+/* Settings -> System -> Hostname: same "change takes a reboot" shape as
+ * font size above, reusing the same shared build_confirm_popup() helper --
+ * see hostname_apply()'s own comment for why a reboot is genuinely required
+ * here (wifi_on.sh/bt_init each only read their file once, on demand). */
+static lv_obj_t * hostname_reboot_popup;
+static lv_obj_t * hostname_reboot_popup_backdrop;
+
+static void hide_hostname_reboot_popup(void) {
+    lv_obj_add_flag(hostname_reboot_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(hostname_reboot_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void hostname_reboot_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_hostname_reboot_popup();
+}
+
+static void hostname_reboot_later_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_hostname_reboot_popup();
+}
+
+static void hostname_reboot_now_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_hostname_reboot_popup();
+    char * reboot_argv[] = { (char *) "/sbin/reboot", NULL };
+    subprocess_run(reboot_argv, NULL, 0);
+}
+
+static void show_hostname_reboot_popup(void) {
+    lv_obj_remove_flag(hostname_reboot_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(hostname_reboot_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(hostname_reboot_popup_backdrop);
+    lv_obj_move_foreground(hostname_reboot_popup);
+}
+
+static void build_hostname_reboot_popup(void) {
+    hostname_reboot_popup = build_confirm_popup(
+        "Restart now to apply the new hostname?", LV_LABEL_LONG_WRAP, NULL, NULL, "Restart Now", accent_lv_color(),
+        hostname_reboot_now_cb, NULL, "Later", lv_color_make(160, 160, 160), hostname_reboot_later_cb, NULL,
+        hostname_reboot_popup_backdrop_cb, &hostname_reboot_popup_backdrop);
+}
+
+static void hostname_entry_done_cb(const char * text, void * user_data) {
+    (void) user_data;
+    /* Empty submission means "reset to the stock name" -- hostname_apply()
+     * itself treats an empty string as a no-op (leaves whatever's already
+     * in effect from a previous boot alone), so resetting to stock also
+     * needs a reboot back to the un-overridden squashfs file, same as
+     * setting a new one does. */
+    snprintf(current_settings.hostname, sizeof(current_settings.hostname), "%s", text);
+    settings_save(&current_settings);
+    show_hostname_reboot_popup();
+}
+
+static void hostname_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    show_text_entry("Hostname", current_settings.hostname, false, false, hostname_entry_done_cb, NULL);
 }
 
 static void eq_profile_row_cb(lv_event_t * e) {
@@ -18855,6 +19418,10 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("settings_load done");
 #endif
+    /* Must run before anything could turn Wi-Fi/Bluetooth on and trigger
+     * wifi_on.sh/bt_init's own one-time read of the file this bind-mounts
+     * over -- see hostname_apply()'s own comment. */
+    hostname_apply(current_settings.hostname);
 
     /* Must run before any screen below captures a ui_size_16/20/22/28
      * pointer into its own style -- see this function's own doc comment. */
@@ -18931,7 +19498,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     lv_style_init(&style_muted_text);
     lv_style_set_text_color(&style_muted_text, lv_color_make(220, 220, 220));
 
-    fallback_font_init_early(current_settings.font_size_tier); /* must run before any style/screen captures &app_font_16/&app_font_22 -- see fallback_font.h */
+    fallback_font_init_early(current_settings.font_size_tier, current_settings.lyrics_font_size_tier); /* must run before any style/screen captures &app_font_16/&app_font_22/&app_font_lyrics -- see fallback_font.h */
     screen_builders_init_list_row_style();
 
     /* Discovers plugin rows/tiles by loading and running every .lua file
@@ -18967,10 +19534,11 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     artists_screen = build_artists_screen();
     albums_screen = build_albums_screen();
     album_artist_screen = build_album_artist_screen();
+    recently_added_screen = build_recently_added_screen();
     /* No whole-library load anywhere in this boot path, on purpose --
      * remote_control.c queries metadata_db.c directly (its own METADATA_DB_
      * GUARD) rather than needing a synced copy of the library, and each of
-     * the four build_*_screen() calls above already activates its own
+     * the five build_*_screen() calls above already activates its own
      * paged provider against the DB internally (see build_all_songs_
      * screen()'s own comment), so there's nothing left that would need a
      * whole-library array at boot for any reason, Remote Control enabled
@@ -19032,15 +19600,30 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * never changes. */
     subsonic_menu_screen = build_subsonic_list_screen("Subsonic", &subsonic_menu_title_label, &subsonic_menu_list);
     {
+        /* Real-device bug report: these 3 rows read noticeably smaller than
+         * "the rest of the player" (their own submenus -- USB Mode, Font
+         * Size, etc. -- looked fine by comparison). Root cause: add_pill_
+         * row_base() hardcodes ui_size_16, the same small size every one of
+         * those submenus' own OPTION rows uses (a radio-button-style list of
+         * choices within one setting) -- correct there, but this menu is a
+         * top-level navigation menu, the same conceptual role as Settings'
+         * own System/Power/Display category rows (build_pill_list_screen(),
+         * ui_size_20 by default). Bumped to match that convention instead of
+         * the options-picker one, since add_pill_row_base() itself is shared
+         * with a dozen real options-pickers and shouldn't change its own
+         * default just for this one caller. */
         lv_obj_t * artists_row = add_pill_row_base(subsonic_menu_list, "Artists");
+        lv_obj_set_style_text_font(lv_obj_get_child(artists_row, 0), ui_size_20, 0);
         lv_obj_add_flag(artists_row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(artists_row, subsonic_menu_artists_row_cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t * playlists_row = add_pill_row_base(subsonic_menu_list, "Playlists");
+        lv_obj_set_style_text_font(lv_obj_get_child(playlists_row, 0), ui_size_20, 0);
         lv_obj_add_flag(playlists_row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(playlists_row, subsonic_menu_playlists_row_cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t * albums_row = add_pill_row_base(subsonic_menu_list, "Albums");
+        lv_obj_set_style_text_font(lv_obj_get_child(albums_row, 0), ui_size_20, 0);
         lv_obj_add_flag(albums_row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(albums_row, subsonic_menu_albums_row_cb, LV_EVENT_CLICKED, NULL);
     }
@@ -19076,16 +19659,27 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * when the screen's own click handler determines it's actually
      * applicable (an Artist page for the albums one; always for the songs
      * one, whether it's an album or a playlist). */
-    subsonic_albums_download_btn = lv_label_create(subsonic_albums_screen);
-    lv_label_set_text(subsonic_albums_download_btn, "Download");
-    lv_obj_set_style_text_color(subsonic_albums_download_btn, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(subsonic_albums_download_btn, ui_size_20, 0);
+    /* Real-device bug report: the "Download" text button started the
+     * download immediately with no confirmation (see subsonic_download_
+     * songs_btn_cb()'s/subsonic_download_artist_btn_cb()'s own comment for
+     * that half of the fix) and, separately, was asked to become an icon
+     * instead of a text label -- a plain downward-arrow-into-a-tray glyph
+     * (stream_media/download.png, a new asset this app adds via the
+     * THEME_OVERRIDE_ROOT mechanism, same as stream_media/subsonic.png's
+     * own precedent -- there's no stock icon for a Subsonic-only feature)
+     * rather than reusing an LVGL built-in symbol font glyph, which would
+     * have clashed with this app's own consistently hand-drawn icon set. */
+    subsonic_albums_download_btn = lv_image_create(subsonic_albums_screen);
+    lv_image_set_src(subsonic_albums_download_btn, asset_path("stream_media/download.png"));
+    lv_obj_set_style_image_recolor(subsonic_albums_download_btn, accent_lv_color(), 0);
+    lv_obj_set_style_image_recolor_opa(subsonic_albums_download_btn, LV_OPA_COVER, 0);
     /* -20-51-16 (not just -20, the plain top-right corner offset the songs
      * button below still uses) -- subsonic_albums_screen also gets a search
      * icon (registered below), which sits at the plain -20 corner; shifted
      * left here to clear it rather than overlapping when both are visible
      * (an Artist page, mid-search). */
-    lv_obj_align(subsonic_albums_download_btn, LV_ALIGN_TOP_RIGHT, -87, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_align(subsonic_albums_download_btn, LV_ALIGN_TOP_RIGHT, -87, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 34) / 2);
+    lv_obj_set_ext_click_area(subsonic_albums_download_btn, 16);
     lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(subsonic_albums_download_btn, subsonic_download_artist_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -19094,11 +19688,12 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * reserving up to it also clears the search icon further right. */
     reserve_title_width_before(subsonic_albums_title_label, subsonic_albums_download_btn);
 
-    subsonic_songs_download_btn = lv_label_create(subsonic_songs_screen);
-    lv_label_set_text(subsonic_songs_download_btn, "Download");
-    lv_obj_set_style_text_color(subsonic_songs_download_btn, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(subsonic_songs_download_btn, ui_size_20, 0);
-    lv_obj_align(subsonic_songs_download_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    subsonic_songs_download_btn = lv_image_create(subsonic_songs_screen);
+    lv_image_set_src(subsonic_songs_download_btn, asset_path("stream_media/download.png"));
+    lv_obj_set_style_image_recolor(subsonic_songs_download_btn, accent_lv_color(), 0);
+    lv_obj_set_style_image_recolor_opa(subsonic_songs_download_btn, LV_OPA_COVER, 0);
+    lv_obj_align(subsonic_songs_download_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 34) / 2);
+    lv_obj_set_ext_click_area(subsonic_songs_download_btn, 16);
     lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(subsonic_songs_download_btn, subsonic_download_songs_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -19127,6 +19722,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     bt_dac_overlay_screen = build_bt_dac_overlay_screen();
     bt_codec_screen = build_bt_codec_screen();
     font_size_screen = build_font_size_screen();
+    lyrics_font_size_screen = build_lyrics_font_size_screen();
     resume_mode_screen = build_resume_mode_screen();
     play_pause_button_mode_screen = build_play_pause_button_mode_screen();
     usb_mode_screen = build_usb_mode_screen();
@@ -19157,6 +19753,8 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     build_eq_reset_popup();
     build_factory_reset_popup();
     build_font_size_reboot_popup();
+    build_hostname_reboot_popup();
+    build_subsonic_download_confirm_popup();
     build_sd_mount_failed_popup();
     build_sd_format_confirm_popup();
     build_power_off_countdown_popup();

@@ -189,14 +189,38 @@ static lv_obj_t * build_back_button(lv_obj_t * scr, lv_event_cb_t back_btn_cb) {
     return btn;
 }
 
+/* 76 (64px back button + 12px breathing room) / 20 -- same values as
+ * gui.c's own TITLE_LABEL_LEFT_INSET/TITLE_LABEL_DEFAULT_RIGHT_MARGIN
+ * (private to that file, so duplicated here rather than shared through the
+ * header for one constant pair) used by every other screen's own
+ * left-aligned, marquee-capable title (build_group_songs_screen(),
+ * build_subsonic_list_screen(), build_files_screen(), ...). Kept in sync by
+ * hand -- if either changes, check the other. */
+#define BUILD_TITLE_LEFT_INSET 76
+#define BUILD_TITLE_RIGHT_MARGIN 20
+
 static lv_obj_t * build_title(lv_obj_t * scr, const char * title) {
     lv_obj_t * label = lv_label_create(scr);
     lv_label_set_text(label, title);
+    /* Real-device bug report: a screen whose title gets set to something
+     * genuinely long at runtime (build_compact_list_screen()'s own title,
+     * e.g. a Subsonic artist/album name once you drill into it) had no
+     * marquee at all and instead just rendered centered, overflowing both
+     * edges -- this helper never gave the label a bounded width or
+     * scrolling long_mode to begin with, unlike every other screen's own
+     * title (see the INSET/MARGIN comment above). Every existing caller
+     * passing a short, static title (Settings, System, Stream Media, ...)
+     * just shifts from centered to left-aligned, matching how those other
+     * screens already look -- no functional difference for a title that
+     * already fit. */
+    lv_obj_set_width(label, lv_display_get_horizontal_resolution(lv_display_get_default()) -
+                                 BUILD_TITLE_LEFT_INSET - BUILD_TITLE_RIGHT_MARGIN);
     /* Vertically centered within the TITLE_ROW_HEIGHT band below the
      * status bar (matches the back button's own 64px height). */
-    lv_obj_align(label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, BUILD_TITLE_LEFT_INSET, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, ui_size_28, 0);
+    row_label_enable_marquee(label);
     return label;
 }
 

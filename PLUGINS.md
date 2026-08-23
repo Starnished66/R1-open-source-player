@@ -297,15 +297,19 @@ doesn't add new ones.
 
 Each entry in `tile_keys` is either a plain string, or a table `{ key =
 "...", bg_color = 0xRRGGBB, text_color = 0xRRGGBB, radius = n, bg_alpha =
-n, ... }` to also style that one tile -- the same "string, or a table for
-the rows that need more" shape `register_list_item()`'s/`show_list()`'s
-own `items` arrays already use. `bg_color`/`text_color`/`radius`/
-`bg_alpha` work in either mode; `radius` (corner radius, in px) is clamped
-to `0..64`, `bg_alpha` (background opacity, `0`-`255`, matching LVGL's own
+n, border_color = 0xRRGGBB, border_width = n, ... }` to also style that one
+tile -- the same "string, or a table for the rows that need more" shape
+`register_list_item()`'s/`show_list()`'s own `items` arrays already use.
+`bg_color`/`text_color`/`radius`/`bg_alpha`/`border_color`/`border_width`
+all work in either mode; `radius` (corner radius, in px) is clamped to
+`0..64`, `bg_alpha` (background opacity, `0`-`255`, matching LVGL's own
 scale -- `255` is today's fully-opaque default) lets a tile go
-semi-transparent over `plugin.set_background_image()`'s wallpaper below.
-Any property left out of a table entry (or every entry left a plain
-string) keeps that tile's default appearance.
+semi-transparent over `plugin.set_background_image()`'s wallpaper below,
+and `border_width` (px, clamped to `0..8`) draws a `border_color`-tinted
+outline around the tile -- `border_color` alone with no `border_width` (or
+`border_width = 0`) is inert, same as leaving both out. Any property left
+out of a table entry (or every entry left a plain string) keeps that
+tile's default appearance.
 
 `options.mode` is `"tile"` (default, the icon grid) or `"list"` (a plain
 vertical list, each tile becoming a row with its icon and a chevron).
@@ -404,8 +408,8 @@ The same reorder/hide/restyle mechanism `set_home_layout()` gives Home,
 generalized to every other top-level native screen with the same shape --
 a small, fixed, string-keyed set of nav tiles/rows. `item_keys` and
 `options` are exactly `set_home_layout()`'s own `tile_keys`/`options`
-(same per-item `bg_color`/`text_color`/`radius`/`bg_alpha` table shape,
-same `options.mode`/`row_gap`/`tile_gap`), just parameterized by which
+(same per-item `bg_color`/`text_color`/`radius`/`bg_alpha`/`border_color`/
+`border_width` table shape, same `options.mode`/`row_gap`/`tile_gap`), just parameterized by which
 screen to target:
 
 | `screen_id` | Shape | Native item keys |

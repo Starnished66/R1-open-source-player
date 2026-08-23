@@ -393,7 +393,8 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
          * see the real divider lines added below at the grid level), but
          * left un-zeroed now it shows as a light border around all four
          * edges of every tile, confirmed on a real-device screenshot. */
-        lv_obj_set_style_border_width(tile, 0, 0);
+        lv_obj_set_style_border_width(tile, item->has_border ? item->border_width : 0, 0);
+        if (item->has_border) lv_obj_set_style_border_color(tile, lv_color_hex(item->border_color), 0);
         lv_obj_set_style_pad_all(tile, ICON_GRID_TILE_PAD, 0);
         lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
@@ -825,7 +826,8 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
          * opacity, and bg_opa=COVER is required just to let it draw at all
          * (see this row's own has_bg_color comment above). */
         lv_obj_set_style_bg_opa(row, (resized && item->has_bg_alpha) ? item->bg_alpha : LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_border_width(row, item->has_border ? item->border_width : 0, 0);
+        if (item->has_border) lv_obj_set_style_border_color(row, lv_color_hex(item->border_color), 0);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t * label = lv_label_create(row);

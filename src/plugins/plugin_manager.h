@@ -287,6 +287,15 @@ bool plugin_manager_get_screen_item_text_color(const char * screen_id, int index
 bool plugin_manager_get_screen_item_radius(const char * screen_id, int index, int32_t * out_radius);
 bool plugin_manager_get_screen_item_bg_alpha(const char * screen_id, int index, uint8_t * out_alpha);
 
+/* Same "false means nothing to apply" shape, for an optional border
+ * (`border_color = 0xRRGGBB, border_width = n`, px, clamped to
+ * 0..PLUGIN_SCREEN_BORDER_WIDTH_MAX) -- works in both tile and list mode,
+ * not list-mode-only like the block below. A border_width of 0 (or the
+ * field left out) never sets has_border, since a 0-width border is
+ * invisible either way. */
+bool plugin_manager_get_screen_item_border(const char * screen_id, int index, uint32_t * out_color,
+                                            int32_t * out_width);
+
 /* List-mode-only per-item extensions (set_screen_layout()'s/set_home_
  * layout()'s per-item config table gains `height`, `width`, `align`,
  * `accessory`, `text_size`, `icon`, PLUGINS.md) -- meaningless in tile

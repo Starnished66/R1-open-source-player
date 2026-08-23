@@ -144,6 +144,11 @@ typedef struct {
      * tile leaves this false, reproducing today's fully-opaque
      * LV_OPA_COVER look. */
     bool has_bg_alpha;   uint8_t bg_alpha;
+    /* Every native tile leaves this false -- a plain lv_obj_create() border
+     * is already forced to 0 unconditionally otherwise (see the real-device
+     * bug report on that in build_icon_grid_screen()), so this is strictly
+     * opt-in, never a default appearance change. border_width in px. */
+    bool has_border;     uint32_t border_color; int32_t border_width;
 } icon_grid_item_t;
 
 /* Titled screen: real back-arrow button (top-left, invokes back_btn_cb) and
@@ -254,6 +259,15 @@ typedef struct {
      * sprite, which can't be recolored/reshaped and always renders fully
      * opaque). */
     bool has_bg_alpha;   uint8_t bg_alpha;
+
+    /* Same meaning as icon_grid_item_t's own has_border -- opt-in only,
+     * every native row leaves this false (border_width already forced to 0
+     * unconditionally otherwise). Unlike has_bg_color/has_radius, this does
+     * NOT force the plain-fill path -- a border is a separate style
+     * property, drawn as its own stroke around the row's box regardless of
+     * whether the fill underneath is the PNG pill sprite or a plain color,
+     * so it works on a native (unresized) row too. border_width in px. */
+    bool has_border;     uint32_t border_color; int32_t border_width;
 
     /* NULL/"left" (default) = today's exact layout (label left-aligned,
      * starting right after any icon -- unaffected by this field). "center"/

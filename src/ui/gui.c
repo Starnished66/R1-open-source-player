@@ -16037,6 +16037,8 @@ static int resolve_screen_items(const char * screen_id, const screen_native_def_
         uint32_t rgb;
         int32_t radius;
         uint8_t alpha;
+        uint32_t border_color;
+        int32_t border_width;
         if (plugin_manager_get_screen_item_bg_color(screen_id, i, &rgb)) {
             out_items[count].has_bg_color = true;
             out_items[count].bg_color = rgb;
@@ -16052,6 +16054,11 @@ static int resolve_screen_items(const char * screen_id, const screen_native_def_
         if (plugin_manager_get_screen_item_bg_alpha(screen_id, i, &alpha)) {
             out_items[count].has_bg_alpha = true;
             out_items[count].bg_alpha = alpha;
+        }
+        if (plugin_manager_get_screen_item_border(screen_id, i, &border_color, &border_width)) {
+            out_items[count].has_border = true;
+            out_items[count].border_color = border_color;
+            out_items[count].border_width = border_width;
         }
         /* icon = false (PLUGINS.md) -- previously list-mode-only (resolve_
          * screen_list_items() below already honors it), now also honored
@@ -16112,6 +16119,9 @@ static void resolve_screen_list_items(const char * screen_id, const icon_grid_it
             .radius = items[i].radius,
             .has_bg_alpha = items[i].has_bg_alpha,
             .bg_alpha = items[i].bg_alpha,
+            .has_border = items[i].has_border,
+            .border_color = items[i].border_color,
+            .border_width = items[i].border_width,
             .row_height = has_row_height ? row_height : 0,
             .row_width = has_row_width ? row_width : 0,
             .text_size = plugin_manager_get_screen_item_text_size(screen_id, i),

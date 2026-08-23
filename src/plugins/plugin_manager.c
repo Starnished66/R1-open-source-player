@@ -1050,6 +1050,11 @@ static const plugin_screen_def_t plugin_screen_defs[] = {
  * reads as intentional spacing rather than the tiles falling apart. */
 #define PLUGIN_SCREEN_TILE_GAP_MAX 40
 
+/* Ceiling on a plugin-chosen border_width -- cosmetic, clamped not errored,
+ * same split PLUGIN_SCREEN_RADIUS_MAX already makes for radius. A thin
+ * accent border is the realistic use case here, not a thick outline. */
+#define PLUGIN_SCREEN_BORDER_WIDTH_MAX 8
+
 /* Shared by is_valid_screen_text_size() below -- "mono" (lv_font_unscii_16,
  * see lv_conf.h) is only offered through set_screen_layout()/set_home_
  * layout() for now (list mode), not through register_list_item()/
@@ -1066,6 +1071,7 @@ typedef struct {
     bool has_text_color; uint32_t text_color; /* 0xRRGGBB */
     bool has_radius;     int32_t radius;      /* px, clamped to 0..PLUGIN_SCREEN_RADIUS_MAX */
     bool has_bg_alpha;   uint8_t bg_alpha;    /* 0-255, lv_opa_t scale */
+    bool has_border;     uint32_t border_color; int32_t border_width; /* px */
 
     /* ---- List-mode-only extensions (plugin.set_screen_layout()/set_home_
      * layout(), PLUGINS.md). Ignored in tile mode -- only read once
@@ -1209,8 +1215,9 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
 
         const char * key;
         bool has_bg_color = false, has_text_color = false, has_radius = false, has_bg_alpha = false;
-        uint32_t bg_color = 0, text_color = 0;
-        int32_t radius = 0;
+        bool has_border = false;
+        uint32_t bg_color = 0, text_color = 0, border_color = 0;
+        int32_t radius = 0, border_width = 0;
         uint8_t bg_alpha = 0;
         /* List-mode-only extensions (PLUGINS.md) -- silently ignored in tile
          * mode, same as bg_color/text_color/radius/bg_alpha are never
@@ -1262,6 +1269,26 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
                 if (a < 0) a = 0;
                 if (a > 255) a = 255;
                 bg_alpha = (uint8_t) a;
+            }
+            lua_pop(L, 1);
+
+            /* border_color/border_width -- a plain 0-width border (the
+             * default) is invisible regardless of border_color, so only
+             * border_width actually flips has_border on; border_color
+             * alone with no width set is silently inert, same "harmless if
+             * incomplete" tolerance every other pair-of-fields option here
+             * already has. */
+            lua_getfield(L, -1, "border_color");
+            if (!lua_isnil(L, -1)) border_color = (uint32_t) lua_tointeger(L, -1);
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "border_width");
+            if (!lua_isnil(L, -1)) {
+                lua_Integer w = lua_tointeger(L, -1);
+                if (w < 0) w = 0;
+                if (w > PLUGIN_SCREEN_BORDER_WIDTH_MAX) w = PLUGIN_SCREEN_BORDER_WIDTH_MAX;
+                border_width = (int32_t) w;
+                has_border = border_width > 0;
             }
             lua_pop(L, 1);
 
@@ -1351,6 +1378,9 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
         new_items[i].radius = radius;
         new_items[i].has_bg_alpha = has_bg_alpha;
         new_items[i].bg_alpha = bg_alpha;
+        new_items[i].has_border = has_border;
+        new_items[i].border_color = border_color;
+        new_items[i].border_width = border_width;
         new_items[i].row_height = row_height;
         new_items[i].row_width = row_width;
         snprintf(new_items[i].text_align, sizeof(new_items[i].text_align), "%s", text_align);
@@ -1432,6 +1462,17 @@ bool plugin_manager_get_screen_item_bg_alpha(const char * screen_id, int index, 
         !plugin_screen_items[slot][index].has_bg_alpha)
         return false;
     *out_alpha = plugin_screen_items[slot][index].bg_alpha;
+    return true;
+}
+
+bool plugin_manager_get_screen_item_border(const char * screen_id, int index, uint32_t * out_color,
+                                            int32_t * out_width) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        !plugin_screen_items[slot][index].has_border)
+        return false;
+    *out_color = plugin_screen_items[slot][index].border_color;
+    *out_width = plugin_screen_items[slot][index].border_width;
     return true;
 }
 

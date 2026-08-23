@@ -161,7 +161,7 @@ from the moment your script starts running (injected before
 | Theme | `set_icon`, `set_background_color`, `set_text_color` |
 | Files | `sd_root`, `list_dir` |
 | Playback | `play_file`, `play_list`, transport controls, playback state |
-| Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
+| Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums`, `refresh_library` |
 | Audio | `eq_load_profile`, `eq_save_profile`, `eq_set_*`, `eq_reset` |
 | Network | `http_request`, `cancel`, legacy `http_get`/`http_post` |
 | Automation | `on`, `set_interval`, `clear_interval` |
@@ -811,6 +811,16 @@ tell them apart; empty from `library_get_artists`).
 - `plugin.library_get_albums([offset], [limit], [artist])` -- `{ group,
   ... }`. `artist` restricts to one artist or album\_artist's own albums;
   omit it for every album, unfiltered.
+
+### `plugin.refresh_library()`
+
+Triggers the same background rescan as Settings -> Update Music Database --
+useful after a plugin writes new files under `plugin.sd_root()`, since none
+of the `library_*()` functions above notice new files on their own;
+there's no filesystem watcher, only a rescan triggered by this, that same
+Settings row, an SD reinsert, or a restart. Shows the same native "Updating
+music database..." progress screen a user tapping that row would see. A
+no-op if a rescan is already running.
 
 ```lua
 plugin.define({ id = "org.example.library_browser", api_min = 1 })

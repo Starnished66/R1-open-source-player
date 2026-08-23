@@ -211,6 +211,15 @@ bool gui_plugin_library_get_song(int64_t id, song_row_t * out_row);
 int gui_plugin_library_get_artists(int offset, int limit, group_row_t * out_rows);
 int gui_plugin_library_get_albums(int offset, int limit, const char * artist_filter, group_row_t * out_rows);
 
+/* Bridges to the same start_library_rescan() Settings > Update Music
+ * Database's own row calls -- background-thread rescan of MUSIC_ROOT_DIR,
+ * showing the same native "Updating music database..." progress screen.
+ * A no-op if a rescan is already in flight (start_library_rescan()'s own
+ * library_rescan_active guard). Lets a plugin that just wrote new files
+ * under plugin.sd_root() make them show up in library_* queries without
+ * the user finding the native menu item themselves. */
+void gui_plugin_refresh_library(void);
+
 /* ---- Bridges for plugin.get_now_playing()/set_interval()/clear_interval()/
  * show_text_input() -- see plugin_manager.h's own comments on the Lua-facing
  * shape of each. ---- */

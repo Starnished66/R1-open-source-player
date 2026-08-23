@@ -791,6 +791,21 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
 
         lv_obj_t * row = lv_obj_create(list);
         lv_obj_set_size(row, width, height);
+        /* Real bug: row never zeroed its own default-theme padding, unlike
+         * every sibling object in this file that positions children by
+         * hand (tile/list above both explicitly zero theirs, list's own
+         * comment describing this exact class of bug). left/right label
+         * math below (label_left/accessory_space) is computed against
+         * `width`, the row's own OUTER box size -- but lv_obj_align()
+         * positions children relative to the CONTENT area, inset by
+         * whatever padding is active. With nonzero default padding still
+         * in effect, that inset silently shifted the label's own box
+         * (and therefore any "center"/"right" text_align within it) off
+         * to one side -- invisible for the default left-aligned native
+         * rows (nothing to visually compare against), glaring once a
+         * plugin's `align = "center"` gave it something to compare
+         * against (real-device bug report). */
+        lv_obj_set_style_pad_all(row, 0, 0);
         /* item_bg.png is a rounded-rect sprite with transparent corners --
          * without an explicit black bg_color here, LVGL's own default
          * object background (light gray/white) shows through at those

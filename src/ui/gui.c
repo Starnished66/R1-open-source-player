@@ -16053,6 +16053,16 @@ static int resolve_screen_items(const char * screen_id, const screen_native_def_
             out_items[count].has_bg_alpha = true;
             out_items[count].bg_alpha = alpha;
         }
+        /* icon = false (PLUGINS.md) -- previously list-mode-only (resolve_
+         * screen_list_items() below already honors it), now also honored
+         * in tile mode: NULLing both icon fields here reaches build_icon_
+         * grid_screen()'s own icon_asset-is-NULL branch (screen_builders.c),
+         * which centers the label alone with no reserved icon space,
+         * instead of trying to decode a NULL path. */
+        if (!plugin_manager_get_screen_item_show_icon(screen_id, i)) {
+            out_items[count].icon_asset = NULL;
+            out_items[count].icon_asset_selected = NULL;
+        }
         count++;
     }
     if (count == 0) {

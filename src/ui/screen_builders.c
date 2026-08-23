@@ -407,29 +407,42 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
          * by dozens of pixels, only for the grid's last row), so the whole
          * tile's content is placed by hand here instead of trusting flex
          * to settle on a stable answer. */
-        lv_obj_t * img_wrap = lv_obj_create(tile);
-        lv_obj_remove_style_all(img_wrap);
-        lv_obj_remove_flag(img_wrap, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(img_wrap, LV_OBJ_FLAG_CLICKABLE); /* let taps fall through to tile's own click handler */
+        /* NULL icon_asset (plugin.set_home_layout()/set_screen_layout()'s
+         * per-item `icon = false`, PLUGINS.md -- previously list-mode-only,
+         * now honored here too) skips the icon entirely: no img_wrap/img
+         * created, target_icon_w/h stay 0 so the label-placement math below
+         * centers the label alone in the tile's full available height,
+         * same "icon = false gives a label genuinely flush/centered with no
+         * reserved icon space" behavior list mode's own pill rows already
+         * have. */
+        lv_obj_t * img_wrap = NULL;
+        lv_obj_t * img = NULL;
+        int32_t target_icon_w = 0, target_icon_h = 0;
+        if (item->icon_asset) {
+            img_wrap = lv_obj_create(tile);
+            lv_obj_remove_style_all(img_wrap);
+            lv_obj_remove_flag(img_wrap, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_remove_flag(img_wrap, LV_OBJ_FLAG_CLICKABLE); /* let taps fall through to tile's own click handler */
 
-        lv_obj_t * img = lv_image_create(img_wrap);
-        const char * icon_full_path = asset_path(item->icon_asset);
-        lv_image_set_src(img, icon_full_path);
+            img = lv_image_create(img_wrap);
+            const char * icon_full_path = asset_path(item->icon_asset);
+            lv_image_set_src(img, icon_full_path);
 
-        lv_image_header_t icon_header;
-        int32_t icon_scale = (340 * icon_scale_percent) / 100; /* fallback: matches the historical flat scale (at 100%) if the header can't be read */
-        int32_t icon_w = 100, icon_h = 100; /* fallback: matches the "category" folder icons' native size */
-        if (lv_image_decoder_get_info(icon_full_path, &icon_header) == LV_RESULT_OK) {
-            int32_t native_max = icon_header.w > icon_header.h ? icon_header.w : icon_header.h;
-            if (native_max > 0) icon_scale = (int32_t) (((int64_t) target_icon_px * 256) / native_max);
-            icon_w = icon_header.w;
-            icon_h = icon_header.h;
+            lv_image_header_t icon_header;
+            int32_t icon_scale = (340 * icon_scale_percent) / 100; /* fallback: matches the historical flat scale (at 100%) if the header can't be read */
+            int32_t icon_w = 100, icon_h = 100; /* fallback: matches the "category" folder icons' native size */
+            if (lv_image_decoder_get_info(icon_full_path, &icon_header) == LV_RESULT_OK) {
+                int32_t native_max = icon_header.w > icon_header.h ? icon_header.w : icon_header.h;
+                if (native_max > 0) icon_scale = (int32_t) (((int64_t) target_icon_px * 256) / native_max);
+                icon_w = icon_header.w;
+                icon_h = icon_header.h;
+            }
+            lv_image_set_scale(img, icon_scale);
+            target_icon_w = (int32_t) (((int64_t) icon_w * icon_scale) / 256);
+            target_icon_h = (int32_t) (((int64_t) icon_h * icon_scale) / 256);
+            lv_obj_set_size(img_wrap, target_icon_w, target_icon_h);
+            lv_obj_center(img);
         }
-        lv_image_set_scale(img, icon_scale);
-        int32_t target_icon_w = (int32_t) (((int64_t) icon_w * icon_scale) / 256);
-        int32_t target_icon_h = (int32_t) (((int64_t) icon_h * icon_scale) / 256);
-        lv_obj_set_size(img_wrap, target_icon_w, target_icon_h);
-        lv_obj_center(img);
 
         lv_obj_t * label = lv_label_create(tile);
         lv_label_set_text(label, item->label);
@@ -459,7 +472,18 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
          * or icon/label placement would overflow the tile's real (now
          * smaller) bottom edge. */
         int32_t available_h = row_h - tile_gap - 2 * ICON_GRID_TILE_PAD;
-        if (label_inside_icon) {
+        if (!img_wrap) {
+            /* No icon (item->icon_asset NULL, plugin `icon = false`) -- just
+             * the label, vertically centered in the tile's full available
+             * height, same "no icon means no reserved icon space" shape
+             * list mode's own icon-less rows already have. */
+            int32_t line_h = lv_font_get_line_height(ui_size_20);
+            int32_t label_h = line_h * 2;
+            lv_obj_set_height(label, label_h);
+            int32_t top_offset = (available_h - label_h) / 2;
+            if (top_offset < 0) top_offset = 0;
+            lv_obj_align(label, LV_ALIGN_TOP_MID, 0, top_offset);
+        } else if (label_inside_icon) {
             /* See this function's own header comment (screen_builders.h) --
              * these assets already reserve their own caption band near the
              * bottom of the image, so there's no separate label row to
@@ -500,7 +524,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
             lv_obj_align(label, LV_ALIGN_TOP_MID, 0, top_offset + target_icon_h + ICON_GRID_ICON_LABEL_GAP);
         }
 
-        if (item->icon_asset_selected) {
+        if (img && item->icon_asset_selected) {
             icon_tile_press_ctx_t * ctx = malloc(sizeof(icon_tile_press_ctx_t));
             ctx->img = img;
             ctx->normal_path = item->icon_asset;

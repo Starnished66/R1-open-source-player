@@ -322,12 +322,20 @@ plugin.set_home_layout({
 plugin.set_home_layout({ "music", "system", "dac" }, { mode = "list" })
 ```
 
-#### List-mode-only extensions
+#### `icon`, and list-mode-only extensions
 
-The icon grid is a fixed 2x3 layout with a centered icon+label per tile --
-none of the properties below have a meaning there, so they're silently
-ignored outside `{ mode = "list" }`. In list mode, each per-tile table also
-accepts:
+- `icon` -- `false` drops the tile's launcher icon (default `true`, today's
+  look), in **either** mode. In tile mode the label alone is centered in
+  the tile with no icon reserved above/inside it. In list mode this isn't
+  just cosmetic: a shown icon always reserves space for itself before the
+  label (so `align = "left"` still starts after it) -- set `icon = false`
+  to get a label genuinely flush against the row's own left edge, or when
+  `height` is small enough that the icon would clip.
+
+The icon grid is otherwise a fixed 2x3 layout with a centered icon+label
+per tile -- none of the properties below have a meaning there, so they're
+silently ignored outside `{ mode = "list" }`. In list mode, each per-tile
+table also accepts:
 
 - `height`/`width` (px) -- resizes that row. Clamped to the same range
   `register_list_item()`'s own `height`/`width` options use.
@@ -340,11 +348,6 @@ accepts:
   monospace/pixel bitmap font). `"mono"` is ASCII-only -- a label with
   accented or non-Latin characters will show blank glyphs for those
   characters, unlike this app's own regenerated fallback-capable fonts.
-- `icon` -- `false` drops the tile's launcher icon (default `true`, today's
-  look). This isn't just cosmetic: a shown icon always reserves space for
-  itself before the label (so `align = "left"` still starts after it) --
-  set `icon = false` to get a label genuinely flush against the row's own
-  left edge, or when `height` is small enough that the icon would clip.
 
 `options.row_gap` (list mode only) sets the vertical spacing between rows,
 in px, clamped to `0..24` (default `6`, today's look).
@@ -418,8 +421,10 @@ screen to target:
 `"settings"`, `"books"`, and `"dac"` are already a plain row list natively
 (no icon-grid equivalent) -- `options.mode` is silently ignored for these
 three, and they're always in the list-mode shape, so every list-mode-only
-per-item property (`height`/`width`/`align`/`accessory`/`text_size`/`icon`)
+per-item property (`height`/`width`/`align`/`accessory`/`text_size`)
 applies to them too, not just to `{ mode = "list" }` on the other four.
+(`icon` applies everywhere, tile mode included -- see `set_home_layout()`
+above.)
 
 ```lua
 -- Reorder + restyle Music's tiles, semi-transparent over a wallpaper

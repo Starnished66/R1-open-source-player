@@ -382,7 +382,11 @@ Mountain Sunset, Zen Terracotta, Retro, Vaporwave, Earthy) spanning both
 modes and every style knob above -- each one a genuinely different
 shape/spacing/alignment recipe, not just a different palette on the same
 skeleton -- picked from a Settings row and persisted the same way
-`Themes.lua`'s own light/dark picker is. Screenshots of all 11 are in
+`Themes.lua`'s own light/dark picker is. Each preset also calls
+`set_background_color()`/`set_text_color()` (all 5 slots below) to match
+the same palette, so the theme carries app-wide -- every screen's
+background, every list row, every card/popup, and both text tiers --
+not just Home. Screenshots of all 11 are in
 `plugins_examples/screenshots/home_themes/`.
 
 ### `plugin.set_background_color(slot, rgb)`

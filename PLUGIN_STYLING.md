@@ -191,6 +191,7 @@ Passed as the 2nd argument to `set_home_layout()` / 3rd to
 | `title_align` | string | `"left"` | `"left"`, `"center"`, `"right"` | every screen with a title | See [Title styling](#title-styling). |
 | `title_size` | string | native (28px) | `"small"`, `"medium"`, `"large"`, `"mono"` | every screen with a title | A larger scale than item `text_size` (`22`/`28`/`40px`) -- see [Title styling](#title-styling) for why. |
 | `title_underline` | bool | `false` | -- | every screen with a title | Adds an underline text-decoration to the title label. |
+| `title_color` | `0xRRGGBB` int | whatever `set_text_color("primary", ...)` is set to | any | every screen with a title | A per-screen override, separate from the app-wide `"primary"` text color slot -- lets one screen's title stand out from its own body text. |
 
 <a id="screen-ids"></a>
 
@@ -224,15 +225,18 @@ tile mode included.
 
 ### Title styling
 
-`options.title_align`/`title_size`/`title_underline` style the screen's
-own title label (e.g. the "Music" or "Settings" text above the grid/list)
--- separate from every per-item field above, which only ever touches
-tiles/rows, never the title.
+`options.title_align`/`title_size`/`title_underline`/`title_color` style
+the screen's own title label (e.g. the "Music" or "Settings" text above
+the grid/list) -- separate from every per-item field above, which only
+ever touches tiles/rows, never the title.
 
 ```lua
 plugin.set_home_layout(
     { "music", "system", "dac" },
-    { mode = "list", title_align = "center", title_size = "large", title_underline = true }
+    {
+        mode = "list", title_align = "center", title_size = "large",
+        title_underline = true, title_color = 0xffb347,
+    }
 )
 ```
 
@@ -410,7 +414,10 @@ end
 
 plugin.set_home_layout(
     themed_layout({ "music", "stream_media", "wireless", "books", "system", "dac" }),
-    { mode = "list", row_gap = 8, title_align = "center", title_size = "large", title_underline = true }
+    {
+        mode = "list", row_gap = 8, title_align = "center", title_size = "large",
+        title_underline = true, title_color = 0xffb347,
+    }
 )
 
 plugin.set_screen_layout("music",

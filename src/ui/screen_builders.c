@@ -288,6 +288,7 @@ static void apply_title_style(lv_obj_t * label, const screen_title_style_t * sty
         lv_obj_set_style_text_font(label, font, 0);
     }
     if (style->underline) lv_obj_set_style_text_decor(label, LV_TEXT_DECOR_UNDERLINE, 0);
+    if (style->has_color) lv_obj_set_style_text_color(label, lv_color_hex(style->color), 0);
 
     bool reflow = style->align && strcmp(style->align, "left") != 0;
     if (reflow) {

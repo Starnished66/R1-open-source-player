@@ -1115,6 +1115,13 @@ static int32_t plugin_screen_tile_gap[PLUGIN_SCREEN_COUNT];
 static char plugin_screen_title_align[PLUGIN_SCREEN_COUNT][8];
 static char plugin_screen_title_size[PLUGIN_SCREEN_COUNT][8];
 static bool plugin_screen_title_underline[PLUGIN_SCREEN_COUNT];
+/* options.title_color -- same idea, a per-screen override of the title
+ * label's own text color, separate from set_text_color("primary", ...)'s
+ * single app-wide slot (which the title also picks up by default, see
+ * build_title()'s own style_theme_text_primary) -- lets a plugin make one
+ * screen's title stand out from its own body text. */
+static bool plugin_screen_has_title_color[PLUGIN_SCREEN_COUNT];
+static uint32_t plugin_screen_title_color[PLUGIN_SCREEN_COUNT];
 
 static int plugin_screen_slot(const char * screen_id) {
     for (int i = 0; i < PLUGIN_SCREEN_COUNT; i++) {
@@ -1188,6 +1195,8 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
     char title_align[8] = "";
     char title_size[8] = "";
     bool title_underline = false;
+    bool has_title_color = false;
+    uint32_t title_color = 0;
     if (lua_gettop(L) >= options_idx && !lua_isnil(L, options_idx)) {
         luaL_checktype(L, options_idx, LUA_TTABLE);
         lua_getfield(L, options_idx, "mode");
@@ -1254,6 +1263,18 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
 
         lua_getfield(L, options_idx, "title_underline");
         if (!lua_isnil(L, -1)) title_underline = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+
+        /* title_color -- separate slot from set_text_color("primary", ...)'s
+         * single app-wide one (which the title picks up by default), same
+         * "own override on top of the global default" relationship
+         * bg_color/text_color already have with set_background_color()/
+         * set_text_color() at the per-item level. */
+        lua_getfield(L, options_idx, "title_color");
+        if (!lua_isnil(L, -1)) {
+            has_title_color = true;
+            title_color = (uint32_t) lua_tointeger(L, -1);
+        }
         lua_pop(L, 1);
     }
 
@@ -1467,6 +1488,8 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
     snprintf(plugin_screen_title_align[slot], sizeof(plugin_screen_title_align[slot]), "%s", title_align);
     snprintf(plugin_screen_title_size[slot], sizeof(plugin_screen_title_size[slot]), "%s", title_size);
     plugin_screen_title_underline[slot] = title_underline;
+    plugin_screen_has_title_color[slot] = has_title_color;
+    plugin_screen_title_color[slot] = title_color;
     return 0;
 }
 
@@ -1634,6 +1657,13 @@ bool plugin_manager_get_screen_title_underline(const char * screen_id) {
     int slot = plugin_screen_slot(screen_id);
     if (slot < 0) return false;
     return plugin_screen_title_underline[slot];
+}
+
+bool plugin_manager_get_screen_title_color(const char * screen_id, uint32_t * out_color) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || !plugin_screen_has_title_color[slot]) return false;
+    *out_color = plugin_screen_title_color[slot];
+    return true;
 }
 
 /* plugin.lerp_color(from, to, t) -- linear-interpolates each RGB channel

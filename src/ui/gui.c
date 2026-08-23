@@ -16143,11 +16143,13 @@ static void resolve_screen_list_items(const char * screen_id, const icon_grid_it
  * "no override" independently, so this is safe to pass unconditionally
  * (no separate "did anything actually change" check needed here). */
 static screen_title_style_t plugin_screen_title_style(const char * screen_id) {
-    return (screen_title_style_t){
+    screen_title_style_t style = {
         .align = plugin_manager_get_screen_title_align(screen_id),
         .size = plugin_manager_get_screen_title_size(screen_id),
         .underline = plugin_manager_get_screen_title_underline(screen_id),
     };
+    style.has_color = plugin_manager_get_screen_title_color(screen_id, &style.color);
+    return style;
 }
 
 static const screen_native_def_t music_tile_defs[] = {

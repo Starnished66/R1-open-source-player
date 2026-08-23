@@ -344,6 +344,12 @@ const char * plugin_manager_get_screen_title_align(const char * screen_id);
 const char * plugin_manager_get_screen_title_size(const char * screen_id);
 bool plugin_manager_get_screen_title_underline(const char * screen_id);
 
+/* options.title_color -- 0xRRGGBB, a per-screen override of the title
+ * label's own text color, separate from set_text_color("primary", ...)'s
+ * single app-wide slot. Returns false (no override) if this screen never
+ * set it. */
+bool plugin_manager_get_screen_title_color(const char * screen_id, uint32_t * out_color);
+
 /* Invoked by gui.c's plugin-settings-list row widgets (see
  * gui_plugin_show_settings_list()) when a "row"-type row in pool slot `slot`
  * at position `row` is tapped -- calls that row's own on_select Lua function

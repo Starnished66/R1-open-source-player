@@ -184,18 +184,24 @@ typedef struct {
  * Only plugin.set_home_layout()'s options.tile_gap (PLUGINS.md, tile mode)
  * ever passes a nonzero value. */
 /* Optional per-screen title override (plugin.set_screen_layout()'s/
- * set_home_layout()'s options.title_align/title_size/title_underline,
- * PLUGINS.md) -- NULL means "no override" at either the struct-pointer
- * level (every native, non-plugin-styleable screen -- Time Zone, About,
- * Playback, ...) or per-field (a plugin set only some of the three).
+ * set_home_layout()'s options.title_align/title_size/title_underline/
+ * title_color, PLUGIN_STYLING.md) -- NULL means "no override" at either
+ * the struct-pointer level (every native, non-plugin-styleable screen --
+ * Time Zone, About, Playback, ...) or per-field (a plugin set only some
+ * of these).
  * align: NULL/"left" (today's exact default), "center", or "right".
- * size: NULL = today's exact default (ui_size_28); otherwise reuses
- * pill_row_resolve_text_size()'s own "small"/"medium"/"large"/"mono" scale
- * so a title can match a plugin's own row font tier. */
+ * size: NULL = today's exact default (ui_size_28); otherwise
+ * title_resolve_text_size()'s own "small"/"medium"/"large"/"mono" scale
+ * (screen_builders.c) -- deliberately its own, larger scale than item
+ * text_size's, see that function's own comment for why.
+ * has_color/color: has_color false = today's exact default (whatever
+ * set_text_color("primary", ...) has set, style_theme_text_primary). */
 typedef struct {
     const char * align;
     const char * size;
     bool underline;
+    bool has_color;
+    uint32_t color;
 } screen_title_style_t;
 
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,

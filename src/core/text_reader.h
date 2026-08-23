@@ -24,4 +24,12 @@ bool text_reader_scan_txt_files(const char * root, char *** out_paths, int * out
 #define TEXT_READER_MAX_BYTES (512 * 1024)
 char * text_reader_load(const char * path, bool * out_truncated);
 
+/* Cached book list and per-path favorites. Tagcache has no book tables;
+ * these live as path lists beside the music database directory. */
+void text_reader_index_replace(char * const * paths, int count);
+void text_reader_index_load(char *** out_paths, int * out_count);
+bool text_reader_favorite_is_set(const char * path);
+void text_reader_favorite_set(const char * path, bool is_favorite);
+void text_reader_load_favorites(char *** out_paths, int * out_count);
+
 #endif /* TEXT_READER_H */

@@ -85,6 +85,8 @@ static void set_defaults(player_settings_t * out) {
     out->subsonic_username[0] = '\0';
     out->subsonic_password[0] = '\0';
     out->subsonic_verify_tls = true;
+    memset(out->subsonic_saved, 0, sizeof(out->subsonic_saved));
+    out->subsonic_saved_count = 0;
     out->bt_volume_sync_enabled = true;
     out->bt_dac_mode_enabled = false;
     snprintf(out->bt_codec, sizeof(out->bt_codec), "auto");
@@ -129,11 +131,76 @@ static void set_defaults(player_settings_t * out) {
     out->clock_24h = true; /* matches the app's original, only-ever clock format -- existing installs see no change */
 }
 
+void settings_subsonic_server_upsert(player_settings_t * settings, const char * url, const char * username,
+                                      const char * password, bool verify_tls) {
+    if (!settings || !url || !url[0]) return;
+    int found = -1;
+    for (int i = 0; i < settings->subsonic_saved_count; i++) {
+        if (strcmp(settings->subsonic_saved[i].url, url) == 0) {
+            found = i;
+            break;
+        }
+    }
+    if (found < 0) {
+        if (settings->subsonic_saved_count >= SETTINGS_SUBSONIC_SAVED_MAX) return;
+        found = settings->subsonic_saved_count++;
+        memset(&settings->subsonic_saved[found], 0, sizeof(settings->subsonic_saved[found]));
+    }
+    snprintf(settings->subsonic_saved[found].url, sizeof(settings->subsonic_saved[found].url), "%s", url);
+    snprintf(settings->subsonic_saved[found].username, sizeof(settings->subsonic_saved[found].username), "%s",
+             username ? username : "");
+    snprintf(settings->subsonic_saved[found].password, sizeof(settings->subsonic_saved[found].password), "%s",
+             password ? password : "");
+    settings->subsonic_saved[found].verify_tls = verify_tls;
+}
+
+static void import_legacy_subsonic_list_file(player_settings_t * out, const char * path) {
+    FILE * f = fopen(path, "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        char * url = line;
+        char * user = strchr(url, '\t');
+        if (!user) continue;
+        *user++ = '\0';
+        char * pass = strchr(user, '\t');
+        if (!pass) continue;
+        *pass++ = '\0';
+        char * tls = strchr(pass, '\t');
+        if (!tls) continue;
+        *tls++ = '\0';
+        settings_subsonic_server_upsert(out, url, user, pass, tls[0] != '0');
+    }
+    fclose(f);
+}
+
+static void import_legacy_subsonic_servers(player_settings_t * out) {
+    if (out->subsonic_saved_count == 0) {
+        import_legacy_subsonic_list_file(out, "./open_hiby_player_subsonic.txt");
+#ifndef HOST_BUILD
+        import_legacy_subsonic_list_file(out, "/usr/data/open_hiby_player_subsonic.txt");
+        import_legacy_subsonic_list_file(out, "/data/mnt/sd_0/.open_hiby_player/subsonic.list");
+#endif
+#ifdef HOST_BUILD
+        import_legacy_subsonic_list_file(out, "./.open_hiby_player/subsonic.list");
+#endif
+    }
+    if (out->subsonic_saved_count == 0 && out->subsonic_url[0]) {
+        settings_subsonic_server_upsert(out, out->subsonic_url, out->subsonic_username, out->subsonic_password,
+                                        out->subsonic_verify_tls);
+    }
+}
+
 bool settings_load(player_settings_t * out) {
     set_defaults(out);
 
     FILE * f = fopen(SETTINGS_FILE_PATH, "r");
-    if (!f) return false;
+    if (!f) {
+        import_legacy_subsonic_servers(out);
+        return false;
+    }
 
     char line[600];
     while (fgets(line, sizeof(line), f)) {
@@ -183,6 +250,22 @@ bool settings_load(player_settings_t * out) {
             snprintf(out->subsonic_password, sizeof(out->subsonic_password), "%s", value);
         } else if (strcmp(key, "subsonic_verify_tls") == 0) {
             out->subsonic_verify_tls = (strcmp(value, "1") == 0);
+        } else if (strncmp(key, "subsonic_saved_", 15) == 0) {
+            int idx = -1;
+            char field[32];
+            if (sscanf(key, "subsonic_saved_%d_%31s", &idx, field) == 2 && idx >= 0 &&
+                idx < SETTINGS_SUBSONIC_SAVED_MAX) {
+                if (idx + 1 > out->subsonic_saved_count) out->subsonic_saved_count = idx + 1;
+                if (strcmp(field, "url") == 0) {
+                    snprintf(out->subsonic_saved[idx].url, sizeof(out->subsonic_saved[idx].url), "%s", value);
+                } else if (strcmp(field, "username") == 0) {
+                    snprintf(out->subsonic_saved[idx].username, sizeof(out->subsonic_saved[idx].username), "%s", value);
+                } else if (strcmp(field, "password") == 0) {
+                    snprintf(out->subsonic_saved[idx].password, sizeof(out->subsonic_saved[idx].password), "%s", value);
+                } else if (strcmp(field, "verify_tls") == 0) {
+                    out->subsonic_saved[idx].verify_tls = (strcmp(value, "1") == 0);
+                }
+            }
         } else if (strcmp(key, "bt_volume_sync") == 0) {
             out->bt_volume_sync_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "bt_dac_mode") == 0) {
@@ -283,6 +366,8 @@ bool settings_load(player_settings_t * out) {
     out->idle_shutdown_minutes = nearest_idle_shutdown_step(out->idle_shutdown_minutes);
     out->sleep_timer_minutes = nearest_sleep_timer_step(out->sleep_timer_minutes);
 
+    import_legacy_subsonic_servers(out);
+
     fclose(f);
     return true;
 }
@@ -335,6 +420,12 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "subsonic_username=%s\n", settings->subsonic_username);
     fprintf(f, "subsonic_password=%s\n", settings->subsonic_password);
     fprintf(f, "subsonic_verify_tls=%d\n", settings->subsonic_verify_tls ? 1 : 0);
+    for (int i = 0; i < settings->subsonic_saved_count && i < SETTINGS_SUBSONIC_SAVED_MAX; i++) {
+        fprintf(f, "subsonic_saved_%d_url=%s\n", i, settings->subsonic_saved[i].url);
+        fprintf(f, "subsonic_saved_%d_username=%s\n", i, settings->subsonic_saved[i].username);
+        fprintf(f, "subsonic_saved_%d_password=%s\n", i, settings->subsonic_saved[i].password);
+        fprintf(f, "subsonic_saved_%d_verify_tls=%d\n", i, settings->subsonic_saved[i].verify_tls ? 1 : 0);
+    }
     fprintf(f, "bt_volume_sync=%d\n", settings->bt_volume_sync_enabled ? 1 : 0);
     fprintf(f, "bt_dac_mode=%d\n", settings->bt_dac_mode_enabled ? 1 : 0);
     fprintf(f, "bt_codec=%s\n", settings->bt_codec);

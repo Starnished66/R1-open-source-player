@@ -23,6 +23,7 @@ extern const int IDLE_SHUTDOWN_STEPS[];
  * is currently counting down is live, session-only state, not saved here. */
 extern const int SLEEP_TIMER_STEPS[];
 #define SLEEP_TIMER_STEP_COUNT 5
+#define SETTINGS_SUBSONIC_SAVED_MAX 16
 
 typedef struct {
     float volume;              /* 0.0 - 1.0 */
@@ -90,6 +91,18 @@ typedef struct {
     char subsonic_username[128];
     char subsonic_password[128];
     bool subsonic_verify_tls;    /* false = accept self-signed certs for this server (opt-in, see http_client.h) */
+
+    /* Saved Subsonic server profiles (the "Saved Servers" list). Tagcache
+     * cannot store these; they live here with the rest of credentials so
+     * they survive an unmounted SD card. url is the unique key -- saving
+     * the same URL again replaces credentials rather than duplicating. */
+    struct {
+        char url[256];
+        char username[128];
+        char password[128];
+        bool verify_tls;
+    } subsonic_saved[SETTINGS_SUBSONIC_SAVED_MAX];
+    int subsonic_saved_count;
 
     /* Bluetooth output settings -- see bluetooth_control.h for what each
      * actually does at the bluealsa/alsa.conf level. Defaults match the
@@ -346,6 +359,11 @@ bool settings_load(player_settings_t * out);
  * temporary file and renames it into place, so a crash or power loss
  * mid-write can't corrupt the settings file. */
 void settings_save(const player_settings_t * settings);
+
+/* Upserts a Saved Servers profile by URL. Does not write disk -- call
+ * settings_save() after, same as every other settings mutation. */
+void settings_subsonic_server_upsert(player_settings_t * settings, const char * url, const char * username,
+                                      const char * password, bool verify_tls);
 
 /* Settings > System > Factory Reset: wipes every direct child of /usr/data
  * EXCEPT "mnt" (real bug report: an earlier version of this only deleted

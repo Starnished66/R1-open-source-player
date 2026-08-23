@@ -356,11 +356,11 @@ static void build_library_json(const char * query, const char * artist_filter, c
     if (limit <= 0 || limit > LIBRARY_JSON_MAX_LIMIT) limit = LIBRARY_JSON_MAX_LIMIT;
     if (offset < 0) offset = 0;
 
-    /* Both queries go straight to SQLite (metadata_db_count_songs_filtered()/
+    /* Both queries go straight to tagcache (metadata_db_count_songs_filtered()/
      * get_songs_filtered_page(), each METADATA_DB_GUARD-protected on their
      * own) -- no status_mutex needed here at all, since nothing in this
      * function touches status_mutex-guarded state anymore. "index" in the
-     * response is the song's stable rowid-based id (metadata_db.c's own
+     * response is the song's stable tagcache id (metadata_db.c's own
      * song_row_t.id), not a position in any array -- every other endpoint
      * that accepts an "index" back (playback/play, playback/queue,
      * playlists) resolves it the same way, via metadata_db_get_song_by_id(). */
@@ -495,7 +495,7 @@ static bool playlist_name_is_safe(const char * name) {
 static void build_playlists_json(char * out, size_t out_size) {
     char ** paths = NULL;
     int count = 0;
-    playlist_files_scan(MUSIC_ROOT_DIR, &paths, &count);
+    playlist_files_scan(PLAYLISTS_DIR, &paths, &count);
 
     /* Audit finding: the loop guard's 300-byte margin doesn't actually
      * cover this entry's own worst case (10 bytes of literal JSON +

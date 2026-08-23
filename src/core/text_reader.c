@@ -1,4 +1,5 @@
 #include "text_reader.h"
+#include "path_cache.h"
 
 #include <dirent.h>
 #include <limits.h>
@@ -98,4 +99,25 @@ char * text_reader_load(const char * path, bool * out_truncated) {
 
     if (out_truncated) *out_truncated = truncated;
     return buf;
+}
+
+void text_reader_index_replace(char * const * paths, int count) {
+    path_cache_replace(PATH_CACHE_BOOKS, paths, count);
+}
+
+void text_reader_index_load(char *** out_paths, int * out_count) {
+    path_cache_load(PATH_CACHE_BOOKS, out_paths, out_count);
+}
+
+bool text_reader_favorite_is_set(const char * path) {
+    return path_cache_has(PATH_CACHE_BOOK_FAVORITES, path);
+}
+
+void text_reader_favorite_set(const char * path, bool is_favorite) {
+    if (is_favorite) path_cache_insert(PATH_CACHE_BOOK_FAVORITES, path);
+    else path_cache_delete(PATH_CACHE_BOOK_FAVORITES, path);
+}
+
+void text_reader_load_favorites(char *** out_paths, int * out_count) {
+    path_cache_load_matching(PATH_CACHE_BOOK_FAVORITES, PATH_CACHE_BOOKS, out_paths, out_count);
 }

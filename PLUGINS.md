@@ -89,20 +89,60 @@ code, so `luaL_openlibs()`'s full standard library is trimmed right after
 each `lua_State` is created (`sandbox_plugin_lua_state()`):
 
 - **Removed entirely**: `load`, `loadstring`, `loadfile`, `dofile`,
-  `require`, `package`, `debug`, `collectgarbage`. Every documented plugin
-  here is a single self-contained file (see above) with no multi-file/
-  `require()` pattern, so this doesn't take away anything a real plugin
-  needs.
-- **Removed from `os`**: `execute`, `remove`, `rename`, `tmpname`,
-  `getenv`, `exit`. `os.time`/`os.date`/`os.clock`/`os.difftime` are still
-  available.
-- **Removed entirely**: the whole `io` table. File access goes through
-  `plugin.list_dir()`/`plugin.sd_root()` instead, scoped to the SD card
-  root rather than the whole filesystem.
+  `require`, `package`, `debug`. Every one of the 7 bundled plugins is a
+  single self-contained file with no multi-file/`require()` pattern
+  (confirmed by actually checking, not assumed), so this doesn't take
+  away anything a currently-shipped plugin needs -- but see the API
+  version 2 changelog above: a *third-party* plugin that does split its
+  own code across files via `require()`/`dofile()` will break.
+- **Removed from `os`**: `execute`, `getenv`, `exit`, `tmpname`.
+  `os.time`/`os.date`/`os.clock`/`os.difftime`/`os.remove`/`os.rename`
+  are still available (see below for the last two).
+- **Removed from `io`**: only `io.popen` (a shell-exec primitive, not
+  file I/O). The rest of `io`, including `io.open`, stays -- all 7
+  bundled plugins genuinely use `io.open()` to persist their own small
+  state file under `plugin.sd_root() .. "/.plugins/..."`, and 3 of them
+  use `os.remove()`/`os.rename()` for an atomic write-then-rename, the
+  same pattern this app's own C code uses elsewhere. An earlier version
+  of this sandbox removed all of `io` and `os.remove`/`os.rename`
+  entirely; real-device testing against the actual installed plugins
+  showed that broke real, legitimate use and was reverted.
+
+**This means plain file I/O is not otherwise restricted** -- `io.open()`
+can open any path the OS-level user can, same risk class as this app's
+own file I/O, not a privilege escalation, with one deliberate exception:
+`io.open()`, `io.lines()`, `io.input()`, `io.output()`, `os.remove()`,
+and `os.rename()` all refuse any path that resolves into the internal
+`plugin.storage`/`plugin.secrets` tree (`/usr/data/plugins/`) -- see that
+section below for why this specific guard exists. `io.input()`/
+`io.output()` only trigger the check when actually given a filename
+(selecting/opening a path); calling either with no argument, or with an
+already-open file handle, passes through unchanged since neither is a
+path to check. Outside that one reserved tree, a plugin can still read,
+write, or delete anything the SD card or `list_dir()`/`sd_root()` already
+exposed to it; that has not changed.
+
+**The same guard also applies to every native `plugin.*` function that
+takes a caller-supplied filesystem path**, not just Lua's own `io`/`os`
+entry points above -- these reach the filesystem directly in C and would
+otherwise bypass the `io`/`os` wrappers entirely: `plugin.list_dir()`,
+`plugin.mkdir()`, `plugin.play_file()`/`plugin.play_list()`,
+`plugin.set_icon()`'s source path (its second argument -- the first,
+`relative_path`, isn't an arbitrary filesystem path to begin with, see
+that function's own doc below), `plugin.eq_load_profile()`/
+`plugin.eq_save_profile()`, and `plugin.download_file_async()`'s
+destination. All of these now raise a clean error naming the reserved
+path rather than silently touching it. `plugin.download_file_async()`
+checks twice -- once before its background worker even starts, and again
+inside that worker immediately before it touches the filesystem -- so the
+guard can't be skipped by a future code path that reaches the worker some
+other way.
 
 Everything a plugin legitimately needs -- file browsing, HTTP, playback
 control, library queries, theme overrides -- has a purpose-built `plugin.*`
-function below; none of it depends on the stdlib pieces above.
+function below; only `io`/`os.remove`/`os.rename` fall outside that (kept
+for existing plugins' own state-file needs, not because nothing else
+covers it).
 
 Every plugin call (a UI callback, a timer tick, an event handler, and the
 file's own top-level code on load) also runs under a wall-clock time
@@ -156,11 +196,13 @@ from the moment your script starts running (injected before
 
 | Area | Main APIs |
 |---|---|
-| Identity | `define`, `api_version`, `has_capability`, `get_app_info` |
+| Identity | `define`, `api_version`, `has_capability`, `get_app_info`, `media_capabilities` |
 | UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
-| Theme | `set_icon`, `set_background_color`, `set_text_color` , `set_home_layout` |
+| Theme | `set_icon`, `set_background_color`, `set_text_color` |
 | Files | `sd_root`, `list_dir`, `mkdir` |
-| Playback | `play_file`, `play_list`, transport controls, playback state |
+| Storage | `storage.get`/`set`/`delete`/`list`, `secrets.set`/`exists`/`delete` |
+| Data | `json_decode`, `json_encode` |
+| Playback | `play_file`, `play_list`, `play_remote`, `queue_remote_list`, transport controls, playback state |
 | Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
 | Audio | `eq_load_profile`, `eq_save_profile`, `eq_set_*`, `eq_reset` |
 | Network | `http_request`, `download_file_async`, `cancel`, legacy `http_get`/`http_post` |
@@ -178,23 +220,68 @@ plugin.define({
     id = "org.example.my_plugin",
     name = "My Plugin",
     version = "1.0.0",
-    api_min = 1,
+    api_min = 2,
 })
 ```
 
 `id` is a stable identifier using letters, digits, `.`, `_`, and `-`; it must
-be unique among loaded plugins. `api_min` rejects the plugin at load time when
-the player API is too old. Existing plugins without `define()` remain supported
-as legacy plugins using an identity derived from their filename.
+be unique among loaded plugins -- checked against every other already-loaded
+plugin's id regardless of whether that id came from an explicit `define()`
+or a legacy plugin's filename-derived fallback, so an explicit
+`id = "legacy.foo"` and a plain `foo.lua` loaded in either order can never
+silently collide and share one storage/secrets namespace. A legacy id that
+would collide is disambiguated with a short, deterministic hash of the
+plugin's own file path (stable across reloads) rather than by load order.
+`api_min` rejects the plugin at load time when the player API is too old.
+Existing plugins without `define()` remain supported as legacy plugins
+using an identity derived from their filename.
 
 - `plugin.api_version()` returns the current integer plugin API version.
 - `plugin.has_capability(name)` reports whether an optional interface exists.
   API 1 includes `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`,
   `ui.theme`, `filesystem.sd`, `playback.control`, `playback.state`,
   `playback.events`, `library.artist_albums`, `network.http.sync`, `network.http.async`,
-  `network.http.download`, `filesystem.mkdir`, `crypto.md5`, and `audio.peq`.
+  `crypto.md5`, and `audio.peq`. API 2 adds `network.http.download`,
+  `filesystem.mkdir`, `data.json`, `storage.namespaced`, and `storage.secrets`.
+  API 3 adds `playback.remote`.
 - `plugin.get_app_info()` returns `version`, `build`, `platform`, and
   `plugin_api` fields.
+
+#### API version 2 changelog
+
+New in API 2: `plugin.storage.*`, `plugin.secrets.*`, `plugin.json_decode()`/
+`plugin.json_encode()`, `plugin.media_capabilities()`,
+`plugin.download_file_async()`, `plugin.mkdir()`, and an extended
+`plugin.http_request()` (arbitrary request headers, `PUT`/`PATCH`/`DELETE`/
+`HEAD` methods, connect/read/total timeouts, bounded redirect-following,
+response headers via a new 4th callback argument, and a `plugin.cancel()`
+that now actually forces the connection closed rather than only
+suppressing the callback) -- all backward compatible, see that function's
+own doc section for the exact compatibility guarantees.
+
+**One breaking change bundled into this same window, not gated by
+`api_min`:** an earlier security-audit pass removed `require`, `dofile`,
+`loadfile`, `load`/`loadstring`, `package`, `debug`, `os.execute`,
+`os.getenv`, `os.exit`, `os.tmpname`, and `io.popen` from every plugin's
+Lua environment. Real-device testing confirmed none of the 7 bundled
+plugins used any of them, and plain file I/O (`io.open`) plus
+`os.remove`/`os.rename` were deliberately kept since several bundled
+plugins genuinely depend on those for their own state files. A
+third-party plugin that split its own code across multiple files via
+`require()`/`dofile()`, or shelled out via `os.execute()`/`io.popen()`,
+will fail after upgrading to a player build with this change -- there is
+currently no restricted module-loader replacement. If this affects your
+plugin, inline your code into a single file for now.
+
+#### API version 3 changelog
+
+New in API 3: `plugin.play_remote()`/`plugin.queue_remote_list()` (see
+their own doc section above) and the `"track_started"` event's two new
+trailing `provider`/`track_id` arguments -- both purely additive, no
+breaking changes bundled into this window. A plugin that only needs
+`play_remote()`/`queue_remote_list()` specifically, without requiring the
+whole API 3 batch, can feature-detect just this with
+`plugin.has_capability("playback.remote")` instead of bumping `api_min`.
 
 <a id="plugin-ui"></a>
 
@@ -277,117 +364,7 @@ different aspect ratio than the original will render at a size/position
 tuned for the original, not the replacement. Keep replacement icons
 roughly the same aspect ratio as what they're replacing.
 
-### `plugin.set_home_layout(tile_keys [, options])`
-
-Reorders and/or hides Home's 6 native tiles, optionally as a plain
-vertical list instead of the icon grid, with optional per-tile background
-color/text color/corner radius overrides.
-
-`tile_keys` is an array of any subset of `"music"`, `"stream_media"`,
-`"wireless"`, `"books"`, `"system"`, `"dac"`, in the order they should
-appear on screen -- any key left out is hidden. Home's icon grid itself is
-a fixed, non-scrollable 2x3 layout (matching the real stock launcher,
-confirmed on real hardware -- there's no way to add a 7th tile of your own
-here; see `register_stream_media_tile()` above for where a plugin *can*
-get its own tile), so this only reorders/hides/restyles the existing 6, it
-doesn't add new ones.
-
-Each entry in `tile_keys` is either a plain string, or a table `{ key =
-"...", bg_color = 0xRRGGBB, text_color = 0xRRGGBB, radius = n, ... }` to
-also style that one tile -- the same "string, or a table for the rows
-that need more" shape `register_list_item()`'s/`show_list()`'s own
-`items` arrays already use. `bg_color`/`text_color`/`radius` work in
-either mode; `radius` (corner radius, in px) is clamped to `0..64`. Any
-property left out of a table entry (or every entry left a plain string)
-keeps that tile's default appearance.
-
-`options.mode` is `"tile"` (default, the icon grid) or `"list"` (a plain
-vertical list, each tile becoming a row with its icon and a chevron).
-
-```lua
--- Icon grid: only System, DAC, and Music, in that order, System restyled
-plugin.set_home_layout({
-    "music",
-    { key = "system", bg_color = 0x2a1a4e, text_color = 0xffcc00, radius = 24 },
-    "dac",
-})
-
--- Same 3 tiles, as a plain list instead
-plugin.set_home_layout({ "music", "system", "dac" }, { mode = "list" })
-```
-
-#### List-mode-only extensions
-
-The icon grid is a fixed 2x3 layout with a centered icon+label per tile --
-none of the properties below have a meaning there, so they're silently
-ignored outside `{ mode = "list" }`. In list mode, each per-tile table also
-accepts:
-
-- `height`/`width` (px) -- resizes that row. Clamped to the same range
-  `register_list_item()`'s own `height`/`width` options use.
-- `align` -- `"left"` (default), `"center"`, or `"right"`. Only the
-  label's own text position changes; the icon (if any) always stays put
-  at the row's left edge.
-- `accessory` -- `false` hides the row's trailing `">"` chevron (default
-  `true`, today's look).
-- `text_size` -- `"small"`, `"medium"`, `"large"`, or `"mono"` (an 8x16
-  monospace/pixel bitmap font). `"mono"` is ASCII-only -- a label with
-  accented or non-Latin characters will show blank glyphs for those
-  characters, unlike this app's own regenerated fallback-capable fonts.
-- `icon` -- `false` drops the tile's launcher icon (default `true`, today's
-  look). This isn't just cosmetic: a shown icon always reserves space for
-  itself before the label (so `align = "left"` still starts after it) --
-  set `icon = false` to get a label genuinely flush against the row's own
-  left edge, or when `height` is small enough that the icon would clip.
-
-`options.row_gap` (list mode only) sets the vertical spacing between rows,
-in px, clamped to `0..24` (default `6`, today's look).
-
-`options.tile_gap` (tile mode only) sets the visible space between adjacent
-tiles in the icon grid, in px, clamped to `0..40` (default `0`, today's
-flush-cell look with its thin divider lines between tiles -- a nonzero
-`tile_gap` insets each tile within its own grid cell instead, and drops
-those divider lines since a real gap already separates the tiles).
-
-```lua
--- A tight, chevron-free, monospace list flush to the left edge --
--- e.g. a retro boot-menu look
-plugin.set_home_layout({
-    { key = "music", bg_color = 0x141824, text_color = 0xe8d16b,
-      radius = 0, height = 64, align = "left", accessory = false, text_size = "mono", icon = false },
-    { key = "system", bg_color = 0x141824, text_color = 0xe0a1c4,
-      radius = 0, height = 64, align = "left", accessory = false, text_size = "mono", icon = false },
-}, { mode = "list", row_gap = 6 })
-```
-
-**Call this from your plugin's top-level script code only**, same
-load-time-only constraint as `set_icon()` above -- Home is built once,
-right after every plugin finishes loading, so a call from inside a
-callback is a silent no-op until the next restart. If more than one
-plugin calls this, whichever call happens last wins (same as
-`set_background_color()`/`set_text_color()`'s own single global slots) --
-one call always fully specifies both the layout and every style override
-together, never layered onto an earlier call.
-
-Raises a Lua error -- Home must never end up with zero tiles -- for an
-empty array, an unknown or duplicate tile key, an invalid `mode`, an
-invalid `align`, or an invalid `text_size`; whatever layout was already
-in effect (the native default, or an earlier successful call) is left
-untouched. `radius` and `row_gap` are purely cosmetic and are clamped
-into range instead of erroring.
-
-`plugins_examples/HomeThemes.lua` is the reference implementation: 11
-ready-made Home looks (Game Boy, Terminal, Monastic, Wavy, Trees, Swamp,
-Mountain Sunset, Zen Terracotta, Retro, Vaporwave, Earthy) spanning both
-modes and every style knob above -- each one a genuinely different
-shape/spacing/alignment recipe, not just a different palette on the same
-skeleton -- picked from a Settings row and persisted the same way
-`Themes.lua`'s own light/dark picker is. Each preset also calls
-`set_background_color()`/`set_text_color()` (all 5 slots below) to match
-the same palette, so the theme carries app-wide -- every screen's
-background, every list row, every card/popup, and both text tiers --
-not just Home. Screenshots of all 11 are in
-`plugins_examples/screenshots/home_themes/`.
+Raises a Lua error if `source_file_path` can't be read or copied.
 
 ### `plugin.set_background_color(slot, rgb)`
 
@@ -657,6 +634,59 @@ track, by design rather than by omission:
   live stream's track title, only whatever label your own plugin already
   passed to `show_list()`/`register_stream_media_tile()`.
 
+### `plugin.play_remote(track)` / `plugin.queue_remote_list(tracks [, start_index])`
+
+The native side of a provider-neutral remote music plugin (Qobuz/Tidal/etc):
+starts playback of one track (`play_remote`) or a fresh playlist of up to
+500 (`queue_remote_list`, same 1-based `start_index` convention as
+`play_list`). Each `track` is a table:
+
+```lua
+plugin.play_remote({
+    provider = "qobuz",           -- required, bounded
+    track_id = "12345",           -- required, bounded -- stable per track
+    stream_url = "https://...",   -- required -- the real, fetchable URL
+    verify_tls = true,            -- optional, default true
+    title = "Song Name", artist = "...", album = "...",  -- optional
+    duration_ms = 214000,         -- optional
+    artwork_url = "https://...",  -- optional
+    codec = "flac",               -- "mp3"/"flac"/"aac", default "mp3"
+    sample_rate = 44100, bit_depth = 16, channels = 2, bitrate_kbps = 0, -- optional, display only
+    replaygain_db = -3.5,         -- optional
+})
+```
+
+`provider` + `track_id` become a stable synthetic key,
+`remote://<provider>/<track_id>` -- this, never `stream_url`, is what
+Favorites/Most Played/History key against, so the underlying favorite
+toggle and play count *accumulate* correctly across repeated plays even
+though `stream_url` itself may be a single-use or time-limited signed URL
+refreshed on every call.
+
+**This does not yet mean a remote track shows up in the Favorites/Most
+Played screens.** Those screens only ever list rows also present in the
+on-device local library scan (they inner-join against it, so a favorited
+song that's since vanished from your library silently drops off the list
+rather than showing a dead entry) -- a `remote://` key is never a row
+there, so it's filtered out the same way a stale local favorite would be.
+The heart can be toggled and the play count keeps counting up invisibly in
+the database, ready to be surfaced once a persistent remote-track catalog
+(and a way to refresh a track's `stream_url` outside of an active queue)
+exists; neither does yet, so don't build a plugin around a remote track's
+Favorites/Most Played entry being visible or reachable anywhere in the app
+today.
+
+For the same expiring-URL reason, **resume-on-launch skips remote tracks
+entirely** -- there's no stable URL to resume into on a cold launch, so
+`last_track` is simply never set to one.
+
+Playback itself goes through the exact same MP3/FLAC callback-streaming
+path `play_file()`'s `http(s)://` streaming already uses (see "Live Stream
+URLs" above) -- **no seeking, no reconnect-on-drop, no auth/expiring-URL
+refresh yet**. `codec` is used directly instead of the extension/Content-
+Type sniffing a plain stream URL needs, since the plugin already knows it
+from its own catalog API.
+
 ### `plugin.show_toast(message)`
 
 Shows the same transient toast used elsewhere in the app (e.g. "Added to
@@ -785,37 +815,104 @@ transform it, so build the string yourself first.
 
 Preferred non-blocking HTTP interface. It returns a request handle immediately;
 DNS, connection, TLS, upload, and response reads happen on a native worker.
-`callback(status, body, error)` is later invoked on the main Lua/UI thread.
-On success, `status` and the binary-safe `body` are set and `error` is `nil`.
-On failure, `status` and `body` are `nil` and `error` describes the failure.
+`callback(status, body, error, headers)` is later invoked on the main Lua/UI
+thread. On success, `status` and the binary-safe `body` are set, `error` is
+`nil`, and `headers` is a `{Name = "value", ...}` table of the response's
+headers. On failure, `status` and `body` are `nil` and `error` is a short,
+stable string (see the error codes below).
 
 ```lua
 local handle, err = plugin.http_request({
     url = "https://example.com/api",
-    method = "POST", -- GET or POST; GET is the default
+    method = "POST", -- GET, POST, PUT, PATCH, DELETE, or HEAD; GET is the default
+    headers = { Authorization = "Bearer " .. token, ["X-Custom"] = "value" },
     body = '{"hello":"world"}',
     content_type = "application/json",
     verify_tls = true,
     max_response_bytes = 262144,
-}, function(status, body, request_error)
+    connect_timeout_ms = 10000,
+    read_timeout_ms = 15000,
+    total_timeout_ms = 30000,
+    redirect_limit = 5,
+}, function(status, body, request_error, headers)
     if request_error then
         plugin.show_toast(request_error)
         return
     end
-    plugin.show_toast("HTTP " .. status .. ", " .. #body .. " bytes")
+    plugin.show_toast("HTTP " .. status .. ", " .. #body .. " bytes, content-type=" ..
+                       (headers["Content-Type"] or "?"))
 end)
 ```
 
-`max_response_bytes` defaults to 512 KiB and may be 1 byte through 2 MiB.
-Request bodies are capped at 1 MiB. At most four asynchronous requests may be
-active across all plugins. The returned handle includes a generation number,
-so a stale handle cannot affect a newer request that reused the pool slot.
+**Compatibility:** every field above except `url` is optional, and a callback
+declared with the original 3 parameters (`status, body, error`) keeps working
+completely unchanged -- Lua silently drops extra arguments a function doesn't
+declare, so the new 4th `headers` argument is invisible to existing plugins.
+`method` still defaults to `GET`; `headers`/`connect_timeout_ms`/
+`read_timeout_ms`/`total_timeout_ms`/`redirect_limit` all default to their
+exact previous (nonexistent) behavior when omitted -- no timeout, no
+redirects followed (a 3xx response is returned as an ordinary result with
+that status code, matching curl's own `--max-redirs 0` convention, not
+treated as an error), no extra headers. `body`/`content_type` are only ever
+sent for `POST`/`PUT`/`PATCH` -- exactly as before, when only `GET`/`POST`
+existed and a `body` set on a `GET` request was silently ignored; that
+silent-ignore behavior for non-body methods is preserved deliberately, not
+newly introduced.
 
-`plugin.cancel(handle)` returns whether it matched an active request. It
-suppresses that request's callback and releases its resources when the native
-operation returns. Cancellation is currently logical rather than a forced
-socket close, so the occupied worker slot is not reusable until the underlying
-connection finishes or times out.
+`max_response_bytes` defaults to 512 KiB and may be 1 byte through 2 MiB.
+Request bodies are capped at 1 MiB. Request headers are capped at 16 entries.
+At most four asynchronous requests may be active across all plugins. The
+returned handle includes a generation number, so a stale handle cannot
+affect a newer request that reused the pool slot.
+
+A repeated response header name keeps only the LAST occurrence in the
+`headers` table passed to your callback -- true case-insensitive
+last-occurrence-wins (matching HTTP's own case-insensitive header-name
+rule), not just a Lua-table-key coincidence: `Content-Type: a` followed by
+`content-type: b` on the same response collapses to one `Content-Type`
+(or `content-type`, whichever spelling came last) key holding `"b"`.
+
+`connect_timeout_ms`/`read_timeout_ms`/`total_timeout_ms` may not exceed
+5 minutes; `redirect_limit` may not exceed 10. A value outside that range
+is a Lua error immediately, not silently clamped -- fix the value rather
+than relying on it being adjusted for you.
+
+**Redirects follow standard method/credential semantics**, not a blind
+resend of the original request: a `303` always becomes a `GET` with no
+body, regardless of the original method; `301`/`302` conventionally
+rewrite `POST` to `GET` with no body (matching curl's own default and
+every major browser); `307`/`308`, and any non-`POST` method on
+`301`/`302`, preserve the original method and body exactly. Separately,
+**`Authorization`/`Cookie`/`Cookie2`/`Proxy-Authorization` are stripped
+from any redirect hop that changes origin** (scheme, host, or port) --
+your bearer token never follows a redirect to a different host. An
+`https://` request redirected to plain `http://` is refused outright
+(`insecure_redirect`) while `verify_tls` is `true`, rather than silently
+sending anything over the downgraded connection.
+
+**Error codes** (the `error` string on failure): `invalid_url`,
+`invalid_request` (a header name/value or the URL itself contained a
+raw CR or LF byte -- rejected outright, not sanitized, since that's the
+actual header-injection vector), `dns_failure`, `connect_failed`,
+`connect_timeout`, `tls_failure`, `timeout` (a `total_timeout_ms`
+deadline was hit -- this now genuinely bounds connect/TLS/upload/
+response-header reads too, each stage using whatever's left of the
+budget, not only the time between response body chunks), `cancelled`,
+`too_many_redirects`, `response_too_large`, `malformed_response`,
+`io_error`, `insecure_redirect`. These are stable strings safe to match
+on in your own code, not just display.
+
+`plugin.cancel(handle)` returns whether it matched an active request. Unlike
+before, this now forces the underlying connection closed immediately (the
+same technique the internet-radio player already used internally) -- it can
+interrupt a request stuck in connect/TLS handshake, not only between
+response chunks. One honest limitation: DNS resolution itself cannot be
+interrupted this way (it's a single blocking system call with no portable
+way to cancel it from another thread) -- a cancel requested while still
+resolving the hostname is only noticed once resolution finishes, same as
+before. The occupied worker slot becomes reusable as soon as the native
+operation notices and unwinds, not only once the connection
+finishes or times out on its own.
 
 ### `plugin.download_file_async(url, dest_path [, verify_tls], callback)`
 
@@ -856,6 +953,156 @@ Returns the MD5 hash of `text` as a lowercase hex string. Bridges
 own Subsonic integration for its token auth) -- no new dependency. Useful
 for any API that needs a request signed this way, e.g. Last.fm's own
 `api_sig` scheme (see `plugins_examples/LastFmScrobbler.lua`).
+
+### `plugin.json_decode(text [, limits])` / `plugin.json_encode(value [, limits])`
+
+Bounded JSON support (wraps the vendored cJSON, already used internally for
+Subsonic responses). Both run synchronously on the calling thread --
+decode/encode a body you already fetched via `http_request()`, don't hold a
+large body across a `set_interval()` tick waiting to parse it.
+
+`json_decode(text, limits)` returns `value, nil` on success or `nil, error`
+on failure. `limits` is optional; every field has a default and a hard
+ceiling a plugin cannot raise past:
+
+| Field | Default | Hard ceiling |
+|---|---|---|
+| `max_input_bytes` | 512 KiB | 512 KiB |
+| `max_nesting` | 32 | 64 |
+| `max_entries` | 10000 | 10000 |
+
+The hard ceiling is the real safety limit on this ~56 MiB device -- a
+decode simultaneously holds the source string, the cJSON tree, and the
+converted Lua tables/strings, so the ceiling is set to what the *default*
+used to be, not a higher number a plugin could opt into via `limits`.
+Passing a larger value in `limits` is silently clamped down to the
+ceiling, not an error.
+
+`json_encode(value, limits)` returns `text, nil` or `nil, error`. Its
+`limits` table uses `max_output_bytes` (same default/ceiling numbers as
+`max_input_bytes` above) instead of `max_input_bytes`, plus the same
+`max_nesting`/`max_entries`.
+
+Known limitations, not bugs -- both follow ordinary JSON-in-a-dynamic-
+language conventions, not something specific to this player:
+- JSON `null` decodes as Lua `nil`, indistinguishable from a missing table
+  key or array hole. Don't rely on `null`'s mere presence in a response.
+- Numbers decode as Lua numbers (IEEE-754 double) -- exact only up to
+  2^53. A provider that needs an exact large ID should emit it as a JSON
+  *string*; treat provider track/album/artist IDs as strings in your own
+  plugin code rather than relying on round-tripping a huge JSON integer.
+- A Lua table with `#t > 0` encodes as a JSON array (indices `1..#t`); any
+  other table, including an empty one, encodes as a JSON object. Object
+  keys must be Lua strings -- a non-string key is a clean encode error,
+  not a crash.
+- Invalid UTF-8 in either direction is a clean decode/encode error rather
+  than being silently passed through or replaced.
+
+```lua
+local resp_text = ... -- from an http_request() callback's result body
+local data, err = plugin.json_decode(resp_text)
+if not data then
+    plugin.show_toast("Bad response: " .. err)
+    return
+end
+
+local body, err2 = plugin.json_encode({ query = "abba", limit = 50 })
+```
+
+### `plugin.storage` / `plugin.secrets`
+
+Namespaced key/value storage, private to your plugin's own `id` (from
+`plugin.define`) and stored under this device's internal persistent
+partition -- **never the removable SD card**, so it survives an SD swap
+and isn't readable by just pulling the card.
+
+```lua
+plugin.storage.set("last_sync", tostring(os.time()))
+local last = plugin.storage.get("last_sync", "never")
+
+local keys = plugin.storage.list("cache_") -- array of matching key names
+plugin.storage.delete("last_sync")
+```
+
+- `plugin.storage.get(key [, default])` -- returns the stored value, or
+  `default` (or `nil` if omitted) when the key doesn't exist.
+- `plugin.storage.set(key, value)` -- `value` is any Lua string, including
+  binary bytes (up to 256 KiB per value); returns `true`, or `false` if it
+  failed (invalid input, or a quota below would be exceeded). A `set()`
+  that would store the exact same bytes already on disk is a fast no-op --
+  it doesn't touch flash again.
+- `plugin.storage.delete(key)` -- returns whether a key was removed *and*
+  that removal's durability across an immediate power loss was confirmed.
+  Same nuance as `set()` below: `false` can mean the key really is gone
+  but that durability confirmation failed, not that it's still there.
+- `plugin.storage.list(prefix)` -- returns an array of key name strings
+  starting with `prefix` (or all keys, if `prefix` is omitted/`""`).
+
+**Quotas**: each plugin's combined `storage` + `secrets` usage is capped
+at 2 MiB and 500 keys, and every plugin's byte usage combined is capped
+at 8 MiB total -- this keeps one plugin from filling the same
+`/usr/data` partition the app's own settings and music database need to
+write to. Usage is tracked with an in-memory cache seeded from a real
+directory scan the first time a plugin id is touched and updated
+incrementally on every write/delete afterward (periodically re-validated
+against a fresh scan), not recomputed by scanning every file on every
+single call -- `set()` stays fast even with many existing keys. `set()`
+returns `false` if a quota would be exceeded; there's no separate error
+code for "quota" vs. other failures yet, so check the return value, not
+just assume success. `false` can also mean the value was written and
+already exists on disk, just that the write's durability across an
+immediate power loss couldn't be confirmed -- not that nothing happened.
+Don't retry a "failed" `set()` in a tight loop assuming it's a no-op.
+
+`plugin.secrets` has the identical `set`/`exists`/`delete` shape for
+credentials (tokens, refresh tokens) but **deliberately no `list()`** --
+your plugin has to remember its own secret key names, so nothing can
+enumerate what secrets exist just by holding a reference to the plugin's
+id.
+
+```lua
+plugin.secrets.set("access_token", token)
+if plugin.secrets.exists("access_token") then ... end
+plugin.secrets.delete("access_token") -- e.g. on log out
+```
+
+**Threat model, stated plainly:** this device has no confirmed hardware
+keystore or secure enclave. "Secrets" storage means restrictive file
+permissions (owner-only, `0600`/`0700`) on the internal partition rather
+than the SD card, **plus** a path guard on `io.open()`/`io.lines()`/
+`io.input()`/`io.output()`/`os.remove()`/`os.rename()` that refuses any
+path resolving into `/usr/data/plugins/` (see "Sandboxing" above) -- that guard, not the file
+permissions, is what actually stops one plugin from reading another's
+secrets: every plugin's Lua code runs in the *same* OS process and user,
+so 0600/0700 alone would do nothing against a plugin that simply
+`io.open()`'d another plugin's predictably-named secrets file directly.
+Neither layer defends against a local attacker with root or physical
+access to this specific running device; there's no device-unique key
+available to this codebase to wrap the data with that such an attacker
+couldn't equally derive. Don't describe this to your own users as
+"encrypted" storage -- it isn't.
+
+### `plugin.media_capabilities()`
+
+Reports what this build's audio pipeline actually supports, as a plain
+table -- useful for a remote-catalog plugin deciding what quality tier to
+request:
+
+```lua
+local caps = plugin.media_capabilities()
+-- caps.codecs               = {"mp3", "aac", "flac"}
+-- caps.containers           = {"mp3", "adts", "flac"}
+-- caps.max_bit_depth        = 16   -- every output path (internal DAC,
+--                                     USB DAC, Bluetooth) is fixed 16-bit
+-- caps.max_channels         = 2
+-- caps.max_sample_rate      = 0    -- not independently verified against
+--                                     real hardware limits yet; treat as
+--                                     informational only, not a real cap
+-- caps.direct_http_streaming = true
+-- caps.range_seeking        = false -- not built yet
+-- caps.hls / caps.dash      = false
+-- caps.encryption_modes = {}, caps.drm_systems = {} -- none supported
+```
 
 ### `plugin.show_text_input(title, initial_text, is_password, on_submit)`
 
@@ -986,13 +1233,18 @@ list entry), an event has no UI real estate to divide up -- **every**
 plugin subscribed to a given event fires, not just the first or the most
 recent. Four recognized events:
 
-- `"track_started"` -- `callback(title, artist, album, duration_seconds)`.
-  Fires whenever a new track begins playing, whatever the cause: a manual
-  tap, next/prev, a gapless or crossfade auto-advance, a plugin's own
-  `play_file()`/`play_list()`, or remote control. There's deliberately no
-  separate "next"/"prev" event -- from a subscriber's point of view it's
-  the same fact ("a new track started, here's its metadata") regardless of
-  what triggered it.
+- `"track_started"` -- `callback(title, artist, album, duration_seconds,
+  provider, track_id)`. Fires whenever a new track begins playing, whatever
+  the cause: a manual tap, next/prev, a gapless or crossfade auto-advance, a
+  plugin's own `play_file()`/`play_list()`/`play_remote()`, or remote
+  control. There's deliberately no separate "next"/"prev" event -- from a
+  subscriber's point of view it's the same fact ("a new track started,
+  here's its metadata") regardless of what triggered it. `provider`/
+  `track_id` are `""` for a local or Subsonic track, and only non-empty for
+  one started via `plugin.play_remote()`/`queue_remote_list()` -- added
+  after `duration_seconds`, so an existing handler declared with only 4
+  parameters keeps working unchanged (Lua silently drops extra arguments a
+  function doesn't declare).
 - `"paused"` / `"resumed"` -- `callback()`, no arguments. Fire on every
   pause/resume transition, however it was triggered (the play/pause button,
   a hardware button, `plugin.toggle_pause()`).

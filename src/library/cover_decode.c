@@ -252,6 +252,57 @@ static uint16_t * resize_cover_fit(const uint8_t * src, int src_w, int src_h, in
     return dst;
 }
 
+static uint32_t le32(const uint8_t * p) {
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+}
+
+static int32_t le32s(const uint8_t * p) {
+    return (int32_t) le32(p);
+}
+
+static uint16_t le16(const uint8_t * p) {
+    return (uint16_t) (p[0] | (p[1] << 8));
+}
+
+/* Uncompressed 24/32-bit BMP to RGB888, for Rockbox albumart cache files. */
+static bool decode_bmp_rgb888(const uint8_t * data, uint32_t size, uint8_t ** out_buf, int * out_w, int * out_h) {
+    if (size < 54 || data[0] != 'B' || data[1] != 'M') return false;
+    uint32_t off = le32(data + 10);
+    uint32_t dib = le32(data + 14);
+    if (dib < 40 || off < 14 + dib || off >= size) return false;
+    int width = le32s(data + 18);
+    int height_raw = le32s(data + 22);
+    bool top_down = height_raw < 0;
+    int height = top_down ? -height_raw : height_raw;
+    uint16_t planes = le16(data + 26);
+    uint16_t bits = le16(data + 28);
+    uint32_t compression = le32(data + 30);
+    if (width <= 0 || height <= 0 || planes != 1 || compression != 0) return false;
+    if (bits != 24 && bits != 32) return false;
+    int bpp = bits / 8;
+    int row_bytes = width * bpp;
+    int stride = (row_bytes + 3) & ~3;
+    size_t need;
+    if (!rgb888_size_ok((size_t) width, (size_t) height, &need)) return false;
+    if ((uint64_t) off + (uint64_t) stride * (uint64_t) height > size) return false;
+    uint8_t * buf = malloc(need);
+    if (!buf) return false;
+    for (int y = 0; y < height; y++) {
+        int src_y = top_down ? y : (height - 1 - y);
+        const uint8_t * src = data + off + (size_t) src_y * (size_t) stride;
+        uint8_t * dst = buf + (size_t) y * (size_t) width * 3;
+        for (int x = 0; x < width; x++) {
+            dst[x * 3 + 0] = src[x * bpp + 2];
+            dst[x * 3 + 1] = src[x * bpp + 1];
+            dst[x * 3 + 2] = src[x * bpp + 0];
+        }
+    }
+    *out_buf = buf;
+    *out_w = width;
+    *out_h = height;
+    return true;
+}
+
 bool cover_decode_to_rgb565(const uint8_t * data, uint32_t size, int target_w, int target_h, uint16_t ** out_pixels) {
     if (!data || size < 8 || target_w <= 0 || target_h <= 0) return false;
 
@@ -263,6 +314,8 @@ bool cover_decode_to_rgb565(const uint8_t * data, uint32_t size, int target_w, i
         ok = decode_jpeg_rgb888(data, size, &native_buf, &native_w, &native_h);
     } else if (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') {
         ok = decode_png_rgb888(data, size, &native_buf, &native_w, &native_h);
+    } else if (data[0] == 'B' && data[1] == 'M') {
+        ok = decode_bmp_rgb888(data, size, &native_buf, &native_w, &native_h);
     } else {
         return false;
     }

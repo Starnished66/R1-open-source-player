@@ -3,6 +3,7 @@
 
 #include "lvgl/lvgl.h"
 #include "metadata_db.h" /* song_row_t/group_row_t, reused as-is by the gui_plugin_library_* declarations below */
+#include "remote_track.h" /* remote_track_meta_t, used by gui_plugin_play_remote_tracks() below */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -65,6 +66,13 @@ int gui_plugin_show_settings_list(const char * title, const int * row_types, con
  * Up Next" semantics as every other play-launch path (on_file_selected()).
  * Copies paths/strings itself; caller retains ownership of its own array. */
 void gui_plugin_play_paths(const char * const * paths, int count, int start_index);
+
+/* Same as gui_plugin_play_paths() above, for a remote-provider queue (see
+ * remote_track.h) -- each track's synthetic "remote://" key becomes the
+ * playlist[] entry, and the full descriptor (real stream URL, codec,
+ * ReplayGain, artwork) is published for gui.c/audio.c to look up by that
+ * key. Copies tracks itself; caller retains ownership of its own array. */
+void gui_plugin_play_remote_tracks(const remote_track_meta_t * tracks, int count, int start_index);
 
 /* Shows the same transient toast used elsewhere in the app (e.g. "Added to
  * queue"). */

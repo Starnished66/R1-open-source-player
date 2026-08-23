@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Decodes compressed embedded-cover-art bytes (JPEG or PNG) and resizes them
+/* Decodes cover-art bytes (JPEG, PNG, or uncompressed 24/32-bit BMP) and resizes them
  * with a "cover fit" (scale to fully fill target_w x target_h, center-
  * cropping whichever dimension overflows -- same as a photo app's cover/
  * thumbnail mode) into a newly malloc()'d RGB565 buffer the caller owns and

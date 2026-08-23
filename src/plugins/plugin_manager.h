@@ -252,6 +252,55 @@ const char * plugin_manager_get_stream_tile_icon(int index);
 const char * plugin_manager_get_stream_tile_icon_selected(int index);
 void plugin_manager_stream_tile_clicked(int index);
 
+/* Backing plugin.set_home_layout() -- gui.c's build_home_screen() reads
+ * these to decide the order/subset of its 6 native tiles to show. 0 from
+ * the count means no plugin called set_home_layout(), i.e. "use the
+ * native default order/set of all 6" -- see build_home_screen()'s own
+ * comment for the full key list ("music"/"stream_media"/"wireless"/
+ * "books"/"system"/"dac"). */
+int plugin_manager_get_home_tile_count(void);
+const char * plugin_manager_get_home_tile_key(int index);
+
+/* true = show Home as a plain vertical list (build_pill_list_screen())
+ * instead of the icon grid (build_icon_grid_screen()) -- set_home_layout()'s
+ * optional `{ mode = "list" }`. Defaults to false (today's icon grid). */
+bool plugin_manager_get_home_tile_list_mode(void);
+
+/* Per-tile style overrides from set_home_layout()'s optional per-tile
+ * config table ({ key = "...", bg_color = 0xRRGGBB, text_color = 0xRRGGBB,
+ * radius = n }, PLUGINS.md) -- each returns false (leaving *out untouched)
+ * if tile `index` has no override for that property, matching every other
+ * "false means nothing to apply" accessor in this file. */
+bool plugin_manager_get_home_tile_bg_color(int index, uint32_t * out_rgb);
+bool plugin_manager_get_home_tile_text_color(int index, uint32_t * out_rgb);
+bool plugin_manager_get_home_tile_radius(int index, int32_t * out_radius);
+
+/* List-mode-only per-tile extensions (set_home_layout()'s per-tile config
+ * table gains `height`, `width`, `align`, `accessory`, `text_size`,
+ * PLUGINS.md) -- meaningless in tile mode, so build_home_screen() only
+ * reads these once plugin_manager_get_home_tile_list_mode() is true. Same
+ * "false/NULL means nothing to apply, caller keeps its own default" shape
+ * as the three accessors above, except plugin_manager_get_home_tile_
+ * accessory() (no natural "unset" value -- defaults true, matching
+ * today's always-shown chevron). */
+bool plugin_manager_get_home_tile_row_height(int index, int32_t * out_height);
+bool plugin_manager_get_home_tile_row_width(int index, int32_t * out_width);
+const char * plugin_manager_get_home_tile_text_align(int index); /* NULL/"left" default */
+bool plugin_manager_get_home_tile_accessory(int index);          /* true = chevron shown */
+const char * plugin_manager_get_home_tile_text_size(int index);  /* NULL = native default */
+bool plugin_manager_get_home_tile_show_icon(int index);          /* true = launcher icon shown
+                                                                    * (and its label indent reserved) */
+
+/* options.row_gap (list mode only) -- vertical px between rows. Defaults to
+ * 6, build_pill_list_screen()'s own pre-existing hardcoded value, so a
+ * plugin that never sets this changes nothing. */
+int32_t plugin_manager_get_home_row_gap(void);
+
+/* options.tile_gap (tile mode only) -- px of visible space between adjacent
+ * tiles. Defaults to 0, build_icon_grid_screen()'s own pre-existing
+ * flush-cell look, so a plugin that never sets this changes nothing. */
+int32_t plugin_manager_get_home_tile_gap(void);
+
 /* Invoked by gui.c's plugin-settings-list row widgets (see
  * gui_plugin_show_settings_list()) when a "row"-type row in pool slot `slot`
  * at position `row` is tapped -- calls that row's own on_select Lua function

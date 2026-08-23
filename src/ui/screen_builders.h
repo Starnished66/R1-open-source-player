@@ -179,9 +179,25 @@ typedef struct {
  * divider lines (redundant, and visually conflicting, once real gaps exist).
  * Only plugin.set_home_layout()'s options.tile_gap (PLUGINS.md, tile mode)
  * ever passes a nonzero value. */
+/* Optional per-screen title override (plugin.set_screen_layout()'s/
+ * set_home_layout()'s options.title_align/title_size/title_underline,
+ * PLUGINS.md) -- NULL means "no override" at either the struct-pointer
+ * level (every native, non-plugin-styleable screen -- Time Zone, About,
+ * Playback, ...) or per-field (a plugin set only some of the three).
+ * align: NULL/"left" (today's exact default), "center", or "right".
+ * size: NULL = today's exact default (ui_size_28); otherwise reuses
+ * pill_row_resolve_text_size()'s own "small"/"medium"/"large"/"mono" scale
+ * so a title can match a plugin's own row font tier. */
+typedef struct {
+    const char * align;
+    const char * size;
+    bool underline;
+} screen_title_style_t;
+
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const icon_grid_item_t * items, int item_count,
-                                   int32_t icon_scale_percent, bool label_inside_icon, int32_t tile_gap);
+                                   int32_t icon_scale_percent, bool label_inside_icon, int32_t tile_gap,
+                                   const screen_title_style_t * title_style);
 
 typedef enum {
     PILL_ACCESSORY_NONE = 0,
@@ -358,7 +374,8 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size);
  * (PLUGINS.md, list mode) ever passes anything else. */
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
-                                   lv_style_t * toggle_accent_style, int32_t row_gap);
+                                   lv_style_t * toggle_accent_style, int32_t row_gap,
+                                   const screen_title_style_t * title_style);
 
 typedef struct {
     const char * label;

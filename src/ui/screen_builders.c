@@ -249,6 +249,32 @@ static lv_obj_t * build_title(lv_obj_t * scr, const char * title) {
     return label;
 }
 
+/* Applies an optional plugin title-style override (screen_title_style_t)
+ * on top of build_title()'s own defaults. `has_back_btn` decides how
+ * "center"/"right" reflow the label's box: a screen with a back button
+ * keeps build_title()'s existing BUILD_TITLE_LEFT_INSET/RIGHT_MARGIN box
+ * (so centered text still clears the arrow, matching every other titled
+ * screen's own asymmetric layout) -- a screen with no back button (only
+ * Home today) instead spans the FULL screen width, since there's no arrow
+ * to avoid and the caller explicitly wants true screen-center, not
+ * "center of the space left after a button that isn't there". style may
+ * be NULL (every native, non-plugin-styleable screen) -- a no-op. */
+static void apply_title_style(lv_obj_t * label, const screen_title_style_t * style, bool has_back_btn) {
+    if (!style) return;
+
+    if (style->size) lv_obj_set_style_text_font(label, pill_row_resolve_text_size(style->size), 0);
+    if (style->underline) lv_obj_set_style_text_decor(label, LV_TEXT_DECOR_UNDERLINE, 0);
+
+    if (style->align && strcmp(style->align, "left") != 0) {
+        lv_text_align_t lv_align = strcmp(style->align, "right") == 0 ? LV_TEXT_ALIGN_RIGHT : LV_TEXT_ALIGN_CENTER;
+        lv_obj_set_style_text_align(label, lv_align, 0);
+        int32_t left_inset = has_back_btn ? BUILD_TITLE_LEFT_INSET : 0;
+        int32_t right_margin = has_back_btn ? BUILD_TITLE_RIGHT_MARGIN : 0;
+        lv_obj_set_width(label, lv_display_get_horizontal_resolution(lv_display_get_default()) - left_inset - right_margin);
+        lv_obj_align(label, LV_ALIGN_TOP_LEFT, left_inset, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    }
+}
+
 /* ---- Icon grid ---- */
 
 typedef struct {
@@ -269,7 +295,8 @@ static void icon_tile_press_event_cb(lv_event_t * e) {
 
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const icon_grid_item_t * items, int item_count,
-                                   int32_t icon_scale_percent, bool label_inside_icon, int32_t tile_gap) {
+                                   int32_t icon_scale_percent, bool label_inside_icon, int32_t tile_gap,
+                                   const screen_title_style_t * title_style) {
     int32_t target_icon_px = (ICON_GRID_TARGET_ICON_PX * icon_scale_percent) / 100;
 
     lv_obj_t * scr = lv_obj_create(NULL);
@@ -283,7 +310,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
      * bar before the grid starts, unlike every other icon-grid screen
      * (Stream Media, Wireless, ...) which does have one. */
     if (back_btn_cb) build_back_button(scr, back_btn_cb);
-    if (title) build_title(scr, title);
+    if (title) apply_title_style(build_title(scr, title), title_style, back_btn_cb != NULL);
 
     /* A true 2-column grid with equal-sized cells and thin divider lines
      * between them, matching a real reference screenshot of the stock
@@ -713,7 +740,8 @@ int32_t pill_row_default_width(void) {
 
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
-                                   lv_style_t * toggle_accent_style, int32_t row_gap) {
+                                   lv_style_t * toggle_accent_style, int32_t row_gap,
+                                   const screen_title_style_t * title_style) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
@@ -721,7 +749,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
      * Home launcher) -- skip the arrow entirely rather than drawing a dead
      * button. */
     if (back_btn_cb) build_back_button(scr, back_btn_cb);
-    build_title(scr, title);
+    apply_title_style(build_title(scr, title), title_style, back_btn_cb != NULL);
 
     lv_obj_t * list = lv_obj_create(scr);
     lv_obj_set_size(list, lv_pct(100),

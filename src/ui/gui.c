@@ -12964,7 +12964,7 @@ static lv_obj_t * build_subsonic_entry_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "Saved Servers", PILL_ACCESSORY_CHEVRON, false, subsonic_saved_servers_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "New Connection", PILL_ACCESSORY_CHEVRON, false, subsonic_new_connection_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, &style_accent, 6, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -16130,6 +16130,19 @@ static void resolve_screen_list_items(const char * screen_id, const icon_grid_it
     }
 }
 
+/* Every field NULL/false when a plugin hasn't set options.title_align/
+ * title_size/title_underline for this screen_id -- build_icon_grid_screen()/
+ * build_pill_list_screen()'s own apply_title_style() treats each field as
+ * "no override" independently, so this is safe to pass unconditionally
+ * (no separate "did anything actually change" check needed here). */
+static screen_title_style_t plugin_screen_title_style(const char * screen_id) {
+    return (screen_title_style_t){
+        .align = plugin_manager_get_screen_title_align(screen_id),
+        .size = plugin_manager_get_screen_title_size(screen_id),
+        .underline = plugin_manager_get_screen_title_underline(screen_id),
+    };
+}
+
 static const screen_native_def_t music_tile_defs[] = {
     { "files", { "category/explorer.png", "category/explorer_s.png", "Files", music_files_tile_cb, NULL } },
     { "artists", { "category/artist.png", "category/artist_s.png", "Artists", artists_tile_cb, NULL } },
@@ -16150,14 +16163,15 @@ static lv_obj_t * build_music_screen(void) {
     static pill_list_item_t list_items[MUSIC_TILE_DEF_COUNT];
     int count = resolve_screen_items("music", music_tile_defs, MUSIC_TILE_DEF_COUNT, items);
 
+    screen_title_style_t title_style = plugin_screen_title_style("music");
     lv_obj_t * scr;
     if (plugin_manager_get_screen_list_mode("music")) {
         resolve_screen_list_items("music", items, count, list_items);
         scr = build_pill_list_screen("Music", generic_back_cb, list_items, count, NULL,
-                                      plugin_manager_get_screen_row_gap("music"));
+                                      plugin_manager_get_screen_row_gap("music"), &title_style);
     } else {
         scr = build_icon_grid_screen("Music", generic_back_cb, items, count, 100, false,
-                                      plugin_manager_get_screen_tile_gap("music"));
+                                      plugin_manager_get_screen_tile_gap("music"), &title_style);
     }
     finalize_screen_navigation(scr);
     return scr;
@@ -16212,14 +16226,15 @@ static lv_obj_t * build_stream_media_screen(void) {
         };
     }
 
+    screen_title_style_t title_style = plugin_screen_title_style("stream_media");
     lv_obj_t * scr;
     if (plugin_manager_get_screen_list_mode("stream_media")) {
         resolve_screen_list_items("stream_media", items, count, list_items);
         scr = build_pill_list_screen("Stream Media", generic_back_cb, list_items, count, NULL,
-                                      plugin_manager_get_screen_row_gap("stream_media"));
+                                      plugin_manager_get_screen_row_gap("stream_media"), &title_style);
     } else {
         scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100, false,
-                                      plugin_manager_get_screen_tile_gap("stream_media"));
+                                      plugin_manager_get_screen_tile_gap("stream_media"), &title_style);
     }
     finalize_screen_navigation(scr);
     return scr;
@@ -18941,11 +18956,12 @@ static lv_obj_t * build_wireless_screen(void) {
     static pill_list_item_t list_items[WIRELESS_TILE_DEF_COUNT];
     int count = resolve_screen_items("wireless", wireless_tile_defs, WIRELESS_TILE_DEF_COUNT, items);
 
+    screen_title_style_t title_style = plugin_screen_title_style("wireless");
     lv_obj_t * scr;
     if (plugin_manager_get_screen_list_mode("wireless")) {
         resolve_screen_list_items("wireless", items, count, list_items);
         scr = build_pill_list_screen("Wireless", generic_back_cb, list_items, count, NULL,
-                                      plugin_manager_get_screen_row_gap("wireless"));
+                                      plugin_manager_get_screen_row_gap("wireless"), &title_style);
     } else {
         /* 160: bigger than the shared 100% default -- explicit user request.
          * Bumped again from an earlier 120 once label_inside_icon (see
@@ -18955,7 +18971,7 @@ static lv_obj_t * build_wireless_screen(void) {
          * at very close to these assets' own native 212x190 resolution
          * within this screen's available cell height. */
         scr = build_icon_grid_screen("Wireless", generic_back_cb, items, count, 160, true,
-                                      plugin_manager_get_screen_tile_gap("wireless"));
+                                      plugin_manager_get_screen_tile_gap("wireless"), &title_style);
     }
     finalize_screen_navigation(scr);
     return scr;
@@ -19311,8 +19327,9 @@ static lv_obj_t * build_books_screen(void) {
         items[count++] = item;
     }
 
+    screen_title_style_t title_style = plugin_screen_title_style("books");
     lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent,
-                                             plugin_manager_get_screen_row_gap("books"));
+                                             plugin_manager_get_screen_row_gap("books"), &title_style);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -19399,7 +19416,7 @@ static lv_obj_t * build_about_screen(void) {
     items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, &style_accent, 6, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20216,7 +20233,7 @@ static lv_obj_t * build_timezone_region_screen(void) {
         items[i] = (pill_list_item_t){ TIMEZONE_REGIONS[i], PILL_ACCESSORY_CHEVRON, false, timezone_region_row_cb, NULL,
                                         (void *) (intptr_t) i };
     }
-    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, &style_accent, 6, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20280,7 +20297,7 @@ static lv_obj_t * build_settings_playback_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, &style_accent, 6, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20323,7 +20340,7 @@ static lv_obj_t * build_settings_display_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, &style_accent, 6, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20362,7 +20379,7 @@ static lv_obj_t * build_settings_power_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, &style_accent, 6, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20405,7 +20422,7 @@ static lv_obj_t * build_settings_system_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, &style_accent, 6, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20481,8 +20498,9 @@ static lv_obj_t * build_settings_screen(void) {
         items[count++] = item;
     }
 
+    screen_title_style_t title_style = plugin_screen_title_style("settings");
     lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent,
-                                             plugin_manager_get_screen_row_gap("settings"));
+                                             plugin_manager_get_screen_row_gap("settings"), &title_style);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20563,8 +20581,9 @@ static lv_obj_t * build_dac_home_screen(void) {
     int count = resolve_screen_items("dac", dac_row_defs, DAC_ROW_DEF_COUNT, native_items);
     resolve_screen_list_items("dac", native_items, count, items);
 
+    screen_title_style_t title_style = plugin_screen_title_style("dac");
     lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, count, &style_accent,
-                                             plugin_manager_get_screen_row_gap("dac"));
+                                             plugin_manager_get_screen_row_gap("dac"), &title_style);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20602,6 +20621,7 @@ static lv_obj_t * build_home_screen(void) {
      * behavior this screen always had, just shared with 6 more screens
      * now. */
     int count = resolve_screen_items("home", home_tile_defs, HOME_TILE_DEF_COUNT, items);
+    screen_title_style_t title_style = plugin_screen_title_style("home");
 
     lv_obj_t * scr;
     if (plugin_manager_get_screen_list_mode("home")) {
@@ -20616,12 +20636,14 @@ static lv_obj_t * build_home_screen(void) {
          * real title band since, unlike the icon grid, this builder always
          * reserves one. */
         resolve_screen_list_items("home", items, count, list_items);
-        scr = build_pill_list_screen("Home", NULL, list_items, count, NULL, plugin_manager_get_screen_row_gap("home"));
+        scr = build_pill_list_screen("Home", NULL, list_items, count, NULL, plugin_manager_get_screen_row_gap("home"),
+                                      &title_style);
     } else {
         /* No back_btn_cb -- this is the true root, nothing to go back to. No
          * title either -- matches the real stock launcher, which has no header
          * text above its icon grid. */
-        scr = build_icon_grid_screen(NULL, NULL, items, count, 100, false, plugin_manager_get_screen_tile_gap("home"));
+        scr = build_icon_grid_screen(NULL, NULL, items, count, 100, false, plugin_manager_get_screen_tile_gap("home"),
+                                      &title_style);
     }
     finalize_screen_navigation(scr);
     return scr;

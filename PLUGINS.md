@@ -52,6 +52,7 @@ Install it as:
 - [Adding a plugin to the UI](#ui-entry-points)
 - [Identity and capability checks](#identity)
 - [Lists and settings screens](#plugin-ui)
+- [Styling: icons, colors, layout, wallpaper](PLUGIN_STYLING.md) -- separate doc
 - [Files and playback](#files-playback)
 - [Networking](#networking)
 - [Playback events and timers](#events)
@@ -158,7 +159,7 @@ from the moment your script starts running (injected before
 |---|---|
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info` |
 | UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
-| Theme | `set_icon`, `set_background_color`, `set_text_color`, `set_background_image`, `set_home_layout`, `set_screen_layout`, `lerp_color` |
+| Styling | `set_icon`, `set_background_color`, `set_text_color`, `set_background_image`, `set_home_layout`, `set_screen_layout`, `lerp_color` -- see [`PLUGIN_STYLING.md`](PLUGIN_STYLING.md) |
 | Files | `sd_root`, `list_dir`, `mkdir` |
 | Playback | `play_file`, `play_list`, transport controls, playback state |
 | Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
@@ -213,8 +214,8 @@ Adds a row to an existing native list screen.
   This is where you'd call `plugin.show_list()` or
   `plugin.show_settings_list()` to show your first screen.
 - `options` (table, optional): `{ icon = "...", height = n, width = n, text_size =
-  "..." }` -- see "Row images, resizing, and text size" below for all
-  three.
+  "..." }` -- see [`PLUGIN_STYLING.md`'s "Row images, resizing, and text
+  size"](PLUGIN_STYLING.md#row-images) for all three.
 
 Every plugin that calls this gets its own row (unlike the old
 `register_tile()` this replaced, where only the first caller was ever
@@ -242,293 +243,21 @@ instance -- see `plugins_examples/NetRadio.lua`).
 Errors if more than `PLUGIN_MAX_STREAM_TILES` (currently 5, across every
 loaded plugin combined) are registered.
 
-### `plugin.set_icon(theme2_relative_path, source_file_path)`
+### 🎨 Styling
 
-Reskins an **existing** tile's icon in place -- a different case from
-`register_stream_media_tile()`'s own icon argument above (which points a
-brand-new tile at whatever icon it likes, no special handling needed) and
-from `register_list_item()`'s/`show_list()`'s/`show_settings_list()`'s own
-`icon` option (which puts a NEW icon on a row that has none, from an
-arbitrary SD-card file rather than an existing theme2 asset -- see "Row
-images, resizing, and text size" below). This function is specifically for
-changing what an *already-existing* stock icon looks like. For example,
-`plugin.set_icon("launcher/book.png", plugin.sd_root() .. "/my_icon.png")`
-changes what Home's Books tile looks like.
-
-Copies `source_file_path`'s bytes into the app's writable theme-override
-directory under `theme2_relative_path`, the same mechanism this app
-already uses for its own non-stock icons (e.g. Subsonic's).
-
-**Call this from your plugin's top-level script code only** (i.e. during
-load, not from inside `on_open`/`on_select`/any callback that might run
-after the app has already shown a screen). LVGL caches decoded images by
-path string for the app's whole lifetime, with no cache-invalidation call
-anywhere in this codebase -- an override written *after* the first time
-that path was resolved+decoded this boot will silently not take effect
-until the next full app restart. Since every plugin's top-level code runs
-during `plugin_manager_init()`, which always runs before `gui_init()`
-builds any icon-grid/pill-list screen, calling this at load time is always
-safe.
-
-Also worth knowing: a tile's on-screen icon size/position is computed once,
-at screen-build time, from the *original* icon's dimensions, and never
-recomputed on a later icon change -- a replacement PNG with a very
-different aspect ratio than the original will render at a size/position
-tuned for the original, not the replacement. Keep replacement icons
-roughly the same aspect ratio as what they're replacing.
-
-### `plugin.set_home_layout(tile_keys [, options])`
-
-Reorders and/or hides Home's 6 native tiles, optionally as a plain
-vertical list instead of the icon grid, with optional per-tile background
-color/text color/corner radius/background alpha overrides. This is sugar
-for `plugin.set_screen_layout("home", tile_keys, options)` below -- Home
-is just one of 7 screens that mechanism reaches, kept as its own
-shorthand since it's the one every existing plugin already calls.
-
-`tile_keys` is an array of any subset of `"music"`, `"stream_media"`,
-`"wireless"`, `"books"`, `"system"`, `"dac"`, in the order they should
-appear on screen -- any key left out is hidden. Home's icon grid itself is
-a fixed, non-scrollable 2x3 layout (matching the real stock launcher,
-confirmed on real hardware -- there's no way to add a 7th tile of your own
-here; see `register_stream_media_tile()` above for where a plugin *can*
-get its own tile), so this only reorders/hides/restyles the existing 6, it
-doesn't add new ones.
-
-Each entry in `tile_keys` is either a plain string, or a table `{ key =
-"...", bg_color = 0xRRGGBB, text_color = 0xRRGGBB, radius = n, bg_alpha =
-n, border_color = 0xRRGGBB, border_width = n, ... }` to also style that one
-tile -- the same "string, or a table for the rows that need more" shape
-`register_list_item()`'s/`show_list()`'s own `items` arrays already use.
-`bg_color`/`text_color`/`radius`/`bg_alpha`/`border_color`/`border_width`
-all work in either mode; `radius` (corner radius, in px) is clamped to
-`0..64`, `bg_alpha` (background opacity, `0`-`255`, matching LVGL's own
-scale -- `255` is today's fully-opaque default) lets a tile go
-semi-transparent over `plugin.set_background_image()`'s wallpaper below,
-and `border_width` (px, clamped to `0..8`) draws a `border_color`-tinted
-outline around the tile -- `border_color` alone with no `border_width` (or
-`border_width = 0`) is inert, same as leaving both out. Any property left
-out of a table entry (or every entry left a plain string) keeps that
-tile's default appearance.
-
-`options.mode` is `"tile"` (default, the icon grid) or `"list"` (a plain
-vertical list, each tile becoming a row with its icon and a chevron).
+Icons, screen layout/reorder/restyle (`set_home_layout`/`set_screen_layout`),
+colors, wallpaper, and gradients now live in their own doc:
+**[`PLUGIN_STYLING.md`](PLUGIN_STYLING.md)** -- every function, every table
+field, every clamped range, in one place.
 
 ```lua
--- Icon grid: only System, DAC, and Music, in that order, System restyled
-plugin.set_home_layout({
-    "music",
-    { key = "system", bg_color = 0x2a1a4e, text_color = 0xffcc00, radius = 24 },
-    "dac",
-})
-
--- Same 3 tiles, as a plain list instead
-plugin.set_home_layout({ "music", "system", "dac" }, { mode = "list" })
-```
-
-#### `icon`, and list-mode-only extensions
-
-- `icon` -- `false` drops the tile's launcher icon (default `true`, today's
-  look), in **either** mode. In tile mode the label alone is centered in
-  the tile with no icon reserved above/inside it. In list mode this isn't
-  just cosmetic: a shown icon always reserves space for itself before the
-  label (so `align = "left"` still starts after it) -- set `icon = false`
-  to get a label genuinely flush against the row's own left edge, or when
-  `height` is small enough that the icon would clip.
-
-The icon grid is otherwise a fixed 2x3 layout with a centered icon+label
-per tile -- none of the properties below have a meaning there, so they're
-silently ignored outside `{ mode = "list" }`. In list mode, each per-tile
-table also accepts:
-
-- `height`/`width` (px) -- resizes that row. Clamped to the same range
-  `register_list_item()`'s own `height`/`width` options use.
-- `align` -- `"left"` (default), `"center"`, or `"right"`. Only the
-  label's own text position changes; the icon (if any) always stays put
-  at the row's left edge.
-- `accessory` -- `false` hides the row's trailing `">"` chevron (default
-  `true`, today's look).
-- `text_size` -- `"small"`, `"medium"`, `"large"`, or `"mono"` (an 8x16
-  monospace/pixel bitmap font). `"mono"` is ASCII-only -- a label with
-  accented or non-Latin characters will show blank glyphs for those
-  characters, unlike this app's own regenerated fallback-capable fonts.
-
-`options.row_gap` (list mode only) sets the vertical spacing between rows,
-in px, clamped to `0..24` (default `6`, today's look).
-
-`options.tile_gap` (tile mode only) sets the visible space between adjacent
-tiles in the icon grid, in px, clamped to `0..40` (default `0`, today's
-flush-cell look with its thin divider lines between tiles -- a nonzero
-`tile_gap` insets each tile within its own grid cell instead, and drops
-those divider lines since a real gap already separates the tiles).
-
-```lua
--- A tight, chevron-free, monospace list flush to the left edge --
--- e.g. a retro boot-menu look
-plugin.set_home_layout({
-    { key = "music", bg_color = 0x141824, text_color = 0xe8d16b,
-      radius = 0, height = 64, align = "left", accessory = false, text_size = "mono", icon = false },
-    { key = "system", bg_color = 0x141824, text_color = 0xe0a1c4,
-      radius = 0, height = 64, align = "left", accessory = false, text_size = "mono", icon = false },
-}, { mode = "list", row_gap = 6 })
-```
-
-**Call this from your plugin's top-level script code only**, same
-load-time-only constraint as `set_icon()` above -- Home is built once,
-right after every plugin finishes loading, so a call from inside a
-callback is a silent no-op until the next restart. If more than one
-plugin calls this, whichever call happens last wins (same as
-`set_background_color()`/`set_text_color()`'s own single global slots) --
-one call always fully specifies both the layout and every style override
-together, never layered onto an earlier call.
-
-Raises a Lua error -- Home must never end up with zero tiles -- for an
-empty array, an unknown or duplicate tile key, an invalid `mode`, an
-invalid `align`, or an invalid `text_size`; whatever layout was already
-in effect (the native default, or an earlier successful call) is left
-untouched. `radius` and `row_gap` are purely cosmetic and are clamped
-into range instead of erroring.
-
-`plugins_examples/HomeThemes.lua` is the reference implementation: 11
-ready-made Home looks (Game Boy, Terminal, Monastic, Wavy, Trees, Swamp,
-Mountain Sunset, Zen Terracotta, Retro, Vaporwave, Earthy) spanning both
-modes and every style knob above -- each one a genuinely different
-shape/spacing/alignment recipe, not just a different palette on the same
-skeleton -- picked from a Settings row and persisted the same way
-`Themes.lua`'s own light/dark picker is. Each preset also calls
-`set_background_color()`/`set_text_color()` (all 5 slots below) to match
-the same palette, so the theme carries app-wide -- every screen's
-background, every list row, every card/popup, and both text tiers --
-not just Home. Screenshots of all 11 are in
-`plugins_examples/screenshots/home_themes/`.
-
-### `plugin.set_screen_layout(screen_id, item_keys [, options])`
-
-The same reorder/hide/restyle mechanism `set_home_layout()` gives Home,
-generalized to every other top-level native screen with the same shape --
-a small, fixed, string-keyed set of nav tiles/rows. `item_keys` and
-`options` are exactly `set_home_layout()`'s own `tile_keys`/`options`
-(same per-item `bg_color`/`text_color`/`radius`/`bg_alpha`/`border_color`/
-`border_width` table shape, same `options.mode`/`row_gap`/`tile_gap`), just parameterized by which
-screen to target:
-
-| `screen_id` | Shape | Native item keys |
-|---|---|---|
-| `"home"` | icon grid or list | `"music"`, `"stream_media"`, `"wireless"`, `"books"`, `"system"`, `"dac"` |
-| `"music"` | icon grid or list | `"files"`, `"artists"`, `"albums"`, `"album_artist"`, `"all_songs"`, `"playlists"` |
-| `"wireless"` | icon grid or list | `"wifi"`, `"bt"`, `"airplay"`, `"dlna"`, `"remote"`, `"import"` |
-| `"stream_media"` | icon grid or list | `"subsonic"` (the only native tile -- any `plugin.register_stream_media_tile()` tiles append after it, untouched by this) |
-| `"settings"` | list only | `"playback"`, `"display"`, `"power"`, `"system"`, `"about"` (plugin rows from `register_list_item("settings", ...)` append after) |
-| `"books"` | list only | `"books"`, `"favorites"` (plugin rows from `register_list_item("books", ...)` append after) |
-| `"dac"` | list only | `"usb_dac"`, `"bluetooth_dac"` |
-
-`"settings"`, `"books"`, and `"dac"` are already a plain row list natively
-(no icon-grid equivalent) -- `options.mode` is silently ignored for these
-three, and they're always in the list-mode shape, so every list-mode-only
-per-item property (`height`/`width`/`align`/`accessory`/`text_size`)
-applies to them too, not just to `{ mode = "list" }` on the other four.
-(`icon` applies everywhere, tile mode included -- see `set_home_layout()`
-above.)
-
-```lua
--- Reorder + restyle Music's tiles, semi-transparent over a wallpaper
-plugin.set_screen_layout("music", {
-    { key = "all_songs", bg_color = 0x104020, bg_alpha = 160, text_color = 0x66ffaa },
-    "artists",
-    "albums",
-})
-
--- Settings is list-only -- no options.mode needed
-plugin.set_screen_layout("settings", {
-    { key = "about", bg_color = 0x2a1a4e, text_color = 0xffcc00 },
-    "system",
-})
-```
-
-Same load-time-only, last-call-wins-per-`screen_id`, "never zero items"
-error behavior as `set_home_layout()` above -- an unknown `screen_id` or
-an unknown/duplicate item key for that screen both raise a Lua error
-rather than silently doing nothing.
-
-### `plugin.set_background_color(slot, rgb)`
-
-Sets one of three background-color slots, live, app-wide, no restart
-needed:
-
-- `"screen"` -- every screen's own background.
-- `"card"` -- every popup, EQ card, and settings slider card -- every
-  neutral dark surface that isn't a plain screen or a list row.
-- `"list_row"` -- every row in every list screen (All Songs, Artists,
-  Playlists, Files, Queue, ...).
-
-`rgb` is a packed `0xRRGGBB` integer, e.g. `0x1E1E22`. Unlike
-`plugin.set_icon()`, this is safe to call at any time, including from
-inside a callback well after load -- it's a plain style-property update
-plus a redraw request, no file/cache involved.
-
-Raises a Lua error if `slot` isn't one of the three names above.
-
-### `plugin.set_text_color(slot, rgb)`
-
-Sets one of two text-color slots, live, app-wide, no restart needed:
-
-- `"primary"` -- the app's dominant near-white text (labels, titles, list
-  row text).
-- `"muted"` -- secondary/disabled-ish gray text (chevrons, timestamps,
-  subtitles).
-
-Destructive-red text (delete/reset confirmations) and accent-tinted text
-are **not** covered by either slot -- they're semantically fixed, not part
-of the light/dark split these two slots (and `set_background_color()`)
-drive. `rgb` is a packed `0xRRGGBB` integer, same convention as
-`set_background_color()`. Safe to call at any time, same live-update
-mechanism as `set_background_color()` -- no file/cache involved.
-
-Raises a Lua error if `slot` isn't `"primary"` or `"muted"`.
-
-### `plugin.set_background_image(image_path)`
-
-Sets a whole-screen wallpaper, live, app-wide, no restart needed -- every
-screen shows it behind its own content, not just Home. Mutates the same
-shared style `set_background_color("screen", ...)` uses, so the two
-compose naturally: the wallpaper draws over that color, and a missing or
-corrupt `image_path` just falls back to whatever `"screen"` color is set,
-no error.
-
-`image_path` follows the same convention every other plugin-supplied-file
-option uses (`register_list_item()`'s own `icon`, for instance): a raw
-absolute path, or one relative to the SD card's `.plugins/` folder (the
-same folder your own `.lua` file lives in).
-
-For a tile/row to show the wallpaper through instead of fully covering
-it, give it `bg_alpha` (see `set_home_layout()`/`set_screen_layout()`
-above) below `255`.
-
-```lua
+-- A taste of what's there -- see PLUGIN_STYLING.md for the full picture
 plugin.set_background_image("wallpaper.jpg")
 plugin.set_home_layout({
-    { key = "music", bg_color = 0x1c2a36, bg_alpha = 200 },
-    "system",
-}, { mode = "list" })
-```
-
-### `plugin.lerp_color(from, to, t)`
-
-Linearly interpolates each RGB channel independently between two packed
-`0xRRGGBB` colors, `from` and `to`, at `t` (a float, `0.0`-`1.0`, clamped
-into range). Returns a packed `0xRRGGBB` integer. Pure math, no UI effect
-by itself -- use it to build an N-stop gradient across a screen's tiles
-from just two endpoint colors instead of hand-picking every stop's own hex
-value:
-
-```lua
-local keys = { "music", "stream_media", "wireless", "books", "system", "dac" }
-local layout = {}
-for i, key in ipairs(keys) do
-    local t = (i - 1) / (#keys - 1)
-    layout[i] = { key = key, bg_color = plugin.lerp_color(0x1c2a36, 0x6f93ab, t) }
-end
-plugin.set_home_layout(layout)
+    "music",
+    { key = "system", bg_color = 0x2a1a4e, text_color = 0xffcc00, radius = 24, bg_alpha = 200 },
+    "dac",
+}, { mode = "list", title_align = "center" })
 ```
 
 ### `plugin.show_list(title, items, on_select [, options])`
@@ -539,8 +268,8 @@ Opens a list screen.
 - `items` (array table): one row per entry, shown in order. Each entry is
   either a plain string (a row with just a label, as before) or a table
   `{ label = "...", icon = "...", text_size = "..." }` for a row with its
-  own icon and/or text size -- see "Row images, resizing, and text size"
-  below.
+  own icon and/or text size -- see [`PLUGIN_STYLING.md`'s "Row images,
+  resizing, and text size"](PLUGIN_STYLING.md#row-images).
 - `on_select` (function): called with the **1-based** index of whichever
   row was tapped (Lua array convention, not C's 0-based one) when the user
   taps a row. Not called if the user backs out without tapping anything.
@@ -588,8 +317,9 @@ itself a small settings panel (see `plugins_examples/PlaybackExtras.lua`).
     Volume, the EQ bands) already uses, so a callback that writes to disk
     isn't hammered mid-drag.
 
-  Every row type also accepts `icon`, `height`, `width`, and `text_size` (see "Row
-  images, resizing, and text size" below) -- except `height` on a
+  Every row type also accepts `icon`, `height`, `width`, and `text_size`
+  (see [`PLUGIN_STYLING.md`'s "Row images, resizing, and text
+  size"](PLUGIN_STYLING.md#row-images)) -- except `height` on a
   `"slider"` row, which is ignored (its card has its own fixed layout with
   no spare room to grow into).
 
@@ -623,46 +353,13 @@ silently dropped.
 
 ### 🎛️ Row Images, Resizing, and Text Size
 
-`register_list_item()`'s `options` table, `show_list()`'s per-row table
-entries, and `show_settings_list()`'s per-row tables support these optional
-layout fields. For `show_list()`, width and height live in the call-level
-`options` table so every browsing row stays uniform:
-
-- **`icon`** (string) -- either a **raw absolute filesystem path**, e.g.
-  `plugin.sd_root() .. "/.plugins/my_icon.png"` -- **not** a theme2-relative
-  path like `register_stream_media_tile()`'s `icon` argument or
-  `set_icon()`'s first argument use -- **or** a plain relative filename/path
-  (doesn't start with `/`), e.g. `"my_icon.png"`, resolved against
-  `<SD card>/.plugins/` -- the same folder your plugin's own `.lua` file
-  already lives in, so a relative path just means "a file sitting next to
-  my script." Any file your plugin can read works, including a file it
-  downloaded itself at runtime. Drawn to the left of the row's label,
-  scaled to a consistent on-screen size regardless of the source file's own
-  resolution. A missing or corrupt file just renders at its native size
-  rather than erroring -- an icon is cosmetic, not worth failing the whole
-  row over.
-- **`height`** (number, px) -- resizes the row. Clamped to a fixed range
-  (currently 100-220px) rather than erroring if you ask for more or less.
-  Not available on a `show_settings_list()` `"slider"` row (see that
-  function's own section above) -- everywhere else, an unset/zero height
-  keeps that row type's own default (124px for a pill/`register_list_item`
-  row, 84px for a plain `show_list` row).
-- **`width`** (number, px) -- resizes and keeps the row centered. It is
-  available for native-list plugin rows, `show_list()` rows, and every
-  `show_settings_list()` row including sliders. Values are clamped to
-  240-464px; unset/zero keeps the native width. Resizing a pill row replaces
-  its fixed-size background sprite with the matching rounded fill so the
-  artwork is never stretched.
-- **`text_size`** (string) -- `"small"`, `"medium"`, or `"large"`. Every
-  size uses a font with full non-Latin fallback (Cyrillic, CJK, Korean,
-  Thai) -- correct for plugin-authored text, which (unlike this app's own
-  fixed English UI chrome) might not be English. An unrecognized value
-  raises a Lua error; omitting it keeps that row type's own existing
-  default size.
-
-None of the three affect a row that doesn't set them -- a plugin that
-never uses this section's fields renders exactly as it did before they
-existed.
+`register_list_item()`'s `options` table above, `show_list()`'s per-row
+table entries, and `show_settings_list()`'s per-row tables all support an
+`icon`/`height`/`width`/`text_size` set of optional layout fields -- see
+[`PLUGIN_STYLING.md`'s "Row images, resizing, and text size"](PLUGIN_STYLING.md#row-images)
+for the full field-by-field reference (documented there rather than here
+since it's the same table shape `set_home_layout()`/`set_screen_layout()`
+already use).
 
 <a id="files-playback"></a>
 

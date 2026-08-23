@@ -1100,6 +1100,14 @@ static int32_t plugin_screen_row_gap[PLUGIN_SCREEN_COUNT] = { 6, 6, 6, 6, 6, 6, 
  * pre-existing flush-cell look (every native caller of that function also
  * passes 0), so a plugin that never sets this changes nothing. */
 static int32_t plugin_screen_tile_gap[PLUGIN_SCREEN_COUNT];
+/* options.title_align/title_size/title_underline -- style overrides for
+ * the screen's own title label (build_title(), gui.c), separate from any
+ * per-item override since the title isn't one of the tile/row items.
+ * "" / false = unset, native default (left-aligned, ui_size_28, no
+ * underline) -- a plugin that never sets these changes nothing. */
+static char plugin_screen_title_align[PLUGIN_SCREEN_COUNT][8];
+static char plugin_screen_title_size[PLUGIN_SCREEN_COUNT][8];
+static bool plugin_screen_title_underline[PLUGIN_SCREEN_COUNT];
 
 static int plugin_screen_slot(const char * screen_id) {
     for (int i = 0; i < PLUGIN_SCREEN_COUNT; i++) {
@@ -1170,6 +1178,9 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
     bool is_list = false;
     int32_t row_gap = 6;  /* today's exact hardcoded build_pill_list_screen() default */
     int32_t tile_gap = 0; /* today's exact flush-cell build_icon_grid_screen() default */
+    char title_align[8] = "";
+    char title_size[8] = "";
+    bool title_underline = false;
     if (lua_gettop(L) >= options_idx && !lua_isnil(L, options_idx)) {
         luaL_checktype(L, options_idx, LUA_TTABLE);
         lua_getfield(L, options_idx, "mode");
@@ -1205,6 +1216,37 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
             if (g > PLUGIN_SCREEN_TILE_GAP_MAX) g = PLUGIN_SCREEN_TILE_GAP_MAX;
             tile_gap = (int32_t) g;
         }
+        lua_pop(L, 1);
+
+        lua_getfield(L, options_idx, "title_align");
+        const char * ta = lua_tostring(L, -1);
+        if (ta) {
+            if (strcmp(ta, "left") != 0 && strcmp(ta, "center") != 0 && strcmp(ta, "right") != 0) {
+                const char * shown_ta = ta;
+                lua_pop(L, 1);
+                return luaL_error(L, "%s: options.title_align must be \"left\", \"center\", or \"right\", got '%s'",
+                                   fn_name, shown_ta);
+            }
+            snprintf(title_align, sizeof(title_align), "%s", ta);
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, options_idx, "title_size");
+        const char * ts = lua_tostring(L, -1);
+        if (ts) {
+            if (!is_valid_screen_text_size(ts)) {
+                const char * shown_ts = ts;
+                lua_pop(L, 1);
+                return luaL_error(L,
+                    "%s: unknown options.title_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
+                    fn_name, shown_ts);
+            }
+            snprintf(title_size, sizeof(title_size), "%s", ts);
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, options_idx, "title_underline");
+        if (!lua_isnil(L, -1)) title_underline = lua_toboolean(L, -1);
         lua_pop(L, 1);
     }
 
@@ -1395,6 +1437,9 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
     plugin_screen_is_list[slot] = is_list;
     plugin_screen_row_gap[slot] = row_gap;
     plugin_screen_tile_gap[slot] = tile_gap;
+    snprintf(plugin_screen_title_align[slot], sizeof(plugin_screen_title_align[slot]), "%s", title_align);
+    snprintf(plugin_screen_title_size[slot], sizeof(plugin_screen_title_size[slot]), "%s", title_size);
+    plugin_screen_title_underline[slot] = title_underline;
     return 0;
 }
 
@@ -1532,6 +1577,27 @@ int32_t plugin_manager_get_screen_tile_gap(const char * screen_id) {
     int slot = plugin_screen_slot(screen_id);
     if (slot < 0) return 0;
     return plugin_screen_tile_gap[slot];
+}
+
+/* options.title_align/title_size -- "" means unset (native default), same
+ * NULL-means-unset convention plugin_manager_get_screen_item_text_align()/
+ * _text_size() already use. */
+const char * plugin_manager_get_screen_title_align(const char * screen_id) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || plugin_screen_title_align[slot][0] == '\0') return NULL;
+    return plugin_screen_title_align[slot];
+}
+
+const char * plugin_manager_get_screen_title_size(const char * screen_id) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || plugin_screen_title_size[slot][0] == '\0') return NULL;
+    return plugin_screen_title_size[slot];
+}
+
+bool plugin_manager_get_screen_title_underline(const char * screen_id) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0) return false;
+    return plugin_screen_title_underline[slot];
 }
 
 /* plugin.lerp_color(from, to, t) -- linear-interpolates each RGB channel

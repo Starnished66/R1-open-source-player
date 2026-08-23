@@ -327,6 +327,16 @@ int32_t plugin_manager_get_screen_row_gap(const char * screen_id);
  * Meaningless (silently unused) for the pill-list-native screens. */
 int32_t plugin_manager_get_screen_tile_gap(const char * screen_id);
 
+/* options.title_align/title_size/title_underline -- styles the screen's own
+ * title label (build_title(), screen_builders.c), separate from any per-item
+ * key in item_keys. NULL (align/size) or false (underline) = today's exact
+ * default (left-aligned, ui_size_28, no underline) -- see
+ * screen_title_style_t's own doc comment in screen_builders.h for how these
+ * reach the label. */
+const char * plugin_manager_get_screen_title_align(const char * screen_id);
+const char * plugin_manager_get_screen_title_size(const char * screen_id);
+bool plugin_manager_get_screen_title_underline(const char * screen_id);
+
 /* Invoked by gui.c's plugin-settings-list row widgets (see
  * gui_plugin_show_settings_list()) when a "row"-type row in pool slot `slot`
  * at position `row` is tapped -- calls that row's own on_select Lua function

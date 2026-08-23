@@ -360,7 +360,7 @@ An example **Audiobooks** plugin is included (`plugins_examples/Audiobooks.lua`)
 
 For the full `plugin.*` API reference and instructions on writing and testing your own plugin, see:
 
-**[PLUGINS.md](PLUGINS.md)**
+**[PLUGINS.md](PLUGINS.md)** — and for icons/colors/layout/wallpaper theming specifically, **[PLUGIN_STYLING.md](PLUGIN_STYLING.md)**
 
 
 # Acknowledgments

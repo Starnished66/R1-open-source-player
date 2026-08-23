@@ -195,13 +195,22 @@ typedef struct {
  * (screen_builders.c) -- deliberately its own, larger scale than item
  * text_size's, see that function's own comment for why.
  * has_color/color: has_color false = today's exact default (whatever
- * set_text_color("primary", ...) has set, style_theme_text_primary). */
+ * set_text_color("primary", ...) has set, style_theme_text_primary).
+ * has_gap/gap: vertical space (px) between the title band and the first
+ * tile/row below it -- has_gap false = today's exact default (4px in
+ * list mode via the list's own pad_top, 0px in tile mode -- the grid
+ * starts immediately after the title band). Unlike align/size/underline/
+ * color, this doesn't touch the title label itself -- applied by the
+ * caller (build_icon_grid_screen()/build_pill_list_screen()) to the
+ * grid/list's own position instead. */
 typedef struct {
     const char * align;
     const char * size;
     bool underline;
     bool has_color;
     uint32_t color;
+    bool has_gap;
+    int32_t gap;
 } screen_title_style_t;
 
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,

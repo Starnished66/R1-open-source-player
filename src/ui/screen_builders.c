@@ -390,6 +390,12 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
      * never overlaps the grid, regardless of which bands are present. */
     int32_t scr_h = lv_display_get_vertical_resolution(lv_display_get_default());
     int32_t header_h = STATUS_BAR_CLEARANCE + (title ? TITLE_ROW_HEIGHT : 0);
+    /* options.title_gap (PLUGIN_STYLING.md) -- extra px between the title
+     * band and the grid, today's exact default (0, grid starts flush
+     * against the title band) unless a plugin sets it. Comes out of the
+     * same row_h budget below, same tradeoff row_gap/tile_gap already
+     * make. */
+    if (title && title_style && title_style->has_gap) header_h += title_style->gap;
 
     /* Rows are a fixed pixel height (see ICON_GRID_REFERENCE_ROWS above)
      * rather than LV_GRID_FR(1) shares of the full available height -- FR
@@ -831,7 +837,10 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
      * row inside it, native or plugin-resized alike. */
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(list, row_gap, 0);
-    lv_obj_set_style_pad_top(list, 4, 0);
+    /* options.title_gap (PLUGIN_STYLING.md) -- extra px between the title
+     * band and the first row, today's exact default (4, the original
+     * hardcoded value) unless a plugin sets it. */
+    lv_obj_set_style_pad_top(list, (title_style && title_style->has_gap) ? title_style->gap : 4, 0);
 
     for (int i = 0; i < item_count; i++) {
         const pill_list_item_t * item = &items[i];

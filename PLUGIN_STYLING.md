@@ -192,6 +192,7 @@ Passed as the 2nd argument to `set_home_layout()` / 3rd to
 | `title_size` | string | native (28px) | `"small"`, `"medium"`, `"large"`, `"mono"` | every screen with a title | A larger scale than item `text_size` (`22`/`28`/`40px`) -- see [Title styling](#title-styling) for why. |
 | `title_underline` | bool | `false` | -- | every screen with a title | Adds an underline text-decoration to the title label. |
 | `title_color` | `0xRRGGBB` int | whatever `set_text_color("primary", ...)` is set to | any | every screen with a title | A per-screen override, separate from the app-wide `"primary"` text color slot -- lets one screen's title stand out from its own body text. |
+| `title_gap` | int, px | `4` (list mode), `0` (tile mode) | `0`-`64` | every screen with a title | Vertical space between the title band and the first tile/row below it. Unlike `title_align`/`title_size`/`title_underline`/`title_color`, this doesn't touch the title label -- it repositions the grid/list below it. |
 
 <a id="screen-ids"></a>
 
@@ -228,14 +229,16 @@ tile mode included.
 `options.title_align`/`title_size`/`title_underline`/`title_color` style
 the screen's own title label (e.g. the "Music" or "Settings" text above
 the grid/list) -- separate from every per-item field above, which only
-ever touches tiles/rows, never the title.
+ever touches tiles/rows, never the title. `title_gap` is the odd one out
+of this group: it doesn't touch the label itself, just the vertical space
+between it and the grid/list below.
 
 ```lua
 plugin.set_home_layout(
     { "music", "system", "dac" },
     {
         mode = "list", title_align = "center", title_size = "large",
-        title_underline = true, title_color = 0xffb347,
+        title_underline = true, title_gap = 24,
     }
 )
 ```
@@ -415,8 +418,8 @@ end
 plugin.set_home_layout(
     themed_layout({ "music", "stream_media", "wireless", "books", "system", "dac" }),
     {
-        mode = "list", row_gap = 8, title_align = "center", title_size = "large",
-        title_underline = true, title_color = 0xffb347,
+        mode = "list", row_gap = 8, title_gap = 24, title_align = "center",
+        title_size = "large", title_underline = true,
     }
 )
 

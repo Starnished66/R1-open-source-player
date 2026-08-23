@@ -350,6 +350,10 @@ bool plugin_manager_get_screen_title_underline(const char * screen_id);
  * set it. */
 bool plugin_manager_get_screen_title_color(const char * screen_id, uint32_t * out_color);
 
+/* options.title_gap -- px between the title band and the first tile/row
+ * below it. Returns false (no override) if this screen never set it. */
+bool plugin_manager_get_screen_title_gap(const char * screen_id, int32_t * out_gap);
+
 /* Invoked by gui.c's plugin-settings-list row widgets (see
  * gui_plugin_show_settings_list()) when a "row"-type row in pool slot `slot`
  * at position `row` is tapped -- calls that row's own on_select Lua function

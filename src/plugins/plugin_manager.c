@@ -1055,6 +1055,11 @@ static const plugin_screen_def_t plugin_screen_defs[] = {
  * reads as intentional spacing rather than the tiles falling apart. */
 #define PLUGIN_SCREEN_TILE_GAP_MAX 40
 
+/* Ceiling on options.title_gap -- same headroom reasoning as
+ * PLUGIN_SCREEN_ROW_GAP_MAX above, comes out of the same available
+ * content area. */
+#define PLUGIN_SCREEN_TITLE_GAP_MAX 64
+
 /* Ceiling on a plugin-chosen border_width -- cosmetic, clamped not errored,
  * same split PLUGIN_SCREEN_RADIUS_MAX already makes for radius. A thin
  * accent border is the realistic use case here, not a thick outline. */
@@ -1127,6 +1132,12 @@ static bool plugin_screen_title_underline[PLUGIN_SCREEN_COUNT];
  * screen's title stand out from its own body text. */
 static bool plugin_screen_has_title_color[PLUGIN_SCREEN_COUNT];
 static uint32_t plugin_screen_title_color[PLUGIN_SCREEN_COUNT];
+/* options.title_gap -- vertical px between the title band and the first
+ * tile/row below it, today's exact default (4px list mode, 0px tile
+ * mode -- see screen_title_style_t's own comment in screen_builders.h)
+ * unless a plugin sets it. */
+static bool plugin_screen_has_title_gap[PLUGIN_SCREEN_COUNT];
+static int32_t plugin_screen_title_gap[PLUGIN_SCREEN_COUNT];
 
 static int plugin_screen_slot(const char * screen_id) {
     for (int i = 0; i < PLUGIN_SCREEN_COUNT; i++) {
@@ -1202,6 +1213,8 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
     bool title_underline = false;
     bool has_title_color = false;
     uint32_t title_color = 0;
+    bool has_title_gap = false;
+    int32_t title_gap = 0;
     if (lua_gettop(L) >= options_idx && !lua_isnil(L, options_idx)) {
         luaL_checktype(L, options_idx, LUA_TTABLE);
         lua_getfield(L, options_idx, "mode");
@@ -1279,6 +1292,18 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
         if (!lua_isnil(L, -1)) {
             has_title_color = true;
             title_color = (uint32_t) lua_tointeger(L, -1);
+        }
+        lua_pop(L, 1);
+
+        /* title_gap -- cosmetic, clamp not error, same precedent row_gap/
+         * tile_gap already set. */
+        lua_getfield(L, options_idx, "title_gap");
+        if (!lua_isnil(L, -1)) {
+            has_title_gap = true;
+            lua_Integer g = lua_tointeger(L, -1);
+            if (g < 0) g = 0;
+            if (g > PLUGIN_SCREEN_TITLE_GAP_MAX) g = PLUGIN_SCREEN_TITLE_GAP_MAX;
+            title_gap = (int32_t) g;
         }
         lua_pop(L, 1);
     }
@@ -1495,6 +1520,8 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
     plugin_screen_title_underline[slot] = title_underline;
     plugin_screen_has_title_color[slot] = has_title_color;
     plugin_screen_title_color[slot] = title_color;
+    plugin_screen_has_title_gap[slot] = has_title_gap;
+    plugin_screen_title_gap[slot] = title_gap;
     return 0;
 }
 
@@ -1668,6 +1695,13 @@ bool plugin_manager_get_screen_title_color(const char * screen_id, uint32_t * ou
     int slot = plugin_screen_slot(screen_id);
     if (slot < 0 || !plugin_screen_has_title_color[slot]) return false;
     *out_color = plugin_screen_title_color[slot];
+    return true;
+}
+
+bool plugin_manager_get_screen_title_gap(const char * screen_id, int32_t * out_gap) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || !plugin_screen_has_title_gap[slot]) return false;
+    *out_gap = plugin_screen_title_gap[slot];
     return true;
 }
 

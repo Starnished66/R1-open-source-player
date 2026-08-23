@@ -16149,6 +16149,7 @@ static screen_title_style_t plugin_screen_title_style(const char * screen_id) {
         .underline = plugin_manager_get_screen_title_underline(screen_id),
     };
     style.has_color = plugin_manager_get_screen_title_color(screen_id, &style.color);
+    style.has_gap = plugin_manager_get_screen_title_gap(screen_id, &style.gap);
     return style;
 }
 

@@ -7996,6 +7996,42 @@ void gui_plugin_set_background_color(const char * slot, uint32_t rgb) {
      * "degraded but working" tolerance elsewhere. */
 }
 
+/* Backing plugin.set_background_image() -- same relative-path resolution as
+ * pill_row_apply_icon()'s own comment (screen_builders.c): an already-
+ * absolute path is used verbatim, anything else is resolved against
+ * <sd_root>/.plugins/, the folder every plugin's own .lua file already
+ * lives in. "S:" is LVGL's POSIX-filesystem driver letter (lv_conf.h) --
+ * unlike asset_path(), this doesn't prefix THEME_ROOT, so it opens the
+ * resolved path as a real absolute file, not a theme2 asset.
+ *
+ * Sets style_theme_screen_bg's bg_image_src directly (not through
+ * lv_style_set_bg_color() -- there's no lv_style_set_bg_image_src() wrapper
+ * in this LVGL build, so this stores it via the plain lv_style_set_prop()
+ * that lv_obj_set_style_bg_image_src() itself expands to) and reports the
+ * change, the exact same live-update mechanism gui_plugin_set_background_
+ * color() above uses for "screen" -- every screen root already has this
+ * style attached, so one call wallpapers every screen immediately. If the
+ * file is missing or fails to decode, LVGL simply draws nothing for the
+ * image layer -- whatever "screen" bg_color is already set (plain black by
+ * default) stays visible underneath, since bg_color and bg_image_src are
+ * independent style properties drawn back-to-front, not a fallback this
+ * function needs to implement itself. */
+void gui_plugin_set_background_image(const char * image_path) {
+    char resolved[600];
+    if (image_path[0] == '/') {
+        snprintf(resolved, sizeof(resolved), "%s", image_path);
+    } else {
+        snprintf(resolved, sizeof(resolved), "%s/.plugins/%s", MUSIC_ROOT_DIR, image_path);
+    }
+    char src[600];
+    snprintf(src, sizeof(src), "S:%s", resolved);
+
+    static char bg_image_src_storage[600];
+    snprintf(bg_image_src_storage, sizeof(bg_image_src_storage), "%s", src);
+    lv_style_set_bg_image_src(&style_theme_screen_bg, bg_image_src_storage);
+    lv_obj_report_style_change(&style_theme_screen_bg);
+}
+
 /* Same shape as gui_plugin_set_background_color() above, for text color --
  * see screen_builders.h's own comment on style_theme_text_primary/
  * style_theme_text_muted for scope (destructive-red and accent-tinted text
@@ -11774,6 +11810,14 @@ static lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) 
     } else {
         lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
         lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        /* Blank the row's own bg_image_src -- style_theme_screen_bg (just
+         * attached above) is the same shared style plugin.set_background_
+         * image() mutates for the whole-screen wallpaper; without this
+         * local override, this row would inherit and draw that wallpaper
+         * right on top of the plain LIST_ROW_BG_COLOR fill just set above,
+         * same root cause screen_builders.c's build_pill_list_screen() own
+         * plain-fill branch needs this exact same fix for. */
+        lv_obj_set_style_bg_image_src(row, NULL, 0);
     }
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(row, 0, 0);
@@ -15941,20 +15985,160 @@ static void playlists_tile_cb(lv_event_t * e) {
     nav_push(playlists_screen);
 }
 
-static lv_obj_t * build_music_screen(void) {
-    static icon_grid_item_t items[6];
-    items[0] = (icon_grid_item_t){ "category/explorer.png", "category/explorer_s.png", "Files", music_files_tile_cb, NULL };
-    items[1] = (icon_grid_item_t){ "category/artist.png", "category/artist_s.png", "Artists", artists_tile_cb, NULL };
-    items[2] = (icon_grid_item_t){ "category/album.png", "category/album_s.png", "Albums", albums_tile_cb, NULL };
-    items[3] = (icon_grid_item_t){ "category/album_artist.png", "category/album_artist_s.png", "Album Artist", album_artist_tile_cb, NULL };
-    items[4] = (icon_grid_item_t){ "category/all.png", "category/all_s.png", "All Songs", all_songs_tile_cb, NULL };
+/* ---- Shared "resolve styled items" helper for every top-level native
+ * screen sharing Home's own shape -- a small, fixed, string-keyed set of
+ * nav tiles/rows, reorderable/hideable/restyleable via
+ * plugin.set_screen_layout()/set_home_layout() (plugin_manager.c). Each
+ * such screen keeps its own small native-defs table (a `{key,
+ * icon_grid_item_t}` array -- icon_asset/icon_asset_selected left NULL for
+ * the pill-list-native screens, which never had icons to begin with) as
+ * gui.c's own source of truth for what a key looks like/does; plugin_
+ * manager.c only ever validates key strings against its own mirrored list.
+ * resolve_screen_items()/resolve_screen_list_items() below are the one
+ * shared implementation of "look up each plugin-selected key against this
+ * screen's own native defs, apply any per-item style override, build the
+ * final item array" -- Home is just another caller of these, not a
+ * separate original copy that everyone else's version was generalized
+ * from. Each screen's own chrome (title, back button, icon scale,
+ * label_inside_icon) stays hand-written and screen-specific -- these
+ * helpers only ever resolve the item list, never build the screen
+ * itself. ---- */
+typedef struct {
+    const char * key;
+    icon_grid_item_t item;
+} screen_native_def_t;
+
+static const icon_grid_item_t * screen_native_def_lookup(const screen_native_def_t * defs, int def_count,
+                                                           const char * key) {
+    for (int i = 0; i < def_count; i++) {
+        if (key && strcmp(defs[i].key, key) == 0) return &defs[i].item;
+    }
+    return NULL;
+}
+
+/* Resolves screen_id's item list against any plugin.set_screen_layout()/
+ * set_home_layout() override for it, applying per-item style overrides
+ * (bg_color/text_color/radius/bg_alpha) on top of the matching native def.
+ * plugin_manager_get_screen_item_count() returning 0 (no plugin targeted
+ * this screen_id, or none successfully) means "use the native default
+ * order/set" below, unchanged from every screen's original behavior --
+ * writes into out_items (caller-owned, at least def_count slots) and
+ * returns the resolved count. */
+static int resolve_screen_items(const char * screen_id, const screen_native_def_t * defs, int def_count,
+                                 icon_grid_item_t * out_items) {
+    int count = 0;
+    int plugin_count = plugin_manager_get_screen_item_count(screen_id);
+    for (int i = 0; i < plugin_count; i++) {
+        const icon_grid_item_t * def =
+            screen_native_def_lookup(defs, def_count, plugin_manager_get_screen_item_key(screen_id, i));
+        if (!def) continue;
+        out_items[count] = *def;
+
+        uint32_t rgb;
+        int32_t radius;
+        uint8_t alpha;
+        if (plugin_manager_get_screen_item_bg_color(screen_id, i, &rgb)) {
+            out_items[count].has_bg_color = true;
+            out_items[count].bg_color = rgb;
+        }
+        if (plugin_manager_get_screen_item_text_color(screen_id, i, &rgb)) {
+            out_items[count].has_text_color = true;
+            out_items[count].text_color = rgb;
+        }
+        if (plugin_manager_get_screen_item_radius(screen_id, i, &radius)) {
+            out_items[count].has_radius = true;
+            out_items[count].radius = radius;
+        }
+        if (plugin_manager_get_screen_item_bg_alpha(screen_id, i, &alpha)) {
+            out_items[count].has_bg_alpha = true;
+            out_items[count].bg_alpha = alpha;
+        }
+        count++;
+    }
+    if (count == 0) {
+        for (int i = 0; i < def_count; i++) out_items[count++] = defs[i].item;
+    }
+    return count;
+}
+
+/* Converts a resolved icon_grid_item_t[] (resolve_screen_items() above)
+ * into a pill_list_item_t[] for list mode, folding in the list-mode-only
+ * per-item extensions (row_height/row_width/text_align/accessory/icon) --
+ * shared by every icon-grid-native screen's own list-mode branch
+ * (home/music/wireless/stream_media) and by every pill-list-native screen
+ * (settings/books/dac), which is always in this shape. icon_asset here
+ * needs asset_path_plain() rather than asset_path(): these are
+ * theme2-relative paths ("launcher/music.png") for the icon-grid-native
+ * screens (NULL for the pill-list-native ones, which have no icon to
+ * begin with), but pill_list_item_t.icon_asset wants a raw absolute path
+ * (pill_row_apply_icon() adds its own "S:" prefix) -- asset_path() already
+ * returns an "S:"-prefixed string, which would double-prefix.
+ *
+ * icon = false (plugin_manager_get_screen_item_show_icon()) passes NULL
+ * instead of the resolved path -- pill_row_apply_icon() no-ops on a NULL
+ * icon_path, which also drops the PILL_ROW_ICON_PX_DEFAULT+12px label
+ * indent screen_builders.c's label_left always reserves for a non-NULL
+ * icon_asset, even under align="left". Without this, a "flush against the
+ * row's own 24px inset" list can't be built -- the indent is there
+ * unconditionally whenever icon_asset is set, regardless of whether the
+ * icon itself is visible. */
+static void resolve_screen_list_items(const char * screen_id, const icon_grid_item_t * items, int count,
+                                       pill_list_item_t * out_list_items) {
+    for (int i = 0; i < count; i++) {
+        int32_t row_height, row_width;
+        bool has_row_height = plugin_manager_get_screen_item_row_height(screen_id, i, &row_height);
+        bool has_row_width = plugin_manager_get_screen_item_row_width(screen_id, i, &row_width);
+        out_list_items[i] = (pill_list_item_t){
+            .label = items[i].label,
+            .accessory = plugin_manager_get_screen_item_accessory(screen_id, i) ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
+            .on_click = items[i].on_click,
+            .icon_asset = (items[i].icon_asset && plugin_manager_get_screen_item_show_icon(screen_id, i))
+                              ? asset_path_plain(items[i].icon_asset) : NULL,
+            .has_bg_color = items[i].has_bg_color,
+            .bg_color = items[i].bg_color,
+            .has_text_color = items[i].has_text_color,
+            .text_color = items[i].text_color,
+            .has_radius = items[i].has_radius,
+            .radius = items[i].radius,
+            .has_bg_alpha = items[i].has_bg_alpha,
+            .bg_alpha = items[i].bg_alpha,
+            .row_height = has_row_height ? row_height : 0,
+            .row_width = has_row_width ? row_width : 0,
+            .text_size = plugin_manager_get_screen_item_text_size(screen_id, i),
+            .text_align = plugin_manager_get_screen_item_text_align(screen_id, i),
+        };
+    }
+}
+
+static const screen_native_def_t music_tile_defs[] = {
+    { "files", { "category/explorer.png", "category/explorer_s.png", "Files", music_files_tile_cb, NULL } },
+    { "artists", { "category/artist.png", "category/artist_s.png", "Artists", artists_tile_cb, NULL } },
+    { "albums", { "category/album.png", "category/album_s.png", "Albums", albums_tile_cb, NULL } },
+    { "album_artist", { "category/album_artist.png", "category/album_artist_s.png", "Album Artist", album_artist_tile_cb, NULL } },
+    { "all_songs", { "category/all.png", "category/all_s.png", "All Songs", all_songs_tile_cb, NULL } },
     /* No dedicated "playlist" icon exists anywhere in the stock theme pack
      * (assets/theme2/category/ has album/album_artist/all/artist/explorer/
      * genre/item/net_radio and nothing else playlist-shaped) -- reusing
      * genre.png/genre_s.png here since Genres no longer has a tile of its
      * own to need it. */
-    items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
-    lv_obj_t * scr = build_icon_grid_screen("Music", generic_back_cb, items, 6, 100, false, 0);
+    { "playlists", { "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL } },
+};
+#define MUSIC_TILE_DEF_COUNT (int) (sizeof(music_tile_defs) / sizeof(music_tile_defs[0]))
+
+static lv_obj_t * build_music_screen(void) {
+    static icon_grid_item_t items[MUSIC_TILE_DEF_COUNT];
+    static pill_list_item_t list_items[MUSIC_TILE_DEF_COUNT];
+    int count = resolve_screen_items("music", music_tile_defs, MUSIC_TILE_DEF_COUNT, items);
+
+    lv_obj_t * scr;
+    if (plugin_manager_get_screen_list_mode("music")) {
+        resolve_screen_list_items("music", items, count, list_items);
+        scr = build_pill_list_screen("Music", generic_back_cb, list_items, count, NULL,
+                                      plugin_manager_get_screen_row_gap("music"));
+    } else {
+        scr = build_icon_grid_screen("Music", generic_back_cb, items, count, 100, false,
+                                      plugin_manager_get_screen_tile_gap("music"));
+    }
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -15989,11 +16173,17 @@ static void plugin_stream_tile_click_cb(lv_event_t * e) {
  * at 6 tiles, can't scroll), Stream Media has real room: 1 built-in +
  * PLUGIN_MAX_STREAM_TILES caps the total at 6, the same "fills exactly 3
  * rows" ceiling proven out for Home. */
-static lv_obj_t * build_stream_media_screen(void) {
-    static icon_grid_item_t items[1 + PLUGIN_MAX_STREAM_TILES];
-    items[0] = (icon_grid_item_t){ "stream_media/subsonic.png", "stream_media/subsonic_s.png", "Subsonic", subsonic_tile_cb, NULL };
+static const screen_native_def_t stream_media_tile_defs[] = {
+    { "subsonic", { "stream_media/subsonic.png", "stream_media/subsonic_s.png", "Subsonic", subsonic_tile_cb, NULL } },
+};
+#define STREAM_MEDIA_TILE_DEF_COUNT (int) (sizeof(stream_media_tile_defs) / sizeof(stream_media_tile_defs[0]))
 
-    int count = 1;
+static lv_obj_t * build_stream_media_screen(void) {
+    static icon_grid_item_t items[STREAM_MEDIA_TILE_DEF_COUNT + PLUGIN_MAX_STREAM_TILES];
+    static pill_list_item_t list_items[STREAM_MEDIA_TILE_DEF_COUNT + PLUGIN_MAX_STREAM_TILES];
+
+    int count = resolve_screen_items("stream_media", stream_media_tile_defs, STREAM_MEDIA_TILE_DEF_COUNT, items);
+
     int plugin_count = plugin_manager_get_stream_tile_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_STREAM_TILES; i++) {
         items[count++] = (icon_grid_item_t){
@@ -16002,7 +16192,15 @@ static lv_obj_t * build_stream_media_screen(void) {
         };
     }
 
-    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100, false, 0);
+    lv_obj_t * scr;
+    if (plugin_manager_get_screen_list_mode("stream_media")) {
+        resolve_screen_list_items("stream_media", items, count, list_items);
+        scr = build_pill_list_screen("Stream Media", generic_back_cb, list_items, count, NULL,
+                                      plugin_manager_get_screen_row_gap("stream_media"));
+    } else {
+        scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100, false,
+                                      plugin_manager_get_screen_tile_gap("stream_media"));
+    }
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -18594,6 +18792,11 @@ static lv_obj_t * build_remote_control_screen(void) {
     } else {
         lv_obj_set_style_radius(toggle_row, LIST_ROW_RADIUS, 0);
         lv_obj_set_style_bg_color(toggle_row, LIST_ROW_BG_COLOR, 0);
+        /* See add_pill_row_base()'s own comment on this same fix -- without
+         * it this row would inherit plugin.set_background_image()'s
+         * wallpaper from style_theme_screen_bg and draw it right on top of
+         * LIST_ROW_BG_COLOR. */
+        lv_obj_set_style_bg_image_src(toggle_row, NULL, 0);
     }
     lv_obj_set_style_bg_opa(toggle_row, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(toggle_row, 0, 0);
@@ -18692,12 +18895,11 @@ static void dlna_tile_cb(lv_event_t * e) {
     open_dlna_screen();
 }
 
-static lv_obj_t * build_wireless_screen(void) {
-    static icon_grid_item_t items[6];
-    items[0] = (icon_grid_item_t){ "wireless/wifi.png", "wireless/wifi_s.png", "Wi-Fi", wifi_tile_cb, NULL };
-    items[1] = (icon_grid_item_t){ "wireless/bt.png", "wireless/bt_s.png", "Bluetooth", bt_tile_cb, NULL };
-    items[2] = (icon_grid_item_t){ "wireless/airplay.png", "wireless/airplay_s.png", "AirPlay", airplay_tile_cb, NULL };
-    items[3] = (icon_grid_item_t){ "wireless/dlna.png", "wireless/dlna_s.png", "DLNA", dlna_tile_cb, NULL };
+static const screen_native_def_t wireless_tile_defs[] = {
+    { "wifi", { "wireless/wifi.png", "wireless/wifi_s.png", "Wi-Fi", wifi_tile_cb, NULL } },
+    { "bt", { "wireless/bt.png", "wireless/bt_s.png", "Bluetooth", bt_tile_cb, NULL } },
+    { "airplay", { "wireless/airplay.png", "wireless/airplay_s.png", "AirPlay", airplay_tile_cb, NULL } },
+    { "dlna", { "wireless/dlna.png", "wireless/dlna_s.png", "DLNA", dlna_tile_cb, NULL } },
     /* Relabeled from the stock "HiBy Link" -- this project doesn't implement
      * that proprietary protocol (see the remote-control design doc/plan for
      * why: only partially recoverable from firmware strings, and only useful
@@ -18709,16 +18911,32 @@ static lv_obj_t * build_wireless_screen(void) {
      * screens these tiles open keep their own full titles (build_remote_
      * control_screen()/Import via Wi-Fi's own title label) -- only the grid
      * caption is shortened. */
-    items[4] = (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "Remote", remote_control_tile_cb, NULL };
-    items[5] = (icon_grid_item_t){ "wireless/via.png", "wireless/via_s.png", "Import", import_wifi_tile_cb, NULL };
-    /* 160: bigger than the shared 100% default -- explicit user request.
-     * Bumped again from an earlier 120 once label_inside_icon (see
-     * build_icon_grid_screen()'s own comment) stopped reserving a separate
-     * below-icon label row, freeing up the room to grow the icon itself
-     * rather than just its surrounding whitespace -- lands at very close to
-     * these assets' own native 212x190 resolution within this screen's
-     * available cell height. */
-    lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6, 160, true, 0);
+    { "remote", { "wireless/hibylink.png", "wireless/hibylink_s.png", "Remote", remote_control_tile_cb, NULL } },
+    { "import", { "wireless/via.png", "wireless/via_s.png", "Import", import_wifi_tile_cb, NULL } },
+};
+#define WIRELESS_TILE_DEF_COUNT (int) (sizeof(wireless_tile_defs) / sizeof(wireless_tile_defs[0]))
+
+static lv_obj_t * build_wireless_screen(void) {
+    static icon_grid_item_t items[WIRELESS_TILE_DEF_COUNT];
+    static pill_list_item_t list_items[WIRELESS_TILE_DEF_COUNT];
+    int count = resolve_screen_items("wireless", wireless_tile_defs, WIRELESS_TILE_DEF_COUNT, items);
+
+    lv_obj_t * scr;
+    if (plugin_manager_get_screen_list_mode("wireless")) {
+        resolve_screen_list_items("wireless", items, count, list_items);
+        scr = build_pill_list_screen("Wireless", generic_back_cb, list_items, count, NULL,
+                                      plugin_manager_get_screen_row_gap("wireless"));
+    } else {
+        /* 160: bigger than the shared 100% default -- explicit user request.
+         * Bumped again from an earlier 120 once label_inside_icon (see
+         * build_icon_grid_screen()'s own comment) stopped reserving a
+         * separate below-icon label row, freeing up the room to grow the
+         * icon itself rather than just its surrounding whitespace -- lands
+         * at very close to these assets' own native 212x190 resolution
+         * within this screen's available cell height. */
+        scr = build_icon_grid_screen("Wireless", generic_back_cb, items, count, 160, true,
+                                      plugin_manager_get_screen_tile_gap("wireless"));
+    }
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -19048,12 +19266,19 @@ static void plugin_books_list_item_click_cb(lv_event_t * e) {
  * (screen_builders.h's own comment), so there's no reason every plugin
  * that wants a Books row can't have its own -- if none are installed, this
  * screen now just shows its 2 native rows, no dead placeholder toast. */
-static lv_obj_t * build_books_screen(void) {
-    static pill_list_item_t items[2 + PLUGIN_MAX_BOOKS_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "Books", PILL_ACCESSORY_CHEVRON, false, books_files_row_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Favorites", PILL_ACCESSORY_CHEVRON, false, books_favorites_row_cb, NULL, NULL };
+static const screen_native_def_t books_row_defs[] = {
+    { "books", { NULL, NULL, "Books", books_files_row_cb, NULL } },
+    { "favorites", { NULL, NULL, "Favorites", books_favorites_row_cb, NULL } },
+};
+#define BOOKS_ROW_DEF_COUNT (int) (sizeof(books_row_defs) / sizeof(books_row_defs[0]))
 
-    int count = 2;
+static lv_obj_t * build_books_screen(void) {
+    static icon_grid_item_t native_items[BOOKS_ROW_DEF_COUNT];
+    static pill_list_item_t items[BOOKS_ROW_DEF_COUNT + PLUGIN_MAX_BOOKS_LIST_ITEMS];
+
+    int count = resolve_screen_items("books", books_row_defs, BOOKS_ROW_DEF_COUNT, native_items);
+    resolve_screen_list_items("books", native_items, count, items);
+
     int plugin_count = plugin_manager_get_books_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_BOOKS_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -19066,7 +19291,8 @@ static lv_obj_t * build_books_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent,
+                                             plugin_manager_get_screen_row_gap("books"));
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20202,15 +20428,22 @@ static void plugin_settings_list_item_click_cb(lv_event_t * e) {
     plugin_manager_settings_list_item_clicked(index);
 }
 
-static lv_obj_t * build_settings_screen(void) {
-    static pill_list_item_t items[5 + PLUGIN_MAX_SETTINGS_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "Playback", PILL_ACCESSORY_CHEVRON, false, settings_category_playback_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Display", PILL_ACCESSORY_CHEVRON, false, settings_category_display_cb, NULL, NULL };
-    items[2] = (pill_list_item_t){ "Power", PILL_ACCESSORY_CHEVRON, false, settings_category_power_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "System", PILL_ACCESSORY_CHEVRON, false, settings_category_system_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "About", PILL_ACCESSORY_CHEVRON, false, settings_about_row_cb, NULL, NULL };
+static const screen_native_def_t settings_row_defs[] = {
+    { "playback", { NULL, NULL, "Playback", settings_category_playback_cb, NULL } },
+    { "display", { NULL, NULL, "Display", settings_category_display_cb, NULL } },
+    { "power", { NULL, NULL, "Power", settings_category_power_cb, NULL } },
+    { "system", { NULL, NULL, "System", settings_category_system_cb, NULL } },
+    { "about", { NULL, NULL, "About", settings_about_row_cb, NULL } },
+};
+#define SETTINGS_ROW_DEF_COUNT (int) (sizeof(settings_row_defs) / sizeof(settings_row_defs[0]))
 
-    int count = 5;
+static lv_obj_t * build_settings_screen(void) {
+    static icon_grid_item_t native_items[SETTINGS_ROW_DEF_COUNT];
+    static pill_list_item_t items[SETTINGS_ROW_DEF_COUNT + PLUGIN_MAX_SETTINGS_LIST_ITEMS];
+
+    int count = resolve_screen_items("settings", settings_row_defs, SETTINGS_ROW_DEF_COUNT, native_items);
+    resolve_screen_list_items("settings", native_items, count, items);
+
     int plugin_count = plugin_manager_get_settings_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SETTINGS_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -20223,7 +20456,8 @@ static lv_obj_t * build_settings_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent,
+                                             plugin_manager_get_screen_row_gap("settings"));
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20291,11 +20525,21 @@ static void dac_home_usb_row_cb(lv_event_t * e) {
     start_usb_mode_switch(USB_MODE_DAC);
 }
 
+static const screen_native_def_t dac_row_defs[] = {
+    { "usb_dac", { NULL, NULL, "USB DAC", dac_home_usb_row_cb, NULL } },
+    { "bluetooth_dac", { NULL, NULL, "Bluetooth DAC", bt_dac_settings_row_cb, NULL } },
+};
+#define DAC_ROW_DEF_COUNT (int) (sizeof(dac_row_defs) / sizeof(dac_row_defs[0]))
+
 static lv_obj_t * build_dac_home_screen(void) {
-    static pill_list_item_t items[2];
-    items[0] = (pill_list_item_t){ "USB DAC", PILL_ACCESSORY_CHEVRON, false, dac_home_usb_row_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Bluetooth DAC", PILL_ACCESSORY_CHEVRON, false, bt_dac_settings_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, &style_accent, 6);
+    static icon_grid_item_t native_items[DAC_ROW_DEF_COUNT];
+    static pill_list_item_t items[DAC_ROW_DEF_COUNT];
+
+    int count = resolve_screen_items("dac", dac_row_defs, DAC_ROW_DEF_COUNT, native_items);
+    resolve_screen_list_items("dac", native_items, count, items);
+
+    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, count, &style_accent,
+                                             plugin_manager_get_screen_row_gap("dac"));
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20306,15 +20550,11 @@ static void dac_home_tile_cb(lv_event_t * e) {
 }
 
 /* The 6 native Home tiles, keyed by the same strings plugin.set_home_
- * layout() takes -- gui.c's own single source of truth for "what a given
- * key looks like/does", so plugin_manager.c never needs to know these
- * icon paths or callbacks itself, only the key strings a plugin passed. */
-typedef struct {
-    const char * key;
-    icon_grid_item_t item;
-} home_tile_def_t;
-
-static const home_tile_def_t home_tile_defs[] = {
+ * layout()/set_screen_layout("home", ...) take -- gui.c's own single
+ * source of truth for "what a given key looks like/does", so plugin_
+ * manager.c never needs to know these icon paths or callbacks itself, only
+ * the key strings a plugin passed. */
+static const screen_native_def_t home_tile_defs[] = {
     { "music", { "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb, NULL } },
     { "stream_media", { "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb, NULL } },
     { "wireless", { "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb, NULL } },
@@ -20324,116 +20564,39 @@ static const home_tile_def_t home_tile_defs[] = {
 };
 #define HOME_TILE_DEF_COUNT (int) (sizeof(home_tile_defs) / sizeof(home_tile_defs[0]))
 
-static const icon_grid_item_t * home_tile_def_lookup(const char * key) {
-    for (int i = 0; i < HOME_TILE_DEF_COUNT; i++) {
-        if (strcmp(home_tile_defs[i].key, key) == 0) return &home_tile_defs[i].item;
-    }
-    return NULL;
-}
-
 static lv_obj_t * build_home_screen(void) {
     static icon_grid_item_t items[HOME_TILE_DEF_COUNT];
     static pill_list_item_t list_items[HOME_TILE_DEF_COUNT];
-    int count = 0;
 
-    /* plugin.set_home_layout() reorders/hides these same 6 tiles, and may
-     * carry per-tile style overrides (background/text color, corner
-     * radius) -- see its own doc comment in plugin_manager.c.
-     * plugin_manager_get_home_tile_count() returning 0 (no plugin called
-     * it, or none successfully) means "use the native default order/set
-     * of all 6" below, unchanged from this screen's original behavior --
-     * note the per-tile override getters below are only ever meaningful
-     * against a plugin-supplied index, so the native-default fallback
-     * loop just below never calls them. */
-    int plugin_count = plugin_manager_get_home_tile_count();
-    for (int i = 0; i < plugin_count; i++) {
-        const icon_grid_item_t * def = home_tile_def_lookup(plugin_manager_get_home_tile_key(i));
-        if (!def) continue;
-        items[count] = *def;
-
-        uint32_t rgb;
-        int32_t radius;
-        if (plugin_manager_get_home_tile_bg_color(i, &rgb)) {
-            items[count].has_bg_color = true;
-            items[count].bg_color = rgb;
-        }
-        if (plugin_manager_get_home_tile_text_color(i, &rgb)) {
-            items[count].has_text_color = true;
-            items[count].text_color = rgb;
-        }
-        if (plugin_manager_get_home_tile_radius(i, &radius)) {
-            items[count].has_radius = true;
-            items[count].radius = radius;
-        }
-        count++;
-    }
-    if (count == 0) {
-        for (int i = 0; i < HOME_TILE_DEF_COUNT; i++) items[count++] = home_tile_defs[i].item;
-    }
+    /* plugin.set_home_layout()/set_screen_layout("home", ...) reorders/
+     * hides these same 6 tiles, and may carry per-tile style overrides
+     * (background/text color, corner radius, background alpha) -- see
+     * do_set_screen_layout()'s own doc comment in plugin_manager.c.
+     * resolve_screen_items() falling back to every native tile (today's
+     * exact default order) when no plugin call targeted "home" is the same
+     * behavior this screen always had, just shared with 6 more screens
+     * now. */
+    int count = resolve_screen_items("home", home_tile_defs, HOME_TILE_DEF_COUNT, items);
 
     lv_obj_t * scr;
-    if (plugin_manager_get_home_tile_list_mode()) {
-        /* List mode (plugin.set_home_layout()'s { mode = "list" }): same
-         * tiles/callbacks/style overrides as tile mode above, rendered as
-         * a plain vertical list (build_pill_list_screen()) instead of the
-         * icon grid -- icon_grid_item_t.on_click and pill_list_item_t.
-         * on_click are both plain lv_event_cb_t, so the same tile
-         * callback works unmodified in either builder. icon_asset here
-         * needs asset_path_plain() rather than asset_path(): these are
-         * theme2-relative paths ("launcher/music.png"), but pill_list_
-         * item_t.icon_asset wants a raw absolute path (pill_row_apply_
-         * icon() adds its own "S:" prefix) -- asset_path() already
-         * returns an "S:"-prefixed string, which would double-prefix.
-         * back_btn_cb NULL / title "Home": Home is still the true
-         * navigation root either way (build_pill_list_screen() already
-         * documents NULL back_btn_cb as exactly this "Home launcher"
-         * case), just with a real title band since, unlike the icon grid,
-         * this builder always reserves one.
-         *
-         * row_height/row_width/text_size/text_align/accessory/icon are
-         * list-mode-only per-tile extensions (PLUGINS.md) -- tile mode has
-         * no equivalent (fixed grid math, centered label, no chevron/gap/
-         * icon-suppression concept), so home_tile_def_lookup()'s own
-         * icon_grid_item_t is never touched by any of these. row_gap is the
-         * list-wide equivalent, passed straight to build_pill_list_screen();
-         * every other caller of that function still passes the literal 6 it
-         * always has.
-         *
-         * icon = false (plugin_manager_get_home_tile_show_icon()) passes
-         * NULL instead of the resolved path -- pill_row_apply_icon() no-ops
-         * on a NULL icon_path, which also drops the PILL_ROW_ICON_PX_DEFAULT
-         * +12px label indent screen_builders.c's label_left always reserves
-         * for a non-NULL icon_asset, even under align="left". Without this,
-         * a "flush against the row's own 24px inset" list can't be built --
-         * the indent is there unconditionally whenever icon_asset is set,
-         * regardless of whether the icon itself is visible. */
-        for (int i = 0; i < count; i++) {
-            int32_t row_height, row_width;
-            bool has_row_height = plugin_manager_get_home_tile_row_height(i, &row_height);
-            bool has_row_width = plugin_manager_get_home_tile_row_width(i, &row_width);
-            list_items[i] = (pill_list_item_t){
-                .label = items[i].label,
-                .accessory = plugin_manager_get_home_tile_accessory(i) ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
-                .on_click = items[i].on_click,
-                .icon_asset = plugin_manager_get_home_tile_show_icon(i) ? asset_path_plain(items[i].icon_asset) : NULL,
-                .has_bg_color = items[i].has_bg_color,
-                .bg_color = items[i].bg_color,
-                .has_text_color = items[i].has_text_color,
-                .text_color = items[i].text_color,
-                .has_radius = items[i].has_radius,
-                .radius = items[i].radius,
-                .row_height = has_row_height ? row_height : 0,
-                .row_width = has_row_width ? row_width : 0,
-                .text_size = plugin_manager_get_home_tile_text_size(i),
-                .text_align = plugin_manager_get_home_tile_text_align(i),
-            };
-        }
-        scr = build_pill_list_screen("Home", NULL, list_items, count, NULL, plugin_manager_get_home_row_gap());
+    if (plugin_manager_get_screen_list_mode("home")) {
+        /* List mode ({ mode = "list" }): same tiles/callbacks/style
+         * overrides as tile mode below, rendered as a plain vertical list
+         * (build_pill_list_screen()) instead of the icon grid --
+         * resolve_screen_list_items() (shared by every icon-grid-native and
+         * pill-list-native screen alike) does the actual conversion. NULL
+         * back_btn_cb / title "Home": Home is still the true navigation
+         * root either way (build_pill_list_screen() already documents NULL
+         * back_btn_cb as exactly this "Home launcher" case), just with a
+         * real title band since, unlike the icon grid, this builder always
+         * reserves one. */
+        resolve_screen_list_items("home", items, count, list_items);
+        scr = build_pill_list_screen("Home", NULL, list_items, count, NULL, plugin_manager_get_screen_row_gap("home"));
     } else {
         /* No back_btn_cb -- this is the true root, nothing to go back to. No
          * title either -- matches the real stock launcher, which has no header
          * text above its icon grid. */
-        scr = build_icon_grid_screen(NULL, NULL, items, count, 100, false, plugin_manager_get_home_tile_gap());
+        scr = build_icon_grid_screen(NULL, NULL, items, count, 100, false, plugin_manager_get_screen_tile_gap("home"));
     }
     finalize_screen_navigation(scr);
     return scr;

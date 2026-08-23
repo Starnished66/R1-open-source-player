@@ -252,54 +252,71 @@ const char * plugin_manager_get_stream_tile_icon(int index);
 const char * plugin_manager_get_stream_tile_icon_selected(int index);
 void plugin_manager_stream_tile_clicked(int index);
 
-/* Backing plugin.set_home_layout() -- gui.c's build_home_screen() reads
- * these to decide the order/subset of its 6 native tiles to show. 0 from
- * the count means no plugin called set_home_layout(), i.e. "use the
- * native default order/set of all 6" -- see build_home_screen()'s own
- * comment for the full key list ("music"/"stream_media"/"wireless"/
- * "books"/"system"/"dac"). */
-int plugin_manager_get_home_tile_count(void);
-const char * plugin_manager_get_home_tile_key(int index);
+/* Backing plugin.set_screen_layout(screen_id, ...) and (as pure sugar,
+ * screen_id pinned to "home") plugin.set_home_layout() -- every top-level
+ * native screen sharing Home's own shape (a small, fixed, string-keyed set
+ * of nav tiles/rows) reads these through the same generic family, keyed by
+ * its own screen_id ("home"/"music"/"wireless"/"stream_media"/"settings"/
+ * "books"/"dac"). 0 from the count means no plugin called set_screen_layout()
+ * for that screen_id, i.e. "use the native default order/set" -- see
+ * gui.c's own per-screen native-defs tables for each screen_id's full key
+ * list. An unknown screen_id (or one this file's own plugin_screen_defs[]
+ * doesn't know) is treated the same as "0 items" by every accessor below,
+ * never a crash. */
+int plugin_manager_get_screen_item_count(const char * screen_id);
+const char * plugin_manager_get_screen_item_key(const char * screen_id, int index);
 
-/* true = show Home as a plain vertical list (build_pill_list_screen())
- * instead of the icon grid (build_icon_grid_screen()) -- set_home_layout()'s
- * optional `{ mode = "list" }`. Defaults to false (today's icon grid). */
-bool plugin_manager_get_home_tile_list_mode(void);
+/* true = show this screen as a plain vertical list (build_pill_list_screen())
+ * instead of the icon grid (build_icon_grid_screen()) -- set_screen_layout()'s/
+ * set_home_layout()'s optional `{ mode = "list" }`. Only meaningful for the
+ * icon-grid-native screens (home/music/wireless/stream_media); always true
+ * for the pill-list-native ones (settings/books/dac), which have no tile
+ * grid to switch to. Defaults to false (today's icon grid) where relevant. */
+bool plugin_manager_get_screen_list_mode(const char * screen_id);
 
-/* Per-tile style overrides from set_home_layout()'s optional per-tile
- * config table ({ key = "...", bg_color = 0xRRGGBB, text_color = 0xRRGGBB,
- * radius = n }, PLUGINS.md) -- each returns false (leaving *out untouched)
- * if tile `index` has no override for that property, matching every other
- * "false means nothing to apply" accessor in this file. */
-bool plugin_manager_get_home_tile_bg_color(int index, uint32_t * out_rgb);
-bool plugin_manager_get_home_tile_text_color(int index, uint32_t * out_rgb);
-bool plugin_manager_get_home_tile_radius(int index, int32_t * out_radius);
+/* Per-item style overrides from set_screen_layout()'s/set_home_layout()'s
+ * optional per-item config table ({ key = "...", bg_color = 0xRRGGBB,
+ * text_color = 0xRRGGBB, radius = n, bg_alpha = n }, PLUGINS.md) -- each
+ * returns false (leaving *out untouched) if item `index` on screen_id has
+ * no override for that property, matching every other "false means nothing
+ * to apply" accessor in this file. bg_alpha (0-255, lv_opa_t scale) lets a
+ * tile/row go semi-transparent over plugin.set_background_image()'s
+ * whole-screen wallpaper. */
+bool plugin_manager_get_screen_item_bg_color(const char * screen_id, int index, uint32_t * out_rgb);
+bool plugin_manager_get_screen_item_text_color(const char * screen_id, int index, uint32_t * out_rgb);
+bool plugin_manager_get_screen_item_radius(const char * screen_id, int index, int32_t * out_radius);
+bool plugin_manager_get_screen_item_bg_alpha(const char * screen_id, int index, uint8_t * out_alpha);
 
-/* List-mode-only per-tile extensions (set_home_layout()'s per-tile config
- * table gains `height`, `width`, `align`, `accessory`, `text_size`,
- * PLUGINS.md) -- meaningless in tile mode, so build_home_screen() only
- * reads these once plugin_manager_get_home_tile_list_mode() is true. Same
- * "false/NULL means nothing to apply, caller keeps its own default" shape
- * as the three accessors above, except plugin_manager_get_home_tile_
- * accessory() (no natural "unset" value -- defaults true, matching
- * today's always-shown chevron). */
-bool plugin_manager_get_home_tile_row_height(int index, int32_t * out_height);
-bool plugin_manager_get_home_tile_row_width(int index, int32_t * out_width);
-const char * plugin_manager_get_home_tile_text_align(int index); /* NULL/"left" default */
-bool plugin_manager_get_home_tile_accessory(int index);          /* true = chevron shown */
-const char * plugin_manager_get_home_tile_text_size(int index);  /* NULL = native default */
-bool plugin_manager_get_home_tile_show_icon(int index);          /* true = launcher icon shown
-                                                                    * (and its label indent reserved) */
+/* List-mode-only per-item extensions (set_screen_layout()'s/set_home_
+ * layout()'s per-item config table gains `height`, `width`, `align`,
+ * `accessory`, `text_size`, `icon`, PLUGINS.md) -- meaningless in tile
+ * mode, so an icon-grid-native screen only reads these once
+ * plugin_manager_get_screen_list_mode() is true for it; a pill-list-native
+ * screen (settings/books/dac) always reads them, since it's always in list
+ * shape. Same "false/NULL means nothing to apply, caller keeps its own
+ * default" shape as the four accessors above, except plugin_manager_get_
+ * screen_item_accessory()/_show_icon() (no natural "unset" value -- both
+ * default true, matching today's always-shown chevron/icon). */
+bool plugin_manager_get_screen_item_row_height(const char * screen_id, int index, int32_t * out_height);
+bool plugin_manager_get_screen_item_row_width(const char * screen_id, int index, int32_t * out_width);
+const char * plugin_manager_get_screen_item_text_align(const char * screen_id, int index); /* NULL/"left" default */
+bool plugin_manager_get_screen_item_accessory(const char * screen_id, int index);          /* true = chevron shown */
+const char * plugin_manager_get_screen_item_text_size(const char * screen_id, int index);  /* NULL = native default */
+bool plugin_manager_get_screen_item_show_icon(const char * screen_id, int index);          /* true = launcher icon shown
+                                                                                              * (and its label indent reserved) */
 
-/* options.row_gap (list mode only) -- vertical px between rows. Defaults to
- * 6, build_pill_list_screen()'s own pre-existing hardcoded value, so a
- * plugin that never sets this changes nothing. */
-int32_t plugin_manager_get_home_row_gap(void);
+/* options.row_gap -- vertical px between rows. Defaults to 6,
+ * build_pill_list_screen()'s own pre-existing hardcoded value, so a plugin
+ * that never sets this changes nothing. Applies whenever screen_id ends up
+ * rendered as a list -- always for the pill-list-native screens, only in
+ * `{ mode = "list" }` for the icon-grid-native ones. */
+int32_t plugin_manager_get_screen_row_gap(const char * screen_id);
 
 /* options.tile_gap (tile mode only) -- px of visible space between adjacent
  * tiles. Defaults to 0, build_icon_grid_screen()'s own pre-existing
- * flush-cell look, so a plugin that never sets this changes nothing. */
-int32_t plugin_manager_get_home_tile_gap(void);
+ * flush-cell look, so a plugin that never sets this changes nothing.
+ * Meaningless (silently unused) for the pill-list-native screens. */
+int32_t plugin_manager_get_screen_tile_gap(const char * screen_id);
 
 /* Invoked by gui.c's plugin-settings-list row widgets (see
  * gui_plugin_show_settings_list()) when a "row"-type row in pool slot `slot`

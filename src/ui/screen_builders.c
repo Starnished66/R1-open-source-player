@@ -383,7 +383,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
          * config) -- every native tile leaves these unset, so this changes
          * nothing about today's transparent-background tiles. */
         if (item->has_bg_color) {
-            lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_opa(tile, item->has_bg_alpha ? item->bg_alpha : LV_OPA_COVER, 0);
             lv_obj_set_style_bg_color(tile, lv_color_hex(item->bg_color), 0);
         }
         if (item->has_radius) lv_obj_set_style_radius(tile, item->radius, 0);
@@ -776,10 +776,31 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         if (resized) {
             lv_obj_set_style_radius(row, item->has_radius ? item->radius : LIST_ROW_RADIUS, 0);
             lv_obj_set_style_bg_color(row, item->has_bg_color ? lv_color_hex(item->bg_color) : LIST_ROW_BG_COLOR, 0);
+            /* Explicitly blank the row's own bg_image_src -- style_theme_
+             * screen_bg (just attached above, for its bg_color) is the same
+             * shared style plugin.set_background_image() mutates to carry
+             * the whole-screen wallpaper; without this, a resized/recolored
+             * row has no LOCAL bg_image_src override of its own, so it
+             * would inherit and draw that wallpaper -- at full bg_image_opa
+             * -- right on top of the plain-fill color this branch just set,
+             * completely hiding it (confirmed via a real run: every pill
+             * row on host, even a totally native one, takes this "resized"
+             * branch, since ui_list_row_width() essentially never returns
+             * exactly 448 at any real panel width). NULL here makes
+             * lv_obj_get_style_bg_image_src() find this local override
+             * first and stop there, the same "local always wins" precedent
+             * every other per-row override in this function already relies
+             * on -- see this row's own has_bg_color comment above for why a
+             * raster sprite can't take this path instead. */
+            lv_obj_set_style_bg_image_src(row, NULL, 0);
         } else {
             lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
         }
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        /* bg_alpha only applies on the plain-fill path above -- the PNG
+         * pill sprite (item_bg.png) is a raster asset with its own baked-in
+         * opacity, and bg_opa=COVER is required just to let it draw at all
+         * (see this row's own has_bg_color comment above). */
+        lv_obj_set_style_bg_opa(row, (resized && item->has_bg_alpha) ? item->bg_alpha : LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 

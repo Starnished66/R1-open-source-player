@@ -23,6 +23,11 @@ plugin.define({ id = "example.home_themes", name = "Home Themes", version = "1.0
 -- theme here applies its colors immediately but only *fully* takes effect
 -- (Home's own layout included) after a restart -- same "persisted choice,
 -- re-applied on boot" pattern plugins_examples/Themes.lua already uses.
+--
+-- The 3 gradient presets (Wavy, Mountain Sunset, Vaporwave) build their
+-- per-tile colors via gradient_colors() below, which calls
+-- plugin.lerp_color() across the 6 tiles from just two endpoint colors
+-- each, rather than hand-picking every stop's own hex value.
 
 local STATE_PATH = plugin.sd_root() .. "/.plugins/.home_theme_state"
 local KEYS = { "music", "stream_media", "wireless", "books", "system", "dac" }
@@ -53,6 +58,35 @@ local function tiles(colors, style)
         table.insert(t, row)
     end
     return t
+end
+
+-- Builds a per-key colors table (the shape tiles() above expects) by
+-- plugin.lerp_color()-ing between two bg/text endpoint pairs across the 6
+-- keys in order -- Wavy/Vaporwave below use this instead of hand-picking
+-- every stop's own hex value.
+local function gradient_colors(bg_from, bg_to, text_from, text_to)
+    local colors = {}
+    for i, key in ipairs(KEYS) do
+        local t = (i - 1) / (#KEYS - 1)
+        colors[key] = { plugin.lerp_color(bg_from, bg_to, t), plugin.lerp_color(text_from, text_to, t) }
+    end
+    return colors
+end
+
+-- Same bg_color gradient as gradient_colors() above, but text_color stays a
+-- flat two-tone switch (dark on the first half's brighter stops, light on
+-- the second half's darker ones) instead of also being lerped -- a smoothly
+-- interpolated text color crossing the same mid-tones as the background
+-- loses contrast right where it matters most (confirmed visually: Mountain
+-- Sunset's middle two tiles below became nearly unreadable once text was
+-- lerped too). Mountain Sunset uses this instead of gradient_colors().
+local function gradient_bg_only(bg_from, bg_to, text_dark, text_light)
+    local colors = {}
+    for i, key in ipairs(KEYS) do
+        local t = (i - 1) / (#KEYS - 1)
+        colors[key] = { plugin.lerp_color(bg_from, bg_to, t), i <= #KEYS / 2 and text_dark or text_light }
+    end
+    return colors
 end
 
 local THEMES = {}
@@ -119,11 +153,8 @@ THEMES.wavy = {
     card = 0x0a2540,
     list_row = 0x0d3050,
     muted = 0x5a92a8,
-    tiles = tiles({
-        music = { 0x0a2540, 0xa8dadc }, stream_media = { 0x0d3050, 0x9fd8dc },
-        wireless = { 0x11406a, 0x97d5dc }, books = { 0x155085, 0x8fd2dc },
-        system = { 0x1a63a0, 0x87cfdc }, dac = { 0x1f78bf, 0x7fccdc },
-    }, { radius = 40, height = 88, width = 430, align = "right", accessory = false, text_size = "medium", icon = false }),
+    tiles = tiles(gradient_colors(0x0a2540, 0x1f78bf, 0xa8dadc, 0x7fccdc),
+        { radius = 40, height = 88, width = 430, align = "right", accessory = false, text_size = "medium", icon = false }),
     options = { mode = "list", row_gap = 8 },
 }
 
@@ -171,11 +202,8 @@ THEMES.mountain_sunset = {
     card = 0x241a3a,
     list_row = 0x2e2050,
     muted = 0x9a86c0,
-    tiles = tiles({
-        music = { 0xff9d5c, 0x3a1a2e }, stream_media = { 0xf07858, 0x3a1a2e },
-        wireless = { 0xc9587c, 0xffe8d6 }, books = { 0x93508f, 0xffe8d6 },
-        system = { 0x5f4a9f, 0xffe8d6 }, dac = { 0x33397f, 0xffe8d6 },
-    }, { radius = 36, height = 90, width = 420, align = "center", accessory = false, text_size = "large", icon = false }),
+    tiles = tiles(gradient_bg_only(0xff9d5c, 0x33397f, 0x3a1a2e, 0xffe8d6),
+        { radius = 36, height = 90, width = 420, align = "center", accessory = false, text_size = "large", icon = false }),
     options = { mode = "list", row_gap = 12 },
 }
 
@@ -223,11 +251,7 @@ THEMES.vaporwave = {
     card = 0x2a1250,
     list_row = 0x351a5f,
     muted = 0xb583c9,
-    tiles = tiles({
-        music = { 0x3a1c71, 0xffd1f7 }, stream_media = { 0x6a2c8f, 0xffc2ec },
-        wireless = { 0x9b3aa0, 0xffe0f5 }, books = { 0xc23f9e, 0xfff0ff },
-        system = { 0xe14f95, 0xfff5fb }, dac = { 0xff6f9c, 0xffffff },
-    }, { radius = 26 }),
+    tiles = tiles(gradient_colors(0x3a1c71, 0xff6f9c, 0xffd1f7, 0xffffff), { radius = 26 }),
     options = { tile_gap = 12 },
 }
 

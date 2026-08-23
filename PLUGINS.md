@@ -158,7 +158,7 @@ from the moment your script starts running (injected before
 |---|---|
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info` |
 | UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
-| Theme | `set_icon`, `set_background_color`, `set_text_color` , `set_home_layout` |
+| Theme | `set_icon`, `set_background_color`, `set_text_color`, `set_background_image`, `set_home_layout`, `set_screen_layout`, `lerp_color` |
 | Files | `sd_root`, `list_dir`, `mkdir` |
 | Playback | `play_file`, `play_list`, transport controls, playback state |
 | Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
@@ -281,7 +281,10 @@ roughly the same aspect ratio as what they're replacing.
 
 Reorders and/or hides Home's 6 native tiles, optionally as a plain
 vertical list instead of the icon grid, with optional per-tile background
-color/text color/corner radius overrides.
+color/text color/corner radius/background alpha overrides. This is sugar
+for `plugin.set_screen_layout("home", tile_keys, options)` below -- Home
+is just one of 7 screens that mechanism reaches, kept as its own
+shorthand since it's the one every existing plugin already calls.
 
 `tile_keys` is an array of any subset of `"music"`, `"stream_media"`,
 `"wireless"`, `"books"`, `"system"`, `"dac"`, in the order they should
@@ -293,13 +296,16 @@ get its own tile), so this only reorders/hides/restyles the existing 6, it
 doesn't add new ones.
 
 Each entry in `tile_keys` is either a plain string, or a table `{ key =
-"...", bg_color = 0xRRGGBB, text_color = 0xRRGGBB, radius = n, ... }` to
-also style that one tile -- the same "string, or a table for the rows
-that need more" shape `register_list_item()`'s/`show_list()`'s own
-`items` arrays already use. `bg_color`/`text_color`/`radius` work in
-either mode; `radius` (corner radius, in px) is clamped to `0..64`. Any
-property left out of a table entry (or every entry left a plain string)
-keeps that tile's default appearance.
+"...", bg_color = 0xRRGGBB, text_color = 0xRRGGBB, radius = n, bg_alpha =
+n, ... }` to also style that one tile -- the same "string, or a table for
+the rows that need more" shape `register_list_item()`'s/`show_list()`'s
+own `items` arrays already use. `bg_color`/`text_color`/`radius`/
+`bg_alpha` work in either mode; `radius` (corner radius, in px) is clamped
+to `0..64`, `bg_alpha` (background opacity, `0`-`255`, matching LVGL's own
+scale -- `255` is today's fully-opaque default) lets a tile go
+semi-transparent over `plugin.set_background_image()`'s wallpaper below.
+Any property left out of a table entry (or every entry left a plain
+string) keeps that tile's default appearance.
 
 `options.mode` is `"tile"` (default, the icon grid) or `"list"` (a plain
 vertical list, each tile becoming a row with its icon and a chevron).
@@ -389,6 +395,52 @@ background, every list row, every card/popup, and both text tiers --
 not just Home. Screenshots of all 11 are in
 `plugins_examples/screenshots/home_themes/`.
 
+### `plugin.set_screen_layout(screen_id, item_keys [, options])`
+
+The same reorder/hide/restyle mechanism `set_home_layout()` gives Home,
+generalized to every other top-level native screen with the same shape --
+a small, fixed, string-keyed set of nav tiles/rows. `item_keys` and
+`options` are exactly `set_home_layout()`'s own `tile_keys`/`options`
+(same per-item `bg_color`/`text_color`/`radius`/`bg_alpha` table shape,
+same `options.mode`/`row_gap`/`tile_gap`), just parameterized by which
+screen to target:
+
+| `screen_id` | Shape | Native item keys |
+|---|---|---|
+| `"home"` | icon grid or list | `"music"`, `"stream_media"`, `"wireless"`, `"books"`, `"system"`, `"dac"` |
+| `"music"` | icon grid or list | `"files"`, `"artists"`, `"albums"`, `"album_artist"`, `"all_songs"`, `"playlists"` |
+| `"wireless"` | icon grid or list | `"wifi"`, `"bt"`, `"airplay"`, `"dlna"`, `"remote"`, `"import"` |
+| `"stream_media"` | icon grid or list | `"subsonic"` (the only native tile -- any `plugin.register_stream_media_tile()` tiles append after it, untouched by this) |
+| `"settings"` | list only | `"playback"`, `"display"`, `"power"`, `"system"`, `"about"` (plugin rows from `register_list_item("settings", ...)` append after) |
+| `"books"` | list only | `"books"`, `"favorites"` (plugin rows from `register_list_item("books", ...)` append after) |
+| `"dac"` | list only | `"usb_dac"`, `"bluetooth_dac"` |
+
+`"settings"`, `"books"`, and `"dac"` are already a plain row list natively
+(no icon-grid equivalent) -- `options.mode` is silently ignored for these
+three, and they're always in the list-mode shape, so every list-mode-only
+per-item property (`height`/`width`/`align`/`accessory`/`text_size`/`icon`)
+applies to them too, not just to `{ mode = "list" }` on the other four.
+
+```lua
+-- Reorder + restyle Music's tiles, semi-transparent over a wallpaper
+plugin.set_screen_layout("music", {
+    { key = "all_songs", bg_color = 0x104020, bg_alpha = 160, text_color = 0x66ffaa },
+    "artists",
+    "albums",
+})
+
+-- Settings is list-only -- no options.mode needed
+plugin.set_screen_layout("settings", {
+    { key = "about", bg_color = 0x2a1a4e, text_color = 0xffcc00 },
+    "system",
+})
+```
+
+Same load-time-only, last-call-wins-per-`screen_id`, "never zero items"
+error behavior as `set_home_layout()` above -- an unknown `screen_id` or
+an unknown/duplicate item key for that screen both raise a Lua error
+rather than silently doing nothing.
+
 ### `plugin.set_background_color(slot, rgb)`
 
 Sets one of three background-color slots, live, app-wide, no restart
@@ -424,6 +476,51 @@ drive. `rgb` is a packed `0xRRGGBB` integer, same convention as
 mechanism as `set_background_color()` -- no file/cache involved.
 
 Raises a Lua error if `slot` isn't `"primary"` or `"muted"`.
+
+### `plugin.set_background_image(image_path)`
+
+Sets a whole-screen wallpaper, live, app-wide, no restart needed -- every
+screen shows it behind its own content, not just Home. Mutates the same
+shared style `set_background_color("screen", ...)` uses, so the two
+compose naturally: the wallpaper draws over that color, and a missing or
+corrupt `image_path` just falls back to whatever `"screen"` color is set,
+no error.
+
+`image_path` follows the same convention every other plugin-supplied-file
+option uses (`register_list_item()`'s own `icon`, for instance): a raw
+absolute path, or one relative to the SD card's `.plugins/` folder (the
+same folder your own `.lua` file lives in).
+
+For a tile/row to show the wallpaper through instead of fully covering
+it, give it `bg_alpha` (see `set_home_layout()`/`set_screen_layout()`
+above) below `255`.
+
+```lua
+plugin.set_background_image("wallpaper.jpg")
+plugin.set_home_layout({
+    { key = "music", bg_color = 0x1c2a36, bg_alpha = 200 },
+    "system",
+}, { mode = "list" })
+```
+
+### `plugin.lerp_color(from, to, t)`
+
+Linearly interpolates each RGB channel independently between two packed
+`0xRRGGBB` colors, `from` and `to`, at `t` (a float, `0.0`-`1.0`, clamped
+into range). Returns a packed `0xRRGGBB` integer. Pure math, no UI effect
+by itself -- use it to build an N-stop gradient across a screen's tiles
+from just two endpoint colors instead of hand-picking every stop's own hex
+value:
+
+```lua
+local keys = { "music", "stream_media", "wireless", "books", "system", "dac" }
+local layout = {}
+for i, key in ipairs(keys) do
+    local t = (i - 1) / (#keys - 1)
+    layout[i] = { key = key, bg_color = plugin.lerp_color(0x1c2a36, 0x6f93ab, t) }
+end
+plugin.set_home_layout(layout)
+```
 
 ### `plugin.show_list(title, items, on_select [, options])`
 

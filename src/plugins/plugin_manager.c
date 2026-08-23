@@ -998,35 +998,64 @@ static int l_plugin_set_icon(lua_State * L) {
     return 0;
 }
 
-/* Fixed key order matches gui.c's build_home_screen()'s own 6 native
- * tiles 1:1 -- see that function's own comment for the full picture. */
-#define PLUGIN_HOME_TILE_COUNT 6
-static const char * const plugin_home_tile_keys[PLUGIN_HOME_TILE_COUNT] = {
-    "music", "stream_media", "wireless", "books", "system", "dac",
+/* Every top-level native screen sharing Home's own shape -- a small, fixed,
+ * string-keyed set of nav tiles/rows, no toggles/sliders -- gets the same
+ * reorder/hide/restyle mechanism Home originally had all to itself. Each
+ * screen_id's own valid-key list mirrors gui.c's own per-screen native-defs
+ * table 1:1 (gui.c stays the real source of truth for what a key looks
+ * like/does -- icon paths, click callbacks -- this file only ever
+ * validates key strings against its own mirrored list, same split the
+ * original Home-only comment already documented). */
+#define PLUGIN_SCREEN_MAX_ITEMS 6
+
+typedef struct {
+    const char * screen_id;
+    const char * const * keys;
+    int key_count;
+} plugin_screen_def_t;
+
+static const char * const plugin_home_keys[] = { "music", "stream_media", "wireless", "books", "system", "dac" };
+static const char * const plugin_music_keys[] = { "files", "artists", "albums", "album_artist", "all_songs", "playlists" };
+static const char * const plugin_wireless_keys[] = { "wifi", "bt", "airplay", "dlna", "remote", "import" };
+static const char * const plugin_stream_media_keys[] = { "subsonic" };
+static const char * const plugin_settings_keys[] = { "playback", "display", "power", "system", "about" };
+static const char * const plugin_books_keys[] = { "books", "favorites" };
+static const char * const plugin_dac_keys[] = { "usb_dac", "bluetooth_dac" };
+
+static const plugin_screen_def_t plugin_screen_defs[] = {
+    { "home", plugin_home_keys, 6 },
+    { "music", plugin_music_keys, 6 },
+    { "wireless", plugin_wireless_keys, 6 },
+    { "stream_media", plugin_stream_media_keys, 1 },
+    { "settings", plugin_settings_keys, 5 },
+    { "books", plugin_books_keys, 2 },
+    { "dac", plugin_dac_keys, 2 },
 };
+#define PLUGIN_SCREEN_COUNT (int) (sizeof(plugin_screen_defs) / sizeof(plugin_screen_defs[0]))
 
 /* Reasonable ceiling on a plugin-chosen tile corner radius -- purely
  * cosmetic (unlike an unknown/duplicate/missing key), so this clamps
  * rather than erroring, same "clamp a cosmetic value, error on a
  * structural one" split plugin.register_list_item()'s own height option
  * already makes (PILL_ROW_HEIGHT_MIN/MAX). */
-#define PLUGIN_HOME_TILE_RADIUS_MAX 64
+#define PLUGIN_SCREEN_RADIUS_MAX 64
 
 /* Ceiling on options.row_gap -- cosmetic, clamped not errored, same split
- * PLUGIN_HOME_TILE_RADIUS_MAX already makes for radius. */
-#define PLUGIN_HOME_ROW_GAP_MAX 24
+ * PLUGIN_SCREEN_RADIUS_MAX already makes for radius. */
+#define PLUGIN_SCREEN_ROW_GAP_MAX 24
 
 /* Ceiling on options.tile_gap -- tile mode's own analogous spacing knob.
  * Higher ceiling than row_gap: tiles are much bigger than list rows (a
  * whole 2x3 grid cell vs. a thin row), so a proportionally bigger gap still
  * reads as intentional spacing rather than the tiles falling apart. */
-#define PLUGIN_HOME_TILE_GAP_MAX 40
+#define PLUGIN_SCREEN_TILE_GAP_MAX 40
 
-/* Shared by is_valid_text_size() below -- "mono" (lv_font_unscii_16, see
- * lv_conf.h) is only offered through set_home_layout() for now (list mode),
- * not through register_list_item()/show_list(), so this stays a separate
- * check rather than widening is_valid_text_size() itself. */
-static bool is_valid_home_text_size(const char * text_size) {
+/* Shared by is_valid_screen_text_size() below -- "mono" (lv_font_unscii_16,
+ * see lv_conf.h) is only offered through set_screen_layout()/set_home_
+ * layout() for now (list mode), not through register_list_item()/
+ * show_list(), so this stays a separate check rather than widening
+ * is_valid_text_size() itself. */
+static bool is_valid_screen_text_size(const char * text_size) {
     return strcmp(text_size, "small") == 0 || strcmp(text_size, "medium") == 0 ||
            strcmp(text_size, "large") == 0 || strcmp(text_size, "mono") == 0;
 }
@@ -1035,11 +1064,13 @@ typedef struct {
     char key[16];
     bool has_bg_color;   uint32_t bg_color;   /* 0xRRGGBB */
     bool has_text_color; uint32_t text_color; /* 0xRRGGBB */
-    bool has_radius;     int32_t radius;      /* px, clamped to 0..PLUGIN_HOME_TILE_RADIUS_MAX */
+    bool has_radius;     int32_t radius;      /* px, clamped to 0..PLUGIN_SCREEN_RADIUS_MAX */
+    bool has_bg_alpha;   uint8_t bg_alpha;    /* 0-255, lv_opa_t scale */
 
-    /* ---- List-mode-only extensions (plugin.set_home_layout(), PLUGINS.md).
-     * Ignored in tile mode -- build_home_screen() only reads these when
-     * plugin_manager_get_home_tile_list_mode() is true. ---- */
+    /* ---- List-mode-only extensions (plugin.set_screen_layout()/set_home_
+     * layout(), PLUGINS.md). Ignored in tile mode -- only read once
+     * plugin_manager_get_screen_list_mode() is true for that screen_id
+     * (always true for the pill-list-native screens: settings/books/dac). ---- */
     int32_t row_height; /* 0 = unset/native default (124px) */
     int32_t row_width;  /* 0 = unset/native default */
     char text_align[8]; /* "" = unset ("left"); "left"/"center"/"right" */
@@ -1050,109 +1081,141 @@ typedef struct {
                            * (screen_builders.c) even where align="left" -- false
                            * drops the icon AND that reserved indent, so the label
                            * sits flush at the row's own 24px inset. */
-} plugin_home_tile_config_t;
+} plugin_screen_item_config_t;
 
-static plugin_home_tile_config_t plugin_home_layout[PLUGIN_HOME_TILE_COUNT];
-static int plugin_home_layout_count = 0; /* 0 == no plugin has called set_home_layout() yet */
-static bool plugin_home_layout_is_list = false;
-/* options.row_gap (list mode only) -- default matches build_pill_list_screen()'s
- * own pre-existing hardcoded 6px, so a plugin that never sets this changes
+static plugin_screen_item_config_t plugin_screen_items[PLUGIN_SCREEN_COUNT][PLUGIN_SCREEN_MAX_ITEMS];
+static int plugin_screen_item_count[PLUGIN_SCREEN_COUNT]; /* 0 == no plugin has called set_screen_layout() for this screen yet */
+static bool plugin_screen_is_list[PLUGIN_SCREEN_COUNT];
+/* options.row_gap -- default matches build_pill_list_screen()'s own
+ * pre-existing hardcoded 6px, so a plugin that never sets this changes
  * nothing. */
-static int32_t plugin_home_row_gap = 6;
-/* options.tile_gap (tile mode only) -- default 0 matches build_icon_grid_
- * screen()'s own pre-existing flush-cell look (every native caller of that
- * function also passes 0), so a plugin that never sets this changes
- * nothing. */
-static int32_t plugin_home_tile_gap = 0;
+static int32_t plugin_screen_row_gap[PLUGIN_SCREEN_COUNT] = { 6, 6, 6, 6, 6, 6, 6 };
+/* options.tile_gap -- default 0 matches build_icon_grid_screen()'s own
+ * pre-existing flush-cell look (every native caller of that function also
+ * passes 0), so a plugin that never sets this changes nothing. */
+static int32_t plugin_screen_tile_gap[PLUGIN_SCREEN_COUNT];
 
-/* Reorders/hides Home's 6 native tiles, optionally switching Home between
- * the icon grid and a plain vertical list, and optionally overriding a
- * tile's background color/text color/corner radius -- only takes effect
- * if called from a plugin's top-level code, since build_home_screen() runs
- * once, right after every plugin finishes loading (plugin_manager_init()
- * runs before it in gui_init()); calling this later from a callback is a
- * silent no-op until the next restart, same load-time-only constraint
- * plugin.set_icon() already documents. Last plugin to call wins if more
- * than one does, same "last call wins" precedent set_background_color()/
- * set_text_color() already established for their own single global slots
- * -- one call always fully specifies both the layout and every per-tile
- * style override together, never a partial update layered onto an earlier
- * call. Home must never end up with zero tiles, so an empty array, an
- * unknown/duplicate tile key, or an invalid `mode` all raise a Lua error
- * (leaving whatever layout -- native default or an earlier successful
- * call -- already in effect untouched) rather than silently doing
- * something wrong.
- *
- * tile_keys entries are either a plain string (a tile key, no style
- * override) or a table { key = "...", bg_color = 0xRRGGBB, text_color =
- * 0xRRGGBB, radius = n } -- the same "string or table" convention
- * register_list_item()'s/show_list()'s own `items` arrays already use for
- * exactly this "plain by default, richer when a plugin needs it" shape.
- * options.mode is "tile" (default) or "list". */
-static int l_plugin_set_home_layout(lua_State * L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    lua_Unsigned raw_n = lua_rawlen(L, 1);
-    if (raw_n == 0) {
-        return luaL_error(L, "plugin.set_home_layout: tile_keys must be a non-empty array");
+static int plugin_screen_slot(const char * screen_id) {
+    for (int i = 0; i < PLUGIN_SCREEN_COUNT; i++) {
+        if (strcmp(plugin_screen_defs[i].screen_id, screen_id) == 0) return i;
     }
-    if (raw_n > (lua_Unsigned) PLUGIN_HOME_TILE_COUNT) {
-        return luaL_error(L, "plugin.set_home_layout: too many tile keys (max %d)", PLUGIN_HOME_TILE_COUNT);
+    return -1;
+}
+
+/* Builds "\"a\", \"b\", or \"c\"" for an unknown-key error message -- each
+ * screen_id now has its own key set, so this can't be a single literal
+ * string the way the original Home-only error message was. */
+static void plugin_screen_format_keys(const plugin_screen_def_t * def, char * buf, size_t buf_size) {
+    size_t used = 0;
+    for (int i = 0; i < def->key_count && used < buf_size; i++) {
+        const char * sep = (i == 0) ? "" : (i == def->key_count - 1) ? (def->key_count > 2 ? ", or " : " or ") : ", ";
+        int n = snprintf(buf + used, buf_size - used, "%s\"%s\"", sep, def->keys[i]);
+        if (n < 0) break;
+        used += (size_t) n;
+    }
+}
+
+/* Shared body behind both plugin.set_screen_layout(screen_id, item_keys
+ * [, options]) and plugin.set_home_layout(item_keys [, options]) -- the
+ * latter is pure sugar for the former with screen_id pinned to "home", so
+ * this is the only place the actual parsing/validation/storage logic
+ * exists. keys_idx/options_idx are the Lua stack indices of item_keys/
+ * options for whichever entry point called in (2/3 for set_screen_layout,
+ * 1/2 for set_home_layout); fn_name is only used in error messages, so
+ * callers see the name they actually called.
+ *
+ * Reorders/hides a screen's native items, optionally switching between the
+ * icon grid and a plain vertical list (icon-grid-native screens only --
+ * options.mode is silently ignored for a screen gui.c never gives a
+ * tile-grid rendering to begin with), and optionally overriding an item's
+ * background color/text color/corner radius/background alpha -- only takes
+ * effect if called from a plugin's top-level code, since every screen this
+ * reaches is built once, right after every plugin finishes loading
+ * (plugin_manager_init() runs before gui_init()); calling this later from a
+ * callback is a silent no-op until the next restart, same load-time-only
+ * constraint plugin.set_icon() already documents. Last plugin to call wins
+ * per screen_id if more than one does, same "last call wins" precedent
+ * set_background_color()/set_text_color() already established for their
+ * own single global slots -- one call always fully specifies both the
+ * layout and every per-item style override together, never a partial
+ * update layered onto an earlier call. A screen must never end up with
+ * zero items, so an empty array, an unknown/duplicate item key, or an
+ * invalid `mode` all raise a Lua error (leaving whatever layout -- native
+ * default or an earlier successful call -- already in effect untouched)
+ * rather than silently doing something wrong. */
+static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_idx, int options_idx,
+                                 const char * fn_name) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0) {
+        return luaL_error(L, "%s: unknown screen_id '%s'", fn_name, screen_id);
+    }
+    const plugin_screen_def_t * def = &plugin_screen_defs[slot];
+
+    luaL_checktype(L, keys_idx, LUA_TTABLE);
+    lua_Unsigned raw_n = lua_rawlen(L, keys_idx);
+    if (raw_n == 0) {
+        return luaL_error(L, "%s: item_keys must be a non-empty array", fn_name);
+    }
+    if (raw_n > (lua_Unsigned) def->key_count) {
+        return luaL_error(L, "%s: too many item keys (max %d for screen '%s')", fn_name, def->key_count, screen_id);
     }
     int n = (int) raw_n;
 
     bool is_list = false;
-    int32_t row_gap = 6; /* today's exact hardcoded build_pill_list_screen() default */
+    int32_t row_gap = 6;  /* today's exact hardcoded build_pill_list_screen() default */
     int32_t tile_gap = 0; /* today's exact flush-cell build_icon_grid_screen() default */
-    if (lua_gettop(L) >= 2 && !lua_isnil(L, 2)) {
-        luaL_checktype(L, 2, LUA_TTABLE);
-        lua_getfield(L, 2, "mode");
+    if (lua_gettop(L) >= options_idx && !lua_isnil(L, options_idx)) {
+        luaL_checktype(L, options_idx, LUA_TTABLE);
+        lua_getfield(L, options_idx, "mode");
         if (!lua_isnil(L, -1)) {
             const char * mode = lua_tostring(L, -1);
             if (mode && strcmp(mode, "list") == 0) {
                 is_list = true;
             } else if (!mode || strcmp(mode, "tile") != 0) {
                 const char * shown = mode ? mode : "?";
-                return luaL_error(L, "plugin.set_home_layout: options.mode must be \"tile\" or \"list\", got '%s'", shown);
+                lua_pop(L, 1);
+                return luaL_error(L, "%s: options.mode must be \"tile\" or \"list\", got '%s'", fn_name, shown);
             }
         }
         lua_pop(L, 1);
 
         /* Cosmetic, not structural -- clamp rather than error, same
-         * precedent radius's own PLUGIN_HOME_TILE_RADIUS_MAX clamp sets. */
-        lua_getfield(L, 2, "row_gap");
+         * precedent radius's own PLUGIN_SCREEN_RADIUS_MAX clamp sets. */
+        lua_getfield(L, options_idx, "row_gap");
         if (!lua_isnil(L, -1)) {
             lua_Integer g = lua_tointeger(L, -1);
             if (g < 0) g = 0;
-            if (g > PLUGIN_HOME_ROW_GAP_MAX) g = PLUGIN_HOME_ROW_GAP_MAX;
+            if (g > PLUGIN_SCREEN_ROW_GAP_MAX) g = PLUGIN_SCREEN_ROW_GAP_MAX;
             row_gap = (int32_t) g;
         }
         lua_pop(L, 1);
 
         /* Same cosmetic clamp-not-error precedent as row_gap above -- tile
          * mode's own analogous "space between tiles" knob. */
-        lua_getfield(L, 2, "tile_gap");
+        lua_getfield(L, options_idx, "tile_gap");
         if (!lua_isnil(L, -1)) {
             lua_Integer g = lua_tointeger(L, -1);
             if (g < 0) g = 0;
-            if (g > PLUGIN_HOME_TILE_GAP_MAX) g = PLUGIN_HOME_TILE_GAP_MAX;
+            if (g > PLUGIN_SCREEN_TILE_GAP_MAX) g = PLUGIN_SCREEN_TILE_GAP_MAX;
             tile_gap = (int32_t) g;
         }
         lua_pop(L, 1);
     }
 
-    plugin_home_tile_config_t new_layout[PLUGIN_HOME_TILE_COUNT];
-    memset(new_layout, 0, sizeof(new_layout));
+    plugin_screen_item_config_t new_items[PLUGIN_SCREEN_MAX_ITEMS];
+    memset(new_items, 0, sizeof(new_items));
     for (int i = 0; i < n; i++) {
-        lua_rawgeti(L, 1, i + 1);
+        lua_rawgeti(L, keys_idx, i + 1);
 
         const char * key;
-        bool has_bg_color = false, has_text_color = false, has_radius = false;
+        bool has_bg_color = false, has_text_color = false, has_radius = false, has_bg_alpha = false;
         uint32_t bg_color = 0, text_color = 0;
         int32_t radius = 0;
-        /* List-mode-only extensions (PLUGINS.md, plugin.set_home_layout()) --
-         * silently ignored in tile mode, same as bg_color/text_color/radius
-         * are never structurally invalid there either, just cosmetically
-         * unused by build_icon_grid_screen(). */
+        uint8_t bg_alpha = 0;
+        /* List-mode-only extensions (PLUGINS.md) -- silently ignored in tile
+         * mode, same as bg_color/text_color/radius/bg_alpha are never
+         * structurally invalid there either, just cosmetically unused by
+         * build_icon_grid_screen(). */
         int32_t row_height = 0, row_width = 0;
         char text_align[8] = "";
         bool accessory = true;
@@ -1183,8 +1246,22 @@ static int l_plugin_set_home_layout(lua_State * L) {
                 has_radius = true;
                 lua_Integer r = lua_tointeger(L, -1);
                 if (r < 0) r = 0;
-                if (r > PLUGIN_HOME_TILE_RADIUS_MAX) r = PLUGIN_HOME_TILE_RADIUS_MAX;
+                if (r > PLUGIN_SCREEN_RADIUS_MAX) r = PLUGIN_SCREEN_RADIUS_MAX;
                 radius = (int32_t) r;
+            }
+            lua_pop(L, 1);
+
+            /* Cosmetic, matches lv_opa_t's own 0-255 scale -- clamp rather
+             * than error, same precedent radius's own clamp sets. Lets a
+             * tile/row go semi-transparent over plugin.set_background_image()'s
+             * whole-screen wallpaper. */
+            lua_getfield(L, -1, "bg_alpha");
+            if (!lua_isnil(L, -1)) {
+                has_bg_alpha = true;
+                lua_Integer a = lua_tointeger(L, -1);
+                if (a < 0) a = 0;
+                if (a > 255) a = 255;
+                bg_alpha = (uint8_t) a;
             }
             lua_pop(L, 1);
 
@@ -1208,9 +1285,8 @@ static int l_plugin_set_home_layout(lua_State * L) {
                 if (strcmp(align, "left") != 0 && strcmp(align, "center") != 0 && strcmp(align, "right") != 0) {
                     const char * shown_align = align;
                     lua_pop(L, 1);
-                    return luaL_error(L,
-                        "plugin.set_home_layout: align must be \"left\", \"center\", or \"right\", got '%s'",
-                        shown_align);
+                    return luaL_error(L, "%s: align must be \"left\", \"center\", or \"right\", got '%s'", fn_name,
+                                       shown_align);
                 }
                 snprintf(text_align, sizeof(text_align), "%s", align);
             }
@@ -1231,12 +1307,12 @@ static int l_plugin_set_home_layout(lua_State * L) {
             lua_getfield(L, -1, "text_size");
             const char * ts = lua_tostring(L, -1);
             if (ts) {
-                if (!is_valid_home_text_size(ts)) {
+                if (!is_valid_screen_text_size(ts)) {
                     const char * shown_ts = ts;
                     lua_pop(L, 1);
                     return luaL_error(L,
-                        "plugin.set_home_layout: unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
-                        shown_ts);
+                        "%s: unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
+                        fn_name, shown_ts);
                 }
                 snprintf(text_size, sizeof(text_size), "%s", ts);
             }
@@ -1246,120 +1322,216 @@ static int l_plugin_set_home_layout(lua_State * L) {
         }
 
         bool known = false;
-        for (int k = 0; k < PLUGIN_HOME_TILE_COUNT; k++) {
-            if (key && strcmp(key, plugin_home_tile_keys[k]) == 0) {
+        for (int k = 0; k < def->key_count; k++) {
+            if (key && strcmp(key, def->keys[k]) == 0) {
                 known = true;
                 break;
             }
         }
         if (!known) {
             const char * shown = key ? key : "?";
+            char expected[160];
+            plugin_screen_format_keys(def, expected, sizeof(expected));
             lua_pop(L, 1);
-            return luaL_error(L,
-                "plugin.set_home_layout: unknown tile key '%s' (expected \"music\", \"stream_media\", "
-                "\"wireless\", \"books\", \"system\", or \"dac\")",
-                shown);
+            return luaL_error(L, "%s: unknown item key '%s' (expected %s)", fn_name, shown, expected);
         }
         for (int j = 0; j < i; j++) {
-            if (strcmp(new_layout[j].key, key) == 0) {
+            if (strcmp(new_items[j].key, key) == 0) {
                 lua_pop(L, 1);
-                return luaL_error(L, "plugin.set_home_layout: duplicate tile key '%s'", key);
+                return luaL_error(L, "%s: duplicate item key '%s'", fn_name, key);
             }
         }
 
-        snprintf(new_layout[i].key, sizeof(new_layout[i].key), "%s", key);
-        new_layout[i].has_bg_color = has_bg_color;
-        new_layout[i].bg_color = bg_color;
-        new_layout[i].has_text_color = has_text_color;
-        new_layout[i].text_color = text_color;
-        new_layout[i].has_radius = has_radius;
-        new_layout[i].radius = radius;
-        new_layout[i].row_height = row_height;
-        new_layout[i].row_width = row_width;
-        snprintf(new_layout[i].text_align, sizeof(new_layout[i].text_align), "%s", text_align);
-        new_layout[i].accessory = accessory;
-        snprintf(new_layout[i].text_size, sizeof(new_layout[i].text_size), "%s", text_size);
-        new_layout[i].show_icon = show_icon;
+        snprintf(new_items[i].key, sizeof(new_items[i].key), "%s", key);
+        new_items[i].has_bg_color = has_bg_color;
+        new_items[i].bg_color = bg_color;
+        new_items[i].has_text_color = has_text_color;
+        new_items[i].text_color = text_color;
+        new_items[i].has_radius = has_radius;
+        new_items[i].radius = radius;
+        new_items[i].has_bg_alpha = has_bg_alpha;
+        new_items[i].bg_alpha = bg_alpha;
+        new_items[i].row_height = row_height;
+        new_items[i].row_width = row_width;
+        snprintf(new_items[i].text_align, sizeof(new_items[i].text_align), "%s", text_align);
+        new_items[i].accessory = accessory;
+        snprintf(new_items[i].text_size, sizeof(new_items[i].text_size), "%s", text_size);
+        new_items[i].show_icon = show_icon;
         lua_pop(L, 1);
     }
 
-    memcpy(plugin_home_layout, new_layout, sizeof(new_layout[0]) * (size_t) n);
-    plugin_home_layout_count = n;
-    plugin_home_layout_is_list = is_list;
-    plugin_home_row_gap = row_gap;
-    plugin_home_tile_gap = tile_gap;
+    memcpy(plugin_screen_items[slot], new_items, sizeof(new_items[0]) * (size_t) n);
+    plugin_screen_item_count[slot] = n;
+    plugin_screen_is_list[slot] = is_list;
+    plugin_screen_row_gap[slot] = row_gap;
+    plugin_screen_tile_gap[slot] = tile_gap;
     return 0;
 }
 
-int plugin_manager_get_home_tile_count(void) {
-    return plugin_home_layout_count;
+static int l_plugin_set_screen_layout(lua_State * L) {
+    const char * screen_id = luaL_checkstring(L, 1);
+    return do_set_screen_layout(L, screen_id, 2, 3, "plugin.set_screen_layout");
 }
 
-const char * plugin_manager_get_home_tile_key(int index) {
-    if (index < 0 || index >= plugin_home_layout_count) return NULL;
-    return plugin_home_layout[index].key;
+/* Pure sugar over do_set_screen_layout() with screen_id pinned to "home" --
+ * plugin.set_home_layout() already shipped with this exact 2-arg signature
+ * before set_screen_layout() existed, so it keeps working unchanged rather
+ * than becoming a second, parallel implementation. */
+static int l_plugin_set_home_layout(lua_State * L) {
+    return do_set_screen_layout(L, "home", 1, 2, "plugin.set_home_layout");
 }
 
-bool plugin_manager_get_home_tile_list_mode(void) {
-    return plugin_home_layout_is_list;
+int plugin_manager_get_screen_item_count(const char * screen_id) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0) return 0;
+    return plugin_screen_item_count[slot];
 }
 
-bool plugin_manager_get_home_tile_bg_color(int index, uint32_t * out_rgb) {
-    if (index < 0 || index >= plugin_home_layout_count || !plugin_home_layout[index].has_bg_color) return false;
-    *out_rgb = plugin_home_layout[index].bg_color;
+const char * plugin_manager_get_screen_item_key(const char * screen_id, int index) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot]) return NULL;
+    return plugin_screen_items[slot][index].key;
+}
+
+bool plugin_manager_get_screen_list_mode(const char * screen_id) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0) return false;
+    return plugin_screen_is_list[slot];
+}
+
+bool plugin_manager_get_screen_item_bg_color(const char * screen_id, int index, uint32_t * out_rgb) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        !plugin_screen_items[slot][index].has_bg_color)
+        return false;
+    *out_rgb = plugin_screen_items[slot][index].bg_color;
     return true;
 }
 
-bool plugin_manager_get_home_tile_text_color(int index, uint32_t * out_rgb) {
-    if (index < 0 || index >= plugin_home_layout_count || !plugin_home_layout[index].has_text_color) return false;
-    *out_rgb = plugin_home_layout[index].text_color;
+bool plugin_manager_get_screen_item_text_color(const char * screen_id, int index, uint32_t * out_rgb) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        !plugin_screen_items[slot][index].has_text_color)
+        return false;
+    *out_rgb = plugin_screen_items[slot][index].text_color;
     return true;
 }
 
-bool plugin_manager_get_home_tile_radius(int index, int32_t * out_radius) {
-    if (index < 0 || index >= plugin_home_layout_count || !plugin_home_layout[index].has_radius) return false;
-    *out_radius = plugin_home_layout[index].radius;
+bool plugin_manager_get_screen_item_radius(const char * screen_id, int index, int32_t * out_radius) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        !plugin_screen_items[slot][index].has_radius)
+        return false;
+    *out_radius = plugin_screen_items[slot][index].radius;
     return true;
 }
 
-bool plugin_manager_get_home_tile_row_height(int index, int32_t * out_height) {
-    if (index < 0 || index >= plugin_home_layout_count || plugin_home_layout[index].row_height == 0) return false;
-    *out_height = plugin_home_layout[index].row_height;
+bool plugin_manager_get_screen_item_bg_alpha(const char * screen_id, int index, uint8_t * out_alpha) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        !plugin_screen_items[slot][index].has_bg_alpha)
+        return false;
+    *out_alpha = plugin_screen_items[slot][index].bg_alpha;
     return true;
 }
 
-bool plugin_manager_get_home_tile_row_width(int index, int32_t * out_width) {
-    if (index < 0 || index >= plugin_home_layout_count || plugin_home_layout[index].row_width == 0) return false;
-    *out_width = plugin_home_layout[index].row_width;
+bool plugin_manager_get_screen_item_row_height(const char * screen_id, int index, int32_t * out_height) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        plugin_screen_items[slot][index].row_height == 0)
+        return false;
+    *out_height = plugin_screen_items[slot][index].row_height;
     return true;
 }
 
-const char * plugin_manager_get_home_tile_text_align(int index) {
-    if (index < 0 || index >= plugin_home_layout_count || plugin_home_layout[index].text_align[0] == '\0') return NULL;
-    return plugin_home_layout[index].text_align;
+bool plugin_manager_get_screen_item_row_width(const char * screen_id, int index, int32_t * out_width) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        plugin_screen_items[slot][index].row_width == 0)
+        return false;
+    *out_width = plugin_screen_items[slot][index].row_width;
+    return true;
 }
 
-bool plugin_manager_get_home_tile_accessory(int index) {
-    if (index < 0 || index >= plugin_home_layout_count) return true;
-    return plugin_home_layout[index].accessory;
+const char * plugin_manager_get_screen_item_text_align(const char * screen_id, int index) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        plugin_screen_items[slot][index].text_align[0] == '\0')
+        return NULL;
+    return plugin_screen_items[slot][index].text_align;
 }
 
-bool plugin_manager_get_home_tile_show_icon(int index) {
-    if (index < 0 || index >= plugin_home_layout_count) return true;
-    return plugin_home_layout[index].show_icon;
+bool plugin_manager_get_screen_item_accessory(const char * screen_id, int index) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot]) return true;
+    return plugin_screen_items[slot][index].accessory;
 }
 
-const char * plugin_manager_get_home_tile_text_size(int index) {
-    if (index < 0 || index >= plugin_home_layout_count || plugin_home_layout[index].text_size[0] == '\0') return NULL;
-    return plugin_home_layout[index].text_size;
+bool plugin_manager_get_screen_item_show_icon(const char * screen_id, int index) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot]) return true;
+    return plugin_screen_items[slot][index].show_icon;
 }
 
-int32_t plugin_manager_get_home_row_gap(void) {
-    return plugin_home_row_gap;
+const char * plugin_manager_get_screen_item_text_size(const char * screen_id, int index) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        plugin_screen_items[slot][index].text_size[0] == '\0')
+        return NULL;
+    return plugin_screen_items[slot][index].text_size;
 }
 
-int32_t plugin_manager_get_home_tile_gap(void) {
-    return plugin_home_tile_gap;
+int32_t plugin_manager_get_screen_row_gap(const char * screen_id) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0) return 6;
+    return plugin_screen_row_gap[slot];
+}
+
+int32_t plugin_manager_get_screen_tile_gap(const char * screen_id) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0) return 0;
+    return plugin_screen_tile_gap[slot];
+}
+
+/* plugin.lerp_color(from, to, t) -- linear-interpolates each RGB channel
+ * independently between two 0xRRGGBB colors at t in 0..1. Pure math, no
+ * error path needed -- t is cosmetic (clamped, not validated), same
+ * "clamp a cosmetic value" precedent PLUGIN_SCREEN_RADIUS_MAX already
+ * sets. Lets a plugin build an N-stop gradient across a screen's resolved
+ * items from just two endpoint colors instead of hand-picking every
+ * stop's own hex value -- see plugins_examples/HomeThemes.lua. */
+static int l_plugin_lerp_color(lua_State * L) {
+    lua_Integer from = luaL_checkinteger(L, 1);
+    lua_Integer to = luaL_checkinteger(L, 2);
+    double t = luaL_checknumber(L, 3);
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+
+    int fr = (int) ((from >> 16) & 0xFF), fg = (int) ((from >> 8) & 0xFF), fb = (int) (from & 0xFF);
+    int tr = (int) ((to >> 16) & 0xFF), tg = (int) ((to >> 8) & 0xFF), tb = (int) (to & 0xFF);
+    int r = fr + (int) ((tr - fr) * t);
+    int g = fg + (int) ((tg - fg) * t);
+    int b = fb + (int) ((tb - fb) * t);
+
+    lua_pushinteger(L, ((lua_Integer) r << 16) | ((lua_Integer) g << 8) | b);
+    return 1;
+}
+
+/* plugin.set_background_image(image_path) -- a whole-screen wallpaper, not
+ * a per-tile one. Mutates the same shared style_theme_screen_bg style
+ * plugin.set_background_color("screen", ...) already mutates (gui.c's
+ * gui_plugin_set_background_image()) -- every screen root already has this
+ * style attached, so one call updates every screen live, no restart and no
+ * per-screen plumbing needed. Same path convention every other
+ * plugin-supplied-file option already uses (raw absolute, or relative to
+ * the SD card's .plugins/ dir, see pill_row_apply_icon()'s own comment) --
+ * gui.c resolves it and falls back gracefully to whatever "screen" color is
+ * set if the file is missing or fails to decode, same graceful-degrade
+ * precedent register_list_item()'s own icon option already sets. */
+static int l_plugin_set_background_image(lua_State * L) {
+    const char * image_path = luaL_checkstring(L, 1);
+    gui_plugin_set_background_image(image_path);
+    return 0;
 }
 
 /* Sets one of three fixed background-color slots, live, app-wide, no
@@ -2350,8 +2522,11 @@ static const luaL_Reg plugin_funcs[] = {
     { "show_toast",                l_plugin_show_toast },
     { "set_icon",                  l_plugin_set_icon },
     { "set_home_layout",           l_plugin_set_home_layout },
+    { "set_screen_layout",         l_plugin_set_screen_layout },
     { "set_background_color",      l_plugin_set_background_color },
     { "set_text_color",            l_plugin_set_text_color },
+    { "set_background_image",      l_plugin_set_background_image },
+    { "lerp_color",                l_plugin_lerp_color },
     { "eq_load_profile",           l_plugin_eq_load_profile },
     { "eq_save_profile",           l_plugin_eq_save_profile },
     { "eq_reset",                  l_plugin_eq_reset },

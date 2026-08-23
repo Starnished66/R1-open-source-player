@@ -84,6 +84,16 @@ void gui_plugin_set_background_color(const char * slot, uint32_t rgb);
  * comment for what each covers and what's deliberately excluded. */
 void gui_plugin_set_text_color(const char * slot, uint32_t rgb);
 
+/* Backing plugin.set_background_image() -- sets style_theme_screen_bg's
+ * bg_image_src live, app-wide, the same shared-style mechanism
+ * gui_plugin_set_background_color() above already uses for "screen". Every
+ * screen root already has this style attached, so one call wallpapers every
+ * screen at once. image_path follows the same resolve convention every
+ * other plugin-supplied-file path uses (raw absolute, or relative to the SD
+ * card's .plugins/ dir) -- a missing/corrupt file just leaves the plain
+ * "screen" bg_color showing through, no error. */
+void gui_plugin_set_background_image(const char * image_path);
+
 /* ---- Playback control bridges for plugin.toggle_pause()/stop()/next_track()/
  * prev_track()/seek()/set_volume()/is_playing()/is_paused()/get_position()/
  * get_duration() ----

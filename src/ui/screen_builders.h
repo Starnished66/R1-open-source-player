@@ -139,6 +139,11 @@ typedef struct {
     bool has_bg_color;   uint32_t bg_color;   /* 0xRRGGBB */
     bool has_text_color; uint32_t text_color; /* 0xRRGGBB */
     bool has_radius;     int32_t radius;      /* px corner radius */
+    /* 0-255 (lv_opa_t scale) -- lets a tile go semi-transparent over
+     * plugin.set_background_image()'s whole-screen wallpaper. Every native
+     * tile leaves this false, reproducing today's fully-opaque
+     * LV_OPA_COVER look. */
+    bool has_bg_alpha;   uint8_t bg_alpha;
 } icon_grid_item_t;
 
 /* Titled screen: real back-arrow button (top-left, invokes back_btn_cb) and
@@ -243,6 +248,12 @@ typedef struct {
     bool has_bg_color;   uint32_t bg_color;
     bool has_text_color; uint32_t text_color;
     bool has_radius;     int32_t radius;
+    /* Same meaning as icon_grid_item_t's own bg_alpha above -- only takes
+     * effect on the plain rounded-rect fill path (has_bg_color/has_radius/
+     * row_height/row_width already force that path over the PNG pill
+     * sprite, which can't be recolored/reshaped and always renders fully
+     * opaque). */
+    bool has_bg_alpha;   uint8_t bg_alpha;
 
     /* NULL/"left" (default) = today's exact layout (label left-aligned,
      * starting right after any icon -- unaffected by this field). "center"/

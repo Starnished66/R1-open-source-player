@@ -2,6 +2,7 @@
 
 #include "path_cache.h"
 #include "remote_state.h"
+#include "subsonic_saved_servers.h"
 #include "tagcache.h"
 
 #include <limits.h>
@@ -846,4 +847,58 @@ void metadata_db_load_favorite_books(char *** out_paths, int * out_count) {
 
 void metadata_db_load_all_books(char *** out_paths, int * out_count) {
     path_cache_load(PATH_CACHE_BOOKS, out_paths, out_count);
+}
+
+void metadata_db_playlist_replace_all(char * const * paths, int count) {
+    path_cache_replace(PATH_CACHE_PLAYLISTS, paths, count);
+}
+
+void metadata_db_load_all_playlists(char *** out_paths, int * out_count) {
+    path_cache_load(PATH_CACHE_PLAYLISTS, out_paths, out_count);
+}
+
+void metadata_db_playlist_insert_one(const char * path) {
+    if (!path || !path[0]) return;
+    path_cache_insert(PATH_CACHE_PLAYLISTS, path);
+}
+
+void metadata_db_playlist_delete_one(const char * path) {
+    if (!path || !path[0]) return;
+    path_cache_delete(PATH_CACHE_PLAYLISTS, path);
+}
+
+void metadata_db_subsonic_server_save(const char * url, const char * username, const char * password, bool verify_tls) {
+    subsonic_saved_servers_upsert(url, username, password, verify_tls);
+}
+
+void metadata_db_load_subsonic_servers(subsonic_server_row_t ** out_rows, int * out_count) {
+    *out_rows = NULL;
+    *out_count = 0;
+    subsonic_saved_server_t * rows = NULL;
+    int count = 0;
+    subsonic_saved_servers_load(&rows, &count);
+    if (count <= 0) {
+        free(rows);
+        return;
+    }
+    /* subsonic_saved_server_t and subsonic_server_row_t are separately
+     * declared (subsonic_saved_servers.h has no dependency on
+     * metadata_db.h, matching path_cache.h/remote_state.h's own
+     * layering) but field-for-field identical -- copy rather than cast,
+     * so a future divergence between the two is a compile error in this
+     * one place, not a silent mismatch. */
+    subsonic_server_row_t * out = malloc(sizeof(*out) * (size_t) count);
+    if (!out) {
+        free(rows);
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        snprintf(out[i].url, sizeof(out[i].url), "%s", rows[i].url);
+        snprintf(out[i].username, sizeof(out[i].username), "%s", rows[i].username);
+        snprintf(out[i].password, sizeof(out[i].password), "%s", rows[i].password);
+        out[i].verify_tls = rows[i].verify_tls;
+    }
+    free(rows);
+    *out_rows = out;
+    *out_count = count;
 }

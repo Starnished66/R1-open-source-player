@@ -295,4 +295,58 @@ void metadata_db_book_replace_all(char * const * paths, int count);
 void metadata_db_load_favorite_books(char *** out_paths, int * out_count);
 void metadata_db_load_all_books(char *** out_paths, int * out_count);
 
+/* Persistent playlist (.m3u) cache -- same "load whatever's cached, don't
+ * touch the filesystem" reasoning as the book cache above (the Playlists
+ * screen in gui.c was slow to open, ~5s against a real SD card, because it
+ * ran playlist_files_scan() on every visit). Unlike books there's no fast
+ * stock-db path to warm-start from (m3u playlists are this app's own
+ * concept, not something the stock player ever indexes) -- populated only
+ * by gui.c's rescan_playlists() (folded into library_scan_once(), same as
+ * rescan_books(), so it runs at boot and on an explicit Settings > Update
+ * Music Database rescan, never on the fast cache-only boot path) and by
+ * the single-row insert/delete functions below for ordinary in-app
+ * playlist create/delete, so those stay instant without a full rescan.
+ * rescan_playlists() walks PLAYLISTS_DIR only, not the whole music tree. */
+void metadata_db_playlist_replace_all(char * const * paths, int count);
+
+/* Enumerates every cached playlist path, alphabetically -- caller-owned
+ * array, same convention as metadata_db_load_all_books(). */
+void metadata_db_load_all_playlists(char *** out_paths, int * out_count);
+
+/* Adds/removes a single path from the playlist cache -- for gui.c's own
+ * playlist_files_create()/playlist_files_delete() call sites, so creating
+ * or deleting one playlist doesn't pay for a full metadata_db_playlist_
+ * replace_all() rescan just to reflect that one file. INSERT is a no-op if
+ * the path's already cached; DELETE is a no-op if it wasn't. */
+void metadata_db_playlist_insert_one(const char * path);
+void metadata_db_playlist_delete_one(const char * path);
+
+/* Saved Subsonic server profiles -- the "Saved Servers" list in gui.c's
+ * Subsonic setup flow. The active connection still lives in settings.c
+ * (subsonic_url/username/password/verify_tls); this is the multi-server
+ * list that used to be only those four fields. Deliberately plain char*
+ * params rather than subsonic_client.h's subsonic_server_t: this file
+ * doesn't otherwise depend on that header, and these are the only pieces
+ * of it ever needed here -- gui.c does its own struct marshaling on both
+ * sides. url is the natural unique key (a real server only has one), so
+ * metadata_db_subsonic_server_save() is an upsert: saving the same URL
+ * again (e.g. reconnecting with updated credentials) replaces the
+ * existing row rather than creating a duplicate. Password is stored in
+ * plain text, same as settings.c's existing single-server field already
+ * did -- no new exposure, this app has no secret-storage mechanism to
+ * upgrade to. Persisted on /usr/data (see subsonic_saved_servers.c). */
+void metadata_db_subsonic_server_save(const char * url, const char * username, const char * password, bool verify_tls);
+
+/* Enumerates every saved server, alphabetically by URL -- caller-owned
+ * array of subsonic_server_row_t, same convention as
+ * metadata_db_load_all_books(). *out_rows is NULL and *out_count is 0 if
+ * there are none. */
+typedef struct {
+    char url[256];
+    char username[128];
+    char password[128];
+    bool verify_tls;
+} subsonic_server_row_t;
+void metadata_db_load_subsonic_servers(subsonic_server_row_t ** out_rows, int * out_count);
+
 #endif /* METADATA_DB_H */

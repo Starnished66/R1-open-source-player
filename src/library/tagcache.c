@@ -59,6 +59,8 @@ enum tag_type {
 #define TAGCACHE_MAGIC 0x54434810
 #define FLAG_DELETED 0x0001
 #define FLAG_SEEN 0x01000000 /* RAM-only, stripped before persist */
+#define FLAG_TAGS_INCOMPLETE 0x02000000 /* RAM-only: unique-tag seek missed on load */
+#define FLAG_RAM_ONLY (FLAG_SEEN | FLAG_TAGS_INCOMPLETE)
 #define TAGCACHE_MAX_ENTRIES 524288
 #define INTERN_BUCKETS 8192
 #define TAGCACHE_RAM_RESERVE (16ull * 1024ull * 1024ull)
@@ -797,7 +799,7 @@ static void apply_tags(entry_t * e, const char * path, int32_t mtime, int32_t si
     e->genre = intern_tag(genre);
     e->mtime = mtime;
     e->size = size;
-    e->flag &= ~FLAG_DELETED;
+    e->flag &= ~(FLAG_DELETED | FLAG_TAGS_INCOMPLETE);
     e->flag |= FLAG_SEEN;
 }
 
@@ -1013,26 +1015,55 @@ static bool write_tag_new(int tag, int32_t gen, int32_t * title_seek, int32_t * 
     return true;
 }
 
+static void snapshot_unique_seeks(int tag, int32_t * out) {
+    for (int32_t i = 0; i < ent_count; i++) {
+        out[i] = 0;
+        if (ents[i].flag & FLAG_DELETED) continue;
+        intern_t * node = intern_node(unique_string(tag, &ents[i]), true);
+        if (node) out[i] = node->persist_seek;
+    }
+}
+
 static bool write_all(void) {
     if (db_dir[0] == '\0') return false;
     mkdir(db_dir, 0755);
 
-    int32_t * title_seek = calloc((size_t) (ent_count > 0 ? ent_count : 1), sizeof(int32_t));
-    int32_t * path_seek = calloc((size_t) (ent_count > 0 ? ent_count : 1), sizeof(int32_t));
-    if (!title_seek || !path_seek) {
+    int32_t nslot = ent_count > 0 ? ent_count : 1;
+    int32_t * title_seek = calloc((size_t) nslot, sizeof(int32_t));
+    int32_t * path_seek = calloc((size_t) nslot, sizeof(int32_t));
+    int32_t * artist_seek_snap = calloc((size_t) nslot, sizeof(int32_t));
+    int32_t * album_seek_snap = calloc((size_t) nslot, sizeof(int32_t));
+    int32_t * genre_seek_snap = calloc((size_t) nslot, sizeof(int32_t));
+    int32_t * aa_seek_snap = calloc((size_t) nslot, sizeof(int32_t));
+    if (!title_seek || !path_seek || !artist_seek_snap || !album_seek_snap || !genre_seek_snap || !aa_seek_snap) {
         free(title_seek);
         free(path_seek);
+        free(artist_seek_snap);
+        free(album_seek_snap);
+        free(genre_seek_snap);
+        free(aa_seek_snap);
         return false;
     }
 
     int32_t new_gen = disk_gen > 0 ? disk_gen + 1 : 1;
     if (new_gen <= 0) new_gen = 1;
 
-    const int unique_tags[] = { tag_artist, tag_album, tag_genre, tag_albumartist, tag_composer, tag_comment,
-                                tag_grouping, tag_virt_canonicalartist };
+    /* intern_t.persist_seek is overwritten by each unique tag file (artist
+     * and albumartist often intern to the same node when TPE2==TPE1).
+     * Snapshot immediately after each file so index seeks stay in that file. */
     bool ok = true;
-    for (size_t t = 0; ok && t < sizeof(unique_tags) / sizeof(unique_tags[0]); t++)
-        ok = write_tag_new(unique_tags[t], new_gen, NULL, NULL);
+    if (ok) ok = write_tag_new(tag_artist, new_gen, NULL, NULL);
+    if (ok) snapshot_unique_seeks(tag_artist, artist_seek_snap);
+    if (ok) ok = write_tag_new(tag_album, new_gen, NULL, NULL);
+    if (ok) snapshot_unique_seeks(tag_album, album_seek_snap);
+    if (ok) ok = write_tag_new(tag_genre, new_gen, NULL, NULL);
+    if (ok) snapshot_unique_seeks(tag_genre, genre_seek_snap);
+    if (ok) ok = write_tag_new(tag_albumartist, new_gen, NULL, NULL);
+    if (ok) snapshot_unique_seeks(tag_albumartist, aa_seek_snap);
+    if (ok) ok = write_tag_new(tag_composer, new_gen, NULL, NULL);
+    if (ok) ok = write_tag_new(tag_comment, new_gen, NULL, NULL);
+    if (ok) ok = write_tag_new(tag_grouping, new_gen, NULL, NULL);
+    if (ok) ok = write_tag_new(tag_virt_canonicalartist, new_gen, NULL, NULL);
     if (ok) ok = write_tag_new(tag_title, new_gen, title_seek, NULL);
     if (ok) ok = write_tag_new(tag_filename, new_gen, NULL, path_seek);
 
@@ -1055,19 +1086,14 @@ static bool write_all(void) {
             for (int32_t i = 0; ok && i < ent_count; i++) {
                 struct index_entry idx;
                 memset(&idx, 0, sizeof(idx));
-                idx.flag = ents[i].flag & ~FLAG_SEEN;
+                idx.flag = ents[i].flag & ~FLAG_RAM_ONLY;
                 if (ents[i].flag & FLAG_DELETED) {
                     idx.flag = FLAG_DELETED;
                 } else {
-                    intern_t * node;
-                    node = intern_node(ents[i].artist, true);
-                    if (node) idx.tag_seek[tag_artist] = node->persist_seek;
-                    node = intern_node(ents[i].album, true);
-                    if (node) idx.tag_seek[tag_album] = node->persist_seek;
-                    node = intern_node(ents[i].genre, true);
-                    if (node) idx.tag_seek[tag_genre] = node->persist_seek;
-                    node = intern_node(ents[i].album_artist, true);
-                    if (node) idx.tag_seek[tag_albumartist] = node->persist_seek;
+                    idx.tag_seek[tag_artist] = artist_seek_snap[i];
+                    idx.tag_seek[tag_album] = album_seek_snap[i];
+                    idx.tag_seek[tag_genre] = genre_seek_snap[i];
+                    idx.tag_seek[tag_albumartist] = aa_seek_snap[i];
                     idx.tag_seek[tag_title] = title_seek[i];
                     idx.tag_seek[tag_filename] = path_seek[i];
                     idx.tag_seek[tag_mtime] = ents[i].mtime;
@@ -1105,6 +1131,10 @@ static bool write_all(void) {
     }
     free(title_seek);
     free(path_seek);
+    free(artist_seek_snap);
+    free(album_seek_snap);
+    free(genre_seek_snap);
+    free(aa_seek_snap);
     return ok;
 }
 
@@ -1365,7 +1395,7 @@ static bool load_all(void) {
         }
         entry_t * e = &ents[i];
         memset(e, 0, sizeof(*e));
-        e->flag = idx.flag & ~FLAG_SEEN;
+        e->flag = idx.flag & ~FLAG_RAM_ONLY;
         e->mtime = idx.tag_seek[tag_mtime];
         e->size = idx.tag_seek[tag_lastoffset];
         e->first_seen = idx.tag_seek[tag_commitid];
@@ -1440,14 +1470,35 @@ static bool load_all(void) {
         const char * album = lookup_seek(maps[3], mapn[3], album_seek[i]);
         const char * album_artist = lookup_seek(maps[4], mapn[4], aa_seek[i]);
         const char * genre = lookup_seek(maps[5], mapn[5], genre_seek[i]);
-        if (!artist || !album || !album_artist || !genre) {
+        /* Older commits stored intern persist_seek from whichever unique
+         * tag file last overwrote the shared intern node (albumartist often
+         * equals artist). Missing unique-tag seeks must not fail the whole
+         * open -- fall back so a good generation still loads. */
+        if (!artist) {
             rows_ok = false;
             break;
+        }
+        /* Unique-tag seek misses must not fail the whole open, but they
+         * also must not look like real empty tags on the next rescan:
+         * mtime/size cache hits would persist intern("") as the album. */
+        bool incomplete = false;
+        if (!album) {
+            album = "";
+            incomplete = true;
+        }
+        if (!album_artist) {
+            album_artist = artist;
+            incomplete = true;
+        }
+        if (!genre) {
+            genre = "";
+            incomplete = true;
         }
         e->artist = intern_tag(artist);
         e->album = intern_tag(album);
         e->album_artist = intern_tag(album_artist);
         e->genre = intern_tag(genre);
+        if (incomplete) e->flag |= FLAG_TAGS_INCOMPLETE;
         if (intern_path_title) {
             const char * path = lookup_seek(maps[0], mapn[0], path_seek[i]);
             const char * title = lookup_seek(maps[1], mapn[1], title_seek[i]);
@@ -1509,7 +1560,7 @@ static void persist_numeric(int32_t idx) {
         close(fd);
         return;
     }
-    ie.flag = ents[idx].flag & ~FLAG_SEEN;
+    ie.flag = ents[idx].flag & ~FLAG_RAM_ONLY;
     ie.tag_seek[tag_mtime] = ents[idx].mtime;
     ie.tag_seek[tag_lastoffset] = ents[idx].size;
     ie.tag_seek[tag_commitid] = ents[idx].first_seen;
@@ -1601,6 +1652,11 @@ bool tagcache_lookup(const char * path, int32_t mtime, int32_t size, tagcache_so
     if (idx < 0 || (ents[idx].flag & FLAG_DELETED)) return false;
     ents[idx].flag |= FLAG_SEEN;
     if (ents[idx].mtime != mtime || ents[idx].size != size) return false;
+    /* "" album is not a real ID3 result (scan writes "Unknown Album").
+     * Load-fallback and a later commit of that fallback both look like a
+     * cache hit unless we force a tag re-read. */
+    if ((ents[idx].flag & FLAG_TAGS_INCOMPLETE) || !ents[idx].album || !ents[idx].album[0])
+        return false;
     if (out) fill_song(idx, out);
     return true;
 }

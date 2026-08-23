@@ -1351,6 +1351,7 @@ static void handle_connection(int cfd) {
             } else if (strcmp(path_only, "/api/playlists") == 0) {
                 char created_path[512];
                 bool created = playlist_files_create(PLAYLISTS_DIR, name, song_path, created_path, sizeof(created_path));
+                if (created) metadata_db_playlist_insert_one(created_path);
                 send_response(cfd, created ? "200 OK" : "500 Internal Server Error", "text/plain",
                                created ? "OK" : "Failed to create playlist");
             } else {

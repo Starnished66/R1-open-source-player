@@ -306,15 +306,12 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         return true;
     }
 
-    if (strcasecmp(ext, ".m4a") == 0) {
-        /* .m4a is a container, not a codec -- peek which one is actually
+    if (strcasecmp(ext, ".m4a") == 0 || strcasecmp(ext, ".m4b") == 0) {
+        /* .m4a/.m4b is a container, not a codec -- peek which one is actually
          * inside (ALAC or AAC) before picking a decoder. The real decoders
          * each open their own mp4_demux_t; this one is just for the peek. */
-        mp4_demux_t * peek = mp4_demux_open(path);
-        if (!peek) return false;
         char fourcc[5];
-        mp4_demux_get_codec_fourcc(peek, fourcc);
-        mp4_demux_close(peek);
+        if (!mp4_demux_peek_codec(path, fourcc)) return false;
 
         if (strcmp(fourcc, "alac") == 0) {
             dec->type = DECODER_ALAC;

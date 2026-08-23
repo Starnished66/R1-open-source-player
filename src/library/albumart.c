@@ -3,8 +3,8 @@
  * Copyright (C) 2007 Nicolas Pennequin (original search order)
  * Copyright (C) Open HiBy Player contributors (POSIX host)
  *
- * Search paths and invalid-character folding follow Rockbox. Storage is
- * the music-root .rockbox/albumart directory, same as ROCKBOX_DIR. */
+ * Search paths and invalid-character folding follow Rockbox. Sized thumbs
+ * are stored under .open_hiby_player/albumart, next to tagcache. */
 
 #include "albumart.h"
 
@@ -18,12 +18,11 @@
 #include <stdint.h>
 
 #ifdef HOST_BUILD
-  #define MUSIC_ROOT_DIR "./music"
+  #define OPEN_HIBY_DIR "./.open_hiby_player"
 #else
-  #define MUSIC_ROOT_DIR "/data/mnt/sd_0"
+  #define OPEN_HIBY_DIR "/data/mnt/sd_0/.open_hiby_player"
 #endif
-#define ROCKBOX_DIR MUSIC_ROOT_DIR "/.rockbox"
-#define ALBUMART_DIR ROCKBOX_DIR "/albumart"
+#define ALBUMART_DIR OPEN_HIBY_DIR "/albumart"
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -234,7 +233,7 @@ bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, 
     const char * artist = info->albumartist[0] ? info->albumartist : info->artist;
     if (!artist[0] || !info->album[0]) return false;
 
-    mkdir(ROCKBOX_DIR, 0755);
+    mkdir(OPEN_HIBY_DIR, 0755);
     mkdir(ALBUMART_DIR, 0755);
 
     char path[PATH_MAX], tmp[PATH_MAX + 16];

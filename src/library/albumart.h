@@ -11,7 +11,7 @@
  *   ./<album><size>.{jpeg,jpg,png,bmp}
  *   ./cover<size>.{jpeg,jpg,png,bmp}
  *   ./folder.{jpg,jpeg,png}  (unsized pass only)
- *   <musicroot>/.rockbox/albumart/<artist>-<album><size>.{jpeg,jpg,png,bmp}
+ *   <musicroot>/.open_hiby_player/albumart/<artist>-<album><size>.{jpeg,jpg,png,bmp}
  *   same album/cover names in the parent directory
  * <size> is ".WxH" or empty for a generic file. */
 
@@ -25,7 +25,7 @@ typedef struct {
 bool albumart_find(const albumart_info_t * info, char * buf, size_t buflen, int width, int height);
 bool albumart_search_files(const albumart_info_t * info, const char * size_string, char * buf, size_t buflen);
 
-/* Writes <musicroot>/.rockbox/albumart/<artist>-<album>.WxH.bmp from RGB565.
+/* Writes <musicroot>/.open_hiby_player/albumart/<artist>-<album>.WxH.bmp from RGB565.
  * Source cover/audio mtime is stored in the BMP reserved field so a later
  * load can detect a replaced cover. */
 bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, const uint16_t * pixels);

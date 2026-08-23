@@ -1113,32 +1113,11 @@ static void compact_list_cancel_pending_job(compact_list_virtual_data_t * data) 
     if (data->poll_timer) lv_timer_pause(data->poll_timer);
 }
 
-/* Paged mode only -- kicks off a background refetch of cache_labels[] via
- * fetch_page() if the current cache doesn't already cover [first,
- * first+POOL_SIZE) AND no fetch is currently in flight for this list.
- * Centers the new cache page around `first` with generous overscan on both
- * sides so a scroll continuing in the same direction doesn't immediately
- * fall back out of the cached range and re-fetch again next frame. One
- * fetch_page() call, not one per row -- COMPACT_LIST_PAGE_CACHE_SIZE rows at
- * once.
- *
- * Real-device concern this replaces a synchronous version of: fetch_page()
- * ultimately reads the on-disk DB (metadata_db.c) on the SD card -- calling
- * it directly from here (compact_list_update_window(), itself called from
- * the LV_EVENT_SCROLL handler) blocked the whole UI/render thread for
- * however long that read took, on every single cache miss. At most one
- * fetch is ever in flight per list (the `pending_job` check below) --
- * a second cache miss arriving while one's already running just waits for
- * it, rather than piling up concurrent reads against the same list; the
- * next scroll tick (or compact_list_poll_fetch_cb() once it lands) tries
- * again if the window has moved further since. */
-static void compact_list_ensure_cache(lv_obj_t * list, compact_list_virtual_data_t * data, int first) {
-    int window_end = first + COMPACT_LIST_POOL_SIZE;
-    bool covered = data->cache_start >= 0 && first >= data->cache_start &&
-                    window_end <= data->cache_start + data->cache_count;
-    if (covered) return;
-    if (data->pending_job) return;
-
+/* Centers a COMPACT_LIST_PAGE_CACHE_SIZE fetch around `first` with the same
+ * overscan compact_list_ensure_cache() uses for both the sync first fill
+ * and the later async scroll misses. Returns the row count to request
+ * (0 at the empty-list edge); writes the logical start into *out_start. */
+static int compact_list_page_range(const compact_list_virtual_data_t * data, int first, int * out_start) {
     int fetch_start = first - (COMPACT_LIST_PAGE_CACHE_SIZE - COMPACT_LIST_POOL_SIZE) / 2;
     if (fetch_start < 0) fetch_start = 0;
     int max_start = data->item_count - COMPACT_LIST_PAGE_CACHE_SIZE;
@@ -1148,6 +1127,66 @@ static void compact_list_ensure_cache(lv_obj_t * list, compact_list_virtual_data
     int want = COMPACT_LIST_PAGE_CACHE_SIZE;
     if (fetch_start + want > data->item_count) want = data->item_count - fetch_start;
     if (want < 0) want = 0;
+    *out_start = fetch_start;
+    return want;
+}
+
+/* First paint / provider-reset path -- fill cache_rows[] on this thread so
+ * compact_list_update_window() never draws empty labels while a background
+ * job is still in flight. Album/artist group pages are already in RAM;
+ * All Songs is a bounded 128-row copy. Scroll misses stay async (see
+ * compact_list_ensure_cache() below) so a stuck SD read cannot freeze
+ * LV_EVENT_SCROLL. */
+static void compact_list_fill_cache_now(compact_list_virtual_data_t * data, int first) {
+    int fetch_start = 0;
+    int want = compact_list_page_range(data, first, &fetch_start);
+    if (want == 0) {
+        data->cache_count = 0;
+        data->cache_start = fetch_start;
+        return;
+    }
+    int n = data->fetch_page(data->provider_ctx, fetch_start, want, data->cache_rows);
+    if (n < 0) n = 0;
+    if (n > want) n = want;
+    data->cache_count = n;
+    data->cache_start = fetch_start;
+}
+
+/* Paged mode only -- kicks off a background refetch of cache_rows[] via
+ * fetch_page() if the current cache doesn't already cover [first,
+ * first+POOL_SIZE) AND no fetch is currently in flight for this list.
+ * Centers the new cache page around `first` with generous overscan on both
+ * sides so a scroll continuing in the same direction doesn't immediately
+ * fall back out of the cached range and re-fetch again next frame. One
+ * fetch_page() call, not one per row -- COMPACT_LIST_PAGE_CACHE_SIZE rows at
+ * once.
+ *
+ * An empty cache (cache_start < 0, including right after compact_list_set_
+ * paged_provider()) is filled synchronously instead: painting the visible
+ * window as blank cards with placeholder art, then filling names only after
+ * a 50ms poll, was the Albums-submenu populate order on a 3k-album library.
+ * Later scroll misses keep the original async path so a stuck SD read
+ * cannot freeze the scroll handler. At most one fetch is ever in flight
+ * per list (the `pending_job` check below) -- a second cache miss arriving
+ * while one's already running just waits for it, rather than piling up
+ * concurrent reads against the same list; the next scroll tick (or
+ * compact_list_poll_fetch_cb() once it lands) tries again if the window
+ * has moved further since. */
+static void compact_list_ensure_cache(lv_obj_t * list, compact_list_virtual_data_t * data, int first) {
+    (void) list;
+    int window_end = first + COMPACT_LIST_POOL_SIZE;
+    bool covered = data->cache_start >= 0 && first >= data->cache_start &&
+                    window_end <= data->cache_start + data->cache_count;
+    if (covered) return;
+    if (data->pending_job) return;
+
+    if (data->cache_start < 0) {
+        compact_list_fill_cache_now(data, first);
+        return;
+    }
+
+    int fetch_start = 0;
+    int want = compact_list_page_range(data, first, &fetch_start);
 
     if (want == 0) {
         data->cache_count = 0;
@@ -1228,40 +1267,53 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
         if (!force_repaint && data->row_logical_index[slot] == index && index != targeted_index) continue;
         data->row_logical_index[slot] = index;
         ((compact_list_row_ctx_t *) data->row_ctx[slot])->logical_index = index;
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_y(row, COMPACT_LIST_TOP_PAD + index * data->row_stride);
+        const char * label = NULL;
+        int64_t identity = 0;
+        const char * trailing_asset = NULL;
         if (data->fetch_page) {
             int cache_idx = index - data->cache_start;
             bool cached = cache_idx >= 0 && cache_idx < data->cache_count;
             compact_list_page_row_t * info = cached ? &data->cache_rows[cache_idx] : NULL;
-            lv_label_set_text(row, info ? info->label : "");
-            lv_obj_t * trailing = data->trailing_images[slot];
-            if (info && info->trailing_asset[0]) {
-                lv_image_set_src(trailing, asset_path(info->trailing_asset));
-                lv_obj_remove_flag(trailing, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_style_pad_right(row, 70, 0);
-            } else {
-                lv_obj_add_flag(trailing, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_style_pad_right(row, LIST_ROW_LABEL_INSET, 0);
+            /* A cache miss used to paint a visible card with an empty label
+             * and (for Albums) placeholder art. Names then arrived after the
+             * async fetch -- and after pad_left/image changes had already
+             * laid the still-empty text out, so the real title waited on a
+             * later image refresh to become visible. Hide the slot until
+             * the page lands instead of showing that empty card. */
+            if (!info) {
+                lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+                data->row_logical_index[slot] = -1;
+                ((compact_list_row_ctx_t *) data->row_ctx[slot])->logical_index = -1;
+                continue;
             }
-            if (data->row_decorator)
-                data->row_decorator(list, row, data->leading_images[slot], index, slot,
-                                    info ? info->identity : 0, data->row_decorator_ctx);
+            label = info->label;
+            identity = info->identity;
+            trailing_asset = info->trailing_asset[0] ? info->trailing_asset : NULL;
         } else {
-            lv_label_set_text(row, data->items[index].label);
-            lv_obj_t * trailing = data->trailing_images[slot];
-            if (data->items[index].trailing_asset) {
-                lv_image_set_src(trailing, asset_path(data->items[index].trailing_asset));
-                lv_obj_remove_flag(trailing, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_style_pad_right(row, 70, 0);
-            } else {
-                lv_obj_add_flag(trailing, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_style_pad_right(row, LIST_ROW_LABEL_INSET, 0);
-            }
-            if (data->row_decorator)
-                data->row_decorator(list, row, data->leading_images[slot], index, slot,
-                                    data->items[index].identity, data->row_decorator_ctx);
+            label = data->items[index].label;
+            identity = data->items[index].identity;
+            trailing_asset = data->items[index].trailing_asset;
         }
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t * trailing = data->trailing_images[slot];
+        if (trailing_asset && trailing_asset[0]) {
+            lv_image_set_src(trailing, asset_path(trailing_asset));
+            lv_obj_remove_flag(trailing, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_pad_right(row, 70, 0);
+        } else {
+            lv_obj_add_flag(trailing, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_pad_right(row, LIST_ROW_LABEL_INSET, 0);
+        }
+        /* Pad/image first: lv_label_set_text() measures against the current
+         * content box, and the album-art decorator's pad_left=100 is what
+         * keeps the title to the right of the 72px cover. Setting the text
+         * before that pad made the name lay out under the image until a
+         * later thumbnail refresh invalidated the label. */
+        if (data->row_decorator)
+            data->row_decorator(list, row, data->leading_images[slot], index, slot,
+                                identity, data->row_decorator_ctx);
+        lv_label_set_text(row, label ? label : "");
 
         /* The row itself is a label, so LVGL aligns child images against
          * its padded content box rather than against the visible card.

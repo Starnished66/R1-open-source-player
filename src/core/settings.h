@@ -93,9 +93,11 @@ typedef struct {
     bool subsonic_verify_tls;    /* false = accept self-signed certs for this server (opt-in, see http_client.h) */
 
     /* Saved Subsonic server profiles (the "Saved Servers" list). Tagcache
-     * cannot store these; they live here with the rest of credentials so
-     * they survive an unmounted SD card. url is the unique key -- saving
-     * the same URL again replaces credentials rather than duplicating. */
+     * cannot store these. The live list is the /usr/data sidecar
+     * (subsonic_saved_servers.c, via metadata_db.h); this array is a
+     * mirror loaded/saved with the rest of credentials so they survive an
+     * unmounted SD card. url is the unique key -- saving the same URL
+     * again replaces credentials rather than duplicating. */
     struct {
         char url[256];
         char username[128];

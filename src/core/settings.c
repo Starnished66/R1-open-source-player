@@ -1,6 +1,7 @@
 #include "settings.h"
 #include "debug_log.h"
 #include "subprocess.h"
+#include "subsonic_saved_servers.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -193,12 +194,65 @@ static void import_legacy_subsonic_servers(player_settings_t * out) {
     }
 }
 
+/* Sidecar is what gui.c reads (via metadata_db_load_subsonic_servers()).
+ * Union settings.subsonic_saved into it (so a settings-only list from this
+ * tree isn't dropped by an SD TSV left by the other copy), then mirror up
+ * to SETTINGS_SUBSONIC_SAVED_MAX sidecar rows back into settings so
+ * settings_save() still keeps a copy on /usr/data. Identical rows are not
+ * rewritten -- upsert itself skips a no-op save. */
+static void sync_subsonic_saved_sidecar(player_settings_t * out) {
+    subsonic_saved_server_t * rows = NULL;
+    int n = 0;
+    subsonic_saved_servers_load(&rows, &n);
+
+    bool wrote = false;
+    for (int i = 0; i < out->subsonic_saved_count; i++) {
+        if (!out->subsonic_saved[i].url[0]) continue;
+        int found = -1;
+        for (int j = 0; j < n; j++) {
+            if (strcmp(rows[j].url, out->subsonic_saved[i].url) == 0) {
+                found = j;
+                break;
+            }
+        }
+        if (found >= 0 && strcmp(rows[found].username, out->subsonic_saved[i].username) == 0 &&
+            strcmp(rows[found].password, out->subsonic_saved[i].password) == 0 &&
+            rows[found].verify_tls == out->subsonic_saved[i].verify_tls) {
+            continue;
+        }
+        subsonic_saved_servers_upsert(out->subsonic_saved[i].url, out->subsonic_saved[i].username,
+                                      out->subsonic_saved[i].password, out->subsonic_saved[i].verify_tls);
+        wrote = true;
+    }
+
+    if (wrote) {
+        free(rows);
+        rows = NULL;
+        n = 0;
+        subsonic_saved_servers_load(&rows, &n);
+    }
+
+    if (n > 0) {
+        int copy = n < SETTINGS_SUBSONIC_SAVED_MAX ? n : SETTINGS_SUBSONIC_SAVED_MAX;
+        memset(out->subsonic_saved, 0, sizeof(out->subsonic_saved));
+        out->subsonic_saved_count = copy;
+        for (int i = 0; i < copy; i++) {
+            snprintf(out->subsonic_saved[i].url, sizeof(out->subsonic_saved[i].url), "%s", rows[i].url);
+            snprintf(out->subsonic_saved[i].username, sizeof(out->subsonic_saved[i].username), "%s", rows[i].username);
+            snprintf(out->subsonic_saved[i].password, sizeof(out->subsonic_saved[i].password), "%s", rows[i].password);
+            out->subsonic_saved[i].verify_tls = rows[i].verify_tls;
+        }
+    }
+    free(rows);
+}
+
 bool settings_load(player_settings_t * out) {
     set_defaults(out);
 
     FILE * f = fopen(SETTINGS_FILE_PATH, "r");
     if (!f) {
         import_legacy_subsonic_servers(out);
+        sync_subsonic_saved_sidecar(out);
         return false;
     }
 
@@ -367,6 +421,7 @@ bool settings_load(player_settings_t * out) {
     out->sleep_timer_minutes = nearest_sleep_timer_step(out->sleep_timer_minutes);
 
     import_legacy_subsonic_servers(out);
+    sync_subsonic_saved_sidecar(out);
 
     fclose(f);
     return true;

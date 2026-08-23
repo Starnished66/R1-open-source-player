@@ -92,16 +92,13 @@ typedef struct {
  * filename, a placeholder image, or no gain adjustment in that case. */
 void metadata_read(const char * path, track_metadata_t * out);
 
-/* Same as metadata_read(), but the actual parse runs in a short-lived
- * child process, SIGKILLed and reaped if it doesn't finish within
- * timeout_ms -- guarantees the caller regains control in bounded time no
- * matter what the underlying parser does (a pathologically slow/infinite
- * loop on malformed data, a kernel-blocked read, or even a crash), unlike
- * metadata_read() alone. On timeout (or if the child crashes before
- * finishing), *out is left the same as metadata_read()'s own "couldn't
- * read tags" case: zeroed, every has_* flag false. picture_data/
- * picture_size/lyrics always come back NULL/0 regardless of what the file
- * actually has -- see the .c file's own comment for why. */
+/* Library-scan tag read. MP3/AAC (our own bounded ID3 parser) run
+ * in-process. Formats that feed vendored/unbounded decoders (FLAC and
+ * the other container walkers) still run in a short-lived child,
+ * SIGKILLed and reaped if they don't finish within timeout_ms -- see
+ * metadata.c. On timeout or child crash, *out is the same as
+ * metadata_read()'s "couldn't read tags" case: zeroed, every has_* flag
+ * false. picture_data/picture_size/lyrics always come back NULL/0. */
 void metadata_read_isolated(const char * path, track_metadata_t * out, int timeout_ms);
 
 #endif /* METADATA_H */

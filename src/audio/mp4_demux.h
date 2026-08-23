@@ -14,6 +14,10 @@ typedef struct mp4_demux mp4_demux_t;
 
 mp4_demux_t * mp4_demux_open(const char * path);
 
+/* Codec fourcc only ("alac"/"mp4a"). Opens and closes a demux; long files
+ * stay compact so this is safe as an extension-dispatch peek. */
+bool mp4_demux_peek_codec(const char * path, char out_fourcc[5]);
+
 /* 4-character codec identifier from the sample description, e.g. "alac" or
  * "mp4a" (AAC). Not null-terminated by convention, so this returns exactly
  * 4 bytes; out_fourcc must have room for 5 (this null-terminates for

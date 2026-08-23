@@ -143,6 +143,41 @@ int main(void) {
     if (metadata_db_get_song_title_offset("/music/a.flac") < 0) fail("compact title offset");
     unsetenv("TAGCACHE_FORCE_COMPACT");
 
+    {
+        char * pl_a = "/tmp/ohp_tagcache_test/Playlists/a.m3u";
+        char * pl_b = "/tmp/ohp_tagcache_test/Playlists/b.m3u";
+        char * batch[] = { pl_a };
+        metadata_db_playlist_replace_all(batch, 1);
+        metadata_db_playlist_insert_one(pl_b);
+        char ** paths = NULL;
+        int pn = 0;
+        metadata_db_load_all_playlists(&paths, &pn);
+        if (pn != 2) fail("playlist cache count");
+        metadata_db_playlist_delete_one(pl_a);
+        for (int i = 0; i < pn; i++) free(paths[i]);
+        free(paths);
+        paths = NULL;
+        pn = 0;
+        metadata_db_load_all_playlists(&paths, &pn);
+        if (pn != 1 || strcmp(paths[0], pl_b) != 0) fail("playlist cache delete");
+        free(paths[0]);
+        free(paths);
+
+        metadata_db_subsonic_server_save("https://b.example", "u2", "p2", false);
+        metadata_db_subsonic_server_save("https://a.example", "u", "p", true);
+        metadata_db_subsonic_server_save("https://a.example", "u", "p-new", true);
+        metadata_db_subsonic_server_save("https://bad.example\t", "u", "p", true);
+        subsonic_server_row_t * srows = NULL;
+        int sn = 0;
+        metadata_db_load_subsonic_servers(&srows, &sn);
+        if (sn != 2) fail("subsonic saved count");
+        if (strcmp(srows[0].url, "https://a.example") != 0) fail("subsonic saved sort");
+        if (strcmp(srows[0].password, "p-new") != 0) fail("subsonic saved upsert");
+        if (srows[0].verify_tls != true) fail("subsonic saved tls");
+        if (strcmp(srows[1].url, "https://b.example") != 0) fail("subsonic saved second");
+        free(srows);
+    }
+
     metadata_db_close();
     printf("ok\n");
     return 0;

@@ -189,7 +189,7 @@ Passed as the 2nd argument to `set_home_layout()` / 3rd to
 | `row_gap` | int, px | `6` | `0`-`24` | list mode (native or `mode="list"`) | Vertical spacing between rows. |
 | `tile_gap` | int, px | `0` (flush cells, thin divider lines) | `0`-`40` | tile mode | Visible space between adjacent tiles; a nonzero value insets each tile within its grid cell and drops the divider lines (redundant once a real gap exists). |
 | `title_align` | string | `"left"` | `"left"`, `"center"`, `"right"` | every screen with a title | See [Title styling](#title-styling). |
-| `title_size` | string | native (28px) | `"small"`, `"medium"`, `"large"`, `"mono"` | every screen with a title | Same font tier scale as item `text_size`. |
+| `title_size` | string | native (28px) | `"small"`, `"medium"`, `"large"`, `"mono"` | every screen with a title | A larger scale than item `text_size` (`22`/`28`/`40px`) -- see [Title styling](#title-styling) for why. |
 | `title_underline` | bool | `false` | -- | every screen with a title | Adds an underline text-decoration to the title label. |
 
 <a id="screen-ids"></a>
@@ -250,9 +250,15 @@ Two things to know about `title_align = "center"`/`"right"` specifically:
   it's "centered within the available space next to the arrow," not
   "centered across the raw screen width."
 
-`title_size` reuses the exact same `"small"`/`"medium"`/`"large"`/
-`"mono"` font-tier scale as the per-item `text_size` field above, so a
-title can match a plugin's own row font if desired.
+`title_size` accepts the same `"small"`/`"medium"`/`"large"`/`"mono"`
+names as the per-item `text_size` field above, but maps to a **different,
+larger** scale: the title's own native default is already `28px`
+(equivalent to item `text_size = "large"`), so reusing the item scale
+directly would make `title_size = "large"` land exactly on that default
+-- a silent no-op. `"small"` is `22px`, `"medium"` is the native `28px`
+(no visible change from the default), and `"large"` is `40px` --
+genuinely, noticeably bigger, regardless of the device's own
+accessibility font-size setting.
 
 <a id="colors"></a>
 

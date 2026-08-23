@@ -249,6 +249,26 @@ static lv_obj_t * build_title(lv_obj_t * scr, const char * title) {
     return label;
 }
 
+/* Title-specific text_size scale -- deliberately NOT pill_row_resolve_
+ * text_size()'s own item-tier scale (small/medium/large -> 16/22/28px).
+ * build_title()'s own native default is already ui_size_28 (28-40px
+ * depending on the device's accessibility font-size-tier setting, see
+ * apply_font_size_tier() in gui.c) -- reusing the item scale directly
+ * would make title_size = "large" land exactly on that native default, a
+ * silent no-op (real feedback: "make title BIG" after setting exactly
+ * that). Shifted up so every tier reads as a real, visible change, with
+ * "large" landing on lv_font_montserrat_40 -- deliberately NOT ui_size_28
+ * itself, so a plugin asking for a big title gets one regardless of
+ * whatever accessibility tier the device is already on. */
+static const lv_font_t * title_resolve_text_size(const char * text_size) {
+    if (!text_size) return ui_size_28;
+    if (strcmp(text_size, "small") == 0) return &app_font_22;
+    if (strcmp(text_size, "medium") == 0) return ui_size_28;
+    if (strcmp(text_size, "large") == 0) return &lv_font_montserrat_40;
+    if (strcmp(text_size, "mono") == 0) return &lv_font_unscii_16;
+    return ui_size_28;
+}
+
 /* Applies an optional plugin title-style override (screen_title_style_t)
  * on top of build_title()'s own defaults. `has_back_btn` decides how
  * "center"/"right" reflow the label's box: a screen with a back button
@@ -262,16 +282,32 @@ static lv_obj_t * build_title(lv_obj_t * scr, const char * title) {
 static void apply_title_style(lv_obj_t * label, const screen_title_style_t * style, bool has_back_btn) {
     if (!style) return;
 
-    if (style->size) lv_obj_set_style_text_font(label, pill_row_resolve_text_size(style->size), 0);
+    const lv_font_t * font = NULL;
+    if (style->size) {
+        font = title_resolve_text_size(style->size);
+        lv_obj_set_style_text_font(label, font, 0);
+    }
     if (style->underline) lv_obj_set_style_text_decor(label, LV_TEXT_DECOR_UNDERLINE, 0);
 
-    if (style->align && strcmp(style->align, "left") != 0) {
+    bool reflow = style->align && strcmp(style->align, "left") != 0;
+    if (reflow) {
         lv_text_align_t lv_align = strcmp(style->align, "right") == 0 ? LV_TEXT_ALIGN_RIGHT : LV_TEXT_ALIGN_CENTER;
         lv_obj_set_style_text_align(label, lv_align, 0);
-        int32_t left_inset = has_back_btn ? BUILD_TITLE_LEFT_INSET : 0;
-        int32_t right_margin = has_back_btn ? BUILD_TITLE_RIGHT_MARGIN : 0;
+    }
+
+    /* Re-run build_title()'s own box/position math whenever the font
+     * changed (a different line height than the hardcoded-28px vertical
+     * centering build_title() assumed, which would otherwise drift out of
+     * the TITLE_ROW_HEIGHT band for anything but the native default) or
+     * the alignment changed (needs a differently-inset box, see `reflow`
+     * above) -- keeps the title correctly vertically centered regardless
+     * of which knob a plugin actually used. */
+    if (style->size || reflow) {
+        int32_t left_inset = reflow ? (has_back_btn ? BUILD_TITLE_LEFT_INSET : 0) : BUILD_TITLE_LEFT_INSET;
+        int32_t right_margin = reflow ? (has_back_btn ? BUILD_TITLE_RIGHT_MARGIN : 0) : BUILD_TITLE_RIGHT_MARGIN;
         lv_obj_set_width(label, lv_display_get_horizontal_resolution(lv_display_get_default()) - left_inset - right_margin);
-        lv_obj_align(label, LV_ALIGN_TOP_LEFT, left_inset, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+        int32_t line_h = lv_font_get_line_height(font ? font : lv_obj_get_style_text_font(label, 0));
+        lv_obj_align(label, LV_ALIGN_TOP_LEFT, left_inset, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - line_h) / 2);
     }
 }
 

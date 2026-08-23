@@ -158,6 +158,7 @@ icon grid has a fixed centered icon+label layout with no room for these).
 | `border_color` | `0xRRGGBB` int | none | any | both | Inert alone -- needs `border_width > 0` too. |
 | `border_width` | int, px | `0` (no border) | `0`-`8` | both | `0`/omitted draws no border regardless of `border_color`. |
 | `icon` | bool | `true` (shown) | -- | both | `false` drops the item's launcher icon. Tile mode: label alone, centered. List mode: also reclaims the space normally reserved for the icon, so `align = "left"` sits flush against the row's real left edge. |
+| `offset_x` | int, px (signed) | `0` (no shift) | `-150`-`150` | both | Pure visual reposition from the item's normal centered position -- negative shifts left, positive shifts right. A real coordinate shift (LVGL's flex/grid layouts fold it into their own placement math), not a draw-only effect, so touch hit-testing moves with it. The realistic use case is an alternating `+N`/`-N` by row/item index for a staggered "brick" list -- see the [full example](#full-example). |
 | `height` | int, px | native (124px) | `48`-`220` | **list only** | Resizes the row. |
 | `width` | int, px | native (448px) | `240`-`~608px` (device width dependent) | **list only** | Resizes and re-centers the row. |
 | `align` | string | `"left"` | `"left"`, `"center"`, `"right"` | **list only** | Only the label's text position -- the icon (if shown) always stays at the row's left edge. |
@@ -394,6 +395,8 @@ local function themed_layout(keys)
             text_size = "large",
             align = "center",
             height = 64,
+            -- Staggered "brick" look: row 1 left, row 2 right, row 3 left, ...
+            offset_x = (i % 2 == 1) and -40 or 40,
         }
     end
     return layout

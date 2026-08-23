@@ -149,6 +149,10 @@ typedef struct {
      * bug report on that in build_icon_grid_screen()), so this is strictly
      * opt-in, never a default appearance change. border_width in px. */
     bool has_border;     uint32_t border_color; int32_t border_width;
+    /* Signed px -- lv_obj_set_style_translate_x() (screen_builders.c), a
+     * pure visual reposition from this tile's normal grid-cell-centered
+     * position. Every native tile leaves this false (0 = no shift). */
+    bool has_offset_x;   int32_t offset_x;
 } icon_grid_item_t;
 
 /* Titled screen: real back-arrow button (top-left, invokes back_btn_cb) and
@@ -284,6 +288,11 @@ typedef struct {
      * whether the fill underneath is the PNG pill sprite or a plain color,
      * so it works on a native (unresized) row too. border_width in px. */
     bool has_border;     uint32_t border_color; int32_t border_width;
+
+    /* Same meaning as icon_grid_item_t's own offset_x -- works on both the
+     * PNG-pill and plain-fill paths, same independence from `resized` the
+     * border fields above already have. */
+    bool has_offset_x;   int32_t offset_x;
 
     /* NULL/"left" (default) = today's exact layout (label left-aligned,
      * starting right after any icon -- unaffected by this field). "center"/

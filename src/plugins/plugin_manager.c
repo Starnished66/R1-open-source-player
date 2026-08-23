@@ -1055,6 +1055,12 @@ static const plugin_screen_def_t plugin_screen_defs[] = {
  * accent border is the realistic use case here, not a thick outline. */
 #define PLUGIN_SCREEN_BORDER_WIDTH_MAX 8
 
+/* Ceiling on a plugin-chosen |offset_x| -- cosmetic, clamped not errored,
+ * same split PLUGIN_SCREEN_RADIUS_MAX already makes for radius. Generous
+ * enough for a real zig-zag/staggered list look (see PLUGIN_STYLING.md)
+ * without a large enough shift routinely pushing a narrow row off-screen. */
+#define PLUGIN_SCREEN_OFFSET_X_MAX 150
+
 /* Shared by is_valid_screen_text_size() below -- "mono" (lv_font_unscii_16,
  * see lv_conf.h) is only offered through set_screen_layout()/set_home_
  * layout() for now (list mode), not through register_list_item()/
@@ -1072,6 +1078,7 @@ typedef struct {
     bool has_radius;     int32_t radius;      /* px, clamped to 0..PLUGIN_SCREEN_RADIUS_MAX */
     bool has_bg_alpha;   uint8_t bg_alpha;    /* 0-255, lv_opa_t scale */
     bool has_border;     uint32_t border_color; int32_t border_width; /* px */
+    bool has_offset_x;   int32_t offset_x;    /* px, signed, -PLUGIN_SCREEN_OFFSET_X_MAX..+MAX */
 
     /* ---- List-mode-only extensions (plugin.set_screen_layout()/set_home_
      * layout(), PLUGINS.md). Ignored in tile mode -- only read once
@@ -1257,9 +1264,9 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
 
         const char * key;
         bool has_bg_color = false, has_text_color = false, has_radius = false, has_bg_alpha = false;
-        bool has_border = false;
+        bool has_border = false, has_offset_x = false;
         uint32_t bg_color = 0, text_color = 0, border_color = 0;
-        int32_t radius = 0, border_width = 0;
+        int32_t radius = 0, border_width = 0, offset_x = 0;
         uint8_t bg_alpha = 0;
         /* List-mode-only extensions (PLUGINS.md) -- silently ignored in tile
          * mode, same as bg_color/text_color/radius/bg_alpha are never
@@ -1331,6 +1338,24 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
                 if (w > PLUGIN_SCREEN_BORDER_WIDTH_MAX) w = PLUGIN_SCREEN_BORDER_WIDTH_MAX;
                 border_width = (int32_t) w;
                 has_border = border_width > 0;
+            }
+            lua_pop(L, 1);
+
+            /* offset_x -- a pure visual reposition (lv_obj_set_style_translate_x(),
+             * screen_builders.c), not a resize/refill like height/width/bg_color
+             * above -- shifts the tile/row that many px left (negative) or right
+             * (positive) from its normal centered position, independent of every
+             * other property here. The realistic use case is an alternating
+             * zig-zag list (a plugin computing +/-N by row index -- see
+             * PLUGIN_STYLING.md), not a one-off nudge, hence the generous-but-
+             * bounded clamp rather than PLUGIN_SCREEN_BORDER_WIDTH_MAX's tiny one. */
+            lua_getfield(L, -1, "offset_x");
+            if (!lua_isnil(L, -1)) {
+                has_offset_x = true;
+                lua_Integer ox = lua_tointeger(L, -1);
+                if (ox < -PLUGIN_SCREEN_OFFSET_X_MAX) ox = -PLUGIN_SCREEN_OFFSET_X_MAX;
+                if (ox > PLUGIN_SCREEN_OFFSET_X_MAX) ox = PLUGIN_SCREEN_OFFSET_X_MAX;
+                offset_x = (int32_t) ox;
             }
             lua_pop(L, 1);
 
@@ -1423,6 +1448,8 @@ static int do_set_screen_layout(lua_State * L, const char * screen_id, int keys_
         new_items[i].has_border = has_border;
         new_items[i].border_color = border_color;
         new_items[i].border_width = border_width;
+        new_items[i].has_offset_x = has_offset_x;
+        new_items[i].offset_x = offset_x;
         new_items[i].row_height = row_height;
         new_items[i].row_width = row_width;
         snprintf(new_items[i].text_align, sizeof(new_items[i].text_align), "%s", text_align);
@@ -1518,6 +1545,15 @@ bool plugin_manager_get_screen_item_border(const char * screen_id, int index, ui
         return false;
     *out_color = plugin_screen_items[slot][index].border_color;
     *out_width = plugin_screen_items[slot][index].border_width;
+    return true;
+}
+
+bool plugin_manager_get_screen_item_offset_x(const char * screen_id, int index, int32_t * out_offset_x) {
+    int slot = plugin_screen_slot(screen_id);
+    if (slot < 0 || index < 0 || index >= plugin_screen_item_count[slot] ||
+        !plugin_screen_items[slot][index].has_offset_x)
+        return false;
+    *out_offset_x = plugin_screen_items[slot][index].offset_x;
     return true;
 }
 

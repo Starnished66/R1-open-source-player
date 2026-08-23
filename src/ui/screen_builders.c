@@ -422,6 +422,11 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
          * edges of every tile, confirmed on a real-device screenshot. */
         lv_obj_set_style_border_width(tile, item->has_border ? item->border_width : 0, 0);
         if (item->has_border) lv_obj_set_style_border_color(tile, lv_color_hex(item->border_color), 0);
+        /* Pure visual reposition -- lv_grid.c's own item-placement code adds
+         * this into the tile's real computed coords (confirmed by reading
+         * it), not just a draw-time-only transform, so touch hit-testing
+         * moves with it too. Every native tile leaves this at 0 (no-op). */
+        lv_obj_set_style_translate_x(tile, item->has_offset_x ? item->offset_x : 0, 0);
         lv_obj_set_style_pad_all(tile, ICON_GRID_TILE_PAD, 0);
         lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
@@ -871,6 +876,11 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_obj_set_style_bg_opa(row, (resized && item->has_bg_alpha) ? item->bg_alpha : LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, item->has_border ? item->border_width : 0, 0);
         if (item->has_border) lv_obj_set_style_border_color(row, lv_color_hex(item->border_color), 0);
+        /* Same lv_flex.c-honored real reposition as icon_grid_item_t's own
+         * offset_x (see build_icon_grid_screen()'s own comment on this) --
+         * this list container uses flex, not grid, but flex's own item-
+         * placement code adds translate the same way. */
+        lv_obj_set_style_translate_x(row, item->has_offset_x ? item->offset_x : 0, 0);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t * label = lv_label_create(row);

@@ -296,6 +296,13 @@ bool plugin_manager_get_screen_item_bg_alpha(const char * screen_id, int index, 
 bool plugin_manager_get_screen_item_border(const char * screen_id, int index, uint32_t * out_color,
                                             int32_t * out_width);
 
+/* options.item_keys[i].offset_x -- signed px, -150..150 (see
+ * PLUGIN_SCREEN_OFFSET_X_MAX, plugin_manager.c). A pure visual reposition
+ * of the tile/row from its normal centered position, e.g. for an
+ * alternating zig-zag list -- see PLUGIN_STYLING.md. Returns false (no
+ * override) if this item never set it. */
+bool plugin_manager_get_screen_item_offset_x(const char * screen_id, int index, int32_t * out_offset_x);
+
 /* List-mode-only per-item extensions (set_screen_layout()'s/set_home_
  * layout()'s per-item config table gains `height`, `width`, `align`,
  * `accessory`, `text_size`, `icon`, PLUGINS.md) -- meaningless in tile

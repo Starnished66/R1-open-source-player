@@ -16060,6 +16060,11 @@ static int resolve_screen_items(const char * screen_id, const screen_native_def_
             out_items[count].border_color = border_color;
             out_items[count].border_width = border_width;
         }
+        int32_t offset_x;
+        if (plugin_manager_get_screen_item_offset_x(screen_id, i, &offset_x)) {
+            out_items[count].has_offset_x = true;
+            out_items[count].offset_x = offset_x;
+        }
         /* icon = false (PLUGINS.md) -- previously list-mode-only (resolve_
          * screen_list_items() below already honors it), now also honored
          * in tile mode: NULLing both icon fields here reaches build_icon_
@@ -16122,6 +16127,8 @@ static void resolve_screen_list_items(const char * screen_id, const icon_grid_it
             .has_border = items[i].has_border,
             .border_color = items[i].border_color,
             .border_width = items[i].border_width,
+            .has_offset_x = items[i].has_offset_x,
+            .offset_x = items[i].offset_x,
             .row_height = has_row_height ? row_height : 0,
             .row_width = has_row_width ? row_width : 0,
             .text_size = plugin_manager_get_screen_item_text_size(screen_id, i),

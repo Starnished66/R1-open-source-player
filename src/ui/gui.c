@@ -4932,7 +4932,14 @@ static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t 
 static bool cover_decode_pending_valid = false;
 static cover_decode_request_t cover_decode_pending;
 
-#define EXTERNAL_COVER_MAX_BYTES (16U * 1024U * 1024U)
+/* The compressed file coexists with cover_decode.c's RGB888 decode buffer
+ * (up to 8 MiB), the audio pipeline, LVGL framebuffers, and the database on
+ * a roughly 56 MiB target. A former 16 MiB allowance could therefore OOM
+ * the process merely by opening Albums, even though the final thumbnail is
+ * only 72x72. Ordinary folder artwork is far below this conservative cap;
+ * oversized art falls back to the default image instead of risking the
+ * whole player. */
+#define EXTERNAL_COVER_MAX_BYTES (4U * 1024U * 1024U)
 
 static bool load_external_cover(const char * track_path, uint8_t ** out_data, uint32_t * out_size) {
     static const char * names[] = {
@@ -6636,6 +6643,7 @@ static void poll_bt_connect(void);
 static void poll_bt_forget(void);
 static void poll_library_rescan(void);
 static void poll_usb_mode_switch(void);
+static void poll_usb_storage_hotplug(void);
 static void poll_sd_card_hotplug(void);
 static void poll_sd_format(void);
 static void poll_import_web_stop(void);
@@ -7555,6 +7563,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_import_web_stop();
     poll_sleep_timer();
     poll_usb_mode_switch();
+    poll_usb_storage_hotplug();
     poll_sd_card_hotplug();
     poll_cover_decode();
     poll_lyrics_load();
@@ -13345,6 +13354,8 @@ static void * album_thumb_gen_thread_func(void * arg) {
     atomic_store(&album_thumb_gen_done_count, 0);
 
 #define ALBUM_THUMB_GEN_BATCH 64
+#define ALBUM_THUMB_GEN_WARM_LIMIT 2048
+#define ALBUM_THUMB_GEN_YIELD_US 10000
     group_row_t rows[ALBUM_THUMB_GEN_BATCH];
     int offset = 0;
     for (;;) {
@@ -13405,9 +13416,13 @@ static void * album_thumb_gen_thread_func(void * arg) {
 #endif
             free(pixels);
             atomic_fetch_add(&album_thumb_gen_done_count, 1);
+            /* This is cache warming, not foreground scan work. Yield after
+             * every album so sustained decoding and SD writes cannot starve
+             * audio/UI work or pin the CPU at full load for minutes. */
+            usleep(ALBUM_THUMB_GEN_YIELD_US);
         }
         offset += n;
-        if (n < ALBUM_THUMB_GEN_BATCH) break;
+        if (n < ALBUM_THUMB_GEN_BATCH || offset >= ALBUM_THUMB_GEN_WARM_LIMIT) break;
     }
 done:
 #ifdef UI_PERF_TRACE
@@ -13433,6 +13448,7 @@ static void start_album_thumbnail_generation(void) {
 
     int artist_count = 0, album_artist_count = 0, album_count = 0;
     metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
+    if (album_count > ALBUM_THUMB_GEN_WARM_LIMIT) album_count = ALBUM_THUMB_GEN_WARM_LIMIT;
     atomic_store(&album_thumb_gen_done_count, 0);
     atomic_store(&album_thumb_gen_total_count, album_count);
     atomic_store(&album_thumb_gen_cancel, false);
@@ -13450,6 +13466,15 @@ static void start_next_album_thumbnail(void) {
     if (!album_thumbnail_active_list ||
         !album_thumbnail_list_is_visible(album_thumbnail_active_list) ||
         album_thumbnail_scrolling || album_thumbnail_active || album_thumbnail_queue_count <= 0) return;
+    /* Never run two full cover decoders at once on the 56 MiB target. The
+     * post-load warmer can still be finishing its current album after the
+     * Albums screen opens; its cancellation is cooperative. Keep this poll
+     * timer alive and give the visible-row job priority as soon as that
+     * worker exits instead of doubling peak JPEG/PNG memory. */
+    if (atomic_load(&album_thumb_gen_active)) {
+        if (album_thumbnail_poll_timer) lv_timer_resume(album_thumbnail_poll_timer);
+        return;
+    }
     album_thumbnail_request_t * req = malloc(sizeof(*req));
     if (!req) return;
     *req = album_thumbnail_queue[0];
@@ -13494,6 +13519,10 @@ static void album_thumbnail_scroll_cb(lv_event_t * e) {
 }
 
 static void album_thumbnail_begin_screen(lv_obj_t * list) {
+    /* Visible rows are latency-sensitive and the lazy path already writes
+     * the identical persistent entries. Stop warming after its current
+     * decode, then let start_next_album_thumbnail() service this screen. */
+    cancel_album_thumbnail_generation();
     album_thumbnail_active_list = list;
     album_thumbnail_scrolling = false;
     album_thumbnail_queue_count = 0;
@@ -13511,7 +13540,12 @@ static void album_thumbnail_end_screen(lv_obj_t * list) {
 }
 
 static void album_thumbnail_poll_cb(lv_timer_t * timer) {
-    if (!album_thumbnail_active || !album_thumbnail_done) return;
+    if (!album_thumbnail_active) {
+        start_next_album_thumbnail();
+        if (!album_thumbnail_active && !atomic_load(&album_thumb_gen_active)) lv_timer_pause(timer);
+        return;
+    }
+    if (!atomic_load(&album_thumbnail_done)) return;
     pthread_join(album_thumbnail_thread, NULL);
     album_thumbnail_active = false;
 
@@ -13528,7 +13562,21 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
             }
         }
         album_thumbnail_cache_entry_t * e = &album_thumbnail_cache[victim];
-        free(e->pixels);
+        uint8_t * retired_pixels = e->pixels;
+        if (retired_pixels) {
+            /* A leading lv_image can retain &e->dsc after its row last ran
+             * the decorator. Freeing pixels first made that image descriptor
+             * point into released heap memory until the row happened to be
+             * recycled: a redraw/scroll use-after-free on libraries larger
+             * than the LRU. Mark this as a known no-art entry temporarily and
+             * repaint every visible row so all references are detached before
+             * releasing/reusing the slot. */
+            e->pixels = NULL;
+            e->dsc.data = NULL;
+            if (album_thumbnail_active_list)
+                compact_list_refresh_visible(album_thumbnail_active_list);
+            free(retired_pixels);
+        }
         memset(e, 0, sizeof(*e));
         e->song_id = album_thumbnail_result_song_id;
         e->known = true;
@@ -17494,6 +17542,9 @@ static bool usb_mode_switch_active = false;
 static volatile bool usb_mode_switch_done_flag = false;
 static volatile bool usb_mode_switch_succeeded = false;
 static usb_mode_t usb_mode_switch_target;
+static bool usb_cable_state_initialized;
+static bool usb_cable_was_connected;
+static bool usb_storage_rebind_pending;
 
 static void usb_mode_option_row_cb(lv_event_t * e);
 static void usb_mode_adb_toggle_cb(lv_event_t * e);
@@ -17612,6 +17663,35 @@ static void poll_usb_mode_switch(void) {
         }
         nav_push(usb_dac_overlay_screen);
     }
+}
+
+/* A fresh boot intentionally has no gadget bound, but previously nothing
+ * reacted when a PC was plugged in: Storage only appeared after manually
+ * switching to DAC/ADB and back, because those taps happened to perform the
+ * missing UDC bind. Reapply Storage on every physical connection edge so a
+ * PC enumerates it immediately. Never override an active DAC/ADB session. */
+static void poll_usb_storage_hotplug(void) {
+    bool connected = usb_mode_control_cable_connected();
+    if (!usb_cable_state_initialized) {
+        usb_cable_state_initialized = true;
+        usb_cable_was_connected = connected;
+        usb_storage_rebind_pending = connected;
+    } else if (connected && !usb_cable_was_connected) {
+        usb_storage_rebind_pending = true;
+    }
+    usb_cable_was_connected = connected;
+
+    if (!connected || !usb_storage_rebind_pending || usb_mode_switch_active) return;
+
+    usb_mode_t live_mode;
+    bool have_live_mode = usb_mode_control_detect_current(&live_mode);
+    if (have_live_mode && (live_mode == USB_MODE_DAC || live_mode == USB_MODE_ADB)) {
+        usb_storage_rebind_pending = false;
+        return;
+    }
+
+    usb_storage_rebind_pending = false;
+    start_usb_mode_switch(USB_MODE_STORAGE);
 }
 
 static void usb_mode_option_row_cb(lv_event_t * e) {

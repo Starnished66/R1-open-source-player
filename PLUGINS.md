@@ -159,11 +159,11 @@ from the moment your script starts running (injected before
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info` |
 | UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
 | Theme | `set_icon`, `set_background_color`, `set_text_color` |
-| Files | `sd_root`, `list_dir` |
+| Files | `sd_root`, `list_dir`, `mkdir` |
 | Playback | `play_file`, `play_list`, transport controls, playback state |
 | Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
 | Audio | `eq_load_profile`, `eq_save_profile`, `eq_set_*`, `eq_reset` |
-| Network | `http_request`, `cancel`, legacy `http_get`/`http_post` |
+| Network | `http_request`, `download_file_async`, `cancel`, legacy `http_get`/`http_post` |
 | Automation | `on`, `set_interval`, `clear_interval` |
 
 <a id="identity"></a>
@@ -192,7 +192,7 @@ as legacy plugins using an identity derived from their filename.
   API 1 includes `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`,
   `ui.theme`, `filesystem.sd`, `playback.control`, `playback.state`,
   `playback.events`, `library.artist_albums`, `network.http.sync`, `network.http.async`,
-  `crypto.md5`, and `audio.peq`.
+  `network.http.download`, `filesystem.mkdir`, `crypto.md5`, and `audio.peq`.
 - `plugin.get_app_info()` returns `version`, `build`, `platform`, and
   `plugin_api` fields.
 
@@ -472,6 +472,18 @@ the real device, `./music` on the host simulator) -- build every path your
 plugin touches from this rather than hardcoding `/data/mnt/sd_0`, so the
 same script works unmodified in the host simulator too.
 
+### `plugin.mkdir(path)`
+
+Creates `path` and any missing parent directories (`mkdir -p` semantics).
+An existing directory is success. Returns `true` on success or `nil, error`
+if a component cannot be created or an existing component is not a directory.
+
+```lua
+local downloads = plugin.sd_root() .. "/Talks/Downloads"
+local ok, err = plugin.mkdir(downloads)
+if not ok then plugin.show_toast(err) end
+```
+
 ### `plugin.play_file(path)`
 
 Starts playback of a single file (`path`, absolute) as a fresh one-song
@@ -694,6 +706,34 @@ suppresses that request's callback and releases its resources when the native
 operation returns. Cancellation is currently logical rather than a forced
 socket close, so the occupied worker slot is not reusable until the underlying
 connection finishes or times out.
+
+### `plugin.download_file_async(url, dest_path [, verify_tls], callback)`
+
+Downloads a GET response directly to disk on a native worker without holding
+the response in RAM or blocking the UI. `verify_tls` defaults to `true`.
+The callback runs on the main Lua/UI thread as `callback(saved_path, error)`:
+`saved_path` is the requested destination and `error` is `nil` on success;
+on failure they are `nil, "download failed"`.
+
+```lua
+local dir = plugin.sd_root() .. "/Talks"
+local ok, mkdir_err = plugin.mkdir(dir)
+if ok then
+    local handle, err = plugin.download_file_async(
+        "https://example.com/talk.mp3",
+        dir .. "/talk.mp3",
+        function(saved_path, download_err)
+            plugin.show_toast(download_err or ("Saved " .. saved_path))
+        end)
+end
+```
+
+The response is streamed into a unique temporary file beside the destination
+and atomically renamed only after a complete HTTP 2xx response. Failed and
+cancelled downloads remove the temporary file and leave an existing destination
+unchanged. Download jobs share the four-slot asynchronous HTTP pool, and their
+handles can be passed to `plugin.cancel(handle)`. Unlike buffered requests,
+cancellation interrupts a file download during its next received chunk.
 
 The older `http_get()` and `http_post()` remain available for compatibility,
 but run synchronously on the UI thread. New plugins should use

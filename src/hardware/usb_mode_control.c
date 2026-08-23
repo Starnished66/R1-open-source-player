@@ -4,7 +4,9 @@
 
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #define SETTLE_RETRY_LIMIT 20 /* ~1s at 50ms between checks */
@@ -21,9 +23,46 @@
  * SUBPROCESS_TIMEOUT_MS is private to subprocess.c and there's no public
  * "run with the default timeout, but checked" entry point. */
 #define SCRIPT_TIMEOUT_MS 15000
+#define POWER_SUPPLY_DIR "/sys/class/power_supply"
 
 static bool path_exists(const char * path) {
     return access(path, F_OK) == 0;
+}
+
+static bool read_trimmed_file(const char * path, char * out, size_t out_size) {
+    FILE * f = fopen(path, "r");
+    if (!f) return false;
+    bool ok = fgets(out, (int) out_size, f) != NULL;
+    fclose(f);
+    if (!ok) return false;
+    size_t len = strlen(out);
+    while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r' || out[len - 1] == ' '))
+        out[--len] = '\0';
+    return true;
+}
+
+bool usb_mode_control_cable_connected(void) {
+#ifdef HOST_BUILD
+    return false;
+#else
+    DIR * dir = opendir(POWER_SUPPLY_DIR);
+    if (!dir) return false;
+    bool connected = false;
+    struct dirent * entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        char path[512], type[32], online[8];
+        snprintf(path, sizeof(path), POWER_SUPPLY_DIR "/%s/type", entry->d_name);
+        if (!read_trimmed_file(path, type, sizeof(type)) || strcasecmp(type, "Battery") == 0) continue;
+        snprintf(path, sizeof(path), POWER_SUPPLY_DIR "/%s/online", entry->d_name);
+        if (read_trimmed_file(path, online, sizeof(online)) && atoi(online) != 0) {
+            connected = true;
+            break;
+        }
+    }
+    closedir(dir);
+    return connected;
+#endif
 }
 
 /* A gadget's UDC sysfs file holds the bound UDC's name (e.g.

@@ -5,6 +5,21 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+
+/* Covers are immediately reduced to a small UI bitmap. Never let malformed
+ * or unnecessarily huge source dimensions consume most of this device's RAM
+ * merely to produce that thumbnail/player image. */
+#define MAX_NATIVE_DECODE_BYTES (8U * 1024U * 1024U)
+
+static bool rgb888_size_ok(size_t width, size_t height, size_t * out_bytes) {
+    if (width == 0 || height == 0 || width > INT_MAX || height > INT_MAX) return false;
+    if (width > SIZE_MAX / height || width * height > SIZE_MAX / 3U) return false;
+    size_t bytes = width * height * 3U;
+    if (bytes > MAX_NATIVE_DECODE_BYTES) return false;
+    if (out_bytes) *out_bytes = bytes;
+    return true;
+}
 
 /* LVGL's zoom/stretch transform only applies to fully-decoded ARGB8888
  * buffers; its tjpgd binding decodes JPEGs lazily, tile by tile, straight
@@ -80,24 +95,24 @@ static bool decode_jpeg_rgb888(const uint8_t * data, uint32_t size,
      * where the native decode buffer itself would risk exhausting this
      * device's limited RAM -- only then fall back to tjpgd's scale,
      * accepting its known corruption as the lesser risk vs an OOM crash. */
-#define MAX_NATIVE_DECODE_BYTES (8 * 1024 * 1024)
     uint8_t scale = 0;
-    size_t native_bytes = (size_t) jd.width * jd.height * 3;
-    while (scale < 3 && native_bytes > MAX_NATIVE_DECODE_BYTES) {
+    size_t decoded_w = jd.width;
+    size_t decoded_h = jd.height;
+    size_t native_bytes = 0;
+    while (scale < 3 && !rgb888_size_ok(decoded_w, decoded_h, &native_bytes)) {
         scale++;
-        native_bytes = (size_t) (jd.width >> scale) * (jd.height >> scale) * 3;
+        decoded_w = jd.width >> scale;
+        decoded_h = jd.height >> scale;
     }
 
-    int decoded_w = jd.width >> scale;
-    int decoded_h = jd.height >> scale;
-    if (decoded_w <= 0 || decoded_h <= 0) return false;
+    if (!rgb888_size_ok(decoded_w, decoded_h, &native_bytes)) return false;
 
-    uint8_t * buf = calloc((size_t) decoded_w * decoded_h, 3);
+    uint8_t * buf = calloc(1, native_bytes);
     if (!buf) return false;
 
     ctx.out_buf = buf;
-    ctx.out_w = decoded_w;
-    ctx.out_h = decoded_h;
+    ctx.out_w = (int) decoded_w;
+    ctx.out_h = (int) decoded_h;
 
     if (jd_decomp(&jd, jpeg_mem_output, scale) != JDR_OK) {
         free(buf);
@@ -105,13 +120,19 @@ static bool decode_jpeg_rgb888(const uint8_t * data, uint32_t size,
     }
 
     *out_buf = buf;
-    *out_w = decoded_w;
-    *out_h = decoded_h;
+    *out_w = (int) decoded_w;
+    *out_h = (int) decoded_h;
     return true;
 }
 
 static bool decode_png_rgb888(const uint8_t * data, uint32_t size, uint8_t ** out_buf, int * out_w, int * out_h) {
-    unsigned w, h;
+    unsigned w = 0, h = 0;
+    LodePNGState state;
+    lodepng_state_init(&state);
+    unsigned inspect_error = lodepng_inspect(&w, &h, &state, data, size);
+    lodepng_state_cleanup(&state);
+    if (inspect_error != 0 || !rgb888_size_ok(w, h, NULL)) return false;
+
     unsigned char * pixels = NULL;
     if (lodepng_decode24(&pixels, &w, &h, data, size) != 0 || !pixels) return false;
 

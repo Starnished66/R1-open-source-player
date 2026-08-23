@@ -18,6 +18,10 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
+#include <stdatomic.h>
+#include <limits.h>
+#include <unistd.h>
 
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -806,6 +810,44 @@ static int l_plugin_sd_root(lua_State * L) {
     return 1;
 }
 
+/* plugin.mkdir(path) -> true | nil, error. mkdir -p semantics: existing
+ * directories are success, while an existing non-directory remains an
+ * error. This intentionally follows Lua's existing unrestricted path-based
+ * file operations; plugins are not confined to sd_root() today. */
+static int l_plugin_mkdir(lua_State * L) {
+    const char * path = luaL_checkstring(L, 1);
+    size_t len = strlen(path);
+    if (len == 0 || len >= PATH_MAX) {
+        lua_pushnil(L);
+        lua_pushstring(L, "invalid path");
+        return 2;
+    }
+
+    char buf[PATH_MAX];
+    memcpy(buf, path, len + 1);
+    while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
+
+    for (size_t i = 1; i <= len; i++) {
+        if (buf[i] != '/' && buf[i] != '\0') continue;
+        char saved = buf[i];
+        buf[i] = '\0';
+        if (buf[0] != '\0' && mkdir(buf, 0755) != 0) {
+            int saved_errno = errno;
+            struct stat st;
+            if (saved_errno != EEXIST || stat(buf, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                buf[i] = saved;
+                lua_pushnil(L);
+                lua_pushstring(L, strerror(saved_errno));
+                return 2;
+            }
+        }
+        buf[i] = saved;
+    }
+
+    lua_pushboolean(L, true);
+    return 1;
+}
+
 static int l_plugin_play_file(lua_State * L) {
     const char * path = luaL_checkstring(L, 1);
     gui_plugin_play_paths(&path, 1, 0);
@@ -1197,16 +1239,18 @@ static int l_plugin_http_post(lua_State * L) {
 
 typedef struct {
     bool active;
-    volatile bool done;
-    bool cancelled;
+    atomic_bool done;
+    atomic_bool cancelled;
     uint16_t generation;
     pthread_t thread;
     lua_State * L;
     int callback_ref;
     bool is_post;
+    bool is_download;
     bool verify_tls;
     char url[2048];
     char content_type[128];
+    char dest_path[PATH_MAX];
     uint8_t * request_body;
     size_t request_body_size;
     size_t max_response_size;
@@ -1218,9 +1262,35 @@ typedef struct {
 
 static plugin_async_http_t plugin_async_http[PLUGIN_MAX_ASYNC_HTTP];
 
+static bool plugin_async_download_progress(uint64_t downloaded, uint64_t total, void * user_data) {
+    (void) downloaded;
+    (void) total;
+    plugin_async_http_t * req = (plugin_async_http_t *) user_data;
+    return !atomic_load(&req->cancelled);
+}
+
 static void * plugin_async_http_thread_func(void * arg) {
     plugin_async_http_t * req = (plugin_async_http_t *) arg;
-    if (req->is_post) {
+    if (req->is_download) {
+        char temp_path[PATH_MAX];
+        int n = snprintf(temp_path, sizeof(temp_path), "%s.part.XXXXXX", req->dest_path);
+        if (n <= 0 || (size_t) n >= sizeof(temp_path)) {
+            req->ok = false;
+        } else {
+            int fd = mkstemp(temp_path);
+            if (fd < 0) {
+                req->ok = false;
+            } else {
+                close(fd);
+                req->ok = http_get_to_file(req->url, req->verify_tls, temp_path,
+                                            plugin_async_download_progress, req);
+                if (req->ok && !atomic_load(&req->cancelled)) {
+                    req->ok = rename(temp_path, req->dest_path) == 0;
+                }
+                if (!req->ok || atomic_load(&req->cancelled)) remove(temp_path);
+            }
+        }
+    } else if (req->is_post) {
         req->ok = http_post_to_buffer_limited(req->url, req->verify_tls, req->content_type, req->request_body,
                                                req->request_body_size, req->max_response_size, &req->status,
                                                &req->response_body, &req->response_body_size);
@@ -1231,7 +1301,7 @@ static void * plugin_async_http_thread_func(void * arg) {
     free(req->request_body);
     req->request_body = NULL;
     req->request_body_size = 0;
-    req->done = true;
+    atomic_store(&req->done, true);
     return NULL;
 }
 
@@ -1305,6 +1375,8 @@ static int l_plugin_http_request(lua_State * L) {
     uint16_t generation = (uint16_t) (req->generation + 1);
     if (generation == 0) generation = 1;
     memset(req, 0, sizeof(*req));
+    atomic_init(&req->done, false);
+    atomic_init(&req->cancelled, false);
     req->generation = generation;
     req->active = true;
     req->L = L;
@@ -1333,6 +1405,61 @@ static int l_plugin_http_request(lua_State * L) {
     return 1;
 }
 
+/* plugin.download_file_async(url, dest_path [, verify_tls], callback)
+ * -> handle | nil, error. Streams into a unique sibling temporary file on
+ * the native HTTP worker, then atomically renames it over dest_path only
+ * after a complete 2xx response. callback(dest_path, error) runs later on
+ * the Lua/UI thread, matching http_request's callback discipline. */
+static int l_plugin_download_file_async(lua_State * L) {
+    const char * url = luaL_checkstring(L, 1);
+    const char * dest_path = luaL_checkstring(L, 2);
+    int callback_index = lua_isfunction(L, 3) ? 3 : 4;
+    bool verify_tls = callback_index == 3 ? true : lua_toboolean(L, 3);
+    luaL_checktype(L, callback_index, LUA_TFUNCTION);
+
+    if (strlen(url) >= sizeof(plugin_async_http[0].url))
+        return luaL_error(L, "plugin.download_file_async: URL is too long");
+    if (dest_path[0] == '\0' || strlen(dest_path) >= sizeof(plugin_async_http[0].dest_path) - 12)
+        return luaL_error(L, "plugin.download_file_async: destination path is invalid or too long");
+
+    int slot = -1;
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        if (!plugin_async_http[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "too many active HTTP requests");
+        return 2;
+    }
+
+    plugin_async_http_t * req = &plugin_async_http[slot];
+    uint16_t generation = (uint16_t) (req->generation + 1);
+    if (generation == 0) generation = 1;
+    memset(req, 0, sizeof(*req));
+    atomic_init(&req->done, false);
+    atomic_init(&req->cancelled, false);
+    req->generation = generation;
+    req->active = true;
+    req->L = L;
+    req->is_download = true;
+    req->verify_tls = verify_tls;
+    snprintf(req->url, sizeof(req->url), "%s", url);
+    snprintf(req->dest_path, sizeof(req->dest_path), "%s", dest_path);
+    lua_pushvalue(L, callback_index);
+    req->callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    if (pthread_create(&req->thread, NULL, plugin_async_http_thread_func, req) != 0) {
+        luaL_unref(L, LUA_REGISTRYINDEX, req->callback_ref);
+        req->active = false;
+        lua_pushnil(L);
+        lua_pushstring(L, "could not start HTTP worker");
+        return 2;
+    }
+
+    lua_pushinteger(L, ((int) generation << 8) | (slot + 1));
+    return 1;
+}
+
 static int l_plugin_cancel(lua_State * L) {
     int handle = (int) luaL_checkinteger(L, 1);
     int slot = (handle & 0xFF) - 1;
@@ -1341,7 +1468,7 @@ static int l_plugin_cancel(lua_State * L) {
     if (slot >= 0 && slot < PLUGIN_MAX_ASYNC_HTTP) {
         plugin_async_http_t * req = &plugin_async_http[slot];
         if (req->active && req->generation == generation) {
-            req->cancelled = true;
+            atomic_store(&req->cancelled, true);
             cancelled = true;
         }
     }
@@ -1796,7 +1923,8 @@ static int l_plugin_api_version(lua_State * L) {
 static const char * const plugin_capabilities[] = {
     "ui.list", "ui.settings", "ui.row_width", "ui.text_input", "ui.toast", "ui.theme",
     "filesystem.sd", "playback.control", "playback.state", "playback.events",
-    "library.artist_albums", "library.paged", "network.http.sync", "network.http.async", "crypto.md5", "audio.peq"
+    "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
+    "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -1840,6 +1968,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "show_settings_list",        l_plugin_show_settings_list },
     { "list_dir",                  l_plugin_list_dir },
     { "sd_root",                   l_plugin_sd_root },
+    { "mkdir",                     l_plugin_mkdir },
     { "play_file",                 l_plugin_play_file },
     { "play_list",                 l_plugin_play_list },
     { "show_toast",                l_plugin_show_toast },
@@ -1867,6 +1996,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "http_get",                  l_plugin_http_get },
     { "http_post",                 l_plugin_http_post },
     { "http_request",              l_plugin_http_request },
+    { "download_file_async",       l_plugin_download_file_async },
     { "cancel",                    l_plugin_cancel },
     { "md5",                       l_plugin_md5 },
     { "show_text_input",           l_plugin_show_text_input },
@@ -2046,24 +2176,36 @@ void plugin_manager_init(void) {
 void plugin_manager_poll(void) {
     for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
         plugin_async_http_t * req = &plugin_async_http[i];
-        if (!req->active || !req->done) continue;
+        if (!req->active || !atomic_load(&req->done)) continue;
         pthread_join(req->thread, NULL);
 
-        if (!req->cancelled) {
+        if (!atomic_load(&req->cancelled)) {
             lua_rawgeti(req->L, LUA_REGISTRYINDEX, req->callback_ref);
-            if (req->ok) {
+            int callback_args;
+            if (req->is_download) {
+                if (req->ok) {
+                    lua_pushstring(req->L, req->dest_path);
+                    lua_pushnil(req->L);
+                } else {
+                    lua_pushnil(req->L);
+                    lua_pushstring(req->L, "download failed");
+                }
+                callback_args = 2;
+            } else if (req->ok) {
                 lua_pushinteger(req->L, req->status);
                 lua_pushlstring(req->L, req->response_body ? (const char *) req->response_body : "",
                                 req->response_body_size);
                 lua_pushnil(req->L);
+                callback_args = 3;
             } else {
                 lua_pushnil(req->L);
                 lua_pushnil(req->L);
                 lua_pushstring(req->L, "network error or response limit exceeded");
+                callback_args = 3;
             }
-            if (plugin_call(req->L, 3, 0, 0) != LUA_OK) {
+            if (plugin_call(req->L, callback_args, 0, 0) != LUA_OK) {
                 const char * err = lua_tostring(req->L, -1);
-                fprintf(stderr, "[plugins] http_request callback error: %s\n", err ? err : "unknown error");
+                fprintf(stderr, "[plugins] HTTP callback error: %s\n", err ? err : "unknown error");
                 lua_pop(req->L, 1);
             }
         }
@@ -2073,8 +2215,8 @@ void plugin_manager_poll(void) {
         req->response_body = NULL;
         req->response_body_size = 0;
         req->active = false;
-        req->done = false;
-        req->cancelled = false;
+        atomic_store(&req->done, false);
+        atomic_store(&req->cancelled, false);
         req->L = NULL;
         req->callback_ref = LUA_NOREF;
     }

@@ -186,7 +186,7 @@ Passed as the 2nd argument to `set_home_layout()` / 3rd to
 | Field | Type | Default | Range / values | Applies to | Notes |
 |---|---|---|---|---|---|
 | `mode` | string | `"tile"` | `"tile"`, `"list"` | icon-grid-native screens only | `"tile"` = the icon grid; `"list"` = every item becomes a plain row with icon + chevron. Silently ignored on the 3 already-list-native screens (`settings`, `books`, `dac`) -- they have no tile-grid equivalent to switch to, and are always in the list-mode shape. |
-| `row_gap` | int, px | `6` | `0`-`24` | list mode (native or `mode="list"`) | Vertical spacing between rows. |
+| `row_gap` | int, px | `6` | `0`-`48` | list mode (native or `mode="list"`) | Vertical spacing between rows. |
 | `tile_gap` | int, px | `0` (flush cells, thin divider lines) | `0`-`40` | tile mode | Visible space between adjacent tiles; a nonzero value insets each tile within its grid cell and drops the divider lines (redundant once a real gap exists). |
 | `title_align` | string | `"left"` | `"left"`, `"center"`, `"right"` | every screen with a title | See [Title styling](#title-styling). |
 | `title_size` | string | native (28px) | `"small"`, `"medium"`, `"large"`, `"mono"` | every screen with a title | A larger scale than item `text_size` (`22`/`28`/`40px`) -- see [Title styling](#title-styling) for why. |

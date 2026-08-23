@@ -1041,8 +1041,13 @@ static const plugin_screen_def_t plugin_screen_defs[] = {
 #define PLUGIN_SCREEN_RADIUS_MAX 64
 
 /* Ceiling on options.row_gap -- cosmetic, clamped not errored, same split
- * PLUGIN_SCREEN_RADIUS_MAX already makes for radius. */
-#define PLUGIN_SCREEN_ROW_GAP_MAX 24
+ * PLUGIN_SCREEN_RADIUS_MAX already makes for radius. Raised from an
+ * original 24 -- real feedback wanted noticeably more breathing room
+ * than that allowed on a short list (e.g. Home's 6 rows), and even the
+ * shortest native row height (PILL_ROW_HEIGHT_MIN, 48px) leaves enough
+ * screen budget for a gap this size without every row no longer fitting
+ * without scrolling. */
+#define PLUGIN_SCREEN_ROW_GAP_MAX 48
 
 /* Ceiling on options.tile_gap -- tile mode's own analogous spacing knob.
  * Higher ceiling than row_gap: tiles are much bigger than list rows (a

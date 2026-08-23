@@ -194,6 +194,8 @@ void metadata_db_close(void) {
     METADATA_DB_GUARD;
     tagcache_close();
     db_ready = false;
+    path_cache_drop();
+    remote_state_drop();
 }
 
 void metadata_db_begin_update(void) {

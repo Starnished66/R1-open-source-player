@@ -1,7 +1,20 @@
 #include "idle_shutdown.h"
-#include "subprocess.h"
+
+#ifndef HOST_BUILD
+#include <unistd.h>
+#include <sys/reboot.h>
+#endif
 
 void idle_shutdown_now(void) {
-    char * argv[] = { "/sbin/poweroff", NULL };
-    subprocess_run(argv, NULL, 0);
+#ifndef HOST_BUILD
+    /* Must not go through subprocess_run(): that helper waits 15s then
+     * SIGKILLs the child. /sbin/poweroff (busybox, talks to init or waits
+     * on other processes) routinely outlives that budget, so the 3-2-1
+     * countdown reached zero, the child was killed, and the device stayed
+     * on -- only a hardware power-button hold actually cut power. */
+    sync();
+    execl("/sbin/poweroff", "poweroff", "-f", (char *) NULL);
+    reboot(RB_POWER_OFF);
+    for (;;) pause();
+#endif
 }

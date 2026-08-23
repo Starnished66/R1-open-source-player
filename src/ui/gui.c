@@ -9909,6 +9909,9 @@ static void library_load_from_cache_only(void) {
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
 
+    /* Close first so a remounted card is not served from a still-open
+     * handle against the previous (or empty unmounted) mount. */
+    metadata_db_close();
     metadata_db_open();
 }
 
@@ -15230,28 +15233,17 @@ static void refresh_library_screens_after_reload(void) {
  * -- see its own comment -- so a previously-scanned card reinserted here
  * has its own already-populated database sitting right there).
  * library_load_from_cache_only() (a bounded tagcache read, not a filesystem
- * walk -- see its own comment) already does exactly this; the only thing
- * missing was calling it here instead of unconditionally reaching for
- * start_library_rescan(). Falls through to that full scan only if the
- * cache load comes back with nothing -- a genuinely new/never-scanned
- * card, or one whose database failed to open. A plain toast rather than
- * the "Updating music database..." screen start_library_rescan() shows --
- * this is a reload the user didn't explicitly ask for, over before they'd
- * even notice a progress screen, so pushing/popping that screen would just
- * yank them away from whatever they're actually doing right now for no
- * reason. */
+ * walk -- see its own comment) already does exactly this. A missing or
+ * empty database leaves the library empty; Settings > Update Music
+ * Database is the only path that walks files. A toast rather than the
+ * "Updating music database..." screen -- this is a reload the user did
+ * not ask for. */
 static void reload_library_on_sd_reinsert(void) {
     library_load_from_cache_only();
-    /* metadata_db_get_song_count() (a cheap COUNT(*) against the freshly
-     * opened DB) is what decides "does this card have a usable cache"
-     * here -- a real, live read of the reopened database, not a cached
-     * in-memory count that could be stale or unset at this point. */
+    refresh_library_screens_after_reload();
     if (metadata_db_get_song_count() > 0) {
-        refresh_library_screens_after_reload();
-        show_info_toast("Library updated");
-        start_album_thumbnail_generation(); /* database already known-good here -- see this function's own comment */
-    } else {
-        start_library_rescan();
+        show_info_toast("Library loaded");
+        start_album_thumbnail_generation();
     }
 }
 
@@ -15356,18 +15348,17 @@ static volatile bool sd_format_active = false;
  * seconds instead of waiting on whatever slow reactive mechanism the OS
  * has -- harmless to call when nothing's inserted (see that function's own
  * comment: it just fails silently). On the unmounted -> mounted edge, it
- * kicks off the same rescan Settings > Update Music Database triggers, so
- * a card inserted after boot actually shows up without the user needing
- * to know to go find that button.
+ * loads the tagcache already on that card (if any). It does not start
+ * Settings > Update Music Database -- a full walk is user-triggered only.
  *
  * Real-device feature request (2026-08-08): removal wasn't handled at all
  * symmetrically -- pulling the card left All Songs/Artists/Albums/
  * Playlists, and the Files screen, still showing entries for files that no
- * longer exist (tapping one would just fail to play), and there was no way
- * back to a correct state short of a manual Settings > Update Music
- * Database rescan. The mounted -> unmounted edge below now fires the same
- * rescan (correctly collapsing to an empty library against an empty
- * mountpoint) plus a Files-screen reset, mirroring the insertion side.
+ * longer exist (tapping one would just fail to play). The mounted ->
+ * unmounted edge now closes the database, rebuilds the library screens
+ * empty, and resets Files -- it must not scan, because a scan against the
+ * empty unmounted directory would write a blank database onto the parent
+ * filesystem and, if the card remounted mid-scan, walk the whole card.
  *
  * That edge relies on sd_card_root_is_mounted() actually flipping to false
  * on a physical eject, which isn't guaranteed on its own: this firmware has
@@ -15458,11 +15449,11 @@ static void poll_sd_card_hotplug(void) {
      * faster than this function's own SD_CARD_MOUNT_POLL_SECONDS poll
      * interval, so a brief unmount (this app's own umount -l retry above,
      * or -- unverified but plausible -- a very fast physical reseat) can
-     * have already remounted again by the time the removal rescan's
-     * background thread actually gets scheduled, making it scan and fully
-     * re-tag the *already-back* real card instead of correctly finding
-     * nothing, exactly the slow full-rescan reload_library_on_sd_reinsert()
-     * below exists to avoid. Requiring the unmounted state to be seen on
+     * have already remounted again by the time the removal handler
+     * actually runs, making it close and reopen against the *already-back*
+     * real card instead of collapsing to empty, which
+     * reload_library_on_sd_reinsert() below exists to do on the insert
+     * edge. Requiring the unmounted state to be seen on
      * SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD consecutive polls (reset to 0 the
      * moment "mounted" is seen again, see the mounted branch below) before
      * acting filters that out -- a genuine removal stays gone far longer
@@ -15498,23 +15489,12 @@ static void poll_sd_card_hotplug(void) {
             cancel_album_thumbnail_generation();
             unmount_confirm_streak++;
             if (unmount_confirm_streak >= SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD && !library_rescan_active) {
-                /* Real-device bug report: metadata_db_open() only ever
-                 * checks `if (db) return;` -- left open across a removal,
-                 * it would keep reusing this now-dead connection (pointing
-                 * at a file on a card that's physically gone) forever
-                 * after, even across a later reinsertion of the same or a
-                 * different card, silently defeating
-                 * reload_library_on_sd_reinsert()'s own cache-load fast
-                 * path below (a query against a dead handle isn't a real
-                 * cache hit). Closing it here -- guarded by the same
-                 * !library_rescan_active this branch already requires, so
-                 * there's no background rescan thread concurrently using
-                 * the connection -- makes the next metadata_db_open()
-                 * (from whichever path runs on the next insertion)
-                 * genuinely reopen fresh against whatever's actually
-                 * mounted by then. */
+                /* Close the SD-resident tagcache so a later reinsert opens
+                 * the files on whichever card is actually mounted, not a
+                 * stale handle. Do not scan: the mountpoint is empty and
+                 * a scan would write a blank database there. */
                 metadata_db_close();
-                start_library_rescan();
+                refresh_library_screens_after_reload();
                 file_browser_reset_to_root();
                 was_mounted = false;
                 unmount_confirm_streak = 0;
@@ -15590,10 +15570,9 @@ static void poll_sd_card_hotplug(void) {
          * nothing ever tells the app's in-memory library to reload. One-
          * shot (not tied to was_mounted) so this can't fire more than once
          * per boot even for a card that's mounted but genuinely has no
-         * music -- reload_library_on_sd_reinsert() falls back to a real
-         * start_library_rescan() when the cache load itself comes back
-         * empty too, which would otherwise repeat forever on every poll
-         * for that case. */
+         * music -- reload_library_on_sd_reinsert() only loads the on-card
+         * database (or leaves the library empty), so an empty card does
+         * not start a repeating full scan. */
         boot_library_recheck_done = true;
         /* metadata_db_get_song_count() (the real database), not
          * all_songs_count -- that's deliberately never populated at boot
@@ -17688,6 +17667,9 @@ static void poll_usb_storage_hotplug(void) {
     if (!usb_cable_state_initialized) {
         usb_cable_state_initialized = true;
         usb_cable_was_connected = connected;
+        /* Storage is the default gadget when a PC is plugged in, including
+         * a cable already present at boot. ADB and DAC stay opt-in from
+         * Settings; usb_mode_control_apply() tears Storage down first. */
         usb_storage_rebind_pending = connected;
     } else if (connected && !usb_cable_was_connected) {
         usb_storage_rebind_pending = true;

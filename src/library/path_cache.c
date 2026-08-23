@@ -177,6 +177,15 @@ static void dup_sorted(const path_list_t * list, const path_list_t * filter, cha
     *out_count = w;
 }
 
+void path_cache_drop(void) {
+    pthread_mutex_lock(&path_cache_mu);
+    for (size_t i = 0; i < sizeof(lists) / sizeof(lists[0]); i++) {
+        path_list_free(&lists[i].list);
+        lists[i].loaded = false;
+    }
+    pthread_mutex_unlock(&path_cache_mu);
+}
+
 void path_cache_replace(const char * name, char * const * paths, int count) {
     pthread_mutex_lock(&path_cache_mu);
     named_list_t * entry = ensure_loaded(name);

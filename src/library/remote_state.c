@@ -149,6 +149,13 @@ static rs_entry_t * ensure_entry(const char * path) {
     return &entries[entry_n++];
 }
 
+void remote_state_drop(void) {
+    pthread_mutex_lock(&mu);
+    free_all();
+    loaded = false;
+    pthread_mutex_unlock(&mu);
+}
+
 bool remote_state_get(const char * path, int32_t * rating, int32_t * playcount, int32_t * last_played) {
     pthread_mutex_lock(&mu);
     ensure_loaded();

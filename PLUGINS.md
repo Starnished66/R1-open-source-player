@@ -159,7 +159,7 @@ from the moment your script starts running (injected before
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info` |
 | UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
 | Theme | `set_icon`, `set_background_color`, `set_text_color` |
-| Files | `sd_root`, `list_dir` |
+| Files | `sd_root`, `list_dir`, `get_storage_info` |
 | Playback | `play_file`, `play_list`, transport controls, playback state |
 | Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
 | Audio | `eq_load_profile`, `eq_save_profile`, `eq_set_*`, `eq_reset` |
@@ -471,6 +471,15 @@ Returns the SD card's absolute mount path as a string (`/data/mnt/sd_0` on
 the real device, `./music` on the host simulator) -- build every path your
 plugin touches from this rather than hardcoding `/data/mnt/sd_0`, so the
 same script works unmodified in the host simulator too.
+
+### `plugin.get_storage_info()`
+
+Returns storage stats for the filesystem `plugin.sd_root()` lives on:
+`{ total_bytes, free_bytes, used_bytes }` (all integers). `free_bytes` is
+space actually available to an unprivileged caller (statvfs's `f_bavail`,
+what `df` calls "available" -- not `f_bfree`, which includes space
+reserved for root). Returns `nil` if the underlying `statvfs()` call
+fails.
 
 ### `plugin.play_file(path)`
 

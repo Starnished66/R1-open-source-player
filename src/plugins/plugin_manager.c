@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -226,6 +227,10 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *   plugin.sd_root()
  *     Returns the SD card's absolute mount path, so a script can build
  *     paths under it (e.g. plugin.sd_root() .. "/Audiobooks").
+ *
+ *   plugin.get_storage_info() -> { total_bytes, free_bytes, used_bytes }, or
+ *   nil on failure
+ *     Storage stats for the filesystem plugin.sd_root() lives on.
  *
  *   plugin.play_file(path)
  *     Plays a single file as a fresh one-song playlist.
@@ -803,6 +808,30 @@ static int l_plugin_list_dir(lua_State * L) {
 
 static int l_plugin_sd_root(lua_State * L) {
     lua_pushstring(L, MUSIC_ROOT_DIR);
+    return 1;
+}
+
+/* plugin.get_storage_info() -> { total_bytes, free_bytes, used_bytes }, or
+ * nil if statvfs() fails. f_bavail (not f_bfree) matches what `df` reports
+ * as "available" -- space reserved for root is excluded, same as every
+ * other unprivileged caller sees. */
+static int l_plugin_get_storage_info(lua_State * L) {
+    struct statvfs st;
+    if (statvfs(MUSIC_ROOT_DIR, &st) != 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    uint64_t total = (uint64_t) st.f_blocks * (uint64_t) st.f_frsize;
+    uint64_t free_space = (uint64_t) st.f_bavail * (uint64_t) st.f_frsize;
+
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer) total);
+    lua_setfield(L, -2, "total_bytes");
+    lua_pushinteger(L, (lua_Integer) free_space);
+    lua_setfield(L, -2, "free_bytes");
+    lua_pushinteger(L, (lua_Integer) (total - free_space));
+    lua_setfield(L, -2, "used_bytes");
     return 1;
 }
 
@@ -1840,6 +1869,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "show_settings_list",        l_plugin_show_settings_list },
     { "list_dir",                  l_plugin_list_dir },
     { "sd_root",                   l_plugin_sd_root },
+    { "get_storage_info",          l_plugin_get_storage_info },
     { "play_file",                 l_plugin_play_file },
     { "play_list",                 l_plugin_play_list },
     { "show_toast",                l_plugin_show_toast },

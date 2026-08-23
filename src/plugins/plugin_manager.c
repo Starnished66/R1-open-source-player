@@ -257,6 +257,18 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *     l_plugin_set_icon()'s own comment for why a later, mid-session call
  *     silently won't update an already-shown icon.
  *
+ *   plugin.set_home_layout(tile_keys [, options])
+ *     Reorders/hides Home's 6 native tiles -- tile_keys is an array of any
+ *     subset of "music", "stream_media", "wireless", "books", "system",
+ *     "dac", in the order they should appear; any key left out is hidden.
+ *     Each entry is a plain string, or a table { key = "...", bg_color =
+ *     0xRRGGBB, text_color = 0xRRGGBB, radius = n } to also override that
+ *     one tile's background color/text color/corner radius (radius
+ *     clamped to 0..64). options.mode is "tile" (default, today's icon
+ *     grid) or "list" (a plain vertical list instead). Same load-time-only
+ *     constraint as set_icon() above. Raises a Lua error on an empty
+ *     array, an unknown/duplicate tile key, or an invalid mode.
+ *
  *   plugin.set_background_color(slot, rgb)
  *     Sets one of three background-color slots app-wide, live, no restart
  *     needed: "screen", "card", or "list_row" -- see
@@ -984,6 +996,370 @@ static int l_plugin_set_icon(lua_State * L) {
     (void) source_path; /* no override root on HOST_BUILD -- see assets.c's asset_path() */
 #endif
     return 0;
+}
+
+/* Fixed key order matches gui.c's build_home_screen()'s own 6 native
+ * tiles 1:1 -- see that function's own comment for the full picture. */
+#define PLUGIN_HOME_TILE_COUNT 6
+static const char * const plugin_home_tile_keys[PLUGIN_HOME_TILE_COUNT] = {
+    "music", "stream_media", "wireless", "books", "system", "dac",
+};
+
+/* Reasonable ceiling on a plugin-chosen tile corner radius -- purely
+ * cosmetic (unlike an unknown/duplicate/missing key), so this clamps
+ * rather than erroring, same "clamp a cosmetic value, error on a
+ * structural one" split plugin.register_list_item()'s own height option
+ * already makes (PILL_ROW_HEIGHT_MIN/MAX). */
+#define PLUGIN_HOME_TILE_RADIUS_MAX 64
+
+/* Ceiling on options.row_gap -- cosmetic, clamped not errored, same split
+ * PLUGIN_HOME_TILE_RADIUS_MAX already makes for radius. */
+#define PLUGIN_HOME_ROW_GAP_MAX 24
+
+/* Ceiling on options.tile_gap -- tile mode's own analogous spacing knob.
+ * Higher ceiling than row_gap: tiles are much bigger than list rows (a
+ * whole 2x3 grid cell vs. a thin row), so a proportionally bigger gap still
+ * reads as intentional spacing rather than the tiles falling apart. */
+#define PLUGIN_HOME_TILE_GAP_MAX 40
+
+/* Shared by is_valid_text_size() below -- "mono" (lv_font_unscii_16, see
+ * lv_conf.h) is only offered through set_home_layout() for now (list mode),
+ * not through register_list_item()/show_list(), so this stays a separate
+ * check rather than widening is_valid_text_size() itself. */
+static bool is_valid_home_text_size(const char * text_size) {
+    return strcmp(text_size, "small") == 0 || strcmp(text_size, "medium") == 0 ||
+           strcmp(text_size, "large") == 0 || strcmp(text_size, "mono") == 0;
+}
+
+typedef struct {
+    char key[16];
+    bool has_bg_color;   uint32_t bg_color;   /* 0xRRGGBB */
+    bool has_text_color; uint32_t text_color; /* 0xRRGGBB */
+    bool has_radius;     int32_t radius;      /* px, clamped to 0..PLUGIN_HOME_TILE_RADIUS_MAX */
+
+    /* ---- List-mode-only extensions (plugin.set_home_layout(), PLUGINS.md).
+     * Ignored in tile mode -- build_home_screen() only reads these when
+     * plugin_manager_get_home_tile_list_mode() is true. ---- */
+    int32_t row_height; /* 0 = unset/native default (124px) */
+    int32_t row_width;  /* 0 = unset/native default */
+    char text_align[8]; /* "" = unset ("left"); "left"/"center"/"right" */
+    bool accessory;      /* true (default) = chevron shown, false = hidden */
+    char text_size[8];  /* "" = unset (native default); "small"/"medium"/"large"/"mono" */
+    bool show_icon;      /* true (default) = tile's launcher icon shown, reserving
+                           * PILL_ROW_ICON_PX_DEFAULT+12px of label indent for it
+                           * (screen_builders.c) even where align="left" -- false
+                           * drops the icon AND that reserved indent, so the label
+                           * sits flush at the row's own 24px inset. */
+} plugin_home_tile_config_t;
+
+static plugin_home_tile_config_t plugin_home_layout[PLUGIN_HOME_TILE_COUNT];
+static int plugin_home_layout_count = 0; /* 0 == no plugin has called set_home_layout() yet */
+static bool plugin_home_layout_is_list = false;
+/* options.row_gap (list mode only) -- default matches build_pill_list_screen()'s
+ * own pre-existing hardcoded 6px, so a plugin that never sets this changes
+ * nothing. */
+static int32_t plugin_home_row_gap = 6;
+/* options.tile_gap (tile mode only) -- default 0 matches build_icon_grid_
+ * screen()'s own pre-existing flush-cell look (every native caller of that
+ * function also passes 0), so a plugin that never sets this changes
+ * nothing. */
+static int32_t plugin_home_tile_gap = 0;
+
+/* Reorders/hides Home's 6 native tiles, optionally switching Home between
+ * the icon grid and a plain vertical list, and optionally overriding a
+ * tile's background color/text color/corner radius -- only takes effect
+ * if called from a plugin's top-level code, since build_home_screen() runs
+ * once, right after every plugin finishes loading (plugin_manager_init()
+ * runs before it in gui_init()); calling this later from a callback is a
+ * silent no-op until the next restart, same load-time-only constraint
+ * plugin.set_icon() already documents. Last plugin to call wins if more
+ * than one does, same "last call wins" precedent set_background_color()/
+ * set_text_color() already established for their own single global slots
+ * -- one call always fully specifies both the layout and every per-tile
+ * style override together, never a partial update layered onto an earlier
+ * call. Home must never end up with zero tiles, so an empty array, an
+ * unknown/duplicate tile key, or an invalid `mode` all raise a Lua error
+ * (leaving whatever layout -- native default or an earlier successful
+ * call -- already in effect untouched) rather than silently doing
+ * something wrong.
+ *
+ * tile_keys entries are either a plain string (a tile key, no style
+ * override) or a table { key = "...", bg_color = 0xRRGGBB, text_color =
+ * 0xRRGGBB, radius = n } -- the same "string or table" convention
+ * register_list_item()'s/show_list()'s own `items` arrays already use for
+ * exactly this "plain by default, richer when a plugin needs it" shape.
+ * options.mode is "tile" (default) or "list". */
+static int l_plugin_set_home_layout(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_Unsigned raw_n = lua_rawlen(L, 1);
+    if (raw_n == 0) {
+        return luaL_error(L, "plugin.set_home_layout: tile_keys must be a non-empty array");
+    }
+    if (raw_n > (lua_Unsigned) PLUGIN_HOME_TILE_COUNT) {
+        return luaL_error(L, "plugin.set_home_layout: too many tile keys (max %d)", PLUGIN_HOME_TILE_COUNT);
+    }
+    int n = (int) raw_n;
+
+    bool is_list = false;
+    int32_t row_gap = 6; /* today's exact hardcoded build_pill_list_screen() default */
+    int32_t tile_gap = 0; /* today's exact flush-cell build_icon_grid_screen() default */
+    if (lua_gettop(L) >= 2 && !lua_isnil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        lua_getfield(L, 2, "mode");
+        if (!lua_isnil(L, -1)) {
+            const char * mode = lua_tostring(L, -1);
+            if (mode && strcmp(mode, "list") == 0) {
+                is_list = true;
+            } else if (!mode || strcmp(mode, "tile") != 0) {
+                const char * shown = mode ? mode : "?";
+                return luaL_error(L, "plugin.set_home_layout: options.mode must be \"tile\" or \"list\", got '%s'", shown);
+            }
+        }
+        lua_pop(L, 1);
+
+        /* Cosmetic, not structural -- clamp rather than error, same
+         * precedent radius's own PLUGIN_HOME_TILE_RADIUS_MAX clamp sets. */
+        lua_getfield(L, 2, "row_gap");
+        if (!lua_isnil(L, -1)) {
+            lua_Integer g = lua_tointeger(L, -1);
+            if (g < 0) g = 0;
+            if (g > PLUGIN_HOME_ROW_GAP_MAX) g = PLUGIN_HOME_ROW_GAP_MAX;
+            row_gap = (int32_t) g;
+        }
+        lua_pop(L, 1);
+
+        /* Same cosmetic clamp-not-error precedent as row_gap above -- tile
+         * mode's own analogous "space between tiles" knob. */
+        lua_getfield(L, 2, "tile_gap");
+        if (!lua_isnil(L, -1)) {
+            lua_Integer g = lua_tointeger(L, -1);
+            if (g < 0) g = 0;
+            if (g > PLUGIN_HOME_TILE_GAP_MAX) g = PLUGIN_HOME_TILE_GAP_MAX;
+            tile_gap = (int32_t) g;
+        }
+        lua_pop(L, 1);
+    }
+
+    plugin_home_tile_config_t new_layout[PLUGIN_HOME_TILE_COUNT];
+    memset(new_layout, 0, sizeof(new_layout));
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(L, 1, i + 1);
+
+        const char * key;
+        bool has_bg_color = false, has_text_color = false, has_radius = false;
+        uint32_t bg_color = 0, text_color = 0;
+        int32_t radius = 0;
+        /* List-mode-only extensions (PLUGINS.md, plugin.set_home_layout()) --
+         * silently ignored in tile mode, same as bg_color/text_color/radius
+         * are never structurally invalid there either, just cosmetically
+         * unused by build_icon_grid_screen(). */
+        int32_t row_height = 0, row_width = 0;
+        char text_align[8] = "";
+        bool accessory = true;
+        char text_size[8] = "";
+        bool show_icon = true;
+
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "key");
+            key = lua_tostring(L, -1);
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "bg_color");
+            if (!lua_isnil(L, -1)) {
+                has_bg_color = true;
+                bg_color = (uint32_t) lua_tointeger(L, -1);
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "text_color");
+            if (!lua_isnil(L, -1)) {
+                has_text_color = true;
+                text_color = (uint32_t) lua_tointeger(L, -1);
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "radius");
+            if (!lua_isnil(L, -1)) {
+                has_radius = true;
+                lua_Integer r = lua_tointeger(L, -1);
+                if (r < 0) r = 0;
+                if (r > PLUGIN_HOME_TILE_RADIUS_MAX) r = PLUGIN_HOME_TILE_RADIUS_MAX;
+                radius = (int32_t) r;
+            }
+            lua_pop(L, 1);
+
+            /* height/width: same "clamp downstream, don't validate here"
+             * story as register_list_item()'s own height/width options --
+             * build_pill_list_screen() already clamps any nonzero row_height/
+             * row_width to PILL_ROW_HEIGHT_MIN/MAX and PILL_ROW_WIDTH_MIN/MAX
+             * (screen_builders.c), so 0 here (unset) reaches it unchanged and
+             * still means "native default". */
+            lua_getfield(L, -1, "height");
+            row_height = (int32_t) luaL_optinteger(L, -1, 0);
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "width");
+            row_width = (int32_t) luaL_optinteger(L, -1, 0);
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "align");
+            const char * align = lua_tostring(L, -1);
+            if (align) {
+                if (strcmp(align, "left") != 0 && strcmp(align, "center") != 0 && strcmp(align, "right") != 0) {
+                    const char * shown_align = align;
+                    lua_pop(L, 1);
+                    return luaL_error(L,
+                        "plugin.set_home_layout: align must be \"left\", \"center\", or \"right\", got '%s'",
+                        shown_align);
+                }
+                snprintf(text_align, sizeof(text_align), "%s", align);
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "accessory");
+            if (!lua_isnil(L, -1)) {
+                accessory = lua_toboolean(L, -1);
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "icon");
+            if (!lua_isnil(L, -1)) {
+                show_icon = lua_toboolean(L, -1);
+            }
+            lua_pop(L, 1);
+
+            lua_getfield(L, -1, "text_size");
+            const char * ts = lua_tostring(L, -1);
+            if (ts) {
+                if (!is_valid_home_text_size(ts)) {
+                    const char * shown_ts = ts;
+                    lua_pop(L, 1);
+                    return luaL_error(L,
+                        "plugin.set_home_layout: unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
+                        shown_ts);
+                }
+                snprintf(text_size, sizeof(text_size), "%s", ts);
+            }
+            lua_pop(L, 1);
+        } else {
+            key = lua_tostring(L, -1);
+        }
+
+        bool known = false;
+        for (int k = 0; k < PLUGIN_HOME_TILE_COUNT; k++) {
+            if (key && strcmp(key, plugin_home_tile_keys[k]) == 0) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            const char * shown = key ? key : "?";
+            lua_pop(L, 1);
+            return luaL_error(L,
+                "plugin.set_home_layout: unknown tile key '%s' (expected \"music\", \"stream_media\", "
+                "\"wireless\", \"books\", \"system\", or \"dac\")",
+                shown);
+        }
+        for (int j = 0; j < i; j++) {
+            if (strcmp(new_layout[j].key, key) == 0) {
+                lua_pop(L, 1);
+                return luaL_error(L, "plugin.set_home_layout: duplicate tile key '%s'", key);
+            }
+        }
+
+        snprintf(new_layout[i].key, sizeof(new_layout[i].key), "%s", key);
+        new_layout[i].has_bg_color = has_bg_color;
+        new_layout[i].bg_color = bg_color;
+        new_layout[i].has_text_color = has_text_color;
+        new_layout[i].text_color = text_color;
+        new_layout[i].has_radius = has_radius;
+        new_layout[i].radius = radius;
+        new_layout[i].row_height = row_height;
+        new_layout[i].row_width = row_width;
+        snprintf(new_layout[i].text_align, sizeof(new_layout[i].text_align), "%s", text_align);
+        new_layout[i].accessory = accessory;
+        snprintf(new_layout[i].text_size, sizeof(new_layout[i].text_size), "%s", text_size);
+        new_layout[i].show_icon = show_icon;
+        lua_pop(L, 1);
+    }
+
+    memcpy(plugin_home_layout, new_layout, sizeof(new_layout[0]) * (size_t) n);
+    plugin_home_layout_count = n;
+    plugin_home_layout_is_list = is_list;
+    plugin_home_row_gap = row_gap;
+    plugin_home_tile_gap = tile_gap;
+    return 0;
+}
+
+int plugin_manager_get_home_tile_count(void) {
+    return plugin_home_layout_count;
+}
+
+const char * plugin_manager_get_home_tile_key(int index) {
+    if (index < 0 || index >= plugin_home_layout_count) return NULL;
+    return plugin_home_layout[index].key;
+}
+
+bool plugin_manager_get_home_tile_list_mode(void) {
+    return plugin_home_layout_is_list;
+}
+
+bool plugin_manager_get_home_tile_bg_color(int index, uint32_t * out_rgb) {
+    if (index < 0 || index >= plugin_home_layout_count || !plugin_home_layout[index].has_bg_color) return false;
+    *out_rgb = plugin_home_layout[index].bg_color;
+    return true;
+}
+
+bool plugin_manager_get_home_tile_text_color(int index, uint32_t * out_rgb) {
+    if (index < 0 || index >= plugin_home_layout_count || !plugin_home_layout[index].has_text_color) return false;
+    *out_rgb = plugin_home_layout[index].text_color;
+    return true;
+}
+
+bool plugin_manager_get_home_tile_radius(int index, int32_t * out_radius) {
+    if (index < 0 || index >= plugin_home_layout_count || !plugin_home_layout[index].has_radius) return false;
+    *out_radius = plugin_home_layout[index].radius;
+    return true;
+}
+
+bool plugin_manager_get_home_tile_row_height(int index, int32_t * out_height) {
+    if (index < 0 || index >= plugin_home_layout_count || plugin_home_layout[index].row_height == 0) return false;
+    *out_height = plugin_home_layout[index].row_height;
+    return true;
+}
+
+bool plugin_manager_get_home_tile_row_width(int index, int32_t * out_width) {
+    if (index < 0 || index >= plugin_home_layout_count || plugin_home_layout[index].row_width == 0) return false;
+    *out_width = plugin_home_layout[index].row_width;
+    return true;
+}
+
+const char * plugin_manager_get_home_tile_text_align(int index) {
+    if (index < 0 || index >= plugin_home_layout_count || plugin_home_layout[index].text_align[0] == '\0') return NULL;
+    return plugin_home_layout[index].text_align;
+}
+
+bool plugin_manager_get_home_tile_accessory(int index) {
+    if (index < 0 || index >= plugin_home_layout_count) return true;
+    return plugin_home_layout[index].accessory;
+}
+
+bool plugin_manager_get_home_tile_show_icon(int index) {
+    if (index < 0 || index >= plugin_home_layout_count) return true;
+    return plugin_home_layout[index].show_icon;
+}
+
+const char * plugin_manager_get_home_tile_text_size(int index) {
+    if (index < 0 || index >= plugin_home_layout_count || plugin_home_layout[index].text_size[0] == '\0') return NULL;
+    return plugin_home_layout[index].text_size;
+}
+
+int32_t plugin_manager_get_home_row_gap(void) {
+    return plugin_home_row_gap;
+}
+
+int32_t plugin_manager_get_home_tile_gap(void) {
+    return plugin_home_tile_gap;
 }
 
 /* Sets one of three fixed background-color slots, live, app-wide, no
@@ -1973,6 +2349,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "play_list",                 l_plugin_play_list },
     { "show_toast",                l_plugin_show_toast },
     { "set_icon",                  l_plugin_set_icon },
+    { "set_home_layout",           l_plugin_set_home_layout },
     { "set_background_color",      l_plugin_set_background_color },
     { "set_text_color",            l_plugin_set_text_color },
     { "eq_load_profile",           l_plugin_eq_load_profile },

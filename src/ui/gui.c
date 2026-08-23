@@ -12920,7 +12920,7 @@ static lv_obj_t * build_subsonic_entry_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "Saved Servers", PILL_ACCESSORY_CHEVRON, false, subsonic_saved_servers_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "New Connection", PILL_ACCESSORY_CHEVRON, false, subsonic_new_connection_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -15954,7 +15954,7 @@ static lv_obj_t * build_music_screen(void) {
      * genre.png/genre_s.png here since Genres no longer has a tile of its
      * own to need it. */
     items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
-    lv_obj_t * scr = build_icon_grid_screen("Music", generic_back_cb, items, 6, 100, false);
+    lv_obj_t * scr = build_icon_grid_screen("Music", generic_back_cb, items, 6, 100, false, 0);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -16002,7 +16002,7 @@ static lv_obj_t * build_stream_media_screen(void) {
         };
     }
 
-    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100, false);
+    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100, false, 0);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -18718,7 +18718,7 @@ static lv_obj_t * build_wireless_screen(void) {
      * rather than just its surrounding whitespace -- lands at very close to
      * these assets' own native 212x190 resolution within this screen's
      * available cell height. */
-    lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6, 160, true);
+    lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6, 160, true, 0);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -19066,7 +19066,7 @@ static lv_obj_t * build_books_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -19153,7 +19153,7 @@ static lv_obj_t * build_about_screen(void) {
     items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -19970,7 +19970,7 @@ static lv_obj_t * build_timezone_region_screen(void) {
         items[i] = (pill_list_item_t){ TIMEZONE_REGIONS[i], PILL_ACCESSORY_CHEVRON, false, timezone_region_row_cb, NULL,
                                         (void *) (intptr_t) i };
     }
-    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20030,7 +20030,7 @@ static lv_obj_t * build_settings_playback_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20073,7 +20073,7 @@ static lv_obj_t * build_settings_display_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20112,7 +20112,7 @@ static lv_obj_t * build_settings_power_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20154,7 +20154,7 @@ static lv_obj_t * build_settings_system_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20223,7 +20223,7 @@ static lv_obj_t * build_settings_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20295,7 +20295,7 @@ static lv_obj_t * build_dac_home_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "USB DAC", PILL_ACCESSORY_CHEVRON, false, dac_home_usb_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Bluetooth DAC", PILL_ACCESSORY_CHEVRON, false, bt_dac_settings_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20305,18 +20305,136 @@ static void dac_home_tile_cb(lv_event_t * e) {
     nav_push(dac_home_screen);
 }
 
+/* The 6 native Home tiles, keyed by the same strings plugin.set_home_
+ * layout() takes -- gui.c's own single source of truth for "what a given
+ * key looks like/does", so plugin_manager.c never needs to know these
+ * icon paths or callbacks itself, only the key strings a plugin passed. */
+typedef struct {
+    const char * key;
+    icon_grid_item_t item;
+} home_tile_def_t;
+
+static const home_tile_def_t home_tile_defs[] = {
+    { "music", { "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb, NULL } },
+    { "stream_media", { "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb, NULL } },
+    { "wireless", { "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb, NULL } },
+    { "books", { "launcher/book.png", "launcher/book_s.png", "Books", books_tile_cb, NULL } },
+    { "system", { "launcher/sys_set.png", "launcher/sys_set_s.png", "System", system_tile_cb, NULL } },
+    { "dac", { "launcher/dac.png", "launcher/dac_s.png", "DAC", dac_home_tile_cb, NULL } },
+};
+#define HOME_TILE_DEF_COUNT (int) (sizeof(home_tile_defs) / sizeof(home_tile_defs[0]))
+
+static const icon_grid_item_t * home_tile_def_lookup(const char * key) {
+    for (int i = 0; i < HOME_TILE_DEF_COUNT; i++) {
+        if (strcmp(home_tile_defs[i].key, key) == 0) return &home_tile_defs[i].item;
+    }
+    return NULL;
+}
+
 static lv_obj_t * build_home_screen(void) {
-    static icon_grid_item_t items[6];
-    items[0] = (icon_grid_item_t){ "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb, NULL };
-    items[1] = (icon_grid_item_t){ "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb, NULL };
-    items[2] = (icon_grid_item_t){ "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb, NULL };
-    items[3] = (icon_grid_item_t){ "launcher/book.png", "launcher/book_s.png", "Books", books_tile_cb, NULL };
-    items[4] = (icon_grid_item_t){ "launcher/sys_set.png", "launcher/sys_set_s.png", "System", system_tile_cb, NULL };
-    items[5] = (icon_grid_item_t){ "launcher/dac.png", "launcher/dac_s.png", "DAC", dac_home_tile_cb, NULL };
-    /* No back_btn_cb -- this is the true root, nothing to go back to. No
-     * title either -- matches the real stock launcher, which has no header
-     * text above its icon grid. */
-    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, 6, 100, false);
+    static icon_grid_item_t items[HOME_TILE_DEF_COUNT];
+    static pill_list_item_t list_items[HOME_TILE_DEF_COUNT];
+    int count = 0;
+
+    /* plugin.set_home_layout() reorders/hides these same 6 tiles, and may
+     * carry per-tile style overrides (background/text color, corner
+     * radius) -- see its own doc comment in plugin_manager.c.
+     * plugin_manager_get_home_tile_count() returning 0 (no plugin called
+     * it, or none successfully) means "use the native default order/set
+     * of all 6" below, unchanged from this screen's original behavior --
+     * note the per-tile override getters below are only ever meaningful
+     * against a plugin-supplied index, so the native-default fallback
+     * loop just below never calls them. */
+    int plugin_count = plugin_manager_get_home_tile_count();
+    for (int i = 0; i < plugin_count; i++) {
+        const icon_grid_item_t * def = home_tile_def_lookup(plugin_manager_get_home_tile_key(i));
+        if (!def) continue;
+        items[count] = *def;
+
+        uint32_t rgb;
+        int32_t radius;
+        if (plugin_manager_get_home_tile_bg_color(i, &rgb)) {
+            items[count].has_bg_color = true;
+            items[count].bg_color = rgb;
+        }
+        if (plugin_manager_get_home_tile_text_color(i, &rgb)) {
+            items[count].has_text_color = true;
+            items[count].text_color = rgb;
+        }
+        if (plugin_manager_get_home_tile_radius(i, &radius)) {
+            items[count].has_radius = true;
+            items[count].radius = radius;
+        }
+        count++;
+    }
+    if (count == 0) {
+        for (int i = 0; i < HOME_TILE_DEF_COUNT; i++) items[count++] = home_tile_defs[i].item;
+    }
+
+    lv_obj_t * scr;
+    if (plugin_manager_get_home_tile_list_mode()) {
+        /* List mode (plugin.set_home_layout()'s { mode = "list" }): same
+         * tiles/callbacks/style overrides as tile mode above, rendered as
+         * a plain vertical list (build_pill_list_screen()) instead of the
+         * icon grid -- icon_grid_item_t.on_click and pill_list_item_t.
+         * on_click are both plain lv_event_cb_t, so the same tile
+         * callback works unmodified in either builder. icon_asset here
+         * needs asset_path_plain() rather than asset_path(): these are
+         * theme2-relative paths ("launcher/music.png"), but pill_list_
+         * item_t.icon_asset wants a raw absolute path (pill_row_apply_
+         * icon() adds its own "S:" prefix) -- asset_path() already
+         * returns an "S:"-prefixed string, which would double-prefix.
+         * back_btn_cb NULL / title "Home": Home is still the true
+         * navigation root either way (build_pill_list_screen() already
+         * documents NULL back_btn_cb as exactly this "Home launcher"
+         * case), just with a real title band since, unlike the icon grid,
+         * this builder always reserves one.
+         *
+         * row_height/row_width/text_size/text_align/accessory/icon are
+         * list-mode-only per-tile extensions (PLUGINS.md) -- tile mode has
+         * no equivalent (fixed grid math, centered label, no chevron/gap/
+         * icon-suppression concept), so home_tile_def_lookup()'s own
+         * icon_grid_item_t is never touched by any of these. row_gap is the
+         * list-wide equivalent, passed straight to build_pill_list_screen();
+         * every other caller of that function still passes the literal 6 it
+         * always has.
+         *
+         * icon = false (plugin_manager_get_home_tile_show_icon()) passes
+         * NULL instead of the resolved path -- pill_row_apply_icon() no-ops
+         * on a NULL icon_path, which also drops the PILL_ROW_ICON_PX_DEFAULT
+         * +12px label indent screen_builders.c's label_left always reserves
+         * for a non-NULL icon_asset, even under align="left". Without this,
+         * a "flush against the row's own 24px inset" list can't be built --
+         * the indent is there unconditionally whenever icon_asset is set,
+         * regardless of whether the icon itself is visible. */
+        for (int i = 0; i < count; i++) {
+            int32_t row_height, row_width;
+            bool has_row_height = plugin_manager_get_home_tile_row_height(i, &row_height);
+            bool has_row_width = plugin_manager_get_home_tile_row_width(i, &row_width);
+            list_items[i] = (pill_list_item_t){
+                .label = items[i].label,
+                .accessory = plugin_manager_get_home_tile_accessory(i) ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
+                .on_click = items[i].on_click,
+                .icon_asset = plugin_manager_get_home_tile_show_icon(i) ? asset_path_plain(items[i].icon_asset) : NULL,
+                .has_bg_color = items[i].has_bg_color,
+                .bg_color = items[i].bg_color,
+                .has_text_color = items[i].has_text_color,
+                .text_color = items[i].text_color,
+                .has_radius = items[i].has_radius,
+                .radius = items[i].radius,
+                .row_height = has_row_height ? row_height : 0,
+                .row_width = has_row_width ? row_width : 0,
+                .text_size = plugin_manager_get_home_tile_text_size(i),
+                .text_align = plugin_manager_get_home_tile_text_align(i),
+            };
+        }
+        scr = build_pill_list_screen("Home", NULL, list_items, count, NULL, plugin_manager_get_home_row_gap());
+    } else {
+        /* No back_btn_cb -- this is the true root, nothing to go back to. No
+         * title either -- matches the real stock launcher, which has no header
+         * text above its icon grid. */
+        scr = build_icon_grid_screen(NULL, NULL, items, count, 100, false, plugin_manager_get_home_tile_gap());
+    }
     finalize_screen_navigation(scr);
     return scr;
 }

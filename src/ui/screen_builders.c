@@ -269,7 +269,7 @@ static void icon_tile_press_event_cb(lv_event_t * e) {
 
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const icon_grid_item_t * items, int item_count,
-                                   int32_t icon_scale_percent, bool label_inside_icon) {
+                                   int32_t icon_scale_percent, bool label_inside_icon, int32_t tile_gap) {
     int32_t target_icon_px = (ICON_GRID_TARGET_ICON_PX * icon_scale_percent) / 100;
 
     lv_obj_t * scr = lv_obj_create(NULL);
@@ -370,7 +370,23 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
 
         lv_obj_t * tile = lv_obj_create(grid);
         lv_obj_set_grid_cell(tile, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
+        /* Real LVGL grid margin, not a bigger ICON_GRID_TILE_PAD -- STRETCH
+         * alignment already subtracts margin from the tile's own computed
+         * size (lv_grid.c's get_margin_hor/ver), so this shrinks the tile
+         * visually within its still-untouched cell instead of touching
+         * row_h/col width math (see this function's own row_h history
+         * comment for why that math is fragile). tile_gap/2 per side so the
+         * gap BETWEEN two adjacent tiles equals tile_gap. */
+        if (tile_gap > 0) lv_obj_set_style_margin_all(tile, tile_gap / 2, 0);
         lv_obj_set_style_bg_opa(tile, 0, 0);
+        /* Per-tile style overrides (plugin.set_home_layout()'s per-tile
+         * config) -- every native tile leaves these unset, so this changes
+         * nothing about today's transparent-background tiles. */
+        if (item->has_bg_color) {
+            lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(tile, lv_color_hex(item->bg_color), 0);
+        }
+        if (item->has_radius) lv_obj_set_style_radius(tile, item->radius, 0);
         /* The default theme's "card" style puts a ~1px border on every
          * plain lv_obj_create() -- harmless back when per-tile borders were
          * hand-drawn here (every tile set its own border_width explicitly,
@@ -425,6 +441,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
          * matches the top bar's own text size rather than inventing a new
          * in-between size. */
         lv_obj_set_style_text_font(label, ui_size_20, 0);
+        if (item->has_text_color) lv_obj_set_style_text_color(label, lv_color_hex(item->text_color), 0);
         /* Real-device bug report: a caption longer than a tile's own width
          * ("Remote Control", "Import via Wi-Fi") had no width/wrap set at
          * all, so it just overflowed straight across into the next tile
@@ -436,7 +453,12 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
 
-        int32_t available_h = row_h - 2 * ICON_GRID_TILE_PAD;
+        /* tile_gap shrinks the tile's own STRETCH-computed height by that
+         * much (its margin_top+margin_bottom) below row_h -- see the
+         * tile_gap margin comment above -- so it has to come off here too,
+         * or icon/label placement would overflow the tile's real (now
+         * smaller) bottom edge. */
+        int32_t available_h = row_h - tile_gap - 2 * ICON_GRID_TILE_PAD;
         if (label_inside_icon) {
             /* See this function's own header comment (screen_builders.h) --
              * these assets already reserve their own caption band near the
@@ -505,8 +527,14 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
      * they're not registered via lv_obj_set_grid_cell(). Same bg_opa-vs-
      * bg_image_opa split used for the volume popup: bg_opa stays
      * transparent so no rect fill draws, while bg_image_opa defaults to
-     * COVER independently, so only the line sprite itself shows. */
-    if (col_count > 1) {
+     * COVER independently, so only the line sprite itself shows.
+     *
+     * Skipped entirely when tile_gap > 0: a real visible gap between tiles
+     * already separates them, and these flush-cell divider lines would
+     * either run pointlessly through empty background space or, on a
+     * plugin-colored tile, visually clash with a color/radius that already
+     * contradicts the flush-grid look these lines were built for. */
+    if (tile_gap == 0 && col_count > 1) {
         lv_obj_t * vline = lv_obj_create(grid);
         lv_obj_remove_style_all(vline);
         lv_obj_add_flag(vline, LV_OBJ_FLAG_IGNORE_LAYOUT);
@@ -518,7 +546,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_obj_set_style_bg_image_tiled(vline, true, 0);
     }
 
-    for (int r = 0; r < row_count - 1; r++) {
+    for (int r = 0; tile_gap == 0 && r < row_count - 1; r++) {
         lv_obj_t * hline = lv_obj_create(grid);
         lv_obj_remove_style_all(hline);
         lv_obj_add_flag(hline, LV_OBJ_FLAG_IGNORE_LAYOUT);
@@ -647,6 +675,10 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size) {
     if (strcmp(text_size, "small") == 0) return &app_font_16;
     if (strcmp(text_size, "medium") == 0) return &app_font_22;
     if (strcmp(text_size, "large") == 0) return &app_font_28;
+    /* 8x16 monospace bitmap font (lv_conf.h's LV_FONT_UNSCII_16) -- ASCII-only,
+     * see that flag's own comment. Plugin rows only (plugin.set_home_layout()'s
+     * text_size = "mono", PLUGINS.md). */
+    if (strcmp(text_size, "mono") == 0) return &lv_font_unscii_16;
     return ui_size_20;
 }
 
@@ -656,7 +688,7 @@ int32_t pill_row_default_width(void) {
 
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
-                                   lv_style_t * toggle_accent_style) {
+                                   lv_style_t * toggle_accent_style, int32_t row_gap) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
@@ -686,8 +718,24 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
     /* Vertical-only -- see the matching comment in build_icon_grid_screen. */
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_gap(list, 6, 0);
+    /* track_cross_place (3rd arg) -- not cross_place (2nd arg) -- is what
+     * actually centers a narrower-than-container row here: with FLEX_FLOW_
+     * COLUMN and no wrap, LVGL's single track shrinks to its widest child
+     * rather than filling the container's full cross size, so cross_place=
+     * CENTER (an item's placement *within* its track) is a no-op once the
+     * track already equals that item's own width -- it's track_cross_place
+     * (the track's own placement within the container) that determines
+     * whether narrower rows sit flush-left or centered. Was START: every
+     * row narrower than the container (any plugin-resized row, and even
+     * native rows by their few-px native/container gutter) rendered pinned
+     * to the left edge with all slack on the right -- barely visible at
+     * near-full native widths, glaring at a deliberately narrow
+     * plugin.set_home_layout()/register_list_item() width (real-device
+     * report: a themed list's cards read "stuck to the left edge"). CENTER
+     * here centers the track itself, which is what actually centers every
+     * row inside it, native or plugin-resized alike. */
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(list, row_gap, 0);
     lv_obj_set_style_pad_top(list, 4, 0);
 
     for (int i = 0; i < item_count; i++) {
@@ -700,7 +748,11 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
          * why the PNG sprite can't just stretch to a new height. */
         int32_t height = 124;
         int32_t width = pill_row_default_width();
-        bool resized = width != 448 || item->row_height > 0 || item->row_width > 0;
+        /* has_bg_color/has_radius also force the plain-fill path below --
+         * item_bg.png is a raster sprite, it can't be recolored/reshaped,
+         * same reasoning row_height/row_width already forced this path for. */
+        bool resized = width != 448 || item->row_height > 0 || item->row_width > 0 ||
+                       item->has_bg_color || item->has_radius;
         if (item->row_height > 0) {
             height = item->row_height;
             if (height < PILL_ROW_HEIGHT_MIN) height = PILL_ROW_HEIGHT_MIN;
@@ -722,8 +774,8 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
          * box underneath it. */
         lv_obj_add_style(row, &style_theme_screen_bg, 0);
         if (resized) {
-            lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-            lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+            lv_obj_set_style_radius(row, item->has_radius ? item->radius : LIST_ROW_RADIUS, 0);
+            lv_obj_set_style_bg_color(row, item->has_bg_color ? lv_color_hex(item->bg_color) : LIST_ROW_BG_COLOR, 0);
         } else {
             lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
         }
@@ -739,6 +791,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
          * ui_size_20, unchanged from before this field existed -- see
          * pill_row_resolve_text_size()'s own comment. */
         lv_obj_set_style_text_font(label, pill_row_resolve_text_size(item->text_size), 0);
+        if (item->has_text_color) lv_obj_set_style_text_color(label, lv_color_hex(item->text_color), 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
         pill_row_apply_icon(row, label, item->icon_asset, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
 
@@ -755,7 +808,17 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         const lv_font_t * label_font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
         lv_obj_set_height(label, label_font ? lv_font_get_line_height(label_font) : 24);
         row_label_enable_marquee(label);
-        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
+        /* NULL/"left" (every native row) -> unchanged default. "center"/
+         * "right" only shift where the text sits inside its own already-
+         * reserved box (label_width above) -- pill_row_apply_icon()'s icon
+         * placement is untouched either way. plugin.set_home_layout() only
+         * (PLUGINS.md), list mode. */
+        lv_text_align_t text_align = LV_TEXT_ALIGN_LEFT;
+        if (item->text_align) {
+            if (strcmp(item->text_align, "center") == 0) text_align = LV_TEXT_ALIGN_CENTER;
+            else if (strcmp(item->text_align, "right") == 0) text_align = LV_TEXT_ALIGN_RIGHT;
+        }
+        lv_obj_set_style_text_align(label, text_align, 0);
 
         if (item->accessory == PILL_ACCESSORY_TOGGLE) {
             lv_obj_t * toggle_img = lv_image_create(row);

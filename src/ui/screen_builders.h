@@ -129,6 +129,16 @@ typedef struct {
     const char * label;
     lv_event_cb_t on_click;           /* fired on LV_EVENT_CLICKED, may be NULL */
     void * user_data;
+
+    /* ---- Optional per-tile style overrides (plugin.set_home_layout()'s
+     * per-tile config table, PLUGINS.md) -- every native tile leaves these
+     * false/0 (a plain compound literal without designators for trailing
+     * fields already defaults them that way), reproducing today's exact
+     * look. Same trailing-fields-are-safe convention pill_list_item_t's own
+     * plugin-row extensions below already established. ---- */
+    bool has_bg_color;   uint32_t bg_color;   /* 0xRRGGBB */
+    bool has_text_color; uint32_t text_color; /* 0xRRGGBB */
+    bool has_radius;     int32_t radius;      /* px corner radius */
 } icon_grid_item_t;
 
 /* Titled screen: real back-arrow button (top-left, invokes back_btn_cb) and
@@ -151,9 +161,17 @@ typedef struct {
  * rest), so drawing a second, separate caption below them left that
  * reserved band sitting empty -- real-device bug report: "black space in
  * the bottom that was meant for the Text to fit inside". */
+/* tile_gap: px of visible space between adjacent tiles (0 = today's exact
+ * flush-cell look with its thin divider lines -- every native caller passes
+ * 0). A positive value insets each tile within its own already-computed grid
+ * cell via a real LVGL margin (tile_gap/2 on every side) rather than
+ * touching the row-height grid math at all, and suppresses the flush-cell
+ * divider lines (redundant, and visually conflicting, once real gaps exist).
+ * Only plugin.set_home_layout()'s options.tile_gap (PLUGINS.md, tile mode)
+ * ever passes a nonzero value. */
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const icon_grid_item_t * items, int item_count,
-                                   int32_t icon_scale_percent, bool label_inside_icon);
+                                   int32_t icon_scale_percent, bool label_inside_icon, int32_t tile_gap);
 
 typedef enum {
     PILL_ACCESSORY_NONE = 0,
@@ -213,16 +231,42 @@ typedef struct {
      * boundary in plugin_manager.c; this layer trusts it's already one of
      * the three recognized values or NULL. */
     const char * text_size;
+
+    /* ---- Optional per-tile style overrides, same fields/meaning as
+     * icon_grid_item_t's own (plugin.set_home_layout()'s per-tile config
+     * table, PLUGINS.md) -- every existing row leaves these false/0,
+     * reproducing today's exact rendering. When has_bg_color/has_radius is
+     * set, the row is forced onto the same plain rounded-rect fill path
+     * row_height/row_width already use instead of the PNG pill sprite (a
+     * raster asset can't be recolored), using these values in place of
+     * LIST_ROW_BG_COLOR/LIST_ROW_RADIUS. ---- */
+    bool has_bg_color;   uint32_t bg_color;
+    bool has_text_color; uint32_t text_color;
+    bool has_radius;     int32_t radius;
+
+    /* NULL/"left" (default) = today's exact layout (label left-aligned,
+     * starting right after any icon -- unaffected by this field). "center"/
+     * "right" re-align the label alone within the row's own remaining width;
+     * pill_row_apply_icon()'s icon placement is never touched by this.
+     * plugin.set_home_layout() only, list mode only (PLUGINS.md) -- no other
+     * caller sets this. */
+    const char * text_align;
 } pill_list_item_t;
 
 /* Row-height bounds for a plugin-resized pill row (register_list_item()'s
- * `height` option) or a plugin-resized show_list() row (gui_plugin_show_list()'s
- * own `height` option) -- shared range for both, silently clamped rather than
+ * `height` option), a plugin-resized show_list() row (gui_plugin_show_list()'s
+ * own `height` option), or a plugin.set_home_layout() list-mode tile
+ * (PLUGINS.md) -- shared range for all three, silently clamped rather than
  * erroring (same convention plugin.set_interval()'s own minimum-clamp uses).
- * Floor is comfortably above PILL_ROW_ICON_PX_DEFAULT so a default-size icon
- * always has real clearance; ceiling keeps one row from dominating the
- * screen. */
-#define PILL_ROW_HEIGHT_MIN 100
+ * Below PILL_ROW_ICON_PX_DEFAULT (64px): real-device request for genuinely
+ * compact rows (a dense retro/pixel-menu look, PLUGINS.md's set_home_layout()
+ * examples) -- a row with BOTH an icon and a height under 64px will clip the
+ * icon's top/bottom against the row bounds (lv_obj_create()'s default
+ * overflow clipping, never made visible on the host build since none of its
+ * launcher icon assets actually decode there); an icon-less row (no
+ * icon_asset, e.g. every plugin.set_home_layout() list tile) never hits
+ * this. Ceiling keeps one row from dominating the screen. */
+#define PILL_ROW_HEIGHT_MIN 48
 #define PILL_ROW_HEIGHT_MAX 220
 #define PILL_ROW_WIDTH_MIN 240
 #define PILL_ROW_WIDTH_MAX (ui_list_row_width_wide())
@@ -283,9 +327,13 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size);
  * lifetime; screen_builders.c never reads its properties directly, only
  * attaches it (same "no visibility into gui.c's accent state" boundary as
  * now_playing_color's own doc comment describes). */
+/* row_gap: vertical spacing between rows, in px (every existing caller
+ * passes 6, today's exact hardcoded value -- see build_pill_list_screen()'s
+ * own history). Only plugin.set_home_layout()'s options.row_gap
+ * (PLUGINS.md, list mode) ever passes anything else. */
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
-                                   lv_style_t * toggle_accent_style);
+                                   lv_style_t * toggle_accent_style, int32_t row_gap);
 
 typedef struct {
     const char * label;

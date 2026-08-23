@@ -158,7 +158,7 @@ from the moment your script starts running (injected before
 |---|---|
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info` |
 | UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
-| Theme | `set_icon`, `set_background_color`, `set_text_color` |
+| Theme | `set_icon`, `set_background_color`, `set_text_color` , `set_home_layout` |
 | Files | `sd_root`, `list_dir`, `mkdir` |
 | Playback | `play_file`, `play_list`, transport controls, playback state |
 | Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
@@ -277,7 +277,117 @@ different aspect ratio than the original will render at a size/position
 tuned for the original, not the replacement. Keep replacement icons
 roughly the same aspect ratio as what they're replacing.
 
-Raises a Lua error if `source_file_path` can't be read or copied.
+### `plugin.set_home_layout(tile_keys [, options])`
+
+Reorders and/or hides Home's 6 native tiles, optionally as a plain
+vertical list instead of the icon grid, with optional per-tile background
+color/text color/corner radius overrides.
+
+`tile_keys` is an array of any subset of `"music"`, `"stream_media"`,
+`"wireless"`, `"books"`, `"system"`, `"dac"`, in the order they should
+appear on screen -- any key left out is hidden. Home's icon grid itself is
+a fixed, non-scrollable 2x3 layout (matching the real stock launcher,
+confirmed on real hardware -- there's no way to add a 7th tile of your own
+here; see `register_stream_media_tile()` above for where a plugin *can*
+get its own tile), so this only reorders/hides/restyles the existing 6, it
+doesn't add new ones.
+
+Each entry in `tile_keys` is either a plain string, or a table `{ key =
+"...", bg_color = 0xRRGGBB, text_color = 0xRRGGBB, radius = n, ... }` to
+also style that one tile -- the same "string, or a table for the rows
+that need more" shape `register_list_item()`'s/`show_list()`'s own
+`items` arrays already use. `bg_color`/`text_color`/`radius` work in
+either mode; `radius` (corner radius, in px) is clamped to `0..64`. Any
+property left out of a table entry (or every entry left a plain string)
+keeps that tile's default appearance.
+
+`options.mode` is `"tile"` (default, the icon grid) or `"list"` (a plain
+vertical list, each tile becoming a row with its icon and a chevron).
+
+```lua
+-- Icon grid: only System, DAC, and Music, in that order, System restyled
+plugin.set_home_layout({
+    "music",
+    { key = "system", bg_color = 0x2a1a4e, text_color = 0xffcc00, radius = 24 },
+    "dac",
+})
+
+-- Same 3 tiles, as a plain list instead
+plugin.set_home_layout({ "music", "system", "dac" }, { mode = "list" })
+```
+
+#### List-mode-only extensions
+
+The icon grid is a fixed 2x3 layout with a centered icon+label per tile --
+none of the properties below have a meaning there, so they're silently
+ignored outside `{ mode = "list" }`. In list mode, each per-tile table also
+accepts:
+
+- `height`/`width` (px) -- resizes that row. Clamped to the same range
+  `register_list_item()`'s own `height`/`width` options use.
+- `align` -- `"left"` (default), `"center"`, or `"right"`. Only the
+  label's own text position changes; the icon (if any) always stays put
+  at the row's left edge.
+- `accessory` -- `false` hides the row's trailing `">"` chevron (default
+  `true`, today's look).
+- `text_size` -- `"small"`, `"medium"`, `"large"`, or `"mono"` (an 8x16
+  monospace/pixel bitmap font). `"mono"` is ASCII-only -- a label with
+  accented or non-Latin characters will show blank glyphs for those
+  characters, unlike this app's own regenerated fallback-capable fonts.
+- `icon` -- `false` drops the tile's launcher icon (default `true`, today's
+  look). This isn't just cosmetic: a shown icon always reserves space for
+  itself before the label (so `align = "left"` still starts after it) --
+  set `icon = false` to get a label genuinely flush against the row's own
+  left edge, or when `height` is small enough that the icon would clip.
+
+`options.row_gap` (list mode only) sets the vertical spacing between rows,
+in px, clamped to `0..24` (default `6`, today's look).
+
+`options.tile_gap` (tile mode only) sets the visible space between adjacent
+tiles in the icon grid, in px, clamped to `0..40` (default `0`, today's
+flush-cell look with its thin divider lines between tiles -- a nonzero
+`tile_gap` insets each tile within its own grid cell instead, and drops
+those divider lines since a real gap already separates the tiles).
+
+```lua
+-- A tight, chevron-free, monospace list flush to the left edge --
+-- e.g. a retro boot-menu look
+plugin.set_home_layout({
+    { key = "music", bg_color = 0x141824, text_color = 0xe8d16b,
+      radius = 0, height = 64, align = "left", accessory = false, text_size = "mono", icon = false },
+    { key = "system", bg_color = 0x141824, text_color = 0xe0a1c4,
+      radius = 0, height = 64, align = "left", accessory = false, text_size = "mono", icon = false },
+}, { mode = "list", row_gap = 6 })
+```
+
+**Call this from your plugin's top-level script code only**, same
+load-time-only constraint as `set_icon()` above -- Home is built once,
+right after every plugin finishes loading, so a call from inside a
+callback is a silent no-op until the next restart. If more than one
+plugin calls this, whichever call happens last wins (same as
+`set_background_color()`/`set_text_color()`'s own single global slots) --
+one call always fully specifies both the layout and every style override
+together, never layered onto an earlier call.
+
+Raises a Lua error -- Home must never end up with zero tiles -- for an
+empty array, an unknown or duplicate tile key, an invalid `mode`, an
+invalid `align`, or an invalid `text_size`; whatever layout was already
+in effect (the native default, or an earlier successful call) is left
+untouched. `radius` and `row_gap` are purely cosmetic and are clamped
+into range instead of erroring.
+
+`plugins_examples/HomeThemes.lua` is the reference implementation: 11
+ready-made Home looks (Game Boy, Terminal, Monastic, Wavy, Trees, Swamp,
+Mountain Sunset, Zen Terracotta, Retro, Vaporwave, Earthy) spanning both
+modes and every style knob above -- each one a genuinely different
+shape/spacing/alignment recipe, not just a different palette on the same
+skeleton -- picked from a Settings row and persisted the same way
+`Themes.lua`'s own light/dark picker is. Each preset also calls
+`set_background_color()`/`set_text_color()` (all 5 slots below) to match
+the same palette, so the theme carries app-wide -- every screen's
+background, every list row, every card/popup, and both text tiers --
+not just Home. Screenshots of all 11 are in
+`plugins_examples/screenshots/home_themes/`.
 
 ### `plugin.set_background_color(slot, rgb)`
 

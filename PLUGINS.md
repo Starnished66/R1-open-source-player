@@ -376,11 +376,14 @@ in effect (the native default, or an earlier successful call) is left
 untouched. `radius` and `row_gap` are purely cosmetic and are clamped
 into range instead of erroring.
 
-`plugins_examples/HomeThemes.lua` is the reference implementation: 10
-ready-made Home looks (Game Boy, Terminal, Retro, Vaporwave, Monastic,
-Wavy, Earthy, Trees, Swamp, Mountain Sunset) spanning both modes and
-every style knob above, picked from a Settings row and persisted the
-same way `Themes.lua`'s own light/dark picker is.
+`plugins_examples/HomeThemes.lua` is the reference implementation: 11
+ready-made Home looks (Game Boy, Terminal, Monastic, Wavy, Trees, Swamp,
+Mountain Sunset, Zen Terracotta, Retro, Vaporwave, Earthy) spanning both
+modes and every style knob above -- each one a genuinely different
+shape/spacing/alignment recipe, not just a different palette on the same
+skeleton -- picked from a Settings row and persisted the same way
+`Themes.lua`'s own light/dark picker is. Screenshots of all 11 are in
+`plugins_examples/screenshots/home_themes/`.
 
 ### `plugin.set_background_color(slot, rgb)`
 

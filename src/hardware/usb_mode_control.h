@@ -53,4 +53,9 @@ bool usb_mode_control_apply(usb_mode_t mode);
  * rather than guessing. */
 bool usb_mode_control_detect_current(usb_mode_t * out_mode);
 
+/* Best-effort physical USB-power/cable presence. Used only to detect a new
+ * connection and (re)bind the default Storage gadget; it does not claim to
+ * distinguish a PC host from a charge-only adapter. */
+bool usb_mode_control_cable_connected(void);
+
 #endif /* USB_MODE_CONTROL_H */

@@ -159,7 +159,7 @@ from the moment your script starts running (injected before
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info` |
 | UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
 | Theme | `set_icon`, `set_background_color`, `set_text_color` |
-| Files | `sd_root`, `list_dir` |
+| Files | `sd_root`, `list_dir`, `playlist_list`, `playlist_read`, `playlist_create`, `playlist_add`, `playlist_remove`, `playlist_delete` |
 | Playback | `play_file`, `play_list`, transport controls, playback state |
 | Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
 | Audio | `eq_load_profile`, `eq_save_profile`, `eq_set_*`, `eq_reset` |
@@ -471,6 +471,33 @@ Returns the SD card's absolute mount path as a string (`/data/mnt/sd_0` on
 the real device, `./music` on the host simulator) -- build every path your
 plugin touches from this rather than hardcoding `/data/mnt/sd_0`, so the
 same script works unmodified in the host simulator too.
+
+### Playlist management (`plugin.playlist_*`)
+
+CRUD over `.m3u` playlists, in the same `Playlists` folder the native
+Playlists screen reads from -- a playlist a plugin creates or deletes shows
+up/disappears there immediately, no rescan needed.
+
+- `plugin.playlist_list()` -- array of every playlist's absolute path, or
+  `nil` if there are none.
+- `plugin.playlist_read(m3u_path)` -- array of the playlist's song paths in
+  file order, or `nil` if it can't be read or is empty.
+- `plugin.playlist_create(name, song_path)` -- creates a new playlist named
+  `name` with `song_path` as its first entry. Returns the new playlist's
+  absolute path, or `nil` on failure.
+- `plugin.playlist_add(m3u_path, song_path)` / `plugin.playlist_remove
+  (m3u_path, song_path)` -- append/remove a song from an existing playlist.
+  Both return `bool`; `remove` deletes every matching occurrence, not just
+  the first.
+- `plugin.playlist_delete(m3u_path)` -- deletes the whole playlist file
+  outright (not a single song within it -- see `playlist_remove` for that).
+  Returns `bool`.
+
+```lua
+local m3u = plugin.playlist_create("Favorites Mix", "/path/to/song1.mp3")
+plugin.playlist_add(m3u, "/path/to/song2.mp3")
+local songs = plugin.playlist_read(m3u)
+```
 
 ### `plugin.play_file(path)`
 

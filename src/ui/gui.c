@@ -20221,6 +20221,10 @@ static void timezone_settings_row_cb(lv_event_t * e) {
  * shape). */
 static void factory_reset_btn_cb(lv_event_t * e);
 
+/* Defined later, alongside its own confirmation popup (build_reset_theme_
+ * icons_popup(), right before build_factory_reset_popup()). */
+static void reset_theme_icons_btn_cb(lv_event_t * e);
+
 /* Alphabetical by label -- real-device feedback: the previous ad-hoc
  * ordering (roughly "added in this order") made a specific setting hard
  * to find in a 17-row list. Keep new entries sorted in too rather than
@@ -20368,16 +20372,17 @@ static void plugin_system_list_item_click_cb(lv_event_t * e) {
 static void hostname_row_cb(lv_event_t * e);
 
 static lv_obj_t * build_settings_system_screen(void) {
-    static pill_list_item_t items[6 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
+    static pill_list_item_t items[7 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "24-Hour Clock", PILL_ACCESSORY_TOGGLE,
                                     current_settings.clock_24h, NULL, clock_24h_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Time Zone", PILL_ACCESSORY_CHEVRON, false, timezone_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Hostname", PILL_ACCESSORY_CHEVRON, false, hostname_row_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
-    items[5] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
+    items[5] = (pill_list_item_t){ "Reset Theme Icons", PILL_ACCESSORY_NONE, false, reset_theme_icons_btn_cb, NULL, NULL };
+    items[6] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
 
-    int count = 6;
+    int count = 7;
     int plugin_count = plugin_manager_get_system_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SYSTEM_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -20762,6 +20767,57 @@ static void build_eq_reset_popup(void) {
                                           lv_color_make(255, 120, 120), eq_reset_confirm_cb, NULL, "Cancel",
                                           accent_lv_color(), eq_reset_cancel_cb, NULL, eq_reset_popup_backdrop_cb,
                                           &eq_reset_popup_backdrop);
+}
+
+/* ---- Reset Theme Icons, with a confirmation popup -- same hand-built
+ * top-layer overlay shape as eq_reset_popup above. A plugin's
+ * plugin.set_icon() override otherwise persists on disk forever (see
+ * assets_reset_theme_overrides()'s own comment in assets.c) -- nothing
+ * else in this app ever cleans it up, not even removing the plugin that
+ * wrote it, so this is the only way back to stock icons short of a full
+ * Factory Reset (which wipes far more than just this). Reboots on
+ * confirm, same reasoning as Font Size/Hostname's own reboot prompts --
+ * screens are only ever built once at startup, so nothing here could
+ * hot-apply the restored icons without one. ---- */
+static lv_obj_t * reset_theme_icons_popup;
+static lv_obj_t * reset_theme_icons_popup_backdrop;
+
+static void hide_reset_theme_icons_popup(void) {
+    lv_obj_add_flag(reset_theme_icons_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(reset_theme_icons_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void reset_theme_icons_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_reset_theme_icons_popup();
+}
+
+static void reset_theme_icons_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_reset_theme_icons_popup();
+}
+
+static void reset_theme_icons_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_reset_theme_icons_popup();
+    assets_reset_theme_overrides();
+    char * reboot_argv[] = { (char *) "/sbin/reboot", NULL };
+    subprocess_run(reboot_argv, NULL, 0);
+}
+
+static void reset_theme_icons_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    lv_obj_remove_flag(reset_theme_icons_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(reset_theme_icons_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(reset_theme_icons_popup_backdrop);
+    lv_obj_move_foreground(reset_theme_icons_popup);
+}
+
+static void build_reset_theme_icons_popup(void) {
+    reset_theme_icons_popup = build_confirm_popup(
+        "Restore every icon to its stock appearance and reboot?", LV_LABEL_LONG_WRAP, NULL, NULL, "Reset",
+        lv_color_make(255, 120, 120), reset_theme_icons_confirm_cb, NULL, "Cancel", accent_lv_color(),
+        reset_theme_icons_cancel_cb, NULL, reset_theme_icons_popup_backdrop_cb, &reset_theme_icons_popup_backdrop);
 }
 
 /* ---- Factory Reset, with a confirmation popup -- same hand-built
@@ -21806,6 +21862,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     eq_screen = build_eq_screen();
     eq_profiles_screen = build_eq_profiles_screen();
     build_eq_reset_popup();
+    build_reset_theme_icons_popup();
     build_factory_reset_popup();
     build_font_size_reboot_popup();
     build_hostname_reboot_popup();

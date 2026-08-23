@@ -38,4 +38,20 @@ const char * asset_path_plain(const char * relative_path);
  * back to NULL if the asset cannot be read. */
 const lv_image_dsc_t * asset_png_memory(const char * relative_path);
 
+/* Deletes every file plugin.set_icon() has ever written into
+ * THEME_OVERRIDE_ROOT, restoring every icon to its real stock appearance --
+ * a plugin's override otherwise persists on disk indefinitely (nothing
+ * cleans it up on its own, not on boot and not when the plugin that wrote
+ * it is later removed or disabled: asset_path() just keeps finding it and
+ * preferring it over the stock asset forever). Scoped to exactly this one
+ * directory, unlike settings_factory_reset()'s much broader wipe of
+ * /usr/data -- this touches nothing else (settings, PEQ, Bluetooth
+ * pairings, ...). A no-op on HOST_BUILD, where THEME_OVERRIDE_ROOT doesn't
+ * exist (see asset_path()'s own HOST_BUILD branch). Screens are built once
+ * at startup from whatever asset_path() resolved then (see this header's
+ * own comment above), so -- same as Factory Reset/Font Size/Hostname --
+ * this doesn't try to hot-apply the change; the caller is expected to
+ * reboot afterward. */
+void assets_reset_theme_overrides(void);
+
 #endif /* ASSETS_H */

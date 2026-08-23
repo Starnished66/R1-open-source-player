@@ -1,6 +1,8 @@
 #include "assets.h"
 
+#include "debug_log.h"
 #include "lvgl.h"
+#include "subprocess.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,4 +115,12 @@ const lv_image_dsc_t * asset_png_memory(const char * relative_path) {
     dsc->data = data;
     dsc->data_size = (uint32_t) st.st_size;
     return dsc;
+}
+
+void assets_reset_theme_overrides(void) {
+#ifndef HOST_BUILD
+    DBG_LOG("assets_reset_theme_overrides: rm -rf %s\n", THEME_OVERRIDE_ROOT);
+    char * rm_argv[] = { (char *) "/bin/rm", (char *) "-rf", (char *) THEME_OVERRIDE_ROOT, NULL };
+    subprocess_run(rm_argv, NULL, 0);
+#endif
 }

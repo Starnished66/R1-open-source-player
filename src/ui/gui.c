@@ -2473,13 +2473,8 @@ char ** gui_plugin_get_next_album_tracks(const char * artist, const char * curre
 
 /* Library scan moved to gui_library.c */
 
-/* Search binding IDs -- indices into search_bindings[], defined together
- * with the rest of the live-search infrastructure much further down (near
- * the A-Z index section). Declared this early only because
- * all_songs_row_click_cb below (used by build_all_songs_screen(), itself
- * earlier in the file than the other three screens' own row-click
- * callbacks) needs to remap a filtered display index back to the real one
-// all_songs, recently_added, group_songs moved to gui_library.c
+/* Search bindings and the All Songs, Recently Added, and grouped-song
+ * implementations moved to gui_library.c. */
 
 
 /* ---- Subsonic-compatible network streaming ----
@@ -2867,27 +2862,11 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     build_power_off_countdown_popup();
     gui_queue_init();
     gui_plugins_init();
-    dac_home_screen = build_dac_home_screen();
-    home_screen = build_home_screen();
+    gui_shell_init(screen_width, screen_height);
+    gui_navigation_init();
 #ifndef HOST_BUILD
     boot_checkpoint("all screens built");
 #endif
-
-    /* See static_snapshot_screen's comment -- these are pure fixed content
-     * (icon grid / pill list, no toggles or per-item state) and never
-     * change after this point, so their transition bitmap is worth
-     * rendering once now rather than on every single visit. settings_screen
-     * (the new category menu) and settings_system_screen now qualify too --
-     * unlike the old flat System list, neither has any toggle rows. */
-    register_static_snapshot(0, home_screen);
-    register_static_snapshot(1, music_screen);
-    register_static_snapshot(2, stream_media_screen);
-    register_static_snapshot(3, wireless_screen);
-    register_static_snapshot(4, gui_books_get_screen());
-    register_static_snapshot(5, about_screen);
-    register_static_snapshot(6, settings_screen);
-    register_static_snapshot(7, settings_system_screen);
-    register_static_snapshot(8, dac_home_screen);
 
 
 

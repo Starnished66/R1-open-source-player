@@ -5,6 +5,7 @@
 #include "gui_theme.h"
 #include "gui_notifications.h"
 #include "gui_library.h"
+#include "gui_queue.h"
 #include "metadata_db.h"
 
 
@@ -344,6 +345,17 @@ void nav_reset_to_home(void);
 void open_queue_screen(void);
 void library_scan_once(void);
 void library_load_from_cache_only(void);
+
+
+extern int playlist_index;
+extern int playlist_count;
+extern char ** playlist;
+extern int queued_pending_count;
+
+void queue_add_song(const char * path);
+void play_track_at(int target);
+void get_display_names(const char * path, char * out_title, size_t title_sz, char * out_folder, size_t folder_sz);
+void row_label_enable_marquee(lv_obj_t * label);
 
 /* ---- Shared GUI and Screen Builders Helpers ---- */
 extern lv_style_t style_accent;

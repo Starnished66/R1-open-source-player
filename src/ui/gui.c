@@ -1,5 +1,6 @@
 #include "gui.h"
 #include "gui_library.h"
+#include "gui_queue.h"
 #include "gui_theme.h"
 #include "gui_notifications.h"
 #include "gui_settings.h"
@@ -314,8 +315,8 @@ static void refresh_quick_drawer_brightness(void) {
     quick_drawer_mark_snapshot_dirty();
 }
 
-static char ** playlist = NULL;
-static int playlist_count = 0;
+char ** playlist = NULL;
+int playlist_count = 0;
 int playlist_index = -1;
 
 /* Non-NULL only while playing from the whole, unfiltered All Songs list OR
@@ -353,7 +354,7 @@ static bool playlist_lazy_order_is_recency = false;
  * play_mode, so a queued song plays next regardless of shuffle/repeat --
  * plain array adjacency alone wouldn't guarantee that under Shuffle, which
  * jumps around the array via shuffle_order rather than stepping by 1. */
-static int queued_pending_count = 0;
+int queued_pending_count = 0;
 static int queue_next_insert_index = -1; /* -1 = nothing pending, next add goes right after playlist_index */
 
 /* Path of whichever song is currently playing, or an empty string if
@@ -4370,7 +4371,7 @@ static int compute_manual_step_index(int index, int direction) {
 /* Splits a full path into a display title (filename, no extension) and the
  * name of its containing folder. No tag/metadata parsing yet, so the
  * filename is the best "song title" available. */
-static void get_display_names(const char * path, char * title_out, size_t title_size,
+void get_display_names(const char * path, char * title_out, size_t title_size,
                                char * folder_out, size_t folder_size) {
     const char * slash = strrchr(path, '/');
     const char * filename = slash ? slash + 1 : path;
@@ -5287,7 +5288,7 @@ void arm_next_track_for_audio(int index) {
  * directly instead of a separate list. No-op with a toast if nothing's
  * playing -- there's no "currently playing track" position to queue
  * after. */
-static void queue_add_song(const char * path) {
+void queue_add_song(const char * path) {
     if (playlist_index < 0 || !playlist) {
         show_error_toast("Nothing is playing");
         return;
@@ -5488,7 +5489,7 @@ static void on_track_auto_advanced(int index) {
     settings_save(&current_settings);
 }
 
-static void play_track_at(int index) {
+void play_track_at(int index) {
     play_track_at_from(index, 0.0);
 }
 
@@ -6855,58 +6856,7 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
  * already just ordinary playlist[] positions (see queued_pending_count's
  * own comment on why the queue is implemented as a splice, not a separate
  * list). Rebuilt fresh on every open (queue sizes are always small, no
- * virtualization needed, same as the Group Songs screen). ---- */
-static lv_obj_t * queue_screen;
-static lv_obj_t * queue_list;
-
-static void queue_row_click_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int offset = (int) (intptr_t) lv_event_get_user_data(e); /* 0-based position within the queued run */
-    if (playlist_index < 0) return;
-    int target = playlist_index + 1 + offset;
-    if (target < playlist_count) play_track_at(target);
-}
-
-static void populate_queue_screen(void) {
-    lv_obj_clean(queue_list);
-
-    if (playlist_index < 0 || queued_pending_count <= 0) {
-        lv_obj_t * label = lv_label_create(queue_list);
-        lv_label_set_text(label, "Queue is empty");
-        lv_obj_add_style(label, &style_theme_text_muted, 0);
-        lv_obj_set_style_pad_left(label, 24, 0);
-        return;
-    }
-
-    for (int i = 0; i < queued_pending_count; i++) {
-        int idx = playlist_index + 1 + i;
-        if (idx >= playlist_count) break;
-
-        lv_obj_t * row = lv_label_create(queue_list);
-        lv_obj_add_style(row, &list_row_style, 0);
-        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
-        row_label_enable_marquee(row);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-        char title[128], folder[128];
-        get_display_names(playlist[idx], title, sizeof(title), folder, sizeof(folder));
-        lv_label_set_text(row, title);
-
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, queue_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
-    }
-}
-
-static lv_obj_t * build_queue_screen(void) {
-    lv_obj_t * title_label;
-    return build_subsonic_list_screen("Queue", &title_label, &queue_list);
-}
-
-void open_queue_screen(void) {
-    populate_queue_screen();
-    nav_push(queue_screen);
-}
-
+/* Queue screen moved to gui_queue.c */
 /* ---- Plugin list screens (src/plugins/plugin_manager.c's gui_plugin_show_list()
  * bridge) ----
  *
@@ -7422,67 +7372,7 @@ static void build_more_menu_popup(void) {
 }
 
 /* ---- Song long-press context menu: Add to Queue / Add to Playlist / Cancel
- * Same hand-built popup shape as build_more_menu_popup() just above, for a
- * long-pressed row in any song list (All Songs, an Artist's/Album's songs,
- * a Playlist, Favorites, Most Played) rather than only the player screen's
- * own currently-playing track. ---- */
-
-static lv_obj_t * song_context_menu_popup;
-static lv_obj_t * song_context_menu_popup_backdrop;
-/* Set right before showing the popup (open_song_context_menu()) -- which
- * song "Add to Queue"/"Add to Playlist" act on, since a long-pressed row
- * isn't necessarily the currently-playing track. */
-static char song_context_menu_target_path[600] = ""; /* 600, matching song_row_t.path's own bound (metadata_db.h) */
-
-static void hide_song_context_menu_popup(void) {
-    lv_obj_add_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(song_context_menu_popup, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void song_context_menu_popup_backdrop_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_song_context_menu_popup();
-}
-
-static void song_context_menu_add_to_queue_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_song_context_menu_popup();
-    if (song_context_menu_target_path[0] != '\0') queue_add_song(song_context_menu_target_path);
-}
-
-static void song_context_menu_add_to_playlist_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_song_context_menu_popup();
-    if (song_context_menu_target_path[0] != '\0') open_add_to_playlist_for(song_context_menu_target_path);
-}
-
-static void song_context_menu_cancel_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_song_context_menu_popup();
-}
-
-/* Called from every song list's long-press handler (all_songs_row_long_
- * press_cb(), group_song_row_long_press_cb()) with that row's actual song
- * path. */
-void open_song_context_menu(const char * path) {
-    snprintf(song_context_menu_target_path, sizeof(song_context_menu_target_path), "%s", path);
-    lv_obj_remove_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(song_context_menu_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(song_context_menu_popup_backdrop);
-    lv_obj_move_foreground(song_context_menu_popup);
-}
-
-static void build_song_context_menu_popup(void) {
-    static const menu_popup_row_t rows[] = {
-        { "Add to Queue", song_context_menu_add_to_queue_cb, false },
-        { "Add to Playlist", song_context_menu_add_to_playlist_cb, false },
-        { "Cancel", song_context_menu_cancel_cb, false },
-    };
-    song_context_menu_popup = build_menu_popup(rows, (int) (sizeof(rows) / sizeof(rows[0])),
-                                                song_context_menu_popup_backdrop_cb,
-                                                &song_context_menu_popup_backdrop);
-}
-
+/* Song context menu moved to gui_queue.c */
 
 static void cover_img_tap_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -9551,7 +9441,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     gui_settings_init();
     gui_books_init();
     build_power_off_countdown_popup();
-    queue_screen = build_queue_screen();
+    gui_queue_init();
     for (int i = 0; i < PLUGIN_LIST_SCREEN_POOL_SIZE; i++) {
         plugin_list_screens[i] = build_subsonic_list_screen("Plugin", &plugin_list_title_labels[i], &plugin_list_lists[i]);
     }
@@ -9561,7 +9451,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     }
     build_delete_song_popup();
     build_more_menu_popup();
-    build_song_context_menu_popup();
     dac_home_screen = build_dac_home_screen();
     home_screen = build_home_screen();
 #ifndef HOST_BUILD

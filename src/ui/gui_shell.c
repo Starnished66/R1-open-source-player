@@ -82,11 +82,11 @@ extern bool player_transition_cache_dirty;
 extern void player_transition_cache_async_cb(void * user_data);
 static lv_obj_t * home_indicator_band = NULL;
 
-lv_obj_t * quick_drawer_title_label = NULL;
-lv_obj_t * quick_drawer_artist_label = NULL;
-lv_obj_t * quick_drawer_favorite_icon = NULL;
-lv_obj_t * quick_drawer_play_btn = NULL;
-lv_obj_t * quick_drawer_order_icon = NULL;
+static lv_obj_t * quick_drawer_title_label = NULL;
+static lv_obj_t * quick_drawer_artist_label = NULL;
+static lv_obj_t * quick_drawer_favorite_icon = NULL;
+static lv_obj_t * quick_drawer_play_btn = NULL;
+static lv_obj_t * quick_drawer_order_icon = NULL;
 
 extern lv_obj_t * gui_books_get_screen();
 extern lv_obj_t * lyrics_screen;
@@ -2897,5 +2897,37 @@ void gui_shell_set_home_indicator_visible(bool visible) {
     if (home_indicator_band) {
         if (visible) lv_obj_remove_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+
+void gui_shell_update_quick_drawer_track(const char * title, const char * artist) {
+    if (quick_drawer_title_label) {
+        lv_label_set_text(quick_drawer_title_label, title ? title : "No track loaded");
+        lv_label_set_text(quick_drawer_artist_label, artist ? artist : "");
+        quick_drawer_mark_snapshot_dirty();
+    }
+}
+
+void gui_shell_update_quick_drawer_favorite(bool is_favorite) {
+    if (quick_drawer_favorite_icon) {
+        lv_image_set_src(quick_drawer_favorite_icon,
+                         asset_path(is_favorite ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
+        quick_drawer_mark_snapshot_dirty();
+    }
+}
+
+void gui_shell_update_quick_drawer_play_state(bool is_playing) {
+    if (quick_drawer_play_btn) {
+        lv_image_set_src(quick_drawer_play_btn,
+                         asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
+        quick_drawer_mark_snapshot_dirty();
+    }
+}
+
+void gui_shell_update_quick_drawer_play_mode(int mode) {
+    if (quick_drawer_order_icon) {
+        lv_image_set_src(quick_drawer_order_icon, asset_path(play_mode_icon_asset((play_mode_t) mode)));
+        quick_drawer_mark_snapshot_dirty();
     }
 }

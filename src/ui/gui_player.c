@@ -95,10 +95,6 @@ static int current_cover_for_index = -1;
 static uint8_t * current_reflection_bytes = NULL;
 static lv_image_dsc_t current_reflection_dsc;
 
-extern lv_obj_t * quick_drawer_title_label;
-extern lv_obj_t * quick_drawer_artist_label;
-extern lv_obj_t * quick_drawer_favorite_icon;
-extern lv_obj_t * quick_drawer_play_btn;
 extern lv_obj_t * volume_topbar_btn;
 extern lv_obj_t * volume_topbar_label;
 extern lv_obj_t * status_bar;
@@ -749,11 +745,7 @@ void favorite_icon_event_cb(lv_event_t * e) {
     favorite_is_set = !favorite_is_set;
     metadata_db_song_favorite_set(playlist_path_at(playlist_index), favorite_is_set);
     lv_image_set_src(favorite_icon, asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
-    if (quick_drawer_favorite_icon) {
-        lv_image_set_src(quick_drawer_favorite_icon,
-                         asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
-        quick_drawer_mark_snapshot_dirty();
-    }
+    gui_shell_update_quick_drawer_favorite(favorite_is_set);
 }
 
 void arm_next_track_for_audio(int index);
@@ -769,10 +761,7 @@ void cycle_play_mode(void) {
     settings_save(&current_settings);
 
     lv_image_set_src(order_icon, asset_path(play_mode_icon_asset(mode)));
-    if (quick_drawer_order_icon) {
-        lv_image_set_src(quick_drawer_order_icon, asset_path(play_mode_icon_asset(mode)));
-        quick_drawer_mark_snapshot_dirty();
-    }
+    gui_shell_update_quick_drawer_play_mode((int) mode);
 
     /* What comes after the current track changes with the mode (e.g.
      * entering Shuffle picks a random next instead of index+1) -- re-arm the
@@ -887,11 +876,7 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
 
     lv_label_set_text(song_title_label, title_text);
     lv_label_set_text(song_folder_label, folder_text);
-    if (quick_drawer_title_label) {
-        lv_label_set_text(quick_drawer_title_label, title_text);
-        lv_label_set_text(quick_drawer_artist_label, folder_text);
-        quick_drawer_mark_snapshot_dirty();
-    }
+    gui_shell_update_quick_drawer_track(title_text, folder_text);
     refresh_format_badge();
     if (is_remote_track && remote_meta.artwork_url[0]) {
         launch_cover_decode_from_url(index, remote_meta.artwork_url, remote_meta.verify_tls);
@@ -935,10 +920,7 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     favorite_is_set = metadata_db_song_favorite_is_set(path);
     const char * favorite_icon_asset = favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png";
     lv_image_set_src(favorite_icon, asset_path(favorite_icon_asset));
-    if (quick_drawer_favorite_icon) {
-        lv_image_set_src(quick_drawer_favorite_icon, asset_path(favorite_icon_asset));
-        quick_drawer_mark_snapshot_dirty();
-    }
+    gui_shell_update_quick_drawer_favorite(favorite_is_set);
 
     /* Once per real "this track started playing" event -- apply_track_
      * metadata_to_ui() is called exactly here for both an explicit pick
@@ -1932,11 +1914,7 @@ void get_display_names(const char * path, char * title_out, size_t title_size,
 void set_play_button_state(bool is_playing) {
     lv_image_set_src(play_btn, asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
     player_transition_mark_dirty(); /* play_btn lives on player_screen -- see the cache's own doc comment */
-    if (quick_drawer_play_btn) {
-        lv_image_set_src(quick_drawer_play_btn,
-                         asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
-        quick_drawer_mark_snapshot_dirty();
-    }
+    gui_shell_update_quick_drawer_play_state(is_playing);
 }
 
 /* resolve_replaygain moved to gui_player.c */

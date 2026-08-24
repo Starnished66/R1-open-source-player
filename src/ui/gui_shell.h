@@ -6,11 +6,10 @@
 lv_obj_t * gui_shell_get_home_screen(void);
 lv_obj_t * gui_shell_get_dac_home_screen(void);
 
-extern lv_obj_t * quick_drawer_title_label;
-extern lv_obj_t * quick_drawer_artist_label;
-extern lv_obj_t * quick_drawer_favorite_icon;
-extern lv_obj_t * quick_drawer_play_btn;
-extern lv_obj_t * quick_drawer_order_icon;
+void gui_shell_update_quick_drawer_track(const char * title, const char * artist);
+void gui_shell_update_quick_drawer_favorite(bool is_favorite);
+void gui_shell_update_quick_drawer_play_state(bool is_playing);
+void gui_shell_update_quick_drawer_play_mode(int mode);
 
 void gui_shell_init(uint32_t screen_width, uint32_t screen_height);
 void refresh_clock_label(void);

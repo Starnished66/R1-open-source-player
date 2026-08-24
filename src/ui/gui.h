@@ -371,13 +371,8 @@ typedef enum {
 } play_mode_t;
 
 const char * play_mode_icon_asset(play_mode_t mode);
-extern lv_obj_t * quick_drawer_order_icon;
 
 
-extern lv_obj_t * quick_drawer_title_label;
-extern lv_obj_t * quick_drawer_artist_label;
-extern lv_obj_t * quick_drawer_favorite_icon;
-extern lv_obj_t * quick_drawer_play_btn;
 void quick_drawer_mark_snapshot_dirty(void);
 
 

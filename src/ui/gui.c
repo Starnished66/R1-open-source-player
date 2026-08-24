@@ -1,4 +1,5 @@
 #include "gui.h"
+#include "gui_books.h"
 #include "assets.h"
 #include "backlight.h"
 #include "debug_log.h"
@@ -239,7 +240,7 @@ static lv_obj_t * subsonic_entry_screen;
 static lv_obj_t * wireless_screen;
 static lv_obj_t * wifi_screen;
 static lv_obj_t * bt_screen;
-static lv_obj_t * books_screen;
+
 static lv_obj_t * about_screen;
 static lv_obj_t * accent_color_screen;
 static lv_obj_t * player_screen;
@@ -625,7 +626,7 @@ static player_settings_t current_settings;
  * updated in place whenever the user picks a new color, so every widget
  * that has this style attached re-renders automatically without having to
  * walk and restyle each one individually. */
-static lv_style_t style_accent;
+lv_style_t style_accent;
 /* Plain light-gray text style for the *unselected* EQ band labels -- kept
  * as its own shared style (rather than a one-off lv_obj_set_style_text_color)
  * so toggling selection is just swapping which shared style is attached,
@@ -1396,7 +1397,7 @@ static void screen_transition_slide(lv_obj_t * to_scr, bool forward) {
     lv_anim_start(&a);
 }
 
-static void nav_push(lv_obj_t * scr) {
+void nav_push(lv_obj_t * scr) {
 #ifdef UI_PERF_TRACE
     uint64_t perf_start_us = ui_perf_now_us();
 #endif
@@ -1464,7 +1465,7 @@ static void nav_reset_to_home(void) {
 
 /* Shared back-button handler for every screen built via the reusable
  * icon-grid/pill-list builders -- passed directly as their back_btn_cb. */
-static void generic_back_cb(lv_event_t * e) {
+void generic_back_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_pop();
 }
@@ -1594,7 +1595,7 @@ static void screen_gesture_event_cb(lv_event_t * e) {
 
 /* Finishing touch every build_XXX_screen() calls just before returning: wire
  * up the swipe gestures generically instead of repeating this per screen. */
-static void finalize_screen_navigation(lv_obj_t * scr) {
+void finalize_screen_navigation(lv_obj_t * scr) {
     /* lv_obj_hit_test() -- and therefore all press/drag/gesture detection --
      * bails out immediately for any object lacking LV_OBJ_FLAG_CLICKABLE
      * (confirmed by reading lv_obj_hit_test() in lv_obj_pos.c). A plain
@@ -3691,8 +3692,8 @@ static void prev_btn_event_cb(lv_event_t * e);
 static void play_btn_event_cb(lv_event_t * e);
 static void next_btn_event_cb(lv_event_t * e);
 static const char * play_mode_icon_asset(play_mode_t mode);
-static const char * basename_of(const char * path);
-static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
+const char * basename_of(const char * path);
+lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
 /* Defined much later, alongside the rest of the new Wi-Fi/Bluetooth
  * screens -- long-pressing the drawer's wifi/bt icons opens the real
  * settings screen for that radio, matching Android's quick-settings
@@ -9402,7 +9403,7 @@ static void music_files_tile_cb(lv_event_t * e) {
     nav_push(files_screen);
 }
 
-static const char * basename_of(const char * path) {
+const char * basename_of(const char * path) {
     const char * slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
 }
@@ -9884,7 +9885,7 @@ static int library_scan_progress_total = 0;
  * now-removed "Scanning" row's job into this same rescan, per real-device
  * feedback -- one rescan action, not two separate ones for music and
  * books. */
-static void rescan_books(void);
+
 
 /* Refreshes the persistent playlist cache (metadata_db.c) from
  * PLAYLISTS_DIR only (the SD card's Playlists folder), not a walk of the
@@ -9907,7 +9908,7 @@ static void library_scan_once(void) {
     library_scan_progress_total = 0;
 
     metadata_db_open();
-    rescan_books();
+    gui_books_rescan();
     rescan_playlists();
 
     char spool_path[PATH_MAX] = {0};
@@ -11931,7 +11932,7 @@ static void populate_indexed_list(lv_obj_t * list, int count, const char * (*lab
     }
 }
 
-static lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list) {
+lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
@@ -18853,75 +18854,18 @@ static lv_obj_t * build_wireless_screen(void) {
  * problem), no pagination, just load the whole file into one scrollable
  * label. */
 
-static lv_obj_t * books_files_screen;
-static lv_obj_t * books_files_list;
-static lv_obj_t * books_files_title_label;
-/* Which data source populate_books_files_screen() reads from -- set right
- * before nav_push()ing books_files_screen by whichever row (Books or
- * Favorites) opened it, see books_files_row_cb()/books_favorites_row_cb()
- * below. One shared screen/list for both, same as the player screen's
- * transport buttons being reused by the quick drawer -- these are
- * structurally identical (a flat list of book rows, tap to open), just
- * sourced differently. */
-static bool books_showing_favorites = false;
 
-static lv_obj_t * text_reader_screen;
-static lv_obj_t * text_reader_title_label;
-static lv_obj_t * text_reader_scroll;
-static lv_obj_t * text_reader_content_label;
-static lv_obj_t * text_reader_favorite_icon;
-static char * text_reader_current_content = NULL; /* owned; replaced (freed) on every new file opened */
-static char text_reader_current_path[600] = ""; /* the currently open book's path -- what the favorite icon below toggles */
 
-static void refresh_text_reader_favorite_icon(void) {
-    bool is_favorite = text_reader_current_path[0] != '\0' && metadata_db_book_favorite_is_set(text_reader_current_path);
-    lv_image_set_src(text_reader_favorite_icon,
-                     asset_path(is_favorite ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
-}
 
-static void text_reader_favorite_icon_event_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (text_reader_current_path[0] == '\0') return;
-    bool is_favorite = metadata_db_book_favorite_is_set(text_reader_current_path);
-    metadata_db_book_favorite_set(text_reader_current_path, !is_favorite);
-    refresh_text_reader_favorite_icon();
-}
 
-static void open_text_reader(const char * path) {
-    free(text_reader_current_content);
-    bool truncated = false;
-    text_reader_current_content = text_reader_load(path, &truncated);
 
-    if (!text_reader_current_content) {
-        lv_label_set_text(text_reader_content_label, "Could not open this file.");
-    } else if (truncated) {
-        /* Prepend a plain-text note rather than reaching for a separate
-         * toast/label widget -- simplest way to say "there's more" for a
-         * feature this basic. */
-        char * buf = malloc(strlen(text_reader_current_content) + 128);
-        if (buf) {
-            snprintf(buf, strlen(text_reader_current_content) + 128,
-                     "[File truncated at %d KB -- showing the first part only]\n\n%s",
-                     TEXT_READER_MAX_BYTES / 1024, text_reader_current_content);
-            free(text_reader_current_content);
-            text_reader_current_content = buf;
-        }
-        lv_label_set_text(text_reader_content_label, text_reader_current_content);
-    } else {
-        lv_label_set_text(text_reader_content_label, text_reader_current_content);
-    }
 
-    lv_label_set_text(text_reader_title_label, basename_of(path));
-    snprintf(text_reader_current_path, sizeof(text_reader_current_path), "%s", path);
-    refresh_text_reader_favorite_icon();
-    lv_obj_scroll_to_y(text_reader_scroll, 0, LV_ANIM_OFF);
-    nav_push(text_reader_screen);
-}
 
-static void books_file_row_cb(lv_event_t * e) {
-    const char * path = (const char *) lv_event_get_user_data(e);
-    open_text_reader(path);
-}
+
+
+
+
+
 
 /* Real-device bug report: recursively looking for books across the whole SD
  * card visibly slowed the device down and could look like a crash. Book
@@ -18941,46 +18885,11 @@ static void books_file_row_cb(lv_event_t * e) {
  * be far faster, and there's no value in blocking the UI for as long. */
 #define BOOKS_SCAN_TIMEOUT_MS 8000
 
-typedef struct {
-    char root[600];
-    atomic_bool done;
-    bool ok;
-    char ** paths;
-    int count;
-} books_scan_work_t;
 
-static void * books_scan_worker(void * arg) {
-    books_scan_work_t * w = (books_scan_work_t *) arg;
-    w->ok = text_reader_scan_txt_files(w->root, &w->paths, &w->count);
-    atomic_store_explicit(&w->done, true, memory_order_release);
-    return NULL;
-}
 
-static bool books_scan_txt_files_with_timeout(const char * root, char *** out_paths, int * out_count) {
-    books_scan_work_t * w = calloc(1, sizeof(*w));
-    snprintf(w->root, sizeof(w->root), "%s", root);
 
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, books_scan_worker, w) != 0) {
-        free(w);
-        return false;
-    }
-    pthread_detach(thread); /* never joined either way -- see scan_all_songs_with_timeout()'s own comment */
 
-    for (int waited_ms = 0; waited_ms < BOOKS_SCAN_TIMEOUT_MS; waited_ms += 20) {
-        if (atomic_load_explicit(&w->done, memory_order_acquire)) {
-            bool ok = w->ok;
-            *out_paths = w->paths;
-            *out_count = w->count;
-            free(w);
-            return ok;
-        }
-        usleep(20000);
-    }
 
-    fprintf(stderr, "Warning: timed out scanning %s for .txt files (possible filesystem corruption) -- treating as empty\n", root);
-    return false;
-}
 
 /* Real-device feedback: the Books menu's old separate "Scanning" row was a
  * dead stub, and the actual per-visit scan (in populate_books_files_screen(),
@@ -18991,166 +18900,23 @@ static bool books_scan_txt_files_with_timeout(const char * root, char *** out_pa
  * menu item. The stock database is deliberately not consulted here: it can
  * contain text files from anywhere on the card, while this player's book
  * contract is now exclusively BOOKS_ROOT_DIR. */
-static void rescan_books(void) {
-    char ** paths = NULL;
-    int count = 0;
-    books_scan_txt_files_with_timeout(BOOKS_ROOT_DIR, &paths, &count);
 
-    metadata_db_book_replace_all(paths, count);
 
-    for (int i = 0; i < count; i++) free(paths[i]);
-    free(paths);
-}
 
-static void populate_books_files_screen(void) {
-    lv_obj_clean(books_files_list);
-    lv_label_set_text(books_files_title_label, books_showing_favorites ? "Favorites" : "Books");
 
-    char ** paths;
-    int count;
-    /* Real-device bug report: this screen was slow to open every time -- a
-     * live recursive readdir()+stat() walk of the whole SD card on every
-     * visit (see books_scan_txt_files_with_timeout()'s own comment). Reads
-     * from the persistent book cache now instead (metadata_db.c), kept
-     * fresh only by rescan_books() (folded into Settings > Update Music
-     * Database) -- this screen itself never touches the filesystem or the
-     * stock db at all anymore. */
-    if (books_showing_favorites) {
-        metadata_db_load_favorite_books(&paths, &count);
-    } else {
-        metadata_db_load_all_books(&paths, &count);
-    }
 
-    if (count == 0) {
-        lv_obj_t * label = lv_label_create(books_files_list);
-        lv_label_set_text(label, books_showing_favorites ? "No favorites yet" : "No .txt files found");
-        lv_obj_add_style(label, &style_theme_text_muted, 0);
-        lv_obj_set_style_pad_left(label, 24, 0);
-        free(paths);
-        return;
-    }
 
-    for (int i = 0; i < count; i++) {
-        lv_obj_t * row = lv_obj_create(books_files_list);
-        lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
-        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(row, 0, 0);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t * label = lv_label_create(row);
-        lv_label_set_text(label, basename_of(paths[i]));
-        lv_obj_add_style(label, &style_theme_text_primary, 0);
-        lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
-        lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
 
-        /* paths[i] itself becomes the row's user_data -- ownership passes
-         * to the row's event callback closure for as long as this screen
-         * exists (the array is only ever rebuilt by lv_obj_clean() above,
-         * which destroys these rows and their callbacks together, so
-         * there's no dangling-pointer window). The char** array holding
-         * them is freed here since each element's ownership already moved
-         * to its row. */
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, books_file_row_cb, LV_EVENT_CLICKED, paths[i]);
-    }
-    free(paths);
-}
 
-static void books_files_row_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    books_showing_favorites = false;
-    populate_books_files_screen();
-    nav_push(books_files_screen);
-}
 
-static void books_favorites_row_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    books_showing_favorites = true;
-    populate_books_files_screen();
-    nav_push(books_files_screen);
-}
 
-static lv_obj_t * build_books_files_screen(void) {
-    lv_obj_t * scr = build_subsonic_list_screen("Books", &books_files_title_label, &books_files_list);
-    return scr;
-}
-
-static lv_obj_t * build_text_reader_screen(void) {
-    lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
-
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
-
-    /* Favorite toggle, top-right -- same collect_in/collect_out asset pair
-     * and click-to-toggle shape as the player screen's own favorite_icon,
-     * just persisted for real here (metadata_db_book_favorite_set()) rather
-     * than that one's purely in-memory, never-saved toggle. */
-    text_reader_favorite_icon = lv_image_create(scr);
-    lv_image_set_src(text_reader_favorite_icon, asset_path("playing_plane/collect_out.png"));
-    lv_obj_align(text_reader_favorite_icon, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_flag(text_reader_favorite_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(text_reader_favorite_icon, 16);
-    lv_obj_add_event_cb(text_reader_favorite_icon, text_reader_favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
-
-    text_reader_title_label = lv_label_create(scr);
-    lv_label_set_text(text_reader_title_label, "");
-    lv_obj_align(text_reader_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(text_reader_title_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(text_reader_title_label, &app_font_28, 0); /* shows the (possibly non-Latin) file's own name -- see fallback_font.h */
-    /* Narrower than build_subsonic_list_screen()'s equivalent titles (70%
-     * -- this one has both the back button AND the favorite icon eating
-     * into its available width) -- same width-capped dot-scroll treatment
-     * as the player screen's own title label either way. */
-    lv_obj_set_width(text_reader_title_label, lv_pct(55));
-    lv_label_set_long_mode(text_reader_title_label, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(text_reader_title_label, LV_TEXT_ALIGN_CENTER, 0);
-
-    text_reader_scroll = lv_obj_create(scr);
-    lv_obj_set_size(text_reader_scroll, lv_pct(100),
-                    lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
-                        TITLE_ROW_HEIGHT);
-    lv_obj_align(text_reader_scroll, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_opa(text_reader_scroll, 0, 0);
-    lv_obj_set_style_border_width(text_reader_scroll, 0, 0);
-    lv_obj_set_scroll_dir(text_reader_scroll, LV_DIR_VER);
-    lv_obj_set_style_pad_all(text_reader_scroll, 16, 0);
-
-    text_reader_content_label = lv_label_create(text_reader_scroll);
-    lv_label_set_long_mode(text_reader_content_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(text_reader_content_label, lv_pct(100));
-    lv_obj_add_style(text_reader_content_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(text_reader_content_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_label_set_text(text_reader_content_label, "");
-
-    finalize_screen_navigation(scr);
-    /* Same reasoning as every other scrollable-content screen in this
-     * file: a drag inside the text itself should scroll the text, not
-     * bubble up as an app-wide swipe. */
-    lv_obj_remove_flag(text_reader_scroll, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    return scr;
-}
 
 /* Shared click handler for every plugin-registered Books list row below --
  * user_data is the row's index into plugin_manager's own plugin_books_
  * list_items[] (not an LVGL object), same index-not-object shape
  * plugin_stream_tile_click_cb() already uses for Stream Media tiles. */
-static void plugin_books_list_item_click_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int index = (int) (intptr_t) lv_event_get_user_data(e);
-    plugin_manager_books_list_item_clicked(index);
-}
+
 
 /* "Books" and "Favorites" are this screen's only native rows -- anything
  * else (an "Audio Books" row, or any other plugin-driven entry) comes from
@@ -19165,28 +18931,7 @@ static void plugin_books_list_item_click_cb(lv_event_t * e) {
  * (screen_builders.h's own comment), so there's no reason every plugin
  * that wants a Books row can't have its own -- if none are installed, this
  * screen now just shows its 2 native rows, no dead placeholder toast. */
-static lv_obj_t * build_books_screen(void) {
-    static pill_list_item_t items[2 + PLUGIN_MAX_BOOKS_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "Books", PILL_ACCESSORY_CHEVRON, false, books_files_row_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Favorites", PILL_ACCESSORY_CHEVRON, false, books_favorites_row_cb, NULL, NULL };
 
-    int count = 2;
-    int plugin_count = plugin_manager_get_books_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_BOOKS_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_books_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_books_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_books_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium"; /* see pill_row_resolve_text_size()'s own comment on why plugin rows always supply a non-NULL default */
-        items[count++] = item;
-    }
-
-    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent, 6);
-    finalize_screen_navigation(scr);
-    return scr;
-}
 
 /* ---- Firmware update confirmation popup -- same hand-built top-layer
  * overlay shape as eq_reset_popup/bt_dac_leave_popup (this codebase doesn't
@@ -20360,10 +20105,7 @@ static void wireless_tile_cb(lv_event_t * e) {
     nav_push(wireless_screen);
 }
 
-static void books_tile_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    nav_push(books_screen);
-}
+
 
 static void system_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -20422,12 +20164,17 @@ static void dac_home_tile_cb(lv_event_t * e) {
     nav_push(dac_home_screen);
 }
 
+static void gui_books_home_tile_cb(lv_event_t * e) {
+    (void) e;
+    gui_books_show();
+}
+
 static lv_obj_t * build_home_screen(void) {
     static icon_grid_item_t items[6];
     items[0] = (icon_grid_item_t){ "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb, NULL };
     items[1] = (icon_grid_item_t){ "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb, NULL };
     items[2] = (icon_grid_item_t){ "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb, NULL };
-    items[3] = (icon_grid_item_t){ "launcher/book.png", "launcher/book_s.png", "Books", books_tile_cb, NULL };
+    items[3] = (icon_grid_item_t){ "launcher/book.png", "launcher/book_s.png", "Books", gui_books_home_tile_cb, NULL };
     items[4] = (icon_grid_item_t){ "launcher/sys_set.png", "launcher/sys_set_s.png", "System", system_tile_cb, NULL };
     items[5] = (icon_grid_item_t){ "launcher/dac.png", "launcher/dac_s.png", "DAC", dac_home_tile_cb, NULL };
     /* No back_btn_cb -- this is the true root, nothing to go back to. No
@@ -21613,9 +21360,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     dlna_screen = build_dlna_screen();
     remote_control_screen = build_remote_control_screen();
     wireless_screen = build_wireless_screen();
-    books_screen = build_books_screen();
-    books_files_screen = build_books_files_screen();
-    text_reader_screen = build_text_reader_screen();
+    gui_books_init();
     about_screen = build_about_screen();
     accent_color_screen = build_accent_color_screen();
     screen_timeout_screen = build_screen_timeout_screen();
@@ -21667,7 +21412,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     register_static_snapshot(1, music_screen);
     register_static_snapshot(2, stream_media_screen);
     register_static_snapshot(3, wireless_screen);
-    register_static_snapshot(4, books_screen);
+    register_static_snapshot(4, gui_books_get_screen());
     register_static_snapshot(5, about_screen);
     register_static_snapshot(6, settings_screen);
     register_static_snapshot(7, settings_system_screen);

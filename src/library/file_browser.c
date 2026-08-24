@@ -583,7 +583,7 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
  * current) since a directory the user was sitting in on a since-removed SD
  * card may no longer exist at all. */
 void file_browser_reset_to_root(void) {
-    if (!list) return; /* files_screen not built yet -- nothing to refresh */
+    if (!list) return; /* gui_library_get_files_screen() not built yet -- nothing to refresh */
     snprintf(current_dir, sizeof(current_dir), "%s", root_dir);
     scan_current_dir();
     rebuild_list();
@@ -603,7 +603,7 @@ int file_browser_get_last_selected_row(void) {
  * isn't root_dir, shifting every entries[] row down by one on screen, so
  * that offset is added here to land on the right actual child. */
 void file_browser_navigate_to(const char * dir, int row_to_reveal) {
-    if (!list) return; /* files_screen not built yet */
+    if (!list) return; /* gui_library_get_files_screen() not built yet */
     snprintf(current_dir, sizeof(current_dir), "%s", dir);
     scan_current_dir();
     rebuild_list();

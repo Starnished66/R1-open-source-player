@@ -3,8 +3,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-extern lv_obj_t * home_screen;
-extern lv_obj_t * dac_home_screen;
+lv_obj_t * gui_shell_get_home_screen(void);
+lv_obj_t * gui_shell_get_dac_home_screen(void);
 extern lv_obj_t * status_bar_band;
 extern lv_obj_t * home_indicator_band;
 

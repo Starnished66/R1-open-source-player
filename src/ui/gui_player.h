@@ -5,20 +5,7 @@
 #include "metadata.h"
 #include "settings.h"
 
-extern lv_obj_t * player_screen;
-extern lv_obj_t * player_dismiss_btn;
-extern lv_obj_t * player_overlay_panel;
-extern lv_obj_t * cover_img;
-extern lv_obj_t * song_folder_label;
-extern lv_obj_t * song_title_label;
-extern lv_obj_t * favorite_icon;
-extern lv_obj_t * prev_btn;
-extern lv_obj_t * next_btn;
-extern lv_obj_t * progress_slider;
-extern lv_obj_t * progress_label;
-extern lv_obj_t * volume_slider;
 
-extern lv_obj_t * volume_popup;
 
 void gui_player_init(uint32_t screen_width, uint32_t screen_height);
 void sync_player_topbar_visibility(lv_obj_t * screen);
@@ -38,13 +25,23 @@ void cycle_play_mode(void);
 void resolve_replaygain(const track_metadata_t * meta, bool * out_has_gain, double * out_gain_db, bool * out_has_peak, double * out_peak);
 
 void favorite_icon_event_cb(lv_event_t * e);
-/* Playback state accessors and mutators */
-extern char ** playlist;
-extern int playlist_count;
-extern int playlist_index;
-extern int * playlist_lazy_sort_order;
-extern char now_playing_path[600];
-extern int queued_pending_count;
+/* Playback state semantic accessors and operations */
+int gui_player_get_playlist_count(void);
+int gui_player_get_playlist_index(void);
+bool gui_player_has_active_track(void);
+const char * gui_player_get_current_track_path(void);
+const char * gui_player_get_track_path_at(int index);
+int gui_player_get_queued_count(void);
+const char * gui_player_get_queued_path_at(int offset);
+void gui_player_queue_add(const char * path);
+void gui_player_queue_remove_at(int offset);
+void gui_player_queue_clear(void);
+void gui_player_play_at(int index);
+void gui_player_play_at_from(int index, double start_seconds);
+void gui_player_step_manual(int direction);
+lv_obj_t * gui_player_get_screen(void);
+lv_obj_t * gui_player_get_cover_img(void);
+bool gui_player_is_seeking(void);
 
 const char * playlist_path_at(int index);
 void free_playlist(void);
@@ -85,4 +82,16 @@ bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * o
 void install_saved_resume_playlist(char ** resume_playlist, int resume_count);
 void prepare_deferred_resume(int index, double start_seconds);
 
+
+int32_t gui_player_get_volume_percent(void);
+void gui_player_set_volume_percent(int32_t percent);
+const char * gui_player_get_now_playing_title(void);
+const char * gui_player_get_now_playing_folder(void);
+
+
+void gui_player_handle_auto_advance(void);
+void gui_player_handle_track_finished(void);
+
+void gui_player_sync_topbar_visibility(lv_obj_t * screen);
+lv_obj_t * gui_player_get_dismiss_btn(void);
 

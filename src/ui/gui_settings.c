@@ -32,26 +32,26 @@
 #include <pthread.h>
 
 /* Extern references to screen pointers owned by this module (defined here) */
-lv_obj_t * settings_screen;
-lv_obj_t * settings_playback_screen;
-lv_obj_t * settings_display_screen;
-lv_obj_t * settings_power_screen;
-lv_obj_t * settings_system_screen;
-lv_obj_t * about_screen;
-lv_obj_t * accent_color_screen;
+static lv_obj_t * settings_screen;
+static lv_obj_t * settings_playback_screen;
+static lv_obj_t * settings_display_screen;
+static lv_obj_t * settings_power_screen;
+static lv_obj_t * settings_system_screen;
+static lv_obj_t * about_screen;
+static lv_obj_t * accent_color_screen;
 static lv_obj_t * screen_timeout_screen;
 static lv_obj_t * startup_volume_screen;
 static lv_obj_t * sleep_timer_screen;
 static lv_obj_t * idle_shutdown_screen;
-lv_obj_t * eq_screen;
+static lv_obj_t * eq_screen;
 static lv_obj_t * eq_profiles_screen;
 
 /* Externs to gui.c functions and state this module needs */
-extern lv_obj_t * music_screen;
+extern lv_obj_t * gui_library_get_music_screen();
 extern lv_obj_t * stream_media_screen;
-extern lv_obj_t * wireless_screen;
-extern lv_obj_t * usb_dac_overlay_screen;
-extern lv_obj_t * dac_home_screen;
+extern lv_obj_t * gui_network_get_wireless_screen();
+extern lv_obj_t * gui_network_get_usb_dac_overlay();
+extern lv_obj_t * gui_shell_get_dac_home_screen();
 extern player_settings_t current_settings;
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
@@ -1136,7 +1136,7 @@ static void timezone_city_row_click_cb(int row_index) {
     nav_pop(); /* Region -> Settings -- picking a leaf city is a completed action, not a place to linger browsing further */
 }
 
-/* Rebuilt (delete + rebuild, same idiom as all_songs_screen after a library
+/* Rebuilt (delete + rebuild, same idiom as gui_library_get_all_songs_screen() after a library
  * rescan -- see poll_library_rescan()) every time a region is opened,
  * filtered down to just that region's entries, rather than built once --
  * needed both because the region changes on every open and so the
@@ -1470,7 +1470,7 @@ static lv_obj_t * build_settings_screen(void) {
 
 static void music_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    nav_push(music_screen);
+    nav_push(gui_library_get_music_screen());
 }
 
 static void stream_media_tile_cb(lv_event_t * e) {
@@ -1480,7 +1480,7 @@ static void stream_media_tile_cb(lv_event_t * e) {
 
 static void wireless_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    nav_push(wireless_screen);
+    nav_push(gui_network_get_wireless_screen());
 }
 
 
@@ -1509,7 +1509,7 @@ static void dac_home_usb_row_cb(lv_event_t * e) {
     bool have_detected = usb_mode_control_detect_current(&detected);
     if (have_detected && detected == USB_MODE_DAC) {
         current_settings.usb_mode = (int) USB_MODE_DAC;
-        nav_push(usb_dac_overlay_screen);
+        nav_push(gui_network_get_usb_dac_overlay());
         return;
     }
     /* Real-device incident: this shortcut used to call start_usb_mode_switch()
@@ -1539,7 +1539,7 @@ lv_obj_t * build_dac_home_screen(void) {
 
 static void dac_home_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    nav_push(dac_home_screen);
+    nav_push(gui_shell_get_dac_home_screen());
 }
 
 
@@ -2302,3 +2302,13 @@ void gui_settings_init(void) {
 /* Extern widget var in gui.c */
 
 
+
+
+lv_obj_t * gui_settings_get_screen(void) { return settings_screen; }
+lv_obj_t * gui_settings_get_playback_screen(void) { return settings_playback_screen; }
+lv_obj_t * gui_settings_get_display_screen(void) { return settings_display_screen; }
+lv_obj_t * gui_settings_get_power_screen(void) { return settings_power_screen; }
+lv_obj_t * gui_settings_get_system_screen(void) { return settings_system_screen; }
+lv_obj_t * gui_settings_get_about_screen(void) { return about_screen; }
+lv_obj_t * gui_settings_get_accent_screen(void) { return accent_color_screen; }
+lv_obj_t * gui_settings_get_eq_screen(void) { return eq_screen; }

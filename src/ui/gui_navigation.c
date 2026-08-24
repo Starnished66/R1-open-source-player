@@ -27,18 +27,18 @@ int nav_depth = 0;
 
 extern player_settings_t current_settings;
 
-extern lv_obj_t * home_screen;
+extern lv_obj_t * gui_shell_get_home_screen();
 
-extern lv_obj_t * music_screen;
+extern lv_obj_t * gui_library_get_music_screen();
 extern lv_obj_t * stream_media_screen;
-extern lv_obj_t * wireless_screen;
-extern lv_obj_t * dac_home_screen;
+extern lv_obj_t * gui_network_get_wireless_screen();
+extern lv_obj_t * gui_shell_get_dac_home_screen();
 extern lv_obj_t * status_bar_band;
 extern lv_obj_t * home_indicator_band;
-extern lv_obj_t * player_screen;
-extern lv_obj_t * about_screen;
-extern lv_obj_t * settings_screen;
-extern lv_obj_t * settings_system_screen;
+extern lv_obj_t * gui_player_get_screen();
+extern lv_obj_t * gui_settings_get_about_screen();
+extern lv_obj_t * gui_settings_get_screen();
+extern lv_obj_t * gui_settings_get_system_screen();
 
 extern void sync_player_topbar_visibility(lv_obj_t * screen);
 extern void open_quick_drawer(void);
@@ -135,7 +135,7 @@ static void blend_overlay_onto_base(lv_draw_buf_t * base, lv_obj_t * overlay_obj
 }
 
 /* Screen-only RGB565 base for target_screen -- player_dismiss_btn's hidden
- * flag (Player's own standalone back arrow, part of player_screen's own
+ * flag (Player's own standalone back arrow, part of gui_player_get_screen()'s own
  * subtree, not a separate layer) is temporarily forced to its TARGET-state
  * value (based on current_settings.hide_player_topbar, never on whichever
  * live screen happens to be active right now) before snapshotting, then
@@ -149,20 +149,21 @@ static void blend_overlay_onto_base(lv_draw_buf_t * base, lv_obj_t * overlay_obj
 static lv_draw_buf_t * snapshot_screen_base(lv_obj_t * target_screen) {
     if (!target_screen) return NULL;
 
-    bool dismiss_target_hidden = current_settings.hide_player_topbar && target_screen == player_screen;
-    bool dismiss_touched = (player_dismiss_btn != NULL && target_screen == player_screen);
+    lv_obj_t * dismiss_btn = gui_player_get_dismiss_btn();
+    bool dismiss_target_hidden = current_settings.hide_player_topbar && target_screen == gui_player_get_screen();
+    bool dismiss_touched = (dismiss_btn != NULL && target_screen == gui_player_get_screen());
     bool dismiss_was_hidden = false;
     if (dismiss_touched) {
-        dismiss_was_hidden = lv_obj_has_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
-        if (dismiss_target_hidden) lv_obj_add_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        dismiss_was_hidden = lv_obj_has_flag(dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        if (dismiss_target_hidden) lv_obj_add_flag(dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(dismiss_btn, LV_OBJ_FLAG_HIDDEN);
     }
 
     lv_draw_buf_t * base = lv_snapshot_take(target_screen, LV_COLOR_FORMAT_RGB565);
 
     if (dismiss_touched) {
-        if (dismiss_was_hidden) lv_obj_add_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        if (dismiss_was_hidden) lv_obj_add_flag(dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(dismiss_btn, LV_OBJ_FLAG_HIDDEN);
     }
     return base;
 }
@@ -195,7 +196,7 @@ static lv_draw_buf_t * snapshot_screen_base(lv_obj_t * target_screen) {
  * forcing. */
 static void blend_persistent_bars(lv_draw_buf_t * base, lv_obj_t * target_screen) {
     bool topbar_target_hidden = current_settings.hide_player_topbar &&
-                                 (target_screen == player_screen || target_screen == gui_lyrics_get_screen());
+                                 (target_screen == gui_player_get_screen() || target_screen == gui_lyrics_get_screen());
     if (status_bar_band) {
         bool status_was_hidden = lv_obj_has_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
         if (!topbar_target_hidden) {
@@ -259,7 +260,7 @@ void register_static_snapshot(int index, lv_obj_t * scr) {
 }
 
 /* Player-screen transition-frame cache -- TRANSITION_PERFORMANCE_PLAN.md
- * Phase 2. player_screen is dynamic (track metadata/art/play-state, so it
+ * Phase 2. gui_player_get_screen() is dynamic (track metadata/art/play-state, so it
  * can't just be baked in once like the STATIC_SNAPSHOT_SCREEN_COUNT screens
  * above), but it's also the single most common transition target (every
  * player-swipe and most Home/Now-Playing navigations) and the one whose
@@ -290,16 +291,16 @@ static lv_draw_buf_t * player_transition_cache_buf = NULL;
 bool player_transition_cache_dirty = true;
 
 static void player_transition_rebuild_cache(void) {
-    /* Nothing to gain while player_screen is already the live screen --
+    /* Nothing to gain while gui_player_get_screen() is already the live screen --
      * no transition can ever target the screen already on display, and
      * re-snapshotting it here would just be wasted work on every one of
      * its own dynamic updates (track change, progress tick via the other
      * dirty triggers, etc.) while the user is actually looking at it. */
-    if (!player_screen || lv_screen_active() == player_screen) return;
+    if (!gui_player_get_screen() || lv_screen_active() == gui_player_get_screen()) return;
 #ifdef UI_PERF_TRACE
     uint64_t perf_start_us = ui_perf_now_us();
 #endif
-    lv_draw_buf_t * fresh = snapshot_screen_base(player_screen);
+    lv_draw_buf_t * fresh = snapshot_screen_base(gui_player_get_screen());
     if (!fresh) return; /* OOM -- keep whatever's cached (stale beats nothing); still tried again on the next dirty notification */
     if (player_transition_cache_buf) lv_draw_buf_destroy(player_transition_cache_buf);
     player_transition_cache_buf = fresh;
@@ -319,13 +320,13 @@ void player_transition_cache_async_cb(void * unused) {
     if (player_transition_cache_dirty) player_transition_rebuild_cache();
 }
 
-/* Called from every site where something visible on player_screen's own
+/* Called from every site where something visible on gui_player_get_screen()'s own
  * subtree changes -- see this function's own doc comment on the cache
  * above for the current full list of call sites. Deliberately NOT called
  * from the routine per-second progress-bar update. */
 void player_transition_mark_dirty(void) {
     player_transition_cache_dirty = true;
-    if (player_screen) lv_async_call(player_transition_cache_async_cb, NULL);
+    if (gui_player_get_screen()) lv_async_call(player_transition_cache_async_cb, NULL);
 }
 
 /* slide_transition_ctx_t defined in gui.h */
@@ -505,7 +506,7 @@ slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward)
     bool used_player_cache = false;
 #endif
     lv_draw_buf_t * cached_base = get_static_snapshot(to_scr);
-    if (!cached_base && to_scr == player_screen && player_transition_cache_buf) {
+    if (!cached_base && to_scr == gui_player_get_screen() && player_transition_cache_buf) {
         cached_base = player_transition_cache_buf;
 #ifdef UI_PERF_TRACE
         used_player_cache = true;
@@ -743,9 +744,9 @@ void nav_remove_stack_slot(int index) {
  * via back-navigation. */
 void nav_reset_to_home(void) {
     nav_depth = 1;
-    nav_stack[0] = home_screen;
-    lv_screen_load(home_screen);
-    sync_player_topbar_visibility(home_screen);
+    nav_stack[0] = gui_shell_get_home_screen();
+    lv_screen_load(gui_shell_get_home_screen());
+    sync_player_topbar_visibility(gui_shell_get_home_screen());
 }
 
 /* Shared back-button handler for every screen built via the reusable
@@ -850,7 +851,7 @@ static void screen_gesture_event_cb(lv_event_t * e) {
         lv_indev_wait_release(indev);
     }
     /* Swipe-left-to-player used to be handled here too (instant
-     * nav_push(player_screen), no animation) -- real-device bug report:
+     * nav_push(gui_player_get_screen()), no animation) -- real-device bug report:
      * entering the player didn't follow the finger the way the quick
      * drawer's own drag does. Replaced with a live, finger-driven version
      * in poll_quick_drawer_drag() (see its own player_swipe_* state),
@@ -903,18 +904,18 @@ void finalize_screen_navigation(lv_obj_t * scr) {
 
 
 void gui_navigation_init(void) {
-    register_static_snapshot(0, home_screen);
-    register_static_snapshot(1, music_screen);
+    register_static_snapshot(0, gui_shell_get_home_screen());
+    register_static_snapshot(1, gui_library_get_music_screen());
     register_static_snapshot(2, stream_media_screen);
-    register_static_snapshot(3, wireless_screen);
+    register_static_snapshot(3, gui_network_get_wireless_screen());
     register_static_snapshot(4, gui_books_get_screen());
-    register_static_snapshot(5, about_screen);
-    register_static_snapshot(6, settings_screen);
-    register_static_snapshot(7, settings_system_screen);
-    register_static_snapshot(8, dac_home_screen);
+    register_static_snapshot(5, gui_settings_get_about_screen());
+    register_static_snapshot(6, gui_settings_get_screen());
+    register_static_snapshot(7, gui_settings_get_system_screen());
+    register_static_snapshot(8, gui_shell_get_dac_home_screen());
 
-    nav_stack[0] = home_screen;
+    nav_stack[0] = gui_shell_get_home_screen();
     nav_depth = 1;
-    lv_screen_load(home_screen);
+    lv_screen_load(gui_shell_get_home_screen());
 }
 

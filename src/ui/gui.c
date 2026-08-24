@@ -480,8 +480,7 @@ static lv_timer_t * play_pause_click_timer = NULL;
 static int play_pause_click_count = 0;
 
 static void physical_skip_prev_track(void) {
-    int prev_index = compute_manual_step_index(playlist_index, -1);
-    if (prev_index >= 0) play_track_at(prev_index);
+    gui_player_step_manual(-1);
 }
 
 static void play_pause_click_timeout_cb(lv_timer_t * timer) {
@@ -545,13 +544,11 @@ static void update_timer_cb(lv_timer_t * timer) {
      * the shuffle logic itself. */
     bool skipped_next = hw_buttons_consume_next();
     if (skipped_next) {
-        int next_index = compute_manual_step_index(playlist_index, 1);
-        if (next_index >= 0) play_track_at(next_index);
+        gui_player_step_manual(1);
     }
     bool skipped_prev = hw_buttons_consume_prev();
     if (skipped_prev) {
-        int prev_index = compute_manual_step_index(playlist_index, -1);
-        if (prev_index >= 0) play_track_at(prev_index);
+        gui_player_step_manual(-1);
     }
 
 #ifndef HOST_BUILD
@@ -567,12 +564,10 @@ static void update_timer_cb(lv_timer_t * timer) {
         toggle_play_pause();
     }
     if (bt_media_player_consume_next()) {
-        int next_index = compute_manual_step_index(playlist_index, 1);
-        if (next_index >= 0) play_track_at(next_index);
+        gui_player_step_manual(1);
     }
     if (bt_media_player_consume_prev()) {
-        int prev_index = compute_manual_step_index(playlist_index, -1);
-        if (prev_index >= 0) play_track_at(prev_index);
+        gui_player_step_manual(-1);
     }
     /* Keeps PlaybackStatus accurate for whenever BlueZ/the accessory next
      * queries it -- cheap (no subprocess, just a mutex-protected bool),
@@ -583,10 +578,10 @@ static void update_timer_cb(lv_timer_t * timer) {
 
     int volume_delta = hw_buttons_consume_volume_delta();
     if (volume_delta != 0) {
-        int32_t new_percent = lv_slider_get_value(volume_slider) + volume_delta;
+        int32_t new_percent = gui_player_get_volume_percent() + volume_delta;
         if (new_percent < 0) new_percent = 0;
         if (new_percent > 100) new_percent = 100;
-        lv_slider_set_value(volume_slider, new_percent, LV_ANIM_OFF);
+        gui_player_set_volume_percent(new_percent);
         audio_set_volume((float) new_percent / 100.0f);
         current_settings.volume = (float) new_percent / 100.0f;
         settings_save(&current_settings);
@@ -603,12 +598,10 @@ static void update_timer_cb(lv_timer_t * timer) {
         toggle_play_pause();
     }
     if (remote_control_consume_next()) {
-        int next_index = compute_manual_step_index(playlist_index, 1);
-        if (next_index >= 0) play_track_at(next_index);
+        gui_player_step_manual(1);
     }
     if (remote_control_consume_prev()) {
-        int prev_index = compute_manual_step_index(playlist_index, -1);
-        if (prev_index >= 0) play_track_at(prev_index);
+        gui_player_step_manual(-1);
     }
     if (remote_control_consume_mode_cycle()) {
         cycle_play_mode();
@@ -619,7 +612,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     }
     int remote_volume_percent;
     if (remote_control_consume_volume(&remote_volume_percent)) {
-        lv_slider_set_value(volume_slider, remote_volume_percent, LV_ANIM_OFF);
+        gui_player_set_volume_percent(remote_volume_percent);
         audio_set_volume((float) remote_volume_percent / 100.0f);
         current_settings.volume = (float) remote_volume_percent / 100.0f;
         settings_save(&current_settings);
@@ -896,7 +889,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * own indev-driven inactivity clock (screen_inactive_ms above) --
      * exempt this screen from both dimming and the full auto-timeout
      * entirely, the same lv_screen_active()-gated exclusion shape already
-     * used for bt_dac_overlay_screen/usb_dac_overlay_screen elsewhere in
+     * used for gui_network_get_bt_dac_overlay()/gui_network_get_usb_dac_overlay() elsewhere in
      * this file (e.g. poll_quick_drawer_drag()'s own gesture exclusions),
      * rather than trying to synthesize fake touch activity to fool the
      * shared clock. Paused, though, is no different from sitting on any
@@ -1125,12 +1118,11 @@ static void update_timer_cb(lv_timer_t * timer) {
          * Album isn't tracked anywhere after the initial metadata_read()
          * call, so it's left blank here -- a real gap, not an oversight,
          * see remote_control.h's own Phase 1 scope note. */
-        const char * now_playing_path =
-            (playlist_count > 0 && playlist_index >= 0 && playlist_index < playlist_count)
-                ? playlist_path_at(playlist_index)
+        const char * now_playing_path = gui_player_has_active_track()
+                ? gui_player_get_current_track_path()
                 : NULL;
-        remote_control_notify_status(audio_is_playing(), audio_is_paused(), lv_label_get_text(song_title_label),
-                                      lv_label_get_text(song_folder_label), "", now_playing_path,
+        remote_control_notify_status(audio_is_playing(), audio_is_paused(), gui_player_get_now_playing_title(),
+                                      gui_player_get_now_playing_folder(), "", now_playing_path,
                                       (int) audio_get_position_seconds(), (int) audio_get_duration_seconds(),
                                       audio_get_volume(), current_settings.play_mode);
     }
@@ -1167,33 +1159,11 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_search_job();
 
     if (audio_consume_track_advanced()) {
-        /* The playback thread already moved on to the queued next track by
-         * itself (gapless handoff or a completed crossfade) -- just sync
-         * the GUI's own index/labels to match, don't restart audio. The
-         * target must match exactly what arm_next_track_for_audio() armed
-         * for this same `playlist_index`, so commit_auto_advance() (which
-         * only actually mutates shuffle state) is called right after. */
-        int advanced_index = compute_auto_advance_index(playlist_index);
-        if (advanced_index >= 0) {
-            commit_auto_advance();
-            on_track_auto_advanced(advanced_index);
-        }
+        gui_player_handle_auto_advance();
     }
 
     if (audio_consume_track_finished()) {
-        /* A true end-of-playlist, OR the queued next track failed to open
-         * (e.g. a corrupt file) -- fall back to the old hard-restart-based
-         * skip so a single bad file in a playlist doesn't stall it. Only
-         * Sequential mode can actually reach "nothing next" here (every
-         * other mode always has somewhere to go -- see
-         * compute_auto_advance_index()). */
-        int finished_index = compute_auto_advance_index(playlist_index);
-        if (finished_index >= 0) {
-            commit_auto_advance();
-            play_track_at(finished_index);
-        } else {
-            set_play_button_state(false);
-        }
+        gui_player_handle_track_finished();
     }
 
     /* All correctness-critical work above (buttons, queue transitions and
@@ -1203,7 +1173,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * eliminating invisible slider/label rendering and asset I/O. */
     if (!backlight_screen_is_on()) return;
 
-    if (playlist_index < 0 || user_seeking) return;
+    if (!gui_player_has_active_track() || gui_player_is_seeking()) return;
 
     gui_player_update_progress();
 
@@ -1269,7 +1239,7 @@ static uint32_t boot_splash_start_tick = 0;
  * other overlay this app builds the same way -- popups, quick drawer,
  * volume popup) parents itself onto lv_layer_top(), LVGL's global overlay
  * layer that renders above whichever screen is active *regardless* of
- * lv_screen_load() -- it's not scoped to home_screen at all. Since
+ * lv_screen_load() -- it's not scoped to gui_shell_get_home_screen() at all. Since
  * gui_init() builds the status bar (and starts populating its icons) while
  * this splash is still the loaded screen, it was appearing on top of the
  * splash within about a second of boot, well before gui_init()'s own
@@ -1326,8 +1296,7 @@ const char * gui_plugin_get_play_mode(void) {
 }
 
 const char * gui_plugin_get_current_track_path(void) {
-    if (playlist_index < 0 || playlist_index >= playlist_count) return NULL;
-    return playlist_path_at(playlist_index);
+    return gui_player_has_active_track() ? gui_player_get_current_track_path() : NULL;
 }
 
 char ** gui_plugin_get_artist_albums(const char * artist, int * out_count) {
@@ -1637,7 +1606,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * ever run again. */
 
 
-    fallback_font_init_early(current_settings.font_size_tier, current_settings.lyrics_font_size_tier); /* must run before any style/screen captures &app_font_16/&app_font_22/&app_font_lyrics -- see fallback_font.h */
 
     /* Discovers plugin rows/tiles by loading and running every .lua file
      * under <SD card>/.plugins/ -- run early, well before Books, Settings,
@@ -1786,7 +1754,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     lv_obj_remove_flag(lv_layer_top(), LV_OBJ_FLAG_HIDDEN);
 #endif
 
-    /* home_screen is the permanent root of the nav stack -- nav_pop() never
+    /* gui_shell_get_home_screen() is the permanent root of the nav stack -- nav_pop() never
      * goes past it. Load it first so there's always something valid on
      * screen even before any auto-resume logic below runs. */
 
@@ -1812,11 +1780,10 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * gui_init() runs). */
     gui_reset_interactive_timeout_baseline();
     lv_timer_create(update_timer_cb, 500, NULL);
-    az_index_drag_timer = lv_timer_create(poll_az_index_drag, LV_DEF_REFR_PERIOD, NULL);
     lv_indev_t * gesture_indev = find_pointer_indev();
     if (gesture_indev) lv_indev_add_event_cb(gesture_indev, resume_fast_gesture_timers_cb, LV_EVENT_PRESSED, NULL);
 #ifndef HOST_BUILD
-    boot_checkpoint("lv_screen_load(home_screen) done");
+    boot_checkpoint("lv_screen_load(gui_shell_get_home_screen()) done");
 #endif
 
     /* Real-device incident (2026-08-08): auto-resuming into a Subsonic
@@ -1891,7 +1858,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
             int resume_count, resume_index;
             if (build_saved_resume_playlist(&resume_playlist, &resume_count, &resume_index)) {
                 install_saved_resume_playlist(resume_playlist, resume_count);
-                /* play_track_at_from() itself nav_push()es player_screen on top
+                /* play_track_at_from() itself nav_push()es gui_player_get_screen() on top
                  * of the seeded root, so a back-swipe from the resumed player
                  * correctly lands back on the home screen. */
                 play_track_at_from(resume_index, current_settings.last_position);
@@ -1930,4 +1897,14 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * pre-first-frame call site that hung boot on the previous attempt at
      * this). */
     fallback_font_schedule_deferred_load();
+}
+
+
+void gui_deinit(void) {
+    gui_library_cancel_background_work();
+    gui_subsonic_cancel_background_work();
+    gui_network_cancel_background_work();
+    gui_lyrics_cancel_background_work();
+    gui_player_cancel_background_work();
+    gui_shell_cancel_background_work();
 }

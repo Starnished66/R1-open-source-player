@@ -5,6 +5,16 @@
 #include "backlight.h"
 #include "led_control.h"
 #include "charge_limiter.h"
+
+/* ---- Playback state and advance machinery ---- */
+static char ** playlist = NULL;
+static int playlist_count = 0;
+static int playlist_index = -1;
+static int * playlist_lazy_sort_order = NULL;
+static bool playlist_lazy_order_is_recency = false;
+static int queued_pending_count = 0;
+static int queue_next_insert_index = -1;
+
 #include "gui_player.h"
 #include "gui.h"
 #include "gui_theme.h"
@@ -37,7 +47,7 @@
 #define VOLUME_POPUP_TIMEOUT_MS 3000
 #define HOME_INDICATOR_BAND_HEIGHT 24
 
-lv_obj_t * player_screen = NULL;
+static lv_obj_t * player_screen = NULL;
 lv_obj_t * player_dismiss_btn = NULL;
 lv_obj_t * player_overlay_panel = NULL;
 lv_obj_t * cover_img = NULL;
@@ -92,10 +102,9 @@ extern lv_obj_t * quick_drawer_play_btn;
 extern lv_obj_t * volume_topbar_btn;
 extern lv_obj_t * volume_topbar_label;
 extern lv_obj_t * status_bar;
-extern lv_obj_t * eq_screen;
+extern lv_obj_t * gui_settings_get_eq_screen();
 extern player_settings_t current_settings;
 extern bool favorite_is_set;
-extern int * playlist_lazy_sort_order;
 
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
@@ -1085,7 +1094,7 @@ static void more_menu_popup_backdrop_cb(lv_event_t * e) {
 }
 
 /* Defined further down, right after populate_group_songs_rows() -- needs
- * group_songs_screen/list/indices/count/title_label and
+ * gui_library_get_group_songs_screen()/list/indices/count/title_label and
  * compact_list_scroll_to_index()/file_browser_navigate_to() all already
  * in scope, none of which are declared yet this early in the file.
  * Forward-declared here so build_more_menu_popup()'s rows table (right
@@ -1107,7 +1116,7 @@ static void more_menu_queue_cb(lv_event_t * e) {
 static void more_menu_eq_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_more_menu_popup();
-    nav_push(eq_screen);
+    nav_push(gui_settings_get_eq_screen());
 }
 
 static void more_menu_delete_cb(lv_event_t * e) {
@@ -1436,6 +1445,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_flag(prev_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(prev_btn, prev_btn_event_cb, LV_EVENT_CLICKED, NULL);
     transport_btn_ctx_t * prev_ctx = malloc(sizeof(transport_btn_ctx_t));
+    if (!prev_ctx) return NULL;
     *prev_ctx = (transport_btn_ctx_t){ prev_btn, "playing_plane/btn_prev.png", "playing_plane/btn_prev_s.png" };
     lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, prev_ctx);
     lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, prev_ctx);
@@ -1458,6 +1468,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_flag(next_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(next_btn, next_btn_event_cb, LV_EVENT_CLICKED, NULL);
     transport_btn_ctx_t * next_ctx = malloc(sizeof(transport_btn_ctx_t));
+    if (!next_ctx) return NULL;
     *next_ctx = (transport_btn_ctx_t){ next_btn, "playing_plane/btn_next.png", "playing_plane/btn_next_s.png" };
     lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, next_ctx);
     lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, next_ctx);
@@ -1540,48 +1551,7 @@ void refresh_format_badge(void) {
 
 
 
-/* ---- Playback state and advance machinery ---- */
-char ** playlist = NULL;
-int playlist_count = 0;
-int playlist_index = -1;
 
-/* Non-NULL only while playing from the whole, unfiltered All Songs list OR
- * the whole Recently Added list -- see on_file_selected_lazy_all_songs()'s/
- * on_file_selected_lazy_recently_added()'s own comments for why. playlist[i]
- * == NULL means "not resolved yet"; playlist_path_at() (forward-declared
- * below) resolves playlist_lazy_sort_order[i] to a real path via a single-
- * row DB query (the DB's own title-sorted order by default, or first_seen-
- * DESC order when playlist_lazy_order_is_recency is set, offset by that
- * value), strdup()s it into playlist[i], and from then on that slot is a
- * completely ordinary owned entry. Kept the same length as
- * playlist[] itself by queue_add_song()/queue_remove_song_at_offset()/
- * delete_song_confirm_cb() -- the only three places that resize or shift
- * playlist[] after creation -- so every still-unresolved slot keeps
- * pointing at the right song after a splice. Real-device cost this exists
- * to avoid: tapping any song in a 32K-song library used to strdup() all
- * 32,000 paths just to play one of them, the same O(library)-per-action
- * failure class as this whole session's boot-scale incidents. */
-int * playlist_lazy_sort_order = NULL;
-/* Which DB order playlist_lazy_sort_order[]'s identity mapping refers to --
- * see playlist_path_at()'s own comment. Only meaningful while playlist_
- * lazy_sort_order is non-NULL. */
-static bool playlist_lazy_order_is_recency = false;
-
-/* "Up Next" queue (long-press a song -> Add to Queue): how many playlist[]
- * slots starting right at playlist_index+1 are still-unplayed queue
- * insertions, and where the NEXT "Add to Queue" tap should splice one in.
- * Implemented as a splice into the live playlist[] array (queue_add_song(),
- * defined with the rest of the playback-advance machinery below) rather
- * than a separate out-of-band list, since apply_track_metadata_to_ui()/
- * arm_next_track_for_audio()/the "Track X of Y" label are all already
- * deeply coupled to playlist[]/playlist_index -- reusing that machinery
- * needs zero changes to any of it. compute_auto_advance_index()/compute_
- * manual_step_index() both check queued_pending_count first, ahead of
- * play_mode, so a queued song plays next regardless of shuffle/repeat --
- * plain array adjacency alone wouldn't guarantee that under Shuffle, which
- * jumps around the array via shuffle_order rather than stepping by 1. */
-int queued_pending_count = 0;
-static int queue_next_insert_index = -1; /* -1 = nothing pending, next add goes right after playlist_index */
 
 /* Path of whichever song is currently playing, or an empty string if
  * nothing is (or the current track isn't part of the local library, e.g.
@@ -1615,7 +1585,7 @@ int player_source_recently_added_index = -1; /* row index into recently_added_li
 
 /* Own copy of the group's song entries at the moment playback started --
  * group_songs_entries/count/title_label themselves just describe
- * whichever group group_songs_screen CURRENTLY shows, which can change
+ * whichever group gui_library_get_group_songs_screen() CURRENTLY shows, which can change
  * (browsing to a different artist/album, or a library rescan) before the
  * user ever opens "List". group_song_entry_t (gui.c further down) is
  * declared after this point in the file -- forward-declared here since
@@ -1683,7 +1653,7 @@ static int * pending_shuffle_order = NULL;
 /* Generic back-stack, replacing the old pairwise hardcoded back targets
  * (settings always -> browser, eq always -> settings). Every screen's back
  * button and the left-to-right swipe gesture just call nav_pop(); forward
- * navigation calls nav_push(). Root (home_screen) is seeded once in
+ * navigation calls nav_push(). Root (gui_shell_get_home_screen()) is seeded once in
  * gui_init() and is never popped past. */
 #define NAV_STACK_MAX 16
 
@@ -2550,7 +2520,10 @@ bool gui_player_has_background_work(void) {
 }
 
 void gui_player_cancel_background_work(void) {
-    /* Joinable cover worker completes and is joined on next tick */
+    if (cover_decode_active) {
+        pthread_join(cover_decode_thread, NULL);
+        cover_decode_active = false;
+    }
 }
 
 const char * playlist_path_at(int index) {
@@ -2687,4 +2660,128 @@ void prepare_deferred_resume(int index, double start_seconds) {
     deferred_resume_pending = true;
     deferred_resume_position = start_seconds;
     nav_push(player_screen);
+}
+
+
+int gui_player_get_playlist_count(void) {
+    return playlist_count;
+}
+
+int gui_player_get_playlist_index(void) {
+    return playlist_index;
+}
+
+bool gui_player_has_active_track(void) {
+    return playlist_index >= 0 && playlist_index < playlist_count;
+}
+
+const char * gui_player_get_current_track_path(void) {
+    if (playlist_index < 0 || playlist_index >= playlist_count) return "";
+    return playlist_path_at(playlist_index);
+}
+
+const char * gui_player_get_track_path_at(int index) {
+    return playlist_path_at(index);
+}
+
+int gui_player_get_queued_count(void) {
+    return queued_pending_count;
+}
+
+const char * gui_player_get_queued_path_at(int offset) {
+    if (offset < 0 || offset >= queued_pending_count || playlist_index < 0) return "";
+    int pos = playlist_index + 1 + offset;
+    if (pos >= playlist_count) return "";
+    return playlist_path_at(pos);
+}
+
+void gui_player_queue_add(const char * path) {
+    queue_add_song(path);
+}
+
+void gui_player_queue_remove_at(int offset) {
+    queue_remove_song_at_offset(offset);
+}
+
+void gui_player_queue_clear(void) {
+    queue_clear_pending();
+}
+
+void gui_player_play_at(int index) {
+    play_track_at(index);
+}
+
+void gui_player_play_at_from(int index, double start_seconds) {
+    play_track_at_from(index, start_seconds);
+}
+
+void gui_player_step_manual(int direction) {
+    if (playlist_index < 0) return;
+    int next_idx = compute_manual_step_index(playlist_index, direction);
+    if (next_idx >= 0) play_track_at(next_idx);
+}
+
+lv_obj_t * gui_player_get_screen(void) {
+    return player_screen;
+}
+
+lv_obj_t * gui_player_get_cover_img(void) {
+    return cover_img;
+}
+
+bool gui_player_is_seeking(void) {
+    return user_seeking;
+}
+
+
+int32_t gui_player_get_volume_percent(void) {
+    return volume_slider ? lv_slider_get_value(volume_slider) : (int32_t)(audio_get_volume() * 100.0f);
+}
+
+void gui_player_set_volume_percent(int32_t percent) {
+    if (volume_slider) lv_slider_set_value(volume_slider, percent, LV_ANIM_OFF);
+}
+
+const char * gui_player_get_now_playing_title(void) {
+    return song_title_label ? lv_label_get_text(song_title_label) : "";
+}
+
+const char * gui_player_get_now_playing_folder(void) {
+    return song_folder_label ? lv_label_get_text(song_folder_label) : "";
+}
+
+
+void gui_player_handle_auto_advance(void) {
+    if (playlist_index < 0) return;
+    int advanced_index = compute_auto_advance_index(playlist_index);
+    if (advanced_index >= 0) {
+        commit_auto_advance();
+        on_track_auto_advanced(advanced_index);
+    }
+}
+
+void gui_player_handle_track_finished(void) {
+    if (playlist_index < 0) return;
+    int finished_index = compute_auto_advance_index(playlist_index);
+    if (finished_index >= 0) {
+        commit_auto_advance();
+        play_track_at(finished_index);
+    } else {
+        set_play_button_state(false);
+    }
+}
+
+
+void gui_player_sync_topbar_visibility(lv_obj_t * screen) {
+    if (player_dismiss_btn) {
+        if (current_settings.hide_player_topbar && screen == player_screen)
+            lv_obj_add_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+
+lv_obj_t * gui_player_get_dismiss_btn(void) {
+    return player_dismiss_btn;
 }

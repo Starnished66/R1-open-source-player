@@ -21,6 +21,7 @@
 
 /* Initialize the user interface elements and callbacks */
 void gui_init(uint32_t screen_width, uint32_t screen_height);
+void gui_deinit(void);
 
 /* Shows a minimal boot-settle splash screen -- call once, as early as
  * possible after display setup, before gui_init(). See gui.c's own
@@ -352,10 +353,6 @@ void library_scan_once(void);
 void library_load_from_cache_only(void);
 
 
-extern int playlist_index;
-extern int playlist_count;
-extern char ** playlist;
-extern int queued_pending_count;
 
 void queue_add_song(const char * path);
 void play_track_at(int target);
@@ -437,7 +434,6 @@ extern bool bt_is_powered_cached;
 extern char bt_connected_mac_cached[18];
 extern char bt_connected_codec_cached[32];
 extern gui_busy_handle_t import_web_stop_token;
-extern int playlist_index;
 void quick_drawer_wifi_event_cb(lv_event_t * e);
 void quick_drawer_bt_event_cb(lv_event_t * e);
 

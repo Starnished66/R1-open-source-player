@@ -1,15 +1,15 @@
 #pragma once
 #include <lvgl/lvgl.h>
 
-/* Screens owned by gui_settings */
-extern lv_obj_t * settings_screen;
-extern lv_obj_t * settings_playback_screen;
-extern lv_obj_t * settings_display_screen;
-extern lv_obj_t * settings_power_screen;
-extern lv_obj_t * settings_system_screen;
-extern lv_obj_t * about_screen;
-extern lv_obj_t * accent_color_screen;
-extern lv_obj_t * eq_screen;
+/* Screen accessors */
+lv_obj_t * gui_settings_get_screen(void);
+lv_obj_t * gui_settings_get_playback_screen(void);
+lv_obj_t * gui_settings_get_display_screen(void);
+lv_obj_t * gui_settings_get_power_screen(void);
+lv_obj_t * gui_settings_get_system_screen(void);
+lv_obj_t * gui_settings_get_about_screen(void);
+lv_obj_t * gui_settings_get_accent_screen(void);
+lv_obj_t * gui_settings_get_eq_screen(void);
 
 void gui_settings_init(void);
 void show_font_size_reboot_popup(void);

@@ -288,15 +288,15 @@ static void * subsonic_library_download_thread_func(void * arg) {
         sanitize_path_component(song->album[0] ? song->album : "Unknown Album", safe_album, sizeof(safe_album));
         sanitize_path_component(song->title[0] ? song->title : "Unknown Title", safe_title, sizeof(safe_title));
 
-        char artist_dir[400], album_dir[400], dest_path[600];
-        snprintf(artist_dir, sizeof(artist_dir), "%s/%s", MUSIC_ROOT_DIR, safe_artist);
+        char artist_dir[1024], album_dir[1024], dest_path[1024];
+        snprintf(artist_dir, sizeof(artist_dir), "%s/%.150s", MUSIC_ROOT_DIR, safe_artist);
         mkdir(artist_dir, 0755); /* no-op (EEXIST) if it's already there, same as every other mkdir() in this file */
-        snprintf(album_dir, sizeof(album_dir), "%s/%s", artist_dir, safe_album);
+        snprintf(album_dir, sizeof(album_dir), "%.500s/%.150s", artist_dir, safe_album);
         mkdir(album_dir, 0755);
         if (song->track > 0) {
-            snprintf(dest_path, sizeof(dest_path), "%s/%02d - %s.%s", album_dir, song->track, safe_title, song->suffix);
+            snprintf(dest_path, sizeof(dest_path), "%.650s/%02d - %.150s.%.32s", album_dir, (int)song->track, safe_title, song->suffix);
         } else {
-            snprintf(dest_path, sizeof(dest_path), "%s/%s.%s", album_dir, safe_title, song->suffix);
+            snprintf(dest_path, sizeof(dest_path), "%.650s/%.150s.%.32s", album_dir, safe_title, song->suffix);
         }
 
         char url[1536];
@@ -438,7 +438,7 @@ lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** ou
      * generous default width (narrowed later, per-screen, by
      * reserve_title_width_before() once that screen's own right-side
      * button actually exists) and auto-scroll for whatever still overflows
-     * -- same fix as group_songs_screen's own title (build_group_songs_screen()). */
+     * -- same fix as gui_library_get_group_songs_screen()'s own title (build_group_songs_screen()). */
     int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
     lv_obj_set_width(title_label, scr_w - TITLE_LABEL_LEFT_INSET - TITLE_LABEL_DEFAULT_RIGHT_MARGIN);
     /* Real-device bug report: same missing-2s-pause bug/fix as group_songs_
@@ -1265,5 +1265,23 @@ bool gui_subsonic_has_background_work(void) {
 }
 
 void gui_subsonic_cancel_background_work(void) {
-    /* Joinable workers complete and are joined on next tick/poll */
+    if (subsonic_connect_active) {
+        pthread_join(subsonic_connect_thread, NULL);
+        subsonic_connect_active = false;
+        gui_busy_hide(subsonic_connect_token);
+    }
+    if (download_active) {
+        pthread_join(download_thread, NULL);
+        download_active = false;
+        gui_busy_hide(download_token);
+    }
+    if (subsonic_library_download_active) {
+        pthread_join(subsonic_library_download_thread, NULL);
+        subsonic_library_download_active = false;
+        gui_busy_hide(subsonic_library_download_token);
+    }
+    if (subsonic_browse_active) {
+        pthread_join(subsonic_browse_thread, NULL);
+        subsonic_browse_active = false;
+    }
 }

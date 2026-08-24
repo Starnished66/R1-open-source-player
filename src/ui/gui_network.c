@@ -26,20 +26,20 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include <sys/stat.h>
 
 /* Screens owned by this module */
-lv_obj_t * wifi_screen;
+static lv_obj_t * wifi_screen;
 static lv_obj_t * wifi_info_screen;
 static lv_obj_t * wifi_dns_screen;
-lv_obj_t * bt_screen;
+static lv_obj_t * bt_screen;
 static lv_obj_t * bt_dac_screen;
-lv_obj_t * bt_dac_overlay_screen;
+static lv_obj_t * bt_dac_overlay_screen;
 static lv_obj_t * bt_codec_screen;
 static lv_obj_t * usb_mode_screen;
-lv_obj_t * usb_dac_overlay_screen;
+static lv_obj_t * usb_dac_overlay_screen;
 static lv_obj_t * import_wifi_screen;
 static lv_obj_t * airplay_screen;
 static lv_obj_t * dlna_screen;
 static lv_obj_t * remote_control_screen;
-lv_obj_t * wireless_screen;
+static lv_obj_t * wireless_screen;
 static lv_obj_t * resume_mode_screen;
 static lv_obj_t * resume_mode_list;
 static lv_obj_t * play_pause_button_mode_screen;
@@ -660,8 +660,8 @@ void populate_wifi_screen(bool enabled) {
         lv_obj_align(icon, LV_ALIGN_LEFT_MID, 20, 0);
 
         lv_obj_t * label = lv_label_create(row);
-        char text[96];
-        snprintf(text, sizeof(text), "%s%s%s", net->ssid, net->secured ? "  (secured)" : "",
+        char text[256];
+        snprintf(text, sizeof(text), "%.128s%s%s", net->ssid, net->secured ? "  (secured)" : "",
                  net->is_current ? "  - Connected" : "");
         lv_label_set_text(label, text);
         lv_obj_add_style(label, &style_theme_text_primary, 0);
@@ -1555,7 +1555,7 @@ static void replaygain_mode_option_row_cb(lv_event_t * e) {
     current_settings.replaygain_mode = replaygain_mode_options[index].mode;
     settings_save(&current_settings);
     populate_replaygain_mode_screen();
-    if (playlist_index >= 0) arm_next_track_for_audio(playlist_index);
+    if (gui_player_has_active_track()) arm_next_track_for_audio(gui_player_get_playlist_index());
 }
 
 static lv_obj_t * build_replaygain_mode_screen(void) {
@@ -2767,5 +2767,54 @@ bool gui_network_has_background_work(void) {
 }
 
 void gui_network_cancel_background_work(void) {
-    /* Joinable network workers complete and are joined on next tick */
+    if (wifi_connect_active) {
+        pthread_join(wifi_connect_thread, NULL);
+        wifi_connect_active = false;
+        gui_busy_hide(wifi_connect_token);
+    }
+    if (wifi_connect_saved_active) {
+        pthread_join(wifi_connect_saved_thread, NULL);
+        wifi_connect_saved_active = false;
+        gui_busy_hide(wifi_connect_saved_token);
+    }
+    if (wifi_disconnect_active) {
+        pthread_join(wifi_disconnect_thread, NULL);
+        wifi_disconnect_active = false;
+    }
+    if (wifi_scan_active) {
+        pthread_join(wifi_scan_thread, NULL);
+        wifi_scan_active = false;
+    }
+    if (wifi_forget_active) {
+        pthread_join(wifi_forget_thread, NULL);
+        wifi_forget_active = false;
+    }
+    if (bt_connect_active) {
+        pthread_join(bt_connect_thread, NULL);
+        bt_connect_active = false;
+    }
+    if (bt_forget_active) {
+        pthread_join(bt_forget_thread, NULL);
+        bt_forget_active = false;
+    }
+    if (bt_scan_active) {
+        pthread_join(bt_scan_thread, NULL);
+        bt_scan_active = false;
+    }
+    if (usb_mode_switch_active) {
+        pthread_join(usb_mode_switch_thread, NULL);
+        usb_mode_switch_active = false;
+    }
+    if (import_web_stop_active) {
+        pthread_join(import_web_stop_thread, NULL);
+        import_web_stop_active = false;
+        gui_busy_hide(import_web_stop_token);
+    }
 }
+
+
+lv_obj_t * gui_network_get_wifi_screen(void) { return wifi_screen; }
+lv_obj_t * gui_network_get_bt_screen(void) { return bt_screen; }
+lv_obj_t * gui_network_get_wireless_screen(void) { return wireless_screen; }
+lv_obj_t * gui_network_get_bt_dac_overlay(void) { return bt_dac_overlay_screen; }
+lv_obj_t * gui_network_get_usb_dac_overlay(void) { return usb_dac_overlay_screen; }

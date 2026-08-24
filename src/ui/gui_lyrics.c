@@ -65,14 +65,14 @@ static lv_obj_t * lyrics_screen;
 /* ---- Fullscreen lyrics view state -- see build_lyrics_screen() and the
  * async .lrc load / backdrop generation just above poll_cover_decode()'s
  * own section. All declared here (rather than local to whichever function
- * first uses them) for the same reason cover_img/current_cover_bytes above
+ * first uses them) for the same reason gui_player_get_cover_img()/current_cover_bytes above
  * are: the async load/poll functions and the screen builder that actually
  * creates the LVGL objects live in different parts of this file, and every
  * static in this file is visible to all of them regardless of definition
  * order. ---- */
 static lyrics_doc_t current_lyrics_doc;
 static bool current_lyrics_doc_valid = false;
-static int current_lyrics_doc_for_index = -1; /* playlist_index current_lyrics_doc was loaded for */
+static int current_lyrics_doc_for_index = -1; /* gui_player_get_playlist_index() current_lyrics_doc was loaded for */
 static int current_lyrics_doc_generation = -1;
 static int lyrics_load_generation = 0;
 /* Real-device request: embedded lyrics tags (ID3 USLT, FLAC/Opus LYRICS/
@@ -91,7 +91,6 @@ extern void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stri
 extern int nav_depth;
 extern lv_obj_t * nav_stack[16];
 
-extern int playlist_index;
 
 extern int current_cover_for_index;
 
@@ -176,7 +175,7 @@ static bool lyrics_load_result_plain_mode;
 static char * lyrics_load_result_plain_text; /* malloc'd, only meaningful when lyrics_load_result_plain_mode */
 /* Bumped on every launch_lyrics_load() call (both a real track change and
  * the internal pending-relaunch below) -- the identity a finished result is
- * checked against in poll_lyrics_load(), not playlist_index. playlist_index
+ * checked against in poll_lyrics_load(), not gui_player_get_playlist_index(). gui_player_get_playlist_index()
  * is a numeric SLOT, not a track identity: if the whole playlist is
  * replaced (a different album/Subsonic queue/etc. loaded) while a load is
  * still in flight, the new playlist's own track at that same slot number
@@ -257,7 +256,7 @@ static void launch_lyrics_load(int for_index, const char * track_path) {
  * regardless of whether the lyrics screen is actually open, so a load
  * finishes well before the user ever taps the album art. Deliberately does
  * not touch any lyrics-screen LVGL object directly (unlike poll_cover_
- * decode(), which owns cover_img/player_overlay_panel outright) -- open_
+ * decode(), which owns gui_player_get_cover_img()/player_overlay_panel outright) -- open_
  * lyrics_screen() and lyrics_timer_cb() below independently notice when
  * current_lyrics_doc_for_index no longer matches what the pool was last
  * built from and resync from scratch at that point, so there is exactly
@@ -279,7 +278,7 @@ static void poll_lyrics_load(void) {
         current_lyrics_plain_text = lyrics_load_result_plain_text;
 
         if ((current_lyrics_doc_valid || current_lyrics_plain_mode) &&
-            current_cover_bytes && current_cover_for_index == playlist_index)
+            current_cover_bytes && current_cover_for_index == gui_player_get_playlist_index())
             launch_lyrics_backdrop_decode();
     } else {
         if (lyrics_load_result_ok) lyrics_doc_free(&lyrics_load_result_doc); /* stale -- superseded by a later launch before this landed */
@@ -403,14 +402,14 @@ static bool lyrics_backdrop_regenerate_pending = false;
  * plain dark background for that one instance rather than blocking the
  * tap. */
 static void launch_lyrics_backdrop_decode(void) {
-    if (!current_cover_bytes || current_cover_for_index != playlist_index ||
+    if (!current_cover_bytes || current_cover_for_index != gui_player_get_playlist_index() ||
         current_lyrics_doc_generation != lyrics_load_generation ||
-        current_lyrics_doc_for_index != playlist_index ||
+        current_lyrics_doc_for_index != gui_player_get_playlist_index() ||
         (!current_lyrics_doc_valid && !current_lyrics_plain_mode)) return;
-    if (current_lyrics_backdrop_for_index == playlist_index &&
+    if (current_lyrics_backdrop_for_index == gui_player_get_playlist_index() &&
         current_lyrics_backdrop_generation == lyrics_load_generation) return;
     if (lyrics_backdrop_active) {
-        if (lyrics_backdrop_active_for_index == playlist_index &&
+        if (lyrics_backdrop_active_for_index == gui_player_get_playlist_index() &&
             lyrics_backdrop_active_generation == lyrics_load_generation) return;
         lyrics_backdrop_regenerate_pending = true;
         return;
@@ -421,7 +420,7 @@ static void launch_lyrics_backdrop_decode(void) {
     req->cover_copy = malloc((size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
     if (!req->cover_copy) { free(req); return; }
     memcpy(req->cover_copy, current_cover_bytes, (size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
-    req->for_index = playlist_index;
+    req->for_index = gui_player_get_playlist_index();
     req->lyrics_generation = lyrics_load_generation;
 
     atomic_store_explicit(&lyrics_backdrop_done_flag, false, memory_order_relaxed);
@@ -447,7 +446,7 @@ static void poll_lyrics_backdrop(void) {
     lyrics_backdrop_active = false;
     pthread_join(lyrics_backdrop_thread, NULL);
 
-    bool result_current = lyrics_backdrop_result_for_index == playlist_index &&
+    bool result_current = lyrics_backdrop_result_for_index == gui_player_get_playlist_index() &&
                           lyrics_backdrop_result_generation == lyrics_load_generation;
     if (lyrics_backdrop_result_bytes && result_current) { /* NULL = allocation failure -- keep whatever backdrop (or plain black) is already showing */
         free(current_lyrics_backdrop_bytes);
@@ -495,13 +494,13 @@ static int lyrics_pool_synced_for_index = -1; /* current_lyrics_doc_for_index th
 static bool lyrics_auto_follow = true;
 static int lyrics_last_centered_index = -2; /* -2 = "never centered yet", distinct from -1 (a real "before the first line" position) */
 static struct timespec lyrics_last_manual_scroll_at;
-/* Only current_lyrics_doc_for_index == playlist_index counts as "this
+/* Only current_lyrics_doc_for_index == gui_player_get_playlist_index() counts as "this
  * doc is for the track actually playing" -- a load still in flight, one
  * that finished for a since-superseded track, or simply having no track
  * playing at all, are all "no active line" here, matching poll_lyrics_
  * load()'s own staleness check above. */
 static int lyrics_current_active_index(void) {
-    if (!current_lyrics_doc_valid || current_lyrics_doc_for_index != playlist_index || playlist_index < 0) return -1;
+    if (!current_lyrics_doc_valid || current_lyrics_doc_for_index != gui_player_get_playlist_index() || gui_player_get_playlist_index() < 0) return -1;
     return lyrics_find_line_at(&current_lyrics_doc, audio_get_position_seconds());
 }
 static int32_t lyrics_line_y(int index) {
@@ -718,7 +717,7 @@ static void lyrics_timer_cb(lv_timer_t * timer) {
 static void open_lyrics_screen(void) {
     launch_lyrics_backdrop_decode();
     if (current_lyrics_backdrop_bytes &&
-        current_lyrics_backdrop_for_index == playlist_index &&
+        current_lyrics_backdrop_for_index == gui_player_get_playlist_index() &&
         current_lyrics_backdrop_generation == lyrics_load_generation)
         lv_obj_remove_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
     lyrics_reset_pool();
@@ -882,7 +881,6 @@ void lyrics_font_size_settings_row_cb(lv_event_t * e) {
     open_lyrics_font_size_screen();
 }
 
-extern int playlist_index;
 
 extern void player_transition_mark_dirty(void);
 extern bool audio_is_playing(void);
@@ -940,5 +938,13 @@ bool gui_lyrics_has_background_work(void) {
 }
 
 void gui_lyrics_cancel_background_work(void) {
-    /* Joinable lyrics workers complete and are joined on next tick */
+    lyrics_load_generation++;
+    if (lyrics_load_active) {
+        pthread_join(lyrics_load_thread, NULL);
+        lyrics_load_active = false;
+    }
+    if (lyrics_backdrop_active) {
+        pthread_join(lyrics_backdrop_thread, NULL);
+        lyrics_backdrop_active = false;
+    }
 }

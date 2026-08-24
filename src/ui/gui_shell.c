@@ -37,8 +37,8 @@
 #define QUICK_DRAWER_HEIGHT 367
 #define QUICK_DRAWER_ANIM_MS 200
 
-lv_obj_t * home_screen = NULL;
-lv_obj_t * dac_home_screen = NULL;
+static lv_obj_t * home_screen = NULL;
+static lv_obj_t * dac_home_screen = NULL;
 lv_obj_t * status_bar_band = NULL;
 extern player_settings_t current_settings;
 
@@ -88,16 +88,16 @@ lv_obj_t * quick_drawer_favorite_icon = NULL;
 lv_obj_t * quick_drawer_play_btn = NULL;
 lv_obj_t * quick_drawer_order_icon = NULL;
 
-extern lv_obj_t * books_screen;
+extern lv_obj_t * gui_books_get_screen();
 extern lv_obj_t * lyrics_screen;
 extern lv_obj_t * radio_screen;
 extern lv_obj_t * podcasts_screen;
-extern lv_obj_t * settings_screen;
-extern lv_obj_t * music_screen;
+extern lv_obj_t * gui_settings_get_screen();
+extern lv_obj_t * gui_library_get_music_screen();
 extern lv_obj_t * file_browser_screen;
-extern lv_obj_t * eq_screen;
+extern lv_obj_t * gui_settings_get_eq_screen();
 extern lv_obj_t * favorites_screen;
-extern lv_obj_t * playlists_screen;
+extern lv_obj_t * gui_library_get_playlists_screen();
 
 extern player_settings_t current_settings;
 extern bool favorite_is_set;
@@ -149,20 +149,15 @@ void sync_player_topbar_visibility(lv_obj_t * screen) {
      * can't be trusted for it) is handled independently by
      * build_flattened_transition_frame()'s own temporary-flag-then-restore
      * approach, not by this function. */
-    bool hide = current_settings.hide_player_topbar && (screen == player_screen || screen == gui_lyrics_get_screen());
+    bool hide = current_settings.hide_player_topbar && (screen == gui_player_get_screen() || screen == gui_lyrics_get_screen());
     if (status_bar_band) {
         if (hide) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_remove_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
     }
-    if (player_dismiss_btn) {
-        if (current_settings.hide_player_topbar && screen == player_screen)
-            lv_obj_add_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
-        else
-            lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
-    }
+    gui_player_sync_topbar_visibility(screen);
 
     /* player_transition_rebuild_cache() (see its own doc comment) refuses to
-     * run while player_screen is still the active one -- which, since
+     * run while gui_player_get_screen() is still the active one -- which, since
      * whatever marked the cache dirty (track change, cover art, play/pause,
      * accent color) almost always happens WHILE the user is looking at the
      * Player screen, is exactly the state the cache is usually dirtied in.
@@ -175,7 +170,7 @@ void sync_player_topbar_visibility(lv_obj_t * screen) {
      * slide_transition_done_cb's commit/nav_reset_to_home), i.e. exactly
      * "after the Player has settled" -- so retrying here, once per actual
      * screen change away from Player, is the natural moment. */
-    if (screen != player_screen && player_transition_cache_dirty)
+    if (screen != gui_player_get_screen() && player_transition_cache_dirty)
         lv_async_call(player_transition_cache_async_cb, NULL);
 }
 
@@ -930,7 +925,7 @@ static void poll_refresh_bt_icon(void) {
          * check needed here anymore -- the whole function already returned
          * early above while a toggle's in flight, see that comment for the
          * real-device bug this used to only half-fix.) */
-        if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen) populate_bt_screen();
+        if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_bt_screen()) populate_bt_screen();
         return;
     }
     lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
@@ -1009,7 +1004,7 @@ static void poll_refresh_bt_icon(void) {
      * actually opens it. (No bt_toggle_active check needed here either --
      * same reasoning as the other populate_bt_screen() call site above,
      * this function's own !display_powered branch.) */
-    if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen) populate_bt_screen();
+    if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_bt_screen()) populate_bt_screen();
 
     /* Real-device bug: pairing/connecting Bluetooth headphones worked (this
      * poll's own refresh_bt_icon_result_connected went true), but no audio
@@ -1634,8 +1629,8 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         if (quick_drawer_open) {
             quick_drawer_drag_tracking = true;
             quick_drawer_drag_panel_start_y = quick_drawer_motion_y();
-        } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !library_rescan_active) {
-            /* !library_rescan_active -- same exclusion as the other rescan-
+        } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !gui_library_has_background_work()) {
+            /* !gui_library_has_background_work() -- same exclusion as the other rescan-
              * time guards below (search this file for library_rescan_active
              * for the rest of them); only blocks starting a NEW open-drag,
              * if the drawer somehow got dragged open right as a rescan
@@ -1683,10 +1678,10 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * finalize_screen_navigation()), so this was the only remaining way
          * off it. */
         home_swipe_tracking = current_settings.swipe_up_home_enabled && !quick_drawer_open &&
-                               lv_screen_active() != bt_dac_overlay_screen &&
-                               lv_screen_active() != usb_dac_overlay_screen &&
+                               lv_screen_active() != gui_network_get_bt_dac_overlay() &&
+                               lv_screen_active() != gui_network_get_usb_dac_overlay() &&
                                lv_screen_active() != gui_lyrics_get_screen() &&
-                               !library_rescan_active &&
+                               !gui_library_has_background_work() &&
                                p.y >= h - HOME_INDICATOR_BAND_HEIGHT;
         home_swipe_start_y = p.y;
         home_swipe_triggered = false;
@@ -1711,9 +1706,9 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * player screen looked like a broken, looping transition; lyrics_
          * gesture_event_cb() is the only swipe this screen responds to. */
         player_swipe_candidate = !quick_drawer_drag_tracking && !quick_drawer_open &&
-                                  lv_screen_active() != player_screen &&
+                                  lv_screen_active() != gui_player_get_screen() &&
                                   lv_screen_active() != gui_lyrics_get_screen() &&
-                                  !library_rescan_active &&
+                                  !gui_library_has_background_work() &&
                                   !player_swipe_press_excluded(p);
         player_swipe_touch_start_x = p.x;
         player_swipe_touch_start_y = p.y;
@@ -1735,7 +1730,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
              * confirms it; anything else (vertical, or rightward) rules it
              * out for good -- either way, stop re-checking every tick. */
             if (dx < 0 && adx > ady) {
-                player_swipe_ctx = begin_slide_transition(player_screen, true); /* see begin_slide_transition()'s own comment -- both sources are always owned copies now */
+                player_swipe_ctx = begin_slide_transition(gui_player_get_screen(), true); /* see begin_slide_transition()'s own comment -- both sources are always owned copies now */
                 if (player_swipe_ctx) {
                     /* No navigation decision exists until release. A
                      * compositor failure during the live drag therefore
@@ -1910,8 +1905,8 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
              * once this settle animation finishes, not here; nothing else
              * reads the nav stack before then, so only the bookkeeping
              * needs to be right immediately. */
-            if (nav_depth < NAV_STACK_MAX && !(nav_depth > 0 && nav_stack[nav_depth - 1] == player_screen)) {
-                nav_stack[nav_depth++] = player_screen;
+            if (nav_depth < NAV_STACK_MAX && !(nav_depth > 0 && nav_stack[nav_depth - 1] == gui_player_get_screen())) {
+                nav_stack[nav_depth++] = gui_player_get_screen();
             }
         }
         lv_anim_t a;
@@ -2088,7 +2083,7 @@ void quick_drawer_wifi_event_cb(lv_event_t * e) {
         wifi_toggle_active = false;
         refresh_wifi_icon();
     start_bt_dac_startup_reapply_if_needed();
-        if (nav_depth > 0 && nav_stack[nav_depth - 1] == wifi_screen)
+        if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_wifi_screen())
             populate_wifi_screen(wifi_control_is_enabled());
     }
 }
@@ -2333,7 +2328,7 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
      * until start_refresh_bt_icon()'s real result lands afterward and
      * correctly finalizes it. */
     bt_is_powered_cached = bt_will_be_powered;
-    if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen) populate_bt_screen();
+    if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_bt_screen()) populate_bt_screen();
 
     /* Runs fully in the background, same as the stock player -- no busy
      * screen. An earlier version pushed a "Turning on Bluetooth..."
@@ -2345,7 +2340,7 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
     if (pthread_create(&bt_toggle_thread, NULL, bt_pending_now ? bt_pending_enable_thread_func : bt_toggle_thread_func, NULL) != 0) {
         bt_toggle_active = false;
         bt_is_powered_cached = !bt_will_be_powered;
-        if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen) populate_bt_screen();
+        if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_bt_screen()) populate_bt_screen();
         show_info_toast("Failed to toggle Bluetooth");
     }
 }
@@ -2363,7 +2358,7 @@ static void poll_bt_toggle(void) {
          * meaningless (there's no Bluetooth left to receive audio over),
          * so close it automatically instead of leaving a "Bluetooth DAC
          * mode" screen up with nothing backing it. */
-        if (lv_screen_active() == bt_dac_overlay_screen) nav_pop();
+        if (lv_screen_active() == gui_network_get_bt_dac_overlay()) nav_pop();
     }
 
     /* start_refresh_bt_icon() only starts the background check -- it
@@ -2870,5 +2865,28 @@ bool gui_shell_has_background_work(void) {
 }
 
 void gui_shell_cancel_background_work(void) {
-    /* Joinable shell workers complete and are joined on next tick */
+    if (bt_toggle_active) {
+        pthread_join(bt_toggle_thread, NULL);
+        bt_toggle_active = false;
+    }
+    if (wifi_toggle_active) {
+        pthread_join(wifi_toggle_thread, NULL);
+        wifi_toggle_active = false;
+    }
+    if (bt_dac_startup_reapply_active) {
+        pthread_join(bt_dac_startup_reapply_thread, NULL);
+        bt_dac_startup_reapply_active = false;
+    }
+    if (bt_apply_output_settings_active) {
+        pthread_join(bt_apply_output_settings_thread, NULL);
+        bt_apply_output_settings_active = false;
+    }
+    if (refresh_bt_icon_active) {
+        pthread_join(refresh_bt_icon_thread, NULL);
+        refresh_bt_icon_active = false;
+    }
 }
+
+
+lv_obj_t * gui_shell_get_home_screen(void) { return home_screen; }
+lv_obj_t * gui_shell_get_dac_home_screen(void) { return dac_home_screen; }

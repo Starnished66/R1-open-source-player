@@ -69,51 +69,42 @@ static int all_songs_fetch_page(void * ctx, int offset, int count, compact_list_
 static void music_files_tile_cb(lv_event_t * e);
 
 /* Screen pointers owned by this module */
-lv_obj_t * music_screen = NULL;
-lv_obj_t * files_screen = NULL;
-lv_obj_t * files_list = NULL;
-lv_obj_t * files_title_label = NULL;
-lv_obj_t * files_search_list = NULL;
-lv_obj_t * files_search_title_label = NULL;
+static lv_obj_t * music_screen = NULL;
+static lv_obj_t * files_screen = NULL;
+static lv_obj_t * files_search_list = NULL;
 
-lv_obj_t * all_songs_screen = NULL;
-lv_obj_t * all_songs_list = NULL;
-lv_obj_t * all_songs_title_label = NULL;
+static lv_obj_t * all_songs_screen = NULL;
+static lv_obj_t * all_songs_list = NULL;
 
-lv_obj_t * recently_added_screen = NULL;
-lv_obj_t * recently_added_list = NULL;
-lv_obj_t * recently_added_title_label = NULL;
+static lv_obj_t * recently_added_screen = NULL;
+static lv_obj_t * recently_added_list = NULL;
 
-lv_obj_t * artists_screen = NULL;
-lv_obj_t * artists_list = NULL;
-lv_obj_t * artists_title_label = NULL;
+static lv_obj_t * artists_screen = NULL;
+static lv_obj_t * artists_list = NULL;
 
-lv_obj_t * albums_screen = NULL;
-lv_obj_t * albums_list = NULL;
-lv_obj_t * albums_title_label = NULL;
+static lv_obj_t * albums_screen = NULL;
+static lv_obj_t * albums_list = NULL;
 
-lv_obj_t * album_artist_screen = NULL;
-lv_obj_t * album_artist_list = NULL;
-lv_obj_t * album_artist_title_label = NULL;
+static lv_obj_t * album_artist_screen = NULL;
+static lv_obj_t * album_artist_list = NULL;
 
-lv_obj_t * group_songs_screen = NULL;
-lv_obj_t * group_songs_list = NULL;
-lv_obj_t * group_songs_title_label = NULL;
+static lv_obj_t * group_songs_screen = NULL;
+static lv_obj_t * group_songs_list = NULL;
+static lv_obj_t * group_songs_title_label = NULL;
 
-lv_obj_t * artist_albums_screen = NULL;
-lv_obj_t * artist_albums_list = NULL;
-lv_obj_t * artist_albums_title_label = NULL;
+static lv_obj_t * artist_albums_screen = NULL;
+static lv_obj_t * artist_albums_list = NULL;
+static lv_obj_t * artist_albums_title_label = NULL;
 
-lv_obj_t * playlists_screen = NULL;
-lv_obj_t * playlists_list = NULL;
-lv_obj_t * playlists_title_label = NULL;
+static lv_obj_t * playlists_screen = NULL;
+static lv_obj_t * playlists_list = NULL;
 
-lv_obj_t * cue_tracks_screen = NULL;
-lv_obj_t * cue_tracks_list = NULL;
-lv_obj_t * cue_tracks_title_label = NULL;
+static lv_obj_t * cue_tracks_screen = NULL;
+static lv_obj_t * cue_tracks_list = NULL;
+static lv_obj_t * cue_tracks_title_label = NULL;
 
-lv_obj_t * add_to_playlist_screen = NULL;
-lv_obj_t * add_to_playlist_list = NULL;
+static lv_obj_t * add_to_playlist_screen = NULL;
+static lv_obj_t * add_to_playlist_list = NULL;
 
 /* Externs to player/queue and global state */
 extern player_settings_t current_settings;
@@ -1518,6 +1509,7 @@ static void album_row_click_cb(int index) {
      * directly as owned paths -- show_group_songs() takes those straight
      * through as group_song_entry_t, no whole-library array involved. */
     group_song_entry_t * entries = calloc((size_t) group.song_count, sizeof(*entries));
+    if (!entries && group.song_count > 0) return;
     int n = 0;
     song_row_t page[64];
     while (entries && n < group.song_count) {
@@ -1946,8 +1938,14 @@ static void search_apply_results_to_list(search_binding_t * b, const metadata_db
     compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) (matched > 0 ? matched : 1));
     int * indices = malloc(sizeof(int) * (size_t) (matched > 0 ? matched : 1));
     char(*labels)[128] = malloc(sizeof(*labels) * (size_t) (matched > 0 ? matched : 1));
+    if (!items || !indices || !labels) {
+        free(items);
+        free(indices);
+        free(labels);
+        return;
+    }
     for (int i = 0; i < matched; i++) {
-        snprintf(labels[i], sizeof(labels[i]), "%s", hits[i].label);
+        snprintf(labels[i], sizeof(labels[i]), "%.127s", hits[i].label);
         items[i] = (compact_list_item_t){ labels[i] };
         indices[i] = hits[i].offset;
     }
@@ -3750,8 +3748,7 @@ void plugin_stream_tile_click_cb(lv_event_t * e) {
  * the stock theme pack at all (Subsonic isn't a stock HiBy feature) --
  * see assets.c's THEME_OVERRIDE_ROOT for how this app adds its own new
  * asset on top of the stock resource pack despite that living on
- * read-only storage on a real device.
-
+ * read-only storage on a real device. */
 
 /* Drill-down target for Artists and Album Artists: tapping either shows the
  * artist's own albums (regrouping just their songs by album, via
@@ -3917,6 +3914,7 @@ static int album_artists_fetch_page(void * ctx, int offset, int count, compact_l
 
 
 void gui_library_init(void) {
+    if (!az_index_drag_timer) az_index_drag_timer = lv_timer_create(poll_az_index_drag, LV_DEF_REFR_PERIOD, NULL);
     files_screen = build_files_screen();
     all_songs_screen = build_all_songs_screen();
     recently_added_screen = build_recently_added_screen();
@@ -4234,4 +4232,33 @@ bool gui_library_has_background_work(void) {
 
 void gui_library_cancel_background_work(void) {
     cancel_album_thumbnail_generation();
+    if (library_rescan_active) {
+        pthread_join(library_rescan_thread, NULL);
+        library_rescan_active = false;
+        gui_busy_hide(library_rescan_token);
+    }
+    if (album_thumbnail_active) {
+        pthread_join(album_thumbnail_thread, NULL);
+        album_thumbnail_active = false;
+    }
+    if (sd_format_active) {
+        pthread_join(sd_format_thread, NULL);
+        sd_format_active = false;
+        gui_busy_hide(sd_format_token);
+    }
+    if (search_job_active) {
+        pthread_join(search_job_thread, NULL);
+        search_job_active = false;
+    }
 }
+
+
+lv_obj_t * gui_library_get_music_screen(void) { return music_screen; }
+lv_obj_t * gui_library_get_files_screen(void) { return files_screen; }
+lv_obj_t * gui_library_get_all_songs_screen(void) { return all_songs_screen; }
+lv_obj_t * gui_library_get_recently_added_screen(void) { return recently_added_screen; }
+lv_obj_t * gui_library_get_artists_screen(void) { return artists_screen; }
+lv_obj_t * gui_library_get_albums_screen(void) { return albums_screen; }
+lv_obj_t * gui_library_get_album_artist_screen(void) { return album_artist_screen; }
+lv_obj_t * gui_library_get_group_songs_screen(void) { return group_songs_screen; }
+lv_obj_t * gui_library_get_playlists_screen(void) { return playlists_screen; }

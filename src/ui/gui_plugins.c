@@ -178,7 +178,10 @@ void gui_plugin_play_paths(const char * const * paths, int count, int start_inde
     if (start_index >= count) start_index = count - 1;
 
     char ** new_playlist = malloc(sizeof(char *) * count);
-    for (int i = 0; i < count; i++) new_playlist[i] = strdup(paths[i]);
+    if (!new_playlist) return;
+    for (int i = 0; i < count; i++) {
+        new_playlist[i] = paths[i] ? strdup(paths[i]) : strdup("");
+    }
     on_file_selected(new_playlist, count, start_index);
 }
 
@@ -302,13 +305,11 @@ void gui_plugin_stop(void) {
 }
 
 void gui_plugin_next_track(void) {
-    int next_index = compute_manual_step_index(playlist_index, 1);
-    if (next_index >= 0) play_track_at(next_index);
+    gui_player_step_manual(1);
 }
 
 void gui_plugin_prev_track(void) {
-    int prev_index = compute_manual_step_index(playlist_index, -1);
-    if (prev_index >= 0) play_track_at(prev_index);
+    gui_player_step_manual(-1);
 }
 
 void gui_plugin_seek(double seconds) {
@@ -319,7 +320,7 @@ void gui_plugin_set_volume(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
 
-    lv_slider_set_value(volume_slider, percent, LV_ANIM_OFF);
+    gui_player_set_volume_percent(percent);
     audio_set_volume((float) percent / 100.0f);
     current_settings.volume = (float) percent / 100.0f;
     settings_save(&current_settings);
@@ -738,7 +739,7 @@ int gui_plugin_library_get_albums(int offset, int limit, const char * artist_fil
 }
 
 bool gui_plugin_refresh_library(void) {
-    if (library_rescan_active) return false;
+    if (gui_library_has_background_work()) return false;
     start_library_rescan();
-    return library_rescan_active;
+    return true;
 }

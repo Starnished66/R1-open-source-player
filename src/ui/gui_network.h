@@ -2,12 +2,12 @@
 #include <lvgl/lvgl.h>
 #include "usb_mode_control.h"
 
-/* Screens owned by gui_network */
-extern lv_obj_t * wifi_screen;
-extern lv_obj_t * bt_screen;
-extern lv_obj_t * bt_dac_overlay_screen;
-extern lv_obj_t * usb_dac_overlay_screen;
-extern lv_obj_t * wireless_screen;
+/* Screen accessors */
+lv_obj_t * gui_network_get_wifi_screen(void);
+lv_obj_t * gui_network_get_bt_screen(void);
+lv_obj_t * gui_network_get_wireless_screen(void);
+lv_obj_t * gui_network_get_bt_dac_overlay(void);
+lv_obj_t * gui_network_get_usb_dac_overlay(void);
 
 void gui_network_init(void);
 void poll_wifi_connect(void);

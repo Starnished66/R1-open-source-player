@@ -39,14 +39,14 @@ extern void show_info_toast(const char * msg);
 
 #define BOOKS_ROOT_DIR "./music/Books"
 
-static lv_obj_t * books_screen;
+static lv_obj_t * books_screen = NULL;
 
 static void rescan_books(void);
 
 static char * text_reader_current_content = NULL; /* owned; replaced (freed) on every new file opened */
 static char text_reader_current_path[600] = ""; /* the currently open book's path -- what the favorite icon below toggles */
 
-static lv_obj_t * books_files_screen;
+static lv_obj_t * books_files_screen = NULL;
 static lv_obj_t * books_files_list;
 static lv_obj_t * books_files_title_label;
 /* Which data source populate_books_files_screen() reads from -- set right

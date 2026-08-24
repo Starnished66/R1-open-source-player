@@ -20,6 +20,38 @@ void gui_show_boot_splash(void);
 /* Re-anchor screen inactivity after main.c switches LVGL from the boot-time
  * clock callback to its low-overhead incremented runtime clock. */
 void gui_reset_interactive_timeout_baseline(void);
+
+
+
+extern lv_style_t style_accent;
+void generic_back_cb(lv_event_t * e);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+typedef uint32_t gui_busy_handle_t;
+void show_error_toast(const char * msg);
+gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
+void gui_busy_hide(gui_busy_handle_t handle);
+void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
+
 #endif
 
 /* ---- Bridge for src/plugins/plugin_manager.c ----
@@ -254,6 +286,60 @@ void gui_plugin_clear_interval(int slot);
  * plugin_manager.h's own doc comment on plugin.show_text_input() for the
  * singleton/cancel-semantics caveats this inherits as-is. */
 void gui_plugin_show_text_input(const char * title, const char * initial_text, bool is_password);
+
+typedef enum {
+    SEARCH_BINDING_ARTISTS,
+    SEARCH_BINDING_ALBUMS,
+    SEARCH_BINDING_ALBUM_ARTIST,
+    SEARCH_BINDING_ALL_SONGS,
+    SEARCH_BINDING_FILES,
+    SEARCH_BINDING_SUBSONIC_ARTISTS,
+    SEARCH_BINDING_SUBSONIC_ALBUMS,
+    SEARCH_BINDING_COUNT
+} search_binding_id_t;
+
+
+extern lv_style_t style_accent;
+void generic_back_cb(lv_event_t * e);
+
+
+
+
+
+
+
+
+
+
+typedef enum {
+    GUI_FONT_ROLE_TITLE,
+    GUI_FONT_ROLE_ROW,
+    GUI_FONT_ROLE_BODY,
+    GUI_FONT_ROLE_SUBTEXT,
+    GUI_FONT_ROLE_STATUS
+} gui_font_role_t;
+
+
+
+
+
+
+
+
+
+
+lv_obj_t * add_pill_chevron_row(lv_obj_t * list, const char * text, lv_event_cb_t cb);
+lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);
+lv_obj_t * add_pill_row_base(lv_obj_t * list, const char * text);
+const lv_font_t * gui_theme_font(gui_font_role_t role);
+void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon);
+
+
+typedef uint32_t gui_busy_handle_t;
+void show_error_toast(const char * msg);
+gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
+void gui_busy_hide(gui_busy_handle_t handle);
+void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
 
 #endif /* GUI_H */
 

@@ -1,7 +1,11 @@
 #include "gui.h"
 #include "gui_subsonic.h"
+#include "settings.h"
+#include "screen_builders.h"
+#include "gui_text_input.h"
+#include <stdio.h>
+
 #include "assets.h"
-#include "colors.h"
 #include "metadata.h"
 #include "subsonic_client.h"
 #include "device_config.h"
@@ -9,6 +13,97 @@
 #include <stdatomic.h>
 #include <unistd.h>
 #include "audio.h"
+
+void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list, const char * (*name_of)(int), const int * count_ptr, bool is_overlay_list, bool db_backed, metadata_db_az_kind_t db_kind, compact_list_fetch_page_cb_t restore_fetch_page);
+
+
+extern player_settings_t current_settings;
+extern int nav_depth;
+extern gui_busy_handle_t wifi_connect_saved_token;
+
+
+#define SUBSONIC_STREAM_CACHE_DIR MUSIC_ROOT_DIR "/.subsonic_cache"
+#define TITLE_LABEL_LEFT_INSET 76
+#define TITLE_LABEL_DEFAULT_RIGHT_MARGIN 20
+
+extern bool playlist_files_append(const char * path, const char * dest_path);
+extern int search_remap_index(search_binding_id_t id, int list_index);
+extern void nav_push(lv_obj_t * screen);
+extern void nav_pop(void);
+extern void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
+extern void start_library_rescan(void);
+extern void finalize_screen_navigation(lv_obj_t * screen);
+extern lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode, lv_obj_t ** out_title, const char * body_text, const char * confirm_text, lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row, const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb, lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
+extern lv_color_t accent_lv_color(void);
+
+
+#ifdef HOST_BUILD
+  #define MUSIC_ROOT_DIR "./music"
+#else
+  #define MUSIC_ROOT_DIR "/data/mnt/sd_0"
+#endif
+
+#define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
+
+
+typedef struct {
+    char url[1536];
+    char dest_path[512];
+    bool verify_tls;
+} download_request_t;
+
+extern bool http_get_to_file(const char * url, bool verify_tls, const char * dest_path, const char * etag, char * new_etag_out);
+
+typedef struct {
+    subsonic_server_t server;
+    subsonic_song_t * songs;
+    int song_count;
+    subsonic_album_t * albums_to_expand;
+    int album_to_expand_count;
+    char playlist_name[128]; 
+} subsonic_library_download_request_t;
+
+extern bool playlist_files_create(const char * dir, const char * name, const char * initial_file, const char * out_m3u_path, size_t out_m3u_path_size);
+
+typedef struct {
+    subsonic_server_t server;
+} subsonic_connect_request_t;
+
+
+
+
+
+
+typedef enum {
+    SUBSONIC_BROWSE_ALBUM_SONGS,
+    SUBSONIC_BROWSE_ARTIST_ALBUMS,
+    SUBSONIC_BROWSE_PLAYLIST_SONGS,
+    SUBSONIC_BROWSE_PLAYLISTS,
+    SUBSONIC_BROWSE_ALL_ALBUMS,
+} subsonic_browse_kind_t;
+
+typedef struct {
+    subsonic_browse_kind_t kind;
+    subsonic_server_t server;
+    char id[64];
+    char title[128];
+} subsonic_browse_request_t;
+
+
+typedef enum { SUBSONIC_DOWNLOAD_PENDING_NONE, SUBSONIC_DOWNLOAD_PENDING_SONGS, SUBSONIC_DOWNLOAD_PENDING_ARTIST } subsonic_download_pending_t;
+
+
+#include <sys/stat.h>
+
+extern void clear_player_source(void);
+extern void on_file_selected(char ** files, int count, int index);
+extern void nav_remove_stack_slot(int depth);
+
+static char download_dest_path[512];
+static atomic_bool download_done_flag = false;
+static bool download_success_flag = false;
+static bool download_active = false;
+static gui_busy_handle_t download_token = 0;
 
 static gui_busy_handle_t subsonic_library_download_token = 0;
 
@@ -20,21 +115,21 @@ static lv_obj_t * subsonic_entry_screen;
 
 lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
 
-static subsonic_stream_song_meta_t * subsonic_stream_meta = NULL; /* parallel array, NULL when no Subsonic stream queue is loaded */
+subsonic_stream_song_meta_t * subsonic_stream_meta = NULL; /* parallel array, NULL when no Subsonic stream queue is loaded */
 
-static int subsonic_stream_meta_count = 0;
+int subsonic_stream_meta_count = 0;
 
-static void poll_subsonic_download(void);
+void poll_subsonic_download(void);
 
-static void poll_subsonic_library_download(void);
+void poll_subsonic_library_download(void);
 
-static void poll_subsonic_connect(void);
+void poll_subsonic_connect(void);
 
-static void poll_subsonic_browse(void);
+void poll_subsonic_browse(void);
 
-static bool subsonic_library_download_active;
+bool subsonic_library_download_active;
 
-static bool subsonic_connect_active;
+bool subsonic_connect_active;
 
 static void on_cue_file_selected(const char * cue_path); /* defined later, alongside build_cue_tracks_screen() -- needs add_playlist_row_base()/build_subsonic_list_screen() already in scope */
 
@@ -80,7 +175,7 @@ static void start_subsonic_download(const char * url, bool verify_tls, const cha
     }
 }
 
-static void poll_subsonic_download(void) {
+void poll_subsonic_download(void) {
     if (!download_active || !atomic_load_explicit(&download_done_flag, memory_order_acquire)) return;
 
     download_active = false;
@@ -144,7 +239,7 @@ static void sanitize_path_component(const char * in, char * out, size_t out_size
 
 static pthread_t subsonic_library_download_thread;
 
-static bool subsonic_library_download_active = false;
+bool subsonic_library_download_active = false;
 
 static atomic_bool subsonic_library_download_done_flag = false;
 
@@ -261,7 +356,7 @@ static void start_subsonic_library_download(subsonic_song_t * songs, int song_co
     }
 }
 
-static void poll_subsonic_library_download(void) {
+void poll_subsonic_library_download(void) {
     if (!subsonic_library_download_active) return;
 
     if (!atomic_load_explicit(&subsonic_library_download_done_flag, memory_order_acquire)) {
@@ -618,7 +713,7 @@ static void start_subsonic_browse(subsonic_browse_kind_t kind, const char * id, 
     }
 }
 
-static void poll_subsonic_browse(void) {
+void poll_subsonic_browse(void) {
     if (!subsonic_browse_active || !atomic_load_explicit(&subsonic_browse_done_flag, memory_order_acquire)) return;
 
     subsonic_browse_active = false;
@@ -828,7 +923,7 @@ static void build_subsonic_download_confirm_popup(void) {
 
 static pthread_t subsonic_connect_thread;
 
-static bool subsonic_connect_active = false;
+bool subsonic_connect_active = false;
 
 static atomic_bool subsonic_connect_done_flag = false;
 
@@ -853,7 +948,7 @@ static void * subsonic_connect_thread_func(void * arg) {
     return NULL;
 }
 
-static void poll_subsonic_connect(void) {
+void poll_subsonic_connect(void) {
     if (!subsonic_connect_active || !atomic_load_explicit(&subsonic_connect_done_flag, memory_order_acquire)) return;
 
     subsonic_connect_active = false;
@@ -1085,7 +1180,47 @@ static lv_obj_t * build_subsonic_entry_screen(void) {
     return scr;
 }
 
-static void subsonic_tile_cb(lv_event_t * e) {
+void subsonic_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_push(subsonic_entry_screen);
+}
+
+void gui_subsonic_init(void) {
+    /* Subsonic screen redesign: the menu (Artists/Playlists/Albums) that's
+     * now the first screen after connecting -- see poll_subsonic_connect().
+     * Rows built once here, not repopulated per visit, since this list
+     * never changes. */
+    subsonic_menu_screen = build_subsonic_list_screen("Subsonic", &subsonic_menu_title_label, &subsonic_menu_list);
+    {
+        /* Real-device bug report: these 3 rows read noticeably smaller than
+         * "the rest of the player" (their own submenus -- USB Mode, Font
+         * Size, etc. -- looked fine by comparison). Root cause: add_pill_
+         * row_base() hardcodes gui_theme_font(GUI_FONT_ROLE_SUBTEXT), the same small size every one of
+         * those submenus' own OPTION rows uses (a radio-button-style list of
+         * choices within one setting) -- correct there, but this menu is a
+         * top-level navigation menu, the same conceptual role as Settings'
+         * own System/Power/Display category rows (build_pill_list_screen(),
+         * gui_theme_font(GUI_FONT_ROLE_BODY) by default). Bumped to match that convention instead of
+         * the options-picker one, since add_pill_row_base() itself is shared
+         * with a dozen real options-pickers and shouldn't change its own
+         * default just for this one caller. */
+        lv_obj_t * artists_row = add_pill_row_base(subsonic_menu_list, "Artists");
+        lv_obj_set_style_text_font(lv_obj_get_child(artists_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+        lv_obj_add_flag(artists_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(artists_row, subsonic_menu_artists_row_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t * playlists_row = add_pill_row_base(subsonic_menu_list, "Playlists");
+        lv_obj_set_style_text_font(lv_obj_get_child(playlists_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+        lv_obj_add_flag(playlists_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(playlists_row, subsonic_menu_playlists_row_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t * albums_row = add_pill_row_base(subsonic_menu_list, "Albums");
+        lv_obj_set_style_text_font(lv_obj_get_child(albums_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+        lv_obj_add_flag(albums_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(albums_row, subsonic_menu_albums_row_cb, LV_EVENT_CLICKED, NULL);
+    }
+    register_search(SEARCH_BINDING_SUBSONIC_ARTISTS, subsonic_artists_screen, subsonic_artists_list, subsonic_artist_label_of,
+                     &subsonic_artists_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
+    register_search(SEARCH_BINDING_SUBSONIC_ALBUMS, subsonic_albums_screen, subsonic_albums_list, subsonic_album_label_of,
+                     &subsonic_albums_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
 }

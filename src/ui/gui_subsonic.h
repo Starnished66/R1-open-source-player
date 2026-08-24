@@ -21,3 +21,8 @@ lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** ou
 
 
 extern subsonic_stream_song_meta_t * subsonic_stream_meta;
+
+void poll_subsonic_download(void);
+void poll_subsonic_library_download(void);
+void poll_subsonic_connect(void);
+void poll_subsonic_browse(void);

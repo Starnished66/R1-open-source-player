@@ -2,6 +2,7 @@
 #include "gui_books.h"
 #include "gui_text_input.h"
 #include "gui_lyrics.h"
+#include "gui_subsonic.h"
 #include "assets.h"
 #include "backlight.h"
 #include "debug_log.h"
@@ -53,33 +54,24 @@
 #include "hostname_apply.h"
 
 /* --- Theme API (gui_theme.h) --- */
-typedef enum {
-    GUI_FONT_ROLE_TITLE,
-    GUI_FONT_ROLE_ROW,
-    GUI_FONT_ROLE_BODY,
-    GUI_FONT_ROLE_SUBTEXT,
-    GUI_FONT_ROLE_STATUS
-} gui_font_role_t;
 
-const lv_font_t * gui_theme_font(gui_font_role_t role);
+
 
 /* --- Notification/Modal API (gui_notifications.h) --- */
-typedef uint32_t gui_busy_handle_t;
 
 static uint32_t gui_busy_current_token = 0;
 static lv_obj_t * gui_busy_screen = NULL;
 static lv_obj_t * gui_busy_label = NULL;
 static lv_obj_t * gui_busy_progress_bar = NULL;
 
-static gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
-static void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
-static void gui_busy_hide(gui_busy_handle_t handle);
+gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
+void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
+void gui_busy_hide(gui_busy_handle_t handle);
 
-static gui_busy_handle_t download_token = 0;
 static gui_busy_handle_t library_rescan_token = 0;
 static gui_busy_handle_t sd_format_token = 0;
 static gui_busy_handle_t wifi_connect_token = 0;
-static gui_busy_handle_t wifi_connect_saved_token = 0;
+gui_busy_handle_t wifi_connect_saved_token = 0;
 static gui_busy_handle_t import_web_stop_token = 0;
 
 #include "src/core/lv_obj.h"
@@ -2772,7 +2764,7 @@ static void build_error_toast(void) {
     lv_timer_pause(error_toast_hide_timer);
 }
 
-static void show_error_toast(const char * msg) {
+void show_error_toast(const char * msg) {
     lv_label_set_text(error_toast_label, msg);
     lv_obj_remove_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(error_toast);
@@ -5364,14 +5356,6 @@ static void refresh_now_playing_indicators(void);
  * than moving apply_track_metadata_to_ui() itself) since the Subsonic click
  * handler that WRITES these lives much further down this file, alongside
  * the rest of the Subsonic screens. */
-typedef struct {
-    char url[1536]; /* the exact playlist[i] this entry describes */
-    char title[128];
-    char artist[128];
-    char album[128];
-    char cover_url[1536];
-    bool verify_tls;
-} subsonic_stream_song_meta_t;
 
 static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     /* Resolved once -- this is playlist_index's first real touch on every
@@ -5807,7 +5791,7 @@ static void play_track_at(int index) {
     play_track_at_from(index, 0.0);
 }
 
-static void on_file_selected(char ** new_playlist, int count, int selected_index) {
+void on_file_selected(char ** new_playlist, int count, int selected_index) {
     free_playlist();
     playlist = new_playlist;
     playlist_count = count;
@@ -5840,7 +5824,7 @@ static void on_file_selected_at(char ** new_playlist, int count, int selected_in
 /* set_player_source_group_songs() is defined further down, right after
  * group_songs_entries/count/title_label -- it needs those already in
  * scope. These three don't. */
-static void clear_player_source(void) {
+void clear_player_source(void) {
     player_source_kind = PLAYER_SOURCE_NONE;
     player_source_all_songs_index = -1;
     player_source_recently_added_index = -1;
@@ -6326,7 +6310,7 @@ static void poll_dlna_control(void);
  * much further down -- forward-declared here since subsonic_library_
  * download_thread_func() (defined well before that point) needs to trigger
  * a rescan once its own batch download finishes. */
-static void start_library_rescan(void);
+void start_library_rescan(void);
 static void poll_wifi_scan(void);
 static void poll_wifi_connect(void);
 static void poll_wifi_connect_saved(void);
@@ -7964,7 +7948,7 @@ static void delete_song_confirm_cb(lv_event_t * e) {
  * shared "are you sure?" 2-button popup shape's own doc comment) --
  * forward-declared here since this and every other popup builder before
  * that point in the file needs it. */
-static lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
+lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
                                        lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
                                        lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
                                        const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
@@ -8562,6 +8546,7 @@ void gui_show_boot_splash(void) {
 }
 
 
+void on_cue_file_selected(const char * cue_path);
 static lv_obj_t * build_files_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
@@ -9184,18 +9169,9 @@ static void library_load_from_cache_only(void) {
  * earlier in the file than the other three screens' own row-click
  * callbacks) needs to remap a filtered display index back to the real one
  * whenever a search is active. */
-typedef enum {
-    SEARCH_BINDING_ARTISTS,
-    SEARCH_BINDING_ALBUMS,
-    SEARCH_BINDING_ALBUM_ARTIST,
-    SEARCH_BINDING_ALL_SONGS,
-    SEARCH_BINDING_FILES,
-    SEARCH_BINDING_SUBSONIC_ARTISTS,
-    SEARCH_BINDING_SUBSONIC_ALBUMS,
-    SEARCH_BINDING_COUNT
-} search_binding_id_t;
 
-static int search_remap_index(search_binding_id_t binding_id, int display_index);
+
+int search_remap_index(search_binding_id_t binding_id, int display_index);
 
 /* Paged All Songs -- see build_all_songs_screen()'s own comment. offset is
  * a position in the DB's own title-sorted order (metadata_db_get_songs_
@@ -9751,7 +9727,7 @@ static void more_menu_list_cb(lv_event_t * e) {
  * lv_obj_get_x() bug this replaced, different root cause. Forcing the
  * layout pass on the screen (both objects' common parent) resolves both at
  * once. */
-static void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon) {
+void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon) {
     lv_obj_update_layout(lv_obj_get_parent(title));
 
     lv_area_t title_area, icon_area;
@@ -9935,10 +9911,7 @@ static lv_obj_t * build_group_songs_screen(void) {
  * the same shape as audio.c's own track_finished flag, for the same reason:
  * LVGL isn't thread-safe, so the thread can't touch any screen/widget
  * state directly. */
-static bool download_active = false;
-static atomic_bool download_done_flag = false;
 static volatile bool download_success_flag = false;
-static char download_dest_path[512];
 
 typedef struct {
     char url[1536];
@@ -9998,7 +9971,7 @@ static void poll_dlna_control(void) {
  * non-cancelable uses. */
 
 /* --- Modal API Implementation --- */
-static gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
+gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
     gui_busy_current_token++;
     if (!gui_busy_screen) {
         gui_busy_screen = lv_obj_create(NULL);
@@ -10029,13 +10002,13 @@ static gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
     return gui_busy_current_token;
 }
 
-static void gui_busy_set_progress(gui_busy_handle_t handle, int percent) {
+void gui_busy_set_progress(gui_busy_handle_t handle, int percent) {
     if (handle != gui_busy_current_token || !gui_busy_screen) return;
     lv_obj_remove_flag(gui_busy_progress_bar, LV_OBJ_FLAG_HIDDEN);
     lv_bar_set_value(gui_busy_progress_bar, percent, LV_ANIM_OFF);
 }
 
-static void gui_busy_hide(gui_busy_handle_t handle) {
+void gui_busy_hide(gui_busy_handle_t handle) {
     if (handle != gui_busy_current_token || !gui_busy_screen) return;
     if (lv_screen_active() == gui_busy_screen) {
         nav_pop();
@@ -10138,7 +10111,7 @@ lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) {
     return row;
 }
 
-static lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click) {
+lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click) {
     lv_obj_t * row = add_pill_row_base(parent, label_text);
 
     lv_obj_t * toggle_img = lv_image_create(row);
@@ -10176,7 +10149,7 @@ static lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text
     return row;
 }
 
-static lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_text, lv_event_cb_t on_click) {
+lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_text, lv_event_cb_t on_click) {
     lv_obj_t * row = add_pill_row_base(parent, label_text);
 
     /* No matching real chevron asset found in theme2 at this screen scale
@@ -10531,20 +10504,7 @@ int gui_plugin_show_settings_list(const char * title, const int * row_types, con
 
 
 
-typedef enum {
-    SUBSONIC_BROWSE_ALBUM_SONGS,
-    SUBSONIC_BROWSE_ARTIST_ALBUMS,
-    SUBSONIC_BROWSE_PLAYLIST_SONGS,
-    SUBSONIC_BROWSE_PLAYLISTS,
-    SUBSONIC_BROWSE_ALL_ALBUMS,
-} subsonic_browse_kind_t;
 
-typedef struct {
-    subsonic_browse_kind_t kind;
-    subsonic_server_t server;
-    char id[64];
-    char title[128];
-} subsonic_browse_request_t;
 
 
 
@@ -10574,7 +10534,6 @@ typedef struct {
  * buttons (same as wifi_action_popup/bt_action_popup's own "one popup, a
  * pending-kind flag picks what Confirm actually does" shape) rather than
  * two near-identical popup instances. */
-typedef enum { SUBSONIC_DOWNLOAD_PENDING_NONE, SUBSONIC_DOWNLOAD_PENDING_SONGS, SUBSONIC_DOWNLOAD_PENDING_ARTIST } subsonic_download_pending_t;
 
 
 
@@ -10615,9 +10574,6 @@ typedef enum { SUBSONIC_DOWNLOAD_PENDING_NONE, SUBSONIC_DOWNLOAD_PENDING_SONGS, 
  * poll_subsonic_connect() ever runs, so this is what poll_subsonic_
  * connect() reads back to know what to persist on success. */
 
-typedef struct {
-    subsonic_server_t server;
-} subsonic_connect_request_t;
 
 
 
@@ -11645,7 +11601,7 @@ static search_binding_t * find_search_binding_for_screen(lv_obj_t * screen) {
     return NULL;
 }
 
-static int search_remap_index(search_binding_id_t binding_id, int display_index) {
+int search_remap_index(search_binding_id_t binding_id, int display_index) {
     search_binding_t * b = &search_bindings[binding_id];
     if (b->filtered_indices) return b->filtered_indices[display_index];
     return display_index;
@@ -12024,7 +11980,7 @@ static void search_close_btn_click_cb(lv_event_t * e) {
  * A-Z index already registers at. Builds the initial search icon (top-
  * right of the title row, same position/pattern playlists_edit_btn
  * already uses) and the search bar (hidden until search_btn is tapped). */
-static void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list, az_index_name_of_t name_of,
+void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list, az_index_name_of_t name_of,
                              const int * count_ptr, bool is_overlay_list, bool db_backed, metadata_db_az_kind_t db_kind,
                              compact_list_fetch_page_cb_t restore_fetch_page) {
     search_binding_t * b = &search_bindings[id];
@@ -12663,7 +12619,7 @@ static lv_obj_t * build_cue_tracks_screen(void) {
 /* file_browser.h's on_cue_select callback -- see file_browser_init()'s own
  * comment. Parses fresh on every tap (a .cue sheet is tiny, no reason to
  * cache) and replaces whatever sheet this screen was last showing. */
-static void on_cue_file_selected(const char * cue_path) {
+void on_cue_file_selected(const char * cue_path) {
     cue_sheet_free(&current_cue_sheet);
     current_cue_sheet_valid = cue_parse_file(cue_path, &current_cue_sheet);
     if (!current_cue_sheet_valid) {
@@ -12702,7 +12658,7 @@ static void * library_rescan_thread_func(void * arg) {
     return NULL;
 }
 
-static void start_library_rescan(void) {
+void start_library_rescan(void) {
     /* Real-device incident: several call sites below don't already guard on
      * library_rescan_active themselves, and a second call while a rescan
      * thread is still running would spawn a second library_rescan_thread_
@@ -15609,7 +15565,7 @@ static void import_rescan_confirm_cb(lv_event_t * e) {
  * its own show/hide functions and owns both objects same as before --
  * this only replaces how each popup's insides get built, not the
  * hide/show/backdrop-tap machinery already established per popup. */
-static lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
+lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
                                        lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
                                        lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
                                        const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
@@ -18671,43 +18627,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     gui_text_input_init();
     music_screen = build_music_screen();
     stream_media_screen = build_stream_media_screen();
-    subsonic_saved_servers_screen = build_subsonic_saved_servers_screen();
-    subsonic_new_connection_screen = build_subsonic_new_connection_screen();
-    subsonic_entry_screen = build_subsonic_entry_screen();
 
-    /* Subsonic screen redesign: the menu (Artists/Playlists/Albums) that's
-     * now the first screen after connecting -- see poll_subsonic_connect().
-     * Rows built once here, not repopulated per visit, since this list
-     * never changes. */
-    subsonic_menu_screen = build_subsonic_list_screen("Subsonic", &subsonic_menu_title_label, &subsonic_menu_list);
-    {
-        /* Real-device bug report: these 3 rows read noticeably smaller than
-         * "the rest of the player" (their own submenus -- USB Mode, Font
-         * Size, etc. -- looked fine by comparison). Root cause: add_pill_
-         * row_base() hardcodes gui_theme_font(GUI_FONT_ROLE_SUBTEXT), the same small size every one of
-         * those submenus' own OPTION rows uses (a radio-button-style list of
-         * choices within one setting) -- correct there, but this menu is a
-         * top-level navigation menu, the same conceptual role as Settings'
-         * own System/Power/Display category rows (build_pill_list_screen(),
-         * gui_theme_font(GUI_FONT_ROLE_BODY) by default). Bumped to match that convention instead of
-         * the options-picker one, since add_pill_row_base() itself is shared
-         * with a dozen real options-pickers and shouldn't change its own
-         * default just for this one caller. */
-        lv_obj_t * artists_row = add_pill_row_base(subsonic_menu_list, "Artists");
-        lv_obj_set_style_text_font(lv_obj_get_child(artists_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-        lv_obj_add_flag(artists_row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(artists_row, subsonic_menu_artists_row_cb, LV_EVENT_CLICKED, NULL);
-
-        lv_obj_t * playlists_row = add_pill_row_base(subsonic_menu_list, "Playlists");
-        lv_obj_set_style_text_font(lv_obj_get_child(playlists_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-        lv_obj_add_flag(playlists_row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(playlists_row, subsonic_menu_playlists_row_cb, LV_EVENT_CLICKED, NULL);
-
-        lv_obj_t * albums_row = add_pill_row_base(subsonic_menu_list, "Albums");
-        lv_obj_set_style_text_font(lv_obj_get_child(albums_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-        lv_obj_add_flag(albums_row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(albums_row, subsonic_menu_albums_row_cb, LV_EVENT_CLICKED, NULL);
-    }
 
     /* Artists/Albums, unlike the rest of this file's ~25 build_subsonic_
      * list_screen() screens, can genuinely scale with library size --
@@ -18722,14 +18642,21 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * local library screens. enable_now_playing is false for both -- a
      * Subsonic artist/album row has no local playlist_index to highlight
      * against. */
-    subsonic_artists_screen = build_compact_list_screen("Artists", generic_back_cb, NULL, 0, subsonic_artist_row_click_cb,
-                                                          NULL, &subsonic_artists_list, &subsonic_artists_title_label,
-                                                          LIST_ROW_WIDTH_WIDE, false, lv_color_black());
-    subsonic_albums_screen = build_compact_list_screen("Albums", generic_back_cb, NULL, 0, subsonic_album_row_click_cb,
-                                                         NULL, &subsonic_albums_list, &subsonic_albums_title_label,
-                                                         LIST_ROW_WIDTH_WIDE, false, lv_color_black());
-    subsonic_songs_screen = build_subsonic_list_screen("Songs", &subsonic_songs_title_label, &subsonic_songs_list);
-    subsonic_playlists_screen = build_subsonic_list_screen("Playlists", &subsonic_playlists_title_label, &subsonic_playlists_list);
+    gui_subsonic_init();
+
+    /* Artists/Albums, unlike the rest of this file's ~25 build_subsonic_
+     * list_screen() screens, can genuinely scale with library size --
+     * getArtists.view has no size cap and getAlbumList2.view's own "every
+     * album" browse returns up to 500 (see subsonic_client.c) -- so these
+     * two use the same virtualized compact_list build_all_songs_screen()/
+     * build_artists_screen()/etc. already do, not the plain flex list every
+     * other (inherently small/bounded) settings/browse screen in this file
+     * shares. Built empty (item_count 0); populated later via compact_list_
+     * set_items() once a real fetch actually completes (poll_subsonic_
+     * connect()/poll_subsonic_browse()), same lazy-population shape as the
+     * local library screens. enable_now_playing is false for both -- a
+     * Subsonic artist/album row has no local playlist_index to highlight
+     * against. */
 
     /* Top-of-screen Download buttons -- see subsonic_download_artist_btn_cb()/
      * subsonic_download_songs_btn_cb() for what each actually downloads.
@@ -18750,35 +18677,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * own precedent -- there's no stock icon for a Subsonic-only feature)
      * rather than reusing an LVGL built-in symbol font glyph, which would
      * have clashed with this app's own consistently hand-drawn icon set. */
-    subsonic_albums_download_btn = lv_image_create(subsonic_albums_screen);
-    lv_image_set_src(subsonic_albums_download_btn, asset_path("stream_media/download.png"));
-    lv_obj_set_style_image_recolor(subsonic_albums_download_btn, accent_lv_color(), 0);
-    lv_obj_set_style_image_recolor_opa(subsonic_albums_download_btn, LV_OPA_COVER, 0);
-    /* -20-51-16 (not just -20, the plain top-right corner offset the songs
-     * button below still uses) -- subsonic_albums_screen also gets a search
-     * icon (registered below), which sits at the plain -20 corner; shifted
-     * left here to clear it rather than overlapping when both are visible
-     * (an Artist page, mid-search). */
-    lv_obj_align(subsonic_albums_download_btn, LV_ALIGN_TOP_RIGHT, -87, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 34) / 2);
-    lv_obj_set_ext_click_area(subsonic_albums_download_btn, 16);
-    lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(subsonic_albums_download_btn, subsonic_download_artist_btn_cb, LV_EVENT_CLICKED, NULL);
-    /* subsonic_albums_download_btn (see its own comment above) is already
-     * the leftmost of the two right-side buttons this screen can show, so
-     * reserving up to it also clears the search icon further right. */
-    reserve_title_width_before(subsonic_albums_title_label, subsonic_albums_download_btn);
-
-    subsonic_songs_download_btn = lv_image_create(subsonic_songs_screen);
-    lv_image_set_src(subsonic_songs_download_btn, asset_path("stream_media/download.png"));
-    lv_obj_set_style_image_recolor(subsonic_songs_download_btn, accent_lv_color(), 0);
-    lv_obj_set_style_image_recolor_opa(subsonic_songs_download_btn, LV_OPA_COVER, 0);
-    lv_obj_align(subsonic_songs_download_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 34) / 2);
-    lv_obj_set_ext_click_area(subsonic_songs_download_btn, 16);
-    lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(subsonic_songs_download_btn, subsonic_download_songs_btn_cb, LV_EVENT_CLICKED, NULL);
-    reserve_title_width_before(subsonic_songs_title_label, subsonic_songs_download_btn);
 
     /* Same live search as Artists/Albums/Album Artist/All Songs (see the
      * search_binding_t infra above), extended to Subsonic's own Artists and
@@ -18791,10 +18689,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * unlike the local-library bindings, these screens are never rebuilt (no
      * equivalent of a library rescan), so there's no second registration
      * site to mirror this at. */
-    register_search(SEARCH_BINDING_SUBSONIC_ARTISTS, subsonic_artists_screen, subsonic_artists_list, subsonic_artist_label_of,
-                     &subsonic_artists_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
-    register_search(SEARCH_BINDING_SUBSONIC_ALBUMS, subsonic_albums_screen, subsonic_albums_list, subsonic_album_label_of,
-                     &subsonic_albums_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
     wifi_screen = build_wifi_screen();
     wifi_info_screen = build_wifi_info_screen();
     wifi_dns_screen = build_wifi_dns_screen();
@@ -18833,7 +18727,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     build_factory_reset_popup();
     build_font_size_reboot_popup();
     build_hostname_reboot_popup();
-    build_subsonic_download_confirm_popup();
     build_sd_mount_failed_popup();
     build_sd_format_confirm_popup();
     build_power_off_countdown_popup();

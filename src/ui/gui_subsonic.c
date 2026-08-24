@@ -1027,7 +1027,13 @@ static void start_subsonic_connect(const subsonic_server_t * server) {
 
     subsonic_connect_token = gui_busy_show("Connecting to server...", "");
 
-    pthread_create(&subsonic_connect_thread, NULL, subsonic_connect_thread_func, req);
+    if (pthread_create(&subsonic_connect_thread, NULL, subsonic_connect_thread_func, req) != 0) {
+        free(req);
+        subsonic_connect_active = false;
+        gui_busy_dismiss(subsonic_connect_token);
+        subsonic_connect_token = 0;
+        show_info_toast("Failed to start connection");
+    }
 }
 
 static subsonic_server_row_t * subsonic_saved_servers = NULL;

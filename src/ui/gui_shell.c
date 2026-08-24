@@ -2342,7 +2342,12 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
      * real, repeatedly-hit stuck-screen bug (multiple uncoordinated users of
      * one shared overlay), which not having an overlay at all sidesteps
      * entirely. */
-    pthread_create(&bt_toggle_thread, NULL, bt_pending_now ? bt_pending_enable_thread_func : bt_toggle_thread_func, NULL);
+    if (pthread_create(&bt_toggle_thread, NULL, bt_pending_now ? bt_pending_enable_thread_func : bt_toggle_thread_func, NULL) != 0) {
+        bt_toggle_active = false;
+        bt_is_powered_cached = !bt_will_be_powered;
+        if (nav_depth > 0 && nav_stack[nav_depth - 1] == bt_screen) populate_bt_screen();
+        show_info_toast("Failed to toggle Bluetooth");
+    }
 }
 
 static void poll_bt_toggle(void) {

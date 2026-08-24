@@ -1542,10 +1542,6 @@ static void dac_home_tile_cb(lv_event_t * e) {
     nav_push(dac_home_screen);
 }
 
-static void gui_books_home_tile_cb(lv_event_t * e) {
-    (void) e;
-    gui_books_show();
-}
 
 lv_obj_t * build_home_screen(void) {
     static icon_grid_item_t items[6];
@@ -2295,7 +2291,12 @@ void gui_settings_init(void) {
     eq_screen = build_eq_screen();
     eq_profiles_screen = build_eq_profiles_screen();
     build_firmware_update_popup();
+    build_eq_reset_popup();
+    build_factory_reset_popup();
+    build_font_size_reboot_popup();
+    build_hostname_reboot_popup();
 }
+
 /* Externs for callbacks defined in gui.c */
 
 /* Extern widget var in gui.c */

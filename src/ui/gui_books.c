@@ -335,7 +335,7 @@ static lv_obj_t * build_books_screen(void) {
     return scr;
 }
 
-static void books_tile_cb(lv_event_t * e) {
+void gui_books_home_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_push(books_screen);
 }

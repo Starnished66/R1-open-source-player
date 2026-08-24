@@ -1185,24 +1185,16 @@ void subsonic_tile_cb(lv_event_t * e) {
 }
 
 void gui_subsonic_init(void) {
+    subsonic_entry_screen = build_subsonic_entry_screen();
+    subsonic_saved_servers_screen = build_subsonic_saved_servers_screen();
+    subsonic_new_connection_screen = build_subsonic_new_connection_screen();
+
     /* Subsonic screen redesign: the menu (Artists/Playlists/Albums) that's
      * now the first screen after connecting -- see poll_subsonic_connect().
      * Rows built once here, not repopulated per visit, since this list
      * never changes. */
     subsonic_menu_screen = build_subsonic_list_screen("Subsonic", &subsonic_menu_title_label, &subsonic_menu_list);
     {
-        /* Real-device bug report: these 3 rows read noticeably smaller than
-         * "the rest of the player" (their own submenus -- USB Mode, Font
-         * Size, etc. -- looked fine by comparison). Root cause: add_pill_
-         * row_base() hardcodes gui_theme_font(GUI_FONT_ROLE_SUBTEXT), the same small size every one of
-         * those submenus' own OPTION rows uses (a radio-button-style list of
-         * choices within one setting) -- correct there, but this menu is a
-         * top-level navigation menu, the same conceptual role as Settings'
-         * own System/Power/Display category rows (build_pill_list_screen(),
-         * gui_theme_font(GUI_FONT_ROLE_BODY) by default). Bumped to match that convention instead of
-         * the options-picker one, since add_pill_row_base() itself is shared
-         * with a dozen real options-pickers and shouldn't change its own
-         * default just for this one caller. */
         lv_obj_t * artists_row = add_pill_row_base(subsonic_menu_list, "Artists");
         lv_obj_set_style_text_font(lv_obj_get_child(artists_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
         lv_obj_add_flag(artists_row, LV_OBJ_FLAG_CLICKABLE);
@@ -1218,6 +1210,40 @@ void gui_subsonic_init(void) {
         lv_obj_add_flag(albums_row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(albums_row, subsonic_menu_albums_row_cb, LV_EVENT_CLICKED, NULL);
     }
+
+    subsonic_artists_screen = build_compact_list_screen("Artists", generic_back_cb, NULL, 0, subsonic_artist_row_click_cb,
+                                                          NULL, &subsonic_artists_list, &subsonic_artists_title_label,
+                                                          LIST_ROW_WIDTH_WIDE, false, lv_color_black());
+    subsonic_albums_screen = build_compact_list_screen("Albums", generic_back_cb, NULL, 0, subsonic_album_row_click_cb,
+                                                         NULL, &subsonic_albums_list, &subsonic_albums_title_label,
+                                                         LIST_ROW_WIDTH_WIDE, false, lv_color_black());
+    subsonic_songs_screen = build_subsonic_list_screen("Songs", &subsonic_songs_title_label, &subsonic_songs_list);
+    subsonic_playlists_screen = build_subsonic_list_screen("Playlists", &subsonic_playlists_title_label, &subsonic_playlists_list);
+
+    subsonic_albums_download_btn = lv_image_create(subsonic_albums_screen);
+    lv_image_set_src(subsonic_albums_download_btn, asset_path("stream_media/download.png"));
+    lv_obj_set_style_image_recolor(subsonic_albums_download_btn, accent_lv_color(), 0);
+    lv_obj_set_style_image_recolor_opa(subsonic_albums_download_btn, LV_OPA_COVER, 0);
+    lv_obj_align(subsonic_albums_download_btn, LV_ALIGN_TOP_RIGHT, -87, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 34) / 2);
+    lv_obj_set_ext_click_area(subsonic_albums_download_btn, 16);
+    lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(subsonic_albums_download_btn, subsonic_download_artist_btn_cb, LV_EVENT_CLICKED, NULL);
+    reserve_title_width_before(subsonic_albums_title_label, subsonic_albums_download_btn);
+
+    subsonic_songs_download_btn = lv_image_create(subsonic_songs_screen);
+    lv_image_set_src(subsonic_songs_download_btn, asset_path("stream_media/download.png"));
+    lv_obj_set_style_image_recolor(subsonic_songs_download_btn, accent_lv_color(), 0);
+    lv_obj_set_style_image_recolor_opa(subsonic_songs_download_btn, LV_OPA_COVER, 0);
+    lv_obj_align(subsonic_songs_download_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 34) / 2);
+    lv_obj_set_ext_click_area(subsonic_songs_download_btn, 16);
+    lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(subsonic_songs_download_btn, subsonic_download_songs_btn_cb, LV_EVENT_CLICKED, NULL);
+    reserve_title_width_before(subsonic_songs_title_label, subsonic_songs_download_btn);
+
+    build_subsonic_download_confirm_popup();
+
     register_search(SEARCH_BINDING_SUBSONIC_ARTISTS, subsonic_artists_screen, subsonic_artists_list, subsonic_artist_label_of,
                      &subsonic_artists_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
     register_search(SEARCH_BINDING_SUBSONIC_ALBUMS, subsonic_albums_screen, subsonic_albums_list, subsonic_album_label_of,

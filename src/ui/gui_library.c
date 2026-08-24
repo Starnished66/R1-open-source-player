@@ -48,11 +48,6 @@ void refresh_artist_albums_now_playing_indicator(void);
 #define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
 #define COMPACT_LIST_PAGE_CACHE_SIZE 64
 #define STATUS_BAR_CLEARANCE 48
-#define TITLE_ROW_HEIGHT 56
-#define MUSIC_LIST_ROW_HEIGHT 88
-#define LIST_ROW_WIDTH_WIDE 432
-#define LIST_ROW_WIDTH_NARROW 384
-#define MOST_PLAYED_LIMIT 100
 #define EXTERNAL_COVER_MAX_BYTES (4U * 1024U * 1024U)
 
 static lv_obj_t * album_thumbnail_active_list = NULL;

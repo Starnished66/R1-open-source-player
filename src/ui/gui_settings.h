@@ -17,3 +17,5 @@ extern lv_obj_t * eq_screen;
 extern lv_obj_t * eq_profiles_screen;
 
 void gui_settings_init(void);
+void show_font_size_reboot_popup(void);
+void build_font_size_reboot_popup(void);

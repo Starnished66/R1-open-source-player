@@ -20,71 +20,6 @@ void gui_show_boot_splash(void);
 /* Re-anchor screen inactivity after main.c switches LVGL from the boot-time
  * clock callback to its low-overhead incremented runtime clock. */
 void gui_reset_interactive_timeout_baseline(void);
-
-
-
-extern lv_style_t style_accent;
-void generic_back_cb(lv_event_t * e);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-typedef uint32_t gui_busy_handle_t;
-void show_error_toast(const char * msg);
-gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
-void gui_busy_hide(gui_busy_handle_t handle);
-void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
-
-
-/* Accent palette -- defined in gui.c, used by gui_settings.c */
-extern const uint32_t accent_palette[];
-extern lv_obj_t * accent_swatches[];
-#define ACCENT_PALETTE_COUNT 24  /* number of entries in accent_palette[] */
-
-/* Settings-related widget vars defined in gui.c */
-extern lv_obj_t * settings_crossfade_toggle_img;
-
-/* Callbacks defined in gui.c, referenced by gui_settings.c */
-void accent_swatch_event_cb(lv_event_t * e);
-void crossfade_switch_event_cb(lv_event_t * e);
-void car_mode_switch_event_cb(lv_event_t * e);
-void swipe_up_home_switch_event_cb(lv_event_t * e);
-void screen_dimming_switch_event_cb(lv_event_t * e);
-void hide_player_topbar_switch_event_cb(lv_event_t * e);
-void charge_limiter_switch_event_cb(lv_event_t * e);
-void safe_charging_switch_event_cb(lv_event_t * e);
-void led_indicator_switch_event_cb(lv_event_t * e);
-void battery_percent_switch_event_cb(lv_event_t * e);
-void clock_24h_switch_event_cb(lv_event_t * e);
-void resume_mode_settings_row_cb(lv_event_t * e);
-void play_pause_button_mode_settings_row_cb(lv_event_t * e);
-void replaygain_mode_settings_row_cb(lv_event_t * e);
-void font_size_settings_row_cb(lv_event_t * e);
-void usb_mode_settings_row_cb(lv_event_t * e);
-void update_music_database_row_cb(lv_event_t * e);
-void firmware_update_row_cb(lv_event_t * e);
-void bt_dac_settings_row_cb(lv_event_t * e);
-void register_swipe_dead_zone(lv_obj_t * obj);
-
-void refresh_clock_label(void);
-
 #endif
 
 /* ---- Bridge for src/plugins/plugin_manager.c ----
@@ -320,6 +255,11 @@ void gui_plugin_clear_interval(int slot);
  * singleton/cancel-semantics caveats this inherits as-is. */
 void gui_plugin_show_text_input(const char * title, const char * initial_text, bool is_password);
 
+
+#define COVER_ART_WIDTH 480
+#define COVER_ART_HEIGHT 480
+
+
 typedef enum {
     SEARCH_BINDING_ARTISTS,
     SEARCH_BINDING_ALBUMS,
@@ -331,18 +271,7 @@ typedef enum {
     SEARCH_BINDING_COUNT
 } search_binding_id_t;
 
-
-extern lv_style_t style_accent;
-void generic_back_cb(lv_event_t * e);
-
-
-
-
-
-
-
-
-
+int search_remap_index(search_binding_id_t binding_id, int display_index);
 
 typedef enum {
     GUI_FONT_ROLE_TITLE,
@@ -353,37 +282,44 @@ typedef enum {
 } gui_font_role_t;
 
 
+typedef struct {
+    const char * label;
+    lv_event_cb_t cb;
+    bool destructive;
+} menu_popup_row_t;
+
+lv_obj_t * build_menu_popup(const menu_popup_row_t * rows, int row_count, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
 
 
+lv_obj_t * add_section_header(lv_obj_t * parent, const char * text);
+void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled);
+void set_play_button_state(bool is_playing);
+void arm_next_track_for_audio(int index);
 
-
-
-
-
-
+/* ---- Shared GUI and Screen Builders Helpers ---- */
+extern lv_style_t style_accent;
+void generic_back_cb(lv_event_t * e);
 lv_obj_t * add_pill_chevron_row(lv_obj_t * list, const char * text, lv_event_cb_t cb);
 lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);
 lv_obj_t * add_pill_row_base(lv_obj_t * list, const char * text);
 const lv_font_t * gui_theme_font(gui_font_role_t role);
 void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon);
 
-
+/* ---- Busy Indicator & Notifications ---- */
 typedef uint32_t gui_busy_handle_t;
 void show_error_toast(const char * msg);
+void show_info_toast(const char * msg);
 gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
 void gui_busy_hide(gui_busy_handle_t handle);
 void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
 
-
-/* Accent palette -- defined in gui.c, used by gui_settings.c */
+/* ---- Accent Palette ---- */
 extern const uint32_t accent_palette[];
 extern lv_obj_t * accent_swatches[];
-#define ACCENT_PALETTE_COUNT 24  /* number of entries in accent_palette[] */
+#define ACCENT_PALETTE_COUNT 24
 
-/* Settings-related widget vars defined in gui.c */
+/* ---- Settings & UI Callbacks ---- */
 extern lv_obj_t * settings_crossfade_toggle_img;
-
-/* Callbacks defined in gui.c, referenced by gui_settings.c */
 void accent_swatch_event_cb(lv_event_t * e);
 void crossfade_switch_event_cb(lv_event_t * e);
 void car_mode_switch_event_cb(lv_event_t * e);
@@ -404,10 +340,22 @@ void update_music_database_row_cb(lv_event_t * e);
 void firmware_update_row_cb(lv_event_t * e);
 void bt_dac_settings_row_cb(lv_event_t * e);
 void register_swipe_dead_zone(lv_obj_t * obj);
-
 void refresh_clock_label(void);
 
-#endif /* GUI_H */
 
-#define COVER_ART_WIDTH 480
-#define COVER_ART_HEIGHT 480
+#define BT_MAX_RESULTS 32
+extern bool bt_is_powered_cached;
+extern char bt_connected_mac_cached[18];
+extern char bt_connected_codec_cached[32];
+extern gui_busy_handle_t import_web_stop_token;
+extern int playlist_index;
+void quick_drawer_wifi_event_cb(lv_event_t * e);
+void quick_drawer_bt_event_cb(lv_event_t * e);
+
+/* ---- Network Declarations ---- */
+extern gui_busy_handle_t wifi_connect_token;
+extern gui_busy_handle_t wifi_connect_saved_token;
+void populate_wifi_screen(bool enabled);
+void show_bt_connect_popup(const char * name, const char * mac);
+
+#endif /* GUI_H */

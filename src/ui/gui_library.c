@@ -1051,7 +1051,7 @@ typedef struct {
 static album_thumbnail_cache_entry_t album_thumbnail_cache[ALBUM_THUMBNAIL_CACHE_SIZE];
 static uint32_t album_thumbnail_use_counter;
 static pthread_t album_thumbnail_thread;
-static bool album_thumbnail_active;
+bool album_thumbnail_active = false;
 static atomic_bool album_thumbnail_done;
 static int64_t album_thumbnail_result_song_id;
 static int album_thumbnail_result_generation;
@@ -2880,7 +2880,7 @@ void on_cue_file_selected(const char * cue_path) {
  * playlists_screen()/populate_playlists_screen() comment for why it
  * doesn't need rebuilding here. */
 static pthread_t library_rescan_thread;
-static bool library_rescan_active = false;
+bool library_rescan_active = false;
 static atomic_bool library_rescan_done_flag = false;
 
 static void * library_rescan_thread_func(void * arg) {
@@ -3035,7 +3035,7 @@ static void reload_library_on_sd_reinsert(void) {
  * finishes, before falling back to Home -- purely so the user gets a
  * moment to actually read it, not a wait for anything real. */
 #define LIBRARY_RESCAN_SUCCESS_MS 1500
-static bool library_rescan_success_pending = false;
+bool library_rescan_success_pending = false;
 static uint32_t library_rescan_success_since_tick = 0;
 void poll_library_rescan(void) {
     /* Cache-only SD reinsertion also starts a generation pass, but has no
@@ -3975,4 +3975,8 @@ void gui_library_init(void) {
 
     build_sd_mount_failed_popup();
     build_sd_format_confirm_popup();
+}
+
+void gui_library_resume_fast_timers(void) {
+    if (az_index_drag_timer) lv_timer_resume(az_index_drag_timer);
 }

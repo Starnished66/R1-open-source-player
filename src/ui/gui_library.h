@@ -89,3 +89,9 @@ void start_power_off_countdown(void);
 void poll_power_off_countdown(void);
 void build_power_off_countdown_popup(void);
 void poll_sd_card_hotplug(void);
+
+extern bool library_rescan_active;
+extern bool library_rescan_success_pending;
+extern bool album_thumbnail_active;
+
+void gui_library_resume_fast_timers(void);

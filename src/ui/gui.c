@@ -16141,7 +16141,12 @@ static void start_wifi_connect(const char * ssid, const char * password) {
 
     wifi_connect_token = gui_busy_show("Connecting to", ssid);
 
-    pthread_create(&wifi_connect_thread, NULL, wifi_connect_thread_func, req);
+        if (pthread_create(&wifi_connect_thread, NULL, wifi_connect_thread_func, req) != 0) {
+        wifi_connect_active = false;
+        free(req);
+        gui_busy_hide(wifi_connect_token);
+        show_error_toast("Thread launch failed");
+    }
 }
 
 static void poll_wifi_connect(void) {
@@ -16199,7 +16204,12 @@ static void start_wifi_connect_saved(int id, const char * ssid) {
 
     wifi_connect_token = gui_busy_show("Connecting to", ssid);
 
-    pthread_create(&wifi_connect_saved_thread, NULL, wifi_connect_saved_thread_func, req);
+        if (pthread_create(&wifi_connect_saved_thread, NULL, wifi_connect_saved_thread_func, req) != 0) {
+        wifi_connect_saved_active = false;
+        free(req);
+        gui_busy_hide(wifi_connect_saved_token);
+        show_error_toast("Thread launch failed");
+    }
 }
 
 static void poll_wifi_connect_saved(void) {
@@ -16228,7 +16238,10 @@ static void * wifi_disconnect_thread_func(void * arg) {
 static void start_wifi_disconnect(void) {
     wifi_disconnect_done_flag = false;
     wifi_disconnect_active = true;
-    pthread_create(&wifi_disconnect_thread, NULL, wifi_disconnect_thread_func, NULL);
+        if (pthread_create(&wifi_disconnect_thread, NULL, wifi_disconnect_thread_func, NULL) != 0) {
+        wifi_disconnect_active = false;
+        show_error_toast("Thread launch failed");
+    }
 }
 
 static void poll_wifi_disconnect(void) {
@@ -16298,7 +16311,9 @@ static void start_wifi_scan(void) {
     wifi_scan_done_flag = false;
     wifi_scan_active = true;
 
-    pthread_create(&wifi_scan_thread, NULL, wifi_scan_thread_func, NULL);
+        if (pthread_create(&wifi_scan_thread, NULL, wifi_scan_thread_func, NULL) != 0) {
+        wifi_scan_active = false;
+    }
 }
 
 static void poll_wifi_scan(void) {
@@ -16330,7 +16345,10 @@ static void start_wifi_forget(int id) {
     req->id = id;
     wifi_forget_done_flag = false;
     wifi_forget_active = true;
-    pthread_create(&wifi_forget_thread, NULL, wifi_forget_thread_func, req);
+        if (pthread_create(&wifi_forget_thread, NULL, wifi_forget_thread_func, req) != 0) {
+        wifi_forget_active = false;
+        free(req);
+    }
 }
 
 static void poll_wifi_forget(void) {

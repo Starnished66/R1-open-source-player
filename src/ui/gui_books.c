@@ -166,6 +166,13 @@ static void rescan_books(void) {
     free(paths);
 }
 
+static void free_user_data_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) == LV_EVENT_DELETE) {
+        void * data = lv_event_get_user_data(e);
+        free(data);
+    }
+}
+
 static void populate_books_files_screen(void) {
     lv_obj_clean(books_files_list);
     lv_label_set_text(books_files_title_label, books_showing_favorites ? "Favorites" : "Books");
@@ -218,6 +225,7 @@ static void populate_books_files_screen(void) {
          * to its row. */
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, books_file_row_cb, LV_EVENT_CLICKED, paths[i]);
+        lv_obj_add_event_cb(row, free_user_data_event_cb, LV_EVENT_DELETE, paths[i]);
     }
     free(paths);
 }

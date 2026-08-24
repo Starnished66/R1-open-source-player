@@ -11,10 +11,6 @@
  * builders) runs. Only for fixed English UI chrome that never shows
  * metadata-derived text -- see fallback_font.h's app_font_16/22/28 for
  * the other category. */
-extern const lv_font_t * ui_size_16;
-extern const lv_font_t * ui_size_20;
-extern const lv_font_t * ui_size_22;
-extern const lv_font_t * ui_size_28;
 
 /* Two screen layouts repeat across the real stock UI: an icon grid (Home
  * launcher, Music/Wireless/Stream Media submenus) and a scrollable list of

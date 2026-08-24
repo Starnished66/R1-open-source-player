@@ -39,12 +39,12 @@ lv_obj_t * settings_power_screen;
 lv_obj_t * settings_system_screen;
 lv_obj_t * about_screen;
 lv_obj_t * accent_color_screen;
-lv_obj_t * screen_timeout_screen;
-lv_obj_t * startup_volume_screen;
-lv_obj_t * sleep_timer_screen;
-lv_obj_t * idle_shutdown_screen;
+static lv_obj_t * screen_timeout_screen;
+static lv_obj_t * startup_volume_screen;
+static lv_obj_t * sleep_timer_screen;
+static lv_obj_t * idle_shutdown_screen;
 lv_obj_t * eq_screen;
-lv_obj_t * eq_profiles_screen;
+static lv_obj_t * eq_profiles_screen;
 
 /* Externs to gui.c functions and state this module needs */
 extern lv_obj_t * music_screen;

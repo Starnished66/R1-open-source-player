@@ -19,10 +19,6 @@ extern lv_style_t style_muted_text;
 extern const uint32_t accent_palette[ACCENT_PALETTE_COUNT];
 extern lv_obj_t * accent_swatches[ACCENT_PALETTE_COUNT];
 
-extern const lv_font_t * ui_size_16;
-extern const lv_font_t * ui_size_20;
-extern const lv_font_t * ui_size_22;
-extern const lv_font_t * ui_size_28;
 
 void gui_theme_init(void);
 const lv_font_t * gui_theme_font(gui_font_role_t role);

@@ -42,3 +42,6 @@ void gui_shell_update_topbar(bool screen_just_woke);
 bool point_in_swipe_dead_zone(lv_point_t p);
 bool active_press_is_over_drag_adjust_widget(void);
 void gui_shell_resume_fast_timers(void);
+
+bool gui_shell_has_background_work(void);
+void gui_shell_cancel_background_work(void);

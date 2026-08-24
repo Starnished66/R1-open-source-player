@@ -8,10 +8,10 @@
 lv_style_t style_accent;
 lv_style_t style_muted_text;
 
-const lv_font_t * ui_size_16 = &lv_font_montserrat_16;
-const lv_font_t * ui_size_20 = &lv_font_montserrat_20;
-const lv_font_t * ui_size_22 = &lv_font_montserrat_22;
-const lv_font_t * ui_size_28 = &lv_font_montserrat_28;
+static const lv_font_t * ui_size_16 = &lv_font_montserrat_16;
+static const lv_font_t * ui_size_20 = &lv_font_montserrat_20;
+static const lv_font_t * ui_size_22 = &lv_font_montserrat_22;
+static const lv_font_t * ui_size_28 = &lv_font_montserrat_28;
 
 const uint32_t accent_palette[ACCENT_PALETTE_COUNT] = {
     0x2196F3, /* blue (default) */

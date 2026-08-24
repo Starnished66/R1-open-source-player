@@ -2461,6 +2461,7 @@ static void * bt_apply_output_settings_thread_func(void * arg) {
 void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled) {
     if (bt_apply_output_settings_active) return;
     bt_apply_output_settings_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
     req->dac_mode_enabled = dac_mode_enabled;
     req->volume_sync_enabled = volume_sync_enabled;
     atomic_store_explicit(&bt_apply_output_settings_done_flag, false, memory_order_relaxed);
@@ -2861,4 +2862,13 @@ void gui_shell_update_topbar(bool screen_just_woke) {
 
 void gui_shell_resume_fast_timers(void) {
     if (quick_drawer_drag_timer) lv_timer_resume(quick_drawer_drag_timer);
+}
+
+bool gui_shell_has_background_work(void) {
+    return bt_toggle_active || bt_dac_startup_reapply_active || bt_apply_output_settings_active ||
+           refresh_bt_icon_active || wifi_toggle_active;
+}
+
+void gui_shell_cancel_background_work(void) {
+    /* Joinable shell workers complete and are joined on next tick */
 }

@@ -1,5 +1,6 @@
 #include "settings.h"
 #include "debug_log.h"
+player_settings_t current_settings;
 #include "subprocess.h"
 #include "subsonic_saved_servers.h"
 

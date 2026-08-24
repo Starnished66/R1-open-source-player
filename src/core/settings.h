@@ -394,4 +394,6 @@ void settings_subsonic_server_upsert(player_settings_t * settings, const char * 
  * rather than trying to hot-swap itself. */
 void settings_factory_reset(void);
 
+
+extern player_settings_t current_settings;
 #endif /* SETTINGS_H */

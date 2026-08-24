@@ -246,7 +246,7 @@ static lv_obj_t * build_title(lv_obj_t * scr, const char * title) {
      * status bar (matches the back button's own 64px height). */
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, BUILD_TITLE_LEFT_INSET, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(label, ui_size_28, 0);
+    lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     row_label_enable_marquee(label);
     return label;
 }
@@ -442,7 +442,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
          * font and so never fell back to that default. montserrat_20
          * matches the top bar's own text size rather than inventing a new
          * in-between size. */
-        lv_obj_set_style_text_font(label, ui_size_20, 0);
+        lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
         if (item->has_text_color) lv_obj_set_style_text_color(label, lv_color_hex(item->text_color), 0);
         /* Real-device bug report: a caption longer than a tile's own width
          * ("Remote Control", "Import via Wi-Fi") had no width/wrap set at
@@ -479,7 +479,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
              * comfortably clears every icon's glyph regardless of its
              * exact bottom edge). */
             int32_t label_cy = top_offset + (int32_t) (((int64_t) target_icon_h * 83) / 100);
-            lv_obj_align(label, LV_ALIGN_TOP_MID, 0, label_cy - lv_font_get_line_height(ui_size_20) / 2);
+            lv_obj_align(label, LV_ALIGN_TOP_MID, 0, label_cy - lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_BODY)) / 2);
         } else {
             /* Real bug caught in review: the label above is LV_LABEL_LONG_
              * WRAP (genuinely multi-line capable, see its own comment), but
@@ -492,7 +492,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
              * to however much text it holds) means a 3rd line clips
              * instead of pushing the overlap even further -- two lines
              * comfortably covers every real label this screen shows. */
-            int32_t line_h = lv_font_get_line_height(ui_size_20);
+            int32_t line_h = lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_BODY));
             int32_t label_h = line_h * 2;
             lv_obj_set_height(label, label_h);
             int32_t content_h = target_icon_h + ICON_GRID_ICON_LABEL_GAP + label_h;
@@ -673,7 +673,7 @@ void pill_row_apply_icon(lv_obj_t * row, lv_obj_t * label, const char * icon_pat
 }
 
 const lv_font_t * pill_row_resolve_text_size(const char * text_size) {
-    if (!text_size) return ui_size_20;
+    if (!text_size) return gui_theme_font(GUI_FONT_ROLE_BODY);
     if (strcmp(text_size, "small") == 0) return &app_font_16;
     if (strcmp(text_size, "medium") == 0) return &app_font_22;
     if (strcmp(text_size, "large") == 0) return &app_font_28;
@@ -681,7 +681,7 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size) {
      * see that flag's own comment. Plugin rows only (plugin.set_home_layout()'s
      * text_size = "mono", PLUGINS.md). */
     if (strcmp(text_size, "mono") == 0) return &lv_font_unscii_16;
-    return ui_size_20;
+    return gui_theme_font(GUI_FONT_ROLE_BODY);
 }
 
 int32_t pill_row_default_width(void) {
@@ -790,7 +790,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_obj_add_style(label, &style_theme_text_primary, 0);
         /* Bumped from montserrat_16 -- see the matching comment on the icon
          * grid's own label above. text_size NULL (every native row) ->
-         * ui_size_20, unchanged from before this field existed -- see
+         * gui_theme_font(GUI_FONT_ROLE_BODY), unchanged from before this field existed -- see
          * pill_row_resolve_text_size()'s own comment. */
         lv_obj_set_style_text_font(label, pill_row_resolve_text_size(item->text_size), 0);
         if (item->has_text_color) lv_obj_set_style_text_color(label, lv_color_hex(item->text_color), 0);
@@ -852,7 +852,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                 lv_obj_t * chevron = lv_label_create(row);
                 lv_label_set_text(chevron, ">");
                 lv_obj_add_style(chevron, &style_theme_text_muted, 0);
-                lv_obj_set_style_text_font(chevron, ui_size_20, 0);
+                lv_obj_set_style_text_font(chevron, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
                 lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, -20, 0);
             }
 

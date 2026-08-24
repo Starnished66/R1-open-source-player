@@ -27,24 +27,24 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 
 /* Screens owned by this module */
 lv_obj_t * wifi_screen;
-lv_obj_t * wifi_info_screen;
-lv_obj_t * wifi_dns_screen;
+static lv_obj_t * wifi_info_screen;
+static lv_obj_t * wifi_dns_screen;
 lv_obj_t * bt_screen;
-lv_obj_t * bt_dac_screen;
+static lv_obj_t * bt_dac_screen;
 lv_obj_t * bt_dac_overlay_screen;
-lv_obj_t * bt_codec_screen;
-lv_obj_t * usb_mode_screen;
+static lv_obj_t * bt_codec_screen;
+static lv_obj_t * usb_mode_screen;
 lv_obj_t * usb_dac_overlay_screen;
-lv_obj_t * import_wifi_screen;
-lv_obj_t * airplay_screen;
-lv_obj_t * dlna_screen;
-lv_obj_t * remote_control_screen;
+static lv_obj_t * import_wifi_screen;
+static lv_obj_t * airplay_screen;
+static lv_obj_t * dlna_screen;
+static lv_obj_t * remote_control_screen;
 lv_obj_t * wireless_screen;
-lv_obj_t * resume_mode_screen;
-lv_obj_t * resume_mode_list;
-lv_obj_t * play_pause_button_mode_screen;
-lv_obj_t * font_size_screen;
-lv_obj_t * replaygain_mode_screen;
+static lv_obj_t * resume_mode_screen;
+static lv_obj_t * resume_mode_list;
+static lv_obj_t * play_pause_button_mode_screen;
+static lv_obj_t * font_size_screen;
+static lv_obj_t * replaygain_mode_screen;
 
 /* Externs to gui.c state and functions */
 extern player_settings_t current_settings;
@@ -63,7 +63,7 @@ extern lv_obj_t * add_pill_row_base(lv_obj_t * list, const char * text);
 extern const lv_font_t * gui_theme_font(gui_font_role_t role);
 extern void generic_back_cb(lv_event_t * e);
 extern void finalize_screen_navigation(lv_obj_t * screen);
-extern gui_busy_handle_t wifi_connect_saved_token;
+static gui_busy_handle_t wifi_connect_saved_token = 0;
 extern gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
 extern void gui_busy_hide(gui_busy_handle_t handle);
 
@@ -74,7 +74,7 @@ extern void gui_busy_hide(gui_busy_handle_t handle);
 #endif
 
 
-extern gui_busy_handle_t wifi_connect_token;
+static gui_busy_handle_t wifi_connect_token = 0;
 extern bt_device_t bt_scan_results[];
 extern int bt_scan_result_count;
 
@@ -138,6 +138,7 @@ static void * wifi_connect_thread_func(void * arg) {
 
 static void start_wifi_connect(const char * ssid, const char * password) {
     wifi_connect_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
     snprintf(req->ssid, sizeof(req->ssid), "%s", ssid);
     snprintf(req->password, sizeof(req->password), "%s", password ? password : "");
 
@@ -202,12 +203,13 @@ static void * wifi_connect_saved_thread_func(void * arg) {
 
 static void start_wifi_connect_saved(int id, const char * ssid) {
     wifi_connect_saved_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
     req->id = id;
 
     atomic_store_explicit(&wifi_connect_saved_done_flag, false, memory_order_relaxed);
     wifi_connect_saved_active = true;
 
-    wifi_connect_token = gui_busy_show("Connecting to", ssid);
+    wifi_connect_saved_token = gui_busy_show("Connecting to", ssid);
 
         if (pthread_create(&wifi_connect_saved_thread, NULL, wifi_connect_saved_thread_func, req) != 0) {
         wifi_connect_saved_active = false;
@@ -222,7 +224,7 @@ void poll_wifi_connect_saved(void) {
 
     wifi_connect_saved_active = false;
     pthread_join(wifi_connect_saved_thread, NULL);
-    gui_busy_hide(wifi_connect_token);
+    gui_busy_hide(wifi_connect_saved_token);
     if (!wifi_connect_saved_succeeded) {
         show_error_toast("Couldn't connect to Wi-Fi network");
     }
@@ -347,6 +349,7 @@ static void * wifi_forget_thread_func(void * arg) {
 
 static void start_wifi_forget(int id) {
     wifi_forget_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
     req->id = id;
     atomic_store_explicit(&wifi_forget_done_flag, false, memory_order_relaxed);
     wifi_forget_active = true;
@@ -746,6 +749,7 @@ static void start_bt_connect(const char * mac) {
     if (bt_connect_active) return; /* one at a time -- bt_connect_thread/succeeded are single shared slots */
 
     bt_connect_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
     snprintf(req->mac, sizeof(req->mac), "%s", mac);
 
     atomic_store_explicit(&bt_connect_done_flag, false, memory_order_relaxed);
@@ -796,6 +800,7 @@ static void * bt_forget_thread_func(void * arg) {
 
 static void start_bt_forget(const char * mac) {
     bt_forget_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
     snprintf(req->mac, sizeof(req->mac), "%s", mac);
     bt_forget_pending_req = req;
 
@@ -2753,4 +2758,14 @@ void gui_network_init(void) {
     build_wifi_action_popup();
     build_usb_dac_leave_popup();
     build_bt_dac_leave_popup();
+}
+
+bool gui_network_has_background_work(void) {
+    return wifi_connect_active || wifi_connect_saved_active || wifi_disconnect_active ||
+           wifi_scan_active || wifi_forget_active || bt_connect_active || bt_forget_active ||
+           bt_scan_active || usb_mode_switch_active || import_web_stop_active;
+}
+
+void gui_network_cancel_background_work(void) {
+    /* Joinable network workers complete and are joined on next tick */
 }

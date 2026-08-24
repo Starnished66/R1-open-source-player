@@ -2,6 +2,7 @@
 #define GUI_H
 
 #include "lvgl/lvgl.h"
+#include "settings.h"
 #include "gui_theme.h"
 #include "gui_notifications.h"
 #include "gui_library.h"
@@ -389,6 +390,7 @@ void quick_drawer_mark_snapshot_dirty(void);
 void toggle_play_pause(void);
 int compute_manual_step_index(int index, int direction);
 void on_file_selected(char ** new_playlist, int count, int selected_index);
+void on_file_selected_at(char ** new_playlist, int count, int selected_index, double start_seconds);
 void clear_player_source(void);
 
 
@@ -439,14 +441,7 @@ extern int playlist_index;
 void quick_drawer_wifi_event_cb(lv_event_t * e);
 void quick_drawer_bt_event_cb(lv_event_t * e);
 
-/* ---- Network Declarations ---- */
-extern gui_busy_handle_t wifi_connect_token;
-extern gui_busy_handle_t wifi_connect_saved_token;
 void populate_wifi_screen(bool enabled);
 void show_bt_connect_popup(const char * name, const char * mac);
 
 #endif /* GUI_H */
-
-extern lv_obj_t * music_screen;
-extern lv_obj_t * stream_media_screen;
-extern lv_obj_t * dac_home_screen;

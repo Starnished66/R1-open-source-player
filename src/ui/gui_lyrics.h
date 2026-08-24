@@ -15,3 +15,6 @@ void gui_lyrics_open_screen(void);
 void lyrics_font_size_settings_row_cb(lv_event_t * e);
 
 #endif
+
+bool gui_lyrics_has_background_work(void);
+void gui_lyrics_cancel_background_work(void);

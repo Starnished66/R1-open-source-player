@@ -26,3 +26,6 @@ void poll_subsonic_download(void);
 void poll_subsonic_library_download(void);
 void poll_subsonic_connect(void);
 void poll_subsonic_browse(void);
+
+bool gui_subsonic_has_background_work(void);
+void gui_subsonic_cancel_background_work(void);

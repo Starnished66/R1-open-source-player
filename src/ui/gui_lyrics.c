@@ -242,6 +242,7 @@ static void launch_lyrics_load(int for_index, const char * track_path) {
 
     lyrics_load_request_t * req = malloc(sizeof(*req));
     if (!req) return;
+    if (!req) return;
     req->generation = lyrics_load_generation;
     req->for_index = for_index;
     snprintf(req->track_path, sizeof(req->track_path), "%s", track_path);
@@ -415,6 +416,7 @@ static void launch_lyrics_backdrop_decode(void) {
         return;
     }
     lyrics_backdrop_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
     if (!req) return;
     req->cover_copy = malloc((size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
     if (!req->cover_copy) { free(req); return; }
@@ -931,4 +933,12 @@ void gui_lyrics_load_track(int index, const char * path) {
 
 void gui_lyrics_open_screen(void) {
     open_lyrics_screen();
+}
+
+bool gui_lyrics_has_background_work(void) {
+    return lyrics_load_active || lyrics_backdrop_active;
+}
+
+void gui_lyrics_cancel_background_work(void) {
+    /* Joinable lyrics workers complete and are joined on next tick */
 }

@@ -156,6 +156,7 @@ static void start_subsonic_download(const char * url, bool verify_tls, const cha
     snprintf(download_dest_path, sizeof(download_dest_path), "%s", dest_path);
 
     download_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
     snprintf(req->url, sizeof(req->url), "%s", url);
     snprintf(req->dest_path, sizeof(req->dest_path), "%s", dest_path);
     req->verify_tls = verify_tls;
@@ -242,9 +243,9 @@ bool subsonic_library_download_active = false;
 
 static atomic_bool subsonic_library_download_done_flag = false;
 
-static volatile int subsonic_library_download_progress = 0; /* songs completed so far */
+static atomic_int subsonic_library_download_progress = 0; /* songs completed so far */
 
-static volatile int subsonic_library_download_total = 0;    /* 0 while still expanding an artist's albums (Mode B) -- see poll_subsonic_library_download() */
+static atomic_int subsonic_library_download_total = 0;    /* 0 while still expanding an artist's albums (Mode B) -- see poll_subsonic_library_download() */
 
 static int subsonic_library_download_success_count = 0;
 
@@ -317,7 +318,7 @@ static void * subsonic_library_download_thread_func(void * arg) {
             }
         }
 
-        subsonic_library_download_progress = i + 1;
+        atomic_store_explicit(&subsonic_library_download_progress, i + 1, memory_order_relaxed);
     }
 
     subsonic_library_download_success_count = success_count;
@@ -331,6 +332,8 @@ static void start_subsonic_library_download(subsonic_song_t * songs, int song_co
                                               subsonic_album_t * albums_to_expand, int album_to_expand_count,
                                               const char * playlist_name, const char * progress_label) {
     subsonic_library_download_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
+    if (!req) return;
     req->server = subsonic_server_from_settings();
     req->songs = songs;
     req->song_count = song_count;
@@ -338,8 +341,8 @@ static void start_subsonic_library_download(subsonic_song_t * songs, int song_co
     req->album_to_expand_count = album_to_expand_count;
     snprintf(req->playlist_name, sizeof(req->playlist_name), "%s", playlist_name ? playlist_name : "");
 
-    subsonic_library_download_progress = 0;
-    subsonic_library_download_total = albums_to_expand ? 0 : song_count; /* 0 = "still figuring out the total," see poll_subsonic_library_download() */
+    atomic_store_explicit(&subsonic_library_download_progress, 0, memory_order_relaxed);
+    atomic_store_explicit(&subsonic_library_download_total, albums_to_expand ? 0 : song_count, memory_order_relaxed); /* 0 = "still figuring out the total," see poll_subsonic_library_download() */
     subsonic_library_download_success_count = 0;
     atomic_store_explicit(&subsonic_library_download_done_flag, false, memory_order_relaxed);
     subsonic_library_download_active = true;
@@ -359,9 +362,9 @@ void poll_subsonic_library_download(void) {
     if (!subsonic_library_download_active) return;
 
     if (!atomic_load_explicit(&subsonic_library_download_done_flag, memory_order_acquire)) {
-        int total = subsonic_library_download_total;
+        int total = atomic_load_explicit(&subsonic_library_download_total, memory_order_relaxed);
         if (total > 0) {
-            gui_busy_set_progress(subsonic_library_download_token, (subsonic_library_download_progress * 100) / total);
+            gui_busy_set_progress(subsonic_library_download_token, (atomic_load_explicit(&subsonic_library_download_progress, memory_order_relaxed) * 100) / total);
         }
         return;
     }
@@ -1019,6 +1022,7 @@ static void start_subsonic_connect(const subsonic_server_t * server) {
     subsonic_connect_pending_server = *server;
 
     subsonic_connect_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
     req->server = *server;
 
     atomic_store_explicit(&subsonic_connect_done_flag, false, memory_order_relaxed);
@@ -1254,4 +1258,12 @@ void gui_subsonic_init(void) {
                      &subsonic_artists_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
     register_search(SEARCH_BINDING_SUBSONIC_ALBUMS, subsonic_albums_screen, subsonic_albums_list, subsonic_album_label_of,
                      &subsonic_albums_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
+}
+
+bool gui_subsonic_has_background_work(void) {
+    return download_active || subsonic_library_download_active || subsonic_connect_active || subsonic_browse_active;
+}
+
+void gui_subsonic_cancel_background_work(void) {
+    /* Joinable workers complete and are joined on next tick/poll */
 }

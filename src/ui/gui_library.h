@@ -95,3 +95,6 @@ extern bool library_rescan_success_pending;
 extern bool album_thumbnail_active;
 
 void gui_library_resume_fast_timers(void);
+
+bool gui_library_has_background_work(void);
+void gui_library_cancel_background_work(void);

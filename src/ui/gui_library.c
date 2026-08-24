@@ -3,7 +3,6 @@
 #include "idle_shutdown.h"
 
 extern void on_file_browser_selected(char ** new_playlist, int count, int selected_index);
-extern void on_file_selected_at(char ** new_playlist, int count, int selected_index, int start_seconds);
 extern void open_queue_screen(void);
 extern void nav_remove_stack_slot(int depth);
 extern void mount_sd_card_if_needed(void);
@@ -4226,4 +4225,13 @@ void library_load_from_cache_only(void) {
      * handle against the previous (or empty unmounted) mount. */
     metadata_db_close();
     metadata_db_open();
+}
+
+bool gui_library_has_background_work(void) {
+    return library_rescan_active || library_rescan_success_pending || album_thumbnail_active ||
+           atomic_load(&album_thumb_gen_active) || sd_format_active || search_job_active;
+}
+
+void gui_library_cancel_background_work(void) {
+    cancel_album_thumbnail_generation();
 }

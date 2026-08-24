@@ -5,15 +5,18 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>
 
 /* Covers are immediately reduced to a small UI bitmap. Never let malformed
  * or unnecessarily huge source dimensions consume most of this device's RAM
- * merely to produce that thumbnail/player image. */
-#define MAX_NATIVE_DECODE_BYTES (8U * 1024U * 1024U)
+ * merely to produce that thumbnail/player image. Sidecar folder JPEGs are
+ * often 2000–4000px; native RGB888 of those plus the compressed file will
+ * OOM the ~56 MiB target. Anything above this side length is skipped and
+ * the UI keeps the default cover. */
+#define MAX_COVER_SIDE 1200
+#define MAX_NATIVE_DECODE_BYTES ((size_t) MAX_COVER_SIDE * (size_t) MAX_COVER_SIDE * 3U)
 
 static bool rgb888_size_ok(size_t width, size_t height, size_t * out_bytes) {
-    if (width == 0 || height == 0 || width > INT_MAX || height > INT_MAX) return false;
+    if (width == 0 || height == 0 || width > MAX_COVER_SIDE || height > MAX_COVER_SIDE) return false;
     if (width > SIZE_MAX / height || width * height > SIZE_MAX / 3U) return false;
     size_t bytes = width * height * 3U;
     if (bytes > MAX_NATIVE_DECODE_BYTES) return false;
@@ -31,7 +34,7 @@ typedef struct {
     const uint8_t * data;
     uint32_t size;
     uint32_t pos;
-    uint8_t * out_buf; /* RGB888, one row per decoded (possibly tjpgd-scaled) pixel */
+    uint8_t * out_buf; /* RGB888, one row per native decoded pixel */
     int out_w;
     int out_h;
 } jpeg_ctx_t;
@@ -84,44 +87,27 @@ static bool decode_jpeg_rgb888(const uint8_t * data, uint32_t size,
 
     if (jd_prepare(&jd, jpeg_mem_read, workbuf, sizeof(workbuf), &ctx) != JDR_OK) return false;
 
-    /* tjpgd's built-in scale (0=1/1 .. 3=1/8) is used only as a memory-safety
-     * fallback for pathologically large embedded art, not for its normal
-     * purpose of shrinking the decode buffer: scale>0 output is corrupted in
-     * this vendored build (the IDCT always produces full unscaled 8x8
-     * blocks, but the RGB conversion loop is told a smaller, scale-reduced
-     * rect for interior MCUs, so it reads pixel data at the wrong stride).
-     * Always decode at native resolution and let resize_cover_fit()'s own
-     * box filter do the downscaling, except above MAX_NATIVE_DECODE_BYTES,
-     * where the native decode buffer itself would risk exhausting this
-     * device's limited RAM -- only then fall back to tjpgd's scale,
-     * accepting its known corruption as the lesser risk vs an OOM crash. */
-    uint8_t scale = 0;
-    size_t decoded_w = jd.width;
-    size_t decoded_h = jd.height;
+    /* Native decode only. tjpgd scale>0 is stride-corrupted in this vendored
+     * build (IDCT still emits full 8x8 blocks while the RGB loop is told a
+     * scaled rect). Oversized sources are skipped rather than scaled. */
     size_t native_bytes = 0;
-    while (scale < 3 && !rgb888_size_ok(decoded_w, decoded_h, &native_bytes)) {
-        scale++;
-        decoded_w = jd.width >> scale;
-        decoded_h = jd.height >> scale;
-    }
-
-    if (!rgb888_size_ok(decoded_w, decoded_h, &native_bytes)) return false;
+    if (!rgb888_size_ok(jd.width, jd.height, &native_bytes)) return false;
 
     uint8_t * buf = calloc(1, native_bytes);
     if (!buf) return false;
 
     ctx.out_buf = buf;
-    ctx.out_w = (int) decoded_w;
-    ctx.out_h = (int) decoded_h;
+    ctx.out_w = (int) jd.width;
+    ctx.out_h = (int) jd.height;
 
-    if (jd_decomp(&jd, jpeg_mem_output, scale) != JDR_OK) {
+    if (jd_decomp(&jd, jpeg_mem_output, 0) != JDR_OK) {
         free(buf);
         return false;
     }
 
     *out_buf = buf;
-    *out_w = (int) decoded_w;
-    *out_h = (int) decoded_h;
+    *out_w = (int) jd.width;
+    *out_h = (int) jd.height;
     return true;
 }
 

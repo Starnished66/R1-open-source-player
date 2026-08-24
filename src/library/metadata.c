@@ -44,6 +44,24 @@ static bool safe_chunk_advance(long chunk_start, uint64_t size, long pad, long *
     return true;
 }
 
+/* Same compressed-byte cap as m4a_read_cover_art() / gui.c's sidecar load.
+ * Decode also rejects sources above 1200x1200; this stops the malloc of a
+ * 10 MiB APIC before that decoder runs. Also used as a hard cap on ID3
+ * tag bodies, USLT/lyrics payloads, and base64 METADATA_BLOCK_PICTURE
+ * decodes so a lying size field cannot malloc tens of MiB in-process. */
+#define METADATA_BLOB_MAX_BYTES (4U * 1024U * 1024U)
+#define EMBEDDED_COVER_MAX_BYTES METADATA_BLOB_MAX_BYTES
+
+static bool store_picture_bytes(track_metadata_t * out, const uint8_t * src, uint32_t n) {
+    if (!out || out->picture_data != NULL || !src || n == 0 || n > EMBEDDED_COVER_MAX_BYTES) return false;
+    uint8_t * copy = malloc(n);
+    if (!copy) return false;
+    memcpy(copy, src, n);
+    out->picture_data = copy;
+    out->picture_size = n;
+    return true;
+}
+
 static void copy_bounded(char * dst, size_t dst_size, const char * src, size_t src_len) {
     if (src_len >= dst_size) src_len = dst_size - 1;
     memcpy(dst, src, src_len);
@@ -178,6 +196,7 @@ static void apply_vorbis_comment_field(track_metadata_t * out, const char * comm
          * first-wins precedent as picture_data. May or may not contain
          * [mm:ss.xx] LRC timestamps -- see track_metadata_t's own lyrics
          * field comment. */
+        if (value_len > METADATA_BLOB_MAX_BYTES) return;
         char * lyrics = malloc(value_len + 1);
         if (lyrics) {
             memcpy(lyrics, value, value_len);
@@ -225,11 +244,7 @@ static void parse_flac_picture_block(const uint8_t * data, size_t size, track_me
     pos += 4;
     if (pic_data_len == 0 || pos + pic_data_len > size) return;
 
-    uint8_t * copy = malloc(pic_data_len);
-    if (!copy) return;
-    memcpy(copy, data + pos, pic_data_len);
-    out->picture_data = copy;
-    out->picture_size = pic_data_len;
+    store_picture_bytes(out, data + pos, pic_data_len);
 }
 
 /* ---- FLAC: VORBIS_COMMENT block ---- */
@@ -241,12 +256,9 @@ static void flac_meta_cb(void * user_data, drflac_metadata * meta) {
         /* dr_flac frees its own copy of pPictureData right after this
          * callback returns, so it has to be copied here, not just
          * pointed to. */
-        if (out->picture_data == NULL && meta->data.picture.pictureDataSize > 0) {
-            out->picture_data = malloc(meta->data.picture.pictureDataSize);
-            if (out->picture_data) {
-                memcpy(out->picture_data, meta->data.picture.pPictureData, meta->data.picture.pictureDataSize);
-                out->picture_size = meta->data.picture.pictureDataSize;
-            }
+        if (out->picture_data == NULL && meta->data.picture.pictureDataSize > 0 &&
+            meta->data.picture.pPictureData != NULL) {
+            store_picture_bytes(out, meta->data.picture.pPictureData, meta->data.picture.pictureDataSize);
         }
         return;
     }
@@ -410,11 +422,7 @@ static void decode_id3v2_apic_frame(const uint8_t * data, uint32_t size, track_m
     uint32_t picture_size = size - pos;
     if (picture_size == 0) return;
 
-    out->picture_data = malloc(picture_size);
-    if (out->picture_data) {
-        memcpy(out->picture_data, data + pos, picture_size);
-        out->picture_size = picture_size;
-    }
+    store_picture_bytes(out, data + pos, picture_size);
 }
 
 /* TXXX frame body: 1 byte text encoding, a description string terminated
@@ -483,11 +491,7 @@ static void decode_id3v2_pic_frame(const uint8_t * data, uint32_t size, track_me
     uint32_t picture_size = size - pos;
     if (picture_size == 0) return;
 
-    out->picture_data = malloc(picture_size);
-    if (out->picture_data) {
-        memcpy(out->picture_data, data + pos, picture_size);
-        out->picture_size = picture_size;
-    }
+    store_picture_bytes(out, data + pos, picture_size);
 }
 
 /* USLT (Unsynchronised lyrics/text transcription) frame body: 1 byte text
@@ -512,7 +516,7 @@ static void decode_id3v2_uslt_frame(const uint8_t * data, uint32_t size, track_m
     if (text_start == 0 || text_start > size) return; /* malformed -- no terminator found */
 
     uint32_t text_len = size - text_start;
-    if (text_len == 0) return;
+    if (text_len == 0 || text_len > METADATA_BLOB_MAX_BYTES) return;
 
     /* decode_id3v2_text_frame() expects data[0] to be the encoding byte, so
      * re-prefix the text into a malloc'd buffer the same way decode_id3v2_
@@ -545,6 +549,7 @@ static bool read_id3v2(FILE * f, track_metadata_t * out) {
     uint8_t major_version = header[3];
     uint8_t flags = header[5];
     uint32_t tag_size = read_be32(&header[6], true); /* overall tag size is always synchsafe */
+    if (tag_size == 0 || tag_size > METADATA_BLOB_MAX_BYTES) return false;
 
     uint8_t * tag_data = malloc(tag_size);
     if (!tag_data) return false;
@@ -963,7 +968,7 @@ static void m4a_read_cover_art(FILE * f, m4a_box_t item, track_metadata_t * out)
     if (!m4a_find_data_payload(f, item, &payload_offset, &payload_size) || payload_size == 0) return;
     /* Audiobook/M4B covers are often multi-megabyte JPEGs. Unbounded
      * malloc here races the decoder's own RAM on the 56 MiB target. */
-    if (payload_size > 4U * 1024U * 1024U) return;
+    if (payload_size > EMBEDDED_COVER_MAX_BYTES) return;
 
     uint8_t * data = malloc(payload_size);
     if (!data) return;
@@ -987,6 +992,7 @@ static void m4a_read_lyrics_tag(FILE * f, m4a_box_t item, track_metadata_t * out
     long payload_offset;
     uint32_t payload_size;
     if (!m4a_find_data_payload(f, item, &payload_offset, &payload_size) || payload_size == 0) return;
+    if (payload_size > METADATA_BLOB_MAX_BYTES) return;
 
     char * data = malloc((size_t) payload_size + 1);
     if (!data) return;
@@ -1083,7 +1089,8 @@ static void read_opus_metadata(const char * path, track_metadata_t * out) {
 
             size_t decoded_len = 0;
             int size_err = mbedtls_base64_decode(NULL, 0, &decoded_len, (const unsigned char *) b64, b64_len);
-            if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) && decoded_len > 0) {
+            if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) && decoded_len > 0 &&
+                decoded_len <= METADATA_BLOB_MAX_BYTES) {
                 uint8_t * decoded = malloc(decoded_len);
                 if (decoded) {
                     size_t actual_len = 0;
@@ -1136,7 +1143,8 @@ static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out) 
 
             size_t decoded_len = 0;
             int size_err = mbedtls_base64_decode(NULL, 0, &decoded_len, (const unsigned char *) b64, b64_len);
-            if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) && decoded_len > 0) {
+            if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) && decoded_len > 0 &&
+                decoded_len <= METADATA_BLOB_MAX_BYTES) {
                 uint8_t * decoded = malloc(decoded_len);
                 if (decoded) {
                     size_t actual_len = 0;

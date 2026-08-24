@@ -143,6 +143,41 @@ int main(void) {
     if (metadata_db_get_song_title_offset("/music/a.flac") < 0) fail("compact title offset");
     unsetenv("TAGCACHE_FORCE_COMPACT");
 
+    /* Untitled tracks store tag_length == 1. Compact mmap load used to
+     * treat that as fatal and present an empty library. */
+    {
+        cached_tags_t untitled = { 0 };
+        snprintf(untitled.artist, sizeof(untitled.artist), "%s", "Unknown Artist");
+        snprintf(untitled.album, sizeof(untitled.album), "%s", "Unknown Album");
+        snprintf(untitled.album_artist, sizeof(untitled.album_artist), "%s", "Unknown Artist");
+        snprintf(untitled.genre, sizeof(untitled.genre), "%s", "Unknown Genre");
+        metadata_db_begin_update();
+        if (!metadata_db_get("/music/a.flac", 100, 1000, &cached)) fail("keep a for empty-title scan");
+        if (!metadata_db_get("/music/b.flac", 100, 1000, &cached)) fail("keep b for empty-title scan");
+        if (!metadata_db_get("/music/unscanned.flac", 100, 1000, &cached)) fail("keep unscanned for empty-title scan");
+        metadata_db_put("/music/untitled.flac", 100, 1000, &untitled);
+        if (!metadata_db_end_update()) fail("empty-title commit");
+        if (metadata_db_get_song_count() != 4) fail("empty-title interned count");
+        setenv("TAGCACHE_FORCE_COMPACT", "1", 1);
+        metadata_db_close();
+        metadata_db_open();
+        if (metadata_db_get_song_count() != 4) fail("compact empty-title count");
+        if (!metadata_db_get_song_by_path("/music/untitled.flac", &by_path)) fail("compact empty-title path");
+        if (by_path.tags.title[0] != '\0') fail("compact empty-title value");
+        unsetenv("TAGCACHE_FORCE_COMPACT");
+    }
+
+    /* Crash during write_all can leave database_*.tcd.gN with no tagcache.gen.
+     * Boot must recover the highest complete generation instead of opening empty. */
+    {
+        if (unlink(".open_hiby_player/tagcache.gen") != 0) fail("unlink gen pointer");
+        metadata_db_close();
+        metadata_db_open();
+        if (metadata_db_get_song_count() != 4) fail("recovered count without gen pointer");
+        if (!metadata_db_get_song_by_path("/music/a.flac", &by_path)) fail("recovered path");
+        if (stat(".open_hiby_player/tagcache.gen", &st) != 0) fail("repaired gen pointer");
+    }
+
     {
         char * pl_a = "/tmp/ohp_tagcache_test/Playlists/a.m3u";
         char * pl_b = "/tmp/ohp_tagcache_test/Playlists/b.m3u";

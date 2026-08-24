@@ -344,9 +344,14 @@ static const char * mapped_string(const char * map, size_t len, int32_t seek) {
     if ((size_t) seek + sizeof(struct tagfile_entry) > len) return NULL;
     struct tagfile_entry te;
     memcpy(&te, map + (size_t) seek, sizeof(te));
-    if (te.tag_length <= 1) return NULL;
+    /* tag_length includes the trailing NUL. 1 is a valid empty title. */
+    if (te.tag_length <= 0) return NULL;
     if ((size_t) seek + sizeof(te) + (size_t) te.tag_length > len) return NULL;
-    return map + (size_t) seek + sizeof(te);
+    const char * s = map + (size_t) seek + sizeof(te);
+    /* Compact loads mmap the tag file. strlen/casecmp must not run off the
+     * map if a torn write left the record without a terminator. */
+    if (!memchr(s, '\0', (size_t) te.tag_length)) return NULL;
+    return s;
 }
 
 static const char * entry_path_str(const entry_t * e) {
@@ -1192,7 +1197,7 @@ static bool load_tag_strings(int tag, int32_t gen, seek_str_t ** out_map, int * 
             ok = false;
             break;
         }
-        if (te.tag_length <= 0 || te.tag_length >= (int32_t) sizeof(buf)) {
+        if (te.tag_length <= 0 || te.tag_length > (int32_t) sizeof(buf)) {
             ok = false;
             break;
         }
@@ -1254,7 +1259,7 @@ static bool compact_scan_filename(int32_t count) {
         if ((size_t) pos + sizeof(struct tagfile_entry) > map_filename_len) return false;
         struct tagfile_entry te;
         memcpy(&te, map_filename + pos, sizeof(te));
-        if (te.tag_length <= 1 || te.tag_length >= TAGCACHE_PATH_MAX) return false;
+        if (te.tag_length <= 1 || te.tag_length > TAGCACHE_PATH_MAX) return false;
         if ((size_t) pos + sizeof(te) + (size_t) te.tag_length > map_filename_len) return false;
         if (te.idx_id < 0 || te.idx_id >= count) return false;
         entry_t * e = &ents[te.idx_id];
@@ -1289,7 +1294,8 @@ static bool compact_scan_title_order(int32_t count) {
         }
         struct tagfile_entry te;
         memcpy(&te, map_title + pos, sizeof(te));
-        if (te.tag_length <= 1 || te.tag_length >= TAGCACHE_PATH_MAX) {
+        /* Empty titles are stored as a single NUL (tag_length == 1). */
+        if (te.tag_length <= 0 || te.tag_length > TAGCACHE_PATH_MAX) {
             free(order);
             return false;
         }
@@ -1313,18 +1319,64 @@ static bool compact_scan_title_order(int32_t count) {
     return true;
 }
 
-static bool load_all(void) {
-    int32_t gen = 0;
-    if (!read_gen_pointer(&gen)) gen = 0;
+static int collect_load_generations(int32_t * out, int max) {
+    int n = 0;
+    int32_t pointed = 0;
+    if (read_gen_pointer(&pointed) && pointed > 0 && n < max) out[n++] = pointed;
+
+    DIR * d = opendir(db_dir);
+    if (d) {
+        struct dirent * de;
+        while ((de = readdir(d)) != NULL && n < max) {
+            int g = 0;
+            if (sscanf(de->d_name, "database_idx.tcd.g%d", &g) != 1 || g <= 0) continue;
+            bool dup = false;
+            for (int i = 0; i < n; i++) {
+                if (out[i] == g) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) out[n++] = g;
+        }
+        closedir(d);
+    }
+
+    int start = (n > 0 && pointed > 0 && out[0] == pointed) ? 1 : 0;
+    for (int i = start + 1; i < n; i++) {
+        int32_t v = out[i];
+        int j = i;
+        while (j > start && out[j - 1] < v) {
+            out[j] = out[j - 1];
+            j--;
+        }
+        out[j] = v;
+    }
+
+    char unversioned[80];
+    master_file_name(unversioned, sizeof(unversioned), 0);
+    char unversioned_path[640];
+    db_path(unversioned_path, sizeof(unversioned_path), unversioned);
+    if (n < max && access(unversioned_path, F_OK) == 0) {
+        bool dup = false;
+        for (int i = 0; i < n; i++) {
+            if (out[i] == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) out[n++] = 0;
+    }
+    return n;
+}
+
+static bool load_generation(int32_t gen) {
     char master_name[80], master_path[640];
     master_file_name(master_name, sizeof(master_name), gen);
     db_path(master_path, sizeof(master_path), master_name);
     intern_path_title = true;
     int fd = open(master_path, O_RDONLY);
-    if (fd < 0) {
-        intern_path_title = choose_intern_strings(0);
-        return true;
-    }
+    if (fd < 0) return false;
 
     struct stat st;
     if (fstat(fd, &st) != 0) {
@@ -1547,6 +1599,39 @@ static bool load_all(void) {
     return true;
 }
 
+static bool load_all(void) {
+    int32_t gens[48];
+    int n = collect_load_generations(gens, 48);
+    if (n == 0) {
+        intern_path_title = choose_intern_strings(0);
+        return true;
+    }
+
+    int32_t pointed = 0;
+    bool have_ptr = read_gen_pointer(&pointed);
+    for (int i = 0; i < n; i++) {
+        intern_path_title = true;
+        if (load_generation(gens[i])) {
+            if (gens[i] > 0 && (!have_ptr || pointed != gens[i])) {
+                fprintf(stderr, "tagcache: recovered generation %d (%s)\n", gens[i],
+                        have_ptr ? "tagcache.gen stale" : "tagcache.gen missing");
+                write_gen_pointer(gens[i]);
+            }
+            return true;
+        }
+        arena_reset();
+        intern_path_title = true;
+        unmap_string_files();
+        free(loaded_title_order);
+        loaded_title_order = NULL;
+        loaded_title_n = 0;
+        ent_count = 0;
+        disk_ready = false;
+        disk_gen = 0;
+    }
+    return false;
+}
+
 static void persist_numeric(int32_t idx) {
     if (!disk_ready || db_dir[0] == '\0' || idx < 0 || idx >= ent_count) return;
     char master_name[80], master_path[640];
@@ -1590,6 +1675,8 @@ bool tagcache_open(const char * dir) {
     db_open = true;
     opened_ok = load_all();
     if (!opened_ok) {
+        fprintf(stderr, "tagcache: failed to load %s -- presenting an empty library; on-disk files left in place\n",
+                db_dir);
         free(ents);
         ents = NULL;
         ent_count = ent_cap = live_count = 0;
@@ -1608,6 +1695,9 @@ bool tagcache_open(const char * dir) {
         intern_path_title = true;
         disk_ready = false;
         disk_gen = 0;
+        /* Still mark open so Settings > Update Music Database can write a
+         * new generation. disk_ready stays false so numeric in-place writes
+         * cannot touch the generation that failed to load. */
         opened_ok = true;
     }
     return true;

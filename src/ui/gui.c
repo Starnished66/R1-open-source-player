@@ -4939,8 +4939,13 @@ typedef struct {
     char stream_url[1536];
     bool stream_verify_tls;
     /* Local track whose directory should be searched when embedded art is
-     * absent. The lookup and file read stay on this worker thread. */
+     * absent. The lookup and file read stay on this worker thread. Artist/
+     * album come from the already-parsed track (or the DB), never from a
+     * second metadata_read() -- that re-parse OOMs on huge ID3/APIC tags. */
     char local_track_path[PATH_MAX];
+    char artist[128];
+    char album[128];
+    char album_artist[128];
 } cover_decode_request_t;
 
 static pthread_t cover_decode_thread;
@@ -4967,13 +4972,10 @@ static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t 
 static bool cover_decode_pending_valid = false;
 static cover_decode_request_t cover_decode_pending;
 
-/* The compressed file coexists with cover_decode.c's RGB888 decode buffer
- * (up to 8 MiB), the audio pipeline, LVGL framebuffers, and the database on
- * a roughly 56 MiB target. A former 16 MiB allowance could therefore OOM
- * the process merely by opening Albums, even though the final thumbnail is
- * only 72x72. Ordinary folder artwork is far below this conservative cap;
- * oversized art falls back to the default image instead of risking the
- * whole player. */
+/* Compressed sidecar cap. cover_decode.c also rejects sources above
+ * 1200x1200 before allocating RGB888, so a 4000px cover.jpg that still
+ * fits in 4 MiB compressed cannot OOM the ~56 MiB target. Oversized art
+ * falls back to the default image. */
 #define EXTERNAL_COVER_MAX_BYTES (4U * 1024U * 1024U)
 
 static void albumart_info_from_path_tags(const char * track_path, const char * artist, const char * album,
@@ -4990,20 +4992,13 @@ static void albumart_info_from_song_row(const song_row_t * song, albumart_info_t
 }
 
 /* Rockbox albumart.c search: sized file first, then generic cover/folder
- * next to the track, then MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>. */
-static bool load_external_cover(const char * track_path, uint8_t ** out_data, uint32_t * out_size) {
+ * next to the track, then MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.
+ * Tags are supplied by the caller (already-parsed track or DB row). This
+ * must not open the audio file. */
+static bool load_external_cover(const char * track_path, const char * artist, const char * album,
+                                const char * album_artist, uint8_t ** out_data, uint32_t * out_size) {
     albumart_info_t info;
-    albumart_info_from_path_tags(track_path, NULL, NULL, NULL, &info);
-    track_metadata_t meta;
-    memset(&meta, 0, sizeof(meta));
-    if (track_path && track_path[0]) {
-        metadata_read(track_path, &meta);
-        snprintf(info.artist, sizeof(info.artist), "%s", meta.artist);
-        snprintf(info.album, sizeof(info.album), "%s", meta.album);
-        snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
-        free(meta.picture_data);
-        free(meta.lyrics);
-    }
+    albumart_info_from_path_tags(track_path, artist, album, album_artist, &info);
     char found[PATH_MAX];
     if (!albumart_find(&info, found, sizeof(found), COVER_ART_WIDTH, COVER_ART_HEIGHT)) return false;
     return albumart_load_file(found, out_data, out_size, EXTERNAL_COVER_MAX_BYTES);
@@ -5027,7 +5022,8 @@ static void * cover_decode_thread_func(void * arg) {
              * over. */
         }
     } else if (!req->picture_data && req->local_track_path[0]) {
-        load_external_cover(req->local_track_path, &req->picture_data, &req->picture_size);
+        load_external_cover(req->local_track_path, req->artist, req->album, req->album_artist,
+                            &req->picture_data, &req->picture_size);
     }
 
     uint16_t * pixels = NULL;
@@ -5094,10 +5090,14 @@ static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t 
     launch_cover_decode_req(r);
 }
 
-static void launch_cover_decode_from_track(int for_index, const char * track_path) {
+static void launch_cover_decode_from_track(int for_index, const char * track_path, const char * artist,
+                                            const char * album, const char * album_artist) {
     cover_decode_request_t r = { .for_index = for_index, .picture_data = NULL, .picture_size = 0,
                                   .stream_url = "", .stream_verify_tls = false };
-    snprintf(r.local_track_path, sizeof(r.local_track_path), "%s", track_path);
+    snprintf(r.local_track_path, sizeof(r.local_track_path), "%s", track_path ? track_path : "");
+    snprintf(r.artist, sizeof(r.artist), "%s", artist ? artist : "");
+    snprintf(r.album, sizeof(r.album), "%s", album ? album : "");
+    snprintf(r.album_artist, sizeof(r.album_artist), "%s", album_artist ? album_artist : "");
     launch_cover_decode_req(r);
 }
 
@@ -5832,7 +5832,7 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     } else {
         free(out_meta->picture_data);
         out_meta->picture_data = NULL;
-        launch_cover_decode_from_track(index, path);
+        launch_cover_decode_from_track(index, path, out_meta->artist, out_meta->album, out_meta->album_artist);
     }
 
     /* No local sidecar (or embedded tag) makes sense for a Subsonic stream
@@ -13321,16 +13321,18 @@ static bool album_thumbnail_load_or_decode(const song_row_t * song, uint16_t ** 
         return ok;
     }
 
-    if (albumart_search_files(&info, "", found, sizeof(found)))
+    if (albumart_search_files(&info, "", found, sizeof(found))) {
+        /* Sidecar present. A too-large or unreadable file must not fall
+         * through into metadata_read() of the audio file -- that is the
+         * in-process ID3/FLAC parse the 4 MiB / 1200px caps exist to avoid. */
         albumart_load_file(found, &data, &size, EXTERNAL_COVER_MAX_BYTES);
-
-    track_metadata_t meta;
-    memset(&meta, 0, sizeof(meta));
-    if (!data) {
+    } else {
+        track_metadata_t meta;
+        memset(&meta, 0, sizeof(meta));
         metadata_read(song->path, &meta);
         data = meta.picture_data;
         size = meta.picture_size;
-        meta.picture_data = NULL;
+        free(meta.lyrics);
         if (!info.artist[0]) snprintf(info.artist, sizeof(info.artist), "%s", meta.artist);
         if (!info.album[0]) snprintf(info.album, sizeof(info.album), "%s", meta.album);
         if (!info.albumartist[0]) snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
@@ -13338,7 +13340,6 @@ static bool album_thumbnail_load_or_decode(const song_row_t * song, uint16_t ** 
     bool ok = data && size &&
               cover_decode_to_rgb565(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, out_pixels);
     free(data);
-    free(meta.lyrics);
     if (ok && *out_pixels)
         albumart_store_rgb565(&info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, *out_pixels);
     return ok;

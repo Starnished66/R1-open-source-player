@@ -15223,7 +15223,11 @@ static void start_library_rescan(void) {
     library_rescan_active = true;
     library_rescan_token = gui_busy_show("Updating\nmusic database...", "");
     gui_busy_set_progress(library_rescan_token, 0);
-    pthread_create(&library_rescan_thread, NULL, library_rescan_thread_func, NULL);
+        if (pthread_create(&library_rescan_thread, NULL, library_rescan_thread_func, NULL) != 0) {
+        library_rescan_active = false;
+        gui_busy_hide(library_rescan_token);
+        show_error_toast("Thread launch failed");
+    }
 }
 
 /* Rebuilds the five prebuilt library screens (All Songs, Artists, Albums,
@@ -15762,7 +15766,11 @@ static void start_sd_format(void) {
     sd_format_done_flag = false;
     sd_format_active = true;
     sd_format_token = gui_busy_show("Formatting\nSD Card...", "");
-    pthread_create(&sd_format_thread, NULL, sd_format_thread_func, NULL);
+        if (pthread_create(&sd_format_thread, NULL, sd_format_thread_func, NULL) != 0) {
+        sd_format_active = false;
+        gui_busy_hide(sd_format_token);
+        show_error_toast("Thread launch failed");
+    }
 }
 
 static void poll_sd_format(void) {
@@ -18363,7 +18371,11 @@ static void import_wifi_back_cb(lv_event_t * e) {
 
     import_web_stop_done_flag = false;
     import_web_stop_active = true;
-    pthread_create(&import_web_stop_thread, NULL, import_web_stop_thread_func, NULL);
+        if (pthread_create(&import_web_stop_thread, NULL, import_web_stop_thread_func, NULL) != 0) {
+        import_web_stop_active = false;
+        gui_busy_hide(import_web_stop_token);
+        show_error_toast("Thread launch failed");
+    }
 }
 
 static lv_obj_t * build_import_wifi_screen(void) {

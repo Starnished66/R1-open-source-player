@@ -53,7 +53,6 @@ extern lv_style_t style_theme_row;
 extern lv_style_t style_theme_text_muted;
 extern lv_style_t style_theme_list_padding;
 extern lv_style_t style_button_pressed;
-extern lv_style_t style_accent;
 
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);

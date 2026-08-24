@@ -699,7 +699,7 @@ static void update_timer_cb(lv_timer_t * timer) {
 #define BT_OUTPUT_DISCONNECT_DEBOUNCE_MS 12000
     {
         static uint32_t bt_disconnected_since_tick = 0; /* 0 = currently connected (or never sampled) */
-        if (refresh_bt_icon_result_a2dp_connected) {
+        if (gui_shell_is_bt_audio_connected()) {
             bt_disconnected_since_tick = 0;
         } else if (bt_disconnected_since_tick == 0) {
             bt_disconnected_since_tick = lv_tick_get();
@@ -719,7 +719,7 @@ static void update_timer_cb(lv_timer_t * timer) {
          * back to true, so there's no user-visible flicker, just the stop
          * below firing sooner than the plain poll+debounce alone would have). */
         bool bt_connected_debounced = !bt_control_output_disconnect_consume() &&
-            (refresh_bt_icon_result_a2dp_connected ||
+            (gui_shell_is_bt_audio_connected() ||
              lv_tick_elaps(bt_disconnected_since_tick) < BT_OUTPUT_DISCONNECT_DEBOUNCE_MS);
 
         static bool last_output_connected = true; /* starts true so nothing fires before any real state has been sampled */
@@ -1857,11 +1857,12 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
             char ** resume_playlist;
             int resume_count, resume_index;
             if (build_saved_resume_playlist(&resume_playlist, &resume_count, &resume_index)) {
-                install_saved_resume_playlist(resume_playlist, resume_count);
-                /* play_track_at_from() itself nav_push()es gui_player_get_screen() on top
-                 * of the seeded root, so a back-swipe from the resumed player
-                 * correctly lands back on the home screen. */
-                play_track_at_from(resume_index, current_settings.last_position);
+                if (install_saved_resume_playlist(resume_playlist, resume_count)) {
+                    /* play_track_at_from() itself nav_push()es gui_player_get_screen() on top
+                     * of the seeded root, so a back-swipe from the resumed player
+                     * correctly lands back on the home screen. */
+                    play_track_at_from(resume_index, current_settings.last_position);
+                }
             }
         }
     } else if (current_settings.resume_mode != 0 && current_settings.last_track[0] != '\0' &&
@@ -1877,13 +1878,14 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
         char ** resume_playlist;
         int resume_count, resume_index;
         if (build_saved_resume_playlist(&resume_playlist, &resume_count, &resume_index)) {
-            install_saved_resume_playlist(resume_playlist, resume_count);
-            if (current_settings.resume_mode == 2) {
-                /* Do not open ALSA at all until the user presses Play.  On
-                 * a headphone-less boot, start-then-pause could lose the
-                 * race to an output-open failure and consume this queue. */
-                prepare_deferred_resume(resume_index, current_settings.last_position);
-            } else play_track_at_from(resume_index, current_settings.last_position);
+            if (install_saved_resume_playlist(resume_playlist, resume_count)) {
+                if (current_settings.resume_mode == 2) {
+                    /* Do not open ALSA at all until the user presses Play.  On
+                     * a headphone-less boot, start-then-pause could lose the
+                     * race to an output-open failure and consume this queue. */
+                    prepare_deferred_resume(resume_index, current_settings.last_position);
+                } else play_track_at_from(resume_index, current_settings.last_position);
+            }
         }
     }
 #ifndef HOST_BUILD

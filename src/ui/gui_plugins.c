@@ -20,7 +20,6 @@
 extern lv_style_t list_row_style;
 extern lv_style_t list_row_pressed_style;
 extern lv_style_t style_theme_text_muted;
-extern lv_style_t style_accent;
 extern lv_style_t style_theme_screen_bg;
 extern player_settings_t current_settings;
 
@@ -470,8 +469,8 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
     if (max <= min) max = min + 1; /* lv_slider_set_range requires min < max */
     lv_slider_set_range(slider, min, max);
     lv_slider_set_value(slider, value, LV_ANIM_OFF);
-    lv_obj_add_style(slider, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_style(slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_style(slider, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(slider, gui_theme_accent_style(), LV_PART_KNOB);
     lv_obj_set_ext_click_area(slider, 20);
     lv_obj_add_event_cb(slider, slider_event_cb, LV_EVENT_ALL, user_data);
 

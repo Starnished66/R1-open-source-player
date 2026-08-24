@@ -23,9 +23,7 @@ void poll_quick_drawer(void);
 void open_quick_drawer(void);
 void close_quick_drawer(void);
 
-extern bool refresh_bt_icon_result_a2dp_connected;
-extern bool wifi_toggle_active;
-extern bool bt_toggle_active;
+bool gui_shell_is_bt_audio_connected(void);
 
 void gui_shell_poll(void);
 void refresh_quick_drawer_crossfade_icon(void);

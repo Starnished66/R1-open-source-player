@@ -118,7 +118,7 @@ gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
         lv_obj_set_size(gui_busy_progress_bar, 280, 14);
         lv_obj_align(gui_busy_progress_bar, LV_ALIGN_CENTER, 0, 30);
         lv_bar_set_range(gui_busy_progress_bar, 0, 100);
-        lv_obj_add_style(gui_busy_progress_bar, &style_accent, LV_PART_INDICATOR);
+        lv_obj_add_style(gui_busy_progress_bar, gui_theme_accent_style(), LV_PART_INDICATOR);
     }
     
     if (msg && msg[0] != '\0') {

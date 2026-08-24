@@ -2635,7 +2635,7 @@ static lv_obj_t * build_remote_control_screen(void) {
      * either state. lv_obj_add_state() above (and remote_control_toggle_
      * cb()'s own add/clear) keeps this selector matching which sprite is
      * actually showing. */
-    lv_obj_add_style(remote_control_toggle_img, &style_accent, LV_STATE_CHECKED);
+    lv_obj_add_style(remote_control_toggle_img, gui_theme_accent_style(), LV_STATE_CHECKED);
 
     lv_obj_t * explanation = lv_label_create(scr);
     lv_label_set_text(explanation,

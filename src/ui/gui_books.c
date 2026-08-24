@@ -21,7 +21,6 @@ extern lv_style_t style_theme_row;
 extern lv_style_t style_theme_text_muted;
 extern lv_style_t style_theme_list_padding;
 extern lv_style_t style_button_pressed;
-extern lv_style_t style_accent;
 
 extern const char * basename_of(const char * path);
 extern lv_obj_t * build_subsonic_list_screen(const char * title_text, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
@@ -338,7 +337,7 @@ static lv_obj_t * build_books_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }

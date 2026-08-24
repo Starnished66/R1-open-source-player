@@ -30,7 +30,7 @@ bool gui_navigation_is_top(lv_obj_t * screen);
 void gui_navigation_remove_screen_instances(lv_obj_t ** screens, int count);
 void gui_navigation_replace_top(lv_obj_t * new_screen);
 void gui_navigation_pop_to_depth(int target_depth);
-extern bool player_transition_cache_dirty;
+bool player_transition_cache_is_dirty(void);
 
 void gui_navigation_init(void);
 void nav_push(lv_obj_t * scr);

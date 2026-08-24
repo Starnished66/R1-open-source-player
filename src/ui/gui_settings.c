@@ -394,7 +394,7 @@ static lv_obj_t * build_about_screen(void) {
     items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -574,7 +574,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_set_flex_grow(enable_label, 1);
 
     screen_timeout_switch = lv_switch_create(enable_row);
-    lv_obj_add_style(screen_timeout_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_style(screen_timeout_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (current_settings.screen_timeout_enabled) lv_obj_add_state(screen_timeout_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(screen_timeout_switch, screen_timeout_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
@@ -604,8 +604,8 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_align(screen_timeout_slider, LV_ALIGN_TOP_MID, 0, 18);
     lv_slider_set_range(screen_timeout_slider, 0, SCREEN_TIMEOUT_STEP_COUNT - 1);
     lv_slider_set_value(screen_timeout_slider, screen_timeout_seconds_to_step_index(current_settings.screen_timeout_seconds), LV_ANIM_OFF);
-    lv_obj_add_style(screen_timeout_slider, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_style(screen_timeout_slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_style(screen_timeout_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(screen_timeout_slider, gui_theme_accent_style(), LV_PART_KNOB);
     lv_obj_add_event_cb(screen_timeout_slider, screen_timeout_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_set_ext_click_area(screen_timeout_slider, 20);
 
@@ -718,7 +718,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_set_flex_grow(enable_label, 1);
 
     startup_volume_switch = lv_switch_create(enable_row);
-    lv_obj_add_style(startup_volume_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_style(startup_volume_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (current_settings.startup_volume_fixed_enabled) lv_obj_add_state(startup_volume_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(startup_volume_switch, startup_volume_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
@@ -736,8 +736,8 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_align(startup_volume_slider, LV_ALIGN_TOP_MID, 0, 18);
     lv_slider_set_range(startup_volume_slider, 0, 100);
     lv_slider_set_value(startup_volume_slider, current_settings.startup_volume_fixed_percent, LV_ANIM_OFF);
-    lv_obj_add_style(startup_volume_slider, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_style(startup_volume_slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_style(startup_volume_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(startup_volume_slider, gui_theme_accent_style(), LV_PART_KNOB);
     lv_obj_add_event_cb(startup_volume_slider, startup_volume_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_set_ext_click_area(startup_volume_slider, 20);
 
@@ -833,8 +833,8 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_align(sleep_timer_slider, LV_ALIGN_TOP_MID, 0, 18);
     lv_slider_set_range(sleep_timer_slider, 0, SLEEP_TIMER_STEP_COUNT - 1);
     lv_slider_set_value(sleep_timer_slider, sleep_timer_minutes_to_step_index(current_settings.sleep_timer_minutes), LV_ANIM_OFF);
-    lv_obj_add_style(sleep_timer_slider, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_style(sleep_timer_slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_style(sleep_timer_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(sleep_timer_slider, gui_theme_accent_style(), LV_PART_KNOB);
     lv_obj_add_event_cb(sleep_timer_slider, sleep_timer_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_set_ext_click_area(sleep_timer_slider, 20);
 
@@ -972,7 +972,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_set_flex_grow(enable_label, 1);
 
     idle_shutdown_switch = lv_switch_create(enable_row);
-    lv_obj_add_style(idle_shutdown_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_style(idle_shutdown_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (current_settings.idle_shutdown_enabled) lv_obj_add_state(idle_shutdown_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(idle_shutdown_switch, idle_shutdown_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
@@ -1070,8 +1070,8 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_align(idle_shutdown_slider, LV_ALIGN_TOP_MID, 0, 48);
     lv_slider_set_range(idle_shutdown_slider, 0, IDLE_SHUTDOWN_STEP_COUNT - 1);
     lv_slider_set_value(idle_shutdown_slider, idle_shutdown_minutes_to_step_index(current_settings.idle_shutdown_minutes), LV_ANIM_OFF);
-    lv_obj_add_style(idle_shutdown_slider, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_style(idle_shutdown_slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_style(idle_shutdown_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(idle_shutdown_slider, gui_theme_accent_style(), LV_PART_KNOB);
     lv_obj_add_event_cb(idle_shutdown_slider, idle_shutdown_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_set_ext_click_area(idle_shutdown_slider, 20);
 
@@ -1211,7 +1211,7 @@ static lv_obj_t * build_timezone_region_screen(void) {
         items[i] = (pill_list_item_t){ TIMEZONE_REGIONS[i], PILL_ACCESSORY_CHEVRON, false, timezone_region_row_cb, NULL,
                                         (void *) (intptr_t) i };
     }
-    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1271,7 +1271,7 @@ static lv_obj_t * build_settings_playback_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1314,7 +1314,7 @@ static lv_obj_t * build_settings_display_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1353,7 +1353,7 @@ static lv_obj_t * build_settings_power_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1395,7 +1395,7 @@ static lv_obj_t * build_settings_system_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1464,7 +1464,7 @@ static lv_obj_t * build_settings_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1533,7 +1533,7 @@ lv_obj_t * build_dac_home_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "USB DAC", PILL_ACCESSORY_CHEVRON, false, dac_home_usb_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Bluetooth DAC", PILL_ACCESSORY_CHEVRON, false, bt_dac_settings_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1619,8 +1619,8 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
     lv_obj_set_width(slider, lv_pct(88));
     lv_obj_set_height(slider, 34);
     lv_slider_set_range(slider, range_min, range_max);
-    lv_obj_add_style(slider, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_style(slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_style(slider, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(slider, gui_theme_accent_style(), LV_PART_KNOB);
     lv_obj_set_ext_click_area(slider, 20);
 
     *out_value_label = value_label;
@@ -2009,7 +2009,7 @@ static lv_obj_t * build_eq_screen(void) {
      * "Rescan"). */
     eq_bypass_switch = lv_switch_create(scr);
     lv_obj_align(eq_bypass_switch, LV_ALIGN_TOP_RIGHT, -16, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(eq_bypass_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_style(eq_bypass_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
 
     /* Reset to defaults -- sits right next to the enable switch per the
      * bug report ask, aligned relative to the switch itself (not a fixed
@@ -2169,7 +2169,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_set_style_text_font(enabled_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
 
     eq_band_enabled_switch = lv_switch_create(enable_row);
-    lv_obj_add_style(eq_band_enabled_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_add_style(eq_band_enabled_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
 
     /* Save/Load Profile row -- the new SD card persistence ask, sitting at
      * the end of the same scrollable list as everything else rather than
@@ -2206,7 +2206,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_t * save_label = lv_label_create(save_btn);
     lv_label_set_text(save_label, "Save Profile");
     lv_obj_set_style_text_font(save_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_add_style(save_label, &style_accent, 0);
+    lv_obj_add_style(save_label, gui_theme_accent_style(), 0);
     lv_label_set_long_mode(save_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(save_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(save_label, lv_pct(100));
@@ -2225,7 +2225,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_t * load_label = lv_label_create(load_btn);
     lv_label_set_text(load_label, "Load Profile");
     lv_obj_set_style_text_font(load_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_add_style(load_label, &style_accent, 0);
+    lv_obj_add_style(load_label, gui_theme_accent_style(), 0);
     lv_label_set_long_mode(load_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(load_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(load_label, lv_pct(100));

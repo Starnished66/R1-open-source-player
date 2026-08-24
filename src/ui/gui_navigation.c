@@ -288,7 +288,9 @@ void register_static_snapshot(int index, lv_obj_t * scr) {
  * transition() blends those bars in fresh from this cached base every
  * time it's used. */
 static lv_draw_buf_t * player_transition_cache_buf = NULL;
-bool player_transition_cache_dirty = true;
+static bool player_transition_cache_dirty = true;
+
+bool player_transition_cache_is_dirty(void) { return player_transition_cache_dirty; }
 
 static void player_transition_rebuild_cache(void) {
     /* Nothing to gain while gui_player_get_screen() is already the live screen --

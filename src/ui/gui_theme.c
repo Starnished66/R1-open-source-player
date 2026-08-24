@@ -5,8 +5,11 @@
 #include "fallback_font.h"
 #include <stdio.h>
 
-lv_style_t style_accent;
-lv_style_t style_muted_text;
+static lv_style_t style_accent;
+static lv_style_t style_muted_text;
+
+lv_style_t * gui_theme_accent_style(void) { return &style_accent; }
+lv_style_t * gui_theme_muted_text_style(void) { return &style_muted_text; }
 
 static const lv_font_t * ui_size_16 = &lv_font_montserrat_16;
 static const lv_font_t * ui_size_20 = &lv_font_montserrat_20;

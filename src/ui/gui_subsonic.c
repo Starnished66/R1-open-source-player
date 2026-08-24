@@ -1182,7 +1182,7 @@ static lv_obj_t * build_subsonic_entry_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "Saved Servers", PILL_ACCESSORY_CHEVRON, false, subsonic_saved_servers_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "New Connection", PILL_ACCESSORY_CHEVRON, false, subsonic_new_connection_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, &style_accent, 6);
+    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, gui_theme_accent_style(), 6);
     finalize_screen_navigation(scr);
     return scr;
 }

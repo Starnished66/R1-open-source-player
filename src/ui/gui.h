@@ -389,7 +389,6 @@ void boot_checkpoint(const char * msg);
 
 #define AUDIOBOOKS_LIBRARY_DIR_NAME "Audiobooks"
 /* ---- Shared GUI and Screen Builders Helpers ---- */
-extern lv_style_t style_accent;
 void generic_back_cb(lv_event_t * e);
 lv_obj_t * add_pill_chevron_row(lv_obj_t * list, const char * text, lv_event_cb_t cb);
 lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);

@@ -65,6 +65,8 @@ static bool quick_drawer_open = false;
 static void start_bt_dac_startup_reapply_if_needed(void);
 static lv_obj_t * quick_drawer_brightness_track = NULL;
 static lv_obj_t * quick_drawer_brightness_label = NULL;
+static bool wifi_toggle_active = false;
+static bool bt_toggle_active = false;
 
 static void refresh_quick_drawer_brightness(void) {
     if (!quick_drawer_brightness_track) return;
@@ -78,7 +80,6 @@ static void refresh_quick_drawer_brightness(void) {
     }
 }
 
-extern bool player_transition_cache_dirty;
 extern void player_transition_cache_async_cb(void * user_data);
 static lv_obj_t * home_indicator_band = NULL;
 
@@ -170,7 +171,7 @@ void sync_player_topbar_visibility(lv_obj_t * screen) {
      * slide_transition_done_cb's commit/nav_reset_to_home), i.e. exactly
      * "after the Player has settled" -- so retrying here, once per actual
      * screen change away from Player, is the natural moment. */
-    if (screen != gui_player_get_screen() && player_transition_cache_dirty)
+    if (screen != gui_player_get_screen() && player_transition_cache_is_dirty())
         lv_async_call(player_transition_cache_async_cb, NULL);
 }
 
@@ -800,7 +801,8 @@ static bool refresh_bt_icon_active = false;
 static atomic_bool refresh_bt_icon_done_flag = false;
 static bool refresh_bt_icon_result_powered = false;
 static bool refresh_bt_icon_result_connected = false;
-bool refresh_bt_icon_result_a2dp_connected = false;
+static bool refresh_bt_icon_result_a2dp_connected = false;
+bool gui_shell_is_bt_audio_connected(void) { return refresh_bt_icon_result_a2dp_connected; }
 static char refresh_bt_icon_result_mac[18] = "";
 static char refresh_bt_icon_result_codec[32] = "";
 
@@ -1982,7 +1984,6 @@ static void quick_drawer_bt_long_press_cb(lv_event_t * e) {
  * enable()/disable() each block for about a second, so this runs on its own
  * thread, polled the same way as every other background op in this file. */
 static pthread_t wifi_toggle_thread;
-bool wifi_toggle_active = false;
 static atomic_bool wifi_toggle_done_flag = false;
 static bool wifi_toggle_target_enabled = false;
 
@@ -2099,7 +2100,6 @@ static void poll_wifi_toggle(void) {
  * not just bluetoothctl power on, is what actually makes the toggle work at
  * all on a fresh boot. */
 static pthread_t bt_toggle_thread;
-bool bt_toggle_active = false;
 static atomic_bool bt_toggle_done_flag = false;
 
 
@@ -2607,8 +2607,8 @@ static void build_quick_drawer(void) {
     /* Real-device bug report: accent color didn't apply here -- see
      * apply_accent_color()'s own comment on why an image-art slider needs
      * bg_image_recolor, not just bg_color. */
-    lv_obj_add_style(quick_drawer_brightness_track, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_style(quick_drawer_brightness_track, &style_accent, LV_PART_KNOB);
+    lv_obj_add_style(quick_drawer_brightness_track, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(quick_drawer_brightness_track, gui_theme_accent_style(), LV_PART_KNOB);
     /* Real-device bug report: same left-edge gray sliver/root cause as
      * volume_popup_track's own fix -- see its comment. */
     configure_native_slider_rail(quick_drawer_brightness_track);

@@ -203,8 +203,8 @@ static void build_volume_popup(void) {
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_KNOB);
     lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
-    lv_obj_add_style(volume_popup_track, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_style(volume_popup_track, &style_accent, LV_PART_KNOB);
+    lv_obj_add_style(volume_popup_track, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(volume_popup_track, gui_theme_accent_style(), LV_PART_KNOB);
     configure_native_slider_rail(volume_popup_track);
     lv_obj_set_style_width(volume_popup_track, 30, LV_PART_KNOB);
     lv_obj_set_style_height(volume_popup_track, 30, LV_PART_KNOB);
@@ -1346,8 +1346,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     /* Real-device bug report: accent color didn't apply here -- see
      * apply_accent_color()'s own comment on why an image-art slider needs
      * bg_image_recolor, not just bg_color. */
-    lv_obj_add_style(progress_slider, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_style(progress_slider, &style_accent, LV_PART_KNOB);
+    lv_obj_add_style(progress_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(progress_slider, gui_theme_accent_style(), LV_PART_KNOB);
     /* Keep the dedicated playing-plane art here: unlike the reused 360px
      * volume rail sprites, these assets match this progress rail's design. */
     lv_obj_set_style_radius(progress_slider, 0, LV_PART_INDICATOR);
@@ -1973,10 +1973,26 @@ void queue_add_song(const char * path) {
     int pos = (queue_next_insert_index >= 0 && queue_next_insert_index <= playlist_count) ? queue_next_insert_index
                                                                                             : playlist_index + 1;
 
+    char * owned_path = strdup(path);
+    if (!owned_path) return;
+
     char ** grown = realloc(playlist, sizeof(char *) * (size_t) (playlist_count + 1));
+    if (!grown) {
+        free(owned_path);
+        return;
+    }
     playlist = grown;
+
+    if (playlist_lazy_sort_order) {
+        int * grown_order = realloc(playlist_lazy_sort_order, sizeof(int) * (size_t) (playlist_count + 1));
+        if (!grown_order) {
+            free(owned_path);
+            return; /* The grown playlist remains valid and logically unchanged. */
+        }
+        playlist_lazy_sort_order = grown_order;
+    }
     memmove(&playlist[pos + 1], &playlist[pos], sizeof(char *) * (size_t) (playlist_count - pos));
-    playlist[pos] = strdup(path);
+    playlist[pos] = owned_path;
 
     /* Kept in lockstep so any still-unresolved lazy slot after `pos` keeps
      * mapping to the right song once shifted -- see playlist_lazy_sort_
@@ -1984,8 +2000,6 @@ void queue_add_song(const char * path) {
      * strdup'd above), so its own new slot here is never read; the value
      * doesn't matter. */
     if (playlist_lazy_sort_order) {
-        int * grown_order = realloc(playlist_lazy_sort_order, sizeof(int) * (size_t) (playlist_count + 1));
-        playlist_lazy_sort_order = grown_order;
         memmove(&playlist_lazy_sort_order[pos + 1], &playlist_lazy_sort_order[pos],
                 sizeof(int) * (size_t) (playlist_count - pos));
         playlist_lazy_sort_order[pos] = -1;
@@ -2506,6 +2520,7 @@ void gui_player_cancel_background_work(void) {
 const char * playlist_path_at(int index) {
     if (index < 0 || index >= playlist_count) return "";
     if (playlist[index]) return playlist[index];
+    if (!playlist_lazy_sort_order) return "";
     int sort_pos = playlist_lazy_sort_order[index];
     song_row_t row;
     int got = playlist_lazy_order_is_recency ? metadata_db_get_songs_page_by_recency(sort_pos, 1, &row)
@@ -2635,16 +2650,22 @@ bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * o
     return file_browser_build_playlist_for_path(current_settings.last_track, out_playlist, out_count, out_index);
 }
 
-void install_saved_resume_playlist(char ** resume_playlist, int resume_count) {
+bool install_saved_resume_playlist(char ** resume_playlist, int resume_count) {
+    int * new_order = NULL;
+    if (resume_playlist_needs_lazy_order) {
+        new_order = malloc(sizeof(int) * (size_t) resume_count);
+        if (!new_order) {
+            for (int i = 0; i < resume_count; i++) free(resume_playlist[i]);
+            free(resume_playlist);
+            return false;
+        }
+        for (int i = 0; i < resume_count; i++) new_order[i] = i;
+    }
     free_playlist();
     playlist = resume_playlist;
     playlist_count = resume_count;
-    if (resume_playlist_needs_lazy_order) {
-        playlist_lazy_sort_order = malloc(sizeof(int) * (size_t) resume_count);
-        if (playlist_lazy_sort_order) {
-            for (int i = 0; i < resume_count; i++) playlist_lazy_sort_order[i] = i;
-        }
-    }
+    playlist_lazy_sort_order = new_order;
+    return true;
 }
 
 void prepare_deferred_resume(int index, double start_seconds) {

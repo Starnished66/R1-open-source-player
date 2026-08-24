@@ -2,6 +2,8 @@
 #define GUI_H
 
 #include "lvgl/lvgl.h"
+#include "gui_theme.h"
+#include "gui_notifications.h"
 #include "metadata_db.h" /* song_row_t/group_row_t, reused as-is by the gui_plugin_library_* declarations below */
 #include "remote_track.h" /* remote_track_meta_t, used by gui_plugin_play_remote_tracks() below */
 #include <stdint.h>
@@ -273,13 +275,7 @@ typedef enum {
 
 int search_remap_index(search_binding_id_t binding_id, int display_index);
 
-typedef enum {
-    GUI_FONT_ROLE_TITLE,
-    GUI_FONT_ROLE_ROW,
-    GUI_FONT_ROLE_BODY,
-    GUI_FONT_ROLE_SUBTEXT,
-    GUI_FONT_ROLE_STATUS
-} gui_font_role_t;
+/* gui_font_role_t declared in gui_theme.h */
 
 
 typedef struct {
@@ -296,31 +292,18 @@ void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enab
 void set_play_button_state(bool is_playing);
 void arm_next_track_for_audio(int index);
 
+const char * basename_of(const char * path);
 /* ---- Shared GUI and Screen Builders Helpers ---- */
 extern lv_style_t style_accent;
 void generic_back_cb(lv_event_t * e);
 lv_obj_t * add_pill_chevron_row(lv_obj_t * list, const char * text, lv_event_cb_t cb);
 lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);
 lv_obj_t * add_pill_row_base(lv_obj_t * list, const char * text);
-const lv_font_t * gui_theme_font(gui_font_role_t role);
 void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon);
 
 /* ---- Busy Indicator & Notifications ---- */
-typedef uint32_t gui_busy_handle_t;
-void show_error_toast(const char * msg);
-void show_info_toast(const char * msg);
-gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
-void gui_busy_hide(gui_busy_handle_t handle);
-void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
-
-/* ---- Accent Palette ---- */
-extern const uint32_t accent_palette[];
-extern lv_obj_t * accent_swatches[];
-#define ACCENT_PALETTE_COUNT 24
-
-/* ---- Settings & UI Callbacks ---- */
+/* Notifications and Accent declared in gui_notifications.h and gui_theme.h */
 extern lv_obj_t * settings_crossfade_toggle_img;
-void accent_swatch_event_cb(lv_event_t * e);
 void crossfade_switch_event_cb(lv_event_t * e);
 void car_mode_switch_event_cb(lv_event_t * e);
 void swipe_up_home_switch_event_cb(lv_event_t * e);
@@ -359,3 +342,7 @@ void populate_wifi_screen(bool enabled);
 void show_bt_connect_popup(const char * name, const char * mac);
 
 #endif /* GUI_H */
+
+extern lv_obj_t * music_screen;
+extern lv_obj_t * stream_media_screen;
+extern lv_obj_t * dac_home_screen;

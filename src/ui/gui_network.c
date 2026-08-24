@@ -412,7 +412,7 @@ static void wifi_action_forget_cb(lv_event_t * e) {
     start_wifi_forget(id);
 }
 
-static void build_wifi_action_popup(void) {
+void build_wifi_action_popup(void) {
     wifi_action_popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &wifi_action_popup_title, NULL, "Connect",
                                              accent_lv_color(), wifi_action_connect_cb, NULL, "Forget",
                                              lv_color_make(255, 120, 120), wifi_action_forget_cb, NULL,
@@ -688,7 +688,7 @@ static lv_obj_t * build_wifi_screen(void) {
     return scr;
 }
 
-static void open_wifi_screen(void) {
+void open_wifi_screen(void) {
     bool enabled = wifi_control_is_enabled();
     populate_wifi_screen(enabled);
     nav_push(wifi_screen);
@@ -879,7 +879,7 @@ static void bt_action_forget_cb(lv_event_t * e) {
     start_bt_forget(mac);
 }
 
-static void build_bt_action_popup(void) {
+void build_bt_action_popup(void) {
     bt_action_popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &bt_action_popup_title, NULL, "Connect",
                                            accent_lv_color(), bt_action_connect_cb, &bt_action_connect_row, "Forget",
                                            lv_color_make(255, 120, 120), bt_action_forget_cb, &bt_action_forget_row,
@@ -1055,7 +1055,7 @@ static void bt_dac_enable_row_cb(lv_event_t * e);
  * another device, so that isn't something a background toggle should hide.
  * open_bt_dac_screen() only ever reaches this screen when Bluetooth DAC is
  * currently off -- while on, it goes straight to the overlay instead. */
-static void populate_bt_dac_screen(void) {
+void populate_bt_dac_screen(void) {
     lv_obj_clean(bt_dac_list);
 
     lv_obj_t * explanation = lv_label_create(bt_dac_list);
@@ -1201,7 +1201,7 @@ static void bt_dac_overlay_back_cb(lv_event_t * e) {
     lv_obj_move_foreground(bt_dac_leave_popup);
 }
 
-static void build_bt_dac_leave_popup(void) {
+void build_bt_dac_leave_popup(void) {
     bt_dac_leave_popup = build_confirm_popup("Leave Bluetooth DAC mode?", LV_LABEL_LONG_WRAP, NULL, NULL, "Leave",
                                               lv_color_make(255, 120, 120), bt_dac_leave_confirm_cb, NULL, "Cancel",
                                               accent_lv_color(), bt_dac_leave_cancel_cb, NULL,
@@ -1641,7 +1641,7 @@ static void * usb_mode_switch_thread_func(void * arg) {
     return NULL;
 }
 
-static void start_usb_mode_switch(usb_mode_t target) {
+void start_usb_mode_switch(usb_mode_t target) {
     if (usb_mode_switch_active) return; /* already switching -- ignore taps until it lands, same guard as wifi/bt toggles */
     usb_mode_switch_target = target;
     usb_mode_switch_active = true;
@@ -1656,7 +1656,7 @@ static void start_usb_mode_switch(usb_mode_t target) {
     }
 }
 
-static void poll_usb_mode_switch(void) {
+void poll_usb_mode_switch(void) {
     if (!usb_mode_switch_active || !atomic_load_explicit(&usb_mode_switch_done_flag, memory_order_acquire)) return;
     usb_mode_switch_active = false;
     pthread_join(usb_mode_switch_thread, NULL);
@@ -1720,7 +1720,7 @@ static void poll_usb_mode_switch(void) {
  * switching to DAC/ADB and back, because those taps happened to perform the
  * missing UDC bind. Reapply Storage on every physical connection edge so a
  * PC enumerates it immediately. Never override an active DAC/ADB session. */
-static void poll_usb_storage_hotplug(void) {
+void poll_usb_storage_hotplug(void) {
     bool connected = usb_mode_control_cable_connected();
     if (!usb_cable_state_initialized) {
         usb_cable_state_initialized = true;
@@ -1837,7 +1837,7 @@ static void usb_dac_overlay_back_cb(lv_event_t * e) {
     lv_obj_move_foreground(usb_dac_leave_popup);
 }
 
-static void build_usb_dac_leave_popup(void) {
+void build_usb_dac_leave_popup(void) {
     usb_dac_leave_popup = build_confirm_popup("Leave USB DAC mode?", LV_LABEL_LONG_WRAP, NULL, NULL, "Leave",
                                                lv_color_make(255, 120, 120), usb_dac_leave_confirm_cb, NULL, "Cancel",
                                                accent_lv_color(), usb_dac_leave_cancel_cb, NULL,
@@ -1997,7 +1997,7 @@ static lv_obj_t * build_bluetooth_screen(void) {
     return scr;
 }
 
-static void open_bluetooth_screen(void) {
+void open_bluetooth_screen(void) {
     populate_bt_screen();
     nav_push(bt_screen);
     if (bt_is_powered_cached) start_bt_scan(); /* auto-refresh -- matches the old always-scan-on-open behavior, but only when there's a radio to scan with -- cached, not a fresh bt_control_is_powered() call, same reasoning as populate_bt_screen() */
@@ -2236,7 +2236,7 @@ static void * import_web_stop_thread_func(void * arg) {
     return NULL;
 }
 
-static void poll_import_web_stop(void) {
+void poll_import_web_stop(void) {
     if (!import_web_stop_active || !atomic_load_explicit(&import_web_stop_done_flag, memory_order_acquire)) return;
 
     import_web_stop_active = false;
@@ -2746,4 +2746,8 @@ void gui_network_init(void) {
     dlna_screen = build_dlna_screen();
     remote_control_screen = build_remote_control_screen();
     wireless_screen = build_wireless_screen();
+    build_bt_action_popup();
+    build_wifi_action_popup();
+    build_usb_dac_leave_popup();
+    build_bt_dac_leave_popup();
 }

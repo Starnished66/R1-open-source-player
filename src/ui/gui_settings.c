@@ -1,5 +1,12 @@
 #include "gui.h"
 #include "gui_settings.h"
+#include <math.h>
+#include <sys/stat.h>
+#include "gui_subsonic.h"
+#include "gui_books.h"
+#include "gui_network.h"
+#include "subprocess.h"
+#include "timezone_apply.h"
 #include "gui_lyrics.h"
 #include "gui_lyrics.h"
 #include "screen_builders.h"
@@ -1521,7 +1528,7 @@ static void dac_home_usb_row_cb(lv_event_t * e) {
     start_usb_mode_switch(USB_MODE_DAC);
 }
 
-static lv_obj_t * build_dac_home_screen(void) {
+lv_obj_t * build_dac_home_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "USB DAC", PILL_ACCESSORY_CHEVRON, false, dac_home_usb_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Bluetooth DAC", PILL_ACCESSORY_CHEVRON, false, bt_dac_settings_row_cb, NULL, NULL };
@@ -1540,7 +1547,7 @@ static void gui_books_home_tile_cb(lv_event_t * e) {
     gui_books_show();
 }
 
-static lv_obj_t * build_home_screen(void) {
+lv_obj_t * build_home_screen(void) {
     static icon_grid_item_t items[6];
     items[0] = (icon_grid_item_t){ "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb, NULL };
     items[1] = (icon_grid_item_t){ "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb, NULL };
@@ -1798,7 +1805,7 @@ void show_font_size_reboot_popup(void) {
     lv_obj_move_foreground(font_size_reboot_popup);
 }
 
-static void build_font_size_reboot_popup(void) {
+void build_font_size_reboot_popup(void) {
     font_size_reboot_popup = build_confirm_popup(
         "Restart now to apply the new font size?", LV_LABEL_LONG_WRAP, NULL, NULL, "Restart Now", accent_lv_color(),
         font_size_reboot_now_cb, NULL, "Later", lv_color_make(160, 160, 160), font_size_reboot_later_cb, NULL,

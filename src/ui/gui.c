@@ -1,4 +1,6 @@
 #include "gui.h"
+#include "gui_theme.h"
+#include "gui_notifications.h"
 #include "gui_settings.h"
 #include "gui_network.h"
 #include "gui_books.h"
@@ -61,10 +63,6 @@
 
 /* --- Notification/Modal API (gui_notifications.h) --- */
 
-static uint32_t gui_busy_current_token = 0;
-static lv_obj_t * gui_busy_screen = NULL;
-static lv_obj_t * gui_busy_label = NULL;
-static lv_obj_t * gui_busy_progress_bar = NULL;
 
 gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
 void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
@@ -178,36 +176,10 @@ static uint64_t ui_perf_now_us(void) {
  * 22/28 already use. Declared extern in screen_builders.h rather than a
  * new header of their own, since that's the one file already shared by
  * every screen-building call site on both sides. */
-const lv_font_t * ui_size_16 = &lv_font_montserrat_16;
-const lv_font_t * ui_size_20 = &lv_font_montserrat_20;
-const lv_font_t * ui_size_22 = &lv_font_montserrat_22;
-const lv_font_t * ui_size_28 = &lv_font_montserrat_28;
-
-static void apply_font_size_tier(int tier) {
-    switch (tier) {
-        case 1: /* Medium */
-            ui_size_16 = &lv_font_montserrat_20;
-            ui_size_20 = &lv_font_montserrat_24;
-            ui_size_22 = &lv_font_montserrat_26;
-            ui_size_28 = &lv_font_montserrat_32;
-            break;
-        case 2: /* BlindMF -- literal feature name, requested verbatim */
-            ui_size_16 = &lv_font_montserrat_24;
-            ui_size_20 = &lv_font_montserrat_30;
-            ui_size_22 = &lv_font_montserrat_34;
-            ui_size_28 = &lv_font_montserrat_40;
-            break;
-        default: /* Small -- the original, unchanged sizing */
-            ui_size_16 = &lv_font_montserrat_16;
-            ui_size_20 = &lv_font_montserrat_20;
-            ui_size_22 = &lv_font_montserrat_22;
-            ui_size_28 = &lv_font_montserrat_28;
-            break;
-    }
-}
+/* ui_size_* and apply_font_size_tier moved to gui_theme.c */
 
 static lv_obj_t * home_screen;
-static lv_obj_t * music_screen;
+lv_obj_t * music_screen;
 static lv_obj_t * files_screen;
 static lv_obj_t * files_search_list; /* search-results overlay, see search_binding_t's is_overlay_list comment */
 static lv_obj_t * all_songs_screen;
@@ -228,12 +200,12 @@ static lv_obj_t * album_thumbnail_active_list;
 static int album_thumbnail_generation;
 static void album_thumbnail_begin_screen(lv_obj_t * list);
 static void album_thumbnail_end_screen(lv_obj_t * list);
-static lv_obj_t * stream_media_screen;
+lv_obj_t * stream_media_screen;
 
 static lv_obj_t * player_screen;
 static lv_obj_t * player_dismiss_btn;
 void sync_player_topbar_visibility(lv_obj_t * screen);
-static lv_obj_t * dac_home_screen;
+lv_obj_t * dac_home_screen;
 
 
 
@@ -526,110 +498,13 @@ player_settings_t current_settings;
  * updated in place whenever the user picks a new color, so every widget
  * that has this style attached re-renders automatically without having to
  * walk and restyle each one individually. */
-lv_style_t style_accent;
+/* style_accent defined in gui_theme.c */
 /* Plain light-gray text style for the *unselected* EQ band labels -- kept
  * as its own shared style (rather than a one-off lv_obj_set_style_text_color)
  * so toggling selection is just swapping which shared style is attached,
  * with no risk of a local per-object style override taking priority over
  * style_accent and silently defeating the highlight. */
-static lv_style_t style_muted_text;
-
-lv_color_t accent_lv_color(void) {
-    return lv_color_hex(current_settings.accent_color);
-}
-
-/* Defined further down alongside the rest of the player-screen transition
- * cache (register_static_snapshot()'s own neighborhood) -- forward-declared
- * here since apply_accent_color() below needs to invalidate that cache
- * (accent color repaints the player screen's own progress-slider styling)
- * but is itself defined earlier in the file. */
-static void player_transition_mark_dirty(void);
-
-static void apply_accent_color(uint32_t rgb) {
-    current_settings.accent_color = rgb;
-    lv_style_set_bg_color(&style_accent, lv_color_hex(rgb));
-    lv_style_set_text_color(&style_accent, lv_color_hex(rgb));
-    /* Real-device bug report: accent color wasn't applying to the volume
-     * popup slider, the quick-drawer brightness slider, or the player
-     * screen's scrub bar -- those three, unlike every other slider/switch
-     * in the app, are built from fixed-art bg_image_src assets
-     * (volume/vol_progress.png, playing_plane/progress.png) rather than a
-     * plain bg_color fill, so style_accent's bg_color alone never touched
-     * them. bg_image_recolor tints an image in place (same "shared style,
-     * one update point" mechanism as everything else here) -- see those
-     * three sliders' own lv_obj_add_style(..., &style_accent, ...) calls. */
-    lv_style_set_bg_image_recolor(&style_accent, lv_color_hex(rgb));
-    lv_style_set_bg_image_recolor_opa(&style_accent, LV_OPA_COVER);
-    /* image_recolor (distinct LVGL property from bg_image_recolor above) is
-     * what a plain lv_image_create() widget reads -- needed for toggle rows
-     * built once at startup and never rebuilt (e.g. remote_control_toggle_img),
-     * which can't just re-read accent_lv_color() on a later screen visit the
-     * way a repopulated list (add_pill_toggle_row()) can.
-     *
-     * Real-device bug report: on.png's ON sprite bakes its white handle
-     * circle and colored track into one flat bitmap (no separate LVGL
-     * part/knob the way a real lv_switch has) -- recoloring at LV_OPA_COVER
-     * (the previous value here) replaces every non-transparent pixel with
-     * the exact same solid accent color regardless of its original
-     * lightness, so the handle and track become one indistinguishable
-     * blob. LVGL's image recolor is a plain per-channel alpha blend
-     * (result = recolor*opa + original*(255-opa), see
-     * lv_draw_sw_img.c's "Apply recolor" block) -- at any opa below COVER,
-     * the handle's original white and the track's original (darker, more
-     * saturated) color still land at different final brightnesses after
-     * blending toward the same accent color, since they started from
-     * different values. LV_OPA_80 keeps a strong, clearly accent-tinted
-     * look while leaving enough of that original contrast for the handle
-     * to still read as a distinct circle against the track. */
-    lv_style_set_image_recolor(&style_accent, lv_color_hex(rgb));
-    lv_style_set_image_recolor_opa(&style_accent, LV_OPA_80);
-    /* Modifying a shared lv_style_t's properties in place doesn't by
-     * itself invalidate the objects that reference it -- LVGL needs an
-     * explicit nudge to know to redraw them (confirmed empirically: without
-     * this, the accent color only ever showed on whatever was drawn after
-     * the change, not on already-visible widgets like a switch already on
-     * screen). lv_obj_refresh_style(NULL, ...) is NOT the right call for
-     * this -- it crashes (NULL obj dereference); lv_obj_report_style_change
-     * is the API meant specifically for "a shared style changed, find and
-     * refresh whoever uses it", and safely walks every screen itself. */
-    lv_obj_report_style_change(&style_accent);
-    settings_save(&current_settings);
-    player_transition_mark_dirty(); /* progress_slider's own style_accent usage on player_screen just repainted -- see the cache's own doc comment */
-}
-
-const uint32_t accent_palette[] = {
-    0x2196F3, /* blue (default) */
-    0x4CAF50, /* green */
-    0xF44336, /* red */
-    0xFF9800, /* orange */
-    0x9C27B0, /* purple */
-    0x009688, /* teal */
-    0xE91E63, /* pink */
-    0xE0E0E0, /* light gray */
-    0xFFEB3B, /* yellow */
-    0x00BCD4, /* cyan */
-    0x3F51B5, /* indigo */
-    0xFFC107, /* amber */
-    0xCDDC39, /* lime */
-    0x795548, /* brown */
-    0x607D8B, /* blue gray */
-    0xFFFFFF, /* white */
-};
-#undef ACCENT_PALETTE_COUNT
-#define ACCENT_PALETTE_COUNT (sizeof(accent_palette) / sizeof(accent_palette[0]))
-lv_obj_t * accent_swatches[ACCENT_PALETTE_COUNT];
-
-void accent_swatch_event_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    uint32_t rgb = (uint32_t) (intptr_t) lv_event_get_user_data(e);
-    apply_accent_color(rgb);
-
-    /* The screen isn't rebuilt on re-visit, so the selection ring has to be
-     * updated here rather than only at construction time. */
-    for (size_t i = 0; i < ACCENT_PALETTE_COUNT; i++) {
-        lv_obj_set_style_border_width(accent_swatches[i], accent_palette[i] == rgb ? 4 : 0, 0);
-    }
-}
+/* accent colors and styles moved to gui_theme.c */
 
 /* Generic back-stack, replacing the old pairwise hardcoded back targets
  * (settings always -> browser, eq always -> settings). Every screen's back
@@ -918,7 +793,7 @@ static void player_transition_cache_async_cb(void * unused) {
  * subtree changes -- see this function's own doc comment on the cache
  * above for the current full list of call sites. Deliberately NOT called
  * from the routine per-second progress-bar update. */
-static void player_transition_mark_dirty(void) {
+void player_transition_mark_dirty(void) {
     player_transition_cache_dirty = true;
     if (player_screen) lv_async_call(player_transition_cache_async_cb, NULL);
 }
@@ -2290,7 +2165,6 @@ static void start_refresh_bt_icon(void) {
     }
 }
 
-static void populate_bt_screen(void); /* defined with the rest of the Bluetooth settings screen, below */
 static bool bt_toggle_active; /* defined with the rest of the tap-to-toggle mechanism, below -- see poll_refresh_bt_icon()'s own use of it */
 
 static void poll_refresh_bt_icon(void) {
@@ -2676,48 +2550,7 @@ static void build_home_indicator_bar(void) {
  * existed before (see poll_subsonic_download()'s and
  * subsonic_connect_row_cb's own "no error-toast UI exists yet" notes) --
  * first real use is Wi-Fi/Bluetooth connect failures. */
-static lv_obj_t * error_toast;
-static lv_obj_t * error_toast_label;
-static lv_timer_t * error_toast_hide_timer;
-
-static void error_toast_hide_timer_cb(lv_timer_t * timer) {
-    (void) timer;
-    lv_obj_add_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
-    lv_timer_pause(error_toast_hide_timer);
-}
-
-static void build_error_toast(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    error_toast = lv_obj_create(top);
-    lv_obj_set_size(error_toast, 400, 70);
-    lv_obj_align(error_toast, LV_ALIGN_CENTER, 0, -180);
-    lv_obj_set_style_radius(error_toast, 16, 0);
-    lv_obj_set_style_bg_color(error_toast, lv_color_make(40, 20, 20), 0);
-    lv_obj_set_style_bg_opa(error_toast, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(error_toast, 0, 0);
-    lv_obj_remove_flag(error_toast, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
-
-    error_toast_label = lv_label_create(error_toast);
-    lv_obj_set_width(error_toast_label, lv_pct(90));
-    lv_label_set_long_mode(error_toast_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(error_toast_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(error_toast_label, lv_color_make(255, 200, 200), 0);
-    lv_obj_set_style_text_font(error_toast_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_center(error_toast_label);
-
-    error_toast_hide_timer = lv_timer_create(error_toast_hide_timer_cb, 2500, NULL);
-    lv_timer_pause(error_toast_hide_timer);
-}
-
-void show_error_toast(const char * msg) {
-    lv_label_set_text(error_toast_label, msg);
-    lv_obj_remove_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(error_toast);
-    lv_timer_reset(error_toast_hide_timer);
-    lv_timer_resume(error_toast_hide_timer);
-}
+/* error_toast moved to gui_notifications.c */
 
 /* Fully automatic, no Settings entry -- meant to feel like the wired
  * headphone jack (refresh_headphone_icon() above), not a mode the user
@@ -2751,48 +2584,7 @@ static void poll_usb_audio_output(void) {
  * longer explanatory one (first use: Car Mode's own explanation on
  * enabling). Bigger box for wrapping, 5s so there's time to actually read
  * it, no error coloring since nothing failed. */
-static lv_obj_t * info_toast;
-static lv_obj_t * info_toast_label;
-static lv_timer_t * info_toast_hide_timer;
-
-static void info_toast_hide_timer_cb(lv_timer_t * timer) {
-    (void) timer;
-    lv_obj_add_flag(info_toast, LV_OBJ_FLAG_HIDDEN);
-    lv_timer_pause(info_toast_hide_timer);
-}
-
-static void build_info_toast(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    info_toast = lv_obj_create(top);
-    lv_obj_set_size(info_toast, 420, 140);
-    lv_obj_align(info_toast, LV_ALIGN_CENTER, 0, -160);
-    lv_obj_set_style_radius(info_toast, 16, 0);
-    lv_obj_add_style(info_toast, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(info_toast, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(info_toast, 0, 0);
-    lv_obj_remove_flag(info_toast, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(info_toast, LV_OBJ_FLAG_HIDDEN);
-
-    info_toast_label = lv_label_create(info_toast);
-    lv_obj_set_width(info_toast_label, lv_pct(90));
-    lv_label_set_long_mode(info_toast_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(info_toast_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(info_toast_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(info_toast_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_center(info_toast_label);
-
-    info_toast_hide_timer = lv_timer_create(info_toast_hide_timer_cb, 5000, NULL);
-    lv_timer_pause(info_toast_hide_timer);
-}
-
-void show_info_toast(const char * msg) {
-    lv_label_set_text(info_toast_label, msg);
-    lv_obj_remove_flag(info_toast, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(info_toast);
-    lv_timer_reset(info_toast_hide_timer);
-    lv_timer_resume(info_toast_hide_timer);
-}
+/* info_toast moved to gui_notifications.c */
 
 /* Shows the popup at the given 0-100 level and (re)starts its 1.5s
  * auto-hide countdown -- called every time the level actually changes, so
@@ -3596,8 +3388,6 @@ const char * basename_of(const char * path);
  * screens -- long-pressing the drawer's wifi/bt icons opens the real
  * settings screen for that radio, matching Android's quick-settings
  * convention (tap toggles, long-press opens the full screen). */
-static void open_wifi_screen(void);
-static void open_bluetooth_screen(void);
 
 /* Long-press handlers for the drawer's wifi/bt icons -- hides the drawer
  * instantly (no slide-out animation; the settings screen navigation is
@@ -4113,7 +3903,6 @@ void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enab
     }
 }
 
-static void populate_bt_dac_screen(void); /* defined with the rest of the Bluetooth DAC screen, below */
 
 static void poll_bt_apply_output_settings(void) {
     if (!bt_apply_output_settings_active || !atomic_load_explicit(&bt_apply_output_settings_done_flag, memory_order_acquire)) return;
@@ -6050,11 +5839,8 @@ void poll_bt_scan(void);
 void poll_bt_connect(void);
 void poll_bt_forget(void);
 static void poll_library_rescan(void);
-static void poll_usb_mode_switch(void);
-static void poll_usb_storage_hotplug(void);
 static void poll_sd_card_hotplug(void);
 static void poll_sd_format(void);
-static void poll_import_web_stop(void);
 
 /* Full radio suspend after a long stretch with the screen off and nothing
  * going on -- deliberately separate from (and much longer than) the
@@ -9694,62 +9480,7 @@ static void poll_dlna_control(void) {
  * non-cancelable uses. */
 
 /* --- Modal API Implementation --- */
-gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
-    gui_busy_current_token++;
-    if (!gui_busy_screen) {
-        gui_busy_screen = lv_obj_create(NULL);
-        lv_obj_add_style(gui_busy_screen, &style_theme_screen_bg, 0);
-
-        gui_busy_label = lv_label_create(gui_busy_screen);
-        lv_obj_add_style(gui_busy_label, &style_theme_text_primary, 0);
-        lv_obj_set_style_text_align(gui_busy_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(gui_busy_label, LV_ALIGN_CENTER, 0, -20);
-
-        gui_busy_progress_bar = lv_bar_create(gui_busy_screen);
-        lv_obj_set_size(gui_busy_progress_bar, 280, 14);
-        lv_obj_align(gui_busy_progress_bar, LV_ALIGN_CENTER, 0, 30);
-        lv_bar_set_range(gui_busy_progress_bar, 0, 100);
-        lv_obj_add_style(gui_busy_progress_bar, &style_accent, LV_PART_INDICATOR);
-    }
-    
-    if (msg && msg[0] != '\0') {
-        lv_label_set_text_fmt(gui_busy_label, "%s\n%s", title, msg);
-    } else {
-        lv_label_set_text(gui_busy_label, title);
-    }
-    lv_obj_add_flag(gui_busy_progress_bar, LV_OBJ_FLAG_HIDDEN);
-    
-    if (lv_screen_active() != gui_busy_screen) {
-        nav_push(gui_busy_screen);
-    }
-    return gui_busy_current_token;
-}
-
-void gui_busy_set_progress(gui_busy_handle_t handle, int percent) {
-    if (handle != gui_busy_current_token || !gui_busy_screen) return;
-    lv_obj_remove_flag(gui_busy_progress_bar, LV_OBJ_FLAG_HIDDEN);
-    lv_bar_set_value(gui_busy_progress_bar, percent, LV_ANIM_OFF);
-}
-
-void gui_busy_hide(gui_busy_handle_t handle) {
-    if (handle != gui_busy_current_token || !gui_busy_screen) return;
-    if (lv_screen_active() == gui_busy_screen) {
-        nav_pop();
-    }
-    gui_busy_current_token++; /* invalidate token */
-}
-
-/* --- Theme API Implementation --- */
-const lv_font_t * gui_theme_font(gui_font_role_t role) {
-    switch (role) {
-        case GUI_FONT_ROLE_TITLE:   return gui_theme_font(GUI_FONT_ROLE_TITLE);
-        case GUI_FONT_ROLE_ROW:     return gui_theme_font(GUI_FONT_ROLE_ROW);
-        case GUI_FONT_ROLE_BODY:    return gui_theme_font(GUI_FONT_ROLE_BODY);
-        case GUI_FONT_ROLE_SUBTEXT: return gui_theme_font(GUI_FONT_ROLE_SUBTEXT);
-        case GUI_FONT_ROLE_STATUS:  return gui_theme_font(GUI_FONT_ROLE_SUBTEXT);
-        default:                    return gui_theme_font(GUI_FONT_ROLE_ROW);
-    }
-}
+/* gui_busy_* and gui_theme_font moved to gui_notifications.c and gui_theme.c */
 
 /* ---- "Download to library" -- Subsonic screen redesign. Unlike the
  * single-song download-then-play flow just above (which caches into
@@ -12433,7 +12164,7 @@ static void refresh_library_screens_after_reload(void) {
      * long enough to show the completion message, so only preserve that
      * explicitly safe case. Resetting also removes deeper group screens
      * whose rows reference the library arrays replaced by the reload. */
-    if (lv_screen_active() != gui_busy_screen) {
+    if (lv_screen_active() != gui_busy_get_screen()) {
         nav_reset_to_home();
     } else {
         /* Audit finding: this exception only skipped nav_reset_to_home()
@@ -13502,11 +13233,12 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     /* Must run before anything could turn Wi-Fi/Bluetooth on and trigger
      * wifi_on.sh/bt_init's own one-time read of the file this bind-mounts
      * over -- see hostname_apply()'s own comment. */
+    gui_theme_init();
+    gui_notifications_init();
     hostname_apply(current_settings.hostname);
 
     /* Must run before any screen below captures a gui_theme_font(GUI_FONT_ROLE_SUBTEXT)/20/22/28
      * pointer into its own style -- see this function's own doc comment. */
-    apply_font_size_tier(current_settings.font_size_tier);
 
     /* Correct the persisted USB mode against live gadget state before
      * anything else reads it (external_dac_block_reason() in particular --
@@ -13563,24 +13295,14 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * PRESSING and per-object LV_EVENT_GESTURE bubbling) proved unreliable
      * here specifically. */
 
-    lv_style_init(&style_accent);
-    lv_style_set_bg_color(&style_accent, accent_lv_color());
-    lv_style_set_text_color(&style_accent, accent_lv_color());
-    lv_style_set_bg_image_recolor(&style_accent, accent_lv_color());
-    lv_style_set_bg_image_recolor_opa(&style_accent, LV_OPA_COVER);
-    lv_style_set_image_recolor(&style_accent, accent_lv_color());
     /* LV_OPA_80, not LV_OPA_COVER -- see apply_accent_color()'s own comment
      * on this same property for why COVER flattens on.png's handle and
      * track into one indistinguishable solid color. Mirrored here since
      * this is the initial setup at boot, before apply_accent_color() might
      * ever run again. */
-    lv_style_set_image_recolor_opa(&style_accent, LV_OPA_80);
 
-    lv_style_init(&style_muted_text);
-    lv_style_set_text_color(&style_muted_text, lv_color_make(220, 220, 220));
 
     fallback_font_init_early(current_settings.font_size_tier, current_settings.lyrics_font_size_tier); /* must run before any style/screen captures &app_font_16/&app_font_22/&app_font_lyrics -- see fallback_font.h */
-    screen_builders_init_list_row_style();
 
     /* Discovers plugin rows/tiles by loading and running every .lua file
      * under <SD card>/.plugins/ -- run early, well before Books, Settings,
@@ -13744,14 +13466,9 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * unlike the local-library bindings, these screens are never rebuilt (no
      * equivalent of a library rescan), so there's no second registration
      * site to mirror this at. */
-    build_import_rescan_popup(); /* must exist before import_wifi_back_cb (wired below) can show it */
     gui_network_init();
     gui_settings_init();
     gui_books_init();
-    build_eq_reset_popup();
-    build_factory_reset_popup();
-    build_font_size_reboot_popup();
-    build_hostname_reboot_popup();
     build_sd_mount_failed_popup();
     build_sd_format_confirm_popup();
     build_power_off_countdown_popup();
@@ -13792,12 +13509,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     build_status_bar();
     build_volume_popup();
     build_home_indicator_bar();
-    build_error_toast();
-    build_info_toast();
-    build_bt_action_popup();
-    build_wifi_action_popup();
-    build_usb_dac_leave_popup();
-    build_bt_dac_leave_popup();
     build_quick_drawer();
     refresh_clock_label();
     refresh_battery_topbar();

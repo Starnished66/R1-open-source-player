@@ -19,3 +19,6 @@ extern lv_obj_t * eq_profiles_screen;
 void gui_settings_init(void);
 void show_font_size_reboot_popup(void);
 void build_font_size_reboot_popup(void);
+
+lv_obj_t * build_home_screen(void);
+lv_obj_t * build_dac_home_screen(void);

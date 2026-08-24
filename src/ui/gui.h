@@ -326,8 +326,6 @@ extern int player_source_file_browser_row;
 void hide_more_menu_popup(void);
 
 extern char now_playing_path[600];
-extern lv_obj_t * nav_stack[];
-extern int nav_depth;
 
 void set_player_source_none(void);
 void set_player_source_all_songs(int index);
@@ -376,7 +374,6 @@ const char * play_mode_icon_asset(play_mode_t mode);
 extern lv_obj_t * quick_drawer_order_icon;
 
 
-extern int * playlist_lazy_sort_order;
 extern lv_obj_t * quick_drawer_title_label;
 extern lv_obj_t * quick_drawer_artist_label;
 extern lv_obj_t * quick_drawer_favorite_icon;
@@ -406,7 +403,6 @@ void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon);
 
 /* ---- Busy Indicator & Notifications ---- */
 /* Notifications and Accent declared in gui_notifications.h and gui_theme.h */
-extern lv_obj_t * settings_crossfade_toggle_img;
 void crossfade_switch_event_cb(lv_event_t * e);
 void car_mode_switch_event_cb(lv_event_t * e);
 void swipe_up_home_switch_event_cb(lv_event_t * e);

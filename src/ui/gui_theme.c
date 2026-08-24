@@ -32,7 +32,7 @@ const uint32_t accent_palette[ACCENT_PALETTE_COUNT] = {
     0xFFFFFF, /* white */
 };
 
-lv_obj_t * accent_swatches[ACCENT_PALETTE_COUNT];
+static lv_obj_t * accent_swatches[ACCENT_PALETTE_COUNT];
 
 extern player_settings_t current_settings;
 extern void settings_save(const player_settings_t * s);
@@ -119,4 +119,11 @@ void gui_theme_init(void) {
 
     fallback_font_init_early(current_settings.font_size_tier, current_settings.lyrics_font_size_tier);
     screen_builders_init_list_row_style();
+}
+
+
+void gui_theme_register_accent_swatch(int index, lv_obj_t * swatch) {
+    if (index >= 0 && index < ACCENT_PALETTE_COUNT) {
+        accent_swatches[index] = swatch;
+    }
 }

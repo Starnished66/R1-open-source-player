@@ -5,8 +5,6 @@
 
 lv_obj_t * gui_shell_get_home_screen(void);
 lv_obj_t * gui_shell_get_dac_home_screen(void);
-extern lv_obj_t * status_bar_band;
-extern lv_obj_t * home_indicator_band;
 
 extern lv_obj_t * quick_drawer_title_label;
 extern lv_obj_t * quick_drawer_artist_label;
@@ -45,3 +43,8 @@ void gui_shell_resume_fast_timers(void);
 
 bool gui_shell_has_background_work(void);
 void gui_shell_cancel_background_work(void);
+
+
+lv_obj_t * gui_shell_get_status_bar_band(void);
+lv_obj_t * gui_shell_get_home_indicator_band(void);
+void gui_shell_set_home_indicator_visible(bool visible);

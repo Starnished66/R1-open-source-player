@@ -16,7 +16,6 @@ extern lv_style_t style_theme_list_padding;
 extern lv_style_t style_button_pressed;
 extern lv_style_t style_accent;
 
-extern int nav_depth;
 extern void nav_remove_stack_slot(int depth);
 extern void enable_gesture_bubble_recursive(lv_obj_t * parent);
 extern void search_textarea_value_changed_cb(lv_event_t * e);
@@ -186,7 +185,7 @@ static void text_entry_commit(void) {
     text_entry_done_cb_t cb = text_entry_on_done;
     void * user_data = text_entry_user_data;
     uint32_t generation_before = text_entry_generation;
-    int depth_before = nav_depth;
+    int depth_before = gui_navigation_get_depth();
     /* Callback runs BEFORE nav_pop() specifically so the checks below can
      * see whether it navigated anywhere on its own -- see
      * text_entry_generation's own comment. Real-device bug report (Wi-Fi
@@ -216,7 +215,7 @@ static void text_entry_commit(void) {
      * out after the fact once it's clear something else already took its
      * place. */
     if (cb) cb(text_copy, user_data);
-    if (nav_depth > depth_before) {
+    if (gui_navigation_get_depth() > depth_before) {
         nav_remove_stack_slot(depth_before - 1);
     } else if (text_entry_generation == generation_before) {
         nav_pop();

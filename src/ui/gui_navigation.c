@@ -19,8 +19,8 @@
 #include "device_config.h"
 #include "transition_compositor.h"
 
-lv_obj_t * nav_stack[NAV_STACK_MAX] = { NULL };
-int nav_depth = 0;
+static lv_obj_t * nav_stack[NAV_STACK_MAX] = { NULL };
+static int nav_depth = 0;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,8 +33,6 @@ extern lv_obj_t * gui_library_get_music_screen();
 extern lv_obj_t * stream_media_screen;
 extern lv_obj_t * gui_network_get_wireless_screen();
 extern lv_obj_t * gui_shell_get_dac_home_screen();
-extern lv_obj_t * status_bar_band;
-extern lv_obj_t * home_indicator_band;
 extern lv_obj_t * gui_player_get_screen();
 extern lv_obj_t * gui_settings_get_about_screen();
 extern lv_obj_t * gui_settings_get_screen();
@@ -197,17 +195,19 @@ static lv_draw_buf_t * snapshot_screen_base(lv_obj_t * target_screen) {
 static void blend_persistent_bars(lv_draw_buf_t * base, lv_obj_t * target_screen) {
     bool topbar_target_hidden = current_settings.hide_player_topbar &&
                                  (target_screen == gui_player_get_screen() || target_screen == gui_lyrics_get_screen());
-    if (status_bar_band) {
-        bool status_was_hidden = lv_obj_has_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t * sb = gui_shell_get_status_bar_band();
+    lv_obj_t * hb = gui_shell_get_home_indicator_band();
+    if (sb) {
+        bool status_was_hidden = lv_obj_has_flag(sb, LV_OBJ_FLAG_HIDDEN);
         if (!topbar_target_hidden) {
-            if (status_was_hidden) lv_obj_remove_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
-            blend_overlay_onto_base(base, status_bar_band);
+            if (status_was_hidden) lv_obj_remove_flag(sb, LV_OBJ_FLAG_HIDDEN);
+            blend_overlay_onto_base(base, sb);
         }
-        if (status_was_hidden) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_remove_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+        if (status_was_hidden) lv_obj_add_flag(sb, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(sb, LV_OBJ_FLAG_HIDDEN);
     }
-    if (home_indicator_band && !lv_obj_has_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN)) {
-        blend_overlay_onto_base(base, home_indicator_band);
+    if (hb && !lv_obj_has_flag(hb, LV_OBJ_FLAG_HIDDEN)) {
+        blend_overlay_onto_base(base, hb);
     }
 }
 
@@ -415,11 +415,12 @@ void slide_transition_done_cb(lv_anim_t * a) {
      * the slide. Restore the status bar for the screen actually selected
      * and restore the screen-independent home-indicator setting now. */
     sync_player_topbar_visibility(final_scr);
-    if (ctx->fallback_bands_suppressed && home_indicator_band) {
+    lv_obj_t * hb_sup = gui_shell_get_home_indicator_band();
+    if (ctx->fallback_bands_suppressed && hb_sup) {
         if (ctx->home_indicator_was_hidden)
-            lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(hb_sup, LV_OBJ_FLAG_HIDDEN);
         else
-            lv_obj_remove_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(hb_sup, LV_OBJ_FLAG_HIDDEN);
     }
     if (ctx->overlay) lv_obj_delete(ctx->overlay); /* deletes img_from/img_to too -- NULL when this transition was handed to the compositor instead (see begin_slide_transition()'s own comment on why the overlay is skipped entirely there, not just left undrawn) */
     if (ctx->buf_from_owned) lv_draw_buf_destroy(ctx->buf_from);
@@ -619,13 +620,15 @@ slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward)
          * exactly once as part of those flattened frames instead of being
          * drawn a second time, stationary, above the sliding images. */
         ctx->fallback_bands_suppressed = true;
-        if (home_indicator_band) {
+        lv_obj_t * hb_sl = gui_shell_get_home_indicator_band();
+        lv_obj_t * sb_sl = gui_shell_get_status_bar_band();
+        if (hb_sl) {
             ctx->home_indicator_was_hidden =
-                lv_obj_has_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_has_flag(hb_sl, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(hb_sl, LV_OBJ_FLAG_HIDDEN);
         }
-        if (status_bar_band)
-            lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
+        if (sb_sl)
+            lv_obj_add_flag(sb_sl, LV_OBJ_FLAG_HIDDEN);
 
         lv_obj_t * overlay = lv_obj_create(lv_layer_top());
         lv_obj_remove_style_all(overlay);
@@ -919,3 +922,43 @@ void gui_navigation_init(void) {
     lv_screen_load(gui_shell_get_home_screen());
 }
 
+
+
+int gui_navigation_get_depth(void) {
+    return nav_depth;
+}
+
+lv_obj_t * gui_navigation_get_top_screen(void) {
+    return (nav_depth > 0) ? nav_stack[nav_depth - 1] : NULL;
+}
+
+lv_obj_t * gui_navigation_get_screen_at(int index) {
+    if (index < 0 || index >= nav_depth) return NULL;
+    return nav_stack[index];
+}
+
+bool gui_navigation_is_top(lv_obj_t * screen) {
+    return (nav_depth > 0 && nav_stack[nav_depth - 1] == screen);
+}
+
+void gui_navigation_remove_screen_instances(lv_obj_t ** screens, int count) {
+    for (int j = 0; j < count; j++) {
+        for (int i = nav_depth - 1; i >= 0; i--) {
+            if (nav_stack[i] == screens[j]) {
+                nav_remove_stack_slot(i);
+            }
+        }
+    }
+}
+
+void gui_navigation_replace_top(lv_obj_t * new_screen) {
+    if (nav_depth > 0) {
+        nav_stack[nav_depth - 1] = new_screen;
+    }
+}
+
+void gui_navigation_pop_to_depth(int target_depth) {
+    if (target_depth >= 1 && target_depth < nav_depth) {
+        nav_depth = target_depth;
+    }
+}

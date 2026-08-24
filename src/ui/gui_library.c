@@ -1,3 +1,4 @@
+#include "gui_navigation.h"
 #include "gui_library.h"
 #include "assets.h"
 #include "idle_shutdown.h"
@@ -2952,14 +2953,7 @@ static void refresh_library_screens_after_reload(void) {
          * screen itself is deliberately left alone. */
         lv_obj_t * being_replaced[] = { all_songs_screen, artists_screen, albums_screen, album_artist_screen,
                                          recently_added_screen };
-        for (int i = nav_depth - 1; i >= 0; i--) {
-            for (size_t j = 0; j < sizeof(being_replaced) / sizeof(being_replaced[0]); j++) {
-                if (nav_stack[i] == being_replaced[j]) {
-                    nav_remove_stack_slot(i);
-                    break;
-                }
-            }
-        }
+        gui_navigation_remove_screen_instances(being_replaced, (int)(sizeof(being_replaced) / sizeof(being_replaced[0])));
     }
 
     lv_obj_delete(all_songs_screen);

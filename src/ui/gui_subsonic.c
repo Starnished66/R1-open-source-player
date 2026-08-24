@@ -18,7 +18,6 @@ void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list,
 
 
 extern player_settings_t current_settings;
-extern int nav_depth;
 extern gui_busy_handle_t wifi_connect_saved_token;
 
 
@@ -205,14 +204,14 @@ void poll_subsonic_download(void) {
      * rather than trying to avoid creating it in the first place -- the
      * push already happened by the time this code can tell whether it
      * did. */
-    int depth_before = nav_depth;
+    int depth_before = gui_navigation_get_depth();
     if (success) {
         char ** playlist = malloc(sizeof(char *));
         playlist[0] = strdup(download_dest_path);
         clear_player_source(); /* a streamed-then-downloaded single track has no on-device list to go back to */
         on_file_selected(playlist, 1, 0);
     }
-    if (nav_depth > depth_before) {
+    if (gui_navigation_get_depth() > depth_before) {
         nav_remove_stack_slot(depth_before - 1);
     } else {
         gui_busy_hide(download_token);
@@ -332,7 +331,6 @@ static void start_subsonic_library_download(subsonic_song_t * songs, int song_co
                                               subsonic_album_t * albums_to_expand, int album_to_expand_count,
                                               const char * playlist_name, const char * progress_label) {
     subsonic_library_download_request_t * req = malloc(sizeof(*req));
-    if (!req) return;
     if (!req) return;
     req->server = subsonic_server_from_settings();
     req->songs = songs;
@@ -721,7 +719,7 @@ void poll_subsonic_browse(void) {
     subsonic_browse_active = false;
     pthread_join(subsonic_browse_thread, NULL);
     bool success = subsonic_browse_success_flag;
-    int depth_before = nav_depth;
+    int depth_before = gui_navigation_get_depth();
 
     if (success) {
         switch (subsonic_browse_result_kind) {
@@ -785,7 +783,7 @@ void poll_subsonic_browse(void) {
         free(subsonic_browse_result_playlists);
     }
 
-    if (nav_depth > depth_before) nav_remove_stack_slot(depth_before - 1);
+    if (gui_navigation_get_depth() > depth_before) nav_remove_stack_slot(depth_before - 1);
     else nav_pop();
 }
 
@@ -965,7 +963,7 @@ void poll_subsonic_connect(void) {
      * stuck underneath the artists screen forever) -- nav_remove_stack_
      * slot() splices it out instead, once it's clear the artists screen
      * already took its place. */
-    int depth_before = nav_depth;
+    int depth_before = gui_navigation_get_depth();
     if (success) {
         /* Becomes the active connection everything else in this app's
          * Subsonic browsing/download flow reads via subsonic_server_from_
@@ -1009,7 +1007,7 @@ void poll_subsonic_connect(void) {
         }
         nav_push(subsonic_menu_screen);
     }
-    if (nav_depth > depth_before) {
+    if (gui_navigation_get_depth() > depth_before) {
         nav_remove_stack_slot(depth_before - 1);
     } else {
         gui_busy_hide(wifi_connect_saved_token);

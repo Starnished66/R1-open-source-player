@@ -411,5 +411,6 @@ int main(void) {
         usleep(time_till_next * 1000); /* Convert milliseconds to microseconds */
     }
 
+    gui_deinit();
     return 0;
 }

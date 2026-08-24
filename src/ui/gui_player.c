@@ -517,7 +517,6 @@ static void launch_cover_decode_req(cover_decode_request_t r) {
     }
 
     cover_decode_request_t * req = malloc(sizeof(*req));
-    if (!req) return;
     if (!req) {
         /* Audit finding: this used to dereference req unconditionally --
          * on this RAM-constrained device, a malloc() this size (the
@@ -2386,9 +2385,9 @@ void swipe_up_home_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.swipe_up_home_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     if (current_settings.swipe_up_home_enabled) {
-        lv_obj_remove_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+        gui_shell_set_home_indicator_visible(true);
     } else {
-        lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+        gui_shell_set_home_indicator_visible(false);
     }
     settings_save(&current_settings);
 }
@@ -2544,11 +2543,20 @@ const char * playlist_path_at(int index) {
 void on_file_selected_lazy_all_songs(int selected_index) {
     int64_t count64 = metadata_db_get_song_count();
     int count = count64 > 0 ? (int) count64 : 0;
+    if (count <= 0 || selected_index < 0 || selected_index >= count) return;
+
+    char ** new_pl = calloc((size_t) count, sizeof(char *));
+    int * new_order = malloc(sizeof(int) * (size_t) count);
+    if (!new_pl || !new_order) {
+        free(new_pl);
+        free(new_order);
+        return;
+    }
 
     free_playlist();
-    playlist = calloc((size_t) count, sizeof(char *));
+    playlist = new_pl;
+    playlist_lazy_sort_order = new_order;
     playlist_count = count;
-    playlist_lazy_sort_order = malloc(sizeof(int) * (size_t) count);
     for (int i = 0; i < count; i++) playlist_lazy_sort_order[i] = i;
     playlist_lazy_order_is_recency = false;
     queued_pending_count = 0;
@@ -2559,11 +2567,20 @@ void on_file_selected_lazy_all_songs(int selected_index) {
 void on_file_selected_lazy_recently_added(int selected_index) {
     int64_t count64 = metadata_db_get_song_count();
     int count = count64 > 0 ? (int) count64 : 0;
+    if (count <= 0 || selected_index < 0 || selected_index >= count) return;
+
+    char ** new_pl = calloc((size_t) count, sizeof(char *));
+    int * new_order = malloc(sizeof(int) * (size_t) count);
+    if (!new_pl || !new_order) {
+        free(new_pl);
+        free(new_order);
+        return;
+    }
 
     free_playlist();
-    playlist = calloc((size_t) count, sizeof(char *));
+    playlist = new_pl;
+    playlist_lazy_sort_order = new_order;
     playlist_count = count;
-    playlist_lazy_sort_order = malloc(sizeof(int) * (size_t) count);
     for (int i = 0; i < count; i++) playlist_lazy_sort_order[i] = i;
     playlist_lazy_order_is_recency = true;
     queued_pending_count = 0;

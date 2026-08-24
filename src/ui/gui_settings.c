@@ -32,6 +32,7 @@
 #include <pthread.h>
 
 /* Extern references to screen pointers owned by this module (defined here) */
+static lv_obj_t * settings_crossfade_toggle_img = NULL;
 static lv_obj_t * settings_screen;
 static lv_obj_t * settings_playback_screen;
 static lv_obj_t * settings_display_screen;
@@ -448,7 +449,7 @@ static lv_obj_t * build_accent_color_screen(void) {
         lv_obj_set_style_border_color(swatch, lv_color_make(255, 255, 255), 0);
         lv_obj_add_flag(swatch, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(swatch, accent_swatch_event_cb, LV_EVENT_CLICKED, (void *) (intptr_t) accent_palette[i]);
-        accent_swatches[i] = swatch;
+        gui_theme_register_accent_swatch(i, swatch);
     }
 
     finalize_screen_navigation(scr);
@@ -2312,3 +2313,13 @@ lv_obj_t * gui_settings_get_system_screen(void) { return settings_system_screen;
 lv_obj_t * gui_settings_get_about_screen(void) { return about_screen; }
 lv_obj_t * gui_settings_get_accent_screen(void) { return accent_color_screen; }
 lv_obj_t * gui_settings_get_eq_screen(void) { return eq_screen; }
+
+
+
+void gui_settings_sync_crossfade_toggle(void) {
+    if (!settings_crossfade_toggle_img) return;
+    lv_image_set_src(settings_crossfade_toggle_img,
+                     asset_path(current_settings.crossfade_enabled ? "settings/on.png" : "settings/off.png"));
+    if (current_settings.crossfade_enabled) lv_obj_add_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
+    else lv_obj_clear_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
+}

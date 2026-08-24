@@ -17,7 +17,7 @@ extern lv_style_t style_accent;
 extern lv_style_t style_muted_text;
 
 extern const uint32_t accent_palette[ACCENT_PALETTE_COUNT];
-extern lv_obj_t * accent_swatches[ACCENT_PALETTE_COUNT];
+void gui_theme_register_accent_swatch(int index, lv_obj_t * swatch);
 
 
 void gui_theme_init(void);

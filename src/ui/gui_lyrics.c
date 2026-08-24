@@ -88,8 +88,6 @@ static int lyrics_load_generation = 0;
  * once poll_lyrics_load() transfers it; freed there on the next load and
  * whenever current_lyrics_plain_mode is cleared. */
 extern void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stride, int radius);
-extern int nav_depth;
-extern lv_obj_t * nav_stack[16];
 
 
 extern int current_cover_for_index;
@@ -240,7 +238,6 @@ static void launch_lyrics_load(int for_index, const char * track_path) {
     }
 
     lyrics_load_request_t * req = malloc(sizeof(*req));
-    if (!req) return;
     if (!req) return;
     req->generation = lyrics_load_generation;
     req->for_index = for_index;
@@ -415,7 +412,6 @@ static void launch_lyrics_backdrop_decode(void) {
         return;
     }
     lyrics_backdrop_request_t * req = malloc(sizeof(*req));
-    if (!req) return;
     if (!req) return;
     req->cover_copy = malloc((size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
     if (!req->cover_copy) { free(req); return; }
@@ -652,9 +648,7 @@ static void lyrics_gesture_event_cb(lv_event_t * e) {
      * launch_lyrics_backdrop_decode()'s own comment), so this costs nothing
      * new on re-entry beyond that already-accepted, already-documented gap. */
     lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
-    if (nav_depth > 1) nav_depth--;
-    lv_screen_load(nav_stack[nav_depth - 1]);
-    sync_player_topbar_visibility(nav_stack[nav_depth - 1]);
+    nav_pop();
 }
 /* Records a manual scroll only when driven by an actual finger-press (same
  * lv_indev_get_state()==LV_INDEV_STATE_PRESSED precedent used elsewhere in

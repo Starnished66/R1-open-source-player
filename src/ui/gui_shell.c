@@ -39,7 +39,7 @@
 
 static lv_obj_t * home_screen = NULL;
 static lv_obj_t * dac_home_screen = NULL;
-lv_obj_t * status_bar_band = NULL;
+static lv_obj_t * status_bar_band = NULL;
 extern player_settings_t current_settings;
 
 static lv_obj_t * clock_topbar_group = NULL;
@@ -80,7 +80,7 @@ static void refresh_quick_drawer_brightness(void) {
 
 extern bool player_transition_cache_dirty;
 extern void player_transition_cache_async_cb(void * user_data);
-lv_obj_t * home_indicator_band = NULL;
+static lv_obj_t * home_indicator_band = NULL;
 
 lv_obj_t * quick_drawer_title_label = NULL;
 lv_obj_t * quick_drawer_artist_label = NULL;
@@ -925,7 +925,7 @@ static void poll_refresh_bt_icon(void) {
          * check needed here anymore -- the whole function already returned
          * early above while a toggle's in flight, see that comment for the
          * real-device bug this used to only half-fix.) */
-        if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_bt_screen()) populate_bt_screen();
+        if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
         return;
     }
     lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
@@ -1004,7 +1004,7 @@ static void poll_refresh_bt_icon(void) {
      * actually opens it. (No bt_toggle_active check needed here either --
      * same reasoning as the other populate_bt_screen() call site above,
      * this function's own !display_powered branch.) */
-    if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_bt_screen()) populate_bt_screen();
+    if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
 
     /* Real-device bug: pairing/connecting Bluetooth headphones worked (this
      * poll's own refresh_bt_icon_result_connected went true), but no audio
@@ -1193,14 +1193,7 @@ void refresh_quick_drawer_crossfade_icon(void) {
  * Playback was opened -- the settings->drawer direction already worked
  * (crossfade_switch_event_cb calls refresh_quick_drawer_crossfade_icon()),
  * but nothing called the reverse. */
-lv_obj_t * settings_crossfade_toggle_img;
-static void sync_settings_crossfade_toggle(void) {
-    if (!settings_crossfade_toggle_img) return;
-    lv_image_set_src(settings_crossfade_toggle_img,
-                     asset_path(current_settings.crossfade_enabled ? "settings/on.png" : "settings/off.png"));
-    if (current_settings.crossfade_enabled) lv_obj_add_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
-    else lv_obj_clear_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
-}
+
 
 static void quick_drawer_crossfade_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -1208,7 +1201,7 @@ static void quick_drawer_crossfade_event_cb(lv_event_t * e) {
     audio_set_crossfade_enabled(current_settings.crossfade_enabled);
     settings_save(&current_settings);
     refresh_quick_drawer_crossfade_icon();
-    sync_settings_crossfade_toggle();
+    gui_settings_sync_crossfade_toggle();
 }
 
 /* Defined later, alongside the rest of the transport-button wiring --
@@ -1905,8 +1898,8 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
              * once this settle animation finishes, not here; nothing else
              * reads the nav stack before then, so only the bookkeeping
              * needs to be right immediately. */
-            if (nav_depth < NAV_STACK_MAX && !(nav_depth > 0 && nav_stack[nav_depth - 1] == gui_player_get_screen())) {
-                nav_stack[nav_depth++] = gui_player_get_screen();
+            if (!gui_navigation_is_top(gui_player_get_screen())) {
+                nav_push(gui_player_get_screen());
             }
         }
         lv_anim_t a;
@@ -2083,7 +2076,7 @@ void quick_drawer_wifi_event_cb(lv_event_t * e) {
         wifi_toggle_active = false;
         refresh_wifi_icon();
     start_bt_dac_startup_reapply_if_needed();
-        if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_wifi_screen())
+        if (gui_navigation_is_top(gui_network_get_wifi_screen()))
             populate_wifi_screen(wifi_control_is_enabled());
     }
 }
@@ -2328,7 +2321,7 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
      * until start_refresh_bt_icon()'s real result lands afterward and
      * correctly finalizes it. */
     bt_is_powered_cached = bt_will_be_powered;
-    if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_bt_screen()) populate_bt_screen();
+    if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
 
     /* Runs fully in the background, same as the stock player -- no busy
      * screen. An earlier version pushed a "Turning on Bluetooth..."
@@ -2340,7 +2333,7 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
     if (pthread_create(&bt_toggle_thread, NULL, bt_pending_now ? bt_pending_enable_thread_func : bt_toggle_thread_func, NULL) != 0) {
         bt_toggle_active = false;
         bt_is_powered_cached = !bt_will_be_powered;
-        if (nav_depth > 0 && nav_stack[nav_depth - 1] == gui_network_get_bt_screen()) populate_bt_screen();
+        if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
         show_info_toast("Failed to toggle Bluetooth");
     }
 }
@@ -2890,3 +2883,19 @@ void gui_shell_cancel_background_work(void) {
 
 lv_obj_t * gui_shell_get_home_screen(void) { return home_screen; }
 lv_obj_t * gui_shell_get_dac_home_screen(void) { return dac_home_screen; }
+
+
+lv_obj_t * gui_shell_get_status_bar_band(void) {
+    return status_bar_band;
+}
+
+lv_obj_t * gui_shell_get_home_indicator_band(void) {
+    return home_indicator_band;
+}
+
+void gui_shell_set_home_indicator_visible(bool visible) {
+    if (home_indicator_band) {
+        if (visible) lv_obj_remove_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_HIDDEN);
+    }
+}

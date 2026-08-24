@@ -51,7 +51,6 @@ extern player_settings_t current_settings;
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
 extern void nav_remove_stack_slot(int depth);
-extern int nav_depth;
 extern void finalize_screen_navigation(lv_obj_t * screen);
 extern void show_error_toast(const char * msg);
 extern void show_info_toast(const char * msg);
@@ -2250,7 +2249,7 @@ void poll_import_web_stop(void) {
     import_web_stop_active = false;
     pthread_join(import_web_stop_thread, NULL);
 
-    if (import_web_stop_nav_slot >= 0 && import_web_stop_nav_slot < nav_depth) {
+    if (import_web_stop_nav_slot >= 0 && import_web_stop_nav_slot < gui_navigation_get_depth()) {
         nav_remove_stack_slot(import_web_stop_nav_slot);
     }
     gui_busy_hide(import_web_stop_token);
@@ -2265,7 +2264,7 @@ void poll_import_web_stop(void) {
 static void import_wifi_back_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-    import_web_stop_nav_slot = nav_depth - 1; /* this screen's own slot, before pushing the busy screen on top of it */
+    import_web_stop_nav_slot = gui_navigation_get_depth() - 1; /* this screen's own slot, before pushing the busy screen on top of it */
     import_web_stop_token = gui_busy_show("Closing\nWeb Server...", "");
 
     atomic_store_explicit(&import_web_stop_done_flag, false, memory_order_relaxed);

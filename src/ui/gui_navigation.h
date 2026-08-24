@@ -23,8 +23,13 @@ typedef struct {
     bool commit;
 } slide_transition_ctx_t;
 
-extern lv_obj_t * nav_stack[NAV_STACK_MAX];
-extern int nav_depth;
+int gui_navigation_get_depth(void);
+lv_obj_t * gui_navigation_get_top_screen(void);
+lv_obj_t * gui_navigation_get_screen_at(int index);
+bool gui_navigation_is_top(lv_obj_t * screen);
+void gui_navigation_remove_screen_instances(lv_obj_t ** screens, int count);
+void gui_navigation_replace_top(lv_obj_t * new_screen);
+void gui_navigation_pop_to_depth(int target_depth);
 extern bool player_transition_cache_dirty;
 
 void gui_navigation_init(void);

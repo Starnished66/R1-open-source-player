@@ -9,6 +9,7 @@
 #include "gui_player.h"
 #include "gui_plugins.h"
 #include "gui_shell.h"
+#include "gui_navigation.h"
 #include "metadata_db.h"
 
 
@@ -391,26 +392,6 @@ void on_file_selected(char ** new_playlist, int count, int selected_index);
 void clear_player_source(void);
 
 
-typedef struct {
-    lv_obj_t * overlay;
-    lv_obj_t * img_from;
-    lv_obj_t * img_to;
-    lv_draw_buf_t * buf_from;
-    lv_draw_buf_t * buf_to;
-    bool buf_from_owned;
-    bool buf_to_owned;
-    bool fallback_bands_suppressed;
-    bool home_indicator_was_hidden;
-    int32_t to_offset;
-    lv_obj_t * from_scr;
-    lv_obj_t * to_scr;
-    bool forward;
-    bool commit;
-} slide_transition_ctx_t;
-
-slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward);
-void slide_transition_anim_x_cb(void * var, int32_t v);
-void slide_transition_done_cb(lv_anim_t * a);
 
 #define NAV_STACK_MAX 16
 void boot_checkpoint(const char * msg);

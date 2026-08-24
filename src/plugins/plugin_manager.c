@@ -2314,6 +2314,16 @@ static int l_plugin_library_get_albums(lua_State * L) {
     return 1;
 }
 
+/* plugin.refresh_library() -- triggers the same background rescan as
+ * Settings > Update Music Database, so a plugin that wrote new files under
+ * plugin.sd_root() can make them show up in library_*() without the user
+ * finding that menu item themselves. No-op if a rescan is already running. */
+static int l_plugin_refresh_library(lua_State * L) {
+    (void) L;
+    gui_plugin_refresh_library();
+    return 0;
+}
+
 /* ---- plugin.on(event, callback) -- see plugin_manager.h's own
  * PLUGIN_MAX_EVENT_SUBSCRIBERS comment for the design rationale (multiple
  * plugins can subscribe to the same event, unlike register_list_item()'s
@@ -2732,6 +2742,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "library_get_song",          l_plugin_library_get_song },
     { "library_get_artists",       l_plugin_library_get_artists },
     { "library_get_albums",        l_plugin_library_get_albums },
+    { "refresh_library",           l_plugin_refresh_library },
     { "on",                        l_plugin_on },
     { "set_interval",              l_plugin_set_interval },
     { "clear_interval",            l_plugin_clear_interval },

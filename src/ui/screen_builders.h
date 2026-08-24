@@ -154,7 +154,7 @@ typedef struct {
  * caption below the icon, in its own reserved row -- the right choice for
  * plain glyph-on-transparent assets (category/launcher/stream_media). true
  * (Wireless only) instead draws the caption inside the icon's own image,
- * near its bottom -- the wireless/*.png assets are themselves pre-baked
+ * near its bottom -- the wireless/ star.png assets are themselves pre-baked
  * "card + glyph + reserved caption band" graphics (confirmed by scanning
  * their actual pixels: every one of them has its glyph content end around
  * 65% down a much taller canvas, with flat card background filling the

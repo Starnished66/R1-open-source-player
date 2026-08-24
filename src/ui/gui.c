@@ -4735,7 +4735,10 @@ static void get_display_names(const char * path, char * title_out, size_t title_
 
         const char * folder_slash = strrchr(dir_path, '/');
         const char * folder_name = folder_slash ? folder_slash + 1 : dir_path;
-        snprintf(folder_out, folder_size, "%s", folder_name);
+        if (folder_size > 0) {
+            strncpy(folder_out, folder_name, folder_size - 1);
+            folder_out[folder_size - 1] = '\0';
+        }
     }
 }
 

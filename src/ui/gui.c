@@ -2326,7 +2326,7 @@ static int bt_paired_states_count = 0;
  * here can no longer block LVGL's own timer_handler() from running. */
 static pthread_t refresh_bt_icon_thread;
 static bool refresh_bt_icon_active = false;
-static volatile bool refresh_bt_icon_done_flag = false;
+static atomic_bool refresh_bt_icon_done_flag = false;
 static bool refresh_bt_icon_result_powered = false;
 static bool refresh_bt_icon_result_connected = false;
 static bool refresh_bt_icon_result_a2dp_connected = false;
@@ -2375,14 +2375,14 @@ static void * refresh_bt_icon_thread_func(void * arg) {
         refresh_bt_icon_result_connected = false;
     }
 
-    refresh_bt_icon_done_flag = true; /* written last -- poll_refresh_bt_icon only checks this flag */
+    atomic_store_explicit(&refresh_bt_icon_done_flag, true, memory_order_release); /* written last -- poll_refresh_bt_icon only checks this flag */
     return NULL;
 }
 
 static void start_refresh_bt_icon(void) {
     if (refresh_bt_icon_active) return; /* previous check still in flight -- same "ignore taps until it lands" pattern as everything else here */
     refresh_bt_icon_active = true;
-    refresh_bt_icon_done_flag = false;
+    atomic_store_explicit(&refresh_bt_icon_done_flag, false, memory_order_relaxed);
         if (pthread_create(&refresh_bt_icon_thread, NULL, refresh_bt_icon_thread_func, NULL) != 0) {
         refresh_bt_icon_active = false;
     }
@@ -2392,7 +2392,7 @@ static void populate_bt_screen(void); /* defined with the rest of the Bluetooth 
 static bool bt_toggle_active; /* defined with the rest of the tap-to-toggle mechanism, below -- see poll_refresh_bt_icon()'s own use of it */
 
 static void poll_refresh_bt_icon(void) {
-    if (!refresh_bt_icon_active || !refresh_bt_icon_done_flag) return;
+    if (!refresh_bt_icon_active || !atomic_load_explicit(&refresh_bt_icon_done_flag, memory_order_acquire)) return;
     refresh_bt_icon_active = false;
     pthread_join(refresh_bt_icon_thread, NULL);
 
@@ -3744,7 +3744,7 @@ static void quick_drawer_bt_long_press_cb(lv_event_t * e) {
  * thread, polled the same way as every other background op in this file. */
 static pthread_t wifi_toggle_thread;
 static bool wifi_toggle_active = false;
-static volatile bool wifi_toggle_done_flag = false;
+static atomic_bool wifi_toggle_done_flag = false;
 static bool wifi_toggle_target_enabled = false;
 
 static void * wifi_toggle_thread_func(void * arg) {
@@ -3768,7 +3768,7 @@ static void * wifi_toggle_thread_func(void * arg) {
         usleep(300000);
     }
 
-    wifi_toggle_done_flag = true; /* written last -- poll_wifi_toggle only checks this flag */
+    atomic_store_explicit(&wifi_toggle_done_flag, true, memory_order_release); /* written last -- poll_wifi_toggle only checks this flag */
     return NULL;
 }
 
@@ -3783,7 +3783,7 @@ static void quick_drawer_wifi_event_cb(lv_event_t * e) {
     if (wifi_toggle_active) return; /* already toggling -- ignore taps until it lands */
     bool wifi_will_be_enabled = !wifi_control_is_enabled();
     wifi_toggle_active = true;
-    wifi_toggle_done_flag = false;
+    atomic_store_explicit(&wifi_toggle_done_flag, false, memory_order_relaxed);
     wifi_toggle_target_enabled = wifi_will_be_enabled;
 
     /* Optimistic sprite flip -- wifi_control_is_enabled() is a plain
@@ -3842,7 +3842,7 @@ static void quick_drawer_wifi_event_cb(lv_event_t * e) {
 }
 
 static void poll_wifi_toggle(void) {
-    if (!wifi_toggle_active || !wifi_toggle_done_flag) return;
+    if (!wifi_toggle_active || !atomic_load_explicit(&wifi_toggle_done_flag, memory_order_acquire)) return;
     wifi_toggle_active = false;
     pthread_join(wifi_toggle_thread, NULL);
     bool enabled = wifi_control_is_enabled();
@@ -3860,7 +3860,7 @@ static void poll_wifi_toggle(void) {
  * all on a fresh boot. */
 static pthread_t bt_toggle_thread;
 static bool bt_toggle_active = false;
-static volatile bool bt_toggle_done_flag = false;
+static atomic_bool bt_toggle_done_flag = false;
 
 
 /* Set by bt_toggle_thread_func() when disabling Bluetooth while DAC mode
@@ -3928,7 +3928,7 @@ static void * bt_toggle_thread_func(void * arg) {
         }
     }
 
-    bt_toggle_done_flag = true; /* written last -- poll_bt_toggle only checks this flag */
+    atomic_store_explicit(&bt_toggle_done_flag, true, memory_order_release); /* written last -- poll_bt_toggle only checks this flag */
     return NULL;
 }
 
@@ -3992,7 +3992,7 @@ static void * bt_pending_enable_thread_func(void * arg) {
     if (init_finished && off_observations < BT_BOOT_ENABLE_OFF_OBSERVATIONS_REQUIRED) {
         if (bt_control_init_chip()) bt_control_enable();
     }
-    bt_toggle_done_flag = true; /* written last -- poll_bt_toggle only checks this flag */
+    atomic_store_explicit(&bt_toggle_done_flag, true, memory_order_release); /* written last -- poll_bt_toggle only checks this flag */
     return NULL;
 }
 
@@ -4029,7 +4029,7 @@ static void quick_drawer_bt_event_cb(lv_event_t * e) {
     bt_boot_off_observations = 0;
 
     bt_toggle_active = true;
-    bt_toggle_done_flag = false;
+    atomic_store_explicit(&bt_toggle_done_flag, false, memory_order_relaxed);
 
     /* Optimistic sprite flip, same reasoning as quick_drawer_wifi_event_cb's
      * own comment -- bt_is_powered_cached (kept fresh by
@@ -4094,7 +4094,7 @@ static void quick_drawer_bt_event_cb(lv_event_t * e) {
 }
 
 static void poll_bt_toggle(void) {
-    if (!bt_toggle_active || !bt_toggle_done_flag) return;
+    if (!bt_toggle_active || !atomic_load_explicit(&bt_toggle_done_flag, memory_order_acquire)) return;
     bt_toggle_active = false;
     pthread_join(bt_toggle_thread, NULL);
 
@@ -4134,14 +4134,14 @@ static void poll_bt_toggle(void) {
  * this can't block gui_init() / the UI thread). */
 static pthread_t bt_dac_startup_reapply_thread;
 static bool bt_dac_startup_reapply_active = false;
-static volatile bool bt_dac_startup_reapply_done_flag = false;
+static atomic_bool bt_dac_startup_reapply_done_flag = false;
 
 static void * bt_dac_startup_reapply_thread_func(void * arg) {
     (void) arg;
     bt_control_init_chip();
     bt_control_enable();
     bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
-    bt_dac_startup_reapply_done_flag = true; /* written last -- poll_bt_dac_startup_reapply only checks this flag */
+    atomic_store_explicit(&bt_dac_startup_reapply_done_flag, true, memory_order_release); /* written last -- poll_bt_dac_startup_reapply only checks this flag */
     return NULL;
 }
 
@@ -4151,7 +4151,7 @@ static void * bt_dac_startup_reapply_thread_func(void * arg) {
 static void start_bt_dac_startup_reapply_if_needed(void) {
     if (!current_settings.bt_dac_mode_enabled) return;
     bt_dac_startup_reapply_active = true;
-    bt_dac_startup_reapply_done_flag = false;
+    atomic_store_explicit(&bt_dac_startup_reapply_done_flag, false, memory_order_relaxed);
         if (pthread_create(&bt_dac_startup_reapply_thread, NULL, bt_dac_startup_reapply_thread_func, NULL) != 0) {
         bt_dac_startup_reapply_active = false;
     }
@@ -4159,7 +4159,7 @@ static void start_bt_dac_startup_reapply_if_needed(void) {
 
 
 static void poll_bt_dac_startup_reapply(void) {
-    if (!bt_dac_startup_reapply_active || !bt_dac_startup_reapply_done_flag) return;
+    if (!bt_dac_startup_reapply_active || !atomic_load_explicit(&bt_dac_startup_reapply_done_flag, memory_order_acquire)) return;
     bt_dac_startup_reapply_active = false;
     pthread_join(bt_dac_startup_reapply_thread, NULL);
     start_refresh_bt_icon();
@@ -4180,7 +4180,7 @@ static void poll_bt_dac_startup_reapply(void) {
  * every other slow Bluetooth/Wi-Fi operation in this file already is. */
 static pthread_t bt_apply_output_settings_thread;
 static bool bt_apply_output_settings_active = false;
-static volatile bool bt_apply_output_settings_done_flag = false;
+static atomic_bool bt_apply_output_settings_done_flag = false;
 
 typedef struct {
     bool dac_mode_enabled;
@@ -4191,7 +4191,7 @@ static void * bt_apply_output_settings_thread_func(void * arg) {
     bt_apply_output_settings_request_t * req = (bt_apply_output_settings_request_t *) arg;
     bt_control_apply_output_settings(req->dac_mode_enabled, req->volume_sync_enabled);
     free(req);
-    bt_apply_output_settings_done_flag = true; /* written last -- poll_bt_apply_output_settings only checks this flag */
+    atomic_store_explicit(&bt_apply_output_settings_done_flag, true, memory_order_release); /* written last -- poll_bt_apply_output_settings only checks this flag */
     return NULL;
 }
 
@@ -4206,7 +4206,7 @@ static void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sy
     bt_apply_output_settings_request_t * req = malloc(sizeof(*req));
     req->dac_mode_enabled = dac_mode_enabled;
     req->volume_sync_enabled = volume_sync_enabled;
-    bt_apply_output_settings_done_flag = false;
+    atomic_store_explicit(&bt_apply_output_settings_done_flag, false, memory_order_relaxed);
     bt_apply_output_settings_active = true;
         if (pthread_create(&bt_apply_output_settings_thread, NULL, bt_apply_output_settings_thread_func, req) != 0) {
         bt_apply_output_settings_active = false;
@@ -4217,7 +4217,7 @@ static void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sy
 static void populate_bt_dac_screen(void); /* defined with the rest of the Bluetooth DAC screen, below */
 
 static void poll_bt_apply_output_settings(void) {
-    if (!bt_apply_output_settings_active || !bt_apply_output_settings_done_flag) return;
+    if (!bt_apply_output_settings_active || !atomic_load_explicit(&bt_apply_output_settings_done_flag, memory_order_acquire)) return;
     bt_apply_output_settings_active = false;
     pthread_join(bt_apply_output_settings_thread, NULL);
     populate_bt_dac_screen(); /* the DAC screen's own toggle rows need the post-apply state */
@@ -4989,7 +4989,7 @@ typedef struct {
 
 static pthread_t cover_decode_thread;
 static bool cover_decode_active = false;
-static volatile bool cover_decode_done_flag = false;
+static atomic_bool cover_decode_done_flag = false;
 
 /* Result fields, written by cover_decode_thread_func() on the background
  * thread and consumed (freed or applied) by poll_cover_decode() on the main
@@ -5077,7 +5077,7 @@ static void * cover_decode_thread_func(void * arg) {
     cover_decode_result_pixels = pixels;
     cover_decode_result_reflection = reflection;
     free(req);
-    cover_decode_done_flag = true; /* written last -- poll_cover_decode() only checks this flag */
+    atomic_store_explicit(&cover_decode_done_flag, true, memory_order_release); /* written last -- poll_cover_decode() only checks this flag */
     return NULL;
 }
 
@@ -5114,7 +5114,7 @@ static void launch_cover_decode_req(cover_decode_request_t r) {
         return;
     }
     *req = r;
-    cover_decode_done_flag = false;
+    atomic_store_explicit(&cover_decode_done_flag, false, memory_order_relaxed);
     cover_decode_active = true;
     if (pthread_create(&cover_decode_thread, NULL, cover_decode_thread_func, req) != 0) {
         free(req->picture_data);
@@ -5161,7 +5161,7 @@ static void launch_lyrics_backdrop_decode(void); /* defined alongside build_lyri
  * one is now either running or about to be), in which case the result is
  * just discarded rather than briefly flashing a stale track's art. */
 static void poll_cover_decode(void) {
-    if (!cover_decode_active || !cover_decode_done_flag) return;
+    if (!cover_decode_active || !atomic_load_explicit(&cover_decode_done_flag, memory_order_acquire)) return;
     cover_decode_active = false;
     pthread_join(cover_decode_thread, NULL);
 
@@ -5381,7 +5381,7 @@ static void * lyrics_load_thread_func(void * arg) {
     lyrics_load_result_plain_mode = plain_mode;
     lyrics_load_result_plain_text = plain_text;
     free(req);
-    lyrics_load_done_flag = true; /* written last -- poll_lyrics_load() only checks this flag */
+    atomic_store_explicit(&lyrics_load_done_flag, true, memory_order_release); /* written last -- poll_lyrics_load() only checks this flag */
     return NULL;
 }
 
@@ -5399,7 +5399,7 @@ static void launch_lyrics_load(int for_index, const char * track_path) {
     req->generation = lyrics_load_generation;
     req->for_index = for_index;
     snprintf(req->track_path, sizeof(req->track_path), "%s", track_path);
-    lyrics_load_done_flag = false;
+    atomic_store_explicit(&lyrics_load_done_flag, false, memory_order_relaxed);
     lyrics_load_active = true;
     if (pthread_create(&lyrics_load_thread, NULL, lyrics_load_thread_func, req) != 0) {
         free(req);
@@ -5417,7 +5417,7 @@ static void launch_lyrics_load(int for_index, const char * track_path) {
  * built from and resync from scratch at that point, so there is exactly
  * one place that reconciles the parsed doc with the on-screen pool. */
 static void poll_lyrics_load(void) {
-    if (!lyrics_load_active || !lyrics_load_done_flag) return;
+    if (!lyrics_load_active || !atomic_load_explicit(&lyrics_load_done_flag, memory_order_acquire)) return;
     lyrics_load_active = false;
     pthread_join(lyrics_load_thread, NULL);
 
@@ -5593,7 +5593,7 @@ static void * lyrics_backdrop_thread_func(void * arg) {
     lyrics_backdrop_result_generation = req->lyrics_generation;
     free(req->cover_copy);
     free(req);
-    lyrics_backdrop_done_flag = true; /* written last, same contract as every other _done_flag in this file */
+    atomic_store_explicit(&lyrics_backdrop_done_flag, true, memory_order_release); /* written last, same contract as every other _done_flag in this file */
     return NULL;
 }
 
@@ -5637,7 +5637,7 @@ static void launch_lyrics_backdrop_decode(void) {
     req->for_index = playlist_index;
     req->lyrics_generation = lyrics_load_generation;
 
-    lyrics_backdrop_done_flag = false;
+    atomic_store_explicit(&lyrics_backdrop_done_flag, false, memory_order_relaxed);
     lyrics_backdrop_active = true;
     lyrics_backdrop_active_for_index = req->for_index;
     lyrics_backdrop_active_generation = req->lyrics_generation;
@@ -5657,7 +5657,7 @@ static void launch_lyrics_backdrop_decode(void) {
  * magic, or LVGL's bin decoder silently corrupts the color format (see that
  * function's own real-device-incident comment for the full story). */
 static void poll_lyrics_backdrop(void) {
-    if (!lyrics_backdrop_active || !lyrics_backdrop_done_flag) return;
+    if (!lyrics_backdrop_active || !atomic_load_explicit(&lyrics_backdrop_done_flag, memory_order_acquire)) return;
     lyrics_backdrop_active = false;
     pthread_join(lyrics_backdrop_thread, NULL);
 
@@ -7496,14 +7496,14 @@ static void update_timer_cb(lv_timer_t * timer) {
              * flight. */
             if (wifi_was_on_before_suspend && !wifi_control_is_enabled() && !wifi_toggle_active) {
                 wifi_toggle_active = true;
-                wifi_toggle_done_flag = false;
+                atomic_store_explicit(&wifi_toggle_done_flag, false, memory_order_relaxed);
                 wifi_toggle_target_enabled = true;
                 if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0)
                     wifi_toggle_active = false;
             }
             if (bt_was_on_before_suspend && !bt_is_powered_cached && !bt_toggle_active) {
                 bt_toggle_active = true;
-                bt_toggle_done_flag = false;
+                atomic_store_explicit(&bt_toggle_done_flag, false, memory_order_relaxed);
                     if (pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL) != 0) {
         bt_toggle_active = false;
     }
@@ -7545,14 +7545,14 @@ static void update_timer_cb(lv_timer_t * timer) {
             bt_was_on_before_suspend = bt_is_powered_cached;
             if (wifi_was_on_before_suspend && !wifi_toggle_active) {
                 wifi_toggle_active = true;
-                wifi_toggle_done_flag = false;
+                atomic_store_explicit(&wifi_toggle_done_flag, false, memory_order_relaxed);
                 wifi_toggle_target_enabled = false;
                 if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0)
                     wifi_toggle_active = false;
             }
             if (bt_was_on_before_suspend && !bt_toggle_active) {
                 bt_toggle_active = true;
-                bt_toggle_done_flag = false;
+                atomic_store_explicit(&bt_toggle_done_flag, false, memory_order_relaxed);
                     if (pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL) != 0) {
         bt_toggle_active = false;
     }
@@ -11510,7 +11510,7 @@ static subsonic_server_t subsonic_server_from_settings(void) {
  * state directly. */
 static pthread_t download_thread;
 static bool download_active = false;
-static volatile bool download_done_flag = false;
+static atomic_bool download_done_flag = false;
 static volatile bool download_success_flag = false;
 static char download_dest_path[512];
 
@@ -11524,7 +11524,7 @@ static void * download_thread_func(void * arg) {
     download_request_t * req = (download_request_t *) arg;
     bool ok = http_get_to_file(req->url, req->verify_tls, req->dest_path, NULL, NULL);
     download_success_flag = ok;
-    download_done_flag = true; /* written last -- update_timer_cb only checks this flag */
+    atomic_store_explicit(&download_done_flag, true, memory_order_release); /* written last -- update_timer_cb only checks this flag */
     free(req);
     return NULL;
 }
@@ -11537,7 +11537,7 @@ static void start_subsonic_download(const char * url, bool verify_tls, const cha
     snprintf(req->dest_path, sizeof(req->dest_path), "%s", dest_path);
     req->verify_tls = verify_tls;
 
-    download_done_flag = false;
+    atomic_store_explicit(&download_done_flag, false, memory_order_relaxed);
     download_success_flag = false;
     download_active = true;
 
@@ -11552,7 +11552,7 @@ static void start_subsonic_download(const char * url, bool verify_tls, const cha
 }
 
 static void poll_subsonic_download(void) {
-    if (!download_active || !download_done_flag) return;
+    if (!download_active || !atomic_load_explicit(&download_done_flag, memory_order_acquire)) return;
 
     download_active = false;
     pthread_join(download_thread, NULL);
@@ -11752,7 +11752,7 @@ typedef struct {
 
 static pthread_t subsonic_library_download_thread;
 static bool subsonic_library_download_active = false;
-static volatile bool subsonic_library_download_done_flag = false;
+static atomic_bool subsonic_library_download_done_flag = false;
 static volatile int subsonic_library_download_progress = 0; /* songs completed so far */
 static volatile int subsonic_library_download_total = 0;    /* 0 while still expanding an artist's albums (Mode B) -- see poll_subsonic_library_download() */
 static int subsonic_library_download_success_count = 0;
@@ -11832,7 +11832,7 @@ static void * subsonic_library_download_thread_func(void * arg) {
     subsonic_library_download_success_count = success_count;
     free(songs);
     free(req);
-    subsonic_library_download_done_flag = true; /* written last -- poll_subsonic_library_download() only checks this flag */
+    atomic_store_explicit(&subsonic_library_download_done_flag, true, memory_order_release); /* written last -- poll_subsonic_library_download() only checks this flag */
     return NULL;
 }
 
@@ -11857,7 +11857,7 @@ static void start_subsonic_library_download(subsonic_song_t * songs, int song_co
     subsonic_library_download_progress = 0;
     subsonic_library_download_total = albums_to_expand ? 0 : song_count; /* 0 = "still figuring out the total," see poll_subsonic_library_download() */
     subsonic_library_download_success_count = 0;
-    subsonic_library_download_done_flag = false;
+    atomic_store_explicit(&subsonic_library_download_done_flag, false, memory_order_relaxed);
     subsonic_library_download_active = true;
 
     subsonic_library_download_token = gui_busy_show(progress_label, "");
@@ -11874,7 +11874,7 @@ static void start_subsonic_library_download(subsonic_song_t * songs, int song_co
 static void poll_subsonic_library_download(void) {
     if (!subsonic_library_download_active) return;
 
-    if (!subsonic_library_download_done_flag) {
+    if (!atomic_load_explicit(&subsonic_library_download_done_flag, memory_order_acquire)) {
         int total = subsonic_library_download_total;
         if (total > 0) {
             gui_busy_set_progress(subsonic_library_download_token, (subsonic_library_download_progress * 100) / total);
@@ -12559,7 +12559,7 @@ typedef struct {
 
 static pthread_t subsonic_browse_thread;
 static bool subsonic_browse_active = false;
-static volatile bool subsonic_browse_done_flag = false;
+static atomic_bool subsonic_browse_done_flag = false;
 static volatile bool subsonic_browse_success_flag = false;
 static subsonic_browse_kind_t subsonic_browse_result_kind;
 static char subsonic_browse_result_title[128];
@@ -12595,8 +12595,7 @@ static void * subsonic_browse_thread_func(void * arg) {
     snprintf(subsonic_browse_result_title, sizeof(subsonic_browse_result_title), "%s", req->title);
     subsonic_browse_result_count = count;
     subsonic_browse_success_flag = ok;
-    subsonic_browse_done_flag = true;
-    free(req);
+    atomic_store_explicit(&subsonic_browse_done_flag, true, memory_order_release); free(req);
     return NULL;
 }
 
@@ -12614,7 +12613,7 @@ static void start_subsonic_browse(subsonic_browse_kind_t kind, const char * id, 
     subsonic_browse_result_albums = NULL;
     subsonic_browse_result_playlists = NULL;
     subsonic_browse_result_count = 0;
-    subsonic_browse_done_flag = false;
+    atomic_store_explicit(&subsonic_browse_done_flag, false, memory_order_relaxed);
     subsonic_browse_success_flag = false;
     subsonic_browse_active = true;
 
@@ -12627,7 +12626,7 @@ static void start_subsonic_browse(subsonic_browse_kind_t kind, const char * id, 
 }
 
 static void poll_subsonic_browse(void) {
-    if (!subsonic_browse_active || !subsonic_browse_done_flag) return;
+    if (!subsonic_browse_active || !atomic_load_explicit(&subsonic_browse_done_flag, memory_order_acquire)) return;
 
     subsonic_browse_active = false;
     pthread_join(subsonic_browse_thread, NULL);
@@ -12876,7 +12875,7 @@ static void build_subsonic_download_confirm_popup(void) {
  * Browse button) below, rather than each having its own copy. */
 static pthread_t subsonic_connect_thread;
 static bool subsonic_connect_active = false;
-static volatile bool subsonic_connect_done_flag = false;
+static atomic_bool subsonic_connect_done_flag = false;
 static volatile bool subsonic_connect_success_flag = false;
 /* Snapshot of whichever server this in-flight attempt is for -- the
  * request struct itself is freed inside the thread function before
@@ -12900,13 +12899,13 @@ static void * subsonic_connect_thread_func(void * arg) {
     }
 
     subsonic_connect_success_flag = ok;
-    subsonic_connect_done_flag = true; /* written last -- poll_subsonic_connect only checks this flag */
+    atomic_store_explicit(&subsonic_connect_done_flag, true, memory_order_release); /* written last -- poll_subsonic_connect only checks this flag */
     free(req);
     return NULL;
 }
 
 static void poll_subsonic_connect(void) {
-    if (!subsonic_connect_active || !subsonic_connect_done_flag) return;
+    if (!subsonic_connect_active || !atomic_load_explicit(&subsonic_connect_done_flag, memory_order_acquire)) return;
 
     subsonic_connect_active = false;
     pthread_join(subsonic_connect_thread, NULL);
@@ -12979,7 +12978,7 @@ static void start_subsonic_connect(const subsonic_server_t * server) {
     subsonic_connect_request_t * req = malloc(sizeof(*req));
     req->server = *server;
 
-    subsonic_connect_done_flag = false;
+    atomic_store_explicit(&subsonic_connect_done_flag, false, memory_order_relaxed);
     subsonic_connect_success_flag = false;
     subsonic_connect_active = true;
 
@@ -14211,7 +14210,7 @@ static void * search_job_thread_func(void * arg) {
     search_job_request_t * req = (search_job_request_t *) arg;
     search_job_result_count = metadata_db_search_names(req->db_kind, req->query, SEARCH_RESULTS_MAX, search_job_result_hits);
     free(req);
-    search_job_done_flag = true; /* written last -- poll_search_job() only checks this flag */
+    atomic_store_explicit(&search_job_done_flag, true, memory_order_release); /* written last -- poll_search_job() only checks this flag */
     return NULL;
 }
 
@@ -14234,7 +14233,7 @@ static void launch_search_job(search_binding_t * b, const char * query) {
     snprintf(req->query, sizeof(req->query), "%s", query);
 
     search_job_for_binding = b;
-    search_job_done_flag = false;
+    atomic_store_explicit(&search_job_done_flag, false, memory_order_relaxed);
     search_job_active = true;
     if (pthread_create(&search_job_thread, NULL, search_job_thread_func, req) != 0) {
         free(req);
@@ -14275,7 +14274,7 @@ static void search_apply_results_to_list(search_binding_t * b, const metadata_db
  * search, or switched to a different search-active screen, while the query
  * was in flight. */
 static void poll_search_job(void) {
-    if (!search_job_active || !search_job_done_flag) return;
+    if (!search_job_active || !atomic_load_explicit(&search_job_done_flag, memory_order_acquire)) return;
     search_job_active = false;
     pthread_join(search_job_thread, NULL);
 
@@ -15193,12 +15192,12 @@ static void on_cue_file_selected(const char * cue_path) {
  * doesn't need rebuilding here. */
 static pthread_t library_rescan_thread;
 static bool library_rescan_active = false;
-static volatile bool library_rescan_done_flag = false;
+static atomic_bool library_rescan_done_flag = false;
 
 static void * library_rescan_thread_func(void * arg) {
     (void) arg;
     library_scan_once();
-    library_rescan_done_flag = true; /* written last -- update_timer_cb only checks this flag */
+    atomic_store_explicit(&library_rescan_done_flag, true, memory_order_release); /* written last -- update_timer_cb only checks this flag */
     return NULL;
 }
 
@@ -15219,7 +15218,7 @@ static void start_library_rescan(void) {
      * now) is what actually pthread_join()s it -- see start_album_
      * thumbnail_generation()'s own comment. */
     cancel_album_thumbnail_generation();
-    library_rescan_done_flag = false;
+    atomic_store_explicit(&library_rescan_done_flag, false, memory_order_relaxed);
     library_rescan_active = true;
     library_rescan_token = gui_busy_show("Updating\nmusic database...", "");
     gui_busy_set_progress(library_rescan_token, 0);
@@ -15379,7 +15378,7 @@ static void poll_library_rescan(void) {
 
     if (!library_rescan_active) return;
 
-    if (!library_rescan_done_flag) {
+    if (!atomic_load_explicit(&library_rescan_done_flag, memory_order_acquire)) {
         /* Still scanning -- total stays 0 until the initial file walk
          * finishes (see library_scan_once()), so there's nothing
          * meaningful to show yet in that window; the label just keeps
@@ -15752,18 +15751,18 @@ static bool sd_format_card_worker(void) {
 #endif
 
 static pthread_t sd_format_thread;
-static volatile bool sd_format_done_flag = false;
+static atomic_bool sd_format_done_flag = false;
 static volatile bool sd_format_succeeded = false;
 
 static void * sd_format_thread_func(void * arg) {
     (void) arg;
     sd_format_succeeded = sd_format_card_worker();
-    sd_format_done_flag = true; /* written last -- poll_sd_format() only checks this flag */
+    atomic_store_explicit(&sd_format_done_flag, true, memory_order_release); /* written last -- poll_sd_format() only checks this flag */
     return NULL;
 }
 
 static void start_sd_format(void) {
-    sd_format_done_flag = false;
+    atomic_store_explicit(&sd_format_done_flag, false, memory_order_relaxed);
     sd_format_active = true;
     sd_format_token = gui_busy_show("Formatting\nSD Card...", "");
         if (pthread_create(&sd_format_thread, NULL, sd_format_thread_func, NULL) != 0) {
@@ -15774,7 +15773,7 @@ static void start_sd_format(void) {
 }
 
 static void poll_sd_format(void) {
-    if (!sd_format_active || !sd_format_done_flag) return;
+    if (!sd_format_active || !atomic_load_explicit(&sd_format_done_flag, memory_order_acquire)) return;
 
     sd_format_active = false;
     pthread_join(sd_format_thread, NULL);
@@ -16117,7 +16116,7 @@ static void start_wifi_scan(void);
 
 static pthread_t wifi_connect_thread;
 static bool wifi_connect_active = false;
-static volatile bool wifi_connect_done_flag = false;
+static atomic_bool wifi_connect_done_flag = false;
 static volatile bool wifi_connect_succeeded = false;
 
 typedef struct {
@@ -16145,7 +16144,7 @@ static void * wifi_connect_thread_func(void * arg) {
         }
     }
     wifi_connect_succeeded = accepted && associated;
-    wifi_connect_done_flag = true; /* written last -- poll_wifi_connect only checks this flag */
+    atomic_store_explicit(&wifi_connect_done_flag, true, memory_order_release); /* written last -- poll_wifi_connect only checks this flag */
     return NULL;
 }
 
@@ -16154,7 +16153,7 @@ static void start_wifi_connect(const char * ssid, const char * password) {
     snprintf(req->ssid, sizeof(req->ssid), "%s", ssid);
     snprintf(req->password, sizeof(req->password), "%s", password ? password : "");
 
-    wifi_connect_done_flag = false;
+    atomic_store_explicit(&wifi_connect_done_flag, false, memory_order_relaxed);
     wifi_connect_active = true;
 
     wifi_connect_token = gui_busy_show("Connecting to", ssid);
@@ -16168,7 +16167,7 @@ static void start_wifi_connect(const char * ssid, const char * password) {
 }
 
 static void poll_wifi_connect(void) {
-    if (!wifi_connect_active || !wifi_connect_done_flag) return;
+    if (!wifi_connect_active || !atomic_load_explicit(&wifi_connect_done_flag, memory_order_acquire)) return;
 
     wifi_connect_active = false;
     pthread_join(wifi_connect_thread, NULL);
@@ -16188,7 +16187,7 @@ static void poll_wifi_connect(void) {
  * just call start_wifi_connect(ssid, NULL) instead. */
 static pthread_t wifi_connect_saved_thread;
 static bool wifi_connect_saved_active = false;
-static volatile bool wifi_connect_saved_done_flag = false;
+static atomic_bool wifi_connect_saved_done_flag = false;
 static volatile bool wifi_connect_saved_succeeded = false;
 
 typedef struct {
@@ -16209,7 +16208,7 @@ static void * wifi_connect_saved_thread_func(void * arg) {
         }
     }
     wifi_connect_saved_succeeded = accepted && associated;
-    wifi_connect_saved_done_flag = true; /* written last -- poll_wifi_connect_saved only checks this flag */
+    atomic_store_explicit(&wifi_connect_saved_done_flag, true, memory_order_release); /* written last -- poll_wifi_connect_saved only checks this flag */
     return NULL;
 }
 
@@ -16217,7 +16216,7 @@ static void start_wifi_connect_saved(int id, const char * ssid) {
     wifi_connect_saved_request_t * req = malloc(sizeof(*req));
     req->id = id;
 
-    wifi_connect_saved_done_flag = false;
+    atomic_store_explicit(&wifi_connect_saved_done_flag, false, memory_order_relaxed);
     wifi_connect_saved_active = true;
 
     wifi_connect_token = gui_busy_show("Connecting to", ssid);
@@ -16231,7 +16230,7 @@ static void start_wifi_connect_saved(int id, const char * ssid) {
 }
 
 static void poll_wifi_connect_saved(void) {
-    if (!wifi_connect_saved_active || !wifi_connect_saved_done_flag) return;
+    if (!wifi_connect_saved_active || !atomic_load_explicit(&wifi_connect_saved_done_flag, memory_order_acquire)) return;
 
     wifi_connect_saved_active = false;
     pthread_join(wifi_connect_saved_thread, NULL);
@@ -16244,17 +16243,17 @@ static void poll_wifi_connect_saved(void) {
 
 static pthread_t wifi_disconnect_thread;
 static bool wifi_disconnect_active = false;
-static volatile bool wifi_disconnect_done_flag = false;
+static atomic_bool wifi_disconnect_done_flag = false;
 
 static void * wifi_disconnect_thread_func(void * arg) {
     (void) arg;
     wifi_control_disconnect();
-    wifi_disconnect_done_flag = true; /* written last -- poll_wifi_disconnect only checks this flag */
+    atomic_store_explicit(&wifi_disconnect_done_flag, true, memory_order_release); /* written last -- poll_wifi_disconnect only checks this flag */
     return NULL;
 }
 
 static void start_wifi_disconnect(void) {
-    wifi_disconnect_done_flag = false;
+    atomic_store_explicit(&wifi_disconnect_done_flag, false, memory_order_relaxed);
     wifi_disconnect_active = true;
         if (pthread_create(&wifi_disconnect_thread, NULL, wifi_disconnect_thread_func, NULL) != 0) {
         wifi_disconnect_active = false;
@@ -16263,7 +16262,7 @@ static void start_wifi_disconnect(void) {
 }
 
 static void poll_wifi_disconnect(void) {
-    if (!wifi_disconnect_active || !wifi_disconnect_done_flag) return;
+    if (!wifi_disconnect_active || !atomic_load_explicit(&wifi_disconnect_done_flag, memory_order_acquire)) return;
     wifi_disconnect_active = false;
     pthread_join(wifi_disconnect_thread, NULL);
     start_wifi_scan(); /* refresh so the list reflects the disconnected state */
@@ -16298,7 +16297,7 @@ static void wifi_rescan_btn_cb(lv_event_t * e) {
 
 static pthread_t wifi_scan_thread;
 static bool wifi_scan_active = false;
-static volatile bool wifi_scan_done_flag = false;
+static atomic_bool wifi_scan_done_flag = false;
 
 static void * wifi_scan_thread_func(void * arg) {
     (void) arg;
@@ -16309,7 +16308,7 @@ static void * wifi_scan_thread_func(void * arg) {
     wifi_control_scan_start();
     sleep(3); /* wpa_cli's scan is async -- give the radio time before reading scan_results */
     wifi_scan_result_count = wifi_control_get_results(wifi_scan_results, WIFI_MAX_RESULTS);
-    wifi_scan_done_flag = true; /* written last -- poll_wifi_scan only checks this flag */
+    atomic_store_explicit(&wifi_scan_done_flag, true, memory_order_release); /* written last -- poll_wifi_scan only checks this flag */
     return NULL;
 }
 
@@ -16326,7 +16325,7 @@ static void * wifi_scan_thread_func(void * arg) {
 static void start_wifi_scan(void) {
     if (wifi_scan_active) return;
 
-    wifi_scan_done_flag = false;
+    atomic_store_explicit(&wifi_scan_done_flag, false, memory_order_relaxed);
     wifi_scan_active = true;
 
         if (pthread_create(&wifi_scan_thread, NULL, wifi_scan_thread_func, NULL) != 0) {
@@ -16335,7 +16334,7 @@ static void start_wifi_scan(void) {
 }
 
 static void poll_wifi_scan(void) {
-    if (!wifi_scan_active || !wifi_scan_done_flag) return;
+    if (!wifi_scan_active || !atomic_load_explicit(&wifi_scan_done_flag, memory_order_acquire)) return;
 
     wifi_scan_active = false;
     pthread_join(wifi_scan_thread, NULL);
@@ -16344,7 +16343,7 @@ static void poll_wifi_scan(void) {
 
 static pthread_t wifi_forget_thread;
 static bool wifi_forget_active = false;
-static volatile bool wifi_forget_done_flag = false;
+static atomic_bool wifi_forget_done_flag = false;
 
 typedef struct {
     int id;
@@ -16354,14 +16353,14 @@ static void * wifi_forget_thread_func(void * arg) {
     wifi_forget_request_t * req = (wifi_forget_request_t *) arg;
     wifi_control_forget(req->id);
     free(req);
-    wifi_forget_done_flag = true; /* written last -- poll_wifi_forget only checks this flag */
+    atomic_store_explicit(&wifi_forget_done_flag, true, memory_order_release); /* written last -- poll_wifi_forget only checks this flag */
     return NULL;
 }
 
 static void start_wifi_forget(int id) {
     wifi_forget_request_t * req = malloc(sizeof(*req));
     req->id = id;
-    wifi_forget_done_flag = false;
+    atomic_store_explicit(&wifi_forget_done_flag, false, memory_order_relaxed);
     wifi_forget_active = true;
         if (pthread_create(&wifi_forget_thread, NULL, wifi_forget_thread_func, req) != 0) {
         wifi_forget_active = false;
@@ -16370,7 +16369,7 @@ static void start_wifi_forget(int id) {
 }
 
 static void poll_wifi_forget(void) {
-    if (!wifi_forget_active || !wifi_forget_done_flag) return;
+    if (!wifi_forget_active || !atomic_load_explicit(&wifi_forget_done_flag, memory_order_acquire)) return;
     wifi_forget_active = false;
     pthread_join(wifi_forget_thread, NULL);
     start_wifi_scan(); /* refresh both memorized and available sections */
@@ -16732,7 +16731,7 @@ static void start_bt_scan(void);
 
 static pthread_t bt_connect_thread;
 static bool bt_connect_active = false;
-static volatile bool bt_connect_done_flag = false;
+static atomic_bool bt_connect_done_flag = false;
 static volatile bool bt_connect_succeeded = false;
 
 /* Which device's row (see add_bt_device_row()) should show inline
@@ -16753,7 +16752,7 @@ static void * bt_connect_thread_func(void * arg) {
     bt_connect_request_t * req = (bt_connect_request_t *) arg;
     bt_connect_succeeded = bt_control_connect(req->mac);
     free(req);
-    bt_connect_done_flag = true; /* written last -- poll_bt_connect only checks this flag */
+    atomic_store_explicit(&bt_connect_done_flag, true, memory_order_release); /* written last -- poll_bt_connect only checks this flag */
     return NULL;
 }
 
@@ -16763,7 +16762,7 @@ static void start_bt_connect(const char * mac) {
     bt_connect_request_t * req = malloc(sizeof(*req));
     snprintf(req->mac, sizeof(req->mac), "%s", mac);
 
-    bt_connect_done_flag = false;
+    atomic_store_explicit(&bt_connect_done_flag, false, memory_order_relaxed);
     bt_connect_active = true;
     snprintf(bt_connecting_mac, sizeof(bt_connecting_mac), "%s", mac);
     bt_connect_failed_mac[0] = '\0';
@@ -16777,7 +16776,7 @@ static void start_bt_connect(const char * mac) {
 }
 
 static void poll_bt_connect(void) {
-    if (!bt_connect_active || !bt_connect_done_flag) return;
+    if (!bt_connect_active || !atomic_load_explicit(&bt_connect_done_flag, memory_order_acquire)) return;
 
     bt_connect_active = false;
     pthread_join(bt_connect_thread, NULL);
@@ -16790,7 +16789,7 @@ static void poll_bt_connect(void) {
 
 static pthread_t bt_forget_thread;
 static bool bt_forget_active = false;
-static volatile bool bt_forget_done_flag = false;
+static atomic_bool bt_forget_done_flag = false;
 
 typedef struct {
     char mac[18];
@@ -16805,7 +16804,7 @@ static bt_forget_request_t * bt_forget_pending_req = NULL;
 static void * bt_forget_thread_func(void * arg) {
     bt_forget_request_t * req = (bt_forget_request_t *) arg;
     bt_control_forget(req->mac);
-    bt_forget_done_flag = true; /* written last -- poll_bt_forget only checks this flag */
+    atomic_store_explicit(&bt_forget_done_flag, true, memory_order_release); /* written last -- poll_bt_forget only checks this flag */
     return NULL;
 }
 
@@ -16814,7 +16813,7 @@ static void start_bt_forget(const char * mac) {
     snprintf(req->mac, sizeof(req->mac), "%s", mac);
     bt_forget_pending_req = req;
 
-    bt_forget_done_flag = false;
+    atomic_store_explicit(&bt_forget_done_flag, false, memory_order_relaxed);
     bt_forget_active = true;
         if (pthread_create(&bt_forget_thread, NULL, bt_forget_thread_func, req) != 0) {
         bt_forget_active = false;
@@ -16830,7 +16829,7 @@ static void start_bt_forget(const char * mac) {
  * scan at all -- the forgotten device just moves from the Paired section to
  * Available (or disappears next real scan, if it's not actually in range). */
 static void poll_bt_forget(void) {
-    if (!bt_forget_active || !bt_forget_done_flag) return;
+    if (!bt_forget_active || !atomic_load_explicit(&bt_forget_done_flag, memory_order_acquire)) return;
     bt_forget_active = false;
     pthread_join(bt_forget_thread, NULL);
 
@@ -17023,12 +17022,12 @@ static void add_bt_device_row(lv_obj_t * parent, int index) {
 
 static pthread_t bt_scan_thread;
 static bool bt_scan_active = false;
-static volatile bool bt_scan_done_flag = false;
+static atomic_bool bt_scan_done_flag = false;
 
 static void * bt_scan_thread_func(void * arg) {
     (void) arg;
     bt_scan_result_count = bt_control_scan(6, bt_scan_results, BT_MAX_RESULTS);
-    bt_scan_done_flag = true; /* written last -- poll_bt_scan only checks this flag */
+    atomic_store_explicit(&bt_scan_done_flag, true, memory_order_release); /* written last -- poll_bt_scan only checks this flag */
     return NULL;
 }
 
@@ -17038,7 +17037,7 @@ static void * bt_scan_thread_func(void * arg) {
 static void start_bt_scan(void) {
     if (bt_scan_active) return;
 
-    bt_scan_done_flag = false;
+    atomic_store_explicit(&bt_scan_done_flag, false, memory_order_relaxed);
     bt_scan_active = true;
 
         if (pthread_create(&bt_scan_thread, NULL, bt_scan_thread_func, NULL) != 0) {
@@ -17047,7 +17046,7 @@ static void start_bt_scan(void) {
 }
 
 static void poll_bt_scan(void) {
-    if (!bt_scan_active || !bt_scan_done_flag) return;
+    if (!bt_scan_active || !atomic_load_explicit(&bt_scan_done_flag, memory_order_acquire)) return;
 
     bt_scan_active = false;
     pthread_join(bt_scan_thread, NULL);
@@ -17648,7 +17647,7 @@ static lv_obj_t * usb_mode_list;
 
 static pthread_t usb_mode_switch_thread;
 static bool usb_mode_switch_active = false;
-static volatile bool usb_mode_switch_done_flag = false;
+static atomic_bool usb_mode_switch_done_flag = false;
 static volatile bool usb_mode_switch_succeeded = false;
 static usb_mode_t usb_mode_switch_target;
 static bool usb_cable_state_initialized;
@@ -17696,7 +17695,7 @@ static void populate_usb_mode_screen(void) {
 static void * usb_mode_switch_thread_func(void * arg) {
     (void) arg;
     usb_mode_switch_succeeded = usb_mode_control_apply(usb_mode_switch_target);
-    usb_mode_switch_done_flag = true; /* written last -- poll_usb_mode_switch only checks this flag */
+    atomic_store_explicit(&usb_mode_switch_done_flag, true, memory_order_release); /* written last -- poll_usb_mode_switch only checks this flag */
     return NULL;
 }
 
@@ -17704,7 +17703,7 @@ static void start_usb_mode_switch(usb_mode_t target) {
     if (usb_mode_switch_active) return; /* already switching -- ignore taps until it lands, same guard as wifi/bt toggles */
     usb_mode_switch_target = target;
     usb_mode_switch_active = true;
-    usb_mode_switch_done_flag = false;
+    atomic_store_explicit(&usb_mode_switch_done_flag, false, memory_order_relaxed);
     int rc = pthread_create(&usb_mode_switch_thread, NULL, usb_mode_switch_thread_func, NULL);
     if (rc != 0) {
         /* Without this rollback, a transient low-memory/thread-creation
@@ -17716,7 +17715,7 @@ static void start_usb_mode_switch(usb_mode_t target) {
 }
 
 static void poll_usb_mode_switch(void) {
-    if (!usb_mode_switch_active || !usb_mode_switch_done_flag) return;
+    if (!usb_mode_switch_active || !atomic_load_explicit(&usb_mode_switch_done_flag, memory_order_acquire)) return;
     usb_mode_switch_active = false;
     pthread_join(usb_mode_switch_thread, NULL);
 
@@ -18328,7 +18327,7 @@ static void build_import_rescan_popup(void) {
  * building new UI just for this one line of text. */
 static pthread_t import_web_stop_thread;
 static bool import_web_stop_active = false;
-static volatile bool import_web_stop_done_flag = false;
+static atomic_bool import_web_stop_done_flag = false;
 /* Import via Wi-Fi screen's own stack slot, recorded right before the busy
  * screen gets pushed on top of it -- spliced out via nav_remove_stack_slot()
  * once teardown finishes (same pattern text_entry_commit()/
@@ -18341,12 +18340,12 @@ static int import_web_stop_nav_slot = -1;
 static void * import_web_stop_thread_func(void * arg) {
     (void) arg;
     import_web_stop();
-    import_web_stop_done_flag = true; /* written last -- poll_import_web_stop() only checks this flag */
+    atomic_store_explicit(&import_web_stop_done_flag, true, memory_order_release); /* written last -- poll_import_web_stop() only checks this flag */
     return NULL;
 }
 
 static void poll_import_web_stop(void) {
-    if (!import_web_stop_active || !import_web_stop_done_flag) return;
+    if (!import_web_stop_active || !atomic_load_explicit(&import_web_stop_done_flag, memory_order_acquire)) return;
 
     import_web_stop_active = false;
     pthread_join(import_web_stop_thread, NULL);
@@ -18369,7 +18368,7 @@ static void import_wifi_back_cb(lv_event_t * e) {
     import_web_stop_nav_slot = nav_depth - 1; /* this screen's own slot, before pushing the busy screen on top of it */
     import_web_stop_token = gui_busy_show("Closing\nWeb Server...", "");
 
-    import_web_stop_done_flag = false;
+    atomic_store_explicit(&import_web_stop_done_flag, false, memory_order_relaxed);
     import_web_stop_active = true;
         if (pthread_create(&import_web_stop_thread, NULL, import_web_stop_thread_func, NULL) != 0) {
         import_web_stop_active = false;

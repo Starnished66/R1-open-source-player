@@ -11543,7 +11543,12 @@ static void start_subsonic_download(const char * url, bool verify_tls, const cha
 
     download_token = gui_busy_show("Downloading", display_title);
 
-    pthread_create(&download_thread, NULL, download_thread_func, req);
+        if (pthread_create(&download_thread, NULL, download_thread_func, req) != 0) {
+        download_active = false;
+        free(req);
+        gui_busy_hide(download_token);
+        show_error_toast("Thread launch failed");
+    }
 }
 
 static void poll_subsonic_download(void) {
@@ -11858,7 +11863,12 @@ static void start_subsonic_library_download(subsonic_song_t * songs, int song_co
     subsonic_library_download_token = gui_busy_show(progress_label, "");
     gui_busy_set_progress(subsonic_library_download_token, 0);
 
-    pthread_create(&subsonic_library_download_thread, NULL, subsonic_library_download_thread_func, req);
+        if (pthread_create(&subsonic_library_download_thread, NULL, subsonic_library_download_thread_func, req) != 0) {
+        subsonic_library_download_active = false;
+        free(req);
+        gui_busy_hide(subsonic_library_download_token);
+        show_error_toast("Thread launch failed");
+    }
 }
 
 static void poll_subsonic_library_download(void) {

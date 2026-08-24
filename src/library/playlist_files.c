@@ -29,6 +29,12 @@
  * any other thread could be touching playlists. */
 static pthread_mutex_t playlist_files_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+bool playlist_files_has_active_write(void) {
+    if (pthread_mutex_trylock(&playlist_files_mutex) != 0) return true;
+    pthread_mutex_unlock(&playlist_files_mutex);
+    return false;
+}
+
 static bool is_m3u_file(const char * name) {
     const char * ext = strrchr(name, '.');
     if (!ext) return false;
@@ -185,10 +191,15 @@ static void scan_dir(const char * dir_path, char *** paths, int * count, int * c
         if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
 
         if (*count == *capacity) {
-            *capacity = *capacity ? *capacity * 2 : 64;
-            *paths = realloc(*paths, sizeof(char *) * (size_t) *capacity);
+            int new_capacity = *capacity ? *capacity * 2 : 64;
+            char ** grown = realloc(*paths, sizeof(char *) * (size_t) new_capacity);
+            if (!grown) break;
+            *paths = grown;
+            *capacity = new_capacity;
         }
-        (*paths)[*count] = strdup(full_path);
+        char * copy = strdup(full_path);
+        if (!copy) break;
+        (*paths)[*count] = copy;
         (*count)++;
     }
 
@@ -233,10 +244,12 @@ bool playlist_files_append(const char * m3u_path, const char * song_path) {
     char rel[PATH_MAX];
     const char * line_to_write = make_relative_path(dir_path, song_path, rel, sizeof(rel)) ? rel : song_path;
 
-    fprintf(f, "%s\n", line_to_write);
-    fclose(f);
+    bool ok = fprintf(f, "%s\n", line_to_write) >= 0;
+    if (ok) ok = fflush(f) == 0;
+    if (ok) ok = fsync(fileno(f)) == 0;
+    if (fclose(f) != 0) ok = false;
     pthread_mutex_unlock(&playlist_files_mutex);
-    return true;
+    return ok;
 }
 
 /* Trims a trailing \n and/or \r in place -- fgets() below always leaves one
@@ -303,14 +316,30 @@ bool playlist_files_remove(const char * m3u_path, const char * song_path) {
         char full_path[PATH_MAX];
         playlist_files_resolve_path(m3u_path, line, full_path, sizeof(full_path));
         if (strcmp(full_path, song_path) == 0) continue; /* the entry being removed */
-        fprintf(out, "%s\n", line);
+        if (fprintf(out, "%s\n", line) < 0) {
+            fclose(f);
+            fclose(out);
+            unlink(tmp_path);
+            pthread_mutex_unlock(&playlist_files_mutex);
+            return false;
+        }
     }
-    fclose(f);
-    fclose(out);
+    bool ok = !ferror(f);
+    if (fclose(f) != 0) ok = false;
+    if (ok) ok = fflush(out) == 0;
+    if (ok) ok = fsync(fileno(out)) == 0;
+    if (fclose(out) != 0) ok = false;
 
-    rename(tmp_path, m3u_path); /* atomic replace on POSIX -- no window where m3u_path is missing or half-written */
+    if (ok) ok = rename(tmp_path, m3u_path) == 0;
+    if (ok) {
+        char dir_path[PATH_MAX];
+        dir_of(m3u_path, dir_path, sizeof(dir_path));
+        fsync_dir(dir_path);
+    } else {
+        unlink(tmp_path);
+    }
     pthread_mutex_unlock(&playlist_files_mutex);
-    return true;
+    return ok;
 }
 
 bool playlist_files_create(const char * dir, const char * name, const char * song_path, char * out_path,
@@ -322,9 +351,13 @@ bool playlist_files_create(const char * dir, const char * name, const char * son
     mkdir(dir, 0755); /* ignore EEXIST -- same "best effort, check the open" pattern as peq.c's profiles dir */
 
     char path[512];
-    snprintf(path, sizeof(path), "%s/%s.m3u", dir, name);
+    int path_len = snprintf(path, sizeof(path), "%s/%s.m3u", dir, name);
+    if (path_len < 0 || (size_t) path_len >= sizeof(path)) {
+        pthread_mutex_unlock(&playlist_files_mutex);
+        return false;
+    }
 
-    FILE * f = fopen(path, "w");
+    FILE * f = fopen(path, "wx");
     if (!f) {
         pthread_mutex_unlock(&playlist_files_mutex);
         return false;
@@ -332,11 +365,16 @@ bool playlist_files_create(const char * dir, const char * name, const char * son
 
     char rel[PATH_MAX];
     const char * line_to_write = make_relative_path(dir, song_path, rel, sizeof(rel)) ? rel : song_path;
-    fprintf(f, "%s\n", line_to_write);
-    fclose(f);
+    bool ok = fprintf(f, "%s\n", line_to_write) >= 0;
+    if (ok) ok = fflush(f) == 0;
+    if (ok) ok = fsync(fileno(f)) == 0;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) unlink(path);
+    if (ok) fsync_dir(dir);
     pthread_mutex_unlock(&playlist_files_mutex);
 
-    if (out_path) snprintf(out_path, out_path_size, "%s", path);
+    if (!ok) return false;
+    if (out_path && snprintf(out_path, out_path_size, "%s", path) >= (int) out_path_size) return false;
     return true;
 }
 
@@ -377,10 +415,25 @@ bool playlist_files_read(const char * m3u_path, char *** out_paths, int * out_co
         playlist_files_resolve_path(m3u_path, line, full_path, sizeof(full_path));
 
         if (count == capacity) {
-            capacity = capacity ? capacity * 2 : 16;
-            paths = realloc(paths, sizeof(char *) * (size_t) capacity);
+            int new_capacity = capacity ? capacity * 2 : 16;
+            char ** grown = realloc(paths, sizeof(char *) * (size_t) new_capacity);
+            if (!grown) {
+                for (int i = 0; i < count; i++) free(paths[i]);
+                free(paths);
+                fclose(f);
+                return false;
+            }
+            paths = grown;
+            capacity = new_capacity;
         }
-        paths[count++] = strdup(full_path);
+        paths[count] = strdup(full_path);
+        if (!paths[count]) {
+            for (int i = 0; i < count; i++) free(paths[i]);
+            free(paths);
+            fclose(f);
+            return false;
+        }
+        count++;
     }
     fclose(f);
 

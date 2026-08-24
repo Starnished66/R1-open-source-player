@@ -539,6 +539,25 @@ static void free_groups(void) {
     }
 }
 
+/* Finalizing a large scan used to build every replacement index/group while
+ * retaining the complete old derived view. None of those old structures is
+ * needed after pruning has finished: lookup/upsert is over, and a failed
+ * rebuild already recovers by reloading the last committed generation.
+ * Drop them before rebuild_indexes() so old and new group membership,
+ * ordering, rank, and hash allocations do not overlap at the scan's peak. */
+static void drop_derived_indexes_before_rebuild(void) {
+    free(title_order);
+    free(recency_order);
+    free(title_rank_of);
+    free(recency_rank_of);
+    title_order = NULL;
+    recency_order = NULL;
+    title_rank_of = NULL;
+    recency_rank_of = NULL;
+    path_hash_clear();
+    free_groups();
+}
+
 typedef struct gmap {
     const char * a;
     const char * b;
@@ -906,7 +925,7 @@ static void unlink_generation(int32_t gen) {
     unlink(path);
 }
 
-static void unlink_other_generations(int32_t keep) {
+static void unlink_other_generations(int32_t keep, int32_t previous) {
     DIR * d = opendir(db_dir);
     if (!d) return;
     struct dirent * de;
@@ -918,7 +937,7 @@ static void unlink_other_generations(int32_t keep) {
         char path[800];
         if (gpos) {
             int gen = atoi(gpos + 6);
-            if (keep > 0 && gen == keep) continue;
+            if ((keep > 0 && gen == keep) || (previous > 0 && gen == previous)) continue;
             db_path(path, sizeof(path), name);
             unlink(path);
             continue;
@@ -1121,6 +1140,8 @@ static bool write_all(void) {
         if (ok) master_commitid = mh.commitid;
     }
 
+    int32_t previous_gen = 0;
+    if (ok) read_gen_pointer(&previous_gen);
     if (ok) ok = fsync_dir(db_dir);
     if (ok) ok = write_gen_pointer(new_gen);
 
@@ -1131,7 +1152,7 @@ static bool write_all(void) {
         unlink(leftover);
     } else {
         disk_gen = new_gen;
-        unlink_other_generations(new_gen);
+        unlink_other_generations(new_gen, previous_gen);
         disk_ready = true;
     }
     free(title_seek);
@@ -1594,7 +1615,6 @@ static bool load_generation(int32_t gen) {
         return false;
     }
     disk_gen = gen;
-    if (gen > 0) unlink_other_generations(gen);
     disk_ready = true;
     return true;
 }
@@ -1791,6 +1811,7 @@ bool tagcache_end_update(bool prune) {
         }
     }
     for (int32_t i = 0; i < ent_count; i++) ents[i].flag &= ~FLAG_SEEN;
+    drop_derived_indexes_before_rebuild();
     if (!rebuild_indexes() || !write_all()) {
         reload_from_disk();
         return false;
@@ -1968,4 +1989,3 @@ int tagcache_group_index(int kind, const char * name, const char * album_artist)
 const char * tagcache_ascii_casestr(const char * hay, const char * needle) {
     return ascii_casestr(hay ? hay : "", needle ? needle : "");
 }
-

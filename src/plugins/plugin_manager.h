@@ -190,6 +190,7 @@
  * load/run is skipped (logged to stderr) without aborting the others. */
 void plugin_manager_init(void);
 void plugin_manager_poll(void);
+bool plugin_manager_has_background_work(void);
 
 /* Rows registered via plugin.register_list_item("books", label, on_open) --
  * gui.c's build_books_screen() appends these after its own 2 built-in rows

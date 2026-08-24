@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 typedef struct {
     char type[5];
@@ -22,9 +23,11 @@ typedef struct {
  * write is SIGKILL). Keep ISO-BMFF stsz/stco/stsc compact past this. */
 #define MP4_EXPAND_MAX_SAMPLES 65536
 #define MP4_MAX_STSC_ENTRIES 4096
+#define MP4_MAX_STSD_ENTRY_BYTES (1024U * 1024U)
 
 struct mp4_demux {
     FILE * f;
+    uint64_t file_size;
 
     char codec_fourcc[5];
     uint8_t * codec_config;
@@ -92,25 +95,36 @@ static bool read_box_header(FILE * f, box_header_t * out) {
         out->header_size = 8;
     }
 
+    if (start < 0 || out->size < (uint64_t) out->header_size ||
+        out->size > (uint64_t) (LONG_MAX - start)) return false;
     out->data_start = start + out->header_size;
     return true;
+}
+
+static bool box_payload_has(box_header_t box, uint64_t offset, uint64_t bytes) {
+    uint64_t payload = box.size - (uint64_t) box.header_size;
+    return offset <= payload && bytes <= payload - offset;
 }
 
 /* Scans children of a plain container box (moov/trak/mdia/minf/stbl/udta/...
  * -- no extra fields before the first child) for one with the given type,
  * within [container_start, container_start + container_size). */
 static bool find_child_box(FILE * f, long container_start, uint64_t container_size, const char * type, box_header_t * out) {
+    if (container_start < 0 || container_size > (uint64_t) (LONG_MAX - container_start)) return false;
     long end = container_start + (long) container_size;
-    fseek(f, container_start, SEEK_SET);
+    if (fseek(f, container_start, SEEK_SET) != 0) return false;
 
     while (ftell(f) < end) {
         box_header_t box;
         if (!read_box_header(f, &box)) return false;
+        long box_start = box.data_start - box.header_size;
+        if (box_start < container_start || box.size > (uint64_t) (end - box_start)) return false;
         if (strcmp(box.type, type) == 0) {
             *out = box;
             return true;
         }
-        long next = (long) (box.data_start - box.header_size) + (long) box.size;
+        long next = box_start + (long) box.size;
+        if (next <= box_start) return false;
         if (fseek(f, next, SEEK_SET) != 0) return false;
     }
     return false;
@@ -152,7 +166,7 @@ static bool find_audio_trak(FILE * f, box_header_t moov, box_header_t * out_trak
  * matches. */
 static bool parse_stsd(mp4_demux_t * d, box_header_t stsd) {
     /* stsd is a FullBox: version/flags(4) + entry_count(4), then entries */
-    fseek(d->f, stsd.data_start + 8, SEEK_SET);
+    if (!box_payload_has(stsd, 0, 8 + 36) || fseek(d->f, stsd.data_start + 8, SEEK_SET) != 0) return false;
 
     uint8_t entry_header[36];
     if (fread(entry_header, 1, sizeof(entry_header), d->f) != sizeof(entry_header)) return false;
@@ -167,7 +181,7 @@ static bool parse_stsd(mp4_demux_t * d, box_header_t stsd) {
      * after Init()/parsing, so this is just a fallback. */
     d->sample_rate = read_u32be(entry_header + 24) >> 16;
 
-    if (entry_size <= 36) return false;
+    if (entry_size <= 36 || entry_size > MP4_MAX_STSD_ENTRY_BYTES || !box_payload_has(stsd, 8, entry_size)) return false;
     uint32_t config_region_size = entry_size - 36;
 
     uint8_t * config_region = malloc(config_region_size);
@@ -319,7 +333,7 @@ static bool sample_offset_at(mp4_demux_t * d, uint32_t i, uint64_t * out) {
 
 static bool parse_stsz(mp4_demux_t * d, box_header_t stsz) {
     uint8_t hdr[12];
-    fseek(d->f, stsz.data_start, SEEK_SET);
+    if (!box_payload_has(stsz, 0, sizeof(hdr)) || fseek(d->f, stsz.data_start, SEEK_SET) != 0) return false;
     if (fread(hdr, 1, sizeof(hdr), d->f) != sizeof(hdr)) return false;
 
     d->uniform_size = read_u32be(hdr + 4);
@@ -327,6 +341,7 @@ static bool parse_stsz(mp4_demux_t * d, box_header_t stsz) {
     if (count == 0) return false;
     d->sample_count = count;
     d->stsz_table_offset = stsz.data_start + 12;
+    if (d->uniform_size == 0 && !box_payload_has(stsz, 12, (uint64_t) count * 4U)) return false;
 
     if (count > MP4_EXPAND_MAX_SAMPLES) return true;
 
@@ -358,16 +373,19 @@ static bool parse_sample_offsets(mp4_demux_t * d, box_header_t stbl) {
     if (!find_child_box(d->f, stbl.data_start, stbl.size - (uint64_t) stbl.header_size, "stsc", &stsc_box)) return false;
 
     uint8_t hdr[8];
+    if (!box_payload_has(stco_box, 0, 8) || !box_payload_has(stsc_box, 0, 8)) return false;
     fseek(d->f, stco_box.data_start, SEEK_SET);
     if (fread(hdr, 1, 8, d->f) != 8) return false;
     d->chunk_count = read_u32be(hdr + 4);
-    if (d->chunk_count == 0) return false;
+    if (d->chunk_count == 0 || d->chunk_count > d->sample_count) return false;
+    if (!box_payload_has(stco_box, 8, (uint64_t) d->chunk_count * (d->stco_is64 ? 8U : 4U))) return false;
     d->stco_table_offset = stco_box.data_start + 8;
 
     fseek(d->f, stsc_box.data_start, SEEK_SET);
     if (fread(hdr, 1, 8, d->f) != 8) return false;
     d->stsc_count = read_u32be(hdr + 4);
     if (d->stsc_count == 0 || d->stsc_count > MP4_MAX_STSC_ENTRIES) return false;
+    if (!box_payload_has(stsc_box, 8, (uint64_t) d->stsc_count * 12U)) return false;
 
     d->stsc = malloc(sizeof(stsc_entry_t) * (size_t) d->stsc_count);
     if (!d->stsc) return false;
@@ -377,6 +395,7 @@ static bool parse_sample_offsets(mp4_demux_t * d, box_header_t stbl) {
         d->stsc[i].first_chunk = read_u32be(buf);
         d->stsc[i].samples_per_chunk = read_u32be(buf + 4);
         if (d->stsc[i].first_chunk == 0 || d->stsc[i].samples_per_chunk == 0) return false;
+        if (i > 0 && d->stsc[i].first_chunk <= d->stsc[i - 1].first_chunk) return false;
     }
 
     if (d->sample_count > MP4_EXPAND_MAX_SAMPLES) {
@@ -396,6 +415,7 @@ static bool parse_sample_offsets(mp4_demux_t * d, box_header_t stbl) {
             return false;
         }
         chunk_offsets[i] = d->stco_is64 ? read_u64be(buf) : (uint64_t) read_u32be(buf);
+        if (chunk_offsets[i] >= d->file_size) { free(chunk_offsets); return false; }
     }
 
     d->sample_offsets = malloc(sizeof(uint64_t) * (size_t) d->sample_count);
@@ -423,6 +443,7 @@ static bool parse_sample_offsets(mp4_demux_t * d, box_header_t stbl) {
                 return false;
             }
             d->sample_offsets[sample_index] = offset;
+            if (offset > d->file_size || sz > d->file_size - offset) { free(chunk_offsets); return false; }
             offset += sz;
         }
     }
@@ -436,23 +457,28 @@ static bool parse_stts(mp4_demux_t * d, box_header_t stbl) {
     if (!find_child_box(d->f, stbl.data_start, stbl.size - (uint64_t) stbl.header_size, "stts", &stts_box)) return false;
 
     uint8_t hdr[8];
+    if (!box_payload_has(stts_box, 0, 8)) return false;
     fseek(d->f, stts_box.data_start, SEEK_SET);
     if (fread(hdr, 1, 8, d->f) != 8) return false;
     uint32_t entry_count = read_u32be(hdr + 4);
     if (entry_count == 0) return false;
+    if (!box_payload_has(stts_box, 8, (uint64_t) entry_count * 8U)) return false;
 
     uint64_t total = 0;
+    uint64_t timed_samples = 0;
     for (uint32_t i = 0; i < entry_count; i++) {
         uint8_t entry[8];
         if (fread(entry, 1, 8, d->f) != 8) return false;
         uint32_t sample_count = read_u32be(entry);
         uint32_t sample_delta = read_u32be(entry + 4);
+        if (sample_count == 0 || sample_delta == 0 || timed_samples + sample_count < timed_samples) return false;
+        timed_samples += sample_count;
         if (i == 0) d->frames_per_sample = sample_delta; /* first entry covers the vast majority of samples */
         total += (uint64_t) sample_count * sample_delta;
     }
 
     d->total_pcm_frames = total;
-    return d->frames_per_sample > 0 && total > 0;
+    return d->frames_per_sample > 0 && total > 0 && timed_samples == d->sample_count;
 }
 
 mp4_demux_t * mp4_demux_open(const char * path) {
@@ -508,6 +534,7 @@ mp4_demux_t * mp4_demux_open(const char * path) {
         return NULL;
     }
     d->f = f;
+    d->file_size = (uint64_t) file_size;
 
     if (!parse_stsd(d, stsd) || !parse_stsz(d, stsz) || !parse_sample_offsets(d, stbl) || !parse_stts(d, stbl)) {
         mp4_demux_close(d);
@@ -518,11 +545,33 @@ mp4_demux_t * mp4_demux_open(const char * path) {
 }
 
 bool mp4_demux_peek_codec(const char * path, char out_fourcc[5]) {
-    mp4_demux_t * d = mp4_demux_open(path);
-    if (!d) return false;
-    memcpy(out_fourcc, d->codec_fourcc, 5);
-    mp4_demux_close(d);
-    return true;
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long file_size = ftell(f);
+    if (file_size <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+    box_header_t moov = {0};
+    bool found = false;
+    while (ftell(f) < file_size) {
+        box_header_t box;
+        if (!read_box_header(f, &box)) break;
+        long start = box.data_start - box.header_size;
+        if (box.size > (uint64_t) (file_size - start)) break;
+        if (strcmp(box.type, "moov") == 0) { moov = box; found = true; break; }
+        if (fseek(f, start + (long) box.size, SEEK_SET) != 0) break;
+    }
+    box_header_t trak, mdia, minf, stbl, stsd;
+    uint8_t entry[12];
+    bool ok = found && find_audio_trak(f, moov, &trak) &&
+              find_child_box(f, trak.data_start, trak.size - (uint64_t) trak.header_size, "mdia", &mdia) &&
+              find_child_box(f, mdia.data_start, mdia.size - (uint64_t) mdia.header_size, "minf", &minf) &&
+              find_child_box(f, minf.data_start, minf.size - (uint64_t) minf.header_size, "stbl", &stbl) &&
+              find_child_box(f, stbl.data_start, stbl.size - (uint64_t) stbl.header_size, "stsd", &stsd) &&
+              box_payload_has(stsd, 0, 20) && fseek(f, stsd.data_start + 8, SEEK_SET) == 0 &&
+              fread(entry, 1, sizeof(entry), f) == sizeof(entry) && read_u32be(entry) >= 36;
+    if (ok) { memcpy(out_fourcc, entry + 4, 4); out_fourcc[4] = '\0'; }
+    fclose(f);
+    return ok;
 }
 
 void mp4_demux_get_codec_fourcc(const mp4_demux_t * d, char out_fourcc[5]) {
@@ -558,7 +607,7 @@ bool mp4_demux_read_sample(mp4_demux_t * d, uint32_t sample_index, uint8_t * buf
     uint32_t size;
     uint64_t offset;
     if (!sample_size_at(d, sample_index, &size) || !sample_offset_at(d, sample_index, &offset)) return false;
-    if (size > buf_size) return false;
+    if (size > buf_size || offset > d->file_size || size > d->file_size - offset || offset > (uint64_t) LONG_MAX) return false;
 
     if (fseek(d->f, (long) offset, SEEK_SET) != 0) return false;
     if (fread(buf, 1, size, d->f) != size) return false;

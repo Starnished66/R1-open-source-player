@@ -86,6 +86,7 @@ typedef struct {
     char name[96];
     char version[32];
     bool defined;
+    time_t last_library_refresh;
 } plugin_instance_t;
 
 static plugin_instance_t plugin_instances[PLUGIN_MAX_FILES];
@@ -2103,6 +2104,47 @@ static int l_plugin_get_next_album_tracks(lua_State * L) {
  * that cache never tracks (confirmed against every native call site doing
  * the same), so they call playlist_files_append()/_remove() alone. ---- */
 
+static bool plugin_playlist_name_valid(const char * name) {
+    if (!name || !name[0] || strlen(name) > 200 || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+    for (const unsigned char * p = (const unsigned char *) name; *p; p++)
+        if (*p < 0x20 || *p == 0x7f || *p == '/' || *p == '\\') return false;
+    return true;
+}
+
+/* Plugin playlist CRUD is deliberately narrower than the native helpers:
+ * only direct .m3u/.m3u8 children returned by playlist_list() are accepted.
+ * realpath() on both the root and existing target also closes symlink
+ * escapes, rather than relying on a lexical "starts with" check. */
+static bool plugin_playlist_path_valid(const char * path) {
+    if (!path || plugin_storage_path_is_reserved(path)) return false;
+    char root_real[PATH_MAX], path_real[PATH_MAX];
+    if (!realpath(PLAYLISTS_DIR, root_real) || !realpath(path, path_real)) return false;
+    size_t root_len = strlen(root_real);
+    if (strncmp(path_real, root_real, root_len) != 0 || path_real[root_len] != '/') return false;
+    const char * base = path_real + root_len + 1;
+    if (!base[0] || strchr(base, '/')) return false;
+    const char * ext = strrchr(base, '.');
+    if (!ext || (strcasecmp(ext, ".m3u") != 0 && strcasecmp(ext, ".m3u8") != 0)) return false;
+    struct stat st;
+    return stat(path_real, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static bool plugin_song_path_valid(const char * path) {
+    if (!path || plugin_storage_path_is_reserved(path)) return false;
+    char root_real[PATH_MAX], path_real[PATH_MAX];
+    if (!realpath(MUSIC_ROOT_DIR, root_real) || !realpath(path, path_real)) return false;
+    size_t root_len = strlen(root_real);
+    if (strncmp(path_real, root_real, root_len) != 0 || path_real[root_len] != '/') return false;
+    struct stat st;
+    return stat(path_real, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int push_plugin_error(lua_State * L, const char * message) {
+    lua_pushnil(L);
+    lua_pushstring(L, message);
+    return 2;
+}
+
 /* plugin.playlist_list() -> { m3u_path, ... } | nil */
 static int l_plugin_playlist_list(lua_State * L) {
     char ** paths = NULL;
@@ -2117,6 +2159,7 @@ static int l_plugin_playlist_list(lua_State * L) {
 /* plugin.playlist_read(m3u_path) -> { song_path, ... } | nil */
 static int l_plugin_playlist_read(lua_State * L) {
     const char * m3u_path = luaL_checkstring(L, 1);
+    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "playlist path must be an existing .m3u file in the SD Playlists folder");
     char ** paths = NULL;
     int count = 0;
     if (!playlist_files_read(m3u_path, &paths, &count)) {
@@ -2131,10 +2174,12 @@ static int l_plugin_playlist_create(lua_State * L) {
     const char * name = luaL_checkstring(L, 1);
     const char * song_path = luaL_checkstring(L, 2);
 
+    if (!plugin_playlist_name_valid(name)) return push_plugin_error(L, "invalid playlist name");
+    if (!plugin_song_path_valid(song_path)) return push_plugin_error(L, "song path must be an existing file on the SD card");
+
     char created_path[512];
     if (!playlist_files_create(PLAYLISTS_DIR, name, song_path, created_path, sizeof(created_path))) {
-        lua_pushnil(L);
-        return 1;
+        return push_plugin_error(L, errno == EEXIST ? "playlist already exists" : "could not create playlist");
     }
     metadata_db_playlist_insert_one(created_path);
     lua_pushstring(L, created_path);
@@ -2145,7 +2190,10 @@ static int l_plugin_playlist_create(lua_State * L) {
 static int l_plugin_playlist_add(lua_State * L) {
     const char * m3u_path = luaL_checkstring(L, 1);
     const char * song_path = luaL_checkstring(L, 2);
-    lua_pushboolean(L, playlist_files_append(m3u_path, song_path));
+    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "invalid playlist path");
+    if (!plugin_song_path_valid(song_path)) return push_plugin_error(L, "invalid song path");
+    if (!playlist_files_append(m3u_path, song_path)) return push_plugin_error(L, "could not update playlist");
+    lua_pushboolean(L, true);
     return 1;
 }
 
@@ -2153,13 +2201,17 @@ static int l_plugin_playlist_add(lua_State * L) {
 static int l_plugin_playlist_remove(lua_State * L) {
     const char * m3u_path = luaL_checkstring(L, 1);
     const char * song_path = luaL_checkstring(L, 2);
-    lua_pushboolean(L, playlist_files_remove(m3u_path, song_path));
+    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "invalid playlist path");
+    if (!plugin_song_path_valid(song_path)) return push_plugin_error(L, "invalid song path");
+    if (!playlist_files_remove(m3u_path, song_path)) return push_plugin_error(L, "could not update playlist");
+    lua_pushboolean(L, true);
     return 1;
 }
 
 /* plugin.playlist_delete(m3u_path) -> bool */
 static int l_plugin_playlist_delete(lua_State * L) {
     const char * m3u_path = luaL_checkstring(L, 1);
+    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "invalid playlist path");
     bool ok = playlist_files_delete(m3u_path);
     if (ok) metadata_db_playlist_delete_one(m3u_path);
     lua_pushboolean(L, ok);
@@ -2319,9 +2371,17 @@ static int l_plugin_library_get_albums(lua_State * L) {
  * plugin.sd_root() can make them show up in library_*() without the user
  * finding that menu item themselves. No-op if a rescan is already running. */
 static int l_plugin_refresh_library(lua_State * L) {
-    (void) L;
-    gui_plugin_refresh_library();
-    return 0;
+    plugin_instance_t * inst = plugin_instance_for_state(L);
+    if (!inst || !inst->defined) return luaL_error(L, "plugin.refresh_library requires plugin.define first");
+    time_t now = time(NULL);
+    if (inst->last_library_refresh > 0 && now >= inst->last_library_refresh && now - inst->last_library_refresh < 60) {
+        lua_pushboolean(L, false); lua_pushliteral(L, "rate_limited"); return 2;
+    }
+    if (!gui_plugin_refresh_library()) {
+        lua_pushboolean(L, false); lua_pushliteral(L, "already_running"); return 2;
+    }
+    inst->last_library_refresh = now;
+    lua_pushboolean(L, true); lua_pushliteral(L, "started"); return 2;
 }
 
 /* ---- plugin.on(event, callback) -- see plugin_manager.h's own
@@ -2501,7 +2561,7 @@ static const char * const plugin_capabilities[] = {
     "filesystem.sd", "playback.control", "playback.state", "playback.events",
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
-    "storage.namespaced", "storage.secrets", "playback.remote"
+    "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -3154,6 +3214,12 @@ void plugin_manager_poll(void) {
         req->L = NULL;
         req->callback_ref = LUA_NOREF;
     }
+}
+
+bool plugin_manager_has_background_work(void) {
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++)
+        if (plugin_async_http[i].active) return true;
+    return false;
 }
 
 /* Shared by plugin_manager_books_list_item_clicked()/_settings_list_item_

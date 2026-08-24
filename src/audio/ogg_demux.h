@@ -33,6 +33,12 @@ ogg_codec_t ogg_detect_codec(const char * path);
 
 ogg_demux_t * ogg_demux_open(const char * path);
 
+/* Metadata-only open used by the library scanner. It parses OpusHead and
+ * OpusTags but deliberately skips the full-file seek-index build required
+ * only for playback. When skip_large_values is true, embedded picture and
+ * lyrics comment values are not copied into the demux object. */
+ogg_demux_t * ogg_demux_open_metadata(const char * path, bool skip_large_values);
+
 /* OpusHead fields (RFC 7845 Section 5.1). Channel Mapping Family must be 0
  * (single-stream mono/stereo) -- multistream Opus files fail to open. */
 unsigned int ogg_demux_get_opus_channels(const ogg_demux_t * d);

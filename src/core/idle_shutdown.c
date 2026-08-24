@@ -13,7 +13,7 @@ void idle_shutdown_now(void) {
      * countdown reached zero, the child was killed, and the device stayed
      * on -- only a hardware power-button hold actually cut power. */
     sync();
-    execl("/sbin/poweroff", "poweroff", "-f", (char *) NULL);
+    execl("/sbin/poweroff", "poweroff", (char *) NULL);
     reboot(RB_POWER_OFF);
     for (;;) pause();
 #endif

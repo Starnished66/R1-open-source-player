@@ -1131,27 +1131,6 @@ static int compact_list_page_range(const compact_list_virtual_data_t * data, int
     return want;
 }
 
-/* First paint / provider-reset path -- fill cache_rows[] on this thread so
- * compact_list_update_window() never draws empty labels while a background
- * job is still in flight. Album/artist group pages are already in RAM;
- * All Songs is a bounded 128-row copy. Scroll misses stay async (see
- * compact_list_ensure_cache() below) so a stuck SD read cannot freeze
- * LV_EVENT_SCROLL. */
-static void compact_list_fill_cache_now(compact_list_virtual_data_t * data, int first) {
-    int fetch_start = 0;
-    int want = compact_list_page_range(data, first, &fetch_start);
-    if (want == 0) {
-        data->cache_count = 0;
-        data->cache_start = fetch_start;
-        return;
-    }
-    int n = data->fetch_page(data->provider_ctx, fetch_start, want, data->cache_rows);
-    if (n < 0) n = 0;
-    if (n > want) n = want;
-    data->cache_count = n;
-    data->cache_start = fetch_start;
-}
-
 /* Paged mode only -- kicks off a background refetch of cache_rows[] via
  * fetch_page() if the current cache doesn't already cover [first,
  * first+POOL_SIZE) AND no fetch is currently in flight for this list.
@@ -1161,12 +1140,9 @@ static void compact_list_fill_cache_now(compact_list_virtual_data_t * data, int 
  * fetch_page() call, not one per row -- COMPACT_LIST_PAGE_CACHE_SIZE rows at
  * once.
  *
- * An empty cache (cache_start < 0, including right after compact_list_set_
- * paged_provider()) is filled synchronously instead: painting the visible
- * window as blank cards with placeholder art, then filling names only after
- * a 50ms poll, was the Albums-submenu populate order on a 3k-album library.
- * Later scroll misses keep the original async path so a stuck SD read
- * cannot freeze the scroll handler. At most one fetch is ever in flight
+     * Initial fills use this same worker path as scroll misses: even a bounded
+     * first page can fault slow SD-backed mmap pages and must never block LVGL.
+     * At most one fetch is ever in flight
  * per list (the `pending_job` check below) -- a second cache miss arriving
  * while one's already running just waits for it, rather than piling up
  * concurrent reads against the same list; the next scroll tick (or
@@ -1179,11 +1155,6 @@ static void compact_list_ensure_cache(lv_obj_t * list, compact_list_virtual_data
                     window_end <= data->cache_start + data->cache_count;
     if (covered) return;
     if (data->pending_job) return;
-
-    if (data->cache_start < 0) {
-        compact_list_fill_cache_now(data, first);
-        return;
-    }
 
     int fetch_start = 0;
     int want = compact_list_page_range(data, first, &fetch_start);
@@ -1361,7 +1332,7 @@ static void compact_list_poll_fetch_cb(lv_timer_t * timer) {
     if (job->result_count >= 0) {
         pthread_join(job->thread, NULL); /* already returned by the time result_count landed -- instant, not a real wait */
         data->pending_job = NULL;
-    memcpy(data->cache_rows, job->rows, sizeof(data->cache_rows));
+        memcpy(data->cache_rows, job->rows, sizeof(data->cache_rows));
         data->cache_count = job->result_count;
         data->cache_start = job->offset;
         compact_list_job_release(job); /* the UI-side reference -- see compact_list_fetch_job_s's own doc comment */

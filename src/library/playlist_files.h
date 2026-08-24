@@ -46,6 +46,7 @@ bool playlist_files_create(const char * dir, const char * name, const char * son
  * which aren't backed by a real M3U file at all. Returns false if the file
  * doesn't exist or can't be removed. */
 bool playlist_files_delete(const char * m3u_path);
+bool playlist_files_has_active_write(void);
 
 /* Reads back a playlist's song paths, in file order -- the read-back
  * counterpart to playlist_files_append()/_create(). Skips blank lines and

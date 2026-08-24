@@ -6,9 +6,11 @@
 #include "stb_vorbis.h"
 #include "mbedtls/base64.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -51,6 +53,7 @@ static bool safe_chunk_advance(long chunk_start, uint64_t size, long pad, long *
  * decodes so a lying size field cannot malloc tens of MiB in-process. */
 #define METADATA_BLOB_MAX_BYTES (4U * 1024U * 1024U)
 #define EMBEDDED_COVER_MAX_BYTES METADATA_BLOB_MAX_BYTES
+#define ID3_TEXT_FRAME_MAX_BYTES (64U * 1024U)
 
 static bool store_picture_bytes(track_metadata_t * out, const uint8_t * src, uint32_t n) {
     if (!out || out->picture_data != NULL || !src || n == 0 || n > EMBEDDED_COVER_MAX_BYTES) return false;
@@ -249,14 +252,20 @@ static void parse_flac_picture_block(const uint8_t * data, size_t size, track_me
 
 /* ---- FLAC: VORBIS_COMMENT block ---- */
 
+typedef struct {
+    track_metadata_t * out;
+    bool include_blobs;
+} flac_metadata_ctx_t;
+
 static void flac_meta_cb(void * user_data, drflac_metadata * meta) {
-    track_metadata_t * out = (track_metadata_t *) user_data;
+    flac_metadata_ctx_t * ctx = (flac_metadata_ctx_t *) user_data;
+    track_metadata_t * out = ctx->out;
 
     if (meta->type == DRFLAC_METADATA_BLOCK_TYPE_PICTURE) {
         /* dr_flac frees its own copy of pPictureData right after this
          * callback returns, so it has to be copied here, not just
          * pointed to. */
-        if (out->picture_data == NULL && meta->data.picture.pictureDataSize > 0 &&
+        if (ctx->include_blobs && out->picture_data == NULL && meta->data.picture.pictureDataSize > 0 &&
             meta->data.picture.pPictureData != NULL) {
             store_picture_bytes(out, meta->data.picture.pPictureData, meta->data.picture.pictureDataSize);
         }
@@ -271,12 +280,22 @@ static void flac_meta_cb(void * user_data, drflac_metadata * meta) {
     drflac_uint32 comment_len;
     const char * comment;
     while ((comment = drflac_next_vorbis_comment(&iter, &comment_len)) != NULL) {
+        /* Scan-only reads do not need lyrics. Avoid allocating a potentially
+         * multi-megabyte comment that the database immediately discards. */
+        if (!ctx->include_blobs) {
+            const char * eq = memchr(comment, '=', comment_len);
+            size_t key_len = eq ? (size_t) (eq - comment) : 0;
+            if ((key_len == 6 && strncasecmp(comment, "LYRICS", 6) == 0) ||
+                (key_len == 14 && strncasecmp(comment, "UNSYNCEDLYRICS", 14) == 0))
+                continue;
+        }
         apply_vorbis_comment_field(out, comment, comment_len);
     }
 }
 
-static void read_flac_metadata(const char * path, track_metadata_t * out) {
-    drflac * flac = drflac_open_file_with_metadata(path, flac_meta_cb, out, NULL);
+static void read_flac_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
+    flac_metadata_ctx_t ctx = { out, include_blobs };
+    drflac * flac = drflac_open_file_with_metadata(path, flac_meta_cb, &ctx, NULL);
     if (flac) drflac_close(flac);
 }
 
@@ -541,15 +560,163 @@ static void decode_id3v2_uslt_frame(const uint8_t * data, uint32_t size, track_m
     free(prefixed);
 }
 
-static bool read_id3v2(FILE * f, track_metadata_t * out) {
+static uint32_t id3_deunsync_in_place(uint8_t * data, uint32_t size) {
+    uint32_t write_pos = 0;
+    for (uint32_t read_pos = 0; read_pos < size; read_pos++) {
+        uint8_t b = data[read_pos];
+        data[write_pos++] = b;
+        if (b == 0xFF && read_pos + 1 < size && data[read_pos + 1] == 0x00) read_pos++;
+    }
+    return write_pos;
+}
+
+typedef struct {
+    FILE * f;
+    uint32_t raw_remaining;
+    bool tag_unsync;
+    bool previous_ff;
+} id3_stream_t;
+
+static bool id3_stream_read(id3_stream_t * s, uint8_t * out, uint32_t count) {
+    uint32_t written = 0;
+    while (written < count && s->raw_remaining > 0) {
+        int c = fgetc(s->f);
+        if (c == EOF) return false;
+        s->raw_remaining--;
+        if (s->tag_unsync && s->previous_ff && c == 0x00) {
+            s->previous_ff = false;
+            continue;
+        }
+        out[written++] = (uint8_t) c;
+        s->previous_ff = c == 0xFF;
+    }
+    return written == count;
+}
+
+static bool id3_stream_skip(id3_stream_t * s, uint32_t count) {
+    if (!s->tag_unsync) {
+        if (count > s->raw_remaining || fseek(s->f, (long) count, SEEK_CUR) != 0) return false;
+        s->raw_remaining -= count;
+        s->previous_ff = false;
+        return true;
+    }
+    uint8_t scratch[512];
+    while (count > 0) {
+        uint32_t n = count < sizeof(scratch) ? count : (uint32_t) sizeof(scratch);
+        if (!id3_stream_read(s, scratch, n)) return false;
+        count -= n;
+    }
+    return true;
+}
+
+/* Oversized tags are usually small text frames plus one very large APIC.
+ * Walk frame headers directly from the file so that APIC can be skipped
+ * without discarding title/artist/album. The file is bounded by tag_end on
+ * every read and seek; no allocation is based on the overall tag size. */
+static bool read_id3v2_streaming(FILE * f, track_metadata_t * out, uint8_t major_version,
+                                 uint8_t tag_flags, uint32_t tag_size, bool include_blobs) {
+    long body_start = ftell(f);
+    if (body_start < 0 || tag_size > (uint32_t) LONG_MAX || body_start > LONG_MAX - (long) tag_size) return false;
+    long tag_end = body_start + (long) tag_size;
+    bool found_any = false;
+    id3_stream_t stream = { f, tag_size, (tag_flags & 0x80) != 0, false };
+
+    if (major_version >= 3 && (tag_flags & 0x40)) {
+        uint8_t ext[4];
+        if (!id3_stream_read(&stream, ext, 4)) return false;
+        uint32_t ext_size = read_be32(ext, major_version >= 4);
+        uint64_t ext_total = major_version >= 4 ? ext_size : (uint64_t) ext_size + 4U;
+        if (ext_total < 4 || ext_total > tag_size || !id3_stream_skip(&stream, (uint32_t) ext_total - 4U)) return false;
+    }
+
+    for (;;) {
+        uint32_t header_size = major_version <= 2 ? 6U : 10U;
+        uint8_t hdr[10];
+        if (!id3_stream_read(&stream, hdr, header_size)) break;
+        if (hdr[0] == 0) break;
+
+        char id[5] = {0};
+        uint32_t frame_size;
+        uint8_t flags2 = 0;
+        if (major_version <= 2) {
+            memcpy(id, hdr, 3);
+            frame_size = ((uint32_t) hdr[3] << 16) | ((uint32_t) hdr[4] << 8) | hdr[5];
+        } else {
+            memcpy(id, hdr, 4);
+            frame_size = read_be32(hdr + 4, major_version >= 4);
+            flags2 = hdr[9];
+        }
+        bool is_text = strcmp(id, major_version <= 2 ? "TT2" : "TIT2") == 0 ||
+                       strcmp(id, major_version <= 2 ? "TP1" : "TPE1") == 0 ||
+                       strcmp(id, major_version <= 2 ? "TAL" : "TALB") == 0 ||
+                       strcmp(id, major_version <= 2 ? "TP2" : "TPE2") == 0 ||
+                       strcmp(id, major_version <= 2 ? "TCO" : "TCON") == 0;
+        bool is_picture = strcmp(id, major_version <= 2 ? "PIC" : "APIC") == 0;
+        bool is_txxx = major_version >= 3 && strcmp(id, "TXXX") == 0;
+        bool is_lyrics = major_version >= 3 && strcmp(id, "USLT") == 0;
+        uint32_t limit = (is_text || is_txxx) ? ID3_TEXT_FRAME_MAX_BYTES : METADATA_BLOB_MAX_BYTES;
+
+        bool compressed = false, encrypted = false, grouped = false, frame_unsync = false, data_len = false;
+        if (major_version >= 4) {
+            compressed = (flags2 & 0x08) != 0; encrypted = (flags2 & 0x04) != 0;
+            grouped = (flags2 & 0x40) != 0; frame_unsync = (flags2 & 0x02) != 0;
+            data_len = (flags2 & 0x01) != 0;
+        } else if (major_version == 3) {
+            compressed = (flags2 & 0x80) != 0; encrypted = (flags2 & 0x40) != 0;
+            grouped = (flags2 & 0x20) != 0; data_len = compressed;
+        }
+
+        bool wanted = is_text || is_txxx || (include_blobs && (is_picture || is_lyrics));
+        if (wanted && !compressed && !encrypted && frame_size <= limit) {
+            uint8_t * data = malloc(frame_size ? frame_size : 1);
+            bool read_ok = data && id3_stream_read(&stream, data, frame_size);
+            if (read_ok) {
+                uint32_t n = frame_size;
+                if (frame_unsync) n = id3_deunsync_in_place(data, n);
+                uint32_t prefix = (grouped ? 1U : 0U) + (data_len ? 4U : 0U);
+                if (prefix <= n) {
+                    uint8_t * payload = data + prefix;
+                    n -= prefix;
+                    if (strcmp(id, major_version <= 2 ? "TT2" : "TIT2") == 0) {
+                        decode_id3v2_text_frame(payload, n, out->title, sizeof(out->title)); out->has_title = out->title[0] != 0;
+                    } else if (strcmp(id, major_version <= 2 ? "TP1" : "TPE1") == 0) {
+                        decode_id3v2_text_frame(payload, n, out->artist, sizeof(out->artist)); out->has_artist = out->artist[0] != 0;
+                    } else if (strcmp(id, major_version <= 2 ? "TAL" : "TALB") == 0) {
+                        decode_id3v2_text_frame(payload, n, out->album, sizeof(out->album)); out->has_album = out->album[0] != 0;
+                    } else if (strcmp(id, major_version <= 2 ? "TP2" : "TPE2") == 0) {
+                        decode_id3v2_text_frame(payload, n, out->album_artist, sizeof(out->album_artist)); out->has_album_artist = out->album_artist[0] != 0;
+                    } else if (strcmp(id, major_version <= 2 ? "TCO" : "TCON") == 0) {
+                        decode_id3v2_text_frame(payload, n, out->genre, sizeof(out->genre)); out->has_genre = out->genre[0] != 0;
+                    } else if (is_picture) {
+                        if (major_version <= 2) decode_id3v2_pic_frame(payload, n, out); else decode_id3v2_apic_frame(payload, n, out);
+                    } else if (is_txxx) decode_id3v2_txxx_frame(payload, n, out);
+                    else if (is_lyrics) decode_id3v2_uslt_frame(payload, n, out);
+                    found_any = true;
+                }
+            }
+            free(data);
+            if (!read_ok) break;
+        } else if (!id3_stream_skip(&stream, frame_size)) break;
+    }
+    fseek(f, tag_end, SEEK_SET);
+    return found_any;
+}
+
+static bool read_id3v2(FILE * f, track_metadata_t * out, bool include_blobs) {
     uint8_t header[10];
     if (fread(header, 1, sizeof(header), f) != sizeof(header)) return false;
     if (memcmp(header, "ID3", 3) != 0) return false;
 
     uint8_t major_version = header[3];
     uint8_t flags = header[5];
+    if (major_version < 2 || major_version > 4) return false;
     uint32_t tag_size = read_be32(&header[6], true); /* overall tag size is always synchsafe */
-    if (tag_size == 0 || tag_size > METADATA_BLOB_MAX_BYTES) return false;
+    if (tag_size == 0) return false;
+    /* A database scan only needs bounded text frames. Always stream in that
+     * mode so a large APIC/USLT body is skipped without allocating the
+     * complete ID3 tag first. */
+    if (!include_blobs || tag_size > METADATA_BLOB_MAX_BYTES)
+        return read_id3v2_streaming(f, out, major_version, flags, tag_size, include_blobs);
 
     uint8_t * tag_data = malloc(tag_size);
     if (!tag_data) return false;
@@ -580,15 +747,7 @@ static bool read_id3v2(FILE * f, track_metadata_t * out) {
      * rather than per-frame since it only matters for the tag-level flag.
      * See further down for the rarer per-frame variant, now also handled. */
     if (flags & 0x80) {
-        uint32_t write_pos = 0;
-        for (uint32_t read_pos = 0; read_pos < tag_size; read_pos++) {
-            uint8_t b = tag_data[read_pos];
-            tag_data[write_pos++] = b;
-            if (b == 0xFF && read_pos + 1 < tag_size && tag_data[read_pos + 1] == 0x00) {
-                read_pos++; /* skip the inserted 0x00 */
-            }
-        }
-        tag_size = write_pos;
+        tag_size = id3_deunsync_in_place(tag_data, tag_size);
     }
 
     uint32_t body_start = 0;
@@ -820,11 +979,11 @@ static bool read_id3v1(FILE * f, track_metadata_t * out) {
     return true;
 }
 
-static void read_mp3_metadata(const char * path, track_metadata_t * out) {
+static void read_mp3_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
 
-    if (!read_id3v2(f, out)) {
+    if (!read_id3v2(f, out, include_blobs)) {
         read_id3v1(f, out);
     }
 
@@ -841,11 +1000,11 @@ static void read_mp3_metadata(const char * path, track_metadata_t * out) {
  * front of/behind the raw ADTS frames, which the tagging software doesn't
  * need to know or care is AAC rather than MP3 -- so this reuses
  * read_id3v2()/read_id3v1() verbatim rather than needing any new parser. */
-static void read_aac_metadata(const char * path, track_metadata_t * out) {
+static void read_aac_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
 
-    if (!read_id3v2(f, out)) {
+    if (!read_id3v2(f, out, include_blobs)) {
         read_id3v1(f, out);
     }
 
@@ -1005,7 +1164,7 @@ static void m4a_read_lyrics_tag(FILE * f, m4a_box_t item, track_metadata_t * out
     }
 }
 
-static void read_m4a_metadata(const char * path, track_metadata_t * out) {
+static void read_m4a_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
 
@@ -1051,9 +1210,9 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out) {
             m4a_read_text_tag(f, item, out->album_artist, sizeof(out->album_artist), &out->has_album_artist);
         } else if (strcmp(item.type, "\xA9" "gen") == 0) {
             m4a_read_text_tag(f, item, out->genre, sizeof(out->genre), &out->has_genre);
-        } else if (strcmp(item.type, "covr") == 0) {
+        } else if (include_blobs && strcmp(item.type, "covr") == 0) {
             m4a_read_cover_art(f, item, out);
-        } else if (strcmp(item.type, "\xA9" "lyr") == 0) {
+        } else if (include_blobs && strcmp(item.type, "\xA9" "lyr") == 0) {
             m4a_read_lyrics_tag(f, item, out);
         }
 
@@ -1066,8 +1225,8 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out) {
 
 /* ---- Opus: OpusTags (Ogg comment header, RFC 7845 5.2) ---- */
 
-static void read_opus_metadata(const char * path, track_metadata_t * out) {
-    ogg_demux_t * demux = ogg_demux_open(path);
+static void read_opus_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
+    ogg_demux_t * demux = include_blobs ? ogg_demux_open(path) : ogg_demux_open_metadata(path, true);
     if (!demux) return;
 
     unsigned int count = ogg_demux_get_comment_count(demux);
@@ -1083,7 +1242,7 @@ static void read_opus_metadata(const char * path, track_metadata_t * out) {
          * binary decoding) keeps it a pure text-field matcher. */
         static const char picture_key[] = "METADATA_BLOCK_PICTURE=";
         size_t picture_key_len = sizeof(picture_key) - 1;
-        if (comment_len > picture_key_len && strncasecmp(comment, picture_key, picture_key_len) == 0) {
+        if (include_blobs && comment_len > picture_key_len && strncasecmp(comment, picture_key, picture_key_len) == 0) {
             const char * b64 = comment + picture_key_len;
             size_t b64_len = comment_len - picture_key_len;
 
@@ -1121,7 +1280,7 @@ static void read_opus_metadata(const char * path, track_metadata_t * out) {
  * scan (this opens a full decoder, not just a comment reader), same
  * pragmatic tradeoff class as other formats in this file that reuse a full
  * decoder-open for a metadata-only read. */
-static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out) {
+static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
     int error = 0;
     stb_vorbis * f = stb_vorbis_open_filename(path, &error, NULL);
     if (!f) return;
@@ -1132,12 +1291,18 @@ static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out) 
         if (!field) continue;
         size_t field_len = strlen(field);
 
+        if (!include_blobs &&
+            ((field_len >= 7 && strncasecmp(field, "LYRICS=", 7) == 0) ||
+             (field_len >= 15 && strncasecmp(field, "UNSYNCEDLYRICS=", 15) == 0) ||
+             (field_len >= 23 && strncasecmp(field, "METADATA_BLOCK_PICTURE=", 23) == 0)))
+            continue;
+
         /* Same METADATA_BLOCK_PICTURE special case as read_opus_metadata()
          * above -- see its own comment for why this stays out of
          * apply_vorbis_comment_field() itself. */
         static const char picture_key[] = "METADATA_BLOCK_PICTURE=";
         size_t picture_key_len = sizeof(picture_key) - 1;
-        if (field_len > picture_key_len && strncasecmp(field, picture_key, picture_key_len) == 0) {
+        if (include_blobs && field_len > picture_key_len && strncasecmp(field, picture_key, picture_key_len) == 0) {
             const char * b64 = field + picture_key_len;
             size_t b64_len = field_len - picture_key_len;
 
@@ -1194,7 +1359,7 @@ static void read_aiff_metadata(const char * path, track_metadata_t * out) {
         long chunk_data_start = ftell(f);
 
         if (strcmp(chunk_id, "ID3 ") == 0) {
-            read_id3v2(f, out);
+            read_id3v2(f, out, true);
             break;
         }
 
@@ -1255,7 +1420,7 @@ static void read_wav_id3_fallback(const char * path, track_metadata_t * out) {
         long chunk_data_start = ftell(f);
 
         if (strcasecmp(chunk_id, "id3 ") == 0) {
-            read_id3v2(f, out);
+            read_id3v2(f, out, true);
             break;
         }
 
@@ -1299,7 +1464,7 @@ static void read_dsf_metadata(const char * path, track_metadata_t * out) {
 
     uint64_t metadata_pointer = read_u64le(&dsd_chunk[20]);
     if (metadata_pointer != 0 && fseek(f, (long) metadata_pointer, SEEK_SET) == 0) {
-        read_id3v2(f, out);
+        read_id3v2(f, out, true);
     }
 
     fclose(f);
@@ -1478,7 +1643,7 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
         chunk_data_start = ftell(f);
 
         if (strcmp(id, "ID3 ") == 0) {
-            read_id3v2(f, out);
+            read_id3v2(f, out, true);
             fclose(f);
             return;
         }
@@ -1695,29 +1860,29 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
     fclose(f);
 }
 
-void metadata_read(const char * path, track_metadata_t * out) {
+static void metadata_read_internal(const char * path, track_metadata_t * out, bool include_blobs) {
     memset(out, 0, sizeof(*out));
 
     const char * ext = strrchr(path, '.');
     if (!ext) return;
 
     if (strcasecmp(ext, ".flac") == 0) {
-        read_flac_metadata(path, out);
+        read_flac_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".mp3") == 0) {
-        read_mp3_metadata(path, out);
+        read_mp3_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".wav") == 0) {
         read_wav_metadata(path, out);
         if (!out->has_title) read_wav_id3_fallback(path, out); /* see its own comment */
     } else if (strcasecmp(ext, ".aac") == 0) {
-        read_aac_metadata(path, out);
+        read_aac_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".m4a") == 0 || strcasecmp(ext, ".m4b") == 0) {
-        read_m4a_metadata(path, out);
+        read_m4a_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".opus") == 0) {
-        read_opus_metadata(path, out);
+        read_opus_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".ogg") == 0) {
         ogg_codec_t codec = ogg_detect_codec(path);
-        if (codec == OGG_CODEC_OPUS) read_opus_metadata(path, out);
-        else if (codec == OGG_CODEC_VORBIS) read_ogg_vorbis_metadata(path, out);
+        if (codec == OGG_CODEC_OPUS) read_opus_metadata(path, out, include_blobs);
+        else if (codec == OGG_CODEC_VORBIS) read_ogg_vorbis_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".aiff") == 0 || strcasecmp(ext, ".aif") == 0) {
         read_aiff_metadata(path, out);
     } else if (strcasecmp(ext, ".dsf") == 0) {
@@ -1729,6 +1894,10 @@ void metadata_read(const char * path, track_metadata_t * out) {
     } else if (strcasecmp(ext, ".wma") == 0) {
         read_wma_metadata(path, out);
     }
+}
+
+void metadata_read(const char * path, track_metadata_t * out) {
+    metadata_read_internal(path, out, true);
 }
 
 /* Real-device incident: a handful of FLAC files with a malformed leading
@@ -1768,8 +1937,56 @@ static bool isolated_needs_child(const char * path) {
     return true;
 }
 
+/* Children stuck in uninterruptible SD-card I/O cannot be synchronously
+ * reaped even after SIGKILL. Keep a small explicit set and retry WNOHANG on
+ * later scan calls; never use waitpid(-1), which could steal a child owned
+ * by another subsystem. Once the set is full, new isolated reads fail
+ * closed instead of creating an unbounded number of unreapable children. */
+#define METADATA_ABANDONED_CHILD_MAX 8
+static pthread_mutex_t abandoned_child_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pid_t abandoned_children[METADATA_ABANDONED_CHILD_MAX];
+
+static void reap_abandoned_metadata_children(void) {
+    pthread_mutex_lock(&abandoned_child_mutex);
+    for (int i = 0; i < METADATA_ABANDONED_CHILD_MAX; i++) {
+        pid_t pid = abandoned_children[i];
+        if (pid <= 0) continue;
+        int status = 0;
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid || (r < 0 && errno == ECHILD)) abandoned_children[i] = 0;
+    }
+    pthread_mutex_unlock(&abandoned_child_mutex);
+}
+
+static bool abandoned_metadata_child_capacity_available(void) {
+    bool available = false;
+    pthread_mutex_lock(&abandoned_child_mutex);
+    for (int i = 0; i < METADATA_ABANDONED_CHILD_MAX; i++) {
+        if (abandoned_children[i] == 0) {
+            available = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&abandoned_child_mutex);
+    return available;
+}
+
+static void remember_abandoned_metadata_child(pid_t pid) {
+    pthread_mutex_lock(&abandoned_child_mutex);
+    for (int i = 0; i < METADATA_ABANDONED_CHILD_MAX; i++) {
+        if (abandoned_children[i] == 0) {
+            abandoned_children[i] = pid;
+            pid = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&abandoned_child_mutex);
+    if (pid > 0)
+        fprintf(stderr, "metadata scan: abandoned-child set full; pid %ld remains for init to reap\n", (long) pid);
+}
+
 static void metadata_read_scan_tags(const char * path, track_metadata_t * out) {
-    metadata_read(path, out);
+    metadata_read_internal(path, out, false);
     free(out->picture_data);
     out->picture_data = NULL;
     out->picture_size = 0;
@@ -1785,9 +2002,15 @@ void metadata_read_isolated(const char * path, track_metadata_t * out, int timeo
         return;
     }
 
+    reap_abandoned_metadata_children();
+    if (!abandoned_metadata_child_capacity_available()) {
+        fprintf(stderr, "metadata scan: too many unreaped parser children; skipping %s\n", path);
+        return;
+    }
+
     int pipefd[2];
     if (pipe(pipefd) != 0) {
-        metadata_read_scan_tags(path, out); /* pipe() failing is exotic enough to fall back in-process */
+        fprintf(stderr, "metadata scan: pipe failed for %s: %s\n", path, strerror(errno));
         return;
     }
 
@@ -1795,7 +2018,7 @@ void metadata_read_isolated(const char * path, track_metadata_t * out, int timeo
     if (pid < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
-        metadata_read_scan_tags(path, out);
+        fprintf(stderr, "metadata scan: fork failed for %s: %s\n", path, strerror(errno));
         return;
     }
 
@@ -1840,5 +2063,5 @@ void metadata_read_isolated(const char * path, track_metadata_t * out, int timeo
         usleep(50000);
     }
     kill(pid, SIGKILL);
-    waitpid(pid, NULL, 0);
+    remember_abandoned_metadata_child(pid);
 }

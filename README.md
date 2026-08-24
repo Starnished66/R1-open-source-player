@@ -178,7 +178,7 @@ The LAN remote-control interface provides a simple way to control the player fro
 
 The following features are planned or currently incomplete:
 
-- Native audiobook support (currently available via the example Audiobooks plugin — see [PLUGINS.md](PLUGINS.md))
+- Song info.
 - Background image/color customization
 - Full theme support (Base is already done with a plugin interface)
 - Additional community-requested features

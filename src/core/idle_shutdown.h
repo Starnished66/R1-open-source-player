@@ -11,7 +11,7 @@
  * only reliable way to actually cut standby power draw -- see gui.c's
  * idle-shutdown timer for the inactivity gating (screen off, not playing,
  * not charging) before this gets called. Replaces this process with
- * busybox `poweroff -f` (then the reboot(RB_POWER_OFF) syscall if exec
+ * busybox `poweroff` (then the reboot(RB_POWER_OFF) syscall if exec
  * fails) so it cannot return on the device. Must not use subprocess_run():
  * that helper SIGKILLs its child after 15s, which cancelled poweroff and
  * left the countdown looking finished while the device stayed on. No-op

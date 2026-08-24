@@ -1244,8 +1244,12 @@ useful after a plugin writes new files under `plugin.sd_root()`, since none
 of the `library_*()` functions above notice new files on their own;
 there's no filesystem watcher, only a rescan triggered by this, that same
 Settings row, an SD reinsert, or a restart. Shows the same native "Updating
-music database..." progress screen a user tapping that row would see. A
-no-op if a rescan is already running.
+music database..." progress screen a user tapping that row would see.
+Returns `true, "started"` when accepted, or `false, "already_running"` /
+`false, "rate_limited"`. Each plugin may start at most one scan per minute;
+requests made while a scan is active are coalesced by returning
+`already_running`. Check `plugin.has_capability("library.refresh")` before
+relying on this interface.
 
 ```lua
 plugin.define({ id = "org.example.library_browser", api_min = 1 })

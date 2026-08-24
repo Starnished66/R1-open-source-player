@@ -48,6 +48,40 @@
 #include "timezone_data.h"
 #include "timezone_apply.h"
 #include "hostname_apply.h"
+
+/* --- Theme API (gui_theme.h) --- */
+typedef enum {
+    GUI_FONT_ROLE_TITLE,
+    GUI_FONT_ROLE_ROW,
+    GUI_FONT_ROLE_BODY,
+    GUI_FONT_ROLE_SUBTEXT,
+    GUI_FONT_ROLE_STATUS
+} gui_font_role_t;
+
+const lv_font_t * gui_theme_font(gui_font_role_t role);
+
+/* --- Notification/Modal API (gui_notifications.h) --- */
+typedef uint32_t gui_busy_handle_t;
+
+static uint32_t gui_busy_current_token = 0;
+static lv_obj_t * gui_busy_screen = NULL;
+static lv_obj_t * gui_busy_label = NULL;
+static lv_obj_t * gui_busy_progress_bar = NULL;
+
+static gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
+static void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
+static void gui_busy_hide(gui_busy_handle_t handle);
+
+static gui_busy_handle_t download_token = 0;
+static gui_busy_handle_t subsonic_library_download_token = 0;
+static gui_busy_handle_t subsonic_browse_token = 0;
+static gui_busy_handle_t subsonic_connect_token = 0;
+static gui_busy_handle_t library_rescan_token = 0;
+static gui_busy_handle_t sd_format_token = 0;
+static gui_busy_handle_t wifi_connect_token = 0;
+static gui_busy_handle_t wifi_connect_saved_token = 0;
+static gui_busy_handle_t import_web_stop_token = 0;
+
 #include "src/core/lv_obj.h"
 #include "src/core/lv_obj_pos.h"
 #include "src/core/lv_obj_style.h"
@@ -2766,7 +2800,7 @@ static void build_error_toast(void) {
     lv_label_set_long_mode(error_toast_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(error_toast_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(error_toast_label, lv_color_make(255, 200, 200), 0);
-    lv_obj_set_style_text_font(error_toast_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(error_toast_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_center(error_toast_label);
 
     error_toast_hide_timer = lv_timer_create(error_toast_hide_timer_cb, 2500, NULL);
@@ -2841,7 +2875,7 @@ static void build_info_toast(void) {
     lv_label_set_long_mode(info_toast_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(info_toast_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(info_toast_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(info_toast_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(info_toast_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_center(info_toast_label);
 
     info_toast_hide_timer = lv_timer_create(info_toast_hide_timer_cb, 5000, NULL);
@@ -3826,8 +3860,6 @@ static pthread_t bt_toggle_thread;
 static bool bt_toggle_active = false;
 static volatile bool bt_toggle_done_flag = false;
 
-static lv_obj_t * subsonic_downloading_screen; /* forward decl -- fully built below with the rest of that shared screen */
-static lv_obj_t * subsonic_downloading_label;
 
 /* Set by bt_toggle_thread_func() when disabling Bluetooth while DAC mode
  * was on -- consumed by poll_bt_toggle() to turn the setting off and close
@@ -4262,7 +4294,7 @@ static void build_quick_drawer(void) {
      * the 84px-wide icon above it. */
     quick_drawer_sleep_label = lv_label_create(quick_drawer);
     lv_obj_add_style(quick_drawer_sleep_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(quick_drawer_sleep_label, ui_size_16, 0);
+    lv_obj_set_style_text_font(quick_drawer_sleep_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_set_width(quick_drawer_sleep_label, 84);
     lv_obj_set_style_text_align(quick_drawer_sleep_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(quick_drawer_sleep_label, LV_ALIGN_TOP_LEFT, 250, QUICK_DRAWER_PANEL1_TOP + 30 + 84 + 4);
@@ -4283,7 +4315,7 @@ static void build_quick_drawer(void) {
 
     quick_drawer_brightness_label = lv_label_create(quick_drawer);
     lv_obj_add_style(quick_drawer_brightness_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(quick_drawer_brightness_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(quick_drawer_brightness_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_align(quick_drawer_brightness_label, LV_ALIGN_TOP_RIGHT, -20, QUICK_DRAWER_PANEL1_TOP + 177);
 
     /* Real-device bug report: the "NN%" label overlapped the slider --
@@ -4301,7 +4333,7 @@ static void build_quick_drawer(void) {
      * room for the widest this label could ever render ("100%") fixes the
      * real, horizontal overlap while leaving both elements' Y positions
      * exactly as originally designed. */
-    int32_t brightness_label_max_w = lv_text_get_width("100%", 4, ui_size_20, 0);
+    int32_t brightness_label_max_w = lv_text_get_width("100%", 4, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     int32_t brightness_track_w = (w - 20 - brightness_label_max_w - 20) - 90;
     if (brightness_track_w > 300) brightness_track_w = 300; /* never wider than the original design */
     if (brightness_track_w < 120) brightness_track_w = 120; /* sane floor so the track never collapses to nothing */
@@ -6793,6 +6825,12 @@ static bool screen_off_playback_active = false;
  * attempt rather than being permanently given up on after one failure. */
 static bool idle_shutdown_attempted = false;
 
+static bool shutdown_background_work_active(void) {
+    return library_rescan_active || library_rescan_success_pending || album_thumbnail_active ||
+           atomic_load(&album_thumb_gen_active) || download_active || subsonic_library_download_active ||
+           subsonic_connect_active || plugin_manager_has_background_work() || playlist_files_has_active_write();
+}
+
 /* Real-device bug report: waking from suspend needed two power-button
  * presses -- see the resume fixup below (right after power_suspend_now())
  * for the full mechanism. An earlier version of this comment attributed the
@@ -7232,13 +7270,16 @@ static void update_timer_cb(lv_timer_t * timer) {
 #ifndef HOST_BUILD
     {
         static bool last_charging = true; /* starts true so nothing fires before any real state has been sampled */
+        static bool car_shutdown_pending = false;
         bool charging = battery_is_charging();
         if (current_settings.car_mode_enabled && last_charging && !charging &&
-            (audio_is_playing() || audio_is_paused())) {
+            (audio_is_playing() || audio_is_paused())) car_shutdown_pending = true;
+        if (car_shutdown_pending && !shutdown_background_work_active()) {
             current_settings.last_position = audio_get_position_seconds();
             settings_save(&current_settings);
             idle_shutdown_now(); /* full poweroff -- does not return, see idle_shutdown.h */
         }
+        if (charging || !current_settings.car_mode_enabled) car_shutdown_pending = false;
         last_charging = charging;
     }
 #endif
@@ -7481,7 +7522,7 @@ static void update_timer_cb(lv_timer_t * timer) {
          * went dark, which is fine: nothing in this app can change BT power
          * state without a UI the user can't reach with the screen off. */
         if (!radios_suspended && !current_settings.wifi_dac_mode_enabled && !current_settings.bt_dac_mode_enabled &&
-            !audio_is_playing() && !battery_is_charging() &&
+            !audio_is_playing() && !battery_is_charging() && !shutdown_background_work_active() &&
             lv_tick_elaps(screen_off_since_tick) >= RADIO_SUSPEND_DELAY_MS) {
             wifi_was_on_before_suspend = wifi_control_is_enabled();
             bt_was_on_before_suspend = bt_is_powered_cached;
@@ -7509,7 +7550,7 @@ static void update_timer_cb(lv_timer_t * timer) {
          * device powering itself off out from under them. */
         if (!idle_shutdown_attempted && current_settings.idle_shutdown_enabled &&
             !current_settings.wifi_dac_mode_enabled && !current_settings.bt_dac_mode_enabled &&
-            !audio_is_playing() && !battery_is_charging() &&
+            !audio_is_playing() && !battery_is_charging() && !shutdown_background_work_active() &&
             lv_tick_elaps(screen_off_since_tick) >= (uint32_t) current_settings.idle_shutdown_minutes * 60 * 1000) {
             if (current_settings.idle_suspend_enabled) {
                 power_suspend_now();
@@ -9326,7 +9367,7 @@ static lv_obj_t * build_files_screen(void) {
     lv_label_set_text(title, "Files");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_28, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
     file_browser_init(scr, MUSIC_ROOT_DIR, on_file_browser_selected, on_cue_file_selected);
 
@@ -9626,8 +9667,10 @@ int gui_plugin_library_get_albums(int offset, int limit, const char * artist_fil
     return metadata_db_get_albums_page_filtered(artist_filter, offset, limit, out_rows);
 }
 
-void gui_plugin_refresh_library(void) {
+bool gui_plugin_refresh_library(void) {
+    if (library_rescan_active) return false;
     start_library_rescan();
+    return library_rescan_active;
 }
 
 /* A stuck read on a corrupted SD card block (confirmed on a real device via
@@ -10580,7 +10623,7 @@ static lv_obj_t * build_group_songs_screen(void) {
     group_songs_edit_btn = lv_label_create(scr);
     lv_label_set_text(group_songs_edit_btn, "Edit");
     lv_obj_set_style_text_color(group_songs_edit_btn, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(group_songs_edit_btn, ui_size_20, 0);
+    lv_obj_set_style_text_font(group_songs_edit_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_align(group_songs_edit_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_HIDDEN);
@@ -11267,10 +11310,10 @@ static void t9_keypad_attach(lv_obj_t * target_screen, lv_obj_t * textarea_paren
     text_entry_inline_mode_active = true;
 }
 
-/* text_entry_textarea's own resting height -- derived from ui_size_20's
+/* text_entry_textarea's own resting height -- derived from gui_theme_font(GUI_FONT_ROLE_BODY)'s
  * real line height (bigger at the Medium/BlindMF font tiers) plus fixed
  * vertical padding, rather than a flat pixel value sized for the smallest
- * tier only. Recomputed on demand (not cached) since ui_size_20 is itself a
+ * tier only. Recomputed on demand (not cached) since gui_theme_font(GUI_FONT_ROLE_BODY) is itself a
  * mutable pointer apply_font_size_tier() only ever reassigns once at boot,
  * but reading it fresh here costs nothing and avoids any ordering
  * assumption about when that reassignment has happened. Shared by both
@@ -11280,7 +11323,7 @@ static void t9_keypad_attach(lv_obj_t * target_screen, lv_obj_t * textarea_paren
  * 50px baked in as a separate literal and silently overwrote the creation
  * site's own (correct) height on every single show_text_entry() call. */
 static int32_t text_entry_field_height(void) {
-    return lv_font_get_line_height(ui_size_20) + 26;
+    return lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_BODY)) + 26;
 }
 
 /* Returns keypad_group + text_entry_textarea to text_entry_screen, their
@@ -11330,16 +11373,16 @@ static lv_obj_t * build_text_entry_screen(void) {
     lv_label_set_text(text_entry_title_label, "");
     lv_obj_align(text_entry_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 8);
     lv_obj_add_style(text_entry_title_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(text_entry_title_label, ui_size_16, 0);
+    lv_obj_set_style_text_font(text_entry_title_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
 
     text_entry_textarea = lv_textarea_create(scr);
     /* Real-device bug report: this field's typed text stayed at LVGL's own
      * unscaled default font regardless of Settings -> Font Size -- unlike
      * every other body-text label in the app, nothing here ever set an
      * explicit ui_size_* font, so it never participated in apply_font_size_
-     * tier()'s own scaling at all. ui_size_20 matches most other body text;
+     * tier()'s own scaling at all. gui_theme_font(GUI_FONT_ROLE_BODY) matches most other body text;
      * see text_entry_field_height()'s own comment for the field's height. */
-    lv_obj_set_style_text_font(text_entry_textarea, ui_size_20, 0);
+    lv_obj_set_style_text_font(text_entry_textarea, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_set_size(text_entry_textarea, lv_pct(78), text_entry_field_height());
     lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 40);
     lv_textarea_set_one_line(text_entry_textarea, true);
@@ -11467,9 +11510,6 @@ static void * download_thread_func(void * arg) {
     return NULL;
 }
 
-static lv_obj_t * subsonic_downloading_screen;
-static lv_obj_t * subsonic_downloading_label;
-static lv_obj_t * subsonic_downloading_progress_bar;
 static void start_subsonic_download(const char * url, bool verify_tls, const char * dest_path, const char * display_title) {
     snprintf(download_dest_path, sizeof(download_dest_path), "%s", dest_path);
 
@@ -11482,8 +11522,7 @@ static void start_subsonic_download(const char * url, bool verify_tls, const cha
     download_success_flag = false;
     download_active = true;
 
-    lv_label_set_text_fmt(subsonic_downloading_label, "Downloading\n%s...", display_title);
-    nav_push(subsonic_downloading_screen);
+    download_token = gui_busy_show("Downloading", display_title);
 
     pthread_create(&download_thread, NULL, download_thread_func, req);
 }
@@ -11528,7 +11567,7 @@ static void poll_subsonic_download(void) {
     if (nav_depth > depth_before) {
         nav_remove_stack_slot(depth_before - 1);
     } else {
-        nav_pop(); /* leave the downloading screen */
+        gui_busy_hide(download_token);
     }
     /* else (download failed, or play_track_at_from() bailed out early via
      * external_dac_block_reason() without navigating): silently stays
@@ -11585,30 +11624,63 @@ static void poll_dlna_control(void) {
  * player; this interstitial and its (now permanently hidden, nothing sets
  * it) cancel button are what's left for the remaining, genuinely
  * non-cancelable uses. */
-static lv_obj_t * build_subsonic_downloading_screen(void) {
-    lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    subsonic_downloading_label = lv_label_create(scr);
-    lv_label_set_text(subsonic_downloading_label, "");
-    lv_obj_add_style(subsonic_downloading_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_align(subsonic_downloading_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(subsonic_downloading_label, LV_ALIGN_CENTER, 0, -20);
+/* --- Modal API Implementation --- */
+static gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
+    gui_busy_current_token++;
+    if (!gui_busy_screen) {
+        gui_busy_screen = lv_obj_create(NULL);
+        lv_obj_add_style(gui_busy_screen, &style_theme_screen_bg, 0);
 
-    /* Only the library-rescan flow (start_library_rescan()/poll_library_
-     * rescan()) ever shows this -- the other reuses of this shared "please
-     * wait" screen (subsonic download/connect, wifi connect) don't have a
-     * meaningful total to report progress against, so it stays hidden
-     * unless a rescan explicitly shows it, and gets hidden again as soon as
-     * that rescan's success message is dismissed. */
-    subsonic_downloading_progress_bar = lv_bar_create(scr);
-    lv_obj_set_size(subsonic_downloading_progress_bar, 280, 14);
-    lv_obj_align(subsonic_downloading_progress_bar, LV_ALIGN_CENTER, 0, 30);
-    lv_bar_set_range(subsonic_downloading_progress_bar, 0, 100);
-    lv_obj_add_style(subsonic_downloading_progress_bar, &style_accent, LV_PART_INDICATOR);
-    lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
+        gui_busy_label = lv_label_create(gui_busy_screen);
+        lv_obj_add_style(gui_busy_label, &style_theme_text_primary, 0);
+        lv_obj_set_style_text_align(gui_busy_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(gui_busy_label, LV_ALIGN_CENTER, 0, -20);
 
-    return scr;
+        gui_busy_progress_bar = lv_bar_create(gui_busy_screen);
+        lv_obj_set_size(gui_busy_progress_bar, 280, 14);
+        lv_obj_align(gui_busy_progress_bar, LV_ALIGN_CENTER, 0, 30);
+        lv_bar_set_range(gui_busy_progress_bar, 0, 100);
+        lv_obj_add_style(gui_busy_progress_bar, &style_accent, LV_PART_INDICATOR);
+    }
+    
+    if (msg && msg[0] != '\0') {
+        lv_label_set_text_fmt(gui_busy_label, "%s\n%s", title, msg);
+    } else {
+        lv_label_set_text(gui_busy_label, title);
+    }
+    lv_obj_add_flag(gui_busy_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    
+    if (lv_screen_active() != gui_busy_screen) {
+        nav_push(gui_busy_screen);
+    }
+    return gui_busy_current_token;
+}
+
+static void gui_busy_set_progress(gui_busy_handle_t handle, int percent) {
+    if (handle != gui_busy_current_token || !gui_busy_screen) return;
+    lv_obj_remove_flag(gui_busy_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_bar_set_value(gui_busy_progress_bar, percent, LV_ANIM_OFF);
+}
+
+static void gui_busy_hide(gui_busy_handle_t handle) {
+    if (handle != gui_busy_current_token || !gui_busy_screen) return;
+    if (lv_screen_active() == gui_busy_screen) {
+        nav_pop();
+    }
+    gui_busy_current_token++; /* invalidate token */
+}
+
+/* --- Theme API Implementation --- */
+const lv_font_t * gui_theme_font(gui_font_role_t role) {
+    switch (role) {
+        case GUI_FONT_ROLE_TITLE:   return gui_theme_font(GUI_FONT_ROLE_TITLE);
+        case GUI_FONT_ROLE_ROW:     return gui_theme_font(GUI_FONT_ROLE_ROW);
+        case GUI_FONT_ROLE_BODY:    return gui_theme_font(GUI_FONT_ROLE_BODY);
+        case GUI_FONT_ROLE_SUBTEXT: return gui_theme_font(GUI_FONT_ROLE_SUBTEXT);
+        case GUI_FONT_ROLE_STATUS:  return gui_theme_font(GUI_FONT_ROLE_SUBTEXT);
+        default:                    return gui_theme_font(GUI_FONT_ROLE_ROW);
+    }
 }
 
 /* ---- "Download to library" -- Subsonic screen redesign. Unlike the
@@ -11764,14 +11836,8 @@ static void start_subsonic_library_download(subsonic_song_t * songs, int song_co
     subsonic_library_download_done_flag = false;
     subsonic_library_download_active = true;
 
-    lv_label_set_text(subsonic_downloading_label, progress_label);
-    lv_bar_set_value(subsonic_downloading_progress_bar, 0, LV_ANIM_OFF);
-    if (albums_to_expand) {
-        lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN); /* no meaningful total yet -- see the "0 while expanding" comment above */
-    } else {
-        lv_obj_remove_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
-    }
-    nav_push(subsonic_downloading_screen);
+    subsonic_library_download_token = gui_busy_show(progress_label, "");
+    gui_busy_set_progress(subsonic_library_download_token, 0);
 
     pthread_create(&subsonic_library_download_thread, NULL, subsonic_library_download_thread_func, req);
 }
@@ -11782,11 +11848,7 @@ static void poll_subsonic_library_download(void) {
     if (!subsonic_library_download_done_flag) {
         int total = subsonic_library_download_total;
         if (total > 0) {
-            lv_obj_remove_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text_fmt(subsonic_downloading_label, "Downloading to library...\n%d / %d",
-                                   subsonic_library_download_progress, total);
-            lv_bar_set_value(subsonic_downloading_progress_bar,
-                              (subsonic_library_download_progress * 100) / total, LV_ANIM_OFF);
+            gui_busy_set_progress(subsonic_library_download_token, (subsonic_library_download_progress * 100) / total);
         }
         return;
     }
@@ -11926,7 +11988,7 @@ static lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) 
     lv_obj_t * label = lv_label_create(row);
     lv_label_set_text(label, label_text);
     lv_obj_add_style(label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(label, ui_size_16, 0);
+    lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
     configure_scrolling_row_label(label, row_width - 136);
     return row;
@@ -11979,7 +12041,7 @@ static lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_tex
     lv_obj_t * chevron = lv_label_create(row);
     lv_label_set_text(chevron, ">");
     lv_obj_add_style(chevron, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(chevron, ui_size_16, 0);
+    lv_obj_set_style_text_font(chevron, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, -20, 0);
 
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -11991,7 +12053,7 @@ static lv_obj_t * add_section_header(lv_obj_t * parent, const char * text) {
     lv_obj_t * label = lv_label_create(parent);
     lv_label_set_text(label, text);
     lv_obj_add_style(label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(label, ui_size_16, 0);
+    lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_set_style_pad_top(label, 12, 0);
     lv_obj_set_style_pad_left(label, 24, 0);
     return label;
@@ -12061,7 +12123,7 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
     lv_obj_add_style(label, &style_theme_text_primary, 0);
     /* text_size is never NULL here -- populate_plugin_settings_list_screen()
      * already defaults it to "small" (matching this row's own previous
-     * hardcoded ui_size_16) before calling in. */
+     * hardcoded gui_theme_font(GUI_FONT_ROLE_SUBTEXT)) before calling in. */
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, 20, 12);
     lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
     pill_row_apply_icon(card, label, icon_path, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_TOP_LEFT, 20, 12);
@@ -12069,7 +12131,7 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
 
     lv_obj_t * value_label = lv_label_create(card); /* child 1 -- see plugin_settings_slider_event_cb()'s lookup */
     lv_obj_add_style(value_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(value_label, ui_size_16, 0);
+    lv_obj_set_style_text_font(value_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(value_label, LV_ALIGN_TOP_RIGHT, -20, 12);
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", value);
@@ -12200,7 +12262,7 @@ static void populate_plugin_settings_list_screen(int slot) {
         void * packed = pack_plugin_settings_slot_row(slot, row);
         const char * icon = st->icon_path[0] ? st->icon_path : NULL;
         /* Default "small" -- matches this whole screen's own previous
-         * hardcoded ui_size_16, so a row that doesn't set text_size renders
+         * hardcoded gui_theme_font(GUI_FONT_ROLE_SUBTEXT), so a row that doesn't set text_size renders
          * exactly as it did before this field existed. */
         const char * text_size = st->text_size[0] ? st->text_size : "small";
 
@@ -12527,12 +12589,11 @@ static void start_subsonic_browse(subsonic_browse_kind_t kind, const char * id, 
     subsonic_browse_success_flag = false;
     subsonic_browse_active = true;
 
-    lv_label_set_text(subsonic_downloading_label, "Loading from server...");
-    nav_push(subsonic_downloading_screen);
+    subsonic_browse_token = gui_busy_show("Loading from server...", "");
     if (pthread_create(&subsonic_browse_thread, NULL, subsonic_browse_thread_func, req) != 0) {
         subsonic_browse_active = false;
         free(req);
-        nav_pop();
+        gui_busy_hide(subsonic_browse_token);
     }
 }
 
@@ -12877,7 +12938,7 @@ static void poll_subsonic_connect(void) {
     if (nav_depth > depth_before) {
         nav_remove_stack_slot(depth_before - 1);
     } else {
-        nav_pop(); /* leave the connecting screen */
+        gui_busy_hide(wifi_connect_saved_token);
     }
     /* else (failure): silently stays wherever nav_pop() landed -- same
      * documented gap as poll_subsonic_download above. */
@@ -12893,8 +12954,7 @@ static void start_subsonic_connect(const subsonic_server_t * server) {
     subsonic_connect_success_flag = false;
     subsonic_connect_active = true;
 
-    lv_label_set_text(subsonic_downloading_label, "Connecting to server...");
-    nav_push(subsonic_downloading_screen);
+    subsonic_connect_token = gui_busy_show("Connecting to server...", "");
 
     pthread_create(&subsonic_connect_thread, NULL, subsonic_connect_thread_func, req);
 }
@@ -14990,7 +15050,7 @@ static lv_obj_t * build_playlists_screen(void) {
     playlists_edit_btn = lv_label_create(scr);
     lv_label_set_text(playlists_edit_btn, "Edit");
     lv_obj_set_style_text_color(playlists_edit_btn, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(playlists_edit_btn, ui_size_20, 0);
+    lv_obj_set_style_text_font(playlists_edit_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_align(playlists_edit_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_flag(playlists_edit_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(playlists_edit_btn, playlists_edit_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -15132,10 +15192,8 @@ static void start_library_rescan(void) {
     cancel_album_thumbnail_generation();
     library_rescan_done_flag = false;
     library_rescan_active = true;
-    lv_label_set_text(subsonic_downloading_label, "Updating\nmusic database...");
-    lv_bar_set_value(subsonic_downloading_progress_bar, 0, LV_ANIM_OFF);
-    lv_obj_remove_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
-    nav_push(subsonic_downloading_screen);
+    library_rescan_token = gui_busy_show("Updating\nmusic database...", "");
+    gui_busy_set_progress(library_rescan_token, 0);
     pthread_create(&library_rescan_thread, NULL, library_rescan_thread_func, NULL);
 }
 
@@ -15163,7 +15221,7 @@ static void refresh_library_screens_after_reload(void) {
      * long enough to show the completion message, so only preserve that
      * explicitly safe case. Resetting also removes deeper group screens
      * whose rows reference the library arrays replaced by the reload. */
-    if (lv_screen_active() != subsonic_downloading_screen) {
+    if (lv_screen_active() != gui_busy_screen) {
         nav_reset_to_home();
     } else {
         /* Audit finding: this exception only skipped nav_reset_to_home()
@@ -15294,11 +15352,7 @@ static void poll_library_rescan(void) {
          * meaningful to show yet in that window; the label just keeps
          * reading "Updating music database..." until then. */
         if (library_scan_progress_total > 0) {
-            lv_label_set_text_fmt(subsonic_downloading_label, "Updating\nmusic database...\n%d / %d",
-                                   library_scan_progress_done, library_scan_progress_total);
-            lv_bar_set_value(subsonic_downloading_progress_bar,
-                              (int32_t) ((int64_t) library_scan_progress_done * 100 / library_scan_progress_total),
-                              LV_ANIM_OFF);
+            gui_busy_set_progress(library_rescan_token, (int32_t) ((int64_t) library_scan_progress_done * 100 / library_scan_progress_total));
         }
         return;
     }
@@ -15312,9 +15366,7 @@ static void poll_library_rescan(void) {
      * progress screen, no toast. The worker yields and cancels when Albums
      * opens so visible-row decode stays first. */
     start_album_thumbnail_generation();
-    lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text_fmt(subsonic_downloading_label, "Library updated\n%lld songs",
-                          (long long) metadata_db_get_song_count());
+    gui_busy_hide(library_rescan_token); show_info_toast("Library updated");
     library_rescan_success_pending = true;
     library_rescan_success_since_tick = lv_tick_get();
 }
@@ -15680,9 +15732,7 @@ static void * sd_format_thread_func(void * arg) {
 static void start_sd_format(void) {
     sd_format_done_flag = false;
     sd_format_active = true;
-    lv_label_set_text(subsonic_downloading_label, "Formatting\nSD Card...");
-    lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN); /* no meaningful sub-progress to show */
-    nav_push(subsonic_downloading_screen);
+    sd_format_token = gui_busy_show("Formatting\nSD Card...", "");
     pthread_create(&sd_format_thread, NULL, sd_format_thread_func, NULL);
 }
 
@@ -15691,7 +15741,7 @@ static void poll_sd_format(void) {
 
     sd_format_active = false;
     pthread_join(sd_format_thread, NULL);
-    nav_pop(); /* leave the "Formatting SD Card..." screen */
+    gui_busy_hide(sd_format_token);
 
     if (sd_format_succeeded) {
         show_error_toast("SD card formatted");
@@ -15880,13 +15930,13 @@ static void build_power_off_countdown_popup(void) {
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
     lv_label_set_text(title, "Powering Off");
 
     power_off_countdown_label = lv_label_create(power_off_countdown_popup);
     lv_obj_add_style(power_off_countdown_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(power_off_countdown_label, ui_size_28, 0);
+    lv_obj_set_style_text_font(power_off_countdown_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align(power_off_countdown_label, LV_ALIGN_CENTER, 0, -10);
     lv_label_set_text_fmt(power_off_countdown_label, "%d", POWER_OFF_COUNTDOWN_SECONDS);
 
@@ -15902,7 +15952,7 @@ static void build_power_off_countdown_popup(void) {
     lv_obj_t * cancel_label = lv_label_create(cancel_row);
     lv_label_set_text(cancel_label, "Cancel");
     lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(cancel_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_center(cancel_label);
 }
 
@@ -16070,8 +16120,7 @@ static void start_wifi_connect(const char * ssid, const char * password) {
     wifi_connect_done_flag = false;
     wifi_connect_active = true;
 
-    lv_label_set_text_fmt(subsonic_downloading_label, "Connecting to\n%s...", ssid);
-    nav_push(subsonic_downloading_screen);
+    wifi_connect_token = gui_busy_show("Connecting to", ssid);
 
     pthread_create(&wifi_connect_thread, NULL, wifi_connect_thread_func, req);
 }
@@ -16081,7 +16130,7 @@ static void poll_wifi_connect(void) {
 
     wifi_connect_active = false;
     pthread_join(wifi_connect_thread, NULL);
-    nav_pop(); /* leave the connecting screen, back to the network list */
+    gui_busy_hide(wifi_connect_token);
     if (!wifi_connect_succeeded) {
         show_error_toast("Couldn't connect to Wi-Fi network");
     }
@@ -16129,8 +16178,7 @@ static void start_wifi_connect_saved(int id, const char * ssid) {
     wifi_connect_saved_done_flag = false;
     wifi_connect_saved_active = true;
 
-    lv_label_set_text_fmt(subsonic_downloading_label, "Connecting to\n%s...", ssid);
-    nav_push(subsonic_downloading_screen);
+    wifi_connect_token = gui_busy_show("Connecting to", ssid);
 
     pthread_create(&wifi_connect_saved_thread, NULL, wifi_connect_saved_thread_func, req);
 }
@@ -16140,7 +16188,7 @@ static void poll_wifi_connect_saved(void) {
 
     wifi_connect_saved_active = false;
     pthread_join(wifi_connect_saved_thread, NULL);
-    nav_pop(); /* leave the connecting screen, back to the network list */
+    gui_busy_hide(wifi_connect_token);
     if (!wifi_connect_saved_succeeded) {
         show_error_toast("Couldn't connect to Wi-Fi network");
     }
@@ -16595,7 +16643,7 @@ static lv_obj_t * build_wifi_screen(void) {
     lv_obj_t * rescan_btn = lv_label_create(scr);
     lv_label_set_text(rescan_btn, "Rescan");
     lv_obj_set_style_text_color(rescan_btn, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(rescan_btn, ui_size_20, 0);
+    lv_obj_set_style_text_font(rescan_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_align(rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_flag(rescan_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(rescan_btn, wifi_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -16903,7 +16951,7 @@ static void add_bt_device_row(lv_obj_t * parent, int index) {
         lv_obj_t * codec_label = lv_label_create(row);
         lv_label_set_text(codec_label, bt_connected_codec_cached);
         lv_obj_add_style(codec_label, &style_theme_text_muted, 0);
-        lv_obj_set_style_text_font(codec_label, ui_size_16, 0);
+        lv_obj_set_style_text_font(codec_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
         lv_obj_align(codec_label, LV_ALIGN_BOTTOM_LEFT, LIST_ROW_LABEL_INSET, -12);
     }
 
@@ -16973,7 +17021,7 @@ static void populate_bt_dac_screen(void) {
     lv_obj_set_width(explanation, lv_pct(90));
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
     lv_obj_add_style(explanation, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(explanation, ui_size_16, 0);
+    lv_obj_set_style_text_font(explanation, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_set_style_pad_left(explanation, 24, 0);
     lv_obj_set_style_pad_top(explanation, 12, 0);
     lv_obj_set_style_pad_bottom(explanation, 12, 0);
@@ -17138,13 +17186,13 @@ static lv_obj_t * build_bt_dac_overlay_screen(void) {
     lv_obj_t * status_label = lv_label_create(scr);
     lv_label_set_text(status_label, "Bluetooth DAC mode");
     lv_obj_add_style(status_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(status_label, ui_size_28, 0);
+    lv_obj_set_style_text_font(status_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align_to(status_label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
 
     lv_obj_t * hint_label = lv_label_create(scr);
     lv_label_set_text(hint_label, "This device is now receiving Bluetooth audio");
     lv_obj_add_style(hint_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(hint_label, ui_size_16, 0);
+    lv_obj_set_style_text_font(hint_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align_to(hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
     return scr;
@@ -17814,13 +17862,13 @@ static lv_obj_t * build_usb_dac_overlay_screen(void) {
     lv_obj_t * status_label = lv_label_create(scr);
     lv_label_set_text(status_label, "USB DAC mode");
     lv_obj_add_style(status_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(status_label, ui_size_28, 0);
+    lv_obj_set_style_text_font(status_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align_to(status_label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
 
     lv_obj_t * hint_label = lv_label_create(scr);
     lv_label_set_text(hint_label, "This device is now a USB sound card");
     lv_obj_add_style(hint_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(hint_label, ui_size_16, 0);
+    lv_obj_set_style_text_font(hint_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align_to(hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
     return scr;
@@ -17936,7 +17984,7 @@ static lv_obj_t * build_bluetooth_screen(void) {
     lv_obj_t * rescan_btn = lv_label_create(scr);
     lv_label_set_text(rescan_btn, "Rescan");
     lv_obj_set_style_text_color(rescan_btn, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(rescan_btn, ui_size_20, 0);
+    lv_obj_set_style_text_font(rescan_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_align(rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_flag(rescan_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(rescan_btn, bt_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -18077,7 +18125,7 @@ static lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mod
     lv_label_set_long_mode(title, title_long_mode);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_22, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
     if (out_title) *out_title = title;
 
     if (body_text) {
@@ -18087,7 +18135,7 @@ static lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mod
         lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_add_style(body, &style_theme_text_muted, 0);
-        lv_obj_set_style_text_font(body, ui_size_16, 0);
+        lv_obj_set_style_text_font(body, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     }
 
     lv_obj_t * confirm_row = lv_obj_create(popup);
@@ -18103,7 +18151,7 @@ static lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mod
     lv_obj_t * confirm_label = lv_label_create(confirm_row);
     lv_label_set_text(confirm_label, confirm_text);
     lv_obj_set_style_text_color(confirm_label, confirm_color, 0);
-    lv_obj_set_style_text_font(confirm_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(confirm_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_center(confirm_label);
     if (out_confirm_row) *out_confirm_row = confirm_row;
 
@@ -18120,7 +18168,7 @@ static lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mod
     lv_obj_t * cancel_label = lv_label_create(cancel_row);
     lv_label_set_text(cancel_label, cancel_text);
     lv_obj_set_style_text_color(cancel_label, cancel_color, 0);
-    lv_obj_set_style_text_font(cancel_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(cancel_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_center(cancel_label);
     if (out_cancel_row) *out_cancel_row = cancel_row;
 
@@ -18181,7 +18229,7 @@ static lv_obj_t * build_menu_popup(const menu_popup_row_t * rows, int row_count,
         lv_obj_t * label = lv_label_create(row);
         lv_label_set_text(label, rows[i].label);
         lv_obj_set_style_text_color(label, rows[i].destructive ? lv_color_make(255, 120, 120) : accent_lv_color(), 0);
-        lv_obj_set_style_text_font(label, ui_size_20, 0);
+        lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
         lv_obj_center(label);
     }
 
@@ -18242,7 +18290,7 @@ static void poll_import_web_stop(void) {
     if (import_web_stop_nav_slot >= 0 && import_web_stop_nav_slot < nav_depth) {
         nav_remove_stack_slot(import_web_stop_nav_slot);
     }
-    nav_pop(); /* leave the busy screen */
+    gui_busy_hide(import_web_stop_token);
     import_web_stop_nav_slot = -1;
 
     lv_obj_remove_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
@@ -18255,8 +18303,7 @@ static void import_wifi_back_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
     import_web_stop_nav_slot = nav_depth - 1; /* this screen's own slot, before pushing the busy screen on top of it */
-    lv_label_set_text(subsonic_downloading_label, "Closing\nWeb Server...");
-    nav_push(subsonic_downloading_screen);
+    import_web_stop_token = gui_busy_show("Closing\nWeb Server...", "");
 
     import_web_stop_done_flag = false;
     import_web_stop_active = true;
@@ -18283,14 +18330,14 @@ static lv_obj_t * build_import_wifi_screen(void) {
     lv_label_set_text(title, "Import via Wi-Fi");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_28, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
     import_wifi_status_label = lv_label_create(scr);
     lv_obj_set_width(import_wifi_status_label, lv_pct(90));
     lv_label_set_long_mode(import_wifi_status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(import_wifi_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(import_wifi_status_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(import_wifi_status_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(import_wifi_status_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_align(import_wifi_status_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 30);
 
 #if LV_USE_QRCODE
@@ -18305,7 +18352,7 @@ static lv_obj_t * build_import_wifi_screen(void) {
 
     import_wifi_url_label = lv_label_create(scr);
     lv_obj_set_style_text_color(import_wifi_url_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(import_wifi_url_label, ui_size_22, 0);
+    lv_obj_set_style_text_font(import_wifi_url_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
     lv_obj_align(import_wifi_url_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 350);
 
     /* Deliberately skips finalize_screen_navigation()'s swipe-to-back --
@@ -18349,7 +18396,7 @@ static void populate_airplay_screen(void) {
     lv_obj_set_width(explanation, lv_pct(90));
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
     lv_obj_add_style(explanation, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(explanation, ui_size_16, 0);
+    lv_obj_set_style_text_font(explanation, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_set_style_pad_left(explanation, 24, 0);
     lv_obj_set_style_pad_top(explanation, 12, 0);
 }
@@ -18437,7 +18484,7 @@ static void populate_dlna_screen(void) {
     lv_obj_set_width(explanation, lv_pct(90));
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
     lv_obj_add_style(explanation, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(explanation, ui_size_16, 0);
+    lv_obj_set_style_text_font(explanation, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_set_style_pad_left(explanation, 24, 0);
     lv_obj_set_style_pad_top(explanation, 12, 0);
 }
@@ -18578,7 +18625,7 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_label_set_text(title, "Remote Control");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_28, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
     /* Same font-tier-aware pill geometry as add_pill_row_base(), built
      * directly here (not via that helper) since it needs to sit above the
@@ -18604,7 +18651,7 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_t * toggle_label = lv_label_create(toggle_row);
     lv_label_set_text(toggle_label, "Remote Control");
     lv_obj_add_style(toggle_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(toggle_label, ui_size_16, 0);
+    lv_obj_set_style_text_font(toggle_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(toggle_label, LV_ALIGN_LEFT_MID, 24, 0);
 
     remote_control_toggle_img = lv_image_create(toggle_row);
@@ -18635,7 +18682,7 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(explanation, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(explanation, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(explanation, ui_size_16, 0);
+    lv_obj_set_style_text_font(explanation, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(explanation, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 150);
 
     remote_control_status_label = lv_label_create(scr);
@@ -18643,10 +18690,10 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_label_set_long_mode(remote_control_status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(remote_control_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(remote_control_status_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(remote_control_status_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(remote_control_status_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     /* Real-device bug report: "Connect to Wi-Fi first" overlapped the
      * explanation text above it at bigger font tiers -- `explanation`
-     * above wraps across more/taller lines as ui_size_16 grows (BlindMF),
+     * above wraps across more/taller lines as gui_theme_font(GUI_FONT_ROLE_SUBTEXT) grows (BlindMF),
      * but this label's own Y was a hardcoded absolute offset from the
      * title, sized assuming `explanation` always stayed within its
      * smallest-tier height. Anchored to `explanation`'s own actual bottom
@@ -18665,7 +18712,7 @@ static lv_obj_t * build_remote_control_screen(void) {
 
     remote_control_url_label = lv_label_create(scr);
     lv_obj_set_style_text_color(remote_control_url_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(remote_control_url_label, ui_size_22, 0);
+    lv_obj_set_style_text_font(remote_control_url_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
     /* Positions qrcode/url_label below remote_control_status_label for the
      * first time -- open_remote_control_screen() calls remote_control_
      * refresh_address() (which calls this same helper again) every time
@@ -19014,7 +19061,7 @@ static lv_obj_t * build_text_reader_screen(void) {
     lv_label_set_long_mode(text_reader_content_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(text_reader_content_label, lv_pct(100));
     lv_obj_add_style(text_reader_content_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(text_reader_content_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(text_reader_content_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_label_set_text(text_reader_content_label, "");
 
     finalize_screen_navigation(scr);
@@ -19178,7 +19225,7 @@ static lv_obj_t * build_accent_color_screen(void) {
     lv_label_set_text(title, "Accent Color");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_28, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
     /* Real-device feedback: the swatches were too small to comfortably tap
      * and the 8-color palette felt limited -- bumped from 36px to 64px
@@ -19300,7 +19347,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_label_set_text(title, "Screen Timeout");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_28, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
     /* Real-device bug report: at bigger system text sizes, "Turn off screen
      * automatically" overlapped the switch -- the row was a fixed 50px-tall
@@ -19328,7 +19375,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_t * enable_label = lv_label_create(enable_row);
     lv_label_set_text(enable_label, "Turn off screen automatically");
     lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(enable_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_label_set_long_mode(enable_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_flex_grow(enable_label, 1);
 
@@ -19370,7 +19417,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
 
     screen_timeout_value_label = lv_label_create(screen_timeout_slider_card);
     lv_obj_add_style(screen_timeout_value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(screen_timeout_value_label, ui_size_28, 0);
+    lv_obj_set_style_text_font(screen_timeout_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align(screen_timeout_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     char initial_buf[32];
     format_screen_timeout(initial_buf, sizeof(initial_buf), current_settings.screen_timeout_seconds);
@@ -19454,7 +19501,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_label_set_text(title, "Startup Volume");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_28, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
     /* Same real-device overlap bug/fix as build_screen_timeout_screen()'s
      * own enable_row -- see its comment. */
@@ -19472,7 +19519,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_t * enable_label = lv_label_create(enable_row);
     lv_label_set_text(enable_label, "Launch at a fixed volume");
     lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(enable_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_label_set_long_mode(enable_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_flex_grow(enable_label, 1);
 
@@ -19502,7 +19549,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
 
     startup_volume_value_label = lv_label_create(startup_volume_slider_card);
     lv_obj_add_style(startup_volume_value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(startup_volume_value_label, ui_size_28, 0);
+    lv_obj_set_style_text_font(startup_volume_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align(startup_volume_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_label_set_text_fmt(startup_volume_value_label, "%d%%", current_settings.startup_volume_fixed_percent);
 
@@ -19577,7 +19624,7 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_label_set_text(title, "Sleep Timer");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_28, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
     lv_obj_t * slider_card = lv_obj_create(scr);
     lv_obj_set_size(slider_card, lv_pct(90), 170);
@@ -19599,7 +19646,7 @@ static lv_obj_t * build_sleep_timer_screen(void) {
 
     sleep_timer_value_label = lv_label_create(slider_card);
     lv_obj_add_style(sleep_timer_value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(sleep_timer_value_label, ui_size_28, 0);
+    lv_obj_set_style_text_font(sleep_timer_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align(sleep_timer_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_label_set_text_fmt(sleep_timer_value_label, "%d min", current_settings.sleep_timer_minutes);
 
@@ -19708,7 +19755,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_label_set_text(title, "Idle Shutdown");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_28, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
     /* Same real-device overlap bug/fix as build_screen_timeout_screen()'s
      * own enable_row -- see its comment. */
@@ -19726,7 +19773,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_t * enable_label = lv_label_create(enable_row);
     lv_label_set_text(enable_label, "Automatically go idle");
     lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(enable_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(enable_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_label_set_long_mode(enable_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_flex_grow(enable_label, 1);
 
@@ -19777,7 +19824,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_t * idle_action_explain_label = lv_label_create(idle_action_section);
     lv_label_set_text(idle_action_explain_label, "Choose what happens when idle:");
     lv_obj_add_style(idle_action_explain_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(idle_action_explain_label, ui_size_16, 0);
+    lv_obj_set_style_text_font(idle_action_explain_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(idle_action_explain_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
     idle_action_poweroff_row = add_pill_row_base(idle_action_section, "Power Off");
@@ -19820,7 +19867,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_t * idle_shutdown_slider_caption = lv_label_create(idle_shutdown_slider_card);
     lv_label_set_text(idle_shutdown_slider_caption, "Idle timeout:");
     lv_obj_add_style(idle_shutdown_slider_caption, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(idle_shutdown_slider_caption, ui_size_16, 0);
+    lv_obj_set_style_text_font(idle_shutdown_slider_caption, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(idle_shutdown_slider_caption, LV_ALIGN_TOP_LEFT, 24, 14);
 
     idle_shutdown_slider = lv_slider_create(idle_shutdown_slider_card);
@@ -19836,7 +19883,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
 
     idle_shutdown_value_label = lv_label_create(idle_shutdown_slider_card);
     lv_obj_add_style(idle_shutdown_value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(idle_shutdown_value_label, ui_size_28, 0);
+    lv_obj_set_style_text_font(idle_shutdown_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align(idle_shutdown_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     char initial_buf[32];
     format_idle_shutdown(initial_buf, sizeof(initial_buf), current_settings.idle_shutdown_minutes);
@@ -20338,7 +20385,7 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
      * every other row/card in this screen (band_row/type_row/enable_row/
      * profile_row) for consistency. */
     lv_obj_set_width(card, lv_pct(96));
-    /* Real-device bug report: at the BlindMF font tier, ui_size_22's much
+    /* Real-device bug report: at the BlindMF font tier, gui_theme_font(GUI_FONT_ROLE_ROW)'s much
      * taller glyphs (34px vs 22px at Small) pushed the value label's own
      * rendered height past where the slider below it was fixed-positioned
      * (card height 132px, slider anchored 18px off the card's bottom --
@@ -20365,7 +20412,7 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
      * lv_obj_set_ext_click_area() below. */
     lv_obj_t * value_label = lv_label_create(card);
     lv_obj_add_style(value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(value_label, ui_size_22, 0);
+    lv_obj_set_style_text_font(value_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
     lv_obj_add_flag(value_label, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(value_label, 16);
     lv_obj_add_event_cb(value_label, eq_field_label_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) field);
@@ -20764,7 +20811,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_label_set_text(title, "PEQ");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, ui_size_28, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
     /* "EQ Enabled" switch lives in the title row itself (top-right), same
      * spot other screens put a title-row action (e.g. the Wi-Fi screen's
@@ -20781,7 +20828,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_t * reset_btn = lv_label_create(scr);
     lv_label_set_text(reset_btn, "Reset");
     lv_obj_set_style_text_color(reset_btn, lv_color_make(255, 120, 120), 0);
-    lv_obj_set_style_text_font(reset_btn, ui_size_16, 0);
+    lv_obj_set_style_text_font(reset_btn, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align_to(reset_btn, eq_bypass_switch, LV_ALIGN_OUT_LEFT_MID, -14, 0);
     lv_obj_add_flag(reset_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(reset_btn, 16);
@@ -20834,7 +20881,7 @@ static lv_obj_t * build_eq_screen(void) {
      * overlapped both within a button and between adjacent buttons. A
      * dropdown sidesteps this entirely (only ever renders one band's
      * label at a time, closed or open) and matches eq_type_dropdown's own
-     * already-working shape just below, including its explicit ui_size_20
+     * already-working shape just below, including its explicit gui_theme_font(GUI_FONT_ROLE_BODY)
      * font so this one also actually scales with the font tier setting,
      * unlike eq_type_dropdown which was never explicitly given one. */
     /* Dropdown width scales with the font tier -- real-device bug report:
@@ -20874,16 +20921,16 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_t * band_label = lv_label_create(band_row);
     lv_label_set_text(band_label, "Band");
     lv_obj_add_style(band_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(band_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(band_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
 
     eq_band_dropdown = lv_dropdown_create(band_row);
     lv_dropdown_set_options(eq_band_dropdown, "Band0\nBand1\nBand2\nBand3\nBand4\nBand5\nBand6\nBand7\nBand8\nBand9");
-    lv_obj_set_style_text_font(eq_band_dropdown, ui_size_20, 0);
+    lv_obj_set_style_text_font(eq_band_dropdown, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     /* The closed box and the opened list are two separate LVGL objects
      * (lv_dropdown_create() builds dropdown->list eagerly, as a child of
      * the screen, not of this dropdown) -- styling only the box above left
      * the opened list's text at LVGL's own default (unscaled) font. */
-    lv_obj_set_style_text_font(lv_dropdown_get_list(eq_band_dropdown), ui_size_20, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(eq_band_dropdown), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_set_width(eq_band_dropdown, eq_dropdown_width);
 
     lv_obj_t * eq_freq_card = create_eq_slider_card(content, EQ_FIELD_FREQ, &eq_freq_value_label, &eq_freq_slider, 0, EQ_FREQ_SLIDER_MAX);
@@ -20904,14 +20951,14 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_t * type_label = lv_label_create(type_row);
     lv_label_set_text(type_label, "Type");
     lv_obj_add_style(type_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(type_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(type_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
 
     eq_type_dropdown = lv_dropdown_create(type_row);
     lv_dropdown_set_options(eq_type_dropdown, "Peaking\nLow Shelf\nHigh Shelf");
     /* Same gap as eq_band_dropdown just above -- box and opened list both
      * need the tier-aware font explicitly, LVGL's own default isn't. */
-    lv_obj_set_style_text_font(eq_type_dropdown, ui_size_20, 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(eq_type_dropdown), ui_size_20, 0);
+    lv_obj_set_style_text_font(eq_type_dropdown, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(eq_type_dropdown), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_set_width(eq_type_dropdown, eq_dropdown_width);
 
     lv_obj_t * enable_row = lv_obj_create(content);
@@ -20928,7 +20975,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_t * enabled_label = lv_label_create(enable_row);
     lv_label_set_text(enabled_label, "Enable");
     lv_obj_add_style(enabled_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(enabled_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(enabled_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
 
     eq_band_enabled_switch = lv_switch_create(enable_row);
     lv_obj_add_style(eq_band_enabled_switch, &style_accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
@@ -20967,7 +21014,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_add_event_cb(save_btn, eq_save_profile_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * save_label = lv_label_create(save_btn);
     lv_label_set_text(save_label, "Save Profile");
-    lv_obj_set_style_text_font(save_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(save_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_add_style(save_label, &style_accent, 0);
     lv_label_set_long_mode(save_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(save_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -20986,7 +21033,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_add_event_cb(load_btn, eq_load_profile_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * load_label = lv_label_create(load_btn);
     lv_label_set_text(load_label, "Load Profile");
-    lv_obj_set_style_text_font(load_label, ui_size_20, 0);
+    lv_obj_set_style_text_font(load_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_add_style(load_label, &style_accent, 0);
     lv_label_set_long_mode(load_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(load_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -21174,7 +21221,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * over -- see hostname_apply()'s own comment. */
     hostname_apply(current_settings.hostname);
 
-    /* Must run before any screen below captures a ui_size_16/20/22/28
+    /* Must run before any screen below captures a gui_theme_font(GUI_FONT_ROLE_SUBTEXT)/20/22/28
      * pointer into its own style -- see this function's own doc comment. */
     apply_font_size_tier(current_settings.font_size_tier);
 
@@ -21355,7 +21402,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     subsonic_saved_servers_screen = build_subsonic_saved_servers_screen();
     subsonic_new_connection_screen = build_subsonic_new_connection_screen();
     subsonic_entry_screen = build_subsonic_entry_screen();
-    subsonic_downloading_screen = build_subsonic_downloading_screen();
 
     /* Subsonic screen redesign: the menu (Artists/Playlists/Albums) that's
      * now the first screen after connecting -- see poll_subsonic_connect().
@@ -21366,27 +21412,27 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
         /* Real-device bug report: these 3 rows read noticeably smaller than
          * "the rest of the player" (their own submenus -- USB Mode, Font
          * Size, etc. -- looked fine by comparison). Root cause: add_pill_
-         * row_base() hardcodes ui_size_16, the same small size every one of
+         * row_base() hardcodes gui_theme_font(GUI_FONT_ROLE_SUBTEXT), the same small size every one of
          * those submenus' own OPTION rows uses (a radio-button-style list of
          * choices within one setting) -- correct there, but this menu is a
          * top-level navigation menu, the same conceptual role as Settings'
          * own System/Power/Display category rows (build_pill_list_screen(),
-         * ui_size_20 by default). Bumped to match that convention instead of
+         * gui_theme_font(GUI_FONT_ROLE_BODY) by default). Bumped to match that convention instead of
          * the options-picker one, since add_pill_row_base() itself is shared
          * with a dozen real options-pickers and shouldn't change its own
          * default just for this one caller. */
         lv_obj_t * artists_row = add_pill_row_base(subsonic_menu_list, "Artists");
-        lv_obj_set_style_text_font(lv_obj_get_child(artists_row, 0), ui_size_20, 0);
+        lv_obj_set_style_text_font(lv_obj_get_child(artists_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
         lv_obj_add_flag(artists_row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(artists_row, subsonic_menu_artists_row_cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t * playlists_row = add_pill_row_base(subsonic_menu_list, "Playlists");
-        lv_obj_set_style_text_font(lv_obj_get_child(playlists_row, 0), ui_size_20, 0);
+        lv_obj_set_style_text_font(lv_obj_get_child(playlists_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
         lv_obj_add_flag(playlists_row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(playlists_row, subsonic_menu_playlists_row_cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t * albums_row = add_pill_row_base(subsonic_menu_list, "Albums");
-        lv_obj_set_style_text_font(lv_obj_get_child(albums_row, 0), ui_size_20, 0);
+        lv_obj_set_style_text_font(lv_obj_get_child(albums_row, 0), gui_theme_font(GUI_FONT_ROLE_BODY), 0);
         lv_obj_add_flag(albums_row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(albums_row, subsonic_menu_albums_row_cb, LV_EVENT_CLICKED, NULL);
     }

@@ -2,6 +2,9 @@
 #include "gui.h"
 #include "peq.h"
 #include "http_client.h"
+#include "playlist_files.h"
+#include "plugin_json.h"
+#include "plugin_storage.h"
 #include "mbedtls/md5.h" /* plugin.md5() -- same primitive subsonic_client.c already uses for its own token auth */
 
 #include "lua.h"
@@ -18,6 +21,10 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
+#include <stdatomic.h>
+#include <limits.h>
+#include <unistd.h>
 
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -35,6 +42,10 @@
    * than writing files nothing would ever read. */
   #define PLUGIN_THEME_OVERRIDE_ROOT "/usr/data/theme_overrides/"
 #endif
+
+/* Same "each file defines its own derived-path macro" convention as
+ * MUSIC_ROOT_DIR above -- matches gui.c's own PLAYLISTS_DIR exactly. */
+#define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
 
 #define PLUGIN_MAX_FILES 16
 #define PLUGIN_MAX_LIST_ITEMS 500
@@ -80,6 +91,57 @@ typedef struct {
 static plugin_instance_t plugin_instances[PLUGIN_MAX_FILES];
 static int plugin_instance_count = 0;
 static int loading_plugin_slot = -1;
+
+/* plugin.storage and plugin.secrets need to know WHICH plugin is calling
+ * at arbitrary runtime (not just at plugin.define() time, unlike
+ * loading_plugin_slot above) -- each plugin owns exactly one lua_State for
+ * its whole lifetime (this file's own top comment), so a linear scan
+ * matching L is enough; PLUGIN_MAX_FILES is small and this only runs on
+ * an explicit plugin.storage/secrets call, not per frame. */
+static plugin_instance_t * plugin_instance_for_state(lua_State * L) {
+    for (int i = 0; i < PLUGIN_MAX_FILES; i++) {
+        if (plugin_instances[i].L == L) return &plugin_instances[i];
+    }
+    return NULL;
+}
+
+/* Shared by every plugin.storage and plugin.secrets binding below --
+ * requires plugin.define({id=...}) to have already run on this lua_State,
+ * matching plugin_storage.c's own expectation that plugin_id is a real,
+ * validated identity, not an empty/default string. */
+static const char * require_plugin_id(lua_State * L) {
+    plugin_instance_t * inst = plugin_instance_for_state(L);
+    if (!inst || !inst->defined || !inst->id[0]) {
+        luaL_error(L, "plugin.storage/secrets requires plugin.define({id=...}) to run first");
+        return NULL; /* unreachable -- luaL_error() longjmps */
+    }
+    return inst->id;
+}
+
+/* Review finding: sandbox_plugin_lua_state()'s io.open()/io.lines()/
+ * io.input()/io.output()/os.remove()/os.rename() wrappers (see that
+ * function's own comment) only cover Lua's OWN stdlib entry points into
+ * the filesystem. Several native plugin.* C functions accept a
+ * caller-controlled path and reach the filesystem directly -- mkdir(),
+ * fopen(), opendir(), a worker thread's own file creation -- entirely
+ * bypassing those wrappers, since they never go through Lua's io/os
+ * tables at all. This is the same reserved-tree check applied uniformly
+ * to every one of those native entry points below (list_dir, mkdir,
+ * play_file/play_list, set_icon's source path, eq_load/save_profile,
+ * download_file_async's destination). Raises a clean Lua error (rather
+ * than returning nil/empty) so a plugin author sees immediately that a
+ * reserved path was rejected, matching io.lines()/io.input()/io.output()'s
+ * own error convention above rather than inventing a different one per
+ * call site. Returns the checked path so callers can use it exactly like
+ * luaL_checkstring()'s result. */
+static const char * check_plugin_external_path(lua_State * L, int index, const char * api) {
+    const char * path = luaL_checkstring(L, index);
+    if (plugin_storage_path_is_reserved(path)) {
+        luaL_error(L, "%s: path is reserved for plugin.storage/plugin.secrets", api);
+        return NULL; /* unreachable -- luaL_error() longjmps */
+    }
+    return path;
+}
 
 /* Registry for plugin.register_list_item("books", ...) -- gui.c's
  * build_books_screen() appends these after its own 2 built-in rows. See
@@ -226,6 +288,17 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *   plugin.sd_root()
  *     Returns the SD card's absolute mount path, so a script can build
  *     paths under it (e.g. plugin.sd_root() .. "/Audiobooks").
+ *
+ *   plugin.playlist_list() -> { m3u_path, ... } | nil
+ *   plugin.playlist_read(m3u_path) -> { song_path, ... } | nil
+ *   plugin.playlist_create(name, song_path) -> m3u_path | nil
+ *   plugin.playlist_add(m3u_path, song_path) -> bool
+ *   plugin.playlist_remove(m3u_path, song_path) -> bool
+ *   plugin.playlist_delete(m3u_path) -> bool
+ *     CRUD over .m3u playlists under the same Playlists folder the native
+ *     Playlists screen uses. create()/delete() also update the app's
+ *     playlist-existence cache, so the result shows up/disappears there
+ *     immediately rather than needing a full library rescan.
  *
  *   plugin.play_file(path)
  *     Plays a single file as a fresh one-song playlist.
@@ -773,7 +846,7 @@ static int l_plugin_show_settings_list(lua_State * L) {
 }
 
 static int l_plugin_list_dir(lua_State * L) {
-    const char * path = luaL_checkstring(L, 1);
+    const char * path = check_plugin_external_path(L, 1, "plugin.list_dir");
     lua_newtable(L);
 
     DIR * d = opendir(path);
@@ -806,8 +879,46 @@ static int l_plugin_sd_root(lua_State * L) {
     return 1;
 }
 
+/* plugin.mkdir(path) -> true | nil, error. mkdir -p semantics: existing
+ * directories are success, while an existing non-directory remains an
+ * error. This intentionally follows Lua's existing unrestricted path-based
+ * file operations; plugins are not confined to sd_root() today. */
+static int l_plugin_mkdir(lua_State * L) {
+    const char * path = check_plugin_external_path(L, 1, "plugin.mkdir");
+    size_t len = strlen(path);
+    if (len == 0 || len >= PATH_MAX) {
+        lua_pushnil(L);
+        lua_pushstring(L, "invalid path");
+        return 2;
+    }
+
+    char buf[PATH_MAX];
+    memcpy(buf, path, len + 1);
+    while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
+
+    for (size_t i = 1; i <= len; i++) {
+        if (buf[i] != '/' && buf[i] != '\0') continue;
+        char saved = buf[i];
+        buf[i] = '\0';
+        if (buf[0] != '\0' && mkdir(buf, 0755) != 0) {
+            int saved_errno = errno;
+            struct stat st;
+            if (saved_errno != EEXIST || stat(buf, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                buf[i] = saved;
+                lua_pushnil(L);
+                lua_pushstring(L, strerror(saved_errno));
+                return 2;
+            }
+        }
+        buf[i] = saved;
+    }
+
+    lua_pushboolean(L, true);
+    return 1;
+}
+
 static int l_plugin_play_file(lua_State * L) {
-    const char * path = luaL_checkstring(L, 1);
+    const char * path = check_plugin_external_path(L, 1, "plugin.play_file");
     gui_plugin_play_paths(&path, 1, 0);
     return 0;
 }
@@ -827,12 +938,179 @@ static int l_plugin_play_list(lua_State * L) {
     for (int i = 0; i < n; i++) {
         lua_rawgeti(L, 1, i + 1);
         const char * s = lua_tostring(L, -1);
+        if (s && plugin_storage_path_is_reserved(s)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "plugin.play_list: path is reserved for plugin.storage/plugin.secrets");
+        }
         snprintf(path_bufs[i], sizeof(path_bufs[i]), "%s", s ? s : "");
         paths[i] = path_bufs[i];
         lua_pop(L, 1);
     }
 
     gui_plugin_play_paths(paths, n, start);
+    return 0;
+}
+
+/* Shared by every numeric remote-track field below -- rejects (rather than
+ * silently wrapping/truncating via an unsigned cast, which is what a bare
+ * "(uint32_t) luaL_optnumber(...)" would otherwise do) a negative value, a
+ * NaN, an infinity, or anything past max_value. A plain lua_Number
+ * comparison against a finite max_value already correctly rejects NaN
+ * (every comparison against NaN is false) and +-infinity (always outside
+ * any finite range) with no separate isnan()/isfinite() check needed. */
+static lua_Number check_bounded_number(lua_State * L, int table_index, const char * field, const char * fn_name, lua_Number max_value) {
+    lua_getfield(L, table_index, field);
+    lua_Number val = luaL_optnumber(L, -1, 0);
+    lua_pop(L, 1);
+    if (!(val >= 0) || !(val <= max_value)) {
+        luaL_error(L, "%s: %s must be a finite number between 0 and %.0f", fn_name, field, (double) max_value);
+    }
+    return val;
+}
+
+/* Reads one remote_track_meta_t out of the Lua table at stack index
+ * table_index (a plain {provider=..., track_id=..., stream_url=..., ...}
+ * value, not a class/metatable of any kind). provider/track_id/stream_url
+ * are required; everything else defaults to empty/zero/true(verify_tls),
+ * matching plugin.http_request()'s own required-vs-optional-field style
+ * above. Raises a Lua error (via luaL_error, which never returns) on any
+ * oversized or missing-required field rather than silently truncating --
+ * same reasoning as l_plugin_http_request()'s own header-length fix. */
+static void parse_remote_track_table(lua_State * L, int table_index, remote_track_meta_t * out, const char * fn_name) {
+    memset(out, 0, sizeof(*out));
+
+    lua_getfield(L, table_index, "provider");
+    const char * provider = luaL_checkstring(L, -1);
+    if (provider[0] == '\0') luaL_error(L, "%s: provider must not be empty", fn_name);
+    if (strlen(provider) >= sizeof(out->provider)) luaL_error(L, "%s: provider is too long", fn_name);
+    snprintf(out->provider, sizeof(out->provider), "%s", provider);
+    lua_pop(L, 1);
+
+    lua_getfield(L, table_index, "track_id");
+    const char * track_id = luaL_checkstring(L, -1);
+    if (track_id[0] == '\0') luaL_error(L, "%s: track_id must not be empty", fn_name);
+    if (strlen(track_id) >= sizeof(out->track_id)) luaL_error(L, "%s: track_id is too long", fn_name);
+    snprintf(out->track_id, sizeof(out->track_id), "%s", track_id);
+    lua_pop(L, 1);
+
+    /* Reuses remote_track_make_key()'s own validation (non-empty, fits,
+     * and -- the part a plain non-empty/length check above can't catch --
+     * no '/' or control character in either field, which would otherwise
+     * let two different (provider, track_id) pairs produce the exact same
+     * "remote://..." key and collide in Favorites/History/play-count).
+     * Only the validity is used here; the key itself is recomputed
+     * on-demand wherever it's actually needed (remote_track.c). */
+    {
+        char key[256];
+        if (!remote_track_make_key(out->provider, out->track_id, key, sizeof(key))) {
+            luaL_error(L, "%s: provider/track_id must not contain '/' or control characters, and must fit the synthetic key", fn_name);
+        }
+    }
+
+    lua_getfield(L, table_index, "stream_url");
+    const char * stream_url = luaL_checkstring(L, -1);
+    if (stream_url[0] == '\0') luaL_error(L, "%s: stream_url must not be empty", fn_name);
+    if (strlen(stream_url) >= sizeof(out->stream_url)) luaL_error(L, "%s: stream_url is too long", fn_name);
+    snprintf(out->stream_url, sizeof(out->stream_url), "%s", stream_url);
+    lua_pop(L, 1);
+
+#define OPT_STR_FIELD(field, name) \
+    lua_getfield(L, table_index, name); \
+    const char * field##_val = luaL_optstring(L, -1, ""); \
+    if (strlen(field##_val) >= sizeof(out->field)) luaL_error(L, "%s: " name " is too long", fn_name); \
+    snprintf(out->field, sizeof(out->field), "%s", field##_val); \
+    lua_pop(L, 1);
+
+    OPT_STR_FIELD(title, "title")
+    OPT_STR_FIELD(artist, "artist")
+    OPT_STR_FIELD(album, "album")
+    OPT_STR_FIELD(artwork_url, "artwork_url")
+#undef OPT_STR_FIELD
+
+    lua_getfield(L, table_index, "codec");
+    const char * codec_val = luaL_optstring(L, -1, "");
+    /* Empty defaults to "mp3" (see remote_track.h's own comment) -- but an
+     * unrecognized NON-empty value is rejected outright rather than
+     * silently falling back to mp3, which would otherwise mean a typo'd
+     * codec ("flc", "opus") looks like it worked at queue time and only
+     * fails much later, confusingly, when decoder_open() actually tries
+     * to open a stream using the wrong decoder. */
+    if (codec_val[0] != '\0' && strcasecmp(codec_val, "mp3") != 0 && strcasecmp(codec_val, "flac") != 0 &&
+        strcasecmp(codec_val, "aac") != 0) {
+        luaL_error(L, "%s: unknown codec '%s' -- must be \"mp3\", \"flac\", \"aac\", or omitted", fn_name, codec_val);
+    }
+    if (strlen(codec_val) >= sizeof(out->codec)) luaL_error(L, "%s: codec is too long", fn_name);
+    snprintf(out->codec, sizeof(out->codec), "%s", codec_val);
+    lua_pop(L, 1);
+
+    /* Bounds are generous (well past anything a real audio stream would
+     * ever declare) -- these are display-only fields (format badge,
+     * quality metadata) except duration_ms, which also seeds the decoder's
+     * total_frames for a remote MP3/AAC stream (audio.c's decoder_open());
+     * the point is rejecting garbage (negative/NaN/absurdly large) before
+     * it's cast to an unsigned type below, not modeling real codec limits. */
+    out->duration_ms = (uint32_t) check_bounded_number(L, table_index, "duration_ms", fn_name, 24.0 * 3600.0 * 1000.0);
+    out->sample_rate = (unsigned int) check_bounded_number(L, table_index, "sample_rate", fn_name, 1000000.0);
+    out->bit_depth = (unsigned int) check_bounded_number(L, table_index, "bit_depth", fn_name, 64.0);
+    out->channels = (unsigned int) check_bounded_number(L, table_index, "channels", fn_name, 64.0);
+    out->bitrate_kbps = (unsigned int) check_bounded_number(L, table_index, "bitrate_kbps", fn_name, 100000.0);
+
+    lua_getfield(L, table_index, "replaygain_db");
+    if (!lua_isnil(L, -1)) {
+        double gain = luaL_checknumber(L, -1);
+        /* +-100 dB is already an absurd amount of gain -- this is purely a
+         * NaN/infinity/garbage-value guard (see resolve_replaygain()'s own
+         * comment for how this feeds into playback volume), not a
+         * meaningful real-world limit. */
+        if (!(gain >= -100.0 && gain <= 100.0)) luaL_error(L, "%s: replaygain_db must be a finite number between -100 and 100", fn_name);
+        out->has_replaygain = true;
+        out->replaygain_db = gain;
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, table_index, "verify_tls");
+    out->verify_tls = lua_isnil(L, -1) ? true : lua_toboolean(L, -1);
+    lua_pop(L, 1);
+}
+
+static int l_plugin_play_remote(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    remote_track_meta_t track;
+    parse_remote_track_table(L, 1, &track, "plugin.play_remote");
+    gui_plugin_play_remote_tracks(&track, 1, 0);
+    return 0;
+}
+
+static int l_plugin_queue_remote_list(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int start = (int) luaL_optinteger(L, 2, 1) - 1;
+
+    lua_Unsigned raw_n = lua_rawlen(L, 1);
+    int n = (raw_n > (lua_Unsigned) PLUGIN_MAX_LIST_ITEMS) ? PLUGIN_MAX_LIST_ITEMS : (int) raw_n;
+    if (n <= 0) return 0;
+    if (start < 0) start = 0;
+    if (start >= n) start = n - 1;
+
+    /* remote_track_meta_t is a few KB each (mostly its bounded string
+     * fields) -- a fixed PLUGIN_MAX_LIST_ITEMS-sized static array here
+     * would be a ~2MB permanent footprint on this device regardless of how
+     * many tracks a given call actually queues. Sized to n (the real,
+     * already-capped count) instead, and allocated as Lua userdata rather
+     * than malloc()'d: parse_remote_track_table() below can luaL_error()
+     * (longjmp) mid-loop on a malformed entry, and a plain malloc()'d
+     * buffer would leak in that case since nothing downstream of a longjmp
+     * ever runs our own free() -- Lua's GC owns and reclaims userdata
+     * regardless of how the call unwinds, once nothing pushed after it on
+     * the stack (nothing is, here) keeps it live past this function. */
+    remote_track_meta_t * tracks = (remote_track_meta_t *) lua_newuserdata(L, sizeof(remote_track_meta_t) * (size_t) n);
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(L, 1, i + 1);
+        luaL_checktype(L, -1, LUA_TTABLE);
+        parse_remote_track_table(L, lua_gettop(L), &tracks[i], "plugin.queue_remote_list");
+        lua_pop(L, 1);
+    }
+
+    gui_plugin_play_remote_tracks(tracks, n, start);
     return 0;
 }
 
@@ -897,7 +1175,7 @@ static bool copy_file(const char * src_path, const char * dst_path) {
  * see PLUGINS.md. */
 static int l_plugin_set_icon(lua_State * L) {
     const char * relative_path = luaL_checkstring(L, 1);
-    const char * source_path = luaL_checkstring(L, 2);
+    const char * source_path = check_plugin_external_path(L, 2, "plugin.set_icon");
 
 #ifndef HOST_BUILD
     /* Audit finding: relative_path is fully plugin-controlled and used to
@@ -993,7 +1271,7 @@ static int l_plugin_set_text_color(lua_State * L) {
  * reboot with no new persistence code. ---- */
 
 static int l_plugin_eq_load_profile(lua_State * L) {
-    const char * path = luaL_checkstring(L, 1);
+    const char * path = check_plugin_external_path(L, 1, "plugin.eq_load_profile");
     bool ok = peq_load_from_path(path);
     if (ok) peq_save();
     lua_pushboolean(L, ok);
@@ -1001,7 +1279,7 @@ static int l_plugin_eq_load_profile(lua_State * L) {
 }
 
 static int l_plugin_eq_save_profile(lua_State * L) {
-    const char * path = luaL_checkstring(L, 1);
+    const char * path = check_plugin_external_path(L, 1, "plugin.eq_save_profile");
     lua_pushboolean(L, peq_save_to_path(path));
     return 1;
 }
@@ -1197,48 +1475,206 @@ static int l_plugin_http_post(lua_State * L) {
 
 typedef struct {
     bool active;
-    volatile bool done;
-    bool cancelled;
+    atomic_bool done;
+    /* http_cancel_token_t is the single source of truth for "was this
+     * cancelled" (checked via http_cancel_token_is_cancelled()) -- no
+     * separate atomic_bool alongside it, which previously risked the two
+     * disagreeing. Also what actually lets l_plugin_cancel() interrupt a
+     * blocked connect/read via shutdown(), not just suppress the eventual
+     * callback (see http_client.h's own comment on http_cancel_token_t). */
+    http_cancel_token_t cancel;
     uint16_t generation;
     pthread_t thread;
     lua_State * L;
     int callback_ref;
-    bool is_post;
+    bool is_download;
+    char dest_path[PATH_MAX]; /* download only */
     bool verify_tls;
+
     char url[2048];
-    char content_type[128];
+    http_method_t method;
+    http_header_t headers[HTTP_MAX_HEADERS];
+    int header_count;
     uint8_t * request_body;
     size_t request_body_size;
+    char content_type[128];
     size_t max_response_size;
+    uint32_t connect_timeout_ms;
+    uint32_t read_timeout_ms;
+    uint32_t total_timeout_ms;
+    int redirect_limit;
+
+    /* Result fields -- the plain-request path (below) populates all of
+     * these; the download path only ever uses `ok`/dest_path. */
     bool ok;
     int status;
     uint8_t * response_body;
     size_t response_body_size;
+    http_header_t response_headers[HTTP_MAX_HEADERS];
+    int response_header_count;
+    const char * response_error; /* one of http_client.h's HTTP_ERR_* constants -- a stable static string, never malloc'd/freed */
 } plugin_async_http_t;
 
 static plugin_async_http_t plugin_async_http[PLUGIN_MAX_ASYNC_HTTP];
 
+static bool plugin_async_download_progress(uint64_t downloaded, uint64_t total, void * user_data) {
+    (void) downloaded;
+    (void) total;
+    plugin_async_http_t * req = (plugin_async_http_t *) user_data;
+    return !http_cancel_token_is_cancelled(&req->cancel);
+}
+
+/* Review finding: the {Name = "value", ...} table handed to a plugin's
+ * http_request() callback used the server's exact-case header spelling as
+ * an exact Lua table key -- "Content-Type"/"content-type" from the same
+ * response produced two separate keys instead of one, contradicting the
+ * documented case-insensitive "last occurrence wins" behavior (header
+ * name lookups are case-insensitive per RFC 7230, but Lua table keys are
+ * exact-match). Collapses headers[0..*count) in place so only the LAST
+ * occurrence of each case-insensitive name survives, keeping that last
+ * occurrence's own spelling -- done once here in C, before anything ever
+ * reaches a Lua table, rather than trying to reconcile it against
+ * whatever's already in the table key by key. */
+static void plugin_dedupe_headers_case_insensitive(http_header_t * headers, int * count) {
+    int out = 0;
+    for (int i = 0; i < *count; i++) {
+        bool superseded = false;
+        for (int j = i + 1; j < *count; j++) {
+            if (strcasecmp(headers[i].name, headers[j].name) == 0) { superseded = true; break; }
+        }
+        if (superseded) continue;
+        if (out != i) headers[out] = headers[i];
+        out++;
+    }
+    *count = out;
+}
+
 static void * plugin_async_http_thread_func(void * arg) {
     plugin_async_http_t * req = (plugin_async_http_t *) arg;
-    if (req->is_post) {
-        req->ok = http_post_to_buffer_limited(req->url, req->verify_tls, req->content_type, req->request_body,
-                                               req->request_body_size, req->max_response_size, &req->status,
-                                               &req->response_body, &req->response_body_size);
+    if (req->is_download) {
+        char temp_path[PATH_MAX];
+        /* Defense in depth: l_plugin_download_file_async() already
+         * rejected a reserved dest_path before ever starting this thread,
+         * but re-check here too, immediately before touching the
+         * filesystem, rather than trusting that the only path into this
+         * branch is the one already-guarded call site -- the same
+         * discipline this codebase already applies to bounds/validity
+         * checks that matter (re-verify at the point of use, not just at
+         * the call site three frames up). Must NOT return early here --
+         * req->done still needs to be set below, via the function's
+         * normal shared tail, or plugin_manager_poll() would never reap
+         * this slot and it would leak permanently as "active". */
+        int n;
+        if (plugin_storage_path_is_reserved(req->dest_path)) {
+            n = -1; /* forces the "invalid" branch below without touching the filesystem */
+        } else {
+            n = snprintf(temp_path, sizeof(temp_path), "%s.part.XXXXXX", req->dest_path);
+        }
+        if (n <= 0 || (size_t) n >= sizeof(temp_path)) {
+            req->ok = false;
+        } else {
+            int fd = mkstemp(temp_path);
+            if (fd < 0) {
+                req->ok = false;
+            } else {
+                close(fd);
+                /* Review finding: http_get_to_file() had no size bound at
+                 * all for its file-sink write path -- http_get_to_file_
+                 * bounded() (0 = a generous 2 GiB built-in default) closes
+                 * that gap for plugin-driven downloads specifically,
+                 * without touching http_get_to_file() itself (DLNA/cover-
+                 * art downloads keep their original unlimited behavior). */
+                req->ok = http_get_to_file_bounded(req->url, req->verify_tls, temp_path, 0,
+                                                    plugin_async_download_progress, req);
+                bool cancelled = http_cancel_token_is_cancelled(&req->cancel);
+                if (req->ok && !cancelled) {
+                    req->ok = rename(temp_path, req->dest_path) == 0;
+                }
+                if (!req->ok || cancelled) remove(temp_path);
+            }
+        }
     } else {
-        req->ok = http_get_to_buffer_limited(req->url, req->verify_tls, req->max_response_size, &req->status,
-                                              &req->response_body, &req->response_body_size);
+        /* plugin.http_request()'s plain (non-download) path -- shares the
+         * extended http_request_ex() (headers, methods beyond GET/POST,
+         * timeouts, redirects, response headers, real cancellation) with
+         * the future authenticated audio-stream reader, per this app's
+         * own remote-provider design (see http_client.h's own comment on
+         * why this is separate, new code rather than a rework of the
+         * do_get()/do_post()-based functions used elsewhere). */
+        http_request_t hreq;
+        memset(&hreq, 0, sizeof(hreq));
+        snprintf(hreq.url, sizeof(hreq.url), "%s", req->url);
+        hreq.method = req->method;
+        memcpy(hreq.headers, req->headers, sizeof(hreq.headers));
+        hreq.header_count = req->header_count;
+        /* Backward-compat note: the OLD GET path (http_get_to_buffer_
+         * limited()) never received request_body at all -- a plugin's
+         * "body" field was parsed and allocated regardless of method, but
+         * silently dropped (never sent, never even passed to the GET
+         * function) unless method was POST. Likewise, do_get() never
+         * built a Content-Type header into the request either, even
+         * though the Lua-facing content_type field already defaulted to a
+         * non-empty string regardless of method. Preserve BOTH exactly:
+         * only pass body and content_type through for methods that
+         * conventionally carry one, so an existing GET-only plugin's
+         * request is byte-for-byte the same on the wire as before -- not
+         * a new (harmless to most servers, but still a real behavior
+         * change) body/Content-Length/Content-Type appearing on a GET for
+         * the first time just because the field happened to be set. */
+        bool method_has_body = req->method == HTTP_METHOD_POST || req->method == HTTP_METHOD_PUT ||
+                                req->method == HTTP_METHOD_PATCH;
+        hreq.body = method_has_body ? req->request_body : NULL;
+        hreq.body_len = method_has_body ? req->request_body_size : 0;
+        hreq.content_type = (method_has_body && req->content_type[0]) ? req->content_type : NULL;
+        hreq.verify_tls = req->verify_tls;
+        hreq.connect_timeout_ms = req->connect_timeout_ms;
+        hreq.read_timeout_ms = req->read_timeout_ms;
+        hreq.total_timeout_ms = req->total_timeout_ms;
+        hreq.max_response_bytes = req->max_response_size;
+        hreq.redirect_limit = req->redirect_limit;
+
+        http_response_t hresp;
+        req->ok = http_request_ex(&hreq, &req->cancel, &hresp);
+        req->status = hresp.status;
+        req->response_body = hresp.body; /* ownership transferred -- do NOT http_response_free() this; freed via plugin_manager_poll()'s existing free(req->response_body) */
+        req->response_body_size = hresp.body_len;
+        memcpy(req->response_headers, hresp.headers, sizeof(req->response_headers));
+        req->response_header_count = hresp.header_count;
+        plugin_dedupe_headers_case_insensitive(req->response_headers, &req->response_header_count);
+        req->response_error = hresp.error;
     }
     free(req->request_body);
     req->request_body = NULL;
     req->request_body_size = 0;
-    req->done = true;
+    atomic_store(&req->done, true);
     return NULL;
 }
 
 /* plugin.http_request(options, callback) -> handle | nil, error. Network
- * work happens on a native worker and the callback is invoked only later by
- * plugin_manager_poll() on the UI/Lua thread. callback(status, body, error):
- * status/body are nil on failure; error is nil on success. */
+ * work happens on a native worker and the callback is invoked only later
+ * by plugin_manager_poll() on the UI/Lua thread.
+ *
+ * callback(status, body, error, headers): the ORIGINAL 3-arg shape
+ * (status, body, error) is preserved exactly -- an existing plugin whose
+ * callback function only declares 3 parameters is completely unaffected,
+ * since Lua silently drops extra arguments a function doesn't declare.
+ * `headers` is new: a plain {name = value} map of the response's headers
+ * (case as the server sent it; look it up case-insensitively yourself if
+ * needed, e.g. via a small helper, since Lua table keys are exact-match).
+ * A repeated header name keeps only the LAST occurrence in this map --
+ * a deliberate simplification, documented in PLUGINS.md.
+ *
+ * New optional `options` fields, all backward compatible (every one
+ * defaults to matching the exact previous behavior when omitted):
+ * - method: now also accepts "PUT"/"PATCH"/"DELETE"/"HEAD", not just
+ *   GET/POST.
+ * - headers = {Name = "value", ...}: arbitrary request headers.
+ * - connect_timeout_ms / read_timeout_ms / total_timeout_ms: 0 (default)
+ *   means no timeout, exactly like every request before this existed.
+ * - redirect_limit: 0 (default) means don't follow redirects -- a 3xx
+ *   itself is returned as an ordinary result (status 3xx, no error),
+ *   matching what happened before redirect-following existed at all
+ *   (do_get()/do_post() never looked at Location either). */
 static int l_plugin_http_request(lua_State * L) {
     luaL_checktype(L, 1, LUA_TTABLE);
     luaL_checktype(L, 2, LUA_TFUNCTION);
@@ -1261,11 +1697,15 @@ static int l_plugin_http_request(lua_State * L) {
     lua_pop(L, 1);
 
     lua_getfield(L, 1, "method");
-    const char * method = luaL_optstring(L, -1, "GET");
-    bool is_post;
-    if (strcasecmp(method, "GET") == 0) is_post = false;
-    else if (strcasecmp(method, "POST") == 0) is_post = true;
-    else return luaL_error(L, "plugin.http_request: method must be GET or POST");
+    const char * method_str = luaL_optstring(L, -1, "GET");
+    http_method_t method;
+    if (strcasecmp(method_str, "GET") == 0) method = HTTP_METHOD_GET;
+    else if (strcasecmp(method_str, "POST") == 0) method = HTTP_METHOD_POST;
+    else if (strcasecmp(method_str, "PUT") == 0) method = HTTP_METHOD_PUT;
+    else if (strcasecmp(method_str, "PATCH") == 0) method = HTTP_METHOD_PATCH;
+    else if (strcasecmp(method_str, "DELETE") == 0) method = HTTP_METHOD_DELETE;
+    else if (strcasecmp(method_str, "HEAD") == 0) method = HTTP_METHOD_HEAD;
+    else return luaL_error(L, "plugin.http_request: unknown method '%s'", method_str);
     lua_pop(L, 1);
 
     lua_getfield(L, 1, "body");
@@ -1289,6 +1729,58 @@ static int l_plugin_http_request(lua_State * L) {
         return luaL_error(L, "plugin.http_request: content_type is too long");
     }
     lua_pop(L, 1);
+
+    /* Arbitrary request headers -- {Name = "value", ...}, bounded to
+     * HTTP_MAX_HEADERS entries and HTTP_HEADER_NAME_MAX/VALUE_MAX per
+     * entry (silently truncated past that, same as content_type/url
+     * above being length-checked rather than ever overflowing). */
+    http_header_t headers[HTTP_MAX_HEADERS];
+    int header_count = 0;
+    lua_getfield(L, 1, "headers");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        /* header_count check MUST come first: once it's false, lua_next()
+         * is never called again (short-circuit), so nothing extra is
+         * ever pushed that would need cleaning up afterward -- the
+         * opposite order would call lua_next() one time too many right
+         * as the bound is hit, pushing a key/value pair the loop body
+         * never runs to pop. Abandoning the traversal early (more table
+         * entries than HTTP_MAX_HEADERS) is fine per the Lua manual, as
+         * long as keys aren't added/removed mid-traversal, which they
+         * aren't here. */
+        while (header_count < HTTP_MAX_HEADERS && lua_next(L, -2) != 0) {
+            if (lua_type(L, -2) == LUA_TSTRING) {
+                /* Review finding: snprintf() alone silently truncated an
+                 * oversized name/value, and validation afterward (the
+                 * CRLF/invalid-character check further down this
+                 * function) then validated the TRUNCATED copy, not what
+                 * the plugin actually passed -- a header could silently
+                 * become a different, shorter one on the wire instead of
+                 * failing loudly. Check the real length (via
+                 * lua_tolstring(), which also catches an embedded NUL a
+                 * plain lua_tostring()+strlen() would miss) and reject
+                 * with a clear Lua error, exactly like an oversized
+                 * url/content_type already does elsewhere in this
+                 * function, instead of truncating. */
+                size_t name_len = 0, value_len = 0;
+                const char * name = lua_tolstring(L, -2, &name_len);
+                const char * value = lua_tolstring(L, -1, &value_len); /* non-string values (numbers) still convert fine via lua_tolstring */
+                if (name && value) {
+                    if (name_len >= sizeof(headers[header_count].name) || value_len >= sizeof(headers[header_count].value)) {
+                        free(body_copy);
+                        return luaL_error(L, "plugin.http_request: header '%s' name/value exceeds %d/%d bytes",
+                                          name, (int) sizeof(headers[0].name) - 1, (int) sizeof(headers[0].value) - 1);
+                    }
+                    memcpy(headers[header_count].name, name, name_len + 1);
+                    memcpy(headers[header_count].value, value, value_len + 1);
+                    header_count++;
+                }
+            }
+            lua_pop(L, 1); /* pop value, keep key for lua_next */
+        }
+    }
+    lua_pop(L, 1); /* pop the headers table (or nil) itself */
+
     lua_getfield(L, 1, "verify_tls");
     bool verify_tls = lua_isnil(L, -1) ? true : lua_toboolean(L, -1);
     lua_pop(L, 1);
@@ -1301,18 +1793,69 @@ static int l_plugin_http_request(lua_State * L) {
                           PLUGIN_ASYNC_HTTP_MAX_RESPONSE);
     }
 
+    lua_getfield(L, 1, "connect_timeout_ms");
+    lua_Integer connect_timeout_ms = luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "read_timeout_ms");
+    lua_Integer read_timeout_ms = luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "total_timeout_ms");
+    lua_Integer total_timeout_ms = luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "redirect_limit");
+    lua_Integer redirect_limit = luaL_optinteger(L, -1, 0);
+    lua_pop(L, 1);
+    if (connect_timeout_ms < 0 || read_timeout_ms < 0 || total_timeout_ms < 0 || redirect_limit < 0) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: timeout/redirect_limit fields must not be negative");
+    }
+    /* Review finding: values were only checked for being non-negative,
+     * then narrowed to uint32_t/int with no upper bound at all. A
+     * timeout above UINT32_MAX would wrap; more seriously, a value
+     * between INT_MAX+1 and UINT32_MAX becomes NEGATIVE once narrowed to
+     * the plain int poll() itself takes, which poll() treats as "wait
+     * indefinitely" -- the opposite of what a timeout is for. An
+     * enormous redirect_limit could also drive the redirect-following
+     * recursion deep enough to exhaust the C stack. Reject outright
+     * rather than silently clamp/truncate, so a plugin passing a garbage
+     * value finds out immediately, not via mysterious hangs later. These
+     * limits match http_client.c's own separate, defensive caps
+     * (HTTP_REQUEST_MAX_TIMEOUT_MS/HTTP_REQUEST_MAX_REDIRECTS) -- kept as
+     * two independent checks deliberately (belt and suspenders), not
+     * because either alone would be insufficient. */
+#define PLUGIN_HTTP_MAX_TIMEOUT_MS (5 * 60 * 1000) /* 5 minutes */
+#define PLUGIN_HTTP_MAX_REDIRECTS 10
+    if (connect_timeout_ms > PLUGIN_HTTP_MAX_TIMEOUT_MS || read_timeout_ms > PLUGIN_HTTP_MAX_TIMEOUT_MS ||
+        total_timeout_ms > PLUGIN_HTTP_MAX_TIMEOUT_MS) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: connect_timeout_ms/read_timeout_ms/total_timeout_ms must not exceed %d",
+                          PLUGIN_HTTP_MAX_TIMEOUT_MS);
+    }
+    if (redirect_limit > PLUGIN_HTTP_MAX_REDIRECTS) {
+        free(body_copy);
+        return luaL_error(L, "plugin.http_request: redirect_limit must not exceed %d", PLUGIN_HTTP_MAX_REDIRECTS);
+    }
+
     plugin_async_http_t * req = &plugin_async_http[slot];
     uint16_t generation = (uint16_t) (req->generation + 1);
     if (generation == 0) generation = 1;
     memset(req, 0, sizeof(*req));
+    atomic_init(&req->done, false);
+    http_cancel_token_init(&req->cancel);
     req->generation = generation;
     req->active = true;
     req->L = L;
-    req->is_post = is_post;
+    req->method = method;
+    memcpy(req->headers, headers, sizeof(req->headers));
+    req->header_count = header_count;
     req->verify_tls = verify_tls;
     req->request_body = body_copy;
     req->request_body_size = body_size;
     req->max_response_size = (size_t) requested_max;
+    req->connect_timeout_ms = (uint32_t) connect_timeout_ms;
+    req->read_timeout_ms = (uint32_t) read_timeout_ms;
+    req->total_timeout_ms = (uint32_t) total_timeout_ms;
+    req->redirect_limit = (int) redirect_limit;
     snprintf(req->url, sizeof(req->url), "%s", url);
     snprintf(req->content_type, sizeof(req->content_type), "%s", content_type);
     lua_pushvalue(L, 2);
@@ -1323,6 +1866,7 @@ static int l_plugin_http_request(lua_State * L) {
         free(req->request_body);
         req->request_body = NULL;
         req->active = false;
+        http_cancel_token_destroy(&req->cancel);
         lua_pushnil(L);
         lua_pushstring(L, "could not start HTTP worker");
         return 2;
@@ -1330,6 +1874,64 @@ static int l_plugin_http_request(lua_State * L) {
 
     int handle = ((int) generation << 8) | (slot + 1);
     lua_pushinteger(L, handle);
+    return 1;
+}
+
+/* plugin.download_file_async(url, dest_path [, verify_tls], callback)
+ * -> handle | nil, error. Streams into a unique sibling temporary file on
+ * the native HTTP worker, then atomically renames it over dest_path only
+ * after a complete 2xx response. callback(dest_path, error) runs later on
+ * the Lua/UI thread, matching http_request's callback discipline. */
+static int l_plugin_download_file_async(lua_State * L) {
+    const char * url = luaL_checkstring(L, 1);
+    const char * dest_path = luaL_checkstring(L, 2);
+    int callback_index = lua_isfunction(L, 3) ? 3 : 4;
+    bool verify_tls = callback_index == 3 ? true : lua_toboolean(L, 3);
+    luaL_checktype(L, callback_index, LUA_TFUNCTION);
+
+    if (strlen(url) >= sizeof(plugin_async_http[0].url))
+        return luaL_error(L, "plugin.download_file_async: URL is too long");
+    if (dest_path[0] == '\0' || strlen(dest_path) >= sizeof(plugin_async_http[0].dest_path) - 12)
+        return luaL_error(L, "plugin.download_file_async: destination path is invalid or too long");
+    if (plugin_storage_path_is_reserved(dest_path))
+        return luaL_error(L, "plugin.download_file_async: path is reserved for plugin.storage/plugin.secrets");
+
+    int slot = -1;
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        if (!plugin_async_http[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "too many active HTTP requests");
+        return 2;
+    }
+
+    plugin_async_http_t * req = &plugin_async_http[slot];
+    uint16_t generation = (uint16_t) (req->generation + 1);
+    if (generation == 0) generation = 1;
+    memset(req, 0, sizeof(*req));
+    atomic_init(&req->done, false);
+    http_cancel_token_init(&req->cancel);
+    req->generation = generation;
+    req->active = true;
+    req->L = L;
+    req->is_download = true;
+    req->verify_tls = verify_tls;
+    snprintf(req->url, sizeof(req->url), "%s", url);
+    snprintf(req->dest_path, sizeof(req->dest_path), "%s", dest_path);
+    lua_pushvalue(L, callback_index);
+    req->callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    if (pthread_create(&req->thread, NULL, plugin_async_http_thread_func, req) != 0) {
+        luaL_unref(L, LUA_REGISTRYINDEX, req->callback_ref);
+        req->active = false;
+        http_cancel_token_destroy(&req->cancel);
+        lua_pushnil(L);
+        lua_pushstring(L, "could not start HTTP worker");
+        return 2;
+    }
+
+    lua_pushinteger(L, ((int) generation << 8) | (slot + 1));
     return 1;
 }
 
@@ -1341,7 +1943,11 @@ static int l_plugin_cancel(lua_State * L) {
     if (slot >= 0 && slot < PLUGIN_MAX_ASYNC_HTTP) {
         plugin_async_http_t * req = &plugin_async_http[slot];
         if (req->active && req->generation == generation) {
-            req->cancelled = true;
+            /* Real cancellation now, not just callback suppression --
+             * http_cancel_token_cancel() shuts down the connection's fd,
+             * forcing a blocked connect()/recv() to return immediately
+             * (see http_client.h's own comment on http_cancel_token_t). */
+            http_cancel_token_cancel(&req->cancel);
             cancelled = true;
         }
     }
@@ -1483,6 +2089,81 @@ static int l_plugin_get_next_album_tracks(lua_State * L) {
     int count = 0;
     char ** tracks = gui_plugin_get_next_album_tracks(artist, current_album, &count);
     return push_string_array_result(L, tracks, count);
+}
+
+/* ---- plugin.playlist_* -- CRUD over .m3u playlists under PLAYLISTS_DIR,
+ * exactly where the native Playlists screen looks. playlist_create()/
+ * playlist_delete() also update metadata_db's playlist-existence cache
+ * (metadata_db_playlist_insert_one()/_delete_one(), reachable here via
+ * gui.h's own #include "metadata_db.h") so a plugin-created/deleted
+ * playlist shows up/disappears there immediately instead of needing a full
+ * rescan -- matching every native call site (gui.c's own
+ * add_to_playlist_confirm_cb()/playlist_delete_row_cb() and friends).
+ * playlist_add()/playlist_remove() only edit a playlist's contents, which
+ * that cache never tracks (confirmed against every native call site doing
+ * the same), so they call playlist_files_append()/_remove() alone. ---- */
+
+/* plugin.playlist_list() -> { m3u_path, ... } | nil */
+static int l_plugin_playlist_list(lua_State * L) {
+    char ** paths = NULL;
+    int count = 0;
+    if (!playlist_files_scan(PLAYLISTS_DIR, &paths, &count)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return push_string_array_result(L, paths, count);
+}
+
+/* plugin.playlist_read(m3u_path) -> { song_path, ... } | nil */
+static int l_plugin_playlist_read(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    char ** paths = NULL;
+    int count = 0;
+    if (!playlist_files_read(m3u_path, &paths, &count)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return push_string_array_result(L, paths, count);
+}
+
+/* plugin.playlist_create(name, song_path) -> m3u_path | nil */
+static int l_plugin_playlist_create(lua_State * L) {
+    const char * name = luaL_checkstring(L, 1);
+    const char * song_path = luaL_checkstring(L, 2);
+
+    char created_path[512];
+    if (!playlist_files_create(PLAYLISTS_DIR, name, song_path, created_path, sizeof(created_path))) {
+        lua_pushnil(L);
+        return 1;
+    }
+    metadata_db_playlist_insert_one(created_path);
+    lua_pushstring(L, created_path);
+    return 1;
+}
+
+/* plugin.playlist_add(m3u_path, song_path) -> bool */
+static int l_plugin_playlist_add(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    const char * song_path = luaL_checkstring(L, 2);
+    lua_pushboolean(L, playlist_files_append(m3u_path, song_path));
+    return 1;
+}
+
+/* plugin.playlist_remove(m3u_path, song_path) -> bool */
+static int l_plugin_playlist_remove(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    const char * song_path = luaL_checkstring(L, 2);
+    lua_pushboolean(L, playlist_files_remove(m3u_path, song_path));
+    return 1;
+}
+
+/* plugin.playlist_delete(m3u_path) -> bool */
+static int l_plugin_playlist_delete(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    bool ok = playlist_files_delete(m3u_path);
+    if (ok) metadata_db_playlist_delete_one(m3u_path);
+    lua_pushboolean(L, ok);
+    return 1;
 }
 
 /* ---- plugin.library_* -- paged, DB-backed library access (see gui.h's own
@@ -1752,6 +2433,20 @@ static bool plugin_id_is_valid(const char * id) {
     return true;
 }
 
+/* Shared by both l_plugin_define() (an explicit id) and load_plugin_file()'s
+ * generated "legacy.<filename>" fallback -- checked against every OTHER
+ * already-fully-loaded instance regardless of which path assigned its id.
+ * Review finding: previously only l_plugin_define() checked for
+ * duplicates, so a legacy plugin loaded AFTER another plugin had already
+ * explicitly declared the same "legacy.foo" id got no check at all, and
+ * could silently share that plugin's storage/secrets namespace. */
+static bool plugin_id_collides(const char * id, int exclude_slot) {
+    for (int i = 0; i < plugin_instance_count; i++) {
+        if (i != exclude_slot && plugin_instances[i].defined && strcmp(plugin_instances[i].id, id) == 0) return true;
+    }
+    return false;
+}
+
 /* plugin.define({ id=..., name=..., version=..., api_min=... }) establishes
  * stable identity before future storage/permission APIs are added. It is
  * deliberately legal only while this file is executing its top-level code:
@@ -1771,10 +2466,8 @@ static int l_plugin_define(lua_State * L) {
         return luaL_error(L, "plugin.define: id must be 1-%zu characters using letters, digits, '.', '_' or '-'",
                           sizeof(inst->id) - 1);
     }
-    for (int i = 0; i < plugin_instance_count; i++) {
-        if (i != loading_plugin_slot && plugin_instances[i].defined && strcmp(plugin_instances[i].id, id) == 0) {
-            return luaL_error(L, "plugin.define: duplicate plugin id '%s'", id);
-        }
+    if (plugin_id_collides(id, loading_plugin_slot)) {
+        return luaL_error(L, "plugin.define: duplicate plugin id '%s'", id);
     }
     snprintf(inst->id, sizeof(inst->id), "%s", id);
     lua_pop(L, 1);
@@ -1806,7 +2499,9 @@ static int l_plugin_api_version(lua_State * L) {
 static const char * const plugin_capabilities[] = {
     "ui.list", "ui.settings", "ui.row_width", "ui.text_input", "ui.toast", "ui.theme",
     "filesystem.sd", "playback.control", "playback.state", "playback.events",
-    "library.artist_albums", "library.paged", "network.http.sync", "network.http.async", "crypto.md5", "audio.peq"
+    "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
+    "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
+    "storage.namespaced", "storage.secrets", "playback.remote"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -1816,6 +2511,148 @@ static int l_plugin_has_capability(lua_State * L) {
         if (strcmp(requested, plugin_capabilities[i]) == 0) { found = true; break; }
     }
     lua_pushboolean(L, found);
+    return 1;
+}
+
+/* plugin.media_capabilities() -- see NEXT_TODO-style remote-provider plan,
+ * requirement 11. Every field here is a verified fact about this exact
+ * pipeline (audio.c's decoder_open()/audio_output.c), not an aspirational
+ * one:
+ * - mp3/aac/flac are all three already confirmed working for a direct
+ *   http(s):// stream today (decoder_open()'s is_stream_url() branch --
+ *   MP3 default, FLAC via the "#.flac" hint, AAC via "#.aac"/"#.aacp" or
+ *   an "audio/aac" Content-Type, ADTS framing via aac_open_stream()).
+ * - max_bit_depth is 16, not an assumption: every output path (internal
+ *   ALSA in audio_output.c's open_device(), the USB-DAC aplay spawn, and
+ *   the Bluetooth aplay spawn) hardcodes PCM_FORMAT_S16_LE / "-f S16_LE"
+ *   with no exception -- whatever bit depth a source decodes to, this is
+ *   what actually reaches the DAC.
+ * - max_channels is 2: nothing in this pipeline remaps or mixes channel
+ *   counts; every path above passes `channels` straight through with no
+ *   multichannel-aware code found anywhere in the codebase.
+ * - max_sample_rate is deliberately left 0 (unspecified) rather than a
+ *   guessed number: config.rate is passed straight through to pcm_open()
+ *   with no software-side cap anywhere in this pipeline, so the real
+ *   ceiling is whatever this device's DAC/kernel driver negotiates --
+ *   that's a hardware fact this codebase doesn't state anywhere and this
+ *   function should not invent one. Fill this in once a real number is
+ *   confirmed against the actual hardware, rather than guessing here. */
+static int l_plugin_media_capabilities(lua_State * L) {
+    lua_newtable(L);
+
+    lua_newtable(L);
+    lua_pushstring(L, "mp3");  lua_rawseti(L, -2, 1);
+    lua_pushstring(L, "aac");  lua_rawseti(L, -2, 2);
+    lua_pushstring(L, "flac"); lua_rawseti(L, -2, 3);
+    lua_setfield(L, -2, "codecs");
+
+    lua_newtable(L);
+    lua_pushstring(L, "mp3");  lua_rawseti(L, -2, 1);
+    lua_pushstring(L, "adts"); lua_rawseti(L, -2, 2);
+    lua_pushstring(L, "flac"); lua_rawseti(L, -2, 3);
+    lua_setfield(L, -2, "containers");
+
+    lua_pushinteger(L, 0);  lua_setfield(L, -2, "max_sample_rate"); /* see comment above -- unverified, do not treat as 0 Hz */
+    lua_pushinteger(L, 16); lua_setfield(L, -2, "max_bit_depth");
+    lua_pushinteger(L, 2);  lua_setfield(L, -2, "max_channels");
+
+    lua_pushboolean(L, true);  lua_setfield(L, -2, "direct_http_streaming");
+    lua_pushboolean(L, false); lua_setfield(L, -2, "range_seeking"); /* Phase 2, not built yet */
+    lua_pushboolean(L, false); lua_setfield(L, -2, "hls");
+    lua_pushboolean(L, false); lua_setfield(L, -2, "dash");
+
+    lua_newtable(L); lua_setfield(L, -2, "encryption_modes"); /* empty: none supported */
+    lua_newtable(L); lua_setfield(L, -2, "drm_systems");      /* empty: none supported */
+
+    return 1;
+}
+
+/* plugin.storage.get(key [, default]) / .set(key, value) / .delete(key) /
+ * .list(prefix) -- see plugin_storage.h's own threat-model comment.
+ * Values round-trip arbitrary bytes (luaL_checklstring/lua_pushlstring),
+ * not just NUL-terminated text. */
+static int l_plugin_storage_get(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    char * value = NULL;
+    size_t value_len = 0;
+    if (plugin_storage_get(id, key, &value, &value_len)) {
+        lua_pushlstring(L, value, value_len);
+        free(value);
+        return 1;
+    }
+    if (lua_gettop(L) >= 2) {
+        lua_pushvalue(L, 2);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+static int l_plugin_storage_set(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    size_t value_len = 0;
+    const char * value = luaL_checklstring(L, 2, &value_len);
+    if (!plugin_storage_set(id, key, value, value_len)) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "plugin.storage.set failed");
+        return 2;
+    }
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int l_plugin_storage_delete(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    lua_pushboolean(L, plugin_storage_delete(id, key));
+    return 1;
+}
+
+static int l_plugin_storage_list(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * prefix = luaL_optstring(L, 1, "");
+    char ** keys = NULL;
+    int count = plugin_storage_list(id, prefix, &keys);
+    if (count < 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "plugin.storage.list failed");
+        return 2;
+    }
+    lua_newtable(L);
+    for (int i = 0; i < count; i++) {
+        lua_pushstring(L, keys[i]);
+        lua_rawseti(L, -2, i + 1);
+        free(keys[i]);
+    }
+    free(keys);
+    return 1;
+}
+
+/* plugin.secrets.set/exists/delete -- deliberately no .list(), so a
+ * plugin (or anything reading its own diagnostics) can't enumerate secret
+ * key names; see plugin_storage.h's threat-model comment. */
+static int l_plugin_secrets_set(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    size_t value_len = 0;
+    const char * value = luaL_checklstring(L, 2, &value_len);
+    lua_pushboolean(L, plugin_secrets_set(id, key, value, value_len));
+    return 1;
+}
+
+static int l_plugin_secrets_exists(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    lua_pushboolean(L, plugin_secrets_exists(id, key));
+    return 1;
+}
+
+static int l_plugin_secrets_delete(lua_State * L) {
+    const char * id = require_plugin_id(L);
+    const char * key = luaL_checkstring(L, 1);
+    lua_pushboolean(L, plugin_secrets_delete(id, key));
     return 1;
 }
 
@@ -1850,8 +2687,17 @@ static const luaL_Reg plugin_funcs[] = {
     { "show_settings_list",        l_plugin_show_settings_list },
     { "list_dir",                  l_plugin_list_dir },
     { "sd_root",                   l_plugin_sd_root },
+    { "playlist_list",             l_plugin_playlist_list },
+    { "playlist_read",             l_plugin_playlist_read },
+    { "playlist_create",           l_plugin_playlist_create },
+    { "playlist_add",              l_plugin_playlist_add },
+    { "playlist_remove",           l_plugin_playlist_remove },
+    { "playlist_delete",           l_plugin_playlist_delete },
+    { "mkdir",                     l_plugin_mkdir },
     { "play_file",                 l_plugin_play_file },
     { "play_list",                 l_plugin_play_list },
+    { "play_remote",               l_plugin_play_remote },
+    { "queue_remote_list",         l_plugin_queue_remote_list },
     { "show_toast",                l_plugin_show_toast },
     { "set_icon",                  l_plugin_set_icon },
     { "set_background_color",      l_plugin_set_background_color },
@@ -1877,8 +2723,12 @@ static const luaL_Reg plugin_funcs[] = {
     { "http_get",                  l_plugin_http_get },
     { "http_post",                 l_plugin_http_post },
     { "http_request",              l_plugin_http_request },
+    { "download_file_async",       l_plugin_download_file_async },
     { "cancel",                    l_plugin_cancel },
     { "md5",                       l_plugin_md5 },
+    { "json_decode",               l_plugin_json_decode },
+    { "json_encode",               l_plugin_json_encode },
+    { "media_capabilities",        l_plugin_media_capabilities },
     { "show_text_input",           l_plugin_show_text_input },
     { "get_now_playing",           l_plugin_get_now_playing },
     { "get_play_mode",             l_plugin_get_play_mode },
@@ -1899,8 +2749,27 @@ static const luaL_Reg plugin_funcs[] = {
     { NULL, NULL }
 };
 
+static const luaL_Reg plugin_storage_funcs[] = {
+    { "get",    l_plugin_storage_get },
+    { "set",    l_plugin_storage_set },
+    { "delete", l_plugin_storage_delete },
+    { "list",   l_plugin_storage_list },
+    { NULL, NULL }
+};
+
+static const luaL_Reg plugin_secrets_funcs[] = {
+    { "set",    l_plugin_secrets_set },
+    { "exists", l_plugin_secrets_exists },
+    { "delete", l_plugin_secrets_delete },
+    { NULL, NULL }
+};
+
 static void register_plugin_api(lua_State * L) {
     luaL_newlib(L, plugin_funcs);
+    luaL_newlib(L, plugin_storage_funcs);
+    lua_setfield(L, -2, "storage");
+    luaL_newlib(L, plugin_secrets_funcs);
+    lua_setfield(L, -2, "secrets");
     lua_setglobal(L, "plugin");
 }
 
@@ -1933,6 +2802,111 @@ static void register_plugin_api(lua_State * L) {
  * load further code, just read/write/delete/rename whatever path the
  * plugin already had permission to name (same risk class as this app's own
  * file I/O, not a privilege escalation). */
+/* Review finding: 0700/0600 file permissions only defend against a
+ * DIFFERENT Unix user/process -- every plugin's lua_State runs in this
+ * same process, so plain io.open()/io.lines()/io.input()/io.output()/
+ * os.remove()/os.rename() (kept above for real, tested plugin needs)
+ * could read, delete, or overwrite ANOTHER plugin's secrets file
+ * directly, since its hashed filename is fully deterministic from a
+ * known plugin id + key. These six wrappers are the actual isolation
+ * boundary for plugin.storage/plugin.secrets: each checks
+ * plugin_storage_path_is_reserved() (see its own comment in
+ * plugin_storage.h) and refuses any path that resolves into the reserved
+ * storage tree, forcing that tree to only ever be touched through the
+ * plugin.storage/secrets API. Every other path (SD card, elsewhere on
+ * the internal partition) is unaffected -- this is intentionally narrow,
+ * not a general filesystem sandbox. The underlying C functions are
+ * identical across every lua_State (plain stateless C functions, not
+ * per-state closures), so capturing them once here and reusing the same
+ * pointers for every plugin is safe.
+ *
+ * Review finding: io.input(path)/io.output(path) open a named file for
+ * the default input/output stream exactly like io.open(), and were
+ * initially missed -- a plugin could select another plugin's secrets
+ * path via io.input(path) then read it with io.read(), or truncate/
+ * overwrite it via io.output(path). Both are guarded the same way, but
+ * ONLY when called WITH a filename argument -- io.input()/io.output()
+ * with no argument (or a file handle already open, not a path string)
+ * just return/set the current default stream and must pass through
+ * unchanged. */
+static lua_CFunction real_io_open = NULL;
+static lua_CFunction real_io_lines = NULL;
+static lua_CFunction real_io_input = NULL;
+static lua_CFunction real_io_output = NULL;
+static lua_CFunction real_os_remove = NULL;
+static lua_CFunction real_os_rename = NULL;
+
+static int l_guarded_io_open(lua_State * L) {
+    const char * path = luaL_optstring(L, 1, "");
+    if (plugin_storage_path_is_reserved(path)) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "io.open: path is reserved for plugin.storage/plugin.secrets");
+        return 2;
+    }
+    return real_io_open(L);
+}
+
+static int l_guarded_io_lines(lua_State * L) {
+    /* io.lines(), with no argument, reads the default input -- not a path,
+     * nothing to check. Unlike io.open(), a real io.lines() failure
+     * raises a Lua error rather than returning nil+message (per the Lua
+     * manual), so this mirrors that convention instead of io.open()'s. */
+    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
+        const char * path = lua_tostring(L, 1);
+        if (plugin_storage_path_is_reserved(path)) {
+            return luaL_error(L, "io.lines: path is reserved for plugin.storage/plugin.secrets");
+        }
+    }
+    return real_io_lines(L);
+}
+
+static int l_guarded_io_input(lua_State * L) {
+    /* Only a STRING first argument names a path to open -- io.input() with
+     * no argument returns the current default input, and io.input(handle)
+     * with an already-open file handle just re-points the default input
+     * at it, neither of which is a path to check. Like io.lines(), a real
+     * io.input() failure raises a Lua error rather than returning
+     * nil+message. */
+    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
+        const char * path = lua_tostring(L, 1);
+        if (plugin_storage_path_is_reserved(path)) {
+            return luaL_error(L, "io.input: path is reserved for plugin.storage/plugin.secrets");
+        }
+    }
+    return real_io_input(L);
+}
+
+static int l_guarded_io_output(lua_State * L) {
+    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
+        const char * path = lua_tostring(L, 1);
+        if (plugin_storage_path_is_reserved(path)) {
+            return luaL_error(L, "io.output: path is reserved for plugin.storage/plugin.secrets");
+        }
+    }
+    return real_io_output(L);
+}
+
+static int l_guarded_os_remove(lua_State * L) {
+    const char * path = luaL_optstring(L, 1, "");
+    if (plugin_storage_path_is_reserved(path)) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "os.remove: path is reserved for plugin.storage/plugin.secrets");
+        return 2;
+    }
+    return real_os_remove(L);
+}
+
+static int l_guarded_os_rename(lua_State * L) {
+    const char * from = luaL_optstring(L, 1, "");
+    const char * to = luaL_optstring(L, 2, "");
+    if (plugin_storage_path_is_reserved(from) || plugin_storage_path_is_reserved(to)) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "os.rename: path is reserved for plugin.storage/plugin.secrets");
+        return 2;
+    }
+    return real_os_rename(L);
+}
+
 static void sandbox_plugin_lua_state(lua_State * L) {
     lua_pushnil(L); lua_setglobal(L, "load");
     lua_pushnil(L); lua_setglobal(L, "loadstring");
@@ -1949,6 +2923,15 @@ static void sandbox_plugin_lua_state(lua_State * L) {
             lua_pushnil(L);
             lua_setfield(L, -2, dangerous_os[i]);
         }
+
+        lua_getfield(L, -1, "remove");
+        if (lua_iscfunction(L, -1)) real_os_remove = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "rename");
+        if (lua_iscfunction(L, -1)) real_os_rename = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        if (real_os_remove) { lua_pushcfunction(L, l_guarded_os_remove); lua_setfield(L, -2, "remove"); }
+        if (real_os_rename) { lua_pushcfunction(L, l_guarded_os_rename); lua_setfield(L, -2, "rename"); }
     }
     lua_pop(L, 1);
 
@@ -1956,6 +2939,23 @@ static void sandbox_plugin_lua_state(lua_State * L) {
     if (lua_istable(L, -1)) {
         lua_pushnil(L);
         lua_setfield(L, -2, "popen"); /* the one io.* function that's a shell-exec primitive, not file I/O */
+
+        lua_getfield(L, -1, "open");
+        if (lua_iscfunction(L, -1)) real_io_open = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "lines");
+        if (lua_iscfunction(L, -1)) real_io_lines = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "input");
+        if (lua_iscfunction(L, -1)) real_io_input = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, -1, "output");
+        if (lua_iscfunction(L, -1)) real_io_output = lua_tocfunction(L, -1);
+        lua_pop(L, 1);
+        if (real_io_open) { lua_pushcfunction(L, l_guarded_io_open); lua_setfield(L, -2, "open"); }
+        if (real_io_lines) { lua_pushcfunction(L, l_guarded_io_lines); lua_setfield(L, -2, "lines"); }
+        if (real_io_input) { lua_pushcfunction(L, l_guarded_io_input); lua_setfield(L, -2, "input"); }
+        if (real_io_output) { lua_pushcfunction(L, l_guarded_io_output); lua_setfield(L, -2, "output"); }
     }
     lua_pop(L, 1);
 }
@@ -2026,6 +3026,41 @@ static void load_plugin_file(const char * path) {
         snprintf(inst->id, sizeof(inst->id), "legacy.%.*s", (int) sizeof(inst->id) - 8, base);
         char * dot = strrchr(inst->id, '.');
         if (dot && strcasecmp(dot, ".lua") == 0) *dot = '\0';
+        /* Review finding: a generated "legacy.<name>" id was never checked
+         * against ids already claimed by other instances -- an explicit
+         * plugin.define({id="legacy.foo"}) loaded earlier and a plain
+         * foo.lua loaded later would silently share one storage/secrets
+         * namespace. Disambiguate deterministically (same file always
+         * gets the same fallback id across reloads, so storage/secrets
+         * continuity isn't lost) with a hash of the full path rather than
+         * something order- or scan-dependent. */
+        if (plugin_id_collides(inst->id, slot)) {
+            uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a 64 */
+            for (const char * p = path; *p; p++) { h ^= (unsigned char) *p; h *= 0x100000001b3ULL; }
+            char base_no_ext[sizeof(inst->id)];
+            snprintf(base_no_ext, sizeof(base_no_ext), "%s", base);
+            char * base_dot = strrchr(base_no_ext, '.');
+            if (base_dot && strcasecmp(base_dot, ".lua") == 0) *base_dot = '\0';
+            /* Review finding: the disambiguated id itself was never
+             * re-checked -- a plugin could deliberately plugin.define() the
+             * exact predictable "legacy.<name>.<hash>" string and, loaded
+             * first, still end up sharing a namespace with the real
+             * legacy plugin. Use the FULL 64-bit hash (not truncated to
+             * 32 bits, to cut accidental-collision risk) and re-check; if
+             * it STILL collides -- now necessarily deliberate, not
+             * accidental -- refuse to load this plugin at all rather than
+             * ever silently sharing a storage/secrets namespace. */
+            snprintf(inst->id, sizeof(inst->id), "legacy.%.*s.%016llx",
+                     (int) sizeof(inst->id) - 7 - 1 - 16 - 1, base_no_ext, (unsigned long long) h);
+            if (plugin_id_collides(inst->id, slot)) {
+                fprintf(stderr, "[plugins] refusing to load %s: generated id '%s' still collides with another plugin's id\n",
+                        path, inst->id);
+                lua_close(L);
+                memset(inst, 0, sizeof(*inst));
+                loading_plugin_slot = -1;
+                return;
+            }
+        }
         snprintf(inst->name, sizeof(inst->name), "%.*s", (int) sizeof(inst->name) - 1, base);
         snprintf(inst->version, sizeof(inst->version), "0");
         inst->defined = true;
@@ -2057,24 +3092,54 @@ void plugin_manager_init(void) {
 void plugin_manager_poll(void) {
     for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
         plugin_async_http_t * req = &plugin_async_http[i];
-        if (!req->active || !req->done) continue;
+        if (!req->active || !atomic_load(&req->done)) continue;
         pthread_join(req->thread, NULL);
 
-        if (!req->cancelled) {
+        if (!http_cancel_token_is_cancelled(&req->cancel)) {
             lua_rawgeti(req->L, LUA_REGISTRYINDEX, req->callback_ref);
-            if (req->ok) {
+            int callback_args;
+            if (req->is_download) {
+                if (req->ok) {
+                    lua_pushstring(req->L, req->dest_path);
+                    lua_pushnil(req->L);
+                } else {
+                    lua_pushnil(req->L);
+                    lua_pushstring(req->L, "download failed");
+                }
+                callback_args = 2;
+            } else if (req->ok) {
                 lua_pushinteger(req->L, req->status);
                 lua_pushlstring(req->L, req->response_body ? (const char *) req->response_body : "",
                                 req->response_body_size);
                 lua_pushnil(req->L);
+                /* New 4th argument: {Name = "value", ...} response
+                 * headers. An existing 3-parameter callback is completely
+                 * unaffected -- Lua silently drops extra arguments a
+                 * function doesn't declare. A repeated header name keeps
+                 * only the last occurrence (documented in PLUGINS.md). */
+                lua_newtable(req->L);
+                for (int h = 0; h < req->response_header_count; h++) {
+                    lua_pushstring(req->L, req->response_headers[h].value);
+                    lua_setfield(req->L, -2, req->response_headers[h].name);
+                }
+                callback_args = 4;
             } else {
                 lua_pushnil(req->L);
                 lua_pushnil(req->L);
-                lua_pushstring(req->L, "network error or response limit exceeded");
+                /* req->response_error is one of http_client.h's stable
+                 * HTTP_ERR_* strings (e.g. "connect_timeout", "cancelled",
+                 * "response_too_large") when http_request_ex() set it --
+                 * more specific than the previous single generic message.
+                 * Still falls back to that generic message for the rare
+                 * case nothing set it (shouldn't happen, but a plugin
+                 * should never see a NULL/empty error string here). */
+                lua_pushstring(req->L, (req->response_error && req->response_error[0])
+                                           ? req->response_error : "network error or response limit exceeded");
+                callback_args = 3;
             }
-            if (plugin_call(req->L, 3, 0, 0) != LUA_OK) {
+            if (plugin_call(req->L, callback_args, 0, 0) != LUA_OK) {
                 const char * err = lua_tostring(req->L, -1);
-                fprintf(stderr, "[plugins] http_request callback error: %s\n", err ? err : "unknown error");
+                fprintf(stderr, "[plugins] HTTP callback error: %s\n", err ? err : "unknown error");
                 lua_pop(req->L, 1);
             }
         }
@@ -2084,8 +3149,8 @@ void plugin_manager_poll(void) {
         req->response_body = NULL;
         req->response_body_size = 0;
         req->active = false;
-        req->done = false;
-        req->cancelled = false;
+        atomic_store(&req->done, false);
+        http_cancel_token_destroy(&req->cancel);
         req->L = NULL;
         req->callback_ref = LUA_NOREF;
     }
@@ -2352,7 +3417,7 @@ void plugin_manager_settings_list_slid(int slot, int row, int new_value) {
 }
 
 void plugin_manager_notify_track_started(const char * title, const char * artist, const char * album,
-                                          double duration_seconds) {
+                                          double duration_seconds, const char * provider, const char * track_id) {
     for (int i = 0; i < plugin_event_subscriber_count[PLUGIN_EVENT_TRACK_STARTED]; i++) {
         plugin_event_subscriber_t * sub = &plugin_event_subscribers[PLUGIN_EVENT_TRACK_STARTED][i];
         lua_rawgeti(sub->L, LUA_REGISTRYINDEX, sub->ref);
@@ -2360,7 +3425,9 @@ void plugin_manager_notify_track_started(const char * title, const char * artist
         lua_pushstring(sub->L, artist ? artist : "");
         lua_pushstring(sub->L, album ? album : "");
         lua_pushnumber(sub->L, duration_seconds);
-        if (plugin_call(sub->L, 4, 0, 0) != LUA_OK) {
+        lua_pushstring(sub->L, provider ? provider : "");
+        lua_pushstring(sub->L, track_id ? track_id : "");
+        if (plugin_call(sub->L, 6, 0, 0) != LUA_OK) {
             const char * err = lua_tostring(sub->L, -1);
             fprintf(stderr, "[plugins] track_started handler error: %s\n", err ? err : "unknown error");
             lua_pop(sub->L, 1);

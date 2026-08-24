@@ -20,8 +20,10 @@
 #include "subsonic_client.h"
 #include "http_client.h"
 #include "cover_decode.h"
+#include "albumart.h"
 #include "lyrics.h"
 #include "lyrics_layout.h"
+#include "remote_track.h"
 #include "transition_compositor.h"
 #include "wifi_control.h"
 #include "bluetooth_control.h"
@@ -2992,7 +2994,6 @@ static void quick_drawer_rebuild_snapshot(void) {
     if (!fresh) return;
     if (!quick_drawer_motion_image) {
         quick_drawer_motion_image = lv_image_create(lv_layer_top());
-        lv_obj_remove_flag(quick_drawer_motion_image, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_image_set_src(quick_drawer_motion_image, NULL);
@@ -3005,21 +3006,26 @@ static void quick_drawer_rebuild_snapshot(void) {
 
 static void quick_drawer_snapshot_async_cb(void * unused) {
     (void) unused;
-    if (quick_drawer_snapshot_dirty && !quick_drawer_open && !quick_drawer_bitmap_motion)
+    if (quick_drawer_snapshot_dirty && !quick_drawer_bitmap_motion)
         quick_drawer_rebuild_snapshot();
 }
 
 static void quick_drawer_mark_snapshot_dirty(void) {
     quick_drawer_snapshot_dirty = true;
-    if (quick_drawer && !quick_drawer_open && !quick_drawer_bitmap_motion)
+    if (quick_drawer && !quick_drawer_bitmap_motion)
         lv_async_call(quick_drawer_snapshot_async_cb, NULL);
 }
 
 static bool quick_drawer_begin_bitmap_motion(void) {
     if (quick_drawer_bitmap_motion) return true;
-    if (quick_drawer_snapshot_dirty || !quick_drawer_motion_buf) quick_drawer_rebuild_snapshot();
-    if (!quick_drawer_motion_buf || !quick_drawer_motion_image) return false;
+    /* Never lv_snapshot_take() on the drag/animation tick: a full-panel
+     * RGB565 snapshot is a multi-millisecond hitch on this SoC and was
+     * the "dragging the drawer feels slow" report. Use a buffer already
+     * built while idle, or follow the live panel. */
+    if (quick_drawer_snapshot_dirty || !quick_drawer_motion_buf || !quick_drawer_motion_image)
+        return false;
     lv_obj_set_y(quick_drawer_motion_image, lv_obj_get_y(quick_drawer));
+    lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(quick_drawer_motion_image);
     lv_obj_move_foreground(status_bar_band);
@@ -3032,9 +3038,12 @@ static void quick_drawer_finish_bitmap_motion(void) {
     int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
     lv_obj_set_y(quick_drawer, quick_drawer_open ? 0 : -h);
     lv_obj_remove_flag(quick_drawer, LV_OBJ_FLAG_HIDDEN);
-    if (quick_drawer_motion_image) lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
+    if (quick_drawer_motion_image) {
+        lv_obj_remove_flag(quick_drawer_motion_image, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
+    }
     quick_drawer_bitmap_motion = false;
-    if (!quick_drawer_open && quick_drawer_snapshot_dirty)
+    if (quick_drawer_snapshot_dirty || quick_drawer_open)
         lv_async_call(quick_drawer_snapshot_async_cb, NULL);
 }
 
@@ -3115,6 +3124,7 @@ static bool library_rescan_active; /* defined with the rest of the Update Music 
  * on why that's reliable here but LV_EVENT_PRESSING isn't). */
 static lv_timer_t * quick_drawer_drag_timer = NULL;
 static bool quick_drawer_drag_tracking = false;
+static bool quick_drawer_drag_claimed = false;
 static bool quick_drawer_was_pressed = false;
 static int32_t quick_drawer_drag_touch_start_y = 0;
 static int32_t quick_drawer_drag_panel_start_y = 0;
@@ -3347,6 +3357,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         } else {
             quick_drawer_drag_tracking = false;
         }
+        quick_drawer_drag_claimed = false;
         quick_drawer_drag_touch_start_y = p.y;
 
         /* Home-indicator swipe-up: only a press starting within the band
@@ -3524,6 +3535,16 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
             int32_t new_y = quick_drawer_drag_panel_start_y + adjusted_delta;
             if (new_y > 0) new_y = 0;
             if (new_y < -h) new_y = -h;
+            /* Past the deadzone this is a drag, not a tap. The live drawer
+             * does not cover the list while opening (it starts off-screen),
+             * and bitmap motion hides the real panel behind a snapshot --
+             * without wait_release(), LVGL re-hit-tests the still-down
+             * finger onto whatever row is now underneath and fires CLICKED
+             * on release. Same tool as the player-swipe path above. */
+            if (!quick_drawer_drag_claimed) {
+                quick_drawer_drag_claimed = true;
+                lv_indev_wait_release(indev);
+            }
             /* Per-tick velocity, in case the finger lifts mid-flick (see the
              * release branch below) -- a plain position delta rather than
              * lv_indev_get_vect() so it's driven by the exact same samples
@@ -4706,14 +4727,28 @@ static void refresh_format_badge(void) {
     }
 
     const char * path = playlist_path_at(playlist_index);
-    const char * dot = strrchr(path, '.');
+
+    /* A remote track's synthetic "remote://" key has no real extension to
+     * parse (see decoder_open()'s own comment) -- the plugin declares the
+     * codec up front instead. */
+    remote_track_meta_t remote_meta;
+    bool is_remote_track = remote_track_meta_copy_for_path(path, &remote_meta);
     char ext[16] = "";
-    if (dot) {
+    if (is_remote_track && remote_meta.codec[0]) {
         size_t i = 0;
-        for (const char * p = dot + 1; *p && i < sizeof(ext) - 1; p++, i++) {
+        for (const char * p = remote_meta.codec; *p && i < sizeof(ext) - 1; p++, i++) {
             ext[i] = (char) toupper((unsigned char) *p);
         }
         ext[i] = '\0';
+    } else if (!is_remote_track) {
+        const char * dot = strrchr(path, '.');
+        if (dot) {
+            size_t i = 0;
+            for (const char * p = dot + 1; *p && i < sizeof(ext) - 1; p++, i++) {
+                ext[i] = (char) toupper((unsigned char) *p);
+            }
+            ext[i] = '\0';
+        }
     }
 
     unsigned int sample_rate = audio_get_sample_rate();
@@ -4932,53 +4967,46 @@ static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t 
 static bool cover_decode_pending_valid = false;
 static cover_decode_request_t cover_decode_pending;
 
-#define EXTERNAL_COVER_MAX_BYTES (16U * 1024U * 1024U)
+/* The compressed file coexists with cover_decode.c's RGB888 decode buffer
+ * (up to 8 MiB), the audio pipeline, LVGL framebuffers, and the database on
+ * a roughly 56 MiB target. A former 16 MiB allowance could therefore OOM
+ * the process merely by opening Albums, even though the final thumbnail is
+ * only 72x72. Ordinary folder artwork is far below this conservative cap;
+ * oversized art falls back to the default image instead of risking the
+ * whole player. */
+#define EXTERNAL_COVER_MAX_BYTES (4U * 1024U * 1024U)
 
+static void albumart_info_from_path_tags(const char * track_path, const char * artist, const char * album,
+                                          const char * album_artist, albumart_info_t * info) {
+    memset(info, 0, sizeof(*info));
+    snprintf(info->path, sizeof(info->path), "%s", track_path ? track_path : "");
+    snprintf(info->artist, sizeof(info->artist), "%s", artist ? artist : "");
+    snprintf(info->album, sizeof(info->album), "%s", album ? album : "");
+    snprintf(info->albumartist, sizeof(info->albumartist), "%s", album_artist ? album_artist : "");
+}
+
+static void albumart_info_from_song_row(const song_row_t * song, albumart_info_t * info) {
+    albumart_info_from_path_tags(song->path, song->tags.artist, song->tags.album, song->tags.album_artist, info);
+}
+
+/* Rockbox albumart.c search: sized file first, then generic cover/folder
+ * next to the track, then MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>. */
 static bool load_external_cover(const char * track_path, uint8_t ** out_data, uint32_t * out_size) {
-    static const char * names[] = {
-        "cover.jpg", "cover.jpeg", "cover.png",
-        "folder.jpg", "folder.jpeg", "folder.png",
-        "front.jpg", "front.jpeg", "front.png"
-    };
-    char directory[PATH_MAX];
-    snprintf(directory, sizeof(directory), "%s", track_path);
-    char * slash = strrchr(directory, '/');
-    if (!slash) snprintf(directory, sizeof(directory), ".");
-    else if (slash == directory) slash[1] = '\0';
-    else *slash = '\0';
-
-    DIR * dir = opendir(directory);
-    if (!dir) return false;
-    char matched[NAME_MAX + 1] = "";
-    for (size_t wanted = 0; wanted < sizeof(names) / sizeof(names[0]) && !matched[0]; wanted++) {
-        rewinddir(dir);
-        struct dirent * entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcasecmp(entry->d_name, names[wanted]) == 0) {
-                snprintf(matched, sizeof(matched), "%s", entry->d_name);
-                break;
-            }
-        }
+    albumart_info_t info;
+    albumart_info_from_path_tags(track_path, NULL, NULL, NULL, &info);
+    track_metadata_t meta;
+    memset(&meta, 0, sizeof(meta));
+    if (track_path && track_path[0]) {
+        metadata_read(track_path, &meta);
+        snprintf(info.artist, sizeof(info.artist), "%s", meta.artist);
+        snprintf(info.album, sizeof(info.album), "%s", meta.album);
+        snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
+        free(meta.picture_data);
+        free(meta.lyrics);
     }
-    closedir(dir);
-    if (!matched[0]) return false;
-
-    char path[PATH_MAX];
-    int path_len = snprintf(path, sizeof(path), "%s/%s", directory, matched);
-    if (path_len < 0 || (size_t) path_len >= sizeof(path)) return false;
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
-        (uint64_t) st.st_size > EXTERNAL_COVER_MAX_BYTES) return false;
-
-    FILE * f = fopen(path, "rb");
-    if (!f) return false;
-    uint8_t * data = malloc((size_t) st.st_size);
-    bool ok = data && fread(data, 1, (size_t) st.st_size, f) == (size_t) st.st_size;
-    fclose(f);
-    if (!ok) { free(data); return false; }
-    *out_data = data;
-    *out_size = (uint32_t) st.st_size;
-    return true;
+    char found[PATH_MAX];
+    if (!albumart_find(&info, found, sizeof(found), COVER_ART_WIDTH, COVER_ART_HEIGHT)) return false;
+    return albumart_load_file(found, out_data, out_size, EXTERNAL_COVER_MAX_BYTES);
 }
 
 static void * cover_decode_thread_func(void * arg) {
@@ -5731,8 +5759,34 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
 
     bool is_subsonic_stream = subsonic_stream_meta && index < subsonic_stream_meta_count &&
                                strcmp(path, subsonic_stream_meta[index].url) == 0;
+    remote_track_meta_t remote_meta;
+    bool is_remote_track = remote_track_meta_copy_for_path(path, &remote_meta);
 
-    if (is_subsonic_stream) {
+    if (is_remote_track) {
+        /* No file to open for a remote track -- unlike the Subsonic branch
+         * below, this also fixes the ReplayGain gap Subsonic has today
+         * (that branch never calls metadata_read(), so has_replaygain stays
+         * false): the plugin declares replaygain_db up front from its own
+         * catalog metadata, fed into resolve_replaygain() the same as any
+         * local track's tag would be. */
+        memset(out_meta, 0, sizeof(*out_meta));
+        if (remote_meta.title[0]) {
+            snprintf(out_meta->title, sizeof(out_meta->title), "%s", remote_meta.title);
+            out_meta->has_title = true;
+        }
+        if (remote_meta.artist[0]) {
+            snprintf(out_meta->artist, sizeof(out_meta->artist), "%s", remote_meta.artist);
+            out_meta->has_artist = true;
+        }
+        if (remote_meta.album[0]) {
+            snprintf(out_meta->album, sizeof(out_meta->album), "%s", remote_meta.album);
+            out_meta->has_album = true;
+        }
+        if (remote_meta.has_replaygain) {
+            out_meta->has_replaygain = true;
+            out_meta->replaygain_gain_db = remote_meta.replaygain_db;
+        }
+    } else if (is_subsonic_stream) {
         memset(out_meta, 0, sizeof(*out_meta));
         if (subsonic_stream_meta[index].title[0]) {
             snprintf(out_meta->title, sizeof(out_meta->title), "%s", subsonic_stream_meta[index].title);
@@ -5764,8 +5818,15 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
         quick_drawer_mark_snapshot_dirty();
     }
     refresh_format_badge();
-    if (is_subsonic_stream && subsonic_stream_meta[index].cover_url[0]) {
+    if (is_remote_track && remote_meta.artwork_url[0]) {
+        launch_cover_decode_from_url(index, remote_meta.artwork_url, remote_meta.verify_tls);
+    } else if (is_subsonic_stream && subsonic_stream_meta[index].cover_url[0]) {
         launch_cover_decode_from_url(index, subsonic_stream_meta[index].cover_url, subsonic_stream_meta[index].verify_tls);
+    } else if (is_remote_track) {
+        /* No artwork_url and nothing local to fall back to -- unlike the
+         * plain "no embedded picture" case below, launch_cover_decode_
+         * from_track() must not be tried: path is the synthetic remote://
+         * key, not a real file. */
     } else if (out_meta->picture_data && out_meta->picture_size > 0) {
         launch_cover_decode(index, out_meta->picture_data, out_meta->picture_size); /* embedded art has priority; takes ownership */
     } else {
@@ -5775,10 +5836,10 @@ static void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     }
 
     /* No local sidecar (or embedded tag) makes sense for a Subsonic stream
-     * URL -- same reasoning cover art uses subsonic_stream_meta[].cover_url
-     * instead of a local-file lookup for that case. A streamed track just
-     * never gets lyrics in this first release. */
-    if (!is_subsonic_stream) {
+     * or remote-provider URL -- same reasoning cover art uses a server-
+     * supplied cover URL instead of a local-file lookup for those. A
+     * streamed track just never gets lyrics in this first release. */
+    if (!is_subsonic_stream && !is_remote_track) {
         launch_lyrics_load(index, path);
     } else {
         if (current_lyrics_doc_valid) {
@@ -5888,14 +5949,28 @@ static void arm_next_track_for_audio(int index) {
         return;
     }
     const char * next_path = playlist_path_at(next_index);
-    track_metadata_t next_meta;
-    metadata_read(next_path, &next_meta);
+    remote_track_meta_t next_remote_meta;
+    bool next_is_remote_track = remote_track_meta_copy_for_path(next_path, &next_remote_meta);
     bool has_gain, has_peak;
     double gain_db, peak;
-    resolve_replaygain(&next_meta, &has_gain, &gain_db, &has_peak, &peak);
+    if (next_is_remote_track) {
+        /* metadata_read() can't open a synthetic "remote://" path -- same
+         * gap this fixes in apply_track_metadata_to_ui() for the CURRENT
+         * track, needed again here for the gapless-prefetched NEXT one
+         * (on_track_auto_advanced()'s own comment: audio.c applies whatever
+         * gain was armed here, not anything recomputed at handoff time). */
+        has_gain = next_remote_meta.has_replaygain;
+        gain_db = next_remote_meta.replaygain_db;
+        has_peak = false;
+        peak = 0.0;
+    } else {
+        track_metadata_t next_meta;
+        metadata_read(next_path, &next_meta);
+        resolve_replaygain(&next_meta, &has_gain, &gain_db, &has_peak, &peak);
+        free(next_meta.picture_data); /* only needed the gain/peak fields, not the art or lyrics */
+        free(next_meta.lyrics);
+    }
     audio_set_next_track(next_path, has_gain, gain_db, has_peak, peak);
-    free(next_meta.picture_data); /* only needed the gain/peak fields, not the art or lyrics */
-    free(next_meta.lyrics);
 }
 
 /* Song long-press context menu's "Add to Queue" -- splices `path` into the
@@ -6012,14 +6087,17 @@ static bool plugin_now_playing_loaded = false;
  * "track_started" plugin event. Called after audio_play_file_at()/the
  * gapless handoff has already happened in both call sites, so
  * audio_get_duration_seconds() reflects the new track. */
-static void notify_plugin_track_started(const track_metadata_t * meta) {
+static void notify_plugin_track_started(const track_metadata_t * meta, const char * path) {
     snprintf(plugin_now_playing_title, sizeof(plugin_now_playing_title), "%s", meta->title);
     snprintf(plugin_now_playing_artist, sizeof(plugin_now_playing_artist), "%s", meta->artist);
     snprintf(plugin_now_playing_album, sizeof(plugin_now_playing_album), "%s", meta->album);
     plugin_now_playing_duration = audio_get_duration_seconds();
     plugin_now_playing_loaded = true;
 
-    plugin_manager_notify_track_started(meta->title, meta->artist, meta->album, plugin_now_playing_duration);
+    remote_track_meta_t remote_meta;
+    bool is_remote_track = remote_track_meta_copy_for_path(path, &remote_meta);
+    plugin_manager_notify_track_started(meta->title, meta->artist, meta->album, plugin_now_playing_duration,
+                                         is_remote_track ? remote_meta.provider : "", is_remote_track ? remote_meta.track_id : "");
 }
 
 static void play_track_at_from(int index, double start_seconds) {
@@ -6049,7 +6127,7 @@ static void play_track_at_from(int index, double start_seconds) {
                                      (long) (audio_get_duration_seconds() * 1000.0));
     hiby_sys_server_report_position((long) (start_seconds * 1000.0));
 #endif
-    notify_plugin_track_started(&meta);
+    notify_plugin_track_started(&meta, path);
 
     set_play_button_state(true);
     /* Manual next/previous and a deferred startup resume can already be on
@@ -6057,8 +6135,18 @@ static void play_track_at_from(int index, double start_seconds) {
      * just because playback is being (re)started there. */
     if (lv_screen_active() != player_screen) nav_push(player_screen);
 
-    snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", path);
-    current_settings.last_position = start_seconds;
+    /* A remote track's stream_url can expire or be single-use -- resuming
+     * into it blind on next launch can't work the way resuming a local
+     * file (or even a Subsonic stream, which at least re-derives its own
+     * salted URL from a stable server+song id) can. Leave last_track
+     * untouched rather than saving a synthetic key that build_saved_
+     * resume_playlist() has no way to turn back into a playable URL --
+     * same "don't build expiring-URL-aware resume in this pass" scope
+     * call as everywhere else remote tracks touch existing machinery. */
+    if (!remote_track_path_is_remote(path)) {
+        snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", path);
+        current_settings.last_position = start_seconds;
+    }
     settings_save(&current_settings);
 }
 
@@ -6081,12 +6169,16 @@ static void on_track_auto_advanced(int index) {
                                      (long) (audio_get_duration_seconds() * 1000.0));
     hiby_sys_server_report_position(0);
 #endif
-    notify_plugin_track_started(&meta);
+    notify_plugin_track_started(&meta, playlist_path_at(index));
 
     set_play_button_state(true);
 
-    snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist_path_at(index));
-    current_settings.last_position = 0.0;
+    /* See play_track_at_from()'s own comment on why a remote track's
+     * synthetic key is never saved as last_track. */
+    if (!remote_track_path_is_remote(playlist_path_at(index))) {
+        snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist_path_at(index));
+        current_settings.last_position = 0.0;
+    }
     settings_save(&current_settings);
 }
 
@@ -6636,6 +6728,7 @@ static void poll_bt_connect(void);
 static void poll_bt_forget(void);
 static void poll_library_rescan(void);
 static void poll_usb_mode_switch(void);
+static void poll_usb_storage_hotplug(void);
 static void poll_sd_card_hotplug(void);
 static void poll_sd_format(void);
 static void poll_import_web_stop(void);
@@ -7555,6 +7648,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_import_web_stop();
     poll_sleep_timer();
     poll_usb_mode_switch();
+    poll_usb_storage_hotplug();
     poll_sd_card_hotplug();
     poll_cover_decode();
     poll_lyrics_load();
@@ -7960,6 +8054,59 @@ void gui_plugin_play_paths(const char * const * paths, int count, int start_inde
 
     char ** new_playlist = malloc(sizeof(char *) * count);
     for (int i = 0; i < count; i++) new_playlist[i] = strdup(paths[i]);
+    on_file_selected(new_playlist, count, start_index);
+}
+
+/* Same shape as gui_plugin_play_paths() above, for a remote-provider queue
+ * (plugin.play_remote()/queue_remote_list()): builds one synthetic
+ * "remote://<provider>/<track_id>" playlist[] entry per track (see
+ * remote_track.h's own comment on why this, not the real stream_url, is
+ * what playlist[]/last_track/Favorites ever see) and publishes the
+ * matching descriptor table before handing off to the same on_file_
+ * selected() every other play-launch path uses. plugin_manager.c has
+ * already validated every field (bounded lengths, non-empty provider/
+ * track_id) before calling this -- this function re-validates anyway
+ * (every remote_track_make_key() result checked, no unconditional malloc)
+ * rather than trusting a caller-supplied invariant, since a NULL/failed
+ * allocation or an unvalidated key here would otherwise reach strdup()
+ * with an uninitialized buffer.
+ *
+ * Nothing is published until the ENTIRE new queue (both the playlist[]
+ * strings and the remote_track_meta_t table) is ready to go: new_playlist
+ * is fully built (and freed again on any failure) before
+ * remote_track_meta_set_all() is even called, and that call's own
+ * all-or-nothing publish (see its own comment) means a malformed or OOM
+ * failure at either step leaves whatever was already playing completely
+ * untouched, never a playlist[] that references a since-replaced (or
+ * never-published) remote_track_meta_t table. */
+void gui_plugin_play_remote_tracks(const remote_track_meta_t * tracks, int count, int start_index) {
+    if (count <= 0) return;
+    if (start_index < 0) start_index = 0;
+    if (start_index >= count) start_index = count - 1;
+
+    char ** new_playlist = malloc(sizeof(char *) * (size_t) count);
+    if (!new_playlist) return;
+
+    int built = 0;
+    for (; built < count; built++) {
+        char key[256];
+        if (!remote_track_make_key(tracks[built].provider, tracks[built].track_id, key, sizeof(key))) break;
+        new_playlist[built] = strdup(key);
+        if (!new_playlist[built]) break;
+    }
+    if (built != count) {
+        for (int j = 0; j < built; j++) free(new_playlist[j]);
+        free(new_playlist);
+        return;
+    }
+
+    if (!remote_track_meta_set_all(tracks, count)) {
+        for (int j = 0; j < count; j++) free(new_playlist[j]);
+        free(new_playlist);
+        return;
+    }
+
+    clear_player_source(); /* a remote queue has no on-device list to go back to -- same as a Subsonic stream queue */
     on_file_selected(new_playlist, count, start_index);
 }
 
@@ -9608,7 +9755,7 @@ static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path
 
     /* The worker may be in uninterruptible I/O. Do not touch/free its state.
      * Its uniquely named spool can be orphaned safely and removed on a later
-     * maintenance pass; critically, it owns no SQLite handle or GUI memory. */
+     * maintenance pass; critically, it owns no tagcache lock or GUI memory. */
     fprintf(stderr, "Warning: scan of %s stalled with no progress for %ds (possible filesystem corruption)\n",
             root, LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS / 1000);
     return false;
@@ -9674,20 +9821,15 @@ static int library_scan_progress_total = 0;
  * books. */
 static void rescan_books(void);
 
-/* Refreshes the persistent playlist cache (metadata_db.c) from a real
- * recursive scan of MUSIC_ROOT_DIR -- folded into library_scan_once() just
- * below, same as rescan_books() above, so it runs at boot and on an
- * explicit Settings > Update Music Database rescan, never on the fast
- * cache-only boot path (library_load_from_cache_only()) or on every
- * Playlists screen visit -- that per-visit live scan was the real-device-
- * reported ~5s-to-open bug this fixes, see metadata_db_playlist_replace_
- * all()'s own comment. Ordinary in-app playlist create/delete
- * (playlist_files_create()/playlist_files_delete() call sites) update the
- * cache with a single-row insert/delete instead of calling this. */
+/* Refreshes the persistent playlist cache (metadata_db.c) from
+ * PLAYLISTS_DIR only (the SD card's Playlists folder), not a walk of the
+ * whole music tree. Folded into library_scan_once() so it runs on Update
+ * Music Database. Ordinary in-app create/delete update the cache with a
+ * single insert/delete instead of calling this. */
 static void rescan_playlists(void) {
     char ** paths = NULL;
     int count = 0;
-    playlist_files_scan(MUSIC_ROOT_DIR, &paths, &count);
+    playlist_files_scan(PLAYLISTS_DIR, &paths, &count);
     metadata_db_playlist_replace_all(paths, count);
     for (int i = 0; i < count; i++) free(paths[i]);
     free(paths);
@@ -9738,7 +9880,8 @@ static void library_scan_once(void) {
         return;
     }
 
-    metadata_db_end_update();
+    if (!metadata_db_end_update())
+        fprintf(stderr, "Warning: music database commit failed -- keeping last on-disk library\n");
 
     library_load_from_cache_only();
 }
@@ -9754,8 +9897,8 @@ static void library_scan_once(void) {
  * enough that this app had never once survived a genuine cold boot in this
  * project's history -- no hardware watchdog would tolerate that delay, on
  * any user's library of meaningful size. metadata_db_open() itself stays
- * here (not removed): its own stock-db warm-start import (metadata_db.c)
- * is plain bounded SQLite row reads, not per-file filesystem I/O, and
+ * here (not removed): opening the on-disk tagcache (metadata_db.c) is
+ * a bounded index load, not per-file filesystem I/O, and
  * finishes in well under a second even for a large library -- it's
  * specifically the filesystem walk + per-file tag-parsing pass that had to
  * move to the user-triggered-only path. All four library screens (All
@@ -9770,6 +9913,9 @@ static void library_load_from_cache_only(void) {
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
 
+    /* Close first so a remounted card is not served from a still-open
+     * handle against the previous (or empty unmounted) mount. */
+    metadata_db_close();
     metadata_db_open();
 }
 
@@ -11573,7 +11719,10 @@ static void * subsonic_library_download_thread_func(void * arg) {
             success_count++;
             if (req->playlist_name[0] != '\0') {
                 if (playlist_first) {
-                    playlist_files_create(PLAYLISTS_DIR, req->playlist_name, dest_path, playlist_m3u_path, sizeof(playlist_m3u_path));
+                    if (playlist_files_create(PLAYLISTS_DIR, req->playlist_name, dest_path, playlist_m3u_path,
+                                              sizeof(playlist_m3u_path))) {
+                        metadata_db_playlist_insert_one(playlist_m3u_path);
+                    }
                     playlist_first = false;
                 } else if (playlist_m3u_path[0] != '\0') {
                     playlist_files_append(playlist_m3u_path, dest_path);
@@ -12698,10 +12847,12 @@ static void poll_subsonic_connect(void) {
         snprintf(current_settings.subsonic_password, sizeof(current_settings.subsonic_password), "%s",
                  subsonic_connect_pending_server.password);
         current_settings.subsonic_verify_tls = subsonic_connect_pending_server.verify_tls;
-        settings_save(&current_settings);
-
         metadata_db_subsonic_server_save(subsonic_connect_pending_server.base_url, subsonic_connect_pending_server.username,
                                           subsonic_connect_pending_server.password, subsonic_connect_pending_server.verify_tls);
+        settings_subsonic_server_upsert(&current_settings, subsonic_connect_pending_server.base_url,
+                                        subsonic_connect_pending_server.username, subsonic_connect_pending_server.password,
+                                        subsonic_connect_pending_server.verify_tls);
+        settings_save(&current_settings);
 
         /* Subsonic screen redesign: lands on a menu (Artists/Playlists/
          * Albums) rather than jumping straight into the artist list --
@@ -12749,7 +12900,7 @@ static void start_subsonic_connect(const subsonic_server_t * server) {
 }
 
 /* ---- Saved Servers -- every server metadata_db_subsonic_server_save() has
- * ever remembered a successful connection for (see poll_subsonic_connect()
+ * remembered after a successful connect (see poll_subsonic_connect()
  * above), listed by URL; tapping one reconnects with its stored
  * credentials via the same start_subsonic_connect() the New Connection
  * form below also uses. ---- */
@@ -12915,7 +13066,7 @@ static lv_obj_t * build_subsonic_entry_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "Saved Servers", PILL_ACCESSORY_CHEVRON, false, subsonic_saved_servers_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "New Connection", PILL_ACCESSORY_CHEVRON, false, subsonic_new_connection_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -13085,13 +13236,12 @@ static int album_artists_fetch_page(void * ctx, int offset, int count, compact_l
 
 /* ---- Virtualized local-album thumbnails -------------------------------
  * Only the 20 recycled compact-list rows can request artwork. One worker at
- * a time reads/decodes a representative song's embedded or external cover,
- * while a 32-entry RGB565 LRU cache keeps the visible window plus scroll
- * headroom bounded at ~324 KiB. */
+ * a time reads/decodes a representative song's embedded or Rockbox albumart
+ * file, while a 32-entry RGB565 LRU cache keeps the visible window plus
+ * scroll headroom bounded at ~324 KiB. Persistent sized files live in
+ * MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp. */
 #define ALBUM_THUMBNAIL_PX 72
 #define ALBUM_THUMBNAIL_CACHE_SIZE 32
-#define ALBUM_THUMBNAIL_DISK_MAGIC 0x48415431u /* "HAT1" */
-#define ALBUM_THUMBNAIL_DISK_DIR MUSIC_ROOT_DIR "/.open_hiby_player_thumbnails"
 
 typedef struct {
     int64_t song_id;
@@ -13149,104 +13299,53 @@ static void album_thumbnail_cache_clear(void) {
     album_thumbnail_use_counter = 0;
 }
 
-typedef struct {
-    uint32_t magic;
-    uint16_t width;
-    uint16_t height;
-    uint64_t path_hash;
-    uint64_t source_size;
-    int64_t source_mtime;
-    uint32_t pixel_bytes;
-} album_thumbnail_disk_header_t;
-
-static uint64_t album_thumbnail_path_hash(const char * path) {
-    uint64_t h = 1469598103934665603ULL;
-    for (const unsigned char * p = (const unsigned char *) path; *p; p++) {
-        h ^= *p;
-        h *= 1099511628211ULL;
-    }
-    return h;
+static bool album_thumbnail_sized_cache_hit(const albumart_info_t * info, char * found, size_t found_size) {
+    return albumart_sized_thumb_fresh(info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, found, found_size);
 }
 
-static void album_thumbnail_disk_path(const char * song_path, char * out, size_t out_size,
-                                      uint64_t * out_hash) {
-    uint64_t hash = album_thumbnail_path_hash(song_path);
-    if (out_hash) *out_hash = hash;
-    snprintf(out, out_size, ALBUM_THUMBNAIL_DISK_DIR "/%016llx.rgb565",
-             (unsigned long long) hash);
-}
-
-/* Cache files are disposable derived data. A truncated file (SD removal or
- * power loss during a write) simply fails validation and is decoded again;
- * the temp+rename write prevents a partial file replacing a prior good one. */
-static bool album_thumbnail_disk_load(const char * song_path, uint16_t ** out_pixels) {
+/* Rockbox albumart search, then embedded picture. A successful decode is
+ * written as MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp
+ * so the next pass is a small BMP load instead of a JPEG/PNG decode.
+ * Albums without artist+album tags still decode, but cannot be stored. */
+static bool album_thumbnail_load_or_decode(const song_row_t * song, uint16_t ** out_pixels) {
     *out_pixels = NULL;
-    struct stat source_st;
-    if (stat(song_path, &source_st) != 0) return false;
-    char path[PATH_MAX];
-    uint64_t hash;
-    album_thumbnail_disk_path(song_path, path, sizeof(path), &hash);
-    FILE * f = fopen(path, "rb");
-    if (!f) return false;
-    album_thumbnail_disk_header_t hdr;
-    bool valid = fread(&hdr, sizeof(hdr), 1, f) == 1 &&
-                 hdr.magic == ALBUM_THUMBNAIL_DISK_MAGIC &&
-                 hdr.width == ALBUM_THUMBNAIL_PX && hdr.height == ALBUM_THUMBNAIL_PX &&
-                 hdr.path_hash == hash && hdr.source_size == (uint64_t) source_st.st_size &&
-                 hdr.source_mtime == (int64_t) source_st.st_mtime &&
-                 hdr.pixel_bytes == ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2;
-    uint16_t * pixels = valid ? malloc(hdr.pixel_bytes) : NULL;
-    if (!pixels || fread(pixels, hdr.pixel_bytes, 1, f) != 1) {
-        free(pixels);
-        pixels = NULL;
-        valid = false;
-    }
-    fclose(f);
-    *out_pixels = pixels;
-    return valid;
-}
+    if (!song || !song->path[0]) return false;
 
-static void album_thumbnail_disk_store(const char * song_path, const uint16_t * pixels) {
-    if (!pixels) return; /* don't make newly-added external artwork stale behind a negative disk entry */
-    struct stat source_st;
-    if (stat(song_path, &source_st) != 0) return;
-    mkdir(ALBUM_THUMBNAIL_DISK_DIR, 0755); /* best effort; fopen below is the real check */
-    char path[PATH_MAX], temp_path[PATH_MAX];
-    uint64_t hash;
-    album_thumbnail_disk_path(song_path, path, sizeof(path), &hash);
-    /* The persistent post-scan generator and the visible-row lazy worker
-     * are intentionally allowed to overlap. A single <hash>.tmp name lets
-     * those two writers truncate/write/rename the same inode concurrently,
-     * which can expose a file while the other writer is still modifying it.
-     * Give every attempt its own file; rename() then publishes only a fully
-     * closed cache entry, while a losing concurrent writer merely replaces
-     * it with another complete entry for the same source. */
-    snprintf(temp_path, sizeof(temp_path), ALBUM_THUMBNAIL_DISK_DIR "/%016llx.tmp.XXXXXX",
-             (unsigned long long) hash);
-    int temp_fd = mkstemp(temp_path);
-    if (temp_fd < 0) return;
-    FILE * f = fdopen(temp_fd, "wb");
-    if (!f) {
-        close(temp_fd);
-        unlink(temp_path);
-        return;
+    albumart_info_t info;
+    albumart_info_from_song_row(song, &info);
+
+    char found[PATH_MAX];
+    uint8_t * data = NULL;
+    uint32_t size = 0;
+
+    if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found))) {
+        bool ok = albumart_load_file(found, &data, &size, EXTERNAL_COVER_MAX_BYTES) &&
+                  cover_decode_to_rgb565(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, out_pixels);
+        free(data);
+        return ok;
     }
-    album_thumbnail_disk_header_t hdr = {
-        .magic = ALBUM_THUMBNAIL_DISK_MAGIC,
-        .width = ALBUM_THUMBNAIL_PX,
-        .height = ALBUM_THUMBNAIL_PX,
-        .path_hash = hash,
-        .source_size = (uint64_t) source_st.st_size,
-        .source_mtime = (int64_t) source_st.st_mtime,
-        .pixel_bytes = ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2
-    };
-    bool ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1 &&
-              fwrite(pixels, hdr.pixel_bytes, 1, f) == 1;
-    if (fclose(f) != 0) ok = false;
-    if (ok) rename(temp_path, path);
-    else {
-        unlink(temp_path);
+
+    if (albumart_search_files(&info, "", found, sizeof(found)))
+        albumart_load_file(found, &data, &size, EXTERNAL_COVER_MAX_BYTES);
+
+    track_metadata_t meta;
+    memset(&meta, 0, sizeof(meta));
+    if (!data) {
+        metadata_read(song->path, &meta);
+        data = meta.picture_data;
+        size = meta.picture_size;
+        meta.picture_data = NULL;
+        if (!info.artist[0]) snprintf(info.artist, sizeof(info.artist), "%s", meta.artist);
+        if (!info.album[0]) snprintf(info.album, sizeof(info.album), "%s", meta.album);
+        if (!info.albumartist[0]) snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
     }
+    bool ok = data && size &&
+              cover_decode_to_rgb565(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, out_pixels);
+    free(data);
+    free(meta.lyrics);
+    if (ok && *out_pixels)
+        albumart_store_rgb565(&info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, *out_pixels);
+    return ok;
 }
 
 static void * album_thumbnail_thread_func(void * arg) {
@@ -13256,23 +13355,8 @@ static void * album_thumbnail_thread_func(void * arg) {
     album_thumbnail_request_t * req = (album_thumbnail_request_t *) arg;
     uint16_t * pixels = NULL;
     song_row_t song;
-    if (metadata_db_get_song_by_id(req->song_id, &song)) {
-        if (!album_thumbnail_disk_load(song.path, &pixels)) {
-            track_metadata_t meta;
-            metadata_read(song.path, &meta);
-            if ((!meta.picture_data || meta.picture_size == 0)) {
-                free(meta.picture_data);
-                meta.picture_data = NULL;
-                load_external_cover(song.path, &meta.picture_data, &meta.picture_size);
-            }
-            if (meta.picture_data && meta.picture_size)
-                cover_decode_to_rgb565(meta.picture_data, meta.picture_size,
-                                       ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, &pixels);
-            free(meta.picture_data);
-            free(meta.lyrics);
-            album_thumbnail_disk_store(song.path, pixels);
-        }
-    }
+    if (metadata_db_get_song_by_id(req->song_id, &song))
+        album_thumbnail_load_or_decode(&song, &pixels);
     album_thumbnail_result_song_id = req->song_id;
     album_thumbnail_result_generation = req->generation;
     album_thumbnail_result_logical_index = req->logical_index;
@@ -13290,25 +13374,21 @@ static void * album_thumbnail_thread_func(void * arg) {
 }
 
 /* ---- Persistent (post-scan) album thumbnail generation ----------------
- * NEXT_TODO_IMPLEMENTATION_PROMPT.md Task 2. Runs once after Update Music
- * Database completes (never before -- see this file's own call site,
- * placed right after the scan thread is joined and the database is
- * already fully committed), generating the SAME 72x72 RGB565 disk cache
- * entries (album_thumbnail_disk_load()/_disk_store() above) the existing
- * LAZY per-row generation already produces one row at a time -- so
- * browsing Albums right after a scan shows artwork immediately instead of
- * only as each row happens to scroll into view. Reuses metadata_db_get_
- * albums_page_filtered(NULL, ...) (streamed/paged, never the whole table
- * at once) grouped by (album, album_artist) -- the same grouping and
- * first_song_id the Album Artist -> Albums drill-down's own query
- * produces for the same pair, so that screen automatically gets the same
- * cached thumbnails with no extra work here. Entirely worker-thread-side:
- * metadata_db_get_albums_page_filtered()/metadata_db_get_song_by_id()/
- * metadata_read()/load_external_cover()/cover_decode_to_rgb565()/
- * album_thumbnail_disk_load()/_disk_store() never touch LVGL. Lazy
- * generation stays exactly as it was, as the fallback for whatever this
- * pass didn't reach (interrupted by a newer scan, artwork missing/changed
- * since, or simply never run). */
+ * Runs once after Update Music Database completes (never before -- see
+ * this file's own call site, placed right after the scan thread is joined
+ * and the database is already fully committed), writing the same Rockbox
+ * sized BMP files album_thumbnail_load_or_decode() produces one row at a
+ * time -- so browsing Albums right after a scan shows artwork immediately
+ * instead of only as each row happens to scroll into view. Reuses
+ * metadata_db_get_albums_page_filtered(NULL, ...) (streamed/paged, never
+ * the whole table at once) grouped by (album, album_artist) -- the same
+ * grouping and first_song_id the Album Artist -> Albums drill-down's own
+ * query produces for the same pair, so that screen automatically gets the
+ * same cached thumbnails with no extra work here. Entirely worker-thread-
+ * side: metadata_db / albumart / cover_decode never touch LVGL. Lazy
+ * generation stays as the fallback for whatever this pass didn't reach
+ * (interrupted by a newer scan, artwork missing/changed since, or simply
+ * never run). */
 static pthread_t album_thumb_gen_thread;
 /* active/cancel/generation cross the UI/worker boundary and therefore must
  * be real atomics, not volatile. thread_joinable is owned by the UI thread:
@@ -13320,8 +13400,6 @@ static atomic_int album_thumb_gen_generation;
 static bool album_thumb_gen_thread_joinable;
 static atomic_int album_thumb_gen_done_count;
 static atomic_int album_thumb_gen_total_count;
-static bool album_thumb_gen_progress_pending;
-static bool album_thumb_gen_progress_abandoned;
 
 static bool album_thumb_gen_should_cancel(int my_generation) {
     return atomic_load(&album_thumb_gen_cancel) ||
@@ -13349,6 +13427,8 @@ static void * album_thumb_gen_thread_func(void * arg) {
     atomic_store(&album_thumb_gen_done_count, 0);
 
 #define ALBUM_THUMB_GEN_BATCH 64
+#define ALBUM_THUMB_GEN_WARM_LIMIT 2048
+#define ALBUM_THUMB_GEN_YIELD_US 10000
     group_row_t rows[ALBUM_THUMB_GEN_BATCH];
     int offset = 0;
     for (;;) {
@@ -13369,49 +13449,39 @@ static void * album_thumb_gen_thread_func(void * arg) {
                 atomic_fetch_add(&album_thumb_gen_done_count, 1);
                 continue;
             }
-            /* Do not regenerate a valid cache entry -- same validation
-             * (path hash + source size + mtime) the lazy path itself
-             * checks, so an interrupted-then-resumed pass, or a re-run
-             * over an already-fully-generated library, does no wasted
-             * decode work at all. */
-            uint16_t * existing = NULL;
-            if (album_thumbnail_disk_load(song.path, &existing)) {
-                free(existing);
+            /* Skip albums that already have a Rockbox sized BMP. Same
+             * search the lazy path uses, so an interrupted-then-resumed
+             * pass, or a re-run over an already-fully-generated library,
+             * does no wasted decode work. */
+            albumart_info_t info;
+            albumart_info_from_song_row(&song, &info);
+            char found[PATH_MAX];
+            if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found))) {
 #ifdef UI_PERF_TRACE
                 perf_skipped++;
 #endif
                 atomic_fetch_add(&album_thumb_gen_done_count, 1);
                 continue;
             }
-            track_metadata_t meta;
-            memset(&meta, 0, sizeof(meta));
-            metadata_read(song.path, &meta);
-            if (!meta.picture_data || meta.picture_size == 0) {
-                free(meta.picture_data);
-                meta.picture_data = NULL;
-                load_external_cover(song.path, &meta.picture_data, &meta.picture_size);
-            }
             uint16_t * pixels = NULL;
-            if (meta.picture_data && meta.picture_size) {
-                cover_decode_to_rgb565(meta.picture_data, meta.picture_size,
-                                       ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, &pixels);
-            }
-            free(meta.picture_data);
-            free(meta.lyrics);
-            /* No-op (per its own guard) when pixels is NULL -- an album
-             * with no resolvable art stays a lazy negative-cache case
+            album_thumbnail_load_or_decode(&song, &pixels);
+            /* No-op store when pixels is NULL -- an album with no
+             * resolvable art stays a lazy negative-cache case
              * (album_thumbnail_cache_find()'s own known-but-NULL entry),
-             * never persisted to disk as a permanent "no art" result, so
-             * artwork added later is picked up normally. */
-            album_thumbnail_disk_store(song.path, pixels);
+             * never persisted as a permanent "no art" result, so artwork
+             * added later is picked up normally. */
 #ifdef UI_PERF_TRACE
             if (pixels) perf_generated++; else perf_failed++;
 #endif
             free(pixels);
             atomic_fetch_add(&album_thumb_gen_done_count, 1);
+            /* This is cache warming, not foreground scan work. Yield after
+             * every album so sustained decoding and SD writes cannot starve
+             * audio/UI work or pin the CPU at full load for minutes. */
+            usleep(ALBUM_THUMB_GEN_YIELD_US);
         }
         offset += n;
-        if (n < ALBUM_THUMB_GEN_BATCH) break;
+        if (n < ALBUM_THUMB_GEN_BATCH || offset >= ALBUM_THUMB_GEN_WARM_LIMIT) break;
     }
 done:
 #ifdef UI_PERF_TRACE
@@ -13437,6 +13507,7 @@ static void start_album_thumbnail_generation(void) {
 
     int artist_count = 0, album_artist_count = 0, album_count = 0;
     metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
+    if (album_count > ALBUM_THUMB_GEN_WARM_LIMIT) album_count = ALBUM_THUMB_GEN_WARM_LIMIT;
     atomic_store(&album_thumb_gen_done_count, 0);
     atomic_store(&album_thumb_gen_total_count, album_count);
     atomic_store(&album_thumb_gen_cancel, false);
@@ -13454,6 +13525,15 @@ static void start_next_album_thumbnail(void) {
     if (!album_thumbnail_active_list ||
         !album_thumbnail_list_is_visible(album_thumbnail_active_list) ||
         album_thumbnail_scrolling || album_thumbnail_active || album_thumbnail_queue_count <= 0) return;
+    /* Never run two full cover decoders at once on the 56 MiB target. The
+     * post-load warmer can still be finishing its current album after the
+     * Albums screen opens; its cancellation is cooperative. Keep this poll
+     * timer alive and give the visible-row job priority as soon as that
+     * worker exits instead of doubling peak JPEG/PNG memory. */
+    if (atomic_load(&album_thumb_gen_active)) {
+        if (album_thumbnail_poll_timer) lv_timer_resume(album_thumbnail_poll_timer);
+        return;
+    }
     album_thumbnail_request_t * req = malloc(sizeof(*req));
     if (!req) return;
     *req = album_thumbnail_queue[0];
@@ -13498,6 +13578,10 @@ static void album_thumbnail_scroll_cb(lv_event_t * e) {
 }
 
 static void album_thumbnail_begin_screen(lv_obj_t * list) {
+    /* Visible rows are latency-sensitive and the lazy path already writes
+     * the identical persistent entries. Stop warming after its current
+     * decode, then let start_next_album_thumbnail() service this screen. */
+    cancel_album_thumbnail_generation();
     album_thumbnail_active_list = list;
     album_thumbnail_scrolling = false;
     album_thumbnail_queue_count = 0;
@@ -13515,7 +13599,12 @@ static void album_thumbnail_end_screen(lv_obj_t * list) {
 }
 
 static void album_thumbnail_poll_cb(lv_timer_t * timer) {
-    if (!album_thumbnail_active || !album_thumbnail_done) return;
+    if (!album_thumbnail_active) {
+        start_next_album_thumbnail();
+        if (!album_thumbnail_active && !atomic_load(&album_thumb_gen_active)) lv_timer_pause(timer);
+        return;
+    }
+    if (!atomic_load(&album_thumbnail_done)) return;
     pthread_join(album_thumbnail_thread, NULL);
     album_thumbnail_active = false;
 
@@ -13532,7 +13621,21 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
             }
         }
         album_thumbnail_cache_entry_t * e = &album_thumbnail_cache[victim];
-        free(e->pixels);
+        uint8_t * retired_pixels = e->pixels;
+        if (retired_pixels) {
+            /* A leading lv_image can retain &e->dsc after its row last ran
+             * the decorator. Freeing pixels first made that image descriptor
+             * point into released heap memory until the row happened to be
+             * recycled: a redraw/scroll use-after-free on libraries larger
+             * than the LRU. Mark this as a known no-art entry temporarily and
+             * repaint every visible row so all references are detached before
+             * releasing/reusing the slot. */
+            e->pixels = NULL;
+            e->dsc.data = NULL;
+            if (album_thumbnail_active_list)
+                compact_list_refresh_visible(album_thumbnail_active_list);
+            free(retired_pixels);
+        }
         memset(e, 0, sizeof(*e));
         e->song_id = album_thumbnail_result_song_id;
         e->known = true;
@@ -13560,17 +13663,29 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
 
 static void album_row_thumbnail_decorator(lv_obj_t * list, lv_obj_t * row, lv_obj_t * image,
                                            int logical_index, int pool_slot, int64_t song_id, void * ctx) {
-    (void) logical_index; (void) pool_slot; (void) ctx;
+    (void) pool_slot; (void) ctx;
     /* 14px card inset + 72px cover + 14px breathing room before text. */
     lv_obj_set_style_pad_left(row, 100, 0);
+    if (song_id <= 0) {
+        lv_obj_add_flag(image, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
     album_thumbnail_cache_entry_t * cached = album_thumbnail_cache_find(song_id);
     if (cached && cached->pixels) {
         lv_image_set_src(image, &cached->dsc);
         lv_image_set_scale(image, LV_SCALE_NONE);
         lv_obj_remove_flag(image, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_image_set_src(image, asset_path("touch_list/list_default_album.png"));
-        lv_image_set_scale(image, (ALBUM_THUMBNAIL_PX * LV_SCALE_NONE) / 72);
+        const void * src = asset_path("touch_list/list_default_album.png");
+        lv_image_set_src(image, src);
+        /* Scale from the asset's own width. A hardcoded /72 assumed the PNG
+         * was already 72px; LV_IMAGE_ALIGN_STRETCH before set_src divided by
+         * img->w=0 and killed the process during build_albums_screen(). */
+        lv_image_header_t header;
+        int32_t src_w = 72;
+        if (lv_image_decoder_get_info(src, &header) == LV_RESULT_OK && header.w > 0)
+            src_w = header.w;
+        lv_image_set_scale(image, (ALBUM_THUMBNAIL_PX * LV_SCALE_NONE) / src_w);
         lv_obj_remove_flag(image, LV_OBJ_FLAG_HIDDEN);
         int32_t scroll_y = lv_obj_get_scroll_y(list);
         int32_t row_y = lv_obj_get_y(row);
@@ -13679,14 +13794,17 @@ static lv_obj_t * build_albums_screen(void) {
     compact_list_set_row_height(albums_list, MUSIC_LIST_ROW_HEIGHT);
     int artist_count = 0, album_artist_count = 0, album_count = 0;
     metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
-    compact_list_set_paged_provider(albums_list, albums_fetch_page, NULL, album_count);
     album_thumbnail_generation++;
     album_thumbnail_cache_clear();
     if (!album_thumbnail_poll_timer) {
         album_thumbnail_poll_timer = lv_timer_create(album_thumbnail_poll_cb, 50, NULL);
         lv_timer_pause(album_thumbnail_poll_timer);
     }
+    /* Decorator before the paged provider so the first (now synchronous)
+     * window fill already has pad_left=100 and the 72px cover slot; names
+     * then lay out to the right of the art instead of under it. */
     compact_list_set_row_decorator(albums_list, album_row_thumbnail_decorator, NULL);
+    compact_list_set_paged_provider(albums_list, albums_fetch_page, NULL, album_count);
     lv_obj_add_event_cb(scr, album_thumbnail_screen_loaded_cb, LV_EVENT_SCREEN_LOADED, albums_list);
     lv_obj_add_event_cb(scr, album_thumbnail_screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, albums_list);
     lv_obj_add_event_cb(albums_list, album_thumbnail_scroll_cb, LV_EVENT_SCROLL_BEGIN, NULL);
@@ -13845,10 +13963,8 @@ static void poll_az_index_drag(lv_timer_t * timer) {
          * starting with a letter -- the display offset of the first
          * matching entry, or the nearest one after it if that exact letter
          * has no entries ("jump forward to nearest match"). Computed fresh
-         * on every touch-down via indexed boundary COUNT(*) queries
-         * (metadata_db_get_az_table()) rather than a linear scan of an
-         * in-memory array, so dragging the A-Z strip never needs to load
-         * one. */
+         * on every touch-down from the already-sorted in-memory index
+         * (metadata_db_get_az_table()). */
         metadata_db_get_az_table(b->db_kind, az_index_jump_table);
         lv_obj_remove_flag(b->popup, LV_OBJ_FLAG_HIDDEN);
     } else if (!pressed) {
@@ -13969,8 +14085,8 @@ static bool search_matches(const char * haystack, const char * needle) {
 
 /* ---- Live search: async DB query for db_backed bindings -------------
  * Efficiency finding: metadata_db_search_names()'s query shape (a
- * ROW_NUMBER() window function wrapped in a leading-wildcard LIKE) can't be
- * pushed down by SQLite -- it's a full table/GROUP BY scan every time this
+ * ROW_NUMBER() window function wrapped in a leading-wildcard LIKE) is
+ * a full tagcache scan every time this
  * runs. Used to run synchronously, directly on the UI thread, once per
  * keystroke; now debounced (search_debounce_timer below, same one-shot-
  * timer idiom as pending_progress_seek_timer above) so a burst of
@@ -14410,9 +14526,8 @@ static void files_search_row_click_cb(int display_index) {
  * released immediately.
  *
  * User-created .m3u playlists (Player screen's "Add to Playlist", or
- * dropped onto the SD card by hand) are listed below those two via
- * playlist_files_scan() -- already used for the Add to Playlist picker,
- * just not previously surfaced anywhere for actually playing one. ---- */
+ * dropped into MUSIC_ROOT_DIR/Playlists by hand) are listed below those
+ * from that folder only. ---- */
 
 #define MOST_PLAYED_LIMIT 20
 #define RECENTLY_ADDED_LIMIT 50
@@ -14800,10 +14915,7 @@ static void populate_playlists_screen(void) {
     free(playlists_m3u_paths);
     playlists_m3u_paths = NULL;
     playlists_m3u_count = 0;
-    /* Persistent cache read (metadata_db.c), not a live playlist_files_scan()
-     * -- real-device feedback: this screen took up to 5s to open because it
-     * re-walked the whole SD card every visit. See rescan_playlists()'s own
-     * comment for where the cache actually gets refreshed. */
+    /* Persistent cache of PLAYLISTS_DIR only -- see rescan_playlists(). */
     metadata_db_load_all_playlists(&playlists_m3u_paths, &playlists_m3u_count);
 
     lv_label_set_text(playlists_edit_btn, playlists_edit_mode ? "Done" : "Edit");
@@ -15017,12 +15129,6 @@ static void start_library_rescan(void) {
      * now) is what actually pthread_join()s it -- see start_album_
      * thumbnail_generation()'s own comment. */
     cancel_album_thumbnail_generation();
-    /* If this replaces a still-visible post-scan thumbnail phase, ownership
-     * of the shared progress screen immediately returns to the new database
-     * scan. The cancelled worker is joined when the new post-scan pass is
-     * started, before its pthread_t can be reused. */
-    album_thumb_gen_progress_pending = false;
-    album_thumb_gen_progress_abandoned = true;
     library_rescan_done_flag = false;
     library_rescan_active = true;
     lv_label_set_text(subsonic_downloading_label, "Updating\nmusic database...");
@@ -15130,29 +15236,18 @@ static void refresh_library_screens_after_reload(void) {
  * METADATA_DB_PATH lives ON the SD card itself, not somewhere device-global
  * -- see its own comment -- so a previously-scanned card reinserted here
  * has its own already-populated database sitting right there).
- * library_load_from_cache_only() (a bounded SQLite read, not a filesystem
- * walk -- see its own comment) already does exactly this; the only thing
- * missing was calling it here instead of unconditionally reaching for
- * start_library_rescan(). Falls through to that full scan only if the
- * cache load comes back with nothing -- a genuinely new/never-scanned
- * card, or one whose database failed to open. A plain toast rather than
- * the "Updating music database..." screen start_library_rescan() shows --
- * this is a reload the user didn't explicitly ask for, over before they'd
- * even notice a progress screen, so pushing/popping that screen would just
- * yank them away from whatever they're actually doing right now for no
- * reason. */
+ * library_load_from_cache_only() (a bounded tagcache read, not a filesystem
+ * walk -- see its own comment) already does exactly this. A missing or
+ * empty database leaves the library empty; Settings > Update Music
+ * Database is the only path that walks files. A toast rather than the
+ * "Updating music database..." screen -- this is a reload the user did
+ * not ask for. */
 static void reload_library_on_sd_reinsert(void) {
     library_load_from_cache_only();
-    /* metadata_db_get_song_count() (a cheap COUNT(*) against the freshly
-     * opened DB) is what decides "does this card have a usable cache"
-     * here -- a real, live read of the reopened database, not a cached
-     * in-memory count that could be stale or unset at this point. */
+    refresh_library_screens_after_reload();
     if (metadata_db_get_song_count() > 0) {
-        refresh_library_screens_after_reload();
-        show_info_toast("Library updated");
-        start_album_thumbnail_generation(); /* database already known-good here -- see this function's own comment */
-    } else {
-        start_library_rescan();
+        show_info_toast("Library loaded");
+        start_album_thumbnail_generation();
     }
 }
 
@@ -15166,10 +15261,8 @@ static void poll_library_rescan(void) {
     /* Cache-only SD reinsertion also starts a generation pass, but has no
      * progress phase of its own. Reap that naturally completed worker here
      * instead of retaining one joinable thread until some future scan. */
-    if (album_thumb_gen_thread_joinable && !album_thumb_gen_progress_pending &&
-        !atomic_load(&album_thumb_gen_active)) {
+    if (album_thumb_gen_thread_joinable && !atomic_load(&album_thumb_gen_active))
         reap_album_thumbnail_generation();
-    }
 
     /* Keep the screen awake for the whole "Updating music database..."/
      * "Library updated" window -- label and progress-bar text updates
@@ -15181,46 +15274,8 @@ static void poll_library_rescan(void) {
      * does now), that read as the whole device freezing -- a dark,
      * touch-unresponsive screen mid-rescan looks identical to a genuine
      * hang from the outside. */
-    if (library_rescan_active || library_rescan_success_pending ||
-        (album_thumb_gen_progress_pending && !album_thumb_gen_progress_abandoned &&
-         lv_screen_active() == subsonic_downloading_screen)) {
+    if (library_rescan_active || library_rescan_success_pending)
         lv_display_trigger_activity(NULL);
-    }
-
-    /* Thumbnail generation is a separate, optional post-scan phase. The
-     * scan has already committed successfully before this state is entered.
-     * The home gesture is enabled because library_rescan_active is false;
-     * once the user leaves, keep generating in the background but never
-     * pull them back to this shared interstitial on completion. */
-    if (album_thumb_gen_progress_pending) {
-        bool showing_progress = lv_screen_active() == subsonic_downloading_screen &&
-                                !album_thumb_gen_progress_abandoned;
-        if (!showing_progress) album_thumb_gen_progress_abandoned = true;
-
-        int done = atomic_load(&album_thumb_gen_done_count);
-        int total = atomic_load(&album_thumb_gen_total_count);
-        if (showing_progress) {
-            lv_label_set_text_fmt(subsonic_downloading_label,
-                                  "Generating album thumbnails...\n%d / %d", done, total);
-            lv_bar_set_value(subsonic_downloading_progress_bar,
-                             total > 0 ? (int32_t) ((int64_t) done * 100 / total) : 0,
-                             LV_ANIM_OFF);
-        }
-
-        if (atomic_load(&album_thumb_gen_active)) return;
-        reap_album_thumbnail_generation();
-        album_thumb_gen_progress_pending = false;
-        if (showing_progress) {
-            lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text_fmt(subsonic_downloading_label, "Library updated\n%lld songs",
-                                  (long long) metadata_db_get_song_count());
-            library_rescan_success_pending = true;
-            library_rescan_success_since_tick = lv_tick_get();
-        } else {
-            show_info_toast("Album thumbnails updated");
-        }
-        return;
-    }
 
     if (library_rescan_success_pending) {
         if (lv_tick_elaps(library_rescan_success_since_tick) >= LIBRARY_RESCAN_SUCCESS_MS) {
@@ -15251,18 +15306,16 @@ static void poll_library_rescan(void) {
     pthread_join(library_rescan_thread, NULL);
 
     refresh_library_screens_after_reload();
-    /* NEXT_TODO_IMPLEMENTATION_PROMPT.md Task 2 -- the database is fully
-     * committed at this point (the scan thread has already been joined),
-     * so it's safe to start the optional post-scan thumbnail-generation
-     * pass now; database success above never depended on this, and never
-     * will -- see start_album_thumbnail_generation()'s own comment. */
+    /* Thumbnail generation is optional cache warming. It must not become a
+     * second user-visible phase after "Updating music database..." -- no
+     * progress screen, no toast. The worker yields and cancels when Albums
+     * opens so visible-row decode stays first. */
     start_album_thumbnail_generation();
-    album_thumb_gen_progress_pending = true;
-    album_thumb_gen_progress_abandoned = false;
-    lv_obj_remove_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text_fmt(subsonic_downloading_label, "Generating album thumbnails...\n0 / %d",
-                          atomic_load(&album_thumb_gen_total_count));
-    lv_bar_set_value(subsonic_downloading_progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_add_flag(subsonic_downloading_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text_fmt(subsonic_downloading_label, "Library updated\n%lld songs",
+                          (long long) metadata_db_get_song_count());
+    library_rescan_success_pending = true;
+    library_rescan_success_since_tick = lv_tick_get();
 }
 
 /* SD mount-failure detection + Format SD Card -- see poll_sd_card_hotplug()
@@ -15299,18 +15352,17 @@ static volatile bool sd_format_active = false;
  * seconds instead of waiting on whatever slow reactive mechanism the OS
  * has -- harmless to call when nothing's inserted (see that function's own
  * comment: it just fails silently). On the unmounted -> mounted edge, it
- * kicks off the same rescan Settings > Update Music Database triggers, so
- * a card inserted after boot actually shows up without the user needing
- * to know to go find that button.
+ * loads the tagcache already on that card (if any). It does not start
+ * Settings > Update Music Database -- a full walk is user-triggered only.
  *
  * Real-device feature request (2026-08-08): removal wasn't handled at all
  * symmetrically -- pulling the card left All Songs/Artists/Albums/
  * Playlists, and the Files screen, still showing entries for files that no
- * longer exist (tapping one would just fail to play), and there was no way
- * back to a correct state short of a manual Settings > Update Music
- * Database rescan. The mounted -> unmounted edge below now fires the same
- * rescan (correctly collapsing to an empty library against an empty
- * mountpoint) plus a Files-screen reset, mirroring the insertion side.
+ * longer exist (tapping one would just fail to play). The mounted ->
+ * unmounted edge now closes the database, rebuilds the library screens
+ * empty, and resets Files -- it must not scan, because a scan against the
+ * empty unmounted directory would write a blank database onto the parent
+ * filesystem and, if the card remounted mid-scan, walk the whole card.
  *
  * That edge relies on sd_card_root_is_mounted() actually flipping to false
  * on a physical eject, which isn't guaranteed on its own: this firmware has
@@ -15401,11 +15453,11 @@ static void poll_sd_card_hotplug(void) {
      * faster than this function's own SD_CARD_MOUNT_POLL_SECONDS poll
      * interval, so a brief unmount (this app's own umount -l retry above,
      * or -- unverified but plausible -- a very fast physical reseat) can
-     * have already remounted again by the time the removal rescan's
-     * background thread actually gets scheduled, making it scan and fully
-     * re-tag the *already-back* real card instead of correctly finding
-     * nothing, exactly the slow full-rescan reload_library_on_sd_reinsert()
-     * below exists to avoid. Requiring the unmounted state to be seen on
+     * have already remounted again by the time the removal handler
+     * actually runs, making it close and reopen against the *already-back*
+     * real card instead of collapsing to empty, which
+     * reload_library_on_sd_reinsert() below exists to do on the insert
+     * edge. Requiring the unmounted state to be seen on
      * SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD consecutive polls (reset to 0 the
      * moment "mounted" is seen again, see the mounted branch below) before
      * acting filters that out -- a genuine removal stays gone far longer
@@ -15441,23 +15493,12 @@ static void poll_sd_card_hotplug(void) {
             cancel_album_thumbnail_generation();
             unmount_confirm_streak++;
             if (unmount_confirm_streak >= SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD && !library_rescan_active) {
-                /* Real-device bug report: metadata_db_open() only ever
-                 * checks `if (db) return;` -- left open across a removal,
-                 * it would keep reusing this now-dead connection (pointing
-                 * at a file on a card that's physically gone) forever
-                 * after, even across a later reinsertion of the same or a
-                 * different card, silently defeating
-                 * reload_library_on_sd_reinsert()'s own cache-load fast
-                 * path below (a query against a dead handle isn't a real
-                 * cache hit). Closing it here -- guarded by the same
-                 * !library_rescan_active this branch already requires, so
-                 * there's no background rescan thread concurrently using
-                 * the connection -- makes the next metadata_db_open()
-                 * (from whichever path runs on the next insertion)
-                 * genuinely reopen fresh against whatever's actually
-                 * mounted by then. */
+                /* Close the SD-resident tagcache so a later reinsert opens
+                 * the files on whichever card is actually mounted, not a
+                 * stale handle. Do not scan: the mountpoint is empty and
+                 * a scan would write a blank database there. */
                 metadata_db_close();
-                start_library_rescan();
+                refresh_library_screens_after_reload();
                 file_browser_reset_to_root();
                 was_mounted = false;
                 unmount_confirm_streak = 0;
@@ -15533,10 +15574,9 @@ static void poll_sd_card_hotplug(void) {
          * nothing ever tells the app's in-memory library to reload. One-
          * shot (not tied to was_mounted) so this can't fire more than once
          * per boot even for a card that's mounted but genuinely has no
-         * music -- reload_library_on_sd_reinsert() falls back to a real
-         * start_library_rescan() when the cache load itself comes back
-         * empty too, which would otherwise repeat forever on every poll
-         * for that case. */
+         * music -- reload_library_on_sd_reinsert() only loads the on-card
+         * database (or leaves the library empty), so an empty card does
+         * not start a repeating full scan. */
         boot_library_recheck_done = true;
         /* metadata_db_get_song_count() (the real database), not
          * all_songs_count -- that's deliberately never populated at boot
@@ -15910,7 +15950,7 @@ static lv_obj_t * build_music_screen(void) {
      * genre.png/genre_s.png here since Genres no longer has a tile of its
      * own to need it. */
     items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
-    lv_obj_t * scr = build_icon_grid_screen("Music", generic_back_cb, items, 6, 100, false);
+    lv_obj_t * scr = build_icon_grid_screen("Music", generic_back_cb, items, 6, 100, false, 0);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -15958,7 +15998,7 @@ static lv_obj_t * build_stream_media_screen(void) {
         };
     }
 
-    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100, false);
+    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100, false, 0);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -17498,6 +17538,9 @@ static bool usb_mode_switch_active = false;
 static volatile bool usb_mode_switch_done_flag = false;
 static volatile bool usb_mode_switch_succeeded = false;
 static usb_mode_t usb_mode_switch_target;
+static bool usb_cable_state_initialized;
+static bool usb_cable_was_connected;
+static bool usb_storage_rebind_pending;
 
 static void usb_mode_option_row_cb(lv_event_t * e);
 static void usb_mode_adb_toggle_cb(lv_event_t * e);
@@ -17616,6 +17659,38 @@ static void poll_usb_mode_switch(void) {
         }
         nav_push(usb_dac_overlay_screen);
     }
+}
+
+/* A fresh boot intentionally has no gadget bound, but previously nothing
+ * reacted when a PC was plugged in: Storage only appeared after manually
+ * switching to DAC/ADB and back, because those taps happened to perform the
+ * missing UDC bind. Reapply Storage on every physical connection edge so a
+ * PC enumerates it immediately. Never override an active DAC/ADB session. */
+static void poll_usb_storage_hotplug(void) {
+    bool connected = usb_mode_control_cable_connected();
+    if (!usb_cable_state_initialized) {
+        usb_cable_state_initialized = true;
+        usb_cable_was_connected = connected;
+        /* Storage is the default gadget when a PC is plugged in, including
+         * a cable already present at boot. ADB and DAC stay opt-in from
+         * Settings; usb_mode_control_apply() tears Storage down first. */
+        usb_storage_rebind_pending = connected;
+    } else if (connected && !usb_cable_was_connected) {
+        usb_storage_rebind_pending = true;
+    }
+    usb_cable_was_connected = connected;
+
+    if (!connected || !usb_storage_rebind_pending || usb_mode_switch_active) return;
+
+    usb_mode_t live_mode;
+    bool have_live_mode = usb_mode_control_detect_current(&live_mode);
+    if (have_live_mode && (live_mode == USB_MODE_DAC || live_mode == USB_MODE_ADB)) {
+        usb_storage_rebind_pending = false;
+        return;
+    }
+
+    usb_storage_rebind_pending = false;
+    start_usb_mode_switch(USB_MODE_STORAGE);
 }
 
 static void usb_mode_option_row_cb(lv_event_t * e) {
@@ -18642,7 +18717,7 @@ static lv_obj_t * build_wireless_screen(void) {
      * rather than just its surrounding whitespace -- lands at very close to
      * these assets' own native 212x190 resolution within this screen's
      * available cell height. */
-    lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6, 160, true);
+    lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6, 160, true, 0);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -18990,7 +19065,7 @@ static lv_obj_t * build_books_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -19077,7 +19152,7 @@ static lv_obj_t * build_about_screen(void) {
     items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -19894,7 +19969,7 @@ static lv_obj_t * build_timezone_region_screen(void) {
         items[i] = (pill_list_item_t){ TIMEZONE_REGIONS[i], PILL_ACCESSORY_CHEVRON, false, timezone_region_row_cb, NULL,
                                         (void *) (intptr_t) i };
     }
-    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -19954,7 +20029,7 @@ static lv_obj_t * build_settings_playback_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -19997,7 +20072,7 @@ static lv_obj_t * build_settings_display_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20036,7 +20111,7 @@ static lv_obj_t * build_settings_power_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20078,7 +20153,7 @@ static lv_obj_t * build_settings_system_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20147,7 +20222,7 @@ static lv_obj_t * build_settings_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20219,7 +20294,7 @@ static lv_obj_t * build_dac_home_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "USB DAC", PILL_ACCESSORY_CHEVRON, false, dac_home_usb_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Bluetooth DAC", PILL_ACCESSORY_CHEVRON, false, bt_dac_settings_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, &style_accent);
+    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, &style_accent, 6);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -20240,7 +20315,7 @@ static lv_obj_t * build_home_screen(void) {
     /* No back_btn_cb -- this is the true root, nothing to go back to. No
      * title either -- matches the real stock launcher, which has no header
      * text above its icon grid. */
-    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, 6, 100, false);
+    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, 6, 100, false, 0);
     finalize_screen_navigation(scr);
     return scr;
 }

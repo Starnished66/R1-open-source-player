@@ -1,4 +1,5 @@
 #include "playlist_files.h"
+#include "path_cache.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -166,28 +167,22 @@ static bool make_relative_path(const char * base_dir, const char * target_abs_pa
     return true;
 }
 
-/* Same depth-first, unsorted-until-the-end approach as text_reader.c's own
- * scan_recursive() -- see its comment for why sorting per-directory would be
- * wasted work. */
-static void scan_recursive(const char * dir_path, char *** paths, int * count, int * capacity) {
+/* Direct children of dir_path only -- playlists live in MUSIC_ROOT_DIR/Playlists,
+ * not scattered through the rest of the card. */
+static void scan_dir(const char * dir_path, char *** paths, int * count, int * capacity) {
     DIR * dir = opendir(dir_path);
     if (!dir) return;
 
     struct dirent * de;
     while ((de = readdir(dir)) != NULL) {
         if (de->d_name[0] == '.') continue;
+        if (!is_m3u_file(de->d_name)) continue;
 
         char full_path[PATH_MAX];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, de->d_name);
 
         struct stat st;
-        if (stat(full_path, &st) != 0) continue;
-
-        if (S_ISDIR(st.st_mode)) {
-            scan_recursive(full_path, paths, count, capacity);
-            continue;
-        }
-        if (!is_m3u_file(de->d_name)) continue;
+        if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
 
         if (*count == *capacity) {
             *capacity = *capacity ? *capacity * 2 : 64;
@@ -211,7 +206,7 @@ bool playlist_files_scan(const char * root, char *** out_paths, int * out_count)
     int count = 0;
     int capacity = 0;
 
-    scan_recursive(root, &paths, &count, &capacity);
+    scan_dir(root, &paths, &count, &capacity);
 
     if (count == 0) {
         free(paths);
@@ -468,4 +463,20 @@ void playlist_files_migrate_to_relative(const char * dir) {
         fclose(marker);
         fsync_dir(dir);
     }
+}
+
+void playlist_files_index_replace(char * const * paths, int count) {
+    path_cache_replace(PATH_CACHE_PLAYLISTS, paths, count);
+}
+
+void playlist_files_index_load(char *** out_paths, int * out_count) {
+    path_cache_load(PATH_CACHE_PLAYLISTS, out_paths, out_count);
+}
+
+void playlist_files_index_insert(const char * path) {
+    path_cache_insert(PATH_CACHE_PLAYLISTS, path);
+}
+
+void playlist_files_index_delete(const char * path) {
+    path_cache_delete(PATH_CACHE_PLAYLISTS, path);
 }

@@ -4,11 +4,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Recursively scans root for .m3u and .m3u8 files, sorted alphabetically by
- * full path -- same contract as text_reader_scan_txt_files() (see its own
- * comment). Caller owns *out_paths (free each entry, then the array).
- * Returns false if root can't be read or has no playlist files anywhere
- * under it. */
+/* Lists .m3u/.m3u8 files in `root` itself (not a recursive walk). Sorted
+ * alphabetically by full path. Caller owns *out_paths (free each entry,
+ * then the array). Returns false if root can't be read or has no playlist
+ * files in it. */
 bool playlist_files_scan(const char * root, char *** out_paths, int * out_count);
 
 /* Appends song_path as a new line to the M3U file at m3u_path, creating the
@@ -73,8 +72,8 @@ bool playlist_files_read(const char * m3u_path, char *** out_paths, int * out_co
  * exact logic inline. */
 void playlist_files_resolve_path(const char * m3u_path, const char * line, char * out_full_path, size_t out_size);
 
-/* Rewrites every .m3u/.m3u8 file directly under dir (found via
- * playlist_files_scan()) so every line becomes relative to that file's own
+/* Rewrites every .m3u/.m3u8 file in dir (found via playlist_files_scan())
+ * so every line becomes relative to that file's own
  * directory, converting any old absolute-path entries left over from
  * before playlist_files_append()/_create() started writing relative ones.
  * Runs at most once: gated by a marker file (dir/.relative_paths_migrated),
@@ -82,5 +81,14 @@ void playlist_files_resolve_path(const char * m3u_path, const char * line, char 
  * Not meant to be called on a schedule -- gui_init() calls it once, guarded
  * #ifndef HOST_BUILD, before the first library/playlist scan. */
 void playlist_files_migrate_to_relative(const char * dir);
+
+/* Cached index of discovered .m3u paths -- tagcache does not store
+ * playlists, so this lives as a path list next to the music database
+ * directory rather than in the tag files. Refreshed by a full scan;
+ * insert/delete keep a single create/delete instant. */
+void playlist_files_index_replace(char * const * paths, int count);
+void playlist_files_index_load(char *** out_paths, int * out_count);
+void playlist_files_index_insert(const char * path);
+void playlist_files_index_delete(const char * path);
 
 #endif /* PLAYLIST_FILES_H */

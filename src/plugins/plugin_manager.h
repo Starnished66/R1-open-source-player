@@ -4,7 +4,32 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define PLUGIN_API_VERSION 1
+/* Bumped 1 -> 2: added plugin.storage and plugin.secrets (namespaced
+ * per-plugin state/credential storage), plugin.json_decode()/json_encode(),
+ * plugin.media_capabilities(), plugin.download_file_async(), plugin.mkdir().
+ * Existing plugins are unaffected by the bump itself (api_min=1 still loads
+ * fine against api_version=2, see the api_min > PLUGIN_API_VERSION check in
+ * l_plugin_define()) -- this only lets a NEW plugin declare api_min=2 to
+ * require the APIs above exist. See PLUGINS.md's "API version 2" changelog
+ * for the one genuinely breaking change bundled into this same window: an
+ * earlier audit pass removed require()/dofile()/loadfile()/package()/
+ * debug/os.execute()/os.getenv() from every plugin's lua_State (real-device
+ * testing confirmed zero installed plugins used any of them) -- a
+ * third-party plugin that split its own code across multiple files via
+ * require()/dofile() will fail to load after this change, with no
+ * restricted module-loader replacement provided yet.
+ *
+ * Bumped 2 -> 3: added plugin.play_remote()/queue_remote_list() (the native
+ * side of a provider-neutral remote-music-service plugin -- Qobuz/Tidal/
+ * etc, see PLUGINS.md) and the "track_started" event's two new trailing
+ * provider/track_id arguments. Purely additive, same as the 1->2 bump: an
+ * existing plugin declaring api_min=1 or 2 keeps loading and working
+ * unchanged. Also see the new "playback.remote" plugin_capabilities[]
+ * entry (plugin_manager.c) -- has_capability("playback.remote") is the
+ * finer-grained, no-version-bump-needed way to feature-detect this
+ * specifically, for a plugin that only cares about this one API rather
+ * than requiring the whole api_min=3 batch. */
+#define PLUGIN_API_VERSION 3
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
 /* Third-party Lua plugin support. Every *.lua file under
@@ -276,8 +301,13 @@ void plugin_manager_settings_list_slid(int slot, int row, int new_value);
  * own PLUGIN_MAX_EVENT_SUBSCRIBERS comment above for the hook-point list).
  * Each loops every plugin currently subscribed to that event and
  * lua_pcall()s it -- a no-op if nothing is subscribed. ---- */
+/* provider/track_id are "" for a local/Subsonic track -- non-empty only for
+ * a remote-provider one (plugin.play_remote(), see remote_track.h), purely
+ * additive on top of the original 4-arg event so an existing subscriber
+ * Lua function (which just ignores extra args it didn't declare) keeps
+ * working unchanged. */
 void plugin_manager_notify_track_started(const char * title, const char * artist, const char * album,
-                                          double duration_seconds);
+                                          double duration_seconds, const char * provider, const char * track_id);
 void plugin_manager_notify_paused(void);
 void plugin_manager_notify_resumed(void);
 void plugin_manager_notify_stopped(void);

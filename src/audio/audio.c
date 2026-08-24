@@ -18,6 +18,7 @@
 #include "vorbis_decoder.h"
 #include "peq.h"
 #include "http_stream.h"
+#include "remote_track.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -135,10 +136,25 @@ static drflac_bool32 flac_stream_seek_cb(void * user_data, int offset, drflac_se
 static bool decoder_open(decoder_t * dec, const char * path) {
     memset(dec, 0, sizeof(*dec));
 
-    if (is_stream_url(path)) {
-        const char * hint = stream_format_hint(path);
-        bool is_flac = hint && strcasecmp(hint, ".flac") == 0;
-        bool is_aac = hint && (strcasecmp(hint, ".aac") == 0 || strcasecmp(hint, ".aacp") == 0);
+    /* A remote-provider track (plugin.play_remote(), see remote_track.h):
+     * path is the stable "remote://<provider>/<track_id>" synthetic key
+     * used for Favorites/History/resume, never a fetchable URL itself --
+     * the real, possibly time-limited fetch URL and verify_tls live in the
+     * looked-up descriptor. Its codec is declared up front by the plugin
+     * (already known from the catalog API, no server round trip needed to
+     * find out), so this skips the extension/fragment-hint/Content-Type
+     * sniffing below entirely -- that sniffing stays exactly as it was for
+     * radio/Subsonic streams, which don't have a declared codec. */
+    remote_track_meta_t remote_meta;
+    bool remote = remote_track_path_is_remote(path) && remote_track_meta_copy_for_path(path, &remote_meta);
+    if (remote_track_path_is_remote(path) && !remote) return false; /* stale/replaced queue entry */
+
+    if (remote || is_stream_url(path)) {
+        const char * hint = remote ? NULL : stream_format_hint(path);
+        bool is_flac = remote ? (strcasecmp(remote_meta.codec, "flac") == 0)
+                              : (hint && strcasecmp(hint, ".flac") == 0);
+        bool is_aac = remote ? (strcasecmp(remote_meta.codec, "aac") == 0)
+                             : (hint && (strcasecmp(hint, ".aac") == 0 || strcasecmp(hint, ".aacp") == 0));
 
         /* Live network stream -- MP3/FLAC use their callback-based decoder
          * APIs, while ADTS AAC uses aac_open_stream()'s incremental framing
@@ -147,11 +163,13 @@ static bool decoder_open(decoder_t * dec, const char * path) {
          * prescans. Other formats still require a finite file/container.
          * Absent a recognized hint or AAC Content-Type, MP3 remains the
          * default for compatibility with ordinary internet-radio URLs. */
-        dec->net_stream = http_stream_open(path, true);
+        dec->net_stream = http_stream_open(remote ? remote_meta.stream_url : path, remote ? remote_meta.verify_tls : true);
         if (!dec->net_stream) return false;
 
-        const char * content_type = http_stream_content_type(dec->net_stream);
-        if (strncasecmp(content_type, "audio/aac", 9) == 0) is_aac = true;
+        if (!remote) {
+            const char * content_type = http_stream_content_type(dec->net_stream);
+            if (strncasecmp(content_type, "audio/aac", 9) == 0) is_aac = true;
+        }
 
         if (is_aac) {
             dec->type = DECODER_AAC;
@@ -163,7 +181,14 @@ static bool decoder_open(decoder_t * dec, const char * path) {
             }
             dec->channels = aac_get_channels(dec->as.aac);
             dec->sample_rate = aac_get_sample_rate(dec->as.aac);
-            dec->total_frames = 0;
+            /* A remote track declares its own duration up front (the
+             * plugin's catalog metadata) -- unlike plain internet radio,
+             * there's no need to leave this at the unknown-duration 0
+             * below; a plain stream URL (remote == false) still has no
+             * such source and keeps today's behavior exactly. */
+            dec->total_frames = (remote && remote_meta.duration_ms > 0)
+                                     ? (uint64_t) ((double) remote_meta.duration_ms / 1000.0 * dec->sample_rate)
+                                     : 0;
             return true;
         }
 
@@ -199,7 +224,14 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         }
         dec->channels = dec->as.mp3->channels;
         dec->sample_rate = dec->as.mp3->sampleRate;
-        dec->total_frames = 0; /* unknown/unbounded -- never prescan a live stream (see drmp3_get_pcm_frame_count() below) */
+        /* See the AAC branch's own comment just above -- a remote track's
+         * declared duration_ms substitutes for the prescan this never does
+         * on a live stream; a plain MP3 stream URL (remote == false, e.g.
+         * internet radio or a Subsonic stream) has no such source and
+         * keeps today's unknown-duration-until-EOF behavior exactly. */
+        dec->total_frames = (remote && remote_meta.duration_ms > 0)
+                                 ? (uint64_t) ((double) remote_meta.duration_ms / 1000.0 * dec->sample_rate)
+                                 : 0;
         return true;
     }
 
@@ -274,15 +306,12 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         return true;
     }
 
-    if (strcasecmp(ext, ".m4a") == 0) {
-        /* .m4a is a container, not a codec -- peek which one is actually
+    if (strcasecmp(ext, ".m4a") == 0 || strcasecmp(ext, ".m4b") == 0) {
+        /* .m4a/.m4b is a container, not a codec -- peek which one is actually
          * inside (ALAC or AAC) before picking a decoder. The real decoders
          * each open their own mp4_demux_t; this one is just for the peek. */
-        mp4_demux_t * peek = mp4_demux_open(path);
-        if (!peek) return false;
         char fourcc[5];
-        mp4_demux_get_codec_fourcc(peek, fourcc);
-        mp4_demux_close(peek);
+        if (!mp4_demux_peek_codec(path, fourcc)) return false;
 
         if (strcmp(fourcc, "alac") == 0) {
             dec->type = DECODER_ALAC;

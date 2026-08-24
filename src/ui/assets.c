@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef HOST_BUILD
   #define THEME_ROOT "assets/theme2/"
@@ -63,6 +64,33 @@ const char * asset_path(const char * relative_path) {
      * structs, so the bounded, one-time leak per image reference is the
      * same accepted tradeoff already made elsewhere in this codebase. */
     return strdup(buf);
+}
+
+const char * asset_path_plain(const char * relative_path) {
+    char buf[320];
+#ifndef HOST_BUILD
+    snprintf(buf, sizeof(buf), THEME_OVERRIDE_ROOT "%s", relative_path);
+    if (access(buf, R_OK) == 0) {
+        return strdup(buf);
+    }
+    snprintf(buf, sizeof(buf), THEME_ROOT "%s", relative_path);
+#else
+    /* THEME_ROOT is a relative path on host ("assets/theme2/", resolved
+     * against the process's own CWD, same as MUSIC_ROOT_DIR's own "./music"
+     * elsewhere) -- fine for asset_path()'s "S:"-prefixed LVGL image source
+     * (LVGL's POSIX fs driver just opens it via the process's normal CWD),
+     * but this function's whole point is a path callers like pill_row_
+     * apply_icon() can tell apart from a plugin-relative one purely by
+     * whether it starts with '/' -- so unlike asset_path(), this needs a
+     * genuinely absolute path even on host. */
+    char cwd[256];
+    if (getcwd(cwd, sizeof(cwd))) {
+        snprintf(buf, sizeof(buf), "%s/" THEME_ROOT "%s", cwd, relative_path);
+    } else {
+        snprintf(buf, sizeof(buf), THEME_ROOT "%s", relative_path);
+    }
+#endif
+    return strdup(buf); /* same heap-allocated-and-never-freed tradeoff as asset_path() above */
 }
 
 const lv_image_dsc_t * asset_png_memory(const char * relative_path) {

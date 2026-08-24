@@ -19,7 +19,6 @@ ALAC_DIR = alac
 OPUS_DIR = opus
 MBEDTLS_DIR = mbedtls
 CJSON_DIR = cJSON
-SQLITE_DIR = sqlite3
 DBUS_DIR = dbus
 LUA_DIR = lua
 # stb_vorbis (public domain, github.com/nothings/stb) -- a single 192KB file
@@ -125,19 +124,6 @@ $(info Cloning libdbus 1.16.2...)
 $(shell git clone --depth 1 -b dbus-1.16.2 https://gitlab.freedesktop.org/dbus/dbus.git $(DBUS_DIR))
 endif
 
-# SQLite (public domain) -- the on-disk music library cache (metadata_db.c),
-# avoiding a full re-scan + re-read of every file's tags on every boot, the
-# same way the stock hiby_player caches its own library in
-# usrlocal_media.db (confirmed via `file`/sqlite3's `.recover` against a real
-# device's SD card: SQLite 3.x, schema 4). Vendored as the official
-# amalgamation (one sqlite3.c) rather than cloning the dev tree, since
-# building the amalgamation from that requires Tcl tooling this project
-# doesn't otherwise need.
-ifeq ($(wildcard $(SQLITE_DIR)),)
-$(info Fetching SQLite 3.53.4 amalgamation...)
-$(shell curl -fsSL -o /tmp/sqlite-amalgamation.zip https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip && unzip -q -o /tmp/sqlite-amalgamation.zip -d /tmp && mv /tmp/sqlite-amalgamation-3530400 $(SQLITE_DIR) && rm /tmp/sqlite-amalgamation.zip)
-endif
-
 # Lua (MIT) -- the plugin scripting engine (src/plugins/plugin_manager.c):
 # each file under the SD card's .plugins/ folder gets its own lua_State,
 # with a small C API table (plugin.*) exposed for registering Home-screen
@@ -175,7 +161,7 @@ endif
 # including "audio.h") still resolves via the compiler's -I fallback search
 # even though foo.h now lives in a different category folder -- no #include
 # statements needed changing when src/ was reorganized into subfolders.
-CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(SQLITE_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
+CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
 HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
 HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
@@ -244,10 +230,6 @@ ALAC_CXXFLAGS = -O3 -g -I$(ALAC_DIR)/codec -std=c++11 $(ALAC_DEFINES)
 # constraint than fixed-point's Q-format SILK API -- is the correct choice.
 OPUS_DEFINES = -DOPUS_BUILD -DVAR_ARRAYS -DHAVE_LRINTF=1 -DHAVE_LRINT=1
 OPUS_CFLAGS = -O3 -g -Wall -I$(OPUS_DIR)/include -I$(OPUS_DIR)/celt -I$(OPUS_DIR)/silk -I$(OPUS_DIR)/silk/float $(OPUS_DEFINES)
-# SQLITE_OMIT_LOAD_EXTENSION -- dlopen() doesn't work from a static musl
-# binary anyway (see the mbedTLS comment above), so this just avoids
-# compiling in the dead code path that would otherwise call it.
-SQLITE_CFLAGS = -O3 -g -I$(SQLITE_DIR) -DSQLITE_OMIT_LOAD_EXTENSION=1
 # No configure step (luaconf.h auto-detects a POSIX/Linux target off the
 # compiler's own predefined __linux__/__unix__ macros, which musl's cross
 # compiler still defines for a Linux target -- same as every other
@@ -270,6 +252,9 @@ TARGET_LDFLAGS = -static -no-pie -lpthread -lm
 APP_SRCS = src/main.c src/ui/gui.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_conn.c src/network/http_client.c src/network/http_stream.c src/network/subsonic_client.c src/library/cover_decode.c src/library/lyrics.c src/audio/asf_demux.c src/audio/wma_decoder.c src/audio/ogg_demux.c src/audio/opus_decoder.c src/audio/vorbis_decoder.c src/library/cue_parser.c src/ui/fallback_font.c \
 src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/hardware/usb_audio_output.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/core/hostname_apply.c src/network/dlna_control.c src/network/remote_control.c src/plugins/plugin_manager.c
 APP_SRCS += src/ui/lyrics_layout.c src/ui/transition_compositor.c
+APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c
+APP_SRCS += src/library/remote_track.c
+APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c
 APP_CXX_SRCS = src/audio/alac_decoder.cpp
 LVGL_SRCS = $(shell find $(LVGL_DIR)/src -type f -name '*.c')
 TINYALSA_SRCS = $(shell find $(TINYALSA_DIR)/src -type f -name '*.c')
@@ -295,7 +280,6 @@ OPUS_SRCS = $(filter-out %/repacketizer_demo.c %/opus_demo.c %/opus_compare.c %/
             $(shell find $(OPUS_DIR)/silk/float -maxdepth 1 -type f -name '*.c')
 MBEDTLS_SRCS = $(shell find $(MBEDTLS_DIR)/library -type f -name '*.c')
 CJSON_SRCS = $(CJSON_DIR)/cJSON.c
-SQLITE_SRCS = $(SQLITE_DIR)/sqlite3.c
 # stb_vorbis.c is its own complete translation unit (the real implementation,
 # compiled exactly once here); stb_vorbis.h is a header-only shim other .c
 # files include instead -- see that file's own comment.
@@ -338,7 +322,6 @@ HOST_OBJS = $(APP_SRCS:src/%.c=build_host/%.o) $(APP_CXX_SRCS:src/%.cpp=build_ho
             $(LVGL_SRCS:$(LVGL_DIR)/%.c=build_host/lvgl/%.o) $(FAAD2_SRCS:$(FAAD2_DIR)/libfaad/%.c=build_host/faad2/%.o) \
             $(ALAC_C_SRCS:$(ALAC_DIR)/codec/%.c=build_host/alac/%.o) $(ALAC_CXX_SRCS:$(ALAC_DIR)/codec/%.cpp=build_host/alac/%.o) \
             $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=build_host/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=build_host/cjson/%.o) \
-            $(SQLITE_SRCS:$(SQLITE_DIR)/%.c=build_host/sqlite3/%.o) \
             $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_host/opus/%.o) \
             $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_host/stb_vorbis/%.o) \
             $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_host/lua/%.o)
@@ -348,7 +331,6 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=buil
               $(FAAD2_SRCS:$(FAAD2_DIR)/libfaad/%.c=build_target/faad2/%.o) \
               $(ALAC_C_SRCS:$(ALAC_DIR)/codec/%.c=build_target/alac/%.o) $(ALAC_CXX_SRCS:$(ALAC_DIR)/codec/%.cpp=build_target/alac/%.o) \
               $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=build_target/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=build_target/cjson/%.o) \
-              $(SQLITE_SRCS:$(SQLITE_DIR)/%.c=build_target/sqlite3/%.o) \
               $(DBUS_SRCS:$(DBUS_DIR)/dbus/%.c=build_target/dbus/%.o) \
               $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_target/opus/%.o) \
               $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_target/stb_vorbis/%.o) \
@@ -397,10 +379,6 @@ build_host/mbedtls/%.o: $(MBEDTLS_DIR)/library/%.c
 build_host/cjson/%.o: $(CJSON_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
-
-build_host/sqlite3/%.o: $(SQLITE_DIR)/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(SQLITE_CFLAGS) -DHOST_BUILD=1 -c $< -o $@
 
 build_host/stb_vorbis/%.o: $(STB_VORBIS_DIR)/%.c
 	@mkdir -p $(dir $@)
@@ -457,10 +435,6 @@ build_target/cjson/%.o: $(CJSON_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
-build_target/sqlite3/%.o: $(SQLITE_DIR)/%.c
-	@mkdir -p $(dir $@)
-	$(CROSS_CC) $(SQLITE_CFLAGS) -c $< -o $@
-
 build_target/stb_vorbis/%.o: $(STB_VORBIS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
@@ -480,6 +454,12 @@ build_target/lua/%.o: $(LUA_DIR)/src/%.c
 # Generate compile_commands.json for Zed/clangd LSP autofill and hover popups
 compile_commands.json:
 	@python3 generate_compile_commands.py
+
+TAGCACHE_SELFTEST_SRCS = src/library/tagcache_selftest.c src/library/metadata_db.c src/library/tagcache.c \
+                         src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c
+tagcache-selftest:
+	$(CC) $(HOST_CFLAGS) -o /tmp/tagcache_selftest $(TAGCACHE_SELFTEST_SRCS) -lpthread
+	/tmp/tagcache_selftest
 
 clean:
 	rm -rf build_host build_target $(HOST_BIN) $(TARGET_BIN) compile_commands.json compile_flags.txt

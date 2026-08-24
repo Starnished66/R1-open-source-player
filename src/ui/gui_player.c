@@ -25,6 +25,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <limits.h>
+#include <ctype.h>
 
 #define VOLUME_POPUP_TIMEOUT_MS 3000
 #define HOME_INDICATOR_BAND_HEIGHT 24
@@ -1135,8 +1136,7 @@ static void build_more_menu_popup(void) {
                                         &more_menu_popup_backdrop);
 }
 
-/* ---- Song long-press context menu: Add to Queue / Add to Playlist / Cancel
-/* Song context menu moved to gui_queue.c */
+/* Song context menu moved to gui_queue.c. */
 
 static void cover_img_tap_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -1508,7 +1508,7 @@ void refresh_format_badge(void) {
         for (const char * p = remote_meta.codec; *p && i < sizeof(ext) - 1; p++, i++) {
             ext[i] = (char) toupper((unsigned char) *p);
         }
-        ext[i] = ' ';
+        ext[i] = '\0';
     } else if (!is_remote_track) {
         const char * dot = strrchr(path, '.');
         if (dot) {
@@ -1516,7 +1516,7 @@ void refresh_format_badge(void) {
             for (const char * p = dot + 1; *p && i < sizeof(ext) - 1; p++, i++) {
                 ext[i] = (char) toupper((unsigned char) *p);
             }
-            ext[i] = ' ';
+            ext[i] = '\0';
         }
     }
 

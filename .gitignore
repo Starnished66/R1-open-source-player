@@ -73,6 +73,9 @@
 # subdirectory. Tracked Python files remain tracked by Git as usual.
 *.py
 
+# Local GUI-refactor extraction workspace
+/scratch/
+
 # Local-only known-issues tracker (not part of the public docs)
 /ISSUES.md
 

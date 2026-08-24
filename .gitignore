@@ -69,6 +69,10 @@
 # not needed to build or run the project)
 /music/
 
+# Local Python helper scripts, including files created in any future
+# subdirectory. Tracked Python files remain tracked by Git as usual.
+*.py
+
 # Local-only known-issues tracker (not part of the public docs)
 /ISSUES.md
 

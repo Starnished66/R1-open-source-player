@@ -256,3 +256,6 @@ void gui_plugin_clear_interval(int slot);
 void gui_plugin_show_text_input(const char * title, const char * initial_text, bool is_password);
 
 #endif /* GUI_H */
+
+#define COVER_ART_WIDTH 480
+#define COVER_ART_HEIGHT 480

@@ -9626,6 +9626,10 @@ int gui_plugin_library_get_albums(int offset, int limit, const char * artist_fil
     return metadata_db_get_albums_page_filtered(artist_filter, offset, limit, out_rows);
 }
 
+void gui_plugin_refresh_library(void) {
+    start_library_rescan();
+}
+
 /* A stuck read on a corrupted SD card block (confirmed on a real device via
  * /proc/<pid>/task/<tid>/status+wchan showing the main thread parked in
  * __bread_gfp, a kernel block-device read, after the card came back from an

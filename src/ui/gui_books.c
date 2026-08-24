@@ -26,16 +26,7 @@ extern lv_style_t style_accent;
 extern const char * basename_of(const char * path);
 extern lv_obj_t * build_subsonic_list_screen(const char * title_text, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
 
-typedef enum {
-    GUI_FONT_ROLE_TITLE,
-    GUI_FONT_ROLE_BODY,
-    GUI_FONT_ROLE_LIST_ITEM,
-    GUI_FONT_ROLE_SUBTITLE,
-    GUI_FONT_ROLE_TINY,
-    GUI_FONT_ROLE_LARGE,
-    GUI_FONT_ROLE_MONO
-} gui_font_role_t;
-extern const lv_font_t * gui_theme_font(gui_font_role_t role);
+/* gui_font_role_t defined in gui_theme.h */
 
 #define BOOKS_SCAN_TIMEOUT_MS 8000
 extern void nav_push(lv_obj_t * screen);

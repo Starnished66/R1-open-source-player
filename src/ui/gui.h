@@ -4,7 +4,11 @@
 #include "lvgl/lvgl.h"
 #include "gui_theme.h"
 #include "gui_notifications.h"
-#include "metadata_db.h" /* song_row_t/group_row_t, reused as-is by the gui_plugin_library_* declarations below */
+#include "gui_library.h"
+#include "metadata_db.h"
+
+
+#include "albumart.h" /* song_row_t/group_row_t, reused as-is by the gui_plugin_library_* declarations below */
 #include "remote_track.h" /* remote_track_meta_t, used by gui_plugin_play_remote_tracks() below */
 #include <stdint.h>
 #include <stddef.h>
@@ -293,6 +297,54 @@ void set_play_button_state(bool is_playing);
 void arm_next_track_for_audio(int index);
 
 const char * basename_of(const char * path);
+
+typedef enum {
+    PLAYER_SOURCE_NONE,
+    PLAYER_SOURCE_ALL_SONGS,
+    PLAYER_SOURCE_GROUP_SONGS,
+    PLAYER_SOURCE_FILE_BROWSER,
+    PLAYER_SOURCE_RECENTLY_ADDED,
+} player_source_kind_t;
+
+extern player_source_kind_t player_source_kind;
+extern int player_source_all_songs_index;
+extern int player_source_recently_added_index;
+extern group_song_entry_t * player_source_group_entries;
+extern int player_source_group_count;
+extern int player_source_group_pos;
+extern char * player_source_group_title;
+extern char player_source_file_browser_dir[];
+extern int player_source_file_browser_row;
+
+void hide_more_menu_popup(void);
+
+extern char now_playing_path[600];
+extern lv_obj_t * nav_stack[];
+extern int nav_depth;
+
+void set_player_source_none(void);
+void set_player_source_all_songs(int index);
+void set_player_source_recently_added(int index);
+void set_player_source_file_browser(const char * dir, int row);
+
+
+
+
+lv_indev_t * find_pointer_indev(void);
+void albumart_info_from_song_row(const song_row_t * song, albumart_info_t * info);
+void configure_scrolling_row_label(lv_obj_t * label, int32_t width);
+void open_song_context_menu(const char * path);
+
+
+const char * playlist_path_at(int index);
+void on_file_selected_lazy_all_songs(int selected_index);
+void on_file_selected_lazy_recently_added(int selected_index);
+
+void nav_reset_to_home(void);
+void open_queue_screen(void);
+void library_scan_once(void);
+void library_load_from_cache_only(void);
+
 /* ---- Shared GUI and Screen Builders Helpers ---- */
 extern lv_style_t style_accent;
 void generic_back_cb(lv_event_t * e);

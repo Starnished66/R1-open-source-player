@@ -131,7 +131,6 @@ bool subsonic_library_download_active;
 
 bool subsonic_connect_active;
 
-static void on_cue_file_selected(const char * cue_path); /* defined later, alongside build_cue_tracks_screen() -- needs add_playlist_row_base()/build_subsonic_list_screen() already in scope */
 
 static subsonic_server_t subsonic_server_from_settings(void) {
     subsonic_server_t server;

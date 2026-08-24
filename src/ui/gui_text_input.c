@@ -28,17 +28,7 @@ extern void finalize_screen_navigation(lv_obj_t * screen);
 extern void generic_back_cb(lv_event_t * e);
 extern void plugin_manager_text_input_cancelled(void);
 
-typedef enum {
-    GUI_FONT_ROLE_TITLE,
-    GUI_FONT_ROLE_BODY,
-    GUI_FONT_ROLE_LIST_ITEM,
-    GUI_FONT_ROLE_SUBTITLE,
-    GUI_FONT_ROLE_TINY,
-    GUI_FONT_ROLE_LARGE,
-    GUI_FONT_ROLE_SUBTEXT,
-    GUI_FONT_ROLE_MONO
-} gui_font_role_t;
-extern const lv_font_t * gui_theme_font(gui_font_role_t role);
+/* gui_font_role_t defined in gui_theme.h */
 
 extern void plugin_text_entry_done_cb(const char * text, void * user_data);
 

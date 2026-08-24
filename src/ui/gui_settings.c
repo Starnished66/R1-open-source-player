@@ -1,5 +1,6 @@
 #include "gui.h"
 #include "gui_settings.h"
+#include "gui_text_input.h"
 #include <math.h>
 #include <sys/stat.h>
 #include "gui_subsonic.h"
@@ -65,7 +66,6 @@ extern lv_obj_t * add_pill_row_base(lv_obj_t * list, const char * text);
 extern const lv_font_t * gui_theme_font(gui_font_role_t role);
 extern void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon);
 extern void generic_back_cb(lv_event_t * e);
-extern void show_text_entry(const char * title, char * buf, bool numeric, bool with_done, lv_event_cb_t done_cb, void * user_data);
 extern void start_library_rescan(void);
 
 static lv_obj_t * screen_timeout_switch;

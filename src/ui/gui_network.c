@@ -1,6 +1,10 @@
 extern int subprocess_run(char * const argv[], char ** out_output, int timeout_sec);
 #include "gui.h"
 #include "gui_network.h"
+#include "gui_text_input.h"
+#include "audio.h"
+#include "plugin_manager.h"
+#include "import_web.h"
 #include "gui_settings.h"
 #include "screen_builders.h"
 #include "settings.h"
@@ -58,7 +62,6 @@ extern lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text
 extern lv_obj_t * add_pill_row_base(lv_obj_t * list, const char * text);
 extern const lv_font_t * gui_theme_font(gui_font_role_t role);
 extern void generic_back_cb(lv_event_t * e);
-extern void show_text_entry(const char * title, char * buf, bool numeric, bool with_done, lv_event_cb_t done_cb, void * user_data);
 extern void finalize_screen_navigation(lv_obj_t * screen);
 extern gui_busy_handle_t wifi_connect_saved_token;
 extern gui_busy_handle_t gui_busy_show(const char * title, const char * msg);

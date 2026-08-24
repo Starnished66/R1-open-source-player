@@ -52,6 +52,39 @@ gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
 void gui_busy_hide(gui_busy_handle_t handle);
 void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
 
+
+/* Accent palette -- defined in gui.c, used by gui_settings.c */
+extern const uint32_t accent_palette[];
+extern lv_obj_t * accent_swatches[];
+#define ACCENT_PALETTE_COUNT 24  /* number of entries in accent_palette[] */
+
+/* Settings-related widget vars defined in gui.c */
+extern lv_obj_t * settings_crossfade_toggle_img;
+
+/* Callbacks defined in gui.c, referenced by gui_settings.c */
+void accent_swatch_event_cb(lv_event_t * e);
+void crossfade_switch_event_cb(lv_event_t * e);
+void car_mode_switch_event_cb(lv_event_t * e);
+void swipe_up_home_switch_event_cb(lv_event_t * e);
+void screen_dimming_switch_event_cb(lv_event_t * e);
+void hide_player_topbar_switch_event_cb(lv_event_t * e);
+void charge_limiter_switch_event_cb(lv_event_t * e);
+void safe_charging_switch_event_cb(lv_event_t * e);
+void led_indicator_switch_event_cb(lv_event_t * e);
+void battery_percent_switch_event_cb(lv_event_t * e);
+void clock_24h_switch_event_cb(lv_event_t * e);
+void resume_mode_settings_row_cb(lv_event_t * e);
+void play_pause_button_mode_settings_row_cb(lv_event_t * e);
+void replaygain_mode_settings_row_cb(lv_event_t * e);
+void font_size_settings_row_cb(lv_event_t * e);
+void usb_mode_settings_row_cb(lv_event_t * e);
+void update_music_database_row_cb(lv_event_t * e);
+void firmware_update_row_cb(lv_event_t * e);
+void bt_dac_settings_row_cb(lv_event_t * e);
+void register_swipe_dead_zone(lv_obj_t * obj);
+
+void refresh_clock_label(void);
+
 #endif
 
 /* ---- Bridge for src/plugins/plugin_manager.c ----
@@ -340,6 +373,39 @@ void show_error_toast(const char * msg);
 gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
 void gui_busy_hide(gui_busy_handle_t handle);
 void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
+
+
+/* Accent palette -- defined in gui.c, used by gui_settings.c */
+extern const uint32_t accent_palette[];
+extern lv_obj_t * accent_swatches[];
+#define ACCENT_PALETTE_COUNT 24  /* number of entries in accent_palette[] */
+
+/* Settings-related widget vars defined in gui.c */
+extern lv_obj_t * settings_crossfade_toggle_img;
+
+/* Callbacks defined in gui.c, referenced by gui_settings.c */
+void accent_swatch_event_cb(lv_event_t * e);
+void crossfade_switch_event_cb(lv_event_t * e);
+void car_mode_switch_event_cb(lv_event_t * e);
+void swipe_up_home_switch_event_cb(lv_event_t * e);
+void screen_dimming_switch_event_cb(lv_event_t * e);
+void hide_player_topbar_switch_event_cb(lv_event_t * e);
+void charge_limiter_switch_event_cb(lv_event_t * e);
+void safe_charging_switch_event_cb(lv_event_t * e);
+void led_indicator_switch_event_cb(lv_event_t * e);
+void battery_percent_switch_event_cb(lv_event_t * e);
+void clock_24h_switch_event_cb(lv_event_t * e);
+void resume_mode_settings_row_cb(lv_event_t * e);
+void play_pause_button_mode_settings_row_cb(lv_event_t * e);
+void replaygain_mode_settings_row_cb(lv_event_t * e);
+void font_size_settings_row_cb(lv_event_t * e);
+void usb_mode_settings_row_cb(lv_event_t * e);
+void update_music_database_row_cb(lv_event_t * e);
+void firmware_update_row_cb(lv_event_t * e);
+void bt_dac_settings_row_cb(lv_event_t * e);
+void register_swipe_dead_zone(lv_obj_t * obj);
+
+void refresh_clock_label(void);
 
 #endif /* GUI_H */
 

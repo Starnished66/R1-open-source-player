@@ -6,6 +6,7 @@
 #include "gui_notifications.h"
 #include "gui_library.h"
 #include "gui_queue.h"
+#include "gui_player.h"
 #include "metadata_db.h"
 
 
@@ -356,6 +357,30 @@ void queue_add_song(const char * path);
 void play_track_at(int target);
 void get_display_names(const char * path, char * out_title, size_t title_sz, char * out_folder, size_t folder_sz);
 void row_label_enable_marquee(lv_obj_t * label);
+
+void refresh_volume_topbar(int32_t percent);
+
+void player_transition_mark_dirty(void);
+void set_play_button_state(bool is_playing);
+
+
+typedef enum {
+    PLAY_MODE_SEQUENTIAL,
+    PLAY_MODE_REPEAT_ALL,
+    PLAY_MODE_REPEAT_ONE,
+    PLAY_MODE_SHUFFLE,
+} play_mode_t;
+
+const char * play_mode_icon_asset(play_mode_t mode);
+extern lv_obj_t * quick_drawer_order_icon;
+
+
+extern int * playlist_lazy_sort_order;
+extern lv_obj_t * quick_drawer_title_label;
+extern lv_obj_t * quick_drawer_artist_label;
+extern lv_obj_t * quick_drawer_favorite_icon;
+extern lv_obj_t * quick_drawer_play_btn;
+void quick_drawer_mark_snapshot_dirty(void);
 
 /* ---- Shared GUI and Screen Builders Helpers ---- */
 extern lv_style_t style_accent;

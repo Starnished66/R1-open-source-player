@@ -676,3 +676,69 @@ void gui_plugins_init(void) {
     }
 }
 
+
+void gui_plugin_free_string_array(char ** array, int count) {
+    for (int i = 0; i < count; i++) free(array[i]);
+    free(array);
+}
+
+/* ---- plugin.library_* -- see gui.h's own comment for the design intent.
+ * Every one of these goes straight to metadata_db.c (its own METADATA_DB_
+ * GUARD), same as gui_plugin_get_artist_albums() and friends above -- no
+ * plugin call in this file forces any whole-library load just because it
+ * looked at the library first. ---- */
+
+static int gui_plugin_library_clamp_limit(int limit) {
+    if (limit <= 0 || limit > GUI_PLUGIN_LIBRARY_MAX_PAGE) return GUI_PLUGIN_LIBRARY_MAX_PAGE;
+    return limit;
+}
+
+int64_t gui_plugin_library_song_count(void) {
+    return metadata_db_get_song_count();
+}
+
+int gui_plugin_library_get_songs(const char * query, const char * artist, const char * album_artist,
+                                  const char * album, int offset, int limit, song_row_t * out_rows,
+                                  int64_t * out_total) {
+    if (offset < 0) offset = 0;
+    limit = gui_plugin_library_clamp_limit(limit);
+    if (out_total) *out_total = metadata_db_count_songs_filtered(query, artist, album_artist, album);
+    return metadata_db_get_songs_filtered_page(query, artist, album_artist, album, offset, limit, out_rows);
+}
+
+int gui_plugin_library_search(const char * query, int limit, song_row_t * out_rows) {
+    limit = gui_plugin_library_clamp_limit(limit);
+    return metadata_db_search_songs(query, out_rows, limit);
+}
+
+bool gui_plugin_library_get_song(int64_t id, song_row_t * out_row) {
+    return metadata_db_get_song_by_id(id, out_row);
+}
+
+/* Real bug caught in review, now moot: metadata_db_get_groups_page()/
+ * get_albums_page_filtered() used to only support a keyset "after_name"
+ * cursor (never actually continued by any real caller), so this used to
+ * fetch offset+limit rows in one shot and slice out [offset, offset+limit)
+ * in C, capped at a generous-but-still-finite ceiling -- confirmed against
+ * this device's real library (210 distinct albums) to silently truncate
+ * offsets past that ceiling with no way for a plugin to detect it. Both
+ * functions take a real offset now (see their own metadata_db.h comments),
+ * so this is a direct pass-through with no cap beyond GUI_PLUGIN_LIBRARY_
+ * MAX_PAGE itself. */
+int gui_plugin_library_get_artists(int offset, int limit, group_row_t * out_rows) {
+    if (offset < 0) offset = 0;
+    limit = gui_plugin_library_clamp_limit(limit);
+    return metadata_db_get_groups_page(METADATA_DB_GROUP_ARTIST, offset, limit, out_rows);
+}
+
+int gui_plugin_library_get_albums(int offset, int limit, const char * artist_filter, group_row_t * out_rows) {
+    if (offset < 0) offset = 0;
+    limit = gui_plugin_library_clamp_limit(limit);
+    return metadata_db_get_albums_page_filtered(artist_filter, offset, limit, out_rows);
+}
+
+bool gui_plugin_refresh_library(void) {
+    if (library_rescan_active) return false;
+    start_library_rescan();
+    return library_rescan_active;
+}

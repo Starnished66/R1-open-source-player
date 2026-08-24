@@ -1,4 +1,6 @@
 #include "screen_builders.h"
+#include "gui_theme.h"
+#include "gui_plugins.h"
 #include "assets.h"
 #include "debug_log.h"
 
@@ -1702,4 +1704,68 @@ lv_obj_t * build_compact_list_screen(const char * title, lv_event_cb_t back_btn_
 
     if (out_list) *out_list = list;
     return scr;
+}
+
+lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) {
+    lv_obj_t * row = lv_obj_create(parent);
+    int32_t row_width = pill_row_default_width();
+    lv_obj_set_size(row, row_width, 124);
+    lv_obj_add_style(row, &style_theme_screen_bg, 0);
+    if (row_width == 448) {
+        lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
+    } else {
+        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
+        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+    }
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * label = lv_label_create(row);
+    lv_label_set_text(label, label_text);
+    lv_obj_add_style(label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
+    configure_scrolling_row_label(label, row_width - 136);
+    return row;
+}
+
+lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click) {
+    lv_obj_t * row = add_pill_row_base(parent, label_text);
+
+    lv_obj_t * toggle_img = lv_image_create(row);
+    lv_image_set_src(toggle_img, asset_path(checked ? "settings/on.png" : "settings/off.png"));
+    lv_obj_align(toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
+    if (checked) {
+        lv_obj_set_style_image_recolor(toggle_img, accent_lv_color(), 0);
+        lv_obj_set_style_image_recolor_opa(toggle_img, LV_OPA_80, 0);
+    }
+
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    if (on_click) lv_obj_add_event_cb(row, on_click, LV_EVENT_CLICKED, NULL);
+    return row;
+}
+
+lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_text, lv_event_cb_t on_click) {
+    lv_obj_t * row = add_pill_row_base(parent, label_text);
+
+    lv_obj_t * chevron = lv_label_create(row);
+    lv_label_set_text(chevron, ">");
+    lv_obj_add_style(chevron, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(chevron, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, -20, 0);
+
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    if (on_click) lv_obj_add_event_cb(row, on_click, LV_EVENT_CLICKED, NULL);
+    return row;
+}
+
+lv_obj_t * add_section_header(lv_obj_t * parent, const char * text) {
+    lv_obj_t * label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_add_style(label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_set_style_pad_top(label, 12, 0);
+    lv_obj_set_style_pad_left(label, 24, 0);
+    return label;
 }

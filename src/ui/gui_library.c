@@ -3980,3 +3980,255 @@ void gui_library_init(void) {
 void gui_library_resume_fast_timers(void) {
     if (az_index_drag_timer) lv_timer_resume(az_index_drag_timer);
 }
+
+typedef struct {
+    char root[600];
+    char spool_path[PATH_MAX];
+    atomic_bool done;
+    bool ok;
+    int count;
+    atomic_int progress;
+} scan_walk_work_t;
+
+/* Binary length-prefixed spool: paths can contain whitespace and, unlike a
+ * newline-delimited temporary file, this remains correct even for odd names.
+ * The spool lives on the SD card, so discovery storage scales with library
+ * size without consuming the device's RAM. */
+static bool scan_spool_visit_cb(const char * path, void * user) {
+    FILE * f = (FILE *) user;
+    size_t n = strlen(path);
+    if (n > UINT32_MAX) return false;
+    uint32_t len = (uint32_t) n;
+    return fwrite(&len, sizeof(len), 1, f) == 1 && fwrite(path, 1, n, f) == n;
+}
+
+
+#define LIBRARY_SCAN_FILE_TIMEOUT_MS 5000
+#define LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS 30000
+
+static void * scan_walk_worker(void * arg) {
+    scan_walk_work_t * w = (scan_walk_work_t *) arg;
+    FILE * spool = fopen(w->spool_path, "wb");
+    if (!spool) {
+        w->ok = false;
+        w->done = true;
+        return NULL;
+    }
+    w->ok = file_browser_walk_all_songs_excluding_top_level(
+        w->root, AUDIOBOOKS_LIBRARY_DIR_NAME, scan_spool_visit_cb, spool, &w->count, &w->progress);
+    if (fclose(spool) != 0) w->ok = false;
+    atomic_store_explicit(&w->done, true, memory_order_release);
+    return NULL;
+}
+
+#define SCAN_WALK_THREAD_STACK_SIZE (1024 * 1024)
+static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path, size_t out_spool_size,
+                                        int * out_count) {
+    scan_walk_work_t * w = calloc(1, sizeof(*w));
+    if (!w) return false;
+    snprintf(w->root, sizeof(w->root), "%s", root);
+    snprintf(w->spool_path, sizeof(w->spool_path), "%s/.open_hiby_scan_%ld_%p.tmp",
+             root, (long) getpid(), (void *) w);
+
+    pthread_attr_t attr;
+    pthread_attr_t * attr_ptr = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        if (pthread_attr_setstacksize(&attr, SCAN_WALK_THREAD_STACK_SIZE) == 0) attr_ptr = &attr;
+    }
+
+    pthread_t thread;
+    bool created = pthread_create(&thread, attr_ptr, scan_walk_worker, w) == 0;
+    if (attr_ptr) pthread_attr_destroy(&attr);
+    if (!created) {
+        free(w);
+        return false;
+    }
+    pthread_detach(thread);
+
+    int last_seen_progress = 0;
+    int stalled_ms = 0;
+    for (;;) {
+        if (atomic_load_explicit(&w->done, memory_order_acquire)) {
+            bool ok = w->ok;
+            if (ok) {
+                snprintf(out_spool_path, out_spool_size, "%s", w->spool_path);
+                *out_count = w->count;
+            } else {
+                remove(w->spool_path);
+            }
+            free(w);
+            return ok;
+        }
+        int progress = w->progress;
+        if (progress != last_seen_progress) {
+            last_seen_progress = progress;
+            stalled_ms = 0;
+        } else {
+            stalled_ms += 20;
+            if (stalled_ms >= LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS) break;
+        }
+        usleep(20000);
+    }
+
+    /* The worker may be in uninterruptible I/O. Do not touch/free its state.
+     * Its uniquely named spool can be orphaned safely and removed on a later
+     * maintenance pass; critically, it owns no tagcache lock or GUI memory. */
+    fprintf(stderr, "Warning: scan of %s stalled with no progress for %ds (possible filesystem corruption)\n",
+            root, LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS / 1000);
+    return false;
+}
+
+static bool scan_spool_read_path(FILE * f, char * path, size_t path_size) {
+    uint32_t len = 0;
+    if (fread(&len, sizeof(len), 1, f) != 1) return false;
+    if (len == 0 || len >= path_size) {
+        if (fseek(f, (long) len, SEEK_CUR) != 0) return false;
+        path[0] = '\0';
+        return true;
+    }
+    if (fread(path, 1, len, f) != len) return false;
+    path[len] = '\0';
+    return true;
+}
+
+static void scan_one_song_into_db(const char * path) {
+    struct stat st;
+    bool have_stat = stat(path, &st) == 0;
+    int64_t mtime = have_stat ? (int64_t) st.st_mtime : 0;
+    int64_t size = have_stat ? (int64_t) st.st_size : 0;
+
+    cached_tags_t cached;
+    if (have_stat && metadata_db_get(path, mtime, size, &cached)) return;
+
+    track_metadata_t meta;
+    metadata_read_isolated(path, &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS);
+
+    cached_tags_t fresh;
+    memset(&fresh, 0, sizeof(fresh));
+    snprintf(fresh.title, sizeof(fresh.title), "%s", meta.has_title ? meta.title : "");
+    snprintf(fresh.artist, sizeof(fresh.artist), "%s", meta.has_artist ? meta.artist : "Unknown Artist");
+    snprintf(fresh.album, sizeof(fresh.album), "%s", meta.has_album ? meta.album : "Unknown Album");
+    const char * album_artist_value = meta.has_album_artist ? meta.album_artist
+                                     : (meta.has_artist ? meta.artist : "Unknown Artist");
+    snprintf(fresh.album_artist, sizeof(fresh.album_artist), "%s", album_artist_value);
+    snprintf(fresh.genre, sizeof(fresh.genre), "%s", meta.has_genre ? meta.genre : "Unknown Genre");
+    free(meta.picture_data);
+    free(meta.lyrics); /* always NULL here (metadata_read_isolated() itself already frees/NULLs it before the pipe write), freeing defensively for symmetry */
+
+    if (have_stat) metadata_db_put(path, mtime, size, &fresh);
+}
+
+/* Overall scan progress, polled by update_timer_cb while library_rescan_active
+ * is true to drive the "Updating music database..." screen's progress bar
+ * (Settings > Update Music Database) -- purely cosmetic, for the user's
+ * peace of mind that a rescan is actually moving rather than stuck, since
+ * the underlying incremental scan (metadata_db.c's mtime/size cache) is
+ * already fast on an unchanged library. _total is set once discovered_count
+ * is known (library_scan_once(), before its spool-reading loop starts);
+ * _done is advanced by that same loop, one file at a time (see
+ * scan_one_song_into_db()'s own caller in library_scan_once()). */
+
+/* Defined later, alongside the rest of the Books screen (needs
+ * books_scan_txt_files_with_timeout(), the live-walk fallback it shares
+ * with populate_books_files_screen()'s old scanning code). Folds the
+ * now-removed "Scanning" row's job into this same rescan, per real-device
+ * feedback -- one rescan action, not two separate ones for music and
+ * books. */
+
+
+/* Refreshes the persistent playlist cache (metadata_db.c) from
+ * PLAYLISTS_DIR only (the SD card's Playlists folder), not a walk of the
+ * whole music tree. Folded into library_scan_once() so it runs on Update
+ * Music Database. Ordinary in-app create/delete update the cache with a
+ * single insert/delete instead of calling this. */
+static void rescan_playlists(void) {
+    char ** paths = NULL;
+    int count = 0;
+    playlist_files_scan(PLAYLISTS_DIR, &paths, &count);
+    metadata_db_playlist_replace_all(paths, count);
+    for (int i = 0; i < count; i++) free(paths[i]);
+    free(paths);
+}
+
+
+void library_scan_once(void) {
+    library_scan_progress_done = 0;
+    library_scan_progress_total = 0;
+
+    metadata_db_open();
+    gui_books_rescan();
+    rescan_playlists();
+
+    char spool_path[PATH_MAX] = {0};
+    int discovered_count = 0;
+    if (!scan_all_songs_with_timeout(MUSIC_ROOT_DIR, spool_path, sizeof(spool_path), &discovered_count)) {
+        return; /* preserve the last known-good in-memory + on-disk library */
+    }
+
+    library_scan_progress_total = discovered_count;
+    metadata_db_begin_update();
+
+    FILE * spool = fopen(spool_path, "rb");
+    if (!spool) {
+        metadata_db_abort_update();
+        remove(spool_path);
+        return;
+    }
+
+    bool complete = true;
+    char path[PATH_MAX];
+    int done = 0;
+    while (done < discovered_count) {
+        if (!scan_spool_read_path(spool, path, sizeof(path))) {
+            complete = false;
+            break;
+        }
+        if (path[0] != '\0') scan_one_song_into_db(path);
+        library_scan_progress_done = ++done;
+    }
+    fclose(spool);
+    remove(spool_path);
+
+    if (!complete) {
+        metadata_db_abort_update();
+        return;
+    }
+
+    if (!metadata_db_end_update())
+        fprintf(stderr, "Warning: music database commit failed -- keeping last on-disk library\n");
+
+    library_load_from_cache_only();
+}
+
+/* Boot-time equivalent of library_scan_once() above (still used verbatim
+ * for the user-triggered Settings > Update Music Database rescan) that
+ * matches the stock player's own boot behavior: load whatever's already
+ * cached, don't walk the filesystem or re-read any file's tags. Real-device
+ * incident: the full scan_once() path took ~149 seconds against a real
+ * cache-cold 2066-song library (confirmed via persistent boot-checkpoint
+ * logging -- library_scan_once() ran synchronously from gui_init(), before
+ * this app's first frame could render or the main loop could start), long
+ * enough that this app had never once survived a genuine cold boot in this
+ * project's history -- no hardware watchdog would tolerate that delay, on
+ * any user's library of meaningful size. metadata_db_open() itself stays
+ * here (not removed): opening the on-disk tagcache (metadata_db.c) is
+ * a bounded index load, not per-file filesystem I/O, and
+ * finishes in well under a second even for a large library -- it's
+ * specifically the filesystem walk + per-file tag-parsing pass that had to
+ * move to the user-triggered-only path. All four library screens (All
+ * Songs, Artists, Albums, Album Artist) and every drill-down/search/A-Z
+ * feature reachable from them are DB-paged from the moment they're built,
+ * so boot never needs to build any whole-library in-memory snapshot at
+ * all -- the boot-time OOM this function exists to avoid (a 32,000-song
+ * library's worth of per-song structs, plus a widget-per-row cost, turning
+ * a completed scan into a boot loop on this device's 55MB RAM) simply has
+ * nothing left to trigger it. */
+void library_load_from_cache_only(void) {
+    library_scan_progress_done = 0;
+    library_scan_progress_total = 0;
+
+    /* Close first so a remounted card is not served from a still-open
+     * handle against the previous (or empty unmounted) mount. */
+    metadata_db_close();
+    metadata_db_open();
+}

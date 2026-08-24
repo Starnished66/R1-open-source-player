@@ -487,3 +487,8 @@ void compact_list_set_paged_provider(lv_obj_t * list, compact_list_fetch_page_cb
                                       int total_count);
 
 #endif /* SCREEN_BUILDERS_H */
+
+lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text);
+lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);
+lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_text, lv_event_cb_t on_click);
+lv_obj_t * add_section_header(lv_obj_t * parent, const char * text);

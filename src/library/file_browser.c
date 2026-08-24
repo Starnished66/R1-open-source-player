@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include "file_browser.h"
 #include "assets.h"
 #include "screen_builders.h" /* STATUS_BAR_CLEARANCE / TITLE_ROW_HEIGHT / LIST_ROW_* */
@@ -357,7 +358,7 @@ static void rebuild_list(void) {
  * directory's entries individually first would be wasted work. */
 #define SCAN_ALL_SONGS_MAX_DEPTH 64
 static void scan_all_songs_recursive(const char * dir_path, char *** paths, int * count, int * capacity, int depth,
-                                      volatile int * progress) {
+                                      atomic_int * progress) {
     if (depth > SCAN_ALL_SONGS_MAX_DEPTH) return;
 
     DIR * dir = opendir(dir_path);
@@ -384,7 +385,7 @@ static void scan_all_songs_recursive(const char * dir_path, char *** paths, int 
          * D-state scenario this exists to catch, per this file's own
          * caller in gui.c) for progress that already happened. See this
          * parameter's own doc comment in file_browser.h. */
-        if (progress) (*progress)++;
+        if (progress) atomic_fetch_add_explicit(progress, 1, memory_order_relaxed);
         if (!stat_ok) continue;
         /* Audit finding: a symlinked directory is already excluded by
          * lstat() above (S_ISDIR is false for it, matching this file's own
@@ -442,7 +443,7 @@ static int compare_paths(const void * a, const void * b) {
  * not in the discovery pass. This is the same separation that keeps Rockbox's
  * tagcache builder from needing an in-RAM representation of the whole library. */
 static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_visit_cb_t cb, void * user,
-                                     int * count, int depth, volatile int * progress,
+                                     int * count, int depth, atomic_int * progress,
                                      const char * excluded_top_level_dir) {
     if (depth > SCAN_ALL_SONGS_MAX_DEPTH) return true;
 
@@ -459,7 +460,7 @@ static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_vi
 
         struct stat st;
         bool stat_ok = lstat(full_path, &st) == 0;
-        if (progress) (*progress)++;
+        if (progress) atomic_fetch_add_explicit(progress, 1, memory_order_relaxed);
         if (!stat_ok) continue;
         /* Audit finding -- see scan_all_songs_recursive()'s own comment,
          * the sibling walker this mirrors. */
@@ -489,20 +490,20 @@ static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_vi
 }
 
 bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t cb, void * user,
-                                 int * out_count, volatile int * progress) {
+                                 int * out_count, atomic_int * progress) {
     return file_browser_walk_all_songs_excluding_top_level(root, NULL, cb, user, out_count, progress);
 }
 
 bool file_browser_walk_all_songs_excluding_top_level(const char * root, const char * excluded_dir,
                                                      file_browser_song_visit_cb_t cb, void * user,
-                                                     int * out_count, volatile int * progress) {
+                                                     int * out_count, atomic_int * progress) {
     int count = 0;
     bool completed = walk_all_songs_recursive(root, cb, user, &count, 0, progress, excluded_dir);
     if (out_count) *out_count = count;
     return completed;
 }
 
-bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, volatile int * progress) {
+bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, atomic_int * progress) {
     char ** paths = NULL;
     int count = 0;
     int capacity = 0;

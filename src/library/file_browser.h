@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #ifndef FILE_BROWSER_H
 #define FILE_BROWSER_H
 
@@ -60,7 +61,7 @@ bool file_browser_build_playlist_for_path(const char * path, char *** out_playli
  * corruption) without needing its own copy of the running count -- see
  * gui.c's scan_all_songs_with_timeout() for the actual stall-detection
  * logic this exists to support. */
-bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, volatile int * progress);
+bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, atomic_int * progress);
 
 /* Rockbox-style bounded-memory library walk. Unlike file_browser_scan_all_songs(),
  * this never builds an O(song_count) path array. Each playable file is delivered
@@ -70,7 +71,7 @@ bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * ou
  * per active directory, independent of library size. */
 typedef bool (*file_browser_song_visit_cb_t)(const char * path, void * user);
 bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t cb, void * user,
-                                 int * out_count, volatile int * progress);
+                                 int * out_count, atomic_int * progress);
 
 /* Database-oriented variant which prunes one immediate child directory of
  * root, case-insensitively.  Descendants with the same name elsewhere are
@@ -79,7 +80,7 @@ bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t
  * playable file on the card. */
 bool file_browser_walk_all_songs_excluding_top_level(const char * root, const char * excluded_dir,
                                                      file_browser_song_visit_cb_t cb, void * user,
-                                                     int * out_count, volatile int * progress);
+                                                     int * out_count, atomic_int * progress);
 
 /* Snapshot of the directory + on-screen row a file/playlist was last
  * tapped from, and a way to jump the browser back there -- for the

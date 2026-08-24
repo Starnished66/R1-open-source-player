@@ -9733,10 +9733,10 @@ bool gui_plugin_refresh_library(void) {
 typedef struct {
     char root[600];
     char spool_path[PATH_MAX];
-    volatile bool done;
+    atomic_bool done;
     bool ok;
     int count;
-    volatile int progress;
+    atomic_int progress;
 } scan_walk_work_t;
 
 /* Binary length-prefixed spool: paths can contain whitespace and, unlike a
@@ -9762,7 +9762,7 @@ static void * scan_walk_worker(void * arg) {
     w->ok = file_browser_walk_all_songs_excluding_top_level(
         w->root, AUDIOBOOKS_LIBRARY_DIR_NAME, scan_spool_visit_cb, spool, &w->count, &w->progress);
     if (fclose(spool) != 0) w->ok = false;
-    w->done = true; /* written last -- the only field polled below */
+    atomic_store_explicit(&w->done, true, memory_order_release);
     return NULL;
 }
 
@@ -9793,7 +9793,7 @@ static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path
     int last_seen_progress = 0;
     int stalled_ms = 0;
     for (;;) {
-        if (w->done) {
+        if (atomic_load_explicit(&w->done, memory_order_acquire)) {
             bool ok = w->ok;
             if (ok) {
                 snprintf(out_spool_path, out_spool_size, "%s", w->spool_path);
@@ -18940,7 +18940,7 @@ static void books_file_row_cb(lv_event_t * e) {
 
 typedef struct {
     char root[600];
-    volatile bool done;
+    atomic_bool done;
     bool ok;
     char ** paths;
     int count;
@@ -18949,7 +18949,7 @@ typedef struct {
 static void * books_scan_worker(void * arg) {
     books_scan_work_t * w = (books_scan_work_t *) arg;
     w->ok = text_reader_scan_txt_files(w->root, &w->paths, &w->count);
-    w->done = true; /* written last -- the only field polled below */
+    atomic_store_explicit(&w->done, true, memory_order_release);
     return NULL;
 }
 
@@ -18965,7 +18965,7 @@ static bool books_scan_txt_files_with_timeout(const char * root, char *** out_pa
     pthread_detach(thread); /* never joined either way -- see scan_all_songs_with_timeout()'s own comment */
 
     for (int waited_ms = 0; waited_ms < BOOKS_SCAN_TIMEOUT_MS; waited_ms += 20) {
-        if (w->done) {
+        if (atomic_load_explicit(&w->done, memory_order_acquire)) {
             bool ok = w->ok;
             *out_paths = w->paths;
             *out_count = w->count;

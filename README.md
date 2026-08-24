@@ -90,6 +90,7 @@ The intention isn't to recreate every quirk of the stock application. Where the 
 - Full screen synced Lyrics support. 
 - Dynamic playlist loading directly from the SD card
 - Incremental music database updates instead of rescanning the entire library
+- Rockbox tagcache as the on-disk music database (no SQLite)
 - Paged/virtualized song lists for very large albums and libraries
 - SD card hotplug support
 - Built-in plain-text (`.txt`) book reader with Favorites, scoped to `Books/` on the SD card

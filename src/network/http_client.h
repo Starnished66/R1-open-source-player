@@ -4,6 +4,81 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
+
+#define HTTP_MAX_HEADERS 32
+#define HTTP_HEADER_NAME_MAX 64
+#define HTTP_HEADER_VALUE_MAX 768
+
+#define HTTP_ERR_NONE ""
+#define HTTP_ERR_CANCELLED "cancelled"
+#define HTTP_ERR_DNS "dns"
+#define HTTP_ERR_CONNECT "connect"
+#define HTTP_ERR_CONNECT_TIMEOUT "connect_timeout"
+#define HTTP_ERR_TLS "tls"
+#define HTTP_ERR_TIMEOUT "timeout"
+#define HTTP_ERR_MALFORMED "malformed"
+#define HTTP_ERR_IO "io"
+#define HTTP_ERR_RESPONSE_TOO_LARGE "response_too_large"
+#define HTTP_ERR_INVALID_URL "invalid_url"
+#define HTTP_ERR_INVALID_REQUEST "invalid_request"
+#define HTTP_ERR_TOO_MANY_REDIRECTS "too_many_redirects"
+#define HTTP_ERR_INSECURE_REDIRECT "insecure_redirect"
+
+typedef struct http_cancel_token {
+    pthread_mutex_t mutex;
+    int fd;
+    bool cancel_requested;
+} http_cancel_token_t;
+
+void http_cancel_token_init(http_cancel_token_t * tok);
+void http_cancel_token_destroy(http_cancel_token_t * tok);
+void http_cancel_token_cancel(http_cancel_token_t * tok);
+bool http_cancel_token_is_cancelled(http_cancel_token_t * tok);
+
+typedef enum {
+    HTTP_METHOD_GET = 0,
+    HTTP_METHOD_POST,
+    HTTP_METHOD_PUT,
+    HTTP_METHOD_PATCH,
+    HTTP_METHOD_DELETE,
+    HTTP_METHOD_HEAD
+} http_method_t;
+
+typedef struct {
+    char name[HTTP_HEADER_NAME_MAX];
+    char value[HTTP_HEADER_VALUE_MAX];
+} http_header_t;
+
+const char * http_headers_get(const http_header_t * headers, int count, const char * name);
+
+typedef struct {
+    char url[2048];
+    http_method_t method;
+    http_header_t headers[HTTP_MAX_HEADERS];
+    int header_count;
+    const uint8_t * body;
+    size_t body_len;
+    const char * content_type;
+    bool verify_tls;
+    uint32_t connect_timeout_ms;
+    uint32_t read_timeout_ms;
+    uint32_t total_timeout_ms;
+    size_t max_response_bytes;
+    int redirect_limit;
+} http_request_t;
+
+typedef struct {
+    int status;
+    http_header_t headers[HTTP_MAX_HEADERS];
+    int header_count;
+    uint8_t * body;
+    size_t body_len;
+    const char * error;
+} http_response_t;
+
+bool http_request_ex(const http_request_t * req_in, http_cancel_token_t * cancel, http_response_t * resp);
+void http_response_free(http_response_t * resp);
 
 /* One-shot GET request (used for the small JSON API responses -- Subsonic's
  * REST API is GET-only). Buffers the whole response body in memory, which
@@ -60,5 +135,10 @@ bool http_get_to_file(const char * url, bool verify_tls, const char * dest_path,
 bool http_get_to_file_ex(const char * url, bool verify_tls, const char * dest_path,
                           http_progress_cb_t progress_cb, void * progress_user_data,
                           char * out_content_type, size_t out_content_type_size);
+
+/* Like http_get_to_file(), with a hard body-size cap. max_body_size 0 means
+ * the internal default (2 GiB). Used by plugin.download_file_async(). */
+bool http_get_to_file_bounded(const char * url, bool verify_tls, const char * dest_path, size_t max_body_size,
+                               http_progress_cb_t progress_cb, void * progress_user_data);
 
 #endif /* HTTP_CLIENT_H */

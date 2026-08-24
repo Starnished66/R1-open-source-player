@@ -41,7 +41,7 @@ static void rebuild_list(void);
 
 /* Kept in sync with audio.c's decoder dispatch. */
 static const char * const PLAYABLE_EXTENSIONS[] = {
-    ".flac", ".mp3", ".wav", ".aiff", ".aif", ".dsf", ".dff", ".aac", ".m4a", ".ape", ".wma", ".opus", ".ogg",
+    ".flac", ".mp3", ".wav", ".aiff", ".aif", ".dsf", ".dff", ".aac", ".m4a", ".m4b", ".ape", ".wma", ".opus", ".ogg",
 };
 
 static bool is_playable_file(const char * name) {

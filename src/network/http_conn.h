@@ -11,6 +11,21 @@
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/x509_crt.h"
 
+struct http_cancel_token; /* defined in http_client.h */
+
+typedef enum {
+    HTTP_CONN_OK = 0,
+    HTTP_CONN_ERR_CANCELLED,
+    HTTP_CONN_ERR_DNS,
+    HTTP_CONN_ERR_SOCKET,
+    HTTP_CONN_ERR_CONNECT,
+    HTTP_CONN_ERR_CONNECT_TIMEOUT,
+    HTTP_CONN_ERR_TLS_SETUP,
+    HTTP_CONN_ERR_TLS_HANDSHAKE,
+    HTTP_CONN_ERR_TLS_HANDSHAKE_TIMEOUT,
+    HTTP_CONN_ERR_TLS_VERIFY
+} http_conn_error_t;
+
 /* Low-level HTTP(S) connection primitives, shared by http_client.c's
  * bounded one-shot GET requests and http_stream.c's unbounded live-stream
  * reader -- URL parsing, opening a plain-TCP-or-mbedTLS connection, and a
@@ -31,6 +46,8 @@ typedef struct {
     mbedtls_ctr_drbg_context ctr_drbg;
     mbedtls_entropy_context entropy;
     bool ssl_initialized; /* only the https fields above need mbedtls_*_free() */
+    bool last_read_timed_out;
+    struct http_cancel_token * cancel_token;
 } http_conn_t;
 
 /* Splits a http(s):// URL into host/port/path. port is filled with the
@@ -46,6 +63,9 @@ bool http_conn_parse_url(const char * url, bool * out_https, char * host, size_t
  * still call http_conn_close() either way, to release whatever TLS state
  * did get initialized before the failure. */
 bool http_conn_open(http_conn_t * conn, const char * host, const char * port, bool https, bool verify_tls);
+bool http_conn_open_ex(http_conn_t * conn, const char * host, const char * port, bool https, bool verify_tls,
+                        uint32_t connect_timeout_ms, uint32_t read_timeout_ms,
+                        struct http_cancel_token * cancel, http_conn_error_t * out_error);
 
 int http_conn_write(http_conn_t * conn, const uint8_t * data, size_t len);
 

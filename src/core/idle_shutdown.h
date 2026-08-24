@@ -10,9 +10,12 @@
  * the screen blank while the backlight stays on), so a full poweroff is the
  * only reliable way to actually cut standby power draw -- see gui.c's
  * idle-shutdown timer for the inactivity gating (screen off, not playing,
- * not charging) before this gets called. Does not return on success; the
- * caller doesn't need to do anything else once this is called. No-op on
- * host (subprocess_run() just fails to find /sbin/poweroff there). */
+ * not charging) before this gets called. Replaces this process with
+ * busybox `poweroff -f` (then the reboot(RB_POWER_OFF) syscall if exec
+ * fails) so it cannot return on the device. Must not use subprocess_run():
+ * that helper SIGKILLs its child after 15s, which cancelled poweroff and
+ * left the countdown looking finished while the device stayed on. No-op
+ * on host. */
 void idle_shutdown_now(void);
 
 #endif /* IDLE_SHUTDOWN_H */

@@ -961,6 +961,9 @@ static void m4a_read_cover_art(FILE * f, m4a_box_t item, track_metadata_t * out)
     long payload_offset;
     uint32_t payload_size;
     if (!m4a_find_data_payload(f, item, &payload_offset, &payload_size) || payload_size == 0) return;
+    /* Audiobook/M4B covers are often multi-megabyte JPEGs. Unbounded
+     * malloc here races the decoder's own RAM on the 56 MiB target. */
+    if (payload_size > 4U * 1024U * 1024U) return;
 
     uint8_t * data = malloc(payload_size);
     if (!data) return;
@@ -1699,7 +1702,7 @@ void metadata_read(const char * path, track_metadata_t * out) {
         if (!out->has_title) read_wav_id3_fallback(path, out); /* see its own comment */
     } else if (strcasecmp(ext, ".aac") == 0) {
         read_aac_metadata(path, out);
-    } else if (strcasecmp(ext, ".m4a") == 0) {
+    } else if (strcasecmp(ext, ".m4a") == 0 || strcasecmp(ext, ".m4b") == 0) {
         read_m4a_metadata(path, out);
     } else if (strcasecmp(ext, ".opus") == 0) {
         read_opus_metadata(path, out);
@@ -1736,24 +1739,47 @@ void metadata_read(const char * path, track_metadata_t * out) {
  * single core, which reads as "frozen" even though no single file was
  * truly stuck forever.
  *
- * This runs the real parse in a short-lived child process instead of the
- * calling thread, exactly like subprocess.c's own SIGKILL-on-timeout
+ * This runs those decoder parses in a short-lived child process instead of
+ * the calling thread, exactly like subprocess.c's own SIGKILL-on-timeout
  * pattern (see subprocess_run_timeout()'s doc comment) -- unlike a leaked
  * thread, the OS fully reclaims a killed process's CPU and memory
- * immediately, and a hard crash inside the decoder (a plausible cause
- * given garbage data is being parsed as if it were valid) is contained to
- * that one child instead of taking down the whole app. picture_data/lyrics
- * are always dropped (freed in the child, never sent back) -- getting a
- * variable-length buffer across a fork boundary isn't worth the
- * complexity for the one caller (a bulk library scan) that needs this,
- * which already discards the picture/lyrics right after this call anyway
- * (a rescan only cares about title/artist/album for the DB). */
+ * immediately, and a hard crash inside the decoder is contained to that
+ * one child instead of taking down the whole app.
+ *
+ * Forking the static player (~5.6 MiB) once per file is itself the scan
+ * bottleneck on this single-core target (~160 ms/file measured on a 60k
+ * dummy-MP3 library). MP3/AAC only run our own bounded ID3 reader, so they
+ * skip the child. picture_data/lyrics are always dropped -- a rescan only
+ * cares about title/artist/album for the DB, and getting a variable-length
+ * buffer across a fork boundary isn't worth it for the formats that still
+ * isolate. */
+static bool isolated_needs_child(const char * path) {
+    const char * ext = strrchr(path, '.');
+    if (!ext) return false;
+    if (strcasecmp(ext, ".mp3") == 0 || strcasecmp(ext, ".aac") == 0) return false;
+    return true;
+}
+
+static void metadata_read_scan_tags(const char * path, track_metadata_t * out) {
+    metadata_read(path, out);
+    free(out->picture_data);
+    out->picture_data = NULL;
+    out->picture_size = 0;
+    free(out->lyrics);
+    out->lyrics = NULL;
+}
+
 void metadata_read_isolated(const char * path, track_metadata_t * out, int timeout_ms) {
     memset(out, 0, sizeof(*out));
+    if (!path || !path[0]) return;
+    if (!isolated_needs_child(path)) {
+        metadata_read_scan_tags(path, out);
+        return;
+    }
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
-        metadata_read(path, out); /* pipe() failing is exotic enough to fall back to the plain, unprotected read rather than reporting every file unreadable */
+        metadata_read_scan_tags(path, out); /* pipe() failing is exotic enough to fall back in-process */
         return;
     }
 
@@ -1761,19 +1787,14 @@ void metadata_read_isolated(const char * path, track_metadata_t * out, int timeo
     if (pid < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
-        metadata_read(path, out);
+        metadata_read_scan_tags(path, out);
         return;
     }
 
     if (pid == 0) {
         close(pipefd[0]);
         track_metadata_t result;
-        metadata_read(path, &result);
-        free(result.picture_data);
-        result.picture_data = NULL;
-        result.picture_size = 0;
-        free(result.lyrics);
-        result.lyrics = NULL;
+        metadata_read_scan_tags(path, &result);
         size_t written = 0;
         while (written < sizeof(result)) {
             ssize_t n = write(pipefd[1], (const char *) &result + written, sizeof(result) - written);

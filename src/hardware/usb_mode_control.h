@@ -17,16 +17,16 @@ typedef enum {
 } usb_mode_t;
 
 /* Switches the USB gadget to `mode`, reusing the stock firmware's own
- * /usr/bin/{adbon,adboff,uac_device_config.sh,usb_dev_mass_storage.sh} and
+ * /usr/bin/{uac_device_config.sh,usb_dev_mass_storage.sh} and
  * /etc/init.d/adb/S440adb scripts (confirmed present and byte-identical to
  * the squashfs-root reference dump on a real device) rather than
  * reimplementing USB gadget configfs setup. Always tears down every mode's
  * gadget first, not just whichever the caller thinks was previously
- * active -- each stop script already self-guards (exits immediately) if
- * its own gadget isn't currently up, so this is safe and side-steps ever
- * needing to trust in-app state against hardware state that doesn't
- * survive a reboot anyway. Blocking (several real configfs/sysfs writes
- * per script); call off the UI thread.
+ * active. Storage teardown is done in C (eject LUN, unbind UDC, rmdir)
+ * instead of usb_dev_mass_storage.sh stop: that script re-binds UDC if
+ * the mass-storage function is still busy, which is what blocked ADB/DAC
+ * while the SD card was exported. Blocking (several real configfs/sysfs
+ * writes per script); call off the UI thread.
  *
  * Returns true only if the target's own start script exited 0 AND the
  * resulting gadget is actually verified bound to the UDC afterward -- a
@@ -52,5 +52,10 @@ bool usb_mode_control_apply(usb_mode_t mode);
  * is clearly active, so callers can fall back to the persisted preference
  * rather than guessing. */
 bool usb_mode_control_detect_current(usb_mode_t * out_mode);
+
+/* Best-effort physical USB-power/cable presence. Used only to detect a new
+ * connection and (re)bind the default Storage gadget; it does not claim to
+ * distinguish a PC host from a charge-only adapter. */
+bool usb_mode_control_cable_connected(void);
 
 #endif /* USB_MODE_CONTROL_H */

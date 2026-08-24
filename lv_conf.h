@@ -42,6 +42,18 @@
 #define LV_FONT_MONTSERRAT_34 1
 #define LV_FONT_MONTSERRAT_40 1
 
+/* Built-in 8x16 monospace bitmap font (lv_font_unscii_16), for plugin rows
+ * that opt into a pixel/mono look (plugin.set_home_layout()'s per-tile
+ * text_size = "mono" -- see pill_row_resolve_text_size() in
+ * screen_builders.c). Already vendored under lvgl/src/font/ and already
+ * compiled unconditionally either way (same "the .o always builds, only the
+ * glyph data inside is conditional" story as every LV_FONT_MONTSERRAT_*
+ * above) -- this just flips it on. Unlike this app's own regenerated
+ * Montserrat tiers, LVGL's stock unscii_16 is plain ASCII-only (no Latin-1
+ * Supplement), so a "mono" label with accented/non-Latin characters will
+ * show blank glyphs for those characters. */
+#define LV_FONT_UNSCII_16 1
+
 /* LVGL's own unconfigured default is lv_font_montserrat_14 (see
  * lv_conf_internal.h) -- every label in this codebase that never sets an
  * explicit text_font style (roughly half of them: dialogs, toasts, misc

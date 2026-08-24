@@ -25,6 +25,14 @@ void assets_init(void);
  * in this codebase that are likewise never freed. */
 const char * asset_path(const char * relative_path);
 
+/* Same override-root-then-stock-root resolution as asset_path(), but
+ * returns a plain absolute filesystem path with no "S:" LVGL-driver
+ * prefix -- for callers that add their own prefix/handling downstream
+ * (e.g. pill_row_apply_icon()'s icon_asset contract, screen_builders.c)
+ * rather than passing straight into an LVGL image-source setter. Same
+ * heap-allocated-and-never-freed tradeoff as asset_path() above. */
+const char * asset_path_plain(const char * relative_path);
+
 /* Loads a small PNG into a process-lifetime variable image descriptor.
  * This avoids reopening immutable slider artwork on every redraw. Falls
  * back to NULL if the asset cannot be read. */

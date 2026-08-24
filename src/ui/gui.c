@@ -2383,7 +2383,9 @@ static void start_refresh_bt_icon(void) {
     if (refresh_bt_icon_active) return; /* previous check still in flight -- same "ignore taps until it lands" pattern as everything else here */
     refresh_bt_icon_active = true;
     refresh_bt_icon_done_flag = false;
-    pthread_create(&refresh_bt_icon_thread, NULL, refresh_bt_icon_thread_func, NULL);
+        if (pthread_create(&refresh_bt_icon_thread, NULL, refresh_bt_icon_thread_func, NULL) != 0) {
+        refresh_bt_icon_active = false;
+    }
 }
 
 static void populate_bt_screen(void); /* defined with the rest of the Bluetooth settings screen, below */
@@ -4150,7 +4152,9 @@ static void start_bt_dac_startup_reapply_if_needed(void) {
     if (!current_settings.bt_dac_mode_enabled) return;
     bt_dac_startup_reapply_active = true;
     bt_dac_startup_reapply_done_flag = false;
-    pthread_create(&bt_dac_startup_reapply_thread, NULL, bt_dac_startup_reapply_thread_func, NULL);
+        if (pthread_create(&bt_dac_startup_reapply_thread, NULL, bt_dac_startup_reapply_thread_func, NULL) != 0) {
+        bt_dac_startup_reapply_active = false;
+    }
 }
 
 
@@ -4204,7 +4208,10 @@ static void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sy
     req->volume_sync_enabled = volume_sync_enabled;
     bt_apply_output_settings_done_flag = false;
     bt_apply_output_settings_active = true;
-    pthread_create(&bt_apply_output_settings_thread, NULL, bt_apply_output_settings_thread_func, req);
+        if (pthread_create(&bt_apply_output_settings_thread, NULL, bt_apply_output_settings_thread_func, req) != 0) {
+        bt_apply_output_settings_active = false;
+        free(req);
+    }
 }
 
 static void populate_bt_dac_screen(void); /* defined with the rest of the Bluetooth DAC screen, below */
@@ -6825,6 +6832,14 @@ static bool screen_off_playback_active = false;
  * attempt rather than being permanently given up on after one failure. */
 static bool idle_shutdown_attempted = false;
 
+
+static bool library_rescan_success_pending;
+static bool download_active;
+static bool subsonic_library_download_active;
+static bool subsonic_connect_active;
+static bool album_thumbnail_active;
+static atomic_bool album_thumb_gen_active;
+
 static bool shutdown_background_work_active(void) {
     return library_rescan_active || library_rescan_success_pending || album_thumbnail_active ||
            atomic_load(&album_thumb_gen_active) || download_active || subsonic_library_download_active ||
@@ -7489,7 +7504,9 @@ static void update_timer_cb(lv_timer_t * timer) {
             if (bt_was_on_before_suspend && !bt_is_powered_cached && !bt_toggle_active) {
                 bt_toggle_active = true;
                 bt_toggle_done_flag = false;
-                pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL);
+                    if (pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL) != 0) {
+        bt_toggle_active = false;
+    }
             }
             radios_suspended = false;
         }
@@ -7536,7 +7553,9 @@ static void update_timer_cb(lv_timer_t * timer) {
             if (bt_was_on_before_suspend && !bt_toggle_active) {
                 bt_toggle_active = true;
                 bt_toggle_done_flag = false;
-                pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL);
+                    if (pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL) != 0) {
+        bt_toggle_active = false;
+    }
             }
             radios_suspended = true;
         }
@@ -16714,7 +16733,11 @@ static void start_bt_connect(const char * mac) {
     bt_connect_failed_mac[0] = '\0';
     populate_bt_screen(); /* immediate inline "Connecting..." on that row */
 
-    pthread_create(&bt_connect_thread, NULL, bt_connect_thread_func, req);
+        if (pthread_create(&bt_connect_thread, NULL, bt_connect_thread_func, req) != 0) {
+        bt_connect_active = false;
+        free(req);
+        if (bt_list) lv_obj_invalidate(bt_list);
+    }
 }
 
 static void poll_bt_connect(void) {
@@ -16757,7 +16780,10 @@ static void start_bt_forget(const char * mac) {
 
     bt_forget_done_flag = false;
     bt_forget_active = true;
-    pthread_create(&bt_forget_thread, NULL, bt_forget_thread_func, req);
+        if (pthread_create(&bt_forget_thread, NULL, bt_forget_thread_func, req) != 0) {
+        bt_forget_active = false;
+        free(req);
+    }
 }
 
 /* Real-device feedback: forgetting a device used to refresh the list via
@@ -16979,7 +17005,9 @@ static void start_bt_scan(void) {
     bt_scan_done_flag = false;
     bt_scan_active = true;
 
-    pthread_create(&bt_scan_thread, NULL, bt_scan_thread_func, NULL);
+        if (pthread_create(&bt_scan_thread, NULL, bt_scan_thread_func, NULL) != 0) {
+        bt_scan_active = false;
+    }
 }
 
 static void poll_bt_scan(void) {

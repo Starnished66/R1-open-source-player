@@ -7,6 +7,7 @@
 #include "gui_library.h"
 #include "gui_queue.h"
 #include "gui_player.h"
+#include "gui_plugins.h"
 #include "metadata_db.h"
 
 
@@ -381,6 +382,12 @@ extern lv_obj_t * quick_drawer_artist_label;
 extern lv_obj_t * quick_drawer_favorite_icon;
 extern lv_obj_t * quick_drawer_play_btn;
 void quick_drawer_mark_snapshot_dirty(void);
+
+
+void toggle_play_pause(void);
+int compute_manual_step_index(int index, int direction);
+void on_file_selected(char ** new_playlist, int count, int selected_index);
+void clear_player_source(void);
 
 /* ---- Shared GUI and Screen Builders Helpers ---- */
 extern lv_style_t style_accent;

@@ -2,6 +2,7 @@
 #include "gui.h"
 #include "peq.h"
 #include "http_client.h"
+#include "playlist_files.h"
 #include "plugin_json.h"
 #include "plugin_storage.h"
 #include "mbedtls/md5.h" /* plugin.md5() -- same primitive subsonic_client.c already uses for its own token auth */
@@ -41,6 +42,10 @@
    * than writing files nothing would ever read. */
   #define PLUGIN_THEME_OVERRIDE_ROOT "/usr/data/theme_overrides/"
 #endif
+
+/* Same "each file defines its own derived-path macro" convention as
+ * MUSIC_ROOT_DIR above -- matches gui.c's own PLAYLISTS_DIR exactly. */
+#define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
 
 #define PLUGIN_MAX_FILES 16
 #define PLUGIN_MAX_LIST_ITEMS 500
@@ -283,6 +288,17 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *   plugin.sd_root()
  *     Returns the SD card's absolute mount path, so a script can build
  *     paths under it (e.g. plugin.sd_root() .. "/Audiobooks").
+ *
+ *   plugin.playlist_list() -> { m3u_path, ... } | nil
+ *   plugin.playlist_read(m3u_path) -> { song_path, ... } | nil
+ *   plugin.playlist_create(name, song_path) -> m3u_path | nil
+ *   plugin.playlist_add(m3u_path, song_path) -> bool
+ *   plugin.playlist_remove(m3u_path, song_path) -> bool
+ *   plugin.playlist_delete(m3u_path) -> bool
+ *     CRUD over .m3u playlists under the same Playlists folder the native
+ *     Playlists screen uses. create()/delete() also update the app's
+ *     playlist-existence cache, so the result shows up/disappears there
+ *     immediately rather than needing a full library rescan.
  *
  *   plugin.play_file(path)
  *     Plays a single file as a fresh one-song playlist.
@@ -2075,6 +2091,81 @@ static int l_plugin_get_next_album_tracks(lua_State * L) {
     return push_string_array_result(L, tracks, count);
 }
 
+/* ---- plugin.playlist_* -- CRUD over .m3u playlists under PLAYLISTS_DIR,
+ * exactly where the native Playlists screen looks. playlist_create()/
+ * playlist_delete() also update metadata_db's playlist-existence cache
+ * (metadata_db_playlist_insert_one()/_delete_one(), reachable here via
+ * gui.h's own #include "metadata_db.h") so a plugin-created/deleted
+ * playlist shows up/disappears there immediately instead of needing a full
+ * rescan -- matching every native call site (gui.c's own
+ * add_to_playlist_confirm_cb()/playlist_delete_row_cb() and friends).
+ * playlist_add()/playlist_remove() only edit a playlist's contents, which
+ * that cache never tracks (confirmed against every native call site doing
+ * the same), so they call playlist_files_append()/_remove() alone. ---- */
+
+/* plugin.playlist_list() -> { m3u_path, ... } | nil */
+static int l_plugin_playlist_list(lua_State * L) {
+    char ** paths = NULL;
+    int count = 0;
+    if (!playlist_files_scan(PLAYLISTS_DIR, &paths, &count)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return push_string_array_result(L, paths, count);
+}
+
+/* plugin.playlist_read(m3u_path) -> { song_path, ... } | nil */
+static int l_plugin_playlist_read(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    char ** paths = NULL;
+    int count = 0;
+    if (!playlist_files_read(m3u_path, &paths, &count)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    return push_string_array_result(L, paths, count);
+}
+
+/* plugin.playlist_create(name, song_path) -> m3u_path | nil */
+static int l_plugin_playlist_create(lua_State * L) {
+    const char * name = luaL_checkstring(L, 1);
+    const char * song_path = luaL_checkstring(L, 2);
+
+    char created_path[512];
+    if (!playlist_files_create(PLAYLISTS_DIR, name, song_path, created_path, sizeof(created_path))) {
+        lua_pushnil(L);
+        return 1;
+    }
+    metadata_db_playlist_insert_one(created_path);
+    lua_pushstring(L, created_path);
+    return 1;
+}
+
+/* plugin.playlist_add(m3u_path, song_path) -> bool */
+static int l_plugin_playlist_add(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    const char * song_path = luaL_checkstring(L, 2);
+    lua_pushboolean(L, playlist_files_append(m3u_path, song_path));
+    return 1;
+}
+
+/* plugin.playlist_remove(m3u_path, song_path) -> bool */
+static int l_plugin_playlist_remove(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    const char * song_path = luaL_checkstring(L, 2);
+    lua_pushboolean(L, playlist_files_remove(m3u_path, song_path));
+    return 1;
+}
+
+/* plugin.playlist_delete(m3u_path) -> bool */
+static int l_plugin_playlist_delete(lua_State * L) {
+    const char * m3u_path = luaL_checkstring(L, 1);
+    bool ok = playlist_files_delete(m3u_path);
+    if (ok) metadata_db_playlist_delete_one(m3u_path);
+    lua_pushboolean(L, ok);
+    return 1;
+}
+
 /* ---- plugin.library_* -- paged, DB-backed library access (see gui.h's own
  * gui_plugin_library_* comment for the design intent: bounded per call,
  * never a whole-library dump). Every row pushes the same {id, path, title,
@@ -2586,6 +2677,12 @@ static const luaL_Reg plugin_funcs[] = {
     { "show_settings_list",        l_plugin_show_settings_list },
     { "list_dir",                  l_plugin_list_dir },
     { "sd_root",                   l_plugin_sd_root },
+    { "playlist_list",             l_plugin_playlist_list },
+    { "playlist_read",             l_plugin_playlist_read },
+    { "playlist_create",           l_plugin_playlist_create },
+    { "playlist_add",              l_plugin_playlist_add },
+    { "playlist_remove",           l_plugin_playlist_remove },
+    { "playlist_delete",           l_plugin_playlist_delete },
     { "mkdir",                     l_plugin_mkdir },
     { "play_file",                 l_plugin_play_file },
     { "play_list",                 l_plugin_play_list },

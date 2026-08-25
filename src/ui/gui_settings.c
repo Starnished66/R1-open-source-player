@@ -465,7 +465,7 @@ static void accent_color_row_cb(lv_event_t * e) {
 
 static lv_obj_t * custom_font_list = NULL;
 static lv_obj_t * custom_font_preview_latin = NULL;
-static lv_obj_t * custom_font_preview_fallback = NULL;
+static lv_obj_t * custom_font_preview_note = NULL;
 static char discovered_custom_fonts[MAX_CUSTOM_FONTS_DISCOVERED][64];
 static int discovered_custom_font_count = 0;
 
@@ -572,11 +572,15 @@ static lv_obj_t * build_custom_font_screen(void) {
     lv_obj_set_style_text_font(custom_font_preview_latin, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
     lv_obj_align(custom_font_preview_latin, LV_ALIGN_TOP_LEFT, 12, 32);
 
-    custom_font_preview_fallback = lv_label_create(preview_card);
-    lv_label_set_text(custom_font_preview_fallback, "日本語 / 한국어 / Русский / ไทย");
-    lv_obj_add_style(custom_font_preview_fallback, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(custom_font_preview_fallback, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
-    lv_obj_align(custom_font_preview_fallback, LV_ALIGN_TOP_LEFT, 12, 62);
+    /* Custom fonts intentionally replace only the Latin face.  Rendering a
+     * sample spanning every file-backed fallback here made this screen take
+     * seconds to enter and leave on slow flash, while not previewing anything
+     * the selected custom font can change. */
+    custom_font_preview_note = lv_label_create(preview_card);
+    lv_label_set_text(custom_font_preview_note, "Custom fonts affect Latin text only.");
+    lv_obj_add_style(custom_font_preview_note, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(custom_font_preview_note, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_align(custom_font_preview_note, LV_ALIGN_TOP_LEFT, 12, 62);
 
     lv_obj_t * hint = lv_label_create(preview_card);
     lv_label_set_text(hint, "Place .ttf fonts in SD /Fonts folder.");

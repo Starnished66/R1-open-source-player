@@ -108,7 +108,7 @@ gui_busy_handle_t import_web_stop_token = 0;
 #include <unistd.h>
 
 #ifdef UI_PERF_TRACE
-static uint64_t ui_perf_now_us(void) {
+uint64_t ui_perf_now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t) ts.tv_nsec / 1000ULL;

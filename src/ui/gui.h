@@ -17,6 +17,10 @@
 #include "albumart.h" /* song_row_t/group_row_t, reused as-is by the gui_plugin_library_* declarations below */
 #include "remote_track.h" /* remote_track_meta_t, used by gui_plugin_play_remote_tracks() below */
 #include <stdint.h>
+
+#ifdef UI_PERF_TRACE
+uint64_t ui_perf_now_us(void);
+#endif
 #include <stddef.h>
 
 /* Initialize the user interface elements and callbacks */

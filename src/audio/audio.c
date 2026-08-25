@@ -28,6 +28,7 @@
 #include <strings.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <limits.h>
 
 #ifdef HOST_BUILD
   #include <SDL2/SDL.h>
@@ -515,13 +516,6 @@ static uint64_t seek_request_generation = 0;
 static char * active_path = NULL; /* protected by audio_mutex */
 
 typedef struct {
-    char * path;
-    uint64_t frame;
-    uint64_t playback_generation;
-    uint64_t seek_generation;
-} seek_work_t;
-
-typedef struct {
     decoder_t dec;
     uint64_t frame;
     uint64_t playback_generation;
@@ -531,6 +525,16 @@ typedef struct {
 /* Produced by a detached seek worker, consumed only by the playback
  * thread. A newer worker may replace an unconsumed result under the mutex. */
 static prepared_seek_t * prepared_seek = NULL;
+
+/* One seek worker at a time. Rapid progress-bar taps used to pthread_create
+ * a new decoder_open()+decoder_seek() per release; generation only dropped
+ * the finished result, so several FLAC opens ran together, saturated this
+ * device, and the player UI stopped taking taps for ~10-15s. A newer
+ * audio_seek() while the worker is busy just updates these fields; the
+ * in-flight worker loops onto the latest target instead of stacking. */
+static bool seek_worker_active = false;
+static uint64_t seek_pending_frame = 0;
+static uint64_t seek_pending_playback_generation = 0;
 
 static uint64_t frames_played = 0;
 static uint64_t current_total_frames = 0;
@@ -562,44 +566,78 @@ static double replaygain_to_linear(bool has_gain, double gain_db, bool has_peak,
 }
 
 static void * seek_worker_func(void * arg) {
-    seek_work_t * work = arg;
-    prepared_seek_t * ready = calloc(1, sizeof(*ready));
-    if (ready && decoder_open(&ready->dec, work->path)) {
-        if (work->frame > ready->dec.total_frames) work->frame = ready->dec.total_frames;
-        decoder_seek(&ready->dec, work->frame);
-        ready->frame = work->frame;
-        ready->playback_generation = work->playback_generation;
-        ready->seek_generation = work->seek_generation;
-    } else {
-        free(ready);
-        ready = NULL;
-    }
+    (void) arg;
 
-    prepared_seek_t * superseded = NULL;
-    pthread_mutex_lock(&audio_mutex);
-    bool still_current = ready &&
-        playback_generation == work->playback_generation &&
-        seek_request_generation == work->seek_generation &&
-        !restart_requested && !stop_requested;
-    if (still_current) {
-        superseded = prepared_seek;
-        prepared_seek = ready;
-        ready = NULL;
-        pthread_cond_signal(&audio_cond);
-    }
-    pthread_mutex_unlock(&audio_mutex);
+    for (;;) {
+        uint64_t frame, pgen, sgen;
+        char * path;
+        pthread_mutex_lock(&audio_mutex);
+        if (!active_path || seek_pending_playback_generation != playback_generation) {
+            seek_worker_active = false;
+            pthread_mutex_unlock(&audio_mutex);
+            return NULL;
+        }
+        path = strdup(active_path);
+        if (!path) {
+            seek_worker_active = false;
+            pthread_mutex_unlock(&audio_mutex);
+            return NULL;
+        }
+        frame = seek_pending_frame;
+        pgen = seek_pending_playback_generation;
+        sgen = seek_request_generation;
+        pthread_mutex_unlock(&audio_mutex);
 
-    if (superseded) {
-        decoder_close(&superseded->dec);
-        free(superseded);
+        prepared_seek_t * ready = calloc(1, sizeof(*ready));
+        bool opened = ready && decoder_open(&ready->dec, path);
+        free(path);
+        if (opened) {
+            pthread_mutex_lock(&audio_mutex);
+            bool stale = (playback_generation != pgen) || (seek_request_generation != sgen);
+            pthread_mutex_unlock(&audio_mutex);
+            if (stale) {
+                decoder_close(&ready->dec);
+                free(ready);
+                continue;
+            }
+            if (frame > ready->dec.total_frames) frame = ready->dec.total_frames;
+            decoder_seek(&ready->dec, frame);
+            ready->frame = frame;
+            ready->playback_generation = pgen;
+            ready->seek_generation = sgen;
+        } else {
+            free(ready);
+            ready = NULL;
+        }
+
+        pthread_mutex_lock(&audio_mutex);
+        bool still_current = ready &&
+            playback_generation == pgen &&
+            seek_request_generation == sgen &&
+            !restart_requested && !stop_requested;
+        if (still_current) {
+            prepared_seek_t * superseded = prepared_seek;
+            prepared_seek = ready;
+            ready = NULL;
+            seek_worker_active = false;
+            pthread_cond_signal(&audio_cond);
+            pthread_mutex_unlock(&audio_mutex);
+            if (superseded) {
+                decoder_close(&superseded->dec);
+                free(superseded);
+            }
+            return NULL;
+        }
+
+        bool retry = (playback_generation == pgen) && (seek_request_generation != sgen);
+        if (!retry) seek_worker_active = false;
+        pthread_mutex_unlock(&audio_mutex);
+        if (ready) {
+            decoder_close(&ready->dec);
+            free(ready);
+        }
+        if (!retry) return NULL;
     }
-    if (ready) {
-        decoder_close(&ready->dec);
-        free(ready);
-    }
-    free(work->path);
-    free(work);
-    return NULL;
 }
 
 /* Real-device feedback: "noticeable sound hissing in quiet songs, not
@@ -1232,22 +1270,27 @@ void audio_seek(double seconds) {
     if (seconds < 0.0) seconds = 0.0;
     uint64_t frame = (uint64_t) (seconds * (double) current_sample_rate);
     if (frame > current_total_frames) frame = current_total_frames;
-    seek_work_t * work = calloc(1, sizeof(*work));
-    if (!work) { pthread_mutex_unlock(&audio_mutex); return; }
-    work->path = strdup(active_path);
-    if (!work->path) { free(work); pthread_mutex_unlock(&audio_mutex); return; }
-    work->frame = frame;
-    work->playback_generation = playback_generation;
-    work->seek_generation = ++seek_request_generation;
+    seek_pending_frame = frame;
+    seek_pending_playback_generation = playback_generation;
+    seek_request_generation++;
+    bool start_worker = !seek_worker_active;
+    pthread_t worker;
+    int create_result = 0;
+    if (start_worker) {
+        /* Keep the reservation and thread creation under the same lock.
+         * Otherwise a concurrent seek can observe seek_worker_active, leave
+         * its request for that worker, and then lose it if pthread_create()
+         * fails and the reservation is cleared afterward. The new worker
+         * simply waits on audio_mutex until this short operation completes. */
+        seek_worker_active = true;
+        create_result = pthread_create(&worker, NULL, seek_worker_func, NULL);
+        if (create_result != 0)
+            seek_worker_active = false;
+    }
     pthread_mutex_unlock(&audio_mutex);
 
-    pthread_t worker;
-    if (pthread_create(&worker, NULL, seek_worker_func, work) == 0) {
+    if (start_worker && create_result == 0)
         pthread_detach(worker);
-    } else {
-        free(work->path);
-        free(work);
-    }
 }
 
 double audio_get_position_seconds(void) {

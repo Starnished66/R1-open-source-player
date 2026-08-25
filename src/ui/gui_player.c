@@ -43,6 +43,7 @@ static int queue_next_insert_index = -1;
 #include <unistd.h>
 #include <limits.h>
 #include <ctype.h>
+#include <math.h>
 
 #define VOLUME_POPUP_TIMEOUT_MS 3000
 #define HOME_INDICATOR_BAND_HEIGHT 24
@@ -1166,6 +1167,11 @@ static void library_btn_event_cb(lv_event_t * e) {
 static lv_timer_t * pending_progress_seek_timer = NULL;
 static double pending_progress_seek_seconds = 0.0;
 bool user_seeking = false;
+/* True from finger-up until audio position catches the requested seek, so
+ * the 500ms progress poll does not yank the knob back to the pre-seek
+ * playhead while a (now single-flight) seek worker is still opening. */
+static bool progress_awaiting_seek = false;
+static int progress_awaiting_seek_ticks = 0;
 
 static void cancel_pending_progress_seek(void) {
     if (pending_progress_seek_timer) {
@@ -1190,6 +1196,9 @@ static void progress_slider_event_cb(lv_event_t * e) {
         double duration = audio_get_duration_seconds();
         int32_t percent = lv_slider_get_value(slider);
         pending_progress_seek_seconds = duration * ((double) percent / 100.0);
+        displayed_progress_percent = percent;
+        progress_awaiting_seek = (duration > 0.0);
+        progress_awaiting_seek_ticks = 0;
         cancel_pending_progress_seek();
         pending_progress_seek_timer = lv_timer_create(pending_progress_seek_timer_cb, 150, NULL);
         lv_timer_set_repeat_count(pending_progress_seek_timer, 1);
@@ -2108,6 +2117,7 @@ void play_track_at_from(int index, double start_seconds) {
 
     cancel_pending_progress_seek();
     user_seeking = false;
+    progress_awaiting_seek = false;
     playlist_index = index;
 
     track_metadata_t meta;
@@ -2155,6 +2165,9 @@ void play_track_at_from(int index, double start_seconds) {
 void on_track_auto_advanced(int index) {
     if (index < 0 || index >= playlist_count) return;
 
+    cancel_pending_progress_seek();
+    user_seeking = false;
+    progress_awaiting_seek = false;
     playlist_index = index;
 
     track_metadata_t meta;
@@ -2481,6 +2494,14 @@ static void format_time(double seconds, char * buf, size_t buf_size) {
 void gui_player_update_progress(void) {
     double position = audio_get_position_seconds();
     double duration = audio_get_duration_seconds();
+
+    if (progress_awaiting_seek) {
+        if (fabs(position - pending_progress_seek_seconds) < 0.4 ||
+            ++progress_awaiting_seek_ticks >= 8)
+            progress_awaiting_seek = false;
+        else
+            return;
+    }
 
     if (duration > 0 && progress_slider) {
         int32_t percent = (int32_t) ((position / duration) * 100.0);

@@ -10,6 +10,7 @@
 #include "gui_network.h"
 #include "gui_lyrics.h"
 #include "screen_builders.h"
+#include "transition_compositor.h"
 #include "metadata.h"
 #include "audio.h"
 #include "settings.h"
@@ -57,6 +58,8 @@ static lv_obj_t * quick_drawer = NULL;
 static lv_obj_t * quick_drawer_motion_image = NULL;
 static lv_draw_buf_t * quick_drawer_motion_buf = NULL;
 static bool quick_drawer_bitmap_motion = false;
+static bool quick_drawer_direct_motion = false;
+static int32_t quick_drawer_direct_y = 0;
 static bool quick_drawer_snapshot_dirty = true;
 static bool quick_drawer_open = false;
 
@@ -1265,10 +1268,26 @@ static void poll_sleep_timer(void) {
 
 static void quick_drawer_anim_y_cb(void * var, int32_t v) {
     (void) var;
+    if (quick_drawer_direct_motion) {
+        quick_drawer_direct_y = v;
+        if (transition_compositor_vertical_overlay_frame(v)) return;
+
+        /* A failed framebuffer present tears the compositor session down
+         * itself. Continue the same gesture through the already-built LVGL
+         * bitmap rather than dropping or snapping the drawer. */
+        quick_drawer_direct_motion = false;
+        lv_obj_set_y(quick_drawer_motion_image, v);
+        lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(quick_drawer_motion_image);
+        lv_obj_move_foreground(status_bar_band);
+        return;
+    }
     lv_obj_set_y(quick_drawer_bitmap_motion ? quick_drawer_motion_image : quick_drawer, v);
 }
 
 static int32_t quick_drawer_motion_y(void) {
+    if (quick_drawer_direct_motion) return quick_drawer_direct_y;
     return lv_obj_get_y(quick_drawer_bitmap_motion ? quick_drawer_motion_image : quick_drawer);
 }
 
@@ -1308,7 +1327,19 @@ static bool quick_drawer_begin_bitmap_motion(void) {
      * built while idle, or follow the live panel. */
     if (quick_drawer_snapshot_dirty || !quick_drawer_motion_buf || !quick_drawer_motion_image)
         return false;
-    lv_obj_set_y(quick_drawer_motion_image, lv_obj_get_y(quick_drawer));
+    int32_t initial_y = lv_obj_get_y(quick_drawer);
+    quick_drawer_direct_y = initial_y;
+    int32_t fixed_top = status_bar_band ? lv_obj_get_height(status_bar_band) : 0;
+    if (transition_compositor_begin_vertical_overlay(quick_drawer_motion_buf, fixed_top)) {
+        lv_obj_add_flag(quick_drawer, LV_OBJ_FLAG_HIDDEN);
+        quick_drawer_bitmap_motion = true;
+        quick_drawer_direct_motion = true;
+        if (transition_compositor_vertical_overlay_frame(initial_y)) return true;
+        /* The begin succeeded but the first present did not. Its failure
+         * path has already restored LVGL; fall through to bitmap motion. */
+        quick_drawer_direct_motion = false;
+    }
+    lv_obj_set_y(quick_drawer_motion_image, initial_y);
     lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(quick_drawer_motion_image);
@@ -1320,6 +1351,8 @@ static bool quick_drawer_begin_bitmap_motion(void) {
 
 static void quick_drawer_finish_bitmap_motion(void) {
     int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
+    if (quick_drawer_direct_motion) transition_compositor_end();
+    quick_drawer_direct_motion = false;
     lv_obj_set_y(quick_drawer, quick_drawer_open ? 0 : -h);
     lv_obj_remove_flag(quick_drawer, LV_OBJ_FLAG_HIDDEN);
     if (quick_drawer_motion_image) {

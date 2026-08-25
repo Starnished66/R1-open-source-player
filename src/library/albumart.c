@@ -222,7 +222,10 @@ bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int hei
     size_t dir_len = strlen(ALBUMART_DIR);
     if (strncmp(found, ALBUMART_DIR, dir_len) != 0 || found[dir_len] != '/') return true;
     uint32_t stored = 0;
-    if (!bmp_source_mtime(found, &stored)) return true;
+    if (!bmp_source_mtime(found, &stored)) {
+        unlink(found); /* Unlink corrupt cache file so fresh artwork will be generated */
+        return false;
+    }
     uint32_t src = source_mtime_of(info);
     if (stored != 0 && src != 0 && stored != src) return false;
     return true;

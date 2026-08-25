@@ -5,30 +5,19 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
-/* Covers are immediately reduced to a small UI bitmap. Never let malformed
- * or unnecessarily huge source dimensions consume most of this device's RAM
- * merely to produce that thumbnail/player image. Sidecar folder JPEGs are
- * often 2000–4000px; native RGB888 of those plus the compressed file will
- * OOM the ~56 MiB target. Anything above this side length is skipped and
- * the UI keeps the default cover. */
-#define MAX_COVER_SIDE 1200
-#define MAX_NATIVE_DECODE_BYTES ((size_t) MAX_COVER_SIDE * (size_t) MAX_COVER_SIDE * 3U)
+#include "artwork_coordinator.h"
+#include "debug_log.h"
 
-static bool rgb888_size_ok(size_t width, size_t height, size_t * out_bytes) {
-    if (width == 0 || height == 0 || width > MAX_COVER_SIDE || height > MAX_COVER_SIDE) return false;
+static bool rgb888_size_ok(size_t width, size_t height, size_t max_side, size_t * out_bytes) {
+    if (width == 0 || height == 0 || width > max_side || height > max_side) return false;
     if (width > SIZE_MAX / height || width * height > SIZE_MAX / 3U) return false;
     size_t bytes = width * height * 3U;
-    if (bytes > MAX_NATIVE_DECODE_BYTES) return false;
+    if (bytes > (size_t) max_side * (size_t) max_side * 3U) return false;
     if (out_bytes) *out_bytes = bytes;
     return true;
 }
-
-/* LVGL's zoom/stretch transform only applies to fully-decoded ARGB8888
- * buffers; its tjpgd binding decodes JPEGs lazily, tile by tile, straight
- * into the draw pipeline, so the transform never touches JPEG album art.
- * This file decodes JPEG/PNG cover art itself and resizes it into an exact
- * target-sized RGB565 buffer before LVGL ever sees it, avoiding that gap. */
 
 typedef struct {
     const uint8_t * data;
@@ -66,10 +55,6 @@ static int jpeg_mem_output(JDEC * jd, void * bitmap, JRECT * rect) {
 
         uint8_t * dst_row = ctx->out_buf + (size_t) dy * ctx->out_w * 3 + (size_t) rect->left * 3;
         const uint8_t * src_row = src + (size_t) y * w * 3;
-        /* tjpgd's YCbCr-to-RGB conversion writes its three output bytes per
-         * pixel in B, G, R order, not R, G, B; swap per-pixel here instead of
-         * a straight memcpy to correct it. lodepng's PNG path already
-         * returns standard R, G, B and needs no such swap. */
         for (int x = 0; x < copy_w; x++) {
             dst_row[x * 3 + 0] = src_row[x * 3 + 2]; /* R <- src B */
             dst_row[x * 3 + 1] = src_row[x * 3 + 1]; /* G <- src G */
@@ -79,22 +64,36 @@ static int jpeg_mem_output(JDEC * jd, void * bitmap, JRECT * rect) {
     return 1;
 }
 
-static bool decode_jpeg_rgb888(const uint8_t * data, uint32_t size,
-                                uint8_t ** out_buf, int * out_w, int * out_h) {
+static bool inspect_jpeg(const uint8_t * data, uint32_t size, int * out_w, int * out_h) {
     uint8_t workbuf[4096];
     JDEC jd;
     jpeg_ctx_t ctx = { .data = data, .size = size, .pos = 0, .out_buf = NULL, .out_w = 0, .out_h = 0 };
 
     if (jd_prepare(&jd, jpeg_mem_read, workbuf, sizeof(workbuf), &ctx) != JDR_OK) return false;
+    *out_w = (int) jd.width;
+    *out_h = (int) jd.height;
+    return true;
+}
 
-    /* Native decode only. tjpgd scale>0 is stride-corrupted in this vendored
-     * build (IDCT still emits full 8x8 blocks while the RGB loop is told a
-     * scaled rect). Oversized sources are skipped rather than scaled. */
+static cover_decode_result_t decode_jpeg_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
+                                                uint8_t ** out_buf, int * out_w, int * out_h) {
+    uint8_t workbuf[4096];
+    JDEC jd;
+    jpeg_ctx_t ctx = { .data = data, .size = size, .pos = 0, .out_buf = NULL, .out_w = 0, .out_h = 0 };
+
+    if (jd_prepare(&jd, jpeg_mem_read, workbuf, sizeof(workbuf), &ctx) != JDR_OK) {
+        return COVER_DECODE_FAIL_UNSUPPORTED;
+    }
+
     size_t native_bytes = 0;
-    if (!rgb888_size_ok(jd.width, jd.height, &native_bytes)) return false;
+    if (!rgb888_size_ok(jd.width, jd.height, max_side, &native_bytes)) {
+        return COVER_DECODE_FAIL_OVERSIZED;
+    }
 
     uint8_t * buf = calloc(1, native_bytes);
-    if (!buf) return false;
+    if (!buf) {
+        return COVER_DECODE_FAIL_ALLOC;
+    }
 
     ctx.out_buf = buf;
     ctx.out_w = (int) jd.width;
@@ -102,41 +101,56 @@ static bool decode_jpeg_rgb888(const uint8_t * data, uint32_t size,
 
     if (jd_decomp(&jd, jpeg_mem_output, 0) != JDR_OK) {
         free(buf);
-        return false;
+        return COVER_DECODE_FAIL_UNSUPPORTED;
     }
 
     *out_buf = buf;
     *out_w = (int) jd.width;
     *out_h = (int) jd.height;
-    return true;
+    return COVER_DECODE_OK;
 }
 
-static bool decode_png_rgb888(const uint8_t * data, uint32_t size, uint8_t ** out_buf, int * out_w, int * out_h) {
+static bool inspect_png(const uint8_t * data, uint32_t size, int * out_w, int * out_h) {
     unsigned w = 0, h = 0;
     LodePNGState state;
     lodepng_state_init(&state);
     unsigned inspect_error = lodepng_inspect(&w, &h, &state, data, size);
     lodepng_state_cleanup(&state);
-    if (inspect_error != 0 || !rgb888_size_ok(w, h, NULL)) return false;
+    if (inspect_error != 0) return false;
+    *out_w = (int) w;
+    *out_h = (int) h;
+    return true;
+}
+
+static cover_decode_result_t decode_png_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
+                                               uint8_t ** out_buf, int * out_w, int * out_h) {
+    unsigned w = 0, h = 0;
+    LodePNGState state;
+    lodepng_state_init(&state);
+    unsigned inspect_error = lodepng_inspect(&w, &h, &state, data, size);
+    lodepng_state_cleanup(&state);
+    if (inspect_error != 0) return COVER_DECODE_FAIL_UNSUPPORTED;
+    if (!rgb888_size_ok(w, h, max_side, NULL)) return COVER_DECODE_FAIL_OVERSIZED;
 
     unsigned char * pixels = NULL;
-    if (lodepng_decode24(&pixels, &w, &h, data, size) != 0 || !pixels) return false;
+    unsigned decode_error = lodepng_decode24(&pixels, &w, &h, data, size);
+    if (decode_error == 83 /* LODEPNG_ERROR_OUT_OF_MEMORY */) {
+        return COVER_DECODE_FAIL_ALLOC;
+    }
+    if (decode_error != 0 || !pixels) {
+        return COVER_DECODE_FAIL_UNSUPPORTED;
+    }
 
     *out_buf = pixels;
     *out_w = (int) w;
     *out_h = (int) h;
-    return true;
+    return COVER_DECODE_OK;
 }
 
 static inline uint16_t rgb888_to_565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
-/* Bilinear sample at fractional source coordinates (fx, fy), clamped to the
- * source bounds -- for the upscale path below. Interpolates between the 4
- * nearest source pixels rather than picking one, the standard fix for
- * magnification (box-filter's own footprint degrades to a single pixel once
- * it's narrower than one source pixel, which is exactly the upscale case). */
 static void bilinear_sample(const uint8_t * src, int src_w, int src_h, float fx, float fy,
                              uint8_t * out_r, uint8_t * out_g, uint8_t * out_b) {
     if (fx < 0) fx = 0;
@@ -163,17 +177,6 @@ static void bilinear_sample(const uint8_t * src, int src_w, int src_h, float fx,
     }
 }
 
-/* "Cover fit": scale so the source fully covers the target box (the larger
- * of the two axis scale ratios), then center-crop whichever dimension
- * overflows -- the same behavior as a photo app's cover/thumbnail mode.
- *
- * Downscaling uses a box filter (area-average of every source pixel whose
- * center falls in the destination pixel's inverse-mapped footprint) rather
- * than nearest-neighbor, since embedded art is usually far larger than the
- * on-screen art box. Upscaling uses bilinear interpolation instead, since a
- * box filter's footprint degrades to nearest-neighbor once it's narrower
- * than one source pixel -- the common case, since most embedded art is
- * smaller than this app's on-screen art box. */
 static uint16_t * resize_cover_fit(const uint8_t * src, int src_w, int src_h, int dst_w, int dst_h) {
     uint16_t * dst = malloc((size_t) dst_w * dst_h * sizeof(uint16_t));
     if (!dst) return NULL;
@@ -192,10 +195,6 @@ static uint16_t * resize_cover_fit(const uint8_t * src, int src_w, int src_h, in
         uint16_t * dst_row = dst + (size_t) dy * dst_w;
 
         if (upscaling) {
-            /* Sample at the destination pixel's center, mapped back into
-             * source space -- the standard convention (+0.5 forward,
-             * -0.5 back) that keeps the interpolation aligned on both axes
-             * instead of shifted by half a source pixel. */
             float fy = ((dy + 0.5f) + crop_y) / scale - 0.5f;
             for (int dx = 0; dx < dst_w; dx++) {
                 float fx = ((dx + 0.5f) + crop_x) / scale - 0.5f;
@@ -250,12 +249,23 @@ static uint16_t le16(const uint8_t * p) {
     return (uint16_t) (p[0] | (p[1] << 8));
 }
 
-/* Uncompressed 24/32-bit BMP to RGB888, for Rockbox albumart cache files. */
-static bool decode_bmp_rgb888(const uint8_t * data, uint32_t size, uint8_t ** out_buf, int * out_w, int * out_h) {
+static bool inspect_bmp(const uint8_t * data, uint32_t size, int * out_w, int * out_h) {
     if (size < 54 || data[0] != 'B' || data[1] != 'M') return false;
+    int width = le32s(data + 18);
+    int height_raw = le32s(data + 22);
+    int height = height_raw < 0 ? -height_raw : height_raw;
+    if (width <= 0 || height <= 0) return false;
+    *out_w = width;
+    *out_h = height;
+    return true;
+}
+
+static cover_decode_result_t decode_bmp_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
+                                               uint8_t ** out_buf, int * out_w, int * out_h) {
+    if (size < 54 || data[0] != 'B' || data[1] != 'M') return COVER_DECODE_FAIL_UNSUPPORTED;
     uint32_t off = le32(data + 10);
     uint32_t dib = le32(data + 14);
-    if (dib < 40 || off < 14 + dib || off >= size) return false;
+    if (dib < 40 || off < 14 + dib || off >= size) return COVER_DECODE_FAIL_UNSUPPORTED;
     int width = le32s(data + 18);
     int height_raw = le32s(data + 22);
     bool top_down = height_raw < 0;
@@ -263,16 +273,16 @@ static bool decode_bmp_rgb888(const uint8_t * data, uint32_t size, uint8_t ** ou
     uint16_t planes = le16(data + 26);
     uint16_t bits = le16(data + 28);
     uint32_t compression = le32(data + 30);
-    if (width <= 0 || height <= 0 || planes != 1 || compression != 0) return false;
-    if (bits != 24 && bits != 32) return false;
+    if (width <= 0 || height <= 0 || planes != 1 || compression != 0) return COVER_DECODE_FAIL_UNSUPPORTED;
+    if (bits != 24 && bits != 32) return COVER_DECODE_FAIL_UNSUPPORTED;
     int bpp = bits / 8;
     int row_bytes = width * bpp;
     int stride = (row_bytes + 3) & ~3;
     size_t need;
-    if (!rgb888_size_ok((size_t) width, (size_t) height, &need)) return false;
-    if ((uint64_t) off + (uint64_t) stride * (uint64_t) height > size) return false;
+    if (!rgb888_size_ok((size_t) width, (size_t) height, max_side, &need)) return COVER_DECODE_FAIL_OVERSIZED;
+    if ((uint64_t) off + (uint64_t) stride * (uint64_t) height > size) return COVER_DECODE_FAIL_UNSUPPORTED;
     uint8_t * buf = malloc(need);
-    if (!buf) return false;
+    if (!buf) return COVER_DECODE_FAIL_ALLOC;
     for (int y = 0; y < height; y++) {
         int src_y = top_down ? y : (height - 1 - y);
         const uint8_t * src = data + off + (size_t) src_y * (size_t) stride;
@@ -286,36 +296,103 @@ static bool decode_bmp_rgb888(const uint8_t * data, uint32_t size, uint8_t ** ou
     *out_buf = buf;
     *out_w = width;
     *out_h = height;
-    return true;
+    return COVER_DECODE_OK;
 }
 
-bool cover_decode_to_rgb565(const uint8_t * data, uint32_t size, int target_w, int target_h, uint16_t ** out_pixels) {
-    if (!data || size < 8 || target_w <= 0 || target_h <= 0) return false;
+cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t size,
+                                               int target_w, int target_h,
+                                               artwork_priority_t prio,
+                                               artwork_cancel_fn cancel_cb, void * user_data,
+                                               uint16_t ** out_pixels) {
+    if (!data || size < 8 || target_w <= 0 || target_h <= 0) return COVER_DECODE_FAIL_UNSUPPORTED;
+    if (cancel_cb && cancel_cb(user_data)) return COVER_DECODE_FAIL_CANCELLED;
 
-    uint8_t * native_buf = NULL;
+    size_t max_side = (target_w <= 72 && target_h <= 72) ? MAX_THUMBNAIL_COVER_SIDE : MAX_PLAYER_COVER_SIDE;
+
+    /* 1. Inspect dimensions before allocating any native buffer */
     int native_w = 0, native_h = 0;
-    bool ok;
+    artwork_format_t fmt = ARTWORK_FORMAT_UNKNOWN;
 
     if (data[0] == 0xFF && data[1] == 0xD8) {
-        ok = decode_jpeg_rgb888(data, size, &native_buf, &native_w, &native_h);
+        fmt = ARTWORK_FORMAT_JPEG;
+        if (!inspect_jpeg(data, size, &native_w, &native_h)) return COVER_DECODE_FAIL_UNSUPPORTED;
     } else if (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') {
-        ok = decode_png_rgb888(data, size, &native_buf, &native_w, &native_h);
+        fmt = ARTWORK_FORMAT_PNG;
+        if (!inspect_png(data, size, &native_w, &native_h)) return COVER_DECODE_FAIL_UNSUPPORTED;
     } else if (data[0] == 'B' && data[1] == 'M') {
-        ok = decode_bmp_rgb888(data, size, &native_buf, &native_w, &native_h);
+        fmt = ARTWORK_FORMAT_BMP;
+        if (!inspect_bmp(data, size, &native_w, &native_h)) return COVER_DECODE_FAIL_UNSUPPORTED;
     } else {
-        return false;
+        return COVER_DECODE_FAIL_UNSUPPORTED;
     }
 
-    if (!ok || !native_buf) return false;
-    if (native_w <= 0 || native_h <= 0) {
+    if (native_w <= 0 || native_h <= 0) return COVER_DECODE_FAIL_UNSUPPORTED;
+    if ((size_t) native_w > max_side || (size_t) native_h > max_side) {
+        DBG_LOG("cover_decode: image rejected by dimension cap (%dx%d > max %zu)\n",
+                native_w, native_h, max_side);
+        return COVER_DECODE_FAIL_OVERSIZED;
+    }
+
+    /* 2. Estimate required memory and acquire decode slot from coordinator */
+    size_t est_bytes = artwork_estimate_decode_bytes(fmt, size, (size_t) native_w, (size_t) native_h,
+                                                     (size_t) target_w, (size_t) target_h);
+    uint32_t timeout_ms = (prio == ARTWORK_PRIO_PLAYER) ? 1000 : 300;
+
+    artwork_acquire_result_t acq = artwork_coordinator_acquire(prio, est_bytes, timeout_ms,
+                                                               cancel_cb, user_data);
+    if (acq == ARTWORK_ACQUIRE_LOW_MEM) return COVER_DECODE_FAIL_LOW_MEMORY;
+    if (acq == ARTWORK_ACQUIRE_BUSY) return COVER_DECODE_FAIL_BUSY;
+    if (acq == ARTWORK_ACQUIRE_CANCELLED || acq == ARTWORK_ACQUIRE_SUSPENDED) return COVER_DECODE_FAIL_CANCELLED;
+    if (acq != ARTWORK_ACQUIRE_OK) return COVER_DECODE_FAIL_BUSY;
+
+    /* 3. Check for preemption right before starting expensive native decode */
+    if (artwork_coordinator_should_yield(prio, cancel_cb, user_data)) {
+        artwork_coordinator_release(prio);
+        return COVER_DECODE_FAIL_CANCELLED;
+    }
+
+    uint8_t * native_buf = NULL;
+    int decoded_w = 0, decoded_h = 0;
+    cover_decode_result_t dec_res = COVER_DECODE_FAIL_UNSUPPORTED;
+
+    if (fmt == ARTWORK_FORMAT_JPEG) {
+        dec_res = decode_jpeg_rgb888(data, size, max_side, &native_buf, &decoded_w, &decoded_h);
+    } else if (fmt == ARTWORK_FORMAT_PNG) {
+        dec_res = decode_png_rgb888(data, size, max_side, &native_buf, &decoded_w, &decoded_h);
+    } else if (fmt == ARTWORK_FORMAT_BMP) {
+        dec_res = decode_bmp_rgb888(data, size, max_side, &native_buf, &decoded_w, &decoded_h);
+    }
+
+    if (dec_res != COVER_DECODE_OK || !native_buf || decoded_w <= 0 || decoded_h <= 0) {
         free(native_buf);
-        return false;
+        artwork_coordinator_release(prio);
+        return dec_res;
     }
 
-    uint16_t * resized = resize_cover_fit(native_buf, native_w, native_h, target_w, target_h);
+    /* 4. Check for preemption right after native decode */
+    if (artwork_coordinator_should_yield(prio, cancel_cb, user_data)) {
+        free(native_buf);
+        artwork_coordinator_release(prio);
+        return COVER_DECODE_FAIL_CANCELLED;
+    }
+
+    /* 5. Perform fast cover-fit resize and immediately free native buffer */
+    uint16_t * resized = resize_cover_fit(native_buf, decoded_w, decoded_h, target_w, target_h);
     free(native_buf);
-    if (!resized) return false;
+
+    /* 6. Release coordinator decode slot */
+    artwork_coordinator_release(prio);
+
+    if (!resized) return COVER_DECODE_FAIL_ALLOC;
 
     *out_pixels = resized;
-    return true;
+    return COVER_DECODE_OK;
+}
+
+bool cover_decode_to_rgb565(const uint8_t * data, uint32_t size, int target_w, int target_h,
+                            uint16_t ** out_pixels) {
+    artwork_priority_t prio = (target_w <= 72 && target_h <= 72) ? ARTWORK_PRIO_THUMBNAIL : ARTWORK_PRIO_PLAYER;
+    cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, target_w, target_h,
+                                                          prio, NULL, NULL, out_pixels);
+    return (res == COVER_DECODE_OK);
 }

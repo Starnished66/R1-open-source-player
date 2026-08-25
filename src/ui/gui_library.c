@@ -25,6 +25,7 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "cue_parser.h"
 #include "cover_decode.h"
 #include "albumart.h"
+#include "artwork_coordinator.h"
 #include "device_config.h"
 #include "settings.h"
 #include "audio.h"
@@ -1046,6 +1047,7 @@ static lv_obj_t * album_thumbnail_result_list;
 static uint8_t * album_thumbnail_result_pixels;
 static lv_timer_t * album_thumbnail_poll_timer;
 static album_thumbnail_request_t album_thumbnail_queue[ALBUM_THUMBNAIL_QUEUE_SIZE];
+static atomic_bool album_thumbnail_screen_active;
 static int album_thumbnail_queue_count;
 static bool album_thumbnail_scrolling;
 static bool album_thumbnail_list_is_visible(lv_obj_t * list) {
@@ -1071,56 +1073,180 @@ static void album_thumbnail_cache_clear(void) {
         memset(&album_thumbnail_cache[i], 0, sizeof(album_thumbnail_cache[i]));
     }
     album_thumbnail_use_counter = 0;
+    artwork_failure_cache_clear();
 }
 
 static bool album_thumbnail_sized_cache_hit(const albumart_info_t * info, char * found, size_t found_size) {
     return albumart_sized_thumb_fresh(info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, found, found_size);
 }
 
+#define THUMBNAIL_SIDECAR_MAX_BYTES (2U * 1024U * 1024U)
+
+/* Persistent warmer state flags */
+static pthread_t album_thumb_gen_thread;
+static atomic_bool album_thumb_gen_active;
+static atomic_bool album_thumb_gen_cancel;
+static atomic_int album_thumb_gen_generation;
+static bool album_thumb_gen_thread_joinable;
+static atomic_int album_thumb_gen_done_count;
+static atomic_int album_thumb_gen_total_count;
+
+static bool album_thumb_gen_should_cancel(int my_generation) {
+    return atomic_load(&album_thumb_gen_cancel) ||
+           atomic_load(&album_thumb_gen_generation) != my_generation ||
+           atomic_load(&album_thumbnail_screen_active);
+}
+
+static void cancel_album_thumbnail_generation(void) {
+    if (!album_thumb_gen_thread_joinable || !atomic_load(&album_thumb_gen_active)) return;
+    atomic_store(&album_thumb_gen_cancel, true);
+    atomic_fetch_add(&album_thumb_gen_generation, 1);
+}
+
+static void reap_album_thumbnail_generation(void) {
+    if (!album_thumb_gen_thread_joinable) return;
+    pthread_join(album_thumb_gen_thread, NULL);
+    album_thumb_gen_thread_joinable = false;
+}
+
+/* Dynamic cancellation callbacks */
+static bool album_thumb_gen_cancel_cb(void * user_data) {
+    int my_gen = (int) (intptr_t) user_data;
+    return album_thumb_gen_should_cancel(my_gen);
+}
+
+static bool album_thumbnail_cancel_cb(void * user_data) {
+    int gen = (int) (intptr_t) user_data;
+    return (gen != album_thumbnail_generation);
+}
+
+static time_t album_source_mtime(const song_row_t * song, const albumart_info_t * info) {
+    time_t max_mtime = 0;
+    struct stat st;
+    if (song && song->path[0] && stat(song->path, &st) == 0) {
+        if (st.st_mtime > max_mtime) max_mtime = st.st_mtime;
+        /* Parent folder mtime (detects adding or modifying cover.jpg) */
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof(dir), "%s", song->path);
+        char * slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = '\0';
+            if (stat(dir, &st) == 0 && st.st_mtime > max_mtime) max_mtime = st.st_mtime;
+        }
+    }
+    if (info) {
+        char found[PATH_MAX];
+        if (albumart_search_files(info, "", found, sizeof(found))) {
+            if (stat(found, &st) == 0 && st.st_mtime > max_mtime) max_mtime = st.st_mtime;
+        }
+    }
+    return max_mtime;
+}
+
 /* Rockbox albumart search, then embedded picture. A successful decode is
  * written as MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp
  * so the next pass is a small BMP load instead of a JPEG/PNG decode.
- * Albums without artist+album tags still decode, but cannot be stored. */
-static bool album_thumbnail_load_or_decode(const song_row_t * song, uint16_t ** out_pixels) {
+ * Albums without artist+album tags still decode, but cannot be stored.
+ * Checks the negative failure cache first to prevent repeated failed decodes.
+ * If sized thumbnail or sidecar is invalid/unreadable, falls through to embedded art. */
+static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_priority_t prio,
+                                              artwork_cancel_fn cancel_cb, void * user_data,
+                                              uint16_t ** out_pixels) {
     *out_pixels = NULL;
     if (!song || !song->path[0]) return false;
 
     albumart_info_t info;
     albumart_info_from_song_row(song, &info);
 
+    time_t source_mtime = album_source_mtime(song, &info);
+
+    artwork_fail_reason_t fail_reason = ARTWORK_FAIL_NONE;
+    if (artwork_failure_cache_is_blocked(song->id, source_mtime, &fail_reason)) return false;
+
     char found[PATH_MAX];
     uint8_t * data = NULL;
     uint32_t size = 0;
 
+    /* Step 1: Try sized Rockbox thumbnail cache (.72x72.bmp) */
     if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found))) {
-        bool ok = albumart_load_file(found, &data, &size, EXTERNAL_COVER_MAX_BYTES) &&
-                  cover_decode_to_rgb565(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, out_pixels);
-        free(data);
-        return ok;
+        if (albumart_load_file(found, &data, &size, THUMBNAIL_SIDECAR_MAX_BYTES)) {
+            cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
+                                                                  prio, cancel_cb, user_data, out_pixels);
+            free(data);
+            data = NULL;
+            size = 0;
+            if (res == COVER_DECODE_OK && *out_pixels) return true;
+            if (res == COVER_DECODE_FAIL_CANCELLED) return false;
+            if (cover_decode_result_is_temporary(res)) {
+                artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+                return false;
+            }
+            /* Corrupt sized thumbnail -> unlink and fall through to source files */
+            unlink(found);
+        } else {
+            unlink(found);
+        }
     }
 
-    if (albumart_search_files(&info, "", found, sizeof(found))) {
-        /* Sidecar present. A too-large or unreadable file must not fall
-         * through into metadata_read() of the audio file -- that is the
-         * in-process ID3/FLAC parse the 4 MiB / 1200px caps exist to avoid. */
-        albumart_load_file(found, &data, &size, EXTERNAL_COVER_MAX_BYTES);
-    } else {
-        track_metadata_t meta;
-        memset(&meta, 0, sizeof(meta));
-        metadata_read(song->path, &meta);
-        data = meta.picture_data;
-        size = meta.picture_size;
-        free(meta.lyrics);
-        if (!info.artist[0]) snprintf(info.artist, sizeof(info.artist), "%s", meta.artist);
-        if (!info.album[0]) snprintf(info.album, sizeof(info.album), "%s", meta.album);
-        if (!info.albumartist[0]) snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
+    /* Step 2: Try external sidecar file (cover.jpg, folder.jpg, etc.) */
+    bool sidecar_searched = albumart_search_files(&info, "", found, sizeof(found));
+    if (sidecar_searched) {
+        if (albumart_load_file(found, &data, &size, THUMBNAIL_SIDECAR_MAX_BYTES)) {
+            cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
+                                                                  prio, cancel_cb, user_data, out_pixels);
+            free(data);
+            data = NULL;
+            size = 0;
+            if (res == COVER_DECODE_OK && *out_pixels) {
+                albumart_store_rgb565(&info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, *out_pixels);
+                return true;
+            }
+            if (res == COVER_DECODE_FAIL_CANCELLED) return false;
+            if (cover_decode_result_is_temporary(res)) {
+                artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+                return false;
+            }
+            /* Corrupt or oversized sidecar falls through to embedded art */
+        }
     }
-    bool ok = data && size &&
-              cover_decode_to_rgb565(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, out_pixels);
-    free(data);
-    if (ok && *out_pixels)
-        albumart_store_rgb565(&info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, *out_pixels);
-    return ok;
+
+    /* Step 3: Try embedded picture from audio file */
+    track_metadata_t meta;
+    memset(&meta, 0, sizeof(meta));
+    metadata_read(song->path, &meta);
+    data = meta.picture_data;
+    size = meta.picture_size;
+    free(meta.lyrics);
+    if (!info.artist[0]) snprintf(info.artist, sizeof(info.artist), "%s", meta.artist);
+    if (!info.album[0]) snprintf(info.album, sizeof(info.album), "%s", meta.album);
+    if (!info.albumartist[0]) snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
+
+    if (data && size > 0) {
+        cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
+                                                              prio, cancel_cb, user_data, out_pixels);
+        free(data);
+        data = NULL;
+        size = 0;
+        if (res == COVER_DECODE_OK && *out_pixels) {
+            albumart_store_rgb565(&info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, *out_pixels);
+            return true;
+        }
+        if (res == COVER_DECODE_FAIL_CANCELLED) return false;
+        if (cover_decode_result_is_temporary(res)) {
+            artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+            return false;
+        }
+    }
+
+    /* Step 4: No valid artwork found or permanent decode failure */
+    artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_PERMANENT);
+    return false;
+}
+
+static bool album_thumbnail_load_or_decode(const song_row_t * song, int generation, uint16_t ** out_pixels) {
+    return album_thumbnail_load_or_decode_ex(song, ARTWORK_PRIO_THUMBNAIL,
+                                            album_thumbnail_cancel_cb, (void *) (intptr_t) generation,
+                                            out_pixels);
 }
 
 static void * album_thumbnail_thread_func(void * arg) {
@@ -1131,7 +1257,7 @@ static void * album_thumbnail_thread_func(void * arg) {
     uint16_t * pixels = NULL;
     song_row_t song;
     if (metadata_db_get_song_by_id(req->song_id, &song))
-        album_thumbnail_load_or_decode(&song, &pixels);
+        album_thumbnail_load_or_decode(&song, req->generation, &pixels);
     album_thumbnail_result_song_id = req->song_id;
     album_thumbnail_result_generation = req->generation;
     album_thumbnail_result_logical_index = req->logical_index;
@@ -1149,49 +1275,15 @@ static void * album_thumbnail_thread_func(void * arg) {
 }
 
 /* ---- Persistent (post-scan) album thumbnail generation ----------------
- * Runs once after Update Music Database completes (never before -- see
- * this file's own call site, placed right after the scan thread is joined
- * and the database is already fully committed), writing the same Rockbox
- * sized BMP files album_thumbnail_load_or_decode() produces one row at a
- * time -- so browsing Albums right after a scan shows artwork immediately
- * instead of only as each row happens to scroll into view. Reuses
- * metadata_db_get_albums_page_filtered(NULL, ...) (streamed/paged, never
- * the whole table at once) grouped by (album, album_artist) -- the same
- * grouping and first_song_id the Album Artist -> Albums drill-down's own
- * query produces for the same pair, so that screen automatically gets the
- * same cached thumbnails with no extra work here. Entirely worker-thread-
- * side: metadata_db / albumart / cover_decode never touch LVGL. Lazy
- * generation stays as the fallback for whatever this pass didn't reach
- * (interrupted by a newer scan, artwork missing/changed since, or simply
- * never run). */
-static pthread_t album_thumb_gen_thread;
-/* active/cancel/generation cross the UI/worker boundary and therefore must
- * be real atomics, not volatile. thread_joinable is owned by the UI thread:
- * it remains true after a worker naturally exits until that worker is
- * joined, preventing one joinable-thread resource leak per database scan. */
-static atomic_bool album_thumb_gen_active;
-static atomic_bool album_thumb_gen_cancel;
-static atomic_int album_thumb_gen_generation;
-static bool album_thumb_gen_thread_joinable;
-static atomic_int album_thumb_gen_done_count;
-static atomic_int album_thumb_gen_total_count;
-
-static bool album_thumb_gen_should_cancel(int my_generation) {
-    return atomic_load(&album_thumb_gen_cancel) ||
-           atomic_load(&album_thumb_gen_generation) != my_generation;
-}
-
-static void cancel_album_thumbnail_generation(void) {
-    if (!album_thumb_gen_thread_joinable || !atomic_load(&album_thumb_gen_active)) return;
-    atomic_store(&album_thumb_gen_cancel, true);
-    atomic_fetch_add(&album_thumb_gen_generation, 1);
-}
-
-static void reap_album_thumbnail_generation(void) {
-    if (!album_thumb_gen_thread_joinable) return;
-    pthread_join(album_thumb_gen_thread, NULL);
-    album_thumb_gen_thread_joinable = false;
-}
+ * Runs once after Update Music Database completes, writing sized BMP files
+ * in short bounded batches with generous cooperative delays so CPU and SD
+ * activity never cause overheating or starve audio playback. Suspends
+ * automatically when audio is playing, when Albums screen is active, or
+ * when memory is low. */
+#define ALBUM_THUMB_GEN_BATCH 16
+#define ALBUM_THUMB_GEN_WARM_LIMIT 512
+#define ALBUM_THUMB_GEN_INTER_ALBUM_US 100000 /* 100 ms yield between albums */
+#define ALBUM_THUMB_GEN_INTER_BATCH_US 1000000 /* 1.0 s pause between batches */
 
 static void * album_thumb_gen_thread_func(void * arg) {
     int my_generation = (int) (intptr_t) arg;
@@ -1201,21 +1293,29 @@ static void * album_thumb_gen_thread_func(void * arg) {
 #endif
     atomic_store(&album_thumb_gen_done_count, 0);
 
-#define ALBUM_THUMB_GEN_BATCH 64
-#define ALBUM_THUMB_GEN_WARM_LIMIT 2048
-#define ALBUM_THUMB_GEN_YIELD_US 10000
     group_row_t rows[ALBUM_THUMB_GEN_BATCH];
     int offset = 0;
     for (;;) {
         if (album_thumb_gen_should_cancel(my_generation)) break;
-        /* Streamed/paged, per requirement -- never the whole album table
-         * (which can be tens of thousands of rows on a large library) held
-         * in memory at once, just ALBUM_THUMB_GEN_BATCH group_row_t at a
-         * time (a few hundred bytes each). */
+
+        /* Suspend warmer while audio is playing, albums screen is actively open, or memory is low */
+        while (audio_is_playing() || atomic_load(&album_thumbnail_screen_active) ||
+               system_get_mem_available_bytes() < 8U * 1024U * 1024U) {
+            if (album_thumb_gen_should_cancel(my_generation)) goto done;
+            usleep(250000); /* Check every 250ms */
+        }
+
         int n = metadata_db_get_albums_page_filtered(NULL, offset, ALBUM_THUMB_GEN_BATCH, rows);
         if (n <= 0) break;
         for (int i = 0; i < n; i++) {
             if (album_thumb_gen_should_cancel(my_generation)) goto done;
+
+            /* Check suspension before each album */
+            while (audio_is_playing() || atomic_load(&album_thumbnail_screen_active)) {
+                if (album_thumb_gen_should_cancel(my_generation)) goto done;
+                usleep(250000);
+            }
+
             song_row_t song;
             if (!metadata_db_get_song_by_id(rows[i].first_song_id, &song)) {
 #ifdef UI_PERF_TRACE
@@ -1224,12 +1324,21 @@ static void * album_thumb_gen_thread_func(void * arg) {
                 atomic_fetch_add(&album_thumb_gen_done_count, 1);
                 continue;
             }
-            /* Skip albums that already have a Rockbox sized BMP. Same
-             * search the lazy path uses, so an interrupted-then-resumed
-             * pass, or a re-run over an already-fully-generated library,
-             * does no wasted decode work. */
+
             albumart_info_t info;
             albumart_info_from_song_row(&song, &info);
+
+            time_t source_mtime = album_source_mtime(&song, &info);
+
+            artwork_fail_reason_t fail_reason;
+            if (artwork_failure_cache_is_blocked(song.id, source_mtime, &fail_reason)) {
+#ifdef UI_PERF_TRACE
+                perf_skipped++;
+#endif
+                atomic_fetch_add(&album_thumb_gen_done_count, 1);
+                continue;
+            }
+
             char found[PATH_MAX];
             if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found))) {
 #ifdef UI_PERF_TRACE
@@ -1238,25 +1347,29 @@ static void * album_thumb_gen_thread_func(void * arg) {
                 atomic_fetch_add(&album_thumb_gen_done_count, 1);
                 continue;
             }
+
             uint16_t * pixels = NULL;
-            album_thumbnail_load_or_decode(&song, &pixels);
-            /* No-op store when pixels is NULL -- an album with no
-             * resolvable art stays a lazy negative-cache case
-             * (album_thumbnail_cache_find()'s own known-but-NULL entry),
-             * never persisted as a permanent "no art" result, so artwork
-             * added later is picked up normally. */
+            album_thumbnail_load_or_decode_ex(&song, ARTWORK_PRIO_WARMER,
+                                              album_thumb_gen_cancel_cb, (void *) (intptr_t) my_generation,
+                                              &pixels);
+
 #ifdef UI_PERF_TRACE
             if (pixels) perf_generated++; else perf_failed++;
 #endif
             free(pixels);
             atomic_fetch_add(&album_thumb_gen_done_count, 1);
-            /* This is cache warming, not foreground scan work. Yield after
-             * every album so sustained decoding and SD writes cannot starve
-             * audio/UI work or pin the CPU at full load for minutes. */
-            usleep(ALBUM_THUMB_GEN_YIELD_US);
+
+            /* Yield between albums to avoid heating up CPU */
+            usleep(ALBUM_THUMB_GEN_INTER_ALBUM_US);
         }
         offset += n;
         if (n < ALBUM_THUMB_GEN_BATCH || offset >= ALBUM_THUMB_GEN_WARM_LIMIT) break;
+
+        /* Pause between batches to give CPU/SD bus complete rest */
+        for (int p = 0; p < 10; p++) {
+            if (album_thumb_gen_should_cancel(my_generation)) goto done;
+            usleep(ALBUM_THUMB_GEN_INTER_BATCH_US / 10);
+        }
     }
 done:
 #ifdef UI_PERF_TRACE
@@ -1357,6 +1470,7 @@ static void album_thumbnail_begin_screen(lv_obj_t * list) {
      * the identical persistent entries. Stop warming after its current
      * decode, then let start_next_album_thumbnail() service this screen. */
     cancel_album_thumbnail_generation();
+    atomic_store(&album_thumbnail_screen_active, true);
     album_thumbnail_active_list = list;
     album_thumbnail_scrolling = false;
     album_thumbnail_queue_count = 0;
@@ -1365,6 +1479,7 @@ static void album_thumbnail_begin_screen(lv_obj_t * list) {
 
 static void album_thumbnail_end_screen(lv_obj_t * list) {
     if (album_thumbnail_active_list != list) return;
+    atomic_store(&album_thumbnail_screen_active, false);
     album_thumbnail_active_list = NULL;
     album_thumbnail_scrolling = false;
     album_thumbnail_queue_count = 0;

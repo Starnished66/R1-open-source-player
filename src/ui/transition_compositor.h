@@ -93,13 +93,20 @@ bool transition_compositor_available(void);
  * would leave GUI-level state disagreeing with what's actually on screen. */
 bool transition_compositor_frame(int32_t v);
 
-/* Vertical opaque-overlay variant used by the quick drawer. The current
- * physical display is copied into an owned stationary base at begin time;
- * overlay is a full-screen RGB565 snapshot whose Y position is supplied to
- * each frame. fixed_top_rows are always restored from the stationary base
- * after composition so the status bar remains fixed above the drawer. */
-bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay, int32_t fixed_top_rows);
+/* Vertical opaque-overlay variant used by the quick drawer. On opening,
+ * the current physical display is copied into an owned stationary base.
+ * That clean underlay can be retained while the drawer is open and reused
+ * when closing; capturing the then-current framebuffer on close would
+ * capture the full-screen drawer itself and reveal a duplicate drawer
+ * underneath it. Set reuse_saved_base for a close/partially-open motion.
+ * fixed_top_rows are refreshed from the current display at every begin so
+ * the fixed status bar does not become stale while the drawer is open. */
+bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay,
+                                                  int32_t fixed_top_rows,
+                                                  bool reuse_saved_base);
 bool transition_compositor_vertical_overlay_frame(int32_t y);
+/* Releases the retained drawer underlay once the drawer is fully closed. */
+void transition_compositor_discard_vertical_base(void);
 
 /* Re-enables LVGL invalidation, ends the fbdev driver's external-
  * composition session (synchronizing LVGL's own next render target with

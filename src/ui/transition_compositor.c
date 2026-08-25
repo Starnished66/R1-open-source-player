@@ -49,6 +49,10 @@ static int32_t compositor_width;
 static int32_t compositor_height;
 static uint32_t compositor_fb_stride;
 static uint8_t * compositor_vertical_base;
+static size_t compositor_vertical_base_size;
+static int32_t compositor_vertical_base_width;
+static int32_t compositor_vertical_base_height;
+static uint32_t compositor_vertical_base_stride;
 static int32_t compositor_vertical_fixed_top;
 #endif
 
@@ -313,10 +317,13 @@ bool transition_compositor_frame(int32_t v) {
 #endif /* COMPOSITOR_DISABLED || !LV_USE_LINUX_FBDEV */
 }
 
-bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay, int32_t fixed_top_rows) {
+bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay,
+                                                  int32_t fixed_top_rows,
+                                                  bool reuse_saved_base) {
 #if COMPOSITOR_DISABLED || !LV_USE_LINUX_FBDEV
     (void) overlay;
     (void) fixed_top_rows;
+    (void) reuse_saved_base;
     return false;
 #else
     if (compositor_active || !overlay) return false;
@@ -333,25 +340,53 @@ bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay,
         (uint64_t) overlay->data_size < (uint64_t) overlay->header.stride * (uint32_t) h)
         return false;
 
+    if (fixed_top_rows < 0) fixed_top_rows = 0;
+    if (fixed_top_rows > h) fixed_top_rows = h;
+
     uint64_t base_size64 = (uint64_t) fb_stride * (uint32_t) h;
     if (base_size64 > SIZE_MAX) return false;
-    uint8_t * base = malloc((size_t) base_size64);
-    if (!base) return false;
-    memcpy(base, active_page, (size_t) base_size64);
+    size_t base_size = (size_t) base_size64;
+    bool saved_base_matches = compositor_vertical_base &&
+                              compositor_vertical_base_size == base_size &&
+                              compositor_vertical_base_width == w &&
+                              compositor_vertical_base_height == h &&
+                              compositor_vertical_base_stride == fb_stride;
+    uint8_t * base;
+    bool new_base = false;
+    if (reuse_saved_base) {
+        /* A missing/mismatched saved base must fall back to LVGL motion.
+         * Capturing active_page here is not a recovery: while closing it
+         * contains the open drawer and would reproduce that drawer beneath
+         * the moving copy. */
+        if (!saved_base_matches) return false;
+        base = compositor_vertical_base;
+        size_t fixed_bytes = (size_t) fixed_top_rows * fb_stride;
+        if (fixed_bytes) memcpy(base, active_page, fixed_bytes);
+    } else {
+        base = malloc(base_size);
+        if (!base) return false;
+        memcpy(base, active_page, base_size);
+        new_base = true;
+    }
 
     if (!lv_linux_fbdev_begin_external_composition(disp)) {
-        free(base);
+        if (new_base) free(base);
         return false;
     }
 
-    if (fixed_top_rows < 0) fixed_top_rows = 0;
-    if (fixed_top_rows > h) fixed_top_rows = h;
+    if (new_base) {
+        free(compositor_vertical_base);
+        compositor_vertical_base = base;
+        compositor_vertical_base_size = base_size;
+        compositor_vertical_base_width = w;
+        compositor_vertical_base_height = h;
+        compositor_vertical_base_stride = fb_stride;
+    }
     compositor_from = overlay;
     compositor_to = NULL;
     compositor_width = w;
     compositor_height = h;
     compositor_fb_stride = fb_stride;
-    compositor_vertical_base = base;
     compositor_vertical_fixed_top = fixed_top_rows;
     compositor_mode = COMPOSITOR_MODE_VERTICAL_OVERLAY;
     lv_display_enable_invalidation(disp, false);
@@ -365,6 +400,20 @@ bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay,
            w, h, fb_stride, fixed_top_rows);
 #endif
     return true;
+#endif
+}
+
+void transition_compositor_discard_vertical_base(void) {
+#if !(COMPOSITOR_DISABLED) && LV_USE_LINUX_FBDEV
+    /* The active vertical session is still reading this storage. Its owner
+     * calls discard only after transition_compositor_end(). */
+    if (compositor_active && compositor_mode == COMPOSITOR_MODE_VERTICAL_OVERLAY) return;
+    free(compositor_vertical_base);
+    compositor_vertical_base = NULL;
+    compositor_vertical_base_size = 0;
+    compositor_vertical_base_width = 0;
+    compositor_vertical_base_height = 0;
+    compositor_vertical_base_stride = 0;
 #endif
 }
 
@@ -456,8 +505,6 @@ void transition_compositor_end(void) {
      * before invalidation comes back on and anything can render again. */
     lv_linux_fbdev_end_external_composition(disp);
     lv_display_enable_invalidation(disp, true);
-    free(compositor_vertical_base);
-    compositor_vertical_base = NULL;
     compositor_mode = COMPOSITOR_MODE_NONE;
 #ifdef UI_PERF_TRACE
     printf("PERF compositor end frames=%u avg_us=%llu max_us=%llu present_failures=%u\n",

@@ -1330,7 +1330,10 @@ static bool quick_drawer_begin_bitmap_motion(void) {
     int32_t initial_y = lv_obj_get_y(quick_drawer);
     quick_drawer_direct_y = initial_y;
     int32_t fixed_top = status_bar_band ? lv_obj_get_height(status_bar_band) : 0;
-    if (transition_compositor_begin_vertical_overlay(quick_drawer_motion_buf, fixed_top)) {
+    int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
+    bool reuse_underlay = initial_y > -h;
+    if (transition_compositor_begin_vertical_overlay(quick_drawer_motion_buf, fixed_top,
+                                                     reuse_underlay)) {
         lv_obj_add_flag(quick_drawer, LV_OBJ_FLAG_HIDDEN);
         quick_drawer_bitmap_motion = true;
         quick_drawer_direct_motion = true;
@@ -1360,6 +1363,8 @@ static void quick_drawer_finish_bitmap_motion(void) {
         lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
     }
     quick_drawer_bitmap_motion = false;
+    if (!quick_drawer_open)
+        transition_compositor_discard_vertical_base();
     if (quick_drawer_snapshot_dirty || quick_drawer_open)
         lv_async_call(quick_drawer_snapshot_async_cb, NULL);
 }

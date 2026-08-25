@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include "gui.h"
+
 #ifdef HOST_BUILD
   #include "src/drivers/sdl/lv_sdl_window.h"
   #include "src/drivers/sdl/lv_sdl_mouse.h"
@@ -22,7 +24,6 @@
   #include "firmware_update.h"
   #include "subprocess.h"
   #include "bt_media_player.h"
-  #include "gui.h"
   #include <fcntl.h>
   #include <sys/ioctl.h>
   #include <sys/stat.h>

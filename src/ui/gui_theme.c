@@ -66,12 +66,12 @@ void apply_font_size_tier(int tier) {
 
 const lv_font_t * gui_theme_font(gui_font_role_t role) {
     switch (role) {
-        case GUI_FONT_ROLE_TITLE:   return ui_size_28;
-        case GUI_FONT_ROLE_ROW:     return ui_size_22;
-        case GUI_FONT_ROLE_BODY:    return ui_size_20;
-        case GUI_FONT_ROLE_SUBTEXT: return ui_size_16;
-        case GUI_FONT_ROLE_STATUS:  return ui_size_16;
-        default:                    return ui_size_20;
+        case GUI_FONT_ROLE_TITLE:   return &app_font_28;
+        case GUI_FONT_ROLE_ROW:     return &app_font_22;
+        case GUI_FONT_ROLE_BODY:    return &app_font_20;
+        case GUI_FONT_ROLE_SUBTEXT: return &app_font_16;
+        case GUI_FONT_ROLE_STATUS:  return &app_font_16;
+        default:                    return &app_font_20;
     }
 }
 

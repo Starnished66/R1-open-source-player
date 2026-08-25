@@ -21,6 +21,7 @@
 #include "timezone_data.h"
 #include "firmware_update.h"
 #include "plugin_manager.h"
+#include "fallback_font.h"
 #include <stdio.h>
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -40,6 +41,7 @@ static lv_obj_t * settings_power_screen;
 static lv_obj_t * settings_system_screen;
 static lv_obj_t * about_screen;
 static lv_obj_t * accent_color_screen;
+static lv_obj_t * custom_font_screen;
 static lv_obj_t * screen_timeout_screen;
 static lv_obj_t * startup_volume_screen;
 static lv_obj_t * sleep_timer_screen;
@@ -459,6 +461,144 @@ static lv_obj_t * build_accent_color_screen(void) {
 static void accent_color_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_push(accent_color_screen);
+}
+
+static lv_obj_t * custom_font_list = NULL;
+static lv_obj_t * custom_font_preview_latin = NULL;
+static lv_obj_t * custom_font_preview_fallback = NULL;
+static char discovered_custom_fonts[MAX_CUSTOM_FONTS_DISCOVERED][64];
+static int discovered_custom_font_count = 0;
+
+static void custom_font_option_cb(lv_event_t * e);
+
+static void populate_custom_font_screen(void) {
+    if (!custom_font_list) return;
+    lv_obj_clean(custom_font_list);
+
+    discovered_custom_font_count = fallback_font_discover_custom(discovered_custom_fonts, MAX_CUSTOM_FONTS_DISCOVERED);
+
+    const char * active_name = fallback_font_get_custom_name();
+
+    /* 1. Default (built-in Montserrat) option */
+    bool default_selected = (strcmp(active_name, "Default") == 0 || !current_settings.custom_font[0]);
+    lv_obj_t * def_row = add_pill_row_base(custom_font_list, "Default (Built-in)");
+    lv_obj_set_style_border_width(def_row, default_selected ? 3 : 0, 0);
+    lv_obj_set_style_border_color(def_row, accent_lv_color(), 0);
+    lv_obj_add_flag(def_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(def_row, custom_font_option_cb, LV_EVENT_CLICKED, (void *) (intptr_t) -1);
+
+    /* 2. Discovered fonts from <SD>/Fonts */
+    for (int i = 0; i < discovered_custom_font_count; i++) {
+        bool selected = (strcmp(active_name, discovered_custom_fonts[i]) == 0);
+        lv_obj_t * row = add_pill_row_base(custom_font_list, discovered_custom_fonts[i]);
+        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
+        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, custom_font_option_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+    }
+
+    if (discovered_custom_font_count == 0) {
+        lv_obj_t * empty_note = lv_label_create(custom_font_list);
+        lv_label_set_text(empty_note, "No .ttf fonts found in /Fonts");
+        lv_obj_add_style(empty_note, &style_theme_text_muted, 0);
+        lv_obj_set_style_text_font(empty_note, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+        lv_obj_set_style_pad_top(empty_note, 12, 0);
+    }
+}
+
+static void custom_font_option_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    const char * target = (index < 0) ? "Default" : discovered_custom_fonts[index];
+
+    if (fallback_font_apply_custom(target)) {
+        snprintf(current_settings.custom_font, sizeof(current_settings.custom_font), "%s",
+                 (index < 0) ? "" : target);
+        settings_save(&current_settings);
+        populate_custom_font_screen();
+        if (custom_font_screen) lv_obj_invalidate(custom_font_screen);
+        show_info_toast((index < 0) ? "Applied default font" : "Custom font applied");
+    } else {
+        show_error_toast("Failed to load font. Check format & memory.");
+    }
+}
+
+static void custom_font_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    populate_custom_font_screen();
+    nav_push(custom_font_screen);
+}
+
+static lv_obj_t * build_custom_font_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Font");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+
+    /* Preview card pinned at top */
+    lv_obj_t * preview_card = lv_obj_create(scr);
+    lv_obj_set_size(preview_card, lv_pct(90), 120);
+    lv_obj_align(preview_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 8);
+    lv_obj_add_style(preview_card, &style_theme_card_bg, 0);
+    lv_obj_set_style_border_width(preview_card, 0, 0);
+    lv_obj_set_style_radius(preview_card, 10, 0);
+    lv_obj_remove_flag(preview_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * preview_title = lv_label_create(preview_card);
+    lv_label_set_text(preview_title, "Preview");
+    lv_obj_add_style(preview_title, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(preview_title, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_align(preview_title, LV_ALIGN_TOP_LEFT, 12, 6);
+
+    custom_font_preview_latin = lv_label_create(preview_card);
+    lv_label_set_text(custom_font_preview_latin, "The quick brown fox jumps 123");
+    lv_obj_add_style(custom_font_preview_latin, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(custom_font_preview_latin, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
+    lv_obj_align(custom_font_preview_latin, LV_ALIGN_TOP_LEFT, 12, 32);
+
+    custom_font_preview_fallback = lv_label_create(preview_card);
+    lv_label_set_text(custom_font_preview_fallback, "日本語 / 한국어 / Русский / ไทย");
+    lv_obj_add_style(custom_font_preview_fallback, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(custom_font_preview_fallback, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
+    lv_obj_align(custom_font_preview_fallback, LV_ALIGN_TOP_LEFT, 12, 62);
+
+    lv_obj_t * hint = lv_label_create(preview_card);
+    lv_label_set_text(hint, "Place .ttf fonts in SD /Fonts folder.");
+    lv_obj_add_style(hint, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(hint, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 12, 92);
+
+    /* Scrollable font list */
+    custom_font_list = lv_obj_create(scr);
+    int32_t top_offset = STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 136;
+    lv_obj_set_size(custom_font_list, lv_pct(100),
+                    lv_display_get_vertical_resolution(lv_display_get_default()) - top_offset);
+    lv_obj_align(custom_font_list, LV_ALIGN_TOP_MID, 0, top_offset);
+    lv_obj_set_style_bg_opa(custom_font_list, 0, 0);
+    lv_obj_set_style_border_width(custom_font_list, 0, 0);
+    lv_obj_set_style_pad_all(custom_font_list, 0, 0);
+    lv_obj_set_flex_flow(custom_font_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(custom_font_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(custom_font_list, 6, 0);
+
+    finalize_screen_navigation(scr);
+    return scr;
 }
 
 /* "45s" below 1 minute, "1m"/"2m" on an exact minute, "1m 30s" otherwise --
@@ -1288,20 +1428,21 @@ static void plugin_display_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_settings_display_screen(void) {
-    static pill_list_item_t items[7 + PLUGIN_MAX_DISPLAY_LIST_ITEMS];
+    static pill_list_item_t items[8 + PLUGIN_MAX_DISPLAY_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Accent Color", PILL_ACCESSORY_CHEVRON, false, accent_color_row_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Font Size", PILL_ACCESSORY_CHEVRON, false, font_size_settings_row_cb, NULL, NULL };
-    items[2] = (pill_list_item_t){ "Lyrics Text Size", PILL_ACCESSORY_CHEVRON, false, lyrics_font_size_settings_row_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Screen Timeout", PILL_ACCESSORY_CHEVRON, false, screen_timeout_row_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "Screen Dimming", PILL_ACCESSORY_TOGGLE,
+    items[1] = (pill_list_item_t){ "Font", PILL_ACCESSORY_CHEVRON, false, custom_font_row_cb, NULL, NULL };
+    items[2] = (pill_list_item_t){ "Font Size", PILL_ACCESSORY_CHEVRON, false, font_size_settings_row_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "Lyrics Text Size", PILL_ACCESSORY_CHEVRON, false, lyrics_font_size_settings_row_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Screen Timeout", PILL_ACCESSORY_CHEVRON, false, screen_timeout_row_cb, NULL, NULL };
+    items[5] = (pill_list_item_t){ "Screen Dimming", PILL_ACCESSORY_TOGGLE,
                                     current_settings.screen_dimming_enabled, NULL, screen_dimming_switch_event_cb, NULL };
-    items[5] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
+    items[6] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
                                     current_settings.swipe_up_home_enabled, NULL, swipe_up_home_switch_event_cb, NULL };
-    items[6] = (pill_list_item_t){ "Hide Player/Lyrics Top Bar", PILL_ACCESSORY_TOGGLE,
+    items[7] = (pill_list_item_t){ "Hide Player/Lyrics Top Bar", PILL_ACCESSORY_TOGGLE,
                                     current_settings.hide_player_topbar, NULL,
                                     hide_player_topbar_switch_event_cb, NULL };
 
-    int count = 7;
+    int count = 8;
     int plugin_count = plugin_manager_get_display_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_DISPLAY_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -2279,6 +2420,7 @@ static lv_obj_t * build_eq_screen(void) {
 void gui_settings_init(void) {
     about_screen = build_about_screen();
     accent_color_screen = build_accent_color_screen();
+    custom_font_screen = build_custom_font_screen();
     screen_timeout_screen = build_screen_timeout_screen();
     startup_volume_screen = build_startup_volume_screen();
     sleep_timer_screen = build_sleep_timer_screen();
@@ -2312,6 +2454,7 @@ lv_obj_t * gui_settings_get_power_screen(void) { return settings_power_screen; }
 lv_obj_t * gui_settings_get_system_screen(void) { return settings_system_screen; }
 lv_obj_t * gui_settings_get_about_screen(void) { return about_screen; }
 lv_obj_t * gui_settings_get_accent_screen(void) { return accent_color_screen; }
+lv_obj_t * gui_settings_get_custom_font_screen(void) { return custom_font_screen; }
 lv_obj_t * gui_settings_get_eq_screen(void) { return eq_screen; }
 
 

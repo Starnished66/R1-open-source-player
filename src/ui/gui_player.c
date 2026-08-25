@@ -24,6 +24,7 @@ static int queue_next_insert_index = -1;
 #include "gui_lyrics.h"
 #include "gui_settings.h"
 #include "gui_subsonic.h"
+#include "fallback_font.h"
 #include "http_client.h"
 #include "screen_builders.h"
 #include "metadata.h"
@@ -1892,17 +1893,32 @@ int compute_manual_step_index(int index, int direction) {
  * filename is the best "song title" available. */
 void get_display_names(const char * path, char * title_out, size_t title_size,
                                char * folder_out, size_t folder_size) {
+    if (!path) {
+        if (title_out && title_size > 0) title_out[0] = '\0';
+        if (folder_out && folder_size > 0) folder_out[0] = '\0';
+        return;
+    }
     const char * slash = strrchr(path, '/');
     const char * filename = slash ? slash + 1 : path;
 
     const char * dot = strrchr(filename, '.');
     size_t len = dot ? (size_t) (dot - filename) : strlen(filename);
-    if (len >= title_size) len = title_size - 1;
-    memcpy(title_out, filename, len);
-    title_out[len] = '\0';
+    if (title_out && title_size > 0) {
+        char * tmp = (char *) malloc(len + 1);
+        if (tmp) {
+            memcpy(tmp, filename, len);
+            tmp[len] = '\0';
+            utf8_truncate_safe(title_out, tmp, title_size);
+            utf8_sanitize(title_out);
+            free(tmp);
+        } else {
+            utf8_truncate_safe(title_out, filename, title_size);
+            utf8_sanitize(title_out);
+        }
+    }
 
-    folder_out[0] = '\0';
-    if (slash) {
+    if (folder_out && folder_size > 0) folder_out[0] = '\0';
+    if (slash && folder_out && folder_size > 0) {
         char dir_path[PATH_MAX];
         size_t dir_len = (size_t) (slash - path);
         if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
@@ -1911,10 +1927,8 @@ void get_display_names(const char * path, char * title_out, size_t title_size,
 
         const char * folder_slash = strrchr(dir_path, '/');
         const char * folder_name = folder_slash ? folder_slash + 1 : dir_path;
-        if (folder_size > 0) {
-            strncpy(folder_out, folder_name, folder_size - 1);
-            folder_out[folder_size - 1] = '\0';
-        }
+        utf8_truncate_safe(folder_out, folder_name, folder_size);
+        utf8_sanitize(folder_out);
     }
 }
 

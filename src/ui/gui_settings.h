@@ -9,6 +9,7 @@ lv_obj_t * gui_settings_get_power_screen(void);
 lv_obj_t * gui_settings_get_system_screen(void);
 lv_obj_t * gui_settings_get_about_screen(void);
 lv_obj_t * gui_settings_get_accent_screen(void);
+lv_obj_t * gui_settings_get_custom_font_screen(void);
 lv_obj_t * gui_settings_get_eq_screen(void);
 
 void gui_settings_init(void);

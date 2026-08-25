@@ -5,6 +5,7 @@
 #include "playlist_files.h"
 #include "plugin_json.h"
 #include "plugin_storage.h"
+#include "fallback_font.h"
 #include "mbedtls/md5.h" /* plugin.md5() -- same primitive subsonic_client.c already uses for its own token auth */
 
 #include "lua.h"
@@ -488,7 +489,8 @@ static void append_list_item(plugin_list_item_t * array, int * count, lua_State 
     plugin_list_item_t * item = &array[(*count)++];
     item->L = L;
     item->open_ref = ref;
-    snprintf(item->label, sizeof(item->label), "%s", label);
+    utf8_truncate_safe(item->label, label, sizeof(item->label));
+    utf8_sanitize(item->label);
     item->icon_path[0] = '\0';
     item->row_height = 0;
     item->row_width = 0;
@@ -598,7 +600,8 @@ static int l_plugin_register_stream_media_tile(lua_State * L) {
     plugin_tile_t * t = &plugin_stream_tiles[plugin_stream_tile_count++];
     t->L = L;
     t->open_ref = ref;
-    snprintf(t->label, sizeof(t->label), "%s", label);
+    utf8_truncate_safe(t->label, label, sizeof(t->label));
+    utf8_sanitize(t->label);
     fill_tile_icon(t, icon, "stream_media/radio.png", "stream_media/radio_s.png");
     return 0;
 }

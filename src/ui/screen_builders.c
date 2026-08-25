@@ -1369,13 +1369,47 @@ static void compact_list_poll_fetch_cb(lv_timer_t * timer) {
     }
 }
 
+#define MAX_ACTIVE_COMPACT_LISTS 32
+static lv_obj_t * s_active_compact_lists[MAX_ACTIVE_COMPACT_LISTS];
+static int s_active_compact_list_count = 0;
+
+static void register_active_compact_list(lv_obj_t * list) {
+    if (!list) return;
+    for (int i = 0; i < s_active_compact_list_count; i++) {
+        if (s_active_compact_lists[i] == list) return;
+    }
+    if (s_active_compact_list_count < MAX_ACTIVE_COMPACT_LISTS) {
+        s_active_compact_lists[s_active_compact_list_count++] = list;
+    }
+}
+
+static void unregister_active_compact_list(lv_obj_t * list) {
+    for (int i = 0; i < s_active_compact_list_count; i++) {
+        if (s_active_compact_lists[i] == list) {
+            s_active_compact_lists[i] = s_active_compact_lists[--s_active_compact_list_count];
+            s_active_compact_lists[s_active_compact_list_count] = NULL;
+            return;
+        }
+    }
+}
+
+void compact_list_refresh_all(void) {
+    for (int i = 0; i < s_active_compact_list_count; i++) {
+        if (s_active_compact_lists[i]) {
+            compact_list_refresh_visible(s_active_compact_lists[i]);
+        }
+    }
+}
+
 static void compact_list_scroll_event_cb(lv_event_t * e) {
     lv_obj_t * list = lv_event_get_target(e);
     compact_list_update_window(list, (compact_list_virtual_data_t *) lv_obj_get_user_data(list));
 }
 
 static void compact_list_delete_event_cb(lv_event_t * e) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(lv_event_get_target(e));
+    lv_obj_t * list = lv_event_get_target(e);
+    unregister_active_compact_list(list);
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
     if (data->poll_timer) lv_timer_delete(data->poll_timer);
     if (data->pending_job) {
         /* Short bounded wait, not indefinite -- the overwhelmingly common
@@ -1638,6 +1672,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     lv_timer_pause(data->poll_timer);
 
     compact_list_update_window(list, data); /* populate the initially-visible rows */
+    register_active_compact_list(list);
 
     return list;
 }

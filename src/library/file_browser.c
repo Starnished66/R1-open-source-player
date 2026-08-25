@@ -3,6 +3,7 @@
 #include "assets.h"
 #include "screen_builders.h" /* STATUS_BAR_CLEARANCE / TITLE_ROW_HEIGHT / LIST_ROW_* */
 #include "playlist_files.h" /* playlist_files_resolve_path() -- shared M3U line resolution */
+#include "fallback_font.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -133,7 +134,8 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
             capacity *= 2;
         }
 
-        snprintf(result[count].name, sizeof(result[count].name), "%s", de->d_name);
+        utf8_truncate_safe(result[count].name, de->d_name, sizeof(result[count].name));
+        utf8_sanitize(result[count].name);
         result[count].is_dir = is_dir;
         result[count].is_playlist = is_playlist;
         result[count].is_cue = is_cue;

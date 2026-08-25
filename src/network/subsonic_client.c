@@ -3,6 +3,7 @@
 
 #include "mbedtls/md5.h"
 #include "cJSON.h"
+#include "fallback_font.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -227,9 +228,12 @@ bool subsonic_get_album_songs(const subsonic_server_t * server, const char * alb
     cJSON * song_item;
     cJSON_ArrayForEach(song_item, song_arr) {
         snprintf(songs[i].id, sizeof(songs[i].id), "%s", json_str(song_item, "id", ""));
-        snprintf(songs[i].title, sizeof(songs[i].title), "%s", json_str(song_item, "title", "(unknown)"));
-        snprintf(songs[i].artist, sizeof(songs[i].artist), "%s", json_str(song_item, "artist", ""));
-        snprintf(songs[i].album, sizeof(songs[i].album), "%s", json_str(song_item, "album", ""));
+        utf8_truncate_safe(songs[i].title, json_str(song_item, "title", "(unknown)"), sizeof(songs[i].title));
+        utf8_sanitize(songs[i].title);
+        utf8_truncate_safe(songs[i].artist, json_str(song_item, "artist", ""), sizeof(songs[i].artist));
+        utf8_sanitize(songs[i].artist);
+        utf8_truncate_safe(songs[i].album, json_str(song_item, "album", ""), sizeof(songs[i].album));
+        utf8_sanitize(songs[i].album);
         snprintf(songs[i].suffix, sizeof(songs[i].suffix), "%s", json_str(song_item, "suffix", "mp3"));
         snprintf(songs[i].cover_art, sizeof(songs[i].cover_art), "%s", json_str(song_item, "coverArt", ""));
         songs[i].track = json_int(song_item, "track", 0);
@@ -327,9 +331,12 @@ bool subsonic_get_playlist_songs(const subsonic_server_t * server, const char * 
     cJSON * entry_item;
     cJSON_ArrayForEach(entry_item, entry_arr) {
         snprintf(songs[i].id, sizeof(songs[i].id), "%s", json_str(entry_item, "id", ""));
-        snprintf(songs[i].title, sizeof(songs[i].title), "%s", json_str(entry_item, "title", "(unknown)"));
-        snprintf(songs[i].artist, sizeof(songs[i].artist), "%s", json_str(entry_item, "artist", ""));
-        snprintf(songs[i].album, sizeof(songs[i].album), "%s", json_str(entry_item, "album", ""));
+        utf8_truncate_safe(songs[i].title, json_str(entry_item, "title", "(unknown)"), sizeof(songs[i].title));
+        utf8_sanitize(songs[i].title);
+        utf8_truncate_safe(songs[i].artist, json_str(entry_item, "artist", ""), sizeof(songs[i].artist));
+        utf8_sanitize(songs[i].artist);
+        utf8_truncate_safe(songs[i].album, json_str(entry_item, "album", ""), sizeof(songs[i].album));
+        utf8_sanitize(songs[i].album);
         snprintf(songs[i].suffix, sizeof(songs[i].suffix), "%s", json_str(entry_item, "suffix", "mp3"));
         snprintf(songs[i].cover_art, sizeof(songs[i].cover_art), "%s", json_str(entry_item, "coverArt", ""));
         songs[i].track = json_int(entry_item, "track", 0);

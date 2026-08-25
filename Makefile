@@ -255,6 +255,7 @@ APP_SRCS += src/ui/lyrics_layout.c src/ui/transition_compositor.c
 APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c
 APP_SRCS += src/library/remote_track.c
 APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c src/library/artwork_coordinator.c
+APP_SRCS += src/core/utf8_util.c
 APP_CXX_SRCS = src/audio/alac_decoder.cpp
 LVGL_SRCS = $(shell find $(LVGL_DIR)/src -type f -name '*.c')
 TINYALSA_SRCS = $(shell find $(TINYALSA_DIR)/src -type f -name '*.c')
@@ -456,7 +457,7 @@ compile_commands.json:
 	@python3 generate_compile_commands.py
 
 TAGCACHE_SELFTEST_SRCS = src/library/tagcache_selftest.c src/library/metadata_db.c src/library/tagcache.c \
-                         src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c
+                         src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c src/core/utf8_util.c
 tagcache-selftest:
 	$(CC) $(HOST_CFLAGS) -o /tmp/tagcache_selftest $(TAGCACHE_SELFTEST_SRCS) -lpthread
 	/tmp/tagcache_selftest
@@ -470,6 +471,11 @@ ARTWORK_SELFTEST_SRCS = src/library/artwork_coordinator_selftest.c src/library/a
 artwork-selftest:
 	$(CC) $(HOST_CFLAGS) -o /tmp/artwork_selftest $(ARTWORK_SELFTEST_SRCS) -lpthread
 	/tmp/artwork_selftest
+
+FONT_SELFTEST_SRCS = src/ui/font_selftest.c src/ui/fallback_font.c src/core/settings.c src/library/subsonic_saved_servers.c src/core/subprocess.c src/core/utf8_util.c $(filter-out $(LVGL_DIR)/src/drivers/sdl/%,$(LVGL_SRCS))
+font-selftest:
+	$(CC) $(HOST_CFLAGS) -I. -Ilvgl -Isrc/ui -Isrc/core -Isrc/hardware -Isrc/audio -Isrc/library -Isrc/network -Isrc/plugins -DLV_CONF_INCLUDE_SIMPLE=1 -DHOST_BUILD=1 -o /tmp/font_selftest $(FONT_SELFTEST_SRCS) -lm -lpthread
+	/tmp/font_selftest
 
 clean:
 	rm -rf build_host build_target $(HOST_BIN) $(TARGET_BIN) compile_commands.json compile_flags.txt

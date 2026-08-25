@@ -131,6 +131,7 @@ static void set_defaults(player_settings_t * out) {
     out->lyrics_font_size_tier = 2; /* Large -- see settings.h's own comment */
     out->brightness_percent = 80;
     out->clock_24h = true; /* matches the app's original, only-ever clock format -- existing installs see no change */
+    out->custom_font[0] = '\0';
 }
 
 void settings_subsonic_server_upsert(player_settings_t * settings, const char * url, const char * username,
@@ -383,6 +384,12 @@ bool settings_load(player_settings_t * out) {
             out->brightness_percent = atoi(value);
         } else if (strcmp(key, "clock_24h") == 0) {
             out->clock_24h = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "custom_font") == 0) {
+            if (!strchr(value, '/') && !strchr(value, '\\') && !strstr(value, "..")) {
+                snprintf(out->custom_font, sizeof(out->custom_font), "%s", value);
+            } else {
+                out->custom_font[0] = '\0';
+            }
         }
     }
 
@@ -513,6 +520,7 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "lyrics_font_size_tier=%d\n", settings->lyrics_font_size_tier);
     fprintf(f, "brightness_percent=%d\n", settings->brightness_percent);
     fprintf(f, "clock_24h=%d\n", settings->clock_24h ? 1 : 0);
+    fprintf(f, "custom_font=%s\n", settings->custom_font);
 
     fflush(f);
     fsync(fileno(f));

@@ -350,6 +350,11 @@ typedef struct {
      * topbar/pm.png -- already-present theme assets, previously unused by
      * any code in this app). */
     bool clock_24h;
+
+    /* Settings -> Display -> Font. Filename of the user-selected custom Latin
+     * TTF font from <SD>/Fonts (e.g. "Roboto-Regular.ttf"). Empty string means
+     * built-in Montserrat default. */
+    char custom_font[64];
 } player_settings_t;
 
 /* Loads settings from disk into *out. If the settings file doesn't exist or

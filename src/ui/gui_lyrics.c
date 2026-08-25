@@ -941,3 +941,11 @@ void gui_lyrics_cancel_background_work(void) {
         lyrics_backdrop_active = false;
     }
 }
+
+void gui_lyrics_refresh_layout(void) {
+    if (!lyrics_screen) return;
+    lyrics_reset_pool();
+    if (!lv_obj_has_flag(lyrics_screen, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_invalidate(lyrics_screen);
+    }
+}

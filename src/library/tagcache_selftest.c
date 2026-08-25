@@ -1,8 +1,10 @@
 #include "metadata_db.h"
+#include "utf8_util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <unistd.h>
 

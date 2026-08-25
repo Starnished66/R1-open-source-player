@@ -16,6 +16,7 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "gui_text_input.h"
 #include "gui_subsonic.h"
 #include "gui_books.h"
+#include "fallback_font.h"
 #include "plugin_manager.h"
 #include "screen_builders.h"
 #include "metadata.h"
@@ -1776,15 +1777,14 @@ static void register_az_index(lv_obj_t * screen, lv_obj_t * list, metadata_db_az
      * entirely and needs no chroma-key support this LVGL build doesn't have. */
     lv_obj_t * strip = lv_label_create(screen);
     lv_label_set_text(strip, "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL\nM\nN\nO\nP\nQ\nR\nS\nT\nU\nV\nW\nX\nY\nZ\n#");
-    lv_obj_set_style_text_font(strip, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(strip, &app_font_16, 0);
     lv_obj_add_style(strip, &style_theme_text_primary, 0);
     lv_obj_set_style_text_align(strip, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_bg_opa(strip, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(strip, 0, 0);
     lv_obj_remove_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
     /* Stretched with extra line spacing to span close to the full list
-     * height (27 lines * lv_font_montserrat_16's own 22px line height is
-     * only ~594px, well short of the ~688px-tall list area) rather than
+     * height (27 lines * app_font_16's own line height) rather than
      * sitting bunched up near the top. */
     lv_obj_set_style_text_line_space(strip, 3, 0);
     /* Top edge (the "A") lines up with the list's own top edge; the
@@ -1800,7 +1800,7 @@ static void register_az_index(lv_obj_t * screen, lv_obj_t * list, metadata_db_az
     lv_obj_add_flag(popup, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t * popup_label = lv_label_create(popup);
-    lv_obj_set_style_text_font(popup_label, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_font(popup_label, &app_font_28, 0);
     lv_obj_add_style(popup_label, &style_theme_text_primary, 0);
     lv_obj_center(popup_label);
 
@@ -3425,46 +3425,14 @@ void poll_sd_card_hotplug(void) {
     if (!was_mounted && !library_rescan_active) {
         reload_library_on_sd_reinsert();
         file_browser_reset_to_root();
+        fallback_font_on_sd_mounted();
     } else if (!boot_library_recheck_done) {
-        /* Real-device bug report: library randomly not loaded after a
-         * reboot (worked around by enabling Resume Last Track, whose own
-         * fallback -- build_saved_resume_playlist()'s file_browser_build_
-         * playlist_for_path() call -- does a live single-folder filesystem
-         * scan independent of the in-memory library, masking this rather
-         * than fixing it). Root cause: mount_sd_card_if_needed() (main.c)
-         * runs once, synchronously, before gui_init() -- if the SD card's
-         * device node hasn't been created by the kernel yet at that exact
-         * point (enumeration timing varies boot to boot), that mount
-         * silently fails with no retry, so library_load_from_cache_only()
-         * (called from gui_init()) finds music_root_is_mounted() false and
-         * leaves the library empty for the rest of the session. This
-         * function's own retry above (mount_sd_card_if_needed() a few
-         * lines up) usually fixes the mount itself within its very first
-         * tick -- but that means was_mounted (which starts true, per its
-         * own comment above) never actually observes a confirmed
-         * not-mounted state (unmount_confirm_streak never reaches
-         * SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD), so it's never flipped to
-         * false, so the !was_mounted branch above never fires either: the
-         * card ends up correctly mounted at the filesystem level, but
-         * nothing ever tells the app's in-memory library to reload. One-
-         * shot (not tied to was_mounted) so this can't fire more than once
-         * per boot even for a card that's mounted but genuinely has no
-         * music -- reload_library_on_sd_reinsert() only loads the on-card
-         * database (or leaves the library empty), so an empty card does
-         * not start a repeating full scan. */
         boot_library_recheck_done = true;
-        /* metadata_db_get_song_count() (the real database), not
-         * all_songs_count -- that's deliberately never populated at boot
-         * anymore (see library_load_from_cache_only()'s own comment), so
-         * checking it here would read 0 on literally every single boot
-         * regardless of whether the SD-mount race this guards against
-         * actually happened, forcing reload_library_on_sd_reinsert()'s own
-         * full eager load every time and defeating this rework's entire
-         * point. */
         if (metadata_db_get_song_count() == 0 && !library_rescan_active) {
             reload_library_on_sd_reinsert();
             file_browser_reset_to_root();
         }
+        fallback_font_on_sd_mounted();
     }
     was_mounted = true;
 }

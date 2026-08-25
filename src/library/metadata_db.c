@@ -4,6 +4,7 @@
 #include "remote_state.h"
 #include "subsonic_saved_servers.h"
 #include "tagcache.h"
+#include "fallback_font.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -491,12 +492,15 @@ int metadata_db_search_names(metadata_db_az_kind_t kind, const char * needle, in
 }
 
 void metadata_db_song_display_title(const song_row_t * row, char * out, size_t out_size) {
+    if (!row || !out || out_size == 0) return;
     if (row->tags.title[0] != '\0') {
-        snprintf(out, out_size, "%s", row->tags.title);
+        utf8_truncate_safe(out, row->tags.title, out_size);
+        utf8_sanitize(out);
         return;
     }
     const char * slash = strrchr(row->path, '/');
-    snprintf(out, out_size, "%s", slash ? slash + 1 : row->path);
+    utf8_truncate_safe(out, slash ? slash + 1 : row->path, out_size);
+    utf8_sanitize(out);
 }
 
 int metadata_db_search_songs(const char * query_text, song_row_t * out_rows, int max_rows) {

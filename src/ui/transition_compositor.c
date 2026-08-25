@@ -223,6 +223,37 @@ bool transition_compositor_frame(int32_t v) {
     int32_t to_end = (to_x + w > w) ? w : to_x + w;
     if (to_end < to_start) to_end = to_start;
 
+    /* RGB565 was validated in begin(), so every pixel is exactly two bytes
+     * and neither source has an indexed-color palette prefix. Compute each
+     * visible span's first-row address once and walk all three buffers by
+     * their independent strides. The old loop called lv_draw_buf_goto_xy()
+     * for each visible source on every scanline, repeating format-size and
+     * y*stride calculations up to twice per row even though only y changed. */
+    const size_t from_copy_bytes = (size_t) (from_end - from_start) * 2U;
+    const size_t to_copy_bytes = (size_t) (to_end - to_start) * 2U;
+    const uint8_t * from_row = (const uint8_t *) compositor_from->data;
+    const uint8_t * to_row = (const uint8_t *) compositor_to->data;
+    if (from_copy_bytes) from_row += (size_t) (from_start - from_x) * 2U;
+    if (to_copy_bytes) to_row += (size_t) (to_start - to_x) * 2U;
+    uint8_t * dest_row = dest_page;
+
+#ifdef UI_PERF_TRACE
+    /* begin() already proves stride*height is inside data_size. These
+     * tighter frame-specific checks document that the selected horizontal
+     * spans also end within every row before the raw-pointer fast path is
+     * entered. */
+    LV_ASSERT(!from_copy_bytes ||
+              ((uint64_t) (uint32_t) (from_start - from_x) * 2ULL + from_copy_bytes <=
+               compositor_from->header.stride));
+    LV_ASSERT(!to_copy_bytes ||
+              ((uint64_t) (uint32_t) (to_start - to_x) * 2ULL + to_copy_bytes <=
+               compositor_to->header.stride));
+    LV_ASSERT(!from_copy_bytes ||
+              ((uint64_t) (uint32_t) from_start * 2ULL + from_copy_bytes <= compositor_fb_stride));
+    LV_ASSERT(!to_copy_bytes ||
+              ((uint64_t) (uint32_t) to_start * 2ULL + to_copy_bytes <= compositor_fb_stride));
+#endif
+
     /* Every row, y=0 through height-1 -- no top/bottom margin is ever
      * skipped or separately re-stamped (see this module's own header
      * comment on why: both `from` and `to` are already complete, full-
@@ -230,17 +261,13 @@ bool transition_compositor_frame(int32_t v) {
      * baked in, so compositing the whole frame uniformly is what makes
      * those bars slide correctly instead of staying stationary). */
     for (int32_t y = 0; y < compositor_height; y++) {
-        uint8_t * dest_row = dest_page + (uint32_t) y * compositor_fb_stride;
-        if (from_end > from_start) {
-            const uint8_t * src = (const uint8_t *) lv_draw_buf_goto_xy(
-                compositor_from, (uint32_t) (from_start - from_x), (uint32_t) y);
-            memcpy(dest_row + (uint32_t) from_start * 2, src, (size_t) (from_end - from_start) * 2);
-        }
-        if (to_end > to_start) {
-            const uint8_t * src = (const uint8_t *) lv_draw_buf_goto_xy(
-                compositor_to, (uint32_t) (to_start - to_x), (uint32_t) y);
-            memcpy(dest_row + (uint32_t) to_start * 2, src, (size_t) (to_end - to_start) * 2);
-        }
+        if (from_copy_bytes)
+            memcpy(dest_row + (size_t) from_start * 2U, from_row, from_copy_bytes);
+        if (to_copy_bytes)
+            memcpy(dest_row + (size_t) to_start * 2U, to_row, to_copy_bytes);
+        from_row += compositor_from->header.stride;
+        to_row += compositor_to->header.stride;
+        dest_row += compositor_fb_stride;
     }
 
     /* Only commit the just-composed page to the screen once every row has

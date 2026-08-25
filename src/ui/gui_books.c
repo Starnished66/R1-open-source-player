@@ -36,7 +36,11 @@ extern void generic_back_cb(lv_event_t * e);
 extern void show_error_toast(const char * msg);
 extern void show_info_toast(const char * msg);
 
+#ifdef HOST_BUILD
 #define BOOKS_ROOT_DIR "./music/Books"
+#else
+#define BOOKS_ROOT_DIR "/data/mnt/sd_0/Books"
+#endif
 
 static lv_obj_t * books_screen = NULL;
 

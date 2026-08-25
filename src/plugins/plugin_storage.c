@@ -232,7 +232,14 @@ bool plugin_storage_path_is_reserved(const char * path) {
     if (!normalize_path(path, path_n, sizeof(path_n))) return false;
     if (path_is_under(path_n, root_n)) return true;
 
-    if (!resolve_nearest_existing_ancestor(root_n, root_r, sizeof(root_r))) {
+    /* Never collapse a not-yet-created reserved root to its nearest existing
+     * ancestor. On this firmware /data resolves through /usr/data, so doing
+     * that while /usr/data/plugins did not yet exist broadened the reserved
+     * tree to all of /usr/data -- including the mounted SD card at
+     * /usr/data/mnt/sd_0. Keep the exact normalized root until it exists;
+     * path_r still follows existing/dangling symlinks and therefore catches
+     * an external path that actually resolves into that exact tree. */
+    if (!resolve_existing_component(root_n, root_r, sizeof(root_r), 0)) {
         snprintf(root_r, sizeof(root_r), "%s", root_n);
     }
     if (!resolve_nearest_existing_ancestor(path_n, path_r, sizeof(path_r))) return false;

@@ -4359,6 +4359,8 @@ static void scan_one_song_into_db(const char * path) {
 
     cached_tags_t fresh;
     memset(&fresh, 0, sizeof(fresh));
+    fresh.track_number = meta.has_track_number ? meta.track_number : -1;
+    fresh.disc_number = meta.has_disc_number ? meta.disc_number : -1;
     snprintf(fresh.title, sizeof(fresh.title), "%s", meta.has_title ? meta.title : "");
     snprintf(fresh.artist, sizeof(fresh.artist), "%s", meta.has_artist ? meta.artist : "Unknown Artist");
     snprintf(fresh.album, sizeof(fresh.album), "%s", meta.has_album ? meta.album : "Unknown Album");

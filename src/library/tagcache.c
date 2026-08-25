@@ -117,6 +117,8 @@ typedef struct {
     int32_t playcount;
     int32_t last_played;
     int32_t rating;
+    int32_t track_number;
+    int32_t disc_number;
     int32_t path_seek;
     int32_t title_seek;
     uint32_t path_h;
@@ -481,6 +483,8 @@ static void fill_song(int32_t idx, tagcache_song_t * out) {
     out->playcount = e->playcount;
     out->last_played = e->last_played;
     out->rating = e->rating;
+    out->track_number = e->track_number;
+    out->disc_number = e->disc_number;
     out->path = entry_path_str(e);
     out->title = entry_title_str(e);
     out->artist = e->artist ? e->artist : "";
@@ -531,6 +535,16 @@ static int cmp_slot_album_path(const void * a, const void * b) {
 static int cmp_slot_path(const void * a, const void * b) {
     int32_t ia = *(const int32_t *) a;
     int32_t ib = *(const int32_t *) b;
+    int da = ents[ia].disc_number > 0 ? ents[ia].disc_number : 1;
+    int db = ents[ib].disc_number > 0 ? ents[ib].disc_number : 1;
+    if (da != db) return da < db ? -1 : 1;
+    int ta = ents[ia].track_number;
+    int tb = ents[ib].track_number;
+    if (ta > 0 || tb > 0) {
+        if (ta <= 0) return 1;
+        if (tb <= 0) return -1;
+        if (ta != tb) return ta < tb ? -1 : 1;
+    }
     if (intern_path_title) {
         int c = ascii_casecmp(entry_path_str(&ents[ia]), entry_path_str(&ents[ib]));
         if (c) return c;
@@ -823,7 +837,8 @@ static bool ensure_cap(int32_t need) {
 }
 
 static void apply_tags(entry_t * e, const char * path, int32_t mtime, int32_t size, const char * title,
-                       const char * artist, const char * album, const char * album_artist, const char * genre) {
+                       const char * artist, const char * album, const char * album_artist, const char * genre,
+                       int32_t track_number, int32_t disc_number) {
     e->path_h = path ? fnv1a(path, strlen(path)) : 0;
     e->path = intern_path(path);
     e->title = intern_tag(title);
@@ -833,6 +848,8 @@ static void apply_tags(entry_t * e, const char * path, int32_t mtime, int32_t si
     e->genre = intern_tag(genre);
     e->mtime = mtime;
     e->size = size;
+    e->track_number = track_number > 0 ? track_number : -1;
+    e->disc_number = disc_number > 0 ? disc_number : -1;
     e->flag &= ~(FLAG_DELETED | FLAG_TAGS_INCOMPLETE);
     e->flag |= FLAG_SEEN;
 }
@@ -1136,6 +1153,8 @@ static bool write_all(void) {
                     idx.tag_seek[tag_playcount] = ents[i].playcount;
                     idx.tag_seek[tag_lastplayed] = ents[i].last_played;
                     idx.tag_seek[tag_rating] = ents[i].rating;
+                    idx.tag_seek[tag_discnumber] = ents[i].disc_number;
+                    idx.tag_seek[tag_tracknumber] = ents[i].track_number;
                     idx.tag_seek[tag_composer] = idx.tag_seek[tag_artist];
                     idx.tag_seek[tag_virt_canonicalartist] = idx.tag_seek[tag_artist];
                     idx.tag_seek[tag_grouping] = title_seek[i];
@@ -1500,6 +1519,8 @@ static bool load_generation(int32_t gen) {
         e->playcount = idx.tag_seek[tag_playcount];
         e->last_played = idx.tag_seek[tag_lastplayed];
         e->rating = idx.tag_seek[tag_rating];
+        e->disc_number = idx.tag_seek[tag_discnumber];
+        e->track_number = idx.tag_seek[tag_tracknumber];
         e->path_seek = idx.tag_seek[tag_filename];
         e->title_seek = idx.tag_seek[tag_title];
         path_seek[i] = e->path_seek;
@@ -1797,11 +1818,13 @@ bool tagcache_lookup(const char * path, int32_t mtime, int32_t size, tagcache_so
 }
 
 void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char * title, const char * artist,
-                     const char * album, const char * album_artist, const char * genre) {
+                     const char * album, const char * album_artist, const char * genre,
+                     int32_t track_number, int32_t disc_number) {
     if (!db_open || !path) return;
     int32_t idx = path_hash_find(path);
     if (idx >= 0 && !(ents[idx].flag & FLAG_DELETED)) {
-        apply_tags(&ents[idx], path, mtime, size, title, artist, album, album_artist, genre);
+        apply_tags(&ents[idx], path, mtime, size, title, artist, album, album_artist, genre,
+                   track_number, disc_number);
         return;
     }
     if (idx >= 0) {
@@ -1809,7 +1832,8 @@ void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char 
         int32_t playcount = ents[idx].playcount;
         int32_t last_played = ents[idx].last_played;
         int32_t rating = ents[idx].rating;
-        apply_tags(&ents[idx], path, mtime, size, title, artist, album, album_artist, genre);
+        apply_tags(&ents[idx], path, mtime, size, title, artist, album, album_artist, genre,
+                   track_number, disc_number);
         ents[idx].first_seen = first_seen;
         ents[idx].playcount = playcount;
         ents[idx].last_played = last_played;
@@ -1822,7 +1846,8 @@ void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char 
     }
     idx = ent_count++;
     memset(&ents[idx], 0, sizeof(ents[idx]));
-    apply_tags(&ents[idx], path, mtime, size, title, artist, album, album_artist, genre);
+    apply_tags(&ents[idx], path, mtime, size, title, artist, album, album_artist, genre,
+               track_number, disc_number);
     ents[idx].first_seen = (int32_t) time(NULL);
     path_hash_insert(idx);
 }

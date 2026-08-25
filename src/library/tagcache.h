@@ -35,6 +35,8 @@ typedef struct {
     int32_t playcount;
     int32_t last_played;
     int32_t rating; /* 1 = favorite, matching Rockbox's rating tag */
+    int32_t track_number;
+    int32_t disc_number;
     const char * path;
     const char * title;
     const char * artist;
@@ -59,7 +61,8 @@ void tagcache_begin_update(void);
  * row exists whose stored mtime and size both match. */
 bool tagcache_lookup(const char * path, int32_t mtime, int32_t size, tagcache_song_t * out);
 void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char * title, const char * artist,
-                     const char * album, const char * album_artist, const char * genre);
+                     const char * album, const char * album_artist, const char * genre,
+                     int32_t track_number, int32_t disc_number);
 /* prune unseen rows, rebuild indexes, persist. Returns false if the
  * on-disk write failed -- RAM is reloaded from the last committed files. */
 bool tagcache_end_update(bool prune);

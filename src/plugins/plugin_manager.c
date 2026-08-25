@@ -2294,7 +2294,7 @@ static int l_plugin_library_get_songs(lua_State * L) {
     }
 
     /* Heap-allocated, not a stack array -- song_row_t is ~1.25KB (a 600-
-     * byte path plus a 640-byte cached_tags_t), and GUI_PLUGIN_LIBRARY_MAX_
+     * byte path plus one cached_tags_t), and GUI_PLUGIN_LIBRARY_MAX_
      * PAGE (200) of those is ~250KB. remote_control.c hit exactly this as a
      * real on-device stack-overflow crash (see build_library_json()'s own
      * comment) before it was fixed the same way; not worth trusting that

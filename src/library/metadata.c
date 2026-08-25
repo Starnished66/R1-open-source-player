@@ -71,6 +71,34 @@ static void copy_bounded(char * dst, size_t dst_size, const char * src, size_t s
     utf8_truncate_safe_bounded(dst, dst_size, src, src_len);
 }
 
+static bool parse_sequence_number(const char * text, size_t len, int * out_value) {
+    size_t i = 0;
+    while (i < len && (text[i] == ' ' || text[i] == '\t')) i++;
+    unsigned value = 0;
+    bool have_digit = false;
+    while (i < len && text[i] >= '0' && text[i] <= '9') {
+        have_digit = true;
+        unsigned digit = (unsigned) (text[i++] - '0');
+        if (value > 9999U) return false;
+        value = value * 10U + digit;
+    }
+    if (!have_digit || value == 0 || value > 99999U) return false;
+    *out_value = (int) value;
+    return true;
+}
+
+static void apply_sequence_text(track_metadata_t * out, bool disc, const char * value, size_t value_len) {
+    int number;
+    if (!parse_sequence_number(value, value_len, &number)) return;
+    if (disc) {
+        out->disc_number = number;
+        out->has_disc_number = true;
+    } else {
+        out->track_number = number;
+        out->has_track_number = true;
+    }
+}
+
 /* strtod() wrapper used by every REPLAYGAIN_* field below -- only reports
  * success when at least one digit was actually consumed (an empty or
  * garbage value silently returns 0.0 from plain strtod, which would
@@ -185,6 +213,11 @@ static void apply_vorbis_comment_field(track_metadata_t * out, const char * comm
     } else if (key_len == 5 && strncasecmp(comment, "GENRE", 5) == 0) {
         copy_bounded(out->genre, sizeof(out->genre), value, value_len);
         out->has_genre = true;
+    } else if (key_len == 11 && strncasecmp(comment, "TRACKNUMBER", 11) == 0) {
+        apply_sequence_text(out, false, value, value_len);
+    } else if ((key_len == 10 && strncasecmp(comment, "DISCNUMBER", 10) == 0) ||
+               (key_len == 10 && strncasecmp(comment, "DISKNUMBER", 10) == 0)) {
+        apply_sequence_text(out, true, value, value_len);
     } else if (key_len == 21 && strncasecmp(comment, "REPLAYGAIN_", 11) == 0) {
         /* strtod() stops at a trailing " dB" on gain fields, no need to
          * strip it -- apply_replaygain_field() re-checks the full key
@@ -319,6 +352,9 @@ static void read_wav_metadata(const char * path, track_metadata_t * out) {
             case drwav_metadata_type_list_info_album:
                 copy_bounded(out->album, sizeof(out->album), meta->data.infoText.pString, meta->data.infoText.stringLength);
                 out->has_album = true;
+                break;
+            case drwav_metadata_type_list_info_tracknumber:
+                apply_sequence_text(out, false, meta->data.infoText.pString, meta->data.infoText.stringLength);
                 break;
             default:
                 break;
@@ -650,7 +686,9 @@ static bool read_id3v2_streaming(FILE * f, track_metadata_t * out, uint8_t major
                        strcmp(id, major_version <= 2 ? "TP1" : "TPE1") == 0 ||
                        strcmp(id, major_version <= 2 ? "TAL" : "TALB") == 0 ||
                        strcmp(id, major_version <= 2 ? "TP2" : "TPE2") == 0 ||
-                       strcmp(id, major_version <= 2 ? "TCO" : "TCON") == 0;
+                       strcmp(id, major_version <= 2 ? "TCO" : "TCON") == 0 ||
+                       strcmp(id, major_version <= 2 ? "TRK" : "TRCK") == 0 ||
+                       strcmp(id, major_version <= 2 ? "TPA" : "TPOS") == 0;
         bool is_picture = strcmp(id, major_version <= 2 ? "PIC" : "APIC") == 0;
         bool is_txxx = major_version >= 3 && strcmp(id, "TXXX") == 0;
         bool is_lyrics = major_version >= 3 && strcmp(id, "USLT") == 0;
@@ -687,6 +725,11 @@ static bool read_id3v2_streaming(FILE * f, track_metadata_t * out, uint8_t major
                         decode_id3v2_text_frame(payload, n, out->album_artist, sizeof(out->album_artist)); out->has_album_artist = out->album_artist[0] != 0;
                     } else if (strcmp(id, major_version <= 2 ? "TCO" : "TCON") == 0) {
                         decode_id3v2_text_frame(payload, n, out->genre, sizeof(out->genre)); out->has_genre = out->genre[0] != 0;
+                    } else if (strcmp(id, major_version <= 2 ? "TRK" : "TRCK") == 0 ||
+                               strcmp(id, major_version <= 2 ? "TPA" : "TPOS") == 0) {
+                        char sequence[32];
+                        decode_id3v2_text_frame(payload, n, sequence, sizeof(sequence));
+                        apply_sequence_text(out, id[1] == 'P', sequence, strlen(sequence));
                     } else if (is_picture) {
                         if (major_version <= 2) decode_id3v2_pic_frame(payload, n, out); else decode_id3v2_apic_frame(payload, n, out);
                     } else if (is_txxx) decode_id3v2_txxx_frame(payload, n, out);
@@ -818,6 +861,11 @@ static bool read_id3v2(FILE * f, track_metadata_t * out, bool include_blobs) {
                 decode_id3v2_text_frame(tag_data + pos, frame_size, out->genre, sizeof(out->genre));
                 out->has_genre = out->genre[0] != '\0';
                 found_any = true;
+            } else if (strcmp(frame_id, "TRK") == 0 || strcmp(frame_id, "TPA") == 0) {
+                char sequence[32];
+                decode_id3v2_text_frame(tag_data + pos, frame_size, sequence, sizeof(sequence));
+                apply_sequence_text(out, frame_id[1] == 'P', sequence, strlen(sequence));
+                found_any = true;
             } else if (strcmp(frame_id, "PIC") == 0) {
                 decode_id3v2_pic_frame(tag_data + pos, frame_size, out);
                 found_any = true;
@@ -939,6 +987,11 @@ static bool read_id3v2(FILE * f, track_metadata_t * out, bool include_blobs) {
                 decode_id3v2_text_frame(frame_data, frame_data_size, out->genre, sizeof(out->genre));
                 out->has_genre = out->genre[0] != '\0';
                 found_any = true;
+            } else if (strcmp(frame_id, "TRCK") == 0 || strcmp(frame_id, "TPOS") == 0) {
+                char sequence[32];
+                decode_id3v2_text_frame(frame_data, frame_data_size, sequence, sizeof(sequence));
+                apply_sequence_text(out, frame_id[1] == 'P', sequence, strlen(sequence));
+                found_any = true;
             } else if (strcmp(frame_id, "APIC") == 0) {
                 decode_id3v2_apic_frame(frame_data, frame_data_size, out);
                 found_any = true;
@@ -976,6 +1029,10 @@ static bool read_id3v1(FILE * f, track_metadata_t * out) {
     out->has_title = out->title[0] != '\0';
     out->has_artist = out->artist[0] != '\0';
     out->has_album = out->album[0] != '\0';
+    if (tag[125] == 0 && tag[126] != 0) {
+        out->track_number = tag[126];
+        out->has_track_number = true;
+    }
     return true;
 }
 
@@ -1119,6 +1176,26 @@ static void m4a_read_text_tag(FILE * f, m4a_box_t item, char * dst, size_t dst_s
     *has_flag = true;
 }
 
+static void m4a_read_sequence_tag(FILE * f, m4a_box_t item, bool disc, track_metadata_t * out) {
+    long payload_offset;
+    uint32_t payload_size;
+    if (!m4a_find_data_payload(f, item, &payload_offset, &payload_size) || payload_size < 4) return;
+    uint8_t data[8] = {0};
+    uint32_t n = payload_size < sizeof(data) ? payload_size : (uint32_t) sizeof(data);
+    if (fseek(f, payload_offset, SEEK_SET) != 0 || fread(data, 1, n, f) != n) return;
+    /* iTunes trkn/disk payload: two reserved bytes followed by the
+     * big-endian current track/disc number (then total count). */
+    int value = ((int) data[2] << 8) | data[3];
+    if (value <= 0) return;
+    if (disc) {
+        out->disc_number = value;
+        out->has_disc_number = true;
+    } else {
+        out->track_number = value;
+        out->has_track_number = true;
+    }
+}
+
 static void m4a_read_cover_art(FILE * f, m4a_box_t item, track_metadata_t * out) {
     if (out->picture_data != NULL) return; /* keep the first picture found, same as FLAC/MP3 */
 
@@ -1210,6 +1287,10 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out, bool in
             m4a_read_text_tag(f, item, out->album_artist, sizeof(out->album_artist), &out->has_album_artist);
         } else if (strcmp(item.type, "\xA9" "gen") == 0) {
             m4a_read_text_tag(f, item, out->genre, sizeof(out->genre), &out->has_genre);
+        } else if (strcmp(item.type, "trkn") == 0) {
+            m4a_read_sequence_tag(f, item, false, out);
+        } else if (strcmp(item.type, "disk") == 0) {
+            m4a_read_sequence_tag(f, item, true, out);
         } else if (include_blobs && strcmp(item.type, "covr") == 0) {
             m4a_read_cover_art(f, item, out);
         } else if (include_blobs && strcmp(item.type, "\xA9" "lyr") == 0) {
@@ -1489,6 +1570,12 @@ static void apply_title_artist_album_field(track_metadata_t * out, const char * 
     } else if (key_len == 5 && strncasecmp(key, "Album", 5) == 0) {
         copy_bounded(out->album, sizeof(out->album), value, value_len);
         out->has_album = true;
+    } else if ((key_len == 5 && strncasecmp(key, "Track", 5) == 0) ||
+               (key_len == 11 && strncasecmp(key, "TrackNumber", 11) == 0)) {
+        apply_sequence_text(out, false, value, value_len);
+    } else if ((key_len == 4 && strncasecmp(key, "Disc", 4) == 0) ||
+               (key_len == 10 && strncasecmp(key, "DiscNumber", 10) == 0)) {
+        apply_sequence_text(out, true, value, value_len);
     }
 }
 

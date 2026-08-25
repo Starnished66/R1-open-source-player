@@ -21,6 +21,8 @@ typedef struct {
     char album[128];
     char album_artist[128];
     char genre[128];
+    int32_t track_number; /* -1 when absent; 0 marks a legacy cache row */
+    int32_t disc_number;  /* -1 when absent; 0 marks a legacy cache row */
 } cached_tags_t;
 
 /* Opens the on-disk tagcache at its fixed path (the SD-card root on

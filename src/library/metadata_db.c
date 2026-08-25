@@ -210,11 +210,17 @@ bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags
     if (!db_ready) return false;
     tagcache_song_t song;
     if (!tagcache_lookup(path, clamp_i32(mtime), clamp_i32(size), &song)) return false;
+    /* Databases written before album-order support left Rockbox's numeric
+     * track/disc slots at zero. New scans persist -1 for a genuinely absent
+     * tag, so zero/zero is an unambiguous one-time upgrade miss. */
+    if (song.track_number == 0 && song.disc_number == 0) return false;
     snprintf(out->title, sizeof(out->title), "%s", song.title);
     snprintf(out->artist, sizeof(out->artist), "%s", song.artist);
     snprintf(out->album, sizeof(out->album), "%s", song.album);
     snprintf(out->album_artist, sizeof(out->album_artist), "%s", song.album_artist);
     snprintf(out->genre, sizeof(out->genre), "%s", song.genre);
+    out->track_number = song.track_number;
+    out->disc_number = song.disc_number;
     return true;
 }
 
@@ -222,7 +228,7 @@ void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cache
     METADATA_DB_GUARD;
     if (!db_ready || !tags) return;
     tagcache_upsert(path, clamp_i32(mtime), clamp_i32(size), tags->title, tags->artist, tags->album, tags->album_artist,
-                    tags->genre);
+                    tags->genre, tags->track_number, tags->disc_number);
     int32_t rating = 0, playcount = 0, last_played = 0;
     if (remote_state_take(path, &rating, &playcount, &last_played))
         tagcache_overlay_stats(path, rating, playcount, last_played);
@@ -692,6 +698,8 @@ void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * o
         snprintf(tags[w].album, sizeof(tags[w].album), "%s", song.album);
         snprintf(tags[w].album_artist, sizeof(tags[w].album_artist), "%s", song.album_artist);
         snprintf(tags[w].genre, sizeof(tags[w].genre), "%s", song.genre);
+        tags[w].track_number = song.track_number;
+        tags[w].disc_number = song.disc_number;
         w++;
     }
     if (w != live) {

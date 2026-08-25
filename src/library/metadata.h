@@ -32,6 +32,14 @@ typedef struct {
     char genre[128];
     bool has_genre;
 
+    /* Album sequencing tags.  Values are the leading positive integer from
+     * common forms such as "3", "03/12", ID3 TRCK/TPOS, Vorbis
+     * TRACKNUMBER/DISCNUMBER, and MP4 trkn/disk atoms. */
+    int track_number;
+    int disc_number;
+    bool has_track_number;
+    bool has_disc_number;
+
     /* Embedded cover art (FLAC METADATA_BLOCK_PICTURE, MP3 ID3v2 APIC),
      * still-encoded (JPEG or PNG) bytes -- NULL if the file has none or
      * isn't a supported container. malloc'd by metadata_read(); caller

@@ -29,11 +29,15 @@ int main(void) {
     snprintf(t1.album, sizeof(t1.album), "%s", "Help");
     snprintf(t1.album_artist, sizeof(t1.album_artist), "%s", "Beatles");
     snprintf(t1.genre, sizeof(t1.genre), "%s", "Rock");
+    t1.track_number = 2;
+    t1.disc_number = 1;
     snprintf(t2.title, sizeof(t2.title), "%s", "Beta");
     snprintf(t2.artist, sizeof(t2.artist), "%s", "Beatles");
     snprintf(t2.album, sizeof(t2.album), "%s", "Help");
     snprintf(t2.album_artist, sizeof(t2.album_artist), "%s", "Beatles");
     snprintf(t2.genre, sizeof(t2.genre), "%s", "Rock");
+    t2.track_number = 1;
+    t2.disc_number = 1;
     snprintf(t3.title, sizeof(t3.title), "%s", "Gamma");
     snprintf(t3.artist, sizeof(t3.artist), "%s", "Queen");
     snprintf(t3.album, sizeof(t3.album), "%s", "Greatest Hits");
@@ -96,6 +100,8 @@ int main(void) {
     if (n != 1) fail("albums after prune");
     n = metadata_db_get_album_songs("Help", "Beatles", 0, rows, 8);
     if (n != 2) fail("album songs");
+    if (strcmp(rows[0].tags.title, "Beta") != 0 || strcmp(rows[1].tags.title, "Alpha") != 0)
+        fail("album disc/track order");
 
     if (metadata_db_get_song_title_offset("/music/a.flac") < 0) fail("title offset");
     n = metadata_db_get_songs_page("Alpha", 1, 8, rows);

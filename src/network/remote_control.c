@@ -371,7 +371,7 @@ static void build_library_json(const char * query, const char * artist_filter, c
     json_builder_appendf(&json, "{\"total\":%lld,\"songs\":[", (long long) total_matches);
 
     /* Real-device crash, caught live: song_row_t is ~1.25KB (a 600-byte
-     * path plus a 640-byte cached_tags_t) -- a LIBRARY_JSON_MAX_LIMIT-
+     * path plus one cached_tags_t -- a LIBRARY_JSON_MAX_LIMIT-
      * element array of those is ~125KB, which overflowed listener_thread_
      * func()'s default pthread stack the first time a client actually hit
      * this endpoint (SIGSEGV in a stack-adjacent LVGL function, not this

@@ -22,6 +22,7 @@ static int queue_next_insert_index = -1;
 #include "gui_library.h"
 #include "gui_queue.h"
 #include "gui_lyrics.h"
+#include "gui_track_info.h"
 #include "gui_settings.h"
 #include "gui_subsonic.h"
 #include "fallback_font.h"
@@ -808,6 +809,66 @@ static void order_icon_event_cb(lv_event_t * e) {
  * handler that WRITES these lives much further down this file, alongside
  * the rest of the Subsonic screens. */
 
+static audio_codec_t info_codec_from_hint(const char * hint) {
+    if (!hint || !hint[0]) return AUDIO_CODEC_UNKNOWN;
+    if (*hint == '.') hint++;
+    if (strcasecmp(hint, "flac") == 0) return AUDIO_CODEC_FLAC;
+    if (strcasecmp(hint, "mp3") == 0) return AUDIO_CODEC_MP3;
+    if (strcasecmp(hint, "wav") == 0 || strcasecmp(hint, "aif") == 0 ||
+        strcasecmp(hint, "aiff") == 0) return AUDIO_CODEC_PCM;
+    if (strcasecmp(hint, "dsf") == 0 || strcasecmp(hint, "dff") == 0)
+        return AUDIO_CODEC_DSD;
+    if (strcasecmp(hint, "aac") == 0 || strcasecmp(hint, "aacp") == 0)
+        return AUDIO_CODEC_AAC;
+    if (strcasecmp(hint, "ape") == 0) return AUDIO_CODEC_APE;
+    if (strcasecmp(hint, "wma") == 0 || strcasecmp(hint, "asf") == 0)
+        return AUDIO_CODEC_WMA;
+    if (strcasecmp(hint, "opus") == 0) return AUDIO_CODEC_OPUS;
+    return AUDIO_CODEC_UNKNOWN; /* M4A/Ogg need the actual decoder to disambiguate. */
+}
+
+static void info_container_from_hint(const char * hint, char out[16]) {
+    out[0] = '\0';
+    if (!hint || !hint[0]) return;
+    if (*hint == '.') hint++;
+    if (strcasecmp(hint, "aif") == 0 || strcasecmp(hint, "aiff") == 0)
+        snprintf(out, 16, "AIFF");
+    else if (strcasecmp(hint, "aac") == 0 || strcasecmp(hint, "aacp") == 0)
+        snprintf(out, 16, "ADTS");
+    else if (strcasecmp(hint, "wma") == 0 || strcasecmp(hint, "asf") == 0)
+        snprintf(out, 16, "ASF");
+    else if (strcasecmp(hint, "m4a") == 0 || strcasecmp(hint, "mp4") == 0)
+        snprintf(out, 16, "M4A");
+    else if (strcasecmp(hint, "ogg") == 0 || strcasecmp(hint, "oga") == 0 ||
+             strcasecmp(hint, "opus") == 0)
+        snprintf(out, 16, "Ogg");
+    else {
+        size_t i = 0;
+        while (hint[i] && i + 1 < 16) {
+            out[i] = (char) toupper((unsigned char) hint[i]);
+            i++;
+        }
+        out[i] = '\0';
+    }
+}
+
+static const char * info_path_hint(const char * path) {
+    if (!path) return NULL;
+    bool url = strncasecmp(path, "http://", 7) == 0 || strncasecmp(path, "https://", 8) == 0;
+    if (url) {
+        /* Only this app's local-only #.<ext> hint is safe to inspect on a
+         * stream. Never treat a URL path/query suffix as a container name:
+         * besides being unreliable, a query can contain an auth token and
+         * must not reach the Information UI even in truncated form. */
+        const char * fragment = strrchr(path, '#');
+        return fragment && fragment[1] == '.' ? fragment + 2 : NULL;
+    }
+    const char * base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const char * dot = strrchr(base, '.');
+    return dot ? dot + 1 : NULL;
+}
+
 void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     /* Resolved once -- this is playlist_index's first real touch on every
      * track-start (play_track_at_from()/on_track_auto_advanced() both call
@@ -868,6 +929,56 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     } else {
         metadata_read(path, out_meta);
     }
+
+    gui_track_info_context_t info = {0};
+    snprintf(info.path, sizeof(info.path), "%s", path);
+    info.replaygain_mode = current_settings.replaygain_mode;
+    info.has_replaygain_track = out_meta->has_replaygain;
+    info.replaygain_track_db = out_meta->replaygain_gain_db;
+    info.has_replaygain_album = out_meta->has_replaygain_album;
+    info.replaygain_album_db = out_meta->replaygain_album_gain_db;
+    info.has_track_number = out_meta->has_track_number;
+    info.track_number = out_meta->track_number;
+    info.has_disc_number = out_meta->has_disc_number;
+    info.disc_number = out_meta->disc_number;
+
+    const char * format_hint = info_path_hint(path);
+    if (is_remote_track) {
+        info.source = GUI_TRACK_SOURCE_PLUGIN;
+        snprintf(info.provider, sizeof(info.provider), "%s", remote_meta.provider);
+        snprintf(info.track_id, sizeof(info.track_id), "%s", remote_meta.track_id);
+        format_hint = remote_meta.codec;
+        info.declared_codec = info_codec_from_hint(remote_meta.codec);
+        if (info.declared_codec == AUDIO_CODEC_UNKNOWN) format_hint = NULL;
+        info.declared_sample_rate = remote_meta.sample_rate;
+        info.declared_bit_depth = remote_meta.bit_depth;
+        info.declared_channels = remote_meta.channels;
+        info.declared_bitrate_kbps = remote_meta.bitrate_kbps;
+        info.declared_duration_seconds = (double) remote_meta.duration_ms / 1000.0;
+    } else if (is_subsonic_stream) {
+        const subsonic_stream_song_meta_t * sm = &subsonic_stream_meta[index];
+        info.source = GUI_TRACK_SOURCE_SUBSONIC;
+        format_hint = sm->suffix;
+        info.declared_codec = info_codec_from_hint(sm->suffix);
+        info.declared_sample_rate = sm->sample_rate;
+        info.declared_bit_depth = sm->bit_depth;
+        info.declared_channels = sm->channels;
+        info.declared_bitrate_kbps = sm->bitrate_kbps;
+        info.declared_duration_seconds = sm->duration_seconds;
+        info.has_track_number = sm->track > 0;
+        info.track_number = sm->track;
+        info.has_disc_number = sm->disc > 0;
+        info.disc_number = sm->disc;
+    } else if (strncasecmp(path, "http://", 7) == 0 || strncasecmp(path, "https://", 8) == 0) {
+        info.source = GUI_TRACK_SOURCE_RADIO;
+        info.declared_codec = info_codec_from_hint(format_hint);
+        if (info.declared_codec == AUDIO_CODEC_UNKNOWN) format_hint = NULL;
+    } else {
+        info.source = GUI_TRACK_SOURCE_LOCAL;
+        info.declared_codec = info_codec_from_hint(format_hint);
+    }
+    info_container_from_hint(format_hint, info.container);
+    gui_track_info_set_current(&info);
 
     snprintf(now_playing_path, sizeof(now_playing_path), "%s", path);
     refresh_now_playing_indicators();
@@ -1095,6 +1206,12 @@ static void more_menu_queue_cb(lv_event_t * e) {
     open_queue_screen();
 }
 
+static void more_menu_information_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_more_menu_popup();
+    gui_track_info_open();
+}
+
 static void more_menu_eq_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_more_menu_popup();
@@ -1128,6 +1245,7 @@ static void build_more_menu_popup(void) {
         { "List", more_menu_list_cb, false },
         { "Queue", more_menu_queue_cb, false },
         { "Add to Playlist", more_menu_add_to_playlist_cb, false },
+        { "Information", more_menu_information_cb, false },
         { "EQ", more_menu_eq_cb, false },
         { "Delete", more_menu_delete_cb, true },
     };
@@ -2494,6 +2612,7 @@ void gui_player_init(uint32_t screen_width, uint32_t screen_height) {
     build_volume_popup();
     build_delete_song_popup();
     build_more_menu_popup();
+    gui_track_info_init();
     player_screen = build_player_screen(screen_width, screen_height);
 }
 

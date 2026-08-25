@@ -8,6 +8,14 @@ typedef struct {
     char album[128];
     char cover_url[1536];
     bool verify_tls;
+    char suffix[16];
+    int track;
+    int disc;
+    int duration_seconds;
+    unsigned int sample_rate;
+    unsigned int bit_depth;
+    unsigned int channels;
+    unsigned int bitrate_kbps;
 } subsonic_stream_song_meta_t;
 
 

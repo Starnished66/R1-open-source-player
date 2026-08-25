@@ -21,6 +21,7 @@ alac_decoder_t * alac_open_file(const char * path);
 
 unsigned int alac_get_channels(const alac_decoder_t * dec);
 unsigned int alac_get_sample_rate(const alac_decoder_t * dec);
+unsigned int alac_get_bit_depth(const alac_decoder_t * dec);
 uint64_t alac_get_total_pcm_frame_count(const alac_decoder_t * dec);
 
 uint64_t alac_read_pcm_frames_s16(alac_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);

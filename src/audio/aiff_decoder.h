@@ -17,6 +17,7 @@ aiff_decoder_t * aiff_open_file(const char * path);
 
 unsigned int aiff_get_channels(const aiff_decoder_t * dec);
 unsigned int aiff_get_sample_rate(const aiff_decoder_t * dec);
+unsigned int aiff_get_bits_per_sample(const aiff_decoder_t * dec);
 uint64_t aiff_get_total_pcm_frame_count(const aiff_decoder_t * dec);
 
 uint64_t aiff_read_pcm_frames_s16(aiff_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);

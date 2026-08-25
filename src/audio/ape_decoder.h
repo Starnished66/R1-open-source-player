@@ -29,6 +29,7 @@ ape_decoder_t * ape_open_file(const char * path);
 
 unsigned int ape_get_channels(const ape_decoder_t * dec);
 unsigned int ape_get_sample_rate(const ape_decoder_t * dec);
+unsigned int ape_get_bits_per_sample(const ape_decoder_t * dec);
 uint64_t ape_get_total_pcm_frame_count(const ape_decoder_t * dec);
 
 uint64_t ape_read_pcm_frames_s16(ape_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);

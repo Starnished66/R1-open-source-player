@@ -127,6 +127,10 @@ unsigned int aiff_get_sample_rate(const aiff_decoder_t * dec) {
     return dec->sample_rate;
 }
 
+unsigned int aiff_get_bits_per_sample(const aiff_decoder_t * dec) {
+    return dec->bits_per_sample;
+}
+
 uint64_t aiff_get_total_pcm_frame_count(const aiff_decoder_t * dec) {
     return dec->total_frames;
 }

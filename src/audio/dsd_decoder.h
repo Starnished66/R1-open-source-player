@@ -19,6 +19,7 @@ typedef struct dsd_decoder dsd_decoder_t;
 dsd_decoder_t * dsd_open_file(const char * path);
 
 unsigned int dsd_get_channels(const dsd_decoder_t * dec);
+unsigned int dsd_get_source_sample_rate(const dsd_decoder_t * dec);
 unsigned int dsd_get_pcm_sample_rate(const dsd_decoder_t * dec);
 uint64_t dsd_get_total_pcm_frame_count(const dsd_decoder_t * dec);
 

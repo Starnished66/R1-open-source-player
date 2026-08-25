@@ -258,6 +258,10 @@ unsigned int dsd_get_channels(const dsd_decoder_t * dec) {
     return dec->channels;
 }
 
+unsigned int dsd_get_source_sample_rate(const dsd_decoder_t * dec) {
+    return dec->dsd_sample_rate;
+}
+
 unsigned int dsd_get_pcm_sample_rate(const dsd_decoder_t * dec) {
     return dec->pcm_sample_rate;
 }

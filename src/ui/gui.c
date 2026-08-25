@@ -15,6 +15,7 @@
 #include "gui_books.h"
 #include "gui_text_input.h"
 #include "gui_lyrics.h"
+#include "gui_track_info.h"
 #include "gui_subsonic.h"
 #include "assets.h"
 #include "backlight.h"
@@ -1229,6 +1230,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     } else if (audio_consume_track_finished()) {
         gui_player_handle_track_finished();
     }
+    gui_track_info_poll();
 
     /* All correctness-critical work above (buttons, queue transitions and
      * completion of requested background operations) still runs at 500 ms.

@@ -141,6 +141,10 @@ unsigned int alac_get_sample_rate(const alac_decoder_t * dec) {
     return dec->sample_rate;
 }
 
+unsigned int alac_get_bit_depth(const alac_decoder_t * dec) {
+    return dec->bit_depth;
+}
+
 uint64_t alac_get_total_pcm_frame_count(const alac_decoder_t * dec) {
     return dec->total_pcm_frames;
 }

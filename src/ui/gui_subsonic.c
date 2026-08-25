@@ -558,6 +558,14 @@ static void subsonic_fill_stream_queue_entry(const subsonic_server_t * server, c
     snprintf(m->title, sizeof(m->title), "%s", song->title);
     snprintf(m->artist, sizeof(m->artist), "%s", song->artist);
     snprintf(m->album, sizeof(m->album), "%s", song->album);
+    snprintf(m->suffix, sizeof(m->suffix), "%s", song->suffix);
+    m->track = song->track;
+    m->disc = song->disc;
+    m->duration_seconds = song->duration_seconds;
+    m->sample_rate = song->sample_rate;
+    m->bit_depth = song->bit_depth;
+    m->channels = song->channels;
+    m->bitrate_kbps = song->bitrate_kbps;
     if (song->cover_art[0]) {
         subsonic_build_cover_art_url(server, song->cover_art, m->cover_url, sizeof(m->cover_url));
     } else {

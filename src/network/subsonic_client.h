@@ -40,7 +40,12 @@ typedef struct {
                           * cover_art="mf-7yjzu1an..._212a3c00" for the same
                           * song), empty if the server didn't send one */
     int track;
+    int disc;
     int duration_seconds;
+    unsigned int sample_rate;
+    unsigned int bit_depth;
+    unsigned int channels;
+    unsigned int bitrate_kbps;
 } subsonic_song_t;
 
 typedef struct {

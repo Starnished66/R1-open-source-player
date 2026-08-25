@@ -2,6 +2,45 @@
 #define AUDIO_H
 
 #include <stdbool.h>
+#include <stdint.h>
+
+typedef enum {
+    AUDIO_CODEC_UNKNOWN = 0,
+    AUDIO_CODEC_FLAC,
+    AUDIO_CODEC_MP3,
+    AUDIO_CODEC_PCM,
+    AUDIO_CODEC_DSD,
+    AUDIO_CODEC_AAC,
+    AUDIO_CODEC_ALAC,
+    AUDIO_CODEC_APE,
+    AUDIO_CODEC_WMA,
+    AUDIO_CODEC_OPUS,
+    AUDIO_CODEC_VORBIS,
+} audio_codec_t;
+
+/* Immutable snapshot of the decoder currently feeding playback. The source
+ * fields describe the encoded media; the output fields describe what this
+ * player actually hands to ALSA/SDL after decoding. source_bit_depth is 0
+ * when a lossy codec has no meaningful bit depth or the provider did not
+ * declare one. path is copied under audio.c's mutex so callers never borrow
+ * active_path or a live decoder pointer. */
+typedef struct {
+    bool valid;
+    char path[2048];
+    audio_codec_t codec;
+    unsigned int source_sample_rate;
+    unsigned int source_bit_depth;
+    unsigned int output_sample_rate;
+    unsigned int output_bit_depth;
+    unsigned int channels;
+    unsigned int bitrate_kbps;
+    double duration_seconds;
+    bool is_stream;
+    bool is_dsd;
+    bool replaygain_applied;
+    double replaygain_applied_db;
+    uint64_t generation;
+} audio_current_format_info_t;
 
 /* One-time setup of the audio backend (SDL2 audio on host, ALSA/tinyalsa on
  * target) and the single playback thread, which lives for the app's whole
@@ -106,6 +145,10 @@ double audio_get_duration_seconds(void);
 
 /* Sample rate of the currently loaded track, in Hz. 0 if nothing loaded. */
 unsigned int audio_get_sample_rate(void);
+
+/* Copies a coherent current-decoder snapshot. Returns false and zeroes *out
+ * when nothing is loaded or the requested track has not opened yet. */
+bool audio_get_current_format_info(audio_current_format_info_t * out);
 
 /* 0.0 (silent) - 1.0 (full volume). Applied as software gain on the decoded PCM. */
 void audio_set_volume(float volume);

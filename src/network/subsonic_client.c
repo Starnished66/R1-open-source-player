@@ -120,6 +120,11 @@ static int json_int(cJSON * obj, const char * key, int fallback) {
     return cJSON_IsNumber(item) ? item->valueint : fallback;
 }
 
+static unsigned int json_positive_uint(cJSON * obj, const char * key) {
+    int value = json_int(obj, key, 0);
+    return value > 0 ? (unsigned int) value : 0;
+}
+
 bool subsonic_ping(const subsonic_server_t * server) {
     cJSON * root = NULL;
     cJSON * resp = api_request(server, "ping.view", NULL, &root);
@@ -237,7 +242,12 @@ bool subsonic_get_album_songs(const subsonic_server_t * server, const char * alb
         snprintf(songs[i].suffix, sizeof(songs[i].suffix), "%s", json_str(song_item, "suffix", "mp3"));
         snprintf(songs[i].cover_art, sizeof(songs[i].cover_art), "%s", json_str(song_item, "coverArt", ""));
         songs[i].track = json_int(song_item, "track", 0);
+        songs[i].disc = json_int(song_item, "discNumber", 0);
         songs[i].duration_seconds = json_int(song_item, "duration", 0);
+        songs[i].sample_rate = json_positive_uint(song_item, "samplingRate");
+        songs[i].bit_depth = json_positive_uint(song_item, "bitDepth");
+        songs[i].channels = json_positive_uint(song_item, "channelCount");
+        songs[i].bitrate_kbps = json_positive_uint(song_item, "bitRate");
         i++;
     }
 
@@ -340,7 +350,12 @@ bool subsonic_get_playlist_songs(const subsonic_server_t * server, const char * 
         snprintf(songs[i].suffix, sizeof(songs[i].suffix), "%s", json_str(entry_item, "suffix", "mp3"));
         snprintf(songs[i].cover_art, sizeof(songs[i].cover_art), "%s", json_str(entry_item, "coverArt", ""));
         songs[i].track = json_int(entry_item, "track", 0);
+        songs[i].disc = json_int(entry_item, "discNumber", 0);
         songs[i].duration_seconds = json_int(entry_item, "duration", 0);
+        songs[i].sample_rate = json_positive_uint(entry_item, "samplingRate");
+        songs[i].bit_depth = json_positive_uint(entry_item, "bitDepth");
+        songs[i].channels = json_positive_uint(entry_item, "channelCount");
+        songs[i].bitrate_kbps = json_positive_uint(entry_item, "bitRate");
         i++;
     }
 

@@ -80,6 +80,9 @@ typedef struct {
     } as;
     unsigned int channels;
     unsigned int sample_rate;
+    unsigned int source_sample_rate;
+    unsigned int source_bit_depth;
+    unsigned int bitrate_kbps;
     uint64_t total_frames;
 
     /* Non-NULL only for a live network stream opened via a URL (see
@@ -186,6 +189,9 @@ static bool decoder_open(decoder_t * dec, const char * path) {
             }
             dec->channels = aac_get_channels(dec->as.aac);
             dec->sample_rate = aac_get_sample_rate(dec->as.aac);
+            dec->source_sample_rate = dec->sample_rate;
+            dec->source_bit_depth = remote ? remote_meta.bit_depth : 0;
+            dec->bitrate_kbps = remote ? remote_meta.bitrate_kbps : 0;
             /* A remote track declares its own duration up front (the
              * plugin's catalog metadata) -- unlike plain internet radio,
              * there's no need to leave this at the unknown-duration 0
@@ -207,6 +213,9 @@ static bool decoder_open(decoder_t * dec, const char * path) {
             }
             dec->channels = dec->as.flac->channels;
             dec->sample_rate = dec->as.flac->sampleRate;
+            dec->source_sample_rate = dec->sample_rate;
+            dec->source_bit_depth = dec->as.flac->bitsPerSample;
+            dec->bitrate_kbps = remote ? remote_meta.bitrate_kbps : 0;
             /* Unlike MP3, this is a REAL, authoritative count straight from
              * the STREAMINFO metadata block (near the top of the file, not
              * a full-stream prescan) -- safe to use for real, matching
@@ -229,6 +238,9 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         }
         dec->channels = dec->as.mp3->channels;
         dec->sample_rate = dec->as.mp3->sampleRate;
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = remote ? remote_meta.bit_depth : 0;
+        dec->bitrate_kbps = remote ? remote_meta.bitrate_kbps : 0;
         /* See the AAC branch's own comment just above -- a remote track's
          * declared duration_ms substitutes for the prescan this never does
          * on a live stream; a plain MP3 stream URL (remote == false, e.g.
@@ -249,6 +261,8 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         if (!dec->as.flac) return false;
         dec->channels = dec->as.flac->channels;
         dec->sample_rate = dec->as.flac->sampleRate;
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = dec->as.flac->bitsPerSample;
         dec->total_frames = dec->as.flac->totalPCMFrameCount;
         return true;
     }
@@ -263,6 +277,7 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         }
         dec->channels = dec->as.mp3->channels;
         dec->sample_rate = dec->as.mp3->sampleRate;
+        dec->source_sample_rate = dec->sample_rate;
         dec->total_frames = drmp3_get_pcm_frame_count(dec->as.mp3);
         return true;
     }
@@ -277,6 +292,8 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         }
         dec->channels = dec->as.wav->channels;
         dec->sample_rate = dec->as.wav->sampleRate;
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = dec->as.wav->bitsPerSample;
         dec->total_frames = dec->as.wav->totalPCMFrameCount;
         return true;
     }
@@ -287,6 +304,8 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         if (!dec->as.aiff) return false;
         dec->channels = aiff_get_channels(dec->as.aiff);
         dec->sample_rate = aiff_get_sample_rate(dec->as.aiff);
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = aiff_get_bits_per_sample(dec->as.aiff);
         dec->total_frames = aiff_get_total_pcm_frame_count(dec->as.aiff);
         return true;
     }
@@ -297,6 +316,8 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         if (!dec->as.dsd) return false;
         dec->channels = dsd_get_channels(dec->as.dsd);
         dec->sample_rate = dsd_get_pcm_sample_rate(dec->as.dsd); /* decimated PCM rate, not the raw DSD rate */
+        dec->source_sample_rate = dsd_get_source_sample_rate(dec->as.dsd);
+        dec->source_bit_depth = 1;
         dec->total_frames = dsd_get_total_pcm_frame_count(dec->as.dsd);
         return true;
     }
@@ -307,6 +328,7 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         if (!dec->as.aac) return false;
         dec->channels = aac_get_channels(dec->as.aac);
         dec->sample_rate = aac_get_sample_rate(dec->as.aac);
+        dec->source_sample_rate = dec->sample_rate;
         dec->total_frames = aac_get_total_pcm_frame_count(dec->as.aac);
         return true;
     }
@@ -324,6 +346,8 @@ static bool decoder_open(decoder_t * dec, const char * path) {
             if (!dec->as.alac) return false;
             dec->channels = alac_get_channels(dec->as.alac);
             dec->sample_rate = alac_get_sample_rate(dec->as.alac);
+            dec->source_sample_rate = dec->sample_rate;
+            dec->source_bit_depth = alac_get_bit_depth(dec->as.alac);
             dec->total_frames = alac_get_total_pcm_frame_count(dec->as.alac);
             return true;
         }
@@ -333,6 +357,7 @@ static bool decoder_open(decoder_t * dec, const char * path) {
             if (!dec->as.aac) return false;
             dec->channels = aac_get_channels(dec->as.aac);
             dec->sample_rate = aac_get_sample_rate(dec->as.aac);
+            dec->source_sample_rate = dec->sample_rate;
             dec->total_frames = aac_get_total_pcm_frame_count(dec->as.aac);
             return true;
         }
@@ -345,6 +370,8 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         if (!dec->as.ape) return false;
         dec->channels = ape_get_channels(dec->as.ape);
         dec->sample_rate = ape_get_sample_rate(dec->as.ape);
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = ape_get_bits_per_sample(dec->as.ape);
         dec->total_frames = ape_get_total_pcm_frame_count(dec->as.ape);
         return true;
     }
@@ -355,6 +382,7 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         if (!dec->as.wma) return false;
         dec->channels = wma_get_channels(dec->as.wma);
         dec->sample_rate = wma_get_sample_rate(dec->as.wma);
+        dec->source_sample_rate = dec->sample_rate;
         dec->total_frames = wma_get_total_pcm_frame_count(dec->as.wma);
         return true;
     }
@@ -365,6 +393,7 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         if (!dec->as.opus) return false;
         dec->channels = opus_get_channels(dec->as.opus);
         dec->sample_rate = opus_get_sample_rate(dec->as.opus);
+        dec->source_sample_rate = dec->sample_rate;
         dec->total_frames = opus_get_total_pcm_frame_count(dec->as.opus);
         return true;
     }
@@ -377,6 +406,7 @@ static bool decoder_open(decoder_t * dec, const char * path) {
             if (!dec->as.opus) return false;
             dec->channels = opus_get_channels(dec->as.opus);
             dec->sample_rate = opus_get_sample_rate(dec->as.opus);
+            dec->source_sample_rate = dec->sample_rate;
             dec->total_frames = opus_get_total_pcm_frame_count(dec->as.opus);
             return true;
         }
@@ -386,6 +416,7 @@ static bool decoder_open(decoder_t * dec, const char * path) {
             if (!dec->as.vorbis) return false;
             dec->channels = vorbis_get_channels(dec->as.vorbis);
             dec->sample_rate = vorbis_get_sample_rate(dec->as.vorbis);
+            dec->source_sample_rate = dec->sample_rate;
             dec->total_frames = vorbis_get_total_pcm_frame_count(dec->as.vorbis);
             return true;
         }
@@ -504,9 +535,11 @@ static uint64_t next_track_generation = 0;
 static char * restart_path = NULL;  /* owned; consumed by the thread on restart */
 static double restart_start_seconds = 0.0;
 static float restart_replaygain_linear = 1.0f;
+static bool restart_replaygain_applied = false;
 
 static char * next_path = NULL;     /* owned; staged by audio_set_next_track(), NULL = none queued */
 static float next_replaygain_linear = 1.0f;
+static bool next_replaygain_applied = false;
 
 static bool crossfade_enabled = false;
 #define CROSSFADE_SECONDS 3.0
@@ -546,6 +579,55 @@ static uint64_t seek_pending_playback_generation = 0;
 static uint64_t frames_played = 0;
 static uint64_t current_total_frames = 0;
 static unsigned int current_sample_rate = 0;
+static audio_current_format_info_t current_format_info;
+static uint64_t current_format_generation = 0;
+
+static audio_codec_t public_codec_for_decoder(decoder_type_t type) {
+    switch (type) {
+        case DECODER_FLAC: return AUDIO_CODEC_FLAC;
+        case DECODER_MP3: return AUDIO_CODEC_MP3;
+        case DECODER_WAV:
+        case DECODER_AIFF: return AUDIO_CODEC_PCM;
+        case DECODER_DSD: return AUDIO_CODEC_DSD;
+        case DECODER_AAC: return AUDIO_CODEC_AAC;
+        case DECODER_ALAC: return AUDIO_CODEC_ALAC;
+        case DECODER_APE: return AUDIO_CODEC_APE;
+        case DECODER_WMA: return AUDIO_CODEC_WMA;
+        case DECODER_OPUS: return AUDIO_CODEC_OPUS;
+        case DECODER_VORBIS: return AUDIO_CODEC_VORBIS;
+    }
+    return AUDIO_CODEC_UNKNOWN;
+}
+
+/* audio_mutex must be held. Publishing a copied scalar snapshot here keeps
+ * the UI completely independent from the playback thread's stack-local
+ * decoder_t and its short-lived gapless/crossfade prefetched decoder. */
+static void publish_current_format_locked(const decoder_t * dec, const char * path,
+                                          float replaygain_linear, bool replaygain_applied) {
+    memset(&current_format_info, 0, sizeof(current_format_info));
+    current_format_info.valid = true;
+    if (path) snprintf(current_format_info.path, sizeof(current_format_info.path), "%s", path);
+    current_format_info.codec = public_codec_for_decoder(dec->type);
+    current_format_info.source_sample_rate = dec->source_sample_rate ? dec->source_sample_rate : dec->sample_rate;
+    current_format_info.source_bit_depth = dec->source_bit_depth;
+    current_format_info.output_sample_rate = dec->sample_rate;
+    current_format_info.output_bit_depth = 16; /* decoder_read_s16() -> S16_LE on every output route */
+    current_format_info.channels = dec->channels;
+    current_format_info.bitrate_kbps = dec->bitrate_kbps;
+    current_format_info.duration_seconds = dec->sample_rate > 0 && dec->total_frames > 0
+        ? (double) dec->total_frames / (double) dec->sample_rate : 0.0;
+    current_format_info.is_stream = dec->net_stream != NULL;
+    current_format_info.is_dsd = dec->type == DECODER_DSD;
+    current_format_info.replaygain_applied = replaygain_applied;
+    current_format_info.replaygain_applied_db = replaygain_applied && replaygain_linear > 0.0f
+        ? 20.0 * log10((double) replaygain_linear) : 0.0;
+    current_format_info.generation = ++current_format_generation;
+}
+
+static void clear_current_format_locked(void) {
+    memset(&current_format_info, 0, sizeof(current_format_info));
+    current_format_generation++;
+}
 
 #ifdef HOST_BUILD
 static SDL_AudioDeviceID sdl_dev = 0;
@@ -876,11 +958,13 @@ static void * audio_thread_func(void * arg) {
     char * cur_path_local = NULL;
     uint64_t cur_frames_played_local = 0;
     float cur_replaygain_linear = 1.0f;
+    bool cur_replaygain_applied = false;
 
     decoder_t nxt_dec;
     bool nxt_open = false;
     bool nxt_format_matches = false;
     float nxt_replaygain_linear_local = 1.0f;
+    bool nxt_replaygain_applied_local = false;
     uint64_t nxt_frames_consumed = 0;
 
     int16_t * buf_cur = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
@@ -926,6 +1010,7 @@ static void * audio_thread_func(void * arg) {
         cur_path_local = restart_path; restart_path = NULL; /* ownership transferred */
         double start_seconds = restart_start_seconds;
         cur_replaygain_linear = restart_replaygain_linear;
+        cur_replaygain_applied = restart_replaygain_applied;
         uint64_t cur_generation = playback_generation;
         pthread_mutex_unlock(&audio_mutex);
 
@@ -937,6 +1022,7 @@ static void * audio_thread_func(void * arg) {
             if (cur_path_local) fprintf(stderr, "audio: failed to open '%s'\n", cur_path_local);
             pthread_mutex_lock(&audio_mutex);
             have_current = false;
+            clear_current_format_locked();
             last_playback_error = AUDIO_ERROR_DECODER_FAILED;
             pthread_mutex_unlock(&audio_mutex);
             continue;
@@ -961,6 +1047,7 @@ static void * audio_thread_func(void * arg) {
             cur_open = false;
             pthread_mutex_lock(&audio_mutex);
             have_current = false;
+            clear_current_format_locked();
             last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
             pthread_mutex_unlock(&audio_mutex);
             continue;
@@ -971,6 +1058,8 @@ static void * audio_thread_func(void * arg) {
         frames_played = cur_frames_played_local;
         current_total_frames = cur_dec.total_frames;
         current_sample_rate = cur_dec.sample_rate;
+        publish_current_format_locked(&cur_dec, cur_path_local,
+                                      cur_replaygain_linear, cur_replaygain_applied);
         pthread_mutex_unlock(&audio_mutex);
 
         bool should_restart = false;
@@ -1026,6 +1115,7 @@ static void * audio_thread_func(void * arg) {
              * to the next iteration). */
             char * staged_next_path = next_path ? strdup(next_path) : NULL;
             float staged_next_replaygain = next_replaygain_linear;
+            bool staged_next_replaygain_applied = next_replaygain_applied;
             uint64_t staged_next_generation = next_track_generation;
             pthread_mutex_unlock(&audio_mutex);
 
@@ -1083,6 +1173,8 @@ static void * audio_thread_func(void * arg) {
                 frames_played = cur_frames_played_local;
                 current_total_frames = cur_dec.total_frames;
                 current_sample_rate = cur_dec.sample_rate;
+                publish_current_format_locked(&cur_dec, cur_path_local,
+                                              cur_replaygain_linear, cur_replaygain_applied);
                 pthread_mutex_unlock(&audio_mutex);
                 free(staged_next_path);
                 continue; /* re-check pause/restart state before decoding */
@@ -1099,6 +1191,7 @@ static void * audio_thread_func(void * arg) {
                     nxt_open = true;
                     nxt_frames_consumed = 0;
                     nxt_replaygain_linear_local = staged_next_replaygain;
+                    nxt_replaygain_applied_local = staged_next_replaygain_applied;
                     nxt_format_matches = (nxt_dec.channels == cur_dec.channels && nxt_dec.sample_rate == cur_dec.sample_rate);
                 } else {
                     DBG_LOG("audio: failed to prefetch next track (%s)\n",
@@ -1145,6 +1238,7 @@ static void * audio_thread_func(void * arg) {
                             pthread_mutex_lock(&audio_mutex);
                             last_playback_error = AUDIO_ERROR_DECODER_FAILED;
                             have_current = false;
+                            clear_current_format_locked();
                             paused = false;
                             pthread_mutex_unlock(&audio_mutex);
                             should_restart = false;
@@ -1194,6 +1288,7 @@ static void * audio_thread_func(void * arg) {
                         pthread_mutex_lock(&audio_mutex);
                         last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
                         have_current = false;
+                        clear_current_format_locked();
                         paused = false;
                         pthread_mutex_unlock(&audio_mutex);
                         should_restart = false;
@@ -1229,6 +1324,7 @@ static void * audio_thread_func(void * arg) {
                     nxt_format_matches = false;
                     cur_frames_played_local = nxt_frames_consumed;
                     cur_replaygain_linear = nxt_replaygain_linear_local;
+                    cur_replaygain_applied = nxt_replaygain_applied_local;
                     free(cur_path_local);
                     cur_path_local = next_path; next_path = NULL;
                     free(active_path);
@@ -1239,6 +1335,8 @@ static void * audio_thread_func(void * arg) {
                     current_total_frames = cur_dec.total_frames;
                     current_sample_rate = cur_dec.sample_rate;
                     frames_played = cur_frames_played_local;
+                    publish_current_format_locked(&cur_dec, cur_path_local,
+                                                  cur_replaygain_linear, cur_replaygain_applied);
                     track_advanced = true;
                     pthread_mutex_unlock(&audio_mutex);
                 } else {
@@ -1297,6 +1395,7 @@ static void * audio_thread_func(void * arg) {
                         pthread_mutex_lock(&audio_mutex);
                         last_playback_error = AUDIO_ERROR_DECODER_FAILED;
                         have_current = false;
+                        clear_current_format_locked();
                         paused = false;
                         pthread_mutex_unlock(&audio_mutex);
                         should_restart = false;
@@ -1316,6 +1415,7 @@ static void * audio_thread_func(void * arg) {
                             nxt_open = true;
                             nxt_frames_consumed = 0;
                             nxt_replaygain_linear_local = staged_next_replaygain;
+                            nxt_replaygain_applied_local = staged_next_replaygain_applied;
                         } else {
                             DBG_LOG("audio: failed to open next track (%s)\n",
                                     safe_path_tail(staged_next_path));
@@ -1345,6 +1445,7 @@ static void * audio_thread_func(void * arg) {
                         nxt_open = false;
                         cur_frames_played_local = nxt_frames_consumed;
                         cur_replaygain_linear = nxt_replaygain_linear_local;
+                        cur_replaygain_applied = nxt_replaygain_applied_local;
                         free(cur_path_local);
 
                         pthread_mutex_lock(&audio_mutex);
@@ -1357,6 +1458,8 @@ static void * audio_thread_func(void * arg) {
                         current_total_frames = cur_dec.total_frames;
                         current_sample_rate = cur_dec.sample_rate;
                         frames_played = cur_frames_played_local;
+                        publish_current_format_locked(&cur_dec, cur_path_local,
+                                                      cur_replaygain_linear, cur_replaygain_applied);
                         track_advanced = true;
                         pthread_mutex_unlock(&audio_mutex);
 
@@ -1395,6 +1498,7 @@ static void * audio_thread_func(void * arg) {
                 pthread_mutex_lock(&audio_mutex);
                 last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
                 have_current = false;
+                clear_current_format_locked();
                 paused = false;
                 pthread_mutex_unlock(&audio_mutex);
                 should_restart = false;
@@ -1427,6 +1531,7 @@ static void * audio_thread_func(void * arg) {
         /* have_current was already cleared in the error gotos above; for
          * normal break paths (stop, natural EOF) it still needs clearing. */
         have_current = false;
+        clear_current_format_locked();
         paused = false;
         if (ended_with_no_next) track_finished = true;
         if (was_stopped) stop_requested = false;
@@ -1459,6 +1564,7 @@ void audio_play_file_at(const char * path, double start_seconds,
     restart_path = strdup(path);
     restart_start_seconds = start_seconds;
     restart_replaygain_linear = (float) replaygain_to_linear(has_replaygain, replaygain_gain_db, has_replaygain_peak, replaygain_peak);
+    restart_replaygain_applied = has_replaygain;
     free(next_path);
     next_path = NULL; /* the caller re-arms this via audio_set_next_track() right after */
     restart_requested = true;
@@ -1471,6 +1577,7 @@ void audio_play_file_at(const char * path, double start_seconds,
     seek_request_generation++;
     free(active_path);
     active_path = strdup(path);
+    clear_current_format_locked();
     pthread_cond_signal(&audio_cond);
     pthread_mutex_unlock(&audio_mutex);
 }
@@ -1481,6 +1588,7 @@ void audio_set_next_track(const char * path, bool has_replaygain, double replayg
     free(next_path);
     next_path = path ? strdup(path) : NULL;
     next_replaygain_linear = (float) replaygain_to_linear(has_replaygain, replaygain_gain_db, has_replaygain_peak, replaygain_peak);
+    next_replaygain_applied = has_replaygain;
     /* Increment generation so any in-flight snapshot the playback thread
      * already took (for a crossfade prefetch) is detected as stale and
      * discarded when the blend window arrives. */
@@ -1621,6 +1729,16 @@ unsigned int audio_get_sample_rate(void) {
     unsigned int result = current_sample_rate;
     pthread_mutex_unlock(&audio_mutex);
     return result;
+}
+
+bool audio_get_current_format_info(audio_current_format_info_t * out) {
+    if (!out) return false;
+    pthread_mutex_lock(&audio_mutex);
+    bool valid = have_current && current_format_info.valid;
+    if (valid) *out = current_format_info;
+    else memset(out, 0, sizeof(*out));
+    pthread_mutex_unlock(&audio_mutex);
+    return valid;
 }
 
 /* Human loudness perception is roughly logarithmic, so a raw linear

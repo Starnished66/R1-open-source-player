@@ -1,6 +1,7 @@
 #include "battery.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -14,7 +15,10 @@
  * `out`, trimming the trailing newline. Returns false if the file doesn't
  * exist or is empty -- normal on host, where none of this exists at all. */
 static bool read_sysfs_attr(const char * device_name, const char * attr, char * out, size_t out_size) {
-    char path[256];
+    /* dirent names can legally be up to 255 bytes; leave enough room for
+     * the fixed power-supply prefix and attribute instead of silently
+     * truncating a path into a different/nonexistent node. */
+    char path[512];
     snprintf(path, sizeof(path), "%s/%s/%s", POWER_SUPPLY_DIR, device_name, attr);
 
     FILE * f = fopen(path, "r");
@@ -142,6 +146,50 @@ static bool discover_battery_device(char * out, size_t out_size) {
     if (!fallback[0]) return false;
     snprintf(out, out_size, "%s", fallback);
     return true;
+}
+
+battery_external_power_state_t battery_get_external_power_state(void) {
+#ifdef HOST_BUILD
+    return BATTERY_EXTERNAL_POWER_UNKNOWN;
+#else
+    DIR * dir = opendir(POWER_SUPPLY_DIR);
+    if (!dir) return BATTERY_EXTERNAL_POWER_UNKNOWN;
+
+    bool saw_offline = false;
+    bool saw_unreadable = false;
+    struct dirent * entry;
+    errno = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+
+        char type[32];
+        if (!read_sysfs_attr(entry->d_name, "type", type, sizeof(type))) {
+            saw_unreadable = true;
+            continue;
+        }
+        if (strcmp(type, "Battery") == 0) continue;
+
+        char online[8];
+        if (!read_sysfs_attr(entry->d_name, "online", online, sizeof(online))) {
+            /* A non-battery supply whose state cannot be sampled makes an
+             * otherwise-all-off result ambiguous.  A positive sample from
+             * any other supply below still proves power is connected. */
+            saw_unreadable = true;
+            continue;
+        }
+        if (strcmp(online, "1") == 0) {
+            closedir(dir);
+            return BATTERY_EXTERNAL_POWER_CONNECTED;
+        }
+        if (strcmp(online, "0") == 0) saw_offline = true;
+        else saw_unreadable = true;
+    }
+    if (errno != 0) saw_unreadable = true;
+    closedir(dir);
+
+    if (saw_offline && !saw_unreadable) return BATTERY_EXTERNAL_POWER_DISCONNECTED;
+    return BATTERY_EXTERNAL_POWER_UNKNOWN;
+#endif
 }
 
 static bool refresh_battery_cache_locked(void) {

@@ -779,27 +779,84 @@ static void update_timer_cb(lv_timer_t * timer) {
      * idle_shutdown.h), at the cost of a real boot splash + library check
      * on every resume instead of an instant one.
      *
-     * Edge-triggered on battery_is_charging() so a normal desk charge with
-     * Car Mode left on doesn't repeatedly retrigger, and gated on something
-     * actually being loaded (audio_is_playing() || audio_is_paused()) --
-     * no track loaded means nothing to "continue playing," so no reason to
-     * force a shutdown cycle. Target-only, same reasoning as the auto-stop
-     * block above -- battery_is_charging() is unconditionally false on
-     * host. */
+     * Edge-triggered on physical external power, not battery_is_charging().
+     * The 85% limiter disables the PMIC charger while leaving the cable
+     * connected, which can make battery status say "Discharging" and used
+     * to trigger a shutdown/resume boot loop.  The physical-power API reads
+     * non-battery power_supply "online" nodes and returns UNKNOWN on an
+     * ambiguous/read-failure sample; UNKNOWN never counts as unplugging.
+     *
+     * A real removal must also persist for three consecutive 500ms control
+     * ticks before it becomes an edge.  This filters driver churn while a
+     * USB supply is settling without making ignition-off shutdown feel
+     * substantially delayed.  charge_limiter_is_holding() is only a
+     * fallback for an UNKNOWN physical sample: while holding, an ambiguous
+     * read is conservatively kept on the powered side rather than allowed
+     * to advance a destructive shutdown decision.
+     *
+     * Still gated on something actually being loaded
+     * (audio_is_playing() || audio_is_paused()) -- no track loaded means
+     * nothing to "continue playing," so no reason to force a shutdown
+     * cycle. Target-only, same reasoning as the auto-stop block above. */
 #ifndef HOST_BUILD
     {
-        static bool last_charging = true; /* starts true so nothing fires before any real state has been sampled */
+        enum { CAR_POWER_REMOVAL_DEBOUNCE_POLLS = 3 };
+        static bool power_sample_initialized = false;
+        static bool last_external_power = false;
+        static unsigned int power_absent_polls = 0;
         static bool car_shutdown_pending = false;
-        bool charging = battery_is_charging();
-        if (current_settings.car_mode_enabled && last_charging && !charging &&
-            (audio_is_playing() || audio_is_paused())) car_shutdown_pending = true;
+
+        if (!current_settings.car_mode_enabled) {
+            /* Re-sample from a clean baseline if Car Mode is enabled later;
+             * enabling it while already unplugged is not itself a removal
+             * edge and must not immediately power the device off. */
+            power_sample_initialized = false;
+            power_absent_polls = 0;
+            car_shutdown_pending = false;
+        } else {
+            /* Keep the sysfs directory/file reads completely out of the
+             * normal 500ms control path when Car Mode is disabled. */
+            battery_external_power_state_t power_state = battery_get_external_power_state();
+            if (power_state == BATTERY_EXTERNAL_POWER_UNKNOWN && charge_limiter_is_holding())
+                power_state = BATTERY_EXTERNAL_POWER_CONNECTED;
+
+            if (power_state == BATTERY_EXTERNAL_POWER_UNKNOWN) {
+                /* Consecutive means consecutive valid samples.  A sysfs
+                 * failure is not evidence of either state and must not let
+                 * two old off samples plus one later off sample confirm a
+                 * removal.  An already-confirmed pending shutdown is left
+                 * intact; only a positive connected sample cancels it. */
+                power_absent_polls = 0;
+            } else {
+                bool external_power = power_state == BATTERY_EXTERNAL_POWER_CONNECTED;
+                if (!power_sample_initialized) {
+                    last_external_power = external_power;
+                    power_sample_initialized = true;
+                    power_absent_polls = 0;
+                    DBG_LOG("car_mode: initial external power=%d\n", external_power);
+                } else if (external_power) {
+                    if (!last_external_power || power_absent_polls > 0 || car_shutdown_pending)
+                        DBG_LOG("car_mode: external power present; removal cancelled\n");
+                    last_external_power = true;
+                    power_absent_polls = 0;
+                    car_shutdown_pending = false;
+                } else if (last_external_power) {
+                    if (power_absent_polls < CAR_POWER_REMOVAL_DEBOUNCE_POLLS) power_absent_polls++;
+                    if (power_absent_polls >= CAR_POWER_REMOVAL_DEBOUNCE_POLLS) {
+                        last_external_power = false;
+                        car_shutdown_pending = audio_is_playing() || audio_is_paused();
+                        DBG_LOG("car_mode: external power removal confirmed; shutdown_pending=%d\n",
+                                car_shutdown_pending);
+                    }
+                }
+            }
+        }
+
         if (car_shutdown_pending && !shutdown_background_work_active()) {
             current_settings.last_position = audio_get_position_seconds();
             settings_save(&current_settings);
             idle_shutdown_now(); /* full poweroff -- does not return, see idle_shutdown.h */
         }
-        if (charging || !current_settings.car_mode_enabled) car_shutdown_pending = false;
-        last_charging = charging;
     }
 #endif
 

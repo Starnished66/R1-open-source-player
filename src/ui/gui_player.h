@@ -13,6 +13,7 @@ void sync_player_topbar_visibility(lv_obj_t * screen);
 void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta);
 void poll_cover_decode(void);
 void gui_player_update_progress(void);
+void gui_format_time(double seconds, char * buf, size_t buf_size);
 void show_volume_popup(int32_t percent);
 void hide_volume_popup(void);
 void poll_volume_popup_timeout(void);

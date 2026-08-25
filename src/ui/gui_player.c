@@ -852,10 +852,14 @@ static void info_container_from_hint(const char * hint, char out[16]) {
     }
 }
 
+static bool is_http_url(const char * path) {
+    if (!path) return false;
+    return strncasecmp(path, "http://", 7) == 0 || strncasecmp(path, "https://", 8) == 0;
+}
+
 static const char * info_path_hint(const char * path) {
     if (!path) return NULL;
-    bool url = strncasecmp(path, "http://", 7) == 0 || strncasecmp(path, "https://", 8) == 0;
-    if (url) {
+    if (is_http_url(path)) {
         /* Only this app's local-only #.<ext> hint is safe to inspect on a
          * stream. Never treat a URL path/query suffix as a container name:
          * besides being unreliable, a query can contain an auth token and
@@ -969,7 +973,7 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
         info.track_number = sm->track;
         info.has_disc_number = sm->disc > 0;
         info.disc_number = sm->disc;
-    } else if (strncasecmp(path, "http://", 7) == 0 || strncasecmp(path, "https://", 8) == 0) {
+    } else if (is_http_url(path)) {
         info.source = GUI_TRACK_SOURCE_RADIO;
         info.declared_codec = info_codec_from_hint(format_hint);
         if (info.declared_codec == AUDIO_CODEC_UNKNOWN) format_hint = NULL;
@@ -2617,10 +2621,20 @@ void gui_player_init(uint32_t screen_width, uint32_t screen_height) {
 }
 
 
-static void format_time(double seconds, char * buf, size_t buf_size) {
-    if (seconds < 0) seconds = 0;
-    int total = (int) seconds;
-    snprintf(buf, buf_size, "%d:%02d", total / 60, total % 60);
+void gui_format_time(double seconds, char * buf, size_t buf_size) {
+    if (!buf || buf_size == 0) return;
+    if (seconds <= 0.0) {
+        snprintf(buf, buf_size, "0:00");
+        return;
+    }
+    uint64_t total = (uint64_t) (seconds + 0.5);
+    uint64_t hours = total / 3600;
+    unsigned int minutes = (unsigned int) ((total % 3600) / 60);
+    unsigned int secs = (unsigned int) (total % 60);
+    if (hours > 0)
+        snprintf(buf, buf_size, "%llu:%02u:%02u", (unsigned long long) hours, minutes, secs);
+    else
+        snprintf(buf, buf_size, "%u:%02u", minutes, secs);
 }
 
 void gui_player_update_progress(void) {
@@ -2648,13 +2662,13 @@ void gui_player_update_progress(void) {
     if (pos_label && position_second != displayed_position_second) {
         char pos_str[16];
         displayed_position_second = position_second;
-        format_time(position, pos_str, sizeof(pos_str));
+        gui_format_time(position, pos_str, sizeof(pos_str));
         lv_label_set_text(pos_label, pos_str);
     }
     if (dur_label && duration_second != displayed_duration_second) {
         char dur_str[16];
         displayed_duration_second = duration_second;
-        format_time(duration, dur_str, sizeof(dur_str));
+        gui_format_time(duration, dur_str, sizeof(dur_str));
         lv_label_set_text(dur_label, dur_str);
     }
 }

@@ -72,21 +72,6 @@ static void format_rate(unsigned int hz, char * out, size_t out_size) {
     }
 }
 
-static void format_duration(double seconds, char * out, size_t out_size) {
-    if (seconds <= 0.0) {
-        out[0] = '\0';
-        return;
-    }
-    uint64_t total = (uint64_t) (seconds + 0.5);
-    uint64_t hours = total / 3600;
-    unsigned int minutes = (unsigned int) ((total % 3600) / 60);
-    unsigned int secs = (unsigned int) (total % 60);
-    if (hours > 0)
-        snprintf(out, out_size, "%llu:%02u:%02u", (unsigned long long) hours, minutes, secs);
-    else
-        snprintf(out, out_size, "%u:%02u", minutes, secs);
-}
-
 static void format_file_size(uint64_t bytes, char * out, size_t out_size) {
     if (bytes >= 1024ULL * 1024ULL * 1024ULL)
         snprintf(out, out_size, "%.2f GB", (double) bytes / (1024.0 * 1024.0 * 1024.0));
@@ -129,20 +114,106 @@ static void sanitized_url_host(const char * url, char * out, size_t out_size) {
     out[len] = '\0';
 }
 
+static void wrap_text_to_width(const char * src, char * out, size_t out_size, const lv_font_t * font, int32_t max_width) {
+    if (!src || !out || out_size == 0) return;
+    if (!font || max_width <= 0) {
+        snprintf(out, out_size, "%s", src);
+        return;
+    }
+
+    size_t out_pos = 0;
+    int32_t cur_line_w = 0;
+
+    size_t i = 0;
+    while (src[i] != '\0' && out_pos + 1 < out_size) {
+        if (src[i] == '\n') {
+            out[out_pos++] = '\n';
+            cur_line_w = 0;
+            i++;
+            continue;
+        }
+
+        size_t token_start = i;
+        int32_t token_w = 0;
+        while (src[i] != '\0' && src[i] != '\n') {
+            uint32_t letter = _lv_text_encoded_next(src, &i);
+            uint32_t next_letter = src[i] ? _lv_text_encoded_next(src, NULL) : 0;
+            token_w += lv_font_get_glyph_width(font, letter, next_letter);
+
+            if (letter == '/' || letter == ' ' || letter == '-' || letter == '_' ||
+                letter == '.' || letter == ':' || letter == '\\') {
+                break;
+            }
+        }
+        size_t token_bytes = i - token_start;
+
+        if (cur_line_w + token_w <= max_width || cur_line_w == 0) {
+            if (out_pos + token_bytes < out_size) {
+                memcpy(&out[out_pos], &src[token_start], token_bytes);
+                out_pos += token_bytes;
+                cur_line_w += token_w;
+            } else {
+                break;
+            }
+        } else {
+            if (out_pos + 1 < out_size) {
+                out[out_pos++] = '\n';
+                cur_line_w = 0;
+            }
+
+            if (token_w > max_width) {
+                size_t c_idx = token_start;
+                while (c_idx < token_start + token_bytes && out_pos + 1 < out_size) {
+                    size_t char_start = c_idx;
+                    uint32_t letter = _lv_text_encoded_next(src, &c_idx);
+                    uint32_t next_letter = (c_idx < token_start + token_bytes) ? _lv_text_encoded_next(src, NULL) : 0;
+                    int32_t glyph_w = lv_font_get_glyph_width(font, letter, next_letter);
+                    uint32_t char_len = c_idx - char_start;
+
+                    if (cur_line_w + glyph_w > max_width && cur_line_w > 0) {
+                        out[out_pos++] = '\n';
+                        cur_line_w = 0;
+                    }
+                    if (out_pos + char_len < out_size) {
+                        memcpy(&out[out_pos], &src[char_start], char_len);
+                        out_pos += char_len;
+                        cur_line_w += glyph_w;
+                    }
+                }
+            } else {
+                if (out_pos + token_bytes < out_size) {
+                    memcpy(&out[out_pos], &src[token_start], token_bytes);
+                    out_pos += token_bytes;
+                    cur_line_w = token_w;
+                }
+            }
+        }
+    }
+    out[out_pos < out_size ? out_pos : out_size - 1] = '\0';
+}
+
 static void add_info_line(const char * name, const char * value) {
     if (!info_list || !name || !value || !value[0]) return;
-    char line[2304];
-    snprintf(line, sizeof(line), "%s: %s", name, value);
+    char raw_line[2304];
+    snprintf(raw_line, sizeof(raw_line), "%s: %s", name, value);
+
+    const lv_font_t * font = gui_theme_font(GUI_FONT_ROLE_BODY);
+    int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
+    int32_t max_w = scr_w - 48;
+    if (max_w <= 0) max_w = 432;
+
+    char wrapped_line[4096];
+    wrap_text_to_width(raw_line, wrapped_line, sizeof(wrapped_line), font, max_w);
 
     lv_obj_t * label = lv_label_create(info_list);
-    lv_obj_set_width(label, lv_pct(100));
+    lv_obj_set_width(label, max_w);
     lv_obj_set_height(label, LV_SIZE_CONTENT);
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
     lv_obj_add_style(label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_set_style_text_font(label, font, 0);
     lv_obj_set_style_pad_top(label, 8, 0);
     lv_obj_add_flag(label, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_label_set_text(label, line);
+    lv_label_set_text(label, wrapped_line);
 }
 
 static void load_local_facts_once(void) {
@@ -171,21 +242,23 @@ static bool current_runtime(audio_current_format_info_t * out) {
 }
 
 static void rebuild_info_text(const audio_current_format_info_t * runtime, bool runtime_valid) {
+    if (!info_list) return;
+    lv_obj_clean(info_list);
     load_local_facts_once();
 
-    char text[4096] = "";
     char value[256];
     char rate[48];
     audio_codec_t codec = runtime_valid && runtime->codec != AUDIO_CODEC_UNKNOWN
         ? runtime->codec : current_context.declared_codec;
     if (codec == AUDIO_CODEC_UNKNOWN) codec = codec_from_container(current_context.container);
-    append_info_line(text, sizeof(text), "Codec", codec_name(codec));
-    append_info_line(text, sizeof(text), "Container", current_context.container);
+    add_info_line("Codec", codec_name(codec));
+    add_info_line("Container", current_context.container);
 
     unsigned int source_rate = runtime_valid && runtime->source_sample_rate
         ? runtime->source_sample_rate : current_context.declared_sample_rate;
     unsigned int source_depth = runtime_valid && runtime->source_bit_depth
         ? runtime->source_bit_depth : current_context.declared_bit_depth;
+    if (!source_rate && !current_context.path[0]) source_rate = audio_get_sample_rate();
     format_rate(source_rate, rate, sizeof(rate));
     value[0] = '\0';
     if (codec == AUDIO_CODEC_DSD && source_rate) {
@@ -197,13 +270,13 @@ static void rebuild_info_text(const audio_current_format_info_t * runtime, bool 
     } else if (source_depth) {
         snprintf(value, sizeof(value), "%u-bit", source_depth);
     }
-    append_info_line(text, sizeof(text), "Source", value);
+    add_info_line("Source", value);
 
     if (runtime_valid && runtime->output_sample_rate) {
         format_rate(runtime->output_sample_rate, rate, sizeof(rate));
         snprintf(value, sizeof(value), "%u-bit PCM / %s",
                  runtime->output_bit_depth ? runtime->output_bit_depth : 16, rate);
-        append_info_line(text, sizeof(text), "Output", value);
+        add_info_line("Output", value);
     }
 
     unsigned int channels = runtime_valid && runtime->channels
@@ -212,13 +285,14 @@ static void rebuild_info_text(const audio_current_format_info_t * runtime, bool 
     else if (channels == 2) snprintf(value, sizeof(value), "Stereo (2 channels)");
     else if (channels > 0) snprintf(value, sizeof(value), "%u channels", channels);
     else value[0] = '\0';
-    append_info_line(text, sizeof(text), "Channels", value);
+    add_info_line("Channels", value);
 
     unsigned int bitrate = runtime_valid && runtime->bitrate_kbps
         ? runtime->bitrate_kbps : current_context.declared_bitrate_kbps;
     bool bitrate_estimated = false;
     double duration = runtime_valid && runtime->duration_seconds > 0.0
         ? runtime->duration_seconds : current_context.declared_duration_seconds;
+    if (duration <= 0.0 && !current_context.path[0]) duration = audio_get_duration_seconds();
     if (!bitrate && local_stat_ok && duration > 0.0) {
         double estimate = ((double) local_file_size * 8.0) / duration / 1000.0;
         if (estimate > 0.0 && estimate < 1000000.0) {
@@ -228,13 +302,17 @@ static void rebuild_info_text(const audio_current_format_info_t * runtime, bool 
     }
     if (bitrate) snprintf(value, sizeof(value), "%s%u kbps", bitrate_estimated ? "~" : "", bitrate);
     else value[0] = '\0';
-    append_info_line(text, sizeof(text), "Bitrate", value);
+    add_info_line("Bitrate", value);
 
-    format_duration(duration, value, sizeof(value));
-    append_info_line(text, sizeof(text), "Duration", value);
+    if (duration > 0.0) {
+        gui_format_time(duration, value, sizeof(value));
+    } else {
+        value[0] = '\0';
+    }
+    add_info_line("Duration", value);
     if (local_stat_ok) {
         format_file_size(local_file_size, value, sizeof(value));
-        append_info_line(text, sizeof(text), "File size", value);
+        add_info_line("File size", value);
     }
 
     value[0] = '\0';
@@ -245,7 +323,7 @@ static void rebuild_info_text(const audio_current_format_info_t * runtime, bool 
         snprintf(value, sizeof(value), "Disc %d", current_context.disc_number);
     else if (current_context.has_track_number)
         snprintf(value, sizeof(value), "Track %d", current_context.track_number);
-    append_info_line(text, sizeof(text), "Position", value);
+    add_info_line("Position", value);
 
     value[0] = '\0';
     if (runtime_valid && runtime->replaygain_applied) {
@@ -261,58 +339,61 @@ static void rebuild_info_text(const audio_current_format_info_t * runtime, bool 
             snprintf(value, sizeof(value), "Album %+.1f dB", current_context.replaygain_album_db);
         }
     }
-    append_info_line(text, sizeof(text), "ReplayGain", value);
+    add_info_line("ReplayGain", value);
 
     value[0] = '\0';
-    if (current_context.source == GUI_TRACK_SOURCE_LOCAL) {
-        const char * local_path = current_context.path;
-        if (!local_path[0] && runtime_valid && !runtime->is_stream &&
-            !strstr(runtime->path, "://"))
-            local_path = runtime->path;
-        append_info_line(text, sizeof(text), "Location", local_path);
-    } else if (current_context.source == GUI_TRACK_SOURCE_SUBSONIC) {
-        append_info_line(text, sizeof(text), "Provider", "Subsonic");
+    if (current_context.source == GUI_TRACK_SOURCE_SUBSONIC) {
+        add_info_line("Provider", "Subsonic");
     } else if (current_context.source == GUI_TRACK_SOURCE_PLUGIN) {
         if (current_context.provider[0] && current_context.track_id[0])
             snprintf(value, sizeof(value), "%s / %s", current_context.provider, current_context.track_id);
         else
             snprintf(value, sizeof(value), "%s", current_context.provider);
-        append_info_line(text, sizeof(text), "Provider", value);
+        add_info_line("Provider", value);
     } else if (current_context.source == GUI_TRACK_SOURCE_RADIO) {
         char host[192];
         sanitized_url_host(current_context.path, host, sizeof(host));
         if (host[0]) snprintf(value, sizeof(value), "Radio / %s", host);
         else snprintf(value, sizeof(value), "Radio");
-        append_info_line(text, sizeof(text), "Provider", value);
+        add_info_line("Provider", value);
     } else if (runtime_valid && runtime->is_stream) {
         /* Do not expose runtime->path here: it may be a signed/authenticated
          * URL.  This fallback only describes the source generically. */
-        append_info_line(text, sizeof(text), "Provider", "Network stream");
+        add_info_line("Provider", "Network stream");
+    } else {
+        const char * local_path = current_context.path;
+        if (!local_path[0] && runtime_valid && !runtime->is_stream &&
+            !strstr(runtime->path, "://"))
+            local_path = runtime->path;
+        add_info_line("Location", local_path);
     }
 
-    if (!text[0]) snprintf(text, sizeof(text), "No track information available");
-    lv_label_set_text(info_label, text);
+    if (lv_obj_get_child_count(info_list) == 0) {
+        lv_obj_t * label = lv_label_create(info_list);
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
+        lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+        lv_obj_set_style_pad_top(label, 8, 0);
+        lv_label_set_text(label, "No track information available");
+    }
 }
 
 void gui_track_info_init(void) {
     if (info_screen) return;
     info_screen = build_subsonic_list_screen("Information", &info_title, &info_list);
-    /* One static, wrapping text block instead of a stack of oversized pill
-     * rows.  The parent remains vertically scrollable for a long local path
-     * or unusually large fonts, while the information itself reads like a
-     * compact specification sheet and never animates/marquees. */
-    info_label = lv_label_create(info_list);
-    lv_obj_set_width(info_label,
-                     lv_display_get_horizontal_resolution(lv_display_get_default()) - 48);
-    lv_obj_set_height(info_label, LV_SIZE_CONTENT);
-    lv_label_set_long_mode(info_label, LV_LABEL_LONG_WRAP);
-    lv_obj_add_style(info_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(info_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_set_style_text_line_space(info_label, 12, 0);
-    lv_obj_set_style_pad_top(info_label, 16, 0);
-    lv_obj_set_style_pad_bottom(info_label, 16, 0);
-    lv_obj_add_flag(info_label, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_label_set_text(info_label, "No track information available");
+    /* Plain left-aligned Name: value labels, same pattern as Wi-Fi Info.
+     * No pill rows, no marquee.  The list stays vertically scrollable for a
+     * long local path or a larger font size. */
+    lv_obj_set_flex_align(info_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_left(info_list, 24, 0);
+    lv_obj_set_style_pad_right(info_list, 24, 0);
+    lv_obj_set_style_pad_top(info_list, 12, 0);
+    lv_obj_set_style_pad_bottom(info_list, 16, 0);
+}
+
+lv_obj_t * gui_track_info_get_screen(void) {
+    return info_screen;
 }
 
 void gui_track_info_set_current(const gui_track_info_context_t * context) {

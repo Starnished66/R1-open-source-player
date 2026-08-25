@@ -9,6 +9,7 @@
 #include "gui_settings.h"
 #include "gui_network.h"
 #include "gui_lyrics.h"
+#include "gui_track_info.h"
 #include "gui_navigation.h"
 #include "gesture_detector.h"
 #include "screen_builders.h"
@@ -1815,6 +1816,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         player_swipe_candidate = !quick_drawer_drag_tracking && !quick_drawer_open &&
                                   lv_screen_active() != gui_player_get_screen() &&
                                   lv_screen_active() != gui_lyrics_get_screen() &&
+                                  lv_screen_active() != gui_track_info_get_screen() &&
                                   !gui_library_has_background_work() &&
                                   !player_swipe_press_excluded(p);
         player_swipe_touch_start_x = p.x;

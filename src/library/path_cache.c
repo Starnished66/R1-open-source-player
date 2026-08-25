@@ -94,6 +94,18 @@ static named_list_t * list_by_name(const char * name) {
     return NULL;
 }
 
+static bool path_valid_for_list(const named_list_t * entry, const char * path) {
+    if (!entry || !path || !path[0]) return false;
+    if (strcmp(entry->name, PATH_CACHE_PLAYLISTS) != 0) return true;
+
+    /* playlists.list is an index of playlist files, never song/database
+     * rows.  Older interrupted database builds could leave unrelated paths
+     * in this sidecar; rejecting them while loading makes those devices
+     * self-heal instead of presenting songs/albums as playlist rows forever. */
+    const char * ext = strrchr(path, '.');
+    return ext && (strcasecmp(ext, ".m3u") == 0 || strcasecmp(ext, ".m3u8") == 0);
+}
+
 static void list_load_file(named_list_t * entry) {
     path_list_free(&entry->list);
     entry->loaded = true;
@@ -104,8 +116,17 @@ static void list_load_file(named_list_t * entry) {
     char line[PATH_CACHE_PATH_MAX];
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
+        /* A record longer than the fixed reader would otherwise be split
+         * into several convincing-looking cache entries.  Discard its
+         * remainder and the whole record. */
+        bool complete = n > 0 && line[n - 1] == '\n';
+        if (!complete && !feof(f)) {
+            int c;
+            while ((c = fgetc(f)) != '\n' && c != EOF) {}
+            continue;
+        }
         while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
-        if (n == 0) continue;
+        if (n == 0 || !path_valid_for_list(entry, line)) continue;
         path_list_add(&entry->list, line);
     }
     fclose(f);
@@ -191,7 +212,9 @@ void path_cache_replace(const char * name, char * const * paths, int count) {
     named_list_t * entry = ensure_loaded(name);
     if (entry) {
         path_list_free(&entry->list);
-        for (int i = 0; i < count; i++) path_list_add(&entry->list, paths[i]);
+        for (int i = 0; i < count; i++) {
+            if (path_valid_for_list(entry, paths[i])) path_list_add(&entry->list, paths[i]);
+        }
         list_save_file(entry);
     }
     pthread_mutex_unlock(&path_cache_mu);
@@ -227,7 +250,7 @@ void path_cache_load_matching(const char * name, const char * filter_name, char 
 void path_cache_insert(const char * name, const char * path) {
     pthread_mutex_lock(&path_cache_mu);
     named_list_t * entry = ensure_loaded(name);
-    if (entry) {
+    if (entry && path_valid_for_list(entry, path)) {
         path_list_add(&entry->list, path);
         list_save_file(entry);
     }

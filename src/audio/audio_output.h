@@ -36,17 +36,20 @@
  * false if opening failed (device busy, aplay failed to spawn, etc). */
 bool audio_output_ensure(unsigned int channels, unsigned int sample_rate);
 
-/* Writes frames to whatever audio_output_ensure() last successfully
- * opened. Paced like a real device: blocks until there's room (local
- * hardware via tinyalsa's own blocking pcm_writei(), or backpressure from
- * aplay's own ALSA write on its end of the pipe for Bluetooth) -- or, if
- * nothing is actually open right now (a failed reopen, aplay having died
- * out from under a live connection), sleeps for approximately this
- * chunk's real playback duration instead of returning instantly, so a
- * caller's own decode loop can't race ahead of real time while output is
- * unavailable. Silently drops the chunk in that case -- callers don't
- * need their own fallback. */
-void audio_output_write(const int16_t * buf, uint64_t frames, unsigned int channels);
+/* Writes frames to whatever audio_output_ensure() last successfully opened.
+ * Blocks until delivery completes (tinyalsa pcm_writei() for local hardware;
+ * pipe back-pressure from aplay's ALSA write for BT/USB).
+ *
+ * If out_frames_written is non-NULL, stores the exact number of frames
+ * successfully delivered before any error occurred (allowing callers to
+ * retry only the remaining undelivered suffix without duplicating audio).
+ *
+ * Returns true if ALL requested frames were successfully delivered.
+ * Returns false on partial delivery, write error, or if no device is open.
+ *
+ * When nothing is open, sleeps for the chunk's nominal playback duration and
+ * returns false with *out_frames_written = 0. */
+bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written);
 
 /* Closes whatever's open (local or Bluetooth) and resets format tracking,
  * so the next audio_output_ensure() call always does a fresh open. */

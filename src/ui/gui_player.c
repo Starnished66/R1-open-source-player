@@ -2808,6 +2808,24 @@ void gui_player_handle_track_finished(void) {
     }
 }
 
+void gui_player_handle_playback_error(audio_error_t err) {
+    if (err == AUDIO_ERROR_NONE) return;
+    if (playlist_index < 0) return;
+
+    /* Checkpoint confirmed position so pressing Play can retry cleanly */
+    double pos = audio_get_position_seconds();
+    deferred_resume_position = (pos > 0.0) ? pos : 0.0;
+    deferred_resume_pending = true;
+
+    set_play_button_state(false);
+
+    if (err == AUDIO_ERROR_DECODER_FAILED) {
+        show_error_toast("Playback error: decoder failed");
+    } else if (err == AUDIO_ERROR_OUTPUT_FAILED) {
+        show_error_toast("Playback error: audio output failed");
+    }
+}
+
 
 void gui_player_sync_topbar_visibility(lv_obj_t * screen) {
     if (player_dismiss_btn) {

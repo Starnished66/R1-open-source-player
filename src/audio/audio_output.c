@@ -2,6 +2,7 @@
 #include "debug_log.h"
 #include "subprocess.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -193,50 +194,73 @@ bool audio_output_ensure(unsigned int channels, unsigned int sample_rate) {
     return open_device(channels, sample_rate);
 }
 
-void audio_output_write(const int16_t * buf, uint64_t frames, unsigned int channels) {
-    bool paced = false;
+bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written) {
+    if (out_frames_written) *out_frames_written = 0;
     if (active_target == OUTPUT_TARGET_BT || active_target == OUTPUT_TARGET_USB) {
-        /* No tinyalsa-style blocking-until-room primitive here -- aplay's
-         * own ALSA write blocks on ITS end of the pipe once its buffer is
-         * full, which backpressures this write() the same way pcm_writei()
-         * paces the local path below. Looped for the same reason
-         * subprocess_run_checked()'s read loop is: a pipe write can return
-         * short. */
         int fd = (active_target == OUTPUT_TARGET_BT) ? bt_aplay_fd : usb_aplay_fd;
+        if (fd < 0) {
+            /* No pipe open -- pace so the caller's loop doesn't spin */
+            unsigned int rate = device_sample_rate ? device_sample_rate : 44100;
+            usleep((useconds_t) ((uint64_t) frames * 1000000ULL / rate));
+            return false;
+        }
+        /* Pipe write: loop until all bytes delivered, handling EINTR.
+         * aplay's own ALSA write blocks on its end once its buffer is full,
+         * which backpressures this write() naturally -- same as pcm_writei().
+         * Any other error (EPIPE, EIO, ...) means aplay died; report failure
+         * so the caller can close+reopen rather than silently dropping. */
         const char * p = (const char *) buf;
-        size_t remaining = (size_t) frames * channels * sizeof(int16_t);
+        size_t frame_bytes = channels * sizeof(int16_t);
+        size_t total_bytes = (size_t) frames * frame_bytes;
+        size_t remaining = total_bytes;
         while (remaining > 0) {
-            ssize_t n = write(fd, p, remaining);
-            if (n <= 0) break; /* aplay died or the pipe broke -- drop this chunk, next audio_output_ensure() call will notice and reopen */
+            ssize_t n;
+            do { n = write(fd, p, remaining); } while (n < 0 && errno == EINTR);
+            if (n <= 0) {
+                size_t written_bytes = total_bytes - remaining;
+                /* On pipe write error (aplay terminated/EPIPE), the old pipe is closed
+                 * and destroyed. Return the count of fully delivered whole frames.
+                 * The caller will reopen a new aplay pipe and resume from the whole-frame
+                 * boundary, ensuring the new pipe receives strictly frame-aligned PCM. */
+                if (out_frames_written) {
+                    *out_frames_written = written_bytes / frame_bytes;
+                }
+                DBG_LOG("audio_output: pipe write failed (target=%d errno=%d written=%" PRIu64 "/%" PRIu64 " frames)\n",
+                        (int) active_target, errno,
+                        out_frames_written ? *out_frames_written : 0ULL, frames);
+                return false;
+            }
             p += n;
             remaining -= (size_t) n;
         }
-        paced = (remaining == 0);
-    } else if (alsa_pcm) {
-        /* pcm_writei blocks until ALSA has room, which paces the caller's own loop naturally */
-        (void) pcm_writei(alsa_pcm, buf, (unsigned int) frames);
-        paced = true;
+        if (out_frames_written) *out_frames_written = frames;
+        return true;
     }
-    /* Real-device incident: when aplay dies out from under a live Bluetooth
-     * connection (confirmed live -- BlueZ tearing down the PCM the instant
-     * the headphones actually disconnect, which bluealsa then reports to
-     * aplay as EOF/error, killing it), the write() above starts failing
-     * instantly instead of blocking -- and unlike pcm_writei()'s failure
-     * modes, an instantly-failing write() gives the caller's decode loop no
-     * backpressure at all. Confirmed live (audio.c's own playback path,
-     * before this was extracted): position tracking raced far ahead of real
-     * time in the gap between the actual disconnect and the next ~5s GUI
-     * connection poll noticing and flipping bt_requested back to local,
-     * burning CPU decoding audio nobody will ever hear. Approximates this
-     * chunk's real playback duration so the loop free-runs no faster than a
-     * working device would have paced it, same as every other no-device-open
-     * case (an initial open failure, mid-stream switch failure) already
-     * silently falls into. */
-    if (!paced) {
-        unsigned int rate = device_sample_rate ? device_sample_rate : 44100;
-        usleep((useconds_t) (frames * 1000000ULL / rate));
+
+    if (alsa_pcm) {
+        /* pcm_writei blocks until ALSA has room -- natural backpressure.
+         * Verify the full frame count was accepted; a short or negative
+         * return means the device had an error (underrun, hw reset, etc.) */
+        int ret = pcm_writei(alsa_pcm, buf, (unsigned int) frames);
+        if (ret < 0 || (unsigned int) ret != (unsigned int) frames) {
+            uint64_t written = (ret > 0) ? (uint64_t) ret : 0;
+            if (out_frames_written) *out_frames_written = written;
+            DBG_LOG("audio_output: pcm_writei returned %d (wanted %u written=%" PRIu64 "): %s\n",
+                    ret, (unsigned int) frames, written,
+                    ret < 0 ? pcm_get_error(alsa_pcm) : "short write");
+            return false;
+        }
+        if (out_frames_written) *out_frames_written = frames;
+        return true;
     }
+
+    /* Nothing open -- pace so the caller cannot race ahead of real time,
+     * then report failure so the caller knows frames were not delivered. */
+    unsigned int rate = device_sample_rate ? device_sample_rate : 44100;
+    usleep((useconds_t) ((uint64_t) frames * 1000000ULL / rate));
+    return false;
 }
+
 
 /* USB takes priority over Bluetooth if both are somehow requested at once
  * (see audio_output.h's own doc comment on audio_output_set_usb_requested())

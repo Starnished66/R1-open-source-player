@@ -163,7 +163,10 @@ static void * bridge_thread_func(void * arg) {
             frame_samples[i * 2] = frame_samples[i * 2 + 1];
         }
 
-        audio_output_write(frame_samples, frame_count, BRIDGE_CHANNELS);
+        /* Ignore write failure: the bridge has no per-frame recovery --
+         * audio_output_ensure() at the top of the next iteration handles
+         * reconnection if aplay died. */
+        (void) audio_output_write(frame_samples, frame_count, BRIDGE_CHANNELS, NULL);
     }
 
     if (!stop_requested) {

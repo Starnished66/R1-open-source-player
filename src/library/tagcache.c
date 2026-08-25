@@ -1343,14 +1343,29 @@ static bool compact_scan_title_order(int32_t count) {
 static int collect_load_generations(int32_t * out, int max) {
     int n = 0;
     int32_t pointed = 0;
-    if (read_gen_pointer(&pointed) && pointed > 0 && n < max) out[n++] = pointed;
+    bool have_pointer = read_gen_pointer(&pointed) && pointed > 0;
+    if (have_pointer && n < max) out[n++] = pointed;
 
-    DIR * d = opendir(db_dir);
+    /* tagcache.gen is the transaction's commit record.  A crash after some
+     * database_*.tcd.gN files were created but before that pointer was
+     * durably renamed must not make N visible on the next boot.  In
+     * particular, accepting every generation found here used to expose a
+     * half-created library through the Playlists screen's database-backed
+     * Favorites/Most Played/Recently Added rows.
+     *
+     * With a valid pointer, generations below it are safe recovery
+     * candidates: write_all() keeps only the previously pointed generation
+     * alongside the new one.  Generations above it are uncommitted orphans
+     * and are deliberately ignored.  With no pointer, no versioned
+     * generation has proof of commit, so only the legacy unversioned cache
+     * considered below may be loaded. */
+    DIR * d = have_pointer ? opendir(db_dir) : NULL;
     if (d) {
         struct dirent * de;
         while ((de = readdir(d)) != NULL && n < max) {
             int g = 0;
             if (sscanf(de->d_name, "database_idx.tcd.g%d", &g) != 1 || g <= 0) continue;
+            if (g > pointed) continue;
             bool dup = false;
             for (int i = 0; i < n; i++) {
                 if (out[i] == g) {
@@ -1363,7 +1378,7 @@ static int collect_load_generations(int32_t * out, int max) {
         closedir(d);
     }
 
-    int start = (n > 0 && pointed > 0 && out[0] == pointed) ? 1 : 0;
+    int start = (n > 0 && have_pointer && out[0] == pointed) ? 1 : 0;
     for (int i = start + 1; i < n; i++) {
         int32_t v = out[i];
         int j = i;

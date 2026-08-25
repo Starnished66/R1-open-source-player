@@ -167,15 +167,17 @@ int main(void) {
         unsetenv("TAGCACHE_FORCE_COMPACT");
     }
 
-    /* Crash during write_all can leave database_*.tcd.gN with no tagcache.gen.
-     * Boot must recover the highest complete generation instead of opening empty. */
+    /* tagcache.gen is the commit record.  A crash can leave structurally
+     * readable database_*.tcd.gN files before the pointer is published;
+     * boot must not promote those uncommitted scan results into the live
+     * library (including database-backed rows under Playlists). */
     {
         if (unlink(".open_hiby_player/tagcache.gen") != 0) fail("unlink gen pointer");
         metadata_db_close();
         metadata_db_open();
-        if (metadata_db_get_song_count() != 4) fail("recovered count without gen pointer");
-        if (!metadata_db_get_song_by_path("/music/a.flac", &by_path)) fail("recovered path");
-        if (stat(".open_hiby_player/tagcache.gen", &st) != 0) fail("repaired gen pointer");
+        if (metadata_db_get_song_count() != 0) fail("uncommitted generation loaded without pointer");
+        if (metadata_db_get_song_by_path("/music/a.flac", &by_path)) fail("uncommitted path visible");
+        if (stat(".open_hiby_player/tagcache.gen", &st) == 0) fail("uncommitted generation pointer recreated");
     }
 
     {
@@ -184,6 +186,14 @@ int main(void) {
         char * batch[] = { pl_a };
         metadata_db_playlist_replace_all(batch, 1);
         metadata_db_playlist_insert_one(pl_b);
+        {
+            FILE * poisoned = fopen(".open_hiby_player/playlists.list", "a");
+            if (!poisoned) fail("open playlist cache poison");
+            fprintf(poisoned, "/music/not-a-playlist.flac\n/music/Album Name\n");
+            fclose(poisoned);
+            metadata_db_close();
+            metadata_db_open();
+        }
         char ** paths = NULL;
         int pn = 0;
         metadata_db_load_all_playlists(&paths, &pn);

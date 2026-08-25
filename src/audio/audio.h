@@ -116,7 +116,7 @@ float audio_get_volume(void);
  * (or the queued one failed to open). Meant to be polled from the GUI
  * thread's timer, since the audio thread must not call into LVGL directly.
  * When a next track WAS queued and playable, the thread moves on by itself
- * instead -- see audio_consume_track_advanced(). */
+ * instead -- see audio_consume_track_advanced(). Note: NOT set on errors. */
 bool audio_consume_track_finished(void);
 
 /* Returns true (and clears the flag) exactly once when the playback thread
@@ -126,5 +126,22 @@ bool audio_consume_track_finished(void);
  * playlist index advanced by one" -- update its own index/labels/art and
  * call audio_set_next_track() again for whatever comes after. */
 bool audio_consume_track_advanced(void);
+
+/* Unrecoverable playback error codes, distinct from natural end-of-track.
+ * Errors do NOT advance the queue; the current track and last confirmed
+ * position remain valid so the UI can show a toast and the user can retry
+ * with audio_play_file_at() at the stored position. */
+typedef enum {
+    AUDIO_ERROR_NONE = 0,
+    AUDIO_ERROR_DECODER_FAILED,  /* premature EOF -- decoder recovery exhausted */
+    AUDIO_ERROR_OUTPUT_FAILED,   /* output write error -- hardware recovery exhausted */
+} audio_error_t;
+
+/* Returns the most recent unrecoverable error (and clears it) exactly once.
+ * AUDIO_ERROR_NONE means no pending error. Designed to be polled from the
+ * GUI thread's timer alongside audio_consume_track_finished() and
+ * audio_consume_track_advanced(). Unlike track_finished, an error MUST NOT
+ * trigger automatic queue advance -- the track stays current. */
+audio_error_t audio_consume_error(void);
 
 #endif /* AUDIO_H */

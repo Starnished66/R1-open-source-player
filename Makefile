@@ -254,7 +254,7 @@ src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c
 APP_SRCS += src/ui/lyrics_layout.c src/ui/transition_compositor.c
 APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c
 APP_SRCS += src/library/remote_track.c
-APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c
+APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c src/library/artwork_coordinator.c
 APP_CXX_SRCS = src/audio/alac_decoder.cpp
 LVGL_SRCS = $(shell find $(LVGL_DIR)/src -type f -name '*.c')
 TINYALSA_SRCS = $(shell find $(TINYALSA_DIR)/src -type f -name '*.c')
@@ -460,6 +460,16 @@ TAGCACHE_SELFTEST_SRCS = src/library/tagcache_selftest.c src/library/metadata_db
 tagcache-selftest:
 	$(CC) $(HOST_CFLAGS) -o /tmp/tagcache_selftest $(TAGCACHE_SELFTEST_SRCS) -lpthread
 	/tmp/tagcache_selftest
+
+AUDIO_SELFTEST_SRCS = src/audio/audio_selftest.c
+audio-selftest:
+	$(CC) $(HOST_CFLAGS) -o /tmp/audio_selftest $(AUDIO_SELFTEST_SRCS) -lpthread
+	/tmp/audio_selftest
+
+ARTWORK_SELFTEST_SRCS = src/library/artwork_coordinator_selftest.c src/library/artwork_coordinator.c
+artwork-selftest:
+	$(CC) $(HOST_CFLAGS) -o /tmp/artwork_selftest $(ARTWORK_SELFTEST_SRCS) -lpthread
+	/tmp/artwork_selftest
 
 clean:
 	rm -rf build_host build_target $(HOST_BIN) $(TARGET_BIN) compile_commands.json compile_flags.txt

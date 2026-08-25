@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include "metadata.h"
 #include "settings.h"
+#include "audio.h"
 
 
 
@@ -91,6 +92,7 @@ const char * gui_player_get_now_playing_folder(void);
 
 void gui_player_handle_auto_advance(void);
 void gui_player_handle_track_finished(void);
+void gui_player_handle_playback_error(audio_error_t err);
 
 void gui_player_sync_topbar_visibility(lv_obj_t * screen);
 lv_obj_t * gui_player_get_dismiss_btn(void);

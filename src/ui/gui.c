@@ -1158,11 +1158,12 @@ static void update_timer_cb(lv_timer_t * timer) {
     gui_lyrics_poll_backdrop();
     poll_search_job();
 
-    if (audio_consume_track_advanced()) {
+    audio_error_t playback_err = audio_consume_error();
+    if (playback_err != AUDIO_ERROR_NONE) {
+        gui_player_handle_playback_error(playback_err);
+    } else if (audio_consume_track_advanced()) {
         gui_player_handle_auto_advance();
-    }
-
-    if (audio_consume_track_finished()) {
+    } else if (audio_consume_track_finished()) {
         gui_player_handle_track_finished();
     }
 

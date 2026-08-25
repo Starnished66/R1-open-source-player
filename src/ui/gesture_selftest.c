@@ -57,6 +57,29 @@ static void test_home_swipe_basic_success(void) {
     printf("  -> Home swipe basic success and single-shot trigger passed.\n");
 }
 
+/* Production adds two invisible pixels above the unchanged visual band. */
+static void test_home_swipe_extra_hit_area(void) {
+    gesture_home_state_t state;
+    gesture_home_config_t cfg = make_default_config();
+    cfg.band_height = BAND_H + HOME_SWIPE_HIT_EXTRA_PX;
+
+    /* The uppermost newly-added pixel is eligible. */
+    gesture_home_state_reset(&state);
+    assert(!gesture_home_state_poll(&state, &cfg, true, SCREEN_H - BAND_H - 2));
+    assert(state.tracking);
+    assert(gesture_home_state_poll(&state, &cfg, true, SCREEN_H - BAND_H - 42));
+    assert(!gesture_home_state_poll(&state, &cfg, false, 0));
+
+    /* One pixel above the expanded target remains excluded. */
+    gesture_home_state_reset(&state);
+    assert(!gesture_home_state_poll(&state, &cfg, true, SCREEN_H - BAND_H - 3));
+    assert(!state.tracking);
+    assert(!gesture_home_state_poll(&state, &cfg, true, SCREEN_H - BAND_H - 50));
+    assert(!gesture_home_state_poll(&state, &cfg, false, 0));
+
+    printf("  -> Invisible 2px home-swipe hit-area expansion passed.\n");
+}
+
 /* 2. Repeated successful Home swipes separated by releases */
 static void test_repeated_home_swipes(void) {
     gesture_home_state_t state;
@@ -364,6 +387,7 @@ static void test_touch_held_across_wake_suppression(void) {
 int main(void) {
     printf("=== Starting Gesture Subsystem Self-Tests ===\n");
     test_home_swipe_basic_success();
+    test_home_swipe_extra_hit_area();
     test_repeated_home_swipes();
     test_short_press_no_movement();
     test_start_outside_band();

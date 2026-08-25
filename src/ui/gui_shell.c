@@ -1732,7 +1732,9 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     home_cfg.is_lyrics_screen = (lv_screen_active() == gui_lyrics_get_screen());
     home_cfg.has_background_work = gui_library_has_background_work();
     home_cfg.screen_height = h;
-    home_cfg.band_height = HOME_INDICATOR_BAND_HEIGHT;
+    /* Slightly expand only the raw press-down target. The overlay band and
+     * its visible pill retain their existing dimensions. */
+    home_cfg.band_height = HOME_INDICATOR_BAND_HEIGHT + HOME_SWIPE_HIT_EXTRA_PX;
 
     bool home_trigger = gesture_home_state_poll(&s_home_gesture_state, &home_cfg, pressed, p.y);
 
@@ -1786,8 +1788,8 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                home_cfg.is_usb_dac_overlay,
                home_cfg.is_lyrics_screen,
                home_cfg.has_background_work,
-               p.y >= h - HOME_INDICATOR_BAND_HEIGHT,
-               (int)p.y, (int)(h - HOME_INDICATOR_BAND_HEIGHT),
+               p.y >= h - home_cfg.band_height,
+               (int)p.y, (int)(h - home_cfg.band_height),
                s_home_gesture_state.tracking);
 #endif
 

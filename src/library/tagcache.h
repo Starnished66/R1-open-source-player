@@ -10,8 +10,10 @@
  * switch `tagcache.gen`; the previous generation stays loadable until that
  * pointer is replaced. Numeric tags live in the master index. Title and
  * path strings are interned only when RAM allows; larger libraries mmap
- * those files instead. This header is the engine API used by metadata_db.c;
- * the public player API stays metadata_db.h. */
+ * those files instead. This header is the internal storage engine used
+ * exclusively by metadata_db.c. All access must be serialized by
+ * metadata_db.c under METADATA_DB_GUARD; public player code must use
+ * metadata_db.h instead. */
 
 #define TAGCACHE_PATH_MAX 600
 #define TAGCACHE_TAG_MAX 128

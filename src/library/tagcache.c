@@ -423,8 +423,13 @@ static void path_hash_grow(int32_t min_cap) {
             uint32_t h = ents[idx].path_h;
             if (!h && ents[idx].path) h = fnv1a(ents[idx].path, strlen(ents[idx].path));
             int32_t slot = (int32_t) (h & (uint32_t) (cap - 1));
-            while (path_hash[slot] != 0) slot = (slot + 1) & (cap - 1);
-            path_hash[slot] = old[i];
+            for (int32_t probe = 0; probe < cap; probe++) {
+                if (path_hash[slot] == 0) {
+                    path_hash[slot] = old[i];
+                    break;
+                }
+                slot = (slot + 1) & (cap - 1);
+            }
         }
         free(old);
     }
@@ -433,13 +438,18 @@ static void path_hash_grow(int32_t min_cap) {
 static void path_hash_insert(int32_t idx) {
     if (path_hash_cap == 0 || (ent_count + 1) * 2 >= path_hash_cap)
         path_hash_grow(path_hash_cap ? path_hash_cap * 2 : 64);
-    if (!path_hash) return;
+    if (!path_hash || path_hash_cap == 0) return;
     uint32_t h = ents[idx].path_h;
     if (!h && ents[idx].path) h = fnv1a(ents[idx].path, strlen(ents[idx].path));
     if (!h && !entry_path_str(&ents[idx])[0]) return;
     int32_t slot = (int32_t) (h & (uint32_t) (path_hash_cap - 1));
-    while (path_hash[slot] != 0) slot = (slot + 1) & (path_hash_cap - 1);
-    path_hash[slot] = idx + 1;
+    for (int32_t probe = 0; probe < path_hash_cap; probe++) {
+        if (path_hash[slot] == 0) {
+            path_hash[slot] = idx + 1;
+            return;
+        }
+        slot = (slot + 1) & (path_hash_cap - 1);
+    }
 }
 
 static int32_t path_hash_find(const char * path) {

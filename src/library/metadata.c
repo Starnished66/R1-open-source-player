@@ -19,6 +19,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Real bug caught in a second review pass: the WMA/DFF/WAV-ID3-fallback
@@ -2036,11 +2037,24 @@ void metadata_read_isolated(const char * path, track_metadata_t * out, int timeo
 
     close(pipefd[1]);
 
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
     size_t total = 0;
     bool ok = true;
     while (total < sizeof(*out)) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t elapsed_ms = (int64_t)(now.tv_sec - start.tv_sec) * 1000 +
+                             (int64_t)(now.tv_nsec - start.tv_nsec) / 1000000;
+        int remaining_ms = timeout_ms - (int) elapsed_ms;
+        if (remaining_ms <= 0) {
+            ok = false;
+            break;
+        }
+
         struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
-        int pr = poll(&pfd, 1, timeout_ms);
+        int pr = poll(&pfd, 1, remaining_ms);
         if (pr <= 0) { ok = false; break; }
         ssize_t n = read(pipefd[0], (char *) out + total, sizeof(*out) - total);
         if (n <= 0) { ok = false; break; }

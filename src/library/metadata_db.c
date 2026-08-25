@@ -730,6 +730,7 @@ void metadata_db_load_favorite_songs(char *** out_paths, int * out_count) {
     int32_t slots = tagcache_slot_count();
     char ** paths = NULL;
     int n = 0, cap = 0;
+    bool ok = true;
     for (int32_t i = 0; i < slots; i++) {
         tagcache_song_t song;
         if (!tagcache_song_at_slot(i, &song)) continue;
@@ -737,15 +738,22 @@ void metadata_db_load_favorite_songs(char *** out_paths, int * out_count) {
         if (n >= cap) {
             int next = cap ? cap * 2 : 16;
             char ** p = realloc(paths, sizeof(*p) * (size_t) next);
-            if (!p) break;
+            if (!p) {
+                ok = false;
+                break;
+            }
             paths = p;
             cap = next;
         }
         paths[n] = strdup(song.path);
-        if (!paths[n]) break;
+        if (!paths[n]) {
+            ok = false;
+            break;
+        }
         n++;
     }
-    if (n == 0) {
+    if (!ok || n == 0) {
+        for (int j = 0; j < n; j++) free(paths[j]);
         free(paths);
         return;
     }
@@ -770,6 +778,7 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
     int32_t slots = tagcache_slot_count();
     played_hit_t * hits = NULL;
     int n = 0, cap = 0;
+    bool hits_ok = true;
     for (int32_t i = 0; i < slots; i++) {
         tagcache_song_t song;
         if (!tagcache_song_at_slot(i, &song)) continue;
@@ -777,7 +786,10 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
         if (n >= cap) {
             int next = cap ? cap * 2 : 16;
             played_hit_t * h = realloc(hits, sizeof(*h) * (size_t) next);
-            if (!h) break;
+            if (!h) {
+                hits_ok = false;
+                break;
+            }
             hits = h;
             cap = next;
         }
@@ -786,6 +798,10 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
         hits[n].last_played = song.last_played;
         n++;
     }
+    if (!hits_ok) {
+        free(hits);
+        return;
+    }
     qsort(hits, (size_t) n, sizeof(*hits), cmp_hit_played);
     if (n > limit) n = limit;
     if (n <= 0) {
@@ -793,6 +809,10 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
         return;
     }
     char ** paths = malloc(sizeof(*paths) * (size_t) n);
+    if (!paths) {
+        free(hits);
+        return;
+    }
     int w = 0;
     for (int i = 0; i < n; i++) {
         paths[w] = strdup(hits[i].path);
@@ -800,7 +820,8 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
         w++;
     }
     free(hits);
-    if (w == 0) {
+    if (w != n) {
+        for (int j = 0; j < w; j++) free(paths[j]);
         free(paths);
         return;
     }
@@ -817,6 +838,7 @@ void metadata_db_load_recently_added_songs(int limit, char *** out_paths, int * 
     if (live <= 0) return;
     int n = live < limit ? (int) live : limit;
     char ** paths = malloc(sizeof(*paths) * (size_t) n);
+    if (!paths) return;
     int w = 0;
     for (int32_t i = 0; i < live && w < n; i++) {
         tagcache_song_t song;
@@ -825,7 +847,8 @@ void metadata_db_load_recently_added_songs(int limit, char *** out_paths, int * 
         if (!paths[w]) break;
         w++;
     }
-    if (w == 0) {
+    if (w != n) {
+        for (int j = 0; j < w; j++) free(paths[j]);
         free(paths);
         return;
     }

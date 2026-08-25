@@ -126,6 +126,13 @@ int main(void) {
         free(favs);
         if (saw_remote) fail("remote listed in local favorites");
         if (!saw_migrated) fail("migrated path missing from favorites");
+
+        char ** recent = NULL;
+        int rn = 0;
+        metadata_db_load_recently_added_songs(10, &recent, &rn);
+        if (rn != 3) fail("recently added count");
+        for (int i = 0; i < rn; i++) free(recent[i]);
+        free(recent);
     }
 
     struct stat st;

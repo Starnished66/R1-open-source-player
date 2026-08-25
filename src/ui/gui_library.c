@@ -4047,7 +4047,21 @@ void gui_library_init(void) {
 }
 
 void gui_library_resume_fast_timers(void) {
-    if (az_index_drag_timer) lv_timer_resume(az_index_drag_timer);
+    if (az_index_drag_timer) {
+        lv_timer_resume(az_index_drag_timer);
+        lv_timer_ready(az_index_drag_timer);
+    }
+}
+
+void gui_library_reset_drag_state(void) {
+    if (az_index_dragging && az_index_active_binding) {
+        lv_obj_add_flag(az_index_active_binding->popup, LV_OBJ_FLAG_HIDDEN);
+        az_index_active_binding = NULL;
+    }
+    az_index_dragging = false;
+    if (az_index_drag_timer) {
+        lv_timer_pause(az_index_drag_timer);
+    }
 }
 
 typedef struct {

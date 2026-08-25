@@ -54,6 +54,7 @@ void build_power_off_countdown_popup(void);
 void poll_sd_card_hotplug(void);
 
 void gui_library_resume_fast_timers(void);
+void gui_library_reset_drag_state(void);
 
 bool gui_library_has_background_work(void);
 void gui_library_cancel_background_work(void);

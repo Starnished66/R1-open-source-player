@@ -35,8 +35,9 @@ void refresh_headphone_icon(void);
 void gui_shell_update_topbar(bool screen_just_woke);
 
 bool point_in_swipe_dead_zone(lv_point_t p);
-bool active_press_is_over_drag_adjust_widget(void);
 void gui_shell_resume_fast_timers(void);
+void gui_shell_reset_drag_state(void);
+void gui_shell_install_indev_hooks(lv_indev_t * indev);
 
 bool gui_shell_has_background_work(void);
 void gui_shell_cancel_background_work(void);

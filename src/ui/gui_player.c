@@ -47,7 +47,6 @@ static int queue_next_insert_index = -1;
 #include <math.h>
 
 #define VOLUME_POPUP_TIMEOUT_MS 3000
-#define HOME_INDICATOR_BAND_HEIGHT 24
 
 static lv_obj_t * player_screen = NULL;
 lv_obj_t * player_dismiss_btn = NULL;

@@ -313,7 +313,8 @@ bool fallback_font_validate_file(const char * path) {
     return valid;
 }
 
-static bool stage_custom_font_from_sd(const char * custom_filename) {
+static bool stage_custom_font_from_sd(const char * custom_filename, bool * out_content_changed) {
+    if (out_content_changed) *out_content_changed = false;
     if (!custom_filename || !custom_filename[0] || strcmp(custom_filename, "Default") == 0) {
         return true;
     }
@@ -352,6 +353,7 @@ static bool stage_custom_font_from_sd(const char * custom_filename) {
         st_staged.st_size == st.st_size &&
         st_staged.st_mtime == st.st_mtime &&
         fallback_font_validate_file(STAGING_CUSTOM_FILE)) {
+        if (out_content_changed) *out_content_changed = false;
         return true;
     }
 
@@ -420,6 +422,7 @@ static bool stage_custom_font_from_sd(const char * custom_filename) {
         close(dir_fd);
     }
 
+    if (out_content_changed) *out_content_changed = true;
     return true;
 }
 
@@ -505,13 +508,14 @@ bool fallback_font_apply_custom(const char * custom_filename) {
     uint32_t target_gen = s_custom_font_generation;
 
     if (!is_default) {
-        if (!stage_custom_font_from_sd(custom_filename)) {
+        bool content_changed = false;
+        if (!stage_custom_font_from_sd(custom_filename, &content_changed)) {
             DBG_LOG("fallback_font: failed staging custom font %s\n", custom_filename);
             return false;
         }
         candidate_staged_valid = true;
-        /* If custom font name changed, increment generation to prevent reusing old font's faces */
-        if (!s_custom_staged_valid || strcmp(s_active_custom_name, custom_filename) != 0) {
+        /* If custom font name changed OR underlying staged content changed, increment generation to construct fresh faces */
+        if (!s_custom_staged_valid || strcmp(s_active_custom_name, custom_filename) != 0 || content_changed) {
             target_gen++;
         }
     } else {
@@ -604,7 +608,8 @@ void fallback_font_init_early(int font_size_tier, int lyrics_font_size_tier) {
 
     bool staged = false;
     if (current_settings.custom_font[0] && strcmp(current_settings.custom_font, "Default") != 0) {
-        staged = stage_custom_font_from_sd(current_settings.custom_font);
+        bool content_changed = false;
+        staged = stage_custom_font_from_sd(current_settings.custom_font, &content_changed);
         if (staged) {
             s_custom_staged_valid = true;
             s_custom_font_generation++;

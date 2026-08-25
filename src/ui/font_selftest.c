@@ -73,6 +73,20 @@ static void test_utf8_truncate_safe(void) {
     assert(bounded_n == 7);
     assert(strcmp(small_buf, "Long so") == 0);
 
+    /* Non-null-terminated buffer: ensure truncation never reads beyond src_len */
+    char raw_chars[5] = { 'A', 'B', 'C', 'D', 'E' };
+    char dst_arr[16];
+    size_t raw_n = utf8_truncate_safe_bounded(dst_arr, sizeof(dst_arr), raw_chars, 5);
+    assert(raw_n == 5);
+    assert(strcmp(dst_arr, "ABCDE") == 0);
+
+    /* Incomplete multibyte at end of exact bounded buffer: Cyrillic 'П' (0xD0 0x9F) + orphan lead (0xD1) */
+    char incomplete_raw[3] = { (char)0xD0, (char)0x9F, (char)0xD1 };
+    raw_n = utf8_truncate_safe_bounded(dst_arr, sizeof(dst_arr), incomplete_raw, 3);
+    assert(raw_n == 2);
+    assert(dst_arr[2] == '\0');
+    assert(strncmp(dst_arr, "П", 2) == 0);
+
     printf("  -> UTF-8 safe boundary truncation passed.\n");
 }
 

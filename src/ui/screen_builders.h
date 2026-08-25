@@ -26,6 +26,7 @@
  * wifi, drawn separately on lv_layer_top()) for the same pixels. */
 #define STATUS_BAR_CLEARANCE 48
 #define TITLE_ROW_HEIGHT 64
+#define HOME_INDICATOR_BAND_HEIGHT 24
 
 /* Shared touch-list row geometry -- every tappable row-of-text list
  * (Artists/Albums/Album Artist/Genres/All Songs/group-songs drill-down,

@@ -91,25 +91,37 @@ size_t utf8_truncate_safe_bounded(char * dst, size_t dst_size, const char * src,
     if (max_copy > src_len) {
         max_copy = src_len;
     }
-
-    size_t cut = max_copy;
-    while (cut > 0 && ((uint8_t)src[cut] & 0xC0) == 0x80) {
-        cut--;
+    if (max_copy == 0) {
+        dst[0] = '\0';
+        return 0;
     }
 
-    if (cut > 0) {
-        uint8_t lead = (uint8_t)src[cut];
-        size_t seq_len = 1;
-        if (lead < 0x80) seq_len = 1;
-        else if ((lead & 0xE0) == 0xC0) seq_len = 2;
-        else if ((lead & 0xF0) == 0xE0) seq_len = 3;
-        else if ((lead & 0xF8) == 0xF0) seq_len = 4;
+    /* Count trailing continuation bytes at the end of the candidate slice src[0 .. max_copy - 1] */
+    size_t k = 0;
+    while (k < max_copy && k < 4 && ((uint8_t)src[max_copy - 1 - k] & 0xC0) == 0x80) {
+        k++;
+    }
 
-        if (cut + seq_len > max_copy) {
-            /* Multibyte codepoint is truncated at boundary; omit incomplete lead byte */
+    size_t cut = max_copy;
+    if (k < max_copy) {
+        size_t lead_idx = max_copy - 1 - k;
+        uint8_t lead = (uint8_t)src[lead_idx];
+        size_t seq_len = 1;
+        if (lead < 0x80) {
+            seq_len = 1;
+        } else if ((lead & 0xE0) == 0xC0) {
+            seq_len = 2;
+        } else if ((lead & 0xF0) == 0xE0) {
+            seq_len = 3;
+        } else if ((lead & 0xF8) == 0xF0) {
+            seq_len = 4;
+        }
+
+        if (lead_idx + seq_len > max_copy) {
+            /* The multibyte sequence crosses past max_copy; drop its incomplete prefix */
+            cut = lead_idx;
         } else {
-            /* Entire sequence fits */
-            cut += seq_len;
+            cut = max_copy;
         }
     }
 

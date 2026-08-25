@@ -181,6 +181,10 @@ ifneq ($(UI_PERF_TRACE),)
 UI_PERF_TRACE_DEFINE = -DUI_PERF_TRACE=1
 endif
 
+ifneq ($(UI_GESTURE_TRACE),)
+UI_GESTURE_TRACE_DEFINE = -DUI_GESTURE_TRACE=1
+endif
+
 # Always defined (no flag needed) -- the fallback the About screen's
 # version line uses when TEST_BUILD_TAG isn't set, e.g. a real flashed
 # deployment via the user's own repack process rather than an adb-pushed
@@ -189,8 +193,8 @@ endif
 # built, not when the Makefile was last edited.
 BUILD_STAMP_DEFINE = -DBUILD_STAMP=\"$(shell date +%Y-%m-%d_%H:%M)\"
 
-TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(BUILD_STAMP_DEFINE)
-TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(BUILD_STAMP_DEFINE)
 TINYALSA_CFLAGS = -O3 -g -Wall -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 # DBUS_COMPILATION/DBUS_STATIC_BUILD: libdbus's own headers gate some
 # declarations on these (matching how its own build always defines them
@@ -256,6 +260,7 @@ APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c
 APP_SRCS += src/library/remote_track.c
 APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c src/library/artwork_coordinator.c
 APP_SRCS += src/core/utf8_util.c
+APP_SRCS += src/ui/gesture_detector.c
 APP_CXX_SRCS = src/audio/alac_decoder.cpp
 LVGL_SRCS = $(shell find $(LVGL_DIR)/src -type f -name '*.c')
 TINYALSA_SRCS = $(shell find $(TINYALSA_DIR)/src -type f -name '*.c')
@@ -476,6 +481,11 @@ FONT_SELFTEST_SRCS = src/ui/font_selftest.c src/ui/fallback_font.c src/core/sett
 font-selftest:
 	$(CC) $(HOST_CFLAGS) -I. -Ilvgl -Isrc/ui -Isrc/core -Isrc/hardware -Isrc/audio -Isrc/library -Isrc/network -Isrc/plugins -DLV_CONF_INCLUDE_SIMPLE=1 -DHOST_BUILD=1 -o /tmp/font_selftest $(FONT_SELFTEST_SRCS) -lm -lpthread
 	/tmp/font_selftest
+
+GESTURE_SELFTEST_SRCS = src/ui/gesture_selftest.c src/ui/gesture_detector.c
+gesture-selftest:
+	$(CC) $(HOST_CFLAGS) -Isrc/ui -o /tmp/gesture_selftest $(GESTURE_SELFTEST_SRCS) -lpthread
+	/tmp/gesture_selftest
 
 clean:
 	rm -rf build_host build_target $(HOST_BIN) $(TARGET_BIN) compile_commands.json compile_flags.txt

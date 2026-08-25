@@ -404,6 +404,9 @@ static void apply_screen_runtime_state(bool screen_on) {
     lv_indev_enable(NULL, screen_on);
     audio_set_low_power_mode(!screen_on);
 
+    gui_shell_reset_drag_state();
+    gui_library_reset_drag_state();
+
     lv_timer_t * refr_timer = lv_display_get_refr_timer(lv_display_get_default());
     if (refr_timer) {
         if (screen_on) lv_timer_resume(refr_timer);
@@ -423,6 +426,9 @@ static void apply_screen_runtime_state(bool screen_on) {
 #ifdef UI_PERF_TRACE
     printf("PERF screen_runtime screen_on=%d refr_timer=%d indev_timers=%d\n",
            screen_on, refr_timer != NULL, indev_timer_count);
+#endif
+#ifdef UI_GESTURE_TRACE
+    printf("[GESTURE_TRACE] apply_screen_runtime_state: screen_on=%d\n", screen_on);
 #endif
 }
 
@@ -1511,23 +1517,6 @@ static lv_obj_t * build_stream_media_screen(void) {
 }
 
 
-/* Wakes quick_drawer_drag_timer/az_index_drag_timer the instant a new press
- * begins anywhere on screen -- registered on the pointer indev itself
- * (LV_EVENT_PRESSED, not tied to any one widget) rather than each screen's
- * own objects, for the same reason poll_quick_drawer_drag()'s own doc
- * comment gives for polling raw indev state in the first place: this is the
- * one press-related event LVGL dispatches regardless of which object was
- * actually hit. Both timers pause themselves the instant they see nothing
- * left to track (see their own handle comments); without this, a paused
- * timer would never resume, silently breaking every gesture that relies on
- * it. lv_timer_resume() on an already-running timer is a harmless no-op, so
- * this doesn't need to check either timer's current state first. */
-static void resume_fast_gesture_timers_cb(lv_event_t * e) {
-    (void) e;
-    gui_shell_resume_fast_timers();
-    gui_library_resume_fast_timers();
-}
-
 void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("gui_init entered");
@@ -1782,7 +1771,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     gui_reset_interactive_timeout_baseline();
     lv_timer_create(update_timer_cb, 500, NULL);
     lv_indev_t * gesture_indev = find_pointer_indev();
-    if (gesture_indev) lv_indev_add_event_cb(gesture_indev, resume_fast_gesture_timers_cb, LV_EVENT_PRESSED, NULL);
+    gui_shell_install_indev_hooks(gesture_indev);
 #ifndef HOST_BUILD
     boot_checkpoint("lv_screen_load(gui_shell_get_home_screen()) done");
 #endif

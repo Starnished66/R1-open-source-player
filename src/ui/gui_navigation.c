@@ -432,14 +432,57 @@ void slide_transition_done_cb(lv_anim_t * a) {
     slide_transition_active = false;
 }
 
-/* Moved up from its own neighborhood further down (build_home_indicator_bar())
- * -- a plain #define has no location dependency on where home_indicator_band
- * itself is built, and blend_overlay_onto_base() (used by
- * build_flattened_transition_frame() above) reads that object's own real
- * on-screen coordinates directly rather than this constant, so nothing
- * below actually requires this specific placement anymore; left here since
- * moving it back offers no benefit either. */
-#define HOME_INDICATOR_BAND_HEIGHT 34
+void slide_transition_cancel(slide_transition_ctx_t ** pctx) {
+    if (!pctx || !*pctx) {
+        if (transition_compositor_is_active()) {
+            transition_compositor_end();
+        }
+        slide_transition_active = false;
+        return;
+    }
+    slide_transition_ctx_t * ctx = *pctx;
+    *pctx = NULL;
+
+    /* Delete any pending or in-flight animation for this context to prevent use-after-free */
+    lv_anim_delete(ctx, slide_transition_anim_x_cb);
+
+    /* Restore the source screen and topbar */
+    lv_obj_t * recovery_scr = ctx->from_scr;
+    if (recovery_scr) {
+        lv_screen_load(recovery_scr);
+        sync_player_topbar_visibility(recovery_scr);
+    }
+
+    /* Restore home indicator band visibility */
+    lv_obj_t * hb_sup = gui_shell_get_home_indicator_band();
+    if (ctx->fallback_bands_suppressed && hb_sup) {
+        if (ctx->home_indicator_was_hidden)
+            lv_obj_add_flag(hb_sup, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_remove_flag(hb_sup, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* Delete overlay and destroy buffers */
+    if (ctx->overlay) {
+        lv_obj_delete(ctx->overlay);
+        ctx->overlay = NULL;
+    }
+    if (ctx->buf_from_owned && ctx->buf_from) {
+        lv_draw_buf_destroy(ctx->buf_from);
+        ctx->buf_from = NULL;
+        ctx->buf_from_owned = false;
+    }
+    if (ctx->buf_to_owned && ctx->buf_to) {
+        lv_draw_buf_destroy(ctx->buf_to);
+        ctx->buf_to = NULL;
+        ctx->buf_to_owned = false;
+    }
+
+    transition_compositor_end();
+    lv_free(ctx);
+    slide_transition_active = false;
+}
+
 
 /* Shared setup for both screen_transition_slide()'s own fixed-duration
  * path and the interactive (finger-driven) player-swipe further down

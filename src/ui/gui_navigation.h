@@ -44,6 +44,7 @@ void finalize_screen_navigation(lv_obj_t * scr);
 slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward);
 void slide_transition_anim_x_cb(void * var, int32_t v);
 void slide_transition_done_cb(lv_anim_t * a);
+void slide_transition_cancel(slide_transition_ctx_t ** pctx);
 void player_transition_cache_async_cb(void * unused);
 void player_transition_mark_dirty(void);
 void register_static_snapshot(int index, lv_obj_t * scr);

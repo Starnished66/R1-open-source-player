@@ -9,6 +9,8 @@
 #include "gui_settings.h"
 #include "gui_network.h"
 #include "gui_lyrics.h"
+#include "gui_navigation.h"
+#include "gesture_detector.h"
 #include "screen_builders.h"
 #include "transition_compositor.h"
 #include "metadata.h"
@@ -34,7 +36,6 @@
 #include <unistd.h>
 #include <time.h>
 
-#define HOME_INDICATOR_BAND_HEIGHT 24
 #define QUICK_DRAWER_HEIGHT 367
 #define QUICK_DRAWER_ANIM_MS 200
 
@@ -1329,9 +1330,17 @@ static bool quick_drawer_begin_bitmap_motion(void) {
         return false;
     int32_t initial_y = lv_obj_get_y(quick_drawer);
     quick_drawer_direct_y = initial_y;
-    int32_t fixed_top = status_bar_band ? lv_obj_get_height(status_bar_band) : 0;
+    int32_t fixed_top = (status_bar_band && !lv_obj_has_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN))
+                        ? lv_obj_get_height(status_bar_band)
+                        : 0;
     int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
     bool reuse_underlay = initial_y > -h;
+#if defined(UI_PERF_TRACE) || defined(UI_GESTURE_TRACE)
+    printf("[DRAWER_TRACE] begin_bitmap_motion: initial_y=%d, status_bar_band=%p, hidden=%d, fixed_top=%d, reuse_underlay=%d\n",
+           (int)initial_y, (void*)status_bar_band,
+           status_bar_band ? lv_obj_has_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN) : -1,
+           (int)fixed_top, (int)reuse_underlay);
+#endif
     if (transition_compositor_begin_vertical_overlay(quick_drawer_motion_buf, fixed_top,
                                                      reuse_underlay)) {
         lv_obj_add_flag(quick_drawer, LV_OBJ_FLAG_HIDDEN);
@@ -1453,15 +1462,8 @@ static int32_t quick_drawer_last_velocity = 0;
 #define QUICK_DRAWER_FLICK_VELOCITY 12 /* px/tick (~750px/s at the ~16ms poll rate) -- fast enough to read as an intentional flick */
 #define QUICK_DRAWER_DRAG_DEADZONE 10 /* matches LVGL's own LV_INDEV_DEF_SCROLL_LIMIT -- see poll_quick_drawer_drag()'s comment */
 
-/* Home-indicator swipe-up tracking -- see build_home_indicator_bar()'s own
- * comment for why this rides alongside the quick drawer's own drag tracking
- * in poll_quick_drawer_drag() below instead of an LV_EVENT_GESTURE handler.
- * Independent of quick_drawer_drag_tracking above (a press can only ever be
- * the start of one or the other, decided by where it lands). */
-static bool home_swipe_tracking = false;
-static int32_t home_swipe_start_y = 0;
-static bool home_swipe_triggered = false; /* fires nav_reset_to_home() at most once per press, even if the finger keeps moving past the threshold */
-#define HOME_SWIPE_UP_THRESHOLD 40 /* px the finger must move up from its start point before this counts as a swipe, not a stray tap in the band */
+/* Home-indicator swipe-up tracking state machine -- see gesture_detector.h. */
+static gesture_home_state_t s_home_gesture_state = { 0 };
 
 /* Swipe-left-to-player tracking -- same "raw indev polling, own dedicated
  * fast timer" reasoning as poll_quick_drawer_drag()'s own doc comment,
@@ -1528,6 +1530,90 @@ lv_indev_t * find_pointer_indev(void) {
         if (lv_indev_get_type(candidate) == LV_INDEV_TYPE_POINTER) return candidate;
     }
     return NULL;
+}
+
+static lv_indev_read_cb_t s_orig_pointer_read_cb = NULL;
+static lv_indev_t * s_hooked_indev = NULL;
+static lv_indev_state_t s_last_raw_pointer_state = LV_INDEV_STATE_RELEASED;
+static bool s_require_release_after_wake = true;
+
+static void wrapped_pointer_read_cb(lv_indev_t * indev, lv_indev_data_t * data) {
+    if (s_orig_pointer_read_cb) {
+        s_orig_pointer_read_cb(indev, data);
+    }
+
+    if (!backlight_screen_is_on()) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        s_last_raw_pointer_state = LV_INDEV_STATE_RELEASED;
+        s_require_release_after_wake = true;
+        return;
+    }
+
+    if (s_require_release_after_wake) {
+        if (data->state == LV_INDEV_STATE_PRESSED) {
+            /* Finger was held down across the wake transition; suppress until released */
+#ifdef UI_GESTURE_TRACE
+            if (s_last_raw_pointer_state != LV_INDEV_STATE_PRESSED) {
+                printf("[GESTURE_TRACE] raw pointer: suppressing held touch across wake at (%d, %d)\n",
+                       (int)data->point.x, (int)data->point.y);
+            }
+#endif
+            data->state = LV_INDEV_STATE_RELEASED;
+            s_last_raw_pointer_state = LV_INDEV_STATE_RELEASED;
+            return;
+        } else {
+            /* Physical release observed: establish clean baseline and arm subsequent presses */
+            s_require_release_after_wake = false;
+#ifdef UI_GESTURE_TRACE
+            printf("[GESTURE_TRACE] raw pointer: release baseline established after wake\n");
+#endif
+        }
+    }
+
+    if (data->state == LV_INDEV_STATE_PRESSED) {
+#ifdef UI_GESTURE_TRACE
+        if (s_last_raw_pointer_state != LV_INDEV_STATE_PRESSED) {
+            printf("[GESTURE_TRACE] raw pointer press edge detected at (%d, %d)\n",
+                   (int)data->point.x, (int)data->point.y);
+        }
+#endif
+        gui_shell_resume_fast_timers();
+        gui_library_resume_fast_timers();
+    }
+    s_last_raw_pointer_state = data->state;
+}
+
+static void indev_pressed_event_cb(lv_event_t * e) {
+    (void) e;
+#ifdef UI_GESTURE_TRACE
+    printf("[GESTURE_TRACE] indev LV_EVENT_PRESSED callback fired\n");
+#endif
+    gui_shell_resume_fast_timers();
+    gui_library_resume_fast_timers();
+}
+
+void gui_shell_install_indev_hooks(lv_indev_t * indev) {
+    if (!indev) indev = find_pointer_indev();
+    if (!indev) {
+#ifdef UI_GESTURE_TRACE
+        printf("[GESTURE_TRACE] indev hook: pointer indev not found\n");
+#endif
+        return;
+    }
+    if (s_hooked_indev == indev) {
+        return;
+    }
+
+    lv_indev_read_cb_t cur_read_cb = lv_indev_get_read_cb(indev);
+    if (cur_read_cb && cur_read_cb != wrapped_pointer_read_cb) {
+        s_orig_pointer_read_cb = cur_read_cb;
+        lv_indev_set_read_cb(indev, wrapped_pointer_read_cb);
+#ifdef UI_GESTURE_TRACE
+        printf("[GESTURE_TRACE] indev hook: wrapped pointer read_cb for indev %p\n", (void*)indev);
+#endif
+    }
+    lv_indev_add_event_cb(indev, indev_pressed_event_cb, LV_EVENT_PRESSED, NULL);
+    s_hooked_indev = indev;
 }
 
 /* Same drag-adjust widget set enable_gesture_bubble_recursive() excludes
@@ -1638,6 +1724,18 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     lv_indev_get_point(indev, &p);
     int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
 
+    gesture_home_config_t home_cfg;
+    home_cfg.swipe_up_home_enabled = current_settings.swipe_up_home_enabled;
+    home_cfg.quick_drawer_open = quick_drawer_open;
+    home_cfg.is_bt_dac_overlay = (lv_screen_active() == gui_network_get_bt_dac_overlay());
+    home_cfg.is_usb_dac_overlay = (lv_screen_active() == gui_network_get_usb_dac_overlay());
+    home_cfg.is_lyrics_screen = (lv_screen_active() == gui_lyrics_get_screen());
+    home_cfg.has_background_work = gui_library_has_background_work();
+    home_cfg.screen_height = h;
+    home_cfg.band_height = HOME_INDICATOR_BAND_HEIGHT;
+
+    bool home_trigger = gesture_home_state_poll(&s_home_gesture_state, &home_cfg, pressed, p.y);
+
     if (pressed && !quick_drawer_was_pressed) {
         /* Cancel any release-snap animation still in flight -- re-grabbing
          * the drawer right after a flick (within its 120ms animation
@@ -1679,45 +1777,19 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         quick_drawer_drag_claimed = false;
         quick_drawer_drag_touch_start_y = p.y;
 
-        /* Home-indicator swipe-up: only a press starting within the band
-         * itself counts, matching the Android gesture-bar convention this
-         * is modeled on (see build_home_indicator_bar()) -- a press
-         * anywhere else on screen never triggers this, even if it later
-         * moves upward (e.g. an aborted attempt to scroll a list).
-         * Real-device bug report: with the drawer already open, ANY press
-         * is presumed to be the start of a close-drag (see quick_drawer_open
-         * branch just above) regardless of where on screen it starts --
-         * competing for the same swipe-up gesture let a single upward drag
-         * both close the drawer AND jump to Home. Excluded outright while
-         * the drawer is open; the drawer itself always wins that gesture
-         * there.
-         * Real-device bug report: swiping up to Home while Bluetooth DAC
-         * mode was active left DAC mode itself still on (bluealsa/bt-agent
-         * still running, phone still "connected") with no way back to it
-         * short of re-entering Settings and toggling DAC mode off and back
-         * on -- only the DAC overlay's own back button is supposed to be
-         * able to leave it, since that's the only path that actually tears
-         * DAC mode down (see bt_dac_overlay_back_cb()). Excluded here the
-         * same way the drawer already is; USB DAC mode has the identical
-         * "only the back button exits" design (build_usb_dac_overlay_screen())
-         * and shares the same gap fixed here.
-         * Same exclusion for library_rescan_active (Settings > Update Music
-         * Database) -- nav_reset_to_home() here would leave the rescan
-         * thread running against arrays the home/library screens themselves
-         * are about to read, same crash as the quick-drawer exclusion just
-         * above. This makes the busy screen fully undismissable while a
-         * rescan is in flight -- it has no swipe-to-back gesture wired
-         * either (build_subsonic_downloading_screen() never calls
-         * finalize_screen_navigation()), so this was the only remaining way
-         * off it. */
-        home_swipe_tracking = current_settings.swipe_up_home_enabled && !quick_drawer_open &&
-                               lv_screen_active() != gui_network_get_bt_dac_overlay() &&
-                               lv_screen_active() != gui_network_get_usb_dac_overlay() &&
-                               lv_screen_active() != gui_lyrics_get_screen() &&
-                               !gui_library_has_background_work() &&
-                               p.y >= h - HOME_INDICATOR_BAND_HEIGHT;
-        home_swipe_start_y = p.y;
-        home_swipe_triggered = false;
+#ifdef UI_GESTURE_TRACE
+        printf("[GESTURE_TRACE] poll: press-down at (%d, %d), res_h=%d\n", (int)p.x, (int)p.y, (int)h);
+        printf("[GESTURE_TRACE] poll: home_swipe eval: enabled=%d, drawer_open=%d, bt_dac=%d, usb_dac=%d, lyrics=%d, bg_work=%d, in_band=%d (y=%d >= %d) -> tracking=%d\n",
+               home_cfg.swipe_up_home_enabled,
+               home_cfg.quick_drawer_open,
+               home_cfg.is_bt_dac_overlay,
+               home_cfg.is_usb_dac_overlay,
+               home_cfg.is_lyrics_screen,
+               home_cfg.has_background_work,
+               p.y >= h - HOME_INDICATOR_BAND_HEIGHT,
+               (int)p.y, (int)(h - HOME_INDICATOR_BAND_HEIGHT),
+               s_home_gesture_state.tracking);
+#endif
 
         /* Player-swipe: eligible unless this exact press already got
          * claimed by the drawer-drag above (quick_drawer_drag_tracking),
@@ -1748,8 +1820,12 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         player_swipe_tracking = false;
     }
 
-    if (pressed && home_swipe_tracking && !home_swipe_triggered && home_swipe_start_y - p.y >= HOME_SWIPE_UP_THRESHOLD) {
-        home_swipe_triggered = true;
+    if (home_trigger) {
+#ifdef UI_GESTURE_TRACE
+        printf("[GESTURE_TRACE] poll: home_swipe TRIGGERED at dy=%d >= %d (start_y=%d, cur_y=%d)\n",
+               (int)(s_home_gesture_state.start_y - p.y), HOME_SWIPE_UP_THRESHOLD, (int)s_home_gesture_state.start_y, (int)p.y);
+#endif
+        lv_indev_wait_release(indev);
         nav_reset_to_home();
     }
 
@@ -1955,6 +2031,14 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         player_swipe_ctx = NULL;
     }
 
+    if (!pressed && quick_drawer_was_pressed) {
+#ifdef UI_GESTURE_TRACE
+        printf("[GESTURE_TRACE] poll: release observed (home_tracking=%d, home_triggered=%d, drawer_tracking=%d, player_tracking=%d)\n",
+               s_home_gesture_state.tracking, s_home_gesture_state.triggered, quick_drawer_drag_tracking, player_swipe_tracking);
+#endif
+        player_swipe_candidate = false;
+    }
+
     quick_drawer_was_pressed = pressed;
 
     /* Every release-handling branch above (drawer snap, player-swipe
@@ -1963,7 +2047,12 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
      * timers_cb() wakes this again on the next press-down. See this
      * timer's own handle comment for why pausing (not just letting the
      * ~60fps tick keep firing and no-op) is what actually matters here. */
-    if (!pressed) lv_timer_pause(timer);
+    if (!pressed) {
+#ifdef UI_GESTURE_TRACE
+        printf("[GESTURE_TRACE] poll: timer self-paused\n");
+#endif
+        lv_timer_pause(timer);
+    }
 }
 
 /* Forward declarations -- defined later in this file (with the player
@@ -2803,7 +2892,11 @@ void gui_shell_init(uint32_t screen_width, uint32_t screen_height) {
     }
     refresh_volume_topbar((int32_t) (audio_get_volume() * 100.0f));
 
-    quick_drawer_drag_timer = lv_timer_create(poll_quick_drawer_drag, LV_DEF_REFR_PERIOD, NULL);
+    gui_shell_reset_drag_state();
+    if (!quick_drawer_drag_timer) {
+        quick_drawer_drag_timer = lv_timer_create(poll_quick_drawer_drag, LV_DEF_REFR_PERIOD, NULL);
+    }
+    gui_shell_install_indev_hooks(NULL);
 }
 
 
@@ -2887,7 +2980,45 @@ void gui_shell_update_topbar(bool screen_just_woke) {
 }
 
 void gui_shell_resume_fast_timers(void) {
-    if (quick_drawer_drag_timer) lv_timer_resume(quick_drawer_drag_timer);
+    if (quick_drawer_drag_timer) {
+#ifdef UI_GESTURE_TRACE
+        bool was_paused = lv_timer_get_paused(quick_drawer_drag_timer);
+        printf("[GESTURE_TRACE] resume_fast_timers: quick_drawer_drag_timer (was_paused=%d)\n", was_paused);
+#endif
+        lv_timer_resume(quick_drawer_drag_timer);
+        lv_timer_ready(quick_drawer_drag_timer);
+    }
+}
+
+void gui_shell_reset_drag_state(void) {
+#ifdef UI_GESTURE_TRACE
+    printf("[GESTURE_TRACE] reset_drag_state called (was_pressed=%d, home_tracking=%d, drawer_tracking=%d, player_tracking=%d)\n",
+           quick_drawer_was_pressed, s_home_gesture_state.tracking, quick_drawer_drag_tracking, player_swipe_tracking);
+#endif
+    quick_drawer_was_pressed = false;
+    quick_drawer_drag_tracking = false;
+    quick_drawer_drag_claimed = false;
+    quick_drawer_last_velocity = 0;
+
+    gesture_home_state_reset(&s_home_gesture_state);
+
+    /* Cancel any active drawer animation or motion and restore deterministic closed state */
+    lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb);
+    if (quick_drawer_bitmap_motion || quick_drawer_direct_motion) {
+        quick_drawer_open = false;
+        quick_drawer_finish_bitmap_motion();
+    }
+
+    player_swipe_candidate = false;
+    player_swipe_tracking = false;
+    if (player_swipe_ctx) {
+        slide_transition_cancel(&player_swipe_ctx);
+    }
+    s_last_raw_pointer_state = LV_INDEV_STATE_RELEASED;
+    s_require_release_after_wake = true;
+    if (quick_drawer_drag_timer) {
+        lv_timer_pause(quick_drawer_drag_timer);
+    }
 }
 
 bool gui_shell_has_background_work(void) {

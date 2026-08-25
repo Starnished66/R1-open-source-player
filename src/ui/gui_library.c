@@ -40,6 +40,69 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include <sys/stat.h>
 #include <limits.h>
 #include <ctype.h>
+#include <time.h>
+#include <stdarg.h>
+#include <errno.h>
+
+#ifdef TEST_BUILD_TAG
+#ifdef HOST_BUILD
+#define TEST_DIAG_DIR "./music/.logs"
+#else
+#define TEST_DIAG_DIR "/data/mnt/sd_0/.logs"
+#endif
+#define TEST_DIAG_PATH TEST_DIAG_DIR "/database_artwork.log"
+
+static pthread_mutex_t test_diag_mutex = PTHREAD_MUTEX_INITIALIZER;
+static FILE * test_diag_file;
+
+static uint64_t test_diag_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000ULL + (uint64_t) ts.tv_nsec / 1000000ULL;
+}
+
+static long test_diag_rss_kb(void) {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[160];
+    long rss = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "VmRSS: %ld kB", &rss) == 1) break;
+    }
+    fclose(f);
+    return rss;
+}
+
+static void test_diag_log(const char * area, const char * fmt, ...) {
+    pthread_mutex_lock(&test_diag_mutex);
+    if (!test_diag_file) {
+        if (mkdir(TEST_DIAG_DIR, 0755) != 0 && errno != EEXIST) {
+            pthread_mutex_unlock(&test_diag_mutex);
+            return;
+        }
+        test_diag_file = fopen(TEST_DIAG_PATH, "a");
+        if (!test_diag_file) {
+            pthread_mutex_unlock(&test_diag_mutex);
+            return;
+        }
+        setvbuf(test_diag_file, NULL, _IOLBF, 0);
+    }
+
+    fprintf(test_diag_file, "[TEST:%s][%s] t=%llu ", TEST_BUILD_TAG, area,
+            (unsigned long long) test_diag_now_ms());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(test_diag_file, fmt, ap);
+    va_end(ap);
+    fputc('\n', test_diag_file);
+    fflush(test_diag_file); /* Preserve the last completed event across a crash/reboot. */
+    pthread_mutex_unlock(&test_diag_mutex);
+}
+
+#define TEST_DIAG(area, fmt, ...) test_diag_log(area, fmt, ##__VA_ARGS__)
+#else
+#define TEST_DIAG(area, fmt, ...) ((void) 0)
+#endif
 
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -61,6 +124,15 @@ static gui_busy_handle_t library_rescan_token = 0;
 static gui_busy_handle_t sd_format_token = 0;
 static atomic_int library_scan_progress_total = 0;
 static atomic_int library_scan_progress_done = 0;
+
+#ifdef TEST_BUILD_TAG
+static uint64_t albums_page_open_requested_ms;
+static uint64_t album_lazy_job_started_ms;
+static unsigned album_lazy_queued;
+static unsigned album_lazy_completed;
+static unsigned album_lazy_with_art;
+static unsigned album_lazy_stale;
+#endif
 
 static void album_thumbnail_screen_loaded_cb(lv_event_t * e);
 static void album_thumbnail_screen_unloaded_cb(lv_event_t * e);
@@ -1255,6 +1327,11 @@ static void * album_thumbnail_thread_func(void * arg) {
     uint64_t perf_start_us = ui_perf_now_us();
 #endif
     album_thumbnail_request_t * req = (album_thumbnail_request_t *) arg;
+#ifdef TEST_BUILD_TAG
+    uint64_t started_ms = test_diag_now_ms();
+    TEST_DIAG("ART_LAZY", "decode_begin song=%lld row=%d generation=%d rss_kb=%ld",
+              (long long) req->song_id, req->logical_index, req->generation, test_diag_rss_kb());
+#endif
     uint16_t * pixels = NULL;
     song_row_t song;
     if (metadata_db_get_song_by_id(req->song_id, &song))
@@ -1266,6 +1343,12 @@ static void * album_thumbnail_thread_func(void * arg) {
     album_thumbnail_result_pixels = (uint8_t *) pixels;
     free(req);
     album_thumbnail_done = true;
+#ifdef TEST_BUILD_TAG
+    TEST_DIAG("ART_LAZY", "decode_end song=%lld row=%d art=%d elapsed_ms=%llu rss_kb=%ld",
+              (long long) album_thumbnail_result_song_id, album_thumbnail_result_logical_index,
+              album_thumbnail_result_pixels != NULL,
+              (unsigned long long) (test_diag_now_ms() - started_ms), test_diag_rss_kb());
+#endif
 #ifdef UI_PERF_TRACE
     printf("PERF album_thumb song=%lld total_us=%llu pixels=%d\n",
            (long long) album_thumbnail_result_song_id,
@@ -1288,6 +1371,12 @@ static void * album_thumbnail_thread_func(void * arg) {
 
 static void * album_thumb_gen_thread_func(void * arg) {
     int my_generation = (int) (intptr_t) arg;
+#ifdef TEST_BUILD_TAG
+    uint64_t started_ms = test_diag_now_ms();
+    int generated = 0, cached = 0, missing = 0, failed = 0;
+    TEST_DIAG("ART_CACHE", "worker_begin generation=%d total=%d rss_kb=%ld", my_generation,
+              atomic_load(&album_thumb_gen_total_count), test_diag_rss_kb());
+#endif
 #ifdef UI_PERF_TRACE
     uint64_t perf_start_us = ui_perf_now_us();
     int perf_generated = 0, perf_skipped = 0, perf_missing = 0, perf_failed = 0;
@@ -1319,6 +1408,9 @@ static void * album_thumb_gen_thread_func(void * arg) {
 
             song_row_t song;
             if (!metadata_db_get_song_by_id(rows[i].first_song_id, &song)) {
+#ifdef TEST_BUILD_TAG
+                missing++;
+#endif
 #ifdef UI_PERF_TRACE
                 perf_missing++;
 #endif
@@ -1333,6 +1425,9 @@ static void * album_thumb_gen_thread_func(void * arg) {
 
             artwork_fail_reason_t fail_reason;
             if (artwork_failure_cache_is_blocked(song.id, source_mtime, &fail_reason)) {
+#ifdef TEST_BUILD_TAG
+                failed++;
+#endif
 #ifdef UI_PERF_TRACE
                 perf_skipped++;
 #endif
@@ -1342,6 +1437,9 @@ static void * album_thumb_gen_thread_func(void * arg) {
 
             char found[PATH_MAX];
             if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found))) {
+#ifdef TEST_BUILD_TAG
+                cached++;
+#endif
 #ifdef UI_PERF_TRACE
                 perf_skipped++;
 #endif
@@ -1353,12 +1451,24 @@ static void * album_thumb_gen_thread_func(void * arg) {
             album_thumbnail_load_or_decode_ex(&song, ARTWORK_PRIO_WARMER,
                                               album_thumb_gen_cancel_cb, (void *) (intptr_t) my_generation,
                                               &pixels);
+#ifdef TEST_BUILD_TAG
+            if (pixels) generated++; else failed++;
+#endif
 
 #ifdef UI_PERF_TRACE
             if (pixels) perf_generated++; else perf_failed++;
 #endif
             free(pixels);
             atomic_fetch_add(&album_thumb_gen_done_count, 1);
+
+#ifdef TEST_BUILD_TAG
+            int diag_done = atomic_load(&album_thumb_gen_done_count);
+            if ((diag_done % 50) == 0) {
+                TEST_DIAG("ART_CACHE", "progress done=%d total=%d generated=%d cached=%d missing=%d failed=%d elapsed_ms=%llu rss_kb=%ld",
+                          diag_done, atomic_load(&album_thumb_gen_total_count), generated, cached, missing, failed,
+                          (unsigned long long) (test_diag_now_ms() - started_ms), test_diag_rss_kb());
+            }
+#endif
 
             /* Yield between albums to avoid heating up CPU */
             usleep(ALBUM_THUMB_GEN_INTER_ALBUM_US);
@@ -1373,6 +1483,12 @@ static void * album_thumb_gen_thread_func(void * arg) {
         }
     }
 done:
+#ifdef TEST_BUILD_TAG
+    TEST_DIAG("ART_CACHE", "worker_end generation=%d done=%d total=%d generated=%d cached=%d missing=%d failed=%d cancelled=%d elapsed_ms=%llu rss_kb=%ld",
+              my_generation, atomic_load(&album_thumb_gen_done_count), atomic_load(&album_thumb_gen_total_count),
+              generated, cached, missing, failed, (int) album_thumb_gen_should_cancel(my_generation),
+              (unsigned long long) (test_diag_now_ms() - started_ms), test_diag_rss_kb());
+#endif
 #ifdef UI_PERF_TRACE
     printf("PERF album_thumb_gen done=%d generated=%d skipped=%d missing=%d failed=%d us=%llu cancelled=%d\n",
            atomic_load(&album_thumb_gen_done_count), perf_generated, perf_skipped, perf_missing, perf_failed,
@@ -1402,9 +1518,12 @@ static void start_album_thumbnail_generation(void) {
     atomic_store(&album_thumb_gen_cancel, false);
     int generation = atomic_fetch_add(&album_thumb_gen_generation, 1) + 1;
     atomic_store(&album_thumb_gen_active, true);
+    TEST_DIAG("ART_CACHE", "start generation=%d albums=%d warm_limit=%d rss_kb=%ld",
+              generation, album_count, ALBUM_THUMB_GEN_WARM_LIMIT, test_diag_rss_kb());
     if (pthread_create(&album_thumb_gen_thread, NULL, album_thumb_gen_thread_func,
                         (void *) (intptr_t) generation) != 0) {
         atomic_store(&album_thumb_gen_active, false);
+        TEST_DIAG("ART_CACHE", "thread_create_failed generation=%d", generation);
     } else {
         album_thumb_gen_thread_joinable = true;
     }
@@ -1430,6 +1549,9 @@ static void start_next_album_thumbnail(void) {
             sizeof(album_thumbnail_queue[0]) * (size_t) (--album_thumbnail_queue_count));
     album_thumbnail_done = false;
     album_thumbnail_active = true;
+#ifdef TEST_BUILD_TAG
+    album_lazy_job_started_ms = test_diag_now_ms();
+#endif
     if (pthread_create(&album_thumbnail_thread, NULL, album_thumbnail_thread_func, req) != 0) {
         album_thumbnail_active = false;
         free(req);
@@ -1450,6 +1572,11 @@ static void queue_album_thumbnail(lv_obj_t * list, int logical_index, int64_t so
         .logical_index = logical_index,
         .list = list
     };
+#ifdef TEST_BUILD_TAG
+    album_lazy_queued++;
+    TEST_DIAG("ART_LAZY", "queued song=%lld row=%d queue_depth=%d generation=%d",
+              (long long) song_id, logical_index, album_thumbnail_queue_count, album_thumbnail_generation);
+#endif
     start_next_album_thumbnail();
 }
 
@@ -1475,6 +1602,14 @@ static void album_thumbnail_begin_screen(lv_obj_t * list) {
     album_thumbnail_active_list = list;
     album_thumbnail_scrolling = false;
     album_thumbnail_queue_count = 0;
+#ifdef TEST_BUILD_TAG
+    album_lazy_queued = album_lazy_completed = album_lazy_with_art = album_lazy_stale = 0;
+    const char * diag_page = list == albums_list ? "albums" : "artist_albums";
+    TEST_DIAG("ALBUMS_PAGE", "loaded page=%s request_to_loaded_ms=%llu rss_kb=%ld", diag_page,
+              albums_page_open_requested_ms ? (unsigned long long) (test_diag_now_ms() - albums_page_open_requested_ms) : 0ULL,
+              test_diag_rss_kb());
+    albums_page_open_requested_ms = 0;
+#endif
     if (list) compact_list_refresh_visible(list);
 }
 
@@ -1484,6 +1619,11 @@ static void album_thumbnail_end_screen(lv_obj_t * list) {
     album_thumbnail_active_list = NULL;
     album_thumbnail_scrolling = false;
     album_thumbnail_queue_count = 0;
+#ifdef TEST_BUILD_TAG
+    TEST_DIAG("ALBUMS_PAGE", "unloaded page=%s queued=%u completed=%u with_art=%u stale=%u rss_kb=%ld",
+              list == albums_list ? "albums" : "artist_albums", album_lazy_queued, album_lazy_completed,
+              album_lazy_with_art, album_lazy_stale, test_diag_rss_kb());
+#endif
     /* Codec work cannot safely be cancelled. Invalidate and discard it
      * when it completes rather than ever repainting a hidden screen. */
     album_thumbnail_generation++;
@@ -1500,6 +1640,9 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
     album_thumbnail_active = false;
 
     bool result_applied = false;
+#ifdef TEST_BUILD_TAG
+    bool result_had_art = album_thumbnail_result_pixels != NULL;
+#endif
     if (album_thumbnail_result_generation == album_thumbnail_generation &&
         album_thumbnail_active_list && album_thumbnail_list_is_visible(album_thumbnail_active_list)) {
         int victim = -1;
@@ -1544,6 +1687,15 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
         album_thumbnail_result_pixels = NULL;
         result_applied = true;
     }
+#ifdef TEST_BUILD_TAG
+    album_lazy_completed++;
+    if (result_had_art) album_lazy_with_art++;
+    if (!result_applied) album_lazy_stale++;
+    TEST_DIAG("ART_LAZY", "result song=%lld row=%d applied=%d art=%d queue_depth=%d ui_wait_ms=%llu",
+              (long long) album_thumbnail_result_song_id, album_thumbnail_result_logical_index,
+              result_applied, result_had_art, album_thumbnail_queue_count,
+              album_lazy_job_started_ms ? (unsigned long long) (test_diag_now_ms() - album_lazy_job_started_ms) : 0ULL);
+#endif
     free(album_thumbnail_result_pixels);
     album_thumbnail_result_pixels = NULL;
     if (result_applied && album_thumbnail_result_list == album_thumbnail_active_list)
@@ -2993,7 +3145,16 @@ static atomic_bool library_rescan_done_flag = false;
 
 static void * library_rescan_thread_func(void * arg) {
     (void) arg;
+#ifdef TEST_BUILD_TAG
+    uint64_t started_ms = test_diag_now_ms();
+    TEST_DIAG("DB", "rescan_thread_begin rss_kb=%ld", test_diag_rss_kb());
+#endif
     library_scan_once();
+#ifdef TEST_BUILD_TAG
+    TEST_DIAG("DB", "rescan_thread_end songs=%lld elapsed_ms=%llu rss_kb=%ld",
+              (long long) metadata_db_get_song_count(), (unsigned long long) (test_diag_now_ms() - started_ms),
+              test_diag_rss_kb());
+#endif
     atomic_store_explicit(&library_rescan_done_flag, true, memory_order_release); /* written last -- update_timer_cb only checks this flag */
     return NULL;
 }
@@ -3007,6 +3168,8 @@ void start_library_rescan(void) {
      * stomping the single library_rescan_thread handle -- undefined
      * behavior, not just wasted work. */
     if (library_rescan_active) return;
+    TEST_DIAG("DB", "rescan_requested existing_songs=%lld rss_kb=%ld",
+              (long long) metadata_db_get_song_count(), test_diag_rss_kb());
     /* A previous scan's own post-scan thumbnail-generation pass (Task 2)
      * might still be running -- signal it to stop now rather than let it
      * keep working against data this new scan is about to make stale.
@@ -3767,6 +3930,14 @@ static void artists_tile_cb(lv_event_t * e) {
 
 static void albums_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+#ifdef TEST_BUILD_TAG
+    int artist_count = 0, album_artist_count = 0, album_count = 0;
+    metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
+    albums_page_open_requested_ms = test_diag_now_ms();
+    TEST_DIAG("ALBUMS_PAGE", "open_requested albums=%d cache_worker_active=%d lazy_active=%d rss_kb=%ld",
+              album_count, (int) atomic_load(&album_thumb_gen_active), (int) album_thumbnail_active,
+              test_diag_rss_kb());
+#endif
     nav_push(albums_screen);
 }
 
@@ -4235,24 +4406,55 @@ static void rescan_playlists(void) {
 
 
 void library_scan_once(void) {
+#ifdef TEST_BUILD_TAG
+    uint64_t scan_started_ms = test_diag_now_ms();
+    uint64_t phase_started_ms = scan_started_ms;
+#endif
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
 
+    TEST_DIAG("DB", "scan_begin root=%s rss_kb=%ld", MUSIC_ROOT_DIR, test_diag_rss_kb());
     metadata_db_open();
+    TEST_DIAG("DB", "db_open elapsed_ms=%llu songs=%lld rss_kb=%ld",
+              (unsigned long long) (test_diag_now_ms() - phase_started_ms), (long long) metadata_db_get_song_count(),
+              test_diag_rss_kb());
+#ifdef TEST_BUILD_TAG
+    phase_started_ms = test_diag_now_ms();
+#endif
     gui_books_rescan();
+    TEST_DIAG("DB", "books_scan_end elapsed_ms=%llu rss_kb=%ld",
+              (unsigned long long) (test_diag_now_ms() - phase_started_ms), test_diag_rss_kb());
+#ifdef TEST_BUILD_TAG
+    phase_started_ms = test_diag_now_ms();
+#endif
     rescan_playlists();
+    TEST_DIAG("DB", "playlists_scan_end elapsed_ms=%llu rss_kb=%ld",
+              (unsigned long long) (test_diag_now_ms() - phase_started_ms), test_diag_rss_kb());
 
     char spool_path[PATH_MAX] = {0};
     int discovered_count = 0;
+#ifdef TEST_BUILD_TAG
+    phase_started_ms = test_diag_now_ms();
+#endif
     if (!scan_all_songs_with_timeout(MUSIC_ROOT_DIR, spool_path, sizeof(spool_path), &discovered_count)) {
+        TEST_DIAG("DB", "discover_failed elapsed_ms=%llu rss_kb=%ld",
+                  (unsigned long long) (test_diag_now_ms() - phase_started_ms), test_diag_rss_kb());
         return; /* preserve the last known-good in-memory + on-disk library */
     }
+    TEST_DIAG("DB", "discover_end files=%d elapsed_ms=%llu spool=%s rss_kb=%ld",
+              discovered_count, (unsigned long long) (test_diag_now_ms() - phase_started_ms),
+              spool_path, test_diag_rss_kb());
 
     library_scan_progress_total = discovered_count;
+#ifdef TEST_BUILD_TAG
+    phase_started_ms = test_diag_now_ms();
+#endif
     metadata_db_begin_update();
+    TEST_DIAG("DB", "update_begin files=%d rss_kb=%ld", discovered_count, test_diag_rss_kb());
 
     FILE * spool = fopen(spool_path, "rb");
     if (!spool) {
+        TEST_DIAG("DB", "spool_open_failed path=%s", spool_path);
         metadata_db_abort_update();
         remove(spool_path);
         return;
@@ -4266,21 +4468,49 @@ void library_scan_once(void) {
             complete = false;
             break;
         }
-        if (path[0] != '\0') scan_one_song_into_db(path);
+        if (path[0] != '\0') {
+#ifdef TEST_BUILD_TAG
+            uint64_t file_started_ms = test_diag_now_ms();
+#endif
+            scan_one_song_into_db(path);
+#ifdef TEST_BUILD_TAG
+            uint64_t file_ms = test_diag_now_ms() - file_started_ms;
+            if (file_ms >= 250)
+                TEST_DIAG("DB", "slow_file index=%d elapsed_ms=%llu path=%s", done,
+                          (unsigned long long) file_ms, path);
+#endif
+        }
         library_scan_progress_done = ++done;
+#ifdef TEST_BUILD_TAG
+        if ((done % 1000) == 0 || done == discovered_count)
+            TEST_DIAG("DB", "tag_progress done=%d total=%d elapsed_ms=%llu rss_kb=%ld",
+                      done, discovered_count, (unsigned long long) (test_diag_now_ms() - phase_started_ms),
+                      test_diag_rss_kb());
+#endif
     }
     fclose(spool);
     remove(spool_path);
 
     if (!complete) {
+        TEST_DIAG("DB", "spool_read_incomplete done=%d total=%d", done, discovered_count);
         metadata_db_abort_update();
         return;
     }
 
-    if (!metadata_db_end_update())
+    bool committed = metadata_db_end_update();
+    if (!committed)
         fprintf(stderr, "Warning: music database commit failed -- keeping last on-disk library\n");
+    TEST_DIAG("DB", "commit_end ok=%d files=%d elapsed_ms=%llu songs=%lld rss_kb=%ld", committed,
+              done, (unsigned long long) (test_diag_now_ms() - phase_started_ms),
+              (long long) metadata_db_get_song_count(), test_diag_rss_kb());
 
+#ifdef TEST_BUILD_TAG
+    phase_started_ms = test_diag_now_ms();
+#endif
     library_load_from_cache_only();
+    TEST_DIAG("DB", "reload_end songs=%lld elapsed_ms=%llu total_ms=%llu rss_kb=%ld",
+              (long long) metadata_db_get_song_count(), (unsigned long long) (test_diag_now_ms() - phase_started_ms),
+              (unsigned long long) (test_diag_now_ms() - scan_started_ms), test_diag_rss_kb());
 }
 
 /* Boot-time equivalent of library_scan_once() above (still used verbatim

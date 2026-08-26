@@ -85,6 +85,7 @@ int tagcache_album_song_ids(const char * album, const char * album_artist, int o
 
 void tagcache_set_rating(const char * path, int32_t rating);
 void tagcache_add_play(const char * path, int32_t now);
+void tagcache_flush_numeric(void);
 /* RAM-only overlay used when migrating sidecar stats onto a just-upserted
  * scan row. Persisted by the following end_update write. */
 void tagcache_overlay_stats(const char * path, int32_t rating, int32_t playcount, int32_t last_played);

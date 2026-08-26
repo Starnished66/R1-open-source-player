@@ -1,4 +1,5 @@
 #include "metadata_db.h"
+#include "tagcache.h"
 #include "utf8_util.h"
 
 #include <stdio.h>
@@ -283,6 +284,249 @@ int main(void) {
         }
         metadata_db_open();
         if (metadata_db_get_song_count() != 0) fail("corrupt db should present empty library");
+    }
+
+    /* Test Batched Asynchronous Numeric Update Coalescing and Persistence */
+    {
+        metadata_db_close();
+        snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
+        if (system(cmd) != 0) fail("setup numeric test");
+        if (chdir(dir) != 0) fail("chdir numeric test");
+        metadata_db_open();
+        cached_tags_t t = { 0 };
+        snprintf(t.title, sizeof(t.title), "Song 1");
+        snprintf(t.artist, sizeof(t.artist), "Artist 1");
+        snprintf(t.album, sizeof(t.album), "Album 1");
+        metadata_db_begin_update();
+        metadata_db_put("/music/track1.flac", 100, 1000, &t);
+        metadata_db_end_update();
+
+        /* Set favorite & rating */
+        metadata_db_song_favorite_set("/music/track1.flac", true);
+        if (!metadata_db_song_favorite_is_set("/music/track1.flac")) fail("immediate favorite RAM hit");
+
+        /* Increment playcount multiple times (coalescing) */
+        for (int i = 0; i < 5; i++) {
+            metadata_db_song_play_count_increment("/music/track1.flac");
+        }
+
+        /* Flush and verify on disk after reload */
+        tagcache_flush_numeric();
+        metadata_db_close();
+        metadata_db_open();
+
+        if (!metadata_db_song_favorite_is_set("/music/track1.flac")) fail("favorite persisted to disk");
+        char ** top = NULL;
+        int top_n = 0;
+        metadata_db_load_top_played_songs(5, &top, &top_n);
+        if (top_n != 1 || strcmp(top[0], "/music/track1.flac") != 0) fail("playcount persisted to disk");
+        free(top[0]);
+        free(top);
+
+        /* Test queue saturation: 100 rapid numeric updates across songs */
+        metadata_db_begin_update();
+        for (int i = 0; i < 80; i++) {
+            char p[64], tit[64];
+            snprintf(p, sizeof(p), "/music/batch_%d.flac", i);
+            snprintf(tit, sizeof(tit), "Batch Song %d", i);
+            snprintf(t.title, sizeof(t.title), "%s", tit);
+            metadata_db_put(p, 100, 1000, &t);
+        }
+        metadata_db_end_update();
+
+        for (int i = 0; i < 80; i++) {
+            char p[64];
+            snprintf(p, sizeof(p), "/music/batch_%d.flac", i);
+            metadata_db_song_favorite_set(p, true);
+        }
+        tagcache_flush_numeric();
+        metadata_db_close();
+        metadata_db_open();
+        for (int i = 0; i < 80; i++) {
+            char p[64];
+            snprintf(p, sizeof(p), "/music/batch_%d.flac", i);
+            if (!metadata_db_song_favorite_is_set(p)) fail("batch favorite persistence");
+        }
+    }
+
+    /* Test Non-NUL Terminated String Corruption Guard */
+    {
+        metadata_db_close();
+        snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
+        if (system(cmd) != 0) fail("setup non-nul test");
+        if (chdir(dir) != 0) fail("chdir non-nul test");
+        metadata_db_open();
+        cached_tags_t t = { 0 };
+        snprintf(t.title, sizeof(t.title), "Valid Title");
+        snprintf(t.artist, sizeof(t.artist), "Valid Artist");
+        snprintf(t.album, sizeof(t.album), "Valid Album");
+        metadata_db_begin_update();
+        metadata_db_put("/music/valid.flac", 100, 1000, &t);
+        metadata_db_end_update();
+        metadata_db_close();
+
+        /* Corrupt the title tag file so its string is not NUL-terminated */
+        FILE * gen_file = fopen(".open_hiby_player/tagcache.gen", "r");
+        int gen = 0;
+        if (gen_file && fscanf(gen_file, "%d", &gen) == 1 && gen > 0) {
+            fclose(gen_file);
+            char title_path[128];
+            snprintf(title_path, sizeof(title_path), ".open_hiby_player/database_3.tcd.g%d", gen);
+            FILE * tf = fopen(title_path, "r+b");
+            if (tf) {
+                fseek(tf, -1, SEEK_END);
+                fputc('X', tf); /* Replace \0 with 'X' */
+                fclose(tf);
+            }
+            metadata_db_open();
+            if (metadata_db_get_song_count() != 0) fail("non-nul string must be rejected");
+        }
+    }
+
+    /* Test Memory Budget Exhaustion Guard */
+    {
+        metadata_db_close();
+        snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
+        if (system(cmd) != 0) fail("setup mem budget test");
+        if (chdir(dir) != 0) fail("chdir mem budget test");
+        metadata_db_open();
+        cached_tags_t t = { 0 };
+        snprintf(t.title, sizeof(t.title), "Song A");
+        snprintf(t.artist, sizeof(t.artist), "Artist A");
+        snprintf(t.album, sizeof(t.album), "Album A");
+        metadata_db_begin_update();
+        metadata_db_put("/music/a.flac", 100, 1000, &t);
+        metadata_db_end_update();
+        if (metadata_db_get_song_count() != 1) fail("initial load count");
+
+        /* Set memory limit to 1KB so next rebuild fails budget */
+        setenv("TAGCACHE_TEST_MEM_AVAILABLE", "1024", 1);
+        metadata_db_begin_update();
+        snprintf(t.title, sizeof(t.title), "Song B");
+        metadata_db_put("/music/b.flac", 100, 1000, &t);
+        bool res = metadata_db_end_update();
+        if (res) fail("rebuild should fail under strict memory budget");
+        unsetenv("TAGCACHE_TEST_MEM_AVAILABLE");
+        metadata_db_close();
+        metadata_db_open();
+        if (metadata_db_get_song_count() != 1) fail("clean recovery of previous valid generation after budget abort");
+    }
+
+    /* Synthetic Scaled Database Test (5,000 tracks across 150 artists and 300 albums) */
+    {
+        metadata_db_close();
+        snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
+        if (system(cmd) != 0) fail("setup 5k scaling test");
+        if (chdir(dir) != 0) fail("chdir 5k scaling test");
+        metadata_db_open();
+        metadata_db_begin_update();
+        for (int i = 0; i < 5000; i++) {
+            cached_tags_t t = { 0 };
+            snprintf(t.title, sizeof(t.title), "Title %05d", i);
+            snprintf(t.artist, sizeof(t.artist), "Artist %03d", i % 150);
+            snprintf(t.album, sizeof(t.album), "Album %03d", i % 300);
+            snprintf(t.album_artist, sizeof(t.album_artist), "Artist %03d", i % 150);
+            snprintf(t.genre, sizeof(t.genre), "Genre %d", i % 10);
+            t.track_number = (i % 15) + 1;
+            t.disc_number = 1;
+            char p[128];
+            snprintf(p, sizeof(p), "/music/artist_%03d/album_%03d/track_%05d.flac", i % 150, i % 300, i);
+            metadata_db_put(p, 100 + i, 10000 + i, &t);
+        }
+        if (!metadata_db_end_update()) fail("5k commit");
+        if (metadata_db_get_song_count() != 5000) fail("5k song count");
+
+        int art = 0, aa = 0, alb = 0;
+        metadata_db_get_group_counts(&art, &aa, &alb);
+        if (art != 150) fail("5k artist count");
+        if (alb != 300) fail("5k album count");
+
+        song_row_t page[16];
+        int pn = metadata_db_get_songs_page(NULL, 0, 16, page);
+        if (pn != 16) fail("5k page fetch");
+        if (strcmp(page[0].tags.title, "Title 00000") != 0) fail("5k title sort order");
+
+        metadata_db_close();
+        metadata_db_open();
+        if (metadata_db_get_song_count() != 5000) fail("5k reload count");
+    }
+
+    /* Test Negative Header datasize Rejection Guard */
+    {
+        metadata_db_close();
+        snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
+        if (system(cmd) != 0) fail("setup negative datasize test");
+        if (chdir(dir) != 0) fail("chdir negative datasize test");
+        metadata_db_open();
+        cached_tags_t t = { 0 };
+        snprintf(t.title, sizeof(t.title), "Song Valid");
+        snprintf(t.artist, sizeof(t.artist), "Artist Valid");
+        snprintf(t.album, sizeof(t.album), "Album Valid");
+        metadata_db_begin_update();
+        metadata_db_put("/music/valid.flac", 100, 1000, &t);
+        metadata_db_end_update();
+        metadata_db_close();
+
+        /* Corrupt master header datasize to -1 */
+        FILE * gen_file = fopen(".open_hiby_player/tagcache.gen", "r");
+        int gen = 0;
+        if (gen_file && fscanf(gen_file, "%d", &gen) == 1 && gen > 0) {
+            fclose(gen_file);
+            char master_path[128];
+            snprintf(master_path, sizeof(master_path), ".open_hiby_player/database_idx.tcd.g%d", gen);
+            FILE * mf = fopen(master_path, "r+b");
+            if (mf) {
+                int32_t neg_val = -1;
+                /* struct master_header { struct tagcache_header { magic, datasize, entry_count } } */
+                fseek(mf, (long) sizeof(int32_t), SEEK_SET); /* Seek to datasize */
+                fwrite(&neg_val, sizeof(int32_t), 1, mf);
+                fclose(mf);
+            }
+            metadata_db_open();
+            if (metadata_db_get_song_count() != 0) fail("negative master datasize must be rejected");
+        }
+    }
+
+    /* Test Degraded Synchronous Numeric Fallback when Worker Thread Cannot Start */
+    {
+        metadata_db_close();
+        snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
+        if (system(cmd) != 0) fail("setup worker failure test");
+        if (chdir(dir) != 0) fail("chdir worker failure test");
+
+        /* Simulate thread creation failure */
+        setenv("TAGCACHE_TEST_DISABLE_NUMERIC_WORKER", "1", 1);
+        metadata_db_open();
+        cached_tags_t t = { 0 };
+        metadata_db_begin_update();
+        for (int i = 0; i < 80; i++) {
+            char p[64], tit[64];
+            snprintf(p, sizeof(p), "/music/degraded_%d.flac", i);
+            snprintf(tit, sizeof(tit), "Degraded %d", i);
+            snprintf(t.title, sizeof(t.title), "%s", tit);
+            metadata_db_put(p, 100, 1000, &t);
+        }
+        metadata_db_end_update();
+
+        /* Update 80 items without background thread (must not deadlock at 64 items) */
+        for (int i = 0; i < 80; i++) {
+            char p[64];
+            snprintf(p, sizeof(p), "/music/degraded_%d.flac", i);
+            metadata_db_song_favorite_set(p, true);
+            metadata_db_song_play_count_increment(p);
+        }
+
+        metadata_db_close();
+        unsetenv("TAGCACHE_TEST_DISABLE_NUMERIC_WORKER");
+
+        /* Reopen normally and verify all 80 items were persisted to disk */
+        metadata_db_open();
+        if (metadata_db_get_song_count() != 80) fail("degraded reload count");
+        for (int i = 0; i < 80; i++) {
+            char p[64];
+            snprintf(p, sizeof(p), "/music/degraded_%d.flac", i);
+            if (!metadata_db_song_favorite_is_set(p)) fail("degraded favorite persistence");
+        }
     }
 
     metadata_db_close();

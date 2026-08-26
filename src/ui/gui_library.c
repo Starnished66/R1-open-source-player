@@ -43,6 +43,8 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include <time.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <sched.h>
+#include <sys/resource.h>
 
 #ifdef TEST_BUILD_TAG
 #ifdef HOST_BUILD
@@ -3145,6 +3147,11 @@ static atomic_bool library_rescan_done_flag = false;
 
 static void * library_rescan_thread_func(void * arg) {
     (void) arg;
+#ifdef __linux__
+    struct sched_param sp = { 0 };
+    sched_setscheduler(0, SCHED_BATCH, &sp);
+    setpriority(PRIO_PROCESS, 0, 5);
+#endif
 #ifdef TEST_BUILD_TAG
     uint64_t started_ms = test_diag_now_ms();
     TEST_DIAG("DB", "rescan_thread_begin rss_kb=%ld", test_diag_rss_kb());

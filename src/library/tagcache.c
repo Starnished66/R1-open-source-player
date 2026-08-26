@@ -19,12 +19,16 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -174,6 +178,113 @@ static const char * map_title;
 static size_t map_title_len;
 static int32_t * loaded_title_order;
 static int32_t loaded_title_n;
+
+/* Checked arithmetic helpers for safe allocation & memory estimation */
+static inline bool checked_add_size(size_t a, size_t b, size_t * out) {
+    if (SIZE_MAX - a < b) return false;
+    *out = a + b;
+    return true;
+}
+
+static inline bool checked_mul_size(size_t a, size_t b, size_t * out) {
+    if (a != 0 && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+
+static inline bool checked_grow_cap(size_t cur, size_t need, size_t max_cap, size_t * out_cap) {
+    if (need > max_cap) return false;
+    if (cur >= need) {
+        *out_cap = cur;
+        return true;
+    }
+    size_t cap = cur ? cur : 64;
+    while (cap < need) {
+        if (cap > max_cap / 2) {
+            cap = max_cap;
+            break;
+        }
+        cap *= 2;
+    }
+    *out_cap = cap;
+    return true;
+}
+
+static uint64_t get_mem_available(void) {
+    const char * env_override = getenv("TAGCACHE_TEST_MEM_AVAILABLE");
+    if (env_override) {
+        unsigned long long val = 0;
+        if (sscanf(env_override, "%llu", &val) == 1) return (uint64_t) val;
+    }
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return UINT64_MAX;
+    char line[128];
+    uint64_t avail_kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %" SCNu64 " kB", &avail_kb) == 1) break;
+    }
+    fclose(f);
+    if (avail_kb == 0) return UINT64_MAX;
+    return avail_kb * 1024ull;
+}
+
+static uint64_t estimate_rebuild_memory(int32_t total_ents, int32_t live_ents) {
+    size_t total = 0, part = 0;
+    if (total_ents < 0 || live_ents < 0) return UINT64_MAX;
+    if (!checked_mul_size((size_t) live_ents, sizeof(int32_t) * 2, &part) ||
+        !checked_add_size(total, part, &total)) return UINT64_MAX;
+    if (!checked_mul_size((size_t) total_ents, sizeof(int32_t) * 2, &part) ||
+        !checked_add_size(total, part, &total)) return UINT64_MAX;
+    size_t hash_cap = 64;
+    size_t hash_need = (size_t) (total_ents + 1) * 2;
+    while (hash_cap < hash_need && hash_cap <= TAGCACHE_MAX_ENTRIES * 2) hash_cap *= 2;
+    if (!checked_mul_size(hash_cap, sizeof(int32_t), &part) ||
+        !checked_add_size(total, part, &total)) return UINT64_MAX;
+    size_t group_overhead = (sizeof(group_t) * (size_t) (live_ents > 0 ? live_ents : 1)) +
+                            (sizeof(int32_t) * (size_t) live_ents) + 65536;
+    if (!checked_mul_size(group_overhead, 3, &part) ||
+        !checked_add_size(total, part, &total)) return UINT64_MAX;
+    return (uint64_t) total;
+}
+
+#ifdef TEST_BUILD_TAG
+#define TC_TIME_START(name) struct timespec _tstart_##name; clock_gettime(CLOCK_MONOTONIC, &_tstart_##name)
+#define TC_TIME_END(name, desc) do { \
+    struct timespec _tend_##name; \
+    clock_gettime(CLOCK_MONOTONIC, &_tend_##name); \
+    long _ms = (_tend_##name.tv_sec - _tstart_##name.tv_sec) * 1000 + (_tend_##name.tv_nsec - _tstart_##name.tv_nsec) / 1000000; \
+    fprintf(stderr, "tagcache_diag: %s took %ld ms\n", desc, _ms); \
+} while(0)
+#else
+#define TC_TIME_START(name) do {} while(0)
+#define TC_TIME_END(name, desc) do {} while(0)
+#endif
+
+#define NUMERIC_QUEUE_CAP 64
+#define NUMERIC_COMMIT_DELAY_SEC 2
+
+typedef struct {
+    int32_t gen;
+    int32_t slot;
+    int32_t mtime;
+    int32_t size;
+    int32_t first_seen;
+    int32_t playcount;
+    int32_t last_played;
+    int32_t rating;
+    int32_t disc_number;
+    int32_t track_number;
+    int32_t flag;
+} numeric_update_t;
+
+static numeric_update_t numeric_queue[NUMERIC_QUEUE_CAP];
+static int numeric_queue_count = 0;
+static pthread_mutex_t numeric_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t numeric_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t numeric_drain_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t numeric_thread;
+static bool numeric_thread_running = false;
+static bool numeric_shutdown = false;
 
 static uint32_t fnv1a(const char * s, size_t n) {
     if (!s) return 0;
@@ -585,23 +696,21 @@ static void drop_derived_indexes_before_rebuild(void) {
     free_groups();
 }
 
-typedef struct gmap {
+typedef struct group_node {
     const char * a;
     const char * b;
     int count;
-    int cap;
+    int group_idx;
     int32_t first;
-    int32_t * slots;
-    struct gmap * next;
-} gmap_t;
+    struct group_node * next;
+} group_node_t;
 
-static void gmap_free_table(gmap_t ** map, int buckets) {
+static void group_node_free_table(group_node_t ** map, int buckets) {
     if (!map) return;
     for (int s = 0; s < buckets; s++) {
-        gmap_t * it = map[s];
+        group_node_t * it = map[s];
         while (it) {
-            gmap_t * n = it->next;
-            free(it->slots);
+            group_node_t * n = it->next;
             free(it);
             it = n;
         }
@@ -610,9 +719,18 @@ static void gmap_free_table(gmap_t ** map, int buckets) {
 }
 
 static bool rebuild_indexes(void) {
+    TC_TIME_START(rebuild);
     int32_t new_live = 0;
     for (int32_t i = 0; i < ent_count; i++) {
         if (!(ents[i].flag & FLAG_DELETED)) new_live++;
+    }
+
+    uint64_t mem_avail = get_mem_available();
+    uint64_t mem_needed = estimate_rebuild_memory(ent_count, new_live);
+    if (mem_needed == UINT64_MAX || (mem_avail != UINT64_MAX && mem_avail < mem_needed + TAGCACHE_RAM_RESERVE)) {
+        fprintf(stderr, "tagcache: rebuild_indexes rejected -- insufficient memory (avail=%" PRIu64 ", need=%" PRIu64 ", reserve=%" PRIu64 ")\n",
+                mem_avail, mem_needed, (uint64_t) TAGCACHE_RAM_RESERVE);
+        return false;
     }
 
     int32_t * new_title = NULL;
@@ -665,6 +783,7 @@ static bool rebuild_indexes(void) {
         nlive++;
     }
     if (nlive > 0) {
+        TC_TIME_START(sort_title_recency);
         if (loaded_title_order && loaded_title_n == nlive) {
             memcpy(new_title, loaded_title_order, sizeof(int32_t) * (size_t) nlive);
             free(loaded_title_order);
@@ -674,6 +793,7 @@ static bool rebuild_indexes(void) {
             qsort(new_title, (size_t) nlive, sizeof(int32_t), cmp_title);
         }
         qsort(new_recency, (size_t) nlive, sizeof(int32_t), cmp_recency);
+        TC_TIME_END(sort_title_recency, "title and recency sort");
     }
 
     const int buckets = 4096;
@@ -681,13 +801,15 @@ static bool rebuild_indexes(void) {
     int new_n[3] = { 0 };
     bool ok = true;
     for (int kind = 0; kind < 3 && ok; kind++) {
-        gmap_t ** map = calloc((size_t) buckets, sizeof(*map));
+        TC_TIME_START(group_kind);
+        group_node_t ** map = calloc((size_t) buckets, sizeof(*map));
         if (!map) {
             ok = false;
             break;
         }
         int unique = 0;
-        for (int32_t i = 0; i < ent_count && ok; i++) {
+        /* Pass 1: Count exact membership and unique groups */
+        for (int32_t i = 0; i < ent_count; i++) {
             if (ents[i].flag & FLAG_DELETED) continue;
             const char * a = "";
             const char * b = "";
@@ -699,7 +821,7 @@ static bool rebuild_indexes(void) {
             }
             uint32_t h = fnv1a(a, strlen(a)) ^ (fnv1a(b, strlen(b)) << 1);
             int slot = (int) (h & (uint32_t) (buckets - 1));
-            gmap_t * it = map[slot];
+            group_node_t * it = map[slot];
             while (it && (it->a != a || it->b != b)) it = it->next;
             if (!it) {
                 it = calloc(1, sizeof(*it));
@@ -710,56 +832,87 @@ static bool rebuild_indexes(void) {
                 it->a = a;
                 it->b = b;
                 it->first = i + 1;
+                it->group_idx = unique++;
                 it->next = map[slot];
                 map[slot] = it;
-                unique++;
             }
-            if (it->count >= it->cap) {
-                int cap = it->cap ? it->cap * 2 : 4;
-                int32_t * ns = realloc(it->slots, sizeof(*ns) * (size_t) cap);
-                if (!ns) {
-                    ok = false;
-                    break;
-                }
-                it->slots = ns;
-                it->cap = cap;
-            }
-            it->slots[it->count++] = i;
+            it->count++;
             if (i + 1 < it->first) it->first = i + 1;
         }
         if (!ok) {
-            gmap_free_table(map, buckets);
+            group_node_free_table(map, buckets);
             break;
         }
+
+        /* Contiguous Allocation: Allocate exact group array and exact per-group song lists */
         new_groups[kind] = calloc((size_t) (unique > 0 ? unique : 1), sizeof(group_t));
         if (!new_groups[kind]) {
-            gmap_free_table(map, buckets);
+            group_node_free_table(map, buckets);
             ok = false;
             break;
         }
-        int w = 0;
+        new_n[kind] = unique; /* Track unique immediately so cleanup will free any songs already allocated */
         for (int s = 0; s < buckets; s++) {
-            gmap_t * it = map[s];
-            while (it) {
-                gmap_t * next = it->next;
-                new_groups[kind][w].name = it->a;
-                new_groups[kind][w].album_artist = kind == TAGCACHE_GROUP_ALBUM ? it->b : "";
-                new_groups[kind][w].song_count = it->count;
-                new_groups[kind][w].first_song_id = it->first;
-                new_groups[kind][w].songs = it->slots;
-                it->slots = NULL;
-                if (kind == TAGCACHE_GROUP_ALBUM)
-                    qsort(new_groups[kind][w].songs, (size_t) it->count, sizeof(int32_t), cmp_slot_path);
-                else
-                    qsort(new_groups[kind][w].songs, (size_t) it->count, sizeof(int32_t), cmp_slot_album_path);
-                w++;
-                free(it);
-                it = next;
+            for (group_node_t * it = map[s]; it; it = it->next) {
+                int g = it->group_idx;
+                new_groups[kind][g].name = it->a;
+                new_groups[kind][g].album_artist = (kind == TAGCACHE_GROUP_ALBUM ? it->b : "");
+                new_groups[kind][g].song_count = it->count;
+                new_groups[kind][g].first_song_id = it->first;
+                if (it->count > 0) {
+                    new_groups[kind][g].songs = malloc(sizeof(int32_t) * (size_t) it->count);
+                    if (!new_groups[kind][g].songs) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (!ok) break;
+        }
+        if (!ok) {
+            group_node_free_table(map, buckets);
+            break;
+        }
+
+        /* Pass 2: Populate exact song slots */
+        int * write_pos = calloc((size_t) (unique > 0 ? unique : 1), sizeof(int));
+        if (!write_pos) {
+            group_node_free_table(map, buckets);
+            ok = false;
+            break;
+        }
+        for (int32_t i = 0; i < ent_count; i++) {
+            if (ents[i].flag & FLAG_DELETED) continue;
+            const char * a = "";
+            const char * b = "";
+            if (kind == TAGCACHE_GROUP_ARTIST) a = ents[i].artist ? ents[i].artist : "";
+            else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) a = ents[i].album_artist ? ents[i].album_artist : "";
+            else {
+                a = ents[i].album ? ents[i].album : "";
+                b = ents[i].album_artist ? ents[i].album_artist : "";
+            }
+            uint32_t h = fnv1a(a, strlen(a)) ^ (fnv1a(b, strlen(b)) << 1);
+            int slot = (int) (h & (uint32_t) (buckets - 1));
+            group_node_t * it = map[slot];
+            while (it && (it->a != a || it->b != b)) it = it->next;
+            if (it) {
+                int g = it->group_idx;
+                new_groups[kind][g].songs[write_pos[g]++] = i;
             }
         }
-        new_n[kind] = w;
-        qsort(new_groups[kind], (size_t) w, sizeof(group_t), cmp_group);
-        free(map);
+        free(write_pos);
+
+        /* Sort per-group song arrays and overall group array */
+        for (int g = 0; g < unique; g++) {
+            if (kind == TAGCACHE_GROUP_ALBUM)
+                qsort(new_groups[kind][g].songs, (size_t) new_groups[kind][g].song_count, sizeof(int32_t), cmp_slot_path);
+            else
+                qsort(new_groups[kind][g].songs, (size_t) new_groups[kind][g].song_count, sizeof(int32_t), cmp_slot_album_path);
+        }
+        qsort(new_groups[kind], (size_t) unique, sizeof(group_t), cmp_group);
+        new_n[kind] = unique;
+        group_node_free_table(map, buckets);
+        TC_TIME_END(group_kind, "group kind build");
     }
 
     int32_t * new_title_rank = NULL;
@@ -816,6 +969,7 @@ static bool rebuild_indexes(void) {
         groups[k] = new_groups[k];
         group_n[k] = new_n[k];
     }
+    TC_TIME_END(rebuild, "rebuild_indexes total");
     return true;
 }
 
@@ -1079,7 +1233,9 @@ static void snapshot_unique_seeks(int tag, int32_t * out) {
 }
 
 static bool write_all(void) {
+    TC_TIME_START(write_all);
     if (db_dir[0] == '\0') return false;
+    tagcache_flush_numeric();
     mkdir(db_dir, 0755);
 
     int32_t nslot = ent_count > 0 ? ent_count : 1;
@@ -1193,7 +1349,37 @@ static bool write_all(void) {
     free(album_seek_snap);
     free(genre_seek_snap);
     free(aa_seek_snap);
+    TC_TIME_END(write_all, "write_all total");
     return ok;
+}
+
+static bool validate_master_header(const struct master_header * mh, size_t file_size) {
+    if (!mh) return false;
+    if (mh->tch.magic != TAGCACHE_MAGIC) return false;
+    if (mh->dirty != 0) return false;
+    if (mh->tch.entry_count < 0 || mh->tch.entry_count > TAGCACHE_MAX_ENTRIES) return false;
+    if (mh->tch.datasize < 0) return false;
+    size_t payload_bytes = 0;
+    if (!checked_mul_size((size_t) mh->tch.entry_count, sizeof(struct index_entry), &payload_bytes)) return false;
+    size_t min_file_size = 0;
+    if (!checked_add_size(sizeof(struct master_header), payload_bytes, &min_file_size)) return false;
+    if (file_size < min_file_size) return false;
+    if (mh->tch.datasize > 0 && (size_t) mh->tch.datasize != payload_bytes) return false;
+    return true;
+}
+
+static bool validate_tag_header(const struct tagcache_header * hdr, size_t file_size) {
+    if (!hdr) return false;
+    if (hdr->magic != TAGCACHE_MAGIC) return false;
+    if (hdr->entry_count < 0 || hdr->entry_count > TAGCACHE_MAX_ENTRIES) return false;
+    if (hdr->datasize < 0) return false;
+    if (file_size < sizeof(struct tagcache_header)) return false;
+    if (hdr->datasize > 0) {
+        size_t min_size = 0;
+        if (!checked_add_size(sizeof(struct tagcache_header), (size_t) hdr->datasize, &min_size)) return false;
+        if (file_size < min_size) return false;
+    }
+    return true;
 }
 
 typedef struct {
@@ -1212,7 +1398,7 @@ static const char * lookup_seek(seek_str_t * map, int n, int32_t seek) {
     return NULL;
 }
 
-static bool load_tag_strings(int tag, int32_t gen, seek_str_t ** out_map, int * out_n, bool nocase) {
+static bool load_tag_strings(int tag, int32_t gen, seek_str_t ** out_map, int * out_n, bool nocase, int32_t master_count) {
     *out_map = NULL;
     *out_n = 0;
     char name[80], path[640];
@@ -1226,12 +1412,7 @@ static bool load_tag_strings(int tag, int32_t gen, seek_str_t ** out_map, int * 
         return false;
     }
     struct tagcache_header hdr;
-    if (!read_fully(fd, &hdr, sizeof(hdr)) || hdr.magic != TAGCACHE_MAGIC || hdr.entry_count < 0 ||
-        hdr.entry_count > TAGCACHE_MAX_ENTRIES) {
-        close(fd);
-        return false;
-    }
-    if ((uint64_t) st.st_size < sizeof(hdr)) {
+    if (!read_fully(fd, &hdr, sizeof(hdr)) || !validate_tag_header(&hdr, (size_t) st.st_size)) {
         close(fd);
         return false;
     }
@@ -1254,11 +1435,18 @@ static bool load_tag_strings(int tag, int32_t gen, seek_str_t ** out_map, int * 
             ok = false;
             break;
         }
+        if (master_count > 0 && (te.idx_id < 0 || te.idx_id >= master_count)) {
+            ok = false;
+            break;
+        }
         if (!read_fully(fd, buf, (size_t) te.tag_length)) {
             ok = false;
             break;
         }
-        buf[te.tag_length - 1] = '\0';
+        if (buf[te.tag_length - 1] != '\0') {
+            ok = false;
+            break;
+        }
         map[n].seek = pos;
         map[n].ptr = intern_len(buf, nocase);
         n++;
@@ -1293,7 +1481,7 @@ static bool map_tag_file(int tag, int32_t gen, const char ** out_map, size_t * o
     if (m == MAP_FAILED) return false;
     struct tagcache_header hdr;
     memcpy(&hdr, m, sizeof(hdr));
-    if (hdr.magic != TAGCACHE_MAGIC) {
+    if (!validate_tag_header(&hdr, (size_t) st.st_size)) {
         munmap(m, (size_t) st.st_size);
         return false;
     }
@@ -1306,7 +1494,7 @@ static bool compact_scan_filename(int32_t count) {
     if (!map_filename || map_filename_len < sizeof(struct tagcache_header)) return false;
     struct tagcache_header hdr;
     memcpy(&hdr, map_filename, sizeof(hdr));
-    if (hdr.entry_count < 0 || hdr.entry_count > TAGCACHE_MAX_ENTRIES) return false;
+    if (!validate_tag_header(&hdr, map_filename_len)) return false;
     int32_t pos = (int32_t) sizeof(hdr);
     for (int32_t i = 0; i < hdr.entry_count; i++) {
         if ((size_t) pos + sizeof(struct tagfile_entry) > map_filename_len) return false;
@@ -1315,11 +1503,15 @@ static bool compact_scan_filename(int32_t count) {
         if (te.tag_length <= 1 || te.tag_length > TAGCACHE_PATH_MAX) return false;
         if ((size_t) pos + sizeof(te) + (size_t) te.tag_length > map_filename_len) return false;
         if (te.idx_id < 0 || te.idx_id >= count) return false;
+        const char * s = map_filename + pos + sizeof(te);
+        if (s[te.tag_length - 1] != '\0') return false;
         entry_t * e = &ents[te.idx_id];
         if (e->path_seek != pos) return false;
-        e->path_h = fnv1a(map_filename + pos + (int32_t) sizeof(te), (size_t) te.tag_length - 1);
+        e->path_h = fnv1a(s, (size_t) te.tag_length - 1);
         pos += (int32_t) sizeof(te) + te.tag_length;
     }
+    int32_t parsed = pos - (int32_t) sizeof(hdr);
+    if (hdr.datasize > 0 && parsed != hdr.datasize) return false;
     for (int32_t i = 0; i < count; i++) {
         if (ents[i].flag & FLAG_DELETED) continue;
         if (!ents[i].path_h) return false;
@@ -1331,7 +1523,7 @@ static bool compact_scan_title_order(int32_t count) {
     if (!map_title || map_title_len < sizeof(struct tagcache_header)) return false;
     struct tagcache_header hdr;
     memcpy(&hdr, map_title, sizeof(hdr));
-    if (hdr.entry_count < 0 || hdr.entry_count > TAGCACHE_MAX_ENTRIES) return false;
+    if (!validate_tag_header(&hdr, map_title_len)) return false;
     free(loaded_title_order);
     loaded_title_order = NULL;
     loaded_title_n = 0;
@@ -1347,7 +1539,6 @@ static bool compact_scan_title_order(int32_t count) {
         }
         struct tagfile_entry te;
         memcpy(&te, map_title + pos, sizeof(te));
-        /* Empty titles are stored as a single NUL (tag_length == 1). */
         if (te.tag_length <= 0 || te.tag_length > TAGCACHE_PATH_MAX) {
             free(order);
             return false;
@@ -1360,12 +1551,22 @@ static bool compact_scan_title_order(int32_t count) {
             free(order);
             return false;
         }
+        const char * s = map_title + pos + sizeof(te);
+        if (s[te.tag_length - 1] != '\0') {
+            free(order);
+            return false;
+        }
         if (ents[te.idx_id].title_seek != pos) {
             free(order);
             return false;
         }
         order[n++] = te.idx_id;
         pos += (int32_t) sizeof(te) + te.tag_length;
+    }
+    int32_t parsed = pos - (int32_t) sizeof(hdr);
+    if (hdr.datasize > 0 && parsed != hdr.datasize) {
+        free(order);
+        return false;
     }
     loaded_title_order = order;
     loaded_title_n = n;
@@ -1378,19 +1579,6 @@ static int collect_load_generations(int32_t * out, int max) {
     bool have_pointer = read_gen_pointer(&pointed) && pointed > 0;
     if (have_pointer && n < max) out[n++] = pointed;
 
-    /* tagcache.gen is the transaction's commit record.  A crash after some
-     * database_*.tcd.gN files were created but before that pointer was
-     * durably renamed must not make N visible on the next boot.  In
-     * particular, accepting every generation found here used to expose a
-     * half-created library through the Playlists screen's database-backed
-     * Favorites/Most Played/Recently Added rows.
-     *
-     * With a valid pointer, generations below it are safe recovery
-     * candidates: write_all() keeps only the previously pointed generation
-     * alongside the new one.  Generations above it are uncommitted orphans
-     * and are deliberately ignored.  With no pointer, no versioned
-     * generation has proof of commit, so only the legacy unversioned cache
-     * considered below may be loaded. */
     DIR * d = have_pointer ? opendir(db_dir) : NULL;
     if (d) {
         struct dirent * de;
@@ -1439,6 +1627,7 @@ static int collect_load_generations(int32_t * out, int max) {
 }
 
 static bool load_generation(int32_t gen) {
+    TC_TIME_START(load_gen);
     char master_name[80], master_path[640];
     master_file_name(master_name, sizeof(master_name), gen);
     db_path(master_path, sizeof(master_path), master_name);
@@ -1452,25 +1641,11 @@ static bool load_generation(int32_t gen) {
         return false;
     }
     struct master_header mh;
-    if (!read_fully(fd, &mh, sizeof(mh)) || mh.tch.magic != TAGCACHE_MAGIC || mh.dirty) {
+    if (!read_fully(fd, &mh, sizeof(mh)) || !validate_master_header(&mh, (size_t) st.st_size)) {
         close(fd);
         return false;
     }
     int32_t count = mh.tch.entry_count;
-    if (count < 0 || count > TAGCACHE_MAX_ENTRIES) {
-        close(fd);
-        return false;
-    }
-    uint64_t need = (uint64_t) sizeof(mh) + (uint64_t) count * (uint64_t) sizeof(struct index_entry);
-    if ((uint64_t) st.st_size < need) {
-        close(fd);
-        return false;
-    }
-    if (mh.tch.datasize > 0 &&
-        (uint64_t) mh.tch.datasize != (uint64_t) count * (uint64_t) sizeof(struct index_entry)) {
-        close(fd);
-        return false;
-    }
     if (!ensure_cap(count)) {
         close(fd);
         return false;
@@ -1546,20 +1721,20 @@ static bool load_generation(int32_t gen) {
     int mapn[6] = { 0 };
     bool strings_ok;
     if (intern_path_title) {
-        strings_ok = load_tag_strings(tag_filename, gen, &maps[0], &mapn[0], false) &&
-                     load_tag_strings(tag_title, gen, &maps[1], &mapn[1], true) &&
-                     load_tag_strings(tag_artist, gen, &maps[2], &mapn[2], true) &&
-                     load_tag_strings(tag_album, gen, &maps[3], &mapn[3], true) &&
-                     load_tag_strings(tag_albumartist, gen, &maps[4], &mapn[4], true) &&
-                     load_tag_strings(tag_genre, gen, &maps[5], &mapn[5], true);
+        strings_ok = load_tag_strings(tag_filename, gen, &maps[0], &mapn[0], false, count) &&
+                     load_tag_strings(tag_title, gen, &maps[1], &mapn[1], true, count) &&
+                     load_tag_strings(tag_artist, gen, &maps[2], &mapn[2], true, count) &&
+                     load_tag_strings(tag_album, gen, &maps[3], &mapn[3], true, count) &&
+                     load_tag_strings(tag_albumartist, gen, &maps[4], &mapn[4], true, count) &&
+                     load_tag_strings(tag_genre, gen, &maps[5], &mapn[5], true, count);
     } else {
         strings_ok = map_tag_file(tag_filename, gen, &map_filename, &map_filename_len) &&
                      map_tag_file(tag_title, gen, &map_title, &map_title_len) &&
                      compact_scan_filename(count) && compact_scan_title_order(count) &&
-                     load_tag_strings(tag_artist, gen, &maps[2], &mapn[2], true) &&
-                     load_tag_strings(tag_album, gen, &maps[3], &mapn[3], true) &&
-                     load_tag_strings(tag_albumartist, gen, &maps[4], &mapn[4], true) &&
-                     load_tag_strings(tag_genre, gen, &maps[5], &mapn[5], true);
+                     load_tag_strings(tag_artist, gen, &maps[2], &mapn[2], true, count) &&
+                     load_tag_strings(tag_album, gen, &maps[3], &mapn[3], true, count) &&
+                     load_tag_strings(tag_albumartist, gen, &maps[4], &mapn[4], true, count) &&
+                     load_tag_strings(tag_genre, gen, &maps[5], &mapn[5], true, count);
     }
     if (!strings_ok) {
         for (int t = 0; t < 6; t++) free(maps[t]);
@@ -1592,17 +1767,10 @@ static bool load_generation(int32_t gen) {
         const char * album = lookup_seek(maps[3], mapn[3], album_seek[i]);
         const char * album_artist = lookup_seek(maps[4], mapn[4], aa_seek[i]);
         const char * genre = lookup_seek(maps[5], mapn[5], genre_seek[i]);
-        /* Older commits stored intern persist_seek from whichever unique
-         * tag file last overwrote the shared intern node (albumartist often
-         * equals artist). Missing unique-tag seeks must not fail the whole
-         * open -- fall back so a good generation still loads. */
         if (!artist) {
             rows_ok = false;
             break;
         }
-        /* Unique-tag seek misses must not fail the whole open, but they
-         * also must not look like real empty tags on the next rescan:
-         * mtime/size cache hits would persist intern("") as the album. */
         bool incomplete = false;
         if (!album) {
             album = "";
@@ -1665,6 +1833,7 @@ static bool load_generation(int32_t gen) {
     }
     disk_gen = gen;
     disk_ready = true;
+    TC_TIME_END(load_gen, "load_generation total");
     return true;
 }
 
@@ -1702,32 +1871,198 @@ static bool load_all(void) {
     return false;
 }
 
-static void persist_numeric(int32_t idx) {
-    if (!disk_ready || db_dir[0] == '\0' || idx < 0 || idx >= ent_count) return;
-    char master_name[80], master_path[640];
-    master_file_name(master_name, sizeof(master_name), disk_gen);
-    db_path(master_path, sizeof(master_path), master_name);
-    int fd = open(master_path, O_RDWR);
-    if (fd < 0) return;
-    struct index_entry ie;
-    off_t off = (off_t) sizeof(struct master_header) + (off_t) idx * (off_t) sizeof(ie);
-    if (pread(fd, &ie, sizeof(ie), off) != (ssize_t) sizeof(ie)) {
+/* Performs disk pwrite + fdatasync for a snapshot of numeric updates. */
+static void flush_numeric_batch(const numeric_update_t * batch, int n) {
+    if (n <= 0 || db_dir[0] == '\0') return;
+    for (int i = 0; i < n; i++) {
+        int32_t gen = batch[i].gen;
+        if (gen <= 0) continue;
+        /* Avoid repeating work for the same generation in this batch */
+        bool already_done = false;
+        for (int k = 0; k < i; k++) {
+            if (batch[k].gen == gen) {
+                already_done = true;
+                break;
+            }
+        }
+        if (already_done) continue;
+
+        char master_name[80], master_path[640];
+        master_file_name(master_name, sizeof(master_name), gen);
+        db_path(master_path, sizeof(master_path), master_name);
+        int fd = open(master_path, O_RDWR);
+        if (fd < 0) continue;
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            close(fd);
+            continue;
+        }
+        struct master_header mh;
+        if (pread(fd, &mh, sizeof(mh), 0) != (ssize_t) sizeof(mh) || !validate_master_header(&mh, (size_t) st.st_size)) {
+            close(fd);
+            continue;
+        }
+        bool any_written = false;
+        for (int j = i; j < n; j++) {
+            if (batch[j].gen != gen) continue;
+            int32_t slot = batch[j].slot;
+            if (slot < 0 || slot >= mh.tch.entry_count) continue;
+            struct index_entry ie;
+            off_t off = (off_t) sizeof(struct master_header) + (off_t) slot * (off_t) sizeof(ie);
+            if (pread(fd, &ie, sizeof(ie), off) != (ssize_t) sizeof(ie)) continue;
+            ie.flag = batch[j].flag & ~FLAG_RAM_ONLY;
+            ie.tag_seek[tag_mtime] = batch[j].mtime;
+            ie.tag_seek[tag_lastoffset] = batch[j].size;
+            ie.tag_seek[tag_commitid] = batch[j].first_seen;
+            ie.tag_seek[tag_playcount] = batch[j].playcount;
+            ie.tag_seek[tag_lastplayed] = batch[j].last_played;
+            ie.tag_seek[tag_rating] = batch[j].rating;
+            if (pwrite(fd, &ie, sizeof(ie), off) == (ssize_t) sizeof(ie)) {
+                any_written = true;
+            }
+        }
+        if (any_written) {
+            fdatasync(fd);
+        }
         close(fd);
+    }
+}
+
+static void numeric_flush_locked(void) {
+    if (numeric_queue_count == 0) return;
+    numeric_update_t batch[NUMERIC_QUEUE_CAP];
+    int n = numeric_queue_count;
+    memcpy(batch, numeric_queue, sizeof(numeric_update_t) * (size_t) n);
+    numeric_queue_count = 0;
+    pthread_cond_broadcast(&numeric_drain_cond);
+    pthread_mutex_unlock(&numeric_mutex);
+    flush_numeric_batch(batch, n);
+    pthread_mutex_lock(&numeric_mutex);
+}
+
+void tagcache_flush_numeric(void) {
+    pthread_mutex_lock(&numeric_mutex);
+    numeric_flush_locked();
+    pthread_mutex_unlock(&numeric_mutex);
+}
+
+static void * numeric_worker_func(void * arg) {
+    (void) arg;
+    pthread_mutex_lock(&numeric_mutex);
+    while (!numeric_shutdown) {
+        if (numeric_queue_count == 0) {
+            pthread_cond_wait(&numeric_cond, &numeric_mutex);
+            continue;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += NUMERIC_COMMIT_DELAY_SEC;
+        int rc = pthread_cond_timedwait(&numeric_cond, &numeric_mutex, &ts);
+        if (rc == ETIMEDOUT || numeric_shutdown || numeric_queue_count >= NUMERIC_QUEUE_CAP) {
+            numeric_flush_locked();
+        }
+    }
+    numeric_flush_locked();
+    pthread_mutex_unlock(&numeric_mutex);
+    return NULL;
+}
+
+static void numeric_worker_start(void) {
+    pthread_mutex_lock(&numeric_mutex);
+    if (!numeric_thread_running) {
+        numeric_shutdown = false;
+        numeric_queue_count = 0;
+        const char * disable_env = getenv("TAGCACHE_TEST_DISABLE_NUMERIC_WORKER");
+        if (disable_env && atoi(disable_env) != 0) {
+            numeric_thread_running = false;
+        } else if (pthread_create(&numeric_thread, NULL, numeric_worker_func, NULL) == 0) {
+            numeric_thread_running = true;
+        } else {
+            fprintf(stderr, "tagcache: failed to spawn numeric worker thread -- running in degraded sync mode\n");
+            numeric_thread_running = false;
+        }
+    }
+    pthread_mutex_unlock(&numeric_mutex);
+}
+
+static void numeric_worker_stop(void) {
+    pthread_mutex_lock(&numeric_mutex);
+    if (numeric_thread_running) {
+        numeric_shutdown = true;
+        pthread_cond_broadcast(&numeric_cond);
+        pthread_cond_broadcast(&numeric_drain_cond);
+        pthread_mutex_unlock(&numeric_mutex);
+        pthread_join(numeric_thread, NULL);
+        pthread_mutex_lock(&numeric_mutex);
+        numeric_thread_running = false;
+        numeric_shutdown = false;
+    }
+    numeric_flush_locked();
+    numeric_queue_count = 0;
+    pthread_mutex_unlock(&numeric_mutex);
+}
+
+static void queue_numeric_update(int32_t idx) {
+    if (!disk_ready || db_dir[0] == '\0' || idx < 0 || idx >= ent_count || disk_gen <= 0) return;
+    pthread_mutex_lock(&numeric_mutex);
+    for (int i = 0; i < numeric_queue_count; i++) {
+        if (numeric_queue[i].gen == disk_gen && numeric_queue[i].slot == idx) {
+            numeric_queue[i].flag = ents[idx].flag;
+            numeric_queue[i].mtime = ents[idx].mtime;
+            numeric_queue[i].size = ents[idx].size;
+            numeric_queue[i].first_seen = ents[idx].first_seen;
+            numeric_queue[i].playcount = ents[idx].playcount;
+            numeric_queue[i].last_played = ents[idx].last_played;
+            numeric_queue[i].rating = ents[idx].rating;
+            if (!numeric_thread_running) {
+                numeric_flush_locked();
+            }
+            pthread_mutex_unlock(&numeric_mutex);
+            return;
+        }
+    }
+    if (!numeric_thread_running) {
+        if (numeric_queue_count >= NUMERIC_QUEUE_CAP) {
+            numeric_flush_locked();
+        }
+        int pos = numeric_queue_count++;
+        numeric_queue[pos].gen = disk_gen;
+        numeric_queue[pos].slot = idx;
+        numeric_queue[pos].flag = ents[idx].flag;
+        numeric_queue[pos].mtime = ents[idx].mtime;
+        numeric_queue[pos].size = ents[idx].size;
+        numeric_queue[pos].first_seen = ents[idx].first_seen;
+        numeric_queue[pos].playcount = ents[idx].playcount;
+        numeric_queue[pos].last_played = ents[idx].last_played;
+        numeric_queue[pos].rating = ents[idx].rating;
+        numeric_queue[pos].disc_number = ents[idx].disc_number;
+        numeric_queue[pos].track_number = ents[idx].track_number;
+        numeric_flush_locked();
+        pthread_mutex_unlock(&numeric_mutex);
         return;
     }
-    ie.flag = ents[idx].flag & ~FLAG_RAM_ONLY;
-    ie.tag_seek[tag_mtime] = ents[idx].mtime;
-    ie.tag_seek[tag_lastoffset] = ents[idx].size;
-    ie.tag_seek[tag_commitid] = ents[idx].first_seen;
-    ie.tag_seek[tag_playcount] = ents[idx].playcount;
-    ie.tag_seek[tag_lastplayed] = ents[idx].last_played;
-    ie.tag_seek[tag_rating] = ents[idx].rating;
-    if (pwrite(fd, &ie, sizeof(ie), off) != (ssize_t) sizeof(ie)) {
-        close(fd);
+    while (numeric_queue_count >= NUMERIC_QUEUE_CAP && !numeric_shutdown && numeric_thread_running) {
+        pthread_cond_signal(&numeric_cond);
+        pthread_cond_wait(&numeric_drain_cond, &numeric_mutex);
+    }
+    if (numeric_shutdown) {
+        pthread_mutex_unlock(&numeric_mutex);
         return;
     }
-    fsync(fd);
-    close(fd);
+    int pos = numeric_queue_count++;
+    numeric_queue[pos].gen = disk_gen;
+    numeric_queue[pos].slot = idx;
+    numeric_queue[pos].flag = ents[idx].flag;
+    numeric_queue[pos].mtime = ents[idx].mtime;
+    numeric_queue[pos].size = ents[idx].size;
+    numeric_queue[pos].first_seen = ents[idx].first_seen;
+    numeric_queue[pos].playcount = ents[idx].playcount;
+    numeric_queue[pos].last_played = ents[idx].last_played;
+    numeric_queue[pos].rating = ents[idx].rating;
+    numeric_queue[pos].disc_number = ents[idx].disc_number;
+    numeric_queue[pos].track_number = ents[idx].track_number;
+    pthread_cond_signal(&numeric_cond);
+    pthread_mutex_unlock(&numeric_mutex);
 }
 
 static bool reload_from_disk(void) {
@@ -1765,15 +2100,14 @@ bool tagcache_open(const char * dir) {
         intern_path_title = true;
         disk_ready = false;
         disk_gen = 0;
-        /* Still mark open so Settings > Update Music Database can write a
-         * new generation. disk_ready stays false so numeric in-place writes
-         * cannot touch the generation that failed to load. */
         opened_ok = true;
     }
+    numeric_worker_start();
     return true;
 }
 
 void tagcache_close(void) {
+    numeric_worker_stop();
     free(ents);
     ents = NULL;
     ent_count = ent_cap = live_count = 0;
@@ -1803,6 +2137,7 @@ bool tagcache_is_open(void) {
 
 void tagcache_begin_update(void) {
     if (!db_open) return;
+    tagcache_flush_numeric();
     for (int32_t i = 0; i < ent_count; i++) ents[i].flag &= ~FLAG_SEEN;
 }
 
@@ -1812,9 +2147,6 @@ bool tagcache_lookup(const char * path, int32_t mtime, int32_t size, tagcache_so
     if (idx < 0 || (ents[idx].flag & FLAG_DELETED)) return false;
     ents[idx].flag |= FLAG_SEEN;
     if (ents[idx].mtime != mtime || ents[idx].size != size) return false;
-    /* "" album is not a real ID3 result (scan writes "Unknown Album").
-     * Load-fallback and a later commit of that fallback both look like a
-     * cache hit unless we force a tag re-read. */
     if ((ents[idx].flag & FLAG_TAGS_INCOMPLETE) || !ents[idx].album || !ents[idx].album[0])
         return false;
     if (out) fill_song(idx, out);
@@ -1858,6 +2190,7 @@ void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char 
 
 bool tagcache_end_update(bool prune) {
     if (!db_open) return false;
+    tagcache_flush_numeric();
     if (prune) {
         for (int32_t i = 0; i < ent_count; i++) {
             if (ents[i].flag & FLAG_DELETED) continue;
@@ -1870,8 +2203,6 @@ bool tagcache_end_update(bool prune) {
         reload_from_disk();
         return false;
     }
-    /* Compact loads mmap the new generation. Interned loads that outgrew
-     * the RAM budget drop title/path intern tables on reload. */
     if (!intern_path_title || !choose_intern_strings(live_count)) {
         if (!reload_from_disk()) return false;
     }
@@ -1880,6 +2211,7 @@ bool tagcache_end_update(bool prune) {
 
 void tagcache_abort_update(void) {
     if (!db_open) return;
+    tagcache_flush_numeric();
     reload_from_disk();
 }
 
@@ -1984,7 +2316,7 @@ void tagcache_set_rating(const char * path, int32_t rating) {
     int32_t idx = path_hash_find(path);
     if (idx < 0 || (ents[idx].flag & FLAG_DELETED)) return;
     ents[idx].rating = rating;
-    persist_numeric(idx);
+    queue_numeric_update(idx);
 }
 
 void tagcache_add_play(const char * path, int32_t now) {
@@ -1992,7 +2324,7 @@ void tagcache_add_play(const char * path, int32_t now) {
     if (idx < 0 || (ents[idx].flag & FLAG_DELETED)) return;
     if (ents[idx].playcount < INT32_MAX) ents[idx].playcount++;
     ents[idx].last_played = now;
-    persist_numeric(idx);
+    queue_numeric_update(idx);
 }
 
 void tagcache_overlay_stats(const char * path, int32_t rating, int32_t playcount, int32_t last_played) {

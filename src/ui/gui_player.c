@@ -1538,6 +1538,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     song_count_label = lv_label_create(overlay);
     lv_label_set_text(song_count_label, "");
     lv_obj_add_style(song_count_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_translate_y(song_count_label, -3, 0);
 
     /* Transport row: prev / play-pause / next, centered. */
     lv_obj_t * controls_row = lv_obj_create(overlay);
@@ -1550,6 +1551,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_flex_flow(controls_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(controls_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(controls_row, 36, 0);
+    lv_obj_set_style_translate_y(controls_row, -3, 0);
 
     /* Play-mode icon (sequential/repeat/shuffle) -- leftmost, matching the
      * reference layout (repeat / prev / play / next / more). Tapping cycles

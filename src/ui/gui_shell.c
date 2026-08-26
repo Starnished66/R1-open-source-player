@@ -1345,7 +1345,12 @@ static void build_home_indicator_bar(void) {
 
     home_indicator_band = lv_obj_create(top);
     lv_obj_remove_style_all(home_indicator_band);
-    lv_obj_set_size(home_indicator_band, lv_pct(100), HOME_INDICATOR_BAND_HEIGHT);
+    /* Match the clickable object to the complete raw-coordinate press-down
+     * surface accepted by gesture_home_state_poll(): the normal 24px band
+     * plus HOME_SWIPE_HIT_EXTRA_PX.  The band remains visually transparent;
+     * only the centered pill below is drawn. */
+    lv_obj_set_size(home_indicator_band, lv_pct(100),
+                    HOME_INDICATOR_BAND_HEIGHT + HOME_SWIPE_HIT_EXTRA_PX);
     lv_obj_align(home_indicator_band, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_remove_flag(home_indicator_band, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(home_indicator_band, LV_OBJ_FLAG_CLICKABLE); /* claims touches in this strip before any list underneath can -- the actual swipe-up trigger is poll_quick_drawer_drag()'s raw position polling, not a click/gesture event on this object */

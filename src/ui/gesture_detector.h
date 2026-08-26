@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define HOME_SWIPE_UP_THRESHOLD 40
-#define HOME_SWIPE_HIT_EXTRA_PX 2
+#define HOME_SWIPE_HIT_EXTRA_PX 7
 
 typedef struct {
     bool swipe_up_home_enabled;

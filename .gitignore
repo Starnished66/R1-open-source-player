@@ -41,6 +41,9 @@
 /assets/theme2/stream_media/*
 !/assets/theme2/stream_media/subsonic.png
 !/assets/theme2/stream_media/subsonic_s.png
+!/assets/theme2/playing_plane/
+/assets/theme2/playing_plane/*
+!/assets/theme2/playing_plane/airplay_logo_white.png
 
 # Korean.ttf-derived host-simulator font: excluded, unlike the rest of
 # assets/fonts/, because this particular file's own embedded metadata

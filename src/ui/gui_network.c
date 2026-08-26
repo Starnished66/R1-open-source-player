@@ -17,6 +17,8 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include "firmware_update.h"
 #include "gui_subsonic.h"
 #include "airplay_control.h"
+#include "airplay_bridge.h"
+#include "airplay_metadata.h"
 #include "dlna_control.h"
 #include "remote_control.h"
 #include <stdio.h>
@@ -37,6 +39,20 @@ static lv_obj_t * usb_mode_screen;
 static lv_obj_t * usb_dac_overlay_screen;
 static lv_obj_t * import_wifi_screen;
 static lv_obj_t * airplay_screen;
+static lv_obj_t * airplay_overlay_screen;
+static lv_obj_t * airplay_overlay_cover_img;
+static lv_obj_t * airplay_overlay_title_label;
+static bool airplay_overlay_showing = false;
+static lv_image_dsc_t airplay_overlay_cover_dsc;
+static uint8_t * airplay_overlay_cover_bytes = NULL;
+/* This screen's own stack slot, recorded right before nav_push() -- same
+ * import_web_stop_nav_slot pattern used below for Import via Wi-Fi's busy
+ * screen. Needed because the overlay can be torn down by session end while
+ * the user has already navigated to some other screen on top of it (or
+ * underneath it in history); without spawning it, nav_pop() alone would
+ * either pop the wrong screen or leave this now-defunct one buried in the
+ * back-navigation history for a later "back" to resurface. */
+static int airplay_overlay_nav_slot = -1;
 static lv_obj_t * dlna_screen;
 static lv_obj_t * remote_control_screen;
 static lv_obj_t * wireless_screen;
@@ -2388,15 +2404,32 @@ static void airplay_toggle_cb(lv_event_t * e) {
     if (current_settings.wifi_dac_mode_enabled) {
         char name[64];
         get_device_name(name, sizeof(name));
-        airplay_control_start(name);
-
-        /* Same three-way mutual exclusion as bt_dac_toggle_cb() -- see its
-         * own comment for why. */
-        if (audio_is_playing()) {
-            audio_stop();
-            set_play_button_state(false);
-            plugin_manager_notify_stopped();
+        if (!airplay_control_start(name)) {
+            /* Startup is transactional (see airplay_control_start()'s own
+             * comment) -- a false return means nothing was actually left
+             * running, so just undo the toggle rather than reporting the
+             * device as "on" when it can't produce sound or be discovered. */
+            current_settings.wifi_dac_mode_enabled = false;
+            settings_save(&current_settings);
+            show_error_toast("Failed to enable AirPlay");
+            populate_airplay_screen();
+            return;
         }
+
+        /* Deliberately does NOT touch local playback here -- toggling
+         * AirPlay only makes this device discoverable/ready to receive
+         * (airplay_bridge_start() starts in a LISTENING state, see its own
+         * comment); an actual incoming AirPlay stream starting is what
+         * stops local playback (gui_network.c's gui_network_poll_airplay_
+         * overlay(), reacting to airplay_bridge_is_streaming()), not this
+         * toggle. Still mutually exclusive with Bluetooth DAC mode
+         * specifically, unlike local playback: BT DAC mode's bluealsa-aplay
+         * writes straight to the local hw:0 device as an entirely separate
+         * process, outside this app's own audio_output.c arbitration, so
+         * the two really can conflict at the hardware level the moment
+         * AirPlay does start streaming -- turning BT DAC off here, rather
+         * than only when AirPlay actually starts streaming, avoids ever
+         * having both simultaneously fighting over real hardware. */
         if (current_settings.bt_dac_mode_enabled) {
             current_settings.bt_dac_mode_enabled = false;
             settings_save(&current_settings);
@@ -2422,6 +2455,192 @@ static void open_airplay_screen(void) {
 static void airplay_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     open_airplay_screen();
+}
+
+/* ---- AirPlay overlay: shown only while a stream is actually active -----
+ * An earlier pass tried reusing the Player screen's own widgets for this
+ * (hiding its transport controls while AirPlay played) -- dropped after
+ * real-device testing: a shadowed-global bug silently left prev/next
+ * unhideable, the layout looked broken with only some controls hidden,
+ * and it coupled this feature into player-owned globals with no other
+ * reason to know about AirPlay. A dedicated overlay, same shape as
+ * bt_dac_overlay_screen/usb_dac_overlay_screen, has none of that: nothing
+ * to hide, nothing to accidentally leave half-hidden. Unlike those two
+ * static overlays, this one has real dynamic content (cover art + song
+ * name), fed by airplay_metadata.c the same way the old Player-screen
+ * integration was, just applied to this screen's own widgets instead.
+ * No back-button confirmation popup (unlike BT DAC's) -- there is nothing
+ * to "leave" here in the sense of a mode switch; navigating away just
+ * stops looking at it, the stream itself keeps flowing regardless of
+ * which screen is on top, and gui_network_poll_airplay_overlay() below
+ * pops back out on its own once the stream actually ends. ---- */
+
+static void airplay_overlay_back_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_pop();
+}
+
+static lv_obj_t * build_airplay_overlay_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+
+    lv_obj_t * back_btn = lv_obj_create(scr);
+    lv_obj_set_size(back_btn, 64, 64);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back_btn, 0, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(back_btn, airplay_overlay_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * back_arrow = lv_image_create(back_btn);
+    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(back_arrow);
+
+    airplay_overlay_cover_img = lv_image_create(scr);
+    lv_image_set_src(airplay_overlay_cover_img, asset_path("playing_plane/default_cover_565.png"));
+    lv_obj_align(airplay_overlay_cover_img, LV_ALIGN_CENTER, 0, -60);
+
+    airplay_overlay_title_label = lv_label_create(scr);
+    lv_label_set_text(airplay_overlay_title_label, "AirPlay");
+    lv_obj_add_style(airplay_overlay_title_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(airplay_overlay_title_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    lv_obj_set_width(airplay_overlay_title_label, lv_pct(85));
+    lv_label_set_long_mode(airplay_overlay_title_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(airplay_overlay_title_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align_to(airplay_overlay_title_label, airplay_overlay_cover_img, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
+
+    /* The AirPlay settings tile's own "wireless/airplay.png" is a stock
+     * theme2 asset with a completely different (colored, wireless-grid)
+     * style -- not the recognizable AirPlay-audio glyph (concentric arcs
+     * over an upward triangle). This is a project-owned custom asset
+     * instead: assets/theme2/playing_plane/airplay_logo_white.png, a
+     * solid-white recolor of the standard glyph (transparent background,
+     * alpha-preserved from the original anti-aliased edges) sized for this
+     * overlay specifically. Resolved via asset_path()'s own THEME_OVERRIDE_
+     * ROOT mechanism on target (see assets.c's own comment -- exactly the
+     * "asset this app adds with no stock equivalent" case that exists for)
+     * and committed directly under assets/theme2/ for the host build,
+     * matching stream_media/subsonic.png's own precedent. */
+    lv_obj_t * airplay_logo = lv_image_create(scr);
+    lv_image_set_src(airplay_logo, asset_path("playing_plane/airplay_logo_white.png"));
+    lv_obj_align(airplay_logo, LV_ALIGN_BOTTOM_MID, 0, -24);
+
+    return scr;
+}
+
+/* Poll from update_timer_cb, same shape as every other background-thread-
+ * to-UI-thread poll in this codebase. Shows/hides the overlay based on
+ * airplay_bridge_is_streaming() transitions and applies whatever metadata
+ * has arrived meanwhile -- decoupled from whether the overlay happens to
+ * be the currently active screen, so metadata keeps updating even if the
+ * user navigated away from it. */
+void gui_network_poll_airplay_overlay(void) {
+    /* Self-heals a respawn failure from airplay_control_disconnect_active_
+     * stream()'s kill-and-respawn (gui_player.c, triggered by local playback
+     * resuming while AirPlay was streaming) -- that path deliberately
+     * ignores airplay_control_start()'s return value (see its own comment),
+     * so this is the only place such a failure ever gets noticed and the
+     * persisted setting corrected, same as airplay_toggle_cb()'s own
+     * synchronous failure handling a few hundred lines up in this file. */
+    if (current_settings.wifi_dac_mode_enabled && !airplay_control_is_active()) {
+        current_settings.wifi_dac_mode_enabled = false;
+        settings_save(&current_settings);
+        show_error_toast("AirPlay stopped unexpectedly");
+        populate_airplay_screen();
+    }
+
+    bool streaming = airplay_bridge_is_streaming();
+    if (streaming != airplay_overlay_showing) {
+        airplay_overlay_showing = streaming;
+        if (streaming) {
+            /* airplay_bridge.c's own reader thread already called
+             * audio_stop() before flipping is_streaming() true (see its own
+             * comment) -- that only stops the backend, same as usb_mode_
+             * control_apply()'s own DAC-mode takeover a few hundred lines up
+             * in this file; the play button icon and plugin state still
+             * need their own explicit refresh here on the UI thread, or
+             * they'd keep claiming playback is active/paused for a track
+             * that AirPlay just silently took the output device out from
+             * under. */
+            set_play_button_state(false);
+            plugin_manager_notify_stopped();
+
+            airplay_overlay_nav_slot = gui_navigation_get_depth(); /* this screen's own slot, about to be occupied */
+            nav_push(airplay_overlay_screen);
+        } else {
+            /* Reset to defaults here, on SESSION END, not on the next
+             * session's start -- metadata for a new session can (and
+             * regularly does) arrive slightly before airplay_bridge_is_
+             * streaming() flips true for it (see the unconditional-apply
+             * comment below), and resetting on start would wipe that
+             * early update right back out, leaving the "AirPlay"
+             * placeholder up for the entire session since nothing else
+             * would trigger a re-apply. Resetting here instead means by
+             * the time a NEW session's early metadata can possibly arrive,
+             * this session's leftover content is already gone -- closing
+             * the same staleness gap without racing a legitimate early
+             * update for the next session. */
+            lv_label_set_text(airplay_overlay_title_label, "AirPlay");
+            free(airplay_overlay_cover_bytes);
+            airplay_overlay_cover_bytes = NULL;
+            lv_image_set_src(airplay_overlay_cover_img, asset_path("playing_plane/default_cover_565.png"));
+
+            if (lv_screen_active() == airplay_overlay_screen) {
+                /* Only auto-dismiss if the user is still looking at it. */
+                nav_pop();
+            } else if (airplay_overlay_nav_slot >= 0 && airplay_overlay_nav_slot < gui_navigation_get_depth()) {
+                /* User already navigated elsewhere with the overlay still
+                 * buried somewhere in their back-navigation history --
+                 * splice its now-defunct slot out entirely (same pattern as
+                 * poll_import_web_stop()'s import_web_stop_nav_slot) rather
+                 * than leaving it there for a later "back" to resurface a
+                 * screen with no active stream behind it. */
+                nav_remove_stack_slot(airplay_overlay_nav_slot);
+            }
+            airplay_overlay_nav_slot = -1;
+        }
+    }
+
+    airplay_metadata_update_t upd;
+    if (!airplay_metadata_consume_update(&upd)) return;
+
+    /* Applied regardless of `streaming` -- the metadata and PCM bridge are
+     * two independent threads/connections (airplay_metadata.c vs. airplay_
+     * bridge.c), so a title/cover update for a session can arrive slightly
+     * before airplay_bridge_is_streaming() actually flips true. Discarding
+     * it here (an earlier version of this function did) meant the overlay
+     * showed the plain "AirPlay" placeholder for the entire first track of
+     * every session unless a later track change happened to resend it.
+     * Applying it always is safe: the streaming->false reset above already
+     * runs the instant a session ends, before a NEW session's own metadata
+     * could possibly arrive, so nothing from a PREVIOUS session is ever
+     * still sitting in these widgets by the time an early update for a new
+     * one shows up here. */
+    lv_label_set_text(airplay_overlay_title_label, upd.title[0] ? upd.title : "AirPlay");
+
+    if (!upd.has_cover) {
+        free(airplay_overlay_cover_bytes);
+        airplay_overlay_cover_bytes = NULL;
+        lv_image_set_src(airplay_overlay_cover_img, asset_path("playing_plane/default_cover_565.png"));
+        return;
+    }
+
+    free(airplay_overlay_cover_bytes);
+    airplay_overlay_cover_bytes = (uint8_t *) upd.cover_pixels;
+
+    /* LV_IMAGE_HEADER_MAGIC is required, not decorative -- see gui_player.c's
+     * poll_cover_decode() for the real-device corruption bug a zeroed magic
+     * field causes (lv_bin_decoder.c "fixes up" what it treats as an old-
+     * format header in place, silently overwriting the color format). */
+    memset(&airplay_overlay_cover_dsc, 0, sizeof(airplay_overlay_cover_dsc));
+    airplay_overlay_cover_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    airplay_overlay_cover_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    airplay_overlay_cover_dsc.header.w = AIRPLAY_COVER_WIDTH;
+    airplay_overlay_cover_dsc.header.h = AIRPLAY_COVER_HEIGHT;
+    airplay_overlay_cover_dsc.header.stride = AIRPLAY_COVER_WIDTH * 2;
+    airplay_overlay_cover_dsc.data = airplay_overlay_cover_bytes;
+    airplay_overlay_cover_dsc.data_size = (uint32_t) AIRPLAY_COVER_WIDTH * AIRPLAY_COVER_HEIGHT * 2;
+    lv_image_set_src(airplay_overlay_cover_img, &airplay_overlay_cover_dsc);
 }
 
 /* ---- DLNA screen -- see dlna_control.h for the real mechanism (stock
@@ -2750,6 +2969,7 @@ void gui_network_init(void) {
     build_import_rescan_popup();
     import_wifi_screen = build_import_wifi_screen();
     airplay_screen = build_airplay_screen();
+    airplay_overlay_screen = build_airplay_overlay_screen();
     dlna_screen = build_dlna_screen();
     remote_control_screen = build_remote_control_screen();
     wireless_screen = build_wireless_screen();

@@ -10,6 +10,7 @@ lv_obj_t * gui_network_get_bt_dac_overlay(void);
 lv_obj_t * gui_network_get_usb_dac_overlay(void);
 
 void gui_network_init(void);
+void gui_network_poll_airplay_overlay(void);
 void poll_wifi_connect(void);
 void poll_wifi_disconnect(void);
 void poll_wifi_scan(void);

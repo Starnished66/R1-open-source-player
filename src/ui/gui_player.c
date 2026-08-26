@@ -38,6 +38,7 @@ static uint64_t current_playback_generation = 0;
 #include "metadata.h"
 #include "metadata_db.h"
 #include "cover_decode.h"
+#include "airplay_control.h"
 #include "albumart.h"
 #include "audio.h"
 #include "settings.h"
@@ -298,7 +299,7 @@ uint16_t rgb888_to_565_dithered(int r, int g, int b, int x, int y) {
  * the reflection from a given COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565
  * buffer and returns a freshly malloc'd REFLECTION_WIDTH x REFLECTION_HEIGHT
  * RGB565 buffer, or NULL on allocation failure. Caller owns the result. */
-static uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
+uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
     int w = REFLECTION_WIDTH, h = REFLECTION_HEIGHT;
     uint8_t * r = malloc((size_t) w * h);
     uint8_t * g = malloc((size_t) w * h);
@@ -699,6 +700,7 @@ void poll_cover_decode(void) {
         cover_decode_pending.picture_size = 0;
     }
 }
+
 
 /* ---- Lyrics: async .lrc load ------------------------------------------
  * Deliberately independent from the cover-decode pipeline above, despite
@@ -1559,7 +1561,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(order_icon, order_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(order_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
 
-    lv_obj_t * prev_btn = lv_image_create(controls_row);
+    prev_btn = lv_image_create(controls_row);
     lv_image_set_src(prev_btn, asset_path("playing_plane/btn_prev.png"));
     lv_obj_add_flag(prev_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(prev_btn, prev_btn_event_cb, LV_EVENT_CLICKED, NULL);
@@ -1582,7 +1584,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * instead. */
     lv_obj_add_style(play_btn, &icon_press_style, LV_STATE_PRESSED);
 
-    lv_obj_t * next_btn = lv_image_create(controls_row);
+    next_btn = lv_image_create(controls_row);
     lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
     lv_obj_add_flag(next_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(next_btn, next_btn_event_cb, LV_EVENT_CLICKED, NULL);
@@ -2272,9 +2274,21 @@ void queue_clear_pending(void) {
  * was a real dead end: the Bluetooth DAC toggle to turn it back off only
  * appears once Bluetooth is powered, which needs a chip re-init the app
  * itself has no way to trigger. */
+/* AirPlay deliberately does NOT appear here -- unlike Bluetooth/USB DAC
+ * (which need an explicit settings change to exit before local playback
+ * can resume, since they're real device-mode switches), AirPlay merely
+ * being enabled/discoverable never blocks local playback at all; only an
+ * ACTIVE stream does, and that case auto-disconnects rather than blocking
+ * with an error toast -- see airplay_control_disconnect_active_stream(),
+ * called by both of this function's own callers before they ever reach
+ * this check. Real-device bug this fixes: this used to unconditionally
+ * check current_settings.wifi_dac_mode_enabled (merely "discoverable"),
+ * so simply having AirPlay toggled on -- whether or not a phone was
+ * actually streaming to it -- blocked every attempt to play a local file
+ * with this same toast, exactly the coupling airplay_bridge_start()'s own
+ * comment describes fixing. */
 static const char * external_dac_block_reason(void) {
     if (current_settings.bt_dac_mode_enabled && bt_is_powered_cached) return "Turn off Bluetooth DAC to play music on this device";
-    if (current_settings.wifi_dac_mode_enabled) return "Turn off AirPlay to play music on this device";
     if (current_settings.usb_mode == USB_MODE_DAC) return "Exit USB DAC mode to play music on this device";
     return NULL;
 }
@@ -2309,8 +2323,35 @@ static void notify_plugin_track_started(const track_metadata_t * meta, const cha
                                          is_remote_track ? remote_meta.provider : "", is_remote_track ? remote_meta.track_id : "");
 }
 
-static void play_track_at_from_internal(int index, double start_seconds, bool push_nav) {
+static void play_track_at_from_internal(int index, double start_seconds, bool push_nav, bool skip_airplay_disconnect) {
     if (index < 0 || index >= playlist_count) return;
+
+    /* Symmetric with airplay_bridge.c's own side of this: an actual
+     * incoming AirPlay stream starting stops local playback (airplay_
+     * bridge_is_streaming() transitioning, see gui_network.c's gui_network_
+     * poll_airplay_overlay()); starting local playback here while a stream
+     * is already active should equally win and disconnect it, rather than
+     * the two silently fighting over the shared output device or this call
+     * failing/behaving oddly underneath a session it doesn't know about.
+     * No-op when nothing is actively streaming. Must run before the block-
+     * reason check below: that check no longer even considers AirPlay
+     * (see external_dac_block_reason()'s own comment), but this call is
+     * also what actually frees the output device before ensure_device()
+     * further down tries to claim it.
+     *
+     * skip_airplay_disconnect exists solely for toggle_play_pause()'s own
+     * resume-after-takeover path: it already called airplay_control_
+     * disconnect_active_stream() itself to decide whether to resume at all,
+     * and airplay_bridge_stop()/airplay_control_stop() are fire-and-forget
+     * (see their own comments) -- is_streaming() can still read true for a
+     * short window afterward. Calling disconnect a second time here could
+     * see that stale true, and kill+respawn shairport a second time right
+     * on top of the first respawn still settling. Every OTHER caller has
+     * not already disconnected anything, so they must still run this call
+     * normally. */
+    if (!skip_airplay_disconnect) {
+        airplay_control_disconnect_active_stream();
+    }
 
     const char * block_reason = external_dac_block_reason();
     if (block_reason) {
@@ -2363,7 +2404,7 @@ static void play_track_at_from_internal(int index, double start_seconds, bool pu
 
 void play_track_at_from(int index, double start_seconds) {
     reset_decoder_failure_tracking();
-    play_track_at_from_internal(index, start_seconds, true);
+    play_track_at_from_internal(index, start_seconds, true, false);
 }
 
 /* Called from update_timer_cb when audio_consume_track_advanced() reports
@@ -2404,7 +2445,7 @@ void on_track_auto_advanced(int index) {
 
 void play_track_at(int index) {
     reset_decoder_failure_tracking();
-    play_track_at_from_internal(index, 0.0, true);
+    play_track_at_from_internal(index, 0.0, true, false);
 }
 
 void on_file_selected(char ** new_playlist, int count, int selected_index) {
@@ -2511,6 +2552,36 @@ void on_file_browser_selected(char ** new_playlist, int count, int selected_inde
 void toggle_play_pause(void) {
     reset_decoder_failure_tracking();
     if (playlist_index < 0) return; /* nothing loaded yet */
+    /* Same reasoning as play_track_at_from_internal()'s own call -- local
+     * playback (resuming here) should win over an active AirPlay stream,
+     * not silently fight it or no-op underneath a session it doesn't know
+     * about. No-op when nothing is actively streaming. */
+    if (airplay_control_disconnect_active_stream()) {
+        /* AirPlay's own audio_stop() already tore down have_current back
+         * when the stream first took over the output device (see airplay_
+         * bridge.c's run_session()) -- audio_toggle_pause() further below
+         * checks !have_current and would be a guaranteed no-op here, doing
+         * nothing while set_play_button_state(false) claims it did.
+         * audio_get_position_seconds() still reports the last real playback
+         * position though: frames_played/current_sample_rate aren't reset
+         * by that teardown, the same fact the AUDIO_ERROR_OUTPUT_FAILED
+         * recovery path elsewhere in this file already relies on. Resume
+         * there directly instead of falling through.
+         *
+         * Calls play_track_at_from_internal() directly (skip_airplay_
+         * disconnect=true) rather than the public play_track_at_from() --
+         * that would call airplay_control_disconnect_active_stream() a
+         * SECOND time. airplay_control_stop()/airplay_bridge_stop() are
+         * fire-and-forget (see their own comments), so is_streaming() can
+         * still read true for a short window after the call just above
+         * returned; a second disconnect seeing that stale true would kill
+         * and respawn shairport again right on top of the first respawn
+         * still settling. reset_decoder_failure_tracking() was already
+         * called at the top of this function, so skip play_track_at_from()'s
+         * own redundant call to it too. */
+        play_track_at_from_internal(playlist_index, audio_get_position_seconds(), true, true);
+        return;
+    }
     if (deferred_resume_pending) {
         double start_seconds = deferred_resume_position;
         deferred_resume_pending = false;
@@ -3047,7 +3118,7 @@ void gui_player_handle_track_finished(void) {
     int finished_index = compute_auto_advance_index(playlist_index);
     if (finished_index >= 0) {
         commit_auto_advance();
-        play_track_at_from_internal(finished_index, 0.0, false);
+        play_track_at_from_internal(finished_index, 0.0, false, false);
     } else {
         set_play_button_state(false);
     }
@@ -3149,7 +3220,7 @@ void gui_player_handle_playback_error_ex(audio_error_t err, uint64_t err_generat
         deferred_resume_pending = false;
         deferred_resume_position = 0.0;
         show_error_toast("Skipped unplayable track");
-        play_track_at_from_internal(plan.target_index, 0.0, false);
+        play_track_at_from_internal(plan.target_index, 0.0, false, false);
     }
 }
 

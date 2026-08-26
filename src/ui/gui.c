@@ -1222,6 +1222,7 @@ static void update_timer_cb(lv_timer_t * timer) {
         gui_player_handle_track_finished();
     }
     gui_player_poll_confirmed_playback();
+    gui_network_poll_airplay_overlay();
     gui_track_info_poll();
 
     /* All correctness-critical work above (buttons, queue transitions and
@@ -1629,7 +1630,14 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     if (current_settings.wifi_dac_mode_enabled) {
         char name[64];
         get_device_name(name, sizeof(name));
-        airplay_control_start(name);
+        if (!airplay_control_start(name)) {
+            /* Startup is transactional (airplay_control_start()'s own
+             * comment) -- nothing was actually left running, so don't leave
+             * the setting claiming AirPlay is on. */
+            current_settings.wifi_dac_mode_enabled = false;
+            settings_save(&current_settings);
+            show_error_toast("AirPlay failed to start");
+        }
     }
     if (current_settings.dlna_renderer_enabled) dlna_control_start();
     if (current_settings.remote_control_enabled) remote_control_start();

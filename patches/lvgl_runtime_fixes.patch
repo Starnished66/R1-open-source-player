@@ -1,0 +1,72 @@
+diff --git a/src/libs/tiny_ttf/lv_tiny_ttf.c b/src/libs/tiny_ttf/lv_tiny_ttf.c
+index b185d39..f1033b7 100644
+--- a/src/libs/tiny_ttf/lv_tiny_ttf.c
++++ b/src/libs/tiny_ttf/lv_tiny_ttf.c
+@@ -134,6 +134,8 @@ void lv_tiny_ttf_destroy(lv_font_t * font)
+ 
+ void lv_tiny_ttf_init(void)
+ {
++    if(tiny_ttf_cache != NULL) return;
++
+     lv_cache_ops_t ops = {
+         .compare_cb = (lv_cache_compare_cb_t)tiny_ttf_cache_compare_cb,
+         .create_cb = (lv_cache_create_cb_t)tiny_ttf_cache_create_cb,
+@@ -145,7 +147,10 @@ void lv_tiny_ttf_init(void)
+ 
+ void lv_tiny_ttf_deinit(void)
+ {
+-    lv_cache_destroy(tiny_ttf_cache, NULL);
++    if(tiny_ttf_cache != NULL) {
++        lv_cache_destroy(tiny_ttf_cache, NULL);
++        tiny_ttf_cache = NULL;
++    }
+ }
+ 
+ /**********************
+@@ -286,6 +291,9 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
+         dsc->stream.size = data_size;
+     }
+     if(0 == stbtt_InitFont(&dsc->info, &dsc->stream, stbtt_GetFontOffsetForIndex(&dsc->stream, 0))) {
++        if(path != NULL) {
++            lv_fs_close(&dsc->file);
++        }
+         lv_free(dsc);
+         LV_LOG_ERROR("tiny_ttf: init failed\n");
+         return NULL;
+@@ -302,6 +310,11 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
+ 
+     lv_font_t * out_font = lv_malloc_zeroed(sizeof(lv_font_t));
+     if(out_font == NULL) {
++#if LV_TINY_TTF_FILE_SUPPORT != 0
++        if(path != NULL) {
++            lv_fs_close(&dsc->file);
++        }
++#endif
+         lv_free(dsc);
+         LV_LOG_ERROR("tiny_ttf: out of memory\n");
+         return NULL;
+diff --git a/src/libs/tjpgd/tjpgdcnf.h b/src/libs/tjpgd/tjpgdcnf.h
+index dc27d6a..514b63d 100644
+--- a/src/libs/tjpgd/tjpgdcnf.h
++++ b/src/libs/tjpgd/tjpgdcnf.h
+@@ -12,7 +12,7 @@
+ /  2: Grayscale (8-bit/pix)
+ */
+ 
+-#define JD_USE_SCALE    0
++#define JD_USE_SCALE    1
+ /* Switches output descaling feature.
+ /  0: Disable
+ /  1: Enable
+diff --git a/src/misc/cache/_lv_cache_lru_rb.c b/src/misc/cache/_lv_cache_lru_rb.c
+index 097f764..b6e7bb6 100644
+--- a/src/misc/cache/_lv_cache_lru_rb.c
++++ b/src/misc/cache/_lv_cache_lru_rb.c
+@@ -403,6 +403,7 @@ static void drop_all_cb(lv_cache_t * cache, void * user_data)
+ 
+     lv_rb_destroy(&lru->rb);
+     _lv_ll_clear(&lru->ll);
++    lv_rb_init(&lru->rb, lru->cache.ops.compare_cb, lv_cache_entry_get_size(lru->cache.node_size) + sizeof(void *));
+ 
+     cache->size = 0;
+ }

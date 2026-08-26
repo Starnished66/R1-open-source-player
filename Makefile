@@ -34,6 +34,126 @@ $(info Cloning LVGL v9.1.0...)
 $(shell git clone --depth 1 -b v9.1.0 https://github.com/lvgl/lvgl.git)
 endif
 
+# This project's own LVGL checkout (gitignored -- real upstream source,
+# not ours to redistribute) carries three categories of local
+# customization that upstream v9.1.0 does not have, all needed for a
+# clean GitHub clone to both LINK and BEHAVE like this developer's tree
+# (see ISSUES.md's "clean GitHub clones cannot link the transition
+# compositor" entry -- fixing only the first category still leaves a
+# clean-cloned build behaviorally different, which is exactly the mistake
+# that entry warns against):
+#
+#   1. fbdev compositor (patches/lvgl_fbdev_compositor.patch): six
+#      functions (lv_linux_fbdev_get_active_page/get_inactive_page/
+#      get_stride/begin_external_composition/present_external_page/
+#      end_external_composition) that transition_compositor.c and
+#      gui_navigation.c call to drive pan-flip transition animations
+#      directly against the two physical framebuffer pages. Missing
+#      entirely from upstream -- a clean clone fails to link with
+#      "undefined reference to `lv_linux_fbdev_get_active_page'" (and the
+#      other five) the moment either caller is linked in.
+#   2. runtime fixes (patches/lvgl_runtime_fixes.patch): three small
+#      genuine upstream bugs this app hit in practice, not feature work --
+#      lv_tiny_ttf_init()/_deinit() missing a null-guard (a second init
+#      call, or deinit after a failed init, double-destroys/leaks the
+#      shared font cache) plus two error paths in lv_tiny_ttf_create()
+#      that leaked an open font-file handle; _lv_cache_lru_rb.c's
+#      drop_all_cb() destroyed the cache's red-black tree without
+#      reinitializing it, so any cache use after a full clear (e.g. a
+#      settings change that invalidates cached UI bitmaps) operated on a
+#      destroyed tree; tjpgdcnf.h's JD_USE_SCALE was left at the upstream
+#      default of 0, disabling TJpgDec's own output downscaling that this
+#      app's album-art thumbnail path relies on to decode cover JPEGs
+#      straight to thumbnail resolution instead of full-size-then-
+#      software-resize (see ISSUES.md's Albums-screen overheat/OOM entry).
+#   3. generated fonts (patches/lvgl_generated_fonts/, copied in whole
+#      rather than diffed): the four Montserrat .c files regenerated with
+#      an expanded lv_font_conv codepoint range (Latin-1 Supplement +
+#      Latin Extended-A + typographic punctuation added to upstream's
+#      bare ASCII range -- each font file's own header comment records
+#      the exact lv_font_conv invocation) so real-world artist/album
+#      metadata with accented characters or curly quotes/en-dashes
+#      renders correctly instead of showing tofu boxes. These are
+#      machine-generated hex-array files with no stable diff context
+#      (every glyph/kerning table shifts on any range change), so unlike
+#      the two patches above they are tracked and restored as whole-file
+#      copies rather than a text diff -- diffing them would be both far
+#      larger than the files themselves and fragile to patch fuzz.
+#
+# LVGL_PINNED_COMMIT is v9.1.0's tag commit (the tag object peels to this
+# -- `git ls-remote https://github.com/lvgl/lvgl.git refs/tags/
+# v9.1.0^{}`), checked before touching anything so none of the three
+# categories above can silently apply to a different LVGL revision and
+# produce a corrupted tree.
+#
+# All three are applied/verified by one real stamp-file TARGET
+# (LVGL_PATCH_STAMP below, wired as a NORMAL prerequisite -- not
+# order-only -- on every object pattern rule that compiles either LVGL or
+# this app's own sources). Two independent reasons neither the stamp nor
+# the normal-prerequisite choice can be relaxed: (1) app code needs the
+# patched lv_linux_fbdev.h visible at ITS OWN compile time too, not just
+# LVGL's -- without real prototypes, an implicit declaration of a
+# pointer-returning function is undefined behavior on the mipsel target,
+# not just a warning; (2) this project has no per-file #include
+# dependency tracking (no -MMD/.d generation anywhere in this Makefile),
+# so if a future revision of any of the three categories changes what
+# callers see, only a NORMAL prerequisite forces every object --
+# including ones some earlier build already compiled and cached -- to be
+# reconsidered against the new stamp timestamp; an order-only prerequisite
+# only guarantees the stamp exists before a first build, not that
+# already-built objects get rebuilt when it changes later, silently
+# reintroducing stale-ABI object files.
+#
+# This is a real stamp-file target rather than another parse-time
+# $(shell ...) block like the clones above because a parse-time $(shell
+# git clone ...) call's exit status is never checked by Make -- a failed
+# clone would silently fall through to a confusing "missing symbols for
+# half of LVGL" failure much further downstream. A real target's recipe
+# can fail loudly and stop the build exactly where the real problem is,
+# which matters more here than for the plain clones above because this
+# step has far more ways to fail on its own (wrong LVGL revision, a patch
+# doesn't apply, a partially-patched tree, a patch updated since last
+# applied, a generated font file that matches neither pristine nor the
+# tracked golden copy) than a plain clone does.
+LVGL_PATCH := patches/lvgl_fbdev_compositor.patch
+LVGL_RUNTIME_FIXES_PATCH := patches/lvgl_runtime_fixes.patch
+LVGL_GENERATED_FONTS_DIR := patches/lvgl_generated_fonts
+LVGL_GENERATED_FONTS := lv_font_montserrat_16.c lv_font_montserrat_20.c lv_font_montserrat_22.c lv_font_montserrat_28.c
+LVGL_PINNED_COMMIT := e1c0b21b2723d391b885de4b2ee5cc997eccca91
+LVGL_FBDEV_C := $(LVGL_DIR)/src/drivers/display/fb/lv_linux_fbdev.c
+LVGL_FBDEV_H := $(LVGL_DIR)/src/drivers/display/fb/lv_linux_fbdev.h
+LVGL_TINY_TTF := $(LVGL_DIR)/src/libs/tiny_ttf/lv_tiny_ttf.c
+LVGL_TJPGDCNF := $(LVGL_DIR)/src/libs/tjpgd/tjpgdcnf.h
+LVGL_LRU_RB := $(LVGL_DIR)/src/misc/cache/_lv_cache_lru_rb.c
+LVGL_FONT_TARGETS := $(LVGL_GENERATED_FONTS:%=$(LVGL_DIR)/src/font/%)
+LVGL_FONT_GOLDEN := $(LVGL_GENERATED_FONTS:%=$(LVGL_GENERATED_FONTS_DIR)/%)
+LVGL_PATCH_STAMP := $(LVGL_DIR)/.lvgl_fbdev_patch_applied
+# "Already applied?" for the two patches is decided by `patch --dry-run
+# --reverse` against the CURRENT patch file (see the stamp recipe below)
+# -- an exact byte-for-byte check of real file content against exactly
+# what that patch produces, not a heuristic. That one check already means
+# a revised patch against an already-patched tree is correctly detected
+# as needing re-evaluation (the old content won't reverse-apply cleanly
+# against the new patch text) rather than being waved through because a
+# function name happened to still be present. `--force --fuzz=0` on every
+# invocation is deliberate, not decoration: `patch`'s own default
+# heuristics silently defeat this exact-match guarantee otherwise --
+# `-t`/`--batch` INCREASES auto-detection of "this looks reversed, flip
+# it" per near GNU patch's own manual, which was caught live during
+# testing giving a false "already applied" verdict on a tree where only
+# one of two files actually had the change; and any nonzero --fuzz lets a
+# hunk land at the wrong offset with reduced context confidence instead
+# of failing outright. LVGL_FBDEV_SYMBOLS below is only a cheap secondary
+# sanity check run once, right after a fresh forward-apply of the fbdev
+# patch specifically, checked against BOTH files (a declaration in the
+# header with no matching definition in the .c file is exactly how the
+# original undefined-reference bug could resurface despite looking
+# "patched"). The generated-font files use a different, simpler check
+# (see the recipe) since they are whole-file copies, not diffs.
+LVGL_FBDEV_SYMBOLS := lv_linux_fbdev_get_active_page lv_linux_fbdev_get_inactive_page \
+                      lv_linux_fbdev_get_stride lv_linux_fbdev_begin_external_composition \
+                      lv_linux_fbdev_present_external_page lv_linux_fbdev_end_external_composition
+
 # dr_flac (single-header FLAC decoder, used on both host and target)
 ifeq ($(wildcard $(DR_LIBS_DIR)),)
 $(info Cloning dr_libs (dr_flac)...)
@@ -354,15 +474,90 @@ $(HOST_BIN): $(HOST_OBJS)
 	$(CXX) -o $@ $(HOST_OBJS) $(HOST_LDFLAGS)
 	@echo "Host build complete: Run './$(HOST_BIN)' to start the simulator."
 
-build_host/%.o: src/%.c
+# See LVGL_PATCH's own comment further up for why this exists. Depends on
+# the two fbdev source files themselves (so editing/reverting either one
+# by hand invalidates the stamp via a normal newer-than-target check) and
+# on the tracked patch file (so a future change to the patch itself also
+# invalidates it), not just on $(LVGL_DIR) existing.
+$(LVGL_PATCH_STAMP): $(LVGL_FBDEV_C) $(LVGL_FBDEV_H) $(LVGL_PATCH) \
+                     $(LVGL_TINY_TTF) $(LVGL_TJPGDCNF) $(LVGL_LRU_RB) $(LVGL_RUNTIME_FIXES_PATCH) \
+                     $(LVGL_FONT_TARGETS) $(LVGL_FONT_GOLDEN)
+	@set -e; \
+	actual_commit=$$(git -C $(LVGL_DIR) rev-parse HEAD 2>/dev/null || echo ""); \
+	if [ "$$actual_commit" != "$(LVGL_PINNED_COMMIT)" ]; then \
+	  echo "ERROR: $(LVGL_DIR) is at commit '$$actual_commit', not the pinned LVGL v9.1.0 commit $(LVGL_PINNED_COMMIT)."; \
+	  echo "       This repo's LVGL patches/golden files are only known to apply cleanly to that exact revision."; \
+	  echo "       Remove $(LVGL_DIR) and re-run make to re-clone the pinned tag, or update"; \
+	  echo "       LVGL_PINNED_COMMIT and the patches/golden files together if intentionally bumping LVGL."; \
+	  exit 1; \
+	fi; \
+	if patch -p1 -d $(LVGL_DIR) --force --fuzz=0 --dry-run --reverse < $(LVGL_PATCH) >/dev/null 2>&1; then \
+	  echo "LVGL fbdev compositor patch already applied in $(LVGL_DIR) and matches $(LVGL_PATCH) exactly, skipping."; \
+	elif patch -p1 -d $(LVGL_DIR) --force --fuzz=0 --dry-run < $(LVGL_PATCH) >/dev/null 2>&1; then \
+	  echo "Applying $(LVGL_PATCH) to $(LVGL_DIR)..."; \
+	  patch -p1 -d $(LVGL_DIR) --force --fuzz=0 < $(LVGL_PATCH) || { \
+	    echo "ERROR: $(LVGL_PATCH) failed to apply to $(LVGL_DIR) even though a dry run just succeeded --"; \
+	    echo "       investigate before building (disk full, read-only checkout, concurrent modification)."; \
+	    exit 1; \
+	  }; \
+	  present=0; total=$$(echo $(LVGL_FBDEV_SYMBOLS) | wc -w); \
+	  for sym in $(LVGL_FBDEV_SYMBOLS); do \
+	    grep -q "$$sym" $(LVGL_FBDEV_H) && grep -q "$$sym" $(LVGL_FBDEV_C) && present=$$((present + 1)); \
+	  done; \
+	  if [ "$$present" -ne "$$total" ]; then \
+	    echo "ERROR: patch applied but only $$present/$$total compositor symbols have both a declaration"; \
+	    echo "       (in $(LVGL_FBDEV_H)) and a definition (in $(LVGL_FBDEV_C)) afterward."; \
+	    exit 1; \
+	  fi; \
+	  echo "LVGL fbdev compositor patch applied successfully."; \
+	else \
+	  echo "ERROR: $(LVGL_DIR) matches the pinned commit $(LVGL_PINNED_COMMIT) but its fbdev driver files are"; \
+	  echo "       neither a pristine match for $(LVGL_PATCH) nor an exact match for its already-applied"; \
+	  echo "       result -- partially patched, hand-modified, or patched against a since-updated"; \
+	  echo "       $(LVGL_PATCH). Remove $(LVGL_DIR) and re-run make to start from a clean pinned checkout."; \
+	  exit 1; \
+	fi; \
+	if patch -p1 -d $(LVGL_DIR) --force --fuzz=0 --dry-run --reverse < $(LVGL_RUNTIME_FIXES_PATCH) >/dev/null 2>&1; then \
+	  echo "LVGL runtime-fixes patch already applied in $(LVGL_DIR) and matches $(LVGL_RUNTIME_FIXES_PATCH) exactly, skipping."; \
+	elif patch -p1 -d $(LVGL_DIR) --force --fuzz=0 --dry-run < $(LVGL_RUNTIME_FIXES_PATCH) >/dev/null 2>&1; then \
+	  echo "Applying $(LVGL_RUNTIME_FIXES_PATCH) to $(LVGL_DIR)..."; \
+	  patch -p1 -d $(LVGL_DIR) --force --fuzz=0 < $(LVGL_RUNTIME_FIXES_PATCH) || { \
+	    echo "ERROR: $(LVGL_RUNTIME_FIXES_PATCH) failed to apply to $(LVGL_DIR) even though a dry run just succeeded --"; \
+	    echo "       investigate before building (disk full, read-only checkout, concurrent modification)."; \
+	    exit 1; \
+	  }; \
+	  echo "LVGL runtime-fixes patch applied successfully."; \
+	else \
+	  echo "ERROR: $(LVGL_DIR) matches the pinned commit $(LVGL_PINNED_COMMIT) but tiny_ttf/tjpgd/lru-rb are"; \
+	  echo "       neither a pristine match for $(LVGL_RUNTIME_FIXES_PATCH) nor an exact match for its"; \
+	  echo "       already-applied result. Remove $(LVGL_DIR) and re-run make to start from a clean checkout."; \
+	  exit 1; \
+	fi; \
+	for f in $(LVGL_GENERATED_FONTS); do \
+	  target=$(LVGL_DIR)/src/font/$$f; golden=$(LVGL_GENERATED_FONTS_DIR)/$$f; \
+	  if cmp -s "$$target" "$$golden"; then \
+	    echo "LVGL generated font $$f already matches $$golden, skipping."; \
+	  elif git -C $(LVGL_DIR) diff --quiet -- src/font/$$f 2>/dev/null; then \
+	    echo "Installing $$golden over $$target..."; \
+	    cp "$$golden" "$$target"; \
+	  else \
+	    echo "ERROR: $$target matches neither the pristine pinned-commit content nor $$golden --"; \
+	    echo "       hand-modified or generated from a different source. Remove $(LVGL_DIR) and re-run"; \
+	    echo "       make to start from a clean pinned checkout."; \
+	    exit 1; \
+	  fi; \
+	done; \
+	touch $@
+
+build_host/%.o: src/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
-build_host/%.o: src/%.cpp
+build_host/%.o: src/%.cpp $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CXX) $(HOST_CXXFLAGS) -c $< -o $@
 
-build_host/lvgl/%.o: $(LVGL_DIR)/%.c
+build_host/lvgl/%.o: $(LVGL_DIR)/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
@@ -405,15 +600,15 @@ $(TARGET_BIN): $(TARGET_OBJS)
 	$(CROSS_CXX) -o $@ $(TARGET_OBJS) $(TARGET_LDFLAGS)
 	@echo "Target build complete: File ready at '$(TARGET_BIN)'"
 
-build_target/%.o: src/%.c
+build_target/%.o: src/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
-build_target/%.o: src/%.cpp
+build_target/%.o: src/%.cpp $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CROSS_CXX) $(TARGET_CXXFLAGS) -c $< -o $@
 
-build_target/lvgl/%.o: $(LVGL_DIR)/%.c
+build_target/lvgl/%.o: $(LVGL_DIR)/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 

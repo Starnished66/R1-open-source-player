@@ -1972,35 +1972,6 @@ static bool is_failed_physical_track_cb(int index, void * userdata) {
     return is_failed_physical_path(path);
 }
 
-int compute_decoder_failure_advance_index(int failed_index) {
-    if (failed_index < 0 || playlist_count <= 1) return -1;
-
-    if ((play_mode_t) current_settings.play_mode == PLAY_MODE_SHUFFLE) {
-        ensure_shuffle_order_current();
-        if (!pending_shuffle_order && shuffle_pos + 1 >= playlist_count) {
-            pending_shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
-            if (pending_shuffle_order) {
-                memcpy(pending_shuffle_order, shuffle_order, sizeof(int) * (size_t) playlist_count);
-                fisher_yates_shuffle(pending_shuffle_order, playlist_count);
-            }
-        }
-    }
-
-    failure_advance_plan_t plan = compute_decoder_failure_advance_plan(
-        failed_index,
-        playlist_count,
-        (int) current_settings.play_mode,
-        queued_pending_count,
-        shuffle_order,
-        shuffle_pos,
-        pending_shuffle_order,
-        is_failed_physical_track_cb,
-        NULL
-    );
-
-    return plan.target_index;
-}
-
 static void commit_decoder_failure_advance_plan(const failure_advance_plan_t * plan) {
     if (!plan || plan->target_index < 0) return;
 
@@ -3086,11 +3057,34 @@ void gui_player_handle_playback_error_ex(audio_error_t err, uint64_t err_generat
     if (err == AUDIO_ERROR_NONE) return;
     if (playlist_index < 0) return;
 
-    /* Stale error rejection: if an error arrived from an older playback generation,
-     * ignore it so it cannot affect or skip a newly selected track. */
+    /* Stale-vs-race generation check: only reject an error OLDER than what
+     * this function has last synced to -- playback_generation only ever
+     * increases, so err_generation < current_playback_generation
+     * unambiguously means this error is about a track already moved past.
+     *
+     * A plain != check is wrong here: the audio thread also bumps
+     * playback_generation on its OWN via a crossfade/gapless promotion
+     * (audio.c's track_advanced=true sites), which the GUI only learns
+     * about by consuming audio_consume_track_advanced() -- and gui.c's
+     * poll checks for an error FIRST, in a single if/else-if chain, so
+     * that consume never runs this tick if an error is also pending. If
+     * the newly-promoted track then fails within the same ~500ms poll
+     * gap (easily possible -- the audio thread runs far more iterations
+     * than that per poll), the error's generation is NEWER than what this
+     * function has seen, not stale -- but a plain != check can't tell
+     * "newer" from "older" and would silently drop a real failure while
+     * audio_consume_error_ex() has already cleared it for good, leaving
+     * the UI believing a track that never actually played is still
+     * playing. Catch up to that pending promotion first (the same call
+     * gui.c's own else-if branch would have made this tick, had the error
+     * not taken priority) so the failure is attributed to the track it
+     * actually happened on. */
     if (err_generation != 0 && current_playback_generation != 0 &&
         err_generation != current_playback_generation) {
-        return;
+        if (err_generation < current_playback_generation) return;
+        if (!audio_consume_track_advanced()) return;
+        gui_player_handle_auto_advance();
+        if (current_playback_generation != err_generation) return;
     }
 
     if (err == AUDIO_ERROR_OUTPUT_FAILED) {

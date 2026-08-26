@@ -1,0 +1,344 @@
+diff --git a/src/drivers/display/fb/lv_linux_fbdev.c b/src/drivers/display/fb/lv_linux_fbdev.c
+index cf529a2..e162698 100644
+--- a/src/drivers/display/fb/lv_linux_fbdev.c
++++ b/src/drivers/display/fb/lv_linux_fbdev.c
+@@ -9,6 +9,18 @@
+ #include "lv_linux_fbdev.h"
+ #if LV_USE_LINUX_FBDEV
+ 
++#include "../../../draw/lv_draw_buf.h"
++/* Needed only for the external-composition handoff (lv_linux_fbdev_end_
++ * external_composition() below) to point disp->buf_act at a specific
++ * physical page directly -- there is no public setter for just buf_act
++ * (lv_display_set_draw_buffers() would also reset buf_1/buf_2, which are
++ * already correct and must not change), and this is exactly the kind of
++ * driver-internal synchronization this header exists for. Nothing outside
++ * this file ever sees or touches disp->buf_act -- see this driver's own
++ * header for why external callers only get the narrow, explicit
++ * begin/get/present/end API instead. */
++#include "../../../display/lv_display_private.h"
++
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <stddef.h>
+@@ -60,6 +72,25 @@ typedef struct {
+     long int screensize;
+     int fbfd;
+     bool force_refresh;
++
++    /* True when /dev/fb0 is double-buffered via panning (yres_virtual >=
++     * 2*yres) and we've handed LVGL the two real physical halves as its
++     * DIRECT-mode draw buffers directly -- see lv_linux_fbdev_set_file().
++     * When true, flush_cb() skips its usual memcpy (pixels already landed
++     * in the right place) and instead pans to whichever half was just
++     * rendered once the frame is complete, tear-free. */
++    bool pan_double_buffer;
++    uint8_t * page0;
++    uint8_t * page1;
++    uint32_t page_yoffset; /* vinfo.yoffset value that selects page1 */
++
++    /* True between a successful lv_linux_fbdev_begin_external_composition()
++     * and its matching lv_linux_fbdev_end_external_composition() -- rejects
++     * a second, nested caller, and lets flush_cb() refuse to independently
++     * pan while some other caller (the transition compositor) owns page
++     * presentation, in case anything ever queues a real LVGL flush during
++     * that window despite invalidation being disabled. */
++    bool external_composition_active;
+ } lv_linux_fb_t;
+ 
+ /**********************
+@@ -222,14 +253,51 @@ void lv_linux_fbdev_set_file(lv_display_t * disp, const char * file)
+ 
+     uint8_t * draw_buf = NULL;
+     uint8_t * draw_buf_2 = NULL;
+-    draw_buf = malloc(draw_buf_size);
+ 
+-    if(LV_LINUX_FBDEV_BUFFER_COUNT == 2) {
+-        draw_buf_2 = malloc(draw_buf_size);
++#if !LV_LINUX_FBDEV_BSD
++    /* If this display is double-buffered via panning (virtual height is at
++     * least twice the visible height) and we've been asked for DIRECT mode
++     * with 2 buffers, skip malloc entirely and hand LVGL the two physical
++     * halves of the real framebuffer as its draw buffers -- LVGL then
++     * renders straight into whichever half isn't currently on screen, and
++     * flush_cb() below just pans to it once the frame's done. This is what
++     * actually eliminates tearing; DIRECT mode with malloc'd buffers alone
++     * does not (see flush_cb). */
++    long int page_bytes = (long int) dsc->finfo.line_length * dsc->vinfo.yres;
++    if(LV_LINUX_FBDEV_RENDER_MODE == LV_DISPLAY_RENDER_MODE_DIRECT && LV_LINUX_FBDEV_BUFFER_COUNT == 2 &&
++       dsc->vinfo.yres_virtual >= dsc->vinfo.yres * 2 && dsc->finfo.smem_len >= page_bytes * 2 &&
++       /* LVGL assumes tightly-packed rows (stride derived purely from
++        * resolution/color format); if the hardware pads each scanline
++        * beyond that, aliasing its real memory directly would skew the
++        * image, so only do this when there's no such padding. */
++       dsc->finfo.line_length == lv_draw_buf_width_to_stride((uint32_t) hor_res, lv_display_get_color_format(disp))) {
++        dsc->pan_double_buffer = true;
++        dsc->page0 = (uint8_t *)dsc->fbp;
++        dsc->page1 = (uint8_t *)dsc->fbp + page_bytes;
++        dsc->page_yoffset = dsc->vinfo.yres;
++        draw_buf = dsc->page0;
++        draw_buf_2 = dsc->page1;
+     }
++#endif /* !LV_LINUX_FBDEV_BSD */
+ 
+-    lv_display_set_buffers(disp, draw_buf, draw_buf_2, draw_buf_size, LV_LINUX_FBDEV_RENDER_MODE);
++    if(!dsc->pan_double_buffer) {
++        draw_buf = malloc(draw_buf_size);
++
++        if(LV_LINUX_FBDEV_BUFFER_COUNT == 2) {
++            draw_buf_2 = malloc(draw_buf_size);
++        }
++    }
++
++    /* Must happen before lv_display_set_buffers(): that call reads the
++     * display's CURRENT resolution (still lv_display_create()'s 800x480
++     * placeholder at this point) to work out each buffer's width/height/
++     * stride. On a panel that isn't 800x480 those come out transposed --
++     * harmless in PARTIAL mode (flush_cb does its own row math straight
++     * from vinfo/finfo, ignoring these), but DIRECT mode's internal
++     * buffer-sync (lv_draw_buf_copy) trusts them directly and walks off
++     * the end of the real buffer, segfaulting. */
+     lv_display_set_resolution(disp, hor_res, ver_res);
++    lv_display_set_buffers(disp, draw_buf, draw_buf_2, draw_buf_size, LV_LINUX_FBDEV_RENDER_MODE);
+ 
+     if(width > 0) {
+         lv_display_set_dpi(disp, DIV_ROUND_UP(hor_res * 254, width * 10));
+@@ -245,6 +313,98 @@ void lv_linux_fbdev_set_force_refresh(lv_display_t * disp, bool enabled)
+     dsc->force_refresh = enabled;
+ }
+ 
++const void * lv_linux_fbdev_get_active_page(lv_display_t * disp)
++{
++    if(!disp) return NULL;
++    lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
++    if(!dsc || !dsc->pan_double_buffer) return NULL;
++    return (dsc->vinfo.yoffset == dsc->page_yoffset) ? dsc->page1 : dsc->page0;
++}
++
++void * lv_linux_fbdev_get_inactive_page(lv_display_t * disp)
++{
++    if(!disp) return NULL;
++    lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
++    if(!dsc || !dsc->pan_double_buffer) return NULL;
++    /* Writable (unlike get_active_page() above) -- callers write into this
++     * one directly, which is exactly what makes it safe to write into: it's
++     * never the page currently being scanned out. */
++    return (dsc->vinfo.yoffset == dsc->page_yoffset) ? dsc->page0 : dsc->page1;
++}
++
++uint32_t lv_linux_fbdev_get_stride(lv_display_t * disp)
++{
++    if(!disp) return 0;
++    lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
++    if(!dsc || !dsc->pan_double_buffer) return 0;
++    return (uint32_t) dsc->finfo.line_length;
++}
++
++bool lv_linux_fbdev_begin_external_composition(lv_display_t * disp)
++{
++    if(!disp) return false;
++    lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
++    if(!dsc || !dsc->pan_double_buffer) return false;
++    if(dsc->external_composition_active) return false; /* reject nested ownership */
++    dsc->external_composition_active = true;
++    return true;
++}
++
++bool lv_linux_fbdev_present_external_page(lv_display_t * disp)
++{
++    if(!disp) return false;
++    lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
++    if(!dsc || !dsc->pan_double_buffer || !dsc->external_composition_active) return false;
++#if LV_LINUX_FBDEV_BSD
++    return false; /* pan_double_buffer is never true on a BSD build (see lv_linux_fbdev_set_file()), so this is unreachable in practice -- kept explicit rather than falling through to code that assumes the Linux fb_var_screeninfo shape */
++#else
++    /* Same target-half computation flush_cb()'s own pan branch uses, just
++     * driven by our own bookkeeping instead of a just-flushed color_p
++     * pointer -- whichever half is currently INACTIVE (about to become
++     * active) is exactly the one the caller just finished writing into. */
++    uint32_t target_yoffset = (dsc->vinfo.yoffset == dsc->page_yoffset) ? 0 : dsc->page_yoffset;
++    if(dsc->vinfo.yoffset == target_yoffset) return true; /* already showing the right page -- nothing to do */
++
++    /* Pan using a TEMPORARY copy, only committing dsc->vinfo.yoffset after
++     * FBIOPAN_DISPLAY actually succeeds -- the previous version wrote
++     * dsc->vinfo.yoffset before the ioctl, so a failed pan left this
++     * driver's own bookkeeping claiming a page change that never physically
++     * happened, silently desyncing every later get_active_page()/
++     * get_inactive_page() call from the real hardware state. */
++    struct fb_var_screeninfo tmp = dsc->vinfo;
++    tmp.yoffset = target_yoffset;
++    if(ioctl(dsc->fbfd, FBIOPAN_DISPLAY, &tmp) == -1) {
++        perror("Error panning display");
++        return false;
++    }
++    dsc->vinfo.yoffset = target_yoffset;
++    return true;
++#endif /* LV_LINUX_FBDEV_BSD */
++}
++
++bool lv_linux_fbdev_end_external_composition(lv_display_t * disp)
++{
++    if(!disp) return false;
++    lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
++    if(!dsc || !dsc->external_composition_active) return false;
++    dsc->external_composition_active = false;
++
++    /* LVGL's own DIRECT-mode buffer alternation (disp->buf_act, toggled only
++     * by lv_refr.c's own flush bookkeeping) has no idea this driver just
++     * panned the physical display independently of any real LVGL render --
++     * left alone, its next render could target buf_act pointing at the
++     * page CURRENTLY being scanned out (whichever one an external caller
++     * just presented), corrupting the live screen mid-redraw instead of
++     * the inactive one. Point buf_act at the real, current INACTIVE
++     * physical page directly so the very next lv_refr_now() is guaranteed
++     * to render somewhere safe to write. */
++    if(dsc->pan_double_buffer) {
++        bool page1_active = (dsc->vinfo.yoffset == dsc->page_yoffset);
++        disp->buf_act = page1_active ? disp->buf_1 : disp->buf_2;
++    }
++    return true;
++}
++
+ /**********************
+  *   STATIC FUNCTIONS
+  **********************/
+@@ -253,6 +413,57 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
+ {
+     lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
+ 
++#if !LV_LINUX_FBDEV_BSD
++    if(dsc->pan_double_buffer) {
++        /* An external caller (the transition compositor) currently owns
++         * page presentation -- see lv_linux_fbdev_begin_external_
++         * composition(). Invalidation is disabled for that whole window so
++         * nothing should ever queue a real LVGL flush during it, but this
++         * is a deliberate defense-in-depth guard rather than an assumption:
++         * panning independently here, on top of whatever the external
++         * caller is doing, would be an immediate tear/corruption risk. Just
++         * drop the flush -- there is nothing safe to do with it. */
++        if(dsc->external_composition_active) {
++            lv_display_flush_ready(disp);
++            return;
++        }
++        /* Nothing to copy -- LVGL already rendered straight into whichever
++         * physical half (page0/page1) it picked for this frame. Once that
++         * frame is fully drawn (all its dirty areas flushed), pan to that
++         * half so it becomes the one actually being scanned out. The half
++         * NOT being displayed is always safe to render into regardless of
++         * scanout timing, which is what actually kills the tearing -- the
++         * pan itself only needs to line up with vblank, which fbdev drivers
++         * are expected to handle internally for FBIOPAN_DISPLAY. An earlier
++         * version of this also called FBIO_WAITFORVSYNC before panning as
++         * an extra safety net, but on real hardware that added a
++         * noticeable, consistent bump to touch-to-screen latency on EVERY
++         * redraw (not just transitions) -- likely double-waiting for a
++         * vblank the pan was already going to wait for on its own. Removed;
++         * if a future panel needs it back, gate it behind a flag rather
++         * than always-on. */
++        if(lv_display_flush_is_last(disp)) {
++            uint32_t target_yoffset = (color_p == dsc->page1) ? dsc->page_yoffset : 0;
++            if(dsc->vinfo.yoffset != target_yoffset) {
++                /* Temporary copy, committed only on success -- see
++                 * lv_linux_fbdev_present_external_page()'s own comment on
++                 * why writing dsc->vinfo.yoffset before confirming the
++                 * ioctl succeeded is a real desync risk, not just tidiness. */
++                struct fb_var_screeninfo tmp = dsc->vinfo;
++                tmp.yoffset = target_yoffset;
++                if(ioctl(dsc->fbfd, FBIOPAN_DISPLAY, &tmp) == -1) {
++                    perror("Error panning display");
++                }
++                else {
++                    dsc->vinfo.yoffset = target_yoffset;
++                }
++            }
++        }
++        lv_display_flush_ready(disp);
++        return;
++    }
++#endif /* !LV_LINUX_FBDEV_BSD */
++
+     if(dsc->fbp == NULL ||
+        area->x2 < 0 || area->y2 < 0 ||
+        area->x1 > (int32_t)dsc->vinfo.xres - 1 || area->y1 > (int32_t)dsc->vinfo.yres - 1) {
+diff --git a/src/drivers/display/fb/lv_linux_fbdev.h b/src/drivers/display/fb/lv_linux_fbdev.h
+index c14e973..b3e639a 100644
+--- a/src/drivers/display/fb/lv_linux_fbdev.h
++++ b/src/drivers/display/fb/lv_linux_fbdev.h
+@@ -39,6 +39,77 @@ void lv_linux_fbdev_set_file(lv_display_t * disp, const char * file);
+  */
+ void lv_linux_fbdev_set_force_refresh(lv_display_t * disp, bool enabled);
+ 
++/**
++ * When double buffering via panning is active (see lv_linux_fbdev.c's
++ * pan_double_buffer), returns a pointer to whichever physical half is
++ * CURRENTLY being scanned out -- i.e. exactly what's on screen right now,
++ * with no render needed to get it. Const: callers only ever need to COPY
++ * this (e.g. into an owned transition-source buffer), never write into the
++ * page still being displayed. Returns NULL if pan-based double buffering
++ * isn't active for this display.
++ */
++const void * lv_linux_fbdev_get_active_page(lv_display_t * disp);
++
++/**
++ * The physical half NOT currently being scanned out -- i.e. safe to write
++ * into directly regardless of scanout timing, the same guarantee
++ * flush_cb()'s own pan_double_buffer branch relies on. Deliberately
++ * writable (unlike lv_linux_fbdev_get_active_page() above): this is the
++ * one page callers are expected to draw into directly. Returns NULL under
++ * the same conditions lv_linux_fbdev_get_active_page() does.
++ */
++void * lv_linux_fbdev_get_inactive_page(lv_display_t * disp);
++
++/**
++ * Bytes per scanline for the two pan_double_buffer physical pages. Only
++ * meaningful (and only ever non-zero) when pan-based double buffering is
++ * actually active -- lv_linux_fbdev_set_file() itself never enables it
++ * unless the hardware's real line_length exactly matches this same value,
++ * so callers can always treat a non-zero result as "tightly packed,
++ * hor_res * bytes-per-pixel".
++ */
++uint32_t lv_linux_fbdev_get_stride(lv_display_t * disp);
++
++/**
++ * External-composition handoff -- for a caller (the transition compositor)
++ * that wants to write directly into the physical framebuffer pages for a
++ * whole sequence of frames, bypassing LVGL's own render/flush pipeline
++ * entirely. Callers must still separately disable LVGL invalidation for
++ * the duration (lv_display_enable_invalidation()) -- this call only
++ * concerns the fbdev driver's own bookkeeping: it rejects a second, nested
++ * caller, and makes flush_cb() refuse to independently pan while active
++ * (see flush_cb()'s own comment). Returns false (no state changed) if
++ * pan-based double buffering isn't active, or a composition session is
++ * already in progress.
++ */
++bool lv_linux_fbdev_begin_external_composition(lv_display_t * disp);
++
++/**
++ * Pans the display straight to whichever physical half
++ * lv_linux_fbdev_get_inactive_page() currently returns, and updates this
++ * driver's own bookkeeping (vinfo.yoffset) to match -- only after
++ * confirming the underlying FBIOPAN_DISPLAY ioctl actually succeeded (a
++ * failed pan leaves this driver's bookkeeping exactly as it was, so
++ * get_active_page()/get_inactive_page() keep describing the real, still-
++ * physically-current page rather than one that was never actually panned
++ * to). Must be called between a successful lv_linux_fbdev_begin_external_
++ * composition() and its matching end call. Returns false (no-op) if that
++ * precondition isn't met or the underlying pan ioctl itself fails.
++ */
++bool lv_linux_fbdev_present_external_page(lv_display_t * disp);
++
++/**
++ * Ends an external-composition session started by lv_linux_fbdev_begin_
++ * external_composition() -- also re-synchronizes LVGL's own next render
++ * target (disp->buf_act, internal to LVGL's core and not otherwise exposed
++ * outside this driver) to point at the real, current INACTIVE physical
++ * page, so the very next ordinary LVGL render is guaranteed to draw
++ * somewhere safe rather than into whatever page an external caller just
++ * presented. Callers must still separately re-enable LVGL invalidation
++ * afterward. Returns false (no-op) if no composition session is active.
++ */
++bool lv_linux_fbdev_end_external_composition(lv_display_t * disp);
++
+ /**********************
+  *      MACROS
+  **********************/

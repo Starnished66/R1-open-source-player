@@ -256,21 +256,4 @@ static inline failure_advance_plan_t compute_decoder_failure_advance_plan(
     }
 }
 
-/* Convenience wrapper returning only the next candidate index */
-static inline int compute_decoder_failure_advance_index_pure(
-    int failed_index,
-    int playlist_count,
-    int play_mode,
-    int queued_pending_count,
-    const int * shuffle_order,
-    int shuffle_pos,
-    const int * pending_shuffle_order)
-{
-    failure_advance_plan_t plan = compute_decoder_failure_advance_plan(
-        failed_index, playlist_count, play_mode, queued_pending_count,
-        shuffle_order, shuffle_pos, pending_shuffle_order, NULL, NULL
-    );
-    return plan.target_index;
-}
-
 #endif /* AUDIO_HELPERS_H */

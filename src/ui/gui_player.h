@@ -82,7 +82,6 @@ void gui_player_cancel_background_work(void);
 
 
 int compute_auto_advance_index(int index);
-int compute_decoder_failure_advance_index(int failed_index);
 void reset_decoder_failure_tracking(void);
 extern bool user_seeking;
 extern bool deferred_resume_pending;

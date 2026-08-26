@@ -6,7 +6,7 @@
 #include "artwork_coordinator.h"
 
 #define MAX_PLAYER_COVER_SIDE 1200
-#define MAX_THUMBNAIL_COVER_SIDE 800
+#define MAX_THUMBNAIL_COVER_SIDE 1200
 
 typedef enum {
     COVER_DECODE_OK = 0,

@@ -238,6 +238,53 @@ int main(void) {
         free(srows);
     }
 
+    /* Rockbox treats every non-numeric tag file as part of one database
+     * schema: a committed generation missing albumartist must be rejected,
+     * not guessed to be a legacy schema.  That same missing file can be the
+     * residue of an interrupted/corrupt transaction. */
+    {
+        metadata_db_close();
+        snprintf(cmd, sizeof(cmd), "rm -rf %s && mkdir -p %s", dir, dir);
+        if (system(cmd) != 0) fail("setup incomplete generation test");
+        if (chdir(dir) != 0) fail("chdir incomplete generation test");
+        metadata_db_open();
+        cached_tags_t t = { 0 };
+        snprintf(t.title, sizeof(t.title), "%s", "Track 1");
+        snprintf(t.artist, sizeof(t.artist), "%s", "Artist");
+        snprintf(t.album, sizeof(t.album), "%s", "Album");
+        snprintf(t.album_artist, sizeof(t.album_artist), "%s", "Album Artist");
+        metadata_db_begin_update();
+        metadata_db_put("/music/incomplete.flac", 100, 1000, &t);
+        if (!metadata_db_end_update()) fail("incomplete generation test commit");
+        metadata_db_close();
+
+        FILE * gen_file = fopen(".open_hiby_player/tagcache.gen", "r");
+        int gen = 0;
+        if (!gen_file || fscanf(gen_file, "%d", &gen) != 1 || gen <= 0)
+            fail("read active generation");
+        fclose(gen_file);
+        char missing_path[128];
+        snprintf(missing_path, sizeof(missing_path),
+                 ".open_hiby_player/database_7.tcd.g%d", gen);
+        if (unlink(missing_path) != 0) fail("remove required albumartist file");
+        metadata_db_open();
+        if (metadata_db_get_song_count() != 0)
+            fail("incomplete generation should present empty library");
+    }
+
+    /* Test corrupt database recovery: truncated master header must fail cleanly without crash */
+    {
+        metadata_db_close();
+        FILE * f = fopen(".open_hiby_player/database_idx.tcd.g1", "wb");
+        if (f) {
+            uint8_t garbage[16] = { 0x12, 0x34, 0x56, 0x78 };
+            fwrite(garbage, 1, sizeof(garbage), f);
+            fclose(f);
+        }
+        metadata_db_open();
+        if (metadata_db_get_song_count() != 0) fail("corrupt db should present empty library");
+    }
+
     metadata_db_close();
     printf("ok\n");
     return 0;

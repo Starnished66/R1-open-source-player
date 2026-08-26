@@ -63,12 +63,9 @@ extern void generic_back_cb(lv_event_t * e);
 static lv_obj_t * lyrics_screen;
 /* ---- Fullscreen lyrics view state -- see build_lyrics_screen() and the
  * async .lrc load / backdrop generation just above poll_cover_decode()'s
- * own section. All declared here (rather than local to whichever function
- * first uses them) for the same reason gui_player_get_cover_img()/current_cover_bytes above
- * are: the async load/poll functions and the screen builder that actually
- * creates the LVGL objects live in different parts of this file, and every
- * static in this file is visible to all of them regardless of definition
- * order. ---- */
+ * own section. All declared here because the async load/poll functions and
+ * the screen builder that creates the LVGL objects live in different parts
+ * of this file. ---- */
 static lyrics_doc_t current_lyrics_doc;
 static bool current_lyrics_doc_valid = false;
 static int current_lyrics_doc_for_index = -1; /* gui_player_get_playlist_index() current_lyrics_doc was loaded for */
@@ -89,8 +86,6 @@ static int lyrics_load_generation = 0;
 extern void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stride, int radius);
 
 
-extern int current_cover_for_index;
-
 typedef struct {
     uint8_t * cover_copy;
     int for_index;
@@ -98,7 +93,6 @@ typedef struct {
 } lyrics_backdrop_request_t;
 
 
-extern const uint8_t * current_cover_bytes;
 extern uint16_t rgb888_to_565_dithered(uint8_t r, uint8_t g, uint8_t b, int x, int y);
 extern void audio_seek(double seconds);
 extern double audio_get_position_seconds(void);
@@ -273,8 +267,7 @@ static void poll_lyrics_load(void) {
         current_lyrics_plain_mode = lyrics_load_result_plain_mode;
         current_lyrics_plain_text = lyrics_load_result_plain_text;
 
-        if ((current_lyrics_doc_valid || current_lyrics_plain_mode) &&
-            current_cover_bytes && current_cover_for_index == gui_player_get_playlist_index())
+        if (current_lyrics_doc_valid || current_lyrics_plain_mode)
             launch_lyrics_backdrop_decode();
     } else {
         if (lyrics_load_result_ok) lyrics_doc_free(&lyrics_load_result_doc); /* stale -- superseded by a later launch before this landed */
@@ -393,13 +386,12 @@ static bool lyrics_backdrop_regenerate_pending = false;
  * cover_decode_pending, a slightly-stale intermediate backdrop for a
  * moment isn't a visible correctness bug, and this is called far less
  * often (screen-open/track-change-while-open, not every track change).
- * Also skips if current_cover_bytes isn't ready yet (rare: tapped during
- * the brief cover-decode window) -- open_lyrics_screen() falls back to a
- * plain dark background for that one instance rather than blocking the
- * tap. */
+ * Also skips if gui_player's decoded cover isn't ready yet (rare: tapped
+ * during the brief cover-decode window). poll_cover_decode() notifies this
+ * module once it becomes available, so that attempt is retried without
+ * blocking the tap. */
 static void launch_lyrics_backdrop_decode(void) {
-    if (!current_cover_bytes || current_cover_for_index != gui_player_get_playlist_index() ||
-        current_lyrics_doc_generation != lyrics_load_generation ||
+    if (current_lyrics_doc_generation != lyrics_load_generation ||
         current_lyrics_doc_for_index != gui_player_get_playlist_index() ||
         (!current_lyrics_doc_valid && !current_lyrics_plain_mode)) return;
     if (current_lyrics_backdrop_for_index == gui_player_get_playlist_index() &&
@@ -414,8 +406,13 @@ static void launch_lyrics_backdrop_decode(void) {
     if (!req) return;
     req->cover_copy = malloc((size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
     if (!req->cover_copy) { free(req); return; }
-    memcpy(req->cover_copy, current_cover_bytes, (size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2);
     req->for_index = gui_player_get_playlist_index();
+    if (!gui_player_copy_cover_rgb565(req->for_index, req->cover_copy,
+                                     (size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2)) {
+        free(req->cover_copy);
+        free(req);
+        return;
+    }
     req->lyrics_generation = lyrics_load_generation;
 
     atomic_store_explicit(&lyrics_backdrop_done_flag, false, memory_order_relaxed);

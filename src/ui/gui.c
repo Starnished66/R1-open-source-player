@@ -202,20 +202,6 @@ void sync_player_topbar_visibility(lv_obj_t * screen);
  * between the plain static buttom.png (no embedded art to reflect) and a
  * freshly generated per-track reflection, hence file-scope rather than a
  * local inside build_player_screen(). */
-/* Backing pixels for the currently-displayed embedded cover art, if any --
- * a plain RGB565 bitmap produced by cover_decode_to_rgb565() (see
- * poll_cover_decode() below), not the original compressed JPEG/PNG bytes. Freed
- * and replaced whenever a new track loads; must outlive the lv_image_set_src()
- * call since current_cover_dsc.data just points at it, unlike a plain PNG
- * file path. */
-uint8_t * current_cover_bytes;
-int current_cover_for_index = -1;
-/* Same idea as current_cover_bytes/current_cover_dsc above, for the
- * generated reflection (see generate_reflection()) shown as
- * player_overlay_panel's background. */
-
-
-
 bool favorite_is_set = false;
 /* Clock, top bar center: real topbar/N.png digit + topbar/colon.png
  * sprites, same asset family as the volume readout below, instead of an

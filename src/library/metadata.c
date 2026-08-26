@@ -1088,6 +1088,7 @@ static uint32_t m4a_read_u32be(const uint8_t * b) {
 
 static bool m4a_read_box_header(FILE * f, m4a_box_t * out) {
     long start = ftell(f);
+    if (start < 0) return false;
     uint8_t hdr[8];
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) return false;
 
@@ -1104,9 +1105,9 @@ static bool m4a_read_box_header(FILE * f, m4a_box_t * out) {
         out->header_size = 16;
     } else if (size32 == 0) {
         long cur = ftell(f);
-        fseek(f, 0, SEEK_END);
+        if (cur < 0 || fseek(f, 0, SEEK_END) != 0) return false;
         long end = ftell(f);
-        fseek(f, cur, SEEK_SET);
+        if (end < start || fseek(f, cur, SEEK_SET) != 0) return false;
         out->size = (uint64_t) (end - start);
         out->header_size = 8;
     } else {
@@ -1130,22 +1131,44 @@ static bool m4a_read_box_header(FILE * f, m4a_box_t * out) {
      * patching every walker that calls this. */
     if (out->size < (uint64_t) out->header_size) return false;
 
+    /* FILE/fseek use a 32-bit long on the target. Validate the still-
+     * unsigned box size before either casting or adding it, otherwise a
+     * corrupt extended-size atom can wrap the next seek backwards and keep
+     * the scanner walking the same bytes indefinitely. */
+    long box_end;
+    if (!safe_chunk_advance(start, out->size, 0, &box_end)) return false;
+
     out->data_start = start + out->header_size;
     return true;
 }
 
-static bool m4a_find_child(FILE * f, long container_start, uint64_t container_size, const char * type, m4a_box_t * out) {
-    long end = container_start + (long) container_size;
-    fseek(f, container_start, SEEK_SET);
+static bool m4a_box_end_within(const m4a_box_t * box, long container_end, long * out_end) {
+    if (!box || box->data_start < box->header_size || container_end < 0) return false;
+    long box_start = box->data_start - box->header_size;
+    long box_end;
+    if (!safe_chunk_advance(box_start, box->size, 0, &box_end)) return false;
+    if (box_end < box->data_start || box_end > container_end) return false;
+    if (out_end) *out_end = box_end;
+    return true;
+}
 
-    while (ftell(f) < end) {
+static bool m4a_find_child(FILE * f, long container_start, uint64_t container_size, const char * type, m4a_box_t * out) {
+    long end;
+    if (!safe_chunk_advance(container_start, container_size, 0, &end) ||
+        fseek(f, container_start, SEEK_SET) != 0)
+        return false;
+
+    for (;;) {
+        long pos = ftell(f);
+        if (pos < 0 || pos >= end) break;
         m4a_box_t box;
         if (!m4a_read_box_header(f, &box)) return false;
+        long next;
+        if (!m4a_box_end_within(&box, end, &next)) return false;
         if (strcmp(box.type, type) == 0) {
             *out = box;
             return true;
         }
-        long next = (long) (box.data_start - box.header_size) + (long) box.size;
         if (fseek(f, next, SEEK_SET) != 0) return false;
     }
     return false;
@@ -1156,11 +1179,14 @@ static bool m4a_find_child(FILE * f, long container_start, uint64_t container_si
  * -- always seen as zeroed/type 1 or 13/14 in practice, not otherwise
  * inspected here) followed immediately by the raw value bytes. */
 static bool m4a_find_data_payload(FILE * f, m4a_box_t parent, long * out_offset, uint32_t * out_size) {
+    if (parent.size < (uint64_t) parent.header_size) return false;
     m4a_box_t data_box;
     if (!m4a_find_child(f, parent.data_start, parent.size - (uint64_t) parent.header_size, "data", &data_box)) return false;
     if (data_box.size < (uint64_t) data_box.header_size + 8) return false;
+    uint64_t payload_size = data_box.size - (uint64_t) data_box.header_size - 8;
+    if (payload_size > UINT32_MAX || data_box.data_start > LONG_MAX - 8) return false;
     *out_offset = data_box.data_start + 8;
-    *out_size = (uint32_t) (data_box.size - (uint64_t) data_box.header_size - 8);
+    *out_size = (uint32_t) payload_size;
     return true;
 }
 
@@ -1245,17 +1271,20 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out, bool in
     FILE * f = fopen(path, "rb");
     if (!f) return;
 
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return; }
     long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (file_size < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return; }
 
     m4a_box_t moov;
     bool found_moov = false;
-    while (ftell(f) < file_size) {
+    for (;;) {
+        long pos = ftell(f);
+        if (pos < 0 || pos >= file_size) break;
         m4a_box_t box;
         if (!m4a_read_box_header(f, &box)) break;
+        long next;
+        if (!m4a_box_end_within(&box, file_size, &next)) break;
         if (strcmp(box.type, "moov") == 0) { moov = box; found_moov = true; break; }
-        long next = (long) (box.data_start - box.header_size) + (long) box.size;
         if (fseek(f, next, SEEK_SET) != 0) break;
     }
     if (!found_moov) { fclose(f); return; }
@@ -1267,15 +1296,28 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out, bool in
     /* Unlike every other container walked here, top-level "meta" is itself a
      * FullBox -- its children start 4 bytes (version+flags) further in
      * than a plain container's would. */
+    if (meta.size < (uint64_t) meta.header_size + 4 || meta.data_start > LONG_MAX - 4) {
+        fclose(f);
+        return;
+    }
     long meta_children_start = meta.data_start + 4;
     uint64_t meta_children_size = meta.size - (uint64_t) meta.header_size - 4;
     if (!m4a_find_child(f, meta_children_start, meta_children_size, "ilst", &ilst)) { fclose(f); return; }
 
-    long ilst_end = ilst.data_start + (long) (ilst.size - (uint64_t) ilst.header_size);
-    fseek(f, ilst.data_start, SEEK_SET);
-    while (ftell(f) < ilst_end) {
+    long ilst_end;
+    if (ilst.size < (uint64_t) ilst.header_size ||
+        !safe_chunk_advance(ilst.data_start, ilst.size - (uint64_t) ilst.header_size, 0, &ilst_end) ||
+        fseek(f, ilst.data_start, SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+    for (;;) {
+        long pos = ftell(f);
+        if (pos < 0 || pos >= ilst_end) break;
         m4a_box_t item;
         if (!m4a_read_box_header(f, &item)) break;
+        long next;
+        if (!m4a_box_end_within(&item, ilst_end, &next)) break;
 
         if (strcmp(item.type, "\xA9" "nam") == 0) {
             m4a_read_text_tag(f, item, out->title, sizeof(out->title), &out->has_title);
@@ -1297,7 +1339,6 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out, bool in
             m4a_read_lyrics_tag(f, item, out);
         }
 
-        long next = (long) (item.data_start - item.header_size) + (long) item.size;
         if (fseek(f, next, SEEK_SET) != 0) break;
     }
 

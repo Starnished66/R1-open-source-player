@@ -2,6 +2,7 @@
 #include <lvgl/lvgl.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "metadata.h"
 #include "settings.h"
 #include "audio.h"
@@ -43,6 +44,10 @@ void gui_player_play_at_from(int index, double start_seconds);
 void gui_player_step_manual(int direction);
 lv_obj_t * gui_player_get_screen(void);
 lv_obj_t * gui_player_get_cover_img(void);
+/* Copies the currently decoded RGB565 cover for `for_index` into `out`.
+ * Keeping ownership inside gui_player avoids exposing a mutable buffer that
+ * is freed and replaced on track changes. */
+bool gui_player_copy_cover_rgb565(int for_index, uint8_t * out, size_t out_size);
 bool gui_player_is_seeking(void);
 
 const char * playlist_path_at(int index);

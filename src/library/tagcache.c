@@ -176,9 +176,10 @@ static int32_t * loaded_title_order;
 static int32_t loaded_title_n;
 
 static uint32_t fnv1a(const char * s, size_t n) {
+    if (!s) return 0;
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < n; i++) {
-        h ^= (unsigned char) s[i];
+        h ^= (uint8_t) s[i];
         h *= 16777619u;
     }
     return h;
@@ -190,6 +191,8 @@ static unsigned char ascii_fold(unsigned char c) {
 }
 
 static int ascii_casecmp(const char * a, const char * b) {
+    if (!a) a = "";
+    if (!b) b = "";
     for (;;) {
         unsigned char ca = ascii_fold((unsigned char) *a++);
         unsigned char cb = ascii_fold((unsigned char) *b++);
@@ -688,11 +691,11 @@ static bool rebuild_indexes(void) {
             if (ents[i].flag & FLAG_DELETED) continue;
             const char * a = "";
             const char * b = "";
-            if (kind == TAGCACHE_GROUP_ARTIST) a = ents[i].artist;
-            else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) a = ents[i].album_artist;
+            if (kind == TAGCACHE_GROUP_ARTIST) a = ents[i].artist ? ents[i].artist : "";
+            else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) a = ents[i].album_artist ? ents[i].album_artist : "";
             else {
-                a = ents[i].album;
-                b = ents[i].album_artist;
+                a = ents[i].album ? ents[i].album : "";
+                b = ents[i].album_artist ? ents[i].album_artist : "";
             }
             uint32_t h = fnv1a(a, strlen(a)) ^ (fnv1a(b, strlen(b)) << 1);
             int slot = (int) (h & (uint32_t) (buckets - 1));
@@ -1686,6 +1689,7 @@ static bool load_all(void) {
             return true;
         }
         arena_reset();
+        if (ents && ent_cap > 0) memset(ents, 0, sizeof(entry_t) * (size_t) ent_cap);
         intern_path_title = true;
         unmap_string_files();
         free(loaded_title_order);

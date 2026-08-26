@@ -202,15 +202,49 @@ static uint32_t source_mtime_of(const albumart_info_t * info) {
     return 0;
 }
 
-static bool bmp_source_mtime(const char * path, uint32_t * out) {
+static uint16_t bmp_le16(const unsigned char * p) {
+    return (uint16_t) p[0] | ((uint16_t) p[1] << 8);
+}
+
+static uint32_t bmp_le32(const unsigned char * p) {
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) |
+           ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+}
+
+static bool bmp_source_mtime(const char * path, int expected_width, int expected_height,
+                             uint32_t * out) {
+    if (!out || expected_width <= 0 || expected_height <= 0) return false;
     *out = 0;
     FILE * f = fopen(path, "rb");
     if (!f) return false;
-    unsigned char hdr[10];
-    bool ok = fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr) && hdr[0] == 'B' && hdr[1] == 'M';
+    struct stat st;
+    unsigned char hdr[54];
+    bool ok = fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode) &&
+              st.st_size >= (off_t) sizeof(hdr) && (uint64_t) st.st_size <= UINT32_MAX &&
+              fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr);
     fclose(f);
-    if (!ok) return false;
-    *out = (uint32_t) hdr[6] | ((uint32_t) hdr[7] << 8) | ((uint32_t) hdr[8] << 16) | ((uint32_t) hdr[9] << 24);
+    if (!ok || hdr[0] != 'B' || hdr[1] != 'M') return false;
+
+    uint32_t file_size = bmp_le32(hdr + 2);
+    uint32_t pixel_offset = bmp_le32(hdr + 10);
+    uint32_t dib_size = bmp_le32(hdr + 14);
+    uint32_t width = bmp_le32(hdr + 18);
+    uint32_t height = bmp_le32(hdr + 22);
+    uint16_t planes = bmp_le16(hdr + 26);
+    uint16_t bits = bmp_le16(hdr + 28);
+    uint32_t compression = bmp_le32(hdr + 30);
+    if (file_size != (uint32_t) st.st_size || dib_size < 40 ||
+        pixel_offset < 54 || (uint64_t) pixel_offset < 14ULL + dib_size ||
+        width != (uint32_t) expected_width || height != (uint32_t) expected_height ||
+        planes != 1 || bits != 24 || compression != 0)
+        return false;
+
+    uint64_t row_bytes = (uint64_t) width * 3ULL;
+    uint64_t stride = (row_bytes + 3ULL) & ~3ULL;
+    uint64_t expected_size = (uint64_t) pixel_offset + stride * (uint64_t) height;
+    if (expected_size != file_size) return false;
+
+    *out = bmp_le32(hdr + 6);
     return true;
 }
 
@@ -222,10 +256,11 @@ bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int hei
     size_t dir_len = strlen(ALBUMART_DIR);
     if (strncmp(found, ALBUMART_DIR, dir_len) != 0 || found[dir_len] != '/') return true;
     uint32_t stored = 0;
-    if (!bmp_source_mtime(found, &stored)) {
-        unlink(found); /* Unlink corrupt cache file so fresh artwork will be generated */
-        return false;
-    }
+    /* A false result makes the caller regenerate and atomically replace the
+     * cache. Do not unlink by pathname here: another worker may have renamed
+     * a valid replacement after this function opened the old inode, and an
+     * unlink at this point would delete that fresh file. */
+    if (!bmp_source_mtime(found, width, height, &stored)) return false;
     uint32_t src = source_mtime_of(info);
     if (stored != 0 && src != 0 && stored != src) return false;
     return true;

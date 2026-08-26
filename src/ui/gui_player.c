@@ -2912,6 +2912,14 @@ lv_obj_t * gui_player_get_cover_img(void) {
     return cover_img;
 }
 
+bool gui_player_copy_cover_rgb565(int for_index, uint8_t * out, size_t out_size) {
+    const size_t required = (size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2;
+    if (!out || out_size < required || !current_cover_bytes || current_cover_for_index != for_index)
+        return false;
+    memcpy(out, current_cover_bytes, required);
+    return true;
+}
+
 bool gui_player_is_seeking(void) {
     return user_seeking;
 }

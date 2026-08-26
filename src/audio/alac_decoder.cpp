@@ -21,6 +21,7 @@ struct alac_decoder {
     uint64_t total_pcm_frames;
 
     uint32_t current_sample_index;
+    unsigned int consecutive_errors;
 
     uint8_t * compressed_buf;
     uint32_t compressed_buf_capacity;
@@ -34,12 +35,24 @@ struct alac_decoder {
     uint64_t current_pcm_frame;
 };
 
-static bool decode_next_sample(alac_decoder_t * dec) {
-    if (dec->current_sample_index >= mp4_demux_get_sample_count(dec->demux)) return false;
+#define ALAC_MAX_CONSECUTIVE_ERRORS 5
+
+static bool decode_next_sample_ex(alac_decoder_t * dec, decoder_read_status_t * out_status) {
+    if (dec->current_sample_index >= mp4_demux_get_sample_count(dec->demux)) {
+        if (out_status) *out_status = DECODER_READ_EOF;
+        return false;
+    }
 
     uint32_t compressed_size;
     if (!mp4_demux_read_sample(dec->demux, dec->current_sample_index, dec->compressed_buf,
                                 dec->compressed_buf_capacity, &compressed_size)) {
+        dec->consecutive_errors++;
+        dec->current_sample_index++;
+        if (dec->consecutive_errors >= ALAC_MAX_CONSECUTIVE_ERRORS) {
+            if (out_status) *out_status = DECODER_READ_FATAL_ERROR;
+            return false;
+        }
+        if (out_status) *out_status = DECODER_READ_RECOVERABLE_ERROR;
         return false;
     }
 
@@ -48,7 +61,16 @@ static bool decode_next_sample(alac_decoder_t * dec) {
 
     uint32_t out_frames = 0;
     int32_t status = dec->decoder->Decode(&bits, dec->raw_output_buf, dec->frame_size, dec->channels, &out_frames);
-    if (status != 0) return false;
+    if (status != 0) {
+        dec->consecutive_errors++;
+        dec->current_sample_index++;
+        if (dec->consecutive_errors >= ALAC_MAX_CONSECUTIVE_ERRORS) {
+            if (out_status) *out_status = DECODER_READ_FATAL_ERROR;
+            return false;
+        }
+        if (out_status) *out_status = DECODER_READ_RECOVERABLE_ERROR;
+        return false;
+    }
 
     if (dec->bit_depth == 16) {
         memcpy(dec->carry_buffer, dec->raw_output_buf, (size_t) out_frames * dec->channels * sizeof(int16_t));
@@ -62,10 +84,16 @@ static bool decode_next_sample(alac_decoder_t * dec) {
         }
     }
 
+    dec->consecutive_errors = 0;
     dec->carry_frames = out_frames;
     dec->carry_read_pos = 0;
     dec->current_sample_index++;
+    if (out_status) *out_status = DECODER_READ_OK;
     return true;
+}
+
+static bool decode_next_sample(alac_decoder_t * dec) {
+    return decode_next_sample_ex(dec, NULL);
 }
 
 extern "C" alac_decoder_t * alac_open_file(const char * path) {
@@ -149,31 +177,44 @@ uint64_t alac_get_total_pcm_frame_count(const alac_decoder_t * dec) {
     return dec->total_pcm_frames;
 }
 
-uint64_t alac_read_pcm_frames_s16(alac_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
-    uint64_t frames_written = 0;
+decoder_read_result_t alac_read_pcm_frames_s16(alac_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !buffer_out) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
 
-    while (frames_written < frames_to_read) {
+    while (res.frames < frames_to_read) {
         if (dec->carry_read_pos >= dec->carry_frames) {
-            if (!decode_next_sample(dec)) break;
+            decoder_read_status_t status = DECODER_READ_OK;
+            if (!decode_next_sample_ex(dec, &status)) {
+                if (res.frames > 0) {
+                    res.status = DECODER_READ_OK;
+                } else {
+                    res.status = status;
+                }
+                break;
+            }
         }
 
         uint64_t available = dec->carry_frames - dec->carry_read_pos;
-        uint64_t to_copy = frames_to_read - frames_written;
+        uint64_t to_copy = frames_to_read - res.frames;
         if (to_copy > available) to_copy = available;
 
-        memcpy(buffer_out + frames_written * dec->channels,
+        memcpy(buffer_out + res.frames * dec->channels,
                dec->carry_buffer + dec->carry_read_pos * dec->channels,
                (size_t) to_copy * dec->channels * sizeof(int16_t));
 
         dec->carry_read_pos += (uint32_t) to_copy;
-        frames_written += to_copy;
+        res.frames += to_copy;
         dec->current_pcm_frame += to_copy;
     }
 
-    return frames_written;
+    return res;
 }
 
 bool alac_seek_to_pcm_frame(alac_decoder_t * dec, uint64_t frame_index) {
+    if (!dec) return false;
     if (frame_index > dec->total_pcm_frames) frame_index = dec->total_pcm_frames;
 
     uint32_t target_sample = (uint32_t) (frame_index / dec->frame_size);
@@ -183,6 +224,7 @@ bool alac_seek_to_pcm_frame(alac_decoder_t * dec, uint64_t frame_index) {
     dec->current_sample_index = target_sample;
     dec->carry_frames = 0;
     dec->carry_read_pos = 0;
+    dec->consecutive_errors = 0;
 
     if (!decode_next_sample(dec)) return false;
 

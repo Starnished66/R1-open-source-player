@@ -11,6 +11,8 @@
  * ('AIFF' and uncompressed 'AIFC'); compressed AIFC variants are not
  * supported. */
 
+#include "decoder_result.h"
+
 typedef struct aiff_decoder aiff_decoder_t;
 
 aiff_decoder_t * aiff_open_file(const char * path);
@@ -20,7 +22,7 @@ unsigned int aiff_get_sample_rate(const aiff_decoder_t * dec);
 unsigned int aiff_get_bits_per_sample(const aiff_decoder_t * dec);
 uint64_t aiff_get_total_pcm_frame_count(const aiff_decoder_t * dec);
 
-uint64_t aiff_read_pcm_frames_s16(aiff_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);
+decoder_read_result_t aiff_read_pcm_frames_s16(aiff_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);
 bool aiff_seek_to_pcm_frame(aiff_decoder_t * dec, uint64_t frame_index);
 
 void aiff_close(aiff_decoder_t * dec);

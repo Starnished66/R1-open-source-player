@@ -254,6 +254,7 @@ struct wma_decoder {
 
     uint64_t total_pcm_frames;
     uint64_t skip_frames_remaining; /* startup decoder delay (frame_len*2), same as FFmpeg's avctx->delay */
+    unsigned int consecutive_errors;
     bool eof;
     bool flush_done;
 };
@@ -1074,7 +1075,9 @@ static void wma_flush_tail(wma_decoder_t * dec) {
     dec->pcm_buf_pos = 0;
 }
 
-static bool wma_fill_more_pcm(wma_decoder_t * dec) {
+#define WMA_MAX_CONSECUTIVE_ERRORS 5
+
+static bool wma_fill_more_pcm_ex(wma_decoder_t * dec, decoder_read_status_t * out_status) {
     for (;;) {
         uint32_t got = 0;
         if (!asf_demux_read_frame(dec->demux, dec->frame_buf, dec->frame_buf_capacity - 16, &got)) {
@@ -1082,8 +1085,10 @@ static bool wma_fill_more_pcm(wma_decoder_t * dec) {
             if (!dec->flush_done) {
                 dec->flush_done = true;
                 wma_flush_tail(dec);
+                if (out_status) *out_status = DECODER_READ_OK;
                 return true;
             }
+            if (out_status) *out_status = DECODER_READ_EOF;
             return false;
         }
         memset(dec->frame_buf + got, 0, 8);
@@ -1092,20 +1097,43 @@ static bool wma_fill_more_pcm(wma_decoder_t * dec) {
 
         int nb_frames = 0;
         int ret = wma_decode_superframe(dec, dec->frame_buf, use_size, dec->pcm_buf, &nb_frames);
-        if (ret < 0) continue; /* skip corrupt superframe */
+        if (ret < 0) {
+            dec->consecutive_errors++;
+            if (dec->consecutive_errors >= WMA_MAX_CONSECUTIVE_ERRORS) {
+                if (out_status) *out_status = DECODER_READ_FATAL_ERROR;
+                return false;
+            }
+            if (out_status) *out_status = DECODER_READ_RECOVERABLE_ERROR;
+            continue; /* skip corrupt superframe within limit */
+        }
         if (nb_frames > 0) {
+            dec->consecutive_errors = 0;
             dec->pcm_buf_count = (uint32_t) nb_frames * (uint32_t) dec->frame_len;
             dec->pcm_buf_pos = 0;
+            if (out_status) *out_status = DECODER_READ_OK;
             return true;
         }
     }
 }
 
-uint64_t wma_read_pcm_frames_s16(wma_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
-    uint64_t produced = 0;
-    while (produced < frames_to_read) {
+decoder_read_result_t wma_read_pcm_frames_s16(wma_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !buffer_out) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
+    while (res.frames < frames_to_read) {
         if (dec->pcm_buf_pos >= dec->pcm_buf_count) {
-            if (!wma_fill_more_pcm(dec)) break;
+            decoder_read_status_t status = DECODER_READ_OK;
+            if (!wma_fill_more_pcm_ex(dec, &status)) {
+                if (res.frames > 0) {
+                    res.status = DECODER_READ_OK;
+                } else {
+                    res.status = status;
+                }
+                break;
+            }
         }
         if (dec->skip_frames_remaining > 0) {
             uint32_t avail_skip = dec->pcm_buf_count - dec->pcm_buf_pos;
@@ -1115,17 +1143,18 @@ uint64_t wma_read_pcm_frames_s16(wma_decoder_t * dec, uint64_t frames_to_read, i
             continue;
         }
         uint32_t avail = dec->pcm_buf_count - dec->pcm_buf_pos;
-        uint64_t want = frames_to_read - produced;
+        uint64_t want = frames_to_read - res.frames;
         uint32_t take = (uint32_t) (want < avail ? want : avail);
-        memcpy(buffer_out + produced * dec->channels, dec->pcm_buf + (size_t) dec->pcm_buf_pos * dec->channels,
+        memcpy(buffer_out + res.frames * dec->channels, dec->pcm_buf + (size_t) dec->pcm_buf_pos * dec->channels,
                (size_t) take * dec->channels * sizeof(int16_t));
         dec->pcm_buf_pos += take;
-        produced += take;
+        res.frames += take;
     }
-    return produced;
+    return res;
 }
 
 bool wma_seek_to_pcm_frame(wma_decoder_t * dec, uint64_t frame_index) {
+    if (!dec) return false;
     uint64_t total_packets = asf_demux_get_packet_count(dec->demux);
     if (total_packets == 0 || dec->total_pcm_frames == 0) return false;
     uint64_t packet_index = frame_index * total_packets / dec->total_pcm_frames;
@@ -1142,6 +1171,7 @@ bool wma_seek_to_pcm_frame(wma_decoder_t * dec, uint64_t frame_index) {
     dec->pcm_buf_count = 0;
     dec->pcm_buf_pos = 0;
     dec->skip_frames_remaining = (uint64_t) dec->frame_len * 2;
+    dec->consecutive_errors = 0;
     dec->eof = false;
     dec->flush_done = false;
     return true;

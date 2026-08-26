@@ -293,15 +293,17 @@ static bool dff_get_channel_byte(dsd_decoder_t * dec, unsigned int ch, uint8_t *
     return true;
 }
 
-uint64_t dsd_read_pcm_frames_s16(dsd_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
-    uint64_t frames_written = 0;
+decoder_read_result_t dsd_read_pcm_frames_s16(dsd_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !dec->f || !buffer_out) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
     bool lsb_first = (dec->container == DSD_CONTAINER_DSF);
-    /* decimation_factor is always a multiple of 8 (8 or 16 -- see
-     * pick_decimation_factor), so this is exact: every channel needs
-     * exactly this many whole bytes, in lockstep, to produce one sample. */
     int bytes_per_output_frame = dec->decimation_factor / 8;
 
-    while (frames_written < frames_to_read && dec->current_pcm_frame < dec->total_pcm_frames) {
+    while (res.frames < frames_to_read && dec->current_pcm_frame < dec->total_pcm_frames) {
         float frame_samples[DSD_MAX_CHANNELS];
         bool ok = true;
 
@@ -333,17 +335,23 @@ uint64_t dsd_read_pcm_frames_s16(dsd_decoder_t * dec, uint64_t frames_to_read, i
             float v = frame_samples[ch] * 32767.0f;
             if (v > 32767.0f) v = 32767.0f;
             if (v < -32768.0f) v = -32768.0f;
-            buffer_out[frames_written * dec->channels + ch] = (int16_t) v;
+            buffer_out[res.frames * dec->channels + ch] = (int16_t) v;
         }
 
-        frames_written++;
+        res.frames++;
         dec->current_pcm_frame++;
     }
 
-    return frames_written;
+    if (res.frames == 0) {
+        res.status = (dec->current_pcm_frame >= dec->total_pcm_frames) ? DECODER_READ_EOF : DECODER_READ_FATAL_ERROR;
+    } else {
+        res.status = DECODER_READ_OK;
+    }
+    return res;
 }
 
 bool dsd_seek_to_pcm_frame(dsd_decoder_t * dec, uint64_t frame_index) {
+    if (!dec || !dec->f) return false;
     if (frame_index > dec->total_pcm_frames) frame_index = dec->total_pcm_frames;
 
     uint64_t dsd_byte_index = (frame_index * (uint64_t) dec->decimation_factor) / 8;

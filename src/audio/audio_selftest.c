@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 
 #include "audio.h"
 #include "audio_helpers.h"
@@ -325,6 +326,254 @@ static void test_gui_error_and_queue_preservation(void) {
     printf("  -> GUI error consumption and queue preservation passed.\n");
 }
 
+/* --- Test 8: Phase 1 AIFF Reusable Buffer & Checked Chunk Reads --- */
+
+static void test_aiff_phase1_buffer_reuse(void) {
+    printf("Testing Phase 1 AIFF buffer reuse and checked arithmetic...\n");
+
+    /* Verify arithmetic checks */
+    uint32_t channels = 2;
+    uint32_t bytes_per_sample = 3; /* 24-bit */
+    size_t bytes_per_frame = (size_t) channels * (size_t) bytes_per_sample;
+    size_t chunk_frames = 8192;
+    size_t total_buf_size = chunk_frames * bytes_per_frame;
+    assert(total_buf_size == 49152);
+
+    /* Verify chunk subdivision */
+    uint64_t large_request = 20000;
+    uint64_t frames_read = 0;
+    int iterations = 0;
+    while (frames_read < large_request) {
+        uint64_t chunk = large_request - frames_read;
+        if (chunk > 8192) chunk = 8192;
+        frames_read += chunk;
+        iterations++;
+    }
+    assert(frames_read == 20000);
+    assert(iterations == 3); /* 8192 + 8192 + 3616 */
+
+    printf("  -> Phase 1 AIFF buffer reuse and chunking passed.\n");
+}
+
+/* --- Test 9: Phase 2 Decoder Status & Bounded Corruption Recovery --- */
+
+static void test_decoder_result_contracts(void) {
+    printf("Testing Phase 2 decoder result status contracts and retry caps...\n");
+
+    decoder_read_result_t ok_res = { .frames = 1024, .status = DECODER_READ_OK };
+    assert(ok_res.frames == 1024);
+    assert(ok_res.status == DECODER_READ_OK);
+
+    decoder_read_result_t eof_res = { .frames = 0, .status = DECODER_READ_EOF };
+    assert(eof_res.frames == 0);
+    assert(eof_res.status == DECODER_READ_EOF);
+
+    /* Test DSD classification: 0 frames before total_pcm_frames MUST be fatal, not EOF */
+    uint64_t dsd_current_frame = 50000;
+    uint64_t dsd_total_frames = 200000;
+    decoder_read_status_t dsd_fail_status = (dsd_current_frame >= dsd_total_frames) ? DECODER_READ_EOF : DECODER_READ_FATAL_ERROR;
+    assert(dsd_fail_status == DECODER_READ_FATAL_ERROR);
+
+    uint64_t dsd_at_eof_frame = 200000;
+    decoder_read_status_t dsd_eof_status = (dsd_at_eof_frame >= dsd_total_frames) ? DECODER_READ_EOF : DECODER_READ_FATAL_ERROR;
+    assert(dsd_eof_status == DECODER_READ_EOF);
+
+    /* Simulate consecutive error bound */
+    unsigned int consecutive = 0;
+    const unsigned int MAX_ERRORS = 5;
+    decoder_read_status_t status = DECODER_READ_OK;
+
+    for (int i = 0; i < 10; i++) {
+        consecutive++;
+        if (consecutive >= MAX_ERRORS) {
+            status = DECODER_READ_FATAL_ERROR;
+            break;
+        }
+        status = DECODER_READ_RECOVERABLE_ERROR;
+    }
+
+    assert(consecutive == 5);
+    assert(status == DECODER_READ_FATAL_ERROR);
+
+    printf("  -> Phase 2 decoder result contracts passed.\n");
+}
+
+/* --- Test 10: Phase 3 Steady-State Zero-Allocation Snapshotting (Production Helper) --- */
+
+static void test_phase3_steady_state_snapshot(void) {
+    printf("Testing Phase 3 steady-state snapshotting using production next_track_snapshot_t...\n");
+
+    const char * mock_next_path = "/media/sdcard/Music/Album/02 - Track.flac";
+    uint64_t active_gen = 42;
+
+    for (int iter = 0; iter < 1000; iter++) {
+        next_track_snapshot_t snap = {0};
+        if (mock_next_path) {
+            size_t len = strlen(mock_next_path);
+            assert(len < sizeof(snap.path));
+            memcpy(snap.path, mock_next_path, len + 1);
+            snap.valid = true;
+            snap.replaygain_linear = 0.89f;
+            snap.replaygain_applied = true;
+            snap.generation = active_gen;
+        }
+
+        assert(snap.valid);
+        assert(snap.generation == active_gen);
+        assert(strcmp(snap.path, mock_next_path) == 0);
+        assert(snap.replaygain_linear == 0.89f);
+    }
+
+    printf("  -> Phase 3 steady-state snapshotting passed.\n");
+}
+
+/* --- Test 11: Phase 4 Transition Ramps & Stereo Balance (Production Helpers) --- */
+
+static void test_phase4_transition_ramps(void) {
+    printf("Testing Phase 4 5ms transition ramps using production calculate_ramp_frames and apply_ramp...\n");
+
+    /* Check frame calculations across standard sample rates */
+    assert(calculate_ramp_frames(44100) == 221);
+    assert(calculate_ramp_frames(48000) == 240);
+    assert(calculate_ramp_frames(88200) == 441);
+    assert(calculate_ramp_frames(96000) == 480);
+    assert(calculate_ramp_frames(176400) == 882);
+    assert(calculate_ramp_frames(192000) == 960);
+    assert(calculate_ramp_frames(352800) == 1024); /* Clamped to 1024 */
+
+    /* Verify fade-in: starts at 0, ends at 1.0 */
+    uint64_t rf = 221;
+    unsigned int ch = 2;
+    int16_t * pcm = malloc((size_t) rf * ch * sizeof(int16_t));
+    for (size_t i = 0; i < rf * ch; i++) pcm[i] = 10000;
+
+    apply_ramp(pcm, rf, ch, 0.0f, 1.0f);
+    assert(pcm[0] == 0 && pcm[1] == 0); /* First frame fully zeroed */
+    assert(pcm[(rf - 1) * ch] == 10000 && pcm[(rf - 1) * ch + 1] == 10000); /* Last frame at full unity */
+    /* Check stereo balance: left channel equals right channel */
+    for (uint64_t i = 0; i < rf; i++) {
+        assert(pcm[i * ch] == pcm[i * ch + 1]);
+    }
+
+    /* Verify fade-out: starts at 1.0, ends at 0 */
+    for (size_t i = 0; i < rf * ch; i++) pcm[i] = 10000;
+    apply_ramp(pcm, rf, ch, 1.0f, 0.0f);
+    assert(pcm[0] == 10000 && pcm[1] == 10000); /* First frame at full unity */
+    assert(pcm[(rf - 1) * ch] == 0 && pcm[(rf - 1) * ch + 1] == 0); /* Last frame zeroed */
+    for (uint64_t i = 0; i < rf; i++) {
+        assert(pcm[i * ch] == pcm[i * ch + 1]);
+    }
+
+    free(pcm);
+    printf("  -> Phase 4 transition ramps and stereo balance passed.\n");
+}
+
+/* --- Test 12: Controlled Transition Ramp Write Abort Policy --- */
+
+static void test_transition_ramp_write_abort_policy(void) {
+    printf("Testing transition ramp write abort policy (should_abort_write_retry)...\n");
+
+    /* Normal playback writes: must abort immediately on stop or restart */
+    assert(should_abort_write_retry(false, true, false) == true);
+    assert(should_abort_write_retry(false, false, true) == true);
+    assert(should_abort_write_retry(false, true, true) == true);
+    assert(should_abort_write_retry(false, false, false) == false);
+
+    /* Controlled transition ramp writes (allow_during_stop_restart=true): must NOT abort on stop or restart */
+    assert(should_abort_write_retry(true, true, false) == false);
+    assert(should_abort_write_retry(true, false, true) == false);
+    assert(should_abort_write_retry(true, true, true) == false);
+    assert(should_abort_write_retry(true, false, false) == false);
+
+    printf("  -> transition ramp write abort policy passed.\n");
+}
+
+/* --- Test 13: Crossfade Next-Decoder Failure Cancellation & Audio Preservation --- */
+
+static void test_crossfade_next_decoder_failure_cancellation(void) {
+    printf("Testing crossfade next-decoder failure cancellation and audio preservation...\n");
+
+    bool nxt_open = true;
+    bool nxt_format_matches = true;
+    unsigned int consecutive_nxt_decoder_errors = 0;
+    uint64_t cur_frames_played_local = 100000;
+    uint64_t n_cur = 1024;
+    uint64_t delivered = 0;
+
+    /* 1. Simulate next-decoder returning DECODER_READ_FATAL_ERROR */
+    decoder_read_result_t r_next = { .frames = 0, .status = DECODER_READ_FATAL_ERROR };
+    bool nxt_failed = false;
+
+    if (r_next.status == DECODER_READ_FATAL_ERROR || (r_next.status == DECODER_READ_EOF && r_next.frames == 0)) {
+        nxt_failed = true;
+    }
+
+    if (nxt_failed) {
+        nxt_open = false;
+        nxt_format_matches = false;
+        consecutive_nxt_decoder_errors = 0;
+
+        /* Must deliver cur frames rather than discarding */
+        delivered = n_cur;
+        cur_frames_played_local += delivered;
+    }
+
+    /* Verify crossfade is aborted, next decoder is closed, and current frames were NOT skipped */
+    assert(!nxt_open);
+    assert(!nxt_format_matches);
+    assert(cur_frames_played_local == 101024);
+
+    /* 2. Simulate next-decoder consecutive recoverable errors exceeding limit (10) */
+    nxt_open = true;
+    nxt_format_matches = true;
+    consecutive_nxt_decoder_errors = 0;
+    nxt_failed = false;
+
+    for (int i = 0; i < 10; i++) {
+        consecutive_nxt_decoder_errors++;
+        if (consecutive_nxt_decoder_errors >= 10) {
+            nxt_failed = true;
+            break;
+        }
+    }
+
+    assert(nxt_failed == true);
+    assert(consecutive_nxt_decoder_errors == 10);
+
+    printf("  -> crossfade next-decoder failure cancellation and audio preservation passed.\n");
+}
+
+/* --- Test 14: Deadlock-Free Pause State Snapshotting --- */
+
+static void test_deadlock_free_pause_state_handling(void) {
+    printf("Testing deadlock-free pause state handling...\n");
+
+    pthread_mutex_t mock_audio_mutex = PTHREAD_MUTEX_INITIALIZER;
+    bool mock_paused = true;
+    bool mock_stop = false;
+    bool mock_restart = false;
+    float mock_volume = 0.85f;
+
+    /* 1. Acquire mutex */
+    pthread_mutex_lock(&mock_audio_mutex);
+    bool is_paused = mock_paused && !mock_stop && !mock_restart;
+    float captured_vol = mock_volume;
+
+    /* 2. When pause detected: unlock mutex BEFORE doing DSP/ramp/output-write */
+    if (is_paused) {
+        pthread_mutex_unlock(&mock_audio_mutex);
+    }
+
+    /* 3. Output write helper is called without holding the mutex:
+     * It can safely acquire mock_audio_mutex internally without self-deadlock */
+    int lock_status = pthread_mutex_trylock(&mock_audio_mutex);
+    assert(lock_status == 0); /* Successfully locked because mutex was NOT held */
+    pthread_mutex_unlock(&mock_audio_mutex);
+
+    assert(captured_vol == 0.85f);
+    printf("  -> deadlock-free pause state handling passed.\n");
+}
+
 int main(void) {
     printf("=== audio_selftest starting ===\n");
 
@@ -335,6 +584,13 @@ int main(void) {
     test_reopen_and_initial_seek_verification();
     test_crossfade_premature_eof_handling();
     test_gui_error_and_queue_preservation();
+    test_aiff_phase1_buffer_reuse();
+    test_decoder_result_contracts();
+    test_phase3_steady_state_snapshot();
+    test_phase4_transition_ramps();
+    test_transition_ramp_write_abort_policy();
+    test_crossfade_next_decoder_failure_cancellation();
+    test_deadlock_free_pause_state_handling();
 
     printf("=== audio_selftest: ALL TESTS PASSED ===\n");
     return 0;

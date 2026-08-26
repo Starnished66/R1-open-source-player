@@ -15,6 +15,8 @@ extern "C" {
  * material is handled (16-bit is the vast majority of real ALAC content);
  * other bit depths are rejected rather than silently mishandled. */
 
+#include "decoder_result.h"
+
 typedef struct alac_decoder alac_decoder_t;
 
 alac_decoder_t * alac_open_file(const char * path);
@@ -24,7 +26,7 @@ unsigned int alac_get_sample_rate(const alac_decoder_t * dec);
 unsigned int alac_get_bit_depth(const alac_decoder_t * dec);
 uint64_t alac_get_total_pcm_frame_count(const alac_decoder_t * dec);
 
-uint64_t alac_read_pcm_frames_s16(alac_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);
+decoder_read_result_t alac_read_pcm_frames_s16(alac_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);
 bool alac_seek_to_pcm_frame(alac_decoder_t * dec, uint64_t frame_index);
 
 void alac_close(alac_decoder_t * dec);

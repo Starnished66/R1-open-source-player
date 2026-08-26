@@ -18,6 +18,8 @@
  * WMAv2/128kbps with ffmpeg, decoded here and compared against ffmpeg's
  * own decode of the same file. */
 
+#include "decoder_result.h"
+
 typedef struct wma_decoder wma_decoder_t;
 
 wma_decoder_t * wma_open_file(const char * path);
@@ -26,7 +28,7 @@ unsigned int wma_get_channels(const wma_decoder_t * dec);
 unsigned int wma_get_sample_rate(const wma_decoder_t * dec);
 uint64_t wma_get_total_pcm_frame_count(const wma_decoder_t * dec);
 
-uint64_t wma_read_pcm_frames_s16(wma_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);
+decoder_read_result_t wma_read_pcm_frames_s16(wma_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);
 bool wma_seek_to_pcm_frame(wma_decoder_t * dec, uint64_t frame_index);
 
 void wma_close(wma_decoder_t * dec);

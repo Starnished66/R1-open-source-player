@@ -19,6 +19,7 @@
  * upper bound for a single Opus packet, matching ogg_demux.h's own
  * OGG_MAX_PAGE_SIZE-class sizing rather than guessing a tighter cap. */
 #define OPUS_MAX_PACKET_BYTES (255 * 255)
+#define OPUS_MAX_CONSECUTIVE_ERRORS 5
 
 struct opus_decoder_wrap {
     ogg_demux_t * demux;
@@ -26,6 +27,7 @@ struct opus_decoder_wrap {
     unsigned int channels;
     uint16_t pre_skip;
     uint64_t total_pcm_frames;
+    unsigned int consecutive_errors;
 
     uint8_t * packet_buf; /* OPUS_MAX_PACKET_BYTES bytes */
 
@@ -34,17 +36,41 @@ struct opus_decoder_wrap {
     uint64_t carry_read_pos;
 };
 
-static bool decode_next_packet(opus_decoder_wrap_t * dec) {
+static bool decode_next_packet_ex(opus_decoder_wrap_t * dec, decoder_read_status_t * out_status) {
     uint32_t packet_len = ogg_demux_read_packet(dec->demux, dec->packet_buf, OPUS_MAX_PACKET_BYTES);
-    if (packet_len == 0) return false;
+    if (packet_len == 0) {
+        if (out_status) *out_status = DECODER_READ_EOF;
+        return false;
+    }
 
     int frames = opus_decode(dec->dec, dec->packet_buf, (opus_int32) packet_len, dec->carry_buffer,
                               OPUS_MAX_FRAME_SAMPLES_PER_CHANNEL, 0);
-    if (frames < 0) return false;
+    if (frames < 0) {
+        dec->consecutive_errors++;
+        /* Attempt Opus Packet Loss Concealment (PLC) using NULL packet */
+        int plc_frames = opus_decode(dec->dec, NULL, 0, dec->carry_buffer, 960, 0);
+        if (plc_frames > 0) {
+            dec->carry_frames = (uint64_t) plc_frames;
+            dec->carry_read_pos = 0;
+        }
 
+        if (dec->consecutive_errors >= OPUS_MAX_CONSECUTIVE_ERRORS) {
+            if (out_status) *out_status = DECODER_READ_FATAL_ERROR;
+            return false;
+        }
+        if (out_status) *out_status = DECODER_READ_RECOVERABLE_ERROR;
+        return (plc_frames > 0);
+    }
+
+    dec->consecutive_errors = 0;
     dec->carry_frames = (uint64_t) frames;
     dec->carry_read_pos = 0;
+    if (out_status) *out_status = DECODER_READ_OK;
     return true;
+}
+
+static bool decode_next_packet(opus_decoder_wrap_t * dec) {
+    return decode_next_packet_ex(dec, NULL);
 }
 
 /* Advances the read position by exactly `count` decoded PCM frames,
@@ -112,7 +138,7 @@ opus_decoder_wrap_t * opus_open_file(const char * path) {
 }
 
 unsigned int opus_get_channels(const opus_decoder_wrap_t * dec) {
-    return dec->channels;
+    return dec ? dec->channels : 0;
 }
 
 unsigned int opus_get_sample_rate(const opus_decoder_wrap_t * dec) {
@@ -121,32 +147,45 @@ unsigned int opus_get_sample_rate(const opus_decoder_wrap_t * dec) {
 }
 
 uint64_t opus_get_total_pcm_frame_count(const opus_decoder_wrap_t * dec) {
-    return dec->total_pcm_frames;
+    return dec ? dec->total_pcm_frames : 0;
 }
 
-uint64_t opus_read_pcm_frames_s16(opus_decoder_wrap_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
-    uint64_t frames_written = 0;
+decoder_read_result_t opus_read_pcm_frames_s16(opus_decoder_wrap_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !buffer_out) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
 
-    while (frames_written < frames_to_read) {
+    while (res.frames < frames_to_read) {
         if (dec->carry_read_pos >= dec->carry_frames) {
-            if (!decode_next_packet(dec)) break;
+            decoder_read_status_t status = DECODER_READ_OK;
+            if (!decode_next_packet_ex(dec, &status)) {
+                if (res.frames > 0) {
+                    res.status = DECODER_READ_OK;
+                } else {
+                    res.status = status;
+                }
+                break;
+            }
         }
 
         uint64_t available = dec->carry_frames - dec->carry_read_pos;
-        uint64_t to_copy = frames_to_read - frames_written;
+        uint64_t to_copy = frames_to_read - res.frames;
         if (to_copy > available) to_copy = available;
 
-        memcpy(buffer_out + frames_written * dec->channels, dec->carry_buffer + dec->carry_read_pos * dec->channels,
+        memcpy(buffer_out + res.frames * dec->channels, dec->carry_buffer + dec->carry_read_pos * dec->channels,
                (size_t) to_copy * dec->channels * sizeof(int16_t));
 
         dec->carry_read_pos += to_copy;
-        frames_written += to_copy;
+        res.frames += to_copy;
     }
 
-    return frames_written;
+    return res;
 }
 
 bool opus_seek_to_pcm_frame(opus_decoder_wrap_t * dec, uint64_t frame_index) {
+    if (!dec) return false;
     if (frame_index > dec->total_pcm_frames) frame_index = dec->total_pcm_frames;
 
     uint64_t target_granule = frame_index + dec->pre_skip;
@@ -161,6 +200,7 @@ bool opus_seek_to_pcm_frame(opus_decoder_wrap_t * dec, uint64_t frame_index) {
 
     dec->carry_frames = 0;
     dec->carry_read_pos = 0;
+    dec->consecutive_errors = 0;
 
     uint64_t discard = target_granule > landed_granule ? target_granule - landed_granule : 0;
     return discard_frames(dec, discard);

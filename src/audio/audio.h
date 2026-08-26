@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "decoder_result.h"
 
 typedef enum {
     AUDIO_CODEC_UNKNOWN = 0,

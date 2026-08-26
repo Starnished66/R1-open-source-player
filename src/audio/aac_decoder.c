@@ -9,6 +9,8 @@
 #define ADTS_MAX_FRAME_BYTES 8192 /* frame_length is a 13-bit field, max 8191 */
 #define AAC_MAX_CHANNELS 8
 #define AAC_MAX_FRAME_SAMPLES (2048 * AAC_MAX_CHANNELS) /* generous: HE-AAC frameSize up to 2048/ch */
+#define AAC_MAX_CONSECUTIVE_ERRORS 5
+#define AAC_STREAM_MAX_SCAN_BYTES 16384
 
 typedef enum {
     AAC_SOURCE_ADTS,
@@ -32,6 +34,7 @@ struct aac_decoder {
     mp4_demux_t * demux;
 
     uint64_t current_frame_index;
+    unsigned int consecutive_errors;
 
     NeAACDecHandle handle;
     unsigned int channels;
@@ -131,10 +134,13 @@ static unsigned int read_compressed_frame(aac_decoder_t * dec, uint64_t frame_in
          * malformed packet. Keep a seven-byte sliding window until the
          * next valid ADTS sync/header rather than ending playback forever
          * on the first stray byte. The bounded 13-bit ADTS length prevents
-         * an attacker/server error from overflowing frame_buf. */
+         * an attacker/server error from overflowing frame_buf. Capped at
+         * AAC_STREAM_MAX_SCAN_BYTES so corrupt streams do not loop unboundedly. */
         if (dec->stream_read_cb(dec->stream_user_data, buf, 7) != 7) return 0;
         unsigned int frame_length;
+        size_t scanned_bytes = 0;
         while (!parse_adts_header(buf, &frame_length) || frame_length > buf_size) {
+            if (++scanned_bytes > AAC_STREAM_MAX_SCAN_BYTES) return 0;
             memmove(buf, buf + 1, 6);
             if (dec->stream_read_cb(dec->stream_user_data, buf + 6, 1) != 1) return 0;
         }
@@ -169,11 +175,49 @@ static bool decode_frame_bytes(aac_decoder_t * dec, uint8_t * frame_buf, unsigne
     return true;
 }
 
-static bool decode_next_frame(aac_decoder_t * dec) {
+static bool decode_next_frame_ex(aac_decoder_t * dec, decoder_read_status_t * out_status) {
+    uint64_t total_count = (dec->source_type == AAC_SOURCE_ADTS) ? dec->frame_count :
+                           (dec->source_type == AAC_SOURCE_MP4) ? mp4_demux_get_sample_count(dec->demux) : 0;
+    if (dec->source_type != AAC_SOURCE_STREAM && dec->current_frame_index >= total_count) {
+        if (out_status) *out_status = DECODER_READ_EOF;
+        return false;
+    }
+
     uint8_t frame_buf[ADTS_MAX_FRAME_BYTES];
     unsigned int frame_length = read_compressed_frame(dec, dec->current_frame_index, frame_buf, sizeof(frame_buf));
-    if (frame_length == 0) return false;
-    return decode_frame_bytes(dec, frame_buf, frame_length);
+    if (frame_length == 0) {
+        if (dec->source_type != AAC_SOURCE_STREAM && dec->current_frame_index >= total_count) {
+            if (out_status) *out_status = DECODER_READ_EOF;
+            return false;
+        }
+        dec->consecutive_errors++;
+        if (dec->source_type != AAC_SOURCE_STREAM) dec->current_frame_index++;
+        if (dec->consecutive_errors >= AAC_MAX_CONSECUTIVE_ERRORS) {
+            if (out_status) *out_status = DECODER_READ_FATAL_ERROR;
+            return false;
+        }
+        if (out_status) *out_status = DECODER_READ_RECOVERABLE_ERROR;
+        return false;
+    }
+
+    if (!decode_frame_bytes(dec, frame_buf, frame_length)) {
+        dec->consecutive_errors++;
+        if (dec->source_type != AAC_SOURCE_STREAM) dec->current_frame_index++;
+        if (dec->consecutive_errors >= AAC_MAX_CONSECUTIVE_ERRORS) {
+            if (out_status) *out_status = DECODER_READ_FATAL_ERROR;
+            return false;
+        }
+        if (out_status) *out_status = DECODER_READ_RECOVERABLE_ERROR;
+        return false;
+    }
+
+    dec->consecutive_errors = 0;
+    if (out_status) *out_status = DECODER_READ_OK;
+    return true;
+}
+
+static bool decode_next_frame(aac_decoder_t * dec) {
+    return decode_next_frame_ex(dec, NULL);
 }
 
 static void configure_decoder(NeAACDecHandle handle) {
@@ -368,31 +412,44 @@ uint64_t aac_get_total_pcm_frame_count(const aac_decoder_t * dec) {
     return dec->total_pcm_frames;
 }
 
-uint64_t aac_read_pcm_frames_s16(aac_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
-    uint64_t frames_written = 0;
+decoder_read_result_t aac_read_pcm_frames_s16(aac_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !buffer_out) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
 
-    while (frames_written < frames_to_read) {
+    while (res.frames < frames_to_read) {
         if (dec->carry_read_pos >= dec->carry_frames) {
-            if (!decode_next_frame(dec)) break;
+            decoder_read_status_t status = DECODER_READ_OK;
+            if (!decode_next_frame_ex(dec, &status)) {
+                if (res.frames > 0) {
+                    res.status = DECODER_READ_OK;
+                } else {
+                    res.status = status;
+                }
+                break;
+            }
         }
 
         uint64_t available = dec->carry_frames - dec->carry_read_pos;
-        uint64_t to_copy = frames_to_read - frames_written;
+        uint64_t to_copy = frames_to_read - res.frames;
         if (to_copy > available) to_copy = available;
 
-        memcpy(buffer_out + frames_written * dec->channels,
+        memcpy(buffer_out + res.frames * dec->channels,
                dec->carry_buffer + dec->carry_read_pos * dec->channels,
                (size_t) to_copy * dec->channels * sizeof(int16_t));
 
         dec->carry_read_pos += to_copy;
-        frames_written += to_copy;
+        res.frames += to_copy;
         dec->current_pcm_frame += to_copy;
     }
 
-    return frames_written;
+    return res;
 }
 
 bool aac_seek_to_pcm_frame(aac_decoder_t * dec, uint64_t frame_index) {
+    if (!dec) return false;
     if (dec->source_type == AAC_SOURCE_STREAM) return false;
     if (frame_index > dec->total_pcm_frames) frame_index = dec->total_pcm_frames;
 
@@ -428,6 +485,7 @@ bool aac_seek_to_pcm_frame(aac_decoder_t * dec, uint64_t frame_index) {
     dec->current_frame_index = target_frame;
     dec->carry_frames = 0;
     dec->carry_read_pos = 0;
+    dec->consecutive_errors = 0;
 
     if (!decode_next_frame(dec)) return false;
 

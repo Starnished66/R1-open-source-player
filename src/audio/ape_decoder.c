@@ -119,6 +119,7 @@ struct ape_decoder {
     void (*entropy_decode_stereo)(struct ape_decoder * ctx, int blockstodecode);
 
     uint32_t current_frame_index;
+    unsigned int consecutive_errors;
     uint32_t frame_samples_remaining; /* samples of the current physical frame not yet decoded into decoded[] */
     uint32_t carry_frames;            /* samples ready to be read out of decoded[] */
     uint32_t carry_read_pos;
@@ -787,38 +788,61 @@ unsigned int ape_get_sample_rate(const ape_decoder_t * dec) { return ape_demux_g
 unsigned int ape_get_bits_per_sample(const ape_decoder_t * dec) { return (unsigned int) dec->bps; }
 uint64_t ape_get_total_pcm_frame_count(const ape_decoder_t * dec) { return dec->total_pcm_frames; }
 
-uint64_t ape_read_pcm_frames_s16(ape_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
-    uint64_t frames_written = 0;
+#define APE_MAX_CONSECUTIVE_ERRORS 5
+
+decoder_read_result_t ape_read_pcm_frames_s16(ape_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !buffer_out) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
     int shift = (dec->bps == 24) ? 8 : 0;
 
-    while (frames_written < frames_to_read) {
+    while (res.frames < frames_to_read) {
         if (dec->carry_read_pos >= dec->carry_frames) {
             uint32_t next_frame = dec->current_frame_index + 1;
-            if (next_frame >= ape_demux_get_frame_count(dec->demux)) break;
-            if (!decode_physical_frame(dec, next_frame)) break;
+            if (next_frame >= ape_demux_get_frame_count(dec->demux)) {
+                if (res.frames == 0) res.status = DECODER_READ_EOF;
+                break;
+            }
+            if (!decode_physical_frame(dec, next_frame)) {
+                dec->consecutive_errors++;
+                dec->current_frame_index = next_frame;
+                dec->carry_frames = 0;
+                dec->carry_read_pos = 0;
+                if (dec->consecutive_errors >= APE_MAX_CONSECUTIVE_ERRORS) {
+                    if (res.frames == 0) res.status = DECODER_READ_FATAL_ERROR;
+                    break;
+                }
+                if (res.frames == 0) res.status = DECODER_READ_RECOVERABLE_ERROR;
+                break;
+            }
+            dec->consecutive_errors = 0;
         }
 
         uint64_t available = dec->carry_frames - dec->carry_read_pos;
-        uint64_t to_copy = frames_to_read - frames_written;
+        uint64_t to_copy = frames_to_read - res.frames;
         if (to_copy > available) to_copy = available;
 
         for (uint64_t i = 0; i < to_copy; i++) {
             uint32_t src_pos = dec->carry_read_pos + (uint32_t) i;
             for (int ch = 0; ch < dec->channels; ch++) {
                 int32_t v = dec->decoded[ch][src_pos];
-                buffer_out[(frames_written + i) * (uint64_t) dec->channels + (uint64_t) ch] = clip_int16(v >> shift);
+                buffer_out[(res.frames + i) * (uint64_t) dec->channels + (uint64_t) ch] = clip_int16(v >> shift);
             }
         }
 
         dec->carry_read_pos += (uint32_t) to_copy;
-        frames_written += to_copy;
+        res.frames += to_copy;
         dec->current_pcm_frame += to_copy;
     }
 
-    return frames_written;
+    return res;
 }
 
 bool ape_seek_to_pcm_frame(ape_decoder_t * dec, uint64_t frame_index) {
+    if (!dec) return false;
     if (frame_index > dec->total_pcm_frames) frame_index = dec->total_pcm_frames;
 
     uint32_t blocksperframe = ape_demux_get_blocks_per_frame(dec->demux);
@@ -828,6 +852,7 @@ bool ape_seek_to_pcm_frame(ape_decoder_t * dec, uint64_t frame_index) {
 
     if (!decode_physical_frame(dec, target_frame)) return false;
 
+    dec->consecutive_errors = 0;
     uint64_t frame_start = (uint64_t) target_frame * blocksperframe;
     uint64_t within = frame_index > frame_start ? frame_index - frame_start : 0;
     if (within > dec->carry_frames) within = dec->carry_frames;

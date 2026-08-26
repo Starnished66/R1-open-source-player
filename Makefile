@@ -469,7 +469,7 @@ tagcache-selftest:
 
 AUDIO_SELFTEST_SRCS = src/audio/audio_selftest.c
 audio-selftest:
-	$(CC) $(HOST_CFLAGS) -o /tmp/audio_selftest $(AUDIO_SELFTEST_SRCS) -lpthread
+	$(CC) $(HOST_CFLAGS) -o /tmp/audio_selftest $(AUDIO_SELFTEST_SRCS) -lpthread -lm
 	/tmp/audio_selftest
 
 ARTWORK_SELFTEST_SRCS = src/library/artwork_coordinator_selftest.c src/library/artwork_coordinator.c

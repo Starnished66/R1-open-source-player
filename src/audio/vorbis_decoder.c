@@ -49,38 +49,35 @@ uint64_t vorbis_get_total_pcm_frame_count(const vorbis_decoder_wrap_t * dec) {
     return dec->total_pcm_frames;
 }
 
-uint64_t vorbis_read_pcm_frames_s16(vorbis_decoder_wrap_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
-    uint64_t frames_written = 0;
-    while (frames_written < frames_to_read) {
-        uint64_t frames_left = frames_to_read - frames_written;
-        /* stb_vorbis_get_samples_short_interleaved()'s own num_shorts param
-         * is int -- cap each call's request so frames_left * channels can
-         * never overflow it, same reasoning as every other bounded-chunk
-         * read loop in this codebase (e.g. audio.c's own NORMAL_CHUNK_FRAMES
-         * sizing). INT_MAX / channels is always comfortably larger than any
-         * real chunk size this app ever requests in one call anyway. */
+decoder_read_result_t vorbis_read_pcm_frames_s16(vorbis_decoder_wrap_t * dec, uint64_t frames_to_read, int16_t * buffer_out) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !dec->f || !buffer_out) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
+    while (res.frames < frames_to_read) {
+        uint64_t frames_left = frames_to_read - res.frames;
         uint64_t chunk_frames = frames_left;
         if (chunk_frames > (uint64_t) (2147483647 / (dec->channels > 0 ? dec->channels : 1))) {
             chunk_frames = (uint64_t) (2147483647 / (dec->channels > 0 ? dec->channels : 1));
         }
         int got = stb_vorbis_get_samples_short_interleaved(
-            dec->f, (int) dec->channels, buffer_out + frames_written * dec->channels,
+            dec->f, (int) dec->channels, buffer_out + res.frames * dec->channels,
             (int) (chunk_frames * dec->channels));
-        if (got <= 0) break; /* real EOF, or a corrupt stream stb_vorbis gave up resyncing -- either way, nothing more to give */
-        frames_written += (uint64_t) got;
+        if (got <= 0) {
+            if (res.frames == 0) res.status = DECODER_READ_EOF;
+            break;
+        }
+        res.frames += (uint64_t) got;
+        if ((uint64_t) got < chunk_frames) break;
     }
-    return frames_written;
+    return res;
 }
 
 bool vorbis_seek_to_pcm_frame(vorbis_decoder_wrap_t * dec, uint64_t frame_index) {
+    if (!dec || !dec->f) return false;
     if (frame_index > dec->total_pcm_frames) frame_index = dec->total_pcm_frames;
-    /* stb_vorbis_seek() (not the frame-approximate seek_frame()) -- sample-
-     * accurate for the get_samples_* family this wrapper's own read function
-     * uses, matching every other decoder's seek contract in this app (used
-     * for progress-bar scrubbing, where landing a whole Vorbis packet off
-     * would be an audible/visible jump). frame_index is already bounded to
-     * unsigned int range by the total_pcm_frames clamp above -- stb_vorbis's
-     * own sample_number param is unsigned int, narrower than uint64_t. */
     return stb_vorbis_seek(dec->f, (unsigned int) frame_index) != 0;
 }
 

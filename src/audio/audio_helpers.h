@@ -77,4 +77,57 @@ static inline bool is_premature_eof(uint64_t frames_played_local, uint64_t total
     return remaining > MAX_EOF_TOLERANCE_FRAMES;
 }
 
+#include <limits.h>
+#include <math.h>
+
+#define RAMP_DURATION_MS 5
+
+/* Calculates transition ramp length in frames from sample rate.
+ * Capped to [1, 1024] to avoid excess latency or zero-frame divisions. */
+static inline uint64_t calculate_ramp_frames(unsigned int sample_rate) {
+    if (sample_rate == 0) sample_rate = 44100;
+    uint64_t f = (uint64_t) ((5.0 / 1000.0) * (double) sample_rate + 0.5);
+    if (f < 1) f = 1;
+    if (f > 1024) f = 1024;
+    return f;
+}
+
+/* Applies linear amplitude ramp from start_gain to end_gain in-place.
+ * Preserves stereo balance by scaling every channel in a frame identically. */
+static inline void apply_ramp(int16_t * buf, uint64_t frames, unsigned int channels, float start_gain, float end_gain) {
+    if (!buf || frames == 0 || channels == 0) return;
+    for (uint64_t i = 0; i < frames; i++) {
+        float t = (frames > 1) ? (float) i / (float) (frames - 1) : 1.0f;
+        float gain = start_gain + t * (end_gain - start_gain);
+        for (unsigned int ch = 0; ch < channels; ch++) {
+            size_t idx = (size_t) i * channels + ch;
+            float val = (float) buf[idx] * gain;
+            int32_t s = (int32_t) (val + (val >= 0.0f ? 0.5f : -0.5f));
+            if (s > 32767) s = 32767;
+            else if (s < -32768) s = -32768;
+            buf[idx] = (int16_t) s;
+        }
+    }
+}
+
+typedef struct {
+    char path[PATH_MAX];
+    bool valid;
+    float replaygain_linear;
+    bool replaygain_applied;
+    uint64_t generation;
+} next_track_snapshot_t;
+
+typedef enum {
+    WRITE_RESULT_OK = 0,
+    WRITE_RESULT_ABORTED,
+    WRITE_RESULT_FAILED
+} write_result_t;
+
+/* Returns true if an output retry loop should abort based on playback state */
+static inline bool should_abort_write_retry(bool allow_during_stop_restart, bool stop_req, bool restart_req) {
+    if (allow_during_stop_restart) return false;
+    return (stop_req || restart_req);
+}
+
 #endif /* AUDIO_HELPERS_H */

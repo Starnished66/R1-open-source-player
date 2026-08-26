@@ -4560,6 +4560,13 @@ bool gui_library_has_background_work(void) {
            atomic_load(&album_thumb_gen_active) || sd_format_active || search_job_active;
 }
 
+bool gui_library_navigation_blocked(void) {
+    /* These operations use a modal progress/completion screen. Thumbnail
+     * decoding, post-scan cache warming, and search are deliberately absent:
+     * they are cancellable/optional workers and do not own the active screen. */
+    return library_rescan_active || library_rescan_success_pending || sd_format_active;
+}
+
 void gui_library_cancel_background_work(void) {
     cancel_album_thumbnail_generation();
     if (library_rescan_active) {

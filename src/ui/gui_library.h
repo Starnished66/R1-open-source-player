@@ -57,4 +57,8 @@ void gui_library_resume_fast_timers(void);
 void gui_library_reset_drag_state(void);
 
 bool gui_library_has_background_work(void);
+/* True only while a modal library operation owns navigation. Optional
+ * workers such as album-art warming remain background work for shutdown
+ * coordination, but must not disable the drawer or screen gestures. */
+bool gui_library_navigation_blocked(void);
 void gui_library_cancel_background_work(void);

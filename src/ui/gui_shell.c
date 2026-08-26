@@ -1731,7 +1731,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     home_cfg.is_bt_dac_overlay = (lv_screen_active() == gui_network_get_bt_dac_overlay());
     home_cfg.is_usb_dac_overlay = (lv_screen_active() == gui_network_get_usb_dac_overlay());
     home_cfg.is_lyrics_screen = (lv_screen_active() == gui_lyrics_get_screen());
-    home_cfg.has_background_work = gui_library_has_background_work();
+    home_cfg.has_background_work = gui_library_navigation_blocked();
     home_cfg.screen_height = h;
     /* Slightly expand only the raw press-down target. The overlay band and
      * its visible pill retain their existing dimensions. */
@@ -1763,10 +1763,10 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         if (quick_drawer_open) {
             quick_drawer_drag_tracking = true;
             quick_drawer_drag_panel_start_y = quick_drawer_motion_y();
-        } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !gui_library_has_background_work()) {
-            /* !gui_library_has_background_work() -- same exclusion as the other rescan-
-             * time guards below (search this file for library_rescan_active
-             * for the rest of them); only blocks starting a NEW open-drag,
+        } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !gui_library_navigation_blocked()) {
+            /* gui_library_navigation_blocked() only covers modal library
+             * operations that own the active screen. Optional artwork/search
+             * workers must not disable normal navigation. This only blocks a NEW open-drag;
              * if the drawer somehow got dragged open right as a rescan
              * started, the quick_drawer_open branch above still lets it be
              * dragged closed again. */
@@ -1817,7 +1817,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                                   lv_screen_active() != gui_player_get_screen() &&
                                   lv_screen_active() != gui_lyrics_get_screen() &&
                                   lv_screen_active() != gui_track_info_get_screen() &&
-                                  !gui_library_has_background_work() &&
+                                  !gui_library_navigation_blocked() &&
                                   !player_swipe_press_excluded(p);
         player_swipe_touch_start_x = p.x;
         player_swipe_touch_start_y = p.y;

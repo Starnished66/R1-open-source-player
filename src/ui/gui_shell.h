@@ -24,6 +24,7 @@ void open_quick_drawer(void);
 void close_quick_drawer(void);
 
 bool gui_shell_is_bt_audio_connected(void);
+void gui_shell_notify_bt_audio_disconnected(void);
 
 void gui_shell_poll(void);
 void refresh_quick_drawer_crossfade_icon(void);

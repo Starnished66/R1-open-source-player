@@ -150,6 +150,69 @@ static lv_obj_t * bt_status_icon;
 static lv_obj_t * a2dp_status_icon;
 static lv_obj_t * usb_audio_status_icon;
 static lv_obj_t * play_pause_status_icon;
+static lv_obj_t * bt_codec_status_icon;
+
+typedef enum {
+    BT_CODEC_TYPE_NONE = 0,
+    BT_CODEC_TYPE_SBC,
+    BT_CODEC_TYPE_AAC,
+    BT_CODEC_TYPE_APTX,
+    BT_CODEC_TYPE_APTX_HD,
+    BT_CODEC_TYPE_LDAC,
+    BT_CODEC_TYPE_UAT,
+    BT_CODEC_TYPE_COUNT
+} bt_codec_type_t;
+
+/* Normalizes input codec string by stripping non-alphanumeric chars and lowercasing,
+ * then maps to a known codec type enum. */
+static bt_codec_type_t bt_codec_identify(const char * codec) {
+    if (!codec) return BT_CODEC_TYPE_NONE;
+
+    char norm[16];
+    int n = 0;
+    for (int i = 0; codec[i] != '\0' && n < (int)sizeof(norm) - 1; i++) {
+        unsigned char c = (unsigned char)codec[i];
+        if (c >= 'A' && c <= 'Z') {
+            norm[n++] = (char)(c + ('a' - 'A'));
+        } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            norm[n++] = (char)c;
+        }
+    }
+    norm[n] = '\0';
+
+    if (n == 0) return BT_CODEC_TYPE_NONE;
+
+    if (strcmp(norm, "sbc") == 0) return BT_CODEC_TYPE_SBC;
+    if (strcmp(norm, "aac") == 0) return BT_CODEC_TYPE_AAC;
+    if (strcmp(norm, "aptx") == 0) return BT_CODEC_TYPE_APTX;
+    if (strcmp(norm, "aptxhd") == 0) return BT_CODEC_TYPE_APTX_HD;
+    if (strcmp(norm, "ldac") == 0) return BT_CODEC_TYPE_LDAC;
+    if (strcmp(norm, "uat") == 0) return BT_CODEC_TYPE_UAT;
+
+    return BT_CODEC_TYPE_NONE;
+}
+
+/* Returns persistent asset path for a codec type, resolving asset_path()
+ * exactly once across the entire process lifetime to prevent unbounded memory leaks. */
+static const char * bt_codec_get_asset(bt_codec_type_t type) {
+    static const char * assets[BT_CODEC_TYPE_COUNT] = { NULL };
+    static bool initialized = false;
+    if (!initialized) {
+        assets[BT_CODEC_TYPE_SBC]     = asset_path("topbar/sbc.png");
+        assets[BT_CODEC_TYPE_AAC]     = asset_path("topbar/aac.png");
+        assets[BT_CODEC_TYPE_APTX]    = asset_path("topbar/aptx.png");
+        assets[BT_CODEC_TYPE_APTX_HD] = asset_path("topbar/aptx_hd.png");
+        assets[BT_CODEC_TYPE_LDAC]    = asset_path("topbar/ldac.png");
+        assets[BT_CODEC_TYPE_UAT]     = asset_path("topbar/uat.png");
+        initialized = true;
+    }
+    if (type > BT_CODEC_TYPE_NONE && type < BT_CODEC_TYPE_COUNT) {
+        return assets[type];
+    }
+    return NULL;
+}
+
+static void sync_bt_codec_status_icon(void);
 
 void sync_player_topbar_visibility(lv_obj_t * screen) {
     /* Settings > Display > "Hide Player/Lyrics Top Bar" -- hides the global
@@ -351,6 +414,16 @@ static void build_status_bar(void) {
     lv_image_set_scale(play_pause_status_icon, LV_SCALE_NONE);
     lv_obj_add_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
 
+    /* Negotiated Bluetooth codec indicator (e.g. sbc.png, aac.png, aptx.png,
+     * aptx_hd.png, ldac.png, uat.png) -- rightmost in volume_topbar_group,
+     * lowest priority on the left side. Shows when an A2DP source PCM is
+     * connected and fits without colliding with clock_topbar_group.
+     * Hidden by default. */
+    bt_codec_status_icon = lv_image_create(volume_topbar_group);
+    lv_image_set_src(bt_codec_status_icon, bt_codec_get_asset(BT_CODEC_TYPE_SBC));
+    lv_image_set_scale(bt_codec_status_icon, LV_SCALE_NONE);
+    lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
+
     /* Deliberately LAST, after every child exists -- done earlier, the
      * LV_SIZE_CONTENT group still had zero content size at that point, and
      * its later growth as children were added did NOT retroactively re-run
@@ -437,14 +510,23 @@ static void build_status_bar(void) {
 }
 
 static void refresh_play_pause_topbar(void) {
-    if (audio_is_playing()) {
+    bool playing = audio_is_playing();
+    bool paused = !playing && audio_is_paused();
+    bool was_hidden = lv_obj_has_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
+    bool should_hide = !playing && !paused;
+
+    if (playing) {
         lv_obj_remove_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_image_set_src(play_pause_status_icon, asset_path("topbar/play.png"));
-    } else if (audio_is_paused()) {
+    } else if (paused) {
         lv_obj_remove_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_image_set_src(play_pause_status_icon, asset_path("topbar/pause.png"));
     } else {
         lv_obj_add_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (was_hidden != should_hide) {
+        sync_bt_codec_status_icon();
     }
 }
 
@@ -595,16 +677,27 @@ void refresh_volume_topbar(int32_t percent) {
         lv_obj_set_style_image_recolor(volume_topbar_digit[i], lv_color_make(255, 0, 0), 0);
         lv_obj_set_style_image_recolor_opa(volume_topbar_digit[i], warn ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
     }
+
+    static int last_volume_len = -1;
+    if (last_volume_len != len) {
+        last_volume_len = len;
+        sync_bt_codec_status_icon();
+    }
 }
 
 /* Polled every timer tick alongside refresh_battery_topbar() -- like
  * battery.c's sysfs read, this is a single cheap fopen/fgets with no
  * subprocess fork, so it doesn't need wifi/bt's throttled polling. */
 void refresh_headphone_icon(void) {
-    if (headphone_is_connected()) {
+    bool connected = headphone_is_connected();
+    bool was_hidden = lv_obj_has_flag(volume_topbar_headphone, LV_OBJ_FLAG_HIDDEN);
+    if (connected) {
         lv_obj_remove_flag(volume_topbar_headphone, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(volume_topbar_headphone, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (was_hidden == connected) {
+        sync_bt_codec_status_icon();
     }
 }
 
@@ -839,9 +932,37 @@ static atomic_bool refresh_bt_icon_done_flag = false;
 static bool refresh_bt_icon_result_powered = false;
 static bool refresh_bt_icon_result_connected = false;
 static bool refresh_bt_icon_result_a2dp_connected = false;
-bool gui_shell_is_bt_audio_connected(void) { return refresh_bt_icon_result_a2dp_connected; }
 static char refresh_bt_icon_result_mac[18] = "";
 static char refresh_bt_icon_result_codec[32] = "";
+
+/* UI-thread owned Bluetooth audio state and disconnect generation latch */
+static bool bt_is_a2dp_connected_ui = false;
+static uint32_t bt_disconnect_epoch = 0;
+static uint32_t bt_worker_launch_epoch = 0;
+
+bool gui_shell_is_bt_audio_connected(void) { return bt_is_a2dp_connected_ui; }
+
+static bool last_codec_eligible = false;
+static bt_codec_type_t last_codec_type = BT_CODEC_TYPE_NONE;
+static uint32_t last_codec_layout_sig = 0;
+static bool hidden_due_to_overlap = false;
+
+static void invalidate_bt_codec_status_cache(void) {
+    last_codec_eligible = false;
+    last_codec_type = BT_CODEC_TYPE_NONE;
+    last_codec_layout_sig = 0;
+    hidden_due_to_overlap = false;
+}
+
+void gui_shell_notify_bt_audio_disconnected(void) {
+    bt_disconnect_epoch++;
+    bt_is_a2dp_connected_ui = false;
+    bt_connected_codec_cached[0] = '\0';
+    if (a2dp_status_icon) lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+    if (bt_codec_status_icon) lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
+    invalidate_bt_codec_status_cache();
+    sync_bt_codec_status_icon();
+}
 
 static void * refresh_bt_icon_thread_func(void * arg) {
     (void) arg;
@@ -892,12 +1013,95 @@ static void * refresh_bt_icon_thread_func(void * arg) {
 static void start_refresh_bt_icon(void) {
     if (refresh_bt_icon_active) return; /* previous check still in flight -- same "ignore taps until it lands" pattern as everything else here */
     refresh_bt_icon_active = true;
+    bt_worker_launch_epoch = bt_disconnect_epoch;
     atomic_store_explicit(&refresh_bt_icon_done_flag, false, memory_order_relaxed);
         if (pthread_create(&refresh_bt_icon_thread, NULL, refresh_bt_icon_thread_func, NULL) != 0) {
         refresh_bt_icon_active = false;
     }
 }
 
+
+/* Updates the negotiated Bluetooth A2DP codec badge in the topbar.
+ * Fully edge-triggered: caches eligibility, codec type, and neighboring
+ * layout visibility to avoid redundant lv_image_set_src() or layout recomputations
+ * during periodic polling when state is unchanged. */
+static void sync_bt_codec_status_icon(void) {
+    if (!bt_codec_status_icon) return;
+
+    bt_codec_type_t codec_type = bt_codec_identify(bt_connected_codec_cached);
+    bool eligible = bt_is_powered_cached && !bt_boot_suppress_active() &&
+                    bt_is_a2dp_connected_ui && (codec_type != BT_CODEC_TYPE_NONE);
+
+    bool currently_hidden = lv_obj_has_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
+
+    if (!eligible) {
+        if (last_codec_eligible || !currently_hidden || hidden_due_to_overlap) {
+            lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
+            invalidate_bt_codec_status_cache();
+        }
+        return;
+    }
+
+    /* Compute layout signature of all neighboring elements that affect horizontal width */
+    bool hp_vis = volume_topbar_headphone && !lv_obj_has_flag(volume_topbar_headphone, LV_OBJ_FLAG_HIDDEN);
+    bool a2dp_vis = a2dp_status_icon && !lv_obj_has_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+    bool usb_vis = usb_audio_status_icon && !lv_obj_has_flag(usb_audio_status_icon, LV_OBJ_FLAG_HIDDEN);
+    bool pp_vis = play_pause_status_icon && !lv_obj_has_flag(play_pause_status_icon, LV_OBJ_FLAG_HIDDEN);
+    bool ampm_vis = clock_topbar_ampm && !lv_obj_has_flag(clock_topbar_ampm, LV_OBJ_FLAG_HIDDEN);
+    int vol_digits_vis = 0;
+    for (int i = 0; i < 3; i++) {
+        if (volume_topbar_digit[i] && !lv_obj_has_flag(volume_topbar_digit[i], LV_OBJ_FLAG_HIDDEN)) {
+            vol_digits_vis++;
+        }
+    }
+
+    uint32_t layout_sig = (hp_vis ? 1 : 0) |
+                          (a2dp_vis ? 2 : 0) |
+                          (usb_vis ? 4 : 0) |
+                          (pp_vis ? 8 : 0) |
+                          (ampm_vis ? 16 : 0) |
+                          ((uint32_t)(vol_digits_vis & 0x7) << 5);
+
+    /* If eligibility, codec type, and layout factors haven't changed, and the badge is in its steady state
+     * (either visible or already known to be hidden due to clock overlap), do nothing */
+    if (last_codec_eligible && last_codec_type == codec_type && last_codec_layout_sig == layout_sig) {
+        if (hidden_due_to_overlap || !currently_hidden) {
+            return;
+        }
+    }
+
+    last_codec_eligible = true;
+    last_codec_layout_sig = layout_sig;
+
+    if (last_codec_type != codec_type) {
+        last_codec_type = codec_type;
+        const char * asset = bt_codec_get_asset(codec_type);
+        if (asset) {
+            lv_image_set_src(bt_codec_status_icon, asset);
+        }
+    }
+
+    lv_obj_remove_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
+
+    /* Clock-overlap protection:
+     * Determine whether displaying bt_codec_status_icon would make volume_topbar_group
+     * reach into clock_topbar_group. Reserve a small visual margin (6px).
+     * If it would overlap, hide only bt_codec_status_icon to preserve all higher-priority
+     * indicators (volume, headphone, A2DP, USB, play/pause). */
+    hidden_due_to_overlap = false;
+    if (volume_topbar_group && clock_topbar_group) {
+        lv_obj_update_layout(volume_topbar_group);
+        lv_obj_update_layout(clock_topbar_group);
+        int32_t left_right = lv_obj_get_x(volume_topbar_group) + lv_obj_get_width(volume_topbar_group);
+        int32_t clock_left = lv_obj_get_x(clock_topbar_group);
+        if (clock_left <= 0) clock_left = 200; /* safe fallback if layout not yet evaluated */
+        if (left_right + 6 > clock_left) {
+            lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_update_layout(volume_topbar_group);
+            hidden_due_to_overlap = true;
+        }
+    }
+}
 
 static void poll_refresh_bt_icon(void) {
     if (!refresh_bt_icon_active || !atomic_load_explicit(&refresh_bt_icon_done_flag, memory_order_acquire)) return;
@@ -945,9 +1149,17 @@ static void poll_refresh_bt_icon(void) {
     bool display_powered = refresh_bt_icon_result_powered;
     if (bt_boot_suppress_active()) display_powered = false;
 
+    /* Discard stale A2DP/codec results if a disconnect occurred while or after the worker launched */
+    bool a2dp_connected = display_powered && refresh_bt_icon_result_a2dp_connected;
+    if (bt_worker_launch_epoch != bt_disconnect_epoch) {
+        a2dp_connected = false;
+    }
+
     bt_is_powered_cached = display_powered;
-    snprintf(bt_connected_mac_cached, sizeof(bt_connected_mac_cached), "%s", refresh_bt_icon_result_mac);
-    snprintf(bt_connected_codec_cached, sizeof(bt_connected_codec_cached), "%s", refresh_bt_icon_result_codec);
+    bt_is_a2dp_connected_ui = a2dp_connected;
+
+    snprintf(bt_connected_mac_cached, sizeof(bt_connected_mac_cached), "%s", a2dp_connected ? refresh_bt_icon_result_mac : "");
+    snprintf(bt_connected_codec_cached, sizeof(bt_connected_codec_cached), "%s", a2dp_connected ? refresh_bt_icon_result_codec : "");
     if (quick_drawer_bt_icon) {
         lv_image_set_src(quick_drawer_bt_icon, asset_path(display_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
         quick_drawer_mark_snapshot_dirty();
@@ -956,6 +1168,8 @@ static void poll_refresh_bt_icon(void) {
     if (!display_powered) {
         lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
+        invalidate_bt_codec_status_cache();
         sync_topbar_status_icon_positions();
         /* Bluetooth screen's own toggle row + everything gated on it reads
          * bt_is_powered_cached too -- only actually needs rebuilding while
@@ -970,11 +1184,12 @@ static void poll_refresh_bt_icon(void) {
     lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
     sync_topbar_status_icon_positions();
     lv_image_set_src(bt_status_icon, asset_path(refresh_bt_icon_result_connected ? "topbar/bluetooth.png" : "topbar/bluetooth_unconnect.png"));
-    if (refresh_bt_icon_result_a2dp_connected) {
+    if (a2dp_connected) {
         lv_obj_remove_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
     }
+    sync_bt_codec_status_icon();
 
     /* Real-device bug: the Bluetooth settings screen's device list kept
      * showing paired/connected state as of the last explicit scan forever
@@ -1178,10 +1393,14 @@ static void poll_usb_audio_output(void) {
     was_connected = connected;
 
     audio_set_usb_output(connected, alsa_device);
+    bool was_hidden = lv_obj_has_flag(usb_audio_status_icon, LV_OBJ_FLAG_HIDDEN);
     if (connected) {
         lv_obj_remove_flag(usb_audio_status_icon, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(usb_audio_status_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (was_hidden == connected) {
+        sync_bt_codec_status_icon();
     }
 }
 
@@ -2458,14 +2677,20 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
      * active connection yet -- poll_refresh_bt_icon() overwrites both with
      * the real, settled state once its own check lands (it already skips
      * doing so while bt_toggle_active, see its own comment). */
+    bt_disconnect_epoch++;
+    bt_is_a2dp_connected_ui = false;
+    bt_connected_codec_cached[0] = '\0';
     if (bt_will_be_powered) {
         lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_image_set_src(bt_status_icon, asset_path("topbar/bluetooth_unconnect.png"));
         lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
     }
+    invalidate_bt_codec_status_cache();
     sync_topbar_status_icon_positions();
 
     /* Optimistically rebuild the whole Bluetooth settings screen too (not

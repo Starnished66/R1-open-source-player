@@ -711,7 +711,11 @@ static void update_timer_cb(lv_timer_t * timer) {
          * later (nothing auto-resumes playback off output_connected going
          * back to true, so there's no user-visible flicker, just the stop
          * below firing sooner than the plain poll+debounce alone would have). */
-        bool bt_connected_debounced = !bt_control_output_disconnect_consume() &&
+        bool bt_disconnect_event = bt_control_output_disconnect_consume();
+        if (bt_disconnect_event) {
+            gui_shell_notify_bt_audio_disconnected();
+        }
+        bool bt_connected_debounced = !bt_disconnect_event &&
             (gui_shell_is_bt_audio_connected() ||
              lv_tick_elaps(bt_disconnected_since_tick) < BT_OUTPUT_DISCONNECT_DEBOUNCE_MS);
 

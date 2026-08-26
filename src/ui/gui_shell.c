@@ -71,6 +71,12 @@ static void start_bt_dac_startup_reapply_if_needed(void);
 static lv_obj_t * quick_drawer_brightness_track = NULL;
 static lv_obj_t * quick_drawer_brightness_label = NULL;
 static bool wifi_toggle_active = false;
+/* While a manual toggle or the ordinary screen-off radio restore is in
+ * flight, the requested state is the UI source of truth.  wifi_on.sh
+ * deliberately tears down/recreates wpa_supplicant, so its control socket
+ * temporarily disappears during a successful cold enable; painting that
+ * transient read used to make the drawer/topbar bounce on -> off -> on. */
+static bool wifi_toggle_target_enabled = false;
 static bool bt_toggle_active = false;
 
 static void refresh_quick_drawer_brightness(void) {
@@ -125,6 +131,11 @@ static lv_obj_t * battery_topbar_percent;
 static lv_obj_t * battery_icon_frame;
 static lv_obj_t * battery_icon_fill_clip;
 static lv_obj_t * battery_icon_fill_img;
+/* The group is initially built with three visible placeholder digits.
+ * refresh_battery_topbar() only forces a flex reflow/re-anchor when the
+ * real reading crosses a digit-count boundary, rather than adding layout
+ * work to its ordinary 500 ms refresh path. */
+static int battery_topbar_visible_digit_count = 3;
 
 /* Fill sprite (topbar/battery.png) bbox within its own 20x30 native canvas,
  * measured directly off the asset (alpha bbox: x 4-15, y 9-22) -- used to
@@ -535,6 +546,20 @@ void refresh_battery_topbar(void) {
             lv_obj_remove_flag(battery_topbar_digit[i], LV_OBJ_FLAG_HIDDEN);
         }
     }
+
+    /* battery_topbar_group is right-anchored beside the battery frame, but
+     * LV_SIZE_CONTENT changing after leading digit sprites are hidden does
+     * not replay that earlier alignment automatically.  Without this
+     * edge-triggered re-anchor, a two-digit reading retained one invisible
+     * 14px slot's worth of gap (and a one-digit reading retained two).
+     * Force layout only at 9<->10 / 99<->100 and on the first non-3-digit
+     * reading, then move Wi-Fi/Bluetooth with their corrected anchor. */
+    if (len != battery_topbar_visible_digit_count) {
+        battery_topbar_visible_digit_count = len;
+        lv_obj_update_layout(battery_topbar_group);
+        lv_obj_align_to(battery_topbar_group, battery_icon_frame, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+        sync_topbar_status_icon_positions();
+    }
 }
 
 /* Called once at startup (gui_init, with the volume loaded from settings),
@@ -671,7 +696,14 @@ static void sync_topbar_status_icon_positions(void) {
  * is a top-bar-only thing) -- the top bar icon keeps the finer-grained
  * enabled-vs-actually-associated-to-an-AP distinction below. */
 static void refresh_wifi_icon(void) {
-    bool enabled = wifi_control_is_enabled();
+    /* Keep an in-flight enable visually enabled even before wlan0's
+     * wpa_supplicant socket exists.  Association is still queried below,
+     * so the topbar naturally advances from the existing disconnected
+     * icon to signal strength without exposing an "enabling" state.  Once
+     * poll_wifi_toggle() clears wifi_toggle_active, this immediately goes
+     * back to the authoritative backend state and can still report a real
+     * failure normally. */
+    bool enabled = wifi_toggle_active ? wifi_toggle_target_enabled : wifi_control_is_enabled();
     if (quick_drawer_wifi_icon) {
         lv_image_set_src(quick_drawer_wifi_icon, asset_path(enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
         quick_drawer_mark_snapshot_dirty();
@@ -2116,7 +2148,6 @@ static void quick_drawer_bt_long_press_cb(lv_event_t * e) {
  * thread, polled the same way as every other background op in this file. */
 static pthread_t wifi_toggle_thread;
 static atomic_bool wifi_toggle_done_flag = false;
-static bool wifi_toggle_target_enabled = false;
 
 static void * wifi_toggle_thread_func(void * arg) {
     (void) arg;

@@ -159,7 +159,7 @@ local function open_bookmarks(key)
     plugin.show_list("Bookmarks", labels, function(index)
         local b = marks[index]
         play_at(key, b.chapter, b.position)
-    end, { width = 440 })
+    end)
 end
 
 local function open_chapters(key)
@@ -170,7 +170,7 @@ local function open_chapters(key)
     for i, chapter in ipairs(chapters) do
         labels[i] = (saved and saved.chapter == chapter.name and "▶ " or "") .. chapter.name
     end
-    plugin.show_list(key, labels, function(index) play_at(key, chapters[index].name, 0) end, { width = 448 })
+    plugin.show_list(key, labels, function(index) play_at(key, chapters[index].name, 0) end)
 end
 
 local function open_book(key)
@@ -210,7 +210,7 @@ local function open_continue()
     if #books == 0 then plugin.show_toast("No books in progress"); return end
     local labels = {}
     for i, key in ipairs(books) do labels[i] = progress_label(key) end
-    plugin.show_list("Continue Listening", labels, function(index) open_book(books[index]) end, { width = 448 })
+    plugin.show_list("Continue Listening", labels, function(index) open_book(books[index]) end)
 end
 
 local function open_library()
@@ -220,7 +220,7 @@ local function open_library()
     for _, key in ipairs(books) do labels[#labels + 1] = progress_label(key) end
     plugin.show_list("Audiobooks", labels, function(index)
         if index == 1 then open_continue() else open_book(books[index - 1]) end
-    end, { width = 448 })
+    end)
 end
 
 local function save_current_progress(force)

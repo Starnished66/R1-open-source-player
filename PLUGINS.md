@@ -199,14 +199,11 @@ from the moment your script starts running (injected before
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info`, `media_capabilities` |
 | UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
 | Theme | `set_icon`, `set_background_color`, `set_text_color` |
-| Files | `sd_root`, `list_dir`, `playlist_list`, `playlist_read`, `playlist_create`, `playlist_add`, `playlist_remove`, `playlist_delete` |
-| Playback | `play_file`, `play_list`, transport controls, playback state |
-| Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums`, `refresh_library` |
-| Files | `sd_root`, `list_dir`, `mkdir` |
-| Storage | `storage.get`/`set`/`delete`/`list`, `secrets.set`/`exists`/`delete` |
-| Data | `json_decode`, `json_encode` |
 | Playback | `play_file`, `play_list`, `play_remote`, `queue_remote_list`, transport controls, playback state |
-| Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums` |
+| Files & Playlists | `sd_root`, `list_dir`, `mkdir`, `playlist_list`, `playlist_read`, `playlist_create`, `playlist_add`, `playlist_remove`, `playlist_delete` |
+| Storage & Secrets | `storage.get`/`set`/`delete`/`list`, `secrets.set`/`exists`/`delete` |
+| Data & Crypto | `json_decode`, `json_encode`, `md5` |
+| Library | `get_artist_albums`, `get_album_tracks`, `get_next_album_tracks`, `library_song_count`, `library_get_songs`, `library_search`, `library_get_song`, `library_get_artists`, `library_get_albums`, `refresh_library` |
 | Audio | `eq_load_profile`, `eq_save_profile`, `eq_set_*`, `eq_reset` |
 | Network | `http_request`, `download_file_async`, `cancel`, legacy `http_get`/`http_post` |
 | Automation | `on`, `set_interval`, `clear_interval` |
@@ -239,14 +236,16 @@ plugin's own file path (stable across reloads) rather than by load order.
 Existing plugins without `define()` remain supported as legacy plugins
 using an identity derived from their filename.
 
-- `plugin.api_version()` returns the current integer plugin API version.
+- `plugin.api_version()` returns the current integer plugin API version (currently `3`).
 - `plugin.has_capability(name)` reports whether an optional interface exists.
-  API 1 includes `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`,
-  `ui.theme`, `filesystem.sd`, `playback.control`, `playback.state`,
-  `playback.events`, `library.artist_albums`, `network.http.sync`, `network.http.async`,
-  `crypto.md5`, and `audio.peq`. API 2 adds `network.http.download`,
-  `filesystem.mkdir`, `data.json`, `storage.namespaced`, and `storage.secrets`.
-  API 3 adds `playback.remote`.
+  Supported capability tokens:
+  - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`
+  - Playback & Audio: `playback.control`, `playback.state`, `playback.events`, `playback.remote`, `audio.peq`
+  - Filesystem & Playlists: `filesystem.sd`, `filesystem.mkdir`, `filesystem.playlists`
+  - Storage & Secrets: `storage.namespaced`, `storage.secrets`
+  - Network: `network.http.sync`, `network.http.async`, `network.http.download`
+  - Data & Crypto: `data.json`, `crypto.md5`
+  - Library: `library.artist_albums`, `library.paged`, `library.refresh`
 - `plugin.get_app_info()` returns `version`, `build`, `platform`, and
   `plugin_api` fields.
 

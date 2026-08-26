@@ -133,7 +133,8 @@ int gui_plugin_show_list(const char * title, const char * const * labels, const 
              * pill_row_resolve_text_size()'s own comment on why a genuine
              * NULL only ever reaches it from a truly-unset call like this. */
             if (text_size) lv_obj_set_style_text_font(row, pill_row_resolve_text_size(text_size), 0);
-            configure_scrolling_row_label(row, row_w - 2 * LIST_ROW_LABEL_INSET);
+            row_label_enable_marquee(row);
+            if (row_w != LIST_ROW_WIDTH) lv_obj_set_style_width(row, row_w, 0);
             lv_obj_set_height(row, row_h);
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             intptr_t packed = ((intptr_t) slot << 16) | (intptr_t) (i & 0xFFFF);

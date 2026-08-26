@@ -91,7 +91,7 @@ local function open_about()
         "Choose any duration from 15 minutes to 3 hours.",
         "Changing duration while armed restarts the countdown.",
         "The countdown resets when the player restarts.",
-    }, function() end, { width = 448 })
+    }, function() end)
 end
 
 local function open_settings()

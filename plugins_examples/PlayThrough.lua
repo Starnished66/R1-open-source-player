@@ -193,7 +193,7 @@ local function open_about()
         "Folders continue in natural sibling-folder order.",
         "Album mode has priority when both options are enabled.",
         "Shuffle and repeat modes are left unchanged.",
-    }, function() end, { width = 448 })
+    }, function() end)
 end
 
 local function open_settings()

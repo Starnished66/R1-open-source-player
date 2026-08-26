@@ -73,6 +73,11 @@
 # subdirectory. Tracked Python files remain tracked by Git as usual.
 *.py
 
+# Standalone development self-tests are local-only and are not shipped in
+# the public source/release tree. Match future files in any directory too.
+*selftest*
+*self_test*
+
 # Local GUI-refactor extraction workspace
 /scratch/
 

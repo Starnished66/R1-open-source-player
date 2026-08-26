@@ -461,31 +461,5 @@ build_target/lua/%.o: $(LUA_DIR)/src/%.c
 compile_commands.json:
 	@python3 generate_compile_commands.py
 
-TAGCACHE_SELFTEST_SRCS = src/library/tagcache_selftest.c src/library/metadata_db.c src/library/tagcache.c \
-                         src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c src/core/utf8_util.c
-tagcache-selftest:
-	$(CC) $(HOST_CFLAGS) -o /tmp/tagcache_selftest $(TAGCACHE_SELFTEST_SRCS) -lpthread
-	/tmp/tagcache_selftest
-
-AUDIO_SELFTEST_SRCS = src/audio/audio_selftest.c
-audio-selftest:
-	$(CC) $(HOST_CFLAGS) -o /tmp/audio_selftest $(AUDIO_SELFTEST_SRCS) -lpthread -lm
-	/tmp/audio_selftest
-
-ARTWORK_SELFTEST_SRCS = src/library/artwork_coordinator_selftest.c src/library/artwork_coordinator.c
-artwork-selftest:
-	$(CC) $(HOST_CFLAGS) -o /tmp/artwork_selftest $(ARTWORK_SELFTEST_SRCS) -lpthread
-	/tmp/artwork_selftest
-
-FONT_SELFTEST_SRCS = src/ui/font_selftest.c src/ui/fallback_font.c src/core/settings.c src/library/subsonic_saved_servers.c src/core/subprocess.c src/core/utf8_util.c $(filter-out $(LVGL_DIR)/src/drivers/sdl/%,$(LVGL_SRCS))
-font-selftest:
-	$(CC) $(HOST_CFLAGS) -I. -Ilvgl -Isrc/ui -Isrc/core -Isrc/hardware -Isrc/audio -Isrc/library -Isrc/network -Isrc/plugins -DLV_CONF_INCLUDE_SIMPLE=1 -DHOST_BUILD=1 -o /tmp/font_selftest $(FONT_SELFTEST_SRCS) -lm -lpthread
-	/tmp/font_selftest
-
-GESTURE_SELFTEST_SRCS = src/ui/gesture_selftest.c src/ui/gesture_detector.c
-gesture-selftest:
-	$(CC) $(HOST_CFLAGS) -Isrc/ui -o /tmp/gesture_selftest $(GESTURE_SELFTEST_SRCS) -lpthread
-	/tmp/gesture_selftest
-
 clean:
 	rm -rf build_host build_target $(HOST_BIN) $(TARGET_BIN) compile_commands.json compile_flags.txt

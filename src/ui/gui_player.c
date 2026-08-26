@@ -1,3 +1,4 @@
+#include <limits.h>
 #include "usb_mode_control.h"
 #include "file_browser.h"
 #include "remote_control.h"
@@ -14,7 +15,13 @@ static int * playlist_lazy_sort_order = NULL;
 static bool playlist_lazy_order_is_recency = false;
 static int queued_pending_count = 0;
 static int queue_next_insert_index = -1;
+static int consecutive_decoder_failure_skips = 0;
+#define MAX_FAILED_PHYSICAL_PATHS 5
+static char failed_physical_paths[MAX_FAILED_PHYSICAL_PATHS][PATH_MAX];
+static int failed_physical_paths_count = 0;
+static uint64_t current_playback_generation = 0;
 
+#include "audio_helpers.h"
 #include "gui_player.h"
 #include "gui.h"
 #include "gui_theme.h"
@@ -1791,7 +1798,34 @@ static int * pending_shuffle_order = NULL;
 /* Status bar and Quick Drawer moved to gui_shell.c */
 
 
+void reset_decoder_failure_tracking(void) {
+    consecutive_decoder_failure_skips = 0;
+    failed_physical_paths_count = 0;
+}
+
+static bool is_failed_physical_path(const char * path) {
+    if (!path || !path[0]) return false;
+    for (int i = 0; i < failed_physical_paths_count; i++) {
+        if (strcmp(failed_physical_paths[i], path) == 0) return true;
+    }
+    return false;
+}
+
+static void record_failed_physical_path(const char * path) {
+    if (!path || !path[0]) return;
+    if (is_failed_physical_path(path)) return;
+    if (failed_physical_paths_count < MAX_FAILED_PHYSICAL_PATHS) {
+        size_t len = strlen(path);
+        if (len < sizeof(failed_physical_paths[failed_physical_paths_count])) {
+            memcpy(failed_physical_paths[failed_physical_paths_count], path, len + 1);
+            failed_physical_paths_count++;
+        }
+    }
+}
+
 void free_playlist(void) {
+    reset_decoder_failure_tracking();
+    current_playback_generation = 0;
     for (int i = 0; i < playlist_count; i++) free(playlist[i]); /* free(NULL) (an unresolved lazy slot) is a safe no-op */
     free(playlist);
     playlist = NULL;
@@ -1929,6 +1963,69 @@ int compute_auto_advance_index(int index) {
         case PLAY_MODE_SEQUENTIAL:
         default:
             return (index + 1 < playlist_count) ? index + 1 : -1;
+    }
+}
+
+static bool is_failed_physical_track_cb(int index, void * userdata) {
+    (void) userdata;
+    const char * path = playlist_path_at(index);
+    return is_failed_physical_path(path);
+}
+
+int compute_decoder_failure_advance_index(int failed_index) {
+    if (failed_index < 0 || playlist_count <= 1) return -1;
+
+    if ((play_mode_t) current_settings.play_mode == PLAY_MODE_SHUFFLE) {
+        ensure_shuffle_order_current();
+        if (!pending_shuffle_order && shuffle_pos + 1 >= playlist_count) {
+            pending_shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
+            if (pending_shuffle_order) {
+                memcpy(pending_shuffle_order, shuffle_order, sizeof(int) * (size_t) playlist_count);
+                fisher_yates_shuffle(pending_shuffle_order, playlist_count);
+            }
+        }
+    }
+
+    failure_advance_plan_t plan = compute_decoder_failure_advance_plan(
+        failed_index,
+        playlist_count,
+        (int) current_settings.play_mode,
+        queued_pending_count,
+        shuffle_order,
+        shuffle_pos,
+        pending_shuffle_order,
+        is_failed_physical_track_cb,
+        NULL
+    );
+
+    return plan.target_index;
+}
+
+static void commit_decoder_failure_advance_plan(const failure_advance_plan_t * plan) {
+    if (!plan || plan->target_index < 0) return;
+
+    if (plan->queued_consumed > 0) {
+        if (plan->queued_consumed >= queued_pending_count) {
+            queued_pending_count = 0;
+            queue_next_insert_index = -1;
+            remote_control_sync_queue(NULL, 0);
+        } else {
+            queued_pending_count -= plan->queued_consumed;
+            remote_control_sync_queue((const char * const *) &playlist[plan->target_index + 1], queued_pending_count);
+        }
+    }
+
+    if ((play_mode_t) current_settings.play_mode == PLAY_MODE_SHUFFLE && plan->shuffle_steps > 0) {
+        if (plan->shuffle_wrapped && pending_shuffle_order) {
+            free(shuffle_order);
+            shuffle_order = pending_shuffle_order;
+            pending_shuffle_order = NULL;
+            shuffle_order_count = playlist_count;
+            shuffle_pos = (shuffle_pos + plan->shuffle_steps) % playlist_count;
+        } else {
+            shuffle_pos += plan->shuffle_steps;
+            if (shuffle_pos >= playlist_count) shuffle_pos = playlist_count - 1;
+        }
     }
 }
 
@@ -2241,7 +2338,7 @@ static void notify_plugin_track_started(const track_metadata_t * meta, const cha
                                          is_remote_track ? remote_meta.provider : "", is_remote_track ? remote_meta.track_id : "");
 }
 
-void play_track_at_from(int index, double start_seconds) {
+static void play_track_at_from_internal(int index, double start_seconds, bool push_nav) {
     if (index < 0 || index >= playlist_count) return;
 
     const char * block_reason = external_dac_block_reason();
@@ -2262,6 +2359,7 @@ void play_track_at_from(int index, double start_seconds) {
     double gain_db, peak;
     resolve_replaygain(&meta, &has_gain, &gain_db, &has_peak, &peak);
     audio_play_file_at(path, start_seconds, has_gain, gain_db, has_peak, peak);
+    current_playback_generation = audio_get_playback_generation();
     arm_next_track_for_audio(index);
 
 #ifndef HOST_BUILD
@@ -2275,7 +2373,7 @@ void play_track_at_from(int index, double start_seconds) {
     /* Manual next/previous and a deferred startup resume can already be on
      * the player screen.  Do not stack a duplicate copy of the same screen
      * just because playback is being (re)started there. */
-    if (lv_screen_active() != player_screen) nav_push(player_screen);
+    if (push_nav && lv_screen_active() != player_screen) nav_push(player_screen);
 
     /* A remote track's stream_url can expire or be single-use -- resuming
      * into it blind on next launch can't work the way resuming a local
@@ -2290,6 +2388,11 @@ void play_track_at_from(int index, double start_seconds) {
         current_settings.last_position = start_seconds;
     }
     settings_save(&current_settings);
+}
+
+void play_track_at_from(int index, double start_seconds) {
+    reset_decoder_failure_tracking();
+    play_track_at_from_internal(index, start_seconds, true);
 }
 
 /* Called from update_timer_cb when audio_consume_track_advanced() reports
@@ -2307,6 +2410,7 @@ void on_track_auto_advanced(int index) {
 
     track_metadata_t meta;
     apply_track_metadata_to_ui(index, &meta); /* audio.c already applied this track's ReplayGain during the handoff */
+    current_playback_generation = audio_get_playback_generation();
     arm_next_track_for_audio(index);
 
 #ifndef HOST_BUILD
@@ -2328,7 +2432,8 @@ void on_track_auto_advanced(int index) {
 }
 
 void play_track_at(int index) {
-    play_track_at_from(index, 0.0);
+    reset_decoder_failure_tracking();
+    play_track_at_from_internal(index, 0.0, true);
 }
 
 void on_file_selected(char ** new_playlist, int count, int selected_index) {
@@ -2433,6 +2538,7 @@ void on_file_browser_selected(char ** new_playlist, int count, int selected_inde
 }
 
 void toggle_play_pause(void) {
+    reset_decoder_failure_tracking();
     if (playlist_index < 0) return; /* nothing loaded yet */
     if (deferred_resume_pending) {
         double start_seconds = deferred_resume_position;
@@ -2483,6 +2589,7 @@ void play_btn_event_cb(lv_event_t * e) {
 
 void prev_btn_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    reset_decoder_failure_tracking();
     if (playlist_index < 0) return;
 
     if (audio_get_position_seconds() > PREV_BUTTON_REWIND_THRESHOLD_SECONDS) {
@@ -2496,6 +2603,7 @@ void prev_btn_event_cb(lv_event_t * e) {
 
 void next_btn_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    reset_decoder_failure_tracking();
     if (playlist_index < 0) return;
     int next_index = compute_manual_step_index(playlist_index, 1);
     if (next_index >= 0) play_track_at(next_index);
@@ -2637,7 +2745,16 @@ void gui_format_time(double seconds, char * buf, size_t buf_size) {
         snprintf(buf, buf_size, "%u:%02u", minutes, secs);
 }
 
+void gui_player_poll_confirmed_playback(void) {
+    if (consecutive_decoder_failure_skips > 0 && audio_is_playing()) {
+        if (audio_get_position_seconds() >= 3.0) {
+            reset_decoder_failure_tracking();
+        }
+    }
+}
+
 void gui_player_update_progress(void) {
+    gui_player_poll_confirmed_playback();
     double position = audio_get_position_seconds();
     double duration = audio_get_duration_seconds();
 
@@ -2899,6 +3016,7 @@ void gui_player_play_at_from(int index, double start_seconds) {
 }
 
 void gui_player_step_manual(int direction) {
+    reset_decoder_failure_tracking();
     if (playlist_index < 0) return;
     int next_idx = compute_manual_step_index(playlist_index, direction);
     if (next_idx >= 0) play_track_at(next_idx);
@@ -2944,6 +3062,7 @@ const char * gui_player_get_now_playing_folder(void) {
 
 void gui_player_handle_auto_advance(void) {
     if (playlist_index < 0) return;
+    reset_decoder_failure_tracking();
     int advanced_index = compute_auto_advance_index(playlist_index);
     if (advanced_index >= 0) {
         commit_auto_advance();
@@ -2953,31 +3072,95 @@ void gui_player_handle_auto_advance(void) {
 
 void gui_player_handle_track_finished(void) {
     if (playlist_index < 0) return;
+    reset_decoder_failure_tracking();
     int finished_index = compute_auto_advance_index(playlist_index);
     if (finished_index >= 0) {
         commit_auto_advance();
-        play_track_at(finished_index);
+        play_track_at_from_internal(finished_index, 0.0, false);
     } else {
         set_play_button_state(false);
     }
 }
 
-void gui_player_handle_playback_error(audio_error_t err) {
+void gui_player_handle_playback_error_ex(audio_error_t err, uint64_t err_generation) {
     if (err == AUDIO_ERROR_NONE) return;
     if (playlist_index < 0) return;
 
-    /* Checkpoint confirmed position so pressing Play can retry cleanly */
-    double pos = audio_get_position_seconds();
-    deferred_resume_position = (pos > 0.0) ? pos : 0.0;
-    deferred_resume_pending = true;
+    /* Stale error rejection: if an error arrived from an older playback generation,
+     * ignore it so it cannot affect or skip a newly selected track. */
+    if (err_generation != 0 && current_playback_generation != 0 &&
+        err_generation != current_playback_generation) {
+        return;
+    }
 
-    set_play_button_state(false);
+    if (err == AUDIO_ERROR_OUTPUT_FAILED) {
+        /* Checkpoint confirmed position so pressing Play can retry cleanly */
+        double pos = audio_get_position_seconds();
+        deferred_resume_position = (pos > 0.0) ? pos : 0.0;
+        deferred_resume_pending = true;
+        set_play_button_state(false);
+        show_error_toast("Playback error: audio output failed");
+        return;
+    }
 
     if (err == AUDIO_ERROR_DECODER_FAILED) {
-        show_error_toast("Playback error: decoder failed");
-    } else if (err == AUDIO_ERROR_OUTPUT_FAILED) {
-        show_error_toast("Playback error: audio output failed");
+        /* Record the failed track's physical path */
+        const char * failed_path = playlist_path_at(playlist_index);
+        if (failed_path) record_failed_physical_path(failed_path);
+
+        consecutive_decoder_failure_skips++;
+        int max_skips = (playlist_count < 5) ? playlist_count : 5;
+        if (consecutive_decoder_failure_skips >= max_skips) {
+            set_play_button_state(false);
+            deferred_resume_pending = false;
+            deferred_resume_position = 0.0;
+            reset_decoder_failure_tracking();
+            show_error_toast("Playback stopped: too many unplayable tracks");
+            return;
+        }
+
+        if ((play_mode_t) current_settings.play_mode == PLAY_MODE_SHUFFLE) {
+            ensure_shuffle_order_current();
+            if (!pending_shuffle_order) {
+                pending_shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
+                if (pending_shuffle_order) {
+                    memcpy(pending_shuffle_order, shuffle_order, sizeof(int) * (size_t) playlist_count);
+                    fisher_yates_shuffle(pending_shuffle_order, playlist_count);
+                }
+            }
+        }
+
+        failure_advance_plan_t plan = compute_decoder_failure_advance_plan(
+            playlist_index,
+            playlist_count,
+            (int) current_settings.play_mode,
+            queued_pending_count,
+            shuffle_order,
+            shuffle_pos,
+            pending_shuffle_order,
+            is_failed_physical_track_cb,
+            NULL
+        );
+
+        if (plan.target_index < 0) {
+            set_play_button_state(false);
+            deferred_resume_pending = false;
+            deferred_resume_position = 0.0;
+            reset_decoder_failure_tracking();
+            show_error_toast("Playback stopped: too many unplayable tracks");
+            return;
+        }
+
+        commit_decoder_failure_advance_plan(&plan);
+        deferred_resume_pending = false;
+        deferred_resume_position = 0.0;
+        show_error_toast("Skipped unplayable track");
+        play_track_at_from_internal(plan.target_index, 0.0, false);
     }
+}
+
+void gui_player_handle_playback_error(audio_error_t err) {
+    gui_player_handle_playback_error_ex(err, 0);
 }
 
 

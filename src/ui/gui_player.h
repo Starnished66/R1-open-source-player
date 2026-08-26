@@ -82,6 +82,8 @@ void gui_player_cancel_background_work(void);
 
 
 int compute_auto_advance_index(int index);
+int compute_decoder_failure_advance_index(int failed_index);
+void reset_decoder_failure_tracking(void);
 extern bool user_seeking;
 extern bool deferred_resume_pending;
 extern double deferred_resume_position;
@@ -99,6 +101,8 @@ const char * gui_player_get_now_playing_folder(void);
 void gui_player_handle_auto_advance(void);
 void gui_player_handle_track_finished(void);
 void gui_player_handle_playback_error(audio_error_t err);
+void gui_player_handle_playback_error_ex(audio_error_t err, uint64_t err_generation);
+void gui_player_poll_confirmed_playback(void);
 
 void gui_player_sync_topbar_visibility(lv_obj_t * screen);
 lv_obj_t * gui_player_get_dismiss_btn(void);

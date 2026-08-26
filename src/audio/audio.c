@@ -559,6 +559,7 @@ static bool paused = false;
 static bool track_finished = false; /* true EOF with no next track queued (or it failed to open) */
 static bool track_advanced = false; /* thread moved on to the queued next track on its own */
 static audio_error_t last_playback_error = AUDIO_ERROR_NONE;
+static uint64_t last_playback_error_generation = 0;
 
 static bool restart_requested = false;
 static uint64_t next_track_generation = 0;
@@ -1065,6 +1066,7 @@ static void * audio_thread_func(void * arg) {
             have_current = false;
             clear_current_format_locked();
             last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+            last_playback_error_generation = cur_generation;
             pthread_mutex_unlock(&audio_mutex);
             continue;
         }
@@ -1090,6 +1092,7 @@ static void * audio_thread_func(void * arg) {
             have_current = false;
             clear_current_format_locked();
             last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+            last_playback_error_generation = cur_generation;
             pthread_mutex_unlock(&audio_mutex);
             continue;
         }
@@ -1310,6 +1313,7 @@ static void * audio_thread_func(void * arg) {
                     nxt_format_matches = false;
                     pthread_mutex_lock(&audio_mutex);
                     last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                    last_playback_error_generation = cur_generation;
                     have_current = false;
                     clear_current_format_locked();
                     paused = false;
@@ -1353,6 +1357,7 @@ static void * audio_thread_func(void * arg) {
                             nxt_format_matches = false;
                             pthread_mutex_lock(&audio_mutex);
                             last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                            last_playback_error_generation = cur_generation;
                             have_current = false;
                             clear_current_format_locked();
                             paused = false;
@@ -1422,6 +1427,7 @@ static void * audio_thread_func(void * arg) {
                             DBG_LOG("audio: crossfade fallback output failure (%s)\n", safe_path_tail(cur_path_local));
                             pthread_mutex_lock(&audio_mutex);
                             last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                            last_playback_error_generation = cur_generation;
                             have_current = false;
                             clear_current_format_locked();
                             paused = false;
@@ -1484,6 +1490,7 @@ static void * audio_thread_func(void * arg) {
                         nxt_format_matches = false;
                         pthread_mutex_lock(&audio_mutex);
                         last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                        last_playback_error_generation = cur_generation;
                         have_current = false;
                         clear_current_format_locked();
                         paused = false;
@@ -1571,6 +1578,7 @@ static void * audio_thread_func(void * arg) {
                         cur_frames_played_local, cur_dec.total_frames, safe_path_tail(cur_path_local));
                 pthread_mutex_lock(&audio_mutex);
                 last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                last_playback_error_generation = cur_generation;
                 have_current = false;
                 clear_current_format_locked();
                 paused = false;
@@ -1618,6 +1626,7 @@ static void * audio_thread_func(void * arg) {
                                 safe_path_tail(cur_path_local));
                         pthread_mutex_lock(&audio_mutex);
                         last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                        last_playback_error_generation = cur_generation;
                         have_current = false;
                         clear_current_format_locked();
                         paused = false;
@@ -1723,6 +1732,7 @@ static void * audio_thread_func(void * arg) {
                         safe_path_tail(cur_path_local));
                 pthread_mutex_lock(&audio_mutex);
                 last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                last_playback_error_generation = cur_generation;
                 have_current = false;
                 clear_current_format_locked();
                 paused = false;
@@ -1798,6 +1808,7 @@ void audio_play_file_at(const char * path, double start_seconds,
     track_finished = false;
     track_advanced = false;
     last_playback_error = AUDIO_ERROR_NONE;
+    last_playback_error_generation = 0;
     playback_generation++;
     seek_request_generation++;
     free(active_path);
@@ -2134,10 +2145,23 @@ bool audio_consume_track_advanced(void) {
     return result;
 }
 
-audio_error_t audio_consume_error(void) {
+audio_error_t audio_consume_error_ex(uint64_t * out_generation) {
     pthread_mutex_lock(&audio_mutex);
     audio_error_t err = last_playback_error;
+    if (out_generation) *out_generation = last_playback_error_generation;
     last_playback_error = AUDIO_ERROR_NONE;
+    last_playback_error_generation = 0;
     pthread_mutex_unlock(&audio_mutex);
     return err;
+}
+
+audio_error_t audio_consume_error(void) {
+    return audio_consume_error_ex(NULL);
+}
+
+uint64_t audio_get_playback_generation(void) {
+    pthread_mutex_lock(&audio_mutex);
+    uint64_t gen = playback_generation;
+    pthread_mutex_unlock(&audio_mutex);
+    return gen;
 }

@@ -130,4 +130,147 @@ static inline bool should_abort_write_retry(bool allow_during_stop_restart, bool
     return (stop_req || restart_req);
 }
 
+typedef struct {
+    int target_index;            /* Next playlist index to play, or -1 if none */
+    int queued_consumed;         /* Number of queued_pending items traversed/consumed */
+    int shuffle_steps;           /* Number of shuffle positions advanced */
+    bool shuffle_wrapped;        /* Whether shuffle order wrapped into pending_shuffle_order */
+} failure_advance_plan_t;
+
+/* Callback type to check whether a given playlist index points to a failed physical file.
+ * Returns true if the index should be skipped. */
+typedef bool (*is_failed_index_fn)(int index, void * userdata);
+
+/* Pure algorithm to compute next playlist index upon fatal decoder failure with full
+ * queue/shuffle step tracking and physical file deduplication.
+ *
+ * play_mode: 0 = PLAY_MODE_SEQUENTIAL, 1 = PLAY_MODE_REPEAT_ALL, 2 = PLAY_MODE_REPEAT_ONE, 3 = PLAY_MODE_SHUFFLE
+ */
+static inline failure_advance_plan_t compute_decoder_failure_advance_plan(
+    int failed_index,
+    int playlist_count,
+    int play_mode,
+    int queued_pending_count,
+    const int * shuffle_order,
+    int shuffle_pos,
+    const int * pending_shuffle_order,
+    is_failed_index_fn is_failed_fn,
+    void * userdata)
+{
+    failure_advance_plan_t plan = {
+        .target_index = -1,
+        .queued_consumed = 0,
+        .shuffle_steps = 0,
+        .shuffle_wrapped = false
+    };
+
+    if (failed_index < 0 || playlist_count <= 0) return plan;
+    int orig_failed_index = failed_index;
+
+    /* 1. Explicitly queued tracks retain priority */
+    if (queued_pending_count > 0) {
+        int queued_limit = (failed_index + queued_pending_count < playlist_count)
+                           ? queued_pending_count
+                           : (playlist_count - 1 - failed_index);
+        for (int q = 1; q <= queued_limit; q++) {
+            int cand = failed_index + q;
+            if (!is_failed_fn || !is_failed_fn(cand, userdata)) {
+                plan.target_index = cand;
+                plan.queued_consumed = q;
+                return plan;
+            }
+        }
+        /* All queued items were traversed and failed; record them as consumed */
+        plan.queued_consumed = queued_pending_count;
+        /* Proceed to normal play_mode from the end of the queued block */
+        failed_index = failed_index + queued_pending_count;
+        if (failed_index >= playlist_count) failed_index = playlist_count - 1;
+    }
+
+    if (playlist_count <= 1) {
+        plan.target_index = -1;
+        return plan;
+    }
+
+    switch (play_mode) {
+        case 3: /* PLAY_MODE_SHUFFLE */ {
+            if (!shuffle_order) {
+                plan.target_index = -1;
+                return plan;
+            }
+            /* Step through shuffle positions. When wrapping into pending_shuffle_order,
+             * we need to examine all remaining entries in the current bag plus all
+             * entries in the pending bag (remaining_current_steps + playlist_count). */
+            int remaining_current_steps = (playlist_count - 1 >= shuffle_pos) ? (playlist_count - 1 - shuffle_pos) : 0;
+            int max_steps = (pending_shuffle_order != NULL) ? (remaining_current_steps + playlist_count) : remaining_current_steps;
+            for (int step = 1; step <= max_steps; step++) {
+                int pos = shuffle_pos + step;
+                int cand = -1;
+                bool wrapped = false;
+                if (pos < playlist_count) {
+                    cand = shuffle_order[pos];
+                } else if (pending_shuffle_order) {
+                    int wrap_pos = pos - playlist_count;
+                    if (wrap_pos < playlist_count) {
+                        cand = pending_shuffle_order[wrap_pos];
+                        wrapped = true;
+                    }
+                }
+                if (cand >= 0 && cand < playlist_count && cand != orig_failed_index && cand != failed_index) {
+                    if (!is_failed_fn || !is_failed_fn(cand, userdata)) {
+                        plan.target_index = cand;
+                        plan.shuffle_steps = step;
+                        plan.shuffle_wrapped = wrapped;
+                        return plan;
+                    }
+                }
+            }
+            plan.target_index = -1;
+            return plan;
+        }
+        case 2: /* PLAY_MODE_REPEAT_ONE: override repeat one for failure recovery */
+        case 1: /* PLAY_MODE_REPEAT_ALL */ {
+            for (int step = 1; step < playlist_count; step++) {
+                int cand = (failed_index + step) % playlist_count;
+                if (cand != orig_failed_index && cand != failed_index) {
+                    if (!is_failed_fn || !is_failed_fn(cand, userdata)) {
+                        plan.target_index = cand;
+                        return plan;
+                    }
+                }
+            }
+            plan.target_index = -1;
+            return plan;
+        }
+        case 0: /* PLAY_MODE_SEQUENTIAL */
+        default: {
+            for (int cand = failed_index + 1; cand < playlist_count; cand++) {
+                if (cand != orig_failed_index && (!is_failed_fn || !is_failed_fn(cand, userdata))) {
+                    plan.target_index = cand;
+                    return plan;
+                }
+            }
+            plan.target_index = -1;
+            return plan;
+        }
+    }
+}
+
+/* Convenience wrapper returning only the next candidate index */
+static inline int compute_decoder_failure_advance_index_pure(
+    int failed_index,
+    int playlist_count,
+    int play_mode,
+    int queued_pending_count,
+    const int * shuffle_order,
+    int shuffle_pos,
+    const int * pending_shuffle_order)
+{
+    failure_advance_plan_t plan = compute_decoder_failure_advance_plan(
+        failed_index, playlist_count, play_mode, queued_pending_count,
+        shuffle_order, shuffle_pos, pending_shuffle_order, NULL, NULL
+    );
+    return plan.target_index;
+}
+
 #endif /* AUDIO_HELPERS_H */

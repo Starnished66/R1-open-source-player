@@ -172,20 +172,24 @@ bool audio_consume_track_finished(void);
 bool audio_consume_track_advanced(void);
 
 /* Unrecoverable playback error codes, distinct from natural end-of-track.
- * Errors do NOT advance the queue; the current track and last confirmed
- * position remain valid so the UI can show a toast and the user can retry
- * with audio_play_file_at() at the stored position. */
+ * audio.c reports failures but does not decide higher-level queue policy.
+ * Decoder errors may be automatically skipped by the GUI layer (subject
+ * to consecutive-failure safety caps), while output hardware errors remain
+ * stopped and retryable at the last confirmed position.
+ * Error events carry playback generation to allow the consumer to reject
+ * stale errors from previous tracks. */
 typedef enum {
     AUDIO_ERROR_NONE = 0,
-    AUDIO_ERROR_DECODER_FAILED,  /* premature EOF -- decoder recovery exhausted */
+    AUDIO_ERROR_DECODER_FAILED,  /* unrecoverable decode/container/file failure */
     AUDIO_ERROR_OUTPUT_FAILED,   /* output write error -- hardware recovery exhausted */
 } audio_error_t;
 
 /* Returns the most recent unrecoverable error (and clears it) exactly once.
- * AUDIO_ERROR_NONE means no pending error. Designed to be polled from the
- * GUI thread's timer alongside audio_consume_track_finished() and
- * audio_consume_track_advanced(). Unlike track_finished, an error MUST NOT
- * trigger automatic queue advance -- the track stays current. */
+ * AUDIO_ERROR_NONE means no pending error. Polled from the GUI timer. */
 audio_error_t audio_consume_error(void);
+audio_error_t audio_consume_error_ex(uint64_t * out_generation);
+
+/* Returns the current playback generation counter. */
+uint64_t audio_get_playback_generation(void);
 
 #endif /* AUDIO_H */

@@ -1333,7 +1333,7 @@ static void poll_refresh_bt_icon(void) {
      * bt_control_source_volume_sync_start()'s own comment in
      * bluetooth_control.c for why this doesn't double-attenuate on top of
      * this app's own volume taper. */
-    if (use_bt_output) {
+    if (use_bt_output && current_settings.bt_volume_sync_enabled) {
         bt_control_source_volume_sync_start();
     } else {
         bt_control_source_volume_sync_stop();

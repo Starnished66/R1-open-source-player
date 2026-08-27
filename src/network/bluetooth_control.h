@@ -185,6 +185,7 @@ bool bt_control_set_codec(const char * codec);
  * matching every other start/stop pair in this file). */
 void bt_control_source_volume_sync_start(void);
 void bt_control_source_volume_sync_stop(void);
+bool bt_control_source_volume_sync_consume_percent(int * out_percent);
 
 /* Fast disconnect detection for that same a2dp-source output PCM. Real-
  * device bug report: a genuine BT headphone disconnect took up to ~17s to

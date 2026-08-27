@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -830,6 +831,7 @@ bool bt_control_get_connected_device_codec(char * out, size_t out_size) {
 static pthread_t bt_source_vol_sync_thread;
 static bool bt_source_vol_sync_active = false;
 static pid_t bt_source_vol_sync_monitor_pid = -1;
+static atomic_int bt_source_vol_pending_percent = ATOMIC_VAR_INIT(-1);
 
 /* Set by whichever direction writes/observes a value most recently, so the
  * other direction recognizes it as already in sync instead of re-writing
@@ -838,8 +840,41 @@ static pid_t bt_source_vol_sync_monitor_pid = -1;
  * direction echoing itself. */
 static int bt_source_vol_last_synced_raw = -1;
 
+static void bt_source_push_app_volume_if_changed(float * last_synced_app_percent) {
+    float current_percent = audio_get_volume();
+    if (current_percent == *last_synced_app_percent) return;
+
+    int raw = (int) (current_percent * (float) BT_SOURCE_VOLUME_MAX + 0.5f);
+    if (raw < 0) raw = 0;
+    if (raw > BT_SOURCE_VOLUME_MAX) raw = BT_SOURCE_VOLUME_MAX;
+
+    if (raw == bt_source_vol_last_synced_raw) {
+        *last_synced_app_percent = current_percent;
+        return;
+    }
+
+    char path[256];
+    if (!find_source_pcm_path(path, sizeof(path))) return;
+
+    char raw_str[8];
+    snprintf(raw_str, sizeof(raw_str), "%d", raw);
+    char * vol_argv[] = { (char *) "bluealsa-cli", (char *) "volume", path, raw_str, raw_str, NULL };
+    if (!subprocess_run(vol_argv, NULL, 0)) return;
+
+    bt_source_vol_last_synced_raw = raw;
+    *last_synced_app_percent = current_percent;
+    hiby_sys_server_report_volume((int) (current_percent * 100.0f + 0.5f));
+}
+
 static void * bt_source_vol_sync_thread_func(void * arg) {
     (void) arg;
+
+    /* Establish the already-visible player value before subscribing to
+     * bluealsa property changes. Starting the monitor first can queue the
+     * accessory's remembered pre-sync value, which would then overwrite
+     * the app even if we push immediately afterward. */
+    float last_synced_app_percent = -1.0f;
+    bt_source_push_app_volume_if_changed(&last_synced_app_percent);
 
     char * argv[] = { (char *) "bluealsa-cli", (char *) "monitor", (char *) "-p", NULL };
     pid_t pid;
@@ -847,15 +882,18 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
     if (!subprocess_popen(argv, &pid, &read_fd)) return NULL;
     bt_source_vol_sync_monitor_pid = pid;
 
-    /* -1.0f sentinel: guarantees the first tick below always pushes this
-     * app's current volume once, so a headphone that just connected starts
-     * in sync with whatever this app is already set to, not just from the
-     * next time the user actually touches the volume. */
-    float last_synced_app_percent = -1.0f;
     char buf[512];
     size_t buf_len = 0;
 
     while (bt_source_vol_sync_active) {
+        /* Push app-driven state BEFORE reading monitor events. In
+         * particular, the first iteration must make the already-visible
+         * player percentage authoritative before bluealsa's monitor can
+         * report the accessory's remembered value; doing this afterward
+         * let that startup event silently change audio_get_volume() while
+         * the slider/topbar still showed the old app value. */
+        bt_source_push_app_volume_if_changed(&last_synced_app_percent);
+
         /* Bounded, not a blocking fgets() like bt_volume_curve_thread_func
          * above -- this loop also needs to notice this app's OWN volume
          * changing (UI slider, hardware buttons), which has no fd to
@@ -887,6 +925,10 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
                         bt_source_vol_last_synced_raw = raw;
                         last_synced_app_percent = (float) raw / (float) BT_SOURCE_VOLUME_MAX;
                         audio_set_volume(last_synced_app_percent);
+                        int percent = (raw * 100 + BT_SOURCE_VOLUME_MAX / 2) /
+                                      BT_SOURCE_VOLUME_MAX;
+                        atomic_store_explicit(&bt_source_vol_pending_percent, percent,
+                                              memory_order_release);
                     }
                 }
                 line_start = newline + 1;
@@ -896,35 +938,6 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
             buf_len = remaining;
         }
 
-        /* Push direction: pick up any app-driven volume change at this same
-         * ~500ms tick, regardless of whether the read above found anything.
-         * Only actually looks up the PCM path and shells out when the
-         * percent has genuinely changed since the last thing this thread
-         * either pushed or received -- not on every tick. */
-        float current_percent = audio_get_volume();
-        if (current_percent != last_synced_app_percent) {
-            int raw = (int) (current_percent * (float) BT_SOURCE_VOLUME_MAX + 0.5f);
-            if (raw < 0) raw = 0;
-            if (raw > BT_SOURCE_VOLUME_MAX) raw = BT_SOURCE_VOLUME_MAX;
-
-            if (raw == bt_source_vol_last_synced_raw) {
-                last_synced_app_percent = current_percent; /* already in sync (this percent just rounds to the same raw value already synced) */
-            } else {
-                char path[256];
-                if (find_source_pcm_path(path, sizeof(path))) {
-                    bt_source_vol_last_synced_raw = raw;
-                    last_synced_app_percent = current_percent;
-                    char raw_str[8];
-                    snprintf(raw_str, sizeof(raw_str), "%d", raw);
-                    char * vol_argv[] = { (char *) "bluealsa-cli", (char *) "volume", path, raw_str, raw_str, NULL };
-                    subprocess_run(vol_argv, NULL, 0);
-                    hiby_sys_server_report_volume((int) (current_percent * 100.0f + 0.5f));
-                }
-                /* else: nothing connected right now -- leave
-                 * last_synced_app_percent unchanged so this retries on the
-                 * next tick instead of silently giving up. */
-            }
-        }
     }
 
     close(read_fd);
@@ -935,6 +948,7 @@ void bt_control_source_volume_sync_start(void) {
     if (bt_source_vol_sync_active) return; /* already running -- matches bt_volume_curve_start()'s own idempotency, just without the defensive re-stop since callers here are expected not to double-start (see gui.c's own gating) */
     bt_source_vol_sync_active = true;
     bt_source_vol_last_synced_raw = -1;
+    atomic_store_explicit(&bt_source_vol_pending_percent, -1, memory_order_relaxed);
     pthread_create(&bt_source_vol_sync_thread, NULL, bt_source_vol_sync_thread_func, NULL);
 }
 
@@ -944,6 +958,15 @@ void bt_control_source_volume_sync_stop(void) {
     if (bt_source_vol_sync_monitor_pid > 0) subprocess_terminate(bt_source_vol_sync_monitor_pid);
     pthread_join(bt_source_vol_sync_thread, NULL);
     bt_source_vol_sync_monitor_pid = -1;
+    atomic_store_explicit(&bt_source_vol_pending_percent, -1, memory_order_release);
+}
+
+bool bt_control_source_volume_sync_consume_percent(int * out_percent) {
+    int percent = atomic_exchange_explicit(&bt_source_vol_pending_percent, -1,
+                                           memory_order_acq_rel);
+    if (percent < 0) return false;
+    if (out_percent) *out_percent = percent;
+    return true;
 }
 
 /* See bt_control_output_disconnect_watch_start()'s own doc comment

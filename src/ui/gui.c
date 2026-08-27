@@ -569,6 +569,19 @@ static void update_timer_cb(lv_timer_t * timer) {
     bt_media_player_notify_playback_state(audio_is_playing());
 #endif
 
+    /* Accessory-originated AVRCP volume changes arrive on bluealsa's
+     * monitor thread. Mirror the already-applied audio value into every UI
+     * and persisted representation here on the sole LVGL thread, so the
+     * next hardware-button step starts from what the user actually hears. */
+    int bt_synced_volume_percent;
+    if (bt_control_source_volume_sync_consume_percent(&bt_synced_volume_percent)) {
+        gui_player_set_volume_percent(bt_synced_volume_percent);
+        current_settings.volume = (float) bt_synced_volume_percent / 100.0f;
+        settings_save(&current_settings);
+        show_volume_popup(bt_synced_volume_percent);
+        refresh_volume_topbar(bt_synced_volume_percent);
+    }
+
     int volume_delta = hw_buttons_consume_volume_delta();
     if (volume_delta != 0) {
         int32_t new_percent = gui_player_get_volume_percent() + volume_delta;

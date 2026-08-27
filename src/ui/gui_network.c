@@ -658,6 +658,11 @@ static void wifi_dns_settings_row_cb(lv_event_t * e) {
 void populate_wifi_screen(bool enabled) {
     lv_obj_clean(wifi_list);
 
+    if (wifi_rescan_btn) {
+        if (enabled) lv_obj_remove_flag(wifi_rescan_btn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(wifi_rescan_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
     /* quick_drawer_wifi_event_cb is the SAME real toggle-thread trigger the
      * drawer's own wifi icon uses -- no drawer-specific logic in it, so
      * it's reused directly here rather than duplicating the thread-kickoff
@@ -2052,6 +2057,10 @@ void populate_bt_screen(void) {
      * pre-existing hang class start_refresh_bt_icon()'s own comment
      * documents). The cache is kept fresh in the background regardless. */
     bool powered = bt_is_powered_cached;
+    if (bt_rescan_btn) {
+        if (powered) lv_obj_remove_flag(bt_rescan_btn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(bt_rescan_btn, LV_OBJ_FLAG_HIDDEN);
+    }
     /* quick_drawer_bt_event_cb is the SAME real toggle-thread trigger the
      * drawer's own bt icon uses -- see populate_wifi_screen()'s identical
      * reasoning for wifi. */

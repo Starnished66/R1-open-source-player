@@ -101,12 +101,30 @@
  * gui.c's own status-bar polling already does more often than this). */
 #define CHARGE_LIMITER_REEVALUATE_SECONDS 5
 
-/* Exported read-only UI state. This tracks a successfully requested hold,
- * not the kernel power_supply status (confirmed stale on this device: it
+/* Exported read-only UI state -- the DESIRED/intended hold, decided purely
+ * from the percent thresholds below, BEFORE disable_charging()/
+ * enable_charging() is even attempted (see charge_limiter_poll()). NOT the
+ * kernel power_supply status either way (confirmed stale on this device: it
  * can keep saying "Charging" while REG18 chg_en is clear and REG01 says
- * not_charging). Only the GUI timer/settings callbacks call this module, so
- * no cross-thread synchronization is needed. */
+ * not_charging) -- but also not a confirmation that the i2c write actually
+ * took effect; if disable_charging() fails, this stays true through the
+ * ~1s retry regardless. Fine for callers that only care about intent (e.g.
+ * gui.c's idle-shutdown eligibility check), wrong for anything that needs
+ * to know the charger is ACTUALLY off right now -- see charger_confirmed_
+ * off below for that. Only the GUI timer/settings callbacks call this
+ * module, so no cross-thread synchronization is needed. */
 static bool limiter_holding = false;
+
+/* Distinct from limiter_holding above: true only once disable_charging()
+ * (or enable_charging()) has actually run AND its own register-readback
+ * check (set_charging_enabled()) confirmed the write took effect. Stays at
+ * its last CONFIRMED value (not the newly-desired one) while a write is
+ * failing/retrying, rather than optimistically flipping the instant intent
+ * changes. This is what led_control.c's blue "charging complete/capped"
+ * indicator consumes -- showing that LED based on limiter_holding alone
+ * would light it during the retry window even if the charger were still
+ * genuinely enabled. */
+static bool charger_confirmed_off = false;
 
 #if CHARGE_LIMITER_ACTIVE
 static bool axp2101_smbus_xfer(uint8_t reg, uint8_t * value, bool write) {
@@ -186,8 +204,12 @@ void charge_limiter_poll(bool enabled, bool force) {
     last_apply = now;
 
     if (!enabled) {
-        if (enable_charging()) limiter_holding = false;
-        else last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+        if (enable_charging()) {
+            limiter_holding = false;
+            charger_confirmed_off = false;
+        } else {
+            last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+        }
         return;
     }
 
@@ -211,12 +233,23 @@ void charge_limiter_poll(bool enabled, bool force) {
     else if (percent <= CHARGE_LIMITER_RESUME_PERCENT) limiter_holding = false;
 
     bool applied = limiter_holding ? disable_charging() : enable_charging();
-    if (!applied) last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+    if (applied) {
+        /* Only now, with the register readback actually confirming it, does
+         * the CONFIRMED state move to match the desired one -- see
+         * charger_confirmed_off's own comment. */
+        charger_confirmed_off = limiter_holding;
+    } else {
+        last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+    }
 #endif
 }
 
 bool charge_limiter_is_holding(void) {
     return limiter_holding;
+}
+
+bool charge_limiter_is_confirmed_off(void) {
+    return charger_confirmed_off;
 }
 
 void safe_charging_poll(bool enabled, bool force) {

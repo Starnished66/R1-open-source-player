@@ -79,10 +79,27 @@
  * CHARGE_LIMITER_REEVALUATE_SECONDS after the user expected it to resume. */
 void charge_limiter_poll(bool enabled, bool force);
 
-/* True while the 85% limiter is actively holding the charger disabled.
- * Used by the UI because this device's kernel battery/status node can stay
- * stuck on "Charging" even after the PMIC confirms charging has stopped. */
+/* True while the 85% limiter WANTS the charger disabled -- decided purely
+ * from the percent thresholds, before disable_charging() is even attempted,
+ * and stays true through a failed-write retry window regardless of whether
+ * the i2c operation actually took effect. Fine for callers that only need
+ * the app's own intent (e.g. gui.c's idle-shutdown eligibility check).
+ * Used by the UI (that intent, not this device's kernel battery/status
+ * node) because that kernel node can stay stuck on "Charging" even after
+ * the PMIC confirms charging has stopped. For anything that needs to know
+ * the charger is ACTUALLY off right now, use charge_limiter_is_confirmed_
+ * off() below instead. */
 bool charge_limiter_is_holding(void);
+
+/* True only once a disable_charging() write has actually been issued AND
+ * its own register-readback check confirmed it took effect -- stays at its
+ * last confirmed value (not the newly-desired one) while a write is
+ * failing/retrying. Distinct from charge_limiter_is_holding() above, which
+ * can already read true before the very first disable attempt is even
+ * made. Use this, not charge_limiter_is_holding(), for anything (like
+ * led_control.c's blue "charging complete/capped" indicator) that would be
+ * actively misleading if shown before the charger is confirmed off. */
+bool charge_limiter_is_confirmed_off(void);
 
 /* Enforces the 500mA charge-current cap while enabled. Disabled is a no-op
  * and does not restore or otherwise modify the current PMIC setting. */

@@ -4,24 +4,32 @@
 #include <stdbool.h>
 
 /* R1 Pro charge-status LEDs, confirmed present via /sys/class/leds/{red,blue}
- * on a real device. Originally driven via the kernel's own LED trigger
- * mechanism (red -> "battery-charging", blue -> "battery-full"), matching
- * the same sysfs paths the stock closed-source binary writes to (confirmed
- * via `strings`) -- but real-device testing found EVERY charge-related
- * trigger on this board's kernel build is non-functional: attaching
- * "battery-charging", "axp_battery-charging", "battery-charging-or-full",
- * even "ac-online"/"usb-online", never sets brightness above 0 regardless
- * of actual charge state (confirmed live: brightness stayed 0 for over 5s
- * while genuinely charging). This is the same category of issue as
- * axp_battery's dead voltage_now/current_now (see charge_limiter.h) --
- * sysfs surface exists, the real wiring behind it doesn't on this kernel.
+ * on a real device.
  *
- * Direct brightness writes DO work (confirmed: trigger=none + brightness=1
- * physically lit the LED), so this now drives both LEDs itself instead of
- * delegating to the kernel: red while battery_is_charging() && not full,
- * blue once battery_is_full(), neither otherwise. Requires actual polling
- * now (unlike the old trigger-based approach) since nothing else updates
- * the LEDs as charge state changes -- see led_control_poll(). */
+ * The driver's advertised max_brightness is 100, but real-device testing
+ * found that trigger=none + brightness=100 only flashes the physical LED
+ * briefly and then leaves it dark even though sysfs continues to read back
+ * 100. A direct brightness=50 write remains visibly lit, so manual control
+ * deliberately uses that confirmed-working midpoint rather than the
+ * misleading advertised maximum. See led_control.c.
+ *
+ * Real, still-relevant issue (unrelated to brightness): the kernel's own
+ * charge-status LED triggers ("battery-charging", "battery-full", etc.)
+ * were tried and abandoned early on because this device's kernel power_
+ * supply status can go stale specifically around this app's own charge_
+ * limiter.c -- chg_en can be cleared via a raw i2c write the kernel's
+ * power_supply core never observes, so anything (a trigger or this app's
+ * own battery_is_charging()/battery_is_full()) that reads that status can
+ * keep reporting "Charging" long after real charging actually stopped (see
+ * charge_limiter.h's own comment on the identical staleness). This module
+ * still polls and decides state itself for that reason -- battery_is_
+ * charging()/battery_is_full() PLUS charge_limiter_is_confirmed_off() (NOT
+ * charge_limiter_is_holding() -- that reflects intent, not a confirmed i2c
+ * write, see its own comment) as the override for "charging was
+ * intentionally capped, treat it as done", further gated on battery_get_
+ * external_power_state() so an unplug shortly after capping doesn't leave
+ * the blue "done charging" LED lit while running on battery -- see led_
+ * control_poll()'s own comment for the exact logic. */
 
 /* Call once at startup and whenever the user flips the settings toggle --
  * forces trigger=none on both LEDs (taking exclusive manual control away

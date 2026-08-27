@@ -335,6 +335,14 @@ void player_transition_mark_dirty(void) {
 
 static bool slide_transition_active = false;
 
+/* The home pill is a persistent top-layer object, but Lyrics deliberately
+ * disables its gesture. Apply its visibility at real screen handoffs so it
+ * is never restored early and baked into the outgoing Lyrics frame. */
+static void sync_home_indicator_visibility(lv_obj_t * screen) {
+    gui_shell_set_home_indicator_visible(current_settings.swipe_up_home_enabled &&
+                                         screen != gui_lyrics_get_screen());
+}
+
 /* Forward declarations -- real (first) tentative/actual definitions
  * further down this file, alongside poll_quick_drawer_drag()'s own
  * player-swipe state. slide_transition_anim_x_cb()'s compositor-failure
@@ -390,6 +398,7 @@ void slide_transition_anim_x_cb(void * var, int32_t v) {
             lv_obj_t * recovery_scr = ctx->commit ? ctx->to_scr : ctx->from_scr;
             lv_screen_load(recovery_scr);
             sync_player_topbar_visibility(recovery_scr);
+            sync_home_indicator_visibility(recovery_scr);
             lv_async_call(full_redraw_async_cb, NULL);
             if (ctx->overlay) lv_obj_delete(ctx->overlay);
             if (ctx->buf_from_owned) lv_draw_buf_destroy(ctx->buf_from);
@@ -424,6 +433,7 @@ void slide_transition_done_cb(lv_anim_t * a) {
         else
             lv_obj_remove_flag(hb_sup, LV_OBJ_FLAG_HIDDEN);
     }
+    sync_home_indicator_visibility(final_scr);
     if (ctx->overlay) lv_obj_delete(ctx->overlay); /* deletes img_from/img_to too -- NULL when this transition was handed to the compositor instead (see begin_slide_transition()'s own comment on why the overlay is skipped entirely there, not just left undrawn) */
     if (ctx->buf_from_owned) lv_draw_buf_destroy(ctx->buf_from);
     if (ctx->buf_to_owned) lv_draw_buf_destroy(ctx->buf_to);
@@ -451,6 +461,7 @@ void slide_transition_cancel(slide_transition_ctx_t ** pctx) {
     if (recovery_scr) {
         lv_screen_load(recovery_scr);
         sync_player_topbar_visibility(recovery_scr);
+        sync_home_indicator_visibility(recovery_scr);
     }
 
     /* Restore home indicator band visibility */
@@ -716,6 +727,7 @@ static void screen_transition_slide(lv_obj_t * to_scr, bool forward) {
     if (!ctx) {
         lv_screen_load(to_scr);
         sync_player_topbar_visibility(to_scr);
+        sync_home_indicator_visibility(to_scr);
         return;
     }
 
@@ -738,6 +750,7 @@ void nav_push(lv_obj_t * scr) {
     if (nav_depth > 0 && nav_stack[nav_depth - 1] == scr) {
         lv_screen_load(scr); /* already the active screen -- nothing to push */
         sync_player_topbar_visibility(scr);
+        sync_home_indicator_visibility(scr);
         return;
     }
     if (nav_depth < NAV_STACK_MAX) {
@@ -748,6 +761,7 @@ void nav_push(lv_obj_t * scr) {
      * used by nav_pop() below, so backing out still animates. */
     lv_screen_load(scr);
     sync_player_topbar_visibility(scr);
+    sync_home_indicator_visibility(scr);
 #ifdef UI_PERF_TRACE
     printf("PERF nav_push load_us=%llu depth=%d\n",
            (unsigned long long) (ui_perf_now_us() - perf_start_us), nav_depth);
@@ -795,6 +809,7 @@ void nav_reset_to_home(void) {
     nav_stack[0] = gui_shell_get_home_screen();
     lv_screen_load(gui_shell_get_home_screen());
     sync_player_topbar_visibility(gui_shell_get_home_screen());
+    sync_home_indicator_visibility(gui_shell_get_home_screen());
 }
 
 /* Shared back-button handler for every screen built via the reusable

@@ -1290,6 +1290,82 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
     }
 }
 
+#ifdef UI_GESTURE_TRACE
+static void debug_transport_btn_all_cb(lv_event_t * e) {
+    printf("[TRANSPORT_TRACE] obj=%p code=%d clickable=%d state=0x%x\n",
+           (void *) lv_event_get_target(e), (int) lv_event_get_code(e),
+           lv_obj_has_flag(lv_event_get_target(e), LV_OBJ_FLAG_CLICKABLE),
+           (unsigned) lv_obj_get_state(lv_event_get_target(e)));
+}
+#endif
+
+#ifdef UI_HITBOX_DEBUG
+/* Outlines `obj`'s REAL click hit-test boundary -- its own drawn size plus
+ * whatever lv_obj_set_ext_click_area(obj, ext) padded it out by -- in a
+ * distinct solid color per transport-row icon, so a real-device hitbox/
+ * overlap question can be answered by looking at the screen instead of
+ * re-deriving the flex-gap math by hand. LVGL's outline style is drawn
+ * OUTSIDE an object's own box, offset outward by outline_pad -- passing the
+ * exact same `ext` used for lv_obj_set_ext_click_area() here means the
+ * drawn line traces exactly where the real (invisible) click boundary is,
+ * not just an approximation of it. `ext` is 0 for play_btn (no ext_click_
+ * area at all), which correctly outlines just its own native 84x84 box. */
+static void debug_paint_hitbox(lv_obj_t * obj, int32_t ext, lv_color_t color) {
+    lv_obj_set_style_outline_width(obj, 3, 0);
+    lv_obj_set_style_outline_pad(obj, ext, 0);
+    lv_obj_set_style_outline_color(obj, color, 0);
+    lv_obj_set_style_outline_opa(obj, LV_OPA_COVER, 0);
+}
+#endif
+
+/* Real-device follow-up: mode/play/prev/next/more still felt hard to reach
+ * near their own top edge, even with TRANSPORT_ICON_EXT_CLICK_AREA -- the
+ * ask was for their hit areas to reach up to one SHARED line well above the
+ * icons (roughly level with song_count_label), which lv_obj_set_ext_click_
+ * area() can't do on its own: it pads by the SAME amount on every side, so
+ * pushing it far enough vertically would also push mode/prev/next/more's
+ * LEFT/RIGHT reach straight through the ceiling TRANSPORT_ICON_EXT_CLICK_
+ * AREA's own comment already established (two neighbors sharing a 36px gap
+ * can't each claim more than half of it). A separate, invisible,
+ * absolutely-positioned sibling -- created AFTER controls_row so it draws
+ * (and hit-tests) on top of it, and marked LV_OBJ_FLAG_IGNORE_LAYOUT so
+ * `scr` (which has no layout of its own anyway) never tries to reposition
+ * it -- adds reach in ONLY the vertical direction these five needed,
+ * without touching the already-maximized horizontal reach at all.
+ *
+ * `top_y`/`bottom_y_exclusive` are real, resolved, absolute screen
+ * coordinates (see
+ * this function's only caller for why lv_obj_update_layout() has to run
+ * first) -- `top_y` is the SAME for every one of the five callers (the
+ * whole point: one shared line, not five independently-derived amounts),
+ * while `bottom_y_exclusive` is just after this icon's existing hit area's
+ * bottom edge. The resulting object therefore owns the complete region;
+ * there is no object seam for a moving finger to cross. `debug_color` is
+ * only ever applied under
+ * UI_HITBOX_DEBUG (a plain border directly on this object -- unlike debug_
+ * paint_hitbox()'s outline-pad trick, an extender IS the exact hit area
+ * itself, not an icon padded out to one, so a normal border already traces
+ * its real boundary); every caller still passes one unconditionally so a
+ * non-debug build has no unused-parameter/-variable cleanup to do. */
+static void add_transport_hit_target(lv_obj_t * scr, int32_t center_x, int32_t width, int32_t top_y,
+                                     int32_t bottom_y_exclusive, lv_event_cb_t cb, lv_color_t debug_color) {
+    lv_obj_t * ext = lv_obj_create(scr);
+    lv_obj_remove_style_all(ext);
+    lv_obj_set_pos(ext, center_x - width / 2, top_y);
+    lv_obj_set_size(ext, width, bottom_y_exclusive - top_y);
+    lv_obj_add_flag(ext, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_remove_flag(ext, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ext, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ext, cb, LV_EVENT_CLICKED, NULL);
+#ifdef UI_HITBOX_DEBUG
+    lv_obj_set_style_border_width(ext, 3, 0);
+    lv_obj_set_style_border_color(ext, debug_color, 0);
+    lv_obj_set_style_border_opa(ext, LV_OPA_COVER, 0);
+#else
+    (void) debug_color;
+#endif
+}
+
 static void library_btn_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_pop();
@@ -1337,6 +1413,30 @@ static void progress_slider_event_cb(lv_event_t * e) {
     }
 }
 
+/* Real-device bug report: mode/prev/next (order_icon/prev_btn/next_btn,
+ * every one of them a plain 40x40 icon -- confirmed against the actual
+ * theme2 assets, order.png/loop.png/single.png/random.png and btn_prev.png/
+ * btn_next.png) felt unresponsive next to play_btn, whose own btn_play.png
+ * is 84x84 -- more than double the raw hit area. controls_row lays all five
+ * icons out with a fixed 36px flex gap between them; lv_obj_set_ext_click_
+ * area() extends a click hit area by the SAME amount on every side, not
+ * just the side facing a neighbor, so two adjacent icons using X each start
+ * touching once 2*X reaches that 36px gap. 18 is the largest value that
+ * still leaves order_icon<->prev_btn and next_btn<->more_icon from ever
+ * overlapping (more_icon uses this same constant too, not a separately
+ * tuned value -- see its own call site), while getting every icon as close
+ * to play_btn's own 84x84 footprint (76x76 effective, since 40 + 18*2 = 76)
+ * as this layout's fixed gap physically allows without touching a
+ * neighboring hit area. */
+#define TRANSPORT_ICON_EXT_CLICK_AREA 18
+
+    /* See add_transport_hit_target()'s own comment -- how far above play_
+ * btn's own native top edge the shared line for mode/play/prev/next/more's
+ * combined hit area sits. Chosen from real-device feedback (a hand-drawn
+ * reference on a screenshot) landing just above song_count_label, without
+ * reaching high enough to overlap progress_slider/time_row's own already-
+ * interactive areas further up the same column. */
+#define TRANSPORT_HIT_LINE_ABOVE_PLAY 20
 
 static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_height) {
     (void) screen_width;
@@ -1559,13 +1659,29 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     order_icon = lv_image_create(controls_row);
     lv_image_set_src(order_icon, asset_path(play_mode_icon_asset((play_mode_t) current_settings.play_mode)));
     lv_obj_add_flag(order_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(order_icon, 16);
+    /* Real-device bug report: mode/prev/next felt unresponsive next to
+     * play/pause -- root cause, their own art (order.png/btn_prev.png/
+     * btn_next.png, all 40x40) is barely half play_btn's native 84x84, with
+     * no ext_click_area at all on prev/next and only a modest +16px here.
+     * TRANSPORT_ICON_EXT_CLICK_AREA below is the largest uniform extension
+     * that still can't make two neighboring icons' extended hit areas touch
+     * -- see its own comment -- so this grows every one of the three named
+     * icons as close to play_btn's own size as physically fits between
+     * them, not just this one. */
+    lv_obj_set_ext_click_area(order_icon, TRANSPORT_ICON_EXT_CLICK_AREA);
     lv_obj_add_event_cb(order_icon, order_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(order_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
+#ifdef UI_GESTURE_TRACE
+    lv_obj_add_event_cb(order_icon, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+#endif
+#ifdef UI_HITBOX_DEBUG
+    debug_paint_hitbox(order_icon, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_RED));
+#endif
 
     prev_btn = lv_image_create(controls_row);
     lv_image_set_src(prev_btn, asset_path("playing_plane/btn_prev.png"));
     lv_obj_add_flag(prev_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(prev_btn, TRANSPORT_ICON_EXT_CLICK_AREA); /* see its own comment */
     lv_obj_add_event_cb(prev_btn, prev_btn_event_cb, LV_EVENT_CLICKED, NULL);
     transport_btn_ctx_t * prev_ctx = malloc(sizeof(transport_btn_ctx_t));
     if (!prev_ctx) return NULL;
@@ -1573,11 +1689,23 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, prev_ctx);
     lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, prev_ctx);
     lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, prev_ctx);
+#ifdef UI_GESTURE_TRACE
+    lv_obj_add_event_cb(prev_btn, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+#endif
+#ifdef UI_HITBOX_DEBUG
+    debug_paint_hitbox(prev_btn, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_GREEN));
+#endif
 
     play_btn = lv_image_create(controls_row);
     lv_image_set_src(play_btn, asset_path("playing_plane/btn_play.png"));
     lv_obj_add_flag(play_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(play_btn, play_btn_event_cb, LV_EVENT_CLICKED, NULL);
+#ifdef UI_GESTURE_TRACE
+    lv_obj_add_event_cb(play_btn, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+#endif
+#ifdef UI_HITBOX_DEBUG
+    debug_paint_hitbox(play_btn, 0, lv_palette_main(LV_PALETTE_BLUE)); /* no ext_click_area -- outlines its own native 84x84 */
+#endif
     /* Not transport_btn_ctx_t's fixed normal/pressed asset-swap -- this
      * icon's own "normal" image already alternates between btn_play.png and
      * btn_pause.png depending on playback state (set_play_button_state()),
@@ -1589,6 +1717,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     next_btn = lv_image_create(controls_row);
     lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
     lv_obj_add_flag(next_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(next_btn, TRANSPORT_ICON_EXT_CLICK_AREA); /* see its own comment */
     lv_obj_add_event_cb(next_btn, next_btn_event_cb, LV_EVENT_CLICKED, NULL);
     transport_btn_ctx_t * next_ctx = malloc(sizeof(transport_btn_ctx_t));
     if (!next_ctx) return NULL;
@@ -1596,15 +1725,67 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, next_ctx);
     lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, next_ctx);
     lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, next_ctx);
+#ifdef UI_GESTURE_TRACE
+    lv_obj_add_event_cb(next_btn, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+#endif
+#ifdef UI_HITBOX_DEBUG
+    debug_paint_hitbox(next_btn, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_ORANGE));
+#endif
 
     /* 3-dot "more" menu -- rightmost, matching the reference layout. Opens
      * more_menu_popup (Add to Playlist / EQ / Delete). */
     lv_obj_t * more_icon = lv_image_create(controls_row);
     lv_image_set_src(more_icon, asset_path("playing_plane/ic_more.png"));
     lv_obj_add_flag(more_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(more_icon, 16);
+    /* TRANSPORT_ICON_EXT_CLICK_AREA, not a separate smaller constant --
+     * next_btn (its only neighbor) already uses the same value, and 18+18
+     * exactly fills their shared 36px gap. A smaller value here (this used
+     * to be a plain 16) would have left 2px of that gap unclaimed by
+     * either side instead of actually maximizing both hit areas. */
+    lv_obj_set_ext_click_area(more_icon, TRANSPORT_ICON_EXT_CLICK_AREA);
     lv_obj_add_event_cb(more_icon, more_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(more_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
+#ifdef UI_HITBOX_DEBUG
+    debug_paint_hitbox(more_icon, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_PURPLE));
+#endif
+
+    /* Force-resolve controls_row's flex layout now so the coordinates read
+     * below are real absolute screen positions, not the stale (0,0) a
+     * flex/align property leaves until a layout pass actually runs -- see
+     * reserve_title_width_before()'s own comment in gui_library.c for the
+     * same gotcha. */
+    lv_obj_update_layout(controls_row);
+
+    lv_area_t order_area, play_area, prev_area, next_area, more_area;
+    lv_obj_get_coords(order_icon, &order_area);
+    lv_obj_get_coords(play_btn, &play_area);
+    lv_obj_get_coords(prev_btn, &prev_area);
+    lv_obj_get_coords(next_btn, &next_area);
+    lv_obj_get_coords(more_icon, &more_area);
+
+    /* Shared top line for all five -- exactly what real-device feedback
+     * asked for: mode/play/prev/next/more's hit areas reach up to the SAME
+     * height, not each one's own separately-derived amount. */
+    int32_t shared_hit_top = play_area.y1 - TRANSPORT_HIT_LINE_ABOVE_PLAY;
+
+    add_transport_hit_target(scr, (order_area.x1 + order_area.x2) / 2,
+                                (order_area.x2 - order_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
+                                order_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, order_icon_event_cb,
+                                lv_palette_main(LV_PALETTE_RED));
+    add_transport_hit_target(scr, (play_area.x1 + play_area.x2) / 2, play_area.x2 - play_area.x1 + 1,
+                                shared_hit_top, play_area.y2 + 1, play_btn_event_cb, lv_palette_main(LV_PALETTE_BLUE));
+    add_transport_hit_target(scr, (prev_area.x1 + prev_area.x2) / 2,
+                                (prev_area.x2 - prev_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
+                                prev_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, prev_btn_event_cb,
+                                lv_palette_main(LV_PALETTE_GREEN));
+    add_transport_hit_target(scr, (next_area.x1 + next_area.x2) / 2,
+                                (next_area.x2 - next_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
+                                next_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, next_btn_event_cb,
+                                lv_palette_main(LV_PALETTE_ORANGE));
+    add_transport_hit_target(scr, (more_area.x1 + more_area.x2) / 2,
+                                (more_area.x2 - more_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
+                                more_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, more_icon_event_cb,
+                                lv_palette_main(LV_PALETTE_PURPLE));
 
     /* Volume is controlled via hardware buttons (see update_timer_cb) and,
      * per the real device, shown only as a transient overlay rather than a

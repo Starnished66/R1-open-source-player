@@ -305,6 +305,17 @@ ifneq ($(UI_GESTURE_TRACE),)
 UI_GESTURE_TRACE_DEFINE = -DUI_GESTURE_TRACE=1
 endif
 
+# Outlines the player screen's transport-row icons (mode/prev/play/next/more)
+# in distinct colors at their real click hit-test boundary -- including
+# lv_obj_set_ext_click_area()'s invisible padding, not just each icon's own
+# drawn size -- so a real-device hitbox/overlap question can be answered by
+# looking at the screen instead of reasoning about flex-gap math. Kept out
+# of normal/release builds unless explicitly requested with
+# `make target UI_HITBOX_DEBUG=1`.
+ifneq ($(UI_HITBOX_DEBUG),)
+UI_HITBOX_DEBUG_DEFINE = -DUI_HITBOX_DEBUG=1
+endif
+
 # Always defined (no flag needed) -- the fallback the About screen's
 # version line uses when TEST_BUILD_TAG isn't set, e.g. a real flashed
 # deployment via the user's own repack process rather than an adb-pushed
@@ -313,8 +324,8 @@ endif
 # built, not when the Makefile was last edited.
 BUILD_STAMP_DEFINE = -DBUILD_STAMP=\"$(shell date +%Y-%m-%d_%H:%M)\"
 
-TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(BUILD_STAMP_DEFINE)
-TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
 TINYALSA_CFLAGS = -O3 -g -Wall -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 # DBUS_COMPILATION/DBUS_STATIC_BUILD: libdbus's own headers gate some
 # declarations on these (matching how its own build always defines them

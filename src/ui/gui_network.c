@@ -14,6 +14,7 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include "wifi_control.h"
 #include "bluetooth_control.h"
 #include "usb_mode_control.h"
+#include "usb_dac_bridge.h"
 #include "firmware_update.h"
 #include "gui_subsonic.h"
 #include "airplay_control.h"
@@ -34,9 +35,13 @@ static lv_obj_t * wifi_dns_screen;
 static lv_obj_t * bt_screen;
 static lv_obj_t * bt_dac_screen;
 static lv_obj_t * bt_dac_overlay_screen;
+static lv_obj_t * bt_dac_stream_label;
 static lv_obj_t * bt_codec_screen;
 static lv_obj_t * usb_mode_screen;
 static lv_obj_t * usb_dac_overlay_screen;
+static lv_obj_t * usb_dac_hint_label;
+static lv_obj_t * usb_dac_input_label;
+static lv_obj_t * usb_dac_path_label;
 static lv_obj_t * import_wifi_screen;
 static lv_obj_t * airplay_screen;
 static lv_obj_t * airplay_overlay_screen;
@@ -1364,6 +1369,14 @@ static lv_obj_t * build_bt_dac_overlay_screen(void) {
     lv_obj_set_style_text_font(hint_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align_to(hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
+    bt_dac_stream_label = lv_label_create(scr);
+    lv_label_set_text(bt_dac_stream_label, "Waiting for Bluetooth stream…");
+    lv_obj_add_style(bt_dac_stream_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(bt_dac_stream_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_set_width(bt_dac_stream_label, LV_PCT(90));
+    lv_obj_set_style_text_align(bt_dac_stream_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align_to(bt_dac_stream_label, hint_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
     return scr;
 }
 
@@ -1994,13 +2007,63 @@ static lv_obj_t * build_usb_dac_overlay_screen(void) {
     lv_obj_set_style_text_font(status_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align_to(status_label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
 
-    lv_obj_t * hint_label = lv_label_create(scr);
-    lv_label_set_text(hint_label, "This device is now a USB sound card");
-    lv_obj_add_style(hint_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(hint_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
-    lv_obj_align_to(hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+    usb_dac_hint_label = lv_label_create(scr);
+    lv_label_set_text(usb_dac_hint_label, "Waiting for USB audio…");
+    lv_obj_add_style(usb_dac_hint_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(usb_dac_hint_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_align_to(usb_dac_hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+    usb_dac_input_label = lv_label_create(scr);
+    lv_obj_add_style(usb_dac_input_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(usb_dac_input_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_align_to(usb_dac_input_label, usb_dac_hint_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+    usb_dac_path_label = lv_label_create(scr);
+    lv_obj_add_style(usb_dac_path_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(usb_dac_path_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_align_to(usb_dac_path_label, usb_dac_input_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
 
     return scr;
+}
+
+static void set_label_if_changed(lv_obj_t * label, const char * text) {
+    if (label && strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+static void format_rate(char * out, size_t size, unsigned int rate) {
+    if (rate && rate % 1000 == 0) snprintf(out, size, "%u kHz", rate / 1000);
+    else if (rate) snprintf(out, size, "%.1f kHz", (double) rate / 1000.0);
+    else snprintf(out, size, "Unknown rate");
+}
+
+static void dac_stream_labels_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    bt_dac_stream_info_t bt;
+    bt_control_get_dac_stream_info(&bt);
+    char text[160];
+    if (!bt.available || !bt.running) {
+        snprintf(text, sizeof(text), "Waiting for Bluetooth stream…");
+    } else {
+        char rate[32];
+        format_rate(rate, sizeof(rate), bt.sample_rate);
+        const char * format = bt.bit_depth ? NULL : (bt.pcm_format[0] ? bt.pcm_format : "Unknown format");
+        if (bt.bit_depth)
+            snprintf(text, sizeof(text), "%s · %s · %u-bit", bt.codec[0] ? bt.codec : "Unknown codec", rate, bt.bit_depth);
+        else
+            snprintf(text, sizeof(text), "%s · %s · %s", bt.codec[0] ? bt.codec : "Unknown codec", rate, format);
+    }
+    set_label_if_changed(bt_dac_stream_label, text);
+
+    usb_dac_stream_info_t usb;
+    usb_dac_bridge_get_stream_info(&usb);
+    set_label_if_changed(usb_dac_hint_label, usb.streaming ? "This device is now a USB sound card" : "Waiting for USB audio…");
+    char input_rate[32], output_rate[32];
+    format_rate(input_rate, sizeof(input_rate), usb.input_sample_rate);
+    format_rate(output_rate, sizeof(output_rate), usb.output_sample_rate);
+    snprintf(text, sizeof(text), "USB input: %s · %u-bit", input_rate, usb.input_bit_depth);
+    set_label_if_changed(usb_dac_input_label, text);
+    snprintf(text, sizeof(text), "DAC path: %s · %u-bit", output_rate, usb.output_bit_depth);
+    set_label_if_changed(usb_dac_path_label, text);
 }
 
 static void bt_volume_sync_toggle_cb(lv_event_t * e) {
@@ -3228,6 +3291,8 @@ void gui_network_init(void) {
     build_wifi_action_popup();
     build_usb_dac_leave_popup();
     build_bt_dac_leave_popup();
+    dac_stream_labels_timer_cb(NULL);
+    lv_timer_create(dac_stream_labels_timer_cb, 500, NULL);
 }
 
 bool gui_network_has_background_work(void) {

@@ -3,6 +3,19 @@
 
 #include <stdbool.h>
 
+typedef struct {
+    bool bridge_running;
+    bool streaming;
+    unsigned int input_sample_rate;
+    unsigned int input_bit_depth;
+    unsigned int output_sample_rate;
+    unsigned int output_bit_depth;
+} usb_dac_stream_info_t;
+
+/* Thread-safe bridge snapshot. These are transport/path formats, not the
+ * original host media resolution: the host may resample before USB output. */
+void usb_dac_bridge_get_stream_info(usb_dac_stream_info_t * out);
+
 /* Bridges the vendor /dev/uac_sa character device (the raw PCM feed from a
  * connected PC once the USB gadget is in UAC2 "sound card" mode -- see
  * usb_mode_control.c) into the shared audio_output module (see

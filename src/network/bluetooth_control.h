@@ -11,6 +11,22 @@ typedef struct {
     bool connected;
 } bt_device_t;
 
+/* Negotiated Bluetooth transport/decoded PCM information. This describes
+ * BlueALSA's incoming A2DP stream, not the original media file on the
+ * phone/PC (which may already have been resampled by the host stack). */
+typedef struct {
+    bool available;
+    bool running;
+    char codec[32];
+    char pcm_format[32];
+    unsigned int sample_rate;
+    unsigned int channels;
+    unsigned int bit_depth; /* 0 when pcm_format cannot be mapped safely */
+} bt_dac_stream_info_t;
+
+/* Non-blocking, thread-safe cached snapshot. */
+void bt_control_get_dac_stream_info(bt_dac_stream_info_t * out);
+
 /* bluetoothd, bluealsa, and a NoInputNoOutput pairing agent are already
  * running on this device; everything here just drives bluetoothctl's
  * non-interactive CLI mode (`bluetoothctl <command> [args]`), which

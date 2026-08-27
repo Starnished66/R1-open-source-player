@@ -38,6 +38,9 @@
  *     confirming the measurement. */
 #define BRIDGE_CHANNELS 2
 #define BRIDGE_SAMPLE_RATE 96000
+#define BRIDGE_BIT_DEPTH 16
+#define USB_ADVERTISED_SAMPLE_RATE 48000
+#define USB_ADVERTISED_BIT_DEPTH 16
 #define BRIDGE_PERIOD_FRAMES 1024
 
 #define OPEN_RETRY_TIMEOUT_MS 5000
@@ -45,12 +48,20 @@
 
 static pthread_mutex_t bridge_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool bridge_running = false;
+static bool bridge_streaming = false;
 static volatile bool stop_requested = false;
 
 #ifndef HOST_BUILD
 static void set_running(bool running) {
     pthread_mutex_lock(&bridge_mutex);
     bridge_running = running;
+    if (!running) bridge_streaming = false;
+    pthread_mutex_unlock(&bridge_mutex);
+}
+
+static void set_streaming(bool streaming) {
+    pthread_mutex_lock(&bridge_mutex);
+    bridge_streaming = streaming;
     pthread_mutex_unlock(&bridge_mutex);
 }
 
@@ -123,6 +134,7 @@ static void * bridge_thread_func(void * arg) {
         struct pollfd pfd = { .fd = uac_fd, .events = POLLIN };
         int pr = poll(&pfd, 1, POLL_INTERVAL_MS);
         if (pr <= 0) {
+            set_streaming(false);
             poll_timeouts_in_a_row++;
             if (poll_timeouts_in_a_row == 25) /* ~5s of nothing but still open -- worth knowing */
                 fprintf(stderr, "usb_dac_bridge: no data from %s in ~5s (still waiting)\n", UAC_SA_DEVICE_PATH);
@@ -132,6 +144,7 @@ static void * bridge_thread_func(void * arg) {
 
         ssize_t n = read(uac_fd, buf, buf_bytes);
         if (n <= 0) {
+            set_streaming(false);
             if (errno == EPERM && eperm_retries < EPERM_RETRY_LIMIT) {
                 eperm_retries++;
                 if (eperm_retries == 1)
@@ -150,6 +163,7 @@ static void * bridge_thread_func(void * arg) {
         }
 
         total_bytes_read += (uint64_t) n;
+        set_streaming(true);
 
         /* Same reasoning as audio.c's own playback loop (see its comment
          * above the equivalent call): the requested Bluetooth target can
@@ -245,4 +259,16 @@ void usb_dac_bridge_set_bt_output(bool enabled) {
 #else
     (void) enabled;
 #endif
+}
+
+void usb_dac_bridge_get_stream_info(usb_dac_stream_info_t * out) {
+    if (!out) return;
+    pthread_mutex_lock(&bridge_mutex);
+    out->bridge_running = bridge_running;
+    out->streaming = bridge_streaming;
+    pthread_mutex_unlock(&bridge_mutex);
+    out->input_sample_rate = USB_ADVERTISED_SAMPLE_RATE;
+    out->input_bit_depth = USB_ADVERTISED_BIT_DEPTH;
+    out->output_sample_rate = BRIDGE_SAMPLE_RATE;
+    out->output_bit_depth = BRIDGE_BIT_DEPTH;
 }

@@ -64,6 +64,15 @@ static char usb_alsa_device[32] = "";
 static unsigned int device_channels = 0;
 static unsigned int device_sample_rate = 0;
 
+/* Which ALSA tuning the CURRENTLY OPEN OUTPUT_TARGET_LOCAL device actually
+ * used -- set by open_device() below, read by audio_output_ensure() so a
+ * mode change (same channels/rate, different low_latency) is recognized as
+ * needing a reopen instead of silently keeping whatever was already open.
+ * Meaningless for BT/USB (aplay's own ALSA config, not this one) -- not
+ * updated on those paths, and audio_output_ensure() only ever compares it
+ * when requested_target is LOCAL. */
+static bool active_low_latency = false;
+
 /* aplay's raw-PCM mode needs the format spelled out on the command line --
  * unlike a .wav it's reading straight off a pipe with no header to sniff
  * rate/channels/format from. `-D <device>` resolves through the real ALSA
@@ -103,7 +112,7 @@ static void close_usb_device(void) {
     usb_aplay_fd = -1;
 }
 
-static bool open_device(unsigned int channels, unsigned int sample_rate) {
+static bool open_device(unsigned int channels, unsigned int sample_rate, bool low_latency) {
     if (requested_target == OUTPUT_TARGET_USB) {
         if (!spawn_aplay(usb_alsa_device, channels, sample_rate, &usb_aplay_pid, &usb_aplay_fd)) return false;
         active_target = OUTPUT_TARGET_USB;
@@ -116,14 +125,36 @@ static bool open_device(unsigned int channels, unsigned int sample_rate) {
         config.channels = channels;
         config.rate = sample_rate;
         config.format = PCM_FORMAT_S16_LE;
-        /* The original 1024-frame period woke this single-core device about
-         * 43 times/sec at 44.1 kHz even when the decoder supplied 8192-frame
-         * screen-off batches. A 2048-frame period halves kernel/ALSA period
-         * wakeups while retaining ~46 ms period granularity; four periods
-         * provide ~186 ms of underrun protection, still below the app's
-         * existing 500 ms hardware-button dispatch interval. */
-        config.period_size = 2048;
-        config.period_count = 4;
+        active_low_latency = low_latency;
+        if (low_latency) {
+            /* Real-device bug report: AirPlay had "significantly more audio
+             * delay than stock player" -- the stock firmware's shairport
+             * invocation (-o ot) writes straight to hardware from within
+             * shairport itself; this app instead relays through a FIFO into
+             * this shared local ALSA path, whose standard tuning below adds
+             * its own ~186ms start_threshold on top with no decoder-timing
+             * reason for a live source (AirPlay currently -- see this
+             * function's own caller) to pay it. That buffer isn't PURELY
+             * wasted latency, though: it also absorbs scheduling/FIFO-
+             * delivery jitter (screen redraws, database/artwork activity,
+             * Wi-Fi), so two periods is a real, smaller underrun-tolerance
+             * tradeoff (not a single-period config, which tinyalsa is more
+             * prone to underrun on even at rest) -- needs live-device
+             * testing under that kind of load before treating this as
+             * risk-free, not just a latency-vs-nothing win. */
+            config.period_size = 1024;
+            config.period_count = 2;
+        } else {
+            /* The original 1024-frame period woke this single-core device
+             * about 43 times/sec at 44.1 kHz even when the decoder supplied
+             * 8192-frame screen-off batches. A 2048-frame period halves
+             * kernel/ALSA period wakeups while retaining ~46 ms period
+             * granularity; four periods provide ~186 ms of underrun
+             * protection, still below the app's existing 500 ms hardware-
+             * button dispatch interval. */
+            config.period_size = 2048;
+            config.period_count = 4;
+        }
         /* Explicit rather than left at the zeroed default -- matches
          * tinyalsa's own usual convention (full buffer size) rather than
          * relying on whatever the driver does with 0. */
@@ -153,7 +184,7 @@ void audio_output_close(void) {
     device_sample_rate = 0;
 }
 
-bool audio_output_ensure(unsigned int channels, unsigned int sample_rate) {
+bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool low_latency) {
     /* Real-device bug: aplay can die entirely on its own (BlueZ tearing
      * down the transport underneath it -- a headset bonding hiccup during
      * testing was one confirmed trigger, but any A2DP renegotiation could
@@ -190,9 +221,17 @@ bool audio_output_ensure(unsigned int channels, unsigned int sample_rate) {
 
     bool device_open = (alsa_pcm != NULL || bt_aplay_pid >= 0 || usb_aplay_pid >= 0);
     if (device_open && active_target != requested_target) device_open = false;
+    /* Only the OUTPUT_TARGET_LOCAL tinyalsa path has more than one tuning
+     * (see open_device()) -- a mode mismatch there must force a reopen the
+     * same as a channel/rate change would, or a caller requesting
+     * low_latency while the device happens to already be open at the same
+     * channels/rate (e.g. AirPlay starting up before local playback's own
+     * async teardown has actually closed it) would silently keep the
+     * wrong tuning instead of getting what it just asked for. */
+    if (device_open && requested_target == OUTPUT_TARGET_LOCAL && active_low_latency != low_latency) device_open = false;
     if (device_open && device_channels == channels && device_sample_rate == sample_rate) return true;
     audio_output_close();
-    return open_device(channels, sample_rate);
+    return open_device(channels, sample_rate, low_latency);
 }
 
 bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written) {

@@ -29,12 +29,31 @@
  * whole premise -- a real /dev/uac_sa USB gadget node -- doesn't exist on
  * a host build either). Callers on the target build only. */
 
-/* Opens (or reopens, if the format changed or the requested output target
- * -- see audio_output_set_bt_requested() below -- no longer matches
- * what's actually open) the output device for this channel count/sample
- * rate. Cheap to call repeatedly with the same values (no-ops). Returns
- * false if opening failed (device busy, aplay failed to spawn, etc). */
-bool audio_output_ensure(unsigned int channels, unsigned int sample_rate);
+/* Opens (or reopens, if the format, low_latency mode, or the requested
+ * output target -- see audio_output_set_bt_requested() below -- no longer
+ * matches what's actually open) the output device for this channel count/
+ * sample rate. Cheap to call repeatedly with the same values (no-ops).
+ * Returns false if opening failed (device busy, aplay failed to spawn, etc).
+ *
+ * low_latency only affects the OUTPUT_TARGET_LOCAL tinyalsa path (BT/USB go
+ * through aplay's own ALSA config, unaffected either way) -- see audio_
+ * output.c's open_device() for the actual period/buffer values. Real-time
+ * PCM sources with no local decoder buffering ahead of audio_output_write()
+ * may want true (AirPlay's own bridge does, having no decoder timing to
+ * lean on); decoder-fed local file playback, and anything not yet verified
+ * safe under its own live-device underrun testing (USB-DAC receive, as of
+ * this writing), should pass false. Passed as a parameter rather than a
+ * separate setter call specifically to close that one gap: a setter call
+ * followed by a separate ensure() call left a window where a different,
+ * concurrently-running caller's own setter call could land in between and
+ * flip the mode this call ends up opening with. This does NOT make
+ * audio_output_ensure() itself, or the shared output state it reads/writes,
+ * safe under concurrent callers in general -- there is still no lock here
+ * (see this file's own top comment on the "one owner at a time" convention
+ * every caller is expected to honor instead). That's pre-existing
+ * architectural debt this parameter doesn't attempt to fix, just one
+ * specific, previously-avoidable gap within it. */
+bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool low_latency);
 
 /* Writes frames to whatever audio_output_ensure() last successfully opened.
  * Blocks until delivery completes (tinyalsa pcm_writei() for local hardware;

@@ -858,7 +858,10 @@ static void write_device(const int16_t * buf, uint64_t frames, unsigned int chan
  * that used to live here directly now lives there instead, shared with
  * usb_dac_bridge.c's own separate output stream. */
 static bool ensure_device(unsigned int channels, unsigned int sample_rate) {
-    bool ok = audio_output_ensure(channels, sample_rate);
+    /* Decoder-fed local playback wants the standard, battery-tuned local
+     * buffer, not the low-latency one AirPlay's own audio_output_ensure()
+     * call requests -- see that parameter's own doc comment. */
+    bool ok = audio_output_ensure(channels, sample_rate, false);
     if (ok) {
         /* Real-device bug report: USB headphones had volume maxed out on
          * first boot no matter what the UI showed, only "fixed" by

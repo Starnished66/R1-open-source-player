@@ -85,7 +85,14 @@ static void * bridge_thread_func(void * arg) {
         return NULL;
     }
 
-    if (!audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE)) {
+    /* Standard tuning, not the low-latency mode airplay_bridge.c requests:
+     * this runs at 96kHz (BRIDGE_SAMPLE_RATE below), where the low-latency
+     * period config doubles ALSA wakeups (~47/s -> ~94/s) and cuts underrun
+     * tolerance to a quarter (~85ms -> ~21ms) -- untested on real USB-DAC
+     * hardware, and this bridge wasn't the subsystem the AirPlay latency
+     * bug report was about. Revisit only with its own live-device underrun
+     * testing under real load, not bundled into an unrelated fix. */
+    if (!audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, false)) {
         fprintf(stderr, "usb_dac_bridge: audio_output_ensure failed\n");
         close(uac_fd);
         set_running(false);
@@ -152,7 +159,7 @@ static void * bridge_thread_func(void * arg) {
          * playback loop originally did, so it's checked every chunk here
          * unconditionally -- cheap, since audio_output_ensure() only
          * actually reopens if something changed. */
-        audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE);
+        audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, false);
 
         /* Overwrite the always-noise first channel slot with the real
          * second one -- see the empirical finding in this file's top

@@ -33,6 +33,8 @@ void build_bt_dac_leave_popup(void);
 void open_wifi_screen(void);
 void open_bluetooth_screen(void);
 void populate_bt_screen(void);
+void gui_network_show_wifi_toggle_pending(bool enabled);
+void gui_network_wifi_toggle_completed(bool enabled);
 
 void start_usb_mode_switch(usb_mode_t target);
 

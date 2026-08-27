@@ -2512,14 +2512,17 @@ void quick_drawer_wifi_event_cb(lv_event_t * e) {
      * this if the toggle unexpectedly failed. */
     /* Do not clean/rebuild wifi_list from inside the clicked row's own
      * event callback: doing so deletes the event target while LVGL is still
-     * dispatching through it. poll_wifi_toggle() performs the authoritative
-     * rebuild as soon as the worker settles. */
+     * dispatching through it. gui_network_show_wifi_toggle_pending() defers
+     * the optimistic rebuild by one UI turn; poll_wifi_toggle() performs the
+     * authoritative rebuild once the worker settles. */
+    if (gui_navigation_is_top(gui_network_get_wifi_screen()))
+        gui_network_show_wifi_toggle_pending(wifi_will_be_enabled);
+
     if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0) {
         wifi_toggle_active = false;
         refresh_wifi_icon();
     start_bt_dac_startup_reapply_if_needed();
-        if (gui_navigation_is_top(gui_network_get_wifi_screen()))
-            populate_wifi_screen(wifi_control_is_enabled());
+        gui_network_wifi_toggle_completed(wifi_control_is_enabled());
     }
 }
 
@@ -2529,7 +2532,7 @@ static void poll_wifi_toggle(void) {
     pthread_join(wifi_toggle_thread, NULL);
     bool enabled = wifi_control_is_enabled();
     refresh_wifi_icon(); /* re-reads the real state -- updates both the status bar and drawer icons */
-    populate_wifi_screen(enabled); /* the Wi-Fi screen's own toggle row + everything gated on it needs the same refresh */
+    gui_network_wifi_toggle_completed(enabled); /* authoritative rows + scan state */
     if (enabled != wifi_toggle_target_enabled) show_error_toast("Wi-Fi failed to change state");
 
     /* Only shut AirPlay/DLNA/Remote Control/Import down once the disable is

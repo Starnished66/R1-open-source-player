@@ -113,6 +113,8 @@ static int wifi_scan_result_count = 0;
 static wifi_saved_network_t wifi_saved_results[WIFI_MAX_SAVED];
 static int wifi_saved_result_count = 0;
 static lv_obj_t * wifi_list;
+static lv_obj_t * wifi_rescan_btn;
+static bool wifi_enable_pending_feedback = false;
 static char wifi_connect_pending_ssid[WIFI_MAX_SSID_LEN];
 
 static void start_wifi_scan(void);
@@ -297,7 +299,30 @@ static void wifi_row_click_cb(lv_event_t * e) {
 
 static void wifi_rescan_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    /* An explicit rescan is a new discovery snapshot, not an append to the
+     * previous one. Clear stale access points immediately so the screen
+     * cannot imply that an old result is still currently visible while the
+     * radio is collecting its replacement set. Saved networks remain in
+     * their own section because they are configuration, not scan results. */
+    wifi_scan_result_count = 0;
+    populate_wifi_screen(wifi_control_is_enabled());
     start_wifi_scan();
+}
+
+static void set_wifi_rescan_active(bool active) {
+    if (!wifi_rescan_btn) return;
+    lv_label_set_text(wifi_rescan_btn, active ? "Scanning..." : "Rescan");
+    lv_obj_set_style_text_color(wifi_rescan_btn,
+                                active ? lv_color_make(160, 160, 160) : accent_lv_color(), 0);
+    lv_obj_align(wifi_rescan_btn, LV_ALIGN_TOP_RIGHT, -20,
+                 STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    if (active) {
+        lv_obj_remove_flag(wifi_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_state(wifi_rescan_btn, LV_STATE_DISABLED);
+    } else {
+        lv_obj_clear_state(wifi_rescan_btn, LV_STATE_DISABLED);
+        lv_obj_add_flag(wifi_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
+    }
 }
 
 static pthread_t wifi_scan_thread;
@@ -332,9 +357,11 @@ static void start_wifi_scan(void) {
 
     atomic_store_explicit(&wifi_scan_done_flag, false, memory_order_relaxed);
     wifi_scan_active = true;
+    set_wifi_rescan_active(true);
 
-        if (pthread_create(&wifi_scan_thread, NULL, wifi_scan_thread_func, NULL) != 0) {
+    if (pthread_create(&wifi_scan_thread, NULL, wifi_scan_thread_func, NULL) != 0) {
         wifi_scan_active = false;
+        set_wifi_rescan_active(false);
     }
 }
 
@@ -343,7 +370,37 @@ void poll_wifi_scan(void) {
 
     wifi_scan_active = false;
     pthread_join(wifi_scan_thread, NULL);
+    set_wifi_rescan_active(false);
     populate_wifi_screen(wifi_control_is_enabled()); /* refresh the list either way -- worth keeping current even if the user already backed out */
+}
+
+static void show_wifi_toggle_pending_async(void * user_data) {
+    bool enabled = (bool) (intptr_t) user_data;
+    if (!gui_navigation_is_top(gui_network_get_wifi_screen())) return;
+
+    wifi_enable_pending_feedback = enabled;
+    if (enabled) wifi_scan_result_count = 0;
+    populate_wifi_screen(enabled);
+    set_wifi_rescan_active(enabled || wifi_scan_active);
+}
+
+void gui_network_show_wifi_toggle_pending(bool enabled) {
+    /* Rebuilding wifi_list synchronously from its toggle row callback would
+     * delete LVGL's active event target. Defer by one UI turn, matching the
+     * safe pattern used elsewhere for destructive screen rebuilds. */
+    lv_async_call(show_wifi_toggle_pending_async, (void *) (intptr_t) enabled);
+}
+
+void gui_network_wifi_toggle_completed(bool enabled) {
+    wifi_enable_pending_feedback = false;
+    if (!gui_navigation_is_top(gui_network_get_wifi_screen())) {
+        set_wifi_rescan_active(wifi_scan_active);
+        return;
+    }
+
+    populate_wifi_screen(enabled);
+    if (enabled) start_wifi_scan();
+    else set_wifi_rescan_active(wifi_scan_active);
 }
 
 static pthread_t wifi_forget_thread;
@@ -615,7 +672,12 @@ void populate_wifi_screen(bool enabled) {
     add_pill_chevron_row(wifi_list, "DNS Settings", wifi_dns_settings_row_cb);
 
     add_section_header(wifi_list, "Memorized Networks");
-    wifi_saved_result_count = wifi_control_list_saved(wifi_saved_results, WIFI_MAX_SAVED);
+    /* During an optimistic cold enable there is no wpa_supplicant control
+     * socket yet. Keep the last cached saved-network rows instead of
+     * launching synchronous wpa_cli subprocesses that cannot succeed and
+     * would undermine the immediate feedback this state exists to provide. */
+    if (!wifi_enable_pending_feedback)
+        wifi_saved_result_count = wifi_control_list_saved(wifi_saved_results, WIFI_MAX_SAVED);
     if (wifi_saved_result_count == 0) {
         lv_obj_t * label = lv_label_create(wifi_list);
         lv_label_set_text(label, "No memorized networks");
@@ -632,7 +694,8 @@ void populate_wifi_screen(bool enabled) {
      * as is_current itself, just reused here by SSID match instead of
      * scan-result identity. */
     wifi_info_t current_wifi_info;
-    bool wifi_currently_connected = wifi_control_get_info(&current_wifi_info);
+    bool wifi_currently_connected = !wifi_enable_pending_feedback &&
+                                    wifi_control_get_info(&current_wifi_info);
     for (int i = 0; i < wifi_saved_result_count; i++) {
         lv_obj_t * row = lv_obj_create(wifi_list);
         lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
@@ -688,7 +751,7 @@ void populate_wifi_screen(bool enabled) {
     }
     if (wifi_scan_result_count == 0) {
         lv_obj_t * label = lv_label_create(wifi_list);
-        lv_label_set_text(label, "No networks found");
+        lv_label_set_text(label, wifi_enable_pending_feedback ? "Scanning for networks..." : "No networks found");
         lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
     }
@@ -698,13 +761,13 @@ static lv_obj_t * build_wifi_screen(void) {
     lv_obj_t * title_label; /* unused after build -- title never changes */
     lv_obj_t * scr = build_subsonic_list_screen("Wi-Fi", &title_label, &wifi_list);
 
-    lv_obj_t * rescan_btn = lv_label_create(scr);
-    lv_label_set_text(rescan_btn, "Rescan");
-    lv_obj_set_style_text_color(rescan_btn, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(rescan_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_flag(rescan_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(rescan_btn, wifi_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
+    wifi_rescan_btn = lv_label_create(scr);
+    lv_label_set_text(wifi_rescan_btn, "Rescan");
+    lv_obj_set_style_text_color(wifi_rescan_btn, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(wifi_rescan_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_align(wifi_rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(wifi_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(wifi_rescan_btn, wifi_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
 
     return scr;
 }
@@ -943,7 +1006,37 @@ static void bt_row_click_cb(lv_event_t * e) {
 
 static void bt_rescan_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    /* bt_scan_results contains both paired devices and transient discovery
+     * results. Preserve the former (pairing is persistent state), but drop
+     * every old Available Devices entry before beginning a new discovery
+     * window. The completed scan replaces this compacted set as usual. */
+    int paired_count = 0;
+    for (int i = 0; i < bt_scan_result_count; i++) {
+        if (!bt_scan_results[i].paired) continue;
+        if (paired_count != i) bt_scan_results[paired_count] = bt_scan_results[i];
+        paired_count++;
+    }
+    bt_scan_result_count = paired_count;
+    populate_bt_screen();
     start_bt_scan();
+}
+
+static lv_obj_t * bt_rescan_btn;
+
+static void set_bt_rescan_active(bool active) {
+    if (!bt_rescan_btn) return;
+    lv_label_set_text(bt_rescan_btn, active ? "Scanning..." : "Rescan");
+    lv_obj_set_style_text_color(bt_rescan_btn,
+                                active ? lv_color_make(160, 160, 160) : accent_lv_color(), 0);
+    lv_obj_align(bt_rescan_btn, LV_ALIGN_TOP_RIGHT, -20,
+                 STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    if (active) {
+        lv_obj_remove_flag(bt_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_state(bt_rescan_btn, LV_STATE_DISABLED);
+    } else {
+        lv_obj_clear_state(bt_rescan_btn, LV_STATE_DISABLED);
+        lv_obj_add_flag(bt_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
+    }
 }
 
 /* Real-device finding (confirmed via `bluetoothctl devices` directly): a
@@ -1045,9 +1138,11 @@ static void start_bt_scan(void) {
 
     atomic_store_explicit(&bt_scan_done_flag, false, memory_order_relaxed);
     bt_scan_active = true;
+    set_bt_rescan_active(true);
 
-        if (pthread_create(&bt_scan_thread, NULL, bt_scan_thread_func, NULL) != 0) {
+    if (pthread_create(&bt_scan_thread, NULL, bt_scan_thread_func, NULL) != 0) {
         bt_scan_active = false;
+        set_bt_rescan_active(false);
     }
 }
 
@@ -1056,6 +1151,7 @@ void poll_bt_scan(void) {
 
     bt_scan_active = false;
     pthread_join(bt_scan_thread, NULL);
+    set_bt_rescan_active(false);
     populate_bt_screen(); /* refresh the list either way -- worth keeping current even if the user already backed out */
 }
 
@@ -2009,13 +2105,13 @@ static lv_obj_t * build_bluetooth_screen(void) {
     lv_obj_t * title_label; /* unused after build -- title never changes */
     lv_obj_t * scr = build_subsonic_list_screen("Bluetooth", &title_label, &bt_list);
 
-    lv_obj_t * rescan_btn = lv_label_create(scr);
-    lv_label_set_text(rescan_btn, "Rescan");
-    lv_obj_set_style_text_color(rescan_btn, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(rescan_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_flag(rescan_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(rescan_btn, bt_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
+    bt_rescan_btn = lv_label_create(scr);
+    lv_label_set_text(bt_rescan_btn, "Rescan");
+    lv_obj_set_style_text_color(bt_rescan_btn, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(bt_rescan_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_align(bt_rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(bt_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(bt_rescan_btn, bt_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
 
     return scr;
 }

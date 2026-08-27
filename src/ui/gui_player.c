@@ -1290,6 +1290,135 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
     }
 }
 
+/* Real-device feature request: holding next/prev should scrub through the
+ * CURRENT track (fast-forward/rewind) instead of only supporting a quick
+ * tap's skip-track/restart-or-previous-track behavior.
+ *
+ * Bug caught in review: audio_seek() only updates audio_get_position_
+ * seconds() once its background worker's newly-opened/seeked decoder is
+ * actually installed (see seek_worker_func()/the ready_seek consumption in
+ * audio.c) -- reopening+seeking a real file is not instant. At LVGL's
+ * default ~100ms long_press_repeat_time, several repeat ticks can fire
+ * before that round-trip lands, so computing each step as "current
+ * position + STEP" from audio_get_position_seconds() read the SAME stale
+ * position repeatedly -- holding next could visibly reopen/seek the
+ * decoder over and over while net position barely moved. transport_seek_
+ * target_seconds is a persistent accumulator instead: seeded from the real
+ * position once, at the start of a hold, then adjusted by STEP on every
+ * subsequent tick regardless of whether the previous seek has landed yet,
+ * so the requested target always advances smoothly; audio_seek()'s own
+ * generation-based coalescing (see its own comment) already makes only the
+ * LATEST accumulated target matter once the worker catches up.
+ *
+ * Also bound to LV_EVENT_LONG_PRESSED itself (not just REPEAT) -- LVGL
+ * fires LONG_PRESSED once after long_press_time (~400ms) and then the
+ * first LONG_PRESSED_REPEAT only ~100ms after that. Only reacting to
+ * REPEAT meant releasing inside that ~400-500ms window suppressed the
+ * normal short-tap action (see transport_long_press_cb() below) while
+ * performing no seek at all -- a dead zone right at the hold threshold.
+ * Taking the first step on LONG_PRESSED itself closes that gap.
+ *
+ * `dir` is +1 for next_hit (forward) and -1 for prev_hit (rewind).
+ *
+ * Bug caught in review: audio_seek() lets the target land exactly on
+ * total_frames (see its own clamp), which the main decode loop can't tell
+ * apart from genuinely playing a track to its natural end -- it queues the
+ * SAME auto-advance-to-next-track handoff either way (audio.c bumps
+ * playback_generation there). Held long enough near a track's end, a hold
+ * could therefore auto-advance mid-hold. TRANSPORT_SEEK_EOF_GUARD_SECONDS
+ * below makes that far less likely (the target is clamped short of true
+ * EOF, so a hold pins just before the end instead of reaching it), but
+ * can't make it impossible -- audio_seek() only relocates the playhead, it
+ * doesn't pause playback, so normal decode can still run out the remaining
+ * guard window and reach real EOF on its own while the hold continues.
+ *
+ * Second bug caught in review: this originally re-seeded the accumulator
+ * from the new track's real position on a generation mismatch and kept
+ * right on stepping -- which stopped the OLD track's stale target from
+ * leaking onto the new one, but a hold that started on Track A would then
+ * carry on scrubbing into Track B, contradicting this whole feature's own
+ * "scrub the CURRENT track" premise. transport_seek_hold_cancelled below
+ * instead stops issuing any further seeks for the rest of THIS hold the
+ * moment a generation mismatch is seen -- the user has to release and
+ * press again to scrub whatever's now playing. Reset only on a fresh
+ * LV_EVENT_LONG_PRESSED, which starts a new hold.
+ *
+ * Known, deliberately accepted residual: generation, position, duration,
+ * and audio_seek() are each their own separate audio_mutex critical
+ * section (see audio_get_playback_generation()/audio_get_position_seconds()/
+ * audio_get_duration_seconds()/audio_seek() in audio.c), not one atomic
+ * transaction, so the decode thread could in principle advance the
+ * generation in the microseconds between this function's own check and its
+ * audio_seek() call, applying one target computed for the old track to the
+ * new one. A generation-conditional seek primitive in audio.c would close
+ * this completely, but that means changing the shared audio_seek() API
+ * every other caller (the progress bar, prev/next's own restart-track
+ * seek) also goes through, for a race whose window is a handful of
+ * microseconds against a ~100ms tick rate, and whose worst case is already
+ * bounded to a single stray seek -- the very next tick's own generation
+ * check (using the ALREADY-advanced generation by then) cancels the hold
+ * exactly as above. Not worth that shared-API change for what's left. */
+#define TRANSPORT_SEEK_STEP_SECONDS 3.0
+#define TRANSPORT_SEEK_EOF_GUARD_SECONDS 0.5
+
+static double transport_seek_target_seconds;
+static uint64_t transport_seek_playback_generation;
+static bool transport_seek_hold_cancelled;
+
+static void transport_seek_repeat_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_LONG_PRESSED && code != LV_EVENT_LONG_PRESSED_REPEAT) return;
+    double dir = (double) (intptr_t) lv_event_get_user_data(e);
+    uint64_t gen = audio_get_playback_generation();
+    if (code == LV_EVENT_LONG_PRESSED) {
+        transport_seek_target_seconds = audio_get_position_seconds();
+        transport_seek_playback_generation = gen;
+        transport_seek_hold_cancelled = false;
+    } else if (gen != transport_seek_playback_generation) {
+        transport_seek_hold_cancelled = true;
+    }
+    if (transport_seek_hold_cancelled) return;
+    transport_seek_target_seconds += dir * TRANSPORT_SEEK_STEP_SECONDS;
+    if (transport_seek_target_seconds < 0.0) transport_seek_target_seconds = 0.0;
+    double duration = audio_get_duration_seconds();
+    double max_target = duration > TRANSPORT_SEEK_EOF_GUARD_SECONDS ? duration - TRANSPORT_SEEK_EOF_GUARD_SECONDS : 0.0;
+    if (transport_seek_target_seconds > max_target) transport_seek_target_seconds = max_target;
+    audio_seek(transport_seek_target_seconds);
+}
+
+/* LV_EVENT_CLICKED still fires on release even after a long press (LVGL's
+ * own documented behavior -- "regardless of long press"), so a hold-then-
+ * release would otherwise ALSO skip/restart the track right after fast-
+ * forwarding/rewinding it. Same fix already established in this codebase
+ * for the exact same problem (quick_drawer_wifi_long_press_fired/
+ * quick_drawer_bt_long_press_fired in gui_shell.c): a flag set here on
+ * LV_EVENT_LONG_PRESSED, checked and cleared at the top of the CLICKED
+ * handler to skip that one release's normal tap action.
+ *
+ * Bug caught in review: that flag was previously only ever cleared inside
+ * the CLICKED handler -- but a press that ends via LV_EVENT_PRESS_LOST
+ * (finger dragged off the object before release) never gets a matching
+ * CLICKED at all (confirmed against lv_indev.c: PRESS_LOST and RELEASED/
+ * CLICKED are emitted from disjoint code paths, never both for the same
+ * press). A long-hold-then-drag-off would leave the flag stuck true
+ * forever, silently discarding the very next legitimate short tap on that
+ * same button. transport_long_press_cancel_cb() below clears it on
+ * PRESS_LOST too so a cancelled hold can't outlive its own press. */
+static bool next_btn_long_press_fired = false;
+static bool prev_btn_long_press_fired = false;
+
+static void transport_long_press_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+    bool * fired = (bool *) lv_event_get_user_data(e);
+    *fired = true;
+}
+
+static void transport_long_press_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_PRESS_LOST) return;
+    bool * fired = (bool *) lv_event_get_user_data(e);
+    *fired = false;
+}
+
 #ifdef UI_GESTURE_TRACE
 static void debug_transport_btn_all_cb(lv_event_t * e) {
     printf("[TRANSPORT_TRACE] obj=%p code=%d clickable=%d state=0x%x\n",
@@ -1347,7 +1476,7 @@ static void debug_paint_hitbox(lv_obj_t * obj, int32_t ext, lv_color_t color) {
  * itself, not an icon padded out to one, so a normal border already traces
  * its real boundary); every caller still passes one unconditionally so a
  * non-debug build has no unused-parameter/-variable cleanup to do. */
-static void add_transport_hit_target(lv_obj_t * scr, int32_t center_x, int32_t width, int32_t top_y,
+static lv_obj_t * add_transport_hit_target(lv_obj_t * scr, int32_t center_x, int32_t width, int32_t top_y,
                                      int32_t bottom_y_exclusive, lv_event_cb_t cb, lv_color_t debug_color) {
     lv_obj_t * ext = lv_obj_create(scr);
     lv_obj_remove_style_all(ext);
@@ -1364,6 +1493,28 @@ static void add_transport_hit_target(lv_obj_t * scr, int32_t center_x, int32_t w
 #else
     (void) debug_color;
 #endif
+    return ext;
+}
+
+/* Real bug caught in review: since add_transport_hit_target()'s object is
+ * created AFTER controls_row and covers each icon's ENTIRE footprint (not
+ * just the extra sliver above it -- see that function's own "no object
+ * seam" comment), LVGL's own child hit-testing (lv_indev_search_obj(),
+ * lv_indev.c -- children checked in REVERSE creation order, first match
+ * wins) means this later, larger sibling now intercepts EVERY tap on these
+ * five buttons, not only the new upper region. The underlying icon
+ * (order_icon/play_btn/more_icon) never receives a real LV_EVENT_PRESSED/
+ * RELEASED again, so icon_press_style's LV_STATE_PRESSED-selector dimming
+ * silently stopped applying on a real touch -- confirmed by tracing
+ * lv_indev_search_obj()'s recursion, not by guessing. Forwarding the hit
+ * target's own PRESSED/RELEASED/PRESS_LOST onto the real icon's state
+ * restores the exact same visual feedback the icon's own style already
+ * defines, without touching that style or duplicating it here. */
+static void forward_press_state_to_icon_cb(lv_event_t * e) {
+    lv_obj_t * icon = (lv_obj_t *) lv_event_get_user_data(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) lv_obj_add_state(icon, LV_STATE_PRESSED);
+    else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) lv_obj_clear_state(icon, LV_STATE_PRESSED);
 }
 
 static void library_btn_event_cb(lv_event_t * e) {
@@ -1768,24 +1919,62 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * height, not each one's own separately-derived amount. */
     int32_t shared_hit_top = play_area.y1 - TRANSPORT_HIT_LINE_ABOVE_PLAY;
 
-    add_transport_hit_target(scr, (order_area.x1 + order_area.x2) / 2,
+    lv_obj_t * order_hit = add_transport_hit_target(scr, (order_area.x1 + order_area.x2) / 2,
                                 (order_area.x2 - order_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
                                 order_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, order_icon_event_cb,
                                 lv_palette_main(LV_PALETTE_RED));
-    add_transport_hit_target(scr, (play_area.x1 + play_area.x2) / 2, play_area.x2 - play_area.x1 + 1,
+    lv_obj_add_event_cb(order_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, order_icon);
+    lv_obj_add_event_cb(order_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, order_icon);
+    lv_obj_add_event_cb(order_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, order_icon);
+
+    lv_obj_t * play_hit = add_transport_hit_target(scr, (play_area.x1 + play_area.x2) / 2, play_area.x2 - play_area.x1 + 1,
                                 shared_hit_top, play_area.y2 + 1, play_btn_event_cb, lv_palette_main(LV_PALETTE_BLUE));
-    add_transport_hit_target(scr, (prev_area.x1 + prev_area.x2) / 2,
+    lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, play_btn);
+    lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, play_btn);
+    lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, play_btn);
+
+    lv_obj_t * prev_hit = add_transport_hit_target(scr, (prev_area.x1 + prev_area.x2) / 2,
                                 (prev_area.x2 - prev_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
                                 prev_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, prev_btn_event_cb,
                                 lv_palette_main(LV_PALETTE_GREEN));
-    add_transport_hit_target(scr, (next_area.x1 + next_area.x2) / 2,
+    /* Not forward_press_state_to_icon_cb -- prev_btn's own pressed feedback
+     * is a fixed sprite swap (transport_btn_press_event_cb/prev_ctx, set up
+     * above), not icon_press_style's LV_STATE_PRESSED selector. Attaching
+     * the same handler+ctx here, on the object that now actually receives
+     * the touch, restores that swap exactly the same way. */
+    lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_PRESSED, prev_ctx);
+    lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_RELEASED, prev_ctx);
+    lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, prev_ctx);
+    /* Hold-to-rewind -- see transport_seek_repeat_cb()'s own comment. Bound
+     * to prev_hit (the object that actually receives the touch now, not the
+     * icon underneath it) so it fires for a real user press. transport_seek_
+     * repeat_cb is bound to BOTH events (first step on LONG_PRESSED itself,
+     * then one more per REPEAT tick) -- see its own comment on why. */
+    lv_obj_add_event_cb(prev_hit, transport_long_press_cb, LV_EVENT_LONG_PRESSED, &prev_btn_long_press_fired);
+    lv_obj_add_event_cb(prev_hit, transport_long_press_cancel_cb, LV_EVENT_PRESS_LOST, &prev_btn_long_press_fired);
+    lv_obj_add_event_cb(prev_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED, (void *) (intptr_t) -1);
+    lv_obj_add_event_cb(prev_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED_REPEAT, (void *) (intptr_t) -1);
+
+    lv_obj_t * next_hit = add_transport_hit_target(scr, (next_area.x1 + next_area.x2) / 2,
                                 (next_area.x2 - next_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
                                 next_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, next_btn_event_cb,
                                 lv_palette_main(LV_PALETTE_ORANGE));
-    add_transport_hit_target(scr, (more_area.x1 + more_area.x2) / 2,
+    lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_PRESSED, next_ctx);
+    lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_RELEASED, next_ctx);
+    lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, next_ctx);
+    /* Hold-to-fast-forward -- see transport_seek_repeat_cb()'s own comment. */
+    lv_obj_add_event_cb(next_hit, transport_long_press_cb, LV_EVENT_LONG_PRESSED, &next_btn_long_press_fired);
+    lv_obj_add_event_cb(next_hit, transport_long_press_cancel_cb, LV_EVENT_PRESS_LOST, &next_btn_long_press_fired);
+    lv_obj_add_event_cb(next_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED, (void *) (intptr_t) 1);
+    lv_obj_add_event_cb(next_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED_REPEAT, (void *) (intptr_t) 1);
+
+    lv_obj_t * more_hit = add_transport_hit_target(scr, (more_area.x1 + more_area.x2) / 2,
                                 (more_area.x2 - more_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
                                 more_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, more_icon_event_cb,
                                 lv_palette_main(LV_PALETTE_PURPLE));
+    lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, more_icon);
+    lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, more_icon);
+    lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, more_icon);
 
     /* Volume is controlled via hardware buttons (see update_timer_cb) and,
      * per the real device, shown only as a transient overlay rather than a
@@ -2814,6 +3003,13 @@ void play_btn_event_cb(lv_event_t * e) {
 
 void prev_btn_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    /* See transport_long_press_cb()'s own comment -- LV_EVENT_CLICKED still
+     * fires on release even after a long press, so a hold-to-rewind session
+     * would otherwise ALSO restart/skip to the previous track right after. */
+    if (prev_btn_long_press_fired) {
+        prev_btn_long_press_fired = false;
+        return;
+    }
     reset_decoder_failure_tracking();
     if (playlist_index < 0) return;
 
@@ -2828,6 +3024,10 @@ void prev_btn_event_cb(lv_event_t * e) {
 
 void next_btn_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (next_btn_long_press_fired) {
+        next_btn_long_press_fired = false;
+        return;
+    }
     reset_decoder_failure_tracking();
     if (playlist_index < 0) return;
     int next_index = compute_manual_step_index(playlist_index, 1);
@@ -2857,11 +3057,10 @@ void car_mode_switch_event_cb(lv_event_t * e) {
 void swipe_up_home_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.swipe_up_home_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    if (current_settings.swipe_up_home_enabled) {
-        gui_shell_set_home_indicator_visible(true);
-    } else {
-        gui_shell_set_home_indicator_visible(false);
-    }
+    lv_obj_t * active = lv_screen_active();
+    gui_shell_set_home_indicator_visible(current_settings.swipe_up_home_enabled &&
+                                         active != gui_shell_get_home_screen() &&
+                                         active != gui_lyrics_get_screen());
     settings_save(&current_settings);
 }
 

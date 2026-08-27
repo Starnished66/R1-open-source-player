@@ -81,6 +81,7 @@ int tagcache_group_count(int kind);
 bool tagcache_group_at(int kind, int index, tagcache_group_t * out);
 /* Page of 1-based song ids from a pre-sorted group membership list. */
 int tagcache_artist_song_ids(const char * artist, int offset, int32_t * out_ids, int max);
+int tagcache_album_artist_song_ids(const char * album_artist, int offset, int32_t * out_ids, int max);
 int tagcache_album_song_ids(const char * album, const char * album_artist, int offset, int32_t * out_ids, int max);
 
 void tagcache_set_rating(const char * path, int32_t rating);

@@ -126,6 +126,10 @@ int metadata_db_get_groups_page(metadata_db_group_kind_t kind, int offset, int m
  * already bound how large this can plausibly get -- see its own comment). */
 int metadata_db_get_artist_songs(const char * artist, int offset, song_row_t * out_rows, int max_rows);
 
+/* Mirrors metadata_db_get_artist_songs() above, keyed by album_artist
+ * instead of artist -- Album Artist -> (their own songs) drill-down. */
+int metadata_db_get_album_artist_songs(const char * album_artist, int offset, song_row_t * out_rows, int max_rows);
+
 /* Every song in one album -- keyed by (album, album_artist) together, not
  * album name alone, so two different artists' same-titled albums ("Greatest
  * Hits", a self-titled album) don't collide. */

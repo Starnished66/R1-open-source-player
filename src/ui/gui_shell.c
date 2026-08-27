@@ -252,6 +252,21 @@ static const char * bt_codec_get_asset(bt_codec_type_t type) {
 
 static void sync_bt_codec_status_icon(void);
 
+void gui_shell_set_status_bar_screen_context(lv_obj_t * screen) {
+    if (!status_bar_band) return;
+
+    /* Library/settings screens already provide a stable background behind
+     * the persistent status icons.  Player and Lyrics intentionally draw
+     * edge-to-edge artwork, which can be nearly white and make those icons
+     * disappear, so give only those two screens a neutral translucent
+     * backing.  Keeping this on the persistent band (rather than either
+     * screen) also lets transition snapshots composite the same treatment. */
+    bool over_artwork = screen == gui_player_get_screen() || screen == gui_lyrics_get_screen();
+    lv_obj_set_style_bg_color(status_bar_band, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(status_bar_band, over_artwork ? LV_OPA_50 : LV_OPA_TRANSP,
+                            LV_PART_MAIN);
+}
+
 void sync_player_topbar_visibility(lv_obj_t * screen) {
     /* Settings > Display > "Hide Player/Lyrics Top Bar" -- hides the global
      * status bar while the Player or its fullscreen Lyrics view is active;
@@ -269,6 +284,7 @@ void sync_player_topbar_visibility(lv_obj_t * screen) {
      * approach, not by this function. */
     bool hide = current_settings.hide_player_topbar && (screen == gui_player_get_screen() || screen == gui_lyrics_get_screen());
     if (status_bar_band) {
+        gui_shell_set_status_bar_screen_context(screen);
         if (hide) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_remove_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
     }

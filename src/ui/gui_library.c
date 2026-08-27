@@ -544,6 +544,26 @@ static void set_group_songs_entries(const group_song_entry_t * entries, int coun
     group_songs_count = copy_group_song_entries(&group_songs_entries, entries, count) ? count : 0;
 }
 
+/* Sibling to set_group_songs_entries() above for exactly one caller --
+ * artist_albums_show_all_songs() -- whose own entries[] has no natural
+ * upper bound (an artist's combined song count across every album, unlike
+ * every other group_songs source here: one album, a hand-curated playlist,
+ * MOST_PLAYED_LIMIT). Real bug caught in review: that caller already builds
+ * its own owned path/title strings, then handing them to set_group_songs_
+ * entries() (which unconditionally strdup's a SECOND copy via copy_group_
+ * song_entries()) briefly held two full copies of every path/title at once
+ * -- fine for the small/bounded sources, a real risk on this device's
+ * limited RAM for a large artist. This takes ownership of an already-
+ * strdup'd entries[] (same shape copy_group_song_entries() itself would
+ * have produced) directly instead, so only one copy is ever held. The
+ * caller must not free `entries` itself afterward -- this function now
+ * owns it, same as if set_group_songs_entries() had copied it. */
+static void set_group_songs_entries_owned(group_song_entry_t * entries, int count) {
+    free_group_song_entries(group_songs_entries, group_songs_count);
+    group_songs_entries = entries;
+    group_songs_count = count;
+}
+
 /* A pathological album can contain tens of thousands of tracks. Building one
  * LVGL object per track caused a large post-scan RSS spike and could make ADB
  * unresponsive. Keep the backing group intact for playback, but materialize
@@ -658,8 +678,34 @@ static void group_song_row_click_cb(lv_event_t * e) {
     }
     int pos = (int) (intptr_t) lv_event_get_user_data(e); /* position within the CURRENT group, not the whole library */
 
-    char ** playlist_copy = malloc(sizeof(char *) * (size_t) group_songs_count);
-    for (int i = 0; i < group_songs_count; i++) playlist_copy[i] = strdup(group_songs_entries[i].path);
+    /* Real bug caught in review: neither this malloc() nor the strdup()
+     * loop below were ever checked. Every group_songs source used to be
+     * small/bounded by construction (one album, a hand-curated playlist,
+     * MOST_PLAYED_LIMIT), so an allocation failure here was near-
+     * theoretical -- the new Artist/Album Artist "All Songs" row makes
+     * group_songs_count large enough on a real (if unusual) library that
+     * it's worth guarding for real: a failed malloc() previously meant an
+     * immediate NULL-pointer write on the very next line, and a failed
+     * strdup() partway through left a raw NULL path inside the array
+     * on_file_selected() was about to install as the live playback queue.
+     * calloc(), not malloc(), so an early bail-out can free every slot
+     * unconditionally -- entries strdup() never reached stay NULL (free()
+     * on NULL is a no-op) instead of holding garbage. */
+    char ** playlist_copy = calloc((size_t) group_songs_count, sizeof(char *));
+    if (!playlist_copy) return;
+    bool ok = true;
+    for (int i = 0; i < group_songs_count; i++) {
+        playlist_copy[i] = strdup(group_songs_entries[i].path);
+        if (!playlist_copy[i]) {
+            ok = false;
+            break;
+        }
+    }
+    if (!ok) {
+        for (int i = 0; i < group_songs_count; i++) free(playlist_copy[i]);
+        free(playlist_copy);
+        return;
+    }
     set_player_source_group_songs(pos);
     on_file_selected(playlist_copy, group_songs_count, pos);
 }
@@ -958,6 +1004,24 @@ static void show_group_songs_editable(const char * name, const group_song_entry_
 
 void show_group_songs(const char * name, const group_song_entry_t * entries, int count) {
     show_group_songs_editable(name, entries, count, NULL);
+}
+
+/* Ownership-transferring sibling of show_group_songs() -- see set_group_
+ * songs_entries_owned()'s own comment for why this exists. Never editable
+ * (no m3u path makes sense for a flattened, non-playlist view), same as
+ * plain show_group_songs()'s own default. Caller must not free `entries`
+ * after this call -- ownership has moved to group_songs_entries. */
+static void show_group_songs_take_ownership(const char * name, group_song_entry_t * entries, int count) {
+    group_songs_source_is_album = false;
+    group_songs_edit_m3u_path = NULL;
+    group_songs_edit_mode = false;
+    set_group_songs_entries_owned(entries, count);
+    group_songs_page_start = 0;
+
+    lv_label_set_text(group_songs_title_label, name);
+    populate_group_songs_rows();
+
+    nav_push(group_songs_screen);
 }
 
 static lv_obj_t * build_group_songs_screen(void) {
@@ -4013,6 +4077,12 @@ void plugin_stream_tile_click_cb(lv_event_t * e) {
  * same rebuild-in-place approach as group_songs_screen. */
 static group_row_t * artist_albums_groups;
 static int artist_albums_group_count;
+/* Name/kind of the artist or album artist this screen is currently showing
+ * -- set by show_artist_albums(), read back by artist_album_row_click_cb()'s
+ * own "All Songs" row (index 0, see that function's own comment) to fetch
+ * every song credited to them, flattened across all their albums. */
+static char artist_albums_current_name[128];
+static metadata_db_group_kind_t artist_albums_current_kind;
 
 /* Defined with the shared bounded artwork cache below. */
 static void album_row_thumbnail_decorator(lv_obj_t * list, lv_obj_t * row, lv_obj_t * image,
@@ -4025,9 +4095,208 @@ static void album_row_thumbnail_decorator(lv_obj_t * list, lv_obj_t * row, lv_ob
 /* This drill-down is a compact list too: fixed row count regardless of how
  * many albums one artist owns, and therefore able to share the exact album
  * artwork decorator/cache used by Music -> Albums. */
+/* Sort scratch for artist_albums_show_all_songs() below -- carries the same
+ * owned path/title an eventual group_song_entry_t needs, plus just enough
+ * of each song's own tags to order the flattened list the same way a real
+ * album listing would (see cmp_artist_song_sort_entry()'s own comment).
+ * Freed after the final group_song_entry_t[] is built; its path/title
+ * pointers are MOVED there, not copied again. */
+typedef struct {
+    char * path;
+    char * title;
+    char album[128];
+    char album_artist[128];
+    int32_t disc_number;
+    int32_t track_number;
+} artist_song_sort_entry_t;
+
+/* Real bug caught in review: Artist/Album Artist tagcache groups sort their
+ * own song membership by (album, file path) -- cmp_slot_album_path() in
+ * tagcache.c, used for grouping/counting, NOT for a listening order -- so
+ * the flattened fetch this backs would otherwise read back in whatever
+ * order filenames happen to alphabetize to within each album, not disc/
+ * track order (a real album's OWN listing, by contrast, is grouped and
+ * sorted with cmp_slot_path(), which is disc/track-aware). This mirrors
+ * that same disc/track/path tie-break locally, entirely client-side --
+ * changing tagcache.c's own shared group order would affect every other
+ * consumer of Artist/Album Artist groups, not just this one screen.
+ *
+ * Second bug caught in review: grouping by album name ALONE first sorted
+ * this comparator too -- but album identity throughout this codebase is
+ * (album, album_artist) together, not name alone (see group_row_t's own
+ * comment: "two different artists' same-titled albums (\"Greatest Hits\", a
+ * self-titled album) don't collide", which is exactly why metadata_db_get_
+ * album_songs() takes both). Two distinct albums this artist appears on
+ * that happen to share a name (a generic title, or two same-titled self-
+ * titled albums under different album_artist credits) would otherwise
+ * interleave by disc/track number instead of staying separate. */
+static int cmp_artist_song_sort_entry(const void * a, const void * b) {
+    const artist_song_sort_entry_t * ea = (const artist_song_sort_entry_t *) a;
+    const artist_song_sort_entry_t * eb = (const artist_song_sort_entry_t *) b;
+    int c = strcasecmp(ea->album, eb->album);
+    if (c) return c;
+    c = strcasecmp(ea->album_artist, eb->album_artist);
+    if (c) return c;
+    int32_t da = ea->disc_number > 0 ? ea->disc_number : 1;
+    int32_t db = eb->disc_number > 0 ? eb->disc_number : 1;
+    if (da != db) return da < db ? -1 : 1;
+    int32_t ta = ea->track_number, tb = eb->track_number;
+    if (ta > 0 || tb > 0) {
+        if (ta <= 0) return 1;
+        if (tb <= 0) return -1;
+        if (ta != tb) return ta < tb ? -1 : 1;
+    }
+    return strcasecmp(ea->path, eb->path);
+}
+
+/* Fetches every song credited to artist_albums_current_name (flattened
+ * across all its albums) and hands it to show_group_songs_take_ownership()
+ * -- the "All Songs" row prepended at index 0 by show_artist_albums().
+ *
+ * Real bug caught in review: `total` used to be summed from artist_albums_
+ * groups[].song_count -- each entry's FULL album song_count, from the
+ * per-album breakdown already in memory. That overestimates badly for an
+ * artist who appears on a "Various Artists"-style compilation: the whole
+ * compilation's track count gets added even though this artist only owns
+ * one of its tracks, allocating room for (and briefly holding) thousands of
+ * entries to display a single song. metadata_db_get_group_offset() +
+ * metadata_db_get_groups_page() reads the ARTIST/ALBUM_ARTIST group's own
+ * song_count directly -- the same exact-membership count metadata_db_get_
+ * artist_songs()/get_album_artist_songs() below actually iterates -- so the
+ * allocation always matches what's really going to be fetched.
+ *
+ * Real risk flagged in review: even with that overestimation gone, this
+ * whole fetch+sort+build still runs synchronously on the UI thread with no
+ * upper bound, unlike every OTHER group_songs source here (one album, a
+ * hand-curated playlist, MOST_PLAYED_LIMIT) -- a genuinely prolific artist
+ * could still mean a real, if much smaller, spike and a noticeable freeze.
+ * Converting this to a background-worker-plus-busy-overlay (this file's own
+ * established pattern for real multi-hundred-ms work) would be the
+ * complete fix, but is a meaningfully sized, lifetime-risk-bearing change
+ * (what happens if the user backs out or opens a different artist mid-
+ * fetch?) for a case this cap already keeps far short of ever mattering in
+ * practice. ARTIST_ALBUMS_ALL_SONGS_CAP is deliberately generous -- well
+ * beyond any real single artist's realistic discography -- so this only
+ * ever bites the genuinely pathological case the cap exists for. */
+#define ARTIST_ALBUMS_ALL_SONGS_CAP 4000
+
+static void artist_albums_show_all_songs(void) {
+    int64_t offset = metadata_db_get_group_offset(artist_albums_current_kind, artist_albums_current_name, NULL);
+    group_row_t artist_row;
+    int real_total = (offset >= 0 && metadata_db_get_groups_page(artist_albums_current_kind, (int) offset, 1,
+                                                                  &artist_row) == 1)
+                          ? artist_row.song_count
+                          : 0;
+    if (real_total <= 0) return;
+    int total = real_total > ARTIST_ALBUMS_ALL_SONGS_CAP ? ARTIST_ALBUMS_ALL_SONGS_CAP : real_total;
+
+    /* calloc, not malloc -- a failure partway through the fetch loop below
+     * frees every one of these `total` slots unconditionally (see that
+     * branch's own comment), relying on the not-yet-reached ones staying
+     * NULL from this zero-init rather than holding garbage. */
+    artist_song_sort_entry_t * sort_entries = calloc((size_t) total, sizeof(*sort_entries));
+    if (!sort_entries) return;
+
+    int n = 0;
+    bool failed = false;
+    song_row_t page[64];
+    while (n < total) {
+        int want = total - n;
+        if (want > 64) want = 64;
+        int got = artist_albums_current_kind == METADATA_DB_GROUP_ALBUM_ARTIST
+                      ? metadata_db_get_album_artist_songs(artist_albums_current_name, n, page, want)
+                      : metadata_db_get_artist_songs(artist_albums_current_name, n, page, want);
+        if (got <= 0) break;
+        for (int i = 0; i < got; i++) {
+            char title[128];
+            metadata_db_song_display_title(&page[i], title, sizeof(title));
+            artist_song_sort_entry_t * dst = &sort_entries[n + i];
+            dst->path = strdup(page[i].path);
+            dst->title = strdup(title);
+            snprintf(dst->album, sizeof(dst->album), "%s", page[i].tags.album);
+            snprintf(dst->album_artist, sizeof(dst->album_artist), "%s", page[i].tags.album_artist);
+            dst->disc_number = page[i].tags.disc_number;
+            dst->track_number = page[i].tags.track_number;
+            if (!dst->path || !dst->title) {
+                failed = true;
+                break;
+            }
+        }
+        if (failed) break;
+        n += got;
+        if (got < want) break;
+    }
+
+    if (failed || n <= 0) {
+        /* `total`, not `n` -- covers the current, partially-filled batch
+         * (whatever this failure landed on) plus every never-reached slot,
+         * all still NULL/zeroed from the calloc above. free(NULL) is a
+         * no-op, so this is safe regardless of exactly how far the loop
+         * got. */
+        for (int i = 0; i < total; i++) {
+            free(sort_entries[i].path);
+            free(sort_entries[i].title);
+        }
+        free(sort_entries);
+        return;
+    }
+
+    /* Real bug caught in review: this list spans every album this artist
+     * has, so a plain fetch order read back alphabetically-by-filename
+     * within each album instead of disc/track order -- see cmp_artist_
+     * song_sort_entry()'s own comment. */
+    qsort(sort_entries, (size_t) n, sizeof(*sort_entries), cmp_artist_song_sort_entry);
+
+    /* Real bug caught in review: this used to hand the strdup'd entries[]
+     * straight to show_group_songs(), which itself strdup's a SECOND full
+     * copy of every path/title (copy_group_song_entries(), via
+     * set_group_songs_entries()) before this function's own copy was
+     * freed -- briefly holding two complete copies of a list with no
+     * natural size ceiling (unlike every other group_songs source here).
+     * Moving the already-owned path/title pointers into a fresh group_
+     * song_entry_t[] and transferring THAT via show_group_songs_take_
+     * ownership() (see its own comment) keeps exactly one copy alive at
+     * all times. */
+    group_song_entry_t * entries = malloc(sizeof(*entries) * (size_t) n);
+    if (!entries) {
+        for (int i = 0; i < n; i++) {
+            free(sort_entries[i].path);
+            free(sort_entries[i].title);
+        }
+        free(sort_entries);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        entries[i].path = sort_entries[i].path;
+        entries[i].title = sort_entries[i].title;
+    }
+    free(sort_entries);
+
+    /* Real bug caught in review: truncating to ARTIST_ALBUMS_ALL_SONGS_CAP
+     * with no indication at all left this screen -- titled with the plain
+     * artist/album-artist name, same as every other group_songs source --
+     * silently missing songs (and, since playback queues straight from this
+     * same list, silently unplayable) past the cap. A toast right as the
+     * screen opens discloses it without needing a permanent title
+     * annotation or its own dedicated UI. */
+    if (real_total > ARTIST_ALBUMS_ALL_SONGS_CAP) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Showing first %d of %d songs", n, real_total);
+        show_info_toast(msg);
+    }
+
+    show_group_songs_take_ownership(artist_albums_current_name, entries, n);
+    /* entries is now owned by group_songs_entries -- do not free here. */
+}
+
 static void artist_album_row_click_cb(int index) {
-    if (index < 0 || index >= artist_albums_group_count) return;
-    group_row_t * group = &artist_albums_groups[index];
+    if (index == 0) {
+        artist_albums_show_all_songs();
+        return;
+    }
+    int group_index = index - 1;
+    if (group_index < 0 || group_index >= artist_albums_group_count) return;
+    group_row_t * group = &artist_albums_groups[group_index];
     group_song_entry_t * entries = calloc((size_t) group->song_count, sizeof(*entries));
     int n = 0;
     song_row_t page[64];
@@ -4091,7 +4360,9 @@ void refresh_artist_albums_now_playing_indicator(void) {
         for (int i = 0; i < artist_albums_group_count; i++) {
             if (strcasecmp(artist_albums_groups[i].name, playing.tags.album) == 0 &&
                 strcasecmp(artist_albums_groups[i].album_artist, playing.tags.album_artist) == 0) {
-                match = i;
+                /* +1 -- show_artist_albums() prepends an "All Songs" row at
+                 * index 0, ahead of every artist_albums_groups[] entry. */
+                match = i + 1;
                 break;
             }
         }
@@ -4101,6 +4372,9 @@ void refresh_artist_albums_now_playing_indicator(void) {
 }
 
 void show_artist_albums(const char * name, metadata_db_group_kind_t kind) {
+    snprintf(artist_albums_current_name, sizeof(artist_albums_current_name), "%s", name);
+    artist_albums_current_kind = kind;
+
     free(artist_albums_groups);
     artist_albums_groups = NULL;
     int64_t count64 = metadata_db_count_albums_for_group(kind, name);
@@ -4113,17 +4387,24 @@ void show_artist_albums(const char * name, metadata_db_group_kind_t kind) {
     }
 
     lv_label_set_text(artist_albums_title_label, name);
+    /* "All Songs" prepended at index 0 -- artist_album_row_click_cb() and
+     * refresh_artist_albums_now_playing_indicator() both account for this
+     * same +1 shift against artist_albums_groups[]. identity=0 (no real
+     * song id) makes album_row_thumbnail_decorator() hide this row's cover
+     * image via its own existing song_id<=0 fallback -- no decorator
+     * changes needed. */
     compact_list_item_t * items = artist_albums_group_count > 0
-        ? malloc(sizeof(*items) * (size_t) artist_albums_group_count) : NULL;
+        ? malloc(sizeof(*items) * (size_t) (artist_albums_group_count + 1)) : NULL;
     if (items) {
+        items[0] = (compact_list_item_t){ .label = "All Songs", .identity = 0, .trailing_asset = NULL };
         for (int i = 0; i < artist_albums_group_count; i++) {
-            items[i] = (compact_list_item_t){
+            items[i + 1] = (compact_list_item_t){
                 .label = artist_albums_groups[i].name,
                 .identity = artist_albums_groups[i].first_song_id,
                 .trailing_asset = NULL
             };
         }
-        compact_list_set_items(artist_albums_list, items, artist_albums_group_count);
+        compact_list_set_items(artist_albums_list, items, artist_albums_group_count + 1);
         free(items);
     } else {
         compact_list_set_items(artist_albums_list, NULL, 0);

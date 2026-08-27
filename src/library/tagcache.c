@@ -2306,6 +2306,16 @@ int tagcache_artist_song_ids(const char * artist, int offset, int32_t * out_ids,
     return copy_group_page(TAGCACHE_GROUP_ARTIST, find_group(TAGCACHE_GROUP_ARTIST, artist, ""), offset, out_ids, max);
 }
 
+/* Mirrors tagcache_artist_song_ids() above, against the ALBUM_ARTIST group
+ * instead -- for the Album Artist drill-down's own "All Songs" row (see
+ * gui_library.c's show_artist_albums()), same as that function already
+ * exists for the Artist drill-down's own version. */
+int tagcache_album_artist_song_ids(const char * album_artist, int offset, int32_t * out_ids, int max) {
+    if (!db_open) return 0;
+    return copy_group_page(TAGCACHE_GROUP_ALBUM_ARTIST, find_group(TAGCACHE_GROUP_ALBUM_ARTIST, album_artist, ""),
+                            offset, out_ids, max);
+}
+
 int tagcache_album_song_ids(const char * album, const char * album_artist, int offset, int32_t * out_ids, int max) {
     if (!db_open) return 0;
     return copy_group_page(TAGCACHE_GROUP_ALBUM, find_group(TAGCACHE_GROUP_ALBUM, album, album_artist), offset, out_ids,

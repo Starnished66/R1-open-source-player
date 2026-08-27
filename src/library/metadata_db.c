@@ -332,6 +332,29 @@ int metadata_db_get_artist_songs(const char * artist, int offset, song_row_t * o
     return w;
 }
 
+/* Mirrors metadata_db_get_artist_songs() above, against the ALBUM_ARTIST
+ * group instead -- see tagcache_album_artist_song_ids()'s own comment. */
+int metadata_db_get_album_artist_songs(const char * album_artist, int offset, song_row_t * out_rows, int max_rows) {
+    METADATA_DB_GUARD;
+    if (!db_ready || max_rows <= 0) return 0;
+    if (offset < 0) offset = 0;
+    int32_t stack_ids[64];
+    int32_t * ids = stack_ids;
+    if (max_rows > 64) {
+        ids = malloc(sizeof(*ids) * (size_t) max_rows);
+        if (!ids) return 0;
+    }
+    int n = tagcache_album_artist_song_ids(album_artist, offset, ids, max_rows);
+    int w = 0;
+    for (int i = 0; i < n && w < max_rows; i++) {
+        tagcache_song_t song;
+        if (!tagcache_song_by_id(ids[i], &song)) continue;
+        copy_song(&song, &out_rows[w++]);
+    }
+    if (ids != stack_ids) free(ids);
+    return w;
+}
+
 int metadata_db_get_album_songs(const char * album, const char * album_artist, int offset, song_row_t * out_rows,
                                  int max_rows) {
     METADATA_DB_GUARD;

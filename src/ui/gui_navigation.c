@@ -188,10 +188,9 @@ static lv_draw_buf_t * snapshot_screen_base(lv_obj_t * target_screen) {
  * present at the wrong moment -- only these two named, permanent bands are
  * ever composited in. status_bar_band's hidden flag is temporarily forced
  * to its target-state value (same reasoning/safety as snapshot_screen_
- * base()'s own comment on player_dismiss_btn); home_indicator_band's
- * current live flag already IS its correct target-state value (its
- * visibility is unrelated to which screen is active), so it needs no such
- * forcing. */
+ * base()'s own comment on player_dismiss_btn). home_indicator_band is also
+ * temporarily forced because Home and Lyrics intentionally hide it while
+ * ordinary destination screens show it. */
 static void blend_persistent_bars(lv_draw_buf_t * base, lv_obj_t * target_screen) {
     bool topbar_target_hidden = current_settings.hide_player_topbar &&
                                  (target_screen == gui_player_get_screen() || target_screen == gui_lyrics_get_screen());
@@ -201,13 +200,25 @@ static void blend_persistent_bars(lv_draw_buf_t * base, lv_obj_t * target_screen
         bool status_was_hidden = lv_obj_has_flag(sb, LV_OBJ_FLAG_HIDDEN);
         if (!topbar_target_hidden) {
             if (status_was_hidden) lv_obj_remove_flag(sb, LV_OBJ_FLAG_HIDDEN);
+            gui_shell_set_status_bar_screen_context(target_screen);
             blend_overlay_onto_base(base, sb);
         }
+        gui_shell_set_status_bar_screen_context(lv_screen_active());
         if (status_was_hidden) lv_obj_add_flag(sb, LV_OBJ_FLAG_HIDDEN);
         else lv_obj_remove_flag(sb, LV_OBJ_FLAG_HIDDEN);
     }
-    if (hb && !lv_obj_has_flag(hb, LV_OBJ_FLAG_HIDDEN)) {
+    /* Home is already the gesture's destination, so showing its pill there
+     * adds a dead-looking bottom bar with no navigation value. Lyrics also
+     * deliberately disables the gesture. Keep target-screen snapshots in
+     * lockstep with the live visibility policy below. */
+    bool home_indicator_target_visible = current_settings.swipe_up_home_enabled &&
+                                         target_screen != gui_shell_get_home_screen() &&
+                                         target_screen != gui_lyrics_get_screen();
+    if (hb && home_indicator_target_visible) {
+        bool home_was_hidden = lv_obj_has_flag(hb, LV_OBJ_FLAG_HIDDEN);
+        if (home_was_hidden) lv_obj_remove_flag(hb, LV_OBJ_FLAG_HIDDEN);
         blend_overlay_onto_base(base, hb);
+        if (home_was_hidden) lv_obj_add_flag(hb, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -340,6 +351,7 @@ static bool slide_transition_active = false;
  * is never restored early and baked into the outgoing Lyrics frame. */
 static void sync_home_indicator_visibility(lv_obj_t * screen) {
     gui_shell_set_home_indicator_visible(current_settings.swipe_up_home_enabled &&
+                                         screen != gui_shell_get_home_screen() &&
                                          screen != gui_lyrics_get_screen());
 }
 

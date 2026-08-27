@@ -13,6 +13,7 @@
 #include <stdatomic.h>
 #include <unistd.h>
 #include "audio.h"
+#include "wifi_status.h"
 
 void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list, const char * (*name_of)(int), const int * count_ptr, bool is_overlay_list, bool db_backed, metadata_db_az_kind_t db_kind, compact_list_fetch_page_cb_t restore_fetch_page);
 
@@ -1024,7 +1025,34 @@ void poll_subsonic_connect(void) {
      * documented gap as poll_subsonic_download above. */
 }
 
+/* Bug report: opening Subsonic (or attempting a connection from within it)
+ * with no real Wi-Fi connection established just sat in the "Connecting to
+ * server..." busy overlay until subsonic_client.h's own HTTP timeout, then
+ * -- per this file's own documented gap just above -- silently landed back
+ * wherever nav_pop() left off, with no indication anything failed. Unlike
+ * the four Wireless tiles' own guard (gui_network.c's wifi_feature_guard(),
+ * which only requires the RADIO to be on -- Wi-Fi ON but disconnected is
+ * fine for those, since they're local-network features with their own
+ * "connect first" in-screen state), Subsonic talks to a remote server, so
+ * radio-on alone isn't enough: this checks wifi_get_status(), the same
+ * "wpa_state=COMPLETED" real-association check the topbar's own Wi-Fi icon
+ * uses, already an accepted synchronous-on-the-UI-thread call elsewhere in
+ * this codebase (refresh_wifi_icon(), gui_shell.c) since it's a single fast
+ * subprocess call, not a network round-trip of its own. Checked at the
+ * tile (don't even open the entry screen) AND here in start_subsonic_
+ * connect() (the actual single choke point both Saved Servers and New
+ * Connection's own "Connect & Browse" already funnel through) -- the
+ * screen can already be open from before Wi-Fi dropped, same reasoning as
+ * every other Wi-Fi-dependent feature's defensive enable guard. */
+static bool subsonic_wifi_connected_guard(void) {
+    int level;
+    if (wifi_get_status(&level)) return true;
+    show_error_toast("Connect to Wi-Fi first");
+    return false;
+}
+
 static void start_subsonic_connect(const subsonic_server_t * server) {
+    if (!subsonic_wifi_connected_guard()) return;
     subsonic_connect_pending_server = *server;
 
     subsonic_connect_request_t * req = malloc(sizeof(*req));
@@ -1197,6 +1225,7 @@ static lv_obj_t * build_subsonic_entry_screen(void) {
 
 void subsonic_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!subsonic_wifi_connected_guard()) return;
     nav_push(subsonic_entry_screen);
 }
 

@@ -712,13 +712,6 @@ static void open_lyrics_screen(void) {
         lv_obj_remove_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
     lyrics_reset_pool();
     lv_timer_resume(lyrics_timer);
-    /* Real-device bug report: the swipe-up-home pill stayed visible on this
-     * screen even though poll_quick_drawer_drag() already excludes it from
-     * the gesture entirely (home_cfg.is_lyrics_screen -- see that function's
-     * own comment) -- a visible affordance that silently does nothing when
-     * swiped. lyrics_gesture_event_cb() restores it (if the setting wants
-     * it) on the one confirmed way back out. */
-    gui_shell_set_home_indicator_visible(false);
     nav_push(lyrics_screen);
     lyrics_timer_cb(NULL); /* one immediate tick so the view isn't blank for up to LYRICS_TIMER_PERIOD_MS after opening */
 }

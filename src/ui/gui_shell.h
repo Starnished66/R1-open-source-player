@@ -51,4 +51,5 @@ void gui_shell_cancel_background_work(void);
 
 lv_obj_t * gui_shell_get_status_bar_band(void);
 lv_obj_t * gui_shell_get_home_indicator_band(void);
+void gui_shell_set_status_bar_screen_context(lv_obj_t * screen);
 void gui_shell_set_home_indicator_visible(bool visible);

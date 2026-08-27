@@ -79,6 +79,44 @@ static bool wifi_toggle_active = false;
 static bool wifi_toggle_target_enabled = false;
 static bool bt_toggle_active = false;
 
+/* True only while the in-flight wifi_toggle_thread was kicked off by
+ * gui_shell_suspend_connections() (the automatic idle-screen-off radio
+ * power-save cycle) rather than the user's own quick_drawer_wifi_event_cb()
+ * tap. Each of the three call sites that can start this thread (that one,
+ * gui_shell_suspend_connections(), and gui_shell_resume_connections()) sets
+ * this immediately before its own pthread_create(), so it always reflects
+ * whichever attempt is actually in flight -- a failed launch never leaves a
+ * stale value behind for a later, unrelated toggle to misread, since
+ * wifi_toggle_active reverting to false means poll_wifi_toggle() never
+ * consumes it for that failed attempt anyway.
+ *
+ * Consumed once by poll_wifi_toggle() to skip gui_network_handle_wifi_
+ * disabled()'s permanent cleanup for this transient case specifically:
+ * unlike AirPlay/BT DAC mode (excluded from radio suspend entirely by
+ * gui.c's own radios_suspended gate), DLNA and Remote Control have no such
+ * exclusion, so without this every idle radio-suspend cycle would stop them
+ * and permanently clear their persisted settings -- gui_shell_resume_
+ * connections() only ever restores the WIFI RADIO transparently afterward,
+ * never these app-level features, so a setting cleared here would never
+ * come back on its own. That's a real regression from the intended
+ * "explicitly shut down whenever Wi-Fi is turned off [by the user]"
+ * behavior, not the transient, self-reversing power-save blip this is. */
+static bool wifi_toggle_is_radio_suspend = false;
+
+/* Read-only effective-Wi-Fi-state accessor for callers outside this file
+ * (gui_network.c's Wi-Fi dependency guard for AirPlay/DLNA/Remote Control/
+ * Import via Wi-Fi) that need the same "in-flight toggle counts as its
+ * target state" logic refresh_wifi_icon() below already uses -- plain
+ * wifi_control_is_enabled() can briefly still report the OLD hardware state
+ * while wifi_toggle_active is true (see wifi_toggle_thread_func()'s own
+ * comment), which would let a tap through for a moment right as Wi-Fi is
+ * being turned off. Deliberately exposes only this bool, not wifi_toggle_
+ * active/wifi_toggle_target_enabled themselves -- callers have no business
+ * reading or driving this file's own toggle machinery directly. */
+bool gui_shell_wifi_effective_enabled(void) {
+    return wifi_toggle_active ? wifi_toggle_target_enabled : wifi_control_is_enabled();
+}
+
 static void refresh_quick_drawer_brightness(void) {
     if (!quick_drawer_brightness_track) return;
     int brightness = backlight_get_percent();
@@ -796,7 +834,7 @@ static void refresh_wifi_icon(void) {
      * poll_wifi_toggle() clears wifi_toggle_active, this immediately goes
      * back to the authoritative backend state and can still report a real
      * failure normally. */
-    bool enabled = wifi_toggle_active ? wifi_toggle_target_enabled : wifi_control_is_enabled();
+    bool enabled = gui_shell_wifi_effective_enabled();
     if (quick_drawer_wifi_icon) {
         lv_image_set_src(quick_drawer_wifi_icon, asset_path(enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
         quick_drawer_mark_snapshot_dirty();
@@ -2409,6 +2447,7 @@ void quick_drawer_wifi_event_cb(lv_event_t * e) {
     if (wifi_toggle_active) return; /* already toggling -- ignore taps until it lands */
     bool wifi_will_be_enabled = !wifi_control_is_enabled();
     wifi_toggle_active = true;
+    wifi_toggle_is_radio_suspend = false; /* a real user tap, not the idle radio-suspend cycle */
     atomic_store_explicit(&wifi_toggle_done_flag, false, memory_order_relaxed);
     wifi_toggle_target_enabled = wifi_will_be_enabled;
 
@@ -2476,6 +2515,28 @@ static void poll_wifi_toggle(void) {
     refresh_wifi_icon(); /* re-reads the real state -- updates both the status bar and drawer icons */
     populate_wifi_screen(enabled); /* the Wi-Fi screen's own toggle row + everything gated on it needs the same refresh */
     if (enabled != wifi_toggle_target_enabled) show_error_toast("Wi-Fi failed to change state");
+
+    /* Only shut AirPlay/DLNA/Remote Control/Import down once the disable is
+     * AUTHORITATIVELY confirmed via the real wifi_control_is_enabled() read
+     * above, not merely because wifi_toggle_target_enabled asked for OFF --
+     * a failed disable (enabled != wifi_toggle_target_enabled, toast just
+     * above) must leave those features running exactly as they were.
+     *
+     * Also excludes the automatic idle radio-suspend disable (wifi_toggle_
+     * is_radio_suspend, set by gui_shell_suspend_connections()) -- that one
+     * shares this exact same toggle-thread/poll mechanism as the user's own
+     * tap, but is a transient, self-reversing power-save blip (gui_shell_
+     * resume_connections() brings the radio back the moment the screen
+     * wakes), not a deliberate "turn Wi-Fi off" the user asked for. Running
+     * the permanent cleanup for it would stop DLNA/Remote Control (AirPlay/
+     * BT DAC are already excluded from ever reaching radio suspend at all,
+     * via gui.c's own radios_suspended gate) and permanently clear their
+     * persisted settings every time the screen idles, with no way for the
+     * plain radio-restore afterward to ever turn them back on. See wifi_
+     * toggle_is_radio_suspend's own comment above for the full reasoning. */
+    bool was_radio_suspend = wifi_toggle_is_radio_suspend;
+    wifi_toggle_is_radio_suspend = false;
+    if (!enabled && !was_radio_suspend) gui_network_handle_wifi_disabled();
 }
 
 /* Same real tap-to-toggle treatment for Bluetooth, mirroring the wifi
@@ -3180,6 +3241,7 @@ void gui_shell_resume_connections(bool wifi_was_on, bool bt_was_on) {
 #ifndef HOST_BUILD
     if (wifi_was_on && !wifi_control_is_enabled() && !wifi_toggle_active) {
         wifi_toggle_active = true;
+        wifi_toggle_is_radio_suspend = false; /* restoring, not the suspend disable itself */
         atomic_store_explicit(&wifi_toggle_done_flag, false, memory_order_relaxed);
         wifi_toggle_target_enabled = true;
         if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0)
@@ -3204,6 +3266,7 @@ void gui_shell_suspend_connections(bool * wifi_was_on, bool * bt_was_on) {
     *bt_was_on = bt_is_powered_cached;
     if (*wifi_was_on && !wifi_toggle_active) {
         wifi_toggle_active = true;
+        wifi_toggle_is_radio_suspend = true; /* transient power-save disable, not a user-requested one -- see its own comment */
         atomic_store_explicit(&wifi_toggle_done_flag, false, memory_order_relaxed);
         wifi_toggle_target_enabled = false;
         if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0)

@@ -6,6 +6,11 @@
 lv_obj_t * gui_shell_get_home_screen(void);
 lv_obj_t * gui_shell_get_dac_home_screen(void);
 
+/* Effective Wi-Fi enabled state: wifi_control_is_enabled(), except an
+ * in-flight toggle's target state wins while it's still settling (see the
+ * .c definition). Read-only -- exposes no way to drive the toggle itself. */
+bool gui_shell_wifi_effective_enabled(void);
+
 void gui_shell_update_quick_drawer_track(const char * title, const char * artist);
 void gui_shell_update_quick_drawer_favorite(bool is_favorite);
 void gui_shell_update_quick_drawer_play_state(bool is_playing);

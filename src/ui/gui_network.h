@@ -38,3 +38,9 @@ void start_usb_mode_switch(usb_mode_t target);
 
 bool gui_network_has_background_work(void);
 void gui_network_cancel_background_work(void);
+
+/* Called once Wi-Fi disable is authoritatively confirmed (gui_shell.c's
+ * poll_wifi_toggle()) -- stops AirPlay/DLNA/Remote Control/Import via Wi-Fi
+ * and clears their persisted enabled flags, since all four require Wi-Fi.
+ * Cheap no-op for whichever of them wasn't running. */
+void gui_network_handle_wifi_disabled(void);

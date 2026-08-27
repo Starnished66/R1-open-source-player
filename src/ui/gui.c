@@ -1627,20 +1627,21 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * the same shape of bug but no slow chip-init step, so it's cheap enough
      * to just call directly here rather than needing its own background
      * thread. */
-    if (current_settings.wifi_dac_mode_enabled) {
-        char name[64];
-        get_device_name(name, sizeof(name));
-        if (!airplay_control_start(name)) {
-            /* Startup is transactional (airplay_control_start()'s own
-             * comment) -- nothing was actually left running, so don't leave
-             * the setting claiming AirPlay is on. */
-            current_settings.wifi_dac_mode_enabled = false;
-            settings_save(&current_settings);
-            show_error_toast("AirPlay failed to start");
-        }
-    }
-    if (current_settings.dlna_renderer_enabled) dlna_control_start();
-    if (current_settings.remote_control_enabled) remote_control_start();
+    /* Network receiver/server modes are deliberately session-only even
+     * though their toggle fields live in the persisted settings structure:
+     * never restore AirPlay, DLNA, or Remote Control automatically after a
+     * process start.  They expose listeners and consume radio/CPU resources,
+     * so every new boot requires an explicit user enable while Wi-Fi is on
+     * (gui_network.c's wifi_feature_guard() enforces that runtime condition).
+     * Import via Wi-Fi already has no persisted enabled flag and never starts
+     * here.  Save once only when correcting an older session's ON values. */
+    bool network_modes_changed = current_settings.wifi_dac_mode_enabled ||
+                                 current_settings.dlna_renderer_enabled ||
+                                 current_settings.remote_control_enabled;
+    current_settings.wifi_dac_mode_enabled = false;
+    current_settings.dlna_renderer_enabled = false;
+    current_settings.remote_control_enabled = false;
+    if (network_modes_changed) settings_save(&current_settings);
 
     /* The quick drawer's own open/close drag tracking is polled from
      * update_timer_cb instead (poll_quick_drawer_drag()) -- see its comment

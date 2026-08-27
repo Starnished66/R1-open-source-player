@@ -2252,6 +2252,24 @@ static atomic_bool import_web_stop_done_flag = false;
  * underneath it. */
 static int import_web_stop_nav_slot = -1;
 
+/* True from a successful open_import_wifi_screen() until teardown (either
+ * the back button or gui_network_handle_wifi_disabled()) is INITIATED --
+ * i.e. "the web server is running or a stop for it hasn't been kicked off
+ * yet". Distinct from import_web_stop_active (which only covers the actual
+ * background-thread window): this is what lets gui_network_handle_wifi_
+ * disabled() tell "nothing to do" apart from "need to tear down", and
+ * flips false the instant teardown starts so a second caller (back button
+ * racing the wifi-disabled path, or vice versa) sees it as already handled
+ * rather than starting a second worker. */
+static bool import_web_active = false;
+
+/* Set by gui_network_handle_wifi_disabled() right before it kicks off the
+ * same async stop worker/busy-overlay import_wifi_back_cb() below uses --
+ * consumed once by poll_import_web_stop() so the "Update music database?"
+ * popup (import_rescan_popup) only ever appears after a real user-initiated
+ * exit, never merely because Wi-Fi disappeared out from under the screen. */
+static bool import_web_stop_suppress_rescan_popup = false;
+
 static void * import_web_stop_thread_func(void * arg) {
     (void) arg;
     import_web_stop();
@@ -2271,25 +2289,63 @@ void poll_import_web_stop(void) {
     gui_busy_hide(import_web_stop_token);
     import_web_stop_nav_slot = -1;
 
+    bool suppress_popup = import_web_stop_suppress_rescan_popup;
+    import_web_stop_suppress_rescan_popup = false;
+    if (suppress_popup) return;
+
     lv_obj_remove_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(import_rescan_popup, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(import_rescan_popup_backdrop);
     lv_obj_move_foreground(import_rescan_popup);
 }
 
-static void import_wifi_back_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
+/* Shared by import_wifi_back_cb() (user-initiated exit) and import_wifi_
+ * handle_wifi_disabled() (Wi-Fi-loss-initiated) below -- both need the exact
+ * same async stop-worker/busy-overlay sequence, just with a different
+ * suppress_popup value. import_web_active is deliberately only cleared
+ * AFTER pthread_create() actually succeeds, not optimistically beforehand:
+ * if thread launch fails, import_web_stop() never runs and thttpd/
+ * udp_server stay up, so leaving import_web_active true keeps that
+ * reflected -- a retry (another back-button tap, or a later Wi-Fi-disabled
+ * confirmation) still sees a stop as needed instead of wrongly treating
+ * this as already handled and silently leaving the servers running
+ * forever. */
+static void import_web_stop_start(bool suppress_popup) {
+    import_web_stop_suppress_rescan_popup = suppress_popup;
     import_web_stop_nav_slot = gui_navigation_get_depth() - 1; /* this screen's own slot, before pushing the busy screen on top of it */
     import_web_stop_token = gui_busy_show("Closing\nWeb Server...", "");
 
     atomic_store_explicit(&import_web_stop_done_flag, false, memory_order_relaxed);
     import_web_stop_active = true;
-        if (pthread_create(&import_web_stop_thread, NULL, import_web_stop_thread_func, NULL) != 0) {
+    if (pthread_create(&import_web_stop_thread, NULL, import_web_stop_thread_func, NULL) != 0) {
         import_web_stop_active = false;
+        import_web_stop_suppress_rescan_popup = false;
         gui_busy_hide(import_web_stop_token);
         show_error_toast("Thread launch failed");
+        return; /* import_web_active stays true -- nothing was actually stopped */
     }
+    import_web_active = false; /* only now that the stop is genuinely in flight */
+}
+
+static void import_wifi_back_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    import_web_stop_start(false); /* a real user exit always wants the rescan prompt */
+}
+
+/* Wi-Fi-disabled counterpart to import_wifi_back_cb() above -- triggered by
+ * gui_network_handle_wifi_disabled() instead of the user's own back-button
+ * tap, and skips the rescan popup on completion since nothing was actually
+ * imported this session. import_web_active being true guarantees import_
+ * wifi_screen is the currently active screen: it skips finalize_screen_
+ * navigation() (no swipe-to-back/swipe-up-home), so the explicit back
+ * button -- which only runs import_web_stop_start() once it actually
+ * launches the worker -- is the only way to leave it. Guarding on
+ * import_web_stop_active additionally means a teardown already in flight
+ * (from either caller) is left alone rather than racing a second worker
+ * against it. */
+static void import_wifi_handle_wifi_disabled(void) {
+    if (!import_web_active || import_web_stop_active) return; /* not running, or already tearing down */
+    import_web_stop_start(true);
 }
 
 static lv_obj_t * build_import_wifi_screen(void) {
@@ -2345,10 +2401,28 @@ static lv_obj_t * build_import_wifi_screen(void) {
     return scr;
 }
 
+/* ---- Shared Wi-Fi dependency guard for AirPlay/DLNA/Remote Control/Import
+ * via Wi-Fi -- all four require the Wi-Fi radio/interface to be enabled
+ * (NOT association with an access point; individual screens keep showing
+ * their own existing "connect first" state for that). Checks gui_shell.c's
+ * effective state (an in-flight disable counts as already off, see that
+ * function's own comment) rather than wifi_control_is_enabled() directly,
+ * shows the exact required toast, and returns false -- callers must bail
+ * out without navigating, touching a setting, or starting anything. Shared
+ * by both the tile taps below (screen not open yet) and each feature's own
+ * enable/toggle path (screen may already be open when Wi-Fi goes away). */
+static bool wifi_feature_guard(void) {
+    if (gui_shell_wifi_effective_enabled()) return true;
+    show_error_toast("Enable WiFi to access");
+    return false;
+}
+
 static void open_import_wifi_screen(void) {
+    if (!wifi_feature_guard()) return;
     import_web_start();
     populate_import_wifi_screen();
     nav_push(import_wifi_screen);
+    import_web_active = true;
 }
 
 static void import_wifi_tile_cb(lv_event_t * e) {
@@ -2398,7 +2472,19 @@ void get_device_name(char * out, size_t out_size) {
 
 static void airplay_toggle_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    current_settings.wifi_dac_mode_enabled = !current_settings.wifi_dac_mode_enabled;
+    bool turning_on = !current_settings.wifi_dac_mode_enabled;
+    /* Guard the enable path even though the tile itself is already guarded
+     * (airplay_tile_cb() below) -- this screen can already be open when
+     * Wi-Fi goes away, so a stale toggle tap must still be rejected here.
+     * Checked before touching the setting at all, so a rejected enable
+     * never even briefly persists as on. Turning OFF is always allowed,
+     * Wi-Fi state notwithstanding -- an already-enabled feature must still
+     * be toggleable off. */
+    if (turning_on && !wifi_feature_guard()) {
+        populate_airplay_screen(); /* nothing changed, but keeps the toggle row's own drawn state honest */
+        return;
+    }
+    current_settings.wifi_dac_mode_enabled = turning_on;
     settings_save(&current_settings);
 
     if (current_settings.wifi_dac_mode_enabled) {
@@ -2454,6 +2540,7 @@ static void open_airplay_screen(void) {
 
 static void airplay_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!wifi_feature_guard()) return;
     open_airplay_screen();
 }
 
@@ -2674,7 +2761,15 @@ static void populate_dlna_screen(void) {
 
 static void dlna_toggle_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    current_settings.dlna_renderer_enabled = !current_settings.dlna_renderer_enabled;
+    bool turning_on = !current_settings.dlna_renderer_enabled;
+    /* Same defensive enable guard as airplay_toggle_cb() -- this screen can
+     * already be open when Wi-Fi is disabled elsewhere, so the tile guard
+     * alone (dlna_tile_cb() below) isn't sufficient. */
+    if (turning_on && !wifi_feature_guard()) {
+        populate_dlna_screen();
+        return;
+    }
+    current_settings.dlna_renderer_enabled = turning_on;
     settings_save(&current_settings);
 
     if (current_settings.dlna_renderer_enabled) {
@@ -2767,7 +2862,14 @@ static void remote_control_refresh_address(void) {
 
 static void remote_control_toggle_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    current_settings.remote_control_enabled = !current_settings.remote_control_enabled;
+    bool turning_on = !current_settings.remote_control_enabled;
+    /* Same defensive enable guard as airplay_toggle_cb()/dlna_toggle_cb() --
+     * this screen can already be open when Wi-Fi is disabled elsewhere. */
+    if (turning_on && !wifi_feature_guard()) {
+        remote_control_refresh_address(); /* nothing changed, but keeps the address text/QR state honest */
+        return;
+    }
+    current_settings.remote_control_enabled = turning_on;
     settings_save(&current_settings);
 
     lv_image_set_src(remote_control_toggle_img,
@@ -2913,12 +3015,56 @@ static void open_remote_control_screen(void) {
 
 static void remote_control_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!wifi_feature_guard()) return;
     open_remote_control_screen();
 }
 
 static void dlna_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!wifi_feature_guard()) return;
     open_dlna_screen();
+}
+
+/* Centralized Wi-Fi-disabled cleanup for all four Wi-Fi-dependent features
+ * -- called by gui_shell.c's poll_wifi_toggle() only once a Wi-Fi disable is
+ * authoritatively confirmed (see that call site's own comment). Stops
+ * whichever of AirPlay/DLNA/Remote Control/Import via Wi-Fi is actually
+ * running and corrects their persisted settings, refreshing any of their
+ * screens/toggles already built so nothing shows stale "on" state. A single
+ * settings_save() at the end covers every flag this pass touched, rather
+ * than one write per feature. */
+void gui_network_handle_wifi_disabled(void) {
+    bool settings_changed = false;
+
+    if (current_settings.wifi_dac_mode_enabled) {
+        airplay_control_stop();
+        current_settings.wifi_dac_mode_enabled = false;
+        settings_changed = true;
+        populate_airplay_screen();
+    }
+
+    if (current_settings.dlna_renderer_enabled) {
+        dlna_control_stop();
+        current_settings.dlna_renderer_enabled = false;
+        settings_changed = true;
+        populate_dlna_screen();
+    }
+
+    if (current_settings.remote_control_enabled) {
+        remote_control_stop();
+        current_settings.remote_control_enabled = false;
+        settings_changed = true;
+        lv_image_set_src(remote_control_toggle_img, asset_path("settings/off.png"));
+        lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
+        remote_control_refresh_address();
+    }
+
+    /* Import via Wi-Fi has no persisted enabled flag (session-only, started
+     * only when its screen opens) -- import_wifi_handle_wifi_disabled() is
+     * a cheap no-op whenever it isn't currently running. */
+    import_wifi_handle_wifi_disabled();
+
+    if (settings_changed) settings_save(&current_settings);
 }
 
 static lv_obj_t * build_wireless_screen(void) {

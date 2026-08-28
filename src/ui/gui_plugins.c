@@ -74,7 +74,11 @@ void configure_scrolling_row_label(lv_obj_t * label, int32_t width) {
     if (width < 40) width = 40;
     lv_obj_set_width(label, width);
     const lv_font_t * font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
-    lv_obj_set_height(label, font ? lv_font_get_line_height(font) : 24);
+    /* Not a bare lv_obj_set_height(label, line_height) -- see that
+     * function's own comment (screen_builders.c) for why the font's line
+     * height alone still clipped descenders and misfired
+     * LV_LABEL_LONG_SCROLL_CIRCULAR's vertical scroll below. */
+    row_label_apply_bounded_height(label, font);
     row_label_enable_marquee(label);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
 }

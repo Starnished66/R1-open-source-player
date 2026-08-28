@@ -27,6 +27,7 @@ lv_style_t list_row_pressed_style;
 lv_style_t icon_press_style;
 static lv_style_t row_marquee_style;
 static lv_anim_t row_marquee_anim;
+#define ICON_GRID_ICON_LABEL_GAP 4
 
 /* Theming: three shared, mutable-in-place bg_color styles, one per
  * "background category" the app has -- every screen root
@@ -154,6 +155,97 @@ void screen_builders_init_list_row_style(void) {
     lv_style_set_text_color(&style_theme_text_muted, lv_color_make(160, 160, 160));
 }
 
+/* Real-device bug report: pill-row/plugin-scrolling-row labels were sized
+ * to exactly lv_font_get_line_height(label_font) -- LVGL's own contract for
+ * that value is "the real line height where any text fits" (lv_font.h), but
+ * at the BlindMF tier (and, less visibly, the smaller tiers too) p/q/g/y
+ * descenders still clipped. lv_tiny_ttf.c computes line_height as
+ * scale*(ascent-descent+line_gap); with line_gap frequently 0, that leaves
+ * zero slack to absorb FreeType rasterization rounding at the target pixel
+ * size, and LV_LABEL_LONG_SCROLL_CIRCULAR reads that overflow as a reason
+ * to start its *vertical* scroll animation, not just its horizontal
+ * marquee -- exactly the "labels scroll upward on first open" symptom.
+ *
+ * Fix: give the label's own box a small proportional margin below the
+ * nominal line, and push the text down by exactly half of it (pad_top) so
+ * the visible glyph position lands at the *same* pixel it already sat at
+ * before this fix (this box is still aligned LV_ALIGN_LEFT_MID within its
+ * row, so growing it symmetrically about that unchanged point keeps the
+ * text centered in the row exactly as before) while the other half becomes
+ * genuine new clearance below the text for descender overshoot. A flat,
+ * bounded margin (not a big fixed height) is deliberate -- this is only
+ * ever called for bounded scrolling row labels (never titles or compact-
+ * list rows, which either auto-size or already reserve generous fixed
+ * height), so it can't distort any other layout. */
+void row_label_apply_bounded_height(lv_obj_t * label, const lv_font_t * font) {
+    int32_t line_h = font ? lv_font_get_line_height(font) : 24;
+    int32_t descender_margin = line_h / 8;
+    if (descender_margin < 4) descender_margin = 4;
+    lv_obj_set_height(label, line_h + descender_margin * 2);
+    lv_obj_set_style_pad_top(label, descender_margin, 0);
+    lv_obj_add_flag(label, LV_OBJ_FLAG_USER_3);
+}
+
+static void refresh_icon_caption_geometry_recursive(lv_obj_t * obj) {
+    /* Re-applies row_label_apply_bounded_height() using this label's
+     * current text_font -- after fallback_font_apply_size_tier()/
+     * fallback_font_apply_custom() swap the stable app_font_* descriptors
+     * in place, a label that already has one of them assigned as its
+     * text_font picks up the new glyph metrics automatically the next time
+     * it draws, but its own explicit height/pad_top (set once at
+     * construction) does not move on its own. */
+    if (lv_obj_check_type(obj, &lv_label_class) && lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_3)) {
+        row_label_apply_bounded_height(obj, lv_obj_get_style_text_font(obj, LV_PART_MAIN));
+    }
+
+    uint32_t child_count = lv_obj_get_child_count(obj);
+    if (child_count >= 2 && lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_1)) {
+        lv_obj_t * img_wrap = lv_obj_get_child(obj, 0);
+        lv_obj_t * label = lv_obj_get_child(obj, 1);
+        if (lv_obj_check_type(label, &lv_label_class) &&
+            lv_obj_get_child_count(img_wrap) == 1 &&
+            lv_obj_check_type(lv_obj_get_child(img_wrap, 0), &lv_image_class)) {
+            int32_t icon_h = lv_obj_get_height(img_wrap);
+            bool label_inside_icon = lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_2);
+            int32_t available_h = lv_obj_get_content_height(obj);
+            if (label_inside_icon) {
+                int32_t top = (available_h - icon_h) / 2;
+                if (top < 0) top = 0;
+                int32_t label_cy = top + (int32_t)(((int64_t)icon_h * 83) / 100);
+                lv_obj_align(img_wrap, LV_ALIGN_TOP_MID, 0, top);
+                lv_obj_align(label, LV_ALIGN_TOP_MID, 0,
+                             label_cy - lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_BODY)) / 2);
+            } else {
+                int32_t line_h = lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_BODY));
+                int32_t label_h = line_h * 2;
+                int32_t content_h = icon_h + ICON_GRID_ICON_LABEL_GAP + label_h;
+                int32_t top = (available_h - content_h) / 2;
+                if (top < 0) top = 0;
+                lv_obj_set_height(label, label_h);
+                lv_obj_align(img_wrap, LV_ALIGN_TOP_MID, 0, top);
+                lv_obj_align(label, LV_ALIGN_TOP_MID, 0, top + icon_h + ICON_GRID_ICON_LABEL_GAP);
+            }
+        }
+    }
+
+    child_count = lv_obj_get_child_count(obj);
+    for (uint32_t i = 0; i < child_count; i++)
+        refresh_icon_caption_geometry_recursive(lv_obj_get_child(obj, i));
+}
+
+void screen_builders_refresh_font_geometry(lv_obj_t * root) {
+    if (!root) {
+        lv_style_set_pad_top(&list_row_style,
+                             (LIST_ROW_HEIGHT - lv_font_get_line_height(&LIST_ROW_FONT)) / 2);
+        lv_style_set_text_font(&list_row_style, &LIST_ROW_FONT);
+        lv_obj_report_style_change(&list_row_style);
+        return;
+    }
+    lv_obj_update_layout(root);
+    refresh_icon_caption_geometry_recursive(root);
+    lv_obj_update_layout(root);
+}
+
 void row_label_enable_marquee(lv_obj_t * label) {
     lv_obj_add_style(label, &row_marquee_style, LV_PART_MAIN);
     lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
@@ -190,7 +282,6 @@ void row_label_enable_marquee(lv_obj_t * label) {
  * its own comment) needs the exact same numbers used by the tile's own
  * pad_all style. */
 #define ICON_GRID_TILE_PAD 8
-#define ICON_GRID_ICON_LABEL_GAP 4
 
 /* STATUS_BAR_CLEARANCE / TITLE_ROW_HEIGHT now live in screen_builders.h --
  * gui.c's hand-built screens (player, accent color, EQ, ...) need them too. */
@@ -371,6 +462,11 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
         int row = i / col_count;
 
         lv_obj_t * tile = lv_obj_create(grid);
+        /* USER_1/USER_2 are zero-allocation markers used by the one-shot
+         * font geometry refresh; unlike a per-tile context they add no
+         * steady-state heap or callback overhead. */
+        lv_obj_add_flag(tile, LV_OBJ_FLAG_USER_1);
+        if (label_inside_icon) lv_obj_add_flag(tile, LV_OBJ_FLAG_USER_2);
         lv_obj_set_grid_cell(tile, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
         /* Real LVGL grid margin, not a bigger ICON_GRID_TILE_PAD -- STRETCH
          * alignment already subtracts margin from the tile's own computed
@@ -805,11 +901,13 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         int32_t accessory_space = item->accessory == PILL_ACCESSORY_TOGGLE ? 112
                                   : item->accessory == PILL_ACCESSORY_CHEVRON ? 60 : 24;
         int32_t label_width = width - label_left - accessory_space;
-        if (label_width < 40) label_width = 40;
-        lv_obj_set_width(label, label_width);
-        const lv_font_t * label_font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
-        lv_obj_set_height(label, label_font ? lv_font_get_line_height(label_font) : 24);
-        row_label_enable_marquee(label);
+        /* configure_scrolling_row_label() (gui_plugins.c) is the one shared
+         * construction path for every bounded scrolling row label, native or
+         * plugin -- see row_label_apply_bounded_height()'s own comment for
+         * why the label's height/pad_top can't just be lv_font_get_line_
+         * height() directly. It also clamps label_width itself and defaults
+         * text_align to LEFT, overridden below for center/right rows. */
+        configure_scrolling_row_label(label, label_width);
         /* NULL/"left" (every native row) -> unchanged default. "center"/
          * "right" only shift where the text sits inside its own already-
          * reserved box (label_width above) -- pill_row_apply_icon()'s icon

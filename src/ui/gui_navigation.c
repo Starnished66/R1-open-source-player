@@ -270,6 +270,30 @@ void register_static_snapshot(int index, lv_obj_t * scr) {
     static_snapshot_buf[index] = snapshot_screen_base(scr);
 }
 
+static void player_transition_discard_cache(void);
+
+static void rebuild_font_snapshots_async_cb(void * unused) {
+    (void) unused;
+    for (int i = 0; i < STATIC_SNAPSHOT_SCREEN_COUNT; i++) {
+        if (!static_snapshot_screen[i]) continue;
+        screen_builders_refresh_font_geometry(static_snapshot_screen[i]);
+        static_snapshot_buf[i] = snapshot_screen_base(static_snapshot_screen[i]);
+    }
+}
+
+void gui_navigation_invalidate_font_snapshots(void) {
+    /* Destroy first: until the next settled LVGL pass rebuilds these, every
+     * transition falls back to a fresh render and can never expose an old-
+     * font bitmap.  The rebuild is one-shot, restoring the normal cached
+     * transition cost before the user can navigate after the black mask. */
+    for (int i = 0; i < STATIC_SNAPSHOT_SCREEN_COUNT; i++) {
+        if (static_snapshot_buf[i]) lv_draw_buf_destroy(static_snapshot_buf[i]);
+        static_snapshot_buf[i] = NULL;
+    }
+    player_transition_discard_cache();
+    lv_async_call(rebuild_font_snapshots_async_cb, NULL);
+}
+
 /* Player-screen transition-frame cache -- TRANSITION_PERFORMANCE_PLAN.md
  * Phase 2. gui_player_get_screen() is dynamic (track metadata/art/play-state, so it
  * can't just be baked in once like the STATIC_SNAPSHOT_SCREEN_COUNT screens
@@ -300,6 +324,13 @@ void register_static_snapshot(int index, lv_obj_t * scr) {
  * time it's used. */
 static lv_draw_buf_t * player_transition_cache_buf = NULL;
 static bool player_transition_cache_dirty = true;
+
+static void player_transition_discard_cache(void) {
+    if (player_transition_cache_buf) lv_draw_buf_destroy(player_transition_cache_buf);
+    player_transition_cache_buf = NULL;
+    player_transition_cache_dirty = true;
+    if (gui_player_get_screen()) lv_async_call(player_transition_cache_async_cb, NULL);
+}
 
 bool player_transition_cache_is_dirty(void) { return player_transition_cache_dirty; }
 

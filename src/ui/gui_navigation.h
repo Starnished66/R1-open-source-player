@@ -48,5 +48,6 @@ void slide_transition_cancel(slide_transition_ctx_t ** pctx);
 void player_transition_cache_async_cb(void * unused);
 void player_transition_mark_dirty(void);
 void register_static_snapshot(int index, lv_obj_t * scr);
+void gui_navigation_invalidate_font_snapshots(void);
 
 void full_redraw_async_cb(void * unused);

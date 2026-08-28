@@ -5,12 +5,8 @@
 #include "fallback_font.h"
 #include <stdbool.h>
 
-/* Settings -> Font Size tier pointers -- see gui.c's own top-of-file
- * comment (search "ui_size_16") for the full story. Defined in gui.c,
- * set once by apply_font_size_tier() before any screen (including these
- * builders) runs. Only for fixed English UI chrome that never shows
- * metadata-derived text -- see fallback_font.h's app_font_16/22/28 for
- * the other category. */
+/* Settings -> Font Size uses the stable fallback-capable app_font_* handles
+ * declared above, for fixed chrome and metadata alike. */
 
 /* Two screen layouts repeat across the real stock UI: an icon grid (Home
  * launcher, Music/Wireless/Stream Media submenus) and a scrollable list of
@@ -94,6 +90,19 @@ extern lv_style_t icon_press_style;
 
 /* Enables the shared constant-speed row marquee with a 2-second pause. */
 void row_label_enable_marquee(lv_obj_t * label);
+/* Sizes a bounded scrolling row label's own box tall enough for real glyph
+ * extents (descenders on p/q/g/y, etc.) instead of the font's bare
+ * lv_font_get_line_height() -- see this function's own definition
+ * (screen_builders.c) for why line_height alone isn't always enough and why
+ * this doesn't shift the label's existing on-screen vertical position.
+ * Tags the label (LV_OBJ_FLAG_USER_3) so screen_builders_refresh_font_
+ * geometry()'s one-shot walk can find and recompute this after a live font-
+ * tier change swaps the stable app_font_* descriptors in place. Called from
+ * configure_scrolling_row_label() (gui_plugins.c) -- the single shared
+ * construction path for every native pill row and every plugin/dynamic
+ * scrolling row -- never call this directly from a new call site instead of
+ * going through that. */
+void row_label_apply_bounded_height(lv_obj_t * label, const lv_font_t * font);
 /* Theming: shared, mutable bg_color styles for the app's other two
  * "background categories" -- attach with lv_obj_add_style(x, &style_theme_screen_bg, 0)
  * on every screen root, or &style_theme_card_bg on every popup/EQ-card/
@@ -199,7 +208,7 @@ typedef struct {
      * build_pill_list_screen() caller leaves these NULL/0 (a plain compound
      * literal without designators for trailing fields already defaults them
      * that way), which reproduces today's exact rendering: PNG pill
-     * background, 124px height, ui_size_20 label font. Only a
+     * background, 124px height, app_font_20 label font. Only a
      * plugin-appended row (gui.c's build_settings_*_screen() plugin-row
      * loops) ever sets these. ---- */
 
@@ -219,7 +228,7 @@ typedef struct {
      * plugin-safe range below and keep the row centered in its list. */
     int32_t row_width;
 
-    /* NULL = this call site's own default (native rows: ui_size_20,
+    /* NULL = this call site's own default (native rows: app_font_20,
      * unchanged; plugin rows: gui.c always supplies a non-NULL default
      * before this reaches here -- see pill_row_resolve_text_size()'s own
      * comment). "small"/"medium"/"large" -> app_font_16/22/28
@@ -298,14 +307,14 @@ void pill_row_apply_icon(lv_obj_t * row, lv_obj_t * label, const char * icon_pat
                           lv_align_t align, int32_t x, int32_t y);
 
 /* Resolves a plugin's chosen text-size tier to the correspondingly-sized
- * fallback-capable font -- NULL returns ui_size_20 (build_pill_list_screen()'s
+ * fallback-capable font -- NULL returns app_font_20 (build_pill_list_screen()'s
  * own native-row default; every plugin call site is responsible for
  * supplying its OWN non-NULL default -- e.g. "medium" -- before calling
  * this, precisely so NULL unambiguously means "a genuine native row" here,
  * never "a plugin row that happened not to set text_size"). "small"/
  * "medium"/"large" -> &app_font_16/22/28 (fallback_font.h). Any other
  * string (shouldn't happen -- plugin_manager.c validates at the Lua
- * boundary) falls back to ui_size_20 rather than dereferencing garbage. */
+ * boundary) falls back to app_font_20 rather than dereferencing garbage. */
 const lv_font_t * pill_row_resolve_text_size(const char * text_size);
 
 /* Titled screen: real back-arrow button and a vertically scrollable list of
@@ -465,6 +474,14 @@ typedef void (*compact_list_row_decorator_cb_t)(lv_obj_t * list, lv_obj_t * row,
 void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx);
 void compact_list_refresh_visible(lv_obj_t * list);
 void compact_list_refresh_all(void);
+
+/* Recomputes the shared list padding, any icon-caption coordinates, and
+ * every bounded scrolling row label's box height (see row_label_apply_
+ * bounded_height()'s own comment) under root after the stable app_font_*
+ * descriptors change metrics. A tier-change caller with more than one
+ * still-live screen to fix (e.g. the whole current navigation stack) calls
+ * this once per screen root -- it does not walk beyond the root passed in. */
+void screen_builders_refresh_font_geometry(lv_obj_t * root);
 /* Re-runs label/accessory decoration for one currently visible logical row.
  * A row that has already scrolled out is intentionally ignored. */
 void compact_list_refresh_item(lv_obj_t * list, int logical_index);

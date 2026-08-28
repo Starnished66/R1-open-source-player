@@ -302,16 +302,9 @@ typedef struct {
      * for the NUL. */
     char hostname[64];
 
-    /* UI text size (Settings -> Font Size): 0 = Small (the original,
-     * unchanged default sizing), 1 = Medium, 2 = "BlindMF" (largest --
-     * literal feature name, requested verbatim). Applied once at startup,
-     * before any screen is built (see gui.c's apply_font_size_tier(),
-     * called at the very top of gui_init()) -- every text label in this
-     * app sets its font via a plain per-object LVGL style
-     * (lv_obj_set_style_text_font()), not a shared style object LVGL could
-     * bulk-refresh, so there's no cheap way to re-style ~90 call sites'
-     * worth of already-built widgets live. Changing this setting takes
-     * effect on the next launch, same as usb_mode above. */
+    /* UI text size (Settings -> Display -> Font Size): 0 = Small, 1 =
+     * Medium, 2 = "BlindMF" (largest; requested name).  Applied at startup
+     * and transactionally live through fallback_font_apply_size_tier(). */
     int font_size_tier;
 
     /* Settings -> Lyrics Text Size: a SEPARATE size control just for the
@@ -325,8 +318,8 @@ typedef struct {
      * see fallback_font.h's app_font_lyrics) -- there's no "Small" option,
      * since a small lyrics view was the exact complaint that prompted this
      * separate control to exist. Defaults to 2 (Large) rather than 1, for
-     * the same readability-first reasoning. Same "next launch, not live"
-     * timing as font_size_tier -- see that field's own comment for why. */
+     * the same readability-first reasoning. Unlike the general live Font
+     * Size setting, this independent control still applies after reboot. */
     int lyrics_font_size_tier;
 
     /* Screen brightness, logical 0-100 (same scale as backlight.h's
@@ -336,7 +329,7 @@ typedef struct {
      * whatever raw value the kernel/bootloader itself defaults the backlight
      * to, not whatever the user had it set to before powering off. Applied
      * once in gui_init(), before any screen is built (same timing as
-     * apply_font_size_tier()), and re-persisted on every slider release
+     * fallback_font_init_early()), and re-persisted on every slider release
      * (quick_drawer_brightness_changed_cb() in gui.c) the same way volume
      * is. Default 80 matches backlight.c's own restore_percent fallback
      * default, for consistency. */

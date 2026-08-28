@@ -11,11 +11,6 @@ static lv_style_t style_muted_text;
 lv_style_t * gui_theme_accent_style(void) { return &style_accent; }
 lv_style_t * gui_theme_muted_text_style(void) { return &style_muted_text; }
 
-static const lv_font_t * ui_size_16 = &lv_font_montserrat_16;
-static const lv_font_t * ui_size_20 = &lv_font_montserrat_20;
-static const lv_font_t * ui_size_22 = &lv_font_montserrat_22;
-static const lv_font_t * ui_size_28 = &lv_font_montserrat_28;
-
 const uint32_t accent_palette[ACCENT_PALETTE_COUNT] = {
     0x2196F3, /* blue (default) */
     0x4CAF50, /* green */
@@ -40,29 +35,6 @@ static lv_obj_t * accent_swatches[ACCENT_PALETTE_COUNT];
 extern player_settings_t current_settings;
 extern void settings_save(const player_settings_t * s);
 extern void player_transition_mark_dirty(void);
-
-void apply_font_size_tier(int tier) {
-    switch (tier) {
-        case 1: /* Medium */
-            ui_size_16 = &lv_font_montserrat_20;
-            ui_size_20 = &lv_font_montserrat_24;
-            ui_size_22 = &lv_font_montserrat_26;
-            ui_size_28 = &lv_font_montserrat_32;
-            break;
-        case 2: /* Large */
-            ui_size_16 = &lv_font_montserrat_24;
-            ui_size_20 = &lv_font_montserrat_30;
-            ui_size_22 = &lv_font_montserrat_34;
-            ui_size_28 = &lv_font_montserrat_40;
-            break;
-        default: /* Small (0) */
-            ui_size_16 = &lv_font_montserrat_16;
-            ui_size_20 = &lv_font_montserrat_20;
-            ui_size_22 = &lv_font_montserrat_22;
-            ui_size_28 = &lv_font_montserrat_28;
-            break;
-    }
-}
 
 const lv_font_t * gui_theme_font(gui_font_role_t role) {
     switch (role) {
@@ -107,8 +79,6 @@ void accent_swatch_event_cb(lv_event_t * e) {
 }
 
 void gui_theme_init(void) {
-    apply_font_size_tier(current_settings.font_size_tier);
-
     lv_style_init(&style_accent);
     lv_style_set_bg_color(&style_accent, accent_lv_color());
     lv_style_set_text_color(&style_accent, accent_lv_color());

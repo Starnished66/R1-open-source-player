@@ -18,7 +18,6 @@ void poll_bt_action(void);
 void poll_bt_dac(void);
 void poll_usb_dac_overlay(void);
 void poll_import_web(void);
-void show_font_size_reboot_popup(void);
 void get_device_name(char * out, size_t out_size);
 
 void populate_bt_dac_screen(void);

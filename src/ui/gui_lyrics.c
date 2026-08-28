@@ -42,7 +42,7 @@ extern lv_font_t app_font_lyrics;
 extern void enable_gesture_bubble_recursive(lv_obj_t * parent);
 extern lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * text);
 extern lv_color_t accent_lv_color(void);
-extern void show_font_size_reboot_popup(void);
+extern void show_lyrics_font_size_reboot_popup(void);
 extern lv_obj_t * build_subsonic_list_screen(const char * title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
 
 
@@ -856,7 +856,7 @@ static void lyrics_font_size_option_row_cb(lv_event_t * e) {
     current_settings.lyrics_font_size_tier = lyrics_font_size_options[index].tier;
     settings_save(&current_settings);
     populate_lyrics_font_size_screen();
-    show_font_size_reboot_popup(); /* same reboot-to-apply popup as Font Size itself -- generic enough text, no need for a second copy */
+    show_lyrics_font_size_reboot_popup();
 }
 static lv_obj_t * build_lyrics_font_size_screen(void) {
     lv_obj_t * title_label; /* unused after build -- title never changes */

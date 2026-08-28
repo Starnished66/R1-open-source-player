@@ -25,11 +25,19 @@ void fallback_font_schedule_deferred_load(void);
 /* Forces immediate synchronous load/build of font stack (used in tests / live switch) */
 void fallback_font_load_now(void);
 
+/* Transactionally rebuilds only the four general-UI font handles for a
+ * Settings -> Display -> Font Size tier.  The active custom face and, once
+ * loaded, every multilingual fallback are required to succeed before the
+ * handles are committed.  app_font_lyrics is deliberately left untouched. */
+bool fallback_font_apply_size_tier(int tier);
+
 /* Discovers custom TTF files under <SD>/Fonts */
 int fallback_font_discover_custom(char out_names[][64], int max_count);
 
-/* Stages, validates and applies a custom Latin TTF font (or "" / "Default" for built-in Montserrat).
- * Transactional: returns true on success; on failure returns false and preserves previous working font stack. */
+/* Stages, validates and applies a custom Latin TTF font (or "" / "Default"
+ * for built-in Montserrat). Transactional: returns true on success; on
+ * failure returns false and preserves the previous working font stack.
+ * The caller owns the subsequent one-shot LVGL layout/invalidation pass. */
 bool fallback_font_apply_custom(const char * custom_filename);
 
 /* Called when an SD card mount is detected to retry staging/applying configured custom font */

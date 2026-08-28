@@ -146,45 +146,10 @@ uint64_t ui_perf_now_us(void) {
 /* Music browsing benefits from roomier touch targets and artwork, while
  * Settings and the rest of the app retain the denser shared 84px rows. */
 
-/* ---- UI text size (Settings -> Font Size) ----
- *
- * Real-device feedback: the app's fixed text size (unchanged since the UI
- * rebuild) reads fine on some eyes, too small on others. Every label in
- * this codebase sets its own font via a plain per-object LVGL style
- * (lv_obj_set_style_text_font()) rather than a shared lv_style_t object
- * LVGL could bulk-refresh in place (the same trick app-wide accent color
- * uses, see lv_obj_report_style_change()'s own comment elsewhere in this
- * file) -- so these four pointers stand in for the four literal
- * lv_font_montserrat_NN sizes (16/20/22/28) this app used at every call
- * site that does NOT need fallback_font.h's non-Latin fallback chaining
- * (fixed English UI chrome -- button captions, section headers, settings
- * rows -- that will never show metadata-derived text). Deliberately named
- * ui_size_* rather than app_font_* -- fallback_font.h already declares
- * real (non-const) app_font_16/22/28 instances for the OTHER category
- * (metadata-derived text: song title/artist, drill-down screen titles,
- * ...), and those are handled separately, by resizing fallback_font.c's
- * own copies in place (see its own comment) rather than through these
- * pointers -- reusing that name here would silently collide.
- *
- * Set once by apply_font_size_tier(), called at the very top of
- * gui_init() before any screen is built. Changing the setting afterward
- * only takes effect on the next launch -- see settings.h's own comment on
- * font_size_tier for why a live re-style isn't practical here.
- *
- * Metadata-derived text (song title/artist, ...) is NOT covered by this
- * function -- that goes through fallback_font.h's app_font_16/22/28
- * instead, resized by its own fallback_font_init_early(tier) call
- * (gui_init() passes current_settings.font_size_tier there directly), so
- * both systems move together without this function reaching into that
- * one.
- *
- * Not static -- screen_builders.c's own handful of fixed-chrome literal
- * font sites (build_title(), pill-list row labels/chevron) need these
- * too, same cross-translation-unit pattern fallback_font.h's app_font_16/
- * 22/28 already use. Declared extern in screen_builders.h rather than a
- * new header of their own, since that's the one file already shared by
- * every screen-building call site on both sides. */
-/* ui_size_* and apply_font_size_tier moved to gui_theme.c */
+/* General UI text uses fallback_font.h's stable app_font_* handles.  Their
+ * descriptors are rebuilt transactionally for live Font Size changes, so
+ * every existing LVGL style keeps the same pointer while its metrics and
+ * multilingual chain change together. */
 
 lv_obj_t * stream_media_screen;
 

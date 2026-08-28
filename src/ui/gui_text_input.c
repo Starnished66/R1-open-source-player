@@ -642,10 +642,9 @@ void t9_keypad_attach(lv_obj_t * target_screen, lv_obj_t * textarea_parent, int3
 /* text_entry_textarea's own resting height -- derived from gui_theme_font(GUI_FONT_ROLE_BODY)'s
  * real line height (bigger at the Medium/BlindMF font tiers) plus fixed
  * vertical padding, rather than a flat pixel value sized for the smallest
- * tier only. Recomputed on demand (not cached) since gui_theme_font(GUI_FONT_ROLE_BODY) is itself a
- * mutable pointer apply_font_size_tier() only ever reassigns once at boot,
- * but reading it fresh here costs nothing and avoids any ordering
- * assumption about when that reassignment has happened. Shared by both
+ * tier only. Recomputed on demand (not cached) because the stable
+ * app_font_* descriptor can change metrics during a live tier switch;
+ * reading it fresh costs nothing. Shared by both
  * text_entry_textarea's own creation site and t9_keypad_release()'s reset
  * below -- real-device bug report: text started scaling correctly but the
  * field's own box didn't, because the reset below still had the old flat
@@ -708,8 +707,8 @@ static lv_obj_t * build_text_entry_screen(void) {
     /* Real-device bug report: this field's typed text stayed at LVGL's own
      * unscaled default font regardless of Settings -> Font Size -- unlike
      * every other body-text label in the app, nothing here ever set an
-     * explicit ui_size_* font, so it never participated in apply_font_size_
-     * tier()'s own scaling at all. gui_theme_font(GUI_FONT_ROLE_BODY) matches most other body text;
+     * explicit tier-aware font. gui_theme_font(GUI_FONT_ROLE_BODY) matches
+     * most other body text and follows live general font-size changes;
      * see text_entry_field_height()'s own comment for the field's height. */
     lv_obj_set_style_text_font(text_entry_textarea, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_set_size(text_entry_textarea, lv_pct(78), text_entry_field_height());

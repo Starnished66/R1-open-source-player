@@ -6,7 +6,9 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include "plugin_manager.h"
 #include "import_web.h"
 #include "gui_settings.h"
+#include "gui_navigation.h"
 #include "screen_builders.h"
+#include "fallback_font.h"
 #include "settings.h"
 #include "assets.h"
 #include "device_config.h"
@@ -1554,13 +1556,9 @@ void play_pause_button_mode_settings_row_cb(lv_event_t * e) {
     open_play_pause_button_mode_screen();
 }
 
-/* ---- Font size selection screen (Settings > Font Size) -- same
- * accent-colored-border single-select shape as the Bluetooth codec screen
- * just above, but selecting a row only saves the setting and shows a
- * toast rather than applying anything live -- see gui.c's own
- * apply_font_size_tier() and fallback_font.h's fallback_font_init_early()
- * for why an already-built screen can't be restyled in place, and needs
- * an app restart to pick up the new tier instead. ---- */
+/* ---- Font size selection screen (Settings > Font Size).  A changed tier
+ * is applied behind one rendered black frame, then navigation is reset
+ * directly to Home without disturbing playback or background services. ---- */
 
 typedef struct {
     int tier; /* matches player_settings_t.font_size_tier */
@@ -1588,22 +1586,78 @@ static void populate_font_size_screen(void) {
     }
 }
 
-/* Defined later, alongside build_eq_reset_popup()/build_factory_reset_popup()
- * (same hand-built top-layer confirmation-popup shape) -- forward-declared
- * here since font_size_option_row_cb() needs it well before that point in
- * the file. */
+static void font_size_apply_timer_cb(lv_timer_t * timer) {
+    lv_obj_t * mask = (lv_obj_t *)lv_timer_get_user_data(timer);
+    int target = (int)(intptr_t)lv_obj_get_user_data(mask) - 1;
+    lv_timer_delete(timer);
+    if (!fallback_font_apply_size_tier(target)) {
+        lv_obj_delete(mask);
+        show_error_toast("Could not apply font size");
+        return;
+    }
 
-/* show_font_size_reboot_popup is in gui_settings.c */
+    /* Stable font addresses mean existing object styles now see the new
+     * descriptors.  Notify LVGL once, refresh only cached pixel geometry,
+     * and discard every bitmap captured with the old metrics.  All of this
+     * is one-shot work inside the mask; no timer or extra allocation remains
+     * afterward. */
+    gui_navigation_invalidate_font_snapshots();
+    current_settings.font_size_tier = target;
+    settings_save(&current_settings);
+    lv_obj_report_style_change(NULL);
+    screen_builders_refresh_font_geometry(NULL);
+    gui_settings_refresh_font_geometry();
+    compact_list_refresh_all();
+    quick_drawer_mark_snapshot_dirty();
+    /* Every screen still on the nav stack right now (Home -> Settings ->
+     * ... -> this Font Size screen) was built under the tier that was just
+     * replaced -- its bounded scrolling row labels (tagged by
+     * row_label_apply_bounded_height()) won't get rebuilt just because
+     * nav_reset_to_home() is about to run, since none of them go through
+     * lv_obj_clean()+repopulate on a plain pop. Bounded by
+     * gui_navigation_get_depth() (<=NAV_STACK_MAX), one-shot, no
+     * allocation. */
+    int font_geom_nav_depth = gui_navigation_get_depth();
+    for (int i = 0; i < font_geom_nav_depth; i++) {
+        lv_obj_t * nav_screen = gui_navigation_get_screen_at(i);
+        if (nav_screen) screen_builders_refresh_font_geometry(nav_screen);
+    }
+    nav_reset_to_home();
+    screen_builders_refresh_font_geometry(lv_screen_active());
+    lv_obj_invalidate(lv_screen_active());
+    lv_obj_invalidate(lv_layer_top());
+    lv_obj_invalidate(lv_layer_sys());
 
-
+    lv_obj_delete(mask);
+}
 
 static void font_size_option_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
-    current_settings.font_size_tier = font_size_options[index].tier;
-    settings_save(&current_settings);
-    populate_font_size_screen();
-    show_font_size_reboot_popup();
+    int target = font_size_options[index].tier;
+    if (target == current_settings.font_size_tier) return;
+
+    lv_obj_t * mask = lv_obj_create(lv_layer_sys());
+    lv_obj_set_user_data(mask, (void *)(intptr_t)(target + 1));
+    lv_display_t * display = lv_display_get_default();
+    lv_obj_set_size(mask,
+                    lv_display_get_horizontal_resolution(display),
+                    lv_display_get_vertical_resolution(display));
+    lv_obj_align(mask, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(mask, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(mask, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mask, 0, 0);
+    lv_obj_set_style_radius(mask, 0, 0);
+    lv_obj_set_style_pad_all(mask, 0, 0);
+    lv_obj_remove_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(mask, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(mask);
+    lv_obj_invalidate(mask);
+
+    /* Leave enough time for the normal refresh timer to paint the mask;
+     * synchronous lv_refr_now() here would re-enter rendering from an input
+     * callback and was the source of earlier transition flicker. */
+    lv_timer_create(font_size_apply_timer_cb, 35, mask);
 }
 
 static lv_obj_t * build_font_size_screen(void) {

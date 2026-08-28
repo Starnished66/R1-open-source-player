@@ -24,5 +24,4 @@ const lv_font_t * gui_theme_font(gui_font_role_t role);
 lv_color_t accent_lv_color(void);
 void apply_accent_color(uint32_t rgb);
 void gui_theme_apply_accent(uint32_t rgb);
-void apply_font_size_tier(int tier);
 void accent_swatch_event_cb(lv_event_t * e);

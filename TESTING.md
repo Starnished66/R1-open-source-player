@@ -140,6 +140,25 @@ which revision it came from.
 
 ## 4. Deploy and launch
 
+For a bootloader-discovered SD update (rather than a temporary `/usr/data`
+test launch), the exact destination is:
+
+```
+/data/mnt/sd_0/.open_hiby_player/open_hiby_player
+```
+
+`.open_hiby_player` is an existing application-data directory; copy the
+binary *inside* it and never replace the directory itself. Push directly to
+the final bootloader-visible filename:
+
+```
+adb push open_hiby_player_target /data/mnt/sd_0/.open_hiby_player/open_hiby_player
+adb shell "chmod 755 /data/mnt/sd_0/.open_hiby_player/open_hiby_player && sync"
+```
+
+Verify the local and device SHA-256 hashes match before rebooting. The
+bootloader scanner treats this exact executable path as the SD update build.
+
 Push to `/usr/data/` (the writable partition) under a name that describes
 what's being tested -- never try to overwrite `/usr/bin/open_hiby_player`
 itself for a quick test (it's read-only squashfs, confirmed directly:

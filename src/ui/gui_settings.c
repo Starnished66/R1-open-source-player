@@ -22,6 +22,7 @@
 #include "firmware_update.h"
 #include "plugin_manager.h"
 #include "fallback_font.h"
+#include "gui_navigation.h"
 #include <stdio.h>
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -101,6 +102,15 @@ static lv_obj_t * eq_freq_value_label;
 static lv_obj_t * eq_gain_value_label;
 static lv_obj_t * eq_q_value_label;
 static int current_eq_band = 0;
+
+void gui_settings_refresh_font_geometry(void) {
+    int32_t width = 170;
+    if (current_settings.font_size_tier == 1) width = 200;
+    else if (current_settings.font_size_tier == 2) width = 240;
+    if (eq_band_dropdown) lv_obj_set_width(eq_band_dropdown, width);
+    if (eq_type_dropdown) lv_obj_set_width(eq_type_dropdown, width);
+    if (eq_screen) lv_obj_update_layout(eq_screen);
+}
 
 #define EQ_FREQ_MIN_HZ 20.0
 #define EQ_FREQ_MAX_HZ 20000.0
@@ -470,6 +480,7 @@ static char discovered_custom_fonts[MAX_CUSTOM_FONTS_DISCOVERED][64];
 static int discovered_custom_font_count = 0;
 
 static void custom_font_option_cb(lv_event_t * e);
+static void custom_font_apply_timer_cb(lv_timer_t * timer);
 
 static void populate_custom_font_screen(void) {
     if (!custom_font_list) return;
@@ -506,21 +517,90 @@ static void populate_custom_font_screen(void) {
     }
 }
 
+static void custom_font_apply_timer_cb(lv_timer_t * timer) {
+    lv_obj_t * mask = (lv_obj_t *)lv_timer_get_user_data(timer);
+    int index = (int)(intptr_t)lv_obj_get_user_data(mask) - 2;
+    lv_timer_delete(timer);
+
+    if (index < -1 || index >= discovered_custom_font_count) {
+        lv_obj_delete(mask);
+        show_error_toast("Font selection is no longer available");
+        return;
+    }
+    const char * target = index < 0 ? "Default" : discovered_custom_fonts[index];
+    if (!fallback_font_apply_custom(target)) {
+        lv_obj_delete(mask);
+        show_error_toast("Failed to load font. Check format & memory.");
+        return;
+    }
+
+    /* The stable app_font_* addresses now contain the candidate descriptors.
+     * Perform the same bounded, one-shot refresh as live Font Size while the
+     * black input mask is still covering the display.  Custom Font also
+     * changes the Latin face of app_font_lyrics (but not its independent
+     * size), so its existing layout gets one explicit refresh here. */
+    gui_navigation_invalidate_font_snapshots();
+    snprintf(current_settings.custom_font, sizeof(current_settings.custom_font), "%s",
+             index < 0 ? "" : target);
+    settings_save(&current_settings);
+    lv_obj_report_style_change(NULL);
+    screen_builders_refresh_font_geometry(NULL);
+    gui_settings_refresh_font_geometry();
+    compact_list_refresh_all();
+    gui_lyrics_refresh_layout();
+    quick_drawer_mark_snapshot_dirty();
+    /* Same reasoning as font_size_apply_timer_cb's own matching sweep
+     * (gui_network.c) -- every screen still on the nav stack was built
+     * under the font just replaced, and none of them get torn down just
+     * because nav_reset_to_home() is about to run. */
+    int font_geom_nav_depth = gui_navigation_get_depth();
+    for (int i = 0; i < font_geom_nav_depth; i++) {
+        lv_obj_t * nav_screen = gui_navigation_get_screen_at(i);
+        if (nav_screen) screen_builders_refresh_font_geometry(nav_screen);
+    }
+    nav_reset_to_home();
+    screen_builders_refresh_font_geometry(lv_screen_active());
+    lv_obj_invalidate(lv_screen_active());
+    lv_obj_invalidate(lv_layer_top());
+    lv_obj_invalidate(lv_layer_sys());
+
+    lv_obj_delete(mask);
+}
+
 static void custom_font_option_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
     const char * target = (index < 0) ? "Default" : discovered_custom_fonts[index];
 
-    if (fallback_font_apply_custom(target)) {
-        snprintf(current_settings.custom_font, sizeof(current_settings.custom_font), "%s",
-                 (index < 0) ? "" : target);
-        settings_save(&current_settings);
-        populate_custom_font_screen();
-        if (custom_font_screen) lv_obj_invalidate(custom_font_screen);
-        show_info_toast((index < 0) ? "Applied default font" : "Custom font applied");
-    } else {
-        show_error_toast("Failed to load font. Check format & memory.");
-    }
+    /* Match Font Size's true no-op: do not copy/validate/rebuild the active
+     * font, flash the display, save settings, or reset navigation. */
+    const char * active = fallback_font_get_custom_name();
+    if ((index < 0 && strcmp(active, "Default") == 0) ||
+        (index >= 0 && strcmp(active, target) == 0)) return;
+
+    lv_obj_t * mask = lv_obj_create(lv_layer_sys());
+    /* Encode -1 (Default) as 1 and discovered indices as 2..N+1.  The
+     * discovered-name table is static and the input-blocking mask prevents
+     * it from being repopulated before the one-shot callback consumes it. */
+    lv_obj_set_user_data(mask, (void *)(intptr_t)(index + 2));
+    lv_display_t * display = lv_display_get_default();
+    lv_obj_set_size(mask,
+                    lv_display_get_horizontal_resolution(display),
+                    lv_display_get_vertical_resolution(display));
+    lv_obj_align(mask, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(mask, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(mask, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mask, 0, 0);
+    lv_obj_set_style_radius(mask, 0, 0);
+    lv_obj_set_style_pad_all(mask, 0, 0);
+    lv_obj_remove_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(mask, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(mask);
+    lv_obj_invalidate(mask);
+
+    /* As with Font Size, let the regular refresh timer paint black before
+     * any SD I/O, TTF validation or cache construction begins. */
+    lv_timer_create(custom_font_apply_timer_cb, 35, mask);
 }
 
 static void custom_font_row_cb(lv_event_t * e) {
@@ -1903,59 +1983,43 @@ static void build_factory_reset_popup(void) {
         factory_reset_popup_backdrop_cb, &factory_reset_popup_backdrop);
 }
 
-/* ---- Font Size restart prompt, same hand-built confirmation-popup shape
- * as eq_reset_popup/factory_reset_popup above -- real-device feedback: the
- * old plain toast ("Restart the app for the new font size to take effect")
- * left the user to go find a way to restart themselves; this offers to do
- * it immediately instead. Not destructive (no data lost, just a restart),
- * so "Restart Now" uses the normal accent color rather than factory
- * reset's warning red. Same /sbin/reboot subprocess_run() call as
- * settings_factory_reset()/idle_shutdown_now()/firmware_update_enter_
- * recovery() -- reboot is how this hardware's own font-size-tier startup
- * path (apply_font_size_tier(), gui_init()) actually gets re-run, there's
- * no live re-style path (see font_size_tier's own doc comment in
- * settings.h). ---- */
-static lv_obj_t * font_size_reboot_popup;
-static lv_obj_t * font_size_reboot_popup_backdrop;
+/* Lyrics Text Size remains an independent reboot-applied setting.  The
+ * general Font Size selector deliberately does not use this popup. */
+static lv_obj_t * lyrics_font_reboot_popup;
+static lv_obj_t * lyrics_font_reboot_backdrop;
 
-static void hide_font_size_reboot_popup(void) {
-    lv_obj_add_flag(font_size_reboot_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(font_size_reboot_popup, LV_OBJ_FLAG_HIDDEN);
+static void hide_lyrics_font_reboot_popup(void) {
+    lv_obj_add_flag(lyrics_font_reboot_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lyrics_font_reboot_popup, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void font_size_reboot_popup_backdrop_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_font_size_reboot_popup();
+static void lyrics_font_reboot_dismiss_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) hide_lyrics_font_reboot_popup();
 }
 
-static void font_size_reboot_later_cb(lv_event_t * e) {
+static void lyrics_font_reboot_now_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_font_size_reboot_popup();
-}
-
-static void font_size_reboot_now_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_font_size_reboot_popup();
+    hide_lyrics_font_reboot_popup();
     char * reboot_argv[] = { (char *) "/sbin/reboot", NULL };
     subprocess_run(reboot_argv, NULL, 0);
 }
 
-void show_font_size_reboot_popup(void) {
-    lv_obj_remove_flag(font_size_reboot_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(font_size_reboot_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(font_size_reboot_popup_backdrop);
-    lv_obj_move_foreground(font_size_reboot_popup);
+void show_lyrics_font_size_reboot_popup(void) {
+    lv_obj_remove_flag(lyrics_font_reboot_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(lyrics_font_reboot_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(lyrics_font_reboot_backdrop);
+    lv_obj_move_foreground(lyrics_font_reboot_popup);
 }
 
-void build_font_size_reboot_popup(void) {
-    font_size_reboot_popup = build_confirm_popup(
-        "Restart now to apply the new font size?", LV_LABEL_LONG_WRAP, NULL, NULL, "Restart Now", accent_lv_color(),
-        font_size_reboot_now_cb, NULL, "Later", lv_color_make(160, 160, 160), font_size_reboot_later_cb, NULL,
-        font_size_reboot_popup_backdrop_cb, &font_size_reboot_popup_backdrop);
+static void build_lyrics_font_reboot_popup(void) {
+    lyrics_font_reboot_popup = build_confirm_popup(
+        "Restart now to apply the new lyrics text size?", LV_LABEL_LONG_WRAP,
+        NULL, NULL, "Restart Now", accent_lv_color(), lyrics_font_reboot_now_cb,
+        NULL, "Later", lv_color_make(160, 160, 160), lyrics_font_reboot_dismiss_cb,
+        NULL, lyrics_font_reboot_dismiss_cb, &lyrics_font_reboot_backdrop);
 }
 
-/* Settings -> System -> Hostname: same "change takes a reboot" shape as
- * font size above, reusing the same shared build_confirm_popup() helper --
+/* Settings -> System -> Hostname uses the shared confirmation-popup helper;
  * see hostname_apply()'s own comment for why a reboot is genuinely required
  * here (wifi_on.sh/bt_init each only read their file once, on demand). */
 static lv_obj_t * hostname_reboot_popup;
@@ -2440,7 +2504,7 @@ void gui_settings_init(void) {
     build_firmware_update_popup();
     build_eq_reset_popup();
     build_factory_reset_popup();
-    build_font_size_reboot_popup();
+    build_lyrics_font_reboot_popup();
     build_hostname_reboot_popup();
 }
 

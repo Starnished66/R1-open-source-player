@@ -45,6 +45,15 @@
 /assets/theme2/playing_plane/*
 !/assets/theme2/playing_plane/airplay_logo_white.png
 
+# Bootloader background image (src/bootloader/main.c's BOOTLOADER_BG_PATH,
+# copied to /etc/bootloader_bg.jpg on-device) -- the user's own artwork, not
+# stock HiBy IP, so unlike /assets/theme2/* above this is tracked normally.
+# Nothing currently excludes /assets/bootloader_bg.jpg, but it's listed here
+# explicitly (matching this file's existing style for one-off asset-policy
+# calls) so its inclusion is a deliberate, documented decision rather than
+# an accident of directory placement.
+!/assets/bootloader_bg.jpg
+
 # Korean.ttf-derived host-simulator font: excluded, unlike the rest of
 # assets/fonts/, because this particular file's own embedded metadata
 # doesn't state a license (see assets/fonts/NOTICE.md). Populate locally

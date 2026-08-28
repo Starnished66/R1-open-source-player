@@ -16,6 +16,7 @@
 
 #include "albumart.h" /* song_row_t/group_row_t, reused as-is by the gui_plugin_library_* declarations below */
 #include "remote_track.h" /* remote_track_meta_t, used by gui_plugin_play_remote_tracks() below */
+#include "home_layout.h" /* home_layout_config_t, used by gui_plugin_set_home_layout() below */
 #include <stdint.h>
 
 #ifdef UI_PERF_TRACE
@@ -108,6 +109,14 @@ void gui_plugin_set_background_color(const char * slot, uint32_t rgb);
  * See screen_builders.h's style_theme_text_primary/style_theme_text_muted
  * comment for what each covers and what's deliberately excluded. */
 void gui_plugin_set_text_color(const char * slot, uint32_t rgb);
+
+/* Stores plugin.set_home_layout()'s validated config for build_home_screen()
+ * (gui_settings.c) to read the next time it runs -- see home_layout.h's own
+ * comment for why this never touches the live Home screen. plugin_manager.c's
+ * l_plugin_set_home_layout() already validated every enum-like field
+ * (key/mode/align/text_size) before calling here, so this trusts its caller,
+ * same convention gui_plugin_set_background_color() above already uses. */
+void gui_plugin_set_home_layout(const home_layout_config_t * config);
 
 /* ---- Playback control bridges for plugin.toggle_pause()/stop()/next_track()/
  * prev_track()/seek()/set_volume()/is_playing()/is_paused()/get_position()/

@@ -28,8 +28,17 @@
  * entry (plugin_manager.c) -- has_capability("playback.remote") is the
  * finer-grained, no-version-bump-needed way to feature-detect this
  * specifically, for a plugin that only cares about this one API rather
- * than requiring the whole api_min=3 batch. */
-#define PLUGIN_API_VERSION 3
+ * than requiring the whole api_min=3 batch.
+ *
+ * Bumped 3 -> 4: added plugin.set_home_layout() (per-tile color/radius/size
+ * overrides for Home's 6 fixed tiles, plus an optional tile-grid ->
+ * pill-list mode switch -- see PLUGINS.md and home_layout.h). Purely
+ * additive, same as every bump before it. Takes effect on the next app
+ * start only (Home is built once, at startup, and never rebuilt) -- see
+ * home_layout.h's own comment. Also see the new "ui.home_layout"
+ * plugin_capabilities[] entry (plugin_manager.c) for the no-version-bump
+ * way to feature-detect just this. */
+#define PLUGIN_API_VERSION 4
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
 /* Third-party Lua plugin support. Every *.lua file under

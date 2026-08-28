@@ -289,6 +289,23 @@ void gui_plugin_set_text_color(const char * slot, uint32_t rgb) {
      * comment on l_plugin_set_text_color() validating first. */
 }
 
+/* Backing storage for plugin.set_home_layout() -- gui_settings.c's
+ * build_home_screen() reads this directly (extern via home_layout.h), same
+ * "shared mutable state declared in the owning header, written here"
+ * pattern this file already uses for list_row_style/style_theme_* above.
+ * Unlike those, this is never touched by any live LVGL call -- Home is
+ * built once at startup and never rebuilt, so there is nothing to redraw or
+ * lv_obj_report_style_change() here. */
+home_layout_config_t home_layout_config = { 0 };
+
+/* plugin_manager.c's l_plugin_set_home_layout() has already validated every
+ * enum-like field (key -> array index, mode, align, text_size) before
+ * building *config, so this is a plain copy -- see home_layout.h's own
+ * comment for why a call made after boot only affects the NEXT app start. */
+void gui_plugin_set_home_layout(const home_layout_config_t * config) {
+    home_layout_config = *config;
+}
+
 /* ---- Playback control bridges -- see gui.h's own comment on why these
  * can't just call audio_toggle_pause()/audio_stop()/audio_set_volume()
  * directly from plugin_manager.c the way plugin.eq_*() calls peq_* directly.

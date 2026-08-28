@@ -340,6 +340,14 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *     ish gray text). Destructive-red and accent-tinted text are not
  *     covered -- see l_plugin_set_text_color()'s own comment.
  *
+ *   plugin.set_home_layout(tiles, options)
+ *     Restyles Home's 6 fixed tiles (color/radius/size/alignment/icon), and
+ *     optionally switches Home from its native icon grid to a scrollable
+ *     pill-list -- see l_plugin_set_home_layout()'s own comment for the full
+ *     `tiles`/`options` shape. Same "load-time only" constraint as
+ *     plugin.set_icon() above: only takes effect on the NEXT app start,
+ *     since Home is built once at startup and never rebuilt.
+ *
  *   plugin.eq_load_profile(path) -> bool
  *     Loads and applies a .peq profile file (src/audio/peq.c's own
  *     save/load format) from an arbitrary path, then persists it as the
@@ -1263,6 +1271,158 @@ static int l_plugin_set_text_color(lua_State * L) {
     }
 
     gui_plugin_set_text_color(slot, (uint32_t) rgb);
+    return 0;
+}
+
+/* Reads an optional 0xRRGGBB-style integer field into out_has/out_value --
+ * *out_has stays whatever the caller initialized it to (false) if the field
+ * is nil/absent, so a tile table that only sets some fields leaves the rest
+ * genuinely unset rather than defaulting to black/0. luaL_checkinteger (not
+ * lua_tointeger) so a wrong-typed value fails loudly rather than silently
+ * becoming 0, same convention every other typed plugin.* field uses. */
+static void get_opt_color_field(lua_State * L, int idx, const char * field, bool * out_has, uint32_t * out_value) {
+    lua_getfield(L, idx, field);
+    if (!lua_isnil(L, -1)) {
+        *out_has = true;
+        *out_value = (uint32_t) luaL_checkinteger(L, -1);
+    }
+    lua_pop(L, 1);
+}
+
+/* Same shape, for an optional boolean field (accessory/icon) -- lua_toboolean
+ * alone can't tell "false" apart from "absent", both would otherwise read as
+ * false, so *out_has records whether the field was actually present. */
+static void get_opt_bool_field(lua_State * L, int idx, const char * field, bool * out_has, bool * out_value) {
+    lua_getfield(L, idx, field);
+    if (!lua_isnil(L, -1)) {
+        *out_has = true;
+        *out_value = lua_toboolean(L, -1);
+    }
+    lua_pop(L, 1);
+}
+
+/* Restyles Home's 6 fixed tiles (PLUGINS.md) -- never adds/removes one, Home
+ * has no spare room for a plugin-added tile (see register_stream_media_tile()'s
+ * own doc comment on why Stream Media has room and Home doesn't). Only takes
+ * effect the NEXT time build_home_screen() runs, i.e. the next app start --
+ * see home_layout.h's own comment for why (Home is built once at startup and
+ * never rebuilt, same "load-time only" constraint plugin.set_icon() already
+ * documents). A call made later, from inside a callback, is not an error --
+ * it just updates gui_plugin_set_home_layout()'s stored config for next
+ * time, with no visible effect this session.
+ *
+ * `tiles`: array of tables, one per tile being restyled -- { key = "music"|
+ * "stream_media"|"wireless"|"books"|"system"|"dac", bg_color, text_color,
+ * radius, height, width, align, accessory, text_size, icon }. A tile key
+ * never mentioned keeps every field at its native default. height/width are
+ * passed through unclamped (same as register_list_item()'s own options) --
+ * build_pill_list_screen() clamps them to PILL_ROW_HEIGHT_MIN/MAX and
+ * PILL_ROW_WIDTH_MIN/MAX itself when list mode actually renders them.
+ *
+ * `options` (optional): { mode = "tile"|"list", tile_gap, row_gap }. `mode`
+ * defaults to "tile" (today's icon grid) if `options` or `mode` is omitted. */
+static int l_plugin_set_home_layout(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+
+    home_layout_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.configured = true;
+
+    lua_Unsigned raw_n = lua_rawlen(L, 1);
+    int n = (raw_n > (lua_Unsigned) HOME_LAYOUT_TILE_COUNT) ? HOME_LAYOUT_TILE_COUNT : (int) raw_n;
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(L, 1, i + 1); /* tile table -> stack top */
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            continue;
+        }
+
+        lua_getfield(L, -1, "key");
+        const char * key = lua_tostring(L, -1);
+        int idx = -1;
+        if (key) {
+            for (int k = 0; k < HOME_LAYOUT_TILE_COUNT; k++) {
+                if (strcmp(key, home_layout_tile_keys[k]) == 0) { idx = k; break; }
+            }
+        }
+        if (idx < 0) {
+            return luaL_error(L, "plugin.set_home_layout: tile %d has an unknown or missing key '%s' "
+                               "(expected \"music\", \"stream_media\", \"wireless\", \"books\", \"system\", or \"dac\")",
+                               i + 1, key ? key : "nil");
+        }
+        lua_pop(L, 1); /* key string */
+
+        home_tile_override_t * ov = &config.tiles[idx];
+        int row_idx = lua_gettop(L); /* the tile table itself, still on the stack */
+
+        get_opt_color_field(L, row_idx, "bg_color", &ov->has_bg_color, &ov->bg_color);
+        get_opt_color_field(L, row_idx, "text_color", &ov->has_text_color, &ov->text_color);
+
+        lua_getfield(L, row_idx, "radius");
+        if (!lua_isnil(L, -1)) { ov->has_radius = true; ov->radius = (int32_t) luaL_checkinteger(L, -1); }
+        lua_pop(L, 1);
+
+        lua_getfield(L, row_idx, "height");
+        ov->height = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, row_idx, "width");
+        ov->width = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, row_idx, "align");
+        const char * align = lua_tostring(L, -1);
+        if (align) {
+            if (strcmp(align, "left") != 0 && strcmp(align, "center") != 0 && strcmp(align, "right") != 0) {
+                lua_pop(L, 1);
+                return luaL_error(L, "plugin.set_home_layout: tile %d has an unknown align '%s' "
+                                   "(expected \"left\", \"center\", or \"right\")", i + 1, align);
+            }
+            snprintf(ov->align, sizeof(ov->align), "%s", align);
+        }
+        lua_pop(L, 1);
+
+        get_opt_bool_field(L, row_idx, "accessory", &ov->has_accessory, &ov->accessory);
+        get_opt_bool_field(L, row_idx, "icon", &ov->has_icon, &ov->icon);
+
+        lua_getfield(L, row_idx, "text_size");
+        const char * text_size = lua_tostring(L, -1);
+        if (text_size) {
+            if (!is_valid_text_size(text_size)) {
+                lua_pop(L, 1);
+                return luaL_error(L, "plugin.set_home_layout: tile %d has an unknown text_size '%s' "
+                                   "(expected \"small\", \"medium\", or \"large\")", i + 1, text_size);
+            }
+            snprintf(ov->text_size, sizeof(ov->text_size), "%s", text_size);
+        }
+        lua_pop(L, 1);
+
+        lua_pop(L, 1); /* tile table */
+    }
+
+    if (lua_gettop(L) >= 2 && lua_istable(L, 2)) {
+        lua_getfield(L, 2, "mode");
+        const char * mode = lua_tostring(L, -1);
+        if (mode) {
+            if (strcmp(mode, "tile") == 0) config.list_mode = false;
+            else if (strcmp(mode, "list") == 0) config.list_mode = true;
+            else {
+                lua_pop(L, 1);
+                return luaL_error(L, "plugin.set_home_layout: unknown mode '%s' (expected \"tile\" or \"list\")", mode);
+            }
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "tile_gap");
+        config.tile_gap = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "row_gap");
+        config.row_gap = (int32_t) luaL_optinteger(L, -1, 0);
+        lua_pop(L, 1);
+    }
+
+    gui_plugin_set_home_layout(&config);
     return 0;
 }
 
@@ -2564,7 +2724,8 @@ static const char * const plugin_capabilities[] = {
     "filesystem.sd", "playback.control", "playback.state", "playback.events",
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
-    "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh"
+    "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
+    "ui.home_layout"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -2765,6 +2926,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "set_icon",                  l_plugin_set_icon },
     { "set_background_color",      l_plugin_set_background_color },
     { "set_text_color",            l_plugin_set_text_color },
+    { "set_home_layout",           l_plugin_set_home_layout },
     { "eq_load_profile",           l_plugin_eq_load_profile },
     { "eq_save_profile",           l_plugin_eq_save_profile },
     { "eq_reset",                  l_plugin_eq_reset },

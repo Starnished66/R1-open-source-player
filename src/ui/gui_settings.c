@@ -1769,18 +1769,93 @@ static void dac_home_tile_cb(lv_event_t * e) {
 }
 
 
+/* Published order for plugin.set_home_layout()'s `key` field (home_layout.h)
+ * -- the one and only place this order is spelled out; plugin_manager.c
+ * validates a Lua `key` string against this same array rather than keeping
+ * its own copy that could drift out of sync. */
+const char * const home_layout_tile_keys[HOME_LAYOUT_TILE_COUNT] = {
+    "music", "stream_media", "wireless", "books", "system", "dac",
+};
+
+/* Native per-tile metadata, same fixed order as home_layout_tile_keys[]
+ * above -- shared by both branches of build_home_screen() below so the
+ * label/icon/click-target triple is written exactly once regardless of
+ * which mode (tile or list) actually renders it. */
+typedef struct {
+    const char * icon_asset;
+    const char * icon_asset_selected;
+    const char * label;
+    lv_event_cb_t on_click;
+} home_native_tile_t;
+
+static const home_native_tile_t home_native_tiles[HOME_LAYOUT_TILE_COUNT] = {
+    { "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb },
+    { "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb },
+    { "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb },
+    { "launcher/book.png", "launcher/book_s.png", "Books", gui_books_home_tile_cb },
+    { "launcher/sys_set.png", "launcher/sys_set_s.png", "System", system_tile_cb },
+    { "launcher/dac.png", "launcher/dac_s.png", "DAC", dac_home_tile_cb },
+};
+
 lv_obj_t * build_home_screen(void) {
-    static icon_grid_item_t items[6];
-    items[0] = (icon_grid_item_t){ "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb, NULL };
-    items[1] = (icon_grid_item_t){ "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb, NULL };
-    items[2] = (icon_grid_item_t){ "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb, NULL };
-    items[3] = (icon_grid_item_t){ "launcher/book.png", "launcher/book_s.png", "Books", gui_books_home_tile_cb, NULL };
-    items[4] = (icon_grid_item_t){ "launcher/sys_set.png", "launcher/sys_set_s.png", "System", system_tile_cb, NULL };
-    items[5] = (icon_grid_item_t){ "launcher/dac.png", "launcher/dac_s.png", "DAC", dac_home_tile_cb, NULL };
+    /* plugin.set_home_layout()'s list-mode path -- a pill-list screen built
+     * from the same 6 native tiles/callbacks above instead of the icon
+     * grid, with each row's style pulled from home_layout_config.tiles[i].
+     * See home_layout.h's own comment for why this only ever reflects
+     * whatever was configured at THIS boot's plugin-load time, never a
+     * live mid-session change. */
+    if (home_layout_config.configured && home_layout_config.list_mode) {
+        static pill_list_item_t items[HOME_LAYOUT_TILE_COUNT];
+        for (int i = 0; i < HOME_LAYOUT_TILE_COUNT; i++) {
+            const home_native_tile_t * native = &home_native_tiles[i];
+            const home_tile_override_t * ov = &home_layout_config.tiles[i];
+            /* asset_path_plain(), not asset_path() -- pill_row_apply_icon()
+             * (screen_builders.c) expects a raw filesystem path with no "S:"
+             * LVGL-driver prefix (it prepends that itself), exactly what
+             * asset_path_plain() returns; asset_path() itself is already
+             * "S:"-prefixed for direct lv_image_set_src() use and would
+             * double up here. */
+            const char * icon_path = (ov->has_icon && ov->icon) ? asset_path_plain(native->icon_asset) : NULL;
+            items[i] = (pill_list_item_t){
+                .label = native->label,
+                .accessory = (ov->has_accessory && ov->accessory) ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
+                .on_click = native->on_click,
+                .icon_asset = icon_path,
+                .row_height = ov->height,
+                .row_width = ov->width,
+                .text_size = ov->text_size[0] ? ov->text_size : NULL,
+                .has_bg_color = ov->has_bg_color, .bg_color = ov->bg_color,
+                .has_text_color = ov->has_text_color, .text_color = ov->text_color,
+                .has_radius = ov->has_radius, .radius = ov->radius,
+                .text_align = ov->align[0] ? ov->align : NULL,
+            };
+        }
+        lv_obj_t * scr = build_pill_list_screen(NULL, NULL, items, HOME_LAYOUT_TILE_COUNT, gui_theme_accent_style(),
+                                                 home_layout_config.row_gap > 0 ? home_layout_config.row_gap : 6);
+        finalize_screen_navigation(scr);
+        return scr;
+    }
+
+    static icon_grid_item_t items[HOME_LAYOUT_TILE_COUNT];
+    for (int i = 0; i < HOME_LAYOUT_TILE_COUNT; i++) {
+        const home_native_tile_t * native = &home_native_tiles[i];
+        const home_tile_override_t * ov = &home_layout_config.tiles[i];
+        items[i] = (icon_grid_item_t){
+            .icon_asset = native->icon_asset,
+            .icon_asset_selected = native->icon_asset_selected,
+            .label = native->label,
+            .on_click = native->on_click,
+            .has_bg_color = ov->has_bg_color, .bg_color = ov->bg_color,
+            .has_text_color = ov->has_text_color, .text_color = ov->text_color,
+            .has_radius = ov->has_radius, .radius = ov->radius,
+        };
+    }
     /* No back_btn_cb -- this is the true root, nothing to go back to. No
      * title either -- matches the real stock launcher, which has no header
-     * text above its icon grid. */
-    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, 6, 100, false, 0);
+     * text above its icon grid. tile_gap stays 0 (today's exact flush-cell
+     * look) unless a plugin configured one. */
+    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, HOME_LAYOUT_TILE_COUNT, 100, false,
+                                             home_layout_config.configured ? home_layout_config.tile_gap : 0);
     finalize_screen_navigation(scr);
     return scr;
 }

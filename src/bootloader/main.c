@@ -90,20 +90,17 @@ static void release_stock_hgl_dma(void) {
  * on a 5/6/5-bit panel. */
 #define CARD_BG_ALPHA 128
 
-/* NOT /etc/logo1.jpeg directly, even though that's this device's own real
- * boot splash asset (confirmed exactly FB_WIDTH x FB_HEIGHT already) --
- * confirmed on-device (JDR_FMT3 from jd_prepare(), then verified directly
- * by walking the file's own JPEG markers) that it's encoded as progressive
- * DCT (SOF marker 0xC2), which tjpgd -- a baseline-only decoder, by
- * design, not a bug in this bootloader's own use of it -- cannot decode
- * at all. This is a baseline re-encode of that exact same image (same
- * pixels, `convert /etc/logo1.jpeg -interlace none`). Ships as part of the
- * squashfs image itself (alongside this binary, see the Phase 3 repack
- * process), not on the writable partition -- unlike the Phase 2 on-device
- * test path this replaced, this must not depend on /usr/data already
- * having been populated by hand; a factory-reset or first-ever-flashed
- * device still needs the background to work. */
-#define BOOTLOADER_BG_PATH "/etc/bootloader_bg.jpg"
+/* Baseline-JPEG conversion of the theme2 boot-animation frame at
+ * /usr/resource/litegui/theme2/boot_animation/en/0.png. The source is an
+ * exact 480x800 RGB PNG, while this compact bootloader intentionally links
+ * only tjpgd, so the build/repack asset is flattened and converted once
+ * rather than adding a second image decoder to the boot-critical binary.
+ * The converted sibling is installed beside the source as `0.jpg` in the
+ * same theme directory. It remains in squashfs, not on the writable
+ * partition: a factory-reset or first-ever-flashed device must not depend
+ * on /usr/data having been populated manually before it can draw the boot
+ * background. */
+#define BOOTLOADER_BG_PATH "/usr/resource/litegui/theme2/boot_animation/en/0.jpg"
 
 #define COLOR_BG fb_rgb(0x12, 0x12, 0x12)
 #define COLOR_TEXT fb_rgb(0xFF, 0xFF, 0xFF)
@@ -439,20 +436,18 @@ int main(void) {
     reserve_stock_hgl_dma();
 
     /* Opened and drawn to BEFORE scanner_scan() (which performs the SD
-     * card settle wait, up to ~2.5s -- see scanner.c's own doc comment),
+     * card settle wait, up to ~5s -- see scanner.c's own doc comment),
      * not after. Real-device regression this specifically fixes: the
      * previous hiby_player.sh -> open_hiby_player chain already paid this
-     * exact settle cost, but inside the PLAYER's own main(), called
-     * "immediately after painting the splash, so this bounded wait
-     * overlaps its existing 3-second minimum display time" (that
-     * function's own comment) -- i.e. the user saw a splash the whole
-     * time. Running the settle wait here, one process earlier, before any
+     * exact settle cost, but inside the PLAYER's own main(), after painting
+     * its splash -- i.e. the user saw a splash throughout the wait. Running
+     * the settle here, one process earlier, before any
      * frame had ever been drawn, would turn that same already-accepted
-     * cost into up to ~2.5s of new, blank-screen latency instead -- same
-     * number of seconds, but a materially different, worse experience,
-     * not "moving an existing cost." Drawing a placeholder here first
-     * makes it overlap something on-screen again, the same way the
-     * player's own splash already did. */
+     * cost into blank-screen latency instead. Drawing the background here
+     * first makes the longer discovery window overlap something on-screen,
+     * the same way the player's own splash already did. No "STARTUP" label:
+     * this frame is a splash, not a progress state, and may be visible only
+     * briefly when the SD is already ready. */
     bool fb_ready = fb_open();
     if (fb_ready) {
         /* See BOOTLOADER_BG_PATH's own doc comment for why this isn't
@@ -463,7 +458,6 @@ int main(void) {
          * fill if the asset is ever missing/unreadable/wrong-sized -- this
          * is cosmetic, not load-bearing, and must never block boot. */
         if (!fb_draw_background_jpeg(BOOTLOADER_BG_PATH)) fb_fill(COLOR_BG);
-        draw_centered(FB_HEIGHT / 2 - fb_text_height() / 2, "STARTUP", COLOR_TEXT);
         fb_flush();
     }
 

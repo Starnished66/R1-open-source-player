@@ -1269,14 +1269,13 @@ static void update_timer_cb(lv_timer_t * timer) {
  * this far into boot, so it doubles as "splash was never shown". */
 static uint32_t boot_splash_start_tick = 0;
 
-/* Stock player's own boot image stays up at least this long -- see
- * gui_show_boot_splash()'s comment. Used by gui_init()'s own settle-wait,
- * further below.
- *
- * Bluetooth does not extend this global wait. gui_shell.c keeps Bluetooth
- * status in an explicit not-ready state and defers its first backend poll
- * until S80_bt_init's completion marker appears. */
-#define BOOT_SPLASH_MIN_DISPLAY_MS 3000
+/* The bootloader now owns the longer (up to 5s) SD-discovery window before
+ * launching this process. Keep a short player-owned splash so framebuffer
+ * takeover remains visually clean, without stacking the former additional
+ * three-second minimum onto every bootloader-managed startup. Standalone
+ * test launches still retain a visible one-second splash. Bluetooth does
+ * not extend this global wait; gui_shell.c tracks its readiness separately. */
+#define BOOT_SPLASH_MIN_DISPLAY_MS 1000
 
 /* Task #44 (stock-UX request): the stock firmware holds its own boot image
  * on screen for a few seconds after the very first kernel/bootloader logo

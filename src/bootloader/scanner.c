@@ -45,10 +45,17 @@ static void try_mount_sd_device_node(const char * device_node) {
     subprocess_run(ntfs_argv, NULL, 0);
 }
 
-/* Same bound as src/main.c's own settle_sd_mount_during_splash(): up to
- * 2.5s (25 x 100ms). That function's own comment explains why this is
- * necessary, not just cautious -- "a software-triggered reboot can start
- * this S92 process before the SD block node has reappeared" -- and
+/* Wait up to 5s (50 x 100ms) for the SD block node. This deliberately
+ * exceeds src/main.c's standalone-player fallback settle: field reports
+ * from multiple devices showed that the original shared 2.5s bound could
+ * expire before mdev exposed the card, making the bootloader silently take
+ * the no-alternate path and auto-boot Open Player even though hiby_player
+ * was present. The player's own splash minimum is correspondingly shorter
+ * now, so this larger bootloader discovery window does not simply stack an
+ * additional full splash delay onto the normal SD-present boot.
+ *
+ * This wait is necessary, not just cautious -- "a software-triggered reboot
+ * can start this S92 process before the SD block node has reappeared" -- and
  * mdev creates /dev/mmcblk0* directly off the mmc host's own card-detect
  * uevent (confirmed in gui_library.c's own comment on hotplug), so there
  * is no faster or more direct "card present" signal available than the
@@ -59,11 +66,10 @@ static void try_mount_sd_device_node(const char * device_node) {
  * one-shot node check here would intermittently miss a genuinely-present
  * SD alternate/update on exactly that path, silently booting internal
  * instead. This does mean a boot with truly no SD card ever inserted can
- * take up to the same 2.5s before falling through to the instant-boot
- * path below -- an accepted, precedented tradeoff (main.c already pays
- * this same cost on every single boot for the same reason), not a new
- * regression introduced here. */
-#define SD_SETTLE_MAX_ATTEMPTS 25
+ * take up to 5s before falling through to the instant-boot
+ * path below. The early boot background is already visible throughout this
+ * bounded wait, without an extra status string (see main.c). */
+#define SD_SETTLE_MAX_ATTEMPTS 50
 #define SD_SETTLE_DELAY_MS 100
 
 /* Mirrors src/main.c's own mount_sd_card_if_needed() (mount point
@@ -94,7 +100,7 @@ static void mount_sd_card_if_needed(void) {
         /* Neither node exists yet, or one exists but genuinely failed to
          * mount (corrupt filesystem, etc.) -- either way, keep retrying
          * rather than giving up on the very first miss; a node that will
-         * never mount just harmlessly rides out the same bounded 2.5s as
+         * never mount just harmlessly rides out the same bounded 5s as
          * one that's still settling. */
         usleep(SD_SETTLE_DELAY_MS * 1000);
     }

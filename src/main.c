@@ -127,7 +127,8 @@ void mount_sd_card_if_needed(void) {
  * it, and plugin_manager_init() later sees no .plugins directory; unlike the
  * library, plugin-backed screens are built only once and cannot recover on
  * the later hotplug poll. Called immediately after painting the splash, so
- * this bounded wait overlaps its existing 3-second minimum display time.
+ * this bounded wait overlaps the player's own splash and remains useful for
+ * standalone test launches that bypass the bootloader.
  * Avoid running mount helpers until a real node exists. */
 static void settle_sd_mount_during_splash(void) {
     const int attempts = 25;

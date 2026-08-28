@@ -22,12 +22,20 @@ extern const char * const home_layout_tile_keys[HOME_LAYOUT_TILE_COUNT];
 
 /* configured==false (plugin.set_home_layout() never called this boot) means
  * every other field here is meaningless -- build_home_screen() builds
- * exactly its old hardcoded layout in that case, unchanged. Only takes
- * effect on the NEXT build_home_screen() call, i.e. the next boot -- Home is
- * built once at startup and never rebuilt (same "load-time only" constraint
- * plugin.set_icon() already documents), so a call made after boot from
- * inside a callback just updates this struct for next time, silently, with
- * no error and no immediate visible effect. */
+ * exactly its old hardcoded layout in that case, unchanged.
+ *
+ * This struct is NEVER written to disk anywhere -- it only ever holds
+ * whatever the most recent plugin.set_home_layout() call in THIS still-
+ * running process passed in, and build_home_screen() only ever reads it
+ * once, at startup. So a call made after boot, from inside a callback, is
+ * not an error, but has no effect beyond updating this in-memory struct for
+ * a build_home_screen() call that will never happen again this session --
+ * restarting the app discards it completely (same "load-time only"
+ * constraint plugin.set_icon() already documents). A plugin that wants a
+ * layout to actually survive a restart must persist its own choice to its
+ * own state file and re-call plugin.set_home_layout() with it from
+ * top-level script code on every boot -- see PLUGINS.md and
+ * plugins_examples/HomeThemes.lua. */
 typedef struct {
     bool has_bg_color;   uint32_t bg_color;
     bool has_text_color; uint32_t text_color;
@@ -41,15 +49,15 @@ typedef struct {
     int32_t width;
     char align[8];      /* "", "left", "center", "right" */
     bool has_accessory; bool accessory;
-    char text_size[8];  /* "", "small", "medium", "large" */
+    char text_size[8];  /* "", "small", "medium", "large", "mono" */
     bool has_icon;      bool icon;
 } home_tile_override_t;
 
 typedef struct {
     bool configured;
     bool list_mode;   /* false = tile mode (today's icon grid), true = pill-list rows */
-    int32_t tile_gap; /* tile mode only */
-    int32_t row_gap;  /* list mode only, 0 = keep build_pill_list_screen()'s native default of 6 */
+    int32_t tile_gap; /* tile mode only -- build_icon_grid_screen() clamps this to 0-64 */
+    int32_t row_gap;  /* list mode only, 0 = keep build_pill_list_screen()'s native default of 6 -- clamped there to 0-84 */
     home_tile_override_t tiles[HOME_LAYOUT_TILE_COUNT];
 } home_layout_config_t;
 

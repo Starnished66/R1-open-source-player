@@ -363,6 +363,18 @@ static void icon_tile_press_event_cb(lv_event_t * e) {
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const icon_grid_item_t * items, int item_count,
                                    int32_t icon_scale_percent, bool label_inside_icon, int32_t tile_gap) {
+    /* Clamped here, not just left to whatever the caller passed -- every
+     * native call site already passes the literal 0, but
+     * plugin.set_home_layout()'s tile_gap (PLUGINS.md) is plugin-controlled
+     * and otherwise unbounded all the way from the Lua boundary. Unlike
+     * build_pill_list_screen()'s row_gap (plain pad_gap spacing), this one
+     * is subtracted straight into `available_h` below (icon/label vertical
+     * budget) -- a large enough value drives that negative and produces
+     * broken tile content positioning, not just a wide gap, so it needs a
+     * real ceiling rather than a cosmetic one. */
+    if (tile_gap < 0) tile_gap = 0;
+    if (tile_gap > 64) tile_gap = 64;
+
     int32_t target_icon_px = (ICON_GRID_TARGET_ICON_PX * icon_scale_percent) / 100;
 
     lv_obj_t * scr = lv_obj_create(NULL);
@@ -787,19 +799,40 @@ int32_t pill_row_default_width(void) {
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
                                    lv_style_t * toggle_accent_style, int32_t row_gap) {
+    /* Clamped here, not just left to whatever the caller passed -- every
+     * native call site already passes a small literal (6), but
+     * plugin.set_home_layout()'s row_gap (PLUGINS.md) is plugin-controlled
+     * and otherwise unbounded all the way from the Lua boundary. A
+     * pathological value here is only a layout-quality issue (pad_gap, not
+     * subtracted from any available-space math the way tile_gap is below),
+     * but there's no legitimate reason to want more than a native row's own
+     * height in gap, so bound it there. */
+    if (row_gap < 0) row_gap = 0;
+    if (row_gap > LIST_ROW_HEIGHT) row_gap = LIST_ROW_HEIGHT;
+
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     /* NULL back_btn_cb means "this screen has nothing to go back to" (the
      * Home launcher) -- skip the arrow entirely rather than drawing a dead
-     * button. */
+     * button. NULL title similarly means "no header row at all" (Home's own
+     * list-mode path, plugin.set_home_layout()) -- build_title() unconditionally
+     * calling lv_label_set_text(label, NULL) on a freshly-created label (whose
+     * own ->text starts NULL) reaches lv_strlen(NULL) and crashes, so this
+     * must be skipped, not just cosmetic; mirrors build_icon_grid_screen()'s
+     * own `if (title) build_title(...)` above. */
     if (back_btn_cb) build_back_button(scr, back_btn_cb);
-    build_title(scr, title);
+    if (title) build_title(scr, title);
+
+    /* Only reserve the title-row band when something is actually drawn into
+     * it (a title label or a back button) -- Home's own list-mode call
+     * passes neither, same "no header" case build_icon_grid_screen() already
+     * gives the Home tile grid today. */
+    int32_t header_h = STATUS_BAR_CLEARANCE + ((title || back_btn_cb) ? TITLE_ROW_HEIGHT : 0);
 
     lv_obj_t * list = lv_obj_create(scr);
     lv_obj_set_size(list, lv_pct(100),
-                    lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
-                        TITLE_ROW_HEIGHT);
+                    lv_display_get_vertical_resolution(lv_display_get_default()) - header_h);
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(list, 0, 0);
     lv_obj_set_style_border_width(list, 0, 0);

@@ -11,6 +11,7 @@
 #include "input.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,48 @@ extern char ** environ; /* not declared by <unistd.h> under this project's
                           * feature-test macro settings -- see this file's
                           * own Makefile entry, and no other file in this
                           * codebase has needed it before now. */
+
+/* The Stock player's proprietary framebuffer backend opens
+ * /dev/sa_hgl_dma and asks its driver for one physically-contiguous 8 MiB
+ * allocation (confirmed from a live order-11 allocation failure in
+ * sahd_open()). Merely having more than 8 MiB free is not sufficient: by
+ * the time the boot selector has decoded its background, allocated its
+ * buffers, scanned the SD card, and waited for a choice, the small 56 MiB
+ * system can have enough total free RAM but no order-11 buddy block left.
+ * Stock then continues without a framebuffer and the last boot-menu frame
+ * appears frozen even though the rest of Stock is alive.
+ *
+ * Reserve that exact driver allocation before this process performs any
+ * substantial allocation. Holding the fd keeps the contiguous block out
+ * of the general allocator throughout the menu. It deliberately remains
+ * open across fork: the child inherits the same open-file reference, the
+ * parent then closes its copy, and O_CLOEXEC releases the child's final
+ * reference inside a successful execve(). This is materially later than
+ * closing before fork -- real-device testing showed that the freshly freed
+ * order-11 block could otherwise be split by fork/ELF-loader allocations
+ * before Stock opened the driver itself. If execve() fails, CLOEXEC has not
+ * fired and the fallback exec remains protected. Open Player does not use
+ * this device, but follows the same handoff for consistent fd hygiene. A
+ * failed reservation is logged but never blocks boot; Stock then retains
+ * its existing best-effort behavior. */
+#define HGL_DMA_DEVICE "/dev/sa_hgl_dma"
+
+static int hgl_dma_reservation_fd = -1;
+
+static void reserve_stock_hgl_dma(void) {
+    hgl_dma_reservation_fd = open(HGL_DMA_DEVICE, O_RDWR | O_CLOEXEC);
+    if (hgl_dma_reservation_fd < 0) {
+        perror("open_hiby_bootloader: failed to reserve Stock HGL DMA memory");
+    }
+}
+
+static void release_stock_hgl_dma(void) {
+    if (hgl_dma_reservation_fd < 0) return;
+    if (close(hgl_dma_reservation_fd) != 0) {
+        perror("open_hiby_bootloader: failed to release Stock HGL DMA reservation");
+    }
+    hgl_dma_reservation_fd = -1;
+}
 
 #define CARD_MARGIN_X 40
 #define CARD_WIDTH (FB_WIDTH - 2 * CARD_MARGIN_X)
@@ -326,7 +369,8 @@ static void run_player_supervised(const char * player_path) {
     if (pid < 0) {
         /* Can't fork at all -- an embedded device in this state has bigger
          * problems than losing the reboot-supervisor for one launch.
-         * execve() replaces this process outright; if THAT also fails,
+         * execve() replaces this process outright; O_CLOEXEC releases the
+         * HGL reservation only once that exec succeeds. If exec also fails,
          * there is no child to wait for either way, so go straight to the
          * same reboot the normal path would have ended in. */
         perror("open_hiby_bootloader: fork failed, execve'ing directly (no reboot-on-crash this launch)");
@@ -336,6 +380,10 @@ static void run_player_supervised(const char * player_path) {
     }
 
     if (pid == 0) {
+        /* Do not close the HGL reservation here. Its O_CLOEXEC flag releases
+         * the final inherited reference inside a successful execve(), later
+         * than an explicit close followed by ELF loading. If this exec
+         * fails, retaining it protects the internal-player fallback below. */
         execve(player_path, (char * []) { (char *) player_path, NULL }, environ);
         /* Only reached if execve() itself failed (bad binary, ENOENT,
          * etc.) -- fall back to the always-present internal player rather
@@ -347,6 +395,13 @@ static void run_player_supervised(const char * player_path) {
         }
         _exit(127);
     }
+
+    /* The child now holds the same open-file reference until its successful
+     * exec processes O_CLOEXEC. Drop only the supervisor's copy: closing it
+     * cannot free the contiguous block prematurely while the child reference
+     * remains alive, but ensures the long-lived waitpid parent pins no RAM
+     * after the player has taken over. */
+    release_stock_hgl_dma();
 
     /* Retry on EINTR rather than treating any waitpid() return as "the
      * child exited" -- an unrelated signal interrupting this call left
@@ -378,6 +433,11 @@ static void run_player_supervised(const char * player_path) {
 }
 
 int main(void) {
+    /* Must remain the first resource acquisition in main(): see
+     * reserve_stock_hgl_dma() for why reserving after fb_open() or the SD
+     * scan is already too late on this memory-constrained device. */
+    reserve_stock_hgl_dma();
+
     /* Opened and drawn to BEFORE scanner_scan() (which performs the SD
      * card settle wait, up to ~2.5s -- see scanner.c's own doc comment),
      * not after. Real-device regression this specifically fixes: the

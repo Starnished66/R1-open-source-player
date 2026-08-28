@@ -247,7 +247,40 @@ bool fb_open(void) {
     return true;
 }
 
+/* Leave the framebuffer in the conventional page-zero state for the next
+ * process. This was originally added while investigating a frozen Stock
+ * handoff, but live foreground logs later proved that failure happened
+ * before Stock acquired any framebuffer at all: its separate sa_hgl_dma
+ * contiguous allocation failed (see main.c's reservation). Normalizing
+ * remains useful descriptor/display hygiene for players that assume page
+ * zero. Blit the final frame there first when the bootloader opened on a
+ * different page, avoiding a flash of stale page-zero contents, then pan.
+ * Best-effort: a failed query or pan is logged and never blocks handoff. */
+static void fb_normalize_to_page_zero(void) {
+    if (!fb_mem || !back_buffer || fb_fd < 0) return;
+
+    if (fb_base_offset_pixels != 0) {
+        for (int y = 0; y < FB_HEIGHT; y++) {
+            memcpy(fb_mem + (size_t) y * fb_stride_pixels,
+                   back_buffer + (size_t) y * FB_WIDTH, (size_t) FB_WIDTH * sizeof(uint16_t));
+        }
+    }
+
+    struct fb_var_screeninfo vinfo;
+    if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) != 0) {
+        perror("fb_draw: FBIOGET_VSCREENINFO before pan-to-page-0 failed");
+        return;
+    }
+    vinfo.xoffset = 0;
+    vinfo.yoffset = 0;
+    if (ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo) != 0) {
+        perror("fb_draw: FBIOPAN_DISPLAY to page 0 failed");
+    }
+}
+
 void fb_close(void) {
+    fb_normalize_to_page_zero();
+
     if (fb_mem) {
         munmap(fb_mem, fb_mem_len);
         fb_mem = NULL;

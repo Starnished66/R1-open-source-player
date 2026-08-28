@@ -1,8 +1,8 @@
 diff --git a/src/libs/tiny_ttf/lv_tiny_ttf.c b/src/libs/tiny_ttf/lv_tiny_ttf.c
-index b185d39..f1033b7 100644
+index b185d39..087f911 100644
 --- a/src/libs/tiny_ttf/lv_tiny_ttf.c
 +++ b/src/libs/tiny_ttf/lv_tiny_ttf.c
-@@ -134,6 +134,8 @@ void lv_tiny_ttf_destroy(lv_font_t * font)
+@@ -134,18 +134,23 @@ void lv_tiny_ttf_destroy(lv_font_t * fon
  
  void lv_tiny_ttf_init(void)
  {
@@ -11,7 +11,12 @@ index b185d39..f1033b7 100644
      lv_cache_ops_t ops = {
          .compare_cb = (lv_cache_compare_cb_t)tiny_ttf_cache_compare_cb,
          .create_cb = (lv_cache_create_cb_t)tiny_ttf_cache_create_cb,
-@@ -145,7 +147,10 @@ void lv_tiny_ttf_init(void)
+         .free_cb = (lv_cache_free_cb_t)tiny_ttf_cache_free_cb,
+     };
+ 
+-    tiny_ttf_cache = lv_cache_create(&lv_cache_class_lru_rb_count, sizeof(tiny_ttf_cache_data_t), 128, ops);
++    tiny_ttf_cache = lv_cache_create(&lv_cache_class_lru_rb_count, sizeof(tiny_ttf_cache_data_t), 512, ops);
+ }
  
  void lv_tiny_ttf_deinit(void)
  {
@@ -23,7 +28,7 @@ index b185d39..f1033b7 100644
  }
  
  /**********************
-@@ -286,6 +291,9 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
+@@ -286,6 +291,9 @@ static lv_font_t * lv_tiny_ttf_create(co
          dsc->stream.size = data_size;
      }
      if(0 == stbtt_InitFont(&dsc->info, &dsc->stream, stbtt_GetFontOffsetForIndex(&dsc->stream, 0))) {
@@ -33,7 +38,7 @@ index b185d39..f1033b7 100644
          lv_free(dsc);
          LV_LOG_ERROR("tiny_ttf: init failed\n");
          return NULL;
-@@ -302,6 +310,11 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
+@@ -302,6 +310,11 @@ static lv_font_t * lv_tiny_ttf_create(co
  
      lv_font_t * out_font = lv_malloc_zeroed(sizeof(lv_font_t));
      if(out_font == NULL) {

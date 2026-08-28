@@ -15,6 +15,7 @@
 
 #include "lyrics.h"
 #include "lyrics_layout.h"
+#include "fallback_font.h"
 
 typedef struct {
     int tier;
@@ -42,8 +43,9 @@ extern lv_font_t app_font_lyrics;
 extern void enable_gesture_bubble_recursive(lv_obj_t * parent);
 extern lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * text);
 extern lv_color_t accent_lv_color(void);
-extern void show_lyrics_font_size_reboot_popup(void);
 extern lv_obj_t * build_subsonic_list_screen(const char * title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
+extern void show_error_toast(const char * msg);
+extern void gui_navigation_invalidate_font_snapshots(void);
 
 
 extern lv_style_t style_theme_screen_bg;
@@ -850,13 +852,61 @@ static void populate_lyrics_font_size_screen(void) {
         lv_obj_add_event_cb(row, lyrics_font_size_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
     }
 }
+/* Live-apply, same black-mask-behind-a-one-shot-timer shape as the general
+ * Font Size selector (font_size_option_row_cb()/font_size_apply_timer_cb(),
+ * gui_network.c) -- no more "Restart Now?" popup/real reboot. Deliberately
+ * lighter than that one's own post-apply refresh: app_font_lyrics is
+ * consumed exclusively by this screen's own row pool (gui_lyrics_refresh_
+ * layout() already resyncs it, including live descender-free row heights,
+ * pixel-perfect), so there's no Settings-pill-row geometry or nav-stack
+ * sweep to do here, unlike a general Font Size change. */
+static void lyrics_font_size_apply_timer_cb(lv_timer_t * timer) {
+    lv_obj_t * mask = (lv_obj_t *) lv_timer_get_user_data(timer);
+    int target = (int) (intptr_t) lv_obj_get_user_data(mask) - 1;
+    lv_timer_delete(timer);
+    if (!fallback_font_apply_lyrics_size_tier(target)) {
+        lv_obj_delete(mask);
+        show_error_toast("Could not apply lyrics text size");
+        return;
+    }
+
+    gui_navigation_invalidate_font_snapshots();
+    current_settings.lyrics_font_size_tier = target;
+    settings_save(&current_settings);
+    gui_lyrics_refresh_layout();
+    populate_lyrics_font_size_screen();
+
+    lv_obj_delete(mask);
+}
+
 static void lyrics_font_size_option_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
-    current_settings.lyrics_font_size_tier = lyrics_font_size_options[index].tier;
-    settings_save(&current_settings);
-    populate_lyrics_font_size_screen();
-    show_lyrics_font_size_reboot_popup();
+    int target = lyrics_font_size_options[index].tier;
+    if (target == current_settings.lyrics_font_size_tier) return;
+
+    lv_obj_t * mask = lv_obj_create(lv_layer_sys());
+    lv_obj_set_user_data(mask, (void *) (intptr_t) (target + 1));
+    lv_display_t * display = lv_display_get_default();
+    lv_obj_set_size(mask,
+                    lv_display_get_horizontal_resolution(display),
+                    lv_display_get_vertical_resolution(display));
+    lv_obj_align(mask, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(mask, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(mask, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(mask, 0, 0);
+    lv_obj_set_style_radius(mask, 0, 0);
+    lv_obj_set_style_pad_all(mask, 0, 0);
+    lv_obj_remove_flag(mask, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(mask, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(mask);
+    lv_obj_invalidate(mask);
+
+    /* Leave enough time for the normal refresh timer to paint the mask;
+     * synchronous lv_refr_now() here would re-enter rendering from an input
+     * callback -- see font_size_option_row_cb()'s own matching comment
+     * (gui_network.c) for why. */
+    lv_timer_create(lyrics_font_size_apply_timer_cb, 35, mask);
 }
 static lv_obj_t * build_lyrics_font_size_screen(void) {
     lv_obj_t * title_label; /* unused after build -- title never changes */

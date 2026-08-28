@@ -59,6 +59,52 @@ static bool s_custom_staged_valid = false;
 static uint32_t s_custom_font_generation = 0;
 static bool s_fallback_loaded = false;
 
+/* Real-device bug report: scrolling lists (Albums) became painfully slow
+ * once a custom SD-card font was selected. Root cause, confirmed by
+ * instrumenting the actual vendored stb_truetype
+ * (lvgl/src/libs/tiny_ttf/stb_truetype_htcw.h) against a real user font
+ * pulled from a device: lv_tiny_ttf_create_file() keeps STAGING_CUSTOM_FILE
+ * open and streams table data on demand, and LV_FS_POSIX_CACHE_SIZE is 0
+ * (lv_conf.h), so every ~2-byte stb_truetype read becomes an uncached
+ * read()+seek() syscall pair -- ~82 of them per glyph, paid on every
+ * cache-miss (i.e. every new album-title character scrolled into view, not
+ * just repeats). Raw rasterization speed was not the problem (measured
+ * faster than a normal system font). The 128->512 glyph-cache bump made
+ * earlier (patches/lvgl_runtime_fixes.patch) only helps *re-visited*
+ * glyphs and is kept as an independent, real improvement -- it just can't
+ * fix this, since a virtualized list scrolling through new content is
+ * mostly cache misses.
+ *
+ * Fix: read STAGING_CUSTOM_FILE into memory once and use
+ * lv_tiny_ttf_create_data() instead -- its stream read/seek callbacks
+ * reduce to a memcpy against this buffer (lv_tiny_ttf.c's
+ * ttf_cb_stream_read/seek), zero syscalls per glyph. Shared by every
+ * pixel-size instance built from the same file content (they all just hold
+ * a pointer into it, confirmed by reading lv_tiny_ttf_destroy() -- it never
+ * frees dsc->stream.data for the data-backed path, so this buffer's
+ * lifetime is entirely owned here, not by tiny_ttf itself).
+ *
+ * Deliberately NOT applied to the CJK/Korean/Thai fallback faces
+ * (FACE_SRC_CJK/KOREAN/THAI below) -- Korean.ttf alone is 4.3MB, a
+ * materially different RAM tradeoff on this ~19MB-available device than a
+ * typical custom font, and the fallback chain is only consulted for
+ * out-of-range characters rather than every glyph of every visible label,
+ * so it isn't the scroll-critical path this bug report is about.
+ *
+ * s_custom_font_data/_size/_generation is the committed buffer any already-
+ * built custom lv_font_t instances point into. s_candidate_font_data/_size
+ * exists only mid-transaction (see build_custom_font_data_candidate() /
+ * commit_custom_font_data() / discard_custom_font_data_candidate() below),
+ * mirroring this file's existing candidate-table pattern for faces
+ * (build_candidate_slot(), destroy_new_candidate_faces()) so a failed
+ * font-tier/custom-font transaction can never leave a currently-in-use
+ * buffer freed out from under a live face. */
+static uint8_t * s_custom_font_data = NULL;
+static size_t s_custom_font_data_size = 0;
+static uint32_t s_custom_font_data_generation = 0;
+static uint8_t * s_candidate_font_data = NULL;
+static size_t s_candidate_font_data_size = 0;
+
 typedef enum {
     FACE_SRC_CUSTOM = 0,
     FACE_SRC_CJK,
@@ -154,7 +200,103 @@ static const char * face_source_file_path(face_source_type_t type, bool custom_s
     }
 }
 
+/* See s_custom_font_data's own comment above for why this exists. Populates
+ * s_candidate_font_data/_size for target_gen: reuses the already-committed
+ * s_custom_font_data unchanged (zero I/O) if its generation already
+ * matches, otherwise reads STAGING_CUSTOM_FILE fully into a fresh buffer.
+ * Returns false on any stat/open/read failure, leaving committed state
+ * (and any already-active custom lv_font_t instances) untouched. */
+static bool build_custom_font_data_candidate(uint32_t target_gen) {
+    if (s_custom_font_data && s_custom_font_data_generation == target_gen) {
+        s_candidate_font_data = s_custom_font_data;
+        s_candidate_font_data_size = s_custom_font_data_size;
+        return true;
+    }
+
+    struct stat st;
+    if (stat(STAGING_CUSTOM_FILE, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        return false;
+    }
+
+    FILE * f = fopen(STAGING_CUSTOM_FILE, "rb");
+    if (!f) return false;
+
+    uint8_t * buf = lv_malloc((size_t) st.st_size);
+    if (!buf) {
+        fclose(f);
+        DBG_LOG("fallback_font: out of memory reading %s into RAM (%lld bytes)\n",
+                STAGING_CUSTOM_FILE, (long long) st.st_size);
+        return false;
+    }
+
+    size_t n = fread(buf, 1, (size_t) st.st_size, f);
+    fclose(f);
+    if (n != (size_t) st.st_size) {
+        lv_free(buf);
+        DBG_LOG("fallback_font: short read staging custom font into RAM (%zu of %lld bytes)\n",
+                n, (long long) st.st_size);
+        return false;
+    }
+
+    s_candidate_font_data = buf;
+    s_candidate_font_data_size = n;
+    return true;
+}
+
+/* Rollback: frees the candidate buffer only if it's a freshly-read one (not
+ * the same pointer as the still-committed buffer), then clears candidate
+ * state. Safe to call even if no candidate was ever built this
+ * transaction. */
+static void discard_custom_font_data_candidate(void) {
+    if (s_candidate_font_data && s_candidate_font_data != s_custom_font_data) {
+        lv_free(s_candidate_font_data);
+    }
+    s_candidate_font_data = NULL;
+    s_candidate_font_data_size = 0;
+}
+
+/* Commit: call ONLY after the transaction's existing "destroy old faces no
+ * longer used" step has already run, so no live lv_font_t still points at
+ * whatever buffer this frees. If the candidate is a different buffer than
+ * what's currently committed, frees the old one and adopts the candidate;
+ * if it's the same pointer (the common case for a Font Size tier change
+ * with the custom font unchanged), this is a no-op besides bookkeeping. */
+static void commit_custom_font_data(uint32_t generation) {
+    if (s_candidate_font_data && s_candidate_font_data != s_custom_font_data) {
+        lv_free(s_custom_font_data);
+        s_custom_font_data = s_candidate_font_data;
+        s_custom_font_data_size = s_candidate_font_data_size;
+    }
+    s_custom_font_data_generation = generation;
+    s_candidate_font_data = NULL;
+    s_candidate_font_data_size = 0;
+}
+
+/* Explicit teardown when reverting to Default -- no candidate is ever built
+ * for that case, since build_candidate_slot()/build_new_tier_slot() never
+ * call load_face_from_file(FACE_SRC_CUSTOM, ...) when custom_staged is
+ * false. Safe to call when nothing was ever loaded (no-op). */
+static void release_custom_font_data(void) {
+    lv_free(s_custom_font_data);
+    s_custom_font_data = NULL;
+    s_custom_font_data_size = 0;
+    s_custom_font_data_generation = 0;
+}
+
 static lv_font_t * load_face_from_file(face_source_type_t type, int pixel_size, bool custom_staged) {
+    /* Custom faces come from the in-memory buffer built by
+     * build_custom_font_data_candidate() -- see s_custom_font_data's own
+     * comment for why this type alone skips the disk-streaming path below. */
+    if (type == FACE_SRC_CUSTOM) {
+        if (!custom_staged || !s_candidate_font_data) return NULL;
+        lv_font_t * font = lv_tiny_ttf_create_data(s_candidate_font_data, s_candidate_font_data_size, pixel_size);
+        if (!font) {
+            DBG_LOG("fallback_font: failed loading custom face (in-memory) at %d px\n", pixel_size);
+            return NULL;
+        }
+        return font;
+    }
+
     const char * filepath = face_source_file_path(type, custom_staged);
     if (!filepath) return NULL;
 
@@ -334,6 +476,15 @@ bool fallback_font_apply_size_tier(int tier) {
         if (s_loaded_faces[i].pixel_size == lyrics_px)
             candidate.entries[candidate.count++] = s_loaded_faces[i];
     }
+    /* Custom font content is unchanged by a tier switch -- this reuses the
+     * already-committed in-memory buffer at zero I/O cost in the common
+     * case (see s_custom_font_data's own comment). */
+    if (s_custom_staged_valid && !build_custom_font_data_candidate(s_custom_font_generation)) {
+        DBG_LOG("fallback_font: size tier %d build failed (custom font data); keeping tier %d\n",
+                tier, s_font_size_tier);
+        return false;
+    }
+
     lv_font_t cand_16, cand_20, cand_22, cand_28;
     bool ok = true;
 #define BUILD_TIER_SLOT(out, px) \
@@ -350,6 +501,7 @@ bool fallback_font_apply_size_tier(int tier) {
         DBG_LOG("fallback_font: size tier %d build failed; keeping tier %d\n",
                 tier, s_font_size_tier);
         destroy_new_candidate_faces(&candidate);
+        discard_custom_font_data_candidate();
         return false;
     }
 
@@ -361,6 +513,7 @@ bool fallback_font_apply_size_tier(int tier) {
             !face_table_contains_font(&candidate, s_loaded_faces[i].font)) {
             if (candidate.count >= MAX_LOADED_FACES) {
                 destroy_new_candidate_faces(&candidate);
+                discard_custom_font_data_candidate();
                 return false;
             }
             candidate.entries[candidate.count++] = s_loaded_faces[i];
@@ -379,6 +532,80 @@ bool fallback_font_apply_size_tier(int tier) {
     s_loaded_face_count = candidate.count;
     for (int i = 0; i < candidate.count; i++) s_loaded_faces[i] = candidate.entries[i];
     s_font_size_tier = tier;
+    if (s_custom_staged_valid) commit_custom_font_data(s_custom_font_generation);
+    return true;
+}
+
+/* See this function's own declaration (fallback_font.h) for the reuse
+ * reasoning. Shape mirrors fallback_font_apply_custom()'s own five-slot
+ * rebuild (build_candidate_slot(), not build_new_tier_slot() -- this isn't
+ * rebuilding every general slot's own fallback chain the way a Font Size
+ * tier change does, so none of that function's own "must not reuse a live
+ * face mid-chain-rewire" concern applies here). */
+bool fallback_font_apply_lyrics_size_tier(int tier) {
+    if (tier < 1 || tier > 2) return false;
+    if (tier == s_lyrics_font_size_tier) return true;
+
+    int size_16, size_20, size_22, size_28;
+    tier_pixel_sizes(s_font_size_tier, &size_16, &size_20, &size_22, &size_28);
+    int size_lyrics = (tier == 1) ? 32 : 40;
+
+    if (s_custom_staged_valid && !build_custom_font_data_candidate(s_custom_font_generation)) {
+        DBG_LOG("fallback_font: lyrics tier %d build failed (custom font data); keeping tier %d\n",
+                tier, s_lyrics_font_size_tier);
+        return false;
+    }
+
+    face_table_t candidate_table = {0};
+    lv_font_t cand_16, cand_20, cand_22, cand_28, cand_lyrics;
+
+    bool ok = true;
+    ok = ok && build_candidate_slot(&candidate_table, &cand_16, size_16, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
+    ok = ok && build_candidate_slot(&candidate_table, &cand_20, size_20, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
+    ok = ok && build_candidate_slot(&candidate_table, &cand_22, size_22, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
+    ok = ok && build_candidate_slot(&candidate_table, &cand_28, size_28, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
+    ok = ok && build_candidate_slot(&candidate_table, &cand_lyrics, size_lyrics, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
+
+    if (!ok) {
+        DBG_LOG("fallback_font: lyrics tier %d build failed; keeping tier %d\n", tier, s_lyrics_font_size_tier);
+        for (int i = 0; i < candidate_table.count; i++) {
+            lv_font_t * cand_font = candidate_table.entries[i].font;
+            bool was_in_old = false;
+            for (int j = 0; j < s_loaded_face_count; j++) {
+                if (s_loaded_faces[j].font == cand_font) { was_in_old = true; break; }
+            }
+            if (!was_in_old && cand_font) {
+                lv_tiny_ttf_destroy(cand_font);
+            }
+        }
+        discard_custom_font_data_candidate();
+        return false;
+    }
+
+    for (int j = 0; j < s_loaded_face_count; j++) {
+        lv_font_t * old_font = s_loaded_faces[j].font;
+        bool in_new = false;
+        for (int i = 0; i < candidate_table.count; i++) {
+            if (candidate_table.entries[i].font == old_font) { in_new = true; break; }
+        }
+        if (!in_new && old_font) {
+            lv_tiny_ttf_destroy(old_font);
+        }
+    }
+
+    app_font_16 = cand_16;
+    app_font_20 = cand_20;
+    app_font_22 = cand_22;
+    app_font_28 = cand_28;
+    app_font_lyrics = cand_lyrics;
+
+    s_loaded_face_count = candidate_table.count;
+    for (int i = 0; i < candidate_table.count; i++) {
+        s_loaded_faces[i] = candidate_table.entries[i];
+    }
+
+    s_lyrics_font_size_tier = tier;
+    if (s_custom_staged_valid) commit_custom_font_data(s_custom_font_generation);
     return true;
 }
 
@@ -654,6 +881,11 @@ bool fallback_font_apply_custom(const char * custom_filename) {
         candidate_staged_valid = false;
     }
 
+    if (!is_default && !build_custom_font_data_candidate(target_gen)) {
+        DBG_LOG("fallback_font: failed reading staged custom font %s into RAM\n", custom_filename);
+        return false;
+    }
+
     int size_16, size_20, size_22, size_28;
     tier_pixel_sizes(s_font_size_tier, &size_16, &size_20, &size_22, &size_28);
     int size_lyrics = (s_lyrics_font_size_tier == 1) ? 32 : 40;
@@ -682,6 +914,7 @@ bool fallback_font_apply_custom(const char * custom_filename) {
                 lv_tiny_ttf_destroy(cand_font);
             }
         }
+        discard_custom_font_data_candidate();
         return false;
     }
 
@@ -713,8 +946,10 @@ bool fallback_font_apply_custom(const char * custom_filename) {
     s_custom_staged_valid = candidate_staged_valid;
     if (is_default) {
         s_active_custom_name[0] = '\0';
+        release_custom_font_data();
     } else {
         utf8_truncate_safe(s_active_custom_name, custom_filename, sizeof(s_active_custom_name));
+        commit_custom_font_data(target_gen);
     }
 
     return true;
@@ -748,6 +983,16 @@ void fallback_font_init_early(int font_size_tier, int lyrics_font_size_tier) {
         }
     }
 
+    /* This function doesn't roll back on a failed face build today (return
+     * values already ignored below) -- match that existing risk profile:
+     * on a data-load failure, just leave custom_staged_valid false so the
+     * five slots below fall back to Montserrat exactly as they would for
+     * any other custom-load failure. */
+    if (s_custom_staged_valid && !build_custom_font_data_candidate(s_custom_font_generation)) {
+        DBG_LOG("fallback_font: failed reading staged custom font into RAM at startup\n");
+        s_custom_staged_valid = false;
+    }
+
     int size_16, size_20, size_22, size_28;
     tier_pixel_sizes(font_size_tier, &size_16, &size_20, &size_22, &size_28);
     int size_lyrics = (lyrics_font_size_tier == 1) ? 32 : 40;
@@ -763,10 +1008,22 @@ void fallback_font_init_early(int font_size_tier, int lyrics_font_size_tier) {
     for (int i = 0; i < init_table.count; i++) {
         s_loaded_faces[i] = init_table.entries[i];
     }
+    if (s_custom_staged_valid) commit_custom_font_data(s_custom_font_generation);
 }
 
 void fallback_font_load_now(void) {
     s_fallback_loaded = true;
+
+    /* In practice build_candidate_slot()'s own reuse-from-s_loaded_faces
+     * path (matching generation) already satisfies the custom slot here
+     * without a fresh read, since this runs shortly after fallback_font_
+     * init_early()/fallback_font_apply_custom() committed one at the same
+     * sizes -- but guard it anyway rather than relying on that timing
+     * coincidence. Same no-rollback risk profile as this function already
+     * has for its own build_candidate_slot() calls below. */
+    if (s_custom_staged_valid && !build_custom_font_data_candidate(s_custom_font_generation)) {
+        DBG_LOG("fallback_font: failed reading staged custom font into RAM for fallback load\n");
+    }
 
     int size_16, size_20, size_22, size_28;
     tier_pixel_sizes(s_font_size_tier, &size_16, &size_20, &size_22, &size_28);
@@ -792,6 +1049,7 @@ void fallback_font_load_now(void) {
     for (int i = 0; i < table.count; i++) {
         s_loaded_faces[i] = table.entries[i];
     }
+    if (s_custom_staged_valid) commit_custom_font_data(s_custom_font_generation);
 
     fallback_font_refresh_ui();
 }

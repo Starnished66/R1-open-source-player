@@ -1983,42 +1983,6 @@ static void build_factory_reset_popup(void) {
         factory_reset_popup_backdrop_cb, &factory_reset_popup_backdrop);
 }
 
-/* Lyrics Text Size remains an independent reboot-applied setting.  The
- * general Font Size selector deliberately does not use this popup. */
-static lv_obj_t * lyrics_font_reboot_popup;
-static lv_obj_t * lyrics_font_reboot_backdrop;
-
-static void hide_lyrics_font_reboot_popup(void) {
-    lv_obj_add_flag(lyrics_font_reboot_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(lyrics_font_reboot_popup, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void lyrics_font_reboot_dismiss_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED) hide_lyrics_font_reboot_popup();
-}
-
-static void lyrics_font_reboot_now_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_lyrics_font_reboot_popup();
-    char * reboot_argv[] = { (char *) "/sbin/reboot", NULL };
-    subprocess_run(reboot_argv, NULL, 0);
-}
-
-void show_lyrics_font_size_reboot_popup(void) {
-    lv_obj_remove_flag(lyrics_font_reboot_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(lyrics_font_reboot_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(lyrics_font_reboot_backdrop);
-    lv_obj_move_foreground(lyrics_font_reboot_popup);
-}
-
-static void build_lyrics_font_reboot_popup(void) {
-    lyrics_font_reboot_popup = build_confirm_popup(
-        "Restart now to apply the new lyrics text size?", LV_LABEL_LONG_WRAP,
-        NULL, NULL, "Restart Now", accent_lv_color(), lyrics_font_reboot_now_cb,
-        NULL, "Later", lv_color_make(160, 160, 160), lyrics_font_reboot_dismiss_cb,
-        NULL, lyrics_font_reboot_dismiss_cb, &lyrics_font_reboot_backdrop);
-}
-
 /* Settings -> System -> Hostname uses the shared confirmation-popup helper;
  * see hostname_apply()'s own comment for why a reboot is genuinely required
  * here (wifi_on.sh/bt_init each only read their file once, on demand). */
@@ -2504,7 +2468,6 @@ void gui_settings_init(void) {
     build_firmware_update_popup();
     build_eq_reset_popup();
     build_factory_reset_popup();
-    build_lyrics_font_reboot_popup();
     build_hostname_reboot_popup();
 }
 

@@ -14,7 +14,6 @@ lv_obj_t * gui_settings_get_eq_screen(void);
 
 void gui_settings_init(void);
 void gui_settings_refresh_font_geometry(void);
-void show_lyrics_font_size_reboot_popup(void);
 
 lv_obj_t * build_home_screen(void);
 lv_obj_t * build_dac_home_screen(void);

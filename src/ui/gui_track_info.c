@@ -124,7 +124,17 @@ static void wrap_text_to_width(const char * src, char * out, size_t out_size, co
     size_t out_pos = 0;
     int32_t cur_line_w = 0;
 
-    size_t i = 0;
+    /* uint32_t, not size_t -- _lv_text_encoded_next()'s own signature is
+     * uint32_t (*)(const char *, uint32_t *) (lv_text_private.h). On a
+     * 32-bit target size_t and uint32_t are the same width, so this built
+     * silently there, but on a 64-bit host passing a size_t* (8 bytes)
+     * where the callee only ever writes/reads 4 lets the top 4 bytes sit
+     * uninitialized garbage that the next `i`/`c_idx` read as part of a
+     * wider size_t -- a real correctness bug on host, not just a build
+     * nuisance. token_start/token_bytes/c_idx/char_start are all derived
+     * from the same byte-index space and follow suit; char_len already
+     * was uint32_t. */
+    uint32_t i = 0;
     while (src[i] != '\0' && out_pos + 1 < out_size) {
         if (src[i] == '\n') {
             out[out_pos++] = '\n';
@@ -133,7 +143,7 @@ static void wrap_text_to_width(const char * src, char * out, size_t out_size, co
             continue;
         }
 
-        size_t token_start = i;
+        uint32_t token_start = i;
         int32_t token_w = 0;
         while (src[i] != '\0' && src[i] != '\n') {
             uint32_t letter = _lv_text_encoded_next(src, &i);
@@ -145,7 +155,7 @@ static void wrap_text_to_width(const char * src, char * out, size_t out_size, co
                 break;
             }
         }
-        size_t token_bytes = i - token_start;
+        uint32_t token_bytes = i - token_start;
 
         if (cur_line_w + token_w <= max_width || cur_line_w == 0) {
             if (out_pos + token_bytes < out_size) {
@@ -162,9 +172,9 @@ static void wrap_text_to_width(const char * src, char * out, size_t out_size, co
             }
 
             if (token_w > max_width) {
-                size_t c_idx = token_start;
+                uint32_t c_idx = token_start;
                 while (c_idx < token_start + token_bytes && out_pos + 1 < out_size) {
-                    size_t char_start = c_idx;
+                    uint32_t char_start = c_idx;
                     uint32_t letter = _lv_text_encoded_next(src, &c_idx);
                     uint32_t next_letter = (c_idx < token_start + token_bytes) ? _lv_text_encoded_next(src, NULL) : 0;
                     int32_t glyph_w = lv_font_get_glyph_width(font, letter, next_letter);

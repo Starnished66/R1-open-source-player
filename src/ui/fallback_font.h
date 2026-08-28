@@ -31,6 +31,20 @@ void fallback_font_load_now(void);
  * handles are committed.  app_font_lyrics is deliberately left untouched. */
 bool fallback_font_apply_size_tier(int tier);
 
+/* Transactionally rebuilds only app_font_lyrics for a Settings -> Display
+ * -> Lyrics Text Size tier (1 = Medium/32px, 2 = Large/40px). Mirrors
+ * fallback_font_apply_size_tier()'s own shape but keyed the other way --
+ * uses build_candidate_slot()'s reuse-aware primitive (same one
+ * fallback_font_apply_custom() already uses) for all five font handles,
+ * so the four general-UI handles (unchanged by this call) come back out
+ * of the existing font registry at zero extra cost, and a lyrics size that
+ * happens to coincide with the general Font Size tier's own 28px slot
+ * (Medium = 32px, BlindMF = 40px) transparently reuses that same handle
+ * instead of loading a duplicate -- no special-case overlap code needed,
+ * the reuse lookup is keyed by (type, pixel size) regardless of which
+ * slot asks first. */
+bool fallback_font_apply_lyrics_size_tier(int tier);
+
 /* Discovers custom TTF files under <SD>/Fonts */
 int fallback_font_discover_custom(char out_names[][64], int max_count);
 

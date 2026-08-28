@@ -44,6 +44,14 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include <stdarg.h>
 #include <errno.h>
 #include <sched.h>
+/* SCHED_BATCH below is glibc's own <bits/sched.h> policy constant, gated
+ * behind _GNU_SOURCE there -- this file deliberately doesn't define that
+ * (see search_matches()'s own comment on strcasestr() for why). The raw
+ * kernel UAPI header defines the same numeric policy constants ungated on
+ * both glibc and musl (confirmed in both toolchains' linux/sched.h), so
+ * this alone is enough on host and target alike without touching feature-
+ * test macros anywhere in this file. */
+#include <linux/sched.h>
 #include <sys/resource.h>
 
 #ifdef TEST_BUILD_TAG

@@ -53,20 +53,38 @@ endif
 #      entirely from upstream -- a clean clone fails to link with
 #      "undefined reference to `lv_linux_fbdev_get_active_page'" (and the
 #      other five) the moment either caller is linked in.
-#   2. runtime fixes (patches/lvgl_runtime_fixes.patch): three small
-#      genuine upstream bugs this app hit in practice, not feature work --
-#      lv_tiny_ttf_init()/_deinit() missing a null-guard (a second init
-#      call, or deinit after a failed init, double-destroys/leaks the
-#      shared font cache) plus two error paths in lv_tiny_ttf_create()
-#      that leaked an open font-file handle; _lv_cache_lru_rb.c's
-#      drop_all_cb() destroyed the cache's red-black tree without
-#      reinitializing it, so any cache use after a full clear (e.g. a
-#      settings change that invalidates cached UI bitmaps) operated on a
-#      destroyed tree; tjpgdcnf.h's JD_USE_SCALE was left at the upstream
-#      default of 0, disabling TJpgDec's own output downscaling that this
-#      app's album-art thumbnail path relies on to decode cover JPEGs
-#      straight to thumbnail resolution instead of full-size-then-
-#      software-resize (see ISSUES.md's Albums-screen overheat/OOM entry).
+#   2. runtime fixes (patches/lvgl_runtime_fixes.patch): four small
+#      genuine upstream bugs/limitations this app hit in practice, not
+#      feature work -- lv_tiny_ttf_init()/_deinit() missing a null-guard (a
+#      second init call, or deinit after a failed init, double-destroys/
+#      leaks the shared font cache) plus two error paths in
+#      lv_tiny_ttf_create() that leaked an open font-file handle;
+#      _lv_cache_lru_rb.c's drop_all_cb() destroyed the cache's red-black
+#      tree without reinitializing it, so any cache use after a full clear
+#      (e.g. a settings change that invalidates cached UI bitmaps) operated
+#      on a destroyed tree; tjpgdcnf.h's JD_USE_SCALE was left at the
+#      upstream default of 0, disabling TJpgDec's own output downscaling
+#      that this app's album-art thumbnail path relies on to decode cover
+#      JPEGs straight to thumbnail resolution instead of full-size-then-
+#      software-resize (see ISSUES.md's Albums-screen overheat/OOM entry);
+#      lv_tiny_ttf_init() also hardcoded its shared rasterized-glyph LRU
+#      cache to 128 entries -- fine for this app's default Montserrat
+#      tiers, which are pre-baked bitmap fonts (lv_font_montserrat_*, see
+#      the generated-fonts category below) that never touch this cache at
+#      all, but the moment Settings > Display > Font applies a custom SD
+#      card .ttf, every one of app_font_16/20/22/28/lyrics (fallback_font.c)
+#      becomes a runtime-rasterized tiny_ttf instance sharing this one
+#      global cache -- a scrolling list cycling through more distinct
+#      glyphs than that across those sizes evicts and re-rasterizes
+#      (STB truetype software rasterization) on nearly every frame, which
+#      is exactly the real-device report ("selecting an SD card font lags
+#      the device, scroll lists become slow"). Bumped to 512: each cached
+#      glyph is a small LV_COLOR_FORMAT_A8 bitmap sized to its own glyph
+#      box (tiny_ttf_cache_create_cb()), so worst case (512 of the largest
+#      BlindMF-tier glyphs) is still under ~1MB against this device's
+#      ~19MB available RAM, comfortably covering several font sizes' full
+#      alphanumeric+punctuation working sets at once without the earlier
+#      128-entry thrashing.
 #   3. generated fonts (patches/lvgl_generated_fonts/, copied in whole
 #      rather than diffed): the four Montserrat .c files regenerated with
 #      an expanded lv_font_conv codepoint range (Latin-1 Supplement +

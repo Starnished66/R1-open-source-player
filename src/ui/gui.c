@@ -1287,13 +1287,24 @@ static uint32_t boot_splash_start_tick = 0;
  * elapsed-time math in gui_init()'s own wait (see boot_splash_start_tick's
  * use below) is measured from as close to true process start as possible.
  *
- * Uses asset_path("boot_animation/en/0.png") rather than a hardcoded path:
- * this app's own THEME_ROOT (theme2) has no boot_animation asset at all --
+ * Uses asset_path("boot_animation/en/0.jpg"), the same baseline-JPEG file
+ * the bootloader itself draws (src/bootloader/main.c's BOOTLOADER_BG_PATH),
+ * rather than the source 0.png sibling -- real-device testing showed a
+ * visible pop at the handoff pan-swap when this screen decoded the PNG:
+ * pixel-identical regions of the same artwork still differ by up to ~65/255
+ * per channel against the bootloader's JPEG re-encode (block-edge/gradient
+ * artifacts from that lossy pass), which reads as a flicker at the instant
+ * the display pans to this screen's page even though the pan itself is
+ * atomic. Decoding the exact same file (LV_USE_TJPGD, already enabled)
+ * makes this repaint byte-for-byte identical to what was already on
+ * screen, so the swap is invisible.
+ *
+ * This app's own THEME_ROOT (theme2) has no boot_animation asset at all --
  * only theme1 does, and that file is the stock "HIBY" wordmark, which this
  * project deliberately doesn't ship (see 89d7ca6d9, "rename app off the
  * HiBy trademark"). asset_path()'s existing THEME_OVERRIDE_ROOT check
  * (assets.c) means a non-trademarked replacement dropped at
- * /usr/data/theme_overrides/boot_animation/en/0.png is picked up
+ * /usr/data/theme_overrides/boot_animation/en/0.jpg is picked up
  * automatically with no code change or reflash. Until that file exists,
  * the underlying decode simply fails and lv_image renders nothing --
  * SCREEN_BG_COLOR alone still gives a clean black screen instead of
@@ -1329,7 +1340,7 @@ void gui_show_boot_splash(void) {
     lv_obj_set_style_pad_all(scr, 0, 0);
 
     lv_obj_t * img = lv_image_create(scr);
-    lv_image_set_src(img, asset_path("boot_animation/en/0.png"));
+    lv_image_set_src(img, asset_path("boot_animation/en/0.jpg"));
     lv_obj_center(img);
 
     lv_screen_load(scr);

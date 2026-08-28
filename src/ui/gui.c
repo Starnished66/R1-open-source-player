@@ -1273,16 +1273,10 @@ static uint32_t boot_splash_start_tick = 0;
  * gui_show_boot_splash()'s comment. Used by gui_init()'s own settle-wait,
  * further below.
  *
- * Deliberately does NOT wait for /etc/init.d/S80_bt_init's own
- * /usr/bin/bt_init to finish -- real-device confirmed requirement:
- * Bluetooth must read "off" right when the splash lifts and STAY off
- * (no auto-enable of any kind) until the user explicitly turns it on
- * themselves. Two earlier attempts at extending this wait to hide
- * bt_init's own boot-time Bluetooth behavior, and a later attempt at
- * having this app auto-enable Bluetooth once bt_init finished in the
- * background, were all tried and reverted -- this app now does neither:
- * it just leaves Bluetooth exactly where bt_init's own (patched) script
- * leaves it, off, and never touches it again until the user does. */
+ * main.c may hold this splash longer while S80_bt_init reaches its
+ * trustworthy final state.  That readiness wait does not enable or alter
+ * Bluetooth; it only prevents UI construction/status polling from observing
+ * bt_init's temporary powered state. */
 #define BOOT_SPLASH_MIN_DISPLAY_MS 3000
 
 /* Task #44 (stock-UX request): the stock firmware holds its own boot image
@@ -1798,10 +1792,9 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * faster, so this isn't always a flat tax on boot time. This also
      * delays start_refresh_bt_icon() (called above) by the same margin.
      *
-     * Deliberately NOT waiting here for bt_init to finish -- see
-     * BOOT_SPLASH_MIN_DISPLAY_MS's own comment, further up, for what was
-     * tried and reverted, and why Bluetooth is left alone (off, and
-     * staying off) rather than this app touching it at all during boot. */
+     * Bluetooth readiness has already been settled by main.c before
+     * gui_init() starts, so the first status worker launched above cannot
+     * capture bt_init's temporary powered state. */
     while (boot_splash_start_tick != 0 &&
            lv_tick_get() - boot_splash_start_tick < BOOT_SPLASH_MIN_DISPLAY_MS) {
         uint32_t wait_ms = lv_timer_handler();

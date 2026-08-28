@@ -24,6 +24,9 @@
 #include "wifi_status.h"
 #include "wifi_control.h"
 #include "bluetooth_control.h"
+#ifndef HOST_BUILD
+#include "bt_media_player.h"
+#endif
 #include "usb_audio_output.h"
 #include "headphone_status.h"
 #include "usb_dac_bridge.h"
@@ -898,34 +901,6 @@ bool bt_is_powered_cached = false;
 char bt_connected_mac_cached[18] = "";
 char bt_connected_codec_cached[32] = "";
 
-/* Real-device incident: on a genuine cold boot, hci0 briefly reads
- * "powered" right after S80_bt_init's own firmware flash (which leaves the
- * raw HCI device up as a side effect of attaching it), before bluetoothd
- * itself has even started, and forces it back off per its own
- * AutoEnable=false default (/etc/bluetooth/main.conf) once bluetoothd does
- * start -- a real, if variable-length (real-device measurements from ~5s
- * to ~16s depending on boot timing), on-then-off transition at the
- * hci0/bluetoothd level, not a UI caching bug -- see S80_bt_init's own
- * /usr/bin/bt_init for the actual sequence. This app's own status poll can
- * straddle that window and flash the topbar/drawer icon on, then off, a
- * few seconds apart.
- *
- * A plain time-boxed suppression window was tried here and removed
- * (2026-08-13): it only hid the transient from polls that happened to land
- * inside the window, so the same on-then-off flash still showed up right
- * after the window closed instead -- not an actual fix, just relocating
- * when the flicker becomes visible.
- *
- * The mask is now state-based rather than time-based: it remains active
- * until bt_init has written its tmpfs completion marker AND two subsequent
- * polls agree the adapter is off. A manual toggle ends it immediately, so
- * explicit user intent always wins. Starting the player later in the same
- * boot does not enable the mask because bt_init_ok already exists; resume
- * likewise never re-enters gui_init(). */
-static bool bt_boot_suppress_enabled = false;
-static unsigned int bt_boot_off_observations = 0;
-#define BT_BOOT_OFF_OBSERVATIONS_REQUIRED 2
-
 /* /usr/bin/bt_init's (stock, unmodified) very last line is
  * `mkdir -p /tmp; echo > /tmp/bt_init_ok`, right after its own real UART
  * chip firmware flash and everything else it does. /tmp is tmpfs on this
@@ -946,8 +921,15 @@ static unsigned int bt_boot_off_observations = 0;
  * comment. */
 #define BT_INIT_OK_FLAG_PATH "/tmp/bt_init_ok"
 
-static bool bt_boot_suppress_active(void) {
-    return bt_boot_suppress_enabled;
+/* Armed only by an app-driven enable path, never by the periodic boot-state
+ * poll itself. poll_refresh_bt_icon() consumes it once that existing poll
+ * reports an authoritative powered state. This adds no subprocesses to the
+ * toggle worker, and hci0's transient boot-time powered window cannot arm
+ * AVRCP by itself. */
+static atomic_bool bt_media_player_enable_pending = false;
+
+static void mark_bt_media_player_enable_pending(void) {
+    atomic_store_explicit(&bt_media_player_enable_pending, true, memory_order_release);
 }
 
 /* Moved up from the Bluetooth settings screen section further down (still
@@ -1083,8 +1065,8 @@ static void sync_bt_codec_status_icon(void) {
     if (!bt_codec_status_icon) return;
 
     bt_codec_type_t codec_type = bt_codec_identify(bt_connected_codec_cached);
-    bool eligible = bt_is_powered_cached && !bt_boot_suppress_active() &&
-                    bt_is_a2dp_connected_ui && (codec_type != BT_CODEC_TYPE_NONE);
+    bool eligible = bt_is_powered_cached && bt_is_a2dp_connected_ui &&
+                    (codec_type != BT_CODEC_TYPE_NONE);
 
     bool currently_hidden = lv_obj_has_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
 
@@ -1182,26 +1164,13 @@ static void poll_refresh_bt_icon(void) {
      * settled state once the in-flight toggle actually completes. */
     if (bt_toggle_active) return;
 
-    /* Do not graduate based on elapsed time. A worker can start its
-     * bluetoothctl query during bt_init's transient powered interval and
-     * deliver that stale "on" result after a timer expires, which is the
-     * exact cold-boot flash this mask exists to prevent. Instead require
-     * bt_init's tmpfs completion marker plus two settled "off" results.
-     * Resume never enters this state, and a deliberate user tap clears it
-     * immediately in quick_drawer_bt_event_cb(). */
-    if (bt_boot_suppress_active()) {
-        if (access(BT_INIT_OK_FLAG_PATH, F_OK) == 0 && !refresh_bt_icon_result_powered) {
-            bt_boot_off_observations++;
-            if (bt_boot_off_observations >= BT_BOOT_OFF_OBSERVATIONS_REQUIRED) {
-                bt_boot_suppress_enabled = false;
-            }
-        } else {
-            bt_boot_off_observations = 0;
-        }
-    }
-
     bool display_powered = refresh_bt_icon_result_powered;
-    if (bt_boot_suppress_active()) display_powered = false;
+
+#ifndef HOST_BUILD
+    if (display_powered &&
+        atomic_exchange_explicit(&bt_media_player_enable_pending, false, memory_order_acq_rel))
+        bt_media_player_init();
+#endif
 
     /* Discard stale A2DP/codec results if a disconnect occurred while or after the worker launched */
     bool a2dp_connected = display_powered && refresh_bt_icon_result_a2dp_connected;
@@ -2580,6 +2549,7 @@ static void * bt_toggle_thread_func(void * arg) {
     bool turning_on = !bt_control_is_powered();
     bool chip_wedged = false;
     if (!turning_on) {
+        atomic_store_explicit(&bt_media_player_enable_pending, false, memory_order_release);
         /* Real-device incident: turning Bluetooth off via the quick drawer
          * while Bluetooth DAC mode was still on left bluealsa/bt-agent
          * (spawned by bt_control_apply_output_settings() when DAC mode
@@ -2609,8 +2579,10 @@ static void * bt_toggle_thread_func(void * arg) {
          * wait here doesn't fix the underlying wedge (nothing in userspace
          * can), but at least stops doubling how long the unresponsive-
          * feeling wait lasts. */
-        if (bt_control_init_chip()) bt_control_enable();
-        else chip_wedged = true;
+        if (bt_control_init_chip()) {
+            bt_control_enable();
+            mark_bt_media_player_enable_pending();
+        } else chip_wedged = true;
     }
 
     /* Real-device bug: bt_control_is_powered() (bluetoothctl show) can
@@ -2681,7 +2653,10 @@ static void * bt_pending_enable_thread_func(void * arg) {
             if (!bt_control_is_powered()) {
                 off_observations++;
                 if (off_observations >= BT_BOOT_ENABLE_OFF_OBSERVATIONS_REQUIRED) {
-                    if (bt_control_init_chip()) bt_control_enable();
+                    if (bt_control_init_chip()) {
+                        bt_control_enable();
+                        mark_bt_media_player_enable_pending();
+                    }
                     break;
                 }
             } else {
@@ -2696,7 +2671,10 @@ static void * bt_pending_enable_thread_func(void * arg) {
      * final state once anyway. Never do this without bt_init_ok: that would
      * reintroduce the unsafe concurrent UART initialization race. */
     if (init_finished && off_observations < BT_BOOT_ENABLE_OFF_OBSERVATIONS_REQUIRED) {
-        if (bt_control_init_chip()) bt_control_enable();
+        if (bt_control_init_chip()) {
+            bt_control_enable();
+            mark_bt_media_player_enable_pending();
+        }
     }
     atomic_store_explicit(&bt_toggle_done_flag, true, memory_order_release); /* written last -- poll_bt_toggle only checks this flag */
     return NULL;
@@ -2725,14 +2703,6 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
      * either way -- exactly the fix for the earlier version of this, which
      * showed no visual feedback at all for a tap that landed too early. */
     bool bt_pending_now = bt_will_be_powered && access(BT_INIT_OK_FLAG_PATH, F_OK) != 0;
-
-    /* Ends the early-boot display suppression immediately on a real user
-     * tap -- see bt_boot_suppress_active()'s own comment for why this
-     * matters (a manual tap shouldn't be fighting a window that doesn't
-     * know the user has acted). No-op once suppression has already ended
-     * on its own. */
-    bt_boot_suppress_enabled = false;
-    bt_boot_off_observations = 0;
 
     bt_toggle_active = true;
     atomic_store_explicit(&bt_toggle_done_flag, false, memory_order_relaxed);
@@ -2857,6 +2827,7 @@ static void * bt_dac_startup_reapply_thread_func(void * arg) {
     (void) arg;
     bt_control_init_chip();
     bt_control_enable();
+    mark_bt_media_player_enable_pending();
     bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
     atomic_store_explicit(&bt_dac_startup_reapply_done_flag, true, memory_order_release); /* written last -- poll_bt_dac_startup_reapply only checks this flag */
     return NULL;

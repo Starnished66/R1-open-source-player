@@ -59,32 +59,60 @@ process's current real name, `cat /usr/bin/hiby_player.sh` and cross-check
 ## 2. Check the Bluetooth chip is actually initialized
 
 `bt_init` (the script that loads Bluetooth chip firmware and starts
-`bluetoothd`) is **not run automatically at boot** on this firmware -- the
-stock player triggers it on demand when its own Bluetooth screen opens.
-Since we killed the stock player in step 1, nothing else will do this for
-us. Check first:
+`bluetoothd` and `bluealsa`) **is run automatically at boot** on this
+firmware. The executable `/etc/init.d/S80_bt_init` starts
+`/usr/bin/bt_init` in the background before
+`S92_03_start_music_player` launches `hiby_player.sh`; with the bootloader
+installed, the resulting order is therefore `S80_bt_init` -> background
+`bt_init` -> `S92_03_start_music_player` -> bootloader -> selected player.
+The S80 script does not wait for `bt_init` to finish, so Bluetooth can still
+be flashing firmware or starting its daemons while the bootloader and player
+are starting. Open Player keeps its splash visible until `/tmp/bt_init_ok`
+exists and two authoritative polls agree the adapter has reached its final
+powered-off state. This replaces the former icon-only mask: the first Home
+frame should therefore never show bt_init's temporary powered state. The wait
+is capped at 30 seconds so a broken Bluetooth initialization cannot prevent
+the UI from appearing forever.
+
+The bootloader supervises the selected player by exit status. A clean exit
+(status 0, used by both players' `/sbin/poweroff` handoff) completes a real
+power-off. A nonzero exit, signal, launch failure, or wait failure is treated
+as a crash and reboots after one second. Device validation must cover both:
+let the normal shutdown countdown finish and confirm the unit stays off, then
+force-kill each player and confirm it still reboots.
+
+Open Player no longer registers its AVRCP media player during early boot.
+Registration starts only after the existing authoritative status poll confirms
+an app-driven Bluetooth enable. On a fresh boot, confirm no AVRCP worker is
+started while Bluetooth remains off; enable Bluetooth once, connect the
+headphones, and verify Play/Pause, Next, Previous, metadata/status, disable/
+re-enable, and a suspend/resume cycle. Repeat after tapping Bluetooth before
+`/tmp/bt_init_ok` exists so the queued-enable path is covered, and with
+Bluetooth DAC persisted on so its startup-enable path is covered.
+
+Killing the player in step 1 does not stop or restart that boot-time job.
+Check its completion marker and resulting processes before interpreting a
+Bluetooth failure as a problem in the test player:
 
 ```
-adb shell "hciconfig 2>&1"
+adb shell "ls -l /tmp/bt_init_ok 2>/dev/null; pidof bluetoothd bluealsa; hciconfig 2>&1"
 ```
 
-If this prints nothing (no `hci0`), Bluetooth hasn't been brought up yet.
-Bring it up **once**, via `setsid` so it survives past this adb shell
-invocation ending:
+`/tmp/bt_init_ok` is written by `bt_init` only after its UART firmware flash,
+`bluetoothd`, pairing agent, and `bluealsa` setup have run. Its absence during
+the first several seconds of boot can be normal because the script runs in
+the background and has taken roughly 5-16 seconds on real boots. If the marker
+appears, `hci0` exists, and the expected daemons are running, continue with
+the test; Bluetooth is deliberately left powered off until the user enables
+it in the UI.
 
-```
-adb shell "setsid /usr/bin/bt_init > /usr/data/bt_init.log 2>&1 & sleep 10; cat /usr/data/bt_init.log; hciconfig 2>&1"
-```
-
-Look for `UP RUNNING` in the `hciconfig` output. If `bt_init` instead prints
-`Can't get device info: No such device`, the chip firmware flash
-(`brcm_patchram_plus`, real UART flashing) failed.
-
-**Do not just re-run `bt_init` to retry.** Re-running it back-to-back
-without a real reboot in between has reliably failed in testing (confirmed
-twice) -- the chip doesn't tolerate being re-patched while already in a
-patched state. If it fails, the fix is a full device reboot, then run
-`bt_init` exactly once from that fresh boot.
+**Do not manually run or re-run `bt_init` during the same boot.** Re-running
+it after the automatic S80 launch has reliably failed in testing (confirmed
+twice) because the chip does not tolerate being patched again while already
+fully or partially initialized. If `/tmp/bt_init_ok` never appears, `hci0`
+is absent, or initialization otherwise fails, capture the available boot log
+and process state, then perform a full device reboot rather than retrying the
+script in place.
 
 ## 3. Always tag test builds so the About screen proves what's running
 

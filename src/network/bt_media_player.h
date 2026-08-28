@@ -16,14 +16,13 @@
  * audio_set_bt_output()'s own callers in gui.c). */
 
 /* Starts two independent background threads, both non-blocking and both
- * for the app's whole lifetime -- call once, as early as possible in
- * main() (right after the SIGPIPE guard); safe to call more than once,
- * only the first call does anything:
+ * for the app's whole lifetime. Call once after Bluetooth has been
+ * successfully enabled and its powered state has settled; safe to call
+ * more than once, only the first call does anything:
  *
  * 1. Connects to the system bus, registers this app's D-Bus object, and
  *    registers as BlueZ's active media player (org.bluez.Media1.
- *    RegisterPlayer), unconditionally, not gated on whether Bluetooth
- *    output is in use. Real-device finding (task #44, 2026-08-13): does
+ *    RegisterPlayer). Real-device finding (task #44, 2026-08-13): does
  *    NOT drive actual button dispatch on this device (see bt_media_
  *    player.c's own top-of-file comment) -- kept because it still answers
  *    standard AVRCP metadata/status queries correctly for any remote that

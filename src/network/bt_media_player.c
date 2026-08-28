@@ -9,6 +9,7 @@
 #include <linux/input.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -48,7 +49,8 @@
 
 static DBusConnection * conn = NULL;
 static pthread_t dispatch_thread;
-static bool init_done = false;
+static atomic_bool connect_thread_started = false;
+static atomic_bool avrcp_input_thread_started = false;
 
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool playing_state = false;    /* mirrors audio_is_playing(), for PlaybackStatus -- set via bt_media_player_notify_playback_state() */
@@ -423,11 +425,10 @@ static void * dispatch_thread_func(void * arg) {
 /* Bounded retry for dbus_bus_get() below -- real-device bug report: after a
  * freeze-triggered reboot, AVRCP transport controls stopped working for the
  * rest of that boot, even though a normal cold boot never had the problem.
- * Root cause: this is called very early in main() (right after audio_init(),
- * well before gui_init()), racing S30dbus's own dbus-daemon startup -- a
+ * Root cause: the original implementation called this very early in main(),
+ * racing S30dbus's own dbus-daemon startup -- a
  * single failed dbus_bus_get() here used to give up for the whole session
- * (init_done reset to false, but bt_media_player_init() is only ever called
- * once from main.c, so nothing actually retried). A reboot immediately
+ * (init_done reset to false, but nothing actually retried). A reboot immediately
  * following a freeze/crash is exactly the boot least likely to have normal,
  * predictable init.d timing (filesystem checks, whatever state the crash
  * left things in), so this needs to tolerate the bus not being up yet rather
@@ -512,18 +513,12 @@ static bool attempt_connect_once(void) {
  * registers unconditionally, for its whole lifetime, with no concept of
  * "is BT output currently active" gating the registration at all.
  *
- * This app now mirrors both properties: bt_media_player_init() is called
- * unconditionally again, as early as main.c can call it (right after the
- * SIGPIPE guard, before even mount_sd_card_if_needed()) rather than lazily
- * on first BT use, so this connect loop starts racing for the bus the
- * moment this process exists at all -- as close to sys_server's own head
- * start as this app's own S92 init.d position allows. And registration
- * itself (dispatch_thread_func()) no longer waits for BT output to become
- * active; it registers immediately once connected and stays registered,
- * matching sys_server's always-on model. Still never touches bluetoothd/
- * hci0 directly -- only this app's own D-Bus connection and timing changed
- * (see bluetooth_control.c's own history for why touching the daemon
- * itself is unsafe). */
+ * Later bootloader-era testing found the opposite startup relationship on
+ * this firmware: beginning the same work only after a successful Bluetooth
+ * enable avoided the early daemon-readiness race, while headphones still
+ * connected promptly and AVRCP playback controls worked. Registration is
+ * therefore lazy now, but once started it still stays registered for the
+ * rest of the app lifetime. It never touches bluetoothd/hci0 directly. */
 static void * connect_thread_func(void * arg) {
     (void) arg;
     for (int attempt = 0; attempt < DBUS_BUS_GET_RETRY_ATTEMPTS; attempt++) {
@@ -606,16 +601,23 @@ static void * avrcp_input_thread_func(void * arg) {
 }
 
 void bt_media_player_init(void) {
-    if (init_done) return;
-    init_done = true;
+    if (!atomic_exchange_explicit(&connect_thread_started, true, memory_order_acq_rel)) {
+        pthread_t connect_thread;
+        if (pthread_create(&connect_thread, NULL, connect_thread_func, NULL) == 0) {
+            pthread_detach(connect_thread);
+        } else {
+            atomic_store_explicit(&connect_thread_started, false, memory_order_release);
+        }
+    }
 
-    pthread_t connect_thread;
-    pthread_create(&connect_thread, NULL, connect_thread_func, NULL);
-    pthread_detach(connect_thread);
-
-    pthread_t avrcp_input_thread;
-    pthread_create(&avrcp_input_thread, NULL, avrcp_input_thread_func, NULL);
-    pthread_detach(avrcp_input_thread);
+    if (!atomic_exchange_explicit(&avrcp_input_thread_started, true, memory_order_acq_rel)) {
+        pthread_t avrcp_input_thread;
+        if (pthread_create(&avrcp_input_thread, NULL, avrcp_input_thread_func, NULL) == 0) {
+            pthread_detach(avrcp_input_thread);
+        } else {
+            atomic_store_explicit(&avrcp_input_thread_started, false, memory_order_release);
+        }
+    }
 }
 
 void bt_media_player_notify_playback_state(bool playing) {

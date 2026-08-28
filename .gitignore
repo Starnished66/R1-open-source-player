@@ -60,6 +60,7 @@
 /open_hiby_player_host
 /open_hiby_player_target
 /open_hiby_player_target_*
+/open_hiby_bootloader
 /compile_commands.json
 /compile_flags.txt
 
@@ -105,3 +106,5 @@ open_hiby_player
 font_fix.md
 possible_lirary_crash.md
 r1.upt
+bootloader_screenshot.png
+wireless_back_stack.png

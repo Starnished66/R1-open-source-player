@@ -9,6 +9,7 @@ CC = gcc
 CXX = g++
 CROSS_CC = mipsel-linux-musl-gcc
 CROSS_CXX = mipsel-linux-musl-g++
+CROSS_STRIP = mipsel-linux-musl-strip
 
 # Dependency directory names
 LVGL_DIR = lvgl
@@ -473,7 +474,7 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=buil
               $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_target/stb_vorbis/%.o) \
               $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_target/lua/%.o)
 
-.PHONY: all host target clean compile_commands.json
+.PHONY: all host target bootloader clean compile_commands.json
 
 # Default target builds for host simulation and generates compile commands for IDE
 all: host compile_commands.json
@@ -610,6 +611,31 @@ target: $(TARGET_BIN)
 $(TARGET_BIN): $(TARGET_OBJS)
 	$(CROSS_CXX) -o $@ $(TARGET_OBJS) $(TARGET_LDFLAGS)
 	@echo "Target build complete: File ready at '$(TARGET_BIN)'"
+
+# Standalone boot selector -- see src/bootloader/main.c's own top comment.
+# Deliberately its own tiny static binary, not linked against LVGL/the main
+# TARGET_OBJS: input_device_utils.c, subprocess.c, and tjpgd.c (for the
+# /etc/logo1.jpeg background -- see fb_draw.c's own doc comment) are pulled
+# in directly (all already dependency-free -- see their own files) rather
+# than reusing TARGET_OBJS's build rule, so this never accidentally drags
+# in the rest of the player/LVGL.
+BOOTLOADER_BIN = open_hiby_bootloader
+BOOTLOADER_SRCS = src/bootloader/main.c src/bootloader/fb_draw.c src/bootloader/input.c \
+                  src/bootloader/scanner.c src/hardware/input_device_utils.c src/core/subprocess.c \
+                  lvgl/src/libs/tjpgd/tjpgd.c
+# -ffunction-sections/-fdata-sections + -Wl,--gc-sections: standard, safe
+# combination that lets the linker drop unused functions/data at the
+# granularity of individual symbols instead of whole .o files -- the only
+# thing this bootloader intentionally over-links (subprocess.c, for the
+# mount helper calls; input_device_utils.c) is small, but neither is used
+# in full, so this actually earns its keep here rather than being cargo-cult.
+BOOTLOADER_CFLAGS = -O2 -Wall -I. -Isrc/bootloader -Isrc/hardware -Isrc/core -ffunction-sections -fdata-sections
+
+bootloader:
+	@mkdir -p build_target
+	$(CROSS_CC) $(BOOTLOADER_CFLAGS) -static -no-pie $(BOOTLOADER_SRCS) -o build_target/$(BOOTLOADER_BIN)_unstripped -Wl,--gc-sections
+	$(CROSS_STRIP) -s -o $(BOOTLOADER_BIN) build_target/$(BOOTLOADER_BIN)_unstripped
+	@echo "Bootloader build complete: File ready at '$(BOOTLOADER_BIN)'"
 
 build_target/%.o: src/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)

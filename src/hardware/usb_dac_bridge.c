@@ -96,21 +96,25 @@ static void * bridge_thread_func(void * arg) {
         return NULL;
     }
 
-    /* REVERTED (was briefly true): a real-device bug report asked for this
-     * ("Latency is very high, audio is even out of sync with the videos"),
-     * matching the same low-latency tuning airplay_bridge.c already uses
-     * successfully (~21ms vs ~85ms of ALSA buffering at this bridge's own
-     * 96kHz rate) -- but a second real-device report after trying it was
-     * "USB Dac mode is completely broken now... not emitting any sound at
-     * all", not crackling/dropouts, which reads as pcm_open() itself
-     * failing at the smaller period size on this specific hardware/kernel
-     * rather than an underrun. This is exactly the risk the original
-     * comment here already flagged as "untested on real USB-DAC hardware"
-     * before ever trying it. Do not flip this back to true without a live
-     * device confirming pcm_open() actually succeeds at period_size=1024/
-     * period_count=2 at 96000Hz on this exact hardware -- if it does, the
-     * AV-sync bug report above is still real and worth revisiting. */
-    if (!audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, false)) {
+    /* Real-device bug report: "Latency is very high, audio is even out of
+     * sync with the videos" -- matches the same low-latency tuning
+     * airplay_bridge.c already uses successfully. First attempt used
+     * audio_output.c's period_size=1024/period_count=2 (~21ms), which broke
+     * USB DAC mode outright ("completely broken now... not emitting any
+     * sound at all") -- root-caused with a standalone tinyalsa probe run
+     * directly on this hardware to pcm_open()'s hw_params negotiation
+     * rejecting that exact (period_size, period_count) pair with EINVAL
+     * (not an underrun). The probe swept nearby configs on the real device
+     * and found period_size=1024/period_count=4 (~43ms, half of this
+     * bridge's own standard ~85ms) is the smallest buffer this hardware's
+     * driver actually accepts near this range -- see audio_output.c's
+     * open_device() low_latency branch for the full sweep results and its
+     * own comment. Not yet verified under this bridge's own sustained
+     * real-device load (continuous USB isochronous jitter is a different
+     * timing profile than local file playback or AirPlay) -- if dropouts
+     * or silence reappear, check that before touching the period config
+     * again. */
+    if (!audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, true)) {
         fprintf(stderr, "usb_dac_bridge: audio_output_ensure failed\n");
         close(uac_fd);
         set_running(false);
@@ -183,7 +187,7 @@ static void * bridge_thread_func(void * arg) {
          * low_latency value as the initial audio_output_ensure() call
          * above -- a mismatch here would make every single chunk look like
          * a mode change and force a reopen on every read, not just once. */
-        audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, false);
+        audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, true);
 
         /* Overwrite the always-noise first channel slot with the real
          * second one -- see the empirical finding in this file's top

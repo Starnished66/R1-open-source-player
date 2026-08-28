@@ -133,17 +133,32 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
              * shairport itself; this app instead relays through a FIFO into
              * this shared local ALSA path, whose standard tuning below adds
              * its own ~186ms start_threshold on top with no decoder-timing
-             * reason for a live source (AirPlay currently -- see this
-             * function's own caller) to pay it. That buffer isn't PURELY
-             * wasted latency, though: it also absorbs scheduling/FIFO-
-             * delivery jitter (screen redraws, database/artwork activity,
-             * Wi-Fi), so two periods is a real, smaller underrun-tolerance
-             * tradeoff (not a single-period config, which tinyalsa is more
-             * prone to underrun on even at rest) -- needs live-device
-             * testing under that kind of load before treating this as
-             * risk-free, not just a latency-vs-nothing win. */
+             * reason for a live source (AirPlay currently, and the USB DAC
+             * bridge -- see this function's own callers) to pay it.
+             *
+             * period_size=1024/period_count=2 (~21ms buffer) was tried here
+             * first and caused a real-device regression when the USB DAC
+             * bridge used it ("completely broken... not emitting any sound
+             * at all"). Root-caused with a standalone tinyalsa probe run
+             * directly on this hardware (same card/device/channels/rate/
+             * format as here): pcm_open()'s hw_params negotiation rejects
+             * that exact (period_size, period_count) pair outright with
+             * EINVAL, not an underrun -- this hardware/driver enforces a
+             * 1024-frame minimum period and only accepts specific
+             * (period_size, period_count) pairs, not a free choice of
+             * buffer size. The same probe swept nearby configs on the real
+             * device: 2048x2, 1024x3, 2048x3, and 4096x2 all also failed
+             * hw_params, while 1024x4 (4096-frame buffer, ~43ms at 96kHz --
+             * half of the ~85ms standard config below) succeeded, including
+             * repeated pcm_writei() calls with no failures. That's the
+             * config used here. It has not been verified under sustained
+             * real playback jitter (screen redraws, database/artwork
+             * activity, Wi-Fi) the way the standard config's four periods
+             * were tuned for -- if AV sync is still off or new dropouts
+             * appear, that's the next thing to check, not another blind
+             * period_count change. */
             config.period_size = 1024;
-            config.period_count = 2;
+            config.period_count = 4;
         } else {
             /* The original 1024-frame period woke this single-core device
              * about 43 times/sec at 44.1 kHz even when the decoder supplied

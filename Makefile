@@ -86,13 +86,24 @@ endif
 #      alphanumeric+punctuation working sets at once without the earlier
 #      128-entry thrashing.
 #   3. generated fonts (patches/lvgl_generated_fonts/, copied in whole
-#      rather than diffed): the four Montserrat .c files regenerated with
-#      an expanded lv_font_conv codepoint range (Latin-1 Supplement +
+#      rather than diffed): ten Montserrat .c files regenerated with an
+#      expanded lv_font_conv codepoint range (Latin-1 Supplement +
 #      Latin Extended-A + typographic punctuation added to upstream's
 #      bare ASCII range -- each font file's own header comment records
 #      the exact lv_font_conv invocation) so real-world artist/album
-#      metadata with accented characters or curly quotes/en-dashes
-#      renders correctly instead of showing tofu boxes. These are
+#      metadata with accented characters (a Spanish name, Latin Extended-A
+#      characters like "a" with a macron, ...) or curly quotes/en-dashes
+#      renders correctly instead of showing tofu boxes or nothing at all.
+#      Originally only the four "Small" Font Size tier sizes (16/20/22/28,
+#      see fallback_font.c's get_montserrat_font_for_px()) were regenerated
+#      -- a real-device bug report ("Spanish accents/Latin Extended-A
+#      characters not rendered by the default font") traced this to the
+#      Medium/BlindMF tiers' six sizes (24/26/30/32/34/40, lv_conf.h's own
+#      comment on LV_FONT_MONTSERRAT_24 etc.) still being pristine upstream
+#      LVGL fonts with the stock bare-ASCII-plus-degree-sign range (`-r
+#      0x20-0x7F,0xB0,0x2022`, confirmed by reading their own pre-patch
+#      header comments) -- regenerated the same way to close the gap
+#      regardless of which Font Size tier is active. These are
 #      machine-generated hex-array files with no stable diff context
 #      (every glyph/kerning table shifts on any range change), so unlike
 #      the two patches above they are tracked and restored as whole-file
@@ -137,7 +148,7 @@ endif
 LVGL_PATCH := patches/lvgl_fbdev_compositor.patch
 LVGL_RUNTIME_FIXES_PATCH := patches/lvgl_runtime_fixes.patch
 LVGL_GENERATED_FONTS_DIR := patches/lvgl_generated_fonts
-LVGL_GENERATED_FONTS := lv_font_montserrat_16.c lv_font_montserrat_20.c lv_font_montserrat_22.c lv_font_montserrat_28.c
+LVGL_GENERATED_FONTS := lv_font_montserrat_16.c lv_font_montserrat_20.c lv_font_montserrat_22.c lv_font_montserrat_24.c lv_font_montserrat_26.c lv_font_montserrat_28.c lv_font_montserrat_30.c lv_font_montserrat_32.c lv_font_montserrat_34.c lv_font_montserrat_40.c
 LVGL_PINNED_COMMIT := e1c0b21b2723d391b885de4b2ee5cc997eccca91
 LVGL_FBDEV_C := $(LVGL_DIR)/src/drivers/display/fb/lv_linux_fbdev.c
 LVGL_FBDEV_H := $(LVGL_DIR)/src/drivers/display/fb/lv_linux_fbdev.h

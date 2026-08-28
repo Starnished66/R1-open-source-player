@@ -34,7 +34,12 @@
  * defined (the .o still gets built either way, an empty translation unit,
  * since the Makefile's own file list isn't conditional -- only the content
  * inside each file is), so these have to be enabled here or referencing
- * them would be a linker error, not just unused. */
+ * them would be a linker error, not just unused. Regenerated with the same
+ * expanded Latin-1/Latin Extended-A range as 16/20/22/28 (see the
+ * Makefile's own LVGL_GENERATED_FONTS comment) -- these six were pristine
+ * upstream (bare ASCII + degree sign only) until a real-device bug report
+ * found Spanish accents and other Latin Extended-A characters missing
+ * specifically on the Medium/BlindMF tiers these sizes back. */
 #define LV_FONT_MONTSERRAT_24 1
 #define LV_FONT_MONTSERRAT_26 1
 #define LV_FONT_MONTSERRAT_30 1

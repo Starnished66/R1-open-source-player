@@ -1262,6 +1262,18 @@ void gui_subsonic_init(void) {
     subsonic_albums_screen = build_compact_list_screen("Albums", generic_back_cb, NULL, 0, subsonic_album_row_click_cb,
                                                          NULL, &subsonic_albums_list, &subsonic_albums_title_label,
                                                          LIST_ROW_WIDTH_WIDE, false, lv_color_black());
+    /* Real-device bug report: swipe-back not working inside Subsonic's
+     * Artists/Albums submenus. Unlike build_subsonic_list_screen() (used by
+     * the sibling Songs/Playlists submenus just below), build_compact_list_
+     * screen() does not call finalize_screen_navigation() itself -- every
+     * other caller (gui_library.c's own Artists/Albums/All Songs/...) calls
+     * it explicitly afterward, but these two never did. Without it, the
+     * screen root never gets LV_OBJ_FLAG_CLICKABLE, keeps LV_OBJ_FLAG_
+     * SCROLLABLE, and never gets the LV_EVENT_GESTURE handler registered --
+     * so a swipe never even registers as a gesture here, let alone
+     * triggers Back. */
+    finalize_screen_navigation(subsonic_artists_screen);
+    finalize_screen_navigation(subsonic_albums_screen);
     subsonic_songs_screen = build_subsonic_list_screen("Songs", &subsonic_songs_title_label, &subsonic_songs_list);
     subsonic_playlists_screen = build_subsonic_list_screen("Playlists", &subsonic_playlists_title_label, &subsonic_playlists_list);
 

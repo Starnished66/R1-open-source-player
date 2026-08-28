@@ -96,13 +96,20 @@ static void * bridge_thread_func(void * arg) {
         return NULL;
     }
 
-    /* Standard tuning, not the low-latency mode airplay_bridge.c requests:
-     * this runs at 96kHz (BRIDGE_SAMPLE_RATE below), where the low-latency
-     * period config doubles ALSA wakeups (~47/s -> ~94/s) and cuts underrun
-     * tolerance to a quarter (~85ms -> ~21ms) -- untested on real USB-DAC
-     * hardware, and this bridge wasn't the subsystem the AirPlay latency
-     * bug report was about. Revisit only with its own live-device underrun
-     * testing under real load, not bundled into an unrelated fix. */
+    /* REVERTED (was briefly true): a real-device bug report asked for this
+     * ("Latency is very high, audio is even out of sync with the videos"),
+     * matching the same low-latency tuning airplay_bridge.c already uses
+     * successfully (~21ms vs ~85ms of ALSA buffering at this bridge's own
+     * 96kHz rate) -- but a second real-device report after trying it was
+     * "USB Dac mode is completely broken now... not emitting any sound at
+     * all", not crackling/dropouts, which reads as pcm_open() itself
+     * failing at the smaller period size on this specific hardware/kernel
+     * rather than an underrun. This is exactly the risk the original
+     * comment here already flagged as "untested on real USB-DAC hardware"
+     * before ever trying it. Do not flip this back to true without a live
+     * device confirming pcm_open() actually succeeds at period_size=1024/
+     * period_count=2 at 96000Hz on this exact hardware -- if it does, the
+     * AV-sync bug report above is still real and worth revisiting. */
     if (!audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, false)) {
         fprintf(stderr, "usb_dac_bridge: audio_output_ensure failed\n");
         close(uac_fd);
@@ -172,7 +179,10 @@ static void * bridge_thread_func(void * arg) {
          * "track boundary" to piggyback the check on the way audio.c's
          * playback loop originally did, so it's checked every chunk here
          * unconditionally -- cheap, since audio_output_ensure() only
-         * actually reopens if something changed. */
+         * actually reopens if something changed. Must pass the same
+         * low_latency value as the initial audio_output_ensure() call
+         * above -- a mismatch here would make every single chunk look like
+         * a mode change and force a reopen on every read, not just once. */
         audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, false);
 
         /* Overwrite the always-noise first channel slot with the real
@@ -215,6 +225,33 @@ void usb_dac_bridge_start(void) {
     bridge_running = true;
     pthread_mutex_unlock(&bridge_mutex);
     stop_requested = false;
+
+    /* Real-device bug report: "USB DAC mode connected but not emitting any
+     * sound", traced to audio_output.c's shared requested_target: an
+     * external-USB-DAC-accessory request (audio_output_set_usb_requested(),
+     * "USB Audio Output" -- a completely different, fully automatic feature,
+     * see gui_shell.c's poll_usb_audio_output()) takes priority over both
+     * Bluetooth and local in recompute_requested_target(). That poll ran
+     * unconditionally regardless of usb_mode and had (falsely, it turned
+     * out) detected an external accessory while actually in DAC/gadget
+     * mode -- see poll_usb_audio_output()'s own updated comment for the
+     * real fix (guarding that poll against USB_MODE_DAC, since it runs
+     * continuously and would otherwise re-set this flag again within one
+     * tick of any one-shot clear here). This bridge's own writes then
+     * silently tried to reopen aplay against a nonexistent external
+     * accessory device string instead of local hardware -- reads from
+     * /dev/uac_sa kept succeeding (so the PC side looked "connected" and
+     * the incoming-format display kept updating) while every write went
+     * nowhere. Kept here too, redundantly but harmlessly, purely for
+     * immediate correctness at the exact moment DAC mode starts rather than
+     * waiting up to one poll tick for the real fix above to take effect --
+     * being a USB gadget (device) is physically incompatible with
+     * simultaneously being a USB host for an external accessory, so
+     * clearing this is always safe regardless of how it got set.
+     * usb_dac_bridge_set_bt_output() is untouched -- routing this bridge's
+     * own output to Bluetooth is a real, independent feature (see this
+     * file's own header comment) and must not be cleared here. */
+    audio_output_set_usb_requested(false, NULL);
 
     audio_stop();
 

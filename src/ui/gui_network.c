@@ -1369,6 +1369,14 @@ static lv_obj_t * build_bt_dac_overlay_screen(void) {
     lv_label_set_text(hint_label, "This device is now receiving Bluetooth audio");
     lv_obj_add_style(hint_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(hint_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    /* Same fixed-width + center treatment as the USB DAC screen's own
+     * matching labels (see build_usb_dac_overlay_screen()'s own comment)
+     * -- kept consistent between the two DAC mode screens on request, and
+     * this specific string is long enough to need an explicit width to
+     * wrap within regardless (no width means no wrap boundary, so it would
+     * otherwise render on one line and can overflow past the screen edge). */
+    lv_obj_set_width(hint_label, LV_PCT(90));
+    lv_obj_set_style_text_align(hint_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align_to(hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
     bt_dac_stream_label = lv_label_create(scr);
@@ -1848,6 +1856,32 @@ void start_usb_mode_switch(usb_mode_t target) {
 }
 
 void poll_usb_mode_switch(void) {
+    /* Real-device bug report: "silent for a couple of seconds [while on USB
+     * DAC input], have to disable/re-enable DAC mode to get it working
+     * again." usb_dac_bridge.c's read() loop on /dev/uac_sa only retries on
+     * EPERM (host hasn't armed the streaming interface yet, up to ~15s) --
+     * any other read() <= 0 (the exact errno the driver returns when the
+     * host briefly stops sending, e.g. on pause, isn't documented and
+     * wasn't reproducible here without a live device) is treated as fatal:
+     * the thread exits for good and nothing was watching to restart it,
+     * since usb_dac_bridge_start() is otherwise only ever called from
+     * usb_mode_control_apply(USB_MODE_DAC) at mode-entry time. Rather than
+     * guess which errno to add to the retry list (risking masking a
+     * genuinely permanent failure by retrying forever inside that thread),
+     * self-heal here instead: if we're still set to DAC mode but the bridge
+     * isn't running, just start it again. Skipped while a mode switch is
+     * actively in flight to avoid racing usb_mode_control_apply()'s own
+     * synchronous usb_dac_bridge_start() call above. If the gadget itself
+     * is gone (e.g. cable unplugged) this costs one more bounded
+     * open()-retry cycle in usb_dac_bridge_start()'s own thread before it
+     * gives up again, same as it already does today -- no different from
+     * toggling the mode off and on by hand. */
+    if (!usb_mode_switch_active && current_settings.usb_mode == (int) USB_MODE_DAC) {
+        usb_dac_stream_info_t info;
+        usb_dac_bridge_get_stream_info(&info);
+        if (!info.bridge_running) usb_dac_bridge_start();
+    }
+
     if (!usb_mode_switch_active || !atomic_load_explicit(&usb_mode_switch_done_flag, memory_order_acquire)) return;
     usb_mode_switch_active = false;
     pthread_join(usb_mode_switch_thread, NULL);
@@ -2061,20 +2095,40 @@ static lv_obj_t * build_usb_dac_overlay_screen(void) {
     lv_obj_set_style_text_font(status_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align_to(status_label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
 
+    /* Real-device bug report: this text sat flush left instead of centered.
+     * These three labels' text is set/changed well after this point (see
+     * dac_stream_labels_timer_cb() -- input/path start out completely
+     * empty here, only ever getting real text from that timer), but
+     * lv_obj_align_to() below is a one-shot position computed from
+     * whatever the label's content-fit box measures *right now* -- it is
+     * not a live constraint that re-centers automatically when the text
+     * (and so the auto-fit width) changes later. A label's box then just
+     * grows rightward from that stale small-width position instead of
+     * re-centering. build_bt_dac_overlay_screen()'s own bt_dac_stream_label
+     * (same screen family, same "text changes after creation" shape)
+     * already avoids this the same way applied here: a fixed width plus
+     * LV_TEXT_ALIGN_CENTER means the box never resizes when the text
+     * inside it does. */
     usb_dac_hint_label = lv_label_create(scr);
     lv_label_set_text(usb_dac_hint_label, "Waiting for USB audio…");
     lv_obj_add_style(usb_dac_hint_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(usb_dac_hint_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_set_width(usb_dac_hint_label, LV_PCT(90));
+    lv_obj_set_style_text_align(usb_dac_hint_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align_to(usb_dac_hint_label, status_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
     usb_dac_input_label = lv_label_create(scr);
     lv_obj_add_style(usb_dac_input_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(usb_dac_input_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_set_width(usb_dac_input_label, LV_PCT(90));
+    lv_obj_set_style_text_align(usb_dac_input_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align_to(usb_dac_input_label, usb_dac_hint_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
 
     usb_dac_path_label = lv_label_create(scr);
     lv_obj_add_style(usb_dac_path_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(usb_dac_path_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    lv_obj_set_width(usb_dac_path_label, LV_PCT(90));
+    lv_obj_set_style_text_align(usb_dac_path_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align_to(usb_dac_path_label, usb_dac_input_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
 
     return scr;

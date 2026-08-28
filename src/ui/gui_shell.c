@@ -30,6 +30,7 @@
 #include "usb_audio_output.h"
 #include "headphone_status.h"
 #include "usb_dac_bridge.h"
+#include "usb_mode_control.h"
 #include "backlight.h"
 #include "plugin_manager.h"
 #include <stdio.h>
@@ -1432,7 +1433,27 @@ static void build_home_indicator_bar(void) {
 static void poll_usb_audio_output(void) {
     static bool was_connected = false;
     char alsa_device[32];
-    bool connected = usb_audio_output_is_connected(alsa_device, sizeof(alsa_device));
+    /* Real-device bug report: "USB DAC mode connected but not emitting any
+     * sound". This device's single USB port can't simultaneously be a USB
+     * gadget (device, what USB_MODE_DAC puts it into -- see usb_mode_
+     * control.c/usb_dac_bridge.c) and a USB host for an external accessory
+     * DAC, so "an external USB audio device is connected" can never be
+     * genuinely true while in that mode -- yet this poll had no such guard
+     * and ran unconditionally, every gui_shell_poll() tick, regardless of
+     * usb_mode. audio_output.c's requested_target gives this auto-detected
+     * external-accessory output priority over both Bluetooth and local
+     * (see its own recompute_requested_target()), so any false-positive
+     * detection here -- confirmed via a real bug report, exact driver-level
+     * cause not independently verified from here -- silently redirected
+     * usb_dac_bridge.c's own writes away from local hardware into a
+     * spawned aplay pointed at a nonexistent device, on every poll tick,
+     * making it impossible for usb_dac_bridge_start()'s own one-shot
+     * audio_output_set_usb_requested(false, ...) (see its own comment) to
+     * stick for longer than one tick on its own. Forcing "not connected"
+     * here for the whole time usb_mode is DAC removes the false positive
+     * at its source instead of just clearing its symptom once. */
+    bool connected = current_settings.usb_mode != USB_MODE_DAC &&
+                      usb_audio_output_is_connected(alsa_device, sizeof(alsa_device));
 
     if (connected && !was_connected) show_error_toast("USB audio device detected");
     was_connected = connected;

@@ -298,7 +298,21 @@ static bool screen_off_playback_active = false;
  * guards against retrying every single tick if idle_shutdown_now() doesn't
  * actually terminate the process for some reason (e.g. /sbin/poweroff
  * missing) -- reset on wake so a genuine idle stretch always gets a fresh
- * attempt rather than being permanently given up on after one failure. */
+ * attempt rather than being permanently given up on after one failure.
+ *
+ * Real-device bug report: turning the screen off while receiving audio via
+ * USB DAC (gadget) mode stopped it from receiving audio. Root cause:
+ * "no DAC receive mode active" above already covered wifi_dac_mode_enabled/
+ * bt_dac_mode_enabled, but USB_MODE_DAC was missing from both this gate
+ * and the radio-suspend one above -- and audio_is_playing() can never
+ * cover for that gap, since it only reflects audio.c's own local-file
+ * playback queue (have_current/paused), completely unaware of usb_dac_
+ * bridge.c's independent thread/streaming state. With the screen off and
+ * no local track "playing", the device read itself as idle mid-USB-stream
+ * and suspended (or, past RADIO_SUSPEND_DELAY_MS, dropped WiFi/Bluetooth --
+ * which also breaks usb_dac_bridge_set_bt_output() routing to a Bluetooth
+ * accessory) out from under it. Both gates now also check
+ * current_settings.usb_mode != USB_MODE_DAC. */
 static bool idle_shutdown_attempted = false;
 
 
@@ -1050,6 +1064,7 @@ static void update_timer_cb(lv_timer_t * timer) {
          * went dark, which is fine: nothing in this app can change BT power
          * state without a UI the user can't reach with the screen off. */
         if (!radios_suspended && !current_settings.wifi_dac_mode_enabled && !current_settings.bt_dac_mode_enabled &&
+            current_settings.usb_mode != (int) USB_MODE_DAC &&
             !audio_is_playing() && !battery_is_charging() && !shutdown_background_work_active() &&
             lv_tick_elaps(screen_off_since_tick) >= RADIO_SUSPEND_DELAY_MS) {
             gui_shell_suspend_connections(&wifi_was_on_before_suspend, &bt_was_on_before_suspend);
@@ -1065,6 +1080,7 @@ static void update_timer_cb(lv_timer_t * timer) {
          * device powering itself off out from under them. */
         if (!idle_shutdown_attempted && current_settings.idle_shutdown_enabled &&
             !current_settings.wifi_dac_mode_enabled && !current_settings.bt_dac_mode_enabled &&
+            current_settings.usb_mode != (int) USB_MODE_DAC &&
             !audio_is_playing() && !battery_is_charging() && !shutdown_background_work_active() &&
             lv_tick_elaps(screen_off_since_tick) >= (uint32_t) current_settings.idle_shutdown_minutes * 60 * 1000) {
             if (current_settings.idle_suspend_enabled) {

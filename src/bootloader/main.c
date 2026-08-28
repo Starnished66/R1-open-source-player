@@ -436,8 +436,10 @@ int main(void) {
     reserve_stock_hgl_dma();
 
     /* Opened and drawn to BEFORE scanner_scan() (which performs the SD
-     * card settle wait, up to ~5s -- see scanner.c's own doc comment),
-     * not after. Real-device regression this specifically fixes: the
+     * card settle wait -- up to 5s for the normal case, extended only with
+     * real evidence a card is still initializing, up to a 20s hard ceiling
+     * -- see sd_ready.c's own top comment for the algorithm), not after.
+     * Real-device regression this specifically fixes: the
      * previous hiby_player.sh -> open_hiby_player chain already paid this
      * exact settle cost, but inside the PLAYER's own main(), after painting
      * its splash -- i.e. the user saw a splash throughout the wait. Running

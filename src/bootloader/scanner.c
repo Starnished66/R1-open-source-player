@@ -1,5 +1,5 @@
 #include "scanner.h"
-#include "subprocess.h"
+#include "sd_ready.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -10,101 +10,15 @@
 
 #define BUILD_STAMP_LEN 16 /* "YYYY-MM-DD_HH:MM" -- see the Makefile's BUILD_STAMP_DEFINE */
 
-/* True if a real filesystem is mounted at SD_MOUNT_POINT (its st_dev
- * differs from its parent's), as opposed to just an empty directory
- * sitting there -- same check as src/main.c's own sd_mount_point_mounted(),
- * against the fully-resolved path (see scanner.h's own comment on why). */
-static bool sd_mount_point_mounted(void) {
-    struct stat parent_st, mnt_st;
-    if (stat("/usr/data/mnt", &parent_st) != 0) return false;
-    if (stat(SD_MOUNT_POINT, &mnt_st) != 0) return false;
-    return parent_st.st_dev != mnt_st.st_dev;
-}
-
-/* Same three-filesystem-in-turn attempt as src/main.c's own
- * try_mount_sd_device_node(), against the same mount options -- ntfs-3g
- * over vfat/exfat is not something this bootloader has any independent
- * basis for; it's copied because the real player's own comment there
- * explains a real, already-debugged reason (no usable in-kernel ntfs path
- * on this kernel/BusyBox combination) that still applies here. */
-static void try_mount_sd_device_node(const char * device_node) {
-    char * vfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "vfat", (char *) "-o",
-                            (char *) "rw,relatime,fmask=0022,dmask=0022,codepage=936,iocharset=utf8,shortname=mixed",
-                            (char *) device_node, (char *) SD_MOUNT_POINT, NULL };
-    subprocess_run(vfat_argv, NULL, 0);
-    if (sd_mount_point_mounted()) return;
-
-    char * exfat_argv[] = { (char *) "mount", (char *) "-t", (char *) "exfat", (char *) "-o",
-                             (char *) "rw,relatime", (char *) device_node, (char *) SD_MOUNT_POINT, NULL };
-    subprocess_run(exfat_argv, NULL, 0);
-    if (sd_mount_point_mounted()) return;
-
-    char * ntfs_argv[] = { (char *) "/usr/bin/ntfs-3g", (char *) "-o",
-                            (char *) "rw,relatime,big_writes,umask=0022",
-                            (char *) device_node, (char *) SD_MOUNT_POINT, NULL };
-    subprocess_run(ntfs_argv, NULL, 0);
-}
-
-/* Wait up to 5s (50 x 100ms) for the SD block node. This deliberately
- * exceeds src/main.c's standalone-player fallback settle: field reports
- * from multiple devices showed that the original shared 2.5s bound could
- * expire before mdev exposed the card, making the bootloader silently take
- * the no-alternate path and auto-boot Open Player even though hiby_player
- * was present. The player's own splash minimum is correspondingly shorter
- * now, so this larger bootloader discovery window does not simply stack an
- * additional full splash delay onto the normal SD-present boot.
- *
- * This wait is necessary, not just cautious -- "a software-triggered reboot
- * can start this S92 process before the SD block node has reappeared" -- and
- * mdev creates /dev/mmcblk0* directly off the mmc host's own card-detect
- * uevent (confirmed in gui_library.c's own comment on hotplug), so there
- * is no faster or more direct "card present" signal available than the
- * node itself eventually existing. This bootloader now occupies that same
- * S92 position (see scanner.h's own doc comment), including after the
- * very same class of software-triggered reboot this bootloader's own
- * run_player_supervised() performs after an abnormal player exit -- a single
- * one-shot node check here would intermittently miss a genuinely-present
- * SD alternate/update on exactly that path, silently booting internal
- * instead. This does mean a boot with truly no SD card ever inserted can
- * take up to 5s before falling through to the instant-boot
- * path below. The early boot background is already visible throughout this
- * bounded wait, without an extra status string (see main.c). */
-#define SD_SETTLE_MAX_ATTEMPTS 50
-#define SD_SETTLE_DELAY_MS 100
-
-/* Mirrors src/main.c's own mount_sd_card_if_needed() (mount point
- * creation, already-mounted short-circuit, partition-node-then-whole-disk
- * fallback for a partition-less "superfloppy" card) -- see scanner.h's own
- * doc comment for why a bootloader needs its own copy of this at all --
- * wrapped in the settle retry above SD_SETTLE_MAX_ATTEMPTS documents. */
-static void mount_sd_card_if_needed(void) {
-    mkdir("/usr/data/mnt", 0755);
-    mkdir(SD_MOUNT_POINT, 0755);
-
-    for (int attempt = 0; attempt < SD_SETTLE_MAX_ATTEMPTS; attempt++) {
-        if (sd_mount_point_mounted()) return;
-
-        /* Gate each node on its own existence first -- attempting a mount
-         * against a node that doesn't exist yet is pure wasted subprocess
-         * spawns (vfat+exfat+ntfs each), and this loop already retries on
-         * its own schedule regardless. */
-        if (access(SD_DEVICE_NODE_PARTITION, F_OK) == 0) {
-            try_mount_sd_device_node(SD_DEVICE_NODE_PARTITION);
-            if (sd_mount_point_mounted()) return;
-        }
-        if (access(SD_DEVICE_NODE_WHOLE_DISK, F_OK) == 0) {
-            try_mount_sd_device_node(SD_DEVICE_NODE_WHOLE_DISK);
-            if (sd_mount_point_mounted()) return;
-        }
-
-        /* Neither node exists yet, or one exists but genuinely failed to
-         * mount (corrupt filesystem, etc.) -- either way, keep retrying
-         * rather than giving up on the very first miss; a node that will
-         * never mount just harmlessly rides out the same bounded 5s as
-         * one that's still settling. */
-        usleep(SD_SETTLE_DELAY_MS * 1000);
-    }
-}
+/* mount_sd_card_if_needed() itself now lives in sd_ready_real.c, backed by
+ * sd_ready.c's adaptive wait_for_sd_ready() state machine instead of a flat
+ * fixed-attempt loop -- see sd_ready.c's own top comment for the algorithm
+ * (the asynchronous MMC-detect / node-publish / mount race this exists to
+ * ride out) and sd_ready_real.c for this build's actual timing policy. Kept
+ * as a real cross-TU call (sd_ready.h) rather than folded back in here so
+ * the readiness state machine itself stays testable (sd_ready_test.c)
+ * without dragging in this file's own build-stamp-scanning/preference-file
+ * logic, which has nothing to do with SD readiness. */
 
 #define DEFAULT_TIMEOUT_SECONDS 3
 #define MIN_TIMEOUT_SECONDS 1

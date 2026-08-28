@@ -503,7 +503,7 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=buil
               $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_target/stb_vorbis/%.o) \
               $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_target/lua/%.o)
 
-.PHONY: all host target bootloader clean compile_commands.json
+.PHONY: all host target bootloader sd_ready_test clean compile_commands.json
 
 # Default target builds for host simulation and generates compile commands for IDE
 all: host compile_commands.json
@@ -651,7 +651,8 @@ $(TARGET_BIN): $(TARGET_OBJS)
 # in the rest of the player/LVGL.
 BOOTLOADER_BIN = open_hiby_bootloader
 BOOTLOADER_SRCS = src/bootloader/main.c src/bootloader/fb_draw.c src/bootloader/input.c \
-                  src/bootloader/scanner.c src/hardware/input_device_utils.c src/core/subprocess.c \
+                  src/bootloader/scanner.c src/bootloader/sd_ready.c src/bootloader/sd_ready_real.c \
+                  src/hardware/input_device_utils.c src/core/subprocess.c \
                   lvgl/src/libs/tjpgd/tjpgd.c
 # -ffunction-sections/-fdata-sections + -Wl,--gc-sections: standard, safe
 # combination that lets the linker drop unused functions/data at the
@@ -666,6 +667,18 @@ bootloader:
 	$(CROSS_CC) $(BOOTLOADER_CFLAGS) -static -no-pie $(BOOTLOADER_SRCS) -o build_target/$(BOOTLOADER_BIN)_unstripped -Wl,--gc-sections
 	$(CROSS_STRIP) -s -o $(BOOTLOADER_BIN) build_target/$(BOOTLOADER_BIN)_unstripped
 	@echo "Bootloader build complete: File ready at '$(BOOTLOADER_BIN)'"
+
+# Host-buildable unit tests for sd_ready.c's pure wait_for_sd_ready() state
+# machine (see sd_ready_test.c's own top comment) -- plain host gcc, no
+# cross toolchain, no dependency on the rest of the bootloader (scanner.c,
+# subprocess.c, sd_ready_real.c's real mount/inotify/sysfs probes are never
+# linked into this binary). Not part of `all`: run explicitly with
+# `make sd_ready_test` after touching sd_ready.c or its header.
+sd_ready_test:
+	@mkdir -p build_target
+	$(CC) -O0 -g -Wall -Isrc/bootloader src/bootloader/sd_ready.c src/bootloader/sd_ready_test.c \
+	    -o build_target/sd_ready_test
+	./build_target/sd_ready_test
 
 build_target/%.o: src/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)

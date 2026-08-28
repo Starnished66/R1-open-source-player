@@ -1273,10 +1273,9 @@ static uint32_t boot_splash_start_tick = 0;
  * gui_show_boot_splash()'s comment. Used by gui_init()'s own settle-wait,
  * further below.
  *
- * main.c may hold this splash longer while S80_bt_init reaches its
- * trustworthy final state.  That readiness wait does not enable or alter
- * Bluetooth; it only prevents UI construction/status polling from observing
- * bt_init's temporary powered state. */
+ * Bluetooth does not extend this global wait. gui_shell.c keeps Bluetooth
+ * status in an explicit not-ready state and defers its first backend poll
+ * until S80_bt_init's completion marker appears. */
 #define BOOT_SPLASH_MIN_DISPLAY_MS 3000
 
 /* Task #44 (stock-UX request): the stock firmware holds its own boot image
@@ -1792,9 +1791,8 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * faster, so this isn't always a flat tax on boot time. This also
      * delays start_refresh_bt_icon() (called above) by the same margin.
      *
-     * Bluetooth readiness has already been settled by main.c before
-     * gui_init() starts, so the first status worker launched above cannot
-     * capture bt_init's temporary powered state. */
+     * Bluetooth readiness is handled asynchronously by gui_shell.c and does
+     * not extend this splash minimum. */
     while (boot_splash_start_tick != 0 &&
            lv_tick_get() - boot_splash_start_tick < BOOT_SPLASH_MIN_DISPLAY_MS) {
         uint32_t wait_ms = lv_timer_handler();

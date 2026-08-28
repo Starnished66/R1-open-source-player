@@ -141,53 +141,6 @@ static void settle_sd_mount_during_splash(void) {
     }
 }
 
-/* S80_bt_init runs asynchronously ahead of the player.  While it is still
- * attaching/flashing hci0, the adapter genuinely passes through a temporary
- * powered state before bluetoothd applies AutoEnable=false.  Starting the UI
- * status worker before that sequence finishes lets a truthful-but-stale "on"
- * result reach the first Home frame and makes the Bluetooth icon flash.
- *
- * Keep the already-painted splash visible until bt_init's tmpfs completion
- * marker exists and BlueZ reports the intended final off state twice.  The
- * marker cannot survive a reboot, and the two D-Bus observations cover the
- * small propagation gap between bt_init's last command and bluetoothd's
- * externally visible state.  This is deliberately bounded: Bluetooth failing
- * to initialize must not turn into a player boot loop or a permanently hidden
- * UI. */
-#define BT_INIT_OK_FLAG_PATH "/tmp/bt_init_ok"
-#define BT_BOOT_READY_TIMEOUT_MS 30000
-#define BT_BOOT_READY_POLL_MS 250
-#define BT_BOOT_READY_OFF_OBSERVATIONS 2
-
-static bool wait_for_bt_boot_ready_during_splash(void) {
-    /* A marker already present when this process starts means bt_init
-     * completed before us.  Do not require the adapter to be off in that
-     * case: a manual same-boot relaunch may legitimately inherit Bluetooth
-     * already enabled by the user. */
-    if (access(BT_INIT_OK_FLAG_PATH, F_OK) == 0) return true;
-
-    uint32_t deadline = custom_tick_get() + BT_BOOT_READY_TIMEOUT_MS;
-    unsigned int off_observations = 0;
-
-    while ((int32_t) (deadline - custom_tick_get()) > 0) {
-        if (access(BT_INIT_OK_FLAG_PATH, F_OK) == 0) {
-            char output[2048];
-            char * argv[] = { (char *) "bluetoothctl", (char *) "show", NULL };
-            bool queried = subprocess_run(argv, output, sizeof(output));
-            /* Only an explicit BlueZ answer counts.  A timeout, missing
-             * controller, empty output, or any other failure must not be
-             * misclassified as the settled powered-off state. */
-            if (queried && strstr(output, "Powered: no") != NULL) {
-                if (++off_observations >= BT_BOOT_READY_OFF_OBSERVATIONS) return true;
-            } else {
-                off_observations = 0;
-            }
-        }
-        usleep(BT_BOOT_READY_POLL_MS * 1000);
-    }
-    return false;
-}
-
 /* Lightweight boot-time diagnostic log at /usr/data/boot_debug.log, readable
  * via adb even after a crash/reboot loop (hiby_player.sh reboots
  * unconditionally on any exit). Not static: gui_init() (gui.c) also calls
@@ -303,10 +256,6 @@ int main(void) {
 
     settle_sd_mount_during_splash();
     boot_checkpoint("settle_sd_mount_during_splash done");
-
-    if (!wait_for_bt_boot_ready_during_splash())
-        fprintf(stderr, "Warning: Bluetooth boot readiness timed out; continuing without blocking the UI\n");
-    boot_checkpoint("Bluetooth boot readiness wait done");
 
     /* Create Touch Input device via evdev. Auto-detect the touch controller
      * by name first (works on the R1's Hynitron "hyn_ts"); fall back to

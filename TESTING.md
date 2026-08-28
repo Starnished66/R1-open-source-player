@@ -67,12 +67,13 @@ installed, the resulting order is therefore `S80_bt_init` -> background
 `bt_init` -> `S92_03_start_music_player` -> bootloader -> selected player.
 The S80 script does not wait for `bt_init` to finish, so Bluetooth can still
 be flashing firmware or starting its daemons while the bootloader and player
-are starting. Open Player keeps its splash visible until `/tmp/bt_init_ok`
-exists and two authoritative polls agree the adapter has reached its final
-powered-off state. This replaces the former icon-only mask: the first Home
-frame should therefore never show bt_init's temporary powered state. The wait
-is capped at 30 seconds so a broken Bluetooth initialization cannot prevent
-the UI from appearing forever.
+are starting. Open Player does not delay the rest of the UI for that job and
+does not mask a queried value: Bluetooth status remains explicitly not ready,
+with no `bluetoothctl` status subprocess launched, until `/tmp/bt_init_ok`
+exists. The existing 500ms UI timer notices the marker and immediately starts
+the first normal authoritative background refresh. Persisted Bluetooth-DAC
+startup is held behind the same gate, while an early manual enable remains
+queued by the existing pending-enable path.
 
 The bootloader supervises the selected player by exit status. A clean exit
 (status 0, used by both players' `/sbin/poweroff` handoff) completes a real

@@ -913,13 +913,26 @@ char bt_connected_codec_cached[32] = "";
  * without a full power cycle), the exact class of incident bt_chip_mutex's
  * own comment already documents (a userspace mutex in THIS app can't
  * protect against a SEPARATE process, bt_init, touching the same UART).
- * The display-suppression window above made the *cosmetic* flicker
- * disappear, but made this WORSE, not better: "graduate on tap" meant a
- * tap landing early now reliably reached the real toggle thread instead of
- * being naturally rate-limited by the flicker's own visibility. Checked in
- * quick_drawer_bt_event_cb() before it does anything real -- see its own
- * comment. */
+ * An earlier display-suppression implementation made the cosmetic flicker
+ * disappear but made this worse by allowing an early tap to reach the real
+ * toggle worker. Checked in quick_drawer_bt_event_cb() before it does
+ * anything real -- see its own comment. */
 #define BT_INIT_OK_FLAG_PATH "/tmp/bt_init_ok"
+
+/* Bluetooth status is unknown, not off, while the stock asynchronous
+ * S80_bt_init job is still flashing/attaching the controller.  No status
+ * subprocess may start before its tmpfs completion marker appears: doing so
+ * captures the real temporary powered state and flashes the icon on the first
+ * Home frames.  This latch is polled with access() from the existing 500ms UI
+ * timer; once true it stays true for this process lifetime and normal
+ * authoritative background polling begins immediately. */
+static bool bt_startup_ready = false;
+
+static bool refresh_bt_startup_readiness(void) {
+    if (!bt_startup_ready && access(BT_INIT_OK_FLAG_PATH, F_OK) == 0)
+        bt_startup_ready = true;
+    return bt_startup_ready;
+}
 
 /* Armed only by an app-driven enable path, never by the periodic boot-state
  * poll itself. poll_refresh_bt_icon() consumes it once that existing poll
@@ -1047,6 +1060,7 @@ static void * refresh_bt_icon_thread_func(void * arg) {
 }
 
 static void start_refresh_bt_icon(void) {
+    if (!refresh_bt_startup_readiness()) return;
     if (refresh_bt_icon_active) return; /* previous check still in flight -- same "ignore taps until it lands" pattern as everything else here */
     refresh_bt_icon_active = true;
     bt_worker_launch_epoch = bt_disconnect_epoch;
@@ -2490,7 +2504,7 @@ void quick_drawer_wifi_event_cb(lv_event_t * e) {
     if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0) {
         wifi_toggle_active = false;
         refresh_wifi_icon();
-    start_bt_dac_startup_reapply_if_needed();
+        start_bt_dac_startup_reapply_if_needed();
         gui_network_wifi_toggle_completed(wifi_control_is_enabled());
     }
 }
@@ -2821,6 +2835,7 @@ static void poll_bt_toggle(void) {
  * this can't block gui_init() / the UI thread). */
 static pthread_t bt_dac_startup_reapply_thread;
 static bool bt_dac_startup_reapply_active = false;
+static bool bt_dac_startup_reapply_started = false;
 static atomic_bool bt_dac_startup_reapply_done_flag = false;
 
 static void * bt_dac_startup_reapply_thread_func(void * arg) {
@@ -2837,11 +2852,14 @@ static void * bt_dac_startup_reapply_thread_func(void * arg) {
  * at load time (a fresh toggle-on tap already goes through
  * bt_dac_toggle_cb() directly and doesn't need this). */
 static void start_bt_dac_startup_reapply_if_needed(void) {
-    if (!current_settings.bt_dac_mode_enabled) return;
+    if (!current_settings.bt_dac_mode_enabled || bt_dac_startup_reapply_started ||
+        !refresh_bt_startup_readiness()) return;
+    bt_dac_startup_reapply_started = true;
     bt_dac_startup_reapply_active = true;
     atomic_store_explicit(&bt_dac_startup_reapply_done_flag, false, memory_order_relaxed);
-        if (pthread_create(&bt_dac_startup_reapply_thread, NULL, bt_dac_startup_reapply_thread_func, NULL) != 0) {
+    if (pthread_create(&bt_dac_startup_reapply_thread, NULL, bt_dac_startup_reapply_thread_func, NULL) != 0) {
         bt_dac_startup_reapply_active = false;
+        bt_dac_startup_reapply_started = false;
     }
 }
 
@@ -3281,6 +3299,15 @@ static int visible_status_poll_tick_counter = 0;
 static int wifi_poll_tick_counter = 0;
 
 void gui_shell_update_topbar(bool screen_just_woke) {
+    /* Cheap startup-only marker check.  This runs every 500ms so the first
+     * authoritative Bluetooth refresh begins promptly when bt_init finishes,
+     * without delaying the rest of the UI or polling BlueZ prematurely.  It
+     * also releases a persisted Bluetooth-DAC reapply behind the same gate. */
+    if (!bt_startup_ready) {
+        start_bt_dac_startup_reapply_if_needed();
+        start_refresh_bt_icon();
+    }
+
     if (screen_just_woke || ++visible_status_poll_tick_counter >= VISIBLE_STATUS_POLL_TICKS) {
         visible_status_poll_tick_counter = 0;
         refresh_clock_label();
@@ -3292,7 +3319,7 @@ void gui_shell_update_topbar(bool screen_just_woke) {
     if (screen_just_woke || ++wifi_poll_tick_counter >= WIFI_POLL_TICKS) {
         wifi_poll_tick_counter = 0;
         refresh_wifi_icon();
-    start_bt_dac_startup_reapply_if_needed();
+        start_bt_dac_startup_reapply_if_needed();
         start_refresh_bt_icon();
     }
 }

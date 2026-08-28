@@ -108,3 +108,10 @@ possible_lirary_crash.md
 r1.upt
 bootloader_screenshot.png
 wireless_back_stack.png
+open_perf_capture.log
+open_perf_idle.log
+open_perf_trace_lines_only.log
+open_perf_trace_output.log
+perf_baseline_stock.md
+stock_perf_capture.log
+stock_perf_idle.log

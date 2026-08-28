@@ -1,4 +1,4 @@
-plugin.define({ id = "example.home_themes", name = "Home Themes", version = "1.0", api_min = 1 })
+plugin.define({ id = "example.home_themes", name = "Home Themes", version = "1.1", api_min = 4 })
 
 -- Reference implementation for plugin.set_home_layout()'s full style
 -- surface (PLUGINS.md): 11 ready-made looks, picked from a Settings row,
@@ -24,10 +24,10 @@ plugin.define({ id = "example.home_themes", name = "Home Themes", version = "1.0
 -- (Home's own layout included) after a restart -- same "persisted choice,
 -- re-applied on boot" pattern plugins_examples/Themes.lua already uses.
 --
--- text_size only supports "small"/"medium"/"large" today (PLUGINS.md) -- no
--- real monospace font exists yet, so Game Boy/Terminal below (originally
--- designed around a "mono" tier) use "small" as the closest available
--- stand-in rather than a text_size that would raise a Lua error.
+-- text_size supports "small"/"medium"/"large"/"mono" (PLUGINS.md) -- "mono"
+-- (Game Boy/Terminal below) is lv_font_unscii_16, an 8x16 bitmap font that's
+-- ASCII-only (no accented/non-Latin glyphs); fine for this file's own plain-
+-- ASCII labels, but not a good default for user-facing text that might not be.
 
 local STATE_PATH = plugin.sd_root() .. "/.plugins/.home_theme_state"
 local KEYS = { "music", "stream_media", "wireless", "books", "system", "dac" }
@@ -76,7 +76,7 @@ THEMES.gameboy = {
         music = { 0x0f1420, 0xf4d35e }, stream_media = { 0x0f1420, 0xeaeaea },
         wireless = { 0x0f1420, 0x7fd1c9 }, books = { 0x0f1420, 0xf4d35e },
         system = { 0x0f1420, 0xee6c8b }, dac = { 0x0f1420, 0xee6c8b },
-    }, { radius = 0, height = 52, align = "left", accessory = false, text_size = "small", icon = false }),
+    }, { radius = 0, height = 52, align = "left", accessory = false, text_size = "mono", icon = false }),
     options = { mode = "list", row_gap = 0 },
 }
 
@@ -94,7 +94,7 @@ THEMES.terminal = {
         music = { 0x000000, 0x33ff33 }, stream_media = { 0x000000, 0x33ff33 },
         wireless = { 0x000000, 0x33ff33 }, books = { 0x000000, 0x33ff33 },
         system = { 0x000000, 0x33ff33 }, dac = { 0x000000, 0x33ff33 },
-    }, { radius = 6, height = 68, width = 440, align = "left", accessory = true, text_size = "small", icon = true }),
+    }, { radius = 6, height = 68, width = 440, align = "left", accessory = true, text_size = "mono", icon = true }),
     options = { mode = "list", row_gap = 10 },
 }
 

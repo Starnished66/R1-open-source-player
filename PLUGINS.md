@@ -69,7 +69,17 @@ before anything could tap into one), every `*.lua` file directly under
 its **own** `lua_State` (`luaL_newstate()` + `luaL_openlibs()`), with the
 `plugin` table (below) injected before the file itself runs
 (`luaL_dofile()`). Subdirectories and anything not ending in `.lua` are
-skipped. Up to 16 plugin files (`PLUGIN_MAX_FILES`) are loaded this way.
+skipped. Every eligible filename is collected and sorted in **ascending
+order** (byte-wise, case-sensitive) -- not raw directory order, which is
+filesystem-dependent and can silently change after copying or reinstalling
+files -- before the first 16 (`PLUGIN_MAX_FILES`) of them are actually
+loaded; with more than 16 `.lua` files present, it's always the
+alphabetically-first 16, never whichever 16 the filesystem happened to
+return first. This matters for every plugin API backed by a single
+global slot that any plugin can overwrite (`set_background_color()`,
+`set_text_color()`, `set_icon()`, `set_home_layout()`): if two installed
+plugins both set the same one, the alphabetically-last plugin's own call
+wins, reproducibly.
 
 Each `lua_State` is kept open for the rest of the app's lifetime, never
 closed -- a plugin's callbacks (`on_open`, a `show_list` row's
@@ -198,7 +208,7 @@ from the moment your script starts running (injected before
 |---|---|
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info`, `media_capabilities` |
 | UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
-| Theme | `set_icon`, `set_background_color`, `set_text_color` |
+| Theme | `set_icon`, `set_background_color`, `set_text_color`, `set_home_layout` |
 | Playback | `play_file`, `play_list`, `play_remote`, `queue_remote_list`, transport controls, playback state |
 | Files & Playlists | `sd_root`, `list_dir`, `mkdir`, `playlist_list`, `playlist_read`, `playlist_create`, `playlist_add`, `playlist_remove`, `playlist_delete` |
 | Storage & Secrets | `storage.get`/`set`/`delete`/`list`, `secrets.set`/`exists`/`delete` |
@@ -236,10 +246,10 @@ plugin's own file path (stable across reloads) rather than by load order.
 Existing plugins without `define()` remain supported as legacy plugins
 using an identity derived from their filename.
 
-- `plugin.api_version()` returns the current integer plugin API version (currently `3`).
+- `plugin.api_version()` returns the current integer plugin API version (currently `4`).
 - `plugin.has_capability(name)` reports whether an optional interface exists.
   Supported capability tokens:
-  - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`
+  - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`
   - Playback & Audio: `playback.control`, `playback.state`, `playback.events`, `playback.remote`, `audio.peq`
   - Filesystem & Playlists: `filesystem.sd`, `filesystem.mkdir`, `filesystem.playlists`
   - Storage & Secrets: `storage.namespaced`, `storage.secrets`
@@ -284,6 +294,15 @@ breaking changes bundled into this window. A plugin that only needs
 `play_remote()`/`queue_remote_list()` specifically, without requiring the
 whole API 3 batch, can feature-detect just this with
 `plugin.has_capability("playback.remote")` instead of bumping `api_min`.
+
+#### API version 4 changelog
+
+New in API 4: `plugin.set_home_layout()` (see its own doc section below) --
+per-tile color/radius/size/alignment/icon overrides for Home's 6 fixed
+tiles, plus an optional switch from Home's native icon grid to a scrollable
+pill-list. Purely additive, no breaking changes bundled into this window. A
+plugin that only needs this one function can feature-detect it with
+`plugin.has_capability("ui.home_layout")` instead of bumping `api_min`.
 
 <a id="plugin-ui"></a>
 
@@ -403,6 +422,90 @@ drive. `rgb` is a packed `0xRRGGBB` integer, same convention as
 mechanism as `set_background_color()` -- no file/cache involved.
 
 Raises a Lua error if `slot` isn't `"primary"` or `"muted"`.
+
+### `plugin.set_home_layout(tiles, options)`
+
+Restyles Home's 6 fixed tiles (`"music"`, `"stream_media"`, `"wireless"`,
+`"books"`, `"system"`, `"dac"`), and optionally switches Home from its
+native icon grid to a scrollable pill-list. Never adds or removes a tile --
+Home has no spare room for a plugin-added one (see
+`register_stream_media_tile()`'s own doc on why Stream Media has room and
+Home doesn't).
+
+**Only takes effect on the next app start, and is never itself persisted.**
+Home is built once, at startup, and never rebuilt -- same constraint
+`set_icon()` already documents. This call only ever updates an in-memory
+config that `build_home_screen()` reads once; nothing here writes to disk.
+Calling it later, from inside a callback, is not an error, but its effect is
+purely local to that one still-running process -- restarting the app
+discards it completely, same as never having called it. To actually have a
+layout survive a restart, a plugin must persist its own chosen layout to its
+own state file (the same way `Themes.lua`/`HomeThemes.lua` persist a theme
+choice) and re-call `set_home_layout()` with it from top-level script code
+on every boot -- there is no native persistence to lean on here.
+
+**Multiple plugins calling this both restyle the same single global Home
+layout -- there's no per-plugin slot.** Whichever plugin's call runs last
+during startup wins outright (its config completely replaces any earlier
+plugin's, not merged field-by-field); see "How Plugins Load" above for the
+now-deterministic (alphabetical-by-filename) load order this follows. Two
+layout-changing plugins installed together should be considered mutually
+exclusive by design, same as two theme-color plugins both calling
+`set_background_color()`.
+
+`tiles` (array table): one entry per tile being restyled, each
+
+```lua
+{
+    key = "music",         -- required: "music", "stream_media", "wireless", "books", "system", or "dac"
+    bg_color = 0xRRGGBB,   -- optional
+    text_color = 0xRRGGBB, -- optional
+    radius = 12,           -- optional, px
+
+    -- list mode only (ignored in tile mode):
+    height = 88, width = 420,   -- optional, px -- clamped the same as register_list_item()'s own height/width
+    align = "center",            -- optional: "left" (default), "center", or "right"
+    accessory = true,            -- optional: show the row's chevron
+    text_size = "medium",        -- optional: "small", "medium", "large", or "mono"
+    icon = true,                 -- optional: show the tile's own native icon on its list row
+}
+```
+
+A tile whose key is never mentioned keeps every field at its native
+default. An unrecognized `key`, `align`, or `text_size`, a non-table array
+entry, more than 6 entries (there are only ever 6 valid keys, so this can
+only mean a mistake -- unlike `show_list()`'s own item cap, this is not
+silently truncated), or a `height`/`width`/`radius` outside a 32-bit
+integer's range, all raise a Lua error immediately. A repeated `key` within
+the same `tiles` array cleanly replaces the earlier entry for that tile
+(every field, not just the ones the later entry sets) rather than merging
+the two. `radius` must also be non-negative.
+
+`options` (table, optional -- a non-table, non-nil value here is also a Lua
+error, since there's no reasonable non-table `options`):
+
+```lua
+{
+    mode = "list",  -- "tile" (default, today's icon grid) or "list"
+    tile_gap = 6,   -- tile mode only, px between tiles, clamped to 0-64
+    row_gap = 10,   -- list mode only, px between rows, clamped to 0-84 (0 = the native default of 6)
+}
+```
+
+Each call to `set_home_layout()` replaces the whole stored config -- there
+is no incremental merge across separate calls, so pass every tile you want
+styled in the same call.
+
+```lua
+plugin.set_home_layout({
+    { key = "music", bg_color = 0x1e3524, text_color = 0xd8c9a3, radius = 24,
+      height = 92, width = 440, align = "center", accessory = true, text_size = "medium", icon = true },
+    -- ... one entry per tile you want to restyle
+}, { mode = "list", row_gap = 10 })
+```
+
+See `plugins_examples/HomeThemes.lua` for a complete reference implementation
+spanning both tile and list mode.
 
 ### `plugin.show_list(title, items, on_select [, options])`
 
@@ -526,12 +629,16 @@ layout fields. For `show_list()`, width and height live in the call-level
   240-464px; unset/zero keeps the native width. Resizing a pill row replaces
   its fixed-size background sprite with the matching rounded fill so the
   artwork is never stretched.
-- **`text_size`** (string) -- `"small"`, `"medium"`, or `"large"`. Every
-  size uses a font with full non-Latin fallback (Cyrillic, CJK, Korean,
-  Thai) -- correct for plugin-authored text, which (unlike this app's own
-  fixed English UI chrome) might not be English. An unrecognized value
-  raises a Lua error; omitting it keeps that row type's own existing
-  default size.
+- **`text_size`** (string) -- `"small"`, `"medium"`, `"large"`, or `"mono"`.
+  `"small"`/`"medium"`/`"large"` use a font with full non-Latin fallback
+  (Cyrillic, CJK, Korean, Thai) -- correct for plugin-authored text, which
+  (unlike this app's own fixed English UI chrome) might not be English.
+  `"mono"` is an 8x16 bitmap monospace font (`lv_font_unscii_16`) for a
+  pixel/terminal look -- **ASCII-only**, no accented or non-Latin glyphs, so
+  only reach for it when you control the text yourself and know it stays
+  plain ASCII (see `plugins_examples/HomeThemes.lua`'s Game Boy/Terminal
+  presets). An unrecognized value raises a Lua error; omitting it keeps that
+  row type's own existing default size.
 
 None of the three affect a row that doesn't set them -- a plugin that
 never uses this section's fields renders exactly as it did before they

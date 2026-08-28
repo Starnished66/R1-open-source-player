@@ -1,4 +1,4 @@
-plugin.define({ id = "example.api_info", name = "Plugin API Info", version = "2.2", api_min = 1 })
+plugin.define({ id = "example.api_info", name = "Plugin API Info", version = "2.3", api_min = 1 })
 
 -- Comprehensive API and Capability Inspector for Open Source Player.
 -- Demonstrates all available namespaces, functions, capabilities, and runtime info.
@@ -8,7 +8,8 @@ local CAPABILITIES = {
     "filesystem.sd", "playback.control", "playback.state", "playback.events",
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
-    "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh"
+    "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
+    "ui.home_layout"
 }
 
 local CATEGORIES = {
@@ -109,6 +110,7 @@ local CATEGORIES = {
                 "plugin.set_icon(slot, path)",
                 "plugin.set_background_color(slot, rgb)",
                 "plugin.set_text_color(slot, rgb)",
+                "plugin.set_home_layout(tiles, options)",
             }
         end
     },

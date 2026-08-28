@@ -1,4 +1,4 @@
-plugin.define({ id = "example.api_info", name = "Plugin API Info", version = "2.1", api_min = 1 })
+plugin.define({ id = "example.api_info", name = "Plugin API Info", version = "2.2", api_min = 1 })
 
 -- Comprehensive API and Capability Inspector for Open Source Player.
 -- Demonstrates all available namespaces, functions, capabilities, and runtime info.
@@ -63,8 +63,8 @@ local CATEGORIES = {
             return {
                 "plugin.play_file(path)",
                 "plugin.play_list(paths, [start_idx])",
-                "plugin.play_remote(tracks, [start_idx])",
-                "plugin.queue_remote_list(tracks)",
+                "plugin.play_remote(track)",
+                "plugin.queue_remote_list(tracks, [start_idx])",
                 "plugin.toggle_pause()",
                 "plugin.stop()",
                 "plugin.next_track()",
@@ -100,12 +100,12 @@ local CATEGORIES = {
         title = "UI & Interaction APIs",
         get_rows = function()
             return {
-                "plugin.show_list(title, items, [cb], [opts])",
+                "plugin.show_list(title, items, on_select, [opts])",
                 "plugin.show_settings_list(title, items)",
                 "plugin.show_text_input(title, initial, password, cb)",
                 "plugin.show_toast(msg)",
-                "plugin.register_list_item(parent, label, cb, [opts])",
-                "plugin.register_stream_media_tile(title, cb, icon)",
+                "plugin.register_list_item(list_id, label, on_open, [opts])",
+                "plugin.register_stream_media_tile(label, on_open, [icon])",
                 "plugin.set_icon(slot, path)",
                 "plugin.set_background_color(slot, rgb)",
                 "plugin.set_text_color(slot, rgb)",
@@ -135,7 +135,7 @@ local CATEGORIES = {
                 "plugin.storage.get(key, [default]) -> val",
                 "plugin.storage.set(key, val) -> bool",
                 "plugin.storage.delete(key) -> bool",
-                "plugin.storage.list() -> table",
+                "plugin.storage.list([prefix]) -> table",
                 "plugin.secrets.set(key, val) -> bool",
                 "plugin.secrets.exists(key) -> bool",
                 "plugin.secrets.delete(key) -> bool",
@@ -149,8 +149,8 @@ local CATEGORIES = {
                 "plugin.http_request(opts, callback)",
                 "plugin.download_file_async(url, dest, [tls], cb)",
                 "plugin.cancel(handle)",
-                "plugin.http_get(url, [verify_tls]) -> body, err",
-                "plugin.http_post(url, body, [tls], [ct]) -> body, err",
+                "plugin.http_get(url, [verify_tls]) -> status, body",
+                "plugin.http_post(url, body, [content_type], [verify_tls]) -> status, body",
             }
         end
     },
@@ -183,8 +183,8 @@ local CATEGORIES = {
                 "plugin.on(event, handler)",
                 "plugin.set_interval(sec, handler) -> handle",
                 "plugin.clear_interval(handle)",
-                "plugin.json_decode(str) -> table",
-                "plugin.json_encode(table) -> str",
+                "plugin.json_decode(str, [limits]) -> table",
+                "plugin.json_encode(table, [limits]) -> str",
                 "plugin.md5(str) -> hex_str",
             }
         end

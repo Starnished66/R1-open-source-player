@@ -609,7 +609,8 @@ build_host/lua/%.o: $(LUA_DIR)/src/%.c
 target: $(TARGET_BIN)
 
 $(TARGET_BIN): $(TARGET_OBJS)
-	$(CROSS_CXX) -o $@ $(TARGET_OBJS) $(TARGET_LDFLAGS)
+	$(CROSS_CXX) -o build_target/$(TARGET_BIN)_unstripped $(TARGET_OBJS) $(TARGET_LDFLAGS)
+	$(CROSS_STRIP) -s -o $@ build_target/$(TARGET_BIN)_unstripped
 	@echo "Target build complete: File ready at '$(TARGET_BIN)'"
 
 # Standalone boot selector -- see src/bootloader/main.c's own top comment.

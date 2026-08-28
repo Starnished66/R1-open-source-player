@@ -345,8 +345,10 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *     optionally switches Home from its native icon grid to a scrollable
  *     pill-list -- see l_plugin_set_home_layout()'s own comment for the full
  *     `tiles`/`options` shape. Same "load-time only" constraint as
- *     plugin.set_icon() above: only takes effect on the NEXT app start,
- *     since Home is built once at startup and never rebuilt.
+ *     plugin.set_icon() above: this call never writes anything to disk, so
+ *     it only has any effect at all on the NEXT app start, and only if the
+ *     plugin itself persisted its choice and re-calls this from top-level
+ *     script code next boot -- see PLUGINS.md.
  *
  *   plugin.eq_load_profile(path) -> bool
  *     Loads and applies a .peq profile file (src/audio/peq.c's own
@@ -471,14 +473,18 @@ static void fill_tile_icon(plugin_tile_t * t, const char * icon, const char * de
     }
 }
 
-/* Validates a text_size string against the three recognized tiers -- shared
- * by append_list_item() below and l_plugin_show_settings_list()/
- * l_plugin_show_list() (fail loudly at the Lua boundary, same convention
- * every other unrecognized-string case in this file already uses; the
- * resolved font itself is picked later, in screen_builders.c's
- * pill_row_resolve_text_size(), which trusts this was already validated). */
+/* Validates a text_size string against the four recognized tiers -- shared
+ * by append_list_item() below, l_plugin_show_settings_list()/
+ * l_plugin_show_list(), and l_plugin_set_home_layout() (fail loudly at the
+ * Lua boundary, same convention every other unrecognized-string case in this
+ * file already uses; the resolved font itself is picked later, in
+ * screen_builders.c's pill_row_resolve_text_size(), which trusts this was
+ * already validated). "mono" (lv_font_unscii_16, ASCII-only -- see
+ * pill_row_resolve_text_size()'s own comment) is available to every plugin
+ * row this validates, not only plugin.set_home_layout()'s tiles. */
 static bool is_valid_text_size(const char * text_size) {
-    return strcmp(text_size, "small") == 0 || strcmp(text_size, "medium") == 0 || strcmp(text_size, "large") == 0;
+    return strcmp(text_size, "small") == 0 || strcmp(text_size, "medium") == 0 || strcmp(text_size, "large") == 0 ||
+           strcmp(text_size, "mono") == 0;
 }
 
 /* Shared by l_plugin_register_list_item() below, once its capacity check
@@ -523,7 +529,7 @@ static void append_list_item(plugin_list_item_t * array, int * count, lua_State 
         if (text_size) {
             if (!is_valid_text_size(text_size)) {
                 lua_pop(L, 1);
-                luaL_error(L, "plugin.register_list_item: unknown text_size '%s' (expected \"small\", \"medium\", or \"large\")",
+                luaL_error(L, "plugin.register_list_item: unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
                            text_size);
             }
             snprintf(item->text_size, sizeof(item->text_size), "%s", text_size);
@@ -662,7 +668,7 @@ static int l_plugin_show_list(lua_State * L) {
             const char * text_size = lua_tostring(L, -1);
             if (text_size) {
                 if (!is_valid_text_size(text_size)) {
-                    return luaL_error(L, "plugin.show_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", or \"large\")",
+                    return luaL_error(L, "plugin.show_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
                                        i + 1, text_size);
                 }
                 snprintf(text_size_bufs[i], sizeof(text_size_bufs[i]), "%s", text_size);
@@ -819,7 +825,7 @@ static int l_plugin_show_settings_list(lua_State * L) {
         const char * text_size = lua_tostring(L, -1);
         if (text_size) {
             if (!is_valid_text_size(text_size)) {
-                return luaL_error(L, "plugin.show_settings_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", or \"large\")",
+                return luaL_error(L, "plugin.show_settings_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
                                    i + 1, text_size);
             }
             snprintf(text_size_bufs[count], sizeof(text_size_bufs[count]), "%s", text_size);
@@ -1291,7 +1297,13 @@ static void get_opt_color_field(lua_State * L, int idx, const char * field, bool
 
 /* Same shape, for an optional boolean field (accessory/icon) -- lua_toboolean
  * alone can't tell "false" apart from "absent", both would otherwise read as
- * false, so *out_has records whether the field was actually present. */
+ * false, so *out_has records whether the field was actually present.
+ * lua_toboolean() itself (not a stricter LUA_TBOOLEAN type check) is
+ * deliberate: Lua's own C API has no narrower notion of "boolean" than
+ * truthiness, and every other boolean-ish field in this file (toggle
+ * initial state, verify_tls, ...) already reads exactly this way -- adding
+ * a stricter check here alone would make this one field the inconsistent
+ * one, not the other way around. */
 static void get_opt_bool_field(lua_State * L, int idx, const char * field, bool * out_has, bool * out_value) {
     lua_getfield(L, idx, field);
     if (!lua_isnil(L, -1)) {
@@ -1301,26 +1313,58 @@ static void get_opt_bool_field(lua_State * L, int idx, const char * field, bool 
     lua_pop(L, 1);
 }
 
+/* Rejects a Lua integer outside int32_t's own range before any narrowing
+ * cast down to it -- lua_Integer is 64-bit (LUA_INT_TYPE, luaconf.h);
+ * converting an out-of-range value to int32_t is implementation-defined
+ * (C11 6.3.1.3p3), and while this toolchain's own behavior (silent 2's-
+ * complement truncation) happens to be harmless for every one of this
+ * function's own fields -- height/width/tile_gap/row_gap are all re-clamped
+ * at their point of use regardless of what garbage a wrap produces (see
+ * build_pill_list_screen()/build_icon_grid_screen(), screen_builders.c),
+ * and radius is unconditionally clamped by LVGL's own
+ * lv_draw_sw_mask_radius_init() -- relying on a downstream clamp to paper
+ * over an implementation-defined cast is fragile, and a plugin passing a
+ * wildly out-of-range integer is a bug worth a clear error, not a silently
+ * "successful" truncation. */
+static int32_t check_int32_field(lua_State * L, lua_Integer value, const char * fn_name, const char * field) {
+    if (value < INT32_MIN || value > INT32_MAX) {
+        return (int32_t) luaL_error(L, "%s: %s (%lld) is out of range", fn_name, field, (long long) value);
+    }
+    return (int32_t) value;
+}
+
 /* Restyles Home's 6 fixed tiles (PLUGINS.md) -- never adds/removes one, Home
  * has no spare room for a plugin-added tile (see register_stream_media_tile()'s
- * own doc comment on why Stream Media has room and Home doesn't). Only takes
- * effect the NEXT time build_home_screen() runs, i.e. the next app start --
- * see home_layout.h's own comment for why (Home is built once at startup and
- * never rebuilt, same "load-time only" constraint plugin.set_icon() already
- * documents). A call made later, from inside a callback, is not an error --
- * it just updates gui_plugin_set_home_layout()'s stored config for next
- * time, with no visible effect this session.
+ * own doc comment on why Stream Media has room and Home doesn't). This never
+ * writes anything to disk -- see home_layout.h's own comment for exactly
+ * what that means for a call made after boot, from inside a callback (not
+ * an error, just has no lasting effect without the plugin's own persistence
+ * and a top-level re-call next boot).
+ *
+ * Every plugin restyles the SAME single global layout -- there is no
+ * per-plugin slot, so if two installed plugins both call this, whichever
+ * one loads later (see plugin_manager_init()'s now-deterministic,
+ * alphabetical-by-filename load order) completely replaces the earlier
+ * one's config, not merged.
  *
  * `tiles`: array of tables, one per tile being restyled -- { key = "music"|
  * "stream_media"|"wireless"|"books"|"system"|"dac", bg_color, text_color,
  * radius, height, width, align, accessory, text_size, icon }. A tile key
- * never mentioned keeps every field at its native default. height/width are
+ * never mentioned keeps every field at its native default; a REPEATED key
+ * within this same array cleanly replaces the earlier entry for that tile
+ * (via the memset() below) rather than merging the two. height/width are
  * passed through unclamped (same as register_list_item()'s own options) --
  * build_pill_list_screen() clamps them to PILL_ROW_HEIGHT_MIN/MAX and
  * PILL_ROW_WIDTH_MIN/MAX itself when list mode actually renders them.
  *
  * `options` (optional): { mode = "tile"|"list", tile_gap, row_gap }. `mode`
- * defaults to "tile" (today's icon grid) if `options` or `mode` is omitted. */
+ * defaults to "tile" (today's icon grid) if `options` or `mode` is omitted.
+ * `tile_gap`/`row_gap` are passed through unclamped here too -- clamped to
+ * 0-64/0-84 respectively in build_icon_grid_screen()/build_pill_list_screen()
+ * (screen_builders.c), the same "clamp at the point of use" pattern
+ * height/width above already follow, since tile_gap in particular feeds
+ * directly into an available-space subtraction that goes wrong long before
+ * any Lua-side integer range check would think to reject it. */
 static int l_plugin_set_home_layout(lua_State * L) {
     luaL_checktype(L, 1, LUA_TTABLE);
 
@@ -1328,13 +1372,23 @@ static int l_plugin_set_home_layout(lua_State * L) {
     memset(&config, 0, sizeof(config));
     config.configured = true;
 
+    /* Unlike show_list()/show_settings_list()'s own item caps (a browsing
+     * list can legitimately have hundreds of entries, so silently dropping
+     * the excess past a generous round-number cap is the right default),
+     * there are only ever 6 valid keys here -- a `tiles` array longer than
+     * that cannot legitimately arise from real use, only from a duplicate
+     * key or a copy-paste mistake, so this fails loudly instead of quietly
+     * truncating to 6. */
     lua_Unsigned raw_n = lua_rawlen(L, 1);
-    int n = (raw_n > (lua_Unsigned) HOME_LAYOUT_TILE_COUNT) ? HOME_LAYOUT_TILE_COUNT : (int) raw_n;
+    if (raw_n > (lua_Unsigned) HOME_LAYOUT_TILE_COUNT) {
+        return luaL_error(L, "plugin.set_home_layout: tiles has %lld entries, but only %d tiles exist",
+                           (long long) raw_n, HOME_LAYOUT_TILE_COUNT);
+    }
+    int n = (int) raw_n;
     for (int i = 0; i < n; i++) {
         lua_rawgeti(L, 1, i + 1); /* tile table -> stack top */
         if (!lua_istable(L, -1)) {
-            lua_pop(L, 1);
-            continue;
+            return luaL_error(L, "plugin.set_home_layout: tile %d must be a table", i + 1);
         }
 
         lua_getfield(L, -1, "key");
@@ -1353,21 +1407,35 @@ static int l_plugin_set_home_layout(lua_State * L) {
         lua_pop(L, 1); /* key string */
 
         home_tile_override_t * ov = &config.tiles[idx];
+        /* A repeated key within one call cleanly replaces the earlier entry
+         * rather than merging fields across the two -- without this reset, a
+         * second { key = "music", text_color = ... } entry would keep
+         * whatever an earlier { key = "music", bg_color = ... } entry set,
+         * silently combining two calls' worth of fields into one tile. */
+        memset(ov, 0, sizeof(*ov));
         int row_idx = lua_gettop(L); /* the tile table itself, still on the stack */
 
         get_opt_color_field(L, row_idx, "bg_color", &ov->has_bg_color, &ov->bg_color);
         get_opt_color_field(L, row_idx, "text_color", &ov->has_text_color, &ov->text_color);
 
         lua_getfield(L, row_idx, "radius");
-        if (!lua_isnil(L, -1)) { ov->has_radius = true; ov->radius = (int32_t) luaL_checkinteger(L, -1); }
+        if (!lua_isnil(L, -1)) {
+            lua_Integer radius = luaL_checkinteger(L, -1);
+            if (radius < 0) {
+                lua_pop(L, 1);
+                return luaL_error(L, "plugin.set_home_layout: tile %d has a negative radius", i + 1);
+            }
+            ov->has_radius = true;
+            ov->radius = check_int32_field(L, radius, "plugin.set_home_layout", "radius");
+        }
         lua_pop(L, 1);
 
         lua_getfield(L, row_idx, "height");
-        ov->height = (int32_t) luaL_optinteger(L, -1, 0);
+        ov->height = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "height");
         lua_pop(L, 1);
 
         lua_getfield(L, row_idx, "width");
-        ov->width = (int32_t) luaL_optinteger(L, -1, 0);
+        ov->width = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "width");
         lua_pop(L, 1);
 
         lua_getfield(L, row_idx, "align");
@@ -1391,7 +1459,7 @@ static int l_plugin_set_home_layout(lua_State * L) {
             if (!is_valid_text_size(text_size)) {
                 lua_pop(L, 1);
                 return luaL_error(L, "plugin.set_home_layout: tile %d has an unknown text_size '%s' "
-                                   "(expected \"small\", \"medium\", or \"large\")", i + 1, text_size);
+                                   "(expected \"small\", \"medium\", \"large\", or \"mono\")", i + 1, text_size);
             }
             snprintf(ov->text_size, sizeof(ov->text_size), "%s", text_size);
         }
@@ -1400,6 +1468,15 @@ static int l_plugin_set_home_layout(lua_State * L) {
         lua_pop(L, 1); /* tile table */
     }
 
+    /* Unlike show_list()'s own options table (a plain "resize every row"
+     * convenience where silently ignoring a wrong-typed argument costs
+     * nothing), a plugin passing a non-table, non-nil `options` here has
+     * unambiguously made a mistake -- there is no reasonable "options" value
+     * that isn't a table, so this fails loudly rather than silently
+     * behaving as if `options` were omitted. */
+    if (lua_gettop(L) >= 2 && !lua_isnil(L, 2) && !lua_istable(L, 2)) {
+        return luaL_error(L, "plugin.set_home_layout: options must be a table");
+    }
     if (lua_gettop(L) >= 2 && lua_istable(L, 2)) {
         lua_getfield(L, 2, "mode");
         const char * mode = lua_tostring(L, -1);
@@ -1414,11 +1491,11 @@ static int l_plugin_set_home_layout(lua_State * L) {
         lua_pop(L, 1);
 
         lua_getfield(L, 2, "tile_gap");
-        config.tile_gap = (int32_t) luaL_optinteger(L, -1, 0);
+        config.tile_gap = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "tile_gap");
         lua_pop(L, 1);
 
         lua_getfield(L, 2, "row_gap");
-        config.row_gap = (int32_t) luaL_optinteger(L, -1, 0);
+        config.row_gap = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "row_gap");
         lua_pop(L, 1);
     }
 
@@ -3294,6 +3371,10 @@ static void load_plugin_file(const char * path) {
     plugin_instance_count++;
 }
 
+static int plugin_filename_cmp(const void * a, const void * b) {
+    return strcmp((const char *) a, (const char *) b);
+}
+
 void plugin_manager_init(void) {
     char dir_path[600];
     snprintf(dir_path, sizeof(dir_path), "%s/.plugins", MUSIC_ROOT_DIR);
@@ -3301,17 +3382,72 @@ void plugin_manager_init(void) {
     DIR * d = opendir(dir_path);
     if (!d) return; /* no .plugins folder -- nothing to do, not an error */
 
+    /* Collected and sorted before any file is actually loaded, rather than
+     * calling load_plugin_file() straight from the readdir() loop -- plain
+     * directory iteration order is filesystem-dependent (real-device
+     * confirmed: it can change after copying or reinstalling files, or
+     * between an SD card formatted on different tools/OSes), which made
+     * "last-loaded plugin wins" APIs (plugin.set_background_color()/
+     * set_text_color()/set_icon()/set_home_layout() -- every one of them a
+     * single global slot every plugin writes into) silently nondeterministic
+     * whenever two installed plugins both set the same one. Sorting by
+     * filename doesn't remove the "last one wins" behavior itself (still
+     * genuinely ambiguous which of two theme plugins a user "wants"), but it
+     * makes the outcome reproducible and independent of the filesystem, and
+     * documented (PLUGINS.md) rather than left to chance.
+     *
+     * Two passes, not one collected straight into a fixed PLUGIN_MAX_FILES-
+     * sized array -- collecting into a 16-slot array during a single
+     * readdir() pass only sorts whichever 16 entries happened to come first
+     * in raw, filesystem-dependent order; with 17+ .lua files installed, the
+     * loaded *subset* would still depend on unsorted directory order, not
+     * just which of that subset loads last. Counting first means every
+     * eligible name is sorted before PLUGIN_MAX_FILES is applied, so the
+     * alphabetically-first 16 are always the ones actually loaded. */
+    int total = 0;
     struct dirent * ent;
     while ((ent = readdir(d)) != NULL) {
         size_t len = strlen(ent->d_name);
         if (len < 5 || strcasecmp(ent->d_name + len - 4, ".lua") != 0) continue;
-        if (plugin_instance_count >= PLUGIN_MAX_FILES) break;
+        total++;
+    }
+    if (total == 0) {
+        closedir(d);
+        return;
+    }
 
-        char full_path[700];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
-        load_plugin_file(full_path);
+    char (*names)[256] = malloc((size_t) total * sizeof(*names));
+    if (!names) {
+        closedir(d);
+        return;
+    }
+
+    /* rewinddir(), not a second opendir() -- same DIR* handle, standard
+     * POSIX way to restart a directory stream already open. name_count is
+     * bounded by `total` from the pass above regardless of whether the
+     * directory's real contents shift between the two passes (a file
+     * added/removed concurrently) -- defensive, not expected in practice at
+     * this point in boot. */
+    rewinddir(d);
+    int name_count = 0;
+    while (name_count < total && (ent = readdir(d)) != NULL) {
+        size_t len = strlen(ent->d_name);
+        if (len < 5 || strcasecmp(ent->d_name + len - 4, ".lua") != 0) continue;
+        snprintf(names[name_count], sizeof(names[0]), "%s", ent->d_name);
+        name_count++;
     }
     closedir(d);
+
+    qsort(names, (size_t) name_count, sizeof(names[0]), plugin_filename_cmp);
+
+    int load_count = (name_count > PLUGIN_MAX_FILES) ? PLUGIN_MAX_FILES : name_count;
+    for (int i = 0; i < load_count; i++) {
+        if (plugin_instance_count >= PLUGIN_MAX_FILES) break;
+        char full_path[700];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, names[i]);
+        load_plugin_file(full_path);
+    }
+    free(names);
 }
 
 void plugin_manager_poll(void) {

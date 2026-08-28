@@ -75,6 +75,14 @@ the first normal authoritative background refresh. Persisted Bluetooth-DAC
 startup is held behind the same gate, while an early manual enable remains
 queued by the existing pending-enable path.
 
+After suspend-to-RAM with Bluetooth initially off, enable Bluetooth and then
+tap it off again as soon as the adapter becomes usable. The second tap must be
+accepted immediately (optimistic icon off) and executed as the queued final
+state when the enable worker releases the chip mutex; it must not be ignored
+for ~30 seconds. Repeat with several rapid taps and verify the final physical
+adapter state matches the last requested UI state, with no on/off/on icon
+bounce from an intermediate status refresh.
+
 The bootloader supervises the selected player by exit status. A clean exit
 (status 0, used by both players' `/sbin/poweroff` handoff) completes a real
 power-off. A nonzero exit, signal, launch failure, or wait failure is treated

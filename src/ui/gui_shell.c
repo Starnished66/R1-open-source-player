@@ -81,6 +81,9 @@ static bool wifi_toggle_active = false;
  * transient read used to make the drawer/topbar bounce on -> off -> on. */
 static bool wifi_toggle_target_enabled = false;
 static bool bt_toggle_active = false;
+static bool bt_toggle_target_enabled = false;
+static bool bt_toggle_followup_pending = false;
+static bool bt_toggle_followup_target_enabled = false;
 
 /* True only while the in-flight wifi_toggle_thread was kicked off by
  * gui_shell_suspend_connections() (the automatic idle-screen-off radio
@@ -2557,10 +2560,23 @@ static atomic_bool bt_toggle_done_flag = false;
  * the DAC overlay screen if it's the one currently showing. */
 static bool bt_toggle_forced_dac_off = false;
 
+/* Encoded pointer values avoid allocating a one-bool thread argument. NULL
+ * remains available for legacy/inferred callers, though all current launch
+ * sites pass an explicit target so the worker never needs a potentially
+ * 15-second bluetoothctl query just to decide which operation to perform. */
+#define BT_TOGGLE_TARGET_ON  ((void *) (intptr_t) 1)
+#define BT_TOGGLE_TARGET_OFF ((void *) (intptr_t) 2)
+
+static void * bt_toggle_target_arg(bool enabled) {
+    return enabled ? BT_TOGGLE_TARGET_ON : BT_TOGGLE_TARGET_OFF;
+}
+
 static void * bt_toggle_thread_func(void * arg) {
-    (void) arg;
     bt_toggle_forced_dac_off = false;
-    bool turning_on = !bt_control_is_powered();
+    bool turning_on;
+    if (arg == BT_TOGGLE_TARGET_ON) turning_on = true;
+    else if (arg == BT_TOGGLE_TARGET_OFF) turning_on = false;
+    else turning_on = !bt_control_is_powered();
     bool chip_wedged = false;
     if (!turning_on) {
         atomic_store_explicit(&bt_media_player_enable_pending, false, memory_order_release);
@@ -2599,26 +2615,14 @@ static void * bt_toggle_thread_func(void * arg) {
         } else chip_wedged = true;
     }
 
-    /* Real-device bug: bt_control_is_powered() (bluetoothctl show) can
-     * still read the OLD state for a moment right after bt_control_enable()/
-     * disable() return -- the command completing doesn't mean bluetoothd
-     * has actually finished updating the adapter's reported Powered state
-     * yet. Confirmed live: the optimistic UI flip (quick_drawer_bt_
-     * event_cb) briefly reverted to the old state once poll_bt_toggle()'s
-     * own start_refresh_bt_icon() check landed too early against this
-     * still-settling state, then corrected itself again on the next
-     * periodic poll a few seconds later -- a visible on/off/on bounce with
-     * no user action in between. Retrying here instead of trusting the
-     * first read means that check lands on the real, settled state
-     * instead. Skipped entirely for the known-wedged-chip case
-     * (chip_wedged) -- retrying there would just be the same pointless
-     * wait the comment above already avoids, since the chip genuinely
-     * isn't coming up. */
-    if (!chip_wedged) {
-        for (int i = 0; i < 5 && bt_control_is_powered() != turning_on; i++) {
-            sleep(1);
-        }
-    }
+    /* Do not confirm via bt_control_is_powered() here. Each status query has
+     * a legitimate 15-second timeout; after resume, Bluetooth was already
+     * usable while several such confirmations kept bt_toggle_active true
+     * for ~30 seconds and caused every disable tap to be discarded. Give
+     * bluetoothd one short propagation interval, then let the existing
+     * asynchronous authoritative refresh confirm/correct the optimistic UI.
+     * A queued opposite request can start as soon as this worker is reaped. */
+    if (!chip_wedged) usleep(500000);
 
     atomic_store_explicit(&bt_toggle_done_flag, true, memory_order_release); /* written last -- poll_bt_toggle only checks this flag */
     return NULL;
@@ -2694,15 +2698,47 @@ static void * bt_pending_enable_thread_func(void * arg) {
     return NULL;
 }
 
+static void show_optimistic_bt_state(bool powered) {
+    lv_image_set_src(quick_drawer_bt_icon, asset_path(powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
+    quick_drawer_mark_snapshot_dirty();
+
+    bt_disconnect_epoch++;
+    bt_is_a2dp_connected_ui = false;
+    bt_connected_codec_cached[0] = '\0';
+    if (powered) {
+        lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(bt_status_icon, asset_path("topbar/bluetooth_unconnect.png"));
+    } else {
+        lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
+    invalidate_bt_codec_status_cache();
+    sync_topbar_status_icon_positions();
+
+    bt_is_powered_cached = powered;
+    if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
+}
+
 void quick_drawer_bt_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     if (quick_drawer_bt_long_press_fired) { /* see quick_drawer_bt_long_press_cb()'s own comment */
         quick_drawer_bt_long_press_fired = false;
         return;
     }
-    if (bt_toggle_active) return; /* already toggling -- ignore taps until it lands */
-
     bool bt_will_be_powered = !bt_is_powered_cached;
+
+    /* Last intent wins while a slow resume/enable is still finishing. The
+     * running operation cannot be safely interrupted while it owns the chip
+     * mutex, but an opposite tap is remembered and launched immediately
+     * after it completes instead of being silently discarded. Repeated taps
+     * collapse back to the in-flight target when appropriate. */
+    if (bt_toggle_active) {
+        bt_toggle_followup_target_enabled = bt_will_be_powered;
+        bt_toggle_followup_pending = (bt_will_be_powered != bt_toggle_target_enabled);
+        show_optimistic_bt_state(bt_will_be_powered);
+        return;
+    }
 
     /* Real-device incident: turning Bluetooth ON before BT_INIT_OK_FLAG_PATH
      * exists raced this app's own bt_control_init_chip() against bt_init's
@@ -2719,6 +2755,8 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
     bool bt_pending_now = bt_will_be_powered && access(BT_INIT_OK_FLAG_PATH, F_OK) != 0;
 
     bt_toggle_active = true;
+    bt_toggle_target_enabled = bt_will_be_powered;
+    bt_toggle_followup_pending = false;
     atomic_store_explicit(&bt_toggle_done_flag, false, memory_order_relaxed);
 
     /* Optimistic sprite flip, same reasoning as quick_drawer_wifi_event_cb's
@@ -2730,9 +2768,6 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
      * what makes the tap itself read as instant instead of the icon
      * sitting frozen until poll_bt_toggle() confirms the real state once
      * the thread lands. */
-    lv_image_set_src(quick_drawer_bt_icon, asset_path(bt_will_be_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
-    quick_drawer_mark_snapshot_dirty();
-
     /* Real-device bug report: the topbar Bluetooth icon stayed frozen on
      * whatever it showed pre-toggle (e.g. still the "connected" sprite
      * after manually turning Bluetooth off) until poll_bt_toggle()'s own
@@ -2746,22 +2781,6 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
      * active connection yet -- poll_refresh_bt_icon() overwrites both with
      * the real, settled state once its own check lands (it already skips
      * doing so while bt_toggle_active, see its own comment). */
-    bt_disconnect_epoch++;
-    bt_is_a2dp_connected_ui = false;
-    bt_connected_codec_cached[0] = '\0';
-    if (bt_will_be_powered) {
-        lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
-        lv_image_set_src(bt_status_icon, asset_path("topbar/bluetooth_unconnect.png"));
-        lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
-    }
-    invalidate_bt_codec_status_cache();
-    sync_topbar_status_icon_positions();
-
     /* Optimistically rebuild the whole Bluetooth settings screen too (not
      * just the toggle row) when that's the screen showing -- same
      * "screen takes a while to appear" real-device feedback as
@@ -2776,8 +2795,7 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
      * (see its own comment on this exact race), so nothing overwrites this
      * until start_refresh_bt_icon()'s real result lands afterward and
      * correctly finalizes it. */
-    bt_is_powered_cached = bt_will_be_powered;
-    if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
+    show_optimistic_bt_state(bt_will_be_powered);
 
     /* Runs fully in the background, same as the stock player -- no busy
      * screen. An earlier version pushed a "Turning on Bluetooth..."
@@ -2786,7 +2804,9 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
      * real, repeatedly-hit stuck-screen bug (multiple uncoordinated users of
      * one shared overlay), which not having an overlay at all sidesteps
      * entirely. */
-    if (pthread_create(&bt_toggle_thread, NULL, bt_pending_now ? bt_pending_enable_thread_func : bt_toggle_thread_func, NULL) != 0) {
+    void * (*thread_func)(void *) = bt_pending_now ? bt_pending_enable_thread_func : bt_toggle_thread_func;
+    void * thread_arg = bt_pending_now ? NULL : bt_toggle_target_arg(bt_will_be_powered);
+    if (pthread_create(&bt_toggle_thread, NULL, thread_func, thread_arg) != 0) {
         bt_toggle_active = false;
         bt_is_powered_cached = !bt_will_be_powered;
         if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
@@ -2808,6 +2828,19 @@ static void poll_bt_toggle(void) {
          * so close it automatically instead of leaving a "Bluetooth DAC
          * mode" screen up with nothing backing it. */
         if (lv_screen_active() == gui_network_get_bt_dac_overlay()) nav_pop();
+    }
+
+    if (bt_toggle_followup_pending) {
+        bool target = bt_toggle_followup_target_enabled;
+        bt_toggle_followup_pending = false;
+        bt_toggle_target_enabled = target;
+        bt_toggle_active = true;
+        atomic_store_explicit(&bt_toggle_done_flag, false, memory_order_relaxed);
+        if (pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func,
+                           bt_toggle_target_arg(target)) == 0)
+            return;
+        bt_toggle_active = false;
+        show_info_toast("Failed to toggle Bluetooth");
     }
 
     /* start_refresh_bt_icon() only starts the background check -- it
@@ -3257,8 +3290,10 @@ void gui_shell_resume_connections(bool wifi_was_on, bool bt_was_on) {
     }
     if (bt_was_on && !bt_is_powered_cached && !bt_toggle_active) {
         bt_toggle_active = true;
+        bt_toggle_target_enabled = true;
+        bt_toggle_followup_pending = false;
         atomic_store_explicit(&bt_toggle_done_flag, false, memory_order_relaxed);
-        if (pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL) != 0) {
+        if (pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, BT_TOGGLE_TARGET_ON) != 0) {
             bt_toggle_active = false;
         }
     }
@@ -3282,8 +3317,10 @@ void gui_shell_suspend_connections(bool * wifi_was_on, bool * bt_was_on) {
     }
     if (*bt_was_on && !bt_toggle_active) {
         bt_toggle_active = true;
+        bt_toggle_target_enabled = false;
+        bt_toggle_followup_pending = false;
         atomic_store_explicit(&bt_toggle_done_flag, false, memory_order_relaxed);
-        if (pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, NULL) != 0)
+        if (pthread_create(&bt_toggle_thread, NULL, bt_toggle_thread_func, BT_TOGGLE_TARGET_OFF) != 0)
             bt_toggle_active = false;
     }
 #else

@@ -31,6 +31,13 @@ void import_web_start(void) {
     char * cp_js_argv[] = { (char *) "cp", (char *) "-p", (char *) SRC_WEB "/pages/index-EN.js",
                             (char *) DST_WEB "/js/index.js", NULL };
     subprocess_run(cp_js_argv, NULL, 0);
+    /* DST_WEB persists under /usr/data and is only seeded once above. Keep
+     * replacement CGI handlers in sync explicitly, just like the localized
+     * HTML/JS, or upgraded devices continue executing the stale stock
+     * list.cgi forever. */
+    char * cp_list_cgi_argv[] = { (char *) "cp", (char *) "-p", (char *) SRC_WEB "/cgi-bin/list.cgi",
+                                  (char *) DST_WEB "/cgi-bin/list.cgi", NULL };
+    subprocess_run(cp_list_cgi_argv, NULL, 0);
 
     char * udp_argv[] = { (char *) "udp_server", (char *) "-p", (char *) "4399", NULL };
     subprocess_spawn_daemon(udp_argv);

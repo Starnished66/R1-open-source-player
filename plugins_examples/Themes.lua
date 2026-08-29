@@ -1,12 +1,9 @@
 plugin.define({ id = "example.themes", name = "Themes", version = "1.0", api_min = 1 })
 
 -- Light/Dark theme switcher, adds a "Theme" row to Settings -> Display.
--- White reskins the app with the stock firmware's own theme1 icon set
--- (theme1 is the light variant of the same litegui asset pack this app's
--- own theme2 already draws from -- both ship at
--- /usr/resource/litegui/theme1 and /theme2 on every real R1) plus a white
--- background; Dark restores this app's own default look (theme2 icons,
--- near-black backgrounds).
+-- White applies a soft blue-white color palette without replacing any of
+-- the player's icons. Dark restores this app's own default look (theme2
+-- icons, near-black backgrounds).
 --
 -- The chosen theme is written to a small state file under .plugins/ and
 -- reapplied at the very top of this script on every boot -- the same
@@ -15,7 +12,6 @@ plugin.define({ id = "example.themes", name = "Themes", version = "1.0", api_min
 -- storage is needed.
 
 local STATE_PATH = plugin.sd_root() .. "/.plugins/.theme_state"
-local THEME1_ROOT = "/usr/resource/litegui/theme1/"
 local THEME2_ROOT = "/usr/resource/litegui/theme2/"
 
 local function read_state()
@@ -37,10 +33,8 @@ end
 -- Every theme2-relative asset path this app actually resolves via
 -- asset_path() (src/ui/assets.c) -- collected by grepping src/ui/*.c for
 -- every literal ".png" path plus the digit/wifi-signal paths built
--- dynamically with snprintf. Deliberately NOT a full mirror of theme1's
--- ~620 files (2.7MB): the device's /usr/data partition (where
--- plugin.set_icon()'s overrides land) typically has only a few MB free,
--- and this app never resolves most of theme1/theme2 anyway.
+-- dynamically with snprintf. Dark copies these from the stock theme2 pack
+-- to restore the default icon set. White deliberately never touches them.
 local ASSETS = {
     "boot_animation/en/0.png", "bt/bt.png",
     "keyboard/char.png", "keyboard/del.png", "keyboard/dot.png", "keyboard/enter.png",
@@ -98,7 +92,7 @@ local ASSETS = {
 local COLORS = {
     dark  = { screen = 0x000000, card = 0x202020, list_row = 0x1C1C1E,
               text_primary = 0xE6E6E6, text_muted = 0xA0A0A0 },
-    white = { screen = 0xFFFFFF, card = 0xF2F2F2, list_row = 0xECECEC,
+    white = { screen = 0xE6F6FF, card = 0xF2F2F2, list_row = 0xECECEC,
               text_primary = 0x1A1A1A, text_muted = 0x6E6E6E },
 }
 
@@ -117,9 +111,9 @@ local COLORS = {
 -- before text" order so if something still does interrupt this mid-way,
 -- the worst case is unstyled text on a correctly-recolored background
 -- (readable, if plain) rather than text and background from two different
--- themes (unreadable). The icon loop -- slower, more failure-prone (each
--- one's own file copy), and merely cosmetic if some icons stay stale --
--- runs after, unchanged in shape.
+-- themes (unreadable). Dark's icon-restoration loop -- slower, more
+-- failure-prone (each one's own file copy), and merely cosmetic if some
+-- icons stay stale -- runs afterward. White skips it completely.
 local function apply_theme(state)
     local c = COLORS[state]
     pcall(plugin.set_background_color, "screen", c.screen)
@@ -128,9 +122,10 @@ local function apply_theme(state)
     pcall(plugin.set_text_color, "primary", c.text_primary)
     pcall(plugin.set_text_color, "muted", c.text_muted)
 
-    local source_root = (state == "white") and THEME1_ROOT or THEME2_ROOT
-    for _, rel in ipairs(ASSETS) do
-        pcall(plugin.set_icon, rel, source_root .. rel)
+    if state == "dark" then
+        for _, rel in ipairs(ASSETS) do
+            pcall(plugin.set_icon, rel, THEME2_ROOT .. rel)
+        end
     end
 end
 
@@ -144,6 +139,10 @@ plugin.register_list_item("display", "Theme", function()
         current_state = new_state
         write_state(new_state)
         apply_theme(new_state)
-        plugin.show_toast("Theme saved -- restart the player to fully apply icons")
+        if new_state == "dark" then
+            plugin.show_toast("Theme saved -- restart the player to fully apply icons")
+        else
+            plugin.show_toast("White theme applied without changing icons")
+        end
     end)
 end)

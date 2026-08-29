@@ -128,19 +128,21 @@ static bool extract_build_stamp(const char * path, char * out, size_t out_size) 
     return found;
 }
 
-/* True only if both binaries have a discoverable BUILD_STAMP and sd_path's
- * is lexically greater than internal_path's -- "YYYY-MM-DD_HH:MM" sorts
- * correctly as plain text, no date parsing needed. Any missing/unreadable
- * stamp on either side is treated as "not newer", never guessed -- an SD
- * binary that isn't even a build of this app (no BUILD_STAMP at all) must
- * never be auto-adopted just because it happens to be named
- * open_hiby_player. */
-static bool sd_build_is_newer(const char * internal_path, const char * sd_path) {
+/* >0 if sd_path's BUILD_STAMP is lexically greater ("newer") than
+ * internal_path's, <0 if lexically less ("older"), 0 if they match exactly
+ * or either side's stamp couldn't be found -- "YYYY-MM-DD_HH:MM" sorts
+ * correctly as plain text, no date parsing needed. A missing/unreadable
+ * stamp on either side folds into 0 ("not comparable"), never guessed as
+ * either direction -- an SD binary that isn't even a build of this app (no
+ * BUILD_STAMP at all) must never be treated as newer OR older just because
+ * it happens to be named open_hiby_player. */
+static int compare_sd_build_to_internal(const char * internal_path, const char * sd_path) {
     char internal_stamp[BUILD_STAMP_LEN + 1];
     char sd_stamp[BUILD_STAMP_LEN + 1];
-    if (!extract_build_stamp(internal_path, internal_stamp, sizeof(internal_stamp))) return false;
-    if (!extract_build_stamp(sd_path, sd_stamp, sizeof(sd_stamp))) return false;
-    return strcmp(sd_stamp, internal_stamp) > 0;
+    if (!extract_build_stamp(internal_path, internal_stamp, sizeof(internal_stamp))) return 0;
+    if (!extract_build_stamp(sd_path, sd_stamp, sizeof(sd_stamp))) return 0;
+    int cmp = strcmp(sd_stamp, internal_stamp);
+    return cmp > 0 ? 1 : (cmp < 0 ? -1 : 0);
 }
 
 /* Round-tripped by scanner_save_last_boot() so persisting a new default
@@ -177,31 +179,41 @@ void scanner_scan(scan_result_t * out) {
     out->sd_stock_present = path_is_executable(SD_STOCK_PLAYER_PATH);
     out->sd_update_present = path_is_executable(SD_UPDATE_PLAYER_PATH);
 
+    int sd_build_cmp = 0;
     if (out->sd_update_present) {
-        out->sd_update_is_newer = sd_build_is_newer(INTERNAL_PLAYER_PATH, SD_UPDATE_PLAYER_PATH);
+        sd_build_cmp = compare_sd_build_to_internal(INTERNAL_PLAYER_PATH, SD_UPDATE_PLAYER_PATH);
+        out->sd_update_is_newer = sd_build_cmp > 0;
     }
 
     load_preferences(&out->default_entry, &out->timeout_seconds);
     loaded_timeout_seconds = out->timeout_seconds;
     /* Persisted choice is no longer reachable (SD removed, file deleted
-     * since) -- fall back rather than defaulting a countdown to an entry
-     * that can't actually be booted. */
+     * since), or the SD update build it pointed at has since been
+     * superseded by a newer internal build (sd_build_cmp < 0) -- fall back
+     * rather than defaulting a countdown to an entry that can't actually be
+     * booted, or to a now-stale build the internal one has overtaken. */
     if (out->default_entry == BOOT_ENTRY_SD_STOCK && !out->sd_stock_present) {
         out->default_entry = BOOT_ENTRY_INTERNAL;
-    } else if (out->default_entry == BOOT_ENTRY_SD_UPDATE && !out->sd_update_present) {
+    } else if (out->default_entry == BOOT_ENTRY_SD_UPDATE && (!out->sd_update_present || sd_build_cmp < 0)) {
         out->default_entry = BOOT_ENTRY_INTERNAL;
     }
 
-    /* An SD update build being present at all takes default priority over
+    /* An SD update build being present takes default priority over
      * whatever was separately persisted from an earlier boot -- dropping a
      * new open_hiby_player build on the card is itself a strong, deliberate
      * signal of intent to run it, stronger than a preference recorded
-     * before that file ever existed. Only reached when it isn't ALSO
-     * newer (see main()'s own decision tree) -- that case already
-     * auto-boots it directly with no menu, so this is specifically the
-     * "present, offered as a menu entry" path highlighting it as the
+     * before that file ever existed. EXCEPT when it is strictly OLDER than
+     * the internal build (sd_build_cmp < 0): an internal rebuild having
+     * since superseded it means the newer side is now internal, not the SD
+     * drop from before that rebuild -- the clamp above already retargeted
+     * default_entry to BOOT_ENTRY_INTERNAL for that case, and this must not
+     * re-force it back to SD_UPDATE. Same-age or not-comparable SD builds
+     * (cmp == 0) still take default priority as before. Only reached when
+     * it isn't ALSO newer (see main()'s own decision tree) -- that case
+     * already auto-boots it directly with no menu, so this is specifically
+     * the "present, offered as a menu entry" path highlighting it as the
      * default rather than requiring it to be manually picked every time. */
-    if (out->sd_update_present) {
+    if (out->sd_update_present && sd_build_cmp >= 0) {
         out->default_entry = BOOT_ENTRY_SD_UPDATE;
     }
 }

@@ -23,7 +23,12 @@
  *    installed one, scanner_scan() also sets sd_update_is_newer, and
  *    main() auto-boots it directly with no menu at all (see that flag's
  *    own doc comment); it is STILL a normal, present, selectable menu
- *    entry the rest of the time (same age, older, or not comparable). */
+ *    entry the rest of the time (same age or not comparable). When it
+ *    compares strictly OLDER than the installed internal build, it is
+ *    still present and selectable, but scanner_scan() no longer defaults
+ *    to it -- the internal build having since overtaken it defaults the
+ *    menu/countdown back to BOOT_ENTRY_INTERNAL instead (see
+ *    default_entry's own doc comment). */
 /* This app's own runtime code mostly refers to this same location as
  * "/data/mnt/sd_0" ("/data" is a symlink to "usr/data", confirmed
  * on-device -- see settings.h's own comment on Factory Reset's "mnt"
@@ -86,11 +91,13 @@ typedef struct {
     /* Persisted BOOT_ENTRY_* from the last successful boot, clamped to a
      * valid choice for THIS scan (falls back to BOOT_ENTRY_INTERNAL if the
      * persisted entry is no longer available, e.g. the SD card was
-     * removed) -- EXCEPT sd_update_present always overrides this to
-     * BOOT_ENTRY_SD_UPDATE regardless of what was persisted (see
-     * scanner_scan()'s own comment on why). This is both the
-     * initially-highlighted menu entry and what a countdown timeout
-     * confirms. */
+     * removed, or if it points at an SD update build that a newer internal
+     * build has since overtaken) -- EXCEPT sd_update_present overrides this
+     * to BOOT_ENTRY_SD_UPDATE regardless of what was persisted, UNLESS that
+     * SD build compares strictly OLDER than the installed internal one, in
+     * which case BOOT_ENTRY_INTERNAL wins instead (see scanner_scan()'s own
+     * comment on why). This is both the initially-highlighted menu entry
+     * and what a countdown timeout confirms. */
     int default_entry;
 
     /* Seconds before an unattended timeout confirms default_entry.

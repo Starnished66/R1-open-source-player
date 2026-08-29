@@ -258,6 +258,11 @@ void gui_plugin_set_background_color(const char * slot, uint32_t rgb) {
     } else if (strcmp(slot, "list_row") == 0) {
         lv_style_set_bg_color(&list_row_style, color);
         lv_obj_report_style_change(&list_row_style);
+        /* pill_row_bg_style is the same "list_row" slot for pill rows --
+         * see its own comment in screen_builders.h for why it's a separate
+         * style object rather than reusing list_row_style directly. */
+        lv_style_set_bg_color(&pill_row_bg_style, color);
+        lv_obj_report_style_change(&pill_row_bg_style);
     }
     /* Else: unknown slot -- plugin_manager.c's l_plugin_set_background_color()
      * already validates against the three known names and raises a Lua

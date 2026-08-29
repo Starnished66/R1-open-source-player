@@ -77,6 +77,16 @@ extern lv_style_t list_row_style;
  * see screen_builders_init_list_row_style()'s own comment on why this is a
  * separate style rather than folded into list_row_style itself. */
 extern lv_style_t list_row_pressed_style;
+/* Same live, plugin-mutable bg_color/radius as list_row_style, for pill rows
+ * (build_pill_list_screen()'s resized branch, add_pill_row_base()) that
+ * position every child themselves via fixed-offset lv_obj_align() calls --
+ * deliberately carries none of list_row_style's width/height/padding/text
+ * properties, since its pad_left/pad_top would shift the content-area
+ * origin lv_obj_align() aligns against, displacing those rows' labels/icons.
+ * gui_plugin_set_background_color() mutates this alongside list_row_style
+ * whenever the "list_row" slot changes -- see screen_builders_init_list_row_
+ * style()'s own comment. */
+extern lv_style_t pill_row_bg_style;
 /* LV_STATE_PRESSED-only tap indicator for a bare lv_image icon button (no
  * background to recolor the way list_row_pressed_style does) -- dims the
  * icon via image_recolor/image_recolor_opa rather than swapping to a

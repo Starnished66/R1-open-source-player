@@ -24,6 +24,7 @@
 
 lv_style_t list_row_style;
 lv_style_t list_row_pressed_style;
+lv_style_t pill_row_bg_style;
 lv_style_t icon_press_style;
 static lv_style_t row_marquee_style;
 static lv_anim_t row_marquee_anim;
@@ -91,6 +92,24 @@ void screen_builders_init_list_row_style(void) {
     lv_style_set_pad_top(&list_row_style, (LIST_ROW_HEIGHT - lv_font_get_line_height(&LIST_ROW_FONT)) / 2);
     lv_style_set_text_color(&list_row_style, lv_color_make(230, 230, 230));
     lv_style_set_text_font(&list_row_style, &LIST_ROW_FONT);
+
+    /* Background/radius only -- no width/height/padding/text -- for pill
+     * rows (build_pill_list_screen()'s resized branch, add_pill_row_base())
+     * that need the same live, plugin-mutable "list_row" color as
+     * list_row_style's own rows but position every child themselves via
+     * fixed-offset lv_obj_align() calls against their own explicit size.
+     * list_row_style's pad_left/pad_top shift the content-area origin
+     * lv_obj_align() aligns against, so attaching it directly to a pill row
+     * pushed labels/icons ~28px right and ~15-16px down (real regression,
+     * caught in review before this shipped) -- this style deliberately
+     * carries none of that. gui_plugin_set_background_color() mutates this
+     * alongside list_row_style whenever the "list_row" slot changes, so
+     * both row families stay in sync. */
+    lv_style_init(&pill_row_bg_style);
+    lv_style_set_radius(&pill_row_bg_style, LIST_ROW_RADIUS);
+    lv_style_set_bg_color(&pill_row_bg_style, LIST_ROW_BG_COLOR);
+    lv_style_set_bg_opa(&pill_row_bg_style, LV_OPA_COVER);
+    lv_style_set_border_width(&pill_row_bg_style, 0);
 
     /* Real-device bug report: no visual feedback at all on touching a song
      * row (list_row_style has no LV_STATE_PRESSED override, so the row's
@@ -905,8 +924,18 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
          * box underneath it. */
         lv_obj_add_style(row, &style_theme_screen_bg, 0);
         if (resized) {
-            lv_obj_set_style_radius(row, item->has_radius ? item->radius : LIST_ROW_RADIUS, 0);
-            lv_obj_set_style_bg_color(row, item->has_bg_color ? lv_color_hex(item->bg_color) : LIST_ROW_BG_COLOR, 0);
+            /* pill_row_bg_style supplies the default radius/bg_color, live
+             * and plugin-mutable via plugin.set_background_color("list_row",
+             * ...) -- see its own comment (background/radius only, kept
+             * separate from list_row_style so its padding doesn't shift this
+             * row's manually lv_obj_align()'d children). Local overrides
+             * below still win over it (LVGL always evaluates an object's own
+             * local style properties before any style added via
+             * lv_obj_add_style, regardless of call order), so an
+             * item-specific radius/bg_color is unaffected. */
+            lv_obj_add_style(row, &pill_row_bg_style, 0);
+            if (item->has_radius) lv_obj_set_style_radius(row, item->radius, 0);
+            if (item->has_bg_color) lv_obj_set_style_bg_color(row, lv_color_hex(item->bg_color), 0);
         } else {
             lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
         }
@@ -1880,8 +1909,12 @@ lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) {
     if (row_width == 448) {
         lv_obj_set_style_bg_image_src(row, asset_path("touch_list/item_bg.png"), 0);
     } else {
-        lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        /* pill_row_bg_style, not a hardcoded LIST_ROW_BG_COLOR -- see its
+         * own comment (background/radius only) and the matching comment in
+         * build_pill_list_screen() above for why this needs to be the live,
+         * plugin-mutable style object, and specifically not list_row_style
+         * itself (its padding would shift this row's aligned children). */
+        lv_obj_add_style(row, &pill_row_bg_style, 0);
     }
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(row, 0, 0);

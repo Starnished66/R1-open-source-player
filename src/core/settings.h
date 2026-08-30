@@ -343,6 +343,9 @@ typedef struct {
      * topbar/pm.png -- already-present theme assets, previously unused by
      * any code in this app). */
     bool clock_24h;
+    bool clock_automatic;
+    int64_t clock_manual_epoch;
+    int64_t clock_system_reference;
 
     /* Settings -> Display -> Font. Filename of the user-selected custom Latin
      * TTF font from <SD>/Fonts (e.g. "Roboto-Regular.ttf"). Empty string means

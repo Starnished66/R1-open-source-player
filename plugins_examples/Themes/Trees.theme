@@ -55,15 +55,15 @@ tile.books.accessory=true
 tile.books.text_size=medium
 tile.books.icon=true
 
-tile.system.bg_color=0x2A4530
-tile.system.text_color=0xD8C9A3
-tile.system.radius=24
-tile.system.height=92
-tile.system.width=440
-tile.system.align=center
-tile.system.accessory=true
-tile.system.text_size=medium
-tile.system.icon=true
+tile.settings.bg_color=0x2A4530
+tile.settings.text_color=0xD8C9A3
+tile.settings.radius=24
+tile.settings.height=92
+tile.settings.width=440
+tile.settings.align=center
+tile.settings.accessory=true
+tile.settings.text_size=medium
+tile.settings.icon=true
 
 tile.dac.bg_color=0x1E3524
 tile.dac.text_color=0xD8C9A3

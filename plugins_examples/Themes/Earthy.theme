@@ -30,9 +30,9 @@ tile.books.bg_color=0x5C4632
 tile.books.text_color=0xF5EAD9
 tile.books.radius=16
 
-tile.system.bg_color=0x7D8F5C
-tile.system.text_color=0x3A2A1E
-tile.system.radius=16
+tile.settings.bg_color=0x7D8F5C
+tile.settings.text_color=0x3A2A1E
+tile.settings.radius=16
 
 tile.dac.bg_color=0x9C6B46
 tile.dac.text_color=0xF5EAD9

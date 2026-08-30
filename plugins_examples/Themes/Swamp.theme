@@ -50,14 +50,14 @@ tile.books.accessory=false
 tile.books.text_size=large
 tile.books.icon=false
 
-tile.system.bg_color=0x2C301C
-tile.system.text_color=0x8A9C5A
-tile.system.radius=0
-tile.system.height=108
-tile.system.align=right
-tile.system.accessory=false
-tile.system.text_size=large
-tile.system.icon=false
+tile.settings.bg_color=0x2C301C
+tile.settings.text_color=0x8A9C5A
+tile.settings.radius=0
+tile.settings.height=108
+tile.settings.align=right
+tile.settings.accessory=false
+tile.settings.text_size=large
+tile.settings.icon=false
 
 tile.dac.bg_color=0x232616
 tile.dac.text_color=0x7C8F4E

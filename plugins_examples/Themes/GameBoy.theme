@@ -14,7 +14,7 @@ icon_root=theme2
 
 home_mode=list
 home_row_gap=8
-home_order=music,stream_media,subsonic,wireless,books,system,dac
+home_order=music,stream_media,subsonic,wireless,books,settings,dac
 
 tile.music.bg_color=0x0F1420
 tile.music.text_color=0xF4D35E
@@ -61,14 +61,14 @@ tile.books.accessory=false
 tile.books.text_size=mono
 tile.books.icon=false
 
-tile.system.bg_color=0x0F1420
-tile.system.text_color=0xEE6C8B
-tile.system.radius=0
-tile.system.height=108
-tile.system.align=left
-tile.system.accessory=false
-tile.system.text_size=mono
-tile.system.icon=false
+tile.settings.bg_color=0x0F1420
+tile.settings.text_color=0xEE6C8B
+tile.settings.radius=0
+tile.settings.height=108
+tile.settings.align=left
+tile.settings.accessory=false
+tile.settings.text_size=mono
+tile.settings.icon=false
 
 tile.dac.bg_color=0x0F1420
 tile.dac.text_color=0xEE6C8B

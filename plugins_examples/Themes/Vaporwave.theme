@@ -31,9 +31,9 @@ tile.books.bg_color=0xC23F9E
 tile.books.text_color=0xFFF0FF
 tile.books.radius=26
 
-tile.system.bg_color=0xE14F95
-tile.system.text_color=0xFFF5FB
-tile.system.radius=26
+tile.settings.bg_color=0xE14F95
+tile.settings.text_color=0xFFF5FB
+tile.settings.radius=26
 
 tile.dac.bg_color=0xFF6F9C
 tile.dac.text_color=0xFFFFFF

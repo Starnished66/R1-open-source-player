@@ -50,7 +50,10 @@
  * same as every bump before it. Also see the new "ui.home_tiles"
  * plugin_capabilities[] entry (plugin_manager.c) for the no-version-bump
  * way to feature-detect just this. */
-#define PLUGIN_API_VERSION 7
+/* API 8 adds plugin.set_launcher_layout(), allowing themes to switch the
+ * native Music, Stream Media, and Wireless launchers between their existing
+ * icon grids and the shared pill-list presentation. */
+#define PLUGIN_API_VERSION 8
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
 /* Third-party Lua plugin support. Every *.lua file under

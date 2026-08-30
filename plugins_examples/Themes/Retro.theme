@@ -42,9 +42,9 @@ tile.books.bg_color=0xC46A4A
 tile.books.text_color=0xF2E9D8
 tile.books.radius=8
 
-tile.system.bg_color=0x8A6B4A
-tile.system.text_color=0xF2E9D8
-tile.system.radius=8
+tile.settings.bg_color=0x8A6B4A
+tile.settings.text_color=0xF2E9D8
+tile.settings.radius=8
 
 tile.dac.bg_color=0xB5804A
 tile.dac.text_color=0xF2E9D8

@@ -131,6 +131,9 @@ static void set_defaults(player_settings_t * out) {
     out->lyrics_font_size_tier = 2; /* Large -- see settings.h's own comment */
     out->brightness_percent = 80;
     out->clock_24h = true; /* matches the app's original, only-ever clock format -- existing installs see no change */
+    out->clock_automatic = true;
+    out->clock_manual_epoch = 0;
+    out->clock_system_reference = 0;
     out->custom_font[0] = '\0';
 }
 
@@ -384,6 +387,12 @@ bool settings_load(player_settings_t * out) {
             out->brightness_percent = atoi(value);
         } else if (strcmp(key, "clock_24h") == 0) {
             out->clock_24h = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "clock_automatic") == 0) {
+            out->clock_automatic = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "clock_manual_epoch") == 0) {
+            out->clock_manual_epoch = (int64_t) strtoll(value, NULL, 10);
+        } else if (strcmp(key, "clock_system_reference") == 0) {
+            out->clock_system_reference = (int64_t) strtoll(value, NULL, 10);
         } else if (strcmp(key, "custom_font") == 0) {
             if (!strchr(value, '/') && !strchr(value, '\\') && !strstr(value, "..")) {
                 snprintf(out->custom_font, sizeof(out->custom_font), "%s", value);
@@ -520,6 +529,9 @@ void settings_save(const player_settings_t * settings) {
     fprintf(f, "lyrics_font_size_tier=%d\n", settings->lyrics_font_size_tier);
     fprintf(f, "brightness_percent=%d\n", settings->brightness_percent);
     fprintf(f, "clock_24h=%d\n", settings->clock_24h ? 1 : 0);
+    fprintf(f, "clock_automatic=%d\n", settings->clock_automatic ? 1 : 0);
+    fprintf(f, "clock_manual_epoch=%lld\n", (long long) settings->clock_manual_epoch);
+    fprintf(f, "clock_system_reference=%lld\n", (long long) settings->clock_system_reference);
     fprintf(f, "custom_font=%s\n", settings->custom_font);
 
     fflush(f);

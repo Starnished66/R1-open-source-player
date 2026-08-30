@@ -940,6 +940,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         content_h += height;
 
         lv_obj_t * row = lv_obj_create(list);
+        if (item->out_row) *item->out_row = row;
         lv_obj_set_size(row, width, height);
         /* item_bg.png is a rounded-rect sprite with transparent corners --
          * without an explicit black bg_color here, LVGL's own default
@@ -1058,6 +1059,33 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
     }
 
     return scr;
+}
+
+lv_obj_t * build_launcher_menu_screen(const char * title, lv_event_cb_t back_btn_cb,
+                                      const icon_grid_item_t * items, int item_count,
+                                      int icon_scale_pct, bool label_inside_icon,
+                                      const launcher_menu_layout_t * layout) {
+    if (!layout || !layout->list_mode)
+        return build_icon_grid_screen(title, back_btn_cb, items, item_count, icon_scale_pct,
+                                      label_inside_icon, 0);
+
+    pill_list_item_t rows[item_count];
+    for (int i = 0; i < item_count; i++) {
+        rows[i] = (pill_list_item_t) {
+            .label = items[i].label,
+            .accessory = layout->has_accessory && layout->accessory ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
+            .on_click = items[i].on_click, .user_data = items[i].user_data,
+            .icon_asset = layout->has_icon && layout->icon ? asset_path_plain(items[i].icon_asset) : NULL,
+            .row_height = layout->height, .row_width = layout->width,
+            .has_bg_color = layout->has_bg_color, .bg_color = layout->bg_color,
+            .has_text_color = layout->has_text_color, .text_color = layout->text_color,
+            .has_radius = layout->has_radius, .radius = layout->radius,
+            .text_size = layout->text_size[0] ? layout->text_size : NULL,
+            .text_align = layout->align[0] ? layout->align : NULL,
+        };
+    }
+    return build_pill_list_screen(title, back_btn_cb, rows, item_count, gui_theme_accent_style(),
+                                  layout->row_gap > 0 ? layout->row_gap : 6);
 }
 
 /* ---- Compact list (virtualized) ---- */

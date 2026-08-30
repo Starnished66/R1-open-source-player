@@ -3371,9 +3371,19 @@ static lv_obj_t * build_wireless_screen(void) {
      * rather than just its surrounding whitespace -- lands at very close to
      * these assets' own native 212x190 resolution within this screen's
      * available cell height. */
-    lv_obj_t * scr = build_icon_grid_screen("Wireless", generic_back_cb, items, 6, 160, true, 0);
+    lv_obj_t * scr = build_launcher_menu_screen("Wireless", generic_back_cb, items, 6, 160, true,
+                                                 &launcher_layout_config.wireless);
     finalize_screen_navigation(scr);
     return scr;
+}
+
+void gui_network_refresh_wireless_screen(void) {
+    lv_obj_t * old = wireless_screen;
+    lv_obj_t * fresh = build_wireless_screen();
+    if (!fresh) return;
+    wireless_screen = fresh;
+    gui_navigation_replace_static_screen(3, old, fresh);
+    if (old) lv_obj_del(old);
 }
 
 void gui_network_init(void) {

@@ -23,6 +23,7 @@ static uint64_t current_playback_generation = 0;
 
 #include "audio_helpers.h"
 #include "gui_player.h"
+#include "app_clock.h"
 #include "gui.h"
 #include "gui_theme.h"
 #include "gui_notifications.h"
@@ -3186,6 +3187,8 @@ void battery_percent_switch_event_cb(lv_event_t * e) {
 void clock_24h_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.clock_24h = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    app_clock_get_persistence(&current_settings.clock_manual_epoch,
+                              &current_settings.clock_system_reference);
     settings_save(&current_settings);
     refresh_clock_label();
 }

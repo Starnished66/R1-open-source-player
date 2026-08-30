@@ -1,4 +1,5 @@
 #include "gui_shell.h"
+#include "app_clock.h"
 #include "gui.h"
 #include "gui_theme.h"
 #include "gui_notifications.h"
@@ -3239,9 +3240,8 @@ static void build_quick_drawer(void) {
 }
 
 void refresh_clock_label(void) {
-    time_t now = time(NULL);
     struct tm tm_info;
-    localtime_r(&now, &tm_info);
+    app_clock_localtime(&tm_info);
     char buf[8];
     /* %I (12h) zero-pads to 2 digits just like %H (24h) does -- "01".."12",
      * never a single digit -- so buf is always "HH:MM" (5 chars) either

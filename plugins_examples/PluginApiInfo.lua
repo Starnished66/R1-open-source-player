@@ -9,7 +9,7 @@ local CAPABILITIES = {
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
     "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
-    "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles"
+    "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles", "ui.launcher_layout"
 }
 
 local CATEGORIES = {
@@ -112,6 +112,7 @@ local CATEGORIES = {
                 "plugin.set_background_color(slot, rgb)",
                 "plugin.set_text_color(slot, rgb)",
                 "plugin.set_home_layout(tiles, options)",
+                "plugin.set_launcher_layout(options)",
                 "plugin.refresh_theme()",
                 "plugin.reload_ui()",
             }

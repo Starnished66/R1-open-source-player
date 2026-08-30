@@ -295,8 +295,16 @@ static void theme_refresh_cb(lv_timer_t * timer) {
     lv_timer_del(timer);
     theme_refresh_scheduled = false;
     lv_image_cache_drop(NULL);
+    /* Drop old bases before replacement. Each replacement registers one
+     * fresh base; invalidating afterwards would immediately destroy those
+     * three new full-screen buffers and allocate them a second time in the
+     * async rebuild, creating avoidable peak memory pressure during rapid
+     * theme switching. */
     gui_navigation_invalidate_theme_snapshots();
     gui_shell_refresh_home();
+    gui_library_refresh_music_screen();
+    gui_stream_media_refresh();
+    gui_network_refresh_wireless_screen();
     quick_drawer_mark_snapshot_dirty();
     player_transition_mark_dirty();
     lv_obj_invalidate(lv_screen_active());

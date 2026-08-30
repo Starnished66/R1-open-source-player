@@ -1468,7 +1468,7 @@ static int32_t check_int32_field(lua_State * L, lua_Integer value, const char * 
  * `tiles`: array of tables, one per tile being restyled -- { key, bg_color,
  * text_color, radius, height, width, align, accessory, text_size, icon }.
  * `key` is one of the native names ("music"/"stream_media"/"wireless"/
- * "books"/"system"/"dac"/"subsonic") or a plugin.register_home_tile() id -- unlike
+ * "books"/"settings"/"dac"/"subsonic") or a plugin.register_home_tile() id -- unlike
  * before API 7, an unrecognized-looking key is NOT rejected here: it may
  * name a plugin tile that hasn't registered yet (plugin_manager_init()
  * loads plugins in filename order, so a theme plugin can run before the
@@ -1695,6 +1695,79 @@ static int l_plugin_set_home_layout(lua_State * L) {
     }
 
     gui_plugin_set_home_layout(&config);
+    return 0;
+}
+
+static void parse_launcher_menu_layout(lua_State * L, int idx, const char * menu,
+                                       launcher_menu_layout_t * out) {
+    idx = lua_absindex(L, idx);
+    lua_getfield(L, idx, "mode");
+    const char * mode = luaL_optstring(L, -1, "tile");
+    if (strcmp(mode, "tile") != 0 && strcmp(mode, "list") != 0)
+        luaL_error(L, "plugin.set_launcher_layout: %s.mode must be \"tile\" or \"list\"", menu);
+    out->list_mode = strcmp(mode, "list") == 0;
+    lua_pop(L, 1);
+
+    lua_getfield(L, idx, "row_gap");
+    out->row_gap = check_int32_field(L, luaL_optinteger(L, -1, 0),
+                                     "plugin.set_launcher_layout", "row_gap");
+    lua_pop(L, 1);
+    lua_getfield(L, idx, "height");
+    out->height = check_int32_field(L, luaL_optinteger(L, -1, 0),
+                                    "plugin.set_launcher_layout", "height");
+    lua_pop(L, 1);
+    lua_getfield(L, idx, "width");
+    out->width = check_int32_field(L, luaL_optinteger(L, -1, 0),
+                                   "plugin.set_launcher_layout", "width");
+    lua_pop(L, 1);
+
+    get_opt_color_field(L, idx, "bg_color", &out->has_bg_color, &out->bg_color);
+    get_opt_color_field(L, idx, "text_color", &out->has_text_color, &out->text_color);
+    lua_getfield(L, idx, "radius");
+    if (!lua_isnil(L, -1)) {
+        lua_Integer radius = luaL_checkinteger(L, -1);
+        if (radius < 0) luaL_error(L, "plugin.set_launcher_layout: %s.radius cannot be negative", menu);
+        out->has_radius = true;
+        out->radius = check_int32_field(L, radius, "plugin.set_launcher_layout", "radius");
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, idx, "align");
+    const char * align = lua_tostring(L, -1);
+    if (align) {
+        if (strcmp(align, "left") != 0 && strcmp(align, "center") != 0 && strcmp(align, "right") != 0)
+            luaL_error(L, "plugin.set_launcher_layout: %s.align must be left, center, or right", menu);
+        snprintf(out->align, sizeof(out->align), "%s", align);
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, idx, "text_size");
+    const char * text_size = lua_tostring(L, -1);
+    if (text_size) {
+        if (!is_valid_text_size(text_size))
+            luaL_error(L, "plugin.set_launcher_layout: %s.text_size is invalid", menu);
+        snprintf(out->text_size, sizeof(out->text_size), "%s", text_size);
+    }
+    lua_pop(L, 1);
+    get_opt_bool_field(L, idx, "accessory", &out->has_accessory, &out->accessory);
+    get_opt_bool_field(L, idx, "icon", &out->has_icon, &out->icon);
+}
+
+static int l_plugin_set_launcher_layout(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    launcher_layout_config_t config;
+    memset(&config, 0, sizeof(config));
+    const char * names[] = { "music", "stream_media", "wireless" };
+    launcher_menu_layout_t * menus[] = { &config.music, &config.stream_media, &config.wireless };
+    for (int i = 0; i < 3; i++) {
+        lua_getfield(L, 1, names[i]);
+        if (!lua_isnil(L, -1)) {
+            if (!lua_istable(L, -1))
+                return luaL_error(L, "plugin.set_launcher_layout: %s must be a table", names[i]);
+            parse_launcher_menu_layout(L, -1, names[i], menus[i]);
+        }
+        lua_pop(L, 1);
+    }
+    gui_plugin_set_launcher_layout(&config);
     return 0;
 }
 
@@ -3023,7 +3096,7 @@ static const char * const plugin_capabilities[] = {
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
     "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
-    "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles"
+    "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles", "ui.launcher_layout"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -3226,6 +3299,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "set_background_color",      l_plugin_set_background_color },
     { "set_text_color",            l_plugin_set_text_color },
     { "set_home_layout",           l_plugin_set_home_layout },
+    { "set_launcher_layout",       l_plugin_set_launcher_layout },
     { "refresh_theme",             l_plugin_refresh_theme },
     { "reload_ui",                 l_plugin_reload_ui },
     { "eq_load_profile",           l_plugin_eq_load_profile },
@@ -3766,6 +3840,7 @@ static void deinit_diag(const char * step) {
 void plugin_manager_deinit(void) {
     deinit_diag("plugin_manager_deinit: reset_home_layout before");
     gui_plugin_reset_home_layout();
+    gui_plugin_reset_launcher_layout();
     deinit_diag("plugin_manager_deinit: cancel_all_async_http before");
     plugin_manager_cancel_all_async_http();
     deinit_diag("plugin_manager_deinit: cancel_all_async_http after");

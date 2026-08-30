@@ -4060,9 +4060,19 @@ static lv_obj_t * build_music_screen(void) {
      * genre.png/genre_s.png here since Genres no longer has a tile of its
      * own to need it. */
     items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
-    lv_obj_t * scr = build_icon_grid_screen("Music", generic_back_cb, items, 6, 100, false, 0);
+    lv_obj_t * scr = build_launcher_menu_screen("Music", generic_back_cb, items, 6, 100, false,
+                                                 &launcher_layout_config.music);
     finalize_screen_navigation(scr);
     return scr;
+}
+
+void gui_library_refresh_music_screen(void) {
+    lv_obj_t * old = music_screen;
+    lv_obj_t * fresh = build_music_screen();
+    if (!fresh) return;
+    music_screen = fresh;
+    gui_navigation_replace_static_screen(1, old, fresh);
+    if (old) lv_obj_del(old);
 }
 
 

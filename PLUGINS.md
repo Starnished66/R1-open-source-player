@@ -252,7 +252,7 @@ using an identity derived from their filename.
 - `plugin.api_version()` returns the current integer plugin API version (currently `4`).
 - `plugin.has_capability(name)` reports whether an optional interface exists.
   Supported capability tokens:
-  - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`
+  - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`, `ui.launcher_layout`
   - Playback & Audio: `playback.control`, `playback.state`, `playback.events`, `playback.remote`, `audio.peq`
   - Filesystem & Playlists: `filesystem.sd`, `filesystem.mkdir`, `filesystem.playlists`
   - Storage & Secrets: `storage.namespaced`, `storage.secrets`
@@ -398,7 +398,7 @@ it to actually appear.
   comma-separated `home_order=` line (`plugins_examples/Themes.lua`), so a
   comma or whitespace would parse incorrectly there. Must also not be one of
   the 7 native keys (`"music"`, `"stream_media"`, `"wireless"`, `"books"`,
-  `"system"`, `"dac"`, `"subsonic"`) -- those always resolve to the real native tile
+  `"settings"`, `"dac"`, `"subsonic"`) -- those always resolve to the real native tile
   first, so a plugin tile registered under one would silently never be
   reachable. Must be unique across every registered home tile, not just
   your own plugin's -- two plugins picking the same id is an immediate Lua
@@ -504,7 +504,7 @@ tile left out of `order` isn't shown, and a `plugin.register_home_tile()`
 id included in it is. The native `"subsonic"` key is opt-in and opens
 Subsonic directly; omitting `order` preserves the original six-tile Home.
 Before API 7, Home was always exactly its 6 native
-tiles (`"music"`, `"stream_media"`, `"wireless"`, `"books"`, `"system"`,
+tiles (`"music"`, `"stream_media"`, `"wireless"`, `"books"`, `"settings"`,
 `"dac"`), always in that fixed order, and this call could only restyle them
 -- omitting `order` entirely still gets you exactly that.
 
@@ -537,7 +537,7 @@ exclusive by design, same as two theme-color plugins both calling
 
 ```lua
 {
-    key = "music",         -- required: music/stream_media/wireless/books/system/dac/subsonic, or a plugin tile id
+    key = "music",         -- required: music/stream_media/wireless/books/settings/dac/subsonic, or a plugin tile id
     bg_color = 0xRRGGBB,   -- optional
     text_color = 0xRRGGBB, -- optional
     radius = 12,           -- optional, px
@@ -575,7 +575,7 @@ error, since there's no reasonable non-table `options`):
     mode = "list",  -- "tile" (default, today's icon grid) or "list"
     tile_gap = 6,   -- tile mode only, px between tiles, clamped to 0-64
     row_gap = 10,   -- list mode only, px between rows, clamped to 0-84 (0 = the native default of 6)
-    order = { "dac", "music", "stream_media", "wireless", "books", "system" },
+    order = { "dac", "music", "stream_media", "wireless", "books", "settings" },
                     -- optional (API 7+); which tiles Home shows, and in what
                     -- position -- position IS order. Each entry is a native
                     -- key or a plugin.register_home_tile() id (resolved the
@@ -610,6 +610,26 @@ files for a complete reference implementation spanning both tile and list
 mode -- e.g. `Terminal.theme`/`GameBoy.theme` (list mode) and
 `Retro.theme`/`Vaporwave.theme` (tile mode).
 
+### `plugin.set_launcher_layout(options)`
+
+API 8. Switches the native `music`, `stream_media`, and `wireless` launcher
+screens independently between their normal icon grid and pill-list rows.
+Each optional menu table accepts `mode = "tile"|"list"` plus `row_gap`,
+`height`, `width`, `bg_color`, `text_color`, `radius`, `align`, `accessory`,
+`text_size`, and `icon`. Omitted menus retain the native grid; an empty call
+resets all three. Like Home layout changes, call `plugin.refresh_theme()` to
+rebuild the affected screens without restarting plugins or live services.
+
+```lua
+plugin.set_launcher_layout({
+    music = { mode = "list", height = 108, width = 480, row_gap = 10,
+              bg_color = 0x000000, text_color = 0x33FF33,
+              align = "left", accessory = true, text_size = "mono", icon = true },
+    stream_media = { mode = "list", height = 108, width = 480 },
+    wireless = { mode = "list", height = 108, width = 480 },
+})
+```
+
 ### `plugin.refresh_theme()`
 
 Applies already-written theme assets and the current Home layout after the
@@ -618,7 +638,8 @@ Home, and refreshes navigation/player/quick-drawer render caches. All other
 screens, plugin Lua states, navigation state, playback, and Wi-Fi/Bluetooth/
 AirPlay/DLNA/Remote Control connections remain alive.
 
-Use this after a batch of `set_icon()`, color, and `set_home_layout()` calls.
+Use this after a batch of `set_icon()`, color, `set_home_layout()`, and
+`set_launcher_layout()` calls.
 Requests are deferred past active transitions and coalesced. The Themes
 example applies its full icon inventory during startup, ensuring existing
 screens already reference the override paths that this call refreshes.

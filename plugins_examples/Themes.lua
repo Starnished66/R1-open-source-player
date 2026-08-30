@@ -1,4 +1,4 @@
-plugin.define({ id = "example.themes", name = "Themes", version = "3.3", api_min = 7 })
+plugin.define({ id = "example.themes", name = "Themes", version = "3.4", api_min = 8 })
 
 -- Loader/switcher for theme DEFINITION FILES, not a hardcoded theme list --
 -- every *.theme file under SD/Themes/ becomes its own selectable entry,
@@ -154,6 +154,7 @@ local DEFAULT_THEME = {
     icon_overrides = {},
     home_tiles = {},
     home_options = {},
+    launcher_layout = {},
 }
 
 local function ensure_trailing_slash(path)
@@ -258,11 +259,15 @@ local COLOR_KEYS = { "screen", "card", "list_row", "text_primary", "text_muted" 
 --                                     -- position -- a native key left out
 --                                     -- entirely is not shown at all. Names
 --                                     -- either a native key (music/stream_
---                                     -- media/wireless/books/system/dac) or
+--                                     -- media/wireless/books/settings/dac) or
 --                                     -- a plugin.register_home_tile() id
 --                                     -- another plugin registered. Omit
 --                                     -- entirely to keep today's fixed
 --                                     -- native order and show all 6.
+--   submenu_mode=list               -- optional; applies the Music tile's
+--                                     -- row styling to Music, Stream Media,
+--                                     -- and Wireless launchers; omit to keep
+--                                     -- their native icon grids
 --
 --   tile.music.bg_color=0x1e3524     -- optional, one block per tile key --
 --   tile.music.text_color=0xd8c9a3   -- "tile key" is any native key above
@@ -400,6 +405,25 @@ local function load_theme_file(path)
         home_options.order = order
     end
 
+    local launcher_layout = {}
+    if fields.submenu_mode then
+        if fields.submenu_mode ~= "tile" and fields.submenu_mode ~= "list" then return nil end
+        local source
+        for _, row in ipairs(home_tiles) do
+            if row.key == "music" then source = row break end
+        end
+        local style = { mode = fields.submenu_mode, row_gap = home_options.row_gap }
+        if source then
+            for _, key in ipairs({ "bg_color", "text_color", "radius", "height", "width",
+                                   "align", "accessory", "text_size", "icon" }) do
+                style[key] = source[key]
+            end
+        end
+        launcher_layout.music = style
+        launcher_layout.stream_media = style
+        launcher_layout.wireless = style
+    end
+
     return {
         name = fields.name,
         colors = colors,
@@ -408,6 +432,7 @@ local function load_theme_file(path)
         icon_overrides = icon_overrides,
         home_tiles = home_tiles,
         home_options = home_options,
+        launcher_layout = launcher_layout,
     }
 end
 
@@ -477,6 +502,7 @@ local function apply_theme(def)
     pcall(plugin.set_text_color, "muted", c.text_muted)
 
     pcall(plugin.set_home_layout, def.home_tiles, def.home_options)
+    pcall(plugin.set_launcher_layout, def.launcher_layout)
 
     local root = resolve_icon_root(def.icon_root)
     if root then

@@ -1,4 +1,5 @@
 #include "gui.h"
+#include "app_clock.h"
 #include "gui_library.h"
 #include "gui_queue.h"
 #include "gui_player.h"
@@ -1560,7 +1561,8 @@ static lv_obj_t * build_stream_media_screen(void) {
         };
     }
 
-    lv_obj_t * scr = build_icon_grid_screen("Stream Media", generic_back_cb, items, count, 100, false, 0);
+    lv_obj_t * scr = build_launcher_menu_screen("Stream Media", generic_back_cb, items, count, 100, false,
+                                                 &launcher_layout_config.stream_media);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1580,11 +1582,22 @@ void gui_stream_media_rebuild(void) {
     stream_media_screen = build_stream_media_screen();
 }
 
+void gui_stream_media_refresh(void) {
+    lv_obj_t * old = stream_media_screen;
+    lv_obj_t * fresh = build_stream_media_screen();
+    if (!fresh) return;
+    stream_media_screen = fresh;
+    gui_navigation_replace_static_screen(2, old, fresh);
+    if (old) lv_obj_del(old);
+}
+
 void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("gui_init entered");
 #endif
     settings_load(&current_settings);
+    app_clock_init(current_settings.clock_automatic, current_settings.clock_manual_epoch,
+                   current_settings.clock_system_reference);
 #ifndef HOST_BUILD
     boot_checkpoint("settings_load done");
 #endif

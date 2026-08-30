@@ -1,7 +1,7 @@
 # Reference .theme file for plugins_examples/Themes.lua -- see White.theme's
 # own header comment for the file format.
 #
-# Green-on-black CRT, but roomier than Game Boy and with its icon + chevron
+# Green-on-black CRT with full-size touch targets and its icon + chevron
 # kept -- a "real app that happens to use a mono font" feel rather than a
 # boot menu.
 name=Terminal
@@ -14,12 +14,14 @@ icon_root=theme2
 
 home_mode=list
 home_row_gap=10
+home_order=music,stream_media,wireless,books,dac,settings
+submenu_mode=list
 
 tile.music.bg_color=0x000000
 tile.music.text_color=0x33FF33
 tile.music.radius=6
-tile.music.height=68
-tile.music.width=440
+tile.music.height=108
+tile.music.width=480
 tile.music.align=left
 tile.music.accessory=true
 tile.music.text_size=mono
@@ -28,8 +30,8 @@ tile.music.icon=true
 tile.stream_media.bg_color=0x000000
 tile.stream_media.text_color=0x33FF33
 tile.stream_media.radius=6
-tile.stream_media.height=68
-tile.stream_media.width=440
+tile.stream_media.height=108
+tile.stream_media.width=480
 tile.stream_media.align=left
 tile.stream_media.accessory=true
 tile.stream_media.text_size=mono
@@ -38,8 +40,8 @@ tile.stream_media.icon=true
 tile.wireless.bg_color=0x000000
 tile.wireless.text_color=0x33FF33
 tile.wireless.radius=6
-tile.wireless.height=68
-tile.wireless.width=440
+tile.wireless.height=108
+tile.wireless.width=480
 tile.wireless.align=left
 tile.wireless.accessory=true
 tile.wireless.text_size=mono
@@ -48,28 +50,28 @@ tile.wireless.icon=true
 tile.books.bg_color=0x000000
 tile.books.text_color=0x33FF33
 tile.books.radius=6
-tile.books.height=68
-tile.books.width=440
+tile.books.height=108
+tile.books.width=480
 tile.books.align=left
 tile.books.accessory=true
 tile.books.text_size=mono
 tile.books.icon=true
 
-tile.system.bg_color=0x000000
-tile.system.text_color=0x33FF33
-tile.system.radius=6
-tile.system.height=68
-tile.system.width=440
-tile.system.align=left
-tile.system.accessory=true
-tile.system.text_size=mono
-tile.system.icon=true
+tile.settings.bg_color=0x000000
+tile.settings.text_color=0x33FF33
+tile.settings.radius=6
+tile.settings.height=108
+tile.settings.width=480
+tile.settings.align=left
+tile.settings.accessory=true
+tile.settings.text_size=mono
+tile.settings.icon=true
 
 tile.dac.bg_color=0x000000
 tile.dac.text_color=0x33FF33
 tile.dac.radius=6
-tile.dac.height=68
-tile.dac.width=440
+tile.dac.height=108
+tile.dac.width=480
 tile.dac.align=left
 tile.dac.accessory=true
 tile.dac.text_size=mono

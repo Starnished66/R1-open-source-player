@@ -3,6 +3,7 @@
 
 #include "lvgl/lvgl.h"
 #include "fallback_font.h"
+#include "launcher_layout.h"
 #include <stdbool.h>
 
 /* Settings -> Font Size uses the stable fallback-capable app_font_* handles
@@ -267,6 +268,7 @@ typedef struct {
      * plugin.set_home_layout() only, list mode only (PLUGINS.md) -- no other
      * caller sets this. */
     const char * text_align;
+    lv_obj_t ** out_row;
 } pill_list_item_t;
 
 /* Row-height bounds for a plugin-resized pill row (register_list_item()'s
@@ -350,6 +352,11 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size);
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
                                    lv_style_t * toggle_accent_style, int32_t row_gap);
+
+lv_obj_t * build_launcher_menu_screen(const char * title, lv_event_cb_t back_btn_cb,
+                                      const icon_grid_item_t * items, int item_count,
+                                      int icon_scale_pct, bool label_inside_icon,
+                                      const launcher_menu_layout_t * layout);
 
 typedef struct {
     const char * label;

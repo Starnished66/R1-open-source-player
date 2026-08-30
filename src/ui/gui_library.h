@@ -28,6 +28,7 @@ void gui_library_init(void);
 /* Deletes every screen this module owns so gui_reload.c's in-process UI
  * reload can call gui_library_init() again from a clean slate. */
 void gui_library_teardown(void);
+void gui_library_refresh_music_screen(void);
 
 void start_library_rescan(void);
 void poll_library_rescan(void);

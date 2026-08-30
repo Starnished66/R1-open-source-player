@@ -1,6 +1,7 @@
 #include "gui.h"
 #include "gui_settings.h"
 #include "gui_text_input.h"
+#include "app_clock.h"
 #include <math.h>
 #include <sys/stat.h>
 #include "gui_subsonic.h"
@@ -47,6 +48,12 @@ static lv_obj_t * screen_timeout_screen;
 static lv_obj_t * startup_volume_screen;
 static lv_obj_t * sleep_timer_screen;
 static lv_obj_t * idle_shutdown_screen;
+static lv_obj_t * clock_screen;
+static lv_obj_t * clock_set_time_screen;
+static lv_obj_t * clock_hour_roller;
+static lv_obj_t * clock_minute_roller;
+static lv_obj_t * clock_ampm_roller;
+static lv_obj_t * clock_set_time_row;
 static lv_obj_t * eq_screen;
 static lv_obj_t * eq_profiles_screen;
 
@@ -1597,10 +1604,151 @@ static void plugin_system_list_item_click_cb(lv_event_t * e) {
  * system_screen()'s own row list below. */
 static void hostname_row_cb(lv_event_t * e);
 
+static void clock_persist(void) {
+    app_clock_get_persistence(&current_settings.clock_manual_epoch,
+                              &current_settings.clock_system_reference);
+    settings_save(&current_settings);
+}
+
+static void clock_update_set_time_enabled(void) {
+    if (!clock_set_time_row) return;
+    if (current_settings.clock_automatic) {
+        lv_obj_clear_flag(clock_set_time_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_opa(clock_set_time_row, LV_OPA_40, 0);
+    } else {
+        lv_obj_add_flag(clock_set_time_row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_opa(clock_set_time_row, LV_OPA_COVER, 0);
+    }
+}
+
+static void clock_automatic_changed_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    bool automatic = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    app_clock_set_automatic(automatic);
+    current_settings.clock_automatic = automatic;
+    clock_update_set_time_enabled();
+    clock_persist();
+    refresh_clock_label();
+}
+
+static void clock_set_time_save_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int hour = (int) lv_roller_get_selected(clock_hour_roller);
+    int minute = (int) lv_roller_get_selected(clock_minute_roller);
+    if (!current_settings.clock_24h) {
+        hour = (hour + 1) % 12;
+        if (lv_roller_get_selected(clock_ampm_roller) == 1) hour += 12;
+    }
+    app_clock_set_local_time(hour, minute);
+    current_settings.clock_automatic = false;
+    clock_persist();
+    refresh_clock_label();
+    nav_pop();
+}
+
+static void clock_set_time_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (current_settings.clock_automatic) {
+        show_info_toast("Turn off Automatic to set the clock");
+        return;
+    }
+    struct tm local;
+    app_clock_localtime(&local);
+    if (current_settings.clock_24h) {
+        lv_roller_set_options(clock_hour_roller,
+            "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23",
+            LV_ROLLER_MODE_NORMAL);
+        lv_roller_set_selected(clock_hour_roller, (uint32_t) local.tm_hour, LV_ANIM_OFF);
+        lv_obj_add_flag(clock_ampm_roller, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_roller_set_options(clock_hour_roller, "01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12",
+                              LV_ROLLER_MODE_NORMAL);
+        lv_roller_set_selected(clock_hour_roller, (uint32_t) ((local.tm_hour + 11) % 12), LV_ANIM_OFF);
+        lv_roller_set_selected(clock_ampm_roller, local.tm_hour >= 12 ? 1 : 0, LV_ANIM_OFF);
+        lv_obj_remove_flag(clock_ampm_roller, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_roller_set_selected(clock_minute_roller, (uint32_t) local.tm_min, LV_ANIM_OFF);
+    nav_push(clock_set_time_screen);
+}
+
+static void clock_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(clock_screen);
+}
+
+static lv_obj_t * build_clock_screen(void) {
+    pill_list_item_t items[] = {
+        { "Automatic", PILL_ACCESSORY_TOGGLE, current_settings.clock_automatic,
+          NULL, clock_automatic_changed_cb, NULL },
+        { .label = "Set Time", .accessory = PILL_ACCESSORY_CHEVRON,
+          .on_click = clock_set_time_row_cb, .out_row = &clock_set_time_row },
+        { "24-Hour Clock", PILL_ACCESSORY_TOGGLE, current_settings.clock_24h,
+          NULL, clock_24h_switch_event_cb, NULL },
+    };
+    lv_obj_t * scr = build_pill_list_screen("Clock", generic_back_cb, items, 3,
+                                            gui_theme_accent_style(), 6);
+    clock_update_set_time_enabled();
+    return scr;
+}
+
+static lv_obj_t * build_clock_set_time_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
+    lv_obj_t * back = lv_button_create(scr);
+    lv_obj_set_size(back, 64, 64);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(back, 0, 0);
+    lv_obj_set_style_border_width(back, 0, 0);
+    lv_obj_add_event_cb(back, generic_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * arrow = lv_image_create(back);
+    lv_image_set_src(arrow, asset_path("sub_back/btn_back.png"));
+    lv_obj_center(arrow);
+    lv_obj_t * title = lv_label_create(scr);
+    lv_label_set_text(title, "Set Time");
+    lv_obj_add_style(title, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+
+    lv_obj_t * row = lv_obj_create(scr);
+    lv_obj_set_size(row, lv_pct(92), 360);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 18);
+    lv_obj_add_style(row, &style_theme_card_bg, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    clock_hour_roller = lv_roller_create(row);
+    clock_minute_roller = lv_roller_create(row);
+    clock_ampm_roller = lv_roller_create(row);
+    lv_roller_set_options(clock_minute_roller,
+        "00\n01\n02\n03\n04\n05\n06\n07\n08\n09\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59",
+        LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_options(clock_ampm_roller, "AM\nPM", LV_ROLLER_MODE_NORMAL);
+    lv_obj_t * rollers[] = { clock_hour_roller, clock_minute_roller, clock_ampm_roller };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_set_size(rollers[i], i == 2 ? 105 : 120, 300);
+        lv_obj_set_style_text_font(rollers[i], gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+        lv_obj_add_style(rollers[i], gui_theme_accent_style(), LV_PART_SELECTED);
+    }
+
+    lv_obj_t * save = lv_button_create(scr);
+    lv_obj_set_size(save, 220, 78);
+    lv_obj_align_to(save, row, LV_ALIGN_OUT_BOTTOM_MID, 0, 28);
+    lv_obj_add_style(save, gui_theme_accent_style(), 0);
+    lv_obj_add_event_cb(save, clock_set_time_save_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * save_label = lv_label_create(save);
+    lv_label_set_text(save_label, "Save");
+    lv_obj_add_style(save_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(save_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_center(save_label);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
 static lv_obj_t * build_settings_system_screen(void) {
     static pill_list_item_t items[6 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "24-Hour Clock", PILL_ACCESSORY_TOGGLE,
-                                    current_settings.clock_24h, NULL, clock_24h_switch_event_cb, NULL };
+    items[0] = (pill_list_item_t){ "Clock", PILL_ACCESSORY_CHEVRON, false,
+                                    clock_settings_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Time Zone", PILL_ACCESSORY_CHEVRON, false, timezone_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Hostname", PILL_ACCESSORY_CHEVRON, false, hostname_row_cb, NULL, NULL };
@@ -1711,7 +1859,7 @@ static void wireless_tile_cb(lv_event_t * e) {
 
 
 
-static void system_tile_cb(lv_event_t * e) {
+static void settings_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_push(settings_screen);
 }
@@ -1774,7 +1922,7 @@ static void dac_home_tile_cb(lv_event_t * e) {
  * validates a Lua `key` string against this same array rather than keeping
  * its own copy that could drift out of sync. */
 const char * const home_layout_tile_keys[HOME_LAYOUT_TILE_COUNT] = {
-    "music", "stream_media", "wireless", "books", "system", "dac", "subsonic",
+    "music", "stream_media", "wireless", "books", "settings", "dac", "subsonic",
 };
 
 /* Native per-tile metadata, same fixed order as home_layout_tile_keys[]
@@ -1793,7 +1941,7 @@ static const home_native_tile_t home_native_tiles[HOME_LAYOUT_TILE_COUNT] = {
     { "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb },
     { "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb },
     { "launcher/book.png", "launcher/book_s.png", "Books", gui_books_home_tile_cb },
-    { "launcher/sys_set.png", "launcher/sys_set_s.png", "System", system_tile_cb },
+    { "launcher/sys_set.png", "launcher/sys_set_s.png", "Settings", settings_tile_cb },
     { "launcher/dac.png", "launcher/dac_s.png", "DAC", dac_home_tile_cb },
     { "stream_media/subsonic.png", "stream_media/subsonic_s.png", "Subsonic", subsonic_tile_cb },
 };
@@ -2625,6 +2773,8 @@ void gui_settings_init(void) {
     sleep_timer_screen = build_sleep_timer_screen();
     idle_shutdown_screen = build_idle_shutdown_screen();
     timezone_region_screen = build_timezone_region_screen();
+    clock_set_time_screen = build_clock_set_time_screen();
+    clock_screen = build_clock_screen();
     settings_playback_screen = build_settings_playback_screen();
     settings_display_screen = build_settings_display_screen();
     settings_power_screen = build_settings_power_screen();
@@ -2664,6 +2814,10 @@ void gui_settings_teardown(void) {
     if (sleep_timer_screen) { lv_obj_del(sleep_timer_screen); sleep_timer_screen = NULL; }
     if (idle_shutdown_screen) { lv_obj_del(idle_shutdown_screen); idle_shutdown_screen = NULL; }
     if (timezone_region_screen) { lv_obj_del(timezone_region_screen); timezone_region_screen = NULL; }
+    if (clock_screen) { lv_obj_del(clock_screen); clock_screen = NULL; }
+    if (clock_set_time_screen) { lv_obj_del(clock_set_time_screen); clock_set_time_screen = NULL; }
+    clock_hour_roller = clock_minute_roller = clock_ampm_roller = NULL;
+    clock_set_time_row = NULL;
     /* Lazily built by open_timezone_city_screen() -- NULL until the user has
      * opened at least one region, same guard shape as every screen above. */
     if (timezone_city_screen) { lv_obj_del(timezone_city_screen); timezone_city_screen = NULL; }

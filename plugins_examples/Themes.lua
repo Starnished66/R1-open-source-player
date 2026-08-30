@@ -1,4 +1,4 @@
-plugin.define({ id = "example.themes", name = "Themes", version = "3.5", api_min = 9 })
+plugin.define({ id = "example.themes", name = "Themes", version = "3.6", api_min = 9 })
 
 -- Loader/switcher for theme DEFINITION FILES, not a hardcoded theme list --
 -- every *.theme file under SD/Themes/ becomes its own selectable entry,
@@ -572,5 +572,5 @@ plugin.register_list_item("display", "Theme", function()
         apply_theme(new_def)
         plugin.show_toast("Theme applied", 1000)
         plugin.refresh_theme()
-    end, { selected = selected_index })
+    end, { selected = selected_index, height = 100 })
 end)

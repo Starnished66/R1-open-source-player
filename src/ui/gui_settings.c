@@ -1723,7 +1723,10 @@ static lv_obj_t * build_clock_screen(void) {
 static lv_obj_t * build_clock_set_time_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
-    lv_obj_t * back = lv_button_create(scr);
+    /* A plain object keeps the 64px touch target without lv_button's
+     * built-in shadow/outline, which remained visible as a rounded box
+     * around the otherwise transparent back arrow. */
+    lv_obj_t * back = lv_obj_create(scr);
     lv_obj_set_size(back, 64, 64);
     lv_obj_align(back, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
     lv_obj_set_style_bg_opa(back, 0, 0);

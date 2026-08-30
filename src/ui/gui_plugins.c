@@ -58,6 +58,22 @@ static lv_obj_t * plugin_list_screens[PLUGIN_LIST_SCREEN_POOL_SIZE];
 static lv_obj_t * plugin_list_title_labels[PLUGIN_LIST_SCREEN_POOL_SIZE];
 static lv_obj_t * plugin_list_lists[PLUGIN_LIST_SCREEN_POOL_SIZE];
 static int plugin_list_pool_next = 0;
+static int plugin_list_selected_indices[PLUGIN_LIST_SCREEN_POOL_SIZE];
+
+static void plugin_list_apply_selection(int slot, int selected_index) {
+    lv_obj_t * list = plugin_list_lists[slot];
+    uint32_t count = lv_obj_get_child_count(list);
+    for (uint32_t i = 0; i < count; i++) {
+        lv_obj_t * row = lv_obj_get_child(list, (int32_t) i);
+        bool selected = (int) i == selected_index;
+        lv_obj_set_style_outline_width(row, selected ? 3 : 0, 0);
+        if (selected) {
+            lv_obj_set_style_outline_color(row, accent_lv_color(), 0);
+            lv_obj_set_style_outline_pad(row, -3, 0);
+        }
+    }
+    plugin_list_selected_indices[slot] = selected_index;
+}
 
 static void plugin_list_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -65,6 +81,8 @@ static void plugin_list_row_click_cb(lv_event_t * e) {
     int slot = (int) (packed >> 16);
     int index = (int) (packed & 0xFFFF);
     plugin_manager_list_item_selected(slot, index);
+    if (plugin_list_selected_indices[slot] >= 0)
+        plugin_list_apply_selection(slot, index);
 }
 
 /* A fixed single-line box is what makes LVGL's circular long mode a marquee
@@ -84,7 +102,8 @@ void configure_scrolling_row_label(lv_obj_t * label, int32_t width) {
 }
 
 int gui_plugin_show_list(const char * title, const char * const * labels, const char * const * icon_paths,
-                          const char * const * text_sizes, int32_t height, int32_t width, int count) {
+                          const char * const * text_sizes, int32_t height, int32_t width,
+                          int selected_index, int count) {
     int slot = plugin_list_pool_next;
     plugin_list_pool_next = (plugin_list_pool_next + 1) % PLUGIN_LIST_SCREEN_POOL_SIZE;
 
@@ -172,6 +191,7 @@ int gui_plugin_show_list(const char * title, const char * const * labels, const 
         lv_obj_add_event_cb(row, plugin_list_row_click_cb, LV_EVENT_CLICKED, (void *) packed);
     }
 
+    plugin_list_apply_selection(slot, selected_index);
     nav_push(plugin_list_screens[slot]);
     return slot;
 }
@@ -242,8 +262,8 @@ void gui_plugin_play_remote_tracks(const remote_track_meta_t * tracks, int count
     on_file_selected(new_playlist, count, start_index);
 }
 
-void gui_plugin_show_toast(const char * msg) {
-    show_info_toast(msg);
+void gui_plugin_show_toast(const char * msg, uint32_t duration_ms) {
+    show_info_toast_for(msg, duration_ms);
 }
 
 void gui_plugin_set_background_color(const char * slot, uint32_t rgb) {

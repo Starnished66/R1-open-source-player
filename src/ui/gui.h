@@ -64,7 +64,8 @@ void gui_reset_interactive_timeout_baseline(void);
  * (0 = default 84px) applies to every row in this call, not per-row. Returns
  * the selected screen-pool slot so callbacks can be stored per slot. */
 int gui_plugin_show_list(const char * title, const char * const * labels, const char * const * icon_paths,
-                          const char * const * text_sizes, int32_t height, int32_t width, int count);
+                          const char * const * text_sizes, int32_t height, int32_t width,
+                          int selected_index, int count);
 
 /* Repopulates and pushes a shared plugin-settings-list screen -- a SEPARATE
  * pool from gui_plugin_show_list()'s own (PLUGIN_SETTINGS_LIST_SCREEN_POOL_
@@ -100,7 +101,7 @@ void gui_plugin_play_remote_tracks(const remote_track_meta_t * tracks, int count
 
 /* Shows the same transient toast used elsewhere in the app (e.g. "Added to
  * queue"). */
-void gui_plugin_show_toast(const char * msg);
+void gui_plugin_show_toast(const char * msg, uint32_t duration_ms);
 
 /* Sets one of the three shared background-color styles (screen_builders.h's
  * style_theme_screen_bg/style_theme_card_bg, or list_row_style itself for

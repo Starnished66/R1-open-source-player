@@ -141,6 +141,15 @@ bool audio_is_paused(void);
 /* Seek to an absolute position in the current track. No-op if nothing is loaded */
 void audio_seek(double seconds);
 
+/* Seek to a 0-100 percent position in the current track. The request is
+ * tied to the current playback generation and conversion to a frame is
+ * deferred until that generation's decoder has published total_frames,
+ * closing the track-start race described in audio_seek_percent() in audio.c.
+ * Prefer this over audio_seek() for any UI control whose target is
+ * naturally a percentage of the track (e.g. a progress slider) rather than
+ * an absolute time offset the caller computed itself. */
+void audio_seek_percent(double percent);
+
 double audio_get_position_seconds(void);
 double audio_get_duration_seconds(void);
 

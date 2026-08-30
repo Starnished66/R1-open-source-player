@@ -1,4 +1,4 @@
-plugin.define({ id = "example.themes", name = "Themes", version = "3.4", api_min = 8 })
+plugin.define({ id = "example.themes", name = "Themes", version = "3.5", api_min = 9 })
 
 -- Loader/switcher for theme DEFINITION FILES, not a hardcoded theme list --
 -- every *.theme file under SD/Themes/ becomes its own selectable entry,
@@ -557,6 +557,11 @@ plugin.register_list_item("display", "Theme", function()
         table.insert(labels, t.def.name)
     end
 
+    local selected_index = 1
+    for i, t in ipairs(themes) do
+        if t.filename == selected_filename then selected_index = i + 1 break end
+    end
+
     plugin.show_list("Theme", labels, function(index)
         local new_filename = (index == 1) and "" or themes[index - 1].filename
         if new_filename == selected_filename then return end
@@ -565,7 +570,7 @@ plugin.register_list_item("display", "Theme", function()
         selected_filename = new_filename
         write_state(new_filename)
         apply_theme(new_def)
-        plugin.show_toast("Theme applied")
+        plugin.show_toast("Theme applied", 1000)
         plugin.refresh_theme()
-    end)
+    end, { selected = selected_index })
 end)

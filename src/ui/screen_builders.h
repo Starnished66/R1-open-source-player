@@ -489,6 +489,10 @@ typedef void (*compact_list_row_decorator_cb_t)(lv_obj_t * list, lv_obj_t * row,
                                                 lv_obj_t * leading_image, int logical_index,
                                                 int pool_slot, int64_t identity, void * ctx);
 void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx);
+/* Makes each visible trailing_asset a separate tappable accessory. The
+ * callback receives the row's current logical index, including after the
+ * virtual row has been recycled during scrolling. NULL disables it. */
+void compact_list_set_trailing_click(lv_obj_t * list, compact_list_click_cb_t cb);
 void compact_list_refresh_visible(lv_obj_t * list);
 void compact_list_refresh_all(void);
 

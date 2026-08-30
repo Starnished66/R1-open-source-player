@@ -6,6 +6,23 @@ and because skipping step 1's "kill both together" detail caused a whole
 session (2026-08-07) of the device auto-rebooting on every single test
 launch, initially misread as a crash in the app under test.
 
+## Remaining real-device regression tests
+
+- [ ] **Repeated progress-slider seeks across long tracks:** use at least
+  three local, seekable songs longer than 30 minutes, preferably including
+  a format that takes noticeable time to open or build its seek index. Play
+  track 1 and tap the progress slider near the middle; immediately advance
+  to track 2 and repeat; immediately advance to track 3 and repeat. Confirm
+  every seek lands in the selected track at approximately the requested
+  percentage, including the third seek, and that playback never continues
+  unchanged from the pre-seek position. Repeat the full sequence several
+  times and include taps made immediately after each track change, while
+  its decoder may still be opening. Also confirm the slider may temporarily
+  resume normal polling after its UI wait timeout without canceling a slow
+  underlying seek. Test more than one codec when suitable long files are
+  available. This validates the playback-generation-bound percentage seek
+  introduced for the reported failure on 30+ minute tracks.
+
 ## 1. Kill the stock player first, always -- BOTH processes, together
 
 The stock firmware auto-launches its own player at boot via a wrapper script

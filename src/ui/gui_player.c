@@ -834,6 +834,12 @@ void arm_next_track_for_audio(int index);
 void cycle_play_mode(void) {
     play_mode_t mode = (play_mode_t) current_settings.play_mode;
     mode = (play_mode_t) ((mode + 1) % 4);
+    gui_player_set_play_mode(mode);
+}
+
+void gui_player_set_play_mode(int mode_value) {
+    play_mode_t mode = (play_mode_t) mode_value;
+    if (mode < PLAY_MODE_SEQUENTIAL || mode > PLAY_MODE_SHUFFLE) return;
     current_settings.play_mode = (int) mode;
     settings_save(&current_settings);
 
@@ -1590,6 +1596,17 @@ static void library_btn_event_cb(lv_event_t * e) {
 }
 
 static lv_timer_t * pending_progress_seek_timer = NULL;
+/* The actual seek target -- audio.c binds this percentage to the current
+ * playback generation and converts it only after that generation's decoder
+ * publishes total_frames, so a slow track start cannot reuse the previous
+ * track's duration. */
+static double pending_progress_seek_percent = 0.0;
+/* Best-effort ESTIMATE of where that percent lands, in seconds -- used only
+ * by the "has the seek landed yet" poll heuristic below, never passed to
+ * audio_seek()/audio_seek_percent() itself. Fine if this is occasionally
+ * stale (same track-switch race as above): the only consequence is the
+ * progress UI falling back to its normal 8-tick timeout instead of
+ * detecting the landed position early, not an incorrect seek. */
 static double pending_progress_seek_seconds = 0.0;
 bool user_seeking = false;
 /* True from finger-up until audio position catches the requested seek, so
@@ -1608,7 +1625,7 @@ static void cancel_pending_progress_seek(void) {
 static void pending_progress_seek_timer_cb(lv_timer_t * timer) {
     (void) timer;
     pending_progress_seek_timer = NULL;
-    audio_seek(pending_progress_seek_seconds);
+    audio_seek_percent(pending_progress_seek_percent);
 }
 
 static void progress_slider_event_cb(lv_event_t * e) {
@@ -1620,6 +1637,7 @@ static void progress_slider_event_cb(lv_event_t * e) {
     } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
         double duration = audio_get_duration_seconds();
         int32_t percent = lv_slider_get_value(slider);
+        pending_progress_seek_percent = (double) percent;
         pending_progress_seek_seconds = duration * ((double) percent / 100.0);
         displayed_progress_percent = percent;
         progress_awaiting_seek = (duration > 0.0);
@@ -2669,6 +2687,67 @@ void queue_add_song(const char * path) {
     remote_control_sync_queue((const char * const *) &playlist[playlist_index + 1], queued_pending_count);
 
     show_info_toast("Added to queue");
+}
+
+void gui_player_queue_add_many(const char * const * paths, int count) {
+    if (count <= 0) return;
+    if (playlist_index < 0 || !playlist) {
+        show_error_toast("Nothing is playing");
+        return;
+    }
+    if (count > INT_MAX - playlist_count || count > INT_MAX - queued_pending_count) return;
+
+    char ** copies = calloc((size_t) count, sizeof(*copies));
+    if (!copies) return;
+    for (int i = 0; i < count; i++) {
+        copies[i] = paths[i] ? strdup(paths[i]) : NULL;
+        if (!copies[i]) {
+            for (int j = 0; j < count; j++) free(copies[j]);
+            free(copies);
+            return;
+        }
+    }
+
+    int pos = (queue_next_insert_index >= 0 && queue_next_insert_index <= playlist_count)
+        ? queue_next_insert_index : playlist_index + 1;
+    char ** grown = realloc(playlist, sizeof(*playlist) * (size_t) (playlist_count + count));
+    if (!grown) {
+        for (int i = 0; i < count; i++) free(copies[i]);
+        free(copies);
+        return;
+    }
+    playlist = grown;
+    int * grown_order = playlist_lazy_sort_order
+        ? realloc(playlist_lazy_sort_order, sizeof(*playlist_lazy_sort_order) * (size_t) (playlist_count + count))
+        : NULL;
+    if (playlist_lazy_sort_order && !grown_order) {
+        for (int i = 0; i < count; i++) free(copies[i]);
+        free(copies);
+        return;
+    }
+    if (grown_order) playlist_lazy_sort_order = grown_order;
+
+    memmove(&playlist[pos + count], &playlist[pos],
+            sizeof(*playlist) * (size_t) (playlist_count - pos));
+    if (playlist_lazy_sort_order) {
+        memmove(&playlist_lazy_sort_order[pos + count], &playlist_lazy_sort_order[pos],
+                sizeof(*playlist_lazy_sort_order) * (size_t) (playlist_count - pos));
+    }
+    for (int i = 0; i < count; i++) {
+        playlist[pos + i] = copies[i];
+        if (playlist_lazy_sort_order) playlist_lazy_sort_order[pos + i] = -1;
+    }
+    free(copies);
+    playlist_count += count;
+    queued_pending_count += count;
+    queue_next_insert_index = pos + count;
+    lv_label_set_text_fmt(song_count_label, "%d/%d", playlist_index + 1, playlist_count);
+    arm_next_track_for_audio(playlist_index);
+    remote_control_sync_queue((const char * const *) &playlist[playlist_index + 1], queued_pending_count);
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Added %d songs to queue", count);
+    show_info_toast(msg);
 }
 
 void queue_remove_song_at_offset(int offset) {

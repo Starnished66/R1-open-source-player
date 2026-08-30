@@ -29,6 +29,7 @@ void hide_more_menu_popup(void);
 
 void configure_native_slider_rail(lv_obj_t * slider);
 void cycle_play_mode(void);
+void gui_player_set_play_mode(int mode);
 void resolve_replaygain(const track_metadata_t * meta, bool * out_has_gain, double * out_gain_db, bool * out_has_peak, double * out_peak);
 
 void favorite_icon_event_cb(lv_event_t * e);
@@ -41,6 +42,7 @@ const char * gui_player_get_track_path_at(int index);
 int gui_player_get_queued_count(void);
 const char * gui_player_get_queued_path_at(int offset);
 void gui_player_queue_add(const char * path);
+void gui_player_queue_add_many(const char * const * paths, int count);
 void gui_player_queue_remove_at(int offset);
 void gui_player_queue_clear(void);
 void gui_player_play_at(int index);

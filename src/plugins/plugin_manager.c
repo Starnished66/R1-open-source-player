@@ -271,7 +271,8 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *     icon = "...", text_size = "..." } for a row with its own icon/text
  *     size (same `icon`/`text_size` meaning as register_list_item()'s
  *     `options` above). on_select(index): called with the 1-based Lua index
- *     of the tapped row. Optional 4th arg `options`: { height = n } --
+ *     of the tapped row. Optional 4th arg `options`: { height = n,
+ *     selected = n } --
  *     applies to every row in this call (not per-row).
  *
  *   plugin.show_settings_list(title, items)
@@ -321,8 +322,9 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *     Plays `paths` (an array table of file paths) as a fresh playlist,
  *     starting at the 1-based `start_index` (default 1).
  *
- *   plugin.show_toast(message)
- *     Shows the same transient toast used elsewhere in the app.
+ *   plugin.show_toast(message [, duration_ms])
+ *     Shows the same transient toast used elsewhere in the app; duration
+ *     defaults to 5000ms and is clamped by validation to 100..30000ms.
  *
  *   plugin.register_stream_media_tile(label, on_open [, icon])
  *     Appended as a real icon-grid tile in gui.c's Stream Media screen
@@ -809,6 +811,7 @@ static int l_plugin_show_list(lua_State * L) {
 
     int32_t height = 0;
     int32_t width = 0;
+    int selected_index = -1;
     if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
         lua_getfield(L, 4, "height");
         height = (int32_t) luaL_optinteger(L, -1, 0);
@@ -816,11 +819,20 @@ static int l_plugin_show_list(lua_State * L) {
         lua_getfield(L, 4, "width");
         width = (int32_t) luaL_optinteger(L, -1, 0);
         lua_pop(L, 1);
+        lua_getfield(L, 4, "selected");
+        if (!lua_isnil(L, -1)) {
+            lua_Integer selected = luaL_checkinteger(L, -1);
+            if (selected < 1 || selected > n)
+                return luaL_error(L, "plugin.show_list: selected index %lld is outside 1..%d",
+                                  (long long) selected, n);
+            selected_index = (int) selected - 1;
+        }
+        lua_pop(L, 1);
     }
 
     lua_pushvalue(L, 3);
     int new_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    int slot = gui_plugin_show_list(title, labels, icon_paths, text_sizes, height, width, n);
+    int slot = gui_plugin_show_list(title, labels, icon_paths, text_sizes, height, width, selected_index, n);
     plugin_list_callback_t * cb = &plugin_list_callbacks[slot];
     if (cb->L && cb->select_ref != LUA_NOREF) luaL_unref(cb->L, LUA_REGISTRYINDEX, cb->select_ref);
     cb->L = L;
@@ -1258,7 +1270,10 @@ static int l_plugin_queue_remote_list(lua_State * L) {
 
 static int l_plugin_show_toast(lua_State * L) {
     const char * msg = luaL_checkstring(L, 1);
-    gui_plugin_show_toast(msg);
+    lua_Integer duration_ms = luaL_optinteger(L, 2, 5000);
+    if (duration_ms < 100 || duration_ms > 30000)
+        return luaL_error(L, "plugin.show_toast: duration_ms must be between 100 and 30000");
+    gui_plugin_show_toast(msg, (uint32_t) duration_ms);
     return 0;
 }
 

@@ -95,10 +95,17 @@ static void build_info_toast(void) {
 }
 
 void show_info_toast(const char * msg) {
+    show_info_toast_for(msg, 5000);
+}
+
+void show_info_toast_for(const char * msg, uint32_t duration_ms) {
     if (!info_toast_label) return;
+    if (duration_ms < 100) duration_ms = 100;
+    if (duration_ms > 30000) duration_ms = 30000;
     lv_label_set_text(info_toast_label, msg);
     lv_obj_remove_flag(info_toast, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(info_toast);
+    lv_timer_set_period(info_toast_hide_timer, duration_ms);
     lv_timer_reset(info_toast_hide_timer);
     lv_timer_resume(info_toast_hide_timer);
 }

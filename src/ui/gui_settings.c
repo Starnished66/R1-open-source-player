@@ -54,6 +54,8 @@ static lv_obj_t * clock_hour_roller;
 static lv_obj_t * clock_minute_roller;
 static lv_obj_t * clock_ampm_roller;
 static lv_obj_t * clock_set_time_row;
+static lv_obj_t * clock_timezone_row;
+static lv_obj_t * clock_timezone_value_label;
 static lv_obj_t * eq_screen;
 static lv_obj_t * eq_profiles_screen;
 
@@ -1357,6 +1359,19 @@ static lv_obj_t * timezone_city_screen;
 static int timezone_city_indices[TIMEZONE_TABLE_COUNT];
 static int timezone_city_count;
 
+static void clock_timezone_indicator_update(void) {
+    if (!clock_timezone_value_label) return;
+    const char * zone = current_settings.timezone[0]
+        ? current_settings.timezone : "Not selected (UTC)";
+    for (int i = 0; current_settings.timezone[0] && i < TIMEZONE_TABLE_COUNT; i++) {
+        if (strcmp(current_settings.timezone, TIMEZONE_TABLE[i].iana_id) == 0) {
+            zone = TIMEZONE_TABLE[i].display_name;
+            break;
+        }
+    }
+    lv_label_set_text(clock_timezone_value_label, zone);
+}
+
 static void timezone_city_row_click_cb(int row_index) {
     if (row_index < 0 || row_index >= timezone_city_count) return;
     const timezone_entry_t * entry = &TIMEZONE_TABLE[timezone_city_indices[row_index]];
@@ -1364,8 +1379,9 @@ static void timezone_city_row_click_cb(int row_index) {
     snprintf(current_settings.timezone, sizeof(current_settings.timezone), "%s", entry->iana_id);
     settings_save(&current_settings);
     refresh_clock_label(); /* topbar clock reflects the new zone immediately, not just on the next periodic refresh */
+    clock_timezone_indicator_update();
     nav_pop(); /* City -> Region */
-    nav_pop(); /* Region -> Settings -- picking a leaf city is a completed action, not a place to linger browsing further */
+    nav_pop(); /* Region -> Clock -- picking a leaf city completes the choice */
 }
 
 /* Rebuilt (delete + rebuild, same idiom as gui_library_get_all_songs_screen() after a library
@@ -1684,9 +1700,22 @@ static lv_obj_t * build_clock_screen(void) {
           .on_click = clock_set_time_row_cb, .out_row = &clock_set_time_row },
         { "24-Hour Clock", PILL_ACCESSORY_TOGGLE, current_settings.clock_24h,
           NULL, clock_24h_switch_event_cb, NULL },
+        { .label = "Time Zone", .accessory = PILL_ACCESSORY_CHEVRON,
+          .on_click = timezone_settings_row_cb, .out_row = &clock_timezone_row },
     };
-    lv_obj_t * scr = build_pill_list_screen("Clock", generic_back_cb, items, 3,
+    lv_obj_t * scr = build_pill_list_screen("Clock", generic_back_cb, items, 4,
                                             gui_theme_accent_style(), 6);
+    if (clock_timezone_row) {
+        lv_obj_t * title = lv_obj_get_child(clock_timezone_row, 0);
+        if (title) lv_obj_align(title, LV_ALIGN_LEFT_MID, 24, -18);
+        clock_timezone_value_label = lv_label_create(clock_timezone_row);
+        lv_obj_add_style(clock_timezone_value_label, &style_theme_text_muted, 0);
+        lv_obj_set_style_text_font(clock_timezone_value_label,
+                                   gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+        configure_scrolling_row_label(clock_timezone_value_label, 370);
+        lv_obj_align(clock_timezone_value_label, LV_ALIGN_LEFT_MID, 24, 23);
+        clock_timezone_indicator_update();
+    }
     clock_update_set_time_enabled();
     return scr;
 }
@@ -1699,6 +1728,8 @@ static lv_obj_t * build_clock_set_time_screen(void) {
     lv_obj_align(back, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
     lv_obj_set_style_bg_opa(back, 0, 0);
     lv_obj_set_style_border_width(back, 0, 0);
+    lv_obj_remove_flag(back, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(back, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * arrow = lv_image_create(back);
     lv_image_set_src(arrow, asset_path("sub_back/btn_back.png"));
@@ -1729,6 +1760,13 @@ static lv_obj_t * build_clock_set_time_screen(void) {
         lv_obj_set_size(rollers[i], i == 2 ? 105 : 120, 300);
         lv_obj_set_style_text_font(rollers[i], gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
         lv_obj_add_style(rollers[i], gui_theme_accent_style(), LV_PART_SELECTED);
+        /* style_accent deliberately sets both background and text to the
+         * accent color (needed by several non-roller users), which makes a
+         * roller's selected value disappear into its selection band. Keep
+         * the accent background but explicitly restore themed primary text
+         * for the selected part; adding this after the accent style gives
+         * it precedence and still follows live theme color changes. */
+        lv_obj_add_style(rollers[i], &style_theme_text_primary, LV_PART_SELECTED);
     }
 
     lv_obj_t * save = lv_button_create(scr);
@@ -1746,16 +1784,15 @@ static lv_obj_t * build_clock_set_time_screen(void) {
 }
 
 static lv_obj_t * build_settings_system_screen(void) {
-    static pill_list_item_t items[6 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
+    static pill_list_item_t items[5 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Clock", PILL_ACCESSORY_CHEVRON, false,
                                     clock_settings_row_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Time Zone", PILL_ACCESSORY_CHEVRON, false, timezone_settings_row_cb, NULL, NULL };
-    items[2] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Hostname", PILL_ACCESSORY_CHEVRON, false, hostname_row_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
-    items[5] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
+    items[2] = (pill_list_item_t){ "Hostname", PILL_ACCESSORY_CHEVRON, false, hostname_row_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
 
-    int count = 6;
+    int count = 5;
     int plugin_count = plugin_manager_get_system_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SYSTEM_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -2818,6 +2855,7 @@ void gui_settings_teardown(void) {
     if (clock_set_time_screen) { lv_obj_del(clock_set_time_screen); clock_set_time_screen = NULL; }
     clock_hour_roller = clock_minute_roller = clock_ampm_roller = NULL;
     clock_set_time_row = NULL;
+    clock_timezone_row = clock_timezone_value_label = NULL;
     /* Lazily built by open_timezone_city_screen() -- NULL until the user has
      * opened at least one region, same guard shape as every screen above. */
     if (timezone_city_screen) { lv_obj_del(timezone_city_screen); timezone_city_screen = NULL; }

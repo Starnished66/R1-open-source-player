@@ -606,6 +606,13 @@ static prepared_seek_t * prepared_seek = NULL;
 static bool seek_worker_active = false;
 static uint64_t seek_pending_frame = 0;
 static uint64_t seek_pending_playback_generation = 0;
+static bool seek_pending_is_percent = false;
+static double seek_pending_percent = 0.0;
+/* Generation whose decoder owns current_total_frames/current_sample_rate.
+ * playback_generation advances as soon as a new path is requested, before
+ * that decoder is open, so the two generations deliberately differ during
+ * track startup. Percentage seeks wait for them to match. */
+static uint64_t loaded_playback_generation = 0;
 
 static uint64_t frames_played = 0;
 static uint64_t current_total_frames = 0;
@@ -634,7 +641,8 @@ static audio_codec_t public_codec_for_decoder(decoder_type_t type) {
  * the UI completely independent from the playback thread's stack-local
  * decoder_t and its short-lived gapless/crossfade prefetched decoder. */
 static void publish_current_format_locked(const decoder_t * dec, const char * path,
-                                          float replaygain_linear, bool replaygain_applied) {
+                                          float replaygain_linear, bool replaygain_applied,
+                                          uint64_t decoder_generation) {
     memset(&current_format_info, 0, sizeof(current_format_info));
     current_format_info.valid = true;
     if (path) snprintf(current_format_info.path, sizeof(current_format_info.path), "%s", path);
@@ -653,11 +661,15 @@ static void publish_current_format_locked(const decoder_t * dec, const char * pa
     current_format_info.replaygain_applied_db = replaygain_applied && replaygain_linear > 0.0f
         ? 20.0 * log10((double) replaygain_linear) : 0.0;
     current_format_info.generation = ++current_format_generation;
+    loaded_playback_generation = decoder_generation;
+    pthread_cond_broadcast(&audio_cond);
 }
 
 static void clear_current_format_locked(void) {
     memset(&current_format_info, 0, sizeof(current_format_info));
     current_format_generation++;
+    loaded_playback_generation = 0;
+    pthread_cond_broadcast(&audio_cond);
 }
 
 #ifdef HOST_BUILD
@@ -692,7 +704,15 @@ static void * seek_worker_func(void * arg) {
         uint64_t frame, pgen, sgen;
         char * path;
         pthread_mutex_lock(&audio_mutex);
-        if (!active_path || seek_pending_playback_generation != playback_generation) {
+        while (active_path &&
+               seek_pending_playback_generation == playback_generation &&
+               seek_pending_is_percent &&
+               loaded_playback_generation != playback_generation &&
+               !stop_requested) {
+            pthread_cond_wait(&audio_cond, &audio_mutex);
+        }
+        if (!active_path || stop_requested ||
+            seek_pending_playback_generation != playback_generation) {
             seek_worker_active = false;
             pthread_mutex_unlock(&audio_mutex);
             return NULL;
@@ -703,7 +723,9 @@ static void * seek_worker_func(void * arg) {
             pthread_mutex_unlock(&audio_mutex);
             return NULL;
         }
-        frame = seek_pending_frame;
+        frame = seek_pending_is_percent
+            ? (uint64_t) ((double) current_total_frames * (seek_pending_percent / 100.0))
+            : seek_pending_frame;
         pgen = seek_pending_playback_generation;
         sgen = seek_request_generation;
         pthread_mutex_unlock(&audio_mutex);
@@ -753,7 +775,13 @@ static void * seek_worker_func(void * arg) {
             return NULL;
         }
 
-        bool retry = (playback_generation == pgen) && (seek_request_generation != sgen);
+        /* audio_seek() may have queued a request for a newly-started track
+         * while this old track's worker was still marked active. In that
+         * case it deliberately does not start a second worker, so this one
+         * must loop onto the current request instead of exiting and losing
+         * it. The old same-track superseding-seek case is covered too. */
+        bool retry = seek_pending_playback_generation == playback_generation &&
+            (pgen != playback_generation || sgen != seek_request_generation);
         if (!retry) seek_worker_active = false;
         pthread_mutex_unlock(&audio_mutex);
         if (ready) {
@@ -1106,7 +1134,8 @@ static void * audio_thread_func(void * arg) {
         current_total_frames = cur_dec.total_frames;
         current_sample_rate = cur_dec.sample_rate;
         publish_current_format_locked(&cur_dec, cur_path_local,
-                                      cur_replaygain_linear, cur_replaygain_applied);
+                                      cur_replaygain_linear, cur_replaygain_applied,
+                                      cur_generation);
         pthread_mutex_unlock(&audio_mutex);
 
         bool should_restart = false;
@@ -1278,7 +1307,8 @@ static void * audio_thread_func(void * arg) {
                 current_total_frames = cur_dec.total_frames;
                 current_sample_rate = cur_dec.sample_rate;
                 publish_current_format_locked(&cur_dec, cur_path_local,
-                                              cur_replaygain_linear, cur_replaygain_applied);
+                                              cur_replaygain_linear, cur_replaygain_applied,
+                                              cur_generation);
                 pthread_mutex_unlock(&audio_mutex);
                 need_fade_in = true;
                 consecutive_decoder_errors = 0;
@@ -1542,7 +1572,8 @@ static void * audio_thread_func(void * arg) {
                     current_sample_rate = cur_dec.sample_rate;
                     frames_played = cur_frames_played_local;
                     publish_current_format_locked(&cur_dec, cur_path_local,
-                                                  cur_replaygain_linear, cur_replaygain_applied);
+                                                  cur_replaygain_linear, cur_replaygain_applied,
+                                                  cur_generation);
                     track_advanced = true;
                     pthread_mutex_unlock(&audio_mutex);
                 } else {
@@ -1694,7 +1725,8 @@ static void * audio_thread_func(void * arg) {
                         current_sample_rate = cur_dec.sample_rate;
                         frames_played = cur_frames_played_local;
                         publish_current_format_locked(&cur_dec, cur_path_local,
-                                                      cur_replaygain_linear, cur_replaygain_applied);
+                                                      cur_replaygain_linear, cur_replaygain_applied,
+                                                      cur_generation);
                         track_advanced = true;
                         pthread_mutex_unlock(&audio_mutex);
 
@@ -1913,18 +1945,9 @@ bool audio_is_paused(void) {
     return result;
 }
 
-void audio_seek(double seconds) {
-    pthread_mutex_lock(&audio_mutex);
-    if (!have_current || current_sample_rate == 0 || current_total_frames == 0 || !active_path) {
-        pthread_mutex_unlock(&audio_mutex);
-        return;
-    }
-    if (seconds < 0.0) seconds = 0.0;
-    uint64_t frame = (uint64_t) (seconds * (double) current_sample_rate);
-    if (frame > current_total_frames) frame = current_total_frames;
-    seek_pending_frame = frame;
-    seek_pending_playback_generation = playback_generation;
-    seek_request_generation++;
+/* Starts the single-flight worker for the request already stored by the
+ * caller. Always called with audio_mutex held and returns with it unlocked. */
+static void start_seek_worker_and_unlock(void) {
     bool start_worker = !seek_worker_active;
     pthread_t worker;
     int create_result = 0;
@@ -1939,10 +1962,71 @@ void audio_seek(double seconds) {
         if (create_result != 0)
             seek_worker_active = false;
     }
+    pthread_cond_broadcast(&audio_cond);
     pthread_mutex_unlock(&audio_mutex);
 
     if (start_worker && create_result == 0)
         pthread_detach(worker);
+}
+
+static void request_seek_and_unlock(uint64_t frame) {
+    if (frame > current_total_frames) frame = current_total_frames;
+    seek_pending_frame = frame;
+    seek_pending_is_percent = false;
+    seek_pending_playback_generation = playback_generation;
+    seek_request_generation++;
+    start_seek_worker_and_unlock();
+}
+
+void audio_seek(double seconds) {
+    pthread_mutex_lock(&audio_mutex);
+    if (!have_current || current_sample_rate == 0 || current_total_frames == 0 || !active_path) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
+    }
+    if (seconds < 0.0) seconds = 0.0;
+    uint64_t frame = (uint64_t) (seconds * (double) current_sample_rate);
+    request_seek_and_unlock(frame);
+}
+
+/* Real-device bug report: tapping the progress slider to seek stopped
+ * working after switching tracks a few times, mostly on 40+ minute songs.
+ * Root cause: progress_slider_event_cb() (gui_player.c) used to read
+ * audio_get_duration_seconds(), convert the tapped percent to an absolute
+ * seconds value, and call audio_seek(seconds) -- two SEPARATE audio_mutex
+ * critical sections, with the audio thread free to run in between. If the
+ * user switches tracks and then taps the slider before the audio thread's
+ * own decoder_open() for the new track has finished (current_sample_rate/
+ * current_total_frames only update once it has -- see the restart handling
+ * at the top of audio_thread_func()'s outer loop), audio_get_duration_
+ * seconds() still reports the OLD track's duration. A percent computed
+ * against that stale duration, then converted to a frame count using
+ * whichever track's current_sample_rate audio_seek() happens to observe by
+ * the time its own separate lock acquisition runs, lands on the wrong
+ * position in the NEW track -- and can look like the tap did nothing at
+ * all if that miscomputed target happens to clamp back near wherever
+ * playback already was. decoder_open() takes measurably longer for a long
+ * file needing to scan/build a seek index (most formats here) than for one
+ * whose header states total_frames outright (FLAC's STREAMINFO), which is
+ * why this was mostly seen on 40+ minute songs and not reported for FLAC.
+ *
+ * Fix: store the percentage together with playback_generation. The worker
+ * waits until that generation's decoder publishes its own total_frames,
+ * then converts the percentage. It therefore cannot combine the previous
+ * track's duration with the newly requested track's path. */
+void audio_seek_percent(double percent) {
+    pthread_mutex_lock(&audio_mutex);
+    if (!active_path) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
+    }
+    if (percent < 0.0) percent = 0.0;
+    if (percent > 100.0) percent = 100.0;
+    seek_pending_percent = percent;
+    seek_pending_is_percent = true;
+    seek_pending_playback_generation = playback_generation;
+    seek_request_generation++;
+    start_seek_worker_and_unlock();
 }
 
 double audio_get_position_seconds(void) {

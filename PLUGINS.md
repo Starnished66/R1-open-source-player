@@ -697,10 +697,10 @@ Opens a list screen.
 - `on_select` (function): called with the **1-based** index of whichever
   row was tapped (Lua array convention, not C's 0-based one) when the user
   taps a row. Not called if the user backs out without tapping anything.
-- `options` (table, optional): `{ height = n, width = n }` -- resizes every row in
-  this call (not per-row -- a plain browsing list mixing wildly different
-  row heights would look broken in a way an occasional taller settings-
-  submenu row doesn't).
+- `options` (table, optional): `{ height = n, width = n, selected = index }` --
+  resizes every row in this call (not per-row) and optionally draws an
+  accent outline around the selected 1-based row. Selecting another row
+  moves that outline automatically.
 
 Each call opens a **new** screen (from a pool of 4 reusable ones -- see
 `PLUGIN_LIST_SCREEN_POOL_SIZE` in `gui.c`), so calling `show_list` again
@@ -998,12 +998,13 @@ refresh yet**. `codec` is used directly instead of the extension/Content-
 Type sniffing a plain stream URL needs, since the plugin already knows it
 from its own catalog API.
 
-### `plugin.show_toast(message)`
+### `plugin.show_toast(message [, duration_ms])`
 
 Shows the same transient toast used elsewhere in the app (e.g. "Added to
 queue"). Useful for "nothing found" / error feedback -- see
 `Audiobooks.lua`'s use of this when a book folder has no playable chapter
-files in it.
+files in it. The optional duration defaults to 5000ms and accepts
+100..30000ms.
 
 ### 🎚️ EQ and Sound Profiles
 

@@ -52,8 +52,10 @@
  * way to feature-detect just this. */
 /* API 8 adds plugin.set_launcher_layout(), allowing themes to switch the
  * native Music, Stream Media, and Wireless launchers between their existing
- * icon grids and the shared pill-list presentation. */
-#define PLUGIN_API_VERSION 8
+ * icon grids and the shared pill-list presentation.
+ * API 9 adds show_list()'s optional selected-row highlight and an optional
+ * duration_ms argument to show_toast(). Both are backward-compatible. */
+#define PLUGIN_API_VERSION 9
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
 /* Third-party Lua plugin support. Every *.lua file under

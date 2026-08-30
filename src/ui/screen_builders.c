@@ -1154,6 +1154,7 @@ typedef struct {
     compact_list_page_row_t cache_rows[COMPACT_LIST_PAGE_CACHE_SIZE];
     compact_list_row_decorator_cb_t row_decorator;
     void * row_decorator_ctx;
+    compact_list_click_cb_t on_trailing_click;
 
     /* Background page fetch -- see compact_list_ensure_cache()'s own
      * comment for why this moved off the scroll-event/UI thread. NULL
@@ -1202,6 +1203,14 @@ static void compact_list_row_long_press_cb(lv_event_t * e) {
     int index = ctx->logical_index;
     if (index < 0 || index >= ctx->data->item_count) return;
     ctx->data->on_long_press(index);
+}
+
+static void compact_list_trailing_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    compact_list_row_ctx_t * ctx = (compact_list_row_ctx_t *) lv_event_get_user_data(e);
+    int index = ctx->logical_index;
+    if (ctx->data->on_trailing_click && index >= 0 && index < ctx->data->item_count)
+        ctx->data->on_trailing_click(index);
 }
 
 /* How often compact_list_poll_fetch_cb() below checks a pending job for
@@ -1800,6 +1809,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     data->poll_timer = NULL; /* created below, once `list` itself exists */
     data->row_decorator = NULL;
     data->row_decorator_ctx = NULL;
+    data->on_trailing_click = NULL;
 
     /* Virtual rows are positioned absolutely, so flex cross alignment does
      * not center them.  Center every width explicitly. */
@@ -1830,7 +1840,9 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
 
         lv_obj_t * trailing = lv_image_create(row);
         lv_obj_align(trailing, LV_ALIGN_RIGHT_MID, -14, 0);
-        lv_obj_remove_flag(trailing, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(trailing, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(trailing, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_set_ext_click_area(trailing, 18);
         lv_obj_add_flag(trailing, LV_OBJ_FLAG_HIDDEN);
         data->trailing_images[slot] = trailing;
 
@@ -1840,6 +1852,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
         ctx->logical_index = -1;
         data->row_ctx[slot] = ctx;
         lv_obj_add_event_cb(row, compact_list_row_click_cb, LV_EVENT_CLICKED, ctx);
+        lv_obj_add_event_cb(trailing, compact_list_trailing_click_cb, LV_EVENT_CLICKED, ctx);
         if (on_long_press) lv_obj_add_event_cb(row, compact_list_row_long_press_cb, LV_EVENT_LONG_PRESSED, ctx);
     }
 
@@ -1897,6 +1910,11 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     register_active_compact_list(list);
 
     return list;
+}
+
+void compact_list_set_trailing_click(lv_obj_t * list, compact_list_click_cb_t cb) {
+    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    data->on_trailing_click = cb;
 }
 
 void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx) {

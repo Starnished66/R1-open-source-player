@@ -5,6 +5,7 @@
 
 lv_obj_t * gui_shell_get_home_screen(void);
 lv_obj_t * gui_shell_get_dac_home_screen(void);
+void gui_shell_refresh_home(void);
 
 /* Effective Wi-Fi enabled state: wifi_control_is_enabled(), except an
  * in-flight toggle's target state wins while it's still settling (see the
@@ -17,6 +18,14 @@ void gui_shell_update_quick_drawer_play_state(bool is_playing);
 void gui_shell_update_quick_drawer_play_mode(int mode);
 
 void gui_shell_init(uint32_t screen_width, uint32_t screen_height);
+/* The screen-construction half of gui_shell_init(), without the Bluetooth-
+ * adjacent startup calls it also makes -- see its own comment. Used by
+ * gui_reload.c's in-process UI reload. */
+void gui_shell_build_screens(uint32_t screen_width, uint32_t screen_height);
+/* Deletes every screen/top-layer object gui_shell.c owns (Home, DAC Home,
+ * status bar, home indicator bar, quick drawer) -- see its own comment.
+ * Used by gui_reload.c before calling gui_shell_build_screens() again. */
+void gui_shell_teardown(void);
 void refresh_clock_label(void);
 void refresh_battery_topbar(void);
 void refresh_wifi_topbar(void);
@@ -24,6 +33,9 @@ void refresh_volume_topbar(int32_t percent);
 void quick_drawer_mark_snapshot_dirty(void);
 void register_swipe_dead_zone(lv_obj_t * obj);
 void unregister_swipe_dead_zone(lv_obj_t * obj);
+/* For gui_reload.c's in-process UI reload -- see its own comment. Must run
+ * before any screen's sliders are actually deleted. */
+void reset_swipe_dead_zones(void);
 void poll_quick_drawer(void);
 void open_quick_drawer(void);
 void close_quick_drawer(void);

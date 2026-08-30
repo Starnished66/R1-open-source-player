@@ -1307,6 +1307,31 @@ void gui_subsonic_init(void) {
                      &subsonic_albums_count, false, false, METADATA_DB_AZ_ALL_SONGS, NULL);
 }
 
+/* For gui_reload.c's in-process UI reload -- deletes every screen this
+ * module owns so gui_subsonic_init() can rebuild them from a clean slate
+ * without leaking the old objects. subsonic_download_confirm_popup and its
+ * backdrop are built directly on lv_layer_top() (see build_confirm_popup()'s
+ * own comment), not as children of any of these screens, so they need their
+ * own explicit deletion. re-running gui_subsonic_init() also re-runs
+ * register_search() for the two virtualized lists below, which already
+ * frees its own prior state on re-registration (gui_library.c) -- nothing
+ * extra needed here for that. */
+void gui_subsonic_teardown(void) {
+    if (subsonic_download_confirm_popup) { lv_obj_del(subsonic_download_confirm_popup); subsonic_download_confirm_popup = NULL; }
+    if (subsonic_download_confirm_popup_backdrop) {
+        lv_obj_del(subsonic_download_confirm_popup_backdrop);
+        subsonic_download_confirm_popup_backdrop = NULL;
+    }
+    if (subsonic_entry_screen) { lv_obj_del(subsonic_entry_screen); subsonic_entry_screen = NULL; }
+    if (subsonic_saved_servers_screen) { lv_obj_del(subsonic_saved_servers_screen); subsonic_saved_servers_screen = NULL; }
+    if (subsonic_new_connection_screen) { lv_obj_del(subsonic_new_connection_screen); subsonic_new_connection_screen = NULL; }
+    if (subsonic_menu_screen) { lv_obj_del(subsonic_menu_screen); subsonic_menu_screen = NULL; }
+    if (subsonic_artists_screen) { lv_obj_del(subsonic_artists_screen); subsonic_artists_screen = NULL; }
+    if (subsonic_albums_screen) { lv_obj_del(subsonic_albums_screen); subsonic_albums_screen = NULL; }
+    if (subsonic_songs_screen) { lv_obj_del(subsonic_songs_screen); subsonic_songs_screen = NULL; }
+    if (subsonic_playlists_screen) { lv_obj_del(subsonic_playlists_screen); subsonic_playlists_screen = NULL; }
+}
+
 bool gui_subsonic_has_background_work(void) {
     return download_active || subsonic_library_download_active || subsonic_connect_active || subsonic_browse_active;
 }

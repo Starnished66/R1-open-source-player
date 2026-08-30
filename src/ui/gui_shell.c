@@ -2017,6 +2017,21 @@ void unregister_swipe_dead_zone(lv_obj_t * obj) {
     }
 }
 
+/* For gui_reload.c's in-process UI reload -- every native slider card
+ * registers itself here once at startup and, per register_swipe_dead_zone()'s
+ * own comment, is never expected to unregister because it "lives forever."
+ * A reload breaks that assumption: it deletes every native slider and
+ * builds fresh ones, but without this, the OLD (now-freed) pointers stay in
+ * the array forever -- point_in_swipe_dead_zone() would dereference freed
+ * memory on the very next swipe check, and every reload would also append
+ * the NEW cards on top without ever clearing the old slots, filling
+ * SWIPE_DEAD_ZONE_MAX permanently after just a few reloads. Only clears the
+ * array (these are borrowed pointers, not owned -- nothing here to free);
+ * every screen rebuilt after this call re-registers its own sliders fresh. */
+void reset_swipe_dead_zones(void) {
+    swipe_dead_zone_count = 0;
+}
+
 bool point_in_swipe_dead_zone(lv_point_t p) {
     for (int i = 0; i < swipe_dead_zone_count; i++) {
         lv_obj_t * obj = swipe_dead_zones[i];
@@ -3252,7 +3267,14 @@ void refresh_clock_label(void) {
     }
 }
 
-void gui_shell_init(uint32_t screen_width, uint32_t screen_height) {
+/* Split out of gui_shell_init() so gui_reload.c's in-process UI reload can
+ * rebuild Home/the status bar/the quick drawer without also re-triggering
+ * start_bt_dac_startup_reapply_if_needed()/start_refresh_bt_icon() below --
+ * those are Bluetooth-adjacent startup side effects (the latter spawns a
+ * background pthread with no idempotency guard) a reload must never repeat.
+ * gui_shell_init() itself (below) still calls this first, then those two,
+ * in the exact same order as before this split -- boot behavior unchanged. */
+void gui_shell_build_screens(uint32_t screen_width, uint32_t screen_height) {
     (void) screen_width;
     (void) screen_height;
     dac_home_screen = build_dac_home_screen();
@@ -3263,15 +3285,7 @@ void gui_shell_init(uint32_t screen_width, uint32_t screen_height) {
     refresh_clock_label();
     refresh_battery_topbar();
     refresh_wifi_icon();
-    start_bt_dac_startup_reapply_if_needed();
     refresh_play_pause_topbar();
-#ifndef HOST_BUILD
-    boot_checkpoint("start_refresh_bt_icon about to be called");
-#endif
-    start_refresh_bt_icon();
-#ifndef HOST_BUILD
-    boot_checkpoint("start_refresh_bt_icon done");
-#endif
     refresh_headphone_icon();
     poll_usb_audio_output();
 
@@ -3285,6 +3299,69 @@ void gui_shell_init(uint32_t screen_width, uint32_t screen_height) {
         quick_drawer_drag_timer = lv_timer_create(poll_quick_drawer_drag, LV_DEF_REFR_PERIOD, NULL);
     }
     gui_shell_install_indev_hooks(NULL);
+}
+
+/* Deletes every screen/top-layer object gui_shell.c itself owns -- for
+ * gui_reload.c's in-process UI reload, so gui_shell_build_screens() can
+ * rebuild these from a clean slate without leaking the old objects. Only
+ * three root containers need an explicit lv_obj_del(): status_bar_band/
+ * home_indicator_band/quick_drawer own every other status-bar/quick-drawer
+ * child (clock digits, battery icon, wifi/bt icons, sliders, ...) as an
+ * LVGL child, so deleting the root recursively frees them -- no need to
+ * null each child pointer individually, since build_status_bar()/build_
+ * home_indicator_bar()/build_quick_drawer() reassign every one of them
+ * again immediately after, with nothing running in between that could read
+ * a stale pointer. quick_drawer_motion_image is the one exception -- a
+ * transient drag-snapshot object created directly under lv_layer_top(),
+ * not as quick_drawer's own child, so it needs its own explicit delete
+ * when a mid-drag reload catches it still present. */
+void gui_shell_teardown(void) {
+    if (quick_drawer_motion_image) {
+        lv_obj_del(quick_drawer_motion_image);
+        quick_drawer_motion_image = NULL;
+    }
+    quick_drawer_bitmap_motion = false;
+    if (quick_drawer) {
+        lv_obj_del(quick_drawer);
+        quick_drawer = NULL;
+    }
+    if (status_bar_band) {
+        lv_obj_del(status_bar_band);
+        status_bar_band = NULL;
+    }
+    if (home_indicator_band) {
+        lv_obj_del(home_indicator_band);
+        home_indicator_band = NULL;
+    }
+    if (dac_home_screen) {
+        lv_obj_del(dac_home_screen);
+        dac_home_screen = NULL;
+    }
+    if (home_screen) {
+        lv_obj_del(home_screen);
+        home_screen = NULL;
+    }
+}
+
+void gui_shell_refresh_home(void) {
+    lv_obj_t * old = home_screen;
+    lv_obj_t * fresh = build_home_screen();
+    if (!fresh) return;
+    home_screen = fresh;
+    gui_navigation_replace_home(old, fresh);
+    if (old) lv_obj_del(old);
+}
+
+void gui_shell_init(uint32_t screen_width, uint32_t screen_height) {
+    gui_shell_build_screens(screen_width, screen_height);
+    start_bt_dac_startup_reapply_if_needed();
+#ifndef HOST_BUILD
+    boot_checkpoint("start_refresh_bt_icon about to be called");
+#endif
+    start_refresh_bt_icon();
+#ifndef HOST_BUILD
+    boot_checkpoint("start_refresh_bt_icon done");
+#endif
 }
 
 

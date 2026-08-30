@@ -7,6 +7,9 @@
 typedef void (*text_entry_done_cb_t)(const char * text, void * user_data);
 
 bool gui_text_input_init(void);
+/* Deletes the text-entry screen so gui_reload.c's in-process UI reload can
+ * call gui_text_input_init() again from a clean slate. */
+void gui_text_input_teardown(void);
 
 void show_text_entry(const char * title, const char * initial_text, bool is_password, bool numeric,
                      text_entry_done_cb_t done_cb, void * user_data);

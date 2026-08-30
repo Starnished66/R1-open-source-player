@@ -1,0 +1,51 @@
+# Reference .theme file for plugins_examples/Themes.lua -- see White.theme's
+# own header comment for the file format.
+#
+# Chunky 80s-computer tile grid: cream/amber/brown, small radius (not
+# soft/glossy), tight gap -- reads mechanical, not modern. Tile mode (the
+# default -- home_mode omitted below), so height/width/align/accessory/
+# text_size/icon are all ignored natively; only radius applies.
+#
+# icon_root=theme2 explicitly resets icons to this app's own stock set --
+# without it, icons are left at whatever a PREVIOUSLY selected theme last
+# set them to (icon_root is the only thing that touches icons; omitting it
+# means "don't touch", not "use the default"), which is undefined/
+# inconsistent depending on selection history. Known limitation either way:
+# theme2's launcher icons (music.png etc.) have an opaque black square
+# canvas baked in, not a transparent background, so they show as a black
+# box against any tile bg_color other than near-black -- not something
+# this theme file or the native renderer can fix without different icon
+# assets; documented here so it isn't mistaken for a color/opacity bug.
+name=Retro
+screen=0x140F08
+card=0x241A10
+list_row=0x2C2014
+text_primary=0xFFDCA0
+text_muted=0x9A7A4A
+icon_root=theme2
+
+home_tile_gap=6
+
+tile.music.bg_color=0xF2C14E
+tile.music.text_color=0x2A1A0A
+tile.music.radius=8
+
+tile.stream_media.bg_color=0xE8845C
+tile.stream_media.text_color=0x2A1A0A
+tile.stream_media.radius=8
+
+tile.wireless.bg_color=0xD9A441
+tile.wireless.text_color=0x2A1A0A
+tile.wireless.radius=8
+
+tile.books.bg_color=0xC46A4A
+tile.books.text_color=0xF2E9D8
+tile.books.radius=8
+
+tile.system.bg_color=0x8A6B4A
+tile.system.text_color=0xF2E9D8
+tile.system.radius=8
+
+tile.dac.bg_color=0xB5804A
+tile.dac.text_color=0xF2E9D8
+tile.dac.radius=8

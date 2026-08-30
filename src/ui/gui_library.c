@@ -37,6 +37,7 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <limits.h>
 #include <ctype.h>
@@ -3889,8 +3890,16 @@ static bool power_off_countdown_active = false;
 static uint32_t power_off_countdown_start_tick;
 
 static void hide_power_off_countdown_popup(void) {
-    lv_obj_add_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(power_off_countdown_popup, LV_OBJ_FLAG_HIDDEN);
+    /* NULL-checked -- originally only ever reachable from a tap on this
+     * exact popup (power_off_countdown_backdrop_cb/power_off_countdown_
+     * cancel_cb), which guaranteed both objects existed. gui_library_
+     * teardown()'s own cancel_power_off_countdown() call (for gui_reload.c's
+     * in-process UI reload) reaches this unconditionally, on every reload,
+     * regardless of whether these were ever built for THIS process
+     * generation -- an unguarded lv_obj_add_flag(NULL, ...) there would
+     * dereference a NULL lv_obj_t*, not a graceful no-op. */
+    if (power_off_countdown_popup_backdrop) lv_obj_add_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    if (power_off_countdown_popup) lv_obj_add_flag(power_off_countdown_popup, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void cancel_power_off_countdown(void) {
@@ -4457,60 +4466,211 @@ static int album_artists_fetch_page(void * ctx, int offset, int count, compact_l
 
 
 
+/* Forward declaration -- defined alongside gui_library_teardown() further
+ * down this file, reused here too for the matching "can't change theme
+ * more than a couple of times" investigation (now tracking a second crash
+ * site inside this function's own rebuild, not just the teardown). */
+static void library_teardown_diag(const char * step);
+
 void gui_library_init(void) {
+    library_teardown_diag("az_index_drag_timer before");
     if (!az_index_drag_timer) az_index_drag_timer = lv_timer_create(poll_az_index_drag, LV_DEF_REFR_PERIOD, NULL);
+    library_teardown_diag("build_files_screen before");
     files_screen = build_files_screen();
+    library_teardown_diag("build_all_songs_screen before");
     all_songs_screen = build_all_songs_screen();
+    library_teardown_diag("build_recently_added_screen before");
     recently_added_screen = build_recently_added_screen();
+    library_teardown_diag("build_artists_screen before");
     artists_screen = build_artists_screen();
+    library_teardown_diag("build_albums_screen before");
     albums_screen = build_albums_screen();
+    library_teardown_diag("build_album_artist_screen before");
     album_artist_screen = build_album_artist_screen();
+    library_teardown_diag("build_playlists_screen before");
     playlists_screen = build_playlists_screen();
+    library_teardown_diag("build_cue_tracks_screen before");
     cue_tracks_screen = build_cue_tracks_screen();
+    library_teardown_diag("build_group_songs_screen before");
     group_songs_screen = build_group_songs_screen();
 
+    library_teardown_diag("build_compact_list_screen(Albums) before");
     artist_albums_screen = build_compact_list_screen("Albums", generic_back_cb, NULL, 0,
                                                       artist_album_row_click_cb, NULL,
                                                       &artist_albums_list, &artist_albums_title_label,
                                                       LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
+    library_teardown_diag("compact_list_set_row_height before");
     compact_list_set_row_height(artist_albums_list, MUSIC_LIST_ROW_HEIGHT);
+    library_teardown_diag("artist_albums event cbs before");
     lv_obj_add_event_cb(artist_albums_screen, album_thumbnail_screen_loaded_cb,
                         LV_EVENT_SCREEN_LOADED, artist_albums_list);
     lv_obj_add_event_cb(artist_albums_screen, album_thumbnail_screen_unloaded_cb,
                         LV_EVENT_SCREEN_UNLOADED, artist_albums_list);
     lv_obj_add_event_cb(artist_albums_list, album_thumbnail_scroll_cb, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(artist_albums_list, album_thumbnail_scroll_cb, LV_EVENT_SCROLL_END, NULL);
+    library_teardown_diag("finalize_screen_navigation(artist_albums) before");
     finalize_screen_navigation(artist_albums_screen);
+    library_teardown_diag("build_add_to_playlist_screen before");
     add_to_playlist_screen = build_add_to_playlist_screen();
+    library_teardown_diag("build_music_screen before");
     music_screen = build_music_screen();
 
     /* Register A-Z index & search */
+    library_teardown_diag("register_az_index(artists) before");
     register_az_index(artists_screen, artists_list, METADATA_DB_AZ_ARTIST);
+    library_teardown_diag("register_az_index(albums) before");
     register_az_index(albums_screen, albums_list, METADATA_DB_AZ_ALBUM);
+    library_teardown_diag("register_az_index(album_artist) before");
     register_az_index(album_artist_screen, album_artist_list, METADATA_DB_AZ_ALBUM_ARTIST);
+    library_teardown_diag("register_az_index(all_songs) before");
     register_az_index(all_songs_screen, all_songs_list, METADATA_DB_AZ_ALL_SONGS);
 
+    library_teardown_diag("register_search(artists) before");
     register_search(SEARCH_BINDING_ARTISTS, artists_screen, artists_list, NULL, NULL, false,
                      true, METADATA_DB_AZ_ARTIST, artists_fetch_page);
+    library_teardown_diag("register_search(albums) before");
     register_search(SEARCH_BINDING_ALBUMS, albums_screen, albums_list, NULL, NULL, false,
                      true, METADATA_DB_AZ_ALBUM, albums_fetch_page);
+    library_teardown_diag("register_search(album_artist) before");
     register_search(SEARCH_BINDING_ALBUM_ARTIST, album_artist_screen, album_artist_list, NULL,
                      NULL, false, true, METADATA_DB_AZ_ALBUM_ARTIST, album_artists_fetch_page);
+    library_teardown_diag("register_search(all_songs) before");
     register_search(SEARCH_BINDING_ALL_SONGS, all_songs_screen, all_songs_list, NULL, NULL, false,
                      true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 
+    library_teardown_diag("build_compact_list_widget(files_search) before");
     files_search_list = build_compact_list_widget(files_screen, NULL, 0, files_search_row_click_cb, NULL, LIST_ROW_WIDTH_WIDE, false, lv_color_black());
     lv_obj_set_style_bg_opa(files_search_list, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(files_search_list, lv_color_black(), 0);
     lv_obj_add_flag(files_search_list, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(files_search_list, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    library_teardown_diag("enable_gesture_bubble_recursive(files_search_list) before");
     enable_gesture_bubble_recursive(files_search_list);
 
+    library_teardown_diag("register_search(files) before");
     register_search(SEARCH_BINDING_FILES, files_screen, files_search_list, NULL, NULL, true,
                      true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 
+    library_teardown_diag("build_sd_mount_failed_popup before");
     build_sd_mount_failed_popup();
+    library_teardown_diag("build_sd_format_confirm_popup before");
     build_sd_format_confirm_popup();
+    library_teardown_diag("gui_library_init done");
+}
+
+/* For gui_reload.c's in-process UI reload -- deletes every screen this
+ * module owns so gui_library_init() can rebuild them from a clean slate
+ * without leaking the old objects. Deliberately does NOT touch
+ * az_index_drag_timer (already guarded/reused correctly by gui_library_
+ * init() itself) or the search_bindings[]/az-index registries -- register_
+ * search()/register_az_index() already free and reassign their own prior
+ * state on re-registration. sd_mount_failed_popup/sd_format_confirm_popup
+ * and their backdrops are built directly on lv_layer_top() (see
+ * build_confirm_popup()'s own comment), not as children of any of these
+ * screens, so they need their own explicit deletion. */
+/* Temporary investigation instrumentation for the "can't change theme more
+ * than a couple of times" report -- a real crash/hang landing inside this
+ * exact function on a repeated (Nth, not first) call, with the process
+ * dying with no dmesg SIGSEGV record this time (unlike the earlier Wavy
+ * incident). Same pattern as gui_reload.c's own reload_diag()/plugin_
+ * manager.c's deinit_diag() -- append-only, fsync per line, one call per
+ * statement here specifically so a recurrence pinpoints the exact
+ * statement, not just "somewhere in gui_library_teardown()". */
+static void library_teardown_diag(const char * step) {
+    int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    char line[96];
+    int len = snprintf(line, sizeof(line), "[pid=%ld]   gui_library_teardown: %s\n", (long) getpid(), step);
+    if (len > 0) {
+        if (len >= (int) sizeof(line)) len = (int) sizeof(line) - 1;
+        write(fd, line, (size_t) len);
+        fsync(fd);
+    }
+    close(fd);
+}
+
+void gui_library_teardown(void) {
+    /* poll_power_off_countdown() runs every tick from update_timer_cb,
+     * which this reload never touches or pauses -- if a countdown is live
+     * when a reload happens, deleting power_off_countdown_popup/backdrop
+     * below without this would leave power_off_countdown_active true and
+     * power_off_countdown_start_tick unchanged, so the countdown keeps
+     * running against a freshly rebuilt (and therefore hidden-by-default)
+     * popup with no visible warning at all, and still calls
+     * idle_shutdown_now() once it reaches zero -- an invisible, surprise
+     * power-off. cancel_power_off_countdown() is the same function Cancel/
+     * the backdrop tap already uses, so this is exactly "the user cancelled
+     * it," not a new code path. */
+    library_teardown_diag("cancel_power_off_countdown before");
+    cancel_power_off_countdown();
+    library_teardown_diag("sd_mount_failed_popup before");
+    if (sd_mount_failed_popup) { lv_obj_del(sd_mount_failed_popup); sd_mount_failed_popup = NULL; }
+    library_teardown_diag("sd_mount_failed_popup_backdrop before");
+    if (sd_mount_failed_popup_backdrop) { lv_obj_del(sd_mount_failed_popup_backdrop); sd_mount_failed_popup_backdrop = NULL; }
+    library_teardown_diag("sd_format_confirm_popup before");
+    if (sd_format_confirm_popup) { lv_obj_del(sd_format_confirm_popup); sd_format_confirm_popup = NULL; }
+    library_teardown_diag("sd_format_confirm_popup_backdrop before");
+    if (sd_format_confirm_popup_backdrop) { lv_obj_del(sd_format_confirm_popup_backdrop); sd_format_confirm_popup_backdrop = NULL; }
+    library_teardown_diag("music_screen before");
+    if (music_screen) { lv_obj_del(music_screen); music_screen = NULL; }
+    library_teardown_diag("files_screen before");
+    if (files_screen) { lv_obj_del(files_screen); files_screen = NULL; }
+    library_teardown_diag("all_songs_screen before");
+    if (all_songs_screen) { lv_obj_del(all_songs_screen); all_songs_screen = NULL; }
+    library_teardown_diag("recently_added_screen before");
+    if (recently_added_screen) { lv_obj_del(recently_added_screen); recently_added_screen = NULL; }
+    library_teardown_diag("artists_screen before");
+    if (artists_screen) { lv_obj_del(artists_screen); artists_screen = NULL; }
+    library_teardown_diag("albums_screen before");
+    if (albums_screen) { lv_obj_del(albums_screen); albums_screen = NULL; }
+    library_teardown_diag("album_artist_screen before");
+    if (album_artist_screen) { lv_obj_del(album_artist_screen); album_artist_screen = NULL; }
+    library_teardown_diag("group_songs_screen before");
+    if (group_songs_screen) { lv_obj_del(group_songs_screen); group_songs_screen = NULL; }
+    library_teardown_diag("artist_albums_screen before");
+    if (artist_albums_screen) { lv_obj_del(artist_albums_screen); artist_albums_screen = NULL; }
+    library_teardown_diag("playlists_screen before");
+    if (playlists_screen) { lv_obj_del(playlists_screen); playlists_screen = NULL; }
+    library_teardown_diag("cue_tracks_screen before");
+    if (cue_tracks_screen) { lv_obj_del(cue_tracks_screen); cue_tracks_screen = NULL; }
+    library_teardown_diag("add_to_playlist_screen before");
+    if (add_to_playlist_screen) { lv_obj_del(add_to_playlist_screen); add_to_playlist_screen = NULL; }
+    /* The screens owned these children; clear the borrowed pointers with
+     * their parents so non-NULL remains a valid liveness check. */
+    files_search_list = NULL;
+    all_songs_list = NULL;
+    recently_added_list = NULL;
+    artists_list = NULL;
+    albums_list = NULL;
+    album_artist_list = NULL;
+    group_songs_list = NULL;
+    group_songs_title_label = NULL;
+    group_songs_edit_btn = NULL;
+    group_songs_now_playing_bar = NULL;
+    artist_albums_list = NULL;
+    artist_albums_title_label = NULL;
+    playlists_list = NULL;
+    playlists_edit_btn = NULL;
+    cue_tracks_list = NULL;
+    cue_tracks_title_label = NULL;
+    add_to_playlist_list = NULL;
+    album_thumbnail_active_list = NULL;
+    album_thumbnail_result_list = NULL;
+    /* build_power_off_countdown_popup() -- called separately from gui_init()
+     * (not from gui_library_init()), but its two lv_layer_top() objects are
+     * still this file's own statics to own and delete. Left out, a visible
+     * (if currently hidden) old popup/backdrop pair would linger above the
+     * rebuilt UI forever, invisible only until the next power-off countdown
+     * actually shows it. */
+    library_teardown_diag("power_off_countdown_popup before");
+    if (power_off_countdown_popup) { lv_obj_del(power_off_countdown_popup); power_off_countdown_popup = NULL; }
+    library_teardown_diag("power_off_countdown_popup_backdrop before");
+    if (power_off_countdown_popup_backdrop) {
+        lv_obj_del(power_off_countdown_popup_backdrop);
+        power_off_countdown_popup_backdrop = NULL;
+    }
+    power_off_countdown_label = NULL;
+    library_teardown_diag("done");
 }
 
 void gui_library_resume_fast_timers(void) {

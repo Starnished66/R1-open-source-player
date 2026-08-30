@@ -389,6 +389,17 @@ static void rebuild_info_text(const audio_current_format_info_t * runtime, bool 
     }
 }
 
+/* For gui_reload.c's in-process UI reload -- gui_track_info_init() is
+ * guarded (`if (info_screen) return;`) so it silently no-ops on a second
+ * call unless info_screen is deleted AND nulled first here. */
+void gui_track_info_teardown(void) {
+    if (!info_screen) return;
+    lv_obj_del(info_screen);
+    info_screen = NULL;
+    info_list = NULL;
+    info_title = NULL;
+}
+
 void gui_track_info_init(void) {
     if (info_screen) return;
     info_screen = build_subsonic_list_screen("Information", &info_title, &info_list);

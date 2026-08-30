@@ -10,6 +10,10 @@
 
 
 void gui_player_init(uint32_t screen_width, uint32_t screen_height);
+/* Deletes every screen/popup this module owns (including gui_track_info's,
+ * via gui_track_info_teardown()) so gui_reload.c's in-process UI reload can
+ * call gui_player_init() again from a clean slate. */
+void gui_player_teardown(void);
 void sync_player_topbar_visibility(lv_obj_t * screen);
 void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta);
 void poll_cover_decode(void);

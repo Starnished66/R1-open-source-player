@@ -3218,6 +3218,30 @@ void gui_player_init(uint32_t screen_width, uint32_t screen_height) {
     player_screen = build_player_screen(screen_width, screen_height);
 }
 
+/* For gui_reload.c's in-process UI reload -- deletes every screen/popup this
+ * module owns so gui_player_init() can rebuild them from a clean slate
+ * without leaking the old objects. volume_popup/delete_song_popup/
+ * more_menu_popup and their backdrops are built directly on lv_layer_top()
+ * (see build_confirm_popup()'s own comment), not as children of
+ * player_screen, so deleting player_screen alone would not reach them. */
+void gui_player_teardown(void) {
+    /* build_volume_popup() creates this with an unguarded lv_timer_create()
+     * -- for gui_reload.c's in-process UI reload, delete it here or the old
+     * (leaked) timer keeps firing volume_popup_hide_timer_cb() forever,
+     * which itself references the GLOBAL volume_popup_hide_timer variable
+     * (by then reassigned to the NEW timer) -- so the leaked OLD timer
+     * would keep incorrectly pausing/resetting the NEW one on every tick,
+     * never itself getting paused, instead of a clean single timer. */
+    if (volume_popup_hide_timer) { lv_timer_del(volume_popup_hide_timer); volume_popup_hide_timer = NULL; }
+    if (volume_popup) { lv_obj_del(volume_popup); volume_popup = NULL; }
+    if (delete_song_popup) { lv_obj_del(delete_song_popup); delete_song_popup = NULL; }
+    if (delete_song_popup_backdrop) { lv_obj_del(delete_song_popup_backdrop); delete_song_popup_backdrop = NULL; }
+    if (more_menu_popup) { lv_obj_del(more_menu_popup); more_menu_popup = NULL; }
+    if (more_menu_popup_backdrop) { lv_obj_del(more_menu_popup_backdrop); more_menu_popup_backdrop = NULL; }
+    gui_track_info_teardown();
+    if (player_screen) { lv_obj_del(player_screen); player_screen = NULL; }
+}
+
 
 void gui_format_time(double seconds, char * buf, size_t buf_size) {
     if (!buf || buf_size == 0) return;

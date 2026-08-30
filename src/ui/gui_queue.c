@@ -133,3 +133,15 @@ void gui_queue_init(void) {
     queue_screen = build_queue_screen();
     build_song_context_menu_popup();
 }
+
+/* For gui_reload.c's in-process UI reload -- deletes every screen/popup this
+ * module owns so gui_queue_init() can rebuild them from a clean slate
+ * without leaking the old objects. song_context_menu_popup/backdrop are
+ * built via build_menu_popup() directly on lv_layer_top() (same shape as
+ * build_confirm_popup(), see its own comment), not as children of
+ * queue_screen, so they need their own explicit deletion. */
+void gui_queue_teardown(void) {
+    if (song_context_menu_popup) { lv_obj_del(song_context_menu_popup); song_context_menu_popup = NULL; }
+    if (song_context_menu_popup_backdrop) { lv_obj_del(song_context_menu_popup_backdrop); song_context_menu_popup_backdrop = NULL; }
+    if (queue_screen) { lv_obj_del(queue_screen); queue_screen = NULL; }
+}

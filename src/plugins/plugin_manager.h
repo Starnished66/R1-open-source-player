@@ -38,7 +38,19 @@
  * home_layout.h's own comment. Also see the new "ui.home_layout"
  * plugin_capabilities[] entry (plugin_manager.c) for the no-version-bump
  * way to feature-detect just this. */
-#define PLUGIN_API_VERSION 4
+/* API 5 adds plugin.reload_ui(); API 6 adds the targeted
+ * plugin.refresh_theme() alternative.
+ *
+ * Bumped 6 -> 7: added plugin.register_home_tile() (a plugin can add its own
+ * tile to Home, same shape as the existing plugin.register_stream_media_tile())
+ * and plugin.set_home_layout()'s new `options.order` field (an ordered list
+ * of native-tile-keys/plugin-tile-ids controlling which tiles Home shows and
+ * in what position -- previously Home's 6 tiles were always shown, always in
+ * a fixed native order; see home_layout.h and PLUGINS.md). Purely additive,
+ * same as every bump before it. Also see the new "ui.home_tiles"
+ * plugin_capabilities[] entry (plugin_manager.c) for the no-version-bump
+ * way to feature-detect just this. */
+#define PLUGIN_API_VERSION 7
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
 /* Third-party Lua plugin support. Every *.lua file under
@@ -116,6 +128,17 @@
  * (1 built-in + this many plugin tiles) -- icon_grid_item_t has no
  * runtime-append API, so that array has to be sized up front. */
 #define PLUGIN_MAX_STREAM_TILES 5
+
+/* Upper bound on how many tiles all plugins combined may register via
+ * plugin.register_home_tile() -- sizes plugin_manager.c's own internal
+ * plugin_home_tiles[] array. Unlike PLUGIN_MAX_STREAM_TILES, this is not
+ * itself Home's real rendering ceiling -- home_layout.h's HOME_LAYOUT_MAX_
+ * TILES (which bounds native + plugin tiles combined, as actually ordered
+ * into Home by set_home_layout()'s `options.order`) is. This cap just bounds
+ * the registry a plugin can add entries to in the first place; matches
+ * PLUGIN_MAX_STREAM_TILES's own round number since Home's realistic mix
+ * (6 native + plugin tiles) is the same rough scale as Stream Media's. */
+#define PLUGIN_MAX_HOME_TILES 6
 
 /* ---- plugin.show_settings_list() -- a second, separate screen pool from
  * plugin.show_list() (PLUGIN_LIST_SCREEN_POOL_SIZE, gui.c), for a plugin's
@@ -200,6 +223,18 @@
 void plugin_manager_init(void);
 void plugin_manager_poll(void);
 bool plugin_manager_has_background_work(void);
+
+/* Counterpart to plugin_manager_init(), for gui_reload.c's in-process UI
+ * reload -- closes every plugin's lua_State (after draining background work
+ * that references it: async HTTP, interval timers, a pending text-input
+ * dialog) and zeroes every list-item/tile/callback/event-subscriber
+ * registry, leaving the plugin system ready for plugin_manager_init() to
+ * run again from a clean state. See its own doc comment (plugin_manager.c)
+ * for exactly what it does and doesn't touch. Not safe to call while any
+ * plugin_call() is on the C stack -- see gui_reload.h's own comment on
+ * deferred execution. */
+void plugin_manager_deinit(void);
+void plugin_manager_cancel_all_async_http(void);
 
 /* Rows registered via plugin.register_list_item("books", label, on_open) --
  * gui.c's build_books_screen() appends these after its own 2 built-in rows
@@ -286,6 +321,23 @@ const char * plugin_manager_get_stream_tile_label(int index);
 const char * plugin_manager_get_stream_tile_icon(int index);
 const char * plugin_manager_get_stream_tile_icon_selected(int index);
 void plugin_manager_stream_tile_clicked(int index);
+
+/* Same shape as the stream-tile family above, for the separate
+ * plugin.register_home_tile() registry -- gui_settings.c's build_home_
+ * screen() reads these to resolve any non-native key in home_layout_config.
+ * order[]/tiles[] against a registered plugin tile by id. _find_by_id()
+ * returns the tile's index into this registry (what plugin_manager_home_
+ * tile_clicked() and every other accessor here expect), or -1 if no
+ * currently-registered tile has that id -- build_home_screen() uses this to
+ * tell "resolves to a plugin tile" apart from "unknown/not loaded", which it
+ * skips with a log rather than treating as an error. */
+int plugin_manager_get_home_tile_count(void);
+int plugin_manager_find_home_tile_by_id(const char * id);
+const char * plugin_manager_get_home_tile_id(int index);
+const char * plugin_manager_get_home_tile_label(int index);
+const char * plugin_manager_get_home_tile_icon(int index);
+const char * plugin_manager_get_home_tile_icon_selected(int index);
+void plugin_manager_home_tile_clicked(int index);
 
 /* Invoked by gui.c's plugin-settings-list row widgets (see
  * gui_plugin_show_settings_list()) when a "row"-type row in pool slot `slot`

@@ -1,0 +1,39 @@
+# Reference .theme file for plugins_examples/Themes.lua -- see White.theme's
+# own header comment for the file format.
+#
+# Rustic clay/moss/bark tile grid: mid radius, minimal gap -- densely
+# packed and grounded, distinct from both Retro's sharp corners and
+# Vaporwave's airy spacing. Tile mode (default, home_mode omitted).
+name=Earthy
+screen=0x140F0A
+card=0x241A10
+list_row=0x2E2216
+text_primary=0xF0E3D0
+text_muted=0x9A8060
+icon_root=theme2
+
+home_tile_gap=4
+
+tile.music.bg_color=0x8A5A3C
+tile.music.text_color=0xF5EAD9
+tile.music.radius=16
+
+tile.stream_media.bg_color=0x6B7C4F
+tile.stream_media.text_color=0xF5EAD9
+tile.stream_media.radius=16
+
+tile.wireless.bg_color=0xA87851
+tile.wireless.text_color=0x3A2A1E
+tile.wireless.radius=16
+
+tile.books.bg_color=0x5C4632
+tile.books.text_color=0xF5EAD9
+tile.books.radius=16
+
+tile.system.bg_color=0x7D8F5C
+tile.system.text_color=0x3A2A1E
+tile.system.radius=16
+
+tile.dac.bg_color=0x9C6B46
+tile.dac.text_color=0xF5EAD9
+tile.dac.radius=16

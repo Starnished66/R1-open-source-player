@@ -1,0 +1,40 @@
+# Reference .theme file for plugins_examples/Themes.lua -- see White.theme's
+# own header comment for the file format.
+#
+# Synthwave sunset grid: deep purple fading to hot pink, big soft radius,
+# roomier gap -- soft and glossy, the opposite of Retro's chunky mechanical
+# grid despite both being tile mode. Tile mode (default, home_mode
+# omitted).
+name=Vaporwave
+screen=0x160A2E
+card=0x2A1250
+list_row=0x351A5F
+text_primary=0xFFE0F5
+text_muted=0xB583C9
+icon_root=theme2
+
+home_tile_gap=12
+
+tile.music.bg_color=0x3A1C71
+tile.music.text_color=0xFFD1F7
+tile.music.radius=26
+
+tile.stream_media.bg_color=0x6A2C8F
+tile.stream_media.text_color=0xFFC2EC
+tile.stream_media.radius=26
+
+tile.wireless.bg_color=0x9B3AA0
+tile.wireless.text_color=0xFFE0F5
+tile.wireless.radius=26
+
+tile.books.bg_color=0xC23F9E
+tile.books.text_color=0xFFF0FF
+tile.books.radius=26
+
+tile.system.bg_color=0xE14F95
+tile.system.text_color=0xFFF5FB
+tile.system.radius=26
+
+tile.dac.bg_color=0xFF6F9C
+tile.dac.text_color=0xFFFFFF
+tile.dac.radius=26

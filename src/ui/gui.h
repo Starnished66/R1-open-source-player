@@ -26,6 +26,10 @@ uint64_t ui_perf_now_us(void);
 
 /* Initialize the user interface elements and callbacks */
 void gui_init(uint32_t screen_width, uint32_t screen_height);
+/* For gui_reload.c's in-process UI reload -- build_stream_media_screen()
+ * itself is static to gui.c, so these wrap it. */
+void gui_stream_media_teardown(void);
+void gui_stream_media_rebuild(void);
 void gui_deinit(void);
 
 /* Shows a minimal boot-settle splash screen -- call once, as early as
@@ -111,12 +115,25 @@ void gui_plugin_set_background_color(const char * slot, uint32_t rgb);
 void gui_plugin_set_text_color(const char * slot, uint32_t rgb);
 
 /* Stores plugin.set_home_layout()'s validated config for build_home_screen()
- * (gui_settings.c) to read the next time it runs -- see home_layout.h's own
- * comment for why this never touches the live Home screen. plugin_manager.c's
+ * (gui_settings.c) to read at startup or a targeted theme refresh.
+ * plugin_manager.c's
  * l_plugin_set_home_layout() already validated every enum-like field
  * (key/mode/align/text_size) before calling here, so this trusts its caller,
  * same convention gui_plugin_set_background_color() above already uses. */
 void gui_plugin_set_home_layout(const home_layout_config_t * config);
+
+/* Restores home_layout_config to its unconfigured (configured == false)
+ * zero state -- for plugin_manager_deinit()'s own full-reload path
+ * (gui_reload.c), called right before plugin_manager_init() re-runs every
+ * plugin's top-level script. Without this, a plugin that used to call
+ * set_home_layout() but was removed/disabled/failed to load this time
+ * would leave the PREVIOUS load's stale config in place, silently
+ * contradicting set_home_layout()'s own documented "nothing re-calls this
+ * before the next rebuild -> reverts to native" contract (PLUGINS.md).
+ * plugin.refresh_theme() never calls this -- it doesn't run plugin_manager_
+ * deinit()/init() at all, only rebuilds Home from whatever's already
+ * configured, so a targeted refresh correctly leaves this alone. */
+void gui_plugin_reset_home_layout(void);
 
 /* ---- Playback control bridges for plugin.toggle_pause()/stop()/next_track()/
  * prev_track()/seek()/set_volume()/is_playing()/is_paused()/get_position()/

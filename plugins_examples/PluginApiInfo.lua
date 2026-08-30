@@ -9,7 +9,7 @@ local CAPABILITIES = {
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
     "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
-    "ui.home_layout"
+    "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles"
 }
 
 local CATEGORIES = {
@@ -107,10 +107,13 @@ local CATEGORIES = {
                 "plugin.show_toast(msg)",
                 "plugin.register_list_item(list_id, label, on_open, [opts])",
                 "plugin.register_stream_media_tile(label, on_open, [icon])",
+                "plugin.register_home_tile(id, label, on_open, icon)",
                 "plugin.set_icon(slot, path)",
                 "plugin.set_background_color(slot, rgb)",
                 "plugin.set_text_color(slot, rgb)",
                 "plugin.set_home_layout(tiles, options)",
+                "plugin.refresh_theme()",
+                "plugin.reload_ui()",
             }
         end
     },

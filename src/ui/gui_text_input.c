@@ -794,6 +794,21 @@ bool gui_text_input_init(void) {
     return true;
 }
 
+/* For gui_reload.c's in-process UI reload -- deletes the text-entry screen
+ * so gui_text_input_init() can rebuild it from a clean slate. Covers
+ * text_entry_keypad_group too even when it's currently reparented onto some
+ * other screen's inline search (t9_keypad_attach()) -- that other screen is
+ * being torn down in the same reload pass regardless. */
+void gui_text_input_teardown(void) {
+    /* Unguarded lv_timer_create() at this screen's own build site -- same
+     * leaked-old-timer hazard as gui_player_teardown()'s volume_popup_hide_
+     * timer, see its own comment. Checked independently of text_entry_screen
+     * below rather than under one shared early-return, so it's still
+     * cleaned up even if the two ever get out of sync. */
+    if (text_entry_multitap_timer) { lv_timer_del(text_entry_multitap_timer); text_entry_multitap_timer = NULL; }
+    if (text_entry_screen) { lv_obj_del(text_entry_screen); text_entry_screen = NULL; }
+}
+
 lv_obj_t * gui_text_input_get_screen(void) {
     return text_entry_screen;
 }

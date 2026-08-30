@@ -359,6 +359,15 @@ bool gui_books_init(void) {
     return true;
 }
 
+/* For gui_reload.c's in-process UI reload -- deletes every screen this
+ * module owns so gui_books_init() can rebuild them from a clean slate
+ * without leaking the old objects. */
+void gui_books_teardown(void) {
+    if (books_files_screen) { lv_obj_del(books_files_screen); books_files_screen = NULL; }
+    if (text_reader_screen) { lv_obj_del(text_reader_screen); text_reader_screen = NULL; }
+    if (books_screen) { lv_obj_del(books_screen); books_screen = NULL; }
+}
+
 void gui_books_rescan(void) {
     rescan_books();
 }

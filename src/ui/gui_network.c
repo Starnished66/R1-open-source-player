@@ -2144,6 +2144,8 @@ static void format_rate(char * out, size_t size, unsigned int rate) {
     else snprintf(out, size, "Unknown rate");
 }
 
+static lv_timer_t * dac_stream_labels_timer = NULL;
+
 static void dac_stream_labels_timer_cb(lv_timer_t * timer) {
     (void) timer;
     bt_dac_stream_info_t bt;
@@ -3400,7 +3402,51 @@ void gui_network_init(void) {
     build_usb_dac_leave_popup();
     build_bt_dac_leave_popup();
     dac_stream_labels_timer_cb(NULL);
-    lv_timer_create(dac_stream_labels_timer_cb, 500, NULL);
+    /* Guarded like gui_library.c's az_index_drag_timer -- gui_network_init()
+     * can run again after a UI reload, and an unguarded lv_timer_create()
+     * here would leak/duplicate a recurring timer each time. */
+    if (!dac_stream_labels_timer) dac_stream_labels_timer = lv_timer_create(dac_stream_labels_timer_cb, 500, NULL);
+}
+
+/* For gui_reload.c's in-process UI reload -- deletes every screen/popup this
+ * module owns so gui_network_init() can rebuild them from a clean slate
+ * without leaking the old objects. Deliberately does NOT touch
+ * dac_stream_labels_timer (already guarded/reused correctly by gui_network_
+ * init() itself). The five popup-and-backdrop pairs below are built
+ * directly on lv_layer_top() (see build_confirm_popup()'s own comment), not
+ * as children of any of these screens, so each needs its own explicit
+ * deletion. */
+void gui_network_teardown(void) {
+    if (import_rescan_popup) { lv_obj_del(import_rescan_popup); import_rescan_popup = NULL; }
+    if (import_rescan_popup_backdrop) { lv_obj_del(import_rescan_popup_backdrop); import_rescan_popup_backdrop = NULL; }
+    if (bt_action_popup) { lv_obj_del(bt_action_popup); bt_action_popup = NULL; }
+    if (bt_action_popup_backdrop) { lv_obj_del(bt_action_popup_backdrop); bt_action_popup_backdrop = NULL; }
+    if (wifi_action_popup) { lv_obj_del(wifi_action_popup); wifi_action_popup = NULL; }
+    if (wifi_action_popup_backdrop) { lv_obj_del(wifi_action_popup_backdrop); wifi_action_popup_backdrop = NULL; }
+    if (usb_dac_leave_popup) { lv_obj_del(usb_dac_leave_popup); usb_dac_leave_popup = NULL; }
+    if (usb_dac_leave_popup_backdrop) { lv_obj_del(usb_dac_leave_popup_backdrop); usb_dac_leave_popup_backdrop = NULL; }
+    if (bt_dac_leave_popup) { lv_obj_del(bt_dac_leave_popup); bt_dac_leave_popup = NULL; }
+    if (bt_dac_leave_popup_backdrop) { lv_obj_del(bt_dac_leave_popup_backdrop); bt_dac_leave_popup_backdrop = NULL; }
+
+    if (wifi_screen) { lv_obj_del(wifi_screen); wifi_screen = NULL; }
+    if (wifi_info_screen) { lv_obj_del(wifi_info_screen); wifi_info_screen = NULL; }
+    if (wifi_dns_screen) { lv_obj_del(wifi_dns_screen); wifi_dns_screen = NULL; }
+    if (bt_screen) { lv_obj_del(bt_screen); bt_screen = NULL; }
+    if (bt_dac_screen) { lv_obj_del(bt_dac_screen); bt_dac_screen = NULL; }
+    if (bt_dac_overlay_screen) { lv_obj_del(bt_dac_overlay_screen); bt_dac_overlay_screen = NULL; }
+    if (bt_codec_screen) { lv_obj_del(bt_codec_screen); bt_codec_screen = NULL; }
+    if (font_size_screen) { lv_obj_del(font_size_screen); font_size_screen = NULL; }
+    if (replaygain_mode_screen) { lv_obj_del(replaygain_mode_screen); replaygain_mode_screen = NULL; }
+    if (resume_mode_screen) { lv_obj_del(resume_mode_screen); resume_mode_screen = NULL; }
+    if (play_pause_button_mode_screen) { lv_obj_del(play_pause_button_mode_screen); play_pause_button_mode_screen = NULL; }
+    if (usb_mode_screen) { lv_obj_del(usb_mode_screen); usb_mode_screen = NULL; }
+    if (usb_dac_overlay_screen) { lv_obj_del(usb_dac_overlay_screen); usb_dac_overlay_screen = NULL; }
+    if (import_wifi_screen) { lv_obj_del(import_wifi_screen); import_wifi_screen = NULL; }
+    if (airplay_screen) { lv_obj_del(airplay_screen); airplay_screen = NULL; }
+    if (airplay_overlay_screen) { lv_obj_del(airplay_overlay_screen); airplay_overlay_screen = NULL; }
+    if (dlna_screen) { lv_obj_del(dlna_screen); dlna_screen = NULL; }
+    if (remote_control_screen) { lv_obj_del(remote_control_screen); remote_control_screen = NULL; }
+    if (wireless_screen) { lv_obj_del(wireless_screen); wireless_screen = NULL; }
 }
 
 bool gui_network_has_background_work(void) {

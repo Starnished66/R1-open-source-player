@@ -1,0 +1,20 @@
+# Reference .theme file for plugins_examples/Themes.lua -- see its own
+# load_theme_file() comment for the full file format (colors, optional
+# icon_root, optional tile.<key>.<field> Home layout overrides).
+#
+# A soft blue-white palette using the stock firmware's own theme1 icon set
+# (theme1 is the light variant of the same litegui asset pack theme2 draws
+# from, shipped on every real R1 alongside theme2). Real-device bug report
+# this once caused (kept for context, now fixed at the loader level, not
+# here): applying colors and icons in one pass with no isolation could
+# leave the screen background switched but list rows still dark, with text
+# unreadable either way, if something interrupted the apply mid-way -- see
+# Themes.lua's own apply_theme() comment for the actual fix (colors first,
+# each independently pcall'd).
+name=White
+screen=0xE6F6FF
+card=0xF2F2F2
+list_row=0xECECEC
+text_primary=0x1A1A1A
+text_muted=0x6E6E6E
+icon_root=theme1

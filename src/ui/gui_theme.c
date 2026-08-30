@@ -78,7 +78,23 @@ void accent_swatch_event_cb(lv_event_t * e) {
     }
 }
 
-void gui_theme_init(void) {
+/* Shared by gui_theme_init() (real boot) and gui_theme_reload_styles()
+ * (gui_reload.c's in-process UI reload) -- everything EXCEPT
+ * fallback_font_init_early(), which must never run a second time (see
+ * gui_theme_reload_styles()'s own comment). */
+static void init_style_objects(void) {
+    /* gui_reload.c's in-process UI reload calls this a second (or Nth) time,
+     * and lv_style_init() on a style that already has properties leaks the
+     * old values_and_props allocation instead of freeing it (LVGL's own
+     * header comment on lv_style_init()). Skip the reset on the very first
+     * call, when these are still freshly zero-initialized statics. */
+    static bool already_initialized = false;
+    if (already_initialized) {
+        lv_style_reset(&style_accent);
+        lv_style_reset(&style_muted_text);
+    }
+    already_initialized = true;
+
     lv_style_init(&style_accent);
     lv_style_set_bg_color(&style_accent, accent_lv_color());
     lv_style_set_text_color(&style_accent, accent_lv_color());
@@ -90,8 +106,30 @@ void gui_theme_init(void) {
     lv_style_init(&style_muted_text);
     lv_style_set_text_color(&style_muted_text, lv_color_make(220, 220, 220));
 
-    fallback_font_init_early(current_settings.font_size_tier, current_settings.lyrics_font_size_tier);
     screen_builders_init_list_row_style();
+}
+
+void gui_theme_init(void) {
+    init_style_objects();
+    fallback_font_init_early(current_settings.font_size_tier, current_settings.lyrics_font_size_tier);
+}
+
+/* For gui_reload.c's in-process UI reload -- everything gui_theme_init()
+ * does EXCEPT fallback_font_init_early(). That function is boot-only, by
+ * design: it always rebuilds every app_font_* slot with include_fallbacks
+ * = false (src/ui/fallback_font.c), deferring the CJK/Korean/Thai fallback
+ * face load to run later, once, in the background
+ * (fallback_font_schedule_deferred_load()/fallback_font_load_now()). A
+ * reload re-running it would silently drop that already-loaded fallback
+ * chain (breaking non-Latin glyphs for the rest of the session) AND leak
+ * the fallback faces already in s_loaded_faces[], since fallback_font_init_
+ * early() replaces that table without freeing what it's replacing -- real
+ * memory, not just a stale pointer, since these are loaded TTF/OTF font
+ * files. A theme/icon reload has no reason to touch fonts at all, so this
+ * just skips that call entirely rather than trying to reconstruct
+ * fallback_font.c's own s_fallback_loaded state from outside it. */
+void gui_theme_reload_styles(void) {
+    init_style_objects();
 }
 
 

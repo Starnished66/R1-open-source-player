@@ -20,6 +20,9 @@ typedef struct {
 
 
 void gui_subsonic_init(void);
+/* Deletes every screen this module owns so gui_reload.c's in-process UI
+ * reload can call gui_subsonic_init() again from a clean slate. */
+void gui_subsonic_teardown(void);
 extern subsonic_stream_song_meta_t * subsonic_stream_meta;
 extern int subsonic_stream_meta_count;
 extern bool subsonic_library_download_active;

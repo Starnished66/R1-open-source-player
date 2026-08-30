@@ -25,6 +25,9 @@ lv_obj_t * gui_library_get_group_songs_screen(void);
 lv_obj_t * gui_library_get_playlists_screen(void);
 
 void gui_library_init(void);
+/* Deletes every screen this module owns so gui_reload.c's in-process UI
+ * reload can call gui_library_init() again from a clean slate. */
+void gui_library_teardown(void);
 
 void start_library_rescan(void);
 void poll_library_rescan(void);

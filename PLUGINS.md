@@ -194,9 +194,12 @@ icon-grid tile in **Stream Media**, after the built-in Subsonic tile. Up to
 `PLUGIN_MAX_STREAM_TILES` plugin tiles are supported (currently 5, for 6
 tiles total). Unlike the Books list above, `build_icon_grid_screen()`'s grid
 **cannot be scrolled** (real-device testing confirmed) -- Stream Media
-happens to have room for this cap because it only has 1 built-in tile,
-unlike Home, which is already full at 6 and has no room for plugin tiles
-of its own at all.
+happens to have room for this cap because it only has 1 built-in tile.
+`plugin.register_home_tile()` gives Home the same capability, up to
+`PLUGIN_MAX_HOME_TILES` (currently 6) plugin tiles -- a registered tile only
+actually appears once a `set_home_layout()` call's `options.order` (or
+another plugin's `.theme`-file-driven one, see `plugins_examples/Themes.lua`)
+references its `id`.
 
 ## 🧰 API Reference
 
@@ -207,8 +210,8 @@ from the moment your script starts running (injected before
 | Area | Main APIs |
 |---|---|
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info`, `media_capabilities` |
-| UI | `register_list_item`, `register_stream_media_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
-| Theme | `set_icon`, `set_background_color`, `set_text_color`, `set_home_layout` |
+| UI | `register_list_item`, `register_stream_media_tile`, `register_home_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
+| Theme | `set_icon`, `set_background_color`, `set_text_color`, `set_home_layout`, `refresh_theme`, `reload_ui` |
 | Playback | `play_file`, `play_list`, `play_remote`, `queue_remote_list`, transport controls, playback state |
 | Files & Playlists | `sd_root`, `list_dir`, `mkdir`, `playlist_list`, `playlist_read`, `playlist_create`, `playlist_add`, `playlist_remove`, `playlist_delete` |
 | Storage & Secrets | `storage.get`/`set`/`delete`/`list`, `secrets.set`/`exists`/`delete` |
@@ -304,6 +307,37 @@ pill-list. Purely additive, no breaking changes bundled into this window. A
 plugin that only needs this one function can feature-detect it with
 `plugin.has_capability("ui.home_layout")` instead of bumping `api_min`.
 
+#### API version 5 changelog
+
+New in API 5: `plugin.reload_ui()` (see its own doc section below) --
+rebuilds every screen/style in the same process, so a `set_icon()`/
+`set_background_color()`/`set_text_color()`/`set_home_layout()` call takes
+full effect without the player being killed and relaunched. Purely
+additive, no breaking changes bundled into this window. A plugin that only
+needs this one function can feature-detect it with
+`plugin.has_capability("ui.reload")` instead of bumping `api_min`.
+
+#### API version 6 changelog
+
+New in API 6: `plugin.refresh_theme()` -- applies theme assets and Home
+layout without tearing down screens, plugins, or live services. Feature-
+detect it with `plugin.has_capability("ui.theme_refresh")`.
+
+#### API version 7 changelog
+
+New in API 7: `plugin.register_home_tile()` (see its own doc section below)
+-- a plugin can add its own tile to Home, the same way
+`plugin.register_stream_media_tile()` already does for Stream Media. Paired
+with `plugin.set_home_layout()`'s new `options.order` (an ordered list of
+native-tile-keys/plugin-tile-ids controlling which tiles Home shows and in
+what position -- see its own doc section), a theme can now reorder any
+tile, drop a native one, or interleave a plugin-registered one among the
+native six, none of which was previously possible (Home was always exactly
+the 6 native tiles, always in a fixed order). Purely additive, no breaking
+changes bundled into this window. A plugin that only needs this can
+feature-detect it with `plugin.has_capability("ui.home_tiles")` instead of
+bumping `api_min`.
+
 <a id="plugin-ui"></a>
 
 ## 🖥️ Lists and Settings UI
@@ -349,6 +383,44 @@ instance -- see `plugins_examples/NetRadio.lua`).
 
 Errors if more than `PLUGIN_MAX_STREAM_TILES` (currently 5, across every
 loaded plugin combined) are registered.
+
+### `plugin.register_home_tile(id, label, on_open, icon)`
+
+Registers a tile a theme can place on Home via `set_home_layout()`'s
+`options.order` below -- naming this tile by `id` alongside any of the 6
+native keys. Registering alone doesn't show it anywhere; a theme (or your
+own plugin's own top-level code) still has to reference `id` in `order` for
+it to actually appear.
+
+- `id` (string): a stable name other code references this tile by. 1-39
+  characters, letters/digits/`.`/`_`/`-` only (same rule `plugin.define()`'s
+  own `id` uses) -- a home tile id can end up inside a `.theme` file's
+  comma-separated `home_order=` line (`plugins_examples/Themes.lua`), so a
+  comma or whitespace would parse incorrectly there. Must also not be one of
+  the 7 native keys (`"music"`, `"stream_media"`, `"wireless"`, `"books"`,
+  `"system"`, `"dac"`, `"subsonic"`) -- those always resolve to the real native tile
+  first, so a plugin tile registered under one would silently never be
+  reachable. Must be unique across every registered home tile, not just
+  your own plugin's -- two plugins picking the same id is an immediate Lua
+  error. Required, unlike `register_stream_media_tile()` above, since
+  Stream Media has no reordering concept and never needed a name to
+  reference a tile by.
+- `label` (string): shown as the tile's caption.
+- `on_open` (function): called with zero arguments when the tile is tapped.
+- `icon` (string): a theme2-relative asset path, non-empty, at most 79
+  characters. Unlike `register_stream_media_tile()`'s own optional `icon`
+  (which falls back to a small default), this is required -- Home's tiles
+  are large and deliberate, and there's no generic placeholder asset that
+  would look right at that size across every device/theme.
+
+Errors if more than `PLUGIN_MAX_HOME_TILES` (currently 6, across every
+loaded plugin combined) are registered, or if `id`/`icon` fails any of the
+checks above.
+
+A tile registered this way but never referenced by any `order` (or
+referenced by a theme that failed to load, or hasn't loaded yet -- see
+`set_home_layout()`'s own note on plugin load order) simply isn't shown --
+not an error.
 
 ### `plugin.set_icon(theme2_relative_path, source_file_path)`
 
@@ -425,24 +497,32 @@ Raises a Lua error if `slot` isn't `"primary"` or `"muted"`.
 
 ### `plugin.set_home_layout(tiles, options)`
 
-Restyles Home's 6 fixed tiles (`"music"`, `"stream_media"`, `"wireless"`,
-`"books"`, `"system"`, `"dac"`), and optionally switches Home from its
-native icon grid to a scrollable pill-list. Never adds or removes a tile --
-Home has no spare room for a plugin-added one (see
-`register_stream_media_tile()`'s own doc on why Stream Media has room and
-Home doesn't).
+Restyles Home's tiles, and optionally switches Home from its native icon
+grid to a scrollable pill-list. Since API 7, `options.order` (below) also
+controls which tiles Home actually shows and in what position -- a native
+tile left out of `order` isn't shown, and a `plugin.register_home_tile()`
+id included in it is. The native `"subsonic"` key is opt-in and opens
+Subsonic directly; omitting `order` preserves the original six-tile Home.
+Before API 7, Home was always exactly its 6 native
+tiles (`"music"`, `"stream_media"`, `"wireless"`, `"books"`, `"system"`,
+`"dac"`), always in that fixed order, and this call could only restyle them
+-- omitting `order` entirely still gets you exactly that.
 
-**Only takes effect on the next app start, and is never itself persisted.**
-Home is built once, at startup, and never rebuilt -- same constraint
-`set_icon()` already documents. This call only ever updates an in-memory
-config that `build_home_screen()` reads once; nothing here writes to disk.
-Calling it later, from inside a callback, is not an error, but its effect is
-purely local to that one still-running process -- restarting the app
-discards it completely, same as never having called it. To actually have a
-layout survive a restart, a plugin must persist its own chosen layout to its
-own state file (the same way `Themes.lua`/`HomeThemes.lua` persist a theme
-choice) and re-call `set_home_layout()` with it from top-level script code
-on every boot -- there is no native persistence to lean on here.
+**Never itself persisted, and only takes effect the next time Home is
+actually built** -- a real app start, `plugin.refresh_theme()`, or the
+legacy full `plugin.reload_ui()`. This call only updates an in-memory config that
+`build_home_screen()` reads at that build time; nothing here writes to disk.
+Calling it from inside a callback with no reload/restart following is not an
+error, but has no visible effect until one of those two things actually
+rebuilds Home -- and if nothing ever re-calls this again before that
+happens, the NEXT rebuild reverts to native, same as never having called it
+at all (there is no native persistence to lean on here). To have a layout
+survive a restart or a reload, a plugin must persist its own chosen layout
+to its own state file (the same way `Themes.lua` persists a theme choice)
+and re-call `set_home_layout()` with it from top-level script code every
+time -- see `plugins_examples/Themes.lua`'s own `tile.<key>.<field>=...`
+`.theme` file format for a complete reference implementation of exactly
+this pattern.
 
 **Multiple plugins calling this both restyle the same single global Home
 layout -- there's no per-plugin slot.** Whichever plugin's call runs last
@@ -457,7 +537,7 @@ exclusive by design, same as two theme-color plugins both calling
 
 ```lua
 {
-    key = "music",         -- required: "music", "stream_media", "wireless", "books", "system", or "dac"
+    key = "music",         -- required: music/stream_media/wireless/books/system/dac/subsonic, or a plugin tile id
     bg_color = 0xRRGGBB,   -- optional
     text_color = 0xRRGGBB, -- optional
     radius = 12,           -- optional, px
@@ -472,14 +552,20 @@ exclusive by design, same as two theme-color plugins both calling
 ```
 
 A tile whose key is never mentioned keeps every field at its native
-default. An unrecognized `key`, `align`, or `text_size`, a non-table array
-entry, more than 6 entries (there are only ever 6 valid keys, so this can
-only mean a mistake -- unlike `show_list()`'s own item cap, this is not
-silently truncated), or a `height`/`width`/`radius` outside a 32-bit
-integer's range, all raise a Lua error immediately. A repeated `key` within
-the same `tiles` array cleanly replaces the earlier entry for that tile
-(every field, not just the ones the later entry sets) rather than merging
-the two. `radius` must also be non-negative.
+default. Unlike before API 7, an unrecognized-looking `key` is NOT rejected
+here -- it may name a plugin tile that simply hasn't registered yet (see
+"How Plugins Load" above for load order), so it's resolved later, when Home
+is actually built; a key that still doesn't resolve to anything at that
+point is silently dropped (not shown), not a crash. An `align` or
+`text_size` that isn't one of the values listed above, a non-table array
+entry, more entries than tiles could ever legitimately need (currently 12,
+across native and plugin tiles combined -- this can only mean a duplicate
+key or a copy-paste mistake, so unlike `show_list()`'s own item cap this is
+not silently truncated), or a `height`/`width`/`radius` outside a 32-bit
+integer's range, all still raise a Lua error immediately. A repeated `key`
+within the same `tiles` array cleanly replaces the earlier entry for that
+tile (every field, not just the ones the later entry sets) rather than
+merging the two. `radius` must also be non-negative.
 
 `options` (table, optional -- a non-table, non-nil value here is also a Lua
 error, since there's no reasonable non-table `options`):
@@ -489,23 +575,93 @@ error, since there's no reasonable non-table `options`):
     mode = "list",  -- "tile" (default, today's icon grid) or "list"
     tile_gap = 6,   -- tile mode only, px between tiles, clamped to 0-64
     row_gap = 10,   -- list mode only, px between rows, clamped to 0-84 (0 = the native default of 6)
+    order = { "dac", "music", "stream_media", "wireless", "books", "system" },
+                    -- optional (API 7+); which tiles Home shows, and in what
+                    -- position -- position IS order. Each entry is a native
+                    -- key or a plugin.register_home_tile() id (resolved the
+                    -- same deferred way `tiles`' own `key` is, above). A
+                    -- native key simply left out is not shown at all --
+                    -- this is how you drop a tile, not just reorder one.
+                    -- Omit `order` entirely to keep today's fixed native
+                    -- order and show all 6. A literal duplicate entry is
+                    -- rejected immediately (unlike an unresolved name, a
+                    -- repeat can't just be a load-order timing issue).
+                    -- In tile mode specifically, `order` is capped at 6 --
+                    -- build_icon_grid_screen()'s 2-column grid cannot
+                    -- scroll, so more than that would render with tiles
+                    -- unreachable off-screen; switch to list mode instead.
 }
 ```
 
 Each call to `set_home_layout()` replaces the whole stored config -- there
 is no incremental merge across separate calls, so pass every tile you want
-styled in the same call.
+styled (and the full `order` you want) in the same call.
 
 ```lua
 plugin.set_home_layout({
     { key = "music", bg_color = 0x1e3524, text_color = 0xd8c9a3, radius = 24,
       height = 92, width = 440, align = "center", accessory = true, text_size = "medium", icon = true },
     -- ... one entry per tile you want to restyle
-}, { mode = "list", row_gap = 10 })
+}, { mode = "list", row_gap = 10, order = { "music", "dac", "books" } })
 ```
 
-See `plugins_examples/HomeThemes.lua` for a complete reference implementation
-spanning both tile and list mode.
+See `plugins_examples/Themes.lua` and its `plugins_examples/Themes/*.theme`
+files for a complete reference implementation spanning both tile and list
+mode -- e.g. `Terminal.theme`/`GameBoy.theme` (list mode) and
+`Retro.theme`/`Vaporwave.theme` (tile mode).
+
+### `plugin.refresh_theme()`
+
+Applies already-written theme assets and the current Home layout after the
+calling callback returns. It drops LVGL's decoded-image cache, replaces only
+Home, and refreshes navigation/player/quick-drawer render caches. All other
+screens, plugin Lua states, navigation state, playback, and Wi-Fi/Bluetooth/
+AirPlay/DLNA/Remote Control connections remain alive.
+
+Use this after a batch of `set_icon()`, color, and `set_home_layout()` calls.
+Requests are deferred past active transitions and coalesced. The Themes
+example applies its full icon inventory during startup, ensuring existing
+screens already reference the override paths that this call refreshes.
+
+### `plugin.reload_ui()`
+
+Rebuilds every screen and style in the same process -- the same trick a
+`set_icon()`/`set_background_color()`/`set_text_color()`/`set_home_layout()`
+call would otherwise need a full player restart to take complete effect
+for (an already-decoded icon stays cached, and most screens are only ever
+built once). Never restarts the process, and never touches audio playback
+or any network/Bluetooth/D-Bus connection (Wi-Fi, Subsonic, DLNA, AirPlay,
+Remote Control) -- those stay exactly as they were before the call.
+
+Takes no arguments and returns nothing. Safe to call from any plugin
+callback, including your own settings-row `on_open`/`on_select` handler --
+the actual reload is deferred to run right after your callback returns, not
+inline, so it's never touching your plugin's own still-running script when
+it tears everything down.
+
+**Only call this from a callback that fires in response to an actual user
+action -- never unconditionally from your plugin's own top-level script
+code.** The reload re-runs every plugin's top-level code as part of
+rebuilding, same as a real boot. A guard prevents that from becoming an
+infinite loop (a request made while a reload is already running is dropped,
+not queued), but an unconditional top-level call still wastes one full
+reload the first time your plugin loads, for no reason -- calling this
+conditionally, only when something actually changed, is still the correct
+thing to do, the way the example below does (only inside the `on_select`
+callback, only when the user actually picked something).
+
+```lua
+plugin.register_list_item("display", "Theme", function()
+    plugin.show_list("Theme", { "Dark", "White" }, function(index)
+        apply_theme(index == 2 and "white" or "dark") -- your own set_icon()/set_background_color() calls
+        plugin.refresh_theme() -- targeted update; connections and navigation survive
+    end)
+end)
+```
+
+Navigation always lands back on Home after a reload, regardless of which
+screen was showing before -- there is no "return to where you were" state
+carried across it.
 
 ### `plugin.show_list(title, items, on_select [, options])`
 
@@ -636,8 +792,8 @@ layout fields. For `show_list()`, width and height live in the call-level
   `"mono"` is an 8x16 bitmap monospace font (`lv_font_unscii_16`) for a
   pixel/terminal look -- **ASCII-only**, no accented or non-Latin glyphs, so
   only reach for it when you control the text yourself and know it stays
-  plain ASCII (see `plugins_examples/HomeThemes.lua`'s Game Boy/Terminal
-  presets). An unrecognized value raises a Lua error; omitting it keeps that
+  plain ASCII (see `plugins_examples/Themes/GameBoy.theme`/`Terminal.theme`).
+  An unrecognized value raises a Lua error; omitting it keeps that
   row type's own existing default size.
 
 None of the three affect a row that doesn't set them -- a plugin that
@@ -1466,17 +1622,10 @@ comments are ignored, and URL-only lines are accepted. A ready-to-copy
 `plugins_examples/Radio.txt` is included. The plugin header covers the
 remaining live-stream limitations (MP3-only, no seeking or auto-reconnect).
 
-`plugins_examples/Themes.lua` is the reference implementation for
-`"display"` list items, `set_icon()`, `set_background_color()`, and
-`set_text_color()` together -- a Dark/White theme switcher reachable from
-Settings -> Display. It reskins icons app-wide by copying from the stock
-firmware's own `theme1`/`theme2` litegui asset packs (both present on every
-real R1 at `/usr/resource/litegui/`), persists the chosen theme in its own
-state file under `.plugins/` (re-applied at the top of the script on every
-boot, since that's how every plugin already survives a restart -- no native
-settings storage involved), and is a useful reference for the load-time-only
-constraint on `set_icon()` (backgrounds/text apply live; icons need a
-restart to fully catch up after switching mid-session).
+`plugins_examples/Themes.lua` is the reference implementation for the full
+theme API. It discovers `.theme` files, installs their icon sets, applies
+colors/Home layout, persists the selection, and uses `refresh_theme()` for
+live switching without disrupting navigation or services.
 
 `plugins_examples/SoundProfiles.lua` is the reference implementation for the
 EQ functions -- a handful of curated `.peq` presets reachable from

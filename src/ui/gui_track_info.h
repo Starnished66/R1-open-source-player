@@ -39,6 +39,10 @@ typedef struct {
 } gui_track_info_context_t;
 
 void gui_track_info_init(void);
+/* Deletes the Information screen and nulls the static it's guarded on, so
+ * gui_track_info_init() can rebuild it after gui_reload.c's in-process UI
+ * reload instead of silently no-opping. */
+void gui_track_info_teardown(void);
 lv_obj_t * gui_track_info_get_screen(void);
 void gui_track_info_set_current(const gui_track_info_context_t * context);
 void gui_track_info_open(void);

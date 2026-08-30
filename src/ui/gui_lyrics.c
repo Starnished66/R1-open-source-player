@@ -931,6 +931,18 @@ void gui_lyrics_init(void) {
     lyrics_font_size_screen = build_lyrics_font_size_screen();
 }
 
+/* For gui_reload.c's in-process UI reload -- deletes both screens this
+ * module owns so gui_lyrics_init() can rebuild them from a clean slate
+ * without leaking the old objects. */
+void gui_lyrics_teardown(void) {
+    /* Unguarded lv_timer_create() at this screen's own build site -- same
+     * leaked-old-timer hazard as gui_player_teardown()'s volume_popup_hide_
+     * timer, see its own comment. */
+    if (lyrics_timer) { lv_timer_del(lyrics_timer); lyrics_timer = NULL; }
+    if (lyrics_screen) { lv_obj_del(lyrics_screen); lyrics_screen = NULL; }
+    if (lyrics_font_size_screen) { lv_obj_del(lyrics_font_size_screen); lyrics_font_size_screen = NULL; }
+}
+
 lv_obj_t * gui_lyrics_get_screen(void) {
     return lyrics_screen;
 }

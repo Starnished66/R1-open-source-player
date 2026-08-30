@@ -1774,7 +1774,7 @@ static void dac_home_tile_cb(lv_event_t * e) {
  * validates a Lua `key` string against this same array rather than keeping
  * its own copy that could drift out of sync. */
 const char * const home_layout_tile_keys[HOME_LAYOUT_TILE_COUNT] = {
-    "music", "stream_media", "wireless", "books", "system", "dac",
+    "music", "stream_media", "wireless", "books", "system", "dac", "subsonic",
 };
 
 /* Native per-tile metadata, same fixed order as home_layout_tile_keys[]
@@ -1795,31 +1795,121 @@ static const home_native_tile_t home_native_tiles[HOME_LAYOUT_TILE_COUNT] = {
     { "launcher/book.png", "launcher/book_s.png", "Books", gui_books_home_tile_cb },
     { "launcher/sys_set.png", "launcher/sys_set_s.png", "System", system_tile_cb },
     { "launcher/dac.png", "launcher/dac_s.png", "DAC", dac_home_tile_cb },
+    { "stream_media/subsonic.png", "stream_media/subsonic_s.png", "Subsonic", subsonic_tile_cb },
 };
 
+/* One resolved entry (native tile or plugin-registered tile), independent
+ * of tile-mode/list-mode -- resolve_home_tiles() below fills this once, and
+ * both build_home_screen() branches read from it, so the native-vs-plugin
+ * resolution and style-override lookup are each written exactly once. */
+typedef struct {
+    const char * icon_asset;
+    const char * icon_asset_selected;
+    const char * label;
+    lv_event_cb_t on_click;
+    void * user_data;
+    const home_tile_override_t * override; /* NULL = never restyled, every native default applies */
+} resolved_home_tile_t;
+
+static void plugin_home_tile_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_home_tile_clicked(index);
+}
+
+/* home_layout_config.tiles[]/tile_count is a flat, unordered list keyed by
+ * name (native key or plugin tile id) -- see home_layout.h's own comment.
+ * Returns NULL, not a zeroed override, when `key` was never restyled, so
+ * callers can tell "no override" apart from "an override that happens to
+ * leave everything at its default" -- in practice both resolve the same
+ * (every has_* false), so this distinction currently only matters for
+ * clarity, not behavior. */
+static const home_tile_override_t * find_home_tile_override(const char * key) {
+    for (int i = 0; i < home_layout_config.tile_count; i++) {
+        if (strcmp(home_layout_config.tiles[i].key, key) == 0) return &home_layout_config.tiles[i].override;
+    }
+    return NULL;
+}
+
+/* Resolves home_layout_config.order[] (or, when unconfigured, today's fixed
+ * 6-native-tile order) into `out`, which must have room for
+ * HOME_LAYOUT_MAX_TILES entries. Returns how many entries were actually
+ * filled -- can be less than the order length when an entry names neither a
+ * native key nor a currently-registered plugin tile id (that plugin failed
+ * to load, or hasn't loaded yet -- see set_home_layout()'s own comment on
+ * why this isn't rejected earlier, at Lua-call time); such an entry is
+ * skipped and logged here, not treated as an error. This is also why this
+ * resolution must happen here rather than in l_plugin_set_home_layout()
+ * itself -- this always runs after plugin_manager_init() has finished
+ * loading every plugin (gui_reload.c's own reload sequence runs plugin_
+ * manager_init() before rebuilding any screen), so a plugin tile referenced
+ * by an earlier-loading theme is reliably resolvable by the time Home is
+ * actually built. */
+static int resolve_home_tiles(resolved_home_tile_t * out) {
+    int n = home_layout_config.order_count > 0 ? home_layout_config.order_count : HOME_LAYOUT_DEFAULT_TILE_COUNT;
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        const char * key = home_layout_config.order_count > 0 ? home_layout_config.order[i] : home_layout_tile_keys[i];
+
+        int native_idx = -1;
+        for (int k = 0; k < HOME_LAYOUT_TILE_COUNT; k++) {
+            if (strcmp(key, home_layout_tile_keys[k]) == 0) { native_idx = k; break; }
+        }
+
+        resolved_home_tile_t * r = &out[count];
+        if (native_idx >= 0) {
+            const home_native_tile_t * native = &home_native_tiles[native_idx];
+            r->icon_asset = native->icon_asset;
+            r->icon_asset_selected = native->icon_asset_selected;
+            r->label = native->label;
+            r->on_click = native->on_click;
+            r->user_data = NULL;
+        } else {
+            int plugin_idx = plugin_manager_find_home_tile_by_id(key);
+            if (plugin_idx < 0) {
+                fprintf(stderr, "[home] order entry '%s' is not a native tile or a currently-registered "
+                                "plugin.register_home_tile() id -- skipping\n", key);
+                continue;
+            }
+            r->icon_asset = plugin_manager_get_home_tile_icon(plugin_idx);
+            r->icon_asset_selected = plugin_manager_get_home_tile_icon_selected(plugin_idx);
+            r->label = plugin_manager_get_home_tile_label(plugin_idx);
+            r->on_click = plugin_home_tile_click_cb;
+            r->user_data = (void *) (intptr_t) plugin_idx;
+        }
+        r->override = find_home_tile_override(key);
+        count++;
+    }
+    return count;
+}
+
 lv_obj_t * build_home_screen(void) {
+    static resolved_home_tile_t resolved[HOME_LAYOUT_MAX_TILES];
+    int count = resolve_home_tiles(resolved);
+    const home_tile_override_t zero_override = { 0 };
+
     /* plugin.set_home_layout()'s list-mode path -- a pill-list screen built
-     * from the same 6 native tiles/callbacks above instead of the icon
-     * grid, with each row's style pulled from home_layout_config.tiles[i].
-     * See home_layout.h's own comment for why this only ever reflects
-     * whatever was configured at THIS boot's plugin-load time, never a
-     * live mid-session change. */
+     * from the resolved tiles above instead of the icon grid, with each
+     * row's style pulled from its own override. See home_layout.h's own
+     * comment for why this only ever reflects whatever was configured at
+     * THIS boot's plugin-load time (or the most recent plugin.refresh_
+     * theme()/reload_ui()), never a live mid-session change outside that. */
     if (home_layout_config.configured && home_layout_config.list_mode) {
-        static pill_list_item_t items[HOME_LAYOUT_TILE_COUNT];
-        for (int i = 0; i < HOME_LAYOUT_TILE_COUNT; i++) {
-            const home_native_tile_t * native = &home_native_tiles[i];
-            const home_tile_override_t * ov = &home_layout_config.tiles[i];
+        static pill_list_item_t items[HOME_LAYOUT_MAX_TILES];
+        for (int i = 0; i < count; i++) {
+            const home_tile_override_t * ov = resolved[i].override ? resolved[i].override : &zero_override;
             /* asset_path_plain(), not asset_path() -- pill_row_apply_icon()
              * (screen_builders.c) expects a raw filesystem path with no "S:"
              * LVGL-driver prefix (it prepends that itself), exactly what
              * asset_path_plain() returns; asset_path() itself is already
              * "S:"-prefixed for direct lv_image_set_src() use and would
              * double up here. */
-            const char * icon_path = (ov->has_icon && ov->icon) ? asset_path_plain(native->icon_asset) : NULL;
+            const char * icon_path = (ov->has_icon && ov->icon) ? asset_path_plain(resolved[i].icon_asset) : NULL;
             items[i] = (pill_list_item_t){
-                .label = native->label,
+                .label = resolved[i].label,
                 .accessory = (ov->has_accessory && ov->accessory) ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
-                .on_click = native->on_click,
+                .on_click = resolved[i].on_click,
+                .user_data = resolved[i].user_data,
                 .icon_asset = icon_path,
                 .row_height = ov->height,
                 .row_width = ov->width,
@@ -1830,21 +1920,21 @@ lv_obj_t * build_home_screen(void) {
                 .text_align = ov->align[0] ? ov->align : NULL,
             };
         }
-        lv_obj_t * scr = build_pill_list_screen(NULL, NULL, items, HOME_LAYOUT_TILE_COUNT, gui_theme_accent_style(),
+        lv_obj_t * scr = build_pill_list_screen(NULL, NULL, items, count, gui_theme_accent_style(),
                                                  home_layout_config.row_gap > 0 ? home_layout_config.row_gap : 6);
         finalize_screen_navigation(scr);
         return scr;
     }
 
-    static icon_grid_item_t items[HOME_LAYOUT_TILE_COUNT];
-    for (int i = 0; i < HOME_LAYOUT_TILE_COUNT; i++) {
-        const home_native_tile_t * native = &home_native_tiles[i];
-        const home_tile_override_t * ov = &home_layout_config.tiles[i];
+    static icon_grid_item_t items[HOME_LAYOUT_MAX_TILES];
+    for (int i = 0; i < count; i++) {
+        const home_tile_override_t * ov = resolved[i].override ? resolved[i].override : &zero_override;
         items[i] = (icon_grid_item_t){
-            .icon_asset = native->icon_asset,
-            .icon_asset_selected = native->icon_asset_selected,
-            .label = native->label,
-            .on_click = native->on_click,
+            .icon_asset = resolved[i].icon_asset,
+            .icon_asset_selected = resolved[i].icon_asset_selected,
+            .label = resolved[i].label,
+            .on_click = resolved[i].on_click,
+            .user_data = resolved[i].user_data,
             .has_bg_color = ov->has_bg_color, .bg_color = ov->bg_color,
             .has_text_color = ov->has_text_color, .text_color = ov->text_color,
             .has_radius = ov->has_radius, .radius = ov->radius,
@@ -1853,8 +1943,10 @@ lv_obj_t * build_home_screen(void) {
     /* No back_btn_cb -- this is the true root, nothing to go back to. No
      * title either -- matches the real stock launcher, which has no header
      * text above its icon grid. tile_gap stays 0 (today's exact flush-cell
-     * look) unless a plugin configured one. */
-    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, HOME_LAYOUT_TILE_COUNT, 100, false,
+     * look) unless a plugin configured one. l_plugin_set_home_layout()
+     * already rejects a tile-mode `order` past 6 entries, so `count` here
+     * never exceeds what build_icon_grid_screen()'s own row math expects. */
+    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, count, 100, false,
                                              home_layout_config.configured ? home_layout_config.tile_gap : 0);
     finalize_screen_navigation(scr);
     return scr;
@@ -2544,6 +2636,44 @@ void gui_settings_init(void) {
     build_eq_reset_popup();
     build_factory_reset_popup();
     build_hostname_reboot_popup();
+}
+
+/* For gui_reload.c's in-process UI reload -- deletes every screen this
+ * module owns so gui_settings_init() can rebuild them from a clean slate
+ * without leaking the old objects. Does NOT touch build_home_screen()'s
+ * result -- that's gui_shell.c's own static (home_screen), not this
+ * module's, even though build_home_screen() itself lives here. The four
+ * popup-and-backdrop pairs below are built directly on lv_layer_top() (see
+ * build_confirm_popup()'s own comment), not as children of any of these
+ * screens, so each needs its own explicit deletion. */
+void gui_settings_teardown(void) {
+    if (firmware_update_popup) { lv_obj_del(firmware_update_popup); firmware_update_popup = NULL; }
+    if (firmware_update_popup_backdrop) { lv_obj_del(firmware_update_popup_backdrop); firmware_update_popup_backdrop = NULL; }
+    if (eq_reset_popup) { lv_obj_del(eq_reset_popup); eq_reset_popup = NULL; }
+    if (eq_reset_popup_backdrop) { lv_obj_del(eq_reset_popup_backdrop); eq_reset_popup_backdrop = NULL; }
+    if (factory_reset_popup) { lv_obj_del(factory_reset_popup); factory_reset_popup = NULL; }
+    if (factory_reset_popup_backdrop) { lv_obj_del(factory_reset_popup_backdrop); factory_reset_popup_backdrop = NULL; }
+    if (hostname_reboot_popup) { lv_obj_del(hostname_reboot_popup); hostname_reboot_popup = NULL; }
+    if (hostname_reboot_popup_backdrop) { lv_obj_del(hostname_reboot_popup_backdrop); hostname_reboot_popup_backdrop = NULL; }
+
+    if (about_screen) { lv_obj_del(about_screen); about_screen = NULL; }
+    if (accent_color_screen) { lv_obj_del(accent_color_screen); accent_color_screen = NULL; }
+    if (custom_font_screen) { lv_obj_del(custom_font_screen); custom_font_screen = NULL; }
+    if (screen_timeout_screen) { lv_obj_del(screen_timeout_screen); screen_timeout_screen = NULL; }
+    if (startup_volume_screen) { lv_obj_del(startup_volume_screen); startup_volume_screen = NULL; }
+    if (sleep_timer_screen) { lv_obj_del(sleep_timer_screen); sleep_timer_screen = NULL; }
+    if (idle_shutdown_screen) { lv_obj_del(idle_shutdown_screen); idle_shutdown_screen = NULL; }
+    if (timezone_region_screen) { lv_obj_del(timezone_region_screen); timezone_region_screen = NULL; }
+    /* Lazily built by open_timezone_city_screen() -- NULL until the user has
+     * opened at least one region, same guard shape as every screen above. */
+    if (timezone_city_screen) { lv_obj_del(timezone_city_screen); timezone_city_screen = NULL; }
+    if (settings_playback_screen) { lv_obj_del(settings_playback_screen); settings_playback_screen = NULL; }
+    if (settings_display_screen) { lv_obj_del(settings_display_screen); settings_display_screen = NULL; }
+    if (settings_power_screen) { lv_obj_del(settings_power_screen); settings_power_screen = NULL; }
+    if (settings_system_screen) { lv_obj_del(settings_system_screen); settings_system_screen = NULL; }
+    if (settings_screen) { lv_obj_del(settings_screen); settings_screen = NULL; }
+    if (eq_screen) { lv_obj_del(eq_screen); eq_screen = NULL; }
+    if (eq_profiles_screen) { lv_obj_del(eq_profiles_screen); eq_profiles_screen = NULL; }
 }
 
 /* Externs for callbacks defined in gui.c */

@@ -266,6 +266,12 @@ static lv_draw_buf_t * get_static_snapshot(lv_obj_t * scr) {
 }
 
 void register_static_snapshot(int index, lv_obj_t * scr) {
+    /* Destroy any buffer from a prior registration of this slot first -- see
+     * gui_navigation_invalidate_font_snapshots()'s own destroy-before-
+     * overwrite pattern just below. Without this, re-registering the same
+     * slot (e.g. gui_navigation_init() running again after a UI reload)
+     * leaks the previous lv_draw_buf_t. */
+    if (static_snapshot_buf[index]) lv_draw_buf_destroy(static_snapshot_buf[index]);
     static_snapshot_screen[index] = scr;
     static_snapshot_buf[index] = snapshot_screen_base(scr);
 }
@@ -277,6 +283,7 @@ static void rebuild_font_snapshots_async_cb(void * unused) {
     for (int i = 0; i < STATIC_SNAPSHOT_SCREEN_COUNT; i++) {
         if (!static_snapshot_screen[i]) continue;
         screen_builders_refresh_font_geometry(static_snapshot_screen[i]);
+        if (static_snapshot_buf[i]) lv_draw_buf_destroy(static_snapshot_buf[i]);
         static_snapshot_buf[i] = snapshot_screen_base(static_snapshot_screen[i]);
     }
 }
@@ -292,6 +299,23 @@ void gui_navigation_invalidate_font_snapshots(void) {
     }
     player_transition_discard_cache();
     lv_async_call(rebuild_font_snapshots_async_cb, NULL);
+}
+
+static void rebuild_theme_snapshots_async_cb(void * unused) {
+    (void) unused;
+    for (int i = 0; i < STATIC_SNAPSHOT_SCREEN_COUNT; i++) {
+        if (static_snapshot_screen[i] && !static_snapshot_buf[i])
+            static_snapshot_buf[i] = snapshot_screen_base(static_snapshot_screen[i]);
+    }
+}
+
+void gui_navigation_invalidate_theme_snapshots(void) {
+    for (int i = 0; i < STATIC_SNAPSHOT_SCREEN_COUNT; i++) {
+        if (static_snapshot_buf[i]) lv_draw_buf_destroy(static_snapshot_buf[i]);
+        static_snapshot_buf[i] = NULL;
+    }
+    player_transition_discard_cache();
+    lv_async_call(rebuild_theme_snapshots_async_cb, NULL);
 }
 
 /* Player-screen transition-frame cache -- TRANSITION_PERFORMANCE_PLAN.md
@@ -1027,6 +1051,49 @@ void gui_navigation_init(void) {
 
 
 
+/* For gui_reload.c's in-process UI reload -- run BEFORE any module deletes
+ * its own screens, so nothing here is left pointing at an object that's
+ * about to be freed. Only resets gui_navigation.c's own state (the nav
+ * stack and its snapshot/transition-cache buffers); it does not, and must
+ * not, lv_obj_del() the screens themselves -- each screen is owned and
+ * freed by its own module's teardown function (gui_shell_teardown(),
+ * gui_network_teardown(), etc.), called separately by the reload
+ * orchestrator. gui_navigation_init() (called again after every screen is
+ * rebuilt) re-registers the snapshots and restores nav_stack/nav_depth to
+ * Home on its own -- no separate "restore navigation" step is needed. */
+void gui_navigation_teardown(void) {
+    for (int i = 0; i < NAV_STACK_MAX; i++) nav_stack[i] = NULL;
+    nav_depth = 0;
+    for (int i = 0; i < STATIC_SNAPSHOT_SCREEN_COUNT; i++) {
+        if (static_snapshot_buf[i]) lv_draw_buf_destroy(static_snapshot_buf[i]);
+        static_snapshot_buf[i] = NULL;
+        static_snapshot_screen[i] = NULL;
+    }
+    player_transition_discard_cache();
+}
+
+/* For gui_reload.c's in-process UI reload -- true while a COMMITTED slide
+ * transition (screen_transition_slide(), driven by nav_push()/nav_pop()) is
+ * still animating. Deliberately does NOT check this file's own player_
+ * swipe_candidate/player_swipe_tracking/player_swipe_ctx -- despite the
+ * name collision, those are dead in this file (never set true anywhere
+ * here; the real, live interactive-swipe/quick-drawer-drag state is
+ * gui_shell.c's own separate statics of the same name, cancelled directly
+ * via gui_shell_reset_drag_state() instead -- see gui_reload.c's own
+ * comment for why that needs to run BEFORE any screen is deleted, not via
+ * this defer-and-retry path).
+ *
+ * A committed transition's slide_transition_ctx_t is only reachable through
+ * its own lv_anim_t, with no direct cancel path from outside this file, so
+ * gui_navigation_teardown() does not attempt one. Simpler and just as
+ * correct for a reload (unlike a real navigation event, it has no "user is
+ * waiting on this specific transition" urgency): gui_reload_request()'s
+ * trigger checks this and defers a few milliseconds instead, until it
+ * settles on its own -- NAV_ANIM_TIME_MS is short. */
+bool gui_navigation_transition_in_progress(void) {
+    return slide_transition_active;
+}
+
 int gui_navigation_get_depth(void) {
     return nav_depth;
 }
@@ -1058,6 +1125,14 @@ void gui_navigation_replace_top(lv_obj_t * new_screen) {
     if (nav_depth > 0) {
         nav_stack[nav_depth - 1] = new_screen;
     }
+}
+
+void gui_navigation_replace_home(lv_obj_t * old_screen, lv_obj_t * new_screen) {
+    for (int i = 0; i < nav_depth; i++) {
+        if (nav_stack[i] == old_screen) nav_stack[i] = new_screen;
+    }
+    register_static_snapshot(0, new_screen);
+    if (lv_screen_active() == old_screen) lv_screen_load(new_screen);
 }
 
 void gui_navigation_pop_to_depth(int target_depth) {

@@ -4,6 +4,9 @@
 #include "lvgl/lvgl.h"
 
 void gui_lyrics_init(void);
+/* Deletes both screens this module owns so gui_reload.c's in-process UI
+ * reload can call gui_lyrics_init() again from a clean slate. */
+void gui_lyrics_teardown(void);
 lv_obj_t * gui_lyrics_get_screen(void);
 lv_obj_t * gui_lyrics_get_font_size_screen(void);
 

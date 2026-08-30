@@ -1,5 +1,6 @@
 #include "plugin_manager.h"
 #include "gui.h"
+#include "gui_reload.h"
 #include "peq.h"
 #include "http_client.h"
 #include "playlist_files.h"
@@ -13,6 +14,7 @@
 #include "lualib.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
@@ -58,6 +60,9 @@
 typedef struct {
     lua_State * L;
     int open_ref; /* LUA_REGISTRYINDEX ref to the on_open function */
+    char id[40];  /* only set/used for plugin_home_tiles[] -- empty for plugin_stream_tiles[],
+                     which has no reordering concept and so never needs a stable name to
+                     reference; home_layout_config.order[]/tiles[] key lookups need one. */
     char label[64];
     char icon[96];
     char icon_selected[96];
@@ -197,6 +202,13 @@ static int plugin_system_list_item_count = 0;
 static plugin_tile_t plugin_stream_tiles[PLUGIN_MAX_STREAM_TILES];
 static int plugin_stream_tile_count = 0;
 
+/* Separate registry for plugin.register_home_tile() -- same plugin_tile_t
+ * shape (its id field is what's actually used here), different surface
+ * (gui_settings.c's build_home_screen(), via home_layout_config.order[]/
+ * tiles[] naming a tile by this id). */
+static plugin_tile_t plugin_home_tiles[PLUGIN_MAX_HOME_TILES];
+static int plugin_home_tile_count = 0;
+
 /* Each reusable plugin.show_list() screen owns its on_select callback. This
  * matters after Back returns from a nested list: the older screen must route
  * through its original callback, not whichever list was opened most recently. */
@@ -323,10 +335,9 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *   plugin.set_icon(theme2_relative_path, source_file_path)
  *     Reskins an EXISTING tile's icon in place (e.g. "launcher/book.png"
  *     for Home's Books tile) by copying source_file_path's bytes into the
- *     app's writable theme-override directory. Must be called from a
- *     plugin's own top-level script code (i.e. during load) -- see
- *     l_plugin_set_icon()'s own comment for why a later, mid-session call
- *     silently won't update an already-shown icon.
+ *     app's writable theme-override directory. Top-level calls take effect
+ *     during startup; a callback can call plugin.refresh_theme() after its
+ *     copies to refresh decoded images safely.
  *
  *   plugin.set_background_color(slot, rgb)
  *     Sets one of three background-color slots app-wide, live, no restart
@@ -344,11 +355,36 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *     Restyles Home's 6 fixed tiles (color/radius/size/alignment/icon), and
  *     optionally switches Home from its native icon grid to a scrollable
  *     pill-list -- see l_plugin_set_home_layout()'s own comment for the full
- *     `tiles`/`options` shape. Same "load-time only" constraint as
- *     plugin.set_icon() above: this call never writes anything to disk, so
- *     it only has any effect at all on the NEXT app start, and only if the
- *     plugin itself persisted its choice and re-calls this from top-level
- *     script code next boot -- see PLUGINS.md.
+ *     `tiles`/`options` shape. It takes effect at startup or after
+ *     plugin.refresh_theme(); persistence remains the plugin's job.
+ *
+ *   plugin.refresh_theme()
+ *     Drops decoded image caches, rebuilds Home, and refreshes transition
+ *     snapshots after the callback returns. Other screens, plugins, and
+ *     connection-owning services stay alive.
+ *
+ *   plugin.reload_ui()
+ *     Rebuilds every screen/style in the same process -- see gui_reload.h/.c
+ *     for the exact scope. This is what actually removes the "next app
+ *     start only" constraint plugin.set_icon()/set_home_layout() above
+ *     otherwise carry -- call it after one of those and the change is
+ *     visible immediately with no restart. Never touches audio playback or
+ *     any network/Bluetooth/D-Bus connection.
+ *
+ *     ONLY call this from a callback that fires in response to an actual
+ *     user action (e.g. an on_select handler when the user changes a
+ *     theme) -- NEVER unconditionally from a plugin's own top-level script
+ *     code. The reload re-runs every plugin's top-level code as part of
+ *     its own rebuild (plugin_manager_init(), same as a real boot); an
+ *     unconditional top-level call there is a request made WHILE that same
+ *     reload is still running, which gui_reload_request()'s reload_in_
+ *     progress guard (gui_reload.c) drops outright rather than queuing --
+ *     so this doesn't loop, but it does still cost one wasted extra reload
+ *     the very first time that plugin ever loads (real boot, or the next
+ *     reload after installing/updating it), for no reason. Calling this
+ *     conditionally, only when something actually changed, is still the
+ *     correct thing to do -- the guard exists to keep a mistake here cheap,
+ *     not to make the mistake free.
  *
  *   plugin.eq_load_profile(path) -> bool
  *     Loads and applies a .peq profile file (src/audio/peq.c's own
@@ -617,6 +653,94 @@ static int l_plugin_register_stream_media_tile(lua_State * L) {
     utf8_truncate_safe(t->label, label, sizeof(t->label));
     utf8_sanitize(t->label);
     fill_tile_icon(t, icon, "stream_media/radio.png", "stream_media/radio_s.png");
+    return 0;
+}
+
+/* Defined further down this file (duplicate-plugin-id checking); forward-
+ * declared here so l_plugin_register_home_tile() below can reuse the exact
+ * same id character-set rule rather than inventing a second one -- a home
+ * tile id rides inside a .theme file's comma-separated home_order= line
+ * (Themes.lua) the same way a plugin id never has to, so it specifically
+ * must not contain a comma or whitespace; letters/digits/'.'/'_'/'-' is
+ * already exactly that safe set. */
+static bool plugin_id_is_valid(const char * id);
+
+/* Registers a tile a theme can place on Home via set_home_layout()'s
+ * `options.order` (PLUGINS.md) -- unlike register_stream_media_tile()
+ * above, `icon` is required, not optional: Home's native tiles are all
+ * large, deliberate, custom icons (the launcher/ asset family), and there is no
+ * confirmed generic/placeholder theme2 asset suitable as a silent fallback
+ * for something shown at that same size and prominence (Stream Media's own
+ * default, stream_media/radio.png, is a small icon-grid tile, a much lower
+ * bar) -- rather than guess an asset path that might not exist on a given
+ * device/theme, this just requires the plugin to supply one.
+ *
+ * `id` must be unique across every registered home tile (not namespaced per
+ * plugin) -- home_layout_config.order[]/tiles[] key lookups are a flat
+ * linear scan by this string, so two plugins picking the same id would
+ * otherwise silently collide; rejected the same way l_plugin_define()
+ * rejects a duplicate plugin id. Also rejected: one of the native keys
+ * (home_layout_tile_keys[]) -- resolve_home_tiles() (gui_settings.c) checks
+ * native keys first, so a plugin tile registered under e.g. "music" would
+ * register successfully but never actually be reachable, permanently
+ * shadowed by the real Music tile. */
+static int l_plugin_register_home_tile(lua_State * L) {
+    const char * id = luaL_checkstring(L, 1);
+    const char * label = luaL_checkstring(L, 2);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+    const char * icon = luaL_checkstring(L, 4);
+
+    /* Length checked here, against the id BEFORE it's ever copied anywhere
+     * -- checking it only after truncating into plugin_tile_t's fixed-size
+     * id[] (as an earlier version of this function did) would let two
+     * different too-long ids that happen to share the same first 39
+     * characters both pass the duplicate check below (each compared in
+     * full against already-truncated stored ids) and then collide once
+     * both are truncated into storage. */
+    if (!plugin_id_is_valid(id) || strlen(id) >= sizeof(plugin_home_tiles[0].id)) {
+        return luaL_error(L, "plugin.register_home_tile: id must be 1-%zu characters using letters, digits, '.', '_' or '-'",
+                           sizeof(plugin_home_tiles[0].id) - 1);
+    }
+    for (int k = 0; k < HOME_LAYOUT_TILE_COUNT; k++) {
+        if (strcmp(id, home_layout_tile_keys[k]) == 0) {
+            return luaL_error(L, "plugin.register_home_tile: id '%s' is reserved for the native Home tile of "
+                               "the same name -- pick a different id", id);
+        }
+    }
+    if (plugin_manager_find_home_tile_by_id(id) >= 0) {
+        return luaL_error(L, "plugin.register_home_tile: id '%s' is already registered", id);
+    }
+    if (plugin_home_tile_count >= PLUGIN_MAX_HOME_TILES) {
+        return luaL_error(L, "too many home tiles registered (max %d)", PLUGIN_MAX_HOME_TILES);
+    }
+    if (icon[0] == '\0') {
+        return luaL_error(L, "plugin.register_home_tile: icon must not be empty");
+    }
+    /* fill_tile_icon()'s own internal scratch buffer for stripping the
+     * extension before deriving "_s.png" is a 80-byte `char base[80]` --
+     * smaller than t->icon's real 96-byte destination. An icon at or past
+     * that length would silently truncate inside fill_tile_icon() BEFORE
+     * the extension strip runs, so t->icon (never truncated, holds the
+     * full icon string up to 95 chars) and t->icon_selected (derived from
+     * the truncated, shorter base) would end up describing two unrelated
+     * files, not just a shorter pair. Reject here, before that mismatch
+     * can happen, rather than silently store two diverging paths. */
+    if (strlen(icon) >= 80) {
+        return luaL_error(L, "plugin.register_home_tile: icon path '%s' is too long (max 79 characters)", icon);
+    }
+
+    lua_pushvalue(L, 3);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    plugin_tile_t * t = &plugin_home_tiles[plugin_home_tile_count++];
+    t->L = L;
+    t->open_ref = ref;
+    snprintf(t->id, sizeof(t->id), "%s", id);
+    utf8_truncate_safe(t->label, label, sizeof(t->label));
+    utf8_sanitize(t->label);
+    fill_tile_icon(t, icon, "", ""); /* icon is required above (luaL_checkstring), so
+                                         fill_tile_icon()'s default-fallback branch is dead
+                                         code here -- these two are never actually read. */
     return 0;
 }
 
@@ -1139,13 +1263,17 @@ static int l_plugin_show_toast(lua_State * L) {
 }
 
 #ifndef HOST_BUILD
-/* Plain byte copy, same fread/fwrite-loop shape as metadata_db.c's own
- * migrate_old_db_if_needed() -- used here to copy a plugin-supplied
- * replacement icon into THEME_OVERRIDE_ROOT. */
+/* Atomic byte copy: readers see either the old complete icon or the new
+ * one, never a partially-written PNG. */
 static bool copy_file(const char * src_path, const char * dst_path) {
     FILE * in = fopen(src_path, "rb");
     if (!in) return false;
-    FILE * out = fopen(dst_path, "wb");
+    char tmp_path[640];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", dst_path, (long) getpid()) >= (int) sizeof(tmp_path)) {
+        fclose(in);
+        return false;
+    }
+    FILE * out = fopen(tmp_path, "wb");
     if (!out) {
         fclose(in);
         return false;
@@ -1162,9 +1290,10 @@ static bool copy_file(const char * src_path, const char * dst_path) {
     }
     ok = ok && !ferror(in);
     fclose(in);
-    fclose(out);
+    if (fclose(out) != 0) ok = false;
 
-    if (!ok) remove(dst_path);
+    if (ok) ok = rename(tmp_path, dst_path) == 0;
+    if (!ok) remove(tmp_path);
     return ok;
 }
 #endif
@@ -1180,17 +1309,9 @@ static bool copy_file(const char * src_path, const char * dst_path) {
  * resolution in the app (already how Subsonic's own non-stock icon works
  * today).
  *
- * Real constraint (confirmed by reading LVGL's own image decoder cache,
- * lv_image_decoder.c/lv_image_cache.c): LVGL caches decoded images keyed
- * by path *string*, not file content or mtime, and this codebase never
- * calls lv_image_cache_drop() anywhere. So this only works reliably when
- * called before the FIRST time relative_path is ever resolved+decoded
- * this boot -- i.e. from a plugin's top-level script code, since
- * plugin_manager_init() always runs before gui_init() builds any
- * icon-grid/pill-list screen. Calling this after the app has already
- * shown a tile using relative_path this session will silently NOT update
- * that already-decoded image. No mid-session swap support is attempted --
- * see PLUGINS.md. */
+ * LVGL caches decoded images by path, so callback-time batches must end
+ * with plugin.refresh_theme(). Startup calls need no refresh because
+ * plugin_manager_init() runs before the UI is built. */
 static int l_plugin_set_icon(lua_State * L) {
     const char * relative_path = luaL_checkstring(L, 1);
     const char * source_path = check_plugin_external_path(L, 2, "plugin.set_icon");
@@ -1333,13 +1454,10 @@ static int32_t check_int32_field(lua_State * L, lua_Integer value, const char * 
     return (int32_t) value;
 }
 
-/* Restyles Home's 6 fixed tiles (PLUGINS.md) -- never adds/removes one, Home
- * has no spare room for a plugin-added tile (see register_stream_media_tile()'s
- * own doc comment on why Stream Media has room and Home doesn't). This never
- * writes anything to disk -- see home_layout.h's own comment for exactly
- * what that means for a call made after boot, from inside a callback (not
- * an error, just has no lasting effect without the plugin's own persistence
- * and a top-level re-call next boot).
+/* Restyles Home's tiles and controls which ones are shown, and in what
+ * order (PLUGINS.md). This never writes anything to disk; persistence
+ * requires a top-level re-call next boot. plugin.refresh_theme() applies a
+ * callback-time change immediately.
  *
  * Every plugin restyles the SAME single global layout -- there is no
  * per-plugin slot, so if two installed plugins both call this, whichever
@@ -1347,24 +1465,41 @@ static int32_t check_int32_field(lua_State * L, lua_Integer value, const char * 
  * alphabetical-by-filename load order) completely replaces the earlier
  * one's config, not merged.
  *
- * `tiles`: array of tables, one per tile being restyled -- { key = "music"|
- * "stream_media"|"wireless"|"books"|"system"|"dac", bg_color, text_color,
- * radius, height, width, align, accessory, text_size, icon }. A tile key
- * never mentioned keeps every field at its native default; a REPEATED key
- * within this same array cleanly replaces the earlier entry for that tile
- * (via the memset() below) rather than merging the two. height/width are
+ * `tiles`: array of tables, one per tile being restyled -- { key, bg_color,
+ * text_color, radius, height, width, align, accessory, text_size, icon }.
+ * `key` is one of the native names ("music"/"stream_media"/"wireless"/
+ * "books"/"system"/"dac"/"subsonic") or a plugin.register_home_tile() id -- unlike
+ * before API 7, an unrecognized-looking key is NOT rejected here: it may
+ * name a plugin tile that hasn't registered yet (plugin_manager_init()
+ * loads plugins in filename order, so a theme plugin can run before the
+ * plugin providing a tile it references), so resolution against both the
+ * native keys and the live plugin-tile registry happens later, in
+ * build_home_screen(), which always runs after every plugin has finished
+ * loading. A tile key never mentioned keeps every field at its native
+ * default; a REPEATED key within this same array cleanly replaces the
+ * earlier entry for that tile rather than merging the two. height/width are
  * passed through unclamped (same as register_list_item()'s own options) --
  * build_pill_list_screen() clamps them to PILL_ROW_HEIGHT_MIN/MAX and
  * PILL_ROW_WIDTH_MIN/MAX itself when list mode actually renders them.
  *
- * `options` (optional): { mode = "tile"|"list", tile_gap, row_gap }. `mode`
- * defaults to "tile" (today's icon grid) if `options` or `mode` is omitted.
- * `tile_gap`/`row_gap` are passed through unclamped here too -- clamped to
- * 0-64/0-84 respectively in build_icon_grid_screen()/build_pill_list_screen()
- * (screen_builders.c), the same "clamp at the point of use" pattern
- * height/width above already follow, since tile_gap in particular feeds
- * directly into an available-space subtraction that goes wrong long before
- * any Lua-side integer range check would think to reject it. */
+ * `options` (optional): { mode = "tile"|"list", tile_gap, row_gap, order }.
+ * `mode` defaults to "tile" (today's icon grid) if `options` or `mode` is
+ * omitted. `tile_gap`/`row_gap` are passed through unclamped here too --
+ * clamped to 0-64/0-84 respectively in build_icon_grid_screen()/build_pill_
+ * list_screen() (screen_builders.c), the same "clamp at the point of use"
+ * pattern height/width above already follow, since tile_gap in particular
+ * feeds directly into an available-space subtraction that goes wrong long
+ * before any Lua-side integer range check would think to reject it.
+ *
+ * `order` (optional array of strings): which tiles Home shows and in what
+ * position -- position IS order. Each entry is a native key or a plugin
+ * tile id, same "resolved later" deferral as `tiles`' own `key` above.
+ * Omitted entirely (order left empty) means "unconfigured", falling back to
+ * today's exact fixed 6-native-tile order. A native key simply not
+ * mentioned in `order` is not shown at all -- this is how a theme drops a
+ * tile, not just reorders one. Duplicate entries are rejected immediately
+ * (unlike unresolved-key names, a literal repeat is unambiguously a
+ * mistake, not a load-order timing issue). */
 static int l_plugin_set_home_layout(lua_State * L) {
     luaL_checktype(L, 1, LUA_TTABLE);
 
@@ -1372,17 +1507,14 @@ static int l_plugin_set_home_layout(lua_State * L) {
     memset(&config, 0, sizeof(config));
     config.configured = true;
 
-    /* Unlike show_list()/show_settings_list()'s own item caps (a browsing
-     * list can legitimately have hundreds of entries, so silently dropping
-     * the excess past a generous round-number cap is the right default),
-     * there are only ever 6 valid keys here -- a `tiles` array longer than
-     * that cannot legitimately arise from real use, only from a duplicate
-     * key or a copy-paste mistake, so this fails loudly instead of quietly
-     * truncating to 6. */
+    /* A `tiles` array longer than the max any theme could ever legitimately
+     * need cannot arise from real use, only from a duplicate key or a
+     * copy-paste mistake, so this fails loudly instead of quietly
+     * truncating. */
     lua_Unsigned raw_n = lua_rawlen(L, 1);
-    if (raw_n > (lua_Unsigned) HOME_LAYOUT_TILE_COUNT) {
-        return luaL_error(L, "plugin.set_home_layout: tiles has %lld entries, but only %d tiles exist",
-                           (long long) raw_n, HOME_LAYOUT_TILE_COUNT);
+    if (raw_n > (lua_Unsigned) HOME_LAYOUT_MAX_TILES) {
+        return luaL_error(L, "plugin.set_home_layout: tiles has %lld entries, more than the %d-tile limit",
+                           (long long) raw_n, HOME_LAYOUT_MAX_TILES);
     }
     int n = (int) raw_n;
     for (int i = 0; i < n; i++) {
@@ -1393,25 +1525,34 @@ static int l_plugin_set_home_layout(lua_State * L) {
 
         lua_getfield(L, -1, "key");
         const char * key = lua_tostring(L, -1);
-        int idx = -1;
-        if (key) {
-            for (int k = 0; k < HOME_LAYOUT_TILE_COUNT; k++) {
-                if (strcmp(key, home_layout_tile_keys[k]) == 0) { idx = k; break; }
-            }
+        if (!key || key[0] == '\0') {
+            return luaL_error(L, "plugin.set_home_layout: tile %d has a missing or empty key", i + 1);
         }
-        if (idx < 0) {
-            return luaL_error(L, "plugin.set_home_layout: tile %d has an unknown or missing key '%s' "
-                               "(expected \"music\", \"stream_media\", \"wireless\", \"books\", \"system\", or \"dac\")",
-                               i + 1, key ? key : "nil");
+        if (strlen(key) >= sizeof(config.tiles[0].key)) {
+            return luaL_error(L, "plugin.set_home_layout: tile %d's key '%s' is too long", i + 1, key);
         }
+        char key_copy[sizeof(config.tiles[0].key)];
+        snprintf(key_copy, sizeof(key_copy), "%s", key);
         lua_pop(L, 1); /* key string */
 
-        home_tile_override_t * ov = &config.tiles[idx];
         /* A repeated key within one call cleanly replaces the earlier entry
-         * rather than merging fields across the two -- without this reset, a
+         * rather than merging fields across the two -- without this, a
          * second { key = "music", text_color = ... } entry would keep
          * whatever an earlier { key = "music", bg_color = ... } entry set,
          * silently combining two calls' worth of fields into one tile. */
+        int idx = -1;
+        for (int t = 0; t < config.tile_count; t++) {
+            if (strcmp(config.tiles[t].key, key_copy) == 0) { idx = t; break; }
+        }
+        if (idx < 0) {
+            if (config.tile_count >= HOME_LAYOUT_MAX_TILES) {
+                return luaL_error(L, "plugin.set_home_layout: too many distinct tile keys (max %d)",
+                                   HOME_LAYOUT_MAX_TILES);
+            }
+            idx = config.tile_count++;
+            snprintf(config.tiles[idx].key, sizeof(config.tiles[idx].key), "%s", key_copy);
+        }
+        home_tile_override_t * ov = &config.tiles[idx].override;
         memset(ov, 0, sizeof(*ov));
         int row_idx = lua_gettop(L); /* the tile table itself, still on the stack */
 
@@ -1497,9 +1638,89 @@ static int l_plugin_set_home_layout(lua_State * L) {
         lua_getfield(L, 2, "row_gap");
         config.row_gap = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "row_gap");
         lua_pop(L, 1);
+
+        lua_getfield(L, 2, "order");
+        if (!lua_isnil(L, -1)) {
+            if (!lua_istable(L, -1)) {
+                return luaL_error(L, "plugin.set_home_layout: options.order must be an array table");
+            }
+            lua_Unsigned order_n = lua_rawlen(L, -1);
+            if (order_n > (lua_Unsigned) HOME_LAYOUT_MAX_TILES) {
+                return luaL_error(L, "plugin.set_home_layout: options.order has %lld entries, more than the %d-tile limit",
+                                   (long long) order_n, HOME_LAYOUT_MAX_TILES);
+            }
+            int order_idx = lua_gettop(L); /* the order table itself, still on the stack */
+            int order_n_int = (int) order_n;
+            for (int i = 0; i < order_n_int; i++) {
+                lua_rawgeti(L, order_idx, i + 1);
+                const char * entry = lua_tostring(L, -1);
+                if (!entry || entry[0] == '\0') {
+                    return luaL_error(L, "plugin.set_home_layout: options.order entry %d must be a non-empty string",
+                                       i + 1);
+                }
+                if (strlen(entry) >= sizeof(config.order[0])) {
+                    return luaL_error(L, "plugin.set_home_layout: options.order entry %d ('%s') is too long",
+                                       i + 1, entry);
+                }
+                /* Unlike an unresolved-key name (which may just not have
+                 * registered yet, see this function's own doc comment), a
+                 * literal duplicate within one `order` array is unambiguous
+                 * -- reject immediately rather than defer. */
+                for (int j = 0; j < i; j++) {
+                    if (strcmp(config.order[j], entry) == 0) {
+                        return luaL_error(L, "plugin.set_home_layout: options.order has a duplicate entry '%s'", entry);
+                    }
+                }
+                snprintf(config.order[i], sizeof(config.order[i]), "%s", entry);
+                lua_pop(L, 1); /* entry string */
+            }
+            config.order_count = order_n_int;
+        }
+        lua_pop(L, 1); /* order (nil or table) */
+
+        /* build_icon_grid_screen() (screen_builders.c) cannot scroll -- its
+         * vertical scroll-direction setting exists only to stop it from
+         * capturing the app-wide back-swipe gesture, not to provide real
+         * scrolling -- so a tile-mode order past 2 columns x 3 reference
+         * rows (ICON_GRID_REFERENCE_ROWS*2, screen_builders.c -- duplicated
+         * here as a literal since that constant isn't exposed via a header)
+         * would render with tiles silently unreachable off-screen. Fail
+         * loud here instead, matching this function's own tiles-array-
+         * length rejection above and register_stream_media_tile()'s own
+         * cap rejection. */
+        if (!config.list_mode && config.order_count > 6) {
+            return luaL_error(L, "plugin.set_home_layout: tile mode supports at most 6 tiles (got %d in "
+                               "options.order) -- use { mode = \"list\" } for more", config.order_count);
+        }
     }
 
     gui_plugin_set_home_layout(&config);
+    return 0;
+}
+
+/* plugin.reload_ui() -- rebuilds every screen/style in the same process
+ * (see gui_reload.h/.c) so a plugin.set_icon()/set_background_color()/
+ * set_text_color()/set_home_layout() call takes full effect without
+ * needing the player killed and relaunched. Never touches audio playback
+ * or any network/Bluetooth/D-Bus connection -- see gui_reload.c's own top
+ * comment for the exact scope.
+ *
+ * Deliberately does NOT call gui_soft_reload() directly: this binding runs
+ * via plugin_call() on the calling plugin's own lua_State, still live on
+ * the C stack inside lua_pcall() -- gui_soft_reload() closes every plugin's
+ * L, including this one, which would be undefined behavior if done while
+ * that same L is still executing. gui_reload_request() only schedules the
+ * real reload for the next main-loop pass, strictly after this call (and
+ * the whole plugin_call() it's part of) has returned. */
+static int l_plugin_reload_ui(lua_State * L) {
+    (void) L;
+    gui_reload_request();
+    return 0;
+}
+
+static int l_plugin_refresh_theme(lua_State * L) {
+    (void) L;
+    gui_theme_refresh_request();
     return 0;
 }
 
@@ -2802,7 +3023,7 @@ static const char * const plugin_capabilities[] = {
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
     "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
-    "ui.home_layout"
+    "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -2984,6 +3205,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "get_app_info",              l_plugin_get_app_info },
     { "register_list_item",        l_plugin_register_list_item },
     { "register_stream_media_tile", l_plugin_register_stream_media_tile },
+    { "register_home_tile",        l_plugin_register_home_tile },
     { "show_list",                 l_plugin_show_list },
     { "show_settings_list",        l_plugin_show_settings_list },
     { "list_dir",                  l_plugin_list_dir },
@@ -3004,6 +3226,8 @@ static const luaL_Reg plugin_funcs[] = {
     { "set_background_color",      l_plugin_set_background_color },
     { "set_text_color",            l_plugin_set_text_color },
     { "set_home_layout",           l_plugin_set_home_layout },
+    { "refresh_theme",             l_plugin_refresh_theme },
+    { "reload_ui",                 l_plugin_reload_ui },
     { "eq_load_profile",           l_plugin_eq_load_profile },
     { "eq_save_profile",           l_plugin_eq_save_profile },
     { "eq_reset",                  l_plugin_eq_reset },
@@ -3450,6 +3674,151 @@ void plugin_manager_init(void) {
     free(names);
 }
 
+/* Forces every in-flight plugin.http_get_async()/download_file_async()
+ * request to finish before a UI reload closes the lua_State it belongs to
+ * -- see plugin_manager_deinit()'s own comment. http_cancel_token_cancel()
+ * is the same mechanism plugin.http_cancel() already uses to unwind a
+ * request early (shuts down the connection's fd so the worker thread wakes
+ * up and exits promptly rather than potentially blocking on I/O for the
+ * request's own timeout). Deliberately never invokes the Lua callback --
+ * plugin_manager_poll()'s own cancelled-request branch already skips it for
+ * the same reason (a cancelled request has nothing meaningful to report),
+ * and here the callback's L is about to be closed by the caller regardless. */
+void plugin_manager_cancel_all_async_http(void) {
+    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
+        plugin_async_http_t * req = &plugin_async_http[i];
+        if (!req->active) continue;
+        http_cancel_token_cancel(&req->cancel);
+        pthread_join(req->thread, NULL);
+        luaL_unref(req->L, LUA_REGISTRYINDEX, req->callback_ref);
+        free(req->response_body);
+        req->response_body = NULL;
+        req->response_body_size = 0;
+        req->active = false;
+        atomic_store(&req->done, false);
+        http_cancel_token_destroy(&req->cancel);
+        req->L = NULL;
+        req->callback_ref = LUA_NOREF;
+    }
+}
+
+/* Counterpart to plugin_manager_init(), for an in-process UI reload
+ * (gui_reload.c) that needs to re-run every plugin's top-level script
+ * against freshly rebuilt screens -- plugin_manager_init() alone is not
+ * safe to call a second time: it would append new plugin_instances[]
+ * entries after the existing ones (never resetting plugin_instance_count)
+ * and leak every previous lua_State, since nothing today ever lua_close()s
+ * one.
+ *
+ * Order matters: background work referencing a plugin's L (async HTTP
+ * threads, interval timers, a pending text-input dialog) must be drained
+ * BEFORE that L is closed, or the next tick of plugin_manager_poll()/
+ * gui_plugin_clear_interval()'s own timer callback/plugin_manager_text_
+ * input_submitted() touches freed memory. Every list-item/tile/list-
+ * callback/settings-row/event-subscriber registry below is safe to just
+ * zero AFTER its owning plugin's L is closed -- every ref in them
+ * (luaL_ref) lives inside that same L, so closing it already frees the
+ * ref; explicit luaL_unref first is only needed for leak-freedom within a
+ * state that stays alive, which doesn't apply once it's about to be closed.
+ *
+ * Resets home_layout_config (gui_plugins.c) back to its unconfigured zero
+ * state via gui_plugin_reset_home_layout() -- unlike the shared theme style
+ * objects below, home_layout_config is a config struct build_home_screen()
+ * only reads at the NEXT rebuild, not a live style property, and set_home_
+ * layout()'s own documented contract is that nothing re-calling it before
+ * that rebuild means it "reverts to native" (PLUGINS.md). Leaving it alone
+ * here would break that promise the moment the plugin that used to call it
+ * is removed, disabled, or fails to load on this particular reload --
+ * without this reset, build_home_screen() would keep applying the STALE
+ * config from whichever plugin set it last time, not revert. plugin.
+ * refresh_theme() never reaches this function at all (it doesn't run
+ * plugin_manager_deinit()/init()), so a targeted refresh is unaffected --
+ * it only ever rebuilds Home from whatever's already configured, live.
+ *
+ * Does NOT touch the shared theme style objects (screen_builders.c's
+ * style_theme_screen_bg/style_theme_card_bg/list_row_style/pill_row_bg_
+ * style/style_theme_text_primary/style_theme_text_muted) -- those are live
+ * style properties applied immediately by set_background_color()/set_text_
+ * color() (PLUGINS.md: "safe to call at any time... no file/cache
+ * involved"), with no analogous "reverts if nothing re-calls" contract to
+ * honor; a reloaded plugin's own top-level code re-applies them the same
+ * as at a normal boot, same as before this change. Also does not touch
+ * PLUGIN_THEME_OVERRIDE_ROOT on disk -- that is exactly the icon-override
+ * state a reload exists to re-read, not something to clear. */
+/* Temporary investigation instrumentation for the "applying Wavy crashed
+ * the device" report -- see gui_reload.c's own reload_diag() for the same
+ * pattern/reasoning. Separate file/function here (not reused across
+ * translation units) purely to avoid a header change for a diagnostic
+ * that's coming back out once this is root-caused. */
+static void deinit_diag(const char * step) {
+    int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    char line[224];
+    int len = snprintf(line, sizeof(line), "[pid=%ld] %s\n", (long) getpid(), step);
+    if (len > 0) {
+        if (len >= (int) sizeof(line)) len = (int) sizeof(line) - 1;
+        write(fd, line, (size_t) len);
+        fsync(fd);
+    }
+    close(fd);
+}
+
+void plugin_manager_deinit(void) {
+    deinit_diag("plugin_manager_deinit: reset_home_layout before");
+    gui_plugin_reset_home_layout();
+    deinit_diag("plugin_manager_deinit: cancel_all_async_http before");
+    plugin_manager_cancel_all_async_http();
+    deinit_diag("plugin_manager_deinit: cancel_all_async_http after");
+
+    for (int i = 0; i < PLUGIN_MAX_INTERVALS; i++) {
+        if (!plugin_intervals[i].active) continue;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "plugin_manager_deinit: clearing interval slot %d before", i);
+        deinit_diag(msg);
+        luaL_unref(plugin_intervals[i].L, LUA_REGISTRYINDEX, plugin_intervals[i].ref);
+        plugin_intervals[i].active = false;
+        plugin_intervals[i].L = NULL;
+        gui_plugin_clear_interval(i); /* deletes the backing lv_timer_t -- see its own comment */
+    }
+
+    deinit_diag("plugin_manager_deinit: text_input_cancelled before");
+    plugin_manager_text_input_cancelled();
+
+    for (int i = 0; i < plugin_instance_count; i++) {
+        if (plugin_instances[i].L) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "plugin_manager_deinit: lua_close slot %d id='%s' name='%s' before", i,
+                     plugin_instances[i].id, plugin_instances[i].name);
+            deinit_diag(msg);
+            lua_close(plugin_instances[i].L);
+        }
+    }
+    deinit_diag("plugin_manager_deinit: all lua_close done, memset before");
+    memset(plugin_instances, 0, sizeof(plugin_instances));
+    plugin_instance_count = 0;
+
+    memset(plugin_books_list_items, 0, sizeof(plugin_books_list_items));
+    plugin_books_list_item_count = 0;
+    memset(plugin_settings_list_items, 0, sizeof(plugin_settings_list_items));
+    plugin_settings_list_item_count = 0;
+    memset(plugin_display_list_items, 0, sizeof(plugin_display_list_items));
+    plugin_display_list_item_count = 0;
+    memset(plugin_playback_list_items, 0, sizeof(plugin_playback_list_items));
+    plugin_playback_list_item_count = 0;
+    memset(plugin_power_list_items, 0, sizeof(plugin_power_list_items));
+    plugin_power_list_item_count = 0;
+    memset(plugin_system_list_items, 0, sizeof(plugin_system_list_items));
+    plugin_system_list_item_count = 0;
+    memset(plugin_stream_tiles, 0, sizeof(plugin_stream_tiles));
+    plugin_stream_tile_count = 0;
+    memset(plugin_home_tiles, 0, sizeof(plugin_home_tiles));
+    plugin_home_tile_count = 0;
+    memset(plugin_list_callbacks, 0, sizeof(plugin_list_callbacks));
+    memset(plugin_settings_list_rows, 0, sizeof(plugin_settings_list_rows));
+    memset(plugin_settings_list_row_counts, 0, sizeof(plugin_settings_list_row_counts));
+    memset(plugin_event_subscriber_count, 0, sizeof(plugin_event_subscriber_count));
+}
+
 void plugin_manager_poll(void) {
     for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
         plugin_async_http_t * req = &plugin_async_http[i];
@@ -3712,6 +4081,43 @@ const char * plugin_manager_get_stream_tile_icon_selected(int index) {
 void plugin_manager_stream_tile_clicked(int index) {
     if (index < 0 || index >= plugin_stream_tile_count) return;
     dispatch_tile_open(&plugin_stream_tiles[index]);
+}
+
+int plugin_manager_get_home_tile_count(void) {
+    return plugin_home_tile_count;
+}
+
+int plugin_manager_find_home_tile_by_id(const char * id) {
+    if (!id) return -1;
+    for (int i = 0; i < plugin_home_tile_count; i++) {
+        if (strcmp(plugin_home_tiles[i].id, id) == 0) return i;
+    }
+    return -1;
+}
+
+const char * plugin_manager_get_home_tile_id(int index) {
+    if (index < 0 || index >= plugin_home_tile_count) return "";
+    return plugin_home_tiles[index].id;
+}
+
+const char * plugin_manager_get_home_tile_label(int index) {
+    if (index < 0 || index >= plugin_home_tile_count) return "";
+    return plugin_home_tiles[index].label;
+}
+
+const char * plugin_manager_get_home_tile_icon(int index) {
+    if (index < 0 || index >= plugin_home_tile_count) return "";
+    return plugin_home_tiles[index].icon;
+}
+
+const char * plugin_manager_get_home_tile_icon_selected(int index) {
+    if (index < 0 || index >= plugin_home_tile_count) return "";
+    return plugin_home_tiles[index].icon_selected;
+}
+
+void plugin_manager_home_tile_clicked(int index) {
+    if (index < 0 || index >= plugin_home_tile_count) return;
+    dispatch_tile_open(&plugin_home_tiles[index]);
 }
 
 void plugin_manager_list_item_selected(int slot, int index) {

@@ -29,10 +29,15 @@ lv_obj_t * gui_navigation_get_screen_at(int index);
 bool gui_navigation_is_top(lv_obj_t * screen);
 void gui_navigation_remove_screen_instances(lv_obj_t ** screens, int count);
 void gui_navigation_replace_top(lv_obj_t * new_screen);
+void gui_navigation_replace_home(lv_obj_t * old_screen, lv_obj_t * new_screen);
 void gui_navigation_pop_to_depth(int target_depth);
 bool player_transition_cache_is_dirty(void);
 
 void gui_navigation_init(void);
+/* For gui_reload.c's in-process UI reload -- see its own comment. */
+void gui_navigation_teardown(void);
+/* For gui_reload.c's in-process UI reload -- see its own comment. */
+bool gui_navigation_transition_in_progress(void);
 void nav_push(lv_obj_t * scr);
 void nav_pop(void);
 void nav_remove_stack_slot(int index);
@@ -49,5 +54,6 @@ void player_transition_cache_async_cb(void * unused);
 void player_transition_mark_dirty(void);
 void register_static_snapshot(int index, lv_obj_t * scr);
 void gui_navigation_invalidate_font_snapshots(void);
+void gui_navigation_invalidate_theme_snapshots(void);
 
 void full_redraw_async_cb(void * unused);

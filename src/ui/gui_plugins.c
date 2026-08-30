@@ -298,9 +298,8 @@ void gui_plugin_set_text_color(const char * slot, uint32_t rgb) {
  * build_home_screen() reads this directly (extern via home_layout.h), same
  * "shared mutable state declared in the owning header, written here"
  * pattern this file already uses for list_row_style/style_theme_* above.
- * Unlike those, this is never touched by any live LVGL call -- Home is
- * built once at startup and never rebuilt, so there is nothing to redraw or
- * lv_obj_report_style_change() here. */
+ * Unlike those, storing the config never touches LVGL; plugin.refresh_theme()
+ * separately rebuilds Home after the calling Lua callback returns. */
 home_layout_config_t home_layout_config = { 0 };
 
 /* plugin_manager.c's l_plugin_set_home_layout() has already validated every
@@ -309,6 +308,11 @@ home_layout_config_t home_layout_config = { 0 };
  * comment for why a call made after boot only affects the NEXT app start. */
 void gui_plugin_set_home_layout(const home_layout_config_t * config) {
     home_layout_config = *config;
+}
+
+/* See gui.h's own comment. */
+void gui_plugin_reset_home_layout(void) {
+    home_layout_config = (home_layout_config_t) { 0 };
 }
 
 /* ---- Playback control bridges -- see gui.h's own comment on why these
@@ -700,6 +704,23 @@ void gui_plugins_init(void) {
     }
     for (int i = 0; i < PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE; i++) {
         plugin_settings_list_screens[i] = build_subsonic_list_screen("Plugin Settings", &plugin_settings_list_title_labels[i], &plugin_settings_list_lists[i]);
+    }
+}
+
+/* For gui_reload.c's in-process UI reload -- deletes every pool screen this
+ * module owns so gui_plugins_init() can rebuild them from a clean slate
+ * without leaking the old objects. Does not separately touch
+ * plugin_settings_list_slider_cards[][] -- those are children of their own
+ * plugin_settings_list_screens[] slot, freed along with it, and get
+ * repopulated the same way they normally are (a plugin's own show_settings_
+ * list() call) once plugin_manager_init() re-runs every plugin's top-level
+ * script in step 7 of gui_soft_reload(). */
+void gui_plugins_teardown(void) {
+    for (int i = 0; i < PLUGIN_LIST_SCREEN_POOL_SIZE; i++) {
+        if (plugin_list_screens[i]) { lv_obj_del(plugin_list_screens[i]); plugin_list_screens[i] = NULL; }
+    }
+    for (int i = 0; i < PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE; i++) {
+        if (plugin_settings_list_screens[i]) { lv_obj_del(plugin_settings_list_screens[i]); plugin_settings_list_screens[i] = NULL; }
     }
 }
 

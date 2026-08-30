@@ -81,6 +81,29 @@ int32_t ui_list_row_width_wide(void) {
 }
 
 void screen_builders_init_list_row_style(void) {
+    /* gui_reload.c's in-process UI reload calls this a second (or Nth) time
+     * in the same process -- LVGL's own lv_style_init() header comment warns
+     * against calling it on a style that already has properties ("Potential
+     * memory leak"): it just lv_memzero()s the struct without freeing the
+     * existing values_and_props allocation first, unlike lv_style_reset(),
+     * which frees it before zeroing. Skip the reset on this function's
+     * very-first-ever call (a freshly zero-initialized static lv_style_t has
+     * no allocation to free, and LV_USE_ASSERT_STYLE builds would otherwise
+     * trip lv_style_reset()'s own sentinel assert on it). */
+    static bool already_initialized = false;
+    if (already_initialized) {
+        lv_style_reset(&list_row_style);
+        lv_style_reset(&pill_row_bg_style);
+        lv_style_reset(&list_row_pressed_style);
+        lv_style_reset(&icon_press_style);
+        lv_style_reset(&row_marquee_style);
+        lv_style_reset(&style_theme_screen_bg);
+        lv_style_reset(&style_theme_card_bg);
+        lv_style_reset(&style_theme_text_primary);
+        lv_style_reset(&style_theme_text_muted);
+    }
+    already_initialized = true;
+
     lv_style_init(&list_row_style);
     lv_style_set_width(&list_row_style, LIST_ROW_WIDTH);
     lv_style_set_height(&list_row_style, LIST_ROW_HEIGHT);
@@ -888,6 +911,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
     lv_obj_set_style_pad_gap(list, row_gap, 0);
     lv_obj_set_style_pad_top(list, 4, 0);
 
+    int32_t content_h = item_count > 0 ? (item_count - 1) * row_gap : 0;
     for (int i = 0; i < item_count; i++) {
         const pill_list_item_t * item = &items[i];
 
@@ -913,6 +937,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
             if (width < PILL_ROW_WIDTH_MIN) width = PILL_ROW_WIDTH_MIN;
             if (width > PILL_ROW_WIDTH_MAX) width = PILL_ROW_WIDTH_MAX;
         }
+        content_h += height;
 
         lv_obj_t * row = lv_obj_create(list);
         lv_obj_set_size(row, width, height);
@@ -1021,6 +1046,15 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                 lv_obj_add_event_cb(row, item->on_click, LV_EVENT_CLICKED, item->user_data);
             }
         }
+    }
+
+    /* Headerless Home lists should occupy the screen as one balanced
+     * block. Keep START for oversized/plugin lists so their first row
+     * remains reachable by scrolling. */
+    int32_t list_h = lv_display_get_vertical_resolution(lv_display_get_default()) - header_h;
+    if (!title && !back_btn_cb && content_h <= list_h) {
+        lv_obj_set_style_pad_top(list, 0, 0);
+        lv_obj_set_flex_align(list, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     }
 
     return scr;

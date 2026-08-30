@@ -10,6 +10,9 @@ lv_obj_t * gui_network_get_bt_dac_overlay(void);
 lv_obj_t * gui_network_get_usb_dac_overlay(void);
 
 void gui_network_init(void);
+/* Deletes every screen/popup this module owns so gui_reload.c's in-process
+ * UI reload can call gui_network_init() again from a clean slate. */
+void gui_network_teardown(void);
 void gui_network_poll_airplay_overlay(void);
 void poll_wifi_connect(void);
 void poll_wifi_disconnect(void);

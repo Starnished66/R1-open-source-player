@@ -1565,6 +1565,20 @@ static lv_obj_t * build_stream_media_screen(void) {
     return scr;
 }
 
+/* build_stream_media_screen() is static to this file, so gui_reload.c's
+ * in-process UI reload (which needs to tear down and rebuild the same
+ * screen gui_init() below builds once at boot) goes through these two
+ * wrappers instead of calling it directly. */
+void gui_stream_media_teardown(void) {
+    if (stream_media_screen) {
+        lv_obj_del(stream_media_screen);
+        stream_media_screen = NULL;
+    }
+}
+
+void gui_stream_media_rebuild(void) {
+    stream_media_screen = build_stream_media_screen();
+}
 
 void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD

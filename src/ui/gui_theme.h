@@ -18,6 +18,9 @@ void gui_theme_register_accent_swatch(int index, lv_obj_t * swatch);
 
 
 void gui_theme_init(void);
+/* For gui_reload.c's in-process UI reload -- see its own comment in
+ * gui_theme.c for why this must never call fallback_font_init_early(). */
+void gui_theme_reload_styles(void);
 lv_style_t * gui_theme_accent_style(void);
 lv_style_t * gui_theme_muted_text_style(void);
 const lv_font_t * gui_theme_font(gui_font_role_t role);

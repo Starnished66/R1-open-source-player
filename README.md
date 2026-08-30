@@ -104,6 +104,7 @@ The intention isn't to recreate every quirk of the stock application. Where the 
   - Airsonic
   - Other compatible servers
   - HTTPS streaming with TLS
+  - Optional dedicated Subsonic tile directly on the Home screen
 - **Subsonic music downloading**
 - DLNA / UPnP-AV renderer
 - AirPlay support using the existing stock protocols where possible
@@ -156,6 +157,10 @@ The LAN remote-control interface provides a simple way to control the player fro
   - Korean Hangul
   - Thai
 - App-wide accent color theming
+- Full theme support via installable `.theme` files — app-wide colors, icon swapping (bulk or per-icon), and Home screen tile styling, all switchable live with no restart
+- Customizable Home screen: reorder, hide, or add tiles (including plugin-provided ones) and switch between the native icon grid or a scrollable list
+- Independently themeable Music, Stream Media, and Wireless screens (icon grid or list mode, per-row styling)
+- Manual or automatic clock, with 12-hour or 24-hour display
 - Focused Books section for plain-text reading and plugin-provided audiobook tools
 
 ## 🧩 Plugins
@@ -164,13 +169,17 @@ The LAN remote-control interface provides a simple way to control the player fro
 - Drop a `.lua` file in `.plugins/` on the SD card, it's picked up automatically
 - Versioned `plugin.*` API with capability discovery
 - Extension rows for Books and the Settings, Display, Playback, Power, and System screens
+- Extension tiles for Stream Media and, since API 7, Home itself
 - Custom row sizing, icons, text sizing, list screens, settings screens, and text input
+- Live UI reload — apply a plugin's icon, color, or Home/launcher layout changes immediately, without restarting the player or dropping active Bluetooth/Wi-Fi/Subsonic/DLNA/AirPlay/Remote Control connections
+- Reorder, drop, or add Home screen tiles from a plugin or theme, including plugins that register their own
 - Playback state/control/events, library access, synchronous and asynchronous HTTP, MD5, theming, and PEQ access
 - Audiobooks example with per-book/chapter progress, resume, bookmarks, and Continue Listening
 - File-configured Net Radio example that loads station names and URLs from `Radio.txt`
 - Play Through example for continuing through folders or albums
 - Extended Sleep Timer example with durations up to three hours
-- Last.fm scrobbling, themes, sound profiles, playback tools, asynchronous HTTP, and other API examples
+- Themes example with a dozen installable `.theme` presets covering colors, icons, and Home layout
+- Last.fm scrobbling, sound profiles, playback tools, asynchronous HTTP, and other API examples
 
 ---
 
@@ -179,8 +188,7 @@ The LAN remote-control interface provides a simple way to control the player fro
 The following features are planned or currently incomplete:
 
 - Song info.
-- Background image/color customization
-- Full theme support (Base is already done with a plugin interface)
+- Background image customization (color theming is already done via the plugin theme interface)
 - Additional community-requested features
 
 This list will evolve as development continues.
@@ -355,9 +363,11 @@ If you're modifying the code, debugging hardware behavior, or working on HiBy OS
 
 Third-party functionality can be added without recompiling the app, as plain Lua scripts — no toolchain, no C, no rebuild/reflash cycle.
 
-Drop a `.lua` file into `.plugins/` on the SD card and it's picked up automatically at startup. The versioned `plugin.*` API exposes native extension rows and list screens, configurable row layout, text input, themes, SD-card and library access, playback control/events, PEQ, cryptographic helpers, and synchronous or asynchronous HTTP.
+Drop a `.lua` file into `.plugins/` on the SD card and it's picked up automatically at startup. The versioned `plugin.*` API exposes native extension rows and list screens, configurable row layout, text input, theming, Home/launcher layout customization, SD-card and library access, playback control/events, PEQ, cryptographic helpers, and synchronous or asynchronous HTTP.
 
-An example **Audiobooks** plugin is included (`plugins_examples/Audiobooks.lua`) — a book-folder browser → chapter-list → playback plugin with per-book progress, automatic resume, bookmarks, and Continue Listening, reachable from **Books → Audiobooks**. Other examples include Last.fm scrobbling, file-configured network radio, Play Through folders/albums, a three-hour sleep timer, themes, sound profiles, asynchronous HTTP, playback extensions, and broader plugin-interface demonstrations.
+Theme, icon, and layout changes can be applied live — `plugin.reload_ui()` and the more targeted `plugin.refresh_theme()` rebuild the affected screens in place, with no restart and no interruption to playback or active Bluetooth/Wi-Fi/Subsonic/DLNA/AirPlay/Remote Control connections.
+
+An example **Audiobooks** plugin is included (`plugins_examples/Audiobooks.lua`) — a book-folder browser → chapter-list → playback plugin with per-book progress, automatic resume, bookmarks, and Continue Listening, reachable from **Books → Audiobooks**. An example **Themes** plugin (`plugins_examples/Themes.lua`) ships with a dozen installable `.theme` presets demonstrating app-wide colors, icon swapping, and full Home-layout control — reordering, hiding, and adding tiles. Other examples include Last.fm scrobbling, file-configured network radio, Play Through folders/albums, a three-hour sleep timer, sound profiles, asynchronous HTTP, playback extensions, and broader plugin-interface demonstrations.
 
 For the full `plugin.*` API reference and instructions on writing and testing your own plugin, see:
 

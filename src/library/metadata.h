@@ -106,9 +106,29 @@ void metadata_read(const char * path, track_metadata_t * out);
  * SIGKILLed if they don't finish within timeout_ms. Reaping is nonblocking:
  * a child stuck in uninterruptible SD I/O is remembered and retried by a
  * later scan call rather than allowing waitpid() to freeze the scanner --
- * see metadata.c. On timeout or child crash, *out is the same as
- * metadata_read()'s "couldn't read tags" case: zeroed, every has_* flag
- * false. picture_data/picture_size/lyrics always come back NULL/0. */
-void metadata_read_isolated(const char * path, track_metadata_t * out, int timeout_ms);
+ * see metadata.c. Returns true only when parsing completed. On timeout or
+ * child crash it returns false and *out is zeroed, allowing the scanner to
+ * preserve an older cached row instead of replacing it with placeholders.
+ * picture_data/picture_size/lyrics always come back NULL/0. */
+bool metadata_read_isolated(const char * path, track_metadata_t * out, int timeout_ms);
+
+typedef enum {
+    METADATA_ARTWORK_FOUND = 0,
+    METADATA_ARTWORK_NOT_FOUND,
+    METADATA_ARTWORK_TEMPORARY_FAILURE,
+    METADATA_ARTWORK_INVALID,
+} metadata_artwork_result_t;
+
+/* Full metadata read with embedded cover bytes, contained in a child
+ * process. Unlike metadata_read_isolated(), this intentionally transfers
+ * picture_data back to the caller (lyrics remain omitted). The result
+ * distinguishes a completed read with no picture from transient process,
+ * timeout, I/O, and allocation failures. Caller owns out->picture_data. */
+metadata_artwork_result_t metadata_read_artwork_isolated(const char * path,
+                                                         track_metadata_t * out,
+                                                         int timeout_ms);
+
+/* Internal subprocess entry point used by main() before player startup. */
+int metadata_artwork_helper_run(const char * path, int output_fd);
 
 #endif /* METADATA_H */

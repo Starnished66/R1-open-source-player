@@ -8,20 +8,52 @@ launch, initially misread as a crash in the app under test.
 
 ## Remaining real-device regression tests
 
+- [ ] **Network streams reject seeks without stopping:** play both a plain
+  radio URL and a remote/Subsonic track with a catalog duration. Tap and
+  drag the progress slider, trigger any available lyrics/remote-control seek,
+  and confirm playback continues from the live stream without reconnecting,
+  reporting a decoder error, or stopping. Repeat immediately after opening
+  the stream to cover the pre-format-publication race.
+
 - [ ] **Repeated progress-slider seeks across long tracks:** use at least
   three local, seekable songs longer than 30 minutes, preferably including
-  a format that takes noticeable time to open or build its seek index. Play
-  track 1 and tap the progress slider near the middle; immediately advance
-  to track 2 and repeat; immediately advance to track 3 and repeat. Confirm
+  a format that takes noticeable time to open or build its seek index. One
+  test file must be a 90+ minute local MP3 audiobook: seek repeatedly both
+  forward and backward, verify its first seek builds the bounded lazy index
+  without rebooting, and listen for the first-seek index-build pause: it must
+  remain acceptably short, contain no click/pop, and return with a smooth
+  fade-in. Verify later seeks on that same track complete promptly rather
+  than brute-force decoding from the beginning. Play
+  track 1 and tap the progress slider several times; immediately advance
+  to track 2 and repeat, continuing through at least five tracks. Confirm
   every seek lands in the selected track at approximately the requested
   percentage, including the third seek, and that playback never continues
   unchanged from the pre-seek position. Repeat the full sequence several
   times and include taps made immediately after each track change, while
-  its decoder may still be opening. Also confirm the slider may temporarily
+  its decoder may still be opening. Stress the exact reboot report by
+  alternating rapid skips with several progress-bar taps for multiple
+  minutes; confirm RSS stays bounded, the device does not reboot, and a
+  subsequent normal reboot does not loop while resuming the last track.
+  Also confirm the slider may temporarily
   resume normal polling after its UI wait timeout without canceling a slow
   underlying seek. Test more than one codec when suitable long files are
   available. This validates the playback-generation-bound percentage seek
-  introduced for the reported failure on 30+ minute tracks.
+  and the single-decoder, in-place seek path introduced for the reported
+  failure and memory-exhaustion reboot on 30+ minute tracks.
+
+- [ ] **Embedded-art thumbnail warm-up cost:** after clearing the generated
+  thumbnail cache, scan a library containing many albums whose artwork exists
+  only as embedded cover data. Compare the `ART_CACHE worker_end elapsed_ms`
+  and `ART_LAZY decode_end elapsed_ms` diagnostics with a sidecar-art library.
+  Confirm warm-up remains acceptably paced, playback suspends it, opening the
+  Albums screen remains responsive, and malformed artwork is contained rather
+  than rebooting the player. The warmer intentionally handles one representative
+  song per album, stops after 512 albums, and yields between albums.
+  Confirm a complete warm-up reaches `ART_CACHE worker_end`, only one
+  `--metadata-artwork-helper` exists at a time, and a deliberately timed-out
+  or killed helper retries after the temporary backoff instead of becoming a
+  permanent missing-cover entry. Run a rescan afterward and verify helper
+  failures cannot turn existing tags into Unknown Artist/Album rows.
 
 ## 1. Kill the stock player first, always -- BOTH processes, together
 

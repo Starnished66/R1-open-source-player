@@ -8,6 +8,7 @@
 
 #include "fallback_font.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <poll.h>
@@ -2071,46 +2072,63 @@ static bool isolated_needs_child(const char * path) {
  * by another subsystem. Once the set is full, new isolated reads fail
  * closed instead of creating an unbounded number of unreapable children. */
 #define METADATA_ABANDONED_CHILD_MAX 8
-static pthread_mutex_t abandoned_child_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pid_t abandoned_children[METADATA_ABANDONED_CHILD_MAX];
+typedef struct {
+    pthread_mutex_t mutex;
+    pid_t children[METADATA_ABANDONED_CHILD_MAX];
+    int capacity;
+    const char * label;
+} metadata_child_pool_t;
 
-static void reap_abandoned_metadata_children(void) {
-    pthread_mutex_lock(&abandoned_child_mutex);
-    for (int i = 0; i < METADATA_ABANDONED_CHILD_MAX; i++) {
-        pid_t pid = abandoned_children[i];
+static metadata_child_pool_t scan_child_pool = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .capacity = METADATA_ABANDONED_CHILD_MAX,
+    .label = "scan",
+};
+static metadata_child_pool_t artwork_child_pool = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .capacity = 2,
+    .label = "artwork",
+};
+static pthread_mutex_t artwork_isolation_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void reap_abandoned_metadata_children(metadata_child_pool_t * pool) {
+    pthread_mutex_lock(&pool->mutex);
+    for (int i = 0; i < pool->capacity; i++) {
+        pid_t pid = pool->children[i];
         if (pid <= 0) continue;
         int status = 0;
         pid_t r = waitpid(pid, &status, WNOHANG);
-        if (r == pid || (r < 0 && errno == ECHILD)) abandoned_children[i] = 0;
+        if (r == pid || (r < 0 && errno == ECHILD)) pool->children[i] = 0;
     }
-    pthread_mutex_unlock(&abandoned_child_mutex);
+    pthread_mutex_unlock(&pool->mutex);
 }
 
-static bool abandoned_metadata_child_capacity_available(void) {
+static bool abandoned_metadata_child_capacity_available(metadata_child_pool_t * pool) {
     bool available = false;
-    pthread_mutex_lock(&abandoned_child_mutex);
-    for (int i = 0; i < METADATA_ABANDONED_CHILD_MAX; i++) {
-        if (abandoned_children[i] == 0) {
+    pthread_mutex_lock(&pool->mutex);
+    for (int i = 0; i < pool->capacity; i++) {
+        if (pool->children[i] == 0) {
             available = true;
             break;
         }
     }
-    pthread_mutex_unlock(&abandoned_child_mutex);
+    pthread_mutex_unlock(&pool->mutex);
     return available;
 }
 
-static void remember_abandoned_metadata_child(pid_t pid) {
-    pthread_mutex_lock(&abandoned_child_mutex);
-    for (int i = 0; i < METADATA_ABANDONED_CHILD_MAX; i++) {
-        if (abandoned_children[i] == 0) {
-            abandoned_children[i] = pid;
+static void remember_abandoned_metadata_child(metadata_child_pool_t * pool, pid_t pid) {
+    pthread_mutex_lock(&pool->mutex);
+    for (int i = 0; i < pool->capacity; i++) {
+        if (pool->children[i] == 0) {
+            pool->children[i] = pid;
             pid = 0;
             break;
         }
     }
-    pthread_mutex_unlock(&abandoned_child_mutex);
+    pthread_mutex_unlock(&pool->mutex);
     if (pid > 0)
-        fprintf(stderr, "metadata scan: abandoned-child set full; pid %ld remains for init to reap\n", (long) pid);
+        fprintf(stderr, "metadata %s: abandoned-child set full; pid %ld remains for init to reap\n",
+                pool->label, (long) pid);
 }
 
 static void metadata_read_scan_tags(const char * path, track_metadata_t * out) {
@@ -2122,24 +2140,24 @@ static void metadata_read_scan_tags(const char * path, track_metadata_t * out) {
     out->lyrics = NULL;
 }
 
-void metadata_read_isolated(const char * path, track_metadata_t * out, int timeout_ms) {
+bool metadata_read_isolated(const char * path, track_metadata_t * out, int timeout_ms) {
     memset(out, 0, sizeof(*out));
-    if (!path || !path[0]) return;
+    if (!path || !path[0]) return false;
     if (!isolated_needs_child(path)) {
         metadata_read_scan_tags(path, out);
-        return;
+        return true;
     }
 
-    reap_abandoned_metadata_children();
-    if (!abandoned_metadata_child_capacity_available()) {
+    reap_abandoned_metadata_children(&scan_child_pool);
+    if (!abandoned_metadata_child_capacity_available(&scan_child_pool)) {
         fprintf(stderr, "metadata scan: too many unreaped parser children; skipping %s\n", path);
-        return;
+        return false;
     }
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         fprintf(stderr, "metadata scan: pipe failed for %s: %s\n", path, strerror(errno));
-        return;
+        return false;
     }
 
     pid_t pid = fork();
@@ -2147,7 +2165,7 @@ void metadata_read_isolated(const char * path, track_metadata_t * out, int timeo
         close(pipefd[0]);
         close(pipefd[1]);
         fprintf(stderr, "metadata scan: fork failed for %s: %s\n", path, strerror(errno));
-        return;
+        return false;
     }
 
     if (pid == 0) {
@@ -2200,9 +2218,172 @@ void metadata_read_isolated(const char * path, track_metadata_t * out, int timeo
      * this can't be a plain blocking waitpid() either. */
     for (int waited_ms = 0; waited_ms < 1000; waited_ms += 50) {
         int status = 0;
-        if (waitpid(pid, &status, WNOHANG) == pid) return;
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            if (ok && WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
+            memset(out, 0, sizeof(*out));
+            return false;
+        }
         usleep(50000);
     }
     kill(pid, SIGKILL);
-    remember_abandoned_metadata_child(pid);
+    remember_abandoned_metadata_child(&scan_child_pool, pid);
+    return ok;
+}
+
+static bool read_with_deadline(int fd, void * dst, size_t size,
+                               const struct timespec * start, int timeout_ms) {
+    size_t total = 0;
+    while (total < size) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t elapsed_ms = (int64_t) (now.tv_sec - start->tv_sec) * 1000 +
+                             (int64_t) (now.tv_nsec - start->tv_nsec) / 1000000;
+        int remaining_ms = timeout_ms - (int) elapsed_ms;
+        if (remaining_ms <= 0) return false;
+
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr;
+        do pr = poll(&pfd, 1, remaining_ms); while (pr < 0 && errno == EINTR);
+        if (pr <= 0) return false;
+        ssize_t n;
+        do n = read(fd, (char *) dst + total, size - total); while (n < 0 && errno == EINTR);
+        if (n <= 0) return false;
+        total += (size_t) n;
+    }
+    return true;
+}
+
+static bool write_all(int fd, const void * src, size_t size) {
+    size_t total = 0;
+    while (total < size) {
+        ssize_t n;
+        do n = write(fd, (const char *) src + total, size - total);
+        while (n < 0 && errno == EINTR);
+        if (n <= 0) return false;
+        total += (size_t) n;
+    }
+    return true;
+}
+
+int metadata_artwork_helper_run(const char * path, int output_fd) {
+    if (!path || !path[0] || output_fd < 0) return 1;
+
+    /* This process is disposable; under unexpected memory pressure the
+     * kernel should discard it instead of the interactive player. */
+    int oom_fd = open("/proc/self/oom_score_adj", O_WRONLY);
+    if (oom_fd >= 0) {
+        const char score[] = "500";
+        ssize_t ignored = write(oom_fd, score, sizeof(score) - 1);
+        (void) ignored;
+        close(oom_fd);
+    }
+
+    track_metadata_t result;
+    metadata_read(path, &result);
+    uint8_t * picture = result.picture_data;
+    uint32_t picture_size = result.picture_size;
+    char * lyrics = result.lyrics;
+    result.picture_data = NULL;
+    result.lyrics = NULL;
+
+    bool ok = write_all(output_fd, &result, sizeof(result));
+    if (ok && picture_size > 0)
+        ok = picture && write_all(output_fd, picture, picture_size);
+    free(picture);
+    free(lyrics);
+    close(output_fd);
+    return ok ? 0 : 1;
+}
+
+static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char * path,
+                                                                     track_metadata_t * out,
+                                                                     int timeout_ms) {
+    memset(out, 0, sizeof(*out));
+    if (!path || !path[0] || timeout_ms <= 0) return METADATA_ARTWORK_TEMPORARY_FAILURE;
+
+    reap_abandoned_metadata_children(&artwork_child_pool);
+    if (!abandoned_metadata_child_capacity_available(&artwork_child_pool))
+        return METADATA_ARTWORK_TEMPORARY_FAILURE;
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return METADATA_ARTWORK_TEMPORARY_FAILURE;
+    char output_fd_arg[24];
+    snprintf(output_fd_arg, sizeof(output_fd_arg), "%d", pipefd[1]);
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return METADATA_ARTWORK_TEMPORARY_FAILURE;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        char * const argv[] = {
+            (char *) "open_hiby_player",
+            (char *) "--metadata-artwork-helper",
+            output_fd_arg,
+            (char *) path,
+            NULL,
+        };
+        execv("/proc/self/exe", argv);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    track_metadata_t result;
+    bool ok = read_with_deadline(pipefd[0], &result, sizeof(result), &start, timeout_ms);
+    metadata_artwork_result_t outcome = METADATA_ARTWORK_TEMPORARY_FAILURE;
+    uint8_t * picture = NULL;
+    if (ok && result.picture_size > EMBEDDED_COVER_MAX_BYTES) {
+        outcome = METADATA_ARTWORK_INVALID;
+        ok = false;
+    }
+    if (ok && result.picture_size > 0) {
+        picture = malloc(result.picture_size);
+        ok = picture && read_with_deadline(pipefd[0], picture, result.picture_size, &start, timeout_ms);
+    }
+    close(pipefd[0]);
+
+    if (ok) {
+        result.picture_data = picture;
+        result.lyrics = NULL;
+        *out = result;
+        outcome = picture ? METADATA_ARTWORK_FOUND : METADATA_ARTWORK_NOT_FOUND;
+    } else {
+        free(picture);
+        kill(pid, SIGKILL);
+    }
+
+    for (int waited_ms = 0; waited_ms < 1000; waited_ms += 50) {
+        int status = 0;
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                free(out->picture_data);
+                memset(out, 0, sizeof(*out));
+                return outcome == METADATA_ARTWORK_INVALID
+                    ? METADATA_ARTWORK_INVALID
+                    : METADATA_ARTWORK_TEMPORARY_FAILURE;
+            }
+            return outcome;
+        }
+        usleep(50000);
+    }
+    kill(pid, SIGKILL);
+    remember_abandoned_metadata_child(&artwork_child_pool, pid);
+    return outcome;
+}
+
+metadata_artwork_result_t metadata_read_artwork_isolated(const char * path,
+                                                         track_metadata_t * out,
+                                                         int timeout_ms) {
+    if (!out) return METADATA_ARTWORK_TEMPORARY_FAILURE;
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&artwork_isolation_mutex);
+    metadata_artwork_result_t result =
+        metadata_read_artwork_isolated_impl(path, out, timeout_ms);
+    pthread_mutex_unlock(&artwork_isolation_mutex);
+    return result;
 }

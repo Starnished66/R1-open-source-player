@@ -85,6 +85,13 @@ typedef struct {
     unsigned int bitrate_kbps;
     uint64_t total_frames;
 
+    /* Local MP3 only. dr_mp3 never owns a bound seek table, so this tagged
+     * decoder owns and frees it alongside the drmp3 instance. Built lazily
+     * on the first seek of a long track; gapless prefetch therefore remains
+     * cheap and short MP3s keep their existing zero-index behavior. */
+    drmp3_seek_point * mp3_seek_points;
+    bool mp3_seek_index_attempted;
+
     /* Non-NULL only for a live network stream opened via a URL (see
      * is_stream_url() below) -- decoder_close() must also tear this down,
      * and decoder_seek() must refuse to seek while it's set (there's
@@ -473,11 +480,70 @@ static decoder_read_result_t decoder_read_s16(decoder_t * dec, uint64_t frames, 
     return res;
 }
 
-static bool decoder_seek(decoder_t * dec, uint64_t frame) {
+#define MP3_SEEK_INDEX_MIN_SECONDS (10u * 60u)
+#define MP3_SEEK_INDEX_INTERVAL_SECONDS 30u
+#define MP3_SEEK_INDEX_MAX_POINTS 256u
+
+static void prepare_mp3_seek_index(decoder_t * dec, const char * path) {
+    if (dec->mp3_seek_index_attempted) return;
+    dec->mp3_seek_index_attempted = true;
+    if (!path || dec->sample_rate == 0 ||
+        dec->total_frames < (uint64_t) dec->sample_rate * MP3_SEEK_INDEX_MIN_SECONDS) return;
+
+    uint64_t interval_frames = (uint64_t) dec->sample_rate * MP3_SEEK_INDEX_INTERVAL_SECONDS;
+    uint64_t desired = dec->total_frames / interval_frames;
+    if (desired < 2) return;
+    if (desired > MP3_SEEK_INDEX_MAX_POINTS) desired = MP3_SEEK_INDEX_MAX_POINTS;
+
+    drmp3_seek_point * points = calloc((size_t) desired, sizeof(*points));
+    drmp3 * scan = malloc(sizeof(*scan));
+    if (!points || !scan) {
+        free(points);
+        free(scan);
+        DBG_LOG("audio: MP3 seek-index allocation failed, using bounded-memory brute seek (%s)\n",
+                safe_path_tail(path));
+        return;
+    }
+
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    drmp3_uint32 count = (drmp3_uint32) desired;
+    bool opened = drmp3_init_file(scan, path, NULL) != 0;
+    bool same_file = opened && scan->sampleRate == dec->as.mp3->sampleRate &&
+                     scan->channels == dec->as.mp3->channels &&
+                     scan->streamLength == dec->as.mp3->streamLength &&
+                     scan->streamStartOffset == dec->as.mp3->streamStartOffset &&
+                     scan->delayInPCMFrames == dec->as.mp3->delayInPCMFrames &&
+                     scan->paddingInPCMFrames == dec->as.mp3->paddingInPCMFrames;
+    bool ready = same_file && drmp3_calculate_seek_points(scan, &count, points) && count > 0;
+    if (opened) drmp3_uninit(scan);
+    free(scan);
+    if (!ready || !drmp3_bind_seek_table(dec->as.mp3, count, points)) {
+        free(points);
+        DBG_LOG("audio: MP3 seek-index build failed, using brute seek (%s)\n",
+                safe_path_tail(path));
+        return;
+    }
+
+    dec->mp3_seek_points = points;
+    struct timespec finished;
+    clock_gettime(CLOCK_MONOTONIC, &finished);
+    uint64_t elapsed_ms = (uint64_t) (finished.tv_sec - started.tv_sec) * 1000ULL;
+    if (finished.tv_nsec >= started.tv_nsec)
+        elapsed_ms += (uint64_t) (finished.tv_nsec - started.tv_nsec) / 1000000ULL;
+    else
+        elapsed_ms -= 1000ULL - (uint64_t) (started.tv_nsec - finished.tv_nsec) / 1000000ULL;
+    DBG_LOG("audio: MP3 seek index ready (%u points, %" PRIu64 " ms, %s)\n",
+            count, elapsed_ms, safe_path_tail(path));
+}
+
+static bool decoder_seek(decoder_t * dec, uint64_t frame, const char * path) {
     if (dec->net_stream) return false; /* live stream -- cannot seek */
     switch (dec->type) {
         case DECODER_FLAC:   return drflac_seek_to_pcm_frame(dec->as.flac, frame) != 0;
-        case DECODER_MP3:    return drmp3_seek_to_pcm_frame(dec->as.mp3, frame) != 0;
+        case DECODER_MP3:
+            if (frame > 0) prepare_mp3_seek_index(dec, path);
+            return drmp3_seek_to_pcm_frame(dec->as.mp3, frame) != 0;
         case DECODER_WAV:    return drwav_seek_to_pcm_frame(dec->as.wav, frame) != 0;
         case DECODER_AIFF:   return aiff_seek_to_pcm_frame(dec->as.aiff, frame);
         case DECODER_DSD:    return dsd_seek_to_pcm_frame(dec->as.dsd, frame);
@@ -498,7 +564,13 @@ static void decoder_close(decoder_t * dec) {
             if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_MP3:
-            if (dec->as.mp3) { drmp3_uninit(dec->as.mp3); free(dec->as.mp3); }
+            if (dec->as.mp3) {
+                drmp3_bind_seek_table(dec->as.mp3, 0, NULL);
+                drmp3_uninit(dec->as.mp3);
+                free(dec->as.mp3);
+            }
+            free(dec->mp3_seek_points);
+            dec->mp3_seek_points = NULL;
             if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_WAV:
@@ -580,39 +652,20 @@ static float volume = 1.0f;      /* UI-facing 0.0-1.0 percent, what audio_get_vo
 static float volume_gain = 1.0f; /* actual linear PCM multiplier the playback thread applies -- see audio_set_volume() */
 static bool low_power_mode = false;
 
-/* Every explicit track start advances this generation. Background seek
- * preparation is accepted only if it still belongs to this exact track. */
+/* Every explicit track start advances this generation. Pending seeks are
+ * accepted only if they still belong to this exact track. */
 static uint64_t playback_generation = 0;
-static uint64_t seek_request_generation = 0;
 static char * active_path = NULL; /* protected by audio_mutex */
 
-typedef struct {
-    decoder_t dec;
-    uint64_t frame;
-    uint64_t playback_generation;
-    uint64_t seek_generation;
-} prepared_seek_t;
-
-/* Produced by a detached seek worker, consumed only by the playback
- * thread. A newer worker may replace an unconsumed result under the mutex. */
-static prepared_seek_t * prepared_seek = NULL;
-
-/* One seek worker at a time. Rapid progress-bar taps used to pthread_create
- * a new decoder_open()+decoder_seek() per release; generation only dropped
- * the finished result, so several FLAC opens ran together, saturated this
- * device, and the player UI stopped taking taps for ~10-15s. A newer
- * audio_seek() while the worker is busy just updates these fields; the
- * in-flight worker loops onto the latest target instead of stacking. */
-static bool seek_worker_active = false;
+/* A seek is a coalesced command consumed by the playback thread. The former
+ * detached design could overlap the current decoder, one worker decoder, a
+ * completed prepared decoder, and gapless prefetch. Keeping the actual seek
+ * on the owned decoder bounds that overlap regardless of tap/skip rate. */
+static bool seek_pending = false;
 static uint64_t seek_pending_frame = 0;
 static uint64_t seek_pending_playback_generation = 0;
 static bool seek_pending_is_percent = false;
 static double seek_pending_percent = 0.0;
-/* Generation whose decoder owns current_total_frames/current_sample_rate.
- * playback_generation advances as soon as a new path is requested, before
- * that decoder is open, so the two generations deliberately differ during
- * track startup. Percentage seeks wait for them to match. */
-static uint64_t loaded_playback_generation = 0;
 
 static uint64_t frames_played = 0;
 static uint64_t current_total_frames = 0;
@@ -641,8 +694,7 @@ static audio_codec_t public_codec_for_decoder(decoder_type_t type) {
  * the UI completely independent from the playback thread's stack-local
  * decoder_t and its short-lived gapless/crossfade prefetched decoder. */
 static void publish_current_format_locked(const decoder_t * dec, const char * path,
-                                          float replaygain_linear, bool replaygain_applied,
-                                          uint64_t decoder_generation) {
+                                          float replaygain_linear, bool replaygain_applied) {
     memset(&current_format_info, 0, sizeof(current_format_info));
     current_format_info.valid = true;
     if (path) snprintf(current_format_info.path, sizeof(current_format_info.path), "%s", path);
@@ -661,15 +713,11 @@ static void publish_current_format_locked(const decoder_t * dec, const char * pa
     current_format_info.replaygain_applied_db = replaygain_applied && replaygain_linear > 0.0f
         ? 20.0 * log10((double) replaygain_linear) : 0.0;
     current_format_info.generation = ++current_format_generation;
-    loaded_playback_generation = decoder_generation;
-    pthread_cond_broadcast(&audio_cond);
 }
 
 static void clear_current_format_locked(void) {
     memset(&current_format_info, 0, sizeof(current_format_info));
     current_format_generation++;
-    loaded_playback_generation = 0;
-    pthread_cond_broadcast(&audio_cond);
 }
 
 #ifdef HOST_BUILD
@@ -695,101 +743,6 @@ static double replaygain_to_linear(bool has_gain, double gain_db, bool has_peak,
      * value into raw sample math. */
     if (!isfinite(linear)) linear = 1.0;
     return linear;
-}
-
-static void * seek_worker_func(void * arg) {
-    (void) arg;
-
-    for (;;) {
-        uint64_t frame, pgen, sgen;
-        char * path;
-        pthread_mutex_lock(&audio_mutex);
-        while (active_path &&
-               seek_pending_playback_generation == playback_generation &&
-               seek_pending_is_percent &&
-               loaded_playback_generation != playback_generation &&
-               !stop_requested) {
-            pthread_cond_wait(&audio_cond, &audio_mutex);
-        }
-        if (!active_path || stop_requested ||
-            seek_pending_playback_generation != playback_generation) {
-            seek_worker_active = false;
-            pthread_mutex_unlock(&audio_mutex);
-            return NULL;
-        }
-        path = strdup(active_path);
-        if (!path) {
-            seek_worker_active = false;
-            pthread_mutex_unlock(&audio_mutex);
-            return NULL;
-        }
-        frame = seek_pending_is_percent
-            ? (uint64_t) ((double) current_total_frames * (seek_pending_percent / 100.0))
-            : seek_pending_frame;
-        pgen = seek_pending_playback_generation;
-        sgen = seek_request_generation;
-        pthread_mutex_unlock(&audio_mutex);
-
-        prepared_seek_t * ready = calloc(1, sizeof(*ready));
-        bool opened = ready && decoder_open(&ready->dec, path);
-        free(path);
-        if (opened) {
-            pthread_mutex_lock(&audio_mutex);
-            bool stale = (playback_generation != pgen) || (seek_request_generation != sgen);
-            pthread_mutex_unlock(&audio_mutex);
-            if (stale) {
-                decoder_close(&ready->dec);
-                free(ready);
-                continue;
-            }
-            if (frame > ready->dec.total_frames) frame = ready->dec.total_frames;
-            if (frame > 0 && !decoder_seek(&ready->dec, frame)) {
-                decoder_close(&ready->dec);
-                free(ready);
-                continue;
-            }
-            ready->frame = frame;
-            ready->playback_generation = pgen;
-            ready->seek_generation = sgen;
-        } else {
-            free(ready);
-            ready = NULL;
-        }
-
-        pthread_mutex_lock(&audio_mutex);
-        bool still_current = ready &&
-            playback_generation == pgen &&
-            seek_request_generation == sgen &&
-            !restart_requested && !stop_requested;
-        if (still_current) {
-            prepared_seek_t * superseded = prepared_seek;
-            prepared_seek = ready;
-            ready = NULL;
-            seek_worker_active = false;
-            pthread_cond_signal(&audio_cond);
-            pthread_mutex_unlock(&audio_mutex);
-            if (superseded) {
-                decoder_close(&superseded->dec);
-                free(superseded);
-            }
-            return NULL;
-        }
-
-        /* audio_seek() may have queued a request for a newly-started track
-         * while this old track's worker was still marked active. In that
-         * case it deliberately does not start a second worker, so this one
-         * must loop onto the current request instead of exiting and losing
-         * it. The old same-track superseding-seek case is covered too. */
-        bool retry = seek_pending_playback_generation == playback_generation &&
-            (pgen != playback_generation || sgen != seek_request_generation);
-        if (!retry) seek_worker_active = false;
-        pthread_mutex_unlock(&audio_mutex);
-        if (ready) {
-            decoder_close(&ready->dec);
-            free(ready);
-        }
-        if (!retry) return NULL;
-    }
 }
 
 /* Real-device feedback: "noticeable sound hissing in quiet songs, not
@@ -825,7 +778,7 @@ static bool reopen_decoder_at(decoder_t * dec, const char * path,
     decoder_close(dec);
     if (!decoder_open(dec, path)) return false;
     if (last_confirmed_frame > 0) {
-        if (!decoder_seek(dec, last_confirmed_frame)) {
+        if (!decoder_seek(dec, last_confirmed_frame, path)) {
             decoder_close(dec);
             return false;
         }
@@ -1104,14 +1057,30 @@ static void * audio_thread_func(void * arg) {
         cur_open = true;
         cur_frames_played_local = 0;
 
-        if (start_seconds > 0.0) {
-            uint64_t start_frame = (uint64_t) (start_seconds * (double) cur_dec.sample_rate);
-            if (start_frame > cur_dec.total_frames) start_frame = cur_dec.total_frames;
-            if (decoder_seek(&cur_dec, start_frame)) {
+        if (!cur_dec.net_stream && isfinite(start_seconds) && start_seconds > 0.0) {
+            double bounded_seconds = start_seconds;
+            double duration_seconds = (double) cur_dec.total_frames / (double) cur_dec.sample_rate;
+            if (bounded_seconds > duration_seconds) bounded_seconds = duration_seconds;
+            uint64_t start_frame = (uint64_t) (bounded_seconds * (double) cur_dec.sample_rate);
+            if (decoder_seek(&cur_dec, start_frame, cur_path_local)) {
                 cur_frames_played_local = start_frame;
             } else {
                 DBG_LOG("audio: initial seek to frame %" PRIu64 " failed (%s), playing from start\n",
                         start_frame, safe_path_tail(cur_path_local));
+                /* Seeking can mutate a decoder before reporting failure
+                 * (notably AAC and Opus). A clean reopen makes the promised
+                 * start-from-zero fallback real and prevents a bad persisted
+                 * resume position from crashing again on every boot. */
+                if (!reopen_decoder_at(&cur_dec, cur_path_local, 0)) {
+                    cur_open = false;
+                    pthread_mutex_lock(&audio_mutex);
+                    have_current = false;
+                    clear_current_format_locked();
+                    last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                    last_playback_error_generation = cur_generation;
+                    pthread_mutex_unlock(&audio_mutex);
+                    continue;
+                }
                 cur_frames_played_local = 0;
             }
         }
@@ -1134,8 +1103,7 @@ static void * audio_thread_func(void * arg) {
         current_total_frames = cur_dec.total_frames;
         current_sample_rate = cur_dec.sample_rate;
         publish_current_format_locked(&cur_dec, cur_path_local,
-                                      cur_replaygain_linear, cur_replaygain_applied,
-                                      cur_generation);
+                                      cur_replaygain_linear, cur_replaygain_applied);
         pthread_mutex_unlock(&audio_mutex);
 
         bool should_restart = false;
@@ -1188,16 +1156,17 @@ static void * audio_thread_func(void * arg) {
                 pthread_mutex_lock(&audio_mutex);
             }
 #endif
-            while (paused && !stop_requested && !restart_requested && prepared_seek == NULL) {
+            while (paused && !stop_requested && !restart_requested && !seek_pending) {
                 pthread_cond_wait(&audio_cond, &audio_mutex);
             }
             bool do_stop = stop_requested;
             bool do_restart = restart_requested;
-            prepared_seek_t * ready_seek = prepared_seek;
-            prepared_seek = NULL;
-            bool ready_seek_valid = ready_seek &&
-                ready_seek->playback_generation == cur_generation &&
-                ready_seek->seek_generation == seek_request_generation;
+            bool do_seek = seek_pending &&
+                seek_pending_playback_generation == cur_generation;
+            uint64_t seek_frame = seek_pending_is_percent
+                ? (uint64_t) ((double) cur_dec.total_frames * (seek_pending_percent / 100.0))
+                : seek_pending_frame;
+            if (seek_pending) seek_pending = false;
             bool xfade_on = crossfade_enabled;
             float vol = volume_gain;
             uint64_t chunk_frames = low_power_mode ? LOW_POWER_CHUNK_FRAMES : NORMAL_CHUNK_FRAMES;
@@ -1221,12 +1190,6 @@ static void * audio_thread_func(void * arg) {
             uint64_t staged_next_generation = staged_next.generation;
             pthread_mutex_unlock(&audio_mutex);
 
-            if (ready_seek && !ready_seek_valid) {
-                decoder_close(&ready_seek->dec);
-                free(ready_seek);
-                ready_seek = NULL;
-            }
-
 #ifndef HOST_BUILD
             /* Real-device bug: connecting Bluetooth headphones mid-track (the
              * common case -- a user pairs while a track is already playing,
@@ -1247,10 +1210,6 @@ static void * audio_thread_func(void * arg) {
 #endif
 
             if (do_restart || do_stop) {
-                if (ready_seek) {
-                    decoder_close(&ready_seek->dec);
-                    free(ready_seek);
-                }
                 /* Phase 4: Controlled transition ramp-down on manual stop/restart */
                 if (cur_open && cur_dec.sample_rate > 0) {
                     uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
@@ -1274,8 +1233,20 @@ static void * audio_thread_func(void * arg) {
                 break;
             }
 
-            if (ready_seek) {
-                /* Phase 4: Smooth transition on prepared seek swap */
+            if (do_seek) {
+                /* Network decoders are forward-only. Keep this guard at the
+                 * owner thread as well as the public API: a seek may be
+                 * queued while a newly requested stream is still opening,
+                 * before current_format_info identifies it as a stream. */
+                if (cur_dec.net_stream) {
+                    DBG_LOG("audio: ignoring seek on network stream (%s)\n",
+                            safe_path_tail(cur_path_local));
+                    continue;
+                }
+
+                /* Smooth seek on the owned playback decoder. The first seek
+                 * in a long MP3 may briefly open one scan-only drmp3 to build
+                 * its bounded table; it is freed before the seek is applied. */
                 if (cur_open && cur_dec.sample_rate > 0) {
                     uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
                     decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
@@ -1296,22 +1267,41 @@ static void * audio_thread_func(void * arg) {
 
                 close_decoder_if_open(&nxt_dec, &nxt_open);
                 nxt_format_matches = false;
-                decoder_close(&cur_dec);
-                cur_dec = ready_seek->dec;
-                cur_open = true;
-                cur_frames_played_local = ready_seek->frame;
-                free(ready_seek);
-                ensure_device(cur_dec.channels, cur_dec.sample_rate);
-                pthread_mutex_lock(&audio_mutex);
-                frames_played = cur_frames_played_local;
-                current_total_frames = cur_dec.total_frames;
-                current_sample_rate = cur_dec.sample_rate;
-                publish_current_format_locked(&cur_dec, cur_path_local,
-                                              cur_replaygain_linear, cur_replaygain_applied,
-                                              cur_generation);
-                pthread_mutex_unlock(&audio_mutex);
-                need_fade_in = true;
-                consecutive_decoder_errors = 0;
+                if (seek_frame > cur_dec.total_frames) seek_frame = cur_dec.total_frames;
+                if (decoder_seek(&cur_dec, seek_frame, cur_path_local)) {
+                    cur_frames_played_local = seek_frame;
+                    pthread_mutex_lock(&audio_mutex);
+                    frames_played = cur_frames_played_local;
+                    pthread_mutex_unlock(&audio_mutex);
+                    need_fade_in = true;
+                    consecutive_decoder_errors = 0;
+                } else {
+                    DBG_LOG("audio: seek to frame %" PRIu64 " failed (%s)\n",
+                            seek_frame, safe_path_tail(cur_path_local));
+                    /* Some codecs reset internal state before they can know
+                     * the seek will fail (AAC closes/recreates its handle,
+                     * Opus moves the demux cursor before discarding). Restore
+                     * the last confirmed position sequentially so playback
+                     * never continues through a half-mutated decoder. */
+                    if (!reopen_decoder_at(&cur_dec, cur_path_local,
+                                           cur_frames_played_local)) {
+                        cur_open = false;
+                        pthread_mutex_lock(&audio_mutex);
+                        last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                        last_playback_error_generation = cur_generation;
+                        have_current = false;
+                        clear_current_format_locked();
+                        paused = false;
+                        pthread_mutex_unlock(&audio_mutex);
+                        should_restart = false;
+                        was_stopped = false;
+                        ended_with_no_next = false;
+                        goto inner_loop_done;
+                    }
+                    cur_open = true;
+                    need_fade_in = true;
+                    consecutive_decoder_errors = 0;
+                }
                 continue; /* re-check pause/restart state before decoding */
             }
 
@@ -1566,14 +1556,13 @@ static void * audio_thread_func(void * arg) {
                     free(active_path);
                     active_path = cur_path_local ? strdup(cur_path_local) : NULL;
                     playback_generation++;
-                    seek_request_generation++;
+                    seek_pending = false;
                     cur_generation = playback_generation;
                     current_total_frames = cur_dec.total_frames;
                     current_sample_rate = cur_dec.sample_rate;
                     frames_played = cur_frames_played_local;
                     publish_current_format_locked(&cur_dec, cur_path_local,
-                                                  cur_replaygain_linear, cur_replaygain_applied,
-                                                  cur_generation);
+                                                  cur_replaygain_linear, cur_replaygain_applied);
                     track_advanced = true;
                     pthread_mutex_unlock(&audio_mutex);
                 } else {
@@ -1719,14 +1708,13 @@ static void * audio_thread_func(void * arg) {
                         free(active_path);
                         active_path = cur_path_local ? strdup(cur_path_local) : NULL;
                         playback_generation++;
-                        seek_request_generation++;
+                        seek_pending = false;
                         cur_generation = playback_generation;
                         current_total_frames = cur_dec.total_frames;
                         current_sample_rate = cur_dec.sample_rate;
                         frames_played = cur_frames_played_local;
                         publish_current_format_locked(&cur_dec, cur_path_local,
-                                                      cur_replaygain_linear, cur_replaygain_applied,
-                                                      cur_generation);
+                                                      cur_replaygain_linear, cur_replaygain_applied);
                         track_advanced = true;
                         pthread_mutex_unlock(&audio_mutex);
 
@@ -1845,7 +1833,7 @@ void audio_play_file_at(const char * path, double start_seconds,
     last_playback_error = AUDIO_ERROR_NONE;
     last_playback_error_generation = 0;
     playback_generation++;
-    seek_request_generation++;
+    seek_pending = false;
     free(active_path);
     active_path = strdup(path);
     clear_current_format_locked();
@@ -1945,28 +1933,12 @@ bool audio_is_paused(void) {
     return result;
 }
 
-/* Starts the single-flight worker for the request already stored by the
- * caller. Always called with audio_mutex held and returns with it unlocked. */
-static void start_seek_worker_and_unlock(void) {
-    bool start_worker = !seek_worker_active;
-    pthread_t worker;
-    int create_result = 0;
-    if (start_worker) {
-        /* Keep the reservation and thread creation under the same lock.
-         * Otherwise a concurrent seek can observe seek_worker_active, leave
-         * its request for that worker, and then lose it if pthread_create()
-         * fails and the reservation is cleared afterward. The new worker
-         * simply waits on audio_mutex until this short operation completes. */
-        seek_worker_active = true;
-        create_result = pthread_create(&worker, NULL, seek_worker_func, NULL);
-        if (create_result != 0)
-            seek_worker_active = false;
-    }
+/* Publish a coalesced command and wake the playback thread. Always called
+ * with audio_mutex held and returns with it unlocked. */
+static void finish_seek_request_and_unlock(void) {
+    seek_pending = true;
     pthread_cond_broadcast(&audio_cond);
     pthread_mutex_unlock(&audio_mutex);
-
-    if (start_worker && create_result == 0)
-        pthread_detach(worker);
 }
 
 static void request_seek_and_unlock(uint64_t frame) {
@@ -1974,17 +1946,23 @@ static void request_seek_and_unlock(uint64_t frame) {
     seek_pending_frame = frame;
     seek_pending_is_percent = false;
     seek_pending_playback_generation = playback_generation;
-    seek_request_generation++;
-    start_seek_worker_and_unlock();
+    finish_seek_request_and_unlock();
 }
 
 void audio_seek(double seconds) {
     pthread_mutex_lock(&audio_mutex);
-    if (!have_current || current_sample_rate == 0 || current_total_frames == 0 || !active_path) {
+    if (!have_current || current_sample_rate == 0 || current_total_frames == 0 || !active_path ||
+        (current_format_info.valid && current_format_info.is_stream)) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
+    }
+    if (!isfinite(seconds)) {
         pthread_mutex_unlock(&audio_mutex);
         return;
     }
     if (seconds < 0.0) seconds = 0.0;
+    double duration = (double) current_total_frames / (double) current_sample_rate;
+    if (seconds > duration) seconds = duration;
     uint64_t frame = (uint64_t) (seconds * (double) current_sample_rate);
     request_seek_and_unlock(frame);
 }
@@ -2010,13 +1988,17 @@ void audio_seek(double seconds) {
  * whose header states total_frames outright (FLAC's STREAMINFO), which is
  * why this was mostly seen on 40+ minute songs and not reported for FLAC.
  *
- * Fix: store the percentage together with playback_generation. The worker
- * waits until that generation's decoder publishes its own total_frames,
- * then converts the percentage. It therefore cannot combine the previous
- * track's duration with the newly requested track's path. */
+ * Fix: store the percentage together with playback_generation. The playback
+ * thread converts it using the decoder for that same generation. It
+ * therefore cannot combine the previous track's duration with the newly
+ * requested track's path. */
 void audio_seek_percent(double percent) {
     pthread_mutex_lock(&audio_mutex);
-    if (!active_path) {
+    if (!active_path || (current_format_info.valid && current_format_info.is_stream)) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
+    }
+    if (!isfinite(percent)) {
         pthread_mutex_unlock(&audio_mutex);
         return;
     }
@@ -2025,8 +2007,7 @@ void audio_seek_percent(double percent) {
     seek_pending_percent = percent;
     seek_pending_is_percent = true;
     seek_pending_playback_generation = playback_generation;
-    seek_request_generation++;
-    start_seek_worker_and_unlock();
+    finish_seek_request_and_unlock();
 }
 
 double audio_get_position_seconds(void) {

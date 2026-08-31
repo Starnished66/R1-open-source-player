@@ -131,6 +131,7 @@ static cover_decode_result_t decode_png_rgb888(const uint8_t * data, uint32_t si
     lodepng_state_cleanup(&state);
     if (inspect_error != 0) return COVER_DECODE_FAIL_UNSUPPORTED;
     if (!rgb888_size_ok(w, h, max_side, NULL)) return COVER_DECODE_FAIL_OVERSIZED;
+    unsigned inspected_w = w, inspected_h = h;
 
     unsigned char * pixels = NULL;
     unsigned decode_error = lodepng_decode24(&pixels, &w, &h, data, size);
@@ -138,6 +139,10 @@ static cover_decode_result_t decode_png_rgb888(const uint8_t * data, uint32_t si
         return COVER_DECODE_FAIL_ALLOC;
     }
     if (decode_error != 0 || !pixels) {
+        return COVER_DECODE_FAIL_UNSUPPORTED;
+    }
+    if (w != inspected_w || h != inspected_h || !rgb888_size_ok(w, h, max_side, NULL)) {
+        free(pixels);
         return COVER_DECODE_FAIL_UNSUPPORTED;
     }
 
@@ -253,8 +258,9 @@ static bool inspect_bmp(const uint8_t * data, uint32_t size, int * out_w, int * 
     if (size < 54 || data[0] != 'B' || data[1] != 'M') return false;
     int width = le32s(data + 18);
     int height_raw = le32s(data + 22);
+    if (width <= 0 || height_raw == INT32_MIN) return false;
     int height = height_raw < 0 ? -height_raw : height_raw;
-    if (width <= 0 || height <= 0) return false;
+    if (height <= 0) return false;
     *out_w = width;
     *out_h = height;
     return true;
@@ -268,6 +274,7 @@ static cover_decode_result_t decode_bmp_rgb888(const uint8_t * data, uint32_t si
     if (dib < 40 || off < 14 + dib || off >= size) return COVER_DECODE_FAIL_UNSUPPORTED;
     int width = le32s(data + 18);
     int height_raw = le32s(data + 22);
+    if (height_raw == INT32_MIN) return COVER_DECODE_FAIL_UNSUPPORTED;
     bool top_down = height_raw < 0;
     int height = top_down ? -height_raw : height_raw;
     uint16_t planes = le16(data + 26);
@@ -275,11 +282,11 @@ static cover_decode_result_t decode_bmp_rgb888(const uint8_t * data, uint32_t si
     uint32_t compression = le32(data + 30);
     if (width <= 0 || height <= 0 || planes != 1 || compression != 0) return COVER_DECODE_FAIL_UNSUPPORTED;
     if (bits != 24 && bits != 32) return COVER_DECODE_FAIL_UNSUPPORTED;
-    int bpp = bits / 8;
-    int row_bytes = width * bpp;
-    int stride = (row_bytes + 3) & ~3;
     size_t need;
     if (!rgb888_size_ok((size_t) width, (size_t) height, max_side, &need)) return COVER_DECODE_FAIL_OVERSIZED;
+    int bpp = bits / 8;
+    size_t row_bytes = (size_t) width * (size_t) bpp;
+    size_t stride = (row_bytes + 3U) & ~(size_t) 3U;
     if ((uint64_t) off + (uint64_t) stride * (uint64_t) height > size) return COVER_DECODE_FAIL_UNSUPPORTED;
     uint8_t * buf = malloc(need);
     if (!buf) return COVER_DECODE_FAIL_ALLOC;
@@ -304,6 +311,8 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
                                                artwork_priority_t prio,
                                                artwork_cancel_fn cancel_cb, void * user_data,
                                                uint16_t ** out_pixels) {
+    if (!out_pixels) return COVER_DECODE_FAIL_UNSUPPORTED;
+    *out_pixels = NULL;
     if (!data || size < 8 || target_w <= 0 || target_h <= 0) return COVER_DECODE_FAIL_UNSUPPORTED;
     if (cancel_cb && cancel_cb(user_data)) return COVER_DECODE_FAIL_CANCELLED;
 

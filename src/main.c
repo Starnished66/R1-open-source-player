@@ -1,6 +1,9 @@
 #include "lvgl/lvgl.h"
 #include "audio.h"
 #include "backlight.h"
+#include "metadata.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <signal.h>
@@ -165,13 +168,21 @@ void boot_checkpoint(const char * step) {
 }
 #endif
 
-int main(void) {
+int main(int argc, char ** argv) {
     /* Ignore SIGPIPE process-wide: a Bluetooth disconnect during playback
      * kills the `aplay -D bluealsa` child audio_output.c writes into, and
      * without this the next write() would kill the whole process instead of
      * just returning EPIPE (which audio_output_write() already handles
      * correctly). Must run before anything else opens a subprocess pipe. */
     signal(SIGPIPE, SIG_IGN);
+
+    if (argc == 4 && strcmp(argv[1], "--metadata-artwork-helper") == 0) {
+        char * end = NULL;
+        errno = 0;
+        long fd = strtol(argv[2], &end, 10);
+        if (errno != 0 || !end || *end != '\0' || fd < 0 || fd > INT_MAX) return 1;
+        return metadata_artwork_helper_run(argv[3], (int) fd);
+    }
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("Starting open_hiby_player...\n");

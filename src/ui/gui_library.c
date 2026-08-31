@@ -1242,6 +1242,11 @@ static bool album_thumbnail_sized_cache_hit(const albumart_info_t * info, char *
 }
 
 #define THUMBNAIL_SIDECAR_MAX_BYTES (2U * 1024U * 1024U)
+#define ALBUM_ART_METADATA_TIMEOUT_MS 5000
+/* Worst-case overlap while the helper transfers a 4 MiB picture: helper
+ * picture/lyrics plus the parent's picture copy. Decode has its own more
+ * precise admission check after inspecting the returned image. */
+#define ALBUM_ART_METADATA_PEAK_BYTES (12U * 1024U * 1024U)
 
 /* Persistent warmer state flags */
 static pthread_t album_thumb_gen_thread;
@@ -1372,9 +1377,14 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     }
 
     /* Step 3: Try embedded picture from audio file */
+    if (!artwork_check_memory_admission(prio, ALBUM_ART_METADATA_PEAK_BYTES)) {
+        artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+        return false;
+    }
     track_metadata_t meta;
     memset(&meta, 0, sizeof(meta));
-    metadata_read(song->path, &meta);
+    metadata_artwork_result_t metadata_result =
+        metadata_read_artwork_isolated(song->path, &meta, ALBUM_ART_METADATA_TIMEOUT_MS);
     data = meta.picture_data;
     size = meta.picture_size;
     free(meta.lyrics);
@@ -1397,6 +1407,11 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
             artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
             return false;
         }
+    }
+
+    if (metadata_result == METADATA_ARTWORK_TEMPORARY_FAILURE) {
+        artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+        return false;
     }
 
     /* Step 4: No valid artwork found or permanent decode failure */
@@ -5019,7 +5034,7 @@ static void scan_one_song_into_db(const char * path) {
     if (have_stat && metadata_db_get(path, mtime, size, &cached)) return;
 
     track_metadata_t meta;
-    metadata_read_isolated(path, &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS);
+    if (!metadata_read_isolated(path, &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS)) return;
 
     cached_tags_t fresh;
     memset(&fresh, 0, sizeof(fresh));
@@ -5137,10 +5152,17 @@ void library_scan_once(void) {
         if (path[0] != '\0') {
 #ifdef TEST_BUILD_TAG
             uint64_t file_started_ms = test_diag_now_ms();
+            /* Crash-repro breadcrumb: flushed before metadata parsing so
+             * the final unmatched file_begin identifies the exact input
+             * being handled if the process or device dies mid-file. */
+            TEST_DIAG("DB_FILE", "file_begin index=%d total=%d rss_kb=%ld path=%s",
+                      done, discovered_count, test_diag_rss_kb(), path);
 #endif
             scan_one_song_into_db(path);
 #ifdef TEST_BUILD_TAG
             uint64_t file_ms = test_diag_now_ms() - file_started_ms;
+            TEST_DIAG("DB_FILE", "file_end index=%d elapsed_ms=%llu rss_kb=%ld path=%s",
+                      done, (unsigned long long) file_ms, test_diag_rss_kb(), path);
             if (file_ms >= 250)
                 TEST_DIAG("DB", "slow_file index=%d elapsed_ms=%llu path=%s", done,
                           (unsigned long long) file_ms, path);

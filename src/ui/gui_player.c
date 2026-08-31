@@ -1368,9 +1368,7 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
  * tap's skip-track/restart-or-previous-track behavior.
  *
  * Bug caught in review: audio_seek() only updates audio_get_position_
- * seconds() once its background worker's newly-opened/seeked decoder is
- * actually installed (see seek_worker_func()/the ready_seek consumption in
- * audio.c) -- reopening+seeking a real file is not instant. At LVGL's
+ * seconds() once the playback thread applies the queued seek. At LVGL's
  * default ~100ms long_press_repeat_time, several repeat ticks can fire
  * before that round-trip lands, so computing each step as "current
  * position + STEP" from audio_get_position_seconds() read the SAME stale
@@ -1380,8 +1378,8 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
  * position once, at the start of a hold, then adjusted by STEP on every
  * subsequent tick regardless of whether the previous seek has landed yet,
  * so the requested target always advances smoothly; audio_seek()'s own
- * generation-based coalescing (see its own comment) already makes only the
- * LATEST accumulated target matter once the worker catches up.
+ * generation-based coalescing already makes only the latest accumulated
+ * target matter once playback catches up.
  *
  * Also bound to LV_EVENT_LONG_PRESSED itself (not just REPEAT) -- LVGL
  * fires LONG_PRESSED once after long_press_time (~400ms) and then the
@@ -1611,7 +1609,7 @@ static double pending_progress_seek_seconds = 0.0;
 bool user_seeking = false;
 /* True from finger-up until audio position catches the requested seek, so
  * the 500ms progress poll does not yank the knob back to the pre-seek
- * playhead while a (now single-flight) seek worker is still opening. */
+ * playhead while the playback thread is applying it. */
 static bool progress_awaiting_seek = false;
 static int progress_awaiting_seek_ticks = 0;
 
@@ -3373,13 +3371,13 @@ void gui_player_update_progress(void) {
     int position_second = (int) position;
     int duration_second = (int) duration;
     if (pos_label && position_second != displayed_position_second) {
-        char pos_str[16];
+        char pos_str[24];
         displayed_position_second = position_second;
         gui_format_time(position, pos_str, sizeof(pos_str));
         lv_label_set_text(pos_label, pos_str);
     }
     if (dur_label && duration_second != displayed_duration_second) {
-        char dur_str[16];
+        char dur_str[24];
         displayed_duration_second = duration_second;
         gui_format_time(duration, dur_str, sizeof(dur_str));
         lv_label_set_text(dur_label, dur_str);

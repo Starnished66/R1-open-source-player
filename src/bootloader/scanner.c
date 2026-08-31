@@ -185,6 +185,8 @@ void scanner_scan(scan_result_t * out) {
 
     int sd_build_cmp = 0;
     if (out->sd_update_present) {
+        out->sd_update_build_comparable = out->internal_build_stamp[0] &&
+                                          out->sd_update_build_stamp[0];
         sd_build_cmp = compare_build_stamps(out->internal_build_stamp,
                                             out->sd_update_build_stamp);
         out->sd_update_is_newer = sd_build_cmp > 0;
@@ -193,12 +195,12 @@ void scanner_scan(scan_result_t * out) {
 
     load_preferences(&out->default_entry, &out->timeout_seconds);
     loaded_timeout_seconds = out->timeout_seconds;
-    /* The unattended/default choice is always the newest comparable Open
-     * Player, independent of an older persisted menu choice. Dropping an
-     * equal or non-comparable SD build remains an explicit signal to use
-     * that copy, preserving the established SD priority. Stock is still a
-     * selectable entry whenever present, but never the automatic one. */
-    out->default_entry = out->sd_update_present && sd_build_cmp >= 0
+    /* The unattended/default choice is the newest comparable Open Player;
+     * Internal wins an exact tie. A non-comparable SD build remains an
+     * explicit signal to use that copy, preserving established behavior.
+     * Stock is selectable whenever present, but never automatic. */
+    out->default_entry = out->sd_update_present &&
+                         (sd_build_cmp > 0 || !out->sd_update_build_comparable)
                        ? BOOT_ENTRY_SD_UPDATE : BOOT_ENTRY_INTERNAL;
 }
 

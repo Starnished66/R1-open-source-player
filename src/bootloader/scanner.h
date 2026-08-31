@@ -94,15 +94,19 @@ typedef struct {
      * stamp is not guessed to be older. */
     bool sd_update_is_older;
 
+    /* True only when both embedded stamps were readable. This separates an
+     * exact match (Internal wins) from an unknown comparison (SD keeps its
+     * established drop-in priority). */
+    bool sd_update_build_comparable;
+
     /* Empty when the corresponding executable has no readable embedded
-     * BUILD_STAMP. The menu displays its YYYY-MM-DD portion; including the
-     * time would exceed the card width with the bootloader's bitmap font. */
+     * BUILD_STAMP. The menu displays the complete stamp on its own line. */
     char internal_build_stamp[BOOT_BUILD_STAMP_LEN + 1];
     char sd_update_build_stamp[BOOT_BUILD_STAMP_LEN + 1];
 
-    /* The newest comparable Open Player: SD when its build is newer or
-     * equal, otherwise Internal. A non-comparable SD build retains SD-drop
-     * priority. Stock is deliberately never the automatic selection. This
+    /* The newest comparable Open Player: SD only when its build is newer;
+     * an exact match gives Internal priority. A non-comparable SD build
+     * retains SD-drop priority. Stock is never the automatic selection. This
      * is both the initially-highlighted menu entry and what a countdown
      * timeout confirms. */
     int default_entry;

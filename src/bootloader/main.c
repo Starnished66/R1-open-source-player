@@ -113,6 +113,7 @@ typedef struct {
     int height;
     const char * line1;
     char line2[40];
+    char line3[40];
     int boot_entry; /* a BOOT_ENTRY_* value (scanner.h) -- which real choice this card represents */
 } card_layout_t;
 
@@ -145,6 +146,7 @@ static void draw_card(const card_layout_t * card, bool selected) {
                         selected ? COLOR_ACCENT : COLOR_BORDER_MUTED);
     fb_draw_text(CARD_MARGIN_X + 30, card->y + 35, card->line1, COLOR_TEXT);
     fb_draw_text(CARD_MARGIN_X + 30, card->y + 75, card->line2, COLOR_MUTED);
+    if (card->line3[0]) fb_draw_text(CARD_MARGIN_X + 30, card->y + 105, card->line3, COLOR_MUTED);
 }
 
 static bool point_in_card(const card_layout_t * card, int x, int y) {
@@ -197,13 +199,13 @@ static long elapsed_ms_since(const struct timespec * start) {
 static int build_cards(const scan_result_t * scan, card_layout_t * cards) {
     int count = 0;
     cards[count] = (card_layout_t) { .line1 = "OPEN PLAYER", .boot_entry = BOOT_ENTRY_INTERNAL };
-    snprintf(cards[count].line2, sizeof(cards[count].line2), "INTERNAL%s%.10s",
-             scan->internal_build_stamp[0] ? "  " : "", scan->internal_build_stamp);
+    snprintf(cards[count].line2, sizeof(cards[count].line2), "INTERNAL");
+    snprintf(cards[count].line3, sizeof(cards[count].line3), "%s", scan->internal_build_stamp);
     count++;
     if (scan->sd_update_present) {
         cards[count] = (card_layout_t) { .line1 = "OPEN PLAYER", .boot_entry = BOOT_ENTRY_SD_UPDATE };
-        snprintf(cards[count].line2, sizeof(cards[count].line2), "SD CARD%s%.10s",
-                 scan->sd_update_build_stamp[0] ? "  " : "", scan->sd_update_build_stamp);
+        snprintf(cards[count].line2, sizeof(cards[count].line2), "SD CARD");
+        snprintf(cards[count].line3, sizeof(cards[count].line3), "%s", scan->sd_update_build_stamp);
         count++;
     }
     if (scan->sd_stock_present) {
@@ -485,17 +487,17 @@ int main(void) {
          * persisted default below. */
         boot_path = SD_UPDATE_PLAYER_PATH;
     } else if (!scan.sd_stock_present &&
-               (!scan.sd_update_present || scan.sd_update_is_older)) {
-        /* No SD Open Player, or its comparable build is older than the
-         * internal one. Also not a preference decision: if
+               (!scan.sd_update_present || scan.sd_update_is_older ||
+                (scan.sd_update_build_comparable && !scan.sd_update_is_newer))) {
+        /* No SD Open Player, or its comparable build is older than or equal
+         * to the internal one. Also not a preference decision: if
          * the SD card is only temporarily missing, this must not clobber
          * a previously-remembered non-Internal default just because
          * neither alternate was reachable this one boot. */
         boot_path = INTERNAL_PLAYER_PATH;
     } else if (scan.sd_update_present && !scan.sd_stock_present) {
-        /* Equal or non-comparable SD builds retain the established SD-drop
-         * priority. There is still no distinct player to choose between,
-         * so do not show a menu. */
+        /* A non-comparable SD build retains the established SD-drop
+         * priority. There is no Stock player, so do not show a menu. */
         boot_path = SD_UPDATE_PLAYER_PATH;
     } else {
         int chosen_entry;

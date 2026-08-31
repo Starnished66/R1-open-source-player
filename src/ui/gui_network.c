@@ -1353,7 +1353,7 @@ static lv_obj_t * build_bt_dac_overlay_screen(void) {
     lv_obj_add_event_cb(back_btn, bt_dac_overlay_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * icon = lv_image_create(scr);
     lv_image_set_src(icon, asset_path("bt/bt.png"));
@@ -2083,7 +2083,7 @@ static lv_obj_t * build_usb_dac_overlay_screen(void) {
     lv_obj_add_event_cb(back_btn, usb_dac_overlay_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * icon = lv_image_create(scr);
     lv_image_set_src(icon, asset_path("usb/usb.png"));
@@ -2640,7 +2640,7 @@ static lv_obj_t * build_import_wifi_screen(void) {
     lv_obj_add_event_cb(back_btn, import_wifi_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Import via Wi-Fi");
@@ -2859,7 +2859,7 @@ static lv_obj_t * build_airplay_overlay_screen(void) {
     lv_obj_add_event_cb(back_btn, airplay_overlay_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     airplay_overlay_cover_img = lv_image_create(scr);
     lv_image_set_src(airplay_overlay_cover_img, asset_path("playing_plane/default_cover_565.png"));
@@ -3181,7 +3181,7 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Remote Control");

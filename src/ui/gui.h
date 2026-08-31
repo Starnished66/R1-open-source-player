@@ -8,6 +8,12 @@
 #include "gui_library.h"
 #include "gui_queue.h"
 #include "gui_player.h"
+
+/* The back-arrow PNG's visible glyph sits above the center of its canvas;
+ * compensate without moving or shrinking the 64px touch target. */
+#ifndef BACK_ARROW_OPTICAL_Y_OFFSET
+#define BACK_ARROW_OPTICAL_Y_OFFSET 7
+#endif
 #include "gui_plugins.h"
 #include "gui_shell.h"
 #include "gui_navigation.h"

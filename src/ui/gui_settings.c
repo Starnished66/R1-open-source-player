@@ -434,7 +434,7 @@ static lv_obj_t * build_accent_color_screen(void) {
     lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Accent Color");
@@ -632,7 +632,7 @@ static lv_obj_t * build_custom_font_screen(void) {
     lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Font");
@@ -768,7 +768,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Screen Timeout");
@@ -922,7 +922,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Startup Volume");
@@ -1045,7 +1045,7 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Sleep Timer");
@@ -1176,7 +1176,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Idle Shutdown");
@@ -1375,13 +1375,20 @@ static void clock_timezone_indicator_update(void) {
 static void timezone_city_row_click_cb(int row_index) {
     if (row_index < 0 || row_index >= timezone_city_count) return;
     const timezone_entry_t * entry = &TIMEZONE_TABLE[timezone_city_indices[row_index]];
-    timezone_apply(entry->iana_id);
+    if (!timezone_apply(entry->iana_id)) {
+        show_error_toast("Failed to apply time zone");
+        return;
+    }
     snprintf(current_settings.timezone, sizeof(current_settings.timezone), "%s", entry->iana_id);
     settings_save(&current_settings);
     refresh_clock_label(); /* topbar clock reflects the new zone immediately, not just on the next periodic refresh */
     clock_timezone_indicator_update();
-    nav_pop(); /* City -> Region */
-    nav_pop(); /* Region -> Clock -- picking a leaf city completes the choice */
+    /* Skip the intermediate Region entry before starting navigation. Two
+     * immediate nav_pop() calls race their slide transitions: the first
+     * can finish later and restore Region over the intended Clock screen. */
+    int depth = gui_navigation_get_depth();
+    if (depth >= 3) nav_remove_stack_slot(depth - 2);
+    nav_pop(); /* City -> Clock -- picking a leaf city completes the choice */
 }
 
 /* Rebuilt (delete + rebuild, same idiom as gui_library_get_all_songs_screen() after a library
@@ -1717,6 +1724,7 @@ static lv_obj_t * build_clock_screen(void) {
         clock_timezone_indicator_update();
     }
     clock_update_set_time_enabled();
+    finalize_screen_navigation(scr);
     return scr;
 }
 
@@ -1736,7 +1744,7 @@ static lv_obj_t * build_clock_set_time_screen(void) {
     lv_obj_add_event_cb(back, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * arrow = lv_image_create(back);
     lv_image_set_src(arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(arrow);
+    lv_obj_align(arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "Set Time");
     lv_obj_add_style(title, &style_theme_text_primary, 0);
@@ -2524,7 +2532,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     lv_obj_t * title = lv_label_create(scr);
     lv_label_set_text(title, "PEQ");

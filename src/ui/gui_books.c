@@ -266,7 +266,7 @@ static lv_obj_t * build_text_reader_screen(void) {
     lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * back_arrow = lv_image_create(back_btn);
     lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(back_arrow);
+    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     /* Favorite toggle, top-right -- same collect_in/collect_out asset pair
      * and click-to-toggle shape as the player screen's own favorite_icon,

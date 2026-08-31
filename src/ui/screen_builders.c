@@ -343,7 +343,7 @@ static lv_obj_t * build_back_button(lv_obj_t * scr, lv_event_cb_t back_btn_cb) {
 
     lv_obj_t * arrow = lv_image_create(btn);
     lv_image_set_src(arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(arrow);
+    lv_obj_align(arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
 
     if (back_btn_cb) lv_obj_add_event_cb(btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
     return btn;

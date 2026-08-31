@@ -3268,7 +3268,7 @@ static int l_plugin_secrets_delete(lua_State * L) {
 
 static int l_plugin_get_app_info(lua_State * L) {
     lua_newtable(L);
-    lua_pushstring(L, "Beta 1"); lua_setfield(L, -2, "version");
+    lua_pushstring(L, "Beta 2"); lua_setfield(L, -2, "version");
 #if defined(TEST_BUILD_TAG)
     lua_pushstring(L, TEST_BUILD_TAG); lua_setfield(L, -2, "build");
 #elif defined(BUILD_STAMP)

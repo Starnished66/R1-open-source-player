@@ -405,11 +405,11 @@ static lv_obj_t * build_about_screen(void) {
      * but the same "which build is this" question still matters. */
     static char version_line[64];
 #if defined(TEST_BUILD_TAG)
-    snprintf(version_line, sizeof(version_line), "Beta 1 (%s)", TEST_BUILD_TAG);
+    snprintf(version_line, sizeof(version_line), "Beta 2 (%s)", TEST_BUILD_TAG);
 #elif defined(BUILD_STAMP)
-    snprintf(version_line, sizeof(version_line), "Beta 1 (%s)", BUILD_STAMP);
+    snprintf(version_line, sizeof(version_line), "Beta 2 (%s)", BUILD_STAMP);
 #else
-    snprintf(version_line, sizeof(version_line), "Beta 1");
+    snprintf(version_line, sizeof(version_line), "Beta 2");
 #endif
     items[0] = (pill_list_item_t){ "Open Source Player for HiBy OS", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };

@@ -522,6 +522,14 @@ int main(void) {
         scanner_save_last_boot(chosen_entry);
     }
 
+    /* The build-stamp comparison reads the SD Open Player in full. If Stock
+     * won the menu, those cached pages are unused and recreate the exact
+     * memory-pressure difference from the failing both-binaries case. Drop
+     * them before releasing the framebuffer and handing the reserved HGL
+     * DMA block across exec. No-op when there was no SD update to scan. */
+    if (strcmp(boot_path, SD_STOCK_PLAYER_PATH) == 0 && scan.sd_update_present) {
+        scanner_drop_sd_update_cache();
+    }
     if (fb_ready) fb_close();
     run_player_supervised(boot_path);
     return 1; /* unreachable -- run_player_supervised() never returns */

@@ -1,7 +1,10 @@
+#define _POSIX_C_SOURCE 200112L
+
 #include "scanner.h"
 #include "sd_ready.h"
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +129,24 @@ static bool extract_build_stamp(const char * path, char * out, size_t out_size) 
 
     fclose(f);
     return found;
+}
+
+void scanner_drop_sd_update_cache(void) {
+    int fd = open(SD_UPDATE_PLAYER_PATH, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+
+    /* extract_build_stamp() reads this executable in full. That is useful
+     * cache when it is about to boot, but pure memory pressure when Stock
+     * was selected instead. On this 56 MiB device it can split the HGL DMA
+     * reservation as Stock reacquires it during exec. Drop only this extra
+     * SD cache and only on that handoff; all normal Open Player paths retain
+     * their useful warm executable pages. Best-effort for filesystems which
+     * do not implement POSIX_FADV_DONTNEED. */
+    int rc = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    if (rc != 0) {
+        fprintf(stderr, "scanner: failed to drop SD update page cache: %s\n", strerror(rc));
+    }
+    close(fd);
 }
 
 /* >0 if sd_path's BUILD_STAMP is lexically greater ("newer") than

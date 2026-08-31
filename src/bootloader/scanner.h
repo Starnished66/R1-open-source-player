@@ -133,6 +133,11 @@ typedef struct {
  * first. */
 void scanner_scan(scan_result_t * out);
 
+/* Discards clean page-cache pages populated while extracting the SD Open
+ * Player's build stamp. Call only when handing off to Stock; an Open Player
+ * launch benefits from retaining those already-read executable pages. */
+void scanner_drop_sd_update_cache(void);
+
 /* Persists `entry` (a BOOT_ENTRY_* value) as the new default for the next
  * boot's countdown/highlighted entry -- called once boot_choice_path (see
  * main.c) is actually about to be handed off to, whether that was reached

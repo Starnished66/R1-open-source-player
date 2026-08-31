@@ -112,7 +112,7 @@ typedef struct {
     int y;
     int height;
     const char * line1;
-    const char * line2;
+    char line2[40];
     int boot_entry; /* a BOOT_ENTRY_* value (scanner.h) -- which real choice this card represents */
 } card_layout_t;
 
@@ -178,8 +178,9 @@ static void draw_menu(const card_layout_t * cards, int count, int selected, int 
 /* Runs the actual selector: input/countdown loop, returns the BOOT_ENTRY_*
  * the user picked or the timeout confirmed. Only called when scanner_scan()
  * has already established there IS a real choice to make (sd_stock_present)
- * -- the no-alternate and newer-update cases in main() never reach this at
- * all, matching the "instant boot, no delay" objective for those. */
+ * -- the no-alternate and newer-update-without-Stock cases in main() never
+ * reach this at all, matching the "instant boot, no delay" objective for
+ * those. */
 static long elapsed_ms_since(const struct timespec * start) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -195,12 +196,20 @@ static long elapsed_ms_since(const struct timespec * start) {
  * way "STOCK PLAYER" is distinguished from it by title alone. */
 static int build_cards(const scan_result_t * scan, card_layout_t * cards) {
     int count = 0;
-    cards[count++] = (card_layout_t) { 0, 0, "OPEN PLAYER", "INTERNAL", BOOT_ENTRY_INTERNAL };
+    cards[count] = (card_layout_t) { .line1 = "OPEN PLAYER", .boot_entry = BOOT_ENTRY_INTERNAL };
+    snprintf(cards[count].line2, sizeof(cards[count].line2), "INTERNAL%s%.10s",
+             scan->internal_build_stamp[0] ? "  " : "", scan->internal_build_stamp);
+    count++;
     if (scan->sd_update_present) {
-        cards[count++] = (card_layout_t) { 0, 0, "OPEN PLAYER", "SD CARD", BOOT_ENTRY_SD_UPDATE };
+        cards[count] = (card_layout_t) { .line1 = "OPEN PLAYER", .boot_entry = BOOT_ENTRY_SD_UPDATE };
+        snprintf(cards[count].line2, sizeof(cards[count].line2), "SD CARD%s%.10s",
+                 scan->sd_update_build_stamp[0] ? "  " : "", scan->sd_update_build_stamp);
+        count++;
     }
     if (scan->sd_stock_present) {
-        cards[count++] = (card_layout_t) { 0, 0, "STOCK PLAYER", "SD CARD", BOOT_ENTRY_SD_STOCK };
+        cards[count] = (card_layout_t) { .line1 = "STOCK PLAYER", .boot_entry = BOOT_ENTRY_SD_STOCK };
+        snprintf(cards[count].line2, sizeof(cards[count].line2), "SD CARD");
+        count++;
     }
     layout_cards(cards, count);
     return count;
@@ -468,40 +477,32 @@ int main(void) {
 
     const char * boot_path;
 
-    if (scan.sd_update_is_newer) {
-        /* Auto-adopt path -- see scanner.h's own doc comment. No menu:
-         * this is meant to feel like the internal player itself got
-         * newer, not like a boot chooser appeared. Not a dual-boot
-         * preference decision -- never touches the persisted default
-         * below. */
+    if (!scan.sd_stock_present && scan.sd_update_is_newer) {
+        /* Auto-adopt path -- see scanner.h's own doc comment. This is safe
+         * to skip the menu only when Stock is absent: hiby_player is a
+         * genuinely different boot choice and must always make the chooser
+         * visible. Not a dual-boot preference decision -- never touches the
+         * persisted default below. */
         boot_path = SD_UPDATE_PLAYER_PATH;
-    } else if (!scan.sd_stock_present && !scan.sd_update_present) {
-        /* Nothing to choose between. Also not a preference decision: if
+    } else if (!scan.sd_stock_present &&
+               (!scan.sd_update_present || scan.sd_update_is_older)) {
+        /* No SD Open Player, or its comparable build is older than the
+         * internal one. Also not a preference decision: if
          * the SD card is only temporarily missing, this must not clobber
          * a previously-remembered non-Internal default just because
          * neither alternate was reachable this one boot. */
         boot_path = INTERNAL_PLAYER_PATH;
     } else if (scan.sd_update_present && !scan.sd_stock_present) {
-        /* Real-device bug report: an SD update present but NOT stock
-         * still showed the full menu/countdown, even though there is
-         * nothing genuinely different to choose between -- Internal vs.
-         * the same app copied to SD isn't a real dual-boot decision the
-         * way Internal-vs-Stock is, and scanner_scan() already makes this
-         * the default entry unconditionally whenever it's present (see
-         * its own comment). Waiting through a countdown to confirm a
-         * choice that was never actually in doubt is pure friction, not
-         * caution -- boot it directly, same as the sd_update_is_newer
-         * case above, regardless of whether it happens to be newer.
-         * Distinct from that branch only in that boot_path is chosen for
-         * a different reason (presence, not recency) -- also not a
-         * preference decision, same reasoning as the branch above. */
+        /* Equal or non-comparable SD builds retain the established SD-drop
+         * priority. There is still no distinct player to choose between,
+         * so do not show a menu. */
         boot_path = SD_UPDATE_PLAYER_PATH;
     } else {
         int chosen_entry;
         if (!fb_ready) {
             /* Can't draw a menu at all -- still boot something rather than
-             * sitting on a dead screen forever. Falls back to whatever the
-             * persisted default was, without ever having shown a menu. */
+             * sitting on a dead screen forever. Falls back to the computed
+             * newest-Open-Player default without showing a menu. */
             fprintf(stderr, "open_hiby_bootloader: fb not available, booting default entry with no menu\n");
             chosen_entry = scan.default_entry;
         } else {

@@ -21,9 +21,11 @@
  *    SD card, e.g. ahead of a full firmware reflash -- BOOT_ENTRY_SD_UPDATE.
  *    When its embedded BUILD_STAMP compares strictly newer than the
  *    installed one, scanner_scan() also sets sd_update_is_newer, and
- *    main() auto-boots it directly with no menu at all (see that flag's
- *    own doc comment); it is STILL a normal, present, selectable menu
- *    entry the rest of the time (same age or not comparable). When it
+ *    main() auto-boots it directly only when the Stock alternate is absent
+ *    (see that flag's own doc comment). If hiby_player is present, the menu
+ *    is always shown and the newer Open Player remains its default entry.
+ *    It is STILL a normal, present, selectable menu entry the rest of the
+ *    time (same age or not comparable). When it
  *    compares strictly OLDER than the installed internal build, it is
  *    still present and selectable, but scanner_scan() no longer defaults
  *    to it -- the internal build having since overtaken it defaults the
@@ -66,6 +68,7 @@
 #define BOOT_ENTRY_INTERNAL 0
 #define BOOT_ENTRY_SD_STOCK 1
 #define BOOT_ENTRY_SD_UPDATE 2
+#define BOOT_BUILD_STAMP_LEN 16 /* "YYYY-MM-DD_HH:MM" */
 
 typedef struct {
     /* True if SD_STOCK_PLAYER_PATH exists and is executable -- when false,
@@ -81,23 +84,27 @@ typedef struct {
 
     /* True if sd_update_present is also true AND its embedded BUILD_STAMP
      * compares strictly newer than INTERNAL_PLAYER_PATH's own -- see
-     * scanner_scan()'s doc comment. When true, the caller boots
-     * SD_UPDATE_PLAYER_PATH directly and skips the menu/countdown
-     * entirely, regardless of what else is present or the persisted
-     * default -- this is the ONE case that bypasses the menu; every other
-     * combination of present entries goes through it normally. */
+     * scanner_scan()'s doc comment. The caller may boot it directly only
+     * when sd_stock_present is false. Stock's presence always forces the
+     * menu; this flag then keeps the newer SD Open Player selected by
+     * default. */
     bool sd_update_is_newer;
 
-    /* Persisted BOOT_ENTRY_* from the last successful boot, clamped to a
-     * valid choice for THIS scan (falls back to BOOT_ENTRY_INTERNAL if the
-     * persisted entry is no longer available, e.g. the SD card was
-     * removed, or if it points at an SD update build that a newer internal
-     * build has since overtaken) -- EXCEPT sd_update_present overrides this
-     * to BOOT_ENTRY_SD_UPDATE regardless of what was persisted, UNLESS that
-     * SD build compares strictly OLDER than the installed internal one, in
-     * which case BOOT_ENTRY_INTERNAL wins instead (see scanner_scan()'s own
-     * comment on why). This is both the initially-highlighted menu entry
-     * and what a countdown timeout confirms. */
+    /* The inverse comparison, kept separate so an equal or unreadable
+     * stamp is not guessed to be older. */
+    bool sd_update_is_older;
+
+    /* Empty when the corresponding executable has no readable embedded
+     * BUILD_STAMP. The menu displays its YYYY-MM-DD portion; including the
+     * time would exceed the card width with the bootloader's bitmap font. */
+    char internal_build_stamp[BOOT_BUILD_STAMP_LEN + 1];
+    char sd_update_build_stamp[BOOT_BUILD_STAMP_LEN + 1];
+
+    /* The newest comparable Open Player: SD when its build is newer or
+     * equal, otherwise Internal. A non-comparable SD build retains SD-drop
+     * priority. Stock is deliberately never the automatic selection. This
+     * is both the initially-highlighted menu entry and what a countdown
+     * timeout confirms. */
     int default_entry;
 
     /* Seconds before an unattended timeout confirms default_entry.
@@ -111,9 +118,10 @@ typedef struct {
  * own mount_sd_card_if_needed() does -- vfat, then exfat, then ntfs-3g,
  * against SD_DEVICE_NODE_PARTITION then SD_DEVICE_NODE_WHOLE_DISK -- then
  * populates out with the full boot decision: whether the SD "stock"
- * alternate exists (menu-worthy), whether a newer SD "update" build should
- * be auto-adopted with no menu at all, and the persisted default entry/
- * timeout to drive the menu's countdown. Never fails outright -- no SD
+ * alternate exists (and therefore forces the menu), whether a newer SD
+ * "update" build may be auto-adopted when Stock is absent, and the
+ * computed default entry plus persisted timeout for the countdown. Never
+ * fails outright -- no SD
  * card present at all, a missing/corrupt preference file, or an unreadable
  * candidate binary all degrade to "internal player, no menu, default
  * timeout" rather than blocking boot. Safe to call even if the real player

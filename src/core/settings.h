@@ -363,6 +363,10 @@ bool settings_load(player_settings_t * out);
  * mid-write can't corrupt the settings file. */
 void settings_save(const player_settings_t * settings);
 
+/* Queue a durable save without blocking the caller on filesystem syncs.
+ * Rapid requests are coalesced to the newest complete snapshot. */
+void settings_save_async(const player_settings_t * settings);
+
 /* Upserts a Saved Servers profile by URL. Does not write disk -- call
  * settings_save() after, same as every other settings mutation. */
 void settings_subsonic_server_upsert(player_settings_t * settings, const char * url, const char * username,

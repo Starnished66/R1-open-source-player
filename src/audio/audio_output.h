@@ -117,6 +117,10 @@ void audio_output_set_usb_requested(bool requested, const char * alsa_device);
  * lazy, process-lifetime tinyalsa mixer handle on first use. */
 void audio_output_set_hw_volume_raw(int raw_left, int raw_right);
 
+/* Coalesces hardware-volume writes on a dedicated process-lifetime worker,
+ * keeping mixer I/O out of LVGL and playback callbacks. */
+void audio_output_request_hw_volume_raw(int raw_left, int raw_right);
+
 /* True only while audio_output_ensure() actually has a USB audio device
  * open (not local, not Bluetooth) -- audio.c's audio_set_volume() uses
  * this to fall back to real digital PCM gain for USB specifically, since

@@ -38,6 +38,10 @@ void backlight_set_percent(int percent);
  * dimming or a full screen-off cycle. */
 void backlight_set_normal_percent(int percent);
 
+/* Coalesces normal-brightness writes on a process-lifetime worker so slider
+ * callbacks never wait on sysfs I/O. */
+void backlight_request_normal_percent(int percent);
+
 /* Temporarily lowers the lit screen without losing the user's configured
  * brightness. Passing false restores that normal brightness. */
 void backlight_set_dimmed(bool dimmed);

@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <inttypes.h>
+#include <stdatomic.h>
 
 #include "debug_log.h"
 #include "audio_helpers.h"
@@ -86,10 +87,9 @@ typedef struct {
     uint64_t total_frames;
 
     /* Local MP3 only. dr_mp3 never owns a bound seek table, so this tagged
-     * decoder owns and frees it alongside the drmp3 instance. Built lazily
-     * on the first seek of a long track; gapless prefetch therefore remains
-     * cheap and short MP3s keep their existing zero-index behavior. */
+     * decoder owns and frees it alongside the drmp3 instance. */
     drmp3_seek_point * mp3_seek_points;
+    drmp3_uint32 mp3_seek_point_count;
     bool mp3_seek_index_attempted;
 
     /* Non-NULL only for a live network stream opened via a URL (see
@@ -484,65 +484,17 @@ static decoder_read_result_t decoder_read_s16(decoder_t * dec, uint64_t frames, 
 #define MP3_SEEK_INDEX_INTERVAL_SECONDS 30u
 #define MP3_SEEK_INDEX_MAX_POINTS 256u
 
-static void prepare_mp3_seek_index(decoder_t * dec, const char * path) {
-    if (dec->mp3_seek_index_attempted) return;
-    dec->mp3_seek_index_attempted = true;
-    if (!path || dec->sample_rate == 0 ||
-        dec->total_frames < (uint64_t) dec->sample_rate * MP3_SEEK_INDEX_MIN_SECONDS) return;
-
-    uint64_t interval_frames = (uint64_t) dec->sample_rate * MP3_SEEK_INDEX_INTERVAL_SECONDS;
-    uint64_t desired = dec->total_frames / interval_frames;
-    if (desired < 2) return;
-    if (desired > MP3_SEEK_INDEX_MAX_POINTS) desired = MP3_SEEK_INDEX_MAX_POINTS;
-
-    drmp3_seek_point * points = calloc((size_t) desired, sizeof(*points));
-    drmp3 * scan = malloc(sizeof(*scan));
-    if (!points || !scan) {
-        free(points);
-        free(scan);
-        DBG_LOG("audio: MP3 seek-index allocation failed, using bounded-memory brute seek (%s)\n",
-                safe_path_tail(path));
-        return;
-    }
-
-    struct timespec started;
-    clock_gettime(CLOCK_MONOTONIC, &started);
-    drmp3_uint32 count = (drmp3_uint32) desired;
-    bool opened = drmp3_init_file(scan, path, NULL) != 0;
-    bool same_file = opened && scan->sampleRate == dec->as.mp3->sampleRate &&
-                     scan->channels == dec->as.mp3->channels &&
-                     scan->streamLength == dec->as.mp3->streamLength &&
-                     scan->streamStartOffset == dec->as.mp3->streamStartOffset &&
-                     scan->delayInPCMFrames == dec->as.mp3->delayInPCMFrames &&
-                     scan->paddingInPCMFrames == dec->as.mp3->paddingInPCMFrames;
-    bool ready = same_file && drmp3_calculate_seek_points(scan, &count, points) && count > 0;
-    if (opened) drmp3_uninit(scan);
-    free(scan);
-    if (!ready || !drmp3_bind_seek_table(dec->as.mp3, count, points)) {
-        free(points);
-        DBG_LOG("audio: MP3 seek-index build failed, using brute seek (%s)\n",
-                safe_path_tail(path));
-        return;
-    }
-
-    dec->mp3_seek_points = points;
-    struct timespec finished;
-    clock_gettime(CLOCK_MONOTONIC, &finished);
-    uint64_t elapsed_ms = (uint64_t) (finished.tv_sec - started.tv_sec) * 1000ULL;
-    if (finished.tv_nsec >= started.tv_nsec)
-        elapsed_ms += (uint64_t) (finished.tv_nsec - started.tv_nsec) / 1000000ULL;
-    else
-        elapsed_ms -= 1000ULL - (uint64_t) (started.tv_nsec - finished.tv_nsec) / 1000000ULL;
-    DBG_LOG("audio: MP3 seek index ready (%u points, %" PRIu64 " ms, %s)\n",
-            count, elapsed_ms, safe_path_tail(path));
+static bool mp3_needs_seek_index(const decoder_t * dec) {
+    return dec && !dec->net_stream && dec->type == DECODER_MP3 && dec->sample_rate > 0 &&
+           dec->total_frames >= (uint64_t) dec->sample_rate * MP3_SEEK_INDEX_MIN_SECONDS;
 }
 
-static bool decoder_seek(decoder_t * dec, uint64_t frame, const char * path) {
+static bool decoder_seek(decoder_t * dec, uint64_t frame) {
     if (dec->net_stream) return false; /* live stream -- cannot seek */
     switch (dec->type) {
         case DECODER_FLAC:   return drflac_seek_to_pcm_frame(dec->as.flac, frame) != 0;
         case DECODER_MP3:
-            if (frame > 0) prepare_mp3_seek_index(dec, path);
+            if (frame > 0 && mp3_needs_seek_index(dec) && !dec->mp3_seek_points) return false;
             return drmp3_seek_to_pcm_frame(dec->as.mp3, frame) != 0;
         case DECODER_WAV:    return drwav_seek_to_pcm_frame(dec->as.wav, frame) != 0;
         case DECODER_AIFF:   return aiff_seek_to_pcm_frame(dec->as.aiff, frame);
@@ -571,6 +523,7 @@ static void decoder_close(decoder_t * dec) {
             }
             free(dec->mp3_seek_points);
             dec->mp3_seek_points = NULL;
+            dec->mp3_seek_point_count = 0;
             if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_WAV:
@@ -650,6 +603,14 @@ static bool crossfade_enabled = false;
 
 static float volume = 1.0f;      /* UI-facing 0.0-1.0 percent, what audio_get_volume() returns */
 static float volume_gain = 1.0f; /* actual linear PCM multiplier the playback thread applies -- see audio_set_volume() */
+static atomic_uint volume_set_generation = 0;
+static pthread_once_t volume_request_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t volume_request_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t volume_request_cond = PTHREAD_COND_INITIALIZER;
+static bool volume_request_worker_ready = false;
+static bool volume_request_pending = false;
+static float volume_requested_value = 1.0f;
+static unsigned int volume_requested_generation = 0;
 static bool low_power_mode = false;
 
 /* Every explicit track start advances this generation. Pending seeks are
@@ -657,10 +618,8 @@ static bool low_power_mode = false;
 static uint64_t playback_generation = 0;
 static char * active_path = NULL; /* protected by audio_mutex */
 
-/* A seek is a coalesced command consumed by the playback thread. The former
- * detached design could overlap the current decoder, one worker decoder, a
- * completed prepared decoder, and gapless prefetch. Keeping the actual seek
- * on the owned decoder bounds that overlap regardless of tap/skip rate. */
+/* Seeks are coalesced commands on the playback-owned decoder, so rapid taps
+ * cannot stack decoder instances. */
 static bool seek_pending = false;
 static uint64_t seek_pending_frame = 0;
 static uint64_t seek_pending_playback_generation = 0;
@@ -672,6 +631,176 @@ static uint64_t current_total_frames = 0;
 static unsigned int current_sample_rate = 0;
 static audio_current_format_info_t current_format_info;
 static uint64_t current_format_generation = 0;
+
+typedef enum {
+    MP3_INDEX_READY,
+    MP3_INDEX_TRANSIENT_FAILURE,
+    MP3_INDEX_PERMANENT_FAILURE
+} mp3_index_outcome_t;
+
+typedef struct mp3_index_job {
+    char * path;
+    uint64_t generation;
+    unsigned int sample_rate;
+    unsigned int channels;
+    uint64_t stream_length;
+    uint64_t stream_start_offset;
+    uint32_t delay_frames;
+    uint32_t padding_frames;
+    drmp3_uint32 count;
+    drmp3_seek_point * points;
+    mp3_index_outcome_t outcome;
+} mp3_index_job_t;
+
+/* One scan-only decoder may exist at a time. It never touches the live
+ * decoder; the playback thread adopts only its small completed table. */
+static bool mp3_index_worker_active = false;
+static mp3_index_job_t * mp3_index_result = NULL;
+static bool mp3_seek_deferred = false;
+static uint64_t mp3_seek_deferred_frame = 0;
+static uint64_t mp3_seek_deferred_generation = 0;
+static unsigned int mp3_seek_deferred_sample_rate = 0;
+static unsigned int mp3_seek_retry_count = 0;
+static uint64_t mp3_seek_retry_after_ms = 0;
+
+#define MP3_SEEK_RETRY_MAX 3u
+#define MP3_SEEK_RETRY_DELAY_MS 500u
+
+static uint64_t monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * 1000ULL + (uint64_t) now.tv_nsec / 1000000ULL;
+}
+
+/* audio_mutex must be held. A new user/resume target gets a fresh bounded
+ * retry budget; worker retries preserve the same target and budget. */
+static void defer_mp3_seek_locked(const decoder_t * dec, uint64_t generation,
+                                  uint64_t frame) {
+    mp3_seek_deferred = true;
+    mp3_seek_deferred_frame = frame;
+    mp3_seek_deferred_generation = generation;
+    mp3_seek_deferred_sample_rate = dec->sample_rate;
+    mp3_seek_retry_count = 0;
+    mp3_seek_retry_after_ms = 0;
+}
+
+static void finish_mp3_deferred_seek_locked(void) {
+    mp3_seek_deferred = false;
+    mp3_seek_retry_count = 0;
+    mp3_seek_retry_after_ms = 0;
+}
+
+static void free_mp3_index_job(mp3_index_job_t * job) {
+    if (!job) return;
+    free(job->points);
+    free(job->path);
+    free(job);
+}
+
+static void * mp3_index_worker(void * arg) {
+    mp3_index_job_t * job = arg;
+    struct timespec started, finished;
+    (void) nice(10); /* keep the single-core playback thread responsive */
+    clock_gettime(CLOCK_MONOTONIC, &started);
+
+    job->points = calloc(job->count, sizeof(*job->points));
+    drmp3 * scan = malloc(sizeof(*scan));
+    if (!job->points || !scan) {
+        free(scan);
+        job->outcome = MP3_INDEX_TRANSIENT_FAILURE;
+    } else {
+        bool opened = drmp3_init_file(scan, job->path, NULL) != 0;
+        bool same_file = opened && scan->sampleRate == job->sample_rate &&
+                         scan->channels == job->channels &&
+                         scan->streamLength == job->stream_length &&
+                         scan->streamStartOffset == job->stream_start_offset &&
+                         scan->delayInPCMFrames == job->delay_frames &&
+                         scan->paddingInPCMFrames == job->padding_frames;
+        if (!opened)
+            job->outcome = MP3_INDEX_TRANSIENT_FAILURE;
+        else if (!same_file)
+            job->outcome = MP3_INDEX_PERMANENT_FAILURE;
+        else
+            job->outcome = drmp3_calculate_seek_points(scan, &job->count, job->points) &&
+                           job->count > 0 ? MP3_INDEX_READY : MP3_INDEX_PERMANENT_FAILURE;
+        if (opened) drmp3_uninit(scan);
+        free(scan);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &finished);
+    uint64_t elapsed_ms = (uint64_t) (finished.tv_sec - started.tv_sec) * 1000ULL;
+    if (finished.tv_nsec >= started.tv_nsec)
+        elapsed_ms += (uint64_t) (finished.tv_nsec - started.tv_nsec) / 1000000ULL;
+    else
+        elapsed_ms -= 1000ULL - (uint64_t) (started.tv_nsec - finished.tv_nsec) / 1000000ULL;
+    DBG_LOG("audio: MP3 seek-index %s (%u points, %" PRIu64 " ms, %s)\n",
+            job->outcome == MP3_INDEX_READY ? "ready" : "failed",
+            job->count, elapsed_ms, safe_path_tail(job->path));
+
+    pthread_mutex_lock(&audio_mutex);
+    mp3_index_worker_active = false;
+    mp3_index_result = job;
+    pthread_cond_signal(&audio_cond);
+    pthread_mutex_unlock(&audio_mutex);
+    return NULL;
+}
+
+/* audio_mutex must be held. Setup failures retain the target but are
+ * retried only after a delay, preventing a low-memory failure from turning
+ * the playback loop into an allocation/thread-creation spin. */
+static bool request_mp3_seek_index_locked(const decoder_t * dec, const char * path,
+                                          uint64_t generation) {
+    if (dec->mp3_seek_index_attempted) {
+        finish_mp3_deferred_seek_locked();
+        return false;
+    }
+    if (mp3_index_worker_active || mp3_index_result) return true;
+    if (monotonic_ms() < mp3_seek_retry_after_ms) return true;
+
+    uint64_t interval = (uint64_t) dec->sample_rate * MP3_SEEK_INDEX_INTERVAL_SECONDS;
+    uint64_t desired = dec->total_frames / interval;
+    if (desired < 2) {
+        finish_mp3_deferred_seek_locked();
+        return false;
+    }
+    if (desired > MP3_SEEK_INDEX_MAX_POINTS) desired = MP3_SEEK_INDEX_MAX_POINTS;
+
+    mp3_index_job_t * job = calloc(1, sizeof(*job));
+    if (!job || !(job->path = strdup(path))) {
+        free_mp3_index_job(job);
+        mp3_seek_retry_count++;
+        mp3_seek_retry_after_ms = monotonic_ms() + MP3_SEEK_RETRY_DELAY_MS;
+        DBG_LOG("audio: MP3 seek-index setup allocation failed, retry %u/%u (%s)\n",
+                mp3_seek_retry_count, MP3_SEEK_RETRY_MAX, safe_path_tail(path));
+        if (mp3_seek_retry_count >= MP3_SEEK_RETRY_MAX)
+            finish_mp3_deferred_seek_locked();
+        return mp3_seek_deferred;
+    }
+    job->generation = generation;
+    job->sample_rate = dec->as.mp3->sampleRate;
+    job->channels = dec->as.mp3->channels;
+    job->stream_length = dec->as.mp3->streamLength;
+    job->stream_start_offset = dec->as.mp3->streamStartOffset;
+    job->delay_frames = dec->as.mp3->delayInPCMFrames;
+    job->padding_frames = dec->as.mp3->paddingInPCMFrames;
+    job->count = (drmp3_uint32) desired;
+
+    pthread_t worker;
+    mp3_index_worker_active = true;
+    if (pthread_create(&worker, NULL, mp3_index_worker, job) != 0) {
+        mp3_index_worker_active = false;
+        free_mp3_index_job(job);
+        mp3_seek_retry_count++;
+        mp3_seek_retry_after_ms = monotonic_ms() + MP3_SEEK_RETRY_DELAY_MS;
+        DBG_LOG("audio: MP3 seek-index worker start failed, retry %u/%u (%s)\n",
+                mp3_seek_retry_count, MP3_SEEK_RETRY_MAX, safe_path_tail(path));
+        if (mp3_seek_retry_count >= MP3_SEEK_RETRY_MAX)
+            finish_mp3_deferred_seek_locked();
+        return mp3_seek_deferred;
+    }
+    pthread_detach(worker);
+    return true;
+}
 
 static audio_codec_t public_codec_for_decoder(decoder_type_t type) {
     switch (type) {
@@ -775,10 +904,40 @@ static void apply_gain(int16_t * buf, size_t sample_count, float gain) {
  * success; on failure dec is left in a closed/invalid state. */
 static bool reopen_decoder_at(decoder_t * dec, const char * path,
                                uint64_t last_confirmed_frame) {
+    drmp3_seek_point * saved_mp3_points = dec->mp3_seek_points;
+    drmp3_uint32 saved_mp3_count = dec->mp3_seek_point_count;
+    unsigned int saved_mp3_rate = saved_mp3_points ? dec->as.mp3->sampleRate : 0;
+    unsigned int saved_mp3_channels = saved_mp3_points ? dec->as.mp3->channels : 0;
+    uint64_t saved_mp3_length = saved_mp3_points ? dec->as.mp3->streamLength : 0;
+    uint64_t saved_mp3_offset = saved_mp3_points ? dec->as.mp3->streamStartOffset : 0;
+    uint32_t saved_mp3_delay = saved_mp3_points ? dec->as.mp3->delayInPCMFrames : 0;
+    uint32_t saved_mp3_padding = saved_mp3_points ? dec->as.mp3->paddingInPCMFrames : 0;
+    dec->mp3_seek_points = NULL;
+    dec->mp3_seek_point_count = 0;
     decoder_close(dec);
-    if (!decoder_open(dec, path)) return false;
+    if (!decoder_open(dec, path)) {
+        free(saved_mp3_points);
+        return false;
+    }
+    if (saved_mp3_points) {
+        if (dec->type != DECODER_MP3 ||
+            dec->as.mp3->sampleRate != saved_mp3_rate ||
+            dec->as.mp3->channels != saved_mp3_channels ||
+            dec->as.mp3->streamLength != saved_mp3_length ||
+            dec->as.mp3->streamStartOffset != saved_mp3_offset ||
+            dec->as.mp3->delayInPCMFrames != saved_mp3_delay ||
+            dec->as.mp3->paddingInPCMFrames != saved_mp3_padding ||
+            !drmp3_bind_seek_table(dec->as.mp3, saved_mp3_count, saved_mp3_points)) {
+            free(saved_mp3_points);
+            decoder_close(dec);
+            return false;
+        }
+        dec->mp3_seek_points = saved_mp3_points;
+        dec->mp3_seek_point_count = saved_mp3_count;
+        dec->mp3_seek_index_attempted = true;
+    }
     if (last_confirmed_frame > 0) {
-        if (!decoder_seek(dec, last_confirmed_frame, path)) {
+        if (!decoder_seek(dec, last_confirmed_frame)) {
             decoder_close(dec);
             return false;
         }
@@ -1056,13 +1215,28 @@ static void * audio_thread_func(void * arg) {
         }
         cur_open = true;
         cur_frames_played_local = 0;
+        bool initial_mp3_seek_deferred = false;
 
         if (!cur_dec.net_stream && isfinite(start_seconds) && start_seconds > 0.0) {
             double bounded_seconds = start_seconds;
             double duration_seconds = (double) cur_dec.total_frames / (double) cur_dec.sample_rate;
             if (bounded_seconds > duration_seconds) bounded_seconds = duration_seconds;
             uint64_t start_frame = (uint64_t) (bounded_seconds * (double) cur_dec.sample_rate);
-            if (decoder_seek(&cur_dec, start_frame, cur_path_local)) {
+            bool long_mp3 = mp3_needs_seek_index(&cur_dec);
+            if (long_mp3) {
+                pthread_mutex_lock(&audio_mutex);
+                defer_mp3_seek_locked(&cur_dec, cur_generation, start_frame);
+                initial_mp3_seek_deferred = request_mp3_seek_index_locked(
+                    &cur_dec, cur_path_local, cur_generation);
+                pthread_mutex_unlock(&audio_mutex);
+            }
+            if (initial_mp3_seek_deferred) {
+                DBG_LOG("audio: initial MP3 seek deferred until index is ready (%s)\n",
+                        safe_path_tail(cur_path_local));
+            } else if (long_mp3) {
+                DBG_LOG("audio: initial MP3 seek skipped because its index is unavailable (%s)\n",
+                        safe_path_tail(cur_path_local));
+            } else if (decoder_seek(&cur_dec, start_frame)) {
                 cur_frames_played_local = start_frame;
             } else {
                 DBG_LOG("audio: initial seek to frame %" PRIu64 " failed (%s), playing from start\n",
@@ -1096,6 +1270,9 @@ static void * audio_thread_func(void * arg) {
             pthread_mutex_unlock(&audio_mutex);
             continue;
         }
+#ifndef HOST_BUILD
+        if (initial_mp3_seek_deferred) close_device();
+#endif
 
         pthread_mutex_lock(&audio_mutex);
         have_current = true;
@@ -1110,6 +1287,7 @@ static void * audio_thread_func(void * arg) {
         bool was_stopped = false;
         bool ended_with_no_next = false;
         bool need_fade_in = true;
+        bool mp3_seek_output_held = initial_mp3_seek_deferred;
         unsigned int consecutive_decoder_errors = 0;
         unsigned int consecutive_nxt_decoder_errors = 0;
 
@@ -1137,7 +1315,7 @@ static void * audio_thread_func(void * arg) {
             if (paused && !stop_requested && !restart_requested) {
                 float vol = volume_gain;
                 pthread_mutex_unlock(&audio_mutex);
-                if (cur_open && cur_dec.sample_rate > 0) {
+                if (!mp3_seek_output_held && cur_open && cur_dec.sample_rate > 0) {
                     uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
                     decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
                     if (r_fade.frames > 0) {
@@ -1156,19 +1334,77 @@ static void * audio_thread_func(void * arg) {
                 pthread_mutex_lock(&audio_mutex);
             }
 #endif
-            while (paused && !stop_requested && !restart_requested && !seek_pending) {
+            while (paused && !stop_requested && !restart_requested && !seek_pending &&
+                   !mp3_index_result) {
                 pthread_cond_wait(&audio_cond, &audio_mutex);
             }
             bool do_stop = stop_requested;
             bool do_restart = restart_requested;
-            bool do_seek = seek_pending &&
-                seek_pending_playback_generation == cur_generation;
-            uint64_t seek_frame = seek_pending_is_percent
-                ? (uint64_t) ((double) cur_dec.total_frames * (seek_pending_percent / 100.0))
-                : seek_pending_frame;
+            bool do_seek = false;
+            uint64_t seek_frame = 0;
+
+            mp3_index_job_t * completed_index = mp3_index_result;
+            mp3_index_result = NULL;
+            if (completed_index && completed_index->generation == cur_generation &&
+                cur_dec.type == DECODER_MP3) {
+                bool adopted = completed_index->outcome == MP3_INDEX_READY &&
+                    drmp3_bind_seek_table(cur_dec.as.mp3, completed_index->count,
+                                          completed_index->points);
+                if (adopted) {
+                    cur_dec.mp3_seek_points = completed_index->points;
+                    cur_dec.mp3_seek_point_count = completed_index->count;
+                    completed_index->points = NULL;
+                    cur_dec.mp3_seek_index_attempted = true;
+                    if (mp3_seek_deferred &&
+                        mp3_seek_deferred_generation == cur_generation) {
+                        do_seek = true;
+                        seek_frame = mp3_seek_deferred_frame;
+                    }
+                } else {
+                    cur_dec.mp3_seek_index_attempted =
+                        completed_index->outcome != MP3_INDEX_TRANSIENT_FAILURE;
+                    if (mp3_seek_deferred_generation == cur_generation) {
+                        if (completed_index->outcome == MP3_INDEX_TRANSIENT_FAILURE &&
+                            ++mp3_seek_retry_count < MP3_SEEK_RETRY_MAX) {
+                            mp3_seek_retry_after_ms = monotonic_ms() + MP3_SEEK_RETRY_DELAY_MS;
+                        } else {
+                            finish_mp3_deferred_seek_locked();
+                        }
+                    }
+                }
+            }
+
+            if (seek_pending && seek_pending_playback_generation == cur_generation) {
+                do_seek = true;
+                seek_frame = seek_pending_is_percent
+                    ? (uint64_t) ((double) cur_dec.total_frames * (seek_pending_percent / 100.0))
+                    : seek_pending_frame;
+            }
             if (seek_pending) seek_pending = false;
+
+            if (do_seek && seek_frame > 0 && mp3_needs_seek_index(&cur_dec) &&
+                !cur_dec.mp3_seek_points) {
+                if (!cur_dec.mp3_seek_index_attempted) {
+                    defer_mp3_seek_locked(&cur_dec, cur_generation, seek_frame);
+                    request_mp3_seek_index_locked(&cur_dec, cur_path_local,
+                                                  cur_generation);
+                } else {
+                    DBG_LOG("audio: MP3 seek ignored because its index is unavailable (%s)\n",
+                            safe_path_tail(cur_path_local));
+                }
+                do_seek = false;
+            } else if (!do_seek && mp3_seek_deferred &&
+                       mp3_seek_deferred_generation == cur_generation &&
+                       !mp3_index_worker_active && !cur_dec.mp3_seek_index_attempted &&
+                       mp3_needs_seek_index(&cur_dec)) {
+                request_mp3_seek_index_locked(&cur_dec, cur_path_local, cur_generation);
+            }
+            bool hold_for_mp3_seek = mp3_seek_deferred &&
+                                     mp3_seek_deferred_generation == cur_generation &&
+                                     !do_seek;
             bool xfade_on = crossfade_enabled;
             float vol = volume_gain;
+            bool remain_paused = paused;
             uint64_t chunk_frames = low_power_mode ? LOW_POWER_CHUNK_FRAMES : NORMAL_CHUNK_FRAMES;
 
             /* Phase 3: Stack-buffered owned snapshot of next track metadata.
@@ -1189,6 +1425,7 @@ static void * audio_thread_func(void * arg) {
             bool staged_next_replaygain_applied = staged_next.replaygain_applied;
             uint64_t staged_next_generation = staged_next.generation;
             pthread_mutex_unlock(&audio_mutex);
+            free_mp3_index_job(completed_index);
 
 #ifndef HOST_BUILD
             /* Real-device bug: connecting Bluetooth headphones mid-track (the
@@ -1206,12 +1443,13 @@ static void * audio_thread_func(void * arg) {
              * nothing extra when nothing changed. Best-effort -- write_device()
              * below skips writing rather than crashing if this fails, and the
              * next iteration tries again. */
-            ensure_device(cur_dec.channels, cur_dec.sample_rate);
+            if (!hold_for_mp3_seek)
+                ensure_device(cur_dec.channels, cur_dec.sample_rate);
 #endif
 
             if (do_restart || do_stop) {
                 /* Phase 4: Controlled transition ramp-down on manual stop/restart */
-                if (cur_open && cur_dec.sample_rate > 0) {
+                if (!mp3_seek_output_held && cur_open && cur_dec.sample_rate > 0) {
                     uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
                     decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
                     if (r_fade.frames > 0) {
@@ -1233,6 +1471,43 @@ static void * audio_thread_func(void * arg) {
                 break;
             }
 
+            if (hold_for_mp3_seek) {
+                if (!mp3_seek_output_held) {
+                    close_decoder_if_open(&nxt_dec, &nxt_open);
+                    nxt_format_matches = false;
+#ifndef HOST_BUILD
+                    close_device();
+#endif
+                    mp3_seek_output_held = true;
+                    need_fade_in = true;
+                }
+                /* Worker completion and transport commands signal audio_cond.
+                 * The timeout only services a delayed transient retry. */
+                struct timespec wake;
+                clock_gettime(CLOCK_REALTIME, &wake);
+                wake.tv_nsec += 100000000L;
+                if (wake.tv_nsec >= 1000000000L) {
+                    wake.tv_sec++;
+                    wake.tv_nsec -= 1000000000L;
+                }
+                pthread_mutex_lock(&audio_mutex);
+                if (mp3_seek_deferred &&
+                    mp3_seek_deferred_generation == cur_generation &&
+                    !stop_requested && !restart_requested && !seek_pending &&
+                    !mp3_index_result)
+                    pthread_cond_timedwait(&audio_cond, &audio_mutex, &wake);
+                pthread_mutex_unlock(&audio_mutex);
+                continue;
+            }
+
+            /* A permanent failure or exhausted transient retry resumes from
+             * the confirmed decoder cursor, with the same fade-in used after
+             * a successful seek. */
+            if (remain_paused && !do_seek)
+                continue;
+            if (mp3_seek_output_held && !do_seek)
+                mp3_seek_output_held = false;
+
             if (do_seek) {
                 /* Network decoders are forward-only. Keep this guard at the
                  * owner thread as well as the public API: a seek may be
@@ -1244,10 +1519,9 @@ static void * audio_thread_func(void * arg) {
                     continue;
                 }
 
-                /* Smooth seek on the owned playback decoder. The first seek
-                 * in a long MP3 may briefly open one scan-only drmp3 to build
-                 * its bounded table; it is freed before the seek is applied. */
-                if (cur_open && cur_dec.sample_rate > 0) {
+                /* Smooth seek on the playback-owned decoder. Long MP3s reach
+                 * this point only after their bounded table is ready. */
+                if (!mp3_seek_output_held && cur_open && cur_dec.sample_rate > 0) {
                     uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
                     decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
                     if (r_fade.frames > 0) {
@@ -1268,16 +1542,23 @@ static void * audio_thread_func(void * arg) {
                 close_decoder_if_open(&nxt_dec, &nxt_open);
                 nxt_format_matches = false;
                 if (seek_frame > cur_dec.total_frames) seek_frame = cur_dec.total_frames;
-                if (decoder_seek(&cur_dec, seek_frame, cur_path_local)) {
+                if (decoder_seek(&cur_dec, seek_frame)) {
                     cur_frames_played_local = seek_frame;
                     pthread_mutex_lock(&audio_mutex);
                     frames_played = cur_frames_played_local;
+                    if (mp3_seek_deferred_generation == cur_generation)
+                        finish_mp3_deferred_seek_locked();
                     pthread_mutex_unlock(&audio_mutex);
+                    mp3_seek_output_held = remain_paused;
                     need_fade_in = true;
                     consecutive_decoder_errors = 0;
                 } else {
                     DBG_LOG("audio: seek to frame %" PRIu64 " failed (%s)\n",
                             seek_frame, safe_path_tail(cur_path_local));
+                    pthread_mutex_lock(&audio_mutex);
+                    if (mp3_seek_deferred_generation == cur_generation)
+                        finish_mp3_deferred_seek_locked();
+                    pthread_mutex_unlock(&audio_mutex);
                     /* Some codecs reset internal state before they can know
                      * the seek will fail (AAC closes/recreates its handle,
                      * Opus moves the demux cursor before discarding). Restore
@@ -1299,6 +1580,7 @@ static void * audio_thread_func(void * arg) {
                         goto inner_loop_done;
                     }
                     cur_open = true;
+                    mp3_seek_output_held = remain_paused;
                     need_fade_in = true;
                     consecutive_decoder_errors = 0;
                 }
@@ -2019,6 +2301,21 @@ double audio_get_position_seconds(void) {
     return result;
 }
 
+double audio_get_resume_position_seconds(void) {
+    pthread_mutex_lock(&audio_mutex);
+    double result;
+    if (mp3_seek_deferred && mp3_seek_deferred_generation == playback_generation &&
+        mp3_seek_deferred_sample_rate > 0) {
+        result = (double) mp3_seek_deferred_frame /
+                 (double) mp3_seek_deferred_sample_rate;
+    } else {
+        result = current_sample_rate != 0
+            ? (double) frames_played / (double) current_sample_rate : 0.0;
+    }
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
+}
+
 double audio_get_duration_seconds(void) {
     pthread_mutex_lock(&audio_mutex);
     double result = (current_sample_rate != 0)
@@ -2159,7 +2456,7 @@ static int volume_db_to_hw_raw(double db) {
  * the same digital-attenuation-shaped noise this whole redesign exists to
  * avoid, for no worthwhile loudness gain. */
 /* Real-device bug report: volume did nothing with a USB headphone/DAC
- * connected. Hardware attenuation (audio_output_set_hw_volume_raw() below)
+ * connected. Hardware attenuation (audio_output_request_hw_volume_raw() below)
  * only ever reaches this device's own internal codec -- USB output instead
  * pipes raw PCM to a separate `aplay -D plughw:<card>,0` process/ALSA card
  * that never touches that mixer (see audio_output_is_usb_active()'s own
@@ -2174,20 +2471,73 @@ static int volume_db_to_hw_raw(double db) {
  * already handled by a completely separate, working AVRCP-based mechanism
  * (bluetooth_control.c's bt_source_vol_sync_thread_func()) that has
  * nothing to do with this app's own PCM gain, so it must be left alone. */
-void audio_set_volume(float new_volume) {
+/* Apply only if no newer synchronous or queued request has superseded this
+ * generation. The check and state update share audio_mutex, so a worker
+ * that races a release-time audio_set_volume() cannot restore an older
+ * drag sample afterward. */
+static void audio_apply_volume(float new_volume, unsigned int generation) {
     if (new_volume < 0.0f) new_volume = 0.0f;
     if (new_volume > 1.0f) new_volume = 1.0f;
     pthread_mutex_lock(&audio_mutex);
+    if (atomic_load(&volume_set_generation) != generation) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
+    }
     volume = new_volume;
     volume_gain = (new_volume <= 0.0f) ? 0.0f : 1.0f;
 #ifndef HOST_BUILD
     int raw = (new_volume <= 0.0f) ? HW_VOLUME_MAX_RAW : volume_db_to_hw_raw(calibrated_taper_db((double) new_volume));
-    audio_output_set_hw_volume_raw(raw, raw);
+    audio_output_request_hw_volume_raw(raw, raw);
     if (audio_output_is_usb_active()) {
         volume_gain = (new_volume <= 0.0f) ? 0.0f : (float) pow(10.0, calibrated_taper_db((double) new_volume) / 20.0);
     }
 #endif
     pthread_mutex_unlock(&audio_mutex);
+}
+
+void audio_set_volume(float new_volume) {
+    unsigned int generation = atomic_fetch_add(&volume_set_generation, 1) + 1;
+    audio_apply_volume(new_volume, generation);
+}
+
+static void * volume_request_worker_main(void * unused) {
+    (void) unused;
+    for (;;) {
+        pthread_mutex_lock(&volume_request_mutex);
+        while (!volume_request_pending)
+            pthread_cond_wait(&volume_request_cond, &volume_request_mutex);
+        float requested = volume_requested_value;
+        unsigned int generation = volume_requested_generation;
+        volume_request_pending = false;
+        pthread_mutex_unlock(&volume_request_mutex);
+        audio_apply_volume(requested, generation);
+    }
+    return NULL;
+}
+
+static void start_volume_request_worker(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, volume_request_worker_main, NULL) == 0) {
+        pthread_detach(thread);
+        volume_request_worker_ready = true;
+    }
+}
+
+void audio_request_volume(float new_volume) {
+    if (new_volume < 0.0f) new_volume = 0.0f;
+    if (new_volume > 1.0f) new_volume = 1.0f;
+    unsigned int generation = atomic_fetch_add(&volume_set_generation, 1) + 1;
+    pthread_once(&volume_request_once, start_volume_request_worker);
+    if (!volume_request_worker_ready) {
+        audio_apply_volume(new_volume, generation);
+        return;
+    }
+    pthread_mutex_lock(&volume_request_mutex);
+    volume_requested_value = new_volume;
+    volume_requested_generation = generation;
+    volume_request_pending = true;
+    pthread_cond_signal(&volume_request_cond);
+    pthread_mutex_unlock(&volume_request_mutex);
 }
 
 float audio_get_volume(void) {

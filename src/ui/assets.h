@@ -38,4 +38,17 @@ const char * asset_path_plain(const char * relative_path);
  * back to NULL if the asset cannot be read. */
 const lv_image_dsc_t * asset_png_memory(const char * relative_path);
 
+/* Keeps one PNG decoded as an LVGL draw buffer until close. Use for large,
+ * immutable artwork that is redrawn on every animation/drag frame; unlike
+ * the global image cache, this cannot be evicted by unrelated screen art. */
+typedef struct {
+    lv_image_decoder_dsc_t decoder;
+    char * path;
+    bool open;
+} asset_decoded_image_t;
+
+bool asset_decoded_image_open(asset_decoded_image_t * image, const char * relative_path);
+void asset_decoded_image_close(asset_decoded_image_t * image);
+const void * asset_decoded_image_source(const asset_decoded_image_t * image);
+
 #endif /* ASSETS_H */

@@ -554,7 +554,8 @@ static void update_timer_cb(lv_timer_t * timer) {
      * and persisted representation here on the sole LVGL thread, so the
      * next hardware-button step starts from what the user actually hears. */
     int bt_synced_volume_percent;
-    if (bt_control_source_volume_sync_consume_percent(&bt_synced_volume_percent)) {
+    if (bt_control_source_volume_sync_consume_percent(&bt_synced_volume_percent) &&
+        !gui_player_volume_is_being_adjusted()) {
         gui_player_set_volume_percent(bt_synced_volume_percent);
         current_settings.volume = (float) bt_synced_volume_percent / 100.0f;
         settings_save(&current_settings);
@@ -597,7 +598,8 @@ static void update_timer_cb(lv_timer_t * timer) {
         audio_seek((double) remote_seek_seconds);
     }
     int remote_volume_percent;
-    if (remote_control_consume_volume(&remote_volume_percent)) {
+    if (remote_control_consume_volume(&remote_volume_percent) &&
+        !gui_player_volume_is_being_adjusted()) {
         gui_player_set_volume_percent(remote_volume_percent);
         audio_set_volume((float) remote_volume_percent / 100.0f);
         current_settings.volume = (float) remote_volume_percent / 100.0f;
@@ -837,7 +839,7 @@ static void update_timer_cb(lv_timer_t * timer) {
         }
 
         if (car_shutdown_pending && !shutdown_background_work_active()) {
-            current_settings.last_position = audio_get_position_seconds();
+            current_settings.last_position = audio_get_resume_position_seconds();
             settings_save(&current_settings);
             idle_shutdown_now(); /* full poweroff -- does not return, see idle_shutdown.h */
         }

@@ -114,3 +114,32 @@ const lv_image_dsc_t * asset_png_memory(const char * relative_path) {
     dsc->data_size = (uint32_t) st.st_size;
     return dsc;
 }
+
+bool asset_decoded_image_open(asset_decoded_image_t * image, const char * relative_path) {
+    if (!image || !relative_path) return false;
+    asset_decoded_image_close(image);
+
+    image->path = (char *) asset_path(relative_path);
+    if (!image->path) return false;
+
+    lv_image_decoder_args_t args = { .no_cache = true };
+    if (lv_image_decoder_open(&image->decoder, image->path, &args) != LV_RESULT_OK ||
+        !image->decoder.decoded) {
+        free(image->path);
+        memset(image, 0, sizeof(*image));
+        return false;
+    }
+    image->open = true;
+    return true;
+}
+
+void asset_decoded_image_close(asset_decoded_image_t * image) {
+    if (!image) return;
+    if (image->open) lv_image_decoder_close(&image->decoder);
+    free(image->path);
+    memset(image, 0, sizeof(*image));
+}
+
+const void * asset_decoded_image_source(const asset_decoded_image_t * image) {
+    return image && image->open ? image->decoder.decoded : NULL;
+}

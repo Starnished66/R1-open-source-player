@@ -26,6 +26,7 @@ void gui_shell_build_screens(uint32_t screen_width, uint32_t screen_height);
  * status bar, home indicator bar, quick drawer) -- see its own comment.
  * Used by gui_reload.c before calling gui_shell_build_screens() again. */
 void gui_shell_teardown(void);
+void gui_shell_refresh_static_assets(void);
 void refresh_clock_label(void);
 void refresh_battery_topbar(void);
 void refresh_wifi_topbar(void);

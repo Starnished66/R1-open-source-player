@@ -56,12 +56,17 @@ static lv_obj_t * clock_topbar_ampm = NULL;
 static lv_obj_t * volume_topbar_group = NULL;
 static lv_obj_t * volume_topbar_digit[3] = { NULL };
 static lv_obj_t * volume_topbar_headphone = NULL;
+static int volume_topbar_last_len = -1;
+static char volume_topbar_last_digits[4] = "";
 
 static int volume_warn_threshold_percent = -1;
 static lv_obj_t * quick_drawer_wifi_icon = NULL;
 static lv_obj_t * quick_drawer_bt_icon = NULL;
 
 static lv_obj_t * quick_drawer = NULL;
+static lv_obj_t * quick_drawer_brightness_icon = NULL;
+static asset_decoded_image_t quick_drawer_bg_image;
+static asset_decoded_image_t quick_drawer_brightness_image;
 static lv_obj_t * quick_drawer_motion_image = NULL;
 static lv_draw_buf_t * quick_drawer_motion_buf = NULL;
 static bool quick_drawer_bitmap_motion = false;
@@ -75,6 +80,9 @@ static bool quick_drawer_open = false;
 static void start_bt_dac_startup_reapply_if_needed(void);
 static lv_obj_t * quick_drawer_brightness_track = NULL;
 static lv_obj_t * quick_drawer_brightness_label = NULL;
+static lv_timer_t * brightness_hw_apply_timer = NULL;
+static int brightness_hw_pending = -1;
+static bool brightness_drag_active = false;
 static bool wifi_toggle_active = false;
 /* While a manual toggle or the ordinary screen-off radio restore is in
  * flight, the requested state is the UI source of truth.  wifi_on.sh
@@ -706,10 +714,21 @@ void refresh_battery_topbar(void) {
     }
 }
 
-/* Called once at startup (gui_init, with the volume loaded from settings),
- * every time the hardware volume buttons change the level
- * (update_timer_cb), and now also live while the user drags volume_popup_
- * track itself (volume_popup_track_event_cb below). */
+/* Resolve each of the ten digit assets once; asset_path() allocates. */
+static const char * topbar_digit_asset_path(char digit_char) {
+    static const char * cache[10] = { 0 };
+    int d = digit_char - '0';
+    if (d < 0 || d > 9) d = 0; /* defensive -- percent is already clamped 0-100 above, digits are always '0'-'9' */
+    if (!cache[d]) {
+        char asset[24];
+        snprintf(asset, sizeof(asset), "topbar/%d.png", d);
+        cache[d] = asset_path(asset);
+    }
+    return cache[d];
+}
+
+/* Called at startup and whenever the displayed volume changes. Skip
+ * identical strings so LVGL does not re-decode unchanged digit images. */
 void refresh_volume_topbar(int32_t percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
@@ -722,15 +741,15 @@ void refresh_volume_topbar(int32_t percent) {
      * declaration) -- guard it explicitly rather than just comparing
      * percent >= threshold, since percent >= -1 is always true. */
     bool warn = volume_warn_threshold_percent >= 0 && percent >= volume_warn_threshold_percent;
+    bool digits_changed = strcmp(volume_topbar_last_digits, digits) != 0;
 
     for (int i = 0; i < 3; i++) {
         int digit_index = i - (3 - len);
         if (digit_index < 0) {
             lv_obj_add_flag(volume_topbar_digit[i], LV_OBJ_FLAG_HIDDEN);
         } else {
-            char asset[24];
-            snprintf(asset, sizeof(asset), "topbar/%c.png", digits[digit_index]);
-            lv_image_set_src(volume_topbar_digit[i], asset_path(asset));
+            if (digits_changed)
+                lv_image_set_src(volume_topbar_digit[i], topbar_digit_asset_path(digits[digit_index]));
             lv_obj_remove_flag(volume_topbar_digit[i], LV_OBJ_FLAG_HIDDEN);
         }
         /* LV_OPA_TRANSP disables the recolor mix entirely, leaving the
@@ -739,10 +758,10 @@ void refresh_volume_topbar(int32_t percent) {
         lv_obj_set_style_image_recolor(volume_topbar_digit[i], lv_color_make(255, 0, 0), 0);
         lv_obj_set_style_image_recolor_opa(volume_topbar_digit[i], warn ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
     }
-
-    static int last_volume_len = -1;
-    if (last_volume_len != len) {
-        last_volume_len = len;
+    if (digits_changed)
+        snprintf(volume_topbar_last_digits, sizeof(volume_topbar_last_digits), "%s", digits);
+    if (volume_topbar_last_len != len) {
+        volume_topbar_last_len = len;
         sync_bt_codec_status_icon();
     }
 }
@@ -1775,6 +1794,7 @@ static lv_timer_t * quick_drawer_drag_timer = NULL;
 static bool quick_drawer_drag_tracking = false;
 static bool quick_drawer_drag_claimed = false;
 static bool quick_drawer_was_pressed = false;
+static bool drag_adjust_press_owned = false;
 static int32_t quick_drawer_drag_touch_start_y = 0;
 static int32_t quick_drawer_drag_panel_start_y = 0;
 static int32_t quick_drawer_last_velocity = 0;
@@ -1889,12 +1909,11 @@ static void wrapped_pointer_read_cb(lv_indev_t * indev, lv_indev_data_t * data) 
         }
     }
 
-    if (data->state == LV_INDEV_STATE_PRESSED) {
+    if (data->state == LV_INDEV_STATE_PRESSED &&
+        s_last_raw_pointer_state != LV_INDEV_STATE_PRESSED) {
 #ifdef UI_GESTURE_TRACE
-        if (s_last_raw_pointer_state != LV_INDEV_STATE_PRESSED) {
-            printf("[GESTURE_TRACE] raw pointer press edge detected at (%d, %d)\n",
-                   (int)data->point.x, (int)data->point.y);
-        }
+        printf("[GESTURE_TRACE] raw pointer press edge detected at (%d, %d)\n",
+               (int)data->point.x, (int)data->point.y);
 #endif
         gui_shell_resume_fast_timers();
         gui_library_resume_fast_timers();
@@ -1946,11 +1965,9 @@ void gui_shell_install_indev_hooks(lv_indev_t * indev) {
  * player screen" transition once the horizontal movement crossed
  * PLAYER_SWIPE_DEADZONE, abandoning the slider adjustment -- this was
  * never about GESTURE_BUBBLE at all, it's a completely separate polling
- * loop with no per-widget exclusions of its own. lv_indev_get_active_obj()
- * is the object LVGL's own input processing most recently hit-tested a
- * press against, so this reflects whatever's actually under the finger
- * right now, not just this timer's own idea of screen layout. */
-bool active_press_is_over_drag_adjust_widget(void) {
+ * loop with no per-widget exclusions of its own. The press owner is latched
+ * below because LVGL can re-hit-test a fast finger outside the widget. */
+static bool active_object_is_drag_adjust_widget(void) {
     lv_obj_t * act = lv_indev_get_active_obj();
     while (act) {
         if (lv_obj_check_type(act, &lv_slider_class) ||
@@ -1962,6 +1979,10 @@ bool active_press_is_over_drag_adjust_widget(void) {
         act = lv_obj_get_parent(act);
     }
     return false;
+}
+
+bool active_press_is_over_drag_adjust_widget(void) {
+    return drag_adjust_press_owned || active_object_is_drag_adjust_widget();
 }
 
 /* active_press_is_over_drag_adjust_widget() alone wasn't enough: real-
@@ -2049,6 +2070,15 @@ static bool player_swipe_press_excluded(lv_point_t p) {
     return active_press_is_over_drag_adjust_widget() || point_in_swipe_dead_zone(p);
 }
 
+static bool quick_drawer_brightness_hit_test(lv_point_t point) {
+    if (!quick_drawer_open || !quick_drawer_brightness_track) return false;
+    lv_area_t area;
+    lv_obj_get_coords(quick_drawer_brightness_track, &area);
+    lv_area_increase(&area, 44, 44); /* matches build_quick_drawer()'s hit area */
+    return point.x >= area.x1 && point.x <= area.x2 &&
+           point.y >= area.y1 && point.y <= area.y2;
+}
+
 static void poll_quick_drawer_drag(lv_timer_t * timer) {
     lv_indev_t * indev = find_pointer_indev();
     if (!indev) return;
@@ -2057,6 +2087,15 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     lv_point_t p;
     lv_indev_get_point(indev, &p);
     int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
+
+    if (pressed && !quick_drawer_was_pressed) {
+        /* Gesture ownership is decided once at press-down. A fast slider
+         * drag may leave its bounds, but it remains a slider drag until lift. */
+        drag_adjust_press_owned = active_object_is_drag_adjust_widget() ||
+                                  point_in_swipe_dead_zone(p) ||
+                                  quick_drawer_brightness_hit_test(p) ||
+                                  gui_player_volume_control_hit_test(p);
+    }
 
     gesture_home_config_t home_cfg;
     home_cfg.swipe_up_home_enabled = current_settings.swipe_up_home_enabled;
@@ -2070,7 +2109,8 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
      * its visible pill retain their existing dimensions. */
     home_cfg.band_height = HOME_INDICATOR_BAND_HEIGHT + HOME_SWIPE_HIT_EXTRA_PX;
 
-    bool home_trigger = gesture_home_state_poll(&s_home_gesture_state, &home_cfg, pressed, p.y);
+    bool home_trigger = gesture_home_state_poll(&s_home_gesture_state, &home_cfg,
+                                                pressed && !drag_adjust_press_owned, p.y);
 
     if (pressed && !quick_drawer_was_pressed) {
         /* Cancel any release-snap animation still in flight -- re-grabbing
@@ -2082,18 +2122,11 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * actually animating. */
         lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb);
 
-        /* A new press just started. If the drawer's already open, any press
-         * anywhere could be the start of a close-drag -- a plain tap on a
-         * button/slider still works fine, since a tap has ~0 movement and
-         * this only ever repositions the drawer by that same ~0 delta. If
-         * it's closed, only a press starting near the very top edge
-         * counts, so e.g. scrolling a list elsewhere never accidentally
-         * drags it open. Panel start reference is the drawer's ACTUAL
-         * current Y (not a fixed 0/-h assumption) -- with the animation
-         * just cancelled above, that could be mid-flight anywhere between
-         * fully open and fully closed, not only at one of the two
-         * endpoints. */
-        if (quick_drawer_open) {
+        /* Use the drawer's current Y so interrupted animations continue
+         * naturally. Adjustment widgets keep ownership of their drags. */
+        if (drag_adjust_press_owned) {
+            quick_drawer_drag_tracking = false;
+        } else if (quick_drawer_open) {
             quick_drawer_drag_tracking = true;
             quick_drawer_drag_panel_start_y = quick_drawer_motion_y();
         } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !gui_library_navigation_blocked()) {
@@ -2385,6 +2418,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
      * timer's own handle comment for why pausing (not just letting the
      * ~60fps tick keep firing and no-op) is what actually matters here. */
     if (!pressed) {
+        drag_adjust_press_owned = false;
 #ifdef UI_GESTURE_TRACE
         printf("[GESTURE_TRACE] poll: timer self-paused\n");
 #endif
@@ -3013,22 +3047,47 @@ static void poll_bt_apply_output_settings(void) {
 #define QUICK_DRAWER_PANEL1_TOP 59
 #define QUICK_DRAWER_PANEL1_BOTTOM 338
 #define QUICK_DRAWER_PANEL2_TOP 363
+#define BRIGHTNESS_HW_APPLY_INTERVAL_MS 50
+
+static void brightness_hw_apply_pending(void) {
+    int pending = brightness_hw_pending;
+    if (pending < 0) return;
+    brightness_hw_pending = -1;
+    backlight_request_normal_percent(pending);
+}
+
+static void brightness_hw_apply_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    brightness_hw_apply_pending();
+    if (brightness_hw_apply_timer && !brightness_drag_active && brightness_hw_pending < 0)
+        lv_timer_pause(brightness_hw_apply_timer);
+}
 
 static void quick_drawer_brightness_changed_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * slider = (lv_obj_t *) lv_event_get_target(e);
     int32_t percent = lv_slider_get_value(slider);
-    lv_obj_t * label = (lv_obj_t *) lv_event_get_user_data(e);
 
-    if (code == LV_EVENT_VALUE_CHANGED) {
-        backlight_set_normal_percent((int) percent); /* live feedback while dragging; also exits inactivity dim */
-        lv_label_set_text_fmt(label, "%d%%", (int) percent);
-        quick_drawer_mark_snapshot_dirty();
-    } else if (code == LV_EVENT_RELEASED) {
-        /* Only persist once the drag settles, not on every intermediate
-         * tick -- same as volume_popup_track_event_cb/volume_slider_event_cb. */
+    if (code == LV_EVENT_PRESSED) {
+        brightness_drag_active = true;
+        if (brightness_hw_apply_timer) {
+            lv_timer_reset(brightness_hw_apply_timer);
+            lv_timer_resume(brightness_hw_apply_timer);
+        }
+    } else if (code == LV_EVENT_VALUE_CHANGED) {
+        brightness_hw_pending = (int) percent;
+        if (quick_drawer_brightness_label)
+            lv_label_set_text_fmt(quick_drawer_brightness_label, "%d%%", (int) percent);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        brightness_drag_active = false;
+        brightness_hw_pending = (int) percent;
+        brightness_hw_apply_pending();
+        if (brightness_hw_apply_timer) lv_timer_pause(brightness_hw_apply_timer);
+        if (quick_drawer_brightness_label)
+            lv_label_set_text_fmt(quick_drawer_brightness_label, "%d%%", (int) percent);
         current_settings.brightness_percent = (int) percent;
-        settings_save(&current_settings);
+        settings_save_async(&current_settings);
+        quick_drawer_mark_snapshot_dirty(); /* one rebuild, now that the label has settled at its final value */
     }
 }
 
@@ -3040,7 +3099,9 @@ static void build_quick_drawer(void) {
     lv_obj_remove_style_all(quick_drawer);
     lv_obj_set_size(quick_drawer, w, h);
     lv_obj_set_pos(quick_drawer, 0, -h); /* fully off-screen above until opened */
-    lv_obj_set_style_bg_image_src(quick_drawer, asset_path("pull_down/bg.png"), 0);
+    const void * drawer_bg = asset_decoded_image_open(&quick_drawer_bg_image, "pull_down/bg.png")
+                           ? asset_decoded_image_source(&quick_drawer_bg_image) : NULL;
+    lv_obj_set_style_bg_image_src(quick_drawer, drawer_bg ? drawer_bg : asset_path("pull_down/bg.png"), 0);
     lv_obj_set_style_bg_opa(quick_drawer, LV_OPA_COVER, 0);
     lv_obj_remove_flag(quick_drawer, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(quick_drawer, LV_OBJ_FLAG_CLICKABLE); /* swallow touches to whatever's behind while open */
@@ -3092,9 +3153,11 @@ static void build_quick_drawer(void) {
     /* Row 2: screen brightness -- real control, via the standard Linux
      * backlight sysfs class (backlight.h), no dedicated slider-track asset
      * in this theme so it reuses the (generic-looking) volume slider's own. */
-    lv_obj_t * brightness_icon = lv_image_create(quick_drawer);
-    lv_image_set_src(brightness_icon, asset_path("pull_down/blk.png"));
-    lv_obj_align(brightness_icon, LV_ALIGN_TOP_LEFT, 40, QUICK_DRAWER_PANEL1_TOP + 174);
+    quick_drawer_brightness_icon = lv_image_create(quick_drawer);
+    const void * brightness = asset_decoded_image_open(&quick_drawer_brightness_image, "pull_down/blk.png")
+                            ? asset_decoded_image_source(&quick_drawer_brightness_image) : NULL;
+    lv_image_set_src(quick_drawer_brightness_icon, brightness ? brightness : asset_path("pull_down/blk.png"));
+    lv_obj_align(quick_drawer_brightness_icon, LV_ALIGN_TOP_LEFT, 40, QUICK_DRAWER_PANEL1_TOP + 174);
 
     quick_drawer_brightness_label = lv_label_create(quick_drawer);
     lv_obj_add_style(quick_drawer_brightness_label, &style_theme_text_primary, 0);
@@ -3134,7 +3197,10 @@ static void build_quick_drawer(void) {
      * every other quick-drawer widget's own initial state. */
     lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_KNOB);
-    lv_obj_set_style_bg_image_src(quick_drawer_brightness_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
+    const lv_image_dsc_t * cursor = gui_player_volume_cursor_image();
+    lv_obj_set_style_bg_image_src(quick_drawer_brightness_track,
+                                  cursor ? (const void *) cursor : asset_path("volume/cursor.png"),
+                                  LV_PART_KNOB);
     /* Real-device bug report: accent color didn't apply here -- see
      * apply_accent_color()'s own comment on why an image-art slider needs
      * bg_image_recolor, not just bg_color. */
@@ -3146,8 +3212,19 @@ static void build_quick_drawer(void) {
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_width(quick_drawer_brightness_track, 26, LV_PART_KNOB);
     lv_obj_set_style_height(quick_drawer_brightness_track, 26, LV_PART_KNOB);
-    lv_obj_add_event_cb(quick_drawer_brightness_track, quick_drawer_brightness_changed_cb, LV_EVENT_ALL,
-                         quick_drawer_brightness_label);
+    lv_obj_add_event_cb(quick_drawer_brightness_track, quick_drawer_brightness_changed_cb,
+                        LV_EVENT_ALL, NULL);
+    if (!brightness_hw_apply_timer) {
+        brightness_hw_apply_timer = lv_timer_create(brightness_hw_apply_timer_cb,
+                                                    BRIGHTNESS_HW_APPLY_INTERVAL_MS, NULL);
+        if (brightness_hw_apply_timer) lv_timer_pause(brightness_hw_apply_timer);
+    }
+
+    /* Stock's drawer gives this control an explicit 436x100 touch rectangle.
+     * Its neighboring icon and percentage are display-only, so matching that
+     * generous vertical capture area does not steal another control's tap. */
+    lv_obj_set_ext_click_area(quick_drawer_brightness_track, 44);
+
     refresh_quick_drawer_brightness();
 
     /* Mini now-playing card: real track title/artist/transport, reusing the
@@ -3316,15 +3393,37 @@ void gui_shell_build_screens(uint32_t screen_width, uint32_t screen_height) {
  * not as quick_drawer's own child, so it needs its own explicit delete
  * when a mid-drag reload catches it still present. */
 void gui_shell_teardown(void) {
+    if (quick_drawer_brightness_track && lv_slider_is_dragged(quick_drawer_brightness_track)) {
+        int percent = (int) lv_slider_get_value(quick_drawer_brightness_track);
+        brightness_hw_pending = percent;
+        current_settings.brightness_percent = percent;
+        settings_save(&current_settings);
+    }
+    brightness_hw_apply_pending();
+    brightness_drag_active = false;
+    if (brightness_hw_apply_timer) {
+        lv_timer_delete(brightness_hw_apply_timer);
+        brightness_hw_apply_timer = NULL;
+    }
+    brightness_hw_pending = -1;
+    volume_topbar_last_len = -1;
+    volume_topbar_last_digits[0] = '\0';
     if (quick_drawer_motion_image) {
         lv_obj_del(quick_drawer_motion_image);
         quick_drawer_motion_image = NULL;
+    }
+    if (quick_drawer_motion_buf) {
+        lv_draw_buf_destroy(quick_drawer_motion_buf);
+        quick_drawer_motion_buf = NULL;
     }
     quick_drawer_bitmap_motion = false;
     if (quick_drawer) {
         lv_obj_del(quick_drawer);
         quick_drawer = NULL;
     }
+    quick_drawer_brightness_icon = NULL;
+    asset_decoded_image_close(&quick_drawer_bg_image);
+    asset_decoded_image_close(&quick_drawer_brightness_image);
     if (status_bar_band) {
         lv_obj_del(status_bar_band);
         status_bar_band = NULL;
@@ -3341,6 +3440,21 @@ void gui_shell_teardown(void) {
         lv_obj_del(home_screen);
         home_screen = NULL;
     }
+}
+
+void gui_shell_refresh_static_assets(void) {
+    if (!quick_drawer) return;
+    asset_decoded_image_close(&quick_drawer_bg_image);
+    asset_decoded_image_close(&quick_drawer_brightness_image);
+    const void * bg = asset_decoded_image_open(&quick_drawer_bg_image, "pull_down/bg.png")
+                    ? asset_decoded_image_source(&quick_drawer_bg_image) : NULL;
+    const void * brightness = asset_decoded_image_open(&quick_drawer_brightness_image, "pull_down/blk.png")
+                            ? asset_decoded_image_source(&quick_drawer_brightness_image) : NULL;
+    lv_obj_set_style_bg_image_src(quick_drawer, bg ? bg : asset_path("pull_down/bg.png"), 0);
+    if (quick_drawer_brightness_icon)
+        lv_image_set_src(quick_drawer_brightness_icon,
+                         brightness ? brightness : asset_path("pull_down/blk.png"));
+    quick_drawer_mark_snapshot_dirty();
 }
 
 void gui_shell_refresh_home(void) {
@@ -3460,10 +3574,9 @@ void gui_shell_update_topbar(bool screen_just_woke) {
 }
 
 void gui_shell_resume_fast_timers(void) {
-    if (quick_drawer_drag_timer) {
+    if (quick_drawer_drag_timer && lv_timer_get_paused(quick_drawer_drag_timer)) {
 #ifdef UI_GESTURE_TRACE
-        bool was_paused = lv_timer_get_paused(quick_drawer_drag_timer);
-        printf("[GESTURE_TRACE] resume_fast_timers: quick_drawer_drag_timer (was_paused=%d)\n", was_paused);
+        printf("[GESTURE_TRACE] resume_fast_timers: quick_drawer_drag_timer\n");
 #endif
         lv_timer_resume(quick_drawer_drag_timer);
         lv_timer_ready(quick_drawer_drag_timer);
@@ -3477,6 +3590,7 @@ void gui_shell_reset_drag_state(void) {
 #endif
     quick_drawer_was_pressed = false;
     quick_drawer_drag_tracking = false;
+    drag_adjust_press_owned = false;
     quick_drawer_drag_claimed = false;
     quick_drawer_last_velocity = 0;
 

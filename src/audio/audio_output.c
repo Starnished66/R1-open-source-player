@@ -4,6 +4,8 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -354,12 +356,66 @@ static struct mixer * get_alsa_mixer(void) {
 }
 
 void audio_output_set_hw_volume_raw(int raw_left, int raw_right) {
+    static struct mixer_ctl * left_ctl = NULL;
+    static struct mixer_ctl * right_ctl = NULL;
+    static int last_left = INT_MIN;
+    static int last_right = INT_MIN;
+
+    if (raw_left == last_left && raw_right == last_right) return;
+
     struct mixer * mixer = get_alsa_mixer();
     if (!mixer) return;
-    struct mixer_ctl * left = mixer_get_ctl_by_name(mixer, "Left Playback Volume");
-    struct mixer_ctl * right = mixer_get_ctl_by_name(mixer, "Right Playback Volume");
-    if (left) mixer_ctl_set_value(left, 0, raw_left);
-    if (right) mixer_ctl_set_value(right, 0, raw_right);
+    if (!left_ctl) left_ctl = mixer_get_ctl_by_name(mixer, "Left Playback Volume");
+    if (!right_ctl) right_ctl = mixer_get_ctl_by_name(mixer, "Right Playback Volume");
+    if (left_ctl && raw_left != last_left && mixer_ctl_set_value(left_ctl, 0, raw_left) == 0)
+        last_left = raw_left;
+    if (right_ctl && raw_right != last_right && mixer_ctl_set_value(right_ctl, 0, raw_right) == 0)
+        last_right = raw_right;
+}
+
+static pthread_once_t volume_worker_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t volume_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t volume_worker_cond = PTHREAD_COND_INITIALIZER;
+static bool volume_worker_ready = false;
+static bool volume_worker_pending = false;
+static int volume_worker_left;
+static int volume_worker_right;
+
+static void * volume_worker_main(void * unused) {
+    (void) unused;
+    for (;;) {
+        pthread_mutex_lock(&volume_worker_mutex);
+        while (!volume_worker_pending)
+            pthread_cond_wait(&volume_worker_cond, &volume_worker_mutex);
+        int left = volume_worker_left;
+        int right = volume_worker_right;
+        volume_worker_pending = false;
+        pthread_mutex_unlock(&volume_worker_mutex);
+        audio_output_set_hw_volume_raw(left, right);
+    }
+    return NULL;
+}
+
+static void start_volume_worker(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, volume_worker_main, NULL) == 0) {
+        pthread_detach(thread);
+        volume_worker_ready = true;
+    }
+}
+
+void audio_output_request_hw_volume_raw(int raw_left, int raw_right) {
+    pthread_once(&volume_worker_once, start_volume_worker);
+    if (!volume_worker_ready) {
+        audio_output_set_hw_volume_raw(raw_left, raw_right);
+        return;
+    }
+    pthread_mutex_lock(&volume_worker_mutex);
+    volume_worker_left = raw_left;
+    volume_worker_right = raw_right;
+    volume_worker_pending = true;
+    pthread_cond_signal(&volume_worker_cond);
+    pthread_mutex_unlock(&volume_worker_mutex);
 }
 
 bool audio_output_is_usb_active(void) {

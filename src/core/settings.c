@@ -7,6 +7,7 @@ player_settings_t current_settings;
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -472,7 +473,7 @@ static void fsync_settings_dir(void) {
     close(dir_fd);
 }
 
-void settings_save(const player_settings_t * settings) {
+static void settings_write_file(const player_settings_t * settings) {
     DBG_LOG("settings_save: called (idle_suspend_enabled=%d)\n", settings->idle_suspend_enabled ? 1 : 0);
     FILE * f = fopen(SETTINGS_TMP_FILE_PATH, "w");
     if (!f) return;
@@ -539,6 +540,74 @@ void settings_save(const player_settings_t * settings) {
     fclose(f);
     rename(SETTINGS_TMP_FILE_PATH, SETTINGS_FILE_PATH);
     fsync_settings_dir();
+}
+
+/* Both synchronous callers and the coalescing worker share the same tmp
+ * file, so writes must be serialized. The generation prevents an older
+ * queued snapshot from landing after a newer synchronous save. */
+static pthread_mutex_t settings_write_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t settings_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t settings_queue_cond = PTHREAD_COND_INITIALIZER;
+static pthread_once_t settings_worker_once = PTHREAD_ONCE_INIT;
+static player_settings_t settings_queued_snapshot;
+static uint64_t settings_save_generation = 0;
+static uint64_t settings_queued_generation = 0;
+static bool settings_save_pending = false;
+static bool settings_worker_ready = false;
+
+void settings_save(const player_settings_t * settings) {
+    if (!settings) return;
+    pthread_mutex_lock(&settings_write_mutex);
+    pthread_mutex_lock(&settings_queue_mutex);
+    settings_save_generation++;
+    pthread_mutex_unlock(&settings_queue_mutex);
+    settings_write_file(settings);
+    pthread_mutex_unlock(&settings_write_mutex);
+}
+
+static void * settings_worker_main(void * unused) {
+    (void) unused;
+    for (;;) {
+        pthread_mutex_lock(&settings_queue_mutex);
+        while (!settings_save_pending)
+            pthread_cond_wait(&settings_queue_cond, &settings_queue_mutex);
+        player_settings_t snapshot = settings_queued_snapshot;
+        uint64_t generation = settings_queued_generation;
+        settings_save_pending = false;
+        pthread_mutex_unlock(&settings_queue_mutex);
+
+        pthread_mutex_lock(&settings_write_mutex);
+        pthread_mutex_lock(&settings_queue_mutex);
+        bool current = generation == settings_save_generation;
+        pthread_mutex_unlock(&settings_queue_mutex);
+        if (current) settings_write_file(&snapshot);
+        pthread_mutex_unlock(&settings_write_mutex);
+    }
+    return NULL;
+}
+
+static void settings_start_worker(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, settings_worker_main, NULL) == 0) {
+        pthread_detach(thread);
+        settings_worker_ready = true;
+    }
+}
+
+void settings_save_async(const player_settings_t * settings) {
+    if (!settings) return;
+    pthread_once(&settings_worker_once, settings_start_worker);
+    if (!settings_worker_ready) {
+        settings_save(settings);
+        return;
+    }
+
+    pthread_mutex_lock(&settings_queue_mutex);
+    settings_queued_snapshot = *settings;
+    settings_queued_generation = ++settings_save_generation;
+    settings_save_pending = true;
+    pthread_cond_signal(&settings_queue_cond);
+    pthread_mutex_unlock(&settings_queue_mutex);
 }
 
 void settings_factory_reset(void) {

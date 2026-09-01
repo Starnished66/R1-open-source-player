@@ -1,10 +1,12 @@
 #include "backlight.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #define BACKLIGHT_CLASS_DIR "/sys/class/backlight"
 
@@ -27,8 +29,10 @@ static bool find_backlight_device(char * out, size_t out_size) {
     struct dirent * entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
-        snprintf(out, out_size, "%s", entry->d_name);
-        snprintf(cached_device, sizeof(cached_device), "%s", entry->d_name);
+        size_t len = strnlen(entry->d_name, sizeof(cached_device));
+        if (len >= sizeof(cached_device) || len >= out_size) continue;
+        memcpy(out, entry->d_name, len + 1);
+        memcpy(cached_device, entry->d_name, len + 1);
         found = true;
         break;
     }
@@ -46,6 +50,17 @@ static int read_int_attr(const char * device_name, const char * attr) {
     bool ok = fscanf(f, "%d", &value) == 1;
     fclose(f);
     return ok ? value : -1;
+}
+
+/* max_brightness is a fixed device property; cache its first valid value. */
+static int brightness_fd = -1;
+static int last_written_raw = -1;
+static pthread_mutex_t backlight_io_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int get_max_brightness(const char * device_name) {
+    static int cached_max = 0;
+    if (cached_max <= 0) cached_max = read_int_attr(device_name, "max_brightness");
+    return cached_max;
 }
 
 /* Real-device bug report: writing the literal max_brightness raw value (101
@@ -95,29 +110,55 @@ static int raw_to_logical(int raw, int max) {
 }
 
 int backlight_get_percent(void) {
+    pthread_mutex_lock(&backlight_io_mutex);
     char device_name[64];
-    if (!find_backlight_device(device_name, sizeof(device_name))) return -1;
+    if (!find_backlight_device(device_name, sizeof(device_name))) {
+        pthread_mutex_unlock(&backlight_io_mutex);
+        return -1;
+    }
 
-    int max = read_int_attr(device_name, "max_brightness");
+    int max = get_max_brightness(device_name);
     int cur = read_int_attr(device_name, "brightness");
-    if (max <= 0 || cur < 0) return -1;
-    return raw_to_logical(cur, max);
+    int result = (max > 0 && cur >= 0) ? raw_to_logical(cur, max) : -1;
+    pthread_mutex_unlock(&backlight_io_mutex);
+    return result;
 }
 
 void backlight_set_percent(int percent) {
+    pthread_mutex_lock(&backlight_io_mutex);
     char device_name[64];
-    if (!find_backlight_device(device_name, sizeof(device_name))) return;
+    if (!find_backlight_device(device_name, sizeof(device_name))) goto done;
 
-    int max = read_int_attr(device_name, "max_brightness");
-    if (max <= 0) return;
+    int max = get_max_brightness(device_name);
+    if (max <= 0) goto done;
     int value = logical_to_raw(percent, max);
 
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s/brightness", BACKLIGHT_CLASS_DIR, device_name);
-    FILE * f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "%d", value);
-    fclose(f);
+    if (value == last_written_raw) goto done;
+
+    if (brightness_fd < 0) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s/brightness", BACKLIGHT_CLASS_DIR, device_name);
+        brightness_fd = open(path, O_WRONLY | O_CLOEXEC);
+        if (brightness_fd < 0) goto done;
+    }
+
+    char buf[16];
+    int n = snprintf(buf, sizeof(buf), "%d", value);
+    if (n <= 0) goto done;
+    if (lseek(brightness_fd, 0, SEEK_SET) < 0) {
+        close(brightness_fd);
+        brightness_fd = -1;
+        goto done;
+    }
+    if (write(brightness_fd, buf, (size_t) n) != n) {
+        close(brightness_fd);
+        brightness_fd = -1;
+        goto done;
+    }
+    last_written_raw = value;
+
+done:
+    pthread_mutex_unlock(&backlight_io_mutex);
 }
 
 /* Guards screen_on/restore_percent below -- accessed from both hw_buttons.c's
@@ -133,16 +174,94 @@ static bool screen_dimmed = false;
  * failed the first time we turned the screen off). Logical percent, same
  * scale as backlight_get_percent()'s own return value. */
 static int restore_percent = 80;
+static bool restore_percent_set = false;
+
+static pthread_once_t brightness_worker_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t brightness_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t brightness_worker_cond = PTHREAD_COND_INITIALIZER;
+static bool brightness_worker_ready = false;
+static bool brightness_worker_pending = false;
+
+static void write_screen_off(void) {
+    pthread_mutex_lock(&backlight_io_mutex);
+    char device_name[64];
+    if (!find_backlight_device(device_name, sizeof(device_name))) goto done;
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s/brightness", BACKLIGHT_CLASS_DIR, device_name);
+    FILE * f = fopen(path, "w");
+    if (!f) goto done;
+    fprintf(f, "0");
+    fclose(f);
+    last_written_raw = -1;
+done:
+    pthread_mutex_unlock(&backlight_io_mutex);
+}
+
+static void apply_requested_brightness(void) {
+    pthread_mutex_lock(&screen_power_mutex);
+    bool on = screen_on;
+    int normal = restore_percent;
+    int target = screen_dimmed && normal > 5 ? 5 : normal;
+    pthread_mutex_unlock(&screen_power_mutex);
+    if (on) backlight_set_percent(target);
+    else write_screen_off();
+}
+
+static void * brightness_worker_main(void * unused) {
+    (void) unused;
+    for (;;) {
+        pthread_mutex_lock(&brightness_worker_mutex);
+        while (!brightness_worker_pending)
+            pthread_cond_wait(&brightness_worker_cond, &brightness_worker_mutex);
+        brightness_worker_pending = false;
+        pthread_mutex_unlock(&brightness_worker_mutex);
+        apply_requested_brightness();
+    }
+    return NULL;
+}
+
+static void start_brightness_worker(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, brightness_worker_main, NULL) == 0) {
+        pthread_detach(thread);
+        brightness_worker_ready = true;
+    }
+}
+
+static void request_brightness_apply(void) {
+    pthread_once(&brightness_worker_once, start_brightness_worker);
+    if (!brightness_worker_ready) {
+        apply_requested_brightness();
+        return;
+    }
+    pthread_mutex_lock(&brightness_worker_mutex);
+    brightness_worker_pending = true;
+    pthread_cond_signal(&brightness_worker_cond);
+    pthread_mutex_unlock(&brightness_worker_mutex);
+}
 
 void backlight_set_normal_percent(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     pthread_mutex_lock(&screen_power_mutex);
     restore_percent = percent;
+    restore_percent_set = true;
     screen_dimmed = false;
     bool write_now = screen_on;
     pthread_mutex_unlock(&screen_power_mutex);
     if (write_now) backlight_set_percent(percent);
+}
+
+void backlight_request_normal_percent(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    pthread_mutex_lock(&screen_power_mutex);
+    restore_percent = percent;
+    restore_percent_set = true;
+    screen_dimmed = false;
+    pthread_mutex_unlock(&screen_power_mutex);
+    request_brightness_apply();
 }
 
 void backlight_set_dimmed(bool dimmed) {
@@ -152,15 +271,8 @@ void backlight_set_dimmed(bool dimmed) {
         return;
     }
     screen_dimmed = dimmed;
-    int normal = restore_percent;
     pthread_mutex_unlock(&screen_power_mutex);
-
-    /* Use an absolute ~5% ceiling rather than a fraction of the selected
-     * brightness. Forty percent of a high normal setting was still far too
-     * bright for the intended low-power/read-asleep state. Never brighten a
-     * user-selected level that is already below the dim target. */
-    int target = dimmed ? (normal < 5 ? normal : 5) : normal;
-    backlight_set_percent(target);
+    request_brightness_apply();
 }
 
 bool backlight_screen_is_on(void) {
@@ -190,34 +302,15 @@ void backlight_set_screen_on(bool on) {
          * failure sentinel) rejected valid low readings, leaving
          * restore_percent stuck at whatever it was before. >= 0 alone
          * still excludes the real failure case. */
-        if (!screen_dimmed) {
+        if (!screen_dimmed && !restore_percent_set) {
             int current = backlight_get_percent();
-            if (current >= 0) restore_percent = current;
+            if (current >= 0) {
+                restore_percent = current;
+                restore_percent_set = true;
+            }
         }
         screen_dimmed = false;
     }
-    int target_percent = restore_percent;
     pthread_mutex_unlock(&screen_power_mutex);
-
-    if (on) {
-        /* backlight_set_percent() already maps this logical percent through
-         * the same safe range backlight_get_percent() reported it from, so
-         * this can't round-trip back into the invisible-at-max-brightness
-         * bug either -- no separate clamping needed here. */
-        backlight_set_percent(target_percent);
-        return;
-    }
-
-    /* Screen truly off needs a literal 0, not just dimmed to
-     * BACKLIGHT_MIN_PERCENT -- backlight_set_percent() can never reach that
-     * (see its own safe-range mapping), so this writes directly instead. */
-    char device_name[64];
-    if (!find_backlight_device(device_name, sizeof(device_name))) return;
-
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s/brightness", BACKLIGHT_CLASS_DIR, device_name);
-    FILE * f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "0");
-    fclose(f);
+    request_brightness_apply();
 }

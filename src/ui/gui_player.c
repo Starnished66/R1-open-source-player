@@ -93,7 +93,11 @@ lv_obj_t * more_menu_popup = NULL;
 lv_obj_t * more_menu_popup_backdrop = NULL;
 
 static lv_obj_t * volume_popup_track = NULL;
+static lv_obj_t * volume_popup_speaker_icon = NULL;
 static lv_timer_t * volume_popup_hide_timer = NULL;
+static const lv_image_dsc_t * volume_cursor_image = NULL;
+static asset_decoded_image_t volume_popup_bg_image;
+static asset_decoded_image_t volume_popup_speaker_image;
 static lv_obj_t * delete_song_popup = NULL;
 static lv_obj_t * delete_song_popup_backdrop = NULL;
 static lv_obj_t * delete_song_popup_title = NULL;
@@ -125,7 +129,6 @@ extern void next_btn_event_cb(lv_event_t * e);
 extern void play_mode_tap_event_cb(lv_event_t * e);
 extern void play_mode_long_press_cb(lv_event_t * e);
 extern void slider_event_cb(lv_event_t * e);
-extern void volume_slider_event_cb(lv_event_t * e);
 extern const char * play_mode_icon_asset(play_mode_t mode);
 
 void poll_volume_popup_timeout(void) {
@@ -146,30 +149,66 @@ static void volume_popup_hide_timer_cb(lv_timer_t * timer) {
     lv_timer_pause(volume_popup_hide_timer);
 }
 
+/* Coalesce live volume feedback to at most 20 worker requests per second. */
+#define VOLUME_HW_APPLY_INTERVAL_MS 50
+static int volume_hw_pending = -1;
+static lv_timer_t * volume_hw_apply_timer = NULL;
+static bool volume_drag_active = false;
+
+static void volume_hw_apply_final(void) {
+    int pending = volume_hw_pending;
+    if (pending < 0) return;
+    volume_hw_pending = -1;
+    if (volume_slider) lv_slider_set_value(volume_slider, pending, LV_ANIM_OFF);
+    refresh_volume_topbar(pending);
+    audio_set_volume((float) pending / 100.0f);
+}
+
+static void volume_hw_apply_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    int pending = volume_hw_pending;
+    if (pending >= 0) {
+        volume_hw_pending = -1;
+        audio_request_volume((float) pending / 100.0f);
+    }
+    if (volume_hw_apply_timer && !volume_drag_active && volume_hw_pending < 0)
+        lv_timer_pause(volume_hw_apply_timer);
+}
+
+static void request_volume_hw(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    volume_hw_pending = percent;
+}
+
 /* Real-device feedback: the popup's own slider used to be display-only
  * (hw volume buttons the only way to change it) -- this makes it drag/
- * touch-able too, same PRESSED/VALUE_CHANGED/RELEASED shape as the player
- * screen's own volume_slider_event_cb, plus keeping that slider and the
- * topbar readout in sync since all three show the same value. */
+ * touch-able too. Its knob follows LVGL directly; secondary displays and
+ * hardware consume the coalesced value above. */
 static void volume_popup_track_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     int32_t percent = lv_slider_get_value(lv_event_get_target(e));
 
     if (code == LV_EVENT_PRESSED) {
+        volume_drag_active = true;
+        if (volume_hw_apply_timer) {
+            lv_timer_reset(volume_hw_apply_timer);
+            lv_timer_resume(volume_hw_apply_timer);
+        }
         /* Stop the 1.5s auto-hide countdown while a finger's still on it --
          * otherwise a slow drag could get hidden out from under the user
          * mid-interaction. */
         lv_timer_pause(volume_popup_hide_timer);
     } else if (code == LV_EVENT_VALUE_CHANGED) {
-        audio_set_volume((float) percent / 100.0f); /* live feedback while dragging */
-        lv_slider_set_value(volume_slider, percent, LV_ANIM_OFF);
+        request_volume_hw((int) percent);
         refresh_volume_topbar(percent);
-    } else if (code == LV_EVENT_RELEASED) {
-        /* Only persist once the drag settles, not on every intermediate
-         * tick -- same as volume_slider_event_cb. Resets the hide timer
-         * fresh from here rather than leaving it paused. */
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        volume_drag_active = false;
+        request_volume_hw((int) percent);
+        volume_hw_apply_final();
+        if (volume_hw_apply_timer) lv_timer_pause(volume_hw_apply_timer);
         current_settings.volume = (float) percent / 100.0f;
-        settings_save(&current_settings);
+        settings_save_async(&current_settings);
         lv_timer_reset(volume_popup_hide_timer);
         lv_timer_resume(volume_popup_hide_timer);
     }
@@ -177,7 +216,7 @@ static void volume_popup_track_event_cb(lv_event_t * e) {
 
 /* The stock rail sprites are 360 px wide. LVGL centers a background image
  * at its native size instead of scaling it to the part, so they protrude
- * from the 340 px volume rail and the dynamically narrower brightness rail.
+ * from the 360 px volume rail and the dynamically narrower brightness rail.
  * Paint those two rails natively; keep cursor.png only for the knob. */
 void configure_native_slider_rail(lv_obj_t * slider) {
     lv_obj_set_style_bg_image_src(slider, NULL, LV_PART_MAIN);
@@ -189,6 +228,22 @@ void configure_native_slider_rail(lv_obj_t * slider) {
     lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
 }
 
+const lv_image_dsc_t * gui_player_volume_cursor_image(void) {
+    if (!volume_cursor_image)
+        volume_cursor_image = asset_png_memory("volume/cursor.png");
+    return volume_cursor_image;
+}
+
+bool gui_player_volume_control_hit_test(lv_point_t point) {
+    if (!volume_popup_track || !volume_popup ||
+        lv_obj_has_flag(volume_popup, LV_OBJ_FLAG_HIDDEN)) return false;
+    lv_area_t area;
+    lv_obj_get_coords(volume_popup_track, &area);
+    lv_area_increase(&area, 24, 24); /* matches build_volume_popup()'s hit area */
+    return point.x >= area.x1 && point.x <= area.x2 &&
+           point.y >= area.y1 && point.y <= area.y2;
+}
+
 static void build_volume_popup(void) {
     lv_obj_t * top = lv_layer_top();
 
@@ -196,24 +251,31 @@ static void build_volume_popup(void) {
     lv_obj_set_size(volume_popup, 440, 60);
     lv_obj_align(volume_popup, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 12);
     lv_obj_set_style_bg_opa(volume_popup, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_bg_image_src(volume_popup, asset_path("volume/bg.png"), 0);
+    const void * popup_bg = asset_decoded_image_open(&volume_popup_bg_image, "volume/bg.png")
+                          ? asset_decoded_image_source(&volume_popup_bg_image) : NULL;
+    lv_obj_set_style_bg_image_src(volume_popup, popup_bg ? popup_bg : asset_path("volume/bg.png"), 0);
     lv_obj_set_style_border_width(volume_popup, 0, 0);
     lv_obj_set_style_pad_all(volume_popup, 0, 0);
     lv_obj_remove_flag(volume_popup, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(volume_popup, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t * speaker_icon = lv_image_create(volume_popup);
-    lv_image_set_src(speaker_icon, asset_path("volume/vol.png"));
-    lv_obj_align(speaker_icon, LV_ALIGN_LEFT_MID, 20, 0);
+    volume_popup_speaker_icon = lv_image_create(volume_popup);
+    const void * speaker = asset_decoded_image_open(&volume_popup_speaker_image, "volume/vol.png")
+                         ? asset_decoded_image_source(&volume_popup_speaker_image) : NULL;
+    lv_image_set_src(volume_popup_speaker_icon, speaker ? speaker : asset_path("volume/vol.png"));
+    lv_obj_align(volume_popup_speaker_icon, LV_ALIGN_LEFT_MID, 20, 0);
 
     volume_popup_track = lv_slider_create(volume_popup);
-    lv_obj_set_size(volume_popup_track, 340, 12);
+    lv_obj_set_size(volume_popup_track, 360, 12);
     lv_obj_align(volume_popup_track, LV_ALIGN_RIGHT_MID, -20, 0);
     lv_slider_set_range(volume_popup_track, 0, 100);
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_KNOB);
-    lv_obj_set_style_bg_image_src(volume_popup_track, asset_path("volume/cursor.png"), LV_PART_KNOB);
+    const lv_image_dsc_t * cursor = gui_player_volume_cursor_image();
+    lv_obj_set_style_bg_image_src(volume_popup_track,
+                                  cursor ? (const void *) cursor : asset_path("volume/cursor.png"),
+                                  LV_PART_KNOB);
     lv_obj_add_style(volume_popup_track, gui_theme_accent_style(), LV_PART_INDICATOR);
     lv_obj_add_style(volume_popup_track, gui_theme_accent_style(), LV_PART_KNOB);
     configure_native_slider_rail(volume_popup_track);
@@ -221,8 +283,16 @@ static void build_volume_popup(void) {
     lv_obj_set_style_height(volume_popup_track, 30, LV_PART_KNOB);
     lv_obj_add_event_cb(volume_popup_track, volume_popup_track_event_cb, LV_EVENT_ALL, NULL);
 
+    /* Stock uses a 390x60 volume control. Keep our rail unchanged visually,
+     * but give it the same forgiving vertical capture area for fast drags. */
+    lv_obj_set_ext_click_area(volume_popup_track, 24);
+
     volume_popup_hide_timer = lv_timer_create(volume_popup_hide_timer_cb, 1500, NULL);
     lv_timer_pause(volume_popup_hide_timer);
+    if (!volume_hw_apply_timer) {
+        volume_hw_apply_timer = lv_timer_create(volume_hw_apply_timer_cb, VOLUME_HW_APPLY_INTERVAL_MS, NULL);
+        if (volume_hw_apply_timer) lv_timer_pause(volume_hw_apply_timer);
+    }
 }
 
 /* Feature request: reuse the stock firmware's own "frosted mirror" look --
@@ -2068,7 +2138,6 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_flag(volume_slider, LV_OBJ_FLAG_HIDDEN);
     lv_slider_set_range(volume_slider, 0, 100);
     lv_slider_set_value(volume_slider, (int32_t) (audio_get_volume() * 100.0f), LV_ANIM_OFF);
-    lv_obj_add_event_cb(volume_slider, volume_slider_event_cb, LV_EVENT_ALL, NULL);
 
     finalize_screen_navigation(scr);
     return scr;
@@ -2079,9 +2148,14 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
 void show_volume_popup(int32_t percent) {
     if (!volume_popup || !volume_popup_track) return;
-    lv_slider_set_value(volume_popup_track, percent, LV_ANIM_OFF);
+    /* A BT/remote/hw-button echo writing the slider under a live finger
+     * snaps the knob back to the last applied value, then the next indev
+     * sample jumps it forward again. */
+    bool dragged = lv_slider_is_dragged(volume_popup_track);
+    if (!dragged)
+        lv_slider_set_value(volume_popup_track, percent, LV_ANIM_OFF);
     lv_obj_remove_flag(volume_popup, LV_OBJ_FLAG_HIDDEN);
-    if (volume_popup_hide_timer) {
+    if (volume_popup_hide_timer && !dragged) {
         lv_timer_reset(volume_popup_hide_timer);
         lv_timer_resume(volume_popup_hide_timer);
     }
@@ -3078,11 +3152,8 @@ void toggle_play_pause(void) {
          * bridge.c's run_session()) -- audio_toggle_pause() further below
          * checks !have_current and would be a guaranteed no-op here, doing
          * nothing while set_play_button_state(false) claims it did.
-         * audio_get_position_seconds() still reports the last real playback
-         * position though: frames_played/current_sample_rate aren't reset
-         * by that teardown, the same fact the AUDIO_ERROR_OUTPUT_FAILED
-         * recovery path elsewhere in this file already relies on. Resume
-         * there directly instead of falling through.
+         * Resume directly from the pending-aware checkpoint rather than
+         * falling through to a no-op pause toggle.
          *
          * Calls play_track_at_from_internal() directly (skip_airplay_
          * disconnect=true) rather than the public play_track_at_from() --
@@ -3095,7 +3166,7 @@ void toggle_play_pause(void) {
          * still settling. reset_decoder_failure_tracking() was already
          * called at the top of this function, so skip play_track_at_from()'s
          * own redundant call to it too. */
-        play_track_at_from_internal(playlist_index, audio_get_position_seconds(), true, true);
+        play_track_at_from_internal(playlist_index, audio_get_resume_position_seconds(), true, true);
         return;
     }
     if (deferred_resume_pending) {
@@ -3127,7 +3198,7 @@ void toggle_play_pause(void) {
     } else {
         /* Checkpoint the resume position on pause -- a natural point to
          * persist, and far less write-heavy than saving on every tick. */
-        current_settings.last_position = audio_get_position_seconds();
+        current_settings.last_position = audio_get_resume_position_seconds();
         settings_save(&current_settings);
         plugin_manager_notify_paused();
     }
@@ -3276,20 +3347,6 @@ void clock_24h_switch_event_cb(lv_event_t * e) {
 
 
 
-void volume_slider_event_cb(lv_event_t * e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    int32_t percent = lv_slider_get_value(lv_event_get_target(e));
-
-    if (code == LV_EVENT_VALUE_CHANGED) {
-        audio_set_volume((float) percent / 100.0f); /* live feedback while dragging */
-    } else if (code == LV_EVENT_RELEASED) {
-        /* Only persist once the drag settles, not on every intermediate tick. */
-        current_settings.volume = (float) percent / 100.0f;
-        settings_save(&current_settings);
-    }
-}
-
-
 void gui_player_init(uint32_t screen_width, uint32_t screen_height) {
     build_volume_popup();
     build_delete_song_popup();
@@ -3313,13 +3370,43 @@ void gui_player_teardown(void) {
      * would keep incorrectly pausing/resetting the NEW one on every tick,
      * never itself getting paused, instead of a clean single timer. */
     if (volume_popup_hide_timer) { lv_timer_del(volume_popup_hide_timer); volume_popup_hide_timer = NULL; }
+    if (volume_drag_active && volume_popup_track)
+        request_volume_hw((int) lv_slider_get_value(volume_popup_track));
+    if (volume_hw_pending >= 0) {
+        int pending = volume_hw_pending;
+        volume_hw_apply_final();
+        current_settings.volume = (float) pending / 100.0f;
+        settings_save(&current_settings);
+    }
+    volume_drag_active = false;
+    if (volume_hw_apply_timer) { lv_timer_delete(volume_hw_apply_timer); volume_hw_apply_timer = NULL; }
+    volume_hw_pending = -1;
     if (volume_popup) { lv_obj_del(volume_popup); volume_popup = NULL; }
+    volume_popup_speaker_icon = NULL;
+    asset_decoded_image_close(&volume_popup_bg_image);
+    asset_decoded_image_close(&volume_popup_speaker_image);
+    volume_cursor_image = NULL;
+    volume_popup_track = NULL;
     if (delete_song_popup) { lv_obj_del(delete_song_popup); delete_song_popup = NULL; }
     if (delete_song_popup_backdrop) { lv_obj_del(delete_song_popup_backdrop); delete_song_popup_backdrop = NULL; }
     if (more_menu_popup) { lv_obj_del(more_menu_popup); more_menu_popup = NULL; }
     if (more_menu_popup_backdrop) { lv_obj_del(more_menu_popup_backdrop); more_menu_popup_backdrop = NULL; }
     gui_track_info_teardown();
     if (player_screen) { lv_obj_del(player_screen); player_screen = NULL; }
+    volume_slider = NULL;
+}
+
+void gui_player_refresh_static_assets(void) {
+    if (!volume_popup) return;
+    asset_decoded_image_close(&volume_popup_bg_image);
+    asset_decoded_image_close(&volume_popup_speaker_image);
+    const void * bg = asset_decoded_image_open(&volume_popup_bg_image, "volume/bg.png")
+                    ? asset_decoded_image_source(&volume_popup_bg_image) : NULL;
+    const void * speaker = asset_decoded_image_open(&volume_popup_speaker_image, "volume/vol.png")
+                         ? asset_decoded_image_source(&volume_popup_speaker_image) : NULL;
+    lv_obj_set_style_bg_image_src(volume_popup, bg ? bg : asset_path("volume/bg.png"), 0);
+    if (volume_popup_speaker_icon)
+        lv_image_set_src(volume_popup_speaker_icon, speaker ? speaker : asset_path("volume/vol.png"));
 }
 
 
@@ -3642,7 +3729,16 @@ int32_t gui_player_get_volume_percent(void) {
 }
 
 void gui_player_set_volume_percent(int32_t percent) {
+    /* External/hardware writes are newer than any coalesced drag sample. */
+    volume_hw_pending = -1;
+    volume_drag_active = false;
+    if (volume_hw_apply_timer) lv_timer_pause(volume_hw_apply_timer);
     if (volume_slider) lv_slider_set_value(volume_slider, percent, LV_ANIM_OFF);
+}
+
+bool gui_player_volume_is_being_adjusted(void) {
+    return (volume_popup_track && lv_slider_is_dragged(volume_popup_track)) ||
+           (volume_slider && lv_slider_is_dragged(volume_slider));
 }
 
 const char * gui_player_get_now_playing_title(void) {
@@ -3712,7 +3808,7 @@ void gui_player_handle_playback_error_ex(audio_error_t err, uint64_t err_generat
 
     if (err == AUDIO_ERROR_OUTPUT_FAILED) {
         /* Checkpoint confirmed position so pressing Play can retry cleanly */
-        double pos = audio_get_position_seconds();
+        double pos = audio_get_resume_position_seconds();
         deferred_resume_position = (pos > 0.0) ? pos : 0.0;
         deferred_resume_pending = true;
         set_play_button_state(false);

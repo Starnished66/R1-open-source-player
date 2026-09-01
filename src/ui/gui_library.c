@@ -4897,7 +4897,7 @@ void gui_library_teardown(void) {
 }
 
 void gui_library_resume_fast_timers(void) {
-    if (az_index_drag_timer) {
+    if (az_index_drag_timer && lv_timer_get_paused(az_index_drag_timer)) {
         lv_timer_resume(az_index_drag_timer);
         lv_timer_ready(az_index_drag_timer);
     }

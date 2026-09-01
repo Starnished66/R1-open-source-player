@@ -8,6 +8,24 @@ launch, initially misread as a crash in the app under test.
 
 ## Remaining real-device regression tests
 
+- [ ] **Volume/brightness slider drags no longer hijack the quick drawer:**
+  press a hardware volume button to show the volume popup and drag its
+  slider with deliberately imperfect (slightly diagonal) finger motion,
+  confirm it tracks the finger smoothly end to end and the drawer never
+  animates/peeks during the drag. Open the quick drawer and repeat with its
+  brightness slider. The knob and displayed percentage must follow every
+  touch sample. Volume and brightness hardware may follow by up to 50 ms;
+  the drawer snapshot and settings persistence apply once on release. Confirm
+  fast drags that leave the slider bounds cannot trigger Home, Back, Now
+  Playing, or drawer open/close gestures before the finger is released. Confirm
+  ordinary drawer open/close drags (started off any slider) and taps on
+  drawer buttons/switches still work normally.
+
+- [ ] **Repeated slider releases do not block the UI or lose settings:**
+  drag and release each volume slider and the brightness slider repeatedly
+  in quick succession. Confirm every re-grab responds immediately, wait for
+  the final save to complete, reboot, and confirm the last values persist.
+
 - [ ] **Network streams reject seeks without stopping:** play both a plain
   radio URL and a remote/Subsonic track with a catalog duration. Tap and
   drag the progress slider, trigger any available lyrics/remote-control seek,
@@ -19,11 +37,19 @@ launch, initially misread as a crash in the app under test.
   three local, seekable songs longer than 30 minutes, preferably including
   a format that takes noticeable time to open or build its seek index. One
   test file must be a 90+ minute local MP3 audiobook: seek repeatedly both
-  forward and backward, verify its first seek builds the bounded lazy index
-  without rebooting, and listen for the first-seek index-build pause: it must
-  remain acceptably short, contain no click/pop, and return with a smooth
-  fade-in. Verify later seeks on that same track complete promptly rather
-  than brute-force decoding from the beginning. Play
+  forward and backward. On initial resume, confirm no audio from the start of
+  the file is emitted while the bounded lazy index builds; on a mid-track
+  seek, confirm playback holds at the confirmed position instead of running
+  on and jumping later. Confirm the latest requested position is applied with
+  a smooth fade-in once ready. Press Stop and skip to
+  another track while a fresh index is building; both actions must respond
+  immediately. On separate runs, pause and simulate Car Mode external-power
+  removal before the index completes, then restart and confirm the intended
+  resume/seek target was preserved rather than being replaced with the old
+  decoder position. Verify later seeks on that same track complete promptly rather
+  than brute-force decoding from the beginning. A permanently invalid index
+  must leave that file unseekable for the session rather than brute-force
+  walking it on the playback thread. Play
   track 1 and tap the progress slider several times; immediately advance
   to track 2 and repeat, continuing through at least five tracks. Confirm
   every seek lands in the selected track at approximately the requested

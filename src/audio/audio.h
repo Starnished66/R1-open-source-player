@@ -151,6 +151,10 @@ void audio_seek(double seconds);
 void audio_seek_percent(double percent);
 
 double audio_get_position_seconds(void);
+/* Pending-aware position for durable pause/power-loss checkpoints. Unlike
+ * audio_get_position_seconds(), this returns the latest deferred long-MP3
+ * seek target while its background index is still being prepared. */
+double audio_get_resume_position_seconds(void);
 double audio_get_duration_seconds(void);
 
 /* Sample rate of the currently loaded track, in Hz. 0 if nothing loaded. */
@@ -162,6 +166,9 @@ bool audio_get_current_format_info(audio_current_format_info_t * out);
 
 /* 0.0 (silent) - 1.0 (full volume). Applied as software gain on the decoded PCM. */
 void audio_set_volume(float volume);
+/* Coalesces slider-originated volume changes on a process-lifetime worker.
+ * A later synchronous audio_set_volume() always supersedes queued work. */
+void audio_request_volume(float volume);
 float audio_get_volume(void);
 
 /* Returns true (and clears the flag) exactly once when playback reached a

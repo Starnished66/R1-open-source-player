@@ -295,6 +295,8 @@ static void theme_refresh_cb(lv_timer_t * timer) {
     lv_timer_del(timer);
     theme_refresh_scheduled = false;
     lv_image_cache_drop(NULL);
+    gui_player_refresh_static_assets();
+    gui_shell_refresh_static_assets();
     /* Drop old bases before replacement. Each replacement registers one
      * fresh base; invalidating afterwards would immediately destroy those
      * three new full-screen buffers and allocate them a second time in the

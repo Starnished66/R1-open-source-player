@@ -56,7 +56,8 @@ jobs:
       - name: Build and test
         run: |
           set -euo pipefail
-          make -j2 target
+          release_label="Daily Build $(date -u +%F)"
+          make -j2 target RELEASE_LABEL="$release_label"
           make bootloader
           make sd_ready_test
 

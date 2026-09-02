@@ -57,20 +57,13 @@ static bool looks_like_build_stamp(const unsigned char * p) {
  * this runs before anything else has established how much RAM is actually
  * free) and keeps the LEXICALLY MAXIMUM substring matching
  * looks_like_build_stamp() -- deliberately not the first one found. `make
- * target` is incremental: BUILD_STAMP is evaluated once per invocation and
- * baked into every .o compiled THAT run, but an unchanged .c file's .o
- * from an EARLIER run (with an OLDER embedded stamp) is reused as-is and
- * linked in alongside it -- confirmed empirically, not hypothetically: a
- * real built binary from this same project was found (via `strings`) to
- * contain two different stamps a minute apart. Which one a byte-scan
- * happens to hit FIRST depends on link order/section placement, not on
- * which is actually newer, so taking the first match is not just
- * theoretically wrong but demonstrated wrong. Taking the max is not a
- * perfect "true full link time" (a build system change -- one always-
- * freshly-generated, uniquely-marked version unit -- would be the fully
- * correct fix) but it is far more robust than trusting scan order: the
- * newest recompiled unit's stamp reliably wins on both sides of the
- * comparison this feeds. Returns false (not true-with-empty-string) if
+ * target` is incremental: unchanged objects can still contain stamps from
+ * earlier invocations, alongside the current stamp in app_version.c (whose
+ * target object is deliberately rebuilt every invocation). Which one a byte
+ * scan hits FIRST depends on link order/section placement, so taking the
+ * lexical maximum remains required: fixed-width YYYY-MM-DD_HH:MM ordering
+ * selects app_version.c's current stamp rather than a stale object stamp.
+ * Returns false (not true-with-empty-string) if
  * the file has no such string at all, e.g. it isn't a build of this app --
  * callers must treat that as "unknown version", never as "oldest possible
  * version". */

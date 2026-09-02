@@ -7,6 +7,7 @@
 #include "plugin_json.h"
 #include "plugin_storage.h"
 #include "plugin_disabled_list.h"
+#include "app_version.h"
 #include "fallback_font.h"
 #include "mbedtls/md5.h" /* plugin.md5() -- same primitive subsonic_client.c already uses for its own token auth */
 
@@ -3370,14 +3371,8 @@ static int l_plugin_secrets_delete(lua_State * L) {
 
 static int l_plugin_get_app_info(lua_State * L) {
     lua_newtable(L);
-    lua_pushstring(L, "Beta 2"); lua_setfield(L, -2, "version");
-#if defined(TEST_BUILD_TAG)
-    lua_pushstring(L, TEST_BUILD_TAG); lua_setfield(L, -2, "build");
-#elif defined(BUILD_STAMP)
-    lua_pushstring(L, BUILD_STAMP); lua_setfield(L, -2, "build");
-#else
-    lua_pushstring(L, "unknown"); lua_setfield(L, -2, "build");
-#endif
+    lua_pushstring(L, app_version_label()); lua_setfield(L, -2, "version");
+    lua_pushstring(L, app_build_identifier()); lua_setfield(L, -2, "build");
 #ifdef HOST_BUILD
     lua_pushstring(L, "host");
 #else

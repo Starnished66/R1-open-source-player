@@ -1414,38 +1414,67 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
          * be attached at launch. That's exactly the long-running,
          * connection-order-independent behavior this needs.
          *
-         * Real-user bug report: audio played through DAC mode noticeably
+         * Real-user bug report #1: audio played through DAC mode noticeably
          * lags the video on the connected phone/PC (e.g. watching a video
-         * with the R1 as the Bluetooth headphone/DAC). Run with no flags
-         * at all (as above), bluealsa-aplay falls back to its own default
-         * ALSA playback buffer sizing, which isn't tuned for this low-
-         * latency use case. --pcm-buffer-time/--pcm-period-time (confirmed
-         * present via `bluealsa-aplay --help` on-device, v4.1.1; values in
-         * microseconds, standard ALSA tool convention) tighten that local
-         * playback buffer -- 100ms buffer / 25ms period is a conservative
-         * low-latency starting point (a 4-period buffer), not yet verified
-         * against this hardware's ALSA driver under real streamed audio;
-         * loosen if this introduces underrun crackling, tighten further if
-         * lag is still perceptible with none. Deliberately NOT a codec
-         * restriction (e.g. excluding LDAC, which has notably higher
-         * codec-level latency than SBC/AAC) -- that was already tried for
-         * this exact bluealsa invocation and reverted after it was
-         * confirmed, on a real phone, to consistently fail to ever reach
-         * AVDTP Start (see the -c SBC -c AAC removal comment above, in
-         * this same function). This flag pair is pure local ALSA output
-         * buffering downstream of bluealsa's own Bluetooth receive/decode
-         * -- it cannot touch codec negotiation or AVDTP connection setup
-         * the way that reverted restriction did, so it carries none of
-         * that regression risk. Standard A2DP still has ~100-250ms of
-         * inherent encode/transmit/decode latency baked in on the SOURCE
-         * phone/PC's side regardless (this hardware/bluealsa build has no
-         * aptX-LL/aptX-Adaptive support either, confirmed via `bluealsa
-         * --help`'s codec list) -- this trims the one stage of the
-         * pipeline actually within this device's control, not a guarantee
-         * of frame-perfect sync. */
+         * with the R1 as the Bluetooth headphone/DAC). --pcm-buffer-time/
+         * --pcm-period-time (confirmed present via `bluealsa-aplay --help`
+         * on-device, v4.1.1; values in microseconds, standard ALSA tool
+         * convention) tighten the local playback buffer downstream of
+         * bluealsa's own Bluetooth receive/decode -- pure local ALSA
+         * output buffering, cannot touch codec negotiation or AVDTP
+         * connection setup. Deliberately NOT a codec restriction (e.g.
+         * excluding LDAC, which has notably higher codec-level latency
+         * than SBC/AAC) -- that was already tried for this exact bluealsa
+         * invocation and reverted after it was confirmed, on a real phone,
+         * to consistently fail to ever reach AVDTP Start (see the -c SBC
+         * -c AAC removal comment above, in this same function). Standard
+         * A2DP still has ~100-250ms of inherent encode/transmit/decode
+         * latency baked in on the SOURCE phone/PC's side regardless (this
+         * hardware/bluealsa build has no aptX-LL/aptX-Adaptive support
+         * either, confirmed via `bluealsa --help`'s codec list) -- this
+         * trims the one stage of the pipeline actually within this
+         * device's control, not a guarantee of frame-perfect sync.
+         *
+         * Real-user bug report #2: DAC-mode audio plays cleanly for about
+         * an hour, then chops/pitches, then the Bluetooth session drops
+         * (reconnecting brings it back to normal until the next ~hour
+         * mark). The 100ms/25ms values chosen for bug report #1 above
+         * left only a 100ms local playback buffer to absorb clock drift
+         * between the phone's Bluetooth stack and this SoC's audio
+         * crystal -- at a typical 25-50ppm mismatch that buffer empties
+         * or fills (ALSA XRUN) in roughly 30-70 minutes, matching the
+         * reported chop/pitch-warble window. Each XRUN is audible: on
+         * EPIPE, bluealsa-aplay's write loop calls snd_pcm_prepare() and
+         * retries rather than exiting (confirmed against the upstream
+         * BlueALSA v4.1.1 source, utils/aplay/aplay.c, the EPIPE case in the
+         * snd_pcm_writei() retry loop) -- it does not itself drop the
+         * daemon or the Bluetooth session; what turns sustained XRUN
+         * retrying into an actual AVDTP/ACL drop is not confirmed here.
+         *
+         * --pcm-period-time must also be chosen to land on an exact
+         * integer frame count at whatever rate the phone actually
+         * negotiates, not just 44.1kHz: bluealsa-aplay's own docs
+         * (doc/bluealsa-aplay.1.rst, "--pcm-period-time") warn that a
+         * period time producing fractional frames causes rate-conversion
+         * rounding error and worsens sync drift, worse with small
+         * periods, and give period times that are multiples of 10000us
+         * as the example fix since those land on exact frame counts at
+         * both common Bluetooth rates (441 frames at 44.1kHz, 480 at
+         * 48kHz per 10000us). An earlier version of this fix used
+         * 46440us/185760us (2048 frames/4 periods, exact only at
+         * 44.1kHz -- 2229.12 frames at 48kHz, a common negotiated A2DP
+         * rate, so it would reintroduce exactly the drift this change is
+         * trying to remove) and overstated its buffer-depth gain as
+         * "roughly quadruples" when 185760/100000 is 1.86x. 50000us
+         * period / 200000us buffer (4 periods) is exact at both 44.1kHz
+         * (2205 frames) and 48kHz (2400 frames) and is 2x the old 100ms
+         * buffer -- a smaller, verifiable claim, not a guess at how much
+         * headroom it buys on real hardware. Do not go back toward
+         * 25ms/100ms, the direction that broke, or reintroduce a period
+         * time that is not an exact frame count at 48kHz. */
         char * bluealsa_aplay_argv[] = { (char *) "bluealsa-aplay",
-                                          (char *) "--pcm-buffer-time=100000",
-                                          (char *) "--pcm-period-time=25000",
+                                          (char *) "--pcm-buffer-time=200000",
+                                          (char *) "--pcm-period-time=50000",
                                           NULL };
         subprocess_spawn_daemon(bluealsa_aplay_argv);
 

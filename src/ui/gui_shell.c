@@ -2379,13 +2379,21 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         }
         player_swipe_ctx->commit = commit;
         if (commit) {
-            /* Stack bookkeeping mirroring nav_push()'s own -- the real
-             * lv_screen_load() happens inside slide_transition_done_cb()
-             * once this settle animation finishes, not here; nothing else
-             * reads the nav stack before then, so only the bookkeeping
-             * needs to be right immediately. */
+            /* Stack-only bookkeeping -- the real lv_screen_load() happens
+             * inside slide_transition_done_cb() once this settle animation
+             * finishes, not here; nothing else reads the nav stack before
+             * then, so only the bookkeeping needs to be right immediately.
+             * Real-device review finding: this used to call plain
+             * nav_push(), which itself now also calls lv_screen_load()
+             * immediately (see its own "Live A/B test" comment) -- firing
+             * LV_EVENT_SCREEN_LOAD_START/LOADED/UNLOAD_START/UNLOADED up to
+             * QUICK_DRAWER_ANIM_MS before the slide below actually
+             * finishes, and making slide_transition_done_cb()'s own later
+             * lv_screen_load() call a silent no-op. nav_push_stack_only()
+             * (gui_navigation.c) does only the bookkeeping this comment
+             * always intended. */
             if (!gui_navigation_is_top(gui_player_get_screen())) {
-                nav_push(gui_player_get_screen());
+                nav_push_stack_only(gui_player_get_screen());
             }
         }
         lv_anim_t a;
@@ -3613,6 +3621,12 @@ void gui_shell_reset_drag_state(void) {
     if (quick_drawer_drag_timer) {
         lv_timer_pause(quick_drawer_drag_timer);
     }
+}
+
+void gui_shell_player_swipe_recover(void * ctx) {
+    if ((slide_transition_ctx_t *) ctx == player_swipe_ctx) player_swipe_ctx = NULL;
+    player_swipe_tracking = false;
+    player_swipe_candidate = false;
 }
 
 bool gui_shell_has_background_work(void) {

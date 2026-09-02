@@ -410,19 +410,20 @@ static void sync_home_indicator_visibility(lv_obj_t * screen) {
                                          screen != gui_lyrics_get_screen());
 }
 
-/* Forward declarations -- real (first) tentative/actual definitions
- * further down this file, alongside poll_quick_drawer_drag()'s own
- * player-swipe state. slide_transition_anim_x_cb()'s compositor-failure
- * abort path below needs to clear these directly: a hard compositor
- * failure can happen mid-drag, and by the time it's detected, transition_
- * compositor_frame() has already torn down the compositor session itself
- * (LVGL invalidation restored, buf_act re-synced) -- what's left is purely
- * this file's OWN gesture-tracking bookkeeping, which only these three
- * variables (plus the ctx/anim cleanup already shared with the normal
- * commit/cancel path) actually hold. */
-static bool player_swipe_candidate;
-static bool player_swipe_tracking;
-static slide_transition_ctx_t * player_swipe_ctx;
+/* Real-device review finding: this file used to declare its own
+ * player_swipe_candidate/player_swipe_tracking/player_swipe_ctx statics
+ * here, reset by slide_transition_anim_x_cb()'s compositor-failure abort
+ * path below on the (wrong) assumption that they were the live gesture
+ * state. They were never set true anywhere in this file -- the real,
+ * live interactive-swipe state is gui_shell.c's own separate statics of
+ * the same name (poll_quick_drawer_drag()'s own player-swipe tracking).
+ * Resetting these dead local copies left gui_shell.c's real
+ * player_swipe_tracking true and its real player_swipe_ctx pointing at
+ * memory this function was about to lv_free() -- a real use-after-free:
+ * the very next touch-poll tick (finger still down after a compositor
+ * failure) called slide_transition_anim_x_cb() again with that freed
+ * pointer. Removed entirely in favor of gui_shell_player_swipe_recover()
+ * below, which resets the actual live state directly. */
 
 /* Shared by two unrelated callers -- both need "the next real
  * lv_timer_handler() pass redraws literally everything" without calling
@@ -470,9 +471,12 @@ void slide_transition_anim_x_cb(void * var, int32_t v) {
             if (ctx->overlay) lv_obj_delete(ctx->overlay);
             if (ctx->buf_from_owned) lv_draw_buf_destroy(ctx->buf_from);
             if (ctx->buf_to_owned) lv_draw_buf_destroy(ctx->buf_to);
-            if (player_swipe_ctx == ctx) player_swipe_ctx = NULL;
-            player_swipe_tracking = false;
-            player_swipe_candidate = false;
+            /* Resets gui_shell.c's REAL interactive-swipe state, not a
+             * same-named local copy -- see gui_shell_player_swipe_recover()'s
+             * own comment (gui_shell.h) for the real use-after-free this
+             * fixes. Must run before the free below, while ctx is still a
+             * valid pointer to compare against. */
+            gui_shell_player_swipe_recover(ctx);
             lv_free(ctx);
             slide_transition_active = false;
         }
@@ -835,6 +839,11 @@ void nav_push(lv_obj_t * scr) {
 #endif
 }
 
+void nav_push_stack_only(lv_obj_t * scr) {
+    if (nav_depth > 0 && nav_stack[nav_depth - 1] == scr) return;
+    if (nav_depth < NAV_STACK_MAX) nav_stack[nav_depth++] = scr;
+}
+
 void nav_pop(void) {
     if (nav_depth > 1) nav_depth--;
     /* Keep the outgoing screen's bars untouched until its physical frame
@@ -1074,14 +1083,14 @@ void gui_navigation_teardown(void) {
 
 /* For gui_reload.c's in-process UI reload -- true while a COMMITTED slide
  * transition (screen_transition_slide(), driven by nav_push()/nav_pop()) is
- * still animating. Deliberately does NOT check this file's own player_
- * swipe_candidate/player_swipe_tracking/player_swipe_ctx -- despite the
- * name collision, those are dead in this file (never set true anywhere
- * here; the real, live interactive-swipe/quick-drawer-drag state is
- * gui_shell.c's own separate statics of the same name, cancelled directly
- * via gui_shell_reset_drag_state() instead -- see gui_reload.c's own
- * comment for why that needs to run BEFORE any screen is deleted, not via
- * this defer-and-retry path).
+ * still animating. Deliberately does not check the live interactive-swipe/
+ * quick-drawer-drag state at all -- that state lives entirely in
+ * gui_shell.c's own statics (this file no longer keeps a same-named, dead
+ * shadow copy of them -- see gui_shell_player_swipe_recover()'s own
+ * comment in gui_shell.h for the real bug that shadow copy caused), and is
+ * cancelled directly via gui_shell_reset_drag_state() instead -- see
+ * gui_reload.c's own comment for why that needs to run BEFORE any screen
+ * is deleted, not via this defer-and-retry path).
  *
  * A committed transition's slide_transition_ctx_t is only reachable through
  * its own lv_anim_t, with no direct cancel path from outside this file, so

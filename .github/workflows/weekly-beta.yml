@@ -1,0 +1,150 @@
+name: Weekly staging beta
+
+on:
+  schedule:
+    # Every Sunday at 00:47 in Costa Rica (UTC-6).
+    - cron: "47 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-staging-beta
+  cancel-in-progress: false
+
+env:
+  TOOLCHAIN_SHA256: 82626533bf7e677c225e7cbedf1d5b0d6bc60c3daaf28249e54f0eb805d89b13
+  # The checksum is a repository secret so no Staging Image fingerprint or
+  # other internal build detail is committed to the public source tree.
+  STAGING_IMAGE_SHA256: ${{ secrets.STAGING_IMAGE_SHA256 }}
+
+jobs:
+  weekly-beta:
+    name: Build, repack, and publish weekly beta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Cache MIPS musl toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/mipsel-linux-musl-cross
+          key: mipsel-linux-musl-cross-${{ runner.os }}-82626533bf7e677c
+
+      - name: Install verified MIPS musl toolchain
+        run: |
+          set -euo pipefail
+          toolchain_dir="$RUNNER_TEMP/mipsel-linux-musl-cross"
+          if [[ ! -x "$toolchain_dir/bin/mipsel-linux-musl-gcc" ]]; then
+            archive="$RUNNER_TEMP/mipsel-linux-musl-cross.tgz"
+            curl --fail --location --retry 3 \
+              https://musl.cc/mipsel-linux-musl-cross.tgz \
+              --output "$archive"
+            echo "$TOOLCHAIN_SHA256  $archive" | sha256sum --check
+            tar -xzf "$archive" -C "$RUNNER_TEMP"
+          fi
+          echo "$toolchain_dir/bin" >> "$GITHUB_PATH"
+
+      - name: Install build and repack tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            file genisoimage lua5.4 p7zip-full squashfs-tools zip
+
+      - name: Build and validate player
+        run: |
+          set -euo pipefail
+          make -j2 target
+          make bootloader
+          make sd_ready_test
+          file open_hiby_player_target open_hiby_bootloader
+          mipsel-linux-musl-readelf -h open_hiby_player_target \
+            | grep 'Machine:.*MIPS' >/dev/null
+          mipsel-linux-musl-readelf -h open_hiby_bootloader \
+            | grep 'Machine:.*MIPS' >/dev/null
+          if strings open_hiby_player_target | grep -Eq \
+              'TEST BUILD|TEST_BUILD_TAG|UI_PERF_TRACE|UI_GESTURE_TRACE|UI_HITBOX_DEBUG'; then
+            echo 'Diagnostic flags were found in the production player.' >&2
+            exit 1
+          fi
+          find plugins_examples -maxdepth 1 -type f -name '*.lua' -print0 \
+            | xargs -0 -r -n1 luac5.4 -p
+
+      - name: Download verified Staging Image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$STAGING_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo 'STAGING_IMAGE_SHA256 secret is missing or invalid.' >&2
+            exit 1
+          }
+          mkdir -p base
+          gh release download staging-image-base --pattern r1.upt --dir base
+          echo "$STAGING_IMAGE_SHA256  base/r1.upt" | sha256sum --check
+
+      - name: Repack Staging Image
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          scripts/repack_upt.sh base/r1.upt open_hiby_player_target \
+            open_hiby_bootloader release/r1.upt
+          (
+            cd plugins_examples
+            zip -q -r ../release/plugins_examples.zip .
+          )
+          sha256sum release/r1.upt release/plugins_examples.zip \
+            > release/SHA256SUMS
+
+      - name: Prepare release notes
+        id: release
+        run: |
+          set -euo pipefail
+          release_date=$(date -u +%F)
+          tag="weekly-beta-$release_date"
+          {
+            cat WHATS_NEW.md
+            echo
+            echo "---"
+            echo
+            echo "Built automatically from commit [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/WHATS_NEW.md)."
+            echo
+            echo "The firmware asset is **r1.upt**. Checksums are attached in **SHA256SUMS**."
+          } > release/RELEASE_NOTES.md
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=Weekly Beta $release_date" >> "$GITHUB_OUTPUT"
+
+      - name: Publish weekly prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          TITLE: ${{ steps.release.outputs.title }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/r1.upt \
+              release/plugins_examples.zip release/SHA256SUMS --clobber
+            gh release edit "$TAG" --prerelease --title "$TITLE" \
+              --notes-file release/RELEASE_NOTES.md
+          else
+            gh release create "$TAG" release/r1.upt \
+              release/plugins_examples.zip release/SHA256SUMS \
+              --prerelease --target "$GITHUB_SHA" --title "$TITLE" \
+              --notes-file release/RELEASE_NOTES.md
+          fi
+
+      - name: Preserve package as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.release.outputs.tag }}
+          path: |
+            release/r1.upt
+            release/plugins_examples.zip
+            release/SHA256SUMS
+            release/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 30

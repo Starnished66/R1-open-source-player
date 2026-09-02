@@ -1,42 +1,23 @@
-name: Sync Upstream, Build and Release
+name: Build and Release HiBy R1 Firmware
 
 on:
-  schedule:
-    - cron: '0 0 * * *' # Runs automatically every day at midnight UTC
-  workflow_dispatch: # Allows you to trigger it manually anytime from the Actions tab
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
-  sync-and-build:
+  build-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # Required to push upstream updates to your fork and create releases
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-          fetch-depth: 0
-
-      - name: Sync with upstream repository
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Add the original upstream repository (Replace with the repo you forked from)
-          git remote add upstream https://github.com/ORIGINAL_OWNER/ORIGINAL_REPO.git
-          git fetch upstream
-          
-          # Pull latest changes from upstream main into your fork's main branch
-          git checkout main
-          git merge upstream/main --no-edit || echo "No new changes or merge handled"
-          
-          # Push the synchronized code back to your fork
-          git push origin main || echo "Nothing to push"
 
       - name: Download and setup MIPS toolchain
         run: |
-          wget -q https://musl.cc/mipsel-linux-musl-cross.tgz
+          # Use curl with location redirects (-L) and 3 automatic retries
+          curl -S -L -O --retry 3 https://musl.cc/mipsel-linux-musl-cross.tgz
           tar -xf mipsel-linux-musl-cross.tgz
           echo "${{ github.workspace }}/mipsel-linux-musl-cross/bin" >> $GITHUB_PATH
 
@@ -45,12 +26,10 @@ jobs:
           make clean
           make target
 
-      - name: Create Automated Release
+      - name: Create GitHub Release and Upload Asset
         uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: build-${{ github.run_number }}
-          name: "Automated Firmware Build # ${{ github.run_number }}"
-          body: "Automatically synced from upstream source and compiled for the HiBy R1."
           files: |
             open_hiby_player_target
         env:

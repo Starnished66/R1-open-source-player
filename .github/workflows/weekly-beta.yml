@@ -87,11 +87,13 @@ jobs:
           mkdir -p release
           scripts/repack_upt.sh base/r1.upt open_hiby_player_target \
             open_hiby_bootloader release/r1.upt
+          cp open_hiby_player_target release/open_hiby_player
           (
             cd plugins_examples
-            zip -q -r ../release/Test-Plugins.zip .
+            zip -q -r ../release/plugin_examples.zip .
           )
-          sha256sum release/r1.upt release/Test-Plugins.zip \
+          sha256sum release/r1.upt release/open_hiby_player \
+            release/plugin_examples.zip \
             > release/SHA256SUMS
 
       - name: Prepare release notes
@@ -104,7 +106,17 @@ jobs:
             echo
             echo "Built automatically from commit [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/WHATS_NEW.md)."
             echo
-            echo "The firmware asset is **r1.upt** and all repository test plugins are in **Test-Plugins.zip**. Checksums are attached in **SHA256SUMS**."
+            echo "### Downloads"
+            echo
+            echo "- **r1.upt** — complete firmware update."
+            echo "- **open_hiby_player** — standalone Open Player update."
+            echo "- **plugin_examples.zip** — all example and test plugins from the repository."
+            echo
+            echo "### Update only Open Player"
+            echo
+            echo "Copy **open_hiby_player** to **SD/.open_hiby_player/open_hiby_player**, replacing the existing file, then reboot the R1. The bootloader will use the updated player from the SD card."
+            echo
+            echo "Checksums are attached in **SHA256SUMS**."
           } > release/RELEASE_NOTES.md
 
       - name: Publish weekly prerelease
@@ -115,17 +127,19 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release/r1.upt \
-              release/Test-Plugins.zip release/SHA256SUMS --clobber
-            if [[ "$(gh release view "$TAG" --json assets --jq \
-                'any(.assets[]; .name == "plugins_examples.zip")')" == "true" ]]; then
-              gh release delete-asset "$TAG" plugins_examples.zip --yes
-            fi
+            gh release upload "$TAG" release/r1.upt release/open_hiby_player \
+              release/plugin_examples.zip release/SHA256SUMS --clobber
+            for legacy_asset in plugins_examples.zip Test-Plugins.zip; do
+              if gh release view "$TAG" --json assets --jq '.assets[].name' \
+                  | grep -Fx "$legacy_asset" >/dev/null; then
+                gh release delete-asset "$TAG" "$legacy_asset" --yes
+              fi
+            done
             gh release edit "$TAG" --prerelease --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
           else
-            gh release create "$TAG" release/r1.upt \
-              release/Test-Plugins.zip release/SHA256SUMS \
+            gh release create "$TAG" release/r1.upt release/open_hiby_player \
+              release/plugin_examples.zip release/SHA256SUMS \
               --prerelease --target "$GITHUB_SHA" --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
           fi
@@ -136,7 +150,8 @@ jobs:
           name: ${{ steps.release.outputs.tag }}
           path: |
             release/r1.upt
-            release/Test-Plugins.zip
+            release/open_hiby_player
+            release/plugin_examples.zip
             release/SHA256SUMS
             release/RELEASE_NOTES.md
           if-no-files-found: error

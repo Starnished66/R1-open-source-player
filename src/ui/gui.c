@@ -1075,6 +1075,68 @@ static void update_timer_cb(lv_timer_t * timer) {
             radios_suspended = true;
         }
 
+#ifdef TEST_BUILD_TAG
+        /* Diagnostic-only, for the "battery drain at idle" investigation:
+         * shutdown_background_work_active() gates BOTH radio-suspend above
+         * and idle-shutdown/suspend below -- if any one of its 8 sources
+         * stays stuck reporting "busy" (e.g. a worker thread whose done-flag
+         * never got cleared after a batched reload or a cancelled scan), the
+         * device never even attempts suspend while idle, staying fully
+         * awake (CPU, display controller, everything) instead of merely
+         * failing to sleep once it tries -- a larger drain than either the
+         * wakeup-IRQ or failed-suspend-write hypotheses covered in
+         * power_suspend.c's own diagnostics. The whole block, not just the
+         * DBG_LOG call, is gated on TEST_BUILD_TAG: shutdown_background_
+         * work_active() calls all 8 subsystem checks, and a production
+         * build has no reader for the result, so it shouldn't pay for that
+         * every 500ms tick the screen is off. Only starts checking once a
+         * still-pending action's deadline has actually elapsed -- normal
+         * short-lived artwork/network work finishing before then is
+         * expected, not a bug, and warning immediately on screen-off would
+         * just be a false positive on every idle session. This distinction
+         * also matters after the radios are already suspended: background
+         * work cannot be called an idle-action blocker until that separate
+         * configured deadline is due, and never when idle shutdown is off.
+         * The 8 flags are snapshotted once into locals and reused for both
+         * the aggregate check and the printed breakdown, rather than calling
+         * shutdown_background_work_active() and then the 8 individual
+         * functions again separately -- a worker finishing in between the
+         * two evaluations could otherwise produce a "blocked" log line
+         * whose own breakdown shows all zeros. Throttled hard (once per
+         * ~30s) on top of that since this can still fire every tick while
+         * something stays genuinely stuck. Read-only, same reasoning as
+         * power_suspend.c's additions: no real-device access from here to
+         * know which of the 8 (if any) is the actual culprit, so this only
+         * measures it rather than guessing which to "fix". */
+        uint32_t idle_elapsed_ms = lv_tick_elaps(screen_off_since_tick);
+        bool radio_suspend_due = !radios_suspended && idle_elapsed_ms >= RADIO_SUSPEND_DELAY_MS;
+        bool idle_action_due = !idle_shutdown_attempted && current_settings.idle_shutdown_enabled &&
+                               idle_elapsed_ms >= (uint32_t) current_settings.idle_shutdown_minutes * 60 * 1000;
+        if ((radio_suspend_due || idle_action_due) &&
+            !current_settings.wifi_dac_mode_enabled && !current_settings.bt_dac_mode_enabled &&
+            current_settings.usb_mode != (int) USB_MODE_DAC && !audio_is_playing() && !battery_is_charging()) {
+            bool library_busy = gui_library_has_background_work();
+            bool subsonic_busy = gui_subsonic_has_background_work();
+            bool network_busy = gui_network_has_background_work();
+            bool lyrics_busy = gui_lyrics_has_background_work();
+            bool player_busy = gui_player_has_background_work();
+            bool shell_busy = gui_shell_has_background_work();
+            bool plugins_busy = plugin_manager_has_background_work();
+            bool playlist_write_busy = playlist_files_has_active_write();
+            if (library_busy || subsonic_busy || network_busy || lyrics_busy || player_busy || shell_busy ||
+                plugins_busy || playlist_write_busy) {
+                static uint32_t last_busy_log_tick = 0;
+                if (last_busy_log_tick == 0 || lv_tick_elaps(last_busy_log_tick) >= 30000) {
+                    last_busy_log_tick = lv_tick_get();
+                    DBG_LOG("gui: idle suspend/shutdown blocked -- library=%d subsonic=%d network=%d lyrics=%d "
+                            "player=%d shell=%d plugins=%d playlist_write=%d\n",
+                            library_busy, subsonic_busy, network_busy, lyrics_busy, player_busy, shell_busy,
+                            plugins_busy, playlist_write_busy);
+                }
+            }
+        }
+#endif /* TEST_BUILD_TAG */
+
         /* Deliberately independent of radios_suspended -- idle_shutdown_minutes
          * is a separate, normally-longer setting than RADIO_SUSPEND_DELAY_MS,
          * and shutdown should still happen on its own schedule even if radio

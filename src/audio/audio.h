@@ -171,6 +171,102 @@ void audio_set_volume(float volume);
 void audio_request_volume(float volume);
 float audio_get_volume(void);
 
+/* Shared with plugin_manager.c's own array-length validation for
+ * plugin.set_hw_volume_curve() -- defined once here, rather than as a
+ * separate local #define in each .c file, so the two can't drift apart. */
+#define HW_VOLUME_CURVE_LEN 101
+
+/* Overrides the UI-volume -> hardware-DAC-register mapping used for the
+ * internal codec's own "Left"/"Right Playback Volume" ALSA controls (see
+ * audio_apply_volume()'s own comment in audio.c). curve[i], i=0..100, is
+ * the raw register value (0-255, hardware-specific meaning, not a dB
+ * value) written for UI volume i% -- including curve[0], which stands in
+ * for the native taper's own mute/silence handling. Pass NULL to fall
+ * back to the built-in calibrated_taper_db()/volume_db_to_hw_raw() taper.
+ * Reapplies immediately at the current UI volume so a switch is audible
+ * right away rather than waiting for the next slider touch. Has no effect
+ * on USB output, which never reaches this codec's own register at all and
+ * always uses its own separate digital taper -- see audio_apply_volume()'s
+ * own comment on why that path is deliberately untouched by this.
+ *
+ * For the normal "an already-loaded, running plugin changes its curve"
+ * case (e.g. a Settings-list tap) -- NOT for plugin_manager.c's own plugin
+ * (re)load transaction (covers both a full deinit/init reload AND each
+ * individual plugin's own top-level run within plugin_manager_init()'s
+ * load loop), which needs the staging functions below instead.
+ * plugin_manager.c itself decides which of the two applies (checking
+ * whether a plugin's own top-level script is currently running), not this
+ * file -- see l_plugin_set_hw_volume_curve()'s own comment. Mutates ONLY
+ * the live state audio_apply_volume() below actually reads -- never the
+ * separate staging state the functions below operate on -- so this and a
+ * plugin (re)load transaction in progress can never interfere with each
+ * other's storage (see audio_stage_custom_hw_volume_curve()'s own comment
+ * for why that separation, not just deferring the write, is required). */
+void audio_set_custom_hw_volume_curve(const uint8_t * curve);
+
+/* Mutates a SEPARATE staging copy of the curve state (curve non-NULL:
+ * staged active with that table; NULL: staged inactive/native) -- not the
+ * live state audio_apply_volume() reads, and issues no hardware write.
+ * `curve` must be non-NULL whenever `active` is true, ignored when false.
+ *
+ * This, plus audio_get_staged_hw_volume_curve_state() and
+ * audio_commit_hw_volume_curve() below, exist for plugin_manager.c's own
+ * (re)load transaction (a full deinit/init reload, or plain top-level
+ * loading of several plugin files in a row, any of which may call
+ * plugin.set_hw_volume_curve()) for two compounding reasons: (1)
+ * audio_output_request_hw_volume_raw() (audio_output.c) is a single-slot
+ * "latest wins" async handoff to a background worker thread, not a real
+ * queue, so writing hardware after every intermediate state change during
+ * a transaction risks an earlier, momentarily-active value actually
+ * reaching the DAC as a real, audible blip before the transaction's own
+ * true final value overwrites it -- or, if a later plugin in the same
+ * transaction then fails, a value that was never meant to survive at all
+ * being written anyway. (2) Mutating the SAME live state
+ * audio_apply_volume() reads is not enough on its own to prevent that,
+ * even with the write itself deferred: a plugin (re)load transaction runs
+ * synchronously on the UI thread, but audio_request_volume()'s own
+ * worker thread (a queued volume-slider drag sample, audio.c) runs
+ * independently and can call audio_apply_volume() -- which DOES write
+ * hardware immediately, unconditionally, by design -- at any moment,
+ * including mid-transaction; if that read the live state, it could send
+ * a transaction's not-yet-committed intermediate value (a temporary
+ * native reset, an intermediate plugin's curve, or a curve belonging to
+ * a plugin that goes on to fail) straight to the DAC on its own,
+ * bypassing the deferred-write discipline entirely. Keeping staged state
+ * completely separate closes this: nothing outside plugin_manager.c's own
+ * transaction functions ever reads it, so a concurrent volume request
+ * during a transaction always sees and writes only the LAST FULLY
+ * COMMITTED state, never an in-progress one. plugin_manager.c stages
+ * state changes here throughout the whole transaction, then calls
+ * audio_commit_hw_volume_curve() exactly once at the very end to install
+ * the staged result as the new live state and write hardware, atomically,
+ * in one locked step. */
+void audio_stage_custom_hw_volume_curve(bool active, const uint8_t * curve);
+
+/* Snapshots the current STAGED (not live) curve state into
+ * *active_out/curve_out (curve_out must have room for HW_VOLUME_CURVE_LEN
+ * bytes; written unconditionally, even when *active_out comes back false,
+ * so a caller can always pass curve_out straight back into
+ * audio_stage_custom_hw_volume_curve() to restore exactly this moment's
+ * staged state later) -- e.g. plugin_manager.c snapshotting before a
+ * single plugin's top-level run, so a mid-script failure can roll the
+ * transaction's own staged state back to exactly what was staged before
+ * THAT plugin started (which may be a different, still-valid plugin's own
+ * curve, staged earlier in the same transaction), not just "off"/native. */
+void audio_get_staged_hw_volume_curve_state(bool * active_out, uint8_t * curve_out);
+
+/* Installs the currently staged curve state (see
+ * audio_stage_custom_hw_volume_curve() above) as the new LIVE state and
+ * writes the hardware register once to match, atomically -- one locked
+ * critical section covers both the install and the write, so nothing,
+ * including a concurrent volume-slider request on
+ * audio_request_volume()'s own worker thread, can ever observe a live
+ * state that has changed but hasn't been written to hardware yet, or vice
+ * versa. Also correct, and a harmless no-op (staged starts zero-
+ * initialized to "inactive", same as live), to call at normal boot for
+ * the same reason. */
+void audio_commit_hw_volume_curve(void);
+
 /* Returns true (and clears the flag) exactly once when playback reached a
  * true end-of-playlist -- current track finished with no next track queued
  * (or the queued one failed to open). Meant to be polled from the GUI

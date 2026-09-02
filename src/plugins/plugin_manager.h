@@ -62,8 +62,18 @@
  * theme-override storage the same way plugin.set_icon() already does.
  * Purely additive, same as every bump before it. Also see the new
  * "ui.home_background" plugin_capabilities[] entry (plugin_manager.c) for
- * the no-version-bump way to feature-detect just this. */
-#define PLUGIN_API_VERSION 10
+ * the no-version-bump way to feature-detect just this.
+ *
+ * Bumped 10 -> 11: added plugin.set_hw_volume_curve() -- lets a plugin
+ * replace the built-in UI-volume -> internal-DAC-hardware-register taper
+ * entirely with its own 101-entry table (e.g. to reproduce a real device's
+ * Low/Medium/High Gain curves, or any other custom curve), for headphone/
+ * IEM-sensitivity use cases the app's own single fixed taper can't cover.
+ * No effect on USB output (see audio.h's own comment on why). Purely
+ * additive, same as every bump before it. Also see the new
+ * "audio.hw_volume_curve" plugin_capabilities[] entry (plugin_manager.c)
+ * for the no-version-bump way to feature-detect just this. */
+#define PLUGIN_API_VERSION 11
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
 /* Third-party Lua plugin support. Every *.lua file under

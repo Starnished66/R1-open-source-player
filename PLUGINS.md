@@ -259,7 +259,7 @@ using an identity derived from their filename.
 - `plugin.has_capability(name)` reports whether an optional interface exists.
   Supported capability tokens:
   - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`, `ui.launcher_layout`, `ui.home_background`
-  - Playback & Audio: `playback.control`, `playback.state`, `playback.events`, `playback.remote`, `audio.peq`
+  - Playback & Audio: `playback.control`, `playback.state`, `playback.events`, `playback.remote`, `audio.peq`, `audio.hw_volume_curve`
   - Filesystem & Playlists: `filesystem.sd`, `filesystem.mkdir`, `filesystem.playlists`
   - Storage & Secrets: `storage.namespaced`, `storage.secrets`
   - Network: `network.http.sync`, `network.http.async`, `network.http.download`
@@ -354,6 +354,16 @@ object only, not every screen in the app. Purely additive, no breaking
 changes bundled into this window. A plugin that only needs this can
 feature-detect it with `plugin.has_capability("ui.home_background")`
 instead of bumping `api_min`.
+
+#### API version 11 changelog
+
+New in API 11: `plugin.set_hw_volume_curve()` (see its own doc section
+above) -- lets a plugin replace the app's own UI-volume -> internal-DAC-
+register mapping with a custom 101-entry table, e.g. to reproduce a real
+device's Low/Medium/High Gain modes. Purely additive, no breaking changes
+bundled into this window. A plugin that only needs this can feature-detect
+it with `plugin.has_capability("audio.hw_volume_curve")` instead of
+bumping `api_min`.
 
 <a id="plugin-ui"></a>
 
@@ -1088,6 +1098,45 @@ already re-reads `peq_get_*()` fresh every time it's opened, so it stays
 correct regardless of what a plugin changed. See
 `plugins_examples/SoundProfiles.lua`.
 
+### `plugin.set_hw_volume_curve(curve)`
+
+Replaces the entire UI-volume (0-100%) -> internal-DAC-hardware-register
+mapping this app's own volume slider drives, letting a plugin implement
+things like the real device's own Low/Medium/High Gain modes (or any other
+custom curve, e.g. one hand-tuned for a specific pair of IEMs) that the
+app's single built-in taper can't cover on its own.
+
+`curve` is a Lua table of **exactly 101 integers, 0-255**, index 1
+(`curve[1]`) through index 101 (`curve[101]`) representing UI volume 0%
+through 100% respectively. Each value is a *raw hardware register value*
+for the internal codec's own "Left"/"Right Playback Volume" ALSA controls,
+not a dB number -- lower is louder (0 is the hardware's own loudest,
+zero-attenuation point), higher is quieter, and there is no requirement
+that the curve be monotonic if you have a real reason for it not to be.
+Pass `nil` (or call with no arguments) to restore the app's own built-in
+curve. Raises a Lua error if the table isn't exactly 101 entries long, or
+if any entry is outside 0-255 (naming the offending index).
+
+Same shape as `plugin.eq_set_band()` above -- calls straight into
+`src/audio/audio.c`, no `gui.c`-paired UI state to keep in sync (it
+doesn't move the volume slider or its popup; it changes what a given
+slider position maps to internally), and takes effect immediately at
+whatever volume is currently set, not just on the next change. In-process
+only, like every other plugin config call in this API -- not persisted,
+so re-apply it at the top of your own script on every boot, same as
+`set_home_layout()` and friends.
+
+**Has no effect on Bluetooth or USB output** -- neither ever reaches this
+codec's own hardware register at all (USB pipes PCM to a separate ALSA
+device/process; Bluetooth volume is synced over AVRCP), so a curve set
+here only ever affects the device's own internal headphone/line-out jack.
+
+See `plugins_examples/GainMode.lua` for a complete Low/High Gain
+implementation using the real stock firmware's own measured curves (the
+real firmware also defines a third "Medium" curve, omitted there because
+it's numerically identical to Low on the real device it was extracted
+from).
+
 ### ⏯️ Playback Control
 
 Unlike the EQ functions above, these **do** go through `gui.c` bridges
@@ -1649,6 +1698,7 @@ one will visibly stall the whole UI until it returns, same tradeoff
 | `Themes.lua` | Display row, icon overrides, background/text colors |
 | `SoundProfiles.lua` | PEQ profile selection and persistence |
 | `MSEB.lua` | Chained settings-list screens, summed EQ band contributions, backup/restore |
+| `GainMode.lua` | Hardware volume curve switching, real stock Low/High Gain curves, safe unset-until-chosen default |
 | `PlaybackExtras.lua` | Native-looking toggles, sliders, and nested settings |
 | `PlayThrough.lua` | Natural-end detection and folder/album continuation |
 | `ExtendedSleepTimer.lua` | Persistent duration, session timer, and delayed playback stop |

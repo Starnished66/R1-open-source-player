@@ -2446,6 +2446,44 @@ static int volume_db_to_hw_raw(double db) {
     return raw;
 }
 
+/* Plugin-supplied alternative to volume_db_to_hw_raw()/calibrated_taper_db()
+ * above -- lets a plugin own the entire UI-volume -> hardware-register
+ * mapping (e.g. to reproduce a real device's own Low/Medium/High Gain
+ * curves, or any other custom curve) instead of this app's own single
+ * built-in taper. HW_VOLUME_CURVE_LEN (audio.h, shared with
+ * plugin_manager.c's own validation) matches the real stock firmware's
+ * own per-gain-mode table shape (ot_devices.json's VOLUMES[0].Gains[*],
+ * one entry per UI volume 0-100 inclusive), not an arbitrary choice --
+ * see audio_set_custom_hw_volume_curve()'s own doc comment in audio.h.
+ *
+ * LIVE state -- the only pair compute_hw_raw() below ever reads. Mutated
+ * ONLY by audio_set_custom_hw_volume_curve() (the immediate, live-plugin-
+ * callback path) and audio_commit_hw_volume_curve() (which installs
+ * whatever is currently staged, see the STAGED pair right below) --
+ * NEVER directly by audio_stage_custom_hw_volume_curve(). This separation
+ * is what actually keeps a concurrent volume-slider request (processed
+ * on audio_request_volume()'s own background worker thread, which can
+ * call audio_apply_volume() -- an unconditional, immediate hardware
+ * write -- at any moment) from ever reading or writing a plugin (re)load
+ * transaction's not-yet-committed intermediate state; see
+ * audio_stage_custom_hw_volume_curve()'s own doc comment in audio.h for
+ * the full reasoning. */
+static bool custom_hw_curve_active = false;
+static uint8_t custom_hw_curve[HW_VOLUME_CURVE_LEN];
+
+/* STAGED state -- plugin_manager.c's own (re)load-transaction scratch
+ * space. Mutated freely during a transaction (plugin_manager_deinit()'s
+ * own reset, each plugin's own set_hw_volume_curve() calls during its own
+ * top-level run, a failed plugin's rollback to an earlier snapshot) with
+ * zero effect on the LIVE pair above -- and so zero effect on
+ * compute_hw_raw()/audio_apply_volume() -- until
+ * audio_commit_hw_volume_curve() installs it. Zero-initialized to
+ * "inactive/native", same as the live pair, which is exactly correct for
+ * the very first plugin_manager_init() at boot (no preceding
+ * plugin_manager_deinit() call to stage anything first). */
+static bool staged_hw_curve_active = false;
+static uint8_t staged_hw_curve[HW_VOLUME_CURVE_LEN];
+
 /* Hardware carries the whole taper (see volume_db_to_hw_raw()'s own comment
  * for the real-device investigation behind this); digital gain stays
  * pinned at unity throughout, including 100%, which lands at raw 0 /
@@ -2471,6 +2509,27 @@ static int volume_db_to_hw_raw(double db) {
  * already handled by a completely separate, working AVRCP-based mechanism
  * (bluetooth_control.c's bt_source_vol_sync_thread_func()) that has
  * nothing to do with this app's own PCM gain, so it must be left alone. */
+/* Shared by audio_apply_volume(), audio_set_custom_hw_volume_curve(), and
+ * audio_commit_hw_volume_curve() below -- factored out (rather than
+ * duplicated) so they can't drift apart. Caller must already hold
+ * audio_mutex. Reads ONLY the LIVE custom_hw_curve_active/custom_hw_curve
+ * pair, never the separate STAGED one -- see that pair's own comment,
+ * right above, for why that separation is required. */
+static int compute_hw_raw(float vol) {
+    if (custom_hw_curve_active) {
+        /* curve[0] stands in for the native-taper branch's own
+         * HW_VOLUME_MAX_RAW mute case -- a plugin curve owns its own
+         * index-0 entry entirely (real device curves put an explicit,
+         * possibly different, mute-register value there rather than
+         * reusing this app's native constant). */
+        int idx = (vol <= 0.0f) ? 0 : (int) lround((double) vol * 100.0);
+        if (idx < 0) idx = 0;
+        if (idx > 100) idx = 100;
+        return custom_hw_curve[idx];
+    }
+    return (vol <= 0.0f) ? HW_VOLUME_MAX_RAW : volume_db_to_hw_raw(calibrated_taper_db((double) vol));
+}
+
 /* Apply only if no newer synchronous or queued request has superseded this
  * generation. The check and state update share audio_mutex, so a worker
  * that races a release-time audio_set_volume() cannot restore an older
@@ -2486,7 +2545,7 @@ static void audio_apply_volume(float new_volume, unsigned int generation) {
     volume = new_volume;
     volume_gain = (new_volume <= 0.0f) ? 0.0f : 1.0f;
 #ifndef HOST_BUILD
-    int raw = (new_volume <= 0.0f) ? HW_VOLUME_MAX_RAW : volume_db_to_hw_raw(calibrated_taper_db((double) new_volume));
+    int raw = compute_hw_raw(new_volume);
     audio_output_request_hw_volume_raw(raw, raw);
     if (audio_output_is_usb_active()) {
         volume_gain = (new_volume <= 0.0f) ? 0.0f : (float) pow(10.0, calibrated_taper_db((double) new_volume) / 20.0);
@@ -2498,6 +2557,62 @@ static void audio_apply_volume(float new_volume, unsigned int generation) {
 void audio_set_volume(float new_volume) {
     unsigned int generation = atomic_fetch_add(&volume_set_generation, 1) + 1;
     audio_apply_volume(new_volume, generation);
+}
+
+void audio_stage_custom_hw_volume_curve(bool active, const uint8_t * curve) {
+    pthread_mutex_lock(&audio_mutex);
+    staged_hw_curve_active = active;
+    if (active) memcpy(staged_hw_curve, curve, sizeof(staged_hw_curve));
+    pthread_mutex_unlock(&audio_mutex);
+}
+
+void audio_get_staged_hw_volume_curve_state(bool * active_out, uint8_t * curve_out) {
+    pthread_mutex_lock(&audio_mutex);
+    *active_out = staged_hw_curve_active;
+    memcpy(curve_out, staged_hw_curve, sizeof(staged_hw_curve));
+    pthread_mutex_unlock(&audio_mutex);
+}
+
+/* Installs staged as the new live state and writes hardware once to
+ * match, both under the same lock -- see this function's own doc comment
+ * in audio.h for why the install and the write must be atomic together,
+ * not two separate locked steps. */
+void audio_commit_hw_volume_curve(void) {
+    pthread_mutex_lock(&audio_mutex);
+    custom_hw_curve_active = staged_hw_curve_active;
+    if (staged_hw_curve_active) memcpy(custom_hw_curve, staged_hw_curve, sizeof(custom_hw_curve));
+#ifndef HOST_BUILD
+    int raw = compute_hw_raw(volume);
+    audio_output_request_hw_volume_raw(raw, raw);
+#endif
+    pthread_mutex_unlock(&audio_mutex);
+}
+
+/* Reapplies immediately at whatever volume is currently authoritative, so
+ * a curve switch is audible right away rather than waiting for the next
+ * slider touch -- for the normal "an already-loaded, running plugin
+ * changes its curve" case only, see this function's own doc comment in
+ * audio.h. Mutates the LIVE pair directly, under one lock alongside the
+ * write -- NOT via audio_stage_custom_hw_volume_curve()/
+ * audio_commit_hw_volume_curve(), which operate on the separate STAGED
+ * pair a plugin (re)load transaction uses; this path runs outside any
+ * such transaction; touching STAGED here would leave it holding a value
+ * that doesn't belong to (and could leak into) whatever transaction
+ * starts next. Deliberately NOT implemented via audio_set_volume():
+ * that bumps volume_set_generation as a brand-new synchronous command,
+ * which would silently invalidate a newer audio_request_volume() (an
+ * in-flight slider-drag sample) already queued on the worker thread by
+ * the time it runs -- this only ever touches the hardware register, not
+ * that generation counter. */
+void audio_set_custom_hw_volume_curve(const uint8_t * curve) {
+    pthread_mutex_lock(&audio_mutex);
+    custom_hw_curve_active = (curve != NULL);
+    if (curve) memcpy(custom_hw_curve, curve, sizeof(custom_hw_curve));
+#ifndef HOST_BUILD
+    int raw = compute_hw_raw(volume);
+    audio_output_request_hw_volume_raw(raw, raw);
+#endif
+    pthread_mutex_unlock(&audio_mutex);
 }
 
 static void * volume_request_worker_main(void * unused) {

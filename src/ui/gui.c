@@ -53,6 +53,7 @@
 #include "headphone_status.h"
 #include "usb_audio_output.h"
 #include "plugin_manager.h"
+#include "gui_plugin_manage.h"
 #include "led_control.h"
 #include "charge_limiter.h"
 #include "idle_shutdown.h"
@@ -1790,6 +1791,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     gui_library_init();
     gui_network_init();
     gui_settings_init();
+    gui_plugin_manage_init();
     gui_books_init();
     build_power_off_countdown_popup();
     gui_queue_init();

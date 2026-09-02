@@ -8,6 +8,14 @@ launch, initially misread as a crash in the app under test.
 
 ## Remaining real-device regression tests
 
+- [ ] **Plugin watchdog preserves native work without becoming bypassable:**
+  load a test plugin whose callback runs `while true do plugin.sd_root() end`
+  and confirm it is aborted after roughly two seconds of cumulative Lua
+  execution rather than freezing the UI. Separately, start with an empty
+  `/usr/data/theme_overrides/`, load Themes, and confirm its settings row is
+  registered and the selected theme finishes copying its icons. Select the
+  already-highlighted theme again and confirm it is reapplied successfully.
+
 - [ ] **Volume/brightness slider drags no longer hijack the quick drawer:**
   press a hardware volume button to show the volume popup and drag its
   slider with deliberately imperfect (slightly diagonal) finger motion,

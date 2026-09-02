@@ -493,6 +493,14 @@ end
 -- string, negative radius, ...) only means Home's layout isn't set to
 -- what this theme wanted; colors and icons still applied normally either
 -- side of it.
+--
+-- A flash-after-upgrade report found that this startup apply used to run
+-- before register_list_item() below. plugin_call()'s 2s Lua-runaway budget
+-- counted time spent inside plugin.set_icon()'s NAND copies, so a wiped
+-- /usr/data/theme_overrides/ (every icon a real write, ~140 of them)
+-- aborted the plugin before the Theme row was registered. Startup apply
+-- now runs after registration, native plugin.* time is excluded from its
+-- Lua budget, and set_icon() skips a rewrite when the destination matches.
 local function apply_theme(def)
     local c = def.colors
     pcall(plugin.set_background_color, "screen", c.screen)
@@ -545,7 +553,6 @@ for _, t in ipairs(startup_themes) do
         break
     end
 end
-apply_theme(selected_def)
 
 plugin.register_list_item("display", "Theme", function()
     -- Fresh scan on every open -- see startup_themes' own comment above for
@@ -564,13 +571,19 @@ plugin.register_list_item("display", "Theme", function()
 
     plugin.show_list("Theme", labels, function(index)
         local new_filename = (index == 1) and "" or themes[index - 1].filename
-        if new_filename == selected_filename then return end
-
         local new_def = (index == 1) and DEFAULT_THEME or themes[index - 1].def
-        selected_filename = new_filename
-        write_state(new_filename)
+        if new_filename ~= selected_filename then
+            selected_filename = new_filename
+            write_state(new_filename)
+        end
         apply_theme(new_def)
         plugin.show_toast("Theme applied", 1000)
         plugin.refresh_theme()
     end, { selected = selected_index, height = 100 })
 end)
+
+-- After the settings row is registered so a failure here cannot take the
+-- Theme picker down with it. Native plugin_call() credits set_icon time,
+-- but a missing icon pack or a full /usr/data still must not unload the
+-- whole plugin. Colors/icons may be incomplete; tapping the row reapplies.
+pcall(apply_theme, selected_def)

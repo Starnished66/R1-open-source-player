@@ -22,6 +22,7 @@
 #include "timezone_data.h"
 #include "firmware_update.h"
 #include "plugin_manager.h"
+#include "gui_plugin_manage.h"
 #include "fallback_font.h"
 #include "gui_navigation.h"
 #include <stdio.h>
@@ -1797,15 +1798,16 @@ static lv_obj_t * build_clock_set_time_screen(void) {
 }
 
 static lv_obj_t * build_settings_system_screen(void) {
-    static pill_list_item_t items[5 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
+    static pill_list_item_t items[6 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Clock", PILL_ACCESSORY_CHEVRON, false,
                                     clock_settings_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Hostname", PILL_ACCESSORY_CHEVRON, false, hostname_row_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Plugins", PILL_ACCESSORY_CHEVRON, false, gui_plugin_manage_row_cb, NULL, NULL };
+    items[5] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
 
-    int count = 5;
+    int count = 6;
     int plugin_count = plugin_manager_get_system_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SYSTEM_LIST_ITEMS; i++) {
         pill_list_item_t item = {

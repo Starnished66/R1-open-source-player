@@ -229,6 +229,34 @@ void plugin_manager_init(void);
 void plugin_manager_poll(void);
 bool plugin_manager_has_background_work(void);
 
+/* One entry per *.lua file found directly under <SD card>/.plugins/,
+ * whether or not it's currently loaded (a disabled plugin's own
+ * plugin.define() id/name is never seen, since its script never runs, so
+ * display_name falls back to the filename itself for those). Used by the
+ * "Manage Plugins" settings screen (gui_plugin_manage.c) to list every
+ * installed plugin, not just the loaded subset plugin_instances[] knows
+ * about. */
+typedef struct {
+    char filename[256];
+    bool disabled;
+    bool loaded;
+    char display_name[96];
+} plugin_available_entry_t;
+
+/* Fills `out` with up to `max` entries and returns the count actually
+ * written. Does its own directory scan (safe to call whether or not
+ * plugin_manager_init() has run), but each entry's `disabled` flag reflects
+ * whatever plugin_disabled_list_load() last loaded into memory --
+ * currently only called from inside plugin_manager_init() itself, so
+ * calling this before the first plugin_manager_init() will report every
+ * file as enabled regardless of what's actually in .disabled on disk.
+ * Entries are sorted by filename, UNLESS the on-disk file count exceeds
+ * `max`, in which case every currently-loaded plugin is placed first
+ * (guaranteed never truncated out) and the remaining budget is filled
+ * alphabetically -- see plugin_manager.c's own comment on this function for
+ * why. */
+int plugin_manager_scan_available(plugin_available_entry_t * out, int max);
+
 /* Counterpart to plugin_manager_init(), for gui_reload.c's in-process UI
  * reload -- closes every plugin's lua_State (after draining background work
  * that references it: async HTTP, interval timers, a pending text-input

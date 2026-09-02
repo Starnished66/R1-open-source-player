@@ -1,6 +1,4 @@
-/* See gui_reload.h for what this does and does not touch, and the plan at
- * (session-local) /home/josegarita/.claude/plans/peppy-splashing-aho.md for
- * the full design rationale.
+/* See gui_reload.h for what this does and does not touch.
  *
  * gui_soft_reload()'s sequence, and why the order matters:
  *
@@ -99,6 +97,7 @@
 #include "gui_queue.h"
 #include "gui_plugins.h"
 #include "plugin_manager.h"
+#include "gui_plugin_manage.h"
 
 /* Temporary investigation instrumentation for the "applying Wavy crashed
  * the device" report -- a real, reproducible SIGSEGV inside musl's free()
@@ -162,6 +161,8 @@ void gui_soft_reload(void) {
     gui_network_teardown();
     reload_diag("gui_settings_teardown: before");
     gui_settings_teardown();
+    reload_diag("gui_plugin_manage_teardown: before");
+    gui_plugin_manage_teardown();
     reload_diag("gui_books_teardown: before");
     gui_books_teardown();
     reload_diag("gui_queue_teardown: before");
@@ -203,6 +204,8 @@ void gui_soft_reload(void) {
     gui_network_init();
     reload_diag("gui_settings_init: before");
     gui_settings_init();
+    reload_diag("gui_plugin_manage_init: before");
+    gui_plugin_manage_init();
     reload_diag("gui_books_init: before");
     gui_books_init();
     reload_diag("build_power_off_countdown_popup: before");

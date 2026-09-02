@@ -719,6 +719,16 @@ typedef struct {
     lv_obj_t * toggle_img;
 } pill_toggle_ctx_t;
 
+/* ctx is malloc()'d once per toggle row (below) and otherwise never freed --
+ * every pill-list screen with a toggle row leaked one per row per rebuild
+ * until this was added. Registered as a second, separate callback on the
+ * same row/ctx pair, same free-on-LV_EVENT_DELETE convention
+ * compact_list_delete_event_cb() above already uses for its own heap
+ * user_data. */
+static void pill_toggle_ctx_delete_cb(lv_event_t * e) {
+    free(lv_event_get_user_data(e));
+}
+
 static void pill_toggle_row_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     pill_toggle_ctx_t * ctx = (pill_toggle_ctx_t *) lv_event_get_user_data(e);
@@ -1022,13 +1032,24 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
 
             if (item->out_toggle_img) *item->out_toggle_img = toggle_img;
 
-            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             pill_toggle_ctx_t * ctx = malloc(sizeof(pill_toggle_ctx_t));
-            ctx->toggle_img = toggle_img;
-            lv_obj_add_event_cb(row, pill_toggle_row_event_cb, LV_EVENT_CLICKED, ctx);
+            if (ctx) {
+                ctx->toggle_img = toggle_img;
+                lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_add_event_cb(row, pill_toggle_row_event_cb, LV_EVENT_CLICKED, ctx);
+                lv_obj_add_event_cb(row, pill_toggle_ctx_delete_cb, LV_EVENT_DELETE, ctx);
 
-            if (item->on_toggle_change) {
-                lv_obj_add_event_cb(toggle_img, item->on_toggle_change, LV_EVENT_VALUE_CHANGED, item->user_data);
+                if (item->on_toggle_change) {
+                    lv_obj_add_event_cb(toggle_img, item->on_toggle_change, LV_EVENT_VALUE_CHANGED, item->user_data);
+                }
+            } else {
+                /* Out of memory -- degrade to a non-interactive row (shows
+                 * the correct initial sprite, just can't be tapped) rather
+                 * than dereferencing a NULL ctx. Without ctx, taps have
+                 * nothing to flip, so on_toggle_change is deliberately left
+                 * unwired too -- it would never fire anyway. */
+                fprintf(stderr, "[screen_builders] out of memory building toggle row '%s'\n",
+                        item->label ? item->label : "");
             }
         } else {
             if (item->accessory == PILL_ACCESSORY_CHEVRON) {

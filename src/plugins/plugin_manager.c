@@ -6,6 +6,7 @@
 #include "playlist_files.h"
 #include "plugin_json.h"
 #include "plugin_storage.h"
+#include "plugin_disabled_list.h"
 #include "fallback_font.h"
 #include "mbedtls/md5.h" /* plugin.md5() -- same primitive subsonic_client.c already uses for its own token auth */
 
@@ -93,6 +94,12 @@ typedef struct {
     char version[32];
     bool defined;
     time_t last_library_refresh;
+    /* Source filename (basename, e.g. "Themes.lua"), not just the derived
+     * plugin id -- needed by plugin_manager_scan_available() to map a
+     * loaded instance back to the file it came from even when the plugin
+     * declared its own custom plugin.define() id rather than falling back
+     * to the "legacy.<filename>" id below. */
+    char filename[256];
 } plugin_instance_t;
 
 static plugin_instance_t plugin_instances[PLUGIN_MAX_FILES];
@@ -1278,9 +1285,46 @@ static int l_plugin_show_toast(lua_State * L) {
 }
 
 #ifndef HOST_BUILD
+/* True when both paths exist as regular files of equal size and equal
+ * bytes. Used by copy_file() to skip a NAND rewrite of an icon that is
+ * already the requested image -- Themes.lua copies ~140 assets on every
+ * load, and after the first successful apply those destinations already
+ * match. */
+static bool files_identical(const char * a_path, const char * b_path) {
+    struct stat sa, sb;
+    if (stat(a_path, &sa) != 0 || stat(b_path, &sb) != 0) return false;
+    if (!S_ISREG(sa.st_mode) || !S_ISREG(sb.st_mode)) return false;
+    if (sa.st_size != sb.st_size) return false;
+
+    FILE * a = fopen(a_path, "rb");
+    FILE * b = fopen(b_path, "rb");
+    if (!a || !b) {
+        if (a) fclose(a);
+        if (b) fclose(b);
+        return false;
+    }
+
+    char ba[4096], bb[4096];
+    bool same = true;
+    for (;;) {
+        size_t na = fread(ba, 1, sizeof(ba), a);
+        size_t nb = fread(bb, 1, sizeof(bb), b);
+        if (na != nb || memcmp(ba, bb, na) != 0) {
+            same = false;
+            break;
+        }
+        if (na == 0) break;
+    }
+    if (ferror(a) || ferror(b)) same = false;
+    fclose(a);
+    fclose(b);
+    return same;
+}
+
 /* Atomic byte copy: readers see either the old complete icon or the new
  * one, never a partially-written PNG. */
 static bool copy_file(const char * src_path, const char * dst_path) {
+    if (files_identical(src_path, dst_path)) return true;
     FILE * in = fopen(src_path, "rb");
     if (!in) return false;
     char tmp_path[640];
@@ -3379,11 +3423,67 @@ static const luaL_Reg plugin_secrets_funcs[] = {
     { NULL, NULL }
 };
 
+#define PLUGIN_CALL_MAX_MS 2000
+
+static struct timespec plugin_call_deadline_start;
+
+/* Add only time actually spent inside a native function to the deadline.
+ * Previously resetting the deadline after every return let an infinite
+ * `while true do plugin.sd_root() end` loop evade the watchdog forever. */
+static void plugin_call_exclude_native_elapsed(const struct timespec * started) {
+    struct timespec ended;
+    clock_gettime(CLOCK_MONOTONIC, &ended);
+    time_t sec = ended.tv_sec - started->tv_sec;
+    long nsec = ended.tv_nsec - started->tv_nsec;
+    if (nsec < 0) { sec--; nsec += 1000000000L; }
+    plugin_call_deadline_start.tv_sec += sec;
+    plugin_call_deadline_start.tv_nsec += nsec;
+    if (plugin_call_deadline_start.tv_nsec >= 1000000000L) {
+        plugin_call_deadline_start.tv_sec++;
+        plugin_call_deadline_start.tv_nsec -= 1000000000L;
+    }
+}
+
+/* Invoke a plain native Lua function through a protected boundary so its
+ * elapsed time is excluded on both success and luaL_error(). */
+static int plugin_call_native(lua_State * L, lua_CFunction fn) {
+    int nargs = lua_gettop(L);
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    lua_pushcfunction(L, fn);
+    lua_insert(L, 1);
+    int rc = lua_pcall(L, nargs, LUA_MULTRET, 0);
+    plugin_call_exclude_native_elapsed(&started);
+    if (rc != LUA_OK) return lua_error(L);
+    return lua_gettop(L);
+}
+
+/* Wraps one plugin.* C function so native elapsed time is excluded even
+ * when the inner function luaL_error()s (lua_pcall here catches that,
+ * accounts, then rethrows). Without this, a long set_icon/http_get would
+ * return to Lua with the original plugin_call() deadline already expired
+ * and the next instruction-count hook would abort the whole plugin --
+ * Themes.lua copies ~140 icons at load via set_icon(), so that abort
+ * looked like "the Themes plugin didn't load" after a flash wiped
+ * /usr/data/theme_overrides/. */
+static int l_plugin_api_guard(lua_State * L) {
+    return plugin_call_native(L, lua_tocfunction(L, lua_upvalueindex(1)));
+}
+
+static void register_plugin_lib(lua_State * L, const luaL_Reg * regs) {
+    lua_newtable(L);
+    for (; regs->name != NULL; regs++) {
+        lua_pushcfunction(L, regs->func);
+        lua_pushcclosure(L, l_plugin_api_guard, 1);
+        lua_setfield(L, -2, regs->name);
+    }
+}
+
 static void register_plugin_api(lua_State * L) {
-    luaL_newlib(L, plugin_funcs);
-    luaL_newlib(L, plugin_storage_funcs);
+    register_plugin_lib(L, plugin_funcs);
+    register_plugin_lib(L, plugin_storage_funcs);
     lua_setfield(L, -2, "storage");
-    luaL_newlib(L, plugin_secrets_funcs);
+    register_plugin_lib(L, plugin_secrets_funcs);
     lua_setfield(L, -2, "secrets");
     lua_setglobal(L, "plugin");
 }
@@ -3458,7 +3558,7 @@ static int l_guarded_io_open(lua_State * L) {
         lua_pushliteral(L, "io.open: path is reserved for plugin.storage/plugin.secrets");
         return 2;
     }
-    return real_io_open(L);
+    return plugin_call_native(L, real_io_open);
 }
 
 static int l_guarded_io_lines(lua_State * L) {
@@ -3472,7 +3572,7 @@ static int l_guarded_io_lines(lua_State * L) {
             return luaL_error(L, "io.lines: path is reserved for plugin.storage/plugin.secrets");
         }
     }
-    return real_io_lines(L);
+    return plugin_call_native(L, real_io_lines);
 }
 
 static int l_guarded_io_input(lua_State * L) {
@@ -3488,7 +3588,7 @@ static int l_guarded_io_input(lua_State * L) {
             return luaL_error(L, "io.input: path is reserved for plugin.storage/plugin.secrets");
         }
     }
-    return real_io_input(L);
+    return plugin_call_native(L, real_io_input);
 }
 
 static int l_guarded_io_output(lua_State * L) {
@@ -3498,7 +3598,7 @@ static int l_guarded_io_output(lua_State * L) {
             return luaL_error(L, "io.output: path is reserved for plugin.storage/plugin.secrets");
         }
     }
-    return real_io_output(L);
+    return plugin_call_native(L, real_io_output);
 }
 
 static int l_guarded_os_remove(lua_State * L) {
@@ -3508,7 +3608,7 @@ static int l_guarded_os_remove(lua_State * L) {
         lua_pushliteral(L, "os.remove: path is reserved for plugin.storage/plugin.secrets");
         return 2;
     }
-    return real_os_remove(L);
+    return plugin_call_native(L, real_os_remove);
 }
 
 static int l_guarded_os_rename(lua_State * L) {
@@ -3519,7 +3619,7 @@ static int l_guarded_os_rename(lua_State * L) {
         lua_pushliteral(L, "os.rename: path is reserved for plugin.storage/plugin.secrets");
         return 2;
     }
-    return real_os_rename(L);
+    return plugin_call_native(L, real_os_rename);
 }
 
 static void sandbox_plugin_lua_state(lua_State * L) {
@@ -3575,10 +3675,6 @@ static void sandbox_plugin_lua_state(lua_State * L) {
     lua_pop(L, 1);
 }
 
-#define PLUGIN_CALL_MAX_MS 2000 /* generous margin above any legitimate plugin operation observed; still short enough that a runaway loop doesn't hang the UI for long */
-
-static struct timespec plugin_call_deadline_start;
-
 static void plugin_call_timeout_hook(lua_State * L, lua_Debug * ar) {
     (void) ar;
     struct timespec now;
@@ -3597,6 +3693,9 @@ static void plugin_call_timeout_hook(lua_State * L, lua_Debug * ar) {
  * freezes the whole player indefinitely, needing a hard power-cycle.
  * Wraps lua_pcall() with a wall-clock budget checked every LUA_MASKCOUNT
  * instructions via a debug hook, installed/torn down around each call.
+ * The budget is cumulative Lua-busy time: native plugin.* and guarded
+ * io/os entry points extend the deadline by exactly their elapsed native
+ * duration, without erasing Lua time already consumed.
  * This whole plugin system only ever runs on the UI thread (every
  * lua_State is only ever touched from here), so a single file-static
  * deadline-start variable, reset immediately before each call, is safe --
@@ -3617,6 +3716,9 @@ static void load_plugin_file(const char * path) {
     plugin_instance_t * inst = &plugin_instances[slot];
     memset(inst, 0, sizeof(*inst));
     inst->L = L;
+    const char * base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    snprintf(inst->filename, sizeof(inst->filename), "%s", base);
     loading_plugin_slot = slot;
     luaL_openlibs(L);
     sandbox_plugin_lua_state(L);
@@ -3636,8 +3738,6 @@ static void load_plugin_file(const char * path) {
     }
 
     if (!inst->defined) {
-        const char * base = strrchr(path, '/');
-        base = base ? base + 1 : path;
         snprintf(inst->id, sizeof(inst->id), "legacy.%.*s", (int) sizeof(inst->id) - 8, base);
         char * dot = strrchr(inst->id, '.');
         if (dot && strcasecmp(dot, ".lua") == 0) *dot = '\0';
@@ -3688,35 +3788,44 @@ static int plugin_filename_cmp(const void * a, const void * b) {
     return strcmp((const char *) a, (const char *) b);
 }
 
-void plugin_manager_init(void) {
-    char dir_path[600];
-    snprintf(dir_path, sizeof(dir_path), "%s/.plugins", MUSIC_ROOT_DIR);
+/* Shared by plugin_manager_init() and plugin_manager_scan_available():
+ * returns a malloc'd, filename-sorted, UNBOUNDED array of every *.lua
+ * filename directly under <SD card>/.plugins/ (caller must free() it), and
+ * writes that directory's path into dir_path_out. Returns NULL (and sets
+ * *out_count to 0) if there's no .plugins folder or no .lua files in it.
+ *
+ * Deliberately not capped at PLUGIN_MAX_FILES here -- both callers need to
+ * see the FULL on-disk list before applying their own separate cap
+ * (plugin_manager_init() only after filtering out disabled names, so a
+ * disabled file's load slot is actually reclaimed; plugin_manager_scan_available()
+ * because a UI list enumerates every file on disk, loaded or not).
+ *
+ * Collected and sorted before any file is actually loaded, rather than
+ * calling load_plugin_file() straight from the readdir() loop -- plain
+ * directory iteration order is filesystem-dependent (real-device confirmed:
+ * it can change after copying or reinstalling files, or between an SD card
+ * formatted on different tools/OSes), which made "last-loaded plugin wins"
+ * APIs (plugin.set_background_color()/set_text_color()/set_icon()/
+ * set_home_layout() -- every one of them a single global slot every plugin
+ * writes into) silently nondeterministic whenever two installed plugins
+ * both set the same one. Sorting by filename doesn't remove the "last one
+ * wins" behavior itself (still genuinely ambiguous which of two theme
+ * plugins a user "wants"), but it makes the outcome reproducible and
+ * independent of the filesystem, and documented (PLUGINS.md) rather than
+ * left to chance.
+ *
+ * Two passes, not one collected straight into a fixed-size array --
+ * collecting into a capped array during a single readdir() pass only sorts
+ * whichever entries happened to come first in raw, filesystem-dependent
+ * order. Counting first means every eligible name is sorted before any cap
+ * is applied. */
+static char (*scan_plugin_dir_sorted_names(char dir_path_out[600], int * out_count))[256] {
+    *out_count = 0;
+    snprintf(dir_path_out, 600, "%s/.plugins", MUSIC_ROOT_DIR);
 
-    DIR * d = opendir(dir_path);
-    if (!d) return; /* no .plugins folder -- nothing to do, not an error */
+    DIR * d = opendir(dir_path_out);
+    if (!d) return NULL; /* no .plugins folder -- nothing to do, not an error */
 
-    /* Collected and sorted before any file is actually loaded, rather than
-     * calling load_plugin_file() straight from the readdir() loop -- plain
-     * directory iteration order is filesystem-dependent (real-device
-     * confirmed: it can change after copying or reinstalling files, or
-     * between an SD card formatted on different tools/OSes), which made
-     * "last-loaded plugin wins" APIs (plugin.set_background_color()/
-     * set_text_color()/set_icon()/set_home_layout() -- every one of them a
-     * single global slot every plugin writes into) silently nondeterministic
-     * whenever two installed plugins both set the same one. Sorting by
-     * filename doesn't remove the "last one wins" behavior itself (still
-     * genuinely ambiguous which of two theme plugins a user "wants"), but it
-     * makes the outcome reproducible and independent of the filesystem, and
-     * documented (PLUGINS.md) rather than left to chance.
-     *
-     * Two passes, not one collected straight into a fixed PLUGIN_MAX_FILES-
-     * sized array -- collecting into a 16-slot array during a single
-     * readdir() pass only sorts whichever 16 entries happened to come first
-     * in raw, filesystem-dependent order; with 17+ .lua files installed, the
-     * loaded *subset* would still depend on unsorted directory order, not
-     * just which of that subset loads last. Counting first means every
-     * eligible name is sorted before PLUGIN_MAX_FILES is applied, so the
-     * alphabetically-first 16 are always the ones actually loaded. */
     int total = 0;
     struct dirent * ent;
     while ((ent = readdir(d)) != NULL) {
@@ -3726,13 +3835,13 @@ void plugin_manager_init(void) {
     }
     if (total == 0) {
         closedir(d);
-        return;
+        return NULL;
     }
 
     char (*names)[256] = malloc((size_t) total * sizeof(*names));
     if (!names) {
         closedir(d);
-        return;
+        return NULL;
     }
 
     /* rewinddir(), not a second opendir() -- same DIR* handle, standard
@@ -3752,8 +3861,30 @@ void plugin_manager_init(void) {
     closedir(d);
 
     qsort(names, (size_t) name_count, sizeof(names[0]), plugin_filename_cmp);
+    *out_count = name_count;
+    return names;
+}
 
-    int load_count = (name_count > PLUGIN_MAX_FILES) ? PLUGIN_MAX_FILES : name_count;
+void plugin_manager_init(void) {
+    plugin_disabled_list_load();
+
+    char dir_path[600];
+    int name_count = 0;
+    char (*names)[256] = scan_plugin_dir_sorted_names(dir_path, &name_count);
+    if (!names) return;
+
+    /* Filter disabled names out BEFORE the PLUGIN_MAX_FILES cap is applied,
+     * not after -- so disabling a plugin actually frees its slot for a 17th
+     * alphabetical file, rather than silently wasting a load slot on a file
+     * that isn't going to load anyway. */
+    int enabled_count = 0;
+    for (int i = 0; i < name_count; i++) {
+        if (plugin_disabled_list_contains(names[i])) continue;
+        if (enabled_count != i) memcpy(names[enabled_count], names[i], sizeof(names[0]));
+        enabled_count++;
+    }
+
+    int load_count = (enabled_count > PLUGIN_MAX_FILES) ? PLUGIN_MAX_FILES : enabled_count;
     for (int i = 0; i < load_count; i++) {
         if (plugin_instance_count >= PLUGIN_MAX_FILES) break;
         char full_path[700];
@@ -3761,6 +3892,67 @@ void plugin_manager_init(void) {
         load_plugin_file(full_path);
     }
     free(names);
+}
+
+/* Fills `e` for `filename`, cross-referencing plugin_instances[] for its
+ * loaded state and (when loaded) its real display name. */
+static void fill_available_entry(plugin_available_entry_t * e, const char * filename) {
+    snprintf(e->filename, sizeof(e->filename), "%s", filename);
+    e->disabled = plugin_disabled_list_contains(filename);
+    e->loaded = false;
+    snprintf(e->display_name, sizeof(e->display_name), "%s", filename);
+
+    for (int j = 0; j < plugin_instance_count; j++) {
+        if (strcmp(plugin_instances[j].filename, filename) == 0) {
+            e->loaded = true;
+            snprintf(e->display_name, sizeof(e->display_name), "%s", plugin_instances[j].name);
+            break;
+        }
+    }
+}
+
+int plugin_manager_scan_available(plugin_available_entry_t * out, int max) {
+    char dir_path[600];
+    int name_count = 0;
+    char (*names)[256] = scan_plugin_dir_sorted_names(dir_path, &name_count);
+    if (!names) return 0;
+
+    int count = 0;
+    if (name_count <= max) {
+        /* Common case -- every file fits, plain alphabetical order. */
+        for (int i = 0; i < name_count; i++) fill_available_entry(&out[count++], names[i]);
+    } else {
+        /* More .lua files on disk than `max` can return. Guarantee every
+         * currently-LOADED plugin is still included -- there can only ever
+         * be PLUGIN_MAX_FILES (16) of those, always <= max -- rather than
+         * truncating in pure alphabetical order and silently hiding an
+         * active plugin with no way to toggle it off from this list (real
+         * finding: N alphabetically-early disabled files would otherwise
+         * push a loaded, alphabetically-later one out of a naive cap).
+         * Loaded entries go first, then whatever budget remains is filled
+         * in alphabetical order -- sacrifices strict A-Z ordering only in
+         * this already-degenerate case. */
+        bool * included = calloc((size_t) name_count, sizeof(bool));
+        if (!included) { free(names); return 0; }
+
+        for (int i = 0; i < name_count && count < max; i++) {
+            bool is_loaded = false;
+            for (int j = 0; j < plugin_instance_count; j++) {
+                if (strcmp(plugin_instances[j].filename, names[i]) == 0) { is_loaded = true; break; }
+            }
+            if (is_loaded) {
+                fill_available_entry(&out[count++], names[i]);
+                included[i] = true;
+            }
+        }
+        for (int i = 0; i < name_count && count < max; i++) {
+            if (!included[i]) fill_available_entry(&out[count++], names[i]);
+        }
+        free(included);
+    }
+
+    free(names);
+    return count;
 }
 
 /* Forces every in-flight plugin.http_get_async()/download_file_async()

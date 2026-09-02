@@ -157,13 +157,19 @@ covers it).
 Every plugin call (a UI callback, a timer tick, an event handler, and the
 file's own top-level code on load) also runs under a wall-clock time
 budget -- 2 seconds, checked periodically via a Lua instruction-count hook
-(`plugin_call()`, wrapping every `lua_pcall()` in `plugin_manager.c`). A
-callback that runs long doing real work (an HTTP request via
-`plugin.http_get()`/`http_post()`/`http_request()`, for instance) is
-**not** affected -- the budget only ever fires between Lua bytecode
-instructions, never while blocked inside a native call, so it only catches
-a genuine runaway loop in Lua code itself (e.g. an accidental `while true
-do end`), not a slow network response.
+(`plugin_call()`, wrapping every `lua_pcall()` in `plugin_manager.c`). The
+budget is cumulative Lua-busy time, not "start of the call to now": every
+native `plugin.*` function, plus the guarded `io`/`os` entry points, adds
+only its own elapsed native time to the deadline. Legitimate native work
+(copying theme icons with `plugin.set_icon()` or a slow
+`plugin.http_get()`) therefore cannot abort the plugin the moment Lua
+resumes, while repeated cheap API calls cannot reset already-consumed Lua
+time. File-handle methods such as `file:read()` remain part of the budget.
+Without that credit, `Themes.lua` failed to load after a firmware flash --
+it copies ~140 icons into a wiped `/usr/data/theme_overrides/` at top
+level, before `plugin.register_list_item()`, and the 2-second wall clock
+killed the whole file. A genuine runaway loop still hits the cumulative
+budget, including one that repeatedly calls a cheap native API.
 
 <a id="ui-entry-points"></a>
 
@@ -1731,7 +1737,19 @@ It also demonstrates the success/busy return contract of `show_text_input()`.
 1. Write the plugin in any text editor—there is no separate plugin build.
 2. Optionally run `luac -p MyPlugin.lua` to catch syntax errors locally.
 3. Copy it to `<SD card>/.plugins/`.
-4. Restart the player; there is currently no hot reload.
+4. Either restart the player, or open Settings -> System -> Plugins and tap
+   "Reload Plugins" to pick up the new/edited file without restarting (same
+   full reload `plugin.reload_ui()` itself triggers -- every other loaded
+   plugin's top-level code re-runs too, and navigation lands back on Home).
+   That screen also has a per-plugin on/off toggle. **The toggle only
+   controls whether a plugin's script runs on the next reload -- it does
+   not undo anything that plugin already did.** A plugin that only adds
+   list rows/tiles or registers callbacks disappears cleanly. A plugin that
+   called `set_icon()` (theme icon files under `theme_overrides/`, never
+   attributed to any one plugin) or the `eq_*` family (persisted EQ state)
+   leaves those changes in place after being toggled off; only reverting
+   them yourself (or a plugin that explicitly does so, e.g. re-toggling a
+   theme back on and picking a different one) removes them.
 5. Follow [TESTING.md](TESTING.md) when launching through ADB and watch the
    foreground output.
 

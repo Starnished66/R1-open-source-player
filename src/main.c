@@ -58,6 +58,54 @@ extern void gui_init(uint32_t screen_width, uint32_t screen_height);
 #endif
 
 #ifndef HOST_BUILD
+#include <ucontext.h>
+
+/* Temporary investigation instrumentation for the "enabling/disabling
+ * plugins triggers a reboot" report -- a live dmesg capture already
+ * confirmed a real SIGSEGV inside musl's pthread_join() (invalid read from
+ * a near-NULL offset, 0x18 into its internal thread struct), and gui_
+ * reload.c/gui_library.c's own reload_diag()/library_teardown_diag() calls
+ * already narrowed it to always landing right after gui_library_init()
+ * finishes and before gui_network_init() starts -- but neither says WHICH
+ * of this codebase's 70+ pthread_join() call sites, or whose thread
+ * handle, is actually at fault. This handler writes pc/ra/sp and
+ * pthread_join()'s own first two arguments (a0 = the bad handle itself,
+ * a1 = its retval-out pointer) into the exact same reload_diag.log every
+ * other diagnostic in this investigation already appends to, plus a raw
+ * scan of the stack above sp for words that land inside this binary's own
+ * static text range -- a poor man's backtrace, since -O3 doesn't keep
+ * frame pointers here for a real one. Re-raises with the default handler
+ * restored afterward so the bootloader's existing crash-reboot behavior
+ * is unchanged. */
+static void crash_diag_handler(int sig, siginfo_t * info, void * ucontext_v) {
+    int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        ucontext_t * uc = (ucontext_t *) ucontext_v;
+        unsigned long pc = (unsigned long) uc->uc_mcontext.pc;
+        unsigned long ra = (unsigned long) uc->uc_mcontext.gregs[31];
+        unsigned long sp = (unsigned long) uc->uc_mcontext.gregs[29];
+        unsigned long a0 = (unsigned long) uc->uc_mcontext.gregs[4];
+        unsigned long a1 = (unsigned long) uc->uc_mcontext.gregs[5];
+        char buf[256];
+        int len = snprintf(buf, sizeof(buf),
+            "[pid=%ld] *** CRASH sig=%d fault_addr=%p pc=%08lx ra=%08lx sp=%08lx a0=%08lx a1=%08lx ***\n",
+            (long) getpid(), sig, info ? info->si_addr : NULL, pc, ra, sp, a0, a1);
+        if (len > 0) { ssize_t r = write(fd, buf, (size_t) len); (void) r; }
+        for (unsigned long addr = sp; addr < sp + 2048 && addr >= sp; addr += 4) {
+            unsigned long word = *(unsigned long *) addr;
+            if (word >= 0x400000UL && word < 0x9d0000UL) {
+                len = snprintf(buf, sizeof(buf), "[pid=%ld]   stack[+%04lx] = %08lx\n",
+                                (long) getpid(), addr - sp, word);
+                if (len > 0) { ssize_t r = write(fd, buf, (size_t) len); (void) r; }
+            }
+        }
+        fsync(fd);
+        close(fd);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 /* Polls /dev/fb0 with a real open()+ioctl() check rather than trusting the
  * device node's mere existence -- the node can appear before the underlying
  * driver has finished settling, and using it too early crashes on the first
@@ -175,6 +223,15 @@ int main(int argc, char ** argv) {
      * just returning EPIPE (which audio_output_write() already handles
      * correctly). Must run before anything else opens a subprocess pipe. */
     signal(SIGPIPE, SIG_IGN);
+
+#ifndef HOST_BUILD
+    struct sigaction crash_sa;
+    memset(&crash_sa, 0, sizeof(crash_sa));
+    crash_sa.sa_sigaction = crash_diag_handler;
+    crash_sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &crash_sa, NULL);
+    sigaction(SIGBUS, &crash_sa, NULL);
+#endif
 
     if (argc == 4 && strcmp(argv[1], "--metadata-artwork-helper") == 0) {
         char * end = NULL;

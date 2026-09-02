@@ -1264,15 +1264,29 @@ static bool album_thumb_gen_should_cancel(int my_generation) {
 }
 
 static void cancel_album_thumbnail_generation(void) {
-    if (!album_thumb_gen_thread_joinable || !atomic_load(&album_thumb_gen_active)) return;
+    if (!album_thumb_gen_thread_joinable || !album_thumb_gen_thread || !atomic_load(&album_thumb_gen_active)) return;
     atomic_store(&album_thumb_gen_cancel, true);
     atomic_fetch_add(&album_thumb_gen_generation, 1);
 }
 
+/* Real-device review finding: a SIGSEGV inside musl's pthread_join()
+ * (invalid read at a near-NULL offset), reproducibly triggered by
+ * enabling/disabling plugins and navigating away from Manage Plugins. A
+ * captured register dump confirmed pthread_join()'s own first argument --
+ * album_thumb_gen_thread itself -- was a literal NULL at the fault, while
+ * album_thumb_gen_thread_joinable read true; every write site to both
+ * (start_album_thumbnail_generation()'s own pthread_create() success path,
+ * this function's own reset on join) pairs them correctly in isolation, so
+ * the joinable flag alone is not a safe guard against whatever flipped it
+ * without a real thread behind it. Also require the handle itself to be
+ * non-zero before joining -- musl's pthread_t is a real pointer here (a
+ * NULL join is exactly what faulted), so this check is meaningful, not a
+ * platform-specific guess. */
 static void reap_album_thumbnail_generation(void) {
     if (!album_thumb_gen_thread_joinable) return;
-    pthread_join(album_thumb_gen_thread, NULL);
     album_thumb_gen_thread_joinable = false;
+    if (!album_thumb_gen_thread) return;
+    pthread_join(album_thumb_gen_thread, NULL);
 }
 
 /* Dynamic cancellation callbacks */

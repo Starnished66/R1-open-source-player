@@ -16,8 +16,8 @@ jobs:
 
       - name: Download and setup MIPS toolchain
         run: |
-          # Use curl with location redirects (-L) and 3 automatic retries
-          curl -S -L -O --retry 3 https://musl.cc/mipsel-linux-musl-cross.tgz
+          # Added -4 to force IPv4 and prevent GitHub Actions from hanging on IPv6
+          curl -4 -S -L -O --retry 3 https://musl.cc/mipsel-linux-musl-cross.tgz
           tar -xf mipsel-linux-musl-cross.tgz
           echo "${{ github.workspace }}/mipsel-linux-musl-cross/bin" >> $GITHUB_PATH
 

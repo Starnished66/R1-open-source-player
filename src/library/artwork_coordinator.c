@@ -115,6 +115,7 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
      * - PNG: LodePNG transiently inflates zlib stream and allocates intermediate
      *   raw scanline buffers with filter bytes (~4 bytes/pixel) + zlib window.
      * - JPEG: tjpgd streams 8x8 MCU blocks into destination; minimal ~32KB buffer.
+     *   native_w/h for JPEG is the post-scale RGB888 size, not the source pixel size.
      * - BMP: uncompressed linear stream; ~16KB overhead. */
     uint64_t decoder_workspace = 64ULL * 1024ULL;
     if (fmt == ARTWORK_FORMAT_PNG) {

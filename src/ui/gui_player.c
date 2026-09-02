@@ -444,9 +444,9 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
 /* Real-device bug report: entering the player screen right after picking a
  * song left its on-screen play/pause/next/prev buttons unresponsive for a
  * couple of seconds. Root cause: apply_track_metadata_to_ui() used to
- * decode the embedded cover art (cover_decode_to_rgb565(), a full native-
- * resolution JPEG/PNG decode -- see cover_decode.c's own comment on why
- * this can't use tjpgd's faster scaled decode) and run the reflection blur
+ * decode the embedded cover art (cover_decode_to_rgb565(), JPEG at the
+ * largest tjpgd 1/2^n that still covers the target then cover-fit, PNG/BMP
+ * at native size then cover-fit) and run the reflection blur
  * above synchronously, on the UI thread, before play_track_at_from() ever
  * reached nav_push(player_screen) -- easily 1-3+ seconds of pure blocking
  * on this hardware for a large embedded image, during which

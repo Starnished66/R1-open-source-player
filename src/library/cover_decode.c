@@ -76,6 +76,7 @@ static bool inspect_jpeg(const uint8_t * data, uint32_t size, int * out_w, int *
 }
 
 static cover_decode_result_t decode_jpeg_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
+                                                int target_w, int target_h,
                                                 uint8_t ** out_buf, int * out_w, int * out_h) {
     uint8_t workbuf[4096];
     JDEC jd;
@@ -85,28 +86,35 @@ static cover_decode_result_t decode_jpeg_rgb888(const uint8_t * data, uint32_t s
         return COVER_DECODE_FAIL_UNSUPPORTED;
     }
 
-    size_t native_bytes = 0;
-    if (!rgb888_size_ok(jd.width, jd.height, max_side, &native_bytes)) {
+    if (!rgb888_size_ok(jd.width, jd.height, max_side, NULL)) {
         return COVER_DECODE_FAIL_OVERSIZED;
     }
 
-    uint8_t * buf = calloc(1, native_bytes);
+    uint8_t scale = jpeg_scale_for_target((int) jd.width, (int) jd.height, target_w, target_h);
+    int scaled_w = (int) (jd.width >> scale);
+    int scaled_h = (int) (jd.height >> scale);
+    size_t scaled_bytes = 0;
+    if (!rgb888_size_ok((size_t) scaled_w, (size_t) scaled_h, max_side, &scaled_bytes)) {
+        return COVER_DECODE_FAIL_OVERSIZED;
+    }
+
+    uint8_t * buf = calloc(1, scaled_bytes);
     if (!buf) {
         return COVER_DECODE_FAIL_ALLOC;
     }
 
     ctx.out_buf = buf;
-    ctx.out_w = (int) jd.width;
-    ctx.out_h = (int) jd.height;
+    ctx.out_w = scaled_w;
+    ctx.out_h = scaled_h;
 
-    if (jd_decomp(&jd, jpeg_mem_output, 0) != JDR_OK) {
+    if (jd_decomp(&jd, jpeg_mem_output, scale) != JDR_OK) {
         free(buf);
         return COVER_DECODE_FAIL_UNSUPPORTED;
     }
 
     *out_buf = buf;
-    *out_w = (int) jd.width;
-    *out_h = (int) jd.height;
+    *out_w = scaled_w;
+    *out_h = scaled_h;
     return COVER_DECODE_OK;
 }
 
@@ -342,8 +350,15 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
         return COVER_DECODE_FAIL_OVERSIZED;
     }
 
-    /* 2. Estimate required memory and acquire decode slot from coordinator */
-    size_t est_bytes = artwork_estimate_decode_bytes(fmt, size, (size_t) native_w, (size_t) native_h,
+    /* 2. Estimate required memory and acquire decode slot from coordinator.
+     * JPEG bills the post-scale RGB888 buffer, not native pixels. */
+    int est_w = native_w, est_h = native_h;
+    if (fmt == ARTWORK_FORMAT_JPEG) {
+        uint8_t scale = jpeg_scale_for_target(native_w, native_h, target_w, target_h);
+        est_w = native_w >> scale;
+        est_h = native_h >> scale;
+    }
+    size_t est_bytes = artwork_estimate_decode_bytes(fmt, size, (size_t) est_w, (size_t) est_h,
                                                      (size_t) target_w, (size_t) target_h);
     uint32_t timeout_ms = (prio == ARTWORK_PRIO_PLAYER) ? 1000 : 300;
 
@@ -365,7 +380,8 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
     cover_decode_result_t dec_res = COVER_DECODE_FAIL_UNSUPPORTED;
 
     if (fmt == ARTWORK_FORMAT_JPEG) {
-        dec_res = decode_jpeg_rgb888(data, size, max_side, &native_buf, &decoded_w, &decoded_h);
+        dec_res = decode_jpeg_rgb888(data, size, max_side, target_w, target_h,
+                                     &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_PNG) {
         dec_res = decode_png_rgb888(data, size, max_side, &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_BMP) {

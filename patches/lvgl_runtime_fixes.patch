@@ -2,7 +2,7 @@ diff --git a/src/libs/tiny_ttf/lv_tiny_ttf.c b/src/libs/tiny_ttf/lv_tiny_ttf.c
 index b185d39..087f911 100644
 --- a/src/libs/tiny_ttf/lv_tiny_ttf.c
 +++ b/src/libs/tiny_ttf/lv_tiny_ttf.c
-@@ -134,18 +134,23 @@ void lv_tiny_ttf_destroy(lv_font_t * fon
+@@ -134,18 +134,23 @@ void lv_tiny_ttf_destroy(lv_font_t * font)
  
  void lv_tiny_ttf_init(void)
  {
@@ -28,7 +28,7 @@ index b185d39..087f911 100644
  }
  
  /**********************
-@@ -286,6 +291,9 @@ static lv_font_t * lv_tiny_ttf_create(co
+@@ -286,6 +291,9 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
          dsc->stream.size = data_size;
      }
      if(0 == stbtt_InitFont(&dsc->info, &dsc->stream, stbtt_GetFontOffsetForIndex(&dsc->stream, 0))) {
@@ -38,7 +38,7 @@ index b185d39..087f911 100644
          lv_free(dsc);
          LV_LOG_ERROR("tiny_ttf: init failed\n");
          return NULL;
-@@ -302,6 +310,11 @@ static lv_font_t * lv_tiny_ttf_create(co
+@@ -302,6 +310,11 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
  
      lv_font_t * out_font = lv_malloc_zeroed(sizeof(lv_font_t));
      if(out_font == NULL) {
@@ -50,6 +50,73 @@ index b185d39..087f911 100644
          lv_free(dsc);
          LV_LOG_ERROR("tiny_ttf: out of memory\n");
          return NULL;
+diff --git a/src/libs/tjpgd/tjpgd.c b/src/libs/tjpgd/tjpgd.c
+index 22dfd56..5e910ca 100644
+--- a/src/libs/tjpgd/tjpgd.c
++++ b/src/libs/tjpgd/tjpgd.c
+@@ -887,8 +887,61 @@ JRESULT jd_mcu_output(
+                 }
+             }
+         }
++        /* Descale the MCU rectangular if needed */
++        if(JD_USE_SCALE && jd->scale) {
++            unsigned int x, y, r, g, b, s, w, a;
++            uint8_t * op;
++
++            /* Get averaged RGB value of each square corresponding to a pixel */
++            s = jd->scale * 2;  /* Number of shifts for averaging */
++            w = 1 << jd->scale; /* Width of square */
++            a = (mx - w) * (JD_FORMAT != 2 ? 3 : 1); /* Bytes to skip for next line in the square */
++            op = (uint8_t *)jd->workbuf;
++            for(iy = 0; iy < my; iy += w) {
++                for(ix = 0; ix < mx; ix += w) {
++                    pix = (uint8_t *)jd->workbuf + (iy * mx + ix) * (JD_FORMAT != 2 ? 3 : 1);
++                    r = g = b = 0;
++                    for(y = 0; y < w; y++) {
++                        for(x = 0; x < w; x++) {
++                            r += *pix++;
++                            if(JD_FORMAT != 2) {
++                                g += *pix++;
++                                b += *pix++;
++                            }
++                        }
++                        pix += a;
++                    }
++                    *op++ = (uint8_t)(r >> s);
++                    if(JD_FORMAT != 2) {
++                        *op++ = (uint8_t)(g >> s);
++                        *op++ = (uint8_t)(b >> s);
++                    }
++                }
++            }
++        }
++    }
++    else {    /* 1/8 scaling: one pixel per 8x8 from the block DC. B,G,R to match the full-MCU loop above. */
++        pix = (uint8_t *)jd->workbuf;
++        pc = jd->mcubuf + mx * my;
++        cb = pc[0] - 128;
++        cr = pc[64] - 128;
++        for(iy = 0; iy < my; iy += 8) {
++            py = jd->mcubuf;
++            if(iy == 8) py += 64 * 2;
++            for(ix = 0; ix < mx; ix += 8) {
++                yy = *py;
++                py += 64;
++                if(JD_FORMAT != 2) {
++                    *pix++ = /*B*/ BYTECLIP(yy + ((int)(1.772 * CVACC) * cb) / CVACC);
++                    *pix++ = /*G*/ BYTECLIP(yy - ((int)(0.344 * CVACC) * cb + (int)(0.714 * CVACC) * cr) / CVACC);
++                    *pix++ = /*R*/ BYTECLIP(yy + ((int)(1.402 * CVACC) * cr) / CVACC);
++                }
++                else {
++                    *pix++ = yy;
++                }
++            }
++        }
+     }
+-
+     /* Squeeze up pixel table if a part of MCU is to be truncated */
+     mx >>= jd->scale;
+     if(rx < mx) {   /* Is the MCU spans rigit edge? */
 diff --git a/src/libs/tjpgd/tjpgdcnf.h b/src/libs/tjpgd/tjpgdcnf.h
 index dc27d6a..514b63d 100644
 --- a/src/libs/tjpgd/tjpgdcnf.h

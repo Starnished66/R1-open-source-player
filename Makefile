@@ -64,9 +64,12 @@ endif
 #      (e.g. a settings change that invalidates cached UI bitmaps) operated
 #      on a destroyed tree; tjpgdcnf.h's JD_USE_SCALE was left at the
 #      upstream default of 0, disabling TJpgDec's own output downscaling
-#      that this app's album-art thumbnail path relies on to decode cover
-#      JPEGs straight to thumbnail resolution instead of full-size-then-
-#      software-resize (see ISSUES.md's Albums-screen overheat/OOM entry);
+#      that this app's album-art path uses to decode cover JPEGs at the
+#      largest 2^n that still covers the target, then cover-fit, instead of
+#      full-size-then-software-resize (see ISSUES.md's Albums-screen
+#      overheat/OOM entry); tjpgd.c's jd_mcu_output was also missing ChaN's
+#      1/2 and 1/4 MCU averaging and 1/8 DC RGB path, so scale!=0 was unusable
+#      until restored here (BGR order, matching this copy's full-MCU loop);
 #      lv_tiny_ttf_init() also hardcoded its shared rasterized-glyph LRU
 #      cache to 128 entries -- fine for this app's default Montserrat
 #      tiers, which are pre-baked bitmap fonts (lv_font_montserrat_*, see
@@ -510,7 +513,7 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=buil
               $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_target/stb_vorbis/%.o) \
               $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_target/lua/%.o)
 
-.PHONY: all host target bootloader sd_ready_test clean compile_commands.json FORCE_VERSION
+.PHONY: all host target bootloader sd_ready_test cover_decode_scale_test clean compile_commands.json FORCE_VERSION
 
 # Default target builds for host simulation and generates compile commands for IDE
 all: host compile_commands.json
@@ -686,6 +689,19 @@ sd_ready_test:
 	$(CC) -O0 -g -Wall -Isrc/bootloader src/bootloader/sd_ready.c src/bootloader/sd_ready_test.c \
 	    -o build_target/sd_ready_test
 	./build_target/sd_ready_test
+
+# Host-buildable tests for JPEG scale selection, tjpgd 1/2 1/4 1/8 decode,
+# cover_decode_to_rgb565_ex, and malformed/oversized rejection. Links the
+# real decoder + tjpgd + artwork coordinator; audio_is_playing and lodepng
+# are stubbed in the test (JPEG-only). Not part of `all`.
+cover_decode_scale_test:
+	@mkdir -p build_target
+	$(CC) -O0 -g -Wall -DHOST_BUILD=1 -DLV_CONF_INCLUDE_SIMPLE=1 \
+	    -I. -Isrc/library -Isrc/core -Isrc/audio -Ilvgl \
+	    src/library/cover_decode_scale_test.c src/library/cover_decode.c \
+	    src/library/artwork_coordinator.c lvgl/src/libs/tjpgd/tjpgd.c \
+	    -lpthread -o build_target/cover_decode_scale_test
+	./build_target/cover_decode_scale_test
 
 build_target/%.o: src/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)

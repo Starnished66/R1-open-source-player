@@ -29,6 +29,13 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Set weekly release identity
+        id: release
+        run: |
+          release_date=$(date -u +%F)
+          echo "tag=weekly-beta-$release_date" >> "$GITHUB_OUTPUT"
+          echo "title=Weekly Beta $release_date" >> "$GITHUB_OUTPUT"
+
       - name: Cache MIPS musl toolchain
         uses: actions/cache@v4
         with:
@@ -56,9 +63,11 @@ jobs:
             file genisoimage lua5.4 p7zip-full squashfs-tools zip
 
       - name: Build and validate player
+        env:
+          RELEASE_LABEL: ${{ steps.release.outputs.title }}
         run: |
           set -euo pipefail
-          make -j2 target
+          make -j2 target RELEASE_LABEL="$RELEASE_LABEL"
           make bootloader
           make sd_ready_test
           file open_hiby_player_target open_hiby_bootloader
@@ -101,11 +110,8 @@ jobs:
             > release/SHA256SUMS
 
       - name: Prepare release notes
-        id: release
         run: |
           set -euo pipefail
-          release_date=$(date -u +%F)
-          tag="weekly-beta-$release_date"
           {
             cat WHATS_NEW.md
             echo
@@ -115,8 +121,6 @@ jobs:
             echo
             echo "The firmware asset is **r1.upt**. Checksums are attached in **SHA256SUMS**."
           } > release/RELEASE_NOTES.md
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "title=Weekly Beta $release_date" >> "$GITHUB_OUTPUT"
 
       - name: Publish weekly prerelease
         env:

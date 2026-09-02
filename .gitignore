@@ -65,6 +65,14 @@
 /compile_commands.json
 /compile_flags.txt
 
+# Local staging/output dirs from reproducing the weekly-beta.yml release
+# process (see WEEKLY_RELEASES.md) outside CI -- scripts/repack_upt.sh's own
+# work happens in a mktemp dir, but the workflow's own `mkdir -p base`/
+# `mkdir -p release` steps (downloaded r1.upt, then the repacked r1.upt/
+# plugins_examples.zip/SHA256SUMS/RELEASE_NOTES.md) are repo-relative.
+/base/
+/release/
+
 # Host-only runtime state (target uses /usr/data instead)
 /open_hiby_player_settings.txt*
 /open_hiby_player_peq.txt*

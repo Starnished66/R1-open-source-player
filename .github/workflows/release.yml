@@ -31,6 +31,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') # Only run this step if triggered by a tag
         with:
           files: |
-            build_target/main.o
+            open_hiby_player_target
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -12,27 +12,17 @@ permissions:
   contents: write
 
 jobs:
-  build-release:
+  build:
     name: Build HiBy R1 Firmware
     runs-on: ubuntu-latest
 
     steps:
-
-      # ============================================================
-      # CHECKOUT
-      # ============================================================
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-
-      # ============================================================
-      # BUILD HiBy R1 TARGET
-      # ============================================================
-
-      - name: Compile Firmware via Docker
+      - name: Build open_hiby_player_target
         run: |
           docker run --rm \
             -v "${GITHUB_WORKSPACE}:/src" \
@@ -41,160 +31,69 @@ jobs:
             bash -c '
               set -e
 
-              echo "=========================================="
-              echo "SETTING UP MIPS TOOLCHAIN"
-              echo "=========================================="
-
-              ln -sf "$(which mipsel-unknown-linux-musl-gcc)" \
-                /usr/local/bin/mipsel-linux-musl-gcc
-
-              ln -sf "$(which mipsel-unknown-linux-musl-g++)" \
-                /usr/local/bin/mipsel-linux-musl-g++
-
-              ln -sf "$(which mipsel-unknown-linux-musl-strip)" \
-                /usr/local/bin/mipsel-linux-musl-strip
-
-              ln -sf "$(which mipsel-unknown-linux-musl-ar)" \
-                /usr/local/bin/mipsel-linux-musl-ar
-
-              ln -sf "$(which mipsel-unknown-linux-musl-ranlib)" \
-                /usr/local/bin/mipsel-linux-musl-ranlib
-
-              ln -sf "$(which mipsel-unknown-linux-musl-objcopy)" \
-                /usr/local/bin/mipsel-linux-musl-objcopy
-
-              echo ""
-              echo "Toolchain:"
-              mipsel-linux-musl-gcc --version | head -1
-              mipsel-linux-musl-g++ --version | head -1
-
-              echo ""
-              echo "=========================================="
-              echo "BUILDING open_hiby_player_target"
-              echo "=========================================="
+              ln -sf "$(which mipsel-unknown-linux-musl-gcc)" /usr/local/bin/mipsel-linux-musl-gcc
+              ln -sf "$(which mipsel-unknown-linux-musl-g++)" /usr/local/bin/mipsel-linux-musl-g++
+              ln -sf "$(which mipsel-unknown-linux-musl-strip)" /usr/local/bin/mipsel-linux-musl-strip
+              ln -sf "$(which mipsel-unknown-linux-musl-ar)" /usr/local/bin/mipsel-linux-musl-ar
+              ln -sf "$(which mipsel-unknown-linux-musl-ranlib)" /usr/local/bin/mipsel-linux-musl-ranlib
+              ln -sf "$(which mipsel-unknown-linux-musl-objcopy)" /usr/local/bin/mipsel-linux-musl-objcopy
 
               make open_hiby_player_target
 
-              echo ""
-              echo "=========================================="
-              echo "BUILD COMPLETED"
-              echo "=========================================="
-
+              test -f open_hiby_player_target
               ls -lh open_hiby_player_target
               file open_hiby_player_target
             '
 
-
-      # ============================================================
-      # VERIFY BINARY
-      # ============================================================
-
-      - name: Verify build artifact
+      - name: Verify binary
         run: |
-          echo "=========================================="
-          echo "VERIFYING BUILD ARTIFACT"
-          echo "=========================================="
-
-          if [ ! -f "open_hiby_player_target" ]; then
-            echo "ERROR: open_hiby_player_target was NOT created."
-            exit 1
-          fi
-
-          echo ""
-          echo "Binary found:"
+          test -f open_hiby_player_target
+          echo "Binary successfully built:"
           ls -lh open_hiby_player_target
-
-          echo ""
-          echo "File type:"
           file open_hiby_player_target
 
-          echo ""
-          echo "=========================================="
-          echo "ARTIFACT READY"
-          echo "=========================================="
-
-
-      # ============================================================
-      # AUTOMATIC BUILD FROM MAIN
-      #
-      # Every push to main gets its own immutable release.
-      # The actual binary is uploaded to that release.
-      # ============================================================
-
-      - name: Create Automatic Build Release
-        if: github.ref == 'refs/heads/main'
+      - name: Create automatic main build release
+        if: ${{ github.ref == 'refs/heads/main' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
 
-          echo "=========================================="
-          echo "CREATING AUTOMATIC BUILD RELEASE"
-          echo "=========================================="
+          cat > release-notes.txt <<EOF
+          Automatic HiBy R1 build
 
-          echo "Tag: $TAG"
-          echo "Commit: $GITHUB_SHA"
-          echo "Binary: open_hiby_player_target"
+          Commit: ${GITHUB_SHA}
+          Build: ${GITHUB_RUN_NUMBER}
+
+          Binary: open_hiby_player_target
+          EOF
 
           gh release create "$TAG" \
             open_hiby_player_target \
             --target "$GITHUB_SHA" \
             --title "HiBy R1 Automatic Build #${GITHUB_RUN_NUMBER}" \
-            --notes "Automatic HiBy R1 build from the main branch.
-
-Commit: ${GITHUB_SHA}
-
-Build: ${GITHUB_RUN_NUMBER}
-
-Artifact: open_hiby_player_target" \
+            --notes-file release-notes.txt \
             --prerelease \
             --latest=false
 
-          echo ""
-          echo "=========================================="
-          echo "RELEASE CREATED SUCCESSFULLY"
-          echo "=========================================="
-
-          gh release view "$TAG"
-
-
-      # ============================================================
-      # VERSIONED RELEASE
-      #
-      # Example:
-      # git tag v1.0.7
-      # git push origin v1.0.7
-      # ============================================================
-
-      - name: Create Version Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create version release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF_NAME}"
 
-          echo "=========================================="
-          echo "CREATING VERSION RELEASE"
-          echo "=========================================="
+          cat > release-notes.txt <<EOF
+          HiBy R1 Player ${TAG}
 
-          echo "Tag: $TAG"
-          echo "Commit: $GITHUB_SHA"
-          echo "Binary: open_hiby_player_target"
+          Commit: ${GITHUB_SHA}
+
+          Binary: open_hiby_player_target
+          EOF
 
           gh release create "$TAG" \
             open_hiby_player_target \
             --verify-tag \
             --title "HiBy R1 Player ${TAG}" \
-            --notes "HiBy R1 Player ${TAG}
-
-Commit: ${GITHUB_SHA}
-
-Artifact: open_hiby_player_target" \
+            --notes-file release-notes.txt \
             --latest
-
-          echo ""
-          echo "=========================================="
-          echo "VERSION RELEASE CREATED SUCCESSFULLY"
-          echo "=========================================="
-
-          gh release view "$TAG"

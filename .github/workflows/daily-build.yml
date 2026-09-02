@@ -1,0 +1,103 @@
+name: Daily build
+
+on:
+  schedule:
+    # 00:17 in Costa Rica (UTC-6). Scheduled workflows run from the
+    # repository's default branch; the offset minute avoids GitHub's busy
+    # top-of-hour window.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build player and bootloader
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Cache MIPS musl toolchain
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/mipsel-linux-musl-cross
+          key: mipsel-linux-musl-cross-${{ runner.os }}-82626533bf7e677c
+
+      - name: Install verified MIPS musl toolchain
+        env:
+          TOOLCHAIN_SHA256: 82626533bf7e677c225e7cbedf1d5b0d6bc60c3daaf28249e54f0eb805d89b13
+        run: |
+          set -euo pipefail
+          toolchain_dir="$RUNNER_TEMP/mipsel-linux-musl-cross"
+          if [[ ! -x "$toolchain_dir/bin/mipsel-linux-musl-gcc" ]]; then
+            archive="$RUNNER_TEMP/mipsel-linux-musl-cross.tgz"
+            curl --fail --location --retry 3 \
+              https://musl.cc/mipsel-linux-musl-cross.tgz \
+              --output "$archive"
+            echo "$TOOLCHAIN_SHA256  $archive" | sha256sum --check
+            tar -xzf "$archive" -C "$RUNNER_TEMP"
+          fi
+          echo "$toolchain_dir/bin" >> "$GITHUB_PATH"
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends file lua5.4
+
+      - name: Build and test
+        run: |
+          set -euo pipefail
+          make -j2 target
+          make bootloader
+          make sd_ready_test
+
+      - name: Validate production outputs and plugins
+        run: |
+          set -euo pipefail
+          file open_hiby_player_target open_hiby_bootloader
+          test -s open_hiby_player_target
+          test -s open_hiby_bootloader
+          # Do not use grep -q here: under pipefail its early exit can make
+          # readelf receive SIGPIPE and falsely fail an otherwise valid job.
+          mipsel-linux-musl-readelf -h open_hiby_player_target \
+            | grep 'Machine:.*MIPS' >/dev/null
+          mipsel-linux-musl-readelf -h open_hiby_bootloader \
+            | grep 'Machine:.*MIPS' >/dev/null
+          if strings open_hiby_player_target | grep -Eq \
+              'TEST BUILD|TEST_BUILD_TAG|UI_PERF_TRACE|UI_GESTURE_TRACE|UI_HITBOX_DEBUG'; then
+            echo 'Diagnostic flags were found in the production player.' >&2
+            exit 1
+          fi
+          find plugins_examples -maxdepth 1 -type f -name '*.lua' -print0 \
+            | xargs -0 -r -n1 luac5.4 -p
+
+      - name: Assemble daily artifact
+        run: |
+          set -euo pipefail
+          mkdir -p daily-build
+          cp open_hiby_player_target open_hiby_bootloader daily-build/
+          cp -a plugins_examples daily-build/
+          {
+            echo "commit=${GITHUB_SHA}"
+            echo "built_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "workflow_run=${GITHUB_RUN_ID}"
+            sha256sum open_hiby_player_target open_hiby_bootloader
+          } > daily-build/BUILD-INFO.txt
+
+      - name: Upload daily build
+        uses: actions/upload-artifact@v4
+        with:
+          name: hiby-r1-daily-${{ github.run_number }}-${{ github.sha }}
+          path: daily-build/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6

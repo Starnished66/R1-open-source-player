@@ -1011,7 +1011,7 @@ bool bt_control_get_connected_device_codec(char * out, size_t out_size) {
 static pthread_t bt_source_vol_sync_thread;
 static bool bt_source_vol_sync_active = false;
 static pid_t bt_source_vol_sync_monitor_pid = -1;
-static atomic_int bt_source_vol_pending_percent = ATOMIC_VAR_INIT(-1);
+static atomic_int bt_source_vol_pending_percent = -1;
 
 /* Set by whichever direction writes/observes a value most recently, so the
  * other direction recognizes it as already in sync instead of re-writing

@@ -34,7 +34,7 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends file lua5.4
+          sudo apt-get install --yes --no-install-recommends file lua5.4 zip
 
       - name: Build and test
         run: |
@@ -70,6 +70,10 @@ jobs:
           mkdir -p daily-build
           cp open_hiby_player_target open_hiby_bootloader daily-build/
           cp -a plugins_examples daily-build/
+          (
+            cd plugins_examples
+            zip -q -r ../daily-build/Test-Plugins.zip .
+          )
           {
             echo "commit=${GITHUB_SHA}"
             echo "built_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"

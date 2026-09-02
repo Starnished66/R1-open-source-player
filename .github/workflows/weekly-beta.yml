@@ -89,9 +89,9 @@ jobs:
             open_hiby_bootloader release/r1.upt
           (
             cd plugins_examples
-            zip -q -r ../release/plugins_examples.zip .
+            zip -q -r ../release/Test-Plugins.zip .
           )
-          sha256sum release/r1.upt release/plugins_examples.zip \
+          sha256sum release/r1.upt release/Test-Plugins.zip \
             > release/SHA256SUMS
 
       - name: Prepare release notes
@@ -104,7 +104,7 @@ jobs:
             echo
             echo "Built automatically from commit [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/WHATS_NEW.md)."
             echo
-            echo "The firmware asset is **r1.upt**. Checksums are attached in **SHA256SUMS**."
+            echo "The firmware asset is **r1.upt** and all repository test plugins are in **Test-Plugins.zip**. Checksums are attached in **SHA256SUMS**."
           } > release/RELEASE_NOTES.md
 
       - name: Publish weekly prerelease
@@ -116,12 +116,16 @@ jobs:
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release/r1.upt \
-              release/plugins_examples.zip release/SHA256SUMS --clobber
+              release/Test-Plugins.zip release/SHA256SUMS --clobber
+            if [[ "$(gh release view "$TAG" --json assets --jq \
+                'any(.assets[]; .name == "plugins_examples.zip")')" == "true" ]]; then
+              gh release delete-asset "$TAG" plugins_examples.zip --yes
+            fi
             gh release edit "$TAG" --prerelease --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
           else
             gh release create "$TAG" release/r1.upt \
-              release/plugins_examples.zip release/SHA256SUMS \
+              release/Test-Plugins.zip release/SHA256SUMS \
               --prerelease --target "$GITHUB_SHA" --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
           fi
@@ -132,7 +136,7 @@ jobs:
           name: ${{ steps.release.outputs.tag }}
           path: |
             release/r1.upt
-            release/plugins_examples.zip
+            release/Test-Plugins.zip
             release/SHA256SUMS
             release/RELEASE_NOTES.md
           if-no-files-found: error

@@ -65,11 +65,10 @@
 /compile_commands.json
 /compile_flags.txt
 
-# Local staging/output dirs from reproducing the weekly-beta.yml release
-# process (see WEEKLY_RELEASES.md) outside CI -- scripts/repack_upt.sh's own
-# work happens in a mktemp dir, but the workflow's own `mkdir -p base`/
-# `mkdir -p release` steps (downloaded r1.upt, then the repacked r1.upt/
-# plugins_examples.zip/SHA256SUMS/RELEASE_NOTES.md) are repo-relative.
+# Local weekly-release guide and staging/output directories. The repack
+# script itself uses a temporary directory, but reproducing the workflow
+# locally creates these directories in the repository root.
+/WEEKLY_RELEASES.md
 /base/
 /release/
 

@@ -1,39 +1,163 @@
-name: Build and Release HiBy R1 Firmware
+name: Build and Release
 
 on:
   push:
     branches:
       - main
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-release:
+    name: Build HiBy R1 Firmware
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
+      # ------------------------------------------------------------
+      # Checkout repository including submodules
+      # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
+      # ------------------------------------------------------------
+      # Build inside the MIPS musl Docker environment
+      # ------------------------------------------------------------
       - name: Compile Firmware via Docker
         run: |
-          docker run --rm -v ${{ github.workspace }}:/work -w /work messense/rust-musl-cross:mipsel-musl bash -c " \
-            apt-get update && \
-            apt-get install -y python3 make && \
-            ln -sf \$(which mipsel-unknown-linux-musl-gcc) /usr/local/bin/mipsel-linux-musl-gcc && \
-            ln -sf \$(which mipsel-unknown-linux-musl-g++) /usr/local/bin/mipsel-linux-musl-g++ && \
-            make clean && \
-            make target"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            messense/rust-musl-cross:mipsel-musl \
+            bash -c '
+              set -e
 
-      - name: Create GitHub Release and Upload Asset
+              echo "=========================================="
+              echo "Setting up MIPS toolchain aliases"
+              echo "=========================================="
+
+              # GCC
+              ln -sf "$(which mipsel-unknown-linux-musl-gcc)" \
+                /usr/local/bin/mipsel-linux-musl-gcc
+
+              # G++
+              ln -sf "$(which mipsel-unknown-linux-musl-g++)" \
+                /usr/local/bin/mipsel-linux-musl-g++
+
+              # Strip
+              ln -sf "$(which mipsel-unknown-linux-musl-strip)" \
+                /usr/local/bin/mipsel-linux-musl-strip
+
+              # Binutils
+              ln -sf "$(which mipsel-unknown-linux-musl-ar)" \
+                /usr/local/bin/mipsel-linux-musl-ar
+
+              ln -sf "$(which mipsel-unknown-linux-musl-ranlib)" \
+                /usr/local/bin/mipsel-linux-musl-ranlib
+
+              ln -sf "$(which mipsel-unknown-linux-musl-objcopy)" \
+                /usr/local/bin/mipsel-linux-musl-objcopy
+
+              echo ""
+              echo "=========================================="
+              echo "Verifying toolchain"
+              echo "=========================================="
+
+              which mipsel-linux-musl-gcc
+              which mipsel-linux-musl-g++
+              which mipsel-linux-musl-strip
+              which mipsel-linux-musl-ar
+              which mipsel-linux-musl-ranlib
+              which mipsel-linux-musl-objcopy
+
+              echo ""
+              echo "=========================================="
+              echo "Toolchain versions"
+              echo "=========================================="
+
+              mipsel-linux-musl-gcc --version
+              mipsel-linux-musl-g++ --version
+
+              echo ""
+              echo "=========================================="
+              echo "Building open_hiby_player_target"
+              echo "=========================================="
+
+              make open_hiby_player_target
+
+              echo ""
+              echo "=========================================="
+              echo "Checking build output"
+              echo "=========================================="
+
+              ls -lh open_hiby_player_target
+
+              file open_hiby_player_target
+
+              echo ""
+              echo "=========================================="
+              echo "Build completed successfully"
+              echo "=========================================="
+            '
+
+      # ------------------------------------------------------------
+      # Verify the binary exists before creating the release
+      # ------------------------------------------------------------
+      - name: Verify build artifact
+        run: |
+          if [ ! -f "open_hiby_player_target" ]; then
+            echo "ERROR: open_hiby_player_target was not created!"
+            exit 1
+          fi
+
+          echo "Build artifact found:"
+          ls -lh open_hiby_player_target
+
+      # ------------------------------------------------------------
+      # Release for normal commits to main
+      #
+      # This creates/updates the rolling "latest-build" release.
+      # ------------------------------------------------------------
+      - name: Create Latest Build Release
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest-build' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Latest Commit Build' }}
+          tag_name: latest-build
+          name: Latest Build
+          body: |
+            Automatic HiBy R1 build from the latest `main` commit.
+
+            Commit:
+            `${{ github.sha }}`
+
+            This is a rolling development build.
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
           files: |
             open_hiby_player_target
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------
+      # Release for version tags such as v1.0.0
+      # ------------------------------------------------------------
+      - name: Create Version Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: HiBy R1 Player ${{ github.ref_name }}
+          body: |
+            HiBy R1 open-source player build.
+
+            Version: `${{ github.ref_name }}`
+            Commit: `${{ github.sha }}`
+          prerelease: false
+          make_latest: true
+          overwrite_files: true
+          files: |
+            open_hiby_player_target

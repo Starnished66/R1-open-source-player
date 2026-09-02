@@ -166,6 +166,18 @@ bool audio_get_current_format_info(audio_current_format_info_t * out);
 
 /* 0.0 (silent) - 1.0 (full volume). Applied as software gain on the decoded PCM. */
 void audio_set_volume(float volume);
+
+/* Select the R1 headphone gain profile used for the hardware volume curve.
+ * AUDIO_GAIN_DEFAULT preserves this project's existing calibrated taper.
+ * AUDIO_GAIN_LOW/HIGH use the stock R1 LDB/HDB hardware-volume tables. */
+typedef enum {
+    AUDIO_GAIN_DEFAULT = 0,
+    AUDIO_GAIN_LOW = 1,
+    AUDIO_GAIN_HIGH = 2,
+} audio_gain_mode_t;
+
+void audio_set_gain_mode(audio_gain_mode_t mode);
+audio_gain_mode_t audio_get_gain_mode(void);
 /* Coalesces slider-originated volume changes on a process-lifetime worker.
  * A later synchronous audio_set_volume() always supersedes queued work. */
 void audio_request_volume(float volume);

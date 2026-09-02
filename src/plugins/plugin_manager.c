@@ -1,6 +1,7 @@
 #include "plugin_manager.h"
 #include "gui.h"
 #include "gui_reload.h"
+#include "audio.h"
 #include "peq.h"
 #include "http_client.h"
 #include "playlist_files.h"
@@ -2001,6 +2002,34 @@ static int l_plugin_eq_set_band_enabled(lua_State * L) {
     return 0;
 }
 
+/* plugin.set_gain(mode) / get_gain() -- maps the stock R1 HDB/LDB hardware
+ * volume curves into the open player's local CS43131 volume control.
+ *
+ * "low" uses the stock LDB table, "high" uses the stock HDB table. The
+ * default mode is intentionally not exposed to Lua: it preserves this
+ * project's existing calibrated taper until the user explicitly chooses a
+ * gain profile. */
+static int l_plugin_set_gain(lua_State * L) {
+    const char * mode = luaL_checkstring(L, 1);
+    if (strcmp(mode, "low") == 0) {
+        audio_set_gain_mode(AUDIO_GAIN_LOW);
+    } else if (strcmp(mode, "high") == 0) {
+        audio_set_gain_mode(AUDIO_GAIN_HIGH);
+    } else {
+        return luaL_error(L, "plugin.set_gain: expected \"low\" or \"high\"");
+    }
+    return 0;
+}
+
+static int l_plugin_get_gain(lua_State * L) {
+    switch (audio_get_gain_mode()) {
+        case AUDIO_GAIN_LOW: lua_pushstring(L, "low"); break;
+        case AUDIO_GAIN_HIGH: lua_pushstring(L, "high"); break;
+        default: lua_pushnil(L); break;
+    }
+    return 1;
+}
+
 /* ---- plugin.toggle_pause()/stop()/next_track()/prev_track()/seek()/
  * set_volume()/is_playing()/is_paused()/get_position()/get_duration() --
  * thin wrappers over gui.h's gui_plugin_*() bridges, needed here (unlike
@@ -3214,7 +3243,7 @@ static const char * const plugin_capabilities[] = {
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
     "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
     "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles", "ui.launcher_layout",
-    "ui.home_background"
+    "ui.home_background", "audio.gain"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -3407,7 +3436,9 @@ static const luaL_Reg plugin_funcs[] = {
     { "play_remote",               l_plugin_play_remote },
     { "queue_remote_list",         l_plugin_queue_remote_list },
     { "show_toast",                l_plugin_show_toast },
-    { "set_icon",                  l_plugin_set_icon },
+    { "set_gain",                   l_plugin_set_gain },
+    { "get_gain",                   l_plugin_get_gain },
+    { "set_icon",                   l_plugin_set_icon },
     { "set_background_color",      l_plugin_set_background_color },
     { "set_text_color",            l_plugin_set_text_color },
     { "set_home_layout",           l_plugin_set_home_layout },

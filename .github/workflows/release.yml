@@ -20,14 +20,11 @@ jobs:
 
       - name: Compile Firmware via Docker
         run: |
-          # 1. Mount the repository into the Docker container
-          # 2. Install python3 and make
-          # 3. Create a symlink to rename the Rust toolchain to the exact name the Makefile demands
-          # 4. Compile the firmware
           docker run --rm -v ${{ github.workspace }}:/work -w /work messense/rust-musl-cross:mipsel-musl bash -c " \
             apt-get update && \
             apt-get install -y python3 make && \
             ln -sf \$(which mipsel-unknown-linux-musl-gcc) /usr/local/bin/mipsel-linux-musl-gcc && \
+            ln -sf \$(which mipsel-unknown-linux-musl-g++) /usr/local/bin/mipsel-linux-musl-g++ && \
             make clean && \
             make target"
 

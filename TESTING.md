@@ -8,6 +8,24 @@ launch, initially misread as a crash in the app under test.
 
 ## Remaining real-device regression tests
 
+- [ ] **Idle suspend remains asleep and reports its wake source:** deploy a
+  clean `TEST_BUILD_TAG` build and first confirm a power-button press reaches
+  the debug log. With playback stopped and Wi-Fi/Bluetooth allowed to idle,
+  unplug USB/charging completely and leave the player untouched overnight.
+  Reconnect only after the test, then inspect every `power_suspend: cycle`
+  line and record the battery percentage change. Confirm `write_ok=1`, the
+  reported sleep duration includes the time spent suspended, and repeated
+  short wake cycles identify `pm_wakeup_irq` when the kernel provides it.
+  If no suspend attempt occurs after its configured deadline, inspect the
+  `idle suspend/shutdown blocked` breakdown for the subsystem holding the
+  gate. A production build must contain neither diagnostic string.
+
+- [ ] **Long artist text does not cover the format badge:** play tracks with
+  both short and unusually long multi-artist tags. Confirm the artist text
+  stays inside the space to the left of the codec/rate badge, long text
+  marquees cleanly, and the badge remains fully readable without moving or
+  clipping.
+
 - [ ] **Batch plugin disable followed by database update stays bounded:**
   open Settings -> System -> Plugins, toggle at least eight plugins without
   leaving the screen, and confirm the UI does not reload between toggles.

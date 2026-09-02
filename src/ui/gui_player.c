@@ -1870,6 +1870,19 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_label_set_text(song_folder_label, "");
     lv_obj_add_style(song_folder_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(song_folder_label, &app_font_16, 0); /* see song_title_label's own comment above */
+    /* Real-user bug report: a track with many singers/artists in its tag
+     * overlapped the format badge (e.g. "FLAC 48kHz") next to it, making the
+     * quality details unreadable. Same root cause and same fix as
+     * song_title_label vs favorite_icon above -- this label had no bounded
+     * width, so it rendered at its full unclipped content width and grew
+     * straight through its SPACE_BETWEEN sibling instead of stopping at it.
+     * flex_grow bounds it to the row's remaining width (row width minus
+     * format_badge_label's own natural width), which is what lets
+     * LV_LABEL_LONG_SCROLL_CIRCULAR detect the overflow and marquee instead
+     * of overlapping -- same shared row_marquee_anim/2s pause as every other
+     * scrolling label in the app. */
+    lv_obj_set_flex_grow(song_folder_label, 1);
+    row_label_enable_marquee(song_folder_label);
 
     format_badge_label = lv_label_create(artist_row);
     lv_label_set_text(format_badge_label, "");

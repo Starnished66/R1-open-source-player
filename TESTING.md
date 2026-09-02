@@ -81,6 +81,34 @@ launch, initially misread as a crash in the app under test.
   permanent missing-cover entry. Run a rescan afterward and verify helper
   failures cannot turn existing tags into Unknown Artist/Album rows.
 
+- [ ] **MSEB plugin audibly changes the sound and composes correctly with
+  manual PEQ:** with a distinctive manual PEQ curve set on the Equalizer
+  screen and MSEB off, confirm it's audible. Turn MSEB on (Settings ->
+  Playback -> MSEB) and move each of the 10 sliders across its 3
+  sub-screens (Bass & Warmth, Vocals & Instruments, Treble & Air); confirm
+  each produces an audible, sensible change in the claimed direction --
+  flag any axis that sounds wrong or too subtle/strong, since the gain
+  scales are first-pass guesses meant to be re-tuned by ear, not values
+  recovered from the stock firmware.
+
+- [ ] **MSEB snapshot/restore survives a real toggle cycle:** with a
+  hand-tuned manual PEQ curve active, enable MSEB, change several sliders
+  across all 3 sub-screens, then disable it again. Confirm the original
+  manual curve is restored exactly (check band values on the Equalizer
+  screen, not just "sounds similar"), and no `.mseb_pre_backup.peq` file
+  remains under `.plugins/` on the SD card.
+
+- [ ] **MSEB backup/restore survives an unclean shutdown:** enable MSEB,
+  then power off abnormally (battery pull, not a clean shutdown) while
+  still enabled. Reboot; confirm it comes back enabled with its last
+  slider values intact, and that disabling it now still correctly restores
+  the pre-MSEB PEQ curve from the surviving backup file.
+
+- [ ] **MSEB persistence across a normal reboot:** set distinctive slider
+  values across all 3 sub-screens, save to a slot, reboot cleanly, confirm
+  the enabled state and last-applied values reload correctly and the saved
+  slot still loads correctly.
+
 ## 1. Kill the stock player first, always -- BOTH processes, together
 
 The stock firmware auto-launches its own player at boot via a wrapper script

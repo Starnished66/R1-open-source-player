@@ -5,6 +5,7 @@
 #include "lvgl/lvgl.h"
 #include "assets.h"
 #include "gui.h"
+#include "gui_theme.h"
 #include <ctype.h>
 
 extern lv_style_t style_theme_screen_bg;
@@ -130,12 +131,13 @@ static lv_timer_t * text_entry_multitap_timer;
  * text_entry_refresh_keys() can update their images/visibility in place
  * when the mode/shift/numeric-lock state changes, without rebuilding the
  * screen. Index 0 is special: it shares its screen position with Shift
- * (see text_entry_key0_click_cb's own comment). The numeric-lock "./-" key
- * and the three always-visible mode-jump buttons (123/ABC/sym) each need
+ * (see text_entry_key0_click_cb's own comment). The numeric-lock decimal
+ * and minus keys and the three mode-jump buttons (123/ABC/sym) each need
  * their own visibility toggled independently of the digit-slot keys, so
  * they get their own named pointers rather than living in this array. */
 static lv_obj_t * text_entry_key_img[10];
 static lv_obj_t * text_entry_dotneg_key;
+static lv_obj_t * text_entry_neg_key;
 static lv_obj_t * text_entry_num_mode_key;
 static lv_obj_t * text_entry_abc_mode_key;
 static lv_obj_t * text_entry_sym_mode_key;
@@ -245,7 +247,7 @@ static void text_entry_multitap_timeout_cb(lv_timer_t * timer) {
  * one character, no cycling" (NUM mode, or ABC mode's key 0/1, or a
  * genuinely single-symbol group); length > 1 is what the multi-tap cycle in
  * text_entry_key_click_cb() steps through. key_index 10 is the
- * numeric-lock-only "./-" key, meaningful only when text_entry_numeric_only
+ * numeric-lock-only decimal key, meaningful only when text_entry_numeric_only
  * is set (its caller already knows not to ask otherwise). out must be at
  * least 8 bytes -- the longest real group (TEXT_ENTRY_SYMBOL_GROUPS' 4-char
  * entries) plus the NUL. uppercase is passed in explicitly (rather than read
@@ -254,7 +256,7 @@ static void text_entry_multitap_timeout_cb(lv_timer_t * timer) {
  * -- see text_entry_pending_shift's own comment. */
 static void text_entry_key_chars_ex(int key_index, char * out, size_t out_size, bool uppercase) {
     if (key_index == 10) {
-        snprintf(out, out_size, ".-");
+        snprintf(out, out_size, ".");
         return;
     }
     if (text_entry_numeric_only || text_entry_kp_mode == TEXT_ENTRY_KP_NUM) {
@@ -316,8 +318,8 @@ static const char * text_entry_key_image(int key_index) {
     return buf;
 }
 
-/* Re-syncs every key's image and (for the mode buttons/numeric-lock "./-"
- * key) visibility with the current mode/shift/numeric-lock state -- called
+/* Re-syncs every key's image and (for the mode buttons/numeric decimal and
+ * minus keys) visibility with the current mode/shift/numeric-lock state -- called
  * once from show_text_entry() and again on every mode/Shift/digit-0 tap. */
 static void text_entry_refresh_keys(void) {
     for (int i = 1; i < 10; i++) {
@@ -335,15 +337,29 @@ static void text_entry_refresh_keys(void) {
 
     if (text_entry_numeric_only) {
         lv_obj_add_flag(text_entry_num_mode_key, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(text_entry_num_mode_key, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(text_entry_abc_mode_key, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(text_entry_abc_mode_key, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(text_entry_sym_mode_key, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(text_entry_sym_mode_key, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_remove_flag(text_entry_dotneg_key, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(text_entry_dotneg_key, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_move_foreground(text_entry_dotneg_key);
+        lv_obj_remove_flag(text_entry_neg_key, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(text_entry_neg_key, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_move_foreground(text_entry_neg_key);
         return;
     }
     lv_obj_add_flag(text_entry_dotneg_key, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(text_entry_dotneg_key, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(text_entry_neg_key, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(text_entry_neg_key, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(text_entry_num_mode_key, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(text_entry_num_mode_key, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(text_entry_abc_mode_key, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(text_entry_abc_mode_key, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(text_entry_sym_mode_key, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(text_entry_sym_mode_key, LV_OBJ_FLAG_CLICKABLE);
 }
 
 /* Shared by every cycling key (the 9 digit-slot keys, the key-0/digit-0
@@ -415,6 +431,22 @@ static void text_entry_key0_click_cb(lv_event_t * e) {
         return;
     }
     text_entry_handle_digit_key(0);
+}
+
+/* Numeric-only keypad: toggle a leading minus so atof() sees a negative
+ * value. Multi-tap ".-" at the cursor (usually the end of a pre-filled
+ * "3.00") produced "3.00-", which atof() treats as +3. */
+static void text_entry_neg_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    text_entry_finalize_pending();
+    const char * text = lv_textarea_get_text(text_entry_textarea);
+    if (text && text[0] == '-') {
+        lv_textarea_set_cursor_pos(text_entry_textarea, 1);
+        lv_textarea_delete_char(text_entry_textarea);
+    } else {
+        lv_textarea_set_cursor_pos(text_entry_textarea, 0);
+        lv_textarea_add_char(text_entry_textarea, (uint32_t) '-');
+    }
 }
 
 /* The three mode buttons stacked in column 0 (rows 0-2) are always visible
@@ -517,9 +549,9 @@ static lv_obj_t * text_entry_make_key(lv_obj_t * scr, int col, int row, lv_event
  * / 1 / 2-ABC / 3-DEF / Del. Row 1: Mode:ABC / 4-GHI / 5-JKL / 6-MNO /
  * 0-or-Shift. Row 2: Mode:sym / 7-PQRS / 8-TUV / 9-WXYZ / Enter (spans
  * rows 2-3). Row 3: Left / Right / Space (spans cols 2-3) / Enter
- * continues. The numeric-lock "./-" key (numeric_only fields only)
- * occupies the same cell as Mode:123, since the three mode buttons are
- * hidden together whenever it's shown -- see text_entry_refresh_keys().
+ * continues. Numeric-only fields hide the three mode buttons and show a
+ * decimal key (same cell as Mode:123) and a minus key (same cell as
+ * Mode:ABC) -- see text_entry_refresh_keys().
  *
  * Every key is built as a child of one `group` container (itself a plain
  * full-screen-sized, invisible object at (0,0)) rather than directly on
@@ -569,15 +601,38 @@ static lv_obj_t * build_t9_keypad_group(lv_obj_t * parent) {
     }
     text_entry_key_img[0] = text_entry_make_key(group, 4, 1, text_entry_key0_click_cb, NULL);
 
-    text_entry_dotneg_key = text_entry_make_key(group, 0, 0, text_entry_key_click_cb, (void *) (intptr_t) 10);
-    lv_image_set_src(text_entry_dotneg_key, asset_path("keyboard/dot.png"));
-
     text_entry_num_mode_key = text_entry_make_key(group, 0, 0, text_entry_mode_num_click_cb, NULL);
     lv_image_set_src(text_entry_num_mode_key, asset_path("keyboard/num.png"));
     text_entry_abc_mode_key = text_entry_make_key(group, 0, 1, text_entry_mode_abc_click_cb, NULL);
     lv_image_set_src(text_entry_abc_mode_key, asset_path("keyboard/char.png"));
     text_entry_sym_mode_key = text_entry_make_key(group, 0, 2, text_entry_mode_sym_click_cb, NULL);
     lv_image_set_src(text_entry_sym_mode_key, asset_path("keyboard/symbol.png"));
+
+    /* Built after the mode keys they replace so they sit on top when shown. */
+    text_entry_dotneg_key = text_entry_make_key(group, 0, 0, text_entry_key_click_cb, (void *) (intptr_t) 10);
+    lv_image_set_src(text_entry_dotneg_key, asset_path("keyboard/dot.png"));
+    lv_obj_add_flag(text_entry_dotneg_key, LV_OBJ_FLAG_HIDDEN);
+
+    text_entry_neg_key = lv_obj_create(group);
+    lv_obj_set_size(text_entry_neg_key, TEXT_ENTRY_KEY_SIZE, TEXT_ENTRY_KEY_SIZE);
+    lv_obj_align(text_entry_neg_key, LV_ALIGN_TOP_LEFT,
+                 TEXT_ENTRY_GRID_X + 0 * (TEXT_ENTRY_KEY_SIZE + TEXT_ENTRY_KEY_GAP),
+                 TEXT_ENTRY_GRID_Y + 1 * (TEXT_ENTRY_KEY_SIZE + TEXT_ENTRY_KEY_GAP));
+    lv_obj_set_style_bg_opa(text_entry_neg_key, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(text_entry_neg_key, lv_color_make(48, 48, 48), 0);
+    lv_obj_set_style_border_width(text_entry_neg_key, 0, 0);
+    lv_obj_set_style_radius(text_entry_neg_key, 8, 0);
+    lv_obj_set_style_pad_all(text_entry_neg_key, 0, 0);
+    lv_obj_remove_flag(text_entry_neg_key, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(text_entry_neg_key, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(text_entry_neg_key, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(text_entry_neg_key, text_entry_neg_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * neg_label = lv_label_create(text_entry_neg_key);
+    lv_label_set_text(neg_label, "-");
+    lv_obj_set_style_text_color(neg_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(neg_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    lv_obj_remove_flag(neg_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(neg_label);
 
     lv_obj_t * del_key = text_entry_make_key(group, 4, 0, text_entry_del_click_cb, NULL);
     lv_image_set_src(del_key, asset_path("keyboard/del.png"));
@@ -751,7 +806,7 @@ static lv_obj_t * build_text_entry_screen(void) {
  * numeric locks the keypad to plain-digit entry (see text_entry_numeric_
  * only's own comment) instead of the normal ABC/NUM/SYM T9 cycle --
  * everything peq.c's freq/gain/Q fields need (digits, a decimal point, and
- * a minus sign for negative gain), nothing else. */
+ * a dedicated minus key that toggles the leading sign), nothing else. */
 void show_text_entry(const char * title, const char * initial_text, bool is_password, bool numeric,
                              text_entry_done_cb_t on_done, void * user_data) {
     if (text_entry_on_done == plugin_text_entry_done_cb && on_done != plugin_text_entry_done_cb) {

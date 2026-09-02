@@ -25,6 +25,8 @@
 #include "fallback_font.h"
 #include "gui_navigation.h"
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
 #else
@@ -2222,8 +2224,6 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
  * file (loaded at startup, saved on every change) -- these profiles are a
  * separate, explicit "keep this exact setup around under a name" action,
  * living in their own SD card folder rather than mixed in with music. */
-#define PEQ_PROFILES_DIR MUSIC_ROOT_DIR "/PEQ_Profiles"
-
 static lv_obj_t * eq_profiles_list;
 /* Name of the named profile whose values are currently loaded.  The PEQ
  * engine deliberately knows only about values and its always-current
@@ -2430,7 +2430,51 @@ static void hostname_row_cb(lv_event_t * e) {
     show_text_entry("Hostname", current_settings.hostname, false, false, hostname_entry_done_cb, NULL);
 }
 
+static char ** eq_profile_paths = NULL;
+static int eq_profile_count = 0;
+static bool eq_profiles_edit_mode = false;
+static lv_obj_t * eq_profiles_edit_btn = NULL;
+static char eq_profile_pending_path[512];
+static lv_obj_t * eq_profile_delete_popup;
+static lv_obj_t * eq_profile_delete_popup_backdrop;
+static bool eq_save_as_long_press_fired = false;
+
+static void eq_profiles_free_paths(void) {
+    for (int i = 0; i < eq_profile_count; i++) free(eq_profile_paths[i]);
+    free(eq_profile_paths);
+    eq_profile_paths = NULL;
+    eq_profile_count = 0;
+}
+
+static bool eq_profile_name_is_valid(const char * text) {
+    if (!text || text[0] == '\0') return false;
+    if (strchr(text, '/') || strchr(text, '\\')) return false;
+    return true;
+}
+
+static void eq_profile_path_from_name(char * out, size_t out_size, const char * name) {
+    snprintf(out, out_size, "%s/%s.peq", PEQ_PROFILES_DIR, name);
+}
+
+static bool eq_save_named_profile(const char * name) {
+    if (!eq_profile_name_is_valid(name)) {
+        show_error_toast("Invalid profile name");
+        return false;
+    }
+    mkdir(PEQ_PROFILES_DIR, 0755);
+    char path[512];
+    eq_profile_path_from_name(path, sizeof(path), name);
+    if (!peq_save_to_path(path)) {
+        show_error_toast("Failed to save profile");
+        return false;
+    }
+    snprintf(eq_current_profile_name, sizeof(eq_current_profile_name), "%s", name);
+    show_info_toast("Profile saved");
+    return true;
+}
+
 static void eq_profile_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     const char * path = (const char *) lv_event_get_user_data(e);
     if (!peq_load_from_path(path)) {
         show_error_toast("Failed to load profile");
@@ -2438,17 +2482,98 @@ static void eq_profile_row_cb(lv_event_t * e) {
     }
     eq_set_current_profile_from_path(path);
     refresh_all_eq_widgets();
-    peq_save(); /* the loaded profile becomes the new always-current state too */
+    peq_save();
     nav_pop();
-    show_error_toast("Profile loaded");
+    show_info_toast("Profile loaded");
+}
+
+static void hide_eq_profile_delete_popup(void) {
+    lv_obj_add_flag(eq_profile_delete_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(eq_profile_delete_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void eq_profile_delete_popup_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_eq_profile_delete_popup();
+}
+
+static void eq_profile_delete_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_eq_profile_delete_popup();
+}
+
+static void populate_eq_profiles_screen(void);
+
+static void eq_profile_delete_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_eq_profile_delete_popup();
+    if (eq_profile_pending_path[0] == '\0') return;
+    if (unlink(eq_profile_pending_path) != 0) {
+        show_error_toast("Failed to delete profile");
+        return;
+    }
+    char stem[256];
+    snprintf(stem, sizeof(stem), "%s", eq_current_profile_name);
+    eq_set_current_profile_from_path(eq_profile_pending_path);
+    if (strcmp(eq_current_profile_name, stem) == 0) eq_current_profile_name[0] = '\0';
+    else snprintf(eq_current_profile_name, sizeof(eq_current_profile_name), "%s", stem);
+    eq_profile_pending_path[0] = '\0';
+    populate_eq_profiles_screen();
+    show_info_toast("Profile deleted");
+}
+
+static void eq_profile_delete_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    const char * path = (const char *) lv_event_get_user_data(e);
+    snprintf(eq_profile_pending_path, sizeof(eq_profile_pending_path), "%s", path);
+    lv_obj_remove_flag(eq_profile_delete_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(eq_profile_delete_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(eq_profile_delete_popup_backdrop);
+    lv_obj_move_foreground(eq_profile_delete_popup);
+}
+
+static void eq_profile_rename_done_cb(const char * text, void * user_data) {
+    const char * old_path = (const char *) user_data;
+    if (!eq_profile_name_is_valid(text)) {
+        show_error_toast("Invalid profile name");
+        return;
+    }
+    char new_path[512];
+    eq_profile_path_from_name(new_path, sizeof(new_path), text);
+    if (strcmp(old_path, new_path) == 0) return;
+    if (rename(old_path, new_path) != 0) {
+        show_error_toast("Failed to rename profile");
+        return;
+    }
+    char previous[256];
+    snprintf(previous, sizeof(previous), "%s", eq_current_profile_name);
+    eq_set_current_profile_from_path(old_path);
+    if (strcmp(eq_current_profile_name, previous) == 0)
+        snprintf(eq_current_profile_name, sizeof(eq_current_profile_name), "%s", text);
+    else
+        snprintf(eq_current_profile_name, sizeof(eq_current_profile_name), "%s", previous);
+    populate_eq_profiles_screen();
+    show_info_toast("Profile renamed");
+}
+
+static void eq_profile_rename_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    const char * path = (const char *) lv_event_get_user_data(e);
+    char display[256];
+    snprintf(display, sizeof(display), "%s", basename_of(path));
+    char * dot = strrchr(display, '.');
+    if (dot && strcmp(dot, ".peq") == 0) *dot = '\0';
+    show_text_entry("Rename Profile", display, false, false, eq_profile_rename_done_cb, (void *) path);
 }
 
 static void populate_eq_profiles_screen(void) {
     lv_obj_clean(eq_profiles_list);
+    eq_profiles_free_paths();
 
-    char ** paths;
-    int count;
-    if (!peq_scan_profiles(PEQ_PROFILES_DIR, &paths, &count)) {
+    if (eq_profiles_edit_btn)
+        lv_label_set_text(eq_profiles_edit_btn, eq_profiles_edit_mode ? "Done" : "Edit");
+
+    if (!peq_scan_profiles(PEQ_PROFILES_DIR, &eq_profile_paths, &eq_profile_count)) {
         lv_obj_t * label = lv_label_create(eq_profiles_list);
         lv_label_set_text(label, "No saved profiles");
         lv_obj_add_style(label, &style_theme_text_muted, 0);
@@ -2456,7 +2581,7 @@ static void populate_eq_profiles_screen(void) {
         return;
     }
 
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < eq_profile_count; i++) {
         lv_obj_t * row = lv_obj_create(eq_profiles_list);
         lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
         lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
@@ -2466,9 +2591,9 @@ static void populate_eq_profiles_screen(void) {
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
         char display[64];
-        snprintf(display, sizeof(display), "%s", basename_of(paths[i]));
+        snprintf(display, sizeof(display), "%s", basename_of(eq_profile_paths[i]));
         char * dot = strrchr(display, '.');
-        if (dot) *dot = '\0'; /* drop the .peq extension for display */
+        if (dot) *dot = '\0';
 
         lv_obj_t * label = lv_label_create(row);
         lv_label_set_text(label, display);
@@ -2476,42 +2601,77 @@ static void populate_eq_profiles_screen(void) {
         lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
 
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, eq_profile_row_cb, LV_EVENT_CLICKED, paths[i]);
+        if (eq_profiles_edit_mode) {
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, eq_profile_rename_row_cb, LV_EVENT_CLICKED, eq_profile_paths[i]);
+            lv_obj_t * delete_icon = lv_image_create(row);
+            lv_image_set_src(delete_icon, asset_path("touch_list/del.png"));
+            lv_obj_align(delete_icon, LV_ALIGN_RIGHT_MID, -20, 0);
+            lv_obj_add_flag(delete_icon, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(delete_icon, eq_profile_delete_row_cb, LV_EVENT_CLICKED, eq_profile_paths[i]);
+        } else {
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, eq_profile_row_cb, LV_EVENT_CLICKED, eq_profile_paths[i]);
+        }
     }
-    free(paths);
+}
+
+static void eq_profiles_edit_btn_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    eq_profiles_edit_mode = !eq_profiles_edit_mode;
+    populate_eq_profiles_screen();
+}
+
+static void build_eq_profile_delete_popup(void) {
+    eq_profile_delete_popup = build_confirm_popup("Delete this profile?", LV_LABEL_LONG_WRAP, NULL, NULL, "Delete",
+                                                   lv_color_make(255, 120, 120), eq_profile_delete_confirm_cb, NULL,
+                                                   "Cancel", accent_lv_color(), eq_profile_delete_cancel_cb, NULL,
+                                                   eq_profile_delete_popup_backdrop_cb, &eq_profile_delete_popup_backdrop);
 }
 
 static lv_obj_t * build_eq_profiles_screen(void) {
     lv_obj_t * title_label;
-    return build_subsonic_list_screen("Load Profile", &title_label, &eq_profiles_list);
+    lv_obj_t * scr = build_subsonic_list_screen("Profiles", &title_label, &eq_profiles_list);
+    eq_profiles_edit_btn = lv_label_create(scr);
+    lv_label_set_text(eq_profiles_edit_btn, "Edit");
+    lv_obj_set_style_text_color(eq_profiles_edit_btn, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(eq_profiles_edit_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_align(eq_profiles_edit_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_add_flag(eq_profiles_edit_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(eq_profiles_edit_btn, eq_profiles_edit_btn_cb, LV_EVENT_CLICKED, NULL);
+    if (title_label) reserve_title_width_before(title_label, eq_profiles_edit_btn);
+    return scr;
 }
 
 static void eq_load_profile_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    eq_profiles_edit_mode = false;
     populate_eq_profiles_screen();
     nav_push(eq_profiles_screen);
 }
 
 static void eq_save_profile_name_done_cb(const char * text, void * user_data) {
     (void) user_data;
-    if (text[0] == '\0') return;
+    eq_save_named_profile(text);
+}
 
-    mkdir(PEQ_PROFILES_DIR, 0755); /* no-op (EEXIST) if it's already there */
-
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s.peq", PEQ_PROFILES_DIR, text);
-    if (peq_save_to_path(path)) {
-        snprintf(eq_current_profile_name, sizeof(eq_current_profile_name), "%s", text);
-        show_error_toast("Profile saved");
-    } else {
-        show_error_toast("Failed to save profile");
-    }
+static void eq_save_profile_long_press_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+    eq_save_as_long_press_fired = true;
+    show_text_entry("Save Profile As", eq_current_profile_name, false, false, eq_save_profile_name_done_cb, NULL);
 }
 
 static void eq_save_profile_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    show_text_entry("Profile Name", eq_current_profile_name, false, false, eq_save_profile_name_done_cb, NULL);
+    if (eq_save_as_long_press_fired) {
+        eq_save_as_long_press_fired = false;
+        return;
+    }
+    if (eq_current_profile_name[0]) {
+        eq_save_named_profile(eq_current_profile_name);
+        return;
+    }
+    show_text_entry("Profile Name", "", false, false, eq_save_profile_name_done_cb, NULL);
 }
 
 static lv_obj_t * build_eq_screen(void) {
@@ -2739,6 +2899,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_remove_flag(save_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(save_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(save_btn, eq_save_profile_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(save_btn, eq_save_profile_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
     lv_obj_t * save_label = lv_label_create(save_btn);
     lv_label_set_text(save_label, "Save Profile");
     lv_obj_set_style_text_font(save_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
@@ -2759,7 +2920,7 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_add_flag(load_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(load_btn, eq_load_profile_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * load_label = lv_label_create(load_btn);
-    lv_label_set_text(load_label, "Load Profile");
+    lv_label_set_text(load_label, "Profiles");
     lv_obj_set_style_text_font(load_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_add_style(load_label, gui_theme_accent_style(), 0);
     lv_label_set_long_mode(load_label, LV_LABEL_LONG_WRAP);
@@ -2832,6 +2993,7 @@ void gui_settings_init(void) {
     eq_profiles_screen = build_eq_profiles_screen();
     build_firmware_update_popup();
     build_eq_reset_popup();
+    build_eq_profile_delete_popup();
     build_factory_reset_popup();
     build_hostname_reboot_popup();
 }
@@ -2849,6 +3011,8 @@ void gui_settings_teardown(void) {
     if (firmware_update_popup_backdrop) { lv_obj_del(firmware_update_popup_backdrop); firmware_update_popup_backdrop = NULL; }
     if (eq_reset_popup) { lv_obj_del(eq_reset_popup); eq_reset_popup = NULL; }
     if (eq_reset_popup_backdrop) { lv_obj_del(eq_reset_popup_backdrop); eq_reset_popup_backdrop = NULL; }
+    if (eq_profile_delete_popup) { lv_obj_del(eq_profile_delete_popup); eq_profile_delete_popup = NULL; }
+    if (eq_profile_delete_popup_backdrop) { lv_obj_del(eq_profile_delete_popup_backdrop); eq_profile_delete_popup_backdrop = NULL; }
     if (factory_reset_popup) { lv_obj_del(factory_reset_popup); factory_reset_popup = NULL; }
     if (factory_reset_popup_backdrop) { lv_obj_del(factory_reset_popup_backdrop); factory_reset_popup_backdrop = NULL; }
     if (hostname_reboot_popup) { lv_obj_del(hostname_reboot_popup); hostname_reboot_popup = NULL; }
@@ -2877,6 +3041,8 @@ void gui_settings_teardown(void) {
     if (settings_screen) { lv_obj_del(settings_screen); settings_screen = NULL; }
     if (eq_screen) { lv_obj_del(eq_screen); eq_screen = NULL; }
     if (eq_profiles_screen) { lv_obj_del(eq_profiles_screen); eq_profiles_screen = NULL; }
+    eq_profiles_edit_btn = NULL;
+    eq_profiles_free_paths();
 }
 
 /* Externs for callbacks defined in gui.c */

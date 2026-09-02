@@ -1613,6 +1613,7 @@ one will visibly stall the whole UI until it returns, same tradeoff
 | `NetRadio.lua` | Stream Media tile and live MP3 streams |
 | `Themes.lua` | Display row, icon overrides, background/text colors |
 | `SoundProfiles.lua` | PEQ profile selection and persistence |
+| `MSEB.lua` | Chained settings-list screens, summed EQ band contributions, backup/restore |
 | `PlaybackExtras.lua` | Native-looking toggles, sliders, and nested settings |
 | `PlayThrough.lua` | Natural-end detection and folder/album continuation |
 | `ExtendedSleepTimer.lua` | Persistent duration, session timer, and delayed playback stop |
@@ -1655,6 +1656,23 @@ Settings -> Playback -> Sound Profile, switched with `plugin.eq_load_profile()` 
 `plugin.show_list()`, following the exact same "`register_list_item` ->
 `show_list` -> apply and persist to a state file" shape `Themes.lua` already
 established for theme switching.
+
+`plugins_examples/MSEB.lua` builds on the same EQ functions -- ten
+mood-based tuning sliders (Sound Temperature, Bass Extension, Vocal
+Position, and so on, modeled after the stock HiBy firmware's own "MSEB"
+feature, reverse-engineered down to the real slider list but not its
+unrecoverable mapping formulas -- this plugin's mapping is original) grouped
+across three chained `show_settings_list()` screens, since
+`PLUGIN_SETTINGS_LIST_MAX_SLIDERS` caps a single call at 4. Two axes share
+a PEQ band each (a whole-spectrum "tilt" control alongside a dedicated
+bass/treble one) -- demonstrates summing contributions into a shared band
+with `plugin.eq_set_band()` rather than one axis overwriting another's.
+Also demonstrates snapshotting the live PEQ curve with
+`plugin.eq_save_profile()` the first time the feature is enabled and
+restoring it with `plugin.eq_load_profile()` on disable, so toggling it
+never destroys a hand-tuned manual curve -- and calling `eq_set_band()`
+only for the specific band(s) a changed slider actually owns, never all 10
+bands on every release, since each call persists to disk immediately.
 
 `plugins_examples/PlaybackExtras.lua` is the reference implementation for
 `register_list_item("playback", ...)` and `show_settings_list()` -- a

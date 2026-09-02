@@ -258,7 +258,7 @@ using an identity derived from their filename.
 - `plugin.api_version()` returns the current integer plugin API version (currently `4`).
 - `plugin.has_capability(name)` reports whether an optional interface exists.
   Supported capability tokens:
-  - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`, `ui.launcher_layout`
+  - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`, `ui.launcher_layout`, `ui.home_background`
   - Playback & Audio: `playback.control`, `playback.state`, `playback.events`, `playback.remote`, `audio.peq`
   - Filesystem & Playlists: `filesystem.sd`, `filesystem.mkdir`, `filesystem.playlists`
   - Storage & Secrets: `storage.namespaced`, `storage.secrets`
@@ -343,6 +343,17 @@ the 6 native tiles, always in a fixed order). Purely additive, no breaking
 changes bundled into this window. A plugin that only needs this can
 feature-detect it with `plugin.has_capability("ui.home_tiles")` instead of
 bumping `api_min`.
+
+#### API version 10 changelog
+
+New in API 10: `plugin.set_home_layout()`'s new `options.background_image`
+field (see its own doc section below) -- a static `.png`/`.jpg`/`.jpeg`
+shown behind Home's own tiles/rows, in both tile and list mode. Unlike
+`plugin.set_background_color("screen", ...)`, this affects Home's root
+object only, not every screen in the app. Purely additive, no breaking
+changes bundled into this window. A plugin that only needs this can
+feature-detect it with `plugin.has_capability("ui.home_background")`
+instead of bumping `api_min`.
 
 <a id="plugin-ui"></a>
 
@@ -581,6 +592,24 @@ error, since there's no reasonable non-table `options`):
     mode = "list",  -- "tile" (default, today's icon grid) or "list"
     tile_gap = 6,   -- tile mode only, px between tiles, clamped to 0-64
     row_gap = 10,   -- list mode only, px between rows, clamped to 0-84 (0 = the native default of 6)
+    background_image = plugin.sd_root() .. "/wallpaper.jpg",
+                    -- optional: a static image (.png, .jpg, or .jpeg) shown
+                    -- behind Home's own tiles/rows, in both tile and list
+                    -- mode. ONLY Home's background -- unlike
+                    -- plugin.set_background_color("screen", ...), every
+                    -- other screen is unaffected. Copied once into this
+                    -- app's writable theme-override storage the moment this
+                    -- call runs (same mechanism plugin.set_icon() uses), so
+                    -- treat it like set_icon(): call from your plugin's
+                    -- top-level script code for a real app start to pick it
+                    -- up reliably, or follow a later call with plugin.
+                    -- refresh_theme()/reload_ui() the same way any other
+                    -- set_home_layout() change needs one to take visible
+                    -- effect. LVGL draws a bg_image at native size, CENTERED,
+                    -- never stretched to fill -- author the file at exactly
+                    -- the panel's own resolution (480x320 on R1) rather than
+                    -- relying on any scale-to-fit. Raises a Lua error if the
+                    -- file isn't .png/.jpg/.jpeg or can't be read.
     order = { "dac", "music", "stream_media", "wireless", "books", "settings" },
                     -- optional (API 7+); which tiles Home shows, and in what
                     -- position -- position IS order. Each entry is a native
@@ -1738,7 +1767,7 @@ It also demonstrates the success/busy return contract of `show_text_input()`.
 2. Optionally run `luac -p MyPlugin.lua` to catch syntax errors locally.
 3. Copy it to `<SD card>/.plugins/`.
 4. Either restart the player, or open Settings -> System -> Plugins and tap
-   "Reload Plugins" to pick up the new/edited file without restarting (same
+   "Apply Plugin Changes" to pick up the new/edited file without restarting (same
    full reload `plugin.reload_ui()` itself triggers -- every other loaded
    plugin's top-level code re-runs too, and navigation lands back on Home).
    That screen also has a per-plugin on/off toggle. **The toggle only

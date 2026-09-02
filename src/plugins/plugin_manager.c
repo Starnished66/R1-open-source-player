@@ -1357,6 +1357,54 @@ static bool copy_file(const char * src_path, const char * dst_path) {
 }
 #endif
 
+#ifndef HOST_BUILD
+/* options.background_image (PLUGINS.md, plugin.set_home_layout()): copies a
+ * plugin-supplied SD-card image into a FIXED theme-override destination
+ * ("home/background.<ext>", extension preserved from source_path so the
+ * right LVGL decoder -- lv_lodepng_init()/lv_tjpgd_init(), assets.c's own
+ * assets_init() -- picks it up), then records that relative path in
+ * *config for build_home_screen() (gui_settings.c) to read. Unlike
+ * l_plugin_set_icon() below, the destination name is fixed by native code
+ * rather than plugin-controlled, so this needs none of set_icon()'s own
+ * ".." rejection -- only source_path (already validated by
+ * check_plugin_external_path() at the call site) ever reaches copy_file().
+ * No-op (config left untouched) on HOST_BUILD, where there is no writable
+ * override root for asset_path() to ever check -- see PLUGIN_THEME_
+ * OVERRIDE_ROOT's own comment. */
+static void set_home_background_image(lua_State * L, const char * source_path, home_layout_config_t * config) {
+    const char * dot = strrchr(source_path, '.');
+    const char * ext = NULL;
+    if (dot && strcasecmp(dot, ".png") == 0) ext = ".png";
+    else if (dot && strcasecmp(dot, ".jpg") == 0) ext = ".jpg";
+    else if (dot && strcasecmp(dot, ".jpeg") == 0) ext = ".jpeg";
+    if (!ext) {
+        luaL_error(L, "plugin.set_home_layout: options.background_image '%s' must be a .png, .jpg, or .jpeg file",
+                   source_path);
+        return; /* unreachable -- luaL_error() longjmps */
+    }
+
+    char relative_path[32];
+    snprintf(relative_path, sizeof(relative_path), "home/background%s", ext);
+    char dst_path[600];
+    snprintf(dst_path, sizeof(dst_path), "%s%s", PLUGIN_THEME_OVERRIDE_ROOT, relative_path);
+
+    /* Same best-effort two-level mkdir as l_plugin_set_icon() below. */
+    mkdir(PLUGIN_THEME_OVERRIDE_ROOT, 0755);
+    char dir_only[600];
+    snprintf(dir_only, sizeof(dir_only), "%shome", PLUGIN_THEME_OVERRIDE_ROOT);
+    mkdir(dir_only, 0755);
+
+    if (!copy_file(source_path, dst_path)) {
+        luaL_error(L, "plugin.set_home_layout: could not copy options.background_image '%s' to '%s'",
+                   source_path, relative_path);
+        return; /* unreachable */
+    }
+
+    snprintf(config->background_image, sizeof(config->background_image), "%s", relative_path);
+    config->has_background_image = true;
+}
+#endif
+
 /* Reskins an EXISTING theme2 asset in place, e.g.
  * plugin.set_icon("launcher/book.png", plugin.sd_root() .. "/my_book.png")
  * to change what Home's Books tile looks like -- a different case from
@@ -1697,6 +1745,15 @@ static int l_plugin_set_home_layout(lua_State * L) {
         lua_getfield(L, 2, "row_gap");
         config.row_gap = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "row_gap");
         lua_pop(L, 1);
+
+#ifndef HOST_BUILD
+        lua_getfield(L, 2, "background_image");
+        if (!lua_isnil(L, -1)) {
+            const char * source_path = check_plugin_external_path(L, -1, "plugin.set_home_layout");
+            set_home_background_image(L, source_path, &config);
+        }
+        lua_pop(L, 1);
+#endif
 
         lua_getfield(L, 2, "order");
         if (!lua_isnil(L, -1)) {
@@ -3155,7 +3212,8 @@ static const char * const plugin_capabilities[] = {
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
     "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
-    "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles", "ui.launcher_layout"
+    "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles", "ui.launcher_layout",
+    "ui.home_background"
 };
 
 static int l_plugin_has_capability(lua_State * L) {

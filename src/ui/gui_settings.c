@@ -2083,6 +2083,20 @@ static int resolve_home_tiles(resolved_home_tile_t * out) {
     return count;
 }
 
+/* options.background_image (PLUGINS.md, plugin.set_home_layout()) -- sets
+ * Home's OWN root object's bg_image_src directly, not style_theme_screen_bg
+ * (shared by every screen in the app, mutated by plugin.set_background_
+ * color("screen", ...)). scr's grid/tile children are already transparent
+ * (build_icon_grid_screen()'s own bg_opa=0 on both, screen_builders.c)
+ * unless a per-tile bg_color override says otherwise, so this shows through
+ * cleanly behind them with no other change needed. Called from both
+ * build_home_screen() branches below, right after each builds its own scr,
+ * so a plugin-set background applies whether Home is tile or list mode. */
+static void apply_home_background_image(lv_obj_t * scr) {
+    if (!home_layout_config.configured || !home_layout_config.has_background_image) return;
+    lv_obj_set_style_bg_image_src(scr, asset_path(home_layout_config.background_image), 0);
+}
+
 lv_obj_t * build_home_screen(void) {
     static resolved_home_tile_t resolved[HOME_LAYOUT_MAX_TILES];
     int count = resolve_home_tiles(resolved);
@@ -2122,6 +2136,7 @@ lv_obj_t * build_home_screen(void) {
         }
         lv_obj_t * scr = build_pill_list_screen(NULL, NULL, items, count, gui_theme_accent_style(),
                                                  home_layout_config.row_gap > 0 ? home_layout_config.row_gap : 6);
+        apply_home_background_image(scr);
         finalize_screen_navigation(scr);
         return scr;
     }
@@ -2148,6 +2163,7 @@ lv_obj_t * build_home_screen(void) {
      * never exceeds what build_icon_grid_screen()'s own row math expects. */
     lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, count, 100, false,
                                              home_layout_config.configured ? home_layout_config.tile_gap : 0);
+    apply_home_background_image(scr);
     finalize_screen_navigation(scr);
     return scr;
 }

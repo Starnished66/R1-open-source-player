@@ -54,8 +54,16 @@
  * native Music, Stream Media, and Wireless launchers between their existing
  * icon grids and the shared pill-list presentation.
  * API 9 adds show_list()'s optional selected-row highlight and an optional
- * duration_ms argument to show_toast(). Both are backward-compatible. */
-#define PLUGIN_API_VERSION 9
+ * duration_ms argument to show_toast(). Both are backward-compatible.
+ * Bumped 9 -> 10: added plugin.set_home_layout()'s new `options.
+ * background_image` field -- a static image shown behind Home's own tiles/
+ * rows only (not every screen, unlike plugin.set_background_color()),
+ * copied once from the plugin's SD-card source into this app's writable
+ * theme-override storage the same way plugin.set_icon() already does.
+ * Purely additive, same as every bump before it. Also see the new
+ * "ui.home_background" plugin_capabilities[] entry (plugin_manager.c) for
+ * the no-version-bump way to feature-detect just this. */
+#define PLUGIN_API_VERSION 10
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
 /* Third-party Lua plugin support. Every *.lua file under

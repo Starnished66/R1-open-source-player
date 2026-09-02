@@ -76,6 +76,21 @@ typedef struct {
     int32_t tile_gap; /* tile mode only -- build_icon_grid_screen() clamps this to 0-64 */
     int32_t row_gap;  /* list mode only, 0 = keep build_pill_list_screen()'s native default of 6 -- clamped there to 0-84 */
 
+    /* options.background_image (PLUGINS.md) -- theme-override-relative path
+     * (e.g. "home/background.png") that plugin_manager.c's
+     * l_plugin_set_home_layout() already copied the plugin's source image
+     * to, extension preserved so the right LVGL decoder (lodepng/tjpgd)
+     * picks it up. Empty/has_background_image==false means "no override,
+     * Home keeps its native plain background". build_home_screen() passes
+     * this straight to asset_path() and sets it as scr's own bg_image_src
+     * -- NOT style_theme_screen_bg, which is shared by every other screen
+     * in the app; this only ever affects Home's own root object. LVGL's
+     * bg_image style draws at native size, centered, never stretched (see
+     * screen_builders.h's own LIST_ROW_BG_COLOR comment) -- the source
+     * image should already be exactly the panel's resolution. */
+    bool has_background_image;
+    char background_image[64];
+
     /* Display order -- position IS order, unlike tiles[] below. Each entry
      * is either one of the 7 native keys in home_layout_tile_keys[] or a
      * plugin.register_home_tile() id. A native key simply not mentioned

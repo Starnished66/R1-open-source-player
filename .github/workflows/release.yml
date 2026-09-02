@@ -2,6 +2,8 @@ name: Build and Release HiBy R1 Firmware
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -9,27 +11,31 @@ on:
 jobs:
   build-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download and setup MIPS toolchain
+      - name: Compile Firmware via Docker
         run: |
-          # Added -4 to force IPv4 and prevent GitHub Actions from hanging on IPv6
-          curl -4 -S -L -O --retry 3 https://musl.cc/mipsel-linux-musl-cross.tgz
-          tar -xf mipsel-linux-musl-cross.tgz
-          echo "${{ github.workspace }}/mipsel-linux-musl-cross/bin" >> $GITHUB_PATH
-
-      - name: Compile Firmware
-        run: |
-          make clean
-          make target
+          # 1. Mount the repository into the Docker container
+          # 2. Install python3 and make
+          # 3. Create a symlink to rename the Rust toolchain to the exact name the Makefile demands
+          # 4. Compile the firmware
+          docker run --rm -v ${{ github.workspace }}:/work -w /work messense/rust-musl-cross:mipsel-musl bash -c " \
+            apt-get update && \
+            apt-get install -y python3 make && \
+            ln -sf \$(which mipsel-unknown-linux-musl-gcc) /usr/local/bin/mipsel-linux-musl-gcc && \
+            make clean && \
+            make target"
 
       - name: Create GitHub Release and Upload Asset
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest-build' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Latest Commit Build' }}
           files: |
             open_hiby_player_target
         env:

@@ -74,6 +74,14 @@ static void test_jpeg_scale_for_target(void) {
     CHECK(jpeg_scale_for_target(128, 128, 64, 64) == 1);
     CHECK(jpeg_scale_for_target(128, 128, 32, 32) == 2);
     CHECK(jpeg_scale_for_target(128, 128, 16, 16) == 3);
+
+    CHECK(jpeg_decode_dims_ok(2000, 2000, 480, 480) == true);   /* 1/4 -> 500 */
+    CHECK(jpeg_decode_dims_ok(4000, 4000, 480, 480) == true);   /* 1/8 -> 500 */
+    CHECK(jpeg_decode_dims_ok(4000, 4000, 72, 72)   == true);
+    CHECK(jpeg_decode_dims_ok(4000, 500, 480, 480)  == false);  /* scale 0, 4000 > 1200 */
+    CHECK(jpeg_decode_dims_ok(20000, 20000, 72, 72) == false);  /* native > 4096, and/or scaled 2500 > 1200 */
+    CHECK(jpeg_decode_dims_ok(4096, 4096, 480, 480) == true);   /* 1/8 -> 512 */
+    CHECK(jpeg_decode_dims_ok(4097, 4097, 480, 480) == false);  /* native cap */
 }
 
 typedef struct {
@@ -261,10 +269,28 @@ static void test_malformed_and_oversized(void) {
 
     uint8_t oversized[2048];
     CHECK(jpeg_red_128_size <= sizeof(oversized));
+
+    /* 4000x500 target 480x480: scale is 0 because 500>>1 = 250 < 480, so native side 4000 > 1200 -> OVERSIZED */
     memcpy(oversized, jpeg_red_128, jpeg_red_128_size);
-    CHECK(patch_sof0_size(oversized, jpeg_red_128_size, 2000, 2000));
+    CHECK(patch_sof0_size(oversized, jpeg_red_128_size, 4000, 500));
+    CHECK(cover_decode_to_rgb565_ex(oversized, jpeg_red_128_size, 480, 480, ARTWORK_PRIO_PLAYER, NULL, NULL, &pixels) ==
+          COVER_DECODE_FAIL_OVERSIZED);
+    CHECK(pixels == NULL);
+
+    /* 20000x20000 target 72x72: exceeds native cap 4096 and scaled (2500) > 1200 -> OVERSIZED */
+    memcpy(oversized, jpeg_red_128, jpeg_red_128_size);
+    CHECK(patch_sof0_size(oversized, jpeg_red_128_size, 20000, 20000));
     CHECK(cover_decode_to_rgb565_ex(oversized, jpeg_red_128_size, 72, 72, ARTWORK_PRIO_PLAYER, NULL, NULL, &pixels) ==
           COVER_DECODE_FAIL_OVERSIZED);
+    CHECK(pixels == NULL);
+
+    /* 2000x2000 target 72x72: scale 1/8 -> 250 <= 1200, dims are OK, so not OVERSIZED.
+     * It fails later in decomp because scan data is still 128x128 fixture bytes. */
+    memcpy(oversized, jpeg_red_128, jpeg_red_128_size);
+    CHECK(patch_sof0_size(oversized, jpeg_red_128_size, 2000, 2000));
+    cover_decode_result_t res_2k = cover_decode_to_rgb565_ex(oversized, jpeg_red_128_size, 72, 72,
+                                                             ARTWORK_PRIO_PLAYER, NULL, NULL, &pixels);
+    CHECK(res_2k != COVER_DECODE_FAIL_OVERSIZED);
     CHECK(pixels == NULL);
 }
 

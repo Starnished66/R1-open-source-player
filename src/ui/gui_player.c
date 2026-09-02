@@ -601,7 +601,8 @@ static void * cover_decode_thread_func(void * arg) {
     } else if (req->picture_data) {
         /* Structured result instead of the plain bool wrapper: a fallback
          * to external art must only trigger on a permanent failure
-         * (corrupt data or over MAX_PLAYER_COVER_SIDE). LOW_MEMORY/BUSY/
+         * (corrupt data or exceeds decode dimension cap; JPEG allows 4k if it
+         * scales, PNG/BMP cap at 1200 native). LOW_MEMORY/BUSY/
          * CANCELLED/ALLOC mean the decode coordinator is already under
          * pressure -- immediately launching a second file read + decode
          * attempt there would turn one coordinator timeout into two and
@@ -681,7 +682,7 @@ static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t 
                                   .stream_url = "", .stream_verify_tls = false };
     /* track_path/artist/album/album_artist let cover_decode_thread_func()
      * fall back to an external cover file if this embedded picture fails
-     * to decode (e.g. exceeds MAX_PLAYER_COVER_SIDE) -- without these the
+     * to decode (e.g. exceeds decode dimension cap) -- without these the
      * fallback guard's local_track_path check is always empty and never
      * fires. */
     snprintf(r.local_track_path, sizeof(r.local_track_path), "%s", track_path ? track_path : "");

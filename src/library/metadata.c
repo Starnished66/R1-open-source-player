@@ -50,10 +50,12 @@ static bool safe_chunk_advance(long chunk_start, uint64_t size, long pad, long *
 }
 
 /* Same compressed-byte cap as m4a_read_cover_art() / gui.c's sidecar load.
- * Decode also rejects sources above 1200x1200; this stops the malloc of a
- * 10 MiB APIC before that decoder runs. Also used as a hard cap on ID3
- * tag bodies, USLT/lyrics payloads, and base64 METADATA_BLOCK_PICTURE
- * decodes so a lying size field cannot malloc tens of MiB in-process. */
+ * Decode also rejects sources with post-scale RGB888 above 1200x1200 (JPEG
+ * allows native up to 4096 if scaled <= 1200; PNG/BMP reject native > 1200);
+ * this stops the malloc of a 10 MiB APIC before that decoder runs. Also used
+ * as a hard cap on ID3 tag bodies, USLT/lyrics payloads, and base64
+ * METADATA_BLOCK_PICTURE decodes so a lying size field cannot malloc tens of
+ * MiB in-process. */
 #define METADATA_BLOB_MAX_BYTES (4U * 1024U * 1024U)
 #define EMBEDDED_COVER_MAX_BYTES METADATA_BLOB_MAX_BYTES
 #define ID3_TEXT_FRAME_MAX_BYTES (64U * 1024U)

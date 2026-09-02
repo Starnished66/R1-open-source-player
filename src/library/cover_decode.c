@@ -86,7 +86,7 @@ static cover_decode_result_t decode_jpeg_rgb888(const uint8_t * data, uint32_t s
         return COVER_DECODE_FAIL_UNSUPPORTED;
     }
 
-    if (!rgb888_size_ok(jd.width, jd.height, max_side, NULL)) {
+    if (!jpeg_decode_dims_ok((int) jd.width, (int) jd.height, target_w, target_h)) {
         return COVER_DECODE_FAIL_OVERSIZED;
     }
 
@@ -344,10 +344,18 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
     }
 
     if (native_w <= 0 || native_h <= 0) return COVER_DECODE_FAIL_UNSUPPORTED;
-    if ((size_t) native_w > max_side || (size_t) native_h > max_side) {
-        DBG_LOG("cover_decode: image rejected by dimension cap (%dx%d > max %zu)\n",
-                native_w, native_h, max_side);
-        return COVER_DECODE_FAIL_OVERSIZED;
+    if (fmt == ARTWORK_FORMAT_JPEG) {
+        if (!jpeg_decode_dims_ok(native_w, native_h, target_w, target_h)) {
+            DBG_LOG("cover_decode: JPEG rejected by dimension cap (%dx%d target %dx%d)\n",
+                    native_w, native_h, target_w, target_h);
+            return COVER_DECODE_FAIL_OVERSIZED;
+        }
+    } else {
+        if ((size_t) native_w > max_side || (size_t) native_h > max_side) {
+            DBG_LOG("cover_decode: image rejected by dimension cap (%dx%d > max %zu)\n",
+                    native_w, native_h, max_side);
+            return COVER_DECODE_FAIL_OVERSIZED;
+        }
     }
 
     /* 2. Estimate required memory and acquire decode slot from coordinator.

@@ -603,6 +603,41 @@ static bool crossfade_enabled = false;
 
 static float volume = 1.0f;      /* UI-facing 0.0-1.0 percent, what audio_get_volume() returns */
 static float volume_gain = 1.0f; /* actual linear PCM multiplier the playback thread applies -- see audio_set_volume() */
+
+/* Stock HiBy R1 hardware-volume curves from /usr/resource/ot_devices.json.
+ * The stock firmware labels these HDB and LDB. HDB is used for High Gain,
+ * LDB for Low Gain. Index 0 is the mute endpoint; indices 1..100 map directly
+ * to the UI volume percentage. */
+static audio_gain_mode_t gain_mode = AUDIO_GAIN_DEFAULT;
+
+static const unsigned char hiby_r1_hdb[101] = {
+    255,
+    176,166,156,146,142,138,134,130,126,124,
+    122,120,118,116,114,112,110,108,106,104,
+    102,100,98,96,94,92,90,88,86,84,
+    82,80,78,76,74,72,70,68,66,64,
+    62,60,58,56,55,54,53,52,51,50,
+    49,48,47,46,45,44,43,42,41,40,
+    39,38,37,36,35,34,33,32,31,30,
+    29,28,27,26,25,24,23,22,21,20,
+    19,18,17,16,15,14,13,12,11,10,
+    9,8,7,6,5,4,3,2,1,0
+};
+
+static const unsigned char hiby_r1_ldb[101] = {
+    255,
+    188,178,168,158,154,150,146,142,138,136,
+    134,132,130,128,126,124,122,120,118,116,
+    114,112,110,108,106,104,102,100,98,96,
+    94,92,90,88,86,84,82,80,78,76,
+    74,72,70,68,67,66,65,64,63,62,
+    61,60,59,58,57,56,55,54,53,52,
+    51,50,49,48,47,46,45,44,43,42,
+    41,40,39,38,37,36,35,34,33,32,
+    31,30,29,28,27,26,25,24,23,22,
+    21,20,19,18,17,16,15,14,13,12
+};
+
 static atomic_uint volume_set_generation = 0;
 static pthread_once_t volume_request_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t volume_request_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2486,7 +2521,18 @@ static void audio_apply_volume(float new_volume, unsigned int generation) {
     volume = new_volume;
     volume_gain = (new_volume <= 0.0f) ? 0.0f : 1.0f;
 #ifndef HOST_BUILD
-    int raw = (new_volume <= 0.0f) ? HW_VOLUME_MAX_RAW : volume_db_to_hw_raw(calibrated_taper_db((double) new_volume));
+    int raw;
+    if (gain_mode == AUDIO_GAIN_LOW || gain_mode == AUDIO_GAIN_HIGH) {
+        int percent = (int) lround((double) new_volume * 100.0);
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+        const unsigned char * table =
+            (gain_mode == AUDIO_GAIN_LOW) ? hiby_r1_ldb : hiby_r1_hdb;
+        raw = table[percent];
+    } else {
+        raw = (new_volume <= 0.0f) ? HW_VOLUME_MAX_RAW :
+              volume_db_to_hw_raw(calibrated_taper_db((double) new_volume));
+    }
     audio_output_request_hw_volume_raw(raw, raw);
     if (audio_output_is_usb_active()) {
         volume_gain = (new_volume <= 0.0f) ? 0.0f : (float) pow(10.0, calibrated_taper_db((double) new_volume) / 20.0);
@@ -2545,6 +2591,30 @@ float audio_get_volume(void) {
     float result = volume;
     pthread_mutex_unlock(&audio_mutex);
     return result;
+}
+
+void audio_set_gain_mode(audio_gain_mode_t mode) {
+    if (mode != AUDIO_GAIN_DEFAULT &&
+        mode != AUDIO_GAIN_LOW &&
+        mode != AUDIO_GAIN_HIGH) {
+        mode = AUDIO_GAIN_DEFAULT;
+    }
+
+    pthread_mutex_lock(&audio_mutex);
+    gain_mode = mode;
+    float current_volume = volume;
+    pthread_mutex_unlock(&audio_mutex);
+
+    /* Reapply the current volume immediately so a profile change while
+     * playing takes effect without needing a volume-button press. */
+    audio_set_volume(current_volume);
+}
+
+audio_gain_mode_t audio_get_gain_mode(void) {
+    pthread_mutex_lock(&audio_mutex);
+    audio_gain_mode_t mode = gain_mode;
+    pthread_mutex_unlock(&audio_mutex);
+    return mode;
 }
 
 bool audio_consume_track_finished(void) {

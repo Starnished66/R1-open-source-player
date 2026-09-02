@@ -2,6 +2,7 @@
 #include "gui_settings.h"
 #include "gui_text_input.h"
 #include "app_clock.h"
+#include "app_version.h"
 #include <math.h>
 #include <sys/stat.h>
 #include "gui_subsonic.h"
@@ -398,24 +399,8 @@ void firmware_update_row_cb(lv_event_t * e) {
 
 static lv_obj_t * build_about_screen(void) {
     static pill_list_item_t items[3];
-    /* TEST_BUILD_TAG: optional -D from the Makefile (see TEST_BUILD_TAG
-     * there), e.g. `make target TEST_BUILD_TAG=test25_avrcp` -- a
-     * friendly label for which of this session's many test builds is
-     * actually running, without needing to check timestamps/MD5s by
-     * hand. BUILD_STAMP is the fallback: always defined automatically by
-     * the Makefile (a build date/time, no flag needed), for the flashed/
-     * real-deployment path where TEST_BUILD_TAG is never explicitly set
-     * but the same "which build is this" question still matters. */
-    static char version_line[64];
-#if defined(TEST_BUILD_TAG)
-    snprintf(version_line, sizeof(version_line), "Beta 2 (%s)", TEST_BUILD_TAG);
-#elif defined(BUILD_STAMP)
-    snprintf(version_line, sizeof(version_line), "Beta 2 (%s)", BUILD_STAMP);
-#else
-    snprintf(version_line, sizeof(version_line), "Beta 2");
-#endif
     items[0] = (pill_list_item_t){ "Open Source Player for HiBy OS", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
-    items[1] = (pill_list_item_t){ version_line, PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
+    items[1] = (pill_list_item_t){ app_version_label(), PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
     lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, gui_theme_accent_style(), 6);

@@ -315,13 +315,21 @@ CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
 HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
 HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
-# Optional: `make target TEST_BUILD_TAG=test25_avrcp` -- shows up in the
-# About screen's version line (see build_about_screen() in gui.c) so a
-# build actually running on the device can be identified without checking
-# timestamps/MD5s by hand. Left unset for a normal build (About just shows
-# the plain version number).
+# Optional: `make target TEST_BUILD_TAG=test25_avrcp` -- replaces the release
+# label in About with a conspicuous test-build identity, so a binary running
+# on the device can be identified without checking timestamps or hashes.
 ifneq ($(TEST_BUILD_TAG),)
 TEST_BUILD_TAG_DEFINE = -DTEST_BUILD_TAG=\"$(TEST_BUILD_TAG)\"
+endif
+
+# Human-facing version shown by About and plugin.get_app_info(). CI sets this
+# to its release/artifact title (for example "Weekly Beta 2026-09-02"). Keep
+# it separate from BUILD_STAMP: the bootloader parses that fixed-width stamp
+# to compare internal and SD-card builds, whereas this label may contain spaces
+# and must match the GitHub release name exactly. The single quotes keep the
+# entire C string define one shell argument even when RELEASE_LABEL has spaces.
+ifneq ($(RELEASE_LABEL),)
+RELEASE_LABEL_DEFINE = -DAPP_RELEASE_LABEL='"$(RELEASE_LABEL)"'
 endif
 
 # Optional low-overhead timing diagnostics for real-device UI profiling.
@@ -346,16 +354,14 @@ ifneq ($(UI_HITBOX_DEBUG),)
 UI_HITBOX_DEBUG_DEFINE = -DUI_HITBOX_DEBUG=1
 endif
 
-# Always defined (no flag needed) -- the fallback the About screen's
-# version line uses when TEST_BUILD_TAG isn't set, e.g. a real flashed
-# deployment via the user's own repack process rather than an adb-pushed
-# test binary. Re-evaluated (a new $(shell date ...) call) on every
-# `make target` invocation, so it reflects when THIS binary was actually
-# built, not when the Makefile was last edited.
+# Always defined (no flag needed) for the machine-facing build identifier used
+# by plugin.get_app_info() and the bootloader version comparison. Re-evaluated
+# on every `make target` invocation, so it reflects when this binary was built,
+# not when the Makefile was last edited.
 BUILD_STAMP_DEFINE = -DBUILD_STAMP=\"$(shell date +%Y-%m-%d_%H:%M)\"
 
-TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
-TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
 TINYALSA_CFLAGS = -O3 -g -Wall -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 # DBUS_COMPILATION/DBUS_STATIC_BUILD: libdbus's own headers gate some
 # declarations on these (matching how its own build always defines them
@@ -414,7 +420,7 @@ TARGET_LDFLAGS = -static -no-pie -lpthread -lm
 # streaming), library/ (metadata/file browsing/playlists), hardware/ (device
 # control), ui/ (gui/screens/assets/fonts), core/ (settings, subprocess,
 # misc). main.c stays at src/ root as the entry point.
-APP_SRCS = src/main.c src/ui/gui.c src/ui/gui_subsonic.c src/ui/gui_settings.c src/ui/gui_network.c src/ui/gui_theme.c src/ui/gui_notifications.c src/ui/gui_library.c src/ui/gui_queue.c src/ui/gui_player.c src/ui/gui_track_info.c src/ui/gui_plugins.c src/ui/gui_shell.c src/ui/gui_navigation.c src/ui/gui_books.c src/ui/gui_text_input.c src/ui/gui_lyrics.c src/ui/gui_reload.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_conn.c src/network/http_client.c src/network/http_stream.c src/network/subsonic_client.c src/library/cover_decode.c src/library/lyrics.c src/audio/asf_demux.c src/audio/wma_decoder.c src/audio/ogg_demux.c src/audio/opus_decoder.c src/audio/vorbis_decoder.c src/library/cue_parser.c src/ui/fallback_font.c \
+APP_SRCS = src/main.c src/ui/gui.c src/ui/gui_subsonic.c src/ui/gui_settings.c src/ui/gui_network.c src/ui/gui_theme.c src/ui/gui_notifications.c src/ui/gui_library.c src/ui/gui_queue.c src/ui/gui_player.c src/ui/gui_track_info.c src/ui/gui_plugins.c src/ui/gui_shell.c src/ui/gui_navigation.c src/ui/gui_books.c src/ui/gui_text_input.c src/ui/gui_lyrics.c src/ui/gui_reload.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/core/app_version.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_conn.c src/network/http_client.c src/network/http_stream.c src/network/subsonic_client.c src/library/cover_decode.c src/library/lyrics.c src/audio/asf_demux.c src/audio/wma_decoder.c src/audio/ogg_demux.c src/audio/opus_decoder.c src/audio/vorbis_decoder.c src/library/cue_parser.c src/ui/fallback_font.c \
 src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/network/airplay_bridge.c src/network/airplay_metadata.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/hardware/usb_audio_output.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/core/hostname_apply.c src/network/dlna_control.c src/network/remote_control.c src/plugins/plugin_manager.c
 APP_SRCS += src/ui/lyrics_layout.c src/ui/transition_compositor.c
 APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c src/plugins/plugin_disabled_list.c
@@ -504,7 +510,7 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=buil
               $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_target/stb_vorbis/%.o) \
               $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_target/lua/%.o)
 
-.PHONY: all host target bootloader sd_ready_test clean compile_commands.json
+.PHONY: all host target bootloader sd_ready_test clean compile_commands.json FORCE_VERSION
 
 # Default target builds for host simulation and generates compile commands for IDE
 all: host compile_commands.json
@@ -682,6 +688,16 @@ sd_ready_test:
 	./build_target/sd_ready_test
 
 build_target/%.o: src/%.c $(LVGL_PATCH_STAMP)
+	@mkdir -p $(dir $@)
+	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
+
+# A release-label or build-stamp change is a Make variable change, not a source
+# timestamp change. Rebuild this tiny unit every invocation so incremental
+# builds cannot retain an earlier release identity; it also guarantees the
+# bootloader scanner always has one current BUILD_STAMP to find.
+FORCE_VERSION:
+
+build_target/core/app_version.o: src/core/app_version.c $(LVGL_PATCH_STAMP) FORCE_VERSION
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 

@@ -65,4 +65,6 @@ bool gui_library_has_background_work(void);
  * workers such as album-art warming remain background work for shutdown
  * coordination, but must not disable the drawer or screen gestures. */
 bool gui_library_navigation_blocked(void);
+/* Joins UI-pointer-bearing artwork/search jobs before a soft screen rebuild. */
+void gui_library_prepare_for_ui_reload(void);
 void gui_library_cancel_background_work(void);

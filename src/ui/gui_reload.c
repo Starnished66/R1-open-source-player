@@ -10,15 +10,18 @@
  *     slide animation has no such direct cancel path -- gui_reload_request()
  *     refuses to even schedule this function while one is still animating
  *     (see its own comment) rather than trying to tear down mid-transition.
- *  2. reset_swipe_dead_zones() -- every native slider registers itself here
+ *  2. gui_library_prepare_for_ui_reload() joins artwork/search jobs that
+ *     carry pointers into the screens about to be deleted. Database scans
+ *     and SD formatting defer the reload before this sequence begins.
+ *  3. reset_swipe_dead_zones() -- every native slider registers itself here
  *     once at startup and is never expected to unregister (see its own
  *     comment); without clearing it first, the sliders each module's
  *     _teardown() is about to delete would leave point_in_swipe_dead_zone()
  *     dereferencing freed pointers on the next swipe check.
- *  3. gui_navigation_teardown() -- resets the nav stack and destroys its own
+ *  4. gui_navigation_teardown() -- resets the nav stack and destroys its own
  *     snapshot/transition-cache buffers. Does NOT delete any screen itself
  *     (each screen is owned and freed by its own module, right below).
- *  4. Every module's own _teardown(): lv_obj_del()s the screens/popups it
+ *  5. Every module's own _teardown(): lv_obj_del()s the screens/popups it
  *     owns, INCLUDING any recurring lv_timer_t its _init() unconditionally
  *     (re)creates (volume_popup_hide_timer, lyrics_timer, text_entry_
  *     multitap_timer) -- left running, the old (leaked) timer's own
@@ -26,20 +29,20 @@
  *     global variable it reads now points to, instead of the dead one that
  *     actually fired. Order among these modules doesn't matter -- none of
  *     them reference another module's screen directly (only via nav_stack/
- *     snapshot state, already cleared in step 3).
- *  5. lv_image_cache_drop(NULL) -- drops LVGL's entire image+header cache in
+ *     snapshot state, already cleared in step 4).
+ *  6. lv_image_cache_drop(NULL) -- drops LVGL's entire image+header cache in
  *     one call (confirmed via lvgl/src/misc/cache/lv_image_cache.c), so
  *     every icon re-decodes from disk against current theme_overrides/
  *     content once screens are rebuilt below.
- *  6. plugin_manager_deinit() -- drains async HTTP/interval-timer/pending-
+ *  7. plugin_manager_deinit() -- drains async HTTP/interval-timer/pending-
  *     text-input work still referencing a plugin's lua_State, then closes
  *     every plugin's L and zeroes every list-item/tile/callback/event-
  *     subscriber registry. Must run after every screen plugins could have
  *     attached a callback to is already gone (a plugin's on_click callback
  *     firing against a half-torn-down screen would be worse than firing
  *     against none at all).
- *  7. gui_theme_reload_styles() -- resets style globals to this app's own
- *     defaults BEFORE plugins reapply on top in step 8, mirroring gui_
+ *  8. gui_theme_reload_styles() -- resets style globals to this app's own
+ *     defaults BEFORE plugins reapply on top in step 9, mirroring gui_
  *     init()'s own boot order MINUS fallback_font_init_early(): that call
  *     is boot-only (always rebuilds every app_font_* slot with fallback
  *     faces excluded, relying on a separate one-time background load to
@@ -51,15 +54,15 @@
  *     properties allocation the way a bare second lv_style_init() call
  *     would (same fix applied to screen_builders_init_list_row_style()'s
  *     own 9 styles).
- *  8. plugin_manager_init() -- BEFORE any screen is rebuilt, same as real
+ *  9. plugin_manager_init() -- BEFORE any screen is rebuilt, same as real
  *     boot (gui_init() calls it before gui_player_init() etc. too): Books/
  *     Settings/Stream Media read the list-item/tile registries plugin_
  *     manager_init() populates AT BUILD TIME to append plugin-contributed
  *     rows, so calling it after rebuilding those screens (as an earlier
  *     version of this function mistakenly did) would build them with zero
  *     plugin rows every time.
- *  9. Rebuild every screen, same order gui_init() builds them in.
- * 10. gui_navigation_init() -- re-registers the snapshot screens and
+ * 10. Rebuild every screen, same order gui_init() builds them in.
+ * 11. gui_navigation_init() -- re-registers the snapshot screens and
  *     restores nav_stack/nav_depth to Home, loading it. No separate
  *     "restore navigation" step is needed; this already does it.
  *
@@ -142,6 +145,8 @@ void gui_soft_reload(void) {
 
     reload_diag("gui_shell_reset_drag_state: before");
     gui_shell_reset_drag_state();
+    reload_diag("gui_library_prepare_for_ui_reload: before");
+    gui_library_prepare_for_ui_reload();
     reload_diag("reset_swipe_dead_zones: before");
     reset_swipe_dead_zones();
     reload_diag("gui_navigation_teardown: before");
@@ -173,6 +178,7 @@ void gui_soft_reload(void) {
     gui_stream_media_teardown();
     reload_diag("gui_shell_teardown: before");
     gui_shell_teardown();
+    gui_player_release_shared_assets();
 
     reload_diag("lv_image_cache_drop: before");
     lv_image_cache_drop(NULL);
@@ -232,11 +238,12 @@ static uint32_t last_reload_tick = 0;
  * the order of a couple hundred ms, so this converges in a handful of
  * ticks without meaningfully delaying the reload a user is waiting on. */
 #define RELOAD_RETRY_PERIOD_MS 20
+#define RELOAD_BUSY_RETRY_MS 250
 
 /* Minimum gap enforced between the END of one reload and the START of the
  * next -- NOT what stops a plugin that unconditionally calls plugin.
  * reload_ui() from its own top-level script code from looping (that's
- * reload_in_progress below: plugin_manager_init(), step 8 above, re-runs
+ * reload_in_progress below: plugin_manager_init(), step 9 above, re-runs
  * top-level code as part of the SAME reload that's still running, and
  * reload_in_progress drops that nested request outright rather than
  * queuing it, so it costs one wasted extra reload the first time such a
@@ -254,7 +261,13 @@ static uint32_t last_reload_tick = 0;
 #define RELOAD_COOLDOWN_MS 250
 
 static void reload_trigger_cb(lv_timer_t * timer) {
-    if (gui_navigation_transition_in_progress()) return; /* recheck next tick */
+    if (gui_navigation_transition_in_progress()) return;
+    if (gui_library_navigation_blocked()) {
+        /* A database scan can last minutes; polling it at the transition
+         * cadence would waste UI-thread time throughout the scan. */
+        lv_timer_set_period(timer, RELOAD_BUSY_RETRY_MS);
+        return;
+    }
     lv_timer_del(timer);
     reload_scheduled = false;
     /* Set BEFORE gui_soft_reload(), not after -- plugin_manager_init()

@@ -96,6 +96,9 @@ static lv_obj_t * volume_popup_track = NULL;
 static lv_obj_t * volume_popup_speaker_icon = NULL;
 static lv_timer_t * volume_popup_hide_timer = NULL;
 static const lv_image_dsc_t * volume_cursor_image = NULL;
+static const lv_image_dsc_t * progress_bg_image = NULL;
+static const lv_image_dsc_t * progress_fill_image = NULL;
+static const lv_image_dsc_t * progress_cursor_image = NULL;
 static asset_decoded_image_t volume_popup_bg_image;
 static asset_decoded_image_t volume_popup_speaker_image;
 static lv_obj_t * delete_song_popup = NULL;
@@ -1881,12 +1884,12 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_align(progress_slider, LV_ALIGN_TOP_MID, 0, 0);
     lv_slider_set_range(progress_slider, 0, 100);
     lv_slider_set_value(progress_slider, 0, LV_ANIM_OFF);
-    const lv_image_dsc_t * progress_bg_mem = asset_png_memory("playing_plane/progress_bg.png");
-    const lv_image_dsc_t * progress_mem = asset_png_memory("playing_plane/progress.png");
-    const lv_image_dsc_t * cursor_mem = asset_png_memory("playing_plane/cursor.png");
-    lv_obj_set_style_bg_image_src(progress_slider, progress_bg_mem ? (const void *) progress_bg_mem : asset_path("playing_plane/progress_bg.png"), LV_PART_MAIN);
-    lv_obj_set_style_bg_image_src(progress_slider, progress_mem ? (const void *) progress_mem : asset_path("playing_plane/progress.png"), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_image_src(progress_slider, cursor_mem ? (const void *) cursor_mem : asset_path("playing_plane/cursor.png"), LV_PART_KNOB);
+    progress_bg_image = asset_png_memory("playing_plane/progress_bg.png");
+    progress_fill_image = asset_png_memory("playing_plane/progress.png");
+    progress_cursor_image = asset_png_memory("playing_plane/cursor.png");
+    lv_obj_set_style_bg_image_src(progress_slider, progress_bg_image ? (const void *) progress_bg_image : asset_path("playing_plane/progress_bg.png"), LV_PART_MAIN);
+    lv_obj_set_style_bg_image_src(progress_slider, progress_fill_image ? (const void *) progress_fill_image : asset_path("playing_plane/progress.png"), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_image_src(progress_slider, progress_cursor_image ? (const void *) progress_cursor_image : asset_path("playing_plane/cursor.png"), LV_PART_KNOB);
     /* Real-device bug report: accent color didn't apply here -- see
      * apply_accent_color()'s own comment on why an image-art slider needs
      * bg_image_recolor, not just bg_color. */
@@ -3385,7 +3388,6 @@ void gui_player_teardown(void) {
     volume_popup_speaker_icon = NULL;
     asset_decoded_image_close(&volume_popup_bg_image);
     asset_decoded_image_close(&volume_popup_speaker_image);
-    volume_cursor_image = NULL;
     volume_popup_track = NULL;
     if (delete_song_popup) { lv_obj_del(delete_song_popup); delete_song_popup = NULL; }
     if (delete_song_popup_backdrop) { lv_obj_del(delete_song_popup_backdrop); delete_song_popup_backdrop = NULL; }
@@ -3393,7 +3395,18 @@ void gui_player_teardown(void) {
     if (more_menu_popup_backdrop) { lv_obj_del(more_menu_popup_backdrop); more_menu_popup_backdrop = NULL; }
     gui_track_info_teardown();
     if (player_screen) { lv_obj_del(player_screen); player_screen = NULL; }
+    asset_png_memory_free(progress_bg_image); progress_bg_image = NULL;
+    asset_png_memory_free(progress_fill_image); progress_fill_image = NULL;
+    asset_png_memory_free(progress_cursor_image); progress_cursor_image = NULL;
     volume_slider = NULL;
+}
+
+/* The volume cursor is shared by gui_player's popup and gui_shell's quick
+ * drawer. Release it only after both modules have deleted their objects;
+ * gui_soft_reload() calls this at that exact boundary. */
+void gui_player_release_shared_assets(void) {
+    asset_png_memory_free(volume_cursor_image);
+    volume_cursor_image = NULL;
 }
 
 void gui_player_refresh_static_assets(void) {

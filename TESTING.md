@@ -8,6 +8,16 @@ launch, initially misread as a crash in the app under test.
 
 ## Remaining real-device regression tests
 
+- [ ] **Batch plugin disable followed by database update stays bounded:**
+  open Settings -> System -> Plugins, toggle at least eight plugins without
+  leaving the screen, and confirm the UI does not reload between toggles.
+  Tap Apply Plugin Changes (and repeat the batch several times), then run
+  Update Music Database. Confirm only one reload occurs per batch, RSS does
+  not rise cumulatively across batches, the scan reaches completion, and no
+  artwork helper/thumbnail decoder overlaps a metadata parser child. Repeat
+  using swipe-back instead of Apply to cover the automatic apply-on-leave
+  path.
+
 - [ ] **Plugin watchdog preserves native work without becoming bypassable:**
   load a test plugin whose callback runs `while true do plugin.sd_root() end`
   and confirm it is aborted after roughly two seconds of cumulative Lua

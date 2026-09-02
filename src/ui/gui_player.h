@@ -30,6 +30,8 @@ void hide_more_menu_popup(void);
 
 void configure_native_slider_rail(lv_obj_t * slider);
 const lv_image_dsc_t * gui_player_volume_cursor_image(void);
+/* Call only after both gui_player_teardown() and gui_shell_teardown(). */
+void gui_player_release_shared_assets(void);
 void cycle_play_mode(void);
 void gui_player_set_play_mode(int mode);
 void resolve_replaygain(const track_metadata_t * meta, bool * out_has_gain, double * out_gain_db, bool * out_has_peak, double * out_peak);

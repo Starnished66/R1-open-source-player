@@ -39,6 +39,30 @@ void assets_init(void) {
     lv_fs_memfs_init();
 }
 
+typedef struct asset_path_entry {
+    struct asset_path_entry * next;
+    char value[];
+} asset_path_entry_t;
+
+static asset_path_entry_t * asset_paths;
+
+/* LVGL keeps raw path pointers in some styles. Intern the fully resolved
+ * value so the pointer remains stable without leaking another strdup on
+ * every soft UI rebuild. The set is bounded by native asset names times
+ * the two possible roots (stock/override), not by reload count. */
+static const char * asset_path_intern(const char * value) {
+    for (asset_path_entry_t * e = asset_paths; e; e = e->next) {
+        if (strcmp(e->value, value) == 0) return e->value;
+    }
+    size_t len = strlen(value);
+    asset_path_entry_t * e = malloc(sizeof(*e) + len + 1);
+    if (!e) return NULL;
+    memcpy(e->value, value, len + 1);
+    e->next = asset_paths;
+    asset_paths = e;
+    return e->value;
+}
+
 const char * asset_path(const char * relative_path) {
     char buf[320];
 #ifndef HOST_BUILD
@@ -49,21 +73,11 @@ const char * asset_path(const char * relative_path) {
     snprintf(buf, sizeof(buf), THEME_OVERRIDE_ROOT "%s", relative_path);
     if (access(buf, R_OK) == 0) {
         snprintf(buf, sizeof(buf), "S:" THEME_OVERRIDE_ROOT "%s", relative_path);
-        return strdup(buf);
+        return asset_path_intern(buf);
     }
 #endif
     snprintf(buf, sizeof(buf), "S:" THEME_ROOT "%s", relative_path);
-    /* Heap-allocated fresh on every call, deliberately never freed here --
-     * some callers (lv_image_set_src) copy the string themselves, but
-     * others (lv_obj_set_style_bg_image_src) just store the raw pointer, so
-     * a single reused static buffer would go stale under them (confirmed:
-     * every touch_list row ended up showing whatever the *last* asset_path()
-     * call anywhere in the app had written, once rendering caught up with
-     * construction). Screens are built once and live for the process's
-     * lifetime, same as the rest of this UI's per-tile/per-row context
-     * structs, so the bounded, one-time leak per image reference is the
-     * same accepted tradeoff already made elsewhere in this codebase. */
-    return strdup(buf);
+    return asset_path_intern(buf);
 }
 
 const char * asset_path_plain(const char * relative_path) {
@@ -71,7 +85,7 @@ const char * asset_path_plain(const char * relative_path) {
 #ifndef HOST_BUILD
     snprintf(buf, sizeof(buf), THEME_OVERRIDE_ROOT "%s", relative_path);
     if (access(buf, R_OK) == 0) {
-        return strdup(buf);
+        return asset_path_intern(buf);
     }
     snprintf(buf, sizeof(buf), THEME_ROOT "%s", relative_path);
 #else
@@ -90,7 +104,7 @@ const char * asset_path_plain(const char * relative_path) {
         snprintf(buf, sizeof(buf), THEME_ROOT "%s", relative_path);
     }
 #endif
-    return strdup(buf); /* same heap-allocated-and-never-freed tradeoff as asset_path() above */
+    return asset_path_intern(buf);
 }
 
 const lv_image_dsc_t * asset_png_memory(const char * relative_path) {
@@ -115,11 +129,18 @@ const lv_image_dsc_t * asset_png_memory(const char * relative_path) {
     return dsc;
 }
 
+void asset_png_memory_free(const lv_image_dsc_t * image) {
+    if (!image) return;
+    free((void *) image->data);
+    free((void *) image);
+}
+
 bool asset_decoded_image_open(asset_decoded_image_t * image, const char * relative_path) {
     if (!image || !relative_path) return false;
     asset_decoded_image_close(image);
 
-    image->path = (char *) asset_path(relative_path);
+    const char * resolved = asset_path(relative_path);
+    image->path = resolved ? strdup(resolved) : NULL;
     if (!image->path) return false;
 
     lv_image_decoder_args_t args = { .no_cache = true };

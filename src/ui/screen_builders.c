@@ -392,6 +392,19 @@ typedef struct {
     const char * selected_path;
 } icon_tile_press_ctx_t;
 
+typedef struct {
+    int32_t cols[3];
+    int32_t rows[ICON_GRID_MAX_ROWS + 1];
+} icon_grid_dsc_ctx_t;
+
+static void heap_ctx_delete_cb(lv_event_t * e) {
+    free(lv_event_get_user_data(e));
+}
+
+static void lv_heap_ctx_delete_cb(lv_event_t * e) {
+    lv_free(lv_event_get_user_data(e));
+}
+
 static void icon_tile_press_event_cb(lv_event_t * e) {
     icon_tile_press_ctx_t * ctx = (icon_tile_press_ctx_t *) lv_event_get_user_data(e);
     lv_event_code_t code = lv_event_get_code(e);
@@ -440,22 +453,23 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
     int col_count = 2;
     int row_count = (item_count + col_count - 1) / col_count;
 
-    /* Heap-allocated (never freed) rather than static -- lv_obj_set_grid_dsc_array()
-     * below stores the pointer, not a copy, and this function is called once
-     * per icon-grid screen (Music, Stream Media, Wireless, Home, ...). A
+    /* Per-grid rather than static -- lv_obj_set_grid_dsc_array() below
+     * stores the pointer, not a copy. A
      * static array here would mean every later call overwrites the same
      * memory a still-alive earlier grid's dsc pointer refers to -- harmless
      * back when every row was LV_GRID_FR(1) (any screen's overwrite was a
      * no-op), but once rows became per-screen fixed pixel heights (see
      * ICON_GRID_REFERENCE_ROWS above) this silently corrupted every
      * previously-built grid's row heights to whichever screen was built
-     * last (Home), confirmed on real hardware and via lv_refr_now()
-     * before/after checks: Music's own row height read back correctly
-     * right after being built, then changed to Home's the moment a real
-     * redraw ran after all screens existed. Same pattern applies to every
-     * other per-widget context struct in this codebase that's deliberately
-     * never freed (screens live for the process's lifetime). */
-    int32_t * col_dsc = lv_malloc(3 * sizeof(int32_t));
+     * last (Home). The owning grid frees this context on LV_EVENT_DELETE so
+     * a soft UI reload does not retain one descriptor set per old screen. */
+    icon_grid_dsc_ctx_t * grid_dsc = lv_malloc(sizeof(*grid_dsc));
+    if (!grid_dsc) {
+        fprintf(stderr, "[screen_builders] out of memory building icon grid '%s'\n",
+                title ? title : "Home");
+        return scr; /* valid header-only screen is safer than a NULL screen */
+    }
+    int32_t * col_dsc = grid_dsc->cols;
     col_dsc[0] = LV_GRID_FR(1);
     col_dsc[1] = LV_GRID_FR(1);
     col_dsc[2] = LV_GRID_TEMPLATE_LAST;
@@ -481,11 +495,12 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
      * just stretched across fewer, oversized cells. */
     int32_t row_h = (scr_h - header_h) / ICON_GRID_REFERENCE_ROWS;
 
-    int32_t * row_dsc = lv_malloc((ICON_GRID_MAX_ROWS + 1) * sizeof(int32_t));
+    int32_t * row_dsc = grid_dsc->rows;
     for (int r = 0; r < row_count && r < ICON_GRID_MAX_ROWS; r++) row_dsc[r] = row_h;
     row_dsc[row_count < ICON_GRID_MAX_ROWS ? row_count : ICON_GRID_MAX_ROWS] = LV_GRID_TEMPLATE_LAST;
 
     lv_obj_t * grid = lv_obj_create(scr);
+    lv_obj_add_event_cb(grid, lv_heap_ctx_delete_cb, LV_EVENT_DELETE, grid_dsc);
     lv_obj_set_size(grid, lv_pct(100), row_count * row_h);
     lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, header_h);
     lv_obj_set_style_bg_opa(grid, 0, 0);
@@ -654,12 +669,15 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
 
         if (item->icon_asset_selected) {
             icon_tile_press_ctx_t * ctx = malloc(sizeof(icon_tile_press_ctx_t));
-            ctx->img = img;
-            ctx->normal_path = item->icon_asset;
-            ctx->selected_path = item->icon_asset_selected;
-            lv_obj_add_event_cb(tile, icon_tile_press_event_cb, LV_EVENT_PRESSED, ctx);
-            lv_obj_add_event_cb(tile, icon_tile_press_event_cb, LV_EVENT_RELEASED, ctx);
-            lv_obj_add_event_cb(tile, icon_tile_press_event_cb, LV_EVENT_PRESS_LOST, ctx);
+            if (ctx) {
+                ctx->img = img;
+                ctx->normal_path = item->icon_asset;
+                ctx->selected_path = item->icon_asset_selected;
+                lv_obj_add_event_cb(tile, icon_tile_press_event_cb, LV_EVENT_PRESSED, ctx);
+                lv_obj_add_event_cb(tile, icon_tile_press_event_cb, LV_EVENT_RELEASED, ctx);
+                lv_obj_add_event_cb(tile, icon_tile_press_event_cb, LV_EVENT_PRESS_LOST, ctx);
+                lv_obj_add_event_cb(tile, heap_ctx_delete_cb, LV_EVENT_DELETE, ctx);
+            }
         }
 
         if (item->on_click) lv_obj_add_event_cb(tile, item->on_click, LV_EVENT_CLICKED, item->user_data);

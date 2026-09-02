@@ -20,10 +20,27 @@
 
 static plugin_available_entry_t manage_entries[PLUGIN_MANAGE_MAX_ROWS];
 static int manage_entry_count = 0;
+static bool manage_changes_dirty = false;
+
+static void plugin_manage_apply_changes(void) {
+    if (!manage_changes_dirty) return;
+    /* Clear first: deleting the active management screen during the reload
+     * emits SCREEN_UNLOADED, which must not schedule a second reload. */
+    manage_changes_dirty = false;
+    gui_reload_request();
+}
 
 static void plugin_manage_reload_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    gui_reload_request();
+    plugin_manage_apply_changes();
+}
+
+static void plugin_manage_screen_unloaded_cb(lv_event_t * e) {
+    (void) e;
+    /* Back button, swipe-back, and Home all converge here. Persist each
+     * toggle immediately, but rebuild the UI only once after the user has
+     * finished changing the set. */
+    plugin_manage_apply_changes();
 }
 
 /* Reuses the exact reload path plugin.reload_ui() already uses -- see
@@ -45,7 +62,8 @@ static void plugin_manage_toggle_cb(lv_event_t * e) {
     bool enabled_now = lv_obj_has_state(toggle_img, LV_STATE_CHECKED);
 
     if (plugin_disabled_list_set(manage_entries[index].filename, !enabled_now)) {
-        gui_reload_request();
+        manage_entries[index].disabled = !enabled_now;
+        manage_changes_dirty = true;
         return;
     }
 
@@ -67,7 +85,7 @@ lv_obj_t * gui_plugin_manage_build_screen(void) {
     manage_entry_count = plugin_manager_scan_available(manage_entries, PLUGIN_MANAGE_MAX_ROWS);
 
     static pill_list_item_t items[1 + PLUGIN_MANAGE_MAX_ROWS];
-    items[0] = (pill_list_item_t){ "Reload Plugins", PILL_ACCESSORY_NONE, false,
+    items[0] = (pill_list_item_t){ "Apply Plugin Changes", PILL_ACCESSORY_NONE, false,
                                     plugin_manage_reload_row_cb, NULL, NULL };
     int count = 1;
     for (int i = 0; i < manage_entry_count; i++) {
@@ -80,6 +98,7 @@ lv_obj_t * gui_plugin_manage_build_screen(void) {
 
     lv_obj_t * scr = build_pill_list_screen("Manage Plugins", generic_back_cb, items, count,
                                              gui_theme_accent_style(), 6);
+    lv_obj_add_event_cb(scr, plugin_manage_screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }

@@ -1807,6 +1807,30 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
     if (!album_thumbnail_active) lv_timer_pause(timer);
 }
 
+/* UI reloads and database replacement both invalidate every list pointer
+ * carried by the lazy artwork request. Stop the warmer first, then join the
+ * single visible-row decoder before any screen or DB generation is torn
+ * down. Both paths are cooperatively bounded by the artwork timeout. */
+static void quiesce_album_artwork_workers(void) {
+    cancel_album_thumbnail_generation();
+    reap_album_thumbnail_generation();
+
+    album_thumbnail_generation++;
+    album_thumbnail_queue_count = 0;
+    album_thumbnail_active_list = NULL;
+    atomic_store(&album_thumbnail_screen_active, false);
+
+    if (album_thumbnail_active) {
+        pthread_join(album_thumbnail_thread, NULL);
+        album_thumbnail_active = false;
+    }
+    atomic_store(&album_thumbnail_done, false);
+    free(album_thumbnail_result_pixels);
+    album_thumbnail_result_pixels = NULL;
+    album_thumbnail_result_list = NULL;
+    if (album_thumbnail_poll_timer) lv_timer_pause(album_thumbnail_poll_timer);
+}
+
 static void album_row_thumbnail_decorator(lv_obj_t * list, lv_obj_t * row, lv_obj_t * image,
                                            int logical_index, int pool_slot, int64_t song_id, void * ctx) {
     (void) pool_slot; (void) ctx;
@@ -3292,14 +3316,10 @@ void start_library_rescan(void) {
     if (library_rescan_active) return;
     TEST_DIAG("DB", "rescan_requested existing_songs=%lld rss_kb=%ld",
               (long long) metadata_db_get_song_count(), test_diag_rss_kb());
-    /* A previous scan's own post-scan thumbnail-generation pass (Task 2)
-     * might still be running -- signal it to stop now rather than let it
-     * keep working against data this new scan is about to make stale.
-     * Non-blocking: whichever call eventually starts the NEXT generation
-     * pass (including this new scan's own completion, a few seconds from
-     * now) is what actually pthread_join()s it -- see start_album_
-     * thumbnail_generation()'s own comment. */
-    cancel_album_thumbnail_generation();
+    /* A metadata parser child is already a meaningful peak on this 56 MiB
+     * target. Do not overlap it with a previous warmer or lazy cover decode;
+     * cancellation is cooperative and bounded by the artwork timeout. */
+    quiesce_album_artwork_workers();
     atomic_store_explicit(&library_rescan_done_flag, false, memory_order_relaxed);
     library_rescan_active = true;
     library_rescan_token = gui_busy_show("Updating\nmusic database...", "");
@@ -5246,16 +5266,26 @@ bool gui_library_navigation_blocked(void) {
     return library_rescan_active || library_rescan_success_pending || sd_format_active;
 }
 
+void gui_library_prepare_for_ui_reload(void) {
+    quiesce_album_artwork_workers();
+
+    if (search_debounce_timer) lv_timer_pause(search_debounce_timer);
+    search_job_pending_valid = false;
+    if (search_job_active) {
+        pthread_join(search_job_thread, NULL);
+        search_job_active = false;
+    }
+    atomic_store_explicit(&search_job_done_flag, false, memory_order_relaxed);
+    search_job_for_binding = NULL;
+    search_job_pending_binding = NULL;
+}
+
 void gui_library_cancel_background_work(void) {
-    cancel_album_thumbnail_generation();
+    quiesce_album_artwork_workers();
     if (library_rescan_active) {
         pthread_join(library_rescan_thread, NULL);
         library_rescan_active = false;
         gui_busy_hide(library_rescan_token);
-    }
-    if (album_thumbnail_active) {
-        pthread_join(album_thumbnail_thread, NULL);
-        album_thumbnail_active = false;
     }
     if (sd_format_active) {
         pthread_join(sd_format_thread, NULL);

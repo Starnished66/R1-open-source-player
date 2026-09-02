@@ -617,9 +617,12 @@ error, since there's no reasonable non-table `options`):
                     -- set_home_layout() change needs one to take visible
                     -- effect. LVGL draws a bg_image at native size, CENTERED,
                     -- never stretched to fill -- author the file at exactly
-                    -- the panel's own resolution (480x320 on R1) rather than
-                    -- relying on any scale-to-fit. Raises a Lua error if the
-                    -- file isn't .png/.jpg/.jpeg or can't be read.
+                    -- the panel's own full-screen resolution (480x800 on
+                    -- R1 -- confirmed in main.c's own SCREEN_WIDTH/
+                    -- SCREEN_HEIGHT; 480x320 is a specific sub-panel
+                    -- elsewhere in the UI, not the whole screen) rather
+                    -- than relying on any scale-to-fit. Raises a Lua error
+                    -- if the file isn't .png/.jpg/.jpeg or can't be read.
     order = { "dac", "music", "stream_media", "wireless", "books", "settings" },
                     -- optional (API 7+); which tiles Home shows, and in what
                     -- position -- position IS order. Each entry is a native

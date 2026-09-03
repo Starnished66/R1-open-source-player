@@ -1820,7 +1820,7 @@ It also demonstrates the success/busy return contract of `show_text_input()`.
 2. Optionally run `luac -p MyPlugin.lua` to catch syntax errors locally.
 3. Copy it to `<SD card>/.plugins/`.
 4. Either restart the player, or open Settings -> System -> Plugins and tap
-   "Apply Plugin Changes" to pick up the new/edited file without restarting (same
+   "Refresh Plugins" to pick up the new/edited file without restarting (same
    full reload `plugin.reload_ui()` itself triggers -- every other loaded
    plugin's top-level code re-runs too, and navigation lands back on Home).
    That screen also has a per-plugin on/off toggle. **The toggle only

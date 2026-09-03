@@ -32,7 +32,22 @@ static void plugin_manage_apply_changes(void) {
 
 static void plugin_manage_reload_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    plugin_manage_apply_changes();
+    /* Real-device bug report: this row gave no feedback when tapped --
+     * worse, going through plugin_manage_apply_changes() made it a
+     * complete no-op whenever nothing had been toggled yet, since that
+     * function only exists to gate the automatic apply-on-leave path
+     * below. Renamed "Apply Plugin Changes" -> "Refresh Plugins" to match
+     * what actually happens: plugin_manager_init() re-scans .plugins/ from
+     * disk every time it runs (see its own opendir()/readdir() loop), so
+     * this is useful even with no toggle changed, e.g. right after copying
+     * a new plugin file onto the SD card -- a manual tap here always
+     * refreshes. The toast (built once at boot on lv_layer_top(), never
+     * torn down by a soft reload -- see gui_reload.c's own comment on what
+     * it deliberately never touches) survives the screen rebuild this
+     * triggers, so it's still visible once the reload lands. */
+    manage_changes_dirty = false;
+    show_info_toast("Refreshing plugins...");
+    gui_reload_request();
 }
 
 static void plugin_manage_screen_unloaded_cb(lv_event_t * e) {
@@ -85,7 +100,7 @@ lv_obj_t * gui_plugin_manage_build_screen(void) {
     manage_entry_count = plugin_manager_scan_available(manage_entries, PLUGIN_MANAGE_MAX_ROWS);
 
     static pill_list_item_t items[1 + PLUGIN_MANAGE_MAX_ROWS];
-    items[0] = (pill_list_item_t){ "Apply Plugin Changes", PILL_ACCESSORY_NONE, false,
+    items[0] = (pill_list_item_t){ "Refresh Plugins", PILL_ACCESSORY_NONE, false,
                                     plugin_manage_reload_row_cb, NULL, NULL };
     int count = 1;
     for (int i = 0; i < manage_entry_count; i++) {

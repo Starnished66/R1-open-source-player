@@ -117,3 +117,4 @@ void gui_player_poll_confirmed_playback(void);
 
 void gui_player_sync_topbar_visibility(lv_obj_t * screen);
 lv_obj_t * gui_player_get_dismiss_btn(void);
+const lv_image_dsc_t * gui_player_get_current_cover_dsc(void);

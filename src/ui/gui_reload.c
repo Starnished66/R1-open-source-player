@@ -101,6 +101,7 @@
 #include "gui_plugins.h"
 #include "plugin_manager.h"
 #include "gui_plugin_manage.h"
+#include "gui_lock_screen.h"
 
 /* Temporary investigation instrumentation for the "applying Wavy crashed
  * the device" report -- a real, reproducible SIGSEGV inside musl's free()
@@ -168,6 +169,8 @@ void gui_soft_reload(void) {
     gui_settings_teardown();
     reload_diag("gui_plugin_manage_teardown: before");
     gui_plugin_manage_teardown();
+    reload_diag("gui_lock_screen_teardown: before");
+    gui_lock_screen_teardown();
     reload_diag("gui_books_teardown: before");
     gui_books_teardown();
     reload_diag("gui_queue_teardown: before");
@@ -212,6 +215,8 @@ void gui_soft_reload(void) {
     gui_settings_init();
     reload_diag("gui_plugin_manage_init: before");
     gui_plugin_manage_init();
+    reload_diag("gui_lock_screen_init: before");
+    gui_lock_screen_init();
     reload_diag("gui_books_init: before");
     gui_books_init();
     reload_diag("build_power_off_countdown_popup: before");

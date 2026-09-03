@@ -147,6 +147,8 @@ void screen_builders_init_list_row_style(void) {
      * quick tap, not just a held press. */
     lv_style_init(&list_row_pressed_style);
     lv_style_set_bg_color(&list_row_pressed_style, lv_color_make(60, 60, 64));
+    lv_style_set_bg_image_recolor(&list_row_pressed_style, lv_color_make(255, 255, 255));
+    lv_style_set_bg_image_recolor_opa(&list_row_pressed_style, LV_OPA_30);
 
     /* Real-device bug report: the player screen's icon buttons (favorite,
      * play mode order, more-menu) gave no feedback at all on touch, unlike
@@ -1083,6 +1085,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
 
             if (item->on_click) {
                 lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
                 lv_obj_add_event_cb(row, item->on_click, LV_EVENT_CLICKED, item->user_data);
             }
         }

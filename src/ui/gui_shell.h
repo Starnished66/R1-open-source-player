@@ -75,6 +75,11 @@ void gui_shell_reset_drag_state(void);
  * slide_transition_anim_x_cb() again with a freed ctx. */
 void gui_shell_player_swipe_recover(void * ctx);
 void gui_shell_install_indev_hooks(lv_indev_t * indev);
+/* Not just lv_indev_get_next(NULL) -- the host simulator also registers a
+ * keyboard indev, so which one enumerates first isn't guaranteed. Shared by
+ * every raw-touch-polling timer in this codebase -- see the .c definition's
+ * own comment. */
+lv_indev_t * find_pointer_indev(void);
 
 bool gui_shell_has_background_work(void);
 void gui_shell_cancel_background_work(void);

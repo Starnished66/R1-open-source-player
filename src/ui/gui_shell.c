@@ -12,6 +12,7 @@
 #include "gui_lyrics.h"
 #include "gui_track_info.h"
 #include "gui_navigation.h"
+#include "gui_lock_screen.h"
 #include "gesture_detector.h"
 #include "screen_builders.h"
 #include "transition_compositor.h"
@@ -298,7 +299,8 @@ void sync_player_topbar_visibility(lv_obj_t * screen) {
      * can't be trusted for it) is handled independently by
      * build_flattened_transition_frame()'s own temporary-flag-then-restore
      * approach, not by this function. */
-    bool hide = current_settings.hide_player_topbar && (screen == gui_player_get_screen() || screen == gui_lyrics_get_screen());
+    bool hide = (current_settings.hide_player_topbar && (screen == gui_player_get_screen() || screen == gui_lyrics_get_screen())) ||
+                screen == gui_lock_screen_get_screen();
     if (status_bar_band) {
         gui_shell_set_status_bar_screen_context(screen);
         if (hide) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
@@ -2103,6 +2105,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     home_cfg.is_bt_dac_overlay = (lv_screen_active() == gui_network_get_bt_dac_overlay());
     home_cfg.is_usb_dac_overlay = (lv_screen_active() == gui_network_get_usb_dac_overlay());
     home_cfg.is_lyrics_screen = (lv_screen_active() == gui_lyrics_get_screen());
+    home_cfg.is_lock_screen = (lv_screen_active() == gui_lock_screen_get_screen());
     home_cfg.has_background_work = gui_library_navigation_blocked();
     home_cfg.screen_height = h;
     /* Slightly expand only the raw press-down target. The overlay band and
@@ -2129,7 +2132,8 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         } else if (quick_drawer_open) {
             quick_drawer_drag_tracking = true;
             quick_drawer_drag_panel_start_y = quick_drawer_motion_y();
-        } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !gui_library_navigation_blocked()) {
+        } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !gui_library_navigation_blocked() &&
+                   lv_screen_active() != gui_lock_screen_get_screen()) {
             /* gui_library_navigation_blocked() only covers modal library
              * operations that own the active screen. Optional artwork/search
              * workers must not disable normal navigation. This only blocks a NEW open-drag;
@@ -2183,6 +2187,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                                   lv_screen_active() != gui_player_get_screen() &&
                                   lv_screen_active() != gui_lyrics_get_screen() &&
                                   lv_screen_active() != gui_track_info_get_screen() &&
+                                  lv_screen_active() != gui_lock_screen_get_screen() &&
                                   !gui_library_navigation_blocked() &&
                                   !player_swipe_press_excluded(p);
         player_swipe_touch_start_x = p.x;

@@ -1,6 +1,7 @@
 #include "plugin_manager.h"
 #include "gui.h"
 #include "gui_reload.h"
+#include "gui_lock_screen.h"
 #include "peq.h"
 #include "audio.h"
 #include "http_client.h"
@@ -3120,6 +3121,7 @@ typedef enum {
     PLUGIN_EVENT_PAUSED,
     PLUGIN_EVENT_RESUMED,
     PLUGIN_EVENT_STOPPED,
+    PLUGIN_EVENT_SCREEN_WOKE,
     PLUGIN_EVENT_COUNT,
 } plugin_event_t;
 
@@ -3140,7 +3142,8 @@ static int l_plugin_on(lua_State * L) {
     else if (strcmp(event, "paused") == 0) idx = PLUGIN_EVENT_PAUSED;
     else if (strcmp(event, "resumed") == 0) idx = PLUGIN_EVENT_RESUMED;
     else if (strcmp(event, "stopped") == 0) idx = PLUGIN_EVENT_STOPPED;
-    else return luaL_error(L, "plugin.on: unknown event '%s' (expected \"track_started\", \"paused\", \"resumed\", or \"stopped\")", event);
+    else if (strcmp(event, "screen_woke") == 0) idx = PLUGIN_EVENT_SCREEN_WOKE;
+    else return luaL_error(L, "plugin.on: unknown event '%s' (expected \"track_started\", \"paused\", \"resumed\", \"stopped\", or \"screen_woke\")", event);
 
     if (plugin_event_subscriber_count[idx] >= PLUGIN_MAX_EVENT_SUBSCRIBERS) {
         return luaL_error(L, "plugin.on: too many subscribers registered for \"%s\" (max %d)", event,
@@ -3204,6 +3207,85 @@ static int l_plugin_clear_interval(lua_State * L) {
     plugin_intervals[slot].L = NULL;
     gui_plugin_clear_interval(slot);
     return 0;
+}
+
+static int l_plugin_show_lock_screen(lua_State * L) {
+    if (!lua_istable(L, 1)) {
+        lua_pushboolean(L, false);
+        lua_pushliteral(L, "options must be a table");
+        return 2;
+    }
+
+    lua_getfield(L, 1, "mode");
+    const char * mode_str = lua_tostring(L, -1);
+    gui_lock_screen_options_t opts;
+    memset(&opts, 0, sizeof(opts));
+
+    if (!mode_str) {
+        lua_pop(L, 1);
+        lua_pushboolean(L, false);
+        lua_pushliteral(L, "missing mode");
+        return 2;
+    }
+
+    if (strcmp(mode_str, "album_art") == 0) {
+        opts.mode = LOCK_SCREEN_MODE_ALBUM_ART;
+    } else if (strcmp(mode_str, "image") == 0) {
+        opts.mode = LOCK_SCREEN_MODE_IMAGE;
+    } else if (strcmp(mode_str, "clock") == 0) {
+        opts.mode = LOCK_SCREEN_MODE_CLOCK;
+    } else {
+        lua_pop(L, 1);
+        lua_pushboolean(L, false);
+        lua_pushliteral(L, "invalid mode (expected 'album_art', 'image', or 'clock')");
+        return 2;
+    }
+    lua_pop(L, 1);
+
+    if (opts.mode == LOCK_SCREEN_MODE_IMAGE) {
+        lua_getfield(L, 1, "image_path");
+        const char * path = lua_tostring(L, -1);
+        /* Checked BEFORE access() -- access() validates whatever the caller
+         * actually passed, but the real copy below is bounded to
+         * sizeof(opts.image_path); without this check a path >= that size
+         * would pass access() against the real file and then get silently
+         * truncated by snprintf() into a different (or nonexistent) path,
+         * while this function still reports success to Lua. */
+        if (!path || strlen(path) >= sizeof(opts.image_path)) {
+            lua_pop(L, 1);
+            lua_pushboolean(L, false);
+            lua_pushliteral(L, "image_path missing or too long");
+            return 2;
+        }
+        if (access(path, R_OK) != 0) {
+            lua_pop(L, 1);
+            lua_pushboolean(L, false);
+            lua_pushliteral(L, "image_path inaccessible or not readable");
+            return 2;
+        }
+        snprintf(opts.image_path, sizeof(opts.image_path), "%s", path);
+        lua_pop(L, 1);
+    }
+
+    lua_getfield(L, 1, "clock_24h");
+    if (lua_isboolean(L, -1)) {
+        opts.clock_24h = lua_toboolean(L, -1);
+    } else {
+        /* No explicit override -- match the device's own 12/24-hour Display
+         * setting rather than silently forcing 24-hour, so the lock screen's
+         * clock doesn't visibly disagree with the status bar/Settings
+         * screen. */
+        opts.clock_24h = current_settings.clock_24h;
+    }
+    lua_pop(L, 1);
+
+    bool ok = gui_lock_screen_show(&opts);
+    lua_pushboolean(L, ok);
+    if (!ok) {
+        lua_pushliteral(L, "failed to show lock screen");
+        return 2;
+    }
+    return 1;
 }
 
 static bool plugin_id_is_valid(const char * id) {
@@ -3285,7 +3367,7 @@ static const char * const plugin_capabilities[] = {
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
     "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
     "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles", "ui.launcher_layout",
-    "ui.home_background", "audio.hw_volume_curve"
+    "ui.home_background", "audio.hw_volume_curve", "ui.lock_screen"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -3530,6 +3612,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "on",                        l_plugin_on },
     { "set_interval",              l_plugin_set_interval },
     { "clear_interval",            l_plugin_clear_interval },
+    { "show_lock_screen",          l_plugin_show_lock_screen },
     { NULL, NULL }
 };
 
@@ -4700,6 +4783,10 @@ void plugin_manager_notify_resumed(void) {
 
 void plugin_manager_notify_stopped(void) {
     notify_event_no_args(PLUGIN_EVENT_STOPPED, "stopped");
+}
+
+void plugin_manager_notify_screen_woke(void) {
+    notify_event_no_args(PLUGIN_EVENT_SCREEN_WOKE, "screen_woke");
 }
 
 void plugin_manager_interval_fired(int slot) {

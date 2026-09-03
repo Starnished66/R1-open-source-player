@@ -11,6 +11,7 @@
 #include "gui_lyrics.h"
 #include "gui_shell.h"
 #include "gui_books.h"
+#include "gui_lock_screen.h"
 #include "screen_builders.h"
 #include "metadata.h"
 #include "audio.h"
@@ -407,7 +408,8 @@ static bool slide_transition_active = false;
 static void sync_home_indicator_visibility(lv_obj_t * screen) {
     gui_shell_set_home_indicator_visible(current_settings.swipe_up_home_enabled &&
                                          screen != gui_shell_get_home_screen() &&
-                                         screen != gui_lyrics_get_screen());
+                                         screen != gui_lyrics_get_screen() &&
+                                         screen != gui_lock_screen_get_screen());
 }
 
 /* Real-device review finding: this file used to declare its own

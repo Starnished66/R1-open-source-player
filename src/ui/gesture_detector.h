@@ -17,6 +17,7 @@ typedef struct {
     bool is_bt_dac_overlay;
     bool is_usb_dac_overlay;
     bool is_lyrics_screen;
+    bool is_lock_screen;
     bool has_background_work;
     int32_t screen_height;
     int32_t band_height;

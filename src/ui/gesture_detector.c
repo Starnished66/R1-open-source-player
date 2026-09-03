@@ -23,6 +23,7 @@ bool gesture_home_state_poll(gesture_home_state_t * state,
                         !cfg->is_bt_dac_overlay &&
                         !cfg->is_usb_dac_overlay &&
                         !cfg->is_lyrics_screen &&
+                        !cfg->is_lock_screen &&
                         !cfg->has_background_work &&
                         in_band;
 

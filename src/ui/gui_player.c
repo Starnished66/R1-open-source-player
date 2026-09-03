@@ -734,6 +734,15 @@ void poll_cover_decode(void) {
         free(current_cover_bytes);
         current_cover_bytes = NULL;
         current_cover_for_index = -1;
+        /* current_cover_dsc.data still points at the block just freed above
+         * -- gui_player_get_current_cover_dsc() hands this same static
+         * struct's address out to other callers (the lock screen), who keep
+         * referencing &current_cover_dsc for as long as they're showing;
+         * without clearing .data here too, their next redraw reads freed
+         * heap. cover_img itself is fine (repointed to the placeholder
+         * asset below), this is purely about the shared descriptor's own
+         * consistency for readers other than cover_img. */
+        current_cover_dsc.data = NULL;
         lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
         /* No in-memory raw bitmap to reflect for the static placeholder
          * cover -- reset the panel back to its plain background rather
@@ -3916,4 +3925,9 @@ void gui_player_sync_topbar_visibility(lv_obj_t * screen) {
 
 lv_obj_t * gui_player_get_dismiss_btn(void) {
     return player_dismiss_btn;
+}
+
+const lv_image_dsc_t * gui_player_get_current_cover_dsc(void) {
+    if (!current_cover_bytes) return NULL;
+    return &current_cover_dsc;
 }

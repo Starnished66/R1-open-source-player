@@ -489,6 +489,18 @@ static void handle_physical_play_pause_press(void) {
     toggle_play_pause();
 }
 
+/* plugin_manager_notify_screen_woke()'s handlers can do real GUI work
+ * (LockScreen.lua's own screen_woke handler calls plugin.show_lock_screen(),
+ * which nav_push()es a new screen) -- calling that notify function directly
+ * from inside the screen_just_woke branch below would be exactly the
+ * re-entrant-from-inside-lv_timer_handler() hazard this same function's own
+ * comment on full_redraw_async_cb already warns about (a few lines up).
+ * Deferred via lv_async_call() the same way, for the same reason. */
+static void notify_screen_woke_async_cb(void * unused) {
+    (void) unused;
+    plugin_manager_notify_screen_woke();
+}
+
 static void update_timer_cb(lv_timer_t * timer) {
     (void) timer;
 
@@ -1035,6 +1047,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     if (screen_just_woke) {
         inactivity_dimmed = false;
         idle_shutdown_attempted = false;
+        lv_async_call(notify_screen_woke_async_cb, NULL);
         if (radios_suspended) {
             gui_shell_resume_connections(wifi_was_on_before_suspend, bt_was_on_before_suspend);
             radios_suspended = false;

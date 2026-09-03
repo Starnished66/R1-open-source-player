@@ -258,7 +258,7 @@ using an identity derived from their filename.
 - `plugin.api_version()` returns the current integer plugin API version (currently `4`).
 - `plugin.has_capability(name)` reports whether an optional interface exists.
   Supported capability tokens:
-  - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`, `ui.launcher_layout`, `ui.home_background`
+  - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`, `ui.launcher_layout`, `ui.home_background`, `ui.lock_screen`
   - Playback & Audio: `playback.control`, `playback.state`, `playback.events`, `playback.remote`, `audio.peq`, `audio.hw_volume_curve`
   - Filesystem & Playlists: `filesystem.sd`, `filesystem.mkdir`, `filesystem.playlists`
   - Storage & Secrets: `storage.namespaced`, `storage.secrets`
@@ -868,6 +868,26 @@ layout fields. For `show_list()`, width and height live in the call-level
 None of the three affect a row that doesn't set them -- a plugin that
 never uses this section's fields renders exactly as it did before they
 existed.
+
+### `plugin.show_lock_screen(options)`
+
+Displays a phone-style full-screen lock screen overlay on top of whatever screen
+is currently active. Dismissed by swiping up. While shown, the status bar and
+home indicator gesture band are hidden, and touches are blocked from reaching the
+underlying screens.
+
+`options` (table):
+- `mode` (string, required): `"album_art"`, `"image"`, or `"clock"`.
+  - `"album_art"`: displays the currently playing track's cover art (or the
+    fallback default cover if none is playing).
+  - `"image"`: displays an image from a local file path.
+  - `"clock"`: displays the current local time in large text, updating every second.
+- `image_path` (string, required if `mode == "image"`): absolute path to an image file.
+  Must be readable.
+- `clock_24h` (boolean, optional): if `true` (default), format clock as 24-hour (`HH:MM`);
+  if `false`, format as 12-hour (`hh:MM`).
+
+Returns `true` on success, or `false, "error message"` on failure.
 
 <a id="files-playback"></a>
 
@@ -1640,11 +1660,11 @@ end
 
 ### `plugin.on(event, callback)`
 
-Subscribes to a playback lifecycle change your plugin didn't itself cause.
-Unlike `register_list_item()` (where each plugin's row coexists as its own
-list entry), an event has no UI real estate to divide up -- **every**
-plugin subscribed to a given event fires, not just the first or the most
-recent. Four recognized events:
+Subscribes to a playback or device lifecycle change your plugin didn't
+itself cause. Unlike `register_list_item()` (where each plugin's row
+coexists as its own list entry), an event has no UI real estate to divide
+up -- **every** plugin subscribed to a given event fires, not just the
+first or the most recent. Five recognized events:
 
 - `"track_started"` -- `callback(title, artist, album, duration_seconds,
   provider, track_id)`. Fires whenever a new track begins playing, whatever
@@ -1670,6 +1690,8 @@ recent. Four recognized events:
   scrobbling (which only cares about elapsed listening time, and simply
   stops noticing once nothing's playing), but worth knowing if you're
   relying on it for something else.
+- `"screen_woke"` -- `callback()`, no arguments. Fires when the device's screen
+  wakes from being off/asleep (e.g. power button pressed to wake the display).
 
 Passing an unrecognized event name raises a Lua error immediately, same
 convention as an unrecognized `list_id`. Capped at 8 subscribers per event,

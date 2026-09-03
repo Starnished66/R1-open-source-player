@@ -4,12 +4,19 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "board_config.h"
+
 /* Confirmed against this project's own src/main.c (SCREEN_WIDTH/
  * SCREEN_HEIGHT) and lv_conf.h (LV_COLOR_DEPTH 16) -- the HiBy R1 panel is
  * a 480x800 portrait RGB565 framebuffer, not the round/ARGB display an
- * earlier draft of this bootloader's design assumed. */
-#define FB_WIDTH 480
-#define FB_HEIGHT 800
+ * earlier draft of this bootloader's design assumed. R3 Pro II's 480x720
+ * is equally confirmed -- see board_config.h's own comment for the
+ * evidence (its stock config.json plus its own boot splash JPEGs' real
+ * pixel dimensions). Both boards are RGB565; fb_open() below still
+ * verifies the real framebuffer against these at runtime and fails closed
+ * on any mismatch rather than trusting the board selected at compile time. */
+#define FB_WIDTH BOARD_SCREEN_WIDTH
+#define FB_HEIGHT BOARD_SCREEN_HEIGHT
 
 typedef uint16_t fb_color_t;
 

@@ -1,6 +1,7 @@
 #include "audio_output.h"
 #include "debug_log.h"
 #include "subprocess.h"
+#include "balanced_output_status.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -373,6 +374,41 @@ void audio_output_set_hw_volume_raw(int raw_left, int raw_right) {
         last_right = raw_right;
 }
 
+/* Actual mixer write for balanced-output routing -- only ever called from
+ * volume_worker_main() below, never directly from the UI thread. See
+ * audio_output_sync_balanced_output()'s own comment for why: get_alsa_
+ * mixer()'s lazy-init (alsa_mixer above) and this function's own cached
+ * mixer_ctl* have no locking of their own, matching audio_output_set_hw_
+ * volume_raw()'s identical pattern just above -- that one has always been
+ * safe in practice because its ONLY caller is this same dedicated worker
+ * thread (audio_output_request_hw_volume_raw()'s queueing wrapper), never
+ * called directly from elsewhere. Real-device review finding: an earlier
+ * version of this function ran the mixer I/O directly on the LVGL/UI
+ * thread on every 500ms tick, racing this worker thread's own unsynchronized
+ * access to the exact same alsa_mixer/mixer_ctl statics whenever a volume
+ * drag happened to land in the same window -- moved here to close that
+ * gap the same way volume writes already avoid it, rather than adding a
+ * new lock (this file has no other locks besides the queue below; adding
+ * one just for this would be a second synchronization mechanism doing the
+ * same job the existing worker-thread serialization already does). */
+static void apply_balanced_output(bool enabled) {
+    static struct mixer_ctl * balanced_ctl = NULL;
+    static bool balanced_ctl_lookup_done = false;
+    static int last_enabled = -1; /* -1 = never written yet */
+
+    struct mixer * mixer = get_alsa_mixer();
+    if (!mixer) return;
+    if (!balanced_ctl_lookup_done) {
+        balanced_ctl = mixer_get_ctl_by_name(mixer, "Balance Lineout En");
+        balanced_ctl_lookup_done = true;
+    }
+    if (!balanced_ctl) return; /* no such control -- R1/host, or the name is wrong; safe no-op either way */
+
+    int value = enabled ? 1 : 0;
+    if (value == last_enabled) return;
+    if (mixer_ctl_set_value(balanced_ctl, 0, value) == 0) last_enabled = value;
+}
+
 static pthread_once_t volume_worker_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t volume_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t volume_worker_cond = PTHREAD_COND_INITIALIZER;
@@ -380,18 +416,28 @@ static bool volume_worker_ready = false;
 static bool volume_worker_pending = false;
 static int volume_worker_left;
 static int volume_worker_right;
+/* Same mutex/cond as the volume request above -- one worker thread, two
+ * kinds of pending work, checked together on every wake rather than
+ * spinning up a second thread for something that changes this rarely. */
+static bool balanced_worker_pending = false;
+static bool balanced_worker_enabled;
 
 static void * volume_worker_main(void * unused) {
     (void) unused;
     for (;;) {
         pthread_mutex_lock(&volume_worker_mutex);
-        while (!volume_worker_pending)
+        while (!volume_worker_pending && !balanced_worker_pending)
             pthread_cond_wait(&volume_worker_cond, &volume_worker_mutex);
+        bool do_volume = volume_worker_pending;
         int left = volume_worker_left;
         int right = volume_worker_right;
         volume_worker_pending = false;
+        bool do_balanced = balanced_worker_pending;
+        bool balanced_enabled = balanced_worker_enabled;
+        balanced_worker_pending = false;
         pthread_mutex_unlock(&volume_worker_mutex);
-        audio_output_set_hw_volume_raw(left, right);
+        if (do_volume) audio_output_set_hw_volume_raw(left, right);
+        if (do_balanced) apply_balanced_output(balanced_enabled);
     }
     return NULL;
 }
@@ -402,6 +448,31 @@ static void start_volume_worker(void) {
         pthread_detach(thread);
         volume_worker_ready = true;
     }
+}
+
+/* UI-thread-safe half of balanced-output sync -- called every tick from
+ * gui.c's update_timer_cb(). Everything here is either a plain sysfs read
+ * (balanced_headphone_is_connected()) or state private to this one
+ * function (own static, never touched by the worker thread), so there is
+ * nothing to synchronize on this side; only the actual mixer write
+ * (apply_balanced_output() above) needs to stay on the single worker
+ * thread, same as hardware volume already does. */
+void audio_output_sync_balanced_output(void) {
+    static int last_requested = -1; /* -1 = never requested yet */
+    int enabled = balanced_headphone_is_connected() ? 1 : 0;
+    if (enabled == last_requested) return;
+    last_requested = enabled;
+
+    pthread_once(&volume_worker_once, start_volume_worker);
+    if (!volume_worker_ready) {
+        apply_balanced_output(enabled != 0);
+        return;
+    }
+    pthread_mutex_lock(&volume_worker_mutex);
+    balanced_worker_enabled = enabled != 0;
+    balanced_worker_pending = true;
+    pthread_cond_signal(&volume_worker_cond);
+    pthread_mutex_unlock(&volume_worker_mutex);
 }
 
 void audio_output_request_hw_volume_raw(int raw_left, int raw_right) {

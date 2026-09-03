@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "board_config.h"
+
 /* Reads shairport's own metadata FIFO -- created automatically inside its
  * "-M" meta-dir (see airplay_control.c's "-M /tmp"), confirmed via `strings`
  * against the real binary ("Could not create metadata FIFO %s", "now_
@@ -29,10 +31,16 @@
 #define AIRPLAY_NOW_PLAYING_PATH "/tmp/now_playing"
 
 /* Must match whatever size the AirPlay overlay screen displays cover art
- * at (gui_network.c) -- the consumer assumes buffers of exactly these
- * fixed dimensions. */
-#define AIRPLAY_COVER_WIDTH 480
-#define AIRPLAY_COVER_HEIGHT 480
+ * at (gui_network.c, build_airplay_overlay_screen()) -- the consumer
+ * assumes buffers of exactly these fixed dimensions. Tracks
+ * BOARD_PLAYER_COVER_HEIGHT (board_config.h), same as the Player screen's
+ * own COVER_ART_HEIGHT, since both display the identical playing_plane/
+ * default_cover_565.png placeholder before real art arrives -- a bare
+ * 480x480 here would leave real decoded AirPlay art a different size than
+ * that placeholder on any board whose own copy of that asset isn't
+ * square. */
+#define AIRPLAY_COVER_WIDTH BOARD_SCREEN_WIDTH
+#define AIRPLAY_COVER_HEIGHT BOARD_PLAYER_COVER_HEIGHT
 
 #define AIRPLAY_META_TITLE_MAX 256
 #define AIRPLAY_META_ARTIST_MAX 256

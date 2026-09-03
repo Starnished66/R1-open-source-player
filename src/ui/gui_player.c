@@ -1,4 +1,5 @@
 #include <limits.h>
+#include "board_config.h"
 #include "usb_mode_control.h"
 #include "file_browser.h"
 #include "remote_control.h"
@@ -309,8 +310,12 @@ static void build_volume_popup(void) {
  * so this is generated fresh here, from the same per-track RGB565 buffer
  * cover_decode_to_rgb565() already decodes, rather than reverse-engineered
  * from an asset that doesn't exist in this codebase's copy of the firmware. */
-#define REFLECTION_WIDTH 480
-#define REFLECTION_HEIGHT 320
+/* Tracks the overlay panel's own real size (BOARD_PLAYER_OVERLAY_HEIGHT),
+ * not the cover's -- this buffer is drawn as player_overlay_panel's own
+ * background (build_player_screen()), so it must fill exactly that panel,
+ * same as buttom.png (the no-track-playing placeholder background) does. */
+#define REFLECTION_WIDTH BOARD_SCREEN_WIDTH
+#define REFLECTION_HEIGHT BOARD_PLAYER_OVERLAY_HEIGHT
 #define REFLECTION_BLUR_RADIUS 32
 #define REFLECTION_BLUR_PASSES 5
 /* Kept as an integer ratio (channel * NUM / DEN) rather than a float --
@@ -1762,11 +1767,18 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_bg_color(scr, lv_color_make(0, 0, 0), 0);
 
     /* Full-bleed album art (real per-track art is Task #16 -- this is the
-     * firmware's own default cover placeholder, 480x480, top-aligned) plus
-     * a matching 480x320 gradient panel that exactly fills the remaining
-     * screen height below it (480 + 320 = 800), giving the seamless
-     * art-fades-to-dark backdrop from the reference photo without needing
-     * any distortion/stretching of the square art. */
+     * firmware's own default cover placeholder, top-aligned) plus a
+     * matching gradient panel that exactly fills the remaining screen
+     * height below it, giving the seamless art-fades-to-dark backdrop from
+     * the reference photo without needing any distortion/stretching of the
+     * art. Both this app's own real per-track cover art and buttom.png are
+     * decoded/drawn at their native size (cover_img has no explicit size
+     * here -- it's driven entirely by whatever the active board's own
+     * default_cover_565.png actually is, same as THEME_ROOT needing no
+     * board branch), so only the overlay panel's own size needs to track
+     * the active board explicitly -- see board_config.h's own comment on
+     * where BOARD_PLAYER_OVERLAY_HEIGHT comes from (each board's real
+     * buttom.png asset, not an arbitrary split). */
     cover_img = lv_image_create(scr);
     lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
     lv_obj_align(cover_img, LV_ALIGN_TOP_MID, 0, 0);
@@ -1775,7 +1787,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
     player_overlay_panel = lv_obj_create(scr);
     lv_obj_t * overlay = player_overlay_panel; /* short local alias, rest of this function was written against this name */
-    lv_obj_set_size(overlay, 480, 320);
+    lv_obj_set_size(overlay, BOARD_SCREEN_WIDTH, BOARD_PLAYER_OVERLAY_HEIGHT);
     lv_obj_align(overlay, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_image_src(overlay, asset_path("playing_plane/buttom.png"), 0);
     lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
@@ -1794,10 +1806,11 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_flex_flow(overlay, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(overlay, 6, 0);
     /* Without an explicit main-axis alignment, flex defaults to packing
-     * children at the top, leaving the rest of this 320px panel empty below
-     * the transport row -- SPACE_BETWEEN spreads title/artist/progress/time/
-     * controls out to fill the whole panel instead, controls_row landing at
-     * the very bottom edge. */
+     * children at the top, leaving the rest of this panel (BOARD_PLAYER_
+     * OVERLAY_HEIGHT tall -- board_config.h) empty below the transport row
+     * -- SPACE_BETWEEN spreads title/artist/progress/time/controls out to
+     * fill the whole panel instead, controls_row landing at the very
+     * bottom edge, regardless of the active board's own overlay height. */
     lv_obj_set_flex_align(overlay, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     /* Dismiss affordance over the album art, top-left -- same left-pointing

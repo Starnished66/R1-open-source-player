@@ -57,11 +57,15 @@
 
 # Build outputs
 /build_host/
+/build_host_*/
 /build_target/
+/build_target_*/
 /open_hiby_player_host
+/open_hiby_player_host_*
 /open_hiby_player_target
 /open_hiby_player_target_*
 /open_hiby_bootloader
+/open_hiby_bootloader_*
 /compile_commands.json
 /compile_flags.txt
 

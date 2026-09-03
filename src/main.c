@@ -32,8 +32,10 @@
   #include <linux/fb.h>
 #endif
 
-#define SCREEN_WIDTH 480
-#define SCREEN_HEIGHT 800
+#include "board_config.h"
+
+#define SCREEN_WIDTH BOARD_SCREEN_WIDTH
+#define SCREEN_HEIGHT BOARD_SCREEN_HEIGHT
 
 /* Custom tick interface for LVGL timing (replaces older thread-based ticks) */
 static uint32_t custom_tick_get(void) {

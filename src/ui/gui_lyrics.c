@@ -22,8 +22,10 @@ typedef struct {
     const char * label;
 } lyrics_font_size_option_t;
 
-#define LYRICS_BACKDROP_WIDTH 480
-#define LYRICS_BACKDROP_HEIGHT 800
+/* The full lyrics screen, not the player's own cover+overlay split -- tracks
+ * the active board's real screen size directly (board_config.h, via gui.h). */
+#define LYRICS_BACKDROP_WIDTH BOARD_SCREEN_WIDTH
+#define LYRICS_BACKDROP_HEIGHT BOARD_SCREEN_HEIGHT
 #define LYRICS_BACKDROP_WORK_WIDTH 60
 #define LYRICS_BACKDROP_WORK_HEIGHT 100
 #define LYRICS_BACKDROP_BLUR_RADIUS 5
@@ -733,7 +735,7 @@ static lv_obj_t * build_lyrics_screen(void) {
      * dithered RGB565 conversion; alpha-blending black here would quantize
      * it a second time and recreate visible color bands. */
     lv_obj_t * dark_overlay = lv_obj_create(scr);
-    lv_obj_set_size(dark_overlay, 480, 800);
+    lv_obj_set_size(dark_overlay, LYRICS_BACKDROP_WIDTH, LYRICS_BACKDROP_HEIGHT);
     lv_obj_align(dark_overlay, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_bg_color(dark_overlay, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_bg_opa(dark_overlay, LV_OPA_TRANSP, 0);
@@ -756,7 +758,7 @@ static lv_obj_t * build_lyrics_screen(void) {
      * line to seek to it); this object only listens for LV_EVENT_SCROLL,
      * to track manual-scroll-vs-auto-follow. */
     lyrics_list = lv_obj_create(scr);
-    lv_obj_set_size(lyrics_list, 480, 800);
+    lv_obj_set_size(lyrics_list, LYRICS_BACKDROP_WIDTH, LYRICS_BACKDROP_HEIGHT);
     lv_obj_align(lyrics_list, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_bg_opa(lyrics_list, 0, 0);
     lv_obj_set_style_border_width(lyrics_list, 0, 0);

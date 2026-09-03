@@ -89,3 +89,53 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 6
+
+  build-r3proii:
+    # Compile-regression guard only -- NOT a release channel. The R3 Pro II
+    # port (Makefile's BOARD= parameter, src/core/board_config.h) has no
+    # real hardware validation yet (see README.md's own "Device Support"
+    # section) and there is no R3 Pro II Staging Image/secret to repack
+    # against, unlike the R1 job above and weekly-beta.yml's real release
+    # pipeline. This job exists only to catch a future change that breaks
+    # the BOARD=r3proii build path -- it builds and sanity-checks the
+    # binary but never publishes it, so a failure here can't be mistaken
+    # for an R3 Pro II release regressing, and a broken R3 build can't
+    # block the R1 daily artifact above (separate job, independent status).
+    name: Build player for R3 Pro II (unsupported, compile check only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install repository-cached MIPS musl toolchain
+        run: |
+          set -euo pipefail
+          toolchain_dir="$(scripts/install_mips_toolchain.sh "$RUNNER_TEMP")"
+          echo "$toolchain_dir/bin" >> "$GITHUB_PATH"
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends file
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          make -j2 target BOARD=r3proii \
+            RELEASE_LABEL="Daily Build R3 Pro II (unsupported) $(date -u +%F)"
+          make bootloader BOARD=r3proii
+
+      - name: Validate build output
+        run: |
+          set -euo pipefail
+          file open_hiby_player_target_r3proii open_hiby_bootloader_r3proii
+          test -s open_hiby_player_target_r3proii
+          test -s open_hiby_bootloader_r3proii
+          # Do not use grep -q here: under pipefail its early exit can make
+          # readelf receive SIGPIPE and falsely fail an otherwise valid job.
+          mipsel-linux-musl-readelf -h open_hiby_player_target_r3proii \
+            | grep 'Machine:.*MIPS' >/dev/null
+          mipsel-linux-musl-readelf -h open_hiby_bootloader_r3proii \
+            | grep 'Machine:.*MIPS' >/dev/null

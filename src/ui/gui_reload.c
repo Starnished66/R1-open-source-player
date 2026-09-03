@@ -129,14 +129,14 @@ static void reload_diag(const char * step) {
 
 static int32_t reload_display_width(void) {
     lv_display_t * display = lv_display_get_default();
-    int32_t width = display ? lv_display_get_horizontal_resolution(display) : 480;
-    return width > 0 ? width : 480;
+    int32_t width = display ? lv_display_get_horizontal_resolution(display) : BOARD_SCREEN_WIDTH;
+    return width > 0 ? width : BOARD_SCREEN_WIDTH;
 }
 
 static int32_t reload_display_height(void) {
     lv_display_t * display = lv_display_get_default();
-    int32_t height = display ? lv_display_get_vertical_resolution(display) : 800;
-    return height > 0 ? height : 800;
+    int32_t height = display ? lv_display_get_vertical_resolution(display) : BOARD_SCREEN_HEIGHT;
+    return height > 0 ? height : BOARD_SCREEN_HEIGHT;
 }
 
 void gui_soft_reload(void) {

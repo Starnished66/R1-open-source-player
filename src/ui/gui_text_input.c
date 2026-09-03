@@ -45,21 +45,23 @@ static text_entry_done_cb_t text_entry_on_done;
 static void * text_entry_user_data;
 
 /* ---- T9 keypad geometry: 5 columns x 4 rows of TEXT_ENTRY_KEY_SIZE keys,
- * centered under the 480px-wide screen and anchored to the bottom of the
- * 800px-tall screen (both hardcoded directly rather than shared from
- * SCREEN_WIDTH/SCREEN_HEIGHT constants -- main.c's copies aren't visible
- * here, same as everywhere else in this file that needs the screen's own
- * pixel size, e.g. COVER_ART_WIDTH above). Matches a real-device photo of
- * the stock keyboard exactly (not asset-name guessing -- an earlier 4x5
- * layout with a single cycling Mode key was wrong): column 0 holds three
- * always-visible mode-jump buttons (123/ABC/sym) stacked vertically rather
- * than one key that cycles between them; columns 1-3 hold the actual T9
- * 3x3 letter/digit/symbol pad; column 4 holds Del (row 0), the key-0/Shift
- * slot (row 1, see text_entry_key0_click_cb's own comment), and Enter
- * (rows 2-3, tall). Row 3's remaining cells are Left/Right and a wide
- * Space spanning columns 2-3. 5 columns at the native 94px key size only
- * just fits 480px wide (a 2px gap leaves a 1px margin each side) -- real
- * device photo confirms the stock keyboard packs this tight too. ---- */
+ * centered under the screen's own width and anchored to the bottom of the
+ * screen's own height (BOARD_SCREEN_WIDTH/HEIGHT, board_config.h via gui.h).
+ * Matches a real-device photo of the R1's own stock keyboard exactly (not
+ * asset-name guessing -- an earlier 4x5 layout with a single cycling Mode
+ * key was wrong): column 0 holds three always-visible mode-jump buttons
+ * (123/ABC/sym) stacked vertically rather than one key that cycles between
+ * them; columns 1-3 hold the actual T9 3x3 letter/digit/symbol pad; column
+ * 4 holds Del (row 0), the key-0/Shift slot (row 1, see text_entry_key0_
+ * click_cb's own comment), and Enter (rows 2-3, tall). Row 3's remaining
+ * cells are Left/Right and a wide Space spanning columns 2-3. 5 columns at
+ * the native 94px key size only just fits 480px wide (a 2px gap leaves a
+ * 1px margin each side) -- real device photo confirms the stock keyboard
+ * packs this tight too. The key grid's own pixel size is NOT board-
+ * conditional (94px keys, unchanged) -- only its position is, via
+ * TEXT_ENTRY_GRID_X/Y below -- since both boards share the same 480px
+ * width and the fixed-height grid comfortably fits under either board's
+ * real screen height with room to spare. ---- */
 #define TEXT_ENTRY_KEY_SIZE 94
 #define TEXT_ENTRY_KEY_GAP 2
 #define TEXT_ENTRY_GRID_COLS 5
@@ -67,8 +69,8 @@ static void * text_entry_user_data;
 #define TEXT_ENTRY_GRID_WIDTH (TEXT_ENTRY_GRID_COLS * TEXT_ENTRY_KEY_SIZE + (TEXT_ENTRY_GRID_COLS - 1) * TEXT_ENTRY_KEY_GAP)
 #define TEXT_ENTRY_GRID_HEIGHT (TEXT_ENTRY_GRID_ROWS * TEXT_ENTRY_KEY_SIZE + (TEXT_ENTRY_GRID_ROWS - 1) * TEXT_ENTRY_KEY_GAP)
 #define TEXT_ENTRY_BOTTOM_MARGIN 16
-#define TEXT_ENTRY_GRID_X ((480 - TEXT_ENTRY_GRID_WIDTH) / 2)
-#define TEXT_ENTRY_GRID_Y (800 - TEXT_ENTRY_GRID_HEIGHT - TEXT_ENTRY_BOTTOM_MARGIN)
+#define TEXT_ENTRY_GRID_X ((BOARD_SCREEN_WIDTH - TEXT_ENTRY_GRID_WIDTH) / 2)
+#define TEXT_ENTRY_GRID_Y (BOARD_SCREEN_HEIGHT - TEXT_ENTRY_GRID_HEIGHT - TEXT_ENTRY_BOTTOM_MARGIN)
 #define TEXT_ENTRY_MULTITAP_MS 900
 
 typedef enum {

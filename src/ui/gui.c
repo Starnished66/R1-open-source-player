@@ -28,6 +28,7 @@
 #include "battery.h"
 #include "wifi_status.h"
 #include "audio.h"
+#include "audio_output.h"
 #include "file_browser.h"
 #include "text_reader.h"
 #include "hw_buttons.h"
@@ -51,6 +52,7 @@
 #include "bt_media_player.h"
 #endif
 #include "headphone_status.h"
+#include "balanced_output_status.h"
 #include "usb_audio_output.h"
 #include "plugin_manager.h"
 #include "gui_plugin_manage.h"
@@ -728,7 +730,16 @@ static void update_timer_cb(lv_timer_t * timer) {
              lv_tick_elaps(bt_disconnected_since_tick) < BT_OUTPUT_DISCONNECT_DEBOUNCE_MS);
 
         static bool last_output_connected = true; /* starts true so nothing fires before any real state has been sampled */
-        bool output_connected = headphone_is_connected() || bt_connected_debounced;
+        /* Real-device review finding (R3 Pro II): the plain "headset" jack
+         * and the balanced jack are two independent switch_dev detection
+         * paths on this board (sa_sound_switch.ko's own sass_headset_ and
+         * sass_balance_ parameter groups, HARDWARE_DRIVERS.md) -- a user with
+         * ONLY a balanced cable connected read as fully disconnected here
+         * (headphone_is_connected() only ever reflects the plain jack),
+         * which would have auto-paused live, actively-routing balanced
+         * playback as if the output had been unplugged. A genuine no-op on
+         * R1/host, same as balanced_headphone_is_connected() itself. */
+        bool output_connected = headphone_is_connected() || balanced_headphone_is_connected() || bt_connected_debounced;
         /* Real-device bug report: this used to call audio_stop() -- not
          * audio_toggle_pause() -- on a disconnect. audio_stop() (audio.c)
          * doesn't just silence output: its playback thread fully unwinds
@@ -753,6 +764,16 @@ static void update_timer_cb(lv_timer_t * timer) {
         }
         last_output_connected = output_connected;
     }
+
+    /* R3 Pro II balanced-output routing -- see audio_output_sync_balanced_
+     * output()'s own doc comment. Deliberately its own standalone call, not
+     * folded into the auto-stop block above: that block's debounce/wedge-
+     * recovery logic is delicate and already carries several real-device
+     * bug-fix histories, and this is unrelated, purely additive behavior
+     * (a genuine no-op on R1/host) that doesn't need to share any of that
+     * state. Cheap enough (one sysfs read, one cached mixer lookup) to run
+     * every tick, same cadence as headphone_is_connected() above. */
+    audio_output_sync_balanced_output();
 #endif
 
     /* Car Mode (Settings toggle, off by default). Matches the stock

@@ -74,14 +74,20 @@ static void release_stock_hgl_dma(void) {
  * shown (cancelled -- see draw_menu()'s own remaining_ms < 0 case) --
  * that's the specific case that looked like wasted space before this. */
 #define CARDS_TOP 110
-#define CARDS_BOTTOM 680
+/* Offsets from FB_HEIGHT (board_config.h), not absolute Y values -- a
+ * fixed FOOTER_Y=700 left only 20px of clearance below the footer's own
+ * text height on an 800-tall screen, which a shorter panel would clip
+ * outright. These offsets reproduce the R1 values unchanged
+ * (800-120=680, 800-100=700) while scaling correctly on any other
+ * FB_HEIGHT. */
+#define CARDS_BOTTOM (FB_HEIGHT - 120)
 #define CARD_GAP 24
 #define MAX_CARDS 3 /* Internal + SD stock + SD update -- see scanner.h's own BOOT_ENTRY_* */
 #define TITLE_Y 36
 #define COUNTDOWN_Y 68
 #define PROGRESS_BAR_Y 92
 #define PROGRESS_BAR_HEIGHT 6
-#define FOOTER_Y 700
+#define FOOTER_Y (FB_HEIGHT - 100)
 
 /* Card backgrounds are alpha-blended over the artwork (see draw_card()),
  * not opaque -- 128/255 reads as roughly 50% without being exactly

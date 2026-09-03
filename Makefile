@@ -1,8 +1,41 @@
 # Makefile for open_hiby_player
 
-# Target executables
+# Board selector -- `make target BOARD=r3proii` (default r1 if unset). Gates
+# BOARD_DEFINE (-DBOARD_R1 / -DBOARD_R3PROII, consumed by src/core/
+# board_config.h) and suffixes every output binary/object directory below so
+# switching boards can never silently relink stale objects built with the
+# OTHER board's defines -- Make has no flag-change tracking of its own, only
+# file-mtime tracking, so two boards sharing one build_target/ would be a
+# real, silent-corruption hazard without this.
+BOARD ?= r1
+ifeq ($(filter $(BOARD),r1 r3proii),)
+$(error Unknown BOARD '$(BOARD)' -- expected r1 or r3proii)
+endif
+BOARD_DEFINE = -DBOARD_$(shell echo $(BOARD) | tr a-z A-Z)
+
+# Object directories -- same r1-stays-bare reasoning as HOST_BIN/TARGET_BIN
+# below. Every build_target/ or build_host/ path elsewhere in this file is
+# written through these two variables, never the literal string, so a board
+# switch can't accidentally reuse the other board's stale .o files.
+ifeq ($(BOARD),r1)
+BUILD_TARGET_DIR = build_target
+BUILD_HOST_DIR = build_host
+else
+BUILD_TARGET_DIR = build_target_$(BOARD)
+BUILD_HOST_DIR = build_host_$(BOARD)
+endif
+
+# Target executables -- r1 keeps its exact original unsuffixed names (every
+# downstream consumer -- the Test2 repack workflow, CI, TESTING.md -- expects
+# these exact filenames), other boards get a distinct suffix so a r3proii
+# build can never be mistaken for or silently overwrite an r1 one.
+ifeq ($(BOARD),r1)
 HOST_BIN = open_hiby_player_host
 TARGET_BIN = open_hiby_player_target
+else
+HOST_BIN = open_hiby_player_host_$(BOARD)
+TARGET_BIN = open_hiby_player_target_$(BOARD)
+endif
 
 # Compiler and Linker configuration
 CC = gcc
@@ -316,8 +349,8 @@ endif
 # statements needed changing when src/ was reorganized into subfolders.
 CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
-HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
-HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags)
+HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags)
+HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags)
 # Optional: `make target TEST_BUILD_TAG=test25_avrcp` -- replaces the release
 # label in About with a conspicuous test-build identity, so a binary running
 # on the device can be identified without checking timestamps or hashes.
@@ -363,8 +396,8 @@ endif
 # not when the Makefile was last edited.
 BUILD_STAMP_DEFINE = -DBUILD_STAMP=\"$(shell date +%Y-%m-%d_%H:%M)\"
 
-TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
-TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
 TINYALSA_CFLAGS = -O3 -g -Wall -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 # DBUS_COMPILATION/DBUS_STATIC_BUILD: libdbus's own headers gate some
 # declarations on these (matching how its own build always defines them
@@ -424,7 +457,7 @@ TARGET_LDFLAGS = -static -no-pie -lpthread -lm
 # control), ui/ (gui/screens/assets/fonts), core/ (settings, subprocess,
 # misc). main.c stays at src/ root as the entry point.
 APP_SRCS = src/main.c src/ui/gui.c src/ui/gui_subsonic.c src/ui/gui_settings.c src/ui/gui_network.c src/ui/gui_theme.c src/ui/gui_notifications.c src/ui/gui_library.c src/ui/gui_queue.c src/ui/gui_player.c src/ui/gui_track_info.c src/ui/gui_plugins.c src/ui/gui_shell.c src/ui/gui_navigation.c src/ui/gui_books.c src/ui/gui_text_input.c src/ui/gui_lyrics.c src/ui/gui_reload.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/core/app_version.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_conn.c src/network/http_client.c src/network/http_stream.c src/network/subsonic_client.c src/library/cover_decode.c src/library/lyrics.c src/audio/asf_demux.c src/audio/wma_decoder.c src/audio/ogg_demux.c src/audio/opus_decoder.c src/audio/vorbis_decoder.c src/library/cue_parser.c src/ui/fallback_font.c \
-src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/network/airplay_bridge.c src/network/airplay_metadata.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/hardware/usb_audio_output.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/core/hostname_apply.c src/network/dlna_control.c src/network/remote_control.c src/plugins/plugin_manager.c
+src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/network/airplay_bridge.c src/network/airplay_metadata.c src/hardware/headphone_status.c src/hardware/balanced_output_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/hardware/usb_audio_output.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/core/hostname_apply.c src/network/dlna_control.c src/network/remote_control.c src/plugins/plugin_manager.c
 APP_SRCS += src/ui/lyrics_layout.c src/ui/transition_compositor.c
 APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c src/plugins/plugin_disabled_list.c
 APP_SRCS += src/ui/gui_plugin_manage.c src/ui/gui_lock_screen.c
@@ -495,23 +528,23 @@ DBUS_SRCS = $(filter-out %-win.c %-win32.c %wince-glue.c $(DBUS_DIR)/dbus/dbus-s
 TARGET_ONLY_APP_SRCS = src/network/bt_media_player.c src/audio/audio_output.c
 
 # Object files
-HOST_OBJS = $(APP_SRCS:src/%.c=build_host/%.o) $(APP_CXX_SRCS:src/%.cpp=build_host/%.o) \
-            $(LVGL_SRCS:$(LVGL_DIR)/%.c=build_host/lvgl/%.o) $(FAAD2_SRCS:$(FAAD2_DIR)/libfaad/%.c=build_host/faad2/%.o) \
-            $(ALAC_C_SRCS:$(ALAC_DIR)/codec/%.c=build_host/alac/%.o) $(ALAC_CXX_SRCS:$(ALAC_DIR)/codec/%.cpp=build_host/alac/%.o) \
-            $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=build_host/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=build_host/cjson/%.o) \
-            $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_host/opus/%.o) \
-            $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_host/stb_vorbis/%.o) \
-            $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_host/lua/%.o)
-TARGET_OBJS = $(APP_SRCS:src/%.c=build_target/%.o) $(APP_CXX_SRCS:src/%.cpp=build_target/%.o) \
-              $(TARGET_ONLY_APP_SRCS:src/%.c=build_target/%.o) \
-              $(LVGL_SRCS:$(LVGL_DIR)/%.c=build_target/lvgl/%.o) $(TINYALSA_SRCS:$(TINYALSA_DIR)/%.c=build_target/tinyalsa/%.o) \
-              $(FAAD2_SRCS:$(FAAD2_DIR)/libfaad/%.c=build_target/faad2/%.o) \
-              $(ALAC_C_SRCS:$(ALAC_DIR)/codec/%.c=build_target/alac/%.o) $(ALAC_CXX_SRCS:$(ALAC_DIR)/codec/%.cpp=build_target/alac/%.o) \
-              $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=build_target/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=build_target/cjson/%.o) \
-              $(DBUS_SRCS:$(DBUS_DIR)/dbus/%.c=build_target/dbus/%.o) \
-              $(OPUS_SRCS:$(OPUS_DIR)/%.c=build_target/opus/%.o) \
-              $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=build_target/stb_vorbis/%.o) \
-              $(LUA_SRCS:$(LUA_DIR)/src/%.c=build_target/lua/%.o)
+HOST_OBJS = $(APP_SRCS:src/%.c=$(BUILD_HOST_DIR)/%.o) $(APP_CXX_SRCS:src/%.cpp=$(BUILD_HOST_DIR)/%.o) \
+            $(LVGL_SRCS:$(LVGL_DIR)/%.c=$(BUILD_HOST_DIR)/lvgl/%.o) $(FAAD2_SRCS:$(FAAD2_DIR)/libfaad/%.c=$(BUILD_HOST_DIR)/faad2/%.o) \
+            $(ALAC_C_SRCS:$(ALAC_DIR)/codec/%.c=$(BUILD_HOST_DIR)/alac/%.o) $(ALAC_CXX_SRCS:$(ALAC_DIR)/codec/%.cpp=$(BUILD_HOST_DIR)/alac/%.o) \
+            $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=$(BUILD_HOST_DIR)/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=$(BUILD_HOST_DIR)/cjson/%.o) \
+            $(OPUS_SRCS:$(OPUS_DIR)/%.c=$(BUILD_HOST_DIR)/opus/%.o) \
+            $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=$(BUILD_HOST_DIR)/stb_vorbis/%.o) \
+            $(LUA_SRCS:$(LUA_DIR)/src/%.c=$(BUILD_HOST_DIR)/lua/%.o)
+TARGET_OBJS = $(APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) $(APP_CXX_SRCS:src/%.cpp=$(BUILD_TARGET_DIR)/%.o) \
+              $(TARGET_ONLY_APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) \
+              $(LVGL_SRCS:$(LVGL_DIR)/%.c=$(BUILD_TARGET_DIR)/lvgl/%.o) $(TINYALSA_SRCS:$(TINYALSA_DIR)/%.c=$(BUILD_TARGET_DIR)/tinyalsa/%.o) \
+              $(FAAD2_SRCS:$(FAAD2_DIR)/libfaad/%.c=$(BUILD_TARGET_DIR)/faad2/%.o) \
+              $(ALAC_C_SRCS:$(ALAC_DIR)/codec/%.c=$(BUILD_TARGET_DIR)/alac/%.o) $(ALAC_CXX_SRCS:$(ALAC_DIR)/codec/%.cpp=$(BUILD_TARGET_DIR)/alac/%.o) \
+              $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=$(BUILD_TARGET_DIR)/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=$(BUILD_TARGET_DIR)/cjson/%.o) \
+              $(DBUS_SRCS:$(DBUS_DIR)/dbus/%.c=$(BUILD_TARGET_DIR)/dbus/%.o) \
+              $(OPUS_SRCS:$(OPUS_DIR)/%.c=$(BUILD_TARGET_DIR)/opus/%.o) \
+              $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=$(BUILD_TARGET_DIR)/stb_vorbis/%.o) \
+              $(LUA_SRCS:$(LUA_DIR)/src/%.c=$(BUILD_TARGET_DIR)/lua/%.o)
 
 .PHONY: all host target bootloader sd_ready_test cover_decode_scale_test clean compile_commands.json FORCE_VERSION
 
@@ -600,47 +633,47 @@ $(LVGL_PATCH_STAMP): $(LVGL_FBDEV_C) $(LVGL_FBDEV_H) $(LVGL_PATCH) \
 	done; \
 	touch $@
 
-build_host/%.o: src/%.c $(LVGL_PATCH_STAMP)
+$(BUILD_HOST_DIR)/%.o: src/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
-build_host/%.o: src/%.cpp $(LVGL_PATCH_STAMP)
+$(BUILD_HOST_DIR)/%.o: src/%.cpp $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CXX) $(HOST_CXXFLAGS) -c $< -o $@
 
-build_host/lvgl/%.o: $(LVGL_DIR)/%.c $(LVGL_PATCH_STAMP)
+$(BUILD_HOST_DIR)/lvgl/%.o: $(LVGL_DIR)/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
-build_host/faad2/%.o: $(FAAD2_DIR)/libfaad/%.c
+$(BUILD_HOST_DIR)/faad2/%.o: $(FAAD2_DIR)/libfaad/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(FAAD2_CFLAGS) -c $< -o $@
 
-build_host/alac/%.o: $(ALAC_DIR)/codec/%.c
+$(BUILD_HOST_DIR)/alac/%.o: $(ALAC_DIR)/codec/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(ALAC_CFLAGS) -c $< -o $@
 
-build_host/alac/%.o: $(ALAC_DIR)/codec/%.cpp
+$(BUILD_HOST_DIR)/alac/%.o: $(ALAC_DIR)/codec/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(ALAC_CXXFLAGS) -c $< -o $@
 
-build_host/mbedtls/%.o: $(MBEDTLS_DIR)/library/%.c
+$(BUILD_HOST_DIR)/mbedtls/%.o: $(MBEDTLS_DIR)/library/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
-build_host/cjson/%.o: $(CJSON_DIR)/%.c
+$(BUILD_HOST_DIR)/cjson/%.o: $(CJSON_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
-build_host/stb_vorbis/%.o: $(STB_VORBIS_DIR)/%.c
+$(BUILD_HOST_DIR)/stb_vorbis/%.o: $(STB_VORBIS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(HOST_CFLAGS) -c $< -o $@
 
-build_host/opus/%.o: $(OPUS_DIR)/%.c
+$(BUILD_HOST_DIR)/opus/%.o: $(OPUS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(OPUS_CFLAGS) -c $< -o $@
 
-build_host/lua/%.o: $(LUA_DIR)/src/%.c
+$(BUILD_HOST_DIR)/lua/%.o: $(LUA_DIR)/src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(LUA_CFLAGS) -DHOST_BUILD=1 -c $< -o $@
 
@@ -648,8 +681,8 @@ build_host/lua/%.o: $(LUA_DIR)/src/%.c
 target: $(TARGET_BIN)
 
 $(TARGET_BIN): $(TARGET_OBJS)
-	$(CROSS_CXX) -o build_target/$(TARGET_BIN)_unstripped $(TARGET_OBJS) $(TARGET_LDFLAGS)
-	$(CROSS_STRIP) -s -o $@ build_target/$(TARGET_BIN)_unstripped
+	$(CROSS_CXX) -o $(BUILD_TARGET_DIR)/$(TARGET_BIN)_unstripped $(TARGET_OBJS) $(TARGET_LDFLAGS)
+	$(CROSS_STRIP) -s -o $@ $(BUILD_TARGET_DIR)/$(TARGET_BIN)_unstripped
 	@echo "Target build complete: File ready at '$(TARGET_BIN)'"
 
 # Standalone boot selector -- see src/bootloader/main.c's own top comment.
@@ -659,7 +692,16 @@ $(TARGET_BIN): $(TARGET_OBJS)
 # in directly (all already dependency-free -- see their own files) rather
 # than reusing TARGET_OBJS's build rule, so this never accidentally drags
 # in the rest of the player/LVGL.
+# Same r1-stays-bare reasoning as HOST_BIN/TARGET_BIN (below the BOARD
+# selector block near the top of this file) -- without this, `make
+# bootloader BOARD=r3proii` would silently overwrite the R1 bootloader
+# sitting in the working directory, since (unlike the player binary and its
+# object directory) this target's own output name was never suffixed.
+ifeq ($(BOARD),r1)
 BOOTLOADER_BIN = open_hiby_bootloader
+else
+BOOTLOADER_BIN = open_hiby_bootloader_$(BOARD)
+endif
 BOOTLOADER_SRCS = src/bootloader/main.c src/bootloader/fb_draw.c src/bootloader/input.c \
                   src/bootloader/scanner.c src/bootloader/sd_ready.c src/bootloader/sd_ready_real.c \
                   src/hardware/input_device_utils.c src/core/subprocess.c \
@@ -670,12 +712,12 @@ BOOTLOADER_SRCS = src/bootloader/main.c src/bootloader/fb_draw.c src/bootloader/
 # thing this bootloader intentionally over-links (subprocess.c, for the
 # mount helper calls; input_device_utils.c) is small, but neither is used
 # in full, so this actually earns its keep here rather than being cargo-cult.
-BOOTLOADER_CFLAGS = -O2 -Wall -I. -Isrc/bootloader -Isrc/hardware -Isrc/core -ffunction-sections -fdata-sections
+BOOTLOADER_CFLAGS = -O2 -Wall -I. -Isrc/bootloader -Isrc/hardware -Isrc/core $(BOARD_DEFINE) -ffunction-sections -fdata-sections
 
 bootloader:
-	@mkdir -p build_target
-	$(CROSS_CC) $(BOOTLOADER_CFLAGS) -static -no-pie $(BOOTLOADER_SRCS) -o build_target/$(BOOTLOADER_BIN)_unstripped -Wl,--gc-sections
-	$(CROSS_STRIP) -s -o $(BOOTLOADER_BIN) build_target/$(BOOTLOADER_BIN)_unstripped
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CROSS_CC) $(BOOTLOADER_CFLAGS) -static -no-pie $(BOOTLOADER_SRCS) -o $(BUILD_TARGET_DIR)/$(BOOTLOADER_BIN)_unstripped -Wl,--gc-sections
+	$(CROSS_STRIP) -s -o $(BOOTLOADER_BIN) $(BUILD_TARGET_DIR)/$(BOOTLOADER_BIN)_unstripped
 	@echo "Bootloader build complete: File ready at '$(BOOTLOADER_BIN)'"
 
 # Host-buildable unit tests for sd_ready.c's pure wait_for_sd_ready() state
@@ -685,25 +727,25 @@ bootloader:
 # linked into this binary). Not part of `all`: run explicitly with
 # `make sd_ready_test` after touching sd_ready.c or its header.
 sd_ready_test:
-	@mkdir -p build_target
+	@mkdir -p $(BUILD_TARGET_DIR)
 	$(CC) -O0 -g -Wall -Isrc/bootloader src/bootloader/sd_ready.c src/bootloader/sd_ready_test.c \
-	    -o build_target/sd_ready_test
-	./build_target/sd_ready_test
+	    -o $(BUILD_TARGET_DIR)/sd_ready_test
+	./$(BUILD_TARGET_DIR)/sd_ready_test
 
 # Host-buildable tests for JPEG scale selection, tjpgd 1/2 1/4 1/8 decode,
 # cover_decode_to_rgb565_ex, and malformed/oversized rejection. Links the
 # real decoder + tjpgd + artwork coordinator; audio_is_playing and lodepng
 # are stubbed in the test (JPEG-only). Not part of `all`.
 cover_decode_scale_test:
-	@mkdir -p build_target
+	@mkdir -p $(BUILD_TARGET_DIR)
 	$(CC) -O0 -g -Wall -DHOST_BUILD=1 -DLV_CONF_INCLUDE_SIMPLE=1 \
 	    -I. -Isrc/library -Isrc/core -Isrc/audio -Ilvgl \
 	    src/library/cover_decode_scale_test.c src/library/cover_decode.c \
 	    src/library/artwork_coordinator.c lvgl/src/libs/tjpgd/tjpgd.c \
-	    -lpthread -o build_target/cover_decode_scale_test
-	./build_target/cover_decode_scale_test
+	    -lpthread -o $(BUILD_TARGET_DIR)/cover_decode_scale_test
+	./$(BUILD_TARGET_DIR)/cover_decode_scale_test
 
-build_target/%.o: src/%.c $(LVGL_PATCH_STAMP)
+$(BUILD_TARGET_DIR)/%.o: src/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
@@ -713,55 +755,55 @@ build_target/%.o: src/%.c $(LVGL_PATCH_STAMP)
 # bootloader scanner always has one current BUILD_STAMP to find.
 FORCE_VERSION:
 
-build_target/core/app_version.o: src/core/app_version.c $(LVGL_PATCH_STAMP) FORCE_VERSION
+$(BUILD_TARGET_DIR)/core/app_version.o: src/core/app_version.c $(LVGL_PATCH_STAMP) FORCE_VERSION
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
-build_target/%.o: src/%.cpp $(LVGL_PATCH_STAMP)
+$(BUILD_TARGET_DIR)/%.o: src/%.cpp $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CROSS_CXX) $(TARGET_CXXFLAGS) -c $< -o $@
 
-build_target/lvgl/%.o: $(LVGL_DIR)/%.c $(LVGL_PATCH_STAMP)
+$(BUILD_TARGET_DIR)/lvgl/%.o: $(LVGL_DIR)/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
-build_target/tinyalsa/%.o: $(TINYALSA_DIR)/%.c
+$(BUILD_TARGET_DIR)/tinyalsa/%.o: $(TINYALSA_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TINYALSA_CFLAGS) -c $< -o $@
 
-build_target/faad2/%.o: $(FAAD2_DIR)/libfaad/%.c
+$(BUILD_TARGET_DIR)/faad2/%.o: $(FAAD2_DIR)/libfaad/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(FAAD2_CFLAGS) -c $< -o $@
 
-build_target/alac/%.o: $(ALAC_DIR)/codec/%.c
+$(BUILD_TARGET_DIR)/alac/%.o: $(ALAC_DIR)/codec/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(ALAC_CFLAGS) -c $< -o $@
 
-build_target/alac/%.o: $(ALAC_DIR)/codec/%.cpp
+$(BUILD_TARGET_DIR)/alac/%.o: $(ALAC_DIR)/codec/%.cpp
 	@mkdir -p $(dir $@)
 	$(CROSS_CXX) $(ALAC_CXXFLAGS) -c $< -o $@
 
-build_target/mbedtls/%.o: $(MBEDTLS_DIR)/library/%.c
+$(BUILD_TARGET_DIR)/mbedtls/%.o: $(MBEDTLS_DIR)/library/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
-build_target/cjson/%.o: $(CJSON_DIR)/%.c
+$(BUILD_TARGET_DIR)/cjson/%.o: $(CJSON_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
-build_target/stb_vorbis/%.o: $(STB_VORBIS_DIR)/%.c
+$(BUILD_TARGET_DIR)/stb_vorbis/%.o: $(STB_VORBIS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
-build_target/dbus/%.o: $(DBUS_DIR)/dbus/%.c
+$(BUILD_TARGET_DIR)/dbus/%.o: $(DBUS_DIR)/dbus/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(DBUS_CFLAGS) -c $< -o $@
 
-build_target/opus/%.o: $(OPUS_DIR)/%.c
+$(BUILD_TARGET_DIR)/opus/%.o: $(OPUS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(OPUS_CFLAGS) -c $< -o $@
 
-build_target/lua/%.o: $(LUA_DIR)/src/%.c
+$(BUILD_TARGET_DIR)/lua/%.o: $(LUA_DIR)/src/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(LUA_CFLAGS) -c $< -o $@
 
@@ -770,4 +812,7 @@ compile_commands.json:
 	@python3 generate_compile_commands.py
 
 clean:
-	rm -rf build_host build_target $(HOST_BIN) $(TARGET_BIN) compile_commands.json compile_flags.txt
+	rm -rf build_host build_host_* build_target build_target_* \
+	    open_hiby_player_host open_hiby_player_host_* \
+	    open_hiby_player_target open_hiby_player_target_* \
+	    compile_commands.json compile_flags.txt

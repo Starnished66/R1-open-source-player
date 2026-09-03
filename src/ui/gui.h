@@ -2,6 +2,7 @@
 #define GUI_H
 
 #include "lvgl/lvgl.h"
+#include "board_config.h"
 #include "settings.h"
 #include "gui_theme.h"
 #include "gui_notifications.h"
@@ -310,8 +311,14 @@ void gui_plugin_clear_interval(int slot);
 void gui_plugin_show_text_input(const char * title, const char * initial_text, bool is_password);
 
 
-#define COVER_ART_WIDTH 480
-#define COVER_ART_HEIGHT 480
+/* The real decoded-cover render target -- must equal each board's own
+ * default_cover_565.png dimensions (BOARD_PLAYER_COVER_HEIGHT, board_
+ * config.h's own comment) so a real playing track's art occupies exactly
+ * the same footprint the placeholder cover does, keeping the Player
+ * screen's cover+overlay = full screen height invariant true whether or
+ * not anything is actually playing. */
+#define COVER_ART_WIDTH BOARD_SCREEN_WIDTH
+#define COVER_ART_HEIGHT BOARD_PLAYER_COVER_HEIGHT
 
 
 typedef enum {

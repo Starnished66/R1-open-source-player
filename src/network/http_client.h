@@ -141,4 +141,13 @@ bool http_get_to_file_ex(const char * url, bool verify_tls, const char * dest_pa
 bool http_get_to_file_bounded(const char * url, bool verify_tls, const char * dest_path, size_t max_body_size,
                                http_progress_cb_t progress_cb, void * progress_user_data);
 
+/* Cancellable, bounded-wait variant for application-owned background jobs.
+ * A Wi-Fi shutdown can interrupt a blocked socket through cancel; the two
+ * stage timeouts ensure a lost peer cannot retain the job forever even when
+ * no explicit cancellation occurs. */
+bool http_get_to_file_cancelable(const char * url, bool verify_tls, const char * dest_path,
+                                  http_progress_cb_t progress_cb, void * progress_user_data,
+                                  uint32_t connect_timeout_ms, uint32_t read_timeout_ms,
+                                  http_cancel_token_t * cancel);
+
 #endif /* HTTP_CLIENT_H */

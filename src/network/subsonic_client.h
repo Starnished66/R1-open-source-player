@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "http_client.h"
 
 /* Connection details for one configured server. verify_tls false skips
  * HTTPS certificate verification -- an explicit, per-server opt-in for
@@ -58,23 +59,24 @@ typedef struct {
  * that's a reasonable amount of detail for a first "Test Connection"
  * button; a real error message would need threading a string back, which
  * isn't done here. */
-bool subsonic_ping(const subsonic_server_t * server);
+bool subsonic_ping(const subsonic_server_t * server, http_cancel_token_t * cancel);
 
 /* getArtists.view, flattened out of its "index by first letter" grouping
  * into one array sorted the way the server already returns it (which is
  * alphabetical) -- the local library's own Artists screen doesn't group by
  * letter either, so this matches that for a consistent feel. Caller owns
  * *out_artists (free() the array itself; no nested allocations). */
-bool subsonic_get_artists(const subsonic_server_t * server, subsonic_artist_t ** out_artists, int * out_count);
+bool subsonic_get_artists(const subsonic_server_t * server, subsonic_artist_t ** out_artists, int * out_count,
+                           http_cancel_token_t * cancel);
 
 /* getArtist.view -- that artist's albums. */
 bool subsonic_get_artist_albums(const subsonic_server_t * server, const char * artist_id,
-                                 subsonic_album_t ** out_albums, int * out_count);
+                                 subsonic_album_t ** out_albums, int * out_count, http_cancel_token_t * cancel);
 
 /* getAlbum.view -- that album's songs, in the order the server returns
  * them (already track-ordered). */
 bool subsonic_get_album_songs(const subsonic_server_t * server, const char * album_id,
-                               subsonic_song_t ** out_songs, int * out_count);
+                               subsonic_song_t ** out_songs, int * out_count, http_cancel_token_t * cancel);
 
 /* getAlbumList2.view (type=alphabeticalByName) -- every album in the whole
  * library, not scoped to one artist (unlike subsonic_get_artist_albums()
@@ -83,17 +85,19 @@ bool subsonic_get_album_songs(const subsonic_server_t * server, const char * alb
  * been tested against, but a genuinely huge server library could be
  * truncated; not expected to matter in practice for a portable player's
  * use case. Caller owns *out_albums. */
-bool subsonic_get_all_albums(const subsonic_server_t * server, subsonic_album_t ** out_albums, int * out_count);
+bool subsonic_get_all_albums(const subsonic_server_t * server, subsonic_album_t ** out_albums, int * out_count,
+                              http_cancel_token_t * cancel);
 
 /* getPlaylists.view -- every playlist visible to this user. Caller owns
  * *out_playlists. */
-bool subsonic_get_playlists(const subsonic_server_t * server, subsonic_playlist_t ** out_playlists, int * out_count);
+bool subsonic_get_playlists(const subsonic_server_t * server, subsonic_playlist_t ** out_playlists, int * out_count,
+                             http_cancel_token_t * cancel);
 
 /* getPlaylist.view -- that playlist's songs, in playlist order. Same
  * subsonic_song_t shape as subsonic_get_album_songs() (a playlist entry and
  * an album's song are the same "Child" element in the Subsonic API). */
 bool subsonic_get_playlist_songs(const subsonic_server_t * server, const char * playlist_id,
-                                  subsonic_song_t ** out_songs, int * out_count);
+                                  subsonic_song_t ** out_songs, int * out_count, http_cancel_token_t * cancel);
 
 /* Builds the full stream.view URL (auth params included) for song_id.
  * mp3/flac songs get played directly against this URL (see decoder_open()

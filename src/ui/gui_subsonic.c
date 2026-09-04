@@ -8,6 +8,7 @@
 #include "assets.h"
 #include "metadata.h"
 #include "subsonic_client.h"
+#include "http_client.h"
 #include "device_config.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -19,9 +20,6 @@ void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list,
 
 
 extern player_settings_t current_settings;
-extern gui_busy_handle_t wifi_connect_saved_token;
-
-
 #define SUBSONIC_STREAM_CACHE_DIR MUSIC_ROOT_DIR "/.subsonic_cache"
 #define TITLE_LABEL_LEFT_INSET 76
 #define TITLE_LABEL_DEFAULT_RIGHT_MARGIN 20
@@ -52,7 +50,8 @@ typedef struct {
     bool verify_tls;
 } download_request_t;
 
-extern bool http_get_to_file(const char * url, bool verify_tls, const char * dest_path, const char * etag, char * new_etag_out);
+#define SUBSONIC_FILE_CONNECT_TIMEOUT_MS 10000U
+#define SUBSONIC_FILE_READ_TIMEOUT_MS 30000U
 
 typedef struct {
     subsonic_server_t server;
@@ -142,10 +141,13 @@ static subsonic_server_t subsonic_server_from_settings(void) {
 }
 
 static pthread_t download_thread;
+static http_cancel_token_t download_cancel;
 
 static void * download_thread_func(void * arg) {
     download_request_t * req = (download_request_t *) arg;
-    bool ok = http_get_to_file(req->url, req->verify_tls, req->dest_path, NULL, NULL);
+    bool ok = http_get_to_file_cancelable(req->url, req->verify_tls, req->dest_path, NULL, NULL,
+                                           SUBSONIC_FILE_CONNECT_TIMEOUT_MS, SUBSONIC_FILE_READ_TIMEOUT_MS,
+                                           &download_cancel);
     download_success_flag = ok;
     atomic_store_explicit(&download_done_flag, true, memory_order_release); /* written last -- update_timer_cb only checks this flag */
     free(req);
@@ -163,12 +165,14 @@ static void start_subsonic_download(const char * url, bool verify_tls, const cha
 
     atomic_store_explicit(&download_done_flag, false, memory_order_relaxed);
     download_success_flag = false;
+    http_cancel_token_init(&download_cancel);
     download_active = true;
 
     download_token = gui_busy_show("Downloading", display_title);
 
-        if (pthread_create(&download_thread, NULL, download_thread_func, req) != 0) {
+    if (pthread_create(&download_thread, NULL, download_thread_func, req) != 0) {
         download_active = false;
+        http_cancel_token_destroy(&download_cancel);
         free(req);
         gui_busy_hide(download_token);
         show_error_toast("Thread launch failed");
@@ -180,6 +184,7 @@ void poll_subsonic_download(void) {
 
     download_active = false;
     pthread_join(download_thread, NULL);
+    http_cancel_token_destroy(&download_cancel);
     bool success = download_success_flag;
 
     /* Real-device bug report: a downloaded Subsonic track needed a second
@@ -238,6 +243,7 @@ static void sanitize_path_component(const char * in, char * out, size_t out_size
 }
 
 static pthread_t subsonic_library_download_thread;
+static http_cancel_token_t subsonic_library_download_cancel;
 
 bool subsonic_library_download_active = false;
 
@@ -259,9 +265,11 @@ static void * subsonic_library_download_thread_func(void * arg) {
         int capacity = 0;
         int count = 0;
         for (int i = 0; i < req->album_to_expand_count; i++) {
+            if (http_cancel_token_is_cancelled(&subsonic_library_download_cancel)) break;
             subsonic_song_t * album_songs = NULL;
             int album_song_count = 0;
-            if (subsonic_get_album_songs(&req->server, req->albums_to_expand[i].id, &album_songs, &album_song_count)) {
+            if (subsonic_get_album_songs(&req->server, req->albums_to_expand[i].id, &album_songs,
+                                          &album_song_count, &subsonic_library_download_cancel)) {
                 if (count + album_song_count > capacity) {
                     capacity = (count + album_song_count) * 2;
                     songs = realloc(songs, sizeof(subsonic_song_t) * (size_t) capacity);
@@ -281,6 +289,7 @@ static void * subsonic_library_download_thread_func(void * arg) {
     int success_count = 0;
 
     for (int i = 0; i < song_count; i++) {
+        if (http_cancel_token_is_cancelled(&subsonic_library_download_cancel)) break;
         subsonic_song_t * song = &songs[i];
 
         char safe_artist[160], safe_album[160], safe_title[160];
@@ -301,7 +310,9 @@ static void * subsonic_library_download_thread_func(void * arg) {
 
         char url[1536];
         subsonic_build_stream_url(&req->server, song->id, url, sizeof(url));
-        bool ok = http_get_to_file(url, req->server.verify_tls, dest_path, NULL, NULL);
+        bool ok = http_get_to_file_cancelable(url, req->server.verify_tls, dest_path, NULL, NULL,
+                                               SUBSONIC_FILE_CONNECT_TIMEOUT_MS, SUBSONIC_FILE_READ_TIMEOUT_MS,
+                                               &subsonic_library_download_cancel);
 
         if (ok) {
             success_count++;
@@ -344,13 +355,15 @@ static void start_subsonic_library_download(subsonic_song_t * songs, int song_co
     atomic_store_explicit(&subsonic_library_download_total, albums_to_expand ? 0 : song_count, memory_order_relaxed); /* 0 = "still figuring out the total," see poll_subsonic_library_download() */
     subsonic_library_download_success_count = 0;
     atomic_store_explicit(&subsonic_library_download_done_flag, false, memory_order_relaxed);
+    http_cancel_token_init(&subsonic_library_download_cancel);
     subsonic_library_download_active = true;
 
     subsonic_library_download_token = gui_busy_show(progress_label, "");
     gui_busy_set_progress(subsonic_library_download_token, 0);
 
-        if (pthread_create(&subsonic_library_download_thread, NULL, subsonic_library_download_thread_func, req) != 0) {
+    if (pthread_create(&subsonic_library_download_thread, NULL, subsonic_library_download_thread_func, req) != 0) {
         subsonic_library_download_active = false;
+        http_cancel_token_destroy(&subsonic_library_download_cancel);
         free(req);
         gui_busy_hide(subsonic_library_download_token);
         show_error_toast("Thread launch failed");
@@ -370,6 +383,7 @@ void poll_subsonic_library_download(void) {
 
     subsonic_library_download_active = false;
     pthread_join(subsonic_library_download_thread, NULL);
+    http_cancel_token_destroy(&subsonic_library_download_cancel);
 
     /* Leave this download's own use of the shared "please wait" screen
      * before either branch below -- start_library_rescan() pushes that same
@@ -646,6 +660,7 @@ static void subsonic_album_row_click_cb(int index);
 static void subsonic_playlist_row_click_cb(lv_event_t * e);
 
 static pthread_t subsonic_browse_thread;
+static http_cancel_token_t subsonic_browse_cancel;
 
 static bool subsonic_browse_active = false;
 
@@ -672,19 +687,24 @@ static void * subsonic_browse_thread_func(void * arg) {
 
     switch (req->kind) {
         case SUBSONIC_BROWSE_ALBUM_SONGS:
-            ok = subsonic_get_album_songs(&req->server, req->id, &subsonic_browse_result_songs, &count);
+            ok = subsonic_get_album_songs(&req->server, req->id, &subsonic_browse_result_songs, &count,
+                                           &subsonic_browse_cancel);
             break;
         case SUBSONIC_BROWSE_ARTIST_ALBUMS:
-            ok = subsonic_get_artist_albums(&req->server, req->id, &subsonic_browse_result_albums, &count);
+            ok = subsonic_get_artist_albums(&req->server, req->id, &subsonic_browse_result_albums, &count,
+                                             &subsonic_browse_cancel);
             break;
         case SUBSONIC_BROWSE_PLAYLIST_SONGS:
-            ok = subsonic_get_playlist_songs(&req->server, req->id, &subsonic_browse_result_songs, &count);
+            ok = subsonic_get_playlist_songs(&req->server, req->id, &subsonic_browse_result_songs, &count,
+                                              &subsonic_browse_cancel);
             break;
         case SUBSONIC_BROWSE_PLAYLISTS:
-            ok = subsonic_get_playlists(&req->server, &subsonic_browse_result_playlists, &count);
+            ok = subsonic_get_playlists(&req->server, &subsonic_browse_result_playlists, &count,
+                                         &subsonic_browse_cancel);
             break;
         case SUBSONIC_BROWSE_ALL_ALBUMS:
-            ok = subsonic_get_all_albums(&req->server, &subsonic_browse_result_albums, &count);
+            ok = subsonic_get_all_albums(&req->server, &subsonic_browse_result_albums, &count,
+                                          &subsonic_browse_cancel);
             break;
     }
 
@@ -712,11 +732,13 @@ static void start_subsonic_browse(subsonic_browse_kind_t kind, const char * id, 
     subsonic_browse_result_count = 0;
     atomic_store_explicit(&subsonic_browse_done_flag, false, memory_order_relaxed);
     subsonic_browse_success_flag = false;
+    http_cancel_token_init(&subsonic_browse_cancel);
     subsonic_browse_active = true;
 
     subsonic_browse_token = gui_busy_show("Loading from server...", "");
     if (pthread_create(&subsonic_browse_thread, NULL, subsonic_browse_thread_func, req) != 0) {
         subsonic_browse_active = false;
+        http_cancel_token_destroy(&subsonic_browse_cancel);
         free(req);
         gui_busy_hide(subsonic_browse_token);
     }
@@ -727,6 +749,7 @@ void poll_subsonic_browse(void) {
 
     subsonic_browse_active = false;
     pthread_join(subsonic_browse_thread, NULL);
+    http_cancel_token_destroy(&subsonic_browse_cancel);
     bool success = subsonic_browse_success_flag;
     int depth_before = gui_navigation_get_depth();
 
@@ -931,6 +954,7 @@ static void build_subsonic_download_confirm_popup(void) {
 }
 
 static pthread_t subsonic_connect_thread;
+static http_cancel_token_t subsonic_connect_cancel;
 
 bool subsonic_connect_active = false;
 
@@ -943,12 +967,13 @@ static subsonic_server_t subsonic_connect_pending_server;
 static void * subsonic_connect_thread_func(void * arg) {
     subsonic_connect_request_t * req = (subsonic_connect_request_t *) arg;
 
-    bool ok = subsonic_ping(&req->server);
+    bool ok = subsonic_ping(&req->server, &subsonic_connect_cancel);
     if (ok) {
         free(subsonic_artists_cache);
         subsonic_artists_cache = NULL;
         subsonic_artists_count = 0;
-        ok = subsonic_get_artists(&req->server, &subsonic_artists_cache, &subsonic_artists_count);
+        ok = subsonic_get_artists(&req->server, &subsonic_artists_cache, &subsonic_artists_count,
+                                   &subsonic_connect_cancel);
     }
 
     subsonic_connect_success_flag = ok;
@@ -962,6 +987,7 @@ void poll_subsonic_connect(void) {
 
     subsonic_connect_active = false;
     pthread_join(subsonic_connect_thread, NULL);
+    http_cancel_token_destroy(&subsonic_connect_cancel);
     bool success = subsonic_connect_success_flag;
 
     /* Same nav_pop()-races-a-navigating-callback issue already fixed for
@@ -1019,15 +1045,16 @@ void poll_subsonic_connect(void) {
     if (gui_navigation_get_depth() > depth_before) {
         nav_remove_stack_slot(depth_before - 1);
     } else {
-        gui_busy_hide(wifi_connect_saved_token);
+        gui_busy_hide(subsonic_connect_token);
     }
+    subsonic_connect_token = 0;
     /* else (failure): silently stays wherever nav_pop() landed -- same
      * documented gap as poll_subsonic_download above. */
 }
 
 /* Bug report: opening Subsonic (or attempting a connection from within it)
  * with no real Wi-Fi connection established just sat in the "Connecting to
- * server..." busy overlay until subsonic_client.h's own HTTP timeout, then
+ * server..." busy overlay until the underlying socket failed, then
  * -- per this file's own documented gap just above -- silently landed back
  * wherever nav_pop() left off, with no indication anything failed. Unlike
  * the four Wireless tiles' own guard (gui_network.c's wifi_feature_guard(),
@@ -1061,6 +1088,7 @@ static void start_subsonic_connect(const subsonic_server_t * server) {
 
     atomic_store_explicit(&subsonic_connect_done_flag, false, memory_order_relaxed);
     subsonic_connect_success_flag = false;
+    http_cancel_token_init(&subsonic_connect_cancel);
     subsonic_connect_active = true;
 
     subsonic_connect_token = gui_busy_show("Connecting to server...", "");
@@ -1068,6 +1096,7 @@ static void start_subsonic_connect(const subsonic_server_t * server) {
     if (pthread_create(&subsonic_connect_thread, NULL, subsonic_connect_thread_func, req) != 0) {
         free(req);
         subsonic_connect_active = false;
+        http_cancel_token_destroy(&subsonic_connect_cancel);
         gui_busy_dismiss(subsonic_connect_token);
         subsonic_connect_token = 0;
         show_info_toast("Failed to start connection");
@@ -1336,24 +1365,39 @@ bool gui_subsonic_has_background_work(void) {
     return download_active || subsonic_library_download_active || subsonic_connect_active || subsonic_browse_active;
 }
 
+void gui_subsonic_handle_wifi_disabled(void) {
+    /* The activity flags remain set until the normal poll functions join
+     * their workers and dismiss their UI. Cancellation only interrupts the
+     * socket here; it never blocks the GUI thread waiting for DNS/TCP/TLS. */
+    if (subsonic_connect_active) http_cancel_token_cancel(&subsonic_connect_cancel);
+    if (subsonic_browse_active) http_cancel_token_cancel(&subsonic_browse_cancel);
+    if (download_active) http_cancel_token_cancel(&download_cancel);
+    if (subsonic_library_download_active) http_cancel_token_cancel(&subsonic_library_download_cancel);
+}
+
 void gui_subsonic_cancel_background_work(void) {
+    gui_subsonic_handle_wifi_disabled();
     if (subsonic_connect_active) {
         pthread_join(subsonic_connect_thread, NULL);
         subsonic_connect_active = false;
+        http_cancel_token_destroy(&subsonic_connect_cancel);
         gui_busy_hide(subsonic_connect_token);
     }
     if (download_active) {
         pthread_join(download_thread, NULL);
         download_active = false;
+        http_cancel_token_destroy(&download_cancel);
         gui_busy_hide(download_token);
     }
     if (subsonic_library_download_active) {
         pthread_join(subsonic_library_download_thread, NULL);
         subsonic_library_download_active = false;
+        http_cancel_token_destroy(&subsonic_library_download_cancel);
         gui_busy_hide(subsonic_library_download_token);
     }
     if (subsonic_browse_active) {
         pthread_join(subsonic_browse_thread, NULL);
         subsonic_browse_active = false;
+        http_cancel_token_destroy(&subsonic_browse_cancel);
     }
 }

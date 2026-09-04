@@ -132,7 +132,8 @@ static bool write_all(http_conn_t * conn, const uint8_t * data, size_t len) {
 
 static bool read_response(http_conn_t * conn, int * out_status, body_sink_t * sink); /* defined below -- shared by do_get()/do_post() */
 
-static bool do_get(const char * url, bool verify_tls, int * out_status, body_sink_t * sink) {
+static bool do_get_ex(const char * url, bool verify_tls, int * out_status, body_sink_t * sink,
+                      uint32_t connect_timeout_ms, uint32_t read_timeout_ms, http_cancel_token_t * cancel) {
     bool is_https;
     char host[256], port[16], path[2048];
     if (!http_conn_parse_url(url, &is_https, host, sizeof(host), port, sizeof(port), path, sizeof(path))) {
@@ -141,7 +142,9 @@ static bool do_get(const char * url, bool verify_tls, int * out_status, body_sin
     }
 
     http_conn_t conn;
-    if (!http_conn_open(&conn, host, port, is_https, verify_tls)) {
+    http_conn_error_t conn_error;
+    if (!http_conn_open_ex(&conn, host, port, is_https, verify_tls, connect_timeout_ms, read_timeout_ms,
+                           cancel, &conn_error)) {
         DBG_LOG("http_client: conn_open failed for host='%s' port='%s' https=%d\n", host, port, is_https);
         http_conn_close(&conn);
         return false;
@@ -165,6 +168,10 @@ static bool do_get(const char * url, bool verify_tls, int * out_status, body_sin
     bool ok = read_response(&conn, out_status, sink);
     http_conn_close(&conn);
     return ok;
+}
+
+static bool do_get(const char * url, bool verify_tls, int * out_status, body_sink_t * sink) {
+    return do_get_ex(url, verify_tls, out_status, sink, 0, 0, NULL);
 }
 
 /* Same connection-handling shape as do_get() above, with a request body --
@@ -368,6 +375,28 @@ bool http_get_to_file_bounded(const char * url, bool verify_tls, const char * de
                           .progress_cb = progress_cb, .progress_user_data = progress_user_data,
                           .out_content_type = NULL, .out_content_type_size = 0 };
     bool ok = do_get(url, verify_tls, &status, &sink);
+    fclose(f);
+
+    if (!ok || status < 200 || status >= 300) {
+        remove(dest_path);
+        return false;
+    }
+    return true;
+}
+
+bool http_get_to_file_cancelable(const char * url, bool verify_tls, const char * dest_path,
+                                  http_progress_cb_t progress_cb, void * progress_user_data,
+                                  uint32_t connect_timeout_ms, uint32_t read_timeout_ms,
+                                  http_cancel_token_t * cancel) {
+    FILE * f = fopen(dest_path, "wb");
+    if (!f) return false;
+
+    int status = 0;
+    body_sink_t sink = { .out_buffer = NULL, .out_buffer_size = NULL, .out_file = f,
+                          .buffer_capacity = 0, .max_buffer_size = HTTP_FILE_DOWNLOAD_DEFAULT_MAX_BYTES,
+                          .progress_cb = progress_cb, .progress_user_data = progress_user_data,
+                          .out_content_type = NULL, .out_content_type_size = 0 };
+    bool ok = do_get_ex(url, verify_tls, &status, &sink, connect_timeout_ms, read_timeout_ms, cancel);
     fclose(f);
 
     if (!ok || status < 200 || status >= 300) {

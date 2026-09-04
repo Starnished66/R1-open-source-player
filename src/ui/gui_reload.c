@@ -181,7 +181,6 @@ void gui_soft_reload(void) {
     gui_stream_media_teardown();
     reload_diag("gui_shell_teardown: before");
     gui_shell_teardown();
-    gui_player_release_shared_assets();
 
     reload_diag("lv_image_cache_drop: before");
     lv_image_cache_drop(NULL);

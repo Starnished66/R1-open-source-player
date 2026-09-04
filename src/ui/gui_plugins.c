@@ -524,13 +524,15 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
 
     lv_obj_t * slider = lv_slider_create(card); /* child 2 */
     lv_obj_set_width(slider, lv_pct(88));
-    lv_obj_set_height(slider, 32);
+    lv_obj_set_height(slider, SLIDER_TRACK_HEIGHT);
     lv_obj_align(slider, LV_ALIGN_BOTTOM_MID, 0, -14);
     if (max <= min) max = min + 1; /* lv_slider_set_range requires min < max */
     lv_slider_set_range(slider, min, max);
     lv_slider_set_value(slider, value, LV_ANIM_OFF);
     lv_obj_add_style(slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(slider, gui_theme_accent_style(), LV_PART_KNOB);
+    lv_obj_add_style(slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
+    lv_obj_set_style_width(slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_set_ext_click_area(slider, 20);
     lv_obj_add_event_cb(slider, slider_event_cb, LV_EVENT_ALL, user_data);
 

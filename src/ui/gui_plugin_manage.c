@@ -89,10 +89,11 @@ static void plugin_manage_toggle_cb(lv_event_t * e) {
      * (plugin_disabled_list_set() itself already rolled its own in-memory
      * state back on failure -- manage_entries[index].disabled still holds
      * that last known-good value). */
+    /* Real lv_switch now (PILL_ACCESSORY_TOGGLE, screen_builders.c) --
+     * CHECKED state alone drives its visual, no sprite swap needed. */
     bool restore_checked = !manage_entries[index].disabled;
     if (restore_checked) lv_obj_add_state(toggle_img, LV_STATE_CHECKED);
     else lv_obj_clear_state(toggle_img, LV_STATE_CHECKED);
-    lv_image_set_src(toggle_img, asset_path(restore_checked ? "settings/on.png" : "settings/off.png"));
     show_info_toast("Couldn't save -- plugin change was not applied");
 }
 

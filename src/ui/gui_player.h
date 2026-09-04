@@ -24,14 +24,15 @@ void show_volume_popup(int32_t percent);
 void hide_volume_popup(void);
 void poll_volume_popup_timeout(void);
 void refresh_play_btn_icon(void);
+/* Recolored btn_play/btn_pause (white disc, accent-colored glyph). Falls
+ * back to the stock path if decode failed. Shared by the player transport
+ * row and the quick-drawer copy. */
+const void * gui_player_play_btn_image_src(bool is_playing);
 void refresh_format_badge(void);
 void set_play_button_state(bool is_playing);
 void hide_more_menu_popup(void);
 
 void configure_native_slider_rail(lv_obj_t * slider);
-const lv_image_dsc_t * gui_player_volume_cursor_image(void);
-/* Call only after both gui_player_teardown() and gui_shell_teardown(). */
-void gui_player_release_shared_assets(void);
 void cycle_play_mode(void);
 void gui_player_set_play_mode(int mode);
 void resolve_replaygain(const track_metadata_t * meta, bool * out_has_gain, double * out_gain_db, bool * out_has_peak, double * out_peak);

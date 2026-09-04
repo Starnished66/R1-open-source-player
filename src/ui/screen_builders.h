@@ -196,7 +196,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
 typedef enum {
     PILL_ACCESSORY_NONE = 0,
     PILL_ACCESSORY_CHEVRON, /* no matching real asset found -- plain ">" label */
-    PILL_ACCESSORY_TOGGLE,  /* real settings/on.png + settings/off.png sprite swap */
+    PILL_ACCESSORY_TOGGLE,  /* real lv_switch, standardized to match the Settings screen's own switches */
 } pill_accessory_type_t;
 
 typedef struct {
@@ -208,11 +208,11 @@ typedef struct {
     void * user_data;
     /* Optional (NULL for every row that doesn't need it): on a
      * PILL_ACCESSORY_TOGGLE row, *out_toggle_img is set to the toggle's own
-     * lv_image_t once built, so a caller can update its sprite/LV_STATE_CHECKED
+     * lv_switch once built, so a caller can update its LV_STATE_CHECKED
      * later from somewhere else entirely (e.g. a quick-drawer icon that
      * mirrors the same underlying setting) -- these screens are built once
      * at startup and never rebuilt, so nothing else keeps this row's visual
-     * state in sync with the setting on its own. See gui.c's
+     * state in sync with the setting on its own. See gui_settings.c's
      * settings_crossfade_toggle_img for the motivating real-device bug
      * (drawer/settings crossfade toggles falling out of sync). */
     lv_obj_t ** out_toggle_img;
@@ -336,7 +336,8 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size);
  * touch_list/item_bg.png pill rows, each with a label and an optional
  * right-side chevron or toggle. toggle_accent_style is applied (via
  * lv_obj_add_style(), not read as a plain value) to every PILL_ACCESSORY_
- * TOGGLE row's on.png/off.png sprite -- a style pointer rather than a
+ * TOGGLE row's own lv_switch (LV_PART_INDICATOR|LV_STATE_CHECKED) -- a
+ * style pointer rather than a
  * resolved lv_color_t like build_compact_list_widget()'s own
  * now_playing_color, specifically because these pill-list screens are each
  * built once at startup and never rebuilt (see e.g.

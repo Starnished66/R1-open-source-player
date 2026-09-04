@@ -96,12 +96,17 @@ lv_obj_t * more_menu_popup_backdrop = NULL;
 static lv_obj_t * volume_popup_track = NULL;
 static lv_obj_t * volume_popup_speaker_icon = NULL;
 static lv_timer_t * volume_popup_hide_timer = NULL;
-static const lv_image_dsc_t * volume_cursor_image = NULL;
 static const lv_image_dsc_t * progress_bg_image = NULL;
 static const lv_image_dsc_t * progress_fill_image = NULL;
-static const lv_image_dsc_t * progress_cursor_image = NULL;
 static asset_decoded_image_t volume_popup_bg_image;
 static asset_decoded_image_t volume_popup_speaker_image;
+/* Decoded copies of btn_play.png / btn_pause.png with the baked-in cyan
+ * glyph rewritten to the current accent. Kept across widget teardown so
+ * the quick-drawer button (destroyed later in gui_shell_teardown) never
+ * holds a freed src pointer during reload. */
+static asset_decoded_image_t play_btn_play_img;
+static asset_decoded_image_t play_btn_pause_img;
+static void load_play_btn_images(void);
 static lv_obj_t * delete_song_popup = NULL;
 static lv_obj_t * delete_song_popup_backdrop = NULL;
 static lv_obj_t * delete_song_popup_title = NULL;
@@ -221,7 +226,7 @@ static void volume_popup_track_event_cb(lv_event_t * e) {
 /* The stock rail sprites are 360 px wide. LVGL centers a background image
  * at its native size instead of scaling it to the part, so they protrude
  * from the 360 px volume rail and the dynamically narrower brightness rail.
- * Paint those two rails natively; keep cursor.png only for the knob. */
+ * Paint those two rails natively; knobs use the shared vector ring style. */
 void configure_native_slider_rail(lv_obj_t * slider) {
     lv_obj_set_style_bg_image_src(slider, NULL, LV_PART_MAIN);
     lv_obj_set_style_bg_image_src(slider, NULL, LV_PART_INDICATOR);
@@ -230,12 +235,6 @@ void configure_native_slider_rail(lv_obj_t * slider) {
     lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
-}
-
-const lv_image_dsc_t * gui_player_volume_cursor_image(void) {
-    if (!volume_cursor_image)
-        volume_cursor_image = asset_png_memory("volume/cursor.png");
-    return volume_cursor_image;
 }
 
 bool gui_player_volume_control_hit_test(lv_point_t point) {
@@ -270,21 +269,16 @@ static void build_volume_popup(void) {
     lv_obj_align(volume_popup_speaker_icon, LV_ALIGN_LEFT_MID, 20, 0);
 
     volume_popup_track = lv_slider_create(volume_popup);
-    lv_obj_set_size(volume_popup_track, 360, 12);
+    lv_obj_set_size(volume_popup_track, 360, SLIDER_TRACK_HEIGHT);
     lv_obj_align(volume_popup_track, LV_ALIGN_RIGHT_MID, -20, 0);
     lv_slider_set_range(volume_popup_track, 0, 100);
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_KNOB);
-    const lv_image_dsc_t * cursor = gui_player_volume_cursor_image();
-    lv_obj_set_style_bg_image_src(volume_popup_track,
-                                  cursor ? (const void *) cursor : asset_path("volume/cursor.png"),
-                                  LV_PART_KNOB);
     lv_obj_add_style(volume_popup_track, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(volume_popup_track, gui_theme_accent_style(), LV_PART_KNOB);
+    lv_obj_add_style(volume_popup_track, gui_theme_accent_knob_style(), LV_PART_KNOB);
     configure_native_slider_rail(volume_popup_track);
-    lv_obj_set_style_width(volume_popup_track, 30, LV_PART_KNOB);
-    lv_obj_set_style_height(volume_popup_track, 30, LV_PART_KNOB);
+    lv_obj_set_style_width(volume_popup_track, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(volume_popup_track, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_add_event_cb(volume_popup_track, volume_popup_track_event_cb, LV_EVENT_ALL, NULL);
 
     /* Stock uses a 390x60 volume control. Keep our rail unchanged visually,
@@ -1911,10 +1905,14 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_label_set_text(format_badge_label, "");
     lv_obj_add_style(format_badge_label, &style_theme_text_muted, 0);
 
-    /* Real seek bar: progress_bg/progress/cursor are all sized to their own
-     * fixed 440x12 (track) / 30x30 (knob) pixel art, so the slider is given
-     * those exact dimensions rather than a percentage width -- stretching
-     * would blur/tile the asset. */
+    /* Real seek bar: progress_bg.png/progress.png are fixed 440x12 pixel
+     * art (confirmed against the real asset files), so the track keeps
+     * those exact dimensions rather than a percentage width or the shared
+     * SLIDER_TRACK_HEIGHT -- LVGL centers a bg_image at its native size
+     * instead of stretching it, so any taller/wider track here would just
+     * show blank space around the unstretched art. The knob itself is no
+     * longer image-based (see gui_theme_accent_knob_style()), so only the
+     * track's own size is still asset-constrained. */
     progress_slider = lv_slider_create(overlay);
     lv_obj_set_size(progress_slider, 440, 12);
     lv_obj_align(progress_slider, LV_ALIGN_TOP_MID, 0, 0);
@@ -1922,23 +1920,18 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_slider_set_value(progress_slider, 0, LV_ANIM_OFF);
     progress_bg_image = asset_png_memory("playing_plane/progress_bg.png");
     progress_fill_image = asset_png_memory("playing_plane/progress.png");
-    progress_cursor_image = asset_png_memory("playing_plane/cursor.png");
     lv_obj_set_style_bg_image_src(progress_slider, progress_bg_image ? (const void *) progress_bg_image : asset_path("playing_plane/progress_bg.png"), LV_PART_MAIN);
     lv_obj_set_style_bg_image_src(progress_slider, progress_fill_image ? (const void *) progress_fill_image : asset_path("playing_plane/progress.png"), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_image_src(progress_slider, progress_cursor_image ? (const void *) progress_cursor_image : asset_path("playing_plane/cursor.png"), LV_PART_KNOB);
-    /* Real-device bug report: accent color didn't apply here -- see
-     * apply_accent_color()'s own comment on why an image-art slider needs
-     * bg_image_recolor, not just bg_color. */
     lv_obj_add_style(progress_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(progress_slider, gui_theme_accent_style(), LV_PART_KNOB);
+    lv_obj_add_style(progress_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
     /* Keep the dedicated playing-plane art here: unlike the reused 360px
      * volume rail sprites, these assets match this progress rail's design. */
     lv_obj_set_style_radius(progress_slider, 0, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_KNOB);
-    lv_obj_set_style_width(progress_slider, 30, LV_PART_KNOB);
-    lv_obj_set_style_height(progress_slider, 30, LV_PART_KNOB);
+    lv_obj_set_style_width(progress_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(progress_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     /* Real-device bug report: seeking (swiping across the bar) sometimes
      * triggered the app-wide back-swipe gesture instead. Root cause: unlike
      * every other draggable slider in this file (screen_timeout_slider,
@@ -2040,7 +2033,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 #endif
 
     play_btn = lv_image_create(controls_row);
-    lv_image_set_src(play_btn, asset_path("playing_plane/btn_play.png"));
+    load_play_btn_images();
+    lv_image_set_src(play_btn, gui_player_play_btn_image_src(audio_is_playing()));
     lv_obj_add_flag(play_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(play_btn, play_btn_event_cb, LV_EVENT_CLICKED, NULL);
 #ifdef UI_GESTURE_TRACE
@@ -2693,8 +2687,69 @@ void get_display_names(const char * path, char * title_out, size_t title_size,
 
 
 
+/* Stock btn_play.png / btn_pause.png are a white disc with a baked-in
+ * #009FF6 play/pause mark. LVGL image_recolor mixes every pixel toward the
+ * recolor color, so applying gui_theme_accent_style() would tint the disc
+ * as well (same COVER flattening apply_accent_color() documents for
+ * on.png). Rewrite only pixels that aren't white / near-white, keeping the
+ * disc and the anti-aliased circle edge, and mixing the glyph toward the
+ * current accent. */
+static void recolor_play_btn_glyph(lv_draw_buf_t * buf, lv_color_t accent)
+{
+    if (!buf || !buf->data || buf->header.cf != LV_COLOR_FORMAT_ARGB8888) return;
+    uint32_t w = buf->header.w;
+    uint32_t h = buf->header.h;
+    uint32_t stride = buf->header.stride;
+    uint8_t ar = accent.red;
+    uint8_t ag = accent.green;
+    uint8_t ab = accent.blue;
+    for (uint32_t y = 0; y < h; y++) {
+        lv_color32_t * row = (lv_color32_t *) (buf->data + y * stride);
+        for (uint32_t x = 0; x < w; x++) {
+            if (row[x].alpha == 0) continue;
+            uint8_t minc = row[x].red;
+            if (row[x].green < minc) minc = row[x].green;
+            if (row[x].blue < minc) minc = row[x].blue;
+            uint8_t t = (uint8_t) (255 - minc);
+            /* Disc interior is white / near-white; the glyph is the stock
+             * cyan. Skip the disc so only the mark is retinted. */
+            if (t < 16) continue;
+            row[x].red   = (uint8_t) (255 - ((uint16_t) (255 - ar) * t) / 255);
+            row[x].green = (uint8_t) (255 - ((uint16_t) (255 - ag) * t) / 255);
+            row[x].blue  = (uint8_t) (255 - ((uint16_t) (255 - ab) * t) / 255);
+        }
+    }
+}
+
+static void load_play_btn_images(void)
+{
+    asset_decoded_image_close(&play_btn_play_img);
+    asset_decoded_image_close(&play_btn_pause_img);
+    lv_color_t accent = accent_lv_color();
+    if (asset_decoded_image_open(&play_btn_play_img, "playing_plane/btn_play.png"))
+        recolor_play_btn_glyph((lv_draw_buf_t *) play_btn_play_img.decoder.decoded, accent);
+    if (asset_decoded_image_open(&play_btn_pause_img, "playing_plane/btn_pause.png"))
+        recolor_play_btn_glyph((lv_draw_buf_t *) play_btn_pause_img.decoder.decoded, accent);
+}
+
+const void * gui_player_play_btn_image_src(bool is_playing)
+{
+    const void * src = asset_decoded_image_source(is_playing ? &play_btn_pause_img : &play_btn_play_img);
+    if (src) return src;
+    return asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png");
+}
+
+void refresh_play_btn_icon(void)
+{
+    load_play_btn_images();
+    bool is_playing = audio_is_playing();
+    if (play_btn) lv_image_set_src(play_btn, gui_player_play_btn_image_src(is_playing));
+    gui_shell_update_quick_drawer_play_state(is_playing);
+    player_transition_mark_dirty(); /* play_btn lives on player_screen -- see the cache's own doc comment */
+}
+
 void set_play_button_state(bool is_playing) {
-    lv_image_set_src(play_btn, asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
+    if (play_btn) lv_image_set_src(play_btn, gui_player_play_btn_image_src(is_playing));
     player_transition_mark_dirty(); /* play_btn lives on player_screen -- see the cache's own doc comment */
     gui_shell_update_quick_drawer_play_state(is_playing);
 }
@@ -3433,19 +3488,11 @@ void gui_player_teardown(void) {
     if (player_screen) { lv_obj_del(player_screen); player_screen = NULL; }
     asset_png_memory_free(progress_bg_image); progress_bg_image = NULL;
     asset_png_memory_free(progress_fill_image); progress_fill_image = NULL;
-    asset_png_memory_free(progress_cursor_image); progress_cursor_image = NULL;
     volume_slider = NULL;
 }
 
-/* The volume cursor is shared by gui_player's popup and gui_shell's quick
- * drawer. Release it only after both modules have deleted their objects;
- * gui_soft_reload() calls this at that exact boundary. */
-void gui_player_release_shared_assets(void) {
-    asset_png_memory_free(volume_cursor_image);
-    volume_cursor_image = NULL;
-}
-
 void gui_player_refresh_static_assets(void) {
+    refresh_play_btn_icon();
     if (!volume_popup) return;
     asset_decoded_image_close(&volume_popup_bg_image);
     asset_decoded_image_close(&volume_popup_speaker_image);

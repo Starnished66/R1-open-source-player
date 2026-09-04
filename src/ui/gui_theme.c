@@ -6,9 +6,11 @@
 #include <stdio.h>
 
 static lv_style_t style_accent;
+static lv_style_t style_accent_knob;
 static lv_style_t style_muted_text;
 
 lv_style_t * gui_theme_accent_style(void) { return &style_accent; }
+lv_style_t * gui_theme_accent_knob_style(void) { return &style_accent_knob; }
 lv_style_t * gui_theme_muted_text_style(void) { return &style_muted_text; }
 
 const uint32_t accent_palette[ACCENT_PALETTE_COUNT] = {
@@ -35,6 +37,7 @@ static lv_obj_t * accent_swatches[ACCENT_PALETTE_COUNT];
 extern player_settings_t current_settings;
 extern void settings_save(const player_settings_t * s);
 extern void player_transition_mark_dirty(void);
+extern void refresh_play_btn_icon(void);
 
 const lv_font_t * gui_theme_font(gui_font_role_t role) {
     switch (role) {
@@ -64,8 +67,16 @@ void gui_theme_apply_accent(uint32_t rgb) {
     lv_style_set_image_recolor(&style_accent, lv_color_hex(rgb));
     lv_style_set_image_recolor_opa(&style_accent, LV_OPA_80);
     lv_obj_report_style_change(&style_accent);
+
+    lv_style_set_bg_color(&style_accent_knob, lv_color_hex(rgb));
+    lv_obj_report_style_change(&style_accent_knob);
+
     settings_save(&current_settings);
     player_transition_mark_dirty();
+    /* Play/pause art is a white disc with a baked-in cyan glyph -- LVGL
+     * image_recolor would tint the disc too, so the glyph is rewritten in
+     * decoded pixels (see refresh_play_btn_icon()). */
+    refresh_play_btn_icon();
 }
 
 void accent_swatch_event_cb(lv_event_t * e) {
@@ -91,6 +102,7 @@ static void init_style_objects(void) {
     static bool already_initialized = false;
     if (already_initialized) {
         lv_style_reset(&style_accent);
+        lv_style_reset(&style_accent_knob);
         lv_style_reset(&style_muted_text);
     }
     already_initialized = true;
@@ -102,6 +114,15 @@ static void init_style_objects(void) {
     lv_style_set_bg_image_recolor_opa(&style_accent, LV_OPA_COVER);
     lv_style_set_image_recolor(&style_accent, accent_lv_color());
     lv_style_set_image_recolor_opa(&style_accent, LV_OPA_80);
+
+    lv_style_init(&style_accent_knob);
+    lv_style_set_bg_color(&style_accent_knob, accent_lv_color());
+    lv_style_set_bg_opa(&style_accent_knob, LV_OPA_COVER);
+    lv_style_set_border_color(&style_accent_knob, lv_color_white());
+    lv_style_set_border_width(&style_accent_knob, SLIDER_KNOB_BORDER_WIDTH);
+    lv_style_set_border_opa(&style_accent_knob, LV_OPA_COVER);
+    lv_style_set_radius(&style_accent_knob, LV_RADIUS_CIRCLE);
+    lv_style_set_pad_all(&style_accent_knob, SLIDER_KNOB_PAD);
 
     lv_style_init(&style_muted_text);
     lv_style_set_text_color(&style_muted_text, lv_color_make(220, 220, 220));

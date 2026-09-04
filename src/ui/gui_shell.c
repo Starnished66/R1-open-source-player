@@ -3198,7 +3198,7 @@ static void build_quick_drawer(void) {
     if (brightness_track_w < 120) brightness_track_w = 120; /* sane floor so the track never collapses to nothing */
 
     quick_drawer_brightness_track = lv_slider_create(quick_drawer);
-    lv_obj_set_size(quick_drawer_brightness_track, brightness_track_w, 12);
+    lv_obj_set_size(quick_drawer_brightness_track, brightness_track_w, SLIDER_TRACK_HEIGHT);
     lv_obj_align(quick_drawer_brightness_track, LV_ALIGN_TOP_LEFT, 90, QUICK_DRAWER_PANEL1_TOP + 185);
     /* Full 0-100 -- backlight.c now maps this logical range to its own safe
      * raw range internally (see backlight.h's own comment), so the slider
@@ -3209,22 +3209,14 @@ static void build_quick_drawer(void) {
      * defined here just so it runs once at build time too, same as
      * every other quick-drawer widget's own initial state. */
     lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_KNOB);
-    const lv_image_dsc_t * cursor = gui_player_volume_cursor_image();
-    lv_obj_set_style_bg_image_src(quick_drawer_brightness_track,
-                                  cursor ? (const void *) cursor : asset_path("volume/cursor.png"),
-                                  LV_PART_KNOB);
-    /* Real-device bug report: accent color didn't apply here -- see
-     * apply_accent_color()'s own comment on why an image-art slider needs
-     * bg_image_recolor, not just bg_color. */
     lv_obj_add_style(quick_drawer_brightness_track, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(quick_drawer_brightness_track, gui_theme_accent_style(), LV_PART_KNOB);
+    lv_obj_add_style(quick_drawer_brightness_track, gui_theme_accent_knob_style(), LV_PART_KNOB);
     /* Real-device bug report: same left-edge gray sliver/root cause as
      * volume_popup_track's own fix -- see its comment. */
     configure_native_slider_rail(quick_drawer_brightness_track);
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_KNOB);
-    lv_obj_set_style_width(quick_drawer_brightness_track, 26, LV_PART_KNOB);
-    lv_obj_set_style_height(quick_drawer_brightness_track, 26, LV_PART_KNOB);
+    lv_obj_set_style_width(quick_drawer_brightness_track, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(quick_drawer_brightness_track, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_add_event_cb(quick_drawer_brightness_track, quick_drawer_brightness_changed_cb,
                         LV_EVENT_ALL, NULL);
     if (!brightness_hw_apply_timer) {
@@ -3309,7 +3301,7 @@ static void build_quick_drawer(void) {
     lv_obj_add_event_cb(prev_btn, prev_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
     quick_drawer_play_btn = lv_image_create(controls_row);
-    lv_image_set_src(quick_drawer_play_btn, asset_path("playing_plane/btn_play.png"));
+    lv_image_set_src(quick_drawer_play_btn, gui_player_play_btn_image_src(audio_is_playing()));
     lv_obj_add_flag(quick_drawer_play_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_play_btn, play_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
@@ -3701,8 +3693,7 @@ void gui_shell_update_quick_drawer_favorite(bool is_favorite) {
 
 void gui_shell_update_quick_drawer_play_state(bool is_playing) {
     if (quick_drawer_play_btn) {
-        lv_image_set_src(quick_drawer_play_btn,
-                         asset_path(is_playing ? "playing_plane/btn_pause.png" : "playing_plane/btn_play.png"));
+        lv_image_set_src(quick_drawer_play_btn, gui_player_play_btn_image_src(is_playing));
         quick_drawer_mark_snapshot_dirty();
     }
 }

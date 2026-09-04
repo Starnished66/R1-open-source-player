@@ -736,7 +736,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
 /* ---- Pill list ---- */
 
 typedef struct {
-    lv_obj_t * toggle_img;
+    lv_obj_t * toggle_sw; /* real lv_switch, not an image -- see pill_toggle_row_event_cb() */
 } pill_toggle_ctx_t;
 
 /* ctx is malloc()'d once per toggle row (below) and otherwise never freed --
@@ -752,17 +752,17 @@ static void pill_toggle_ctx_delete_cb(lv_event_t * e) {
 static void pill_toggle_row_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     pill_toggle_ctx_t * ctx = (pill_toggle_ctx_t *) lv_event_get_user_data(e);
-    lv_obj_t * img = ctx->toggle_img;
+    lv_obj_t * sw = ctx->toggle_sw;
 
-    bool now_checked = !lv_obj_has_state(img, LV_STATE_CHECKED);
-    if (now_checked) lv_obj_add_state(img, LV_STATE_CHECKED);
-    else lv_obj_clear_state(img, LV_STATE_CHECKED);
-    lv_image_set_src(img, asset_path(now_checked ? "settings/on.png" : "settings/off.png"));
-
-    /* Real toggle rows only visually differ by which sprite is shown -- the
-     * VALUE_CHANGED event lets callers read state the same way they already
-     * do for lv_switch (lv_obj_has_state(target, LV_STATE_CHECKED)). */
-    lv_obj_send_event(img, LV_EVENT_VALUE_CHANGED, NULL);
+    bool now_checked = !lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (now_checked) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    else lv_obj_clear_state(sw, LV_STATE_CHECKED);
+    /* Real lv_switch now -- CHECKED state alone drives its own visual
+     * (LV_PART_INDICATOR|LV_STATE_CHECKED style, default-theme white knob),
+     * no manual sprite swap needed. VALUE_CHANGED still fires so callers
+     * keep reading state the same way they already do for every other
+     * lv_switch (lv_obj_has_state(target, LV_STATE_CHECKED)). */
+    lv_obj_send_event(sw, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
 void pill_row_apply_icon(lv_obj_t * row, lv_obj_t * label, const char * icon_path, int32_t icon_px,
@@ -1039,28 +1039,30 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_obj_set_style_text_align(label, text_align, 0);
 
         if (item->accessory == PILL_ACCESSORY_TOGGLE) {
-            lv_obj_t * toggle_img = lv_image_create(row);
-            lv_image_set_src(toggle_img, asset_path(item->toggle_initial_state ? "settings/on.png" : "settings/off.png"));
-            lv_obj_align(toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
-            if (item->toggle_initial_state) lv_obj_add_state(toggle_img, LV_STATE_CHECKED);
-            /* LV_STATE_CHECKED selector, not unconditional -- otherwise the
-             * recolor hits both the ON and OFF sprite alike, making the
-             * toggle unreadable in either state (real-device bug report).
-             * pill_toggle_row_event_cb() above already keeps this state in
-             * sync with which sprite is showing on every tap. */
-            if (toggle_accent_style) lv_obj_add_style(toggle_img, toggle_accent_style, LV_STATE_CHECKED);
+            /* Real lv_switch, standardized to match the Settings screen's
+             * own switches (screen_timeout_switch et al.) -- replaces the
+             * old flat-tinted on.png/off.png sprite swap per real-device
+             * feedback. Non-interactive: the row itself is still the sole
+             * clickable target (pill_toggle_row_event_cb below), so the
+             * switch must not capture its own touch/drag or every tap
+             * would double-toggle. */
+            lv_obj_t * toggle_sw = lv_switch_create(row);
+            lv_obj_remove_flag(toggle_sw, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_align(toggle_sw, LV_ALIGN_RIGHT_MID, -20, 0);
+            if (item->toggle_initial_state) lv_obj_add_state(toggle_sw, LV_STATE_CHECKED);
+            if (toggle_accent_style) lv_obj_add_style(toggle_sw, toggle_accent_style, LV_PART_INDICATOR | LV_STATE_CHECKED);
 
-            if (item->out_toggle_img) *item->out_toggle_img = toggle_img;
+            if (item->out_toggle_img) *item->out_toggle_img = toggle_sw;
 
             pill_toggle_ctx_t * ctx = malloc(sizeof(pill_toggle_ctx_t));
             if (ctx) {
-                ctx->toggle_img = toggle_img;
+                ctx->toggle_sw = toggle_sw;
                 lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
                 lv_obj_add_event_cb(row, pill_toggle_row_event_cb, LV_EVENT_CLICKED, ctx);
                 lv_obj_add_event_cb(row, pill_toggle_ctx_delete_cb, LV_EVENT_DELETE, ctx);
 
                 if (item->on_toggle_change) {
-                    lv_obj_add_event_cb(toggle_img, item->on_toggle_change, LV_EVENT_VALUE_CHANGED, item->user_data);
+                    lv_obj_add_event_cb(toggle_sw, item->on_toggle_change, LV_EVENT_VALUE_CHANGED, item->user_data);
                 }
             } else {
                 /* Out of memory -- degrade to a non-interactive row (shows
@@ -2054,13 +2056,23 @@ lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) {
 lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click) {
     lv_obj_t * row = add_pill_row_base(parent, label_text);
 
-    lv_obj_t * toggle_img = lv_image_create(row);
-    lv_image_set_src(toggle_img, asset_path(checked ? "settings/on.png" : "settings/off.png"));
-    lv_obj_align(toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
-    if (checked) {
-        lv_obj_set_style_image_recolor(toggle_img, accent_lv_color(), 0);
-        lv_obj_set_style_image_recolor_opa(toggle_img, LV_OPA_80, 0);
-    }
+    /* Real native lv_switch, same style as the Settings screen's own
+     * switches (screen_timeout_switch et al.) -- standardized to match
+     * per real-device feedback, replacing the old flat-tinted on.png/
+     * off.png image (which had no distinct white knob, just a single
+     * solid-colored icon). Non-interactive: the row itself is still the
+     * only clickable target (on_click below), so the switch must not
+     * capture its own touch/drag or every tap would double-toggle --
+     * once via the switch's own gesture, once via the row's CLICKED
+     * handler. checked is baked in at creation time and this whole row
+     * is rebuilt by the caller's own on_click/repopulate flow (e.g.
+     * poll_wifi_toggle()) rather than live-updated in place, matching
+     * the image version's exact same one-shot-render contract. */
+    lv_obj_t * toggle_sw = lv_switch_create(row);
+    lv_obj_remove_flag(toggle_sw, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_style(toggle_sw, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (checked) lv_obj_add_state(toggle_sw, LV_STATE_CHECKED);
+    lv_obj_align(toggle_sw, LV_ALIGN_RIGHT_MID, -20, 0);
 
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
     if (on_click) lv_obj_add_event_cb(row, on_click, LV_EVENT_CLICKED, NULL);

@@ -821,12 +821,14 @@ static lv_obj_t * build_screen_timeout_screen(void) {
 
     screen_timeout_slider = lv_slider_create(screen_timeout_slider_card);
     lv_obj_set_width(screen_timeout_slider, lv_pct(94));
-    lv_obj_set_height(screen_timeout_slider, 36);
+    lv_obj_set_height(screen_timeout_slider, SLIDER_TRACK_HEIGHT);
     lv_obj_align(screen_timeout_slider, LV_ALIGN_TOP_MID, 0, 18);
     lv_slider_set_range(screen_timeout_slider, 0, SCREEN_TIMEOUT_STEP_COUNT - 1);
     lv_slider_set_value(screen_timeout_slider, screen_timeout_seconds_to_step_index(current_settings.screen_timeout_seconds), LV_ANIM_OFF);
     lv_obj_add_style(screen_timeout_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(screen_timeout_slider, gui_theme_accent_style(), LV_PART_KNOB);
+    lv_obj_add_style(screen_timeout_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
+    lv_obj_set_style_width(screen_timeout_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(screen_timeout_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_add_event_cb(screen_timeout_slider, screen_timeout_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_set_ext_click_area(screen_timeout_slider, 20);
 
@@ -953,12 +955,14 @@ static lv_obj_t * build_startup_volume_screen(void) {
 
     startup_volume_slider = lv_slider_create(startup_volume_slider_card);
     lv_obj_set_width(startup_volume_slider, lv_pct(94));
-    lv_obj_set_height(startup_volume_slider, 36);
+    lv_obj_set_height(startup_volume_slider, SLIDER_TRACK_HEIGHT);
     lv_obj_align(startup_volume_slider, LV_ALIGN_TOP_MID, 0, 18);
     lv_slider_set_range(startup_volume_slider, 0, 100);
     lv_slider_set_value(startup_volume_slider, current_settings.startup_volume_fixed_percent, LV_ANIM_OFF);
     lv_obj_add_style(startup_volume_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(startup_volume_slider, gui_theme_accent_style(), LV_PART_KNOB);
+    lv_obj_add_style(startup_volume_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
+    lv_obj_set_style_width(startup_volume_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(startup_volume_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_add_event_cb(startup_volume_slider, startup_volume_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_set_ext_click_area(startup_volume_slider, 20);
 
@@ -1050,12 +1054,14 @@ static lv_obj_t * build_sleep_timer_screen(void) {
 
     sleep_timer_slider = lv_slider_create(slider_card);
     lv_obj_set_width(sleep_timer_slider, lv_pct(94));
-    lv_obj_set_height(sleep_timer_slider, 36);
+    lv_obj_set_height(sleep_timer_slider, SLIDER_TRACK_HEIGHT);
     lv_obj_align(sleep_timer_slider, LV_ALIGN_TOP_MID, 0, 18);
     lv_slider_set_range(sleep_timer_slider, 0, SLEEP_TIMER_STEP_COUNT - 1);
     lv_slider_set_value(sleep_timer_slider, sleep_timer_minutes_to_step_index(current_settings.sleep_timer_minutes), LV_ANIM_OFF);
     lv_obj_add_style(sleep_timer_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(sleep_timer_slider, gui_theme_accent_style(), LV_PART_KNOB);
+    lv_obj_add_style(sleep_timer_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
+    lv_obj_set_style_width(sleep_timer_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(sleep_timer_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_add_event_cb(sleep_timer_slider, sleep_timer_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_set_ext_click_area(sleep_timer_slider, 20);
 
@@ -1287,12 +1293,14 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
 
     idle_shutdown_slider = lv_slider_create(idle_shutdown_slider_card);
     lv_obj_set_width(idle_shutdown_slider, lv_pct(94));
-    lv_obj_set_height(idle_shutdown_slider, 36);
+    lv_obj_set_height(idle_shutdown_slider, SLIDER_TRACK_HEIGHT);
     lv_obj_align(idle_shutdown_slider, LV_ALIGN_TOP_MID, 0, 48);
     lv_slider_set_range(idle_shutdown_slider, 0, IDLE_SHUTDOWN_STEP_COUNT - 1);
     lv_slider_set_value(idle_shutdown_slider, idle_shutdown_minutes_to_step_index(current_settings.idle_shutdown_minutes), LV_ANIM_OFF);
     lv_obj_add_style(idle_shutdown_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(idle_shutdown_slider, gui_theme_accent_style(), LV_PART_KNOB);
+    lv_obj_add_style(idle_shutdown_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
+    lv_obj_set_style_width(idle_shutdown_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(idle_shutdown_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_add_event_cb(idle_shutdown_slider, idle_shutdown_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_set_ext_click_area(idle_shutdown_slider, 20);
 
@@ -2210,10 +2218,12 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
      * to sit fully inside the card at both extremes. */
     lv_obj_t * slider = lv_slider_create(card);
     lv_obj_set_width(slider, lv_pct(88));
-    lv_obj_set_height(slider, 34);
+    lv_obj_set_height(slider, SLIDER_TRACK_HEIGHT);
     lv_slider_set_range(slider, range_min, range_max);
     lv_obj_add_style(slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(slider, gui_theme_accent_style(), LV_PART_KNOB);
+    lv_obj_add_style(slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
+    lv_obj_set_style_width(slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_set_ext_click_area(slider, 20);
 
     *out_value_label = value_label;
@@ -3069,8 +3079,8 @@ lv_obj_t * gui_settings_get_eq_screen(void) { return eq_screen; }
 
 void gui_settings_sync_crossfade_toggle(void) {
     if (!settings_crossfade_toggle_img) return;
-    lv_image_set_src(settings_crossfade_toggle_img,
-                     asset_path(current_settings.crossfade_enabled ? "settings/on.png" : "settings/off.png"));
+    /* Real lv_switch now (see PILL_ACCESSORY_TOGGLE in screen_builders.c) --
+     * CHECKED state alone drives its visual, no sprite swap needed. */
     if (current_settings.crossfade_enabled) lv_obj_add_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
     else lv_obj_clear_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
 }

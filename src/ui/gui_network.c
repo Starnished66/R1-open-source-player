@@ -3150,13 +3150,8 @@ static void remote_control_toggle_cb(lv_event_t * e) {
     current_settings.remote_control_enabled = turning_on;
     settings_save(&current_settings);
 
-    lv_image_set_src(remote_control_toggle_img,
-                      asset_path(current_settings.remote_control_enabled ? "settings/on.png" : "settings/off.png"));
-    /* Keeps the LV_STATE_CHECKED selector on remote_control_toggle_img's own
-     * style_accent attachment (see build_remote_control_screen()'s own
-     * comment) tracking reality, so the accent recolor only ever shows on
-     * the ON sprite -- see add_pill_toggle_row()'s own bug report #2 for
-     * why an unconditional recolor is wrong here. */
+    /* Real lv_switch now (see build_remote_control_screen()'s own comment)
+     * -- CHECKED state alone drives its visual, no sprite swap needed. */
     if (current_settings.remote_control_enabled) lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
     else lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
     if (current_settings.remote_control_enabled) {
@@ -3216,25 +3211,19 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_set_style_text_font(toggle_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(toggle_label, LV_ALIGN_LEFT_MID, 24, 0);
 
-    remote_control_toggle_img = lv_image_create(toggle_row);
-    lv_image_set_src(remote_control_toggle_img,
-                      asset_path(current_settings.remote_control_enabled ? "settings/on.png" : "settings/off.png"));
+    /* Real lv_switch, standardized to match the Settings screen's own
+     * switches -- replaces the old flat-tinted on.png/off.png sprite swap
+     * per real-device feedback. Non-interactive: toggle_row itself is the
+     * sole clickable target (remote_control_toggle_cb above), so the
+     * switch must not capture its own touch/drag. This screen is built
+     * exactly once at startup and never rebuilt, so it needs the same
+     * live-updating shared style every other switch uses (gui_theme_
+     * apply_accent() keeps it current on a later accent color change). */
+    remote_control_toggle_img = lv_switch_create(toggle_row);
+    lv_obj_remove_flag(remote_control_toggle_img, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_align(remote_control_toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
     if (current_settings.remote_control_enabled) lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
-    /* Real-device bug report: accent color wasn't applying to this toggle
-     * either. Unlike add_pill_toggle_row() (rebuilt fresh on every screen
-     * repopulation, so a plain local color read is fine there), this
-     * screen is built exactly once at startup (see its own call site) and
-     * never rebuilt -- needs the live-updating shared style so a later
-     * accent color change still reaches it.
-     *
-     * Real-device bug report #2: LV_STATE_CHECKED selector, not the
-     * unconditional 0 this originally used -- otherwise the recolor hits
-     * both the ON and OFF sprite alike, making the toggle unreadable in
-     * either state. lv_obj_add_state() above (and remote_control_toggle_
-     * cb()'s own add/clear) keeps this selector matching which sprite is
-     * actually showing. */
-    lv_obj_add_style(remote_control_toggle_img, gui_theme_accent_style(), LV_STATE_CHECKED);
+    lv_obj_add_style(remote_control_toggle_img, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
 
     lv_obj_t * explanation = lv_label_create(scr);
     lv_label_set_text(explanation,
@@ -3332,7 +3321,6 @@ void gui_network_handle_wifi_disabled(void) {
         remote_control_stop();
         current_settings.remote_control_enabled = false;
         settings_changed = true;
-        lv_image_set_src(remote_control_toggle_img, asset_path("settings/off.png"));
         lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
         remote_control_refresh_address();
     }

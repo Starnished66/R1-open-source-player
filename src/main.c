@@ -219,20 +219,22 @@ void boot_checkpoint(const char * step) {
 }
 #endif
 
-void handler(int sig) {
-  void *array[10];
-  size_t size;
+void crash_handler(int sig) {
+    void *buffer[128];
+    int size;
 
-  printf("B\n");
+    size = backtrace(buffer, 128);
 
-  // get void*'s for all entries on the stack
-  size = backtrace(array, 10);
+    // Write directly to stderr (safe in signal handlers)
+    write(STDERR_FILENO, "Crashed! Backtrace:\n", 20);
+    backtrace_symbols_fd(buffer, size, STDERR_FILENO);
+    exit(1);
+}
 
-  // print out all the frames to stderr
-  // fprintf(stderr, "Error: signal %d:\n", sig);
-  printf("Error: signal %d:\n", sig);
-  backtrace_symbols_fd(array, size, STDERR_FILENO);
-  exit(1);
+
+void baz() {
+	int *foo = (int*)-1;   // make a bad pointer
+	printf("%d\n", *foo);  // causes segfault
 }
 
 int main(int argc, char ** argv) {
@@ -242,8 +244,10 @@ int main(int argc, char ** argv) {
      * just returning EPIPE (which audio_output_write() already handles
      * correctly). Must run before anything else opens a subprocess pipe. */
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGSEGV, handler);
-    printf("A\n");
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
+
+    // baz();
 
 #ifndef HOST_BUILD
     struct sigaction crash_sa;

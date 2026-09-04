@@ -231,7 +231,7 @@ void crash_handler(int sig) {
     exit(1);
 }
 
-
+// function to force a segfault
 void baz() {
 	int *foo = (int*)-1;   // make a bad pointer
 	printf("%d\n", *foo);  // causes segfault

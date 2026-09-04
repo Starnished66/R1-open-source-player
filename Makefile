@@ -54,6 +54,7 @@ OPUS_DIR = opus
 MBEDTLS_DIR = mbedtls
 CJSON_DIR = cJSON
 DBUS_DIR = dbus
+LIBEXECINFO_DIR = libexecinfo
 LUA_DIR = lua
 # stb_vorbis (public domain, github.com/nothings/stb) -- a single 192KB file
 # rather than a whole cloned tree like every other dependency above, so it's
@@ -310,6 +311,26 @@ $(info Cloning libdbus 1.16.2...)
 $(shell git clone --depth 1 -b dbus-1.16.2 https://gitlab.freedesktop.org/dbus/dbus.git $(DBUS_DIR))
 endif
 
+# A modern, BSD-licensed clone of the backtrace facility found in GNU libc.
+# This library is primarily intended for porting Linux code to BSD platforms
+# and other systems that don't have built-in backtrace support -- needed here
+# because the target's musl libc (unlike host glibc) ships no <execinfo.h>/
+# backtrace() at all, and main.c's SIGSEGV handler calls backtrace()/
+# backtrace_symbols_fd() unconditionally on both builds.
+ifeq ($(wildcard $(LIBEXECINFO_DIR)),)
+$(info Cloning libexecinfo...)
+$(shell git clone --depth 1 https://github.com/fam007e/libexecinfo.git $(LIBEXECINFO_DIR))
+endif
+# getreturnaddr()/getframeaddr() (used by execinfo.c's backtrace()) aren't
+# committed as a .c file upstream -- their own Makefile generates
+# stacktraverse.c from gen.py at build time (one __builtin_return_address(N)/
+# __builtin_frame_address(N) case per depth, since those GCC builtins only
+# accept compile-time-constant N), so this does the same thing here.
+ifeq ($(wildcard $(LIBEXECINFO_DIR)/stacktraverse.c),)
+$(info Generating libexecinfo/stacktraverse.c...)
+$(shell python3 $(LIBEXECINFO_DIR)/gen.py --max-depth 128 --output $(LIBEXECINFO_DIR)/stacktraverse.c >/dev/null)
+endif
+
 # Lua (MIT) -- the plugin scripting engine (src/plugins/plugin_manager.c):
 # each file under the SD card's .plugins/ folder gets its own lua_State,
 # with a small C API table (plugin.*) exposed for registering Home-screen
@@ -396,8 +417,12 @@ endif
 # not when the Makefile was last edited.
 BUILD_STAMP_DEFINE = -DBUILD_STAMP=\"$(shell date +%Y-%m-%d_%H:%M)\"
 
-TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
-TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
+# -I$(LIBEXECINFO_DIR) precedes the rest so its execinfo.h is what main.c's
+# #include <execinfo.h> resolves to on target: musl (unlike host's glibc)
+# ships no execinfo.h/backtrace() of its own, which is what main.c's SIGSEGV
+# handler needs. Host build doesn't need this -- glibc already provides it.
+TARGET_CFLAGS = $(CFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
 TINYALSA_CFLAGS = -O3 -g -Wall -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 # DBUS_COMPILATION/DBUS_STATIC_BUILD: libdbus's own headers gate some
 # declarations on these (matching how its own build always defines them
@@ -526,6 +551,10 @@ DBUS_SRCS = $(filter-out %-win.c %-win32.c %wince-glue.c $(DBUS_DIR)/dbus/dbus-s
 # are guarded with #ifndef HOST_BUILD for the same reason audio.c's own
 # Bluetooth-output code is.
 TARGET_ONLY_APP_SRCS = src/network/bt_media_player.c src/audio/audio_output.c
+# Target-only (see TARGET_CFLAGS's own comment on why): provides
+# backtrace()/backtrace_symbols_fd() for main.c's SIGSEGV handler on musl,
+# which has no execinfo.h/backtrace() of its own.
+LIBEXECINFO_SRCS = $(LIBEXECINFO_DIR)/execinfo.c $(LIBEXECINFO_DIR)/stacktraverse.c
 
 # Object files
 HOST_OBJS = $(APP_SRCS:src/%.c=$(BUILD_HOST_DIR)/%.o) $(APP_CXX_SRCS:src/%.cpp=$(BUILD_HOST_DIR)/%.o) \
@@ -544,7 +573,8 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) $(APP_CXX_SRCS:src/%.c
               $(DBUS_SRCS:$(DBUS_DIR)/dbus/%.c=$(BUILD_TARGET_DIR)/dbus/%.o) \
               $(OPUS_SRCS:$(OPUS_DIR)/%.c=$(BUILD_TARGET_DIR)/opus/%.o) \
               $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=$(BUILD_TARGET_DIR)/stb_vorbis/%.o) \
-              $(LUA_SRCS:$(LUA_DIR)/src/%.c=$(BUILD_TARGET_DIR)/lua/%.o)
+              $(LUA_SRCS:$(LUA_DIR)/src/%.c=$(BUILD_TARGET_DIR)/lua/%.o) \
+              $(LIBEXECINFO_SRCS:$(LIBEXECINFO_DIR)/%.c=$(BUILD_TARGET_DIR)/libexecinfo/%.o)
 
 .PHONY: all host target bootloader sd_ready_test cover_decode_scale_test clean compile_commands.json FORCE_VERSION
 
@@ -806,6 +836,10 @@ $(BUILD_TARGET_DIR)/opus/%.o: $(OPUS_DIR)/%.c
 $(BUILD_TARGET_DIR)/lua/%.o: $(LUA_DIR)/src/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(LUA_CFLAGS) -c $< -o $@
+
+$(BUILD_TARGET_DIR)/libexecinfo/%.o: $(LIBEXECINFO_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CROSS_CC) -O2 -g -Wall -Wno-frame-address -I$(LIBEXECINFO_DIR) -c $< -o $@
 
 # Generate compile_commands.json for Zed/clangd LSP autofill and hover popups
 compile_commands.json:

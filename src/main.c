@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <execinfo.h>
 
 #include "gui.h"
 
@@ -218,6 +219,22 @@ void boot_checkpoint(const char * step) {
 }
 #endif
 
+void handler(int sig) {
+  void *array[10];
+  size_t size;
+
+  printf("B\n");
+
+  // get void*'s for all entries on the stack
+  size = backtrace(array, 10);
+
+  // print out all the frames to stderr
+  // fprintf(stderr, "Error: signal %d:\n", sig);
+  printf("Error: signal %d:\n", sig);
+  backtrace_symbols_fd(array, size, STDERR_FILENO);
+  exit(1);
+}
+
 int main(int argc, char ** argv) {
     /* Ignore SIGPIPE process-wide: a Bluetooth disconnect during playback
      * kills the `aplay -D bluealsa` child audio_output.c writes into, and
@@ -225,6 +242,8 @@ int main(int argc, char ** argv) {
      * just returning EPIPE (which audio_output_write() already handles
      * correctly). Must run before anything else opens a subprocess pipe. */
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGSEGV, handler);
+    printf("A\n");
 
 #ifndef HOST_BUILD
     struct sigaction crash_sa;
@@ -333,7 +352,7 @@ int main(int argc, char ** argv) {
      * guessing event0/event1 for variants where that lookup doesn't match. */
     lv_indev_t * touch = NULL;
     char touch_path[64];
-    if (find_input_device_by_name("hyn_ts", touch_path, sizeof(touch_path))) {
+    if (find_input_device_by_name("hyn_ts", touch_path, sizeof(touch_path)) || find_input_device_by_name("goodix-ts", touch_path, sizeof(touch_path))) {
         printf("Detected touch controller at %s\n", touch_path);
         touch = lv_evdev_create(LV_INDEV_TYPE_POINTER, touch_path);
     }

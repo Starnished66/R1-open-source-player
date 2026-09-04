@@ -54,6 +54,10 @@ void peq_set_band_enabled(int index, bool enabled);
  * bypassed or no bands are enabled and preamp is 0dB. */
 void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int sample_rate);
 
+/* In-place processing of an interleaved S24_LE/S32 buffer (low 24 bits active).
+ * Uses scaled limiter ceiling (~8386560) and 24-bit clamp bounds. */
+void peq_process_s32(int32_t * buf, size_t frame_count, int channels, unsigned int sample_rate);
+
 /* Persistence, same temp-file-then-rename pattern as settings.c -- this
  * pair always targets the one fixed, always-current PEQ_FILE_PATH (loaded
  * at startup, saved on every change), distinct from the named-profile

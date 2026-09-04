@@ -75,6 +75,35 @@ static unsigned int device_sample_rate = 0;
  * updated on those paths, and audio_output_ensure() only ever compares it
  * when requested_target is LOCAL. */
 static bool active_low_latency = false;
+static enum pcm_format active_format = PCM_FORMAT_S16_LE;
+
+/* Record of an observed hw_params rejection of PCM_FORMAT_S24_LE at a
+ * specific (channels, sample_rate) -- set only inside open_device()'s
+ * S16_LE fallback below. Exists so a real, reproducible rejection (S24_LE
+ * period_size/period_count are explicitly unvalidated -- see open_device()'s
+ * own TODO) doesn't get re-attempted on every single chunk of the same
+ * track: without this, audio_output_ensure()'s format-mismatch check below
+ * would see "S24_LE requested, S16_LE active" as a change worth reopening
+ * for on every call, driving a close+reopen+fail+fallback cycle every chunk
+ * for the rest of the track instead of settling once.
+ *
+ * Deliberately NOT permanent for the process's whole lifetime, though: a
+ * single pcm_open() failure isn't necessarily a hardware fact -- it could be
+ * transient (brief resource contention, a momentarily-busy device) rather
+ * than "this config never works." Caching it forever would silently
+ * downgrade every later track at this same (channels, rate) to S16_LE for
+ * the rest of the session even after whatever caused the one failure has
+ * long since cleared. audio_output_reset_s24_probe() clears this, called
+ * once per NEW track becoming current (see its own doc comment and callers)
+ * -- frequent enough that a real, reproducible hardware limitation still
+ * gets caught again almost immediately (so the per-chunk thrashing this
+ * exists to prevent stays prevented within any one track), infrequent
+ * enough (once per track, not once per chunk) that a transient failure only
+ * costs one extra failed pcm_open() attempt before the next track gets a
+ * clean shot at S24_LE again. */
+static bool s24_unsupported_known = false;
+static unsigned int s24_unsupported_channels = 0;
+static unsigned int s24_unsupported_rate = 0;
 
 /* aplay's raw-PCM mode needs the format spelled out on the command line --
  * unlike a .wav it's reading straight off a pipe with no header to sniff
@@ -115,7 +144,7 @@ static void close_usb_device(void) {
     usb_aplay_fd = -1;
 }
 
-static bool open_device(unsigned int channels, unsigned int sample_rate, bool low_latency) {
+static bool open_device(unsigned int channels, unsigned int sample_rate, bool low_latency, bool want_s24) {
     if (requested_target == OUTPUT_TARGET_USB) {
         if (!spawn_aplay(usb_alsa_device, channels, sample_rate, &usb_aplay_pid, &usb_aplay_fd)) return false;
         active_target = OUTPUT_TARGET_USB;
@@ -127,7 +156,8 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
         memset(&config, 0, sizeof(config));
         config.channels = channels;
         config.rate = sample_rate;
-        config.format = PCM_FORMAT_S16_LE;
+        config.format = want_s24 ? PCM_FORMAT_S24_LE : PCM_FORMAT_S16_LE;
+        active_format = config.format;
         active_low_latency = low_latency;
         if (low_latency) {
             /* Real-device bug report: AirPlay had "significantly more audio
@@ -170,6 +200,26 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
              * granularity; four periods provide ~186 ms of underrun
              * protection, still below the app's existing 500 ms hardware-
              * button dispatch interval. */
+            /* Confirmed on real R1 hardware for S24_LE too, not just assumed
+             * carried over from S16_LE: tools/s24_hw_params_probe.c swept
+             * period_count in {2,3,4} at every period_size the S16_LE probe
+             * above tried (512/1024/2048/4096/8192), across all 8 standard
+             * rates 44.1kHz-384kHz and both mono/stereo, all at
+             * PCM_FORMAT_S24_LE. Every single period_count=2 and
+             * period_count=3 combination failed hw_params with EINVAL, at
+             * every rate and channel count with no exception; every
+             * period_count=4 combination succeeded (negotiation AND three
+             * real pcm_writei() calls), also with no exception. Same
+             * period_count=4 requirement the S16_LE probe above already
+             * found, now confirmed rate/format-independent rather than an
+             * assumption -- this hardware's I2S/DMA path apparently just
+             * requires exactly 4 periods regardless of format or rate. So
+             * 2048x4 (this branch) and 1024x4 (the low_latency branch above)
+             * were already the right choice for S24_LE, not a guess left
+             * over from S16_LE tuning. Not yet verified under sustained real
+             * playback jitter at S24_LE specifically (screen redraws,
+             * library scans, Wi-Fi) -- same caveat the low_latency S16_LE
+             * config above still carries. */
             config.period_size = 2048;
             config.period_count = 4;
         }
@@ -181,10 +231,34 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
 
         alsa_pcm = pcm_open(ALSA_CARD, ALSA_DEVICE, PCM_OUT, &config);
         if (!alsa_pcm || !pcm_is_ready(alsa_pcm)) {
-            DBG_LOG("audio_output: pcm_open failed: %s\n", alsa_pcm ? pcm_get_error(alsa_pcm) : "unknown");
+            DBG_LOG("audio_output: pcm_open failed (format=%d): %s\n", (int) config.format,
+                    alsa_pcm ? pcm_get_error(alsa_pcm) : "unknown");
             if (alsa_pcm) pcm_close(alsa_pcm);
             alsa_pcm = NULL;
-            return false;
+            if (!want_s24) return false;
+            /* S24_LE hw_params negotiation failed -- rather than aborting the
+             * whole track (the previous behavior), fall back to the exact
+             * same S16_LE config every non-wide track already uses. Record
+             * the failure so audio_output_ensure() stops re-requesting S24_LE
+             * for this (channels, rate) on every subsequent chunk -- see
+             * s24_unsupported_known's own comment. The caller (audio.c) must
+             * re-check audio_output_is_s24_active() after this call returns
+             * and use the s16 decode/process/write path when it's false;
+             * it must not assume its own want_s24 request was honored. */
+            DBG_LOG("audio_output: S24_LE open failed, falling back to S16_LE\n");
+            s24_unsupported_known = true;
+            s24_unsupported_channels = channels;
+            s24_unsupported_rate = sample_rate;
+            config.format = PCM_FORMAT_S16_LE;
+            active_format = config.format;
+            alsa_pcm = pcm_open(ALSA_CARD, ALSA_DEVICE, PCM_OUT, &config);
+            if (!alsa_pcm || !pcm_is_ready(alsa_pcm)) {
+                DBG_LOG("audio_output: S16_LE fallback also failed: %s\n",
+                        alsa_pcm ? pcm_get_error(alsa_pcm) : "unknown");
+                if (alsa_pcm) pcm_close(alsa_pcm);
+                alsa_pcm = NULL;
+                return false;
+            }
         }
         active_target = OUTPUT_TARGET_LOCAL;
     }
@@ -198,11 +272,22 @@ void audio_output_close(void) {
     if (active_target == OUTPUT_TARGET_USB) close_usb_device();
     active_target = OUTPUT_TARGET_LOCAL; /* only open_device() above was ever setting this to BT/USB, never this side */
     if (alsa_pcm) { pcm_close(alsa_pcm); alsa_pcm = NULL; }
+    active_format = PCM_FORMAT_S16_LE;
     device_channels = 0;
     device_sample_rate = 0;
 }
 
-bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool low_latency) {
+bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool low_latency, bool want_s24) {
+    /* Already know this exact (channels, rate) fails S24_LE hw_params
+     * negotiation (open_device()'s fallback set this on a real failure) --
+     * downgrading here, before the format-mismatch check below, keeps a
+     * fallen-back-to-S16 device from being torn down and re-attempted at
+     * S24_LE on every subsequent chunk of the same track. */
+    if (want_s24 && s24_unsupported_known &&
+        s24_unsupported_channels == channels && s24_unsupported_rate == sample_rate) {
+        want_s24 = false;
+    }
+
     /* Real-device bug: aplay can die entirely on its own (BlueZ tearing
      * down the transport underneath it -- a headset bonding hiccup during
      * testing was one confirmed trigger, but any A2DP renegotiation could
@@ -239,17 +324,15 @@ bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool l
 
     bool device_open = (alsa_pcm != NULL || bt_aplay_pid >= 0 || usb_aplay_pid >= 0);
     if (device_open && active_target != requested_target) device_open = false;
-    /* Only the OUTPUT_TARGET_LOCAL tinyalsa path has more than one tuning
-     * (see open_device()) -- a mode mismatch there must force a reopen the
-     * same as a channel/rate change would, or a caller requesting
-     * low_latency while the device happens to already be open at the same
-     * channels/rate (e.g. AirPlay starting up before local playback's own
-     * async teardown has actually closed it) would silently keep the
-     * wrong tuning instead of getting what it just asked for. */
+    /* Only the OUTPUT_TARGET_LOCAL tinyalsa path has format and tuning options --
+     * a format or mode mismatch must force a reopen the same as a channel/rate change. */
+    enum pcm_format requested_format = (requested_target == OUTPUT_TARGET_LOCAL && want_s24)
+                                       ? PCM_FORMAT_S24_LE : PCM_FORMAT_S16_LE;
+    if (device_open && requested_target == OUTPUT_TARGET_LOCAL && active_format != requested_format) device_open = false;
     if (device_open && requested_target == OUTPUT_TARGET_LOCAL && active_low_latency != low_latency) device_open = false;
     if (device_open && device_channels == channels && device_sample_rate == sample_rate) return true;
     audio_output_close();
-    return open_device(channels, sample_rate, low_latency);
+    return open_device(channels, sample_rate, low_latency, want_s24);
 }
 
 bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written) {
@@ -317,6 +400,57 @@ bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int chann
     unsigned int rate = device_sample_rate ? device_sample_rate : 44100;
     usleep((useconds_t) ((uint64_t) frames * 1000000ULL / rate));
     return false;
+}
+
+bool audio_output_write_s24(const int32_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written) {
+    if (out_frames_written) *out_frames_written = 0;
+    /* Checking active_target alone is not enough: open_device()'s own S24_LE
+     * hw_params fallback can leave active_target == OUTPUT_TARGET_LOCAL while
+     * active_format == PCM_FORMAT_S16_LE. Handing this 32-bit-per-sample
+     * buffer to a PCM handle actually configured for S16_LE (2 bytes/sample)
+     * would not fail -- pcm_writei() sizes bytes from pcm->config.format, so
+     * it would happily write frames*channels*2 bytes read from a buffer
+     * meant to be read at 4 bytes/sample, i.e. real, silent sample
+     * corruption reaching the DAC, not a clean error. audio_output_is_s24_
+     * active() is the one true precondition for this function. */
+    if (!audio_output_is_s24_active()) {
+        DBG_LOG("audio_output: audio_output_write_s24 called while device is not local S24_LE (target=%d format=%d)\n",
+                (int) active_target, (int) active_format);
+        return false;
+    }
+
+    if (alsa_pcm) {
+        /* pcm_writei blocks until ALSA has room -- natural backpressure.
+         * tinyalsa sizes bytes per frame internally from pcm->config.format
+         * (PCM_FORMAT_S24_LE -> 4 bytes per sample / 8 bytes per stereo frame). */
+        int ret = pcm_writei(alsa_pcm, buf, (unsigned int) frames);
+        if (ret < 0 || (unsigned int) ret != (unsigned int) frames) {
+            uint64_t written = (ret > 0) ? (uint64_t) ret : 0;
+            if (out_frames_written) *out_frames_written = written;
+            DBG_LOG("audio_output: s24 pcm_writei returned %d (wanted %u written=%" PRIu64 "): %s\n",
+                    ret, (unsigned int) frames, written,
+                    ret < 0 ? pcm_get_error(alsa_pcm) : "short write");
+            return false;
+        }
+        if (out_frames_written) *out_frames_written = frames;
+        return true;
+    }
+
+    unsigned int rate = device_sample_rate ? device_sample_rate : 44100;
+    usleep((useconds_t) ((uint64_t) frames * 1000000ULL / rate));
+    return false;
+}
+
+bool audio_output_is_local_requested(void) {
+    return requested_target == OUTPUT_TARGET_LOCAL;
+}
+
+bool audio_output_is_s24_active(void) {
+    return active_target == OUTPUT_TARGET_LOCAL && active_format == PCM_FORMAT_S24_LE;
+}
+
+void audio_output_reset_s24_probe(void) {
+    s24_unsupported_known = false;
 }
 
 

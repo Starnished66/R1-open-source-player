@@ -480,6 +480,62 @@ static decoder_read_result_t decoder_read_s16(decoder_t * dec, uint64_t frames, 
     return res;
 }
 
+#ifndef HOST_BUILD
+static decoder_read_result_t decoder_read_s32(decoder_t * dec, uint64_t frames, int32_t * buf) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !buf) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
+    switch (dec->type) {
+        case DECODER_FLAC: {
+            uint64_t r = drflac_read_pcm_frames_s32(dec->as.flac, frames, buf);
+            res.frames = r;
+            res.status = (r > 0) ? DECODER_READ_OK : DECODER_READ_EOF;
+            /* FLAC is left-justified (MSB at bit 31). Arithmetic right shift by 8
+             * on signed int32_t so the sign bit replicates correctly, placing the
+             * 24-bit sample into the low 24 bits for ALSA S24_LE. */
+            size_t sample_count = (size_t) r * dec->channels;
+            for (size_t i = 0; i < sample_count; i++) {
+                buf[i] >>= 8;
+            }
+            return res;
+        }
+        case DECODER_WAV: {
+            uint64_t r = drwav_read_pcm_frames_s32(dec->as.wav, frames, buf);
+            res.frames = r;
+            res.status = (r > 0) ? DECODER_READ_OK : DECODER_READ_EOF;
+            /* WAV is left-justified (MSB at bit 31). Arithmetic right shift by 8
+             * on signed int32_t so the sign bit replicates correctly, placing the
+             * 24-bit sample into the low 24 bits for ALSA S24_LE. */
+            size_t sample_count = (size_t) r * dec->channels;
+            for (size_t i = 0; i < sample_count; i++) {
+                buf[i] >>= 8;
+            }
+            return res;
+        }
+        case DECODER_ALAC:
+            /* ALAC decodes internally to right-justified true-magnitude int32 for
+             * 24-bit sources: DO NOT shift; already in S24_LE layout. */
+            return alac_read_pcm_frames_s32(dec->as.alac, frames, buf);
+        case DECODER_APE:
+            /* APE decodes internally to right-justified true-magnitude int32 for
+             * 24-bit sources: DO NOT shift; already in S24_LE layout. */
+            return ape_read_pcm_frames_s32(dec->as.ape, frames, buf);
+        case DECODER_AIFF:
+            /* AIFF decodes internally to right-justified sign-extended int32 for
+             * 24-bit sources: DO NOT shift; already in S24_LE layout. */
+            return aiff_read_pcm_frames_s32(dec->as.aiff, frames, buf);
+        default:
+            /* Only the five lossless formats above have a wide read path.
+             * Any other decoder reaching here is a caller bug. */
+            res.status = DECODER_READ_FATAL_ERROR;
+            return res;
+    }
+}
+#endif
+
 #define MP3_SEEK_INDEX_MIN_SECONDS (10u * 60u)
 #define MP3_SEEK_INDEX_INTERVAL_SECONDS 30u
 #define MP3_SEEK_INDEX_MAX_POINTS 256u
@@ -819,6 +875,21 @@ static audio_codec_t public_codec_for_decoder(decoder_type_t type) {
     return AUDIO_CODEC_UNKNOWN;
 }
 
+#ifndef HOST_BUILD
+static bool can_use_wide_path(const decoder_t * dec) {
+    if (!dec) return false;
+    if (dec->net_stream != NULL) return false;
+    if (dec->source_bit_depth <= 16) return false;
+    if (dec->type != DECODER_FLAC &&
+        dec->type != DECODER_WAV &&
+        dec->type != DECODER_ALAC &&
+        dec->type != DECODER_APE &&
+        dec->type != DECODER_AIFF) return false;
+    if (!audio_output_is_local_requested()) return false;
+    return true;
+}
+#endif
+
 /* audio_mutex must be held. Publishing a copied scalar snapshot here keeps
  * the UI completely independent from the playback thread's stack-local
  * decoder_t and its short-lived gapless/crossfade prefetched decoder. */
@@ -831,7 +902,24 @@ static void publish_current_format_locked(const decoder_t * dec, const char * pa
     current_format_info.source_sample_rate = dec->source_sample_rate ? dec->source_sample_rate : dec->sample_rate;
     current_format_info.source_bit_depth = dec->source_bit_depth;
     current_format_info.output_sample_rate = dec->sample_rate;
-    current_format_info.output_bit_depth = 16; /* decoder_read_s16() -> S16_LE on every output route */
+#ifndef HOST_BUILD
+    /* can_use_wide_path() alone is a prediction (source eligibility + what
+     * output route is currently REQUESTED) -- audio_output_is_s24_active()
+     * is the ground truth for what's actually open right now. They can
+     * disagree: a route change to Bluetooth/USB, or an S24_LE hw_params
+     * negotiation failure that fell back to S16_LE (see audio_output.c's
+     * open_device()), both leave can_use_wide_path() true while the device
+     * is actually running at S16_LE. Requiring both here means the UI never
+     * claims 24-bit output that isn't really happening. At a crossfade
+     * promotion (cur_dec = nxt_dec) this can under-report by one chunk's
+     * worth of time, since the device's format for the newly-promoted track
+     * isn't renegotiated until the next chunk's own ensure_device_format()
+     * call -- self-corrects immediately once that runs, not worth special-
+     * casing for a display value. */
+    current_format_info.output_bit_depth = (can_use_wide_path(dec) && audio_output_is_s24_active()) ? 24 : 16;
+#else
+    current_format_info.output_bit_depth = 16; /* host simulator SDL playback is always 16-bit */
+#endif
     current_format_info.channels = dec->channels;
     current_format_info.bitrate_kbps = dec->bitrate_kbps;
     current_format_info.duration_seconds = dec->sample_rate > 0 && dec->total_frames > 0
@@ -898,6 +986,22 @@ static void apply_gain(int16_t * buf, size_t sample_count, float gain) {
         buf[i] = (int16_t) scaled;
     }
 }
+
+#ifndef HOST_BUILD
+static void apply_gain_s32(int32_t * buf, size_t sample_count, float gain) {
+    if (gain > 0.999f && gain < 1.001f) return;
+    for (size_t i = 0; i < sample_count; i++) {
+        float scaled_f = (float) buf[i] * gain;
+        if (scaled_f > 8388607.0f) {
+            buf[i] = 8388607;
+        } else if (scaled_f < -8388608.0f) {
+            buf[i] = -8388608;
+        } else {
+            buf[i] = (int32_t) lrintf(scaled_f);
+        }
+    }
+}
+#endif
 
 /* Closes and reopens a local decoder at last_confirmed_frame.
  * Only valid for finite local files (not net_stream). Returns true on
@@ -997,11 +1101,11 @@ static void write_device(const int16_t * buf, uint64_t frames, unsigned int chan
  * local-hardware-vs-Bluetooth routing, pacing, and failure-handling logic
  * that used to live here directly now lives there instead, shared with
  * usb_dac_bridge.c's own separate output stream. */
-static bool ensure_device(unsigned int channels, unsigned int sample_rate) {
+static bool ensure_device_format(unsigned int channels, unsigned int sample_rate, bool want_s24) {
     /* Decoder-fed local playback wants the standard, battery-tuned local
      * buffer, not the low-latency one AirPlay's own audio_output_ensure()
      * call requests -- see that parameter's own doc comment. */
-    bool ok = audio_output_ensure(channels, sample_rate, false);
+    bool ok = audio_output_ensure(channels, sample_rate, false, want_s24);
     if (ok) {
         /* Real-device bug report: USB headphones had volume maxed out on
          * first boot no matter what the UI showed, only "fixed" by
@@ -1029,6 +1133,10 @@ static bool ensure_device(unsigned int channels, unsigned int sample_rate) {
     return ok;
 }
 
+static bool ensure_device(unsigned int channels, unsigned int sample_rate) {
+    return ensure_device_format(channels, sample_rate, false);
+}
+
 static void close_device(void) {
     audio_output_close();
 }
@@ -1054,6 +1162,10 @@ static write_result_t write_device_with_retry_ex(const int16_t * buf, uint64_t f
                                                 bool allow_during_stop_restart) {
     uint64_t delivered = 0;
     if (out_delivered_frames) *out_delivered_frames = 0;
+
+    if (!ensure_device(channels, sample_rate)) {
+        return WRITE_RESULT_FAILED;
+    }
 
     for (int attempt = 0; attempt <= OUTPUT_WRITE_RETRIES; attempt++) {
         pthread_mutex_lock(&audio_mutex);
@@ -1108,6 +1220,95 @@ static inline write_result_t write_device_transition_ramp(const int16_t * buf, u
                                                           uint64_t * out_delivered_frames) {
     return write_device_with_retry_ex(buf, frames, channels, sample_rate, path, out_delivered_frames, true);
 }
+
+/* fallback_buf must have room for at least frames*channels int16_t samples
+ * (buf_cur, already allocated at MAX_CHUNK_FRAMES*MAX_CHANNELS and otherwise
+ * idle while a chunk is being decoded/written through this s32 path, is what
+ * every real caller passes -- see write_device_with_retry_s32()'s own
+ * caller). Used only if the device turns out not to actually be local S24_LE
+ * when it's time to write -- see the ground-truth check inside the loop. */
+static write_result_t write_device_with_retry_s32_ex(const int32_t * buf, uint64_t frames,
+                                                    unsigned int channels,
+                                                    unsigned int sample_rate,
+                                                    const char * path,
+                                                    int16_t * fallback_buf,
+                                                    uint64_t * out_delivered_frames,
+                                                    bool allow_during_stop_restart) {
+    uint64_t delivered = 0;
+    if (out_delivered_frames) *out_delivered_frames = 0;
+
+    if (!ensure_device_format(channels, sample_rate, true)) {
+        return WRITE_RESULT_FAILED;
+    }
+
+    for (int attempt = 0; attempt <= OUTPUT_WRITE_RETRIES; attempt++) {
+        pthread_mutex_lock(&audio_mutex);
+        bool abort = should_abort_write_retry(allow_during_stop_restart, stop_requested, restart_requested);
+        pthread_mutex_unlock(&audio_mutex);
+        if (abort) {
+            if (out_delivered_frames) *out_delivered_frames = delivered;
+            return WRITE_RESULT_ABORTED;
+        }
+
+        if (attempt > 0) {
+            close_device();
+            usleep(OUTPUT_WRITE_RETRY_SLEEP_US);
+            if (!ensure_device_format(channels, sample_rate, true)) {
+                DBG_LOG("audio: output reopen (s32) failed on retry %d (%s)\n",
+                        attempt, safe_path_tail(path));
+                continue;
+            }
+            DBG_LOG("audio: output reopened (s32) for retry %d (%s)\n",
+                    attempt, safe_path_tail(path));
+        }
+
+        const int32_t * cur_buf = buf + (size_t) (delivered * channels);
+        uint64_t remaining_frames = frames - delivered;
+        uint64_t written_this_call = 0;
+        bool ok;
+        if (audio_output_is_s24_active()) {
+            ok = audio_output_write_s24(cur_buf, remaining_frames, channels, &written_this_call);
+        } else {
+            /* ensure_device_format() above only REQUESTED S24_LE -- this is the
+             * ground truth for what actually opened. A route change to
+             * Bluetooth/USB landing between the request and this write (want_s24
+             * is silently irrelevant to those paths), or an S24_LE hw_params
+             * negotiation failure that fell back to S16_LE (open_device()'s own
+             * fallback), both leave this false even though the request above
+             * just returned true. audio_output_write_s24() itself now refuses
+             * this combination rather than corrupting samples (see its own
+             * guard), so retrying it here would only exhaust the budget and
+             * fail the whole track for no reason. Narrow this remaining portion
+             * to S16 and deliver it through the ordinary, already-correct path
+             * instead -- checked fresh on every attempt, not just once, so a
+             * route/format change mid-retry is caught too. */
+            size_t sample_count = (size_t) remaining_frames * channels;
+            for (size_t i = 0; i < sample_count; i++) {
+                fallback_buf[i] = (int16_t) (cur_buf[i] >> 8);
+            }
+            ok = audio_output_write(fallback_buf, remaining_frames, channels, &written_this_call);
+        }
+        delivered += written_this_call;
+        if (out_delivered_frames) *out_delivered_frames = delivered;
+
+        if (ok || delivered >= frames) return WRITE_RESULT_OK;
+
+        DBG_LOG("audio: output write (s32) failed attempt %d/%d (delivered %" PRIu64 "/%" PRIu64 " frames) (%s)\n",
+                attempt + 1, OUTPUT_WRITE_RETRIES + 1, delivered, frames, safe_path_tail(path));
+    }
+    DBG_LOG("audio: output recovery (s32) exhausted (%s)\n", safe_path_tail(path));
+    if (out_delivered_frames) *out_delivered_frames = delivered;
+    return WRITE_RESULT_FAILED;
+}
+
+static inline write_result_t write_device_with_retry_s32(const int32_t * buf, uint64_t frames,
+                                                         unsigned int channels,
+                                                         unsigned int sample_rate,
+                                                         const char * path,
+                                                         int16_t * fallback_buf,
+                                                         uint64_t * out_delivered_frames) {
+    return write_device_with_retry_s32_ex(buf, frames, channels, sample_rate, path, fallback_buf, out_delivered_frames, false);
+}
 #endif /* !HOST_BUILD */
 
 static void close_decoder_if_open(decoder_t * dec, bool * is_open) {
@@ -1117,7 +1318,21 @@ static void close_decoder_if_open(decoder_t * dec, bool * is_open) {
 /* Mixes n frames of buf_cur/buf_next into buf_out with a linear crossfade.
  * fade_start_frame is how many frames into the CROSSFADE_SECONDS window
  * this chunk's first frame falls, so the fade is continuous across chunk
- * boundaries rather than stepped. */
+ * boundaries rather than stepped.
+ *
+ * Deliberately int16_t only, never widened to int32_t/S24_LE -- this always
+ * blends two DIFFERENT decoders' output, so "native bit depth" doesn't have
+ * a single meaning here even when both sides are 24-bit sources. Known,
+ * accepted cost of that scope decision: entering and leaving a blend window
+ * forces the ALSA device to close+reopen if either side of the transition
+ * was using the S24_LE wide path (see can_use_wide_path()'s per-chunk use
+ * a few lines below) -- a real device format change requires a reopen, so
+ * a track boundary that crosses a 16-bit/24-bit distinction while
+ * crossfading is not perfectly seamless (a brief gap, not corruption or a
+ * failure -- audio_output_ensure()'s reopen is a normal, successful path).
+ * Making crossfade itself wide-capable would remove this, but is a real
+ * scope increase (a parallel int32_t mix_crossfade_s32(), matching decode/
+ * gain/PEQ treatment) rather than a bug fix -- not done here. */
 static void mix_crossfade(const int16_t * buf_cur, const int16_t * buf_next, int16_t * buf_out,
                            uint64_t n, unsigned int channels, uint64_t fade_start_frame, uint64_t crossfade_frames) {
     for (uint64_t k = 0; k < n; k++) {
@@ -1155,6 +1370,9 @@ static void * audio_thread_func(void * arg) {
     int16_t * buf_cur = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
     int16_t * buf_next = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
     int16_t * buf_out = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
+#ifndef HOST_BUILD
+    int32_t * buf_cur_s32 = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int32_t));
+#endif
 
 #ifndef HOST_BUILD
     /* Real-device bug report: plugging/unplugging headphones or an aux
@@ -1259,7 +1477,21 @@ static void * audio_thread_func(void * arg) {
             }
         }
 
+#ifndef HOST_BUILD
+        /* A different decoder is becoming current -- give it a clean shot at
+         * S24_LE even if a previous, unrelated track at this same (channels,
+         * rate) hit a transient pcm_open() failure (see s24_unsupported_
+         * known's own comment for why that record isn't kept forever). Must
+         * run BEFORE ensure_device_format() below, not after: resetting
+         * afterward would immediately erase a failure this exact call just
+         * legitimately observed, defeating the per-chunk-thrashing
+         * protection that record exists for within this same track. */
+        audio_output_reset_s24_probe();
+        bool initial_wide = can_use_wide_path(&cur_dec);
+        if (!ensure_device_format(cur_dec.channels, cur_dec.sample_rate, initial_wide)) {
+#else
         if (!ensure_device(cur_dec.channels, cur_dec.sample_rate)) {
+#endif
             decoder_close(&cur_dec);
             cur_open = false;
             pthread_mutex_lock(&audio_mutex);
@@ -1443,8 +1675,24 @@ static void * audio_thread_func(void * arg) {
              * nothing extra when nothing changed. Best-effort -- write_device()
              * below skips writing rather than crashing if this fails, and the
              * next iteration tries again. */
-            if (!hold_for_mp3_seek)
-                ensure_device(cur_dec.channels, cur_dec.sample_rate);
+            if (!hold_for_mp3_seek) {
+                bool is_blending = (xfade_on && staged_next_path != NULL && nxt_open && nxt_format_matches);
+                bool use_wide = !is_blending && can_use_wide_path(&cur_dec);
+                ensure_device_format(cur_dec.channels, cur_dec.sample_rate, use_wide);
+                /* use_wide is only the REQUEST; audio_output_is_s24_active() (checked
+                 * right after ensure_device_format() actually ran) is the ground truth
+                 * -- see its own doc comment for why these can disagree (route race,
+                 * hw_params negotiation failure). The decode/process/write branch
+                 * decision below re-derives this same combined check independently
+                 * rather than trusting this one, since a route change could still land
+                 * in the gap between here and there; this copy only drives the display
+                 * value. */
+                pthread_mutex_lock(&audio_mutex);
+                if (current_format_info.valid) {
+                    current_format_info.output_bit_depth = (use_wide && audio_output_is_s24_active()) ? 24 : 16;
+                }
+                pthread_mutex_unlock(&audio_mutex);
+            }
 #endif
 
             if (do_restart || do_stop) {
@@ -1828,6 +2076,16 @@ static void * audio_thread_func(void * arg) {
                 if (snap_still_valid) {
                     decoder_close(&cur_dec);
                     cur_dec = nxt_dec;
+#ifndef HOST_BUILD
+                    /* A different decoder is now current, promoted out of the
+                     * crossfade blend window -- give it a clean shot at S24_LE
+                     * on the next chunk's own ensure_device_format() call (this
+                     * point itself doesn't negotiate the device; the per-chunk
+                     * check does that on the next loop iteration), even if some
+                     * earlier, unrelated track at this same (channels, rate) hit
+                     * a transient pcm_open() failure. */
+                    audio_output_reset_s24_probe();
+#endif
                     nxt_open = false;
                     nxt_format_matches = false;
                     cur_frames_played_local = nxt_frames_consumed;
@@ -1861,6 +2119,227 @@ static void * audio_thread_func(void * arg) {
 
             /* Not blending (crossfade off, not yet near the end, or the next
              * track's format doesn't match) -- plain single-source playback. */
+#ifndef HOST_BUILD
+            /* can_use_wide_path() alone is source-side eligibility only --
+             * whether the device is ACTUALLY open as local S24_LE right now
+             * can differ (a route change to Bluetooth/USB landed after this
+             * chunk's own ensure_device_format() call above, or that call's
+             * S24_LE negotiation failed and silently fell back to S16_LE;
+             * see audio_output_is_s24_active()'s own doc comment). Requiring
+             * both here, at the single point that decides whether this whole
+             * chunk decodes/processes/writes through the s32 path, means a
+             * stale or failed wide-path prediction falls through to the
+             * ordinary s16 path below instead of reaching
+             * audio_output_write_s24(), which would otherwise correctly
+             * refuse the write (active_target != OUTPUT_TARGET_LOCAL) and
+             * exhaust this chunk's retry budget into a hard playback failure. */
+            if (can_use_wide_path(&cur_dec) && audio_output_is_s24_active()) {
+                decoder_read_result_t r_cur = decoder_read_s32(&cur_dec, chunk_frames, buf_cur_s32);
+                uint64_t n_cur = r_cur.frames;
+
+                if (r_cur.status == DECODER_READ_RECOVERABLE_ERROR) {
+                    consecutive_decoder_errors++;
+                    DBG_LOG("audio: recoverable decoder error #%u at frame %" PRIu64 " (%s)\n",
+                            consecutive_decoder_errors, cur_frames_played_local, safe_path_tail(cur_path_local));
+                    if (consecutive_decoder_errors >= 10) {
+                        DBG_LOG("audio: consecutive recoverable errors exceeded limit (%s)\n",
+                                safe_path_tail(cur_path_local));
+                        r_cur.status = DECODER_READ_FATAL_ERROR;
+                    }
+                } else if (r_cur.status == DECODER_READ_OK) {
+                    consecutive_decoder_errors = 0;
+                }
+
+                if (r_cur.status == DECODER_READ_FATAL_ERROR) {
+                    DBG_LOG("audio: fatal decoder error at frame %" PRIu64 "/%" PRIu64 " (%s)\n",
+                            cur_frames_played_local, cur_dec.total_frames, safe_path_tail(cur_path_local));
+                    pthread_mutex_lock(&audio_mutex);
+                    last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                    last_playback_error_generation = cur_generation;
+                    have_current = false;
+                    clear_current_format_locked();
+                    paused = false;
+                    pthread_mutex_unlock(&audio_mutex);
+                    should_restart = false;
+                    was_stopped = false;
+                    ended_with_no_next = false;
+                    goto inner_loop_done;
+                }
+
+                if (n_cur == 0 && r_cur.status == DECODER_READ_EOF) {
+                    /* Zero-frame read: check whether this is a premature EOF for a
+                     * finite local file, or a genuine (or live-stream) end. */
+                    bool is_stream = (cur_dec.net_stream != NULL);
+                    if (is_premature_eof(cur_frames_played_local, cur_dec.total_frames, is_stream)) {
+                        /* Attempt bounded reopen+seek recovery */
+                        bool recovered = false;
+                        for (int dr = 0; dr < 3; dr++) {
+                            pthread_mutex_lock(&audio_mutex);
+                            bool abort = stop_requested || restart_requested;
+                            pthread_mutex_unlock(&audio_mutex);
+                            if (abort) break;
+
+                            DBG_LOG("audio: premature EOF at frame %" PRIu64 "/%" PRIu64
+                                    ", reopen attempt %d (%s)\n",
+                                    cur_frames_played_local, cur_dec.total_frames, dr + 1,
+                                    safe_path_tail(cur_path_local));
+                            usleep(50000); /* 50 ms backoff */
+
+                            if (!reopen_decoder_at(&cur_dec, cur_path_local,
+                                                   cur_frames_played_local)) {
+                                DBG_LOG("audio: decoder reopen failed on attempt %d\n", dr + 1);
+                                cur_open = false; /* dec is now closed */
+                                continue;
+                            }
+                            cur_open = true;
+                            r_cur = decoder_read_s32(&cur_dec, chunk_frames, buf_cur_s32);
+                            n_cur = r_cur.frames;
+                            if (n_cur > 0) { recovered = true; break; }
+                        }
+                        if (!recovered) {
+                            DBG_LOG("audio: decoder recovery exhausted at %" PRIu64 "/%" PRIu64
+                                    " (%s)\n",
+                                    cur_frames_played_local, cur_dec.total_frames,
+                                    safe_path_tail(cur_path_local));
+                            pthread_mutex_lock(&audio_mutex);
+                            last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                            last_playback_error_generation = cur_generation;
+                            have_current = false;
+                            clear_current_format_locked();
+                            paused = false;
+                            pthread_mutex_unlock(&audio_mutex);
+                            should_restart = false;
+                            was_stopped = false;
+                            ended_with_no_next = false;
+                            goto inner_loop_done;
+                        }
+                        /* n_cur > 0 now -- fall through to normal processing */
+                    }
+
+                    if (n_cur == 0) {
+                        /* True EOF (or live stream end). If a next track is queued, hand
+                         * off to it -- seamlessly if the format matches (device stays open),
+                         * or with a brief reopen if it doesn't. */
+                        if (!nxt_open && staged_next_path != NULL) {
+                            if (decoder_open(&nxt_dec, staged_next_path)) {
+                                nxt_open = true;
+                                nxt_frames_consumed = 0;
+                                nxt_replaygain_linear_local = staged_next_replaygain;
+                                nxt_replaygain_applied_local = staged_next_replaygain_applied;
+                            } else {
+                                DBG_LOG("audio: failed to open next track (%s)\n",
+                                        safe_path_tail(staged_next_path));
+                            }
+                        }
+
+                        if (nxt_open) {
+                            pthread_mutex_lock(&audio_mutex);
+                            bool snap_still_valid = (staged_next_generation == next_track_generation);
+                            if (!snap_still_valid) {
+                                /* Stale next track: queued track was replaced while playing. Discard nxt_dec. */
+                                pthread_mutex_unlock(&audio_mutex);
+                                close_decoder_if_open(&nxt_dec, &nxt_open);
+                                nxt_format_matches = false;
+                                DBG_LOG("audio: stale gapless prefetch discarded (%s)\n",
+                                        safe_path_tail(staged_next_path));
+                                ended_with_no_next = true;
+                                break;
+                            }
+                            pthread_mutex_unlock(&audio_mutex);
+
+                            /* Gapless handoff to a different decoder -- see the
+                             * initial-open call site's identical comment on why
+                             * this must run before ensure_device_format(). */
+                            audio_output_reset_s24_probe();
+                            bool next_wide = can_use_wide_path(&nxt_dec);
+                            bool device_ok = ensure_device_format(nxt_dec.channels, nxt_dec.sample_rate, next_wide);
+                            decoder_close(&cur_dec);
+                            cur_dec = nxt_dec;
+                            cur_open = true;
+                            nxt_open = false;
+                            cur_frames_played_local = nxt_frames_consumed;
+                            cur_replaygain_linear = nxt_replaygain_linear_local;
+                            cur_replaygain_applied = nxt_replaygain_applied_local;
+                            free(cur_path_local);
+
+                            pthread_mutex_lock(&audio_mutex);
+                            cur_path_local = next_path; next_path = NULL;
+                            free(active_path);
+                            active_path = cur_path_local ? strdup(cur_path_local) : NULL;
+                            playback_generation++;
+                            seek_pending = false;
+                            cur_generation = playback_generation;
+                            current_total_frames = cur_dec.total_frames;
+                            current_sample_rate = cur_dec.sample_rate;
+                            frames_played = cur_frames_played_local;
+                            publish_current_format_locked(&cur_dec, cur_path_local,
+                                                          cur_replaygain_linear, cur_replaygain_applied);
+                            track_advanced = true;
+                            pthread_mutex_unlock(&audio_mutex);
+
+                            if (!device_ok) { ended_with_no_next = true; break; }
+                            continue;
+                        }
+
+                        ended_with_no_next = true;
+                        break;
+                    }
+                }
+
+                apply_gain_s32(buf_cur_s32, (size_t) n_cur * cur_dec.channels, cur_replaygain_linear);
+                peq_process_s32(buf_cur_s32, (size_t) n_cur, (int) cur_dec.channels, cur_dec.sample_rate);
+                apply_gain_s32(buf_cur_s32, (size_t) n_cur * cur_dec.channels, vol);
+
+                if (need_fade_in && n_cur > 0) {
+                    uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+                    uint64_t in_frames = (n_cur < rf) ? n_cur : rf;
+                    for (uint64_t i = 0; i < in_frames; i++) {
+                        float t = (in_frames > 1) ? (float) i / (float) (in_frames - 1) : 1.0f;
+                        for (unsigned int ch = 0; ch < cur_dec.channels; ch++) {
+                            size_t idx = (size_t) i * cur_dec.channels + ch;
+                            float val = (float) buf_cur_s32[idx] * t;
+                            int32_t s = (int32_t) (val + (val >= 0.0f ? 0.5f : -0.5f));
+                            if (s > 8388607) s = 8388607;
+                            else if (s < -8388608) s = -8388608;
+                            buf_cur_s32[idx] = s;
+                        }
+                    }
+                    need_fade_in = false;
+                }
+
+                uint64_t delivered = 0;
+                /* buf_cur is idle here -- this chunk decoded into buf_cur_s32
+                 * instead -- so it doubles as the S16 fallback scratch buffer
+                 * if the device turns out not to actually be local S24_LE by
+                 * write time (see write_device_with_retry_s32_ex()'s own
+                 * comment). */
+                write_result_t wr = write_device_with_retry_s32(buf_cur_s32, n_cur, cur_dec.channels,
+                                                                 cur_dec.sample_rate, cur_path_local,
+                                                                 buf_cur, &delivered);
+                cur_frames_played_local += delivered;
+                pthread_mutex_lock(&audio_mutex);
+                frames_played = cur_frames_played_local;
+                pthread_mutex_unlock(&audio_mutex);
+
+                if (wr == WRITE_RESULT_ABORTED) {
+                    continue;
+                } else if (wr == WRITE_RESULT_FAILED) {
+                    DBG_LOG("audio: output failure, stopping (%s)\n",
+                            safe_path_tail(cur_path_local));
+                    pthread_mutex_lock(&audio_mutex);
+                    last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                    last_playback_error_generation = cur_generation;
+                    have_current = false;
+                    clear_current_format_locked();
+                    paused = false;
+                    pthread_mutex_unlock(&audio_mutex);
+                    should_restart = false;
+                    was_stopped = false;
+                    ended_with_no_next = false;
+                    goto inner_loop_done;
+                }
+            } else
+#endif
             {
             decoder_read_result_t r_cur = decoder_read_s16(&cur_dec, chunk_frames, buf_cur);
             uint64_t n_cur = r_cur.frames;
@@ -1975,7 +2454,16 @@ static void * audio_thread_func(void * arg) {
                         }
                         pthread_mutex_unlock(&audio_mutex);
 
+#ifndef HOST_BUILD
+                        /* Gapless handoff to a different decoder -- see the
+                         * initial-open call site's identical comment on why
+                         * this must run before ensure_device_format(). */
+                        audio_output_reset_s24_probe();
+                        bool next_wide = can_use_wide_path(&nxt_dec);
+                        bool device_ok = ensure_device_format(nxt_dec.channels, nxt_dec.sample_rate, next_wide);
+#else
                         bool device_ok = ensure_device(nxt_dec.channels, nxt_dec.sample_rate);
+#endif
                         decoder_close(&cur_dec);
                         cur_dec = nxt_dec;
                         cur_open = true;
@@ -2081,6 +2569,9 @@ static void * audio_thread_func(void * arg) {
     free(buf_cur);
     free(buf_next);
     free(buf_out);
+#ifndef HOST_BUILD
+    free(buf_cur_s32);
+#endif
     return NULL;
 }
 

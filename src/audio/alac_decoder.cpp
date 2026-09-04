@@ -29,6 +29,7 @@ struct alac_decoder {
     uint8_t * raw_output_buf; /* native bit-depth output from ALACDecoder::Decode() */
 
     int16_t * carry_buffer; /* converted to S16, ready to deliver */
+    int32_t * carry_buffer_s32; /* converted to S32/S24_LE layout, ready to deliver */
     uint32_t carry_frames;
     uint32_t carry_read_pos;
 
@@ -74,13 +75,26 @@ static bool decode_next_sample_ex(alac_decoder_t * dec, decoder_read_status_t * 
 
     if (dec->bit_depth == 16) {
         memcpy(dec->carry_buffer, dec->raw_output_buf, (size_t) out_frames * dec->channels * sizeof(int16_t));
-    } else { /* 24-bit: packed 3-byte little-endian samples per copyPredictorTo24/unmix24 -- keep the top 16 bits */
+        if (dec->carry_buffer_s32) {
+            const int16_t * src16 = (const int16_t *) dec->raw_output_buf;
+            size_t sample_count = (size_t) out_frames * dec->channels;
+            for (size_t i = 0; i < sample_count; i++) {
+                dec->carry_buffer_s32[i] = (int32_t) src16[i];
+            }
+        }
+    } else { /* 24-bit: packed 3-byte little-endian samples per copyPredictorTo24/unmix24 */
         const uint8_t * src = dec->raw_output_buf;
         size_t sample_count = (size_t) out_frames * dec->channels;
         for (size_t i = 0; i < sample_count; i++) {
             int32_t v = src[i * 3] | (src[i * 3 + 1] << 8) | (src[i * 3 + 2] << 16);
             if (v & 0x800000) v |= (int32_t) 0xFF000000; /* sign-extend */
             dec->carry_buffer[i] = (int16_t) (v >> 8);
+            if (dec->carry_buffer_s32) {
+                /* ALAC decoded sample v is already a right-justified, sign-extended
+                 * true-magnitude int32 value -- do NOT shift, it is already in the
+                 * low 24 bits matching ALSA S24_LE layout. */
+                dec->carry_buffer_s32[i] = v;
+            }
         }
     }
 
@@ -213,6 +227,63 @@ decoder_read_result_t alac_read_pcm_frames_s16(alac_decoder_t * dec, uint64_t fr
     return res;
 }
 
+decoder_read_result_t alac_read_pcm_frames_s32(alac_decoder_t * dec, uint64_t frames_to_read, int32_t * buffer_out) {
+    if (dec && !dec->carry_buffer_s32) {
+        dec->carry_buffer_s32 = (int32_t *) malloc((size_t) dec->frame_size * dec->channels * sizeof(int32_t));
+        if (dec->carry_buffer_s32 && dec->carry_frames > 0) {
+            if (dec->bit_depth == 16) {
+                const int16_t * src16 = (const int16_t *) dec->raw_output_buf;
+                size_t sample_count = (size_t) dec->carry_frames * dec->channels;
+                for (size_t i = 0; i < sample_count; i++) {
+                    dec->carry_buffer_s32[i] = (int32_t) src16[i];
+                }
+            } else {
+                const uint8_t * src = dec->raw_output_buf;
+                size_t sample_count = (size_t) dec->carry_frames * dec->channels;
+                for (size_t i = 0; i < sample_count; i++) {
+                    int32_t v = src[i * 3] | (src[i * 3 + 1] << 8) | (src[i * 3 + 2] << 16);
+                    if (v & 0x800000) v |= (int32_t) 0xFF000000;
+                    dec->carry_buffer_s32[i] = v;
+                }
+            }
+        }
+    }
+
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !buffer_out || !dec->carry_buffer_s32) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
+    while (res.frames < frames_to_read) {
+        if (dec->carry_read_pos >= dec->carry_frames) {
+            decoder_read_status_t status = DECODER_READ_OK;
+            if (!decode_next_sample_ex(dec, &status)) {
+                if (res.frames > 0) {
+                    res.status = DECODER_READ_OK;
+                } else {
+                    res.status = status;
+                }
+                break;
+            }
+        }
+
+        uint64_t available = dec->carry_frames - dec->carry_read_pos;
+        uint64_t to_copy = frames_to_read - res.frames;
+        if (to_copy > available) to_copy = available;
+
+        memcpy(buffer_out + res.frames * dec->channels,
+               dec->carry_buffer_s32 + dec->carry_read_pos * dec->channels,
+               (size_t) to_copy * dec->channels * sizeof(int32_t));
+
+        dec->carry_read_pos += (uint32_t) to_copy;
+        res.frames += to_copy;
+        dec->current_pcm_frame += to_copy;
+    }
+
+    return res;
+}
+
 bool alac_seek_to_pcm_frame(alac_decoder_t * dec, uint64_t frame_index) {
     if (!dec) return false;
     if (frame_index > dec->total_pcm_frames) frame_index = dec->total_pcm_frames;
@@ -239,5 +310,6 @@ void alac_close(alac_decoder_t * dec) {
     free(dec->compressed_buf);
     free(dec->raw_output_buf);
     free(dec->carry_buffer);
+    free(dec->carry_buffer_s32);
     free(dec);
 }

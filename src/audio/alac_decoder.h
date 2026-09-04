@@ -27,6 +27,7 @@ unsigned int alac_get_bit_depth(const alac_decoder_t * dec);
 uint64_t alac_get_total_pcm_frame_count(const alac_decoder_t * dec);
 
 decoder_read_result_t alac_read_pcm_frames_s16(alac_decoder_t * dec, uint64_t frames_to_read, int16_t * buffer_out);
+decoder_read_result_t alac_read_pcm_frames_s32(alac_decoder_t * dec, uint64_t frames_to_read, int32_t * buffer_out);
 bool alac_seek_to_pcm_frame(alac_decoder_t * dec, uint64_t frame_index);
 
 void alac_close(alac_decoder_t * dec);

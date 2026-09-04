@@ -53,7 +53,7 @@
  * every caller is expected to honor instead). That's pre-existing
  * architectural debt this parameter doesn't attempt to fix, just one
  * specific, previously-avoidable gap within it. */
-bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool low_latency);
+bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool low_latency, bool want_s24);
 
 /* Writes frames to whatever audio_output_ensure() last successfully opened.
  * Blocks until delivery completes (tinyalsa pcm_writei() for local hardware;
@@ -69,6 +69,40 @@ bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool l
  * When nothing is open, sleeps for the chunk's nominal playback duration and
  * returns false with *out_frames_written = 0. */
 bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written);
+
+/* Writes 32-bit frames (right-justified in low 24-bits, PCM_FORMAT_S24_LE) to local hardware.
+ * Only valid when active_target == OUTPUT_TARGET_LOCAL and tinyalsa opened in S24_LE.
+ * Returns false immediately if called while active_target != OUTPUT_TARGET_LOCAL. */
+bool audio_output_write_s24(const int32_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written);
+
+/* Returns true if OUTPUT_TARGET_LOCAL is the currently requested output target
+ * (neither Bluetooth nor USB DAC output is requested). */
+bool audio_output_is_local_requested(void);
+
+/* Ground truth for whether the device open RIGHT NOW is actually local
+ * hardware running at PCM_FORMAT_S24_LE -- not merely what a caller last
+ * asked for. A caller that requested want_s24=true via audio_output_ensure()
+ * can still end up here false: the route may have changed to Bluetooth/USB
+ * between the request and this check (want_s24 is silently irrelevant to
+ * those paths), or hw_params negotiation for S24_LE may have failed and
+ * open_device() fell back to S16_LE (see its own comment). Callers that
+ * decoded/processed a chunk assuming the wide path must re-check this
+ * AFTER audio_output_ensure() returns and before choosing which write
+ * function to call -- audio_output_write_s24() unconditionally refuses to
+ * write while the active target isn't local, so trusting a pre-negotiation
+ * prediction instead of this can turn a route change or a negotiation
+ * failure into a hard write failure that aborts playback. */
+bool audio_output_is_s24_active(void);
+
+/* Clears any remembered "S24_LE hw_params negotiation failed at this
+ * (channels, rate)" record (see audio_output.c's s24_unsupported_known for
+ * why one exists and why it's deliberately not permanent). Call once per
+ * new track becoming current -- audio.c does this from
+ * publish_current_format_locked(), the single point every "a different
+ * decoder is now the current one" transition already goes through (initial
+ * open, gapless handoff, crossfade promotion). Safe/cheap to call even when
+ * nothing was cached. */
+void audio_output_reset_s24_probe(void);
 
 /* Closes whatever's open (local or Bluetooth) and resets format tracking,
  * so the next audio_output_ensure() call always does a fresh open. */

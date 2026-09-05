@@ -275,6 +275,7 @@ void gui_plugin_set_background_color(const char * slot, uint32_t rgb) {
     } else if (strcmp(slot, "card") == 0) {
         lv_style_set_bg_color(&style_theme_card_bg, color);
         lv_obj_report_style_change(&style_theme_card_bg);
+        gui_theme_update_surface_contrast();
     } else if (strcmp(slot, "list_row") == 0) {
         lv_style_set_bg_color(&list_row_style, color);
         lv_obj_report_style_change(&list_row_style);
@@ -283,6 +284,7 @@ void gui_plugin_set_background_color(const char * slot, uint32_t rgb) {
          * style object rather than reusing list_row_style directly. */
         lv_style_set_bg_color(&pill_row_bg_style, color);
         lv_obj_report_style_change(&pill_row_bg_style);
+        gui_theme_update_surface_contrast();
     }
     /* Else: unknown slot -- plugin_manager.c's l_plugin_set_background_color()
      * already validates against the three known names and raises a Lua
@@ -306,6 +308,7 @@ void gui_plugin_set_text_color(const char * slot, uint32_t rgb) {
         lv_obj_report_style_change(&style_theme_text_primary);
         lv_style_set_text_color(&list_row_style, color);
         lv_obj_report_style_change(&list_row_style);
+        gui_theme_update_surface_contrast();
     } else if (strcmp(slot, "muted") == 0) {
         lv_style_set_text_color(&style_theme_text_muted, color);
         lv_obj_report_style_change(&style_theme_text_muted);
@@ -564,6 +567,7 @@ static void plugin_settings_tap_row_click_cb(lv_event_t * e) {
 static void apply_plugin_pill_row_resize(lv_obj_t * row_obj, int32_t row_height, int32_t row_width) {
     if (row_height <= 0 && row_width <= 0) return;
     if (row_height > 0) {
+        lv_obj_remove_style(row_obj, &native_row_min_style, 0);
         int32_t height = row_height;
         if (height < PILL_ROW_HEIGHT_MIN) height = PILL_ROW_HEIGHT_MIN;
         if (height > PILL_ROW_HEIGHT_MAX) height = PILL_ROW_HEIGHT_MAX;
@@ -577,7 +581,7 @@ static void apply_plugin_pill_row_resize(lv_obj_t * row_obj, int32_t row_height,
     }
     lv_obj_set_style_bg_image_src(row_obj, NULL, 0);
     lv_obj_set_style_radius(row_obj, LIST_ROW_RADIUS, 0);
-    lv_obj_set_style_bg_color(row_obj, LIST_ROW_BG_COLOR, 0);
+    lv_obj_add_style(row_obj, &pill_row_bg_style, 0);
 }
 
 static void populate_plugin_settings_list_screen(int slot); /* forward -- toggle click rebuilds its own slot */

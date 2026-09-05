@@ -3,7 +3,7 @@
 
 /* Screen accessors */
 lv_obj_t * gui_settings_get_screen(void);
-lv_obj_t * gui_settings_get_playback_screen(void);
+lv_obj_t * gui_settings_get_music_screen(void);
 lv_obj_t * gui_settings_get_display_screen(void);
 lv_obj_t * gui_settings_get_power_screen(void);
 lv_obj_t * gui_settings_get_system_screen(void);
@@ -23,3 +23,4 @@ lv_obj_t * build_home_screen(void);
 lv_obj_t * build_dac_home_screen(void);
 
 void gui_settings_sync_crossfade_toggle(void);
+void gui_settings_sync_sleep_timer_toggle(void);

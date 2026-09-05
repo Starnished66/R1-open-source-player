@@ -1529,8 +1529,9 @@ void refresh_quick_drawer_crossfade_icon(void) {
     quick_drawer_mark_snapshot_dirty();
 }
 
-/* Settings > Playback's own Crossfade toggle row (build_settings_playback_screen(),
- * captured via pill_list_item_t's out_toggle_img) -- that screen is built
+/* Settings > Music Settings > Playback's own Crossfade toggle row
+ * (build_music_playback_screen(), captured via pill_list_item_t's
+ * out_toggle_img) -- that screen is built
  * once at gui_init() and never rebuilt, so its toggle's sprite/LV_STATE_CHECKED
  * only ever reflects whatever current_settings.crossfade_enabled was at
  * that one build time unless something explicitly pokes it afterward.
@@ -1568,9 +1569,17 @@ static bool sleep_timer_active = false;
 static uint32_t sleep_timer_start_tick = 0;
 static lv_obj_t * quick_drawer_sleep_icon;
 static lv_obj_t * quick_drawer_sleep_label;
-static void quick_drawer_sleep_event_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    sleep_timer_active = !sleep_timer_active;
+/* Shared by the drawer icon's own click handler and the Settings > Sleep
+ * Timer toggle (quick_drawer_sleep_timer_set_active(), gui_settings.c) --
+ * both need the exact same icon/label/tick bookkeeping, and both then call
+ * gui_settings_sync_sleep_timer_toggle() themselves afterward to keep the
+ * OTHER one's widget in sync (same bidirectional pattern as crossfade --
+ * see refresh_quick_drawer_crossfade_icon()'s own comment). poll_sleep_
+ * timer()'s own expiry path below updates the drawer icon/label inline
+ * instead of calling this (it needs the pause-playback side effect too),
+ * but still calls that same sync afterward. */
+static void apply_sleep_timer_active(bool active) {
+    sleep_timer_active = active;
     if (sleep_timer_active) {
         sleep_timer_start_tick = lv_tick_get();
         lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch_s.png"));
@@ -1581,6 +1590,36 @@ static void quick_drawer_sleep_event_cb(lv_event_t * e) {
         lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
     }
     quick_drawer_mark_snapshot_dirty();
+}
+
+bool quick_drawer_sleep_timer_is_active(void) {
+    return sleep_timer_active;
+}
+
+/* For Settings > Sleep Timer's "Show Time Remaining" button (build_sleep_
+ * timer_screen(), gui_settings.c) -- same total_ms/elapsed_ms math as
+ * poll_sleep_timer() below, just returning the value instead of acting on
+ * it. 0 when not armed, never negative. */
+int quick_drawer_sleep_timer_remaining_seconds(void) {
+    if (!sleep_timer_active) return 0;
+    uint32_t total_ms = (uint32_t) current_settings.sleep_timer_minutes * 60000;
+    uint32_t elapsed_ms = lv_tick_elaps(sleep_timer_start_tick);
+    if (elapsed_ms >= total_ms) return 0;
+    return (int) ((total_ms - elapsed_ms) / 1000);
+}
+
+/* Settings > Sleep Timer's own enable toggle (build_sleep_timer_screen(),
+ * gui_settings.c) -- real-device bug report: this screen had no way to
+ * arm/disarm the timer at all, only the drawer icon did, and the two
+ * needed to agree once one existed. */
+void quick_drawer_sleep_timer_set_active(bool active) {
+    apply_sleep_timer_active(active);
+}
+
+static void quick_drawer_sleep_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    apply_sleep_timer_active(!sleep_timer_active);
+    gui_settings_sync_sleep_timer_toggle();
 }
 
 /* Called every update_timer_cb tick (500ms). Cheap no-op when not armed. */
@@ -1596,6 +1635,7 @@ static void poll_sleep_timer(void) {
         lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
         lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
         quick_drawer_mark_snapshot_dirty();
+        gui_settings_sync_sleep_timer_toggle(); /* Settings' toggle must not keep showing armed once expiry disarmed it */
         return;
     }
 
@@ -3261,18 +3301,22 @@ static void build_quick_drawer(void) {
     quick_drawer_title_label = lv_label_create(card);
     lv_label_set_text(quick_drawer_title_label, "No track loaded");
     lv_obj_add_style(quick_drawer_title_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(quick_drawer_title_label, &app_font_16, 0); /* see song_title_label's own comment */
-    lv_obj_set_width(quick_drawer_title_label, lv_pct(100));
+    lv_obj_set_style_text_font(quick_drawer_title_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
+    lv_obj_set_width(quick_drawer_title_label, 392);
     lv_obj_set_style_text_align(quick_drawer_title_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(quick_drawer_title_label, LV_ALIGN_TOP_MID, 0, 14);
+    row_label_apply_bounded_height(quick_drawer_title_label, gui_theme_font(GUI_FONT_ROLE_ROW));
+    row_label_enable_marquee(quick_drawer_title_label);
+    lv_obj_align(quick_drawer_title_label, LV_ALIGN_TOP_MID, 0, 22);
 
     quick_drawer_artist_label = lv_label_create(card);
     lv_label_set_text(quick_drawer_artist_label, "");
     lv_obj_add_style(quick_drawer_artist_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(quick_drawer_artist_label, &app_font_16, 0);
-    lv_obj_set_width(quick_drawer_artist_label, lv_pct(100));
+    lv_obj_set_style_text_font(quick_drawer_artist_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_set_width(quick_drawer_artist_label, 392);
     lv_obj_set_style_text_align(quick_drawer_artist_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(quick_drawer_artist_label, LV_ALIGN_TOP_MID, 0, 44);
+    row_label_apply_bounded_height(quick_drawer_artist_label, gui_theme_font(GUI_FONT_ROLE_BODY));
+    row_label_enable_marquee(quick_drawer_artist_label);
+    lv_obj_align(quick_drawer_artist_label, LV_ALIGN_TOP_MID, 0, 76);
 
     /* Transport row: order/prev/play/next/favorite, all five in one row --
      * matching the stock drawer exactly (shuffle-style icon leftmost,

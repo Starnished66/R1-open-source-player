@@ -48,6 +48,12 @@ void set_player_source_group_songs_direct(const group_song_entry_t * entries, in
 bool search_close_if_active_for_screen(lv_obj_t * screen);
 void refresh_now_playing_indicators(void);
 
+/* Shared song identity used by library and queue rows: display title on the
+ * first line, then Artist · Album on the metadata line. */
+void gui_library_format_song_identity(const song_row_t * row,
+                                      char * title, size_t title_size,
+                                      char * subtitle, size_t subtitle_size);
+
 void more_menu_list_cb(lv_event_t * e);
 
 void poll_search_job(void);

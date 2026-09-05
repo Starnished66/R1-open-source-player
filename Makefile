@@ -763,6 +763,23 @@ sd_ready_test:
 	./$(BUILD_TARGET_DIR)/sd_ready_test
 
 .PHONY: playlist-selftest
+.PHONY: ui-style-selftest
+# Headless real-LVGL layout tests: no SDL development package or device
+# required. Keep these objects separate from both production configurations.
+UI_STYLE_TEST_SRCS = $(LVGL_SRCS) src/ui/screen_builders.c src/ui/gui_theme.c src/ui/gui_notifications.c src/ui/gui_plugins.c src/ui/screen_builders_test.c
+UI_STYLE_TEST_OBJS = $(UI_STYLE_TEST_SRCS:%.c=build_ui_test/%.o)
+ui-style-selftest: build_ui_test/ui_style_test
+	./build_ui_test/ui_style_test
+
+build_ui_test/ui_style_test: $(UI_STYLE_TEST_OBJS)
+	$(CC) $^ -Wl,--gc-sections -lpthread -lm -o $@
+
+build_ui_test/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections -c $< -o $@
+
+-include $(UI_STYLE_TEST_OBJS:.o=.d)
+
 PLAYLIST_TEST_SANITIZERS ?=
 playlist-selftest:
 	@mkdir -p $(BUILD_TARGET_DIR)
@@ -851,7 +868,7 @@ compile_commands.json:
 	@python3 generate_compile_commands.py
 
 clean:
-	rm -rf build_host build_host_* build_target build_target_* \
+	rm -rf build_host build_host_* build_target build_target_* build_ui_test \
 	    open_hiby_player_host open_hiby_player_host_* \
 	    open_hiby_player_target open_hiby_player_target_* \
 	    compile_commands.json compile_flags.txt

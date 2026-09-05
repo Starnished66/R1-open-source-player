@@ -1692,6 +1692,22 @@ void gui_stream_media_refresh(void) {
     if (old) lv_obj_del(old);
 }
 
+/* One-shot deferred trigger for a fresh-SD-card/first-run auto rescan --
+ * see this timer's own scheduling call site (gui_init(), right after
+ * library_load_from_cache_only()) for why this can't just call
+ * start_library_rescan() synchronously there. Same pattern as fallback_
+ * font.c's fallback_font_load_deferred()/fallback_font_schedule_deferred_
+ * load(). */
+static void fresh_database_rescan_timer_cb(lv_timer_t * timer) {
+    lv_timer_delete(timer);
+    start_library_rescan();
+}
+
+#define FRESH_DATABASE_RESCAN_DELAY_MS 500
+static void fresh_database_schedule_deferred_rescan(void) {
+    lv_timer_create(fresh_database_rescan_timer_cb, FRESH_DATABASE_RESCAN_DELAY_MS, NULL);
+}
+
 void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("gui_init entered");
@@ -1810,6 +1826,23 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("library_load_from_cache_only done");
 #endif
+    /* Fresh SD card / first run: no database_idx.tcd* file exists yet, so
+     * library_load_from_cache_only() above just opened an empty in-memory
+     * library with nothing to show -- see metadata_db_had_no_saved_
+     * database()'s own comment for why this is distinct from a real,
+     * previously-scanned-but-genuinely-empty library (which must NOT
+     * trigger an unrequested rescan every boot). Deferred via a one-shot
+     * lv_timer, same pattern as fallback_font_schedule_deferred_load()
+     * just below in this same function, rather than calling start_library_
+     * rescan() synchronously here: that spawns a background thread which
+     * mutates live tagcache state (metadata_db_begin_update()/upsert per
+     * file) while gui_init() is still synchronously building every screen
+     * below this point, several of which activate their own paged DB
+     * queries as soon as they're built. Every existing start_library_
+     * rescan() call site already assumes the app has finished booting into
+     * its normal event-loop phase; this defers to that exact same phase
+     * instead of being the first caller to violate that assumption. */
+    if (metadata_db_had_no_saved_database()) fresh_database_schedule_deferred_rescan();
     /* No whole-library load anywhere in this boot path, on purpose --
      * remote_control.c queries metadata_db.c directly (its own METADATA_DB_
      * GUARD) rather than needing a synced copy of the library, and each of

@@ -1449,8 +1449,8 @@ static void bt_codec_settings_row_cb(lv_event_t * e) {
     open_bt_codec_screen();
 }
 
-/* ---- Resume Last Track selection screen (Settings > Playback > Resume Last
- * Track) -- same accent-colored-border single-select shape as Font Size
+/* ---- Resume Last Track selection screen (Settings > Music Settings >
+ * Playback > Resume Last Track) -- same accent-colored-border single-select shape as Font Size
  * just below, but takes effect on the NEXT cold boot (there's nothing to
  * apply live -- this only ever matters at startup), so no reboot popup is
  * needed, just a toast confirming the choice. See gui_init()'s own resume
@@ -1505,10 +1505,11 @@ void resume_mode_settings_row_cb(lv_event_t * e) {
     open_resume_mode_screen();
 }
 
-/* ---- Play/Pause button behavior selection screen (Settings > Playback >
- * Play/Pause Button) -- same accent-colored-border single-select shape as
- * Resume Last Track just above. Feature request: the physical play/pause
- * button can act as Previous Track instead, or combine both via a short
+/* ---- Play/Pause button behavior selection screen (Settings > Music Settings
+ * > Controls & Interface > Play/Pause Button) -- same accent-colored-border
+ * single-select shape as Resume Last Track just above. Feature request: the
+ * physical play/pause button can act as Previous Track instead, or combine
+ * both via a short
  * double-click window -- see handle_physical_play_pause_press() near
  * update_timer_cb for the actual dispatch. Unlike Resume Last Track, this
  * takes effect on the very next physical button press, not just at next
@@ -1956,6 +1957,25 @@ void poll_usb_storage_hotplug(void) {
         usb_storage_rebind_pending = connected;
     } else if (connected && !usb_cable_was_connected) {
         usb_storage_rebind_pending = true;
+    } else if (!connected && usb_cable_was_connected) {
+        /* Disconnect edge: real-device feature request -- copying files onto
+         * the SD card via USB Mass Storage is the single most common way a
+         * user adds "just a couple of songs", and nothing previously
+         * reacted to the cable coming back out. Only when the gadget was
+         * actually Storage at that moment -- DAC/ADB never touch the SD
+         * card's filesystem, so unplugging out of either has nothing to
+         * rescan for. No confirmation popup: start_library_rescan()'s own
+         * "Updating music database..." busy screen already blocks the user
+         * from doing anything else while it runs, which is the right
+         * tradeoff here -- a silent background scan competing with whatever
+         * the user does right after unplugging (most likely starting
+         * playback) risks contending with it for the same SD card
+         * bandwidth and CPU a foreground, blocking scan sidesteps by making
+         * that wait explicit instead. */
+        usb_mode_t live_mode;
+        if (usb_mode_control_detect_current(&live_mode) && live_mode == USB_MODE_STORAGE) {
+            start_library_rescan();
+        }
     }
     usb_cable_was_connected = connected;
 
@@ -2340,41 +2360,6 @@ static void populate_import_wifi_screen(void) {
 #endif
 }
 
-/* ---- "Update music database?" confirmation, shown on leaving Import via
- * Wi-Fi -- mirrors build_delete_song_popup()'s own centered-card/two-row
- * shape. Real-device feedback: a full rescan used to run unconditionally on
- * every exit from this screen, even if the user never actually uploaded
- * anything (just looked at the QR code, or backed out immediately) --
- * wasteful on a real library, and gave no way to skip it. Leaving the screen
- * and tearing down the HTTP server (import_web_stop(), now backgrounded --
- * see poll_import_web_stop()'s own comment) both still happen
- * unconditionally regardless of the choice made here; only the rescan
- * itself is behind it. This popup is shown once that teardown finishes,
- * not right when back is tapped. */
-static lv_obj_t * import_rescan_popup;
-static lv_obj_t * import_rescan_popup_backdrop;
-
-static void hide_import_rescan_popup(void) {
-    lv_obj_add_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(import_rescan_popup, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void import_rescan_popup_backdrop_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_import_rescan_popup();
-}
-
-static void import_rescan_cancel_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_import_rescan_popup();
-}
-
-static void import_rescan_confirm_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_import_rescan_popup();
-    start_library_rescan();
-}
-
 /* Shared "are you sure?" 2-button confirmation popup shape -- backdrop +
  * centered card + wrapped title + two full-width buttons. Real-device bug
  * report: this exact shape was independently hand-duplicated (fixed 400-
@@ -2493,20 +2478,6 @@ lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t tit
 /* build_menu_popup is in gui.c */
 
 
-static void build_import_rescan_popup(void) {
-    /* lv_color_make(160,160,160) matches style_theme_text_muted's own
-     * default (screen_builders.c) verbatim -- a raw color snapshot here
-     * rather than lv_obj_add_style(&style_theme_text_muted), same
-     * build-time-snapshot tradeoff the accent-colored "Update" button
-     * right next to it already had before this popup was ever migrated to
-     * build_confirm_popup() (accent_lv_color() below is also just read
-     * once, at build time, not a live-tracking style). */
-    import_rescan_popup = build_confirm_popup("Update music database?", LV_LABEL_LONG_WRAP, NULL, NULL, "Update",
-                                               accent_lv_color(), import_rescan_confirm_cb, NULL, "Not now",
-                                               lv_color_make(160, 160, 160), import_rescan_cancel_cb, NULL,
-                                               import_rescan_popup_backdrop_cb, &import_rescan_popup_backdrop);
-}
-
 /* Real-device feedback: leaving Import via Wi-Fi used to just hang -- no
  * visible feedback at all -- for however long import_web_stop() took (its
  * own comment: killall -9 across up to 8 process names, plus a bounded
@@ -2543,10 +2514,11 @@ static bool import_web_active = false;
 
 /* Set by gui_network_handle_wifi_disabled() right before it kicks off the
  * same async stop worker/busy-overlay import_wifi_back_cb() below uses --
- * consumed once by poll_import_web_stop() so the "Update music database?"
- * popup (import_rescan_popup) only ever appears after a real user-initiated
- * exit, never merely because Wi-Fi disappeared out from under the screen. */
-static bool import_web_stop_suppress_rescan_popup = false;
+ * consumed once by poll_import_web_stop() so the automatic rescan below
+ * only ever fires after a real user-initiated exit, never merely because
+ * Wi-Fi disappeared out from under the screen (which may not have
+ * downloaded anything worth rescanning for at all). */
+static bool import_web_stop_suppress_rescan = false;
 
 static void * import_web_stop_thread_func(void * arg) {
     (void) arg;
@@ -2567,20 +2539,24 @@ void poll_import_web_stop(void) {
     gui_busy_hide(import_web_stop_token);
     import_web_stop_nav_slot = -1;
 
-    bool suppress_popup = import_web_stop_suppress_rescan_popup;
-    import_web_stop_suppress_rescan_popup = false;
-    if (suppress_popup) return;
+    bool suppress_rescan = import_web_stop_suppress_rescan;
+    import_web_stop_suppress_rescan = false;
+    if (suppress_rescan) return;
 
-    lv_obj_remove_flag(import_rescan_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(import_rescan_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(import_rescan_popup_backdrop);
-    lv_obj_move_foreground(import_rescan_popup);
+    /* No confirmation popup: same reasoning as poll_usb_storage_hotplug()'s
+     * own disconnect-edge trigger -- a foreground, blocking rescan (start_
+     * library_rescan()'s own "Updating music database..." busy screen)
+     * sidesteps a silent background scan contending with whatever the user
+     * does right after closing Web Import, at the cost of making the user
+     * wait through it explicitly if a genuinely large download means a lot
+     * changed. */
+    start_library_rescan();
 }
 
 /* Shared by import_wifi_back_cb() (user-initiated exit) and import_wifi_
  * handle_wifi_disabled() (Wi-Fi-loss-initiated) below -- both need the exact
  * same async stop-worker/busy-overlay sequence, just with a different
- * suppress_popup value. import_web_active is deliberately only cleared
+ * suppress_rescan value. import_web_active is deliberately only cleared
  * AFTER pthread_create() actually succeeds, not optimistically beforehand:
  * if thread launch fails, import_web_stop() never runs and thttpd/
  * udp_server stay up, so leaving import_web_active true keeps that
@@ -2588,8 +2564,8 @@ void poll_import_web_stop(void) {
  * confirmation) still sees a stop as needed instead of wrongly treating
  * this as already handled and silently leaving the servers running
  * forever. */
-static void import_web_stop_start(bool suppress_popup) {
-    import_web_stop_suppress_rescan_popup = suppress_popup;
+static void import_web_stop_start(bool suppress_rescan) {
+    import_web_stop_suppress_rescan = suppress_rescan;
     import_web_stop_nav_slot = gui_navigation_get_depth() - 1; /* this screen's own slot, before pushing the busy screen on top of it */
     import_web_stop_token = gui_busy_show("Closing\nWeb Server...", "");
 
@@ -2597,7 +2573,7 @@ static void import_web_stop_start(bool suppress_popup) {
     import_web_stop_active = true;
     if (pthread_create(&import_web_stop_thread, NULL, import_web_stop_thread_func, NULL) != 0) {
         import_web_stop_active = false;
-        import_web_stop_suppress_rescan_popup = false;
+        import_web_stop_suppress_rescan = false;
         gui_busy_hide(import_web_stop_token);
         show_error_toast("Thread launch failed");
         return; /* import_web_active stays true -- nothing was actually stopped */
@@ -3394,7 +3370,6 @@ void gui_network_init(void) {
     play_pause_button_mode_screen = build_play_pause_button_mode_screen();
     usb_mode_screen = build_usb_mode_screen();
     usb_dac_overlay_screen = build_usb_dac_overlay_screen();
-    build_import_rescan_popup();
     import_wifi_screen = build_import_wifi_screen();
     airplay_screen = build_airplay_screen();
     airplay_overlay_screen = build_airplay_overlay_screen();
@@ -3416,13 +3391,11 @@ void gui_network_init(void) {
  * module owns so gui_network_init() can rebuild them from a clean slate
  * without leaking the old objects. Deliberately does NOT touch
  * dac_stream_labels_timer (already guarded/reused correctly by gui_network_
- * init() itself). The five popup-and-backdrop pairs below are built
+ * init() itself). The four popup-and-backdrop pairs below are built
  * directly on lv_layer_top() (see build_confirm_popup()'s own comment), not
  * as children of any of these screens, so each needs its own explicit
  * deletion. */
 void gui_network_teardown(void) {
-    if (import_rescan_popup) { lv_obj_del(import_rescan_popup); import_rescan_popup = NULL; }
-    if (import_rescan_popup_backdrop) { lv_obj_del(import_rescan_popup_backdrop); import_rescan_popup_backdrop = NULL; }
     if (bt_action_popup) { lv_obj_del(bt_action_popup); bt_action_popup = NULL; }
     if (bt_action_popup_backdrop) { lv_obj_del(bt_action_popup_backdrop); bt_action_popup_backdrop = NULL; }
     if (wifi_action_popup) { lv_obj_del(wifi_action_popup); wifi_action_popup = NULL; }

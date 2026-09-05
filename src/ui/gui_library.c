@@ -353,23 +353,7 @@ static lv_obj_t * build_files_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Files");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Files", generic_back_cb, NULL, NULL);
 
     file_browser_init(scr, MUSIC_ROOT_DIR, on_file_browser_selected, on_cue_file_selected);
 
@@ -436,8 +420,19 @@ static const char * song_quality_asset_for_path(const char * path) {
     return "touch_list/quality_nomal.png";
 }
 
+void gui_library_format_song_identity(const song_row_t * row,
+                                      char * title, size_t title_size,
+                                      char * subtitle, size_t subtitle_size) {
+    char artist[121], album[121];
+    metadata_db_song_display_title(row, title, title_size);
+    utf8_truncate_safe(artist, row->tags.artist[0] ? row->tags.artist : "Unknown artist", sizeof(artist));
+    utf8_truncate_safe(album, row->tags.album[0] ? row->tags.album : "Unknown album", sizeof(album));
+    snprintf(subtitle, subtitle_size, "%s · %s", artist, album);
+}
+
 static void fill_song_page_visual(compact_list_page_row_t * out, const song_row_t * row) {
-    metadata_db_song_display_title(row, out->label, sizeof(out->label));
+    gui_library_format_song_identity(row, out->label, sizeof(out->label),
+                                     out->subtitle, sizeof(out->subtitle));
     out->identity = row->id;
     snprintf(out->trailing_asset, sizeof(out->trailing_asset), "%s", song_quality_asset_for_path(row->path));
 }
@@ -519,11 +514,9 @@ static lv_obj_t * build_all_songs_screen(void) {
  * since neither makes as much sense against a recency-ordered list. */
 static void playlist_start_options(bool recent);
 static void format_song_identity(const song_row_t * row, char * out, size_t size) {
-    char title[128];
-    metadata_db_song_display_title(row, title, sizeof(title));
-    snprintf(out, size, "%.127s\n%.120s • %.120s", title,
-        row->tags.artist[0] ? row->tags.artist : "Unknown artist",
-        row->tags.album[0] ? row->tags.album : "Unknown album");
+    char title[128], subtitle[256];
+    gui_library_format_song_identity(row, title, sizeof(title), subtitle, sizeof(subtitle));
+    snprintf(out, size, "%s\n%s", title, subtitle);
 }
 
 static int recently_added_fetch_page(void * ctx, int offset, int count, compact_list_page_row_t out_rows[]) {
@@ -532,6 +525,8 @@ static int recently_added_fetch_page(void * ctx, int offset, int count, compact_
     if (offset == 0 && count > 0) {
         memset(&out_rows[0], 0, sizeof(out_rows[0]));
         snprintf(out_rows[0].label, sizeof(out_rows[0].label), "Play All");
+        out_rows[0].is_action = true;
+        snprintf(out_rows[0].subtitle, sizeof(out_rows[0].subtitle), "Choose sequential or shuffle playback");
         prefix = 1; count--; offset++;
     }
     if (count <= 0) return prefix;
@@ -539,7 +534,6 @@ static int recently_added_fetch_page(void * ctx, int offset, int count, compact_
     int n = rows ? metadata_db_get_songs_page_by_recency(offset - 1, count, rows) : 0;
     for (int i = 0; i < n; i++) {
         fill_song_page_visual(&out_rows[prefix + i], &rows[i]);
-        format_song_identity(&rows[i], out_rows[prefix + i].label, sizeof(out_rows[prefix + i].label));
     }
     free(rows);
     return n + prefix;
@@ -896,12 +890,12 @@ static void populate_group_songs_rows(void) {
     }
 
     bool editing = editable && group_songs_edit_mode;
-    if (!editing) add_group_songs_page_row("Play All", group_start_options_cb);
+    if (!editing) {
+        lv_obj_t * start = add_group_songs_page_row(LV_SYMBOL_PLAY "  Play All", group_start_options_cb);
+        lv_obj_add_style(start, &style_theme_card_bg, 0);
+    }
     if (group_songs_count == 0) {
-        lv_obj_t * empty = lv_label_create(group_songs_list);
-        lv_label_set_text(empty, "Playlist is empty. Add songs from a song menu.");
-        lv_obj_set_width(empty, LIST_ROW_WIDTH);
-        lv_obj_add_style(empty, &style_theme_text_muted, 0);
+        build_list_message(group_songs_list, "Playlist is empty", "Add songs from a song menu.");
     }
 
     if (group_songs_count <= GROUP_SONGS_PAGE_SIZE) group_songs_page_start = 0;
@@ -920,24 +914,7 @@ static void populate_group_songs_rows(void) {
 
     for (int i = group_songs_page_start; i < page_end; i++) {
         if (editing) {
-            /* Container row (label + remove icon), same shape as e.g.
-             * build_wifi_screen()'s saved/scanned network rows -- unlike the
-             * plain-label rows below, this needs a second child so it can't
-             * reuse list_row_style as-is. */
-            lv_obj_t * row = lv_obj_create(group_songs_list);
-            lv_obj_set_size(row, LIST_ROW_WIDTH, MUSIC_LIST_ROW_HEIGHT);
-            lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-            lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
-            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(row, 0, 0);
-            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-            lv_obj_t * label = lv_label_create(row);
-            lv_label_set_text(label, group_songs_entries[i].title);
-            lv_obj_add_style(label, &style_theme_text_primary, 0);
-            lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
-            lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
-            configure_scrolling_row_label(label, LIST_ROW_WIDTH - LIST_ROW_LABEL_INSET - 190);
+            lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, 190);
             for (int direction = 0; direction < 2; direction++) {
                 lv_obj_t * move = lv_label_create(row);
                 lv_label_set_text(move, direction ? LV_SYMBOL_DOWN : LV_SYMBOL_UP);
@@ -956,27 +933,14 @@ static void populate_group_songs_rows(void) {
             /* One lv_label via the shared list_row_style, not a container +
              * child label each with their own local style properties -- see
              * list_row_style's own doc comment (screen_builders.h). */
-            lv_obj_t * row = lv_label_create(group_songs_list);
-            lv_obj_add_style(row, &list_row_style, 0);
-            lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
-            row_label_enable_marquee(row);
-            lv_obj_set_style_height(row, MUSIC_LIST_ROW_HEIGHT, LV_PART_MAIN);
-            lv_obj_set_style_pad_top(row,
-                (MUSIC_LIST_ROW_HEIGHT - lv_font_get_line_height(&LIST_ROW_FONT) *
-                    (strchr(group_songs_entries[i].title, '\n') ? 2 : 1)) / 2, LV_PART_MAIN);
-            lv_obj_set_style_pad_right(row, 70, 0);
-            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            lv_label_set_text(row, group_songs_entries[i].title);
+            lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, 70);
 
             lv_obj_t * quality = lv_image_create(row);
             lv_image_set_src(quality, asset_path(song_quality_asset_for_path(group_songs_entries[i].path)));
             /* Child alignment is relative to the label's padded content
              * box. Cancel the 70px text reserve so the badge is physically
              * 14px from the card edge (same rule as compact-list rows). */
-            int32_t quality_pad_top = lv_obj_get_style_pad_top(row, LV_PART_MAIN);
-            int32_t quality_pad_bottom = lv_obj_get_style_pad_bottom(row, LV_PART_MAIN);
-            lv_obj_align(quality, LV_ALIGN_RIGHT_MID, 70 - 14,
-                         (quality_pad_top - quality_pad_bottom) / -2);
+            lv_obj_align(quality, LV_ALIGN_RIGHT_MID, -14, 0);
             lv_obj_remove_flag(quality, LV_OBJ_FLAG_CLICKABLE);
 
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -1132,44 +1096,7 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    group_songs_title_label = lv_label_create(scr);
-    lv_label_set_text(group_songs_title_label, "");
-    lv_obj_add_style(group_songs_title_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(group_songs_title_label, &app_font_28, 0); /* shows a metadata-derived artist/album/genre name -- see fallback_font.h */
-    /* Real-device bug report: a long artist/album/genre/playlist name
-     * (this label's whole reason for existing, per the comment above)
-     * centered via LV_ALIGN_TOP_MID ran directly under the back button on
-     * the left and the Edit button on the right. Left-aligned starting
-     * just past the back button, narrowed below (once group_songs_edit_btn
-     * itself exists) to stop before it, with auto-scroll for whatever
-     * still overflows -- same fix as build_subsonic_list_screen()'s own
-     * title. */
-    int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
-    lv_obj_set_width(group_songs_title_label, scr_w - TITLE_LABEL_LEFT_INSET - TITLE_LABEL_DEFAULT_RIGHT_MARGIN);
-    /* Real-device bug report: this title scrolled immediately, with none of
-     * the 2s-pause-before-scrolling every other marquee in the app has --
-     * root cause: setting LV_LABEL_LONG_SCROLL_CIRCULAR directly here never
-     * attached row_marquee_style (the shared style carrying that 2s delay/
-     * repeat-delay), so it fell back to LVGL's own built-in default
-     * animation timing instead. row_label_enable_marquee() sets the long
-     * mode AND attaches that style in one call -- same fix as
-     * build_subsonic_list_screen()'s own title label just below. */
-    row_label_enable_marquee(group_songs_title_label);
-    lv_obj_align(group_songs_title_label, LV_ALIGN_TOP_LEFT, TITLE_LABEL_LEFT_INSET,
-                 STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-
+    group_songs_title_label = build_screen_header(scr, "", generic_back_cb, NULL, NULL);
     /* Hidden by default -- populate_group_songs_rows() (via
      * show_group_songs_editable()) is what actually shows this, and only
      * for a group backed by an editable .m3u playlist. */
@@ -1200,8 +1127,8 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_obj_set_style_pad_all(group_songs_list, 0, 0);
     lv_obj_set_scroll_dir(group_songs_list, LV_DIR_VER); /* see build_icon_grid_screen's comment */
     lv_obj_set_flex_flow(group_songs_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(group_songs_list, 4, 0);
-    lv_obj_set_style_pad_top(group_songs_list, 4, 0);
+    lv_obj_set_style_pad_gap(group_songs_list, GUI_ROW_GAP, 0);
+    lv_obj_set_style_pad_top(group_songs_list, GUI_ROW_GAP, 0);
 
     finalize_screen_navigation(scr);
     return scr;
@@ -2001,8 +1928,8 @@ static group_song_entry_t * load_album_entries(const char * name, const char * a
         int got = metadata_db_get_album_songs(name, album_artist, n, page, want);
         if (got <= 0) break;
         for (int i = 0; i < got; i++) {
-            char title[128];
-            metadata_db_song_display_title(&page[i], title, sizeof(title));
+            char title[384];
+            format_song_identity(&page[i], title, sizeof(title));
             entries[n + i].path = strdup(page[i].path);
             entries[n + i].title = strdup(title);
             if (!entries[n + i].path || !entries[n + i].title) {
@@ -3125,10 +3052,9 @@ static void playlist_row_click_cb(lv_event_t * e) {
 static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_text) {
     lv_obj_t * row = lv_obj_create(parent);
     lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, MUSIC_LIST_ROW_HEIGHT);
-    lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-    lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
-    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_add_style(row, &pill_row_bg_style, 0);
+    lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+    lv_obj_set_style_pad_all(row, 0, 0);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t * label = lv_label_create(row);
@@ -3136,6 +3062,14 @@ static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_te
     lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+    configure_scrolling_row_label(label, LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - 60);
+    if (parent == playlists_list && !playlists_edit_mode) {
+        lv_obj_t * chevron = lv_label_create(row);
+        lv_label_set_text(chevron, ">");
+        lv_obj_add_style(chevron, &style_theme_text_muted, 0);
+        lv_obj_set_style_text_font(chevron, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+        lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, -GUI_TEXT_INSET, 0);
+    }
     return row;
 }
 
@@ -3213,11 +3147,10 @@ static void populate_playlists_screen(void) {
 
     lv_label_set_text(playlists_edit_btn, playlists_edit_mode ? "Done" : "Edit");
     lv_obj_t * create = add_playlist_row_base(playlists_list, "+ New Playlist");
+    lv_obj_add_style(create, &style_theme_card_bg, 0);
     lv_obj_add_flag(create, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(create, new_playlist_row_cb, LV_EVENT_CLICKED, (void *) 1);
-    lv_obj_t * system_label = lv_label_create(playlists_list);
-    lv_label_set_text(system_label, "System");
-    lv_obj_add_style(system_label, &style_theme_text_muted, 0);
+    build_list_section(playlists_list, "System playlists");
 
     /* Favorites/Most Played/Queue/Recently Added are never deletable (none
      * is a real .m3u file -- see playlist_row_click_cb()'s index==0..3
@@ -3253,14 +3186,14 @@ static void populate_playlists_screen(void) {
         lv_obj_add_event_cb(recently_added_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 3);
     }
 
-    lv_obj_t * user_label = lv_label_create(playlists_list);
-    lv_label_set_text(user_label, "User");
-    lv_obj_add_style(user_label, &style_theme_text_muted, 0);
+    build_list_section(playlists_list, "User playlists");
+    if (!playlists_m3u_count)
+        build_list_message(playlists_list, "No user playlists", "Create a playlist above or copy one to the SD card's Playlists folder.");
     for (int i = 0; i < playlists_m3u_count; i++) {
         const char * display = playlists_m3u_paths[i];
         if (strncmp(display, PLAYLISTS_DIR "/", strlen(PLAYLISTS_DIR) + 1) == 0) display += strlen(PLAYLISTS_DIR) + 1;
         lv_obj_t * row = add_playlist_row_base(playlists_list, display);
-        lv_obj_set_width(lv_obj_get_child(row, 0), LIST_ROW_WIDTH_WIDE - (playlists_edit_mode ? 180 : 50));
+        lv_obj_set_width(lv_obj_get_child(row, 0), LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - (playlists_edit_mode ? 180 : 60));
         lv_label_set_long_mode(lv_obj_get_child(row, 0), LV_LABEL_LONG_DOT);
         if (playlists_edit_mode) {
             lv_obj_t * rename = lv_label_create(row);
@@ -3553,11 +3486,21 @@ static void refresh_library_screens_after_reload(void) {
  * -- see its own comment -- so a previously-scanned card reinserted here
  * has its own already-populated database sitting right there).
  * library_load_from_cache_only() (a bounded tagcache read, not a filesystem
- * walk -- see its own comment) already does exactly this. A missing or
- * empty database leaves the library empty; Settings > Update Music
- * Database is the only path that walks files. A toast rather than the
- * "Updating music database..." screen -- this is a reload the user did
- * not ask for. */
+ * walk -- see its own comment) already does this instantly, giving the
+ * "Library loaded" toast below (and the covered case of a genuinely fresh,
+ * never-scanned card -- see metadata_db_had_no_saved_database()'s own
+ * comment -- which this simply leaves empty here) immediate feedback.
+ *
+ * A real filesystem walk still follows unconditionally, via the exact same
+ * start_library_rescan() every other automatic trigger now uses (USB Mass
+ * Storage disconnect, Wi-Fi Import closing) -- the card could have been
+ * plugged into a PC and had files added/removed while it was out, which a
+ * cache-only reload can never see. Its own "Updating music database..."
+ * busy screen (blocking, matching every other automatic trigger's choice
+ * to prefer that over a silent background scan -- see poll_usb_storage_
+ * hotplug()'s own comment on why) briefly follows the toast rather than
+ * replacing it; poll_library_rescan()'s completion handler does its own
+ * refresh/toast once that finishes, so nothing here needs to wait for it. */
 static void reload_library_on_sd_reinsert(void) {
     playlist_files_refresh_async(PLAYLISTS_DIR);
     library_load_from_cache_only();
@@ -3566,6 +3509,7 @@ static void reload_library_on_sd_reinsert(void) {
         show_info_toast("Library loaded");
         start_album_thumbnail_generation();
     }
+    start_library_rescan();
 }
 
 /* How long the "Library updated" success message stays up once a rescan
@@ -3858,17 +3802,31 @@ void poll_sd_card_hotplug(void) {
     mount_fail_streak = 0;
     sd_mount_fail_notified = false;
     unmount_confirm_streak = 0; /* seeing "mounted" again cancels any not-yet-confirmed removal */
+    /* reload_library_on_sd_reinsert() runs LAST in both branches below, real-
+     * device bug report: it used to run first, and now that it unconditionally
+     * ends with start_library_rescan() (a fresh SD card, or one with no saved
+     * database, gets a real background rescan -- see that function's own
+     * comment), that call pushes a brand-new busy screen and starts rendering
+     * it in this exact same tick. file_browser_reset_to_root() and fallback_
+     * font_on_sd_mounted() (the latter potentially swapping every global font
+     * pointer and forcing a full UI invalidate/refresh, if a custom SD-card
+     * font needs reloading) used to run against whatever screen the user was
+     * already stably looking at; running them AFTER the busy screen had just
+     * been pushed instead interleaved a font swap with that screen's own
+     * first-ever render. Settling both quick, synchronous side effects first,
+     * then triggering the (now screen-switching) reload last, removes that
+     * interleaving instead of relying on timing to avoid it. */
     if (!was_mounted && !library_rescan_active) {
-        reload_library_on_sd_reinsert();
         file_browser_reset_to_root();
         fallback_font_on_sd_mounted();
+        reload_library_on_sd_reinsert();
     } else if (!boot_library_recheck_done) {
         boot_library_recheck_done = true;
-        if (metadata_db_get_song_count() == 0 && !library_rescan_active) {
-            reload_library_on_sd_reinsert();
-            file_browser_reset_to_root();
-        }
         fallback_font_on_sd_mounted();
+        if (metadata_db_get_song_count() == 0 && !library_rescan_active) {
+            file_browser_reset_to_root();
+            reload_library_on_sd_reinsert();
+        }
     }
     was_mounted = true;
 }
@@ -4242,7 +4200,7 @@ static void music_files_tile_cb(lv_event_t * e) {
 
 static void music_screen_playback_settings_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    nav_push(gui_settings_get_playback_screen());
+    nav_push(gui_settings_get_music_screen());
 }
 
 static lv_obj_t * build_music_screen(void) {
@@ -4263,8 +4221,8 @@ static lv_obj_t * build_music_screen(void) {
     /* Same real stock-firmware gear icon as the Queue screen's own Options
      * button (sub_back/set.png) -- build_top_right_icon_button() guarantees
      * it lands at exactly the same visual level as this screen's own back
-     * arrow, on the opposite corner. Shortcuts straight to Playback
-     * Settings rather than the full Settings > Playback drill-down. */
+     * arrow, on the opposite corner. Shortcuts straight to Music Settings
+     * rather than the full Settings > Music Settings drill-down. */
     build_top_right_icon_button(scr, asset_path("sub_back/set.png"), music_screen_playback_settings_cb);
     finalize_screen_navigation(scr);
     return scr;
@@ -4913,7 +4871,7 @@ void gui_library_init(void) {
     library_teardown_diag("build_compact_list_widget(files_search) before");
     files_search_list = build_compact_list_widget(files_screen, NULL, 0, files_search_row_click_cb, NULL, LIST_ROW_WIDTH_WIDE, false, lv_color_black());
     lv_obj_set_style_bg_opa(files_search_list, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(files_search_list, lv_color_black(), 0);
+    lv_obj_add_style(files_search_list, &style_theme_screen_bg, 0);
     lv_obj_add_flag(files_search_list, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(files_search_list, LV_OBJ_FLAG_GESTURE_BUBBLE);
     library_teardown_diag("enable_gesture_bubble_recursive(files_search_list) before");

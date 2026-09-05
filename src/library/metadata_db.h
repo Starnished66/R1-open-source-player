@@ -30,6 +30,12 @@ typedef struct {
  * open. */
 void metadata_db_open(void);
 void metadata_db_close(void);
+/* True when the most recent metadata_db_open() found no saved database at
+ * all on the mounted music root (fresh SD card / first run) -- see
+ * tagcache_had_no_saved_database()'s own comment. False if the SD card
+ * wasn't mounted yet when metadata_db_open() ran (nothing was actually
+ * checked that call), same as every other query against an unready DB. */
+bool metadata_db_had_no_saved_database(void);
 
 /* Starts a scan pass against the SD-resident tagcache. Unchanged files
  * are marked seen; new/changed files are upserted. metadata_db_end_update()

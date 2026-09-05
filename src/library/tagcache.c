@@ -70,6 +70,19 @@ enum tag_type {
 #define TAGCACHE_RAM_RESERVE (16ull * 1024ull * 1024ull)
 #define TAGCACHE_FULL_BYTES_PER_SONG 200ull
 
+/* Scaling the reserve to the rebuild's computed need keeps small rebuilds
+ * cheap while growing the safety margin for large rebuilds that hold their
+ * working set longer. The floor reserve is not for the rebuild's own headroom
+ * (covered by `need`), but guarantees available memory for the player itself
+ * and potential bursts from concurrent processes (Wi-Fi, Bluetooth, Subsonic, etc.). */
+#define TAGCACHE_REBUILD_RESERVE_FLOOR (4ull * 1024ull * 1024ull)
+#define TAGCACHE_REBUILD_RESERVE_SCALE 4ull
+
+static uint64_t tagcache_rebuild_reserve(uint64_t need) {
+    uint64_t scaled = need * TAGCACHE_REBUILD_RESERVE_SCALE;
+    return scaled < TAGCACHE_REBUILD_RESERVE_FLOOR ? TAGCACHE_REBUILD_RESERVE_FLOOR : scaled;
+}
+
 #define TAGCACHE_NUMERIC_TAGS                                                                                          \
     ((1u << tag_year) | (1u << tag_discnumber) | (1u << tag_tracknumber) | (1u << tag_bitrate) | (1u << tag_length) |  \
      (1u << tag_playcount) | (1u << tag_rating) | (1u << tag_playtime) | (1u << tag_lastplayed) |                      \
@@ -146,6 +159,7 @@ static char db_dir[512];
 static bool db_open;
 static bool disk_ready;
 static bool opened_ok;
+static bool no_saved_database_found; /* True if no saved database files were found on disk */
 
 static arena_block_t * arena_blocks;
 static intern_t ** intern_exact_buckets;
@@ -677,12 +691,9 @@ static void free_groups(void) {
     }
 }
 
-/* Finalizing a large scan used to build every replacement index/group while
- * retaining the complete old derived view. None of those old structures is
- * needed after pruning has finished: lookup/upsert is over, and a failed
- * rebuild already recovers by reloading the last committed generation.
- * Drop them before rebuild_indexes() so old and new group membership,
- * ordering, rank, and hash allocations do not overlap at the scan's peak. */
+/* Drops old derived indexes (group membership, ordering, rank, and hash tables)
+ * before rebuild_indexes() so old and new structures do not overlap in memory
+ * at the scan's peak allocation. */
 static void drop_derived_indexes_before_rebuild(void) {
     free(title_order);
     free(recency_order);
@@ -727,9 +738,15 @@ static bool rebuild_indexes(void) {
 
     uint64_t mem_avail = get_mem_available();
     uint64_t mem_needed = estimate_rebuild_memory(ent_count, new_live);
-    if (mem_needed == UINT64_MAX || (mem_avail != UINT64_MAX && mem_avail < mem_needed + TAGCACHE_RAM_RESERVE)) {
+    if (mem_needed == UINT64_MAX) {
+        fprintf(stderr, "tagcache: rebuild_indexes rejected -- insufficient memory (avail=%" PRIu64 ", need=%" PRIu64 ", reserve=n/a)\n",
+                mem_avail, mem_needed);
+        return false;
+    }
+    uint64_t reserve = tagcache_rebuild_reserve(mem_needed);
+    if (mem_avail != UINT64_MAX && mem_avail < mem_needed + reserve) {
         fprintf(stderr, "tagcache: rebuild_indexes rejected -- insufficient memory (avail=%" PRIu64 ", need=%" PRIu64 ", reserve=%" PRIu64 ")\n",
-                mem_avail, mem_needed, (uint64_t) TAGCACHE_RAM_RESERVE);
+                mem_avail, mem_needed, reserve);
         return false;
     }
 
@@ -1840,6 +1857,9 @@ static bool load_generation(int32_t gen) {
 static bool load_all(void) {
     int32_t gens[48];
     int n = collect_load_generations(gens, 48);
+    /* Records whether any database files exist on disk (first run or fresh card),
+     * distinguishing a missing database from a validly loaded empty library. */
+    no_saved_database_found = (n == 0);
     if (n == 0) {
         intern_path_title = choose_intern_strings(0);
         return true;
@@ -2135,6 +2155,11 @@ bool tagcache_is_open(void) {
     return db_open && opened_ok;
 }
 
+/* Returns true if the most recent tagcache_open() found no database files on disk. */
+bool tagcache_had_no_saved_database(void) {
+    return no_saved_database_found;
+}
+
 void tagcache_begin_update(void) {
     if (!db_open) return;
     tagcache_flush_numeric();
@@ -2306,10 +2331,7 @@ int tagcache_artist_song_ids(const char * artist, int offset, int32_t * out_ids,
     return copy_group_page(TAGCACHE_GROUP_ARTIST, find_group(TAGCACHE_GROUP_ARTIST, artist, ""), offset, out_ids, max);
 }
 
-/* Mirrors tagcache_artist_song_ids() above, against the ALBUM_ARTIST group
- * instead -- for the Album Artist drill-down's own "All Songs" row (see
- * gui_library.c's show_artist_albums()), same as that function already
- * exists for the Artist drill-down's own version. */
+/* Returns song IDs belonging to the specified album artist group. */
 int tagcache_album_artist_song_ids(const char * album_artist, int offset, int32_t * out_ids, int max) {
     if (!db_open) return 0;
     return copy_group_page(TAGCACHE_GROUP_ALBUM_ARTIST, find_group(TAGCACHE_GROUP_ALBUM_ARTIST, album_artist, ""),

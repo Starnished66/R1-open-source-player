@@ -426,38 +426,7 @@ lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** ou
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title_label = lv_label_create(scr);
-    lv_label_set_text(title_label, default_title);
-    lv_obj_add_style(title_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title_label, &app_font_28, 0); /* later re-set to a real (possibly non-Latin) server artist/album/song name -- see fallback_font.h */
-    /* Real-device bug report: a long artist/album/playlist name (this
-     * label's whole reason for existing, per the comment above) centered
-     * via LV_ALIGN_TOP_MID ran directly under the back button on the left
-     * and, on a screen that also has a search/download button on the
-     * right (see reserve_title_width_before()'s own callers below), under
-     * that too. Left-aligned starting just past the back button, with a
-     * generous default width (narrowed later, per-screen, by
-     * reserve_title_width_before() once that screen's own right-side
-     * button actually exists) and auto-scroll for whatever still overflows
-     * -- same fix as gui_library_get_group_songs_screen()'s own title (build_group_songs_screen()). */
-    int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
-    lv_obj_set_width(title_label, scr_w - TITLE_LABEL_LEFT_INSET - TITLE_LABEL_DEFAULT_RIGHT_MARGIN);
-    /* Real-device bug report: same missing-2s-pause bug/fix as group_songs_
-     * screen's own title -- see build_group_songs_screen()'s comment. */
-    row_label_enable_marquee(title_label);
-    lv_obj_align(title_label, LV_ALIGN_TOP_LEFT, TITLE_LABEL_LEFT_INSET, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    lv_obj_t * title_label = build_screen_header(scr, default_title, generic_back_cb, NULL, NULL);
 
     lv_obj_t * list = lv_obj_create(scr);
     lv_obj_set_size(list, lv_pct(100),
@@ -476,8 +445,8 @@ lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** ou
     lv_obj_set_scroll_dir(list, LV_DIR_VER); /* see build_icon_grid_screen's comment in screen_builders.c */
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_gap(list, 4, 0);
-    lv_obj_set_style_pad_top(list, 4, 0);
+    lv_obj_set_style_pad_gap(list, GUI_ROW_GAP, 0);
+    lv_obj_set_style_pad_top(list, GUI_ROW_GAP, 0);
 
     *out_title_label = title_label;
     *out_list = list;
@@ -1247,7 +1216,7 @@ static lv_obj_t * build_subsonic_entry_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "Saved Servers", PILL_ACCESSORY_CHEVRON, false, subsonic_saved_servers_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "New Connection", PILL_ACCESSORY_CHEVRON, false, subsonic_new_connection_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, gui_theme_accent_style(), 6);
+    lv_obj_t * scr = build_pill_list_screen("Subsonic", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }

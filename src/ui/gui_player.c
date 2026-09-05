@@ -759,7 +759,7 @@ void poll_cover_decode(void) {
          * before this one. */
         free(current_reflection_bytes);
         current_reflection_bytes = NULL;
-        lv_obj_set_style_bg_image_src(player_overlay_panel, asset_path("playing_plane/buttom.png"), 0);
+        lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
         player_transition_mark_dirty(); /* cover_img just changed to the placeholder -- see the cache's own doc comment */
     } else {
         free(current_cover_bytes);
@@ -1326,8 +1326,8 @@ static void delete_song_confirm_cb(lv_event_t * e) {
     show_error_toast("Song deleted");
 }
 
-/* Defined much further down, alongside build_import_rescan_popup() (the
- * shared "are you sure?" 2-button popup shape's own doc comment) --
+/* Defined much further down, in gui_network.c (see its own doc comment
+ * there for the shared "are you sure?" 2-button popup shape this builds) --
  * forward-declared here since this and every other popup builder before
  * that point in the file needs it. */
 lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
@@ -1768,7 +1768,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     (void) screen_width;
     (void) screen_height;
     lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, lv_color_make(0, 0, 0), 0);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     /* Full-bleed album art (real per-track art is Task #16 -- this is the
      * firmware's own default cover placeholder, top-aligned) plus a
@@ -1793,7 +1793,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_t * overlay = player_overlay_panel; /* short local alias, rest of this function was written against this name */
     lv_obj_set_size(overlay, BOARD_SCREEN_WIDTH, BOARD_PLAYER_OVERLAY_HEIGHT);
     lv_obj_align(overlay, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_image_src(overlay, asset_path("playing_plane/buttom.png"), 0);
+    /* Native fallback surface; per-track artwork reflections remain unchanged. */
+    lv_obj_add_style(overlay, &style_theme_screen_bg, 0);
     lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(overlay, 0, 0);
     lv_obj_set_style_radius(overlay, 0, 0);
@@ -4023,12 +4024,31 @@ bool gui_player_queue_select(uint64_t revision, int index) {
     return true;
 }
 
-void gui_player_queue_clear_upcoming(void) {
+/* Clears the ENTIRE queue -- played history and upcoming alike -- leaving
+ * only the single track actively playing, at position 0. Not a full stop:
+ * there is no "go idle, nothing loaded" path anywhere in this player (every
+ * screen that starts playback always hands it a full playlist to build
+ * one), and clearing the queue was never a request to stop the track
+ * already sounding out of the speaker, only to empty everything around it
+ * -- the same convention other media players' own "Clear queue" actions
+ * follow for the same reason. queue_materialize_order() above already
+ * normalizes playlist[]/shuffle_order[] to plain identity order against
+ * playlist_index, so the only bookkeeping left here is collapsing both
+ * down to that one surviving element. */
+void gui_player_queue_clear_all(void) {
     if (audio_consume_track_advanced()) gui_player_handle_auto_advance();
     if (!gui_player_has_active_track() || !queue_materialize_order()) return;
-    for (int i = playlist_index + 1; i < playlist_count; i++) free(playlist[i]);
-    playlist_count = playlist_index + 1;
-    if (shuffle_order) shuffle_order_count = playlist_count;
+    for (int i = 0; i < playlist_count; i++) {
+        if (i != playlist_index) free(playlist[i]);
+    }
+    playlist[0] = playlist[playlist_index];
+    playlist_count = 1;
+    playlist_index = 0;
+    if (shuffle_order) {
+        shuffle_order[0] = 0;
+        shuffle_order_count = 1;
+        shuffle_pos = 0;
+    }
     queued_pending_count = 0; queue_next_insert_index = -1;
     remote_control_sync_queue(NULL, 0);
     arm_next_track_for_audio(playlist_index);

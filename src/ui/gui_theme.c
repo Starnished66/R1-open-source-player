@@ -7,11 +7,10 @@
 
 static lv_style_t style_accent;
 static lv_style_t style_accent_knob;
-static lv_style_t style_muted_text;
 
 lv_style_t * gui_theme_accent_style(void) { return &style_accent; }
 lv_style_t * gui_theme_accent_knob_style(void) { return &style_accent_knob; }
-lv_style_t * gui_theme_muted_text_style(void) { return &style_muted_text; }
+lv_style_t * gui_theme_muted_text_style(void) { return &style_theme_text_muted; }
 
 const uint32_t accent_palette[ACCENT_PALETTE_COUNT] = {
     0x2196F3, /* blue (default) */
@@ -52,6 +51,19 @@ const lv_font_t * gui_theme_font(gui_font_role_t role) {
 
 lv_color_t accent_lv_color(void) {
     return lv_color_hex(current_settings.accent_color);
+}
+
+void gui_theme_update_surface_contrast(void) {
+    lv_style_value_t text, row, card;
+    if (lv_style_get_prop(&style_theme_text_primary, LV_STYLE_TEXT_COLOR, &text) != LV_STYLE_RES_FOUND ||
+        lv_style_get_prop(&list_row_style, LV_STYLE_BG_COLOR, &row) != LV_STYLE_RES_FOUND ||
+        lv_style_get_prop(&style_theme_card_bg, LV_STYLE_BG_COLOR, &card) != LV_STYLE_RES_FOUND) return;
+    /* Contrast follows the plugin's own foreground, so a light palette
+     * darkens on press instead of flashing a hardcoded charcoal surface. */
+    lv_style_set_bg_color(&list_row_pressed_style, lv_color_mix(text.color, row.color, 32));
+    lv_style_set_border_color(&style_theme_card_bg, lv_color_mix(text.color, card.color, 24));
+    lv_obj_report_style_change(&list_row_pressed_style);
+    lv_obj_report_style_change(&style_theme_card_bg);
 }
 
 void apply_accent_color(uint32_t rgb) {
@@ -103,7 +115,6 @@ static void init_style_objects(void) {
     if (already_initialized) {
         lv_style_reset(&style_accent);
         lv_style_reset(&style_accent_knob);
-        lv_style_reset(&style_muted_text);
     }
     already_initialized = true;
 
@@ -124,15 +135,13 @@ static void init_style_objects(void) {
     lv_style_set_radius(&style_accent_knob, LV_RADIUS_CIRCLE);
     lv_style_set_pad_all(&style_accent_knob, SLIDER_KNOB_PAD);
 
-    lv_style_init(&style_muted_text);
-    lv_style_set_text_color(&style_muted_text, lv_color_make(220, 220, 220));
-
     screen_builders_init_list_row_style();
 }
 
 void gui_theme_init(void) {
     init_style_objects();
     fallback_font_init_early(current_settings.font_size_tier, current_settings.lyrics_font_size_tier);
+    screen_builders_refresh_font_geometry(NULL);
 }
 
 /* For gui_reload.c's in-process UI reload -- everything gui_theme_init()
@@ -151,6 +160,7 @@ void gui_theme_init(void) {
  * fallback_font.c's own s_fallback_loaded state from outside it. */
 void gui_theme_reload_styles(void) {
     init_style_objects();
+    screen_builders_refresh_font_geometry(NULL);
 }
 
 

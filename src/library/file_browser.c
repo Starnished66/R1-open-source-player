@@ -254,15 +254,13 @@ static lv_obj_t * add_file_row(const char * label_text, const char * icon_asset,
      * density used by Artists/Albums/All Songs; Settings stays at the
      * shared 84px default. */
     lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, MUSIC_LIST_ROW_HEIGHT); /* 15% wider than the shared default -- explicit user request */
-    lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-    lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
-    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_add_style(row, &pill_row_bg_style, 0);
+    lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t * label = lv_label_create(row);
     lv_label_set_text(label, label_text);
-    lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
 
     if (icon_asset) {
@@ -530,8 +528,8 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
      * which had the identical bug despite also using CENTER alignment. */
     lv_obj_set_style_pad_all(list, 0, 0);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(list, 4, 0);
-    lv_obj_set_style_pad_top(list, 4, 0);
+    lv_obj_set_style_pad_gap(list, GUI_ROW_GAP, 0);
+    lv_obj_set_style_pad_top(list, GUI_ROW_GAP, 0);
     /* Rows are LIST_ROW_WIDTH_WIDE (476px, this device's 480px-wide screen
      * minus a thin 4px margin) -- explicit cross-axis centering so that
      * width is guaranteed to sit centered within this full-width container. */

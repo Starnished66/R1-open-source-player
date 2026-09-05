@@ -151,17 +151,15 @@ void audio_output_set_usb_requested(bool requested, const char * alsa_device);
  * lazy, process-lifetime tinyalsa mixer handle on first use. */
 void audio_output_set_hw_volume_raw(int raw_left, int raw_right);
 
-/* R3 Pro II balanced-output routing. Reads balanced_headphone_is_connected()
- * (balanced_output_status.h) and, if a mixer control by that name exists,
- * sets/clears it to match -- a genuine no-op on R1 and on host, since
- * neither the switch_dev node nor the mixer control exist there. "Balance
- * Lineout En" is a real control name from the R3 Pro II's own sound-card
- * kernel module, not a placeholder guess, but its exact semantics (plain
- * boolean switch vs. something needing a different value) are unconfirmed
- * until read back from a live device. Safe to call from any thread/
- * frequency: the actual mixer write happens on the same dedicated worker
- * thread audio_output_set_hw_volume_raw() above already uses, not
- * synchronously on the caller's own thread. */
+/* R3 Pro II output-port routing. Picks a route (3.5mm headset vs. 4.4mm
+ * balanced, headphone_status.h deciding which)
+ * and writes it to the "Output Port Switch" mixer control -- a control
+ * name and value scheme ported from a separate, already-working player for
+ * this same hardware, not a guess. A genuine no-op on R1 and on host, since
+ * neither switch_dev node nor this mixer control exist there. Safe to call
+ * from any thread/frequency: the actual mixer write happens on the same
+ * dedicated worker thread audio_output_set_hw_volume_raw() above already
+ * uses, not synchronously on the caller's own thread. */
 void audio_output_sync_balanced_output(void);
 
 /* Coalesces hardware-volume writes on a dedicated process-lifetime worker,

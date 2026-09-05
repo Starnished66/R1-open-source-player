@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <execinfo.h>
 
 #include "gui.h"
 
@@ -36,6 +37,8 @@
 
 #define SCREEN_WIDTH BOARD_SCREEN_WIDTH
 #define SCREEN_HEIGHT BOARD_SCREEN_HEIGHT
+
+static volatile sig_atomic_t running = 1;
 
 /* Custom tick interface for LVGL timing (replaces older thread-based ticks) */
 static uint32_t custom_tick_get(void) {
@@ -218,6 +221,27 @@ void boot_checkpoint(const char * step) {
 }
 #endif
 
+// handler for signals that indicate crashes like SIGSEGV or SIGABRT
+void crash_handler(int sig) {
+    void *buffer[128];
+    int size;
+
+    size = backtrace(buffer, 128);
+
+    // Write directly to stderr (safe in signal handlers)
+    write(STDERR_FILENO, "Crashed! Backtrace:\n", 20);
+    backtrace_symbols_fd(buffer, size, STDERR_FILENO);
+    exit(1);
+}
+
+// handler for SIGINT
+static void sigint_handler(int sig) {
+	(void)sig;
+	running = 0;
+
+	// TODO: add more cleanup (like turning off the screen)
+}
+
 int main(int argc, char ** argv) {
     /* Ignore SIGPIPE process-wide: a Bluetooth disconnect during playback
      * kills the `aplay -D bluealsa` child audio_output.c writes into, and
@@ -225,6 +249,9 @@ int main(int argc, char ** argv) {
      * just returning EPIPE (which audio_output_write() already handles
      * correctly). Must run before anything else opens a subprocess pipe. */
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
+    signal(SIGINT, sigint_handler);  // interrupt handling (ctrl-c in terminal)
 
 #ifndef HOST_BUILD
     struct sigaction crash_sa;
@@ -333,7 +360,7 @@ int main(int argc, char ** argv) {
      * guessing event0/event1 for variants where that lookup doesn't match. */
     lv_indev_t * touch = NULL;
     char touch_path[64];
-    if (find_input_device_by_name("hyn_ts", touch_path, sizeof(touch_path))) {
+    if (find_input_device_by_name("hyn_ts", touch_path, sizeof(touch_path)) || find_input_device_by_name("goodix-ts", touch_path, sizeof(touch_path))) {
         printf("Detected touch controller at %s\n", touch_path);
         touch = lv_evdev_create(LV_INDEV_TYPE_POINTER, touch_path);
     }
@@ -407,7 +434,7 @@ int main(int argc, char ** argv) {
     unsigned perf_handler_calls = 0;
     unsigned perf_handler_over_16ms = 0;
 #endif
-    while(1) {
+    while(running) {
         uint32_t real_tick = custom_tick_get();
         lv_tick_inc(real_tick - last_real_tick);
         last_real_tick = real_tick;

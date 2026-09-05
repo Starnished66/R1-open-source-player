@@ -772,7 +772,7 @@ void refresh_volume_topbar(int32_t percent) {
  * battery.c's sysfs read, this is a single cheap fopen/fgets with no
  * subprocess fork, so it doesn't need wifi/bt's throttled polling. */
 void refresh_headphone_icon(void) {
-    bool connected = headphone_is_connected();
+    bool connected = get_headphone_state() != HEADPHONE_STATE_NONE;
     bool was_hidden = lv_obj_has_flag(volume_topbar_headphone, LV_OBJ_FLAG_HIDDEN);
     if (connected) {
         lv_obj_remove_flag(volume_topbar_headphone, LV_OBJ_FLAG_HIDDEN);
@@ -1445,8 +1445,8 @@ static void build_home_indicator_bar(void) {
  * headphone jack (refresh_headphone_icon() above), not a mode the user
  * switches into (unlike Storage/USB DAC/ADB in the manual USB Mode
  * screen). usb_audio_output_is_connected() is a plain /proc file read (no
- * subprocess), same cheap class of check as headphone_is_connected()'s own
- * direct sysfs read, so this is safe to call directly on the UI thread at
+ * subprocess), same cheap class of check as get_headphone_state()'s own
+ * direct sysfs reads, so this is safe to call directly on the UI thread at
  * the same low cadence as the wifi/Bluetooth polls (see their own
  * WIFI_POLL_TICKS call site) rather than needing its own background
  * thread. Toast fires only on the actual connect transition (was_connected

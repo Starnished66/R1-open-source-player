@@ -66,8 +66,10 @@ static bool looks_like_build_stamp(const unsigned char * p) {
  * Returns false (not true-with-empty-string) if
  * the file has no such string at all, e.g. it isn't a build of this app --
  * callers must treat that as "unknown version", never as "oldest possible
- * version". */
-static bool extract_build_stamp(const char * path, char * out, size_t out_size) {
+ * version". Exposed to main.c (as scanner_read_build_stamp(), scanner.h) so
+ * it can re-derive the displayed stamp after installer_run() may have
+ * changed which file "the internal player" actually is. */
+bool scanner_read_build_stamp(const char * path, char * out, size_t out_size) {
     if (out_size <= BUILD_STAMP_LEN) return false;
     FILE * f = fopen(path, "rb");
     if (!f) return false;
@@ -128,32 +130,19 @@ void scanner_drop_sd_update_cache(void) {
     int fd = open(SD_UPDATE_PLAYER_PATH, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
 
-    /* extract_build_stamp() reads this executable in full. That is useful
-     * cache when it is about to boot, but pure memory pressure when Stock
-     * was selected instead. On this 56 MiB device it can split the HGL DMA
-     * reservation as Stock reacquires it during exec. Drop only this extra
-     * SD cache and only on that handoff; all normal Open Player paths retain
-     * their useful warm executable pages. Best-effort for filesystems which
-     * do not implement POSIX_FADV_DONTNEED. */
+    /* installer_run() reads this executable in full (for its checksum, and
+     * again when actually copying it). That is useful cache when it is
+     * about to boot, but pure memory pressure when Stock was selected
+     * instead. On this 56 MiB device it can split the HGL DMA reservation as
+     * Stock reacquires it during exec. Drop only this extra SD cache and
+     * only on that handoff; all normal Open Player paths retain their
+     * useful warm executable pages. Best-effort for filesystems which do not
+     * implement POSIX_FADV_DONTNEED. */
     int rc = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
     if (rc != 0) {
         fprintf(stderr, "scanner: failed to drop SD update page cache: %s\n", strerror(rc));
     }
     close(fd);
-}
-
-/* >0 if sd_path's BUILD_STAMP is lexically greater ("newer") than
- * internal_path's, <0 if lexically less ("older"), 0 if they match exactly
- * or either side's stamp couldn't be found -- "YYYY-MM-DD_HH:MM" sorts
- * correctly as plain text, no date parsing needed. A missing/unreadable
- * stamp on either side folds into 0 ("not comparable"), never guessed as
- * either direction -- an SD binary that isn't even a build of this app (no
- * BUILD_STAMP at all) must never be treated as newer OR older just because
- * it happens to be named open_hiby_player. */
-static int compare_build_stamps(const char * internal_stamp, const char * sd_stamp) {
-    if (!internal_stamp[0] || !sd_stamp[0]) return 0;
-    int cmp = strcmp(sd_stamp, internal_stamp);
-    return cmp > 0 ? 1 : (cmp < 0 ? -1 : 0);
 }
 
 /* Round-tripped by scanner_save_last_boot() so persisting a new default
@@ -173,8 +162,7 @@ static void load_preferences(int * out_default_entry, int * out_timeout_seconds)
     while (fgets(line, sizeof(line), f)) {
         int value;
         if (sscanf(line, "default_entry=%d", &value) == 1) {
-            if (value == BOOT_ENTRY_INTERNAL || value == BOOT_ENTRY_SD_STOCK || value == BOOT_ENTRY_SD_UPDATE)
-                *out_default_entry = value;
+            if (value == BOOT_ENTRY_INTERNAL || value == BOOT_ENTRY_SD_STOCK) *out_default_entry = value;
         } else if (sscanf(line, "timeout_seconds=%d", &value) == 1) {
             if (value >= MIN_TIMEOUT_SECONDS && value <= MAX_TIMEOUT_SECONDS) *out_timeout_seconds = value;
         }
@@ -190,32 +178,18 @@ void scanner_scan(scan_result_t * out) {
     out->sd_stock_present = path_is_executable(SD_STOCK_PLAYER_PATH);
     out->sd_update_present = path_is_executable(SD_UPDATE_PLAYER_PATH);
 
-    extract_build_stamp(INTERNAL_PLAYER_PATH, out->internal_build_stamp,
-                        sizeof(out->internal_build_stamp));
-    if (out->sd_update_present) {
-        extract_build_stamp(SD_UPDATE_PLAYER_PATH, out->sd_update_build_stamp,
-                            sizeof(out->sd_update_build_stamp));
-    }
-
-    int sd_build_cmp = 0;
-    if (out->sd_update_present) {
-        out->sd_update_build_comparable = out->internal_build_stamp[0] &&
-                                          out->sd_update_build_stamp[0];
-        sd_build_cmp = compare_build_stamps(out->internal_build_stamp,
-                                            out->sd_update_build_stamp);
-        out->sd_update_is_newer = sd_build_cmp > 0;
-        out->sd_update_is_older = sd_build_cmp < 0;
-    }
+    scanner_read_build_stamp(INTERNAL_PLAYER_PATH, out->internal_build_stamp,
+                             sizeof(out->internal_build_stamp));
 
     load_preferences(&out->default_entry, &out->timeout_seconds);
     loaded_timeout_seconds = out->timeout_seconds;
-    /* The unattended/default choice is the newest comparable Open Player;
-     * Internal wins an exact tie. A non-comparable SD build remains an
-     * explicit signal to use that copy, preserving established behavior.
-     * Stock is selectable whenever present, but never automatic. */
-    out->default_entry = out->sd_update_present &&
-                         (sd_build_cmp > 0 || !out->sd_update_build_comparable)
-                       ? BOOT_ENTRY_SD_UPDATE : BOOT_ENTRY_INTERNAL;
+    /* Stock is never the automatic selection -- see scan_result_t's own doc
+     * comment on default_entry. There is no longer a competing "newer SD
+     * build" auto-selection either: an SD update binary is never a boot
+     * destination in its own right (installer.c), so the only two possible
+     * destinations here are Internal and Stock, and Internal always wins
+     * the unattended default. */
+    out->default_entry = BOOT_ENTRY_INTERNAL;
 }
 
 void scanner_save_last_boot(int entry) {

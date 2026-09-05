@@ -1842,7 +1842,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * rescan() call site already assumes the app has finished booting into
      * its normal event-loop phase; this defers to that exact same phase
      * instead of being the first caller to violate that assumption. */
-    if (metadata_db_had_no_saved_database()) fresh_database_schedule_deferred_rescan();
+    if (metadata_db_had_no_saved_database() && gui_library_auto_rescan_enabled()) fresh_database_schedule_deferred_rescan();
     /* No whole-library load anywhere in this boot path, on purpose --
      * remote_control.c queries metadata_db.c directly (its own METADATA_DB_
      * GUARD) rather than needing a synced copy of the library, and each of

@@ -135,7 +135,7 @@ static void test_diag_log(const char * area, const char * fmt, ...) {
 #define EXTERNAL_COVER_MAX_BYTES (4U * 1024U * 1024U)
 
 static lv_obj_t * album_thumbnail_active_list = NULL;
-static int album_thumbnail_generation = 0;
+static atomic_int album_thumbnail_generation = 0;
 static lv_obj_t * playlists_edit_btn = NULL;
 static bool playlists_edit_mode = false;
 static bool group_songs_source_is_album = false;
@@ -1449,6 +1449,7 @@ static bool album_thumbnail_load_or_decode(const song_row_t * song, int generati
 }
 
 static void * album_thumbnail_thread_func(void * arg) {
+    install_thread_crash_altstack(); /* see its own comment (main.c) */
 #ifdef UI_PERF_TRACE
     uint64_t perf_start_us = ui_perf_now_us();
 #endif
@@ -1496,6 +1497,7 @@ static void * album_thumbnail_thread_func(void * arg) {
 #define ALBUM_THUMB_GEN_INTER_BATCH_US 1000000 /* 1.0 s pause between batches */
 
 static void * album_thumb_gen_thread_func(void * arg) {
+    install_thread_crash_altstack(); /* see its own comment (main.c) */
     int my_generation = (int) (intptr_t) arg;
 #ifdef TEST_BUILD_TAG
     uint64_t started_ms = test_diag_now_ms();
@@ -1632,6 +1634,21 @@ done:
  * it's been superseded and exit, which happens within roughly one album's
  * worth of decode work given the cancellation check at the top of every
  * iteration. */
+/* Real-device bug report: a real SIGBUS (root-caused, see start_library_
+ * rescan()'s own LIBRARY_RESCAN_THREAD_STACK_SIZE comment, to library_
+ * rescan_thread's undersized default pthread stack) was reproduced again by
+ * removing the SD card right as an "Update Music Database" pass finished --
+ * exactly when this function's own thread starts (see this function's own
+ * doc comment: called right after that scan's thread is joined). Both
+ * pthread_create() calls below still used a bare NULL attr despite doing
+ * the single heaviest per-item work in this app: a full JPEG/PNG cover
+ * decode (see start_next_album_thumbnail()'s own "never run two full cover
+ * decoders at once... doubling peak JPEG/PNG memory" comment) -- at least
+ * as stack-hungry as library_rescan_thread's own format parsers, arguably
+ * more given image decoders' own internal buffer/table usage, yet neither
+ * had that thread's fix applied. Same pattern, same fix. */
+#define ALBUM_COVER_DECODE_THREAD_STACK_SIZE (4 * 1024 * 1024)
+
 static void start_album_thumbnail_generation(void) {
     cancel_album_thumbnail_generation();
     reap_album_thumbnail_generation();
@@ -1646,8 +1663,16 @@ static void start_album_thumbnail_generation(void) {
     atomic_store(&album_thumb_gen_active, true);
     TEST_DIAG("ART_CACHE", "start generation=%d albums=%d warm_limit=%d rss_kb=%ld",
               generation, album_count, ALBUM_THUMB_GEN_WARM_LIMIT, test_diag_rss_kb());
-    if (pthread_create(&album_thumb_gen_thread, NULL, album_thumb_gen_thread_func,
-                        (void *) (intptr_t) generation) != 0) {
+
+    pthread_attr_t attr;
+    pthread_attr_t * attr_ptr = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        if (pthread_attr_setstacksize(&attr, ALBUM_COVER_DECODE_THREAD_STACK_SIZE) == 0) attr_ptr = &attr;
+    }
+    bool created = pthread_create(&album_thumb_gen_thread, attr_ptr, album_thumb_gen_thread_func,
+                                   (void *) (intptr_t) generation) == 0;
+    if (attr_ptr) pthread_attr_destroy(&attr);
+    if (!created) {
         atomic_store(&album_thumb_gen_active, false);
         TEST_DIAG("ART_CACHE", "thread_create_failed generation=%d", generation);
     } else {
@@ -1678,7 +1703,16 @@ static void start_next_album_thumbnail(void) {
 #ifdef TEST_BUILD_TAG
     album_lazy_job_started_ms = test_diag_now_ms();
 #endif
-    if (pthread_create(&album_thumbnail_thread, NULL, album_thumbnail_thread_func, req) != 0) {
+    /* See start_album_thumbnail_generation()'s own ALBUM_COVER_DECODE_THREAD_
+     * STACK_SIZE comment -- same full JPEG/PNG cover decode, same fix. */
+    pthread_attr_t attr;
+    pthread_attr_t * attr_ptr = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        if (pthread_attr_setstacksize(&attr, ALBUM_COVER_DECODE_THREAD_STACK_SIZE) == 0) attr_ptr = &attr;
+    }
+    bool created = pthread_create(&album_thumbnail_thread, attr_ptr, album_thumbnail_thread_func, req) == 0;
+    if (attr_ptr) pthread_attr_destroy(&attr);
+    if (!created) {
         album_thumbnail_active = false;
         free(req);
         return;
@@ -3347,8 +3381,18 @@ static pthread_t library_rescan_thread;
 bool library_rescan_active = false;
 static atomic_bool library_rescan_done_flag = false;
 
+/* See scan_one_song_into_db()'s own comment on why this exists. Non-static
+ * so crash_diag_handler() (main.c) can read it directly from a signal
+ * handler -- no getter/mutex, a diagnostic breadcrumb doesn't need either,
+ * and calling a function from a signal handler than just returns a global
+ * would be no safer than reading the global itself. */
+char g_scan_last_path[PATH_MAX] = "";
+/* Published to the UI by library_rescan_done_flag's release/acquire pair. */
+static bool library_rescan_succeeded;
+
 static void * library_rescan_thread_func(void * arg) {
     (void) arg;
+    install_thread_crash_altstack(); /* see its own comment (main.c) */
 #ifdef __linux__
     struct sched_param sp = { 0 };
     sched_setscheduler(0, SCHED_BATCH, &sp);
@@ -3367,6 +3411,39 @@ static void * library_rescan_thread_func(void * arg) {
     atomic_store_explicit(&library_rescan_done_flag, true, memory_order_release); /* written last -- update_timer_cb only checks this flag */
     return NULL;
 }
+
+/* See this function's own doc comment in gui_library.h. Was false while the
+ * real-device SIGBUS below was under investigation; re-enabled now that
+ * root cause (library_rescan_thread's undersized default pthread stack --
+ * see LIBRARY_RESCAN_THREAD_STACK_SIZE's own comment just above start_
+ * library_rescan()) is fixed. Does not affect the manual Settings > Update
+ * Music Database row or plugin.refresh_library(), neither of which check
+ * this. */
+#define GUI_LIBRARY_AUTO_RESCAN_ENABLED true
+bool gui_library_auto_rescan_enabled(void) {
+    return GUI_LIBRARY_AUTO_RESCAN_ENABLED;
+}
+
+/* Real-device bug report: a real SIGBUS traced (via a "last file scanned"
+ * breadcrumb, see scan_one_song_into_db()'s own comment) to THREE different,
+ * unrelated crash sites across separate reproductions -- LVGL draw code, a
+ * metadata parser, and tagcache.c's own write_all()/tagcache_end_update()
+ * commit path -- each time landing exactly at a callee's own entry point on
+ * this exact thread. That shape (same thread, different function each time,
+ * always right at a call boundary) is the signature of a stack overflow, not
+ * a bug local to any one of those three functions: it manifests wherever the
+ * stack happens to peak that particular run, not at a fixed line. This
+ * thread's own call chain is easily the deepest and most stack-hungry in the
+ * app -- scan_one_song_into_db() -> metadata_read_isolated() -> whichever of
+ * a dozen format-specific parsers -> (eventually, once every file is done)
+ * metadata_db_end_update() -> tagcache_end_update() -> rebuild_indexes()/
+ * write_all() -- yet was the one thread in this file still created with a
+ * bare NULL attr, using whichever default musl gives it. Its own sibling,
+ * scan_walk_worker() above (SCAN_WALK_THREAD_STACK_SIZE), already reserves 1
+ * MiB for doing far less: a plain directory walk with no format parsers or
+ * tagcache commit in its own call chain at all. Matching that pattern here,
+ * with headroom above it for the deeper chain, is the fix. */
+#define LIBRARY_RESCAN_THREAD_STACK_SIZE (4 * 1024 * 1024)
 
 void start_library_rescan(void) {
     /* Real-device incident: several call sites below don't already guard on
@@ -3387,7 +3464,15 @@ void start_library_rescan(void) {
     library_rescan_active = true;
     library_rescan_token = gui_busy_show("Updating\nmusic database...", "");
     gui_busy_set_progress(library_rescan_token, 0);
-        if (pthread_create(&library_rescan_thread, NULL, library_rescan_thread_func, NULL) != 0) {
+
+    pthread_attr_t attr;
+    pthread_attr_t * attr_ptr = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        if (pthread_attr_setstacksize(&attr, LIBRARY_RESCAN_THREAD_STACK_SIZE) == 0) attr_ptr = &attr;
+    }
+    bool created = pthread_create(&library_rescan_thread, attr_ptr, library_rescan_thread_func, NULL) == 0;
+    if (attr_ptr) pthread_attr_destroy(&attr);
+    if (!created) {
         library_rescan_active = false;
         gui_busy_hide(library_rescan_token);
         show_error_toast("Thread launch failed");
@@ -3509,7 +3594,7 @@ static void reload_library_on_sd_reinsert(void) {
         show_info_toast("Library loaded");
         start_album_thumbnail_generation();
     }
-    start_library_rescan();
+    if (gui_library_auto_rescan_enabled()) start_library_rescan();
 }
 
 /* How long the "Library updated" success message stays up once a rescan
@@ -3567,6 +3652,12 @@ void poll_library_rescan(void) {
      * second user-visible phase after "Updating music database..." -- no
      * progress screen, no toast. The worker yields and cancels when Albums
      * opens so visible-row decode stays first. */
+    if (!library_rescan_succeeded) {
+        gui_busy_hide(library_rescan_token);
+        nav_reset_to_home();
+        show_error_toast("Library update failed");
+        return;
+    }
     start_album_thumbnail_generation();
     gui_busy_hide(library_rescan_token); show_info_toast("Library updated");
     library_rescan_success_pending = true;
@@ -5157,6 +5248,20 @@ static void scan_one_song_into_db(const char * path) {
     cached_tags_t cached;
     if (have_stat && metadata_db_get(path, mtime, size, &cached)) return;
 
+    /* Real-device bug report: a real SIGBUS crash was traced into
+     * metadata_read_isolated()'s in-process path (only .mp3/.aac skip the
+     * fork-isolation isolated_needs_child() otherwise gives every other
+     * format -- see that function's own comment), but with no way to know
+     * WHICH file was being parsed at the moment it crashed, out of however
+     * many are on the card. This breadcrumb (best-effort, no locking -- a
+     * diagnostic string, not something correctness depends on) records the
+     * path right before the call most likely to crash, so crash_diag_
+     * handler() (main.c) can include it in the exact same reload_diag.log
+     * every other crash diagnostic in this app already writes to -- turning
+     * "some file crashed the scanner" into "this specific file did" the
+     * next time it happens. */
+    snprintf(g_scan_last_path, sizeof(g_scan_last_path), "%s", path);
+
     track_metadata_t meta;
     if (!metadata_read_isolated(path, &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS)) return;
 
@@ -5245,6 +5350,7 @@ static void rescan_playlists(void) {
 
 
 void library_scan_once(void) {
+    library_rescan_succeeded = false;
 #ifdef TEST_BUILD_TAG
     uint64_t scan_started_ms = test_diag_now_ms();
     uint64_t phase_started_ms = scan_started_ms;
@@ -5344,6 +5450,7 @@ void library_scan_once(void) {
     }
 
     bool committed = metadata_db_end_update();
+    library_rescan_succeeded = committed;
     if (!committed)
         fprintf(stderr, "Warning: music database commit failed -- keeping last on-disk library\n");
     TEST_DIAG("DB", "commit_end ok=%d files=%d elapsed_ms=%llu songs=%lld rss_kb=%ld", committed,

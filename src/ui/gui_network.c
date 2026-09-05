@@ -1973,7 +1973,8 @@ void poll_usb_storage_hotplug(void) {
          * bandwidth and CPU a foreground, blocking scan sidesteps by making
          * that wait explicit instead. */
         usb_mode_t live_mode;
-        if (usb_mode_control_detect_current(&live_mode) && live_mode == USB_MODE_STORAGE) {
+        if (gui_library_auto_rescan_enabled() && usb_mode_control_detect_current(&live_mode) &&
+            live_mode == USB_MODE_STORAGE) {
             start_library_rescan();
         }
     }
@@ -2550,7 +2551,7 @@ void poll_import_web_stop(void) {
      * does right after closing Web Import, at the cost of making the user
      * wait through it explicitly if a genuinely large download means a lot
      * changed. */
-    start_library_rescan();
+    if (gui_library_auto_rescan_enabled()) start_library_rescan();
 }
 
 /* Shared by import_wifi_back_cb() (user-initiated exit) and import_wifi_

@@ -7,6 +7,7 @@
  * player's intentional power-off request -- see run_player_supervised(). */
 
 #include "scanner.h"
+#include "installer.h"
 #include "fb_draw.h"
 #include "input.h"
 
@@ -82,7 +83,9 @@ static void release_stock_hgl_dma(void) {
  * FB_HEIGHT. */
 #define CARDS_BOTTOM (FB_HEIGHT - 120)
 #define CARD_GAP 24
-#define MAX_CARDS 3 /* Internal + SD stock + SD update -- see scanner.h's own BOOT_ENTRY_* */
+#define MAX_CARDS 2 /* Internal + SD stock -- see scanner.h's own BOOT_ENTRY_*. An SD update
+                     * binary is never a menu entry in its own right -- installer_run() has
+                     * already resolved it (or left it for a later boot) before this is built. */
 #define TITLE_Y 36
 #define COUNTDOWN_Y 68
 #define PROGRESS_BAR_Y 92
@@ -196,24 +199,18 @@ static long elapsed_ms_since(const struct timespec * start) {
 }
 
 /* Builds however many cards actually apply -- Internal is always present;
- * SD stock/update are each independently optional (see scanner.h's own
- * sd_stock_present/sd_update_present) and BOTH can be present on the same
- * card at once. "OPEN PLAYER" is deliberately reused as SD update's own
- * title too (same app, just a different copy) -- the "SD CARD" subtitle
- * is what actually distinguishes it from Internal's own card, the same
- * way "STOCK PLAYER" is distinguished from it by title alone. */
+ * SD stock is independently optional (scanner.h's own sd_stock_present).
+ * Internal's own line3 shows whichever build is actually about to run --
+ * INSTALLED_PLAYER_PATH's stamp when installer_run() has ever completed,
+ * INTERNAL_PLAYER_PATH's own otherwise (main() overwrites scan->
+ * internal_build_stamp accordingly before calling this -- see its own
+ * comment there). */
 static int build_cards(const scan_result_t * scan, card_layout_t * cards) {
     int count = 0;
     cards[count] = (card_layout_t) { .line1 = "OPEN PLAYER", .boot_entry = BOOT_ENTRY_INTERNAL };
     snprintf(cards[count].line2, sizeof(cards[count].line2), "INTERNAL");
     snprintf(cards[count].line3, sizeof(cards[count].line3), "%s", scan->internal_build_stamp);
     count++;
-    if (scan->sd_update_present) {
-        cards[count] = (card_layout_t) { .line1 = "OPEN PLAYER", .boot_entry = BOOT_ENTRY_SD_UPDATE };
-        snprintf(cards[count].line2, sizeof(cards[count].line2), "SD CARD");
-        snprintf(cards[count].line3, sizeof(cards[count].line3), "%s", scan->sd_update_build_stamp);
-        count++;
-    }
     if (scan->sd_stock_present) {
         cards[count] = (card_layout_t) { .line1 = "STOCK PLAYER", .boot_entry = BOOT_ENTRY_SD_STOCK };
         snprintf(cards[count].line2, sizeof(cards[count].line2), "SD CARD");
@@ -305,12 +302,11 @@ static int run_menu(const scan_result_t * scan) {
 
         if (ev.type == BL_INPUT_MOVE_UP || ev.type == BL_INPUT_MOVE_DOWN) {
             /* Cycles through however many cards are actually present, by
-             * ARRAY POSITION, not by BOOT_ENTRY_* value -- those two no
-             * longer coincide now that either SD alternate can be absent
-             * independently (e.g. with only SD update present, the array
-             * is [Internal, SdUpdate], positions 0 and 1, while
-             * BOOT_ENTRY_SD_UPDATE is 2). Find the current card's index,
-             * step it, wrap around. */
+             * ARRAY POSITION, not by BOOT_ENTRY_* value -- kept
+             * position-based rather than assuming the two always coincide,
+             * since build_cards() still only adds a card when its own
+             * presence flag is set. Find the current card's index, step
+             * it, wrap around. */
             int idx = 0;
             for (int i = 0; i < card_count; i++) {
                 if (cards[i].boot_entry == selected) { idx = i; break; }
@@ -483,57 +479,70 @@ int main(void) {
     scan_result_t scan;
     scanner_scan(&scan);
 
+    /* Never a boot destination in its own right -- see installer.c's own
+     * top comment for why running straight off the SD card is unsafe.
+     * Presence alone (scan.sd_update_present) is enough to trigger this;
+     * it either finishes durably (SD copy deleted, INSTALLED_PLAYER_PATH
+     * now current) or leaves everything exactly as it was for another
+     * attempt next boot. Captured (not re-scanned) BEFORE this call, for
+     * the SD-update page-cache drop further down -- that check cares
+     * whether this boot did any reading of the SD copy at all, which this
+     * pre-install snapshot correctly reflects either way. */
+    bool sd_update_was_present = scan.sd_update_present;
+    installer_run(&scan, fb_ready);
+
+    const char * internal_path = installer_internal_player_path();
+    if (strcmp(internal_path, INTERNAL_PLAYER_PATH) != 0) {
+        /* installer_internal_player_path() resolved to the installed
+         * copy, not squashfs -- scan.internal_build_stamp was populated
+         * from INTERNAL_PLAYER_PATH by scanner_scan() above and no longer
+         * describes what is actually about to run; re-derive it from the
+         * real boot target so the Internal card's label stays accurate. */
+        char stamp[BOOT_BUILD_STAMP_LEN + 1];
+        if (scanner_read_build_stamp(internal_path, stamp, sizeof(stamp))) {
+            memcpy(scan.internal_build_stamp, stamp, sizeof(stamp));
+        } else {
+            scan.internal_build_stamp[0] = '\0';
+        }
+    }
+
     const char * boot_path;
 
-    if (!scan.sd_stock_present && scan.sd_update_is_newer) {
-        /* Auto-adopt path -- see scanner.h's own doc comment. This is safe
-         * to skip the menu only when Stock is absent: hiby_player is a
-         * genuinely different boot choice and must always make the chooser
-         * visible. Not a dual-boot preference decision -- never touches the
-         * persisted default below. */
-        boot_path = SD_UPDATE_PLAYER_PATH;
-    } else if (!scan.sd_stock_present &&
-               (!scan.sd_update_present || scan.sd_update_is_older ||
-                (scan.sd_update_build_comparable && !scan.sd_update_is_newer))) {
-        /* No SD Open Player, or its comparable build is older than or equal
-         * to the internal one. Also not a preference decision: if
-         * the SD card is only temporarily missing, this must not clobber
-         * a previously-remembered non-Internal default just because
-         * neither alternate was reachable this one boot. */
-        boot_path = INTERNAL_PLAYER_PATH;
-    } else if (scan.sd_update_present && !scan.sd_stock_present) {
-        /* A non-comparable SD build retains the established SD-drop
-         * priority. There is no Stock player, so do not show a menu. */
-        boot_path = SD_UPDATE_PLAYER_PATH;
+    if (!scan.sd_stock_present) {
+        /* No Stock alternate to choose between -- just boot the current
+         * internal copy (freshly installed this boot, previously
+         * installed, or squashfs on a device that has never received an
+         * SD update) with no menu delay, matching the original
+         * "instant boot" behavior for this case. Not a preference decision
+         * -- never touches the persisted default below. */
+        boot_path = internal_path;
     } else {
         int chosen_entry;
         if (!fb_ready) {
             /* Can't draw a menu at all -- still boot something rather than
-             * sitting on a dead screen forever. Falls back to the computed
-             * newest-Open-Player default without showing a menu. */
+             * sitting on a dead screen forever. Falls back to the
+             * persisted/computed default without showing a menu. */
             fprintf(stderr, "open_hiby_bootloader: fb not available, booting default entry with no menu\n");
             chosen_entry = scan.default_entry;
         } else {
             chosen_entry = run_menu(&scan);
             input_close();
         }
-        switch (chosen_entry) {
-            case BOOT_ENTRY_SD_STOCK: boot_path = SD_STOCK_PLAYER_PATH; break;
-            case BOOT_ENTRY_SD_UPDATE: boot_path = SD_UPDATE_PLAYER_PATH; break;
-            default: boot_path = INTERNAL_PLAYER_PATH; break;
-        }
+        boot_path = (chosen_entry == BOOT_ENTRY_SD_STOCK) ? SD_STOCK_PLAYER_PATH : internal_path;
         /* Only persisted here -- this is the one branch where chosen_entry
          * reflects an actual (live or re-affirmed) dual-boot preference,
          * not a forced/automatic outcome. */
         scanner_save_last_boot(chosen_entry);
     }
 
-    /* The build-stamp comparison reads the SD Open Player in full. If Stock
-     * won the menu, those cached pages are unused and recreate the exact
-     * memory-pressure difference from the failing both-binaries case. Drop
-     * them before releasing the framebuffer and handing the reserved HGL
-     * DMA block across exec. No-op when there was no SD update to scan. */
-    if (strcmp(boot_path, SD_STOCK_PLAYER_PATH) == 0 && scan.sd_update_present) {
+    /* installer_run() reads the SD Open Player in full (checksum, and
+     * again if it actually copies it) whenever sd_update_was_present. If
+     * Stock won the menu, those cached pages are unused and recreate the
+     * exact memory-pressure difference from the failing both-binaries case.
+     * Drop them before releasing the framebuffer and handing the reserved
+     * HGL DMA block across exec. No-op when there was no SD update to
+     * begin with. */
+    if (strcmp(boot_path, SD_STOCK_PLAYER_PATH) == 0 && sd_update_was_present) {
         scanner_drop_sd_update_cache();
     }
     if (fb_ready) fb_close();

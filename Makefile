@@ -733,7 +733,8 @@ else
 BOOTLOADER_BIN = open_hiby_bootloader_$(BOARD)
 endif
 BOOTLOADER_SRCS = src/bootloader/main.c src/bootloader/fb_draw.c src/bootloader/input.c \
-                  src/bootloader/scanner.c src/bootloader/sd_ready.c src/bootloader/sd_ready_real.c \
+                  src/bootloader/scanner.c src/bootloader/installer.c src/bootloader/sd_ready.c \
+                  src/bootloader/sd_ready_real.c \
                   src/hardware/input_device_utils.c src/core/subprocess.c \
                   lvgl/src/libs/tjpgd/tjpgd.c
 # -ffunction-sections/-fdata-sections + -Wl,--gc-sections: standard, safe

@@ -37,7 +37,7 @@ static void build_error_toast(void) {
     lv_obj_align(error_toast, LV_ALIGN_CENTER, 0, -180);
     lv_obj_set_style_radius(error_toast, 16, 0);
     lv_obj_set_style_bg_color(error_toast, lv_color_make(40, 20, 20), 0);
-    lv_obj_set_style_bg_opa(error_toast, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(error_toast, LV_OPA_80, 0);
     lv_obj_set_style_border_width(error_toast, 0, 0);
     lv_obj_remove_flag(error_toast, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
@@ -77,7 +77,7 @@ static void build_info_toast(void) {
     lv_obj_align(info_toast, LV_ALIGN_CENTER, 0, -160);
     lv_obj_set_style_radius(info_toast, 16, 0);
     lv_obj_add_style(info_toast, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(info_toast, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(info_toast, LV_OPA_80, 0);
     lv_obj_set_style_border_width(info_toast, 0, 0);
     lv_obj_remove_flag(info_toast, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(info_toast, LV_OBJ_FLAG_HIDDEN);

@@ -351,6 +351,31 @@ static lv_obj_t * build_back_button(lv_obj_t * scr, lv_event_cb_t back_btn_cb) {
     return btn;
 }
 
+lv_obj_t * build_top_right_icon_button(lv_obj_t * scr, const char * icon_asset, lv_event_cb_t click_cb) {
+    /* Exact mirror of build_back_button() above (same 64x64 hitbox, same
+     * STATUS_BAR_CLEARANCE y) so this icon lines up with the back arrow at
+     * the same visual level -- just anchored to the right edge instead of
+     * the left, and with a caller-supplied icon/callback instead of the
+     * hardcoded back arrow. No BACK_ARROW_OPTICAL_Y_OFFSET-style nudge here:
+     * that correction is specific to the arrow glyph's own asymmetric
+     * visual weight, not a general icon-centering fix -- a plain centered
+     * icon (gear, etc.) doesn't need it. */
+    lv_obj_t * btn = lv_obj_create(scr);
+    lv_obj_set_size(btn, 64, 64);
+    lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_style_bg_opa(btn, 0, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t * icon = lv_image_create(btn);
+    lv_image_set_src(icon, icon_asset);
+    lv_obj_align(icon, LV_ALIGN_CENTER, 0, 0);
+
+    if (click_cb) lv_obj_add_event_cb(btn, click_cb, LV_EVENT_CLICKED, NULL);
+    return btn;
+}
+
 /* 76 (64px back button + 12px breathing room) / 20 -- same values as
  * gui.c's own TITLE_LABEL_LEFT_INSET/TITLE_LABEL_DEFAULT_RIGHT_MARGIN
  * (private to that file, so duplicated here rather than shared through the
@@ -685,50 +710,14 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
         if (item->on_click) lv_obj_add_event_cb(tile, item->on_click, LV_EVENT_CLICKED, item->user_data);
     }
 
-    /* Divider lines between cells, drawn from the stock firmware's own
-     * launcher/hor_line.png and launcher/ver_line.png sprites (thin, flat
-     * near-black bars, confirmed via a real stock-player screenshot to be
-     * exactly what separates its launcher grid cells) instead of hand-drawn
-     * LVGL borders. Drawn once at the grid level rather than per-tile,
-     * since one continuous line crosses every column/row boundary --
-     * ver_line.png's own native height (749px) matches a full 3-row
-     * reference grid, and bg_image_tiled means a shorter grid (fewer rows)
-     * still tiles the source's flat color cleanly rather than clipping or
-     * stretching it. LV_OBJ_FLAG_IGNORE_LAYOUT keeps the grid's own GRID
-     * layout from trying to auto-place these into an unassigned cell, since
-     * they're not registered via lv_obj_set_grid_cell(). Same bg_opa-vs-
-     * bg_image_opa split used for the volume popup: bg_opa stays
-     * transparent so no rect fill draws, while bg_image_opa defaults to
-     * COVER independently, so only the line sprite itself shows.
-     *
-     * Skipped entirely when tile_gap > 0: a real visible gap between tiles
-     * already separates them, and these flush-cell divider lines would
-     * either run pointlessly through empty background space or, on a
-     * plugin-colored tile, visually clash with a color/radius that already
-     * contradicts the flush-grid look these lines were built for. */
-    if (tile_gap == 0 && col_count > 1) {
-        lv_obj_t * vline = lv_obj_create(grid);
-        lv_obj_remove_style_all(vline);
-        lv_obj_add_flag(vline, LV_OBJ_FLAG_IGNORE_LAYOUT);
-        lv_obj_remove_flag(vline, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(vline, 1, row_count * row_h);
-        lv_obj_align(vline, LV_ALIGN_TOP_MID, 0, 0);
-        lv_obj_set_style_bg_opa(vline, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_bg_image_src(vline, asset_path("launcher/ver_line.png"), 0);
-        lv_obj_set_style_bg_image_tiled(vline, true, 0);
-    }
-
-    for (int r = 0; tile_gap == 0 && r < row_count - 1; r++) {
-        lv_obj_t * hline = lv_obj_create(grid);
-        lv_obj_remove_style_all(hline);
-        lv_obj_add_flag(hline, LV_OBJ_FLAG_IGNORE_LAYOUT);
-        lv_obj_remove_flag(hline, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(hline, lv_pct(100), 1);
-        lv_obj_align(hline, LV_ALIGN_TOP_LEFT, 0, (r + 1) * row_h);
-        lv_obj_set_style_bg_opa(hline, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_bg_image_src(hline, asset_path("launcher/hor_line.png"), 0);
-        lv_obj_set_style_bg_image_tiled(hline, true, 0);
-    }
+    /* Divider lines between cells (launcher/hor_line.png / ver_line.png,
+     * drawn once at the grid level whenever tile_gap == 0) were removed per
+     * a UI request to drop the flush-grid separator lines from every
+     * build_icon_grid_screen() consumer (Home, Music, Stream Media,
+     * Wireless) without touching the grid geometry itself -- row_h,
+     * col_dsc/row_dsc, and tile_gap's own flush-vs-gapped behavior above are
+     * all unchanged, only the two line-sprite objects that used to be drawn
+     * here are gone. */
 
     return scr;
 }
@@ -1563,10 +1552,29 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
                                 identity, data->row_decorator_ctx);
         lv_label_set_text(row, label ? label : "");
         /* Identity details use two lines on music rows. Reset on every
-         * recycled slot so the selector/single-line rows retain centering. */
+         * recycled slot so the selector/single-line rows retain centering.
+         *
+         * Real bug caught in review: this used to read the row's live
+         * height/font back via lv_obj_get_height(row)/lv_obj_get_style_
+         * text_font(row, 0) instead of data->row_height/&LIST_ROW_FONT.
+         * compact_list_set_row_height() calls this function immediately
+         * after lv_obj_set_style_height() on every pool row, in the same
+         * call stack, before LVGL's layout engine has necessarily caught
+         * up -- lv_obj_get_height() could still read the row's stale
+         * pre-resize (or default, on first build) height, computing a
+         * pad_top of ~0 and pinning the label to the very top of the row
+         * instead of centering it. Reproduced on real hardware: every row
+         * of a freshly-opened Album Artist list (all computed during that
+         * same initial compact_list_set_row_height() call) came up top-
+         * aligned, while rows scrolled into view later (recycled well
+         * after layout had settled) centered correctly -- exactly the
+         * "some rows, not others" pattern this timing bug produces.
+         * data->row_height and LIST_ROW_FONT are the same deterministic
+         * values compact_list_set_row_height() itself already uses to
+         * compute this exact padding, with no read-back race possible. */
         int lines = label && strchr(label, '\n') ? 2 : 1;
-        int text_height = lv_font_get_line_height(lv_obj_get_style_text_font(row, 0)) * lines;
-        int pad = (lv_obj_get_height(row) - text_height) / 2;
+        int text_height = lv_font_get_line_height(&LIST_ROW_FONT) * lines;
+        int pad = (data->row_height - text_height) / 2;
         lv_obj_set_style_pad_top(row, pad > 0 ? pad : 0, 0);
 
         /* The row itself is a label, so LVGL aligns child images against

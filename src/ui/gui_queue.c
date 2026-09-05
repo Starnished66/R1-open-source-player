@@ -7,6 +7,7 @@
 #include "gui_text_input.h"
 #include "screen_builders.h"
 #include "metadata.h"
+#include "assets.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,9 +80,10 @@ void populate_queue_screen(void) {
     lv_obj_clean(queue_list);
     displayed_revision = revision;
     displayed_current = current;
-    lv_obj_t * start = queue_label("Start playlist: Sequential / Shuffle");
-    lv_obj_add_flag(start, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(start, queue_actions_open, LV_EVENT_CLICKED, NULL);
+    /* No in-list "Start playlist" row here -- the header's own "Options"
+     * button (build_queue_screen()) already opens this exact same
+     * queue_actions popup (Start sequentially/Shuffle/Edit/Clear/Save),
+     * so this was a plain duplicate entry point, not the only way in. */
     if (!count) { queue_label("Queue is empty"); free(order); return; }
     if (queue_page < 0) queue_page = 0;
     if (queue_page >= count) queue_page = ((count - 1) / QUEUE_PAGE_SIZE) * QUEUE_PAGE_SIZE;
@@ -185,12 +187,13 @@ static void queue_actions_open(lv_event_t * e) {
 static lv_obj_t * build_queue_screen(void) {
     lv_obj_t * title;
     lv_obj_t * screen = build_subsonic_list_screen("Queue", &title, &queue_list);
-    lv_obj_t * menu = lv_label_create(screen);
-    lv_label_set_text(menu, "Options");
-    lv_obj_align(menu, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + 18);
-    lv_obj_add_flag(menu, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(menu, 12);
-    lv_obj_add_event_cb(menu, queue_actions_open, LV_EVENT_CLICKED, NULL);
+    /* Real stock-firmware icon (sub_back/set.png, 51x51), not a text label --
+     * present on every real R1 as-is (THEME_ROOT points straight at the
+     * stock firmware's own resource pack on target builds, see assets.c's
+     * own comment), and copied into assets/theme2/ here too for host-build
+     * parity. build_top_right_icon_button() guarantees this lands at
+     * exactly the same visual level as the screen's own back arrow. */
+    build_top_right_icon_button(screen, asset_path("sub_back/set.png"), queue_actions_open);
     static const menu_popup_row_t rows[] = {
         { "Start sequentially", queue_start_sequential, false },
         { "Shuffle from a random song", queue_start_shuffle, false },

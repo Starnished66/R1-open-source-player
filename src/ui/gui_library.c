@@ -15,6 +15,7 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "gui.h"
 #include "gui_theme.h"
 #include "gui_notifications.h"
+#include "gui_settings.h"
 #include "gui_text_input.h"
 #include "gui_subsonic.h"
 #include "gui_books.h"
@@ -125,7 +126,12 @@ static void test_diag_log(const char * area, const char * fmt, ...) {
 
 #define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
 #define COMPACT_LIST_PAGE_CACHE_SIZE 64
-#define STATUS_BAR_CLEARANCE 48
+/* STATUS_BAR_CLEARANCE comes from screen_builders.h (already included
+ * above) -- this used to be a redundant local redefinition at the same
+ * value (48), which silently masked the fact that it would override the
+ * shared constant the moment the two ever diverged (as they now have,
+ * screen_builders.h's own value shrunk to close a real-device dead-space
+ * bug report). Removed rather than kept in sync by hand. */
 #define EXTERNAL_COVER_MAX_BYTES (4U * 1024U * 1024U)
 
 static lv_obj_t * album_thumbnail_active_list = NULL;
@@ -4234,6 +4240,11 @@ static void music_files_tile_cb(lv_event_t * e) {
     nav_push(files_screen);
 }
 
+static void music_screen_playback_settings_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(gui_settings_get_playback_screen());
+}
+
 static lv_obj_t * build_music_screen(void) {
     static icon_grid_item_t items[6];
     items[0] = (icon_grid_item_t){ "category/explorer.png", "category/explorer_s.png", "Files", music_files_tile_cb, NULL };
@@ -4249,6 +4260,12 @@ static lv_obj_t * build_music_screen(void) {
     items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
     lv_obj_t * scr = build_launcher_menu_screen("Music", generic_back_cb, items, 6, 100, false,
                                                  &launcher_layout_config.music);
+    /* Same real stock-firmware gear icon as the Queue screen's own Options
+     * button (sub_back/set.png) -- build_top_right_icon_button() guarantees
+     * it lands at exactly the same visual level as this screen's own back
+     * arrow, on the opposite corner. Shortcuts straight to Playback
+     * Settings rather than the full Settings > Playback drill-down. */
+    build_top_right_icon_button(scr, asset_path("sub_back/set.png"), music_screen_playback_settings_cb);
     finalize_screen_navigation(scr);
     return scr;
 }

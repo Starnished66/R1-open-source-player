@@ -38,6 +38,8 @@
 #define SCREEN_WIDTH BOARD_SCREEN_WIDTH
 #define SCREEN_HEIGHT BOARD_SCREEN_HEIGHT
 
+static volatile sig_atomic_t running = 1;
+
 /* Custom tick interface for LVGL timing (replaces older thread-based ticks) */
 static uint32_t custom_tick_get(void) {
     struct timespec ts;
@@ -219,6 +221,7 @@ void boot_checkpoint(const char * step) {
 }
 #endif
 
+// handler for signals that indicate crashes like SIGSEGV or SIGABRT
 void crash_handler(int sig) {
     void *buffer[128];
     int size;
@@ -231,10 +234,12 @@ void crash_handler(int sig) {
     exit(1);
 }
 
-// function to force a segfault
-void baz() {
-	int *foo = (int*)-1;   // make a bad pointer
-	printf("%d\n", *foo);  // causes segfault
+// handler for SIGINT
+static void sigint_handler(int sig) {
+	(void)sig;
+	running = 0;
+
+	// TODO: add more cleanup (like turning off the screen)
 }
 
 int main(int argc, char ** argv) {
@@ -246,8 +251,7 @@ int main(int argc, char ** argv) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
-
-    // baz();
+    signal(SIGINT, sigint_handler);  // interrupt handling (ctrl-c in terminal)
 
 #ifndef HOST_BUILD
     struct sigaction crash_sa;
@@ -430,7 +434,7 @@ int main(int argc, char ** argv) {
     unsigned perf_handler_calls = 0;
     unsigned perf_handler_over_16ms = 0;
 #endif
-    while(1) {
+    while(running) {
         uint32_t real_tick = custom_tick_get();
         lv_tick_inc(real_tick - last_real_tick);
         last_real_tick = real_tick;

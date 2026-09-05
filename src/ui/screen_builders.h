@@ -371,7 +371,7 @@ typedef struct {
 /* Fixed size of a paged-mode row label buffer (compact_list_fetch_page_cb_t
  * below) -- matches cached_tags_t.title's own size (metadata_db.h), the
  * largest display string a paged provider actually needs to carry. */
-#define COMPACT_LIST_LABEL_MAX 128
+#define COMPACT_LIST_LABEL_MAX 384
 
 typedef struct {
     char label[COMPACT_LIST_LABEL_MAX];

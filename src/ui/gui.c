@@ -324,7 +324,7 @@ static bool shutdown_background_work_active(void) {
     return gui_library_has_background_work() || gui_subsonic_has_background_work() ||
            gui_network_has_background_work() || gui_lyrics_has_background_work() ||
            gui_player_has_background_work() || gui_shell_has_background_work() ||
-           plugin_manager_has_background_work() || playlist_files_has_active_write();
+           plugin_manager_has_background_work() || playlist_files_has_active_write() || gui_player_queue_write_busy();
 }
 
 /* Real-device bug report: waking from suspend needed two power-button
@@ -1156,7 +1156,7 @@ static void update_timer_cb(lv_timer_t * timer) {
             bool player_busy = gui_player_has_background_work();
             bool shell_busy = gui_shell_has_background_work();
             bool plugins_busy = plugin_manager_has_background_work();
-            bool playlist_write_busy = playlist_files_has_active_write();
+            bool playlist_write_busy = playlist_files_has_active_write() || gui_player_queue_write_busy();
             if (library_busy || subsonic_busy || network_busy || lyrics_busy || player_busy || shell_busy ||
                 plugins_busy || playlist_write_busy) {
                 static uint32_t last_busy_log_tick = 0;
@@ -1301,6 +1301,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_usb_mode_switch();
     poll_usb_storage_hotplug();
     poll_sd_card_hotplug();
+    gui_library_poll_playlists();
     poll_cover_decode();
     gui_lyrics_poll_load();
     gui_lyrics_poll_backdrop();
@@ -1316,6 +1317,7 @@ static void update_timer_cb(lv_timer_t * timer) {
         gui_player_handle_track_finished();
     }
     gui_player_poll_confirmed_playback();
+    gui_queue_poll();
     gui_network_poll_airplay_overlay();
     gui_track_info_poll();
 

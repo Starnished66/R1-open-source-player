@@ -50,6 +50,18 @@ void gui_player_queue_add(const char * path);
 void gui_player_queue_add_many(const char * const * paths, int count);
 void gui_player_queue_remove_at(int offset);
 void gui_player_queue_clear(void);
+void gui_player_queue_play_next(const char * path);
+/* Indices in a snapshot identify occurrences, not paths. A revision makes
+ * stale UI actions fail rather than acting on a different occurrence. */
+uint64_t gui_player_queue_revision(void);
+bool gui_player_queue_snapshot(int ** order, int * count, int * current, uint64_t * revision);
+bool gui_player_queue_edit(uint64_t revision, int from, int to);
+bool gui_player_queue_select(uint64_t revision, int index);
+void gui_player_queue_clear_upcoming(void);
+bool gui_player_queue_save_as(const char * name);
+void gui_player_queue_checkpoint(void);
+bool gui_player_queue_write_busy(void);
+void gui_player_queue_flush(void);
 void gui_player_play_at(int index);
 void gui_player_play_at_from(int index, double start_seconds);
 void gui_player_step_manual(int direction);

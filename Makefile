@@ -462,6 +462,7 @@ APP_SRCS += src/ui/lyrics_layout.c src/ui/transition_compositor.c
 APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c src/plugins/plugin_disabled_list.c
 APP_SRCS += src/ui/gui_plugin_manage.c src/ui/gui_lock_screen.c
 APP_SRCS += src/library/remote_track.c
+APP_SRCS += src/library/queue_resume.c
 APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c src/library/artwork_coordinator.c
 APP_SRCS += src/core/utf8_util.c src/core/app_clock.c
 APP_SRCS += src/ui/gesture_detector.c
@@ -731,6 +732,15 @@ sd_ready_test:
 	$(CC) -O0 -g -Wall -Isrc/bootloader src/bootloader/sd_ready.c src/bootloader/sd_ready_test.c \
 	    -o $(BUILD_TARGET_DIR)/sd_ready_test
 	./$(BUILD_TARGET_DIR)/sd_ready_test
+
+.PHONY: playlist-selftest
+PLAYLIST_TEST_SANITIZERS ?=
+playlist-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O1 -g -Wall -Wextra $(PLAYLIST_TEST_SANITIZERS) -ffunction-sections -fdata-sections -Isrc/library \
+	    src/library/playlist_test.c src/library/playlist_files.c src/library/queue_resume.c \
+	    -Wl,--gc-sections -lpthread -lm -o $(BUILD_TARGET_DIR)/playlist_test
+	./$(BUILD_TARGET_DIR)/playlist_test
 
 # Host-buildable tests for JPEG scale selection, tjpgd 1/2 1/4 1/8 decode,
 # cover_decode_to_rgb565_ex, and malformed/oversized rejection. Links the

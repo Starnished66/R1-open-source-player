@@ -1562,6 +1562,12 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
             data->row_decorator(list, row, data->leading_images[slot], index, slot,
                                 identity, data->row_decorator_ctx);
         lv_label_set_text(row, label ? label : "");
+        /* Identity details use two lines on music rows. Reset on every
+         * recycled slot so the selector/single-line rows retain centering. */
+        int lines = label && strchr(label, '\n') ? 2 : 1;
+        int text_height = lv_font_get_line_height(lv_obj_get_style_text_font(row, 0)) * lines;
+        int pad = (lv_obj_get_height(row) - text_height) / 2;
+        lv_obj_set_style_pad_top(row, pad > 0 ? pad : 0, 0);
 
         /* The row itself is a label, so LVGL aligns child images against
          * its padded content box rather than against the visible card.

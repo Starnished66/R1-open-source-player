@@ -531,7 +531,7 @@ static int recently_added_fetch_page(void * ctx, int offset, int count, compact_
     int prefix = 0;
     if (offset == 0 && count > 0) {
         memset(&out_rows[0], 0, sizeof(out_rows[0]));
-        snprintf(out_rows[0].label, sizeof(out_rows[0].label), "Start playlist: Sequential / Shuffle");
+        snprintf(out_rows[0].label, sizeof(out_rows[0].label), "Play All");
         prefix = 1; count--; offset++;
     }
     if (count <= 0) return prefix;
@@ -896,7 +896,7 @@ static void populate_group_songs_rows(void) {
     }
 
     bool editing = editable && group_songs_edit_mode;
-    if (!editing) add_group_songs_page_row("Start playlist: Sequential / Shuffle", group_start_options_cb);
+    if (!editing) add_group_songs_page_row("Play All", group_start_options_cb);
     if (group_songs_count == 0) {
         lv_obj_t * empty = lv_label_create(group_songs_list);
         lv_label_set_text(empty, "Playlist is empty. Add songs from a song menu.");

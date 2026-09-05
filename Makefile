@@ -87,7 +87,7 @@ endif
 #      entirely from upstream -- a clean clone fails to link with
 #      "undefined reference to `lv_linux_fbdev_get_active_page'" (and the
 #      other five) the moment either caller is linked in.
-#   2. runtime fixes (patches/lvgl_runtime_fixes.patch): four small
+#   2. runtime fixes (patches/lvgl_runtime_fixes.patch): five small
 #      genuine upstream bugs/limitations this app hit in practice, not
 #      feature work -- lv_tiny_ttf_init()/_deinit() missing a null-guard (a
 #      second init call, or deinit after a failed init, double-destroys/
@@ -121,7 +121,17 @@ endif
 #      BlindMF-tier glyphs) is still under ~1MB against this device's
 #      ~19MB available RAM, comfortably covering several font sizes' full
 #      alphanumeric+punctuation working sets at once without the earlier
-#      128-entry thrashing.
+#      128-entry thrashing. lodepng.c's decodeGeneric() sized the buffer it
+#      unfilters a PNG's native-depth scanlines into as a hardcoded 4 bytes/
+#      pixel (an ARGB8888-shaped stride), but postProcessScanlines() writes
+#      that buffer at the PNG's own native bpp -- any source with more than
+#      32 bits per pixel (16-bit-per-channel RGBA is 64bpp) overflowed that
+#      buffer by exactly the difference, corrupting the heap. Real-device
+#      report: decoding a stock 16-bit RGBA icon (copied in from an R3 Pro
+#      II firmware dump for the in-progress port) silently corrupted the
+#      heap, surfacing later as a segfault inside an unrelated free() call
+#      and a reboot-on-crash loop. Fixed by sizing that buffer's stride to
+#      the larger of the native row width and the ARGB8888 row width.
 #   3. generated fonts (patches/lvgl_generated_fonts/, copied in whole
 #      rather than diffed): ten Montserrat .c files regenerated with an
 #      expanded lv_font_conv codepoint range (Latin-1 Supplement +
@@ -192,6 +202,7 @@ LVGL_FBDEV_H := $(LVGL_DIR)/src/drivers/display/fb/lv_linux_fbdev.h
 LVGL_TINY_TTF := $(LVGL_DIR)/src/libs/tiny_ttf/lv_tiny_ttf.c
 LVGL_TJPGDCNF := $(LVGL_DIR)/src/libs/tjpgd/tjpgdcnf.h
 LVGL_LRU_RB := $(LVGL_DIR)/src/misc/cache/_lv_cache_lru_rb.c
+LVGL_LODEPNG := $(LVGL_DIR)/src/libs/lodepng/lodepng.c
 LVGL_FONT_TARGETS := $(LVGL_GENERATED_FONTS:%=$(LVGL_DIR)/src/font/%)
 LVGL_FONT_GOLDEN := $(LVGL_GENERATED_FONTS:%=$(LVGL_GENERATED_FONTS_DIR)/%)
 LVGL_PATCH_STAMP := $(LVGL_DIR)/.lvgl_fbdev_patch_applied
@@ -368,7 +379,25 @@ endif
 # including "audio.h") still resolves via the compiler's -I fallback search
 # even though foo.h now lives in a different category folder -- no #include
 # statements needed changing when src/ was reorganized into subfolders.
-CFLAGS = -O3 -g -Wall -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
+# -MMD -MP: real-device/real-build bug report -- this project had NO
+# per-file #include dependency tracking at all (see LVGL_PATCH_STAMP's own
+# comment further up, which documents the one narrow case someone already
+# got bitten by and hand-worked-around). Concretely: changing a widely-
+# included header (e.g. screen_builders.h's STATUS_BAR_CLEARANCE) and
+# rebuilding reported success, but every .c file that only #includes that
+# header -- without itself having changed -- kept its stale, pre-change
+# object file, since Make's default dependency is just "object newer than
+# its own .c", with no idea a header it read also matters. The fix silently
+# never reached most of the app (built fine, wrong binary) until a full
+# `make clean` was manually forced. -MMD makes each compile emit a matching
+# .d file listing every header that translation unit actually included;
+# -MP adds a phony target for each of those headers too, so a header being
+# DELETED (not just edited) doesn't leave a dangling prerequisite that
+# breaks the build outright. The -include of build_target/build_host's own
+# *.d files near the bottom of this Makefile is what actually feeds these
+# back in on the next invocation -- this flag alone does nothing without
+# that companion include.
+CFLAGS = -O3 -g -Wall -MMD -MP -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
 HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags)
 HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags)
@@ -487,6 +516,7 @@ APP_SRCS += src/ui/lyrics_layout.c src/ui/transition_compositor.c
 APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c src/plugins/plugin_disabled_list.c
 APP_SRCS += src/ui/gui_plugin_manage.c src/ui/gui_lock_screen.c
 APP_SRCS += src/library/remote_track.c
+APP_SRCS += src/library/queue_resume.c
 APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c src/library/artwork_coordinator.c
 APP_SRCS += src/core/utf8_util.c src/core/app_clock.c
 APP_SRCS += src/ui/gesture_detector.c
@@ -594,7 +624,7 @@ $(HOST_BIN): $(HOST_OBJS)
 # on the tracked patch file (so a future change to the patch itself also
 # invalidates it), not just on $(LVGL_DIR) existing.
 $(LVGL_PATCH_STAMP): $(LVGL_FBDEV_C) $(LVGL_FBDEV_H) $(LVGL_PATCH) \
-                     $(LVGL_TINY_TTF) $(LVGL_TJPGDCNF) $(LVGL_LRU_RB) $(LVGL_RUNTIME_FIXES_PATCH) \
+                     $(LVGL_TINY_TTF) $(LVGL_TJPGDCNF) $(LVGL_LRU_RB) $(LVGL_LODEPNG) $(LVGL_RUNTIME_FIXES_PATCH) \
                      $(LVGL_FONT_TARGETS) $(LVGL_FONT_GOLDEN)
 	@set -e; \
 	actual_commit=$$(git -C $(LVGL_DIR) rev-parse HEAD 2>/dev/null || echo ""); \
@@ -642,7 +672,7 @@ $(LVGL_PATCH_STAMP): $(LVGL_FBDEV_C) $(LVGL_FBDEV_H) $(LVGL_PATCH) \
 	  }; \
 	  echo "LVGL runtime-fixes patch applied successfully."; \
 	else \
-	  echo "ERROR: $(LVGL_DIR) matches the pinned commit $(LVGL_PINNED_COMMIT) but tiny_ttf/tjpgd/lru-rb are"; \
+	  echo "ERROR: $(LVGL_DIR) matches the pinned commit $(LVGL_PINNED_COMMIT) but tiny_ttf/tjpgd/lru-rb/lodepng are"; \
 	  echo "       neither a pristine match for $(LVGL_RUNTIME_FIXES_PATCH) nor an exact match for its"; \
 	  echo "       already-applied result. Remove $(LVGL_DIR) and re-run make to start from a clean checkout."; \
 	  exit 1; \
@@ -762,6 +792,15 @@ sd_ready_test:
 	    -o $(BUILD_TARGET_DIR)/sd_ready_test
 	./$(BUILD_TARGET_DIR)/sd_ready_test
 
+.PHONY: playlist-selftest
+PLAYLIST_TEST_SANITIZERS ?=
+playlist-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O1 -g -Wall -Wextra $(PLAYLIST_TEST_SANITIZERS) -ffunction-sections -fdata-sections -Isrc/library \
+	    src/library/playlist_test.c src/library/playlist_files.c src/library/queue_resume.c \
+	    -Wl,--gc-sections -lpthread -lm -o $(BUILD_TARGET_DIR)/playlist_test
+	./$(BUILD_TARGET_DIR)/playlist_test
+
 # Host-buildable tests for JPEG scale selection, tjpgd 1/2 1/4 1/8 decode,
 # cover_decode_to_rgb565_ex, and malformed/oversized rejection. Links the
 # real decoder + tjpgd + artwork coordinator; audio_is_playing and lodepng
@@ -850,3 +889,17 @@ clean:
 	    open_hiby_player_host open_hiby_player_host_* \
 	    open_hiby_player_target open_hiby_player_target_* \
 	    compile_commands.json compile_flags.txt
+
+# Companion to -MMD -MP in CFLAGS above (see that comment for the real-
+# device/real-build incident this exists to prevent) -- pulls in every
+# already-generated .d file for whichever single board this invocation is
+# actually building (BUILD_TARGET_DIR/BUILD_HOST_DIR are already resolved
+# to that board's own suffixed directory by this point), so Make sees each
+# object's real header dependencies, not just its own .c file. `-include`
+# (not `include`) so a completely fresh checkout -- no .d files generated
+# yet -- doesn't fail the very first build attempting to read files that
+# don't exist; find's own 2>/dev/null covers the same case for when the
+# directory itself doesn't exist yet either. Must stay at the end of the
+# file: every .d this generates references targets/variables (BUILD_
+# TARGET_DIR, BUILD_HOST_DIR) that need to already be fully resolved.
+-include $(shell find $(BUILD_TARGET_DIR) $(BUILD_HOST_DIR) -name '*.d' 2>/dev/null)

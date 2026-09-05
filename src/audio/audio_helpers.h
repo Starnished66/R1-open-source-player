@@ -110,6 +110,26 @@ static inline void apply_ramp(int16_t * buf, uint64_t frames, unsigned int chann
     }
 }
 
+/* Same as apply_ramp() but for the S24_LE wide path's int32_t buffers
+ * (right-justified 24-in-32, see decoder_read_s32()'s own comment in
+ * audio.c) -- clamp bounds are the 24-bit range (2^23) instead of int16's,
+ * everything else is identical. */
+static inline void apply_ramp_s32(int32_t * buf, uint64_t frames, unsigned int channels, float start_gain, float end_gain) {
+    if (!buf || frames == 0 || channels == 0) return;
+    for (uint64_t i = 0; i < frames; i++) {
+        float t = (frames > 1) ? (float) i / (float) (frames - 1) : 1.0f;
+        float gain = start_gain + t * (end_gain - start_gain);
+        for (unsigned int ch = 0; ch < channels; ch++) {
+            size_t idx = (size_t) i * channels + ch;
+            float val = (float) buf[idx] * gain;
+            int32_t s = (int32_t) (val + (val >= 0.0f ? 0.5f : -0.5f));
+            if (s > 8388607) s = 8388607;
+            else if (s < -8388608) s = -8388608;
+            buf[idx] = s;
+        }
+    }
+}
+
 typedef struct {
     char path[PATH_MAX];
     bool valid;

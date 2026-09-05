@@ -9,6 +9,18 @@
  * then the array). Returns false if root can't be read or has no playlist
  * files in it. */
 bool playlist_files_scan(const char * root, char *** out_paths, int * out_count);
+/* Recursive, complete scan: success includes an empty directory; failure
+ * never publishes a partial result. Symlink directories are not followed. */
+bool playlist_files_scan_complete(const char * root, char *** out_paths, int * out_count);
+void playlist_files_refresh_async(const char * root);
+bool playlist_files_refresh_poll(void);
+bool playlist_files_reconcile(const char * root);
+bool playlist_files_rename(const char * path, const char * name, char * out, size_t size);
+/* Entry offsets count nonempty, non-comment lines, including unavailable files.
+ * to < 0 removes exactly one occurrence; otherwise moves it before offset to. */
+bool playlist_files_edit_entry(const char * path, int from, int to);
+bool playlist_files_write_new(const char * dir, const char * name,
+                              const char * const * paths, int count, char * out, size_t size);
 
 /* Appends song_path as a new line to the M3U file at m3u_path, creating the
  * file (but not its parent directory) if it doesn't already exist. Returns
@@ -61,6 +73,11 @@ bool playlist_files_has_active_write(void);
  * thread. Caller owns *out_paths (free each entry, then the array).
  * Returns false if the file can't be read. */
 bool playlist_files_read(const char * m3u_path, char *** out_paths, int * out_count);
+typedef enum {
+    PLAYLIST_READ_OK, PLAYLIST_READ_EMPTY, PLAYLIST_READ_IO_ERROR,
+    PLAYLIST_READ_INVALID, PLAYLIST_READ_NO_MEMORY
+} playlist_read_status_t;
+playlist_read_status_t playlist_files_read_ex(const char * path, char *** paths, int * count);
 
 /* Resolves a single M3U line (as read via fgets(), already trimmed of its
  * trailing newline) against the directory m3u_path itself lives in -- a

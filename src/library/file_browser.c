@@ -182,49 +182,19 @@ static void build_playlist_and_select(int file_display_index) {
 }
 
 bool file_browser_build_playlist_from_m3u(const char * m3u_path, char *** out_playlist, int * out_count) {
-    FILE * f = fopen(m3u_path, "r");
-    if (!f) return false;
-
-    char ** playlist = NULL;
-    int capacity = 0;
+    char ** paths = NULL;
     int count = 0;
-    char line[PATH_MAX];
-
-    while (fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-        if (len == 0 || line[0] == '#') continue; /* blank line or M3U directive/comment */
-        if (!is_playable_file(line)) continue;
-
-        /* Resolves both absolute lines (old-style) and lines relative to
-         * m3u_path's own directory (the standard M3U convention, and what
-         * playlist_files_append()/_create() now write) -- see
-         * playlist_files_resolve_path()'s own comment. */
-        char full_path[PATH_MAX];
-        playlist_files_resolve_path(m3u_path, line, full_path, sizeof(full_path));
-
-        if (count == capacity) {
-            /* Audit finding: same unguarded-realloc-plus-early-capacity-
-             * update issue as scan_all_songs_recursive()'s own fix -- see
-             * its comment for the full reasoning. */
-            int new_capacity = capacity ? capacity * 2 : 8;
-            char ** grown = realloc(playlist, sizeof(char *) * (size_t) new_capacity);
-            if (!grown) break;
-            playlist = grown;
-            capacity = new_capacity;
-        }
-        playlist[count++] = strdup(full_path);
+    *out_playlist = NULL;
+    *out_count = 0;
+    if (!playlist_files_read(m3u_path, &paths, &count)) return false;
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        if (is_playable_file(paths[i])) paths[kept++] = paths[i];
+        else free(paths[i]);
     }
-
-    fclose(f);
-
-    if (count == 0) {
-        free(playlist);
-        return false;
-    }
-
-    *out_playlist = playlist;
-    *out_count = count;
+    if (!kept) { free(paths); return false; }
+    *out_playlist = paths;
+    *out_count = kept;
     return true;
 }
 

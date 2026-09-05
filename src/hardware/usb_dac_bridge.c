@@ -114,7 +114,7 @@ static void * bridge_thread_func(void * arg) {
      * timing profile than local file playback or AirPlay) -- if dropouts
      * or silence reappear, check that before touching the period config
      * again. */
-    if (!audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, true)) {
+    if (!audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, true, false)) {
         fprintf(stderr, "usb_dac_bridge: audio_output_ensure failed\n");
         close(uac_fd);
         set_running(false);
@@ -187,7 +187,7 @@ static void * bridge_thread_func(void * arg) {
          * low_latency value as the initial audio_output_ensure() call
          * above -- a mismatch here would make every single chunk look like
          * a mode change and force a reopen on every read, not just once. */
-        audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, true);
+        audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, true, false);
 
         /* Overwrite the always-noise first channel slot with the real
          * second one -- see the empirical finding in this file's top

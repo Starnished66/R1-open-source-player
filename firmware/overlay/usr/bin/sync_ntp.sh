@@ -1,0 +1,1 @@
+../share/udhcpc/default.script.d/ntpdate

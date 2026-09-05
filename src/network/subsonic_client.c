@@ -12,6 +12,10 @@
 
 #define SUBSONIC_API_VERSION "1.16.1"
 #define SUBSONIC_CLIENT_NAME "open_hiby_player"
+#define SUBSONIC_CONNECT_TIMEOUT_MS 10000U
+#define SUBSONIC_READ_TIMEOUT_MS 15000U
+#define SUBSONIC_TOTAL_TIMEOUT_MS 30000U
+#define SUBSONIC_MAX_API_RESPONSE (8U * 1024U * 1024U)
 
 static void url_encode(const char * in, char * out, size_t out_size) {
     static const char hex[] = "0123456789ABCDEF";
@@ -73,7 +77,8 @@ static void build_auth_query(const subsonic_server_t * server, char * out, size_
  * the JSON response. Returns the "subsonic-response" object (still owned
  * by *out_root -- caller must cJSON_Delete(*out_root) when done with it)
  * on a status:"ok" response, or NULL on any network/parse/auth failure. */
-static cJSON * api_request(const subsonic_server_t * server, const char * endpoint, const char * extra_params, cJSON ** out_root) {
+static cJSON * api_request(const subsonic_server_t * server, const char * endpoint, const char * extra_params,
+                           cJSON ** out_root, http_cancel_token_t * cancel) {
     char auth[512];
     build_auth_query(server, auth, sizeof(auth));
 
@@ -84,17 +89,25 @@ static cJSON * api_request(const subsonic_server_t * server, const char * endpoi
         snprintf(url, sizeof(url), "%s/rest/%s?%s", server->base_url, endpoint, auth);
     }
 
-    int status = 0;
-    uint8_t * body = NULL;
-    size_t body_size = 0;
-    bool ok = http_get_to_buffer(url, server->verify_tls, &status, &body, &body_size);
-    if (!ok || status != 200 || !body) {
-        free(body);
+    http_request_t request = {0};
+    snprintf(request.url, sizeof(request.url), "%s", url);
+    request.method = HTTP_METHOD_GET;
+    request.verify_tls = server->verify_tls;
+    request.connect_timeout_ms = SUBSONIC_CONNECT_TIMEOUT_MS;
+    request.read_timeout_ms = SUBSONIC_READ_TIMEOUT_MS;
+    request.total_timeout_ms = SUBSONIC_TOTAL_TIMEOUT_MS;
+    request.max_response_bytes = SUBSONIC_MAX_API_RESPONSE;
+    request.redirect_limit = 5;
+
+    http_response_t http_response;
+    bool ok = http_request_ex(&request, cancel, &http_response);
+    if (!ok || http_response.status != 200 || !http_response.body) {
+        http_response_free(&http_response);
         return NULL;
     }
 
-    cJSON * root = cJSON_ParseWithLength((const char *) body, body_size);
-    free(body);
+    cJSON * root = cJSON_ParseWithLength((const char *) http_response.body, http_response.body_len);
+    http_response_free(&http_response);
     if (!root) return NULL;
 
     cJSON * resp = cJSON_GetObjectItemCaseSensitive(root, "subsonic-response");
@@ -125,20 +138,21 @@ static unsigned int json_positive_uint(cJSON * obj, const char * key) {
     return value > 0 ? (unsigned int) value : 0;
 }
 
-bool subsonic_ping(const subsonic_server_t * server) {
+bool subsonic_ping(const subsonic_server_t * server, http_cancel_token_t * cancel) {
     cJSON * root = NULL;
-    cJSON * resp = api_request(server, "ping.view", NULL, &root);
+    cJSON * resp = api_request(server, "ping.view", NULL, &root, cancel);
     bool ok = (resp != NULL);
     if (root) cJSON_Delete(root);
     return ok;
 }
 
-bool subsonic_get_artists(const subsonic_server_t * server, subsonic_artist_t ** out_artists, int * out_count) {
+bool subsonic_get_artists(const subsonic_server_t * server, subsonic_artist_t ** out_artists, int * out_count,
+                           http_cancel_token_t * cancel) {
     *out_artists = NULL;
     *out_count = 0;
 
     cJSON * root = NULL;
-    cJSON * resp = api_request(server, "getArtists.view", NULL, &root);
+    cJSON * resp = api_request(server, "getArtists.view", NULL, &root, cancel);
     if (!resp) return false;
 
     cJSON * artists_obj = cJSON_GetObjectItemCaseSensitive(resp, "artists");
@@ -173,7 +187,7 @@ bool subsonic_get_artists(const subsonic_server_t * server, subsonic_artist_t **
 }
 
 bool subsonic_get_artist_albums(const subsonic_server_t * server, const char * artist_id,
-                                 subsonic_album_t ** out_albums, int * out_count) {
+                                 subsonic_album_t ** out_albums, int * out_count, http_cancel_token_t * cancel) {
     *out_albums = NULL;
     *out_count = 0;
 
@@ -183,7 +197,7 @@ bool subsonic_get_artist_albums(const subsonic_server_t * server, const char * a
     snprintf(params, sizeof(params), "id=%s", id_enc);
 
     cJSON * root = NULL;
-    cJSON * resp = api_request(server, "getArtist.view", params, &root);
+    cJSON * resp = api_request(server, "getArtist.view", params, &root, cancel);
     if (!resp) return false;
 
     cJSON * artist_obj = cJSON_GetObjectItemCaseSensitive(resp, "artist");
@@ -209,7 +223,7 @@ bool subsonic_get_artist_albums(const subsonic_server_t * server, const char * a
 }
 
 bool subsonic_get_album_songs(const subsonic_server_t * server, const char * album_id,
-                               subsonic_song_t ** out_songs, int * out_count) {
+                               subsonic_song_t ** out_songs, int * out_count, http_cancel_token_t * cancel) {
     *out_songs = NULL;
     *out_count = 0;
 
@@ -219,7 +233,7 @@ bool subsonic_get_album_songs(const subsonic_server_t * server, const char * alb
     snprintf(params, sizeof(params), "id=%s", id_enc);
 
     cJSON * root = NULL;
-    cJSON * resp = api_request(server, "getAlbum.view", params, &root);
+    cJSON * resp = api_request(server, "getAlbum.view", params, &root, cancel);
     if (!resp) return false;
 
     cJSON * album_obj = cJSON_GetObjectItemCaseSensitive(resp, "album");
@@ -257,12 +271,13 @@ bool subsonic_get_album_songs(const subsonic_server_t * server, const char * alb
     return count > 0;
 }
 
-bool subsonic_get_all_albums(const subsonic_server_t * server, subsonic_album_t ** out_albums, int * out_count) {
+bool subsonic_get_all_albums(const subsonic_server_t * server, subsonic_album_t ** out_albums, int * out_count,
+                              http_cancel_token_t * cancel) {
     *out_albums = NULL;
     *out_count = 0;
 
     cJSON * root = NULL;
-    cJSON * resp = api_request(server, "getAlbumList2.view", "type=alphabeticalByName&size=500", &root);
+    cJSON * resp = api_request(server, "getAlbumList2.view", "type=alphabeticalByName&size=500", &root, cancel);
     if (!resp) return false;
 
     cJSON * list_obj = cJSON_GetObjectItemCaseSensitive(resp, "albumList2");
@@ -287,12 +302,13 @@ bool subsonic_get_all_albums(const subsonic_server_t * server, subsonic_album_t 
     return count > 0;
 }
 
-bool subsonic_get_playlists(const subsonic_server_t * server, subsonic_playlist_t ** out_playlists, int * out_count) {
+bool subsonic_get_playlists(const subsonic_server_t * server, subsonic_playlist_t ** out_playlists, int * out_count,
+                             http_cancel_token_t * cancel) {
     *out_playlists = NULL;
     *out_count = 0;
 
     cJSON * root = NULL;
-    cJSON * resp = api_request(server, "getPlaylists.view", NULL, &root);
+    cJSON * resp = api_request(server, "getPlaylists.view", NULL, &root, cancel);
     if (!resp) return false;
 
     cJSON * list_obj = cJSON_GetObjectItemCaseSensitive(resp, "playlists");
@@ -317,7 +333,7 @@ bool subsonic_get_playlists(const subsonic_server_t * server, subsonic_playlist_
 }
 
 bool subsonic_get_playlist_songs(const subsonic_server_t * server, const char * playlist_id,
-                                  subsonic_song_t ** out_songs, int * out_count) {
+                                  subsonic_song_t ** out_songs, int * out_count, http_cancel_token_t * cancel) {
     *out_songs = NULL;
     *out_count = 0;
 
@@ -327,7 +343,7 @@ bool subsonic_get_playlist_songs(const subsonic_server_t * server, const char * 
     snprintf(params, sizeof(params), "id=%s", id_enc);
 
     cJSON * root = NULL;
-    cJSON * resp = api_request(server, "getPlaylist.view", params, &root);
+    cJSON * resp = api_request(server, "getPlaylist.view", params, &root, cancel);
     if (!resp) return false;
 
     cJSON * playlist_obj = cJSON_GetObjectItemCaseSensitive(resp, "playlist");

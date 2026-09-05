@@ -21,7 +21,22 @@
  * text entry, group songs, subsonic lists), reserves these so its own
  * content never competes with the persistent status bar (clock/battery/
  * wifi, drawn separately on lv_layer_top()) for the same pixels. */
-#define STATUS_BAR_CLEARANCE 48
+/* Real-device bug report: this band left a visibly large blank gap between
+ * the status bar (clock/battery/wifi) and every screen's own back-arrow/
+ * title row. Every real topbar asset (clock digits, battery, wifi, codec
+ * badges -- confirmed against the actual stock-firmware theme pack) is
+ * exactly 30px tall; 32 leaves only 1px of margin above/below them --
+ * deliberately tight, about as far as this can go without the icons
+ * touching the band edges, per a follow-up request to shrink it further
+ * than an initial, more conservative 36 (3px margin). Every consumer of
+ * this constant derives its own position algebraically from it (mostly
+ * `STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2`-shaped formulas), so
+ * changing this one value propagates correctly everywhere with no other
+ * hand-tuned offset needing a matching adjustment. Deliberately not
+ * touching TITLE_ROW_HEIGHT below -- that sizes the back button's own
+ * touch target (see build_back_button()'s own comment on why it's
+ * generously sized), a separate, already-validated concern from this gap. */
+#define STATUS_BAR_CLEARANCE 32
 #define TITLE_ROW_HEIGHT 64
 #ifndef BACK_ARROW_OPTICAL_Y_OFFSET
 #define BACK_ARROW_OPTICAL_Y_OFFSET 7
@@ -192,6 +207,15 @@ typedef struct {
 lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const icon_grid_item_t * items, int item_count,
                                    int32_t icon_scale_percent, bool label_inside_icon, int32_t tile_gap);
+
+/* Top-right counterpart to the internal build_back_button() (screen_builders.c) --
+ * same 64x64 transparent hitbox, same STATUS_BAR_CLEARANCE vertical position,
+ * so any caller's icon lands at exactly the same visual level as the screen's
+ * own back arrow, mirrored to the right edge instead of the left. icon_asset
+ * is passed straight to lv_image_set_src() (caller resolves it via
+ * asset_path()/asset_path_plain() first, same as every other icon in this
+ * codebase). click_cb may be NULL for a purely decorative icon. */
+lv_obj_t * build_top_right_icon_button(lv_obj_t * scr, const char * icon_asset, lv_event_cb_t click_cb);
 
 typedef enum {
     PILL_ACCESSORY_NONE = 0,
@@ -371,7 +395,7 @@ typedef struct {
 /* Fixed size of a paged-mode row label buffer (compact_list_fetch_page_cb_t
  * below) -- matches cached_tags_t.title's own size (metadata_db.h), the
  * largest display string a paged provider actually needs to carry. */
-#define COMPACT_LIST_LABEL_MAX 128
+#define COMPACT_LIST_LABEL_MAX 384
 
 typedef struct {
     char label[COMPACT_LIST_LABEL_MAX];

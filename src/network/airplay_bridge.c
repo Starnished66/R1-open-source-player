@@ -168,7 +168,7 @@ static void run_session(uint8_t * buf, size_t buf_bytes, uint64_t * total_bytes_
              * see audio_output_ensure()'s low_latency parameter doc comment
              * for why the standard local-playback tuning adds needless
              * latency here, and the bug report this fixes. */
-            audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, true);
+            audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, true, false);
 
             size_t total = leftover_len + (size_t) n;
             size_t frame_count = total / FRAME_BYTES;

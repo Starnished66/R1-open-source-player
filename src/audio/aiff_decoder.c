@@ -261,6 +261,98 @@ decoder_read_result_t aiff_read_pcm_frames_s16(aiff_decoder_t * dec, uint64_t fr
     return res;
 }
 
+decoder_read_result_t aiff_read_pcm_frames_s32(aiff_decoder_t * dec, uint64_t frames_to_read, int32_t * buffer_out) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !dec->f || !buffer_out) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
+    if (dec->current_frame >= dec->total_frames) {
+        res.status = DECODER_READ_EOF;
+        return res;
+    }
+
+    unsigned int bytes_per_sample = dec->bits_per_sample / 8;
+    size_t frame_bytes = (size_t) dec->channels * bytes_per_sample;
+    if (frame_bytes == 0) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
+    uint64_t total_frames_left = dec->total_frames - dec->current_frame;
+    if (frames_to_read > total_frames_left) {
+        frames_to_read = total_frames_left;
+    }
+
+    while (res.frames < frames_to_read) {
+        uint64_t chunk = frames_to_read - res.frames;
+        if (chunk > dec->max_chunk_frames) {
+            chunk = dec->max_chunk_frames;
+        }
+
+        size_t bytes_to_read = (size_t) chunk * frame_bytes;
+        size_t bytes_read = fread(dec->raw_buffer, 1, bytes_to_read, dec->f);
+        uint64_t frames_read = bytes_read / frame_bytes;
+
+        if (frames_read == 0) {
+            if (feof(dec->f)) {
+                res.status = DECODER_READ_EOF;
+                break;
+            } else if (ferror(dec->f)) {
+                res.status = DECODER_READ_FATAL_ERROR;
+                break;
+            } else {
+                res.status = DECODER_READ_EOF;
+                break;
+            }
+        }
+
+        size_t sample_count = (size_t) frames_read * dec->channels;
+        int32_t * out_ptr = buffer_out + (size_t) res.frames * dec->channels;
+
+        for (size_t i = 0; i < sample_count; i++) {
+            const uint8_t * s = dec->raw_buffer + i * bytes_per_sample;
+            int32_t sample;
+
+            if (dec->bits_per_sample == 8) {
+                sample = (int32_t) ((int8_t) s[0]) << 8; /* AIFF 8-bit PCM is signed */
+            } else if (dec->bits_per_sample == 16) {
+                sample = dec->little_endian ? (int16_t) (s[0] | (s[1] << 8))
+                                             : (int16_t) ((s[0] << 8) | s[1]);
+            } else { /* 24-bit: sign-extended right-justified int32 directly in low 24 bits for S24_LE (no >> 8) */
+                int32_t s24 = dec->little_endian
+                    ? (int32_t) ((uint32_t) s[0] | ((uint32_t) s[1] << 8) | ((uint32_t) s[2] << 16))
+                    : (int32_t) (((uint32_t) s[0] << 16) | ((uint32_t) s[1] << 8) | (uint32_t) s[2]);
+                if (s24 & 0x800000) s24 |= (int32_t) 0xFF000000; /* sign-extend */
+                sample = s24;
+            }
+
+            out_ptr[i] = sample;
+        }
+
+        res.frames += frames_read;
+        dec->current_frame += frames_read;
+
+        if (frames_read < chunk) {
+            if (feof(dec->f)) {
+                res.status = DECODER_READ_EOF;
+            } else if (ferror(dec->f)) {
+                res.status = DECODER_READ_FATAL_ERROR;
+            }
+            break;
+        }
+    }
+
+    if (res.frames > 0) {
+        res.status = DECODER_READ_OK;
+    } else if (res.status == DECODER_READ_OK) {
+        res.status = (dec->current_frame >= dec->total_frames) ? DECODER_READ_EOF : DECODER_READ_FATAL_ERROR;
+    }
+
+    return res;
+}
+
 bool aiff_seek_to_pcm_frame(aiff_decoder_t * dec, uint64_t frame_index) {
     if (!dec || !dec->f) return false;
     if (frame_index > dec->total_frames) frame_index = dec->total_frames;

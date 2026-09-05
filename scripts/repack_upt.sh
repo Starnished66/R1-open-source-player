@@ -57,6 +57,17 @@ fi
 
 install -m 0755 "$player" "$work/root/usr/bin/open_hiby_player"
 install -m 0755 "$bootloader" "$work/root/usr/bin/open_hiby_bootloader"
+
+# Files we own that are not in stock, laid out as squashfs-root-relative
+# paths under firmware/overlay/ (e.g. usr/share/udhcpc/default.script.d/
+# ntpdate). Applied after unpack so a newer overlay wins over whatever the
+# Staging Image already has -- or doesn't. cp -a keeps mode bits and
+# relative symlinks (sync_ntp.sh).
+overlay="$(cd "$(dirname "$0")/.." && pwd)/firmware/overlay"
+if [[ -d "$overlay" ]]; then
+    cp -a "$overlay"/. "$work/root/"
+fi
+
 mksquashfs "$work/root" "$work/new-rootfs.squashfs" \
     -comp lzo -all-root -noappend -no-xattrs >/dev/null
 

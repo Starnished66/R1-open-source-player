@@ -43,6 +43,7 @@ typedef struct {
 static peq_band_t bands[PEQ_NUM_BANDS];
 static biquad_coeffs_t coeffs[PEQ_NUM_BANDS];
 static biquad_state_t state[PEQ_NUM_BANDS][PEQ_MAX_CHANNELS];
+static bool last_call_was_s32 = false;
 static bool bypass = false;
 static double preamp_db = 0.0;
 static unsigned int coeffs_sample_rate = 0;
@@ -96,6 +97,10 @@ static float limiter_gain = 1.0f; /* current linear gain reduction, 1.0 = none *
 #define LIMITER_ATTACK_SEC 0.001
 #define LIMITER_RELEASE_SEC 0.050
 #define LIMITER_CEILING 32760.0f
+/* Scaled ceiling for 24-bit range (2^23 = 8388608 full-scale).
+ * Maintains exact same headroom ratio (32760/32768 = 8386560/8388608 = 0.999755859375,
+ * i.e. 32760 * 256 = 8386560.0f). */
+#define LIMITER_CEILING_S32 8386560.0f
 
 /* attack/release coefficients only actually depend on sample_rate (the two
  * time constants above are fixed), so they're computed alongside the biquad
@@ -288,6 +293,11 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
         return;
     }
 
+    if (last_call_was_s32) {
+        memset(state, 0, sizeof(state));
+        last_call_was_s32 = false;
+    }
+
     if (coeffs_dirty || sample_rate != coeffs_sample_rate) recompute_all_coeffs(sample_rate);
 
     if (channels < 1) return;
@@ -359,6 +369,79 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
             if (sample > 32767.0f) sample = 32767.0f;
             if (sample < -32768.0f) sample = -32768.0f;
             buf[i * (size_t) channels + (size_t) ch] = (int16_t) sample;
+        }
+    }
+}
+
+void peq_process_s32(int32_t * buf, size_t frame_count, int channels, unsigned int sample_rate) {
+    if (bypass) {
+        limiter_gain = 1.0f;
+        return;
+    }
+
+    bool any_enabled = false;
+    for (int i = 0; i < PEQ_NUM_BANDS; i++) {
+        if (bands[i].enabled) { any_enabled = true; break; }
+    }
+    if (!any_enabled && preamp_db == 0.0) {
+        limiter_gain = 1.0f;
+        return;
+    }
+
+    if (!last_call_was_s32) {
+        memset(state, 0, sizeof(state));
+        last_call_was_s32 = true;
+    }
+
+    if (coeffs_dirty || sample_rate != coeffs_sample_rate) recompute_all_coeffs(sample_rate);
+
+    if (channels < 1) return;
+    if (channels > PEQ_MAX_CHANNELS) channels = PEQ_MAX_CHANNELS;
+
+    float preamp_linear = cached_preamp_linear;
+    float attack_coeff = cached_attack_coeff;
+    float release_coeff = cached_release_coeff;
+
+    for (size_t i = 0; i < frame_count; i++) {
+        float frame_samples[PEQ_MAX_CHANNELS];
+        float frame_peak = 0.0f;
+
+        for (int ch = 0; ch < channels; ch++) {
+            float sample = (float) buf[i * (size_t) channels + (size_t) ch] * preamp_linear;
+
+            for (int band = 0; band < PEQ_NUM_BANDS; band++) {
+                if (!bands[band].enabled) continue;
+
+                biquad_coeffs_t * c = &coeffs[band];
+                biquad_state_t * s = &state[band][ch];
+
+                float x0 = sample;
+                float y0 = c->b0 * x0 + c->b1 * s->x1 + c->b2 * s->x2
+                         - c->a1 * s->y1 - c->a2 * s->y2;
+
+                s->x2 = s->x1;
+                s->x1 = x0;
+                s->y2 = s->y1;
+                s->y1 = y0;
+
+                sample = y0;
+            }
+
+            if (!isfinite(sample)) sample = 0.0f;
+            frame_samples[ch] = sample;
+            float abs_sample = sample < 0.0f ? -sample : sample;
+            if (abs_sample > frame_peak) frame_peak = abs_sample;
+        }
+
+        float desired_gain = frame_peak > LIMITER_CEILING_S32 ? LIMITER_CEILING_S32 / frame_peak : 1.0f;
+        float coeff = desired_gain < limiter_gain ? attack_coeff : release_coeff;
+        limiter_gain = coeff * limiter_gain + (1.0f - coeff) * desired_gain;
+
+        for (int ch = 0; ch < channels; ch++) {
+            float sample = frame_samples[ch] * limiter_gain;
+            if (sample > 8388607.0f) sample = 8388607.0f;
+            if (sample < -8388608.0f) sample = -8388608.0f;
+            buf[i * (size_t) channels + (size_t) ch] = (int32_t) sample;
         }
     }
 }

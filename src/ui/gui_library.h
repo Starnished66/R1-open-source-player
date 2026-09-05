@@ -36,6 +36,7 @@ void poll_sd_format(void);
 void album_thumbnail_generation_poll(void);
 
 void open_add_to_playlist_for(const char * path);
+void gui_library_poll_playlists(void);
 void on_cue_file_selected(const char * cue_path);
 void show_artist_albums(const char * name, metadata_db_group_kind_t kind);
 void refresh_library_screens_after_rescan(void);

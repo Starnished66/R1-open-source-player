@@ -30,6 +30,16 @@ static uint64_t current_playback_generation = 0;
 #include "gui_notifications.h"
 #include "gui_library.h"
 #include "gui_queue.h"
+#include "playlist_files.h"
+#include "playback_order.h"
+#include "queue_resume.h"
+#ifdef HOST_BUILD
+#define MUSIC_ROOT_DIR "./music"
+#else
+#define MUSIC_ROOT_DIR "/data/mnt/sd_0"
+#endif
+#define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
+#define SUBSONIC_STREAM_CACHE_DIR "/tmp/subsonic_stream_cache"
 #include "gui_lyrics.h"
 #include "gui_track_info.h"
 #include "gui_settings.h"
@@ -2316,6 +2326,7 @@ static int shuffle_pos = -1;        /* index into shuffle_order such that shuffl
  * ensure_shuffle_order_current() -- defined earlier in this file -- also
  * needs to invalidate it on a playlist change. */
 static int * pending_shuffle_order = NULL;
+static uint64_t queue_revision = 1;
 
 
 
@@ -2388,6 +2399,11 @@ static void record_failed_physical_path(const char * path) {
 }
 
 void free_playlist(void) {
+    queue_revision++;
+    queued_pending_count = 0;
+    queue_next_insert_index = -1;
+    free(shuffle_order); shuffle_order = NULL; shuffle_order_count = 0; shuffle_pos = -1;
+    free(pending_shuffle_order); pending_shuffle_order = NULL;
     reset_decoder_failure_tracking();
     current_playback_generation = 0;
     for (int i = 0; i < playlist_count; i++) free(playlist[i]); /* free(NULL) (an unresolved lazy slot) is a safe no-op */
@@ -2442,6 +2458,7 @@ static void ensure_shuffle_order_current(void) {
 
     free(shuffle_order);
     shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
+    if (!shuffle_order) { shuffle_order_count = 0; shuffle_pos = -1; return; }
     for (int i = 0; i < playlist_count; i++) shuffle_order[i] = i;
     fisher_yates_shuffle(shuffle_order, playlist_count);
     shuffle_order_count = playlist_count;
@@ -2460,11 +2477,51 @@ static void ensure_shuffle_order_current(void) {
     if (playlist_index >= 0) {
         for (int i = 0; i < playlist_count; i++) {
             if (shuffle_order[i] == playlist_index) {
-                shuffle_pos = i;
+                int first = shuffle_order[0];
+                shuffle_order[0] = shuffle_order[i];
+                shuffle_order[i] = first;
+                shuffle_pos = 0;
                 break;
             }
         }
     }
+    /* Explicit additions must occupy the next slots in a fresh bag too. */
+    for (int n = 0; n < queued_pending_count; n++) {
+        int physical = playlist_index + 1 + n;
+        int found = 0;
+        while (found < playlist_count && shuffle_order[found] != physical) found++;
+        if (found == playlist_count) continue;
+        memmove(shuffle_order + found, shuffle_order + found + 1, (size_t) (playlist_count - found - 1) * sizeof(int));
+        if (found <= shuffle_pos) shuffle_pos--;
+        int at = shuffle_pos + 1 + n;
+        memmove(shuffle_order + at + 1, shuffle_order + at, (size_t) (playlist_count - at - 1) * sizeof(int));
+        shuffle_order[at] = physical;
+    }
+}
+
+static void queue_shuffle_insert(int physical, int added) {
+    int old_count = playlist_count - added;
+    if (shuffle_order && shuffle_order_count == old_count) {
+        int * grown = realloc(shuffle_order, (size_t) playlist_count * sizeof(int));
+        if (grown) {
+            shuffle_order = grown;
+            int at = shuffle_pos + 1 + physical - playlist_index - 1;
+            if (at < 0) at = 0;
+            if (at > old_count) at = old_count;
+            playback_order_insert(shuffle_order, old_count, physical, at, added);
+            shuffle_order_count = playlist_count;
+        } else { free(shuffle_order); shuffle_order = NULL; shuffle_order_count = 0; }
+    }
+    free(pending_shuffle_order); pending_shuffle_order = NULL;
+}
+
+static void queue_shuffle_remove(int physical) {
+    if (shuffle_order && shuffle_order_count == playlist_count) {
+        int removed = playback_order_remove(shuffle_order, playlist_count, physical);
+        if (removed <= shuffle_pos) shuffle_pos--;
+        shuffle_order_count--;
+    }
+    free(pending_shuffle_order); pending_shuffle_order = NULL;
 }
 
 
@@ -2496,6 +2553,7 @@ int compute_auto_advance_index(int index) {
             return (index + 1) % playlist_count;
         case PLAY_MODE_SHUFFLE: {
             ensure_shuffle_order_current();
+            if (!shuffle_order) return -1;
             int peek_pos = shuffle_pos + 1;
             if (peek_pos < playlist_count) return shuffle_order[peek_pos];
 
@@ -2519,6 +2577,7 @@ int compute_auto_advance_index(int index) {
              * genuinely new wrap still gets a fresh shuffle. */
             if (!pending_shuffle_order) {
                 pending_shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
+                if (!pending_shuffle_order) return -1;
                 memcpy(pending_shuffle_order, shuffle_order, sizeof(int) * (size_t) playlist_count);
                 fisher_yates_shuffle(pending_shuffle_order, playlist_count);
             }
@@ -2576,6 +2635,7 @@ void commit_auto_advance(void) {
      * untouched), so it's handled here first and returns before any of the
      * shuffle bookkeeping below. */
     if (queued_pending_count > 0) {
+        if (shuffle_order && shuffle_order_count == playlist_count) shuffle_pos++;
         queued_pending_count--;
         if (queued_pending_count == 0) queue_next_insert_index = -1;
         remote_control_sync_queue(queued_pending_count > 0 ? (const char * const *) &playlist[playlist_index + 2] : NULL,
@@ -2605,6 +2665,10 @@ void commit_auto_advance(void) {
  * this same track". Returns -1 for "no-op, already at that edge". */
 int compute_manual_step_index(int index, int direction) {
     if (index < 0 || playlist_count <= 0) return -1;
+    if (direction < 0 && queued_pending_count > 0) {
+        queued_pending_count = 0; queue_next_insert_index = -1;
+        remote_control_sync_queue(NULL, 0);
+    }
 
     /* Same queue-priority override as compute_auto_advance_index()/
      * commit_auto_advance() -- a manual Next tap should land on a queued
@@ -2614,6 +2678,7 @@ int compute_manual_step_index(int index, int direction) {
      * each behind its own edge-triggered "consume" flag) -- never a
      * speculative preview call -- so decrementing here is safe. */
     if (direction > 0 && queued_pending_count > 0 && index + 1 < playlist_count) {
+        if (shuffle_order && shuffle_order_count == playlist_count) shuffle_pos++;
         queued_pending_count--;
         if (queued_pending_count == 0) queue_next_insert_index = -1;
         remote_control_sync_queue(queued_pending_count > 0 ? (const char * const *) &playlist[index + 2] : NULL,
@@ -2623,6 +2688,7 @@ int compute_manual_step_index(int index, int direction) {
 
     if ((play_mode_t) current_settings.play_mode == PLAY_MODE_SHUFFLE) {
         ensure_shuffle_order_current();
+        if (!shuffle_order) return -1;
         int new_pos = shuffle_pos + direction;
         if (new_pos < 0) return -1; /* no history to go back past */
         if (new_pos >= playlist_count) {
@@ -2763,6 +2829,13 @@ void set_play_button_state(bool is_playing) {
  * advances on its own, or the chain of automatic transitions stops after
  * one hop. */
 void arm_next_track_for_audio(int index) {
+    queue_revision++;
+    if (current_settings.play_mode == PLAY_MODE_SHUFFLE) {
+        ensure_shuffle_order_current();
+        if (shuffle_order) {
+            for (int i = 0; i < playlist_count; i++) if (shuffle_order[i] == index) { shuffle_pos = i; break; }
+        }
+    }
     int next_index = compute_auto_advance_index(index);
     if (next_index < 0) {
         audio_set_next_track(NULL, false, 0.0, false, 0.0);
@@ -2802,65 +2875,12 @@ void arm_next_track_for_audio(int index) {
  * playing -- there's no "currently playing track" position to queue
  * after. */
 void queue_add_song(const char * path) {
-    if (playlist_index < 0 || !playlist) {
-        show_error_toast("Nothing is playing");
-        return;
-    }
-
-    int pos = (queue_next_insert_index >= 0 && queue_next_insert_index <= playlist_count) ? queue_next_insert_index
-                                                                                            : playlist_index + 1;
-
-    char * owned_path = strdup(path);
-    if (!owned_path) return;
-
-    char ** grown = realloc(playlist, sizeof(char *) * (size_t) (playlist_count + 1));
-    if (!grown) {
-        free(owned_path);
-        return;
-    }
-    playlist = grown;
-
-    if (playlist_lazy_sort_order) {
-        int * grown_order = realloc(playlist_lazy_sort_order, sizeof(int) * (size_t) (playlist_count + 1));
-        if (!grown_order) {
-            free(owned_path);
-            return; /* The grown playlist remains valid and logically unchanged. */
-        }
-        playlist_lazy_sort_order = grown_order;
-    }
-    memmove(&playlist[pos + 1], &playlist[pos], sizeof(char *) * (size_t) (playlist_count - pos));
-    playlist[pos] = owned_path;
-
-    /* Kept in lockstep so any still-unresolved lazy slot after `pos` keeps
-     * mapping to the right song once shifted -- see playlist_lazy_sort_
-     * order's own comment. playlist[pos] is already resolved/owned (just
-     * strdup'd above), so its own new slot here is never read; the value
-     * doesn't matter. */
-    if (playlist_lazy_sort_order) {
-        memmove(&playlist_lazy_sort_order[pos + 1], &playlist_lazy_sort_order[pos],
-                sizeof(int) * (size_t) (playlist_count - pos));
-        playlist_lazy_sort_order[pos] = -1;
-    }
-    playlist_count++;
-    queued_pending_count++;
-    queue_next_insert_index = pos + 1;
-
-    lv_label_set_text_fmt(song_count_label, "%d/%d", playlist_index + 1, playlist_count);
-    /* Re-arm gapless preload -- what comes right after playlist_index may
-     * have just changed (a brand new queue, or this insert landing exactly
-     * there). */
-    arm_next_track_for_audio(playlist_index);
-    remote_control_sync_queue((const char * const *) &playlist[playlist_index + 1], queued_pending_count);
-
-    show_info_toast("Added to queue");
+    if (path && path[0]) gui_player_queue_add_many(&path, 1);
 }
 
 void gui_player_queue_add_many(const char * const * paths, int count) {
+    if (audio_consume_track_advanced()) gui_player_handle_auto_advance();
     if (count <= 0) return;
-    if (playlist_index < 0 || !playlist) {
-        show_error_toast("Nothing is playing");
-        return;
-    }
     if (count > INT_MAX - playlist_count || count > INT_MAX - queued_pending_count) return;
 
     char ** copies = calloc((size_t) count, sizeof(*copies));
@@ -2874,6 +2894,24 @@ void gui_player_queue_add_many(const char * const * paths, int count) {
         }
     }
 
+    if (!gui_player_has_active_track()) {
+        free_playlist();
+        clear_player_source();
+        playlist = copies; playlist_count = count; playlist_index = 0;
+        queued_pending_count = count - 1;
+        queue_next_insert_index = count > 1 ? count : -1;
+        track_metadata_t meta;
+        apply_track_metadata_to_ui(0, &meta);
+        set_play_button_state(false);
+        deferred_resume_pending = true; deferred_resume_position = 0.0;
+        snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist[0]);
+        current_settings.last_position = 0;
+        current_settings.last_source_kind = 0;
+        current_settings.last_source_name[0] = '\0';
+        settings_save(&current_settings);
+        show_info_toast("Queue ready. Press Play to start.");
+        return;
+    }
     int pos = (queue_next_insert_index >= 0 && queue_next_insert_index <= playlist_count)
         ? queue_next_insert_index : playlist_index + 1;
     char ** grown = realloc(playlist, sizeof(*playlist) * (size_t) (playlist_count + count));
@@ -2907,6 +2945,7 @@ void gui_player_queue_add_many(const char * const * paths, int count) {
     playlist_count += count;
     queued_pending_count += count;
     queue_next_insert_index = pos + count;
+    queue_shuffle_insert(pos, count);
     lv_label_set_text_fmt(song_count_label, "%d/%d", playlist_index + 1, playlist_count);
     arm_next_track_for_audio(playlist_index);
     remote_control_sync_queue((const char * const *) &playlist[playlist_index + 1], queued_pending_count);
@@ -2919,6 +2958,7 @@ void gui_player_queue_add_many(const char * const * paths, int count) {
 void queue_remove_song_at_offset(int offset) {
     if (offset < 0 || offset >= queued_pending_count || playlist_index < 0) return;
     int pos = playlist_index + 1 + offset;
+    queue_shuffle_remove(pos);
     free(playlist[pos]);
     memmove(&playlist[pos], &playlist[pos + 1], sizeof(char *) * (size_t) (playlist_count - pos - 1));
     if (playlist_lazy_sort_order) {
@@ -3046,6 +3086,8 @@ static void play_track_at_from_internal(int index, double start_seconds, bool pu
     cancel_pending_progress_seek();
     user_seeking = false;
     progress_awaiting_seek = false;
+    deferred_resume_pending = false;
+    deferred_resume_position = 0.0;
     playlist_index = index;
 
     track_metadata_t meta;
@@ -3357,10 +3399,6 @@ void car_mode_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.car_mode_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     settings_save(&current_settings);
-    if (current_settings.car_mode_enabled) {
-        show_info_toast("Car Mode powers the device off when it loses external power, and "
-                         "automatically resumes playback once power is restored.");
-    }
 }
 
 void swipe_up_home_switch_event_cb(lv_event_t * e) {
@@ -3568,7 +3606,7 @@ void gui_player_update_progress(void) {
 }
 
 bool gui_player_has_background_work(void) {
-    return cover_decode_active;
+    return cover_decode_active || gui_player_queue_write_busy();
 }
 
 void gui_player_cancel_background_work(void) {
@@ -3643,9 +3681,110 @@ void on_file_selected_lazy_recently_added(int selected_index) {
 }
 
 static bool resume_playlist_needs_lazy_order = false;
+#ifdef HOST_BUILD
+#define QUEUE_RESUME_PATH "./open_hiby_player_queue.bin"
+#else
+#define QUEUE_RESUME_PATH "/usr/data/open_hiby_player_queue.bin"
+#endif
+static queue_resume_t restored_queue;
+static bool have_restored_queue;
+static queue_resume_t checkpoint_queue;
+static pthread_t checkpoint_thread;
+static bool checkpoint_running;
+static atomic_bool checkpoint_done;
+static uint64_t checkpoint_revision;
+static double checkpoint_position = -1;
+
+static void * queue_checkpoint_worker(void * unused) {
+    (void) unused;
+    if (!queue_resume_write(QUEUE_RESUME_PATH, &checkpoint_queue)) {
+        /* Retry on the next checkpoint; never replace a valid file on failure. */
+        checkpoint_revision = 0;
+    }
+    queue_resume_free(&checkpoint_queue);
+    atomic_store(&checkpoint_done, true);
+    return NULL;
+}
+
+bool gui_player_queue_write_busy(void) {
+    return checkpoint_running && !atomic_load(&checkpoint_done);
+}
+
+void gui_player_queue_checkpoint(void) {
+    if (checkpoint_running) {
+        if (!atomic_load(&checkpoint_done)) return;
+        pthread_join(checkpoint_thread, NULL);
+        checkpoint_running = false;
+    }
+    if (!gui_player_has_active_track()) return;
+    double position = deferred_resume_pending ? deferred_resume_position : audio_get_resume_position_seconds();
+    if (queue_revision == checkpoint_revision && fabs(position - checkpoint_position) < 1.0) return;
+    queue_resume_t s = { .count = playlist_count, .current = playlist_index, .pending = queued_pending_count,
+        .mode = current_settings.play_mode, .shuffle_pos = shuffle_pos, .position = position };
+    s.paths = calloc((size_t) s.count, sizeof(char *));
+    if (!s.paths) return;
+    bool ok = true;
+    for (int i = 0; i < s.count; i++) {
+        const char * path = playlist_path_at(i);
+        if (!path || !path[0] || remote_track_path_is_remote(path) ||
+            strncmp(path, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) == 0) { ok = false; break; }
+        s.paths[i] = strdup(path);
+        if (!s.paths[i]) { ok = false; break; }
+    }
+    if (ok && current_settings.play_mode == PLAY_MODE_SHUFFLE) {
+        ensure_shuffle_order_current();
+        s.shuffle_pos = shuffle_pos;
+        s.order = malloc((size_t) s.count * sizeof(int));
+        ok = s.order && shuffle_order;
+        if (ok) memcpy(s.order, shuffle_order, (size_t) s.count * sizeof(int));
+        if (ok && pending_shuffle_order) {
+            s.continuation = malloc((size_t) s.count * sizeof(int));
+            ok = s.continuation != NULL;
+            if (ok) memcpy(s.continuation, pending_shuffle_order, (size_t) s.count * sizeof(int));
+        }
+    }
+    if (!ok) { queue_resume_free(&s); return; }
+    checkpoint_queue = s;
+    checkpoint_revision = queue_revision; checkpoint_position = position;
+    atomic_store(&checkpoint_done, false);
+    checkpoint_running = pthread_create(&checkpoint_thread, NULL, queue_checkpoint_worker, NULL) == 0;
+    if (!checkpoint_running) { queue_resume_free(&checkpoint_queue); checkpoint_revision = 0; }
+}
+
+void gui_player_queue_flush(void) {
+    if (checkpoint_running) {
+        pthread_join(checkpoint_thread, NULL);
+        checkpoint_running = false;
+    }
+    gui_player_queue_checkpoint();
+    if (checkpoint_running) {
+        pthread_join(checkpoint_thread, NULL);
+        checkpoint_running = false;
+    }
+}
 
 bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * out_index) {
     resume_playlist_needs_lazy_order = false;
+    queue_resume_free(&restored_queue);
+    have_restored_queue = false;
+    if (queue_resume_read(QUEUE_RESUME_PATH, &restored_queue)) {
+        bool local = true;
+        for (int i = 0; i < restored_queue.count; i++) {
+            const char * path = restored_queue.paths[i];
+            if (remote_track_path_is_remote(path) || strncmp(path, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) == 0)
+                local = false;
+        }
+        if (local && strcmp(restored_queue.paths[restored_queue.current], current_settings.last_track) == 0) {
+            *out_playlist = restored_queue.paths;
+            *out_count = restored_queue.count;
+            *out_index = restored_queue.current;
+            restored_queue.paths = NULL;
+            current_settings.last_position = restored_queue.position;
+            have_restored_queue = true;
+            return true;
+        }
+        queue_resume_free(&restored_queue);
+    }
     song_row_t current;
     bool indexed = metadata_db_get_song_by_path(current_settings.last_track, &current);
 
@@ -3726,6 +3865,18 @@ bool install_saved_resume_playlist(char ** resume_playlist, int resume_count) {
     playlist = resume_playlist;
     playlist_count = resume_count;
     playlist_lazy_sort_order = new_order;
+    if (have_restored_queue) {
+        queued_pending_count = restored_queue.pending;
+        queue_next_insert_index = queued_pending_count ? restored_queue.current + 1 + queued_pending_count : -1;
+        current_settings.play_mode = restored_queue.mode;
+        shuffle_order = restored_queue.order; restored_queue.order = NULL;
+        pending_shuffle_order = restored_queue.continuation; restored_queue.continuation = NULL;
+        shuffle_order_count = shuffle_order ? resume_count : 0;
+        shuffle_pos = restored_queue.shuffle_pos;
+        remote_control_sync_queue(queued_pending_count ? (const char * const *) &playlist[restored_queue.current + 1] : NULL, queued_pending_count);
+        queue_resume_free(&restored_queue);
+        have_restored_queue = false;
+    }
     return true;
 }
 
@@ -3782,6 +3933,134 @@ void gui_player_queue_remove_at(int offset) {
 
 void gui_player_queue_clear(void) {
     queue_clear_pending();
+}
+
+uint64_t gui_player_queue_revision(void) { return queue_revision; }
+
+bool gui_player_queue_snapshot(int ** order, int * count, int * current, uint64_t * revision) {
+    *order = NULL; *count = playlist_count; *current = playlist_index; *revision = queue_revision;
+    if (!playlist_count) return true;
+    int * result = malloc((size_t) playlist_count * sizeof(int));
+    if (!result) return false;
+    if (current_settings.play_mode == PLAY_MODE_SHUFFLE) {
+        ensure_shuffle_order_current();
+        if (!shuffle_order) { free(result); return false; }
+        memcpy(result, shuffle_order, (size_t) playlist_count * sizeof(int));
+        *current = shuffle_pos;
+    } else for (int i = 0; i < playlist_count; i++) result[i] = i;
+    *order = result;
+    return true;
+}
+
+/* Materialize a displayed cycle before editing. The audio owns its decoder;
+ * rearranging path slots does not restart the current track. */
+static bool queue_materialize_order(void) {
+    int * order = NULL, count, current;
+    uint64_t revision;
+    if (!gui_player_queue_snapshot(&order, &count, &current, &revision)) return false;
+    if (!count) { free(order); return true; }
+    char ** paths = calloc((size_t) count, sizeof(*paths));
+    if (!paths) { free(order); return false; }
+    for (int i = 0; i < count; i++) {
+        const char * path = playlist_path_at(order[i]);
+        if (!path || !path[0]) { free(paths); free(order); return false; }
+        paths[i] = playlist[order[i]];
+    }
+    free(playlist); playlist = paths;
+    free(playlist_lazy_sort_order); playlist_lazy_sort_order = NULL;
+    playlist_index = current;
+    if (shuffle_order && shuffle_order_count == count) {
+        for (int i = 0; i < count; i++) shuffle_order[i] = i;
+        shuffle_pos = current;
+    }
+    free(pending_shuffle_order); pending_shuffle_order = NULL;
+    queue_next_insert_index = queued_pending_count ? current + 1 + queued_pending_count : -1;
+    free(order);
+    return true;
+}
+
+bool gui_player_queue_edit(uint64_t revision, int from, int to) {
+    if (audio_consume_track_advanced()) gui_player_handle_auto_advance();
+    if (revision != queue_revision) return false;
+    int * order = NULL, count, current;
+    uint64_t actual;
+    if (!gui_player_queue_snapshot(&order, &count, &current, &actual)) return false;
+    free(order);
+    if (from <= current || from >= count || (to >= 0 && (to <= current || to >= count))) return false;
+    if (!queue_materialize_order()) return false;
+    char * path = playlist[from];
+    int pending_end = playlist_index + queued_pending_count;
+    if (to < 0) {
+        queue_shuffle_remove(from);
+        memmove(playlist + from, playlist + from + 1, (size_t) (playlist_count - from - 1) * sizeof(*playlist));
+        free(path); playlist_count--;
+        if (from <= pending_end) queued_pending_count--;
+    } else {
+        if (from < to) memmove(playlist + from, playlist + from + 1, (size_t) (to - from) * sizeof(*playlist));
+        else memmove(playlist + to + 1, playlist + to, (size_t) (from - to) * sizeof(*playlist));
+        playlist[to] = path;
+        /* Crossing the priority boundary explicitly schedules that prefix. */
+        if (from <= pending_end && to > pending_end) queued_pending_count = to - playlist_index;
+        else if (from > pending_end && to <= pending_end) queued_pending_count++;
+    }
+    queue_next_insert_index = queued_pending_count ? playlist_index + 1 + queued_pending_count : -1;
+    arm_next_track_for_audio(playlist_index);
+    remote_control_sync_queue(queued_pending_count ? (const char * const *) &playlist[playlist_index + 1] : NULL, queued_pending_count);
+    return true;
+}
+
+bool gui_player_queue_select(uint64_t revision, int index) {
+    if (audio_consume_track_advanced()) gui_player_handle_auto_advance();
+    if (revision != queue_revision || index < 0 || index >= playlist_count) return false;
+    if (!queue_materialize_order()) return false;
+    if (index > playlist_index && index <= playlist_index + queued_pending_count)
+        queued_pending_count -= index - playlist_index;
+    else if (index != playlist_index) queued_pending_count = 0;
+    queue_next_insert_index = queued_pending_count ? index + 1 + queued_pending_count : -1;
+    if (shuffle_order) shuffle_pos = index;
+    remote_control_sync_queue(queued_pending_count ? (const char * const *) &playlist[index + 1] : NULL, queued_pending_count);
+    play_track_at(index);
+    return true;
+}
+
+void gui_player_queue_clear_upcoming(void) {
+    if (audio_consume_track_advanced()) gui_player_handle_auto_advance();
+    if (!gui_player_has_active_track() || !queue_materialize_order()) return;
+    for (int i = playlist_index + 1; i < playlist_count; i++) free(playlist[i]);
+    playlist_count = playlist_index + 1;
+    if (shuffle_order) shuffle_order_count = playlist_count;
+    queued_pending_count = 0; queue_next_insert_index = -1;
+    remote_control_sync_queue(NULL, 0);
+    arm_next_track_for_audio(playlist_index);
+}
+
+void gui_player_queue_play_next(const char * path) {
+    if (audio_consume_track_advanced()) gui_player_handle_auto_advance();
+    int old_count = playlist_count;
+    int old_insert = queue_next_insert_index;
+    queue_next_insert_index = playlist_index + 1;
+    queue_add_song(path);
+    if (playlist_count == old_count) queue_next_insert_index = old_insert;
+    else queue_next_insert_index = playlist_index + 1 + queued_pending_count;
+}
+
+bool gui_player_queue_save_as(const char * name) {
+    int * order = NULL, count, current;
+    uint64_t revision;
+    if (!gui_player_queue_snapshot(&order, &count, &current, &revision)) return false;
+    const char ** paths = calloc((size_t) (count ? count : 1), sizeof(*paths));
+    if (!paths) { free(order); return false; }
+    bool ok = true;
+    for (int i = 0; i < count; i++) {
+        paths[i] = playlist_path_at(order[i]);
+        if (!paths[i] || !paths[i][0] || remote_track_path_is_remote(paths[i]) ||
+            strncmp(paths[i], SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) == 0) ok = false;
+    }
+    char created[PATH_MAX];
+    if (ok) ok = playlist_files_write_new(PLAYLISTS_DIR, name, paths, count, created, sizeof(created));
+    if (ok) metadata_db_playlist_insert_one(created);
+    free(paths); free(order);
+    return ok;
 }
 
 void gui_player_play_at(int index) {

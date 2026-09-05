@@ -3303,6 +3303,12 @@ static void dlna_tile_cb(lv_event_t * e) {
 void gui_network_handle_wifi_disabled(void) {
     bool settings_changed = false;
 
+    /* Subsonic requests are ordinary background sockets, not persistent
+     * services with a settings toggle. Interrupt them before tearing down
+     * the rest of the Wi-Fi-owned features so their active flags cannot
+     * veto idle suspend after the radio is already off. */
+    gui_subsonic_handle_wifi_disabled();
+
     if (current_settings.wifi_dac_mode_enabled) {
         airplay_control_stop();
         current_settings.wifi_dac_mode_enabled = false;

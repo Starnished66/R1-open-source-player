@@ -564,6 +564,12 @@ static inline int16_t clip_int16(int32_t v) {
     return (int16_t) v;
 }
 
+static inline int32_t clip_int24(int32_t v) {
+    if (v < -8388608) return -8388608;
+    if (v > 8388607) return 8388607;
+    return v;
+}
+
 static void do_apply_filter(ape_decoder_t * ctx, APEFilter * f, int32_t * data, int count, int order, int fracbits) {
     (void) ctx;
     int res;
@@ -830,6 +836,57 @@ decoder_read_result_t ape_read_pcm_frames_s16(ape_decoder_t * dec, uint64_t fram
             for (int ch = 0; ch < dec->channels; ch++) {
                 int32_t v = dec->decoded[ch][src_pos];
                 buffer_out[(res.frames + i) * (uint64_t) dec->channels + (uint64_t) ch] = clip_int16(v >> shift);
+            }
+        }
+
+        dec->carry_read_pos += (uint32_t) to_copy;
+        res.frames += to_copy;
+        dec->current_pcm_frame += to_copy;
+    }
+
+    return res;
+}
+
+decoder_read_result_t ape_read_pcm_frames_s32(ape_decoder_t * dec, uint64_t frames_to_read, int32_t * buffer_out) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !buffer_out) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
+    while (res.frames < frames_to_read) {
+        if (dec->carry_read_pos >= dec->carry_frames) {
+            uint32_t next_frame = dec->current_frame_index + 1;
+            if (next_frame >= ape_demux_get_frame_count(dec->demux)) {
+                if (res.frames == 0) res.status = DECODER_READ_EOF;
+                break;
+            }
+            if (!decode_physical_frame(dec, next_frame)) {
+                dec->consecutive_errors++;
+                dec->current_frame_index = next_frame;
+                dec->carry_frames = 0;
+                dec->carry_read_pos = 0;
+                if (dec->consecutive_errors >= APE_MAX_CONSECUTIVE_ERRORS) {
+                    if (res.frames == 0) res.status = DECODER_READ_FATAL_ERROR;
+                    break;
+                }
+                if (res.frames == 0) res.status = DECODER_READ_RECOVERABLE_ERROR;
+                break;
+            }
+            dec->consecutive_errors = 0;
+        }
+
+        uint64_t available = dec->carry_frames - dec->carry_read_pos;
+        uint64_t to_copy = frames_to_read - res.frames;
+        if (to_copy > available) to_copy = available;
+
+        for (uint64_t i = 0; i < to_copy; i++) {
+            uint32_t src_pos = dec->carry_read_pos + (uint32_t) i;
+            for (int ch = 0; ch < dec->channels; ch++) {
+                int32_t v = dec->decoded[ch][src_pos];
+                /* APE 24-bit decoded samples are already right-justified in dec->decoded.
+                 * Write directly to buffer_out without shifting. */
+                buffer_out[(res.frames + i) * (uint64_t) dec->channels + (uint64_t) ch] = clip_int24(v);
             }
         }
 

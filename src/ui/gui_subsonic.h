@@ -39,4 +39,5 @@ void poll_subsonic_connect(void);
 void poll_subsonic_browse(void);
 
 bool gui_subsonic_has_background_work(void);
+void gui_subsonic_handle_wifi_disabled(void);
 void gui_subsonic_cancel_background_work(void);

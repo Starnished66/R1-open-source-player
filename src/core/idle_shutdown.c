@@ -7,6 +7,8 @@
 
 void idle_shutdown_now(void) {
 #ifndef HOST_BUILD
+    extern void gui_player_queue_flush(void);
+    gui_player_queue_flush();
     /* Must not go through subprocess_run(): that helper waits 15s then
      * SIGKILLs the child. /sbin/poweroff (busybox, talks to init or waits
      * on other processes) routinely outlives that budget, so the 3-2-1

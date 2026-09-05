@@ -3388,11 +3388,17 @@ static int l_plugin_has_capability(lua_State * L) {
  *   http(s):// stream today (decoder_open()'s is_stream_url() branch --
  *   MP3 default, FLAC via the "#.flac" hint, AAC via "#.aac"/"#.aacp" or
  *   an "audio/aac" Content-Type, ADTS framing via aac_open_stream()).
- * - max_bit_depth is 16, not an assumption: every output path (internal
- *   ALSA in audio_output.c's open_device(), the USB-DAC aplay spawn, and
- *   the Bluetooth aplay spawn) hardcodes PCM_FORMAT_S16_LE / "-f S16_LE"
- *   with no exception -- whatever bit depth a source decodes to, this is
- *   what actually reaches the DAC.
+ * - max_bit_depth is 16 for what this function actually describes: a
+ *   plugin-provided REMOTE stream (see decoder_open()'s is_stream_url()
+ *   branch this whole comment block is about). audio.c's can_use_wide_path()
+ *   explicitly excludes any decoder with a net_stream set, so a plugin's
+ *   direct http(s):// stream stays on the s16 decode/output path regardless
+ *   of what the source claims -- this is still an accurate, verified fact,
+ *   not a stale one. It is NOT true of local file playback any more: local
+ *   FLAC/WAV/ALAC/APE/AIFF sources above 16-bit now reach the DAC at
+ *   PCM_FORMAT_S24_LE (audio_output.c's open_device()) when hw_params
+ *   negotiation for it succeeds. The USB-DAC and Bluetooth aplay spawns are
+ *   still unconditionally "-f S16_LE" with no exception, same as before.
  * - max_channels is 2: nothing in this pipeline remaps or mixes channel
  *   counts; every path above passes `channels` straight through with no
  *   multichannel-aware code found anywhere in the codebase.

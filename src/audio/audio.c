@@ -876,6 +876,15 @@ static audio_codec_t public_codec_for_decoder(decoder_type_t type) {
 }
 
 #ifndef HOST_BUILD
+/* Wide-path scratch buffers, allocated once in audio_thread_func(). The
+ * primary buffer is sufficient for ordinary S24 playback; the other two are
+ * optional and needed only when two wide tracks are crossfaded. Keeping those
+ * availability checks separate prevents a failed optional allocation from
+ * disabling otherwise-valid 24-bit playback. */
+static int32_t * buf_cur_s32 = NULL;
+static int32_t * buf_next_s32 = NULL;
+static int32_t * buf_out_s32 = NULL;
+
 static bool can_use_wide_path(const decoder_t * dec) {
     if (!dec) return false;
     if (dec->net_stream != NULL) return false;
@@ -886,7 +895,13 @@ static bool can_use_wide_path(const decoder_t * dec) {
         dec->type != DECODER_APE &&
         dec->type != DECODER_AIFF) return false;
     if (!audio_output_is_local_requested()) return false;
+    if (!buf_cur_s32) return false;
     return true;
+}
+
+static bool can_use_wide_crossfade(const decoder_t * cur, const decoder_t * next) {
+    return can_use_wide_path(cur) && can_use_wide_path(next) &&
+           buf_next_s32 != NULL && buf_out_s32 != NULL;
 }
 #endif
 
@@ -1320,19 +1335,34 @@ static void close_decoder_if_open(decoder_t * dec, bool * is_open) {
  * this chunk's first frame falls, so the fade is continuous across chunk
  * boundaries rather than stepped.
  *
- * Deliberately int16_t only, never widened to int32_t/S24_LE -- this always
- * blends two DIFFERENT decoders' output, so "native bit depth" doesn't have
- * a single meaning here even when both sides are 24-bit sources. Known,
- * accepted cost of that scope decision: entering and leaving a blend window
- * forces the ALSA device to close+reopen if either side of the transition
- * was using the S24_LE wide path (see can_use_wide_path()'s per-chunk use
- * a few lines below) -- a real device format change requires a reopen, so
- * a track boundary that crosses a 16-bit/24-bit distinction while
- * crossfading is not perfectly seamless (a brief gap, not corruption or a
- * failure -- audio_output_ensure()'s reopen is a normal, successful path).
- * Making crossfade itself wide-capable would remove this, but is a real
- * scope increase (a parallel int32_t mix_crossfade_s32(), matching decode/
- * gain/PEQ treatment) rather than a bug fix -- not done here. */
+ * int16_t only. Originally this meant EVERY crossfade forced an ALSA
+ * close+reopen if either side was on the S24_LE wide path -- even a
+ * 24-bit-to-24-bit pair, since `is_blending` forced use_wide=false
+ * unconditionally regardless of either side's actual eligibility. Confirmed
+ * on real hardware (2026-09-04) that the resulting gap does NOT land at a
+ * clean boundary between the two tracks: the blend window mixes both
+ * tracks together for its full CROSSFADE_SECONDS span (fade_next ramps
+ * 0->1 across the whole window), so the incoming track's opening is
+ * already superimposed with the outgoing track's tail from the very start
+ * of blending -- a reopen glitch anywhere in that window audibly affects
+ * BOTH sides at once, not just a blip at the boundary.
+ *
+ * Fixed for the case that can actually be fixed: `is_blending` a few lines
+ * below now allows use_wide=true during a blend when BOTH cur_dec and
+ * nxt_dec are themselves S24_LE-eligible, and the actual branch decision
+ * (see mix_crossfade_s32() below and its own caller) blends in the wide
+ * (int32_t) domain instead, entirely avoiding the reopen for a same-depth
+ * pair -- confirmed seamless on real hardware.
+ *
+ * MIXED-DEPTH pairs (one side wide-eligible, the other not -- e.g. a 24-bit
+ * FLAC crossfading into a 16-bit MP3) still pay this cost, unavoidably:
+ * this function stays int16_t-only, so any crossfade involving a source
+ * that isn't itself S24_LE-eligible always uses this narrow path, with the
+ * same forced S16 reopen as before. What no longer forces the reopen is
+ * the case BOTH sides qualify -- see mix_crossfade_s32() below and its own
+ * caller in audio_thread_func() (gated on can_use_wide_path() for both
+ * cur_dec and nxt_dec, plus audio_output_is_s24_active() as the ground
+ * truth, same reasoning as the plain-playback wide-path branch). */
 static void mix_crossfade(const int16_t * buf_cur, const int16_t * buf_next, int16_t * buf_out,
                            uint64_t n, unsigned int channels, uint64_t fade_start_frame, uint64_t crossfade_frames) {
     for (uint64_t k = 0; k < n; k++) {
@@ -1349,6 +1379,29 @@ static void mix_crossfade(const int16_t * buf_cur, const int16_t * buf_next, int
         }
     }
 }
+
+#ifndef HOST_BUILD
+/* Same as mix_crossfade() but for the S24_LE wide path's int32_t buffers
+ * (right-justified 24-in-32). Only ever called when BOTH cur_dec and
+ * nxt_dec have already been confirmed S24_LE-eligible -- see this
+ * function's own caller. */
+static void mix_crossfade_s32(const int32_t * buf_cur, const int32_t * buf_next, int32_t * buf_out,
+                              uint64_t n, unsigned int channels, uint64_t fade_start_frame, uint64_t crossfade_frames) {
+    for (uint64_t k = 0; k < n; k++) {
+        float fade_next = (float) (fade_start_frame + k) / (float) crossfade_frames;
+        if (fade_next > 1.0f) fade_next = 1.0f;
+        if (fade_next < 0.0f) fade_next = 0.0f;
+        float fade_cur = 1.0f - fade_next;
+        for (unsigned int ch = 0; ch < channels; ch++) {
+            size_t idx = (size_t) k * channels + ch;
+            float mixed = (float) buf_cur[idx] * fade_cur + (float) buf_next[idx] * fade_next;
+            if (mixed > 8388607.0f) mixed = 8388607.0f;
+            if (mixed < -8388608.0f) mixed = -8388608.0f;
+            buf_out[idx] = (int32_t) mixed;
+        }
+    }
+}
+#endif
 
 static void * audio_thread_func(void * arg) {
     (void) arg;
@@ -1371,7 +1424,15 @@ static void * audio_thread_func(void * arg) {
     int16_t * buf_next = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
     int16_t * buf_out = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
 #ifndef HOST_BUILD
-    int32_t * buf_cur_s32 = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int32_t));
+    /* File-scope statics so the eligibility gates can verify allocation.
+     * A missing primary buffer disables all wide playback; missing optional
+     * blend buffers disable only wide crossfade. */
+    buf_cur_s32 = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int32_t));
+    /* Only used for a wide (both-sides-S24_LE) crossfade blend -- see
+     * mix_crossfade_s32()'s own caller below. Idle the rest of the time,
+     * same as buf_cur_s32 is idle outside the plain wide-playback path. */
+    buf_next_s32 = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int32_t));
+    buf_out_s32 = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int32_t));
 #endif
 
 #ifndef HOST_BUILD
@@ -1677,7 +1738,14 @@ static void * audio_thread_func(void * arg) {
              * next iteration tries again. */
             if (!hold_for_mp3_seek) {
                 bool is_blending = (xfade_on && staged_next_path != NULL && nxt_open && nxt_format_matches);
-                bool use_wide = !is_blending && can_use_wide_path(&cur_dec);
+                /* A blend window no longer unconditionally forces S16_LE: if
+                 * BOTH sides of the crossfade are themselves S24_LE-eligible,
+                 * request S24_LE here too, so entering/leaving the blend
+                 * window doesn't force an avoidable close+reopen (see
+                 * mix_crossfade_s32()'s own comment on why this doesn't help
+                 * a mixed-depth pair, only a same-depth-24-bit one). */
+                bool blend_can_be_wide = is_blending && can_use_wide_crossfade(&cur_dec, &nxt_dec);
+                bool use_wide = blend_can_be_wide || (!is_blending && can_use_wide_path(&cur_dec));
                 ensure_device_format(cur_dec.channels, cur_dec.sample_rate, use_wide);
                 /* use_wide is only the REQUEST; audio_output_is_s24_active() (checked
                  * right after ensure_device_format() actually ran) is the ground truth
@@ -1857,6 +1925,250 @@ static void * audio_thread_func(void * arg) {
             if (in_blend_window && nxt_open && nxt_format_matches) {
                 unsigned int channels = cur_dec.channels;
                 uint64_t want = (frames_remaining < chunk_frames) ? frames_remaining : chunk_frames;
+
+#ifndef HOST_BUILD
+                if (can_use_wide_crossfade(&cur_dec, &nxt_dec) && audio_output_is_s24_active()) {
+                    /* Both sides of this crossfade qualify for S24_LE and the
+                     * device is confirmed actually open at S24_LE right now --
+                     * blend in the wide (int32_t) domain instead of forcing the
+                     * S16_LE reopen every crossfade used to pay unconditionally
+                     * (see mix_crossfade()'s own comment for the mixed-depth
+                     * case, which still can't avoid it). Exact mirror of the
+                     * narrow branch below, just s32-typed -- keep both in sync
+                     * if the narrow branch's error handling ever changes. */
+                    decoder_read_result_t r_cur = decoder_read_s32(&cur_dec, want, buf_cur_s32);
+                    uint64_t n_cur = r_cur.frames;
+
+                    if (r_cur.status == DECODER_READ_FATAL_ERROR) {
+                        DBG_LOG("audio: crossfade fatal decode error (%s)\n", safe_path_tail(cur_path_local));
+                        close_decoder_if_open(&nxt_dec, &nxt_open);
+                        nxt_format_matches = false;
+                        pthread_mutex_lock(&audio_mutex);
+                        last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                        last_playback_error_generation = cur_generation;
+                        have_current = false;
+                        clear_current_format_locked();
+                        paused = false;
+                        pthread_mutex_unlock(&audio_mutex);
+                        should_restart = false;
+                        was_stopped = false;
+                        ended_with_no_next = false;
+                        goto inner_loop_done;
+                    }
+
+                    /* Unlike the plain-playback path, this was previously left
+                     * unhandled: a recoverable error returns n_cur==0 with a
+                     * status that is neither FATAL nor EOF, so it fell through
+                     * every check below (including the n_cur>0 gate) straight
+                     * to "blend window finished -- promote next to current",
+                     * treating a transient, retriable decode hiccup as if
+                     * cur_dec had legitimately reached the end of the track --
+                     * cutting off up to the rest of the crossfade window
+                     * (CROSSFADE_SECONDS, currently 3s) of real audio. Mirrors
+                     * the plain-playback path's own consecutive_decoder_errors
+                     * escalation exactly. */
+                    if (r_cur.status == DECODER_READ_RECOVERABLE_ERROR) {
+                        consecutive_decoder_errors++;
+                        DBG_LOG("audio: crossfade recoverable decode error #%u (%s)\n",
+                                consecutive_decoder_errors, safe_path_tail(cur_path_local));
+                        if (consecutive_decoder_errors >= 10) {
+                            DBG_LOG("audio: crossfade consecutive recoverable errors exceeded limit (%s)\n",
+                                    safe_path_tail(cur_path_local));
+                            close_decoder_if_open(&nxt_dec, &nxt_open);
+                            nxt_format_matches = false;
+                            pthread_mutex_lock(&audio_mutex);
+                            last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                            last_playback_error_generation = cur_generation;
+                            have_current = false;
+                            clear_current_format_locked();
+                            paused = false;
+                            pthread_mutex_unlock(&audio_mutex);
+                            should_restart = false;
+                            was_stopped = false;
+                            ended_with_no_next = false;
+                            goto inner_loop_done;
+                        }
+                        continue;
+                    } else if (r_cur.status == DECODER_READ_OK) {
+                        consecutive_decoder_errors = 0;
+                    }
+
+                    if (n_cur == 0 && frames_remaining > 0 && r_cur.status == DECODER_READ_EOF) {
+                        bool is_stream = (cur_dec.net_stream != NULL);
+                        if (is_premature_eof(cur_frames_played_local, cur_dec.total_frames, is_stream)) {
+                            bool recovered = false;
+                            for (int dr = 0; dr < 3; dr++) {
+                                pthread_mutex_lock(&audio_mutex);
+                                bool abort = stop_requested || restart_requested;
+                                pthread_mutex_unlock(&audio_mutex);
+                                if (abort) break;
+
+                                DBG_LOG("audio: crossfade premature EOF at frame %" PRIu64 "/%" PRIu64
+                                        ", reopen attempt %d (%s)\n",
+                                        cur_frames_played_local, cur_dec.total_frames, dr + 1,
+                                        safe_path_tail(cur_path_local));
+                                usleep(50000);
+
+                                if (!reopen_decoder_at(&cur_dec, cur_path_local, cur_frames_played_local)) {
+                                    DBG_LOG("audio: crossfade decoder reopen failed on attempt %d\n", dr + 1);
+                                    cur_open = false;
+                                    continue;
+                                }
+                                cur_open = true;
+                                r_cur = decoder_read_s32(&cur_dec, want, buf_cur_s32);
+                                n_cur = r_cur.frames;
+                                if (n_cur > 0) { recovered = true; break; }
+                            }
+                            if (!recovered) {
+                                DBG_LOG("audio: crossfade decoder recovery exhausted (%s)\n",
+                                        safe_path_tail(cur_path_local));
+                                close_decoder_if_open(&nxt_dec, &nxt_open);
+                                nxt_format_matches = false;
+                                pthread_mutex_lock(&audio_mutex);
+                                last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                                last_playback_error_generation = cur_generation;
+                                have_current = false;
+                                clear_current_format_locked();
+                                paused = false;
+                                pthread_mutex_unlock(&audio_mutex);
+                                should_restart = false;
+                                was_stopped = false;
+                                ended_with_no_next = false;
+                                goto inner_loop_done;
+                            }
+                        }
+                    }
+
+                    if (n_cur > 0) {
+                        decoder_read_result_t r_next = decoder_read_s32(&nxt_dec, n_cur, buf_next_s32);
+                        bool nxt_failed = false;
+
+                        if (r_next.status == DECODER_READ_FATAL_ERROR || (r_next.status == DECODER_READ_EOF && r_next.frames == 0)) {
+                            nxt_failed = true;
+                        } else if (r_next.status == DECODER_READ_RECOVERABLE_ERROR) {
+                            consecutive_nxt_decoder_errors++;
+                            DBG_LOG("audio: next track recoverable decode error (%u/10) (%s)\n",
+                                    consecutive_nxt_decoder_errors, safe_path_tail(staged_next_path));
+                            if (consecutive_nxt_decoder_errors >= 10) {
+                                DBG_LOG("audio: next track consecutive recoverable errors exceeded limit, cancelling blend (%s)\n",
+                                        safe_path_tail(staged_next_path));
+                                nxt_failed = true;
+                            }
+                        } else if (r_next.status == DECODER_READ_OK) {
+                            consecutive_nxt_decoder_errors = 0;
+                        }
+
+                        if (nxt_failed) {
+                            DBG_LOG("audio: next track crossfade decode failed (status=%d), cancelling crossfade (%s)\n",
+                                    (int) r_next.status, safe_path_tail(staged_next_path));
+                            close_decoder_if_open(&nxt_dec, &nxt_open);
+                            nxt_format_matches = false;
+                            consecutive_nxt_decoder_errors = 0;
+
+                            /* IMPORTANT: Do NOT discard buf_cur_s32! Output the decoded frames of
+                             * cur_dec as unblended audio and advance cur_frames_played_local to
+                             * prevent skips and maintain accurate timeline sync. buf_cur (s16) is
+                             * idle in this wide branch -- reused as write_device_with_retry_s32()'s
+                             * narrow-fallback scratch buffer, see that function's own comment. */
+                            apply_gain_s32(buf_cur_s32, (size_t) n_cur * channels, cur_replaygain_linear);
+                            peq_process_s32(buf_cur_s32, (size_t) n_cur, (int) channels, cur_dec.sample_rate);
+                            apply_gain_s32(buf_cur_s32, (size_t) n_cur * channels, vol);
+
+                            if (need_fade_in) {
+                                uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+                                uint64_t in_frames = (n_cur < rf) ? n_cur : rf;
+                                apply_ramp_s32(buf_cur_s32, in_frames, channels, 0.0f, 1.0f);
+                                need_fade_in = false;
+                            }
+
+                            uint64_t delivered = 0;
+                            write_result_t wr = write_device_with_retry_s32(buf_cur_s32, n_cur, channels,
+                                                                             cur_dec.sample_rate, cur_path_local,
+                                                                             buf_cur, &delivered);
+                            cur_frames_played_local += delivered;
+                            frames_remaining -= (delivered < frames_remaining) ? delivered : frames_remaining;
+                            pthread_mutex_lock(&audio_mutex);
+                            frames_played = cur_frames_played_local;
+                            pthread_mutex_unlock(&audio_mutex);
+
+                            if (wr == WRITE_RESULT_ABORTED) {
+                                continue;
+                            } else if (wr == WRITE_RESULT_FAILED) {
+                                DBG_LOG("audio: crossfade fallback output failure (%s)\n", safe_path_tail(cur_path_local));
+                                pthread_mutex_lock(&audio_mutex);
+                                last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                                last_playback_error_generation = cur_generation;
+                                have_current = false;
+                                clear_current_format_locked();
+                                paused = false;
+                                pthread_mutex_unlock(&audio_mutex);
+                                should_restart = false;
+                                was_stopped = false;
+                                ended_with_no_next = false;
+                                goto inner_loop_done;
+                            }
+                            continue;
+                        }
+
+                        uint64_t n_next = r_next.frames;
+                        nxt_frames_consumed += n_next;
+                        if (n_next < n_cur) {
+                            memset(buf_next_s32 + (size_t) n_next * channels, 0, (size_t) (n_cur - n_next) * channels * sizeof(int32_t));
+                        }
+
+                        apply_gain_s32(buf_cur_s32, (size_t) n_cur * channels, cur_replaygain_linear);
+                        apply_gain_s32(buf_next_s32, (size_t) n_cur * channels, nxt_replaygain_linear_local);
+
+                        uint64_t fade_start_frame = crossfade_frames - frames_remaining;
+                        mix_crossfade_s32(buf_cur_s32, buf_next_s32, buf_out_s32, n_cur, channels, fade_start_frame, crossfade_frames);
+
+                        peq_process_s32(buf_out_s32, (size_t) n_cur, (int) channels, cur_dec.sample_rate);
+                        apply_gain_s32(buf_out_s32, (size_t) n_cur * channels, vol);
+
+                        if (need_fade_in) {
+                            uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+                            uint64_t in_frames = (n_cur < rf) ? n_cur : rf;
+                            apply_ramp_s32(buf_out_s32, in_frames, channels, 0.0f, 1.0f);
+                            need_fade_in = false;
+                        }
+
+                        uint64_t delivered = 0;
+                        write_result_t wr = write_device_with_retry_s32(buf_out_s32, n_cur, channels,
+                                                                         cur_dec.sample_rate, cur_path_local,
+                                                                         buf_out, &delivered);
+                        cur_frames_played_local += delivered;
+                        frames_remaining -= (delivered < frames_remaining) ? delivered : frames_remaining;
+                        pthread_mutex_lock(&audio_mutex);
+                        frames_played = cur_frames_played_local;
+                        pthread_mutex_unlock(&audio_mutex);
+
+                        if (wr == WRITE_RESULT_ABORTED) {
+                            continue;
+                        } else if (wr == WRITE_RESULT_FAILED) {
+                            DBG_LOG("audio: crossfade output failure, abandoning blend (%s)\n",
+                                    safe_path_tail(cur_path_local));
+                            close_decoder_if_open(&nxt_dec, &nxt_open);
+                            nxt_format_matches = false;
+                            pthread_mutex_lock(&audio_mutex);
+                            last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                            last_playback_error_generation = cur_generation;
+                            have_current = false;
+                            clear_current_format_locked();
+                            paused = false;
+                            pthread_mutex_unlock(&audio_mutex);
+                            should_restart = false;
+                            was_stopped = false;
+                            ended_with_no_next = false;
+                            goto inner_loop_done;
+                        }
+
+                        if (frames_remaining > 0) {
+                            continue; /* more of cur left in the window, keep blending */
+                        }
+                    }
+                } else
+#endif
+                {
                 decoder_read_result_t r_cur = decoder_read_s16(&cur_dec, want, buf_cur);
                 uint64_t n_cur = r_cur.frames;
 
@@ -1875,6 +2187,37 @@ static void * audio_thread_func(void * arg) {
                     was_stopped = false;
                     ended_with_no_next = false;
                     goto inner_loop_done;
+                }
+
+                /* See the wide (S32) branch's identical comment above --
+                 * this recoverable-error handling was missing from this
+                 * narrow branch too (present in the plain-playback path,
+                 * absent here), letting a transient decode hiccup fall
+                 * through as if cur_dec had reached a legitimate EOF. */
+                if (r_cur.status == DECODER_READ_RECOVERABLE_ERROR) {
+                    consecutive_decoder_errors++;
+                    DBG_LOG("audio: crossfade recoverable decode error #%u (%s)\n",
+                            consecutive_decoder_errors, safe_path_tail(cur_path_local));
+                    if (consecutive_decoder_errors >= 10) {
+                        DBG_LOG("audio: crossfade consecutive recoverable errors exceeded limit (%s)\n",
+                                safe_path_tail(cur_path_local));
+                        close_decoder_if_open(&nxt_dec, &nxt_open);
+                        nxt_format_matches = false;
+                        pthread_mutex_lock(&audio_mutex);
+                        last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                        last_playback_error_generation = cur_generation;
+                        have_current = false;
+                        clear_current_format_locked();
+                        paused = false;
+                        pthread_mutex_unlock(&audio_mutex);
+                        should_restart = false;
+                        was_stopped = false;
+                        ended_with_no_next = false;
+                        goto inner_loop_done;
+                    }
+                    continue;
+                } else if (r_cur.status == DECODER_READ_OK) {
+                    consecutive_decoder_errors = 0;
                 }
 
                 if (n_cur == 0 && frames_remaining > 0 && r_cur.status == DECODER_READ_EOF) {
@@ -2066,6 +2409,7 @@ static void * audio_thread_func(void * arg) {
                         continue; /* more of cur left in the window, keep blending */
                     }
                 }
+                } /* end narrow (S16) crossfade branch */
 
                 /* Blend window finished (cur fully consumed) -- promote next to current.
                  * Verify the snapshot's generation still matches what was armed --
@@ -2571,6 +2915,8 @@ static void * audio_thread_func(void * arg) {
     free(buf_out);
 #ifndef HOST_BUILD
     free(buf_cur_s32);
+    free(buf_next_s32);
+    free(buf_out_s32);
 #endif
     return NULL;
 }

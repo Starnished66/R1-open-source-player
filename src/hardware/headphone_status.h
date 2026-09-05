@@ -3,11 +3,13 @@
 
 #include <stdbool.h>
 
-/* Real headphone/line-out jack detection via the kernel's switch class,
- * confirmed on real R1 Pro hardware by physically plugging/unplugging while
- * watching the sysfs node change. Reads false (no headphone) on host, where
- * the node doesn't exist -- same honest "no data" treatment as battery.c
- * and wifi_status.c. */
-bool headphone_is_connected(void);
+enum HEADPHONE_STATE {
+	HEADPHONE_STATE_NONE,      // none plugged in
+	HEADPHONE_STATE_HEADSET,   // 3.5mm plugged in
+	HEADPHONE_STATE_BALANCED,  // 4.4mm plugged in
+};
+
+// TODO: add description
+enum HEADPHONE_STATE get_headphone_state(void);
 
 #endif

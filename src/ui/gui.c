@@ -52,7 +52,6 @@
 #include "bt_media_player.h"
 #endif
 #include "headphone_status.h"
-#include "balanced_output_status.h"
 #include "usb_audio_output.h"
 #include "plugin_manager.h"
 #include "gui_plugin_manage.h"
@@ -658,7 +657,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * audio to go -- stop outright rather than leaving it silently playing
      * into nothing. Checked every tick, deliberately NOT gated on
      * screen_on_now below (background, screen-off playback needs the same
-     * protection). headphone_is_connected() is a cheap sysfs read (no
+     * protection). get_headphone_state() is a cheap sysfs read (no
      * subprocess); the A2DP half reuses whatever poll_refresh_bt_icon()
      * last found rather than re-querying bluealsa-cli here every tick --
      * that's already throttled to its own ~5s cadence (see
@@ -667,7 +666,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * process every single tick.
      *
      * Target-only: HOST_BUILD has no real jack/BT hardware to detect at
-     * all (headphone_is_connected() is unconditionally false there, see
+     * all (get_headphone_state() is unconditionally HEADPHONE_STATE_NONE there, see
      * headphone_status.h), so this would otherwise fire a spurious "stop"
      * on the very first tick after starting playback in the simulator --
      * there's no real disconnect to protect against on host, since the dev
@@ -733,13 +732,8 @@ static void update_timer_cb(lv_timer_t * timer) {
         /* Real-device review finding (R3 Pro II): the plain "headset" jack
          * and the balanced jack are two independent switch_dev detection
          * paths on this board (sa_sound_switch.ko's own sass_headset_ and
-         * sass_balance_ parameter groups, HARDWARE_DRIVERS.md) -- a user with
-         * ONLY a balanced cable connected read as fully disconnected here
-         * (headphone_is_connected() only ever reflects the plain jack),
-         * which would have auto-paused live, actively-routing balanced
-         * playback as if the output had been unplugged. A genuine no-op on
-         * R1/host, same as balanced_headphone_is_connected() itself. */
-        bool output_connected = headphone_is_connected() || balanced_headphone_is_connected() || bt_connected_debounced;
+         * sass_balance_ parameter groups, HARDWARE_DRIVERS.md) */
+        bool output_connected = get_headphone_state() != HEADPHONE_STATE_NONE || bt_connected_debounced;
         /* Real-device bug report: this used to call audio_stop() -- not
          * audio_toggle_pause() -- on a disconnect. audio_stop() (audio.c)
          * doesn't just silence output: its playback thread fully unwinds
@@ -772,7 +766,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * bug-fix histories, and this is unrelated, purely additive behavior
      * (a genuine no-op on R1/host) that doesn't need to share any of that
      * state. Cheap enough (one sysfs read, one cached mixer lookup) to run
-     * every tick, same cadence as headphone_is_connected() above. */
+     * every tick, same cadence as get_headphone_state() above. */
     audio_output_sync_balanced_output();
 #endif
 
@@ -2017,11 +2011,11 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
          * aux/dock connection, not open air) and disable Car Mode so a
          * user who hits this doesn't land back in the exact same trap on
          * their very next boot too, before they've had any chance to
-         * investigate. headphone_is_connected() is a cheap synchronous
+         * investigate. get_headphone_state() is a cheap synchronous
          * sysfs read (no D-Bus/Bluetooth involved) -- safe to call this
          * early in boot, unlike a Bluetooth connectivity check (see the
          * "no startup-time Bluetooth cleanup" comment in main.c). */
-        if (!headphone_is_connected()) {
+        if (get_headphone_state() == HEADPHONE_STATE_NONE) {
             current_settings.car_mode_enabled = false;
             settings_save(&current_settings);
             show_info_toast("Car Mode disabled: no headphone detected at boot");

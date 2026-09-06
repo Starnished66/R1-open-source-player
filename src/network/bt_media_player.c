@@ -15,33 +15,11 @@
 #include <string.h>
 #include <unistd.h>
 
-/* AVRCP transport button support. Two independent halves:
- *
- * 1. A D-Bus org.mpris.MediaPlayer2.Player object this app registers and
- *    hosts via Media1.RegisterPlayer (below) -- this is the *standard*
- *    BlueZ mechanism, and still correctly answers metadata/status queries
- *    from any AVRCP controller that asks. Uses a vendored libdbus (this
- *    project targets mipsel-linux-musl, incompatible with the device's
- *    glibc-built libdbus-1.so.3).
- *
- * 2. Actual button *dispatch* (avrcp_input_thread_func(), further down):
- *    real-device testing (task #44, 2026-08-13) proved exhaustively that
- *    this device's bluetoothd never calls Play()/Pause()/Next()/Previous()
- *    on the registered player above, no matter how it's registered. The
- *    real mechanism, confirmed via a raw /dev/input capture against the
- *    stock firmware's own reference behavior: BlueZ's own standard "input"
- *    plugin (loaded unconditionally by bluetoothd -- not a HiBy patch)
- *    creates a virtual evdev keyboard device whenever an AVRCP-capable
- *    accessory connects, named "<accessory's own Bluetooth name> (AVRCP)",
- *    and injects ordinary KEY_PLAYCD/KEY_PAUSECD/KEY_NEXTSONG/
- *    KEY_PREVIOUSSONG press/release events into it -- exactly the same
- *    shape hw_buttons.c already reads for this device's own physical
- *    buttons. Kept in this file rather than hw_buttons.c since the device
- *    appears/disappears dynamically with the BT connection (unlike the
- *    two always-present physical-button devices hw_buttons.c assumes),
- *    and because it shares play_pause_requested/next_requested/
- *    prev_requested below with part 1 -- gui.c's existing bt_media_player_
- *    consume_play_pause()/_next()/_prev() calls need no changes at all. */
+/* AVRCP transport button support.
+ * 1. Hosts a D-Bus org.mpris.MediaPlayer2.Player object via Media1.RegisterPlayer
+ *    to answer metadata and status queries from AVRCP controllers.
+ * 2. Reads AVRCP button events from BlueZ's virtual evdev keyboard device
+ *    ("<name> (AVRCP)") to handle play/pause, next, and previous inputs. */
 
 #define BT_MEDIA_PLAYER_OBJECT_PATH "/org/openhibyplayer/MediaPlayer"
 #define BT_MEDIA_PLAYER_ADAPTER_PATH "/org/bluez/hci0"
@@ -381,20 +359,8 @@ static void * dispatch_thread_func(void * arg) {
      * this app already knows the real state. */
     bool last_notified_playing = !playing_state;
 
-    /* Registers once, immediately and unconditionally, for the app's whole
-     * lifetime -- not gated on whether BT output is the currently active
-     * route, matching the stock platform's own sys_server (which also
-     * registers once, early, and stays registered regardless of what's
-     * outputting audio). No periodic re-register: task #44's real-device
-     * investigation (2026-08-13) conclusively traced actual AVRCP button
-     * *dispatch* to a completely different mechanism (avrcp_input_thread_
-     * func() below, evdev-based) that doesn't depend on this registration
-     * at all -- re-registering repeatedly was a workaround for a theory
-     * ("maybe timing/frequency helps bluetoothd pick this up") that turned
-     * out to be wrong, so it added churn without ever fixing anything. This
-     * registration's only remaining job is answering standard AVRCP
-     * metadata/status queries for any controller that asks, which a single
-     * registration already does correctly. */
+    /* Registers once for the app's lifetime to answer standard AVRCP
+     * metadata/status queries. */
     call_register_player(true);
     DBG_LOG("bt_media_player: registered\n");
 
@@ -422,26 +388,13 @@ static void * dispatch_thread_func(void * arg) {
     return NULL; /* unreached -- this thread runs for the app's whole lifetime, same as audio.c's playback thread */
 }
 
-/* Bounded retry for dbus_bus_get() below -- real-device bug report: after a
- * freeze-triggered reboot, AVRCP transport controls stopped working for the
- * rest of that boot, even though a normal cold boot never had the problem.
- * Root cause: the original implementation called this very early in main(),
- * racing S30dbus's own dbus-daemon startup -- a
- * single failed dbus_bus_get() here used to give up for the whole session
- * (init_done reset to false, but nothing actually retried). A reboot immediately
- * following a freeze/crash is exactly the boot least likely to have normal,
- * predictable init.d timing (filesystem checks, whatever state the crash
- * left things in), so this needs to tolerate the bus not being up yet rather
- * than assume a clean boot's timing. 10 attempts / 300ms apart = 3s worst
- * case -- generous enough for a slow boot, still bounded so a genuinely
- * absent bus (not just slow) doesn't hang startup indefinitely. */
+/* Bounded retry for dbus_bus_get() to tolerate slow or in-progress D-Bus startup. */
 #define DBUS_BUS_GET_RETRY_ATTEMPTS 10
 #define DBUS_BUS_GET_RETRY_DELAY_US 300000
 
 /* One connection attempt: get the bus, register our object path, start the
  * dispatch thread. Shared by the fast bounded retry in bt_media_player_
- * init() below and the slower background retry further down -- pulled out
- * so both loops attempt the exact same thing rather than drifting apart. */
+ * init() below and the slower background retry further down. */
 static bool attempt_connect_once(void) {
     DBusError err;
     dbus_error_init(&err);
@@ -464,61 +417,11 @@ static bool attempt_connect_once(void) {
     return true;
 }
 
-/* Real-device bug report (a second, worse instance of the incident
- * documented above DBUS_BUS_GET_RETRY_ATTEMPTS): AVRCP transport controls
- * still didn't work on a fresh boot, even with that bounded 3s retry in
- * place. Root cause: this device's own S30dbus + S80_bt_init boot scripts
- * always leave TWO independent dbus-daemon processes running (see
- * bluetooth_control.h's own extensive history on this exact split-brain
- * condition, and why this app deliberately does NOT try to fix it at boot
- * time -- an earlier attempt reliably hung the whole app before it ever
- * reached the main loop, confirmed across three separate rounds of trying
- * to fix the attempt itself, not just the timing). Confirmed live: after
- * manually consolidating the two daemons down to one and forcing a
- * reconnect, dbus_bus_get() STILL failed every one of the 10 fast
- * attempts, apparently because the freshly-restarted daemon+bluetoothd
- * pair genuinely needed more than the ~3s this loop allows for. A slow or
- * contended boot -- exactly what the split-brain condition, or a slow
- * chip bring-up (bt_control_init_chip() itself already documents ~10-13s
- * for that alone), makes plausible -- can outlast 3s even on a completely
- * normal, non-crash-triggered boot, not just the freeze-reboot scenario
- * the original fix targeted. Falls back to a slower, effectively-unbounded
- * retry (5s apart) once the fast loop is exhausted rather than giving up
- * outright -- negligible overhead even in the worst case (a bus that never
- * comes up at all), so there's no real cost to just retrying forever rather
- * than picking some arbitrary give-up point that would only reproduce this
- * exact bug again for anyone whose boot is slower than that. */
+/* Background retry delay when initial connection attempts fail. */
 #define BT_MEDIA_PLAYER_BACKGROUND_RETRY_DELAY_US (5 * 1000000)
 
-/* Task #44, real-device finding (2026-08-13): live debugging traced the
- * cold-boot AVRCP failure past every registration-side theory this app
- * could control on its own (a single early RegisterPlayer, a periodic
- * re-register over 10 minutes, a genuinely fresh D-Bus connection identity
- * after a live app relaunch, a genuinely fresh AVRCP session after a live
- * headset reconnect, even connecting lazily to avoid early-boot D-Bus
- * contention entirely) -- none of it made bluetoothd dispatch a single
- * passthrough command. What did work, live: killing and restarting
- * bluetoothd itself, then reconnecting the headset. That pointed at
- * bluetoothd's own AVRCP subsystem needing to see a player registered at
- * (or very near) the moment its own AVRCP subsystem initializes, not one
- * registered onto an already-running subsystem, however freshly.
- *
- * Confirmed by comparing against the stock firmware: its closed-source
- * hiby_player binary has zero AVRCP/MPRIS strings in it at all -- the
- * actual registration happens in a separate stock service, sys_server
- * (confirmed via its own strings: RegisterPlayer, org.bluez.MediaPlayer1,
- * org.mpris.MediaPlayer2.Player, /org/bluez/hiby/player), which starts at
- * init.d's S50sys_server -- before S80_bt_init even brings up hci0, and
- * long before this app's own S92_03_start_music_player. sys_server also
- * registers unconditionally, for its whole lifetime, with no concept of
- * "is BT output currently active" gating the registration at all.
- *
- * Later bootloader-era testing found the opposite startup relationship on
- * this firmware: beginning the same work only after a successful Bluetooth
- * enable avoided the early daemon-readiness race, while headphones still
- * connected promptly and AVRCP playback controls worked. Registration is
- * therefore lazy now, but once started it still stays registered for the
- * rest of the app lifetime. It never touches bluetoothd/hci0 directly. */
+/* Connects to D-Bus and registers the media player, retrying in the background
+ * if the bus is not immediately available. */
 static void * connect_thread_func(void * arg) {
     (void) arg;
     for (int attempt = 0; attempt < DBUS_BUS_GET_RETRY_ATTEMPTS; attempt++) {

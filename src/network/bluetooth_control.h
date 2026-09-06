@@ -34,35 +34,9 @@ void bt_control_get_dac_stream_info(bt_dac_stream_info_t * out);
 
 bool bt_control_is_powered(void);
 
-/* Deliberately no startup-time cleanup call here (there used to be one).
- * Running it during boot -- killing/respawning the D-Bus daemons that
- * S30dbus and S80_bt_init leave running, which other still-starting
- * init.d services depend on -- reliably hung the app before it reached
- * the main loop; skipping it entirely boots cleanly and reliably. The
- * D-Bus split-brain condition it addressed is instead handled reactively:
- * see ensure_single_dbus_daemon() further down, called only once a real
- * symptom (bluetoothctl hanging, an agent registered on the wrong bus) is
- * observed during normal use. */
-
-/* Brings up the Bluetooth chip if it isn't already (no hci0 this boot) by
- * running the real firmware's own /usr/bin/bt_resume script -- the same
- * effective bring-up the stock hiby_player triggers on demand when its own
- * Bluetooth screen opens, since chip init isn't automatic at boot on this
- * firmware. No-op (returns true immediately) if hci0 already exists:
- * re-running chip bring-up without an intervening reboot reliably fails
- * ("Can't get device info"), confirmed on a real device.
- *
- * Uses bt_resume rather than the similar /usr/bin/bt_init: bt_init
- * unconditionally starts its own dbus-daemon with no check for one already
- * running (confirmed by reading the script directly), which would add a
- * THIRD one on top of the two S30dbus and S80_bt_init already leave running
- * every boot (see the comment above bt_control_init_chip's declaration
- * above) -- bt_resume's own dbus-daemon-starting
- * lines exist in the script but are commented out, so it just uses whatever
- * bus is already there instead.
- *
- * Slow (~10-13s: chip firmware flash plus several sleeps baked into the
- * script itself) -- always call this off the UI thread. */
+/* Brings up the Bluetooth chip if it isn't already active (no hci0) by
+ * running /usr/bin/bt_resume. No-op if hci0 already exists.
+ * Call off the UI thread as this takes several seconds. */
 bool bt_control_init_chip(void);
 
 /* Each blocks for about a second (bluetoothctl's own controller-power round
@@ -70,22 +44,8 @@ bool bt_control_init_chip(void);
 void bt_control_enable(void);
 void bt_control_disable(void);
 
-/* Task #44 fix: kill + relaunch bluetoothd (adapter reset, power restore,
- * output profile reapply), same recipe the reactive wedge-recovery in
- * bt_control_is_powered() already uses, but called unconditionally rather
- * than only after a detected wedge symptom -- see bluetooth_control.c's
- * own comment on this function for the real-device diagnosis that led
- * here (a cold-boot-only AVRCP passthrough bug bluetoothctl-based wedge
- * detection never observes, since the daemon answers every other query
- * normally the whole time). Blocks for a few seconds (kill/reset/respawn/
- * re-enable, each its own subprocess call) -- NOT the "no startup-time
- * cleanup" case warned about just above bt_control_init_chip(): that
- * warning is specifically about running daemon cleanup before the main
- * loop starts; this is safe to call any time AFTER that, from any
- * thread that isn't the UI thread. bt_media_player.c's dispatch thread
- * (already running well past app startup by the time BT first connects)
- * is the intended caller, once, right before its own first real
- * RegisterPlayer this boot. */
+/* Restarts bluetoothd (kill, adapter reset, power restore, output profile reapply).
+ * Blocks for several seconds; call off the UI thread. */
 void bt_control_restart_daemon(void);
 
 /* True if any paired device currently has an active connection. Cheap
@@ -203,18 +163,8 @@ void bt_control_source_volume_sync_start(void);
 void bt_control_source_volume_sync_stop(void);
 bool bt_control_source_volume_sync_consume_percent(int * out_percent);
 
-/* Fast disconnect detection for that same a2dp-source output PCM. Real-
- * device bug report: a genuine BT headphone disconnect took up to ~17s to
- * even be noticed (gui.c's own ~5s poll cadence plus its 12s debounce --
- * see that debounce's own comment for why it can't just be shortened; a
- * real A2DP renegotiation blip looks identical to a genuine drop over a
- * window that short). bluealsa itself knows the instant BlueZ tears the
- * transport down and broadcasts it over D-Bus -- `bluealsa-cli monitor`
- * (confirmed via `strings` on the real binary) surfaces that as a
- * "PCMRemoved <path>" line in well under a second. This is a fast-path
- * NOTIFICATION only, not a replacement for the polled/debounced check --
- * that one stays as the fallback in case this monitor subprocess dies or
- * bluealsa doesn't emit the signal for some reason.
+/* Fast disconnect detection for a2dp-source output PCM via `bluealsa-cli monitor`.
+ * Provides immediate notification of device disconnection to supplement polling.
  *
  * Same start/stop lifecycle convention as bt_control_source_volume_sync_start()/
  * _stop() just above -- start whenever Bluetooth output is actually in use,

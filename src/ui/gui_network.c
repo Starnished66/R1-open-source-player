@@ -446,16 +446,8 @@ void poll_wifi_forget(void) {
 }
 
 /* ---- Wi-Fi saved-network action popup ------------------------------------
- * Real-device bug report: tapping a memorized network used to call
- * start_wifi_forget() directly and unconditionally -- there was no way to
- * just reconnect to one, and no confirmation before it got forgotten either.
- * Mirrors bt_action_popup's exact shape (same hand-built top-layer overlay,
- * same tap-outside-to-dismiss backdrop) for a consistent feel between the
- * two screens, per that same feedback ("just like on the bluetooth page").
- * Unlike Bluetooth's popup, both actions are always offered here -- a
- * memorized network is by definition not the live association status, so
- * "Connect" is always at least plausible (also covers reconnecting after a
- * manual disconnect), and "Forget" always applies to anything memorized. */
+ * Presents options to Connect or Forget for a selected memorized network,
+ * matching bt_action_popup's overlay and backdrop pattern. */
 static lv_obj_t * wifi_action_popup;
 static lv_obj_t * wifi_action_popup_backdrop;
 static lv_obj_t * wifi_action_popup_title;
@@ -696,15 +688,8 @@ void populate_wifi_screen(bool enabled) {
         lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, 24, 0);
     }
-    /* Real-device bug report: no indicator of which saved network is
-     * actually connected -- Available Networks below already shows this
-     * (net->is_current, from the scan results), but the scan and the
-     * saved-network list are two entirely separate queries (wpa_cli
-     * status vs. list_networks), so nothing here ever cross-referenced
-     * them. wifi_control_get_info() (already used by the Wi-Fi Info
-     * screen) is the same "ask wpa_cli status directly" source of truth
-     * as is_current itself, just reused here by SSID match instead of
-     * scan-result identity. */
+    /* Cross-reference wpa_cli status against saved network SSIDs to indicate
+     * which saved network is currently connected. */
     wifi_info_t current_wifi_info;
     bool wifi_currently_connected = !wifi_enable_pending_feedback &&
                                     wifi_control_get_info(&current_wifi_info);
@@ -902,13 +887,8 @@ static void start_bt_forget(const char * mac) {
     }
 }
 
-/* Real-device feedback: forgetting a device used to refresh the list via
- * start_bt_scan() -- a brand new 6+ second discovery scan with its own busy
- * overlay flashing on screen, surprising ("it shouldn't be triggered") for
- * what's really just a local state change we already know the outcome of.
- * Updating bt_scan_results directly and redrawing is instant and needs no
- * scan at all -- the forgotten device just moves from the Paired section to
- * Available (or disappears next real scan, if it's not actually in range). */
+/* Updates bt_scan_results locally and redraws the Bluetooth screen upon
+ * forgetting a device without running a full background scan. */
 void poll_bt_forget(void) {
     if (!bt_forget_active || !atomic_load_explicit(&bt_forget_done_flag, memory_order_acquire)) return;
     bt_forget_active = false;
@@ -927,14 +907,8 @@ void poll_bt_forget(void) {
 }
 
 /* ---- Bluetooth device action popup --------------------------------------
- * Tapping a device row used to implicitly Forget (if ->connected) or
- * Connect (otherwise) -- that meant a paired-but-not-currently-connected
- * device had NO path to being forgotten at all, since the only route to
- * start_bt_forget() required ->connected. This replaces that with an
- * explicit popup offering just the actions that make sense for the
- * device's actual state. Same hand-built top-layer overlay shape as
- * error_toast/volume_popup above (this codebase doesn't use LVGL's
- * lv_msgbox anywhere), plus a tap-outside-to-dismiss backdrop. */
+ * Displays an action popup offering Connect or Forget based on the device's
+ * current paired/connected state. */
 static lv_obj_t * bt_action_popup;
 static lv_obj_t * bt_action_popup_backdrop;
 static lv_obj_t * bt_action_popup_title;
@@ -1051,15 +1025,8 @@ static void set_bt_rescan_active(bool active) {
     }
 }
 
-/* Real-device finding (confirmed via `bluetoothctl devices` directly): a
- * device with no advertised name doesn't come back with an empty name at
- * all -- bluetoothctl itself substitutes the device's own MAC address,
- * dashes instead of colons (e.g. mac "5D:C4:96:7E:56:88" -> name
- * "5D-C4-96-7E-56-88"), as a placeholder. bt_scan_results[i].name[0] ==
- * '\0' (an earlier version of the "hide unnamed devices" filter below)
- * essentially never matches real-world unnamed devices because of this --
- * confirmed live as "not reliable, doesn't hide them". Detects that exact
- * placeholder shape instead of assuming an empty string. */
+/* Checks if the device name is a MAC address placeholder (e.g. "5D-C4-96-7E-56-88")
+ * substituted by bluetoothctl when no advertised name is present. */
 static bool bt_name_is_mac_placeholder(const bt_device_t * dev) {
     if (dev->name[0] == '\0') return true;
     size_t mac_len = strlen(dev->mac);
@@ -1142,9 +1109,7 @@ static void * bt_scan_thread_func(void * arg) {
     return NULL;
 }
 
-/* Runs fully in the background, same as the stock player -- no busy
- * screen, no navigation at all. See start_wifi_scan()'s own comment for
- * why (same mechanism, same real incident, just the Bluetooth side of it). */
+/* Runs Bluetooth scan in a background thread without navigation or busy screen. */
 static void start_bt_scan(void) {
     if (bt_scan_active) return;
 
@@ -1208,33 +1173,17 @@ void populate_bt_dac_screen(void) {
 }
 
 /* Shared by bt_dac_enable_row_cb() and open_bt_dac_screen()'s "already
- * enabled" shortcut -- ALWAYS re-applies the actual bluealsa/bt-agent
- * sink configuration rather than trusting current_settings.bt_dac_mode_enabled
- * as proof the underlying pipeline is really in that state. Real-device
- * incident: the two could desync -- the flag stayed true (and the overlay
- * kept showing on re-entry) while bluealsa had actually drifted back to
- * its plain a2dp-source baseline (observed after live debugging that
- * involved manually restarting bluetoothd/bluealsa outside the app's own
- * control, but the same desync could happen from any crash or external
- * interference) -- leaving the user staring at a "Bluetooth DAC mode"
- * screen that silently wasn't receiving audio at all, with nothing to
- * indicate why. Re-applying unconditionally on every visit, not just the
- * first enable, is cheap (a few subprocess spawns) and makes the overlay
- * a reliable guarantee of the underlying state instead of a one-time
- * side effect that can go stale. */
+ * enabled" shortcut -- reapplies the bluealsa/bt-agent sink configuration
+ * rather than relying solely on current_settings.bt_dac_mode_enabled, ensuring
+ * the underlying pipeline matches the active UI state. */
 static void enable_bt_dac_and_show_overlay(void) {
     current_settings.bt_dac_mode_enabled = true;
     settings_save(&current_settings);
     start_bt_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
 
-    /* This device's incoming-audio consumers (aplay -D bluealsa for
-     * Bluetooth DAC, shairport -o ot for AirPlay) and this app's own
-     * tinyalsa playback all target the same physical ALSA hardware (hw:0,0
-     * / "hibysoundcard") -- real-device testing confirmed fighting over it
-     * is a genuine problem, not just a theoretical one. So all three are
-     * mutually exclusive: enabling Bluetooth DAC stops local playback (see
-     * play_track_at_from()/toggle_play_pause()'s own guards) and turns off
-     * AirPlay if it was on. */
+    /* Bluetooth DAC, AirPlay, and local playback share the same physical ALSA
+     * audio device and are mutually exclusive. Enabling Bluetooth DAC stops local
+     * playback and turns off AirPlay if active. */
     if (audio_is_playing()) {
         audio_stop();
         set_play_button_state(false);
@@ -1684,12 +1633,9 @@ void font_size_settings_row_cb(lv_event_t * e) {
     open_font_size_screen();
 }
 
-/* ---- Lyrics Text Size (Settings -> Display) -- real-device request: the
- * fullscreen lyrics view needed its own separate size control, decoupled
- * from the rest of the app's own Font Size above (see settings.h's own
- * lyrics_font_size_tier comment and fallback_font.h's app_font_lyrics for
- * why). Same single-select, accent-border, reboot-to-apply shape as Font
- * Size itself, just 2 options (Medium/Large) instead of 3. ---- */
+/* ---- Lyrics Text Size (Settings -> Display) ------------------------------
+ * Dedicated font size selector for fullscreen lyrics view, separate from
+ * main app font size. ---- */
 
 typedef struct {
     int tier; /* matches player_settings_t.lyrics_font_size_tier -- 1 or 2 only */
@@ -1704,16 +1650,9 @@ typedef struct {
 
 
 
-/* ---- ReplayGain mode (Settings -> Playback) -- same single-select,
- * accent-border shape as Lyrics Text Size/Font Size above, but live-apply
- * rather than reboot-to-apply: the setting itself is just which of a
- * track's own already-parsed gain fields resolve_replaygain() picks, no
- * font atlas or anything else expensive to reload, so the change can take
- * effect as soon as the next track starts (same "avoid a mid-song loudness
- * jump" reasoning the old on/off toggle already had -- only the already-
- * queued next track and subsequent starts adopt the new preference, not
- * the one playing right now). Replaces that old plain toggle with a real
- * 3-way choice. ---- */
+/* ---- ReplayGain mode (Settings -> Playback) -- 3-way option (Off, Per Track,
+ * Per Album). Applied immediately to take effect on the next started or queued
+ * track without loudness jumps during current playback. ---- */
 
 typedef struct {
     int mode; /* matches player_settings_t.replaygain_mode */
@@ -1765,13 +1704,10 @@ void replaygain_mode_settings_row_cb(lv_event_t * e) {
     open_replaygain_mode_screen();
 }
 
-/* ---- USB device mode (Settings > USB Mode) -- single-select list, same
- * shape as the Bluetooth codec screen just above (accent-colored border on
- * the current choice). Applying a mode is real configfs/sysfs work (see
- * usb_mode_control.c), so it runs on its own thread and gets polled from
- * update_timer_cb like every other real-device toggle in this file, rather
- * than blocking the UI thread the way bt_codec_option_row_cb's direct call
- * does. ---- */
+/* ---- USB device mode (Settings > USB Mode) -- single-select list with an
+ * accent-colored border on the active option. Applying a mode modifies
+ * configfs/sysfs in a worker thread polled from update_timer_cb to prevent
+ * blocking the UI thread. ---- */
 
 typedef struct {
     usb_mode_t mode;
@@ -1857,26 +1793,9 @@ void start_usb_mode_switch(usb_mode_t target) {
 }
 
 void poll_usb_mode_switch(void) {
-    /* Real-device bug report: "silent for a couple of seconds [while on USB
-     * DAC input], have to disable/re-enable DAC mode to get it working
-     * again." usb_dac_bridge.c's read() loop on /dev/uac_sa only retries on
-     * EPERM (host hasn't armed the streaming interface yet, up to ~15s) --
-     * any other read() <= 0 (the exact errno the driver returns when the
-     * host briefly stops sending, e.g. on pause, isn't documented and
-     * wasn't reproducible here without a live device) is treated as fatal:
-     * the thread exits for good and nothing was watching to restart it,
-     * since usb_dac_bridge_start() is otherwise only ever called from
-     * usb_mode_control_apply(USB_MODE_DAC) at mode-entry time. Rather than
-     * guess which errno to add to the retry list (risking masking a
-     * genuinely permanent failure by retrying forever inside that thread),
-     * self-heal here instead: if we're still set to DAC mode but the bridge
-     * isn't running, just start it again. Skipped while a mode switch is
-     * actively in flight to avoid racing usb_mode_control_apply()'s own
-     * synchronous usb_dac_bridge_start() call above. If the gadget itself
-     * is gone (e.g. cable unplugged) this costs one more bounded
-     * open()-retry cycle in usb_dac_bridge_start()'s own thread before it
-     * gives up again, same as it already does today -- no different from
-     * toggling the mode off and on by hand. */
+    /* If set to USB DAC mode but the audio bridge is not running, restart it.
+     * Skipped while a mode switch is in flight to avoid racing
+     * usb_mode_control_apply(). */
     if (!usb_mode_switch_active && current_settings.usb_mode == (int) USB_MODE_DAC) {
         usb_dac_stream_info_t info;
         usb_dac_bridge_get_stream_info(&info);
@@ -1958,20 +1877,9 @@ void poll_usb_storage_hotplug(void) {
     } else if (connected && !usb_cable_was_connected) {
         usb_storage_rebind_pending = true;
     } else if (!connected && usb_cable_was_connected) {
-        /* Disconnect edge: real-device feature request -- copying files onto
-         * the SD card via USB Mass Storage is the single most common way a
-         * user adds "just a couple of songs", and nothing previously
-         * reacted to the cable coming back out. Only when the gadget was
-         * actually Storage at that moment -- DAC/ADB never touch the SD
-         * card's filesystem, so unplugging out of either has nothing to
-         * rescan for. No confirmation popup: start_library_rescan()'s own
-         * "Updating music database..." busy screen already blocks the user
-         * from doing anything else while it runs, which is the right
-         * tradeoff here -- a silent background scan competing with whatever
-         * the user does right after unplugging (most likely starting
-         * playback) risks contending with it for the same SD card
-         * bandwidth and CPU a foreground, blocking scan sidesteps by making
-         * that wait explicit instead. */
+        /* On USB disconnect while in Storage mode, automatically initiate
+         * a library rescan if auto-rescan is enabled, updating the music
+         * database for newly transferred files. */
         usb_mode_t live_mode;
         if (gui_library_auto_rescan_enabled() && usb_mode_control_detect_current(&live_mode) &&
             live_mode == USB_MODE_STORAGE) {
@@ -2116,20 +2024,8 @@ static lv_obj_t * build_usb_dac_overlay_screen(void) {
     lv_obj_set_style_text_font(status_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align_to(status_label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
 
-    /* Real-device bug report: this text sat flush left instead of centered.
-     * These three labels' text is set/changed well after this point (see
-     * dac_stream_labels_timer_cb() -- input/path start out completely
-     * empty here, only ever getting real text from that timer), but
-     * lv_obj_align_to() below is a one-shot position computed from
-     * whatever the label's content-fit box measures *right now* -- it is
-     * not a live constraint that re-centers automatically when the text
-     * (and so the auto-fit width) changes later. A label's box then just
-     * grows rightward from that stale small-width position instead of
-     * re-centering. build_bt_dac_overlay_screen()'s own bt_dac_stream_label
-     * (same screen family, same "text changes after creation" shape)
-     * already avoids this the same way applied here: a fixed width plus
-     * LV_TEXT_ALIGN_CENTER means the box never resizes when the text
-     * inside it does. */
+    /* Use fixed width with centered text alignment so the labels stay centered
+     * when their text content updates dynamically. */
     usb_dac_hint_label = lv_label_create(scr);
     lv_label_set_text(usb_dac_hint_label, "Waiting for USB audio…");
     lv_obj_add_style(usb_dac_hint_label, &style_theme_text_muted, 0);
@@ -2205,14 +2101,8 @@ static void bt_volume_sync_toggle_cb(lv_event_t * e) {
     populate_bt_screen();
 }
 
-/* Real-device feedback: "bluetooth screen is showing a lot of devices
- * without a name" -- nearby BLE beacons/accessories that never broadcast
- * one show up as raw MAC addresses (add_bt_device_row()'s own fallback)
- * cluttering the Available Devices list. Purely a display filter, unlike
- * the volume-sync toggle above -- no bluealsa/bluetoothctl state to push,
- * just a settings flag and a re-render. Paired devices are never filtered
- * by this (see populate_bt_screen()'s own loop) -- you wouldn't have
- * paired with one you couldn't identify in the first place. */
+/* Display filter toggle to hide unnamed Bluetooth devices (e.g. BLE beacons)
+ * from the Available Devices list. Paired devices are never hidden. */
 static void bt_hide_unnamed_toggle_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     current_settings.bt_hide_unnamed_devices = !current_settings.bt_hide_unnamed_devices;
@@ -2228,16 +2118,8 @@ static void bt_hide_unnamed_toggle_cb(lv_event_t * e) {
  * call; this just splits that single list into the two sections by
  * ->paired rather than needing two separate scans. ---- */
 void populate_bt_screen(void) {
-    /* Real-device bug: this screen rebuilds from scratch on every ~5s
-     * connection poll tick (see poll_refresh_bt_icon()'s own call site),
-     * and lv_obj_clean() below resets the list's scroll position to the
-     * top along with destroying its children -- confirmed live: with
-     * enough devices to need scrolling, the periodic rebuild snapped the
-     * view back to the top every cycle, making it impossible to actually
-     * read anything past the first screenful. Captured before the clean
-     * and restored after rebuilding (both exit paths -- the early return
-     * just below when Bluetooth is off has nothing to restore into, but
-     * costs nothing to always capture/restore symmetrically). */
+    /* Preserve scroll position across periodic screen rebuilds so the view
+     * does not snap back to the top while browsing devices. */
     int32_t saved_scroll_y = lv_obj_get_scroll_y(bt_list);
 
     lv_obj_clean(bt_list);
@@ -2361,23 +2243,9 @@ static void populate_import_wifi_screen(void) {
 #endif
 }
 
-/* Shared "are you sure?" 2-button confirmation popup shape -- backdrop +
- * centered card + wrapped title + two full-width buttons. Real-device bug
- * report: this exact shape was independently hand-duplicated (fixed 400-
- * 420px-wide, ~220px-tall popup, title/buttons at fixed pixel y-offsets)
- * across roughly 15 different popups in this file, all tuned for the
- * small/medium font tiers -- BlindMF's much bigger text broke each one
- * the same way (title/button text overflowing those fixed offsets), first
- * caught here on the EQ reset and "Update music database?" popups.
- * LV_SIZE_CONTENT + flex column throughout, same structural fix already
- * proven on the PEQ screen's own cards, so the popup's height (and the
- * gap between its title and buttons) follows however tall the rendered
- * text actually is at whatever tier is active, instead of a number that
- * only happened to be enough for the original tier. Returns the popup
- * object and writes the backdrop to *out_backdrop; the caller wires up
- * its own show/hide functions and owns both objects same as before --
- * this only replaces how each popup's insides get built, not the
- * hide/show/backdrop-tap machinery already established per popup. */
+/* Shared 2-button confirmation popup builder (backdrop, card, wrapped title,
+ * and confirm/cancel buttons) using LV_SIZE_CONTENT and flex layout to
+ * accommodate varying font sizes. */
 lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
                                        lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
                                        lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
@@ -2467,29 +2335,10 @@ lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t tit
     return popup;
 }
 
-/* Shared N-row action-menu popup shape -- backdrop + centered card + a
- * column of tappable text rows (e.g. "List"/"Queue"/"Add to Playlist"/
- * "EQ"/"Delete"). Same real-device bug and same structural fix as
- * build_confirm_popup() just above (LV_SIZE_CONTENT/flex column instead of
- * a fixed-pixel box with rows at fixed y-offsets, tuned only for the
- * small/medium font tiers) -- this is the OTHER hand-duplicated popup
- * shape in this file, used by menus rather than yes/no confirmations.
- * Returns the popup object and writes the backdrop to *out_backdrop, same
- * ownership split as build_confirm_popup(). */
-/* build_menu_popup is in gui.c */
+/* Shared N-row action-menu popup shape is built by build_menu_popup in gui.c. */
 
-
-/* Real-device feedback: leaving Import via Wi-Fi used to just hang -- no
- * visible feedback at all -- for however long import_web_stop() took (its
- * own comment: killall -9 across up to 8 process names, plus a bounded
- * pgrep-polled wait for all of them to actually be reaped, up to ~500ms of
- * genuine subprocess churn) before the screen finally changed, since that
- * call used to run right on this UI-thread click handler. Same background-
- * thread-plus-polled-done-flag shape as every other multi-hundred-ms
- * operation in this file (start_wifi_connect()/poll_wifi_connect() is the
- * closest match: same "push the shared busy screen, no numeric progress to
- * show" shape), reusing subsonic_downloading_screen/_label rather than
- * building new UI just for this one line of text. */
+/* Background worker and polling state for stopping the Wi-Fi web import server
+ * asynchronously without blocking the UI thread during process teardown. */
 static pthread_t import_web_stop_thread;
 static bool import_web_stop_active = false;
 static atomic_bool import_web_stop_done_flag = false;
@@ -2800,22 +2649,9 @@ static void airplay_tile_cb(lv_event_t * e) {
 }
 
 /* ---- AirPlay overlay: shown only while a stream is actually active -----
- * An earlier pass tried reusing the Player screen's own widgets for this
- * (hiding its transport controls while AirPlay played) -- dropped after
- * real-device testing: a shadowed-global bug silently left prev/next
- * unhideable, the layout looked broken with only some controls hidden,
- * and it coupled this feature into player-owned globals with no other
- * reason to know about AirPlay. A dedicated overlay, same shape as
- * bt_dac_overlay_screen/usb_dac_overlay_screen, has none of that: nothing
- * to hide, nothing to accidentally leave half-hidden. Unlike those two
- * static overlays, this one has real dynamic content (cover art + song
- * name), fed by airplay_metadata.c the same way the old Player-screen
- * integration was, just applied to this screen's own widgets instead.
- * No back-button confirmation popup (unlike BT DAC's) -- there is nothing
- * to "leave" here in the sense of a mode switch; navigating away just
- * stops looking at it, the stream itself keeps flowing regardless of
- * which screen is on top, and gui_network_poll_airplay_overlay() below
- * pops back out on its own once the stream actually ends. ---- */
+ * Dedicated overlay screen displaying cover art, song name, and stream info
+ * updated dynamically via airplay_metadata.c. Navigating back leaves the
+ * stream running in the background until it completes or is stopped. ---- */
 
 static void airplay_overlay_back_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -2970,10 +2806,8 @@ void gui_network_poll_airplay_overlay(void) {
     free(airplay_overlay_cover_bytes);
     airplay_overlay_cover_bytes = (uint8_t *) upd.cover_pixels;
 
-    /* LV_IMAGE_HEADER_MAGIC is required, not decorative -- see gui_player.c's
-     * poll_cover_decode() for the real-device corruption bug a zeroed magic
-     * field causes (lv_bin_decoder.c "fixes up" what it treats as an old-
-     * format header in place, silently overwriting the color format). */
+    /* LV_IMAGE_HEADER_MAGIC is required so LVGL's image decoders recognize
+     * the custom RGB565 image descriptor without attempting format fixups. */
     memset(&airplay_overlay_cover_dsc, 0, sizeof(airplay_overlay_cover_dsc));
     airplay_overlay_cover_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
     airplay_overlay_cover_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
@@ -2985,13 +2819,8 @@ void gui_network_poll_airplay_overlay(void) {
     lv_image_set_src(airplay_overlay_cover_img, &airplay_overlay_cover_dsc);
 }
 
-/* ---- DLNA screen -- see dlna_control.h for the real mechanism (stock
- * firmware's own dmrd binary) and its documented limitations (Pause/Mute/
- * reliable-Volume-feedback/Seek are all confirmed broken inside dmrd
- * itself on real-device testing, independent of anything built here).
- * Same toggle-plus-explanation shape as build_airplay_screen(), but no
- * mutual exclusion with Bluetooth DAC/AirPlay -- see settings.h's own
- * comment on dlna_renderer_enabled for why. ---- */
+/* ---- DLNA screen -- toggles the DLNA DMR service (dmrd) to allow UPnP/DLNA
+ * controllers on the local Wi-Fi network to stream to this device. ---- */
 
 static lv_obj_t * dlna_list;
 
@@ -3188,14 +3017,8 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_set_style_text_font(toggle_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(toggle_label, LV_ALIGN_LEFT_MID, 24, 0);
 
-    /* Real lv_switch, standardized to match the Settings screen's own
-     * switches -- replaces the old flat-tinted on.png/off.png sprite swap
-     * per real-device feedback. Non-interactive: toggle_row itself is the
-     * sole clickable target (remote_control_toggle_cb above), so the
-     * switch must not capture its own touch/drag. This screen is built
-     * exactly once at startup and never rebuilt, so it needs the same
-     * live-updating shared style every other switch uses (gui_theme_
-     * apply_accent() keeps it current on a later accent color change). */
+    /* Standardized switch widget matching the Settings screen style.
+     * Non-interactive because the parent toggle_row handles clicks. */
     remote_control_toggle_img = lv_switch_create(toggle_row);
     lv_obj_remove_flag(remote_control_toggle_img, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_align(remote_control_toggle_img, LV_ALIGN_RIGHT_MID, -20, 0);
@@ -3219,14 +3042,8 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_set_style_text_align(remote_control_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(remote_control_status_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(remote_control_status_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    /* Real-device bug report: "Connect to Wi-Fi first" overlapped the
-     * explanation text above it at bigger font tiers -- `explanation`
-     * above wraps across more/taller lines as gui_theme_font(GUI_FONT_ROLE_SUBTEXT) grows (BlindMF),
-     * but this label's own Y was a hardcoded absolute offset from the
-     * title, sized assuming `explanation` always stayed within its
-     * smallest-tier height. Anchored to `explanation`'s own actual bottom
-     * edge instead, so it always clears however tall that text really
-     * rendered. */
+    /* Position below explanation text to dynamically accommodate text
+     * wrapping across different font sizes. */
     lv_obj_align_to(remote_control_status_label, explanation, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
 
 #if LV_USE_QRCODE
@@ -3322,26 +3139,10 @@ static lv_obj_t * build_wireless_screen(void) {
     items[1] = (icon_grid_item_t){ "wireless/bt.png", "wireless/bt_s.png", "Bluetooth", bt_tile_cb, NULL };
     items[2] = (icon_grid_item_t){ "wireless/airplay.png", "wireless/airplay_s.png", "AirPlay", airplay_tile_cb, NULL };
     items[3] = (icon_grid_item_t){ "wireless/dlna.png", "wireless/dlna_s.png", "DLNA", dlna_tile_cb, NULL };
-    /* Relabeled from the stock "HiBy Link" -- this project doesn't implement
-     * that proprietary protocol (see the remote-control design doc/plan for
-     * why: only partially recoverable from firmware strings, and only useful
-     * against HiBy's own closed-source app). This is that plan's own Phase 1
-     * (read-only Now Playing web page) now wired up -- see
-     * build_remote_control_screen(). */
-    /* Shortened from "Remote Control"/"Import via Wi-Fi" -- real-device
-     * feedback: the full names overflowed this tile's caption width. The
-     * screens these tiles open keep their own full titles (build_remote_
-     * control_screen()/Import via Wi-Fi's own title label) -- only the grid
-     * caption is shortened. */
+    /* Shortened captions ("Remote" and "Import") prevent overflow within tile bounds. */
     items[4] = (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "Remote", remote_control_tile_cb, NULL };
     items[5] = (icon_grid_item_t){ "wireless/via.png", "wireless/via_s.png", "Import", import_wifi_tile_cb, NULL };
-    /* 160: bigger than the shared 100% default -- explicit user request.
-     * Bumped again from an earlier 120 once label_inside_icon (see
-     * build_icon_grid_screen()'s own comment) stopped reserving a separate
-     * below-icon label row, freeing up the room to grow the icon itself
-     * rather than just its surrounding whitespace -- lands at very close to
-     * these assets' own native 212x190 resolution within this screen's
-     * available cell height. */
+    /* 160% icon scale to closely match native asset resolution within cell height. */
     lv_obj_t * scr = build_launcher_menu_screen("Wireless", generic_back_cb, items, 6, 160, true,
                                                  &launcher_layout_config.wireless);
     finalize_screen_navigation(scr);

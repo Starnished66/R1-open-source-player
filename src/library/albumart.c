@@ -368,22 +368,45 @@ bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, 
 }
 
 bool albumart_load_file(const char * path, uint8_t ** out_data, uint32_t * out_size, uint32_t max_bytes) {
+    return albumart_load_file_ex(path, out_data, out_size, max_bytes, ARTWORK_PRIO_PLAYER) == ALBUMART_LOAD_OK;
+}
+
+albumart_load_result_t albumart_load_file_ex(const char * path, uint8_t ** out_data,
+    uint32_t * out_size, uint32_t max_bytes, artwork_priority_t priority) {
+    if (!out_data || !out_size) return ALBUMART_LOAD_INVALID;
     *out_data = NULL;
     *out_size = 0;
-    if (!path || !path[0]) return false;
+    if (!path || !path[0]) return ALBUMART_LOAD_INVALID;
     struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) return false;
-    if ((uint64_t) st.st_size > max_bytes) return false;
-    FILE * f = fopen(path, "rb");
-    if (!f) return false;
+    /* Nonblocking open prevents a substituted FIFO from hanging the worker
+     * before we can reject non-regular files. Size comes from this same fd. */
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return ALBUMART_LOAD_TEMPORARY;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return ALBUMART_LOAD_TEMPORARY;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size <= 0 || (uint64_t) st.st_size > max_bytes) {
+        close(fd);
+        return ALBUMART_LOAD_INVALID;
+    }
+    if (!artwork_check_memory_admission(priority, (size_t) st.st_size)) {
+        close(fd);
+        return ALBUMART_LOAD_TEMPORARY;
+    }
+    FILE * f = fdopen(fd, "rb");
+    if (!f) {
+        close(fd);
+        return ALBUMART_LOAD_TEMPORARY;
+    }
     uint8_t * data = malloc((size_t) st.st_size);
     bool ok = data && fread(data, 1, (size_t) st.st_size, f) == (size_t) st.st_size;
     fclose(f);
     if (!ok) {
         free(data);
-        return false;
+        return ALBUMART_LOAD_TEMPORARY;
     }
     *out_data = data;
     *out_size = (uint32_t) st.st_size;
-    return true;
+    return ALBUMART_LOAD_OK;
 }

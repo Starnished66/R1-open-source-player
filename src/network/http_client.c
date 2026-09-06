@@ -32,15 +32,7 @@ typedef struct {
 
 static bool sink_write(body_sink_t * sink, const uint8_t * data, size_t len, uint64_t total_written, uint64_t total_expected) {
     if (sink->out_file) {
-        /* Review finding: this branch previously had NO size bound at all,
-         * unlike the buffer branch below -- a malicious or misbehaving
-         * server could write an unbounded amount to this device's limited
-         * storage. max_buffer_size == 0 preserves the exact original
-         * unlimited behavior for http_get_to_file()/http_get_to_file_ex()
-         * (DLNA/cover-art downloads, which already trust their own
-         * source and whose callers were not touched by this fix); a real,
-         * nonzero bound is opted into by http_get_to_file_bounded() below,
-         * used by plugin.download_file_async(). */
+        /* Enforce max_buffer_size limit when nonzero. */
         if (sink->max_buffer_size > 0 && total_written > sink->max_buffer_size) return false;
         if (len > 0 && fwrite(data, 1, len, sink->out_file) != len) return false;
     } else {
@@ -432,29 +424,9 @@ void http_cancel_token_destroy(http_cancel_token_t * tok) {
 
 void http_cancel_token_cancel(http_cancel_token_t * tok) {
     if (!tok) return;
-    /* Review finding: shutdown() previously ran AFTER releasing the
-     * mutex, using an fd value already read while still holding it --
-     * between that unlock and the shutdown() call below, http_conn.c's
-     * own unregister-then-close (running under the same mutex, see its
-     * own comment) could complete entirely: clear tok->fd AND actually
-     * close the real fd, freeing that number for reuse by a completely
-     * unrelated socket elsewhere in this app, which the shutdown() call
-     * here would then hit instead. Reading fd and calling shutdown() on
-     * it must be one atomic operation with respect to unregister-and-
-     * close, not two separate steps split across an unlock -- both sides
-     * now hold this same mutex for their ENTIRE critical operation
-     * (including the actual shutdown()/close() syscall, not just the
-     * bookkeeping around it), so they can never interleave: either this
-     * shutdown() runs while the fd is still genuinely valid, or the
-     * close() already ran and tok->fd already reads -1 by the time this
-     * function gets the lock, correctly skipping shutdown() entirely. */
+    /* Record cancellation and shutdown socket under mutex to unblock pending I/O. */
     pthread_mutex_lock(&tok->mutex);
     tok->cancel_requested = true;
-    /* Same technique http_stream_close() already uses: force whatever
-     * blocking recv()/connect() is in progress to return immediately
-     * rather than waiting on the network. Safe to call even if fd is
-     * still -1 (nothing connected yet -- the cancel_requested flag alone
-     * makes the connect attempt itself bail out, see http_conn_open_ex()). */
     if (tok->fd >= 0) shutdown(tok->fd, SHUT_RDWR);
     pthread_mutex_unlock(&tok->mutex);
 }
@@ -474,18 +446,7 @@ const char * http_headers_get(const http_header_t * headers, int count, const ch
     return NULL;
 }
 
-/* Review finding: plugin-supplied header names/values (and the URL's own
- * path component) were copied straight into the request block with no
- * validation at all -- a value containing "\r\n" could inject an
- * arbitrary extra header or split the request into two. Rejected up
- * front (HTTP_ERR_INVALID_REQUEST), before any connection is even
- * attempted, rather than silently sanitized/truncated -- a plugin should
- * see a clear error for malformed input, not have it silently altered.
- * Name grammar loosely follows RFC 7230's "token" (reject CTLs, space,
- * DEL, and ':' specifically since that's the name/value separator);
- * value only rejects CR/LF/NUL, the actual injection vectors, not every
- * RFC-pedantic separator, since real header values legitimately contain
- * spaces, commas, etc. */
+/* Validates header names to prevent header injection (RFC 7230 token grammar). */
 static bool http_header_name_is_valid(const char * name) {
     if (!name || !name[0]) return false;
     for (const unsigned char * p = (const unsigned char *) name; *p; p++) {
@@ -535,13 +496,8 @@ static bool http_header_name_is_sensitive(const char * name) {
            strcasecmp(name, "Cookie2") == 0 || strcasecmp(name, "Proxy-Authorization") == 0;
 }
 
-/* Review finding: redirect handling reused the complete original request
- * -- including Authorization/Cookie -- for ANY absolute http(s) redirect
- * target, so a provider redirecting to a different host would receive
- * the original bearer token. Strips credential-bearing headers from
- * `headers`/`*header_count` in place whenever the two origins differ;
- * same-origin redirects (the overwhelmingly common case -- a server
- * redirecting within its own domain) are unaffected. */
+/* Strips sensitive credential headers (Authorization, Cookie, etc.) on
+ * cross-origin redirects. */
 static void http_strip_sensitive_headers(http_header_t * headers, int * header_count) {
     int out = 0;
     for (int i = 0; i < *header_count; i++) {
@@ -552,12 +508,7 @@ static void http_strip_sensitive_headers(http_header_t * headers, int * header_c
     *header_count = out;
 }
 
-/* Review finding: standard redirect method/body semantics weren't applied
- * at all -- every hop blindly resent the original method and body. 303
- * always becomes GET with no body; 301/302 conventionally rewrite POST to
- * GET with no body (matching curl's own default and every major browser,
- * even though RFC 7231 technically permits preserving the method); 307/308
- * and any non-POST method on 301/302 preserve both exactly. */
+/* Applies standard redirect method/body semantics (303 -> GET, 301/302 POST -> GET). */
 static void http_apply_redirect_method_semantics(http_request_t * req, int status) {
     if (status == 303 || ((status == 301 || status == 302) && req->method == HTTP_METHOD_POST)) {
         req->method = HTTP_METHOD_GET;
@@ -566,21 +517,7 @@ static void http_apply_redirect_method_semantics(http_request_t * req, int statu
     }
 }
 
-/* Clamps a per-stage timeout to whatever's left of the request's overall
- * total_timeout_ms budget -- review finding: total_timeout_ms was only
- * ever checked between hops/body chunks, so it bounded neither connect,
- * TLS setup, the request upload, nor a response-header read stuck waiting
- * on read_timeout_ms's own (possibly much larger, or unset) budget.
- * absolute_deadline_ms == 0 means no total-timeout was requested at all,
- * in which case the per-stage value passes through completely unchanged.
- * A deadline already in the past returns 1 (not 0, which would mean "no
- * timeout" to http_conn_open_ex) so the very next operation fails almost
- * immediately instead of blocking. This still isn't a single hermetic
- * deadline enforced on every syscall (SO_RCVTIMEO is a per-call timeout,
- * re-armed fresh for each read, so many small reads could in principle
- * still add up past the budget) -- but connect/handshake/every read now
- * genuinely cannot individually exceed the remaining budget, which is
- * the substantive part of the gap. */
+/* Clamps per-stage timeout to remaining total_timeout_ms deadline. */
 static uint32_t http_effective_timeout_ms(uint32_t requested_ms, uint64_t absolute_deadline_ms) {
     if (absolute_deadline_ms == 0) return requested_ms;
     uint64_t now = monotonic_now_ms();
@@ -592,12 +529,7 @@ static uint32_t http_effective_timeout_ms(uint32_t requested_ms, uint64_t absolu
     return requested_ms;
 }
 
-/* Review finding: http_conn_open_ex()'s old bool-plus-out_timed_out result
- * couldn't distinguish DNS failure, TLS setup failure, certificate
- * verification failure, or a non-timeout handshake failure from a plain
- * connect failure -- nearly everything collapsed into HTTP_ERR_CONNECT.
- * Translates the real http_conn_error_t (http_conn.h) into the stable
- * HTTP_ERR_* string a plugin actually sees. */
+/* Maps http_conn_error_t codes to public HTTP_ERR_* strings. */
 static const char * http_conn_error_to_str(http_conn_error_t e) {
     switch (e) {
         case HTTP_CONN_OK: return HTTP_ERR_NONE;
@@ -711,11 +643,7 @@ static bool read_response_ex(http_conn_t * conn, http_response_t * resp, body_si
 
     char status_line[256];
     if (!http_conn_reader_line(&reader, status_line, sizeof(status_line))) {
-        /* Review finding: every read failure reported the same generic
-         * error, indistinguishable from a genuine SO_RCVTIMEO read
-         * timeout. conn->last_read_timed_out (http_conn.c) is set on
-         * every http_conn_read() call, success or failure -- check it
-         * immediately after any read-based failure, here and below. */
+        /* Check if read timed out or failed with malformed status. */
         resp->error = conn->last_read_timed_out ? HTTP_ERR_TIMEOUT : HTTP_ERR_MALFORMED;
         return false;
     }
@@ -731,14 +659,7 @@ static bool read_response_ex(http_conn_t * conn, http_response_t * resp, body_si
     uint64_t content_length = 0;
     if (out_location && out_location_size > 0) out_location[0] = '\0';
 
-    /* Review-adjacent finding, caught while fixing the above: the
-     * original "while (read_line() && line[0] != '\0')" loop condition
-     * could not distinguish "read a genuine blank line (normal end of
-     * headers)" from "the read itself failed" -- a connection dropping
-     * mid-header-read was silently swallowed, falling through to try
-     * reading a body anyway with whatever partial header state existed
-     * so far, rather than being reported as a failure at all. Tracks
-     * which case ended the loop explicitly. */
+    /* Parse response headers until empty line. */
     char header_line[1024];
     bool headers_ok = true;
     for (;;) {
@@ -759,18 +680,7 @@ static bool read_response_ex(http_conn_t * conn, http_response_t * resp, body_si
             snprintf(out_location, out_location_size, "%s", value);
         }
 
-        /* Review finding: this used to snprintf() unconditionally,
-         * silently truncating a name/value too long for the fixed
-         * buffers (also what the compiler's own -Wformat-truncation
-         * warning was flagging). A truncated response header can look
-         * like a complete, valid value to a plugin when it isn't (a
-         * cut-off token or signed URL, for instance) -- DROP the header
-         * entirely instead if it doesn't fit, rather than hand back
-         * something silently corrupted. Real header names are
-         * practically always well under HTTP_HEADER_NAME_MAX; a value
-         * this long is rarer but real (a long Set-Cookie, for instance),
-         * and simply won't appear in the table rather than appearing
-         * wrong. */
+        /* Store header if within length limits; skip if too long to avoid truncation. */
         if (resp->header_count < HTTP_MAX_HEADERS) {
             size_t name_len = strlen(header_line);
             size_t value_len = strlen(value);
@@ -794,19 +704,7 @@ static bool read_response_ex(http_conn_t * conn, http_response_t * resp, body_si
     }
 
     if (!read_body(&reader, is_chunked, content_length, sink)) {
-        /* Review finding: unlike the status-line and header-loop failures
-         * just above in this same function, this branch never checked
-         * conn->last_read_timed_out -- a read_timeout_ms-triggered
-         * SO_RCVTIMEO firing mid-body-read (headers arrived fine, the body
-         * then stalled) was still unconditionally reported as io_error,
-         * exactly the bug already fixed for the status-line/header cases.
-         * Both real values are still overwritten by the caller when they
-         * apply (HTTP_ERR_CANCELLED for a cancel token, HTTP_ERR_TIMEOUT
-         * for a total_timeout_ms deadline that fired via the progress
-         * callback -- see http_request_ex_internal()'s own comment on why
-         * that second case needs a separate check: last_read_timed_out is
-         * false there too, since the underlying read that triggered the
-         * callback already succeeded). */
+        /* Report timeout if read timed out; otherwise report I/O error. */
         resp->error = conn->last_read_timed_out ? HTTP_ERR_TIMEOUT : HTTP_ERR_IO;
         return false;
     }
@@ -913,12 +811,7 @@ static bool http_request_ex_internal(http_request_t * req, http_cancel_token_t *
             return false;
         }
 
-        /* Review finding: refuse an https -> http downgrade while the
-         * caller asked for TLS verification -- a provider redirecting a
-         * bearer-token-bearing request to plain HTTP would otherwise send
-         * that token in the clear. This is deliberately a hard failure,
-         * not a silent strip-and-continue -- a downgrade this severe
-         * should be visible to the caller, not quietly worked around. */
+        /* Refuse HTTPS -> HTTP downgrade redirect when verify_tls is active. */
         if (is_https && !new_is_https && req->verify_tls) {
             free(body);
             DBG_LOG("http_client: http_request_ex refusing https->http downgrade redirect to '%s'\n", location);
@@ -926,13 +819,7 @@ static bool http_request_ex_internal(http_request_t * req, http_cancel_token_t *
             return false;
         }
 
-        /* Review finding: Authorization/Cookie/etc. were previously
-         * carried unconditionally to ANY absolute redirect target,
-         * including a different host entirely -- a real credential leak
-         * for exactly the kind of bearer-token API this app's own plugin
-         * foundation is built around. Strip them the moment the origin
-         * changes; a same-origin redirect (by far the common case) is
-         * unaffected. */
+        /* Strip sensitive credential headers on cross-origin redirect. */
         if (!http_same_origin(is_https, host, port, new_is_https, new_host, new_port)) {
             DBG_LOG("http_client: http_request_ex cross-origin redirect (%s:%s -> %s:%s) -- stripping credential headers\n",
                     host, port, new_host, new_port);
@@ -968,18 +855,7 @@ static bool http_request_ex_internal(http_request_t * req, http_cancel_token_t *
     return true;
 }
 
-/* Review finding: nothing capped connect/read/total_timeout_ms or
- * redirect_limit at the C level at all -- the Lua binding
- * (plugin_manager.c) independently clamps what a plugin can request, but
- * this library function is the authoritative entry point regardless of
- * caller (a future native caller, e.g. an authenticated audio-stream
- * reader, could pass whatever it likes otherwise). An enormous
- * redirect_limit could also drive http_request_ex_internal()'s recursion
- * deep enough to exhaust the C stack; capping it here bounds that
- * regardless of what any caller passes. These are a defensive backstop,
- * not the primary UX-facing limit -- see plugin_manager.c's own,
- * separately-enforced (and separately documented) bounds for the actual
- * plugin-facing ones. */
+/* Upper bounds for request timeouts and redirect limits. */
 #define HTTP_REQUEST_MAX_TIMEOUT_MS (5U * 60U * 1000U) /* 5 minutes */
 #define HTTP_REQUEST_MAX_REDIRECTS 10
 

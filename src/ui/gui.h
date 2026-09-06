@@ -133,16 +133,12 @@ void gui_plugin_set_text_color(const char * slot, uint32_t rgb);
 void gui_plugin_set_home_layout(const home_layout_config_t * config);
 
 /* Restores home_layout_config to its unconfigured (configured == false)
- * zero state -- for plugin_manager_deinit()'s own full-reload path
- * (gui_reload.c), called right before plugin_manager_init() re-runs every
- * plugin's top-level script. Without this, a plugin that used to call
- * set_home_layout() but was removed/disabled/failed to load this time
- * would leave the PREVIOUS load's stale config in place, silently
- * contradicting set_home_layout()'s own documented "nothing re-calls this
- * before the next rebuild -> reverts to native" contract (PLUGINS.md).
- * plugin.refresh_theme() never calls this -- it doesn't run plugin_manager_
- * deinit()/init() at all, only rebuilds Home from whatever's already
- * configured, so a targeted refresh correctly leaves this alone. */
+ * zero state -- called by plugin_manager_deinit()'s full-reload path
+ * (gui_reload.c) before plugin_manager_init() re-runs plugin scripts.
+ * Ensures that if a plugin modifying home_layout is removed or disabled,
+ * the layout reverts to native rather than retaining stale configuration.
+ * plugin.refresh_theme() does not call this, rebuilding Home from whatever
+ * is currently configured. */
 void gui_plugin_reset_home_layout(void);
 void gui_plugin_set_launcher_layout(const launcher_layout_config_t * config);
 void gui_plugin_reset_launcher_layout(void);

@@ -16,31 +16,9 @@ typedef struct {
  * original host media resolution: the host may resample before USB output. */
 void usb_dac_bridge_get_stream_info(usb_dac_stream_info_t * out);
 
-/* Bridges the vendor /dev/uac_sa character device (the raw PCM feed from a
- * connected PC once the USB gadget is in UAC2 "sound card" mode -- see
- * usb_mode_control.c) into the shared audio_output module (see
- * audio_output.h) -- the same local-hardware-or-Bluetooth output audio.c's
- * own playback thread uses -- so USB DAC mode actually produces sound
- * instead of just enumerating as a silent sound card, and (real-device bug
- * report: "can't use bluetooth headphones while on USB DAC") can route that
- * sound to a connected Bluetooth accessory the same way local file
- * playback already can.
- *
- * /dev/uac_sa's exact ioctl protocol is undocumented and wasn't recoverable
- * (no kernel .ko to disassemble -- the f_uac_sa function is built into the
- * kernel image -- and live-tracing the stock player's own use of it wasn't
- * possible: ADB and the DAC gadget can't be up on the USB port at the same
- * time on this device, and this device's adbd doesn't support `adb tcpip`
- * to move ADB off USB). This works without it: open the device, read() raw
- * frames, write them to the output -- no ioctl call at all. Getting there
- * needed two empirical corrections against uac_device_config.sh's own
- * gadget config, which turned out not to describe the driver's actual
- * behavior (see usb_dac_bridge.c's top comment for exactly what and how
- * each was confirmed): a channel fixup (one of the two interleaved 16-bit
- * slots is always noise, not the declared stereo pair) and the true frame
- * rate (measured at ~96kHz on a real device, not the declared 48kHz).
- * EPERM on read() until the host actually arms the streaming interface is
- * also handled (retried, not fatal) -- see EPERM_RETRY_LIMIT in the .c. */
+/* Bridges the /dev/uac_sa character device (the raw PCM feed from the host PC
+ * when the USB gadget is in UAC2 sound card mode) into the shared audio_output
+ * module, routing to local hardware or connected Bluetooth output. */
 
 /* Starts the bridge thread. Stops local playback first (audio_stop()) to
  * free the shared hw:0,0 device. Safe to call again while already running

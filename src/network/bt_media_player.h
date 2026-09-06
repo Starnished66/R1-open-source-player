@@ -3,36 +3,10 @@
 
 #include <stdbool.h>
 
-/* AVRCP transport-button support (headphones' own play/pause/next/previous
- * controlling this app) -- see bt_media_player.c's own top-of-file comment
- * for the full story on why this needs a real D-Bus service (registering
- * an org.mpris.MediaPlayer2.Player object with BlueZ) rather than the
- * one-shot bluetoothctl/dbus-send/bluealsa-cli calls everything else in
- * bluetooth_control.c uses.
- *
- * Target-only (needs the vendored libdbus, see Makefile's DBUS_DIR
- * section) -- callers must guard with #ifndef HOST_BUILD, matching every
- * other Bluetooth-output-only code path in this codebase (e.g.
- * audio_set_bt_output()'s own callers in gui.c). */
-
-/* Starts two independent background threads, both non-blocking and both
- * for the app's whole lifetime. Call once after Bluetooth has been
- * successfully enabled and its powered state has settled; safe to call
- * more than once, only the first call does anything:
- *
- * 1. Connects to the system bus, registers this app's D-Bus object, and
- *    registers as BlueZ's active media player (org.bluez.Media1.
- *    RegisterPlayer). Real-device finding (task #44, 2026-08-13): does
- *    NOT drive actual button dispatch on this device (see bt_media_
- *    player.c's own top-of-file comment) -- kept because it still answers
- *    standard AVRCP metadata/status queries correctly for any remote that
- *    asks.
- *
- * 2. Watches for BlueZ's own virtual "(AVRCP)" evdev keyboard device and
- *    reads button presses from it directly -- this is what actually
- *    drives bt_media_player_consume_play_pause()/_next()/_prev() below on
- *    real hardware. See bt_media_player.c's own top-of-file comment for
- *    the full story. */
+/* AVRCP transport-button and playback status support.
+ * Uses a D-Bus MediaPlayer2 player object to answer AVRCP metadata/status
+ * queries, and monitors the virtual evdev keyboard device created by BlueZ
+ * ("<name> (AVRCP)") to receive remote button presses. */
 void bt_media_player_init(void);
 
 /* Tells BlueZ (and therefore the connected accessory, if it displays

@@ -1,10 +1,5 @@
-/* Mozilla CA certificate bundle, as distributed by most Linux distros
- * (this copy taken from /etc/ca-certificates/extracted/tls-ca-bundle.pem on
- * the build machine) -- used to verify HTTPS server certificates for
- * network streaming (subsonic_client.c), since the real R1 firmware ships
- * an empty /etc/ssl/certs with no usable CA bundle of its own. Regenerate
- * by re-running the conversion script against a fresh bundle; not hand-
- * maintained. */
+/* Mozilla CA certificate bundle used to verify HTTPS server certificates for
+ * network streaming (subsonic_client.c). */
 
 #include "ca_bundle.h"
 

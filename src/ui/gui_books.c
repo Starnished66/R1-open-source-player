@@ -182,13 +182,9 @@ static void populate_books_files_screen(void) {
 
     char ** paths;
     int count;
-    /* Real-device bug report: this screen was slow to open every time -- a
-     * live recursive readdir()+stat() walk of the whole SD card on every
-     * visit (see books_scan_txt_files_with_timeout()'s own comment). Reads
-     * from the persistent book cache now instead (metadata_db.c), kept
-     * fresh only by rescan_books() (folded into Settings > Update Music
-     * Database) -- this screen itself never touches the filesystem or the
-     * stock db at all anymore. */
+    /* Reads from the persistent book cache (metadata_db.c), populated
+     * during library scan, rather than performing an SD card directory
+     * walk. */
     if (books_showing_favorites) {
         metadata_db_load_favorite_books(&paths, &count);
     } else {

@@ -126,12 +126,7 @@ static void test_diag_log(const char * area, const char * fmt, ...) {
 
 #define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
 #define COMPACT_LIST_PAGE_CACHE_SIZE 64
-/* STATUS_BAR_CLEARANCE comes from screen_builders.h (already included
- * above) -- this used to be a redundant local redefinition at the same
- * value (48), which silently masked the fact that it would override the
- * shared constant the moment the two ever diverged (as they now have,
- * screen_builders.h's own value shrunk to close a real-device dead-space
- * bug report). Removed rather than kept in sync by hand. */
+/* STATUS_BAR_CLEARANCE is provided by screen_builders.h. */
 #define EXTERNAL_COVER_MAX_BYTES (4U * 1024U * 1024U)
 
 static lv_obj_t * album_thumbnail_active_list = NULL;
@@ -262,13 +257,7 @@ static void existing_playlist_row_cb(lv_event_t * e) {
     const char * path = (const char *) lv_event_get_user_data(e);
     if (add_to_playlist_target_path[0] == '\0') return;
 
-    /* Playlist design change: adding a song already in the target playlist
-     * used to just append a second copy with no feedback -- confirmed by
-     * playlist_files_append()'s own unconditional fprintf(). Checked here
-     * rather than inside playlist_files_append() itself so that function
-     * stays a plain, unconditional "add this line" primitive other callers
-     * (e.g. new_playlist_name_done_cb() below, adding a brand-new file's
-     * first song) don't pay an unnecessary duplicate scan for. */
+    /* Check for duplicates before appending to avoid adding the same track twice. */
     if (playlist_files_contains(path, add_to_playlist_target_path)) {
         show_error_toast("Song already added");
         nav_pop();
@@ -361,15 +350,9 @@ static lv_obj_t * build_files_screen(void) {
     return scr;
 }
 
-/* One song within a group_songs_screen listing (Artist/Album Artist's own
+/* One song within a group_songs_screen listing (Artist/Album Artist's
  * albums, one album, Favorites, Most Played, a user .m3u playlist) -- an
- * owned path + precomputed display title, resolved via a targeted DB query
- * per screen-open rather than an index into any whole-library array. Every
- * one of those screens is inherently small (one album's tracks, a hand-
- * curated playlist, MOST_PLAYED_LIMIT), so a DB query plus a handful of
- * owned strings costs nothing next to what this app used to spend loading
- * the whole library into memory just to hand this screen a few dozen
- * entries. */
+ * owned path and display title resolved via targeted database query. */
 /* group_song_entry_t defined in gui_library.h */
 
 void free_group_song_entries(group_song_entry_t * entries, int count) {
@@ -476,21 +459,9 @@ static void all_songs_row_long_press_cb(int display_index) {
     if (all_songs_resolve_path_at(display_index, path, sizeof(path))) open_song_context_menu(path);
 }
 
-/* Real-device fix: this used to build items[] eagerly from all_songs_
- * paths/all_songs_sort_order (all_songs_count of them), which meant every
- * tap-to-play (via ensure_library_arrays_loaded(), a prerequisite for that
- * array to even exist) cost O(library) memory and CPU regardless of which
- * one song was actually wanted -- confirmed at real risk of exhausting
- * this device's 55MB RAM for a large enough library (see this session's
- * own measurements). Now paged (compact_list_set_paged_provider()): built
- * and immediately activated against the current library, populated a
- * bounded page at a time as the list scrolls, regardless of library size.
- * Both call sites (gui_init(), refresh_library_screens_after_reload()) run
- * this after metadata_db.c is already open (library_load_from_cache_only()
- * always precedes the first, and the DB has been open since boot by the
- * time the second's rescan/reinsert-triggered rebuild can happen), so
- * metadata_db_get_song_count() here always reflects the real library, not
- * an unopened DB's 0. */
+/* Builds the "All Songs" screen with a paged provider
+ * (compact_list_set_paged_provider()) so items are loaded incrementally
+ * on scroll rather than materializing the full library in memory. */
 static lv_obj_t * build_all_songs_screen(void) {
     lv_obj_t * scr = build_compact_list_screen("All Songs", generic_back_cb, NULL, 0, all_songs_row_click_cb,
                                                 all_songs_row_long_press_cb, &all_songs_list, NULL,
@@ -602,20 +573,10 @@ static void set_group_songs_entries(const group_song_entry_t * entries, int coun
     group_songs_count = copy_group_song_entries(&group_songs_entries, entries, count) ? count : 0;
 }
 
-/* Sibling to set_group_songs_entries() above for exactly one caller --
- * artist_albums_show_all_songs() -- whose own entries[] has no natural
- * upper bound (an artist's combined song count across every album, unlike
- * every other group_songs source here: one album, a hand-curated playlist,
- * MOST_PLAYED_LIMIT). Real bug caught in review: that caller already builds
- * its own owned path/title strings, then handing them to set_group_songs_
- * entries() (which unconditionally strdup's a SECOND copy via copy_group_
- * song_entries()) briefly held two full copies of every path/title at once
- * -- fine for the small/bounded sources, a real risk on this device's
- * limited RAM for a large artist. This takes ownership of an already-
- * strdup'd entries[] (same shape copy_group_song_entries() itself would
- * have produced) directly instead, so only one copy is ever held. The
- * caller must not free `entries` itself afterward -- this function now
- * owns it, same as if set_group_songs_entries() had copied it. */
+/* Sibling to set_group_songs_entries() that takes ownership of an already
+ * allocated entries[] array rather than copying it, avoiding duplicate
+ * allocations for large song lists. The caller transfers ownership and
+ * must not free `entries` or its elements afterward. */
 static void set_group_songs_entries_owned(group_song_entry_t * entries, int count) {
     free_group_song_entries(group_songs_entries, group_songs_count);
     group_songs_entries = entries;
@@ -730,15 +691,8 @@ static lv_obj_t * add_group_songs_page_row(const char * text, lv_event_cb_t cb) 
  * playlist that's become empty. */
 static void populate_playlists_screen(void);
 
-/* Real-device incident: LVGL still sends LV_EVENT_CLICKED on release even
- * when LV_EVENT_LONG_PRESSED already fired earlier in that same press --
- * same root cause/fix as quick_drawer_wifi_long_press_cb's own doc comment
- * (search that name for the full story) and compact_list_row_click_cb's
- * own matching fix (screen_builders.c) for All Songs -- without this, long-
- * pressing a Group Songs row (Artist/Album/Playlist/Favorites/Most Played)
- * to open the context menu also started that song playing on release. One
- * flag, not per-row -- single-touch device, only one row can plausibly be
- * mid-press at a time. */
+/* Suppresses the follow-up LV_EVENT_CLICKED event when a long press has
+ * already triggered the context menu on a group song row. */
 static bool group_song_row_long_press_fired = false;
 
 static void group_play_at(int pos) {
@@ -746,19 +700,8 @@ static void group_play_at(int pos) {
     if (group_songs_edit_m3u_path && !group_playlist_unchanged()) {
         reload_edited_playlist(); show_info_toast("Playlist changed. Select a song again."); return;
     }
-    /* Real bug caught in review: neither this malloc() nor the strdup()
-     * loop below were ever checked. Every group_songs source used to be
-     * small/bounded by construction (one album, a hand-curated playlist,
-     * MOST_PLAYED_LIMIT), so an allocation failure here was near-
-     * theoretical -- the new Artist/Album Artist "All Songs" row makes
-     * group_songs_count large enough on a real (if unusual) library that
-     * it's worth guarding for real: a failed malloc() previously meant an
-     * immediate NULL-pointer write on the very next line, and a failed
-     * strdup() partway through left a raw NULL path inside the array
-     * on_file_selected() was about to install as the live playback queue.
-     * calloc(), not malloc(), so an early bail-out can free every slot
-     * unconditionally -- entries strdup() never reached stay NULL (free()
-     * on NULL is a no-op) instead of holding garbage. */
+    /* Allocate and copy playlist paths using calloc to handle potential
+     * allocation failures cleanly. */
     char ** playlist_copy = calloc((size_t) group_songs_count, sizeof(char *));
     if (!playlist_copy) return;
     bool ok = true;
@@ -1016,23 +959,9 @@ void more_menu_list_cb(lv_event_t * e) {
  * real position, and reserving room for it whether or not it's showing
  * right now is simpler and safer than tracking two different widths.
  *
- * Uses lv_obj_get_coords(), NOT lv_obj_get_x() -- real-device bug report:
- * lv_obj_get_x() reflects the coordinate as set relative to whichever
- * alignment reference the object was last lv_obj_align()'d against (e.g. a
- * TOP_RIGHT-aligned button's "x" isn't a left-relative position at all), so
- * comparing it against title's own TOP_LEFT-relative x produced nonsense.
- * lv_obj_get_coords() always returns real absolute screen coordinates
- * regardless of how the object was positioned, so title_area.x1/icon_area.x1
- * are directly comparable -- BUT only once a layout pass has actually run:
- * lv_obj_align() (lv_obj_pos.c) just sets style properties (align + offset)
- * for the layout engine to resolve LATER, it does not compute real
- * coordinates on the spot. Without lv_obj_update_layout() first,
- * lv_obj_get_coords() here was reading stale/uncommitted (0,0) coordinates
- * from before either object was ever positioned -- second real-device bug
- * report, same "only a couple characters visible" symptom as the
- * lv_obj_get_x() bug this replaced, different root cause. Forcing the
- * layout pass on the screen (both objects' common parent) resolves both at
- * once. */
+ * Uses lv_obj_get_coords() after lv_obj_update_layout() on the common
+ * parent so absolute coordinates are resolved before calculating the
+ * available title width. */
 void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon) {
     lv_obj_update_layout(lv_obj_get_parent(title));
 
@@ -1120,10 +1049,7 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_obj_align(group_songs_list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(group_songs_list, 0, 0);
     lv_obj_set_style_border_width(group_songs_list, 0, 0);
-    /* Real-device bug report: same root cause as build_compact_list_widget()'s
-     * own fix (see that function's comment) -- rows here (Artist/Album
-     * Artist's own song/album drill-down list) were shifted right, clipped
-     * against the screen edge with a gap on the left. */
+    /* Clear padding so rows align flush with container edges. */
     lv_obj_set_style_pad_all(group_songs_list, 0, 0);
     lv_obj_set_scroll_dir(group_songs_list, LV_DIR_VER); /* see build_icon_grid_screen's comment */
     lv_obj_set_flex_flow(group_songs_list, LV_FLEX_FLOW_COLUMN);
@@ -1146,14 +1072,9 @@ static lv_obj_t * build_group_songs_screen(void) {
  * declared earlier, alongside show_text_entry(), for the PEQ screen's
  * tap-to-edit handlers.)
  *
- * Real T9 multi-tap keypad, replacing an earlier lv_keyboard_create()-based
- * QWERTY layout -- feature request: reuse the stock firmware's own
- * keyboard/ theme assets (confirmed present under THEME_ROOT on a real
- * device, same asset_path() convention as every other themed icon in this
- * app) for a phone-keypad-style input instead of LVGL's generic keyboard
- * widget. 12-key layout (1-9, Mode, Shift, plus dedicated Del/Left/Right/
- * Enter/Space keys) in a 4-column x 5-row grid; keys 2-9 cycle through their
- * letter group (e.g. key 2 -> a -> b -> c) on repeated taps within
+ * T9 multi-tap keypad using themed keyboard assets. 12-key layout (1-9, Mode,
+ * Shift, plus Del/Left/Right/Enter/Space) in a 4-column x 5-row grid; keys 2-9
+ * cycle through their letter group (e.g. key 2 -> a -> b -> c) on repeated taps within
  * TEXT_ENTRY_MULTITAP_MS, matching classic phone-keypad multi-tap text
  * entry. Three keypad modes (ABC/NUM/SYM), cycled via the Mode key: ABC
  * cycles letters per key (0 and 1 have no letter group on this asset set,
@@ -1252,10 +1173,9 @@ static bool album_thumbnail_sized_cache_hit(const albumart_info_t * info, char *
 
 #define THUMBNAIL_SIDECAR_MAX_BYTES (2U * 1024U * 1024U)
 #define ALBUM_ART_METADATA_TIMEOUT_MS 5000
-/* Worst-case overlap while the helper transfers a 4 MiB picture: helper
- * picture/lyrics plus the parent's picture copy. Decode has its own more
- * precise admission check after inspecting the returned image. */
-#define ALBUM_ART_METADATA_PEAK_BYTES (12U * 1024U * 1024U)
+/* Small startup allowance; the helper has a bounded address-space budget
+ * and the returned picture is admitted at its actual compressed size. */
+#define ALBUM_ART_METADATA_START_BYTES (1024U * 1024U)
 
 /* Persistent warmer state flags */
 static pthread_t album_thumb_gen_thread;
@@ -1265,6 +1185,12 @@ static atomic_int album_thumb_gen_generation;
 static bool album_thumb_gen_thread_joinable;
 static atomic_int album_thumb_gen_done_count;
 static atomic_int album_thumb_gen_total_count;
+static atomic_bool album_thumb_gen_retry_pending;
+static uint32_t album_thumb_gen_retry_tick;
+static volatile bool sd_format_active = false;
+#ifndef HOST_BUILD
+static bool sd_card_root_is_mounted(void);
+#endif
 
 static bool album_thumb_gen_should_cancel(int my_generation) {
     return atomic_load(&album_thumb_gen_cancel) ||
@@ -1278,19 +1204,8 @@ static void cancel_album_thumbnail_generation(void) {
     atomic_fetch_add(&album_thumb_gen_generation, 1);
 }
 
-/* Real-device review finding: a SIGSEGV inside musl's pthread_join()
- * (invalid read at a near-NULL offset), reproducibly triggered by
- * enabling/disabling plugins and navigating away from Manage Plugins. A
- * captured register dump confirmed pthread_join()'s own first argument --
- * album_thumb_gen_thread itself -- was a literal NULL at the fault, while
- * album_thumb_gen_thread_joinable read true; every write site to both
- * (start_album_thumbnail_generation()'s own pthread_create() success path,
- * this function's own reset on join) pairs them correctly in isolation, so
- * the joinable flag alone is not a safe guard against whatever flipped it
- * without a real thread behind it. Also require the handle itself to be
- * non-zero before joining -- musl's pthread_t is a real pointer here (a
- * NULL join is exactly what faulted), so this check is meaningful, not a
- * platform-specific guess. */
+/* Waits for thumbnail generation thread completion. Requires both the
+ * joinable flag and a non-NULL thread handle before calling pthread_join(). */
 static void reap_album_thumbnail_generation(void) {
     if (!album_thumb_gen_thread_joinable) return;
     album_thumb_gen_thread_joinable = false;
@@ -1358,7 +1273,12 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
 
     /* Step 1: Try sized Rockbox thumbnail cache (.72x72.bmp) */
     if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found))) {
-        if (albumart_load_file(found, &data, &size, THUMBNAIL_SIDECAR_MAX_BYTES)) {
+        albumart_load_result_t load = albumart_load_file_ex(found, &data, &size, THUMBNAIL_SIDECAR_MAX_BYTES, prio);
+        if (load == ALBUMART_LOAD_TEMPORARY) {
+            artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+            return false; /* Do not delete a valid cache file under memory pressure. */
+        }
+        if (load == ALBUMART_LOAD_OK) {
             cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
                                                                   prio, cancel_cb, user_data, out_pixels);
             free(data);
@@ -1380,7 +1300,12 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     /* Step 2: Try external sidecar file (cover.jpg, folder.jpg, etc.) */
     bool sidecar_searched = albumart_search_files(&info, "", found, sizeof(found));
     if (sidecar_searched) {
-        if (albumart_load_file(found, &data, &size, THUMBNAIL_SIDECAR_MAX_BYTES)) {
+        albumart_load_result_t load = albumart_load_file_ex(found, &data, &size, THUMBNAIL_SIDECAR_MAX_BYTES, prio);
+        if (load == ALBUMART_LOAD_TEMPORARY) {
+            artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+            return false;
+        }
+        if (load == ALBUMART_LOAD_OK) {
             cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
                                                                   prio, cancel_cb, user_data, out_pixels);
             free(data);
@@ -1400,7 +1325,12 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     }
 
     /* Step 3: Try embedded picture from audio file */
-    if (!artwork_check_memory_admission(prio, ALBUM_ART_METADATA_PEAK_BYTES)) {
+    /* Serialize extraction with decoding too. The helper bounds parser
+     * allocations, and the parent admits the actual returned picture size. */
+    artwork_acquire_result_t admission = artwork_coordinator_acquire(
+        prio, ALBUM_ART_METADATA_START_BYTES, 300, cancel_cb, user_data);
+    if (admission == ARTWORK_ACQUIRE_CANCELLED || admission == ARTWORK_ACQUIRE_SUSPENDED) return false;
+    if (admission != ARTWORK_ACQUIRE_OK) {
         artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
         return false;
     }
@@ -1408,6 +1338,7 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     memset(&meta, 0, sizeof(meta));
     metadata_artwork_result_t metadata_result =
         metadata_read_artwork_isolated(song->path, &meta, ALBUM_ART_METADATA_TIMEOUT_MS);
+    artwork_coordinator_release(prio);
     data = meta.picture_data;
     size = meta.picture_size;
     free(meta.lyrics);
@@ -1517,10 +1448,10 @@ static void * album_thumb_gen_thread_func(void * arg) {
         if (album_thumb_gen_should_cancel(my_generation)) break;
 
         /* Suspend warmer while audio is playing, albums screen is actively open, or memory is low */
-        while (audio_is_playing() || atomic_load(&album_thumbnail_screen_active) ||
-               system_get_mem_available_bytes() < 8U * 1024U * 1024U) {
-            if (album_thumb_gen_should_cancel(my_generation)) goto done;
-            usleep(250000); /* Check every 250ms */
+        if (audio_is_playing() || atomic_load(&album_thumbnail_screen_active) ||
+            !artwork_check_memory_admission(ARTWORK_PRIO_WARMER, ALBUM_ART_METADATA_START_BYTES)) {
+            atomic_store(&album_thumb_gen_retry_pending, true);
+            goto done;
         }
 
         int n = metadata_db_get_albums_page_filtered(NULL, offset, ALBUM_THUMB_GEN_BATCH, rows);
@@ -1529,9 +1460,9 @@ static void * album_thumb_gen_thread_func(void * arg) {
             if (album_thumb_gen_should_cancel(my_generation)) goto done;
 
             /* Check suspension before each album */
-            while (audio_is_playing() || atomic_load(&album_thumbnail_screen_active)) {
-                if (album_thumb_gen_should_cancel(my_generation)) goto done;
-                usleep(250000);
+            if (audio_is_playing() || atomic_load(&album_thumbnail_screen_active)) {
+                atomic_store(&album_thumb_gen_retry_pending, true);
+                goto done;
             }
 
             song_row_t song;
@@ -1553,6 +1484,8 @@ static void * album_thumb_gen_thread_func(void * arg) {
 
             artwork_fail_reason_t fail_reason;
             if (artwork_failure_cache_is_blocked(song.id, source_mtime, &fail_reason)) {
+                if (fail_reason == ARTWORK_FAIL_TEMPORARY)
+                    atomic_store(&album_thumb_gen_retry_pending, true);
 #ifdef TEST_BUILD_TAG
                 failed++;
 #endif
@@ -1579,6 +1512,10 @@ static void * album_thumb_gen_thread_func(void * arg) {
             album_thumbnail_load_or_decode_ex(&song, ARTWORK_PRIO_WARMER,
                                               album_thumb_gen_cancel_cb, (void *) (intptr_t) my_generation,
                                               &pixels);
+            if (!pixels && (audio_is_playing() || album_thumb_gen_should_cancel(my_generation) ||
+                (artwork_failure_cache_is_blocked(song.id, source_mtime, &fail_reason) &&
+                 fail_reason == ARTWORK_FAIL_TEMPORARY)))
+                atomic_store(&album_thumb_gen_retry_pending, true);
 #ifdef TEST_BUILD_TAG
             if (pixels) generated++; else failed++;
 #endif
@@ -1634,24 +1571,15 @@ done:
  * it's been superseded and exit, which happens within roughly one album's
  * worth of decode work given the cancellation check at the top of every
  * iteration. */
-/* Real-device bug report: a real SIGBUS (root-caused, see start_library_
- * rescan()'s own LIBRARY_RESCAN_THREAD_STACK_SIZE comment, to library_
- * rescan_thread's undersized default pthread stack) was reproduced again by
- * removing the SD card right as an "Update Music Database" pass finished --
- * exactly when this function's own thread starts (see this function's own
- * doc comment: called right after that scan's thread is joined). Both
- * pthread_create() calls below still used a bare NULL attr despite doing
- * the single heaviest per-item work in this app: a full JPEG/PNG cover
- * decode (see start_next_album_thumbnail()'s own "never run two full cover
- * decoders at once... doubling peak JPEG/PNG memory" comment) -- at least
- * as stack-hungry as library_rescan_thread's own format parsers, arguably
- * more given image decoders' own internal buffer/table usage, yet neither
- * had that thread's fix applied. Same pattern, same fix. */
+/* 4MB stack size configured for thumbnail generation thread to accommodate
+ * stack usage of JPEG and PNG cover decoders. */
 #define ALBUM_COVER_DECODE_THREAD_STACK_SIZE (4 * 1024 * 1024)
 
 static void start_album_thumbnail_generation(void) {
     cancel_album_thumbnail_generation();
     reap_album_thumbnail_generation();
+    atomic_store(&album_thumb_gen_retry_pending, false);
+    album_thumb_gen_retry_tick = lv_tick_get();
 
     int artist_count = 0, album_artist_count = 0, album_count = 0;
     metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
@@ -1757,6 +1685,8 @@ static void album_thumbnail_begin_screen(lv_obj_t * list) {
     /* Visible rows are latency-sensitive and the lazy path already writes
      * the identical persistent entries. Stop warming after its current
      * decode, then let start_next_album_thumbnail() service this screen. */
+    if (atomic_load(&album_thumb_gen_active))
+        atomic_store(&album_thumb_gen_retry_pending, true);
     cancel_album_thumbnail_generation();
     atomic_store(&album_thumbnail_screen_active, true);
     album_thumbnail_active_list = list;
@@ -1873,6 +1803,7 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
 static void quiesce_album_artwork_workers(void) {
     cancel_album_thumbnail_generation();
     reap_album_thumbnail_generation();
+    atomic_store(&album_thumb_gen_retry_pending, false);
 
     album_thumbnail_generation++;
     album_thumbnail_queue_count = 0;
@@ -2007,19 +1938,8 @@ static void album_row_click_cb(int index) {
     (void) show_album_group(&group);
 }
 
-/* Real-device fix: these three screens used to build items[] eagerly from
- * artist_groups/album_groups/album_artist_groups (all_songs_count-scale
- * arrays), which meant every tile tap cost O(library) memory and CPU --
- * confirmed at real risk of exhausting this device's 55MB RAM for a large
- * enough library, same class as All Songs' own pre-paging cost (see build_
- * all_songs_screen()'s own comment). Artists/Album Artist are paged now
- * (compact_list_set_paged_provider()); Albums additionally fixes the real
- * album-identity bug found in review (see metadata_db_get_albums_page_
- * filtered()'s own comment) as part of the same conversion, since that's
- * exactly where the bug lived. Built and immediately activated against the
- * current library -- both call sites (gui_init(), refresh_library_screens_
- * after_reload()) run this after metadata_db.c is already open, same
- * reasoning as build_all_songs_screen()'s own comment. */
+/* Builds the Artists screen using a paged provider
+ * (compact_list_set_paged_provider()) to load artist groups incrementally. */
 static lv_obj_t * build_artists_screen(void) {
     lv_obj_t * scr = build_compact_list_screen("Artists", generic_back_cb, NULL, 0, artist_row_click_cb, NULL,
                                                 &artists_list, NULL, LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
@@ -2327,19 +2247,9 @@ static bool search_matches(const char * haystack, const char * needle) {
 #define SEARCH_RESULTS_MAX 200
 
 /* ---- Live search: async DB query for db_backed bindings -------------
- * Efficiency finding: metadata_db_search_names()'s query shape (a
- * ROW_NUMBER() window function wrapped in a leading-wildcard LIKE) is
- * a full tagcache scan every time this
- * runs. Used to run synchronously, directly on the UI thread, once per
- * keystroke; now debounced (search_debounce_timer below, same one-shot-
- * timer idiom as pending_progress_seek_timer above) so a burst of
- * keystrokes collapses into one query, and that one query runs on a
- * background thread -- same shape as poll_lyrics_load()/poll_cover_decode()
- * elsewhere in this file -- so even a single slow scan on a large library
- * never blocks a frame. Non-db_backed bindings (the two Subsonic ones)
- * still scan their in-memory arrays synchronously inside search_apply_
- * filter() below -- cheap and already bounded at SEARCH_RESULTS_MAX, not
- * what this finding was about. */
+ * Debounces keystrokes via search_debounce_timer and offloads the database
+ * search query to a worker pthread, keeping the UI responsive. In-memory
+ * bindings search synchronously in search_apply_filter(). */
 #define SEARCH_DEBOUNCE_MS 200
 
 static lv_timer_t * search_debounce_timer;
@@ -2396,12 +2306,7 @@ static void launch_search_job(search_binding_t * b, const char * query) {
 }
 
 /* Builds compact_list_item_t/filtered_indices/filtered_labels from a
- * finished search job's hits and applies them to b->list -- the same tail
- * search_apply_filter()'s own db_backed branch used to do synchronously
- * right after the query, now split out so poll_search_job() below can call
- * it once the background query actually finishes. Old filtered_indices/
- * filtered_labels are freed and replaced atomically here (the list only
- * ever shows one complete result set, never a stale-then-fresh flash). */
+ * finished search job's hits and applies them to b->list. */
 static void search_apply_results_to_list(search_binding_t * b, const metadata_db_search_hit_t * hits, int matched) {
     compact_list_item_t * items = malloc(sizeof(compact_list_item_t) * (size_t) (matched > 0 ? matched : 1));
     int * indices = malloc(sizeof(int) * (size_t) (matched > 0 ? matched : 1));
@@ -2448,25 +2353,13 @@ void poll_search_job(void) {
     }
 }
 
-/* Rebuilds binding->list's contents to only entries matching `query`, via
- * compact_list_set_items() rather than a screen rebuild. An empty query
- * shows NOTHING (not the full library) -- real-device feedback: search
- * should be an overlay that only shows something once you've actually
- * typed something, not the whole list up front. filtered_indices maps each
- * surviving display row back to its real index (an offset into the same
- * unfiltered sequence the screen's own paged provider/click handlers use),
- * for the row-click callbacks' search_remap_index() calls. Stops once
- * SEARCH_RESULTS_MAX matches are found -- see that constant's own comment.
+/* Rebuilds binding->list contents to entries matching `query` via
+ * compact_list_set_items(). An empty query clears the list.
+ * `filtered_indices` maps display rows back to unfiltered indices for
+ * search_remap_index(), capped at SEARCH_RESULTS_MAX matches.
  *
- * db_backed bindings (Artists/Albums/Album Artist/All Songs/Files) query
- * metadata_db_search_names() directly instead of scanning name_of/count_ptr
- * -- no whole-library array dependency at all, matching the A-Z index's own
- * conversion. filtered_labels owns the label strings compact_list_item_t
- * points at in this path, since a DB query's results have no other long-
- * lived home to point into. As of the async rework above, the query itself
- * runs on a background thread (launch_search_job()) -- this function only
- * ever handles the immediate "query cleared" case for db_backed bindings
- * synchronously now. */
+ * db_backed bindings query metadata_db_search_names() via a background
+ * worker (launch_search_job()). In-memory bindings are filtered synchronously. */
 static void search_apply_filter(search_binding_t * b, const char * query) {
     bool have_query = query && query[0];
 
@@ -2622,10 +2515,7 @@ static void search_close(search_binding_t * b) {
 
     if (b->db_backed) {
         /* Switches the list back to paged mode instead of rebuilding a
-         * static items[] array -- the exact same provider/total_count
-         * build_*_screen() set up originally (see its own compact_list_set_
-         * paged_provider() call), recomputed fresh here in case a rescan
-         * changed the library while search was open. */
+         * static items[] array. */
         int artist_count = 0, album_artist_count = 0, album_count = 0;
         metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
         int total = 0;
@@ -2685,24 +2575,15 @@ void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list,
 
     lv_obj_t * search_btn = lv_image_create(screen);
     lv_image_set_src(search_btn, asset_path("sub_back/btn_search.png"));
-    /* Vertically centered within the same STATUS_BAR_CLEARANCE..+TITLE_ROW_HEIGHT
-     * band the back button's own 64x64 box occupies (build_back_button()),
-     * not the shorter title-label-specific centering formula this used to
-     * borrow -- real-device feedback: the two didn't line up. */
+    /* Vertically centered within the STATUS_BAR_CLEARANCE..+TITLE_ROW_HEIGHT
+     * band to match the back button alignment. */
     lv_obj_align(search_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 51) / 2);
     lv_obj_add_flag(search_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(search_btn, search_btn_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) id);
     lv_obj_add_flag(search_btn, LV_OBJ_FLAG_GESTURE_BUBBLE); /* added after finalize_screen_navigation()'s one-time pass, needs this set explicitly -- see screen_gesture_event_cb()'s own comment */
 
-    /* Sized to bg_search.png's own native 440x80 (not lv_pct(100)) and
-     * left-aligned at x=0 -- LVGL's bg_image draws at native size CENTERED
-     * within the object's own box (see LIST_ROW_WIDTH's own comment in
-     * screen_builders.h), so a same-size box is what makes the image
-     * render flush against bar's left edge instead of with margins on
-     * both sides. Still fully covers the 64px-wide back button underneath
-     * for tap-absorption purposes (440 >> 64). No mag_icon/clear_btn --
-     * real-device feedback: search mode should show just the bar and the
-     * close ("x") button, nothing else. */
+    /* Sized to bg_search.png native dimensions (440x80) and aligned to
+     * cover the title row. Includes close button and text input. */
     lv_obj_t * bar = lv_obj_create(screen);
     lv_obj_set_size(bar, 440, SEARCH_BAR_HEIGHT);
     lv_obj_set_pos(bar, 0, SEARCH_BAR_Y);
@@ -2753,9 +2634,7 @@ static void files_search_row_click_cb(int display_index) {
     on_file_selected_lazy_all_songs(all_songs_display_index);
 }
 
-/* ---- Playlists (Music submenu, replacing the old Genres tile -- real-
- * device feedback: genre tags are inconsistently populated across
- * libraries, unlike play history/manual curation) --
+/* ---- Playlists (Music submenu) --
  *
  * Favorites and Most Played (top 20 by play count, see metadata_db's
  * song_play_count table) are resolved fresh from the DB on every tap and
@@ -2804,18 +2683,9 @@ static group_song_entry_t * build_group_song_entries_from_paths(char ** paths, i
     return entries;
 }
 
-/* Real-device bug report: playing a song from the remote-control web UI
- * always queued the entire library (alphabetical order, whatever play_mode
- * happened to be) instead of just the Album/Playlist the song was actually
- * tapped from -- see remote_control.c's own request_play_playlist_name
- * comment for the full story. playlist_name/artist_filter/album_artist_
- * filter/album_filter are remote_control_consume_play_index()'s own
- * context, empty string meaning "not provided". song_path is the caller's
- * own DB resolution of remote_control.c's song id (metadata_db_get_song_
- * by_id()). Falls back to the existing whole-library behavior whenever no
- * usable scope resolves -- both the plain "no filters at all" case (someone
- * playing from All Songs/search) and a stale reference (e.g. a playlist
- * renamed/deleted since the phone last loaded its song list). */
+/* Plays a song selected via the remote-control web UI within its intended
+ * scope (album, playlist, or artist). Falls back to full-library queue if
+ * no scope is provided or resolved. */
 void play_remote_control_song(const char * song_path, const char * playlist_name, const char * artist_filter,
                                       const char * album_artist_filter, const char * album_filter) {
     if (!song_path || !song_path[0]) return;
@@ -3278,23 +3148,11 @@ static lv_obj_t * build_playlists_screen(void) {
     return scr;
 }
 
-/* ---- CUE sheet track list (File Browser -> tap a .cue) -- MVP scope, real
- * bug report/ISSUES.md to-do item: browse and jump straight to any track
- * within a single large lossless rip (album.flac + album.cue), rather than
- * only being able to play/scrub the one giant file with no idea where each
- * song actually starts. Tapping a track seeks the shared physical file to
- * that track's own INDEX 01 offset (on_file_selected_at() -- see its own
- * comment) and plays from there.
- *
- * Deliberately NOT wired into gapless next/prev-across-track-boundaries in
- * this pass: playlist[] here holds the SAME file path once per CUE track
- * (so the row tapped and the "Track N of M" label at least make sense), but
- * skip-next/skip-prev between two of them just restarts the same physical
- * file at 0:00 rather than seeking to the next track's own start -- doing
- * that correctly needs a per-playlist-slot start-offset the core playback
- * model doesn't carry today (every other source in this app is genuinely
- * one file per slot). Browsing back to this screen and tapping a different
- * track directly still works correctly either way. */
+/* ---- CUE sheet track list (File Browser -> tap a .cue) ----
+ * Allows browsing and jumping straight to any track within a single
+ * audio rip (e.g. album.flac + album.cue). Tapping a track seeks the
+ * shared audio file to that track's INDEX 01 offset (on_file_selected_at())
+ * and begins playback from there. */
 static cue_sheet_t current_cue_sheet;
 static bool current_cue_sheet_valid = false;
 static char current_cue_source_dir[PATH_MAX];
@@ -3414,47 +3272,18 @@ static void * library_rescan_thread_func(void * arg) {
     return NULL;
 }
 
-/* See this function's own doc comment in gui_library.h. Was false while the
- * real-device SIGBUS below was under investigation; re-enabled now that
- * root cause (library_rescan_thread's undersized default pthread stack --
- * see LIBRARY_RESCAN_THREAD_STACK_SIZE's own comment just above start_
- * library_rescan()) is fixed. Does not affect the manual Settings > Update
- * Music Database row or plugin.refresh_library(), neither of which check
- * this. */
+/* Controls automatic library rescanning on boot / SD mount. */
 #define GUI_LIBRARY_AUTO_RESCAN_ENABLED true
 bool gui_library_auto_rescan_enabled(void) {
     return GUI_LIBRARY_AUTO_RESCAN_ENABLED;
 }
 
-/* Real-device bug report: a real SIGBUS traced (via a "last file scanned"
- * breadcrumb, see scan_one_song_into_db()'s own comment) to THREE different,
- * unrelated crash sites across separate reproductions -- LVGL draw code, a
- * metadata parser, and tagcache.c's own write_all()/tagcache_end_update()
- * commit path -- each time landing exactly at a callee's own entry point on
- * this exact thread. That shape (same thread, different function each time,
- * always right at a call boundary) is the signature of a stack overflow, not
- * a bug local to any one of those three functions: it manifests wherever the
- * stack happens to peak that particular run, not at a fixed line. This
- * thread's own call chain is easily the deepest and most stack-hungry in the
- * app -- scan_one_song_into_db() -> metadata_read_isolated() -> whichever of
- * a dozen format-specific parsers -> (eventually, once every file is done)
- * metadata_db_end_update() -> tagcache_end_update() -> rebuild_indexes()/
- * write_all() -- yet was the one thread in this file still created with a
- * bare NULL attr, using whichever default musl gives it. Its own sibling,
- * scan_walk_worker() above (SCAN_WALK_THREAD_STACK_SIZE), already reserves 1
- * MiB for doing far less: a plain directory walk with no format parsers or
- * tagcache commit in its own call chain at all. Matching that pattern here,
- * with headroom above it for the deeper chain, is the fix. */
+/* 4MB stack size configured for library rescan thread to accommodate deep
+ * call chains through metadata parsers and tagcache indexing. */
 #define LIBRARY_RESCAN_THREAD_STACK_SIZE (4 * 1024 * 1024)
 
 void start_library_rescan(void) {
-    /* Real-device incident: several call sites below don't already guard on
-     * library_rescan_active themselves, and a second call while a rescan
-     * thread is still running would spawn a second library_rescan_thread_
-     * func() thread racing the first over metadata_db.c's own scan-
-     * generation state (metadata_db_begin_update()/end_update()) and
-     * stomping the single library_rescan_thread handle -- undefined
-     * behavior, not just wasted work. */
+    /* Ignore request if a rescan is already running. */
     if (library_rescan_active) return;
     TEST_DIAG("DB", "rescan_requested existing_songs=%lld rss_kb=%ld",
               (long long) metadata_db_get_song_count(), test_diag_rss_kb());
@@ -3508,19 +3337,8 @@ static void refresh_library_screens_after_reload(void) {
     if (lv_screen_active() != gui_busy_get_screen()) {
         nav_reset_to_home();
     } else {
-        /* Audit finding: this exception only skipped nav_reset_to_home()
-         * -- the lv_obj_delete() calls below always run regardless. Real
-         * bug: subsonic_downloading_screen is a shared singleton (Wi-Fi
-         * "Connecting...", Subsonic connect, SD format, and library
-         * rescan all reuse it), not exclusive to the rescan flow this
-         * exception was written for. If the user reached one of these
-         * four screens via some other in-progress navigation (e.g. All
-         * Songs -> Wi-Fi settings -> "Connecting...") and a reload lands
-         * while that shared screen is active, its stack slot goes stale
-         * the instant lv_obj_delete() runs below -- and a later nav_pop()
-         * back through it loads a freed screen. Purge any of the four
-         * from nav_stack before deleting them, even though the active
-         * screen itself is deliberately left alone. */
+        /* Purge screens being replaced from nav_stack before deleting them
+         * so a subsequent nav_pop() does not pop a deleted screen. */
         lv_obj_t * being_replaced[] = { all_songs_screen, artists_screen, albums_screen, album_artist_screen,
                                          recently_added_screen };
         gui_navigation_remove_screen_instances(being_replaced, (int)(sizeof(being_replaced) / sizeof(being_replaced[0])));
@@ -3562,32 +3380,9 @@ static void refresh_library_screens_after_reload(void) {
                      true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 }
 
-/* SD-card-reinsertion fast path -- see poll_sd_card_hotplug()'s own call
- * site. Real-device feature request: reinserting a card the app has
- * already scanned before was recreating/re-reading its whole tag cache
- * from scratch every single time (a full start_library_rescan(), same
- * multi-minute cost as a genuinely new library, since that's the only path
- * poll_sd_card_hotplug() ever used on the mount edge) instead of just
- * loading the cache that same card's own root already carries (metadata_db.c's
- * METADATA_DB_PATH lives ON the SD card itself, not somewhere device-global
- * -- see its own comment -- so a previously-scanned card reinserted here
- * has its own already-populated database sitting right there).
- * library_load_from_cache_only() (a bounded tagcache read, not a filesystem
- * walk -- see its own comment) already does this instantly, giving the
- * "Library loaded" toast below (and the covered case of a genuinely fresh,
- * never-scanned card -- see metadata_db_had_no_saved_database()'s own
- * comment -- which this simply leaves empty here) immediate feedback.
- *
- * A real filesystem walk still follows unconditionally, via the exact same
- * start_library_rescan() every other automatic trigger now uses (USB Mass
- * Storage disconnect, Wi-Fi Import closing) -- the card could have been
- * plugged into a PC and had files added/removed while it was out, which a
- * cache-only reload can never see. Its own "Updating music database..."
- * busy screen (blocking, matching every other automatic trigger's choice
- * to prefer that over a silent background scan -- see poll_usb_storage_
- * hotplug()'s own comment on why) briefly follows the toast rather than
- * replacing it; poll_library_rescan()'s completion handler does its own
- * refresh/toast once that finishes, so nothing here needs to wait for it. */
+/* Fast path for SD card reinsertion: loads the card's existing database
+ * cache first for immediate library availability, followed by a background
+ * rescan to detect any files modified while unmounted. */
 static void reload_library_on_sd_reinsert(void) {
     playlist_files_refresh_async(PLAYLISTS_DIR);
     library_load_from_cache_only();
@@ -3612,16 +3407,21 @@ void poll_library_rescan(void) {
     if (album_thumb_gen_thread_joinable && !atomic_load(&album_thumb_gen_active))
         reap_album_thumbnail_generation();
 
-    /* Keep the screen awake for the whole "Updating music database..."/
-     * "Library updated" window -- label and progress-bar text updates
-     * don't touch LVGL's own indev-driven inactivity clock (no touch, no
-     * hw button), so without this the auto screen-timeout would fire mid-
-     * scan on a short timeout setting same as it would on any other idle
-     * screen. Real-device feedback: with the screen-timeout fix that made
-     * touch no longer wake an auto-slept screen (only the power button
-     * does now), that read as the whole device freezing -- a dark,
-     * touch-unresponsive screen mid-rescan looks identical to a genuine
-     * hang from the outside. */
+    /* Deferred work is not an active worker/wakelock. Retry after the
+     * failure-cache backoff, and resume after the user leaves Albums. */
+    if (atomic_load(&album_thumb_gen_retry_pending) &&
+        !atomic_load(&album_thumb_gen_active) && !album_thumbnail_active &&
+        !atomic_load(&album_thumbnail_screen_active) && !library_rescan_active &&
+        !sd_format_active && !audio_is_playing() &&
+        lv_tick_elaps(album_thumb_gen_retry_tick) >= 15000 &&
+#ifndef HOST_BUILD
+        sd_card_root_is_mounted() &&
+#endif
+        artwork_check_memory_admission(ARTWORK_PRIO_WARMER, ALBUM_ART_METADATA_START_BYTES))
+        start_album_thumbnail_generation();
+
+    /* Keep the screen awake for the rescan progress display so the auto
+     * screen-timeout does not trigger mid-rescan. */
     if (library_rescan_active || library_rescan_success_pending)
         lv_display_trigger_activity(NULL);
 
@@ -3675,64 +3475,14 @@ void poll_library_rescan(void) {
  * see them regardless of which one is defined first. */
 static void show_sd_mount_failed_popup(void); /* defined below, alongside its popup */
 static bool sd_mount_fail_notified = false;
-static volatile bool sd_format_active = false;
 
 #ifndef HOST_BUILD
-/* Real-device bug report: reinserting the SD card while the device is
- * already on doesn't populate its files in the player. Root cause -- see
- * main.c's own mount_sd_card_if_needed() comment for the full real-device
- * investigation: this firmware has NO hotplug mechanism at all for the
- * internal SD card slot (confirmed by reading every relevant piece of
- * config -- /etc/mdev.conf only has a rule for external USB mass-storage
- * sd[a-z] devices, not the internal mmcblk* card; no fstab entry; no
- * init.d script). Something else on the system does eventually retry
- * mounting it reactively, but confirmed (via dmesg) to take on the order
- * of many minutes, and even once mounted, this app itself never notices --
- * only the user-triggered Settings > Update Music Database rescan reads
- * the SD card, and nothing was polling for "did it just become mounted"
- * to trigger that automatically.
+/* Periodic polling for SD card mount state changes.
  *
- * This polls whether MUSIC_ROOT_DIR is currently a real mount point (its
- * st_dev differs from its parent /data/mnt's -- the standard POSIX "is
- * this a mountpoint" check, since an unmounted MUSIC_ROOT_DIR is just an
- * empty directory living directly on /data/mnt's own filesystem). While
- * not mounted, it retries mount_sd_card_if_needed() itself every few
- * seconds instead of waiting on whatever slow reactive mechanism the OS
- * has -- harmless to call when nothing's inserted (see that function's own
- * comment: it just fails silently). On the unmounted -> mounted edge, it
- * loads the tagcache already on that card (if any). It does not start
- * Settings > Update Music Database -- a full walk is user-triggered only.
- *
- * Real-device feature request (2026-08-08): removal wasn't handled at all
- * symmetrically -- pulling the card left All Songs/Artists/Albums/
- * Playlists, and the Files screen, still showing entries for files that no
- * longer exist (tapping one would just fail to play). The mounted ->
- * unmounted edge now closes the database, rebuilds the library screens
- * empty, and resets Files -- it must not scan, because a scan against the
- * empty unmounted directory would write a blank database onto the parent
- * filesystem and, if the card remounted mid-scan, walk the whole card.
- *
- * That edge relies on sd_card_root_is_mounted() actually flipping to false
- * on a physical eject, which isn't guaranteed on its own: this firmware has
- * no hotplug mechanism at all for this slot (see above), so nothing ever
- * calls umount() when the card is pulled -- the VFS mount entry for
- * MUSIC_ROOT_DIR can just sit there claiming to still be mounted (same
- * st_dev) with reads underneath it now failing at the I/O layer instead.
- * sd_card_device_node_present() checks for the card's block device node
- * separately -- mdev creates/removes /dev/mmcblk0p1 directly off the
- * kernel's own uevents for the mmc host controller's card-detect line, a
- * baseline mdev behavior independent of the custom per-device *rules*
- * mdev.conf lacks for mmcblk* (those only add extra actions on top, they're
- * not what makes the node itself appear/disappear) -- so the node going
- * away is a real, kernel-driven signal of physical removal even though
- * nothing above the block layer reacts to it. When it disappears while
- * still nominally mounted, this self-issues the same `umount` this
- * firmware's own mass_storage_removing.sh uses for external USB media, so
- * the ordinary mounted -> unmounted edge below fires correctly on the very
- * next poll instead of never firing at all. Unverified against a real
- * eject on this exact device/kernel at the time this was written (no live
- * unit on hand) -- flagged for a real removal-cycle test rather than
- * asserted as confirmed working. */
+ * When an unmounted card is detected, retries mounting. On transition to
+ * mounted, reloads the database cache from the card. On transition to
+ * unmounted, closes the database, clears library screens, and resets
+ * the file browser to root. */
 #define SD_CARD_MOUNT_POLL_SECONDS 5
 
 /* Consecutive failed poll cycles (SD_CARD_MOUNT_POLL_SECONDS apart) before
@@ -3776,17 +3526,8 @@ static bool sd_card_base_device_present(void) {
 }
 
 void poll_sd_card_hotplug(void) {
-    /* Starts true: mount_sd_card_if_needed() already ran once at boot
-     * (main.c, before gui_init()) and the initial library load already
-     * happened against whatever was mounted by then -- assuming "already
-     * mounted" here avoids this poll re-triggering a redundant rescan on
-     * its very first tick when the card was present all along. If it
-     * wasn't actually mounted yet at that point, this does NOT reliably
-     * fall into the "not mounted" case below (see boot_library_recheck_
-     * done's own comment further down for why -- that used to be this
-     * comment's own claim, and was wrong: a boot-time race that self-heals
-     * within this function's very first tick never confirms as "not
-     * mounted" for long enough to flip this back to false). */
+    /* Assume already mounted initially since mount_sd_card_if_needed() ran
+     * at boot. */
     static bool was_mounted = true;
     /* See its own comment further down, where it's checked -- separate
      * one-shot guard for the boot-time-mount-race case was_mounted's own
@@ -3794,23 +3535,9 @@ void poll_sd_card_hotplug(void) {
     static bool boot_library_recheck_done = false;
     static time_t last_check = 0;
     static int mount_fail_streak = 0;
-    /* Real-device testing: a plain single-poll "was mounted, now isn't"
-     * edge fires the removal-collapse rescan below too eagerly -- confirmed
-     * live that mount_sd_card_if_needed() (called synchronously, right
-     * above that rescan's own pthread_create()) can complete a re-mount
-     * faster than this function's own SD_CARD_MOUNT_POLL_SECONDS poll
-     * interval, so a brief unmount (this app's own umount -l retry above,
-     * or -- unverified but plausible -- a very fast physical reseat) can
-     * have already remounted again by the time the removal handler
-     * actually runs, making it close and reopen against the *already-back*
-     * real card instead of collapsing to empty, which
-     * reload_library_on_sd_reinsert() below exists to do on the insert
-     * edge. Requiring the unmounted state to be seen on
-     * SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD consecutive polls (reset to 0 the
-     * moment "mounted" is seen again, see the mounted branch below) before
-     * acting filters that out -- a genuine removal stays gone far longer
-     * than this short confirmation window, so real removal handling is
-     * delayed by only a few seconds, not skipped. */
+    /* Require unmounted state across consecutive polls
+     * (SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD) before tearing down library
+     * state to debounce brief transient unmounts. */
     static int unmount_confirm_streak = 0;
 #define SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD 2
 
@@ -3839,6 +3566,7 @@ void poll_sd_card_hotplug(void) {
              * generator start/reap poll so this hotplug callback never
              * blocks the UI on an in-progress image decode. */
             cancel_album_thumbnail_generation();
+            atomic_store(&album_thumb_gen_retry_pending, false);
             unmount_confirm_streak++;
             if (unmount_confirm_streak >= SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD && !library_rescan_active) {
                 /* Close the SD-resident tagcache so a later reinsert opens
@@ -3895,20 +3623,8 @@ void poll_sd_card_hotplug(void) {
     mount_fail_streak = 0;
     sd_mount_fail_notified = false;
     unmount_confirm_streak = 0; /* seeing "mounted" again cancels any not-yet-confirmed removal */
-    /* reload_library_on_sd_reinsert() runs LAST in both branches below, real-
-     * device bug report: it used to run first, and now that it unconditionally
-     * ends with start_library_rescan() (a fresh SD card, or one with no saved
-     * database, gets a real background rescan -- see that function's own
-     * comment), that call pushes a brand-new busy screen and starts rendering
-     * it in this exact same tick. file_browser_reset_to_root() and fallback_
-     * font_on_sd_mounted() (the latter potentially swapping every global font
-     * pointer and forcing a full UI invalidate/refresh, if a custom SD-card
-     * font needs reloading) used to run against whatever screen the user was
-     * already stably looking at; running them AFTER the busy screen had just
-     * been pushed instead interleaved a font swap with that screen's own
-     * first-ever render. Settling both quick, synchronous side effects first,
-     * then triggering the (now screen-switching) reload last, removes that
-     * interleaving instead of relying on timing to avoid it. */
+    /* Reset file browser and reload fallback fonts before triggering the
+     * rescan screen switch. */
     if (!was_mounted && !library_rescan_active) {
         file_browser_reset_to_root();
         fallback_font_on_sd_mounted();
@@ -4086,10 +3802,7 @@ static void sd_format_confirm_cb(lv_event_t * e) {
     start_sd_format();
 }
 
-/* Only ever shown from the debounced detection in poll_sd_card_hotplug()
- * above -- deliberately has no permanent home in Settings, so it can't be
- * used to format a perfectly working card by mistake; it only exists at
- * all once a real, sustained mount failure has actually been observed. */
+/* Displayed when persistent SD card mount failure is detected. */
 static void show_sd_mount_failed_popup(void) {
     lv_obj_remove_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(sd_mount_failed_popup, LV_OBJ_FLAG_HIDDEN);
@@ -4134,14 +3847,7 @@ static bool power_off_countdown_active = false;
 static uint32_t power_off_countdown_start_tick;
 
 static void hide_power_off_countdown_popup(void) {
-    /* NULL-checked -- originally only ever reachable from a tap on this
-     * exact popup (power_off_countdown_backdrop_cb/power_off_countdown_
-     * cancel_cb), which guaranteed both objects existed. gui_library_
-     * teardown()'s own cancel_power_off_countdown() call (for gui_reload.c's
-     * in-process UI reload) reaches this unconditionally, on every reload,
-     * regardless of whether these were ever built for THIS process
-     * generation -- an unguarded lv_obj_add_flag(NULL, ...) there would
-     * dereference a NULL lv_obj_t*, not a graceful no-op. */
+    /* Null-check ensures safe teardown even if countdown popups were not built. */
     if (power_off_countdown_popup_backdrop) lv_obj_add_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
     if (power_off_countdown_popup) lv_obj_add_flag(power_off_countdown_popup, LV_OBJ_FLAG_HIDDEN);
 }
@@ -4392,26 +4098,10 @@ typedef struct {
     int32_t track_number;
 } artist_song_sort_entry_t;
 
-/* Real bug caught in review: Artist/Album Artist tagcache groups sort their
- * own song membership by (album, file path) -- cmp_slot_album_path() in
- * tagcache.c, used for grouping/counting, NOT for a listening order -- so
- * the flattened fetch this backs would otherwise read back in whatever
- * order filenames happen to alphabetize to within each album, not disc/
- * track order (a real album's OWN listing, by contrast, is grouped and
- * sorted with cmp_slot_path(), which is disc/track-aware). This mirrors
- * that same disc/track/path tie-break locally, entirely client-side --
- * changing tagcache.c's own shared group order would affect every other
- * consumer of Artist/Album Artist groups, not just this one screen.
- *
- * Second bug caught in review: grouping by album name ALONE first sorted
- * this comparator too -- but album identity throughout this codebase is
- * (album, album_artist) together, not name alone (see group_row_t's own
- * comment: "two different artists' same-titled albums (\"Greatest Hits\", a
- * self-titled album) don't collide", which is exactly why metadata_db_get_
- * album_songs() takes both). Two distinct albums this artist appears on
- * that happen to share a name (a generic title, or two same-titled self-
- * titled albums under different album_artist credits) would otherwise
- * interleave by disc/track number instead of staying separate. */
+/* Sorts songs by album, then album artist, then disc number, track number,
+ * and file path. Grouping by both album and album artist prevents collision
+ * between same-titled albums from different artists, while sorting by disc
+ * and track preserves listening order within each album. */
 static int cmp_artist_song_sort_entry(const void * a, const void * b) {
     const artist_song_sort_entry_t * ea = (const artist_song_sort_entry_t *) a;
     const artist_song_sort_entry_t * eb = (const artist_song_sort_entry_t *) b;
@@ -4435,31 +4125,8 @@ static int cmp_artist_song_sort_entry(const void * a, const void * b) {
  * across all its albums) and hands it to show_group_songs_take_ownership()
  * -- the "All Songs" row prepended at index 0 by show_artist_albums().
  *
- * Real bug caught in review: `total` used to be summed from artist_albums_
- * groups[].song_count -- each entry's FULL album song_count, from the
- * per-album breakdown already in memory. That overestimates badly for an
- * artist who appears on a "Various Artists"-style compilation: the whole
- * compilation's track count gets added even though this artist only owns
- * one of its tracks, allocating room for (and briefly holding) thousands of
- * entries to display a single song. metadata_db_get_group_offset() +
- * metadata_db_get_groups_page() reads the ARTIST/ALBUM_ARTIST group's own
- * song_count directly -- the same exact-membership count metadata_db_get_
- * artist_songs()/get_album_artist_songs() below actually iterates -- so the
- * allocation always matches what's really going to be fetched.
- *
- * Real risk flagged in review: even with that overestimation gone, this
- * whole fetch+sort+build still runs synchronously on the UI thread with no
- * upper bound, unlike every OTHER group_songs source here (one album, a
- * hand-curated playlist, MOST_PLAYED_LIMIT) -- a genuinely prolific artist
- * could still mean a real, if much smaller, spike and a noticeable freeze.
- * Converting this to a background-worker-plus-busy-overlay (this file's own
- * established pattern for real multi-hundred-ms work) would be the
- * complete fix, but is a meaningfully sized, lifetime-risk-bearing change
- * (what happens if the user backs out or opens a different artist mid-
- * fetch?) for a case this cap already keeps far short of ever mattering in
- * practice. ARTIST_ALBUMS_ALL_SONGS_CAP is deliberately generous -- well
- * beyond any real single artist's realistic discography -- so this only
- * ever bites the genuinely pathological case the cap exists for. */
+ * Exact track count is queried via metadata_db_get_group_offset() /
+ * metadata_db_get_groups_page() so buffer sizing matches accurately. */
 #define ARTIST_ALBUMS_ALL_SONGS_CAP 4000
 
 static bool artist_albums_show_all_songs(void) {
@@ -4523,22 +4190,11 @@ static bool artist_albums_show_all_songs(void) {
         return false;
     }
 
-    /* Real bug caught in review: this list spans every album this artist
-     * has, so a plain fetch order read back alphabetically-by-filename
-     * within each album instead of disc/track order -- see cmp_artist_
-     * song_sort_entry()'s own comment. */
+    /* Sort songs in disc and track order within each album across the artist's catalog. */
     qsort(sort_entries, (size_t) n, sizeof(*sort_entries), cmp_artist_song_sort_entry);
 
-    /* Real bug caught in review: this used to hand the strdup'd entries[]
-     * straight to show_group_songs(), which itself strdup's a SECOND full
-     * copy of every path/title (copy_group_song_entries(), via
-     * set_group_songs_entries()) before this function's own copy was
-     * freed -- briefly holding two complete copies of a list with no
-     * natural size ceiling (unlike every other group_songs source here).
-     * Moving the already-owned path/title pointers into a fresh group_
-     * song_entry_t[] and transferring THAT via show_group_songs_take_
-     * ownership() (see its own comment) keeps exactly one copy alive at
-     * all times. */
+    /* Transfer ownership of path and title strings into a group_song_entry_t
+     * array for show_group_songs_take_ownership() to avoid duplicate allocations. */
     group_song_entry_t * entries = malloc(sizeof(*entries) * (size_t) n);
     if (!entries) {
         for (int i = 0; i < n; i++) {
@@ -4554,13 +4210,7 @@ static bool artist_albums_show_all_songs(void) {
     }
     free(sort_entries);
 
-    /* Real bug caught in review: truncating to ARTIST_ALBUMS_ALL_SONGS_CAP
-     * with no indication at all left this screen -- titled with the plain
-     * artist/album-artist name, same as every other group_songs source --
-     * silently missing songs (and, since playback queues straight from this
-     * same list, silently unplayable) past the cap. A toast right as the
-     * screen opens discloses it without needing a permanent title
-     * annotation or its own dedicated UI. */
+    /* Disclose truncation via a toast if the songs exceed the display cap. */
     if (real_total > ARTIST_ALBUMS_ALL_SONGS_CAP) {
         char msg[96];
         snprintf(msg, sizeof(msg), "Showing first %d of %d songs", n, real_total);
@@ -4889,10 +4539,7 @@ static int album_artists_fetch_page(void * ctx, int offset, int count, compact_l
 
 
 
-/* Forward declaration -- defined alongside gui_library_teardown() further
- * down this file, reused here too for the matching "can't change theme
- * more than a couple of times" investigation (now tracking a second crash
- * site inside this function's own rebuild, not just the teardown). */
+/* Diagnostic logging helper for teardown and initialization steps. */
 static void library_teardown_diag(const char * step);
 
 void gui_library_init(void) {
@@ -4993,14 +4640,8 @@ void gui_library_init(void) {
  * and their backdrops are built directly on lv_layer_top() (see
  * build_confirm_popup()'s own comment), not as children of any of these
  * screens, so they need their own explicit deletion. */
-/* Temporary investigation instrumentation for the "can't change theme more
- * than a couple of times" report -- a real crash/hang landing inside this
- * exact function on a repeated (Nth, not first) call, with the process
- * dying with no dmesg SIGSEGV record this time (unlike the earlier Wavy
- * incident). Same pattern as gui_reload.c's own reload_diag()/plugin_
- * manager.c's deinit_diag() -- append-only, fsync per line, one call per
- * statement here specifically so a recurrence pinpoints the exact
- * statement, not just "somewhere in gui_library_teardown()". */
+/* Diagnostic logging helper writing teardown and init steps to reload_diag.log
+ * with fsync per line to pinpoint failures during theme reload. */
 static void library_teardown_diag(const char * step) {
     int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd < 0) return;
@@ -5250,18 +4891,8 @@ static void scan_one_song_into_db(const char * path) {
     cached_tags_t cached;
     if (have_stat && metadata_db_get(path, mtime, size, &cached)) return;
 
-    /* Real-device bug report: a real SIGBUS crash was traced into
-     * metadata_read_isolated()'s in-process path (only .mp3/.aac skip the
-     * fork-isolation isolated_needs_child() otherwise gives every other
-     * format -- see that function's own comment), but with no way to know
-     * WHICH file was being parsed at the moment it crashed, out of however
-     * many are on the card. This breadcrumb (best-effort, no locking -- a
-     * diagnostic string, not something correctness depends on) records the
-     * path right before the call most likely to crash, so crash_diag_
-     * handler() (main.c) can include it in the exact same reload_diag.log
-     * every other crash diagnostic in this app already writes to -- turning
-     * "some file crashed the scanner" into "this specific file did" the
-     * next time it happens. */
+    /* Record breadcrumb path prior to reading metadata so crash diagnostics
+     * can report the specific file being parsed if an unhandled signal occurs. */
     snprintf(g_scan_last_path, sizeof(g_scan_last_path), "%s", path);
 
     track_metadata_t meta;
@@ -5293,13 +4924,6 @@ static void scan_one_song_into_db(const char * path) {
  * is known (library_scan_once(), before its spool-reading loop starts);
  * _done is advanced by that same loop, one file at a time (see
  * scan_one_song_into_db()'s own caller in library_scan_once()). */
-
-/* Defined later, alongside the rest of the Books screen (needs
- * books_scan_txt_files_with_timeout(), the live-walk fallback it shares
- * with populate_books_files_screen()'s old scanning code). Folds the
- * now-removed "Scanning" row's job into this same rescan, per real-device
- * feedback -- one rescan action, not two separate ones for music and
- * books. */
 
 
 /* Refreshes the persistent playlist cache (metadata_db.c) from
@@ -5468,29 +5092,10 @@ void library_scan_once(void) {
               (unsigned long long) (test_diag_now_ms() - scan_started_ms), test_diag_rss_kb());
 }
 
-/* Boot-time equivalent of library_scan_once() above (still used verbatim
- * for the user-triggered Settings > Update Music Database rescan) that
- * matches the stock player's own boot behavior: load whatever's already
- * cached, don't walk the filesystem or re-read any file's tags. Real-device
- * incident: the full scan_once() path took ~149 seconds against a real
- * cache-cold 2066-song library (confirmed via persistent boot-checkpoint
- * logging -- library_scan_once() ran synchronously from gui_init(), before
- * this app's first frame could render or the main loop could start), long
- * enough that this app had never once survived a genuine cold boot in this
- * project's history -- no hardware watchdog would tolerate that delay, on
- * any user's library of meaningful size. metadata_db_open() itself stays
- * here (not removed): opening the on-disk tagcache (metadata_db.c) is
- * a bounded index load, not per-file filesystem I/O, and
- * finishes in well under a second even for a large library -- it's
- * specifically the filesystem walk + per-file tag-parsing pass that had to
- * move to the user-triggered-only path. All four library screens (All
- * Songs, Artists, Albums, Album Artist) and every drill-down/search/A-Z
- * feature reachable from them are DB-paged from the moment they're built,
- * so boot never needs to build any whole-library in-memory snapshot at
- * all -- the boot-time OOM this function exists to avoid (a 32,000-song
- * library's worth of per-song structs, plus a widget-per-row cost, turning
- * a completed scan into a boot loop on this device's 55MB RAM) simply has
- * nothing left to trigger it. */
+/* Boot-time equivalent of library_scan_once() that loads existing cached
+ * metadata from the database without walking the filesystem or re-reading
+ * file tags. The filesystem walk and tag extraction only run on explicit
+ * user-triggered rescan. */
 void library_load_from_cache_only(void) {
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;

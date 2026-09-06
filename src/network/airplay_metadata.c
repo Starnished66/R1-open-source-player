@@ -204,11 +204,8 @@ static void run_session(void) {
 static void * metadata_thread_func(void * arg) {
     (void) arg;
 
-    /* Restart-in-place loop -- same reasoning and same bug fixed as
-     * airplay_bridge.c's own bridge_thread_func(): airplay_metadata_start()
-     * sets restart_requested instead of spawning a second thread when
-     * called while this one is still in META_STOPPING, so a rapid
-     * off-then-on can never leave a running session with no reader. */
+    /* Restart-in-place loop: handles restarts requested while stopping without
+     * spawning multiple concurrent threads. */
     for (;;) {
         run_session();
 

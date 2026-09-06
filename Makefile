@@ -819,10 +819,17 @@ playlist-selftest:
 	    -Wl,--gc-sections -lpthread -lm -o $(BUILD_TARGET_DIR)/playlist_test
 	./$(BUILD_TARGET_DIR)/playlist_test
 
-# Host-buildable tests for JPEG scale selection, tjpgd 1/2 1/4 1/8 decode,
-# cover_decode_to_rgb565_ex, and malformed/oversized rejection. Links the
-# real decoder + tjpgd + artwork coordinator; audio_is_playing and lodepng
-# are stubbed in the test (JPEG-only). Not part of `all`.
+# Host tests for artwork-only parsing, size admission and helper allocation limits.
+.PHONY: metadata-artwork-selftest
+metadata-artwork-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -ffunction-sections -fdata-sections -DHOST_BUILD=1 -DLV_CONF_INCLUDE_SIMPLE=1 \
+	    -I. -Isrc/library -Isrc/core -Isrc/audio -Isrc/ui -Ilvgl -Idr_libs -Istb_vorbis -Imbedtls/include \
+	    src/library/metadata_artwork_test.c src/library/artwork_coordinator.c src/library/albumart.c src/core/utf8_util.c \
+	    -Wl,--gc-sections -lpthread -lm -o $(BUILD_TARGET_DIR)/metadata_artwork_test
+	./$(BUILD_TARGET_DIR)/metadata_artwork_test
+
+# Host JPEG decoder tests plus the mocked LVGL PNG buffer ownership contract.
 cover_decode_scale_test:
 	@mkdir -p $(BUILD_TARGET_DIR)
 	$(CC) -O0 -g -Wall -DHOST_BUILD=1 -DLV_CONF_INCLUDE_SIMPLE=1 \

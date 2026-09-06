@@ -31,20 +31,11 @@ void gui_library_teardown(void);
 void gui_library_refresh_music_screen(void);
 
 void start_library_rescan(void);
-/* Guards every AUTOMATIC start_library_rescan() trigger this app has (fresh-
- * database boot, SD reinsertion, USB Mass Storage disconnect, Wi-Fi Import
- * close) -- NOT the manual Settings > Update Music Database row or
- * plugin.refresh_library(), both of which the user/plugin author explicitly
- * asked for and stay enabled regardless. Real-device bug report: a real
- * SIGBUS crash, reproduced three times at three different, unrelated crash
- * sites (LVGL draw code, a metadata parser, tagcache.c's own write_all()) --
- * that shape (same background thread, different function each time, always
- * right at a call boundary) is a stack overflow's signature, traced to
- * library_rescan_thread's undersized default pthread stack (start_library_
- * rescan(), gui_library.c, LIBRARY_RESCAN_THREAD_STACK_SIZE's own comment).
- * This flag stayed false while that was under investigation; it's back to
- * true now that the actual fix (an explicit, larger stack for that thread,
- * matching scan_walk_worker's own sibling pattern) is in. */
+/* Guards every AUTOMATIC start_library_rescan() trigger (fresh-database
+ * boot, SD reinsertion, USB Mass Storage disconnect, Wi-Fi Import close) --
+ * does NOT guard the manual Settings > Update Music Database row or
+ * plugin.refresh_library(), both of which are explicitly requested and
+ * stay enabled regardless. */
 bool gui_library_auto_rescan_enabled(void);
 void poll_library_rescan(void);
 void poll_sd_format(void);

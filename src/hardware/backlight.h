@@ -17,11 +17,11 @@
  * glitch, not something fixable from software beyond just never writing
  * that value). Callers never need to think about either edge themselves. */
 
-/* Real-hardware feedback: letting the quick-drawer slider go all the way to
- * a literal 0 turns the screen fully black with no way to see what you're
- * doing to bring it back up. Never go lower than this (in raw/safe-percent
- * terms) in either direction -- logical 0 still maps here, not to a true
- * off; only backlight_set_screen_on(false) ever writes a true 0. */
+/* Minimum brightness in percent. Never go lower than this in either
+ * direction -- logical 0 still maps here, not to a true off;
+ * only backlight_set_screen_on(false) ever writes a true 0.
+ * Values below this make the screen fully black with no visible feedback
+ * to adjust back upward. */
 #define BACKLIGHT_MIN_PERCENT 5
 
 /* Current brightness as logical 0-100, or -1 if no backlight class device

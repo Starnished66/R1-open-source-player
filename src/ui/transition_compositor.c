@@ -130,13 +130,9 @@ bool transition_compositor_begin(const lv_draw_buf_t * from, const lv_draw_buf_t
      * be at least w*2 -- lv_draw_buf_goto_xy() below trusts each buffer's
      * OWN header.stride for row addressing, so a buffer that's the right
      * w/h but a smaller data_size or a too-small stride (e.g. a corrupt or
-     * truncated snapshot) would still walk off its own end. 64-bit
-     * arithmetic throughout: at this display's real size (480x800x2) the
-     * product fits comfortably in 32 bits, but validation code should
-     * never be the thing that overflows first. Real-device review finding
-     * (2026-08-22): an earlier version validated `to` against a threshold
-     * computed from `from`'s own stride instead of its own, silently
-     * passing a mismatched `to` buffer whenever the two strides differed. */
+     * truncated snapshot) would still walk off its own end.
+     * Uses 64-bit arithmetic to prevent overflow. Validates both `from` and
+     * `to` buffers against thresholds derived from their respective strides. */
     uint64_t min_stride = (uint64_t) (uint32_t) w * 2ULL;
     uint64_t from_need = (uint64_t) from->header.stride * (uint64_t) (uint32_t) h;
     uint64_t to_need = (uint64_t) to->header.stride * (uint64_t) (uint32_t) h;
@@ -176,10 +172,8 @@ bool transition_compositor_begin(const lv_draw_buf_t * from, const lv_draw_buf_t
      * makes every _lv_inv_area() call (every lv_obj_invalidate*() anywhere
      * in the app, for the rest of this compositor session) a silent no-op,
      * so lv_timer_handler() has nothing queued to ever render or flush.
-     * lv_snapshot_take() (used to build both full-frame transition
-     * sources) is unaffected either way -- confirmed by reading
-     * lv_snapshot.c: it draws into its own independently-allocated buffer,
-     * never disp->buf_act. */
+     * lv_snapshot_take() is unaffected because it renders into its own
+     * independently-allocated buffer rather than disp->buf_act. */
     lv_display_enable_invalidation(disp, false);
     compositor_active = true;
 #ifdef UI_PERF_TRACE

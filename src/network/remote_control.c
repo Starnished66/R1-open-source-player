@@ -39,9 +39,8 @@ static int status_duration_seconds = 0;
 static float status_volume = 0;
 static int status_play_mode = 0;
 
-/* Playback requests -- same edge-triggered "background thread sets a flag,
- * update_timer_cb consumes it" pattern as hw_buttons.c/bt_media_player.c's
- * transport buttons, guarded by the same mutex as the status snapshot. */
+/* Playback requests -- edge-triggered flags consumed by update_timer_cb.
+ * Guarded by status_mutex. */
 static bool request_play_pause = false;
 static bool request_next = false;
 static bool request_prev = false;
@@ -57,42 +56,14 @@ static int64_t request_queue_index = 0;
 static bool request_has_queue_remove = false;
 static int request_queue_remove_offset = 0;
 static bool request_queue_clear = false;
-/* Real-device bug report: playing a song from the web UI always built the
- * playback queue from the whole library (alphabetical, whatever play_mode
- * happens to be), regardless of which Album/Playlist the song was actually
- * tapped from -- reads as "it ignores the list I picked from and just
- * shuffles/plays through everything" even though play_mode itself was
- * always honored correctly, just against the wrong (too-broad) queue. The
- * web UI already fetches each of these views with the exact same artist/
- * album_artist/album/playlist context (see build_library_json()'s own
- * filters and /api/playlists/songs), so /api/playback/play now accepts the
- * same params echoed back -- empty/absent means "whole library", same as
- * today. gui.c resolves these into the same artist_groups/album_groups/
- * album_artist_groups or .m3u file its own on-device Artist/Album/Playlist
- * screens already use, so a remote play scopes next/prev identically to
- * tapping that song on the device itself. */
+/* Scope filters echoed back by /api/playback/play to build the queue within
+ * an album, artist, album-artist, or playlist view. Empty string means entire library. */
 static char request_play_playlist_name[128] = "";
 static char request_play_artist_filter[128] = "";
 static char request_play_album_artist_filter[128] = "";
 static char request_play_album_filter[128] = "";
 
-/* Real-device rework: this used to be a second, independent full-library
- * copy (five strdup'd-per-song arrays plus pre-rendered artist/album JSON
- * caches, all rebuilt from scratch on every gui.c-side library change),
- * specifically because the HTTP handler thread can't safely touch gui.c's
- * own all_songs_paths/all_song_tags (not mutex-protected, assumed UI-thread-
- * only). For a library sized in the tens of thousands that duplication was
- * its own multi-megabyte cost, unconditionally paid the moment Remote
- * Control was turned on -- the same failure shape as this whole session's
- * boot-time incident, just reached through a different door. Every function
- * below now queries metadata_db.c directly instead: METADATA_DB_GUARD
- * already provides the exact thread-safety boundary this used to build by
- * hand, so there's no duplication left to keep in sync, and every response
- * reflects the live database instead of whatever gui.c last pushed. Only
- * the queue itself still needs a small array here -- it's server-side
- * state (what's queued), not a library copy -- storing each entry's song
- * id (metadata_db.c's own stable rowid-based identity, not an array
- * position) instead of an index into a now-nonexistent local copy. */
+/* Queue of song IDs (metadata_db song_row_t.id). Guarded by status_mutex. */
 static int64_t * queue_song_ids = NULL;
 static int queue_song_id_count = 0;
 
@@ -356,28 +327,15 @@ static void build_library_json(const char * query, const char * artist_filter, c
     if (limit <= 0 || limit > LIBRARY_JSON_MAX_LIMIT) limit = LIBRARY_JSON_MAX_LIMIT;
     if (offset < 0) offset = 0;
 
-    /* Both queries go straight to tagcache (metadata_db_count_songs_filtered()/
-     * get_songs_filtered_page(), each METADATA_DB_GUARD-protected on their
-     * own) -- no status_mutex needed here at all, since nothing in this
-     * function touches status_mutex-guarded state anymore. "index" in the
-     * response is the song's stable tagcache id (metadata_db.c's own
-     * song_row_t.id), not a position in any array -- every other endpoint
-     * that accepts an "index" back (playback/play, playback/queue,
-     * playlists) resolves it the same way, via metadata_db_get_song_by_id(). */
+    /* Query filtered songs directly from metadata_db. "index" in the response
+     * is the persistent song id (song_row_t.id). */
     int64_t total_matches = metadata_db_count_songs_filtered(query, artist_filter, album_artist_filter, album_filter);
 
     json_builder_t json;
     json_builder_init(&json, out, out_size);
     json_builder_appendf(&json, "{\"total\":%lld,\"songs\":[", (long long) total_matches);
 
-    /* Real-device crash, caught live: song_row_t is ~1.25KB (a 600-byte
-     * path plus one cached_tags_t -- a LIBRARY_JSON_MAX_LIMIT-
-     * element array of those is ~125KB, which overflowed listener_thread_
-     * func()'s default pthread stack the first time a client actually hit
-     * this endpoint (SIGSEGV in a stack-adjacent LVGL function, not this
-     * one -- classic stack-smash symptom). Heap-allocated instead, matching
-     * every other multi-row buffer in this file (build_playlists_json's
-     * malloc(65536), the GROUPS_JSON_MAX group arrays below). */
+    /* Allocate rows on the heap to keep stack usage bounded. */
     song_row_t * rows = malloc(sizeof(song_row_t) * LIBRARY_JSON_MAX_LIMIT);
     int n = rows ? metadata_db_get_songs_filtered_page(query, artist_filter, album_artist_filter, album_filter,
                                                          offset, limit, rows)
@@ -395,17 +353,8 @@ static void build_library_json(const char * query, const char * artist_filter, c
     free(rows);
 }
 
-/* Shared by /api/library/artists, /api/library/album_artists and
- * /api/library/albums below -- renders an already-computed group_row_t[]
- * (metadata_db_get_groups_page()/get_albums_page_filtered(), each already
- * sorted by name and already the exact "distinct value + count" shape this
- * used to compute by hand from a raw per-song array) into the same
- * {"name":...,"count":...,"index":...} JSON shape those endpoints have
- * always returned. index is a representative song id for that group (only
- * the albums list's phone UI actually uses it, to pull /api/art thumbnail
- * bytes for that album) -- metadata_db.c's own group_row_t.first_song_id,
- * a rowid-based song id like every other "index" this file emits now, not
- * a position into anything. */
+/* Renders group_row_t entries into a JSON array {"name":..., "count":..., "index":..., "album_artist":...}.
+ * index is a representative first song id from group_row_t.first_song_id. */
 static void render_name_counts_json(const group_row_t * groups, int count, const char * json_key, char * out,
                                      size_t out_size) {
     json_builder_t json;
@@ -414,12 +363,7 @@ static void render_name_counts_json(const group_row_t * groups, int count, const
     for (int i = 0; i < count && !json.truncated && json.capacity - json.length >= 512; i++) {
         char name_esc[300] = {0}, album_artist_esc[300] = {0};
         json_escape_append(name_esc, sizeof(name_esc), groups[i].name);
-        /* Empty for artists/album_artists (group_row_t.album_artist is only
-         * ever populated by metadata_db_get_albums_page_filtered() -- see
-         * its own comment) -- harmless extra field for those, and lets the
-         * albums list disambiguate two different artists' same-titled
-         * albums, which now show as separate rows (see that same comment
-         * on why merging them was a real bug). */
+        /* album_artist is populated for album groups. */
         json_escape_append(album_artist_esc, sizeof(album_artist_esc), groups[i].album_artist);
         if (!json_builder_appendf(&json, "%s{\"name\":\"%s\",\"count\":%d,\"index\":%lld,\"album_artist\":\"%s\"}",
                                   i > 0 ? "," : "", name_esc, groups[i].song_count,
@@ -429,9 +373,7 @@ static void render_name_counts_json(const group_row_t * groups, int count, const
     json_builder_appendf(&json, "]}");
 }
 
-/* Same bound the old in-memory version used (NAME_COUNTS_JSON_MAX) -- a
- * personal library's distinct artist/album count is nowhere near this, kept
- * as a sanity ceiling rather than a real limit. */
+/* Upper bound for groups queries. */
 #define GROUPS_JSON_MAX 2000
 
 static void build_artists_json(char * out, size_t out_size) {
@@ -448,10 +390,7 @@ static void build_album_artists_json(char * out, size_t out_size) {
     free(groups);
 }
 
-/* artist_filter and album_artist_filter are mutually exclusive in practice
- * (GET /api/library/albums passes exactly one, matching the browse path the
- * request came from), but metadata_db_get_albums_page_filtered() treats
- * either as "matches artist OR album_artist" so either works the same way. */
+/* Build album groups matching artist_filter or album_artist_filter. */
 static void build_albums_json(const char * artist_filter, const char * album_artist_filter, char * out,
                                size_t out_size) {
     const char * filter = artist_filter[0] != '\0' ? artist_filter : album_artist_filter;
@@ -497,16 +436,7 @@ static void build_playlists_json(char * out, size_t out_size) {
     int count = 0;
     playlist_files_scan(PLAYLISTS_DIR, &paths, &count);
 
-    /* Audit finding: the loop guard's 300-byte margin doesn't actually
-     * cover this entry's own worst case (10 bytes of literal JSON +
-     * up to 299 bytes of escaped name + 36 more bytes of literal JSON =
-     * up to 345 bytes) -- the exact same snprintf-return-value-outruns-
-     * the-margin heap overflow already found and fixed in remote_control.c's
-     * handle_playlist_songs_request(), just not flagged by that pass since
-     * the entry shape differs. json_builder_t/json_builder_appendf()
-     * (same fix already applied there) can't overrun by construction: it
-     * rolls back a would-be-truncated append instead of ever accepting a
-     * partial write. */
+    /* Build JSON array of playlists using json_builder_t with bounds checking. */
     json_builder_t json;
     json_builder_init(&json, out, out_size);
     json_builder_appendf(&json,
@@ -519,7 +449,7 @@ static void build_playlists_json(char * out, size_t out_size) {
         json_escape_append(name_esc, sizeof(name_esc), base);
         if (!json_builder_appendf(&json, ",{\"name\":\"%s\",\"internal\":false,\"writable\":true}", name_esc)) break;
     }
-    json.truncated = false; /* a rejected item left the prior JSON intact -- see build_library_songs_json()'s own use of this pattern */
+    json.truncated = false;
     json_builder_appendf(&json, "]}");
 
     for (int i = 0; i < count; i++) free(paths[i]);
@@ -527,15 +457,8 @@ static void build_playlists_json(char * out, size_t out_size) {
 }
 
 static void build_queue_json(char * out, size_t out_size) {
-    /* queue_song_ids is only ever written by remote_control_sync_queue()
-     * under status_mutex, so read it under the same lock -- but resolve
-     * ids via metadata_db_get_songs_by_ids() (its own METADATA_DB_GUARD)
-     * only after taking a private snapshot, never while status_mutex is
-     * still held, for the same lock-ordering reason documented on
-     * remote_control_sync_queue() itself. Resolved in one batched call
-     * (one prepared statement reused across every id) rather than a fresh
-     * metadata_db_get_song_by_id() prepare/finalize per song in the loop
-     * below -- see that function's own doc comment. */
+    /* Snapshot queue_song_ids under status_mutex, then resolve IDs via
+     * metadata_db_get_songs_by_ids() outside the lock. */
     pthread_mutex_lock(&status_mutex);
     int count = queue_song_id_count;
     int64_t * ids = NULL;
@@ -550,15 +473,7 @@ static void build_queue_json(char * out, size_t out_size) {
     if (count > 0 && !rows) count = 0;
     if (rows) metadata_db_get_songs_by_ids(ids, count, rows);
 
-    /* Audit finding: the loop guard's 768-byte margin doesn't cover this
-     * entry's own worst case (title/artist can each hold up to 511 escaped
-     * bytes, well over 1000 bytes total with the surrounding JSON) -- the
-     * exact same snprintf-return-value-outruns-the-margin heap overflow
-     * already found and fixed in handle_playlist_songs_request() (and just
-     * above in build_playlists_json()), just not flagged by that pass
-     * since this entry shape differs. json_builder_t/json_builder_appendf()
-     * can't overrun by construction: it rolls back a would-be-truncated
-     * append instead of ever accepting a partial write. */
+    /* Build JSON array of queue songs using json_builder_t with bounds checking. */
     json_builder_t json;
     json_builder_init(&json, out, out_size);
     json_builder_appendf(&json, "{\"songs\":[");
@@ -571,24 +486,14 @@ static void build_queue_json(char * out, size_t out_size) {
         if (!json_builder_appendf(&json, "%s{\"offset\":%d,\"index\":%lld,\"title\":\"%s\",\"artist\":\"%s\"}",
                                   i ? "," : "", i, (long long) rows[i].id, title, artist)) break;
     }
-    json.truncated = false; /* a rejected item left the prior JSON intact -- see build_library_songs_json()'s own use of this pattern */
+    json.truncated = false;
     json_builder_appendf(&json, "]}");
     free(rows);
     free(ids);
 }
 
-/* The whole remote-control web app: a persistent playback header (art/
- * title/transport/volume, polling /api/status every second) always shown
- * above whichever of Library/Queue/Playlists is the active bottom-nav tab
- * -- there's no separate "Now Playing" tab (removed: with the header
- * always visible regardless of tab, a tab that just cleared the content
- * area to blank had nothing of its own to show). Transport buttons and the
- * volume slider post to the Phase 2 endpoints below. Plain vanilla HTML/
- * CSS/JS, no framework or build step, matching this project's own "no
- * build tooling beyond what's already here" approach everywhere else. The
- * volume slider deliberately doesn't post on every drag tick (see its own
- * oninput/onchange split) -- only on release, so dragging it doesn't flood
- * the device with a request per pixel of movement. */
+/* Remote-control web application HTML/CSS/JS. Persistent playback header
+ * polling /api/status, and bottom-nav tabs for Library, Queue, and Playlists. */
 static const char * const REMOTE_CONTROL_APP_HTML =
     "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -878,17 +783,7 @@ static void send_all(int fd, const char * data, size_t len) {
     }
 }
 
-/* Real-device incident: the play/pause button on the Now Playing page
- * didn't update after tapping a song from the library search results --
- * it only "caught up" once the user tapped the button itself. Root
- * cause: this response never sent any cache-control headers, and a phone
- * browser (unlike curl, which was used to verify the backend itself
- * responds correctly within 2s of a play request) caches GET responses
- * by default -- the page's own poll() was very likely re-displaying a
- * stale cached /api/status response instead of actually re-fetching it
- * every second. Every response from this server is dynamic and must
- * never be cached, including the static HTML/JS itself (a stale cached
- * copy across app updates would be its own, separate confusing bug). */
+/* Sends an HTTP response with no-cache headers. */
 static void send_response(int fd, const char * status_line, const char * content_type, const char * body) {
     char header[320];
     int header_len = snprintf(header, sizeof(header),
@@ -900,12 +795,8 @@ static void send_response(int fd, const char * status_line, const char * content
     send_all(fd, body, strlen(body));
 }
 
-/* Pulls an integer query parameter (e.g. "seconds" out of
- * "/api/playback/seek?seconds=42") straight out of the request path --
- * this server never needs a request body, every Phase 2 action fits in
- * the URL, so there's no reason to also parse Content-Length/read a body
- * (one less thing that can be malformed). Returns false if the key isn't
- * present or has no valid integer value. */
+/* Pulls an integer query parameter from the request path. Returns false if
+ * absent or invalid. */
 static bool query_param_int(const char * path, const char * key, int * out_value) {
     const char * q = strchr(path, '?');
     if (!q) return false;
@@ -927,10 +818,7 @@ static bool query_param_int(const char * path, const char * key, int * out_value
     return false;
 }
 
-/* Same as query_param_int() above but for "index" query params, which are
- * now song ids (metadata_db.c's rowid-based song_row_t.id, an int64_t) --
- * a plain int would silently truncate a valid id on the rare library where
- * rowids have climbed past INT_MAX. */
+/* Pulls a 64-bit integer query parameter from the request path. */
 static bool query_param_int64(const char * path, const char * key, int64_t * out_value) {
     const char * q = strchr(path, '?');
     if (!q) return false;
@@ -952,22 +840,8 @@ static bool query_param_int64(const char * path, const char * key, int64_t * out
     return false;
 }
 
-/* GET /api/art (optionally ?index=N) -- serves a song's embedded cover art
- * as a raw image, re-extracted straight from the file on disk via the same
- * metadata_read() gui.c itself uses for cover_decode.c's LVGL image (not a
- * copy of gui.c's already-decoded pixel buffer -- simplest way to get
- * still-encoded JPEG/PNG bytes suitable for an HTTP image response is to
- * just read the file's own embedded picture again, not re-serialize a
- * decoded LVGL image back into a compressed format). Runs on the HTTP
- * thread directly (file I/O, no LVGL/audio state), same justification as
- * playlist mutation's own file I/O in handle_connection() -- the lookup of
- * which path to read is done under a short status_mutex lock, then
- * unlocked before the (slower) metadata_read() call. Resolves the path
- * either from a song id (metadata_db_get_song_by_id(), its own
- * METADATA_DB_GUARD, taken without status_mutex held at all since this
- * branch touches no status_mutex-guarded state) or (no index given)
- * status_path, the currently-playing file remote_control_notify_status()
- * was last called with. */
+/* Serves a song's embedded cover art as a raw image. Resolves the path from
+ * song id or from the currently playing file if no index is provided. */
 static bool resolve_art_source_path(bool have_index, int64_t index, char * out_path, size_t out_path_size) {
     if (have_index) {
         song_row_t row;
@@ -1157,28 +1031,8 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
         return;
     }
 
-    /* Playlist files store paths, not ids -- metadata_db_get_song_by_path()
-     * resolves each one against the DB (its own METADATA_DB_GUARD); no
-     * status_mutex needed since nothing here touches status_mutex-guarded
-     * state.
-     *
-     * Audit finding: this used to hand-roll its own snprintf+len-tracking
-     * loop with a fixed 256-byte safety margin, but a single entry's true
-     * worst case (comma + `{"index":` + up to 20 digits for a 64-bit id +
-     * `,"title":"` + up to 299 bytes of escaped title + `","artist":"` +
-     * up to 299 bytes of escaped artist + `"}`) is ~650 bytes -- more than
-     * the margin covered. snprintf() returns the length it WOULD have
-     * written even when truncated, so `len` could end up past 65536, and
-     * the trailing `snprintf(json + len, 65536 - len, "]}")` then computed
-     * an out-of-bounds pointer with an underflowed (huge, unsigned) size --
-     * a real heap overflow reachable by any playlist with a long enough
-     * title/artist, over the remote-control HTTP API. json_builder_t/
-     * json_builder_appendf() (used by every sibling JSON-array endpoint in
-     * this file, e.g. build_library_songs_json() just above) already
-     * solves this properly: it rolls back a would-be-truncated append
-     * instead of accepting a partial write, so `length` can never exceed
-     * `capacity`. Matches that same established loop shape here instead
-     * of re-deriving a safe margin by hand. */
+    /* Resolve playlist file paths against metadata_db and serialize to JSON
+     * using json_builder_t with bounds checking. */
     json_builder_t json;
     json_builder_init(&json, json_buf, 65536);
     json_builder_appendf(&json, "{\"songs\":[");
@@ -1195,7 +1049,7 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
                                   emitted > 0 ? "," : "", (long long) row.id, title_esc, artist_esc)) break;
         emitted++;
     }
-    json.truncated = false; /* a rejected item left the prior JSON intact -- see build_library_songs_json()'s own use of this pattern */
+    json.truncated = false;
     json_builder_appendf(&json, "]}");
 
     send_response(cfd, "200 OK", "application/json", json_buf);
@@ -1452,19 +1306,8 @@ static void handle_connection(int cfd) {
     close(cfd);
 }
 
-/* Real-device incident: this used to call a plain blocking accept() and
- * rely on remote_control_stop() closing listen_fd to unblock it (the same
- * pattern dlna_control_stop() uses for its own AF_UNIX listener) -- on
- * this device's kernel (4.4.94), closing a socket from another thread does
- * NOT reliably wake a thread already blocked in accept() on it for a plain
- * AF_INET/SOCK_STREAM socket. Confirmed live: toggling Remote Control off
- * froze the whole app -- the main/UI thread blocked forever in
- * pthread_join() waiting for this thread to exit, while this thread sat
- * forever in accept(), having never noticed the socket was closed. Fixed
- * by polling with a bounded timeout instead of blocking directly in
- * accept(), so this thread notices `running` went false within one poll
- * interval on its own, independent of whatever close()-from-another-
- * thread does or doesn't do on this kernel. */
+/* Timeout for poll() on listen_fd so listener_thread_func periodically checks
+ * running and terminates cleanly on stop. */
 #define ACCEPT_POLL_TIMEOUT_MS 200
 
 static void * listener_thread_func(void * arg) {
@@ -1472,7 +1315,7 @@ static void * listener_thread_func(void * arg) {
     while (running) {
         struct pollfd pfd = { .fd = listen_fd, .events = POLLIN, .revents = 0 };
         int pr = poll(&pfd, 1, ACCEPT_POLL_TIMEOUT_MS);
-        if (pr <= 0) continue; /* timeout or interrupted -- just re-check running and poll again */
+        if (pr <= 0) continue; /* Timeout or interrupted -- re-check running */
         if (!running) break;
 
         int cfd = accept(listen_fd, NULL, NULL);
@@ -1516,13 +1359,7 @@ void remote_control_stop(void) {
     if (!running) return;
     running = false;
 
-    /* The listener thread notices `running` went false on its own, within
-     * one ACCEPT_POLL_TIMEOUT_MS poll cycle (see listener_thread_func()'s
-     * own comment on why this doesn't rely on closing listen_fd to
-     * interrupt a blocking accept() the way dlna_control_stop() does for
-     * its own listener) -- so this join is bounded to ~200ms, not
-     * indefinite. Only close the fd after the thread has actually exited
-     * and is guaranteed to no longer touch it. */
+    /* Wait for listener thread to exit after noticing running = false. */
     pthread_join(listener_thread, NULL);
     if (listen_fd >= 0) {
         close(listen_fd);

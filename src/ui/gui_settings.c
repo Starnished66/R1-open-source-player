@@ -314,11 +314,8 @@ static void eq_freq_slider_event_cb(lv_event_t * e) {
     if (!band) return;
     double freq = slider_to_freq(lv_slider_get_value(lv_event_get_target(e)));
 
-    /* Real-device bug report: this used to switch to a shorter, unlabeled
-     * "228 Hz" format while actively dragging, only showing the full
-     * "Frequency: 228 Hz" once released -- read as the label "hiding" its
-     * name mid-drag. Same full format at all times now, matching
-     * refresh_eq_band_widgets()'s own resting-state format exactly. */
+    /* Format string with label prefix consistently during active dragging
+     * and when released. */
     if (code == LV_EVENT_VALUE_CHANGED) {
         peq_set_band(current_eq_band, freq, band->gain_db, band->q);
         lv_label_set_text_fmt(eq_freq_value_label, "Frequency: %.0f Hz", freq);
@@ -440,14 +437,8 @@ static lv_obj_t * build_accent_color_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
-    /* Real-device feedback: the swatches were too small to comfortably tap
-     * and the 8-color palette felt limited -- bumped from 36px to 64px
-     * (matching this screen's own back_btn hitbox size) and doubled the
-     * palette to 16. That no longer fits one 50px row, so this container
-     * grows to LV_SIZE_CONTENT height and wraps across as many rows as it
-     * needs -- pad_row/pad_column give the bigger circles even breathing
-     * room in both directions, matching SPACE_EVENLY's own horizontal
-     * distribution instead of just relying on it alone. */
+    /* 16-swatch color palette displayed in a wrapping flex container with
+     * generous touch targets and spacing. */
     lv_obj_t * swatch_row = lv_obj_create(scr);
     lv_obj_set_size(swatch_row, lv_pct(92), LV_SIZE_CONTENT);
     lv_obj_align(swatch_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
@@ -774,18 +765,9 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
-    /* Real-device bug report: at bigger system text sizes, "Turn off screen
-     * automatically" overlapped the switch -- the row was a fixed 50px-tall
-     * box with both children absolute-positioned (label pinned LEFT_MID,
-     * switch pinned RIGHT_MID), so nothing reserved space for the switch or
-     * let the label wrap when its rendered width grew with the font. Same
-     * fix as eq_band_enabled_switch's own row in build_eq_screen(): flex row
-     * + SPACE_BETWEEN with the label given flex_grow so it wraps within
-     * whatever width is left after the switch instead of running under it,
-     * and SIZE_CONTENT height so a wrapped 2nd line still fits. The card
-     * below is repositioned relative to this row's actual (now variable)
-     * bottom edge rather than a hardcoded offset, so it can't end up
-     * overlapping a taller wrapped row either. */
+    /* Enable row configured with flex layout (SPACE_BETWEEN and flex-grow)
+     * so the text label wraps cleanly across font sizes without overlapping
+     * the switch. */
     lv_obj_t * enable_row = lv_obj_create(scr);
     lv_obj_set_width(enable_row, lv_pct(90));
     lv_obj_set_height(enable_row, LV_SIZE_CONTENT);
@@ -809,18 +791,8 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     if (current_settings.screen_timeout_enabled) lv_obj_add_state(screen_timeout_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(screen_timeout_switch, screen_timeout_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    /* Reuses the EQ card look (rounded dark card, live numeric readout +
-     * slider, style_theme_card_bg -- the same shared "card surface" style
-     * every popup/EQ-card/slider-card in the app uses) for a consistent
-     * "settings with a live readout" feel. Taller than the EQ card (170 vs 82),
-     * with the slider near the top and the value label centered well below
-     * it (rather than the EQ card's label-top-left/slider-along-the-bottom
-     * layout) -- real-device feedback: the original thin-track/small-text/
-     * top-left-label version was hard to reliably grab, and a later
-     * bottom-anchored label still visually overlapped the slider's knob
-     * (its default theme style draws it noticeably larger than the 36px
-     * track height it's centered on), needing extra clearance below the
-     * slider rather than just under it. */
+    /* Rounded slider card with vertical clearance below the track for the
+     * knob diameter and centered value label. */
     screen_timeout_slider_card = lv_obj_create(scr);
     lv_obj_set_size(screen_timeout_slider_card, lv_pct(90), 170);
     lv_obj_align_to(screen_timeout_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
@@ -851,21 +823,8 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_label_set_text(screen_timeout_value_label, initial_buf);
 
     finalize_screen_navigation(scr);
-    /* Unlike every other plain container on this screen, this card's own
-     * background must NOT bubble drags up as an app-wide swipe:
-     * finalize_screen_navigation() -> enable_gesture_bubble_recursive() just
-     * gave it LV_OBJ_FLAG_GESTURE_BUBBLE like any other non-slider
-     * container (blank space on any screen is meant to swipe-navigate).
-     * Real-device feedback: a drag anywhere in this particular card that
-     * missed the (thin, bottom-aligned) slider track landed on that
-     * background instead and bubbled to screen_gesture_event_cb() as a
-     * swipe (down = jump to player, up = back) rather than moving the
-     * slider. Removing the flag here, after it was added, makes any drag
-     * starting in this card go nowhere instead of misfiring navigation,
-     * regardless of whether it lands on the slider or the card around it.
-     * Also registered as a player-swipe dead zone (register_swipe_dead_zone()'s
-     * own comment) -- that's a separate raw-polling path this
-     * GESTURE_BUBBLE removal doesn't reach. */
+    /* Remove gesture bubble from the card and register a swipe dead zone so
+     * touch drags intended for the slider do not trigger navigation gestures. */
     lv_obj_remove_flag(screen_timeout_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
     register_swipe_dead_zone(screen_timeout_slider_card);
     return scr;
@@ -930,8 +889,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
-    /* Same real-device overlap bug/fix as build_screen_timeout_screen()'s
-     * own enable_row -- see its comment. */
+    /* Flex row with SPACE_BETWEEN layout to prevent text/switch overlap. */
     lv_obj_t * enable_row = lv_obj_create(scr);
     lv_obj_set_width(enable_row, lv_pct(90));
     lv_obj_set_height(enable_row, LV_SIZE_CONTENT);
@@ -1012,7 +970,7 @@ static int sleep_timer_minutes_to_step_index(int minutes) {
     return best;
 }
 
-/* "45 min" / "1 hr" / "1 hr 30 min" -- same shape as ExtendedSleepTimer.lua's
+/* Extracted from build_sleep_timer_screen() so it can be shared with its
  * own format_duration(), needed now that SLEEP_TIMER_STEPS reaches 180
  * (settings.c) and a bare "%d min" would read as "180 min" instead of the
  * much more readable "3 hr". */
@@ -1024,15 +982,8 @@ static void format_sleep_timer_duration(char * buf, size_t buf_size, int minutes
     else snprintf(buf, buf_size, "%d hr %d min", hours, remainder);
 }
 
-/* Real-device bug report: this screen only ever picked the duration the
- * drawer icon (quick_drawer_sleep_event_cb, gui_shell.c) would use NEXT
- * time it was tapped -- there was no way to arm/disarm the timer from here
- * at all. sleep_timer_switch_event_cb below now does that directly (the
- * same single arm/disarm action the drawer icon performs, not a separate
- * "enabled" preference layer -- this timer has no such layer, see
- * current_settings.sleep_timer_minutes' own comment on why only the
- * duration persists), keeping both in sync via gui_settings_sync_sleep_
- * timer_toggle() / quick_drawer_sleep_timer_is_active() (gui_shell.c). */
+/* Arms or disarms the sleep timer directly, synchronizing state with the
+ * quick drawer sleep timer toggle. */
 static void sleep_timer_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     bool active = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
@@ -1292,8 +1243,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
-    /* Same real-device overlap bug/fix as build_screen_timeout_screen()'s
-     * own enable_row -- see its comment. */
+    /* Uses content-based sizing so wrapped label text does not overlap. */
     lv_obj_t * enable_row = lv_obj_create(scr);
     lv_obj_set_width(enable_row, lv_pct(90));
     lv_obj_set_height(enable_row, LV_SIZE_CONTENT);
@@ -1317,37 +1267,16 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     if (current_settings.idle_shutdown_enabled) lv_obj_add_state(idle_shutdown_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(idle_shutdown_switch, idle_shutdown_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    /* Mutually-exclusive idle-action choice, ahead of the duration slider
-     * below (real-device feedback: "just like the USB mode selector, 2
-     * choices with the slider below") -- full poweroff (idle_shutdown_now(),
-     * the default, better-tested path) or real suspend-to-RAM
-     * (power_suspend_now(), quick resume instead of a reboot). Shown/hidden
-     * together with the slider card, toggled together in
+    /* Mutually-exclusive idle-action choice (Power Off or Suspend to RAM).
+     * Shown/hidden together with the slider card in
      * idle_shutdown_switch_event_cb(). */
-    /* lv_pct(100), not (90) -- add_pill_row_base()'s rows are a fixed
-     * 448px wide (same asset/size as build_subsonic_list_screen()'s own
-     * Storage/USB DAC/Font Size rows, which live inside that builder's
-     * full lv_pct(100)-wide list). A narrower lv_pct(90) parent (~432px on
-     * this 480px-wide display) clipped them -- real-device feedback: "not
-     * rendered inside the screen". Left at the default theme "card" pad_all
-     * (not zeroed) for the same reason: that padding is what insets the
-     * full-width row snugly within its parent on every other screen that
-     * hosts these same rows, rather than each row filling flush edge-to-edge.
-     * pad_top/pad_bottom are zeroed here though -- left at PAD_DEF, the
-     * section's own children (label + 2 rows, using hardcoded y offsets
-     * that already assume a zero top pad) sit that much lower than the
-     * section's fixed 292px height accounts for, so the bottom row's
-     * true bottom edge exceeds the section's own bounds and gets clipped
-     * there -- real-device feedback: "lower rectangle is not rendered
-     * completely, cut off". Zeroing only top/bottom (not left/right)
-     * keeps the width fit from the fix above while eliminating the
-     * vertical overflow. */
+    /* 100% width accommodates fixed-width 448px pill rows without clipping.
+     * pad_top and pad_bottom are zeroed so the child rows and label fit within
+     * the 292px section height without vertical overflow. */
     idle_action_section = lv_obj_create(scr);
     lv_obj_set_size(idle_action_section, lv_pct(100), 292);
-    /* Relative to enable_row's actual (now variable, see its own comment)
-     * bottom edge rather than a hardcoded offset from the title, so a
-     * wrapped 2nd line in enable_row at bigger text sizes can't push this
-     * section up into overlapping it. */
+    /* Positioned relative to enable_row's bottom edge so wrapped label text
+     * does not cause overlapping. */
     lv_obj_align_to(idle_action_section, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_set_style_bg_opa(idle_action_section, 0, 0);
     lv_obj_set_style_border_width(idle_action_section, 0, 0);
@@ -1376,23 +1305,10 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_add_flag(idle_action_suspend_row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(idle_action_suspend_row, idle_action_choice_cb, LV_EVENT_CLICKED, (void *) (intptr_t) true);
 
-    /* Same card/slider look as the screen-timeout screen above, for
-     * consistency between the two "enable switch + discrete-step slider"
-     * settings screens. Positioned below idle_action_section now, not
-     * directly under the enable switch -- same real-device feedback as
-     * that section's own comment. idle_action_section now zeroes its own
-     * pad_top/pad_bottom (see that section's comment), so its declared
-     * 292px height is exact and a plain +20 gap is enough.
-     * 30px taller than screen_timeout_slider_card (200 vs 170) to fit an
-     * explanatory caption above the slider -- real-device feedback: once
-     * idle_action_section (with its own "Choose what happens when idle:"
-     * caption) sat between the enable switch and this slider, what the
-     * slider itself actually controls was no longer obvious just from the
-     * screen title. */
+    /* Slider card positioned below idle_action_section. Sized at 200px height
+     * to accommodate the explanatory caption above the slider. */
     idle_shutdown_slider_card = lv_obj_create(scr);
     lv_obj_set_size(idle_shutdown_slider_card, lv_pct(90), 200);
-    /* Relative to idle_action_section's own (now possibly-shifted, see its
-     * comment) position rather than a hardcoded offset from the title. */
     lv_obj_align_to(idle_shutdown_slider_card, idle_action_section, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_add_style(idle_shutdown_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(idle_shutdown_slider_card, 0, 0);
@@ -1427,11 +1343,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_label_set_text(idle_shutdown_value_label, initial_buf);
 
     finalize_screen_navigation(scr);
-    /* Same reasoning as screen_timeout_slider_card's identical line: don't
-     * let a drag that misses the slider bubble up as an app-wide swipe.
-     * Also registered as a player-swipe dead zone -- see
-     * register_swipe_dead_zone()'s own comment (this is the exact card
-     * the real-device report that led to that function came from). */
+    /* Prevent dragging or touching near the slider from bubbling up as a screen swipe. */
     lv_obj_remove_flag(idle_shutdown_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
     register_swipe_dead_zone(idle_shutdown_slider_card);
     return scr;
@@ -1443,19 +1355,9 @@ static void idle_shutdown_row_cb(lv_event_t * e) {
 }
 
 /* ---- Time Zone picker ----------------------------------------------------
- * Region -> City, matching the stock firmware's own selection flow (per
- * user direction: "just a region -> country selector that sets up the
- * current time" -- the hardware's RTC already ships with a reasonable
- * date/time, confirmed live, so there's no separate manual date/time entry
- * here, only the zone). TIMEZONE_TABLE (timezone_data.h, ~370 entries) is
- * generated offline from the stock firmware's own city-name list,
- * cross-checked against this device's real /usr/share/zoneinfo tree -- see
- * timezone_data.c's own header comment; it's already sorted by UTC offset
- * then city name, which stays a sensible order even after filtering down to
- * one region (most regions span a limited, roughly west-to-east offset
- * range). Region names below are exactly the top-level IANA region
- * components actually present in TIMEZONE_TABLE (confirmed by inspection),
- * not a hand-typed guess. */
+ * Region -> City selection. TIMEZONE_TABLE (timezone_data.h) is sorted
+ * by UTC offset then city name. Region names are the top-level IANA region
+ * components present in TIMEZONE_TABLE. */
 static const char * const TIMEZONE_REGIONS[] = {
     "Africa", "America", "Antarctica", "Arctic", "Asia", "Atlantic", "Australia", "Europe", "Indian", "Pacific"
 };
@@ -1590,25 +1492,12 @@ static void timezone_settings_row_cb(lv_event_t * e) {
  * shape). */
 static void factory_reset_btn_cb(lv_event_t * e);
 
-/* Alphabetical by label -- real-device feedback: the previous ad-hoc
- * ordering (roughly "added in this order") made a specific setting hard
- * to find in a 17-row list. Keep new entries sorted in too rather than
- * appended at the end. */
-/* ---- Settings category sub-screens -- the flat 16-item System list grew
- * unwieldy enough (real-device feedback) that it's now a menu of 4 category
- * screens plus About, rather than one long scroll. Each sub-screen reuses
- * the exact same items/callbacks the old flat list had, just grouped. ---- */
+/* ---- Settings category sub-screens -- grouped into category screens
+ * (Display, Power & Sleep, Device & Storage, Date & Time, About). ---- */
 
-/* ---- Music Settings sub-screens -- the flat Playback list (9 native rows
- * plus however many plugins added) hit the exact same unwieldy-list problem
- * the System split above already solved, for the same real-device-feedback
- * reason: playback behavior, audio processing, hardware controls, timers,
- * library maintenance, and plugin-added rows were all one long undifferentiated
- * scroll. Renamed "Music Settings" (was "Playback") since that flat list's
- * own top-level identity no longer fits now that "Playback" is just one of
- * six categories under it, not the whole screen. Every native row below
- * keeps its exact original callback -- this only regroups them, never
- * changes what any individual row does. */
+/* ---- Music Settings sub-screens -- grouped into category screens
+ * (Playback, Audio, Controls & Interface, Timers, Library, Plugins). ---- */
+
 
 /* Shared click handler for every plugin-registered Playback list row below
  * -- same index-not-object shape plugin_display_list_item_click_cb() already
@@ -2040,15 +1929,9 @@ static void settings_about_row_cb(lv_event_t * e) {
     nav_push(about_screen);
 }
 
-/* "Auto-resume on launch" deliberately has no row anywhere in Settings --
- * real-device incident: auto-resume-on-launch is entirely disabled at
- * compile time (AUTO_RESUME_ON_LAUNCH_ENABLED, gui_init()) after a
- * crash-reboot loop report, but this toggle itself was left fully
- * interactive and defaulting to checked -- functionally inert either way,
- * but showing a live-looking control for a feature that silently does
- * nothing is actively misleading. Removed until the feature itself is
- * re-enabled; current_settings.auto_resume_enabled and
- * auto_resume_switch_event_cb are both still there, just unreferenced. */
+/* Auto-resume on launch has no settings row while AUTO_RESUME_ON_LAUNCH_ENABLED
+ * is disabled at compile time. current_settings.auto_resume_enabled and
+ * auto_resume_switch_event_cb remain available for when re-enabled. */
 /* Shared click handler for every plugin-registered Settings list row below
  * -- same index-not-object shape plugin_books_list_item_click_cb() already
  * uses for the Books screen. */
@@ -2116,11 +1999,7 @@ static void settings_tile_cb(lv_event_t * e) {
 
 static void dac_home_usb_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    /* Same real-state correction as open_usb_mode_screen()'s own comment --
-     * current_settings.usb_mode is only a UI hint, never re-applied to
-     * hardware on startup, so it can't be trusted after a reboot or a
-     * change made outside this app. If USB DAC is genuinely already active,
-     * go straight to its overlay instead of re-running the switch. */
+    /* If USB DAC is already active in hardware, show its overlay directly. */
     usb_mode_t detected;
     bool have_detected = usb_mode_control_detect_current(&detected);
     if (have_detected && detected == USB_MODE_DAC) {
@@ -2128,15 +2007,7 @@ static void dac_home_usb_row_cb(lv_event_t * e) {
         nav_push(gui_network_get_usb_dac_overlay());
         return;
     }
-    /* Real-device incident: this shortcut used to call start_usb_mode_switch()
-     * unconditionally, which crashed the app when the device was in ADB
-     * mode -- an untested path. The USB Mode screen itself never allows
-     * this: populate_usb_mode_screen() dims the Storage/DAC rows and makes
-     * them non-clickable whenever ADB is active, only letting the user
-     * switch away from ADB via its own explicit toggle first. This shortcut
-     * has no dimmed-row UI to lean on, so it enforces the same rule with an
-     * explanatory toast instead of silently attempting a switch nothing
-     * else in this app has ever exercised safely. */
+    /* Require explicit disable of ADB mode before switching to USB DAC. */
     if (have_detected && detected == USB_MODE_ADB) {
         show_info_toast("Turn off ADB first (Settings > System > USB Mode), then enable USB DAC from here.");
         return;
@@ -2358,35 +2229,14 @@ lv_obj_t * build_home_screen(void) {
     return scr;
 }
 
-/* Bigger than the old 82px-tall/default-font cards (real-device feedback:
- * "sliders and text should be a little bigger and not overlap") -- value
- * label gets its own clear band at the top in a larger font, then a solid
- * gap before a taller slider track, instead of a small label crammed above
- * a thin slider in the same tight card. Card is now a plain flex-flow
- * child (no y/lv_obj_align -- see build_eq_screen()'s content container)
- * so screen-wide spacing lives in one place (the container's pad_gap)
- * rather than being hand-tuned per card. */
+/* EQ slider card with value label on top and slider track below.
+ * Card uses flex-column flow with content-based sizing so card height
+ * dynamically adjusts to the active font tier without overlapping. */
 static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_obj_t ** out_value_label,
                                         lv_obj_t ** out_slider, int32_t range_min, int32_t range_max) {
     lv_obj_t * card = lv_obj_create(parent);
-    /* 96%, not the original 92% -- real-device bug report: with wider
-     * dropdowns and bigger BlindMF text now needing the room, the old
-     * side margin looked like unused wasted space. Widened here and on
-     * every other row/card in this screen (band_row/type_row/enable_row/
-     * profile_row) for consistency. */
     lv_obj_set_width(card, lv_pct(96));
-    /* Real-device bug report: at the BlindMF font tier, gui_theme_font(GUI_FONT_ROLE_ROW)'s much
-     * taller glyphs (34px vs 22px at Small) pushed the value label's own
-     * rendered height past where the slider below it was fixed-positioned
-     * (card height 132px, slider anchored 18px off the card's bottom --
-     * both tuned for the small/medium tiers' shorter label, with no
-     * margin against a bigger one), overlapping them. Flex column with
-     * LV_SIZE_CONTENT height fixes this structurally instead of just
-     * re-tuning the fixed offsets for one more tier: the card's own height
-     * -- and the gap between label and slider -- now follows the label's
-     * actual rendered height at whatever font tier is active, so there's
-     * no fixed number left to go stale if a future tier adds an even
-     * bigger font. */
+    /* Flex column with content height accommodates varying font heights. */
     lv_obj_set_height(card, LV_SIZE_CONTENT);
     lv_obj_add_style(card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(card, 0, 0);
@@ -2407,12 +2257,7 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
     lv_obj_set_ext_click_area(value_label, 16);
     lv_obj_add_event_cb(value_label, eq_field_label_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) field);
 
-    /* Real-device bug report: at lv_pct(100), the knob's own radius
-     * overshoots past the slider's nominal track bounds at the min/max
-     * ends -- with the track already flush against the card's 14px
-     * padding, the knob there touched/clipped against the card's own
-     * rounded corners. Inset instead of full-width so the knob has room
-     * to sit fully inside the card at both extremes. */
+    /* Inset track width so the knob radius stays within the card at slider extremes. */
     lv_obj_t * slider = lv_slider_create(card);
     lv_obj_set_width(slider, lv_pct(88));
     lv_obj_set_height(slider, SLIDER_TRACK_HEIGHT);
@@ -2917,11 +2762,8 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_align(eq_bypass_switch, LV_ALIGN_TOP_RIGHT, -16, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
     lv_obj_add_style(eq_bypass_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
 
-    /* Reset to defaults -- sits right next to the enable switch per the
-     * bug report ask, aligned relative to the switch itself (not a fixed
-     * x offset) so it stays correctly placed regardless of the switch's
-     * actual rendered width. Confirmation required (build_eq_reset_popup())
-     * since this clobbers every band's freq/gain/Q/type plus the preamp. */
+    /* Reset to defaults -- positioned relative to the bypass switch.
+     * Requires confirmation popup since this resets all band settings and preamp. */
     lv_obj_t * reset_btn = lv_label_create(scr);
     lv_label_set_text(reset_btn, "Reset");
     lv_obj_set_style_text_color(reset_btn, lv_color_make(255, 120, 120), 0);
@@ -2943,24 +2785,11 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(content, 0, 0);
     lv_obj_set_style_border_width(content, 0, 0);
-    /* Real-device bug report: same root cause as build_compact_list_widget()'s
-     * own fix (see that function's comment) -- this container never zeroed
-     * its own padding, so it carried LVGL's default object theme padding on
-     * top of every child's own pct-width/pad math, shifting the whole PEQ
-     * screen's cards right and clipping them against the screen edge. */
+    /* Zero default container padding so card width calculations align cleanly. */
     lv_obj_set_style_pad_all(content, 0, 0);
     lv_obj_set_scroll_dir(content, LV_DIR_VER);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-    /* Main-place (1st arg) must be START, not CENTER -- this column's
-     * children overflow the container height on purpose (that's what makes
-     * it scrollable), and CENTER main-place centers that whole oversized
-     * stack instead of anchoring it to the top. That pushed the first card
-     * (Pre-Amp) above the reachable top of the scroll range entirely --
-     * real-device bug report: "can't see the preamp part, can't scroll up
-     * enough". START anchors the stack's top to the container's top, same
-     * as every other scrollable list in this file (e.g.
-     * build_subsonic_list_screen's list, which never sets this at all and
-     * gets START by default). */
+    /* START main-axis alignment anchors children to top of scrollable area. */
     lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(content, 16, 0);
     lv_obj_set_style_pad_top(content, 12, 0);
@@ -2971,39 +2800,12 @@ static lv_obj_t * build_eq_screen(void) {
      * own gain -- same role as the reference DAP's "Pre AMP" control. */
     lv_obj_t * eq_preamp_card = create_eq_slider_card(content, EQ_FIELD_PREAMP, &eq_preamp_value_label, &eq_preamp_slider, -120, 120);
 
-    /* Band picker: a dropdown rather than the original 5x2 grid of
-     * tappable band-number buttons -- real-device bug report, the grid's
-     * buttons were a fixed 80x44 with no allowance for a bigger font tier
-     * (Settings > System > Font Size), so BlindMF's much larger glyphs
-     * overlapped both within a button and between adjacent buttons. A
-     * dropdown sidesteps this entirely (only ever renders one band's
-     * label at a time, closed or open) and matches eq_type_dropdown's own
-     * already-working shape just below, including its explicit gui_theme_font(GUI_FONT_ROLE_BODY)
-     * font so this one also actually scales with the font tier setting,
-     * unlike eq_type_dropdown which was never explicitly given one. */
-    /* Dropdown width scales with the font tier -- real-device bug report:
-     * fixed at 170px regardless of tier, BlindMF's much wider "Low Shelf"/
-     * "High Shelf" text ran into the dropdown's own arrow glyph, which
-     * occupies a roughly fixed pixel area on the right regardless of font
-     * size. Shared by both dropdowns below rather than computed via
-     * LV_SIZE_CONTENT, which would resize the box to whichever option is
-     * currently selected and make it visibly jump width every time the
-     * user picks a different one. */
+    /* Dropdown width scales with font size tier so options fit without truncation. */
     int32_t eq_dropdown_width = 170;
     if (current_settings.font_size_tier == 1) eq_dropdown_width = 200;
     else if (current_settings.font_size_tier == 2) eq_dropdown_width = 240;
 
-    /* Band picker: a dropdown rather than the original 5x2 grid of
-     * tappable band-number buttons -- real-device bug report, the grid's
-     * buttons were a fixed 80x44 with no allowance for a bigger font tier
-     * (Settings > System > Font Size), so BlindMF's much larger glyphs
-     * overlapped both within a button and between adjacent buttons. This
-     * row (and type_row/enable_row just below) is now LV_SIZE_CONTENT-
-     * height and flex-laid-out rather than a fixed 64px with hand-placed
-     * children, same "structural, not hand-tuned-per-tier" reasoning as
-     * create_eq_slider_card's own redesign above -- a fixed 64px row could
-     * still clip a dropdown/switch whose own natural height grows with a
-     * bigger font. */
+    /* Band selection row with flex layout and content-based height. */
     lv_obj_t * band_row = lv_obj_create(content);
     lv_obj_set_width(band_row, lv_pct(96));
     lv_obj_set_height(band_row, LV_SIZE_CONTENT);
@@ -3077,18 +2879,7 @@ static lv_obj_t * build_eq_screen(void) {
     eq_band_enabled_switch = lv_switch_create(enable_row);
     lv_obj_add_style(eq_band_enabled_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
 
-    /* Save/Load Profile row -- the new SD card persistence ask, sitting at
-     * the end of the same scrollable list as everything else rather than
-     * a separate screen of its own. */
-    /* Real-device bug report: at BlindMF, "Save Profile"/"Load Profile"
-     * didn't fit their fixed lv_pct(46) x 56 buttons -- same class of bug
-     * as create_eq_slider_card's above, fixed the same structural way:
-     * LV_SIZE_CONTENT height (grows to fit however many lines the label
-     * needs) and the label itself set to wrap within its button's width
-     * rather than overflow it, instead of a fixed pixel box sized for the
-     * small/medium tiers' shorter rendered text. flex_grow(1) on both
-     * buttons (rather than the old fixed lv_pct(46) each) keeps them
-     * evenly split regardless of how wide either one's content ends up. */
+    /* Save/Load Profile row with wrapping button labels and content-based height. */
     lv_obj_t * profile_row = lv_obj_create(content);
     lv_obj_set_width(profile_row, lv_pct(96));
     lv_obj_set_height(profile_row, LV_SIZE_CONTENT);
@@ -3138,12 +2929,9 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_set_width(load_label, lv_pct(100));
     lv_obj_center(load_label);
 
-    /* Establish correct initial visual state for every widget BEFORE
-     * binding any event callbacks -- lv_obj_add_state()/clear_state() can
-     * itself fire LV_EVENT_VALUE_CHANGED, which would otherwise trigger a
-     * spurious peq_save() during screen construction (observed empirically:
-     * band 0 ended up saved as enabled=1 on a fresh run with no user
-     * interaction at all). */
+    /* Establish correct initial visual state for every widget before
+     * binding event callbacks to avoid spurious value-changed events during
+     * screen construction. */
     refresh_all_eq_widgets();
 
     lv_obj_add_event_cb(eq_bypass_switch, eq_bypass_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
@@ -3156,22 +2944,10 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_add_event_cb(eq_q_slider, eq_q_slider_event_cb, LV_EVENT_ALL, NULL);
 
     finalize_screen_navigation(scr);
-    /* Same reasoning as every other scrollable-content screen in this
-     * file: a drag over a card that isn't the slider itself should scroll
-     * the list, not bubble up as an app-wide swipe. */
+    /* Prevent dragging in the scrollable content area from bubbling up as an app-wide swipe. */
     lv_obj_remove_flag(content, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    /* Real-device bug report: dragging a PEQ slider (Pre-Amp/Freq/Gain/Q)
-     * right-to-left could still get hijacked into the app-wide "swipe to
-     * player" transition mid-drag, abandoning the slider adjustment --
-     * the exact same real-device incident already fixed for the Idle
-     * Shutdown/Screen Timeout/Startup Volume sliders (see
-     * active_press_is_over_drag_adjust_widget()'s and
-     * register_swipe_dead_zone()'s own comments): the swipe-to-player
-     * gesture is detected by a separate raw-indev-polling path that
-     * doesn't go through LVGL's GESTURE_BUBBLE/event system at all, so
-     * removing content's own GESTURE_BUBBLE flag above doesn't reach it.
-     * These 4 cards were never registered as dead zones for that path,
-     * unlike those other sliders' own cards -- fixing that omission here. */
+    /* Register slider cards as dead zones to prevent horizontal slider adjustments
+     * from triggering the swipe-to-player transition. */
     lv_obj_remove_flag(eq_preamp_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
     register_swipe_dead_zone(eq_preamp_card);
     lv_obj_remove_flag(eq_freq_card, LV_OBJ_FLAG_GESTURE_BUBBLE);

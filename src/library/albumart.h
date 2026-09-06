@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "artwork_coordinator.h"
 
 /* POSIX port of Rockbox apps/recorder/albumart.c (GPLv2+).
  * Search order matches find_albumart()/search_albumart_files():
@@ -37,5 +38,16 @@ bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int hei
 
 /* Reads a JPEG/PNG/BMP found by albumart_find into *out_data (caller frees). */
 bool albumart_load_file(const char * path, uint8_t ** out_data, uint32_t * out_size, uint32_t max_bytes);
+
+typedef enum {
+    ALBUMART_LOAD_OK,
+    ALBUMART_LOAD_INVALID,
+    ALBUMART_LOAD_TEMPORARY,
+} albumart_load_result_t;
+
+/* Admit the opened file's actual size before allocating/reading its data.
+ * Memory pressure, allocation failure and I/O failure remain retryable. */
+albumart_load_result_t albumart_load_file_ex(const char * path, uint8_t ** out_data,
+    uint32_t * out_size, uint32_t max_bytes, artwork_priority_t priority);
 
 #endif /* ALBUMART_H */

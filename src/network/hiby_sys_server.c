@@ -11,10 +11,7 @@
 
 #define SYS_SERVER_SOCKET_PATH "/var/run/sys_server"
 
-/* 300ms: generous for a local Unix socket round-trip, short enough that a
- * wedged/absent sys_server can't stall whichever thread calls into this
- * for long -- see this file's own header comment on why failures here are
- * silently tolerated rather than retried. */
+/* Timeout for sys_server Unix domain socket communication. */
 #define SYS_SERVER_TIMEOUT_MS 300
 
 static void send_command(const char * cmd) {
@@ -42,10 +39,7 @@ static void send_command(const char * cmd) {
         return;
     }
 
-    /* Reply ("OK"/"FAIL") observed live but never needed by any caller --
-     * still drained so sys_server's own send() doesn't block on a peer
-     * that never reads, and so a slow reply is bounded by the same
-     * SO_RCVTIMEO above rather than hanging this socket open. */
+    /* Drain reply so sys_server send does not block. */
     char reply[64];
     ssize_t got = recv(fd, reply, sizeof(reply) - 1, 0);
     if (got > 0) {
@@ -80,7 +74,7 @@ void hiby_sys_server_report_volume(int percent) {
 
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
-    int raw = (percent * 127 + 50) / 100; /* 0-127, same AVRCP absolute-volume scale as BT_SOURCE_VOLUME_MAX in bluetooth_control.c */
+    int raw = (percent * 127 + 50) / 100; /* Scale 0-100 to 0-127 AVRCP absolute volume */
 
     char cmd[48];
     snprintf(cmd, sizeof(cmd), "BT:ABSVOL:%s %d", mac, raw);

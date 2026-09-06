@@ -17,19 +17,8 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-/* Guards bt_control_init_chip()/bt_control_enable()/bt_control_disable() --
- * the three functions that actually touch the physical chip (chip firmware
- * flash, or the D-Bus adapter power toggle). Real-device incident: BT ended
- * up permanently wedged (unrecoverable without a full reboot) after waking
- * from suspend, traced to gui.c's own pre-existing radio-suspend/restore
- * threads and power_suspend.c's post-resume restore thread both being able
- * to call into these with no coordination between the two modules -- two
- * concurrent chip operations racing each other, which this chip is already
- * documented (see bt_control_disable()'s own comment on bt_suspend/
- * bt_resume) not to tolerate. Held for the entire body of each of the three
- * functions below, not just the individual subprocess_run() calls, so a
- * caller can never observe or interleave with a partial chip operation from
- * another thread. */
+/* Guards bt_control_init_chip(), bt_control_enable(), and bt_control_disable()
+ * so chip firmware operations and power toggles are strictly serialized across threads. */
 static pthread_mutex_t bt_chip_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_mutex_t bt_dac_info_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -254,20 +243,7 @@ static void ensure_single_dbus_daemon(void) {
     remove("/var/run/messagebus.pid"); /* stale pidfile blocks a fresh start otherwise */
     usleep(300000);
 
-    /* Real-device incident: without --fork, this build of dbus-daemon
-     * doesn't daemonize -- it stays in the foreground indefinitely. This
-     * used to be launched with the blocking subprocess_run(), which waited
-     * out its full 15s timeout (freezing whichever thread called this --
-     * the main GUI thread, when reached via
-     * bt_control_recover_wedged_daemon()) and then SIGKILLed the
-     * dbus-daemon it had just started, leaving the system with no system
-     * bus at all. Confirmed live: `dbus-daemon --system` alone stayed
-     * foreground; `dbus-daemon --system --fork` returned immediately with
-     * the daemon still running. subprocess_spawn_daemon() (fire and
-     * forget, same as every other long-running daemon this file starts --
-     * bluetoothd, bluealsa) is the correct call shape regardless of --fork,
-     * but passing --fork too matches how a real dbus-daemon is meant to be
-     * started and costs nothing. */
+    /* Launch dbus-daemon in the background with --fork. */
     char * argv[] = { (char *) "dbus-daemon", (char *) "--system", (char *) "--fork", NULL };
     subprocess_spawn_daemon(argv);
     usleep(300000);
@@ -318,18 +294,7 @@ static void bt_control_recover_wedged_daemon(void) {
 
     DBG_LOG("bt_control: wedged daemon detected, attempting recovery\n");
 
-    /* Real-device incident: found live while debugging this exact wedge --
-     * two dbus-daemon --system processes were running simultaneously (the
-     * same split-brain condition ensure_single_dbus_daemon() already
-     * exists to fix at startup, see its own comment for the full history).
-     * bluetoothctl and the freshly-restarted bluetoothd below can end up
-     * on different buses in that state, which explains why bluetoothctl
-     * show hung completely (full subprocess timeout, not even a fast
-     * error) rather than returning a quick "No default controller"
-     * response -- it was waiting for a reply from a bluetoothd that
-     * wasn't listening on the bus it asked. Checked/fixed here too, not
-     * just at startup, since real-device testing showed this condition
-     * recurring mid-session, not only on a fresh boot. */
+    /* Ensure a single system D-Bus daemon is running before restarting bluetoothd. */
     ensure_single_dbus_daemon();
 
     subprocess_kill_all_matching("bluetoothd");
@@ -372,33 +337,8 @@ static void bt_control_recover_wedged_daemon(void) {
  * all, so that one still recovers immediately without a threshold. */
 #define TIMEOUT_RECOVERY_THRESHOLD 4
 
-/* Bluetooth could visibly turn itself off then back on right after boot
- * with no user action. Cause: this app's first status poll can land
- * before bluetoothd finishes registering the adapter object even though
- * hci0 already exists at the kernel level, so `bluetoothctl show`
- * correctly reports "No default controller available" for a brief, normal
- * startup window -- not because anything is wedged. That string is
- * normally treated as an immediate wedge signal (no threshold, unlike the
- * timeout path above) since mid-session it reliably is one, but during
- * this boot window it isn't, and the resulting recovery (kill bluetoothd,
- * reset, respawn, re-power) is itself the visible disable-then-enable
- * cycle that was reported. Fixed by giving "No default controller
- * available" the same not-immediately-fatal treatment as a timeout for a
- * grace window after this process's first poll, after which it reverts to
- * triggering recovery immediately.
- *
- * Real-device bug report: Bluetooth still visibly flickered on then off
- * shortly after a real power-down/power-up, despite this grace window
- * already existing. Root cause: bt_control_init_chip()'s own comment above
- * documents cold chip-init (bt_resume, a real UART firmware flash) taking up
- * to ~10-13s, but this window was only 8000ms -- shorter than the
- * documented worst case, so a slower boot could legitimately still be
- * mid-init when the grace window expired, at which point the very next
- * "No default controller available" poll was treated as a genuine wedge and
- * triggered bt_control_recover_wedged_daemon() (which unconditionally
- * force-repowers Bluetooth), producing exactly the on-then-off flicker
- * reported. Widened to comfortably clear the documented worst case with
- * headroom, rather than just matching it exactly. */
+/* Grace period after startup to avoid falsely triggering daemon recovery while
+ * Bluetooth chip initialization or bring-up is still in progress. */
 #define BT_BOOT_RACE_GRACE_MS 15000
 
 static uint32_t bt_control_monotonic_ms(void) {
@@ -407,26 +347,8 @@ static uint32_t bt_control_monotonic_ms(void) {
     return (uint32_t) (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
-/* Guards bt_control_is_powered()'s own static bookkeeping below
- * (consecutive_timeouts, first_poll_seen/first_poll_tick) -- separate from
- * bt_chip_mutex above, not reused, since bt_control_is_powered() can itself
- * call into bt_control_recover_wedged_daemon() -> bt_control_enable(), which
- * takes bt_chip_mutex; reusing the same mutex here would self-deadlock.
- *
- * Real-device bug report: Bluetooth toggled off by the user sometimes
- * flipped back on by itself a moment later. Root cause: this function is
- * polled from gui.c's own periodic refresh_bt_icon() timer on the main
- * thread AND, concurrently, from inside bt_toggle_thread_func()'s own
- * post-toggle confirmation retry loop on a background thread -- with no
- * synchronization at all on the static counters below. Two callers racing
- * on a plain (non-atomic) consecutive_timeouts increment/reset could hit
- * TIMEOUT_RECOVERY_THRESHOLD from a lost update rather than genuine
- * consecutive timeouts, or interleave a stale first_poll_tick read -- either
- * way spuriously triggering bt_control_recover_wedged_daemon(), which
- * unconditionally force-repowers Bluetooth regardless of what the user just
- * asked for. Serializing the whole function (not just the counter updates)
- * is the simplest fix that can't leave the bookkeeping and the decision it
- * drives observing different, interleaved states. */
+/* Guards bt_control_is_powered() state and timeout counters against concurrent
+ * polling from the GUI timer and toggle background threads. */
 static pthread_mutex_t bt_status_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static bool bt_control_is_powered_impl(void) {
@@ -613,27 +535,8 @@ bool bt_control_is_connected(void) {
     return false;
 }
 
-/* Real-device bug: the Bluetooth settings screen's own device list
- * (bt_scan_results[] in gui.c) only ever reflected paired/connected state
- * as of the last explicit scan (Rescan button, or opening the screen) --
- * unlike the top-bar icon, nothing refreshed it afterward, so a device
- * connecting/disconnecting elsewhere (or via this app's own now-working
- * Bluetooth audio output) never updated the list short of leaving and
- * re-entering the screen. Same underlying `bluetoothctl paired-devices` +
- * per-device `info` query bt_control_is_connected() already does, but
- * returning the full breakdown instead of collapsing it into one bool --
- * gui.c's periodic icon-refresh poll calls this once and derives its own
- * "is anything connected" from the result, instead of paying for this same
- * per-device loop twice every cycle. Returns how many entries were written
- * into out[] (capped at max_count, same convention as bt_control_scan()),
- * or -1 if the underlying `bluetoothctl paired-devices` call itself failed
- * (hung/killed by subprocess_run()'s own timeout) -- distinct from a
- * genuine "0 paired devices" so gui.c's own merge logic (see
- * poll_refresh_bt_icon()'s own comment on why this distinction matters)
- * can tell a real empty list from a query that didn't actually run, rather
- * than treating a transient subprocess hiccup as "nothing is paired
- * anymore" and wiping every device's known state for a cycle. Blocking;
- * call off the UI thread. */
+/* Returns paired and connected state for all paired devices.
+ * Returns device count, or -1 if the underlying bluetoothctl call fails. */
 int bt_control_list_paired_states(bt_device_t * out, int max_count) {
     char devices_buf[4096];
     char * devices_argv[] = { (char *) "bluetoothctl", (char *) "paired-devices", NULL };
@@ -659,38 +562,8 @@ int bt_control_list_paired_states(bt_device_t * out, int max_count) {
     return count;
 }
 
-/* BlueZ real-device incident: a plain `bluetoothctl --timeout N scan on`
- * scans BOTH bearers at once (ControllerMode=dual in main.conf), and for a
- * dual-mode accessory that advertises over LE as well as classic (confirmed
- * on a real pair of earbuds -- companion-app features like "Find My Buds"
- * use LE, the actual A2DP/AVRCP audio path is classic BR/EDR only), whichever
- * bearer's advertisement/inquiry result lands first in bluetoothd wins the
- * device object's bearer identity for the *next* `pair`. When that's LE, the
- * result is an LE-only bond (an LTK, no classic link key) that looks
- * "Paired: yes" to a casual query but can never actually carry A2DP/AVRCP.
- * Confirmed live: bluetoothd's own periodic LE auto-reconnect attempt to
- * such a device then fails every time (`ATT bt_io_connect(): connect: No
- * route to host`), and the kernel eventually emits a real
- * MGMT_EV_DEVICE_UNPAIRED for it -- which BlueZ (src/device.c
- * device_set_unpaired()) treats as *fully* unpaired since there was never a
- * working classic bond to fall back on, wiping the stored keys and deleting
- * the device object outright (src/adapter.c remove_temp_devices()). That's
- * the actual root cause behind "forget device, then it vanishes for good
- * even though other devices can still see it": not a caching bug in this
- * app, but an LE-only bond silently going stale server-side.
- *
- * Fix: restrict discovery to the classic bearer only, via bluetoothctl's
- * `scan.transport bredr` submenu command. That command only takes effect
- * for a discovery *started in the same process* (BlueZ's SetDiscoveryFilter
- * is scoped to the calling D-Bus connection, and bluetoothctl's own filter
- * state is a plain in-process static, never persisted) -- so unlike every
- * other bluetoothctl call in this file, this needs one persistent
- * interactive session (`scan.transport bredr` + `scan on` + wait + `scan
- * off`, all through the same stdin pipe) rather than one-shot argv
- * invocations. The actual device list is still read back afterward via the
- * normal one-shot `bluetoothctl devices` call below -- that's fine, because
- * by then the device objects already exist server-side in bluetoothd with
- * the classic-only bearer identity this filter guaranteed. */
+/* Runs discovery restricted to the classic BR/EDR bearer using `scan.transport bredr`.
+ * Dual-mode devices paired via classic BR/EDR reliably support A2DP/AVRCP audio. */
 static void run_bredr_scan(int seconds) {
     pid_t pid;
     int write_fd;
@@ -767,35 +640,11 @@ bool bt_control_forget(const char * mac) {
     return strstr(out, "Failed") == NULL;
 }
 
-/* Real-device finding: with --a2dp-volume on, bluealsa's SoftVolume applies
- * the phone's AVRCP absolute-volume value as a straight LINEAR PCM
- * amplitude gain -- confirmed with measured data across one phone's full
- * slider range (10%/20%/30%/50%/80%/100% phone volume produced raw values
- * 9/17/26/43/68/85, i.e. consistently ~0.85x phone% -- genuinely linear,
- * and this phone's own ceiling is 85, not the full 0-127 AVRCP range).
- * Human hearing perceives loudness logarithmically, so a linear amplitude
- * curve front-loads nearly the whole perceived range into the bottom half
- * of the slider (10% to 50% amplitude is already about +14dB) -- confirmed
- * on a real device as "maxed out by 50%, already too loud around 30%",
- * which is a real risk with sensitive headphones. There's no bluealsa flag
- * for this (checked --help). Fixed entirely from userspace, no need to
- * patch bluealsa itself: `bluealsa-cli monitor -p` streams every volume
- * change the phone sends as plain text
- * ("PropertyChanged <pcm-path> Volume 0xLLRR", confirmed live), and
- * `bluealsa-cli volume <pcm-path> <L> <R>` can write an arbitrary value
- * back -- this intercepts the phone's raw updates and rewrites them
- * through a proper dB taper before bluealsa ever applies them. */
-/* Real-device incident: 40dB (a fairly standard "full range" figure for
- * consumer audio taper curves) turned out too aggressive here -- confirmed
- * live it compresses nearly the whole practical phone-slider range into a
- * narrow, barely-audible band (e.g. writing a mid-scale raw value of 64
- * settled, correctly per this formula, at a corrected 13 -- about 10% of
- * full scale), which reads as "stuck near-silent" even though it's
- * technically still responding. 20dB is a gentler, still-standard choice
- * that keeps meaningfully more of the corrected range in the audible
- * portion of the phone's slider. */
+/* Intercepts incoming AVRCP absolute-volume updates from bluealsa-cli monitor
+ * and reshapes them through a 20dB logarithmic taper before applying them,
+ * correcting the default linear amplitude curve. */
 #define BT_VOLUME_CURVE_TAPER_DB 20.0
-#define BT_VOLUME_RAW_MAX 127 /* AVRCP absolute volume's own 7-bit spec range -- what bluealsa's Volume property scale actually is, regardless of what any given phone's own slider happens to top out at (this one caps at 85) */
+#define BT_VOLUME_RAW_MAX 127
 
 static pthread_t bt_volume_curve_thread;
 static bool bt_volume_curve_active = false;
@@ -842,19 +691,8 @@ static void * bt_volume_curve_thread_func(void * arg) {
         if (corrected < 0) corrected = 0;
         if (corrected > BT_VOLUME_RAW_MAX) corrected = BT_VOLUME_RAW_MAX;
 
-        /* Real-device incident: set BEFORE issuing the write below, not
-         * after -- confirmed live that a single write triggers the monitor
-         * to print the echoed PropertyChanged line TWICE, and since
-         * subprocess_run() blocks on bluealsa-cli's own D-Bus call
-         * completing (not on the separate, async PropertyChanged signal
-         * actually reaching this process's monitor subprocess), there was
-         * a real window where an echo could be read before
-         * last_written_raw caught up -- misreading our own write as a new
-         * phone-driven change and re-applying the (non-idempotent) dB
-         * taper to its own output. That's not just a redundant correction:
-         * iterating a nonlinear taper on its own result diverges fast,
-         * confirmed on a real device as volume randomly swinging between
-         * 0% and 100%. */
+        /* Update last_written_raw before issuing write to avoid misinterpreting
+         * our own echo as a new volume change. */
         last_written_raw = corrected;
         char corrected_str[8];
         snprintf(corrected_str, sizeof(corrected_str), "%d", corrected);
@@ -866,16 +704,11 @@ static void * bt_volume_curve_thread_func(void * arg) {
     return NULL;
 }
 
-/* Called from bt_control_apply_output_settings() -- see this section's own
- * comment for what this corrects and why. */
+/* Called from bt_control_apply_output_settings() */
 static void bt_volume_curve_stop(void) {
     if (!bt_volume_curve_active) return;
     bt_volume_curve_active = false;
-    /* The thread is almost certainly blocked in fgets(), waiting on the
-     * monitor subprocess's next line -- which may never come on its own.
-     * Killing that subprocess here (not from inside the thread) forces
-     * EOF, which is what actually unblocks fgets() and lets the thread
-     * reach its own natural return. */
+    /* Terminate the monitor subprocess to unblock fgets. */
     if (bt_volume_curve_monitor_pid > 0) subprocess_terminate(bt_volume_curve_monitor_pid);
     pthread_join(bt_volume_curve_thread, NULL);
     bt_volume_curve_monitor_pid = -1;
@@ -887,44 +720,15 @@ static void bt_volume_curve_start(void) {
     pthread_create(&bt_volume_curve_thread, NULL, bt_volume_curve_thread_func, NULL);
 }
 
-/* ---- Source-direction (a2dp-source, this device streaming TO headphones)
- * AVRCP volume sync -- the mirror image of bt_volume_curve_start()/_stop()
- * above, which corrects the OTHER direction (a2dp-sink/DAC mode, a phone
- * streaming TO this device). Real-device bug report: once Bluetooth output
- * itself started working (see audio_set_bt_output()'s history in audio.h),
- * the headphones' own volume buttons had no effect on this app's playback
- * volume, and this app's own volume slider had no effect on whatever level
- * the headphones themselves show/remember.
- *
- * No dB reshaping needed here, unlike bt_volume_curve_thread_func above:
- * confirmed live via `bluealsa-cli info` that a fresh a2dp-source PCM's
- * SoftVolume is off by default (bluealsa passes PCM through unscaled), so
- * this app's own volume_percent_to_gain() taper in audio.c remains the
- * ONLY real gain stage regardless of what AVRCP's raw value says -- that
- * raw 0-127 number is purely a position indicator kept in sync with this
- * app's own 0.0-1.0 percent via a plain linear mapping, not a second
- * amplitude control. (If a future bluealsa version or a specific accessory
- * ever turns SoftVolume on by default for this PCM, this would start
- * double-attenuating -- re-check `bluealsa-cli info` first if music turns
- * out quieter than expected specifically over Bluetooth.) */
+/* Synchronizes volume between this player and connected a2dp-source accessories.
+ * Maps AVRCP 0-127 linearly to the player's 0-100% volume. */
 #define BT_SOURCE_VOLUME_MAX 127
 
 static bool find_source_pcm_path(char * out, size_t out_size) {
     char list_out[4096];
     char * argv[] = { (char *) "bluealsa-cli", (char *) "list-pcms", NULL };
     if (!subprocess_run(argv, list_out, sizeof(list_out))) {
-        /* Real-device bug report: BT "hangs" (needs disable/enable +
-         * reconnect to recover) sometime after reconnecting and starting a
-         * new track -- not yet reproduced/confirmed, but bt_control_is_
-         * powered()'s own wedge detection only watches `bluetoothctl show`;
-         * a bluealsa-cli call timing out/failing here was previously
-         * completely silent, so if bluealsa itself (not bluetoothd) is
-         * what's actually wedging, there was nothing in the log to show it.
-         * Logged, not auto-recovered -- this alone doesn't yet know it's a
-         * genuine wedge vs. a normal transient "nothing connected right
-         * now" (see this function's own callers), so it shouldn't trigger
-         * bt_control_recover_wedged_daemon() itself without more evidence
-         * that this is the actual failure mode. */
+        /* Log failure if bluealsa-cli list-pcms fails or times out. */
         DBG_LOG("bt_control: find_source_pcm_path: bluealsa-cli list-pcms failed/timed out\n");
         return false;
     }
@@ -1194,14 +998,7 @@ static void * bt_output_disconnect_thread_func(void * arg) {
                 bt_output_disconnect_flag = true;
             }
         } else if (strncmp(line, "PCMAdded ", 9) == 0) {
-            /* Diagnostic only -- real-device bug report: BT "hangs" some
-             * time after reconnecting and starting a new track. If a
-             * reconnect's own AVDTP renegotiation briefly tears down and
-             * recreates this PCM (PCMRemoved immediately followed by
-             * PCMAdded, not a genuine physical disconnect), that would
-             * already be visible here as a spurious flag right after
-             * reconnecting -- logged so a future capture can show whether
-             * that's what's happening, without changing behavior yet. */
+            /* Log PCMAdded events for diagnostics. */
             DBG_LOG("bt_control: output_disconnect_watch: %s", line);
         }
     }
@@ -1243,33 +1040,12 @@ static bool last_applied_volume_sync_enabled = false;
 static bool output_settings_ever_applied = false;
 
 /* Serializes bt_control_apply_output_settings() against itself across the
- * two independent threads that can call it (see that function's own
- * comment for the real-device race this fixes) -- a plain, non-recursive
- * mutex is safe here specifically because bt_control_recover_wedged_
- * daemon() never holds it while calling into bt_control_apply_output_
- * settings() (it only reaches that indirectly, via bt_control_reapply_
- * last_output_settings(), and never locks this mutex itself). */
+ * two independent threads that can call it. */
 static pthread_mutex_t bt_daemon_respawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define BLUEALSA_STARTUP_LOG_PATH "/usr/data/bluealsa_startup.log"
 
-/* Real-device incident: bluealsa's own D-Bus query to BlueZ's
- * ObjectManager (GetManagedObjects, used to discover the adapter/devices
- * at startup) timed out in one specific capture ("Couldn't get managed
- * objects: Timeout was reached"). An earlier version of this function
- * blocked here for 800ms to check the log for that before letting
- * bt_control_apply_output_settings() continue on to starting bt-agent/
- * bluealsa-aplay/discoverable, retrying the spawn if it found the error --
- * but a later real-device regression (audio that used to actually play
- * stopped working, connections dropping instead) traced back to timing
- * changes in this exact function versus the version last confirmed
- * working, and that 800ms block delaying everything after it was the
- * clearest concrete difference. Still logs bluealsa's startup output for
- * visibility, but no longer blocks or retries on it -- matches the timing
- * of the plain fire-and-forget spawn this replaced. Only actually writes
- * the log file on a TEST_BUILD_TAG build (see debug_log.h's own comment on
- * why) -- a real flash deployment has nobody to read it and no reason to
- * spend flash writes creating it on every single profile switch. */
+/* Spawns bluealsa daemon, logging startup output if TEST_BUILD_TAG is defined. */
 static bool spawn_bluealsa_and_verify(char * const argv[]) {
 #if defined(TEST_BUILD_TAG)
     return subprocess_spawn_daemon_logged(argv, BLUEALSA_STARTUP_LOG_PATH);
@@ -1279,73 +1055,15 @@ static bool spawn_bluealsa_and_verify(char * const argv[]) {
 }
 
 bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled) {
-    /* Real-device concurrency finding: this function and bt_control_recover_
-     * wedged_daemon() (via bt_control_reapply_last_output_settings() at the
-     * end of its own recovery sequence) each independently kill-then-respawn
-     * bluealsa/bt-agent, with nothing previously stopping both from doing so
-     * at once -- e.g. a wedge detected on the ~5s connection poll at the
-     * same moment the user (or a BT disconnect's own auto-stop path) touches
-     * a DAC-mode/output-setting toggle. That's the exact "9 accumulated
-     * bt-agent processes" failure mode subprocess_kill_all_matching() below was
-     * originally added to fix (see its own comment), just reachable through
-     * two separate call sites racing instead of one call site respawning
-     * without cleanup. bt_daemon_respawn_mutex below serializes them.
-     * Both call sites already run on their own background thread (gui.c's
-     * start_bt_apply_output_settings() thread wrapper for this function;
-     * refresh_bt_icon_thread_func() for the wedge-recovery path), never the
-     * UI thread, so blocking here on the other one finishing can't freeze
-     * the UI -- it just makes one wait briefly instead of interleaving with
-     * the other's kill/respawn sequence.
-     *
-     * Audit finding: last_applied_dac_mode_enabled/last_applied_volume_
-     * sync_enabled/output_settings_ever_applied used to be written BEFORE
-     * this lock, while bt_control_reapply_last_output_settings() (the
-     * wedge-recovery path mentioned above) read them with no lock at all.
-     * A toggle landing at the same moment as a wedge-triggered reapply
-     * could observe an inconsistent combination of the two flags. Writing
-     * them under the same mutex that already serializes the two call
-     * sites' actual daemon respawns closes this with no new lock needed. */
+    /* Serializes bluealsa/bt-agent respawns and updates last-applied settings
+     * to protect against concurrent caller races. */
     pthread_mutex_lock(&bt_daemon_respawn_mutex);
     last_applied_dac_mode_enabled = dac_mode_enabled;
     last_applied_volume_sync_enabled = volume_sync_enabled;
     output_settings_ever_applied = true;
 
-    /* Sink and source are mutually exclusive here, matching the real
-     * firmware's own /usr/bin/bluealsa_profile script exactly (confirmed by
-     * reading it directly): it always runs bluealsa with a SINGLE `-p`
-     * profile, never `-p a2dp-source -p a2dp-sink` together. An earlier
-     * version of this code ran both simultaneously (to keep our own
-     * outgoing-audio-to-headphones path alive at the same time), which is
-     * not a combination the stock firmware itself ever exercises --
-     * plausibly implicated in a real-device freeze once actual audio
-     * started flowing. Since local playback is already blocked while DAC
-     * mode is on (see play_track_at_from()/toggle_play_pause() in gui.c),
-     * there's nothing that would need the source profile at the same time
-     * anyway. */
-    /* bluealsa_profile also kills and respawns bt-agent on every profile
-     * switch (source uses a PIN file, sink doesn't) -- confirmed by reading
-     * the script directly. An earlier version of this function left
-     * whatever bt-agent bt_resume/bt_init originally started running
-     * untouched across profile switches instead of matching that.
-     *
-     * Real-device incident: this used to shell out to `killall bluealsa` /
-     * `killall aplay` / `killall bluealsa-aplay` / `killall bt-agent`
-     * directly, same as kill_stock_player_if_running() originally did for
-     * hiby_player -- and just as unreliably: confirmed live with NINE
-     * accumulated bt-agent processes after repeated DAC-mode/volume-sync
-     * toggles, each one apparently surviving `killall` and each new toggle
-     * spawning yet another on top. Nine agents simultaneously fighting to
-     * register with bluetoothd over D-Bus is a real, confirmed cause of
-     * broader Bluetooth instability (agent registration churn, D-Bus
-     * congestion), not just leaked processes. subprocess_kill_all_matching() (see its
-     * own comment) is the same ps-output-based approach already proven
-     * reliable for hiby_player/dbus-daemon cleanup. "bluealsa" as the
-     * search string also matches bluealsa-aplay (it contains "bluealsa" as
-     * a substring), so this covers both in one pass. */
-    /* Stopped unconditionally, even when about to turn DAC mode back on --
-     * the PCM path it was watching is about to become stale the moment
-     * bluealsa restarts below anyway, and bt_volume_curve_start() gets
-     * called again further down when relevant. */
+    /* Single profile mode: runs a2dp-sink or a2dp-source. */
+    /* Clean up existing instances before respawning daemons. */
     bt_volume_curve_stop();
     bt_dac_info_monitor_stop();
 
@@ -1393,122 +1111,14 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
     }
 
     if (dac_mode_enabled) {
-        /* Real-device incident: plain `aplay -D bluealsa` (against the
-         * generic pre-configured PCM plugin at /etc/alsa/conf.d/
-         * 20-bluealsa.conf) needs that PCM to already resolve to an active
-         * A2DP stream at the moment aplay opens it -- but DAC mode gets
-         * toggled on before any phone has actually connected, so aplay just
-         * exits immediately with nothing to play. bluealsa then has no
-         * consumer at all once a phone DOES connect and start streaming --
-         * confirmed on a real device to freeze it.
-         *
-         * bluealsa-aplay is the right tool after all (an earlier version of
-         * this function tried it with a made-up -p flag it doesn't have,
-         * confirmed via --help, and wrongly concluded the binary itself was
-         * unusable): --help also shows A2DP is already its default profile
-         * (no flag needed at all -- only --profile-sco opts into the
-         * alternate SCO profile), and run with no MAC address it explicitly
-         * defaults to "any/empty MAC ... allow[ing] connections from any
-         * Bluetooth device", staying up and dynamically attaching whenever
-         * one actually starts streaming rather than needing one to already
-         * be attached at launch. That's exactly the long-running,
-         * connection-order-independent behavior this needs.
-         *
-         * Real-user bug report #1: audio played through DAC mode noticeably
-         * lags the video on the connected phone/PC (e.g. watching a video
-         * with the R1 as the Bluetooth headphone/DAC). --pcm-buffer-time/
-         * --pcm-period-time (confirmed present via `bluealsa-aplay --help`
-         * on-device, v4.1.1; values in microseconds, standard ALSA tool
-         * convention) tighten the local playback buffer downstream of
-         * bluealsa's own Bluetooth receive/decode -- pure local ALSA
-         * output buffering, cannot touch codec negotiation or AVDTP
-         * connection setup. Deliberately NOT a codec restriction (e.g.
-         * excluding LDAC, which has notably higher codec-level latency
-         * than SBC/AAC) -- that was already tried for this exact bluealsa
-         * invocation and reverted after it was confirmed, on a real phone,
-         * to consistently fail to ever reach AVDTP Start (see the -c SBC
-         * -c AAC removal comment above, in this same function). Standard
-         * A2DP still has ~100-250ms of inherent encode/transmit/decode
-         * latency baked in on the SOURCE phone/PC's side regardless (this
-         * hardware/bluealsa build has no aptX-LL/aptX-Adaptive support
-         * either, confirmed via `bluealsa --help`'s codec list) -- this
-         * trims the one stage of the pipeline actually within this
-         * device's control, not a guarantee of frame-perfect sync.
-         *
-         * Real-user bug report #2: DAC-mode audio plays cleanly for about
-         * an hour, then chops/pitches, then the Bluetooth session drops
-         * (reconnecting brings it back to normal until the next ~hour
-         * mark). The 100ms/25ms values chosen for bug report #1 above
-         * left only a 100ms local playback buffer to absorb clock drift
-         * between the phone's Bluetooth stack and this SoC's audio
-         * crystal -- at a typical 25-50ppm mismatch that buffer empties
-         * or fills (ALSA XRUN) in roughly 30-70 minutes, matching the
-         * reported chop/pitch-warble window. Each XRUN is audible: on
-         * EPIPE, bluealsa-aplay's write loop calls snd_pcm_prepare() and
-         * retries rather than exiting (confirmed against the upstream
-         * BlueALSA v4.1.1 source, utils/aplay/aplay.c, the EPIPE case in the
-         * snd_pcm_writei() retry loop) -- it does not itself drop the
-         * daemon or the Bluetooth session; what turns sustained XRUN
-         * retrying into an actual AVDTP/ACL drop is not confirmed here.
-         *
-         * --pcm-period-time must also be chosen to land on an exact
-         * integer frame count at whatever rate the phone actually
-         * negotiates, not just 44.1kHz: bluealsa-aplay's own docs
-         * (doc/bluealsa-aplay.1.rst, "--pcm-period-time") warn that a
-         * period time producing fractional frames causes rate-conversion
-         * rounding error and worsens sync drift, worse with small
-         * periods, and give period times that are multiples of 10000us
-         * as the example fix since those land on exact frame counts at
-         * both common Bluetooth rates (441 frames at 44.1kHz, 480 at
-         * 48kHz per 10000us). An earlier version of this fix used
-         * 46440us/185760us (2048 frames/4 periods, exact only at
-         * 44.1kHz -- 2229.12 frames at 48kHz, a common negotiated A2DP
-         * rate, so it would reintroduce exactly the drift this change is
-         * trying to remove) and overstated its buffer-depth gain as
-         * "roughly quadruples" when 185760/100000 is 1.86x. 50000us
-         * period / 200000us buffer (4 periods) is exact at both 44.1kHz
-         * (2205 frames) and 48kHz (2400 frames) and is 2x the old 100ms
-         * buffer -- a smaller, verifiable claim, not a guess at how much
-         * headroom it buys on real hardware. Do not go back toward
-         * 25ms/100ms, the direction that broke, or reintroduce a period
-         * time that is not an exact frame count at 48kHz. */
+        /* Runs bluealsa-aplay with 200ms buffer (4 periods of 50ms) to ensure
+         * exact frame boundaries at both 44.1kHz and 48kHz and reduce latency
+         * while buffering against clock drift. */
         char * bluealsa_aplay_argv[] = { (char *) "bluealsa-aplay",
                                           (char *) "--pcm-buffer-time=200000",
                                           (char *) "--pcm-period-time=50000",
                                           NULL };
         subprocess_spawn_daemon(bluealsa_aplay_argv);
-
-        /* bt_volume_curve_start() is DISABLED for now -- see its own
-         * comment (above bt_control_apply_output_settings()) for the
-         * feature itself, but real-device testing found a problem with the
-         * whole approach that a tuning tweak can't fix: writing a
-         * corrected value back into bluealsa's own Volume property (the
-         * same property --a2dp-volume syncs bidirectionally with the
-         * phone) causes the PHONE to push its own uncorrected value right
-         * back moments later, since AVRCP absolute volume is a two-way
-         * sync and the phone doesn't know about our correction -- a real
-         * tug-of-war, confirmed live, that settles into the volume getting
-         * stuck oscillating in a narrow band regardless of what's actually
-         * set on the phone. Needs a redesign that applies the correction
-         * somewhere that isn't itself synced back to the phone (e.g. the
-         * separate hardware ALSA mixer -- though a first attempt at that
-         * found cset on it not sticking, needs more investigation) before
-         * this can be safely re-enabled. Until then this intentionally
-         * falls back to bluealsa's own plain linear SoftVolume -- not
-         * ideal (see the taper comment), but predictable, unlike the
-         * broken correction attempt. */
-
-        /* Explicit `bluetoothctl discoverable/pairable on` calls
-         * TEMPORARILY REMOVED for the same live A/B test as the codec
-         * restriction, the delays, and bluealsa-aplay above -- the stock
-         * player's own bluealsa_profile script never calls these at all
-         * (confirmed by reading it directly), and was just confirmed
-         * working flawlessly. Whatever makes this device discoverable/
-         * pairable when the stock player enters DAC mode must happen
-         * somewhere else (its own native bt-adapter/D-Bus calls baked into
-         * the binary, not this script) -- if removing this breaks
-         * pairing, that's itself useful information about where that
-         * actually needs to happen. */
     } else {
         char * disc_argv[] = { (char *) "bluetoothctl", (char *) "discoverable", (char *) "off", NULL };
         subprocess_run(disc_argv, NULL, 0);
@@ -1519,12 +1129,8 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
 }
 
 static void bt_control_reapply_last_output_settings(void) {
-    /* Audit finding: these three globals used to be read here with no lock
-     * at all -- see bt_control_apply_output_settings()'s own comment on
-     * the write side of this same race. Snapshot under the lock, then call
-     * outside it (bt_control_apply_output_settings() acquires this same
-     * mutex itself -- calling it while still holding the lock here would
-     * self-deadlock). */
+    /* Read settings under lock to avoid racing concurrent updates,
+     * then call bt_control_apply_output_settings outside the lock. */
     pthread_mutex_lock(&bt_daemon_respawn_mutex);
     bool ever_applied = output_settings_ever_applied;
     bool dac_mode = last_applied_dac_mode_enabled;

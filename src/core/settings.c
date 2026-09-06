@@ -105,17 +105,10 @@ static void set_defaults(player_settings_t * out) {
     out->charge_limiter_enabled = false; /* opt-in -- caps max charge at 85%, a real behavior change the user should choose, not a default surprise */
     out->safe_charging_enabled = false; /* off means leave the PMIC charge-current setting untouched */
     out->show_battery_percent = true; /* on by default -- matches every previous version's always-on behavior */
-    /* Real-world feedback: users who never open Settings at all were
-     * reporting overnight battery drain -- with idle_shutdown_enabled
-     * defaulting off (matching stock), a device left screen-off just sits
-     * at full power indefinitely unless someone opts in by hand. Defaulting
-     * this on, with suspend-to-RAM (not a full poweroff) as the idle
-     * action, fixes that drain for exactly the users who'd never find the
-     * toggle, without the "why did my music/queue reset" complaint a
-     * default poweroff would cause. 10 minutes (the shortest step in
-     * IDLE_SHUTDOWN_STEPS) rather than the old 30-minute value, since this
-     * now needs to actually catch a device left idle, not just sit as a
-     * rarely-hit opt-in backstop. */
+    /* Defaults on: a device left screen-off with idle_shutdown_enabled=false
+     * sits at full power indefinitely. Suspend-to-RAM (not a full poweroff)
+     * avoids resetting the music queue. 10 minutes (IDLE_SHUTDOWN_STEPS min)
+     * to reliably catch devices left idle. */
     out->idle_shutdown_enabled = true;
     out->idle_shutdown_minutes = 10;
     out->idle_suspend_enabled = true;
@@ -445,27 +438,8 @@ bool settings_load(player_settings_t * out) {
     return true;
 }
 
-/* Real-device bug reports: settings (most visibly volume, since hardware
- * volume buttons call this on every single press -- see gui.c's
- * update_timer_cb) reset back to defaults after a reboot on some devices,
- * inconsistently. Root cause: this used to just fclose() the tmp file and
- * rename() it over the real one, with no fsync anywhere -- fclose() only
- * flushes stdio's own userspace buffer into the kernel page cache, it
- * doesn't force that page to actual flash, and neither does rename(). This
- * device's UBIFS partition has been separately confirmed (see TESTING.md's
- * own note on losing a file deletion across an unclean shutdown) to drop
- * recently-written-but-not-yet-committed metadata across anything other than
- * a clean shutdown -- and a clean, UI-driven shutdown isn't how most users of
- * a physical-button DAP actually power one of these off; holding the power
- * button is. That made this a routine case, not a rare edge one, and volume
- * being saved (and lost) more often than anything else made it the most
- * visibly broken setting even though every field here was equally at risk.
- * fsync() on the tmp file's own fd before close ensures its *contents* are
- * durable; a rename() being applied is itself just a directory-metadata
- * change, so the containing directory's own fd needs its own fsync()
- * afterward for the rename itself to survive an unclean shutdown -- the
- * standard atomic-durable-replace recipe (write tmp -> fsync tmp -> rename
- * -> fsync directory). */
+/* Flushes directory metadata changes to flash so the rename survives an unclean
+ * shutdown (atomic durable replace: write tmp -> fsync tmp -> rename -> fsync dir). */
 static void fsync_settings_dir(void) {
     int dir_fd = open(SETTINGS_DIR_PATH, O_RDONLY);
     if (dir_fd < 0) return;
@@ -613,30 +587,8 @@ void settings_save_async(const player_settings_t * settings) {
 void settings_factory_reset(void) {
     DBG_LOG("settings_factory_reset: called\n");
 #ifndef HOST_BUILD
-    /* Real bug report: this used to delete only the settings file, leaving
-     * every OTHER piece of device/app state (the active PEQ, hostname
-     * override, Bluetooth pairings, ALSA config, theme overrides, ...)
-     * still in effect after a "reset" -- not what Factory Reset is supposed
-     * to mean. Wipes every direct child of /usr/data EXCEPT "mnt", which is
-     * left completely undescended-into.
-     *
-     * "mnt" is not an ordinary subdirectory to be careful with -- it's the
-     * live SD card mount. Confirmed directly on-device: /data is a symlink
-     * to usr/data (`readlink /data` -> "usr/data"), and /usr/data/mnt/sd_0
-     * is where /dev/mmcblk0p1 (the physical SD card) is actually mounted
-     * (confirmed via `mount`). Every MUSIC_ROOT_DIR/PLAYLISTS_DIR/
-     * METADATA_DB_PATH reference elsewhere in this app that reads "/data/
-     * mnt/sd_0" is this exact same path. A wipe that didn't skip "mnt"
-     * wouldn't just risk "issues with the SD card" -- rm -rf recurses
-     * through a mount point same as any other directory, so it would
-     * delete the user's entire music library and every real file on the
-     * card, not just this app's own state.
-     *
-     * Each surviving top-level entry is deleted by its own explicit path,
-     * one subprocess_run() per entry, rather than one command referencing
-     * /usr/data as a whole with an exclude pattern -- this way "mnt" is
-     * never passed to rm at all, not merely excluded by a flag/pattern that
-     * would need to be trusted to work correctly. */
+    /* Wipes every direct child of /usr/data except "mnt", preserving the physical
+     * SD card mount (/usr/data/mnt/sd_0) while clearing all other configuration files. */
     DIR * dir = opendir(SETTINGS_DIR_PATH);
     if (dir) {
         struct dirent * entry;

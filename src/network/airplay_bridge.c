@@ -116,12 +116,9 @@ static void run_session(uint8_t * buf, size_t buf_bytes, uint64_t * total_bytes_
             continue;
         }
 
-        /* LISTENING for this fifo_fd until the first real byte arrives --
-         * deliberately does NOT touch audio.c/audio_output at all yet. This
-         * is the crux of the real-device UX fix: toggling AirPlay on (which
-         * gets this thread and shairport itself running) must not
-         * interrupt whatever is already playing locally; only an actual
-         * incoming stream should, and only once it genuinely starts. */
+        /* Remains in LISTENING state without touching audio_output until real
+         * audio bytes arrive. Toggling AirPlay on does not interrupt local
+         * playback until an incoming stream begins. */
         bool session_active = false;
         leftover_len = 0;
 
@@ -139,20 +136,8 @@ static void run_session(uint8_t * buf, size_t buf_bytes, uint64_t * total_bytes_
             if (n == 0) break; /* every writer closed -- shairport session ended */
 
             if (!session_active) {
-                /* First real bytes of this connection -- transition from
-                 * LISTENING to actually STREAMING. Symmetric with local
-                 * playback's own airplay_control_disconnect_active_stream()
-                 * (airplay_control.h), which gives local playback priority
-                 * the other direction: whichever side starts second wins,
-                 * neither permanently disables the other. Same reasoning
-                 * as usb_dac_bridge.c's own wait -- audio_stop() only
-                 * signals the audio thread; audio_output_close() happens
-                 * asynchronously on that thread, so wait for it to actually
-                 * finish before touching the shared output device
-                 * ourselves, or audio_output_ensure() below can fail the
-                 * same "Resource busy" way this project has already hit
-                 * once (see subprocess.c's close_inherited_fds() doc
-                 * comment). */
+                /* Transition to STREAMING. Stops local playback and waits
+                 * for the audio thread to release audio output before claiming it. */
                 audio_stop();
                 for (int waited_ms = 0; waited_ms < 2000; waited_ms += 20) {
                     if (!audio_is_playing() && !audio_is_paused()) break;
@@ -164,10 +149,7 @@ static void run_session(uint8_t * buf, size_t buf_bytes, uint64_t * total_bytes_
             }
 
             *total_bytes_read += (uint64_t) n;
-            /* Real-time source, no local decoder buffering ahead of this --
-             * see audio_output_ensure()'s low_latency parameter doc comment
-             * for why the standard local-playback tuning adds needless
-             * latency here, and the bug report this fixes. */
+            /* Real-time streaming uses low-latency output configuration. */
             audio_output_ensure(BRIDGE_CHANNELS, BRIDGE_SAMPLE_RATE, true, false);
 
             size_t total = leftover_len + (size_t) n;
@@ -246,16 +228,8 @@ static void * bridge_thread_func(void * arg) {
     }
     uint64_t total_bytes_read = 0;
 
-    /* Restart-in-place loop: airplay_bridge_start() sets restart_requested
-     * instead of spawning a second thread when called while this one is
-     * still in BRIDGE_STOPPING (see that function's own comment for the
-     * real bug this fixes -- a rapid off-then-on used to silently no-op,
-     * leaving a freshly spawned shairport with no reader at all). Treating
-     * a requested restart as "run another session in this same thread"
-     * rather than "spawn a new one" means there is never a window where
-     * two bridge threads could exist, or where bridge_state could say
-     * STOPPED/STOPPING while a shairport process is actually running with
-     * nothing reading its FIFO. */
+    /* Restart in place if restart was requested while stopping, preventing
+     * multiple threads from running simultaneously. */
     for (;;) {
         run_session(buf, buf_bytes, &total_bytes_read);
 
@@ -276,21 +250,7 @@ static void * bridge_thread_func(void * arg) {
     fprintf(stderr, "airplay_bridge: stopped, %llu bytes read total\n", (unsigned long long) total_bytes_read);
 
     free(buf);
-    /* No trailing audio_output_close() here -- run_session() already closes
-     * the device itself the instant a streaming run ends (see its own
-     * "if (session_active)" block), covering every path this thread can
-     * exit through. A call here used to run unconditionally as "belt and
-     * suspenders", but it could only ever legitimately have something to
-     * close if session_active was true when the LAST run_session() call
-     * returned, and that path already closed it. If this thread stopped
-     * while merely LISTENING (session_active never became true this run),
-     * the bridge itself never touched audio_output at all -- but by the
-     * time this line ran, bridge_state had already flipped to BRIDGE_
-     * STOPPED, so an unrelated consumer (most exposed: local playback
-     * starting immediately after the user turns AirPlay off while idle)
-     * could already have opened the shared output in that window. Closing
-     * it here regardless would then tear that down out from under them --
-     * a real, previously-unguarded race, not a hypothetical one. */
+    /* Audio output is closed inside run_session() when session_active is true. */
     return NULL;
 }
 #endif
@@ -303,11 +263,7 @@ bool airplay_bridge_start(void) {
         return true;
     }
     if (bridge_state == BRIDGE_STOPPING) {
-        /* The previous thread hasn't noticed stop_requested yet (or is
-         * mid-teardown) -- tell it to restart itself once it gets there
-         * rather than racing a second pthread_create() against a
-         * bridge_state the old thread hasn't cleared yet. See
-         * bridge_thread_func()'s own comment for the bug this fixes. */
+        /* Tell stopping thread to restart itself rather than spawning a concurrent thread. */
         restart_requested = true;
         pthread_mutex_unlock(&bridge_mutex);
         return true;
@@ -319,11 +275,7 @@ bool airplay_bridge_start(void) {
 
     pthread_t thread;
     if (pthread_create(&thread, NULL, bridge_thread_func, NULL) != 0) {
-        /* Reset state immediately rather than leaving bridge_state stuck at
-         * RUNNING forever with no thread to ever clear it -- airplay_
-         * control_start() has already created the FIFO by the time this is
-         * called (see its own comment on the ordering, and on why it no
-         * longer spawns shairport when this returns false). */
+        /* Reset state if thread creation fails. */
         pthread_mutex_lock(&bridge_mutex);
         bridge_state = BRIDGE_STOPPED;
         pthread_mutex_unlock(&bridge_mutex);

@@ -119,9 +119,10 @@ typedef enum {
     METADATA_ARTWORK_INVALID,
 } metadata_artwork_result_t;
 
-/* Full metadata read with embedded cover bytes, contained in a child
+/* Artwork-only metadata read with embedded cover bytes, contained in a child
  * process. Unlike metadata_read_isolated(), this intentionally transfers
- * picture_data back to the caller (lyrics remain omitted). The result
+ * picture_data back to the caller (lyrics are not decoded). Parser address
+ * space is bounded and the parent admits the actual picture-copy size. The result
  * distinguishes a completed read with no picture from transient process,
  * timeout, I/O, and allocation failures. Caller owns out->picture_data. */
 metadata_artwork_result_t metadata_read_artwork_isolated(const char * path,

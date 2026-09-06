@@ -1,10 +1,6 @@
-/* open_hiby_bootloader -- see the design doc this was built from for the
- * full rationale. Short version: hiby_player.sh execs straight into this
- * binary now (see that script's own updated comment); this decides which
- * player to run, optionally shows a boot-selector menu, then takes over
- * hiby_player.sh's previous job of supervising that player. Unexpected
- * exits still reboot for crash recovery, while a clean exit completes the
- * player's intentional power-off request -- see run_player_supervised(). */
+/* Bootloader entry: decides which player binary to run, displays the boot
+ * selection menu if applicable, and supervises player execution. Reboots
+ * on unexpected exits for crash recovery, or powers off on clean exit. */
 
 #include "scanner.h"
 #include "installer.h"
@@ -21,34 +17,16 @@
 #include <time.h>
 #include <unistd.h>
 
-extern char ** environ; /* not declared by <unistd.h> under this project's
-                          * feature-test macro settings -- see this file's
-                          * own Makefile entry, and no other file in this
-                          * codebase has needed it before now. */
+extern char ** environ;
 
-/* The Stock player's proprietary framebuffer backend opens
- * /dev/sa_hgl_dma and asks its driver for one physically-contiguous 8 MiB
- * allocation (confirmed from a live order-11 allocation failure in
- * sahd_open()). Merely having more than 8 MiB free is not sufficient: by
- * the time the boot selector has decoded its background, allocated its
- * buffers, scanned the SD card, and waited for a choice, the small 56 MiB
- * system can have enough total free RAM but no order-11 buddy block left.
- * Stock then continues without a framebuffer and the last boot-menu frame
- * appears frozen even though the rest of Stock is alive.
+/* The Stock player framebuffer backend requires a physically-contiguous 8 MiB
+ * DMA allocation via /dev/sa_hgl_dma. Holding the fd reserves this block during
+ * the boot menu so that memory fragmentation does not prevent Stock from
+ * allocating its framebuffer.
  *
- * Reserve that exact driver allocation before this process performs any
- * substantial allocation. Holding the fd keeps the contiguous block out
- * of the general allocator throughout the menu. It deliberately remains
- * open across fork: the child inherits the same open-file reference, the
- * parent then closes its copy, and O_CLOEXEC releases the child's final
- * reference inside a successful execve(). This is materially later than
- * closing before fork -- real-device testing showed that the freshly freed
- * order-11 block could otherwise be split by fork/ELF-loader allocations
- * before Stock opened the driver itself. If execve() fails, CLOEXEC has not
- * fired and the fallback exec remains protected. Open Player does not use
- * this device, but follows the same handoff for consistent fd hygiene. A
- * failed reservation is logged but never blocks boot; Stock then retains
- * its existing best-effort behavior. */
+ * The reservation fd remains open across fork and is released by O_CLOEXEC
+ * on successful execve(), ensuring the block remains allocated until the new
+ * process takes over. */
 #define HGL_DMA_DEVICE "/dev/sa_hgl_dma"
 
 static int hgl_dma_reservation_fd = -1;
@@ -70,45 +48,22 @@ static void release_stock_hgl_dma(void) {
 
 #define CARD_MARGIN_X 40
 #define CARD_WIDTH (FB_WIDTH - 2 * CARD_MARGIN_X)
-/* Tight enough that the first card sits right under the title/countdown
- * area with no dead space, even when the countdown itself isn't currently
- * shown (cancelled -- see draw_menu()'s own remaining_ms < 0 case) --
- * that's the specific case that looked like wasted space before this. */
+/* Vertical offset for the first card below the title/countdown area. */
 #define CARDS_TOP 110
-/* Offsets from FB_HEIGHT (board_config.h), not absolute Y values -- a
- * fixed FOOTER_Y=700 left only 20px of clearance below the footer's own
- * text height on an 800-tall screen, which a shorter panel would clip
- * outright. These offsets reproduce the R1 values unchanged
- * (800-120=680, 800-100=700) while scaling correctly on any other
- * FB_HEIGHT. */
+/* Bottom offset for cards relative to FB_HEIGHT. */
 #define CARDS_BOTTOM (FB_HEIGHT - 120)
 #define CARD_GAP 24
-#define MAX_CARDS 2 /* Internal + SD stock -- see scanner.h's own BOOT_ENTRY_*. An SD update
-                     * binary is never a menu entry in its own right -- installer_run() has
-                     * already resolved it (or left it for a later boot) before this is built. */
+#define MAX_CARDS 2 /* Internal and SD stock entries. */
 #define TITLE_Y 36
 #define COUNTDOWN_Y 68
 #define PROGRESS_BAR_Y 92
 #define PROGRESS_BAR_HEIGHT 6
 #define FOOTER_Y (FB_HEIGHT - 100)
 
-/* Card backgrounds are alpha-blended over the artwork (see draw_card()),
- * not opaque -- 128/255 reads as roughly 50% without being exactly
- * transposed through 8-bit math out to 3 significant figures, which
- * would be a false precision no one could actually see the difference of
- * on a 5/6/5-bit panel. */
+/* Card background alpha blending level (~50%). */
 #define CARD_BG_ALPHA 128
 
-/* Baseline-JPEG conversion of the theme2 boot-animation frame at
- * /usr/resource/litegui/theme2/boot_animation/en/0.png. The source is an
- * exact 480x800 RGB PNG, while this compact bootloader intentionally links
- * only tjpgd, so the build/repack asset is flattened and converted once
- * rather than adding a second image decoder to the boot-critical binary.
- * The converted sibling is installed beside the source as `0.jpg` in the
- * same theme directory. It remains in squashfs, not on the writable
- * partition: a factory-reset or first-ever-flashed device must not depend
- * on /usr/data having been populated manually before it can draw the boot
- * background. */
+/* Background JPEG image from theme assets used for the bootloader screen. */
 #define BOOTLOADER_BG_PATH "/usr/resource/litegui/theme2/boot_animation/en/0.jpg"
 
 #define COLOR_BG fb_rgb(0x12, 0x12, 0x12)
@@ -126,12 +81,7 @@ typedef struct {
     int boot_entry; /* a BOOT_ENTRY_* value (scanner.h) -- which real choice this card represents */
 } card_layout_t;
 
-/* Splits the fixed CARDS_TOP..CARDS_BOTTOM band evenly across however many
- * cards are actually present (2, when only one SD alternate exists
- * alongside Internal, or 3, when both do) -- rather than a fixed height
- * that only ever fit exactly two, since either SD alternate can now be
- * present independently of the other (see scanner.h's own doc comment on
- * sd_stock_present/sd_update_present). */
+/* Distributes card positions evenly within the CARDS_TOP..CARDS_BOTTOM band. */
 static void layout_cards(card_layout_t * cards, int count) {
     int height = (CARDS_BOTTOM - CARDS_TOP - CARD_GAP * (count - 1)) / count;
     for (int i = 0; i < count; i++) {
@@ -162,12 +112,9 @@ static bool point_in_card(const card_layout_t * card, int x, int y) {
     return x >= CARD_MARGIN_X && x < CARD_MARGIN_X + CARD_WIDTH && y >= card->y && y < card->y + card->height;
 }
 
-/* remaining_ms < 0 hides the countdown text/bar entirely -- used once a
- * key/touch input has cancelled the timeout (see main()'s own doc comment
- * on why cancelling must still leave a menu the user can act on, not blank
- * the screen). */
+/* Draws menu cards and optional countdown bar. Pass remaining_ms < 0 to hide countdown. */
 static void draw_menu(const card_layout_t * cards, int count, int selected, int remaining_ms, int timeout_ms) {
-    fb_restore_background(COLOR_BG); /* fast cached blit, not a re-decode -- see fb_draw.h's own doc comment */
+    fb_restore_background(COLOR_BG);
     draw_centered(TITLE_Y, "SELECT PLAYER", COLOR_TEXT);
 
     if (remaining_ms >= 0) {
@@ -186,25 +133,14 @@ static void draw_menu(const card_layout_t * cards, int count, int selected, int 
     fb_flush();
 }
 
-/* Runs the actual selector: input/countdown loop, returns the BOOT_ENTRY_*
- * the user picked or the timeout confirmed. Only called when scanner_scan()
- * has already established there IS a real choice to make (sd_stock_present)
- * -- the no-alternate and newer-update-without-Stock cases in main() never
- * reach this at all, matching the "instant boot, no delay" objective for
- * those. */
+/* Returns milliseconds elapsed since the specified start timestamp. */
 static long elapsed_ms_since(const struct timespec * start) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - start->tv_sec) * 1000L + (now.tv_nsec - start->tv_nsec) / 1000000L;
 }
 
-/* Builds however many cards actually apply -- Internal is always present;
- * SD stock is independently optional (scanner.h's own sd_stock_present).
- * Internal's own line3 shows whichever build is actually about to run --
- * INSTALLED_PLAYER_PATH's stamp when installer_run() has ever completed,
- * INTERNAL_PLAYER_PATH's own otherwise (main() overwrites scan->
- * internal_build_stamp accordingly before calling this -- see its own
- * comment there). */
+/* Populates menu cards based on detected player installations. */
 static int build_cards(const scan_result_t * scan, card_layout_t * cards) {
     int count = 0;
     cards[count] = (card_layout_t) { .line1 = "OPEN PLAYER", .boot_entry = BOOT_ENTRY_INTERNAL };
@@ -224,27 +160,13 @@ static int run_menu(const scan_result_t * scan) {
     card_layout_t cards[MAX_CARDS];
     int card_count = build_cards(scan, cards);
 
-    input_open(); /* whether anything actually opened is re-checked live via input_any_open() below, not captured once here */
+    input_open();
     int selected = scan->default_entry;
     int timeout_ms = scan->timeout_seconds * 1000;
-    /* Always starts true, regardless of whether any input device is open --
-     * with none open, nothing can ever cancel it, but it still has to
-     * actually count down to confirm the default and boot. Previously
-     * this was seeded from input_open()'s own one-time return value, which
-     * meant a device with every input fd unopenable (permissions, hardware
-     * fault) hung here forever: the loop's exit condition required the
-     * countdown to be both active AND expired, but starting it disabled
-     * left neither ever true. */
+    /* Start with countdown active so default entry boots even if input is unavailable. */
     bool countdown_active = true;
 
-    /* CLOCK_MONOTONIC deadline, not a fixed per-iteration decrement -- a
-     * loop that subtracted a flat tick_ms per iteration regardless of how
-     * long poll() actually blocked could shorten the countdown for real:
-     * any evdev read that returns quickly with data poll() doesn't
-     * recognize as a menu event (a touch-move update card, an intermediate
-     * SYN_REPORT, anything drain_fd() doesn't map to a bl_input_type_t)
-     * still ends that iteration fast, and the loop would charge it a full
-     * tick's worth of assumed elapsed time regardless. */
+    /* Track elapsed time against monotonic clock deadline. */
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
@@ -257,45 +179,20 @@ static int run_menu(const scan_result_t * scan) {
             if (remaining_ms <= 0) return selected; /* countdown reached zero -- confirm whatever is currently highlighted */
         }
 
-        /* Poll only up to the next redraw tick (or the exact remaining
-         * time, if less) while the countdown is live, so the displayed
-         * number/bar still updates smoothly; block indefinitely (-1, valid
-         * per poll()) once cancelled -- nothing left to time, and it costs
-         * nothing to wait for the user's actual decision instead of
-         * waking up every 100ms for no reason. */
+        /* Cap poll timeout to next redraw interval while counting down, or wait indefinitely once cancelled. */
         int poll_timeout_ms;
         if (!countdown_active) poll_timeout_ms = -1;
         else poll_timeout_ms = remaining_ms < 100 ? remaining_ms : 100;
 
-        /* Re-checked every iteration, not just once up front -- input_poll()
-         * itself closes and drops any fd that reports POLLHUP/POLLERR/
-         * POLLNVAL (a disconnected/errored device). Without re-checking,
-         * a device that starts out fine and later wedges would leave this
-         * loop still trying to call input_poll(-1) (indefinite block) with
-         * zero fds actually open, which returns immediately every time
-         * instead of blocking -- a 100%-CPU busy loop once the countdown
-         * is cancelled, not a hang exactly, but just as stuck in practice. */
+        /* Check if any input device is currently open before polling. */
         bl_input_event_t ev;
         if (input_any_open()) {
             ev = input_poll(poll_timeout_ms);
         } else if (!countdown_active) {
-            /* No input left at all, AND the countdown was already
-             * cancelled by a real, earlier user action -- there is no
-             * deadline left to eventually expire (that top-of-loop check
-             * is skipped entirely while !countdown_active) and now no way
-             * to ever receive the confirmation that action was waiting
-             * for either. Waiting any longer here hangs forever: paced at
-             * 100ms instead of busy-spinning, but just as stuck in
-             * practice. Resolve with whatever was last selected rather
-             * than sit here indefinitely. */
+            /* If all inputs closed after countdown was cancelled, proceed with selected entry. */
             return selected;
         } else {
-            /* Countdown still active, just no input devices to poll (none
-             * ever opened, or all have since errored out) -- nothing to
-             * poll, but this iteration must still take real wall-clock
-             * time; the top-of-loop deadline check above is what actually
-             * ends the countdown in this case, this just paces how often
-             * it's re-checked. */
+            /* Sleep briefly when countdown is active but no input devices are open. */
             usleep((useconds_t) (poll_timeout_ms > 0 ? poll_timeout_ms : 100) * 1000);
             ev = (bl_input_event_t) { BL_INPUT_NONE, 0, 0 };
         }
@@ -346,30 +243,20 @@ static int run_menu(const scan_result_t * scan) {
     }
 }
 
-/* Takes over hiby_player.sh's crash-supervision job. A pure execve() chain
- * with nothing left supervising would silently drop reboot-on-crash, but
- * treating EVERY child exit as a crash is also wrong: both players replace
- * themselves with /sbin/poweroff for an intentional shutdown, and that
- * helper exits successfully once it has handed shutdown to init. Rebooting
- * one second later races and defeats that shutdown. Therefore a confirmed
- * exit status of zero means "complete power-off"; a signal, nonzero exit,
- * wait failure, fork/exec failure, or any other abnormal outcome retains
- * the established crash-recovery reboot. */
+/* Supervises player execution. A clean exit status (0) triggers device poweroff,
+ * while abnormal termination (signals or non-zero exit) triggers a reboot. */
 static void reboot_device(void) {
     sleep(1);
     sync();
     reboot(RB_AUTOBOOT);
-    /* reboot() not returning is the expected outcome; if it somehow does,
-     * there is nothing left for this process to usefully do. */
+    /* reboot() is expected to terminate the process; exit if it returns. */
     _exit(1);
 }
 
 static void poweroff_device(void) {
     sync();
     reboot(RB_POWER_OFF);
-    /* Never turn a failed power-off into a reboot. Remaining alive is the
-     * safer failure mode: init's already-requested shutdown may still
-     * finish, and the user can still use the hardware power button. */
+    /* If poweroff syscall fails, pause indefinitely rather than rebooting. */
     perror("open_hiby_bootloader: poweroff syscall failed");
     for (;;) pause();
 }
@@ -377,12 +264,7 @@ static void poweroff_device(void) {
 static void run_player_supervised(const char * player_path) {
     pid_t pid = fork();
     if (pid < 0) {
-        /* Can't fork at all -- an embedded device in this state has bigger
-         * problems than losing the reboot-supervisor for one launch.
-         * execve() replaces this process outright; O_CLOEXEC releases the
-         * HGL reservation only once that exec succeeds. If exec also fails,
-         * there is no child to wait for either way, so go straight to the
-         * same reboot the normal path would have ended in. */
+        /* If fork fails, attempt direct execve before rebooting. */
         perror("open_hiby_bootloader: fork failed, execve'ing directly (no reboot-on-crash this launch)");
         execve(player_path, (char * []) { (char *) player_path, NULL }, environ);
         perror("open_hiby_bootloader: execve failed");
@@ -390,15 +272,9 @@ static void run_player_supervised(const char * player_path) {
     }
 
     if (pid == 0) {
-        /* Do not close the HGL reservation here. Its O_CLOEXEC flag releases
-         * the final inherited reference inside a successful execve(), later
-         * than an explicit close followed by ELF loading. If this exec
-         * fails, retaining it protects the internal-player fallback below. */
+        /* HGL reservation remains open in child until released via O_CLOEXEC on execve. */
         execve(player_path, (char * []) { (char *) player_path, NULL }, environ);
-        /* Only reached if execve() itself failed (bad binary, ENOENT,
-         * etc.) -- fall back to the always-present internal player rather
-         * than leaving a blank screen, matching the original design's own
-         * fallback intent, then give up for real if even that fails. */
+        /* Fall back to internal player if selected binary execve fails. */
         perror("open_hiby_bootloader: execve failed, falling back to internal player");
         if (strcmp(player_path, INTERNAL_PLAYER_PATH) != 0) {
             execve(INTERNAL_PLAYER_PATH, (char * []) { (char *) INTERNAL_PLAYER_PATH, NULL }, environ);
@@ -406,19 +282,10 @@ static void run_player_supervised(const char * player_path) {
         _exit(127);
     }
 
-    /* The child now holds the same open-file reference until its successful
-     * exec processes O_CLOEXEC. Drop only the supervisor's copy: closing it
-     * cannot free the contiguous block prematurely while the child reference
-     * remains alive, but ensures the long-lived waitpid parent pins no RAM
-     * after the player has taken over. */
+    /* Close supervisor's reference to HGL DMA reservation; child holds its own copy. */
     release_stock_hgl_dma();
 
-    /* Retry on EINTR rather than treating any waitpid() return as "the
-     * child exited" -- an unrelated signal interrupting this call left
-     * `status` unset and pid still running; proceeding straight to reboot
-     * in that case would reboot the device out from under a player that
-     * is still fine, not recovering from anything. Only a return of
-     * exactly `pid` means it was actually reaped. */
+    /* Wait for child process, retrying on EINTR. */
     int status;
     pid_t reaped;
     do {
@@ -426,11 +293,7 @@ static void run_player_supervised(const char * player_path) {
     } while (reaped == -1 && errno == EINTR);
 
     if (reaped != pid) {
-        /* Shouldn't happen (this is the exact pid this process just
-         * forked, not some untracked/already-reaped child) -- but if it
-         * ever does, there is no more useful state to report than the
-         * fact that the wait itself failed; still fall through to reboot
-         * rather than looping on an error that will not resolve itself. */
+        /* Child wait failed unexpectedly; fall through to reboot. */
         perror("open_hiby_bootloader: waitpid failed unexpectedly");
     } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         fprintf(stderr, "open_hiby_bootloader: %s exited cleanly -- powering off\n", player_path);
@@ -443,35 +306,13 @@ static void run_player_supervised(const char * player_path) {
 }
 
 int main(void) {
-    /* Must remain the first resource acquisition in main(): see
-     * reserve_stock_hgl_dma() for why reserving after fb_open() or the SD
-     * scan is already too late on this memory-constrained device. */
+    /* Reserve Stock HGL DMA before other allocations. */
     reserve_stock_hgl_dma();
 
-    /* Opened and drawn to BEFORE scanner_scan() (which performs the SD
-     * card settle wait -- up to 5s for the normal case, extended only with
-     * real evidence a card is still initializing, up to a 20s hard ceiling
-     * -- see sd_ready.c's own top comment for the algorithm), not after.
-     * Real-device regression this specifically fixes: the
-     * previous hiby_player.sh -> open_hiby_player chain already paid this
-     * exact settle cost, but inside the PLAYER's own main(), after painting
-     * its splash -- i.e. the user saw a splash throughout the wait. Running
-     * the settle here, one process earlier, before any
-     * frame had ever been drawn, would turn that same already-accepted
-     * cost into blank-screen latency instead. Drawing the background here
-     * first makes the longer discovery window overlap something on-screen,
-     * the same way the player's own splash already did. No "STARTUP" label:
-     * this frame is a splash, not a progress state, and may be visible only
-     * briefly when the SD is already ready. */
+    /* Open framebuffer and paint splash background before waiting on SD card settle. */
     bool fb_ready = fb_open();
     if (fb_ready) {
-        /* See BOOTLOADER_BG_PATH's own doc comment for why this isn't
-         * /etc/logo1.jpeg directly. Decoded exactly once, here, before
-         * anything else touches the screen; draw_menu()'s own redraws
-         * reuse the cache via fb_restore_background() rather than
-         * re-decoding this on every countdown tick. Falls back to a plain
-         * fill if the asset is ever missing/unreadable/wrong-sized -- this
-         * is cosmetic, not load-bearing, and must never block boot. */
+        /* Paint cached background image or fill background on error. */
         if (!fb_draw_background_jpeg(BOOTLOADER_BG_PATH)) fb_fill(COLOR_BG);
         fb_flush();
     }
@@ -479,25 +320,13 @@ int main(void) {
     scan_result_t scan;
     scanner_scan(&scan);
 
-    /* Never a boot destination in its own right -- see installer.c's own
-     * top comment for why running straight off the SD card is unsafe.
-     * Presence alone (scan.sd_update_present) is enough to trigger this;
-     * it either finishes durably (SD copy deleted, INSTALLED_PLAYER_PATH
-     * now current) or leaves everything exactly as it was for another
-     * attempt next boot. Captured (not re-scanned) BEFORE this call, for
-     * the SD-update page-cache drop further down -- that check cares
-     * whether this boot did any reading of the SD copy at all, which this
-     * pre-install snapshot correctly reflects either way. */
+    /* Run installer if an SD player update is present. */
     bool sd_update_was_present = scan.sd_update_present;
     installer_run(&scan, fb_ready);
 
     const char * internal_path = installer_internal_player_path();
     if (strcmp(internal_path, INTERNAL_PLAYER_PATH) != 0) {
-        /* installer_internal_player_path() resolved to the installed
-         * copy, not squashfs -- scan.internal_build_stamp was populated
-         * from INTERNAL_PLAYER_PATH by scanner_scan() above and no longer
-         * describes what is actually about to run; re-derive it from the
-         * real boot target so the Internal card's label stays accurate. */
+        /* Update build stamp if installed update overrides internal squashfs copy. */
         char stamp[BOOT_BUILD_STAMP_LEN + 1];
         if (scanner_read_build_stamp(internal_path, stamp, sizeof(stamp))) {
             memcpy(scan.internal_build_stamp, stamp, sizeof(stamp));
@@ -509,19 +338,12 @@ int main(void) {
     const char * boot_path;
 
     if (!scan.sd_stock_present) {
-        /* No Stock alternate to choose between -- just boot the current
-         * internal copy (freshly installed this boot, previously
-         * installed, or squashfs on a device that has never received an
-         * SD update) with no menu delay, matching the original
-         * "instant boot" behavior for this case. Not a preference decision
-         * -- never touches the persisted default below. */
+        /* Boot internal player directly when no Stock player is present on SD. */
         boot_path = internal_path;
     } else {
         int chosen_entry;
         if (!fb_ready) {
-            /* Can't draw a menu at all -- still boot something rather than
-             * sitting on a dead screen forever. Falls back to the
-             * persisted/computed default without showing a menu. */
+            /* Boot default entry without showing menu if framebuffer failed. */
             fprintf(stderr, "open_hiby_bootloader: fb not available, booting default entry with no menu\n");
             chosen_entry = scan.default_entry;
         } else {
@@ -529,19 +351,11 @@ int main(void) {
             input_close();
         }
         boot_path = (chosen_entry == BOOT_ENTRY_SD_STOCK) ? SD_STOCK_PLAYER_PATH : internal_path;
-        /* Only persisted here -- this is the one branch where chosen_entry
-         * reflects an actual (live or re-affirmed) dual-boot preference,
-         * not a forced/automatic outcome. */
+        /* Persist user choice as the new default entry. */
         scanner_save_last_boot(chosen_entry);
     }
 
-    /* installer_run() reads the SD Open Player in full (checksum, and
-     * again if it actually copies it) whenever sd_update_was_present. If
-     * Stock won the menu, those cached pages are unused and recreate the
-     * exact memory-pressure difference from the failing both-binaries case.
-     * Drop them before releasing the framebuffer and handing the reserved
-     * HGL DMA block across exec. No-op when there was no SD update to
-     * begin with. */
+    /* Drop SD update page cache before launching Stock player to free memory. */
     if (strcmp(boot_path, SD_STOCK_PLAYER_PATH) == 0 && sd_update_was_present) {
         scanner_drop_sd_update_cache();
     }

@@ -76,25 +76,16 @@ static void lock_touch_timer_cb(lv_timer_t * timer) {
 
     bool dismiss = gesture_home_state_poll(&lock_gesture_state, &cfg, pressed, p.y);
     if (dismiss) {
-        /* Same real-device fix already applied to the home-swipe and
-         * player-swipe gestures elsewhere (gui_navigation.c) -- without
-         * this, the finger is still down when nav_pop() loads the screen
-         * underneath, and the eventual release lands on whatever's at that
-         * coordinate there (e.g. a Home tile), firing an unintended tap
-         * right as the lock screen dismisses. */
+        /* Wait for touch release before dismissing to prevent the gesture release
+         * from triggering an unintentional click on underlying screen elements. */
         lv_indev_wait_release(indev);
         gui_lock_screen_hide();
     }
 }
 
 static void start_timers(void) {
-    /* Symmetric, not just a conditional start -- gui_lock_screen_show() can
-     * be called again with a DIFFERENT mode while already showing (e.g. a
-     * second screen_woke fires before the user dismisses), and this must
-     * leave lock_clock_timer matching the NEW mode either way. A one-sided
-     * "start if clock" here previously left a stale timer running forever
-     * (until the eventual hide/teardown) after switching away from clock
-     * mode without an intervening hide(). */
+    /* Ensures lock_clock_timer matches current_mode, creating the timer in
+     * clock mode or deleting it when switching to other modes. */
     if (current_mode == LOCK_SCREEN_MODE_CLOCK) {
         if (!lock_clock_timer) {
             lock_clock_timer = lv_timer_create(lock_clock_timer_cb, 1000, NULL);

@@ -3,41 +3,18 @@
 
 #include <stdbool.h>
 
-/* The three USB device (gadget) modes the stock firmware's own Settings >
- * USB device mode dropdown exposes -- confirmed via strings in the stock
- * hiby_player binary (system_if_usb_select_device()) and the matching
- * shell scripts it shells out to (see usb_mode_control.c). Storage is the
- * default: a fresh boot has no USB gadget bound at all (ADB's own
- * /etc/init.d/T90adb is T-prefixed, i.e. not auto-run by init), so nothing
- * is active until the app or the user explicitly picks a mode. */
+/* The three USB device (gadget) modes supported by the hardware:
+ * Storage (mass storage), DAC (USB Audio Class 2), and ADB. */
 typedef enum {
     USB_MODE_STORAGE = 0,
     USB_MODE_DAC,
     USB_MODE_ADB,
 } usb_mode_t;
 
-/* Switches the USB gadget to `mode`, reusing the stock firmware's own
- * /usr/bin/{uac_device_config.sh,usb_dev_mass_storage.sh} and
- * /etc/init.d/adb/S440adb scripts (confirmed present and byte-identical to
- * the squashfs-root reference dump on a real device) rather than
- * reimplementing USB gadget configfs setup. Always tears down every mode's
- * gadget first, not just whichever the caller thinks was previously
- * active. Storage teardown is done in C (eject LUN, unbind UDC, rmdir)
- * instead of usb_dev_mass_storage.sh stop: that script re-binds UDC if
- * the mass-storage function is still busy, which is what blocked ADB/DAC
- * while the SD card was exported. Blocking (several real configfs/sysfs
- * writes per script); call off the UI thread.
+/* Switches the USB gadget to `mode`. Tears down existing gadget configuration
+ * before setting up the target mode. Blocking operation; call off the UI thread.
  *
- * Returns true only if the target's own start script exited 0 AND the
- * resulting gadget is actually verified bound to the UDC afterward -- a
- * script running to completion isn't proof it worked (its own
- * precondition checks can fail silently from the caller's point of view
- * otherwise). Also refuses to even attempt the switch (returns false
- * immediately) if leftover gadget state from an incomplete previous
- * teardown is still present, rather than starting on top of it -- see
- * usb_mode_control.c's own comment on why that matters (Storage and DAC
- * share the same "android0" configfs directory, and only DAC's stop path
- * fully removes it). */
+ * Returns true only if the mode was applied and verified bound to the UDC. */
 bool usb_mode_control_apply(usb_mode_t mode);
 
 /* Inspects live configfs/sysfs gadget state to determine which mode is

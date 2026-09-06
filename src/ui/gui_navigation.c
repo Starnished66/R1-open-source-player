@@ -171,27 +171,14 @@ static lv_draw_buf_t * snapshot_screen_base(lv_obj_t * target_screen) {
  * visible on target_screen (status_bar_band per Settings > Display > "Hide
  * Player/Lyrics Top Bar", home_indicator_band per Settings > Display >
  * "Swipe Up for Home") onto an existing owned RGB565 base, mutating it in
- * place. TRANSITION_PERFORMANCE_PLAN.md Phase 3 target architecture,
- * section B -- kept as a separate, cheap, always-fresh step from the base
- * snapshot itself (snapshot_screen_base() above) specifically so a CACHED
- * base (the static-screen cache or the Phase 2 player cache, both below)
- * never bakes in stale clock/battery/wifi/home-indicator content: real-
- * device review finding -- baking bars into a snapshot taken once (the
- * static cache, built at startup) or infrequently (the player cache, only
- * rebuilt on track/art/play-state changes, not every second) meant a
- * transition could show a visibly wrong/outdated clock or a home-indicator
- * bar whose visibility had since been toggled off. Blending fresh at
- * transition time instead means the persistent-bar content is never more
- * than a few lines of code away from what a real, current LVGL render of
- * lv_layer_top() would show. Deliberately does NOT snapshot lv_layer_top()
- * as a whole: that would also capture transient overlays (the volume
- * popup, quick-drawer motion image, a DAC overlay) that may happen to be
- * present at the wrong moment -- only these two named, permanent bands are
- * ever composited in. status_bar_band's hidden flag is temporarily forced
- * to its target-state value (same reasoning/safety as snapshot_screen_
- * base()'s own comment on player_dismiss_btn). home_indicator_band is also
- * temporarily forced because Home and Lyrics intentionally hide it while
- * ordinary destination screens show it. */
+ * place. Kept as a separate, fresh step from the base snapshot itself
+ * (snapshot_screen_base() above) so a cached base does not bake in stale
+ * clock, battery, wifi, or home-indicator content.
+ * Persistent bars are blended fresh at transition time to reflect current
+ * status. Only the two named, permanent bands are composited in (avoiding
+ * transient overlays on lv_layer_top()). status_bar_band and
+ * home_indicator_band hidden flags are temporarily set to match target
+ * screen expectations during blending. */
 static void blend_persistent_bars(lv_draw_buf_t * base, lv_obj_t * target_screen) {
     bool topbar_target_hidden = current_settings.hide_player_topbar &&
                                  (target_screen == gui_player_get_screen() || target_screen == gui_lyrics_get_screen());
@@ -412,20 +399,10 @@ static void sync_home_indicator_visibility(lv_obj_t * screen) {
                                          screen != gui_lock_screen_get_screen());
 }
 
-/* Real-device review finding: this file used to declare its own
- * player_swipe_candidate/player_swipe_tracking/player_swipe_ctx statics
- * here, reset by slide_transition_anim_x_cb()'s compositor-failure abort
- * path below on the (wrong) assumption that they were the live gesture
- * state. They were never set true anywhere in this file -- the real,
- * live interactive-swipe state is gui_shell.c's own separate statics of
- * the same name (poll_quick_drawer_drag()'s own player-swipe tracking).
- * Resetting these dead local copies left gui_shell.c's real
- * player_swipe_tracking true and its real player_swipe_ctx pointing at
- * memory this function was about to lv_free() -- a real use-after-free:
- * the very next touch-poll tick (finger still down after a compositor
- * failure) called slide_transition_anim_x_cb() again with that freed
- * pointer. Removed entirely in favor of gui_shell_player_swipe_recover()
- * below, which resets the actual live state directly. */
+/* The interactive player swipe state (player_swipe_candidate,
+ * player_swipe_tracking, player_swipe_ctx) is maintained in gui_shell.c.
+ * gui_shell_player_swipe_recover() is called below to reset that state
+ * directly on compositor failures. */
 
 /* Shared by two unrelated callers -- both need "the next real
  * lv_timer_handler() pass redraws literally everything" without calling
@@ -585,16 +562,12 @@ void slide_transition_cancel(slide_transition_ctx_t ** pctx) {
  * (only the interactive path ever sets it false, on a cancelled drag).
  *
  * Both transition sources are always OWNED, independent copies now
- * (TRANSITION_PERFORMANCE_PLAN.md Phase 3) -- never a live alias of real
- * framebuffer memory, and never a direct reference to a cache buffer that
- * something else could destroy out from under this transition. See this
- * function's own body for the two separate real-device reasons: (1) a
- * live-aliased outgoing frame bled through live redraws happening on
- * from_scr during a held drag ("swiping to enter the player causes the
- * main menu to flicker"); (2) once the direct-framebuffer compositor is
- * involved, an aliased source becomes the compositor's OWN write target
- * again a couple of frames later (the two physical pages ping-pong every
- * frame), an overlapping-memcpy hazard, not just a staleness question. */
+ * Both transition sources are always owned, independent copies
+ * (never live aliases of framebuffer memory, nor direct references to a cache
+ * buffer): (1) a live-aliased outgoing frame could bleed through live
+ * redraws happening on from_scr during a drag; (2) when direct-framebuffer
+ * compositing is active, the physical pages ping-pong every frame, which
+ * would create an overlapping read/write hazard with an aliased source. */
 slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward) {
 #ifdef UI_PERF_TRACE
     uint64_t perf_begin_us = ui_perf_now_us();
@@ -617,20 +590,11 @@ slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward)
     ctx->fallback_bands_suppressed = false;
     ctx->home_indicator_was_hidden = true;
 
-    /* Incoming source prepared FIRST, before the outgoing physical-page
-     * capture below -- TRANSITION_PERFORMANCE_PLAN.md Phase 3 real-device
-     * review finding. Always a COMPLETE flattened frame -- screen content
-     * plus whichever persistent bars would really be visible there, never
-     * a bare screen-only snapshot. The (comparatively expensive) screen
-     * content itself is pre-baked for the fixed STATIC_SNAPSHOT_SCREEN_COUNT
-     * screens or the Phase 2 player-transition cache when available (each
-     * DUPLICATED here, never referenced directly -- the player cache can
-     * be destroyed and replaced by an lv_async_call() rebuild firing mid-
-     * gesture, a real use-after-free risk if referenced instead of
-     * copied), else captured fresh synchronously; the persistent bars
-     * (status bar/home indicator) are always blended in fresh right here,
-     * regardless of which base was used -- see blend_persistent_bars()'s
-     * own comment on why baking them into either cache would go stale. */
+    /* Incoming source prepared first, before capturing the outgoing physical
+     * page. Produces a complete flattened frame (screen content plus persistent
+     * bars). Cached bases (static screens or player cache) are duplicated rather
+     * than referenced directly to prevent use-after-free if the cache is
+     * rebuilt asynchronously, while persistent bars are blended fresh. */
     lv_draw_buf_t * buf_to;
 #ifdef UI_PERF_TRACE
     bool used_player_cache = false;
@@ -652,36 +616,21 @@ slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward)
     perf_to_done_us = ui_perf_now_us();
 #endif
 
-    /* Drain any already-queued LVGL rendering NOW, before capturing the
-     * outgoing physical page -- TRANSITION_PERFORMANCE_PLAN.md Phase 3
-     * real-device review finding: capturing the physical page first and
-     * draining afterward (the earlier design, inside transition_
-     * compositor_begin()) meant a pending redraw could still pan to a
-     * DIFFERENT physical page after the capture, leaving frame zero of the
-     * animation showing an already-stale image that visibly jumped
-     * backward once the real (post-drain) state caught up. This driver's
-     * flush_cb() is fully synchronous (no deferred/async flush
-     * completion), so one lv_refr_now() call is guaranteed to fully
-     * render AND flush everything pending before returning -- nothing can
-     * still be "in flight" by the time the capture below runs.
-     * transition_compositor_begin() itself no longer does this drain --
-     * doing it here, before capture, is what actually matters; doing it
-     * again inside begin() (after capture) would be too late. */
+    /* Drain any already-queued LVGL rendering now, before capturing the
+     * outgoing physical page. Capturing first and draining afterward could
+     * allow a pending redraw to update to a different physical page, causing
+     * an initial frame jump. Synchronous lv_refr_now() ensures all pending
+     * drawing and flushing is complete before capture. */
     lv_refr_now(disp);
 #ifdef UI_PERF_TRACE
     perf_drain_done_us = ui_perf_now_us();
 #endif
 
-    /* Outgoing source: an owned copy of the REAL physical scanout page,
-     * captured AFTER the drain above -- TRANSITION_PERFORMANCE_PLAN.md
-     * Phase 3 fix. lv_linux_fbdev_get_active_page() is the fbdev driver's
-     * own accessor for whichever physical half is actually being scanned
-     * out right now; LVGL's generic lv_display_get_buf_active() (disp->
-     * buf_act) is simply whichever buffer LVGL itself last rendered into
-     * -- normally the same thing, but not a driver-level guarantee in
-     * DIRECT double-buffered mode, so it's only the fallback here (host/
-     * SDL builds, or if fbdev pan-based double buffering isn't active on
-     * this display). */
+    /* Outgoing source: an owned copy of the physical scanout page,
+     * captured after the drain above. lv_linux_fbdev_get_active_page() is the
+     * fbdev driver's accessor for the physical half currently being scanned
+     * out; lv_display_get_buf_active() is used as fallback (host/SDL builds,
+     * or if fbdev pan-based double buffering is inactive). */
     lv_draw_buf_t * buf_from = NULL;
 #if LV_USE_LINUX_FBDEV
     {
@@ -726,19 +675,10 @@ slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward)
 
     slide_transition_active = true;
 
-    /* TRANSITION_PERFORMANCE_PLAN.md Phase 3 -- try to hand this transition
-     * off to the direct-framebuffer compositor BEFORE creating any LVGL
-     * overlay/image objects, not after. Real-device bug (earlier design):
-     * creating those objects first queued their own initial-draw
-     * invalidation via the normal, still-enabled path, which then got
-     * rendered and flushed for real on the next lv_timer_handler() tick
-     * regardless of disabling invalidation moments later -- visible as a
-     * leftover static image flashing on top of the compositor's own
-     * correctly-sliding frames. Skipping the overlay entirely when the
-     * compositor takes over removes the problem at its root; transition_
-     * compositor_begin() itself also drains any OTHER already-queued LVGL
-     * rendering (lv_refr_now()) before disabling invalidation, so nothing
-     * unrelated is left stranded in the queue either. */
+    /* Handoff transition to the direct-framebuffer compositor before
+     * creating LVGL overlay/image objects. Skipping overlay objects when
+     * the compositor takes over avoids queuing initial-draw invalidations
+     * that could flash during compositing. */
     if (transition_compositor_begin(buf_from, buf_to, to_offset)) {
         ctx->overlay = NULL;
         ctx->img_from = NULL;
@@ -858,21 +798,10 @@ void nav_pop(void) {
  * above it down by one), with no screen load of any kind -- used when a
  * transient interstitial screen (Wi-Fi/Subsonic's "Connecting..."/
  * "Downloading..." screen, or a chained show_text_entry() call) has
- * already been left behind by something that pushed a DIFFERENT screen on
- * top of it instead of returning to it. Real-device bug report: a
- * downloaded Subsonic track played fine (see poll_subsonic_download()'s
- * own comment on the race this and its sibling nav_pop()-skipping fixes
- * solve), but backing out of the player afterward landed back on the now-
- * defunct "Downloading..." screen instead of the song list underneath it
- * -- because skipping nav_pop() to avoid yanking the player screen away
- * left that interstitial's own slot sitting in the stack forever, one
- * level below wherever things actually ended up. This removes exactly
- * that stale slot after the fact, once it's clear something else already
- * took its place, so a later Back walks back through where the user
- * really came from instead of a resolved, no-longer-relevant waiting
- * screen. Purely bookkeeping -- whatever's currently on screen was
- * already loaded by the nav_push() that grew the stack past `index` in
- * the first place, so nothing here should touch the display. */
+ * already been left behind by something that pushed a different screen on
+ * top of it instead of returning to it.
+ * Bookkeeping only -- whatever is currently on screen was already loaded
+ * by the nav_push() that grew the stack past `index`. */
 void nav_remove_stack_slot(int index) {
     for (int i = index; i < nav_depth - 1; i++) nav_stack[i] = nav_stack[i + 1];
     if (nav_depth > 0) nav_depth--;
@@ -924,7 +853,7 @@ void enable_gesture_bubble_recursive(lv_obj_t * obj) {
 /* Defined later alongside player_swipe_press_excluded()'s own raw-polling
  * dead-zone machinery -- needed here too, by screen_gesture_event_cb()
  * below, see its own comment. */
-#define QUICK_DRAWER_ANIM_MS 120 /* real-hardware feedback: 200 felt slow for the post-release snap */
+#define QUICK_DRAWER_ANIM_MS 120 /* post-release snap animation duration */
 #define QUICK_DRAWER_TRIGGER_ZONE 140 /* swipe-down must start within this many px of the top edge to open it */
 
 /* Global swipe handling for back/forward nav. Swipe left-to-right (finger
@@ -935,13 +864,9 @@ void enable_gesture_bubble_recursive(lv_obj_t * obj) {
  * finalize_screen_navigation(), which bubbles correctly via
  * enable_gesture_bubble_recursive() (see its own comment).
  *
- * The quick-access drawer's open/close used to also be driven from here
- * (swipe-down/up as instant, threshold-triggered LV_EVENT_GESTURE actions),
- * but that's now poll_quick_drawer_drag()'s job instead -- see its own
- * comment for why: both the GESTURE-bubbling approach here and an
- * indev-wide LV_EVENT_PRESSING attempt turned out unreliable on real
- * hardware for a surface as densely covered in its own interactive
- * children (icons, a 300px-wide slider) as the drawer is. */
+ * Quick-access drawer drag is handled via poll_quick_drawer_drag() rather
+ * than gesture events due to high density of interactive widgets on the
+ * drawer surface. */
 /* Defined in the search-binding section below -- true (and closes it)
  * if `screen` had an active inline search; forward-declared here so the
  * back-swipe gesture can close search first instead of popping straight
@@ -953,25 +878,9 @@ static void screen_gesture_event_cb(lv_event_t * e) {
     lv_indev_t * indev = lv_indev_active();
     if (!indev) return;
 
-    /* Real-device bug report: dragging the player screen's own seek bar
-     * (progress_slider) still triggered the back-swipe. Widening its
-     * ext_click_area (see progress_slider's own comment) wasn't enough on
-     * its own -- LVGL's gesture recognition runs throughout a slider drag
-     * regardless (sliders clear LV_OBJ_FLAG_SCROLLABLE in their
-     * constructor, so the generic scroll_obj early-exit indev_gesture()
-     * relies on elsewhere never applies to one), and real-device testing
-     * showed this still reaching here rather than staying resolved to the
-     * slider itself the way GESTURE_BUBBLE exclusion (enable_gesture_
-     * bubble_recursive()) was expected to guarantee. Reusing the same two
-     * checks player_swipe_press_excluded() already combines for the
-     * separate raw-polling player-swipe path: active_press_is_over_drag_
-     * adjust_widget() (hit-tested object identity -- covers a press that
-     * lands squarely on progress_slider) plus point_in_swipe_dead_zone()
-     * (raw point-in-rect against the registered dead-zone list --
-     * progress_slider is registered there too, see its own
-     * register_swipe_dead_zone() call, covering a press that lands just
-     * off it) closes the gap regardless of exactly which part of LVGL's
-     * own gesture-bubbling chain let it through. */
+    /* Check whether press is over a drag-adjust widget or within a swipe dead
+     * zone (e.g. player progress slider) to prevent accidental back-swipe
+     * triggers while seeking. */
     lv_point_t gesture_press_point;
     lv_indev_get_point(indev, &gesture_press_point);
     if (active_press_is_over_drag_adjust_widget() || point_in_swipe_dead_zone(gesture_press_point)) return;
@@ -984,36 +893,17 @@ static void screen_gesture_event_cb(lv_event_t * e) {
         /* The finger is still down mid-gesture when the screen swaps out
          * from under it -- without this, its eventual release gets
          * delivered to whatever object now sits at that same coordinate on
-         * the NEW screen, firing an unwanted click there (real-hardware
-         * testing: swiping back from a submenu landed a phantom tap on
-         * whatever Home tile happened to be under the finger). Telling the
+         * the new screen, firing an unwanted click there. Telling the
          * indev to disregard everything until the next physical release
          * stops that bleed-through. */
         lv_indev_wait_release(indev);
     }
-    /* Swipe-left-to-player used to be handled here too (instant
-     * nav_push(gui_player_get_screen()), no animation) -- real-device bug report:
-     * entering the player didn't follow the finger the way the quick
-     * drawer's own drag does. Replaced with a live, finger-driven version
-     * in poll_quick_drawer_drag() (see its own player_swipe_* state),
-     * which claims the press well before LVGL's own ~50px built-in gesture
-     * threshold (LV_INDEV_DEF_GESTURE_LIMIT) would ever fire this handler
-     * for LV_DIR_LEFT -- left here removed rather than merely unreachable,
-     * since leaving it live risked a second, redundant nav_push() firing
-     * behind the new interactive one, and creating an overlay object under
-     * an already-moving finger is exactly the kind of thing that corrupts
-     * LVGL's own press tracking (see the PRESS_LOST history on the
-     * drawer's own icons, quick_drawer_wifi_long_press_cb's comment) if
-     * anything else is still independently reacting to the same gesture.
+    /* Interactive swipe-left to player is handled in poll_quick_drawer_drag()
+     * before the built-in gesture threshold.
      *
-     * Swipe-up-to-Home is deliberately NOT handled here -- real-device
-     * feedback: this fired from anywhere on screen, including a drag that
-     * started well above the home indicator band and only incidentally
-     * ended up moving upward (e.g. an aborted attempt to scroll a list up).
-     * home_indicator_gesture_cb() (see build_home_indicator_bar()) is the
-     * only path to nav_reset_to_home() now -- it only ever fires for a drag
-     * that actually started within the reserved bottom strip, matching the
-     * Android gesture-bar convention this is modeled on. */
+     * Swipe-up-to-Home is handled exclusively in home_indicator_gesture_cb()
+     * (see build_home_indicator_bar()) so it only fires from drags starting
+     * within the reserved bottom indicator band. */
 }
 
 /* Finishing touch every build_XXX_screen() calls just before returning: wire
@@ -1083,24 +973,12 @@ void gui_navigation_teardown(void) {
     player_transition_discard_cache();
 }
 
-/* For gui_reload.c's in-process UI reload -- true while a COMMITTED slide
- * transition (screen_transition_slide(), driven by nav_push()/nav_pop()) is
- * still animating. Deliberately does not check the live interactive-swipe/
- * quick-drawer-drag state at all -- that state lives entirely in
- * gui_shell.c's own statics (this file no longer keeps a same-named, dead
- * shadow copy of them -- see gui_shell_player_swipe_recover()'s own
- * comment in gui_shell.h for the real bug that shadow copy caused), and is
- * cancelled directly via gui_shell_reset_drag_state() instead -- see
- * gui_reload.c's own comment for why that needs to run BEFORE any screen
- * is deleted, not via this defer-and-retry path).
+/* Returns true while a committed slide transition is still animating.
+ * Interactive drag states are tracked in gui_shell.c and cancelled via
+ * gui_shell_reset_drag_state().
  *
- * A committed transition's slide_transition_ctx_t is only reachable through
- * its own lv_anim_t, with no direct cancel path from outside this file, so
- * gui_navigation_teardown() does not attempt one. Simpler and just as
- * correct for a reload (unlike a real navigation event, it has no "user is
- * waiting on this specific transition" urgency): gui_reload_request()'s
- * trigger checks this and defers a few milliseconds instead, until it
- * settles on its own -- NAV_ANIM_TIME_MS is short. */
+ * Used by gui_reload to defer reload requests until an in-flight slide
+ * animation completes. */
 bool gui_navigation_transition_in_progress(void) {
     return slide_transition_active;
 }

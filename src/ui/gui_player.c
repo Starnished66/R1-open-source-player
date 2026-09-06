@@ -200,10 +200,9 @@ static void request_volume_hw(int percent) {
     volume_hw_pending = percent;
 }
 
-/* Real-device feedback: the popup's own slider used to be display-only
- * (hw volume buttons the only way to change it) -- this makes it drag/
- * touch-able too. Its knob follows LVGL directly; secondary displays and
- * hardware consume the coalesced value above. */
+/* Handles touch/drag interactions on the popup volume slider. Its knob
+ * follows LVGL directly; secondary displays and hardware consume the
+ * coalesced value above. */
 static void volume_popup_track_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     int32_t percent = lv_slider_get_value(lv_event_get_target(e));
@@ -303,17 +302,11 @@ static void build_volume_popup(void) {
     }
 }
 
-/* Feature request: reuse the stock firmware's own "frosted mirror" look --
- * a heavily blurred, darkened, vertically-mirrored copy of the album art
- * filling the panel behind the transport controls (player_overlay_panel,
- * built in build_player_screen()), rather than that panel's plain flat
- * buttom.png background. Confirmed via investigation that the stock
- * firmware itself doesn't ship this as a static asset (every buttom.png
- * across both themes is a flat opaque solid color, no gradient or baked-in
- * art) and no now-playing layout JSON was available to inspect directly --
- * so this is generated fresh here, from the same per-track RGB565 buffer
- * cover_decode_to_rgb565() already decodes, rather than reverse-engineered
- * from an asset that doesn't exist in this codebase's copy of the firmware. */
+/* Generates a "frosted mirror" look behind the transport controls
+ * (player_overlay_panel, built in build_player_screen()): a heavily
+ * blurred, darkened, vertically-mirrored copy of the album art,
+ * replacing the flat buttom.png placeholder. Generated fresh from the
+ * per-track RGB565 buffer decoded by cover_decode_to_rgb565(). */
 /* Tracks the overlay panel's own real size (BOARD_PLAYER_OVERLAY_HEIGHT),
  * not the cover's -- this buffer is drawn as player_overlay_panel's own
  * background (build_player_screen()), so it must fill exactly that panel,
@@ -450,26 +443,11 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
     return out_bytes;
 }
 
-/* Real-device bug report: entering the player screen right after picking a
- * song left its on-screen play/pause/next/prev buttons unresponsive for a
- * couple of seconds. Root cause: apply_track_metadata_to_ui() used to
- * decode the embedded cover art (cover_decode_to_rgb565(), JPEG at the
- * largest tjpgd 1/2^n that still covers the target then cover-fit, PNG/BMP
- * at native size then cover-fit) and run the reflection blur
- * above synchronously, on the UI thread, before play_track_at_from() ever
- * reached nav_push(player_screen) -- easily 1-3+ seconds of pure blocking
- * on this hardware for a large embedded image, during which
- * lv_timer_handler() never runs, so nothing redraws and no touch input is
- * processed at all. Exact same shape of bug (and fix) as the real-device
- * incident documented at bt_apply_output_settings_thread_func()'s own
- * comment above -- backgrounded here the same way: launch_cover_decode()
- * kicks off the decode+blur on a pthread (cover_decode_to_rgb565() and
- * compute_reflection_bytes() touch no LVGL/shared state, so this is safe),
- * and poll_cover_decode() (called from update_timer_cb every tick) applies
- * the result to the actual widgets once it's ready -- so nav_push() and
- * audio_play_file_at() in play_track_at_from() now run immediately, with
- * the cover art/reflection catching up a moment later instead of blocking
- * everything else on the way there. */
+/* Cover art decoding (cover_decode_to_rgb565()) and reflection blur
+ * computation are offloaded to a background pthread to avoid blocking the
+ * UI thread. launch_cover_decode() spawns the worker thread, and
+ * poll_cover_decode() (called periodically from update_timer_cb) applies
+ * the decoded RGB565 buffers to the image widgets once ready. */
 typedef struct {
     int for_index;
     uint8_t * picture_data; /* owned; NULL if the track has no embedded art */
@@ -564,7 +542,10 @@ static bool load_and_decode_external_cover(const char * track_path, const char *
         if (!albumart_search_files(&info, size_strings[i], found, sizeof(found))) continue;
         uint8_t * data = NULL;
         uint32_t size = 0;
-        if (!albumart_load_file(found, &data, &size, EXTERNAL_COVER_MAX_BYTES)) continue;
+        albumart_load_result_t load = albumart_load_file_ex(found, &data, &size,
+                                                           EXTERNAL_COVER_MAX_BYTES, ARTWORK_PRIO_PLAYER);
+        if (load == ALBUMART_LOAD_TEMPORARY) return false;
+        if (load != ALBUMART_LOAD_OK) continue;
         if (size == 0) {
             free(data);
             continue;
@@ -662,15 +643,8 @@ static void launch_cover_decode_req(cover_decode_request_t r) {
 
     cover_decode_request_t * req = malloc(sizeof(*req));
     if (!req) {
-        /* Audit finding: this used to dereference req unconditionally --
-         * on this RAM-constrained device, a malloc() this size (the
-         * struct embeds a 1536-byte stream_url and a PATH_MAX local_track_
-         * path) can genuinely fail under memory pressure, and this runs on
-         * essentially every track change, not just a deliberate low-memory
-         * test. Free the request's own owned picture_data (same ownership
-         * contract every other caller relies on) and just skip this
-         * decode -- cover art staying stale for one track is a far better
-         * outcome than crashing the whole app. */
+        /* Free owned picture_data and skip decoding if request allocation
+         * fails under memory pressure. */
         free(r.picture_data);
         return;
     }
@@ -768,32 +742,10 @@ void poll_cover_decode(void) {
         free(current_reflection_bytes);
         current_reflection_bytes = cover_decode_result_reflection;
 
-        /* Real-device incident: "severe noise/corruption" on the actual on-
-         * screen cover art, root-caused via a raw dump of current_cover_bytes
-         * taken the instant cover_decode_to_rgb565() returns (before this
-         * point) -- a correct, undamaged image every time, on the real
-         * target hardware, not just a host-build test, which ruled out the
-         * decode pipeline entirely. An intermediate theory (LVGL's image
-         * cache, keyed on the source pointer, serving stale tiles since
-         * current_cover_dsc is a reused static struct) turned out to be
-         * wrong too -- lv_image_cache_drop() before every reassignment made
-         * no difference, and the same corruption showed up on a completely
-         * different track's art, not just a stale leftover from the
-         * previous one.
-         *
-         * The real bug: lv_image_header_t.magic (lv_image_dsc.h) must be
-         * LV_IMAGE_HEADER_MAGIC -- lv_bin_decoder.c (the decoder this hand-
-         * constructed raw descriptor actually goes through) treats any other
-         * value as an old-format header from before the magic field existed,
-         * and "fixes it up" in place via `header->cf = header->magic;
-         * header->magic = LV_IMAGE_HEADER_MAGIC;`. memset()ing the whole
-         * descriptor to 0 before setting cf/w/h/stride left magic at 0, so
-         * this quirks-mode shim fired on literally every track change,
-         * silently overwriting our just-set LV_COLOR_FORMAT_RGB565 with 0
-         * right before the image ever got drawn -- corrupting the color
-         * format used to interpret every pixel, not the pixel data itself,
-         * which is exactly why the underlying buffer always dumped correctly
-         * but the screen never showed it right. */
+        /* lv_image_header_t.magic must be set to LV_IMAGE_HEADER_MAGIC;
+         * otherwise LVGL's bin decoder treats a 0 magic value as a legacy
+         * header format and overwrites header->cf with header->magic (0),
+         * corrupting the pixel color format interpretation. */
         memset(&current_cover_dsc, 0, sizeof(current_cover_dsc));
         current_cover_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
         current_cover_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
@@ -815,21 +767,8 @@ void poll_cover_decode(void) {
         current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * REFLECTION_HEIGHT * 2;
         lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
 
-        /* Bug report: the lyrics screen's blurred backdrop could still show
-         * the PREVIOUS track's art even after its own regenerate-pending
-         * retry ran, because that retry read whatever current_cover_bytes
-         * held at that moment -- and this decode (the one that actually
-         * updates current_cover_bytes for the new track) can easily still
-         * be in flight when the retry fires, since the two run on
-         * independent async pipelines with no ordering between them. This
-         * is the one place current_cover_bytes is ever updated for a new
-         * track, so triggering the refresh from here (rather than from
-         * lyrics_timer_cb()'s own earlier, opportunistic attempt) is the
-         * only way to guarantee it always runs against the CORRECT art.
-         * launch_lyrics_backdrop_decode() itself already no-ops if a
-         * generation happens to already be running (marking it pending
-         * instead, same as any other caller), so this is safe to call
-         * unconditionally whenever the lyrics screen is open. */
+        /* Refresh lyrics screen backdrop now that current_cover_bytes has
+         * been updated with new cover art. */
         gui_lyrics_on_cover_changed(playlist_index);
         player_transition_mark_dirty(); /* cover_img/player_overlay_panel's reflection just changed -- see the cache's own doc comment */
     }
@@ -840,20 +779,8 @@ void poll_cover_decode(void) {
     if (cover_decode_pending_valid) {
         cover_decode_pending_valid = false;
         launch_cover_decode_req(cover_decode_pending); /* not launch_cover_decode() -- must carry stream_url too, see that field's own comment */
-        /* Real-device incident: ownership of picture_data just passed into
-         * launch_cover_decode_req() above (either into a freshly malloc'd
-         * req, or back into this same cover_decode_pending if a decode was
-         * somehow still active) -- but this struct still holds a copy of
-         * that same pointer. Left as-is, a rapid next track change landing
-         * before the handed-off decode finishes would call
-         * launch_cover_decode_req() again, see cover_decode_active still
-         * true, and free(cover_decode_pending.picture_data) a buffer the
-         * in-flight decode thread already owns and will free itself --
-         * double free, reproduced by rapidly pressing Next/Prev. Clearing
-         * the pointer here (not inside launch_cover_decode_req(), which
-         * can't tell "just consumed" apart from "still needs freeing" for
-         * its own r argument) makes this copy stop looking like it owns
-         * the buffer. */
+        /* Clear picture_data to avoid double-freeing if another track
+         * change occurs while the handed-off decode thread is running. */
         cover_decode_pending.picture_data = NULL;
         cover_decode_pending.picture_size = 0;
     }
@@ -890,11 +817,8 @@ void poll_cover_decode(void) {
  * thread, since poll_cover_decode() can free and replace that pointer out
  * from under a still-running backdrop job on a rapid track change. ---- */
 
-/* Final brightness is baked in before RGB565 dithering. This used to be a
- * 3/4-bright backdrop followed by LVGL's 40%-black alpha overlay (net 45%),
- * but that second RGB565 blend re-quantized the already-dithered image and
- * brought visible bands back. 9/20 preserves the same net brightness in a
- * single quantization step. */
+/* Final brightness is baked in before RGB565 dithering (9/20 net brightness)
+ * to avoid an alpha overlay blend re-quantizing the dithered image. */
 
 
 
@@ -1290,12 +1214,9 @@ static void delete_song_confirm_cb(lv_event_t * e) {
     char * to_delete = strdup(playlist_path_at(playlist_index));
     int del_index = playlist_index;
 
-    /* What to play next is decided BEFORE touching the file or the array --
-     * whatever ends up sitting at del_index once the deleted entry is
-     * removed (i.e. what used to be right after it), or the new last track
-     * if the deleted one was last. Doesn't try to honor Shuffle/Repeat here
-     * -- a delete is a one-off structural change to the queue, not a
-     * "what's next" playback decision. */
+    /* What to play next is decided before removing the entry: the track
+     * shifting into del_index, or the new last track if the deleted one
+     * was last. */
     free(playlist[del_index]);
     for (int i = del_index; i < playlist_count - 1; i++) playlist[i] = playlist[i + 1];
     /* Kept in lockstep -- see playlist_lazy_sort_order's own comment. */
@@ -1455,72 +1376,22 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
     }
 }
 
-/* Real-device feature request: holding next/prev should scrub through the
- * CURRENT track (fast-forward/rewind) instead of only supporting a quick
- * tap's skip-track/restart-or-previous-track behavior.
+/* Long-press seeking on next/prev buttons (fast-forward/rewind).
  *
- * Bug caught in review: audio_seek() only updates audio_get_position_
- * seconds() once the playback thread applies the queued seek. At LVGL's
- * default ~100ms long_press_repeat_time, several repeat ticks can fire
- * before that round-trip lands, so computing each step as "current
- * position + STEP" from audio_get_position_seconds() read the SAME stale
- * position repeatedly -- holding next could visibly reopen/seek the
- * decoder over and over while net position barely moved. transport_seek_
- * target_seconds is a persistent accumulator instead: seeded from the real
- * position once, at the start of a hold, then adjusted by STEP on every
- * subsequent tick regardless of whether the previous seek has landed yet,
- * so the requested target always advances smoothly; audio_seek()'s own
- * generation-based coalescing already makes only the latest accumulated
- * target matter once playback catches up.
+ * `transport_seek_target_seconds` accumulates seek offsets persistently
+ * so rapid repeat events advance smoothly without re-reading intermediate
+ * positions before earlier seeks complete.
  *
- * Also bound to LV_EVENT_LONG_PRESSED itself (not just REPEAT) -- LVGL
- * fires LONG_PRESSED once after long_press_time (~400ms) and then the
- * first LONG_PRESSED_REPEAT only ~100ms after that. Only reacting to
- * REPEAT meant releasing inside that ~400-500ms window suppressed the
- * normal short-tap action (see transport_long_press_cb() below) while
- * performing no seek at all -- a dead zone right at the hold threshold.
- * Taking the first step on LONG_PRESSED itself closes that gap.
+ * Seeking triggers on LV_EVENT_LONG_PRESSED and repeats on
+ * LV_EVENT_LONG_PRESSED_REPEAT. Target positions are clamped short of EOF
+ * by TRANSPORT_SEEK_EOF_GUARD_SECONDS to prevent auto-advancing into the
+ * next track while holding.
  *
- * `dir` is +1 for next_hit (forward) and -1 for prev_hit (rewind).
+ * If playback generation changes during a hold (indicating a track
+ * transition), `transport_seek_hold_cancelled` stops further seeks until
+ * the next press.
  *
- * Bug caught in review: audio_seek() lets the target land exactly on
- * total_frames (see its own clamp), which the main decode loop can't tell
- * apart from genuinely playing a track to its natural end -- it queues the
- * SAME auto-advance-to-next-track handoff either way (audio.c bumps
- * playback_generation there). Held long enough near a track's end, a hold
- * could therefore auto-advance mid-hold. TRANSPORT_SEEK_EOF_GUARD_SECONDS
- * below makes that far less likely (the target is clamped short of true
- * EOF, so a hold pins just before the end instead of reaching it), but
- * can't make it impossible -- audio_seek() only relocates the playhead, it
- * doesn't pause playback, so normal decode can still run out the remaining
- * guard window and reach real EOF on its own while the hold continues.
- *
- * Second bug caught in review: this originally re-seeded the accumulator
- * from the new track's real position on a generation mismatch and kept
- * right on stepping -- which stopped the OLD track's stale target from
- * leaking onto the new one, but a hold that started on Track A would then
- * carry on scrubbing into Track B, contradicting this whole feature's own
- * "scrub the CURRENT track" premise. transport_seek_hold_cancelled below
- * instead stops issuing any further seeks for the rest of THIS hold the
- * moment a generation mismatch is seen -- the user has to release and
- * press again to scrub whatever's now playing. Reset only on a fresh
- * LV_EVENT_LONG_PRESSED, which starts a new hold.
- *
- * Known, deliberately accepted residual: generation, position, duration,
- * and audio_seek() are each their own separate audio_mutex critical
- * section (see audio_get_playback_generation()/audio_get_position_seconds()/
- * audio_get_duration_seconds()/audio_seek() in audio.c), not one atomic
- * transaction, so the decode thread could in principle advance the
- * generation in the microseconds between this function's own check and its
- * audio_seek() call, applying one target computed for the old track to the
- * new one. A generation-conditional seek primitive in audio.c would close
- * this completely, but that means changing the shared audio_seek() API
- * every other caller (the progress bar, prev/next's own restart-track
- * seek) also goes through, for a race whose window is a handful of
- * microseconds against a ~100ms tick rate, and whose worst case is already
- * bounded to a single stray seek -- the very next tick's own generation
- * check (using the ALREADY-advanced generation by then) cancels the hold
- * exactly as above. Not worth that shared-API change for what's left. */
+ * `dir` is +1 for forward seeking and -1 for rewinding. */
 #define TRANSPORT_SEEK_STEP_SECONDS 3.0
 #define TRANSPORT_SEEK_EOF_GUARD_SECONDS 0.5
 
@@ -1592,16 +1463,9 @@ static void debug_transport_btn_all_cb(lv_event_t * e) {
 #endif
 
 #ifdef UI_HITBOX_DEBUG
-/* Outlines `obj`'s REAL click hit-test boundary -- its own drawn size plus
+/* Outlines `obj`'s click hit-test boundary -- its drawn size plus
  * whatever lv_obj_set_ext_click_area(obj, ext) padded it out by -- in a
- * distinct solid color per transport-row icon, so a real-device hitbox/
- * overlap question can be answered by looking at the screen instead of
- * re-deriving the flex-gap math by hand. LVGL's outline style is drawn
- * OUTSIDE an object's own box, offset outward by outline_pad -- passing the
- * exact same `ext` used for lv_obj_set_ext_click_area() here means the
- * drawn line traces exactly where the real (invisible) click boundary is,
- * not just an approximation of it. `ext` is 0 for play_btn (no ext_click_
- * area at all), which correctly outlines just its own native 84x84 box. */
+ * distinct solid color per transport-row icon for hitbox inspection. */
 static void debug_paint_hitbox(lv_obj_t * obj, int32_t ext, lv_color_t color) {
     lv_obj_set_style_outline_width(obj, 3, 0);
     lv_obj_set_style_outline_pad(obj, ext, 0);
@@ -1610,35 +1474,15 @@ static void debug_paint_hitbox(lv_obj_t * obj, int32_t ext, lv_color_t color) {
 }
 #endif
 
-/* Real-device follow-up: mode/play/prev/next/more still felt hard to reach
- * near their own top edge, even with TRANSPORT_ICON_EXT_CLICK_AREA -- the
- * ask was for their hit areas to reach up to one SHARED line well above the
- * icons (roughly level with song_count_label), which lv_obj_set_ext_click_
- * area() can't do on its own: it pads by the SAME amount on every side, so
- * pushing it far enough vertically would also push mode/prev/next/more's
- * LEFT/RIGHT reach straight through the ceiling TRANSPORT_ICON_EXT_CLICK_
- * AREA's own comment already established (two neighbors sharing a 36px gap
- * can't each claim more than half of it). A separate, invisible,
- * absolutely-positioned sibling -- created AFTER controls_row so it draws
- * (and hit-tests) on top of it, and marked LV_OBJ_FLAG_IGNORE_LAYOUT so
- * `scr` (which has no layout of its own anyway) never tries to reposition
- * it -- adds reach in ONLY the vertical direction these five needed,
- * without touching the already-maximized horizontal reach at all.
+/* Extends the vertical reach of transport buttons (mode/play/prev/next/more)
+ * up to a single shared top line (roughly level with song_count_label).
+ * A separate invisible, absolutely-positioned sibling marked
+ * LV_OBJ_FLAG_IGNORE_LAYOUT provides vertical hit area without altering
+ * horizontal padding between neighboring buttons.
  *
- * `top_y`/`bottom_y_exclusive` are real, resolved, absolute screen
- * coordinates (see
- * this function's only caller for why lv_obj_update_layout() has to run
- * first) -- `top_y` is the SAME for every one of the five callers (the
- * whole point: one shared line, not five independently-derived amounts),
- * while `bottom_y_exclusive` is just after this icon's existing hit area's
- * bottom edge. The resulting object therefore owns the complete region;
- * there is no object seam for a moving finger to cross. `debug_color` is
- * only ever applied under
- * UI_HITBOX_DEBUG (a plain border directly on this object -- unlike debug_
- * paint_hitbox()'s outline-pad trick, an extender IS the exact hit area
- * itself, not an icon padded out to one, so a normal border already traces
- * its real boundary); every caller still passes one unconditionally so a
- * non-debug build has no unused-parameter/-variable cleanup to do. */
+ * `top_y`/`bottom_y_exclusive` are absolute screen coordinates resolved
+ * after lv_obj_update_layout(). The resulting object covers the hit region
+ * seamlessly. */
 static lv_obj_t * add_transport_hit_target(lv_obj_t * scr, int32_t center_x, int32_t width, int32_t top_y,
                                      int32_t bottom_y_exclusive, lv_event_cb_t cb, lv_color_t debug_color) {
     lv_obj_t * ext = lv_obj_create(scr);
@@ -1739,29 +1583,15 @@ static void progress_slider_event_cb(lv_event_t * e) {
     }
 }
 
-/* Real-device bug report: mode/prev/next (order_icon/prev_btn/next_btn,
- * every one of them a plain 40x40 icon -- confirmed against the actual
- * theme2 assets, order.png/loop.png/single.png/random.png and btn_prev.png/
- * btn_next.png) felt unresponsive next to play_btn, whose own btn_play.png
- * is 84x84 -- more than double the raw hit area. controls_row lays all five
- * icons out with a fixed 36px flex gap between them; lv_obj_set_ext_click_
- * area() extends a click hit area by the SAME amount on every side, not
- * just the side facing a neighbor, so two adjacent icons using X each start
- * touching once 2*X reaches that 36px gap. 18 is the largest value that
- * still leaves order_icon<->prev_btn and next_btn<->more_icon from ever
- * overlapping (more_icon uses this same constant too, not a separately
- * tuned value -- see its own call site), while getting every icon as close
- * to play_btn's own 84x84 footprint (76x76 effective, since 40 + 18*2 = 76)
- * as this layout's fixed gap physically allows without touching a
- * neighboring hit area. */
+/* mode/prev/next (order_icon/prev_btn/next_btn, 40x40 icons) extend click area
+ * by 18px on each side. controls_row lays out icons with a 36px flex gap,
+ * so 18px is the maximum padding before adjacent hit areas overlap
+ * (40 + 18*2 = 76x76 effective hit area). */
 #define TRANSPORT_ICON_EXT_CLICK_AREA 18
 
-    /* See add_transport_hit_target()'s own comment -- how far above play_
- * btn's own native top edge the shared line for mode/play/prev/next/more's
- * combined hit area sits. Chosen from real-device feedback (a hand-drawn
- * reference on a screenshot) landing just above song_count_label, without
- * reaching high enough to overlap progress_slider/time_row's own already-
- * interactive areas further up the same column. */
+/* Distance above play_btn's top edge for the shared transport hit area
+ * line (roughly level with song_count_label without overlapping the progress
+ * bar or time row). */
 #define TRANSPORT_HIT_LINE_ABOVE_PLAY 20
 
 static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_height) {
@@ -1865,16 +1695,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * this is one of the handful of labels that needs the non-Latin
      * fallback but was never otherwise styled. */
     lv_obj_set_style_text_font(song_title_label, &app_font_16, 0);
-    /* Real-device bug report: a long song title just grew title_row's flex
-     * child past the favorite icon instead of stopping at it -- unlike
-     * row_label_enable_marquee()'s usual callers (list rows), this label had
-     * no bounded width for LVGL's circular long mode to scroll within, so it
-     * rendered at its full unclipped text width and overlapped the icon
-     * next to it. flex_grow gives it exactly the row's remaining width
-     * (title_row's width minus the icon), same as any other flex-grow
-     * child, which is all LV_LABEL_LONG_SCROLL_CIRCULAR needs to know it
-     * overflows and should marquee -- same shared style/2s pause as every
-     * other scrolling row label in the app (row_marquee_anim). */
+    /* Bounded to the row's remaining width via flex_grow so long titles
+     * marquee instead of overflowing adjacent controls. */
     lv_obj_set_flex_grow(song_title_label, 1);
     row_label_enable_marquee(song_title_label);
 
@@ -1898,17 +1720,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_label_set_text(song_folder_label, "");
     lv_obj_add_style(song_folder_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(song_folder_label, &app_font_16, 0); /* see song_title_label's own comment above */
-    /* Real-user bug report: a track with many singers/artists in its tag
-     * overlapped the format badge (e.g. "FLAC 48kHz") next to it, making the
-     * quality details unreadable. Same root cause and same fix as
-     * song_title_label vs favorite_icon above -- this label had no bounded
-     * width, so it rendered at its full unclipped content width and grew
-     * straight through its SPACE_BETWEEN sibling instead of stopping at it.
-     * flex_grow bounds it to the row's remaining width (row width minus
-     * format_badge_label's own natural width), which is what lets
-     * LV_LABEL_LONG_SCROLL_CIRCULAR detect the overflow and marquee instead
-     * of overlapping -- same shared row_marquee_anim/2s pause as every other
-     * scrolling label in the app. */
+    /* Bounded to the row's remaining width via flex_grow so long artist text
+     * marquees instead of overflowing adjacent format badges. */
     lv_obj_set_flex_grow(song_folder_label, 1);
     row_label_enable_marquee(song_folder_label);
 
@@ -1943,18 +1756,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_width(progress_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_set_style_height(progress_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    /* Real-device bug report: seeking (swiping across the bar) sometimes
-     * triggered the app-wide back-swipe gesture instead. Root cause: unlike
-     * every other draggable slider in this file (screen_timeout_slider,
-     * startup_volume_slider, sleep_timer_slider, idle_shutdown_slider, ...,
-     * all of which call this with 20), this 12px-tall bar never widened its
-     * touch target past LVGL's tiny built-in default (LV_DPX(8), set in
-     * lv_slider_constructor). A touch landing just off that thin band missed
-     * the slider's hit-test area entirely and fell through to `overlay`
-     * behind it, which -- unlike the slider -- does carry
-     * LV_OBJ_FLAG_GESTURE_BUBBLE (see enable_gesture_bubble_recursive()), so
-     * the drag bubbled up to screen_gesture_event_cb() as a real navigation
-     * swipe. */
+    /* Extended click area (20px) ensures touches near the 12px bar are
+     * captured rather than falling through to the gesture handler. */
     lv_obj_set_ext_click_area(progress_slider, 20);
     lv_obj_add_event_cb(progress_slider, progress_slider_event_cb, LV_EVENT_ALL, NULL);
     /* See screen_gesture_event_cb()'s own comment -- covers a press that
@@ -2006,15 +1809,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     order_icon = lv_image_create(controls_row);
     lv_image_set_src(order_icon, asset_path(play_mode_icon_asset((play_mode_t) current_settings.play_mode)));
     lv_obj_add_flag(order_icon, LV_OBJ_FLAG_CLICKABLE);
-    /* Real-device bug report: mode/prev/next felt unresponsive next to
-     * play/pause -- root cause, their own art (order.png/btn_prev.png/
-     * btn_next.png, all 40x40) is barely half play_btn's native 84x84, with
-     * no ext_click_area at all on prev/next and only a modest +16px here.
-     * TRANSPORT_ICON_EXT_CLICK_AREA below is the largest uniform extension
-     * that still can't make two neighboring icons' extended hit areas touch
-     * -- see its own comment -- so this grows every one of the three named
-     * icons as close to play_btn's own size as physically fits between
-     * them, not just this one. */
+    /* Extend click area to maximize touch target size without overlapping
+     * neighboring transport buttons. */
     lv_obj_set_ext_click_area(order_icon, TRANSPORT_ICON_EXT_CLICK_AREA);
     lv_obj_add_event_cb(order_icon, order_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(order_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
@@ -2085,11 +1881,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_t * more_icon = lv_image_create(controls_row);
     lv_image_set_src(more_icon, asset_path("playing_plane/ic_more.png"));
     lv_obj_add_flag(more_icon, LV_OBJ_FLAG_CLICKABLE);
-    /* TRANSPORT_ICON_EXT_CLICK_AREA, not a separate smaller constant --
-     * next_btn (its only neighbor) already uses the same value, and 18+18
-     * exactly fills their shared 36px gap. A smaller value here (this used
-     * to be a plain 16) would have left 2px of that gap unclaimed by
-     * either side instead of actually maximizing both hit areas. */
+    /* TRANSPORT_ICON_EXT_CLICK_AREA fills the 36px gap between more_icon
+     * and next_btn without overlapping. */
     lv_obj_set_ext_click_area(more_icon, TRANSPORT_ICON_EXT_CLICK_AREA);
     lv_obj_add_event_cb(more_icon, more_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(more_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
@@ -2111,9 +1904,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_get_coords(next_btn, &next_area);
     lv_obj_get_coords(more_icon, &more_area);
 
-    /* Shared top line for all five -- exactly what real-device feedback
-     * asked for: mode/play/prev/next/more's hit areas reach up to the SAME
-     * height, not each one's own separately-derived amount. */
+    /* Shared top line so all transport controls have consistent vertical
+     * hit reach. */
     int32_t shared_hit_top = play_area.y1 - TRANSPORT_HIT_LINE_ABOVE_PLAY;
 
     lv_obj_t * order_hit = add_transport_hit_target(scr, (order_area.x1 + order_area.x2) / 2,
@@ -2320,12 +2112,8 @@ static int * shuffle_order = NULL;
 static int shuffle_order_count = 0; /* playlist_count this bag was generated for -- staleness check */
 static int shuffle_pos = -1;        /* index into shuffle_order such that shuffle_order[shuffle_pos] == playlist_index */
 
-/* Set only when compute_auto_advance_index() has to precompute a reshuffled
- * continuation bag for the shuffle-wrap case -- see both that function's
- * and commit_auto_advance()'s own comments. Declared here (rather than
- * just above compute_auto_advance_index(), where it used to live) since
- * ensure_shuffle_order_current() -- defined earlier in this file -- also
- * needs to invalidate it on a playlist change. */
+/* Precomputed reshuffled continuation bag for the shuffle-wrap case.
+ * Invalidated on playlist change by ensure_shuffle_order_current(). */
 static int * pending_shuffle_order = NULL;
 static uint64_t queue_revision = 1;
 
@@ -2563,19 +2351,10 @@ int compute_auto_advance_index(int index) {
              * gets armed for gapless preload here and whatever that commit
              * later confirms are guaranteed to be the same track.
              *
-             * Audit finding: this used to regenerate pending_shuffle_order
-             * unconditionally on every call, directly violating this
-             * function's own documented contract just above ("must be safe
-             * to call more than once for the same index and always get the
-             * same answer") -- arm_next_track_for_audio() calls this
-             * speculatively and can call it again for the same pending
-             * transition (e.g. a crossfade/ReplayGain setting change
-             * re-arming before the track actually finishes), and each call
-             * was drawing a brand-new random order, silently discarding
-             * whichever track audio.c had already been armed with. Only
-             * generate once per wrap; commit_auto_advance() consumes and
-             * NULLs this when the wrap is actually confirmed, so the next
-             * genuinely new wrap still gets a fresh shuffle. */
+             * Precomputed once per wrap so repeated calls for the same
+             * transition return a consistent answer. commit_auto_advance()
+             * consumes and clears pending_shuffle_order when the wrap is
+             * confirmed. */
             if (!pending_shuffle_order) {
                 pending_shuffle_order = malloc(sizeof(int) * (size_t) playlist_count);
                 if (!pending_shuffle_order) return -1;
@@ -2999,19 +2778,9 @@ void queue_clear_pending(void) {
  * was a real dead end: the Bluetooth DAC toggle to turn it back off only
  * appears once Bluetooth is powered, which needs a chip re-init the app
  * itself has no way to trigger. */
-/* AirPlay deliberately does NOT appear here -- unlike Bluetooth/USB DAC
- * (which need an explicit settings change to exit before local playback
- * can resume, since they're real device-mode switches), AirPlay merely
- * being enabled/discoverable never blocks local playback at all; only an
- * ACTIVE stream does, and that case auto-disconnects rather than blocking
- * with an error toast -- see airplay_control_disconnect_active_stream(),
- * called by both of this function's own callers before they ever reach
- * this check. Real-device bug this fixes: this used to unconditionally
- * check current_settings.wifi_dac_mode_enabled (merely "discoverable"),
- * so simply having AirPlay toggled on -- whether or not a phone was
- * actually streaming to it -- blocked every attempt to play a local file
- * with this same toast, exactly the coupling airplay_bridge_start()'s own
- * comment describes fixing. */
+/* Checks whether Bluetooth DAC or USB DAC mode is actively blocking
+ * local playback. AirPlay discoverability does not block local playback;
+ * active streams are auto-disconnected instead. */
 static const char * external_dac_block_reason(void) {
     if (current_settings.bt_dac_mode_enabled && bt_is_powered_cached) return "Turn off Bluetooth DAC to play music on this device";
     if (current_settings.usb_mode == USB_MODE_DAC) return "Exit USB DAC mode to play music on this device";
@@ -3347,10 +3116,10 @@ void play_btn_event_cb(lv_event_t * e) {
 }
 
 /* Standard CD-player/iPod convention: a tap partway into a track restarts
- * it, and only a tap already near the start (real device feedback: "first
- * press rewind, second press goes to previous song") moves to the actual
- * previous track -- no separate double-tap timer needed, since "already
- * near the start" is naturally true right after the first tap rewound it. */
+ * it; only a tap already near the start (first press rewinds, second press
+ * goes to previous song) moves to the actual previous track -- no separate
+ * double-tap timer needed, since "already near the start" is naturally true
+ * right after the first tap rewound it. */
 #define PREV_BUTTON_REWIND_THRESHOLD_SECONDS 3.0
 
 void prev_btn_event_cb(lv_event_t * e) {

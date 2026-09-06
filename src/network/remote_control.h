@@ -5,104 +5,60 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Phone remote-control feature: a small hand-rolled HTTP/1.1 server
- * serving a static Now Playing web page and a JSON API (status polling,
- * playback control, library browsing, playlist create/add-to). No
- * authentication, consistent with this project's existing DLNA/AirPlay/
- * Import-via-WiFi trust model -- anyone on the same Wi-Fi network can
- * control the device, a deliberate tradeoff. Playback requests use the
- * same "background thread sets a flag, only update_timer_cb consumes it"
- * pattern as hw_buttons.c and bt_media_player.c's transport buttons. */
+/* Phone remote-control server: serves a static Now Playing web page and a JSON
+ * API (status polling, playback control, library browsing, playlist creation/addition).
+ * Playback requests set flags that are polled and consumed by update_timer_cb. */
 
-/* Starts the HTTP listener thread on REMOTE_CONTROL_PORT (see .c). Caller
- * (gui.c) should only call this once Wi-Fi has a real IP. Idempotent. */
+/* Starts the HTTP listener thread on REMOTE_CONTROL_PORT. Idempotent. */
 void remote_control_start(void);
 
 /* Stops the listener thread and its socket. Idempotent. */
 void remote_control_stop(void);
 
-/* Push a fresh now-playing snapshot for /api/status to serve -- call once
- * per gui.c tick. Cheap mutex-guarded struct copy, no I/O; safe to call
- * even when the listener isn't running. path is the currently-playing
- * file on disk, used only by GET /api/art (no index given) to know which
- * file to pull embedded cover art from. play_mode is gui.c's own
- * play_mode_t cast to int (0=Sequential, 1=Repeat All, 2=Repeat One,
- * 3=Shuffle) -- duplicated as a plain int here rather than pulling in
- * gui.c's own enum, same reasoning as this file's own MUSIC_ROOT_DIR
- * duplication above. */
+/* Push a fresh now-playing snapshot for /api/status. Thread-safe snapshot copy.
+ * path is the currently-playing file on disk. play_mode is gui.c's play_mode_t
+ * cast to int (0=Sequential, 1=Repeat All, 2=Repeat One, 3=Shuffle). */
 void remote_control_notify_status(bool playing, bool paused, const char * title, const char * artist,
                                    const char * album, const char * path, int position_seconds,
                                    int duration_seconds, float volume, int play_mode);
 
-/* Poll from update_timer_cb only, same edge-triggered "true once, then
- * clears itself" convention as hw_buttons_consume_play_pause()/
- * bt_media_player_consume_play_pause(). */
+/* Poll from update_timer_cb only. Edge-triggered (cleared once consumed). */
 bool remote_control_consume_play_pause(void);
 bool remote_control_consume_next(void);
 bool remote_control_consume_prev(void);
 
-/* POST /api/playback/mode -- same one-button cycle as the player screen's
- * own order_icon_event_cb (Sequential -> Repeat All -> Repeat One ->
- * Shuffle -> Sequential), not an independent shuffle/repeat toggle pair --
- * the app has no state to represent shuffle and repeat at the same time.
- * Consumer should call whatever gui.c function order_icon_event_cb itself
- * calls, so the player screen's icon and this stay in sync. */
+/* POST /api/playback/mode -- cycles play mode (Sequential -> Repeat All ->
+ * Repeat One -> Shuffle -> Sequential). */
 bool remote_control_consume_mode_cycle(void);
 
-/* Same edge-triggered convention, but also hands back the requested
- * target -- out_seconds/out_percent are only written when this returns
- * true. percent is 0-100 (this app's volume slider range), not the raw
- * 0.0-1.0 audio_set_volume() takes. */
+/* Edge-triggered seek and volume control consumption. out_seconds/out_percent
+ * are only written when returning true. percent is 0-100. */
 bool remote_control_consume_seek(int * out_seconds);
 bool remote_control_consume_volume(int * out_percent);
 
-/* POST /api/playback/queue?index=N -- enqueue one library song through
- * gui.c's normal Up Next splice. out_index is a song id (metadata_db.c's
- * stable rowid-based song_row_t.id, not an array position) -- same id
- * space as remote_control_consume_play_index() and every "index" field
- * this file's JSON responses emit. Caller resolves it via
- * metadata_db_get_song_by_id(). */
+/* POST /api/playback/queue?index=N -- enqueue one library song by metadata_db id. */
 bool remote_control_consume_queue_index(int64_t * out_index);
 bool remote_control_consume_queue_remove(int * out_offset);
 bool remote_control_consume_queue_clear(void);
 
-/* Snapshot the live Up Next run for GET /api/queue. Paths are resolved to
- * song ids (metadata_db_get_song_by_path()) before being copied. */
+/* Snapshot the live playback queue for GET /api/queue. */
 void remote_control_sync_queue(const char * const * paths, int count);
 
-/* Same edge-triggered convention as remote_control_consume_seek() --
- * out_index is a song id (metadata_db.c's rowid-based song_row_t.id),
- * resolved by the caller via metadata_db_get_song_by_id(). out_playlist/
- * out_artist/out_album_artist/out_album are always written (empty string
- * if the request carried no such context, the "whole library" case) --
- * see request_play_playlist_name's own comment in remote_control.c for why
- * these exist: they let the caller scope the playback queue to whichever
- * Album/Playlist/Artist view the song was actually tapped from, matching
- * the on-device Group Songs/Playlist screens, instead of always queuing
- * the entire library. */
+/* Consume requested song id to play. Scope strings (playlist, artist,
+ * album_artist, album) narrow the context for building the playback queue. */
 bool remote_control_consume_play_index(int64_t * out_index, char * out_playlist, size_t playlist_size,
-                                        char * out_artist, size_t artist_size, char * out_album_artist,
-                                        size_t album_artist_size, char * out_album, size_t album_size);
+                                         char * out_artist, size_t artist_size, char * out_album_artist,
+                                         size_t album_artist_size, char * out_album, size_t album_size);
 
-/* Playlist mutation (create a playlist / add a song to an existing one),
- * mirroring gui.c's in-app "Add to Playlist" flow (same PLAYLISTS_DIR,
- * same playlist_files_create()/_append()/_contains() calls). Unlike
- * playback actions these run synchronously on the HTTP thread itself
- * rather than through a consume-flag, since they're plain file I/O with
- * no LVGL/audio state involved.
+/* Playlist mutation (create playlist / add song) runs synchronously on the HTTP
+ * thread.
  *
- * The API also exposes: GET /api/library/artists and
- * /api/library/album_artists (distinct names + counts), GET
- * /api/library/albums?artist=NAME or ?album_artist=NAME (that artist's
- * distinct albums + counts), and artist=/album_artist=/album= exact-match
- * filters on GET /api/library on top of offset/limit/q -- together these
- * let the phone UI walk Artist -> Albums -> Songs the same way gui.c's
- * show_artist_albums() does. GET /api/playlists/songs?name=NAME lists one
- * playlist's songs, skipping any entry that no longer matches a synced
- * library path. GET /api/art (optionally ?index=N) streams a song's
- * embedded cover art; with no index, serves the currently-playing track's
- * art. GET /assets/icon?name= serves one of a small fixed whitelist of the
- * stock firmware's theme2/category/ PNG icons, so the phone UI can reuse
- * the same icons gui.c's build_music_screen() uses. */
+ * Additional endpoints:
+ * - GET /api/library/artists and /api/library/album_artists
+ * - GET /api/library/albums?artist=NAME or ?album_artist=NAME
+ * - GET /api/library (with offset/limit/q and artist/album_artist/album filters)
+ * - GET /api/playlists/songs?name=NAME
+ * - GET /api/art (optional ?index=N)
+ * - GET /assets/icon?name= */
 
 #endif /* REMOTE_CONTROL_H */

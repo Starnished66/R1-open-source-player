@@ -20,6 +20,8 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include "artwork_coordinator.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -45,6 +47,9 @@ static bool safe_chunk_advance(long chunk_start, uint64_t size, long pad, long *
 #define METADATA_BLOB_MAX_BYTES (4U * 1024U * 1024U)
 #define EMBEDDED_COVER_MAX_BYTES METADATA_BLOB_MAX_BYTES
 #define ID3_TEXT_FRAME_MAX_BYTES (64U * 1024U)
+
+/* Enabled only in the disposable artwork helper, never in playback readers. */
+static bool artwork_only;
 
 static bool store_picture_bytes(track_metadata_t * out, const uint8_t * src, uint32_t n) {
     if (!out || out->picture_data != NULL || !src || n == 0 || n > EMBEDDED_COVER_MAX_BYTES) return false;
@@ -192,7 +197,7 @@ static void apply_vorbis_comment_field(track_metadata_t * out, const char * comm
          * strip it -- apply_replaygain_field() re-checks the full key
          * against each of the four exact REPLAYGAIN_* names itself. */
         apply_replaygain_field(out, comment, key_len, value, value_len);
-    } else if (out->lyrics == NULL && value_len > 0 &&
+    } else if (!artwork_only && out->lyrics == NULL && value_len > 0 &&
                ((key_len == 6 && strncasecmp(comment, "LYRICS", 6) == 0) ||
                 (key_len == 14 && strncasecmp(comment, "UNSYNCEDLYRICS", 14) == 0))) {
         /* Plain UTF-8 text, no ID3v2-style encoding byte to strip -- unlike
@@ -673,7 +678,7 @@ static bool read_id3v2_streaming(FILE * f, track_metadata_t * out, uint8_t major
             grouped = (flags2 & 0x20) != 0; data_len = compressed;
         }
 
-        bool wanted = is_text || is_txxx || (include_blobs && (is_picture || is_lyrics));
+        bool wanted = is_text || is_txxx || (include_blobs && (is_picture || (is_lyrics && !artwork_only)));
         if (wanted && !compressed && !encrypted && frame_size <= limit) {
             uint8_t * data = malloc(frame_size ? frame_size : 1);
             bool read_ok = data && id3_stream_read(&stream, data, frame_size);
@@ -727,7 +732,7 @@ static bool read_id3v2(FILE * f, track_metadata_t * out, bool include_blobs) {
     /* A database scan only needs bounded text frames. Always stream in that
      * mode so a large APIC/USLT body is skipped without allocating the
      * complete ID3 tag first. */
-    if (!include_blobs || tag_size > METADATA_BLOB_MAX_BYTES)
+    if (artwork_only || !include_blobs || tag_size > METADATA_BLOB_MAX_BYTES)
         return read_id3v2_streaming(f, out, major_version, flags, tag_size, include_blobs);
 
     uint8_t * tag_data = malloc(tag_size);
@@ -1213,7 +1218,7 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out, bool in
             m4a_read_sequence_tag(f, item, true, out);
         } else if (include_blobs && strcmp(item.type, "covr") == 0) {
             m4a_read_cover_art(f, item, out);
-        } else if (include_blobs && strcmp(item.type, "\xA9" "lyr") == 0) {
+        } else if (include_blobs && !artwork_only && strcmp(item.type, "\xA9" "lyr") == 0) {
             m4a_read_lyrics_tag(f, item, out);
         }
 
@@ -2040,8 +2045,33 @@ static bool write_all(int fd, const void * src, size_t size) {
     return true;
 }
 
+static bool metadata_artwork_limit_memory(void) {
+    /* Bound ALL parser allocations, including third-party container readers.
+     * The limit is headroom, not an allocation: a small picture only uses
+     * its actual bytes. Keep the same 8 MiB system reserve as the warmer. */
+    size_t available = system_get_mem_available_bytes();
+    const size_t reserve = 8U * 1024U * 1024U;
+    if (available <= reserve + 1024U * 1024U) return false;
+    size_t budget = available - reserve;
+    if (budget > 12U * 1024U * 1024U) budget = 12U * 1024U * 1024U;
+    FILE * statm = fopen("/proc/self/statm", "r");
+    unsigned long pages = 0;
+    bool have_size = statm && fscanf(statm, "%lu", &pages) == 1;
+    if (statm) fclose(statm);
+    long page_size = sysconf(_SC_PAGESIZE);
+    struct rlimit limit;
+    if (!have_size || page_size <= 0 || getrlimit(RLIMIT_AS, &limit) != 0) return false;
+    uint64_t ceiling = (uint64_t) pages * (unsigned long) page_size + budget;
+    if (ceiling > SIZE_MAX) return false;
+    if (limit.rlim_cur == RLIM_INFINITY || ceiling < limit.rlim_cur)
+        limit.rlim_cur = (rlim_t) ceiling;
+    return setrlimit(RLIMIT_AS, &limit) == 0;
+}
+
 int metadata_artwork_helper_run(const char * path, int output_fd) {
     if (!path || !path[0] || output_fd < 0) return 1;
+    if (!metadata_artwork_limit_memory()) return 1;
+    artwork_only = true;
 
     /* This process is disposable; under unexpected memory pressure the
      * kernel should discard it instead of the interactive player. */
@@ -2054,7 +2084,12 @@ int metadata_artwork_helper_run(const char * path, int output_fd) {
     }
 
     track_metadata_t result;
+    errno = 0;
     metadata_read(path, &result);
+    if (!result.picture_data && errno == ENOMEM) {
+        free(result.lyrics);
+        return 1;
+    }
     uint8_t * picture = result.picture_data;
     uint32_t picture_size = result.picture_size;
     char * lyrics = result.lyrics;
@@ -2117,7 +2152,10 @@ static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char 
         ok = false;
     }
     if (ok && result.picture_size > 0) {
-        picture = malloc(result.picture_size);
+        /* The helper still owns its copy. Charge only the additional copy
+         * against current free memory, not a fixed worst-case tag size. */
+        picture = artwork_check_memory_admission(ARTWORK_PRIO_WARMER, result.picture_size)
+            ? malloc(result.picture_size) : NULL;
         ok = picture && read_with_deadline(pipefd[0], picture, result.picture_size, &start, timeout_ms);
     }
     close(pipefd[0]);

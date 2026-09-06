@@ -63,34 +63,11 @@ static int get_max_brightness(const char * device_name) {
     return cached_max;
 }
 
-/* Real-device bug report: writing the literal max_brightness raw value (101
- * on a real R1 -- not a round number) turned the screen fully invisible
- * instead of "as bright as possible" -- confirmed live by writing 101
- * directly to brightness over adb with the app not even involved, and by
- * the user finding any slider position below 100% turned the screen back
- * on. A PWM backlight hitting its exact max duty cycle glitching dark like
- * this is a known class of embedded panel/PWM quirk, not something fixable
- * from here at the value level -- so the fix is to simply never write that
- * exact raw value. Every public function in this file works in "logical"
- * percent instead (a clean 0-100 the UI can show directly, "0%" and "100%"
- * included), mapped directly to/from the safe raw range
- * [BACKLIGHT_MIN_PERCENT, BACKLIGHT_SAFE_MAX_PERCENT] of max_brightness --
- * never the literal top or an unreadably-dim bottom -- so callers never
- * need to think about either edge themselves.
- *
- * Real-device bug report #2: an earlier version of this converted through
- * an intermediate "safe percent" (logical -> safe percent -> raw for
- * writes, raw -> safe percent -> logical for reads) -- two independent
- * floor-divisions each way, which don't necessarily round-trip back to the
- * same value with this device's own non-round max_brightness (101):
- * logical 100 -> safe percent 99 -> raw 99, but raw 99 read back -> safe
- * percent 98, one short of the 99 the read side's own "snap to 100" check
- * expected -- confirmed live as the slider topping out at 98%/99% no
- * matter how far right it was dragged, once the drawer was closed and
- * reopened. Converting directly between logical and raw in one step below,
- * using the exact same min/max raw bounds on both the write and read side,
- * keeps them consistent regardless of how max_brightness happens to
- * divide. */
+/* Converts logical percent (0-100) directly to/from the safe raw range
+ * [BACKLIGHT_MIN_PERCENT, BACKLIGHT_SAFE_MAX_PERCENT] of max_brightness.
+ * Capping below 100% of max_brightness prevents hardware PWM glitching at
+ * 100% duty cycle, and direct mapping avoids rounding discrepancy on non-round
+ * max_brightness values. */
 #define BACKLIGHT_SAFE_MAX_PERCENT 99
 
 static int logical_to_raw(int logical, int max) {
@@ -291,17 +268,8 @@ void backlight_set_screen_on(bool on) {
     screen_on = on;
 
     if (!on) {
-        /* Real-device bug report: brightness reset to the hardcoded 80
-         * default (not the user's real prior level) every time the screen
-         * turned off, whenever that level was low. Root cause, confirmed
-         * live with debug logging: the old percent<->raw round trip lost
-         * enough precision that a real, deliberately-set low value could
-         * read back a few points lower than what was actually set, and
-         * comparing that reading against a "looks like it might be a
-         * failed read" threshold (rather than checking for the actual -1
-         * failure sentinel) rejected valid low readings, leaving
-         * restore_percent stuck at whatever it was before. >= 0 alone
-         * still excludes the real failure case. */
+        /* Save current brightness level before screen turns off so it can be restored.
+         * Any non-negative reading is valid (negative indicates read failure). */
         if (!screen_dimmed && !restore_percent_set) {
             int current = backlight_get_percent();
             if (current >= 0) {

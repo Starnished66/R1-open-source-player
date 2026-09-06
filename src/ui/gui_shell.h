@@ -60,22 +60,12 @@ bool point_in_swipe_dead_zone(lv_point_t p);
 void gui_shell_resume_fast_timers(void);
 void gui_shell_reset_drag_state(void);
 /* Narrow counterpart to gui_shell_reset_drag_state() above -- resets only
- * this file's own real interactive player-swipe tracking state
- * (player_swipe_tracking/candidate/ctx), not the unrelated quick-drawer/
- * home-gesture state that function also touches, and does NOT call
- * slide_transition_cancel() on a still-live context the way that function
- * does. For gui_navigation.c's own compositor-failure recovery
- * (slide_transition_anim_x_cb()) to call on the SAME slide_transition_ctx_t
- * it is itself about to lv_free() -- MUST be called before that free, and
- * takes void* rather than slide_transition_ctx_t* so this header doesn't
- * need gui_navigation.h's own type definition just for one declaration.
- * Real-device review finding: before this existed, that recovery path only
- * reset gui_navigation.c's OWN same-named statics, which the file's own
- * gui_navigation_transition_in_progress() comment already documents as
- * dead/never-set-true there -- leaving gui_shell.c's real player_swipe_
- * tracking true and player_swipe_ctx dangling after a compositor failure,
- * so the very next touch-poll tick (finger still down) called
- * slide_transition_anim_x_cb() again with a freed ctx. */
+ * the interactive player-swipe tracking state (player_swipe_tracking,
+ * candidate, ctx) without touching quick-drawer or home-gesture state,
+ * and does NOT call slide_transition_cancel().
+ * Called by gui_navigation.c on compositor-failure recovery
+ * (slide_transition_anim_x_cb()) before freeing the slide_transition_ctx_t.
+ * Takes void* so this header does not need gui_navigation.h's type definition. */
 void gui_shell_player_swipe_recover(void * ctx);
 void gui_shell_install_indev_hooks(lv_indev_t * indev);
 /* Not just lv_indev_get_next(NULL) -- the host simulator also registers a

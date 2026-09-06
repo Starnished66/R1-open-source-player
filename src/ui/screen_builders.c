@@ -119,47 +119,25 @@ void screen_builders_init_list_row_style(void) {
     lv_style_set_text_color(&list_row_style, lv_color_hex(GUI_COLOR_PRIMARY));
     lv_style_set_text_font(&list_row_style, &LIST_ROW_FONT);
 
-    /* Background/radius only -- no width/height/padding/text -- for pill
-     * rows (build_pill_list_screen()'s resized branch, add_pill_row_base())
-     * that need the same live, plugin-mutable "list_row" color as
-     * list_row_style's own rows but position every child themselves via
-     * fixed-offset lv_obj_align() calls against their own explicit size.
-     * list_row_style's pad_left/pad_top shift the content-area origin
-     * lv_obj_align() aligns against, so attaching it directly to a pill row
-     * pushed labels/icons ~28px right and ~15-16px down (real regression,
-     * caught in review before this shipped) -- this style deliberately
-     * carries none of that. gui_plugin_set_background_color() mutates this
-     * alongside list_row_style whenever the "list_row" slot changes, so
-     * both row families stay in sync. */
+    /* Background/radius only (no padding/dimensions/text) for pill rows
+     * that manage child layout with explicit lv_obj_align() offsets.
+     * Keeps pill row backgrounds in sync with the plugin-mutable list_row slot
+     * without shifting the alignment origin. */
     lv_style_init(&pill_row_bg_style);
     lv_style_set_radius(&pill_row_bg_style, LIST_ROW_RADIUS);
     lv_style_set_bg_color(&pill_row_bg_style, LIST_ROW_BG_COLOR);
     lv_style_set_bg_opa(&pill_row_bg_style, LV_OPA_COVER);
     lv_style_set_border_width(&pill_row_bg_style, 0);
 
-    /* Real-device bug report: no visual feedback at all on touching a song
-     * row (list_row_style has no LV_STATE_PRESSED override, so the row's
-     * bg_color never changed) -- a plain tap had nothing confirming it
-     * registered, and a long-press-in-progress looked identical to not
-     * touching the screen at all until the context menu suddenly appeared.
-     * Added as its own style (not folded into list_row_style itself) so it
-     * can be attached with the LV_STATE_PRESSED selector specifically --
-     * see build_compact_list_widget()/populate_group_songs_rows()'s own
-     * lv_obj_add_style() calls. Noticeably lighter than LIST_ROW_BG_COLOR
-     * (28,28,30) rather than a subtle tint, so it reads clearly even in a
-     * quick tap, not just a held press. */
+    /* Visual feedback for pressed song rows (attached with LV_STATE_PRESSED).
+     * Provides a lighter background and recolor overlay during tap or hold. */
     lv_style_init(&list_row_pressed_style);
     lv_style_set_bg_color(&list_row_pressed_style, lv_color_hex(GUI_COLOR_PRESSED));
     lv_style_set_bg_image_recolor(&list_row_pressed_style, lv_color_make(255, 255, 255));
     lv_style_set_bg_image_recolor_opa(&list_row_pressed_style, LV_OPA_30);
 
-    /* Real-device bug report: the player screen's icon buttons (favorite,
-     * play mode order, more-menu) gave no feedback at all on touch, unlike
-     * every list row (list_row_pressed_style above) and the prev/next
-     * transport buttons (their own pressed-asset swap). Recolor-toward-black
-     * at partial opacity darkens whatever's currently drawn without needing
-     * a dedicated "_s" asset for every possible source image an icon might
-     * be showing. */
+    /* Touch-press feedback for player screen icon buttons.
+     * Darkens the icon via partial-opacity black recolor without requiring separate pressed assets. */
     lv_style_init(&icon_press_style);
     lv_style_set_image_recolor(&icon_press_style, lv_color_make(0, 0, 0));
     lv_style_set_image_recolor_opa(&icon_press_style, LV_OPA_40);
@@ -189,28 +167,9 @@ void screen_builders_init_list_row_style(void) {
     lv_style_set_text_color(&style_theme_text_muted, lv_color_hex(GUI_COLOR_SECONDARY));
 }
 
-/* Real-device bug report: pill-row/plugin-scrolling-row labels were sized
- * to exactly lv_font_get_line_height(label_font) -- LVGL's own contract for
- * that value is "the real line height where any text fits" (lv_font.h), but
- * at the BlindMF tier (and, less visibly, the smaller tiers too) p/q/g/y
- * descenders still clipped. lv_tiny_ttf.c computes line_height as
- * scale*(ascent-descent+line_gap); with line_gap frequently 0, that leaves
- * zero slack to absorb FreeType rasterization rounding at the target pixel
- * size, and LV_LABEL_LONG_SCROLL_CIRCULAR reads that overflow as a reason
- * to start its *vertical* scroll animation, not just its horizontal
- * marquee -- exactly the "labels scroll upward on first open" symptom.
- *
- * Fix: give the label's own box a small proportional margin below the
- * nominal line, and push the text down by exactly half of it (pad_top) so
- * the visible glyph position lands at the *same* pixel it already sat at
- * before this fix (this box is still aligned LV_ALIGN_LEFT_MID within its
- * row, so growing it symmetrically about that unchanged point keeps the
- * text centered in the row exactly as before) while the other half becomes
- * genuine new clearance below the text for descender overshoot. A flat,
- * bounded margin (not a big fixed height) is deliberate -- this is only
- * ever called for bounded scrolling row labels (never titles or compact-
- * list rows, which either auto-size or already reserve generous fixed
- * height), so it can't distort any other layout. */
+/* Applies a bounded height and descender margin to scrolling row labels,
+ * preventing descender clipping and spurious vertical scroll animation.
+ * Adds proportional top padding to maintain vertical centering within the row. */
 void row_label_apply_bounded_height(lv_obj_t * label, const lv_font_t * font) {
     int32_t line_h = font ? lv_font_get_line_height(font) : 24;
     int32_t descender_margin = line_h / 8;
@@ -534,17 +493,8 @@ static lv_obj_t * build_title(lv_obj_t * scr, const char * title) {
     lv_obj_t * label = lv_label_create(scr);
     lv_obj_add_flag(label, LV_OBJ_FLAG_USER_4);
     lv_label_set_text(label, title);
-    /* Real-device bug report: a screen whose title gets set to something
-     * genuinely long at runtime (build_compact_list_screen()'s own title,
-     * e.g. a Subsonic artist/album name once you drill into it) had no
-     * marquee at all and instead just rendered centered, overflowing both
-     * edges -- this helper never gave the label a bounded width or
-     * scrolling long_mode to begin with, unlike every other screen's own
-     * title (see the INSET/MARGIN comment above). Every existing caller
-     * passing a short, static title (Settings, System, Stream Media, ...)
-     * just shifts from centered to left-aligned, matching how those other
-     * screens already look -- no functional difference for a title that
-     * already fit. */
+    /* Bound title width within header margins so long titles can marquee scroll
+     * rather than overflow screen edges. */
     lv_obj_set_width(label, lv_display_get_horizontal_resolution(lv_display_get_default()) -
                                  BUILD_TITLE_LEFT_INSET - BUILD_TITLE_RIGHT_MARGIN);
     /* Vertically centered within the TITLE_ROW_HEIGHT band below the
@@ -618,33 +568,16 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    /* NULL back_btn_cb means "this screen has nothing to go back to" (the
-     * Home launcher) -- skip the arrow entirely rather than drawing a dead
-     * button. NULL title similarly means "no header" -- the real stock
-     * launcher has no title text at all above its icon grid (confirmed
-     * against a real-device screenshot), just a small gap below the status
-     * bar before the grid starts, unlike every other icon-grid screen
-     * (Stream Media, Wireless, ...) which does have one. */
+    /* NULL back_btn_cb omits the back button (for Home launcher).
+     * NULL title omits the header title, leaving a small gap below the status bar. */
     build_screen_header(scr, title, back_btn_cb, NULL, NULL);
 
-    /* A true 2-column grid with equal-sized cells and thin divider lines
-     * between them, matching a real reference screenshot of the stock
-     * launcher -- the earlier flex-wrap layout packed tiles at their native
-     * content size with even spacing around them, which reads noticeably
-     * smaller/looser than the stock grid's large, evenly-divided cells. */
+    /* 2-column grid with equal-sized cells and divider lines between them. */
     int col_count = 2;
     int row_count = (item_count + col_count - 1) / col_count;
 
-    /* Per-grid rather than static -- lv_obj_set_grid_dsc_array() below
-     * stores the pointer, not a copy. A
-     * static array here would mean every later call overwrites the same
-     * memory a still-alive earlier grid's dsc pointer refers to -- harmless
-     * back when every row was LV_GRID_FR(1) (any screen's overwrite was a
-     * no-op), but once rows became per-screen fixed pixel heights (see
-     * ICON_GRID_REFERENCE_ROWS above) this silently corrupted every
-     * previously-built grid's row heights to whichever screen was built
-     * last (Home). The owning grid frees this context on LV_EVENT_DELETE so
-     * a soft UI reload does not retain one descriptor set per old screen. */
+    /* Allocated per-grid because lv_obj_set_grid_dsc_array() stores the pointer.
+     * The owning grid frees this context on LV_EVENT_DELETE so soft reloads do not leak. */
     icon_grid_dsc_ctx_t * grid_dsc = lv_malloc(sizeof(*grid_dsc));
     if (!grid_dsc) {
         fprintf(stderr, "[screen_builders] out of memory building icon grid '%s'\n",
@@ -656,25 +589,13 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
     col_dsc[1] = LV_GRID_FR(1);
     col_dsc[2] = LV_GRID_TEMPLATE_LAST;
 
-    /* Grid height is the screen height minus whichever header bands this
-     * particular screen actually has (status bar always; title row only
-     * when a title/back button was requested) -- not a flat percentage.
-     * Music/Stream Media/Wireless used to get lv_pct(78) here while Home
-     * got lv_pct(92) purely because 78/92 had been tuned by eye rather
-     * than computed from the header's real pixel height, so titled
-     * screens' cells came out visibly smaller than Home's despite the
-     * same 2-column layout -- and later, once the status bar itself grew,
-     * their title text started overlapping it outright. This keeps every
-     * icon-grid screen's cells the same size AND guarantees the header
-     * never overlaps the grid, regardless of which bands are present. */
+    /* Grid height is screen height minus active header bands (status bar clearance
+     * and optional title row) to keep cell sizing consistent across all icon grids. */
     int32_t scr_h = lv_display_get_vertical_resolution(lv_display_get_default());
     int32_t header_h = STATUS_BAR_CLEARANCE + (title ? TITLE_ROW_HEIGHT : 0);
 
-    /* Rows are a fixed pixel height (see ICON_GRID_REFERENCE_ROWS above)
-     * rather than LV_GRID_FR(1) shares of the full available height -- FR
-     * shares divide *whatever's available* evenly among however many rows
-     * exist, so a 2-row screen got the same total height as a 3-row one,
-     * just stretched across fewer, oversized cells. */
+    /* Rows use fixed pixel height based on ICON_GRID_REFERENCE_ROWS rather than
+     * fractional shares, so cell heights remain consistent regardless of row count. */
     int32_t row_h = (scr_h - header_h) / ICON_GRID_REFERENCE_ROWS;
 
     int32_t * row_dsc = grid_dsc->rows;
@@ -688,21 +609,10 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
     lv_obj_set_style_bg_opa(grid, 0, 0);
     lv_obj_set_style_border_width(grid, 0, 0);
     lv_obj_set_style_pad_all(grid, 0, 0);
-    /* lv_obj_create()'s default style has a nonzero row/column gap, which
-     * silently ate into row_h above (grid height was sized as an exact
-     * row_count*row_h multiple, with no room left for that gap) -- harmless
-     * under the old LV_GRID_FR(1) rows since those always divided whatever
-     * height the grid was given, gap included, but with fixed-pixel rows it
-     * pushed the last row past the grid's own bottom edge and clipped it
-     * (confirmed on real hardware: Stream Media/Wireless's last row lost its
-     * labels). The divider border lines are the only separation these tiles
-     * were ever meant to have. */
+    /* Zero row/column pad gaps so the grid height precisely matches row_count * row_h. */
     lv_obj_set_style_pad_row(grid, 0, 0);
     lv_obj_set_style_pad_column(grid, 0, 0);
-    /* Vertical-only -- real-hardware testing showed a horizontal swipe
-     * (meant as the app-wide back gesture) getting captured as a scroll
-     * attempt instead of escalating to LV_EVENT_GESTURE, since a plain
-     * lv_obj_create() defaults to scrollable in every direction. */
+    /* Vertical-only scroll direction so horizontal swipes pass through to gesture handling. */
     lv_obj_set_scroll_dir(grid, LV_DIR_VER);
     lv_obj_set_grid_dsc_array(grid, col_dsc, row_dsc);
     lv_obj_set_layout(grid, LV_LAYOUT_GRID);
@@ -719,13 +629,8 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_obj_add_flag(tile, LV_OBJ_FLAG_USER_1);
         if (label_inside_icon) lv_obj_add_flag(tile, LV_OBJ_FLAG_USER_2);
         lv_obj_set_grid_cell(tile, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
-        /* Real LVGL grid margin, not a bigger ICON_GRID_TILE_PAD -- STRETCH
-         * alignment already subtracts margin from the tile's own computed
-         * size (lv_grid.c's get_margin_hor/ver), so this shrinks the tile
-         * visually within its still-untouched cell instead of touching
-         * row_h/col width math (see this function's own row_h history
-         * comment for why that math is fragile). tile_gap/2 per side so the
-         * gap BETWEEN two adjacent tiles equals tile_gap. */
+        /* Margins visually inset the tile within its stretched grid cell,
+         * with tile_gap / 2 per side so adjacent tiles have a total gap of tile_gap. */
         if (tile_gap > 0) lv_obj_set_style_margin_all(tile, tile_gap / 2, 0);
         lv_obj_set_style_bg_opa(tile, 0, 0);
         /* Per-tile style overrides (plugin.set_home_layout()'s per-tile
@@ -736,41 +641,17 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
             lv_obj_set_style_bg_color(tile, lv_color_hex(item->bg_color), 0);
         }
         if (item->has_radius) lv_obj_set_style_radius(tile, item->radius, 0);
-        /* Bug report: tapping a tile (Home, Music, Stream Media, Wireless,
-         * or any themed/plugin grid) had no visual press feedback at all --
-         * bg_opa is 0 by default above, so list_row_pressed_style's own
-         * bg_color-only change (used everywhere else in this app) would be
-         * invisible here without also covering the state's own opacity.
-         * Same GUI_COLOR_PRESSED/LV_OPA_COVER language every pressed list
-         * row already uses, applied per-object rather than via that shared
-         * style since it must override whatever base bg_opa/bg_color this
-         * exact tile has (transparent by default, or a themed/plugin
-         * has_bg_color above) only for the PRESSED state, not replace it
-         * outright. Respects has_radius automatically -- LVGL's own
-         * background fill always follows the object's current radius
-         * regardless of state. */
+        /* Visual press feedback using GUI_COLOR_PRESSED with full opacity. */
         lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_STATE_PRESSED);
         lv_obj_set_style_bg_color(tile, lv_color_hex(GUI_COLOR_PRESSED), LV_STATE_PRESSED);
-        /* The default theme's "card" style puts a ~1px border on every
-         * plain lv_obj_create() -- harmless back when per-tile borders were
-         * hand-drawn here (every tile set its own border_width explicitly,
-         * see the real divider lines added below at the grid level), but
-         * left un-zeroed now it shows as a light border around all four
-         * edges of every tile, confirmed on a real-device screenshot. */
+        /* Zero default card border so only grid-level divider lines are drawn. */
         lv_obj_set_style_border_width(tile, 0, 0);
         lv_obj_set_style_pad_all(tile, ICON_GRID_TILE_PAD, 0);
         lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
 
         /* Icon and label are positioned with explicit pixel offsets rather
-         * than flex auto-centering -- flex's cross-axis centering here
-         * turned out to recompute differently between a plain layout pass
-         * and the real draw/refresh pass (reproduced consistently with
-         * lv_refr_now() before/after checks: the *reported* coordinates
-         * right after layout didn't match what actually got painted, off
-         * by dozens of pixels, only for the grid's last row), so the whole
-         * tile's content is placed by hand here instead of trusting flex
-         * to settle on a stable answer. */
+         * than flex auto-centering for stable rendering across layout passes. */
         lv_obj_t * img_wrap = lv_obj_create(tile);
         lv_obj_remove_style_all(img_wrap);
         lv_obj_remove_flag(img_wrap, LV_OBJ_FLAG_SCROLLABLE);
@@ -798,21 +679,9 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_obj_t * label = lv_label_create(tile);
         lv_label_set_text(label, item->label);
         lv_obj_add_style(label, &style_theme_text_primary, 0);
-        /* Bumped from montserrat_16 -- real-device feedback: the main
-         * menu/submenu text still read too small even after the app-wide
-         * LV_FONT_DEFAULT bump, since these tiles always set an explicit
-         * font and so never fell back to that default. montserrat_20
-         * matches the top bar's own text size rather than inventing a new
-         * in-between size. */
         lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
         if (item->has_text_color) lv_obj_set_style_text_color(label, lv_color_hex(item->text_color), 0);
-        /* Real-device bug report: a caption longer than a tile's own width
-         * ("Remote Control", "Import via Wi-Fi") had no width/wrap set at
-         * all, so it just overflowed straight across into the next tile
-         * (or off the right edge of the screen) instead of wrapping or
-         * clipping. lv_pct(100) resolves against `label`'s own parent
-         * (`tile`), matching whatever width the grid layout actually gave
-         * this cell. */
+        /* Wrap label text within the tile width to prevent overflow into adjacent tiles. */
         lv_obj_set_width(label, lv_pct(100));
         lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
@@ -880,15 +749,6 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
         if (item->on_click) lv_obj_add_event_cb(tile, item->on_click, LV_EVENT_CLICKED, item->user_data);
     }
 
-    /* Divider lines between cells (launcher/hor_line.png / ver_line.png,
-     * drawn once at the grid level whenever tile_gap == 0) were removed per
-     * a UI request to drop the flush-grid separator lines from every
-     * build_icon_grid_screen() consumer (Home, Music, Stream Media,
-     * Wireless) without touching the grid geometry itself -- row_h,
-     * col_dsc/row_dsc, and tile_gap's own flush-vs-gapped behavior above are
-     * all unchanged, only the two line-sprite objects that used to be drawn
-     * here are gone. */
-
     return scr;
 }
 
@@ -928,20 +788,8 @@ void pill_row_apply_icon(lv_obj_t * row, lv_obj_t * label, const char * icon_pat
                           lv_align_t align, int32_t x, int32_t y) {
     if (!icon_path) return;
 
-    /* Real-device bug report: a plugin's icon path "didn't load" -- root
-     * cause was PLUGINS.md's own documented "absolute path" requirement
-     * being non-obvious/easy to miss; the actual plugin passed a relative
-     * one ("./headphones.png"), which LVGL's POSIX fs driver (below) opens
-     * relative to the app's own process working directory, nowhere near
-     * the SD card. A relative path is also a completely reasonable thing
-     * for a plugin author to reach for ("a file sitting next to my own
-     * script"), so rather than only fixing the docs, resolve any icon_path
-     * that doesn't start with '/' against <sd_root>/.plugins/ -- the
-     * folder every plugin's own .lua file already lives in, matching that
-     * exact "next to my script" expectation. An already-absolute path
-     * (e.g. plugin.sd_root() .. "/..." or a real stock theme2 asset,
-     * plugins_examples/PlaybackExtras.lua's own reference usage) is passed
-     * through untouched, unaffected by this. */
+    /* Relative icon paths are resolved against <sd_root>/.plugins/ (the plugin directory),
+     * while absolute paths starting with '/' are preserved verbatim. */
     char resolved[600];
     if (icon_path[0] == '/') {
         snprintf(resolved, sizeof(resolved), "%s", icon_path);
@@ -949,28 +797,14 @@ void pill_row_apply_icon(lv_obj_t * row, lv_obj_t * label, const char * icon_pat
         snprintf(resolved, sizeof(resolved), "%s/.plugins/%s", MUSIC_ROOT_DIR, icon_path);
     }
 
-    /* "S:" is LVGL's own POSIX-filesystem driver letter (lv_conf.h) --
-     * unlike asset_path(), this doesn't prefix THEME_ROOT, so it opens
-     * resolved verbatim as a real absolute path (e.g. a file on the SD
-     * card, not this app's own theme directory). */
+    /* "S:" is LVGL's POSIX-filesystem driver letter (lv_conf.h). Opens
+     * resolved as an absolute filesystem path. */
     char src[600];
     snprintf(src, sizeof(src), "S:%s", resolved);
 
-    /* lv_image_set_scale() only changes what's DRAWN -- the widget's own
-     * coordinate box stays at the source's native (unscaled) size, same
-     * reason build_icon_grid_screen() above never aligns/sizes an
-     * lv_image directly either. Left as its native size, `img` would (a)
-     * paint its own default background across that full native box, not
-     * just the visibly-scaled content -- a real-device bug report: a
-     * near-black launcher icon rendered as a solid black square wildly
-     * bigger than the intended 64px target -- and (b) throw off `label`'s
-     * own re-alignment math below, which needs to know the icon's REAL
-     * on-screen width. Same fix as build_icon_grid_screen(): a
-     * fully-style-stripped wrapper explicitly sized to the true scaled
-     * (target_w x target_h) dimensions, with `img` centered inside it --
-     * the wrapper both clips any of img's own oversized background and
-     * gives align/label-offset math a box that matches what's actually
-     * visible. */
+    /* lv_image_set_scale() only scales rendering without altering widget bounds.
+     * Wrap in an explicitly-sized container matching target dimensions so layout
+     * and label-offset calculations receive the actual on-screen width. */
     lv_obj_t * img_wrap = lv_obj_create(row);
     lv_obj_remove_style_all(img_wrap);
     lv_obj_remove_flag(img_wrap, LV_OBJ_FLAG_SCROLLABLE);
@@ -1066,35 +900,12 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(list, 0, 0);
     lv_obj_set_style_border_width(list, 0, 0);
-    /* Real-device bug report: same root cause as build_compact_list_widget()'s
-     * own fix (see that function's comment) -- this container never zeroed
-     * its own left/right padding either, so every row (already close to
-     * full screen width at the wider font tiers) rendered visibly shifted
-     * right, clipping against the screen edge with a gap on the left. Flex
-     * centering alone doesn't cancel this out: the row is centered within
-     * the padded content box, not the screen, so asymmetric slack left
-     * after that centering (this box is narrower than the screen once
-     * padding is subtracted) still reads as an off-center row. */
+    /* Zero container padding so rows center across the full display width. */
     lv_obj_set_style_pad_all(list, 0, 0);
-    /* Vertical-only -- see the matching comment in build_icon_grid_screen. */
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    /* track_cross_place (3rd arg) -- not cross_place (2nd arg) -- is what
-     * actually centers a narrower-than-container row here: with FLEX_FLOW_
-     * COLUMN and no wrap, LVGL's single track shrinks to its widest child
-     * rather than filling the container's full cross size, so cross_place=
-     * CENTER (an item's placement *within* its track) is a no-op once the
-     * track already equals that item's own width -- it's track_cross_place
-     * (the track's own placement within the container) that determines
-     * whether narrower rows sit flush-left or centered. Was START: every
-     * row narrower than the container (any plugin-resized row, and even
-     * native rows by their few-px native/container gutter) rendered pinned
-     * to the left edge with all slack on the right -- barely visible at
-     * near-full native widths, glaring at a deliberately narrow
-     * plugin.set_home_layout()/register_list_item() width (real-device
-     * report: a themed list's cards read "stuck to the left edge"). CENTER
-     * here centers the track itself, which is what actually centers every
-     * row inside it, native or plugin-resized alike. */
+    /* track_cross_place (3rd arg) set to CENTER centers the column track within
+     * the container, ensuring narrower rows are properly centered rather than left-aligned. */
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(list, row_gap, 0);
     lv_obj_set_style_pad_top(list, GUI_ROW_GAP, 0);
@@ -1172,13 +983,7 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_obj_set_style_text_align(label, text_align, 0);
 
         if (item->accessory == PILL_ACCESSORY_TOGGLE) {
-            /* Real lv_switch, standardized to match the Settings screen's
-             * own switches (screen_timeout_switch et al.) -- replaces the
-             * old flat-tinted on.png/off.png sprite swap per real-device
-             * feedback. Non-interactive: the row itself is still the sole
-             * clickable target (pill_toggle_row_event_cb below), so the
-             * switch must not capture its own touch/drag or every tap
-             * would double-toggle. */
+            /* Non-clickable switch visual driven by row tap (row handles the click event). */
             lv_obj_t * toggle_sw = lv_switch_create(row);
             lv_obj_remove_flag(toggle_sw, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_align(toggle_sw, LV_ALIGN_RIGHT_MID, -20, 0);
@@ -1297,14 +1102,7 @@ typedef struct {
     int item_count;
     compact_list_click_cb_t on_click;
     compact_list_click_cb_t on_long_press; /* NULL for a list with no long-press action (e.g. Artists/Albums name rows) */
-    /* Real-device incident: LVGL still sends LV_EVENT_CLICKED on release
-     * even when LV_EVENT_LONG_PRESSED already fired earlier in that same
-     * press (lv_indev.c's indev_proc_release() doesn't check) -- same root
-     * cause as quick_drawer_wifi_long_press_cb's own doc comment in gui.c,
-     * fixed the same way: the long-press handler sets this, the click
-     * handler checks-and-clears it first and skips entirely if set. One
-     * flag for the whole list, not per-row -- this is a single-touch
-     * device, only one row can plausibly be mid-press at a time. */
+    /* Tracks whether a long press fired so the subsequent release click can be suppressed. */
     bool long_press_fired;
     int32_t row_height;
     int32_t requested_row_height;
@@ -1429,48 +1227,16 @@ typedef struct compact_list_fetch_job_s {
     int offset;
     int count;
     compact_list_page_row_t rows[COMPACT_LIST_PAGE_CACHE_SIZE];
-    /* -1 until the worker thread finishes; written last, the only field the
-     * poll timer reads to decide the job is done. atomic_int rather than a
-     * plain volatile int -- analyzer finding: pthread_join() (called once
-     * result_count>=0 is observed) already makes everything AFTER that
-     * observation fully synchronized, including labels[]/refs, but the
-     * read/write of result_count ITSELF has no C11-recognized ordering
-     * between the two threads otherwise, which is formally a data race
-     * regardless of what happens later. A plain int (word-sized, written
-     * once, no read-modify-write) is safe in practice on real hardware
-     * either way -- this is the exact same poll-a-flag idiom used
-     * throughout the rest of this codebase (cover_decode_done_flag,
-     * lyrics_load_done_flag, etc.) -- but atomic_int makes this specific,
-     * already-flagged instance formally correct at no behavioral cost:
-     * plain assignment/comparison on an _Atomic-qualified object already
-     * uses sequentially consistent ordering by default in C11, so every
-     * existing read/write site below is unchanged syntactically. */
+    /* -1 until the worker thread finishes; written last as the completion signal
+     * polled by the UI thread timer. atomic_int ensures well-ordered cross-thread access. */
     atomic_int result_count;
-    /* Two owners share this job's lifetime: the worker thread's own
-     * execution, and whichever UI-thread path eventually resolves it
-     * (compact_list_poll_fetch_cb()'s normal completion, or compact_list_
-     * abandon_job() below). Each releases its own reference exactly once
-     * via compact_list_job_release(); whichever release brings this to 0
-     * -- which one that is depends on real timing and isn't knowable in
-     * advance -- does the actual free(). A plain bool flag here (an
-     * earlier version of this fix used one) is NOT safe for this: the
-     * worker's check-then-free and the UI thread's write-then-detach are
-     * two independent read/write pairs on the SAME field with no ordering
-     * between them, so either side could free the job while the other is
-     * still about to touch it (real analyzer-caught bug, not just a
-     * theoretical concern -- pthread_detach(job->thread) reading `job`
-     * after the worker had already freed it, or the opposite: worker sees
-     * `false` and returns without freeing at all, leaking it anyway).
-     * An atomic refcount makes "who does the free" an unambiguous, race-
-     * free question. */
+    /* Shared reference count between the worker thread and the UI thread.
+     * Released via compact_list_job_release() so whichever thread finishes last
+     * frees the job struct. */
     atomic_int refs;
 } compact_list_fetch_job_t;
 
-/* Releases one of a job's two references -- see compact_list_fetch_job_s's
- * own doc comment. atomic_fetch_sub() returns the value from BEFORE the
- * decrement, so `== 1` means this call just brought it from 1 to 0: the
- * other side already released, and this call is the second/last one, so
- * it's the one responsible for the actual free(). */
+/* Releases one of a job's two references. Whichever caller decrements to zero frees the job. */
 static void compact_list_job_release(compact_list_fetch_job_t * job) {
     if (atomic_fetch_sub(&job->refs, 1) == 1) free(job);
 }
@@ -1480,29 +1246,12 @@ static void * compact_list_fetch_worker(void * arg) {
     /* Providers written before optional visual fields leave them untouched. */
     memset(job->rows, 0, sizeof(job->rows));
     job->result_count = job->fetch_page(job->provider_ctx, job->offset, job->count, job->rows);
-    compact_list_job_release(job); /* the worker's own reference -- job may already be freed by the other side by the time this call returns */
+    compact_list_job_release(job); /* the worker's own reference */
     return NULL;
 }
 
-/* Abandons a job without waiting on it -- pthread_join() would block for as
- * long as the underlying read takes, which is exactly what this whole
- * background-fetch scheme exists to never do again on the UI/scroll
- * thread. Real-device/analyzer finding: every abandon path used to just
- * detach and never free the job struct at all, tolerated as a "rare,
- * bounded" leak for the original 5s-stuck-read timeout case -- but this is
- * also called from compact_list_cancel_pending_job() below on every
- * ordinary list/search switch, not just that rare case, so the leak was
- * far from rare in practice. Two paths now: if the job has ALREADY
- * finished (result_count landed) but just hasn't been polled/applied yet,
- * join it directly -- pthread_join() is effectively instant once
- * result_count is set, the same reasoning compact_list_poll_fetch_cb()'s
- * own normal-completion path already relies on. Only a job that's
- * genuinely still running falls through to detach; either way, this
- * releases the UI-side reference afterward, safe to do unconditionally
- * since pthread_detach()/pthread_join() above already ran while this
- * thread's own reference was still guaranteed outstanding (the refcount
- * can't have reached 0 without this release, so job->thread was still
- * valid to read either way). */
+/* Abandons a background fetch job. If already completed, joins immediately;
+ * otherwise detaches the worker thread. Releases the UI-side reference in either case. */
 static void compact_list_abandon_job(compact_list_fetch_job_t * job) {
     if (job->result_count >= 0) {
         pthread_join(job->thread, NULL);
@@ -1663,12 +1412,7 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
             int cache_idx = index - data->cache_start;
             bool cached = cache_idx >= 0 && cache_idx < data->cache_count;
             compact_list_page_row_t * info = cached ? &data->cache_rows[cache_idx] : NULL;
-            /* A cache miss used to paint a visible card with an empty label
-             * and (for Albums) placeholder art. Names then arrived after the
-             * async fetch -- and after pad_left/image changes had already
-             * laid the still-empty text out, so the real title waited on a
-             * later image refresh to become visible. Hide the slot until
-             * the page lands instead of showing that empty card. */
+            /* Hide the slot until page data arrives to avoid rendering an empty card. */
             if (!info) {
                 lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
                 data->row_logical_index[slot] = -1;
@@ -1709,25 +1453,8 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
         if (is_action) lv_obj_add_style(row, &style_theme_card_bg, 0);
         /* Identity details use two lines on music rows. Reset on every
          * recycled slot so the selector/single-line rows retain centering.
-         *
-         * Real bug caught in review: this used to read the row's live
-         * height/font back via lv_obj_get_height(row)/lv_obj_get_style_
-         * text_font(row, 0) instead of data->row_height/&LIST_ROW_FONT.
-         * compact_list_set_row_height() calls this function immediately
-         * after lv_obj_set_style_height() on every pool row, in the same
-         * call stack, before LVGL's layout engine has necessarily caught
-         * up -- lv_obj_get_height() could still read the row's stale
-         * pre-resize (or default, on first build) height, computing a
-         * pad_top of ~0 and pinning the label to the very top of the row
-         * instead of centering it. Reproduced on real hardware: every row
-         * of a freshly-opened Album Artist list (all computed during that
-         * same initial compact_list_set_row_height() call) came up top-
-         * aligned, while rows scrolled into view later (recycled well
-         * after layout had settled) centered correctly -- exactly the
-         * "some rows, not others" pattern this timing bug produces.
-         * data->row_height and LIST_ROW_FONT are the same deterministic
-         * values compact_list_set_row_height() itself already uses to
-         * compute this exact padding, with no read-back race possible. */
+         * Uses data->row_height and LIST_ROW_FONT directly rather than querying
+         * widget geometry before layout calculation settles. */
         row_label_set_identity(row, data->subtitle_labels[slot], label, subtitle, data->row_height);
 
         /* The row itself is a label, so LVGL aligns child images against
@@ -1996,16 +1723,7 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(list, 0, 0);
     lv_obj_set_style_border_width(list, 0, 0);
-    /* Real-device bug report: every row in every compact-list screen
-     * (Artists/Album Artist/All Songs, the Files search overlay, the
-     * timezone city list, ...) sat shifted well to the right, leaving a
-     * large gap on the left and clipping against the right edge. Root
-     * cause: rows below are positioned with an absolute lv_obj_set_pos(row,
-     * row_x, ...), which places them relative to this container's own
-     * CONTENT area -- but `list` never zeroed its padding, so it was still
-     * carrying LVGL's default object theme padding on all four sides,
-     * silently offsetting every row_x (computed assuming zero padding) by
-     * that same amount on top of its own value. */
+    /* Zero container padding so absolute row positions align with screen coordinates. */
     lv_obj_set_style_pad_all(list, 0, 0);
     /* Vertical-only -- see the matching comment in build_icon_grid_screen.
      * No flex flow here (unlike the old implementation) -- every row is
@@ -2252,18 +1970,7 @@ lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text) {
 lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click) {
     lv_obj_t * row = add_pill_row_base(parent, label_text);
 
-    /* Real native lv_switch, same style as the Settings screen's own
-     * switches (screen_timeout_switch et al.) -- standardized to match
-     * per real-device feedback, replacing the old flat-tinted on.png/
-     * off.png image (which had no distinct white knob, just a single
-     * solid-colored icon). Non-interactive: the row itself is still the
-     * only clickable target (on_click below), so the switch must not
-     * capture its own touch/drag or every tap would double-toggle --
-     * once via the switch's own gesture, once via the row's CLICKED
-     * handler. checked is baked in at creation time and this whole row
-     * is rebuilt by the caller's own on_click/repopulate flow (e.g.
-     * poll_wifi_toggle()) rather than live-updated in place, matching
-     * the image version's exact same one-shot-render contract. */
+    /* Non-clickable switch visual; the row itself handles the click event. */
     lv_obj_t * toggle_sw = lv_switch_create(row);
     lv_obj_remove_flag(toggle_sw, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_style(toggle_sw, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);

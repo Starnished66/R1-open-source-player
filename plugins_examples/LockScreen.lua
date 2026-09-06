@@ -1,123 +1,432 @@
-plugin.define({
-  id = "example.lock_screen",
-  name = "Lock Screen",
-  version = "1.0",
-  api_min = 1,
-})
+#include "gui_lock_screen.h"
+#include "gui_navigation.h"
+#include "gui_shell.h"
+#include "gui_theme.h"
+#include "gui_player.h"
+#include "app_clock.h"
+#include "assets.h"
+#include "screen_builders.h"
+#include "gesture_detector.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
--- Lock Screen companion plugin.
--- Adds a "Lock Screen" row to Settings -> Display.
--- Configures a cosmetic lock screen overlay shown when screen wakes from being off:
--- Modes: Off / Album Art / Custom Image / Clock.
--- Dismissed by swiping up.
+static lv_obj_t * lock_screen = NULL;
+static lv_obj_t * lock_image_obj = NULL;
+static lv_obj_t * lock_clock_label = NULL;
+static lv_timer_t * lock_clock_timer = NULL;
+static lv_timer_t * lock_touch_timer = NULL;
 
-if not plugin.has_capability("ui.lock_screen") then
-  plugin.show_toast("Lock Screen needs a newer player build")
-  return
-end
+static gui_lock_screen_mode_t current_mode = LOCK_SCREEN_MODE_OFF;
+static bool current_clock_24h = true;
 
-local STORAGE_KEY_MODE = "mode"
-local STORAGE_KEY_IMAGE = "image_path"
+/* Swipe-up-to-dismiss tracking -- reuses the same detector already driving
+ * the home-indicator swipe gesture elsewhere (gui_shell.c) rather than
+ * hand-rolling a second copy of the same press/track/threshold bookkeeping.
+ * band_height is set to the full screen height at poll time (see
+ * lock_touch_timer_cb()) so every press anywhere on the lock screen is
+ * eligible, not just one starting in a narrow bottom band like the home
+ * indicator's own gesture. */
+static gesture_home_state_t lock_gesture_state;
 
-local MODES = {
-  { key = "off",       label = "Off" },
-  { key = "album_art", label = "Album Art" },
-  { key = "image",     label = "Custom Image" },
-  { key = "clock",     label = "Clock" },
+lv_obj_t * gui_lock_screen_get_screen(void) {
+    return lock_screen;
 }
 
-local function get_current_mode()
-  return plugin.storage.get(STORAGE_KEY_MODE, "off")
-end
+bool gui_lock_screen_is_showing(void) {
+    return lock_screen != NULL && lv_screen_active() == lock_screen;
+}
 
-local function set_current_mode(mode_key)
-  plugin.storage.set(STORAGE_KEY_MODE, mode_key)
-end
+static void update_clock_display(void) {
+    if (!lock_clock_label) return;
 
-local function get_custom_image_path()
-  return plugin.storage.get(STORAGE_KEY_IMAGE, "")
-end
+    struct tm tm_info;
+    app_clock_localtime(&tm_info);
 
-local function set_custom_image_path(path)
-  plugin.storage.set(STORAGE_KEY_IMAGE, path)
-end
+    char buf[16];
 
-local function trigger_lock_screen()
-  local mode = get_current_mode()
-  if mode == "off" then return end
+    strftime(
+        buf,
+        sizeof(buf),
+        current_clock_24h ? "%H:%M" : "%I:%M",
+        &tm_info
+    );
 
-  local opts = { mode = mode }
-  if mode == "image" then
-    local img_path = get_custom_image_path()
-    if not img_path or img_path == "" then return end
-    opts.image_path = img_path
-  end
+    lv_label_set_text(lock_clock_label, buf);
+}
 
-  plugin.show_lock_screen(opts)
-end
+static void lock_clock_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    update_clock_display();
+}
 
--- Screen woke event handler
-plugin.on("screen_woke", function()
-  trigger_lock_screen()
-end)
+static void lock_touch_timer_cb(lv_timer_t * timer) {
+    (void) timer;
 
-local function open_custom_image_picker()
-  local dir_path = plugin.sd_root() .. "/.plugins/lock_images"
-  local files = plugin.list_dir(dir_path)
-  local image_files = {}
+    if (!gui_lock_screen_is_showing()) return;
 
-  for _, entry in ipairs(files) do
-    if not entry.dir then
-      local name_lower = entry.name:lower()
-      if name_lower:match("%.png$") or name_lower:match("%.jpg$") or name_lower:match("%.jpeg$") then
-        table.insert(image_files, entry.name)
-      end
-    end
-  end
+    lv_indev_t * indev = find_pointer_indev();
+    if (!indev) return;
 
-  table.sort(image_files)
+    bool pressed =
+        (lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED);
 
-  if #image_files == 0 then
-    plugin.show_toast("No images in /.plugins/lock_images")
-    return
-  end
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
 
-  local current_img = get_custom_image_path()
-  local selected_idx = 0
-  for i, name in ipairs(image_files) do
-    if dir_path .. "/" .. name == current_img then
-      selected_idx = i
-      break
-    end
-  end
+    gesture_home_config_t cfg;
 
-  plugin.show_list("Select Image", image_files, function(index)
-    local chosen = dir_path .. "/" .. image_files[index]
-    set_custom_image_path(chosen)
-    set_current_mode("image")
-    plugin.show_toast("Lock Image: " .. image_files[index])
-  end, selected_idx > 0 and { selected = selected_idx } or nil)
-end
+    int32_t screen_height =
+        lv_display_get_vertical_resolution(
+            lv_display_get_default()
+        );
 
-plugin.register_list_item("display", "Lock Screen", function()
-  local current_mode = get_current_mode()
-  local labels = {}
-  local selected_idx = 0
+    cfg.swipe_up_home_enabled = true;
+    cfg.quick_drawer_open = false;
+    cfg.is_bt_dac_overlay = false;
+    cfg.is_usb_dac_overlay = false;
+    cfg.is_lyrics_screen = false;
+    cfg.is_lock_screen = false;
+    cfg.has_background_work = false;
+    cfg.screen_height = screen_height;
 
-  for i, m in ipairs(MODES) do
-    labels[i] = m.label
-    if m.key == current_mode then
-      selected_idx = i
-    end
-  end
+    /* The whole screen is the swipe surface. */
+    cfg.band_height = screen_height;
 
-  plugin.show_list("Lock Screen", labels, function(index)
-    local chosen_mode = MODES[index].key
-    if chosen_mode == "image" then
-      open_custom_image_picker()
-    else
-      set_current_mode(chosen_mode)
-      plugin.show_toast("Lock Screen: " .. MODES[index].label)
-    end
-  end, selected_idx > 0 and { selected = selected_idx } or nil)
-end)
+    bool dismiss =
+        gesture_home_state_poll(
+            &lock_gesture_state,
+            &cfg,
+            pressed,
+            p.y
+        );
+
+    if (dismiss) {
+        /*
+         * Wait for touch release before dismissing to prevent the
+         * release from triggering an unintended click underneath.
+         */
+        lv_indev_wait_release(indev);
+        gui_lock_screen_hide();
+    }
+}
+
+static void start_timers(void) {
+    /*
+     * The live clock is required for:
+     *
+     *   - Album Art
+     *   - Custom Image
+     *   - Standalone Clock
+     *
+     * Off mode does not need the clock timer.
+     */
+    if (current_mode == LOCK_SCREEN_MODE_CLOCK ||
+        current_mode == LOCK_SCREEN_MODE_IMAGE ||
+        current_mode == LOCK_SCREEN_MODE_ALBUM_ART) {
+
+        if (!lock_clock_timer) {
+            lock_clock_timer =
+                lv_timer_create(
+                    lock_clock_timer_cb,
+                    1000,
+                    NULL
+                );
+        }
+
+    } else if (lock_clock_timer) {
+
+        lv_timer_delete(lock_clock_timer);
+        lock_clock_timer = NULL;
+    }
+
+    /*
+     * Touch polling is needed whenever the lock screen exists.
+     */
+    if (!lock_touch_timer) {
+        lock_touch_timer =
+            lv_timer_create(
+                lock_touch_timer_cb,
+                20,
+                NULL
+            );
+    }
+}
+
+static void stop_timers(void) {
+    if (lock_clock_timer) {
+        lv_timer_delete(lock_clock_timer);
+        lock_clock_timer = NULL;
+    }
+
+    if (lock_touch_timer) {
+        lv_timer_delete(lock_touch_timer);
+        lock_touch_timer = NULL;
+    }
+
+    gesture_home_state_reset(&lock_gesture_state);
+}
+
+static void build_lock_screen_if_needed(void) {
+    if (lock_screen) return;
+
+    lock_screen = lv_obj_create(NULL);
+
+    lv_obj_add_style(
+        lock_screen,
+        &style_theme_screen_bg,
+        0
+    );
+
+    lv_obj_remove_flag(
+        lock_screen,
+        LV_OBJ_FLAG_SCROLLABLE
+    );
+
+    /*
+     * Image object is created first.
+     */
+    lock_image_obj = lv_image_create(lock_screen);
+
+    lv_obj_align(
+        lock_image_obj,
+        LV_ALIGN_CENTER,
+        0,
+        0
+    );
+
+    lv_obj_add_flag(
+        lock_image_obj,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    /*
+     * Clock label is created second.
+     *
+     * Because it is later in the object hierarchy, it renders above
+     * the album art/custom image.
+     */
+    lock_clock_label = lv_label_create(lock_screen);
+
+    lv_obj_add_style(
+        lock_clock_label,
+        &style_theme_text_primary,
+        0
+    );
+
+    lv_obj_set_style_text_align(
+        lock_clock_label,
+        LV_TEXT_ALIGN_CENTER,
+        0
+    );
+
+    /*
+     * GUI_FONT_ROLE_TITLE is the existing largest general application
+     * font role and currently maps to app_font_28.
+     */
+    lv_obj_set_style_text_font(
+        lock_clock_label,
+        gui_theme_font(GUI_FONT_ROLE_TITLE),
+        0
+    );
+
+    lv_obj_align(
+        lock_clock_label,
+        LV_ALIGN_CENTER,
+        0,
+        0
+    );
+
+    lv_obj_add_flag(
+        lock_clock_label,
+        LV_OBJ_FLAG_HIDDEN
+    );
+}
+
+bool gui_lock_screen_show(
+    const gui_lock_screen_options_t * options
+) {
+    if (!options ||
+        options->mode == LOCK_SCREEN_MODE_OFF) {
+        return false;
+    }
+
+    build_lock_screen_if_needed();
+
+    current_mode = options->mode;
+    current_clock_24h = options->clock_24h;
+
+    /*
+     * Reset both visual objects before applying the selected mode.
+     */
+    lv_obj_add_flag(
+        lock_image_obj,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    lv_obj_add_flag(
+        lock_clock_label,
+        LV_OBJ_FLAG_HIDDEN
+    );
+
+    /*
+     * ------------------------------------------------------------
+     * ALBUM ART + LIVE CLOCK
+     * ------------------------------------------------------------
+     */
+    if (current_mode == LOCK_SCREEN_MODE_ALBUM_ART) {
+
+        const lv_image_dsc_t * cover =
+            gui_player_get_current_cover_dsc();
+
+        if (cover && cover->data) {
+
+            lv_image_set_src(
+                lock_image_obj,
+                cover
+            );
+
+        } else {
+
+            lv_image_set_src(
+                lock_image_obj,
+                asset_path(
+                    "playing_plane/default_cover_565.png"
+                )
+            );
+        }
+
+        /*
+         * Show album art.
+         */
+        lv_obj_remove_flag(
+            lock_image_obj,
+            LV_OBJ_FLAG_HIDDEN
+        );
+
+        /*
+         * Show the live centered clock above the album art.
+         */
+        update_clock_display();
+
+        lv_obj_remove_flag(
+            lock_clock_label,
+            LV_OBJ_FLAG_HIDDEN
+        );
+
+    /*
+     * ------------------------------------------------------------
+     * CUSTOM IMAGE + LIVE CLOCK
+     * ------------------------------------------------------------
+     */
+    } else if (current_mode == LOCK_SCREEN_MODE_IMAGE) {
+
+        /*
+         * LVGL's filesystem driver is selected from src[0].
+         * Plugin paths are normal POSIX paths, therefore use the
+         * project's "S:" POSIX filesystem driver prefix.
+         */
+        char prefixed_path[
+            sizeof(options->image_path) + 2
+        ];
+
+        snprintf(
+            prefixed_path,
+            sizeof(prefixed_path),
+            "S:%s",
+            options->image_path
+        );
+
+        lv_image_set_src(
+            lock_image_obj,
+            prefixed_path
+        );
+
+        /*
+         * Show custom image.
+         */
+        lv_obj_remove_flag(
+            lock_image_obj,
+            LV_OBJ_FLAG_HIDDEN
+        );
+
+        /*
+         * Show the live centered clock above the image.
+         */
+        update_clock_display();
+
+        lv_obj_remove_flag(
+            lock_clock_label,
+            LV_OBJ_FLAG_HIDDEN
+        );
+
+    /*
+     * ------------------------------------------------------------
+     * STANDALONE CLOCK
+     * ------------------------------------------------------------
+     */
+    } else if (current_mode == LOCK_SCREEN_MODE_CLOCK) {
+
+        update_clock_display();
+
+        lv_obj_remove_flag(
+            lock_clock_label,
+            LV_OBJ_FLAG_HIDDEN
+        );
+    }
+
+    /*
+     * Start the appropriate timers.
+     */
+    start_timers();
+
+    /*
+     * Put the lock screen on top of the current navigation stack.
+     */
+    if (lv_screen_active() != lock_screen) {
+        nav_push(lock_screen);
+    }
+
+    return true;
+}
+
+void gui_lock_screen_hide(void) {
+    stop_timers();
+
+    if (lock_screen &&
+        lv_screen_active() == lock_screen) {
+        nav_pop();
+    }
+}
+
+void gui_lock_screen_init(void) {
+    lock_screen = NULL;
+    lock_image_obj = NULL;
+    lock_clock_label = NULL;
+    lock_clock_timer = NULL;
+    lock_touch_timer = NULL;
+
+    current_mode = LOCK_SCREEN_MODE_OFF;
+    current_clock_24h = true;
+
+    gesture_home_state_reset(
+        &lock_gesture_state
+    );
+}
+
+/*
+ * Called from gui_soft_reload() (gui_reload.c), after
+ * gui_navigation_teardown() has already zeroed nav_stack/nav_depth.
+ *
+ * The lock screen does not need to navigate anywhere during teardown.
+ * It only needs to release its timers/object resources.
+ */
+void gui_lock_screen_teardown(void) {
+    stop_timers();
+
+    if (lock_screen) {
+        lv_obj_delete(lock_screen);
+    }
+
+    gui_lock_screen_init();
+}

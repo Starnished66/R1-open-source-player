@@ -977,19 +977,8 @@ static double replaygain_to_linear(bool has_gain, double gain_db, bool has_peak,
     return linear;
 }
 
-/* Real-device feedback: "noticeable sound hissing in quiet songs, not
- * related to the files (same songs sound clean in the stock player)".
- * Root cause: a plain `(int32_t) (float)` cast truncates toward zero
- * rather than rounding to the nearest integer, and it did so on every
- * single sample at every non-unity gain (which is almost always -- see
- * audio_set_volume()'s own comment, true silence is the only exact
- * 1.0x). For a quiet passage, sample magnitudes are already small, so
- * truncation's bias (always toward zero, i.e. always down in magnitude)
- * is a large fraction of the sample's own value rather than a rounding
- * error a full dynamic-range signal would completely mask -- exactly the
- * classic naive-gain-scaling recipe for audible quantization
- * distortion/hiss. lrintf() rounds to the nearest representable integer
- * (ties to even) instead of always truncating down. */
+/* Applies linear gain scaling to int16 PCM samples. Uses lrintf() to round
+ * to nearest integer to minimize quantization error in quiet passages. */
 static void apply_gain(int16_t * buf, size_t sample_count, float gain) {
     /* Fast path: no scaling needed. A positive ReplayGain adjustment can
      * push this above 1.0f, so this can't just be ">= 0.999f". */
@@ -1112,32 +1101,13 @@ static void write_device(const int16_t * buf, uint64_t frames, unsigned int chan
 }
 #else
 /* Target build: thin wrappers around the shared audio_output module (see
- * audio_output.h and its own top-of-file comment) -- all the actual
- * local-hardware-vs-Bluetooth routing, pacing, and failure-handling logic
- * that used to live here directly now lives there instead, shared with
- * usb_dac_bridge.c's own separate output stream. */
+ * audio_output.h) for output routing and format configuration. */
 static bool ensure_device_format(unsigned int channels, unsigned int sample_rate, bool want_s24) {
-    /* Decoder-fed local playback wants the standard, battery-tuned local
-     * buffer, not the low-latency one AirPlay's own audio_output_ensure()
-     * call requests -- see that parameter's own doc comment. */
+    /* Decoder-fed local playback requests standard battery-tuned local buffer. */
     bool ok = audio_output_ensure(channels, sample_rate, false, want_s24);
     if (ok) {
-        /* Real-device bug report: USB headphones had volume maxed out on
-         * first boot no matter what the UI showed, only "fixed" by
-         * pressing vol+/-. Root cause: audio_set_volume()'s USB
-         * digital-taper branch (see its own comment) depends on
-         * audio_output_is_usb_active(), which only reflects the truth once
-         * open_device() has actually run for the current track -- any
-         * audio_set_volume() call made before that (e.g. applying the
-         * saved volume right after boot, before anything has ever played)
-         * always sees it as false, pinning volume_gain at unity even
-         * though the eventual real target is USB. Nothing re-derived it
-         * once the real target became known. Re-checking here, right after
-         * every ensure_device() call (already invoked every decode chunk
-         * for the same class of target-changed-mid-stream reason -- see
-         * this function's own caller comment on Bluetooth), and only
-         * re-deriving on an actual change costs nothing extra the rest of
-         * the time. */
+        /* Reapply volume if USB output state changed so digital volume taper
+         * is correctly activated or deactivated. */
         static bool last_gain_for_usb = false;
         bool now_usb = audio_output_is_usb_active();
         if (now_usb != last_gain_for_usb) {
@@ -1335,34 +1305,9 @@ static void close_decoder_if_open(decoder_t * dec, bool * is_open) {
  * this chunk's first frame falls, so the fade is continuous across chunk
  * boundaries rather than stepped.
  *
- * int16_t only. Originally this meant EVERY crossfade forced an ALSA
- * close+reopen if either side was on the S24_LE wide path -- even a
- * 24-bit-to-24-bit pair, since `is_blending` forced use_wide=false
- * unconditionally regardless of either side's actual eligibility. Confirmed
- * on real hardware (2026-09-04) that the resulting gap does NOT land at a
- * clean boundary between the two tracks: the blend window mixes both
- * tracks together for its full CROSSFADE_SECONDS span (fade_next ramps
- * 0->1 across the whole window), so the incoming track's opening is
- * already superimposed with the outgoing track's tail from the very start
- * of blending -- a reopen glitch anywhere in that window audibly affects
- * BOTH sides at once, not just a blip at the boundary.
- *
- * Fixed for the case that can actually be fixed: `is_blending` a few lines
- * below now allows use_wide=true during a blend when BOTH cur_dec and
- * nxt_dec are themselves S24_LE-eligible, and the actual branch decision
- * (see mix_crossfade_s32() below and its own caller) blends in the wide
- * (int32_t) domain instead, entirely avoiding the reopen for a same-depth
- * pair -- confirmed seamless on real hardware.
- *
- * MIXED-DEPTH pairs (one side wide-eligible, the other not -- e.g. a 24-bit
- * FLAC crossfading into a 16-bit MP3) still pay this cost, unavoidably:
- * this function stays int16_t-only, so any crossfade involving a source
- * that isn't itself S24_LE-eligible always uses this narrow path, with the
- * same forced S16 reopen as before. What no longer forces the reopen is
- * the case BOTH sides qualify -- see mix_crossfade_s32() below and its own
- * caller in audio_thread_func() (gated on can_use_wide_path() for both
- * cur_dec and nxt_dec, plus audio_output_is_s24_active() as the ground
- * truth, same reasoning as the plain-playback wide-path branch). */
+ * int16_t crossfade blending path. Used when either the current or next track
+ * is 16-bit. When both tracks qualify for S24_LE wide output, mix_crossfade_s32()
+ * is used instead to avoid reopening ALSA at S16_LE. */
 static void mix_crossfade(const int16_t * buf_cur, const int16_t * buf_next, int16_t * buf_out,
                            uint64_t n, unsigned int channels, uint64_t fade_start_frame, uint64_t crossfade_frames) {
     for (uint64_t k = 0; k < n; k++) {
@@ -1436,30 +1381,9 @@ static void * audio_thread_func(void * arg) {
 #endif
 
 #ifndef HOST_BUILD
-    /* Real-device bug report: plugging/unplugging headphones or an aux
-     * cable produced an audible pop/static even with NOTHING ever played
-     * this boot (no track loaded, ensure_device() never once called) --
-     * confirmed NOT reproducible on the stock player, and confirmed via a
-     * genuine fresh reboot test (not just residual state from earlier
-     * playback this same boot). See HARDWARE_DRIVERS.md's "Audio subsystem"
-     * section for the full investigation -- an ALSA-mixer-control-based fix
-     * (muting "Mute Output" at startup) was tried and DISPROVEN by direct
-     * testing: that control doesn't hold state from userspace at all on
-     * this driver, under any condition. Root cause instead: this codec's
-     * driver implements the standard ASoC .digital_mute DAI callback, and
-     * the machine driver gates real chip power (cs43131_set_power())
-     * through the standard DAPM bias-level state machine as streams
-     * start/stop -- the SAME mechanism this file's own pause-time pop fix
-     * (close_device() the instant pause is detected, further down this
-     * loop) already relies on, and which HARDWARE_DRIVERS.md confirms is
-     * genuinely effective. A track that's simply never been played yet has
-     * never triggered that stop sequence even once, leaving the codec in
-     * whatever raw state its own boot-time kernel probe left it in --
-     * different from, and apparently less safe than, the state reached by
-     * actually going through a real open-then-close cycle. Priming it once
-     * here, before the very first real track ever loads, puts the codec
-     * through that exact same proven-safe sequence early -- no audio is
-     * written, so this is inaudible in itself. */
+    /* Prime the ALSA audio device open-and-close once on startup so the codec
+     * driver enters a safe low-power bias state, preventing jack insertion/removal pops
+     * before the first track plays. */
     if (ensure_device(2, 44100)) close_device();
 #endif
 
@@ -1539,14 +1463,8 @@ static void * audio_thread_func(void * arg) {
         }
 
 #ifndef HOST_BUILD
-        /* A different decoder is becoming current -- give it a clean shot at
-         * S24_LE even if a previous, unrelated track at this same (channels,
-         * rate) hit a transient pcm_open() failure (see s24_unsupported_
-         * known's own comment for why that record isn't kept forever). Must
-         * run BEFORE ensure_device_format() below, not after: resetting
-         * afterward would immediately erase a failure this exact call just
-         * legitimately observed, defeating the per-chunk-thrashing
-         * protection that record exists for within this same track. */
+        /* Reset S24 probe cache before ensuring format so each new track
+         * can negotiate S24_LE output. */
         audio_output_reset_s24_probe();
         bool initial_wide = can_use_wide_path(&cur_dec);
         if (!ensure_device_format(cur_dec.channels, cur_dec.sample_rate, initial_wide)) {
@@ -1587,24 +1505,9 @@ static void * audio_thread_func(void * arg) {
         for (;;) {
             pthread_mutex_lock(&audio_mutex);
 #ifndef HOST_BUILD
-            /* Real-device bug report: plugging/unplugging headphones or an
-             * aux cable produced an audible pop/static -- confirmed NOT
-             * reproducible on the stock player, and not reproducible here
-             * either once actually stopped (close_device() below already
-             * runs then) -- only while paused, with a track still loaded.
-             * Root cause: this loop only ever waited here while paused,
-             * never closing the PCM device (tinyalsa's pcm_open() from
-             * audio_output.c stayed open the whole time, same struct pcm*
-             * live from before the pause), leaving whatever this codec's
-             * own DAPM/amp power state is tied to "playing" energized
-             * indefinitely -- a physical jack insertion/removal on a live,
-             * powered analog path is exactly what produces an audible pop,
-             * confirmed by this app being the only thing different (the
-             * headphone jack and codec hardware are identical either way).
-             * Closed here, the instant a pause is detected -- reopened
-             * automatically by ensure_device() a few lines below once
-             * playback actually resumes, the same lazy reopen it already
-             * does for every other reason the device might be closed. */
+            /* Close the audio output device while paused so the analog amplifier
+             * is de-energized, preventing audible pops on jack insertion/removal.
+             * Output is automatically reopened via ensure_device() upon resume. */
             if (paused && !stop_requested && !restart_requested) {
                 float vol = volume_gain;
                 pthread_mutex_unlock(&audio_mutex);
@@ -1721,29 +1624,12 @@ static void * audio_thread_func(void * arg) {
             free_mp3_index_job(completed_index);
 
 #ifndef HOST_BUILD
-            /* Real-device bug: connecting Bluetooth headphones mid-track (the
-             * common case -- a user pairs while a track is already playing,
-             * or this app auto-resumed playback before the GUI's connection
-             * poll had even run once) never switched output, because the two
-             * ensure_device() call sites below only run at a track boundary
-             * (a fresh audio_play_file_at(), or the automatic handoff into a
-             * queued next track). The requested Bluetooth target can change
-             * at any moment from the GUI thread's poll, so it needs checking
-             * every chunk here too, not just at those boundaries. Cheap:
-             * audio_output_ensure() (which this delegates to) already only
-             * reopens if the format OR the Bluetooth target actually
-             * changed, so calling it unconditionally every chunk costs
-             * nothing extra when nothing changed. Best-effort -- write_device()
-             * below skips writing rather than crashing if this fails, and the
-             * next iteration tries again. */
+            /* Check device format and output target every chunk so mid-track route changes
+             * (such as Bluetooth connection/disconnection) take effect immediately. */
             if (!hold_for_mp3_seek) {
                 bool is_blending = (xfade_on && staged_next_path != NULL && nxt_open && nxt_format_matches);
-                /* A blend window no longer unconditionally forces S16_LE: if
-                 * BOTH sides of the crossfade are themselves S24_LE-eligible,
-                 * request S24_LE here too, so entering/leaving the blend
-                 * window doesn't force an avoidable close+reopen (see
-                 * mix_crossfade_s32()'s own comment on why this doesn't help
-                 * a mixed-depth pair, only a same-depth-24-bit one). */
+                /* Request S24_LE if both sides of a crossfade are S24_LE-eligible,
+                 * avoiding unnecessary close+reopen cycles. */
                 bool blend_can_be_wide = is_blending && can_use_wide_crossfade(&cur_dec, &nxt_dec);
                 bool use_wide = blend_can_be_wide || (!is_blending && can_use_wide_path(&cur_dec));
                 ensure_device_format(cur_dec.channels, cur_dec.sample_rate, use_wide);
@@ -1929,13 +1815,7 @@ static void * audio_thread_func(void * arg) {
 #ifndef HOST_BUILD
                 if (can_use_wide_crossfade(&cur_dec, &nxt_dec) && audio_output_is_s24_active()) {
                     /* Both sides of this crossfade qualify for S24_LE and the
-                     * device is confirmed actually open at S24_LE right now --
-                     * blend in the wide (int32_t) domain instead of forcing the
-                     * S16_LE reopen every crossfade used to pay unconditionally
-                     * (see mix_crossfade()'s own comment for the mixed-depth
-                     * case, which still can't avoid it). Exact mirror of the
-                     * narrow branch below, just s32-typed -- keep both in sync
-                     * if the narrow branch's error handling ever changes. */
+                     * device is active at S24_LE -- blend in the wide (int32_t) domain. */
                     decoder_read_result_t r_cur = decoder_read_s32(&cur_dec, want, buf_cur_s32);
                     uint64_t n_cur = r_cur.frames;
 
@@ -1956,17 +1836,9 @@ static void * audio_thread_func(void * arg) {
                         goto inner_loop_done;
                     }
 
-                    /* Unlike the plain-playback path, this was previously left
-                     * unhandled: a recoverable error returns n_cur==0 with a
-                     * status that is neither FATAL nor EOF, so it fell through
-                     * every check below (including the n_cur>0 gate) straight
-                     * to "blend window finished -- promote next to current",
-                     * treating a transient, retriable decode hiccup as if
-                     * cur_dec had legitimately reached the end of the track --
-                     * cutting off up to the rest of the crossfade window
-                     * (CROSSFADE_SECONDS, currently 3s) of real audio. Mirrors
-                     * the plain-playback path's own consecutive_decoder_errors
-                     * escalation exactly. */
+                    /* Handle recoverable decode errors using consecutive error counts,
+                     * matching the plain-playback retry path rather than prematurely
+                     * ending the crossfade window. */
                     if (r_cur.status == DECODER_READ_RECOVERABLE_ERROR) {
                         consecutive_decoder_errors++;
                         DBG_LOG("audio: crossfade recoverable decode error #%u (%s)\n",
@@ -2421,13 +2293,8 @@ static void * audio_thread_func(void * arg) {
                     decoder_close(&cur_dec);
                     cur_dec = nxt_dec;
 #ifndef HOST_BUILD
-                    /* A different decoder is now current, promoted out of the
-                     * crossfade blend window -- give it a clean shot at S24_LE
-                     * on the next chunk's own ensure_device_format() call (this
-                     * point itself doesn't negotiate the device; the per-chunk
-                     * check does that on the next loop iteration), even if some
-                     * earlier, unrelated track at this same (channels, rate) hit
-                     * a transient pcm_open() failure. */
+                    /* Reset S24 probe cache on track promotion so the new track
+                     * can negotiate S24_LE output. */
                     audio_output_reset_s24_probe();
 #endif
                     nxt_open = false;
@@ -3086,31 +2953,9 @@ void audio_seek(double seconds) {
     request_seek_and_unlock(frame);
 }
 
-/* Real-device bug report: tapping the progress slider to seek stopped
- * working after switching tracks a few times, mostly on 40+ minute songs.
- * Root cause: progress_slider_event_cb() (gui_player.c) used to read
- * audio_get_duration_seconds(), convert the tapped percent to an absolute
- * seconds value, and call audio_seek(seconds) -- two SEPARATE audio_mutex
- * critical sections, with the audio thread free to run in between. If the
- * user switches tracks and then taps the slider before the audio thread's
- * own decoder_open() for the new track has finished (current_sample_rate/
- * current_total_frames only update once it has -- see the restart handling
- * at the top of audio_thread_func()'s outer loop), audio_get_duration_
- * seconds() still reports the OLD track's duration. A percent computed
- * against that stale duration, then converted to a frame count using
- * whichever track's current_sample_rate audio_seek() happens to observe by
- * the time its own separate lock acquisition runs, lands on the wrong
- * position in the NEW track -- and can look like the tap did nothing at
- * all if that miscomputed target happens to clamp back near wherever
- * playback already was. decoder_open() takes measurably longer for a long
- * file needing to scan/build a seek index (most formats here) than for one
- * whose header states total_frames outright (FLAC's STREAMINFO), which is
- * why this was mostly seen on 40+ minute songs and not reported for FLAC.
- *
- * Fix: store the percentage together with playback_generation. The playback
- * thread converts it using the decoder for that same generation. It
- * therefore cannot combine the previous track's duration with the newly
- * requested track's path. */
+/* Seeks to a percentage of the currently playing track. Stores the percentage
+ * alongside playback_generation so the audio thread converts it using the
+ * correct decoder metadata for that generation. */
 void audio_seek_percent(double percent) {
     pthread_mutex_lock(&audio_mutex);
     if (!active_path || (current_format_info.valid && current_format_info.is_stream)) {
@@ -3179,64 +3024,12 @@ bool audio_get_current_format_info(audio_current_format_info_t * out) {
     return valid;
 }
 
-/* Human loudness perception is roughly logarithmic, so a raw linear
- * amplitude scale (gain == percent) crams nearly the entire perceptible
- * range into the bottom ~10-20% of the slider and makes the rest barely
- * distinguishable -- real-device feedback comparing against stock: "volume
- * on 2 corresponds to volume in 20 on the stock OS", i.e. stock isn't
- * linear either. This maps the UI's 0-100% onto MIN_VOLUME_DB..0dB
- * linearly in dB (the standard "audio taper" essentially all real volume
- * controls use) and converts that to the actual linear multiplier
- * apply_gain() needs. 0% is always true silence, not just -50dB.
- *
- * Real-device feedback, two rounds: first "setting it to 1 is equivalent of
- * setting it to 15/20 in the stock player" (low settings too loud), then --
- * after a first attempt at a fix that reshaped this into a curve via a
- * TAPER_EXPONENT < 1 on (1-percent), keeping it closer to the MIN_VOLUME_DB
- * floor for a larger share of the low end -- "volume from 1% to 20% is
- * almost the same with unnoticeable change", because that exponent
- * compressed the wrong thing: it reduced absolute loudness at low percents,
- * but it also compressed the dB *spacing* between adjacent low percents
- * (1% and 20% landed only ~5dB apart instead of the plain linear taper's
- * ~9.5dB), which is the opposite of what "too loud, and also want to still
- * be able to tell settings apart" calls for. Reverted the exponent entirely
- * -- back to a plain, equal-dB-per-percent linear taper, which is what
- * actually preserves even, distinguishable steps -- and widened the floor
- * itself instead (-50dB to -70dB) so a given low percent is genuinely
- * quieter in absolute terms without touching how much the curve moves per
- * percent point. At 1%: -69.3dB (was -49.5dB). At 20%: -56dB (was -40dB) --
- * a ~13dB gap between those two, comfortably audible, instead of the
- * exponent version's ~5dB. Still a best-effort widening pending real
- * side-by-side percent/step reference points against stock, not a precise
- * fit. */
+/* Maps UI volume (0-100%) to a logarithmic audio taper in dB (MIN_VOLUME_DB..0dB),
+ * converted to a linear multiplier for apply_gain(). 0% is true silence. */
 #define MIN_VOLUME_DB (-70.0)
-/* Real-device comparison against stock: stock's own max volume was audibly
- * louder than ours at the time, when this taper's 100% still meant exactly
- * 1.0x (0dB) digital gain with the hardware DAC's own "Left"/"Right Playback
- * Volume" registers believed to be unusable (raw 0, thought to be their only
- * usable setting). A digital-only +6dB boost zone at the top of the slider
- * was added to close that gap, then later removed once the hardware
- * registers turned out to be a real, working attenuator after all (see
- * volume_db_to_hw_raw()'s own comment) -- with hardware actually carrying
- * the taper down from raw 0 (its own loudest point, confirmed live to
- * already be louder than stock's own boosted max), there was no gap left
- * to close, and live listening confirmed the digital boost only added noise
- * without a worthwhile loudness gain on top of that. apply_gain() still
- * hard-clips any sample that would overflow int16 range rather than
- * wrapping, for replaygain or any other gain source that can exceed unity. */
-/* Real-device stock-player calibration (2026-08-18): this app's 50% was
- * reported to match only about 27% on the stock player, and most of the
- * useful loudness arrived abruptly above 75%. Modeling that measured
- * mapping as stock = ours^k gives k=log(.27)/log(.50)=1.889; applying its
- * inverse (1/k ~= .529) before the existing equal-dB taper makes a UI value
- * represent approximately the same perceived position as stock. Rounded to
- * 0.53 rather than pretending the ear comparison has laboratory precision.
- *
- * Resulting anchors (versus the old linear-dB curve): 25% -36.4dB (was
- * -52.5), 50% -21.5dB (was -35), 75% -9.9dB (was -17.5), 100% 0dB. This
- * raises the previously unusable low/mid range while flattening dB spacing
- * near the top, eliminating the perceived >75% surge. 0% remains handled
- * separately as true silence, so pow(0, exponent) never compromises mute. */
+
+/* Curve exponent applied before the equal-dB taper to calibrate volume progression
+ * across the 0-100% range. */
 #define VOLUME_CURVE_EXPONENT 0.53
 
 static double calibrated_taper_db(double percent) {
@@ -3245,36 +3038,11 @@ static double calibrated_taper_db(double percent) {
     return MIN_VOLUME_DB * (1.0 - pow(percent, VOLUME_CURVE_EXPONENT));
 }
 
-/* Real-device investigation: applying this entire taper digitally (the only
- * option before this) shrinks the *used* range of a 16-bit PCM sample at low
- * volumes, which is audible as noise -- a real complaint ("noticeable noise
- * in the lower end"). The codec's own "Left"/"Right Playback Volume" ALSA
- * controls (raw 0-255, no TLV/dB scale published -- `amixer contents` shows
- * `access=rw------`, no R flag) turn out to be a real, working hardware
- * attenuator, despite `amixer cget` making them look broken: cget always
- * reports 0 no matter what was last written (confirmed live, same-shell
- * write-then-read-back), but the write itself demonstrably reaches the DAC
- * and audibly changes output level -- confirmed live, ear-to-speaker, at
- * several raw values with real playback running and both channels
- * independently verified. Raw 0 is the loudest point (no attenuation);
- * increasing raw attenuates further, reaching full silence around raw 230
- * (~90% of the register's range) -- also confirmed live.
- *
- * HW_VOLUME_DB_PER_STEP is an ESTIMATE, not a measured constant -- there is
- * no TLV, no datasheet, and no SPL meter available. It's derived from a
- * single live A/B: raw ~191 (75% of range) was reported as "barely
- * audible, matching stock's 5-10%", and this taper's own
- * the then-current linear taper at 7.5% worked out to about -64.75dB, giving roughly
- * 0.34dB per raw step. Treat this as a first-pass calibration that will
- * very likely need live tuning against real listening feedback, the same
- * way MIN_VOLUME_DB above needed two rounds before it matched
- * expectations. That history predates the later stock-player calibration
- * implemented by calibrated_taper_db() below; unlike the earlier guessed
- * exponent, the new exponent is derived from a measured 50%=stock-27%
- * anchor and deliberately corrects the opposite problem (low/mid range too
- * quiet, with loudness crowded above 75%). */
+/* Hardware volume mapping: the codec's "Left"/"Right Playback Volume" ALSA controls
+ * provide hardware attenuation. Raw 0 is maximum volume (0dB attenuation), with
+ * higher raw values providing increasing attenuation up to full mute. */
 #define HW_VOLUME_DB_PER_STEP 0.34
-#define HW_VOLUME_MAX_RAW 230 /* confirmed live: full silence by here */
+#define HW_VOLUME_MAX_RAW 230 /* full attenuation / silence */
 
 static int volume_db_to_hw_raw(double db) {
     if (db >= 0.0) return 0; /* hardware's loudest point -- can't go past it */
@@ -3284,81 +3052,27 @@ static int volume_db_to_hw_raw(double db) {
 }
 
 /* Plugin-supplied alternative to volume_db_to_hw_raw()/calibrated_taper_db()
- * above -- lets a plugin own the entire UI-volume -> hardware-register
- * mapping (e.g. to reproduce a real device's own Low/Medium/High Gain
- * curves, or any other custom curve) instead of this app's own single
- * built-in taper. HW_VOLUME_CURVE_LEN (audio.h, shared with
- * plugin_manager.c's own validation) matches the real stock firmware's
- * own per-gain-mode table shape (ot_devices.json's VOLUMES[0].Gains[*],
- * one entry per UI volume 0-100 inclusive), not an arbitrary choice --
- * see audio_set_custom_hw_volume_curve()'s own doc comment in audio.h.
+ * allowing plugins to define custom UI-volume to hardware-register mappings.
  *
- * LIVE state -- the only pair compute_hw_raw() below ever reads. Mutated
- * ONLY by audio_set_custom_hw_volume_curve() (the immediate, live-plugin-
- * callback path) and audio_commit_hw_volume_curve() (which installs
- * whatever is currently staged, see the STAGED pair right below) --
- * NEVER directly by audio_stage_custom_hw_volume_curve(). This separation
- * is what actually keeps a concurrent volume-slider request (processed
- * on audio_request_volume()'s own background worker thread, which can
- * call audio_apply_volume() -- an unconditional, immediate hardware
- * write -- at any moment) from ever reading or writing a plugin (re)load
- * transaction's not-yet-committed intermediate state; see
- * audio_stage_custom_hw_volume_curve()'s own doc comment in audio.h for
- * the full reasoning. */
+ * LIVE state read by compute_hw_raw(). Mutated only by audio_set_custom_hw_volume_curve()
+ * and audio_commit_hw_volume_curve(). */
 static bool custom_hw_curve_active = false;
 static uint8_t custom_hw_curve[HW_VOLUME_CURVE_LEN];
 
-/* STAGED state -- plugin_manager.c's own (re)load-transaction scratch
- * space. Mutated freely during a transaction (plugin_manager_deinit()'s
- * own reset, each plugin's own set_hw_volume_curve() calls during its own
- * top-level run, a failed plugin's rollback to an earlier snapshot) with
- * zero effect on the LIVE pair above -- and so zero effect on
- * compute_hw_raw()/audio_apply_volume() -- until
- * audio_commit_hw_volume_curve() installs it. Zero-initialized to
- * "inactive/native", same as the live pair, which is exactly correct for
- * the very first plugin_manager_init() at boot (no preceding
- * plugin_manager_deinit() call to stage anything first). */
+/* STAGED state scratch space used during plugin (re)load transactions,
+ * committed to LIVE state via audio_commit_hw_volume_curve(). */
 static bool staged_hw_curve_active = false;
 static uint8_t staged_hw_curve[HW_VOLUME_CURVE_LEN];
 
-/* Hardware carries the whole taper (see volume_db_to_hw_raw()'s own comment
- * for the real-device investigation behind this); digital gain stays
- * pinned at unity throughout, including 100%, which lands at raw 0 /
- * digital 1.0 -- the hardware's own loudest point. A digital boost mode
- * that pushed louder than that was tried and removed: raw 0 alone was
- * already confirmed live to be as loud as, or louder than, stock's own
- * "boosted" max, and adding digital gain on top of it only brought back
- * the same digital-attenuation-shaped noise this whole redesign exists to
- * avoid, for no worthwhile loudness gain. */
-/* Real-device bug report: volume did nothing with a USB headphone/DAC
- * connected. Hardware attenuation (audio_output_request_hw_volume_raw() below)
- * only ever reaches this device's own internal codec -- USB output instead
- * pipes raw PCM to a separate `aplay -D plughw:<card>,0` process/ALSA card
- * that never touches that mixer (see audio_output_is_usb_active()'s own
- * comment in audio_output.h). The hardware write and unity-gain pin below
- * still run unconditionally first, exactly as before (a harmless no-op for
- * USB, and for Bluetooth too, and still correct for local output) -- only
- * for USB specifically is volume_gain then overwritten with a real digital
- * taper afterward. Deliberately NOT applied for Bluetooth: an earlier
- * attempt applied this same digital fallback whenever output wasn't local
- * (Bluetooth included) and was reverted after a real-device report of
- * double-attenuated (too quiet) Bluetooth audio -- Bluetooth volume is
- * already handled by a completely separate, working AVRCP-based mechanism
- * (bluetooth_control.c's bt_source_vol_sync_thread_func()) that has
- * nothing to do with this app's own PCM gain, so it must be left alone. */
-/* Shared by audio_apply_volume(), audio_set_custom_hw_volume_curve(), and
- * audio_commit_hw_volume_curve() below -- factored out (rather than
- * duplicated) so they can't drift apart. Caller must already hold
- * audio_mutex. Reads ONLY the LIVE custom_hw_curve_active/custom_hw_curve
- * pair, never the separate STAGED one -- see that pair's own comment,
- * right above, for why that separation is required. */
+/* For local output, hardware attenuation is used and digital volume_gain remains 1.0.
+ * For USB DAC output, hardware mixer controls do not apply to the USB stream, so
+ * digital attenuation is applied instead. Bluetooth volume is managed separately
+ * via AVRCP.
+ *
+ * Shared helper for volume calculation. Caller must hold audio_mutex. */
 static int compute_hw_raw(float vol) {
     if (custom_hw_curve_active) {
-        /* curve[0] stands in for the native-taper branch's own
-         * HW_VOLUME_MAX_RAW mute case -- a plugin curve owns its own
-         * index-0 entry entirely (real device curves put an explicit,
-         * possibly different, mute-register value there rather than
-         * reusing this app's native constant). */
+        /* Use plugin curve index 0 for mute when vol <= 0.0f. */
         int idx = (vol <= 0.0f) ? 0 : (int) lround((double) vol * 100.0);
         if (idx < 0) idx = 0;
         if (idx > 100) idx = 100;

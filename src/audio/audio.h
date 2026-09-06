@@ -100,23 +100,9 @@ void audio_set_crossfade_enabled(bool enabled);
  * audio-thread wakeups. Normal batches are restored immediately on wake. */
 void audio_set_low_power_mode(bool enabled);
 
-/* Routes playback to a connected Bluetooth a2dp-source sink (headphones/
- * speaker this device is streaming TO) instead of the local hardware
- * output, or back to local when disabled. Real-device bug: pairing/
- * connecting Bluetooth headphones worked (bluealsa already runs in
- * a2dp-source profile from boot, and the AVDTP connection itself completed
- * fine), but no audio ever played -- this app's output device was
- * hardcoded to the local ALSA card via tinyalsa, which can only address
- * numbered hw: cards directly and has no way to reach bluealsa's PCM at
- * all (that's only reachable through the full ALSA library's plugin
- * system, see audio.c). The GUI calls this whenever its own Bluetooth
- * connection-state poll changes (see poll_refresh_bt_icon() in gui.c),
- * gated on Bluetooth DAC mode being off (DAC mode swaps bluealsa to
- * a2dp-sink -- receiving audio, not sending -- so there's no source
- * profile for this device's own playback to route into while it's on).
- * Cheap to call repeatedly with the same value: only actually reopens the
- * output device (see ensure_device() in audio.c) if the requested target
- * differs from what's currently open, same as a sample-rate change does. */
+/* Routes playback to a connected Bluetooth A2DP source sink instead of the
+ * local hardware output, or back to local when disabled. Reopens output only
+ * if the destination has changed. */
 void audio_set_bt_output(bool enabled);
 
 /* Same shape as audio_set_bt_output() above, for an externally connected

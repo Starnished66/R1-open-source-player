@@ -17,8 +17,16 @@ bool audio_is_playing(void) {
     return false;
 }
 
-/* cover_decode.c also references lodepng; this JPEG-only test does not link
- * lodepng.c (it pulls the rest of LVGL). Stubs make PNG inspect/decode fail. */
+/* Model the LVGL fork's descriptor ownership contract without linking LVGL.
+ * This exercises the adapter, not PNG decompression itself. */
+static bool mock_png;
+static unsigned mock_png_error;
+static unsigned mock_png_destroyed;
+void lv_draw_buf_destroy(lv_draw_buf_t * buf) {
+    free(buf->data);
+    free(buf);
+    mock_png_destroyed++;
+}
 void lodepng_state_init(LodePNGState * state) {
     memset(state, 0, sizeof(*state));
 }
@@ -29,6 +37,10 @@ unsigned lodepng_inspect(unsigned * w, unsigned * h, LodePNGState * state, const
     (void) state;
     (void) in;
     (void) insize;
+    if (mock_png) {
+        *w = *h = 2;
+        return 0;
+    }
     if (w) *w = 0;
     if (h) *h = 0;
     return 1;
@@ -36,6 +48,16 @@ unsigned lodepng_inspect(unsigned * w, unsigned * h, LodePNGState * state, const
 unsigned lodepng_decode24(unsigned char ** out, unsigned * w, unsigned * h, const unsigned char * in, size_t insize) {
     (void) in;
     (void) insize;
+    if (mock_png) {
+        lv_draw_buf_t * buf = calloc(1, sizeof(*buf));
+        buf->data_size = 16;
+        buf->data = calloc(1, buf->data_size);
+        /* Packed RGB24, despite the allocation's four-byte-per-pixel size. */
+        for (int i = 0; i < 4; i++) buf->data[i * 3] = 255;
+        *out = (unsigned char *) buf;
+        *w = *h = 2;
+        return mock_png_error;
+    }
     if (out) *out = NULL;
     if (w) *w = 0;
     if (h) *h = 0;
@@ -294,7 +316,32 @@ static void test_malformed_and_oversized(void) {
     CHECK(pixels == NULL);
 }
 
+static void test_png_draw_buffer_ownership(void) {
+    BEGIN_TEST("png_draw_buffer_ownership");
+    const uint8_t signature[8] = {0x89, 'P', 'N', 'G', 13, 10, 26, 10};
+    mock_png = true;
+    const unsigned errors[] = {0, 83, 1};
+    const cover_decode_result_t expected[] = {
+        COVER_DECODE_OK, COVER_DECODE_FAIL_ALLOC, COVER_DECODE_FAIL_UNSUPPORTED
+    };
+    for (unsigned i = 0; i < 3; i++) {
+        mock_png_error = errors[i];
+        uint16_t * pixels = NULL;
+        unsigned destroyed = mock_png_destroyed;
+        CHECK(cover_decode_to_rgb565_ex(signature, sizeof(signature), 2, 2,
+              ARTWORK_PRIO_PLAYER, NULL, NULL, &pixels) == expected[i]);
+        CHECK(mock_png_destroyed == destroyed + 1);
+        if (i == 0) {
+            CHECK(pixels != NULL);
+            if (pixels) for (int p = 0; p < 4; p++) CHECK(pixels[p] == 0xf800);
+        } else CHECK(pixels == NULL);
+        free(pixels);
+    }
+    mock_png = false;
+}
+
 int main(void) {
+    test_png_draw_buffer_ownership();
     test_jpeg_scale_for_target();
     test_tjpgd_scaled_geometry_and_bgr();
     test_cover_decode_red_each_scale();

@@ -12,7 +12,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef HOST_BUILD
 #include <execinfo.h>
+#endif
 
 #include "gui.h"
 
@@ -38,7 +40,9 @@
 #define SCREEN_WIDTH BOARD_SCREEN_WIDTH
 #define SCREEN_HEIGHT BOARD_SCREEN_HEIGHT
 
+#ifdef HOST_BUILD
 static volatile sig_atomic_t running = 1;
+#endif
 
 /* Custom tick interface for LVGL timing (replaces older thread-based ticks) */
 static uint32_t custom_tick_get(void) {
@@ -264,6 +268,22 @@ void boot_checkpoint(const char * step) {
 }
 #endif
 
+#ifdef HOST_BUILD
+/* Host-only dev convenience: backtrace()/backtrace_symbols_fd() aren't
+ * guaranteed async-signal-safe (both can touch malloc/stdio internals), and
+ * exit() runs atexit handlers and flushes stdio -- none of that is safe to
+ * re-enter from inside a signal handler if the crash happened while the
+ * crashing thread already held one of those same locks (exactly the case
+ * for a SIGABRT raised by a heap-corruption check, which is the realistic
+ * way SIGABRT actually fires). On the real device this handler being wired
+ * to SIGABRT could turn a clean, supervisor-recoverable crash into a hang:
+ * run_player_supervised() (src/bootloader/main.c) waits on this process to
+ * actually exit before deciding whether to reboot, so a hang here means no
+ * recovery reboot ever fires. Kept for HOST_BUILD only, where there is no
+ * supervisor/reboot contract to break and a best-effort backtrace during
+ * local dev testing is worth the trade-off. Device crashes still go through
+ * the SA_ONSTACK-based crash_diag_handler below, which sticks to raw
+ * write()/_exit() for exactly this reason. */
 // handler for signals that indicate crashes like SIGSEGV or SIGABRT
 void crash_handler(int sig) {
     void *buffer[128];
@@ -277,6 +297,13 @@ void crash_handler(int sig) {
     exit(1);
 }
 
+/* Host-only: lets Ctrl-C in the terminal cleanly exit the SDL simulator
+ * window instead of the OS just killing the process. Deliberately not
+ * enabled on the real device -- see main()'s own comment at the signal()
+ * call site below for why running the same "clean exit(0)" path there
+ * would be a real regression (the bootloader treats exit(0) as an
+ * intentional poweroff request, not something a stray SIGINT should ever
+ * trigger). */
 // handler for SIGINT
 static void sigint_handler(int sig) {
 	(void)sig;
@@ -284,6 +311,7 @@ static void sigint_handler(int sig) {
 
 	// TODO: add more cleanup (like turning off the screen)
 }
+#endif
 
 int main(int argc, char ** argv) {
     /* Ignore SIGPIPE process-wide: a Bluetooth disconnect during playback
@@ -292,9 +320,11 @@ int main(int argc, char ** argv) {
      * just returning EPIPE (which audio_output_write() already handles
      * correctly). Must run before anything else opens a subprocess pipe. */
     signal(SIGPIPE, SIG_IGN);
+#ifdef HOST_BUILD
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
     signal(SIGINT, sigint_handler);  // interrupt handling (ctrl-c in terminal)
+#endif
 
 #ifndef HOST_BUILD
     struct sigaction crash_sa;
@@ -489,7 +519,20 @@ int main(int argc, char ** argv) {
     unsigned perf_handler_calls = 0;
     unsigned perf_handler_over_16ms = 0;
 #endif
-    while(running) {
+    /* HOST_BUILD only: a stray SIGINT on the real device must NOT reach this
+     * loop's exit path -- falling through to gui_deinit(); return 0; makes
+     * run_player_supervised() (src/bootloader/main.c) treat it as a clean,
+     * intentional shutdown request and power the device off. sigint_handler
+     * is only ever wired up under HOST_BUILD (see main()'s own signal()
+     * call above), so `running` never leaves 1 on-device either way, but
+     * looping on the literal constant here keeps that guarantee visible at
+     * the one place it actually matters instead of relying on a variable
+     * defined and set far away. */
+#ifdef HOST_BUILD
+    while (running) {
+#else
+    while (1) {
+#endif
         uint32_t real_tick = custom_tick_get();
         lv_tick_inc(real_tick - last_real_tick);
         last_real_tick = real_tick;

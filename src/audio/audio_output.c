@@ -30,11 +30,7 @@ typedef enum {
     OUTPUT_TARGET_USB,
 } output_target_t;
 
-/* See audio_output_set_bt_requested()/_set_usb_requested()'s doc comments
- * in audio_output.h for the real-device bug this exists to fix (originally
- * found/fixed for audio.c's own playback path; this file is that same fix,
- * extracted so usb_dac_bridge.c can share it rather than re-deriving it).
- * requested_target is set from the GUI thread (poll_refresh_bt_icon() ->
+/* requested_target is set from the GUI thread (poll_refresh_bt_icon() ->
  * audio_set_bt_output()/usb_dac_bridge_set_bt_output(), or the USB Audio
  * Output poll -> audio_output_set_usb_requested()); active_target records
  * which output audio_output_ensure() actually has open right now, so a
@@ -160,66 +156,13 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
         active_format = config.format;
         active_low_latency = low_latency;
         if (low_latency) {
-            /* Real-device bug report: AirPlay had "significantly more audio
-             * delay than stock player" -- the stock firmware's shairport
-             * invocation (-o ot) writes straight to hardware from within
-             * shairport itself; this app instead relays through a FIFO into
-             * this shared local ALSA path, whose standard tuning below adds
-             * its own ~186ms start_threshold on top with no decoder-timing
-             * reason for a live source (AirPlay currently, and the USB DAC
-             * bridge -- see this function's own callers) to pay it.
-             *
-             * period_size=1024/period_count=2 (~21ms buffer) was tried here
-             * first and caused a real-device regression when the USB DAC
-             * bridge used it ("completely broken... not emitting any sound
-             * at all"). Root-caused with a standalone tinyalsa probe run
-             * directly on this hardware (same card/device/channels/rate/
-             * format as here): pcm_open()'s hw_params negotiation rejects
-             * that exact (period_size, period_count) pair outright with
-             * EINVAL, not an underrun -- this hardware/driver enforces a
-             * 1024-frame minimum period and only accepts specific
-             * (period_size, period_count) pairs, not a free choice of
-             * buffer size. The same probe swept nearby configs on the real
-             * device: 2048x2, 1024x3, 2048x3, and 4096x2 all also failed
-             * hw_params, while 1024x4 (4096-frame buffer, ~43ms at 96kHz --
-             * half of the ~85ms standard config below) succeeded, including
-             * repeated pcm_writei() calls with no failures. That's the
-             * config used here. It has not been verified under sustained
-             * real playback jitter (screen redraws, database/artwork
-             * activity, Wi-Fi) the way the standard config's four periods
-             * were tuned for -- if AV sync is still off or new dropouts
-             * appear, that's the next thing to check, not another blind
-             * period_count change. */
+            /* Low-latency buffer tuning: 1024 frames x 4 periods (~43ms at 96kHz)
+             * to reduce latency for live sources like AirPlay. */
             config.period_size = 1024;
             config.period_count = 4;
         } else {
-            /* The original 1024-frame period woke this single-core device
-             * about 43 times/sec at 44.1 kHz even when the decoder supplied
-             * 8192-frame screen-off batches. A 2048-frame period halves
-             * kernel/ALSA period wakeups while retaining ~46 ms period
-             * granularity; four periods provide ~186 ms of underrun
-             * protection, still below the app's existing 500 ms hardware-
-             * button dispatch interval. */
-            /* Confirmed on real R1 hardware for S24_LE too, not just assumed
-             * carried over from S16_LE: tools/s24_hw_params_probe.c swept
-             * period_count in {2,3,4} at every period_size the S16_LE probe
-             * above tried (512/1024/2048/4096/8192), across all 8 standard
-             * rates 44.1kHz-384kHz and both mono/stereo, all at
-             * PCM_FORMAT_S24_LE. Every single period_count=2 and
-             * period_count=3 combination failed hw_params with EINVAL, at
-             * every rate and channel count with no exception; every
-             * period_count=4 combination succeeded (negotiation AND three
-             * real pcm_writei() calls), also with no exception. Same
-             * period_count=4 requirement the S16_LE probe above already
-             * found, now confirmed rate/format-independent rather than an
-             * assumption -- this hardware's I2S/DMA path apparently just
-             * requires exactly 4 periods regardless of format or rate. So
-             * 2048x4 (this branch) and 1024x4 (the low_latency branch above)
-             * were already the right choice for S24_LE, not a guess left
-             * over from S16_LE tuning. Not yet verified under sustained real
-             * playback jitter at S24_LE specifically (screen redraws,
-             * library scans, Wi-Fi) -- same caveat the low_latency S16_LE
-             * config above still carries. */
+            /* Standard buffer tuning: 2048 frames x 4 periods (~186ms buffer)
+             * to balance wakeup frequency and underrun protection. */
             config.period_size = 2048;
             config.period_count = 4;
         }
@@ -236,15 +179,8 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
             if (alsa_pcm) pcm_close(alsa_pcm);
             alsa_pcm = NULL;
             if (!want_s24) return false;
-            /* S24_LE hw_params negotiation failed -- rather than aborting the
-             * whole track (the previous behavior), fall back to the exact
-             * same S16_LE config every non-wide track already uses. Record
-             * the failure so audio_output_ensure() stops re-requesting S24_LE
-             * for this (channels, rate) on every subsequent chunk -- see
-             * s24_unsupported_known's own comment. The caller (audio.c) must
-             * re-check audio_output_is_s24_active() after this call returns
-             * and use the s16 decode/process/write path when it's false;
-             * it must not assume its own want_s24 request was honored. */
+            /* Fall back to S16_LE if S24_LE hw_params negotiation fails, and record
+             * the unsupported format so subsequent chunks do not re-probe. */
             DBG_LOG("audio_output: S24_LE open failed, falling back to S16_LE\n");
             s24_unsupported_known = true;
             s24_unsupported_channels = channels;
@@ -288,21 +224,8 @@ bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool l
         want_s24 = false;
     }
 
-    /* Real-device bug: aplay can die entirely on its own (BlueZ tearing
-     * down the transport underneath it -- a headset bonding hiccup during
-     * testing was one confirmed trigger, but any A2DP renegotiation could
-     * do the same; the same class of thing could happen to a USB DAC being
-     * unplugged mid-stream) while requested_target never changes (this
-     * app's own connection polls still report "connected" for a beat after
-     * the specific audio transport actually died). The active_target !=
-     * requested_target check below alone can't catch that -- both sides
-     * still agree on the target -- so a dead aplay would otherwise go
-     * unnoticed forever, with every future write() failing instantly and
-     * audio_output_write()'s own pacing fallback silently swallowing every
-     * chunk. Checking liveness (WNOHANG, not a blocking wait -- this runs
-     * on the hot path) here catches it and forces the reopen below to
-     * actually respawn aplay, the same as if the target itself had
-     * changed. */
+    /* Check if aplay died unexpectedly (e.g. transport disconnect) to force
+     * reopening even if the requested output target has not changed. */
     if (active_target == OUTPUT_TARGET_BT && bt_aplay_pid >= 0) {
         int status;
         if (waitpid(bt_aplay_pid, &status, WNOHANG) == bt_aplay_pid) {
@@ -524,23 +447,8 @@ static int detect_output_port(void) {
     return OUTPUT_PORT_HEADSET;
 }
 
-/* Actual mixer write for output-port routing -- only ever called from
- * volume_worker_main() below, never directly from the UI thread. See
- * audio_output_sync_balanced_output()'s own comment for why: get_alsa_
- * mixer()'s lazy-init (alsa_mixer above) and this function's own cached
- * mixer_ctl* have no locking of their own, matching audio_output_set_hw_
- * volume_raw()'s identical pattern just above -- that one has always been
- * safe in practice because its ONLY caller is this same dedicated worker
- * thread (audio_output_request_hw_volume_raw()'s queueing wrapper), never
- * called directly from elsewhere. Real-device review finding: an earlier
- * version of this function ran the mixer I/O directly on the LVGL/UI
- * thread on every 500ms tick, racing this worker thread's own unsynchronized
- * access to the exact same alsa_mixer/mixer_ctl statics whenever a volume
- * drag happened to land in the same window -- moved here to close that
- * gap the same way volume writes already avoid it, rather than adding a
- * new lock (this file has no other locks besides the queue below; adding
- * one just for this would be a second synchronization mechanism doing the
- * same job the existing worker-thread serialization already does). */
+/* Actual mixer write for output-port routing -- called from volume_worker_main()
+ * to serialize access to ALSA mixer controls alongside hardware volume updates. */
 static void apply_output_port(int port) {
     static struct mixer_ctl * port_ctl = NULL;
     static bool port_ctl_lookup_done = false;

@@ -49,18 +49,8 @@ static double preamp_db = 0.0;
 static unsigned int coeffs_sample_rate = 0;
 static bool coeffs_dirty = true;
 
-/* Real bug caught in a third review pass: preamp_linear was still
- * recomputed via pow() on every single peq_process() call, unlike the
- * limiter's own attack/release coefficients right below (which got the
- * cached-and-invalidated treatment in the previous pass). Cached here and
- * kept in sync by every one of preamp_db's own write sites (peq_set_
- * preamp_db(), set_defaults(), and peq_load_from_path()'s profile-loading
- * parse loop -- that last one writes preamp_db directly rather than through
- * the setter, which is exactly why an earlier pass left this one
- * uncached: a cache only keyed off "did the setter run" would go stale on
- * every profile load. update_preamp_linear_cache() is the one recompute
- * point every write site calls afterward instead, so there's no unguarded
- * write path left. */
+/* Cached linear preamp factor (10^(preamp_db / 20.0)), updated whenever
+ * preamp_db changes to avoid recomputing pow() during audio processing. */
 static float cached_preamp_linear = 1.0f;
 
 static void update_preamp_linear_cache(void) {
@@ -68,21 +58,9 @@ static void update_preamp_linear_cache(void) {
 }
 
 /* Peak limiter -- stereo-linked (one shared gain-reduction envelope across
- * channels, rather than independent per-channel), so a loud transient
- * doesn't shift the stereo image the way independent per-channel gain
- * reduction would. Engages only when the preamp/EQ stage's own output would
- * exceed full scale -- unboosted material never pulls limiter_gain below
- * 1.0, so normal EQ use (cuts, or boosts that stay within headroom) sounds
- * completely unaffected. Real-device bug report: the "Loudness Boost"
- * example plugin (raises this same preamp via plugin.eq_set_preamp())
- * distorted audibly at anything above a few dB of boost -- a bare linear-
- * gain-then-hard-clip signal chain (peq_process()'s previous behavior)
- * clips almost any normally-mastered track well before +12dB, the plugin's
- * own max. This replaces that flat clamp with real gain reduction; the
- * int16 clamp still in peq_process() below is now just a belt-and-
- * suspenders safety net for the one sample a no-lookahead limiter can't
- * react in time for (e.g. a sudden transient's very first sample), not the
- * primary anti-clipping mechanism. */
+ * channels) so a loud transient does not shift the stereo image. Engages only
+ * when the preamp/EQ stage's output would exceed full scale, leaving unboosted
+ * audio unaffected. */
 static float limiter_gain = 1.0f; /* current linear gain reduction, 1.0 = none */
 
 /* One-pole envelope-follower time constants -- attack fast enough to catch
@@ -102,15 +80,9 @@ static float limiter_gain = 1.0f; /* current linear gain reduction, 1.0 = none *
  * i.e. 32760 * 256 = 8386560.0f). */
 #define LIMITER_CEILING_S32 8386560.0f
 
-/* attack/release coefficients only actually depend on sample_rate (the two
- * time constants above are fixed), so they're computed alongside the biquad
- * coefficients in recompute_all_coeffs() below -- gated by the exact same
- * coeffs_dirty/coeffs_sample_rate check that function already correctly
- * maintains -- rather than via two fresh exp() calls on every single
- * peq_process() invocation regardless of whether anything actually changed
- * since the last one. Real-device concern caught in review: this is a
- * single-core MIPS target, and peq_process() runs on every decoded audio
- * buffer for as long as any EQ/preamp is active, not just once per track. */
+/* Attack and release coefficients recomputed alongside biquad coefficients in
+ * recompute_all_coeffs() whenever sample_rate changes to avoid redundant exp()
+ * calls during audio processing. */
 static float cached_attack_coeff = 0.0f;
 static float cached_release_coeff = 0.0f;
 
@@ -160,22 +132,8 @@ static void compute_band_coeffs(int index, unsigned int sample_rate) {
          * Web Audio API's BiquadFilterNode uses for lowshelf/highshelf)
          * rather than the RBJ cookbook's alternate S/slope parameter, so
          * every band type shares the same Q control in the UI. */
-        /* Real-device bug report: enabling the high-shelf band (or the
-         * low-shelf band -- both use this same formula) with a boosted/cut
-         * gain and a high enough Q muted the entire device, not just this
-         * band, surviving even a disable until a full settings reset.
-         * Root cause: this term goes negative for any gain != 0dB once Q is
-         * large enough (e.g. +12dB with Q >= ~5, both reachable on the real
-         * gain -12..+12dB / Q 0.1..10.0 sliders) -- sqrt() of a negative
-         * number is NaN, and NaN in one band's biquad state poisons every
-         * later band in the cascade and the final output permanently until
-         * that state is reset, matching "disabling didn't visibly help
-         * until a broader reset." Clamped to 0 (the RBJ cookbook shelf
-         * formula's own well-defined floor -- alpha simply saturates
-         * rather than going complex) rather than restricting the Q/gain
-         * sliders themselves, so no currently-valid slider combination
-         * changes behavior, only the ones that were already silently
-         * broken. */
+        /* Clamp under_sqrt to 0 to prevent complex values and NaN when
+         * calculating alpha at high Q settings. */
         double under_sqrt = (A + 1.0 / A) * (1.0 / q - 1.0) + 2.0;
         if (under_sqrt < 0.0) under_sqrt = 0.0;
         double alpha = (sin_w0 / 2.0) * sqrt(under_sqrt);
@@ -267,18 +225,8 @@ void peq_set_band_enabled(int index, bool enabled) {
 }
 
 void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int sample_rate) {
-    /* Real bug caught in review: limiter_gain is continuous smoothing state
-     * (same idea as the biquad state[] below), but neither of the two
-     * inactivity paths reset it -- so a limiter that was mid-gain-reduction
-     * (e.g. from a loud, heavily-boosted track) stayed frozen at that
-     * reduced value across a bypass toggle or a preamp/all-bands-off period
-     * with NO chance to recover toward unity (this function returns before
-     * ever reaching the envelope-follower code below). Re-enabling
-     * processing later would then start audibly quieter than intended until
-     * the release envelope caught back up. Resetting here, at every path
-     * that skips real processing, means the limiter always starts fresh
-     * from unity the next time it's actually needed, regardless of what
-     * state it was left in before. */
+    /* Reset limiter gain to unity when processing is bypassed or inactive so
+     * that it starts cleanly the next time processing resumes. */
     if (bypass) {
         limiter_gain = 1.0f;
         return;
@@ -303,11 +251,6 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
     if (channels < 1) return;
     if (channels > PEQ_MAX_CHANNELS) channels = PEQ_MAX_CHANNELS;
 
-    /* Cached (update_preamp_linear_cache(), kept in sync by every one of
-     * preamp_db's own write sites -- see that function's own comment for
-     * why an earlier pass left this uncached and why that reasoning didn't
-     * hold up). float, not double, for the same reason biquad_coeffs_t/
-     * biquad_state_t are float -- see their own comment. */
     float preamp_linear = cached_preamp_linear;
 
     float attack_coeff = cached_attack_coeff;
@@ -338,13 +281,8 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
                 sample = y0;
             }
 
-            /* NaN fails every comparison (including the clamps below), so
-             * it would otherwise poison frame_peak/limiter_gain permanently
-             * (both just track whatever's handed to them, with no clamp of
-             * their own) -- real-device bug this session already root-
-             * caused once for the shelf-filter sqrt() above: a bad
-             * coefficient produced NaN that stuck around as a full, sticky
-             * device mute. Caught here, before it can spread. */
+            /* Discard non-finite samples to prevent NaN or Inf from poisoning
+             * the limiter gain or cascading through biquad filters. */
             if (!isfinite(sample)) sample = 0.0f;
             frame_samples[ch] = sample;
             float abs_sample = sample < 0.0f ? -sample : sample;
@@ -361,11 +299,8 @@ void peq_process(int16_t * buf, size_t frame_count, int channels, unsigned int s
 
         for (int ch = 0; ch < channels; ch++) {
             float sample = frame_samples[ch] * limiter_gain;
-            /* Belt-and-suspenders, not the primary anti-clipping mechanism
-             * anymore -- see limiter_gain's own comment. A no-lookahead
-             * limiter can't fully react to a single-sample transient before
-             * it happens, so this is the real last line of defense for
-             * that one edge case. */
+            /* Hard clamp to prevent clipping on single-sample transients that
+             * occur before the limiter envelope reacts. */
             if (sample > 32767.0f) sample = 32767.0f;
             if (sample < -32768.0f) sample = -32768.0f;
             buf[i * (size_t) channels + (size_t) ch] = (int16_t) sample;
@@ -503,10 +438,7 @@ bool peq_save_to_path(const char * path) {
         fprintf(f, "band%d_enabled=%d\n", i, bands[i].enabled ? 1 : 0);
     }
 
-    /* Do not report success until stdio and the underlying SD-card write
-     * have both completed. fclose() errors (card removed/full/read-only)
-     * were previously ignored and could produce a misleading "saved"
-     * toast even though the temp file was incomplete. */
+    /* Ensure stdio buffers and SD card writes have completed before reporting success. */
     bool write_ok = !ferror(f) && fflush(f) == 0 && fsync(fileno(f)) == 0;
     if (fclose(f) != 0) write_ok = false;
     if (!write_ok) {
@@ -515,14 +447,9 @@ bool peq_save_to_path(const char * path) {
         return false;
     }
 
-    /* rename(temp, target) is atomic and replaces target on normal POSIX
-     * filesystems, so keep that as the fast path. Some FAT/VFAT firmware
-     * combinations reject replacement when the destination already exists,
-     * which made new PEQ profiles save correctly but prevented overwriting
-     * profiles already on the SD card. Fall back to a recoverable two-step
-     * replacement: move the existing profile aside, install the completed
-     * temp file, then remove the backup. If installation fails, restore the
-     * original so an attempted overwrite never destroys the user's preset. */
+    /* Rename temp file to target. On filesystems where atomic overwrite via
+     * rename() is not supported when target exists, fall back to staging a
+     * backup copy and restoring it if installation fails. */
     if (rename(tmp_path, path) == 0) return true;
     int direct_rename_errno = errno;
     if (access(path, F_OK) != 0) {

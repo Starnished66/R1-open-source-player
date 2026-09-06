@@ -81,22 +81,8 @@ static bool prescan_adts(FILE * f, uint64_t ** out_offsets, uint64_t * out_count
         if (!parse_adts_header(header, &frame_length)) break;
 
         if (count == capacity) {
-            /* Real-device crash report: long (30+ minute) podcasts crashed
-             * outright rather than just failing to load -- this loop's
-             * per-ADTS-frame offset table (one uint64_t per frame, tens of
-             * thousands of frames for a long episode) used to realloc()
-             * without checking the result. On failure realloc() returns
-             * NULL while leaving the original block untouched, but
-             * unconditionally assigning that NULL back over `offsets` lost
-             * the only pointer to it (a leak) and the very next
-             * `offsets[count++] = ...` wrote through a NULL pointer --
-             * guaranteed to segfault, and more likely to actually happen
-             * the longer (so the bigger this table gets) the file is,
-             * matching the exact "large podcasts" report. Now grown into a
-             * temporary so a failed realloc doesn't destroy the still-valid
-             * original block, and a failure here just stops the scan with
-             * whatever frames were already found -- same fallback shape as
-             * hitting the end of the file or a corrupt frame, not a crash. */
+            /* Safely grow the frame offset table, stopping the scan and
+             * preserving existing offsets if realloc fails. */
             uint64_t new_capacity = capacity * 2;
             uint64_t * grown = realloc(offsets, sizeof(uint64_t) * new_capacity);
             if (!grown) break;

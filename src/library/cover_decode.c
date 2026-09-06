@@ -141,18 +141,30 @@ static cover_decode_result_t decode_png_rgb888(const uint8_t * data, uint32_t si
     if (!rgb888_size_ok(w, h, max_side, NULL)) return COVER_DECODE_FAIL_OVERSIZED;
     unsigned inspected_w = w, inspected_h = h;
 
-    unsigned char * pixels = NULL;
-    unsigned decode_error = lodepng_decode24(&pixels, &w, &h, data, size);
+    unsigned char * decoded = NULL;
+    unsigned decode_error = lodepng_decode24(&decoded, &w, &h, data, size);
+    /* Our LVGL LodePNG fork returns a draw-buffer descriptor, not a raw
+     * malloc buffer. RGB24 conversion writes packed RGB into its data field
+     * (the descriptor's ARGB8888 stride is allocation capacity only). */
+    lv_draw_buf_t * draw_buf = (lv_draw_buf_t *) decoded;
     if (decode_error == 83 /* LODEPNG_ERROR_OUT_OF_MEMORY */) {
+        if (draw_buf) lv_draw_buf_destroy(draw_buf);
         return COVER_DECODE_FAIL_ALLOC;
     }
-    if (decode_error != 0 || !pixels) {
+    if (decode_error != 0 || !draw_buf) {
+        if (draw_buf) lv_draw_buf_destroy(draw_buf);
         return COVER_DECODE_FAIL_UNSUPPORTED;
     }
-    if (w != inspected_w || h != inspected_h || !rgb888_size_ok(w, h, max_side, NULL)) {
-        free(pixels);
+    size_t bytes = 0;
+    if (w != inspected_w || h != inspected_h || !rgb888_size_ok(w, h, max_side, &bytes) ||
+        !draw_buf->data || draw_buf->data_size < bytes) {
+        lv_draw_buf_destroy(draw_buf);
         return COVER_DECODE_FAIL_UNSUPPORTED;
     }
+    uint8_t * pixels = malloc(bytes);
+    if (pixels) memcpy(pixels, draw_buf->data, bytes);
+    lv_draw_buf_destroy(draw_buf);
+    if (!pixels) return COVER_DECODE_FAIL_ALLOC;
 
     *out_buf = pixels;
     *out_w = (int) w;

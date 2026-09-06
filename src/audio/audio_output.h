@@ -4,55 +4,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Shared PCM output device for the target build -- local hardware (via
- * tinyalsa) or a connected Bluetooth accessory (via a piped `aplay -D
- * bluealsa`, see audio_output.c's own top-of-file comment for why), used
- * by BOTH audio.c's playback thread and usb_dac_bridge.c's USB DAC
- * bridge thread. Extracted out of audio.c (where this logic originated,
- * fixing several real-device Bluetooth-output bugs one at a time -- see
- * git history / the comments still in audio_output.c) once
- * usb_dac_bridge.c needed the exact same routing/pacing/failure-handling
- * behavior for its own, separate output stream: re-deriving it a second
- * time risked quietly missing one of those already-fixed edge cases.
+/* Shared PCM output device for the target build -- local hardware (via tinyalsa),
+ * a connected Bluetooth accessory, or USB DAC (via piped aplay). Used by both
+ * audio.c's playback thread and usb_dac_bridge.c's USB DAC bridge thread.
  *
- * Safe to share despite being plain file-scope state, not because it's
- * thread-safe for concurrent use, but because it never needs to be: only
- * one of the two callers is ever actually running at a time
- * (usb_dac_bridge_start() calls audio_stop() before touching this, and
- * usb_mode_control_apply() tears down DAC mode, including this bridge,
- * before any other mode's playback could resume) -- the same "single
- * owner at any given moment" shape audio.c's own playback thread already
- * relied on before this was ever shared.
+ * Safe to share despite being file-scope state because only one caller is active
+ * at a time (USB DAC mode stops playback before streaming; exiting DAC mode tears
+ * down the bridge before playback resumes).
  *
- * No HOST_BUILD variant: the host simulator has its own separate SDL
- * audio path (still directly inside audio.c, since usb_dac_bridge.c's
- * whole premise -- a real /dev/uac_sa USB gadget node -- doesn't exist on
- * a host build either). Callers on the target build only. */
+ * Target build only; host simulator uses SDL. */
 
-/* Opens (or reopens, if the format, low_latency mode, or the requested
- * output target -- see audio_output_set_bt_requested() below -- no longer
- * matches what's actually open) the output device for this channel count/
- * sample rate. Cheap to call repeatedly with the same values (no-ops).
- * Returns false if opening failed (device busy, aplay failed to spawn, etc).
+/* Opens (or reopens) the output device for the given format, target, and latency mode.
+ * Returns false if opening failed.
  *
- * low_latency only affects the OUTPUT_TARGET_LOCAL tinyalsa path (BT/USB go
- * through aplay's own ALSA config, unaffected either way) -- see audio_
- * output.c's open_device() for the actual period/buffer values. Real-time
- * PCM sources with no local decoder buffering ahead of audio_output_write()
- * may want true (AirPlay's own bridge does, having no decoder timing to
- * lean on); decoder-fed local file playback, and anything not yet verified
- * safe under its own live-device underrun testing (USB-DAC receive, as of
- * this writing), should pass false. Passed as a parameter rather than a
- * separate setter call specifically to close that one gap: a setter call
- * followed by a separate ensure() call left a window where a different,
- * concurrently-running caller's own setter call could land in between and
- * flip the mode this call ends up opening with. This does NOT make
- * audio_output_ensure() itself, or the shared output state it reads/writes,
- * safe under concurrent callers in general -- there is still no lock here
- * (see this file's own top comment on the "one owner at a time" convention
- * every caller is expected to honor instead). That's pre-existing
- * architectural debt this parameter doesn't attempt to fix, just one
- * specific, previously-avoidable gap within it. */
+ * low_latency configures smaller period/buffer sizes on the local tinyalsa path
+ * (e.g. for real-time sources like AirPlay). */
 bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool low_latency, bool want_s24);
 
 /* Writes frames to whatever audio_output_ensure() last successfully opened.
@@ -109,15 +75,8 @@ void audio_output_reset_s24_probe(void);
 void audio_output_close(void);
 
 /* Routes subsequent audio_output_ensure()/_write() calls to a connected
- * Bluetooth accessory instead of local hardware, or back again -- see
- * audio_set_bt_output()'s own doc comment in audio.h (the original,
- * still-current call site: gui.c's poll_refresh_bt_icon(), mirroring
- * Bluetooth connection state) for the real-device history behind this.
- * usb_dac_bridge.c's own USB-DAC-mode output should be routed by the
- * exact same signal -- see usb_dac_bridge_set_bt_output() in
- * usb_dac_bridge.h, called from the same gui.c call site. Only takes
- * effect on the next audio_output_ensure() call, same lazy-reopen
- * behavior as a format change. */
+ * Bluetooth accessory instead of local hardware. Takes effect on the next
+ * audio_output_ensure() call. */
 void audio_output_set_bt_requested(bool requested);
 
 /* Routes subsequent audio_output_ensure()/_write() calls to an external
@@ -134,21 +93,9 @@ void audio_output_set_bt_requested(bool requested);
  * format change. */
 void audio_output_set_usb_requested(bool requested, const char * alsa_device);
 
-/* Writes the codec's own hardware attenuation registers ("Left"/"Right
- * Playback Volume", raw 0-255) directly via tinyalsa's mixer API -- see
- * audio.c's volume_set_hw_raw() doc comment for the full real-device
- * investigation behind this (why it exists, what raw 0 vs increasing raw
- * values do, and the big caveat below).
- *
- * Real-device finding: this control's own .get() callback is broken -- it
- * always reports 0 regardless of what was last written, confirmed live
- * (write a non-zero value, read it back in the very same shell invocation,
- * still 0), even though the write demonstrably reaches the hardware and
- * changes real output level (also confirmed live, ear-to-speaker). This
- * function therefore never reads the control back to verify -- there is
- * nothing meaningful to read. Callers must track their own last-written
- * value if they need it. Safe to call from any thread/frequency; opens a
- * lazy, process-lifetime tinyalsa mixer handle on first use. */
+/* Writes the codec's hardware attenuation registers ("Left"/"Right Playback Volume",
+ * raw 0-255) via tinyalsa. The control is write-only as driver reads do not reflect
+ * written values; callers track written values independently if needed. */
 void audio_output_set_hw_volume_raw(int raw_left, int raw_right);
 
 /* R3 Pro II output-port routing. Picks a route (3.5mm headset vs. 4.4mm
@@ -166,20 +113,9 @@ void audio_output_sync_balanced_output(void);
  * keeping mixer I/O out of LVGL and playback callbacks. */
 void audio_output_request_hw_volume_raw(int raw_left, int raw_right);
 
-/* True only while audio_output_ensure() actually has a USB audio device
- * open (not local, not Bluetooth) -- audio.c's audio_set_volume() uses
- * this to fall back to real digital PCM gain for USB specifically, since
- * audio_output_set_hw_volume_raw() above is a no-op for it (USB PCM is
- * piped to a separate `aplay -D plughw:<card>,0` process, never touches
- * this device's own card-0 mixer -- see audio_output.c's own architecture
- * comment). Deliberately NOT also true for Bluetooth: BT volume is already
- * handled by a completely separate, working mechanism (AVRCP absolute
- * volume pushed to the connected accessory, bluetooth_control.c's
- * bt_source_vol_sync_thread_func()) that has nothing to do with this app's
- * own PCM gain -- applying digital gain there too was tried and reverted
- * after a real-device bug report of double-attenuated (too quiet)
- * Bluetooth audio. Reflects active_target, not requested_target -- what's
- * actually open right now, not merely asked for. */
+/* True only while audio_output_ensure() actually has a USB audio device open.
+ * Used to apply digital PCM gain for USB output (which bypasses the local codec mixer).
+ * Bluetooth volume is handled separately via AVRCP absolute volume rather than PCM gain. */
 bool audio_output_is_usb_active(void);
 
 #endif /* AUDIO_OUTPUT_H */

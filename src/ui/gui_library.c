@@ -1797,7 +1797,8 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
     }
     if (!atomic_load(&album_thumbnail_done)) return;
     pthread_join(album_thumbnail_thread, NULL);
-    album_thumbnail_active = false;
+    /* Keep the slot busy until all result fields are consumed. Row refreshes
+     * below can synchronously queue work and try to start the next worker. */
 
     bool result_applied = false;
 #ifdef TEST_BUILD_TAG
@@ -1860,6 +1861,7 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
     album_thumbnail_result_pixels = NULL;
     if (result_applied && album_thumbnail_result_list == album_thumbnail_active_list)
         compact_list_refresh_item(album_thumbnail_result_list, album_thumbnail_result_logical_index);
+    album_thumbnail_active = false;
     start_next_album_thumbnail();
     if (!album_thumbnail_active) lv_timer_pause(timer);
 }

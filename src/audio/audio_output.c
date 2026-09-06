@@ -1,7 +1,7 @@
 #include "audio_output.h"
 #include "debug_log.h"
 #include "subprocess.h"
-#include "balanced_output_status.h"
+#include "headphone_status.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -508,7 +508,23 @@ void audio_output_set_hw_volume_raw(int raw_left, int raw_right) {
         last_right = raw_right;
 }
 
-/* Actual mixer write for balanced-output routing -- only ever called from
+/* Route values for the R3 Pro II's "Output Port Switch" mixer control --
+ * ported from a separate, already-working player for this same hardware. */
+#define OUTPUT_PORT_HEADSET 2
+#define OUTPUT_PORT_BALANCED 3
+// TODO: add usb spdif output mode. reference https://github.com/hiby-modding/hiby_os_crack/blob/main/docs/r3proii/OUTPUT_MODES.md
+
+/* Mirrors the ported detect_output(): balanced (4.4mm) takes priority over
+ * plain 3.5mm if somehow both switch_dev nodes read connected at once,
+ * otherwise 3.5mm, otherwise 3.5mm again as the default output port. */
+static int detect_output_port(void) {
+	enum HEADPHONE_STATE headphone_state = get_headphone_state();
+    if (headphone_state == HEADPHONE_STATE_BALANCED) return OUTPUT_PORT_BALANCED;
+    if (headphone_state == HEADPHONE_STATE_HEADSET) return OUTPUT_PORT_HEADSET;
+    return OUTPUT_PORT_HEADSET;
+}
+
+/* Actual mixer write for output-port routing -- only ever called from
  * volume_worker_main() below, never directly from the UI thread. See
  * audio_output_sync_balanced_output()'s own comment for why: get_alsa_
  * mixer()'s lazy-init (alsa_mixer above) and this function's own cached
@@ -525,22 +541,21 @@ void audio_output_set_hw_volume_raw(int raw_left, int raw_right) {
  * new lock (this file has no other locks besides the queue below; adding
  * one just for this would be a second synchronization mechanism doing the
  * same job the existing worker-thread serialization already does). */
-static void apply_balanced_output(bool enabled) {
-    static struct mixer_ctl * balanced_ctl = NULL;
-    static bool balanced_ctl_lookup_done = false;
-    static int last_enabled = -1; /* -1 = never written yet */
+static void apply_output_port(int port) {
+    static struct mixer_ctl * port_ctl = NULL;
+    static bool port_ctl_lookup_done = false;
+    static int last_port = -1; /* -1 = never written yet */
 
     struct mixer * mixer = get_alsa_mixer();
     if (!mixer) return;
-    if (!balanced_ctl_lookup_done) {
-        balanced_ctl = mixer_get_ctl_by_name(mixer, "Balance Lineout En");
-        balanced_ctl_lookup_done = true;
+    if (!port_ctl_lookup_done) {
+        port_ctl = mixer_get_ctl_by_name(mixer, "Output Port Switch");
+        port_ctl_lookup_done = true;
     }
-    if (!balanced_ctl) return; /* no such control -- R1/host, or the name is wrong; safe no-op either way */
+    if (!port_ctl) return; /* no such control -- R1/host; safe no-op either way */
 
-    int value = enabled ? 1 : 0;
-    if (value == last_enabled) return;
-    if (mixer_ctl_set_value(balanced_ctl, 0, value) == 0) last_enabled = value;
+    if (port == last_port) return;
+    if (mixer_ctl_set_value(port_ctl, 0, port) == 0) last_port = port;
 }
 
 static pthread_once_t volume_worker_once = PTHREAD_ONCE_INIT;
@@ -553,25 +568,25 @@ static int volume_worker_right;
 /* Same mutex/cond as the volume request above -- one worker thread, two
  * kinds of pending work, checked together on every wake rather than
  * spinning up a second thread for something that changes this rarely. */
-static bool balanced_worker_pending = false;
-static bool balanced_worker_enabled;
+static bool output_port_worker_pending = false;
+static int output_port_worker_value;
 
 static void * volume_worker_main(void * unused) {
     (void) unused;
     for (;;) {
         pthread_mutex_lock(&volume_worker_mutex);
-        while (!volume_worker_pending && !balanced_worker_pending)
+        while (!volume_worker_pending && !output_port_worker_pending)
             pthread_cond_wait(&volume_worker_cond, &volume_worker_mutex);
         bool do_volume = volume_worker_pending;
         int left = volume_worker_left;
         int right = volume_worker_right;
         volume_worker_pending = false;
-        bool do_balanced = balanced_worker_pending;
-        bool balanced_enabled = balanced_worker_enabled;
-        balanced_worker_pending = false;
+        bool do_output_port = output_port_worker_pending;
+        int output_port = output_port_worker_value;
+        output_port_worker_pending = false;
         pthread_mutex_unlock(&volume_worker_mutex);
         if (do_volume) audio_output_set_hw_volume_raw(left, right);
-        if (do_balanced) apply_balanced_output(balanced_enabled);
+        if (do_output_port) apply_output_port(output_port);
     }
     return NULL;
 }
@@ -584,27 +599,27 @@ static void start_volume_worker(void) {
     }
 }
 
-/* UI-thread-safe half of balanced-output sync -- called every tick from
+/* UI-thread-safe half of output-port routing sync -- called every tick from
  * gui.c's update_timer_cb(). Everything here is either a plain sysfs read
- * (balanced_headphone_is_connected()) or state private to this one
- * function (own static, never touched by the worker thread), so there is
- * nothing to synchronize on this side; only the actual mixer write
- * (apply_balanced_output() above) needs to stay on the single worker
- * thread, same as hardware volume already does. */
+ * (detect_output_port()'s own calls) or state private to this one function
+ * (own static, never touched by the worker thread), so there is nothing to
+ * synchronize on this side; only the actual mixer write (apply_output_port()
+ * above) needs to stay on the single worker thread, same as hardware volume
+ * already does. */
 void audio_output_sync_balanced_output(void) {
     static int last_requested = -1; /* -1 = never requested yet */
-    int enabled = balanced_headphone_is_connected() ? 1 : 0;
-    if (enabled == last_requested) return;
-    last_requested = enabled;
+    int port = detect_output_port();
+    if (port == last_requested) return;
+    last_requested = port;
 
     pthread_once(&volume_worker_once, start_volume_worker);
     if (!volume_worker_ready) {
-        apply_balanced_output(enabled != 0);
+        apply_output_port(port);
         return;
     }
     pthread_mutex_lock(&volume_worker_mutex);
-    balanced_worker_enabled = enabled != 0;
-    balanced_worker_pending = true;
+    output_port_worker_value = port;
+    output_port_worker_pending = true;
     pthread_cond_signal(&volume_worker_cond);
     pthread_mutex_unlock(&volume_worker_mutex);
 }

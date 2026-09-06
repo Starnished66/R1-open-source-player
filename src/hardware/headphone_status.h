@@ -9,7 +9,9 @@ enum HEADPHONE_STATE {
 	HEADPHONE_STATE_BALANCED,  // 4.4mm plugged in
 };
 
-// TODO: add description
+
+// returns which headphone output is plugged in
+// if 3.5mm and 4.4mm are both plugged in, 4.4mm is prioritized
 enum HEADPHONE_STATE get_headphone_state(void);
 
 #endif

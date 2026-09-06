@@ -13,6 +13,11 @@ concurrency:
   group: weekly-staging-beta
   cancel-in-progress: false
 
+env:
+  # The checksum is a repository secret so no Staging Image fingerprint or
+  # other internal build detail is committed to the public source tree.
+  STAGING_IMAGE_SHA256: ${{ secrets.STAGING_IMAGE_SHA256 }}
+
 jobs:
   weekly-beta:
     name: Build, repack, and publish weekly beta
@@ -26,25 +31,9 @@ jobs:
       - name: Set weekly release identity
         id: release
         run: |
-          set -euo pipefail
-
           release_date=$(date -u +%F)
-          branch="${GITHUB_REF_NAME}"
-
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-
-          if [ "$branch" = "main" ]; then
-            echo "tag=weekly-main-$release_date" >> "$GITHUB_OUTPUT"
-            echo "title=Weekly Main $release_date" >> "$GITHUB_OUTPUT"
-            echo "type=Main Build" >> "$GITHUB_OUTPUT"
-          elif [ "$branch" = "beta" ]; then
-            echo "tag=weekly-beta-$release_date" >> "$GITHUB_OUTPUT"
-            echo "title=Weekly Beta $release_date" >> "$GITHUB_OUTPUT"
-            echo "type=Weekly Beta" >> "$GITHUB_OUTPUT"
-          else
-            echo "Unsupported branch: $branch" >&2
-            exit 1
-          fi
+          echo "tag=weekly-beta-$release_date" >> "$GITHUB_OUTPUT"
+          echo "title=Weekly Beta $release_date" >> "$GITHUB_OUTPUT"
 
       - name: Install repository-cached MIPS musl toolchain
         run: |
@@ -63,25 +52,19 @@ jobs:
           RELEASE_LABEL: ${{ steps.release.outputs.title }}
         run: |
           set -euo pipefail
-
           make -j2 target RELEASE_LABEL="$RELEASE_LABEL"
           make bootloader
           make sd_ready_test
-
           file open_hiby_player_target open_hiby_bootloader
-
           mipsel-linux-musl-readelf -h open_hiby_player_target \
             | grep 'Machine:.*MIPS' >/dev/null
-
           mipsel-linux-musl-readelf -h open_hiby_bootloader \
             | grep 'Machine:.*MIPS' >/dev/null
-
           if strings open_hiby_player_target | grep -Eq \
               'TEST BUILD|TEST_BUILD_TAG|UI_PERF_TRACE|UI_GESTURE_TRACE|UI_HITBOX_DEBUG'; then
             echo 'Diagnostic flags were found in the production player.' >&2
             exit 1
           fi
-
           find plugins_examples -maxdepth 1 -type f -name '*.lua' -print0 \
             | xargs -0 -r -n1 luac5.4 -p
 
@@ -90,144 +73,76 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
+          [[ "$STAGING_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo 'STAGING_IMAGE_SHA256 secret is missing or invalid.' >&2
+            exit 1
+          }
           mkdir -p base
-
-          echo "Downloading staging image from upstream repository."
-
-          gh release download staging-image-base \
-            --pattern r1.upt \
-            --dir base \
-            --repo Starnished66/R1-open-source-player
-
-          test -f base/r1.upt
-
-          echo "Staging image downloaded successfully:"
-          ls -lh base/r1.upt
+          gh release download staging-image-base --pattern r1.upt --dir base
+          echo "$STAGING_IMAGE_SHA256  base/r1.upt" | sha256sum --check
 
       - name: Repack Staging Image
         run: |
           set -euo pipefail
-
           mkdir -p release
-
-          scripts/repack_upt.sh \
-            base/r1.upt \
-            open_hiby_player_target \
-            open_hiby_bootloader \
-            release/r1.upt
-
+          scripts/repack_upt.sh base/r1.upt open_hiby_player_target \
+            open_hiby_bootloader release/r1.upt
           cp open_hiby_player_target release/open_hiby_player
-
           (
             cd plugins_examples
             zip -q -r ../release/plugin_examples.zip .
           )
-
-          sha256sum \
-            release/r1.upt \
-            release/open_hiby_player \
+          sha256sum release/r1.upt release/open_hiby_player \
             release/plugin_examples.zip \
             > release/SHA256SUMS
 
       - name: Prepare release notes
-        env:
-          BRANCH: ${{ steps.release.outputs.branch }}
-          RELEASE_TYPE: ${{ steps.release.outputs.type }}
-          RELEASE_TITLE: ${{ steps.release.outputs.title }}
         run: |
           set -euo pipefail
-
           {
-            echo "# $RELEASE_TITLE"
-            echo
-            echo "**Build branch:** \`$BRANCH\`"
-            echo
-            echo "**Build type:** $RELEASE_TYPE"
-            echo
-            echo "**Commit:** [\`$GITHUB_SHA\`](https://github.com/${GITHUB_REPOSITORY}/commit/$GITHUB_SHA)"
-            echo
-            echo "---"
-            echo
-
             cat WHATS_NEW.md
-
             echo
             echo "---"
             echo
-
-            echo "Built automatically from commit [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/$GITHUB_SHA) on branch \`$BRANCH\`."
-
+            echo "Built automatically from commit [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/WHATS_NEW.md)."
             echo
             echo "### Downloads"
             echo
-
             echo "- **r1.upt** — complete firmware update."
             echo "- **open_hiby_player** — standalone Open Player update."
             echo "- **plugin_examples.zip** — all example and test plugins from the repository."
-
             echo
             echo "### Update only Open Player"
             echo
-
             echo "Copy **open_hiby_player** to **SD/.open_hiby_player/open_hiby_player**, replacing the existing file, then reboot the R1. The bootloader will use the updated player from the SD card."
-
             echo
             echo "Checksums are attached in **SHA256SUMS**."
-
           } > release/RELEASE_NOTES.md
 
-      - name: Publish weekly release
+      - name: Publish weekly prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
           TITLE: ${{ steps.release.outputs.title }}
         run: |
           set -euo pipefail
-
           if gh release view "$TAG" >/dev/null 2>&1; then
-
-            echo "Release $TAG already exists. Updating assets and release metadata."
-
-            gh release upload "$TAG" \
-              release/r1.upt \
-              release/open_hiby_player \
-              release/plugin_examples.zip \
-              release/SHA256SUMS \
-              --clobber
-
+            gh release upload "$TAG" release/r1.upt release/open_hiby_player \
+              release/plugin_examples.zip release/SHA256SUMS --clobber
             for legacy_asset in plugins_examples.zip Test-Plugins.zip; do
               if gh release view "$TAG" --json assets --jq '.assets[].name' \
                   | grep -Fx "$legacy_asset" >/dev/null; then
                 gh release delete-asset "$TAG" "$legacy_asset" --yes
               fi
             done
-
-            gh release edit "$TAG" \
-              --prerelease \
-              --latest=false \
-              --title "$TITLE" \
+            gh release edit "$TAG" --prerelease --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
-
           else
-
-            echo "Creating new release $TAG."
-
-            gh release create "$TAG" \
-              release/r1.upt \
-              release/open_hiby_player \
-              release/plugin_examples.zip \
-              release/SHA256SUMS \
-              --latest=false \
-              --prerelease \
-              --target "$GITHUB_SHA" \
-              --title "$TITLE" \
+            gh release create "$TAG" release/r1.upt release/open_hiby_player \
+              release/plugin_examples.zip release/SHA256SUMS \
+              --prerelease --target "$GITHUB_SHA" --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
-
           fi
-
-          echo "Release published successfully: $TAG"
-          echo "Release URL: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
 
       - name: Preserve package as workflow artifact
         uses: actions/upload-artifact@v4

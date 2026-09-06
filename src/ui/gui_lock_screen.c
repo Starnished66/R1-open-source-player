@@ -89,28 +89,35 @@ static void lock_touch_timer_cb(lv_timer_t * timer) {
 }
 
 static void start_timers(void) {
-    /* Symmetric, not just a conditional start -- gui_lock_screen_show() can
-     * be called again with a DIFFERENT mode while already showing (e.g. a
-     * second screen_woke fires before the user dismisses), and this must
-     * leave lock_clock_timer matching the NEW mode either way. A one-sided
-     * "start if clock" here previously left a stale timer running forever
-     * (until the eventual hide/teardown) after switching away from clock
-     * mode without an intervening hide(). */
+    /*
+     * The live clock is required for:
+     *
+     *   - Album Art
+     *   - Custom Image
+     *   - Standalone Clock
+     *
+     * When gui_lock_screen_show() is called again while the lock screen
+     * is already visible, current_mode may change without the previous
+     * timer being deleted first. Keep the timer state synchronized with
+     * the new mode.
+     */
     if (current_mode == LOCK_SCREEN_MODE_CLOCK ||
         current_mode == LOCK_SCREEN_MODE_IMAGE ||
         current_mode == LOCK_SCREEN_MODE_ALBUM_ART) {
+
         if (!lock_clock_timer) {
             lock_clock_timer = lv_timer_create(lock_clock_timer_cb, 1000, NULL);
         }
+
     } else if (lock_clock_timer) {
         lv_timer_delete(lock_clock_timer);
         lock_clock_timer = NULL;
     }
+
     if (!lock_touch_timer) {
         lock_touch_timer = lv_timer_create(lock_touch_timer_cb, 20, NULL);
     }
 }
-
 static void stop_timers(void) {
     if (lock_clock_timer) {
         lv_timer_delete(lock_clock_timer);

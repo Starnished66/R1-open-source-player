@@ -44,6 +44,7 @@ static void update_clock_display(void) {
     char buf[16];
     strftime(buf, sizeof(buf), current_clock_24h ? "%H:%M" : "%I:%M", &tm_info);
     lv_label_set_text(lock_clock_label, buf);
+
 }
 
 static void lock_clock_timer_cb(lv_timer_t * timer) {
@@ -95,7 +96,9 @@ static void start_timers(void) {
      * "start if clock" here previously left a stale timer running forever
      * (until the eventual hide/teardown) after switching away from clock
      * mode without an intervening hide(). */
-    if (current_mode == LOCK_SCREEN_MODE_CLOCK) {
+    if (current_mode == LOCK_SCREEN_MODE_CLOCK ||
+        current_mode == LOCK_SCREEN_MODE_IMAGE ||
+        current_mode == LOCK_SCREEN_MODE_ALBUM_ART) {
         if (!lock_clock_timer) {
             lock_clock_timer = lv_timer_create(lock_clock_timer_cb, 1000, NULL);
         }
@@ -161,6 +164,10 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
             lv_image_set_src(lock_image_obj, asset_path("playing_plane/default_cover_565.png"));
         }
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
+
+        /* Album Art lock screen also shows the live centered clock above the image. */
+        update_clock_display();
+        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
     } else if (current_mode == LOCK_SCREEN_MODE_IMAGE) {
         /* LVGL's lv_fs_get_drv() picks a driver off src[0] -- a plain POSIX
          * path (what plugin.sd_root() and every plugin-supplied path use)
@@ -174,6 +181,8 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
         snprintf(prefixed_path, sizeof(prefixed_path), "S:%s", options->image_path);
         lv_image_set_src(lock_image_obj, prefixed_path);
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
+        update_clock_display();
+        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
     } else if (current_mode == LOCK_SCREEN_MODE_CLOCK) {
         update_clock_display();
         lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);

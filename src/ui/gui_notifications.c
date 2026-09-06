@@ -181,14 +181,17 @@ lv_obj_t * build_menu_popup(const menu_popup_row_t * rows, int row_count, lv_eve
     lv_obj_t * popup = lv_obj_create(top);
     lv_obj_set_width(popup, lv_pct(84));
     lv_obj_set_height(popup, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_height(popup,
+        lv_display_get_vertical_resolution(lv_display_get_default()) - 2 * STATUS_BAR_CLEARANCE, 0);
     lv_obj_align(popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(popup, 16, 0);
     lv_obj_add_style(popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(popup, 0, 0);
+    lv_obj_set_style_border_width(popup, 1, 0);
     lv_obj_set_style_pad_all(popup, 20, 0);
-    lv_obj_set_style_pad_row(popup, 10, 0);
-    lv_obj_remove_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_row(popup, GUI_ROW_GAP, 0);
+    lv_obj_add_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(popup, LV_DIR_VER);
     lv_obj_add_flag(popup, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -197,17 +200,22 @@ lv_obj_t * build_menu_popup(const menu_popup_row_t * rows, int row_count, lv_eve
         lv_obj_t * row = lv_obj_create(popup);
         lv_obj_set_width(row, lv_pct(100));
         lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_min_height(row, 64, 0);
         lv_obj_set_style_pad_all(row, 14, 0);
         lv_obj_set_style_radius(row, 12, 0);
         lv_obj_set_style_bg_opa(row, 0, 0);
+        lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_PRESSED);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, rows[i].cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t * label = lv_label_create(row);
+        lv_obj_set_width(label, lv_pct(100));
         lv_label_set_text(label, rows[i].label);
-        lv_obj_set_style_text_color(label, rows[i].destructive ? lv_color_make(255, 120, 120) : accent_lv_color(), 0);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
+        if (rows[i].destructive) lv_obj_set_style_text_color(label, lv_color_make(255, 120, 120), 0);
         lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
         lv_obj_center(label);
     }

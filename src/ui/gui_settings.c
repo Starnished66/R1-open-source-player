@@ -1,5 +1,6 @@
 #include "gui.h"
 #include "gui_settings.h"
+#include "gui_shell.h"
 #include "gui_text_input.h"
 #include "app_clock.h"
 #include "app_version.h"
@@ -41,7 +42,13 @@
 /* Extern references to screen pointers owned by this module (defined here) */
 static lv_obj_t * settings_crossfade_toggle_img = NULL;
 static lv_obj_t * settings_screen;
-static lv_obj_t * settings_playback_screen;
+static lv_obj_t * settings_music_screen;
+static lv_obj_t * music_playback_screen;
+static lv_obj_t * music_audio_screen;
+static lv_obj_t * music_controls_screen;
+static lv_obj_t * music_timers_screen;
+static lv_obj_t * music_library_screen;
+static lv_obj_t * music_plugins_screen;
 static lv_obj_t * settings_display_screen;
 static lv_obj_t * settings_power_screen;
 static lv_obj_t * settings_system_screen;
@@ -93,6 +100,9 @@ static lv_obj_t * startup_volume_switch;
 static lv_obj_t * startup_volume_slider_card;
 static lv_obj_t * startup_volume_value_label;
 static lv_obj_t * startup_volume_slider;
+static lv_obj_t * sleep_timer_switch;
+static lv_obj_t * sleep_timer_slider_card;
+static lv_obj_t * sleep_timer_remaining_btn;
 static lv_obj_t * sleep_timer_value_label;
 static lv_obj_t * sleep_timer_slider;
 static lv_obj_t * idle_shutdown_switch;
@@ -403,7 +413,7 @@ static lv_obj_t * build_about_screen(void) {
     items[1] = (pill_list_item_t){ app_version_label(), PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, gui_theme_accent_style(), 6);
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1002,11 +1012,46 @@ static int sleep_timer_minutes_to_step_index(int minutes) {
     return best;
 }
 
-/* This only sets the duration the quick-drawer sleep icon uses NEXT time
- * it's armed -- unlike screen_timeout_slider_event_cb's sibling, there's no
- * enable toggle here and no live countdown to interrupt, since arming
- * itself only ever happens from the drawer icon (quick_drawer_sleep_event_cb),
- * never from this screen. */
+/* "45 min" / "1 hr" / "1 hr 30 min" -- same shape as ExtendedSleepTimer.lua's
+ * own format_duration(), needed now that SLEEP_TIMER_STEPS reaches 180
+ * (settings.c) and a bare "%d min" would read as "180 min" instead of the
+ * much more readable "3 hr". */
+static void format_sleep_timer_duration(char * buf, size_t buf_size, int minutes) {
+    int hours = minutes / 60;
+    int remainder = minutes % 60;
+    if (hours == 0) snprintf(buf, buf_size, "%d min", remainder);
+    else if (remainder == 0) snprintf(buf, buf_size, "%d hr", hours);
+    else snprintf(buf, buf_size, "%d hr %d min", hours, remainder);
+}
+
+/* Real-device bug report: this screen only ever picked the duration the
+ * drawer icon (quick_drawer_sleep_event_cb, gui_shell.c) would use NEXT
+ * time it was tapped -- there was no way to arm/disarm the timer from here
+ * at all. sleep_timer_switch_event_cb below now does that directly (the
+ * same single arm/disarm action the drawer icon performs, not a separate
+ * "enabled" preference layer -- this timer has no such layer, see
+ * current_settings.sleep_timer_minutes' own comment on why only the
+ * duration persists), keeping both in sync via gui_settings_sync_sleep_
+ * timer_toggle() / quick_drawer_sleep_timer_is_active() (gui_shell.c). */
+static void sleep_timer_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    bool active = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    quick_drawer_sleep_timer_set_active(active);
+    if (active) {
+        lv_obj_remove_flag(sleep_timer_slider_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(sleep_timer_remaining_btn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(sleep_timer_slider_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(sleep_timer_remaining_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* This only sets the duration the quick-drawer sleep icon/enable toggle
+ * above arms next time (or restarts the CURRENT countdown at, if already
+ * armed -- same real-time-restart behavior ExtendedSleepTimer.lua's own
+ * duration slider has, matching what a user dragging this while counting
+ * down would expect: the countdown they're looking at should reflect the
+ * duration they just picked, not the one that was armed before). */
 static void sleep_timer_slider_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     int32_t index = lv_slider_get_value(lv_event_get_target(e));
@@ -1014,15 +1059,39 @@ static void sleep_timer_slider_event_cb(lv_event_t * e) {
 
     if (code == LV_EVENT_VALUE_CHANGED) {
         current_settings.sleep_timer_minutes = minutes;
-        lv_label_set_text_fmt(sleep_timer_value_label, "%d min", minutes);
+        char duration_buf[32];
+        format_sleep_timer_duration(duration_buf, sizeof(duration_buf), minutes);
+        lv_label_set_text(sleep_timer_value_label, duration_buf);
+        if (quick_drawer_sleep_timer_is_active()) quick_drawer_sleep_timer_set_active(true);
     } else if (code == LV_EVENT_RELEASED) {
         settings_save(&current_settings);
     }
 }
 
-/* Mirrors build_screen_timeout_screen()'s layout minus the enable toggle
- * (a plain duration picker -- see sleep_timer_slider_event_cb's own
- * comment for why arming doesn't belong on this screen). */
+/* "Show Time Remaining" button -- same info ExtendedSleepTimer.lua's own
+ * "Show Time Remaining" settings row surfaces via a toast, in the same
+ * H:MM:SS (or M:SS under an hour) shape as that plugin's format_remaining().
+ * Hidden whenever the timer is disarmed (sleep_timer_switch_event_cb /
+ * gui_settings_sync_sleep_timer_toggle), so this is only ever reachable
+ * while armed -- no "timer is off" fallback message needed here. */
+static void sleep_timer_show_remaining_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int total_seconds = quick_drawer_sleep_timer_remaining_seconds();
+    int hours = total_seconds / 3600;
+    int minutes = (total_seconds / 60) % 60;
+    int secs = total_seconds % 60;
+    char buf[48];
+    if (hours > 0) snprintf(buf, sizeof(buf), "Time remaining: %d:%02d:%02d", hours, minutes, secs);
+    else snprintf(buf, sizeof(buf), "Time remaining: %d:%02d", minutes, secs);
+    show_info_toast(buf);
+}
+
+/* Mirrors build_screen_timeout_screen()'s layout (enable row + slider
+ * card), plus one more row: a "Show Time Remaining" button neither that
+ * screen nor this one needed before ExtendedSleepTimer.lua's own version
+ * of this same feature demonstrated why one's genuinely useful here (the
+ * status bar has nowhere to show a running countdown, unlike the quick
+ * drawer's own quick_drawer_sleep_label). */
 static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
@@ -1045,14 +1114,41 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
 
-    lv_obj_t * slider_card = lv_obj_create(scr);
-    lv_obj_set_size(slider_card, lv_pct(90), 170);
-    lv_obj_align(slider_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
-    lv_obj_add_style(slider_card, &style_theme_card_bg, 0);
-    lv_obj_set_style_border_width(slider_card, 0, 0);
-    lv_obj_set_style_radius(slider_card, 10, 0);
+    /* Same flex-row/SPACE_BETWEEN/flex_grow-label shape as build_screen_
+     * timeout_screen()'s own enable_row -- see its comment for the real-
+     * device overlap bug this avoids at bigger system text sizes. */
+    lv_obj_t * enable_row = lv_obj_create(scr);
+    lv_obj_set_width(enable_row, lv_pct(90));
+    lv_obj_set_height(enable_row, LV_SIZE_CONTENT);
+    lv_obj_align(enable_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
+    lv_obj_set_style_bg_opa(enable_row, 0, 0);
+    lv_obj_set_style_border_width(enable_row, 0, 0);
+    lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(enable_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(enable_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(enable_row, 12, 0);
 
-    sleep_timer_slider = lv_slider_create(slider_card);
+    lv_obj_t * enable_label = lv_label_create(enable_row);
+    lv_label_set_text(enable_label, "Enable Sleep Timer");
+    lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(enable_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_label_set_long_mode(enable_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(enable_label, 1);
+
+    sleep_timer_switch = lv_switch_create(enable_row);
+    lv_obj_add_style(sleep_timer_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (quick_drawer_sleep_timer_is_active()) lv_obj_add_state(sleep_timer_switch, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sleep_timer_switch, sleep_timer_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    sleep_timer_slider_card = lv_obj_create(scr);
+    lv_obj_set_size(sleep_timer_slider_card, lv_pct(90), 170);
+    lv_obj_align_to(sleep_timer_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
+    lv_obj_add_style(sleep_timer_slider_card, &style_theme_card_bg, 0);
+    lv_obj_set_style_border_width(sleep_timer_slider_card, 0, 0);
+    lv_obj_set_style_radius(sleep_timer_slider_card, 10, 0);
+    if (!quick_drawer_sleep_timer_is_active()) lv_obj_add_flag(sleep_timer_slider_card, LV_OBJ_FLAG_HIDDEN);
+
+    sleep_timer_slider = lv_slider_create(sleep_timer_slider_card);
     lv_obj_set_width(sleep_timer_slider, lv_pct(94));
     lv_obj_set_height(sleep_timer_slider, SLIDER_TRACK_HEIGHT);
     lv_obj_align(sleep_timer_slider, LV_ALIGN_TOP_MID, 0, 18);
@@ -1065,19 +1161,37 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_add_event_cb(sleep_timer_slider, sleep_timer_slider_event_cb, LV_EVENT_ALL, NULL);
     lv_obj_set_ext_click_area(sleep_timer_slider, 20);
 
-    sleep_timer_value_label = lv_label_create(slider_card);
+    sleep_timer_value_label = lv_label_create(sleep_timer_slider_card);
     lv_obj_add_style(sleep_timer_value_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(sleep_timer_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align(sleep_timer_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
-    lv_label_set_text_fmt(sleep_timer_value_label, "%d min", current_settings.sleep_timer_minutes);
+    char duration_buf[32];
+    format_sleep_timer_duration(duration_buf, sizeof(duration_buf), current_settings.sleep_timer_minutes);
+    lv_label_set_text(sleep_timer_value_label, duration_buf);
+
+    sleep_timer_remaining_btn = lv_obj_create(scr);
+    lv_obj_set_size(sleep_timer_remaining_btn, lv_pct(90), 70);
+    lv_obj_align_to(sleep_timer_remaining_btn, sleep_timer_slider_card, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
+    lv_obj_add_style(sleep_timer_remaining_btn, &style_theme_card_bg, 0);
+    lv_obj_set_style_border_width(sleep_timer_remaining_btn, 0, 0);
+    lv_obj_set_style_radius(sleep_timer_remaining_btn, 10, 0);
+    lv_obj_remove_flag(sleep_timer_remaining_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(sleep_timer_remaining_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(sleep_timer_remaining_btn, sleep_timer_show_remaining_cb, LV_EVENT_CLICKED, NULL);
+    if (!quick_drawer_sleep_timer_is_active()) lv_obj_add_flag(sleep_timer_remaining_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t * remaining_label = lv_label_create(sleep_timer_remaining_btn);
+    lv_label_set_text(remaining_label, "Show Time Remaining");
+    lv_obj_add_style(remaining_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(remaining_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_center(remaining_label);
 
     finalize_screen_navigation(scr);
     /* Same reasoning as screen_timeout_slider_card's identical line: don't
      * let a drag that misses the slider bubble up as an app-wide swipe.
      * Also registered as a player-swipe dead zone -- see
      * register_swipe_dead_zone()'s own comment. */
-    lv_obj_remove_flag(slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    register_swipe_dead_zone(slider_card);
+    lv_obj_remove_flag(sleep_timer_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    register_swipe_dead_zone(sleep_timer_slider_card);
     return scr;
 }
 
@@ -1461,7 +1575,7 @@ static lv_obj_t * build_timezone_region_screen(void) {
         items[i] = (pill_list_item_t){ TIMEZONE_REGIONS[i], PILL_ACCESSORY_CHEVRON, false, timezone_region_row_cb, NULL,
                                         (void *) (intptr_t) i };
     }
-    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, gui_theme_accent_style(), 6);
+    lv_obj_t * scr = build_pill_list_screen("Time Zone", generic_back_cb, items, (int) TIMEZONE_REGION_COUNT, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1485,6 +1599,17 @@ static void factory_reset_btn_cb(lv_event_t * e);
  * screens plus About, rather than one long scroll. Each sub-screen reuses
  * the exact same items/callbacks the old flat list had, just grouped. ---- */
 
+/* ---- Music Settings sub-screens -- the flat Playback list (9 native rows
+ * plus however many plugins added) hit the exact same unwieldy-list problem
+ * the System split above already solved, for the same real-device-feedback
+ * reason: playback behavior, audio processing, hardware controls, timers,
+ * library maintenance, and plugin-added rows were all one long undifferentiated
+ * scroll. Renamed "Music Settings" (was "Playback") since that flat list's
+ * own top-level identity no longer fits now that "Playback" is just one of
+ * six categories under it, not the whole screen. Every native row below
+ * keeps its exact original callback -- this only regroups them, never
+ * changes what any individual row does. */
+
 /* Shared click handler for every plugin-registered Playback list row below
  * -- same index-not-object shape plugin_display_list_item_click_cb() already
  * uses. */
@@ -1494,21 +1619,56 @@ static void plugin_playback_list_item_click_cb(lv_event_t * e) {
     plugin_manager_playback_list_item_clicked(index);
 }
 
-static lv_obj_t * build_settings_playback_screen(void) {
-    static pill_list_item_t items[8 + PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
-                                    current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
-    items[1] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
+static lv_obj_t * build_music_playback_screen(void) {
+    static pill_list_item_t items[3];
+    items[0] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "ReplayGain", PILL_ACCESSORY_CHEVRON, false, replaygain_mode_settings_row_cb, NULL, NULL };
+    items[2] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
                                     current_settings.crossfade_enabled, NULL, crossfade_switch_event_cb, NULL,
                                     &settings_crossfade_toggle_img };
-    items[2] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Play/Pause Button", PILL_ACCESSORY_CHEVRON, false, play_pause_button_mode_settings_row_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "ReplayGain", PILL_ACCESSORY_CHEVRON, false, replaygain_mode_settings_row_cb, NULL, NULL };
-    items[5] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
-    items[6] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
-    items[7] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, 3, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
 
-    int count = 8;
+static lv_obj_t * build_music_audio_screen(void) {
+    static pill_list_item_t items[2];
+    items[0] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Audio", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_music_controls_screen(void) {
+    static pill_list_item_t items[2];
+    items[0] = (pill_list_item_t){ "Play/Pause Button", PILL_ACCESSORY_CHEVRON, false, play_pause_button_mode_settings_row_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Controls & Interface", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_music_timers_screen(void) {
+    static pill_list_item_t items[1];
+    items[0] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Timers", generic_back_cb, items, 1, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_music_library_screen(void) {
+    static pill_list_item_t items[1];
+    items[0] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Library", generic_back_cb, items, 1, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_music_plugins_screen(void) {
+    static pill_list_item_t items[PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
+    int count = 0;
     int plugin_count = plugin_manager_get_playback_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_PLAYBACK_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -1520,8 +1680,46 @@ static lv_obj_t * build_settings_playback_screen(void) {
         item.text_size = text_size ? text_size : "medium";
         items[count++] = item;
     }
+    lv_obj_t * scr = build_pill_list_screen("Plugins", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
 
-    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, gui_theme_accent_style(), 6);
+static void music_category_playback_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(music_playback_screen);
+}
+static void music_category_audio_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(music_audio_screen);
+}
+static void music_category_controls_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(music_controls_screen);
+}
+static void music_category_timers_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(music_timers_screen);
+}
+static void music_category_library_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(music_library_screen);
+}
+static void music_category_plugins_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(music_plugins_screen);
+}
+
+static lv_obj_t * build_music_settings_screen(void) {
+    static pill_list_item_t items[6];
+    items[0] = (pill_list_item_t){ "Playback", PILL_ACCESSORY_CHEVRON, false, music_category_playback_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "Audio", PILL_ACCESSORY_CHEVRON, false, music_category_audio_cb, NULL, NULL };
+    items[2] = (pill_list_item_t){ "Controls & Interface", PILL_ACCESSORY_CHEVRON, false, music_category_controls_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "Timers", PILL_ACCESSORY_CHEVRON, false, music_category_timers_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Library", PILL_ACCESSORY_CHEVRON, false, music_category_library_cb, NULL, NULL };
+    items[5] = (pill_list_item_t){ "Plugins", PILL_ACCESSORY_CHEVRON, false, music_category_plugins_cb, NULL, NULL };
+
+    lv_obj_t * scr = build_pill_list_screen("Music Settings", generic_back_cb, items, 6, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1565,7 +1763,7 @@ static lv_obj_t * build_settings_display_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, gui_theme_accent_style(), 6);
+    lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1604,7 +1802,7 @@ static lv_obj_t * build_settings_power_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, gui_theme_accent_style(), 6);
+    lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1707,7 +1905,7 @@ static lv_obj_t * build_clock_screen(void) {
           .on_click = timezone_settings_row_cb, .out_row = &clock_timezone_row },
     };
     lv_obj_t * scr = build_pill_list_screen("Clock", generic_back_cb, items, 4,
-                                            gui_theme_accent_style(), 6);
+gui_theme_accent_style(), GUI_ROW_GAP);
     if (clock_timezone_row) {
         lv_obj_t * title = lv_obj_get_child(clock_timezone_row, 0);
         if (title) lv_obj_align(title, LV_ALIGN_LEFT_MID, 24, -18);
@@ -1791,16 +1989,15 @@ static lv_obj_t * build_clock_set_time_screen(void) {
 }
 
 static lv_obj_t * build_settings_system_screen(void) {
-    static pill_list_item_t items[6 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
+    static pill_list_item_t items[5 + PLUGIN_MAX_SYSTEM_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Clock", PILL_ACCESSORY_CHEVRON, false,
                                     clock_settings_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Hostname", PILL_ACCESSORY_CHEVRON, false, hostname_row_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "Plugins", PILL_ACCESSORY_CHEVRON, false, gui_plugin_manage_row_cb, NULL, NULL };
-    items[5] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "Plugins", PILL_ACCESSORY_CHEVRON, false, gui_plugin_manage_row_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
 
-    int count = 6;
+    int count = 5;
     int plugin_count = plugin_manager_get_system_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SYSTEM_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -1813,14 +2010,14 @@ static lv_obj_t * build_settings_system_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, gui_theme_accent_style(), 6);
+    lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
 
-static void settings_category_playback_cb(lv_event_t * e) {
+static void settings_category_music_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    nav_push(settings_playback_screen);
+    nav_push(settings_music_screen);
 }
 
 static void settings_category_display_cb(lv_event_t * e) {
@@ -1863,7 +2060,7 @@ static void plugin_settings_list_item_click_cb(lv_event_t * e) {
 
 static lv_obj_t * build_settings_screen(void) {
     static pill_list_item_t items[5 + PLUGIN_MAX_SETTINGS_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "Playback", PILL_ACCESSORY_CHEVRON, false, settings_category_playback_cb, NULL, NULL };
+    items[0] = (pill_list_item_t){ "Music Settings", PILL_ACCESSORY_CHEVRON, false, settings_category_music_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Display", PILL_ACCESSORY_CHEVRON, false, settings_category_display_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Power", PILL_ACCESSORY_CHEVRON, false, settings_category_power_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "System", PILL_ACCESSORY_CHEVRON, false, settings_category_system_cb, NULL, NULL };
@@ -1882,7 +2079,7 @@ static lv_obj_t * build_settings_screen(void) {
         items[count++] = item;
     }
 
-    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, gui_theme_accent_style(), 6);
+    lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1951,7 +2148,7 @@ lv_obj_t * build_dac_home_screen(void) {
     static pill_list_item_t items[2];
     items[0] = (pill_list_item_t){ "USB DAC", PILL_ACCESSORY_CHEVRON, false, dac_home_usb_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Bluetooth DAC", PILL_ACCESSORY_CHEVRON, false, bt_dac_settings_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, gui_theme_accent_style(), 6);
+    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -2997,7 +3194,13 @@ void gui_settings_init(void) {
     timezone_region_screen = build_timezone_region_screen();
     clock_set_time_screen = build_clock_set_time_screen();
     clock_screen = build_clock_screen();
-    settings_playback_screen = build_settings_playback_screen();
+    music_playback_screen = build_music_playback_screen();
+    music_audio_screen = build_music_audio_screen();
+    music_controls_screen = build_music_controls_screen();
+    music_timers_screen = build_music_timers_screen();
+    music_library_screen = build_music_library_screen();
+    music_plugins_screen = build_music_plugins_screen();
+    settings_music_screen = build_music_settings_screen();
     settings_display_screen = build_settings_display_screen();
     settings_power_screen = build_settings_power_screen();
     settings_system_screen = build_settings_system_screen();
@@ -3047,7 +3250,13 @@ void gui_settings_teardown(void) {
     /* Lazily built by open_timezone_city_screen() -- NULL until the user has
      * opened at least one region, same guard shape as every screen above. */
     if (timezone_city_screen) { lv_obj_del(timezone_city_screen); timezone_city_screen = NULL; }
-    if (settings_playback_screen) { lv_obj_del(settings_playback_screen); settings_playback_screen = NULL; }
+    if (settings_music_screen) { lv_obj_del(settings_music_screen); settings_music_screen = NULL; }
+    if (music_playback_screen) { lv_obj_del(music_playback_screen); music_playback_screen = NULL; }
+    if (music_audio_screen) { lv_obj_del(music_audio_screen); music_audio_screen = NULL; }
+    if (music_controls_screen) { lv_obj_del(music_controls_screen); music_controls_screen = NULL; }
+    if (music_timers_screen) { lv_obj_del(music_timers_screen); music_timers_screen = NULL; }
+    if (music_library_screen) { lv_obj_del(music_library_screen); music_library_screen = NULL; }
+    if (music_plugins_screen) { lv_obj_del(music_plugins_screen); music_plugins_screen = NULL; }
     if (settings_display_screen) { lv_obj_del(settings_display_screen); settings_display_screen = NULL; }
     if (settings_power_screen) { lv_obj_del(settings_power_screen); settings_power_screen = NULL; }
     if (settings_system_screen) { lv_obj_del(settings_system_screen); settings_system_screen = NULL; }
@@ -3066,7 +3275,7 @@ void gui_settings_teardown(void) {
 
 
 lv_obj_t * gui_settings_get_screen(void) { return settings_screen; }
-lv_obj_t * gui_settings_get_playback_screen(void) { return settings_playback_screen; }
+lv_obj_t * gui_settings_get_music_screen(void) { return settings_music_screen; }
 lv_obj_t * gui_settings_get_display_screen(void) { return settings_display_screen; }
 lv_obj_t * gui_settings_get_power_screen(void) { return settings_power_screen; }
 lv_obj_t * gui_settings_get_system_screen(void) { return settings_system_screen; }
@@ -3083,4 +3292,26 @@ void gui_settings_sync_crossfade_toggle(void) {
      * CHECKED state alone drives its visual, no sprite swap needed. */
     if (current_settings.crossfade_enabled) lv_obj_add_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
     else lv_obj_clear_state(settings_crossfade_toggle_img, LV_STATE_CHECKED);
+}
+
+/* Same bidirectional-sync role as gui_settings_sync_crossfade_toggle()
+ * above, for the Sleep Timer screen's own enable switch -- called from
+ * gui_shell.c whenever the drawer icon arms/disarms the timer, or the
+ * countdown expires on its own, so this screen never shows a stale state
+ * the next time it's opened. Also shows/hides the duration slider card and
+ * the "Show Time Remaining" button, matching sleep_timer_switch_event_cb's
+ * own behavior when the switch is toggled from this screen directly. */
+void gui_settings_sync_sleep_timer_toggle(void) {
+    if (!sleep_timer_switch) return;
+    bool active = quick_drawer_sleep_timer_is_active();
+    if (active) lv_obj_add_state(sleep_timer_switch, LV_STATE_CHECKED);
+    else lv_obj_clear_state(sleep_timer_switch, LV_STATE_CHECKED);
+    if (!sleep_timer_slider_card) return;
+    if (active) {
+        lv_obj_remove_flag(sleep_timer_slider_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(sleep_timer_remaining_btn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(sleep_timer_slider_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(sleep_timer_remaining_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 }

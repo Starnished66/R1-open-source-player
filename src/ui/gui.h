@@ -434,6 +434,10 @@ void clear_player_source(void);
 
 #define NAV_STACK_MAX 16
 void boot_checkpoint(const char * msg);
+/* See its own doc comment (main.c) -- call once, at the very start of any
+ * thread whose own crash needs to be loggable even if the crash IS the
+ * thread's own stack being exhausted. */
+void install_thread_crash_altstack(void);
 
 #define AUDIOBOOKS_LIBRARY_DIR_NAME "Audiobooks"
 /* ---- Shared GUI and Screen Builders Helpers ---- */

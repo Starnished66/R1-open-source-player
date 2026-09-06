@@ -4,6 +4,7 @@
 #include "lvgl/lvgl.h"
 #include "fallback_font.h"
 #include "launcher_layout.h"
+#include "gui_theme.h"
 #include <stdbool.h>
 
 /* Settings -> Font Size uses the stable fallback-capable app_font_* handles
@@ -55,22 +56,20 @@
  * LVGL's bg_image style draws a bg_image_src at its native size centered in
  * the object's box (see lv_draw_rect.c), not stretched to fill it, so
  * reusing the old asset at a bigger row size would've just centered the
- * original small pill inside a bigger empty box. LIST_ROW_BG_COLOR matches
- * that PNG's own fill color (sampled directly from the asset) so the look
- * carries over despite the switch. */
+ * original small pill inside a bigger empty box. Native row colors now
+ * come from the charcoal palette, with live plugin overrides. */
 int32_t ui_list_row_width(void);
 int32_t ui_list_row_width_wide(void);
 #define LIST_ROW_WIDTH (ui_list_row_width())
 /* Wider rows for the main library lists. Both widths are calculated from
- * the active panel: ordinary rows retain a 4px/side gutter at 480px while
- * wide rows retain 2px/side. The gutter grows gently on larger panels. */
+ * the active panel: music rows retain 8px/side, settings/actions 12px/side. */
 #define LIST_ROW_WIDTH_WIDE (ui_list_row_width_wide())
 #define LIST_ROW_HEIGHT 84
-#define MUSIC_LIST_ROW_HEIGHT 100
+#define MUSIC_LIST_ROW_HEIGHT GUI_MUSIC_ROW_HEIGHT
 #define LIST_ROW_RADIUS 16
-#define LIST_ROW_BG_COLOR lv_color_make(28, 28, 30)
+#define LIST_ROW_BG_COLOR lv_color_hex(GUI_COLOR_ROW)
 #define LIST_ROW_FONT app_font_22 /* see fallback_font.h -- same metrics as lv_font_montserrat_22, plus a non-Latin fallback */
-#define LIST_ROW_LABEL_INSET 28
+#define LIST_ROW_LABEL_INSET GUI_TEXT_INSET
 
 /* Every row-of-text list in the app (build_compact_list_screen below,
  * plus gui.c's show_group_songs()/populate_indexed_list(), all built by
@@ -106,6 +105,9 @@ extern lv_style_t list_row_pressed_style;
  * whenever the "list_row" slot changes -- see screen_builders_init_list_row_
  * style()'s own comment. */
 extern lv_style_t pill_row_bg_style;
+/* Minimum touch/text clearance for native rows. Explicit plugin sizing
+ * removes this style rather than silently clamping the plugin's layout. */
+extern lv_style_t native_row_min_style;
 /* LV_STATE_PRESSED-only tap indicator for a bare lv_image icon button (no
  * background to recolor the way list_row_pressed_style does) -- dims the
  * icon via image_recolor/image_recolor_opa rather than swapping to a
@@ -119,6 +121,17 @@ extern lv_style_t icon_press_style;
 
 /* Enables the shared constant-speed row marquee with a 2-second pause. */
 void row_label_enable_marquee(lv_obj_t * label);
+/* A secondary label belongs to its row, never intercepts taps, and is
+ * reused with the row pool. Legacy title\nmetadata strings remain valid. */
+lv_obj_t * row_label_create_subtitle(lv_obj_t * row);
+void row_label_set_identity(lv_obj_t * row, lv_obj_t * subtitle_label,
+                            const char * title, const char * subtitle, int32_t height);
+int32_t ui_music_row_height(void);
+/* Label-as-card contract, shared by bounded playlist/queue pages. */
+lv_obj_t * build_music_list_row(lv_obj_t * parent, const char * title, const char * subtitle,
+                               int32_t trailing_space);
+lv_obj_t * build_list_section(lv_obj_t * parent, const char * title);
+lv_obj_t * build_list_message(lv_obj_t * parent, const char * title, const char * detail);
 /* Sizes a bounded scrolling row label's own box tall enough for real glyph
  * extents (descenders on p/q/g/y, etc.) instead of the font's bare
  * lv_font_get_line_height() -- see this function's own definition
@@ -135,7 +148,7 @@ void row_label_apply_bounded_height(lv_obj_t * label, const lv_font_t * font);
 /* Theming: shared, mutable bg_color styles for the app's other two
  * "background categories" -- attach with lv_obj_add_style(x, &style_theme_screen_bg, 0)
  * on every screen root, or &style_theme_card_bg on every popup/EQ-card/
- * slider-card. Initialized (with this app's original default colors)
+ * slider-card. Initialized with the native charcoal palette
  * alongside list_row_style by screen_builders_init_list_row_style() below
  * -- see its own comment for why these three specifically, and why not
  * gui.c's style_accent. gui.c's gui_plugin_set_background_color() is what
@@ -216,6 +229,9 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
  * asset_path()/asset_path_plain() first, same as every other icon in this
  * codebase). click_cb may be NULL for a purely decorative icon. */
 lv_obj_t * build_top_right_icon_button(lv_obj_t * scr, const char * icon_asset, lv_event_cb_t click_cb);
+/* Returns the title label. Optional trailing action reserves its hitbox. */
+lv_obj_t * build_screen_header(lv_obj_t * scr, const char * title, lv_event_cb_t back_cb,
+                              const char * trailing_asset, lv_event_cb_t trailing_cb);
 
 typedef enum {
     PILL_ACCESSORY_NONE = 0,
@@ -245,8 +261,8 @@ typedef struct {
      * `options` table, PLUGINS.md) -- every existing native row across every
      * build_pill_list_screen() caller leaves these NULL/0 (a plain compound
      * literal without designators for trailing fields already defaults them
-     * that way), which reproduces today's exact rendering: PNG pill
-     * background, 124px height, app_font_20 label font. Only a
+     * that way), selecting native rounded surfaces, font-aware 84px
+     * minimum rows and app_font_20 labels. Only a
      * plugin-appended row (gui.c's build_settings_*_screen() plugin-row
      * loops) ever sets these. ---- */
 
@@ -256,13 +272,11 @@ typedef struct {
      * below. NULL = no icon, today's exact layout. */
     const char * icon_asset;
 
-    /* 0 = default (124px, PNG pill sprite). A non-zero value (clamped to
-     * PILL_ROW_HEIGHT_MIN..MAX) resizes the row AND switches its background
-     * from the PNG sprite to a plain rounded-rect fill -- see
-     * PILL_ROW_HEIGHT_MIN's own comment for why the PNG can't just stretch. */
+    /* 0 = native font-aware density. A non-zero value is clamped to
+     * PILL_ROW_HEIGHT_MIN..MAX and preserves explicit plugin sizing. */
     int32_t row_height;
 
-    /* 0 = the native 448px width. Non-zero values are clamped to the
+    /* 0 = the native display width minus gutters. Non-zero values use the
      * plugin-safe range below and keep the row centered in its list. */
     int32_t row_width;
 
@@ -322,8 +336,8 @@ int32_t pill_row_default_width(void);
 /* On-screen icon footprint (longest edge, in px) a plugin row's icon targets
  * -- same scaling formula as build_icon_grid_screen()'s own
  * ICON_GRID_TARGET_ICON_PX, just a smaller target since this sits inside a
- * single row rather than a whole tile. Fits a 124px-tall default pill row
- * with real clearance (124-64=60px, 30px top/bottom). */
+ * single row rather than a whole tile. Fits the native 84px row with
+ * 10px clearance above and below. */
 #define PILL_ROW_ICON_PX_DEFAULT 64
 
 /* Adds a plugin-supplied icon to an already-built row and re-aligns `label`
@@ -390,6 +404,8 @@ typedef struct {
     const char * label;
     int64_t identity;              /* optional stable DB/item identity for row decorators */
     const char * trailing_asset;   /* optional theme-relative badge asset */
+    const char * subtitle;         /* optional; same borrowed lifetime as label */
+    bool is_action;                /* explicit action affordance, not a song */
 } compact_list_item_t;
 
 /* Fixed size of a paged-mode row label buffer (compact_list_fetch_page_cb_t
@@ -401,6 +417,8 @@ typedef struct {
     char label[COMPACT_LIST_LABEL_MAX];
     int64_t identity;
     char trailing_asset[64];
+    char subtitle[256];
+    bool is_action;
 } compact_list_page_row_t;
 
 /* Fired when a row is tapped, with the index into the `items` array passed

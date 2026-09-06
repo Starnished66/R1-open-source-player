@@ -43,12 +43,9 @@ typedef struct {
 } remote_track_meta_t;
 
 /* "remote://<provider>/<track_id>" -- the stable synthetic playlist[] key
- * for a remote track. Never the actual stream_url: that's a single-use or
- * expiring signed URL, and Favorites/Most-Played/History (metadata_db.c)
- * are keyed by raw playlist path -- keying them off a URL that changes
- * every time the track is queued would mean favorite/play-count state
- * could never accumulate (the exact gap this project's Subsonic streaming
- * already has, being fixed here rather than repeated).
+ * for a remote track. Never the actual stream_url (which may be a single-use
+ * or expiring signed URL), so Favorites, Most-Played, and History state
+ * keyed by path can accumulate reliably.
  *
  * Returns false (and leaves out untouched) if provider/track_id are empty,
  * don't fit, or contain '/' or a control character -- '/' specifically

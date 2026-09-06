@@ -31,6 +31,21 @@ void gui_library_teardown(void);
 void gui_library_refresh_music_screen(void);
 
 void start_library_rescan(void);
+/* Guards every AUTOMATIC start_library_rescan() trigger this app has (fresh-
+ * database boot, SD reinsertion, USB Mass Storage disconnect, Wi-Fi Import
+ * close) -- NOT the manual Settings > Update Music Database row or
+ * plugin.refresh_library(), both of which the user/plugin author explicitly
+ * asked for and stay enabled regardless. Real-device bug report: a real
+ * SIGBUS crash, reproduced three times at three different, unrelated crash
+ * sites (LVGL draw code, a metadata parser, tagcache.c's own write_all()) --
+ * that shape (same background thread, different function each time, always
+ * right at a call boundary) is a stack overflow's signature, traced to
+ * library_rescan_thread's undersized default pthread stack (start_library_
+ * rescan(), gui_library.c, LIBRARY_RESCAN_THREAD_STACK_SIZE's own comment).
+ * This flag stayed false while that was under investigation; it's back to
+ * true now that the actual fix (an explicit, larger stack for that thread,
+ * matching scan_walk_worker's own sibling pattern) is in. */
+bool gui_library_auto_rescan_enabled(void);
 void poll_library_rescan(void);
 void poll_sd_format(void);
 void album_thumbnail_generation_poll(void);
@@ -47,6 +62,12 @@ void set_player_source_group_songs_direct(const group_song_entry_t * entries, in
 
 bool search_close_if_active_for_screen(lv_obj_t * screen);
 void refresh_now_playing_indicators(void);
+
+/* Shared song identity used by library and queue rows: display title on the
+ * first line, then Artist · Album on the metadata line. */
+void gui_library_format_song_identity(const song_row_t * row,
+                                      char * title, size_t title_size,
+                                      char * subtitle, size_t subtitle_size);
 
 void more_menu_list_cb(lv_event_t * e);
 

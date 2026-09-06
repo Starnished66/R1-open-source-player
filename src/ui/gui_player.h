@@ -57,7 +57,7 @@ uint64_t gui_player_queue_revision(void);
 bool gui_player_queue_snapshot(int ** order, int * count, int * current, uint64_t * revision);
 bool gui_player_queue_edit(uint64_t revision, int from, int to);
 bool gui_player_queue_select(uint64_t revision, int index);
-void gui_player_queue_clear_upcoming(void);
+void gui_player_queue_clear_all(void);
 bool gui_player_queue_save_as(const char * name);
 void gui_player_queue_checkpoint(void);
 bool gui_player_queue_write_busy(void);

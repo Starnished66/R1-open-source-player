@@ -62,13 +62,7 @@ static void queue_page_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * queue_label(const char * text) {
-    lv_obj_t * row = lv_label_create(queue_list);
-    lv_obj_add_style(row, &list_row_style, 0);
-    lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
-    lv_label_set_text(row, text);
-    lv_label_set_long_mode(row, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_height(row, MUSIC_LIST_ROW_HEIGHT, 0);
-    lv_obj_set_style_pad_top(row, strchr(text, '\n') ? 12 : 30, 0);
+    lv_obj_t * row = build_music_list_row(queue_list, text, NULL, 0);
     return row;
 }
 
@@ -84,7 +78,10 @@ void populate_queue_screen(void) {
      * button (build_queue_screen()) already opens this exact same
      * queue_actions popup (Start sequentially/Shuffle/Edit/Clear/Save),
      * so this was a plain duplicate entry point, not the only way in. */
-    if (!count) { queue_label("Queue is empty"); free(order); return; }
+    if (!count) {
+        build_list_message(queue_list, "Queue is empty", "Play an album or playlist to see its songs here.");
+        free(order); return;
+    }
     if (queue_page < 0) queue_page = 0;
     if (queue_page >= count) queue_page = ((count - 1) / QUEUE_PAGE_SIZE) * QUEUE_PAGE_SIZE;
     if (queue_page > 0) {
@@ -96,20 +93,21 @@ void populate_queue_screen(void) {
     if (end > count) end = count;
     for (int i = queue_page; i < end; i++) {
         const char * path = gui_player_get_track_path_at(order[i]);
-        char title[128], folder[128], text[320];
-        get_display_names(path, title, sizeof(title), folder, sizeof(folder));
-        const char * kind = i < current ? "Played" : i == current ? "Current" :
+        char title[128], subtitle[256], numbered_title[160];
+        song_row_t song;
+        if (metadata_db_get_song_by_path(path, &song)) {
+            gui_library_format_song_identity(&song, title, sizeof(title),
+                                              subtitle, sizeof(subtitle));
+        } else {
+            char folder[128];
+            get_display_names(path, title, sizeof(title), folder, sizeof(folder));
+            subtitle[0] = '\0';
+        }
+        const char * state = i < current ? "Played" : i == current ? "Playing" :
             i <= current + gui_player_get_queued_count() ? "Queued" : "Upcoming";
-        snprintf(text, sizeof(text), "%d. %s\n%s  [%s]", i + 1, title, folder, kind);
+        snprintf(numbered_title, sizeof(numbered_title), "%d. %s", i + 1, title);
         if (queue_editing && i > current) {
-            lv_obj_t * row = lv_obj_create(queue_list);
-            lv_obj_set_size(row, LIST_ROW_WIDTH, MUSIC_LIST_ROW_HEIGHT);
-            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_t * label = lv_label_create(row);
-            lv_label_set_text(label, text);
-            lv_obj_set_width(label, LIST_ROW_WIDTH - 180);
-            lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-            lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+            lv_obj_t * row = build_music_list_row(queue_list, numbered_title, subtitle, 180);
             for (int a = 0; a < 3; a++) {
                 lv_obj_t * button = lv_label_create(row);
                 lv_label_set_text(button, a == 0 ? LV_SYMBOL_UP : a == 1 ? LV_SYMBOL_DOWN : LV_SYMBOL_TRASH);
@@ -119,8 +117,28 @@ void populate_queue_screen(void) {
                 lv_obj_add_event_cb(button, queue_edit_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (i * 3 + a));
             }
         } else {
-            lv_obj_t * row = queue_label(text);
-            if (i == current) lv_obj_set_style_text_color(row, accent_lv_color(), 0);
+            /* Same title/metadata geometry as Favorites/Most Played, with a
+             * dedicated trailing column reserved before either label is
+             * laid out. The queue state shares the metadata baseline but
+             * cannot overlap or be crossed by either marquee. */
+            const int32_t state_column_width = 112;
+            const int32_t state_column_reserve = state_column_width + GUI_TEXT_INSET + 12;
+            lv_obj_t * row = build_music_list_row(queue_list, numbered_title, subtitle, state_column_reserve);
+            lv_obj_t * state_label = lv_label_create(row);
+            lv_label_set_text(state_label, state);
+            lv_obj_add_style(state_label, &style_theme_text_muted, 0);
+            lv_obj_set_style_text_font(state_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+            lv_obj_set_width(state_label, state_column_width);
+            lv_obj_set_pos(state_label, LIST_ROW_WIDTH - GUI_TEXT_INSET - state_column_width, 64);
+            lv_obj_set_style_text_align(state_label, LV_TEXT_ALIGN_RIGHT, 0);
+            row_label_apply_bounded_height(state_label, gui_theme_font(GUI_FONT_ROLE_BODY));
+            lv_label_set_long_mode(state_label, LV_LABEL_LONG_DOT);
+            if (i == current) {
+                lv_obj_add_style(state_label, gui_theme_accent_style(), 0);
+                lv_obj_set_style_border_side(row, LV_BORDER_SIDE_LEFT, 0);
+                lv_obj_set_style_border_width(row, 4, 0);
+                lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+            }
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(row, queue_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
         }
@@ -166,7 +184,7 @@ static void queue_start(lv_event_t * e, bool shuffle) {
 static void queue_start_sequential(lv_event_t * e) { queue_start(e, false); }
 static void queue_start_shuffle(lv_event_t * e) { queue_start(e, true); }
 static void queue_clear_cb(lv_event_t * e) {
-    queue_actions_hide(e); gui_player_queue_clear_upcoming(); populate_queue_screen();
+    queue_actions_hide(e); gui_player_queue_clear_all(); populate_queue_screen();
 }
 static void queue_save_done(const char * name, void * data) {
     (void) data;
@@ -198,7 +216,7 @@ static lv_obj_t * build_queue_screen(void) {
         { "Start sequentially", queue_start_sequential, false },
         { "Shuffle from a random song", queue_start_shuffle, false },
         { "Edit / Done", queue_toggle_edit, false },
-        { "Clear Upcoming", queue_clear_cb, false },
+        { "Clear Queue", queue_clear_cb, false },
         { "Save as Playlist", queue_save_cb, false },
         { "Cancel", queue_actions_hide, false },
     };

@@ -46,6 +46,9 @@ void gui_shell_notify_bt_audio_disconnected(void);
 
 void gui_shell_poll(void);
 void refresh_quick_drawer_crossfade_icon(void);
+bool quick_drawer_sleep_timer_is_active(void);
+void quick_drawer_sleep_timer_set_active(bool active);
+int quick_drawer_sleep_timer_remaining_seconds(void);
 void gui_shell_resume_connections(bool wifi_was_on, bool bt_was_on);
 
 void gui_shell_suspend_connections(bool * wifi_was_on, bool * bt_was_on);

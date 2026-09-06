@@ -13,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <errno.h>
 
 typedef struct {
     char name[256];
@@ -122,12 +123,7 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
         if (!is_dir && !is_playlist && !is_cue && !is_playable_file(de->d_name)) continue;
 
         if (count == capacity) {
-            /* Audit finding: the previous version overwrote `result` with
-             * realloc()'s return value unconditionally -- on allocation
-             * failure that's NULL, leaking the existing buffer and crashing
-             * on the very next write below. Stop growing and return
-             * whatever was collected so far instead; a failed grow shouldn't
-             * lose (or crash on) the entries already found. */
+            /* Stop growing and return entries collected so far if realloc fails. */
             dir_entry_t * grown = realloc(result, sizeof(dir_entry_t) * (size_t) (capacity * 2));
             if (!grown) break;
             result = grown;
@@ -254,15 +250,13 @@ static lv_obj_t * add_file_row(const char * label_text, const char * icon_asset,
      * density used by Artists/Albums/All Songs; Settings stays at the
      * shared 84px default. */
     lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, MUSIC_LIST_ROW_HEIGHT); /* 15% wider than the shared default -- explicit user request */
-    lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-    lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
-    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_add_style(row, &pill_row_bg_style, 0);
+    lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t * label = lv_label_create(row);
     lv_label_set_text(label, label_text);
-    lv_obj_set_style_text_color(label, lv_color_make(230, 230, 230), 0);
+    lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
 
     if (icon_asset) {
@@ -301,33 +295,10 @@ static void rebuild_list(void) {
     }
 }
 
-/* Real-device incident: this recursion had no depth limit and followed
- * symlinks (plain stat(), not lstat()) -- confirmed live as the cause of a
- * hard crash (SIGSEGV inside vsnprintf, on the library-rescan background
- * thread) after a couple of Import-via-Wi-Fi cycles, each of which triggers
- * a full library rescan on exit. Each recursion level's own PATH_MAX
- * (4KB-ish) full_path buffer plus a struct stat adds up fast against a
- * background pthread's default (musl, well under a desktop's typical 8MB)
- * stack -- a symlink loop anywhere under the music root recurses
- * indefinitely and blows that stack in well under a hundred levels; even a
- * genuinely deep but finite real directory tree could get uncomfortably
- * close. Fixed two ways: lstat() instead of stat() so a symlinked
- * directory is identified as a symlink rather than resolved and recursed
- * into (the same reasoning most real media-library scanners use -- there's
- * no legitimate reason for a scan of the music root to leave it via a
- * symlink), and a hard depth cap as defense-in-depth against any other
- * pathologically deep tree, symlink-related or not. A symlinked individual
- * file is rejected the same way (S_ISLNK check right after lstat(), below)
- * -- an earlier version of this fix let it through, since lstat()'s
- * S_ISDIR is only false for it, same as for a plain file, so it fell
- * through to the ordinary is_playable_file() check; a later audit flagged
- * that as a real path-traversal gap (a playable-extension symlink can
- * point anywhere on the filesystem, feeding arbitrary on-device file
- * content into the tag parsers below).
- *
- * Directories are visited in readdir() order (not sorted) since the whole
- * result gets one final sort by full path anyway -- sorting each
- * directory's entries individually first would be wasted work. */
+/* Recursively scans directories up to SCAN_ALL_SONGS_MAX_DEPTH. Uses lstat()
+ * and rejects symlinks (both directories and files) to prevent recursion loops
+ * and path traversal outside the music root. Entries are visited in readdir()
+ * order since the final result is sorted by full path. */
 #define SCAN_ALL_SONGS_MAX_DEPTH 64
 static void scan_all_songs_recursive(const char * dir_path, char *** paths, int * count, int * capacity, int depth,
                                       atomic_int * progress) {
@@ -359,17 +330,7 @@ static void scan_all_songs_recursive(const char * dir_path, char *** paths, int 
          * parameter's own doc comment in file_browser.h. */
         if (progress) atomic_fetch_add_explicit(progress, 1, memory_order_relaxed);
         if (!stat_ok) continue;
-        /* Audit finding: a symlinked directory is already excluded by
-         * lstat() above (S_ISDIR is false for it, matching this file's own
-         * "no legitimate reason for a scan of the music root to leave it
-         * via a symlink" reasoning) -- but per this function's own header
-         * comment, a symlinked individual FILE was deliberately still
-         * followed. That lets a crafted SD card point a playable-extension
-         * symlink at an arbitrary on-device path (e.g. /usr/data/
-         * wpa_supplicant.conf), feeding attacker-chosen file content into
-         * the tag parsers this same audit found multiple crash bugs in
-         * (ID3v2/M4A) -- reject every symlink outright, not just directory
-         * ones. */
+        /* Reject symlinks to prevent path traversal outside the music root. */
         if (S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
@@ -379,17 +340,7 @@ static void scan_all_songs_recursive(const char * dir_path, char *** paths, int 
         if (!is_playable_file(de->d_name)) continue;
 
         if (*count == *capacity) {
-            /* Audit finding: same unguarded-realloc crash risk as scan_
-             * directory() above, plus a second bug specific to this one --
-             * *capacity was doubled BEFORE the realloc even ran, so a
-             * failure left *paths NULL while *capacity already reflected
-             * the bigger size, meaning the very next growth check wouldn't
-             * even fire again and every recursive call would keep writing
-             * through the NULL pointer. Compute the new size into a local
-             * first and only commit *paths and *capacity once realloc
-             * actually succeeds; on failure, stop collecting more entries at this
-             * recursion level (every other in-flight/future call converges
-             * the same way once real OOM is reached) rather than crash. */
+            /* Safely reallocate paths array; stop collecting entries on failure. */
             int new_capacity = *capacity ? *capacity * 2 : 64;
             char ** grown = realloc(*paths, sizeof(char *) * (size_t) new_capacity);
             if (!grown) break;
@@ -417,25 +368,28 @@ static int compare_paths(const void * a, const void * b) {
 static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_visit_cb_t cb, void * user,
                                      int * count, int depth, atomic_int * progress,
                                      const char * excluded_top_level_dir) {
-    if (depth > SCAN_ALL_SONGS_MAX_DEPTH) return true;
+    if (depth > SCAN_ALL_SONGS_MAX_DEPTH) return false;
 
     DIR * dir = opendir(dir_path);
-    if (!dir) return true;
+    if (!dir) return false;
 
     bool keep_going = true;
     struct dirent * de;
-    while (keep_going && (de = readdir(dir)) != NULL) {
+    while (keep_going) {
+        errno = 0;
+        de = readdir(dir);
+        if (!de) { if (errno) keep_going = false; break; }
         if (de->d_name[0] == '.') continue;
 
         char full_path[PATH_MAX];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, de->d_name);
+        int length = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, de->d_name);
+        if (length < 0 || (size_t) length >= sizeof(full_path)) { keep_going = false; break; }
 
         struct stat st;
         bool stat_ok = lstat(full_path, &st) == 0;
         if (progress) atomic_fetch_add_explicit(progress, 1, memory_order_relaxed);
-        if (!stat_ok) continue;
-        /* Audit finding -- see scan_all_songs_recursive()'s own comment,
-         * the sibling walker this mirrors. */
+        if (!stat_ok) { keep_going = false; break; }
+        /* Reject symlinks to prevent path traversal outside the music root. */
         if (S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
@@ -514,24 +468,14 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(list, 0, 0);
     lv_obj_set_style_border_width(list, 0, 0);
-    /* Vertical-only -- a plain lv_obj_create() defaults to scrollable in
-     * every direction, which real-hardware testing showed capturing the
-     * app-wide horizontal back-swipe as a (no-op) scroll attempt instead of
-     * letting it escalate to LV_EVENT_GESTURE. Still scrolls vertically
-     * fine for a directory with more files than fit on screen. */
+    /* Vertical-only scrolling so horizontal back-swipe gestures can escalate
+     * to LV_EVENT_GESTURE instead of being consumed as scroll events. */
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
-    /* Real-device bug report: same root cause as build_compact_list_widget()'s
-     * own fix in screen_builders.c (see that function's comment) -- this
-     * container never zeroed its own padding, so it carried LVGL's default
-     * object theme padding on top of every row's own centering math, shifting
-     * the whole Files screen's rows right and clipping them against the
-     * screen edge. Flex CENTER cross-axis alignment does NOT compensate for
-     * this on its own -- confirmed the hard way on build_pill_list_screen(),
-     * which had the identical bug despite also using CENTER alignment. */
+    /* Clear default theme padding so rows center properly without edge clipping. */
     lv_obj_set_style_pad_all(list, 0, 0);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(list, 4, 0);
-    lv_obj_set_style_pad_top(list, 4, 0);
+    lv_obj_set_style_pad_gap(list, GUI_ROW_GAP, 0);
+    lv_obj_set_style_pad_top(list, GUI_ROW_GAP, 0);
     /* Rows are LIST_ROW_WIDTH_WIDE (476px, this device's 480px-wide screen
      * minus a thin 4px margin) -- explicit cross-axis centering so that
      * width is guaranteed to sit centered within this full-width container. */
@@ -541,19 +485,8 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
     rebuild_list();
 }
 
-/* Real-device bug report (2026-08-08): the Files screen's own listing (root
- * and any subdirectory) is otherwise only ever scanned once -- at
- * file_browser_init() time (app boot) and again on each interactive
- * up/entry click above -- so an SD-card hotplug event that happens while the
- * user isn't actively navigating the browser (or on the very first view of
- * the root, before any click) left it showing a stale snapshot: files that
- * no longer exist after a card is pulled, or a newly inserted card's
- * content not showing up at all without the user manually navigating away
- * and back. Called from gui.c's poll_sd_card_hotplug() on both the
- * unmounted->mounted and mounted->unmounted edges. Resets back to the
- * browser's root (not just re-scanning whatever directory happened to be
- * current) since a directory the user was sitting in on a since-removed SD
- * card may no longer exist at all. */
+/* Resets the browser to root and refreshes the directory listing on SD card
+ * hotplug events (mount/unmount) to avoid displaying stale or removed files. */
 void file_browser_reset_to_root(void) {
     if (!list) return; /* gui_library_get_files_screen() not built yet -- nothing to refresh */
     snprintf(current_dir, sizeof(current_dir), "%s", root_dir);

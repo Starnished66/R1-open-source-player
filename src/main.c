@@ -60,10 +60,21 @@ static uint64_t perf_now_us(void) {
  * target-only headers transitively), so this is the only declaration
  * gui_init() gets there. */
 extern void gui_init(uint32_t screen_width, uint32_t screen_height);
+/* Host builds do not install the target crash handler. Shared workers still
+ * call this hook, so retain a no-op definition for the simulator. */
+void install_thread_crash_altstack(void) {}
 #endif
 
 #ifndef HOST_BUILD
 #include <ucontext.h>
+
+/* See scan_one_song_into_db()'s own comment (gui_library.c) -- best-effort
+ * "what file was the scanner working on" breadcrumb for the metadata-parser
+ * SIGBUS investigation below. Reading a global char array from a signal
+ * handler is safe (no allocation, no lock); it may show a slightly stale
+ * or empty path if the crash isn't actually in the scanner at all, which is
+ * fine for a diagnostic that costs nothing to include either way. */
+extern char g_scan_last_path[PATH_MAX];
 
 /* Temporary investigation instrumentation for the "enabling/disabling
  * plugins triggers a reboot" report -- a live dmesg capture already
@@ -96,6 +107,15 @@ static void crash_diag_handler(int sig, siginfo_t * info, void * ucontext_v) {
             "[pid=%ld] *** CRASH sig=%d fault_addr=%p pc=%08lx ra=%08lx sp=%08lx a0=%08lx a1=%08lx ***\n",
             (long) getpid(), sig, info ? info->si_addr : NULL, pc, ra, sp, a0, a1);
         if (len > 0) { ssize_t r = write(fd, buf, (size_t) len); (void) r; }
+        if (g_scan_last_path[0]) {
+            len = snprintf(buf, sizeof(buf), "[pid=%ld]   scan_last_path = %s\n",
+                            (long) getpid(), g_scan_last_path);
+            if (len > 0) {
+                /* snprintf returns the required length even when truncated. */
+                size_t written = (size_t) len < sizeof(buf) ? (size_t) len : sizeof(buf) - 1;
+                ssize_t r = write(fd, buf, written); (void) r;
+            }
+        }
         for (unsigned long addr = sp; addr < sp + 2048 && addr >= sp; addr += 4) {
             unsigned long word = *(unsigned long *) addr;
             if (word >= 0x400000UL && word < 0x9d0000UL) {
@@ -109,6 +129,29 @@ static void crash_diag_handler(int sig, siginfo_t * info, void * ucontext_v) {
     }
     signal(sig, SIG_DFL);
     raise(sig);
+}
+
+/* sigaltstack() is a per-THREAD attribute, unlike sigaction() (process-wide
+ * -- the SIGSEGV/SIGBUS disposition set up above already covers every
+ * thread). A thread that never calls this still runs crash_diag_handler()
+ * on its OWN stack if it crashes, even with SA_ONSTACK requested -- fine for
+ * an ordinary crash, useless for the specific failure mode this exists for:
+ * a genuine stack overflow on library_rescan_thread/album_thumb_gen_thread/
+ * album_thumbnail_thread (see LIBRARY_RESCAN_THREAD_STACK_SIZE/ALBUM_COVER_
+ * DECODE_THREAD_STACK_SIZE, gui_library.c), where the thread's own stack is
+ * exactly what's exhausted and has no room left to run this handler at all.
+ * Each of those three threads calls this once, right at its own start.
+ * _Thread_local, not a shared/malloc'd buffer: sigaltstack() requires the
+ * memory to remain valid for as long as it might be used, which for a
+ * detached/joined worker thread is its own entire lifetime -- a per-thread
+ * static gives every thread its own without manual alloc/free bookkeeping. */
+void install_thread_crash_altstack(void) {
+    static _Thread_local uint8_t altstack_buf[32768];
+    stack_t ss;
+    ss.ss_sp = altstack_buf;
+    ss.ss_size = sizeof(altstack_buf);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
 }
 
 /* Polls /dev/fb0 with a real open()+ioctl() check rather than trusting the
@@ -257,7 +300,19 @@ int main(int argc, char ** argv) {
     struct sigaction crash_sa;
     memset(&crash_sa, 0, sizeof(crash_sa));
     crash_sa.sa_sigaction = crash_diag_handler;
-    crash_sa.sa_flags = SA_SIGINFO;
+    /* SA_ONSTACK: without it, a genuine stack overflow (this handler's own
+     * reason for existing right now -- see install_thread_crash_altstack()'s
+     * own comment) has nowhere left to run this handler AT ALL, since the
+     * thread's own stack is exactly what's exhausted. Real-device symptom
+     * this explains: two reproductions of the same album-art-decode crash
+     * this investigation is chasing rebooted with NO reload_diag.log entry
+     * at all, unlike three earlier reproductions that logged cleanly --
+     * consistent with the handler itself failing to run on an already-
+     * overflowed stack rather than the crash suddenly becoming unloggable.
+     * Only takes effect for a thread that has itself called sigaltstack()
+     * (install_thread_crash_altstack() below) -- this flag alone does not
+     * retroactively protect a thread that never registered one. */
+    crash_sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigaction(SIGSEGV, &crash_sa, NULL);
     sigaction(SIGBUS, &crash_sa, NULL);
 #endif

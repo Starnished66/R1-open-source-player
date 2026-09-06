@@ -13,22 +13,8 @@
 #include <errno.h>
 #include <stdatomic.h>
 
-/* Audit finding: playlist_files_append() writes directly into the live
- * .m3u file, while playlist_files_remove() reads the whole file, writes a
- * filtered copy to a temp file, and atomically rename()s it over the
- * original -- with nothing serializing the two. The GUI thread and the
- * remote-control HTTP server thread (see remote_control.c) both reach
- * these functions, so a remove() that started reading before a concurrent
- * append()'s write lands can rename its own (now-stale) snapshot over the
- * file afterward, silently discarding the just-appended line with no error
- * surfaced to either caller -- a real, reachable lost update, not just a
- * theoretical one. One process-wide mutex around every mutating operation
- * (append/remove/create/delete) is simple and correct: these are rare,
- * user-initiated edits, not a hot path, so serializing across all
- * playlists rather than per-file is a fine trade for not having to manage
- * per-path lock lifetimes. playlist_files_migrate_to_relative() doesn't
- * need it -- its own doc comment guarantees it only ever runs once, before
- * any other thread could be touching playlists. */
+/* Process-wide mutex serializing mutating operations (append, remove, create, delete)
+ * across threads to prevent concurrent file modifications. */
 static pthread_mutex_t playlist_files_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t refresh_thread;
 static bool refresh_running;
@@ -154,11 +140,8 @@ static void normalize_path(char * path, size_t path_size) {
     }
 }
 
-/* fsync()s a directory's own inode -- needed after a rename() into it for
- * the rename itself to survive an unclean shutdown, same "write tmp ->
- * fsync tmp -> rename -> fsync directory" recipe settings.c's own
- * settings_save() uses (added there after a real data-loss incident on
- * this device's UBIFS partition from an fclose()+rename() alone). */
+/* fsync()s a directory's inode after a rename() so the change survives an
+ * unclean shutdown (atomic write tmp -> fsync tmp -> rename -> fsync directory). */
 static void fsync_dir(const char * dir_path) {
     int dir_fd = open(dir_path, O_RDONLY);
     if (dir_fd < 0) return;

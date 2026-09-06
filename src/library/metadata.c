@@ -23,23 +23,9 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Real bug caught in a second review pass: the WMA/DFF/WAV-ID3-fallback
- * chunk walkers below used to compute their own `next` seek target as
- * `chunk_start + (long) size + pad` -- a raw uint64_t `size` straight off
- * disk, cast then added with no bound checking first. A forward-progress
- * check (`next <= chunk_start`) was already added after that computation to
- * stop a corrupted file from looping forever, but the computation itself
- * could already have invoked undefined behavior (signed overflow in the
- * addition -- not just the implementation-defined truncation the cast
- * alone would be) before that check ever runs; a post-hoc sanity check
- * can't retroactively make an already-UB expression's result trustworthy.
- * This validates the raw, still-unsigned `size` against a safe bound
- * BEFORE any cast or addition touches it, so the arithmetic that actually
- * produces `next` can never overflow in the first place. Returns false
- * (leaving *out_next untouched) if `size` is too large to safely add to
- * `chunk_start` at all -- every call site below already treats "can't
- * compute a valid next position" the same as "doesn't advance", i.e. stop
- * walking this chunk list. */
+/* Validates that adding size and pad to chunk_start will not overflow a
+ * signed long. Returns true and writes the next seek offset to *out_next on
+ * success, or false if size exceeds safe bounds. */
 static bool safe_chunk_advance(long chunk_start, uint64_t size, long pad, long * out_next) {
     if (chunk_start < 0 || pad < 0) return false;
     if (size > (uint64_t) (LONG_MAX - pad)) return false;
@@ -102,18 +88,8 @@ static void apply_sequence_text(track_metadata_t * out, bool disc, const char * 
     }
 }
 
-/* strtod() wrapper used by every REPLAYGAIN_* field below -- only reports
- * success when at least one digit was actually consumed (an empty or
- * garbage value silently returns 0.0 from plain strtod, which would
- * otherwise be accepted as a spurious valid 0dB tag) and the result is
- * finite. NaN/Infinity is the dangerous case, not garbage: strtod() itself
- * accepts literal "nan"/"inf"/"infinity" text per C99, and either one
- * reaching audio.c's apply_gain() would hit lrintf() on a non-finite value
- * -- undefined behavior in C. This codebase already had one real incident
- * from an unguarded NaN reaching raw sample math (peq.c's shelf-filter
- * sqrt(), see its own comment) from a bad but well-formed-looking input;
- * closing the same class of bug here rather than trusting every tagger (or
- * a hand-edited/corrupted file) to only ever write sane numbers. */
+/* strtod() wrapper for REPLAYGAIN_* fields. Reports success only when at least
+ * one digit was consumed and the parsed float is finite (rejecting NaN and Infinity). */
 static bool parse_finite_double(const char * str, double * out) {
     char * end = NULL;
     double v = strtod(str, &end);
@@ -130,18 +106,8 @@ static bool parse_finite_double(const char * str, double * out) {
  * keys too, so this tag family isn't actually Vorbis-specific despite the
  * name). value is bounded-copied into a small stack buffer first since
  * neither caller's value buffer is guaranteed NUL-terminated. */
-/* Real bug caught in a second review pass: parse_finite_double() rejects
- * non-finite text (literal "nan"/"inf") but happily accepts an absurd-but-
- * finite value like "1e308" -- gain_db that large overflows pow(10.0,
- * gain_db/20.0) in audio.c's replaygain_to_linear() to +/-infinity, which
- * (absent a peak tag to clamp it, not every tagger writes one) reaches
- * apply_gain()'s lrintf() call on a non-finite float, the same unspecified-
- * result class of bug the finite check was meant to close in the first
- * place. Real-world ReplayGain gain values sit within a few dB of 0 (loud-
- * to-quiet mastering differences rarely exceed +-20dB); real peak values
- * are a linear ratio a bit above or below 1.0. These bounds are already
- * generous by an order of magnitude or more on both sides -- anything
- * outside them is corrupted, not just unusually mastered. */
+/* Bounds ReplayGain values to sane limits (+-100 dB gain, 0..100 peak ratio)
+ * to prevent floating-point overflow during linear gain conversion. */
 #define REPLAYGAIN_GAIN_DB_LIMIT 100.0
 #define REPLAYGAIN_PEAK_LIMIT 100.0
 
@@ -771,48 +737,16 @@ static bool read_id3v2(FILE * f, track_metadata_t * out, bool include_blobs) {
         return false;
     }
 
-    /* Real-device bug report: album art missing entirely from some
-     * libraries, and corrupted/pixelated on larger images from others.
-     * Root cause -- the tag header's own unsynchronization flag (bit 0x80
-     * of the flags byte, header[5]) was never checked. When a tagger sets
-     * it (an ID3v2.3+ mechanism that inserts a spurious 0x00 after every
-     * 0xFF byte in the tag body, so a naive MP3 player scanning raw bytes
-     * for a false sync signal (0xFF Ex) can't mistake tag content for the
-     * start of an audio frame), every frame's payload needs those inserted
-     * 0x00s stripped back out before it means anything. Plain text frames
-     * (title/artist/...) rarely contain a raw 0xFF byte, so this went
-     * unnoticed there -- but a JPEG bytestream is full of 0xFF marker
-     * bytes (SOI/EOI/DHT/DQT/...), so an unsynchronized tag's embedded
-     * APIC picture data was corrupted by scattered stray 0x00 bytes almost
-     * every time, either failing to decode at all (in the "missing
-     * entirely" library) or partially decoding with visible artifacts (the
-     * "pixelated/corrupted" one) depending on where the corruption landed
-     * relative to the JPEG's own structure. Fixed by de-unsynchronizing
-     * the whole tag body in place, in one pass, before any frame is parsed
-     * -- same standard fix every real ID3v2 reader applies, done once here
-     * rather than per-frame since it only matters for the tag-level flag.
-     * See further down for the rarer per-frame variant, now also handled. */
+    /* De-unsynchronize tag body in place if the header unsynchronization flag
+     * (bit 0x80) is set, stripping inserted 0x00 bytes following 0xFF bytes. */
     if (flags & 0x80) {
         tag_size = id3_deunsync_in_place(tag_data, tag_size);
     }
 
     uint32_t body_start = 0;
 
-    /* Real-device bug report (persisting after the tag-level unsync fix
-     * above): an ID3v2.3/2.4 tag can carry an optional extended header
-     * (flags bit 0x40) between the 10-byte tag header and the first real
-     * frame -- some taggers (certain foobar2000/Mp3tag configurations,
-     * e.g. writing a CRC) include one. Left unskipped, its bytes get
-     * misread as a bogus frame ID + frame size, which either desyncs
-     * every frame boundary for the rest of the tag or trips the frame
-     * loop's own bounds check and aborts it immediately -- silently
-     * dropping every frame, title/artist/APIC alike. Sizes differ by spec
-     * version: ID3v2.4's extended header size field includes itself (skip
-     * exactly that many bytes); ID3v2.3's excludes it (skip 4 more, for
-     * the size field itself). Doesn't apply to ID3v2.2 -- its flags byte
-     * has no extended-header bit at all (only unsynchronisation and a
-     * near-never-used whole-tag compression bit), so this is guarded to
-     * major_version >= 3. */
+    /* Skip the optional extended header if present (flags bit 0x40).
+     * In ID3v2.4 the size includes itself; in ID3v2.3 it excludes the 4-byte size field. */
     if (major_version >= 3 && (flags & 0x40) && tag_size >= 4) {
         uint32_t ext_size = read_be32(tag_data, major_version >= 4);
         uint32_t ext_total = (major_version >= 4) ? ext_size : (ext_size + 4);
@@ -822,16 +756,8 @@ static bool read_id3v2(FILE * f, track_metadata_t * out, bool include_blobs) {
     bool found_any = false;
 
     if (major_version <= 2) {
-        /* Real-device bug report: ID3v2.2 tags (written by older tools --
-         * early iTunes, old EasyTAG/Winamp versions) use 3-character frame
-         * IDs and 6-byte frame headers (3-char ID + 3-byte non-synchsafe
-         * size), with no per-frame flags at all -- structurally different
-         * from ID3v2.3/2.4's 10-byte headers the loop below assumes.
-         * Running that parser against a v2.2 tag misreads every frame
-         * boundary starting with the very first frame, typically finding
-         * nothing at all (not just missing art -- title/artist too).
-         * PIC (the v2.2 picture frame) also has a different body layout
-         * than APIC -- see decode_id3v2_pic_frame()'s own comment. */
+        /* ID3v2.2 uses 3-character frame IDs and 6-byte frame headers (3-char ID
+         * plus 3-byte size without flags). PIC picture frames use a distinct layout. */
         uint32_t pos = body_start;
         while (pos + 6 <= tag_size) {
             if (tag_data[pos] == '\0') break;
@@ -893,43 +819,13 @@ static bool read_id3v2(FILE * f, track_metadata_t * out, bool include_blobs) {
         uint32_t frame_size = read_be32(tag_data + pos + 4, frame_size_synchsafe);
         uint8_t frame_flags2 = tag_data[pos + 9];
         pos += 10;
-        /* Audit finding: a v2.3 tag (frame_size_synchsafe == false) stores
-         * frame_size as a plain, fully attacker-controlled 32-bit value --
-         * unlike v2.4's synchsafe encoding, which caps it at 0x0FFFFFFF and
-         * can never overflow this addition for any realistic tag_size. The
-         * previous `pos + frame_size > tag_size` check computed that sum in
-         * uint32_t before comparing, so a frame_size near UINT32_MAX wraps
-         * the sum back under tag_size and passes -- after which the RAW,
-         * unwrapped frame_size (not the wrapped sum) is used as frame_
-         * data_size below and handed straight to decode_id3v2_text_frame()/
-         * decode_id3v2_apic_frame(), reading up to ~4GB past the malloc()'d
-         * tag_data buffer. Subtracting instead of adding avoids the
-         * overflow entirely: pos <= tag_size is already guaranteed by this
-         * loop's own `pos + 10 <= tag_size` condition above, so tag_size -
-         * pos can't underflow, and this comparison is exact for any
-         * frame_size value up to UINT32_MAX. */
+        /* Bound frame_size against remaining tag size using subtraction to avoid 32-bit overflow. */
         if (frame_size > tag_size - pos) break;
         uint32_t next_pos = pos + frame_size; /* safe now -- frame_size <= tag_size - pos, just proven above; may still be adjusted below */
 
-        /* Real-device bug report (persisting after the tag-level unsync fix
-         * above): the two per-frame flag bytes were read but never
-         * interpreted. ID3v2.4 adds a *per-frame* unsynchronisation bit
-         * independent of the tag-level one already handled above -- a
-         * tagger can leave the tag-level flag off and still set it only on
-         * the APIC frame -- plus an optional grouping-identity byte and a
-         * data-length-indicator field prepended to the frame body, and
-         * compression/encryption bits this codebase has no decoder for.
-         * Left unhandled, any of these silently feeds the wrong bytes (or
-         * genuinely compressed/encrypted ones) into the APIC decoder as if
-         * they were raw image data -- exactly the "still pixelated/
-         * corrupted" symptom reported after the tag-level fix alone. Frame
-         * flag byte layout differs between v2.3 and v2.4 (same two byte
-         * positions, different bit meanings); v2.3 has no per-frame unsync
-         * bit (added in v2.4) and no separate data-length-indicator bit (a
-         * compressed v2.3 frame always carries that 4-byte prefix
-         * unconditionally, per spec). Compressed/encrypted frames are
-         * skipped entirely (not fed to any decoder) rather than risking
-         * garbage output. */
+        /* Interpret per-frame flag bytes for v2.3 and v2.4 (per-frame unsync,
+         * grouping identity, data-length indicators, and compression/encryption).
+         * Unsupported compressed or encrypted frames are skipped. */
         bool frame_compressed, frame_encrypted, frame_grouped, frame_unsync, frame_has_data_len;
         if (major_version >= 4) {
             frame_compressed = (frame_flags2 & 0x08) != 0;
@@ -1050,16 +946,8 @@ static void read_mp3_metadata(const char * path, track_metadata_t * out, bool in
     fclose(f);
 }
 
-/* Real-device bug report: album art (and title/artist/album) missing
- * entirely for raw AAC (.aac, ADTS/ADIF bitstream, as opposed to .m4a's
- * MP4 container) files -- metadata_read()'s dispatch below had no branch
- * for this extension at all, so every .aac file silently got a fully
- * zeroed track_metadata_t regardless of what tags it actually carried.
- * Raw AAC files are commonly tagged the exact same way MP3s are -- a
- * prepended ID3v2 tag (and/or a trailing ID3v1 one) sitting directly in
- * front of/behind the raw ADTS frames, which the tagging software doesn't
- * need to know or care is AAC rather than MP3 -- so this reuses
- * read_id3v2()/read_id3v1() verbatim rather than needing any new parser. */
+/* Raw AAC (.aac, ADTS/ADIF) metadata parser. Parses prepended ID3v2 or trailing
+ * ID3v1 tags commonly placed around raw ADTS streams. */
 static void read_aac_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
@@ -1118,20 +1006,7 @@ static bool m4a_read_box_header(FILE * f, m4a_box_t * out) {
         out->header_size = 8;
     }
 
-    /* Audit finding: a malformed/malicious box whose declared size32 is
-     * less than its own 8-byte header (e.g. 2-7) was accepted as-is here.
-     * m4a_find_child()'s `next = (data_start - header_size) + size` then
-     * seeks BACKWARD, behind the header it just read -- and since the
-     * attacker fully controls the bytes there, the re-read header can be
-     * forced to keep producing the same tiny size indefinitely, taking
-     * m4a_find_child()'s `while (ftell(f) < end)` loop a very long time (in
-     * the worst case, effectively forever for a large enough container) to
-     * naturally walk past `end` two bytes at a time. metadata_read() (not
-     * the fork-isolated metadata_read_isolated()) reaches this directly on
-     * the tap-to-play path, so a single malicious .m4a file hangs the UI
-     * thread. A box this small can never legitimately exist (it can't even
-     * fit its own header), so reject it here at the source rather than
-     * patching every walker that calls this. */
+    /* Reject malformed boxes smaller than their own header. */
     if (out->size < (uint64_t) out->header_size) return false;
 
     /* FILE/fseek use a 32-bit long on the target. Validate the still-
@@ -1453,15 +1328,8 @@ static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out, 
     stb_vorbis_close(f);
 }
 
-/* ---- AIFF/AIFC: metadata_read() previously had no branch for this
- * extension at all -- same silently-fully-zeroed track_metadata_t bug as
- * AAC's own, above. AIFF's real-world tagging convention (iTunes and most
- * other taggers) is a plain embedded "ID3 " IFF chunk, so this reuses
- * read_id3v2() verbatim once positioned at that chunk's data, same as
- * read_aac_metadata() does. Deliberately an independent chunk walk from
- * aiff_decoder.c's own open() (which stops the moment COMM+SSND are both
- * found, since decoding needs nothing past that) -- an ID3 chunk is
- * commonly placed AFTER SSND, so this scans every chunk to EOF instead. */
+/* AIFF/AIFC metadata parser. Reads embedded "ID3 " IFF chunks, which are often
+ * positioned after the SSND chunk. */
 static void read_aiff_metadata(const char * path, track_metadata_t * out) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
@@ -1488,13 +1356,7 @@ static void read_aiff_metadata(const char * path, track_metadata_t * out) {
             break;
         }
 
-        /* Chunks are padded to an even number of bytes, same as
-         * aiff_decoder.c's own walk. Real bug caught in review: this loop
-         * had no bound at all (not even a forward-progress check) -- a
-         * corrupted chunk_size could seek back to chunk_start and loop
-         * here forever, reachable via plain metadata_read() (not just the
-         * isolated/timeout variant) whenever a user taps to play a
-         * corrupted AIFF file. */
+        /* Chunks are 2-byte aligned; ensure forward progress to prevent infinite loops on corrupted files. */
         long next;
         if (!safe_chunk_advance(chunk_data_start, chunk_size, (long) (chunk_size & 1), &next) ||
             next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
@@ -1503,25 +1365,8 @@ static void read_aiff_metadata(const char * path, track_metadata_t * out) {
     fclose(f);
 }
 
-/* ---- WAV, take 2: real-device bug report -- an album ripped/tagged with
- * an embedded ID3v2 tag (a real, if non-standard, WAV tagging convention
- * some tools use, same underlying frame format as MP3's own tags) showed no
- * metadata at all. read_wav_metadata() above only reads the RIFF LIST/INFO
- * chunk via dr_wav's own metadata API, which has no support for this
- * convention (confirmed by reading dr_wav.h's own drwav_metadata_type_*
- * enum -- there is no id3 entry). Root-caused by pulling one of the actual
- * files off the device and walking its chunks by hand: RIFF/WAVE, "fmt ",
- * "data" (48MB of PCM), then a trailing lowercase "id3 " chunk holding a
- * standard ID3v2.4 tag (TIT2/TPE1/TALB/TRCK frames) -- placed AFTER the
- * audio data, same reasoning read_aiff_metadata() above already documents
- * for why a full scan-to-EOF is needed rather than stopping once fmt+data
- * are found (which is all dsd_decoder.c-style decoding itself ever needs).
- * Same chunk-ID case-uncertainty AIFF/DFF already ran into for their own
- * embedded ID3 chunks -- matched case-insensitively here too rather than
- * assuming every tagger writes the same case. Only called as a fallback,
- * from metadata_read()'s own WAV dispatch, when read_wav_metadata() found
- * nothing -- the two conventions aren't expected to coexist, but checking
- * has_title first avoids ever overwriting a real LIST/INFO read. */
+/* WAV ID3 fallback parser. Scans for embedded "id3 " / "ID3 " RIFF chunks
+ * (often placed after audio data) when standard RIFF LIST/INFO chunks are absent. */
 static void read_wav_id3_fallback(const char * path, track_metadata_t * out) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
@@ -1549,13 +1394,7 @@ static void read_wav_id3_fallback(const char * path, track_metadata_t * out) {
             break;
         }
 
-        /* Chunks are padded to an even number of bytes, same RIFF convention as every other chunk here.
-         * Real bug caught in review, hardened in a second pass: validating
-         * `size` before any cast/add (safe_chunk_advance()) rather than
-         * just sanity-checking `next` after computing it -- a post-hoc
-         * check can't undo an already-UB signed-overflow addition that ran
-         * to produce a bad `next` in the first place. This loop has no
-         * other bound at all besides forward progress. */
+        /* Chunks are 2-byte aligned; validate size and ensure forward progress to prevent infinite loops. */
         long next;
         if (!safe_chunk_advance(chunk_data_start, chunk_size, (long) (chunk_size & 1), &next) ||
             next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
@@ -1570,13 +1409,8 @@ static uint64_t read_u64le(const uint8_t * b) {
     return v;
 }
 
-/* ---- DSF: same missing-branch bug as AIFF's above. The DSF spec's own
- * "DSD " master chunk (magic(4) + chunkSize u64LE(8) + totalFileSize
- * u64LE(8) + metadataPointer u64LE(8) -- identical layout to
- * dsd_decoder.c's own open_dsf(), which only reads this same 28-byte chunk
- * for its non-metadata fields) carries a direct file-offset pointer to an
- * ID3v2 tag, zero if the file has none -- reuses read_id3v2() verbatim
- * once seeked there, no new tag-format parser needed. */
+/* DSF metadata parser. Reads the ID3v2 metadataPointer offset from the "DSD "
+ * master chunk and parses the ID3v2 tag. */
 static void read_dsf_metadata(const char * path, track_metadata_t * out) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
@@ -1707,14 +1541,7 @@ static void read_ape_metadata(const char * path, track_metadata_t * out) {
             if (value && fread(value, 1, value_length, f) == value_length) {
                 if ((item_flags & 0x6) == 0) { /* bits 1-2 of item_flags: 0 = UTF-8 text */
                     apply_title_artist_album_field(out, key, key_len, value, value_length);
-                    /* APEv2 is Monkey's Audio's native tag format -- real
-                     * taggers write the same REPLAYGAIN_TRACK_GAIN/_PEAK/
-                     * _ALBUM_GAIN/_ALBUM_PEAK keys here as Vorbis comments
-                     * use, just via APEv2's own already-split key/value
-                     * item framing instead of a "KEY=VALUE" string. Real
-                     * gap this session's own bug-analyzer review caught:
-                     * .ape files got zero ReplayGain support (neither Per
-                     * Track nor Per Album) before this. */
+                    /* APEv2 stores ReplayGain keys using the same naming as Vorbis comments. */
                     apply_replaygain_field(out, key, key_len, value, value_length);
                 }
             }
@@ -1779,14 +1606,7 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
             return;
         }
         if (strcmp(id, "DIIN") == 0 && diin_data_start < 0) {
-            /* Real bug caught in a second review pass: this used to
-             * compute diin_end unconditionally, the same raw cast-and-add
-             * every other `next` here was already hardened against below
-             * -- a corrupted `size` could make it overflow just the same.
-             * Only recorded when it can be computed safely; otherwise
-             * diin_data_start stays -1, and the DIIN fallback below simply
-             * never runs for this (corrupted) chunk, same as if no DIIN
-             * chunk had been seen at all. */
+            /* Safely compute diin_end without overflow. */
             long candidate_end;
             if (safe_chunk_advance(chunk_data_start, size, 0, &candidate_end)) {
                 diin_data_start = chunk_data_start;
@@ -1794,15 +1614,7 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
             }
         }
 
-        /* Real bug caught in review, hardened in a second pass: `size` is a
-         * raw uint64_t straight off disk with no validation -- validating
-         * it before any cast/add (safe_chunk_advance()) rather than only
-         * sanity-checking `next` afterward, since a post-hoc check can't
-         * undo an already-UB signed-overflow addition that ran to produce
-         * a bad `next` in the first place. Forward progress is still
-         * required on top of that -- this loop has no other bound at all
-         * (unlike, say, read_wma_metadata()'s own chunk walk, which is at
-         * least capped by a finite object count). */
+        /* Chunks are 2-byte aligned; validate size and ensure forward progress to prevent infinite loops. */
         long next;
         if (!safe_chunk_advance(chunk_data_start, size, (long) (size & 1), &next) ||
             next <= chunk_start || fseek(f, next, SEEK_SET) != 0) break;
@@ -1833,12 +1645,7 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
                 }
             }
 
-            /* This loop's own `while (ftell(f) < diin_end)` bound only
-             * protects against a NEVER-arriving end position -- it doesn't
-             * stop a non-advancing `next` from re-reading the same bytes
-             * forever, since ftell(f) would never move past diin_end in
-             * that case either. Same safe-advance-then-forward-progress
-             * requirement as the outer chunk walk above. */
+            /* Validate subchunk size and ensure forward progress. */
             long next;
             if (!safe_chunk_advance(sub_data_start, sub_size, (long) (sub_size & 1), &next) ||
                 next <= sub_chunk_start || fseek(f, next, SEEK_SET) != 0) break;
@@ -1917,19 +1724,8 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
         if (fread(sub_guid, 1, 16, f) != 16 || fread(sub_size_buf, 1, 8, f) != 8) break;
         uint64_t sub_size = read_u64le(sub_size_buf);
         long data_start = ftell(f);
-        /* Real bug caught in review, hardened in a second pass: sub_size is
-         * raw off disk -- a corrupted file with sub_size < 24 (smaller than
-         * the guid+size header this object's own data is supposed to start
-         * after) used to underflow this subtraction before anything ever
-         * checked it, then feed the wrapped huge value into a cast/add that
-         * could itself already be UB (signed overflow) by the time any
-         * post-hoc sanity check on `next` ran. Rejected outright, before
-         * any arithmetic touches sub_size at all, rather than validated
-         * after the fact. The num_objects loop bound above still caps the
-         * total iteration count on its own, but a non-advancing/backward
-         * `next` could still make this re-read (and effectively hang on)
-         * the same bytes for every remaining one of a corrupted, possibly
-         * huge num_objects -- checked below alongside the actual seek. */
+        /* Ensure sub_size covers the 24-byte header before subtracting,
+         * avoiding underflow and safely advancing to the next object. */
         if (sub_size < 24) break;
         long next;
         if (!safe_chunk_advance(data_start, sub_size - 24, 0, &next)) break;
@@ -2031,36 +1827,13 @@ void metadata_read(const char * path, track_metadata_t * out) {
     metadata_read_internal(path, out, true);
 }
 
-/* Real-device incident: a handful of FLAC files with a malformed leading
- * ID3v2 tag (confirmed via a standalone host-side reproduction: dr_flac's
- * ID3-skip landed at the wrong offset and went on to parse garbage bytes
- * as fake metadata block headers) made a full library rescan grind the
- * whole device to a halt on this single-core, 56MB-RAM target, even though
- * the same files didn't visibly hang on a fast host CPU -- consistent with
- * a garbage block-length value blowing up into a pathologically slow (not
- * strictly infinite, just far too slow to matter) parse loop rather than a
- * hang in the traditional sense. gui.c's own scan already had a thread-
- * based watchdog for a stuck file, but that can only ABANDON a stuck
- * worker thread, never actually stop it (pthread_cancel against arbitrary
- * vendored decoder code mid-flight isn't safe) -- several such files in a
- * row each left one more runaway thread permanently competing for the
- * single core, which reads as "frozen" even though no single file was
- * truly stuck forever.
+/* Isolates decoder-based metadata parsing in a short-lived child process so
+ * timeouts can be cleanly terminated with SIGKILL without leaking threads or
+ * risking memory corruption from decoder crashes.
  *
- * This runs those decoder parses in a short-lived child process instead of
- * the calling thread, exactly like subprocess.c's own SIGKILL-on-timeout
- * pattern (see subprocess_run_timeout()'s doc comment) -- unlike a leaked
- * thread, the OS fully reclaims a killed process's CPU and memory
- * immediately, and a hard crash inside the decoder is contained to that
- * one child instead of taking down the whole app.
- *
- * Forking the static player (~5.6 MiB) once per file is itself the scan
- * bottleneck on this single-core target (~160 ms/file measured on a 60k
- * dummy-MP3 library). MP3/AAC only run our own bounded ID3 reader, so they
- * skip the child. picture_data/lyrics are always dropped -- a rescan only
- * cares about title/artist/album for the DB, and getting a variable-length
- * buffer across a fork boundary isn't worth it for the formats that still
- * isolate. */
+ * MP3 and raw AAC files skip the fork because they use internal bounded ID3
+ * readers. Embedded pictures and lyrics are omitted in isolated reads to keep
+ * IPC fixed-size. */
 static bool isolated_needs_child(const char * path) {
     const char * ext = strrchr(path, '.');
     if (!ext) return false;

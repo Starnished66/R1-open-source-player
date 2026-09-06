@@ -122,10 +122,13 @@
 
 /* Same shape and reasoning as PLUGIN_MAX_DISPLAY_LIST_ITEMS above, for
  * plugin.register_list_item("playback", ...) -- sizes plugin_manager.c's own
- * internal plugin_playback_list_items[] array, and gui.c's build_settings_
- * playback_screen() sizes its own static items[] array off this (6 built-in
- * rows -- "Car Mode", "Crossfade", "Equalizer", "Resume Last Track", "Sleep
- * Timer", "Startup Volume" -- plus this many plugin rows). */
+ * internal plugin_playback_list_items[] array, and gui_settings.c's
+ * build_music_plugins_screen() (Settings > Music Settings > Plugins) sizes
+ * its own static items[] array off this. Plugin rows get their own
+ * dedicated screen now, not appended after native rows -- see build_music_
+ * settings_screen()'s own comment for the six native categories (Playback,
+ * Audio, Controls & Interface, Timers, Library, Plugins) this replaced the
+ * old flat Playback list with. */
 #define PLUGIN_MAX_PLAYBACK_LIST_ITEMS 8
 
 /* Same shape and reasoning as PLUGIN_MAX_DISPLAY_LIST_ITEMS above, for
@@ -331,9 +334,9 @@ void plugin_manager_display_list_item_clicked(int index);
 void plugin_manager_get_display_list_item_options(int index, const char ** out_icon, int32_t * out_height,
                                                    int32_t * out_width, const char ** out_text_size);
 
-/* Same shape again, for plugin.register_list_item("playback", ...) -- gui.c's
- * build_settings_playback_screen() appends these after its own 6 built-in
- * rows. */
+/* Same shape again, for plugin.register_list_item("playback", ...) --
+ * gui_settings.c's build_music_plugins_screen() (Settings > Music Settings >
+ * Plugins) lists these on their own dedicated screen. */
 int plugin_manager_get_playback_list_item_count(void);
 const char * plugin_manager_get_playback_list_item_label(int index);
 void plugin_manager_playback_list_item_clicked(int index);

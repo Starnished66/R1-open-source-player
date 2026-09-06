@@ -1237,7 +1237,7 @@ void gui_subsonic_init(void) {
     lv_image_set_src(subsonic_albums_download_btn, asset_path("stream_media/download.png"));
     lv_obj_set_style_image_recolor(subsonic_albums_download_btn, accent_lv_color(), 0);
     lv_obj_set_style_image_recolor_opa(subsonic_albums_download_btn, LV_OPA_COVER, 0);
-    lv_obj_align(subsonic_albums_download_btn, LV_ALIGN_TOP_RIGHT, -87, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 34) / 2);
+    align_screen_header_action(subsonic_albums_download_btn, 87);
     lv_obj_set_ext_click_area(subsonic_albums_download_btn, 16);
     lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
@@ -1248,7 +1248,7 @@ void gui_subsonic_init(void) {
     lv_image_set_src(subsonic_songs_download_btn, asset_path("stream_media/download.png"));
     lv_obj_set_style_image_recolor(subsonic_songs_download_btn, accent_lv_color(), 0);
     lv_obj_set_style_image_recolor_opa(subsonic_songs_download_btn, LV_OPA_COVER, 0);
-    lv_obj_align(subsonic_songs_download_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 34) / 2);
+    align_screen_header_action(subsonic_songs_download_btn, 20);
     lv_obj_set_ext_click_area(subsonic_songs_download_btn, 16);
     lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);

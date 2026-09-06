@@ -321,8 +321,7 @@ static void set_wifi_rescan_active(bool active) {
     lv_label_set_text(wifi_rescan_btn, active ? "Scanning..." : "Rescan");
     lv_obj_set_style_text_color(wifi_rescan_btn,
                                 active ? lv_color_make(160, 160, 160) : accent_lv_color(), 0);
-    lv_obj_align(wifi_rescan_btn, LV_ALIGN_TOP_RIGHT, -20,
-                 STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    align_screen_header_action(wifi_rescan_btn, 20);
     if (active) {
         lv_obj_remove_flag(wifi_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_state(wifi_rescan_btn, LV_STATE_DISABLED);
@@ -762,7 +761,7 @@ static lv_obj_t * build_wifi_screen(void) {
     lv_label_set_text(wifi_rescan_btn, "Rescan");
     lv_obj_set_style_text_color(wifi_rescan_btn, accent_lv_color(), 0);
     lv_obj_set_style_text_font(wifi_rescan_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(wifi_rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    align_screen_header_action(wifi_rescan_btn, 20);
     lv_obj_add_flag(wifi_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(wifi_rescan_btn, wifi_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
 
@@ -1014,8 +1013,7 @@ static void set_bt_rescan_active(bool active) {
     lv_label_set_text(bt_rescan_btn, active ? "Scanning..." : "Rescan");
     lv_obj_set_style_text_color(bt_rescan_btn,
                                 active ? lv_color_make(160, 160, 160) : accent_lv_color(), 0);
-    lv_obj_align(bt_rescan_btn, LV_ALIGN_TOP_RIGHT, -20,
-                 STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    align_screen_header_action(bt_rescan_btn, 20);
     if (active) {
         lv_obj_remove_flag(bt_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_state(bt_rescan_btn, LV_STATE_DISABLED);
@@ -1292,17 +1290,7 @@ static lv_obj_t * build_bt_dac_overlay_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, bt_dac_overlay_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
+    build_screen_header(scr, NULL, bt_dac_overlay_back_cb, NULL, NULL);
 
     lv_obj_t * icon = lv_image_create(scr);
     lv_image_set_src(icon, asset_path("bt/bt.png"));
@@ -2002,17 +1990,7 @@ static lv_obj_t * build_usb_dac_overlay_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, usb_dac_overlay_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
+    build_screen_header(scr, NULL, usb_dac_overlay_back_cb, NULL, NULL);
 
     lv_obj_t * icon = lv_image_create(scr);
     lv_image_set_src(icon, asset_path("usb/usb.png"));
@@ -2194,7 +2172,7 @@ static lv_obj_t * build_bluetooth_screen(void) {
     lv_label_set_text(bt_rescan_btn, "Rescan");
     lv_obj_set_style_text_color(bt_rescan_btn, accent_lv_color(), 0);
     lv_obj_set_style_text_font(bt_rescan_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(bt_rescan_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    align_screen_header_action(bt_rescan_btn, 20);
     lv_obj_add_flag(bt_rescan_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(bt_rescan_btn, bt_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
 
@@ -2456,23 +2434,7 @@ static lv_obj_t * build_import_wifi_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, import_wifi_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Import via Wi-Fi");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Import via Wi-Fi", import_wifi_back_cb, NULL, NULL);
 
     import_wifi_status_label = lv_label_create(scr);
     lv_obj_set_width(import_wifi_status_label, lv_pct(90));
@@ -2662,17 +2624,7 @@ static lv_obj_t * build_airplay_overlay_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, airplay_overlay_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
+    build_screen_header(scr, NULL, airplay_overlay_back_cb, NULL, NULL);
 
     airplay_overlay_cover_img = lv_image_create(scr);
     lv_image_set_src(airplay_overlay_cover_img, asset_path("playing_plane/default_cover_565.png"));
@@ -2972,23 +2924,7 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Remote Control");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Remote Control", generic_back_cb, NULL, NULL);
 
     /* Same font-tier-aware pill geometry as add_pill_row_base(), built
      * directly here (not via that helper) since it needs to sit above the

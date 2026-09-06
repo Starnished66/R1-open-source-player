@@ -1656,25 +1656,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * corner landing a handful of pixels below a tight 44x44 box (finger
      * imprecision on a small corner target), so the touch area is padded out
      * generously while the icon itself stays centered at its normal size. */
-    lv_obj_t * dismiss_btn = lv_obj_create(scr);
-    player_dismiss_btn = dismiss_btn;
-    lv_obj_set_size(dismiss_btn, 64, 64);
-    lv_obj_align(dismiss_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(dismiss_btn, 0, 0);
-    lv_obj_set_style_border_width(dismiss_btn, 0, 0);
-    lv_obj_remove_flag(dismiss_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(dismiss_btn, LV_OBJ_FLAG_CLICKABLE);
-    /* Visibility toggled dynamically by sync_player_topbar_visibility() per
-     * Settings > Display > "Hide Player/Lyrics Top Bar" -- visible here by
-     * default (its normal, initial-build state) whenever the setting is
-     * off. See build_flattened_transition_frame() for how the Phase 2
-     * transition cache captures this button's TARGET-state visibility
-     * correctly even while Player is inactive, without relying on this
-     * live object's own current flag value. */
-    lv_obj_add_event_cb(dismiss_btn, library_btn_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * dismiss_arrow = lv_image_create(dismiss_btn);
-    lv_image_set_src(dismiss_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(dismiss_arrow);
+    player_dismiss_btn = build_header_back_button(scr, library_btn_event_cb);
 
     /* Title row: song title (left) + favorite icon (right) -- matches the
      * reference layout, where the 3-dot "more" menu lives in the transport

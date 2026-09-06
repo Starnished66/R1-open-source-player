@@ -51,25 +51,14 @@ extern bool active_press_is_over_drag_adjust_widget(void);
  * navigation is the mirror of that. */
 #define NAV_ANIM_TIME_MS 165 /* 220ms * 0.75, per real-hardware feedback */
 
-/* lv_screen_load_anim() animates the real screen OBJECTS, which on this
- * GPU-less MIPS target meant fully re-rendering both the outgoing and
- * incoming screen's whole widget tree on every single animation frame --
- * confirmed via real-hardware testing to be the actual cause of choppy,
- * tearing-prone navigation (not just a refresh-rate/vsync issue). Instead,
- * take ONE snapshot of each screen as a static bitmap up front, and slide
- * those two bitmaps on a top-layer overlay -- "N frames x 2 full re-renders"
- * becomes "2 renders + N cheap bitmap blits". The real target screen is
- * only actually made active once the slide finishes. */
+/* Slide transitions use pre-rendered RGB565 bitmaps rather than animating
+ * the live widget trees. Two static snapshots (one per screen) are blitted
+ * per frame instead of re-rendering both widget trees, then the real target
+ * screen is made active once the slide finishes. */
 
-/* Forward declarations -- real (first) tentative definitions further down
- * this file, alongside the code that actually builds/positions each of
- * these. A plain `static T * x;` with no initializer is a tentative
- * definition in C; declaring the same one twice in one translation unit is
- * fine and merges into a single variable, so this is just an ordering fix,
- * not a second/shadow copy -- build_flattened_transition_frame() below
- * needs all three, and is used by register_static_snapshot() just below
- * it, which is itself defined earlier in the file than any of the real
- * declarations. */
+/* Forward declarations so build_flattened_transition_frame() (below) can
+ * reference these, which is defined before the actual variable definitions
+ * further down the file. */
 
 /* Alpha-blends one row of an ARGB8888 source over an RGB565 destination
  * row, `count` pixels wide -- shared by build_flattened_transition_frame()
@@ -306,34 +295,15 @@ void gui_navigation_invalidate_theme_snapshots(void) {
     lv_async_call(rebuild_theme_snapshots_async_cb, NULL);
 }
 
-/* Player-screen transition-frame cache -- TRANSITION_PERFORMANCE_PLAN.md
- * Phase 2. gui_player_get_screen() is dynamic (track metadata/art/play-state, so it
- * can't just be baked in once like the STATIC_SNAPSHOT_SCREEN_COUNT screens
- * above), but it's also the single most common transition target (every
- * player-swipe and most Home/Now-Playing navigations) and the one whose
- * on-demand lv_snapshot_take() cost is actually visible: confirmed via
- * on-device UI_PERF_TRACE profiling, that snapshot alone typically costs
- * 10-14ms and spiked to ~84ms on a cold cache the first time it ran. This
- * mirrors quick_drawer_mark_snapshot_dirty()/quick_drawer_rebuild_snapshot()
- * above -- the exact same "own an independent bitmap, invalidate lazily,
- * rebuild once via lv_async_call() during the next idle pass instead of on
- * the touch-down path" shape, just for a full-screen target instead of the
- * drawer panel. Rebuilt off the gesture path entirely: at track start, once
- * cover art actually finishes decoding, on play/pause icon changes, on
- * accent-color changes, and when the hide-topbar setting changes -- NOT on
- * every per-second progress-bar tick (deliberately -- see the plan's own
- * Phase 2 requirement 2), so the cached frame's progress fill can be up to
- * a few seconds stale. Always safe to use regardless of staleness: this is
- * an independent owned copy, never aliased to any live widget's own memory,
- * so nothing about "how stale" it is can make it unsafe to display, only
- * slightly out of date -- see begin_slide_transition()'s own use of it.
- * Screen-only base -- deliberately does NOT include the persistent status
- * bar/home-indicator content, for the same staleness reason
- * blend_persistent_bars() explains: this cache is only rebuilt on the
- * dirty triggers above, not every second, so baking in the clock/battery/
- * wifi here would go visibly stale between rebuilds. begin_slide_
- * transition() blends those bars in fresh from this cached base every
- * time it's used. */
+/* Player-screen transition-frame cache. gui_player_get_screen() is dynamic
+ * (track metadata/art/play-state), so it cannot be baked in once like the
+ * static snapshots above. An independent owned copy is rebuilt asynchronously
+ * via lv_async_call() when track art finishes decoding, on play/pause icon
+ * changes, on accent-color changes, and when the hide-topbar setting changes
+ * -- NOT on per-second progress-bar ticks. The cached frame's progress fill
+ * may be a few seconds stale; this is intentional. Always safe to use:
+ * this copy is never aliased to any live widget memory.
+ * Screen-only base -- persistent bars blended in fresh at transition time. */
 static lv_draw_buf_t * player_transition_cache_buf = NULL;
 static bool player_transition_cache_dirty = true;
 
@@ -404,15 +374,9 @@ static void sync_home_indicator_visibility(lv_obj_t * screen) {
  * gui_shell_player_swipe_recover() is called below to reset that state
  * directly on compositor failures. */
 
-/* Shared by two unrelated callers -- both need "the next real
- * lv_timer_handler() pass redraws literally everything" without calling
- * lv_refr_now() synchronously from inside a callback that's itself already
- * running from within an lv_timer_handler() pass (a real reentrancy risk,
- * not just a style preference): slide_transition_anim_x_cb()'s compositor-
- * failure recovery (see its own comment), and update_timer_cb()'s screen-
- * wake handling (NEXT_TODO_IMPLEMENTATION_PROMPT.md Task 1) -- the async
- * call runs within that same lv_timer_handler() invocation, just after all
- * timers finish, which is still effectively immediate either way. */
+/* Defers a full invalidation until the next lv_timer_handler() pass,
+ * avoiding a re-entrant lv_refr_now() from within an animation or timer
+ * callback. Used by compositor failure recovery and screen-wake handling. */
 void full_redraw_async_cb(void * unused) {
     (void) unused;
     lv_obj_invalidate(lv_screen_active());
@@ -769,9 +733,7 @@ void nav_push(lv_obj_t * scr) {
     if (nav_depth < NAV_STACK_MAX) {
         nav_stack[nav_depth++] = scr;
     }
-    /* Live A/B test: forward navigation (entering a submenu) now cuts
-     * instantly instead of sliding -- screen_transition_slide() is still
-     * used by nav_pop() below, so backing out still animates. */
+    /* Forward navigation cuts instantly; back navigation (nav_pop) slides. */
     lv_screen_load(scr);
     sync_player_topbar_visibility(scr);
     sync_home_indicator_visibility(scr);
@@ -848,32 +810,24 @@ void enable_gesture_bubble_recursive(lv_obj_t * obj) {
     }
 }
 
-/* Defined later alongside the rest of the quick-access drawer, but needed
- * here for the swipe-down-from-the-top-edge trigger below. */
-/* Defined later alongside player_swipe_press_excluded()'s own raw-polling
- * dead-zone machinery -- needed here too, by screen_gesture_event_cb()
- * below, see its own comment. */
+/* Used by screen_gesture_event_cb() below -- defined later with the drawer
+ * and dead-zone machinery. */
 #define QUICK_DRAWER_ANIM_MS 120 /* post-release snap animation duration */
 #define QUICK_DRAWER_TRIGGER_ZONE 140 /* swipe-down must start within this many px of the top edge to open it */
 
 /* Global swipe handling for back/forward nav. Swipe left-to-right (finger
- * drags rightward) = go back, matching the standard back gesture shown in
- * the reference photos. Swipe right-to-left (finger drags leftward) = jump
- * straight to the player screen from anywhere, matching the real device's
- * "now playing" shortcut. Registered per-screen in
- * finalize_screen_navigation(), which bubbles correctly via
- * enable_gesture_bubble_recursive() (see its own comment).
+ * drags rightward) = go back. Swipe right-to-left = jump to the player
+ * screen. Registered per-screen in finalize_screen_navigation().
  *
  * Quick-access drawer drag is handled via poll_quick_drawer_drag() rather
  * than gesture events due to high density of interactive widgets on the
  * drawer surface. */
-/* Defined in the search-binding section below -- true (and closes it)
- * if `screen` had an active inline search; forward-declared here so the
- * back-swipe gesture can close search first instead of popping straight
- * past it to the previous screen, same convention as a back button/gesture
- * dismissing an open search box before it navigates anywhere. */
 
-/* Same for the Files screen: steps up one directory instead of leaving it. */
+/* Forward-declared from the search-binding section below: closes an active
+ * inline search before the back-swipe navigates away. */
+
+/* Forward-declared from gui_library.c: steps up one directory in Files
+ * instead of leaving the screen. */
 
 static void screen_gesture_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;

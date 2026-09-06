@@ -115,9 +115,38 @@ static void check_layout(int display_height) {
     assert(lv_obj_get_y(subtitle) >= lv_font_get_line_height(&app_font_22));
     assert(lv_obj_get_y(subtitle) + lv_obj_get_height(subtitle) + lv_obj_get_style_pad_top(first, 0) <= lv_obj_get_height(first));
     screenshot(screen, "library", display_height);
-    build_top_right_icon_button(screen, NULL, noop);
+    lv_obj_t * action = build_top_right_icon_button(screen, NULL, noop);
     lv_obj_update_layout(screen);
     assert(lv_obj_get_width(title) == 480 - 76 - TITLE_ROW_HEIGHT - 12);
+    lv_obj_t * back = lv_obj_get_child(screen, 0);
+    assert(lv_obj_get_y(back) == STATUS_BAR_CLEARANCE);
+    assert(lv_obj_get_y(action) == lv_obj_get_y(back));
+    assert(lv_obj_get_height(back) == TITLE_ROW_HEIGHT);
+    assert(lv_obj_get_height(action) == TITLE_ROW_HEIGHT);
+    assert(lv_obj_get_width(action) == TITLE_ROW_HEIGHT);
+    assert(lv_obj_get_x(action) == 480 - TITLE_ROW_HEIGHT);
+    /* Missing assets in this harness have zero size; give both icons a
+     * geometry so their shared center can be tested without filesystem IO. */
+    lv_obj_t * back_icon = lv_obj_get_child(back, 0);
+    lv_obj_t * action_icon = lv_obj_get_child(action, 0);
+    lv_obj_set_size(back_icon, 24, 24);
+    lv_obj_set_size(action_icon, 32, 32);
+    lv_obj_update_layout(screen);
+    assert(lv_obj_get_y(back_icon) + 12 == TITLE_ROW_HEIGHT / 2);
+    assert(lv_obj_get_y(action_icon) + 16 == TITLE_ROW_HEIGHT / 2);
+    assert(lv_obj_get_y(title) == STATUS_BAR_CLEARANCE +
+        (TITLE_ROW_HEIGHT - lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_TITLE))) / 2);
+    lv_obj_t * text_action = lv_label_create(screen);
+    lv_label_set_text(text_action, "Rescan");
+    align_screen_header_action(text_action, 20);
+    for (int h = 24; h <= 48; h += 24) {
+        lv_obj_set_height(text_action, h);
+        lv_obj_update_layout(screen);
+        lv_area_t area;
+        lv_obj_get_coords(text_action, &area);
+        assert(area.y1 + h / 2 == STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT / 2);
+    }
+    lv_obj_delete(text_action);
 
     lv_obj_t * music_host = lv_obj_create(screen);
     lv_obj_set_size(music_host, lv_pct(100), 150);

@@ -426,49 +426,41 @@ lv_obj_t * build_list_message(lv_obj_t * parent, const char * title, const char 
 /* STATUS_BAR_CLEARANCE / TITLE_ROW_HEIGHT now live in screen_builders.h --
  * gui.c's hand-built screens (player, accent color, EQ, ...) need them too. */
 
-static lv_obj_t * build_back_button(lv_obj_t * scr, lv_event_cb_t back_btn_cb) {
+static lv_obj_t * build_header_icon_button(lv_obj_t * scr, const char * asset,
+                                          lv_align_t alignment, lv_event_cb_t cb) {
     /* Hitbox is deliberately larger than the visual icon -- real-hardware
      * testing showed taps aimed at this corner landing a few pixels outside
      * a tight 44x44 box, so the touch area is padded out generously while
      * the icon itself stays centered at its normal size. */
     lv_obj_t * btn = lv_obj_create(scr);
-    lv_obj_set_size(btn, 64, 64);
-    lv_obj_align(btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
+    lv_obj_set_size(btn, TITLE_ROW_HEIGHT, TITLE_ROW_HEIGHT);
+    lv_obj_align(btn, alignment, 0, STATUS_BAR_CLEARANCE);
     lv_obj_set_style_bg_opa(btn, 0, 0);
     lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
     lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t * arrow = lv_image_create(btn);
-    lv_image_set_src(arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
+    lv_image_set_src(arrow, asset);
+    lv_obj_align(arrow, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_remove_flag(arrow, LV_OBJ_FLAG_CLICKABLE);
 
-    if (back_btn_cb) lv_obj_add_event_cb(btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
+    if (cb) lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
     return btn;
 }
 
+lv_obj_t * build_header_back_button(lv_obj_t * scr, lv_event_cb_t cb) {
+    return build_header_icon_button(scr, asset_path("sub_back/btn_back.png"), LV_ALIGN_TOP_LEFT, cb);
+}
+
+void align_screen_header_action(lv_obj_t * action, int32_t right_inset) {
+    lv_obj_align(action, LV_ALIGN_TOP_RIGHT, -right_inset, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT / 2);
+    lv_obj_set_style_translate_y(action, lv_pct(-50), 0);
+}
+
 lv_obj_t * build_top_right_icon_button(lv_obj_t * scr, const char * icon_asset, lv_event_cb_t click_cb) {
-    /* Exact mirror of build_back_button() above (same 64x64 hitbox, same
-     * STATUS_BAR_CLEARANCE y) so this icon lines up with the back arrow at
-     * the same visual level -- just anchored to the right edge instead of
-     * the left, and with a caller-supplied icon/callback instead of the
-     * hardcoded back arrow. No BACK_ARROW_OPTICAL_Y_OFFSET-style nudge here:
-     * that correction is specific to the arrow glyph's own asymmetric
-     * visual weight, not a general icon-centering fix -- a plain centered
-     * icon (gear, etc.) doesn't need it. */
-    lv_obj_t * btn = lv_obj_create(scr);
-    lv_obj_set_size(btn, 64, 64);
-    lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(btn, 0, 0);
-    lv_obj_set_style_border_width(btn, 0, 0);
-    lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-
-    lv_obj_t * icon = lv_image_create(btn);
-    lv_image_set_src(icon, icon_asset);
-    lv_obj_align(icon, LV_ALIGN_CENTER, 0, 0);
-
-    if (click_cb) lv_obj_add_event_cb(btn, click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t * btn = build_header_icon_button(scr, icon_asset, LV_ALIGN_TOP_RIGHT, click_cb);
     /* Some screens add their action after the shared header was built. */
     for (uint32_t i = 0; i < lv_obj_get_child_count(scr); ++i) {
         lv_obj_t * child = lv_obj_get_child(scr, i);
@@ -510,7 +502,7 @@ static lv_obj_t * build_title(lv_obj_t * scr, const char * title) {
 /* ---- Icon grid ---- */
 lv_obj_t * build_screen_header(lv_obj_t * scr, const char * title, lv_event_cb_t back_cb,
                               const char * trailing_asset, lv_event_cb_t trailing_cb) {
-    if (back_cb) build_back_button(scr, back_cb);
+    if (back_cb) build_header_back_button(scr, back_cb);
     lv_obj_t * label = title ? build_title(scr, title) : NULL;
     if (trailing_asset) {
         build_top_right_icon_button(scr, trailing_asset, trailing_cb);

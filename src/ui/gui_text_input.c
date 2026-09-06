@@ -5,6 +5,7 @@
 #include "lvgl/lvgl.h"
 #include "assets.h"
 #include "gui.h"
+#include "screen_builders.h"
 #include "gui_theme.h"
 #include <ctype.h>
 
@@ -19,7 +20,6 @@ extern lv_style_t style_button_pressed;
 extern void nav_remove_stack_slot(int depth);
 extern void enable_gesture_bubble_recursive(lv_obj_t * parent);
 extern void search_textarea_value_changed_cb(lv_event_t * e);
-#define STATUS_BAR_CLEARANCE 40
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
 extern void nav_reset_to_home(void);
@@ -620,7 +620,7 @@ void t9_keypad_release(void) {
     lv_obj_set_parent(text_entry_keypad_group, text_entry_screen);
     lv_obj_set_parent(text_entry_textarea, text_entry_screen);
     lv_obj_set_size(text_entry_textarea, lv_pct(78), text_entry_field_height());
-    lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 40);
+    lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 8);
     text_entry_inline_mode_active = false;
 }
 
@@ -635,29 +635,13 @@ static lv_obj_t * build_text_entry_screen(void) {
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
     /* Top-left back button navigating back via text_entry_back_cb. */
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, text_entry_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    text_entry_title_label = lv_label_create(scr);
-    lv_label_set_text(text_entry_title_label, "");
-    lv_obj_align(text_entry_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 8);
-    lv_obj_add_style(text_entry_title_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(text_entry_title_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+    text_entry_title_label = build_screen_header(scr, "", text_entry_back_cb, NULL, NULL);
 
     text_entry_textarea = lv_textarea_create(scr);
     /* Configure font based on active theme role to respect user font settings. */
     lv_obj_set_style_text_font(text_entry_textarea, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_set_size(text_entry_textarea, lv_pct(78), text_entry_field_height());
-    lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 40);
+    lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 8);
     lv_textarea_set_one_line(text_entry_textarea, true);
     /* Built once here, so it persists across every future t9_keypad_attach()
      * reparenting onto a library screen's own search bar -- lets a swipe

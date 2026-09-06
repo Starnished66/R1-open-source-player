@@ -28,9 +28,6 @@
  * from this constant. */
 #define STATUS_BAR_CLEARANCE 32
 #define TITLE_ROW_HEIGHT 64
-#ifndef BACK_ARROW_OPTICAL_Y_OFFSET
-#define BACK_ARROW_OPTICAL_Y_OFFSET 7
-#endif
 #define HOME_INDICATOR_BAND_HEIGHT 24
 
 /* Shared touch-list row geometry -- every tappable row-of-text list
@@ -184,7 +181,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const icon_grid_item_t * items, int item_count,
                                    int32_t icon_scale_percent, bool label_inside_icon, int32_t tile_gap);
 
-/* Top-right counterpart to the internal build_back_button() (screen_builders.c) --
+/* Top-right counterpart to build_header_back_button() --
  * same 64x64 transparent hitbox, same STATUS_BAR_CLEARANCE vertical position,
  * so any caller's icon lands at exactly the same visual level as the screen's
  * own back arrow, mirrored to the right edge instead of the left. icon_asset
@@ -192,6 +189,11 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
  * asset_path()/asset_path_plain() first, same as every other icon in this
  * codebase). click_cb may be NULL for a purely decorative icon. */
 lv_obj_t * build_top_right_icon_button(lv_obj_t * scr, const char * icon_asset, lv_event_cb_t click_cb);
+/* Shared back control for screens that retain its handle to toggle visibility. */
+lv_obj_t * build_header_back_button(lv_obj_t * scr, lv_event_cb_t cb);
+/* Align existing text actions/switches by their actual height, not an
+ * assumed font or asset size. Position remains centered when size changes. */
+void align_screen_header_action(lv_obj_t * action, int32_t right_inset);
 /* Returns the title label. Optional trailing action reserves its hitbox. */
 lv_obj_t * build_screen_header(lv_obj_t * scr, const char * title, lv_event_cb_t back_cb,
                               const char * trailing_asset, lv_event_cb_t trailing_cb);

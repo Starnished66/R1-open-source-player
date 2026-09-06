@@ -257,7 +257,7 @@ static lv_obj_t * add_file_row(const char * label_text, const char * icon_asset,
     /* Files is a Music submenu, so it shares the roomier 100px browsing
      * density used by Artists/Albums/All Songs; Settings stays at the
      * shared 84px default. */
-    lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, MUSIC_LIST_ROW_HEIGHT); /* 15% wider than the shared default -- explicit user request */
+    lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, MUSIC_LIST_ROW_HEIGHT);
     lv_obj_add_style(row, &pill_row_bg_style, 0);
     lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
@@ -288,7 +288,7 @@ static void rebuild_list(void) {
     lv_label_set_text(path_label, current_dir);
 
     if (strlen(current_dir) > strlen(root_dir)) {
-        add_file_row("Back", "touch_list/list_folder.png", up_click_cb, NULL);
+        add_file_row("Back", "sub_back/btn_back.png", up_click_cb, NULL);
     }
 
     for (int i = 0; i < entry_count; i++) {
@@ -324,18 +324,10 @@ static void scan_all_songs_recursive(const char * dir_path, char *** paths, int 
 
         struct stat st;
         bool stat_ok = lstat(full_path, &st) == 0;
-        /* Bumped only once lstat() actually returns, for every real entry
-         * examined (not just playable files found) -- a long stretch of
-         * non-music subfolders (playlists, artwork, whatever else shares
-         * the card) is still genuine forward progress, not a stall, and
-         * counting only matches would let a caller's stall detector
-         * false-trigger partway through a large library just because the
-         * music itself is unevenly distributed across the tree. Placed
-         * after the call, not before it starts, so a caller watching this
-         * can't mistake a currently-hung lstat() (the exact corrupted-block
-         * D-state scenario this exists to catch, per this file's own
-         * caller in gui.c) for progress that already happened. See this
-         * parameter's own doc comment in file_browser.h. */
+        /* Incremented after each lstat() returns, for every entry examined
+         * (not just playable files), so callers can distinguish a long
+         * stretch of non-music entries from a hung lstat(). Placed after
+         * the call so a stuck lstat() is not counted as progress. */
         if (progress) atomic_fetch_add_explicit(progress, 1, memory_order_relaxed);
         if (!stat_ok) continue;
         /* Reject symlinks to prevent path traversal outside the music root. */
@@ -369,10 +361,8 @@ static int compare_paths(const void * a, const void * b) {
 }
 
 
-/* Bounded-memory variant used by the database scanner. It deliberately does not
- * sort: ordering is a presentation/query concern and belongs in the on-disk DB,
- * not in the discovery pass. This is the same separation that keeps Rockbox's
- * tagcache builder from needing an in-RAM representation of the whole library. */
+/* Bounded-memory variant used by the database scanner. Does not sort:
+ * ordering belongs in the on-disk DB, not in the discovery pass. */
 static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_visit_cb_t cb, void * user,
                                      int * count, int depth, atomic_int * progress,
                                      const char * excluded_top_level_dir) {
@@ -401,11 +391,9 @@ static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_vi
         if (S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            /* Music-library scans may reserve one root-level tree for a
-             * different media domain (currently Audiobooks).  Prune it
-             * before recursion so its files incur no metadata I/O at all;
-             * depth==0 is essential, since an album legitimately named
-             * "Audiobooks" deeper inside Music must remain discoverable. */
+            /* Skip the excluded top-level directory before recursion.
+             * depth==0 ensures subdirectories with the same name deeper
+             * in the tree are still discovered. */
             if (depth == 0 && excluded_top_level_dir &&
                 strcasecmp(de->d_name, excluded_top_level_dir) == 0)
                 continue;

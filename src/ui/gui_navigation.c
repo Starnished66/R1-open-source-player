@@ -873,6 +873,8 @@ void enable_gesture_bubble_recursive(lv_obj_t * obj) {
  * past it to the previous screen, same convention as a back button/gesture
  * dismissing an open search box before it navigates anywhere. */
 
+/* Same for the Files screen: steps up one directory instead of leaving it. */
+
 static void screen_gesture_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
     lv_indev_t * indev = lv_indev_active();
@@ -887,7 +889,9 @@ static void screen_gesture_event_cb(lv_event_t * e) {
 
     lv_dir_t dir = lv_indev_get_gesture_dir(indev);
     if (dir == LV_DIR_RIGHT) {
-        if (!search_close_if_active_for_screen(lv_screen_active())) {
+        lv_obj_t * active_screen = lv_screen_active();
+        if (!search_close_if_active_for_screen(active_screen) &&
+            !file_browser_back_if_not_root_for_screen(active_screen)) {
             nav_pop();
         }
         /* The finger is still down mid-gesture when the screen swaps out

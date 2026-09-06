@@ -194,8 +194,11 @@ bool file_browser_build_playlist_from_m3u(const char * m3u_path, char *** out_pl
     return true;
 }
 
-static void up_click_cb(lv_event_t * e) {
-    (void) e;
+bool file_browser_at_root(void) {
+    return strlen(current_dir) <= strlen(root_dir);
+}
+
+void file_browser_go_up(void) {
     char * last_slash = strrchr(current_dir, '/');
     if (last_slash && strlen(current_dir) > strlen(root_dir)) {
         *last_slash = '\0';
@@ -205,6 +208,11 @@ static void up_click_cb(lv_event_t * e) {
         scan_current_dir();
         rebuild_list();
     }
+}
+
+static void up_click_cb(lv_event_t * e) {
+    (void) e;
+    file_browser_go_up();
 }
 
 static void entry_click_cb(lv_event_t * e) {
@@ -280,7 +288,7 @@ static void rebuild_list(void) {
     lv_label_set_text(path_label, current_dir);
 
     if (strlen(current_dir) > strlen(root_dir)) {
-        add_file_row("Up", "touch_list/list_folder.png", up_click_cb, NULL);
+        add_file_row("Back", "touch_list/list_folder.png", up_click_cb, NULL);
     }
 
     for (int i = 0; i < entry_count; i++) {
@@ -504,7 +512,7 @@ int file_browser_get_last_selected_row(void) {
 
 /* row_to_reveal is the raw entries[] index (same value
  * file_browser_get_last_selected_row() returned), not a file-only
- * position -- rebuild_list() prepends an "Up" row whenever current_dir
+ * position -- rebuild_list() prepends a "Back" row whenever current_dir
  * isn't root_dir, shifting every entries[] row down by one on screen, so
  * that offset is added here to land on the right actual child. */
 void file_browser_navigate_to(const char * dir, int row_to_reveal) {

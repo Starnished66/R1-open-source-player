@@ -97,6 +97,13 @@ const char * file_browser_get_last_selected_dir(void);
 int file_browser_get_last_selected_row(void);
 void file_browser_navigate_to(const char * dir, int row_to_reveal);
 
+/* True when the browser is showing root_dir itself. */
+bool file_browser_at_root(void);
+
+/* Steps current_dir up one level toward root_dir and rebuilds the list.
+ * No-op if already at root. */
+void file_browser_go_up(void);
+
 /* Parses a M3U/M3U8 playlist file: one entry path per non-blank,
  * non-comment line, resolved relative to the playlist's own directory
  * (standard M3U convention) unless already absolute. Entries that aren't

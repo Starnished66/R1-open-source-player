@@ -338,11 +338,23 @@ void open_add_to_playlist_for(const char * path) {
 }
 
 void on_cue_file_selected(const char * cue_path);
+
+/* Steps up one directory instead of leaving the screen, unless already at
+ * root. Mirrored for swipe-back by file_browser_back_if_not_root_for_screen(). */
+static void files_back_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (file_browser_at_root()) {
+        nav_pop();
+    } else {
+        file_browser_go_up();
+    }
+}
+
 static lv_obj_t * build_files_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    build_screen_header(scr, "Files", generic_back_cb, NULL, NULL);
+    build_screen_header(scr, "Files", files_back_cb, NULL, NULL);
 
     file_browser_init(scr, MUSIC_ROOT_DIR, on_file_browser_selected, on_cue_file_selected);
 
@@ -2546,6 +2558,14 @@ bool search_close_if_active_for_screen(lv_obj_t * screen) {
     search_binding_t * b = find_search_binding_for_screen(screen);
     if (!b || !b->active) return false;
     search_close(b);
+    return true;
+}
+
+/* screen_gesture_event_cb()'s back-swipe hook for the Files screen: steps up
+ * one directory instead of popping the screen, unless already at root. */
+bool file_browser_back_if_not_root_for_screen(lv_obj_t * screen) {
+    if (screen != files_screen || file_browser_at_root()) return false;
+    file_browser_go_up();
     return true;
 }
 

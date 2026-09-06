@@ -26,16 +26,9 @@ typedef enum {
     HTTP_CONN_ERR_TLS_VERIFY
 } http_conn_error_t;
 
-/* Low-level HTTP(S) connection primitives, shared by http_client.c's
- * bounded one-shot GET requests and http_stream.c's unbounded live-stream
- * reader -- URL parsing, opening a plain-TCP-or-mbedTLS connection, and a
- * small buffered line/exact-byte reader on top of it (header/chunk-size
- * parsing needs to read a line at a time, but http_conn_read() only ever
- * hands back whatever happened to already be sitting on the wire). Neither
- * caller needs to know which transport it has -- both go through the same
- * http_conn_read()/http_conn_write(). Originally lived only inside
- * http_client.c; pulled out here once http_stream.c needed the same
- * connect/request/header-parse logic for its own unbounded body read. */
+/* Low-level HTTP(S) connection primitives shared by http_client and http_stream:
+ * URL parsing, opening plain TCP or mbedTLS connections, and buffered
+ * reading of lines and exact byte sequences. */
 
 typedef struct {
     bool is_https;
@@ -94,17 +87,8 @@ bool http_conn_reader_line(http_conn_reader_t * r, char * out, size_t out_size);
  * reads as needed. Returns false on EOF/error before n bytes arrived. */
 bool http_conn_reader_read_exact(http_conn_reader_t * r, uint8_t * out, size_t n);
 
-/* Like http_conn_read(), but reader-aware: serves bytes already sitting in
- * r's internal buffer first (e.g. left over from a prior http_conn_reader_
- * line() call that read further than the line itself -- a real risk for
- * TLS, where mbedtls_ssl_read() hands back a whole decrypted record at
- * once, routinely bundling response headers together with the start of
- * the body in a single underlying read) before falling back to a fresh
- * http_conn_read() once the buffer is empty. Without this, a caller that
- * switches from line-based reading (headers) to raw http_conn_read() (the
- * body) silently drops whatever body bytes had already been buffered --
- * this is exactly that switch, done safely. Same return contract as
- * http_conn_read() (bytes read, 0 on clean EOF, <0 on error). */
+/* Like http_conn_read(), but consumes any remaining bytes in the reader's
+ * internal buffer before reading directly from the connection. */
 int http_conn_reader_read_some(http_conn_reader_t * r, uint8_t * buf, size_t len);
 
 #endif /* HTTP_CONN_H */

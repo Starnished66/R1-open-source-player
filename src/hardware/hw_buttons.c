@@ -11,39 +11,18 @@
 #include <time.h>
 #include <unistd.h>
 
-/* One physical button press = one percentage point, giving the full 100
- * discrete steps the slider/readout range (0-100) supports, rather than
- * coarsely jumping 5 at a time (real-device feedback: "should be 100 in
- * total, not jump from 5 to 5"). */
+/* One physical button press = one percentage point (0-100 range). */
 #define VOLUME_STEP_PERCENT 1
 
-/* Long-press auto-repeat, typematic-style: the first repeat waits longer
- * than the ones after it, so a quick tap never accidentally free-runs and a
- * deliberate hold ramps up at a steady, predictable rate. 60ms (~16
- * steps/sec, full 0-100 sweep in ~6s) -- real-device feedback on an
- * earlier, slower 120ms interval was "works correctly, but a bit slow". */
+/* Typematic repeat for volume keys: initial delay followed by periodic repeats. */
 #define VOLUME_REPEAT_INITIAL_DELAY_MS 350
 #define VOLUME_REPEAT_INTERVAL_MS 60
 
-/* Real-device bug report: holding the power button turned the screen off
- * immediately (the previous behavior fired on every KEY_POWER down edge,
- * tap or hold alike) with no way to actually power the device off short of
- * the idle-shutdown timer. A hold past this threshold now instead fires
- * hw_buttons_consume_power_long_press() (see handle_key_event() below) so
- * gui.c can show a power-off countdown; a genuine short tap still toggles
- * the screen exactly as before. 700ms -- long enough that a normal
- * screen-toggle tap never crosses it, short enough to feel deliberate
- * rather than sluggish. */
+/* Threshold to trigger power long-press (power-off menu) instead of a short tap (screen toggle). */
 #define POWER_LONG_PRESS_MS 700
 
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
-/* A count, not a bool: update_timer_cb (gui.c) only polls every 500ms, and a
- * real double-click's two presses routinely land inside a single poll
- * window -- a plain "was it pressed" flag would collapse them into one
- * consumed press, making Settings -> Playback -> Play/Pause Button's
- * double-click mode silently undetectable. Real-device measurement: a fast
- * double-tap produced two clean, ~100-200ms-apart down/up pairs at this
- * layer, but only ever a single gui.c-side dispatch under the old bool. */
+/* Tracks press counts between GUI poll intervals to reliably detect multi-clicks. */
 static int play_pause_press_count = 0;
 static bool next_requested = false;
 static bool prev_requested = false;
@@ -168,18 +147,7 @@ static void * hw_buttons_thread_func(void * arg) {
     char earpods_path[64];
     bool have_gpio_keys = find_input_device_by_name("md-gpio-keys", gpio_keys_path, sizeof(gpio_keys_path));
     bool have_adc_keyboard = find_input_device_by_name("jz adc keyboard", adc_keyboard_path, sizeof(adc_keyboard_path));
-    /* Wired headphone inline remote (play/pause, vol+/-): the R1's
-     * headphone jack has its own ADC-ladder remote-detection circuit,
-     * exposed as a separate evdev device -- confirmed live via
-     * /sys/class/input/eventN/device/uevent: NAME="earpods_adc",
-     * MODALIAS=...k72,73,A3,A4,A5,A8,D0... i.e. KEY_VOLUMEDOWN,
-     * KEY_VOLUMEUP, KEY_NEXTSONG, KEY_PLAYPAUSE, KEY_PREVIOUSSONG,
-     * KEY_REWIND, KEY_FASTFORWARD. The first five are exactly the codes
-     * handle_key_event() below already handles for the device's own
-     * physical buttons, which switches purely on the key code, not which
-     * of these three fds it arrived on -- REWIND/FASTFORWARD fall through
-     * to its existing default no-op, same as the front panel not having
-     * those either. */
+    /* Wired headphone inline remote (earpods_adc). */
     bool have_earpods = find_input_device_by_name("earpods_adc", earpods_path, sizeof(earpods_path));
 
     if (!have_gpio_keys && !have_adc_keyboard && !have_earpods) {
@@ -187,15 +155,8 @@ static void * hw_buttons_thread_func(void * arg) {
         return NULL;
     }
 
-    /* O_NONBLOCK matters: the read loop below drains each ready fd with
-     * `while (read(...) == sizeof(ev))`, and once one device's queue empties
-     * a blocking read() on it just sits there instead of returning -- which
-     * starves poll() from ever being called again, so the *other* device's
-     * events queue up and never get read. Confirmed on real hardware: Power
-     * and Next/Prev live on md-gpio-keys, Volume and Play/Pause live on "jz
-     * adc keyboard", and without this, the very first gpio-keys press parked
-     * the thread in a blocking read on that fd forever, silently starving
-     * every subsequent volume/play-pause press on the other device. */
+    /* O_NONBLOCK prevents empty read queues on one device from blocking poll
+     * and starving inputs from the other button devices. */
     struct pollfd fds[3];
     int nfds = 0;
     if (have_gpio_keys) {
@@ -239,13 +200,8 @@ static void * hw_buttons_thread_func(void * arg) {
         bool power_pending_long_press = power_held && !power_long_press_fired;
         pthread_mutex_unlock(&state_mutex);
 
-        /* Blocks indefinitely (no wasted wakeups) except while a volume key
-         * is held or the power button is held awaiting its long-press
-         * threshold, when a short timeout is the only way to notice "still
-         * held, no new event" and fire the next repeat step / long-press --
-         * see apply_due_volume_repeats()/apply_due_power_long_press().
-         * Reverts to -1 the moment nothing is pending either way, same idle
-         * efficiency as before either feature existed. */
+        /* Blocks indefinitely except while a volume key or power button is held
+         * and awaiting a timed repeat step or long-press threshold. */
         int ret = poll(fds, (nfds_t) nfds, (volume_held || power_pending_long_press) ? VOLUME_REPEAT_INTERVAL_MS : -1);
         if (ret == 0) {
             apply_due_volume_repeats();

@@ -13,15 +13,8 @@
 
 #define BUILD_STAMP_LEN BOOT_BUILD_STAMP_LEN
 
-/* mount_sd_card_if_needed() itself now lives in sd_ready_real.c, backed by
- * sd_ready.c's adaptive wait_for_sd_ready() state machine instead of a flat
- * fixed-attempt loop -- see sd_ready.c's own top comment for the algorithm
- * (the asynchronous MMC-detect / node-publish / mount race this exists to
- * ride out) and sd_ready_real.c for this build's actual timing policy. Kept
- * as a real cross-TU call (sd_ready.h) rather than folded back in here so
- * the readiness state machine itself stays testable (sd_ready_test.c)
- * without dragging in this file's own build-stamp-scanning/preference-file
- * logic, which has nothing to do with SD readiness. */
+/* mount_sd_card_if_needed() is implemented in sd_ready_real.c, backed by
+ * the wait_for_sd_ready() state machine. */
 
 #define DEFAULT_TIMEOUT_SECONDS 3
 #define MIN_TIMEOUT_SECONDS 1
@@ -32,13 +25,7 @@ static bool path_is_executable(const char * path) {
     return path && path[0] && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
 }
 
-/* True if the 16 bytes at p, followed by a NUL, exactly match the
- * "YYYY-MM-DD_HH:MM" shape the Makefile's `date +%Y-%m-%d_%H:%M` always
- * produces. Checking for the trailing NUL (not just the digit/separator
- * shape) matters: this is scanning raw file bytes, not parsed text, and a
- * string literal in an ELF's rodata is NUL-terminated -- requiring it
- * rules out a coincidental digit run inside unrelated binary data that
- * merely happens to start with the right shape. */
+/* Returns true if the 16 bytes at p and the trailing NUL match "YYYY-MM-DD_HH:MM". */
 static bool looks_like_build_stamp(const unsigned char * p) {
     for (int i = 0; i < 4; i++) if (!isdigit(p[i])) return false;
     if (p[4] != '-') return false;
@@ -52,23 +39,8 @@ static bool looks_like_build_stamp(const unsigned char * p) {
     return p[16] == '\0';
 }
 
-/* Scans the WHOLE file in bounded chunks (never loads a ~20MB player
- * binary fully into memory just to find a handful of 16-byte strings --
- * this runs before anything else has established how much RAM is actually
- * free) and keeps the LEXICALLY MAXIMUM substring matching
- * looks_like_build_stamp() -- deliberately not the first one found. `make
- * target` is incremental: unchanged objects can still contain stamps from
- * earlier invocations, alongside the current stamp in app_version.c (whose
- * target object is deliberately rebuilt every invocation). Which one a byte
- * scan hits FIRST depends on link order/section placement, so taking the
- * lexical maximum remains required: fixed-width YYYY-MM-DD_HH:MM ordering
- * selects app_version.c's current stamp rather than a stale object stamp.
- * Returns false (not true-with-empty-string) if
- * the file has no such string at all, e.g. it isn't a build of this app --
- * callers must treat that as "unknown version", never as "oldest possible
- * version". Exposed to main.c (as scanner_read_build_stamp(), scanner.h) so
- * it can re-derive the displayed stamp after installer_run() may have
- * changed which file "the internal player" actually is. */
+/* Scans an executable binary in chunks for build stamps matching looks_like_build_stamp()
+ * and selects the lexicographically maximum stamp found. */
 bool scanner_read_build_stamp(const char * path, char * out, size_t out_size) {
     if (out_size <= BUILD_STAMP_LEN) return false;
     FILE * f = fopen(path, "rb");
@@ -83,24 +55,10 @@ bool scanner_read_build_stamp(const char * path, char * out, size_t out_size) {
         size_t n = fread(buf + carry, 1, sizeof(buf) - carry - 1, f);
         size_t total = carry + n;
         if (total < (size_t) BUILD_STAMP_LEN + 1) break; /* not enough left for a full match + trailing NUL */
-        /* buf[total] is a SENTINEL this function wrote, never a byte the
-         * file actually contains at that position -- a candidate starting
-         * at i == total - BUILD_STAMP_LEN would read p[16] as that
-         * sentinel instead of the real next file byte (which, mid-file,
-         * hasn't been read yet; it arrives in the NEXT chunk's fread()).
-         * That made looks_like_build_stamp() see a false NUL terminator
-         * at every chunk boundary regardless of the real byte there,
-         * capable of manufacturing a bogus "maximum" stamp right at a
-         * boundary. Stopping one earlier (scan_end = total - (LEN+1))
-         * guarantees p[16] is always a byte this function actually read.
-         * This does not cost a genuine match sitting exactly at true EOF:
-         * when the file's real last byte IS the stamp's terminating NUL,
-         * that byte is already counted in `total` (fread() actually read
-         * it), so scan_end still includes that candidate's start index --
-         * p[16] resolves to buf[total-1], the real last byte, never to
-         * the buf[total] sentinel. */
         buf[total] = '\0';
 
+        /* Stop scanning at total - (BUILD_STAMP_LEN + 1) to ensure the trailing NUL byte
+         * is part of the bytes read from the file. */
         size_t scan_end = total - (BUILD_STAMP_LEN + 1);
         for (size_t i = 0; i <= scan_end; i++) {
             if (!looks_like_build_stamp(buf + i)) continue;

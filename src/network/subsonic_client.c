@@ -39,10 +39,7 @@ static void md5_hex(const char * data, size_t len, char out_hex[33]) {
     for (int i = 0; i < 16; i++) snprintf(out_hex + i * 2, 3, "%02x", digest[i]);
 }
 
-/* Not cryptographically strong, but the Subsonic token scheme only needs a
- * value that's different per request (so a captured token can't be
- * replayed indefinitely) -- srand() is seeded once from the current time
- * the first time this runs. */
+/* Generates random alphanumeric salt for Subsonic token generation. */
 static void random_salt(char * out, size_t out_size) {
     static bool seeded = false;
     if (!seeded) { srand((unsigned int) time(NULL)); seeded = true; }
@@ -53,9 +50,7 @@ static void random_salt(char * out, size_t out_size) {
     out[n] = '\0';
 }
 
-/* u/t/s/v/c/f -- every Subsonic API call needs these six params. Token-based
- * auth (t=md5(password+salt), s=salt) is used instead of the deprecated
- * plain p=password scheme, so the password itself never goes on the wire. */
+/* Builds query parameters for token-based authentication (u, t, s, v, c, f). */
 static void build_auth_query(const subsonic_server_t * server, char * out, size_t out_size) {
     char salt[17];
     random_salt(salt, sizeof(salt));
@@ -72,11 +67,8 @@ static void build_auth_query(const subsonic_server_t * server, char * out, size_
               user_enc, token, salt, SUBSONIC_API_VERSION, SUBSONIC_CLIENT_NAME);
 }
 
-/* Calls endpoint (e.g. "ping.view"), with extra_params (already
- * URL-encoded, may be NULL) appended alongside the auth params, and parses
- * the JSON response. Returns the "subsonic-response" object (still owned
- * by *out_root -- caller must cJSON_Delete(*out_root) when done with it)
- * on a status:"ok" response, or NULL on any network/parse/auth failure. */
+/* Calls a Subsonic REST endpoint, parses the JSON response, and validates status "ok".
+ * Caller owns *out_root upon success. */
 static cJSON * api_request(const subsonic_server_t * server, const char * endpoint, const char * extra_params,
                            cJSON ** out_root, http_cancel_token_t * cancel) {
     char auth[512];

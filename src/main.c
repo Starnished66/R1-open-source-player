@@ -72,31 +72,13 @@ void install_thread_crash_altstack(void) {}
 #ifndef HOST_BUILD
 #include <ucontext.h>
 
-/* See scan_one_song_into_db()'s own comment (gui_library.c) -- best-effort
- * "what file was the scanner working on" breadcrumb for the metadata-parser
- * SIGBUS investigation below. Reading a global char array from a signal
- * handler is safe (no allocation, no lock); it may show a slightly stale
- * or empty path if the crash isn't actually in the scanner at all, which is
- * fine for a diagnostic that costs nothing to include either way. */
+/* See scan_one_song_into_db()'s own comment (gui_library.c) -- breadcrumb
+ * for the metadata-parser crash handler below. Reading this global char
+ * array from a signal handler is safe (no allocation, no lock). */
 extern char g_scan_last_path[PATH_MAX];
 
-/* Temporary investigation instrumentation for the "enabling/disabling
- * plugins triggers a reboot" report -- a live dmesg capture already
- * confirmed a real SIGSEGV inside musl's pthread_join() (invalid read from
- * a near-NULL offset, 0x18 into its internal thread struct), and gui_
- * reload.c/gui_library.c's own reload_diag()/library_teardown_diag() calls
- * already narrowed it to always landing right after gui_library_init()
- * finishes and before gui_network_init() starts -- but neither says WHICH
- * of this codebase's 70+ pthread_join() call sites, or whose thread
- * handle, is actually at fault. This handler writes pc/ra/sp and
- * pthread_join()'s own first two arguments (a0 = the bad handle itself,
- * a1 = its retval-out pointer) into the exact same reload_diag.log every
- * other diagnostic in this investigation already appends to, plus a raw
- * scan of the stack above sp for words that land inside this binary's own
- * static text range -- a poor man's backtrace, since -O3 doesn't keep
- * frame pointers here for a real one. Re-raises with the default handler
- * restored afterward so the bootloader's existing crash-reboot behavior
- * is unchanged. */
+/* Signal handler that logs register state and a stack word scan to
+ * reload_diag.log, then re-raises the signal with the default handler. */
 static void crash_diag_handler(int sig, siginfo_t * info, void * ucontext_v) {
     int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd >= 0) {
@@ -135,20 +117,9 @@ static void crash_diag_handler(int sig, siginfo_t * info, void * ucontext_v) {
     raise(sig);
 }
 
-/* sigaltstack() is a per-THREAD attribute, unlike sigaction() (process-wide
- * -- the SIGSEGV/SIGBUS disposition set up above already covers every
- * thread). A thread that never calls this still runs crash_diag_handler()
- * on its OWN stack if it crashes, even with SA_ONSTACK requested -- fine for
- * an ordinary crash, useless for the specific failure mode this exists for:
- * a genuine stack overflow on library_rescan_thread/album_thumb_gen_thread/
- * album_thumbnail_thread (see LIBRARY_RESCAN_THREAD_STACK_SIZE/ALBUM_COVER_
- * DECODE_THREAD_STACK_SIZE, gui_library.c), where the thread's own stack is
- * exactly what's exhausted and has no room left to run this handler at all.
- * Each of those three threads calls this once, right at its own start.
- * _Thread_local, not a shared/malloc'd buffer: sigaltstack() requires the
- * memory to remain valid for as long as it might be used, which for a
- * detached/joined worker thread is its own entire lifetime -- a per-thread
- * static gives every thread its own without manual alloc/free bookkeeping. */
+/* Installs a per-thread signal alternate stack so crash_diag_handler() can
+ * run even when the thread's own stack is exhausted. Must be called at
+ * thread start for each worker thread that uses a custom stack size. */
 void install_thread_crash_altstack(void) {
     static _Thread_local uint8_t altstack_buf[32768];
     stack_t ss;
@@ -269,21 +240,8 @@ void boot_checkpoint(const char * step) {
 #endif
 
 #ifdef HOST_BUILD
-/* Host-only dev convenience: backtrace()/backtrace_symbols_fd() aren't
- * guaranteed async-signal-safe (both can touch malloc/stdio internals), and
- * exit() runs atexit handlers and flushes stdio -- none of that is safe to
- * re-enter from inside a signal handler if the crash happened while the
- * crashing thread already held one of those same locks (exactly the case
- * for a SIGABRT raised by a heap-corruption check, which is the realistic
- * way SIGABRT actually fires). On the real device this handler being wired
- * to SIGABRT could turn a clean, supervisor-recoverable crash into a hang:
- * run_player_supervised() (src/bootloader/main.c) waits on this process to
- * actually exit before deciding whether to reboot, so a hang here means no
- * recovery reboot ever fires. Kept for HOST_BUILD only, where there is no
- * supervisor/reboot contract to break and a best-effort backtrace during
- * local dev testing is worth the trade-off. Device crashes still go through
- * the SA_ONSTACK-based crash_diag_handler below, which sticks to raw
- * write()/_exit() for exactly this reason. */
+/* Host-only dev convenience: provides backtraces on crashes during host simulation.
+ * Device builds use the async-signal-safe crash_diag_handler below. */
 // handler for signals that indicate crashes like SIGSEGV or SIGABRT
 void crash_handler(int sig) {
     void *buffer[128];
@@ -297,13 +255,8 @@ void crash_handler(int sig) {
     exit(1);
 }
 
-/* Host-only: lets Ctrl-C in the terminal cleanly exit the SDL simulator
- * window instead of the OS just killing the process. Deliberately not
- * enabled on the real device -- see main()'s own comment at the signal()
- * call site below for why running the same "clean exit(0)" path there
- * would be a real regression (the bootloader treats exit(0) as an
- * intentional poweroff request, not something a stray SIGINT should ever
- * trigger). */
+/* Host-only: clean shutdown on SIGINT (Ctrl-C) in terminal for SDL simulator.
+ * On device builds, the main loop runs continuously and shutdown is supervised. */
 // handler for SIGINT
 static void sigint_handler(int sig) {
 	(void)sig;
@@ -330,18 +283,9 @@ int main(int argc, char ** argv) {
     struct sigaction crash_sa;
     memset(&crash_sa, 0, sizeof(crash_sa));
     crash_sa.sa_sigaction = crash_diag_handler;
-    /* SA_ONSTACK: without it, a genuine stack overflow (this handler's own
-     * reason for existing right now -- see install_thread_crash_altstack()'s
-     * own comment) has nowhere left to run this handler AT ALL, since the
-     * thread's own stack is exactly what's exhausted. Real-device symptom
-     * this explains: two reproductions of the same album-art-decode crash
-     * this investigation is chasing rebooted with NO reload_diag.log entry
-     * at all, unlike three earlier reproductions that logged cleanly --
-     * consistent with the handler itself failing to run on an already-
-     * overflowed stack rather than the crash suddenly becoming unloggable.
-     * Only takes effect for a thread that has itself called sigaltstack()
-     * (install_thread_crash_altstack() below) -- this flag alone does not
-     * retroactively protect a thread that never registered one. */
+    /* SA_ONSTACK: required so crash_diag_handler() can run on a thread whose
+     * own stack is exhausted. Only takes effect for threads that have called
+     * sigaltstack() (install_thread_crash_altstack()). */
     crash_sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigaction(SIGSEGV, &crash_sa, NULL);
     sigaction(SIGBUS, &crash_sa, NULL);
@@ -498,11 +442,8 @@ int main(int argc, char ** argv) {
      * advance it once per handler iteration from one real clock read. Timer
      * semantics remain identical: the tick is stable while one handler pass
      * runs, just like the conventional interrupt-driven lv_tick_inc model. */
-    /* Preserve LVGL's exact clock domain across the handoff. Using a second
-     * custom_tick_get() value as the internal-clock seed looked equivalent,
-     * but real-device tracing showed the display's last_activity_time and
-     * the newly seeded clock separated by ~3.88 billion ms (wraparound),
-     * making screen timeout fire on the first runtime timer callback. */
+    /* Preserve LVGL's exact clock domain across the handoff to prevent
+     * wraparound differences with interactive timeout baselines. */
     uint32_t lvgl_handoff_tick = lv_tick_get();
     uint32_t last_real_tick = custom_tick_get();
     lv_tick_inc(lvgl_handoff_tick);
@@ -559,23 +500,9 @@ int main(int argc, char ** argv) {
             perf_handler_over_16ms = 0;
         }
 #endif
-        /* Real-device bug report: a screen (compact_list's own background-
-         * fetch poll timer, screen_builders.c) went permanently blank after
-         * scrolling -- confirmed via direct tracing that its fetch actually
-         * completed, but the timer polling for that completion never fired
-         * again. Root cause: lv_timer_handler() returns LV_NO_TIMER_READY
-         * (0xFFFFFFFF, lv_timer.h) when no *currently unpaused* timer has
-         * work due -- true here for a brief window whenever every other
-         * active timer happens to be paused/idle at the same moment as this
-         * one (e.g. right after a fetch completes and its own poll timer
-         * re-pauses itself). `time_till_next * 1000` then silently
-         * overflows this uint32_t, producing a ~71-minute usleep() instead
-         * of the intended "sleep only until the next timer needs it" --
-         * indistinguishable from a permanent freeze in normal testing.
-         * Capping the sleep bounds the worst case to this constant instead,
-         * while still being long enough that a genuinely idle app burns
-         * negligible CPU -- and covers any future timer hitting the same
-         * window, not just this one. */
+        /* Cap idle sleep duration: lv_timer_handler() returns LV_NO_TIMER_READY
+         * (0xFFFFFFFF) when no unpaused timers are ready, which would overflow
+         * microsecond conversion. */
         /* Screen-off CPU/battery optimization: while the backlight is off,
          * gui.c's own update_timer_cb() (still running every 500ms -- see
          * its own comment on why that keeps going regardless) is the only

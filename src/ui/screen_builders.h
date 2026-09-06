@@ -22,21 +22,10 @@
  * text entry, group songs, subsonic lists), reserves these so its own
  * content never competes with the persistent status bar (clock/battery/
  * wifi, drawn separately on lv_layer_top()) for the same pixels. */
-/* Real-device bug report: this band left a visibly large blank gap between
- * the status bar (clock/battery/wifi) and every screen's own back-arrow/
- * title row. Every real topbar asset (clock digits, battery, wifi, codec
- * badges -- confirmed against the actual stock-firmware theme pack) is
- * exactly 30px tall; 32 leaves only 1px of margin above/below them --
- * deliberately tight, about as far as this can go without the icons
- * touching the band edges, per a follow-up request to shrink it further
- * than an initial, more conservative 36 (3px margin). Every consumer of
- * this constant derives its own position algebraically from it (mostly
- * `STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2`-shaped formulas), so
- * changing this one value propagates correctly everywhere with no other
- * hand-tuned offset needing a matching adjustment. Deliberately not
- * touching TITLE_ROW_HEIGHT below -- that sizes the back button's own
- * touch target (see build_back_button()'s own comment on why it's
- * generously sized), a separate, already-validated concern from this gap. */
+/* Clearance band height (32px) between the display top and screen headers.
+ * Topbar assets (clock, battery, wifi, codec badges) are 30px tall, leaving
+ * 1px margin above/below them. Consumers derive positions algebraically
+ * from this constant. */
 #define STATUS_BAR_CLEARANCE 32
 #define TITLE_ROW_HEIGHT 64
 #ifndef BACK_ARROW_OPTICAL_Y_OFFSET
@@ -47,17 +36,9 @@
 /* Shared touch-list row geometry -- every tappable row-of-text list
  * (Artists/Albums/Album Artist/Genres/All Songs/group-songs drill-down,
  * Files, Wi-Fi/Bluetooth scan results, Subsonic browsing) uses these same
- * dimensions, rather than each screen picking its own, so the whole app
- * reads as one consistent list style. Sized up from the original stock-
- * asset-matched 448x60 (real-hardware feedback: too small/cramped to
- * reliably tap on the actual device). Since these no longer match any real
- * stock touch_list bg PNG asset's pixel dimensions, rows are now a plain
- * rounded rect (LIST_ROW_BG_COLOR/LIST_ROW_RADIUS) instead of that PNG --
- * LVGL's bg_image style draws a bg_image_src at its native size centered in
- * the object's box (see lv_draw_rect.c), not stretched to fill it, so
- * reusing the old asset at a bigger row size would've just centered the
- * original small pill inside a bigger empty box. Native row colors now
- * come from the charcoal palette, with live plugin overrides. */
+ * dimensions for consistency. Rows use a rounded rect
+ * (LIST_ROW_BG_COLOR/LIST_ROW_RADIUS) with colors from the charcoal palette
+ * and support live plugin overrides. */
 int32_t ui_list_row_width(void);
 int32_t ui_list_row_width_wide(void);
 #define LIST_ROW_WIDTH (ui_list_row_width())
@@ -71,24 +52,13 @@ int32_t ui_list_row_width_wide(void);
 #define LIST_ROW_FONT app_font_22 /* see fallback_font.h -- same metrics as lv_font_montserrat_22, plus a non-Latin fallback */
 #define LIST_ROW_LABEL_INSET GUI_TEXT_INSET
 
-/* Every row-of-text list in the app (build_compact_list_screen below,
- * plus gui.c's show_group_songs()/populate_indexed_list(), all built by
- * hand against the LIST_ROW_* geometry above) used to set size/radius/
- * bg/border/pad/text-color/text-font as six-plus individual local style
- * properties on TWO objects per row (a container plus a child label).
- * Real-device feedback: opening a ~2000-song "All Songs" list took ~5
- * seconds, almost entirely construction cost. One shared lv_style_t
- * attached via lv_obj_add_style() is far cheaper per row than the same
- * properties set locally -- LVGL's local-style storage is a small
- * allocated array per object per property, where a shared style is just
- * one pointer appended to the object's style list. Merging the row+label
- * into a single lv_label (a label is a plain lv_obj subclass, so it can
- * be sized/styled/clicked exactly like the old container) halves the
- * object count on top of that. pad_top is baked in here (not computed
- * per row) to vertically center LIST_ROW_FONT's single-line text within
- * LIST_ROW_HEIGHT, since a label draws text from its own top edge by
- * default. Call screen_builders_init_list_row_style() once, before
- * building any list screen (gui_init() does this). */
+/* Shared lv_style_t for row-of-text lists (build_compact_list_screen,
+ * show_group_songs, populate_indexed_list). Using a shared style and
+ * merging row+label into a single clickable lv_label minimizes object
+ * count and construction overhead for large lists. pad_top is baked in
+ * to vertically center LIST_ROW_FONT text within LIST_ROW_HEIGHT.
+ * Call screen_builders_init_list_row_style() once before building any
+ * list screen (handled in gui_init()). */
 extern lv_style_t list_row_style;
 /* LV_STATE_PRESSED-only bg_color override for a list_row_style row -- attach
  * with lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED),
@@ -198,17 +168,10 @@ typedef struct {
  * pass a value above/below 100 to make just this screen's icons bigger or
  * smaller without affecting the others).
  *
- * label_inside_icon: false (every icon set except Wireless's) draws the
- * caption below the icon, in its own reserved row -- the right choice for
- * plain glyph-on-transparent assets (category/launcher/stream_media). true
- * (Wireless only) instead draws the caption inside the icon's own image,
- * near its bottom -- the wireless/ star.png assets are themselves pre-baked
- * "card + glyph + reserved caption band" graphics (confirmed by scanning
- * their actual pixels: every one of them has its glyph content end around
- * 65% down a much taller canvas, with flat card background filling the
- * rest), so drawing a second, separate caption below them left that
- * reserved band sitting empty -- real-device bug report: "black space in
- * the bottom that was meant for the Text to fit inside". */
+ * label_inside_icon: false draws the caption below the icon in its own
+ * reserved row (used for plain glyph-on-transparent assets). true (used for
+ * Wireless cards) draws the caption inside the icon's own image near its bottom,
+ * as those card assets have a built-in caption band at the bottom. */
 /* tile_gap: px of visible space between adjacent tiles (0 = today's exact
  * flush-cell look with its thin divider lines -- every native caller passes
  * 0). A positive value insets each tile within its own already-computed grid
@@ -246,15 +209,10 @@ typedef struct {
     lv_event_cb_t on_click;         /* fired on row LV_EVENT_CLICKED (NONE/CHEVRON rows) */
     lv_event_cb_t on_toggle_change; /* fired on LV_EVENT_VALUE_CHANGED (TOGGLE rows) */
     void * user_data;
-    /* Optional (NULL for every row that doesn't need it): on a
-     * PILL_ACCESSORY_TOGGLE row, *out_toggle_img is set to the toggle's own
-     * lv_switch once built, so a caller can update its LV_STATE_CHECKED
-     * later from somewhere else entirely (e.g. a quick-drawer icon that
-     * mirrors the same underlying setting) -- these screens are built once
-     * at startup and never rebuilt, so nothing else keeps this row's visual
-     * state in sync with the setting on its own. See gui_settings.c's
-     * settings_crossfade_toggle_img for the motivating real-device bug
-     * (drawer/settings crossfade toggles falling out of sync). */
+    /* Optional (NULL if not needed): on a PILL_ACCESSORY_TOGGLE row,
+     * *out_toggle_img is set to the toggle's own lv_switch once built,
+     * allowing callers to update its LV_STATE_CHECKED state later from
+     * elsewhere (e.g. settings_crossfade_toggle_img in gui_settings.c). */
     lv_obj_t ** out_toggle_img;
 
     /* ---- Plugin-row extensions (plugin.register_list_item()'s optional
@@ -317,14 +275,11 @@ typedef struct {
  * own `height` option), or a plugin.set_home_layout() list-mode tile
  * (PLUGINS.md) -- shared range for all three, silently clamped rather than
  * erroring (same convention plugin.set_interval()'s own minimum-clamp uses).
- * Below PILL_ROW_ICON_PX_DEFAULT (64px): real-device request for genuinely
- * compact rows (a dense retro/pixel-menu look, PLUGINS.md's set_home_layout()
- * examples) -- a row with BOTH an icon and a height under 64px will clip the
- * icon's top/bottom against the row bounds (lv_obj_create()'s default
- * overflow clipping, never made visible on the host build since none of its
- * launcher icon assets actually decode there); an icon-less row (no
- * icon_asset, e.g. every plugin.set_home_layout() list tile) never hits
- * this. Ceiling keeps one row from dominating the screen. */
+ * Values below PILL_ROW_ICON_PX_DEFAULT (64px) allow compact rows
+ * (e.g. set_home_layout() list tiles). If a row has both an icon and a height
+ * below 64px, the icon will be clipped to row bounds; rows without icons
+ * are unaffected. PILL_ROW_HEIGHT_MAX prevents a single row from dominating
+ * the screen. */
 #define PILL_ROW_HEIGHT_MIN 48
 #define PILL_ROW_HEIGHT_MAX 220
 #define PILL_ROW_WIDTH_MIN 240
@@ -431,13 +386,10 @@ typedef void (*compact_list_click_cb_t)(int index);
 
 /* Titled screen: real back-arrow button and a vertically scrollable,
  * virtualized list of compact 84px rows (no icon, no accessory -- just a
- * label). Virtualized because a flat list can be the entire local library
- * (thousands of songs): only a small pool of row widgets actually exists
- * at once, repositioned and relabeled as the list scrolls, rather than one
- * real LVGL object per item -- real-device feedback: building one row
- * object per song made opening "All Songs" against a ~2000-song library
- * visibly freeze for several seconds, almost entirely LVGL's own one-time
- * layout cost for that many objects. `items` (and the strings its `label`
+ * label). Virtualized because a flat list can contain thousands of songs:
+ * only a small pool of row widgets exists at once, repositioned and
+ * relabeled as the list scrolls, avoiding the memory and layout overhead
+ * of allocating an LVGL object per song. `items` (and the strings its `label`
  * pointers reference) must stay valid for the screen's entire lifetime --
  * this function keeps its own copy of the `items` array itself (freed
  * automatically when the screen is deleted), but not of the label strings

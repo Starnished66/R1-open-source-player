@@ -1,27 +1,9 @@
-/* Executing a player binary straight off the SD card's own block device
- * (this app's original design, and Stock's own long-standing one) maps that
- * binary's code pages from removable media. Pulling the card mid-run, or
- * even a quick reinsert cycle, can invalidate those mappings out from under
- * a still-running process -- a real, reproduced-on-device SIGBUS, not a
- * theoretical concern (see gui_library.c's own LIBRARY_RESCAN_THREAD_STACK_
- * SIZE comment for the investigation that first surfaced SD-media fragility
- * as a real crash source in this app, albeit via a different mechanism).
- * The fix here is structural rather than defensive: never map player code
- * from the SD card at all. SD_UPDATE_PLAYER_PATH (scanner.h) is now only
- * ever a SOURCE to copy from, once, into a durable file on the same
- * writable partition BOOT_PREF_PATH already lives on -- INSTALLED_PLAYER_
- * PATH, below -- and every boot after that runs from there or from the
- * always-present squashfs INTERNAL_PLAYER_PATH, never from removable media.
+/* Copies updates from SD storage to internal storage (INSTALLED_PLAYER_PATH)
+ * rather than executing directly from removable media, avoiding invalid
+ * memory mappings if the SD card is removed.
  *
- * The copy itself follows this project's own established durable-write
- * idiom (temp file, fsync, atomic rename -- see scanner_save_last_boot()'s
- * own doc comment, and albumart.c's albumart_store_rgb565() for the same
- * pattern in the main app): the SD source file is deleted only after the
- * new internal copy has been verified byte-for-byte and made durable, so a
- * power loss or SD removal at any point during the copy leaves the device
- * exactly as bootable as it was before this ran -- either the SD file is
- * still there to retry from, or the install already completed and the SD
- * file's removal is the only step left outstanding. */
+ * Writes to a temporary file, verifies integrity, fsyncs, and atomically
+ * renames before removing the source SD file. */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -37,17 +19,10 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 
-/* Same directory INSTALLED_PLAYER_PATH itself lives in -- statvfs()'d for
- * free space and fsync()'d as a plain directory fd once the rename below
- * has landed. */
+/* Target installation directory, checked for free space and fsynced after rename. */
 #define INSTALL_DIR "/usr/data"
 
-/* Fixed name, not mkstemp() -- this project already uses a fixed
- * ".tmp"-suffixed sibling for exactly this purpose (scanner_save_last_boot()).
- * Never opened for read by anything else in this file or by
- * installer_internal_player_path(), so a stale leftover from an interrupted
- * previous attempt is simply overwritten (O_TRUNC) the next time this runs,
- * never mistaken for an installed binary. */
+/* Temporary path used during installation before atomic rename. */
 #define INSTALL_TMP_PATH "/usr/data/.open_hiby_player.installing"
 
 static bool path_is_executable_file(const char * path) {
@@ -55,17 +30,9 @@ static bool path_is_executable_file(const char * path) {
     return path && path[0] && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
 }
 
-/* Plain, table-driven CRC-32 (the standard reflected 0xEDB88320 polynomial)
- * used only to confirm two files' CONTENT matches -- detecting a truncated
- * or corrupted copy (SD removed mid-read, a flipped bit, ENOSPC cutting a
- * write short), not authenticating the file against tampering. This
- * bootloader intentionally links nothing beyond tjpgd (see BOOTLOADER_SRCS'
- * own comment in the Makefile) -- pulling in mbedtls's MD5/SHA (already
- * vendored for the main player's own network/plugin code) into this small,
- * boot-critical binary for a corruption check alone isn't warranted. The
- * table is built once, lazily, into a function-local static: this file only
- * ever runs the check on the rare boot where an SD update is actually
- * present, never on the common no-update boot path. */
+/* Table-driven CRC-32 (standard reflected 0xEDB88320 polynomial) used to
+ * verify copy integrity and detect truncation or file corruption.
+ * The table is lazily initialized on first use. */
 static uint32_t crc32_table[256];
 static bool crc32_table_ready = false;
 
@@ -113,10 +80,7 @@ static bool fsync_path(const char * path, bool is_dir) {
     return ok;
 }
 
-/* Plain byte copy, src to dst (dst created/truncated fresh). Any short read
- * or short/failed write -- SD card pulled mid-copy, ENOSPC, an unrelated
- * I/O error -- reports failure; the caller then discards dst rather than
- * ever treating a partial copy as usable. */
+/* Copies bytes from src to dst. Returns false on short read or write failure. */
 static bool copy_file(const char * src_path, const char * dst_path) {
     int src_fd = open(src_path, O_RDONLY);
     if (src_fd < 0) {
@@ -168,31 +132,10 @@ static uint32_t read_u32le(const unsigned char * p) {
     return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
 }
 
-/* Confirms the copied file is a complete, loadable MIPS32LE executable ELF
- * -- a structural/truncation check independent of file_crc32_and_size()
- * above, which only proves the copy matches whatever bytes came off the SD
- * card: a source file truncated (or otherwise corrupted) to exactly the
- * right shorter length copies "accurately" just the same. This app's own
- * toolchain (mipsel-linux-musl-gcc, -static -no-pie) always produces a
- * fixed-size 52-byte ELFCLASS32/ELFDATA2LSB/ET_EXEC/EM_MIPS header
- * (confirmed against this project's own unstripped build output) followed
- * immediately by a 32-byte-entry program-header table -- both boards this
- * project currently supports (r1, r3proii) share the same X1600 MIPS SoC
- * family, so none of this is board-specific.
- *
- * Checking only those fixed-offset header bytes (as an earlier version of
- * this function did) still passes a file truncated to just past them: the
- * header alone doesn't prove anything about what should follow it. This
- * additionally requires the program-header table itself to fit within the
- * actual file size, and every PT_LOAD segment's [p_offset, p_offset +
- * p_filesz) range to fit within it too -- a real executable's loadable
- * code/data cannot lie beyond the file's own end. Deliberately not a full
- * ELF parse (no section headers, no relocation/symbol validation, no
- * segment CONTENT inspection): this bootloader intentionally avoids
- * pulling in a real ELF library (see this file's own top comment on why
- * mbedtls was skipped for the same reason) and this is not a security
- * boundary, only a guard against installing something that could never
- * have actually run. */
+/* Confirms the copied file is a complete, loadable MIPS32LE executable ELF.
+ * Validates ELF header fields, ensures the program header table fits within
+ * the file, and verifies that all PT_LOAD segment ranges are bounded by the
+ * actual file size to guard against truncated binaries. */
 static bool validate_player_elf(const char * path) {
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
@@ -226,9 +169,7 @@ static bool validate_player_elf(const char * path) {
         e_phnum = read_u16le(ehdr + 44);
     }
 
-    /* The program-header table must itself lie entirely within the file --
-     * a copy truncated right after a byte-for-byte-intact ELF header would
-     * otherwise pass everything checked so far. */
+    /* The program-header table must lie entirely within the file. */
     if (ok && (e_phnum == 0 || e_phentsize < ELF32_PHDR_SIZE)) ok = false;
     if (ok) {
         uint64_t phtable_end = (uint64_t) e_phoff + (uint64_t) e_phentsize * (uint64_t) e_phnum;
@@ -251,13 +192,7 @@ static bool validate_player_elf(const char * path) {
         uint32_t p_filesz = read_u32le(phdr + 16);
         if (p_type == 1 /* PT_LOAD */) {
             saw_load_segment = true;
-            /* Every loadable segment's own file-backed bytes must fit
-             * within the actual (not merely declared) file size -- this is
-             * the check that actually catches a truncated copy: a short
-             * file can still have a fully in-bounds, well-formed program-
-             * header table sitting right after the (also intact) ELF
-             * header while the LOAD segment(s) the table describes point
-             * past where the real file data actually ends. */
+            /* Ensure loadable segment bytes fit within actual file size. */
             if ((uint64_t) p_offset + (uint64_t) p_filesz > file_size) ok = false;
         }
     }
@@ -288,23 +223,14 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
         return;
     }
 
-    /* Content-identical to what is already installed: either nothing has
-     * actually changed, or a previous install completed but its own SD-file
-     * cleanup below didn't. Either way, never repeat the copy/verify/install
-     * work -- only retry the cleanup, so a redundant SD copy eventually
-     * stops being carried around without ever being reinstalled needlessly. */
+    /* If the SD update is byte-identical to the installed player, skip
+     * installation and complete any pending cleanup of the SD update file. */
     if (path_is_executable_file(INSTALLED_PLAYER_PATH)) {
         uint32_t inst_crc;
         off_t inst_size;
         if (file_crc32_and_size(INSTALLED_PLAYER_PATH, &inst_crc, &inst_size) && inst_size == sd_size &&
             inst_crc == sd_crc) {
-            /* Confirm the installed copy's directory entry is durable
-             * before destroying the only other copy of it -- the SD file
-             * is the sole recovery path if a power loss right after this
-             * point turns out to have never made that entry durable in the
-             * first place (e.g. an earlier boot's own post-rename fsync,
-             * below, failed and was never retried until now). Not fatal:
-             * just try again next boot, same as any other install failure. */
+            /* Ensure installed directory entry is durable before removing SD file. */
             if (!fsync_path(INSTALL_DIR, true)) {
                 fprintf(stderr,
                         "installer: %s already installed but directory sync failed -- retrying its SD cleanup "
@@ -324,14 +250,7 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
         }
     }
 
-    /* Reclaim any leftover temp file from an interrupted previous attempt
-     * BEFORE measuring free space -- statvfs() below sees this file's
-     * space as already spoken for until it's actually gone, so on a
-     * nearly-full partition a stale, never-cleaned-up .installing file
-     * could fail every subsequent retry's space check even though the
-     * space it holds would be enough once reclaimed. copy_file() below
-     * would truncate this same path anyway, but that happens after the
-     * check this exists to fix. */
+    /* Remove any leftover temporary file before checking available space. */
     unlink(INSTALL_TMP_PATH);
 
     struct statvfs vfs;
@@ -390,15 +309,7 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
         unlink(INSTALL_TMP_PATH);
         return;
     }
-    /* The new binary is already in place and bootable either way from this
-     * point on -- but its directory entry is not yet confirmed durable, and
-     * the SD copy is the only other copy that exists. Require the fsync to
-     * succeed before deleting that copy: a power interruption between an
-     * unsynced rename and the next boot could otherwise lose the rename
-     * (leaving no installed copy at all) at the same time as the SD source
-     * (leaving nothing to reinstall from). A failed sync here just retries
-     * -- both the sync and the SD cleanup -- next boot, via the
-     * content-identical path above. */
+    /* Ensure directory entry is durable before deleting the SD update file. */
     if (!fsync_path(INSTALL_DIR, true)) {
         fprintf(stderr, "installer: install completed but directory sync failed -- leaving SD update for a later "
                         "boot\n");

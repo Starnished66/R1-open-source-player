@@ -99,41 +99,14 @@ static void * stream_thread_func(void * arg) {
             char crlf[4];
             if (!http_conn_reader_line(&s->reader, crlf, sizeof(crlf))) break;
         } else {
-            /* No Content-Length and no chunked framing -- the normal shape
-             * for live internet radio. Just keep reading raw bytes off the
-             * wire until the connection closes or errors; http_conn_read()
-             * naturally returns <= 0 at that point either way, including
-             * the (rare, for a live source) case where the server did send
-             * a real Content-Length and the stream is genuinely finite.
-             *
-             * Reader-aware, not a raw http_conn_read() -- real-server
-             * finding (a live Navidrome/TLS test, not caught by earlier
-             * testing against plain-HTTP servers): mbedtls_ssl_read() hands
-             * back a whole decrypted TLS record at once, which routinely
-             * bundles the first body bytes together with the response
-             * headers in the SAME underlying read that s->reader's header-
-             * line parsing already consumed. A plain http_conn_read() here
-             * only sees whatever arrives on a later read, silently
-             * skipping over those already-buffered leading bytes -- for a
-             * format like FLAC, corrupting the file's own magic number and
-             * failing to open at all. http_conn_reader_read_some() drains
-             * s->reader's buffer first before falling back to a fresh
-             * read, so nothing already received is ever dropped. */
+            /* Read raw stream bytes, draining reader's buffered bytes first. */
             int n = http_conn_reader_read_some(&s->reader, chunk, sizeof(chunk));
             if (n <= 0) break;
             if (!push_to_ring(s, chunk, (size_t) n)) break;
         }
     }
 
-    /* Audit finding: http_conn_close() (which frees s->conn.net.fd via
-     * mbedtls_net_free() -- closing the real fd and setting net.fd = -1)
-     * used to run outside this lock, while http_stream_close() read that
-     * same net.fd with no lock at all. A close()'d fd number can be
-     * reused by an unrelated socket/file elsewhere in this multi-socket
-     * app (DLNA, remote control, Wi-Fi) almost immediately, so a stale
-     * read here could shutdown() the wrong connection entirely. Closing
-     * inside the same lock http_stream_close() now also holds (see that
-     * function's own comment) makes the two properly mutually exclusive. */
+    /* Mark stream ended and close network connection under mutex. */
     pthread_mutex_lock(&s->mutex);
     s->ended = true;
     pthread_cond_broadcast(&s->cond);
@@ -319,21 +292,7 @@ void http_stream_close(http_stream_t * s) {
     pthread_cond_broadcast(&s->cond);
     pthread_mutex_unlock(&s->mutex);
 
-    /* The pump thread may be blocked inside http_conn_read() on the socket
-     * itself (mbedtls_net_recv/ssl_read ultimately wrap a plain blocking
-     * recv()), which push_to_ring()'s stop_requested check can't reach --
-     * shutdown() forces that recv() to return immediately instead of
-     * waiting indefinitely for the server to send more data. The thread's
-     * own http_conn_close() still runs, right before it exits.
-     *
-     * Audit finding: reading s->conn.net.fd here used to happen with no
-     * lock held at all, racing stream_thread_func()'s own http_conn_close()
-     * (which frees/invalidates that same field via mbedtls_net_free()) at
-     * natural end-of-stream -- see that function's own comment for the
-     * stale-fd-reuse consequence. Locked here too now, matching where it
-     * closes; if the pump thread already finished and closed on its own,
-     * net.fd already reads -1 under this same lock and shutdown() is
-     * correctly skipped instead of acting on a stale/reused fd number. */
+    /* Unblock pending socket read by shutting down fd if still connected. */
     pthread_mutex_lock(&s->mutex);
     int fd = s->conn.net.fd;
     pthread_mutex_unlock(&s->mutex);

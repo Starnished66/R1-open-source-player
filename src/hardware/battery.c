@@ -41,32 +41,8 @@ static bool read_sysfs_attr(const char * device_name, const char * attr, char * 
  * like "battery" or "axp2101-battery", which could change across firmware
  * updates if the fuel-gauge driver is ever swapped).
  *
- * Real-hardware testing found the R1 actually exposes *two* entries typed
- * "Battery": "axp_battery" (a raw/uncalibrated PMIC sub-node) and "battery"
- * (the real fuel gauge, reporting the correct percentage).
- *
- * Real-device bug report (2026-08-08): the charge limiter (configured to
- * stop at 85%) was reported stopping at two DIFFERENT values on two
- * different physical units -- 86% and 91% -- confirmed both on the same,
- * already-fixed charge_limiter.c build. A spread that wide, differing
- * *per unit*, doesn't fit a timing/lag explanation (that would produce a
- * small, fairly consistent overshoot); it fits this scan silently reading
- * from a different physical sensor on each unit. The previous version of
- * this scan preferred "whichever Battery-typed entry reports a nonzero
- * capacity first, in readdir()'s own enumeration order" -- a real fix for
- * the specific case already found (axp_battery reading exactly capacity=0
- * at one observed moment), but readdir() order isn't guaranteed identical
- * across physical units/boots, and axp_battery's raw PMIC voltage-based
- * SOC estimate is notoriously inaccurate near full charge (voltage curves
- * flatten out non-linearly there) -- if it happens to report ANY nonzero
- * value before "battery" is enumerated, this scan would silently lock onto
- * the wrong, less accurate sensor, with no way to tell from the outside.
- * Fixed to deterministically prefer an entry actually named "battery" (the
- * confirmed real fuel-gauge driver name above) over any other
- * Battery-typed entry, rather than trusting enumeration order or a
- * nonzero-value heuristic -- falls back to the old best-effort scan only
- * if no entry is literally named "battery", for robustness on any other
- * device/variant where the real gauge might be named differently. */
+ * Prefers an entry named "battery" (the dedicated fuel gauge driver) over "axp_battery"
+ * (raw PMIC node), falling back to any Battery-typed entry if not found. */
 static pthread_mutex_t battery_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char cached_battery_device[64];
 static int cached_capacity = -1;
@@ -239,23 +215,8 @@ int battery_get_display_percent(void) {
     struct timespec now;
     clock_gettime(battery_clock_id(), &now);
 
-    /* Real-device bug report: the displayed percent stayed pinned at a
-     * pre-sleep reading (e.g. 71%) across an entire ~8-hour overnight
-     * suspend, only to suddenly jump straight to the real value (e.g. 63%)
-     * within a couple of minutes of the screen actually being kept on --
-     * looking like a random stall-then-jump rather than a steady drain.
-     * Root cause: nothing calls this function at all while the screen is
-     * off, so the very first poll after waking sees a raw value that's
-     * already stale by the entire sleep duration, but this smoothing logic
-     * treated it exactly like routine gauge jitter -- starting a fresh
-     * BATTERY_DISPLAY_STABLE_MS observation window before trusting it. A
-     * brief look at the screen (long enough to notice the stale number, not
-     * long enough for that window to elapse) put it right back to sleep
-     * with display_capacity never corrected; the "jump" only happened once
-     * the screen was later left on continuously past the stability window.
-     * A gap this large between polls isn't gauge noise to filter -- it's
-     * confirmation nothing has been observed for a while, so the fresh
-     * reading should be trusted immediately, the same as a cold start. */
+    /* If there is a large gap since the last poll (e.g. waking from suspend),
+     * accept the raw value immediately without smoothing lag. */
     bool long_gap = display_last_poll_valid && elapsed_ms(now, display_last_poll) >= BATTERY_DISPLAY_RESYNC_GAP_MS;
     display_last_poll = now;
     display_last_poll_valid = true;
@@ -297,20 +258,8 @@ int battery_get_display_percent(void) {
             int gap = powered ? display_candidate - display_capacity : display_capacity - display_candidate;
 
             if (valid_direction && gap >= BATTERY_DISPLAY_JUMP_THRESHOLD) {
-                /* Real-device bug report: the displayed percent stayed
-                 * stuck (e.g. showing 74% with the real battery already at
-                 * 85%) for many minutes -- confirmed only correcting itself
-                 * on an app restart, which resets this whole static state
-                 * and snaps straight to the real reading (the
-                 * display_capacity < 0 branch above). Root cause: a gap
-                 * this size, once stable, is a real change (a long charge
-                 * session, or the battery moving while asleep and this
-                 * simply not being polled to catch it as it happened) --
-                 * but the 1-point-per-BATTERY_DISPLAY_STEP_MS climb below
-                 * would take many minutes to catch up to it regardless.
-                 * Snap straight to the real reading once it's been stable
-                 * this long (still filters a single noisy sample, just not
-                 * a genuinely sustained gap this large). */
+                /* If a large difference is sustained across the stability window,
+                 * snap directly to the candidate value rather than stepping slowly. */
                 display_capacity = raw;
                 display_last_step = now;
             } else if (valid_direction && elapsed_ms(now, display_last_step) >= BATTERY_DISPLAY_STEP_MS) {

@@ -103,16 +103,9 @@
 #include "gui_plugin_manage.h"
 #include "gui_lock_screen.h"
 
-/* Temporary investigation instrumentation for the "applying Wavy crashed
- * the device" report -- a real, reproducible SIGSEGV inside musl's free()
- * (dmesg: "invalid read access from 00000008", epc in get_meta, ra in
- * __libc_free), meaning something is passing a corrupted pointer to
- * free() somewhere in this sequence, not a plain NULL dereference in
- * application code. Append-only, fsync per line, so a crash mid-step
- * doesn't take the last few log lines down with it -- same reasoning the
- * bootloader's own boot_diag_log() uses. Brackets every single step so
- * the exact step (not just "somewhere in gui_soft_reload()") is known
- * from the log's last line once this reproduces again. */
+/* Diagnostic logging for UI reload steps. Append-only with fsync per line
+ * to ensure entries are flushed to storage immediately to identify the
+ * failure point if a crash occurs during reload. */
 #define RELOAD_DIAG_PATH "/data/mnt/sd_0/reload_diag.log"
 static void reload_diag(const char * step) {
     int fd = open(RELOAD_DIAG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);

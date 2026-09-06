@@ -32,20 +32,11 @@ typedef struct {
     int last_source_kind;      /* 0 = unknown/filesystem, 1 = All Songs, 2 = album */
     char last_source_name[128];/* album title when last_source_kind == 2 */
 
-    /* Settings -> Playback -> Resume Last Track. 0 = off (default), 1 =
-     * resume and start playing immediately on a cold boot, 2 = resume
-     * (load last_track, seek to last_position, show the player screen) but
-     * stay paused -- no audible auto-play, just ready the moment the user
-     * hits play. Replaces the old plain auto_resume_enabled bool (defaulted
-     * true, defaulting a boot-time auto-play feature to on) -- see gui_init()
-     * for the actual resume path, gated on this and reusing the exact same
-     * Subsonic-cache guard Car Mode's own separate, always-on resume
-     * mechanism already established after a real crash-reboot-loop
-     * incident (2026-08-08) traced to resuming into a cached stream file.
-     * Independent of car_mode_enabled below -- Car Mode has its own
-     * dedicated docking-routine resume (always plays, requires a headphone
-     * connected at boot), this is the general-purpose one a normal user
-     * opts into by hand. */
+    /* Settings -> Playback -> Resume Last Track.
+     * 0 = off (default), 1 = resume and start playing on boot,
+     * 2 = load last track and seek to last position but stay paused.
+     * Skips tracks in SUBSONIC_STREAM_CACHE_DIR.
+     * Car Mode has its own separate, always-on, headphone-gated resume. */
     int resume_mode;
 
     /* Settings -> Playback -> Play/Pause Button. What the physical
@@ -69,16 +60,9 @@ typedef struct {
      * that field's old on-disk key. */
     int replaygain_mode;
 
-    /* Car Mode: matches the stock firmware's own real behavior (confirmed
-     * by real-device report) -- unplugging power while something is loaded
-     * checkpoints position and powers the device off; plugging power back
-     * in powers it back on and resumes automatically (forces the same
-     * startup path auto_resume_enabled triggers, independent of that
-     * setting). See gui.c's update_timer_cb and gui_init() for the two
-     * halves. Off by default: this is an opt-in convenience for a specific
-     * docking routine, not a default playback behavior -- and unlike a
-     * plain auto-resume toggle, leaving it on outside a car would power the
-     * device off every time its charger gets unplugged. */
+    /* Car Mode: unplugging power while something is loaded checkpoints position
+     * and powers the device off; plugging power back in powers it back on and
+     * resumes automatically. Off by default. */
     bool car_mode_enabled;
 
     /* Subsonic-compatible (Subsonic/Navidrome/Airsonic/...) server config.
@@ -113,12 +97,9 @@ typedef struct {
     bool bt_volume_sync_enabled; /* --a2dp-volume: HW volume buttons also change the paired device's volume */
     bool bt_dac_mode_enabled;    /* a2dp-sink profile: lets another device stream audio TO this one */
     char bt_codec[16];           /* "auto"/"ldac_hq"/"ldac_sq"/"aptx"/"aac"/"sbc" -- written into alsa.conf */
-    /* Real-device feedback: nearby BLE beacons/accessories that don't
-     * broadcast a name clutter the Bluetooth screen's "Available Devices"
-     * list, showing as raw MAC addresses (see add_bt_device_row()'s own
-     * MAC-address fallback in gui.c). Defaults to hiding them -- paired
-     * devices are shown regardless of this setting, since a device you've
-     * already paired with is never something you'd want hidden. */
+    /* When true, BLE devices without a broadcast name are hidden from the
+     * "Available Devices" list (shown as raw MAC addresses otherwise).
+     * Paired devices are always shown regardless of this setting. */
     bool bt_hide_unnamed_devices;
 
     /* AirPlay receive mode -- see airplay_control.h. Mutually exclusive with
@@ -286,62 +267,25 @@ typedef struct {
     char timezone[64];
 
     /* Settings -> System -> Hostname. Empty means "use the stock device
-     * name" (/usr/resource/hostname, baked into the read-only squashfs at
-     * build time -- this app has no write access there). When non-empty,
-     * applied at every boot by apply_custom_hostname() (main.c), which
-     * bind-mounts a writable copy over BOTH /usr/resource/hostname and
-     * /usr/resource/bt_name (the same file already drives the DHCP
-     * hostname wifi_on.sh advertises and the Bluetooth alias bt_init sets
-     * -- see apply_custom_hostname()'s own comment) and calls sethostname()
-     * for the kernel's own copy. Requires a reboot to take effect since
-     * both wifi_on.sh and bt_init only ever read their file once, at the
-     * point something turns Wi-Fi/Bluetooth on -- matches the explicit
-     * real-device request ("reboot and have it applied") rather than
-     * trying to force a live re-apply into two scripts this app doesn't
-     * own. RFC 1123 caps a hostname label at 63 characters; 64 leaves room
-     * for the NUL. */
+     * name" (/usr/resource/hostname). When non-empty, applied at boot by
+     * hostname_apply(). Requires a reboot to take effect. */
     char hostname[64];
 
     /* UI text size (Settings -> Display -> Font Size): 0 = Small, 1 =
-     * Medium, 2 = "BlindMF" (largest; requested name).  Applied at startup
-     * and transactionally live through fallback_font_apply_size_tier(). */
+     * Medium, 2 = "BlindMF" (largest). Applied at startup and live
+     * via fallback_font_apply_size_tier(). */
     int font_size_tier;
 
-    /* Settings -> Lyrics Text Size: a SEPARATE size control just for the
-     * fullscreen synchronized lyrics view, independent of font_size_tier
-     * above. Real-device request: lyrics need to stay large/readable
-     * regardless of whatever the user picked for the rest of the app's UI
-     * chrome, since scaling them down with a smaller general text-size
-     * choice made them hard to read. Only 2 of the 3 usual tiers apply here
-     * (1 = Medium, 2 = Large, matching the same tier numbering/pixel sizes
-     * font_size_tier's own Medium/BlindMF already use for their 28px slot --
-     * see fallback_font.h's app_font_lyrics) -- there's no "Small" option,
-     * since a small lyrics view was the exact complaint that prompted this
-     * separate control to exist. Defaults to 2 (Large) rather than 1, for
-     * the same readability-first reasoning. Unlike the general live Font
-     * Size setting, this independent control still applies after reboot. */
+    /* Settings -> Lyrics Text Size: independent text size control for the
+     * fullscreen synchronized lyrics view (1 = Medium, 2 = Large). Defaults to 2 (Large). */
     int lyrics_font_size_tier;
 
-    /* Screen brightness, logical 0-100 (same scale as backlight.h's
-     * backlight_get_percent()/backlight_set_percent()). Real-device bug
-     * report: brightness had no memory across a real power-down/power-up --
-     * nothing applied any brightness at startup, so the screen came up at
-     * whatever raw value the kernel/bootloader itself defaults the backlight
-     * to, not whatever the user had it set to before powering off. Applied
-     * once in gui_init(), before any screen is built (same timing as
-     * fallback_font_init_early()), and re-persisted on every slider release
-     * (quick_drawer_brightness_changed_cb() in gui.c) the same way volume
-     * is. Default 80 matches backlight.c's own restore_percent fallback
-     * default, for consistency. */
+    /* Screen brightness (0-100), applied at startup and updated when adjusted.
+     * Defaults to 80. */
     int brightness_percent;
 
-    /* Settings -> System -> "24-Hour Clock". Controls the topbar clock's
-     * format (refresh_clock_label() in gui.c): true renders "%H:%M" (the
-     * app's original, only-ever behavior, so this is the default -- an
-     * existing install's clock does not change format on its own), false
-     * renders "%I:%M" plus an AM/PM sprite next to it (topbar/am.png,
-     * topbar/pm.png -- already-present theme assets, previously unused by
-     * any code in this app). */
+    /* Settings -> System -> "24-Hour Clock". Controls the topbar clock format:
+     * true renders 24-hour "%H:%M", false renders 12-hour "%I:%M" with an AM/PM sprite. */
     bool clock_24h;
     bool clock_automatic;
     int64_t clock_manual_epoch;
@@ -372,31 +316,9 @@ void settings_save_async(const player_settings_t * settings);
 void settings_subsonic_server_upsert(player_settings_t * settings, const char * url, const char * username,
                                       const char * password, bool verify_tls);
 
-/* Settings > System > Factory Reset: wipes every direct child of /usr/data
- * EXCEPT "mnt" (real bug report: an earlier version of this only deleted
- * the settings file, leaving the active PEQ, hostname override, Bluetooth
- * pairings, ALSA config, theme overrides, etc. all still in effect after a
- * "reset"), then reboots so the next boot's settings_load() falls through
- * to plain defaults, same as a genuinely fresh install.
- *
- * "mnt" is not an ordinary subdirectory -- it's the live SD card mount
- * (/usr/data/mnt/sd_0, confirmed on-device: /data is a symlink to usr/data,
- * and /dev/mmcblk0p1 is mounted there). Every one of this app's own
- * MUSIC_ROOT_DIR/PLAYLISTS_DIR/METADATA_DB_PATH references elsewhere point
- * at that same path -- the music/book library cache, saved PEQ profiles,
- * and playlists all already live there, so skipping "mnt" both protects the
- * user's actual SD card from ever being touched and, as a direct
- * consequence, already preserves all of that real user *data* without
- * needing its own separate carve-out. See settings.c's own implementation
- * comment for exactly how "mnt" is skipped (never even descended into, not
- * merely excluded by a flag/pattern).
- *
- * Doesn't touch *out or re-apply anything live -- the caller is expected to
- * reboot right after (see gui.c's factory_reset_confirm_cb()), since re-
- * syncing every individual subsystem's live state (accent color, screen
- * timeout, BT/Wi-Fi power, LEDs, ...) by hand is exactly what a fresh boot
- * already does for free, the same reasoning a firmware update reboots
- * rather than trying to hot-swap itself. */
+/* Settings > System > Factory Reset: wipes all configuration files and data
+ * in /usr/data except the "mnt" directory (the SD card mount point), then reboots
+ * into default settings. */
 void settings_factory_reset(void);
 
 

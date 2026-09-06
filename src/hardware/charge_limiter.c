@@ -10,21 +10,9 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Real-device incident (2026-08-08): after this feature was active for a
- * while on a charging device, the status bar's battery percentage/charge
- * status stopped updating, and separately the whole UI went white/text-only
- * (asset loading failing). At the time this looked like it might be this
- * file's own repeated raw i2c smbus transactions against the AXP2101
- * somehow wedging the power_supply sysfs nodes battery.c reads from, so
- * this was reverted to fully inert as a precaution. Root-caused since:
- * battery.c's read_best_battery_status() had a real, unrelated file
- * descriptor leak (its "battery" fast path returned early without
- * closedir()) that leaked a few fds a second on every status-bar poll --
- * exhausting the process's fd limit in well under ten minutes, at which
- * point every open()/fopen() call in the whole process starts failing at
- * once (sysfs reads AND PNG asset loading, together, matching exactly what
- * was seen). Fixed in battery.c; confirmed independent of this file. Back
- * to active. */
+/* CHARGE_LIMITER_ACTIVE gates the AXP2101 i2c transactions.
+ * Set to 0 to disable entirely; the limiter is independent of
+ * battery.c's status polling. */
 #define CHARGE_LIMITER_ACTIVE 1
 
 #define AXP2101_I2C_BUS "/dev/i2c-0"
@@ -55,75 +43,26 @@
 #define AXP2101_CHG_CURRENT_MASK 0x1Fu
 #define AXP2101_CHG_CURRENT_500MA 0x08u
 
-/* Real-device incident (2026-08-07): charge_limiter previously throttled by
- * zeroing REG62 (ICC / "fast charge current", the constant-CURRENT phase
- * target) instead of this register -- documented at length in
- * charge_limiter.h's own history as the fix for an even earlier wrong
- * approach (a sysfs node wired to the wrong register entirely). REG62 was a
- * real, working control, just for the wrong phase of charging: per the
- * official AXP2101 datasheet section 7.7.3.3, once VBAT reaches the target
- * voltage (VREG) the charger enters constant-VOLTAGE (CV) mode and holds
- * output voltage constant while current tapers on its own -- REG62's
- * CC-phase current ceiling stops being the active constraint at that point,
- * so zeroing it has no effect on a charge cycle that's already in CV phase.
- * Confirmed as the actual bug: user report was charging stopping at
- * ~91-92% instead of the configured 85% -- consistent with the battery
- * already being in CV phase well before the 85% check ever fires, so the
- * charger just ran its own CV taper down to its own internal termination-
- * current threshold (ITERM, ~125mA default) and completed on its own,
- * ignoring REG62 entirely. chg_en (this register) disables the WHOLE
- * charger state machine, CC and CV phases alike -- confirmed against the
- * same datasheet section: "the charger is enabled when an adapter is
- * inserted" and "charger enable bit is reset to 1" (to exit battery-safe-
- * mode) are both described as controls over this exact bit, not REG62. */
+/* Disabling chg_en in REG_MODULE_EN turns off the charger state machine
+ * across both constant-current and constant-voltage phases. */
 
 #define CHARGE_LIMITER_STOP_PERCENT 85
 #define CHARGE_LIMITER_TRIGGER_PERCENT 84
 #define CHARGE_LIMITER_RESUME_PERCENT 82
 
-/* Re-checks and re-applies at most this often, rather than on every 500ms
- * gui.c timer tick -- the i2c write itself is cheap, but there's no reason
- * to repeat it dozens of times a minute while nothing has changed.
- * Re-applying periodically (not just on threshold-crossing edges) also
- * covers the datasheet's own documented auto-re-enable-on-adapter-insert
- * behavior -- if the user unplugs/replugs the cable while already over the
- * limit, the PMIC may re-enable charging on its own, and the next poll
- * corrects it again within this interval.
- *
- * Was 30s; tightened after a real-device overshoot report (stopping at
- * 86-91% instead of 85%) -- the primary cause turned out to be
- * battery.c's own sensor-selection bug (see its history), not this
- * interval, but a shorter window still directly reduces how much the
- * battery can climb between "crossed 85%" and "we actually noticed and
- * disabled charging," on general principle, for whatever residual lag the
- * real fuel gauge itself has. The i2c read this costs every 5s is cheap
- * (a couple of register reads/writes, no different in kind from what
- * gui.c's own status-bar polling already does more often than this). */
+/* Re-checks and re-applies at most this often rather than on every GUI tick.
+ * Periodic re-application ensures any state changes (such as adapter replug)
+ * are caught and addressed. */
 #define CHARGE_LIMITER_REEVALUATE_SECONDS 5
 
-/* Exported read-only UI state -- the DESIRED/intended hold, decided purely
- * from the percent thresholds below, BEFORE disable_charging()/
- * enable_charging() is even attempted (see charge_limiter_poll()). NOT the
- * kernel power_supply status either way (confirmed stale on this device: it
- * can keep saying "Charging" while REG18 chg_en is clear and REG01 says
- * not_charging) -- but also not a confirmation that the i2c write actually
- * took effect; if disable_charging() fails, this stays true through the
- * ~1s retry regardless. Fine for callers that only care about intent (e.g.
- * gui.c's idle-shutdown eligibility check), wrong for anything that needs
- * to know the charger is ACTUALLY off right now -- see charger_confirmed_
- * off below for that. Only the GUI timer/settings callbacks call this
- * module, so no cross-thread synchronization is needed. */
+/* Exported read-only UI state -- the desired hold, decided from the percent
+ * thresholds before hardware writes are attempted. Used for intent checks
+ * (e.g. idle-shutdown eligibility). Only GUI callbacks call this module, so no
+ * cross-thread synchronization is needed. */
 static bool limiter_holding = false;
 
-/* Distinct from limiter_holding above: true only once disable_charging()
- * (or enable_charging()) has actually run AND its own register-readback
- * check (set_charging_enabled()) confirmed the write took effect. Stays at
- * its last CONFIRMED value (not the newly-desired one) while a write is
- * failing/retrying, rather than optimistically flipping the instant intent
- * changes. This is what led_control.c's blue "charging complete/capped"
- * indicator consumes -- showing that LED based on limiter_holding alone
- * would light it during the retry window even if the charger were still
- * genuinely enabled. */
+/* True only once register readback confirms charging is disabled. Used by
+ * LED indicators to avoid transient false positives during retries. */
 static bool charger_confirmed_off = false;
 
 #if CHARGE_LIMITER_ACTIVE
@@ -216,27 +155,19 @@ void charge_limiter_poll(bool enabled, bool force) {
     int percent = battery_get_percent();
     if (percent < 0) return; /* no battery data (e.g. host build) -- nothing to act on */
 
-    /* battery_get_percent() itself, not just the chg_stat register logged
-     * inside disable_charging()/enable_charging(), so a live overshoot
-     * report can distinguish "we correctly disabled right at 85%, the
-     * fuel gauge itself later crept up" from "we were late/reading the
-     * wrong sensor" -- exactly the ambiguity the 86%-vs-91% two-tester
-     * report needed and didn't have visibility into before this. */
+    /* Log battery percent and threshold state. */
     DBG_LOG("charge_limiter: poll percent=%d (target=%d trigger=%d resume=%d holding=%d)\n",
             percent, CHARGE_LIMITER_STOP_PERCENT, CHARGE_LIMITER_TRIGGER_PERCENT,
             CHARGE_LIMITER_RESUME_PERCENT, limiter_holding);
 
-    /* Stop one displayed percentage point early to absorb the real gauge's
-     * normal lag, then hold the charger off through 83/84/85% bounce rather
-     * than re-enabling it every time a noisy sample dips below 85. */
+    /* Trigger one percentage point early to absorb gauge lag, with hysteresis
+     * to avoid repeatedly cycling charging on noisy readings. */
     if (percent >= CHARGE_LIMITER_TRIGGER_PERCENT) limiter_holding = true;
     else if (percent <= CHARGE_LIMITER_RESUME_PERCENT) limiter_holding = false;
 
     bool applied = limiter_holding ? disable_charging() : enable_charging();
     if (applied) {
-        /* Only now, with the register readback actually confirming it, does
-         * the CONFIRMED state move to match the desired one -- see
-         * charger_confirmed_off's own comment. */
+        /* Update confirmed state only upon register confirmation. */
         charger_confirmed_off = limiter_holding;
     } else {
         last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */

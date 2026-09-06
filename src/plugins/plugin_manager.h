@@ -4,75 +4,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Bumped 1 -> 2: added plugin.storage and plugin.secrets (namespaced
- * per-plugin state/credential storage), plugin.json_decode()/json_encode(),
- * plugin.media_capabilities(), plugin.download_file_async(), plugin.mkdir().
- * Existing plugins are unaffected by the bump itself (api_min=1 still loads
- * fine against api_version=2, see the api_min > PLUGIN_API_VERSION check in
- * l_plugin_define()) -- this only lets a NEW plugin declare api_min=2 to
- * require the APIs above exist. See PLUGINS.md's "API version 2" changelog
- * for the one genuinely breaking change bundled into this same window: an
- * earlier audit pass removed require()/dofile()/loadfile()/package()/
- * debug/os.execute()/os.getenv() from every plugin's lua_State (real-device
- * testing confirmed zero installed plugins used any of them) -- a
- * third-party plugin that split its own code across multiple files via
- * require()/dofile() will fail to load after this change, with no
- * restricted module-loader replacement provided yet.
- *
- * Bumped 2 -> 3: added plugin.play_remote()/queue_remote_list() (the native
- * side of a provider-neutral remote-music-service plugin -- Qobuz/Tidal/
- * etc, see PLUGINS.md) and the "track_started" event's two new trailing
- * provider/track_id arguments. Purely additive, same as the 1->2 bump: an
- * existing plugin declaring api_min=1 or 2 keeps loading and working
- * unchanged. Also see the new "playback.remote" plugin_capabilities[]
- * entry (plugin_manager.c) -- has_capability("playback.remote") is the
- * finer-grained, no-version-bump-needed way to feature-detect this
- * specifically, for a plugin that only cares about this one API rather
- * than requiring the whole api_min=3 batch.
- *
- * Bumped 3 -> 4: added plugin.set_home_layout() (per-tile color/radius/size
- * overrides for Home's 6 fixed tiles, plus an optional tile-grid ->
- * pill-list mode switch -- see PLUGINS.md and home_layout.h). Purely
- * additive, same as every bump before it. Takes effect on the next app
- * start only (Home is built once, at startup, and never rebuilt) -- see
- * home_layout.h's own comment. Also see the new "ui.home_layout"
- * plugin_capabilities[] entry (plugin_manager.c) for the no-version-bump
- * way to feature-detect just this. */
-/* API 5 adds plugin.reload_ui(); API 6 adds the targeted
- * plugin.refresh_theme() alternative.
- *
- * Bumped 6 -> 7: added plugin.register_home_tile() (a plugin can add its own
- * tile to Home, same shape as the existing plugin.register_stream_media_tile())
- * and plugin.set_home_layout()'s new `options.order` field (an ordered list
- * of native-tile-keys/plugin-tile-ids controlling which tiles Home shows and
- * in what position -- previously Home's 6 tiles were always shown, always in
- * a fixed native order; see home_layout.h and PLUGINS.md). Purely additive,
- * same as every bump before it. Also see the new "ui.home_tiles"
- * plugin_capabilities[] entry (plugin_manager.c) for the no-version-bump
- * way to feature-detect just this. */
-/* API 8 adds plugin.set_launcher_layout(), allowing themes to switch the
- * native Music, Stream Media, and Wireless launchers between their existing
- * icon grids and the shared pill-list presentation.
- * API 9 adds show_list()'s optional selected-row highlight and an optional
- * duration_ms argument to show_toast(). Both are backward-compatible.
- * Bumped 9 -> 10: added plugin.set_home_layout()'s new `options.
- * background_image` field -- a static image shown behind Home's own tiles/
- * rows only (not every screen, unlike plugin.set_background_color()),
- * copied once from the plugin's SD-card source into this app's writable
- * theme-override storage the same way plugin.set_icon() already does.
- * Purely additive, same as every bump before it. Also see the new
- * "ui.home_background" plugin_capabilities[] entry (plugin_manager.c) for
- * the no-version-bump way to feature-detect just this.
- *
- * Bumped 10 -> 11: added plugin.set_hw_volume_curve() -- lets a plugin
- * replace the built-in UI-volume -> internal-DAC-hardware-register taper
- * entirely with its own 101-entry table (e.g. to reproduce a real device's
- * Low/Medium/High Gain curves, or any other custom curve), for headphone/
- * IEM-sensitivity use cases the app's own single fixed taper can't cover.
- * No effect on USB output (see audio.h's own comment on why). Purely
- * additive, same as every bump before it. Also see the new
- * "audio.hw_volume_curve" plugin_capabilities[] entry (plugin_manager.c)
- * for the no-version-bump way to feature-detect just this. */
+/* Plugin API version definition.
+ * Plugins can declare api_min to require specific API features.
+ * Sandboxed Lua states restrict filesystem and OS execution access. */
 #define PLUGIN_API_VERSION 11
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
@@ -88,15 +22,7 @@
  * closures that need their owning state alive to be called later. */
 
 /* Upper bound on how many rows all plugins combined may register into the
- * Books screen's list via plugin.register_list_item("books", ...) -- sizes
- * plugin_manager.c's own internal plugin_books_list_items[] array, and
- * gui.c's build_books_screen() sizes its own static items[] array off this
- * (2 built-in rows -- "Books", "Favorites" -- plus this many plugin rows).
- * Unlike the icon-grid tile registries below, build_pill_list_screen()'s
- * rows genuinely scroll (real-device confirmed, screen_builders.h's own
- * comment), so there's no hard "fills the screen" ceiling forcing this
- * number down the way PLUGIN_MAX_STREAM_TILES's own comment describes --
- * 8 is just a generous, arbitrary round number, not a rendering limit. */
+ * Books screen list via plugin.register_list_item("books", ...). */
 #define PLUGIN_MAX_BOOKS_LIST_ITEMS 8
 
 /* Same shape and same reasoning as PLUGIN_MAX_BOOKS_LIST_ITEMS above, for

@@ -75,18 +75,15 @@ static bool current_lyrics_doc_valid = false;
 static int current_lyrics_doc_for_index = -1; /* gui_player_get_playlist_index() current_lyrics_doc was loaded for */
 static int current_lyrics_doc_generation = -1;
 static int lyrics_load_generation = 0;
-/* Real-device request: embedded lyrics tags (ID3 USLT, FLAC/Opus LYRICS/
+/* Embedded lyrics tags (ID3 USLT, FLAC/Opus LYRICS/
  * UNSYNCEDLYRICS, M4A "\xA9lyr") are usually plain unsynced text with no
- * [mm:ss.xx] timestamps -- despite the name, that's what "unsynced" means
- * for 3 of those 4 tag names. current_lyrics_doc_valid/current_lyrics_doc
- * above stay reserved for the synced case (an .lrc sidecar, or the less
- * common tagger that does embed real LRC text in one of those fields);
- * this is the parallel "just show the raw text as a static block, no
- * per-line highlight or auto-follow" case -- mutually exclusive with
- * current_lyrics_doc_valid, same as their lyrics_load_result_* counterparts
- * above. current_lyrics_plain_text is malloc'd, owned by these globals
- * once poll_lyrics_load() transfers it; freed there on the next load and
- * whenever current_lyrics_plain_mode is cleared. */
+ * [mm:ss.xx] timestamps. current_lyrics_doc_valid/current_lyrics_doc
+ * stay reserved for the synced case (an .lrc sidecar, or tags containing
+ * LRC timestamps); unsynced text is displayed as a static block without
+ * per-line highlight or auto-follow, mutually exclusive with
+ * current_lyrics_doc_valid. current_lyrics_plain_text is malloc'd, owned
+ * by these globals once poll_lyrics_load() transfers it; freed on the next
+ * load and whenever current_lyrics_plain_mode is cleared. */
 extern void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stride, int radius);
 
 
@@ -147,14 +144,8 @@ static lv_image_dsc_t current_lyrics_backdrop_dsc;
 static void launch_lyrics_backdrop_decode(void); /* defined alongside build_lyrics_screen() below -- see poll_cover_decode()'s own use of it */
 static pthread_t lyrics_load_thread;
 static bool lyrics_load_active = false;
-/* atomic_bool rather than a plain volatile bool -- audit finding: a plain
- * bool has no C11-recognized ordering between the worker thread's write
- * here and the UI thread's poll read, the same formally-a-data-race
- * pattern already fixed for compact_list_fetch_job_t.result_count
- * (screen_builders.c) elsewhere in this session's diff. Cost-free to make
- * consistent: plain assignment/comparison on an _Atomic-qualified object
- * already uses sequentially consistent ordering by default in C11, so
- * every read/write site below is unchanged syntactically. */
+/* atomic_bool ensures well-defined memory ordering between the worker
+ * thread's write and the UI thread's poll read. */
 static atomic_bool lyrics_load_done_flag = false;
 static int lyrics_load_result_generation;
 static int lyrics_load_result_for_index;
@@ -187,18 +178,10 @@ static void * lyrics_load_thread_func(void * arg) {
     bool plain_mode = false;
     char * plain_text = NULL;
 
-    /* Real-device request: fall back to the track's own embedded lyrics tag
-     * (ID3 USLT, FLAC/Opus LYRICS/UNSYNCEDLYRICS, M4A "\xA9lyr" -- see
-     * metadata_read()'s own doc comment) when there's no .lrc sidecar.
-     * Independent metadata_read() call rather than sharing apply_track_
-     * metadata_to_ui()'s own -- see that function's comment on why (this
-     * thread already does its own file I/O regardless, so re-parsing tags
-     * here is cheaper than plumbing a pointer through two independent async
-     * paths that don't otherwise share state). Tries lrc parsing first
-     * (some taggers do embed real [mm:ss.xx] text in these fields despite
-     * "unsynced" being right there in 3 of the 4 tag names); anything with
-     * text but no usable timestamp lines falls back to plain_mode, a static
-     * unsynced block, rather than showing nothing. */
+    /* Fall back to the track's embedded lyrics tag (ID3 USLT, FLAC/Opus
+     * LYRICS/UNSYNCEDLYRICS, M4A "\xA9lyr") when there is no .lrc sidecar.
+     * Parses LRC timestamps if present; otherwise falls back to plain_mode
+     * (static unsynced text). */
     if (!ok) {
         track_metadata_t meta;
         metadata_read(req->track_path, &meta);
@@ -377,13 +360,9 @@ static void * lyrics_backdrop_thread_func(void * arg) {
     return NULL;
 }
 /* Set by launch_lyrics_backdrop_decode() when a request arrives while a
- * generation is already running for a since-superseded track -- real bug
- * report: silently dropping that request (the old behavior) left the OLD
- * track's backdrop permanently stuck once the in-flight job's stale result
- * was applied by poll_lyrics_backdrop(), since nothing else ever retried
- * for the track actually playing now. poll_lyrics_backdrop() checks this
- * once the in-flight job lands and immediately kicks off a fresh
- * generation for whatever's current at that point. */
+ * generation is already running for a since-superseded track.
+ * poll_lyrics_backdrop() checks this once the in-flight job lands and
+ * immediately kicks off a fresh generation for the current track. */
 static bool lyrics_backdrop_regenerate_pending = false;
 /* No queuing beyond the single pending flag above (never more than one
  * generation queued behind the active one) -- unlike cover art's own
@@ -432,11 +411,8 @@ static void launch_lyrics_backdrop_decode(void) {
 /* Applies a finished backdrop generation to lyrics_backdrop_img -- called
  * from lyrics_timer_cb() (only ticking while the lyrics screen is open)
  * rather than update_timer_cb(), so it resolves within one 150 ms tick of
- * becoming ready instead of waiting up to 500 ms. Same lv_image_dsc_t
- * construction care as current_cover_dsc/current_reflection_dsc in poll_
- * cover_decode() above -- memset to 0 first, then explicitly set header.
- * magic, or LVGL's bin decoder silently corrupts the color format (see that
- * function's own real-device-incident comment for the full story). */
+ * becoming ready instead of waiting up to 500 ms. Sets up lv_image_dsc_t
+ * with LV_IMAGE_HEADER_MAGIC and RGB565 format for LVGL's bin decoder. */
 static void poll_lyrics_backdrop(void) {
     if (!lyrics_backdrop_active || !atomic_load_explicit(&lyrics_backdrop_done_flag, memory_order_acquire)) return;
     lyrics_backdrop_active = false;

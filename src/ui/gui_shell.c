@@ -86,10 +86,10 @@ static int brightness_hw_pending = -1;
 static bool brightness_drag_active = false;
 static bool wifi_toggle_active = false;
 /* While a manual toggle or the ordinary screen-off radio restore is in
- * flight, the requested state is the UI source of truth.  wifi_on.sh
- * deliberately tears down/recreates wpa_supplicant, so its control socket
- * temporarily disappears during a successful cold enable; painting that
- * transient read used to make the drawer/topbar bounce on -> off -> on. */
+ * flight, the requested state is the UI source of truth. wifi_on.sh
+ * tears down and recreates wpa_supplicant, so its control socket
+ * temporarily disappears during a cold enable; this prevents the UI
+ * from bouncing on -> off -> on during the transition. */
 static bool wifi_toggle_target_enabled = false;
 static bool bt_toggle_active = false;
 static bool bt_toggle_target_enabled = false;
@@ -107,17 +107,9 @@ static bool bt_toggle_followup_target_enabled = false;
  * wifi_toggle_active reverting to false means poll_wifi_toggle() never
  * consumes it for that failed attempt anyway.
  *
- * Consumed once by poll_wifi_toggle() to skip gui_network_handle_wifi_
- * disabled()'s permanent cleanup for this transient case specifically:
- * unlike AirPlay/BT DAC mode (excluded from radio suspend entirely by
- * gui.c's own radios_suspended gate), DLNA and Remote Control have no such
- * exclusion, so without this every idle radio-suspend cycle would stop them
- * and permanently clear their persisted settings -- gui_shell_resume_
- * connections() only ever restores the WIFI RADIO transparently afterward,
- * never these app-level features, so a setting cleared here would never
- * come back on its own. That's a real regression from the intended
- * "explicitly shut down whenever Wi-Fi is turned off [by the user]"
- * behavior, not the transient, self-reversing power-save blip this is. */
+ * Consumed once by poll_wifi_toggle() to skip permanent cleanup of
+ * DLNA and Remote Control during transient power-save radio suspend,
+ * preserving their settings across screen-off sleep cycles. */
 static bool wifi_toggle_is_radio_suspend = false;
 
 /* Read-only effective-Wi-Fi-state accessor for callers outside this file
@@ -193,11 +185,10 @@ static lv_obj_t * battery_icon_fill_img;
 static int battery_topbar_visible_digit_count = 3;
 
 /* Fill sprite (topbar/battery.png) bbox within its own 20x30 native canvas,
- * measured directly off the asset (alpha bbox: x 4-15, y 9-22) -- used to
- * clip it down from the bottom as a charge-level gauge in
- * refresh_battery_topbar(). Not derived at runtime since nothing else in
- * this codebase decodes PNG alpha to find sprite bounds; a fixed asset gets
- * a fixed constant, same as every other hand-placed topbar sprite here. */
+ * measured directly off the asset (alpha bbox: x 4-15, y 9-22) and clipped
+ * from the bottom as a charge-level gauge in refresh_battery_topbar(). Not
+ * derived at runtime since nothing else in this codebase decodes PNG alpha
+ * to find sprite bounds; a fixed asset gets a fixed constant. */
 #define BATTERY_FILL_W 12
 #define BATTERY_FILL_H 14
 static lv_obj_t * wifi_icon;
@@ -393,33 +384,23 @@ static void build_status_bar(void) {
      * with the real time, so there's no visible flash of "00:00". */
     lv_obj_align(clock_topbar_group, LV_ALIGN_CENTER, 0, 0);
 
-    /* Left edge of the bar, in the clock's old spot -- matches the stock
-     * player's own layout (speaker icon, red volume number, headphone-out
-     * icon, all pinned left, confirmed via real-device screenshot). A flex
-     * row lets hidden digit slots (see refresh_volume_topbar()) collapse
-     * cleanly instead of leaving a gap. */
+    /* Left edge of the bar: speaker icon, red volume number, headphone-out
+     * icon, all pinned left. A flex row lets hidden digit slots (see
+     * refresh_volume_topbar()) collapse cleanly instead of leaving a gap. */
     volume_topbar_group = lv_obj_create(band);
     lv_obj_remove_style_all(volume_topbar_group);
     lv_obj_set_size(volume_topbar_group, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(volume_topbar_group, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(volume_topbar_group, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     /* No extra column padding -- each digit sprite already has ~1px of
-     * transparent margin baked into its own canvas on both edges (e.g.
-     * topbar/9.png is a 14px-wide canvas with the glyph itself only
-     * spanning x=1..13), which is enough separation on its own. Adding a
-     * pad_column on top of that visibly widened the gap between digits at
-     * this size (confirmed against real-device feedback: "space between
-     * the numbers"). */
+     * transparent margin baked into its canvas on both edges (e.g.
+     * topbar/9.png is a 14px-wide canvas with the glyph spanning x=1..13),
+     * providing sufficient separation. */
     lv_obj_set_style_pad_column(volume_topbar_group, 0, 0);
     lv_obj_remove_flag(volume_topbar_group, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Rendered at native asset resolution (LV_SCALE_NONE), same as
-     * battery_icon/wifi_icon/bt_status_icon below -- an earlier downscale
-     * here (~0.65x) was based on a mismeasured comparison against the
-     * clock text and came out looking too small (real-device feedback).
-     * Re-measured directly against a real stock-player screenshot: the red
-     * "93" glyph bbox was 21px tall vs the clock's 19px -- i.e. native size
-     * is already the right size, no downscale needed. */
+    /* Rendered at native asset resolution (LV_SCALE_NONE), matching
+     * battery_icon/wifi_icon/bt_status_icon. */
     lv_obj_t * volume_topbar_icon = lv_image_create(volume_topbar_group);
     lv_image_set_src(volume_topbar_icon, asset_path("topbar/speaker.png"));
     lv_image_set_scale(volume_topbar_icon, LV_SCALE_NONE);
@@ -436,11 +417,9 @@ static void build_status_bar(void) {
         lv_image_set_scale(volume_topbar_digit[i], LV_SCALE_NONE);
     }
 
-    /* Headphone-out glyph (topbar/po.png, confirmed by pixel comparison
-     * against a real-device screenshot) -- starts hidden and is only shown
-     * by refresh_headphone_icon() once real jack-detect state says a
-     * headphone/dongle is actually plugged in (see headphone_status.h),
-     * not shown unconditionally like the previous round had it. */
+    /* Headphone-out glyph (topbar/po.png) -- starts hidden and is shown
+     * by refresh_headphone_icon() when a headphone/dongle is plugged in
+     * (see headphone_status.h). */
     volume_topbar_headphone = lv_image_create(volume_topbar_group);
     lv_image_set_src(volume_topbar_headphone, asset_path("topbar/po.png"));
     lv_image_set_scale(volume_topbar_headphone, LV_SCALE_NONE);
@@ -466,12 +445,8 @@ static void build_status_bar(void) {
      * this is meant to feel like the wired headphone jack, not a mode you
      * switch into). */
     usb_audio_status_icon = lv_image_create(volume_topbar_group);
-    /* topbar/usb.png, NOT usb/usb.png -- real-device bug report: the latter
-     * is the big centered glyph the USB DAC mode overlay screen uses
-     * (build_usb_dac_overlay_screen(), further down), a different asset
-     * sized/styled for that full-screen context, not this small topbar
-     * status row (which every other icon here -- topbar/a2dp.png,
-     * topbar/play.png -- already correctly pulls from topbar/). */
+    /* Uses topbar/usb.png for the topbar status row (distinct from
+     * usb/usb.png used by the full-screen USB DAC mode overlay). */
     lv_image_set_src(usb_audio_status_icon, asset_path("topbar/usb.png"));
     lv_image_set_scale(usb_audio_status_icon, LV_SCALE_NONE);
     lv_obj_add_flag(usb_audio_status_icon, LV_OBJ_FLAG_HIDDEN);
@@ -648,19 +623,10 @@ void refresh_battery_topbar(void) {
     }
     if (percent > 100) percent = 100;
 
-    /* Real-device bug report: the charging bolt disappeared as soon as the
-     * 85% limiter was enabled, well before the battery actually got there.
-     * Root cause: charge_limiter_holding tracks charge_limiter.c's own
-     * hysteresis state, which flips true one point EARLY (at 84%, see
-     * CHARGE_LIMITER_TRIGGER_PERCENT's own comment -- deliberate, to absorb
-     * fuel-gauge lag before the real 85% cutoff) and, being sticky
-     * hysteresis, can stay true from a previous session even once the
-     * displayed percent has since dropped a little without crossing the
-     * lower CHARGE_LIMITER_RESUME_PERCENT reset point. Neither case means
-     * the battery has actually reached the 85% this UI promises -- only
-     * suppress the charging icon once the displayed percent has genuinely
-     * gotten there too, matching what's on screen rather than the internal
-     * hysteresis flag alone. */
+    /* charge_limiter_holding tracks the hysteresis state (which flips true
+     * early to absorb fuel-gauge lag). Suppress the charging bolt only once
+     * the displayed percentage actually reaches 85% to match what is visible
+     * on screen. */
     bool limiter_capped_now = charge_limiter_holding && percent >= 85;
     bool charging = !limiter_capped_now && battery_is_charging();
     bool low = !charging && percent < 5;
@@ -790,26 +756,13 @@ void refresh_headphone_icon(void) {
  * sub-second polling anyway. */
 #define WIFI_POLL_TICKS 10
 
-/* Real-device bug report: wifi_icon and bt_status_icon originally each sat
- * at their own hand-tuned fixed offset from battery_icon_frame -- fine when
- * both or neither were showing, but with only one of the two radios on, the
- * other's now-hidden slot was left as a dead gap between the visible icon
- * and the battery percentage instead of the visible one sliding over to sit
- * right next to it. Fix: track which of the two is CURRENTLY closer to the
- * battery (order[0], the inner slot) vs. one slot further out (order[1]),
- * and re-derive it from scratch on every call rather than mutating an
- * existing arrangement in place -- simpler and can't drift out of sync with
- * the two icons' own hidden-flag state, the actual source of truth, which
- * is all this ever reads. Whichever of the two is currently visible AND was
- * already occupying a slot keeps it; a newly-visible icon takes whichever
- * slot (if any) is still free. This is what gives "closer to the battery"
- * its "whichever appeared first" ordering from the bug report: the icon
- * that was already on when the second one turns on keeps the inner slot
- * instead of being displaced, and the moment either disappears the survivor
- * (if any) is pulled into the inner slot so there's never a gap. The two
- * slots are positioned relative to battery_topbar_group/battery_icon_frame
- * (not a fixed offset), further down -- see that comment for how Settings >
- * Power > "Battery Percentage" folds into the same anchor logic. */
+/* Derives topbar icon order (wifi_icon and bt_status_icon) relative to
+ * battery_topbar_group/battery_icon_frame. Tracks which icon occupies the
+ * inner slot (closer to battery) versus the outer slot, avoiding gaps
+ * when one of the radios is disabled. Whichever icon was already visible
+ * keeps the inner slot; newly-visible icons take any remaining free slot.
+ * The two slots are positioned relative to
+ * battery_topbar_group/battery_icon_frame. */
 typedef enum {
     TOPBAR_STATUS_ICON_NONE = 0,
     TOPBAR_STATUS_ICON_WIFI,
@@ -867,10 +820,8 @@ static void sync_topbar_status_icon_positions(void) {
     }
 }
 
-/* The drawer's own wifi icon just reflects radio-on/off (blue as soon as
- * enabled, real-device feedback: the connected-vs-just-enabled distinction
- * is a top-bar-only thing) -- the top bar icon keeps the finer-grained
- * enabled-vs-actually-associated-to-an-AP distinction below. */
+/* The drawer's wifi icon reflects radio on/off (highlighted when enabled),
+ * while the top bar icon indicates connection status and signal strength. */
 static void refresh_wifi_icon(void) {
     /* Keep an in-flight enable visually enabled even before wlan0's
      * wpa_supplicant socket exists.  Association is still queried below,
@@ -927,22 +878,11 @@ bool bt_is_powered_cached = false;
 char bt_connected_mac_cached[18] = "";
 char bt_connected_codec_cached[32] = "";
 
-/* /usr/bin/bt_init's (stock, unmodified) very last line is
- * `mkdir -p /tmp; echo > /tmp/bt_init_ok`, right after its own real UART
- * chip firmware flash and everything else it does. /tmp is tmpfs on this
- * device, so this file can never be a stale leftover from a previous boot.
- *
- * Real-device incident: tapping Bluetooth on (quick_drawer_bt_event_cb()
- * below) while bt_init's own chip flash was still genuinely in progress
- * raced this app's own bt_control_init_chip() -> /usr/bin/bt_resume
- * against it -- confirmed live to actually wedge the chip (unrecoverable
- * without a full power cycle), the exact class of incident bt_chip_mutex's
- * own comment already documents (a userspace mutex in THIS app can't
- * protect against a SEPARATE process, bt_init, touching the same UART).
- * An earlier display-suppression implementation made the cosmetic flicker
- * disappear but made this worse by allowing an early tap to reach the real
- * toggle worker. Checked in quick_drawer_bt_event_cb() before it does
- * anything real -- see its own comment. */
+/* /usr/bin/bt_init's last line creates /tmp/bt_init_ok once chip firmware
+ * flash and initialization complete. Because /tmp is tmpfs, this flag is
+ * never stale from a prior boot.
+ * Checked before attempting Bluetooth toggles to prevent concurrent UART
+ * access while the system initialization script is running. */
 #define BT_INIT_OK_FLAG_PATH "/tmp/bt_init_ok"
 
 /* Bluetooth status is unknown, not off, while the stock asynchronous
@@ -971,13 +911,9 @@ static void mark_bt_media_player_enable_pending(void) {
     atomic_store_explicit(&bt_media_player_enable_pending, true, memory_order_release);
 }
 
-/* Moved up from the Bluetooth settings screen section further down (still
- * used there, see populate_bt_screen()) -- refresh_bt_icon_thread_func()
- * below needs to reference bt_scan_results directly, before its own
- * definition down there, to fix a real-device bug: the settings screen's
- * device list only ever reflected paired/connected state as of the last
- * explicit scan, never refreshed afterward unlike the top-bar icon (see
- * poll_refresh_bt_icon()'s own comment on the merge step below). */
+/* Shared Bluetooth device scan results, referenced by both
+ * refresh_bt_icon_thread_func() and the Bluetooth settings screen
+ * (populate_bt_screen()). */
 #define BT_MAX_RESULTS 32
 bt_device_t bt_scan_results[BT_MAX_RESULTS];
 int bt_scan_result_count = 0;
@@ -987,20 +923,10 @@ int bt_scan_result_count = 0;
 static bt_device_t bt_paired_states_result[BT_MAX_RESULTS];
 static int bt_paired_states_count = 0;
 
-/* Real-device incident: this used to call bt_control_is_powered()/
- * bt_control_is_connected() (bluetoothctl show / bluetoothctl info)
- * directly, synchronously, right here on the UI thread -- every call site
- * of what's now start_refresh_bt_icon() ran on that thread, including the
- * periodic ~5s poll. subprocess_run()'s own 15s timeout-and-kill exists
- * specifically because bluetoothctl show is known to hang under certain
- * Bluetooth states (see its doc comment) -- confirmed on a real device
- * that active A2DP audio streaming (Bluetooth DAC, phone actively playing)
- * is exactly such a state: bluetoothctl show hung, and since the periodic
- * poll re-issued another call as soon as (or before) the previous one's
- * bounded wait gave up, the whole UI stayed frozen for as long as the hang
- * persisted, not just one bounded 15s stall. Backgrounded the same way
- * every other slow Bluetooth operation in this file already is, so a hang
- * here can no longer block LVGL's own timer_handler() from running. */
+/* Bluetooth status checks (bt_control_is_powered / bt_control_is_connected)
+ * run asynchronously in a worker thread to prevent bluetoothctl subprocess
+ * execution from blocking the UI thread during streaming or slow state
+ * transitions. */
 static pthread_t refresh_bt_icon_thread;
 static bool refresh_bt_icon_active = false;
 static atomic_bool refresh_bt_icon_done_flag = false;
@@ -1184,24 +1110,9 @@ static void poll_refresh_bt_icon(void) {
     refresh_bt_icon_active = false;
     pthread_join(refresh_bt_icon_thread, NULL);
 
-    /* Real-device bug report: enabling Bluetooth from the quick drawer
-     * flipped the drawer icon on (quick_drawer_bt_event_cb()'s own
-     * optimistic flip), then back off, then back on again. Root cause:
-     * this poll runs independently, on its own periodic cadence, of the
-     * user's own tap-to-toggle -- if one lands mid-flight (turning
-     * Bluetooth on for real can take ~10-13s cold), refresh_bt_icon_result_
-     * powered still reflects the OLD, pre-toggle state, since bt_control_
-     * is_powered() genuinely hasn't changed yet. The populate_bt_screen()
-     * call further down was ALREADY guarded against exactly this race (see
-     * its own comment) after an earlier, identical bug report about the
-     * Bluetooth settings screen's own toggle row -- but that fix only
-     * covered the settings screen, not bt_is_powered_cached itself or the
-     * drawer icon below, which this same stale result was still freely
-     * overwriting. Skipping the whole result application while
-     * bt_toggle_active leaves the optimistic flip standing undisturbed
-     * everywhere, not just on the settings screen, until poll_bt_toggle()'s
-     * own follow-up start_refresh_bt_icon() call lands with the real,
-     * settled state once the in-flight toggle actually completes. */
+    /* While a manual toggle is in-flight (bt_toggle_active), ignore the
+     * background poll result to prevent overwriting the optimistic state
+     * with stale pre-toggle hardware readings. */
     if (bt_toggle_active) return;
 
     bool display_powered = refresh_bt_icon_result_powered;
@@ -1235,12 +1146,7 @@ static void poll_refresh_bt_icon(void) {
         invalidate_bt_codec_status_cache();
         sync_topbar_status_icon_positions();
         /* Bluetooth screen's own toggle row + everything gated on it reads
-         * bt_is_powered_cached too -- only actually needs rebuilding while
-         * that screen is the one on screen, see the comment below on the
-         * other populate_bt_screen() call site for why. (No bt_toggle_active
-         * check needed here anymore -- the whole function already returned
-         * early above while a toggle's in flight, see that comment for the
-         * real-device bug this used to only half-fix.) */
+         * bt_is_powered_cached too -- rebuilt only while that screen is visible. */
         if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
         return;
     }
@@ -1254,43 +1160,9 @@ static void poll_refresh_bt_icon(void) {
     }
     sync_bt_codec_status_icon();
 
-    /* Real-device bug: the Bluetooth settings screen's device list kept
-     * showing paired/connected state as of the last explicit scan forever
-     * after -- populate_bt_screen() re-runs every poll tick already (right
-     * below), but it only re-renders bt_scan_results, which nothing kept
-     * fresh; only this function's own icon update above was ever current.
-     * Update in place by MAC match rather than appending -- a device not
-     * already in bt_scan_results (nothing scanned yet) still needs an
-     * explicit Rescan, same as before; this only fixes staleness for
-     * entries already on screen.
-     *
-     * Real-device bug #2 (found later): "Forget Device" (poll_bt_forget())
-     * clears bt_scan_results[i].paired locally and immediately, but this
-     * loop used to only ever UPDATE an entry that appeared in the fresh
-     * bt_paired_states_result[] snapshot -- never explicitly clear one that
-     * dropped OUT of it. A background poll that started (bt_control_
-     * list_paired_states() takes several real subprocess round trips)
-     * before the user hit Forget, but which HAPPENS to land afterward,
-     * still carried the stale "still paired" snapshot -- reapplying it
-     * here silently undid poll_bt_forget()'s own correct clear, confirmed
-     * live as "forgot a device, it stopped showing up at all" (stuck
-     * showing as still-paired, so filtered out of both list sections it
-     * could sanely appear in). Iterating bt_scan_results and searching
-     * bt_paired_states_result (inverted from the original nesting) instead
-     * makes this poll's own result authoritative in BOTH directions: found
-     * -> apply it, not found -> it's not paired, full stop, regardless of
-     * whatever an even-more-stale direct clear or a previous poll left
-     * behind.
-     *
-     * Guarded on bt_paired_states_count >= 0 (not -1, see
-     * bt_control_list_paired_states()'s own doc comment): a failed query
-     * means no fresh data at all this cycle, not "0 devices are paired" --
-     * applying the "not found -> clear it" half on a failed query would
-     * incorrectly wipe every device's real paired state over a transient
-     * subprocess hiccup. Skipping the whole merge (leaving bt_scan_results
-     * exactly as it was) just means this cycle contributes nothing, same as
-     * if the poll simply hadn't run yet -- the next successful cycle
-     * catches up normally. */
+    /* Update scan results in-place by MAC match against the fresh paired states
+     * snapshot from the background poll. If bt_paired_states_count is negative,
+     * the query failed, so skip merge to retain current state. */
     if (bt_paired_states_count >= 0) {
         for (int j = 0; j < bt_scan_result_count; j++) {
             bool found = false;
@@ -1308,64 +1180,30 @@ static void poll_refresh_bt_icon(void) {
             }
         }
     }
-    /* Real-device bug: this used to call populate_bt_screen() unconditionally
-     * every ~5s poll tick regardless of which screen was actually on
-     * screen -- lv_obj_clean() + rebuilding every device row (icons,
-     * labels, buttons) is real LVGL work, confirmed live as visible UI
-     * tearing/animation stutter on OTHER screens (player, home, ...) the
-     * whole time Bluetooth was on, not just while the Bluetooth screen was
-     * open. bt_scan_results itself is still kept fresh above every cycle
-     * regardless (cheap, no LVGL calls) -- only the actual widget rebuild is
-     * gated, and open_bluetooth_screen() already calls populate_bt_screen()
-     * itself once on entry, so the screen is never stale when the user
-     * actually opens it. (No bt_toggle_active check needed here either --
-     * same reasoning as the other populate_bt_screen() call site above,
-     * this function's own !display_powered branch.) */
+    /* Rebuild Bluetooth screen only when it is currently on top to avoid
+     * UI stutter on other screens. */
     if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
 
-    /* Real-device bug: pairing/connecting Bluetooth headphones worked (this
-     * poll's own refresh_bt_icon_result_connected went true), but no audio
-     * ever played -- see audio_set_bt_output()'s doc comment in audio.h for
-     * the root cause (this app's output was hardcoded to local hardware,
-     * with no path to bluealsa at all). Gated on bt_dac_mode_enabled being
-     * off: DAC mode runs bluealsa as a2dp-sink (receiving audio FROM a
-     * phone), not a2dp-source, so there's no source profile for this app's
-     * own playback to route into while DAC mode has that swapped out (see
-     * bt_control_apply_output_settings()'s own comment on the two being
-     * mutually exclusive). */
+    /* Route audio to Bluetooth when connected, unless Bluetooth DAC mode is
+     * enabled (which runs bluealsa as an A2DP sink rather than source). */
     bool use_bt_output = refresh_bt_icon_result_connected && !current_settings.bt_dac_mode_enabled;
     audio_set_bt_output(use_bt_output);
 
-    /* Same gating as audio_set_bt_output() right above -- real-device bug
-     * report: once Bluetooth output itself worked, the headphones' own
-     * volume buttons had no effect on this app and vice versa. See
-     * bt_control_source_volume_sync_start()'s own comment in
-     * bluetooth_control.c for why this doesn't double-attenuate on top of
-     * this app's own volume taper. */
+    /* Volume synchronization with Bluetooth audio output devices. */
     if (use_bt_output && current_settings.bt_volume_sync_enabled) {
         bt_control_source_volume_sync_start();
     } else {
         bt_control_source_volume_sync_stop();
     }
 
-    /* Same gating again -- see bt_control_output_disconnect_watch_start()'s
-     * own comment (bluetooth_control.h) for what this buys over the plain
-     * ~5s poll below (refresh_bt_icon_result_a2dp_connected itself): a real
-     * disconnect surfaces in well under a second instead of up to ~17s. */
+    /* Output disconnect watcher for faster disconnection detection. */
     if (use_bt_output) {
         bt_control_output_disconnect_watch_start();
     } else {
         bt_control_output_disconnect_watch_stop();
     }
 
-    /* Same gating again -- real-device bug report: "can't use bluetooth
-     * headphones while on USB DAC". usb_dac_bridge.c's own output stream
-     * used to always go straight to local hardware regardless of this;
-     * now it shares the same audio_output module local playback uses (see
-     * usb_dac_bridge_set_bt_output()'s own doc comment), so it needs the
-     * same signal. Harmless to call when USB DAC mode isn't even active
-     * (the bridge just isn't running, so this only updates a flag it'll
-     * read next time it starts). */
+    /* Mirror Bluetooth output setting to USB DAC bridge when active. */
     usb_dac_bridge_set_bt_output(use_bt_output);
 }
 
@@ -1373,35 +1211,10 @@ static void poll_refresh_bt_icon(void) {
 
 
 /* Android-style home indicator: a small pill fixed to the bottom edge,
- * living on lv_layer_top() (drawn above every screen, same trick as the
- * status bar) so a swipe-up starting there is always caught by THIS object
- * instead of whatever scrollable list happens to be underneath it.
- *
- * Real-device bug report: plain swipe-up-anywhere (screen_gesture_event_cb()
- * above) didn't work on any screen with a scrollable list -- LVGL claims a
- * vertical drag as a list SCROLL before it ever escalates to a gesture (see
- * enable_gesture_bubble_recursive()'s own comment: that only affects whether
- * a completed gesture bubbles up, not whether one gets generated in the
- * first place on an object that can still scroll in that direction). A
- * horizontal swipe doesn't have this problem since none of these lists
- * scroll sideways, which is why back/forward navigation swipes were never
- * affected. Deliberately NOT shrinking every screen's own content height to
- * visually reserve this strip too (touches this many build_XXX_screen()
- * call sites for a first pass) -- it overlays the very bottom of scrollable
- * content instead, same tradeoff plenty of real apps make with a floating
- * gesture bar.
- *
- * Second real-device bug report: an LV_EVENT_GESTURE handler directly on
- * this band (the first attempt) never fired at all. Same root cause already
- * documented and fixed for the quick drawer's own edge-swipe (see
- * poll_quick_drawer_drag()'s own long comment): LVGL's gesture detection is
- * unreliable for this exact "small dedicated edge zone" shape of
- * interaction on real hardware. Tracking is done there instead, by polling
- * the indev's raw position every tick alongside the drawer's own drag
- * tracking (home_swipe_tracking/home_swipe_start_y/home_swipe_triggered,
- * declared there) -- sidesteps LVGL's hit-testing/gesture-escalation
- * machinery entirely, the same fix that made the drawer's own swipe
- * reliable. */
+ * living on lv_layer_top() (drawn above every screen) so a swipe-up
+ * starting there is caught by this object.
+ * Position tracking is handled via raw coordinate polling in
+ * poll_quick_drawer_drag() / gesture_home_state_poll(). */
 
 static void build_home_indicator_bar(void) {
     lv_obj_t * top = lv_layer_top();
@@ -1455,25 +1268,10 @@ static void build_home_indicator_bar(void) {
 static void poll_usb_audio_output(void) {
     static bool was_connected = false;
     char alsa_device[32];
-    /* Real-device bug report: "USB DAC mode connected but not emitting any
-     * sound". This device's single USB port can't simultaneously be a USB
-     * gadget (device, what USB_MODE_DAC puts it into -- see usb_mode_
-     * control.c/usb_dac_bridge.c) and a USB host for an external accessory
-     * DAC, so "an external USB audio device is connected" can never be
-     * genuinely true while in that mode -- yet this poll had no such guard
-     * and ran unconditionally, every gui_shell_poll() tick, regardless of
-     * usb_mode. audio_output.c's requested_target gives this auto-detected
-     * external-accessory output priority over both Bluetooth and local
-     * (see its own recompute_requested_target()), so any false-positive
-     * detection here -- confirmed via a real bug report, exact driver-level
-     * cause not independently verified from here -- silently redirected
-     * usb_dac_bridge.c's own writes away from local hardware into a
-     * spawned aplay pointed at a nonexistent device, on every poll tick,
-     * making it impossible for usb_dac_bridge_start()'s own one-shot
-     * audio_output_set_usb_requested(false, ...) (see its own comment) to
-     * stick for longer than one tick on its own. Forcing "not connected"
-     * here for the whole time usb_mode is DAC removes the false positive
-     * at its source instead of just clearing its symptom once. */
+    /* When USB_MODE_DAC is active, the USB port operates in gadget mode rather
+     * than host mode, so external host-accessory audio devices cannot be
+     * connected. Bypassing detection while in USB_MODE_DAC prevents false
+     * positives from redirecting audio output away from the DAC bridge. */
     bool connected = current_settings.usb_mode != USB_MODE_DAC &&
                       usb_audio_output_is_connected(alsa_device, sizeof(alsa_device));
 
@@ -1512,15 +1310,9 @@ static void poll_usb_audio_output(void) {
  * screen_gesture_event_cb, which needs the latter for its
  * swipe-down-near-the-top-edge check. */
 
-/* Real control now -- see crossfade_switch_event_cb (Settings > Crossfade)
- * for the other half of this same toggle; both read/write
- * current_settings.crossfade_enabled and both keep the OTHER one's icon/
- * switch state in sync (refresh_quick_drawer_crossfade_icon() /
- * sync_settings_crossfade_toggle()), so whichever one you use, the other
- * reflects it next time you look. Uses pull_down/fade.png/fade_s.png (a
- * real stock asset, dedicated to this -- confirmed by name, unlike
- * gain_h.png/gain_l.png this used to show, which was always a placeholder
- * for "output gain", never a real control). */
+/* Crossfade toggle control. Synchronized bidirectionally with Settings > Crossfade
+ * (refresh_quick_drawer_crossfade_icon() / gui_settings_sync_crossfade_toggle()).
+ * Uses pull_down/fade.png and pull_down/fade_s.png. */
 static lv_obj_t * quick_drawer_crossfade_icon;
 void refresh_quick_drawer_crossfade_icon(void) {
     if (!quick_drawer_crossfade_icon) return;
@@ -1529,18 +1321,8 @@ void refresh_quick_drawer_crossfade_icon(void) {
     quick_drawer_mark_snapshot_dirty();
 }
 
-/* Settings > Music Settings > Playback's own Crossfade toggle row
- * (build_music_playback_screen(), captured via pill_list_item_t's
- * out_toggle_img) -- that screen is built
- * once at gui_init() and never rebuilt, so its toggle's sprite/LV_STATE_CHECKED
- * only ever reflects whatever current_settings.crossfade_enabled was at
- * that one build time unless something explicitly pokes it afterward.
- * Real-device bug report: toggling crossfade from the quick drawer left
- * this row showing the old (now wrong) state the next time Settings >
- * Playback was opened -- the settings->drawer direction already worked
- * (crossfade_switch_event_cb calls refresh_quick_drawer_crossfade_icon()),
- * but nothing called the reverse. */
-
+/* Settings > Music Settings > Playback's Crossfade toggle row is kept in sync
+ * with quick drawer toggles via gui_settings_sync_crossfade_toggle(). */
 
 static void quick_drawer_crossfade_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -1556,15 +1338,9 @@ static void quick_drawer_crossfade_event_cb(lv_event_t * e) {
  * expiry. */
 
 
-/* Sleep timer: tapping this icon arms/disarms a real countdown (current
- * duration from current_settings.sleep_timer_minutes, configurable via
- * Settings > Sleep Timer) that pauses playback once it elapses -- see
- * poll_sleep_timer() (update_timer_cb) for the actual countdown/expiry
- * logic. quick_drawer_sleep_label shows the remaining time below the icon
- * while armed, per real-device feedback wanting a visible countdown, not
- * just an on/off glow -- hidden the rest of the time. Session-only state
- * (sleep_timer_active): arming isn't persisted, so a relaunch never resumes
- * a stale countdown from a previous session. */
+/* Sleep timer: arms/disarms countdown from current_settings.sleep_timer_minutes.
+ * quick_drawer_sleep_label displays remaining time while armed.
+ * Arming state is session-only and not persisted across restarts. */
 static bool sleep_timer_active = false;
 static uint32_t sleep_timer_start_tick = 0;
 static lv_obj_t * quick_drawer_sleep_icon;
@@ -1608,10 +1384,7 @@ int quick_drawer_sleep_timer_remaining_seconds(void) {
     return (int) ((total_ms - elapsed_ms) / 1000);
 }
 
-/* Settings > Sleep Timer's own enable toggle (build_sleep_timer_screen(),
- * gui_settings.c) -- real-device bug report: this screen had no way to
- * arm/disarm the timer at all, only the drawer icon did, and the two
- * needed to agree once one existed. */
+/* Settings > Sleep Timer enable toggle synchronization. */
 void quick_drawer_sleep_timer_set_active(bool active) {
     apply_sleep_timer_active(active);
 }
@@ -1776,20 +1549,8 @@ void open_quick_drawer(void) {
      * directly off the asset), so the status bar ends up sitting on that as
      * a backdrop rather than on anything from the screen underneath. */
     lv_obj_move_foreground(status_bar_band);
-    /* Real-device bug report: "drawer animation is sluggish" -- root cause
-     * was two (or more) of these animations running concurrently, not a
-     * rendering-speed problem. lv_anim_start() only dedupes same-var/
-     * same-exec_cb animations via its own early_apply path (see
-     * remove_concurrent_anims() in lv_anim.c), which this never opts into
-     * -- so a second open/close triggered before a prior 120ms animation
-     * finished (an easy thing to do with a quick double-flick, or
-     * re-grabbing the drawer to drag again right after a release-snap)
-     * left BOTH animations alive, each calling quick_drawer_anim_y_cb with
-     * its own diverging interpolated Y every tick and visibly fighting
-     * each other -- indistinguishable from slow/janky rendering unless you
-     * know to look for it. Explicitly cancelling any prior animation on
-     * this exact (var, exec_cb) pair before starting a new one removes
-     * that race entirely. */
+    /* Cancel any prior animation on this exact (var, exec_cb) pair before
+     * starting a new one to prevent concurrent animations from fighting. */
     lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb);
     lv_anim_t a;
     lv_anim_init(&a);
@@ -1875,29 +1636,13 @@ static slide_transition_ctx_t * player_swipe_ctx = NULL;
  * so poll_quick_drawer_drag() below can exclude the home-swipe gesture
  * while either DAC overlay is active (see its own comment on why). */
 
-/* Drives the quick drawer's open/close by directly following the finger's
- * raw Y position every tick -- "dynamic", per real-hardware feedback,
- * rather than an instant threshold-triggered animation -- snapping to fully
- * open or fully closed only once the finger actually lifts.
+/* Drives the quick drawer's open/close by following the finger's raw Y position
+ * every tick, snapping to fully open or closed when the finger lifts.
  *
- * Polled from its own dedicated fast lv_timer (see gui_init()) rather than
- * update_timer_cb's existing 500ms one, or driven by touch events, for two
- * separate reasons discovered in that order: first, LV_EVENT_PRESSED/
- * RELEASED/CLICKED/LONG_PRESSED are the only events LVGL ever dispatches to
- * an indev's own event list regardless of which object was actually hit
- * (confirmed directly in lv_indev.c's send_event()) -- LV_EVENT_PRESSING is
- * deliberately NOT among them, so a first attempt (an indev-wide
- * LV_EVENT_PRESSING handler) silently never fired at all, and the attempt
- * before THAT (the drawer's own LV_EVENT_GESTURE handler, relying on
- * enable_gesture_bubble_recursive()) got swallowed whenever the swipe
- * started on the 300px-wide brightness slider, deliberately excluded from
- * gesture-bubbling for the same reason every other screen excludes its own
- * sliders. Reading the indev's raw position directly instead sidesteps
- * hit-testing entirely. Second, once switched to polling, real-device
- * testing showed the drag still wasn't followed smoothly: it turned out
- * update_timer_cb's 500ms period is far slower than a typical swipe (well
- * under 300ms start to finish), so it was only ever sampling zero or one
- * point per gesture -- hence this gets its own ~60fps timer instead. */
+ * Polled from its own dedicated ~60fps lv_timer (see gui_init()). Reading
+ * raw indev coordinates directly avoids widget hit-test interception
+ * (e.g. over the brightness slider), and the ~60fps polling rate provides
+ * responsive tracking throughout quick swipes. */
 /* Not just lv_indev_get_next(NULL) -- the target build only ever registers
  * the one touchscreen indev, but the host simulator also registers a
  * keyboard indev (see main.c's lv_sdl_keyboard_create()), and there's no
@@ -1996,19 +1741,11 @@ void gui_shell_install_indev_hooks(lv_indev_t * indev) {
     s_hooked_indev = indev;
 }
 
-/* Same drag-adjust widget set enable_gesture_bubble_recursive() excludes
- * from swipe-bubbling (sliders/switches/dropdowns/rollers), checked here
- * for the player-swipe candidate below -- that check is unrelated to
- * GESTURE_BUBBLE (this whole file's raw-indev-polling swipe detectors
- * don't go through LVGL's event/bubbling system at all, per this
- * function's own doc comment on why). Real-device feedback: dragging the
- * Idle Shutdown timeout slider leftward (its natural adjustment
- * direction) was randomly getting hijacked mid-drag into a "swipe to
- * player screen" transition once the horizontal movement crossed
- * PLAYER_SWIPE_DEADZONE, abandoning the slider adjustment -- this was
- * never about GESTURE_BUBBLE at all, it's a completely separate polling
- * loop with no per-widget exclusions of its own. The press owner is latched
- * below because LVGL can re-hit-test a fast finger outside the widget. */
+/* Checks whether the active pressed object or any of its parents is an
+ * interactive drag-adjust widget (slider, switch, dropdown, roller) so that
+ * horizontal drag adjustments are not intercepted by the swipe-to-player
+ * detector. The press owner is latched to prevent fast drags from slipping
+ * outside widget bounds. */
 static bool active_object_is_drag_adjust_widget(void) {
     lv_obj_t * act = lv_indev_get_active_obj();
     while (act) {
@@ -2027,30 +1764,10 @@ bool active_press_is_over_drag_adjust_widget(void) {
     return drag_adjust_press_owned || active_object_is_drag_adjust_widget();
 }
 
-/* active_press_is_over_drag_adjust_widget() alone wasn't enough: real-
- * device feedback after that fix still showed a press starting on a
- * slider card's background -- near the slider but not precisely inside
- * its own hit-test box -- still hijacked into a player-swipe. Root cause:
- * every one of these cards is deliberately built WITHOUT
- * LV_OBJ_FLAG_CLICKABLE (matching finalize_screen_navigation()'s own
- * comment on plain lv_obj_create() objects), so a press on the card's
- * background hit-tests straight through to the screen itself --
- * lv_indev_get_active_obj() then returns the screen, indistinguishable
- * from a press on genuinely empty space that SHOULD navigate. Each of
- * these cards already marks itself as a swipe dead zone by having its
- * own LV_OBJ_FLAG_GESTURE_BUBBLE removed (for the separate GESTURE-event-
- * based back/down-swipe path) -- register_swipe_dead_zone() reuses that
- * same set of objects for this unrelated raw-polling path, checked by
- * raw point-in-rect instead of by hit-tested object identity so it
- * doesn't matter whether the card itself is clickable.
- *
- * Widened from 8 to 16: the original 8 slots are all native sliders (built
- * once at startup, live forever). plugin.show_settings_list()'s own slider
- * rows (gui_plugin_show_settings_list()) add real, bounded headroom on top
- * -- PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE pool slots x PLUGIN_SETTINGS_
- * LIST_MAX_SLIDERS sliders each (plugin_manager.h) -- not unbounded growth,
- * since a pool slot's own slider cards are unregistered (see
- * unregister_swipe_dead_zone() below) before that slot is ever repopulated. */
+/* Checks point coordinates against registered dead zones. Prevents presses
+ * starting on non-clickable card containers near sliders from triggering
+ * swipe transitions. Capacity accommodates native sliders and dynamic
+ * plugin settings list sliders. */
 #define SWIPE_DEAD_ZONE_MAX 16
 static lv_obj_t * swipe_dead_zones[SWIPE_DEAD_ZONE_MAX];
 static int swipe_dead_zone_count = 0;
@@ -2156,13 +1873,8 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                                                 pressed && !drag_adjust_press_owned, p.y);
 
     if (pressed && !quick_drawer_was_pressed) {
-        /* Cancel any release-snap animation still in flight -- re-grabbing
-         * the drawer right after a flick (within its 120ms animation
-         * window) used to leave that old animation alive, fighting this
-         * new drag's own direct lv_obj_set_y() calls every tick (same
-         * underlying issue as open_quick_drawer()'s own comment on
-         * concurrent animations). Harmless/cheap no-op when nothing's
-         * actually animating. */
+        /* Cancel any release-snap animation still in flight to prevent it
+         * from fighting a newly started drag. */
         lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb);
 
         /* Use the drawer's current Y so interrupted animations continue
@@ -2204,25 +1916,11 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                s_home_gesture_state.tracking);
 #endif
 
-        /* Player-swipe: eligible unless this exact press already got
-         * claimed by the drawer-drag above (quick_drawer_drag_tracking),
-         * the drawer is open (its own close-drag owns every press while
-         * open), the player screen is already the one showing (nothing
-         * to swipe TO), or the press actually started on a slider/switch/
-         * dropdown/roller or one of the registered slider-card dead zones
-         * (see player_swipe_press_excluded()'s own comment -- dragging a
-         * slider leftward, or starting the drag on its card's background,
-         * was getting mistaken for this gesture). Real direction isn't
-         * knowable from a single point -- judged once real movement
-         * accumulates, below -- so this only marks the press as a
-         * CANDIDATE, not yet a confirmed drag. Also excluded while
-         * library_rescan_active, same reasoning as the quick-drawer/
-         * home-swipe exclusions above -- this is the last remaining swipe
-         * gesture that could navigate off the rescan's busy screen. Also
-         * excluded on gui_lyrics_get_screen() -- real-device feedback: triggering
-         * this gesture from a screen that's already reached FROM the
-         * player screen looked like a broken, looping transition; lyrics_
-         * gesture_event_cb() is the only swipe this screen responds to. */
+        /* Player-swipe: eligible unless claimed by the drawer drag, the drawer
+         * is open, the player screen is already active, or the press started on
+         * a drag-adjust widget/dead-zone. Excluded on lyrics, track info,
+         * lock screen, and while library navigation is blocked. Candidate only
+         * until sufficient displacement accumulates to determine gesture direction. */
         player_swipe_candidate = !quick_drawer_drag_tracking && !quick_drawer_open &&
                                   lv_screen_active() != gui_player_get_screen() &&
                                   lv_screen_active() != gui_lyrics_get_screen() &&
@@ -2273,38 +1971,9 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                     lv_indev_wait_release(indev);
                 }
             } else if (ady > adx && !lv_indev_get_scroll_obj(indev)) {
-                /* Real-device bug report: on a screen whose list is short
-                 * enough to need no scrolling at all (confirmed case: the
-                 * Settings home category list), a vertical swipe attempt
-                 * lands here (ruled out as a player-swipe, since it isn't
-                 * horizontal-left-dominant) with nothing scrollable to
-                 * claim it either -- LVGL only cancels a pending click once
-                 * some object's own lv_indev_get_scroll_obj() claims the
-                 * drag as a real scroll, so a swipe that travelled well
-                 * past PLAYER_SWIPE_DEADZONE but found nothing to scroll
-                 * still resolved as a plain tap on whatever row the finger
-                 * started on, firing that row's own action. Suppressing the
-                 * eventual click here, same tool as the confirmed-swipe
-                 * branch above, whenever the drag went far enough to
-                 * clearly not be a stationary tap.
-                 * Real-device bug report #2: this originally fired for ANY
-                 * non-left-confirmed direction, including rightward -- which
-                 * silently broke swipe-to-go-back (screen_gesture_event_cb's
-                 * own LV_DIR_RIGHT handling), since lv_indev_wait_release()
-                 * called this early (past this function's own 20px
-                 * PLAYER_SWIPE_DEADZONE) pre-empted LVGL's own native
-                 * gesture recognition before it could reach its ~50px
-                 * LV_INDEV_DEF_GESTURE_LIMIT and fire the real
-                 * LV_EVENT_GESTURE. Restricted to ady > adx (clearly
-                 * vertical, matching the actual "tried to scroll" bug this
-                 * fixes) so a horizontal drag -- rightward (back) or
-                 * leftward-but-not-quite-dominant-yet -- is left completely
-                 * alone here and keeps reaching LVGL's own gesture handling
-                 * normally.
-                 * Left alone either way (no suppression) when
-                 * lv_indev_get_scroll_obj() IS set -- that's a real, working
-                 * scroll already in progress, and forcing an early release
-                 * there would cut its motion off mid-drag. */
+                /* If vertical drag exceeds deadzone on a non-scrollable screen,
+                 * suppress the pending tap via lv_indev_wait_release() to prevent
+                 * accidental row activation when an attempted scroll cannot occur. */
                 lv_indev_wait_release(indev);
             }
             player_swipe_candidate = false;
@@ -2322,22 +1991,10 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     }
 
     if (pressed && quick_drawer_drag_tracking) {
-        /* Deadzone before actually moving the panel -- real-device feedback:
-         * long-pressing a drawer icon (wifi/bt) wasn't opening its settings
-         * screen at all. Root cause, confirmed by reading indev_proc_press()
-         * in lv_indev.c: it re-hit-tests the SAME raw screen point on every
-         * tick, and if that now resolves to a different object than the one
-         * originally pressed, LVGL sends PRESS_LOST and resets the press --
-         * killing the long-press timer before it can fire. Moving the whole
-         * drawer (and everything on it, including the icon under the
-         * finger) by even a couple of px in response to ordinary touch
-         * jitter during a "held still" long-press was exactly triggering
-         * that. 10px matches LVGL's own LV_INDEV_DEF_SCROLL_LIMIT -- the
-         * same threshold it uses internally to tell a stationary press from
-         * an intentional scroll/drag. Below it, the panel doesn't move at
-         * all, so a tap or long-press on a child stays stable under the
-         * finger; past it, the deadzone amount is subtracted so dragging
-         * starts smoothly from zero rather than jumping. */
+        /* Deadzone before moving panel: suppresses minor jitter during taps
+         * and long-presses so child widgets (icons) do not receive PRESS_LOST.
+         * Beyond QUICK_DRAWER_DRAG_DEADZONE (10px), the deadzone is subtracted
+         * so drag motion starts smoothly from zero. */
         int32_t raw_delta = p.y - quick_drawer_drag_touch_start_y;
         if (raw_delta > QUICK_DRAWER_DRAG_DEADZONE || raw_delta < -QUICK_DRAWER_DRAG_DEADZONE) {
             int32_t adjusted_delta = raw_delta > 0 ? raw_delta - QUICK_DRAWER_DRAG_DEADZONE
@@ -2369,12 +2026,8 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     }
 
     if (!pressed && quick_drawer_was_pressed && quick_drawer_drag_tracking) {
-        /* Finger lifted. A fast flick -- real-hardware feedback: "a quick
-         * swap [that] goes back to closed"/"keeps open" -- often doesn't
-         * travel far enough to cross the halfway rubber-band point before
-         * the finger leaves, even though the user's intent was obvious from
-         * how fast it moved. Falls back to the halfway position check only
-         * for a slow/undecided drag that ends with little to no velocity. */
+        /* Settle decision on release: fast flicks snap based on exit velocity;
+         * otherwise snaps based on whether position crossed the halfway mark. */
         quick_drawer_drag_tracking = false;
         bool snap_open;
         if (quick_drawer_last_velocity > QUICK_DRAWER_FLICK_VELOCITY) {
@@ -2402,17 +2055,9 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * drawer's own release logic just above, just horizontal. */
         player_swipe_tracking = false;
         int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
-        /* player_swipe_last_v already holds exactly this value -- it's set
-         * to the same v applied via slide_transition_anim_x_cb() every tick
-         * just above, before either the LVGL-object or compositor path
-         * consumes it. Reading it back here directly (instead of
-         * lv_obj_get_x(player_swipe_ctx->img_from)) is required, not just
-         * simpler, now that img_from can be NULL -- TRANSITION_PERFORMANCE_
-         * PLAN.md Phase 3's compositor path skips creating it entirely (see
-         * begin_slide_transition()'s own comment); real-device crash log
-         * confirmed lv_obj_get_x(NULL) -> SIGSEGV (invalid read from 0x14,
-         * lv_obj_get_x()'s own offset into a null lv_obj_t) the first time
-         * this was reached under compositor mode. */
+        /* player_swipe_last_v stores the last offset applied to
+         * slide_transition_anim_x_cb(). Reads it directly rather than inspecting
+         * img_from, which is NULL when direct-framebuffer compositing is active. */
         int32_t current_v = player_swipe_last_v;
         bool commit;
         if (player_swipe_last_velocity < -PLAYER_SWIPE_FLICK_VELOCITY) {
@@ -2424,19 +2069,10 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         }
         player_swipe_ctx->commit = commit;
         if (commit) {
-            /* Stack-only bookkeeping -- the real lv_screen_load() happens
-             * inside slide_transition_done_cb() once this settle animation
-             * finishes, not here; nothing else reads the nav stack before
-             * then, so only the bookkeeping needs to be right immediately.
-             * Real-device review finding: this used to call plain
-             * nav_push(), which itself now also calls lv_screen_load()
-             * immediately (see its own "Live A/B test" comment) -- firing
-             * LV_EVENT_SCREEN_LOAD_START/LOADED/UNLOAD_START/UNLOADED up to
-             * QUICK_DRAWER_ANIM_MS before the slide below actually
-             * finishes, and making slide_transition_done_cb()'s own later
-             * lv_screen_load() call a silent no-op. nav_push_stack_only()
-             * (gui_navigation.c) does only the bookkeeping this comment
-             * always intended. */
+            /* Stack-only bookkeeping -- actual lv_screen_load() is deferred
+             * until slide_transition_done_cb() runs when the settle animation
+             * completes. nav_push_stack_only() updates the nav stack without
+             * prematurely triggering screen load events. */
             if (!gui_navigation_is_top(gui_player_get_screen())) {
                 nav_push_stack_only(gui_player_get_screen());
             }
@@ -2479,9 +2115,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     }
 }
 
-/* Forward declarations -- defined later in this file (with the player
- * screen's own transport buttons, which they were originally written for),
- * but the quick drawer's mini now-playing card reuses them verbatim. */
+/* Forward declarations -- defined later in this file with player screen transport buttons. */
 void favorite_icon_event_cb(lv_event_t * e);
 void prev_btn_event_cb(lv_event_t * e);
 void play_btn_event_cb(lv_event_t * e);
@@ -2496,16 +2130,9 @@ const char * basename_of(const char * path);
  * instantly (no slide-out animation; the settings screen navigation is
  * about to slide in over it anyway) then opens the real settings screen.
  *
- * Real-device incident: LVGL still sends LV_EVENT_CLICKED on release even
- * when LV_EVENT_LONG_PRESSED already fired earlier in that same press --
- * confirmed directly in lv_indev.c's indev_proc_release(), which doesn't
- * check whether a long-press was already sent before deciding a release
- * without enough movement counts as a click. Without this flag, a
- * long-press opened the settings screen AND, on release, the click handler
- * fired right behind it and toggled the radio -- e.g. long-pressing the
- * wifi icon opened Wi-Fi settings but also turned wifi off. Each click
- * handler below checks and clears its own flag first, skipping its toggle
- * entirely when the long-press already handled this press. */
+ * LVGL still sends LV_EVENT_CLICKED on release even after LV_EVENT_LONG_PRESSED
+ * fired. The long_press_fired flags ensure click handlers do not inadvertently
+ * toggle radios when a long-press has already opened settings. */
 static bool quick_drawer_wifi_long_press_fired = false;
 static bool quick_drawer_bt_long_press_fired = false;
 
@@ -2525,15 +2152,8 @@ static void quick_drawer_bt_long_press_cb(lv_event_t * e) {
     open_bluetooth_screen();
 }
 
-/* Real tap-to-toggle for the wifi icon -- unlike quick_drawer_bt_event_cb
- * (a purely local sprite swap, "no real backend" per its own comment), wifi
- * actually has one (wifi_control_enable()/disable()), it just was never
- * wired to anything that could turn it back OFF: the only existing caller,
- * wifi_scan_thread_func(), only ever enables it (auto-enabling when the
- * Wi-Fi settings screen is opened), so wifi previously could only ever go
- * from off to on, matching the "stays on all the time" real-device report.
- * enable()/disable() each block for about a second, so this runs on its own
- * thread, polled the same way as every other background op in this file. */
+/* Tap-to-toggle handler for Wi-Fi. Runs asynchronously in a background thread
+ * to avoid blocking the UI while enabling or disabling the radio. */
 static pthread_t wifi_toggle_thread;
 static atomic_bool wifi_toggle_done_flag = false;
 
@@ -2543,17 +2163,8 @@ static void * wifi_toggle_thread_func(void * arg) {
     if (turning_on) wifi_control_enable();
     else wifi_control_disable();
 
-    /* Real-device bug: wifi_control_is_enabled() (a plain access() check on
-     * wpa_supplicant's control socket) can still read the OLD state for a
-     * moment right after wifi_on.sh/wifi_off.sh return -- the script
-     * finishing doesn't guarantee the socket has actually been created/
-     * removed yet. Confirmed live: the optimistic UI flip (quick_drawer_
-     * wifi_event_cb) briefly reverted to the old state once poll_wifi_
-     * toggle()'s own check landed too early against this still-settling
-     * socket, then corrected itself again shortly after -- a visible
-     * on/off/on bounce with no user action in between. Retrying here
-     * instead of trusting the first read means poll_wifi_toggle()'s check
-     * lands on the real, settled state instead. */
+    /* Wait for control socket to settle to avoid reading stale state immediately
+     * after wifi_on.sh/wifi_off.sh execution. */
     for (int i = 0; i < 10 && wifi_control_is_enabled() != turning_on; i++) {
         usleep(300000);
     }
@@ -2588,16 +2199,8 @@ void quick_drawer_wifi_event_cb(lv_event_t * e) {
     lv_image_set_src(quick_drawer_wifi_icon, asset_path(wifi_will_be_enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
     quick_drawer_mark_snapshot_dirty();
 
-    /* Real-device bug report: the topbar Wi-Fi icon stayed frozen (hidden,
-     * or showing whatever signal-strength sprite it had before toggling
-     * off) until poll_wifi_toggle()'s own refresh_wifi_icon() call landed --
-     * same delay-to-first-feedback bug already fixed for Bluetooth's own
-     * topbar icon in quick_drawer_bt_event_cb(), same fix here: flip it
-     * optimistically alongside the drawer icon just above. ON shows the
-     * disconnected sprite (a fresh toggle-on can't be associated to an AP
-     * yet); OFF hides it outright. refresh_wifi_icon() overwrites this with
-     * the real, settled state (association status included) once
-     * wifi_control_enable()/disable() actually finishes. */
+    /* Optimistically update the topbar Wi-Fi icon alongside the drawer icon.
+     * Overwritten with authoritative state once the worker thread settles. */
     if (wifi_will_be_enabled) {
         lv_obj_remove_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
         lv_image_set_src(wifi_icon, asset_path("topbar/wifi_unconnect.png"));
@@ -2606,20 +2209,8 @@ void quick_drawer_wifi_event_cb(lv_event_t * e) {
     }
     sync_topbar_status_icon_positions();
 
-    /* Optimistically rebuild the whole Wi-Fi settings screen too (not just
-     * the toggle row) when that's the screen showing -- real-device
-     * feedback: flipping just the row's own sprite left the Wi-Fi Info/
-     * Manual SSID Entry/Memorized Networks rows (populate_wifi_screen()'s
-     * own enabled-gated content) not appearing until wifi_control_enable()
-     * actually finished (~1-3s), which read as the screen "taking a while"
-     * even though the toggle itself looked instant. Passing the optimistic
-     * wifi_will_be_enabled here (not a real wifi_control_is_enabled() call,
-     * which would still read the pre-toggle state) makes the whole screen
-     * -- toggle row and its gated content -- appear immediately, exactly
-     * like the eventual real rebuild will look on success.
-     * poll_wifi_toggle() still re-populates with the real, authoritative
-     * state once wifi_control_enable()/disable() actually lands, correcting
-     * this if the toggle unexpectedly failed. */
+    /* Optimistically rebuild Wi-Fi settings screen if visible so dependent rows
+     * appear immediately rather than waiting for the backend script to complete. */
     /* Do not clean/rebuild wifi_list from inside the clicked row's own
      * event callback: doing so deletes the event target while LVGL is still
      * dispatching through it. gui_network_show_wifi_toggle_pending() defers
@@ -2704,35 +2295,17 @@ static void * bt_toggle_thread_func(void * arg) {
     bool chip_wedged = false;
     if (!turning_on) {
         atomic_store_explicit(&bt_media_player_enable_pending, false, memory_order_release);
-        /* Real-device incident: turning Bluetooth off via the quick drawer
-         * while Bluetooth DAC mode was still on left bluealsa/bt-agent
-         * (spawned by bt_control_apply_output_settings() when DAC mode
-         * turned on) running orphaned against an adapter that was about to
-         * be powered off out from under them -- confirmed to corrupt
-         * bluetoothd's own adapter registration (hci0 stayed up fine at
-         * the kernel level, but bluetoothd stopped seeing it entirely,
-         * "No default controller available", and Bluetooth couldn't be
-         * re-enabled again until bluetoothd was manually restarted). Tear
-         * DAC mode's processes down first, same call
-         * bt_dac_leave_confirm_cb() uses, before disabling the radio. */
+        /* If Bluetooth DAC mode is active, tear down its processes
+         * (bluealsa/bt-agent) before powering down the radio to prevent
+         * orphaned processes from corrupting bluetoothd adapter registration. */
         if (current_settings.bt_dac_mode_enabled) {
             bt_control_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
             bt_toggle_forced_dac_off = true;
         }
         bt_control_disable();
     } else {
-        /* Real-device incident: enabling Bluetooth when bt_resume can't
-         * actually bring hci0 up (a wedged BT chip -- confirmed live,
-         * "Can't get device info: No such device" surviving repeated
-         * bt_resume retries, needing a real power cycle to clear) used to
-         * call bt_control_enable() anyway, adding a second full ~15s bounded
-         * subprocess_run() wait against an adapter already known not to
-         * exist -- with no busy screen at all (see quick_drawer_bt_event_cb's
-         * own comment on why), the whole ~45s combined stall read to the
-         * user as the device having frozen. Skipping the pointless second
-         * wait here doesn't fix the underlying wedge (nothing in userspace
-         * can), but at least stops doubling how long the unresponsive-
-         * feeling wait lasts. */
+        /* If chip initialization fails, skip calling bt_control_enable() to
+         * avoid redundant timeouts against a non-existent controller. */
         if (bt_control_init_chip()) {
             bt_control_enable();
             mark_bt_media_player_enable_pending();
@@ -2752,34 +2325,10 @@ static void * bt_toggle_thread_func(void * arg) {
     return NULL;
 }
 
-/* Real-device incident: a tap that landed while bt_init's own chip flash
- * was still genuinely in progress used to just be refused outright (see
- * BT_INIT_OK_FLAG_PATH's own comment for the actual chip-wedging risk that
- * guards against) -- functionally safe, but made the user re-tap
- * themselves once it settled, AND gave no visual feedback at all that
- * anything had registered (the drawer's own icon never flipped, unlike a
- * normal toggle). This queues the intent properly instead: waits for
- * BT_INIT_OK_FLAG_PATH, then waits for two real powered-off observations
- * before performing the exact same turn-on sequence bt_toggle_thread_func()'s
- * own turning-on path uses, automatically, no second tap needed. Waiting
- * for the settled-off state matters: bt_init_ok can become visible just
- * before the boot sequence's final disable propagates through bluetoothd,
- * and enabling in that gap lets the final disable erase the user's intent.
- * Deliberately
- * NOT the same thing as the unconditional-auto-enable-at-boot approach
- * tried and reverted earlier -- this only ever fires because the user
- * explicitly asked to turn Bluetooth on, just before it was safe to.
- *
- * Reuses bt_toggle_active/bt_toggle_thread/bt_toggle_done_flag/
- * poll_bt_toggle() -- the exact same in-flight-toggle bookkeeping
- * bt_toggle_thread_func() already uses -- rather than a separate parallel
- * flag, specifically so quick_drawer_bt_event_cb()'s own optimistic icon
- * flip (and populate_bt_screen() guard) apply here too automatically,
- * fixing the "no visual clue" gap. poll_bt_toggle()'s own
- * start_refresh_bt_icon() call at the end is exactly what's wanted here
- * too: a fresh real-state poll once this either succeeds or times out.
- * Capped at BT_BOOT_ENABLE_MAX_WAIT_MS so a genuinely wedged/never-
- * finishing bt_init doesn't leave this polling forever. */
+/* Queues Bluetooth enable intent if requested while bt_init is still running.
+ * Waits for BT_INIT_OK_FLAG_PATH and stable off state before executing
+ * the chip initialization and enable sequence, providing immediate visual
+ * feedback via optimistic icon updates. */
 #define BT_BOOT_ENABLE_MAX_WAIT_MS 30000
 #define BT_BOOT_ENABLE_POLL_INTERVAL_MS 300
 #define BT_BOOT_ENABLE_OFF_OBSERVATIONS_REQUIRED 2
@@ -2864,18 +2413,9 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
         return;
     }
 
-    /* Real-device incident: turning Bluetooth ON before BT_INIT_OK_FLAG_PATH
-     * exists raced this app's own bt_control_init_chip() against bt_init's
-     * own still-in-progress UART chip firmware flash and genuinely wedged
-     * the chip (unrecoverable without a full power cycle) -- see its own
-     * comment. Turning OFF is always safe (bt_control_disable() is
-     * D-Bus-only, no chip-level operation), so this only ever affects the
-     * turning-on direction: bt_pending_now queues bt_toggle_thread_func()'s
-     * usual work behind bt_pending_enable_thread_func() instead of running
-     * it directly, but everything below (icon flip, cached value,
-     * settings-screen refresh, bt_toggle_active bookkeeping) is identical
-     * either way -- exactly the fix for the earlier version of this, which
-     * showed no visual feedback at all for a tap that landed too early. */
+    /* If turning on before /tmp/bt_init_ok exists, queue behind
+     * bt_pending_enable_thread_func() to wait for initialization to complete.
+     * Disabling is D-Bus-only and safe to run directly. */
     bool bt_pending_now = bt_will_be_powered && access(BT_INIT_OK_FLAG_PATH, F_OK) != 0;
 
     bt_toggle_active = true;
@@ -2883,51 +2423,12 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
     bt_toggle_followup_pending = false;
     atomic_store_explicit(&bt_toggle_done_flag, false, memory_order_relaxed);
 
-    /* Optimistic sprite flip, same reasoning as quick_drawer_wifi_event_cb's
-     * own comment -- bt_is_powered_cached (kept fresh by
-     * poll_refresh_bt_icon()) is a plain bool read, not the subprocess spawn
-     * bt_control_is_powered() itself is, so it's safe to read synchronously
-     * here. Turning on cold can take ~10-13s (bt_control_init_chip()), or
-     * however long is left of bt_init's own run if bt_pending_now; this is
-     * what makes the tap itself read as instant instead of the icon
-     * sitting frozen until poll_bt_toggle() confirms the real state once
-     * the thread lands. */
-    /* Real-device bug report: the topbar Bluetooth icon stayed frozen on
-     * whatever it showed pre-toggle (e.g. still the "connected" sprite
-     * after manually turning Bluetooth off) until poll_bt_toggle()'s own
-     * follow-up start_refresh_bt_icon() subprocess round trip finally
-     * landed -- a real, user-visible delay, not just the ~10-13s cold-boot
-     * chip-init case: even turning OFF (bt_control_disable() is D-Bus-only,
-     * no chip op, so the toggle thread itself finishes fast) still waited
-     * on that separate re-check. Flip it here too, same as the drawer icon
-     * just above: OFF hides it outright (nothing to be connected to), ON
-     * shows the disconnected sprite since a fresh toggle-on can't have an
-     * active connection yet -- poll_refresh_bt_icon() overwrites both with
-     * the real, settled state once its own check lands (it already skips
-     * doing so while bt_toggle_active, see its own comment). */
-    /* Optimistically rebuild the whole Bluetooth settings screen too (not
-     * just the toggle row) when that's the screen showing -- same
-     * "screen takes a while to appear" real-device feedback as
-     * quick_drawer_wifi_event_cb's own comment, actually worse here: the
-     * real path is bt_toggle_thread_func() (up to ~10-13s cold) followed by
-     * a SEPARATE start_refresh_bt_icon() subprocess round-trip
-     * (poll_bt_toggle() doesn't call populate_bt_screen() itself -- see its
-     * own comment) before bt_is_powered_cached actually catches up and the
-     * screen naturally rebuilds. Setting bt_is_powered_cached directly here
-     * is safe: poll_refresh_bt_icon() (the only other writer) skips its own
-     * populate_bt_screen() call entirely while bt_toggle_active is true
-     * (see its own comment on this exact race), so nothing overwrites this
-     * until start_refresh_bt_icon()'s real result lands afterward and
-     * correctly finalizes it. */
+    /* Optimistically update topbar and drawer icons, and rebuild the Bluetooth
+     * settings screen if visible. Confirmed by authoritative poll on completion. */
     show_optimistic_bt_state(bt_will_be_powered);
 
     /* Runs fully in the background, same as the stock player -- no busy
-     * screen. An earlier version pushed a "Turning on Bluetooth..."
-     * interstitial here, shared with wifi/bt scan's own overlay -- see git
-     * history if that's ever needed again, but it was also the source of a
-     * real, repeatedly-hit stuck-screen bug (multiple uncoordinated users of
-     * one shared overlay), which not having an overlay at all sidesteps
-     * entirely. */
+     * screen. */
     void * (*thread_func)(void *) = bt_pending_now ? bt_pending_enable_thread_func : bt_toggle_thread_func;
     void * thread_arg = bt_pending_now ? NULL : bt_toggle_target_arg(bt_will_be_powered);
     if (pthread_create(&bt_toggle_thread, NULL, thread_func, thread_arg) != 0) {
@@ -2978,18 +2479,9 @@ static void poll_bt_toggle(void) {
     start_refresh_bt_icon(); /* re-reads the real state -- updates the status bar/drawer icons and (once done) the Bluetooth screen's toggle row */
 }
 
-/* Real-device incident: bt_dac_enable_row_cb() is the ONLY call site for
- * bt_control_apply_output_settings() -- current_settings.bt_dac_mode_enabled
- * is persisted to disk, so if it was left on at the end of a previous
- * session, this app's UI comes back up on next launch already showing the
- * toggle as on (and correctly blocking local playback via
- * external_dac_block_reason()), but the actual bluealsa/bt-agent processes
- * that make a Bluetooth DAC connection possible were never started this
- * boot -- confirmed on a real device: the toggle read "on", yet no device
- * could connect at all (bluealsa/bt-agent simply weren't running). This
- * reapplies the persisted state once at startup, mirroring
- * bt_toggle_thread_func() (chip init can take ~10-13s on a fresh boot, so
- * this can't block gui_init() / the UI thread). */
+/* Reapplies persisted bt_dac_mode_enabled configuration asynchronously
+ * at startup, launching the necessary bluealsa and bt-agent processes without
+ * blocking the UI thread. */
 static pthread_t bt_dac_startup_reapply_thread;
 static bool bt_dac_startup_reapply_active = false;
 static bool bt_dac_startup_reapply_started = false;
@@ -3028,19 +2520,9 @@ static void poll_bt_dac_startup_reapply(void) {
     start_refresh_bt_icon();
 }
 
-/* Real-device incident: bt_dac_toggle_cb(), bt_volume_sync_toggle_cb(), and
- * airplay_toggle_cb() (when turning AirPlay on forces Bluetooth DAC off)
- * all called bt_control_apply_output_settings() directly from their LVGL
- * click handlers, i.e. on the UI thread -- despite that function's own doc
- * comment already saying "blocking, call off the UI thread". Confirmed on a
- * real device: it kills and respawns bluealsa/bt-agent/bluealsa-aplay with
- * two separate 500ms sleeps plus several subprocess spawns baked in, easily
- * 1-3+ seconds of pure blocking -- since lv_timer_handler() runs on this
- * same thread, that froze the entire UI (no redraws, no touch input at all)
- * for the whole duration, with whatever screen happened to be showing at
- * that instant stuck on screen looking unresponsive, no way to back out of
- * it, until the call finally returned. This backgrounds it the same way
- * every other slow Bluetooth/Wi-Fi operation in this file already is. */
+/* Asynchronously executes bt_control_apply_output_settings() on a background
+ * thread to avoid blocking the UI thread with process restarts (bluealsa,
+ * bt-agent, bluealsa-aplay) and sleeps. */
 static pthread_t bt_apply_output_settings_thread;
 static bool bt_apply_output_settings_active = false;
 static atomic_bool bt_apply_output_settings_done_flag = false;
@@ -3217,21 +2699,8 @@ static void build_quick_drawer(void) {
     lv_obj_set_style_text_font(quick_drawer_brightness_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_align(quick_drawer_brightness_label, LV_ALIGN_TOP_RIGHT, -20, QUICK_DRAWER_PANEL1_TOP + 177);
 
-    /* Real-device bug report: the "NN%" label overlapped the slider --
-     * first attempted by pushing the slider's own Y down to clear the
-     * label's line height, but real-device feedback rejected that ("the
-     * slider can't be lower than the icon, restore it to its default
-     * position") -- brightness_icon (row 2's own visual anchor) sits at a
-     * fixed Y, and the slider is meant to sit at a fixed, small offset
-     * below it, not drift down with text size. The actual overlap was
-     * horizontal, not vertical: the label is right-anchored and grows
-     * LEFTWARD as its rendered text widens at bigger font tiers (BlindMF),
-     * eventually reaching past the slider's fixed 300px-wide right edge.
-     * Shrinking the slider's own WIDTH -- explicitly OK per that same
-     * feedback ("it's ok to make the slider smaller") -- to always leave
-     * room for the widest this label could ever render ("100%") fixes the
-     * real, horizontal overlap while leaving both elements' Y positions
-     * exactly as originally designed. */
+    /* Dynamically sizes slider width based on the maximum width of the percentage
+     * label ("100%") to prevent horizontal overlap when using larger font tiers. */
     int32_t brightness_label_max_w = lv_text_get_width("100%", 4, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     int32_t brightness_track_w = (w - 20 - brightness_label_max_w - 20) - 90;
     if (brightness_track_w > 300) brightness_track_w = 300; /* never wider than the original design */
@@ -3251,8 +2720,7 @@ static void build_quick_drawer(void) {
     lv_obj_set_style_bg_color(quick_drawer_brightness_track, lv_color_black(), LV_PART_MAIN);
     lv_obj_add_style(quick_drawer_brightness_track, gui_theme_accent_style(), LV_PART_INDICATOR);
     lv_obj_add_style(quick_drawer_brightness_track, gui_theme_accent_knob_style(), LV_PART_KNOB);
-    /* Real-device bug report: same left-edge gray sliver/root cause as
-     * volume_popup_track's own fix -- see its comment. */
+    /* Configures rail styling to prevent visual artifacts on the track edge. */
     configure_native_slider_rail(quick_drawer_brightness_track);
     lv_obj_set_style_bg_opa(quick_drawer_brightness_track, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_width(quick_drawer_brightness_track, SLIDER_KNOB_SIZE, LV_PART_KNOB);
@@ -3272,19 +2740,8 @@ static void build_quick_drawer(void) {
 
     refresh_quick_drawer_brightness();
 
-    /* Mini now-playing card: real track title/artist/transport, reusing the
-     * exact same callbacks as the player screen's own buttons. Transparent
-     * -- it sits directly on the second bg.png panel (which already is a
-     * rounded dark box) rather than drawing a second, slightly-differently
-     * colored rounded rect on top of that one.
-     *
-     * Real-device feedback comparing against the stock drawer: this used
-     * to be only 200px tall, well short of the second panel's own measured
-     * 367px height (y=363-730, see build_quick_drawer()'s own panel-bounds
-     * comment) -- leaving most of the panel empty and the transport row
-     * sitting high up rather than low in the card like the stock
-     * reference. 330 leaves a comparable margin above the panel's bottom
-     * edge instead. */
+    /* Mini now-playing card: track title, artist, and transport controls.
+     * Sized to fit the second panel's bounds with a balanced bottom margin. */
     lv_obj_t * card = lv_obj_create(quick_drawer);
     lv_obj_set_size(card, 440, 330);
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, QUICK_DRAWER_PANEL2_TOP + 12);
@@ -3292,12 +2749,7 @@ static void build_quick_drawer(void) {
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Title/artist centered (matching the stock drawer's own mini card,
-     * confirmed via a real-device screenshot comparison -- this was
-     * previously left-aligned with the favorite icon pinned separately in
-     * the top-right corner, not part of the transport row at all). Both
-     * need an explicit width for LV_TEXT_ALIGN_CENTER to have something to
-     * center within. */
+    /* Title and artist labels centered within explicit widths. */
     quick_drawer_title_label = lv_label_create(card);
     lv_label_set_text(quick_drawer_title_label, "No track loaded");
     lv_obj_add_style(quick_drawer_title_label, &style_theme_text_primary, 0);

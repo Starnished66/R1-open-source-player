@@ -19,11 +19,9 @@
 
 static struct pcm * alsa_pcm = NULL;
 
-/* Three possible output targets -- originally just local-vs-Bluetooth (two
- * bools, bt_requested/bt_active), refactored to a tri-state enum when USB
- * output was added rather than bolting a third bool onto that scheme,
- * since "which ONE of three is active" is what every call site actually
- * needs, not three independent flags that could disagree with each other. */
+/* Three possible output targets: local (ALSA), Bluetooth (bluealsa/aplay),
+ * and USB DAC (handled by usb_dac_bridge.c). A tri-state enum rather than
+ * multiple bools, since exactly one target is active at any time. */
 typedef enum {
     OUTPUT_TARGET_LOCAL = 0,
     OUTPUT_TARGET_BT,

@@ -6,11 +6,7 @@
 #include <stdio.h>
 
 #define LED_CLASS_DIR "/sys/class/leds"
-/* Real-device confirmation (2026-08-26): although max_brightness reports
- * 100 and sysfs accepts that value, writing 100 makes the physical LED only
- * flash briefly and then remain dark while brightness still reads back as
- * 100.  A direct write of 50 remains visibly lit.  Use that proven-stable
- * midpoint instead of trusting the driver's advertised maximum. */
+/* Uses brightness 50 for a stable visible midpoint level. */
 #define LED_ON_BRIGHTNESS "50"
 
 static void write_led_attr(const char * led_name, const char * attr, const char * value) {
@@ -56,41 +52,12 @@ void led_control_apply(bool enabled) {
 void led_control_poll(bool enabled) {
     if (!enabled) return;
 
-    /* battery_is_charging()/battery_is_full() read this device's kernel
-     * power_supply status string, which is confirmed stale specifically
-     * around this app's OWN charge_limiter.c: it can keep reporting
-     * "Charging" for as long as the app keeps polling, even well after the
-     * PMIC's real charger-enable bit was actually cleared (see charge_
-     * limiter.h's own comment on the identical staleness, and gui.c's
-     * existing use of charge_limiter_is_holding() for the same reason).
-     * Trusting battery_is_charging() alone here would keep the red
-     * "actively charging" LED lit long after real charging had already
-     * stopped at the configured cap.
-     *
-     * charge_limiter_is_confirmed_off() -- NOT charge_limiter_is_holding()
-     * -- is folded in as the second source: is_holding() reflects the
-     * app's DESIRED state, set the instant the percent threshold is
-     * crossed, before disable_charging() is even attempted, and it stays
-     * true through a failed-write retry window regardless of whether the
-     * charger is actually off yet. is_confirmed_off() only flips once the
-     * i2c write's own register-readback has verified it took effect, which
-     * is what this LED must wait for -- showing blue based on intent alone
-     * would light it during that retry window even if the charger were
-     * still genuinely enabled. */
+    /* Gated by charge_limiter_is_confirmed_off() so intentional charging caps
+     * are treated as completed even if power supply status reports charging. */
     bool capped = charge_limiter_is_confirmed_off();
 
-    /* Also gate on physical external power, not just capped/full status:
-     * capped stays true (charge_limiter.c's own hysteresis, see its
-     * CHARGE_LIMITER_RESUME_PERCENT) until the battery discharges back down
-     * to 82%, which comfortably outlives a real unplug at 84-85% -- without
-     * this check, unplugging right after the limiter capped charging would
-     * leave the blue "done charging" LED lit while the device is actually
-     * running on battery. UNKNOWN (a transient sysfs read failure, not a
-     * confirmed cable removal -- see battery.h's own comment) is treated
-     * the same as CONNECTED here: a briefly-wrong blue during a transient
-     * glitch is far less misleading than briefly turning it off while
-     * still genuinely plugged in, same conservative bias battery.h's own
-     * documented UNKNOWN-vs-DISCONNECTED distinction already exists for. */
+    /* Also gate on physical external power so the full/capped LED is not lit
+     * when unplugged and running on battery. */
     bool power_disconnected = battery_get_external_power_state() == BATTERY_EXTERNAL_POWER_DISCONNECTED;
     bool full = !power_disconnected && (battery_is_full() || capped);
     bool charging = !full && !power_disconnected && battery_is_charging();

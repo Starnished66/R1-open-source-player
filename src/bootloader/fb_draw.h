@@ -6,15 +6,9 @@
 
 #include "board_config.h"
 
-/* Confirmed against this project's own src/main.c (SCREEN_WIDTH/
- * SCREEN_HEIGHT) and lv_conf.h (LV_COLOR_DEPTH 16) -- the HiBy R1 panel is
- * a 480x800 portrait RGB565 framebuffer, not the round/ARGB display an
- * earlier draft of this bootloader's design assumed. R3 Pro II's 480x720
- * is equally confirmed -- see board_config.h's own comment for the
- * evidence (its stock config.json plus its own boot splash JPEGs' real
- * pixel dimensions). Both boards are RGB565; fb_open() below still
- * verifies the real framebuffer against these at runtime and fails closed
- * on any mismatch rather than trusting the board selected at compile time. */
+/* Display resolution from board_config.h.
+ * HiBy R1 is 480x800 RGB565; R3 Pro II is 480x720 RGB565.
+ * fb_open() verifies the runtime framebuffer geometry against these dimensions. */
 #define FB_WIDTH BOARD_SCREEN_WIDTH
 #define FB_HEIGHT BOARD_SCREEN_HEIGHT
 
@@ -56,17 +50,8 @@ void fb_draw_text(int x, int y, const char * text, fb_color_t color);
 int fb_text_width(const char * text);
 int fb_text_height(void);
 
-/* The actual visible update. Every drawing primitive in this file (fills,
- * borders, text, the background image) targets an off-screen buffer, not
- * the real, currently-scanned-out framebuffer -- this is what copies that
- * buffer out to the screen, in one tight bulk blit. Real-device finding
- * this exists to fix: drawing multiple separate layers (background, text,
- * cards, borders) straight to the visible page, one call at a time, was
- * independently visible mid-redraw and produced a real flicker every
- * countdown tick -- worse once card fills became alpha-blended (more
- * per-pixel work, a longer partial-frame window). Call this once, after
- * every complete frame is fully drawn to the off-screen buffer, never
- * mid-frame. */
+/* Copies the off-screen back buffer to the visible framebuffer.
+ * Call after a complete frame has been drawn. */
 void fb_flush(void);
 
 /* Decodes a JPEG file straight into the off-screen drawing buffer at

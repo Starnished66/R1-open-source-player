@@ -45,23 +45,10 @@ static text_entry_done_cb_t text_entry_on_done;
 static void * text_entry_user_data;
 
 /* ---- T9 keypad geometry: 5 columns x 4 rows of TEXT_ENTRY_KEY_SIZE keys,
- * centered under the screen's own width and anchored to the bottom of the
- * screen's own height (BOARD_SCREEN_WIDTH/HEIGHT, board_config.h via gui.h).
- * Matches a real-device photo of the R1's own stock keyboard exactly (not
- * asset-name guessing -- an earlier 4x5 layout with a single cycling Mode
- * key was wrong): column 0 holds three always-visible mode-jump buttons
- * (123/ABC/sym) stacked vertically rather than one key that cycles between
- * them; columns 1-3 hold the actual T9 3x3 letter/digit/symbol pad; column
- * 4 holds Del (row 0), the key-0/Shift slot (row 1, see text_entry_key0_
- * click_cb's own comment), and Enter (rows 2-3, tall). Row 3's remaining
- * cells are Left/Right and a wide Space spanning columns 2-3. 5 columns at
- * the native 94px key size only just fits 480px wide (a 2px gap leaves a
- * 1px margin each side) -- real device photo confirms the stock keyboard
- * packs this tight too. The key grid's own pixel size is NOT board-
- * conditional (94px keys, unchanged) -- only its position is, via
- * TEXT_ENTRY_GRID_X/Y below -- since both boards share the same 480px
- * width and the fixed-height grid comfortably fits under either board's
- * real screen height with room to spare. ---- */
+ * centered horizontally and anchored to the bottom of the screen.
+ * Column 0 holds mode buttons (123/ABC/sym); columns 1-3 hold the 3x3
+ * letter/digit/symbol pad; column 4 holds Del, Key 0/Shift, and Enter
+ * (spanning rows 2-3). Row 3 holds Left, Right, and Space (cols 2-3). ---- */
 #define TEXT_ENTRY_KEY_SIZE 94
 #define TEXT_ENTRY_KEY_GAP 2
 #define TEXT_ENTRY_GRID_COLS 5
@@ -95,14 +82,9 @@ static const char * const TEXT_ENTRY_SYMBOL_GROUPS[10] = {
 };
 
 static text_entry_kp_mode_t text_entry_kp_mode = TEXT_ENTRY_KP_ABC;
-/* Real-device bug report: Shift behaved as a persistent caps toggle (tap
- * once, every following letter stays capitalized until tapped again) --
- * every real T9/phone keypad instead treats these as two separate things:
- * Shift (the key-0 slot) capitalizes only the very next letter typed, then
- * reverts on its own, while tapping the ABC mode button AGAIN while it's
- * already the active mode is what toggles persistent caps ("Caps Lock").
- * text_entry_is_uppercase() below is the union of both -- everywhere that
- * used to read text_entry_shift directly for case now reads that instead. */
+/* Shift state: one-shot Shift capitalizes only the next letter, while tapping
+ * the ABC mode button again toggles persistent Caps Lock. text_entry_is_uppercase()
+ * evaluates the union of both states. */
 static bool text_entry_shift = false;     /* one-shot: consumed by the next letter (see text_entry_handle_digit_key) */
 static bool text_entry_caps_lock = false; /* persistent: toggled by re-tapping the ABC mode button */
 static bool text_entry_numeric_only = false;
@@ -144,26 +126,9 @@ static lv_obj_t * text_entry_num_mode_key;
 static lv_obj_t * text_entry_abc_mode_key;
 static lv_obj_t * text_entry_sym_mode_key;
 
-/* Bumped on every show_text_entry() call -- lets the READY handler below
- * tell whether the caller's done-callback chained straight into ANOTHER
- * show_text_entry() (Wi-Fi manual SSID entry is the one place that does:
- * SSID entered -> immediately prompts for the password) versus a callback
- * that just saved a value and returned. Real-device bug report: manual SSID
- * entry never actually asked for the password. Root cause was a race, not a
- * missing call -- the chained show_text_entry() DID run and DID push the
- * password screen, but this handler's own nav_pop() (issued for the SSID
- * screen, right before invoking the callback) is an ANIMATED transition
- * (screen_transition_slide(), ~NAV_ANIM_TIME_MS), and its completion
- * callback unconditionally lv_screen_load()s the screen nav_pop() was
- * originally headed to once that animation finishes -- landing well after
- * the password screen had already been pushed on top of it, and snapping
- * straight back to the Wi-Fi list before the user ever got a real chance at
- * it. nav_push()'s own dedup guard (same screen object already on top of
- * the stack -> just reload, don't grow the stack) means comparing nav_depth
- * before/after the callback can't detect this -- a chained call reuses this
- * same singleton text_entry_screen without changing nav_depth at all -- so
- * a dedicated generation counter is what actually distinguishes the two
- * cases. */
+/* Generation counter incremented on every show_text_entry() call to distinguish
+ * between callbacks that chain into another show_text_entry() call and those
+ * that complete navigation back. */
 static uint32_t text_entry_generation = 0;
 
 static void text_entry_reveal_btn_cb(lv_event_t * e) {
@@ -173,10 +138,7 @@ static void text_entry_reveal_btn_cb(lv_event_t * e) {
     lv_image_set_src(text_entry_reveal_btn, asset_path(now_masked ? "keyboard/psk_show.png" : "keyboard/psk_hide.png"));
 }
 
-/* Extracted from what used to be lv_keyboard's own LV_EVENT_READY handler
- * (the T9 Enter key below just calls this directly) -- the chained-
- * show_text_entry()/nav_remove_stack_slot() logic is unrelated to the
- * keypad rewrite, so it's preserved verbatim rather than re-derived. */
+/* Commits text input and invokes the completion callback. */
 static void text_entry_commit(void) {
     /* lv_textarea_get_text()'s buffer belongs to the textarea and would be
      * invalidated/reused the moment another screen starts editing it, so
@@ -189,34 +151,10 @@ static void text_entry_commit(void) {
     void * user_data = text_entry_user_data;
     uint32_t generation_before = text_entry_generation;
     int depth_before = gui_navigation_get_depth();
-    /* Callback runs BEFORE nav_pop() specifically so the checks below can
-     * see whether it navigated anywhere on its own -- see
-     * text_entry_generation's own comment. Real-device bug report (Wi-Fi
-     * manual SSID entry): the generation check alone wasn't enough -- it
-     * only catches a callback that chains into ANOTHER show_text_entry()
-     * call reusing this same singleton screen (nav_depth unchanged, dedup
-     * guard in nav_push() eats the push). Wi-Fi's password-entered callback
-     * instead calls start_wifi_connect(), which nav_push()es a DIFFERENT
-     * screen (subsonic_downloading_screen, "Connecting to X...") straight
-     * off this one -- nav_depth DOES grow there, since that push isn't a
-     * dedup no-op. Confirmed live: the connecting screen flashed up then was
-     * animated straight back to the password field by nav_pop() a moment
-     * later, looking like nothing happened -- each repeat tap on the
-     * keyboard's OK button (six of them, one real device test) genuinely
-     * re-ran the whole callback, creating a fresh duplicate saved network
-     * every time (wifi_control_connect() always add_network()s a new entry,
-     * see its own comment).
-     *
-     * Simply skipping nav_pop() in that case (an earlier version of this
-     * fix) stopped the yank-back, but left THIS screen's own stack slot
-     * sitting there permanently, one level below wherever the callback's
-     * own push actually landed -- confirmed live via the Subsonic download
-     * path's identical shape (see poll_subsonic_download()'s own comment):
-     * backing out of the destination screen afterward surfaced this
-     * now-defunct form again instead of whatever was open before it, since
-     * nothing had ever removed its slot. nav_remove_stack_slot() splices it
-     * out after the fact once it's clear something else already took its
-     * place. */
+    /* Invoke the callback before navigation checks so any chained navigation
+     * can be detected. If the callback navigated forward to another screen,
+     * remove this text entry slot from the stack so navigating back returns to
+     * the preceding screen. If not chained, pop back normally. */
     if (cb) cb(text_copy, user_data);
     if (gui_navigation_get_depth() > depth_before) {
         nav_remove_stack_slot(depth_before - 1);
@@ -270,10 +208,7 @@ static void text_entry_key_chars_ex(int key_index, char * out, size_t out_size, 
         snprintf(out, out_size, "%s", TEXT_ENTRY_SYMBOL_GROUPS[key_index]);
         return;
     }
-    /* ABC mode. Key 1 has no letter group on this asset set -- real-device
-     * photo confirmed the stock keyboard repurposes it as a punctuation
-     * shortcut here specifically (char_l.png/char_u.png's own baked-in
-     * glyph), not literal "1" the way NUM mode's key 1 is. */
+    /* ABC mode: Key 1 acts as a punctuation shortcut. */
     if (key_index == 1) {
         snprintf(out, out_size, "._@/#");
         return;
@@ -451,10 +386,7 @@ static void text_entry_neg_click_cb(lv_event_t * e) {
     }
 }
 
-/* The three mode buttons stacked in column 0 (rows 0-2) are always visible
- * together and each jump straight to their own mode -- unlike the earlier
- * single cycling Mode key this replaces, matching a real-device photo of
- * the stock keyboard's own layout exactly. */
+/* Column 0 mode buttons (123, ABC, SYM) switch directly to their respective modes. */
 static void text_entry_mode_num_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     text_entry_finalize_pending();
@@ -463,13 +395,8 @@ static void text_entry_mode_num_click_cb(lv_event_t * e) {
     text_entry_refresh_keys();
 }
 
-/* Real-device bug report: tapping ABC again while it was ALREADY the active
- * mode did nothing -- the real stock keyboard uses exactly that (re-tapping
- * the already-active mode button) as its persistent Caps Lock toggle,
- * distinct from Shift's one-shot-next-letter behavior on the key-0 slot
- * above. Switching INTO ABC from NUM/SYM just activates it, same as before;
- * text_entry_caps_lock deliberately isn't reset there, so a caps-lock
- * preference set earlier survives a detour through NUM/SYM and back. */
+/* Tapping ABC while already in ABC mode toggles persistent Caps Lock.
+ * Switching into ABC from other modes activates ABC mode without resetting Caps Lock. */
 static void text_entry_mode_abc_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     text_entry_finalize_pending();
@@ -546,13 +473,11 @@ static lv_obj_t * text_entry_make_key(lv_obj_t * scr, int col, int row, lv_event
     return img;
 }
 
-/* T9 keypad: 5 columns x 4 rows (see TEXT_ENTRY_GRID_X/Y's own comment
- * above for the real-device-photo source of this layout). Row 0: Mode:123
- * / 1 / 2-ABC / 3-DEF / Del. Row 1: Mode:ABC / 4-GHI / 5-JKL / 6-MNO /
- * 0-or-Shift. Row 2: Mode:sym / 7-PQRS / 8-TUV / 9-WXYZ / Enter (spans
- * rows 2-3). Row 3: Left / Right / Space (spans cols 2-3) / Enter
- * continues. Numeric-only fields hide the three mode buttons and show a
- * decimal key (same cell as Mode:123) and a minus key (same cell as
+/* T9 keypad: 5 columns x 4 rows. Row 0: Mode:123 / 1 / 2-ABC / 3-DEF / Del.
+ * Row 1: Mode:ABC / 4-GHI / 5-JKL / 6-MNO / 0-or-Shift. Row 2: Mode:sym / 7-PQRS /
+ * 8-TUV / 9-WXYZ / Enter (spans rows 2-3). Row 3: Left / Right / Space (spans
+ * cols 2-3) / Enter continues. Numeric-only fields hide the three mode buttons
+ * and show a decimal key (same cell as Mode:123) and a minus key (same cell as
  * Mode:ABC) -- see text_entry_refresh_keys().
  *
  * Every key is built as a child of one `group` container (itself a plain
@@ -570,22 +495,13 @@ static lv_obj_t * build_t9_keypad_group(lv_obj_t * parent) {
     lv_obj_set_pos(group, 0, 0);
     lv_obj_set_style_bg_opa(group, 0, 0);
     lv_obj_set_style_border_width(group, 0, 0);
-    /* lv_obj_create()'s default theme padding shifts every key's TOP_LEFT-
-     * aligned TEXT_ENTRY_GRID_X/Y position (and the black backing rect
-     * below) inward from group's true left/top edge -- real-device
-     * feedback: the keypad's first column didn't actually reach the
-     * screen's left border despite TEXT_ENTRY_GRID_X computing to ~1px.
-     * Same root cause already documented on the search bar's own padding. */
+    /* Remove padding so key coordinates align cleanly with the group container. */
     lv_obj_set_style_pad_all(group, 0, 0);
     lv_obj_remove_flag(group, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(group, LV_OBJ_FLAG_CLICKABLE);
 
-    /* Opaque black backing sized to the keypad's own footprint (plus a
-     * small margin), created before the keys so it sits behind them --
-     * real-device feedback: the keys themselves have gaps between them
-     * (TEXT_ENTRY_KEY_GAP), and `group` above is fully transparent, so
-     * without this whatever's on the target screen behind the keypad
-     * (list rows, etc.) showed through those gaps instead of solid black. */
+    /* Opaque black backing sized to the keypad footprint, placed behind keys
+     * so underlying screen content does not show through the key gaps. */
     lv_obj_t * backing = lv_obj_create(group);
     lv_obj_set_size(backing, lv_pct(100), TEXT_ENTRY_GRID_HEIGHT + TEXT_ENTRY_BOTTOM_MARGIN + 8);
     lv_obj_set_pos(backing, 0, TEXT_ENTRY_GRID_Y - 8);
@@ -672,15 +588,8 @@ void t9_keypad_attach(lv_obj_t * target_screen, lv_obj_t * textarea_parent, int3
                               int32_t textarea_w) {
     lv_obj_set_parent(text_entry_keypad_group, target_screen);
     lv_obj_set_parent(text_entry_textarea, textarea_parent);
-    /* lv_obj_align() (used to position this textarea for the modal flow,
-     * see t9_keypad_release() below) sets a PERSISTENT align-mode style
-     * property, not just a one-off position -- plain lv_obj_set_pos() here
-     * left that mode at its build-time LV_ALIGN_TOP_MID, so textarea_x/y
-     * were being applied as an offset from horizontal CENTER of whatever
-     * the current parent is, not as an absolute top-left position.
-     * Real-device symptom: the textarea rendered ~38px further right than
-     * intended and visibly overlapped close_btn. lv_obj_align() with
-     * TOP_LEFT here resets the mode so these coordinates are absolute. */
+    /* Align with LV_ALIGN_TOP_LEFT so textarea_x and textarea_y are treated as
+     * absolute coordinates relative to the parent container. */
     lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_LEFT, textarea_x, textarea_y);
     lv_obj_set_width(text_entry_textarea, textarea_w);
     lv_textarea_set_password_mode(text_entry_textarea, false);
@@ -696,17 +605,7 @@ void t9_keypad_attach(lv_obj_t * target_screen, lv_obj_t * textarea_parent, int3
     text_entry_inline_mode_active = true;
 }
 
-/* text_entry_textarea's own resting height -- derived from gui_theme_font(GUI_FONT_ROLE_BODY)'s
- * real line height (bigger at the Medium/BlindMF font tiers) plus fixed
- * vertical padding, rather than a flat pixel value sized for the smallest
- * tier only. Recomputed on demand (not cached) because the stable
- * app_font_* descriptor can change metrics during a live tier switch;
- * reading it fresh costs nothing. Shared by both
- * text_entry_textarea's own creation site and t9_keypad_release()'s reset
- * below -- real-device bug report: text started scaling correctly but the
- * field's own box didn't, because the reset below still had the old flat
- * 50px baked in as a separate literal and silently overwrote the creation
- * site's own (correct) height on every single show_text_entry() call. */
+/* Derives textarea resting height dynamically from the font line height plus padding. */
 static int32_t text_entry_field_height(void) {
     return lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_BODY)) + 26;
 }
@@ -735,13 +634,7 @@ static lv_obj_t * build_text_entry_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    /* lv_keyboard_create()'s built-in Close/X key used to be this screen's
-     * only cancel path (see the old LV_EVENT_CANCEL branch this replaces --
-     * generic_back_cb below is functionally identical, just nav_pop()).
-     * Removing lv_keyboard for the T9 keypad below means that key is gone,
-     * so this screen needs its own explicit back button now -- same
-     * top-left 64x64/sub_back/btn_back.png pattern as build_files_screen()
-     * and every other hand-built screen in this file. */
+    /* Top-left back button navigating back via text_entry_back_cb. */
     lv_obj_t * back_btn = lv_obj_create(scr);
     lv_obj_set_size(back_btn, 64, 64);
     lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
@@ -761,12 +654,7 @@ static lv_obj_t * build_text_entry_screen(void) {
     lv_obj_set_style_text_font(text_entry_title_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
 
     text_entry_textarea = lv_textarea_create(scr);
-    /* Real-device bug report: this field's typed text stayed at LVGL's own
-     * unscaled default font regardless of Settings -> Font Size -- unlike
-     * every other body-text label in the app, nothing here ever set an
-     * explicit tier-aware font. gui_theme_font(GUI_FONT_ROLE_BODY) matches
-     * most other body text and follows live general font-size changes;
-     * see text_entry_field_height()'s own comment for the field's height. */
+    /* Configure font based on active theme role to respect user font settings. */
     lv_obj_set_style_text_font(text_entry_textarea, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_set_size(text_entry_textarea, lv_pct(78), text_entry_field_height());
     lv_obj_align(text_entry_textarea, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 40);
@@ -784,11 +672,7 @@ static lv_obj_t * build_text_entry_screen(void) {
      * for all 9 existing modal callers. */
     lv_obj_add_event_cb(text_entry_textarea, search_textarea_value_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    /* Real-device bug report: no way to unmask a password field while
-     * typing it. Hidden entirely for non-password fields by
-     * show_text_entry() below -- the textarea is narrowed to make room for
-     * it unconditionally so switching between password/non-password fields
-     * doesn't reflow the textarea's width and position. */
+    /* Password unmask toggle button, positioned adjacent to the textarea. */
     text_entry_reveal_btn = lv_image_create(scr);
     lv_image_set_src(text_entry_reveal_btn, asset_path("keyboard/psk_show.png"));
     lv_obj_align_to(text_entry_reveal_btn, text_entry_textarea, LV_ALIGN_OUT_RIGHT_MID, 8, 0);

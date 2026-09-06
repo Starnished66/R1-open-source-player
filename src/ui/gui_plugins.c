@@ -798,16 +798,7 @@ bool gui_plugin_library_get_song(int64_t id, song_row_t * out_row) {
     return metadata_db_get_song_by_id(id, out_row);
 }
 
-/* Real bug caught in review, now moot: metadata_db_get_groups_page()/
- * get_albums_page_filtered() used to only support a keyset "after_name"
- * cursor (never actually continued by any real caller), so this used to
- * fetch offset+limit rows in one shot and slice out [offset, offset+limit)
- * in C, capped at a generous-but-still-finite ceiling -- confirmed against
- * this device's real library (210 distinct albums) to silently truncate
- * offsets past that ceiling with no way for a plugin to detect it. Both
- * functions take a real offset now (see their own metadata_db.h comments),
- * so this is a direct pass-through with no cap beyond GUI_PLUGIN_LIBRARY_
- * MAX_PAGE itself. */
+/* Fetches a page of artists with offset and clamped limit directly from the database. */
 int gui_plugin_library_get_artists(int offset, int limit, group_row_t * out_rows) {
     if (offset < 0) offset = 0;
     limit = gui_plugin_library_clamp_limit(limit);

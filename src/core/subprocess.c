@@ -9,27 +9,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* Real-device incident: none of the open()/pcm_open() calls elsewhere in
- * this codebase (tinyalsa's pcm_hw_open() for the audio device notably
- * included) set O_CLOEXEC, so every fd this app has open at the moment any
- * of the fork() calls below happens gets duplicated into the child --
- * harmless for a short-lived one-shot command, but a real problem for any
- * child that goes on to exec a long-lived daemon of its own (confirmed on
- * a real device: switching USB modes while a song was playing forked
- * through /usr/bin/adbon -> S440adb -> adbserver.sh -> adbd, and adbd kept
- * running long after, permanently holding a duplicate of the ALSA PCM
- * device fd open -- every subsequent pcm_open() in this app failed with
- * "Resource busy" until that adbd was killed, even though the app's own
- * handle to the device had long since been closed. Rather than hunting
- * down and adding O_CLOEXEC to every current and future open()/socket()/
- * pcm_open() call in this codebase individually (easy to miss one, and
- * tinyalsa's is in vendored code this project doesn't otherwise patch),
- * this closes everything above stdin/stdout/stderr in the child right
- * before exec -- one fix that protects every subprocess call regardless of
- * what else the app happens to have open at the time. Safe to do after
- * fork(): the child is single-threaded at this point (fork() only
- * duplicates the calling thread), so there's no other thread that could
- * still be using one of these fds out from under it. */
+/* Closes all file descriptors above stderr in the child after fork().
+ * Many open()/pcm_open() calls in this codebase (including tinyalsa's
+ * pcm_hw_open()) do not set O_CLOEXEC, so every fd is duplicated into
+ * any forked child. Long-lived daemons spawned via exec can permanently
+ * hold duplicates of, e.g., the ALSA PCM fd, causing EBUSY on every
+ * subsequent pcm_open() in the parent even after its own handle is closed.
+ * Closing inherited fds in the child right before exec protects every
+ * subprocess call regardless of what the parent has open at the time.
+ * Safe after fork(): the child is single-threaded at that point. */
 static void close_inherited_fds(void) {
     DIR * dir = opendir("/proc/self/fd");
     if (!dir) return;
@@ -44,27 +32,8 @@ static void close_inherited_fds(void) {
     closedir(dir);
 }
 
-/* Real-device incident: bluetoothctl show hung indefinitely (bluetoothd/
- * hci0 in a bad state after an unclean reboot), and since subprocess_run()
- * is called directly from update_timer_cb's periodic poll (refresh_bt_icon,
- * every 5s) on the one thread driving the whole UI, that single hung child
- * process froze the entire device -- not just this app. subprocess_run()
- * previously had no bound on either the pipe read or the final waitpid(),
- * so a child that never writes/closes stdout or never exits blocked here
- * forever. This timeout is generous enough to never trip on any real,
- * healthy call at this default timeout -- the longest plain subprocess_run()
- * call left is a few seconds (bluetoothctl info/pair/trust/connect, wpa_cli
- * scan, etc). bt_control_scan()'s own scan window now runs through
- * subprocess_popen_stdin() instead (see run_bredr_scan() in
- * bluetooth_control.c -- needs one persistent bluetoothctl session so a
- * `scan.transport bredr` filter actually applies to the `scan on` that
- * follows it), so this shared timeout no longer bounds it; that call site
- * has its own sleep(seconds) instead. The one subprocess_run() call that
- * legitimately needs longer than this default (bt_control_init_chip()'s
- * /usr/bin/bt_init, whose own script sleeps for ~10-13s across chip
- * firmware flashing and service startup) uses subprocess_run_timeout()
- * directly with its own explicit budget instead of raising this shared
- * default. */
+/* Default subprocess execution timeout (15s) to ensure hung commands do not block the UI.
+ * Commands requiring longer budgets (e.g. bt_init) call subprocess_run_timeout() directly. */
 #define SUBPROCESS_TIMEOUT_MS 15000
 
 bool subprocess_run(char * const argv[], char * out_buf, size_t out_buf_size) {
@@ -196,26 +165,8 @@ bool subprocess_spawn_daemon_logged(char * const argv[], const char * log_path) 
         _exit(0);
     }
 
-    /* Bounded, not a plain blocking waitpid() -- the first child only does
-     * one more fork() then exits immediately, which should be near-instant,
-     * but fork() itself has no userspace timeout, and confirmed via
-     * persistent boot-checkpoint logging on a real device that a
-     * structurally identical unbounded wait (in a startup D-Bus-cleanup
-     * function since removed entirely -- see bluetooth_control.h's comment
-     * above bt_control_is_powered() for the full story) hung indefinitely
-     * at exactly this kind of call on a genuine cold boot -- plausibly
-     * memory pressure from dbus/wifi/bluetooth all still starting up at
-     * once on this device's very limited RAM stalling the inner fork().
-     * Every caller of
-     * this function (bluetoothd/bt-agent/bluealsa-aplay respawns, AirPlay's
-     * shairport, the local-import HTTP server) is reachable from a
-     * real-device incident's recovery path or the startup path, so this is
-     * fixed once here rather than requiring every caller to know to guard
-     * against it individually. Polled in small slices, same pattern as
-     * subprocess_run_checked()'s own tail wait and subprocess_terminate().
-     * If the first child doesn't exit in time, stop waiting on it anyway --
-     * it and the real daemon it's spawning keep running regardless, this
-     * was only ever reaping bookkeeping, not the actual work. */
+    /* Wait for intermediate child exit with timeout to avoid hanging if the child
+     * process stalls. */
     for (int waited_ms = 0; waited_ms < SUBPROCESS_TIMEOUT_MS; waited_ms += 50) {
         if (waitpid(pid, NULL, WNOHANG) == pid) break;
         usleep(50000);

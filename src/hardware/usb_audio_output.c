@@ -7,20 +7,10 @@
 
 #define DEV_SND_DIR "/dev/snd"
 
-/* This device's kernel build has no /proc/asound at all (confirmed on real
- * hardware -- CONFIG_SND_PROC_FS isn't enabled, even the internal codec
- * doesn't show up there), so card detection has to go through the raw ALSA
- * device nodes in /dev/snd/ instead, which do exist (tinyalsa opens
- * /dev/snd/pcmC0D0p directly for the internal codec, confirmed working).
- * Playback device nodes are named pcmC<card>D<device>p -- card 0 is always
- * this device's own internal codec (confirmed real-device: pcmC0D0p is
- * present at boot with nothing else attached), so an externally connected
- * USB DAC/amp/DSP headphone is identified as the first pcmC<N>D0p node with
- * N != 0. "plughw" (not "hw") wraps the raw card in ALSA's own rate/format
- * conversion plugin, same reasoning as bluealsa's own pcm.bluealsa "type
- * plug" wrapping (see audio_output.c's own comment) -- an arbitrary
- * external DAC isn't guaranteed to natively support whatever rate this app
- * happens to be decoding at. */
+/* Card detection uses the raw ALSA device nodes in /dev/snd/ (pcmC<card>D<device>p).
+ * Card 0 is the internal codec, so an externally connected USB DAC is identified
+ * as the first pcmC<N>D0p node with N != 0. "plughw" wraps the raw card in ALSA's
+ * rate/format conversion plugin to accommodate arbitrary external DAC sample rates. */
 bool usb_audio_output_is_connected(char * out, size_t out_size) {
     DIR * d = opendir(DEV_SND_DIR);
     if (!d) return false;

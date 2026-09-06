@@ -15,44 +15,9 @@ bool wifi_control_is_enabled(void) {
     return access("/var/run/wpa_supplicant/" WIFI_INTERFACE, F_OK) == 0;
 }
 
-/* Real-device bug report: WiFi wasn't automatically reconnecting to saved
- * networks (most visibly after suspend/resume, which tears the radio down
- * and calls this to bring it back -- see power_suspend.c's own
- * radio_restore_thread_func()). Root cause, confirmed live: /usr/bin/
- * wifi_on.sh (stock firmware script, not this project's own -- not
- * something this build ships or can patch) starts wpa_supplicant, waits a
- * hardcoded 1.3s, then fires `udhcpc -b -i wlan0 -q -x hostname:...` in the
- * background. A real AP's association + WPA handshake can easily take
- * longer than 1.3s, especially right after a radio power-cycle -- when it
- * does, that udhcpc's initial DHCPDISCOVER attempts go out before the
- * interface has any real L2 connectivity and get no response. Reproduced
- * directly on-device: wpa_cli status read wpa_state=COMPLETED (fully
- * associated) with no ip_address= line at all -- the radio was genuinely
- * connected but had no IP.
- *
- * Fixed here, not in wifi_on.sh (can't patch stock firmware, and this is
- * the one place already treated as "slow, call from a background thread"
- * by every caller -- see wifi_toggle_thread_func()'s own comment): poll
- * wpa_cli status for up to ~10s for either an IP to show up on its own (the
- * script's own udhcpc call winning the race, the common case) or
- * association to complete; if it associated but still has no IP once that
- * window closes, re-run udhcpc ourselves once, the same invocation
- * wifi_on.sh's own last line uses.
- *
- * BusyBox udhcpc's own embedded --help (checked directly against the
- * actual on-device busybox binary, not assumed) is explicit that -b means
- * "Background if lease is not obtained" -- paired with no -n ("Exit if
- * lease is not obtained"), a udhcpc that fails its initial attempts
- * backgrounds itself and keeps retrying indefinitely rather than exiting,
- * for as long as this ~10s poll window and then some. That means wifi_on.
- * sh's own udhcpc can still be alive (backgrounded, still retrying) by the
- * time this decides to re-kick -- launching a second one without first
- * killing the first would leave two udhcpc processes contending for the
- * same interface, the exact class of duplicate-daemon bug bluetooth_
- * control.c already guards against for bluealsa/bt-agent (see
- * subprocess_kill_all_matching()'s own doc comment) -- so this does the
- * same here before the manual re-kick, matching wifi_on.sh's own first
- * line ("killall udhcpc"). */
+/* Enables WiFi by running wifi_on.sh, then polls wpa_cli status up to ~10s
+ * for an IP address or completed association. If associated without an IP address,
+ * terminates existing udhcpc instances and triggers udhcpc to obtain a lease. */
 void wifi_control_enable(void) {
     char * argv[] = { (char *) "/usr/bin/wifi_on.sh", NULL };
     subprocess_run(argv, NULL, 0);

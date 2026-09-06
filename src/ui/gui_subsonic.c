@@ -187,29 +187,9 @@ void poll_subsonic_download(void) {
     http_cancel_token_destroy(&download_cancel);
     bool success = download_success_flag;
 
-    /* Real-device bug report: a downloaded Subsonic track needed a second
-     * tap on the song to actually start playing -- same race already fixed
-     * for Wi-Fi manual SSID entry (see text_entry_kb_event_cb's own comment
-     * for the full mechanism). on_file_selected() -> play_track_at_from()
-     * nav_push()es the player screen the instant playback starts; nav_pop()
-     * below (leaving the "Downloading..." screen) is an ANIMATED transition
-     * queued via screen_transition_slide(), whose completion callback
-     * unconditionally lv_screen_load()s back to the song list once that
-     * animation finishes, a moment after the player screen was already
-     * showing -- yanking the UI back even though audio was, underneath,
-     * genuinely already playing.
-     *
-     * Real-device follow-up: simply skipping nav_pop() when on_file_
-     * selected() already navigated (an earlier version of this fix) did
-     * stop the yank-back, but left subsonic_downloading_screen's own slot
-     * sitting in the stack forever, one level below the player screen --
-     * confirmed live as backing out of the player landing back on the now-
-     * defunct "Downloading..." screen instead of the song list underneath
-     * it. nav_remove_stack_slot() (see its own comment) splices that slot
-     * out once it's clear the player screen already took its place,
-     * rather than trying to avoid creating it in the first place -- the
-     * push already happened by the time this code can tell whether it
-     * did. */
+    /* If playback started and pushed the player screen, remove the downloading
+     * screen slot from the navigation stack so navigating back returns directly
+     * to the song list rather than the transient downloading screen. */
     int depth_before = gui_navigation_get_depth();
     if (success) {
         char ** playlist = malloc(sizeof(char *));
@@ -435,12 +415,7 @@ lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** ou
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(list, 0, 0);
     lv_obj_set_style_border_width(list, 0, 0);
-    /* Real-device bug report: same root cause as build_compact_list_widget()/
-     * build_pill_list_screen()'s own fix (see build_compact_list_widget()'s
-     * comment) -- every screen built through this shared function (resume
-     * mode, font size, USB mode, play/pause button mode, sleep timer,
-     * startup volume, the timezone city list, ...) had its rows shifted
-     * right, clipped against the screen edge with a gap on the left. */
+    /* Clear padding so rows align cleanly to screen edges without horizontal offset. */
     lv_obj_set_style_pad_all(list, 0, 0);
     lv_obj_set_scroll_dir(list, LV_DIR_VER); /* see build_icon_grid_screen's comment in screen_builders.c */
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
@@ -991,17 +966,9 @@ void poll_subsonic_connect(void) {
                                         subsonic_connect_pending_server.verify_tls);
         settings_save(&current_settings);
 
-        /* Subsonic screen redesign: lands on a menu (Artists/Playlists/
-         * Albums) rather than jumping straight into the artist list --
-         * getArtists is still fetched right here as part of connecting
-         * (below), so tapping Artists from the menu is instant with no
-         * extra round trip; Playlists/Albums fetch lazily on their own tap,
-         * same as every other drill-down in this screen already does.
-         * getArtists.view has no size cap (unlike getAlbumList2's own
-         * size=500) -- a large self-hosted server's whole artist list is a
-         * real widget-explosion risk populate_indexed_list() used to hit
-         * here, same class as the local library's pre-virtualization All
-         * Songs/Artists/Albums screens. */
+        /* Subsonic menu screen: pre-populates the artists list so opening it is
+         * immediate without an additional server fetch, while playlists and albums
+         * fetch on demand when their respective rows are tapped. */
         {
             compact_list_item_t * items =
                 malloc(sizeof(compact_list_item_t) * (size_t) (subsonic_artists_count > 0 ? subsonic_artists_count : 1));
@@ -1260,16 +1227,7 @@ void gui_subsonic_init(void) {
     subsonic_albums_screen = build_compact_list_screen("Albums", generic_back_cb, NULL, 0, subsonic_album_row_click_cb,
                                                          NULL, &subsonic_albums_list, &subsonic_albums_title_label,
                                                          LIST_ROW_WIDTH_WIDE, false, lv_color_black());
-    /* Real-device bug report: swipe-back not working inside Subsonic's
-     * Artists/Albums submenus. Unlike build_subsonic_list_screen() (used by
-     * the sibling Songs/Playlists submenus just below), build_compact_list_
-     * screen() does not call finalize_screen_navigation() itself -- every
-     * other caller (gui_library.c's own Artists/Albums/All Songs/...) calls
-     * it explicitly afterward, but these two never did. Without it, the
-     * screen root never gets LV_OBJ_FLAG_CLICKABLE, keeps LV_OBJ_FLAG_
-     * SCROLLABLE, and never gets the LV_EVENT_GESTURE handler registered --
-     * so a swipe never even registers as a gesture here, let alone
-     * triggers Back. */
+    /* Finalize navigation handlers and gesture support for swipe-back navigation. */
     finalize_screen_navigation(subsonic_artists_screen);
     finalize_screen_navigation(subsonic_albums_screen);
     subsonic_songs_screen = build_subsonic_list_screen("Songs", &subsonic_songs_title_label, &subsonic_songs_list);

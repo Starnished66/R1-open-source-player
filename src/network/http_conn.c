@@ -86,18 +86,7 @@ static bool cancel_register(struct http_cancel_token * cancel, int fd) {
     return !already;
 }
 
-/* Review finding (round 2): clearing cancel->fd and closing fd as two
- * SEPARATE steps -- even with the compare-before-clear above, and even
- * with http_cancel_token_cancel() itself now reading fd and calling
- * shutdown() atomically under the same mutex -- still leaves the
- * unregister (lock/clear/unlock) and the actual close() as two
- * independent operations. Belt and suspenders, matching the reviewer's
- * own explicit recommendation: hold cancel's mutex for the unregister
- * AND the real close() together, as one atomic operation, exactly
- * mirroring http_cancel_token_cancel()'s own read-fd-and-shutdown being
- * one atomic operation under the same mutex. Between the two, the fd can
- * never be observed by a canceller in a state where it's already closed
- * but the token doesn't know it yet, or vice versa. */
+/* Unregisters fd from cancel token and closes fd atomically under cancel mutex. */
 static void cancel_unregister_and_close(struct http_cancel_token * cancel, int fd) {
     if (!cancel) {
         close(fd);
@@ -109,33 +98,13 @@ static void cancel_unregister_and_close(struct http_cancel_token * cancel, int f
     pthread_mutex_unlock(&cancel->mutex);
 }
 
-/* Equivalent to mbedtls_net_connect(), bounded by connect_timeout_ms (0 =
- * no timeout, waits indefinitely -- poll()'s own -1 timeout, not a
- * fallback to mbedtls_net_connect() anymore, see below) via a non-blocking
- * connect()+poll(). mbedtls_net_connect() itself has no connect-timeout
- * parameter in this vendored version (confirmed directly from mbedtls/
- * library/net_sockets.c, not assumed), and offers no way to register a
- * cancel token either, which is why this always uses its own connect path
- * now rather than only when a timeout is requested -- review finding:
- * previously, connect_timeout_ms == 0 fell through to plain
- * mbedtls_net_connect(), which could not be cancelled at all during
- * connect. Registers EVERY candidate socket into `cancel` immediately
- * after socket() creation, before connect()/poll(), so a cancel during
- * either is caught, not just during a later blocked read. Applies the
- * SAME timeout budget to each resolved address in turn (not a single
- * shared deadline split across them) -- a deliberate simplification: real
- * hostnames here resolve to one or two addresses, and the worst case
- * (every address individually timing out) is still a bounded, small
- * multiple of connect_timeout_ms, not unbounded. */
+/* Connects to host:port with a timeout using non-blocking connect() and poll().
+ * Registers socket into cancel token to allow cancellation during connect. */
 static http_conn_error_t net_connect_timeout(mbedtls_net_context * ctx, const char * host, const char * port,
                                               uint32_t connect_timeout_ms, struct http_cancel_token * cancel) {
     if (cancel_requested_conn(cancel)) return HTTP_CONN_ERR_CANCELLED;
 
-    /* DNS resolution itself is a single blocking libc call with no
-     * portable way to interrupt from another thread in this codebase (no
-     * async resolver here) -- a cancel requested while blocked here is
-     * only noticed once getaddrinfo() returns. Documented honestly in
-     * http_conn.h rather than claimed as covered. */
+    /* Blocking DNS resolution via getaddrinfo. */
     struct addrinfo hints, * addr_list, * cur;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -328,28 +297,8 @@ int http_conn_read(http_conn_t * conn, uint8_t * buf, size_t len) {
         conn->last_read_timed_out = false;
         return 0;
     }
-    /* Correction to the comment this replaced: that comment assumed a
-     * SO_RCVTIMEO timeout on our socket surfaces as MBEDTLS_ERR_SSL_
-     * WANT_READ/WRITE. It does not, for the sockets this code actually
-     * uses. mbedtls/library/net_sockets.c's net_would_block() explicitly
-     * documents "on a blocking socket this function always returns 0" --
-     * and net_connect_timeout() (this file) deliberately restores the fd
-     * to blocking mode after the non-blocking connect/poll dance
-     * ("back to blocking for the rest of this connection's life"). So on
-     * every read after connect, an EAGAIN from SO_RCVTIMEO makes
-     * mbedtls_net_recv() fall through past its own would-block check and
-     * return the generic MBEDTLS_ERR_NET_RECV_FAILED instead --
-     * indistinguishable from a real I/O error by return code alone.
-     * mbedtls's own would-block check reads errno into a local, restores
-     * it unchanged, and returns without a further syscall in between --
-     * so errno is still exactly what the failing read()/recv() left it
-     * as when we get back here. Check it directly rather than trusting a
-     * WANT_READ/WRITE code this configuration can never actually
-     * produce; the WANT_READ/WRITE check is kept too since it's what a
-     * hypothetical future non-blocking caller of this same function
-     * would actually see. Updated on every call, not just failures, so a
-     * stale true from an earlier read can never leak into a later,
-     * unrelated failure's diagnosis. */
+    /* Check errno directly for timeout (EAGAIN/EWOULDBLOCK) in addition to
+     * mbedTLS want-read/want-write status codes. */
     conn->last_read_timed_out = (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) ||
                                  (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
     return n;
@@ -366,16 +315,7 @@ void http_conn_close(http_conn_t * conn) {
             mbedtls_entropy_free(&conn->entropy);
         }
     }
-    /* Review finding (round 2): unregistering (compare-and-clear) and
-     * THEN separately calling mbedtls_net_free() (the real close) was
-     * still two non-atomic steps, even with http_cancel_token_cancel()
-     * itself already fixed to read fd and shutdown() atomically -- hold
-     * the SAME mutex across both the unregister and the actual close
-     * here too, exactly mirroring the other side, so the two can never
-     * interleave in a way that lets a cancel() observe a half-updated
-     * state (token still says a since-closed-and-possibly-reused fd is
-     * valid). Without a cancel_token at all, this is just the original,
-     * unsynchronized close -- nothing to serialize against. */
+    /* Unregister from cancel token and free network context under cancel mutex. */
     struct http_cancel_token * cancel = conn->cancel_token;
     if (cancel) {
         pthread_mutex_lock(&cancel->mutex);

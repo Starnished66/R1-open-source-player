@@ -33,19 +33,8 @@ static int fb_base_offset_pixels = 0;
  * waitpid() by that point. */
 static uint16_t * bg_cache = NULL;
 
-/* Every drawing primitive below (put_pixel/get_pixel, and therefore
- * everything built on them) targets THIS compact, no-stride, always-
- * (0,0)-based off-screen buffer -- never fb_mem directly. Real-device
- * finding: with drawing going straight to the visible, currently-scanned-
- * out page (the original design), every redraw's multiple separate steps
- * (restore background, title, countdown, cards' alpha-blended fills,
- * borders, text) were each independently visible mid-sequence, and the
- * repeated background-restore-then-redraw cycle every countdown tick
- * produced a real, visible flicker -- worse once card fills became
- * alpha-blended (more per-pixel work per frame, a longer partial-frame
- * window for the scanout to catch). fb_flush() is what actually copies
- * this to the real, visible fb_mem, in one tight per-row loop -- turning
- * many small, independently-visible writes into one fast bulk update. */
+/* Off-screen back buffer used by drawing primitives to assemble frames before
+ * blitting to the visible framebuffer in fb_flush(). */
 static uint16_t * back_buffer = NULL;
 
 /* 5x7 dot-matrix font, uppercase + digits + space only. Deliberately not a
@@ -247,15 +236,8 @@ bool fb_open(void) {
     return true;
 }
 
-/* Leave the framebuffer in the conventional page-zero state for the next
- * process. This was originally added while investigating a frozen Stock
- * handoff, but live foreground logs later proved that failure happened
- * before Stock acquired any framebuffer at all: its separate sa_hgl_dma
- * contiguous allocation failed (see main.c's reservation). Normalizing
- * remains useful descriptor/display hygiene for players that assume page
- * zero. Blit the final frame there first when the bootloader opened on a
- * different page, avoiding a flash of stale page-zero contents, then pan.
- * Best-effort: a failed query or pan is logged and never blocks handoff. */
+/* Normalizes framebuffer offset to page zero before handoff to the next process.
+ * Blits the current frame to page zero if opened on a different page, then pans. */
 static void fb_normalize_to_page_zero(void) {
     if (!fb_mem || !back_buffer || fb_fd < 0) return;
 

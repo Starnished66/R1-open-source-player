@@ -639,14 +639,8 @@ static int l_plugin_register_list_item(lua_State * L) {
     return 0;
 }
 
-/* Registers a Stream Media tile, appended after the built-in Subsonic one
- * -- see PLUGIN_MAX_STREAM_TILES's own comment in plugin_manager.h.
- * Default icon is stream_media/radio.png -- a real stock theme2 asset
- * (confirmed still present on disk; this session's earlier Qobuz/Tidal/Net
- * Radio cleanup only removed the dead *code* referencing it, not the
- * asset itself, which isn't this project's own to delete anyway), a
- * sensible default for the kind of plugin (a Net Radio-style streaming
- * source) this registry is meant for. */
+/* Registers a Stream Media tile, appended after the built-in Subsonic tile.
+ * Defaults icon to "stream_media/radio.png" if not specified. */
 static int l_plugin_register_stream_media_tile(lua_State * L) {
     const char * label = luaL_checkstring(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
@@ -678,37 +672,16 @@ static int l_plugin_register_stream_media_tile(lua_State * L) {
 static bool plugin_id_is_valid(const char * id);
 
 /* Registers a tile a theme can place on Home via set_home_layout()'s
- * `options.order` (PLUGINS.md) -- unlike register_stream_media_tile()
- * above, `icon` is required, not optional: Home's native tiles are all
- * large, deliberate, custom icons (the launcher/ asset family), and there is no
- * confirmed generic/placeholder theme2 asset suitable as a silent fallback
- * for something shown at that same size and prominence (Stream Media's own
- * default, stream_media/radio.png, is a small icon-grid tile, a much lower
- * bar) -- rather than guess an asset path that might not exist on a given
- * device/theme, this just requires the plugin to supply one.
- *
- * `id` must be unique across every registered home tile (not namespaced per
- * plugin) -- home_layout_config.order[]/tiles[] key lookups are a flat
- * linear scan by this string, so two plugins picking the same id would
- * otherwise silently collide; rejected the same way l_plugin_define()
- * rejects a duplicate plugin id. Also rejected: one of the native keys
- * (home_layout_tile_keys[]) -- resolve_home_tiles() (gui_settings.c) checks
- * native keys first, so a plugin tile registered under e.g. "music" would
- * register successfully but never actually be reachable, permanently
- * shadowed by the real Music tile. */
+ * `options.order`. The `icon` parameter is required.
+ * Gated on id not colliding with any of the fixed native tile keys
+ * (home_layout_tile_keys[]). */
 static int l_plugin_register_home_tile(lua_State * L) {
     const char * id = luaL_checkstring(L, 1);
     const char * label = luaL_checkstring(L, 2);
     luaL_checktype(L, 3, LUA_TFUNCTION);
     const char * icon = luaL_checkstring(L, 4);
 
-    /* Length checked here, against the id BEFORE it's ever copied anywhere
-     * -- checking it only after truncating into plugin_tile_t's fixed-size
-     * id[] (as an earlier version of this function did) would let two
-     * different too-long ids that happen to share the same first 39
-     * characters both pass the duplicate check below (each compared in
-     * full against already-truncated stored ids) and then collide once
-     * both are truncated into storage. */
+    /* Validate ID format and maximum length before storage. */
     if (!plugin_id_is_valid(id) || strlen(id) >= sizeof(plugin_home_tiles[0].id)) {
         return luaL_error(L, "plugin.register_home_tile: id must be 1-%zu characters using letters, digits, '.', '_' or '-'",
                            sizeof(plugin_home_tiles[0].id) - 1);
@@ -1427,18 +1400,8 @@ static int l_plugin_set_icon(lua_State * L) {
     const char * source_path = check_plugin_external_path(L, 2, "plugin.set_icon");
 
 #ifndef HOST_BUILD
-    /* Audit finding: relative_path is fully plugin-controlled and used to
-     * be concatenated straight onto PLUGIN_THEME_OVERRIDE_ROOT below with
-     * no sanitization -- "../../../../data/some/file" walks the resulting
-     * dst_path outside that root entirely, and copy_file() then overwrites
-     * whatever it lands on with attacker-controlled bytes: an arbitrary
-     * file WRITE, independent of (and not covered by) the Lua stdlib
-     * sandboxing in sandbox_plugin_lua_state() above, since this is a
-     * native C function reachable straight through the vetted plugin.*
-     * API. Every real caller only ever needs a plain "dir/name.ext" shape
-     * (see this function's own doc comment above) -- reject anything
-     * containing a ".." component or starting with '/' outright, rather
-     * than trying to canonicalize and re-check. */
+    /* Reject absolute paths and directory traversal to constrain writes
+     * within PLUGIN_THEME_OVERRIDE_ROOT. */
     if (relative_path[0] == '/' || strstr(relative_path, "..") != NULL) {
         return luaL_error(L, "plugin.set_icon: relative_path must be a plain path under the theme root, got '%s'",
                            relative_path);
@@ -1544,19 +1507,7 @@ static void get_opt_bool_field(lua_State * L, int idx, const char * field, bool 
     lua_pop(L, 1);
 }
 
-/* Rejects a Lua integer outside int32_t's own range before any narrowing
- * cast down to it -- lua_Integer is 64-bit (LUA_INT_TYPE, luaconf.h);
- * converting an out-of-range value to int32_t is implementation-defined
- * (C11 6.3.1.3p3), and while this toolchain's own behavior (silent 2's-
- * complement truncation) happens to be harmless for every one of this
- * function's own fields -- height/width/tile_gap/row_gap are all re-clamped
- * at their point of use regardless of what garbage a wrap produces (see
- * build_pill_list_screen()/build_icon_grid_screen(), screen_builders.c),
- * and radius is unconditionally clamped by LVGL's own
- * lv_draw_sw_mask_radius_init() -- relying on a downstream clamp to paper
- * over an implementation-defined cast is fragile, and a plugin passing a
- * wildly out-of-range integer is a bug worth a clear error, not a silently
- * "successful" truncation. */
+/* Validates that a 64-bit Lua integer fits within int32_t bounds before casting. */
 static int32_t check_int32_field(lua_State * L, lua_Integer value, const char * fn_name, const char * field) {
     if (value < INT32_MIN || value > INT32_MAX) {
         return (int32_t) luaL_error(L, "%s: %s (%lld) is out of range", fn_name, field, (long long) value);
@@ -2200,12 +2151,7 @@ static int l_plugin_http_post(lua_State * L) {
 typedef struct {
     bool active;
     atomic_bool done;
-    /* http_cancel_token_t is the single source of truth for "was this
-     * cancelled" (checked via http_cancel_token_is_cancelled()) -- no
-     * separate atomic_bool alongside it, which previously risked the two
-     * disagreeing. Also what actually lets l_plugin_cancel() interrupt a
-     * blocked connect/read via shutdown(), not just suppress the eventual
-     * callback (see http_client.h's own comment on http_cancel_token_t). */
+    /* Token tracking cancellation state and allowing socket interrupt via shutdown(). */
     http_cancel_token_t cancel;
     uint16_t generation;
     pthread_t thread;
@@ -2248,17 +2194,8 @@ static bool plugin_async_download_progress(uint64_t downloaded, uint64_t total, 
     return !http_cancel_token_is_cancelled(&req->cancel);
 }
 
-/* Review finding: the {Name = "value", ...} table handed to a plugin's
- * http_request() callback used the server's exact-case header spelling as
- * an exact Lua table key -- "Content-Type"/"content-type" from the same
- * response produced two separate keys instead of one, contradicting the
- * documented case-insensitive "last occurrence wins" behavior (header
- * name lookups are case-insensitive per RFC 7230, but Lua table keys are
- * exact-match). Collapses headers[0..*count) in place so only the LAST
- * occurrence of each case-insensitive name survives, keeping that last
- * occurrence's own spelling -- done once here in C, before anything ever
- * reaches a Lua table, rather than trying to reconcile it against
- * whatever's already in the table key by key. */
+/* Collapses headers in place so only the last occurrence of each case-insensitive
+ * header name is retained when passed to Lua callbacks. */
 static void plugin_dedupe_headers_case_insensitive(http_header_t * headers, int * count) {
     int out = 0;
     for (int i = 0; i < *count; i++) {
@@ -2948,11 +2885,7 @@ static int l_plugin_playlist_delete(lua_State * L) {
  * first_song_id} for an artist/album group. ---- */
 
 static void push_song_row(lua_State * L, const song_row_t * row) {
-    /* Real bug caught in review: pushing row->tags.title verbatim left
-     * "title" blank for any untagged file (confirmed against this device's
-     * own library). metadata_db_song_display_title() falls back to the
-     * file's own basename, same as gui.c's own on-device list screens
-     * already do for the exact same case. */
+    /* Use display title fallback (file basename) for untagged tracks. */
     char display_title[128];
     metadata_db_song_display_title(row, display_title, sizeof(display_title));
 
@@ -3297,13 +3230,7 @@ static bool plugin_id_is_valid(const char * id) {
     return true;
 }
 
-/* Shared by both l_plugin_define() (an explicit id) and load_plugin_file()'s
- * generated "legacy.<filename>" fallback -- checked against every OTHER
- * already-fully-loaded instance regardless of which path assigned its id.
- * Review finding: previously only l_plugin_define() checked for
- * duplicates, so a legacy plugin loaded AFTER another plugin had already
- * explicitly declared the same "legacy.foo" id got no check at all, and
- * could silently share that plugin's storage/secrets namespace. */
+/* Checks whether a plugin ID collides with any already-loaded plugin instance. */
 static bool plugin_id_collides(const char * id, int exclude_slot) {
     for (int i = 0; i < plugin_instance_count; i++) {
         if (i != exclude_slot && plugin_instances[i].defined && strcmp(plugin_instances[i].id, id) == 0) return true;
@@ -3641,9 +3568,7 @@ static const luaL_Reg plugin_secrets_funcs[] = {
 
 static struct timespec plugin_call_deadline_start;
 
-/* Add only time actually spent inside a native function to the deadline.
- * Previously resetting the deadline after every return let an infinite
- * `while true do plugin.sd_root() end` loop evade the watchdog forever. */
+/* Adds time spent executing inside native C functions to the deadline start. */
 static void plugin_call_exclude_native_elapsed(const struct timespec * started) {
     struct timespec ended;
     clock_gettime(CLOCK_MONOTONIC, &ended);
@@ -3702,62 +3627,12 @@ static void register_plugin_api(lua_State * L) {
     lua_setglobal(L, "plugin");
 }
 
-/* Audit finding: luaL_openlibs() grants every plugin's lua_State the full,
- * unrestricted standard library -- os.execute()/io.popen() for arbitrary
- * shell commands, load()/loadstring()/dofile()/require() to pull in and
- * run further arbitrary code, and debug.* (powerful enough to defeat any
- * of the other restrictions below via metatable manipulation). A plugin is
- * just a .lua file dropped into <MUSIC_ROOT_DIR>/.plugins/, no different in
- * trust level from any other file an SD card author could place there, and
- * this codebase already treats SD-card-supplied content as untrusted
- * everywhere else (see the ID3v2/M4A parser hardening and file_browser.c's
- * symlink rejection elsewhere in this same audit).
- *
- * Real-device correction: an earlier version of this function also removed
- * the whole `io` table and os.remove()/os.rename(), reasoning that
- * plugin_funcs' own filesystem API (list_dir()/sd_root()) covered
- * everything a plugin should need -- live testing against the actual
- * installed plugins proved that wrong: all 7 (Audiobooks, Themes,
- * SoundProfiles, PlaybackExtras, LastFmScrobbler, ExtendedSleepTimer,
- * PlayThrough) use io.open() to persist their own small state file under
- * plugin.sd_root() .. "/.plugins/...", and 3 of them use os.remove()+
- * os.rename() for an atomic write-to-.tmp-then-rename -- the exact same
- * pattern this project's own C code uses (see playlist_files.c). Zero
- * installed plugins use os.execute(), io.popen(), load()/dofile()/
- * require(), or debug.* -- only the genuinely dangerous, actually-unused
- * primitives are removed below now: arbitrary shell execution and
- * arbitrary code loading. Plain file I/O and os.remove()/os.rename() stay,
- * since real plugins depend on them and they can't run a shell command or
- * load further code, just read/write/delete/rename whatever path the
- * plugin already had permission to name (same risk class as this app's own
- * file I/O, not a privilege escalation). */
-/* Review finding: 0700/0600 file permissions only defend against a
- * DIFFERENT Unix user/process -- every plugin's lua_State runs in this
- * same process, so plain io.open()/io.lines()/io.input()/io.output()/
- * os.remove()/os.rename() (kept above for real, tested plugin needs)
- * could read, delete, or overwrite ANOTHER plugin's secrets file
- * directly, since its hashed filename is fully deterministic from a
- * known plugin id + key. These six wrappers are the actual isolation
- * boundary for plugin.storage/plugin.secrets: each checks
- * plugin_storage_path_is_reserved() (see its own comment in
- * plugin_storage.h) and refuses any path that resolves into the reserved
- * storage tree, forcing that tree to only ever be touched through the
- * plugin.storage/secrets API. Every other path (SD card, elsewhere on
- * the internal partition) is unaffected -- this is intentionally narrow,
- * not a general filesystem sandbox. The underlying C functions are
- * identical across every lua_State (plain stateless C functions, not
- * per-state closures), so capturing them once here and reusing the same
- * pointers for every plugin is safe.
- *
- * Review finding: io.input(path)/io.output(path) open a named file for
- * the default input/output stream exactly like io.open(), and were
- * initially missed -- a plugin could select another plugin's secrets
- * path via io.input(path) then read it with io.read(), or truncate/
- * overwrite it via io.output(path). Both are guarded the same way, but
- * ONLY when called WITH a filename argument -- io.input()/io.output()
- * with no argument (or a file handle already open, not a path string)
- * just return/set the current default stream and must pass through
- * unchanged. */
+/* Sandboxes the Lua state by removing shell execution (os.execute, io.popen),
+ * dynamic code loading (load, dofile, require), and debug library access.
+ * Retains basic file I/O operations needed by plugins. */
+
+/* Wrappers preventing direct access to reserved plugin storage paths
+ * (plugin_storage_path_is_reserved) via standard io and os library functions. */
 static lua_CFunction real_io_open = NULL;
 static lua_CFunction real_io_lines = NULL;
 static lua_CFunction real_io_input = NULL;
@@ -3900,21 +3775,9 @@ static void plugin_call_timeout_hook(lua_State * L, lua_Debug * ar) {
     }
 }
 
-/* Audit finding: no execution-time limit was ever installed on any plugin
- * lua_State, and every plugin callback (on_open/on_select/timers/event
- * handlers, all 11 lua_pcall() call sites in this file) runs synchronously
- * on the single UI thread -- a plugin containing `while true do end`
- * freezes the whole player indefinitely, needing a hard power-cycle.
- * Wraps lua_pcall() with a wall-clock budget checked every LUA_MASKCOUNT
- * instructions via a debug hook, installed/torn down around each call.
- * The budget is cumulative Lua-busy time: native plugin.* and guarded
- * io/os entry points extend the deadline by exactly their elapsed native
- * duration, without erasing Lua time already consumed.
- * This whole plugin system only ever runs on the UI thread (every
- * lua_State is only ever touched from here), so a single file-static
- * deadline-start variable, reset immediately before each call, is safe --
- * no locking needed. Same signature as lua_pcall() itself, so every
- * existing call site needed only a mechanical rename. */
+/* Executes a Lua protected call with a wall-clock timeout enforced by an
+ * instruction count hook. Time spent in native C functions is added to the
+ * deadline to avoid penalizing I/O. */
 static int plugin_call(lua_State * L, int nargs, int nresults, int errfunc) {
     clock_gettime(CLOCK_MONOTONIC, &plugin_call_deadline_start);
     lua_sethook(L, plugin_call_timeout_hook, LUA_MASKCOUNT, 10000);
@@ -3923,16 +3786,7 @@ static int plugin_call(lua_State * L, int nargs, int nresults, int errfunc) {
     return result;
 }
 
-/* Shared by every load_plugin_file() failure path below -- rolls the
- * hardware-volume-curve transaction back to exactly what was staged
- * before this plugin's own top-level run started (see the snapshot taken
- * at the top of load_plugin_file(), before plugin_call()), then discards
- * the half-loaded instance. A prior version only wired the rollback into
- * the Lua-error failure path, missing the legacy-id-collision refusal
- * entirely -- a real, if narrow (needs a deliberately colliding id), gap
- * in the "every failure rolls back" guarantee this exists to close for
- * good: any new failure path added later only has to call this, not
- * remember to re-duplicate the rollback by hand. */
+/* Discards failed plugin instance and rolls back staged hardware volume curve. */
 static void discard_failed_plugin_load(plugin_instance_t * inst, lua_State * L,
                                         bool prev_curve_active, const uint8_t * prev_curve) {
     audio_stage_custom_hw_volume_curve(prev_curve_active, prev_curve_active ? prev_curve : NULL);
@@ -3956,25 +3810,8 @@ static void load_plugin_file(const char * path) {
     sandbox_plugin_lua_state(L);
     register_plugin_api(L);
 
-    /* Review finding: a plugin can call plugin.set_hw_volume_curve()
-     * successfully early in its own top-level run, then fail on a LATER
-     * call in that same run (e.g. hitting register_list_item()'s row
-     * cap) -- the whole lua_State gets discarded below, but without
-     * rolling the curve state back too, whatever it last set (or cleared)
-     * stayed in effect on a plugin now reported as failed to load. A
-     * blind "clear to native" on failure is its own, more subtle bug: if
-     * an EARLIER, successfully-loaded plugin already had its own curve
-     * active before this one started, that curve -- not native -- is
-     * what failure should restore, and a naive clear would wipe out a
-     * still-valid plugin's own state. Snapshotting the exact STAGED state
-     * (audio_get_staged_hw_volume_curve_state(), not the live state --
-     * see audio_stage_custom_hw_volume_curve()'s own comment in audio.h
-     * for why the two must stay separate) right before this plugin's own
-     * top-level run starts, and restoring that exact snapshot (not just
-     * "off") on failure via discard_failed_plugin_load() above, handles
-     * both. Still no hardware write either way -- plugin_manager_init()
-     * commits the real final value exactly once after every plugin has
-     * finished (re)loading. */
+    /* Snapshot staged hardware volume curve so it can be restored if this
+     * plugin fails to load. */
     bool prev_curve_active;
     uint8_t prev_curve[HW_VOLUME_CURVE_LEN];
     audio_get_staged_hw_volume_curve_state(&prev_curve_active, prev_curve);
@@ -3994,14 +3831,8 @@ static void load_plugin_file(const char * path) {
         snprintf(inst->id, sizeof(inst->id), "legacy.%.*s", (int) sizeof(inst->id) - 8, base);
         char * dot = strrchr(inst->id, '.');
         if (dot && strcasecmp(dot, ".lua") == 0) *dot = '\0';
-        /* Review finding: a generated "legacy.<name>" id was never checked
-         * against ids already claimed by other instances -- an explicit
-         * plugin.define({id="legacy.foo"}) loaded earlier and a plain
-         * foo.lua loaded later would silently share one storage/secrets
-         * namespace. Disambiguate deterministically (same file always
-         * gets the same fallback id across reloads, so storage/secrets
-         * continuity isn't lost) with a hash of the full path rather than
-         * something order- or scan-dependent. */
+        /* If generated legacy ID collides with an existing plugin, append
+         * a deterministic 64-bit hash of the file path to disambiguate. */
         if (plugin_id_collides(inst->id, slot)) {
             uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a 64 */
             for (const char * p = path; *p; p++) { h ^= (unsigned char) *p; h *= 0x100000001b3ULL; }
@@ -4009,15 +3840,6 @@ static void load_plugin_file(const char * path) {
             snprintf(base_no_ext, sizeof(base_no_ext), "%s", base);
             char * base_dot = strrchr(base_no_ext, '.');
             if (base_dot && strcasecmp(base_dot, ".lua") == 0) *base_dot = '\0';
-            /* Review finding: the disambiguated id itself was never
-             * re-checked -- a plugin could deliberately plugin.define() the
-             * exact predictable "legacy.<name>.<hash>" string and, loaded
-             * first, still end up sharing a namespace with the real
-             * legacy plugin. Use the FULL 64-bit hash (not truncated to
-             * 32 bits, to cut accidental-collision risk) and re-check; if
-             * it STILL collides -- now necessarily deliberate, not
-             * accidental -- refuse to load this plugin at all rather than
-             * ever silently sharing a storage/secrets namespace. */
             snprintf(inst->id, sizeof(inst->id), "legacy.%.*s.%016llx",
                      (int) sizeof(inst->id) - 7 - 1 - 16 - 1, base_no_ext, (unsigned long long) h);
             if (plugin_id_collides(inst->id, slot)) {
@@ -4049,27 +3871,7 @@ static int plugin_filename_cmp(const void * a, const void * b) {
  * see the FULL on-disk list before applying their own separate cap
  * (plugin_manager_init() only after filtering out disabled names, so a
  * disabled file's load slot is actually reclaimed; plugin_manager_scan_available()
- * because a UI list enumerates every file on disk, loaded or not).
- *
- * Collected and sorted before any file is actually loaded, rather than
- * calling load_plugin_file() straight from the readdir() loop -- plain
- * directory iteration order is filesystem-dependent (real-device confirmed:
- * it can change after copying or reinstalling files, or between an SD card
- * formatted on different tools/OSes), which made "last-loaded plugin wins"
- * APIs (plugin.set_background_color()/set_text_color()/set_icon()/
- * set_home_layout() -- every one of them a single global slot every plugin
- * writes into) silently nondeterministic whenever two installed plugins
- * both set the same one. Sorting by filename doesn't remove the "last one
- * wins" behavior itself (still genuinely ambiguous which of two theme
- * plugins a user "wants"), but it makes the outcome reproducible and
- * independent of the filesystem, and documented (PLUGINS.md) rather than
- * left to chance.
- *
- * Two passes, not one collected straight into a fixed-size array --
- * collecting into a capped array during a single readdir() pass only sorts
- * whichever entries happened to come first in raw, filesystem-dependent
- * order. Counting first means every eligible name is sorted before any cap
- * is applied. */
+ * Scans and sorts plugin filenames alphabetically to ensure deterministic load order. */
 static char (*scan_plugin_dir_sorted_names(char dir_path_out[600], int * out_count))[256] {
     *out_count = 0;
     snprintf(dir_path_out, 600, "%s/.plugins", MUSIC_ROOT_DIR);
@@ -4263,19 +4065,8 @@ void plugin_manager_cancel_all_async_http(void) {
  * ref; explicit luaL_unref first is only needed for leak-freedom within a
  * state that stays alive, which doesn't apply once it's about to be closed.
  *
- * Resets home_layout_config (gui_plugins.c) back to its unconfigured zero
- * state via gui_plugin_reset_home_layout() -- unlike the shared theme style
- * objects below, home_layout_config is a config struct build_home_screen()
- * only reads at the NEXT rebuild, not a live style property, and set_home_
- * layout()'s own documented contract is that nothing re-calling it before
- * that rebuild means it "reverts to native" (PLUGINS.md). Leaving it alone
- * here would break that promise the moment the plugin that used to call it
- * is removed, disabled, or fails to load on this particular reload --
- * without this reset, build_home_screen() would keep applying the STALE
- * config from whichever plugin set it last time, not revert. plugin.
- * refresh_theme() never reaches this function at all (it doesn't run
- * plugin_manager_deinit()/init()), so a targeted refresh is unaffected --
- * it only ever rebuilds Home from whatever's already configured, live.
+ * Resets home_layout_config back to unconfigured state via gui_plugin_reset_home_layout()
+ * so removed or disabled plugins do not leave stale layouts in effect.
  *
  * Does NOT touch the shared theme style objects (screen_builders.c's
  * style_theme_screen_bg/style_theme_card_bg/list_row_style/pill_row_bg_
@@ -4287,11 +4078,7 @@ void plugin_manager_cancel_all_async_http(void) {
  * as at a normal boot, same as before this change. Also does not touch
  * PLUGIN_THEME_OVERRIDE_ROOT on disk -- that is exactly the icon-override
  * state a reload exists to re-read, not something to clear. */
-/* Temporary investigation instrumentation for the "applying Wavy crashed
- * the device" report -- see gui_reload.c's own reload_diag() for the same
- * pattern/reasoning. Separate file/function here (not reused across
- * translation units) purely to avoid a header change for a diagnostic
- * that's coming back out once this is root-caused. */
+/* Diagnostic logging for plugin deinitialization steps during reload. */
 static void deinit_diag(const char * step) {
     int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd < 0) return;

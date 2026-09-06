@@ -42,17 +42,10 @@ bool gui_navigation_transition_in_progress(void);
 void nav_push(lv_obj_t * scr);
 /* Stack-only counterpart to nav_push() above -- pushes onto the nav stack
  * without calling lv_screen_load()/sync_player_topbar_visibility()/
- * sync_home_indicator_visibility(). For a caller that still has its own
- * settle animation in flight and must not hand the screen over until that
- * animation's own completion callback runs -- see gui_shell.c's
- * interactive player-swipe commit path and slide_transition_done_cb()'s
- * own real lv_screen_load() call. Real-device review finding: that call
- * site used to call plain nav_push(), on the (once-true, now-stale)
- * assumption that nav_push() itself deferred the real screen load --
- * nav_push() started cutting instantly instead (see its own "Live A/B
- * test" comment) without this call site being updated to match, so
- * LV_EVENT_SCREEN_LOAD_START/LOADED/UNLOAD_START/UNLOADED fired up to
- * QUICK_DRAWER_ANIM_MS early, mid-animation. */
+ * sync_home_indicator_visibility(). Used by callers that have their own
+ * settle animation in flight and must not load the screen until the
+ * animation's completion callback runs (e.g. gui_shell.c interactive
+ * player-swipe commit path and slide_transition_done_cb()). */
 void nav_push_stack_only(lv_obj_t * scr);
 void nav_pop(void);
 void nav_remove_stack_slot(int index);

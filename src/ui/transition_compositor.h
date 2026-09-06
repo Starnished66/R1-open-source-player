@@ -33,15 +33,12 @@
  * slide_transition_anim_x_cb() uses (the incoming frame's position relative
  * to the outgoing one).
  *
- * Real-device correctness requirement: the two physical framebuffer pages
- * ping-pong every single frame (this module writes into whichever is
- * currently INACTIVE, then presents it), so a live-aliased `from` would
- * become this module's OWN write target again a couple of frames later --
- * reading it as a source for one frame while it was simultaneously the
- * destination of a slightly different recent one is a genuine overlapping-
- * memcpy hazard, not just a staleness question. gui.c is responsible for
- * always duplicating (never aliasing) whenever this compositor might be
- * used -- see transition_compositor_available().
+ * The two physical framebuffer pages ping-pong every frame (writing into
+ * whichever page is currently inactive, then presenting it). A live-aliased
+ * `from` buffer would overlap with the write destination, causing memory
+ * corruption. Callers must ensure `from` and `to` are independent copies
+ * rather than aliases of active framebuffer memory (see
+ * transition_compositor_available()).
  *
  * On success: takes ownership of the fbdev driver's page presentation
  * (lv_linux_fbdev_begin_external_composition()) and disables LVGL

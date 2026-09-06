@@ -171,34 +171,11 @@ void sync_player_topbar_visibility(lv_obj_t * screen);
  * freshly generated per-track reflection, hence file-scope rather than a
  * local inside build_player_screen(). */
 bool favorite_is_set = false;
-/* Clock, top bar center: real topbar/N.png digit + topbar/colon.png
- * sprites, same asset family as the volume readout below, instead of an
- * lv_label -- switched from font text so it's pixel-identical in size/style
- * to the volume/headphone indicator rather than an approximate font-size
- * match (real-device feedback: "match the size of ... the volume and
- * headphone indicator"). Fixed HH:MM layout, always all 5 slots visible
- * (no leading-zero hiding the way the volume/battery readouts need, since
- * a clock always shows both digits of the hour). */
-/* Settings -> System -> "24-Hour Clock" (current_settings.clock_24h). Extra
- * flex-row child after the 5 digit slots, hidden entirely in 24h mode --
- * topbar/am.png and topbar/pm.png are pre-existing theme assets, unused by
- * any code before this setting. clock_topbar_group is LV_SIZE_CONTENT and
- * center-aligned to the status bar band, so hiding/showing this slot
- * reflows and re-centers the whole clock automatically, same as any other
- * flex child visibility change in this file. */
-/* Volume readout, far left of the status bar: real topbar/N.png digit
- * sprites (theme2 asset set) plus topbar/speaker.png and topbar/po.png
- * (headphone-out glyph), not a text label -- matches the stock player's own
- * top bar exactly (confirmed via a real-device screenshot of the stock
- * `hiby_player` binary: speaker icon, a red-recolored volume number, then a
- * headphone icon, all pinned to the left edge, with the clock centered
- * separately -- our previous layout had guessed a plain lv_label clock at
- * the left edge with the volume group trailing after it, which doesn't
- * match). Up to 3 digit slots for 0-100; unused leading slots are hidden
- * rather than left blank, so the flex row collapses the gap instead of
- * showing empty space before the first significant digit. volume_topbar_headphone
- * is shown/hidden by refresh_headphone_icon() based on real jack-detect
- * state (see headphone_status.h), not always-on. */
+/* Clock, top bar center: topbar/N.png digit and topbar/colon.png sprite widgets
+ * in a fixed HH:MM layout with an optional AM/PM indicator when 12-hour mode is active. */
+/* Volume readout, left edge of status bar: speaker icon, up to 3 digit sprites,
+ * and headphone icon (shown when headphone jack is connected). Leading unused digit
+ * slots are hidden to collapse spacing. */
 
 /* Loud-volume warning color threshold, read once at startup from the stock
  * firmware's own /usr/resource/config.json (see device_config.h) -- e.g. a
@@ -214,16 +191,8 @@ bool favorite_is_set = false;
  * rather than introducing a second, separately-polled source of truth.
  * NULL until build_quick_drawer() runs; every update site guards on that. */
 
-/* Real-device bug report: the drawer's brightness slider/label only ever
- * reflected whatever backlight_get_percent() read back at build_quick_
- * drawer() time (app startup) -- turning the screen off and back on
- * restores the real prior brightness (see backlight_set_screen_on()'s own
- * comment) without this ever re-reading it, so the slider silently drifted
- * out of sync with the real screen brightness on every screen-off/on cycle,
- * not just the one the reset bug above also affected. Called once at build
- * time (build_quick_drawer() itself) and again every time the drawer opens
- * (open_quick_drawer()), so it's never stale by the time the user can
- * actually see it. */
+/* The quick drawer brightness slider and label are refreshed both at build time
+ * and whenever the drawer opens to ensure they match the current screen brightness. */
 
 
 /* Defined with the rest of the Subsonic streaming logic further down;
@@ -298,24 +267,14 @@ static bool screen_off_playback_active = false;
  * going on -- same gating as radio-suspend above (not playing, not
  * charging, no DAC receive mode active) since none of those should ever be
  * interrupted by the device turning itself off. idle_shutdown_attempted
- * guards against retrying every single tick if idle_shutdown_now() doesn't
- * actually terminate the process for some reason (e.g. /sbin/poweroff
- * missing) -- reset on wake so a genuine idle stretch always gets a fresh
- * attempt rather than being permanently given up on after one failure.
+/* Idle shutdown logic:
  *
- * Real-device bug report: turning the screen off while receiving audio via
- * USB DAC (gadget) mode stopped it from receiving audio. Root cause:
- * "no DAC receive mode active" above already covered wifi_dac_mode_enabled/
- * bt_dac_mode_enabled, but USB_MODE_DAC was missing from both this gate
- * and the radio-suspend one above -- and audio_is_playing() can never
- * cover for that gap, since it only reflects audio.c's own local-file
- * playback queue (have_current/paused), completely unaware of usb_dac_
- * bridge.c's independent thread/streaming state. With the screen off and
- * no local track "playing", the device read itself as idle mid-USB-stream
- * and suspended (or, past RADIO_SUSPEND_DELAY_MS, dropped WiFi/Bluetooth --
- * which also breaks usb_dac_bridge_set_bt_output() routing to a Bluetooth
- * accessory) out from under it. Both gates now also check
- * current_settings.usb_mode != USB_MODE_DAC. */
+ * Automatically power off if the device is inactive for a user-defined period
+ * with the screen off. Shutdown is blocked if music is playing, the device is
+ * charging, or if external audio (USB/WiFi/BT DAC) is active.
+ *
+ * In addition to WiFi and Bluetooth DAC modes, USB DAC mode (USB_MODE_DAC)
+ * is checked to prevent idle suspend or radio disconnect while receiving USB audio. */
 static bool idle_shutdown_attempted = false;
 
 
@@ -326,34 +285,12 @@ static bool shutdown_background_work_active(void) {
            plugin_manager_has_background_work() || playlist_files_has_active_write() || gui_player_queue_write_busy();
 }
 
-/* Real-device bug report: waking from suspend needed two power-button
- * presses -- see the resume fixup below (right after power_suspend_now())
- * for the full mechanism. An earlier version of this comment attributed the
- * bug entirely to an unreset LVGL inactivity clock (now fixed by
- * resume_from_suspend_fixups()'s own lv_display_trigger_activity() call)
- * and treated this window as covering only a rare, secondary race -- real
- * diagnostic logging during a live repro instead found this window itself
- * to be the actual remaining cause. hw_buttons.c only sets its
- * short-tap-consumed flag on the button's RELEASE, not the initial press
- * that wakes the kernel (see its own handle_key_event(), value==0 branch) --
- * and a real capture measured 2350ms between this window being armed (right
- * as power_suspend_now() returns, at/near the press that woke the kernel)
- * and that same press's release finally being consumed, comfortably past
- * the old 1000ms budget. Once the window auto-expires "unused," that
- * release is read as a brand new deliberate toggle-off press instead of
- * being recognized as the wake press's own echo -- exactly the "press 1
- * wakes then immediately goes dark, press 2 actually wakes it" report.
- * Raised with real margin above that measured gap. Short grace window, not
- * a one-shot drain: the physical press that wakes the kernel is captured by
- * hw_buttons.c's own independent evdev reader thread, whose timing relative
- * to this (main) thread's own resume handling isn't guaranteed -- a drain
- * attempted too early could miss a flag that thread hadn't set yet. Any
- * power-button press consumed within this window of a resume is treated as
- * an echo of the wake press and silently discarded rather than toggling the
- * screen; a genuinely deliberate second press to go back to sleep right
- * after waking landing inside this now-longer window is a rarer, but
- * real, tradeoff accepted in exchange for the wake press itself no longer
- * routinely misfiring. */
+/* Grace window after resuming from suspend. hw_buttons sets its short-tap flag
+ * on button release (handle_key_event, value==0). The physical button press that
+ * wakes the kernel from suspend is read asynchronously by the evdev thread,
+ * and its release event can be consumed after power_suspend_now() returns.
+ * Any power-button press consumed within this window is treated as an echo of
+ * the wake press and discarded to avoid toggling the screen back off. */
 #define RESUME_POWER_DRAIN_WINDOW_MS 3000
 static uint32_t resumed_from_suspend_tick = 0;
 static bool resumed_from_suspend_pending = false;
@@ -401,15 +338,8 @@ static void apply_screen_runtime_state(bool screen_on) {
 #endif
 }
 
-/* Everything a caller of power_suspend_now() needs to do immediately after
- * it returns, factored out so Car Mode (below) can share it with the
- * idle-shutdown "suspend instead of power off" path this was originally
- * written for -- see that call site's own comment for the full history of
- * each individual fixup (backlight/indev resync, the inactivity-timer
- * flash-on-then-off bug, the two-presses-to-wake bug). Doesn't call
- * power_suspend_now() itself: the two callers gate entry into suspend
- * differently (a screen-off idle timer vs. a charging-edge transition), so
- * each still makes that call directly, right before calling this. */
+/* Restores backlight, input devices, and inactivity timer state immediately
+ * after waking from suspend. Shared between idle-shutdown and Car Mode suspend paths. */
 static void resume_from_suspend_fixups(void) {
     backlight_set_screen_on(true);
     apply_screen_runtime_state(true);
@@ -435,21 +365,8 @@ static void resume_from_suspend_fixups(void) {
  * down -- forward-declared here since update_timer_cb() (just below) polls
  * it every tick, same as poll_cover_decode()/poll_lyrics_load(). */
 
-/* Settings -> Playback -> Play/Pause Button (current_settings.
- * play_pause_button_mode). Mode 2 needs to tell a single press apart from
- * the first half of a double-click, so it defers the decision behind a
- * short timer -- same reset-then-resume idiom as TEXT_ENTRY_MULTITAP_MS
- * further down in this file -- rather than acting immediately; modes 0 and
- * 1 fire with zero added latency since there's nothing to disambiguate.
- * Real-device incident: update_timer_cb only polls hw_buttons every 500ms
- * (see its own lv_timer_create() call), so a click that straddles two poll
- * windows can show up here up to ~500ms later than the physical press that
- * caused it -- on top of the real gap between the two clicks themselves.
- * hw_buttons_consume_play_pause() returning a count instead of a bool
- * (see hw_buttons.c) already makes a double-click landing inside a single
- * poll window resolve immediately with no timer involved at all; this
- * window only needs to cover the slower, poll-straddling case, hence the
- * headroom above the 500ms poll period itself. */
+/* Physical play/pause button handler. In double-click mode (mode 2), a timer
+ * window disambiguates single presses from double clicks across poll cycles. */
 #define PLAY_PAUSE_DOUBLE_CLICK_MS 700
 static lv_timer_t * play_pause_click_timer = NULL;
 static int play_pause_click_count = 0;
@@ -516,19 +433,8 @@ static void update_timer_cb(lv_timer_t * timer) {
     for (int i = 0; i < played_paused_count; i++) {
         handle_physical_play_pause_press();
     }
-    /* Real-device bug report: shuffle "sometimes shuffles, sometimes just
-     * plays the next song," and physical-button skip never shuffled at all.
-     * Root cause -- this block used to step playlist_index by a plain +-1
-     * regardless of play mode, rather than going through
-     * compute_manual_step_index() (the same shuffle-aware/repeat-all-wrap
-     * logic the touchscreen Prev/Next buttons already used, further down in
-     * next_btn_event_cb/prev_btn_event_cb) -- so a physical button press
-     * always played the literal next track in playlist order no matter what
-     * current_settings.play_mode was. In Shuffle mode specifically, the
-     * *touchscreen* buttons genuinely did shuffle every time; the
-     * "sometimes" in the report was almost certainly this exact
-     * inconsistency between the two input paths, not real randomness in
-     * the shuffle logic itself. */
+    /* Physical skip buttons use gui_player_step_manual() so shuffle and repeat
+     * modes are respected consistently with on-screen transport controls. */
     bool skipped_next = hw_buttons_consume_next();
     if (skipped_next) {
         gui_player_step_manual(1);
@@ -539,14 +445,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     }
 
 #ifndef HOST_BUILD
-    /* Bluetooth accessory's own play/pause/next/previous buttons -- same
-     * "background thread sets a flag, this is the one thread allowed to
-     * touch LVGL/playlist state" pattern as the physical hw_buttons above,
-     * since bt_media_player.c's D-Bus dispatch runs on its own thread. Now
-     * shares the same shuffle-aware compute_manual_step_index() stepping as
-     * hw_buttons and the touchscreen buttons -- see the shuffle bug comment
-     * just above; a remote's buttons should behave like every other
-     * "skip" input, not bypass play mode entirely. */
+    /* Bluetooth accessory controls dispatch to UI/player state on this thread. */
     if (bt_media_player_consume_play_pause()) {
         toggle_play_pause();
     }
@@ -673,31 +572,9 @@ static void update_timer_cb(lv_timer_t * timer) {
      * machine's own speakers are the actual output regardless of this
      * app's simulated jack/BT state. */
 #ifndef HOST_BUILD
-    /* Real-device bug report: "Bluetooth dropping connection randomly."
-     * refresh_bt_icon_result_a2dp_connected comes from a subprocess-backed
-     * poll (bluealsa-cli list-pcms, gated on bt_control_is_powered()) that
-     * this file's own Bluetooth wedge-recovery logic (see
-     * bt_control_recover_wedged_daemon()'s doc comment) already documents,
-     * with a real-device strace to back it up, as prone to a single false
-     * "not connected"/"No default controller" reading during a normal,
-     * several-second-long bluetoothd/bluealsa busy window -- not a genuine
-     * disconnect. That existing recovery logic requires several CONSECUTIVE
-     * failures (TIMEOUT_RECOVERY_THRESHOLD) before concluding it's a real
-     * wedge, specifically to filter out that blip. This auto-stop check
-     * used to have no such filter at all -- a single bad poll cut playback
-     * immediately, which is a far more likely explanation for "random"
-     * drops than the radio itself actually losing the connection.
-     *
-     * Debounced on wall-clock time (not a "how many ticks in a row" counter
-     * -- refresh_bt_icon_result_a2dp_connected only actually changes value
-     * once every ~5s poll cycle, so counting 500ms update_timer_cb ticks
-     * would just recount the same stale reading many times over) rather
-     * than the raw signal, and only the Bluetooth half: headphone_is_
-     * connected() is a direct, instant sysfs read with no such ambiguity,
-     * so a wired jack pull still pauses playback immediately, unchanged --
-     * this debounce only ever gated the Bluetooth reading going into the
-     * same shared output_connected/audio_toggle_pause() check below, which
-     * a wired pull reaches exactly the same way BT does. */
+    /* Bluetooth disconnect is debounced on wall-clock time (12s) to prevent
+     * transient bluealsa-cli busy polling failures from falsely cutting playback.
+     * Wired headphone disconnects remain immediate via direct sysfs reads. */
 #define BT_OUTPUT_DISCONNECT_DEBOUNCE_MS 12000
     {
         static uint32_t bt_disconnected_since_tick = 0; /* 0 = currently connected (or never sampled) */
@@ -729,26 +606,11 @@ static void update_timer_cb(lv_timer_t * timer) {
              lv_tick_elaps(bt_disconnected_since_tick) < BT_OUTPUT_DISCONNECT_DEBOUNCE_MS);
 
         static bool last_output_connected = true; /* starts true so nothing fires before any real state has been sampled */
-        /* Real-device review finding (R3 Pro II): the plain "headset" jack
-         * and the balanced jack are two independent switch_dev detection
-         * paths on this board (sa_sound_switch.ko's own sass_headset_ and
-         * sass_balance_ parameter groups, HARDWARE_DRIVERS.md) */
+        /* Headphone detection covers both single-ended and balanced jacks. */
         bool output_connected = get_headphone_state() != HEADPHONE_STATE_NONE || bt_connected_debounced;
-        /* Real-device bug report: this used to call audio_stop() -- not
-         * audio_toggle_pause() -- on a disconnect. audio_stop() (audio.c)
-         * doesn't just silence output: its playback thread fully unwinds
-         * the current track (decoder_close(), free()s the path, have_current
-         * = false), the same as if the user had never opened it. That left
-         * no way to resume once reconnected -- confirmed by a live test
-         * report ("stops the music, instead of pause, so it can't be
-         * resumed later"). audio_toggle_pause() keeps the decoder/position
-         * intact and is what toggle_play_pause() itself already uses for an
-         * ordinary pause tap, so resuming afterward (headphones reconnected,
-         * tap play) picks up exactly where it left off. Only fires while
-         * actually playing -- audio_is_paused() removed from the trigger
-         * condition entirely, since toggling pause on an ALREADY-paused
-         * track would incorrectly resume it into a dead/disconnected
-         * output, the opposite of what this is for. */
+        /* Pause playback on disconnect while preserving decoder and position
+         * so playback can resume when an output is reconnected. Only triggers
+         * if audio is actively playing to avoid toggling an already-paused track. */
         bool was_playing = audio_is_playing();
         if (last_output_connected && !output_connected && was_playing) {
             DBG_LOG("gui: output disconnected while playing -- pausing playback\n");
@@ -759,59 +621,21 @@ static void update_timer_cb(lv_timer_t * timer) {
         last_output_connected = output_connected;
     }
 
-    /* R3 Pro II balanced-output routing -- see audio_output_sync_balanced_
-     * output()'s own doc comment. Deliberately its own standalone call, not
-     * folded into the auto-stop block above: that block's debounce/wedge-
-     * recovery logic is delicate and already carries several real-device
-     * bug-fix histories, and this is unrelated, purely additive behavior
-     * (a genuine no-op on R1/host) that doesn't need to share any of that
-     * state. Cheap enough (one sysfs read, one cached mixer lookup) to run
-     * every tick, same cadence as get_headphone_state() above. */
+    /* Synchronize balanced output routing for hardware supporting balanced jacks. */
     audio_output_sync_balanced_output();
 #endif
 
-    /* Car Mode (Settings toggle, off by default). Matches the stock
-     * firmware's own real behavior (confirmed by real-device report):
-     * unplugging power (car ignition off) checkpoints position and powers
-     * the device off; plugging power back in (ignition on) powers it back
-     * on and auto-resumes the same track/position (see gui_init()'s
-     * resume-on-launch block, below).
+    /* Car Mode:
+     * When external power is disconnected, save current playback position and
+     * power off the device (idle_shutdown_now()). When power returns, the device
+     * boots and auto-resumes playback.
      *
-     * Reworked back to a full poweroff (idle_shutdown_now()) rather than
-     * power_suspend_now() -- an earlier version of this used suspend-to-RAM
-     * for a near-instant resume with no boot splash, but real-device
-     * testing found two problems with that neither had a fix: suspend
-     * never actually woke back up when power returned (this board's
-     * PMIC/kernel wakeup-source support for VBUS insert, as opposed to a
-     * power-button press, couldn't be confirmed -- see this function's own
-     * prior git history for the sysfs probe that would be needed), and
-     * suspending with an actively-connected Bluetooth output could reboot
-     * the device outright. A full poweroff sidesteps both: /sbin/poweroff
-     * and a cold power-on are both already proven-reliable on this
-     * hardware (idle_shutdown_now() itself already uses poweroff as its
-     * own default, for the same jzfb suspend/resume reason -- see
-     * idle_shutdown.h), at the cost of a real boot splash + library check
-     * on every resume instead of an instant one.
+     * External power presence is edge-triggered using physical power supply state
+     * rather than battery charging status (which may report discharging when charge
+     * limiter holds at 85%). Power removal must persist for three consecutive 500ms
+     * control ticks to filter transient fluctuations.
      *
-     * Edge-triggered on physical external power, not battery_is_charging().
-     * The 85% limiter disables the PMIC charger while leaving the cable
-     * connected, which can make battery status say "Discharging" and used
-     * to trigger a shutdown/resume boot loop.  The physical-power API reads
-     * non-battery power_supply "online" nodes and returns UNKNOWN on an
-     * ambiguous/read-failure sample; UNKNOWN never counts as unplugging.
-     *
-     * A real removal must also persist for three consecutive 500ms control
-     * ticks before it becomes an edge.  This filters driver churn while a
-     * USB supply is settling without making ignition-off shutdown feel
-     * substantially delayed.  charge_limiter_is_holding() is only a
-     * fallback for an UNKNOWN physical sample: while holding, an ambiguous
-     * read is conservatively kept on the powered side rather than allowed
-     * to advance a destructive shutdown decision.
-     *
-     * Still gated on something actually being loaded
-     * (audio_is_playing() || audio_is_paused()) -- no track loaded means
-     * nothing to "continue playing," so no reason to force a shutdown
-     * cycle. Target-only, same reasoning as the auto-stop block above. */
+     * Only triggers if a track is actively playing or paused. */
 #ifndef HOST_BUILD
     {
         enum { CAR_POWER_REMOVAL_DEBOUNCE_POLLS = 3 };
@@ -874,37 +698,18 @@ static void update_timer_cb(lv_timer_t * timer) {
     }
 #endif
 
-    /* Auto screen-timeout. Physical button presses don't go through LVGL's
-     * own indev system at all (see hw_buttons.h's own comment on why this
-     * needs a raw evdev thread), so lv_display_get_inactive_time() alone
-     * would only track touches -- feed it button activity too via
-     * lv_display_trigger_activity(), or a session spent purely skipping
-     * tracks would still auto-sleep the screen despite being actively used.
-     * This only delays the NEXT auto-sleep, though -- it deliberately does
-     * NOT wake an already-off screen (see the power-button block below for
-     * why: touches don't either, real-device feedback was that a screen
-     * meant to be off shouldn't relight itself from a pocket touch/bump,
-     * only a deliberate power-button press should turn it back on). */
+    /* Feed button activity into the inactivity clock so physical button presses
+     * delay auto-timeout during active use without waking an already-off screen. */
     if (played_paused_count > 0 || skipped_next || skipped_prev || volume_delta != 0) {
         lv_display_trigger_activity(NULL);
     }
 
     bool screen_was_on = backlight_screen_is_on();
 
-    /* The ONLY way the screen turns back on, whether it went off from the
-     * auto-timeout below or a previous manual power-button press -- deliberately
-     * not touch, and not the hw button presses above either, even though both
-     * feed the same LVGL inactivity clock: real-device feedback was that
-     * touching a screen that's meant to be off (auto-timeout or manual) was
-     * turning it back on, which isn't the expected "screen off means off
-     * until you explicitly wake it" behavior. Applied here rather than
-     * straight from the hw_buttons reader thread so the backlight toggle and
-     * the LVGL inactivity clock (used below for the auto-timeout check)
-     * update atomically on this thread -- toggling the backlight from the
-     * other thread without also resetting the inactivity clock left it stuck
-     * expired, so the auto-timeout check just below immediately re-fired and
-     * turned the screen straight back off on the very next tick, a
-     * press-to-wake that looked like a frozen black screen. */
+    /* Screen wake is triggered only by the power button; touch and other hardware
+     * buttons do not wake the display. The backlight toggle and inactivity clock
+     * reset are performed together on this thread so the display does not immediately
+     * re-expire on the next tick. */
     if (resumed_from_suspend_pending && lv_tick_elaps(resumed_from_suspend_tick) >= RESUME_POWER_DRAIN_WINDOW_MS) {
         DBG_LOG("resume: grace window expired unused at tick=%u\n", lv_tick_get());
         resumed_from_suspend_pending = false;
@@ -937,17 +742,9 @@ static void update_timer_cb(lv_timer_t * timer) {
         if (resumed_from_suspend_pending) {
             resumed_from_suspend_pending = false;
         } else {
-            /* Real-device bug report: the countdown popped up invisibly if
-             * the screen was already asleep (from timeout or a previous
-             * short tap) when the hold crossed the long-press threshold --
-             * lv_display_trigger_activity() alone only resets the
-             * inactivity clock, it doesn't touch the backlight. Explicit
-             * backlight_set_screen_on(true) here (unconditional, same
-             * idiom as resume_from_suspend_fixups()'s own wake-up) makes
-             * screen_on_now below come out true, which is what already
-             * drives lv_indev_enable(NULL, true) further down -- so this
-             * also re-enables touch for the Cancel button, not just the
-             * backlight. */
+            /* If screen is asleep when long-press threshold is reached, wake the
+             * backlight and reset inactivity so the countdown dialog and touch
+             * controls are visible and active. */
             backlight_set_screen_on(true);
             lv_display_trigger_activity(NULL);
             start_power_off_countdown();
@@ -961,19 +758,9 @@ static void update_timer_cb(lv_timer_t * timer) {
         if (screen_inactive_ms > interactive_age_ms) screen_inactive_ms = interactive_age_ms;
     }
     bool screen_on_before_timeout = backlight_screen_is_on();
-    /* Reading lyrics while a track is actually playing is real, continuous
-     * screen use with little or no touch activity to keep resetting LVGL's
-     * own indev-driven inactivity clock (screen_inactive_ms above) --
-     * exempt this screen from both dimming and the full auto-timeout
-     * entirely, the same lv_screen_active()-gated exclusion shape already
-     * used for gui_network_get_bt_dac_overlay()/gui_network_get_usb_dac_overlay() elsewhere in
-     * this file (e.g. poll_quick_drawer_drag()'s own gesture exclusions),
-     * rather than trying to synthesize fake touch activity to fool the
-     * shared clock. Paused, though, is no different from sitting on any
-     * other screen not actively being read/watched -- real-device feedback
-     * was explicit that timeout/dim/suspend should behave normally then,
-     * not stay suppressed just because the lyrics view happens to still be
-     * open. */
+    /* Exempt lyrics view from dimming and timeout while audio is playing so lyrics
+     * remain readable without requiring continuous touch input. When paused, normal
+     * timeout applies. */
     bool lyrics_screen_active = lv_screen_active() == gui_lyrics_get_screen() && audio_is_playing();
     if (current_settings.screen_dimming_enabled && screen_on_before_timeout &&
         !inactivity_dimmed && !lyrics_screen_active && screen_inactive_ms >= SCREEN_DIM_AFTER_MS) {
@@ -1003,60 +790,11 @@ static void update_timer_cb(lv_timer_t * timer) {
     bool screen_just_woke = screen_on_now && (!screen_was_on || force_screen_just_woke);
     if (screen_just_woke) force_screen_just_woke = false;
 
-    /* Touch input, not just the backlight, needs to follow screen on/off --
-     * real-device feedback: a touch on a screen that's meant to be off was
-     * both relighting it (fixed above, by no longer waking on plain
-     * activity) AND, independent of that, still being delivered to whatever
-     * was underneath in the dark (a blind touch could still press a button
-     * or navigate a screen the user can't see). Disabling every indev while
-     * off blocks both: LVGL never processes the touch at all, so there's
-     * nothing left to wake the screen OR act on. Physical hardware buttons
-     * are unaffected -- hw_buttons.c reads them on its own raw evdev thread
-     * outside LVGL's indev system entirely, so play/pause/skip/volume/power
-     * keep working with the screen dark, matching a normal DAP. */
+    /* Touch input and display refresh follow screen on/off state. Disabling indev
+     * devices when screen is off prevents accidental touch events. Physical buttons
+     * continue operating via their dedicated evdev thread. */
     if (screen_on_now != screen_was_on) {
         apply_screen_runtime_state(screen_on_now);
-
-        /* NEXT_TODO_IMPLEMENTATION_PROMPT.md Task 1 -- pause LVGL's own
-         * display-refresh timer while the backlight is off: nothing on
-         * screen can be seen, so there is no reason to keep re-rendering
-         * (or even re-checking for invalidated areas) at anywhere near its
-         * normal cadence. update_timer_cb() (this very function) is NOT
-         * this timer -- it's registered completely separately in
-         * gui_init() and keeps running every 500ms regardless of this,
-         * which is what still services hardware buttons, charging,
-         * hotplug, and async-job completion while dark (see this
-         * function's own body for the full list). Resumed the moment the
-         * screen comes back on, together with invalidating the active
-         * screen and both persistent layers so the very first visible
-         * frame after waking is already fully correct (current track/
-         * position, battery/charge, Wi-Fi/BT, volume, album art, topbar
-         * visibility) rather than showing whatever was on screen right
-         * before it went dark. The invalidation itself is deferred one
-         * async tick (full_redraw_async_cb, shared with slide_transition_
-         * anim_x_cb()'s own compositor-failure recovery -- see its own
-         * comment), not called inline here -- this function is itself
-         * already running from inside the SAME lv_timer_handler() pass
-         * that would need to service that redraw, and forcing a
-         * synchronous re-entrant refresh from inside a timer callback is
-         * exactly the kind of reentrancy this codebase has already hit
-         * real bugs from elsewhere -- lv_async_call() runs within this
-         * same lv_timer_handler() invocation, just after all timers
-         * finish, which is still effectively immediate. */
-        /* Real-device finding: pausing the display-refresh timer alone did
-         * NOT reduce main-loop wakeup frequency at all -- confirmed via
-         * UI_PERF_TRACE, the loop kept waking ~65 times/second with the
-         * screen off, just doing far less work per wakeup (avg handler time
-         * dropped from ~250-500us to ~15-45us, but the WAKEUP ITSELF still
-         * costs power regardless of how little work it does once awake).
-         * Root cause: lv_indev_enable(NULL, false) above only suppresses
-         * event dispatch -- each registered indev (the touchscreen here)
-         * has its OWN separate periodic read timer (lv_indev_get_read_
-         * timer(), created internally by LVGL alongside the indev itself)
-         * that keeps polling on its own default ~16-33ms period regardless
-         * of whether the indev is enabled. Pausing that too, for every
-         * registered indev, is what actually lets the idle-cap change in
-         * main.c matter. */
     }
 
     if (screen_just_woke) {
@@ -1075,17 +813,9 @@ static void update_timer_cb(lv_timer_t * timer) {
              * began. */
             screen_off_since_tick = lv_tick_get();
         } else if (screen_off_playback_active && !playing_now_for_idle) {
-            /* Real-device bug report: playback that continued past the
-             * screen going dark (e.g. a long album) reaching the end of the
-             * queue could suspend/poweroff the device on the very next tick
-             * instead of waiting a full RADIO_SUSPEND_DELAY_MS/
-             * idle_shutdown_minutes window -- because both clocks below are
-             * measured from screen_off_since_tick (when the SCREEN went
-             * off), which had already elapsed past the threshold while
-             * audio_is_playing() was gating them off. Restart the clock the
-             * moment playback actually stops, so the device only sleeps
-             * after being genuinely idle (screen off AND silent) for the
-             * configured duration, not merely screen-off. */
+            /* If playback ended while the screen was already off, restart the idle
+             * timer from this moment so radio suspend and idle shutdown wait for
+             * the full configured delay after playback stops. */
             screen_off_since_tick = lv_tick_get();
         }
         screen_off_playback_active = playing_now_for_idle;
@@ -1104,38 +834,9 @@ static void update_timer_cb(lv_timer_t * timer) {
         }
 
 #ifdef TEST_BUILD_TAG
-        /* Diagnostic-only, for the "battery drain at idle" investigation:
-         * shutdown_background_work_active() gates BOTH radio-suspend above
-         * and idle-shutdown/suspend below -- if any one of its 8 sources
-         * stays stuck reporting "busy" (e.g. a worker thread whose done-flag
-         * never got cleared after a batched reload or a cancelled scan), the
-         * device never even attempts suspend while idle, staying fully
-         * awake (CPU, display controller, everything) instead of merely
-         * failing to sleep once it tries -- a larger drain than either the
-         * wakeup-IRQ or failed-suspend-write hypotheses covered in
-         * power_suspend.c's own diagnostics. The whole block, not just the
-         * DBG_LOG call, is gated on TEST_BUILD_TAG: shutdown_background_
-         * work_active() calls all 8 subsystem checks, and a production
-         * build has no reader for the result, so it shouldn't pay for that
-         * every 500ms tick the screen is off. Only starts checking once a
-         * still-pending action's deadline has actually elapsed -- normal
-         * short-lived artwork/network work finishing before then is
-         * expected, not a bug, and warning immediately on screen-off would
-         * just be a false positive on every idle session. This distinction
-         * also matters after the radios are already suspended: background
-         * work cannot be called an idle-action blocker until that separate
-         * configured deadline is due, and never when idle shutdown is off.
-         * The 8 flags are snapshotted once into locals and reused for both
-         * the aggregate check and the printed breakdown, rather than calling
-         * shutdown_background_work_active() and then the 8 individual
-         * functions again separately -- a worker finishing in between the
-         * two evaluations could otherwise produce a "blocked" log line
-         * whose own breakdown shows all zeros. Throttled hard (once per
-         * ~30s) on top of that since this can still fire every tick while
-         * something stays genuinely stuck. Read-only, same reasoning as
-         * power_suspend.c's additions: no real-device access from here to
-         * know which of the 8 (if any) is the actual culprit, so this only
-         * measures it rather than guessing which to "fix". */
+        /* Diagnostic logging for idle suspend/shutdown blockers. When an idle
+         * deadline expires but background work is active, log which subsystems
+         * are reporting busy (throttled to once every 30s). */
         uint32_t idle_elapsed_ms = lv_tick_elaps(screen_off_since_tick);
         bool radio_suspend_due = !radios_suspended && idle_elapsed_ms >= RADIO_SUSPEND_DELAY_MS;
         bool idle_action_due = !idle_shutdown_attempted && current_settings.idle_shutdown_enabled &&
@@ -1180,45 +881,8 @@ static void update_timer_cb(lv_timer_t * timer) {
             if (current_settings.idle_suspend_enabled) {
                 power_suspend_now();
 
-                /* Real-device bug report: after resuming from suspend, the
-                 * backlight itself came back on (the kernel's own fbdev/
-                 * backlight power-notifier chain does that automatically in
-                 * response to power_suspend_now()'s raw `/sys/class/
-                 * graphics/fb0/blank` write) but the UI itself was never
-                 * visible again -- confirmed root cause: that raw sysfs
-                 * write completely bypasses this app's OWN screen-on state
-                 * (backlight.c's screen_on static, only ever flipped by
-                 * backlight_set_screen_on()) and this function's own
-                 * indev-enable logic just above, which only reacts to a
-                 * screen_on_now/screen_was_on transition it detects BETWEEN
-                 * ticks -- but both are read from the exact same
-                 * backlight_screen_is_on() call, so flipping that state
-                 * mid-tick here (rather than waiting for a real transition
-                 * to be observed across two separate ticks) would never be
-                 * seen as an "edge" and that logic would never fire again.
-                 *
-                 * Also folds in one of two fixes for a related real-device
-                 * report -- waking from suspend needed two power-button
-                 * presses, the first visibly flashing the backlight on then
-                 * straight back off. First cause: lv_display_get_inactive_time(NULL),
-                 * read by the auto-screen-timeout check just below, is fed
-                 * only by lv_display_trigger_activity() calls, none of which
-                 * happen anywhere during the entire suspend duration (the
-                 * whole app, including this timer, is frozen) -- so the
-                 * instant the screen is force-enabled, that check could see
-                 * an inactivity duration spanning the sleep and immediately
-                 * flip the screen back off again on this same tick.
-                 * Resetting it explicitly here (lv_display_trigger_activity()
-                 * below) fixes that half. A second, independent cause
-                 * remained even with that fix: RESUME_POWER_DRAIN_WINDOW_MS's
-                 * own grace window (see its comment, right above
-                 * resume_from_suspend_fixups()) was too short relative to
-                 * how late the wake press's own RELEASE (not its down edge)
-                 * gets consumed -- confirmed by real diagnostic logging
-                 * during a live repro, not by inspection alone.
-                 *
-                 * See resume_from_suspend_fixups()'s own comment for why
-                 * this is shared with Car Mode's own suspend call below. */
+                /* Restore UI state and reset inactivity timers on resume so the
+                 * display does not immediately time out again. */
                 resume_from_suspend_fixups();
 
                 /* Unlike idle_shutdown_now() (which never returns --
@@ -1354,54 +1018,17 @@ static uint32_t boot_splash_start_tick = 0;
  * not extend this global wait; gui_shell.c tracks its readiness separately. */
 #define BOOT_SPLASH_MIN_DISPLAY_MS 1000
 
-/* Task #44 (stock-UX request): the stock firmware holds its own boot image
- * on screen for a few seconds after the very first kernel/bootloader logo
- * (S11jpeg_display_shell), before its player is interactive -- this app had
- * no equivalent, racing straight into screen-building and Bluetooth polling
- * within ~2s of process start. Called from main.c immediately after the
- * framebuffer is ready, before any of gui_init()'s own (much heavier) setup
- * work, so this is the very first thing this app ever paints, and so the
- * elapsed-time math in gui_init()'s own wait (see boot_splash_start_tick's
- * use below) is measured from as close to true process start as possible.
+/* Displays the boot splash image immediately after framebuffer initialization.
  *
- * Uses asset_path("boot_animation/en/0.jpg"), the same baseline-JPEG file
- * the bootloader itself draws (src/bootloader/main.c's BOOTLOADER_BG_PATH),
- * rather than the source 0.png sibling -- real-device testing showed a
- * visible pop at the handoff pan-swap when this screen decoded the PNG:
- * pixel-identical regions of the same artwork still differ by up to ~65/255
- * per channel against the bootloader's JPEG re-encode (block-edge/gradient
- * artifacts from that lossy pass), which reads as a flicker at the instant
- * the display pans to this screen's page even though the pan itself is
- * atomic. Decoding the exact same file (LV_USE_TJPGD, already enabled)
- * makes this repaint byte-for-byte identical to what was already on
- * screen, so the swap is invisible.
+ * Uses asset_path("boot_animation/en/0.jpg"), matching the JPEG drawn by the
+ * bootloader to provide a seamless visual handoff without decode discrepancies.
  *
- * This app's own THEME_ROOT (theme2) has no boot_animation asset at all --
- * only theme1 does, and that file is the stock "HIBY" wordmark, which this
- * project deliberately doesn't ship (see 89d7ca6d9, "rename app off the
- * HiBy trademark"). asset_path()'s existing THEME_OVERRIDE_ROOT check
- * (assets.c) means a non-trademarked replacement dropped at
- * /usr/data/theme_overrides/boot_animation/en/0.jpg is picked up
- * automatically with no code change or reflash. Until that file exists,
- * the underlying decode simply fails and lv_image renders nothing --
- * SCREEN_BG_COLOR alone still gives a clean black screen instead of
- * whatever the framebuffer previously held, so this is safe either way.
+ * An override placed at /usr/data/theme_overrides/boot_animation/en/0.jpg is
+ * picked up automatically via asset_path(). If the file does not exist,
+ * SCREEN_BG_COLOR provides a clean black background.
  *
- * Real-device bug report: the status bar (build_status_bar(), and every
- * other overlay this app builds the same way -- popups, quick drawer,
- * volume popup) parents itself onto lv_layer_top(), LVGL's global overlay
- * layer that renders above whichever screen is active *regardless* of
- * lv_screen_load() -- it's not scoped to gui_shell_get_home_screen() at all. Since
- * gui_init() builds the status bar (and starts populating its icons) while
- * this splash is still the loaded screen, it was appearing on top of the
- * splash within about a second of boot, well before gui_init()'s own
- * settle-wait even finished -- reading as "the splash barely showed" even
- * though the splash screen object itself stayed loaded for the full
- * BOOT_SPLASH_MIN_DISPLAY_MS (confirmed via boot_debug.log timestamps).
- * Hiding the whole top layer here and revealing it once gui_init()'s wait
- * is done (see its own call site further below) keeps every one of those
- * overlays off-screen for exactly as long as the splash itself is up,
- * without needing to touch each overlay builder individually. */
+ * lv_layer_top() is hidden while the splash is displayed so status bar icons
+ * and overlays built during gui_init() do not appear until the splash finishes. */
 void gui_show_boot_splash(void) {
     boot_splash_start_tick = lv_tick_get();
 
@@ -1550,27 +1177,6 @@ char ** gui_plugin_get_next_album_tracks(const char * artist, const char * curre
  * allocation per genuinely stuck path for the life of the process, which
  * only happens on real filesystem corruption -- a bounded cost, and far
  * better than the whole UI freezing. */
-/* Real-device bug report: a library of a few thousand tracks spread across
- * many subfolders (nested Artist/Album directories on a plain SD card
- * labeled "Music") scanned as completely empty -- no error shown anywhere
- * a real deployment could surface one (stderr has no reader outside a
- * TEST_BUILD_TAG debug session, see debug_log.h), just a silently empty
- * library. Root cause: this used to be a flat wall-clock budget for the
- * ENTIRE recursive walk (file_browser.c's scan_all_songs_recursive()) --
- * fine for the genuine-corruption case it was built for (a single lstat()
- * stuck in an uninterruptible kernel wait, same reasoning as
- * LIBRARY_SCAN_FILE_TIMEOUT_MS above), but it couldn't tell that apart from
- * a large, healthy, deeply-nested library on a slow card just legitimately
- * taking longer than the flat budget to finish readdir()+lstat() on every
- * entry -- the whole scan was discarded either way. Now a stall timeout
- * instead (see the progress-counter poll loop below): as long as
- * file_browser_scan_all_songs() keeps making forward progress (any real
- * directory entry examined, not just playable files -- see its own
- * progress parameter's doc comment in file_browser.h), no matter how long
- * the walk takes in total, it's never treated as stuck. Only a stretch of
- * this many ms with zero new progress -- the actual "something is
- * genuinely wedged" signal -- gives up. */
-
 /* Library scan moved to gui_library.c */
 
 /* Search bindings and the All Songs, Recently Added, and grouped-song
@@ -1608,22 +1214,9 @@ typedef struct {
 
 
 
-/* DLNA/UPnP-AV cast-and-play -- see dlna_control.h for the full mechanism
- * (dmrd relays SetAVTransportURI/Play/Stop over an undocumented socket;
- * this module downloads the cast URL and hands it to the normal local
- * playback pipeline, same download-then-play shape as Subsonic streaming
- * just above, and the same reason: no decoder here reads a true network
- * stream). Relies on the downloaded file's own embedded tags for Now
- * Playing display via the standard on_file_selected() path, same as
- * Subsonic, rather than the richer DIDL-Lite title/artist/album
- * dlna_control_consume_ready_track() also provides -- real casts observed
- * during this feature's investigation had matching embedded tags, and
- * threading an override path through apply_track_metadata_to_ui() for a
- * case that may not come up in practice wasn't worth the added risk this
- * round. No "please wait" screen the way subsonic downloads get one --
- * a cast is user-initiated from another device, not from a tap on this
- * screen, so there's no local navigation context to hold open while it
- * downloads. */
+/* DLNA/UPnP-AV cast playback:
+ * When a cast track is downloaded and ready, hand it to on_file_selected()
+ * for local playback using the file's embedded metadata tags. */
 static void poll_dlna_control(void) {
     char path[512], title[256], artist[256], album[256];
     if (dlna_control_consume_ready_track(path, sizeof(path), title, sizeof(title),
@@ -1744,11 +1337,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
                           : current_settings.volume); /* picked up below when the volume slider reads audio_get_volume() */
     audio_set_crossfade_enabled(current_settings.crossfade_enabled);
 
-    /* Real-device bug report: brightness jumped to an arbitrary value after
-     * a real power-down/power-up -- root cause, nothing in this app applied
-     * ANY brightness at startup before this, so the screen just came up at
-     * whatever raw value the kernel/bootloader itself left the backlight
-     * sysfs attribute at. See settings.h's own comment on brightness_percent. */
+    /* Apply saved brightness level at startup. */
     backlight_set_normal_percent(current_settings.brightness_percent);
 
     led_control_apply(current_settings.led_indicator_enabled);
@@ -1756,20 +1345,10 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     safe_charging_poll(current_settings.safe_charging_enabled, true);
     if (current_settings.timezone[0] != '\0') timezone_apply(current_settings.timezone);
 
-    /* Reapply persisted external-DAC state -- see
-     * start_bt_dac_startup_reapply_if_needed()'s own comment for the real
-     * incident this fixes. AirPlay's equivalent (wifi_dac_mode_enabled) has
-     * the same shape of bug but no slow chip-init step, so it's cheap enough
-     * to just call directly here rather than needing its own background
-     * thread. */
-    /* Network receiver/server modes are deliberately session-only even
-     * though their toggle fields live in the persisted settings structure:
-     * never restore AirPlay, DLNA, or Remote Control automatically after a
-     * process start.  They expose listeners and consume radio/CPU resources,
-     * so every new boot requires an explicit user enable while Wi-Fi is on
-     * (gui_network.c's wifi_feature_guard() enforces that runtime condition).
-     * Import via Wi-Fi already has no persisted enabled flag and never starts
-     * here.  Save once only when correcting an older session's ON values. */
+    /* Network receiver/server modes are session-only:
+     * Never restore AirPlay, DLNA, or Remote Control automatically after a
+     * process start to avoid unintentional listener exposure and resource usage.
+     * Require explicit user activation while Wi-Fi is connected. */
     bool network_modes_changed = current_settings.wifi_dac_mode_enabled ||
                                  current_settings.dlna_renderer_enabled ||
                                  current_settings.remote_control_enabled;
@@ -1882,37 +1461,6 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * Subsonic artist/album row has no local playlist_index to highlight
      * against. */
 
-    /* Top-of-screen Download buttons -- see subsonic_download_artist_btn_cb()/
-     * subsonic_download_songs_btn_cb() for what each actually downloads.
-     * Added directly onto the already-built screens (same pattern as
-     * build_wifi_screen()'s Rescan button) rather than threading a new
-     * parameter through build_subsonic_list_screen() itself, which ~20
-     * other, unrelated screens also share. Hidden by default -- shown only
-     * when the screen's own click handler determines it's actually
-     * applicable (an Artist page for the albums one; always for the songs
-     * one, whether it's an album or a playlist). */
-    /* Real-device bug report: the "Download" text button started the
-     * download immediately with no confirmation (see subsonic_download_
-     * songs_btn_cb()'s/subsonic_download_artist_btn_cb()'s own comment for
-     * that half of the fix) and, separately, was asked to become an icon
-     * instead of a text label -- a plain downward-arrow-into-a-tray glyph
-     * (stream_media/download.png, a new asset this app adds via the
-     * THEME_OVERRIDE_ROOT mechanism, same as stream_media/subsonic.png's
-     * own precedent -- there's no stock icon for a Subsonic-only feature)
-     * rather than reusing an LVGL built-in symbol font glyph, which would
-     * have clashed with this app's own consistently hand-drawn icon set. */
-
-    /* Same live search as Artists/Albums/Album Artist/All Songs (see the
-     * search_binding_t infra above), extended to Subsonic's own Artists and
-     * Albums lists -- now virtualized compact_lists too (see their own
-     * build_compact_list_screen() comment above), so search_apply_filter()
-     * repopulates them via compact_list_set_items() same as every other
-     * binding, no special-casing needed here anymore. No A-Z index -- same
-     * reasoning as Files (search-only), and unlike Files this isn't even
-     * alphabetically sorted (server order). Registered once here only --
-     * unlike the local-library bindings, these screens are never rebuilt (no
-     * equivalent of a library rescan), so there's no second registration
-     * site to mirror this at. */
     gui_library_init();
     gui_network_init();
     gui_settings_init();
@@ -1960,25 +1508,8 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * screen even before any auto-resume logic below runs. */
 
 
-    /* The screen-timeout clock belongs to the interactive UI, not startup.
-     * update_timer_cb used to be created before the splash settle loop, so
-     * LVGL counted library/screen construction and the visible splash as
-     * user inactivity; with a short timeout it could switch the panel off
-     * immediately after (or even during) the splash. Establish the activity
-     * baseline at the exact splash -> Home transition, then start runtime
-     * polling. The fast gesture timers likewise have no work while the
-     * splash is the only visible screen -- and self-pause again (see their
-     * own handle comments) the moment the very first tick after this finds
-     * nothing pressed, rather than running at ~60fps for the rest of the
-     * app's life regardless of whether anyone's touching the screen: with
-     * no other timer registered below LV_DEF_REFR_PERIOD, these two used to
-     * be the sole reason main()'s own usleep(lv_timer_handler()) could never
-     * sleep longer than one frame, forever, including idle/screen-off
-     * playback. resume_fast_gesture_timers_cb() wakes both again the
-     * instant a new press begins, on whichever indev is the real
-     * touchscreen (find_pointer_indev() is safe to call here -- the target
-     * build's touch indev is already registered by main.c well before
-     * gui_init() runs). */
+    /* Initialize user inactivity baseline at the splash-to-Home transition,
+     * start runtime update timer, and install gesture indev hooks. */
     gui_reset_interactive_timeout_baseline();
     lv_timer_create(update_timer_cb, 500, NULL);
     lv_indev_t * gesture_indev = find_pointer_indev();
@@ -1987,67 +1518,16 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     boot_checkpoint("lv_screen_load(gui_shell_get_home_screen()) done");
 #endif
 
-    /* Real-device incident (2026-08-08): auto-resuming into a Subsonic
-     * track (cached locally at SUBSONIC_STREAM_CACHE_DIR/stream.<suffix>,
-     * see that macro's own comment further down -- last_track points at
-     * that cache file, not a live stream URL) crashed and rebooted the
-     * device on a cold boot with no Wi-Fi connected yet. Root cause was
-     * never fully pinned down -- candidates included the cache file being
-     * a leftover partial/corrupt download from a session killed mid-stream,
-     * or something else on this path unexpectedly touching network state
-     * -- so this whole path was disabled outright rather than resuming
-     * into a file of unknown safety on every single cold boot.
-     *
-     * Car Mode's rework back to poweroff+auto-resume (see its own comment
-     * above, in the update_timer_cb Car Mode block) needs this path
-     * working again, so it's re-enabled here with the guard that was
-     * actually missing before: last_track is skipped if it's inside
-     * SUBSONIC_STREAM_CACHE_DIR rather than a real library file. This can't
-     * rule out every possible cause of the original crash, but it removes
-     * the one concretely different thing about a Subsonic-cache resume
-     * versus a normal library-file resume -- this same path already worked
-     * fine for ordinary local files before that incident -- so it's the
-     * correct first fix to try rather than leaving auto-resume disabled
-     * for everyone over one still-unexplained edge case.
-     *
-     * This block was, for a long time, gated on car_mode_enabled only, NOT
-     * the separate general "resume on every launch" setting -- that one had
-     * no UI toggle at all since this incident (its Settings row was removed
-     * entirely, not just left inert -- a live-looking toggle for a feature
-     * that silently did nothing read as a regression) and defaulted to true,
-     * so wiring it back in here unconditionally would have silently
-     * auto-resumed on EVERY cold boot for every user, not just those who
-     * deliberately opted into Car Mode's specific docking routine.
-     *
-     * Now reintroduced as Settings -> Playback -> Resume Last Track
-     * (player_settings_t.resume_mode), opt-in and defaulting to off (0),
-     * handled in the separate `else if` below so it can share this same
-     * Subsonic-cache guard without duplicating it, while staying fully
-     * independent of Car Mode's own always-on, headphone-gated resume. */
+    /* Auto-resume playback on startup:
+     * Used by Car Mode and the opt-in "Resume Last Track" setting.
+     * Tracks in SUBSONIC_STREAM_CACHE_DIR are skipped to prevent resuming into
+     * transient cache files without network connectivity. */
     if (current_settings.car_mode_enabled && current_settings.last_track[0] != '\0' &&
         strncmp(current_settings.last_track, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) != 0) {
 #ifndef HOST_BUILD
-        /* Real-device incident: a device Car Mode shut down (unplugged
-         * while playing) that was later found with its wired headphones
-         * ALSO disconnected, then manually powered on with no external
-         * power connected at all, boot-looped on every attempt -- only
-         * recoverable by pulling the SD card (so this whole block's
-         * file_browser_build_playlist_for_path() call below fails to find
-         * last_track and the resume is skipped entirely) and then
-         * disabling Car Mode by hand. This is the same general class of
-         * problem as the 2026-08-08 Subsonic-cache incident above (an
-         * auto-resume at boot crashing/hanging for a reason never fully
-         * pinned down) -- rather than resume blind into a state already
-         * twice confirmed dangerous, refuse outright whenever there's no
-         * headphone jack connected (this app's own docking routine's own
-         * assumption: Car Mode expects to resume into a car's own wired
-         * aux/dock connection, not open air) and disable Car Mode so a
-         * user who hits this doesn't land back in the exact same trap on
-         * their very next boot too, before they've had any chance to
-         * investigate. get_headphone_state() is a cheap synchronous
-         * sysfs read (no D-Bus/Bluetooth involved) -- safe to call this
-         * early in boot, unlike a Bluetooth connectivity check (see the
-         * "no startup-time Bluetooth cleanup" comment in main.c). */
+        /* Car Mode expects a connected headphone/aux jack to resume into.
+         * If no headphone is connected at boot, skip auto-resume and disable
+         * Car Mode to prevent unexpected playback or boot issues. */
         if (get_headphone_state() == HEADPHONE_STATE_NONE) {
             current_settings.car_mode_enabled = false;
             settings_save(&current_settings);
@@ -2068,14 +1548,9 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
         }
     } else if (current_settings.resume_mode != 0 && current_settings.last_track[0] != '\0' &&
                strncmp(current_settings.last_track, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) != 0) {
-        /* General-purpose "Resume Last Track" (Settings -> Playback),
-         * independent of Car Mode's own dedicated docking-routine resume
-         * above -- reuses the exact same Subsonic-cache guard (the one
-         * concretely identified cause of the 2026-08-08 crash-reboot-loop
-         * incident) but deliberately has none of Car Mode's own
-         * headphone-presence requirement, which is specific to its docking
-         * assumption and doesn't apply to a normal user just picking this
-         * setting up in Settings. */
+        /* General "Resume Last Track" (Settings -> Playback):
+         * Resumes the last played local track on launch without requiring
+         * headphone presence. */
         char ** resume_playlist;
         int resume_count, resume_index;
         if (build_saved_resume_playlist(&resume_playlist, &resume_count, &resume_index)) {

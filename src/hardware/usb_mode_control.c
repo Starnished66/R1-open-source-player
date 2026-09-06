@@ -248,10 +248,8 @@ static bool configfs_has_gadgets(void) {
     return found;
 }
 
-/* The stock ADB and DAC start scripts both deliberately refuse to run if
- * configfs is already mounted. Their stop scripts normally unmount it, but
- * our fallback cleanup previously did not; one imperfect Storage teardown
- * therefore made every later ADB/DAC attempt fail until reboot. */
+/* ADB and DAC start scripts require configfs to be unmounted before running.
+ * Unmount configfs if no active gadgets remain. */
 static bool unmount_empty_configfs(void) {
     if (!path_exists("/sys/kernel/config/usb_gadget")) return true;
     if (configfs_has_gadgets()) return false;

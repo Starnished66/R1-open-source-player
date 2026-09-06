@@ -14,40 +14,11 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 
-/* The undocumented socket dmrd's own gmrender-resurrect-derived code
- * expects its playback companion to be listening on -- see dlna_control.h
- * for how this was found (live traffic capture on a real device, not a
- * spec). Always under /usr/data (symlinked to /data on this firmware, see
- * fallback_font.c's own /usr/resource precedent for a similar "the real
- * path is a symlink target" note), the one writable partition. */
+/* Unix domain socket where dmrd expects its playback companion to listen. */
 #define DMR_STREAMER_SOCKET_PATH "/data/dmr_streamer"
 
-/* Real-device incident, first fix: this used to be under /tmp, which this
- * firmware mounts as tmpfs (RAM-backed, confirmed via `mount`) -- on a
- * device with only ~57MB total RAM and only a few MB typically free,
- * downloading any real-sized cast track (a FLAC can easily be tens of MB)
- * into /tmp filled memory directly and got the whole app OOM-killed by the
- * kernel partway through, which looked to the user like the device freezing
- * (confirmed via `dmesg`: "Out of memory: Kill process ... (hiby_player)").
- *
- * Real-device incident, second fix: moving it to /data (the same writable
- * UBIFS partition DMR_STREAMER_SOCKET_PATH above uses) fixed the OOM, but
- * that partition is only ~35.8MB total, most of it already used by the
- * firmware/app itself -- confirmed live: a real 61MB cast FLAC failed
- * partway through download (`read_body failed`) because /data simply
- * doesn't have room for a file that size, and even a middling one would
- * fight with test binaries or normal app growth for the same few MB. The
- * SD card (MUSIC_ROOT_DIR, same as gui.c's own Subsonic download-to-
- * library feature already uses for exactly this "need to write a real,
- * possibly-large audio file somewhere" need) has actual capacity instead.
- * A dot-prefixed subdirectory keeps it out of the library scan entirely --
- * file_browser.c's scan_all_songs_recursive() skips any dirent whose name
- * starts with '.', so a cast track never briefly shows up as a phantom
- * library entry. Falls back to failing the download gracefully (existing
- * !ok handling in dlna_download_thread_func()) if no SD card is mounted at
- * all, same as Subsonic download-to-library already does in that case --
- * this device genuinely has nowhere else with enough room for a real audio
- * file. */
+/* Temporary download directory and file path on the SD card. Uses a dot-prefixed
+ * directory so recursive library scans ignore it. */
 #ifdef HOST_BUILD
 #define DLNA_TEMP_DOWNLOAD_DIR "./music/.dlna_cast"
 #else
@@ -61,11 +32,8 @@ static bool running = false;
 static int listen_fd = -1;
 static pthread_t listener_thread;
 
-/* Accumulated from set_uri:/set_meta: commands as they arrive, one at a
- * time, ahead of the play@N that actually triggers a download -- mirrors
- * dmrd's own "SetNextAVTransportURI queues these, Play consumes them"
- * flow. Guarded by dlna_mutex since the download thread reads a snapshot
- * of these when play@N fires. */
+/* Accumulated from set_uri: and set_meta: commands before play@ triggers
+ * download. Guarded by dlna_mutex. */
 static char pending_uri[2048] = {0};
 static char pending_title[256] = {0};
 static char pending_artist[256] = {0};
@@ -78,34 +46,15 @@ static char ready_path[512] = {0};
 static char ready_title[256] = {0};
 static char ready_artist[256] = {0};
 static char ready_album[256] = {0};
-static char last_produced_path[512] = {0}; /* superseded on the next successful download, then removed */
+static char last_produced_path[512] = {0}; /* Superseded on the next successful download, then removed */
 
-/* Guarded by dlna_mutex like everything else above -- see dlna_control_
- * notify_status()'s own doc comment in the header. */
+/* Guarded by dlna_mutex. Updated via dlna_control_notify_status(). */
 static bool status_playing = false;
 static bool status_paused = false;
 
-/* Real-device finding: the phone's DLNA controller app queries state@
- * exactly once, immediately after sending play@ -- and never again,
- * apparently treating that single answer as the lasting transport state
- * (its later polling is get_volume only, not another state@). This app's
- * download-then-play architecture (see dlna_control.h's own reasoning)
- * means real playback only starts once the download finishes, well after
- * that single query -- so status_playing was still (correctly, at that
- * instant) false, the controller's UI never got told it was actually
- * playing, and the app looked "stuck" from the phone's side even though
- * audio was playing fine on the device itself. Confirmed live via a raw
- * command trace: play@0 immediately followed by state@0, replied to with
- * the real-but-premature "STOPPED", then the download proceeding
- * afterward with nothing left to tell the controller otherwise.
- *
- * Fixed by answering that one query optimistically: as soon as handle_play()
- * accepts a valid URI (matching what a real-time-streaming DLNA renderer's
- * own instant Play->PLAYING transition would look like from the
- * controller's side), state@ reports PLAYING immediately, before the
- * download has even started -- cleared once the real state actually
- * catches up (dlna_control_notify_status(playing=true)) or a Stop is
- * processed, so it doesn't linger past its purpose. */
+/* Optimistic playback state flag set upon receiving play@ to immediately report
+ * PLAYING to controller queries while the track downloads in the background.
+ * Cleared once real playback starts or stop is requested. */
 static bool cast_intent_playing = false;
 
 typedef struct {
@@ -115,17 +64,8 @@ typedef struct {
     char album[256];
 } dlna_download_request_t;
 
-/* Maps a small, deliberately non-exhaustive set of real-world audio
- * Content-Type values to one of the extensions audio.c's decoder_open()
- * actually dispatches on (see its own strcasecmp(ext, ...) chain) -- a
- * DLNA SetAVTransportURI media URL is typically an opaque token with no
- * extension of its own (confirmed live: every real capture during this
- * feature's investigation had none), so the server's declared type is the
- * only signal available. Returns NULL (caller should give up rather than
- * guess) for anything not confidently one of the formats this app
- * actually supports -- e.g. the real capture that turned out to be a
- * miscast .lrc lyrics file came back as "application/octet-stream", which
- * intentionally maps to nothing here rather than being guessed as audio. */
+/* Maps supported audio Content-Type MIME strings to file extensions recognized
+ * by decoder_open(). Returns NULL for unrecognized types. */
 static const char * extension_for_content_type(const char * content_type) {
     if (strcasecmp(content_type, "audio/flac") == 0 || strcasecmp(content_type, "audio/x-flac") == 0) return ".flac";
     if (strcasecmp(content_type, "audio/mpeg") == 0 || strcasecmp(content_type, "audio/mp3") == 0) return ".mp3";
@@ -138,17 +78,7 @@ static const char * extension_for_content_type(const char * content_type) {
     if (strcasecmp(content_type, "audio/x-ape") == 0 || strcasecmp(content_type, "audio/ape") == 0) return ".ape";
     if (strcasecmp(content_type, "audio/x-ms-wma") == 0) return ".wma";
     if (strcasecmp(content_type, "audio/opus") == 0) return ".opus";
-    /* audio/ogg and application/ogg are generic Ogg-container MIME types --
-     * genuinely ambiguous between Vorbis and Opus payloads, unlike audio/
-     * opus (RFC 7845, Opus-specific) above. Real bug caught in review: both
-     * used to map to .opus unconditionally, so a real Ogg Vorbis cast (now
-     * supported, see vorbis_decoder.h) would download fine but fail to open
-     * -- audio.c's own extension dispatch would hand Vorbis-encoded bytes
-     * to opus_open_file(), the wrong codec entirely. Mapped to .ogg instead:
-     * a server correctly following RFC 7845 for Opus already sends the more
-     * specific audio/opus type (handled above), so anything landing on
-     * these two generic types is more likely classic Ogg Vorbis in
-     * practice. */
+    /* Generic Ogg-container MIME types map to .ogg for Vorbis decoding. */
     if (strcasecmp(content_type, "audio/ogg") == 0 || strcasecmp(content_type, "application/ogg") == 0) return ".ogg";
     return NULL;
 }
@@ -156,7 +86,7 @@ static const char * extension_for_content_type(const char * content_type) {
 static void * dlna_download_thread_func(void * arg) {
     dlna_download_request_t * req = (dlna_download_request_t *) arg;
 
-    mkdir(DLNA_TEMP_DOWNLOAD_DIR, 0755); /* ignore EEXIST -- same best-effort pattern as playlist_files_create() */
+    mkdir(DLNA_TEMP_DOWNLOAD_DIR, 0755); /* Ignore EEXIST */
 
     char content_type[128];
     bool ok = http_get_to_file_ex(req->uri, true, DLNA_TEMP_DOWNLOAD_PATH, NULL, NULL,
@@ -176,9 +106,7 @@ static void * dlna_download_thread_func(void * arg) {
         return NULL;
     }
 
-    /* Same reasoning as DLNA_TEMP_DOWNLOAD_PATH above -- rename() also
-     * requires the source and destination to be on the same filesystem, so
-     * this must stay in step with wherever that constant points. */
+    /* Target path with extension corresponding to the detected Content-Type. */
     char final_path[512];
     snprintf(final_path, sizeof(final_path), DLNA_TEMP_DOWNLOAD_DIR "/dlna_track%s", ext);
     if (rename(DLNA_TEMP_DOWNLOAD_PATH, final_path) != 0) {
@@ -197,7 +125,7 @@ static void * dlna_download_thread_func(void * arg) {
     snprintf(ready_title, sizeof(ready_title), "%s", req->title);
     snprintf(ready_artist, sizeof(ready_artist), "%s", req->artist);
     snprintf(ready_album, sizeof(ready_album), "%s", req->album);
-    track_ready = true; /* written last -- consumers only check this flag */
+    track_ready = true; /* Written last after path and metadata are updated */
     pthread_mutex_unlock(&dlna_mutex);
 
     free(req);
@@ -206,7 +134,7 @@ static void * dlna_download_thread_func(void * arg) {
 
 static void handle_play(void) {
     dlna_download_request_t * req = malloc(sizeof(*req));
-    if (!req) return; /* audit finding: this used to dereference req unconditionally right below -- on this ~57MB-RAM device, malloc() can genuinely fail under memory pressure, and this is reachable by any DLNA controller on the LAN */
+    if (!req) return;
     pthread_mutex_lock(&dlna_mutex);
     snprintf(req->uri, sizeof(req->uri), "%s", pending_uri);
     snprintf(req->title, sizeof(req->title), "%s", pending_title);
@@ -223,11 +151,7 @@ static void handle_play(void) {
     cast_intent_playing = true;
     pthread_mutex_unlock(&dlna_mutex);
 
-    /* Detached, one-shot -- this listener thread must stay free to keep
-     * accepting/answering the frequent get_volume polls a real DLNA
-     * controller app sends throughout playback (confirmed live: every few
-     * seconds), which a multi-second FLAC download would otherwise block
-     * behind. */
+    /* Run download in a detached thread to prevent blocking socket polling. */
     pthread_t t;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -244,29 +168,14 @@ static void handle_connection(int cfd) {
     DBG_LOG("dlna_control: recv '%.100s'\n", (const char *) buf);
 
     if ((size_t) n >= 10 && memcmp(buf, "get_volume", 10) == 0) {
-        /* Real-device finding: dmrd's own GetVolume response construction
-         * doesn't reliably reflect this reply back to the controller
-         * regardless of its value (silent, no logged error on dmrd's
-         * side) -- see dlna_control.h's own comment. Still answered so
-         * dmrd's request doesn't hang; the exact value is otherwise
-         * inconsequential given that bug. */
+        /* Reply to get_volume with nominal full volume. */
         const char * reply = "100";
         write(cfd, reply, strlen(reply));
     } else if ((size_t) n >= 8 && memcmp(buf, "get_mute", 8) == 0) {
         const char * reply = "0";
         write(cfd, reply, strlen(reply));
     } else if ((size_t) n >= 6 && memcmp(buf, "state@", 6) == 0) {
-        /* Real-device bug report: a cast played correctly on this device but
-         * the phone's own DLNA controller UI never showed it as playing --
-         * this used to always reply "STOPPED" here regardless of actual
-         * state. dmrd relays this from its own UPnP AVTransport
-         * GetTransportInfo, whose CurrentTransportState argument is a fixed
-         * enumeration (UPnP AVTransport:1 spec) -- PLAYING/PAUSED_PLAYBACK/
-         * STOPPED are the three this app can actually distinguish (no
-         * TRANSITIONING/RECORDING/etc. state exists in this app's own
-         * playback model). status_playing/status_paused are pushed from
-         * gui.c every tick via dlna_control_notify_status(), mirroring
-         * audio_is_playing()/audio_is_paused() exactly. */
+        /* Report transport state (PLAYING, PAUSED_PLAYBACK, or STOPPED). */
         pthread_mutex_lock(&dlna_mutex);
         const char * reply = (status_playing || cast_intent_playing) ? "PLAYING"
                               : status_paused                         ? "PAUSED_PLAYBACK"
@@ -296,32 +205,15 @@ static void handle_connection(int cfd) {
         pthread_mutex_lock(&dlna_mutex);
         cast_intent_playing = false;
         pthread_mutex_unlock(&dlna_mutex);
-        stop_requested = true; /* consumed from the LVGL thread */
+        stop_requested = true; /* Consumed by LVGL/main thread */
     }
-    /* Everything else (set_meta:albumarturi:/duration:, and any command
-     * this feature's scope doesn't cover) is deliberately ignored --
-     * accepted and closed with no reply, same as dmrd's own apparent
-     * tolerance for a peer that doesn't answer commands it doesn't
-     * recognize. */
+    /* Other commands are ignored without reply. */
 
     close(cfd);
 }
 
-/* Real-device incident (2026-08-11): this used to call a plain blocking
- * accept() and rely on dlna_control_stop() closing listen_fd to unblock it
- * -- the exact same pattern remote_control.c's own listener used to use,
- * fixed there for the identical reason (see that file's own
- * ACCEPT_POLL_TIMEOUT_MS comment): on this device's kernel, closing a
- * socket from another thread does NOT reliably wake a thread already
- * blocked in accept() on it. Confirmed live here too -- disabling DLNA
- * froze the whole app (main thread stuck in dlna_control_stop()'s
- * pthread_join(), this thread stuck forever in accept()), needing a hard
- * power-cycle to recover; this file had been explicitly flagged as sharing
- * remote_control.c's own pre-fix bug but was left unfixed until it actually
- * happened. Same fix: poll with a bounded timeout instead of blocking
- * directly in accept(), so this thread notices `running` went false within
- * one poll interval on its own, independent of whatever close()-from-
- * another-thread does or doesn't do on this kernel. */
+/* Timeout for accept polling so listener_thread_func periodically checks the
+ * running flag and terminates cleanly on stop. */
 #define ACCEPT_POLL_TIMEOUT_MS 200
 
 static void * listener_thread_func(void * arg) {
@@ -329,7 +221,7 @@ static void * listener_thread_func(void * arg) {
     while (running) {
         struct pollfd pfd = { .fd = listen_fd, .events = POLLIN, .revents = 0 };
         int pr = poll(&pfd, 1, ACCEPT_POLL_TIMEOUT_MS);
-        if (pr <= 0) continue; /* timeout or interrupted -- just re-check running and poll again */
+        if (pr <= 0) continue; /* Timeout or interrupted -- re-check running */
         if (!running) break;
 
         int cfd = accept(listen_fd, NULL, NULL);
@@ -360,7 +252,7 @@ void dlna_control_start(void) {
         listen_fd = -1;
         return;
     }
-    chmod(DMR_STREAMER_SOCKET_PATH, 0777); /* dmrd connects as a different, unprivileged-by-default process */
+    chmod(DMR_STREAMER_SOCKET_PATH, 0777); /* Allow dmrd process to connect */
 
     if (listen(listen_fd, 4) < 0) {
         close(listen_fd);
@@ -377,12 +269,7 @@ void dlna_control_stop(void) {
     if (!running) return;
     running = false;
 
-    /* The listener thread notices `running` went false on its own, within
-     * one ACCEPT_POLL_TIMEOUT_MS poll cycle (see listener_thread_func()'s
-     * own comment on why this doesn't rely on closing listen_fd to
-     * interrupt a blocking accept()) -- so this join is bounded to ~200ms,
-     * not indefinite. Only close the fd after the thread has actually
-     * exited and is guaranteed to no longer touch it. */
+    /* Wait for listener thread to exit after noticing running = false. */
     pthread_join(listener_thread, NULL);
     if (listen_fd >= 0) {
         close(listen_fd);
@@ -422,9 +309,7 @@ void dlna_control_notify_status(bool playing, bool paused) {
     status_playing = playing;
     status_paused = paused;
     if (playing) {
-        /* Real playback has caught up -- the optimistic flag has done its
-         * job (see its declaration comment) and can stop overriding
-         * status_paused/status_playing transitions from here on. */
+        /* Real playback started; clear optimistic intent flag. */
         cast_intent_playing = false;
     }
     pthread_mutex_unlock(&dlna_mutex);

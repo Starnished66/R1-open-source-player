@@ -59,46 +59,17 @@ static bool s_custom_staged_valid = false;
 static uint32_t s_custom_font_generation = 0;
 static bool s_fallback_loaded = false;
 
-/* Real-device bug report: scrolling lists (Albums) became painfully slow
- * once a custom SD-card font was selected. Root cause, confirmed by
- * instrumenting the actual vendored stb_truetype
- * (lvgl/src/libs/tiny_ttf/stb_truetype_htcw.h) against a real user font
- * pulled from a device: lv_tiny_ttf_create_file() keeps STAGING_CUSTOM_FILE
- * open and streams table data on demand, and LV_FS_POSIX_CACHE_SIZE is 0
- * (lv_conf.h), so every ~2-byte stb_truetype read becomes an uncached
- * read()+seek() syscall pair -- ~82 of them per glyph, paid on every
- * cache-miss (i.e. every new album-title character scrolled into view, not
- * just repeats). Raw rasterization speed was not the problem (measured
- * faster than a normal system font). The 128->512 glyph-cache bump made
- * earlier (patches/lvgl_runtime_fixes.patch) only helps *re-visited*
- * glyphs and is kept as an independent, real improvement -- it just can't
- * fix this, since a virtualized list scrolling through new content is
- * mostly cache misses.
+/* Custom SD-card fonts are loaded into memory and created via lv_tiny_ttf_create_data()
+ * rather than streaming from file on demand. This avoids per-glyph read/seek syscalls
+ * during list scrolling. The buffer is shared across pixel-size instances built from
+ * the same file.
  *
- * Fix: read STAGING_CUSTOM_FILE into memory once and use
- * lv_tiny_ttf_create_data() instead -- its stream read/seek callbacks
- * reduce to a memcpy against this buffer (lv_tiny_ttf.c's
- * ttf_cb_stream_read/seek), zero syscalls per glyph. Shared by every
- * pixel-size instance built from the same file content (they all just hold
- * a pointer into it, confirmed by reading lv_tiny_ttf_destroy() -- it never
- * frees dsc->stream.data for the data-backed path, so this buffer's
- * lifetime is entirely owned here, not by tiny_ttf itself).
+ * Fallback faces (CJK, Korean, Thai) stream from disk to preserve RAM given their
+ * larger file sizes and lower consultation frequency.
  *
- * Deliberately NOT applied to the CJK/Korean/Thai fallback faces
- * (FACE_SRC_CJK/KOREAN/THAI below) -- Korean.ttf alone is 4.3MB, a
- * materially different RAM tradeoff on this ~19MB-available device than a
- * typical custom font, and the fallback chain is only consulted for
- * out-of-range characters rather than every glyph of every visible label,
- * so it isn't the scroll-critical path this bug report is about.
- *
- * s_custom_font_data/_size/_generation is the committed buffer any already-
- * built custom lv_font_t instances point into. s_candidate_font_data/_size
- * exists only mid-transaction (see build_custom_font_data_candidate() /
- * commit_custom_font_data() / discard_custom_font_data_candidate() below),
- * mirroring this file's existing candidate-table pattern for faces
- * (build_candidate_slot(), destroy_new_candidate_faces()) so a failed
- * font-tier/custom-font transaction can never leave a currently-in-use
- * buffer freed out from under a live face. */
+ * s_custom_font_data/_size/_generation holds the committed buffer that built
+ * lv_font_t instances point to. s_candidate_font_data/_size is used mid-transaction
+ * so a failed transaction never frees an active buffer. */
 static uint8_t * s_custom_font_data = NULL;
 static size_t s_custom_font_data_size = 0;
 static uint32_t s_custom_font_data_generation = 0;
@@ -660,10 +631,7 @@ bool fallback_font_validate_file(const char * path) {
                 break;
             }
         }
-        /* Validation used to retain all ten test faces until the end.  A
-         * large TTF therefore caused a needless peak-memory/cache spike on
-         * this small device.  Each size is independent, so release it as
-         * soon as its metrics and ASCII coverage have been checked. */
+        /* Release each test face immediately to minimize peak memory usage. */
         lv_tiny_ttf_destroy(tf);
         if (!valid) break;
     }

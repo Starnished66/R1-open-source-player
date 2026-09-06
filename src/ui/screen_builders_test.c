@@ -1,4 +1,4 @@
-/* Headless layout/regression tests using real LVGL objects and fonts.
+/* Headless layout tests using real LVGL objects and fonts.
  * Navigation, storage and asset lookup are isolated from device services. */
 #include "screen_builders.h"
 #include "gui_notifications.h"

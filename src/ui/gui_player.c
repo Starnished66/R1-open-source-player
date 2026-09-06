@@ -1376,6 +1376,10 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
     }
 }
 
+static void transport_btn_ctx_delete_cb(lv_event_t * e) {
+    free(lv_event_get_user_data(e));
+}
+
 /* Long-press seeking on next/prev buttons (fast-forward/rewind).
  *
  * `transport_seek_target_seconds` accumulates seek offsets persistently
@@ -1503,20 +1507,9 @@ static lv_obj_t * add_transport_hit_target(lv_obj_t * scr, int32_t center_x, int
     return ext;
 }
 
-/* Real bug caught in review: since add_transport_hit_target()'s object is
- * created AFTER controls_row and covers each icon's ENTIRE footprint (not
- * just the extra sliver above it -- see that function's own "no object
- * seam" comment), LVGL's own child hit-testing (lv_indev_search_obj(),
- * lv_indev.c -- children checked in REVERSE creation order, first match
- * wins) means this later, larger sibling now intercepts EVERY tap on these
- * five buttons, not only the new upper region. The underlying icon
- * (order_icon/play_btn/more_icon) never receives a real LV_EVENT_PRESSED/
- * RELEASED again, so icon_press_style's LV_STATE_PRESSED-selector dimming
- * silently stopped applying on a real touch -- confirmed by tracing
- * lv_indev_search_obj()'s recursion, not by guessing. Forwarding the hit
- * target's own PRESSED/RELEASED/PRESS_LOST onto the real icon's state
- * restores the exact same visual feedback the icon's own style already
- * defines, without touching that style or duplicating it here. */
+/* Transport icons are visual-only elements inside controls_row.
+ * Forwarding the hit target's PRESSED/RELEASED/PRESS_LOST onto the
+ * underlying icon's state triggers icon_press_style dimming on real touch. */
 static void forward_press_state_to_icon_cb(lv_event_t * e) {
     lv_obj_t * icon = (lv_obj_t *) lv_event_get_user_data(e);
     lv_event_code_t code = lv_event_get_code(e);
@@ -1588,6 +1581,10 @@ static void progress_slider_event_cb(lv_event_t * e) {
  * so 18px is the maximum padding before adjacent hit areas overlap
  * (40 + 18*2 = 76x76 effective hit area). */
 #define TRANSPORT_ICON_EXT_CLICK_AREA 18
+
+/* favorite_icon (also 40x40) has no clickable neighbors, so this can go
+ * wider than the tightly-packed transport row above. */
+#define FAVORITE_ICON_EXT_CLICK_AREA 24
 
 /* Distance above play_btn's top edge for the shared transport hit area
  * line (roughly level with song_count_label without overlapping the progress
@@ -1667,6 +1664,10 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_border_width(title_row, 0, 0);
     lv_obj_set_style_pad_all(title_row, 0, 0);
     lv_obj_remove_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+    /* Row is exactly content-height (40px, favorite_icon's own height), so
+     * without this its ext_click_area outline would render clipped away --
+     * see gui_shell.c's own comment on lv_obj's default child clipping. */
+    lv_obj_add_flag(title_row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -1687,6 +1688,10 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_flag(favorite_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(favorite_icon, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(favorite_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
+    lv_obj_set_ext_click_area(favorite_icon, FAVORITE_ICON_EXT_CLICK_AREA);
+#ifdef UI_HITBOX_DEBUG
+    debug_paint_hitbox(favorite_icon, FAVORITE_ICON_EXT_CLICK_AREA, lv_color_hex((uint32_t) rand() & 0xFFFFFFu));
+#endif
 
     /* Artist row: artist (left) + format/quality badge (right). */
     lv_obj_t * artist_row = lv_obj_create(overlay);
@@ -1786,52 +1791,21 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_translate_y(controls_row, -3, 0);
 
     /* Play-mode icon (sequential/repeat/shuffle) -- leftmost, matching the
-     * reference layout (repeat / prev / play / next / more). Tapping cycles
-     * Sequential -> Repeat All -> Repeat One -> Shuffle (order_icon_event_cb). */
+     * reference layout (repeat / prev / play / next / more). Visual-only;
+     * input is handled by order_hit below. */
     order_icon = lv_image_create(controls_row);
     lv_image_set_src(order_icon, asset_path(play_mode_icon_asset((play_mode_t) current_settings.play_mode)));
-    lv_obj_add_flag(order_icon, LV_OBJ_FLAG_CLICKABLE);
-    /* Extend click area to maximize touch target size without overlapping
-     * neighboring transport buttons. */
-    lv_obj_set_ext_click_area(order_icon, TRANSPORT_ICON_EXT_CLICK_AREA);
-    lv_obj_add_event_cb(order_icon, order_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(order_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
-#ifdef UI_GESTURE_TRACE
-    lv_obj_add_event_cb(order_icon, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
-#endif
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(order_icon, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_RED));
-#endif
 
     prev_btn = lv_image_create(controls_row);
     lv_image_set_src(prev_btn, asset_path("playing_plane/btn_prev.png"));
-    lv_obj_add_flag(prev_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(prev_btn, TRANSPORT_ICON_EXT_CLICK_AREA); /* see its own comment */
-    lv_obj_add_event_cb(prev_btn, prev_btn_event_cb, LV_EVENT_CLICKED, NULL);
     transport_btn_ctx_t * prev_ctx = malloc(sizeof(transport_btn_ctx_t));
     if (!prev_ctx) return NULL;
     *prev_ctx = (transport_btn_ctx_t){ prev_btn, "playing_plane/btn_prev.png", "playing_plane/btn_prev_s.png" };
-    lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, prev_ctx);
-    lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, prev_ctx);
-    lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, prev_ctx);
-#ifdef UI_GESTURE_TRACE
-    lv_obj_add_event_cb(prev_btn, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
-#endif
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(prev_btn, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_GREEN));
-#endif
 
     play_btn = lv_image_create(controls_row);
     load_play_btn_images();
     lv_image_set_src(play_btn, gui_player_play_btn_image_src(audio_is_playing()));
-    lv_obj_add_flag(play_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(play_btn, play_btn_event_cb, LV_EVENT_CLICKED, NULL);
-#ifdef UI_GESTURE_TRACE
-    lv_obj_add_event_cb(play_btn, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
-#endif
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(play_btn, 0, lv_palette_main(LV_PALETTE_BLUE)); /* no ext_click_area -- outlines its own native 84x84 */
-#endif
     /* Not transport_btn_ctx_t's fixed normal/pressed asset-swap -- this
      * icon's own "normal" image already alternates between btn_play.png and
      * btn_pause.png depending on playback state (set_play_button_state()),
@@ -1842,35 +1816,19 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
     next_btn = lv_image_create(controls_row);
     lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
-    lv_obj_add_flag(next_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(next_btn, TRANSPORT_ICON_EXT_CLICK_AREA); /* see its own comment */
-    lv_obj_add_event_cb(next_btn, next_btn_event_cb, LV_EVENT_CLICKED, NULL);
     transport_btn_ctx_t * next_ctx = malloc(sizeof(transport_btn_ctx_t));
-    if (!next_ctx) return NULL;
+    if (!next_ctx) {
+        free(prev_ctx);
+        return NULL;
+    }
     *next_ctx = (transport_btn_ctx_t){ next_btn, "playing_plane/btn_next.png", "playing_plane/btn_next_s.png" };
-    lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, next_ctx);
-    lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, next_ctx);
-    lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, next_ctx);
-#ifdef UI_GESTURE_TRACE
-    lv_obj_add_event_cb(next_btn, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
-#endif
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(next_btn, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_ORANGE));
-#endif
 
     /* 3-dot "more" menu -- rightmost, matching the reference layout. Opens
-     * more_menu_popup (Add to Playlist / EQ / Delete). */
+     * more_menu_popup (Add to Playlist / EQ / Delete). Visual-only; input is
+     * handled by more_hit below. */
     lv_obj_t * more_icon = lv_image_create(controls_row);
     lv_image_set_src(more_icon, asset_path("playing_plane/ic_more.png"));
-    lv_obj_add_flag(more_icon, LV_OBJ_FLAG_CLICKABLE);
-    /* TRANSPORT_ICON_EXT_CLICK_AREA fills the 36px gap between more_icon
-     * and next_btn without overlapping. */
-    lv_obj_set_ext_click_area(more_icon, TRANSPORT_ICON_EXT_CLICK_AREA);
-    lv_obj_add_event_cb(more_icon, more_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(more_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(more_icon, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_PURPLE));
-#endif
 
     /* Force-resolve controls_row's flex layout now so the coordinates read
      * below are real absolute screen positions, not the stale (0,0) a
@@ -1916,6 +1874,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_PRESSED, prev_ctx);
     lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_RELEASED, prev_ctx);
     lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, prev_ctx);
+    lv_obj_add_event_cb(prev_hit, transport_btn_ctx_delete_cb, LV_EVENT_DELETE, prev_ctx);
     /* Hold-to-rewind -- see transport_seek_repeat_cb()'s own comment. Bound
      * to prev_hit (the object that actually receives the touch now, not the
      * icon underneath it) so it fires for a real user press. transport_seek_
@@ -1933,6 +1892,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_PRESSED, next_ctx);
     lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_RELEASED, next_ctx);
     lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, next_ctx);
+    lv_obj_add_event_cb(next_hit, transport_btn_ctx_delete_cb, LV_EVENT_DELETE, next_ctx);
     /* Hold-to-fast-forward -- see transport_seek_repeat_cb()'s own comment. */
     lv_obj_add_event_cb(next_hit, transport_long_press_cb, LV_EVENT_LONG_PRESSED, &next_btn_long_press_fired);
     lv_obj_add_event_cb(next_hit, transport_long_press_cancel_cb, LV_EVENT_PRESS_LOST, &next_btn_long_press_fired);
@@ -1946,6 +1906,14 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, more_icon);
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, more_icon);
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, more_icon);
+
+#ifdef UI_GESTURE_TRACE
+    lv_obj_add_event_cb(order_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(play_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(prev_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(next_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(more_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+#endif
 
     /* Volume is controlled via hardware buttons (see update_timer_cb) and,
      * per the real device, shown only as a transient overlay rather than a

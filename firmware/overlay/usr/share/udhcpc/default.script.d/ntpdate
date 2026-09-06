@@ -1,0 +1,74 @@
+#!/bin/sh
+#
+# udhcpc hook: synchronize system time via NTP on first DHCP lease (bound)
+# and persist to the hardware RTC.
+#
+# Not on renew: ntpdate -b would step the clock on every lease refresh of a
+# long-lived udhcpc (wifi_up.sh). wifi_on.sh uses -q, so it only ever
+# fires bound anyway.
+#
+
+if [ "$1" != "--sync" ]; then
+    # udhcpc passes bound/renew/...; no-args is the /usr/bin/sync_ntp.sh
+    # symlink used as a manual trigger (same as the old ${1:-bound}).
+    [ -z "$1" ] || [ "$1" = "bound" ] || exit 0
+    # New session so udhcpc -q exiting cannot SIGHUP this work.
+    # setsid is a busybox applet on this image.
+    setsid "$0" --sync </dev/null &
+    exit 0
+fi
+
+[ -x /usr/bin/ntpdate ] || exit 0
+
+# flock -n on an open fd is atomic; the old PID-file check was racy.
+# Leave the lockfile in /tmp (tmpfs) -- unlinking while holding the fd
+# lets a second bound create a new inode and run in parallel.
+LOCKFILE="/tmp/ntpdate.lock"
+exec 9>"$LOCKFILE" || exit 0
+flock -n 9 || exit 0
+
+# Allow routing and DNS resolver to settle after default.script's
+# resolv.conf rewrite.
+sleep 1
+
+# 1. DHCP option 42 ($ntpsrv, busybox udhcpc's name for it)
+# 2. /etc/ntp.conf
+# 3. pool.ntp.org
+SERVERS=""
+if [ -n "$ntpsrv" ]; then
+    SERVERS="$ntpsrv"
+elif [ -f /etc/ntp.conf ]; then
+    SERVERS=$(awk '/^[[:space:]]*server[[:space:]]/ {print $2}' /etc/ntp.conf 2>/dev/null)
+fi
+if [ -z "$SERVERS" ]; then
+    SERVERS="0.pool.ntp.org 1.pool.ntp.org pool.ntp.org"
+fi
+
+LOGFILE="/tmp/ntp.log"
+log() {
+    echo "[$(date -u +'%Y-%m-%d %H:%M:%SZ' 2>/dev/null || date)] udhcpc hook: $*" >> "$LOGFILE"
+}
+
+log "starting NTP sync (servers: $SERVERS)..."
+
+SYNC_OK=0
+i=0
+while [ "$i" -lt 3 ]; do
+    if /usr/bin/ntpdate -u -b -t 3 $SERVERS >> "$LOGFILE" 2>&1; then
+        SYNC_OK=1
+        break
+    fi
+    i=$((i + 1))
+    [ "$i" -lt 3 ] && sleep 3
+done
+
+if [ "$SYNC_OK" -eq 1 ]; then
+    if [ -x /sbin/hwclock ]; then
+        /sbin/hwclock -w -u 2>/dev/null || /sbin/hwclock -w 2>/dev/null
+    fi
+    log "NTP sync succeeded, RTC updated."
+else
+    log "NTP sync failed."
+fi
+
+exit 0

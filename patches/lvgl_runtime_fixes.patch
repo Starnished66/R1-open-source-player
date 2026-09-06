@@ -142,3 +142,33 @@ index 097f764..b6e7bb6 100644
  
      cache->size = 0;
  }
+diff --git a/src/libs/lodepng/lodepng.c b/src/libs/lodepng/lodepng.c
+index 385cf45..0dbfcf9 100644
+--- a/src/libs/lodepng/lodepng.c
++++ b/src/libs/lodepng/lodepng.c
+@@ -5307,7 +5307,24 @@ static void decodeGeneric(unsigned char ** out, unsigned * w, unsigned * h,
+     lodepng_free(idat);
+ 
+     if(!state->error) {
+-        lv_draw_buf_t * decoded = lv_draw_buf_create(*w, *h, LV_COLOR_FORMAT_ARGB8888, 4 * *w);
++        /* postProcessScanlines() below unfilters straight into this buffer at
++        the PNG's own native bpp (lodepng_get_bpp(&state->info_png.color)),
++        not at the fixed 4 bytes/pixel this ARGB8888 draw_buf's default
++        stride assumes -- any source with more than 32 bits per pixel (e.g.
++        16-bit-per-channel RGBA, 64bpp) overflows a 4**w stride by exactly
++        that much, corrupting whatever the allocator placed next on the
++        heap. A real-device crash traced to exactly this: decoding a stock
++        16-bit RGBA icon corrupted the heap silently, surfacing later as a
++        segfault inside an unrelated free() call. Widening the stride to
++        the larger of the two needs keeps this buffer correct for both the
++        native unfilter step here and, when no color conversion turns out
++        to be needed (lodepng_decode()'s "same color type" branch), for the
++        final ARGB8888 image this same allocation becomes. */
++        size_t native_bpp = lodepng_get_bpp(&state->info_png.color);
++        size_t native_row_bytes = ((size_t)*w * native_bpp + 7u) / 8u;
++        size_t argb8888_row_bytes = 4 * (size_t)*w;
++        uint32_t stride = (uint32_t)(native_row_bytes > argb8888_row_bytes ? native_row_bytes : argb8888_row_bytes);
++        lv_draw_buf_t * decoded = lv_draw_buf_create(*w, *h, LV_COLOR_FORMAT_ARGB8888, stride);
+         if(decoded) {
+             *out = (unsigned char*)decoded;
+             outsize = decoded->data_size;

@@ -2,6 +2,8 @@
 #include "gui_library.h"
 #include "assets.h"
 #include "idle_shutdown.h"
+#include "backlight.h"
+#include "usb_mode_control.h"
 
 extern void on_file_browser_selected(char ** new_playlist, int count, int selected_index);
 extern void open_queue_screen(void);
@@ -13,6 +15,7 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "gui.h"
 #include "gui_theme.h"
 #include "gui_notifications.h"
+#include "gui_settings.h"
 #include "gui_text_input.h"
 #include "gui_subsonic.h"
 #include "gui_books.h"
@@ -123,11 +126,16 @@ static void test_diag_log(const char * area, const char * fmt, ...) {
 
 #define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
 #define COMPACT_LIST_PAGE_CACHE_SIZE 64
-#define STATUS_BAR_CLEARANCE 48
+/* STATUS_BAR_CLEARANCE comes from screen_builders.h (already included
+ * above) -- this used to be a redundant local redefinition at the same
+ * value (48), which silently masked the fact that it would override the
+ * shared constant the moment the two ever diverged (as they now have,
+ * screen_builders.h's own value shrunk to close a real-device dead-space
+ * bug report). Removed rather than kept in sync by hand. */
 #define EXTERNAL_COVER_MAX_BYTES (4U * 1024U * 1024U)
 
 static lv_obj_t * album_thumbnail_active_list = NULL;
-static int album_thumbnail_generation = 0;
+static atomic_int album_thumbnail_generation = 0;
 static lv_obj_t * playlists_edit_btn = NULL;
 static bool playlists_edit_mode = false;
 static bool group_songs_source_is_album = false;
@@ -227,20 +235,26 @@ extern void unregister_static_snapshot(lv_obj_t * screen);
  * song long-press context menu reaches this same screen for an arbitrary
  * row, not just the player's own "..." menu). */
 static char add_to_playlist_target_path[600] = ""; /* 600, matching song_row_t.path's own bound (metadata_db.h) */
+static void populate_playlists_screen(void);
+static bool standalone_playlist_create;
 
 static void new_playlist_name_done_cb(const char * text, void * user_data) {
     (void) user_data;
-    if (text[0] == '\0' || add_to_playlist_target_path[0] == '\0') return;
+    if (text[0] == '\0') return;
 
     char created_path[512];
     bool ok = playlist_files_create(PLAYLISTS_DIR, text, add_to_playlist_target_path, created_path, sizeof(created_path));
     if (ok) metadata_db_playlist_insert_one(created_path);
     show_error_toast(ok ? "Playlist created" : "Failed to create playlist");
-    nav_pop(); /* leave the Add to Playlist picker too, back to the player */
+    if (!ok) return;
+    if (standalone_playlist_create) populate_playlists_screen();
+    else nav_pop();
 }
 
 static void new_playlist_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    standalone_playlist_create = lv_event_get_user_data(e) != NULL;
+    if (standalone_playlist_create) add_to_playlist_target_path[0] = '\0';
     show_text_entry("Playlist Name", "", false, false, new_playlist_name_done_cb, NULL);
 }
 
@@ -264,6 +278,10 @@ static void existing_playlist_row_cb(lv_event_t * e) {
     bool ok = playlist_files_append(path, add_to_playlist_target_path);
     show_error_toast(ok ? "Added to playlist" : "Failed to add to playlist");
     nav_pop();
+}
+
+static void playlist_picker_path_free_cb(lv_event_t * e) {
+    free(lv_event_get_user_data(e));
 }
 
 static void populate_add_to_playlist_screen(void) {
@@ -302,7 +320,8 @@ static void populate_add_to_playlist_screen(void) {
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, existing_playlist_row_cb, LV_EVENT_CLICKED, paths[i]); /* not freed here -- same lives-for-the-screen's-lifetime tradeoff as eq_profile_row_cb's own paths[i] */
+        lv_obj_add_event_cb(row, existing_playlist_row_cb, LV_EVENT_CLICKED, paths[i]);
+        lv_obj_add_event_cb(row, playlist_picker_path_free_cb, LV_EVENT_DELETE, paths[i]);
 
         lv_obj_t * label = lv_label_create(row);
         lv_label_set_text(label, basename_of(paths[i]));
@@ -334,23 +353,7 @@ static lv_obj_t * build_files_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Files");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Files", generic_back_cb, NULL, NULL);
 
     file_browser_init(scr, MUSIC_ROOT_DIR, on_file_browser_selected, on_cue_file_selected);
 
@@ -417,8 +420,19 @@ static const char * song_quality_asset_for_path(const char * path) {
     return "touch_list/quality_nomal.png";
 }
 
+void gui_library_format_song_identity(const song_row_t * row,
+                                      char * title, size_t title_size,
+                                      char * subtitle, size_t subtitle_size) {
+    char artist[121], album[121];
+    metadata_db_song_display_title(row, title, title_size);
+    utf8_truncate_safe(artist, row->tags.artist[0] ? row->tags.artist : "Unknown artist", sizeof(artist));
+    utf8_truncate_safe(album, row->tags.album[0] ? row->tags.album : "Unknown album", sizeof(album));
+    snprintf(subtitle, subtitle_size, "%s · %s", artist, album);
+}
+
 static void fill_song_page_visual(compact_list_page_row_t * out, const song_row_t * row) {
-    metadata_db_song_display_title(row, out->label, sizeof(out->label));
+    gui_library_format_song_identity(row, out->label, sizeof(out->label),
+                                     out->subtitle, sizeof(out->subtitle));
     out->identity = row->id;
     snprintf(out->trailing_asset, sizeof(out->trailing_asset), "%s", song_quality_asset_for_path(row->path));
 }
@@ -498,13 +512,31 @@ static lv_obj_t * build_all_songs_screen(void) {
  * get_songs_page_by_recency() instead of title via metadata_db_get_songs_
  * filtered_page()) -- no search/A-Z index wired up here, unlike All Songs,
  * since neither makes as much sense against a recency-ordered list. */
+static void playlist_start_options(bool recent);
+static void format_song_identity(const song_row_t * row, char * out, size_t size) {
+    char title[128], subtitle[256];
+    gui_library_format_song_identity(row, title, sizeof(title), subtitle, sizeof(subtitle));
+    snprintf(out, size, "%s\n%s", title, subtitle);
+}
+
 static int recently_added_fetch_page(void * ctx, int offset, int count, compact_list_page_row_t out_rows[]) {
     (void) ctx;
+    int prefix = 0;
+    if (offset == 0 && count > 0) {
+        memset(&out_rows[0], 0, sizeof(out_rows[0]));
+        snprintf(out_rows[0].label, sizeof(out_rows[0].label), "Play All");
+        out_rows[0].is_action = true;
+        snprintf(out_rows[0].subtitle, sizeof(out_rows[0].subtitle), "Choose sequential or shuffle playback");
+        prefix = 1; count--; offset++;
+    }
+    if (count <= 0) return prefix;
     song_row_t * rows = malloc(sizeof(song_row_t) * (size_t) count);
-    int n = rows ? metadata_db_get_songs_page_by_recency(offset, count, rows) : 0;
-    for (int i = 0; i < n; i++) fill_song_page_visual(&out_rows[i], &rows[i]);
+    int n = rows ? metadata_db_get_songs_page_by_recency(offset - 1, count, rows) : 0;
+    for (int i = 0; i < n; i++) {
+        fill_song_page_visual(&out_rows[prefix + i], &rows[i]);
+    }
     free(rows);
-    return n;
+    return n + prefix;
 }
 
 /* Same role as all_songs_resolve_path_at() above, against the recency order. */
@@ -516,6 +548,8 @@ static bool recently_added_resolve_path_at(int display_index, char * out, size_t
 }
 
 static void recently_added_row_click_cb(int display_index) {
+    if (display_index == 0) { playlist_start_options(true); return; }
+    display_index--;
     /* on_file_selected_lazy_recently_added() builds the queue lazily,
      * identity-mapped into the DB's own first_seen-DESC order (the same
      * display order this screen's paged provider uses) -- see its own
@@ -525,6 +559,8 @@ static void recently_added_row_click_cb(int display_index) {
 }
 
 static void recently_added_row_long_press_cb(int display_index) {
+    if (display_index <= 0) return;
+    display_index--;
     char path[600];
     if (recently_added_resolve_path_at(display_index, path, sizeof(path))) open_song_context_menu(path);
 }
@@ -535,7 +571,7 @@ static lv_obj_t * build_recently_added_screen(void) {
                                                 LIST_ROW_WIDTH_WIDE, true, accent_lv_color());
     compact_list_set_row_height(recently_added_list, MUSIC_LIST_ROW_HEIGHT);
     compact_list_set_paged_provider(recently_added_list, recently_added_fetch_page, NULL,
-                                     (int) metadata_db_get_song_count());
+                                     (int) metadata_db_get_song_count() + 1);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -635,6 +671,19 @@ static void set_player_source_group_songs(int pos) {
  * reset to false on every fresh entry into this screen so leaving and
  * re-entering never starts already in edit mode. */
 static const char * group_songs_edit_m3u_path = NULL;
+static char group_songs_owned_m3u_path[PATH_MAX];
+static void group_song_move_row_cb(lv_event_t * e);
+static void reload_edited_playlist(void);
+static struct stat group_songs_file_stat;
+static bool group_songs_file_stat_valid;
+static bool group_playlist_unchanged(void) {
+    struct stat st;
+    return group_songs_edit_m3u_path && group_songs_file_stat_valid &&
+        stat(group_songs_edit_m3u_path, &st) == 0 && st.st_ino == group_songs_file_stat.st_ino &&
+        st.st_dev == group_songs_file_stat.st_dev && st.st_size == group_songs_file_stat.st_size &&
+        st.st_mtim.tv_sec == group_songs_file_stat.st_mtim.tv_sec &&
+        st.st_mtim.tv_nsec == group_songs_file_stat.st_mtim.tv_nsec;
+}
 static bool group_songs_edit_mode = false;
 
 /* Defined near show_m3u_playlist() further down, where the playlist file
@@ -692,14 +741,11 @@ static void populate_playlists_screen(void);
  * mid-press at a time. */
 static bool group_song_row_long_press_fired = false;
 
-static void group_song_row_click_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (group_song_row_long_press_fired) {
-        group_song_row_long_press_fired = false;
-        return;
+static void group_play_at(int pos) {
+    if (pos < 0 || pos >= group_songs_count) return;
+    if (group_songs_edit_m3u_path && !group_playlist_unchanged()) {
+        reload_edited_playlist(); show_info_toast("Playlist changed. Select a song again."); return;
     }
-    int pos = (int) (intptr_t) lv_event_get_user_data(e); /* position within the CURRENT group, not the whole library */
-
     /* Real bug caught in review: neither this malloc() nor the strdup()
      * loop below were ever checked. Every group_songs source used to be
      * small/bounded by construction (one album, a hand-curated playlist,
@@ -730,6 +776,58 @@ static void group_song_row_click_cb(lv_event_t * e) {
     }
     set_player_source_group_songs(pos);
     on_file_selected(playlist_copy, group_songs_count, pos);
+}
+
+static void group_song_row_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (group_song_row_long_press_fired) { group_song_row_long_press_fired = false; return; }
+    group_play_at((int) (intptr_t) lv_event_get_user_data(e));
+}
+
+static lv_obj_t * playlist_start_popup, * playlist_start_backdrop;
+static bool playlist_start_recent;
+
+static void playlist_start_cancel(lv_event_t * e) {
+    (void) e;
+    lv_obj_add_flag(playlist_start_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(playlist_start_backdrop, LV_OBJ_FLAG_HIDDEN);
+}
+static void playlist_start_selected(lv_event_t * e, bool shuffle) {
+    playlist_start_cancel(e);
+    int count = playlist_start_recent ? (int) metadata_db_get_song_count() : group_songs_count;
+    if (count <= 0) { show_info_toast("Playlist is empty"); return; }
+    int index = 0;
+    if (shuffle) {
+        unsigned int value = (unsigned int) time(NULL) ^ lv_tick_get();
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0) { ssize_t n = read(fd, &value, sizeof(value)); (void) n; close(fd); }
+        index = (int) (value % (unsigned int) count);
+    }
+    gui_player_set_play_mode(shuffle ? PLAY_MODE_SHUFFLE : PLAY_MODE_SEQUENTIAL);
+    if (playlist_start_recent) {
+        set_player_source_recently_added(index);
+        on_file_selected_lazy_recently_added(index);
+    } else group_play_at(index);
+}
+static void playlist_start_sequential(lv_event_t * e) { playlist_start_selected(e, false); }
+static void playlist_start_shuffle(lv_event_t * e) { playlist_start_selected(e, true); }
+static void playlist_start_options(bool recent) {
+    playlist_start_recent = recent;
+    if (!playlist_start_popup) {
+        static const menu_popup_row_t rows[] = {
+            { "Start sequentially", playlist_start_sequential, false },
+            { "Shuffle from a random song", playlist_start_shuffle, false },
+            { "Cancel", playlist_start_cancel, false },
+        };
+        playlist_start_popup = build_menu_popup(rows, 3, playlist_start_cancel, &playlist_start_backdrop);
+    }
+    lv_obj_remove_flag(playlist_start_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(playlist_start_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(playlist_start_backdrop);
+    lv_obj_move_foreground(playlist_start_popup);
+}
+static void group_start_options_cb(lv_event_t * e) {
+    (void) e; playlist_start_options(false);
 }
 
 static void group_song_row_long_press_cb(lv_event_t * e) {
@@ -766,7 +864,7 @@ static void refresh_group_songs_now_playing_indicator(void) {
         lv_obj_add_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    int visible_row = match - group_songs_page_start + (group_songs_page_start > 0 ? 1 : 0);
+    int visible_row = match - group_songs_page_start + (group_songs_page_start > 0 ? 1 : 0) + (!group_songs_edit_mode ? 1 : 0);
     lv_obj_remove_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_pos(group_songs_now_playing_bar, 0, 4 + visible_row * (MUSIC_LIST_ROW_HEIGHT + 4));
 }
@@ -792,6 +890,13 @@ static void populate_group_songs_rows(void) {
     }
 
     bool editing = editable && group_songs_edit_mode;
+    if (!editing) {
+        lv_obj_t * start = add_group_songs_page_row(LV_SYMBOL_PLAY "  Play All", group_start_options_cb);
+        lv_obj_add_style(start, &style_theme_card_bg, 0);
+    }
+    if (group_songs_count == 0) {
+        build_list_message(group_songs_list, "Playlist is empty", "Add songs from a song menu.");
+    }
 
     if (group_songs_count <= GROUP_SONGS_PAGE_SIZE) group_songs_page_start = 0;
     if (group_songs_page_start >= group_songs_count && group_songs_count > 0) {
@@ -809,24 +914,15 @@ static void populate_group_songs_rows(void) {
 
     for (int i = group_songs_page_start; i < page_end; i++) {
         if (editing) {
-            /* Container row (label + remove icon), same shape as e.g.
-             * build_wifi_screen()'s saved/scanned network rows -- unlike the
-             * plain-label rows below, this needs a second child so it can't
-             * reuse list_row_style as-is. */
-            lv_obj_t * row = lv_obj_create(group_songs_list);
-            lv_obj_set_size(row, LIST_ROW_WIDTH, MUSIC_LIST_ROW_HEIGHT);
-            lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-            lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
-            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_width(row, 0, 0);
-            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-            lv_obj_t * label = lv_label_create(row);
-            lv_label_set_text(label, group_songs_entries[i].title);
-            lv_obj_add_style(label, &style_theme_text_primary, 0);
-            lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
-            lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
-            configure_scrolling_row_label(label, LIST_ROW_WIDTH - LIST_ROW_LABEL_INSET - 84);
+            lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, 190);
+            for (int direction = 0; direction < 2; direction++) {
+                lv_obj_t * move = lv_label_create(row);
+                lv_label_set_text(move, direction ? LV_SYMBOL_DOWN : LV_SYMBOL_UP);
+                lv_obj_align(move, LV_ALIGN_RIGHT_MID, direction ? -80 : -130, 0);
+                lv_obj_set_ext_click_area(move, 12);
+                lv_obj_add_flag(move, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_add_event_cb(move, group_song_move_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (i * 2 + direction));
+            }
 
             lv_obj_t * remove_icon = lv_image_create(row);
             lv_image_set_src(remove_icon, asset_path("touch_list/del.png"));
@@ -837,26 +933,14 @@ static void populate_group_songs_rows(void) {
             /* One lv_label via the shared list_row_style, not a container +
              * child label each with their own local style properties -- see
              * list_row_style's own doc comment (screen_builders.h). */
-            lv_obj_t * row = lv_label_create(group_songs_list);
-            lv_obj_add_style(row, &list_row_style, 0);
-            lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
-            row_label_enable_marquee(row);
-            lv_obj_set_style_height(row, MUSIC_LIST_ROW_HEIGHT, LV_PART_MAIN);
-            lv_obj_set_style_pad_top(row,
-                (MUSIC_LIST_ROW_HEIGHT - lv_font_get_line_height(&LIST_ROW_FONT)) / 2, LV_PART_MAIN);
-            lv_obj_set_style_pad_right(row, 70, 0);
-            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            lv_label_set_text(row, group_songs_entries[i].title);
+            lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, 70);
 
             lv_obj_t * quality = lv_image_create(row);
             lv_image_set_src(quality, asset_path(song_quality_asset_for_path(group_songs_entries[i].path)));
             /* Child alignment is relative to the label's padded content
              * box. Cancel the 70px text reserve so the badge is physically
              * 14px from the card edge (same rule as compact-list rows). */
-            int32_t quality_pad_top = lv_obj_get_style_pad_top(row, LV_PART_MAIN);
-            int32_t quality_pad_bottom = lv_obj_get_style_pad_bottom(row, LV_PART_MAIN);
-            lv_obj_align(quality, LV_ALIGN_RIGHT_MID, 70 - 14,
-                         (quality_pad_top - quality_pad_bottom) / -2);
+            lv_obj_align(quality, LV_ALIGN_RIGHT_MID, -14, 0);
             lv_obj_remove_flag(quality, LV_OBJ_FLAG_CLICKABLE);
 
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -904,47 +988,7 @@ static void populate_group_songs_rows(void) {
 void more_menu_list_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_more_menu_popup();
-
-    switch (player_source_kind) {
-    case PLAYER_SOURCE_ALL_SONGS:
-        nav_push(all_songs_screen);
-        compact_list_scroll_to_index(all_songs_list, player_source_all_songs_index);
-        break;
-    case PLAYER_SOURCE_RECENTLY_ADDED:
-        nav_push(recently_added_screen);
-        compact_list_scroll_to_index(recently_added_list, player_source_recently_added_index);
-        break;
-    case PLAYER_SOURCE_GROUP_SONGS:
-        /* View-only when reached via List, even if the source group was
-         * an editable .m3u playlist -- this is for orientation/navigation,
-         * not editing, and group_songs_edit_m3u_path's own lifetime
-         * guarantee (valid only "as long as this screen is showing it",
-         * per its own comment) doesn't cover this snapshot anyway. */
-        group_songs_edit_m3u_path = NULL;
-        group_songs_edit_mode = false;
-        group_songs_source_is_album = current_settings.last_source_kind == 2;
-        set_group_songs_entries(player_source_group_entries, player_source_group_count);
-        group_songs_page_start = player_source_group_pos >= 0
-                                     ? (player_source_group_pos / GROUP_SONGS_PAGE_SIZE) * GROUP_SONGS_PAGE_SIZE
-                                     : 0;
-        lv_label_set_text(group_songs_title_label, player_source_group_title ? player_source_group_title : "");
-        populate_group_songs_rows();
-        nav_push(group_songs_screen);
-        lv_obj_update_layout(group_songs_list);
-        int visible_pos = player_source_group_pos - group_songs_page_start + (group_songs_page_start > 0 ? 1 : 0);
-        if (visible_pos >= 0 && visible_pos < (int) lv_obj_get_child_count(group_songs_list)) {
-            lv_obj_scroll_to_view(lv_obj_get_child(group_songs_list, visible_pos), LV_ANIM_OFF);
-        }
-        break;
-    case PLAYER_SOURCE_FILE_BROWSER:
-        nav_push(files_screen);
-        file_browser_navigate_to(player_source_file_browser_dir, player_source_file_browser_row);
-        break;
-    case PLAYER_SOURCE_NONE:
-    default:
-        show_error_toast("No source list for this track");
-        break;
-    }
+    open_queue_screen();
 }
 
 /* Every screen's back button is a fixed 64x64 at the screen's own left
@@ -1013,7 +1057,9 @@ static void group_songs_edit_btn_cb(lv_event_t * e) {
 static void show_group_songs_editable(const char * name, const group_song_entry_t * entries, int count,
                                        const char * editable_m3u_path) {
     group_songs_source_is_album = false;
-    group_songs_edit_m3u_path = editable_m3u_path;
+    if (editable_m3u_path) snprintf(group_songs_owned_m3u_path, sizeof(group_songs_owned_m3u_path), "%s", editable_m3u_path);
+    group_songs_edit_m3u_path = editable_m3u_path ? group_songs_owned_m3u_path : NULL;
+    group_songs_file_stat_valid = editable_m3u_path && stat(editable_m3u_path, &group_songs_file_stat) == 0;
     group_songs_edit_mode = false;
     set_group_songs_entries(entries, count);
     group_songs_page_start = 0;
@@ -1050,44 +1096,7 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    group_songs_title_label = lv_label_create(scr);
-    lv_label_set_text(group_songs_title_label, "");
-    lv_obj_add_style(group_songs_title_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(group_songs_title_label, &app_font_28, 0); /* shows a metadata-derived artist/album/genre name -- see fallback_font.h */
-    /* Real-device bug report: a long artist/album/genre/playlist name
-     * (this label's whole reason for existing, per the comment above)
-     * centered via LV_ALIGN_TOP_MID ran directly under the back button on
-     * the left and the Edit button on the right. Left-aligned starting
-     * just past the back button, narrowed below (once group_songs_edit_btn
-     * itself exists) to stop before it, with auto-scroll for whatever
-     * still overflows -- same fix as build_subsonic_list_screen()'s own
-     * title. */
-    int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
-    lv_obj_set_width(group_songs_title_label, scr_w - TITLE_LABEL_LEFT_INSET - TITLE_LABEL_DEFAULT_RIGHT_MARGIN);
-    /* Real-device bug report: this title scrolled immediately, with none of
-     * the 2s-pause-before-scrolling every other marquee in the app has --
-     * root cause: setting LV_LABEL_LONG_SCROLL_CIRCULAR directly here never
-     * attached row_marquee_style (the shared style carrying that 2s delay/
-     * repeat-delay), so it fell back to LVGL's own built-in default
-     * animation timing instead. row_label_enable_marquee() sets the long
-     * mode AND attaches that style in one call -- same fix as
-     * build_subsonic_list_screen()'s own title label just below. */
-    row_label_enable_marquee(group_songs_title_label);
-    lv_obj_align(group_songs_title_label, LV_ALIGN_TOP_LEFT, TITLE_LABEL_LEFT_INSET,
-                 STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-
+    group_songs_title_label = build_screen_header(scr, "", generic_back_cb, NULL, NULL);
     /* Hidden by default -- populate_group_songs_rows() (via
      * show_group_songs_editable()) is what actually shows this, and only
      * for a group backed by an editable .m3u playlist. */
@@ -1118,8 +1127,8 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_obj_set_style_pad_all(group_songs_list, 0, 0);
     lv_obj_set_scroll_dir(group_songs_list, LV_DIR_VER); /* see build_icon_grid_screen's comment */
     lv_obj_set_flex_flow(group_songs_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(group_songs_list, 4, 0);
-    lv_obj_set_style_pad_top(group_songs_list, 4, 0);
+    lv_obj_set_style_pad_gap(group_songs_list, GUI_ROW_GAP, 0);
+    lv_obj_set_style_pad_top(group_songs_list, GUI_ROW_GAP, 0);
 
     finalize_screen_navigation(scr);
     return scr;
@@ -1440,6 +1449,7 @@ static bool album_thumbnail_load_or_decode(const song_row_t * song, int generati
 }
 
 static void * album_thumbnail_thread_func(void * arg) {
+    install_thread_crash_altstack(); /* see its own comment (main.c) */
 #ifdef UI_PERF_TRACE
     uint64_t perf_start_us = ui_perf_now_us();
 #endif
@@ -1487,6 +1497,7 @@ static void * album_thumbnail_thread_func(void * arg) {
 #define ALBUM_THUMB_GEN_INTER_BATCH_US 1000000 /* 1.0 s pause between batches */
 
 static void * album_thumb_gen_thread_func(void * arg) {
+    install_thread_crash_altstack(); /* see its own comment (main.c) */
     int my_generation = (int) (intptr_t) arg;
 #ifdef TEST_BUILD_TAG
     uint64_t started_ms = test_diag_now_ms();
@@ -1623,6 +1634,21 @@ done:
  * it's been superseded and exit, which happens within roughly one album's
  * worth of decode work given the cancellation check at the top of every
  * iteration. */
+/* Real-device bug report: a real SIGBUS (root-caused, see start_library_
+ * rescan()'s own LIBRARY_RESCAN_THREAD_STACK_SIZE comment, to library_
+ * rescan_thread's undersized default pthread stack) was reproduced again by
+ * removing the SD card right as an "Update Music Database" pass finished --
+ * exactly when this function's own thread starts (see this function's own
+ * doc comment: called right after that scan's thread is joined). Both
+ * pthread_create() calls below still used a bare NULL attr despite doing
+ * the single heaviest per-item work in this app: a full JPEG/PNG cover
+ * decode (see start_next_album_thumbnail()'s own "never run two full cover
+ * decoders at once... doubling peak JPEG/PNG memory" comment) -- at least
+ * as stack-hungry as library_rescan_thread's own format parsers, arguably
+ * more given image decoders' own internal buffer/table usage, yet neither
+ * had that thread's fix applied. Same pattern, same fix. */
+#define ALBUM_COVER_DECODE_THREAD_STACK_SIZE (4 * 1024 * 1024)
+
 static void start_album_thumbnail_generation(void) {
     cancel_album_thumbnail_generation();
     reap_album_thumbnail_generation();
@@ -1637,8 +1663,16 @@ static void start_album_thumbnail_generation(void) {
     atomic_store(&album_thumb_gen_active, true);
     TEST_DIAG("ART_CACHE", "start generation=%d albums=%d warm_limit=%d rss_kb=%ld",
               generation, album_count, ALBUM_THUMB_GEN_WARM_LIMIT, test_diag_rss_kb());
-    if (pthread_create(&album_thumb_gen_thread, NULL, album_thumb_gen_thread_func,
-                        (void *) (intptr_t) generation) != 0) {
+
+    pthread_attr_t attr;
+    pthread_attr_t * attr_ptr = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        if (pthread_attr_setstacksize(&attr, ALBUM_COVER_DECODE_THREAD_STACK_SIZE) == 0) attr_ptr = &attr;
+    }
+    bool created = pthread_create(&album_thumb_gen_thread, attr_ptr, album_thumb_gen_thread_func,
+                                   (void *) (intptr_t) generation) == 0;
+    if (attr_ptr) pthread_attr_destroy(&attr);
+    if (!created) {
         atomic_store(&album_thumb_gen_active, false);
         TEST_DIAG("ART_CACHE", "thread_create_failed generation=%d", generation);
     } else {
@@ -1669,7 +1703,16 @@ static void start_next_album_thumbnail(void) {
 #ifdef TEST_BUILD_TAG
     album_lazy_job_started_ms = test_diag_now_ms();
 #endif
-    if (pthread_create(&album_thumbnail_thread, NULL, album_thumbnail_thread_func, req) != 0) {
+    /* See start_album_thumbnail_generation()'s own ALBUM_COVER_DECODE_THREAD_
+     * STACK_SIZE comment -- same full JPEG/PNG cover decode, same fix. */
+    pthread_attr_t attr;
+    pthread_attr_t * attr_ptr = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        if (pthread_attr_setstacksize(&attr, ALBUM_COVER_DECODE_THREAD_STACK_SIZE) == 0) attr_ptr = &attr;
+    }
+    bool created = pthread_create(&album_thumbnail_thread, attr_ptr, album_thumbnail_thread_func, req) == 0;
+    if (attr_ptr) pthread_attr_destroy(&attr);
+    if (!created) {
         album_thumbnail_active = false;
         free(req);
         return;
@@ -1919,8 +1962,8 @@ static group_song_entry_t * load_album_entries(const char * name, const char * a
         int got = metadata_db_get_album_songs(name, album_artist, n, page, want);
         if (got <= 0) break;
         for (int i = 0; i < got; i++) {
-            char title[128];
-            metadata_db_song_display_title(&page[i], title, sizeof(title));
+            char title[384];
+            format_song_identity(&page[i], title, sizeof(title));
             entries[n + i].path = strdup(page[i].path);
             entries[n + i].title = strdup(title);
             if (!entries[n + i].path || !entries[n + i].title) {
@@ -2744,9 +2787,9 @@ static group_song_entry_t * build_group_song_entries_from_paths(char ** paths, i
     for (int i = 0; i < count; i++) {
         entries[i].path = strdup(paths[i]);
         song_row_t row;
-        char title[128];
+        char title[384];
         if (metadata_db_get_song_by_path(paths[i], &row)) {
-            metadata_db_song_display_title(&row, title, sizeof(title));
+            format_song_identity(&row, title, sizeof(title));
         } else {
             snprintf(title, sizeof(title), "%s", basename_of(paths[i]));
         }
@@ -2898,7 +2941,7 @@ void refresh_now_playing_indicators(void) {
     if (albums_list) compact_list_set_now_playing(albums_list, album_row);
     if (album_artist_list) compact_list_set_now_playing(album_artist_list, album_artist_row);
     if (all_songs_list) compact_list_set_now_playing(all_songs_list, all_songs_row);
-    if (recently_added_list) compact_list_set_now_playing(recently_added_list, recently_added_row);
+    if (recently_added_list) compact_list_set_now_playing(recently_added_list, recently_added_row >= 0 ? recently_added_row + 1 : -1);
 
     refresh_group_songs_now_playing_indicator(); /* group_songs isn't compact_list-based -- see its own comment */
     refresh_artist_albums_now_playing_indicator(); /* Artists/Album Artist's shared compact album drill-down */
@@ -2935,6 +2978,8 @@ static void show_most_played(void) {
  * (build_recently_added_screen()) instead. Same "prebuilt screen, just
  * nav_push it" shape as open_queue_screen(). */
 static void open_recently_added_screen(void) {
+    compact_list_set_paged_provider(recently_added_list, recently_added_fetch_page, NULL,
+        (int) metadata_db_get_song_count() + 1);
     nav_push(recently_added_screen);
 }
 
@@ -2957,7 +3002,7 @@ static char playlist_m3u_name[128];
  * Played/Artists/Albums. */
 static void show_m3u_playlist(const char * name, const char * m3u_path, char ** paths, int count) {
     group_song_entry_t * entries = build_group_song_entries_from_paths(paths, count);
-    if (!entries) return;
+    if (count && !entries) return;
     snprintf(playlist_m3u_name, sizeof(playlist_m3u_name), "%s", name);
     show_group_songs_editable(playlist_m3u_name, entries, count, m3u_path);
     free_group_song_entries(entries, count);
@@ -2970,91 +3015,62 @@ static void show_m3u_playlist(const char * name, const char * m3u_path, char ** 
  * same group_songs_screen instance, just with the file's new contents)
  * rather than trusting the in-memory indices array to still match the file
  * after the rewrite. */
+static void reload_edited_playlist(void) {
+    char ** songs = NULL;
+    int count = 0;
+    if (!playlist_files_read(group_songs_edit_m3u_path, &songs, &count)) {
+        show_error_toast("Cannot read playlist"); return;
+    }
+    group_song_entry_t * entries = count ? build_group_song_entries_from_paths(songs, count) : NULL;
+    for (int i = 0; i < count; i++) free(songs[i]);
+    free(songs);
+    if (count && !entries) return;
+    group_songs_file_stat_valid = stat(group_songs_edit_m3u_path, &group_songs_file_stat) == 0;
+    set_group_songs_entries(entries, count);
+    free_group_song_entries(entries, count);
+    populate_group_songs_rows();
+}
+
+static void group_song_move_row_cb(lv_event_t * e) {
+    int value = (int) (intptr_t) lv_event_get_user_data(e);
+    int pos = value / 2;
+    int to = pos + (value % 2 ? 1 : -1);
+    if (!group_songs_edit_m3u_path || to < 0 || to >= group_songs_count) return;
+    if (!group_playlist_unchanged()) { reload_edited_playlist(); show_info_toast("Playlist changed. Try again."); return; }
+    if (!playlist_files_edit_entry(group_songs_edit_m3u_path, pos, to)) {
+        show_error_toast("Cannot reorder playlist"); return;
+    }
+    reload_edited_playlist();
+}
+
 static void group_song_remove_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int pos = (int) (intptr_t) lv_event_get_user_data(e);
     if (!group_songs_edit_m3u_path || pos < 0 || pos >= group_songs_count) return;
-
-    const char * m3u_path = group_songs_edit_m3u_path;
-    playlist_files_remove(m3u_path, group_songs_entries[pos].path);
-
-    char ** songs = NULL;
-    int count = 0;
-    file_browser_build_playlist_from_m3u(m3u_path, &songs, &count); /* false (empty playlist) leaves songs/count at 0, nothing allocated -- handled below */
-
-    if (count == 0) {
-        /* Empty playlists are auto-deleted rather than left around as a
-         * stuck row nothing can open again -- this is the normal, in-app
-         * way a playlist becomes empty (removing its last song). m3u_path
-         * (== group_songs_edit_m3u_path) is a pointer into
-         * playlists_m3u_paths, so delete before populate_playlists_screen()
-         * below frees/rebuilds that array out from under it. */
-        playlist_files_delete(m3u_path);
-        metadata_db_playlist_delete_one(m3u_path);
-        populate_playlists_screen(); /* not auto-refreshed by nav_pop() -- see build_playlists_screen()'s own comment */
-        nav_pop();
-        show_error_toast("Playlist deleted (last song removed)");
-        return;
+    if (!group_playlist_unchanged()) { reload_edited_playlist(); show_info_toast("Playlist changed. Try again."); return; }
+    if (!playlist_files_edit_entry(group_songs_edit_m3u_path, pos, -1)) {
+        show_error_toast("Cannot remove entry"); return;
     }
-
-    group_song_entry_t * entries = build_group_song_entries_from_paths(songs, count);
-    for (int i = 0; i < count; i++) free(songs[i]);
-    free(songs);
-    if (!entries) return;
-    set_group_songs_entries(entries, count);
-    free_group_song_entries(entries, count);
-    populate_group_songs_rows();
-    show_error_toast("Removed from playlist");
+    reload_edited_playlist();
+    show_info_toast("Removed from playlist");
 }
 
 static void playlist_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
-
-    if (index == 0) {
-        show_favorites();
-        return;
+    if (index == 0) { show_favorites(); return; }
+    if (index == 1) { show_most_played(); return; }
+    if (index == 2) { open_queue_screen(); return; }
+    if (index == 3) { open_recently_added_screen(); return; }
+    int i = index - 4;
+    if (i < 0 || i >= playlists_m3u_count) return;
+    char ** songs = NULL;
+    int count = 0;
+    if (!playlist_files_read(playlists_m3u_paths[i], &songs, &count)) {
+        show_error_toast("Playlist unavailable or unreadable"); return;
     }
-    if (index == 1) {
-        show_most_played();
-        return;
-    }
-    if (index == 2) {
-        open_queue_screen();
-        return;
-    }
-    if (index == 3) {
-        open_recently_added_screen();
-        return;
-    }
-
-    int m3u_index = index - 4;
-    if (m3u_index < 0 || m3u_index >= playlists_m3u_count) return;
-
-    char ** songs;
-    int count;
-    if (!file_browser_build_playlist_from_m3u(playlists_m3u_paths[m3u_index], &songs, &count)) {
-        /* False here means either "genuinely can't open" (leave it alone --
-         * could be a transient SD-card issue, not the playlist's fault) or
-         * "opened fine, zero playable entries" (a stale empty playlist,
-         * e.g. one that predates the auto-delete-on-last-removal fix in
-         * group_song_remove_row_cb() -- safe to clean up now that it's been
-         * tapped). fopen() success alone distinguishes the two without
-         * risking deleting a file we merely failed to read. */
-        FILE * probe = fopen(playlists_m3u_paths[m3u_index], "r");
-        if (probe) {
-            fclose(probe);
-            playlist_files_delete(playlists_m3u_paths[m3u_index]);
-            metadata_db_playlist_delete_one(playlists_m3u_paths[m3u_index]);
-            populate_playlists_screen();
-            show_error_toast("Empty playlist deleted");
-        } else {
-            show_error_toast("Playlist is empty or unreadable");
-        }
-        return;
-    }
-    show_m3u_playlist(basename_of(playlists_m3u_paths[m3u_index]), playlists_m3u_paths[m3u_index], songs, count);
-    for (int i = 0; i < count; i++) free(songs[i]);
+    show_m3u_playlist(basename_of(playlists_m3u_paths[i]), playlists_m3u_paths[i], songs, count);
+    for (int j = 0; j < count; j++) free(songs[j]);
     free(songs);
 }
 
@@ -3070,10 +3086,9 @@ static void playlist_row_click_cb(lv_event_t * e) {
 static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_text) {
     lv_obj_t * row = lv_obj_create(parent);
     lv_obj_set_size(row, LIST_ROW_WIDTH_WIDE, MUSIC_LIST_ROW_HEIGHT);
-    lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-    lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
-    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_add_style(row, &pill_row_bg_style, 0);
+    lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
+    lv_obj_set_style_pad_all(row, 0, 0);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t * label = lv_label_create(row);
@@ -3081,21 +3096,71 @@ static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_te
     lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
+    configure_scrolling_row_label(label, LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - 60);
+    if (parent == playlists_list && !playlists_edit_mode) {
+        lv_obj_t * chevron = lv_label_create(row);
+        lv_label_set_text(chevron, ">");
+        lv_obj_add_style(chevron, &style_theme_text_muted, 0);
+        lv_obj_set_style_text_font(chevron, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+        lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, -GUI_TEXT_INSET, 0);
+    }
     return row;
 }
 
 /* Edit-mode delete icon for a user-created .m3u row -- never wired onto the
  * Favorites/Most Played rows (see populate_playlists_screen() below), since
  * neither is backed by a real file playlist_files_delete() could remove. */
-static void playlist_delete_row_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int m3u_index = (int) (intptr_t) lv_event_get_user_data(e);
-    if (m3u_index < 0 || m3u_index >= playlists_m3u_count) return;
+static lv_obj_t * playlist_delete_popup, * playlist_delete_backdrop;
+static char playlist_action_path[PATH_MAX];
 
-    playlist_files_delete(playlists_m3u_paths[m3u_index]);
-    metadata_db_playlist_delete_one(playlists_m3u_paths[m3u_index]);
+static void playlist_delete_cancel_cb(lv_event_t * e) {
+    (void) e;
+    if (playlist_delete_popup) lv_obj_add_flag(playlist_delete_popup, LV_OBJ_FLAG_HIDDEN);
+    if (playlist_delete_backdrop) lv_obj_add_flag(playlist_delete_backdrop, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void playlist_delete_confirm_cb(lv_event_t * e) {
+    playlist_delete_cancel_cb(e);
+    if (!playlist_files_delete(playlist_action_path)) {
+        show_error_toast("Cannot delete playlist"); return;
+    }
+    metadata_db_playlist_delete_one(playlist_action_path);
     populate_playlists_screen();
-    show_error_toast("Playlist deleted");
+    show_info_toast("Playlist deleted");
+}
+
+static void playlist_delete_row_cb(lv_event_t * e) {
+    int i = (int) (intptr_t) lv_event_get_user_data(e);
+    if (i < 0 || i >= playlists_m3u_count) return;
+    snprintf(playlist_action_path, sizeof(playlist_action_path), "%s", playlists_m3u_paths[i]);
+    if (!playlist_delete_popup)
+        playlist_delete_popup = build_confirm_popup("Delete playlist?", LV_LABEL_LONG_WRAP, NULL,
+            "The playlist file will be deleted. Music files are kept.", "Delete",
+            accent_lv_color(), playlist_delete_confirm_cb, NULL, "Cancel", accent_lv_color(),
+            playlist_delete_cancel_cb, NULL, playlist_delete_cancel_cb, &playlist_delete_backdrop);
+    lv_obj_remove_flag(playlist_delete_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(playlist_delete_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(playlist_delete_backdrop);
+    lv_obj_move_foreground(playlist_delete_popup);
+}
+
+static void playlist_rename_done_cb(const char * name, void * data) {
+    (void) data;
+    char dest[PATH_MAX];
+    if (!playlist_files_rename(playlist_action_path, name, dest, sizeof(dest))) {
+        show_error_toast("Cannot rename: invalid name or file exists"); return;
+    }
+    metadata_db_playlist_delete_one(playlist_action_path);
+    metadata_db_playlist_insert_one(dest);
+    populate_playlists_screen();
+    show_info_toast("Playlist renamed");
+}
+
+static void playlist_rename_row_cb(lv_event_t * e) {
+    int i = (int) (intptr_t) lv_event_get_user_data(e);
+    if (i < 0 || i >= playlists_m3u_count) return;
+    snprintf(playlist_action_path, sizeof(playlist_action_path), "%s", playlists_m3u_paths[i]);
+    show_text_entry("Rename Playlist", basename_of(playlist_action_path), false, false, playlist_rename_done_cb, NULL);
 }
 
 static void playlists_edit_btn_cb(lv_event_t * e) {
@@ -3115,6 +3180,11 @@ static void populate_playlists_screen(void) {
     metadata_db_load_all_playlists(&playlists_m3u_paths, &playlists_m3u_count);
 
     lv_label_set_text(playlists_edit_btn, playlists_edit_mode ? "Done" : "Edit");
+    lv_obj_t * create = add_playlist_row_base(playlists_list, "+ New Playlist");
+    lv_obj_add_style(create, &style_theme_card_bg, 0);
+    lv_obj_add_flag(create, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(create, new_playlist_row_cb, LV_EVENT_CLICKED, (void *) 1);
+    build_list_section(playlists_list, "System playlists");
 
     /* Favorites/Most Played/Queue/Recently Added are never deletable (none
      * is a real .m3u file -- see playlist_row_click_cb()'s index==0..3
@@ -3150,9 +3220,22 @@ static void populate_playlists_screen(void) {
         lv_obj_add_event_cb(recently_added_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 3);
     }
 
+    build_list_section(playlists_list, "User playlists");
+    if (!playlists_m3u_count)
+        build_list_message(playlists_list, "No user playlists", "Create a playlist above or copy one to the SD card's Playlists folder.");
     for (int i = 0; i < playlists_m3u_count; i++) {
-        lv_obj_t * row = add_playlist_row_base(playlists_list, basename_of(playlists_m3u_paths[i]));
+        const char * display = playlists_m3u_paths[i];
+        if (strncmp(display, PLAYLISTS_DIR "/", strlen(PLAYLISTS_DIR) + 1) == 0) display += strlen(PLAYLISTS_DIR) + 1;
+        lv_obj_t * row = add_playlist_row_base(playlists_list, display);
+        lv_obj_set_width(lv_obj_get_child(row, 0), LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - (playlists_edit_mode ? 180 : 60));
+        lv_label_set_long_mode(lv_obj_get_child(row, 0), LV_LABEL_LONG_DOT);
         if (playlists_edit_mode) {
+            lv_obj_t * rename = lv_label_create(row);
+            lv_label_set_text(rename, "Rename");
+            lv_obj_align(rename, LV_ALIGN_RIGHT_MID, -70, 0);
+            lv_obj_add_flag(rename, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_ext_click_area(rename, 10);
+            lv_obj_add_event_cb(rename, playlist_rename_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
             lv_obj_t * delete_icon = lv_image_create(row);
             lv_image_set_src(delete_icon, asset_path("touch_list/del.png"));
             lv_obj_align(delete_icon, LV_ALIGN_RIGHT_MID, -20, 0);
@@ -3298,8 +3381,18 @@ static pthread_t library_rescan_thread;
 bool library_rescan_active = false;
 static atomic_bool library_rescan_done_flag = false;
 
+/* See scan_one_song_into_db()'s own comment on why this exists. Non-static
+ * so crash_diag_handler() (main.c) can read it directly from a signal
+ * handler -- no getter/mutex, a diagnostic breadcrumb doesn't need either,
+ * and calling a function from a signal handler than just returns a global
+ * would be no safer than reading the global itself. */
+char g_scan_last_path[PATH_MAX] = "";
+/* Published to the UI by library_rescan_done_flag's release/acquire pair. */
+static bool library_rescan_succeeded;
+
 static void * library_rescan_thread_func(void * arg) {
     (void) arg;
+    install_thread_crash_altstack(); /* see its own comment (main.c) */
 #ifdef __linux__
     struct sched_param sp = { 0 };
     sched_setscheduler(0, SCHED_BATCH, &sp);
@@ -3318,6 +3411,39 @@ static void * library_rescan_thread_func(void * arg) {
     atomic_store_explicit(&library_rescan_done_flag, true, memory_order_release); /* written last -- update_timer_cb only checks this flag */
     return NULL;
 }
+
+/* See this function's own doc comment in gui_library.h. Was false while the
+ * real-device SIGBUS below was under investigation; re-enabled now that
+ * root cause (library_rescan_thread's undersized default pthread stack --
+ * see LIBRARY_RESCAN_THREAD_STACK_SIZE's own comment just above start_
+ * library_rescan()) is fixed. Does not affect the manual Settings > Update
+ * Music Database row or plugin.refresh_library(), neither of which check
+ * this. */
+#define GUI_LIBRARY_AUTO_RESCAN_ENABLED true
+bool gui_library_auto_rescan_enabled(void) {
+    return GUI_LIBRARY_AUTO_RESCAN_ENABLED;
+}
+
+/* Real-device bug report: a real SIGBUS traced (via a "last file scanned"
+ * breadcrumb, see scan_one_song_into_db()'s own comment) to THREE different,
+ * unrelated crash sites across separate reproductions -- LVGL draw code, a
+ * metadata parser, and tagcache.c's own write_all()/tagcache_end_update()
+ * commit path -- each time landing exactly at a callee's own entry point on
+ * this exact thread. That shape (same thread, different function each time,
+ * always right at a call boundary) is the signature of a stack overflow, not
+ * a bug local to any one of those three functions: it manifests wherever the
+ * stack happens to peak that particular run, not at a fixed line. This
+ * thread's own call chain is easily the deepest and most stack-hungry in the
+ * app -- scan_one_song_into_db() -> metadata_read_isolated() -> whichever of
+ * a dozen format-specific parsers -> (eventually, once every file is done)
+ * metadata_db_end_update() -> tagcache_end_update() -> rebuild_indexes()/
+ * write_all() -- yet was the one thread in this file still created with a
+ * bare NULL attr, using whichever default musl gives it. Its own sibling,
+ * scan_walk_worker() above (SCAN_WALK_THREAD_STACK_SIZE), already reserves 1
+ * MiB for doing far less: a plain directory walk with no format parsers or
+ * tagcache commit in its own call chain at all. Matching that pattern here,
+ * with headroom above it for the deeper chain, is the fix. */
+#define LIBRARY_RESCAN_THREAD_STACK_SIZE (4 * 1024 * 1024)
 
 void start_library_rescan(void) {
     /* Real-device incident: several call sites below don't already guard on
@@ -3338,7 +3464,15 @@ void start_library_rescan(void) {
     library_rescan_active = true;
     library_rescan_token = gui_busy_show("Updating\nmusic database...", "");
     gui_busy_set_progress(library_rescan_token, 0);
-        if (pthread_create(&library_rescan_thread, NULL, library_rescan_thread_func, NULL) != 0) {
+
+    pthread_attr_t attr;
+    pthread_attr_t * attr_ptr = NULL;
+    if (pthread_attr_init(&attr) == 0) {
+        if (pthread_attr_setstacksize(&attr, LIBRARY_RESCAN_THREAD_STACK_SIZE) == 0) attr_ptr = &attr;
+    }
+    bool created = pthread_create(&library_rescan_thread, attr_ptr, library_rescan_thread_func, NULL) == 0;
+    if (attr_ptr) pthread_attr_destroy(&attr);
+    if (!created) {
         library_rescan_active = false;
         gui_busy_hide(library_rescan_token);
         show_error_toast("Thread launch failed");
@@ -3437,18 +3571,30 @@ static void refresh_library_screens_after_reload(void) {
  * -- see its own comment -- so a previously-scanned card reinserted here
  * has its own already-populated database sitting right there).
  * library_load_from_cache_only() (a bounded tagcache read, not a filesystem
- * walk -- see its own comment) already does exactly this. A missing or
- * empty database leaves the library empty; Settings > Update Music
- * Database is the only path that walks files. A toast rather than the
- * "Updating music database..." screen -- this is a reload the user did
- * not ask for. */
+ * walk -- see its own comment) already does this instantly, giving the
+ * "Library loaded" toast below (and the covered case of a genuinely fresh,
+ * never-scanned card -- see metadata_db_had_no_saved_database()'s own
+ * comment -- which this simply leaves empty here) immediate feedback.
+ *
+ * A real filesystem walk still follows unconditionally, via the exact same
+ * start_library_rescan() every other automatic trigger now uses (USB Mass
+ * Storage disconnect, Wi-Fi Import closing) -- the card could have been
+ * plugged into a PC and had files added/removed while it was out, which a
+ * cache-only reload can never see. Its own "Updating music database..."
+ * busy screen (blocking, matching every other automatic trigger's choice
+ * to prefer that over a silent background scan -- see poll_usb_storage_
+ * hotplug()'s own comment on why) briefly follows the toast rather than
+ * replacing it; poll_library_rescan()'s completion handler does its own
+ * refresh/toast once that finishes, so nothing here needs to wait for it. */
 static void reload_library_on_sd_reinsert(void) {
+    playlist_files_refresh_async(PLAYLISTS_DIR);
     library_load_from_cache_only();
     refresh_library_screens_after_reload();
     if (metadata_db_get_song_count() > 0) {
         show_info_toast("Library loaded");
         start_album_thumbnail_generation();
     }
+    if (gui_library_auto_rescan_enabled()) start_library_rescan();
 }
 
 /* How long the "Library updated" success message stays up once a rescan
@@ -3506,6 +3652,12 @@ void poll_library_rescan(void) {
      * second user-visible phase after "Updating music database..." -- no
      * progress screen, no toast. The worker yields and cancels when Albums
      * opens so visible-row decode stays first. */
+    if (!library_rescan_succeeded) {
+        gui_busy_hide(library_rescan_token);
+        nav_reset_to_home();
+        show_error_toast("Library update failed");
+        return;
+    }
     start_album_thumbnail_generation();
     gui_busy_hide(library_rescan_token); show_info_toast("Library updated");
     library_rescan_success_pending = true;
@@ -3741,17 +3893,31 @@ void poll_sd_card_hotplug(void) {
     mount_fail_streak = 0;
     sd_mount_fail_notified = false;
     unmount_confirm_streak = 0; /* seeing "mounted" again cancels any not-yet-confirmed removal */
+    /* reload_library_on_sd_reinsert() runs LAST in both branches below, real-
+     * device bug report: it used to run first, and now that it unconditionally
+     * ends with start_library_rescan() (a fresh SD card, or one with no saved
+     * database, gets a real background rescan -- see that function's own
+     * comment), that call pushes a brand-new busy screen and starts rendering
+     * it in this exact same tick. file_browser_reset_to_root() and fallback_
+     * font_on_sd_mounted() (the latter potentially swapping every global font
+     * pointer and forcing a full UI invalidate/refresh, if a custom SD-card
+     * font needs reloading) used to run against whatever screen the user was
+     * already stably looking at; running them AFTER the busy screen had just
+     * been pushed instead interleaved a font swap with that screen's own
+     * first-ever render. Settling both quick, synchronous side effects first,
+     * then triggering the (now screen-switching) reload last, removes that
+     * interleaving instead of relying on timing to avoid it. */
     if (!was_mounted && !library_rescan_active) {
-        reload_library_on_sd_reinsert();
         file_browser_reset_to_root();
         fallback_font_on_sd_mounted();
+        reload_library_on_sd_reinsert();
     } else if (!boot_library_recheck_done) {
         boot_library_recheck_done = true;
-        if (metadata_db_get_song_count() == 0 && !library_rescan_active) {
-            reload_library_on_sd_reinsert();
-            file_browser_reset_to_root();
-        }
         fallback_font_on_sd_mounted();
+        if (metadata_db_get_song_count() == 0 && !library_rescan_active) {
+            file_browser_reset_to_root();
+            reload_library_on_sd_reinsert();
+        }
     }
     was_mounted = true;
 }
@@ -4123,6 +4289,11 @@ static void music_files_tile_cb(lv_event_t * e) {
     nav_push(files_screen);
 }
 
+static void music_screen_playback_settings_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(gui_settings_get_music_screen());
+}
+
 static lv_obj_t * build_music_screen(void) {
     static icon_grid_item_t items[6];
     items[0] = (icon_grid_item_t){ "category/explorer.png", "category/explorer_s.png", "Files", music_files_tile_cb, NULL };
@@ -4138,6 +4309,12 @@ static lv_obj_t * build_music_screen(void) {
     items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
     lv_obj_t * scr = build_launcher_menu_screen("Music", generic_back_cb, items, 6, 100, false,
                                                  &launcher_layout_config.music);
+    /* Same real stock-firmware gear icon as the Queue screen's own Options
+     * button (sub_back/set.png) -- build_top_right_icon_button() guarantees
+     * it lands at exactly the same visual level as this screen's own back
+     * arrow, on the opposite corner. Shortcuts straight to Music Settings
+     * rather than the full Settings > Music Settings drill-down. */
+    build_top_right_icon_button(scr, asset_path("sub_back/set.png"), music_screen_playback_settings_cb);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -4785,7 +4962,7 @@ void gui_library_init(void) {
     library_teardown_diag("build_compact_list_widget(files_search) before");
     files_search_list = build_compact_list_widget(files_screen, NULL, 0, files_search_row_click_cb, NULL, LIST_ROW_WIDTH_WIDE, false, lv_color_black());
     lv_obj_set_style_bg_opa(files_search_list, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(files_search_list, lv_color_black(), 0);
+    lv_obj_add_style(files_search_list, &style_theme_screen_bg, 0);
     lv_obj_add_flag(files_search_list, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(files_search_list, LV_OBJ_FLAG_GESTURE_BUBBLE);
     library_teardown_diag("enable_gesture_bubble_recursive(files_search_list) before");
@@ -4836,6 +5013,10 @@ static void library_teardown_diag(const char * step) {
 }
 
 void gui_library_teardown(void) {
+    if (playlist_start_popup) { lv_obj_delete(playlist_start_popup); playlist_start_popup = NULL; }
+    if (playlist_start_backdrop) { lv_obj_delete(playlist_start_backdrop); playlist_start_backdrop = NULL; }
+    if (playlist_delete_popup) { lv_obj_delete(playlist_delete_popup); playlist_delete_popup = NULL; }
+    if (playlist_delete_backdrop) { lv_obj_delete(playlist_delete_backdrop); playlist_delete_backdrop = NULL; }
     /* poll_power_off_countdown() runs every tick from update_timer_cb,
      * which this reload never touches or pauses -- if a countdown is live
      * when a reload happens, deleting power_off_countdown_popup/backdrop
@@ -5067,6 +5248,20 @@ static void scan_one_song_into_db(const char * path) {
     cached_tags_t cached;
     if (have_stat && metadata_db_get(path, mtime, size, &cached)) return;
 
+    /* Real-device bug report: a real SIGBUS crash was traced into
+     * metadata_read_isolated()'s in-process path (only .mp3/.aac skip the
+     * fork-isolation isolated_needs_child() otherwise gives every other
+     * format -- see that function's own comment), but with no way to know
+     * WHICH file was being parsed at the moment it crashed, out of however
+     * many are on the card. This breadcrumb (best-effort, no locking -- a
+     * diagnostic string, not something correctness depends on) records the
+     * path right before the call most likely to crash, so crash_diag_
+     * handler() (main.c) can include it in the exact same reload_diag.log
+     * every other crash diagnostic in this app already writes to -- turning
+     * "some file crashed the scanner" into "this specific file did" the
+     * next time it happens. */
+    snprintf(g_scan_last_path, sizeof(g_scan_last_path), "%s", path);
+
     track_metadata_t meta;
     if (!metadata_read_isolated(path, &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS)) return;
 
@@ -5110,17 +5305,52 @@ static void scan_one_song_into_db(const char * path) {
  * whole music tree. Folded into library_scan_once() so it runs on Update
  * Music Database. Ordinary in-app create/delete update the cache with a
  * single insert/delete instead of calling this. */
+void gui_library_poll_playlists(void) {
+    static lv_obj_t * last_screen;
+    static uint32_t last_check;
+    static bool startup = true, was_storage;
+    lv_obj_t * screen = lv_screen_active();
+    bool visible = screen && (screen == playlists_screen || screen == add_to_playlist_screen);
+    bool entered = visible && screen != last_screen;
+    last_screen = screen;
+    if (playlist_files_refresh_poll() && visible) {
+        lv_obj_t * list = screen == playlists_screen ? playlists_list : add_to_playlist_list;
+        int32_t scroll = lv_obj_get_scroll_y(list);
+        if (screen == playlists_screen) populate_playlists_screen();
+        else populate_add_to_playlist_screen();
+        lv_obj_scroll_to_y(list, scroll, LV_ANIM_OFF);
+    }
+    if (!backlight_screen_is_on()) return;
+#ifndef HOST_BUILD
+    if (!sd_card_root_is_mounted()) return;
+#endif
+    uint32_t now = lv_tick_get();
+    if (!startup && !entered && now - last_check < 5000) return;
+    last_check = now;
+    usb_mode_t mode;
+    bool storage = usb_mode_control_cable_connected() && usb_mode_control_detect_current(&mode) && mode == USB_MODE_STORAGE;
+    bool returned = was_storage && !storage;
+    was_storage = storage;
+    if (storage) return;
+    if (screen == group_songs_screen && group_songs_edit_m3u_path && !group_playlist_unchanged()) {
+        struct stat st;
+        if (stat(group_songs_edit_m3u_path, &st) == 0) {
+            int32_t scroll = lv_obj_get_scroll_y(group_songs_list);
+            reload_edited_playlist();
+            lv_obj_scroll_to_y(group_songs_list, scroll, LV_ANIM_OFF);
+        }
+    }
+    if (startup || visible || returned) playlist_files_refresh_async(PLAYLISTS_DIR);
+    startup = false;
+}
+
 static void rescan_playlists(void) {
-    char ** paths = NULL;
-    int count = 0;
-    playlist_files_scan(PLAYLISTS_DIR, &paths, &count);
-    metadata_db_playlist_replace_all(paths, count);
-    for (int i = 0; i < count; i++) free(paths[i]);
-    free(paths);
+    playlist_files_reconcile(PLAYLISTS_DIR);
 }
 
 
 void library_scan_once(void) {
+    library_rescan_succeeded = false;
 #ifdef TEST_BUILD_TAG
     uint64_t scan_started_ms = test_diag_now_ms();
     uint64_t phase_started_ms = scan_started_ms;
@@ -5220,6 +5450,7 @@ void library_scan_once(void) {
     }
 
     bool committed = metadata_db_end_update();
+    library_rescan_succeeded = committed;
     if (!committed)
         fprintf(stderr, "Warning: music database commit failed -- keeping last on-disk library\n");
     TEST_DIAG("DB", "commit_end ok=%d files=%d elapsed_ms=%llu songs=%lld rss_kb=%ld", committed,

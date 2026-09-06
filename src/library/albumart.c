@@ -71,6 +71,17 @@ static void fix_path_part(char * path, int offset, int count) {
 
 static const char * const extensions[] = { "jpeg", "jpg", "png", "bmp" };
 
+/* Hash raw, separated identity fields before filename sanitization. */
+static uint64_t thumbnail_key(const albumart_info_t * info) {
+    const char * fields[] = { info->albumartist[0] ? info->albumartist : info->artist, info->album };
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (int i = 0; i < 2; i++) {
+        const unsigned char * p = (const unsigned char *) fields[i];
+        do { hash = (hash ^ *p) * UINT64_C(1099511628211); } while (*p++);
+    }
+    return hash;
+}
+
 static bool try_exts(char * path, int len) {
     if (len < 0 || (size_t) len >= PATH_MAX) return false;
     for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
@@ -141,7 +152,11 @@ bool albumart_search_files(const albumart_info_t * id3, const char * size_string
 
         artist = id3->albumartist[0] ? id3->albumartist : id3->artist;
         if (!found && artist[0] && id3->album[0]) {
-            pathlen = snprintf(path, sizeof(path), "%s/%s-%s%s.", ALBUMART_DIR, artist, id3->album, size_string);
+            if (size_string[0])
+                pathlen = snprintf(path, sizeof(path), "%s/v2-%016llx%s.", ALBUMART_DIR,
+                                   (unsigned long long) thumbnail_key(id3), size_string);
+            else
+                pathlen = snprintf(path, sizeof(path), "%s/%s-%s%s.", ALBUMART_DIR, artist, id3->album, size_string);
             fix_path_part(path, (int) strlen(ALBUMART_DIR) + 1, PATH_MAX);
             found = try_exts(path, pathlen);
         }
@@ -275,7 +290,8 @@ bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, 
     mkdir(ALBUMART_DIR, 0755);
 
     char path[PATH_MAX], tmp[PATH_MAX + 16];
-    int pathlen = snprintf(path, sizeof(path), "%s/%s-%s.%dx%d.bmp", ALBUMART_DIR, artist, info->album, width, height);
+    int pathlen = snprintf(path, sizeof(path), "%s/v2-%016llx.%dx%d.bmp", ALBUMART_DIR,
+                           (unsigned long long) thumbnail_key(info), width, height);
     if (pathlen < 0 || (size_t) pathlen >= sizeof(path)) return false;
     fix_path_part(path, (int) strlen(ALBUMART_DIR) + 1, PATH_MAX);
     if (snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path) >= (int) sizeof(tmp)) return false;

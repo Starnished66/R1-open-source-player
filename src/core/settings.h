@@ -22,7 +22,7 @@ extern const int IDLE_SHUTDOWN_STEPS[];
  * drawer sleep icon (gui.c) arms next time it's tapped -- whether the timer
  * is currently counting down is live, session-only state, not saved here. */
 extern const int SLEEP_TIMER_STEPS[];
-#define SLEEP_TIMER_STEP_COUNT 5
+#define SLEEP_TIMER_STEP_COUNT 10
 #define SETTINGS_SUBSONIC_SAVED_MAX 16
 
 typedef struct {

@@ -191,6 +191,11 @@ void metadata_db_open(void) {
     db_ready = true;
 }
 
+bool metadata_db_had_no_saved_database(void) {
+    METADATA_DB_GUARD;
+    return db_ready && tagcache_had_no_saved_database();
+}
+
 void metadata_db_close(void) {
     METADATA_DB_GUARD;
     tagcache_close();

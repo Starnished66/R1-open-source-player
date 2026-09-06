@@ -9,6 +9,18 @@
  * then the array). Returns false if root can't be read or has no playlist
  * files in it. */
 bool playlist_files_scan(const char * root, char *** out_paths, int * out_count);
+/* Recursive, complete scan: success includes an empty directory; failure
+ * never publishes a partial result. Symlink directories are not followed. */
+bool playlist_files_scan_complete(const char * root, char *** out_paths, int * out_count);
+void playlist_files_refresh_async(const char * root);
+bool playlist_files_refresh_poll(void);
+bool playlist_files_reconcile(const char * root);
+bool playlist_files_rename(const char * path, const char * name, char * out, size_t size);
+/* Entry offsets count nonempty, non-comment lines, including unavailable files.
+ * to < 0 removes exactly one occurrence; otherwise moves it before offset to. */
+bool playlist_files_edit_entry(const char * path, int from, int to);
+bool playlist_files_write_new(const char * dir, const char * name,
+                              const char * const * paths, int count, char * out, size_t size);
 
 /* Appends song_path as a new line to the M3U file at m3u_path, creating the
  * file (but not its parent directory) if it doesn't already exist. Returns
@@ -61,26 +73,21 @@ bool playlist_files_has_active_write(void);
  * thread. Caller owns *out_paths (free each entry, then the array).
  * Returns false if the file can't be read. */
 bool playlist_files_read(const char * m3u_path, char *** out_paths, int * out_count);
+typedef enum {
+    PLAYLIST_READ_OK, PLAYLIST_READ_EMPTY, PLAYLIST_READ_IO_ERROR,
+    PLAYLIST_READ_INVALID, PLAYLIST_READ_NO_MEMORY
+} playlist_read_status_t;
+playlist_read_status_t playlist_files_read_ex(const char * path, char *** paths, int * count);
 
-/* Resolves a single M3U line (as read via fgets(), already trimmed of its
- * trailing newline) against the directory m3u_path itself lives in -- a
- * line starting with '/' is treated as already-absolute and used as-is;
- * anything else is joined onto m3u_path's own directory (the standard M3U
- * convention, and the one every writer in this file now uses -- see
- * playlist_files_append()/_create()'s own comments). Shared by
- * playlist_files_read()/_contains()/_remove(), and by file_browser.c's own
- * file_browser_build_playlist_from_m3u(), which used to duplicate this
- * exact logic inline. */
+/* Resolves a single M3U line against the directory m3u_path lives in.
+ * A line starting with '/' is treated as absolute; otherwise it is resolved
+ * relative to m3u_path's directory. Shared by playlist reading/mutation helpers
+ * and file_browser.c's file_browser_build_playlist_from_m3u(). */
 void playlist_files_resolve_path(const char * m3u_path, const char * line, char * out_full_path, size_t out_size);
 
-/* Rewrites every .m3u/.m3u8 file in dir (found via playlist_files_scan())
- * so every line becomes relative to that file's own
- * directory, converting any old absolute-path entries left over from
- * before playlist_files_append()/_create() started writing relative ones.
- * Runs at most once: gated by a marker file (dir/.relative_paths_migrated),
- * so calling this on every boot is a cheap no-op after the first real run.
- * Not meant to be called on a schedule -- gui_init() calls it once, guarded
- * #ifndef HOST_BUILD, before the first library/playlist scan. */
+/* Rewrites every .m3u/.m3u8 file in dir so every line is relative to that
+ * file's own directory, migrating any absolute-path entries. Runs at most
+ * once, gated by a marker file (dir/.relative_paths_migrated). */
 void playlist_files_migrate_to_relative(const char * dir);
 
 /* Cached index of discovered .m3u paths -- tagcache does not store

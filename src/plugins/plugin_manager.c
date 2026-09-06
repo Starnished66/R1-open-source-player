@@ -186,10 +186,10 @@ static int plugin_settings_list_item_count = 0;
 static plugin_list_item_t plugin_display_list_items[PLUGIN_MAX_DISPLAY_LIST_ITEMS];
 static int plugin_display_list_item_count = 0;
 
-/* Registry for plugin.register_list_item("playback", ...) -- gui.c's
- * build_settings_playback_screen() appends these after its own 6 built-in
- * rows. See PLUGIN_MAX_PLAYBACK_LIST_ITEMS's own comment in
- * plugin_manager.h. */
+/* Registry for plugin.register_list_item("playback", ...) --
+ * gui_settings.c's build_music_plugins_screen() (Settings > Music Settings >
+ * Plugins) lists these on their own dedicated screen. See PLUGIN_MAX_
+ * PLAYBACK_LIST_ITEMS's own comment in plugin_manager.h. */
 static plugin_list_item_t plugin_playback_list_items[PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
 static int plugin_playback_list_item_count = 0;
 

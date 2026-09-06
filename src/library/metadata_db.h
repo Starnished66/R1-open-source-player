@@ -30,6 +30,12 @@ typedef struct {
  * open. */
 void metadata_db_open(void);
 void metadata_db_close(void);
+/* True when the most recent metadata_db_open() found no saved database at
+ * all on the mounted music root (fresh SD card / first run) -- see
+ * tagcache_had_no_saved_database()'s own comment. False if the SD card
+ * wasn't mounted yet when metadata_db_open() ran (nothing was actually
+ * checked that call), same as every other query against an unready DB. */
+bool metadata_db_had_no_saved_database(void);
 
 /* Starts a scan pass against the SD-resident tagcache. Unchanged files
  * are marked seen; new/changed files are upserted. metadata_db_end_update()
@@ -222,25 +228,10 @@ int metadata_db_get_songs_filtered_page(const char * query, const char * artist_
                                          const char * album_artist_filter, const char * album_filter, int offset,
                                          int max_rows, song_row_t * out_rows);
 
-/* Albums grouped and filtered by artist OR album_artist matching one name
- * -- remote_control.c's GET /api/library/albums?artist=X, gui.c's own
- * Albums screen (unfiltered). filter may be NULL/"" for every album,
- * unfiltered. Real bug caught in review: an earlier version of this
- * grouped by album name alone, so two different artists' same-titled
- * albums ("Greatest Hits", a self-titled album, a "Various Artists"
- * compilation reissued under different album_artist tags) silently merged
- * into one row -- disagreeing with metadata_db_get_group_counts()'s own
- * album count (which already correctly counted distinct (album,
- * album_artist) pairs) and combining unrelated albums' song counts/cover
- * art. Groups by the pair now, matching get_group_counts(); out_rows[i].
- * album_artist carries the second half of that identity (empty from every
- * other group-returning function here, which have no such ambiguity) --
- * needed by metadata_db_get_album_songs() below to fetch the right
- * album's songs, not just a same-named one. Offset-paginated (not
- * keyset) -- no real caller here ever continued a keyset cursor anyway
- * (every existing call passed after_name/NULL, i.e. "just the first
- * page"), and offset is what a virtualized UI list actually needs
- * (arbitrary scroll-driven jumps, not just "next page"). */
+/* Albums grouped and filtered by artist OR album_artist matching one name.
+ * filter may be NULL/"" for every album, unfiltered. Groups by distinct
+ * (album, album_artist) pairs so identically named albums remain separate;
+ * out_rows[i].album_artist carries the album artist identity. Offset-paginated. */
 int metadata_db_get_albums_page_filtered(const char * artist_or_album_artist_filter, int offset, int max_rows,
                                           group_row_t * out_rows);
 
@@ -327,20 +318,9 @@ void metadata_db_load_all_playlists(char *** out_paths, int * out_count);
 void metadata_db_playlist_insert_one(const char * path);
 void metadata_db_playlist_delete_one(const char * path);
 
-/* Saved Subsonic server profiles -- the "Saved Servers" list in gui.c's
- * Subsonic setup flow. The active connection still lives in settings.c
- * (subsonic_url/username/password/verify_tls); this is the multi-server
- * list that used to be only those four fields. Deliberately plain char*
- * params rather than subsonic_client.h's subsonic_server_t: this file
- * doesn't otherwise depend on that header, and these are the only pieces
- * of it ever needed here -- gui.c does its own struct marshaling on both
- * sides. url is the natural unique key (a real server only has one), so
- * metadata_db_subsonic_server_save() is an upsert: saving the same URL
- * again (e.g. reconnecting with updated credentials) replaces the
- * existing row rather than creating a duplicate. Password is stored in
- * plain text, same as settings.c's existing single-server field already
- * did -- no new exposure, this app has no secret-storage mechanism to
- * upgrade to. Persisted on /usr/data (see subsonic_saved_servers.c). */
+/* Saved Subsonic server profiles for the multi-server list in GUI setup.
+ * url is the unique key (saving replaces existing row). Password is stored
+ * in plain text. Persisted on /usr/data (see subsonic_saved_servers.c). */
 void metadata_db_subsonic_server_save(const char * url, const char * username, const char * password, bool verify_tls);
 
 /* Enumerates every saved server, alphabetically by URL -- caller-owned

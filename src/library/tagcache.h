@@ -55,6 +55,10 @@ typedef struct {
 bool tagcache_open(const char * dir);
 void tagcache_close(void);
 bool tagcache_is_open(void);
+/* True when the most recent tagcache_open() found no database_idx.tcd* file
+ * at all (fresh SD card / first run), as opposed to one that loaded
+ * successfully but is legitimately empty. */
+bool tagcache_had_no_saved_database(void);
 
 void tagcache_begin_update(void);
 /* Marks path seen for this pass. Returns true and fills *out when a live

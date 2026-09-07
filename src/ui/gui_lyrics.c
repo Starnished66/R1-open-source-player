@@ -596,35 +596,41 @@ static void lyrics_row_click_cb(lv_event_t * e) {
     lyrics_auto_follow = true;
     lyrics_last_centered_index = -2;
 }
-/* The ONLY way out of this screen -- see build_lyrics_screen()'s own header
- * comment for why this isn't the shared screen_gesture_event_cb() (no
- * animation here, and no left-swipe-to-player handling to speak of since
- * poll_quick_drawer_drag() already excludes lyrics_screen from that
- * gesture entirely). Manipulates nav_depth/nav_stack directly, the same
- * bookkeeping nav_pop() itself does, just finishing with a plain
- * lv_screen_load() instead of the animated screen_transition_slide(). */
+/* Shared shutdown for every way out of this screen (manual swipe-back below,
+ * and lyrics_timer_cb()'s own auto-close when a track change resolves to no
+ * lyrics) -- pauses the timer and drops the backdrop before nav_pop().
+ * Real bug caught in review: the backdrop (~768KB RGB565, LYRICS_BACKDROP_
+ * WIDTH x HEIGHT x 2) stayed allocated for the rest of the app's runtime
+ * after leaving this screen -- not a leak (poll_lyrics_backdrop() already
+ * frees the previous one before replacing it on the NEXT open), but a
+ * needless standing hold on a device with ~56MB total RAM. Freed here
+ * instead. lyrics_backdrop_img is re-hidden so a stale freed pointer in
+ * current_lyrics_backdrop_dsc can't get redrawn before the next open's own
+ * launch_lyrics_backdrop_decode() lands a fresh one -- open_lyrics_screen()
+ * already falls back to a plain dark background for that brief window
+ * regardless (see launch_lyrics_backdrop_decode()'s own comment), so this
+ * costs nothing new on re-entry beyond that already-accepted, already-
+ * documented gap. */
+static void close_lyrics_screen(void) {
+    lv_timer_pause(lyrics_timer);
+    lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
+    nav_pop();
+}
+
+/* The ONLY way a user directly leaves this screen -- see build_lyrics_
+ * screen()'s own header comment for why this isn't the shared screen_
+ * gesture_event_cb() (no animation here, and no left-swipe-to-player
+ * handling to speak of since poll_quick_drawer_drag() already excludes
+ * lyrics_screen from that gesture entirely). close_lyrics_screen() itself
+ * manipulates nav_depth/nav_stack directly via nav_pop(), the same
+ * bookkeeping a normal screen's back gesture does. */
 static void lyrics_gesture_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
     lv_indev_t * indev = lv_indev_active();
     if (!indev || lv_indev_get_gesture_dir(indev) != LV_DIR_RIGHT) return;
 
     lv_indev_wait_release(indev); /* same reasoning as screen_gesture_event_cb's own comment -- avoid a phantom tap landing on the player screen under the still-down finger */
-    lv_timer_pause(lyrics_timer);
-    /* Real bug caught in review: the backdrop (~768KB RGB565, LYRICS_
-     * BACKDROP_WIDTH x HEIGHT x 2) stayed allocated for the rest of the
-     * app's runtime after leaving this screen -- not a leak (poll_lyrics_
-     * backdrop() already frees the previous one before replacing it on the
-     * NEXT open), but a needless standing hold on a device with ~56MB total
-     * RAM. Freed here instead, on the one confirmed way out of this screen
-     * (see this function's own header comment). lyrics_backdrop_img is
-     * re-hidden so a stale freed pointer in current_lyrics_backdrop_dsc
-     * can't get redrawn before the next open's own launch_lyrics_backdrop_
-     * decode() lands a fresh one -- open_lyrics_screen() already falls back
-     * to a plain dark background for that brief window regardless (see
-     * launch_lyrics_backdrop_decode()'s own comment), so this costs nothing
-     * new on re-entry beyond that already-accepted, already-documented gap. */
-    lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
-    nav_pop();
+    close_lyrics_screen();
 }
 /* Records a manual scroll only when driven by an actual finger-press (same
  * lv_indev_get_state()==LV_INDEV_STATE_PRESSED precedent used elsewhere in
@@ -646,6 +652,36 @@ static void lyrics_timer_cb(lv_timer_t * timer) {
     poll_lyrics_backdrop();
 
     if (current_lyrics_doc_for_index != lyrics_pool_synced_for_index) {
+        /* current_lyrics_doc_for_index changes synchronously the moment the
+         * track changes (gui_lyrics_load_track()), well before the
+         * background .lrc/tag load (poll_lyrics_load(), on gui.c's own
+         * slower 500ms poll) has had a chance to resolve -- gui_lyrics_load_
+         * track() clears current_lyrics_doc_valid/current_lyrics_plain_mode
+         * to false right away too, so judging "no lyrics" on that momentary
+         * state would misjudge a track that does have lyrics, and -- since
+         * lyrics_pool_synced_for_index would already match by the time the
+         * real result lands -- never get a second chance to display them.
+         * Wait until the load actually resolves (or confirm none was
+         * needed at all, e.g. a remote track: launch_lyrics_load() then
+         * never runs and lyrics_load_generation is left unbumped) before
+         * deciding anything. */
+        if (current_lyrics_doc_generation != lyrics_load_generation) return;
+
+        if (!current_lyrics_doc_valid && !current_lyrics_plain_mode) {
+            /* The song this screen was showing lyrics for changed (manual
+             * skip or natural end-of-track advance) and the new one has
+             * none -- close back out instead of sitting on the "No
+             * synchronized lyrics found" placeholder for a track the user
+             * never asked to view lyrics for. open_lyrics_screen() already
+             * pre-syncs lyrics_pool_synced_for_index before this timer's
+             * first tick, so this branch only ever fires for a genuine
+             * track change while already open, never the initial open of a
+             * track that already has no lyrics (that case still shows the
+             * placeholder, unchanged). */
+            close_lyrics_screen();
+            return;
+        }
+
         lyrics_reset_pool();
         launch_lyrics_backdrop_decode(); /* track changed while this screen is open -- refresh the backdrop too */
     }

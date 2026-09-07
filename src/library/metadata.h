@@ -100,6 +100,14 @@ typedef struct {
  * filename, a placeholder image, or no gain adjustment in that case. */
 void metadata_read(const char * path, track_metadata_t * out);
 
+/* Reads textual tags, sequencing, and ReplayGain without extracting
+ * embedded cover artwork. Embedded lyrics are also omitted; callers that
+ * need lyrics should use the separate lyrics loader. */
+void metadata_read_without_artwork(const char * path, track_metadata_t * out);
+
+/* Like metadata_read(), but retains embedded lyrics while omitting artwork. */
+void metadata_read_lyrics_without_artwork(const char * path, track_metadata_t * out);
+
 /* Library-scan tag read. MP3/AAC (our own bounded ID3 parser) run
  * in-process. Formats that feed vendored/unbounded decoders (FLAC and
  * the other container walkers) still run in a short-lived child,

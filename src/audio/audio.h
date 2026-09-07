@@ -138,8 +138,8 @@ void audio_seek_percent(double percent);
 
 double audio_get_position_seconds(void);
 /* Pending-aware position for durable pause/power-loss checkpoints. Unlike
- * audio_get_position_seconds(), this returns the latest deferred long-MP3
- * seek target while its background index is still being prepared. */
+ * audio_get_position_seconds(), this returns the latest deferred MP3 seek
+ * target while its background seek-index is still being prepared. */
 double audio_get_resume_position_seconds(void);
 double audio_get_duration_seconds(void);
 

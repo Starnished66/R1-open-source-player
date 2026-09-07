@@ -1601,6 +1601,30 @@ static void transport_btn_ctx_delete_cb(lv_event_t * e) {
 #define TRANSPORT_SEEK_STEP_SECONDS 3.0
 #define TRANSPORT_SEEK_EOF_GUARD_SECONDS 0.5
 
+/* Shared math for both the touch long-press repeat below and the physical
+ * Next button's own hold (gui_player_hw_next_seek_steps()) -- each input
+ * source keeps its own target_seconds/playback_generation/hold_cancelled
+ * triple so a hold on one doesn't interfere with a hold on the other. */
+static void apply_transport_seek_step(double dir, int step_count, bool is_first, double * target_seconds,
+                                       uint64_t * playback_generation, bool * hold_cancelled) {
+    if (step_count <= 0) return;
+    uint64_t gen = audio_get_playback_generation();
+    if (is_first) {
+        *target_seconds = audio_get_position_seconds();
+        *playback_generation = gen;
+        *hold_cancelled = false;
+    } else if (gen != *playback_generation) {
+        *hold_cancelled = true;
+    }
+    if (*hold_cancelled) return;
+    *target_seconds += dir * TRANSPORT_SEEK_STEP_SECONDS * (double) step_count;
+    if (*target_seconds < 0.0) *target_seconds = 0.0;
+    double duration = audio_get_duration_seconds();
+    double max_target = duration > TRANSPORT_SEEK_EOF_GUARD_SECONDS ? duration - TRANSPORT_SEEK_EOF_GUARD_SECONDS : 0.0;
+    if (*target_seconds > max_target) *target_seconds = max_target;
+    audio_seek(*target_seconds);
+}
+
 static double transport_seek_target_seconds;
 static uint64_t transport_seek_playback_generation;
 static bool transport_seek_hold_cancelled;
@@ -1609,21 +1633,20 @@ static void transport_seek_repeat_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code != LV_EVENT_LONG_PRESSED && code != LV_EVENT_LONG_PRESSED_REPEAT) return;
     double dir = (double) (intptr_t) lv_event_get_user_data(e);
-    uint64_t gen = audio_get_playback_generation();
-    if (code == LV_EVENT_LONG_PRESSED) {
-        transport_seek_target_seconds = audio_get_position_seconds();
-        transport_seek_playback_generation = gen;
-        transport_seek_hold_cancelled = false;
-    } else if (gen != transport_seek_playback_generation) {
-        transport_seek_hold_cancelled = true;
-    }
-    if (transport_seek_hold_cancelled) return;
-    transport_seek_target_seconds += dir * TRANSPORT_SEEK_STEP_SECONDS;
-    if (transport_seek_target_seconds < 0.0) transport_seek_target_seconds = 0.0;
-    double duration = audio_get_duration_seconds();
-    double max_target = duration > TRANSPORT_SEEK_EOF_GUARD_SECONDS ? duration - TRANSPORT_SEEK_EOF_GUARD_SECONDS : 0.0;
-    if (transport_seek_target_seconds > max_target) transport_seek_target_seconds = max_target;
-    audio_seek(transport_seek_target_seconds);
+    apply_transport_seek_step(dir, 1, code == LV_EVENT_LONG_PRESSED, &transport_seek_target_seconds,
+                               &transport_seek_playback_generation, &transport_seek_hold_cancelled);
+}
+
+/* Physical Next button, held -- see hw_buttons_consume_next_seek_steps()'s
+ * own comment. Called from gui.c's update_timer_cb with however many steps
+ * accumulated since the last poll. */
+static double hw_next_seek_target_seconds;
+static uint64_t hw_next_seek_playback_generation;
+static bool hw_next_seek_hold_cancelled;
+
+void gui_player_hw_next_seek_steps(int step_count, bool is_first) {
+    apply_transport_seek_step(1.0, step_count, is_first, &hw_next_seek_target_seconds,
+                               &hw_next_seek_playback_generation, &hw_next_seek_hold_cancelled);
 }
 
 /* LV_EVENT_CLICKED still fires on release even after a long press (LVGL's

@@ -20,8 +20,26 @@ void hw_buttons_init(void);
  * window -- see hw_buttons.c's play_pause_press_count for why this is a
  * count rather than a bool), and resets it to 0. */
 int hw_buttons_consume_play_pause(void);
+
+/* True once a press-and-release completes WITHOUT having crossed the
+ * hold-to-seek threshold (see hw_buttons_consume_next_seek_steps() below) --
+ * same "fires on release, suppressed once the hold takes over" convention as
+ * hw_buttons_consume_power()/_power_long_press() above. */
 bool hw_buttons_consume_next(void);
 bool hw_buttons_consume_prev(void);
+
+/* Next button, held: number of forward-seek steps (each worth
+ * TRANSPORT_SEEK_STEP_SECONDS, gui_player.c) accumulated since the last
+ * call, then reset to 0 -- same accumulate-on-the-reader-thread,
+ * apply-on-the-GUI-thread split as hw_buttons_consume_volume_delta(), so the
+ * repeat rate isn't limited by the GUI's own 500ms poll interval.
+ * *out_is_first is set true if this batch includes the very first step of a
+ * new hold (the caller should reset its seek-target accumulator from the
+ * live playback position for that step, same as a touch long-press's first
+ * LV_EVENT_LONG_PRESSED vs its later LV_EVENT_LONG_PRESSED_REPEAT ticks).
+ * Mutually exclusive with hw_buttons_consume_next() for the same physical
+ * press, same as the power button's short-tap/long-press pair. */
+int hw_buttons_consume_next_seek_steps(bool * out_is_first);
 
 /* Power button, short tap: true once a press-and-release completes without
  * having crossed the long-press threshold (see hw_buttons_consume_power_

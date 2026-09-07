@@ -27,6 +27,7 @@
 #include "gui_plugin_manage.h"
 #include "fallback_font.h"
 #include "gui_navigation.h"
+#include "db_log.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -53,6 +54,7 @@ static lv_obj_t * settings_display_screen;
 static lv_obj_t * settings_power_screen;
 static lv_obj_t * settings_system_screen;
 static lv_obj_t * about_screen;
+static lv_obj_t * dev_options_screen;
 static lv_obj_t * accent_color_screen;
 static lv_obj_t * custom_font_screen;
 static lv_obj_t * screen_timeout_screen;
@@ -404,13 +406,39 @@ void firmware_update_row_cb(lv_event_t * e) {
     lv_obj_move_foreground(firmware_update_popup);
 }
 
+static void dev_options_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(dev_options_screen);
+}
+
 static lv_obj_t * build_about_screen(void) {
-    static pill_list_item_t items[3];
+    static pill_list_item_t items[4];
     items[0] = (pill_list_item_t){ "Open Source Player for HiBy OS", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[1] = (pill_list_item_t){ app_version_label(), PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, gui_theme_accent_style(), GUI_ROW_GAP);
+    items[3] =
+        (pill_list_item_t){ "Developer Options", PILL_ACCESSORY_CHEVRON, false, dev_options_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 4, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void db_logging_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.db_logging_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+    db_log_set_enabled(current_settings.db_logging_enabled);
+}
+
+/* Writes a detailed timestamped log of library database scans and album art
+ * cache jobs (including lazy load) to .logs/database_artwork.log on the SD
+ * card -- see db_log.h. */
+static lv_obj_t * build_dev_options_screen(void) {
+    static pill_list_item_t items[1];
+    items[0] = (pill_list_item_t){ "Enable database logging", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.db_logging_enabled, NULL, db_logging_switch_event_cb, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Developer Options", generic_back_cb, items, 1, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -2831,6 +2859,7 @@ static lv_obj_t * build_eq_screen(void) {
 
 void gui_settings_init(void) {
     about_screen = build_about_screen();
+    dev_options_screen = build_dev_options_screen();
     accent_color_screen = build_accent_color_screen();
     custom_font_screen = build_custom_font_screen();
     screen_timeout_screen = build_screen_timeout_screen();
@@ -2881,6 +2910,7 @@ void gui_settings_teardown(void) {
     if (hostname_reboot_popup_backdrop) { lv_obj_del(hostname_reboot_popup_backdrop); hostname_reboot_popup_backdrop = NULL; }
 
     if (about_screen) { lv_obj_del(about_screen); about_screen = NULL; }
+    if (dev_options_screen) { lv_obj_del(dev_options_screen); dev_options_screen = NULL; }
     if (accent_color_screen) { lv_obj_del(accent_color_screen); accent_color_screen = NULL; }
     if (custom_font_screen) { lv_obj_del(custom_font_screen); custom_font_screen = NULL; }
     if (screen_timeout_screen) { lv_obj_del(screen_timeout_screen); screen_timeout_screen = NULL; }

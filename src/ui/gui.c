@@ -37,6 +37,7 @@
 #include "peq.h"
 #include "screen_builders.h"
 #include "settings.h"
+#include "db_log.h"
 #include "subsonic_client.h"
 #include "http_client.h"
 #include "cover_decode.h"
@@ -442,6 +443,14 @@ static void update_timer_cb(lv_timer_t * timer) {
     bool skipped_prev = hw_buttons_consume_prev();
     if (skipped_prev) {
         gui_player_step_manual(-1);
+    }
+    /* Holding the physical Next button fast-forwards within the track, same
+     * as holding the touch one -- see hw_buttons_consume_next_seek_steps()'s
+     * own comment. */
+    bool next_seek_is_first;
+    int next_seek_steps = hw_buttons_consume_next_seek_steps(&next_seek_is_first);
+    if (next_seek_steps > 0) {
+        gui_player_hw_next_seek_steps(next_seek_steps, next_seek_is_first);
     }
 
 #ifndef HOST_BUILD
@@ -1300,6 +1309,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     boot_checkpoint("gui_init entered");
 #endif
     settings_load(&current_settings);
+    db_log_set_enabled(current_settings.db_logging_enabled);
     app_clock_init(current_settings.clock_automatic, current_settings.clock_manual_epoch,
                    current_settings.clock_system_reference);
 #ifndef HOST_BUILD

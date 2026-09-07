@@ -831,14 +831,216 @@ void poll_cover_decode(void) {
 
 
 
+/* ---- Asynchronous favorite persistence worker -------------------------
+ * Favorite persistence calls metadata_db_song_favorite_set(), which may
+ * acquire global metadata locks, trigger tagcache updates, or synchronously
+ * rewrite and fsync() remote state files (remote_state_set_rating()).
+ * Executing this directly on the LVGL UI thread stalls rendering and causes
+ * tap latency or freezes.
+ *
+ * This long-lived worker thread queues and persists favorite requests off the
+ * UI thread. Rapid taps on the same track are coalesced using a 150 ms debounce
+ * window so intermediate states are collapsed into the final requested state.
+ * Distinct tracks maintain independent entries with owned path copies so track
+ * changes do not overwrite or corrupt pending persistence operations. ---- */
+#define FAVORITE_QUEUE_INITIAL_CAPACITY 8
+#define FAVORITE_DEBOUNCE_MS 150
+#define FAVORITE_WORKER_STACK_SIZE (128 * 1024)
+
+typedef struct {
+    char * path;
+    bool is_favorite;
+    struct timespec deadline;
+} favorite_req_t;
+
+static pthread_t favorite_worker_thread;
+static pthread_mutex_t favorite_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t favorite_worker_cond;
+static pthread_once_t favorite_worker_once = PTHREAD_ONCE_INIT;
+static bool favorite_worker_ready = false;
+
+static favorite_req_t * favorite_queue = NULL;
+static int favorite_queue_count = 0;
+static int favorite_queue_capacity = 0;
+
+static void * favorite_worker_main(void * unused) {
+    (void) unused;
+    for (;;) {
+        pthread_mutex_lock(&favorite_worker_mutex);
+        while (favorite_queue_count == 0) {
+            pthread_cond_wait(&favorite_worker_cond, &favorite_worker_mutex);
+        }
+
+        int ready_idx = -1;
+        while (ready_idx < 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+
+            struct timespec earliest = favorite_queue[0].deadline;
+            int earliest_idx = 0;
+            for (int i = 1; i < favorite_queue_count; i++) {
+                if (favorite_queue[i].deadline.tv_sec < earliest.tv_sec ||
+                    (favorite_queue[i].deadline.tv_sec == earliest.tv_sec &&
+                     favorite_queue[i].deadline.tv_nsec < earliest.tv_nsec)) {
+                    earliest = favorite_queue[i].deadline;
+                    earliest_idx = i;
+                }
+            }
+
+            if (now.tv_sec > earliest.tv_sec ||
+                (now.tv_sec == earliest.tv_sec && now.tv_nsec >= earliest.tv_nsec)) {
+                ready_idx = earliest_idx;
+                break;
+            }
+
+            int ret = pthread_cond_timedwait(&favorite_worker_cond, &favorite_worker_mutex, &earliest);
+            (void) ret;
+            if (favorite_queue_count == 0) break;
+        }
+
+        if (ready_idx < 0) {
+            pthread_mutex_unlock(&favorite_worker_mutex);
+            continue;
+        }
+
+        /* Dequeue the ready request and take ownership */
+        char * req_path = favorite_queue[ready_idx].path;
+        bool req_fav = favorite_queue[ready_idx].is_favorite;
+
+        for (int i = ready_idx; i < favorite_queue_count - 1; i++) {
+            favorite_queue[i] = favorite_queue[i + 1];
+        }
+        favorite_queue_count--;
+
+        /* Unlock worker mutex before calling metadata DB / file I/O */
+        pthread_mutex_unlock(&favorite_worker_mutex);
+
+        if (req_path) {
+            metadata_db_song_favorite_set(req_path, req_fav);
+            free(req_path);
+        }
+    }
+    return NULL;
+}
+
+static void favorite_start_worker(void) {
+    pthread_condattr_t cattr;
+    if (pthread_condattr_init(&cattr) != 0) {
+        fprintf(stderr, "gui_player: failed to initialize favorite worker condition variable\n");
+        return;
+    }
+    if (pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) != 0 ||
+        pthread_cond_init(&favorite_worker_cond, &cattr) != 0) {
+        fprintf(stderr, "gui_player: failed to initialize favorite worker condition variable\n");
+        pthread_condattr_destroy(&cattr);
+        return;
+    }
+    pthread_condattr_destroy(&cattr);
+
+    favorite_queue = calloc(FAVORITE_QUEUE_INITIAL_CAPACITY, sizeof(*favorite_queue));
+    if (!favorite_queue) {
+        fprintf(stderr, "gui_player: failed to allocate favorite persistence queue\n");
+        pthread_cond_destroy(&favorite_worker_cond);
+        return;
+    }
+    favorite_queue_capacity = FAVORITE_QUEUE_INITIAL_CAPACITY;
+
+    pthread_attr_t attr;
+    bool attr_initialized = pthread_attr_init(&attr) == 0;
+    if (attr_initialized) pthread_attr_setstacksize(&attr, FAVORITE_WORKER_STACK_SIZE);
+    int create_rc = pthread_create(&favorite_worker_thread, attr_initialized ? &attr : NULL,
+                                   favorite_worker_main, NULL);
+    if (attr_initialized) pthread_attr_destroy(&attr);
+    if (create_rc == 0) {
+        pthread_detach(favorite_worker_thread);
+        favorite_worker_ready = true;
+    } else {
+        fprintf(stderr, "gui_player: failed to spawn favorite persistence worker thread\n");
+        free(favorite_queue);
+        favorite_queue = NULL;
+        favorite_queue_capacity = 0;
+        pthread_cond_destroy(&favorite_worker_cond);
+    }
+}
+
+static void favorite_queue_submit(const char * path, bool is_favorite) {
+    if (!path) return;
+    pthread_once(&favorite_worker_once, favorite_start_worker);
+    if (!favorite_worker_ready) {
+        fprintf(stderr, "gui_player: favorite worker not ready; dropping async persistence\n");
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    struct timespec deadline = now;
+    deadline.tv_nsec += (long) FAVORITE_DEBOUNCE_MS * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+        deadline.tv_nsec %= 1000000000L;
+    }
+
+    pthread_mutex_lock(&favorite_worker_mutex);
+
+    /* 1. Coalesce by exact path match if already queued */
+    for (int i = 0; i < favorite_queue_count; i++) {
+        if (strcmp(favorite_queue[i].path, path) == 0) {
+            favorite_queue[i].is_favorite = is_favorite;
+            favorite_queue[i].deadline = deadline;
+            pthread_cond_signal(&favorite_worker_cond);
+            pthread_mutex_unlock(&favorite_worker_mutex);
+            return;
+        }
+    }
+
+    /* 2. New track entry: allocate owned path copy */
+    char * path_copy = strdup(path);
+    if (!path_copy) {
+        fprintf(stderr, "gui_player: strdup failed for favorite path '%s'\n", path);
+        pthread_mutex_unlock(&favorite_worker_mutex);
+        return;
+    }
+
+    /* Grow only for distinct tracks. Same-track tap storms are coalesced
+     * above, while this path keeps the LVGL thread from waiting for slow
+     * metadata or SD-card I/O and never evicts an acknowledged change. */
+    if (favorite_queue_count >= favorite_queue_capacity) {
+        int new_capacity = favorite_queue_capacity * 2;
+        favorite_req_t * grown = realloc(favorite_queue,
+                                          sizeof(*favorite_queue) * (size_t) new_capacity);
+        if (!grown) {
+            fprintf(stderr, "gui_player: failed to grow favorite persistence queue\n");
+            free(path_copy);
+            pthread_mutex_unlock(&favorite_worker_mutex);
+            return;
+        }
+        favorite_queue = grown;
+        favorite_queue_capacity = new_capacity;
+    }
+
+    favorite_queue[favorite_queue_count].path = path_copy;
+    favorite_queue[favorite_queue_count].is_favorite = is_favorite;
+    favorite_queue[favorite_queue_count].deadline = deadline;
+    favorite_queue_count++;
+
+    pthread_cond_signal(&favorite_worker_cond);
+    pthread_mutex_unlock(&favorite_worker_mutex);
+}
+
 void favorite_icon_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     if (playlist_index < 0 || playlist_index >= playlist_count) return;
 
+    const char * path = playlist_path_at(playlist_index);
+    if (!path) return;
+
     favorite_is_set = !favorite_is_set;
-    metadata_db_song_favorite_set(playlist_path_at(playlist_index), favorite_is_set);
-    lv_image_set_src(favorite_icon, asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
+    if (favorite_icon) {
+        lv_image_set_src(favorite_icon, asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
+    }
     gui_shell_update_quick_drawer_favorite(favorite_is_set);
+
+    favorite_queue_submit(path, favorite_is_set);
 }
 
 void arm_next_track_for_audio(int index);
@@ -1466,18 +1668,6 @@ static void debug_transport_btn_all_cb(lv_event_t * e) {
 }
 #endif
 
-#ifdef UI_HITBOX_DEBUG
-/* Outlines `obj`'s click hit-test boundary -- its drawn size plus
- * whatever lv_obj_set_ext_click_area(obj, ext) padded it out by -- in a
- * distinct solid color per transport-row icon for hitbox inspection. */
-static void debug_paint_hitbox(lv_obj_t * obj, int32_t ext, lv_color_t color) {
-    lv_obj_set_style_outline_width(obj, 3, 0);
-    lv_obj_set_style_outline_pad(obj, ext, 0);
-    lv_obj_set_style_outline_color(obj, color, 0);
-    lv_obj_set_style_outline_opa(obj, LV_OPA_COVER, 0);
-}
-#endif
-
 /* Extends the vertical reach of transport buttons (mode/play/prev/next/more)
  * up to a single shared top line (roughly level with song_count_label).
  * A separate invisible, absolutely-positioned sibling marked
@@ -1585,6 +1775,7 @@ static void progress_slider_event_cb(lv_event_t * e) {
 /* favorite_icon (also 40x40) has no clickable neighbors, so this can go
  * wider than the tightly-packed transport row above. */
 #define FAVORITE_ICON_EXT_CLICK_AREA 24
+#define FAVORITE_ICON_EXTRA_LEFT_CLICK_AREA 10
 
 /* Distance above play_btn's top edge for the shared transport hit area
  * line (roughly level with song_count_label without overlapping the progress
@@ -1664,10 +1855,6 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_border_width(title_row, 0, 0);
     lv_obj_set_style_pad_all(title_row, 0, 0);
     lv_obj_remove_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
-    /* Row is exactly content-height (40px, favorite_icon's own height), so
-     * without this its ext_click_area outline would render clipped away --
-     * see gui_shell.c's own comment on lv_obj's default child clipping. */
-    lv_obj_add_flag(title_row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -1685,13 +1872,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
     favorite_icon = lv_image_create(title_row);
     lv_image_set_src(favorite_icon, asset_path("playing_plane/collect_out.png"));
-    lv_obj_add_flag(favorite_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(favorite_icon, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(favorite_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
-    lv_obj_set_ext_click_area(favorite_icon, FAVORITE_ICON_EXT_CLICK_AREA);
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(favorite_icon, FAVORITE_ICON_EXT_CLICK_AREA, lv_color_hex((uint32_t) rand() & 0xFFFFFFu));
-#endif
 
     /* Artist row: artist (left) + format/quality badge (right). */
     lv_obj_t * artist_row = lv_obj_create(overlay);
@@ -1913,6 +2094,31 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(prev_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(next_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(more_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+#endif
+
+    /* Use one explicit target because LVGL's ext-click API is symmetric. It
+     * preserves the proven bounds and adds ten pixels only on the left. */
+    lv_obj_update_layout(scr);
+    lv_area_t favorite_area;
+    lv_obj_get_coords(favorite_icon, &favorite_area);
+    lv_obj_t * favorite_hit = lv_obj_create(scr);
+    lv_obj_remove_style_all(favorite_hit);
+    lv_obj_set_pos(favorite_hit,
+                   favorite_area.x1 - FAVORITE_ICON_EXT_CLICK_AREA - FAVORITE_ICON_EXTRA_LEFT_CLICK_AREA,
+                   favorite_area.y1 - FAVORITE_ICON_EXT_CLICK_AREA);
+    lv_obj_set_size(favorite_hit,
+                    lv_area_get_width(&favorite_area) + 2 * FAVORITE_ICON_EXT_CLICK_AREA +
+                        FAVORITE_ICON_EXTRA_LEFT_CLICK_AREA,
+                    lv_area_get_height(&favorite_area) + 2 * FAVORITE_ICON_EXT_CLICK_AREA);
+    lv_obj_add_flag(favorite_hit, LV_OBJ_FLAG_IGNORE_LAYOUT | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(favorite_hit, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(favorite_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, favorite_icon);
+    lv_obj_add_event_cb(favorite_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, favorite_icon);
+    lv_obj_add_event_cb(favorite_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, favorite_icon);
+#ifdef UI_HITBOX_DEBUG
+    lv_obj_set_style_border_width(favorite_hit, 3, 0);
+    lv_obj_set_style_border_color(favorite_hit, lv_palette_main(LV_PALETTE_PINK), 0);
+    lv_obj_set_style_border_opa(favorite_hit, LV_OPA_COVER, 0);
 #endif
 
     /* Volume is controlled via hardware buttons (see update_timer_cb) and,
@@ -3200,6 +3406,9 @@ void clock_24h_switch_event_cb(lv_event_t * e) {
 
 
 void gui_player_init(uint32_t screen_width, uint32_t screen_height) {
+    /* Pay thread and stack setup during initialization, not inside the first
+     * favorite tap where it would visibly block the LVGL event callback. */
+    pthread_once(&favorite_worker_once, favorite_start_worker);
     build_volume_popup();
     build_delete_song_popup();
     build_more_menu_popup();
@@ -3244,6 +3453,7 @@ void gui_player_teardown(void) {
     if (more_menu_popup_backdrop) { lv_obj_del(more_menu_popup_backdrop); more_menu_popup_backdrop = NULL; }
     gui_track_info_teardown();
     if (player_screen) { lv_obj_del(player_screen); player_screen = NULL; }
+    favorite_icon = NULL;
     asset_png_memory_free(progress_bg_image); progress_bg_image = NULL;
     asset_png_memory_free(progress_fill_image); progress_fill_image = NULL;
     volume_slider = NULL;

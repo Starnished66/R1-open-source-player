@@ -50,6 +50,7 @@ static uint64_t current_playback_generation = 0;
 #include "metadata.h"
 #include "metadata_db.h"
 #include "cover_decode.h"
+#include "db_log.h"
 #include "airplay_control.h"
 #include "albumart.h"
 #include "audio.h"
@@ -445,12 +446,12 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
 
 /* Cover art decoding (cover_decode_to_rgb565()) and reflection blur
  * computation are offloaded to a background pthread to avoid blocking the
- * UI thread. launch_cover_decode() spawns the worker thread, and
+ * UI thread. launch_cover_decode_req() spawns the worker thread, and
  * poll_cover_decode() (called periodically from update_timer_cb) applies
  * the decoded RGB565 buffers to the image widgets once ready. */
 typedef struct {
     int for_index;
-    uint8_t * picture_data; /* owned; NULL if the track has no embedded art */
+    uint8_t * picture_data; /* owned download buffer for streamed artwork */
     uint32_t picture_size;
 
     /* Set instead of picture_data/picture_size for a Subsonic stream's cover
@@ -461,8 +462,8 @@ typedef struct {
      * every other caller. */
     char stream_url[1536];
     bool stream_verify_tls;
-    /* Local track whose directory should be searched when embedded art is
-     * absent. The lookup and file read stay on this worker thread. Artist/
+    /* Local track identifying its generated album cache. The lookup and
+     * file read stay on this worker thread. Artist/
      * album come from the already-parsed track (or the DB), never from a
      * second metadata_read() -- that re-parse OOMs on huge ID3/APIC tags. */
     char local_track_path[PATH_MAX];
@@ -486,21 +487,16 @@ static bool cover_decode_result_ok;
 static uint16_t * cover_decode_result_pixels;    /* COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565, owned */
 static uint8_t * cover_decode_result_reflection; /* REFLECTION_WIDTH x REFLECTION_HEIGHT RGB565, owned */
 
-static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t picture_size,
-                                const char * track_path, const char * artist, const char * album,
-                                const char * album_artist);
 
-/* Holds at most one superseded request -- see launch_cover_decode()'s own
+/* Holds at most one superseded request -- see launch_cover_decode_req()'s own
  * comment on why a track change that arrives while a decode is already in
  * flight can't just be dropped (that would leave the cover permanently
  * stuck showing an earlier track's art). */
 static bool cover_decode_pending_valid = false;
 static cover_decode_request_t cover_decode_pending;
 
-/* Compressed sidecar cap. cover_decode.c also rejects sources above
- * 1200x1200 before allocating RGB888, so a 4000px cover.jpg that still
- * fits in 4 MiB compressed cannot OOM the ~56 MiB target. Oversized art
- * falls back to the default image. */
+/* Bound reads even if a generated cache file was replaced or corrupted.
+ * The expected 480x480 BMP occupies 691254 bytes. */
 #define EXTERNAL_COVER_MAX_BYTES (4U * 1024U * 1024U)
 
 static void albumart_info_from_path_tags(const char * track_path, const char * artist, const char * album,
@@ -516,52 +512,86 @@ void albumart_info_from_song_row(const song_row_t * song, albumart_info_t * info
     albumart_info_from_path_tags(song->path, song->tags.artist, song->tags.album, song->tags.album_artist, info);
 }
 
-/* Rockbox albumart.c search: sized file first, then generic cover/folder
- * next to the track, then MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.
- * Tags are supplied by the caller (already-parsed track or DB row). This
- * must not open the audio file.
- *
- * Unlike albumart_find() (which stops at the first candidate that merely
- * *exists* on disk, sized candidate preferred), this decodes each candidate
- * and only accepts it on a real decode success -- a corrupt/truncated sized
- * cache file must not block falling through to a perfectly good folder.jpg/
- * cover.jpg. Mirrors the sized-then-generic fallthrough gui_library.c's own
- * album_thumbnail_load_or_decode_ex() already does for the 72x72 thumbnail
- * cache, just against Rockbox's generic sized-file convention instead. */
-static bool load_and_decode_external_cover(const char * track_path, const char * artist, const char * album,
-                                           const char * album_artist, uint16_t ** out_pixels) {
+/* Session-scoped negative cache for load_cached_player_cover()'s slow path:
+ * a track with no art anywhere (no sidecar, no embedded picture) or with
+ * tags too empty for albumart_store_rgb565()'s artist+album requirement
+ * can never produce a persistable cache entry, so without this,
+ * gui_library_generate_player_cover()'s full fork+isolated-extract fallback
+ * would silently re-run on every single play of that track -- exactly the
+ * per-play cost this feature exists to eliminate. Small, bounded, path-hash
+ * keyed (FNV-1a, same convention already used for cache filenames
+ * elsewhere in this codebase); cleared only by an app restart, which is
+ * fine since art appearing for an already-negative track mid-session (the
+ * user edited its tags while it happened to be playing) is rare enough to
+ * not warrant mtime tracking here. */
+#define PLAYER_COVER_NEGATIVE_CACHE_SIZE 32
+static uint64_t player_cover_negative_cache[PLAYER_COVER_NEGATIVE_CACHE_SIZE];
+static int player_cover_negative_cache_next = 0;
+
+static uint64_t player_cover_path_hash(const char * path) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char * p = (const unsigned char *) path; *p; p++)
+        hash = (hash ^ *p) * UINT64_C(1099511628211);
+    return hash;
+}
+
+static bool player_cover_negative_cache_hit(const char * path) {
+    uint64_t h = player_cover_path_hash(path);
+    for (int i = 0; i < PLAYER_COVER_NEGATIVE_CACHE_SIZE; i++)
+        if (player_cover_negative_cache[i] == h) return true;
+    return false;
+}
+
+static void player_cover_negative_cache_add(const char * path) {
+    player_cover_negative_cache[player_cover_negative_cache_next] = player_cover_path_hash(path);
+    player_cover_negative_cache_next = (player_cover_negative_cache_next + 1) % PLAYER_COVER_NEGATIVE_CACHE_SIZE;
+}
+
+/* Local playback uses the generated 480px BMP. Never decode the original
+ * embedded/sidecar image directly here: cache generation owns that
+ * expensive work -- normally the background warmer, or, for a track it
+ * hasn't reached yet, the one-time-per-session fallback below. */
+static bool load_cached_player_cover(const char * track_path, const char * artist, const char * album,
+                                      const char * album_artist, uint16_t ** out_pixels) {
     albumart_info_t info;
     albumart_info_from_path_tags(track_path, artist, album, album_artist, &info);
-
-    char sized[24];
-    snprintf(sized, sizeof(sized), ".%dx%d", COVER_ART_WIDTH, COVER_ART_HEIGHT);
-    const char * size_strings[2] = { sized, "" };
-
-    for (size_t i = 0; i < 2; i++) {
-        char found[PATH_MAX];
-        if (!albumart_search_files(&info, size_strings[i], found, sizeof(found))) continue;
+    char found[PATH_MAX];
+    if (albumart_generated_cache_fresh(&info, ALBUMART_PLAYER_CACHE_SIZE,
+                                  ALBUMART_PLAYER_CACHE_SIZE, found, sizeof(found))) {
         uint8_t * data = NULL;
         uint32_t size = 0;
-        albumart_load_result_t load = albumart_load_file_ex(found, &data, &size,
-                                                           EXTERNAL_COVER_MAX_BYTES, ARTWORK_PRIO_PLAYER);
-        if (load == ALBUMART_LOAD_TEMPORARY) return false;
-        if (load != ALBUMART_LOAD_OK) continue;
-        if (size == 0) {
+        if (albumart_load_file_ex(found, &data, &size, EXTERNAL_COVER_MAX_BYTES,
+                                 ARTWORK_PRIO_PLAYER) == ALBUMART_LOAD_OK) {
+            cover_decode_result_t result = cover_decode_to_rgb565_ex(data, size,
+                COVER_ART_WIDTH, COVER_ART_HEIGHT, ARTWORK_PRIO_PLAYER, NULL, NULL, out_pixels);
             free(data);
-            continue;
+            if (result == COVER_DECODE_OK) {
+                DB_LOG("ART_PLAYER", "cache_hit path=%s file=%s", track_path, found);
+                return true;
+            }
         }
-        /* Structured result, same reasoning as cover_decode_thread_func()'s
-         * own embedded-art check: only retry the next candidate (or, for
-         * the outer caller, give up on external art entirely) on a
-         * permanent failure. A temporary one means the coordinator is
-         * already under pressure -- immediately reading and decoding a
-         * second file would make that worse, not better. */
-        cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, COVER_ART_WIDTH, COVER_ART_HEIGHT,
-                                                              ARTWORK_PRIO_PLAYER, NULL, NULL, out_pixels);
-        free(data);
-        if (res == COVER_DECODE_OK) return true;
-        if (!cover_decode_result_is_permanent(res)) return false;
     }
+
+    if (player_cover_negative_cache_hit(track_path)) {
+        DB_LOG("ART_PLAYER", "no_art_known path=%s", track_path);
+        return false;
+    }
+
+    /* Cache miss -- this track's album hasn't been warmed yet (freshly
+     * added, or the background scan just hasn't reached it). Generate and
+     * persist the cache now so every later play of this track hits the
+     * fast path above. */
+    bool no_art_confirmed = false;
+    if (gui_library_generate_player_cover(track_path, artist, album, album_artist,
+                                          NULL, NULL, out_pixels, &no_art_confirmed)) {
+        DB_LOG("ART_PLAYER", "cache_miss_generated path=%s", track_path);
+        return true;
+    }
+    /* Only remember a confirmed "no art anywhere" result -- a transient one
+     * (coordinator busy, isolated-helper fork/timeout) must retry on the
+     * next play, not get silently and permanently suppressed. */
+    DB_LOG("ART_PLAYER", "cache_miss_failed path=%s confirmed=%d", track_path, no_art_confirmed);
+    if (no_art_confirmed) player_cover_negative_cache_add(track_path);
     return false;
 }
 
@@ -588,28 +618,9 @@ static void * cover_decode_thread_func(void * arg) {
              cover_decode_to_rgb565(req->picture_data, req->picture_size, COVER_ART_WIDTH, COVER_ART_HEIGHT, &pixels);
         free(req->picture_data);
         req->picture_data = NULL;
-    } else if (req->picture_data) {
-        /* Structured result instead of the plain bool wrapper: a fallback
-         * to external art must only trigger on a permanent failure
-         * (corrupt data or exceeds decode dimension cap; JPEG allows 4k if it
-         * scales, PNG/BMP cap at 1200 native). LOW_MEMORY/BUSY/
-         * CANCELLED/ALLOC mean the decode coordinator is already under
-         * pressure -- immediately launching a second file read + decode
-         * attempt there would turn one coordinator timeout into two and
-         * add load exactly when there's least room for it. */
-        cover_decode_result_t res = cover_decode_to_rgb565_ex(req->picture_data, req->picture_size,
-                                                              COVER_ART_WIDTH, COVER_ART_HEIGHT,
-                                                              ARTWORK_PRIO_PLAYER, NULL, NULL, &pixels);
-        free(req->picture_data);
-        req->picture_data = NULL;
-        ok = (res == COVER_DECODE_OK);
-        if (!ok && cover_decode_result_is_permanent(res) && req->local_track_path[0]) {
-            ok = load_and_decode_external_cover(req->local_track_path, req->artist, req->album,
-                                                req->album_artist, &pixels);
-        }
     } else if (req->local_track_path[0]) {
-        ok = load_and_decode_external_cover(req->local_track_path, req->artist, req->album,
-                                            req->album_artist, &pixels);
+        ok = load_cached_player_cover(req->local_track_path, req->artist, req->album,
+                                       req->album_artist, &pixels);
     }
 
     uint8_t * reflection = ok ? compute_reflection_bytes((const uint8_t *) pixels) : NULL;
@@ -658,22 +669,6 @@ static void launch_cover_decode_req(cover_decode_request_t r) {
     }
 }
 
-static void launch_cover_decode(int for_index, uint8_t * picture_data, uint32_t picture_size,
-                                const char * track_path, const char * artist, const char * album,
-                                const char * album_artist) {
-    cover_decode_request_t r = { .for_index = for_index, .picture_data = picture_data, .picture_size = picture_size,
-                                  .stream_url = "", .stream_verify_tls = false };
-    /* track_path/artist/album/album_artist let cover_decode_thread_func()
-     * fall back to an external cover file if this embedded picture fails
-     * to decode (e.g. exceeds decode dimension cap) -- without these the
-     * fallback guard's local_track_path check is always empty and never
-     * fires. */
-    snprintf(r.local_track_path, sizeof(r.local_track_path), "%s", track_path ? track_path : "");
-    snprintf(r.artist, sizeof(r.artist), "%s", artist ? artist : "");
-    snprintf(r.album, sizeof(r.album), "%s", album ? album : "");
-    snprintf(r.album_artist, sizeof(r.album_artist), "%s", album_artist ? album_artist : "");
-    launch_cover_decode_req(r);
-}
 
 static void launch_cover_decode_from_track(int for_index, const char * track_path, const char * artist,
                                             const char * album, const char * album_artist) {
@@ -690,7 +685,7 @@ static void launch_cover_decode_from_track(int for_index, const char * track_pat
  * comment. url is subsonic_build_cover_art_url()'s output, fetched on the
  * same background thread that would otherwise be decoding already-local
  * bytes, so a slow/flaky connection can't block the UI here either, same
- * reasoning as launch_cover_decode() itself. */
+ * reasoning as launch_cover_decode_from_track() itself. */
 static void launch_cover_decode_from_url(int for_index, const char * url, bool verify_tls) {
     cover_decode_request_t r = { .for_index = for_index, .picture_data = NULL, .picture_size = 0,
                                   .stream_verify_tls = verify_tls };
@@ -778,7 +773,7 @@ void poll_cover_decode(void) {
 
     if (cover_decode_pending_valid) {
         cover_decode_pending_valid = false;
-        launch_cover_decode_req(cover_decode_pending); /* not launch_cover_decode() -- must carry stream_url too, see that field's own comment */
+        launch_cover_decode_req(cover_decode_pending); /* the whole request, not a rebuilt one -- must carry stream_url too, see that field's own comment */
         /* Clear picture_data to avoid double-freeing if another track
          * change occurs while the handed-off decode thread is running. */
         cover_decode_pending.picture_data = NULL;
@@ -1230,7 +1225,7 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
             out_meta->has_album = true;
         }
     } else {
-        metadata_read(path, out_meta);
+        metadata_read_without_artwork(path, out_meta);
     }
 
     gui_track_info_context_t info = {0};
@@ -1302,9 +1297,6 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
          * plain "no embedded picture" case below, launch_cover_decode_
          * from_track() must not be tried: path is the synthetic remote://
          * key, not a real file. */
-    } else if (out_meta->picture_data && out_meta->picture_size > 0) {
-        launch_cover_decode(index, out_meta->picture_data, out_meta->picture_size, /* embedded art has priority; takes ownership */
-                            path, out_meta->artist, out_meta->album, out_meta->album_artist);
     } else {
         free(out_meta->picture_data);
         out_meta->picture_data = NULL;
@@ -2807,7 +2799,7 @@ void arm_next_track_for_audio(int index) {
         peak = 0.0;
     } else {
         track_metadata_t next_meta;
-        metadata_read(next_path, &next_meta);
+        metadata_read_without_artwork(next_path, &next_meta);
         resolve_replaygain(&next_meta, &has_gain, &gain_db, &has_peak, &peak);
         free(next_meta.picture_data); /* only needed the gain/peak fields, not the art or lyrics */
         free(next_meta.lyrics);

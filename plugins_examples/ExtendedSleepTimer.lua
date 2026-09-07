@@ -142,4 +142,4 @@ plugin.set_interval(1, function()
     plugin.show_toast("Sleep timer finished")
 end)
 
-plugin.register_list_item("playback", "Extended Sleep Timer", open_settings)
+plugin.register_list_item("music_timers", "Extended Sleep Timer", open_settings)

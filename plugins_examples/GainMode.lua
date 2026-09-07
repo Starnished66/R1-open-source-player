@@ -1,6 +1,7 @@
 plugin.define({ id = "example.gain_mode", name = "Gain Mode", version = "1.0", api_min = 1 })
 
--- Low/High Gain switcher, adds a "Gain Mode" row to Settings -> Playback.
+-- Low/High Gain switcher, adds a "Gain Mode" row to Settings -> Music
+-- Settings -> Audio.
 -- Reference implementation for plugin.set_hw_volume_curve() (PLUGIN API
 -- 11, see PLUGINS.md) -- reproduces the R1's own stock firmware High/Low
 -- Gain curves exactly, extracted from a real device's own
@@ -30,10 +31,10 @@ plugin.define({ id = "example.gain_mode", name = "Gain Mode", version = "1.0", a
 --
 -- Also does NOT default a first-time install to either Gain Mode: an
 -- unset/corrupted saved state leaves the app's own built-in volume taper
--- untouched until the user explicitly opens Settings -> Playback -> Gain
--- Mode and picks one -- silently defaulting to High (or even Low) would
--- still be an unrequested, potentially startling loudness change on first
--- boot for whatever headphones happen to already be plugged in.
+-- untouched until the user explicitly opens Settings -> Music Settings ->
+-- Audio -> Gain Mode and picks one -- silently defaulting to High (or even
+-- Low) would still be an unrequested, potentially startling loudness change
+-- on first boot for whatever headphones happen to already be plugged in.
 
 local MODES = {
     {
@@ -105,7 +106,7 @@ if plugin.has_capability("audio.hw_volume_curve") then
         plugin.set_hw_volume_curve(current_mode.curve)
     end -- else: leave the app's own built-in taper alone until a mode is chosen below
 
-    plugin.register_list_item("playback", "Gain Mode", function()
+    plugin.register_list_item("music_audio", "Gain Mode", function()
         local names = {}
         local selected = 0
         for i, m in ipairs(MODES) do

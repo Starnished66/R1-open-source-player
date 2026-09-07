@@ -49,7 +49,6 @@ static lv_obj_t * music_audio_screen;
 static lv_obj_t * music_controls_screen;
 static lv_obj_t * music_timers_screen;
 static lv_obj_t * music_library_screen;
-static lv_obj_t * music_plugins_screen;
 static lv_obj_t * settings_display_screen;
 static lv_obj_t * settings_power_screen;
 static lv_obj_t * settings_system_screen;
@@ -1202,7 +1201,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     /* Mutually-exclusive idle-action choice (Power Off or Suspend to RAM).
      * Shown/hidden together with the slider card in
      * idle_shutdown_switch_event_cb(). */
-    /* 100% width accommodates fixed-width 448px pill rows without clipping.
+    /* 100% width accommodates display-width pill rows without clipping.
      * pad_top and pad_bottom are zeroed so the child rows and label fit within
      * the 292px section height without vertical overflow. */
     idle_action_section = lv_obj_create(scr);
@@ -1440,56 +1439,39 @@ static void plugin_playback_list_item_click_cb(lv_event_t * e) {
     plugin_manager_playback_list_item_clicked(index);
 }
 
+static void plugin_music_audio_list_item_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_music_audio_list_item_clicked(index);
+}
+
+static void plugin_music_controls_list_item_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_music_controls_list_item_clicked(index);
+}
+
+static void plugin_music_timers_list_item_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_music_timers_list_item_clicked(index);
+}
+
+static void plugin_music_library_list_item_click_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    plugin_manager_music_library_list_item_clicked(index);
+}
+
 static lv_obj_t * build_music_playback_screen(void) {
-    static pill_list_item_t items[3];
+    static pill_list_item_t items[3 + PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "ReplayGain", PILL_ACCESSORY_CHEVRON, false, replaygain_mode_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
                                     current_settings.crossfade_enabled, NULL, crossfade_switch_event_cb, NULL,
                                     &settings_crossfade_toggle_img };
-    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, 3, gui_theme_accent_style(), GUI_ROW_GAP);
-    finalize_screen_navigation(scr);
-    return scr;
-}
 
-static lv_obj_t * build_music_audio_screen(void) {
-    static pill_list_item_t items[2];
-    items[0] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Audio", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP);
-    finalize_screen_navigation(scr);
-    return scr;
-}
-
-static lv_obj_t * build_music_controls_screen(void) {
-    static pill_list_item_t items[2];
-    items[0] = (pill_list_item_t){ "Play/Pause Button", PILL_ACCESSORY_CHEVRON, false, play_pause_button_mode_settings_row_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
-                                    current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Controls & Interface", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP);
-    finalize_screen_navigation(scr);
-    return scr;
-}
-
-static lv_obj_t * build_music_timers_screen(void) {
-    static pill_list_item_t items[1];
-    items[0] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Timers", generic_back_cb, items, 1, gui_theme_accent_style(), GUI_ROW_GAP);
-    finalize_screen_navigation(scr);
-    return scr;
-}
-
-static lv_obj_t * build_music_library_screen(void) {
-    static pill_list_item_t items[1];
-    items[0] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Library", generic_back_cb, items, 1, gui_theme_accent_style(), GUI_ROW_GAP);
-    finalize_screen_navigation(scr);
-    return scr;
-}
-
-static lv_obj_t * build_music_plugins_screen(void) {
-    static pill_list_item_t items[PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
-    int count = 0;
+    int count = 3;
     int plugin_count = plugin_manager_get_playback_list_item_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_PLAYBACK_LIST_ITEMS; i++) {
         pill_list_item_t item = {
@@ -1501,7 +1483,99 @@ static lv_obj_t * build_music_plugins_screen(void) {
         item.text_size = text_size ? text_size : "medium";
         items[count++] = item;
     }
-    lv_obj_t * scr = build_pill_list_screen("Plugins", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
+
+    lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_music_audio_screen(void) {
+    static pill_list_item_t items[2 + PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS];
+    items[0] = (pill_list_item_t){ "Equalizer", PILL_ACCESSORY_CHEVRON, false, eq_screen_btn_event_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
+
+    int count = 2;
+    int plugin_count = plugin_manager_get_music_audio_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS; i++) {
+        pill_list_item_t item = {
+            plugin_manager_get_music_audio_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_music_audio_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+        const char * text_size = NULL;
+        plugin_manager_get_music_audio_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
+        item.text_size = text_size ? text_size : "medium";
+        items[count++] = item;
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Audio", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_music_controls_screen(void) {
+    static pill_list_item_t items[2 + PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS];
+    items[0] = (pill_list_item_t){ "Play/Pause Button", PILL_ACCESSORY_CHEVRON, false, play_pause_button_mode_settings_row_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };
+
+    int count = 2;
+    int plugin_count = plugin_manager_get_music_controls_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS; i++) {
+        pill_list_item_t item = {
+            plugin_manager_get_music_controls_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_music_controls_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+        const char * text_size = NULL;
+        plugin_manager_get_music_controls_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
+        item.text_size = text_size ? text_size : "medium";
+        items[count++] = item;
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Controls & Interface", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_music_timers_screen(void) {
+    static pill_list_item_t items[1 + PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS];
+    items[0] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
+
+    int count = 1;
+    int plugin_count = plugin_manager_get_music_timers_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS; i++) {
+        pill_list_item_t item = {
+            plugin_manager_get_music_timers_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_music_timers_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+        const char * text_size = NULL;
+        plugin_manager_get_music_timers_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
+        item.text_size = text_size ? text_size : "medium";
+        items[count++] = item;
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Timers", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_music_library_screen(void) {
+    static pill_list_item_t items[1 + PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS];
+    items[0] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
+
+    int count = 1;
+    int plugin_count = plugin_manager_get_music_library_list_item_count();
+    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS; i++) {
+        pill_list_item_t item = {
+            plugin_manager_get_music_library_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
+            plugin_music_library_list_item_click_cb, NULL, (void *) (intptr_t) i
+        };
+        const char * text_size = NULL;
+        plugin_manager_get_music_library_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
+        item.text_size = text_size ? text_size : "medium";
+        items[count++] = item;
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Library", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1526,21 +1600,16 @@ static void music_category_library_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_push(music_library_screen);
 }
-static void music_category_plugins_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    nav_push(music_plugins_screen);
-}
 
 static lv_obj_t * build_music_settings_screen(void) {
-    static pill_list_item_t items[6];
+    static pill_list_item_t items[5];
     items[0] = (pill_list_item_t){ "Playback", PILL_ACCESSORY_CHEVRON, false, music_category_playback_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Audio", PILL_ACCESSORY_CHEVRON, false, music_category_audio_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Controls & Interface", PILL_ACCESSORY_CHEVRON, false, music_category_controls_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Timers", PILL_ACCESSORY_CHEVRON, false, music_category_timers_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "Library", PILL_ACCESSORY_CHEVRON, false, music_category_library_cb, NULL, NULL };
-    items[5] = (pill_list_item_t){ "Plugins", PILL_ACCESSORY_CHEVRON, false, music_category_plugins_cb, NULL, NULL };
 
-    lv_obj_t * scr = build_pill_list_screen("Music Settings", generic_back_cb, items, 6, gui_theme_accent_style(), GUI_ROW_GAP);
+    lv_obj_t * scr = build_pill_list_screen("Music Settings", generic_back_cb, items, 5, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -2874,7 +2943,6 @@ void gui_settings_init(void) {
     music_controls_screen = build_music_controls_screen();
     music_timers_screen = build_music_timers_screen();
     music_library_screen = build_music_library_screen();
-    music_plugins_screen = build_music_plugins_screen();
     settings_music_screen = build_music_settings_screen();
     settings_display_screen = build_settings_display_screen();
     settings_power_screen = build_settings_power_screen();
@@ -2932,7 +3000,6 @@ void gui_settings_teardown(void) {
     if (music_controls_screen) { lv_obj_del(music_controls_screen); music_controls_screen = NULL; }
     if (music_timers_screen) { lv_obj_del(music_timers_screen); music_timers_screen = NULL; }
     if (music_library_screen) { lv_obj_del(music_library_screen); music_library_screen = NULL; }
-    if (music_plugins_screen) { lv_obj_del(music_plugins_screen); music_plugins_screen = NULL; }
     if (settings_display_screen) { lv_obj_del(settings_display_screen); settings_display_screen = NULL; }
     if (settings_power_screen) { lv_obj_del(settings_power_screen); settings_power_screen = NULL; }
     if (settings_system_screen) { lv_obj_del(settings_system_screen); settings_system_screen = NULL; }

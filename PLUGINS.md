@@ -185,7 +185,11 @@ on one of these screens:
 | `"books"` | Books | Readers, audiobooks, reference tools | 8 |
 | `"settings"` | Settings | General plugin configuration | 8 |
 | `"display"` | Settings → Display | Themes and visual tools | 8 |
-| `"playback"` | Settings → Playback | Audio and playback tools | 8 |
+| `"playback"` | Settings → Music Settings → Playback | Resume/ReplayGain/crossfade-adjacent tools | 8 |
+| `"music_audio"` | Settings → Music Settings → Audio | EQ, DSP, gain/volume-curve tools | 8 |
+| `"music_controls"` | Settings → Music Settings → Controls & Interface | Playback-button and interface behavior | 8 |
+| `"music_timers"` | Settings → Music Settings → Timers | Sleep/idle timer tools | 8 |
+| `"music_library"` | Settings → Music Settings → Library | Scanning, tagging, scrobbling tools | 8 |
 | `"power"` | Settings → Power | Battery and power tools | 8 |
 | `"system"` | Settings → System | Device and maintenance tools | 8 |
 
@@ -374,8 +378,9 @@ bumping `api_min`.
 Adds a row to an existing native list screen.
 
 - `list_id` (string): which screen to add to -- `"books"`, `"settings"`,
-  `"display"`, `"playback"`, `"power"`, or `"system"` (see "Adding Your
-  Plugin to the UI" above for what each targets) -- anything else raises
+  `"display"`, `"playback"`, `"music_audio"`, `"music_controls"`,
+  `"music_timers"`, `"music_library"`, `"power"`, or `"system"` (see "Adding
+  Your Plugin to the UI" above for what each targets) -- anything else raises
   a Lua error immediately, rather than silently registering into nothing.
 - `label` (string): the row's visible text.
 - `on_open` (function): called with zero arguments when the row is tapped.
@@ -391,7 +396,7 @@ reachable) -- a script can still call it more than once if it genuinely
 wants multiple independent entry points into the same list.
 
 Errors if more than that `list_id`'s own cap (currently 8 for each of the
-six) is registered, across every loaded plugin combined.
+ten) is registered, across every loaded plugin combined.
 
 ### `plugin.register_stream_media_tile(label, on_open [, icon])`
 
@@ -1762,7 +1767,7 @@ live switching without disrupting navigation or services.
 
 `plugins_examples/SoundProfiles.lua` is the reference implementation for the
 EQ functions -- a handful of curated `.peq` presets reachable from
-Settings -> Playback -> Sound Profile, switched with `plugin.eq_load_profile()` and
+Settings -> Music Settings -> Audio -> Sound Profile, switched with `plugin.eq_load_profile()` and
 `plugin.show_list()`, following the exact same "`register_list_item` ->
 `show_list` -> apply and persist to a state file" shape `Themes.lua` already
 established for theme switching.
@@ -1785,8 +1790,8 @@ only for the specific band(s) a changed slider actually owns, never all 10
 bands on every release, since each call persists to disk immediately.
 
 `plugins_examples/PlaybackExtras.lua` is the reference implementation for
-`register_list_item("playback", ...)` and `show_settings_list()` -- a
-"Loudness Boost" row in Settings -> Playback opening a submenu with a real
+`register_list_item("music_audio", ...)` and `show_settings_list()` -- a
+"Loudness Boost" row in Settings -> Music Settings -> Audio opening a submenu with a real
 toggle switch, a real slider (both driving `plugin.eq_set_preamp()`), and a
 nested `"row"` ("About") that opens a second `show_settings_list()` screen
 on top of the first, demonstrating submenu-inside-a-submenu nesting -- and,
@@ -1795,7 +1800,8 @@ own `icon` (pointed at a real stock theme2 asset by its raw filesystem
 path) and the "About" row's `text_size = "large"`.
 
 `plugins_examples/PlayThrough.lua` adds persistent **Play Through Folders**
-and **Play Through Albums** controls under Settings → Playback. It combines
+and **Play Through Albums** controls under Settings → Music Settings →
+Playback. It combines
 playback events, a short polling interval, library album queries, SD-card
 directory browsing, and `play_list()` to continue only after a genuine
 natural playlist end. Album continuation has priority when both options are
@@ -1803,7 +1809,7 @@ enabled; folder continuation is the fallback. Explicit Stop and non-sequential
 play modes are deliberately respected.
 
 `plugins_examples/ExtendedSleepTimer.lua` adds an **Extended Sleep Timer**
-under Settings → Playback with a 15–180 minute range. It demonstrates a
+under Settings → Music Settings → Timers with a 15–180 minute range. It demonstrates a
 persistent preferred duration, session-only armed state, countdown status,
 and a lightweight interval that calls `plugin.stop()` at expiration. Like the
 native timer, an active countdown does not survive restarting the player.

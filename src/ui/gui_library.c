@@ -34,6 +34,7 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "settings.h"
 #include "audio.h"
 #include "subprocess.h"
+#include "db_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,66 +59,6 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include <linux/sched.h>
 #include <sys/resource.h>
 
-#ifdef TEST_BUILD_TAG
-#ifdef HOST_BUILD
-#define TEST_DIAG_DIR "./music/.logs"
-#else
-#define TEST_DIAG_DIR "/data/mnt/sd_0/.logs"
-#endif
-#define TEST_DIAG_PATH TEST_DIAG_DIR "/database_artwork.log"
-
-static pthread_mutex_t test_diag_mutex = PTHREAD_MUTEX_INITIALIZER;
-static FILE * test_diag_file;
-
-static uint64_t test_diag_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t) ts.tv_sec * 1000ULL + (uint64_t) ts.tv_nsec / 1000000ULL;
-}
-
-static long test_diag_rss_kb(void) {
-    FILE * f = fopen("/proc/self/status", "r");
-    if (!f) return -1;
-    char line[160];
-    long rss = -1;
-    while (fgets(line, sizeof(line), f)) {
-        if (sscanf(line, "VmRSS: %ld kB", &rss) == 1) break;
-    }
-    fclose(f);
-    return rss;
-}
-
-static void test_diag_log(const char * area, const char * fmt, ...) {
-    pthread_mutex_lock(&test_diag_mutex);
-    if (!test_diag_file) {
-        if (mkdir(TEST_DIAG_DIR, 0755) != 0 && errno != EEXIST) {
-            pthread_mutex_unlock(&test_diag_mutex);
-            return;
-        }
-        test_diag_file = fopen(TEST_DIAG_PATH, "a");
-        if (!test_diag_file) {
-            pthread_mutex_unlock(&test_diag_mutex);
-            return;
-        }
-        setvbuf(test_diag_file, NULL, _IOLBF, 0);
-    }
-
-    fprintf(test_diag_file, "[TEST:%s][%s] t=%llu ", TEST_BUILD_TAG, area,
-            (unsigned long long) test_diag_now_ms());
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(test_diag_file, fmt, ap);
-    va_end(ap);
-    fputc('\n', test_diag_file);
-    fflush(test_diag_file); /* Preserve the last completed event across a crash/reboot. */
-    pthread_mutex_unlock(&test_diag_mutex);
-}
-
-#define TEST_DIAG(area, fmt, ...) test_diag_log(area, fmt, ##__VA_ARGS__)
-#else
-#define TEST_DIAG(area, fmt, ...) ((void) 0)
-#endif
-
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
 #else
@@ -131,22 +72,18 @@ static void test_diag_log(const char * area, const char * fmt, ...) {
 
 static lv_obj_t * album_thumbnail_active_list = NULL;
 static atomic_int album_thumbnail_generation = 0;
-static lv_obj_t * playlists_edit_btn = NULL;
-static bool playlists_edit_mode = false;
 static bool group_songs_source_is_album = false;
 static gui_busy_handle_t library_rescan_token = 0;
 static gui_busy_handle_t sd_format_token = 0;
 static atomic_int library_scan_progress_total = 0;
 static atomic_int library_scan_progress_done = 0;
 
-#ifdef TEST_BUILD_TAG
 static uint64_t albums_page_open_requested_ms;
 static uint64_t album_lazy_job_started_ms;
 static unsigned album_lazy_queued;
 static unsigned album_lazy_completed;
 static unsigned album_lazy_with_art;
 static unsigned album_lazy_stale;
-#endif
 
 static void album_thumbnail_screen_loaded_cb(lv_event_t * e);
 static void album_thumbnail_screen_unloaded_cb(lv_event_t * e);
@@ -338,6 +275,7 @@ void open_add_to_playlist_for(const char * path) {
 }
 
 void on_cue_file_selected(const char * cue_path);
+
 static lv_obj_t * build_files_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
@@ -597,17 +535,9 @@ static int group_songs_page_start;
  * one -- see refresh_group_songs_now_playing_indicator()'s own comment. */
 static lv_obj_t * group_songs_now_playing_bar;
 
-/* clear_player_source()/set_player_source_all_songs() etc. are defined
- * right after on_file_selected() -- this one needs group_songs_entries/
- * count/title_label above already in scope, which those didn't. */
-/* Split out of set_player_source_group_songs() below so a caller that has
- * its own entries/title -- not the on-device Group Songs screen's own
- * group_songs_entries/title_label -- can set the same source kind without
- * touching that screen's shared, mutable display state. Used by remote
- * control's scoped play (play_remote_control_song()), which deliberately
- * never nav_pushes group_songs_screen and so must not reuse (and risk
- * replacing, via set_group_songs_entries(), out from under whatever that
- * screen currently has on-device) its live globals. */
+/* Forward-declared here (defined after on_file_selected()) because
+ * set_player_source_group_songs() needs group_songs_entries/count/title_label
+ * already in scope, which the following definitions did not have. */
 /* set_player_source_group_songs_direct defined in gui.c */
 
 
@@ -619,18 +549,12 @@ static void set_player_source_group_songs(int pos) {
              group_songs_source_is_album ? lv_label_get_text(group_songs_title_label) : "");
 }
 
-/* Playlist design change: user .m3u playlists needed a way to remove a song
- * again after adding it. Non-NULL only when the group currently shown is a
- * user-created .m3u playlist (set by show_m3u_playlist() below, via
- * show_group_songs_editable()) -- stays NULL for Artists/Albums/Favorites/
- * Most Played, none of which back onto a file this app can rewrite (Favorites
- * is metadata_db-backed, Most Played is derived play-count ranking, and
- * unfavoriting/uncounting a song isn't what "remove from playlist" means for
- * either). Borrowed from playlists_m3u_paths[], same lifetime guarantee
- * show_favorites()/show_most_played()'s own indices arrays already rely on
- * (valid for as long as this screen is showing it). group_songs_edit_mode is
- * reset to false on every fresh entry into this screen so leaving and
- * re-entering never starts already in edit mode. */
+/* Non-NULL only when the currently shown group is a user-created .m3u
+ * playlist (set by show_m3u_playlist() via show_group_songs_editable()),
+ * enabling the edit/remove-song UI. NULL for Artists/Albums/Favorites/
+ * Most Played, which do not back onto a rewritable file. Borrowed pointer
+ * from playlists_m3u_paths[]; valid for the lifetime of the screen.
+ * group_songs_edit_mode is reset to false on every fresh entry. */
 static const char * group_songs_edit_m3u_path = NULL;
 static char group_songs_owned_m3u_path[PATH_MAX];
 static void group_song_move_row_cb(lv_event_t * e);
@@ -1033,7 +957,7 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_label_set_text(group_songs_edit_btn, "Edit");
     lv_obj_set_style_text_color(group_songs_edit_btn, accent_lv_color(), 0);
     lv_obj_set_style_text_font(group_songs_edit_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(group_songs_edit_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    align_screen_header_action(group_songs_edit_btn, 20);
     lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(group_songs_edit_btn, group_songs_edit_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -1385,11 +1309,14 @@ static void * album_thumbnail_thread_func(void * arg) {
     uint64_t perf_start_us = ui_perf_now_us();
 #endif
     album_thumbnail_request_t * req = (album_thumbnail_request_t *) arg;
-#ifdef TEST_BUILD_TAG
-    uint64_t started_ms = test_diag_now_ms();
-    TEST_DIAG("ART_LAZY", "decode_begin song=%lld row=%d generation=%d rss_kb=%ld",
-              (long long) req->song_id, req->logical_index, req->generation, test_diag_rss_kb());
-#endif
+    /* Cached once -- see library_scan_once()'s own comment on why an
+     * unconditional db_log_now_ms() call here would cost a real syscall on
+     * every lazy-loaded thumbnail even with logging disabled. */
+    bool db_logging = db_log_enabled();
+    uint64_t started_ms = db_logging ? db_log_now_ms() : 0;
+    if (db_logging)
+        DB_LOG("ART_LAZY", "decode_begin song=%lld row=%d generation=%d rss_kb=%ld",
+               (long long) req->song_id, req->logical_index, req->generation, db_log_rss_kb());
     uint16_t * pixels = NULL;
     song_row_t song;
     if (metadata_db_get_song_by_id(req->song_id, &song))
@@ -1401,12 +1328,11 @@ static void * album_thumbnail_thread_func(void * arg) {
     album_thumbnail_result_pixels = (uint8_t *) pixels;
     free(req);
     album_thumbnail_done = true;
-#ifdef TEST_BUILD_TAG
-    TEST_DIAG("ART_LAZY", "decode_end song=%lld row=%d art=%d elapsed_ms=%llu rss_kb=%ld",
-              (long long) album_thumbnail_result_song_id, album_thumbnail_result_logical_index,
-              album_thumbnail_result_pixels != NULL,
-              (unsigned long long) (test_diag_now_ms() - started_ms), test_diag_rss_kb());
-#endif
+    if (db_logging)
+        DB_LOG("ART_LAZY", "decode_end song=%lld row=%d art=%d elapsed_ms=%llu rss_kb=%ld",
+               (long long) album_thumbnail_result_song_id, album_thumbnail_result_logical_index,
+               album_thumbnail_result_pixels != NULL,
+               (unsigned long long) (db_log_now_ms() - started_ms), db_log_rss_kb());
 #ifdef UI_PERF_TRACE
     printf("PERF album_thumb song=%lld total_us=%llu pixels=%d\n",
            (long long) album_thumbnail_result_song_id,
@@ -1430,12 +1356,10 @@ static void * album_thumbnail_thread_func(void * arg) {
 static void * album_thumb_gen_thread_func(void * arg) {
     install_thread_crash_altstack(); /* see its own comment (main.c) */
     int my_generation = (int) (intptr_t) arg;
-#ifdef TEST_BUILD_TAG
-    uint64_t started_ms = test_diag_now_ms();
+    uint64_t started_ms = db_log_enabled() ? db_log_now_ms() : 0;
     int generated = 0, cached = 0, missing = 0, failed = 0;
-    TEST_DIAG("ART_CACHE", "worker_begin generation=%d total=%d rss_kb=%ld", my_generation,
-              atomic_load(&album_thumb_gen_total_count), test_diag_rss_kb());
-#endif
+    DB_LOG("ART_CACHE", "worker_begin generation=%d total=%d rss_kb=%ld", my_generation,
+           atomic_load(&album_thumb_gen_total_count), db_log_rss_kb());
 #ifdef UI_PERF_TRACE
     uint64_t perf_start_us = ui_perf_now_us();
     int perf_generated = 0, perf_skipped = 0, perf_missing = 0, perf_failed = 0;
@@ -1467,9 +1391,7 @@ static void * album_thumb_gen_thread_func(void * arg) {
 
             song_row_t song;
             if (!metadata_db_get_song_by_id(rows[i].first_song_id, &song)) {
-#ifdef TEST_BUILD_TAG
                 missing++;
-#endif
 #ifdef UI_PERF_TRACE
                 perf_missing++;
 #endif
@@ -1486,9 +1408,7 @@ static void * album_thumb_gen_thread_func(void * arg) {
             if (artwork_failure_cache_is_blocked(song.id, source_mtime, &fail_reason)) {
                 if (fail_reason == ARTWORK_FAIL_TEMPORARY)
                     atomic_store(&album_thumb_gen_retry_pending, true);
-#ifdef TEST_BUILD_TAG
                 failed++;
-#endif
 #ifdef UI_PERF_TRACE
                 perf_skipped++;
 #endif
@@ -1498,9 +1418,7 @@ static void * album_thumb_gen_thread_func(void * arg) {
 
             char found[PATH_MAX];
             if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found))) {
-#ifdef TEST_BUILD_TAG
                 cached++;
-#endif
 #ifdef UI_PERF_TRACE
                 perf_skipped++;
 #endif
@@ -1516,9 +1434,7 @@ static void * album_thumb_gen_thread_func(void * arg) {
                 (artwork_failure_cache_is_blocked(song.id, source_mtime, &fail_reason) &&
                  fail_reason == ARTWORK_FAIL_TEMPORARY)))
                 atomic_store(&album_thumb_gen_retry_pending, true);
-#ifdef TEST_BUILD_TAG
             if (pixels) generated++; else failed++;
-#endif
 
 #ifdef UI_PERF_TRACE
             if (pixels) perf_generated++; else perf_failed++;
@@ -1526,14 +1442,12 @@ static void * album_thumb_gen_thread_func(void * arg) {
             free(pixels);
             atomic_fetch_add(&album_thumb_gen_done_count, 1);
 
-#ifdef TEST_BUILD_TAG
             int diag_done = atomic_load(&album_thumb_gen_done_count);
             if ((diag_done % 50) == 0) {
-                TEST_DIAG("ART_CACHE", "progress done=%d total=%d generated=%d cached=%d missing=%d failed=%d elapsed_ms=%llu rss_kb=%ld",
-                          diag_done, atomic_load(&album_thumb_gen_total_count), generated, cached, missing, failed,
-                          (unsigned long long) (test_diag_now_ms() - started_ms), test_diag_rss_kb());
+                DB_LOG("ART_CACHE", "progress done=%d total=%d generated=%d cached=%d missing=%d failed=%d elapsed_ms=%llu rss_kb=%ld",
+                       diag_done, atomic_load(&album_thumb_gen_total_count), generated, cached, missing, failed,
+                       (unsigned long long) (db_log_now_ms() - started_ms), db_log_rss_kb());
             }
-#endif
 
             /* Yield between albums to avoid heating up CPU */
             usleep(ALBUM_THUMB_GEN_INTER_ALBUM_US);
@@ -1548,12 +1462,10 @@ static void * album_thumb_gen_thread_func(void * arg) {
         }
     }
 done:
-#ifdef TEST_BUILD_TAG
-    TEST_DIAG("ART_CACHE", "worker_end generation=%d done=%d total=%d generated=%d cached=%d missing=%d failed=%d cancelled=%d elapsed_ms=%llu rss_kb=%ld",
-              my_generation, atomic_load(&album_thumb_gen_done_count), atomic_load(&album_thumb_gen_total_count),
-              generated, cached, missing, failed, (int) album_thumb_gen_should_cancel(my_generation),
-              (unsigned long long) (test_diag_now_ms() - started_ms), test_diag_rss_kb());
-#endif
+    DB_LOG("ART_CACHE", "worker_end generation=%d done=%d total=%d generated=%d cached=%d missing=%d failed=%d cancelled=%d elapsed_ms=%llu rss_kb=%ld",
+           my_generation, atomic_load(&album_thumb_gen_done_count), atomic_load(&album_thumb_gen_total_count),
+           generated, cached, missing, failed, (int) album_thumb_gen_should_cancel(my_generation),
+           (unsigned long long) (db_log_now_ms() - started_ms), db_log_rss_kb());
 #ifdef UI_PERF_TRACE
     printf("PERF album_thumb_gen done=%d generated=%d skipped=%d missing=%d failed=%d us=%llu cancelled=%d\n",
            atomic_load(&album_thumb_gen_done_count), perf_generated, perf_skipped, perf_missing, perf_failed,
@@ -1589,8 +1501,8 @@ static void start_album_thumbnail_generation(void) {
     atomic_store(&album_thumb_gen_cancel, false);
     int generation = atomic_fetch_add(&album_thumb_gen_generation, 1) + 1;
     atomic_store(&album_thumb_gen_active, true);
-    TEST_DIAG("ART_CACHE", "start generation=%d albums=%d warm_limit=%d rss_kb=%ld",
-              generation, album_count, ALBUM_THUMB_GEN_WARM_LIMIT, test_diag_rss_kb());
+    DB_LOG("ART_CACHE", "start generation=%d albums=%d warm_limit=%d rss_kb=%ld",
+           generation, album_count, ALBUM_THUMB_GEN_WARM_LIMIT, db_log_rss_kb());
 
     pthread_attr_t attr;
     pthread_attr_t * attr_ptr = NULL;
@@ -1602,7 +1514,7 @@ static void start_album_thumbnail_generation(void) {
     if (attr_ptr) pthread_attr_destroy(&attr);
     if (!created) {
         atomic_store(&album_thumb_gen_active, false);
-        TEST_DIAG("ART_CACHE", "thread_create_failed generation=%d", generation);
+        DB_LOG("ART_CACHE", "thread_create_failed generation=%d rss_kb=%ld", generation, db_log_rss_kb());
     } else {
         album_thumb_gen_thread_joinable = true;
     }
@@ -1628,9 +1540,7 @@ static void start_next_album_thumbnail(void) {
             sizeof(album_thumbnail_queue[0]) * (size_t) (--album_thumbnail_queue_count));
     album_thumbnail_done = false;
     album_thumbnail_active = true;
-#ifdef TEST_BUILD_TAG
-    album_lazy_job_started_ms = test_diag_now_ms();
-#endif
+    album_lazy_job_started_ms = db_log_enabled() ? db_log_now_ms() : 0;
     /* See start_album_thumbnail_generation()'s own ALBUM_COVER_DECODE_THREAD_
      * STACK_SIZE comment -- same full JPEG/PNG cover decode, same fix. */
     pthread_attr_t attr;
@@ -1660,11 +1570,9 @@ static void queue_album_thumbnail(lv_obj_t * list, int logical_index, int64_t so
         .logical_index = logical_index,
         .list = list
     };
-#ifdef TEST_BUILD_TAG
     album_lazy_queued++;
-    TEST_DIAG("ART_LAZY", "queued song=%lld row=%d queue_depth=%d generation=%d",
-              (long long) song_id, logical_index, album_thumbnail_queue_count, album_thumbnail_generation);
-#endif
+    DB_LOG("ART_LAZY", "queued song=%lld row=%d queue_depth=%d generation=%d",
+           (long long) song_id, logical_index, album_thumbnail_queue_count, album_thumbnail_generation);
     start_next_album_thumbnail();
 }
 
@@ -1692,14 +1600,12 @@ static void album_thumbnail_begin_screen(lv_obj_t * list) {
     album_thumbnail_active_list = list;
     album_thumbnail_scrolling = false;
     album_thumbnail_queue_count = 0;
-#ifdef TEST_BUILD_TAG
     album_lazy_queued = album_lazy_completed = album_lazy_with_art = album_lazy_stale = 0;
     const char * diag_page = list == albums_list ? "albums" : "artist_albums";
-    TEST_DIAG("ALBUMS_PAGE", "loaded page=%s request_to_loaded_ms=%llu rss_kb=%ld", diag_page,
-              albums_page_open_requested_ms ? (unsigned long long) (test_diag_now_ms() - albums_page_open_requested_ms) : 0ULL,
-              test_diag_rss_kb());
+    DB_LOG("ALBUMS_PAGE", "loaded page=%s request_to_loaded_ms=%llu rss_kb=%ld", diag_page,
+           albums_page_open_requested_ms ? (unsigned long long) (db_log_now_ms() - albums_page_open_requested_ms) : 0ULL,
+           db_log_rss_kb());
     albums_page_open_requested_ms = 0;
-#endif
     if (list) compact_list_refresh_visible(list);
 }
 
@@ -1709,11 +1615,9 @@ static void album_thumbnail_end_screen(lv_obj_t * list) {
     album_thumbnail_active_list = NULL;
     album_thumbnail_scrolling = false;
     album_thumbnail_queue_count = 0;
-#ifdef TEST_BUILD_TAG
-    TEST_DIAG("ALBUMS_PAGE", "unloaded page=%s queued=%u completed=%u with_art=%u stale=%u rss_kb=%ld",
-              list == albums_list ? "albums" : "artist_albums", album_lazy_queued, album_lazy_completed,
-              album_lazy_with_art, album_lazy_stale, test_diag_rss_kb());
-#endif
+    DB_LOG("ALBUMS_PAGE", "unloaded page=%s queued=%u completed=%u with_art=%u stale=%u rss_kb=%ld",
+           list == albums_list ? "albums" : "artist_albums", album_lazy_queued, album_lazy_completed,
+           album_lazy_with_art, album_lazy_stale, db_log_rss_kb());
     /* Codec work cannot safely be cancelled. Invalidate and discard it
      * when it completes rather than ever repainting a hidden screen. */
     album_thumbnail_generation++;
@@ -1731,9 +1635,7 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
      * below can synchronously queue work and try to start the next worker. */
 
     bool result_applied = false;
-#ifdef TEST_BUILD_TAG
     bool result_had_art = album_thumbnail_result_pixels != NULL;
-#endif
     if (album_thumbnail_result_generation == album_thumbnail_generation &&
         album_thumbnail_active_list && album_thumbnail_list_is_visible(album_thumbnail_active_list)) {
         int victim = -1;
@@ -1778,15 +1680,13 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
         album_thumbnail_result_pixels = NULL;
         result_applied = true;
     }
-#ifdef TEST_BUILD_TAG
     album_lazy_completed++;
     if (result_had_art) album_lazy_with_art++;
     if (!result_applied) album_lazy_stale++;
-    TEST_DIAG("ART_LAZY", "result song=%lld row=%d applied=%d art=%d queue_depth=%d ui_wait_ms=%llu",
-              (long long) album_thumbnail_result_song_id, album_thumbnail_result_logical_index,
-              result_applied, result_had_art, album_thumbnail_queue_count,
-              album_lazy_job_started_ms ? (unsigned long long) (test_diag_now_ms() - album_lazy_job_started_ms) : 0ULL);
-#endif
+    DB_LOG("ART_LAZY", "result song=%lld row=%d applied=%d art=%d queue_depth=%d ui_wait_ms=%llu",
+           (long long) album_thumbnail_result_song_id, album_thumbnail_result_logical_index,
+           result_applied, result_had_art, album_thumbnail_queue_count,
+           album_lazy_job_started_ms ? (unsigned long long) (db_log_now_ms() - album_lazy_job_started_ms) : 0ULL);
     free(album_thumbnail_result_pixels);
     album_thumbnail_result_pixels = NULL;
     if (result_applied && album_thumbnail_result_list == album_thumbnail_active_list)
@@ -2549,6 +2449,14 @@ bool search_close_if_active_for_screen(lv_obj_t * screen) {
     return true;
 }
 
+/* screen_gesture_event_cb()'s back-swipe hook for the Files screen: steps up
+ * one directory instead of popping the screen, unless already at root. */
+bool file_browser_back_if_not_root_for_screen(lv_obj_t * screen) {
+    if (screen != files_screen || file_browser_at_root()) return false;
+    file_browser_go_up();
+    return true;
+}
+
 static void search_btn_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     search_binding_id_t id = (search_binding_id_t) (intptr_t) lv_event_get_user_data(e);
@@ -2564,8 +2472,8 @@ static void search_close_btn_click_cb(lv_event_t * e) {
 /* Called once per screen right after that screen (and its list) is built,
  * same two call sites (boot-time gui_init() + post-rescan rebuild) the
  * A-Z index already registers at. Builds the initial search icon (top-
- * right of the title row, same position/pattern playlists_edit_btn
- * already uses) and the search bar (hidden until search_btn is tapped). */
+ * right of the title row) and the search bar (hidden until search_btn is
+ * tapped). */
 void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list, az_index_name_of_t name_of,
                              const int * count_ptr, bool is_overlay_list, bool db_backed, metadata_db_az_kind_t db_kind,
                              compact_list_fetch_page_cb_t restore_fetch_page) {
@@ -2573,12 +2481,7 @@ void register_search(search_binding_id_t id, lv_obj_t * screen, lv_obj_t * list,
     free(b->filtered_indices); /* re-registering (post-rescan rebuild) over a binding left mid-filter would otherwise leak this */
     free(b->filtered_labels);
 
-    lv_obj_t * search_btn = lv_image_create(screen);
-    lv_image_set_src(search_btn, asset_path("sub_back/btn_search.png"));
-    /* Vertically centered within the STATUS_BAR_CLEARANCE..+TITLE_ROW_HEIGHT
-     * band to match the back button alignment. */
-    lv_obj_align(search_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 51) / 2);
-    lv_obj_add_flag(search_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t * search_btn = build_top_right_icon_button(screen, asset_path("sub_back/btn_search.png"), NULL);
     lv_obj_add_event_cb(search_btn, search_btn_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) id);
     lv_obj_add_flag(search_btn, LV_OBJ_FLAG_GESTURE_BUBBLE); /* added after finalize_screen_navigation()'s one-time pass, needs this set explicitly -- see screen_gesture_event_cb()'s own comment */
 
@@ -2927,8 +2830,13 @@ static void group_song_remove_row_cb(lv_event_t * e) {
     show_info_toast("Removed from playlist");
 }
 
+/* Suppresses the follow-up LV_EVENT_CLICKED event when a long press has
+ * already opened the playlist context menu on a user-playlist row. */
+static bool playlist_row_long_press_fired = false;
+
 static void playlist_row_click_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (playlist_row_long_press_fired) { playlist_row_long_press_fired = false; return; }
     int index = (int) (intptr_t) lv_event_get_user_data(e);
     if (index == 0) { show_favorites(); return; }
     if (index == 1) { show_most_played(); return; }
@@ -2969,7 +2877,7 @@ static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_te
     lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
     configure_scrolling_row_label(label, LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - 60);
-    if (parent == playlists_list && !playlists_edit_mode) {
+    if (parent == playlists_list) {
         lv_obj_t * chevron = lv_label_create(row);
         lv_label_set_text(chevron, ">");
         lv_obj_add_style(chevron, &style_theme_text_muted, 0);
@@ -2979,10 +2887,12 @@ static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_te
     return row;
 }
 
-/* Edit-mode delete icon for a user-created .m3u row -- never wired onto the
- * Favorites/Most Played rows (see populate_playlists_screen() below), since
- * neither is backed by a real file playlist_files_delete() could remove. */
+/* Long-press context menu (Rename/Delete) for a user-created .m3u row --
+ * never wired onto the Favorites/Most Played/Queue/Recently Added rows (see
+ * populate_playlists_screen() below), since none is backed by a real file
+ * playlist_files_delete()/playlist_files_rename() could act on. */
 static lv_obj_t * playlist_delete_popup, * playlist_delete_backdrop;
+static lv_obj_t * playlist_context_menu_popup, * playlist_context_menu_backdrop;
 static char playlist_action_path[PATH_MAX];
 
 static void playlist_delete_cancel_cb(lv_event_t * e) {
@@ -3001,21 +2911,6 @@ static void playlist_delete_confirm_cb(lv_event_t * e) {
     show_info_toast("Playlist deleted");
 }
 
-static void playlist_delete_row_cb(lv_event_t * e) {
-    int i = (int) (intptr_t) lv_event_get_user_data(e);
-    if (i < 0 || i >= playlists_m3u_count) return;
-    snprintf(playlist_action_path, sizeof(playlist_action_path), "%s", playlists_m3u_paths[i]);
-    if (!playlist_delete_popup)
-        playlist_delete_popup = build_confirm_popup("Delete playlist?", LV_LABEL_LONG_WRAP, NULL,
-            "The playlist file will be deleted. Music files are kept.", "Delete",
-            accent_lv_color(), playlist_delete_confirm_cb, NULL, "Cancel", accent_lv_color(),
-            playlist_delete_cancel_cb, NULL, playlist_delete_cancel_cb, &playlist_delete_backdrop);
-    lv_obj_remove_flag(playlist_delete_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(playlist_delete_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(playlist_delete_backdrop);
-    lv_obj_move_foreground(playlist_delete_popup);
-}
-
 static void playlist_rename_done_cb(const char * name, void * data) {
     (void) data;
     char dest[PATH_MAX];
@@ -3028,17 +2923,62 @@ static void playlist_rename_done_cb(const char * name, void * data) {
     show_info_toast("Playlist renamed");
 }
 
-static void playlist_rename_row_cb(lv_event_t * e) {
-    int i = (int) (intptr_t) lv_event_get_user_data(e);
-    if (i < 0 || i >= playlists_m3u_count) return;
-    snprintf(playlist_action_path, sizeof(playlist_action_path), "%s", playlists_m3u_paths[i]);
+static void hide_playlist_context_menu_popup(void) {
+    if (playlist_context_menu_popup) lv_obj_add_flag(playlist_context_menu_popup, LV_OBJ_FLAG_HIDDEN);
+    if (playlist_context_menu_backdrop) lv_obj_add_flag(playlist_context_menu_backdrop, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void playlist_context_menu_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_playlist_context_menu_popup();
+}
+
+static void playlist_context_menu_rename_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_playlist_context_menu_popup();
     show_text_entry("Rename Playlist", basename_of(playlist_action_path), false, false, playlist_rename_done_cb, NULL);
 }
 
-static void playlists_edit_btn_cb(lv_event_t * e) {
+static void playlist_context_menu_delete_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    playlists_edit_mode = !playlists_edit_mode;
-    populate_playlists_screen();
+    hide_playlist_context_menu_popup();
+    if (!playlist_delete_popup)
+        playlist_delete_popup = build_confirm_popup("Delete playlist?", LV_LABEL_LONG_WRAP, NULL,
+            "The playlist file will be deleted. Music files are kept.", "Delete",
+            accent_lv_color(), playlist_delete_confirm_cb, NULL, "Cancel", accent_lv_color(),
+            playlist_delete_cancel_cb, NULL, playlist_delete_cancel_cb, &playlist_delete_backdrop);
+    lv_obj_remove_flag(playlist_delete_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(playlist_delete_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(playlist_delete_backdrop);
+    lv_obj_move_foreground(playlist_delete_popup);
+}
+
+static void playlist_context_menu_cancel_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_playlist_context_menu_popup();
+}
+
+static void build_playlist_context_menu_popup(void) {
+    static const menu_popup_row_t rows[] = {
+        { "Rename Playlist", playlist_context_menu_rename_cb, false },
+        { "Delete Playlist", playlist_context_menu_delete_cb, true },
+        { "Cancel", playlist_context_menu_cancel_cb, false },
+    };
+    playlist_context_menu_popup = build_menu_popup(rows, (int) (sizeof(rows) / sizeof(rows[0])),
+                                                    playlist_context_menu_backdrop_cb,
+                                                    &playlist_context_menu_backdrop);
+}
+
+static void playlist_row_long_press_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+    playlist_row_long_press_fired = true;
+    int i = (int) (intptr_t) lv_event_get_user_data(e);
+    if (i < 0 || i >= playlists_m3u_count) return;
+    snprintf(playlist_action_path, sizeof(playlist_action_path), "%s", playlists_m3u_paths[i]);
+    lv_obj_remove_flag(playlist_context_menu_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(playlist_context_menu_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(playlist_context_menu_backdrop);
+    lv_obj_move_foreground(playlist_context_menu_popup);
 }
 
 static void populate_playlists_screen(void) {
@@ -3051,46 +2991,30 @@ static void populate_playlists_screen(void) {
     /* Persistent cache of PLAYLISTS_DIR only -- see rescan_playlists(). */
     metadata_db_load_all_playlists(&playlists_m3u_paths, &playlists_m3u_count);
 
-    lv_label_set_text(playlists_edit_btn, playlists_edit_mode ? "Done" : "Edit");
     lv_obj_t * create = add_playlist_row_base(playlists_list, "+ New Playlist");
     lv_obj_add_style(create, &style_theme_card_bg, 0);
     lv_obj_add_flag(create, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(create, new_playlist_row_cb, LV_EVENT_CLICKED, (void *) 1);
     build_list_section(playlists_list, "System playlists");
 
-    /* Favorites/Most Played/Queue/Recently Added are never deletable (none
-     * is a real .m3u file -- see playlist_row_click_cb()'s index==0..3
-     * special cases), so edit mode just makes them inert instead of showing
-     * a delete icon that would have nothing to act on. Same "row does
-     * nothing, only the per-row action works" convention as
-     * populate_group_songs_rows()'s own edit mode. */
+    /* Favorites/Most Played/Queue/Recently Added are never deletable/
+     * renamable (none is a real .m3u file -- see playlist_row_click_cb()'s
+     * index==0..3 special cases), so they get no long-press handler. */
     lv_obj_t * favorites_row = add_playlist_row_base(playlists_list, "Favorites");
-    if (!playlists_edit_mode) {
-        lv_obj_add_flag(favorites_row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(favorites_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 0);
-    }
+    lv_obj_add_flag(favorites_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(favorites_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 0);
 
     lv_obj_t * most_played_row = add_playlist_row_base(playlists_list, "Most Played");
-    if (!playlists_edit_mode) {
-        lv_obj_add_flag(most_played_row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(most_played_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 1);
-    }
+    lv_obj_add_flag(most_played_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(most_played_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 1);
 
-    /* Never deletable either -- same treatment as Favorites/Most Played
-     * above, see playlist_row_click_cb()'s index==2 case. */
     lv_obj_t * queue_row = add_playlist_row_base(playlists_list, "Queue");
-    if (!playlists_edit_mode) {
-        lv_obj_add_flag(queue_row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(queue_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 2);
-    }
+    lv_obj_add_flag(queue_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(queue_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 2);
 
-    /* Never deletable either -- same treatment as Favorites/Most Played/Queue
-     * above, see playlist_row_click_cb()'s index==3 case. */
     lv_obj_t * recently_added_row = add_playlist_row_base(playlists_list, "Recently Added");
-    if (!playlists_edit_mode) {
-        lv_obj_add_flag(recently_added_row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(recently_added_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 3);
-    }
+    lv_obj_add_flag(recently_added_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(recently_added_row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) 3);
 
     build_list_section(playlists_list, "User playlists");
     if (!playlists_m3u_count)
@@ -3099,24 +3023,11 @@ static void populate_playlists_screen(void) {
         const char * display = playlists_m3u_paths[i];
         if (strncmp(display, PLAYLISTS_DIR "/", strlen(PLAYLISTS_DIR) + 1) == 0) display += strlen(PLAYLISTS_DIR) + 1;
         lv_obj_t * row = add_playlist_row_base(playlists_list, display);
-        lv_obj_set_width(lv_obj_get_child(row, 0), LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - (playlists_edit_mode ? 180 : 60));
+        lv_obj_set_width(lv_obj_get_child(row, 0), LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - 60);
         lv_label_set_long_mode(lv_obj_get_child(row, 0), LV_LABEL_LONG_DOT);
-        if (playlists_edit_mode) {
-            lv_obj_t * rename = lv_label_create(row);
-            lv_label_set_text(rename, "Rename");
-            lv_obj_align(rename, LV_ALIGN_RIGHT_MID, -70, 0);
-            lv_obj_add_flag(rename, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_set_ext_click_area(rename, 10);
-            lv_obj_add_event_cb(rename, playlist_rename_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
-            lv_obj_t * delete_icon = lv_image_create(row);
-            lv_image_set_src(delete_icon, asset_path("touch_list/del.png"));
-            lv_obj_align(delete_icon, LV_ALIGN_RIGHT_MID, -20, 0);
-            lv_obj_add_flag(delete_icon, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(delete_icon, playlist_delete_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
-        } else {
-            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (4 + i));
-        }
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (4 + i));
+        lv_obj_add_event_cb(row, playlist_row_long_press_cb, LV_EVENT_LONG_PRESSED, (void *) (intptr_t) i);
     }
 }
 
@@ -3131,19 +3042,6 @@ static lv_obj_t * build_playlists_screen(void) {
      * whatever the shared builder's own (untouched, ~20-screens-shared)
      * default flex alignment happens to be. */
     lv_obj_set_flex_align(playlists_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
-
-    /* Attached directly onto this specific screen instance rather than
-     * threaded through build_subsonic_list_screen()'s own parameters --
-     * that builder is shared by ~20 unrelated screens, same established
-     * pattern as build_wifi_screen()'s Rescan button and the Subsonic
-     * Download buttons. */
-    playlists_edit_btn = lv_label_create(scr);
-    lv_label_set_text(playlists_edit_btn, "Edit");
-    lv_obj_set_style_text_color(playlists_edit_btn, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(playlists_edit_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(playlists_edit_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_flag(playlists_edit_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(playlists_edit_btn, playlists_edit_btn_cb, LV_EVENT_CLICKED, NULL);
 
     return scr;
 }
@@ -3258,16 +3156,12 @@ static void * library_rescan_thread_func(void * arg) {
     sched_setscheduler(0, SCHED_BATCH, &sp);
     setpriority(PRIO_PROCESS, 0, 5);
 #endif
-#ifdef TEST_BUILD_TAG
-    uint64_t started_ms = test_diag_now_ms();
-    TEST_DIAG("DB", "rescan_thread_begin rss_kb=%ld", test_diag_rss_kb());
-#endif
+    uint64_t started_ms = db_log_enabled() ? db_log_now_ms() : 0;
+    DB_LOG("DB", "rescan_thread_begin rss_kb=%ld", db_log_rss_kb());
     library_scan_once();
-#ifdef TEST_BUILD_TAG
-    TEST_DIAG("DB", "rescan_thread_end songs=%lld elapsed_ms=%llu rss_kb=%ld",
-              (long long) metadata_db_get_song_count(), (unsigned long long) (test_diag_now_ms() - started_ms),
-              test_diag_rss_kb());
-#endif
+    DB_LOG("DB", "rescan_thread_end songs=%lld elapsed_ms=%llu rss_kb=%ld",
+           (long long) metadata_db_get_song_count(), (unsigned long long) (db_log_now_ms() - started_ms),
+           db_log_rss_kb());
     atomic_store_explicit(&library_rescan_done_flag, true, memory_order_release); /* written last -- update_timer_cb only checks this flag */
     return NULL;
 }
@@ -3285,8 +3179,8 @@ bool gui_library_auto_rescan_enabled(void) {
 void start_library_rescan(void) {
     /* Ignore request if a rescan is already running. */
     if (library_rescan_active) return;
-    TEST_DIAG("DB", "rescan_requested existing_songs=%lld rss_kb=%ld",
-              (long long) metadata_db_get_song_count(), test_diag_rss_kb());
+    DB_LOG("DB", "rescan_requested existing_songs=%lld rss_kb=%ld",
+           (long long) metadata_db_get_song_count(), db_log_rss_kb());
     /* A metadata parser child is already a meaningful peak on this 56 MiB
      * target. Do not overlap it with a previous warmer or lazy cover decode;
      * cancellation is cooperative and bounded by the artwork timeout. */
@@ -3968,14 +3862,17 @@ static void artists_tile_cb(lv_event_t * e) {
 
 static void albums_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-#ifdef TEST_BUILD_TAG
-    int artist_count = 0, album_artist_count = 0, album_count = 0;
-    metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
-    albums_page_open_requested_ms = test_diag_now_ms();
-    TEST_DIAG("ALBUMS_PAGE", "open_requested albums=%d cache_worker_active=%d lazy_active=%d rss_kb=%ld",
-              album_count, (int) atomic_load(&album_thumb_gen_active), (int) album_thumbnail_active,
-              test_diag_rss_kb());
-#endif
+    /* metadata_db_get_group_counts() is a real DB query, worth skipping
+     * outright (not just leaving DB_LOG to no-op on the result) since this
+     * runs on every ordinary tap into Albums, not just during a scan. */
+    if (db_log_enabled()) {
+        int artist_count = 0, album_artist_count = 0, album_count = 0;
+        metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
+        albums_page_open_requested_ms = db_log_now_ms();
+        DB_LOG("ALBUMS_PAGE", "open_requested albums=%d cache_worker_active=%d lazy_active=%d rss_kb=%ld",
+               album_count, (int) atomic_load(&album_thumb_gen_active), (int) album_thumbnail_active,
+               db_log_rss_kb());
+    }
     nav_push(albums_screen);
 }
 
@@ -3986,7 +3883,6 @@ static void album_artist_tile_cb(lv_event_t * e) {
 
 static void playlists_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    playlists_edit_mode = false; /* fresh entry from the menu always starts out of edit mode, same convention as show_group_songs_editable() */
     populate_playlists_screen();
     nav_push(playlists_screen);
 }
@@ -4559,6 +4455,7 @@ void gui_library_init(void) {
     album_artist_screen = build_album_artist_screen();
     library_teardown_diag("build_playlists_screen before");
     playlists_screen = build_playlists_screen();
+    build_playlist_context_menu_popup();
     library_teardown_diag("build_cue_tracks_screen before");
     cue_tracks_screen = build_cue_tracks_screen();
     library_teardown_diag("build_group_songs_screen before");
@@ -4660,6 +4557,8 @@ void gui_library_teardown(void) {
     if (playlist_start_backdrop) { lv_obj_delete(playlist_start_backdrop); playlist_start_backdrop = NULL; }
     if (playlist_delete_popup) { lv_obj_delete(playlist_delete_popup); playlist_delete_popup = NULL; }
     if (playlist_delete_backdrop) { lv_obj_delete(playlist_delete_backdrop); playlist_delete_backdrop = NULL; }
+    if (playlist_context_menu_popup) { lv_obj_delete(playlist_context_menu_popup); playlist_context_menu_popup = NULL; }
+    if (playlist_context_menu_backdrop) { lv_obj_delete(playlist_context_menu_backdrop); playlist_context_menu_backdrop = NULL; }
     /* poll_power_off_countdown() runs every tick from update_timer_cb,
      * which this reload never touches or pauses -- if a countdown is live
      * when a reload happens, deleting power_off_countdown_popup/backdrop
@@ -4731,7 +4630,6 @@ void gui_library_teardown(void) {
     artist_albums_list = NULL;
     artist_albums_title_label = NULL;
     playlists_list = NULL;
-    playlists_edit_btn = NULL;
     cue_tracks_list = NULL;
     cue_tracks_title_label = NULL;
     add_to_playlist_list = NULL;
@@ -4882,21 +4780,28 @@ static bool scan_spool_read_path(FILE * f, char * path, size_t path_size) {
     return true;
 }
 
-static void scan_one_song_into_db(const char * path) {
+typedef enum {
+    SCAN_SONG_CACHED,   /* metadata_db_get() hit -- no parse attempted */
+    SCAN_SONG_PARSED,   /* isolated read + DB upsert succeeded */
+    SCAN_SONG_FAILED,   /* metadata_read_isolated() failed -- isolated child timeout/crash/malformed input */
+    SCAN_SONG_NO_STAT,  /* stat() failed -- metadata was parsed but never upserted (no mtime/size to key the row by) */
+} scan_song_result_t;
+
+static scan_song_result_t scan_one_song_into_db(const char * path) {
     struct stat st;
     bool have_stat = stat(path, &st) == 0;
     int64_t mtime = have_stat ? (int64_t) st.st_mtime : 0;
     int64_t size = have_stat ? (int64_t) st.st_size : 0;
 
     cached_tags_t cached;
-    if (have_stat && metadata_db_get(path, mtime, size, &cached)) return;
+    if (have_stat && metadata_db_get(path, mtime, size, &cached)) return SCAN_SONG_CACHED;
 
     /* Record breadcrumb path prior to reading metadata so crash diagnostics
      * can report the specific file being parsed if an unhandled signal occurs. */
     snprintf(g_scan_last_path, sizeof(g_scan_last_path), "%s", path);
 
     track_metadata_t meta;
-    if (!metadata_read_isolated(path, &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS)) return;
+    if (!metadata_read_isolated(path, &meta, LIBRARY_SCAN_FILE_TIMEOUT_MS)) return SCAN_SONG_FAILED;
 
     cached_tags_t fresh;
     memset(&fresh, 0, sizeof(fresh));
@@ -4912,7 +4817,9 @@ static void scan_one_song_into_db(const char * path) {
     free(meta.picture_data);
     free(meta.lyrics); /* always NULL here (metadata_read_isolated() itself already frees/NULLs it before the pipe write), freeing defensively for symmetry */
 
-    if (have_stat) metadata_db_put(path, mtime, size, &fresh);
+    if (!have_stat) return SCAN_SONG_NO_STAT;
+    metadata_db_put(path, mtime, size, &fresh);
+    return SCAN_SONG_PARSED;
 }
 
 /* Overall scan progress, polled by update_timer_cb while library_rescan_active
@@ -4977,55 +4884,46 @@ static void rescan_playlists(void) {
 
 void library_scan_once(void) {
     library_rescan_succeeded = false;
-#ifdef TEST_BUILD_TAG
-    uint64_t scan_started_ms = test_diag_now_ms();
+    bool db_logging = db_log_enabled();
+    uint64_t scan_started_ms = db_logging ? db_log_now_ms() : 0;
     uint64_t phase_started_ms = scan_started_ms;
-#endif
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
 
-    TEST_DIAG("DB", "scan_begin root=%s rss_kb=%ld", MUSIC_ROOT_DIR, test_diag_rss_kb());
+    DB_LOG("DB", "scan_begin root=%s rss_kb=%ld", MUSIC_ROOT_DIR, db_log_rss_kb());
     metadata_db_open();
-    TEST_DIAG("DB", "db_open elapsed_ms=%llu songs=%lld rss_kb=%ld",
-              (unsigned long long) (test_diag_now_ms() - phase_started_ms), (long long) metadata_db_get_song_count(),
-              test_diag_rss_kb());
-#ifdef TEST_BUILD_TAG
-    phase_started_ms = test_diag_now_ms();
-#endif
+    DB_LOG("DB", "db_open elapsed_ms=%llu songs=%lld rss_kb=%ld",
+           (unsigned long long) (db_log_now_ms() - phase_started_ms), (long long) metadata_db_get_song_count(),
+           db_log_rss_kb());
+    phase_started_ms = db_logging ? db_log_now_ms() : 0;
     gui_books_rescan();
-    TEST_DIAG("DB", "books_scan_end elapsed_ms=%llu rss_kb=%ld",
-              (unsigned long long) (test_diag_now_ms() - phase_started_ms), test_diag_rss_kb());
-#ifdef TEST_BUILD_TAG
-    phase_started_ms = test_diag_now_ms();
-#endif
+    DB_LOG("DB", "books_scan_end elapsed_ms=%llu rss_kb=%ld",
+           (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
+    phase_started_ms = db_logging ? db_log_now_ms() : 0;
     rescan_playlists();
-    TEST_DIAG("DB", "playlists_scan_end elapsed_ms=%llu rss_kb=%ld",
-              (unsigned long long) (test_diag_now_ms() - phase_started_ms), test_diag_rss_kb());
+    DB_LOG("DB", "playlists_scan_end elapsed_ms=%llu rss_kb=%ld",
+           (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
 
     char spool_path[PATH_MAX] = {0};
     int discovered_count = 0;
-#ifdef TEST_BUILD_TAG
-    phase_started_ms = test_diag_now_ms();
-#endif
+    phase_started_ms = db_logging ? db_log_now_ms() : 0;
     if (!scan_all_songs_with_timeout(MUSIC_ROOT_DIR, spool_path, sizeof(spool_path), &discovered_count)) {
-        TEST_DIAG("DB", "discover_failed elapsed_ms=%llu rss_kb=%ld",
-                  (unsigned long long) (test_diag_now_ms() - phase_started_ms), test_diag_rss_kb());
+        DB_LOG("DB", "discover_failed elapsed_ms=%llu rss_kb=%ld",
+               (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
         return; /* preserve the last known-good in-memory + on-disk library */
     }
-    TEST_DIAG("DB", "discover_end files=%d elapsed_ms=%llu spool=%s rss_kb=%ld",
-              discovered_count, (unsigned long long) (test_diag_now_ms() - phase_started_ms),
-              spool_path, test_diag_rss_kb());
+    DB_LOG("DB", "discover_end files=%d elapsed_ms=%llu spool=%s rss_kb=%ld",
+           discovered_count, (unsigned long long) (db_log_now_ms() - phase_started_ms),
+           spool_path, db_log_rss_kb());
 
     library_scan_progress_total = discovered_count;
-#ifdef TEST_BUILD_TAG
-    phase_started_ms = test_diag_now_ms();
-#endif
+    phase_started_ms = db_logging ? db_log_now_ms() : 0;
     metadata_db_begin_update();
-    TEST_DIAG("DB", "update_begin files=%d rss_kb=%ld", discovered_count, test_diag_rss_kb());
+    DB_LOG("DB", "update_begin files=%d rss_kb=%ld", discovered_count, db_log_rss_kb());
 
     FILE * spool = fopen(spool_path, "rb");
     if (!spool) {
-        TEST_DIAG("DB", "spool_open_failed path=%s", spool_path);
+        DB_LOG("DB", "spool_open_failed rss_kb=%ld path=%s", db_log_rss_kb(), spool_path);
         metadata_db_abort_update();
         remove(spool_path);
         return;
@@ -5034,43 +4932,53 @@ void library_scan_once(void) {
     bool complete = true;
     char path[PATH_MAX];
     int done = 0;
+    /* Cached once, not read fresh every song: db_log_now_ms() is a real
+     * clock_gettime() syscall on this target (no vDSO), and DB_LOG's own
+     * internal enabled-check can't save that cost since its arguments (the
+     * elapsed-time expressions below) are already evaluated before the call
+     * is even made. Skipping db_log_now_ms()/DB_LOG entirely when off is the
+     * only way a 10,000+ song scan doesn't pay two syscalls per file even
+     * with logging disabled (the default). */
     while (done < discovered_count) {
         if (!scan_spool_read_path(spool, path, sizeof(path))) {
             complete = false;
             break;
         }
         if (path[0] != '\0') {
-#ifdef TEST_BUILD_TAG
-            uint64_t file_started_ms = test_diag_now_ms();
-            /* Crash-repro breadcrumb: flushed before metadata parsing so
-             * the final unmatched file_begin identifies the exact input
-             * being handled if the process or device dies mid-file. */
-            TEST_DIAG("DB_FILE", "file_begin index=%d total=%d rss_kb=%ld path=%s",
-                      done, discovered_count, test_diag_rss_kb(), path);
-#endif
-            scan_one_song_into_db(path);
-#ifdef TEST_BUILD_TAG
-            uint64_t file_ms = test_diag_now_ms() - file_started_ms;
-            TEST_DIAG("DB_FILE", "file_end index=%d elapsed_ms=%llu rss_kb=%ld path=%s",
-                      done, (unsigned long long) file_ms, test_diag_rss_kb(), path);
-            if (file_ms >= 250)
-                TEST_DIAG("DB", "slow_file index=%d elapsed_ms=%llu path=%s", done,
-                          (unsigned long long) file_ms, path);
-#endif
+            uint64_t file_started_ms = db_logging ? db_log_now_ms() : 0;
+            /* No rss_kb here -- see db_log_rss_kb()'s own comment; RSS is
+             * only worth the /proc read at phase boundaries, progress
+             * intervals, slow files, and failures, not on every song. Plain
+             * buffered logging, no per-file flush -- crash forensics for the
+             * parent are already covered by g_scan_last_path (set inside
+             * scan_one_song_into_db() itself, see its own comment) plus
+             * main.c's crash handler, which fsyncs reload_diag.log; the
+             * actual metadata parse also runs in an isolated child process
+             * (metadata_read_isolated()), so a malformed file yields
+             * SCAN_SONG_FAILED below rather than crashing this process. */
+            if (db_logging) DB_LOG("DB_FILE", "file_begin index=%d total=%d path=%s", done, discovered_count, path);
+            scan_song_result_t result = scan_one_song_into_db(path);
+            if (db_logging) {
+                uint64_t file_ms = db_log_now_ms() - file_started_ms;
+                static const char * const scan_song_result_name[] = { "cached", "parsed", "failed", "no_stat" };
+                DB_LOG("DB_FILE", "file_end index=%d result=%s elapsed_ms=%llu path=%s", done,
+                       scan_song_result_name[result], (unsigned long long) file_ms, path);
+                if (file_ms >= 250)
+                    DB_LOG("DB", "slow_file index=%d result=%s elapsed_ms=%llu rss_kb=%ld path=%s", done,
+                           scan_song_result_name[result], (unsigned long long) file_ms, db_log_rss_kb(), path);
+            }
         }
         library_scan_progress_done = ++done;
-#ifdef TEST_BUILD_TAG
         if ((done % 1000) == 0 || done == discovered_count)
-            TEST_DIAG("DB", "tag_progress done=%d total=%d elapsed_ms=%llu rss_kb=%ld",
-                      done, discovered_count, (unsigned long long) (test_diag_now_ms() - phase_started_ms),
-                      test_diag_rss_kb());
-#endif
+            DB_LOG("DB", "tag_progress done=%d total=%d elapsed_ms=%llu rss_kb=%ld",
+                   done, discovered_count, (unsigned long long) (db_log_now_ms() - phase_started_ms),
+                   db_log_rss_kb());
     }
     fclose(spool);
     remove(spool_path);
 
     if (!complete) {
-        TEST_DIAG("DB", "spool_read_incomplete done=%d total=%d", done, discovered_count);
+        DB_LOG("DB", "spool_read_incomplete done=%d total=%d rss_kb=%ld", done, discovered_count, db_log_rss_kb());
         metadata_db_abort_update();
         return;
     }
@@ -5079,17 +4987,15 @@ void library_scan_once(void) {
     library_rescan_succeeded = committed;
     if (!committed)
         fprintf(stderr, "Warning: music database commit failed -- keeping last on-disk library\n");
-    TEST_DIAG("DB", "commit_end ok=%d files=%d elapsed_ms=%llu songs=%lld rss_kb=%ld", committed,
-              done, (unsigned long long) (test_diag_now_ms() - phase_started_ms),
-              (long long) metadata_db_get_song_count(), test_diag_rss_kb());
+    DB_LOG("DB", "commit_end ok=%d files=%d elapsed_ms=%llu songs=%lld rss_kb=%ld", committed,
+           done, (unsigned long long) (db_log_now_ms() - phase_started_ms),
+           (long long) metadata_db_get_song_count(), db_log_rss_kb());
 
-#ifdef TEST_BUILD_TAG
-    phase_started_ms = test_diag_now_ms();
-#endif
+    phase_started_ms = db_logging ? db_log_now_ms() : 0;
     library_load_from_cache_only();
-    TEST_DIAG("DB", "reload_end songs=%lld elapsed_ms=%llu total_ms=%llu rss_kb=%ld",
-              (long long) metadata_db_get_song_count(), (unsigned long long) (test_diag_now_ms() - phase_started_ms),
-              (unsigned long long) (test_diag_now_ms() - scan_started_ms), test_diag_rss_kb());
+    DB_LOG("DB", "reload_end songs=%lld elapsed_ms=%llu total_ms=%llu rss_kb=%ld",
+           (long long) metadata_db_get_song_count(), (unsigned long long) (db_log_now_ms() - phase_started_ms),
+           (unsigned long long) (db_log_now_ms() - scan_started_ms), db_log_rss_kb());
 }
 
 /* Boot-time equivalent of library_scan_once() that loads existing cached

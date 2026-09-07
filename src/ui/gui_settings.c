@@ -27,6 +27,7 @@
 #include "gui_plugin_manage.h"
 #include "fallback_font.h"
 #include "gui_navigation.h"
+#include "db_log.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -53,6 +54,7 @@ static lv_obj_t * settings_display_screen;
 static lv_obj_t * settings_power_screen;
 static lv_obj_t * settings_system_screen;
 static lv_obj_t * about_screen;
+static lv_obj_t * dev_options_screen;
 static lv_obj_t * accent_color_screen;
 static lv_obj_t * custom_font_screen;
 static lv_obj_t * screen_timeout_screen;
@@ -404,13 +406,39 @@ void firmware_update_row_cb(lv_event_t * e) {
     lv_obj_move_foreground(firmware_update_popup);
 }
 
+static void dev_options_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(dev_options_screen);
+}
+
 static lv_obj_t * build_about_screen(void) {
-    static pill_list_item_t items[3];
+    static pill_list_item_t items[4];
     items[0] = (pill_list_item_t){ "Open Source Player for HiBy OS", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[1] = (pill_list_item_t){ app_version_label(), PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 3, gui_theme_accent_style(), GUI_ROW_GAP);
+    items[3] =
+        (pill_list_item_t){ "Developer Options", PILL_ACCESSORY_CHEVRON, false, dev_options_row_cb, NULL, NULL };
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 4, gui_theme_accent_style(), GUI_ROW_GAP);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void db_logging_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.db_logging_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+    db_log_set_enabled(current_settings.db_logging_enabled);
+}
+
+/* Writes a detailed timestamped log of library database scans and album art
+ * cache jobs (including lazy load) to .logs/database_artwork.log on the SD
+ * card -- see db_log.h. */
+static lv_obj_t * build_dev_options_screen(void) {
+    static pill_list_item_t items[1];
+    items[0] = (pill_list_item_t){ "Enable database logging", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.db_logging_enabled, NULL, db_logging_switch_event_cb, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Developer Options", generic_back_cb, items, 1, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -419,23 +447,7 @@ static lv_obj_t * build_accent_color_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Accent Color");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Accent Color", generic_back_cb, NULL, NULL);
 
     /* 16-swatch color palette displayed in a wrapping flex container with
      * generous touch targets and spacing. */
@@ -611,23 +623,7 @@ static lv_obj_t * build_custom_font_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Font");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Font", generic_back_cb, NULL, NULL);
 
     /* Preview card pinned at top */
     lv_obj_t * preview_card = lv_obj_create(scr);
@@ -747,23 +743,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Screen Timeout");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Screen Timeout", generic_back_cb, NULL, NULL);
 
     /* Enable row configured with flex layout (SPACE_BETWEEN and flex-grow)
      * so the text label wraps cleanly across font sizes without overlapping
@@ -871,23 +851,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Startup Volume");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Startup Volume", generic_back_cb, NULL, NULL);
 
     /* Flex row with SPACE_BETWEEN layout to prevent text/switch overlap. */
     lv_obj_t * enable_row = lv_obj_create(scr);
@@ -1047,23 +1011,7 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Sleep Timer");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Sleep Timer", generic_back_cb, NULL, NULL);
 
     /* Same flex-row/SPACE_BETWEEN/flex_grow-label shape as build_screen_
      * timeout_screen()'s own enable_row -- see its comment for the real-
@@ -1225,23 +1173,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Idle Shutdown");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "Idle Shutdown", generic_back_cb, NULL, NULL);
 
     /* Uses content-based sizing so wrapped label text does not overlap. */
     lv_obj_t * enable_row = lv_obj_create(scr);
@@ -1814,25 +1746,7 @@ gui_theme_accent_style(), GUI_ROW_GAP);
 static lv_obj_t * build_clock_set_time_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
-    /* A plain object keeps the 64px touch target without lv_button's
-     * built-in shadow/outline, which remained visible as a rounded box
-     * around the otherwise transparent back arrow. */
-    lv_obj_t * back = lv_obj_create(scr);
-    lv_obj_set_size(back, 64, 64);
-    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back, 0, 0);
-    lv_obj_set_style_border_width(back, 0, 0);
-    lv_obj_remove_flag(back, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * arrow = lv_image_create(back);
-    lv_image_set_src(arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Set Time");
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    build_screen_header(scr, "Set Time", generic_back_cb, NULL, NULL);
 
     lv_obj_t * row = lv_obj_create(scr);
     lv_obj_set_size(row, lv_pct(92), 360);
@@ -2691,7 +2605,7 @@ static lv_obj_t * build_eq_profiles_screen(void) {
     lv_label_set_text(eq_profiles_edit_btn, "Edit");
     lv_obj_set_style_text_color(eq_profiles_edit_btn, accent_lv_color(), 0);
     lv_obj_set_style_text_font(eq_profiles_edit_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(eq_profiles_edit_btn, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    align_screen_header_action(eq_profiles_edit_btn, 20);
     lv_obj_add_flag(eq_profiles_edit_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(eq_profiles_edit_btn, eq_profiles_edit_btn_cb, LV_EVENT_CLICKED, NULL);
     if (title_label) reserve_title_width_before(title_label, eq_profiles_edit_btn);
@@ -2737,29 +2651,13 @@ static lv_obj_t * build_eq_screen(void) {
      * (build_subsonic_list_screen et al) instead of the old screen's own
      * one-off green "< Back" button -- the other half of "styling should
      * use the same as all the other screens". */
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "PEQ");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    build_screen_header(scr, "PEQ", generic_back_cb, NULL, NULL);
 
     /* "EQ Enabled" switch lives in the title row itself (top-right), same
      * spot other screens put a title-row action (e.g. the Wi-Fi screen's
      * "Rescan"). */
     eq_bypass_switch = lv_switch_create(scr);
-    lv_obj_align(eq_bypass_switch, LV_ALIGN_TOP_RIGHT, -16, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
+    align_screen_header_action(eq_bypass_switch, 16);
     lv_obj_add_style(eq_bypass_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
 
     /* Reset to defaults -- positioned relative to the bypass switch.
@@ -2961,6 +2859,7 @@ static lv_obj_t * build_eq_screen(void) {
 
 void gui_settings_init(void) {
     about_screen = build_about_screen();
+    dev_options_screen = build_dev_options_screen();
     accent_color_screen = build_accent_color_screen();
     custom_font_screen = build_custom_font_screen();
     screen_timeout_screen = build_screen_timeout_screen();
@@ -3011,6 +2910,7 @@ void gui_settings_teardown(void) {
     if (hostname_reboot_popup_backdrop) { lv_obj_del(hostname_reboot_popup_backdrop); hostname_reboot_popup_backdrop = NULL; }
 
     if (about_screen) { lv_obj_del(about_screen); about_screen = NULL; }
+    if (dev_options_screen) { lv_obj_del(dev_options_screen); dev_options_screen = NULL; }
     if (accent_color_screen) { lv_obj_del(accent_color_screen); accent_color_screen = NULL; }
     if (custom_font_screen) { lv_obj_del(custom_font_screen); custom_font_screen = NULL; }
     if (screen_timeout_screen) { lv_obj_del(screen_timeout_screen); screen_timeout_screen = NULL; }

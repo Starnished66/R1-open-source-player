@@ -55,20 +55,16 @@ bool file_browser_build_playlist_for_path(const char * path, char *** out_playli
  * under it.
  *
  * progress, if non-NULL, is incremented (not overwritten -- start it at 0)
- * every time a filesystem entry has successfully returned from lstat(), so a caller running this on a
- * background thread can tell genuine forward progress on a large/deep
- * library apart from a stuck readdir()/lstat() (real filesystem
- * corruption) without needing its own copy of the running count -- see
- * gui.c's scan_all_songs_with_timeout() for the actual stall-detection
- * logic this exists to support. */
+ * after each lstat() returns, so a background caller can detect genuine
+ * forward progress distinct from a hung readdir()/lstat() without needing
+ * its own copy of the running count. */
 bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, atomic_int * progress);
 
-/* Rockbox-style bounded-memory library walk. Unlike file_browser_scan_all_songs(),
- * this never builds an O(song_count) path array. Each playable file is delivered
- * immediately to cb; the path is valid only for the duration of the callback.
- * Returning false from cb stops the walk. out_count receives the number of songs
- * delivered. Memory use is bounded by the recursion stack + one PATH_MAX buffer
- * per active directory, independent of library size. */
+/* Bounded-memory library walk. Each playable file is delivered immediately
+ * to cb; the path is valid only for the duration of the callback. Returning
+ * false from cb stops the walk. out_count receives the number of songs
+ * delivered. Memory use is bounded by the recursion stack + one PATH_MAX
+ * buffer per active directory, independent of library size. */
 typedef bool (*file_browser_song_visit_cb_t)(const char * path, void * user);
 bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t cb, void * user,
                                  int * out_count, atomic_int * progress);
@@ -96,6 +92,13 @@ bool file_browser_walk_all_songs_excluding_top_level(const char * root, const ch
 const char * file_browser_get_last_selected_dir(void);
 int file_browser_get_last_selected_row(void);
 void file_browser_navigate_to(const char * dir, int row_to_reveal);
+
+/* True when the browser is showing root_dir itself. */
+bool file_browser_at_root(void);
+
+/* Steps current_dir up one level toward root_dir and rebuilds the list.
+ * No-op if already at root. */
+void file_browser_go_up(void);
 
 /* Parses a M3U/M3U8 playlist file: one entry path per non-blank,
  * non-comment line, resolved relative to the playlist's own directory

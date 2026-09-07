@@ -831,14 +831,216 @@ void poll_cover_decode(void) {
 
 
 
+/* ---- Asynchronous favorite persistence worker -------------------------
+ * Favorite persistence calls metadata_db_song_favorite_set(), which may
+ * acquire global metadata locks, trigger tagcache updates, or synchronously
+ * rewrite and fsync() remote state files (remote_state_set_rating()).
+ * Executing this directly on the LVGL UI thread stalls rendering and causes
+ * tap latency or freezes.
+ *
+ * This long-lived worker thread queues and persists favorite requests off the
+ * UI thread. Rapid taps on the same track are coalesced using a 150 ms debounce
+ * window so intermediate states are collapsed into the final requested state.
+ * Distinct tracks maintain independent entries with owned path copies so track
+ * changes do not overwrite or corrupt pending persistence operations. ---- */
+#define FAVORITE_QUEUE_INITIAL_CAPACITY 8
+#define FAVORITE_DEBOUNCE_MS 150
+#define FAVORITE_WORKER_STACK_SIZE (128 * 1024)
+
+typedef struct {
+    char * path;
+    bool is_favorite;
+    struct timespec deadline;
+} favorite_req_t;
+
+static pthread_t favorite_worker_thread;
+static pthread_mutex_t favorite_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t favorite_worker_cond;
+static pthread_once_t favorite_worker_once = PTHREAD_ONCE_INIT;
+static bool favorite_worker_ready = false;
+
+static favorite_req_t * favorite_queue = NULL;
+static int favorite_queue_count = 0;
+static int favorite_queue_capacity = 0;
+
+static void * favorite_worker_main(void * unused) {
+    (void) unused;
+    for (;;) {
+        pthread_mutex_lock(&favorite_worker_mutex);
+        while (favorite_queue_count == 0) {
+            pthread_cond_wait(&favorite_worker_cond, &favorite_worker_mutex);
+        }
+
+        int ready_idx = -1;
+        while (ready_idx < 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+
+            struct timespec earliest = favorite_queue[0].deadline;
+            int earliest_idx = 0;
+            for (int i = 1; i < favorite_queue_count; i++) {
+                if (favorite_queue[i].deadline.tv_sec < earliest.tv_sec ||
+                    (favorite_queue[i].deadline.tv_sec == earliest.tv_sec &&
+                     favorite_queue[i].deadline.tv_nsec < earliest.tv_nsec)) {
+                    earliest = favorite_queue[i].deadline;
+                    earliest_idx = i;
+                }
+            }
+
+            if (now.tv_sec > earliest.tv_sec ||
+                (now.tv_sec == earliest.tv_sec && now.tv_nsec >= earliest.tv_nsec)) {
+                ready_idx = earliest_idx;
+                break;
+            }
+
+            int ret = pthread_cond_timedwait(&favorite_worker_cond, &favorite_worker_mutex, &earliest);
+            (void) ret;
+            if (favorite_queue_count == 0) break;
+        }
+
+        if (ready_idx < 0) {
+            pthread_mutex_unlock(&favorite_worker_mutex);
+            continue;
+        }
+
+        /* Dequeue the ready request and take ownership */
+        char * req_path = favorite_queue[ready_idx].path;
+        bool req_fav = favorite_queue[ready_idx].is_favorite;
+
+        for (int i = ready_idx; i < favorite_queue_count - 1; i++) {
+            favorite_queue[i] = favorite_queue[i + 1];
+        }
+        favorite_queue_count--;
+
+        /* Unlock worker mutex before calling metadata DB / file I/O */
+        pthread_mutex_unlock(&favorite_worker_mutex);
+
+        if (req_path) {
+            metadata_db_song_favorite_set(req_path, req_fav);
+            free(req_path);
+        }
+    }
+    return NULL;
+}
+
+static void favorite_start_worker(void) {
+    pthread_condattr_t cattr;
+    if (pthread_condattr_init(&cattr) != 0) {
+        fprintf(stderr, "gui_player: failed to initialize favorite worker condition variable\n");
+        return;
+    }
+    if (pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) != 0 ||
+        pthread_cond_init(&favorite_worker_cond, &cattr) != 0) {
+        fprintf(stderr, "gui_player: failed to initialize favorite worker condition variable\n");
+        pthread_condattr_destroy(&cattr);
+        return;
+    }
+    pthread_condattr_destroy(&cattr);
+
+    favorite_queue = calloc(FAVORITE_QUEUE_INITIAL_CAPACITY, sizeof(*favorite_queue));
+    if (!favorite_queue) {
+        fprintf(stderr, "gui_player: failed to allocate favorite persistence queue\n");
+        pthread_cond_destroy(&favorite_worker_cond);
+        return;
+    }
+    favorite_queue_capacity = FAVORITE_QUEUE_INITIAL_CAPACITY;
+
+    pthread_attr_t attr;
+    bool attr_initialized = pthread_attr_init(&attr) == 0;
+    if (attr_initialized) pthread_attr_setstacksize(&attr, FAVORITE_WORKER_STACK_SIZE);
+    int create_rc = pthread_create(&favorite_worker_thread, attr_initialized ? &attr : NULL,
+                                   favorite_worker_main, NULL);
+    if (attr_initialized) pthread_attr_destroy(&attr);
+    if (create_rc == 0) {
+        pthread_detach(favorite_worker_thread);
+        favorite_worker_ready = true;
+    } else {
+        fprintf(stderr, "gui_player: failed to spawn favorite persistence worker thread\n");
+        free(favorite_queue);
+        favorite_queue = NULL;
+        favorite_queue_capacity = 0;
+        pthread_cond_destroy(&favorite_worker_cond);
+    }
+}
+
+static void favorite_queue_submit(const char * path, bool is_favorite) {
+    if (!path) return;
+    pthread_once(&favorite_worker_once, favorite_start_worker);
+    if (!favorite_worker_ready) {
+        fprintf(stderr, "gui_player: favorite worker not ready; dropping async persistence\n");
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    struct timespec deadline = now;
+    deadline.tv_nsec += (long) FAVORITE_DEBOUNCE_MS * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+        deadline.tv_nsec %= 1000000000L;
+    }
+
+    pthread_mutex_lock(&favorite_worker_mutex);
+
+    /* 1. Coalesce by exact path match if already queued */
+    for (int i = 0; i < favorite_queue_count; i++) {
+        if (strcmp(favorite_queue[i].path, path) == 0) {
+            favorite_queue[i].is_favorite = is_favorite;
+            favorite_queue[i].deadline = deadline;
+            pthread_cond_signal(&favorite_worker_cond);
+            pthread_mutex_unlock(&favorite_worker_mutex);
+            return;
+        }
+    }
+
+    /* 2. New track entry: allocate owned path copy */
+    char * path_copy = strdup(path);
+    if (!path_copy) {
+        fprintf(stderr, "gui_player: strdup failed for favorite path '%s'\n", path);
+        pthread_mutex_unlock(&favorite_worker_mutex);
+        return;
+    }
+
+    /* Grow only for distinct tracks. Same-track tap storms are coalesced
+     * above, while this path keeps the LVGL thread from waiting for slow
+     * metadata or SD-card I/O and never evicts an acknowledged change. */
+    if (favorite_queue_count >= favorite_queue_capacity) {
+        int new_capacity = favorite_queue_capacity * 2;
+        favorite_req_t * grown = realloc(favorite_queue,
+                                          sizeof(*favorite_queue) * (size_t) new_capacity);
+        if (!grown) {
+            fprintf(stderr, "gui_player: failed to grow favorite persistence queue\n");
+            free(path_copy);
+            pthread_mutex_unlock(&favorite_worker_mutex);
+            return;
+        }
+        favorite_queue = grown;
+        favorite_queue_capacity = new_capacity;
+    }
+
+    favorite_queue[favorite_queue_count].path = path_copy;
+    favorite_queue[favorite_queue_count].is_favorite = is_favorite;
+    favorite_queue[favorite_queue_count].deadline = deadline;
+    favorite_queue_count++;
+
+    pthread_cond_signal(&favorite_worker_cond);
+    pthread_mutex_unlock(&favorite_worker_mutex);
+}
+
 void favorite_icon_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     if (playlist_index < 0 || playlist_index >= playlist_count) return;
 
+    const char * path = playlist_path_at(playlist_index);
+    if (!path) return;
+
     favorite_is_set = !favorite_is_set;
-    metadata_db_song_favorite_set(playlist_path_at(playlist_index), favorite_is_set);
-    lv_image_set_src(favorite_icon, asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
+    if (favorite_icon) {
+        lv_image_set_src(favorite_icon, asset_path(favorite_is_set ? "playing_plane/collect_in.png" : "playing_plane/collect_out.png"));
+    }
     gui_shell_update_quick_drawer_favorite(favorite_is_set);
+
+    favorite_queue_submit(path, favorite_is_set);
 }
 
 void arm_next_track_for_audio(int index);
@@ -1376,6 +1578,10 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
     }
 }
 
+static void transport_btn_ctx_delete_cb(lv_event_t * e) {
+    free(lv_event_get_user_data(e));
+}
+
 /* Long-press seeking on next/prev buttons (fast-forward/rewind).
  *
  * `transport_seek_target_seconds` accumulates seek offsets persistently
@@ -1395,6 +1601,30 @@ static void transport_btn_press_event_cb(lv_event_t * e) {
 #define TRANSPORT_SEEK_STEP_SECONDS 3.0
 #define TRANSPORT_SEEK_EOF_GUARD_SECONDS 0.5
 
+/* Shared math for both the touch long-press repeat below and the physical
+ * Next button's own hold (gui_player_hw_next_seek_steps()) -- each input
+ * source keeps its own target_seconds/playback_generation/hold_cancelled
+ * triple so a hold on one doesn't interfere with a hold on the other. */
+static void apply_transport_seek_step(double dir, int step_count, bool is_first, double * target_seconds,
+                                       uint64_t * playback_generation, bool * hold_cancelled) {
+    if (step_count <= 0) return;
+    uint64_t gen = audio_get_playback_generation();
+    if (is_first) {
+        *target_seconds = audio_get_position_seconds();
+        *playback_generation = gen;
+        *hold_cancelled = false;
+    } else if (gen != *playback_generation) {
+        *hold_cancelled = true;
+    }
+    if (*hold_cancelled) return;
+    *target_seconds += dir * TRANSPORT_SEEK_STEP_SECONDS * (double) step_count;
+    if (*target_seconds < 0.0) *target_seconds = 0.0;
+    double duration = audio_get_duration_seconds();
+    double max_target = duration > TRANSPORT_SEEK_EOF_GUARD_SECONDS ? duration - TRANSPORT_SEEK_EOF_GUARD_SECONDS : 0.0;
+    if (*target_seconds > max_target) *target_seconds = max_target;
+    audio_seek(*target_seconds);
+}
+
 static double transport_seek_target_seconds;
 static uint64_t transport_seek_playback_generation;
 static bool transport_seek_hold_cancelled;
@@ -1403,21 +1633,20 @@ static void transport_seek_repeat_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code != LV_EVENT_LONG_PRESSED && code != LV_EVENT_LONG_PRESSED_REPEAT) return;
     double dir = (double) (intptr_t) lv_event_get_user_data(e);
-    uint64_t gen = audio_get_playback_generation();
-    if (code == LV_EVENT_LONG_PRESSED) {
-        transport_seek_target_seconds = audio_get_position_seconds();
-        transport_seek_playback_generation = gen;
-        transport_seek_hold_cancelled = false;
-    } else if (gen != transport_seek_playback_generation) {
-        transport_seek_hold_cancelled = true;
-    }
-    if (transport_seek_hold_cancelled) return;
-    transport_seek_target_seconds += dir * TRANSPORT_SEEK_STEP_SECONDS;
-    if (transport_seek_target_seconds < 0.0) transport_seek_target_seconds = 0.0;
-    double duration = audio_get_duration_seconds();
-    double max_target = duration > TRANSPORT_SEEK_EOF_GUARD_SECONDS ? duration - TRANSPORT_SEEK_EOF_GUARD_SECONDS : 0.0;
-    if (transport_seek_target_seconds > max_target) transport_seek_target_seconds = max_target;
-    audio_seek(transport_seek_target_seconds);
+    apply_transport_seek_step(dir, 1, code == LV_EVENT_LONG_PRESSED, &transport_seek_target_seconds,
+                               &transport_seek_playback_generation, &transport_seek_hold_cancelled);
+}
+
+/* Physical Next button, held -- see hw_buttons_consume_next_seek_steps()'s
+ * own comment. Called from gui.c's update_timer_cb with however many steps
+ * accumulated since the last poll. */
+static double hw_next_seek_target_seconds;
+static uint64_t hw_next_seek_playback_generation;
+static bool hw_next_seek_hold_cancelled;
+
+void gui_player_hw_next_seek_steps(int step_count, bool is_first) {
+    apply_transport_seek_step(1.0, step_count, is_first, &hw_next_seek_target_seconds,
+                               &hw_next_seek_playback_generation, &hw_next_seek_hold_cancelled);
 }
 
 /* LV_EVENT_CLICKED still fires on release even after a long press (LVGL's
@@ -1462,18 +1691,6 @@ static void debug_transport_btn_all_cb(lv_event_t * e) {
 }
 #endif
 
-#ifdef UI_HITBOX_DEBUG
-/* Outlines `obj`'s click hit-test boundary -- its drawn size plus
- * whatever lv_obj_set_ext_click_area(obj, ext) padded it out by -- in a
- * distinct solid color per transport-row icon for hitbox inspection. */
-static void debug_paint_hitbox(lv_obj_t * obj, int32_t ext, lv_color_t color) {
-    lv_obj_set_style_outline_width(obj, 3, 0);
-    lv_obj_set_style_outline_pad(obj, ext, 0);
-    lv_obj_set_style_outline_color(obj, color, 0);
-    lv_obj_set_style_outline_opa(obj, LV_OPA_COVER, 0);
-}
-#endif
-
 /* Extends the vertical reach of transport buttons (mode/play/prev/next/more)
  * up to a single shared top line (roughly level with song_count_label).
  * A separate invisible, absolutely-positioned sibling marked
@@ -1503,20 +1720,9 @@ static lv_obj_t * add_transport_hit_target(lv_obj_t * scr, int32_t center_x, int
     return ext;
 }
 
-/* Real bug caught in review: since add_transport_hit_target()'s object is
- * created AFTER controls_row and covers each icon's ENTIRE footprint (not
- * just the extra sliver above it -- see that function's own "no object
- * seam" comment), LVGL's own child hit-testing (lv_indev_search_obj(),
- * lv_indev.c -- children checked in REVERSE creation order, first match
- * wins) means this later, larger sibling now intercepts EVERY tap on these
- * five buttons, not only the new upper region. The underlying icon
- * (order_icon/play_btn/more_icon) never receives a real LV_EVENT_PRESSED/
- * RELEASED again, so icon_press_style's LV_STATE_PRESSED-selector dimming
- * silently stopped applying on a real touch -- confirmed by tracing
- * lv_indev_search_obj()'s recursion, not by guessing. Forwarding the hit
- * target's own PRESSED/RELEASED/PRESS_LOST onto the real icon's state
- * restores the exact same visual feedback the icon's own style already
- * defines, without touching that style or duplicating it here. */
+/* Transport icons are visual-only elements inside controls_row.
+ * Forwarding the hit target's PRESSED/RELEASED/PRESS_LOST onto the
+ * underlying icon's state triggers icon_press_style dimming on real touch. */
 static void forward_press_state_to_icon_cb(lv_event_t * e) {
     lv_obj_t * icon = (lv_obj_t *) lv_event_get_user_data(e);
     lv_event_code_t code = lv_event_get_code(e);
@@ -1589,6 +1795,11 @@ static void progress_slider_event_cb(lv_event_t * e) {
  * (40 + 18*2 = 76x76 effective hit area). */
 #define TRANSPORT_ICON_EXT_CLICK_AREA 18
 
+/* favorite_icon (also 40x40) has no clickable neighbors, so this can go
+ * wider than the tightly-packed transport row above. */
+#define FAVORITE_ICON_EXT_CLICK_AREA 24
+#define FAVORITE_ICON_EXTRA_LEFT_CLICK_AREA 10
+
 /* Distance above play_btn's top edge for the shared transport hit area
  * line (roughly level with song_count_label without overlapping the progress
  * bar or time row). */
@@ -1656,25 +1867,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * corner landing a handful of pixels below a tight 44x44 box (finger
      * imprecision on a small corner target), so the touch area is padded out
      * generously while the icon itself stays centered at its normal size. */
-    lv_obj_t * dismiss_btn = lv_obj_create(scr);
-    player_dismiss_btn = dismiss_btn;
-    lv_obj_set_size(dismiss_btn, 64, 64);
-    lv_obj_align(dismiss_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(dismiss_btn, 0, 0);
-    lv_obj_set_style_border_width(dismiss_btn, 0, 0);
-    lv_obj_remove_flag(dismiss_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(dismiss_btn, LV_OBJ_FLAG_CLICKABLE);
-    /* Visibility toggled dynamically by sync_player_topbar_visibility() per
-     * Settings > Display > "Hide Player/Lyrics Top Bar" -- visible here by
-     * default (its normal, initial-build state) whenever the setting is
-     * off. See build_flattened_transition_frame() for how the Phase 2
-     * transition cache captures this button's TARGET-state visibility
-     * correctly even while Player is inactive, without relying on this
-     * live object's own current flag value. */
-    lv_obj_add_event_cb(dismiss_btn, library_btn_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * dismiss_arrow = lv_image_create(dismiss_btn);
-    lv_image_set_src(dismiss_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_center(dismiss_arrow);
+    player_dismiss_btn = build_header_back_button(scr, library_btn_event_cb);
 
     /* Title row: song title (left) + favorite icon (right) -- matches the
      * reference layout, where the 3-dot "more" menu lives in the transport
@@ -1702,8 +1895,6 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
     favorite_icon = lv_image_create(title_row);
     lv_image_set_src(favorite_icon, asset_path("playing_plane/collect_out.png"));
-    lv_obj_add_flag(favorite_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(favorite_icon, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(favorite_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
 
     /* Artist row: artist (left) + format/quality badge (right). */
@@ -1804,52 +1995,21 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_translate_y(controls_row, -3, 0);
 
     /* Play-mode icon (sequential/repeat/shuffle) -- leftmost, matching the
-     * reference layout (repeat / prev / play / next / more). Tapping cycles
-     * Sequential -> Repeat All -> Repeat One -> Shuffle (order_icon_event_cb). */
+     * reference layout (repeat / prev / play / next / more). Visual-only;
+     * input is handled by order_hit below. */
     order_icon = lv_image_create(controls_row);
     lv_image_set_src(order_icon, asset_path(play_mode_icon_asset((play_mode_t) current_settings.play_mode)));
-    lv_obj_add_flag(order_icon, LV_OBJ_FLAG_CLICKABLE);
-    /* Extend click area to maximize touch target size without overlapping
-     * neighboring transport buttons. */
-    lv_obj_set_ext_click_area(order_icon, TRANSPORT_ICON_EXT_CLICK_AREA);
-    lv_obj_add_event_cb(order_icon, order_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(order_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
-#ifdef UI_GESTURE_TRACE
-    lv_obj_add_event_cb(order_icon, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
-#endif
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(order_icon, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_RED));
-#endif
 
     prev_btn = lv_image_create(controls_row);
     lv_image_set_src(prev_btn, asset_path("playing_plane/btn_prev.png"));
-    lv_obj_add_flag(prev_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(prev_btn, TRANSPORT_ICON_EXT_CLICK_AREA); /* see its own comment */
-    lv_obj_add_event_cb(prev_btn, prev_btn_event_cb, LV_EVENT_CLICKED, NULL);
     transport_btn_ctx_t * prev_ctx = malloc(sizeof(transport_btn_ctx_t));
     if (!prev_ctx) return NULL;
     *prev_ctx = (transport_btn_ctx_t){ prev_btn, "playing_plane/btn_prev.png", "playing_plane/btn_prev_s.png" };
-    lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, prev_ctx);
-    lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, prev_ctx);
-    lv_obj_add_event_cb(prev_btn, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, prev_ctx);
-#ifdef UI_GESTURE_TRACE
-    lv_obj_add_event_cb(prev_btn, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
-#endif
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(prev_btn, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_GREEN));
-#endif
 
     play_btn = lv_image_create(controls_row);
     load_play_btn_images();
     lv_image_set_src(play_btn, gui_player_play_btn_image_src(audio_is_playing()));
-    lv_obj_add_flag(play_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(play_btn, play_btn_event_cb, LV_EVENT_CLICKED, NULL);
-#ifdef UI_GESTURE_TRACE
-    lv_obj_add_event_cb(play_btn, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
-#endif
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(play_btn, 0, lv_palette_main(LV_PALETTE_BLUE)); /* no ext_click_area -- outlines its own native 84x84 */
-#endif
     /* Not transport_btn_ctx_t's fixed normal/pressed asset-swap -- this
      * icon's own "normal" image already alternates between btn_play.png and
      * btn_pause.png depending on playback state (set_play_button_state()),
@@ -1860,35 +2020,19 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
     next_btn = lv_image_create(controls_row);
     lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
-    lv_obj_add_flag(next_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(next_btn, TRANSPORT_ICON_EXT_CLICK_AREA); /* see its own comment */
-    lv_obj_add_event_cb(next_btn, next_btn_event_cb, LV_EVENT_CLICKED, NULL);
     transport_btn_ctx_t * next_ctx = malloc(sizeof(transport_btn_ctx_t));
-    if (!next_ctx) return NULL;
+    if (!next_ctx) {
+        free(prev_ctx);
+        return NULL;
+    }
     *next_ctx = (transport_btn_ctx_t){ next_btn, "playing_plane/btn_next.png", "playing_plane/btn_next_s.png" };
-    lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_PRESSED, next_ctx);
-    lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_RELEASED, next_ctx);
-    lv_obj_add_event_cb(next_btn, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, next_ctx);
-#ifdef UI_GESTURE_TRACE
-    lv_obj_add_event_cb(next_btn, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
-#endif
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(next_btn, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_ORANGE));
-#endif
 
     /* 3-dot "more" menu -- rightmost, matching the reference layout. Opens
-     * more_menu_popup (Add to Playlist / EQ / Delete). */
+     * more_menu_popup (Add to Playlist / EQ / Delete). Visual-only; input is
+     * handled by more_hit below. */
     lv_obj_t * more_icon = lv_image_create(controls_row);
     lv_image_set_src(more_icon, asset_path("playing_plane/ic_more.png"));
-    lv_obj_add_flag(more_icon, LV_OBJ_FLAG_CLICKABLE);
-    /* TRANSPORT_ICON_EXT_CLICK_AREA fills the 36px gap between more_icon
-     * and next_btn without overlapping. */
-    lv_obj_set_ext_click_area(more_icon, TRANSPORT_ICON_EXT_CLICK_AREA);
-    lv_obj_add_event_cb(more_icon, more_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_style(more_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
-#ifdef UI_HITBOX_DEBUG
-    debug_paint_hitbox(more_icon, TRANSPORT_ICON_EXT_CLICK_AREA, lv_palette_main(LV_PALETTE_PURPLE));
-#endif
 
     /* Force-resolve controls_row's flex layout now so the coordinates read
      * below are real absolute screen positions, not the stale (0,0) a
@@ -1934,6 +2078,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_PRESSED, prev_ctx);
     lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_RELEASED, prev_ctx);
     lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, prev_ctx);
+    lv_obj_add_event_cb(prev_hit, transport_btn_ctx_delete_cb, LV_EVENT_DELETE, prev_ctx);
     /* Hold-to-rewind -- see transport_seek_repeat_cb()'s own comment. Bound
      * to prev_hit (the object that actually receives the touch now, not the
      * icon underneath it) so it fires for a real user press. transport_seek_
@@ -1951,6 +2096,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_PRESSED, next_ctx);
     lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_RELEASED, next_ctx);
     lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, next_ctx);
+    lv_obj_add_event_cb(next_hit, transport_btn_ctx_delete_cb, LV_EVENT_DELETE, next_ctx);
     /* Hold-to-fast-forward -- see transport_seek_repeat_cb()'s own comment. */
     lv_obj_add_event_cb(next_hit, transport_long_press_cb, LV_EVENT_LONG_PRESSED, &next_btn_long_press_fired);
     lv_obj_add_event_cb(next_hit, transport_long_press_cancel_cb, LV_EVENT_PRESS_LOST, &next_btn_long_press_fired);
@@ -1964,6 +2110,39 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, more_icon);
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, more_icon);
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, more_icon);
+
+#ifdef UI_GESTURE_TRACE
+    lv_obj_add_event_cb(order_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(play_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(prev_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(next_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_event_cb(more_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
+#endif
+
+    /* Use one explicit target because LVGL's ext-click API is symmetric. It
+     * preserves the proven bounds and adds ten pixels only on the left. */
+    lv_obj_update_layout(scr);
+    lv_area_t favorite_area;
+    lv_obj_get_coords(favorite_icon, &favorite_area);
+    lv_obj_t * favorite_hit = lv_obj_create(scr);
+    lv_obj_remove_style_all(favorite_hit);
+    lv_obj_set_pos(favorite_hit,
+                   favorite_area.x1 - FAVORITE_ICON_EXT_CLICK_AREA - FAVORITE_ICON_EXTRA_LEFT_CLICK_AREA,
+                   favorite_area.y1 - FAVORITE_ICON_EXT_CLICK_AREA);
+    lv_obj_set_size(favorite_hit,
+                    lv_area_get_width(&favorite_area) + 2 * FAVORITE_ICON_EXT_CLICK_AREA +
+                        FAVORITE_ICON_EXTRA_LEFT_CLICK_AREA,
+                    lv_area_get_height(&favorite_area) + 2 * FAVORITE_ICON_EXT_CLICK_AREA);
+    lv_obj_add_flag(favorite_hit, LV_OBJ_FLAG_IGNORE_LAYOUT | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(favorite_hit, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(favorite_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, favorite_icon);
+    lv_obj_add_event_cb(favorite_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, favorite_icon);
+    lv_obj_add_event_cb(favorite_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, favorite_icon);
+#ifdef UI_HITBOX_DEBUG
+    lv_obj_set_style_border_width(favorite_hit, 3, 0);
+    lv_obj_set_style_border_color(favorite_hit, lv_palette_main(LV_PALETTE_PINK), 0);
+    lv_obj_set_style_border_opa(favorite_hit, LV_OPA_COVER, 0);
+#endif
 
     /* Volume is controlled via hardware buttons (see update_timer_cb) and,
      * per the real device, shown only as a transient overlay rather than a
@@ -3250,6 +3429,9 @@ void clock_24h_switch_event_cb(lv_event_t * e) {
 
 
 void gui_player_init(uint32_t screen_width, uint32_t screen_height) {
+    /* Pay thread and stack setup during initialization, not inside the first
+     * favorite tap where it would visibly block the LVGL event callback. */
+    pthread_once(&favorite_worker_once, favorite_start_worker);
     build_volume_popup();
     build_delete_song_popup();
     build_more_menu_popup();
@@ -3294,6 +3476,7 @@ void gui_player_teardown(void) {
     if (more_menu_popup_backdrop) { lv_obj_del(more_menu_popup_backdrop); more_menu_popup_backdrop = NULL; }
     gui_track_info_teardown();
     if (player_screen) { lv_obj_del(player_screen); player_screen = NULL; }
+    favorite_icon = NULL;
     asset_png_memory_free(progress_bg_image); progress_bg_image = NULL;
     asset_png_memory_free(progress_fill_image); progress_fill_image = NULL;
     volume_slider = NULL;

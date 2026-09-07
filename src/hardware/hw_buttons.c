@@ -21,6 +21,12 @@
 /* Threshold to trigger power long-press (power-off menu) instead of a short tap (screen toggle). */
 #define POWER_LONG_PRESS_MS 700
 
+/* Hold-to-seek threshold/repeat for the Next button, matching LVGL's own
+ * default long-press timing (LV_INDEV_DEF_LONG_PRESS_TIME/_REP_TIME) so
+ * holding the physical button feels the same as holding the touch one. */
+#define NEXT_SEEK_LONG_PRESS_MS 400
+#define NEXT_SEEK_REPEAT_MS 100
+
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Tracks press counts between GUI poll intervals to reliably detect multi-clicks. */
 static int play_pause_press_count = 0;
@@ -48,6 +54,18 @@ static bool power_held = false;
 static bool power_long_press_fired = false;
 static uint32_t power_long_press_due_ms = 0;
 
+/* Next-button hold-to-seek state, same shape as the power long-press state
+ * above: next_seek_fired guards against firing the "first step" flag more
+ * than once per hold, and against also firing the short-press flag once the
+ * hold has taken over. next_seek_step_count accumulates on this thread at
+ * NEXT_SEEK_REPEAT_MS granularity; the GUI thread drains it independently of
+ * its own (coarser) poll interval, exactly like volume_delta above. */
+static bool next_held = false;
+static bool next_seek_fired = false;
+static uint32_t next_seek_due_ms = 0;
+static int next_seek_step_count = 0;
+static bool next_seek_step_is_first = false;
+
 static uint32_t monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -71,7 +89,13 @@ static void handle_key_event(unsigned short code, int value) {
                 break;
             }
             case KEY_PLAYPAUSE:      play_pause_press_count++; break;
-            case KEY_NEXTSONG:       next_requested = true; break;
+            case KEY_NEXTSONG: {
+                uint32_t now = monotonic_ms();
+                next_held = true;
+                next_seek_fired = false;
+                next_seek_due_ms = now + NEXT_SEEK_LONG_PRESS_MS;
+                break;
+            }
             case KEY_PREVIOUSSONG:   prev_requested = true; break;
             case KEY_VOLUMEUP:
                 volume_delta += VOLUME_STEP_PERCENT;
@@ -100,6 +124,12 @@ static void handle_key_event(unsigned short code, int value) {
                 break;
             case KEY_VOLUMEUP:   volume_up_held = false; break;
             case KEY_VOLUMEDOWN: volume_down_held = false; break;
+            case KEY_NEXTSONG:
+                /* Same suppression as KEY_POWER above: only a release that
+                 * never crossed the seek threshold counts as a short press. */
+                if (next_held && !next_seek_fired) next_requested = true;
+                next_held = false;
+                break;
             default: break;
         }
     }
@@ -135,6 +165,24 @@ static void apply_due_power_long_press(void) {
     if (power_held && !power_long_press_fired && (int32_t) (now - power_long_press_due_ms) >= 0) {
         power_long_press_fired = true;
         power_long_press_requested = true;
+    }
+    pthread_mutex_unlock(&state_mutex);
+}
+
+/* Called on every poll() timeout while the Next button is held (see the main
+ * loop below) -- accumulates one seek step every NEXT_SEEK_REPEAT_MS once
+ * the hold has passed NEXT_SEEK_LONG_PRESS_MS, marking the first such step
+ * per hold via next_seek_step_is_first. */
+static void apply_due_next_seek(void) {
+    uint32_t now = monotonic_ms();
+    pthread_mutex_lock(&state_mutex);
+    if (next_held && (int32_t) (now - next_seek_due_ms) >= 0) {
+        next_seek_step_count++;
+        if (!next_seek_fired) {
+            next_seek_fired = true;
+            next_seek_step_is_first = true;
+        }
+        next_seek_due_ms = now + NEXT_SEEK_REPEAT_MS;
     }
     pthread_mutex_unlock(&state_mutex);
 }
@@ -198,14 +246,18 @@ static void * hw_buttons_thread_func(void * arg) {
         pthread_mutex_lock(&state_mutex);
         bool volume_held = volume_up_held || volume_down_held;
         bool power_pending_long_press = power_held && !power_long_press_fired;
+        bool next_pending_seek = next_held;
         pthread_mutex_unlock(&state_mutex);
 
-        /* Blocks indefinitely except while a volume key or power button is held
-         * and awaiting a timed repeat step or long-press threshold. */
-        int ret = poll(fds, (nfds_t) nfds, (volume_held || power_pending_long_press) ? VOLUME_REPEAT_INTERVAL_MS : -1);
+        /* Blocks indefinitely except while a volume key, power button, or
+         * Next button is held and awaiting a timed repeat step or long-press
+         * threshold. */
+        int ret = poll(fds, (nfds_t) nfds,
+                        (volume_held || power_pending_long_press || next_pending_seek) ? VOLUME_REPEAT_INTERVAL_MS : -1);
         if (ret == 0) {
             apply_due_volume_repeats();
             apply_due_power_long_press();
+            apply_due_next_seek();
             continue;
         }
         if (ret < 0) continue;
@@ -268,6 +320,16 @@ bool hw_buttons_consume_prev(void) {
     pthread_mutex_lock(&state_mutex);
     bool result = prev_requested;
     prev_requested = false;
+    pthread_mutex_unlock(&state_mutex);
+    return result;
+}
+
+int hw_buttons_consume_next_seek_steps(bool * out_is_first) {
+    pthread_mutex_lock(&state_mutex);
+    int result = next_seek_step_count;
+    next_seek_step_count = 0;
+    if (out_is_first) *out_is_first = next_seek_step_is_first;
+    next_seek_step_is_first = false;
     pthread_mutex_unlock(&state_mutex);
     return result;
 }

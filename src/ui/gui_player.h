@@ -65,6 +65,11 @@ void gui_player_queue_flush(void);
 void gui_player_play_at(int index);
 void gui_player_play_at_from(int index, double start_seconds);
 void gui_player_step_manual(int direction);
+/* Applies `step_count` accumulated forward-seek steps from a held physical
+ * Next button (hw_buttons_consume_next_seek_steps()) -- is_first resets the
+ * seek target from the live playback position, same as a touch hold's first
+ * tick vs its later repeats. */
+void gui_player_hw_next_seek_steps(int step_count, bool is_first);
 lv_obj_t * gui_player_get_screen(void);
 lv_obj_t * gui_player_get_cover_img(void);
 /* Copies the currently decoded RGB565 cover for `for_index` into `out`.

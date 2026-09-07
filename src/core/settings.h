@@ -147,6 +147,12 @@ typedef struct {
      * device charging overnight in a dark room. */
     bool led_indicator_enabled;
 
+    /* Settings -> About -> Developer Options -> "Enable database logging" --
+     * writes a detailed, timestamped log of library database scans and
+     * album art cache jobs (including lazy load) to .logs/database_artwork.log
+     * on the SD card. See db_log.h. */
+    bool db_logging_enabled;
+
     /* Caps charging at 85% to extend battery longevity -- see
      * charge_limiter.h for how this is actually enforced (there's no
      * dedicated state-of-charge cutoff on this hardware, so it throttles

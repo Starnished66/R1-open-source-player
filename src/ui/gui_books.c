@@ -252,41 +252,10 @@ static lv_obj_t * build_text_reader_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    lv_obj_t * back_btn = lv_obj_create(scr);
-    lv_obj_set_size(back_btn, 64, 64);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_CLEARANCE);
-    lv_obj_set_style_bg_opa(back_btn, 0, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_remove_flag(back_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(back_btn, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(back_btn, generic_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * back_arrow = lv_image_create(back_btn);
-    lv_image_set_src(back_arrow, asset_path("sub_back/btn_back.png"));
-    lv_obj_align(back_arrow, LV_ALIGN_CENTER, 0, BACK_ARROW_OPTICAL_Y_OFFSET);
-
-    /* Favorite toggle, top-right -- same collect_in/collect_out asset pair
-     * and click-to-toggle shape as the player screen's own favorite_icon,
-     * just persisted for real here (metadata_db_book_favorite_set()) rather
-     * than that one's purely in-memory, never-saved toggle. */
-    text_reader_favorite_icon = lv_image_create(scr);
-    lv_image_set_src(text_reader_favorite_icon, asset_path("playing_plane/collect_out.png"));
-    lv_obj_align(text_reader_favorite_icon, LV_ALIGN_TOP_RIGHT, -20, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_flag(text_reader_favorite_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(text_reader_favorite_icon, 16);
-    lv_obj_add_event_cb(text_reader_favorite_icon, text_reader_favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
-
-    text_reader_title_label = lv_label_create(scr);
-    lv_label_set_text(text_reader_title_label, "");
-    lv_obj_align(text_reader_title_label, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + (TITLE_ROW_HEIGHT - 28) / 2);
-    lv_obj_add_style(text_reader_title_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(text_reader_title_label, &app_font_28, 0); /* shows the (possibly non-Latin) file's own name -- see fallback_font.h */
-    /* Narrower than build_subsonic_list_screen()'s equivalent titles (70%
-     * -- this one has both the back button AND the favorite icon eating
-     * into its available width) -- same width-capped dot-scroll treatment
-     * as the player screen's own title label either way. */
-    lv_obj_set_width(text_reader_title_label, lv_pct(55));
-    lv_label_set_long_mode(text_reader_title_label, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(text_reader_title_label, LV_TEXT_ALIGN_CENTER, 0);
+    text_reader_title_label = build_screen_header(scr, "", generic_back_cb, NULL, NULL);
+    lv_obj_t * favorite_button = build_top_right_icon_button(scr,
+        asset_path("playing_plane/collect_out.png"), text_reader_favorite_icon_event_cb);
+    text_reader_favorite_icon = lv_obj_get_child(favorite_button, 0);
 
     text_reader_scroll = lv_obj_create(scr);
     lv_obj_set_size(text_reader_scroll, lv_pct(100),

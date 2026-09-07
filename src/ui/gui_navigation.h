@@ -35,9 +35,8 @@ void gui_navigation_pop_to_depth(int target_depth);
 bool player_transition_cache_is_dirty(void);
 
 void gui_navigation_init(void);
-/* For gui_reload.c's in-process UI reload -- see its own comment. */
+/* Called by gui_reload.c's in-process UI reload before and after rebuilding screens. */
 void gui_navigation_teardown(void);
-/* For gui_reload.c's in-process UI reload -- see its own comment. */
 bool gui_navigation_transition_in_progress(void);
 void nav_push(lv_obj_t * scr);
 /* Stack-only counterpart to nav_push() above -- pushes onto the nav stack

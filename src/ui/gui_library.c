@@ -1086,7 +1086,8 @@ static lv_obj_t * build_group_songs_screen(void) {
  * file, while a 32-entry RGB565 LRU cache keeps the visible window plus
  * scroll headroom bounded at ~324 KiB. Persistent sized files live in
  * MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp. */
-#define ALBUM_THUMBNAIL_PX 72
+#define ALBUM_THUMBNAIL_PX ALBUMART_THUMBNAIL_SIZE
+#define ALBUM_PLAYER_CACHE_PX ALBUMART_PLAYER_CACHE_SIZE
 #define ALBUM_THUMBNAIL_CACHE_SIZE 32
 
 typedef struct {
@@ -1149,6 +1150,11 @@ static void album_thumbnail_cache_clear(void) {
 
 static bool album_thumbnail_sized_cache_hit(const albumart_info_t * info, char * found, size_t found_size) {
     return albumart_sized_thumb_fresh(info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, found, found_size);
+}
+
+static bool album_player_cache_hit(const albumart_info_t * info, char * found, size_t found_size) {
+    return albumart_generated_cache_fresh(info, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX,
+                                          found, found_size);
 }
 
 #define THUMBNAIL_SIDECAR_MAX_BYTES (2U * 1024U * 1024U)
@@ -1227,6 +1233,123 @@ static time_t album_source_mtime(const song_row_t * song, const albumart_info_t 
     return max_mtime;
 }
 
+/* The warmer builds the player-sized cache from the original compressed art
+ * while it is already resident for the 72px decode.  Keeping this out of the
+ * visible thumbnail path prevents scrolling from triggering a second large
+ * decode; the player can then open the persistent 480px BMP without any
+ * metadata extraction or lazy source decode. */
+static cover_decode_result_t album_thumbnail_maybe_store_player_cache(
+        const albumart_info_t * info, const uint8_t * data, uint32_t size,
+        artwork_priority_t prio, artwork_cancel_fn cancel_cb, void * user_data) {
+    if (prio != ARTWORK_PRIO_WARMER || !info || !data || size == 0)
+        return COVER_DECODE_OK;
+    char found[PATH_MAX];
+    if (album_player_cache_hit(info, found, sizeof(found))) return COVER_DECODE_OK;
+
+    uint16_t * pixels = NULL;
+    cover_decode_result_t res = cover_decode_to_rgb565_ex(
+        data, size, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX, prio,
+        cancel_cb, user_data, &pixels);
+    if (res == COVER_DECODE_OK && pixels &&
+        !albumart_store_rgb565(info, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX, pixels))
+        res = COVER_DECODE_FAIL_ALLOC;
+    free(pixels);
+    return res;
+}
+
+/* On-demand fallback for the Playing Now page when the warmer hasn't
+ * produced the player-sized cache for this track yet: same source order as
+ * album_thumbnail_load_or_decode_ex() (external sidecar, then embedded
+ * picture via the bounded/isolated extraction below -- never a plain
+ * metadata_read(), which can OOM on a huge APIC/covr tag), decodes and
+ * persists the cache, and returns display-sized pixels so the caller has
+ * something to show immediately instead of waiting for the warmer.
+ *
+ * *out_no_art_confirmed is set true only when this track was actually
+ * determined to have no art anywhere (safe for the caller to stop asking
+ * about it), and left false on every transient failure (coordinator/
+ * memory-pressure admission refused, isolated-helper fork/pipe/timeout
+ * failure, cancellation) -- a caller keying a negative cache off this must
+ * not do so on a transient false, or a passing resource hiccup would
+ * permanently hide art that is actually there. */
+bool gui_library_generate_player_cover(const char * track_path, const char * artist,
+                                       const char * album, const char * album_artist,
+                                       artwork_cancel_fn cancel_cb, void * user_data,
+                                       uint16_t ** out_pixels, bool * out_no_art_confirmed) {
+    *out_pixels = NULL;
+    if (out_no_art_confirmed) *out_no_art_confirmed = false;
+    if (!track_path || !track_path[0]) return false;
+
+    albumart_info_t info = {0};
+    snprintf(info.path, sizeof(info.path), "%s", track_path);
+    snprintf(info.artist, sizeof(info.artist), "%s", artist ? artist : "");
+    snprintf(info.album, sizeof(info.album), "%s", album ? album : "");
+    snprintf(info.albumartist, sizeof(info.albumartist), "%s", album_artist ? album_artist : "");
+
+    uint8_t * data = NULL;
+    uint32_t size = 0;
+
+    bool from_sidecar = false;
+    char found[PATH_MAX];
+    if (albumart_search_files(&info, "", found, sizeof(found))) {
+        albumart_load_result_t load = albumart_load_file_ex(found, &data, &size,
+                                                             THUMBNAIL_SIDECAR_MAX_BYTES, ARTWORK_PRIO_PLAYER);
+        if (load == ALBUMART_LOAD_TEMPORARY) return false; /* transient -- do not confirm "no art" */
+        if (load == ALBUMART_LOAD_OK) from_sidecar = true;
+        else { data = NULL; size = 0; }
+    }
+
+    metadata_artwork_result_t artwork_result = METADATA_ARTWORK_NOT_FOUND;
+    if (!data || size == 0) {
+        artwork_acquire_result_t admission = artwork_coordinator_acquire(
+            ARTWORK_PRIO_PLAYER, ALBUM_ART_METADATA_START_BYTES, 300, cancel_cb, user_data);
+        if (admission != ARTWORK_ACQUIRE_OK) return false; /* transient -- coordinator busy/cancelled */
+        track_metadata_t meta;
+        memset(&meta, 0, sizeof(meta));
+        artwork_result = metadata_read_artwork_isolated(track_path, &meta, ALBUM_ART_METADATA_TIMEOUT_MS);
+        artwork_coordinator_release(ARTWORK_PRIO_PLAYER);
+        data = meta.picture_data;
+        size = meta.picture_size;
+        free(meta.lyrics);
+        if (!info.artist[0]) snprintf(info.artist, sizeof(info.artist), "%s", meta.artist);
+        if (!info.album[0]) snprintf(info.album, sizeof(info.album), "%s", meta.album);
+        if (!info.albumartist[0]) snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
+    }
+
+    if (!data || size == 0) {
+        free(data);
+        /* Confirmed empty only if the embedded-picture helper actually ran
+         * to completion and found nothing (or found something invalid) --
+         * not if it merely failed to run (fork/pipe/timeout). A corrupt or
+         * unreadable sidecar file still falls through to that embedded
+         * check above (data/size stay NULL/0), so reaching here already
+         * means embedded extraction had its chance regardless of whether a
+         * sidecar file existed. */
+        if (out_no_art_confirmed && (artwork_result == METADATA_ARTWORK_NOT_FOUND ||
+                                     artwork_result == METADATA_ARTWORK_INVALID))
+            *out_no_art_confirmed = true;
+        return false;
+    }
+
+    DB_LOG("ART_PLAYER", "generate_source path=%s source=%s", track_path,
+           from_sidecar ? "sidecar" : "embedded");
+
+    uint16_t * cache_pixels = NULL;
+    cover_decode_result_t cache_res = cover_decode_to_rgb565_ex(
+        data, size, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX,
+        ARTWORK_PRIO_PLAYER, cancel_cb, user_data, &cache_pixels);
+    if (cache_res == COVER_DECODE_OK && cache_pixels)
+        albumart_store_rgb565(&info, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX, cache_pixels);
+    free(cache_pixels);
+
+    cover_decode_result_t res = cover_decode_to_rgb565_ex(
+        data, size, COVER_ART_WIDTH, COVER_ART_HEIGHT, ARTWORK_PRIO_PLAYER, cancel_cb, user_data, out_pixels);
+    free(data);
+    if (res != COVER_DECODE_OK && out_no_art_confirmed && cover_decode_result_is_permanent(res))
+        *out_no_art_confirmed = true; /* corrupt/oversized source -- won't change until re-tagged */
+    return res == COVER_DECODE_OK;
+}
+
 /* Rockbox albumart search, then embedded picture. A successful decode is
  * written as MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp
  * so the next pass is a small BMP load instead of a JPEG/PNG decode.
@@ -1242,18 +1365,27 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     albumart_info_t info;
     albumart_info_from_song_row(song, &info);
 
+    uint64_t mtime_t0 = db_log_now_ms();
     time_t source_mtime = album_source_mtime(song, &info);
+    DB_LOG("ART_LAZY", "source_mtime_ms=%llu song=%lld", (unsigned long long) (db_log_now_ms() - mtime_t0),
+           (long long) song->id);
 
     artwork_fail_reason_t fail_reason = ARTWORK_FAIL_NONE;
     if (artwork_failure_cache_is_blocked(song->id, source_mtime, &fail_reason)) return false;
 
     char found[PATH_MAX];
+    char thumbnail_found[PATH_MAX];
     uint8_t * data = NULL;
     uint32_t size = 0;
 
     /* Step 1: Try sized Rockbox thumbnail cache (.72x72.bmp) */
-    if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found))) {
-        albumart_load_result_t load = albumart_load_file_ex(found, &data, &size, THUMBNAIL_SIDECAR_MAX_BYTES, prio);
+    bool step1_hit = album_thumbnail_sized_cache_hit(&info, thumbnail_found, sizeof(thumbnail_found));
+    DB_LOG("ART_LAZY", "step1 song=%lld artist=%s albumartist=%s album=%s key=%016llx hit=%d found=%s",
+           (long long) song->id, info.artist, info.albumartist, info.album,
+           (unsigned long long) albumart_debug_thumbnail_key(&info), step1_hit,
+           step1_hit ? thumbnail_found : "");
+    if (step1_hit) {
+        albumart_load_result_t load = albumart_load_file_ex(thumbnail_found, &data, &size, THUMBNAIL_SIDECAR_MAX_BYTES, prio);
         if (load == ALBUMART_LOAD_TEMPORARY) {
             artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
             return false; /* Do not delete a valid cache file under memory pressure. */
@@ -1264,16 +1396,26 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
             free(data);
             data = NULL;
             size = 0;
-            if (res == COVER_DECODE_OK && *out_pixels) return true;
+            if (res == COVER_DECODE_OK && *out_pixels) {
+                /* A warmer pass must continue to the original source when
+                 * only the 72px cache exists, so it can materialize 480px.
+                 * Visible thumbnail requests can return immediately. */
+                if (prio != ARTWORK_PRIO_WARMER || album_player_cache_hit(&info, found, sizeof(found)))
+                    return true;
+                /* Keep the valid 72px cache intact while the warmer obtains
+                 * the original source for the missing player-sized cache. */
+                free(*out_pixels);
+                *out_pixels = NULL;
+            }
             if (res == COVER_DECODE_FAIL_CANCELLED) return false;
             if (cover_decode_result_is_temporary(res)) {
                 artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
                 return false;
             }
             /* Corrupt sized thumbnail -> unlink and fall through to source files */
-            unlink(found);
+            if (res != COVER_DECODE_OK) unlink(thumbnail_found);
         } else {
-            unlink(found);
+            unlink(thumbnail_found);
         }
     }
 
@@ -1286,6 +1428,13 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
             return false;
         }
         if (load == ALBUMART_LOAD_OK) {
+            cover_decode_result_t player_res = album_thumbnail_maybe_store_player_cache(
+                &info, data, size, prio, cancel_cb, user_data);
+            if (cover_decode_result_is_temporary(player_res)) {
+                free(data);
+                artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+                return false;
+            }
             cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
                                                                   prio, cancel_cb, user_data, out_pixels);
             free(data);
@@ -1327,6 +1476,13 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     if (!info.albumartist[0]) snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
 
     if (data && size > 0) {
+        cover_decode_result_t player_res = album_thumbnail_maybe_store_player_cache(
+            &info, data, size, prio, cancel_cb, user_data);
+        if (cover_decode_result_is_temporary(player_res)) {
+            free(data);
+            artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+            return false;
+        }
         cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
                                                               prio, cancel_cb, user_data, out_pixels);
         free(data);
@@ -1405,7 +1561,6 @@ static void * album_thumbnail_thread_func(void * arg) {
  * automatically when audio is playing, when Albums screen is active, or
  * when memory is low. */
 #define ALBUM_THUMB_GEN_BATCH 16
-#define ALBUM_THUMB_GEN_WARM_LIMIT 512
 #define ALBUM_THUMB_GEN_INTER_ALBUM_US 100000 /* 100 ms yield between albums */
 #define ALBUM_THUMB_GEN_INTER_BATCH_US 1000000 /* 1.0 s pause between batches */
 
@@ -1473,7 +1628,8 @@ static void * album_thumb_gen_thread_func(void * arg) {
             }
 
             char found[PATH_MAX];
-            if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found))) {
+            if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found)) &&
+                album_player_cache_hit(&info, found, sizeof(found))) {
                 cached++;
 #ifdef UI_PERF_TRACE
                 perf_skipped++;
@@ -1509,7 +1665,7 @@ static void * album_thumb_gen_thread_func(void * arg) {
             usleep(ALBUM_THUMB_GEN_INTER_ALBUM_US);
         }
         offset += n;
-        if (n < ALBUM_THUMB_GEN_BATCH || offset >= ALBUM_THUMB_GEN_WARM_LIMIT) break;
+        if (n < ALBUM_THUMB_GEN_BATCH) break;
 
         /* Pause between batches to give CPU/SD bus complete rest */
         for (int p = 0; p < 10; p++) {
@@ -1551,14 +1707,13 @@ static void start_album_thumbnail_generation(void) {
 
     int artist_count = 0, album_artist_count = 0, album_count = 0;
     metadata_db_get_group_counts(&artist_count, &album_artist_count, &album_count);
-    if (album_count > ALBUM_THUMB_GEN_WARM_LIMIT) album_count = ALBUM_THUMB_GEN_WARM_LIMIT;
     atomic_store(&album_thumb_gen_done_count, 0);
     atomic_store(&album_thumb_gen_total_count, album_count);
     atomic_store(&album_thumb_gen_cancel, false);
     int generation = atomic_fetch_add(&album_thumb_gen_generation, 1) + 1;
     atomic_store(&album_thumb_gen_active, true);
-    DB_LOG("ART_CACHE", "start generation=%d albums=%d warm_limit=%d rss_kb=%ld",
-           generation, album_count, ALBUM_THUMB_GEN_WARM_LIMIT, db_log_rss_kb());
+    DB_LOG("ART_CACHE", "start generation=%d albums=%d rss_kb=%ld",
+           generation, album_count, db_log_rss_kb());
 
     pthread_attr_t attr;
     pthread_attr_t * attr_ptr = NULL;

@@ -1487,13 +1487,6 @@ static void more_menu_popup_backdrop_cb(lv_event_t * e) {
     hide_more_menu_popup();
 }
 
-/* Defined further down, right after populate_group_songs_rows() -- needs
- * gui_library_get_group_songs_screen()/list/indices/count/title_label and
- * compact_list_scroll_to_index()/file_browser_navigate_to() all already
- * in scope, none of which are declared yet this early in the file.
- * Forward-declared here so build_more_menu_popup()'s rows table (right
- * below) can wire it up as a row's click handler. */
-
 static void more_menu_add_to_playlist_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_more_menu_popup();
@@ -1543,7 +1536,6 @@ static void more_icon_event_cb(lv_event_t * e) {
 
 static void build_more_menu_popup(void) {
     static const menu_popup_row_t rows[] = {
-        { "List", more_menu_list_cb, false },
         { "Queue", more_menu_queue_cb, false },
         { "Add to Playlist", more_menu_add_to_playlist_cb, false },
         { "Information", more_menu_information_cb, false },
@@ -2230,9 +2222,7 @@ void refresh_format_badge(void) {
  * below. */
 char now_playing_path[600] = "";
 
-/* Where the current playlist came from -- the player screen's "List" menu
- * option (more_menu_list_cb) uses this to reopen the screen the current
- * track was tapped from, scrolled back to it. Deliberately NOT derived
+/* Where the current playlist came from. Deliberately NOT derived
  * from `playlist` itself: that's just a flat array of paths with no
  * memory of which screen/group built it. Each interactive play-launch
  * site (all_songs_row_click_cb, group_song_row_click_cb,
@@ -2252,7 +2242,7 @@ int player_source_recently_added_index = -1; /* row index into recently_added_li
  * group_songs_entries/count/title_label themselves just describe
  * whichever group gui_library_get_group_songs_screen() CURRENTLY shows, which can change
  * (browsing to a different artist/album, or a library rescan) before the
- * user ever opens "List". group_song_entry_t (gui.c further down) is
+ * playback continues. group_song_entry_t (gui.c further down) is
  * declared after this point in the file -- forward-declared here since
  * this struct only needs a pointer to it, not its layout. */
 /* group_song_entry_t defined in gui_library.h */

@@ -472,9 +472,8 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(list, GUI_ROW_GAP, 0);
     lv_obj_set_style_pad_top(list, GUI_ROW_GAP, 0);
-    /* Rows are LIST_ROW_WIDTH_WIDE (476px, this device's 480px-wide screen
-     * minus a thin 4px margin) -- explicit cross-axis centering so that
-     * width is guaranteed to sit centered within this full-width container. */
+    /* Rows follow the live display width. Explicit cross-axis centering also
+     * keeps this correct if a future parent is narrower than the display. */
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
 
     scan_current_dir();

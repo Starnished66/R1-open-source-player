@@ -875,6 +875,26 @@ static audio_codec_t public_codec_for_decoder(decoder_type_t type) {
     return AUDIO_CODEC_UNKNOWN;
 }
 
+bool audio_probe_file_format(const char * path, audio_current_format_info_t * out) {
+    if (!path || !path[0] || !out || is_stream_url(path) || remote_track_path_is_remote(path)) return false;
+    decoder_t dec;
+    memset(&dec, 0, sizeof(dec));
+    if (!decoder_open(&dec, path)) return false;
+    memset(out, 0, sizeof(*out));
+    out->valid = true;
+    snprintf(out->path, sizeof(out->path), "%s", path);
+    out->codec = public_codec_for_decoder(dec.type);
+    out->source_sample_rate = dec.source_sample_rate ? dec.source_sample_rate : dec.sample_rate;
+    out->source_bit_depth = dec.source_bit_depth;
+    out->channels = dec.channels;
+    out->bitrate_kbps = dec.bitrate_kbps;
+    out->duration_seconds = dec.sample_rate && dec.total_frames
+        ? (double) dec.total_frames / (double) dec.sample_rate : 0.0;
+    out->is_dsd = dec.type == DECODER_DSD;
+    decoder_close(&dec);
+    return true;
+}
+
 #ifndef HOST_BUILD
 /* Wide-path scratch buffers, allocated once in audio_thread_func(). The
  * primary buffer is sufficient for ordinary S24 playback; the other two are

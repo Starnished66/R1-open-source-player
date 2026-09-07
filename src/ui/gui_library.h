@@ -61,8 +61,6 @@ void gui_library_format_song_identity(const song_row_t * row,
                                       char * title, size_t title_size,
                                       char * subtitle, size_t subtitle_size);
 
-void more_menu_list_cb(lv_event_t * e);
-
 void poll_search_job(void);
 void play_remote_control_song(const char * song_path, const char * playlist_name, const char * artist_filter,
                               const char * album_artist_filter, const char * album_filter);

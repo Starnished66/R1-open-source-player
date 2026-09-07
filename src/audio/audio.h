@@ -150,6 +150,10 @@ unsigned int audio_get_sample_rate(void);
  * when nothing is loaded or the requested track has not opened yet. */
 bool audio_get_current_format_info(audio_current_format_info_t * out);
 
+/* Opens a local file only long enough to read its stream/container facts,
+ * then closes it without touching playback state or the output device. */
+bool audio_probe_file_format(const char * path, audio_current_format_info_t * out);
+
 /* 0.0 (silent) - 1.0 (full volume). Applied as software gain on the decoded PCM. */
 void audio_set_volume(float volume);
 /* Coalesces slider-originated volume changes on a process-lifetime worker.

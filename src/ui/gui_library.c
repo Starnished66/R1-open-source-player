@@ -341,6 +341,37 @@ static const char * song_quality_asset_for_path(const char * path) {
     return "touch_list/quality_nomal.png";
 }
 
+static const char * library_codec_name(audio_codec_t codec) {
+    switch (codec) {
+        case AUDIO_CODEC_FLAC: return "FLAC";
+        case AUDIO_CODEC_MP3: return "MP3";
+        case AUDIO_CODEC_PCM: return "PCM";
+        case AUDIO_CODEC_DSD: return "DSD";
+        case AUDIO_CODEC_AAC: return "AAC";
+        case AUDIO_CODEC_ALAC: return "ALAC";
+        case AUDIO_CODEC_APE: return "APE";
+        case AUDIO_CODEC_WMA: return "WMA";
+        case AUDIO_CODEC_OPUS: return "Opus";
+        case AUDIO_CODEC_VORBIS: return "Vorbis";
+        case AUDIO_CODEC_UNKNOWN: break;
+    }
+    return "Audio";
+}
+
+static void format_music_submenu_identity(const song_row_t * song, char * out, size_t out_size) {
+    char title[128];
+    metadata_db_song_display_title(song, title, sizeof(title));
+    audio_current_format_info_t info;
+    if (audio_probe_file_format(song->path, &info) && info.duration_seconds > 0.0) {
+        unsigned int seconds = (unsigned int)(info.duration_seconds + 0.5);
+        snprintf(out, out_size, "%s\n%u:%02u · %s", title, seconds / 60, seconds % 60,
+                 library_codec_name(info.codec));
+        return;
+    }
+    const char * ext = strrchr(song->path, '.');
+    snprintf(out, out_size, "%s\n%s", title, ext && ext[1] ? ext + 1 : "Audio");
+}
+
 void gui_library_format_song_identity(const song_row_t * row,
                                       char * title, size_t title_size,
                                       char * subtitle, size_t subtitle_size) {
@@ -534,6 +565,8 @@ static int group_songs_page_start;
  * ever valid between one populate call and the next, never stale across
  * one -- see refresh_group_songs_now_playing_indicator()'s own comment. */
 static lv_obj_t * group_songs_now_playing_bar;
+static lv_obj_t * group_songs_visible_rows[GROUP_SONGS_PAGE_SIZE];
+static bool group_songs_music_submenu;
 
 /* Forward-declared here (defined after on_file_selected()) because
  * set_player_source_group_songs() needs group_songs_entries/count/title_label
@@ -596,6 +629,7 @@ static void group_songs_next_page_cb(lv_event_t * e) {
 static lv_obj_t * add_group_songs_page_row(const char * text, lv_event_cb_t cb) {
     lv_obj_t * row = lv_label_create(group_songs_list);
     lv_obj_add_style(row, &list_row_style, 0);
+    if (group_songs_music_submenu) lv_obj_set_width(row, lv_pct(100));
     lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
     row_label_enable_marquee(row);
     lv_obj_set_style_height(row, MUSIC_LIST_ROW_HEIGHT, LV_PART_MAIN);
@@ -704,17 +738,29 @@ static void group_song_row_long_press_cb(lv_event_t * e) {
     open_song_context_menu(group_songs_entries[pos].path);
 }
 
+/* Music's Artist/Album drill-down uses a deliberate two-line identity.
+ * Playlist and Queue rows intentionally retain their established shared
+ * builder geometry. */
+static void layout_music_submenu_row_text(lv_obj_t * row) {
+    if (!row || lv_obj_get_child_count(row) < 2) return;
+    lv_obj_t * primary = lv_obj_get_child(row, 0);
+    lv_obj_t * secondary = lv_obj_get_child(row, 1);
+    if (lv_obj_has_flag(secondary, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_set_y(primary, 28);
+        return;
+    }
+    lv_obj_set_y(primary, 18);
+    lv_obj_set_y(secondary, 62);
+}
+
 /* Positions/shows or hides group_songs_now_playing_bar against the CURRENT
  * group_songs_entries/count -- callable standalone (no row rebuild, no
  * scroll reset) whenever now_playing_path changes while this screen
  * is open, and also called once at the end of populate_group_songs_rows()
  * itself so a freshly opened group (or an edit-mode toggle, which also goes
- * through a full repopulate) starts with the right state. Row height/gap
- * (LIST_ROW_HEIGHT+4, 4) are the same literals build_group_songs_screen()
- * already gives this list's own pad_top/pad_gap -- every row here is a
- * uniform LIST_ROW_HEIGHT regardless of edit mode, so row i's y is exactly
- * this formula even though this list is flex-laid-out (not manually
- * positioned like the compact-list infra's own pool). */
+ * through a full repopulate) starts with the right state. The visible-row
+ * table lets the marker follow LVGL's final flex layout, including runtime
+ * font/touch sizing and any action or paging rows before the song. */
 static void refresh_group_songs_now_playing_indicator(void) {
     if (!group_songs_now_playing_bar) return;
 
@@ -731,9 +777,18 @@ static void refresh_group_songs_now_playing_indicator(void) {
         lv_obj_add_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    int visible_row = match - group_songs_page_start + (group_songs_page_start > 0 ? 1 : 0) + (!group_songs_edit_mode ? 1 : 0);
+    lv_obj_t * row = group_songs_visible_rows[match - group_songs_page_start];
+    if (!row) {
+        lv_obj_add_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    /* Runtime font/touch sizing can make the rendered row taller than its
+     * compile-time minimum. Follow the real laid-out object rather than
+     * reconstructing its bounds from fixed height and gap constants. */
+    lv_obj_update_layout(group_songs_list);
     lv_obj_remove_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(group_songs_now_playing_bar, 0, 4 + visible_row * (MUSIC_LIST_ROW_HEIGHT + 4));
+    lv_obj_set_pos(group_songs_now_playing_bar, 0, lv_obj_get_y(row));
+    lv_obj_set_height(group_songs_now_playing_bar, lv_obj_get_height(row));
 }
 
 /* Rebuilds group_songs_list's rows from whatever group_songs_entries/count
@@ -747,6 +802,7 @@ static void refresh_group_songs_now_playing_indicator(void) {
  * re-deriving the group or nav_push()ing a second copy of this screen. */
 static void populate_group_songs_rows(void) {
     lv_obj_clean(group_songs_list);
+    memset(group_songs_visible_rows, 0, sizeof(group_songs_visible_rows));
 
     bool editable = group_songs_edit_m3u_path != NULL;
     if (editable) {
@@ -782,6 +838,9 @@ static void populate_group_songs_rows(void) {
     for (int i = group_songs_page_start; i < page_end; i++) {
         if (editing) {
             lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, 190);
+            if (group_songs_music_submenu) lv_obj_set_width(row, lv_pct(100));
+            group_songs_visible_rows[i - group_songs_page_start] = row;
+            if (group_songs_music_submenu) layout_music_submenu_row_text(row);
             for (int direction = 0; direction < 2; direction++) {
                 lv_obj_t * move = lv_label_create(row);
                 lv_label_set_text(move, direction ? LV_SYMBOL_DOWN : LV_SYMBOL_UP);
@@ -801,6 +860,9 @@ static void populate_group_songs_rows(void) {
              * child label each with their own local style properties -- see
              * list_row_style's own doc comment (screen_builders.h). */
             lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, 70);
+            if (group_songs_music_submenu) lv_obj_set_width(row, lv_pct(100));
+            group_songs_visible_rows[i - group_songs_page_start] = row;
+            if (group_songs_music_submenu) layout_music_submenu_row_text(row);
 
             lv_obj_t * quality = lv_image_create(row);
             lv_image_set_src(quality, asset_path(song_quality_asset_for_path(group_songs_entries[i].path)));
@@ -844,18 +906,6 @@ static void populate_group_songs_rows(void) {
     lv_obj_remove_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(group_songs_now_playing_bar, LV_OBJ_FLAG_HIDDEN);
     refresh_group_songs_now_playing_indicator();
-}
-
-/* The player screen's "List" option -- reopens whichever screen the
- * current track was tapped from, scrolled back to it. Forward-declared
- * near the other more_menu_*_cb functions (build_more_menu_popup() wires
- * it up there); defined here instead since PLAYER_SOURCE_GROUP_SONGS
- * needs group_songs_screen/list/entries/count/title_label and
- * populate_group_songs_rows() all already in scope. */
-void more_menu_list_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    hide_more_menu_popup();
-    open_queue_screen();
 }
 
 /* Every screen's back button is a fixed 64x64 at the screen's own left
@@ -908,8 +958,9 @@ static void group_songs_edit_btn_cb(lv_event_t * e) {
  * this call returns, unlike the old group_t-based API where the group_t's
  * .indices had to stay valid for as long as this screen kept showing it. */
 static void show_group_songs_editable(const char * name, const group_song_entry_t * entries, int count,
-                                       const char * editable_m3u_path) {
+                                       const char * editable_m3u_path, bool music_submenu) {
     group_songs_source_is_album = false;
+    group_songs_music_submenu = music_submenu;
     if (editable_m3u_path) snprintf(group_songs_owned_m3u_path, sizeof(group_songs_owned_m3u_path), "%s", editable_m3u_path);
     group_songs_edit_m3u_path = editable_m3u_path ? group_songs_owned_m3u_path : NULL;
     group_songs_file_stat_valid = editable_m3u_path && stat(editable_m3u_path, &group_songs_file_stat) == 0;
@@ -924,7 +975,11 @@ static void show_group_songs_editable(const char * name, const group_song_entry_
 }
 
 void show_group_songs(const char * name, const group_song_entry_t * entries, int count) {
-    show_group_songs_editable(name, entries, count, NULL);
+    show_group_songs_editable(name, entries, count, NULL, false);
+}
+
+static void show_music_group_songs(const char * name, const group_song_entry_t * entries, int count) {
+    show_group_songs_editable(name, entries, count, NULL, true);
 }
 
 /* Ownership-transferring sibling of show_group_songs() -- see set_group_
@@ -934,6 +989,7 @@ void show_group_songs(const char * name, const group_song_entry_t * entries, int
  * after this call -- ownership has moved to group_songs_entries. */
 static void show_group_songs_take_ownership(const char * name, group_song_entry_t * entries, int count) {
     group_songs_source_is_album = false;
+    group_songs_music_submenu = true;
     group_songs_edit_m3u_path = NULL;
     group_songs_edit_mode = false;
     set_group_songs_entries_owned(entries, count);
@@ -1796,7 +1852,7 @@ static group_song_entry_t * load_album_entries(const char * name, const char * a
         if (got <= 0) break;
         for (int i = 0; i < got; i++) {
             char title[384];
-            format_song_identity(&page[i], title, sizeof(title));
+            format_music_submenu_identity(&page[i], title, sizeof(title));
             entries[n + i].path = strdup(page[i].path);
             entries[n + i].title = strdup(title);
             if (!entries[n + i].path || !entries[n + i].title) {
@@ -1820,7 +1876,7 @@ static bool show_album_group(const group_row_t * group) {
     group_song_entry_t * entries = load_album_entries(group->name, group->album_artist,
                                                        group->song_count, &count);
     if (!entries) return false;
-    show_group_songs(group->name, entries, count);
+    show_music_group_songs(group->name, entries, count);
     free_group_song_entries(entries, count);
     group_songs_source_is_album = true;
     return true;
@@ -1928,6 +1984,52 @@ typedef struct {
 #define AZ_INDEX_BINDING_COUNT 4
 static az_index_binding_t az_index_bindings[AZ_INDEX_BINDING_COUNT];
 static int az_index_registered_count = 0;
+static lv_timer_t * az_index_visibility_timer;
+static az_index_binding_t * az_index_visibility_binding;
+static bool az_index_dragging;
+
+#define AZ_INDEX_HIDE_DELAY_MS 900
+
+static void az_index_visibility_timeout_cb(lv_timer_t * timer) {
+    (void) timer;
+    if (az_index_dragging) {
+        lv_timer_reset(az_index_visibility_timer);
+        return;
+    }
+    if (az_index_visibility_binding && az_index_visibility_binding->strip)
+        lv_obj_add_flag(az_index_visibility_binding->strip, LV_OBJ_FLAG_HIDDEN);
+    az_index_visibility_binding = NULL;
+    lv_timer_pause(az_index_visibility_timer);
+}
+
+static void az_index_scroll_visibility_cb(lv_event_t * e) {
+    lv_obj_t * list = lv_event_get_target(e);
+    az_index_binding_t * binding = NULL;
+    for (int i = 0; i < az_index_registered_count; ++i) {
+        if (az_index_bindings[i].list == list) { binding = &az_index_bindings[i]; break; }
+    }
+    if (!binding) return;
+    if (az_index_visibility_binding && az_index_visibility_binding != binding)
+        lv_obj_add_flag(az_index_visibility_binding->strip, LV_OBJ_FLAG_HIDDEN);
+    az_index_visibility_binding = binding;
+    lv_obj_remove_flag(binding->strip, LV_OBJ_FLAG_HIDDEN);
+    if (!az_index_visibility_timer) {
+        az_index_visibility_timer = lv_timer_create(az_index_visibility_timeout_cb,
+                                                     AZ_INDEX_HIDE_DELAY_MS, NULL);
+    }
+    lv_timer_set_period(az_index_visibility_timer, AZ_INDEX_HIDE_DELAY_MS);
+    lv_timer_reset(az_index_visibility_timer);
+    lv_timer_resume(az_index_visibility_timer);
+}
+
+static void reset_az_index_bindings(void) {
+    if (az_index_visibility_timer) {
+        lv_timer_delete(az_index_visibility_timer);
+        az_index_visibility_timer = NULL;
+    }
+    az_index_visibility_binding = NULL;
+    az_index_registered_count = 0;
+}
 
 
 /* Called once per screen right after that screen (and its list) is built,
@@ -1949,22 +2051,37 @@ static void register_az_index(lv_obj_t * screen, lv_obj_t * list, metadata_db_az
      * entirely and needs no chroma-key support this LVGL build doesn't have. */
     lv_obj_t * strip = lv_label_create(screen);
     lv_label_set_text(strip, "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL\nM\nN\nO\nP\nQ\nR\nS\nT\nU\nV\nW\nX\nY\nZ\n#");
-    lv_obj_set_style_text_font(strip, &app_font_16, 0);
+    int32_t top = STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT;
+    int32_t display_h = lv_display_get_vertical_resolution(lv_display_get_default());
+    int32_t available_h = display_h - top - HOME_INDICATOR_BAND_HEIGHT;
+    const lv_font_t * strip_font = &lv_font_montserrat_20;
+    int32_t line_h = lv_font_get_line_height(strip_font);
+    lv_obj_set_style_text_font(strip, strip_font, 0);
+    lv_obj_set_width(strip, 30);
+    lv_obj_set_style_pad_right(strip, 4, 0);
     lv_obj_add_style(strip, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_align(strip, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_align(strip, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_style_bg_opa(strip, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(strip, 0, 0);
     lv_obj_remove_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
     /* Stretched with extra line spacing to span close to the full list
      * height (27 lines * app_font_16's own line height) rather than
      * sitting bunched up near the top. */
-    lv_obj_set_style_text_line_space(strip, 3, 0);
+    int32_t line_space = (available_h - line_h * 27) / 26;
+    /* Negative line spacing is intentional on shorter panels: retaining
+     * readable 20px glyphs is preferable to falling back to the old tiny
+     * font, and the evenly compressed 27-line column still maps touches by
+     * its final measured bounds. */
+    if (line_space < -6) line_space = -6;
+    if (line_space > 3) line_space = 3;
+    lv_obj_set_style_text_line_space(strip, line_space, 0);
     /* Top edge (the "A") lines up with the list's own top edge; the
      * stretched height above lands the bottom ("#") close to the screen's
      * bottom corner, matching the list's own bottom edge -- the list
      * itself starts at exactly STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT and
      * runs flush to the screen bottom (see build_compact_list_screen()). */
-    lv_obj_align(strip, LV_ALIGN_TOP_RIGHT, -4, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT);
+    lv_obj_align(strip, LV_ALIGN_TOP_RIGHT, 0, top);
+    lv_obj_add_flag(strip, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t * popup = lv_image_create(screen);
     lv_image_set_src(popup, asset_path("touch_list/a_z_result_bg.png"));
@@ -1977,6 +2094,9 @@ static void register_az_index(lv_obj_t * screen, lv_obj_t * list, metadata_db_az
     lv_obj_center(popup_label);
 
     az_index_bindings[az_index_registered_count++] = (az_index_binding_t){ screen, list, strip, popup, popup_label, db_kind };
+    lv_obj_add_event_cb(list, az_index_scroll_visibility_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(list, az_index_scroll_visibility_cb, LV_EVENT_SCROLL, NULL);
+    lv_obj_add_event_cb(list, az_index_scroll_visibility_cb, LV_EVENT_SCROLL_END, NULL);
 }
 
 static az_index_binding_t * find_az_binding_for_screen(lv_obj_t * screen) {
@@ -1989,7 +2109,6 @@ static az_index_binding_t * find_az_binding_for_screen(lv_obj_t * screen) {
 /* Same pause/resume treatment as quick_drawer_drag_timer above, and for the
  * same reason -- see its own comment. */
 lv_timer_t * az_index_drag_timer = NULL;
-static bool az_index_dragging = false;
 static az_index_binding_t * az_index_active_binding = NULL;
 static int az_index_jump_table[27];
 
@@ -2015,6 +2134,7 @@ void poll_az_index_drag(lv_timer_t * timer) {
         }
         az_index_binding_t * b = find_az_binding_for_screen(lv_screen_active());
         if (!b) return;
+        if (lv_obj_has_flag(b->strip, LV_OBJ_FLAG_HIDDEN)) return;
 
         lv_area_t area;
         lv_obj_get_coords(b->strip, &area);
@@ -2779,7 +2899,7 @@ static void show_m3u_playlist(const char * name, const char * m3u_path, char ** 
     group_song_entry_t * entries = build_group_song_entries_from_paths(paths, count);
     if (count && !entries) return;
     snprintf(playlist_m3u_name, sizeof(playlist_m3u_name), "%s", name);
-    show_group_songs_editable(playlist_m3u_name, entries, count, m3u_path);
+    show_group_songs_editable(playlist_m3u_name, entries, count, m3u_path, false);
     free_group_song_entries(entries, count);
 }
 
@@ -3035,12 +3155,8 @@ static lv_obj_t * build_playlists_screen(void) {
     lv_obj_t * title_label;
     lv_obj_t * scr = build_subsonic_list_screen("Playlists", &title_label, &playlists_list);
 
-    /* Rows here are LIST_ROW_WIDTH_WIDE (see add_playlist_row_base()), wider
-     * than build_subsonic_list_screen()'s own default 448px pill rows --
-     * explicit cross-axis centering scoped to just this screen instance so
-     * the wider rows are guaranteed centered rather than relying on
-     * whatever the shared builder's own (untouched, ~20-screens-shared)
-     * default flex alignment happens to be. */
+    /* Explicit cross-axis centering scoped to this screen also keeps rows
+     * correct if it is ever hosted in a parent narrower than the display. */
     lv_obj_set_flex_align(playlists_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
 
     return scr;
@@ -3258,7 +3374,7 @@ static void refresh_library_screens_after_reload(void) {
     /* The four old screens' A-Z index bindings (strip/popup/list pointers)
      * just went dangling along with the lv_obj_delete()s above -- re-register
      * against the freshly rebuilt screens/lists before anything can poll them. */
-    az_index_registered_count = 0;
+    reset_az_index_bindings();
     register_az_index(artists_screen, artists_list, METADATA_DB_AZ_ARTIST);
     register_az_index(albums_screen, albums_list, METADATA_DB_AZ_ALBUM);
     register_az_index(album_artist_screen, album_artist_list, METADATA_DB_AZ_ALBUM_ARTIST);
@@ -4053,8 +4169,8 @@ static bool artist_albums_show_all_songs(void) {
                       : metadata_db_get_artist_songs(artist_albums_current_name, n, page, want);
         if (got <= 0) break;
         for (int i = 0; i < got; i++) {
-            char title[128];
-            metadata_db_song_display_title(&page[i], title, sizeof(title));
+            char title[192];
+            format_music_submenu_identity(&page[i], title, sizeof(title));
             artist_song_sort_entry_t * dst = &sort_entries[n + i];
             dst->path = strdup(page[i].path);
             dst->title = strdup(title);
@@ -4135,8 +4251,8 @@ static void artist_album_row_click_cb(int index) {
         int got = metadata_db_get_album_songs(group->name, group->album_artist, n, page, want);
         if (got <= 0) break;
         for (int i = 0; i < got; i++) {
-            char title[128];
-            metadata_db_song_display_title(&page[i], title, sizeof(title));
+            char title[192];
+            format_music_submenu_identity(&page[i], title, sizeof(title));
             entries[n + i].path = strdup(page[i].path);
             entries[n + i].title = strdup(title);
             if (!entries[n + i].path || !entries[n + i].title) {
@@ -4151,7 +4267,7 @@ static void artist_album_row_click_cb(int index) {
         if (got < want) break;
     }
     if (!entries) return;
-    show_group_songs(group->name, entries, n);
+    show_music_group_songs(group->name, entries, n);
     free_group_song_entries(entries, n);
     group_songs_source_is_album = true;
 }
@@ -4553,6 +4669,7 @@ static void library_teardown_diag(const char * step) {
 }
 
 void gui_library_teardown(void) {
+    reset_az_index_bindings();
     if (playlist_start_popup) { lv_obj_delete(playlist_start_popup); playlist_start_popup = NULL; }
     if (playlist_start_backdrop) { lv_obj_delete(playlist_start_backdrop); playlist_start_backdrop = NULL; }
     if (playlist_delete_popup) { lv_obj_delete(playlist_delete_popup); playlist_delete_popup = NULL; }

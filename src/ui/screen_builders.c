@@ -57,8 +57,9 @@ lv_style_t style_theme_text_primary;
 lv_style_t style_theme_text_muted;
 
 /* Runtime geometry replaces the original panel-specific 448/464/476px
- * constants.  Small symmetric edge gutters preserve the pill silhouette
- * while allowing the same screens to fill a wider sibling device. */
+ * constants. Rows span the active display: parent lists already own their
+ * scrolling/clipping bounds, so subtracting a second gutter here produced
+ * asymmetric empty space whenever a flex list left-aligned its children. */
 static int32_t active_display_width(void) {
     lv_display_t * display = lv_display_get_default();
     int32_t width = display ? lv_display_get_horizontal_resolution(display) : 480;
@@ -69,15 +70,11 @@ static void compact_list_refresh_font_layout(lv_obj_t * list);
 static void row_label_layout_identity(lv_obj_t * row, lv_obj_t * secondary, int32_t height);
 
 int32_t ui_list_row_width(void) {
-    int32_t width = active_display_width();
-    int32_t gutter = 12;
-    return width > gutter * 2 ? width - gutter * 2 : width;
+    return active_display_width();
 }
 
 int32_t ui_list_row_width_wide(void) {
-    int32_t width = active_display_width();
-    int32_t gutter = 8;
-    return width > gutter * 2 ? width - gutter * 2 : width;
+    return active_display_width();
 }
 
 void screen_builders_init_list_row_style(void) {

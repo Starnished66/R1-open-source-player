@@ -1237,10 +1237,19 @@ static time_t album_source_mtime(const song_row_t * song, const albumart_info_t 
  * while it is already resident for the 72px decode.  Keeping this out of the
  * visible thumbnail path prevents scrolling from triggering a second large
  * decode; the player can then open the persistent 480px BMP without any
- * metadata extraction or lazy source decode. */
+ * metadata extraction or lazy source decode.
+ *
+ * When a fresh 480px decode actually runs (warmer, cache miss) and is stored,
+ * *out_player_pixels receives those pixels so the caller can derive the 72px
+ * thumbnail from them instead of entropy-decoding the same source a second
+ * time.  On every skip path (not warmer, cache already present) and every
+ * failure, *out_player_pixels is NULL -- caller then does the 72px decode
+ * itself, same as before.  Caller owns and must free() a non-NULL return. */
 static cover_decode_result_t album_thumbnail_maybe_store_player_cache(
         const albumart_info_t * info, const uint8_t * data, uint32_t size,
-        artwork_priority_t prio, artwork_cancel_fn cancel_cb, void * user_data) {
+        artwork_priority_t prio, artwork_cancel_fn cancel_cb, void * user_data,
+        uint16_t ** out_player_pixels) {
+    if (out_player_pixels) *out_player_pixels = NULL;
     if (prio != ARTWORK_PRIO_WARMER || !info || !data || size == 0)
         return COVER_DECODE_OK;
     char found[PATH_MAX];
@@ -1253,8 +1262,28 @@ static cover_decode_result_t album_thumbnail_maybe_store_player_cache(
     if (res == COVER_DECODE_OK && pixels &&
         !albumart_store_rgb565(info, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX, pixels))
         res = COVER_DECODE_FAIL_ALLOC;
+    if (res == COVER_DECODE_OK && pixels && out_player_pixels) {
+        *out_player_pixels = pixels;
+        pixels = NULL;
+    }
     free(pixels);
     return res;
+}
+
+/* 72px pixels: cover-fit from a just-decoded 480px buffer when the warmer
+ * actually produced one, otherwise a single decode at thumbnail size. */
+static cover_decode_result_t album_thumbnail_pixels_from_source(
+        const uint8_t * data, uint32_t size, const uint16_t * player_pixels,
+        artwork_priority_t prio, artwork_cancel_fn cancel_cb, void * user_data,
+        uint16_t ** out_pixels) {
+    if (player_pixels) {
+        *out_pixels = cover_resize_rgb565(player_pixels,
+                                          ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX,
+                                          ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX);
+        return *out_pixels ? COVER_DECODE_OK : COVER_DECODE_FAIL_ALLOC;
+    }
+    return cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
+                                     prio, cancel_cb, user_data, out_pixels);
 }
 
 /* On-demand fallback for the Playing Now page when the warmer hasn't
@@ -1335,15 +1364,16 @@ bool gui_library_generate_player_cover(const char * track_path, const char * art
            from_sidecar ? "sidecar" : "embedded");
 
     uint16_t * cache_pixels = NULL;
-    cover_decode_result_t cache_res = cover_decode_to_rgb565_ex(
+    cover_decode_result_t res = cover_decode_to_rgb565_ex(
         data, size, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX,
         ARTWORK_PRIO_PLAYER, cancel_cb, user_data, &cache_pixels);
-    if (cache_res == COVER_DECODE_OK && cache_pixels)
+    if (res == COVER_DECODE_OK && cache_pixels) {
         albumart_store_rgb565(&info, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX, cache_pixels);
+        *out_pixels = cover_resize_rgb565(cache_pixels, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX,
+                                          COVER_ART_WIDTH, COVER_ART_HEIGHT);
+        if (!*out_pixels) res = COVER_DECODE_FAIL_ALLOC;
+    }
     free(cache_pixels);
-
-    cover_decode_result_t res = cover_decode_to_rgb565_ex(
-        data, size, COVER_ART_WIDTH, COVER_ART_HEIGHT, ARTWORK_PRIO_PLAYER, cancel_cb, user_data, out_pixels);
     free(data);
     if (res != COVER_DECODE_OK && out_no_art_confirmed && cover_decode_result_is_permanent(res))
         *out_no_art_confirmed = true; /* corrupt/oversized source -- won't change until re-tagged */
@@ -1428,15 +1458,18 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
             return false;
         }
         if (load == ALBUMART_LOAD_OK) {
+            uint16_t * player_pixels = NULL;
             cover_decode_result_t player_res = album_thumbnail_maybe_store_player_cache(
-                &info, data, size, prio, cancel_cb, user_data);
+                &info, data, size, prio, cancel_cb, user_data, &player_pixels);
             if (cover_decode_result_is_temporary(player_res)) {
+                free(player_pixels);
                 free(data);
                 artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
                 return false;
             }
-            cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
-                                                                  prio, cancel_cb, user_data, out_pixels);
+            cover_decode_result_t res = album_thumbnail_pixels_from_source(
+                data, size, player_pixels, prio, cancel_cb, user_data, out_pixels);
+            free(player_pixels);
             free(data);
             data = NULL;
             size = 0;
@@ -1476,15 +1509,18 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     if (!info.albumartist[0]) snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
 
     if (data && size > 0) {
+        uint16_t * player_pixels = NULL;
         cover_decode_result_t player_res = album_thumbnail_maybe_store_player_cache(
-            &info, data, size, prio, cancel_cb, user_data);
+            &info, data, size, prio, cancel_cb, user_data, &player_pixels);
         if (cover_decode_result_is_temporary(player_res)) {
+            free(player_pixels);
             free(data);
             artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
             return false;
         }
-        cover_decode_result_t res = cover_decode_to_rgb565_ex(data, size, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX,
-                                                              prio, cancel_cb, user_data, out_pixels);
+        cover_decode_result_t res = album_thumbnail_pixels_from_source(
+            data, size, player_pixels, prio, cancel_cb, user_data, out_pixels);
+        free(player_pixels);
         free(data);
         data = NULL;
         size = 0;

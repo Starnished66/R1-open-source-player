@@ -54,6 +54,41 @@ static inline bool jpeg_decode_dims_ok(int native_w, int native_h, int target_w,
     return sw > 0 && sh > 0 && sw <= MAX_DECODED_COVER_SIDE && sh <= MAX_DECODED_COVER_SIDE;
 }
 
+/* Cheap up-front JPEG header inspection, independent of tjpgd's jd_prepare()
+ * (which rejects progressive/SOF2 outright and allocates Huffman tables even
+ * for the baseline case). Walks markers (SOI -> skip APPn/COM/DQT/DHT/DRI ->
+ * first SOFn) with no heap allocation, so both baseline and progressive
+ * files can be routed correctly BEFORE committing to either decoder. */
+typedef struct {
+    bool is_progressive;  /* true only for SOF2 */
+    bool supported;       /* false for arithmetic coding (SOF9-SOF15), lossless
+                            * (SOF3), hierarchical, or a marker stream that never
+                            * reached a SOF before running out of data/hitting a
+                            * genuinely malformed marker -- caller must treat as
+                            * COVER_DECODE_FAIL_UNSUPPORTED regardless of
+                            * is_progressive in that case. */
+    int native_w;
+    int native_h;
+    /* Real coefficient-buffer size estimate for progressive JPEG admission
+     * control -- 0 if !is_progressive or !supported. Computed from the SOF
+     * marker's own component sampling factors (never assumed/guessed):
+     * MCU-round each component's block dimensions against the frame's own
+     * max sampling factors, 128 bytes (64 coefficients * sizeof(int16_t))
+     * per 8x8 block, summed across all components. This is the dominant,
+     * unavoidable memory cost of progressive JPEG -- it scales with native
+     * (SOF) dimensions, not the caller's requested output size, and no
+     * decoder (this one included) can avoid materializing it. */
+    uint64_t coeff_bytes;
+} jpeg_probe_t;
+
+/* Returns false only if no SOF marker was ever reached (truncated/malformed
+ * input before any header info was available) -- check result->supported
+ * too: a true return with supported=false means a SOF WAS found but it's an
+ * unsupported JPEG process (arithmetic coding, lossless, etc), not that the
+ * file is truncated. On any false/unsupported return, *result's other
+ * fields are zeroed/false and must not be used. */
+bool jpeg_probe(const uint8_t * data, uint32_t size, jpeg_probe_t * result);
+
 /* Decodes cover-art bytes (JPEG, PNG, or uncompressed 24/32-bit BMP) and resizes them
  * with a "cover fit" (scale to fully fill target_w x target_h, center-
  * cropping whichever dimension overflows -- same as a photo app's cover/
@@ -72,5 +107,14 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
                                                artwork_priority_t prio,
                                                artwork_cancel_fn cancel_cb, void * user_data,
                                                uint16_t ** out_pixels);
+
+/* Cover-fit an already-decoded RGB565 buffer into a newly malloc()'d RGB565
+ * buffer the caller owns and must free(). Same cover-fit, center-crop,
+ * area-average-downscale, and bilinear-upscale math as
+ * cover_decode_to_rgb565_ex()'s internal resize -- pixel sampling is RGB565
+ * packed instead of RGB888 triplets. Same-size (src_w==dst_w && src_h==dst_h)
+ * copies pixels byte-for-byte. Returns NULL on invalid args or alloc failure. */
+uint16_t * cover_resize_rgb565(const uint16_t * src, int src_w, int src_h,
+                               int dst_w, int dst_h);
 
 #endif /* COVER_DECODE_H */

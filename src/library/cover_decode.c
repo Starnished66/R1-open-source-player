@@ -2,10 +2,16 @@
 
 #include "lvgl/src/libs/tjpgd/tjpgd.h"
 #include "lvgl/src/libs/lodepng/lodepng.h"
+/* Progressive-JPEG-only fallback (decode_jpeg_progressive_rgb888() below) --
+ * tjpgd above stays the sole decoder for every baseline JPEG, unchanged. */
+#include <stdio.h>  /* jpeglib.h expects size_t/FILE to already be visible */
+#include "jpeglib.h"
+#include "jerror.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <setjmp.h>
 
 #include "artwork_coordinator.h"
 #include "debug_log.h"
@@ -75,6 +81,129 @@ static bool inspect_jpeg(const uint8_t * data, uint32_t size, int * out_w, int *
     return true;
 }
 
+/* Real coefficient-buffer estimate from actual SOF component sampling
+ * factors -- see jpeg_probe_t's own doc comment (cover_decode.h) for the
+ * MCU-rounding rationale. Never assumes 4:2:0; reads the real factors. */
+static uint64_t jpeg_probe_coeff_bytes(int width, int height, int num_comp,
+                                       const uint8_t * h_samp, const uint8_t * v_samp) {
+    int h_max = 1, v_max = 1;
+    for (int i = 0; i < num_comp; i++) {
+        if (h_samp[i] > h_max) h_max = h_samp[i];
+        if (v_samp[i] > v_max) v_max = v_samp[i];
+    }
+    if (h_max <= 0 || v_max <= 0) return 0;
+
+    uint64_t mcus_per_row = ((uint64_t) width + (uint64_t) (8 * h_max) - 1) / (uint64_t) (8 * h_max);
+    uint64_t mcus_per_col = ((uint64_t) height + (uint64_t) (8 * v_max) - 1) / (uint64_t) (8 * v_max);
+
+    uint64_t total = 0;
+    for (int i = 0; i < num_comp; i++) {
+        uint64_t blocks_wide = mcus_per_row * (uint64_t) h_samp[i];
+        uint64_t blocks_high = mcus_per_col * (uint64_t) v_samp[i];
+        /* 64 coefficients/block * sizeof(int16_t) = 128 bytes/block. Checked
+         * multiply order (blocks first, then *128) keeps every intermediate
+         * well under uint64_t range for any width/height this ever sees --
+         * SOF fields are 16-bit, so blocks_wide/high are individually
+         * bounded near 8192 each, nowhere near overflow. */
+        total += blocks_wide * blocks_high * 128ULL;
+    }
+    return total;
+}
+
+bool jpeg_probe(const uint8_t * data, uint32_t size, jpeg_probe_t * result) {
+    memset(result, 0, sizeof(*result));
+    if (!data || size < 4 || data[0] != 0xFF || data[1] != 0xD8) return false; /* not even a JPEG SOI */
+
+    uint32_t pos = 2; /* invariant, maintained by every advance below: pos <= size */
+    while (size - pos > 1) {
+        if (data[pos] != 0xFF) return false; /* expected a marker, stream is malformed */
+        uint8_t marker = data[pos + 1];
+        pos += 2;
+        /* JPEG allows arbitrary 0xFF fill bytes before the real marker code. */
+        while (marker == 0xFF && pos < size) {
+            marker = data[pos];
+            pos++;
+        }
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue; /* TEM, RSTn -- no length/payload */
+        if (marker == 0xD9) return false; /* EOI reached, no SOF ever found */
+        /* Every remaining-length check below is `size - pos` (never
+         * `pos + N > size`) specifically because pos/size are both
+         * attacker-influenced uint32_t: an addition-based check can wrap
+         * around near UINT32_MAX and silently pass when it shouldn't.
+         * Subtraction is safe here only because pos <= size is an
+         * invariant maintained by every advance in this function -- never
+         * introduce a new advance without re-checking that it holds. */
+        if (size - pos < 2) return false; /* truncated before a length field */
+        uint32_t seg_len = ((uint32_t) data[pos] << 8) | (uint32_t) data[pos + 1];
+        if (seg_len < 2 || size - pos < seg_len) return false; /* malformed/truncated segment */
+
+        bool is_sof = (marker >= 0xC0 && marker <= 0xCF) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+        if (is_sof) {
+            /* Payload after the 2 length bytes: 1 precision, 2 height, 2
+             * width, 1 component count, then 3 bytes per component. */
+            uint32_t payload = pos + 2;
+            if (seg_len < 8 || size - payload < 6) return false;
+            int height = ((int) data[payload + 1] << 8) | (int) data[payload + 2];
+            int width = ((int) data[payload + 3] << 8) | (int) data[payload + 4];
+            int num_comp = data[payload + 5];
+            if (width <= 0 || height <= 0 || num_comp <= 0 || num_comp > 4) return false;
+            uint32_t comp_bytes = (uint32_t) num_comp * 3;
+            /* The segment's OWN declared length must actually be big enough
+             * for its own component table (per spec, seg_len == exactly
+             * 8 + 3*num_comp for a well-formed SOF) -- without this, a SOF
+             * with a too-short seg_len could still pass a plain file-size
+             * bounds check by reading bytes that really belong to whatever
+             * follows this segment, misinterpreting them as its own
+             * component records. Algebraically, combined with the
+             * `size - pos < seg_len` check above, this also guarantees
+             * `size - payload >= 6 + comp_bytes` -- the explicit check just
+             * below is deliberately redundant with that (cheap, and this is
+             * adversarial-input-facing code: prefer an explicit second
+             * guarantee over trusting the algebra alone). */
+            if (seg_len < 8 + comp_bytes) return false;
+            if (size - payload < 6 + comp_bytes) return false;
+
+            /* We only ever support SOF0 (routes to the existing tjpgd
+             * baseline path, unchanged) or SOF2 (routes to the new
+             * progressive libjpeg path) -- extended sequential (SOF1),
+             * lossless (SOF3), differential (SOF5-7), and every arithmetic-
+             * coded variant (SOF9-15, jdarith.c is deliberately not
+             * vendored/linked) are all genuinely unsupported. */
+            if (marker != 0xC0 && marker != 0xC2) {
+                result->supported = false;
+                return true;
+            }
+
+            uint8_t h_samp[4], v_samp[4];
+            for (int i = 0; i < num_comp; i++) {
+                uint8_t samp = data[payload + 6 + i * 3 + 1];
+                h_samp[i] = (samp >> 4) & 0x0F;
+                v_samp[i] = samp & 0x0F;
+                /* JPEG/T.81 caps sampling factors at 1-4; the 4-bit nibble
+                 * encoding allows up to 15, so a crafted file could claim a
+                 * much larger value. Nothing downstream would overflow on
+                 * that (width/height are already 16-bit-bounded, so the
+                 * MCU-rounded block counts in jpeg_probe_coeff_bytes() stay
+                 * bounded regardless), but there's no reason to accept an
+                 * out-of-spec value silently just because the arithmetic
+                 * happens to stay safe -- reject it explicitly instead. */
+                if (h_samp[i] == 0 || h_samp[i] > 4 || v_samp[i] == 0 || v_samp[i] > 4) return false;
+            }
+
+            result->is_progressive = (marker == 0xC2);
+            result->supported = true;
+            result->native_w = width;
+            result->native_h = height;
+            result->coeff_bytes = result->is_progressive ?
+                jpeg_probe_coeff_bytes(width, height, num_comp, h_samp, v_samp) : 0;
+            return true;
+        }
+
+        pos += seg_len; /* not a SOF -- skip this segment (APPn/COM/DQT/DHT/DRI/...) */
+    }
+    return false; /* ran out of data before any SOF marker */
+}
+
 static cover_decode_result_t decode_jpeg_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
                                                 int target_w, int target_h,
                                                 uint8_t ** out_buf, int * out_w, int * out_h) {
@@ -115,6 +244,107 @@ static cover_decode_result_t decode_jpeg_rgb888(const uint8_t * data, uint32_t s
     *out_buf = buf;
     *out_w = scaled_w;
     *out_h = scaled_h;
+    return COVER_DECODE_OK;
+}
+
+struct my_jpeg_error_mgr {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+    cover_decode_result_t fail_code;
+};
+
+static void my_jpeg_error_exit(j_common_ptr cinfo) {
+    struct my_jpeg_error_mgr * myerr = (struct my_jpeg_error_mgr *) cinfo->err;
+    if (cinfo->err && cinfo->err->msg_code == JERR_OUT_OF_MEMORY) {
+        myerr->fail_code = COVER_DECODE_FAIL_ALLOC;
+    } else {
+        myerr->fail_code = COVER_DECODE_FAIL_UNSUPPORTED;
+    }
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+static cover_decode_result_t decode_jpeg_progressive_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
+                                                             int target_w, int target_h,
+                                                             uint8_t ** out_buf, int * out_w, int * out_h) {
+    if (!out_buf || !out_w || !out_h) return COVER_DECODE_FAIL_UNSUPPORTED;
+    *out_buf = NULL;
+    *out_w = 0;
+    *out_h = 0;
+    if (!data || size == 0) return COVER_DECODE_FAIL_UNSUPPORTED;
+
+    struct jpeg_decompress_struct cinfo;
+    struct my_jpeg_error_mgr jerr;
+    uint8_t * raw_buf = NULL;
+
+    memset(&cinfo, 0, sizeof(cinfo));
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = my_jpeg_error_exit;
+    jerr.fail_code = COVER_DECODE_FAIL_UNSUPPORTED;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        if (raw_buf) {
+            free(raw_buf);
+            raw_buf = NULL;
+        }
+        jpeg_destroy_decompress(&cinfo);
+        return jerr.fail_code;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, data, (size_t) size);
+
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return COVER_DECODE_FAIL_UNSUPPORTED;
+    }
+
+    /* Scaling: mirror baseline tjpgd policy for consistency across decoders */
+    uint8_t n = jpeg_scale_for_target((int) cinfo.image_width, (int) cinfo.image_height,
+                                      target_w, target_h);
+    cinfo.scale_num = 1;
+    cinfo.scale_denom = 1U << n;
+
+    cinfo.out_color_space = JCS_RGB;
+    cinfo.do_fancy_upsampling = FALSE;
+    cinfo.do_block_smoothing = FALSE;
+    cinfo.dct_method = JDCT_ISLOW;
+
+    jpeg_calc_output_dimensions(&cinfo);
+
+    int out_width = (int) cinfo.output_width;
+    int out_height = (int) cinfo.output_height;
+
+    size_t needed_bytes = 0;
+    if (!rgb888_size_ok((size_t) out_width, (size_t) out_height, max_side, &needed_bytes)) {
+        jpeg_destroy_decompress(&cinfo);
+        return COVER_DECODE_FAIL_OVERSIZED;
+    }
+
+    raw_buf = malloc(needed_bytes);
+    if (!raw_buf) {
+        jpeg_destroy_decompress(&cinfo);
+        return COVER_DECODE_FAIL_ALLOC;
+    }
+
+    /* jpeg_start_decompress handles multi-scan input consumption for progressive JPEG */
+    (void) jpeg_start_decompress(&cinfo);
+
+    while (cinfo.output_scanline < cinfo.output_height) {
+        JSAMPROW row_ptr = (JSAMPROW) (raw_buf + (size_t) cinfo.output_scanline * (size_t) out_width * 3U);
+        JDIMENSION lines_read = jpeg_read_scanlines(&cinfo, &row_ptr, 1);
+        if (lines_read == 0) {
+            free(raw_buf);
+            jpeg_destroy_decompress(&cinfo);
+            return COVER_DECODE_FAIL_UNSUPPORTED;
+        }
+    }
+
+    (void) jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+
+    *out_buf = raw_buf;
+    *out_w = out_width;
+    *out_h = out_height;
     return COVER_DECODE_OK;
 }
 
@@ -262,6 +492,117 @@ static uint16_t * resize_cover_fit(const uint8_t * src, int src_w, int src_h, in
     return dst;
 }
 
+/* Expand RGB565 to 8-bit by left-shifting into the MSBs. Round-trip through
+ * rgb888_to_565() is lossless for those 5/6 bits; bit-replication would not
+ * change the packed result after the packer's 0xF8/0xFC masks. */
+static inline void rgb565_to_888(uint16_t p, uint8_t * r, uint8_t * g, uint8_t * b) {
+    *r = (uint8_t) ((p >> 11) << 3);
+    *g = (uint8_t) (((p >> 5) & 0x3F) << 2);
+    *b = (uint8_t) ((p & 0x1F) << 3);
+}
+
+static void bilinear_sample_rgb565(const uint16_t * src, int src_w, int src_h, float fx, float fy,
+                                   uint8_t * out_r, uint8_t * out_g, uint8_t * out_b) {
+    if (fx < 0) fx = 0;
+    if (fy < 0) fy = 0;
+    if (fx > src_w - 1) fx = (float) (src_w - 1);
+    if (fy > src_h - 1) fy = (float) (src_h - 1);
+
+    int x0 = (int) fx, y0 = (int) fy;
+    int x1 = x0 + 1 < src_w ? x0 + 1 : x0;
+    int y1 = y0 + 1 < src_h ? y0 + 1 : y0;
+    float tx = fx - x0, ty = fy - y0;
+
+    uint8_t p00[3], p10[3], p01[3], p11[3];
+    rgb565_to_888(src[(size_t) y0 * src_w + x0], &p00[0], &p00[1], &p00[2]);
+    rgb565_to_888(src[(size_t) y0 * src_w + x1], &p10[0], &p10[1], &p10[2]);
+    rgb565_to_888(src[(size_t) y1 * src_w + x0], &p01[0], &p01[1], &p01[2]);
+    rgb565_to_888(src[(size_t) y1 * src_w + x1], &p11[0], &p11[1], &p11[2]);
+
+    for (int c = 0; c < 3; c++) {
+        float top = p00[c] * (1.0f - tx) + p10[c] * tx;
+        float bot = p01[c] * (1.0f - tx) + p11[c] * tx;
+        float v = top * (1.0f - ty) + bot * ty;
+        uint8_t out = (uint8_t) (v + 0.5f);
+        if (c == 0) *out_r = out; else if (c == 1) *out_g = out; else *out_b = out;
+    }
+}
+
+uint16_t * cover_resize_rgb565(const uint16_t * src, int src_w, int src_h, int dst_w, int dst_h) {
+    if (!src || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return NULL;
+
+    /* Same-size must copy, not fall through to the area-average path:
+     * at scale=1.0 that path's inclusive floor windows (sx1 = dx+1) average
+     * a 2x2 neighborhood, which is not identity. R1's player-cache and
+     * on-screen cover are both 480x480, so this is the hot path there. */
+    if (src_w == dst_w && src_h == dst_h) {
+        size_t bytes = (size_t) dst_w * (size_t) dst_h * sizeof(uint16_t);
+        uint16_t * dst = malloc(bytes);
+        if (!dst) return NULL;
+        memcpy(dst, src, bytes);
+        return dst;
+    }
+
+    uint16_t * dst = malloc((size_t) dst_w * dst_h * sizeof(uint16_t));
+    if (!dst) return NULL;
+
+    float scale_w = (float) dst_w / (float) src_w;
+    float scale_h = (float) dst_h / (float) src_h;
+    float scale = scale_w > scale_h ? scale_w : scale_h;
+    bool upscaling = scale > 1.0f;
+
+    float scaled_w = src_w * scale;
+    float scaled_h = src_h * scale;
+    float crop_x = (scaled_w - dst_w) / 2.0f;
+    float crop_y = (scaled_h - dst_h) / 2.0f;
+
+    for (int dy = 0; dy < dst_h; dy++) {
+        uint16_t * dst_row = dst + (size_t) dy * dst_w;
+
+        if (upscaling) {
+            float fy = ((dy + 0.5f) + crop_y) / scale - 0.5f;
+            for (int dx = 0; dx < dst_w; dx++) {
+                float fx = ((dx + 0.5f) + crop_x) / scale - 0.5f;
+                uint8_t r, g, b;
+                bilinear_sample_rgb565(src, src_w, src_h, fx, fy, &r, &g, &b);
+                dst_row[dx] = rgb888_to_565(r, g, b);
+            }
+            continue;
+        }
+
+        int sy0 = (int) ((dy + crop_y) / scale);
+        int sy1 = (int) ((dy + 1 + crop_y) / scale);
+        if (sy0 < 0) sy0 = 0;
+        if (sy0 >= src_h) sy0 = src_h - 1;
+        if (sy1 >= src_h) sy1 = src_h - 1;
+        if (sy1 < sy0) sy1 = sy0;
+
+        for (int dx = 0; dx < dst_w; dx++) {
+            int sx0 = (int) ((dx + crop_x) / scale);
+            int sx1 = (int) ((dx + 1 + crop_x) / scale);
+            if (sx0 < 0) sx0 = 0;
+            if (sx0 >= src_w) sx0 = src_w - 1;
+            if (sx1 >= src_w) sx1 = src_w - 1;
+            if (sx1 < sx0) sx1 = sx0;
+
+            uint32_t r_sum = 0, g_sum = 0, b_sum = 0, count = 0;
+            for (int sy = sy0; sy <= sy1; sy++) {
+                const uint16_t * row = src + (size_t) sy * src_w;
+                for (int sx = sx0; sx <= sx1; sx++) {
+                    uint8_t r, g, b;
+                    rgb565_to_888(row[sx], &r, &g, &b);
+                    r_sum += r;
+                    g_sum += g;
+                    b_sum += b;
+                    count++;
+                }
+            }
+            dst_row[dx] = rgb888_to_565((uint8_t) (r_sum / count), (uint8_t) (g_sum / count), (uint8_t) (b_sum / count));
+        }
+    }
+    return dst;
+}
+
 static uint32_t le32(const uint8_t * p) {
     return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
 }
@@ -341,10 +682,26 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
     /* 1. Inspect dimensions before allocating any native buffer */
     int native_w = 0, native_h = 0;
     artwork_format_t fmt = ARTWORK_FORMAT_UNKNOWN;
+    uint64_t progressive_coeff_bytes = 0;
 
     if (data[0] == 0xFF && data[1] == 0xD8) {
-        fmt = ARTWORK_FORMAT_JPEG;
-        if (!inspect_jpeg(data, size, &native_w, &native_h)) return COVER_DECODE_FAIL_UNSUPPORTED;
+        /* jpeg_probe() (not inspect_jpeg()/tjpgd's jd_prepare()) makes the
+         * routing decision here: baseline (SOF0) still goes through tjpgd
+         * completely unchanged below via inspect_jpeg(), progressive (SOF2)
+         * routes to the separate libjpeg fallback -- see jpeg_probe_t's own
+         * doc comment (cover_decode.h) for why tjpgd's own probe can't be
+         * reused for this (it rejects SOF2 outright, with no dimensions). */
+        jpeg_probe_t probe;
+        if (!jpeg_probe(data, size, &probe) || !probe.supported) return COVER_DECODE_FAIL_UNSUPPORTED;
+        if (probe.is_progressive) {
+            fmt = ARTWORK_FORMAT_JPEG_PROGRESSIVE;
+            native_w = probe.native_w;
+            native_h = probe.native_h;
+            progressive_coeff_bytes = probe.coeff_bytes;
+        } else {
+            fmt = ARTWORK_FORMAT_JPEG;
+            if (!inspect_jpeg(data, size, &native_w, &native_h)) return COVER_DECODE_FAIL_UNSUPPORTED;
+        }
     } else if (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') {
         fmt = ARTWORK_FORMAT_PNG;
         if (!inspect_png(data, size, &native_w, &native_h)) return COVER_DECODE_FAIL_UNSUPPORTED;
@@ -362,6 +719,22 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
                     native_w, native_h, target_w, target_h);
             return COVER_DECODE_FAIL_OVERSIZED;
         }
+    } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE) {
+        /* Strict cap, no scale-loophole: baseline's jpeg_decode_dims_ok()
+         * allows native up to MAX_JPEG_NATIVE_SIDE (4096) as long as the
+         * POST-SCALE output fits, because tjpgd never materializes more
+         * than a flat ~32KB workspace regardless of source size. Progressive
+         * has no equivalent escape hatch -- its coefficient buffer scales
+         * with NATIVE dimensions no matter how small the requested target
+         * is, so native itself must stay within MAX_DECODED_COVER_SIDE. A
+         * 4096px progressive cover would need ~50-100MB of coefficients
+         * alone, categorically impossible on this device -- permanently
+         * reject rather than retry, it will never become decodable. */
+        if (native_w > MAX_DECODED_COVER_SIDE || native_h > MAX_DECODED_COVER_SIDE) {
+            DBG_LOG("cover_decode: progressive JPEG rejected by native dimension cap (%dx%d > %d)\n",
+                    native_w, native_h, MAX_DECODED_COVER_SIDE);
+            return COVER_DECODE_FAIL_OVERSIZED;
+        }
     } else {
         if ((size_t) native_w > max_side || (size_t) native_h > max_side) {
             DBG_LOG("cover_decode: image rejected by dimension cap (%dx%d > max %zu)\n",
@@ -371,15 +744,19 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
     }
 
     /* 2. Estimate required memory and acquire decode slot from coordinator.
-     * JPEG bills the post-scale RGB888 buffer, not native pixels. */
+     * JPEG (baseline and progressive alike) bills the post-scale RGB888
+     * buffer via est_w/est_h -- progressive's real, dimension-dependent
+     * coefficient cost is billed separately via progressive_coeff_bytes,
+     * computed from the SOF's true native size, not this post-scale size. */
     int est_w = native_w, est_h = native_h;
-    if (fmt == ARTWORK_FORMAT_JPEG) {
+    if (fmt == ARTWORK_FORMAT_JPEG || fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE) {
         uint8_t scale = jpeg_scale_for_target(native_w, native_h, target_w, target_h);
         est_w = native_w >> scale;
         est_h = native_h >> scale;
     }
     size_t est_bytes = artwork_estimate_decode_bytes(fmt, size, (size_t) est_w, (size_t) est_h,
-                                                     (size_t) target_w, (size_t) target_h);
+                                                     (size_t) target_w, (size_t) target_h,
+                                                     progressive_coeff_bytes);
     uint32_t timeout_ms = (prio == ARTWORK_PRIO_PLAYER) ? 1000 : 300;
 
     artwork_acquire_result_t acq = artwork_coordinator_acquire(prio, est_bytes, timeout_ms,
@@ -402,6 +779,9 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
     if (fmt == ARTWORK_FORMAT_JPEG) {
         dec_res = decode_jpeg_rgb888(data, size, max_side, target_w, target_h,
                                      &native_buf, &decoded_w, &decoded_h);
+    } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE) {
+        dec_res = decode_jpeg_progressive_rgb888(data, size, max_side, target_w, target_h,
+                                                 &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_PNG) {
         dec_res = decode_png_rgb888(data, size, max_side, &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_BMP) {

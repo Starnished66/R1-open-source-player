@@ -102,7 +102,8 @@ size_t system_get_mem_available_bytes(void) {
 
 size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_size,
                                      size_t native_w, size_t native_h,
-                                     size_t target_w, size_t target_h) {
+                                     size_t target_w, size_t target_h,
+                                     uint64_t progressive_coeff_bytes) {
     if (native_w == 0 || native_h == 0 || target_w == 0 || target_h == 0) return SIZE_MAX;
     if (native_w > 4096 || native_h > 4096 || target_w > 1024 || target_h > 1024) return SIZE_MAX;
 
@@ -116,12 +117,24 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
      *   raw scanline buffers with filter bytes (~4 bytes/pixel) + zlib window.
      * - JPEG: tjpgd streams 8x8 MCU blocks into destination; minimal ~32KB buffer.
      *   native_w/h for JPEG is the post-scale RGB888 size, not the source pixel size.
+     * - JPEG_PROGRESSIVE: vendored libjpeg decoder-only build. native_w/h here
+     *   are ALSO the post-scale RGB888 size (same convention as baseline
+     *   JPEG) -- the coefficient buffer (the dominant, dimension-dependent
+     *   cost, scaling with the SOF's true native size, not this post-scale
+     *   size) is billed separately via progressive_coeff_bytes below.
      * - BMP: uncompressed linear stream; ~16KB overhead. */
     uint64_t decoder_workspace = 64ULL * 1024ULL;
     if (fmt == ARTWORK_FORMAT_PNG) {
         decoder_workspace = (uint64_t) native_w * (uint64_t) native_h * 4ULL + (128ULL * 1024ULL);
     } else if (fmt == ARTWORK_FORMAT_JPEG) {
         decoder_workspace = 32ULL * 1024ULL;
+    } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE) {
+        /* 128KiB workspace (Huffman tables, MCU row buffers, jpeg_decompress_
+         * struct) -- larger than baseline tjpgd's flat 32KiB since libjpeg's
+         * struct/table footprint is genuinely bigger, independent of image
+         * size. progressive_coeff_bytes (the real, dimension/sampling-
+         * dependent cost) is added on top, not folded into this constant. */
+        decoder_workspace = 128ULL * 1024ULL + progressive_coeff_bytes;
     } else if (fmt == ARTWORK_FORMAT_BMP) {
         decoder_workspace = 16ULL * 1024ULL;
     }

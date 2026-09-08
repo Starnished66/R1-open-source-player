@@ -62,6 +62,12 @@ LUA_DIR = lua
 # block (which would need to sparse-clone one file out of the much larger,
 # otherwise-unrelated stb monorepo for no real benefit over committing it).
 STB_VORBIS_DIR = stb_vorbis
+# Classic IJG libjpeg v9f (see LICENSE.md -- IJG/BSD-style/zlib terms), used
+# ONLY as a fallback for progressive (SOF2) JPEG cover art, which tjpgd
+# (LVGL's vendored decoder, used for every baseline JPEG) explicitly rejects.
+# Cloned from libjpeg-turbo's own "ijg" mirror -- the official, canonical
+# source for unmodified historical IJG releases, not a random fork.
+JPEG_DIR = jpeg
 
 # Self-bootstrap: clone dependencies if they don't exist yet before evaluating variables
 ifeq ($(wildcard $(LVGL_DIR)),)
@@ -269,6 +275,14 @@ $(info Cloning libopus v1.5.2...)
 $(shell git clone --depth 1 -b v1.5.2 https://github.com/xiph/opus.git)
 endif
 
+# Classic IJG libjpeg v9f -- decoder-only, progressive-JPEG cover art fallback
+# only (see JPEG_DIR's own comment above and cover_decode.c's dispatch logic).
+# tjpgd stays the unchanged, unconditional path for every baseline JPEG.
+ifeq ($(wildcard $(JPEG_DIR)),)
+$(info Cloning IJG libjpeg v9f...)
+$(shell git clone --depth 1 -b jpeg-9f https://github.com/libjpeg-turbo/ijg.git $(JPEG_DIR))
+endif
+
 # mbedTLS (Apache 2.0 -- TLS for network streaming, subsonic_client.c). The
 # real R1 firmware has no usable CA bundle (/etc/ssl/certs is empty) and its
 # own libcurl/OpenSSL .so's are glibc-built and unreachable from a static
@@ -397,7 +411,7 @@ endif
 # *.d files near the bottom of this Makefile is what actually feeds these
 # back in on the next invocation -- this flag alone does nothing without
 # that companion include.
-CFLAGS = -O3 -g -Wall -MMD -MP -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
+CFLAGS = -O3 -g -Wall -MMD -MP -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -Ijpeg_vendor_config -I$(JPEG_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
 HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags)
 HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags)
@@ -491,6 +505,12 @@ ALAC_CXXFLAGS = -O3 -g -I$(ALAC_DIR)/codec -std=c++11 $(ALAC_DEFINES)
 # constraint than fixed-point's Q-format SILK API -- is the correct choice.
 OPUS_DEFINES = -DOPUS_BUILD -DVAR_ARRAYS -DHAVE_LRINTF=1 -DHAVE_LRINT=1
 OPUS_CFLAGS = -O3 -g -Wall -I$(OPUS_DIR)/include -I$(OPUS_DIR)/celt -I$(OPUS_DIR)/silk -I$(OPUS_DIR)/silk/float $(OPUS_DEFINES)
+# jpeg_vendor_config holds a hand-written jconfig.h (no configure/autotools
+# step is run, matching every other vendored library in this Makefile) --
+# jmorecfg.h itself needs no platform customization and is used unmodified
+# straight from $(JPEG_DIR). -I order matters: jpeg_vendor_config first so
+# its jconfig.h is found before anything else on the path could shadow it.
+JPEG_CFLAGS = -O2 -g -Wall -Ijpeg_vendor_config -I$(JPEG_DIR)
 # No configure step (luaconf.h auto-detects a POSIX/Linux target off the
 # compiler's own predefined __linux__/__unix__ macros, which musl's cross
 # compiler still defines for a Linux target -- same as every other
@@ -521,9 +541,9 @@ APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache
 APP_SRCS += src/core/utf8_util.c src/core/app_clock.c src/core/db_log.c
 APP_SRCS += src/ui/gesture_detector.c
 APP_CXX_SRCS = src/audio/alac_decoder.cpp
-LVGL_SRCS = $(shell find $(LVGL_DIR)/src -type f -name '*.c')
-TINYALSA_SRCS = $(shell find $(TINYALSA_DIR)/src -type f -name '*.c')
-FAAD2_SRCS = $(shell find $(FAAD2_DIR)/libfaad -type f -name '*.c')
+LVGL_SRCS = $(sort $(shell find $(LVGL_DIR)/src -type f -name '*.c'))
+TINYALSA_SRCS = $(sort $(shell find $(TINYALSA_DIR)/src -type f -name '*.c'))
+FAAD2_SRCS = $(sort $(shell find $(FAAD2_DIR)/libfaad -type f -name '*.c'))
 # Decoder-only ALAC sources (the repo also ships an encoder we don't need)
 ALAC_C_SRCS = $(ALAC_DIR)/codec/ag_dec.c $(ALAC_DIR)/codec/dp_dec.c $(ALAC_DIR)/codec/matrix_dec.c \
               $(ALAC_DIR)/codec/ALACBitUtilities.c $(ALAC_DIR)/codec/EndianPortable.c
@@ -541,14 +561,38 @@ ALAC_CXX_SRCS = $(ALAC_DIR)/codec/ALACDecoder.cpp
 # explicitly enabled, all off by default, so this stays a plain SILK+CELT
 # decoder build with no separate DNN component to vendor.
 OPUS_SRCS = $(filter-out %/repacketizer_demo.c %/opus_demo.c %/opus_compare.c %/opus_custom_demo.c, \
-              $(shell find $(OPUS_DIR)/src $(OPUS_DIR)/celt $(OPUS_DIR)/silk -maxdepth 1 -type f -name '*.c')) \
-            $(shell find $(OPUS_DIR)/silk/float -maxdepth 1 -type f -name '*.c')
-MBEDTLS_SRCS = $(shell find $(MBEDTLS_DIR)/library -type f -name '*.c')
+              $(sort $(shell find $(OPUS_DIR)/src $(OPUS_DIR)/celt $(OPUS_DIR)/silk -maxdepth 1 -type f -name '*.c'))) \
+            $(sort $(shell find $(OPUS_DIR)/silk/float -maxdepth 1 -type f -name '*.c'))
+MBEDTLS_SRCS = $(sort $(shell find $(MBEDTLS_DIR)/library -type f -name '*.c'))
 CJSON_SRCS = $(CJSON_DIR)/cJSON.c
 # stb_vorbis.c is its own complete translation unit (the real implementation,
 # compiled exactly once here); stb_vorbis.h is a header-only shim other .c
 # files include instead -- see that file's own comment.
 STB_VORBIS_SRCS = $(STB_VORBIS_DIR)/stb_vorbis.c
+# Decoder-only IJG libjpeg v9f -- no encoder (jc*.c/cjpeg.c/djpeg.c/jpegtran.c),
+# no rd*/wr*.c non-JPEG format converters (BMP/GIF/PPM/Targa, cjpeg/djpeg's
+# own file-format glue, unused here), no jmemansi.c/jmemname.c/jmemdos.c/
+# jmemmac.c (temp-file-backed allocators -- jmemnobs.c is the ONLY one
+# linked in: a JPEG decode must never spill to SD-card storage). v9 unified
+# progressive Huffman decoding into jdhuff.c itself (no separate jdphuff.c
+# exists in this release) and replaced the old fixed 1/2/1/4/1/8-only IDCT
+# reduction scheme with jddctmgr.c's own flexible arbitrary-ratio DCT
+# scaling (no separate jidctred.c exists either) -- confirmed directly
+# against this checkout's real file list, not assumed from older IJG
+# versions. jidctfst.c/jidctflt.c, jquant1.c/jquant2.c, and jdarith.c are
+# all still required at LINK time even though this app only ever selects
+# JDCT_ISLOW (jidctint.c)/JCS_RGB (no quantization)/baseline-or-progressive-
+# Huffman (never arithmetic, jpeg_probe() rejects those SOF markers before
+# this decoder is ever invoked) at runtime: jddctmgr.c/jdmaster.c/jdtrans.c
+# reference jpeg_idct_ifast/jpeg_idct_float/jinit_1pass_quantizer/
+# jinit_2pass_quantizer/jinit_arith_decoder unconditionally as C symbols
+# regardless of which runtime branch actually executes -- confirmed via a
+# real link failure, not guessed. This matches how every real IJG decoder-
+# only build (e.g. djpeg's own Makefile) links these same files.
+JPEG_SRCS = $(addprefix $(JPEG_DIR)/, jdapimin.c jdapistd.c jdatasrc.c jdcoefct.c jdcolor.c \
+              jddctmgr.c jdhuff.c jdinput.c jdmainct.c jdmarker.c jdmaster.c jdmerge.c \
+              jdpostct.c jdsample.c jdtrans.c jdarith.c jaricom.c jcomapi.c jerror.c jmemmgr.c jmemnobs.c \
+              jutils.c jidctint.c jidctfst.c jidctflt.c jquant1.c jquant2.c)
 # Library sources only (verified against this checkout's own doc/readme.html
 # file list) -- excludes lua.c/luac.c, the standalone interpreter/compiler
 # CLI mains, since this is an embedded library build.
@@ -573,7 +617,7 @@ DBUS_SRCS = $(filter-out %-win.c %-win32.c %wince-glue.c $(DBUS_DIR)/dbus/dbus-s
               $(DBUS_DIR)/dbus/dbus-spawn-unix.c $(DBUS_DIR)/dbus/dbus-test%.c \
               $(DBUS_DIR)/dbus/dbus-uuidgen.c $(DBUS_DIR)/dbus/dbus-pollable-set-epoll.c \
               $(DBUS_DIR)/dbus/dbus-message-util.c, \
-              $(shell find $(DBUS_DIR)/dbus -maxdepth 1 -name '*.c'))
+              $(sort $(shell find $(DBUS_DIR)/dbus -maxdepth 1 -name '*.c')))
 # bt_media_player.c (AVRCP transport-button service, see the DBUS_DIR
 # section above) needs libdbus, so it's target-only -- not part of
 # APP_SRCS (shared with the host simulator build, which has no Bluetooth
@@ -593,7 +637,8 @@ HOST_OBJS = $(APP_SRCS:src/%.c=$(BUILD_HOST_DIR)/%.o) $(APP_CXX_SRCS:src/%.cpp=$
             $(MBEDTLS_SRCS:$(MBEDTLS_DIR)/library/%.c=$(BUILD_HOST_DIR)/mbedtls/%.o) $(CJSON_SRCS:$(CJSON_DIR)/%.c=$(BUILD_HOST_DIR)/cjson/%.o) \
             $(OPUS_SRCS:$(OPUS_DIR)/%.c=$(BUILD_HOST_DIR)/opus/%.o) \
             $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=$(BUILD_HOST_DIR)/stb_vorbis/%.o) \
-            $(LUA_SRCS:$(LUA_DIR)/src/%.c=$(BUILD_HOST_DIR)/lua/%.o)
+            $(LUA_SRCS:$(LUA_DIR)/src/%.c=$(BUILD_HOST_DIR)/lua/%.o) \
+            $(JPEG_SRCS:$(JPEG_DIR)/%.c=$(BUILD_HOST_DIR)/jpeg/%.o)
 TARGET_OBJS = $(APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) $(APP_CXX_SRCS:src/%.cpp=$(BUILD_TARGET_DIR)/%.o) \
               $(TARGET_ONLY_APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) \
               $(LVGL_SRCS:$(LVGL_DIR)/%.c=$(BUILD_TARGET_DIR)/lvgl/%.o) $(TINYALSA_SRCS:$(TINYALSA_DIR)/%.c=$(BUILD_TARGET_DIR)/tinyalsa/%.o) \
@@ -604,7 +649,8 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) $(APP_CXX_SRCS:src/%.c
               $(OPUS_SRCS:$(OPUS_DIR)/%.c=$(BUILD_TARGET_DIR)/opus/%.o) \
               $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=$(BUILD_TARGET_DIR)/stb_vorbis/%.o) \
               $(LUA_SRCS:$(LUA_DIR)/src/%.c=$(BUILD_TARGET_DIR)/lua/%.o) \
-              $(LIBEXECINFO_SRCS:$(LIBEXECINFO_DIR)/%.c=$(BUILD_TARGET_DIR)/libexecinfo/%.o)
+              $(LIBEXECINFO_SRCS:$(LIBEXECINFO_DIR)/%.c=$(BUILD_TARGET_DIR)/libexecinfo/%.o) \
+              $(JPEG_SRCS:$(JPEG_DIR)/%.c=$(BUILD_TARGET_DIR)/jpeg/%.o)
 
 .PHONY: all host target bootloader sd_ready_test cover_decode_scale_test clean compile_commands.json FORCE_VERSION
 
@@ -733,6 +779,10 @@ $(BUILD_HOST_DIR)/opus/%.o: $(OPUS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(OPUS_CFLAGS) -c $< -o $@
 
+$(BUILD_HOST_DIR)/jpeg/%.o: $(JPEG_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(JPEG_CFLAGS) -c $< -o $@
+
 $(BUILD_HOST_DIR)/lua/%.o: $(LUA_DIR)/src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(LUA_CFLAGS) -DHOST_BUILD=1 -c $< -o $@
@@ -830,13 +880,20 @@ metadata-artwork-selftest:
 	./$(BUILD_TARGET_DIR)/metadata_artwork_test
 
 # Host JPEG decoder tests plus the mocked LVGL PNG buffer ownership contract.
-cover_decode_scale_test:
+# Depends on LVGL_PATCH_STAMP: tjpgd.c is compiled directly against a fresh
+# lvgl/ clone here (not through the normal $(BUILD_HOST_DIR)/lvgl/%.o pattern
+# rule, which already carries this dependency), and tjpgd's decoded pixel
+# format/geometry depend on lvgl/src/libs/tjpgd/tjpgdcnf.h's project-specific
+# customization, one of the golden files the patch stamp installs.
+cover_decode_scale_test: $(LVGL_PATCH_STAMP)
 	@mkdir -p $(BUILD_TARGET_DIR)
 	$(CC) -O0 -g -Wall -DHOST_BUILD=1 -DLV_CONF_INCLUDE_SIMPLE=1 \
 	    -I. -Isrc/library -Isrc/core -Isrc/audio -Ilvgl \
+	    -Ijpeg_vendor_config -I$(JPEG_DIR) \
 	    src/library/cover_decode_scale_test.c src/library/cover_decode.c \
 	    src/library/artwork_coordinator.c lvgl/src/libs/tjpgd/tjpgd.c \
-	    -lpthread -o $(BUILD_TARGET_DIR)/cover_decode_scale_test
+	    $(JPEG_SRCS) \
+	    -lpthread -lm -o $(BUILD_TARGET_DIR)/cover_decode_scale_test
 	./$(BUILD_TARGET_DIR)/cover_decode_scale_test
 
 $(BUILD_TARGET_DIR)/%.o: src/%.c $(LVGL_PATCH_STAMP)
@@ -896,6 +953,10 @@ $(BUILD_TARGET_DIR)/dbus/%.o: $(DBUS_DIR)/dbus/%.c
 $(BUILD_TARGET_DIR)/opus/%.o: $(OPUS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(OPUS_CFLAGS) -c $< -o $@
+
+$(BUILD_TARGET_DIR)/jpeg/%.o: $(JPEG_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CROSS_CC) $(JPEG_CFLAGS) -c $< -o $@
 
 $(BUILD_TARGET_DIR)/lua/%.o: $(LUA_DIR)/src/%.c
 	@mkdir -p $(dir $@)

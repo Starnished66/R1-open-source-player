@@ -21,6 +21,14 @@ typedef enum {
     ARTWORK_FORMAT_JPEG,
     ARTWORK_FORMAT_PNG,
     ARTWORK_FORMAT_BMP,
+    /* Progressive (SOF2) JPEG -- decoded via a separate vendored libjpeg
+     * fallback (src/library/cover_decode.c), never tjpgd (which rejects
+     * SOF2 outright). Its memory profile is fundamentally different from
+     * baseline ARTWORK_FORMAT_JPEG: dominated by a coefficient buffer that
+     * scales with NATIVE image dimensions, not the requested output size --
+     * see artwork_estimate_decode_bytes()'s progressive_coeff_bytes
+     * parameter. */
+    ARTWORK_FORMAT_JPEG_PROGRESSIVE,
 } artwork_format_t;
 
 typedef enum {
@@ -47,10 +55,22 @@ size_t system_get_mem_available_bytes(void);
 void system_set_mock_mem_available(size_t bytes);
 
 /* Calculates estimated peak memory for a decode using format-specific overhead.
+ * native_w/native_h are the POST-SCALE dimensions the decoder will actually
+ * produce for ARTWORK_FORMAT_JPEG/JPEG_PROGRESSIVE (matching this JPEG
+ * decode's own jpeg_scale_for_target() policy), and the true NATIVE (source)
+ * dimensions for PNG/BMP, which don't scale during decode.
+ * progressive_coeff_bytes is the real coefficient-buffer size from a prior
+ * jpeg_probe() call -- ignored for every format except JPEG_PROGRESSIVE,
+ * where it's the dominant cost (see jpeg_probe_t's own doc comment,
+ * cover_decode.h, for why this can't be derived from native_w/native_h
+ * alone: it depends on the SOF's true native dimensions and component
+ * sampling factors, not the post-scale output size this function otherwise
+ * bills). Pass 0 for every non-progressive-JPEG call.
  * Returns estimated bytes, or SIZE_MAX on overflow / invalid dimensions. */
 size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_size,
                                      size_t native_w, size_t native_h,
-                                     size_t target_w, size_t target_h);
+                                     size_t target_w, size_t target_h,
+                                     uint64_t progressive_coeff_bytes);
 
 /* Checks if MemAvailable satisfies (reserve + estimated_bytes). */
 bool artwork_check_memory_admission(artwork_priority_t prio, size_t estimated_bytes);

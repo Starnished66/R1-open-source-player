@@ -37,6 +37,11 @@
 */
 #define MP2731_FAST_CHARGE_CURRENT_MASK 0b01111111  // for CHARGE_CURRENT_REGULATION register
 
+/* 480mA is the closest value at or below the AXP2101's 500mA safe-charging
+ * cap that the MP2731's 40mA step size can express (320mA offset + bit2's
+ * 160mA = 480mA). */
+#define MP2731_FAST_CHARGE_CURRENT_480MA 0b00000100
+
 /* MP2731 Battery Regulation Voltage (Max Charge Voltage):
  * This sets the battery regulation voltage. It has a 3.4V offset and a 3.4V to 4.67V range
  *
@@ -203,6 +208,37 @@ static bool axp2101_set_charge_voltage_limit(enum AXP2101_CHARGE_VOLTAGE_LIMIT v
 	return true;
 }
 
+// function to set the AXP2101 fast charge current limit
+// value is a raw register value already masked to AXP2101_CHG_CURRENT_MASK
+static bool axp2101_set_charge_current_limit(uint8_t value) {
+	// return failure if trying to set a bit that's not in the mask
+	if ((value & (~AXP2101_CHG_CURRENT_MASK)) != 0) {
+		return false;
+	}
+
+	uint8_t stat;
+
+	// read current setting
+	if (!axp2101_read_reg(AXP2101_REG_CHG_CURRENT, &stat)) return false;
+	DBG_LOG("safe_charging: Read AXP2101 Charge Current Value: %d\n", stat);
+
+	// if value already correct, exit early
+	if ((stat & AXP2101_CHG_CURRENT_MASK) == value) return true;
+
+	uint8_t desired = (stat & (uint8_t) ~AXP2101_CHG_CURRENT_MASK) | value;
+
+	// write the new setting
+	if (!axp2101_write_reg(AXP2101_REG_CHG_CURRENT, desired)) return false;
+	DBG_LOG("safe_charging: Set AXP2101 Charge Current Value: %d\n", desired);
+
+	// check for failed write
+	if (!axp2101_read_reg(AXP2101_REG_CHG_CURRENT, &stat)) return false;
+	DBG_LOG("safe_charging: Checked AXP2101 Charge Current Value: %d\n", stat);
+	if ((stat & AXP2101_CHG_CURRENT_MASK) != value) return false;
+
+	return true;
+}
+
 // function to set the mp2731 charge voltage limit
 // reference the comment above MP2731_BATTERY_REGULATION_VOLTAGE_MASK to see what each input value means
 static bool mp2731_set_charge_voltage_limit(enum MP2731_CHARGE_VOLTAGE_LIMIT value) {
@@ -228,9 +264,40 @@ static bool mp2731_set_charge_voltage_limit(enum MP2731_CHARGE_VOLTAGE_LIMIT val
 	DBG_LOG("charge_limiter: Set MP2731 Charge Voltage Regulation Value: %d\n", value);
 
 	// check for failed write
-	axp2101_read_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, &stat);
+	mp2731_read_reg(MP2731_REG_CHARGE_VOLTAGE_REGULATION, &stat);
 	DBG_LOG("charge_limiter: Checked MP2731 Charge Voltage Regulation Value: %d\n", value);
 	if (stat != value) return false;
+
+	return true;
+}
+
+// function to set the mp2731 fast charge current limit
+// value is a raw register value already masked to MP2731_FAST_CHARGE_CURRENT_MASK
+static bool mp2731_set_charge_current_limit(uint8_t value) {
+	// return failure if trying to set a bit that's not in the mask
+	if ((value & (~MP2731_FAST_CHARGE_CURRENT_MASK)) != 0) {
+		return false;
+	}
+
+	uint8_t stat;
+
+	// read current setting
+	if (!mp2731_read_reg(MP2731_REG_CHARGE_CURRENT_REGULATION, &stat)) return false;
+	DBG_LOG("safe_charging: Read MP2731 Charge Current Regulation Value: %d\n", stat);
+
+	// if value already correct, exit early
+	if ((stat & MP2731_FAST_CHARGE_CURRENT_MASK) == value) return true;
+
+	uint8_t desired = (stat & (uint8_t) ~MP2731_FAST_CHARGE_CURRENT_MASK) | value;
+
+	// write the new setting
+	if (!mp2731_write_reg(MP2731_REG_CHARGE_CURRENT_REGULATION, desired)) return false;
+	DBG_LOG("safe_charging: Set MP2731 Charge Current Regulation Value: %d\n", desired);
+
+	// check for failed write
+	if (!mp2731_read_reg(MP2731_REG_CHARGE_CURRENT_REGULATION, &stat)) return false;
+	DBG_LOG("safe_charging: Checked MP2731 Charge Current Regulation Value: %d\n", stat);
+	if ((stat & MP2731_FAST_CHARGE_CURRENT_MASK) != value) return false;
 
 	return true;
 }
@@ -256,7 +323,6 @@ void charge_limiter_poll(bool enabled, bool force) {
 
         // TODO: make sure the mp2731 code doesn't cause bad stuff on the R1
         if (!mp2731_set_charge_voltage_limit(MP2731_CHARGE_VOLTAGE_LIMIT_4_4V)) {
-        	// TODO: is it safe to subtract from last_apply.tv_sec like this? could it underflow?
         	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
         }
 
@@ -269,7 +335,6 @@ void charge_limiter_poll(bool enabled, bool force) {
     }
 
     if (!mp2731_set_charge_voltage_limit(MP2731_CHARGE_VOLTAGE_LIMIT_4V)) {
-    	// TODO: is it safe to subtract from last_apply.tv_sec like this? could it underflow?
     	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
     }
 #endif
@@ -283,13 +348,13 @@ bool charge_limiter_is_confirmed_off(void) {
     return charger_confirmed_off;
 }
 
-// TODO: implement safe charging with MP2731
 void safe_charging_poll(bool enabled, bool force) {
 #if !CHARGE_LIMITER_ACTIVE
     (void) enabled;
     (void) force;
 #else
     static struct timespec last_apply;
+    // TODO: doesn't just returning mean that the registers are never reset? shouldn't this use the same pattern as charge_limiter_poll() uses?
     if (!enabled) return; /* Off means leave the PMIC unchanged. */
 
     struct timespec now;
@@ -298,23 +363,13 @@ void safe_charging_poll(bool enabled, bool force) {
         now.tv_sec - last_apply.tv_sec < CHARGE_LIMITER_REEVALUATE_SECONDS) return;
     last_apply = now;
 
-    uint8_t current;
-    if (!axp2101_read_reg(AXP2101_REG_CHG_CURRENT, &current)) {
-        last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1;
-        return;
-    }
-    uint8_t desired = (current & (uint8_t) ~AXP2101_CHG_CURRENT_MASK) |
-                      AXP2101_CHG_CURRENT_500MA;
-    if (desired != current && !axp2101_write_reg(AXP2101_REG_CHG_CURRENT, desired)) {
-        last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1;
-        return;
+    // cap to 500mA charge current
+    if (!axp2101_set_charge_current_limit(AXP2101_CHG_CURRENT_500MA)) {
+    	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
     }
 
-    uint8_t readback = 0;
-    bool confirmed = axp2101_read_reg(AXP2101_REG_CHG_CURRENT, &readback) &&
-                     (readback & AXP2101_CHG_CURRENT_MASK) == AXP2101_CHG_CURRENT_500MA;
-    DBG_LOG("safe_charging: 500mA cap reg62 0x%02X -> 0x%02X (%s)\n",
-            current, readback, confirmed ? "confirmed" : "FAILED");
-    if (!confirmed) last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1;
+    if (!mp2731_set_charge_current_limit(MP2731_FAST_CHARGE_CURRENT_480MA)) {
+    	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+    }
 #endif
 }

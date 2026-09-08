@@ -1,5 +1,5 @@
 #include "charge_limiter.h"
-#include "debug_log.h"
+#include "debug_log.h"  // TODO: fix false-positive "'debug_log.h' file not found" warning in IDE
 
 #include <fcntl.h>
 #include <linux/i2c-dev.h>
@@ -14,6 +14,43 @@
  * Set to 0 to disable entirely; the limiter is independent of
  * battery.c's status polling. */
 #define CHARGE_LIMITER_ACTIVE 1
+
+#define MP2731_I2C_BUS "/dev/i2c-0"
+#define MP2731_I2C_ADDR 0x4b
+
+/* TODO: description */
+#define MP2731_REG_CHARGE_CURRENT_REGULATION 0x05
+#define MP2731_REG_CHARGE_VOLTAGE_REGULATION 0x07
+
+/* MP2731 Fast Charge Current:
+ * This sets the fast charge current. It has a 320mA offset and a 320mA to 4520mA range
+ *
+ * | Bit | Meaning |
+ * |-----|---------|
+ * | 6   | 2560mA  |
+ * | 5   | 1280mA  |
+ * | 4   | 640mA   |
+ * | 3   | 320mA   |
+ * | 2   | 160mA   |
+ * | 1   | 80mA    |
+ * | 0   | 40mA    |
+*/
+#define MP2731_FAST_CHARGE_CURRENT_MASK 0b01111111  // for CHARGE_CURRENT_REGULATION register
+
+/* MP2731 Battery Regulation Voltage (Max Charge Voltage):
+ * This sets the battery regulation voltage. It has a 3.4V offset and a 3.4V to 4.67V range
+ *
+ * | Bit | Meaning |
+ * |-----|---------|
+ * | 7   | 640mV   |
+ * | 6   | 320mV   |
+ * | 5   | 160mV   |
+ * | 4   | 80mV    |
+ * | 3   | 40mV    |
+ * | 2   | 20mV    |
+ * | 1   | 10mV    |
+*/
+#define MP2731_BATTERY_REGULATION_VOLTAGE_MASK 0b11111110  // for CHARGE_VOLTAGE_REGULATION register
 
 #define AXP2101_I2C_BUS "/dev/i2c-0"
 #define AXP2101_I2C_ADDR 0x34
@@ -54,12 +91,12 @@ static bool limiter_holding = false;
 static bool charger_confirmed_off = false;
 
 #if CHARGE_LIMITER_ACTIVE
-static bool axp2101_smbus_xfer(uint8_t reg, uint8_t * value, bool write) {
-    int fd = open(AXP2101_I2C_BUS, O_RDWR);
+static bool smbus_xfer(char * i2c_bus, uint8_t i2c_addr, uint8_t reg, uint8_t * value, bool write) {
+    int fd = open(i2c_bus, O_RDWR);
     if (fd < 0) return false;
 
     bool ok = false;
-    if (ioctl(fd, I2C_SLAVE_FORCE, AXP2101_I2C_ADDR) >= 0) {
+    if (ioctl(fd, I2C_SLAVE_FORCE, i2c_addr) >= 0) {
         union i2c_smbus_data data;
         if (write) data.byte = *value;
 
@@ -78,12 +115,21 @@ static bool axp2101_smbus_xfer(uint8_t reg, uint8_t * value, bool write) {
     return ok;
 }
 
+// TODO: define enum for registers (separate enums for axp2101 and mp2731)
 static bool axp2101_read_reg(uint8_t reg, uint8_t * out) {
-    return axp2101_smbus_xfer(reg, out, false);
+    return smbus_xfer(AXP2101_I2C_BUS, AXP2101_I2C_ADDR, reg, out, false);
 }
 
 static bool axp2101_write_reg(uint8_t reg, uint8_t value) {
-    return axp2101_smbus_xfer(reg, &value, true);
+    return smbus_xfer(AXP2101_I2C_BUS, AXP2101_I2C_ADDR, reg, &value, true);
+}
+
+static bool mp2731_read_reg(uint8_t reg, uint8_t * out) {
+    return smbus_xfer(MP2731_I2C_BUS, MP2731_I2C_ADDR, reg, out, false);
+}
+
+static bool mp2731_write_reg(uint8_t reg, uint8_t value) {
+    return smbus_xfer(MP2731_I2C_BUS, MP2731_I2C_ADDR, reg, &value, true);
 }
 
 static void log_chg_stat(const char * when) {
@@ -99,12 +145,20 @@ static void log_chg_stat(const char * when) {
     printf("charge_limiter: CV Charge Voltage Setting = %d\n", stat);
 }
 
-enum CHARGE_VOLTAGE_LIMIT {
-	CHARGE_VOLTAGE_LIMIT_4V    = 1,
-	CHARGE_VOLTAGE_LIMIT_4_1V  = 2,
-	CHARGE_VOLTAGE_LIMIT_4_2V  = 3,
-	CHARGE_VOLTAGE_LIMIT_4_35V = 4,
-	CHARGE_VOLTAGE_LIMIT_4_4V  = 5,
+enum AXP2101_CHARGE_VOLTAGE_LIMIT {
+	AXP2101_CHARGE_VOLTAGE_LIMIT_4V    = 1,
+	AXP2101_CHARGE_VOLTAGE_LIMIT_4_1V  = 2,
+	AXP2101_CHARGE_VOLTAGE_LIMIT_4_2V  = 3,
+	AXP2101_CHARGE_VOLTAGE_LIMIT_4_35V = 4,
+	AXP2101_CHARGE_VOLTAGE_LIMIT_4_4V  = 5,
+};
+
+enum MP2731_CHARGE_VOLTAGE_LIMIT {
+	MP2731_CHARGE_VOLTAGE_LIMIT_4V    = 0b01111000,
+	MP2731_CHARGE_VOLTAGE_LIMIT_4_1V  = 0b10001100,
+	MP2731_CHARGE_VOLTAGE_LIMIT_4_2V  = 0b10100000,
+	MP2731_CHARGE_VOLTAGE_LIMIT_4_35V = 0b10111110,
+	MP2731_CHARGE_VOLTAGE_LIMIT_4_4V  = 0b11001000,
 };
 
 // Function to set AXP2101 charge_voltage_limit
@@ -122,7 +176,7 @@ enum CHARGE_VOLTAGE_LIMIT {
  * Source: https://files.waveshare.com/wiki/common/X-power-AXP2101_SWcharge_V1.0.pdf
  */
 // NOTE: the low 3 bits of register 0x64 are the only ones used in that byte. So it is safe to always write 0 to the other bits.
-static bool set_charge_voltage_limit(enum CHARGE_VOLTAGE_LIMIT value) {
+static bool axp2101_set_charge_voltage_limit(enum AXP2101_CHARGE_VOLTAGE_LIMIT value) {
 	// return failure if trying to set an invalid value (reserved)
 	if (value == 0 || value >= 6) {
 		return false;
@@ -148,6 +202,38 @@ static bool set_charge_voltage_limit(enum CHARGE_VOLTAGE_LIMIT value) {
 
 	return true;
 }
+
+// function to set the mp2731 charge voltage limit
+// reference the comment above MP2731_BATTERY_REGULATION_VOLTAGE_MASK to see what each input value means
+static bool mp2731_set_charge_voltage_limit(enum MP2731_CHARGE_VOLTAGE_LIMIT value) {
+	// return failure if trying to set a bit that's not in the mask
+	if ((value & (~MP2731_BATTERY_REGULATION_VOLTAGE_MASK)) != 0) {
+		return false;
+	}
+
+	// extra safety, not really needed. just applying the mask (even though we've already filtered out inputs that dont match the mask)
+	value = value & MP2731_BATTERY_REGULATION_VOLTAGE_MASK;
+
+	uint8_t stat;
+
+	// read current setting
+	if (!mp2731_read_reg(MP2731_REG_CHARGE_VOLTAGE_REGULATION, &stat)) return false;
+	DBG_LOG("charge_limiter: Read MP2731 Charge Voltage Regulation Value: %d\n", stat);
+
+	// if value already correct, exit early
+	if (stat == value) return true;
+
+	// write the new setting (no write happens if value was already correct)
+	if (!mp2731_write_reg(MP2731_REG_CHARGE_VOLTAGE_REGULATION, value)) return false;
+	DBG_LOG("charge_limiter: Set MP2731 Charge Voltage Regulation Value: %d\n", value);
+
+	// check for failed write
+	axp2101_read_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, &stat);
+	DBG_LOG("charge_limiter: Checked MP2731 Charge Voltage Regulation Value: %d\n", value);
+	if (stat != value) return false;
+
+	return true;
+}
 #endif
 
 void charge_limiter_poll(bool enabled, bool force) {
@@ -164,7 +250,13 @@ void charge_limiter_poll(bool enabled, bool force) {
 
     if (!enabled) {
         // set back to default 4.4V charge voltage
-        if (!set_charge_voltage_limit(CHARGE_VOLTAGE_LIMIT_4_4V)) {
+        if (!axp2101_set_charge_voltage_limit(AXP2101_CHARGE_VOLTAGE_LIMIT_4_4V)) {
+        	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+        }
+
+        // TODO: make sure the mp2731 code doesn't cause bad stuff on the R1
+        if (!mp2731_set_charge_voltage_limit(MP2731_CHARGE_VOLTAGE_LIMIT_4_4V)) {
+        	// TODO: is it safe to subtract from last_apply.tv_sec like this? could it underflow?
         	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
         }
 
@@ -172,7 +264,12 @@ void charge_limiter_poll(bool enabled, bool force) {
     }
 
     // set to 4.2V charge voltage
-    if (!set_charge_voltage_limit(CHARGE_VOLTAGE_LIMIT_4_2V)) {
+    if (!axp2101_set_charge_voltage_limit(AXP2101_CHARGE_VOLTAGE_LIMIT_4_2V)) {
+    	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+    }
+
+    if (!mp2731_set_charge_voltage_limit(MP2731_CHARGE_VOLTAGE_LIMIT_4V)) {
+    	// TODO: is it safe to subtract from last_apply.tv_sec like this? could it underflow?
     	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
     }
 #endif
@@ -186,6 +283,7 @@ bool charge_limiter_is_confirmed_off(void) {
     return charger_confirmed_off;
 }
 
+// TODO: implement safe charging with MP2731
 void safe_charging_poll(bool enabled, bool force) {
 #if !CHARGE_LIMITER_ACTIVE
     (void) enabled;

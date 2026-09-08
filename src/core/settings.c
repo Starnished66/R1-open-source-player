@@ -103,7 +103,7 @@ static void set_defaults(player_settings_t * out) {
     out->hide_player_topbar = false;
     out->led_indicator_enabled = true;
     out->db_logging_enabled = false; /* opt-in developer diagnostic, off by default */
-    out->charge_limiter_enabled = false; /* opt-in -- caps max charge at 85%, a real behavior change the user should choose, not a default surprise */
+    out->charge_limiter_enabled = false; /* opt-in -- caps max charge voltage to 4.2V, a real behavior change the user should choose, not a default surprise */
     out->safe_charging_enabled = false; /* off means leave the PMIC charge-current setting untouched */
     out->show_battery_percent = true; /* on by default -- matches every previous version's always-on behavior */
     /* Defaults on: a device left screen-off with idle_shutdown_enabled=false

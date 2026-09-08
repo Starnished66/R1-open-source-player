@@ -13,10 +13,12 @@ int battery_get_percent(void);
  * raw getter above remains available to safety/charge-limit logic. */
 int battery_get_display_percent(void);
 
-/* Physical external-power state, independent of whether the PMIC charger
- * itself is enabled.  This distinction matters while the 85% charge limiter
- * is holding: it disables charging, so the battery status can legitimately
- * say "Discharging" even though USB/car power is still connected.
+/* Physical external-power state, independent of the PMIC charger's own
+ * status reporting -- the charge limiter (see charge_limiter.h) only ever
+ * caps the target charge voltage, it never disables the charger, so the
+ * "Discharging"/"Charging" distinction it can introduce is smaller than
+ * under an on/off style limiter, but a status node can still be stale or
+ * momentarily unreadable independent of the limiter.
  *
  * UNKNOWN is deliberately distinct from DISCONNECTED.  Callers that can
  * trigger destructive actions (Car Mode powers the device off) must ignore a
@@ -30,8 +32,8 @@ typedef enum {
 battery_external_power_state_t battery_get_external_power_state(void);
 
 /* True if the selected battery status says "Charging" or "Full".  This is
- * charger activity/status, not a reliable physical-cable detector while the
- * 85% limiter is holding; use battery_get_external_power_state() for that. */
+ * charger activity/status, not a reliable physical-cable detector; use
+ * battery_get_external_power_state() for that. */
 bool battery_is_charging(void);
 
 /* True only for "Full" specifically (plugged in, topped up) -- distinct

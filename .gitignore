@@ -98,6 +98,15 @@
 *selftest*
 *self_test*
 
+# *_test.c files (playlist_test.c, charge_limiter_test.c, etc.) are local-
+# only from here forward -- explicit request, distinct from the
+# *selftest*/*self_test* rule above. Does not retroactively untrack the
+# handful already committed (cover_decode_scale_test.c, metadata_artwork_
+# test.c, playlist_test.c, screen_builders_test.c, sd_ready_test.c) --
+# gitignore never affects files git already tracks; `git rm --cached` them
+# too if the intent is to stop tracking those as well.
+*_test.c
+
 # Local GUI-refactor extraction workspace
 /scratch/
 

@@ -1669,7 +1669,7 @@ static void plugin_power_list_item_click_cb(lv_event_t * e) {
 
 static lv_obj_t * build_settings_power_screen(void) {
     static pill_list_item_t items[5 + PLUGIN_MAX_POWER_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "Charge Limiter (85%)", PILL_ACCESSORY_TOGGLE,
+    items[0] = (pill_list_item_t){ "Charge Limiter (4.2V)", PILL_ACCESSORY_TOGGLE,
                                     current_settings.charge_limiter_enabled, NULL, charge_limiter_switch_event_cb, NULL };
     items[1] = (pill_list_item_t){ "Safe Charging (500mA)", PILL_ACCESSORY_TOGGLE,
                                     current_settings.safe_charging_enabled, NULL, safe_charging_switch_event_cb, NULL };

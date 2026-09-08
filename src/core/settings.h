@@ -153,10 +153,9 @@ typedef struct {
      * on the SD card. See db_log.h. */
     bool db_logging_enabled;
 
-    /* Caps charging at 85% to extend battery longevity -- see
-     * charge_limiter.h for how this is actually enforced (there's no
-     * dedicated state-of-charge cutoff on this hardware, so it throttles
-     * the USB input current limit instead). */
+    /* Caps the PMIC's charge-termination voltage to 4.2V to extend battery
+     * longevity, rather than a literal state-of-charge cutoff -- see
+     * charge_limiter.h for how this is actually enforced. */
     bool charge_limiter_enabled;
 
     /* Caps the AXP2101 constant-current charging phase at 500mA. Turning

@@ -640,9 +640,10 @@ static void update_timer_cb(lv_timer_t * timer) {
      * boots and auto-resumes playback.
      *
      * External power presence is edge-triggered using physical power supply state
-     * rather than battery charging status (which may report discharging when charge
-     * limiter holds at 85%). Power removal must persist for three consecutive 500ms
-     * control ticks to filter transient fluctuations.
+     * rather than battery charging status, which is a charger-activity signal, not
+     * a cable-presence one (see battery_is_charging()'s own doc comment). Power
+     * removal must persist for three consecutive 500ms control ticks to filter
+     * transient fluctuations.
      *
      * Only triggers if a track is actively playing or paused. */
 #ifndef HOST_BUILD
@@ -663,9 +664,20 @@ static void update_timer_cb(lv_timer_t * timer) {
         } else {
             /* Keep the sysfs directory/file reads completely out of the
              * normal 500ms control path when Car Mode is disabled. */
+            /* No charge_limiter_is_holding()-based fallback for an UNKNOWN
+             * read here (there used to be one): under the old on/off
+             * percentage limiter, "holding" only became true once the
+             * charger had actually been disabled near 85% SoC while
+             * plugged in -- a reasonable proxy for "must be on external
+             * power". Under the current voltage-cap design, "holding" just
+             * means the 4.2V register write succeeded, which happens
+             * throughout an entire charge session regardless of whether
+             * power is still connected at the moment of THIS poll (the
+             * AXP2101 is I2C-reachable off the system rail either way) --
+             * it is no longer meaningful evidence of a physical cable.
+             * Treating UNKNOWN as ambiguous (see the branch below) is the
+             * existing safe default already. */
             battery_external_power_state_t power_state = battery_get_external_power_state();
-            if (power_state == BATTERY_EXTERNAL_POWER_UNKNOWN && charge_limiter_is_holding())
-                power_state = BATTERY_EXTERNAL_POWER_CONNECTED;
 
             if (power_state == BATTERY_EXTERNAL_POWER_UNKNOWN) {
                 /* Consecutive means consecutive valid samples.  A sysfs

@@ -896,6 +896,36 @@ cover_decode_scale_test: $(LVGL_PATCH_STAMP)
 	    -lpthread -lm -o $(BUILD_TARGET_DIR)/cover_decode_scale_test
 	./$(BUILD_TARGET_DIR)/cover_decode_scale_test
 
+# Host charge-limiter tests: mocked I2C seams, no real device needed (see
+# charge_limiter_test.c's own top comment). Built twice -- once per board --
+# since HAS_MP2731 (BOARD_R3PROII) changes which registers exist at compile
+# time, not just at runtime. CHARGE_LIMITER_BASELINE_PATH is overridden to a
+# scratch file under $(BUILD_TARGET_DIR) (the real default, /usr/data/...,
+# does not exist on a dev machine) and removed before every scenario so one
+# scenario's persisted baseline can never leak into the next -- each
+# scenario is its own process, but they'd otherwise share one file on disk.
+CHARGE_LIMITER_TEST_R1_SCENARIOS = r1-no-mp2731 voltage-restore lower-current backup-failure current-restore stale-baseline-recovers
+CHARGE_LIMITER_TEST_R3PROII_SCENARIOS = r3proii-voltage-baseline-restore r3proii-voltage-cap-applied r3proii-current-restore
+.PHONY: charge_limiter_test
+charge_limiter_test:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Isrc/hardware -Isrc/core \
+	    -DCHARGE_LIMITER_BASELINE_PATH='"$(BUILD_TARGET_DIR)/charge_limiter_test_r1_baseline.txt"' \
+	    src/hardware/charge_limiter_test.c \
+	    -lpthread -o $(BUILD_TARGET_DIR)/charge_limiter_test_r1
+	@for s in $(CHARGE_LIMITER_TEST_R1_SCENARIOS); do \
+	  rm -f $(BUILD_TARGET_DIR)/charge_limiter_test_r1_baseline.txt; \
+	  ./$(BUILD_TARGET_DIR)/charge_limiter_test_r1 $$s || exit 1; \
+	done
+	$(CC) -O0 -g -Wall -Wextra -Isrc/hardware -Isrc/core -DBOARD_R3PROII \
+	    -DCHARGE_LIMITER_BASELINE_PATH='"$(BUILD_TARGET_DIR)/charge_limiter_test_r3proii_baseline.txt"' \
+	    src/hardware/charge_limiter_test.c \
+	    -lpthread -o $(BUILD_TARGET_DIR)/charge_limiter_test_r3proii
+	@for s in $(CHARGE_LIMITER_TEST_R3PROII_SCENARIOS); do \
+	  rm -f $(BUILD_TARGET_DIR)/charge_limiter_test_r3proii_baseline.txt; \
+	  ./$(BUILD_TARGET_DIR)/charge_limiter_test_r3proii $$s || exit 1; \
+	done
+
 $(BUILD_TARGET_DIR)/%.o: src/%.c $(LVGL_PATCH_STAMP)
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@

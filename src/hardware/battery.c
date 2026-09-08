@@ -189,16 +189,7 @@ static bool refresh_battery_cache_locked(void) {
         !discover_battery_device(cached_battery_device, sizeof(cached_battery_device))) return false;
 
     char capacity_str[16];
-    char status[24];
-#if defined(MP2731_CHARGER_DEVICE)
-	// devices using the MP2731 (at least the R3Pro II) always read status as "discharging" from battery
-	// reading from the mp2731 instead gives the correct value
-    bool have_status = read_sysfs_attr(MP2731_CHARGER_DEVICE, "status", status, sizeof(status));
-#else
-    bool have_status = read_sysfs_attr(cached_battery_device, "status", status, sizeof(status));
-#endif
-    if (!read_sysfs_attr(cached_battery_device, "capacity", capacity_str, sizeof(capacity_str)) ||
-        !have_status) {
+    if (!read_sysfs_attr(cached_battery_device, "capacity", capacity_str, sizeof(capacity_str))) {
         /* A driver can disappear/reappear across suspend. Rediscover once
          * on the next call instead of pinning a stale sysfs name forever. */
         cached_battery_device[0] = '\0';
@@ -206,7 +197,25 @@ static bool refresh_battery_cache_locked(void) {
         return false;
     }
     cached_capacity = atoi(capacity_str);
-    snprintf(cached_status, sizeof(cached_status), "%s", status);
+
+    /* Status comes from a separate, independent node on R3 Pro II (see
+     * MP2731_CHARGER_DEVICE's own comment above) -- a transient failure to
+     * read IT must not blank out the capacity we just successfully read.
+     * Leave cached_status at whatever it was (stale-but-better-than-
+     * pretending-no-data-exists-at-all); it refreshes on the next
+     * successful read within BATTERY_CACHE_TTL_MS. No device-rediscovery
+     * here either: an MP2731 read hiccup says nothing about whether
+     * cached_battery_device (the capacity node) is still valid. */
+    char status[24];
+#if defined(MP2731_CHARGER_DEVICE)
+    // devices using the MP2731 (at least the R3Pro II) always read status as "discharging" from battery
+    // reading from the mp2731 instead gives the correct value
+    bool have_status = read_sysfs_attr(MP2731_CHARGER_DEVICE, "status", status, sizeof(status));
+#else
+    bool have_status = read_sysfs_attr(cached_battery_device, "status", status, sizeof(status));
+#endif
+    if (have_status) snprintf(cached_status, sizeof(cached_status), "%s", status);
+
     cached_at = now;
     cache_valid = true;
     return true;

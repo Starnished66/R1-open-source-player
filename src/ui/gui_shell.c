@@ -590,17 +590,6 @@ static void sync_topbar_status_icon_positions(void);
 void refresh_battery_topbar(void) {
     int percent = battery_get_display_percent();
 
-    /* The fuel gauge can recalibrate upward after charging is stopped, and
-     * the kernel's preferred battery/status node remains stale at
-     * "Charging" even while AXP2101 REG18 has chg_en cleared and REG01 says
-     * not_charging. Without this limiter-aware presentation, battery.c's
-     * direction filter walks the visible number from 85 toward that stale
-     * raw value, making a working electrical cutoff look broken. Keep the
-     * raw percentage untouched for charge_limiter_poll()'s hysteresis; only
-     * cap what the 85%-limit UI promises to show while a hold is active. */
-    bool charge_limiter_holding = charge_limiter_is_holding();
-    if (charge_limiter_holding && percent > 85) percent = 85;
-
     /* battery_icon_frame (the outline + fill gauge) is always shown --
      * current_settings.show_battery_percent (Settings > Power > "Battery
      * Percentage") only ever hides the "NN%" digit readout below, never the
@@ -625,11 +614,15 @@ void refresh_battery_topbar(void) {
     }
     if (percent > 100) percent = 100;
 
-    /* charge_limiter_holding tracks the hysteresis state (which flips true
-     * early to absorb fuel-gauge lag). Suppress the charging bolt only once
-     * the displayed percentage actually reaches 85% to match what is visible
-     * on screen. */
-    bool limiter_capped_now = charge_limiter_holding && percent >= 85;
+    /* charge_limiter_is_holding() (voltage cap applied) is true for the
+     * entire time the limiter is on and charging is active, independent of
+     * percentage -- not a useful "suppress the bolt" signal by itself.
+     * charge_limiter_is_confirmed_off() only goes true once charging has
+     * actually tapered off/completed under the cap (same physically-
+     * verified signal led_control.c uses for the charge-complete LED), so
+     * the bolt stays lit for as long as current is genuinely still
+     * flowing. */
+    bool limiter_capped_now = charge_limiter_is_confirmed_off();
     bool charging = !limiter_capped_now && battery_is_charging();
     bool low = !charging && percent < 5;
 

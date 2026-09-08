@@ -44,6 +44,7 @@
 /assets/theme2/stream_media/*
 !/assets/theme2/stream_media/subsonic.png
 !/assets/theme2/stream_media/subsonic_s.png
+!/assets/theme2/stream_media/download.png
 !/assets/theme2/playing_plane/
 /assets/theme2/playing_plane/*
 !/assets/theme2/playing_plane/airplay_logo_white.png

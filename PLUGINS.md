@@ -1669,7 +1669,7 @@ Subscribes to a playback or device lifecycle change your plugin didn't
 itself cause. Unlike `register_list_item()` (where each plugin's row
 coexists as its own list entry), an event has no UI real estate to divide
 up -- **every** plugin subscribed to a given event fires, not just the
-first or the most recent. Five recognized events:
+first or the most recent. Six recognized events:
 
 - `"track_started"` -- `callback(title, artist, album, duration_seconds,
   provider, track_id)`. Fires whenever a new track begins playing, whatever
@@ -1694,9 +1694,17 @@ first or the most recent. Five recognized events:
   route through any of this app's own explicit stop points. Not needed for
   scrobbling (which only cares about elapsed listening time, and simply
   stops noticing once nothing's playing), but worth knowing if you're
-  relying on it for something else.
+  relying on it for something else. See the new `"queue_exhausted"` event below for reacting to a manual Next/Previous press at that same boundary.
 - `"screen_woke"` -- `callback()`, no arguments. Fires when the device's screen
   wakes from being off/asleep (e.g. power button pressed to wake the display).
+- `"queue_exhausted"` -- `callback(direction)`, `direction` is `1` (Next) or `-1`
+  (Previous). Fires when a manual step (button/touch/remote) finds no further
+  track to advance to in that direction under the current play mode -- e.g.
+  pressing Next on the last track in Sequential mode, or Previous on the first
+  track. Lets a plugin react immediately instead of only on natural playback-end
+  (see the "stopped" event's own Known gap note above) -- useful for anything
+  that wants to continue playback past the edge of the current playlist, such as
+  jumping to a next album/folder.
 
 Passing an unrecognized event name raises a Lua error immediately, same
 convention as an unrecognized `list_id`. Capped at 8 subscribers per event,

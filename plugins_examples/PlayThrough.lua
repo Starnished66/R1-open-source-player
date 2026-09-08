@@ -167,6 +167,20 @@ end)
 
 plugin.on("resumed", function() stopped_polls = 0 end)
 
+local function continue_now()
+    local paths = candidate_paths
+    candidate_paths = nil
+    stopped_polls = 0
+    plugin.play_list(paths, 1)
+    plugin.show_toast("Continuing playback")
+end
+
+plugin.on("queue_exhausted", function(direction)
+    if direction ~= 1 then return end
+    if not candidate_paths or plugin.get_play_mode() ~= "sequential" then return end
+    continue_now()
+end)
+
 plugin.set_interval(1, function()
     if not candidate_paths or plugin.get_play_mode() ~= "sequential" then
         stopped_polls = 0
@@ -180,11 +194,7 @@ plugin.set_interval(1, function()
     stopped_polls = stopped_polls + 1
     if stopped_polls < 2 then return end
 
-    local paths = candidate_paths
-    candidate_paths = nil
-    stopped_polls = 0
-    plugin.play_list(paths, 1)
-    plugin.show_toast("Continuing playback")
+    continue_now()
 end)
 
 local function open_about()

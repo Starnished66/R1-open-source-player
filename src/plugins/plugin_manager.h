@@ -415,6 +415,7 @@ void plugin_manager_notify_paused(void);
 void plugin_manager_notify_resumed(void);
 void plugin_manager_notify_stopped(void);
 void plugin_manager_notify_screen_woke(void);
+void plugin_manager_notify_queue_exhausted(int direction);
 
 /* Invoked by gui.c's shared plugin-interval lv_timer callback when the
  * timer for pool slot `slot` (plugin_interval_timers[], gui.c) fires --

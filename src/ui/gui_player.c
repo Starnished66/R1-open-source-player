@@ -3300,8 +3300,7 @@ void prev_btn_event_cb(lv_event_t * e) {
         return;
     }
 
-    int prev_index = compute_manual_step_index(playlist_index, -1);
-    if (prev_index >= 0) play_track_at(prev_index);
+    gui_player_step_manual(-1);
 }
 
 void next_btn_event_cb(lv_event_t * e) {
@@ -3312,8 +3311,7 @@ void next_btn_event_cb(lv_event_t * e) {
     }
     reset_decoder_failure_tracking();
     if (playlist_index < 0) return;
-    int next_index = compute_manual_step_index(playlist_index, 1);
-    if (next_index >= 0) play_track_at(next_index);
+    gui_player_step_manual(1);
 }
 
 
@@ -4030,6 +4028,7 @@ void gui_player_step_manual(int direction) {
     if (playlist_index < 0) return;
     int next_idx = compute_manual_step_index(playlist_index, direction);
     if (next_idx >= 0) play_track_at(next_idx);
+    else plugin_manager_notify_queue_exhausted(direction);
 }
 
 lv_obj_t * gui_player_get_screen(void) {

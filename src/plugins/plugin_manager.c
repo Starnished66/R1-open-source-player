@@ -3107,6 +3107,7 @@ typedef enum {
     PLUGIN_EVENT_RESUMED,
     PLUGIN_EVENT_STOPPED,
     PLUGIN_EVENT_SCREEN_WOKE,
+    PLUGIN_EVENT_QUEUE_EXHAUSTED,
     PLUGIN_EVENT_COUNT,
 } plugin_event_t;
 
@@ -3128,7 +3129,8 @@ static int l_plugin_on(lua_State * L) {
     else if (strcmp(event, "resumed") == 0) idx = PLUGIN_EVENT_RESUMED;
     else if (strcmp(event, "stopped") == 0) idx = PLUGIN_EVENT_STOPPED;
     else if (strcmp(event, "screen_woke") == 0) idx = PLUGIN_EVENT_SCREEN_WOKE;
-    else return luaL_error(L, "plugin.on: unknown event '%s' (expected \"track_started\", \"paused\", \"resumed\", \"stopped\", or \"screen_woke\")", event);
+    else if (strcmp(event, "queue_exhausted") == 0) idx = PLUGIN_EVENT_QUEUE_EXHAUSTED;
+    else return luaL_error(L, "plugin.on: unknown event '%s' (expected \"track_started\", \"paused\", \"resumed\", \"stopped\", \"screen_woke\", or \"queue_exhausted\")", event);
 
     if (plugin_event_subscriber_count[idx] >= PLUGIN_MAX_EVENT_SUBSCRIBERS) {
         return luaL_error(L, "plugin.on: too many subscribers registered for \"%s\" (max %d)", event,
@@ -4720,6 +4722,19 @@ void plugin_manager_notify_stopped(void) {
 
 void plugin_manager_notify_screen_woke(void) {
     notify_event_no_args(PLUGIN_EVENT_SCREEN_WOKE, "screen_woke");
+}
+
+void plugin_manager_notify_queue_exhausted(int direction) {
+    for (int i = 0; i < plugin_event_subscriber_count[PLUGIN_EVENT_QUEUE_EXHAUSTED]; i++) {
+        plugin_event_subscriber_t * sub = &plugin_event_subscribers[PLUGIN_EVENT_QUEUE_EXHAUSTED][i];
+        lua_rawgeti(sub->L, LUA_REGISTRYINDEX, sub->ref);
+        lua_pushnumber(sub->L, direction);
+        if (plugin_call(sub->L, 1, 0, 0) != LUA_OK) {
+            const char * err = lua_tostring(sub->L, -1);
+            fprintf(stderr, "[plugins] queue_exhausted handler error: %s\n", err ? err : "unknown error");
+            lua_pop(sub->L, 1);
+        }
+    }
 }
 
 void plugin_manager_interval_fired(int slot) {

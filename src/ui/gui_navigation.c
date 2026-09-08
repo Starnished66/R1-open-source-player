@@ -19,6 +19,7 @@
 #include "assets.h"
 #include "device_config.h"
 #include "transition_compositor.h"
+#include "db_log.h"
 
 static lv_obj_t * nav_stack[NAV_STACK_MAX] = { NULL };
 static int nav_depth = 0;
@@ -369,10 +370,10 @@ static void sync_home_indicator_visibility(lv_obj_t * screen) {
                                          screen != gui_lock_screen_get_screen());
 }
 
-/* The interactive player swipe state (player_swipe_candidate,
- * player_swipe_tracking, player_swipe_ctx) is maintained in gui_shell.c.
- * gui_shell_player_swipe_recover() is called below to reset that state
- * directly on compositor failures. */
+/* Interactive swipe state (player_swipe_* and back_swipe_*) lives in
+ * gui_shell.c. gui_shell_player_swipe_recover() resets both on compositor
+ * failures so a freed slide_transition_ctx_t cannot be driven from a
+ * still-set tracking pointer. */
 
 /* Defers a full invalidation until the next lv_timer_handler() pass,
  * avoiding a re-entrant lv_refr_now() from within an animation or timer
@@ -425,8 +426,13 @@ void slide_transition_anim_x_cb(void * var, int32_t v) {
         }
         return;
     }
-    lv_obj_set_x(ctx->img_from, v);
-    lv_obj_set_x(ctx->img_to, v + ctx->to_offset);
+    if (ctx->vertical) {
+        lv_obj_set_y(ctx->img_from, v);
+        if (!ctx->reveal) lv_obj_set_y(ctx->img_to, v + ctx->to_offset);
+    } else {
+        lv_obj_set_x(ctx->img_from, v);
+        if (!ctx->reveal) lv_obj_set_x(ctx->img_to, v + ctx->to_offset);
+    }
 }
 
 void slide_transition_done_cb(lv_anim_t * a) {
@@ -533,6 +539,10 @@ void slide_transition_cancel(slide_transition_ctx_t ** pctx) {
  * compositing is active, the physical pages ping-pong every frame, which
  * would create an overlapping read/write hazard with an aliased source. */
 slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward) {
+    return begin_slide_transition_ex(to_scr, forward, false, false);
+}
+
+slide_transition_ctx_t * begin_slide_transition_ex(lv_obj_t * to_scr, bool forward, bool vertical, bool reveal) {
 #ifdef UI_PERF_TRACE
     uint64_t perf_begin_us = ui_perf_now_us();
     uint64_t perf_to_done_us;
@@ -630,20 +640,26 @@ slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward)
         return NULL;
     }
 
-    int32_t to_offset = forward ? w : -w;
+    int32_t to_offset = vertical ? (forward ? h : -h) : (forward ? w : -w);
     ctx->buf_from = buf_from;
     ctx->buf_to = buf_to;
     ctx->from_scr = from_scr;
     ctx->to_scr = to_scr;
     ctx->to_offset = to_offset;
+    ctx->vertical = vertical;
+    ctx->reveal = reveal;
 
     slide_transition_active = true;
 
     /* Handoff transition to the direct-framebuffer compositor before
      * creating LVGL overlay/image objects. Skipping overlay objects when
      * the compositor takes over avoids queuing initial-draw invalidations
-     * that could flash during compositing. */
-    if (transition_compositor_begin(buf_from, buf_to, to_offset)) {
+     * that could flash during compositing. The compositor's fast path is
+     * horizontal-only (see transition_compositor.c) and always draws the
+     * plain two-panel slide -- it has no concept of reveal, so a reveal
+     * request must always fall through to the LVGL-overlay branch below,
+     * same as a vertical slide does. */
+    if (!vertical && !reveal && transition_compositor_begin(buf_from, buf_to, to_offset)) {
         ctx->overlay = NULL;
         ctx->img_from = NULL;
         ctx->img_to = NULL;
@@ -679,7 +695,18 @@ slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward)
 
         lv_obj_t * img_to = lv_image_create(overlay);
         lv_image_set_src(img_to, buf_to);
-        lv_obj_set_pos(img_to, to_offset, 0);
+        /* reveal: destination starts (and stays, see slide_transition_anim_
+         * x_cb()) at (0,0) -- already "in place," uncovered as img_from
+         * slides away over it, rather than sliding in from the offset. */
+        lv_obj_set_pos(img_to, reveal ? 0 : (vertical ? 0 : to_offset),
+                              reveal ? 0 : (vertical ? to_offset : 0));
+        /* img_to is added after img_from, so LVGL draws it on top by
+         * default -- irrelevant for the two-panel slide (the two images
+         * never overlap, always exactly adjacent), but reveal keeps img_to
+         * stationary directly underneath img_from for the whole gesture, so
+         * img_from must stay the top child or Home would show through
+         * immediately instead of being uncovered as it slides away. */
+        if (reveal) lv_obj_move_foreground(img_from);
 
         ctx->overlay = overlay;
         ctx->img_from = img_from;
@@ -756,6 +783,10 @@ void nav_pop(void) {
     screen_transition_slide(nav_stack[nav_depth - 1], false);
 }
 
+void nav_pop_stack_only(void) {
+    if (nav_depth > 1) nav_depth--;
+}
+
 /* Splices the stack slot at `index` out entirely (shifting everything
  * above it down by one), with no screen load of any kind -- used when a
  * transient interstitial screen (Wi-Fi/Subsonic's "Connecting..."/
@@ -779,6 +810,11 @@ void nav_reset_to_home(void) {
     lv_screen_load(gui_shell_get_home_screen());
     sync_player_topbar_visibility(gui_shell_get_home_screen());
     sync_home_indicator_visibility(gui_shell_get_home_screen());
+}
+
+void nav_reset_to_home_stack_only(void) {
+    nav_depth = 1;
+    nav_stack[0] = gui_shell_get_home_screen();
 }
 
 /* Shared back-button handler for every screen built via the reusable
@@ -842,8 +878,18 @@ static void screen_gesture_event_cb(lv_event_t * e) {
     if (active_press_is_over_drag_adjust_widget() || point_in_swipe_dead_zone(gesture_press_point)) return;
 
     lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    /* poll_quick_drawer_drag()'s back_swipe_* already owns this whole press
+     * once it judges the press eligible at press-down -- see gui_shell.c's
+     * own comment on gui_shell_back_swipe_owns_press() for why this check,
+     * not just wait_release() at deadzone-confirm time, is what actually
+     * prevents double-handling: LVGL's own gesture recognition can dispatch
+     * LV_EVENT_GESTURE for this same press before that poll-based deadzone
+     * has had a tick to confirm, on a fast enough swipe. */
+    if (dir == LV_DIR_RIGHT && gui_shell_back_swipe_owns_press()) return;
     if (dir == LV_DIR_RIGHT) {
         lv_obj_t * active_screen = lv_screen_active();
+        DB_LOG("GESTURE", "screen_gesture_event_cb RIGHT fired screen=%s",
+               active_screen == gui_library_get_files_screen() ? "files" : "other");
         if (!search_close_if_active_for_screen(active_screen) &&
             !file_browser_back_if_not_root_for_screen(active_screen)) {
             nav_pop();
@@ -856,12 +902,12 @@ static void screen_gesture_event_cb(lv_event_t * e) {
          * stops that bleed-through. */
         lv_indev_wait_release(indev);
     }
-    /* Interactive swipe-left to player is handled in poll_quick_drawer_drag()
-     * before the built-in gesture threshold.
-     *
-     * Swipe-up-to-Home is handled exclusively in home_indicator_gesture_cb()
-     * (see build_home_indicator_bar()) so it only fires from drags starting
-     * within the reserved bottom indicator band. */
+    /* Interactive swipe-left to player, swipe-right to back, and swipe-up
+     * to Home are all handled in poll_quick_drawer_drag() before the
+     * built-in gesture threshold -- see its own home_swipe_, back_swipe_,
+     * and player_swipe_ state. The Home gesture only fires from drags
+     * starting within the reserved bottom indicator band
+     * (build_home_indicator_bar()). */
 }
 
 /* Finishing touch every build_XXX_screen() calls just before returning: wire

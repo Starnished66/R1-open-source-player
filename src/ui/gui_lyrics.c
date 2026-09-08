@@ -634,23 +634,28 @@ static void lyrics_row_click_cb(lv_event_t * e) {
  * regardless (see launch_lyrics_backdrop_decode()'s own comment), so this
  * costs nothing new on re-entry beyond that already-accepted, already-
  * documented gap. */
-static void close_lyrics_screen(void) {
+void gui_lyrics_prepare_exit(void) {
     lv_timer_pause(lyrics_timer);
     lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void close_lyrics_screen(void) {
+    gui_lyrics_prepare_exit();
     nav_pop();
 }
 
-/* The ONLY way a user directly leaves this screen -- see build_lyrics_
- * screen()'s own header comment for why this isn't the shared screen_
- * gesture_event_cb() (no animation here, and no left-swipe-to-player
- * handling to speak of since poll_quick_drawer_drag() already excludes
- * lyrics_screen from that gesture entirely). close_lyrics_screen() itself
- * manipulates nav_depth/nav_stack directly via nav_pop(), the same
- * bookkeeping a normal screen's back gesture does. */
+/* The auto-close-on-track-change-with-no-lyrics path (lyrics_timer_cb())
+ * still calls close_lyrics_screen() directly. A user's own right-swipe now
+ * goes through gui_shell.c's live back-swipe instead (reveal-style, exiting
+ * to Player) once that candidate claims the press -- see gui_shell_back_
+ * swipe_owns_press()'s own comment for why standing down here, not just
+ * wait_release() at gesture-recognition time, is what actually prevents
+ * double-handling on real hardware. */
 static void lyrics_gesture_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
     lv_indev_t * indev = lv_indev_active();
     if (!indev || lv_indev_get_gesture_dir(indev) != LV_DIR_RIGHT) return;
+    if (gui_shell_back_swipe_owns_press()) return;
 
     lv_indev_wait_release(indev); /* same reasoning as screen_gesture_event_cb's own comment -- avoid a phantom tap landing on the player screen under the still-down finger */
     close_lyrics_screen();
@@ -700,7 +705,22 @@ static void lyrics_timer_cb(lv_timer_t * timer) {
              * first tick, so this branch only ever fires for a genuine
              * track change while already open, never the initial open of a
              * track that already has no lyrics (that case still shows the
-             * placeholder, unchanged). */
+             * placeholder, unchanged).
+             *
+             * Real bug caught in cross-check: close_lyrics_screen() calls
+             * nav_pop(), which does a REAL stack decrement and its own
+             * screen_transition_slide(). A user's live back-swipe (still
+             * being dragged, gui_shell.c's back_swipe_tracking) already has
+             * slide_transition_active set, so that nested transition would
+             * return NULL and fall back to an immediate lv_screen_load()
+             * out from under the still-live-dragged overlay -- and the
+             * back-swipe's own nav_pop_stack_only() at release would then
+             * double-decrement the stack (commit) or strand a
+             * paused/hidden Lyrics screen that's no longer even on the
+             * stack (cancel). Defer instead: the condition above isn't
+             * consumed by this early return, so it retries every tick
+             * until the gesture resolves and this fires cleanly. */
+            if (gui_navigation_transition_in_progress()) return;
             close_lyrics_screen();
             return;
         }

@@ -11,12 +11,14 @@
 #include "gui_network.h"
 #include "gui_lyrics.h"
 #include "gui_track_info.h"
+#include "gui_text_input.h"
 #include "gui_navigation.h"
 #include "gui_lock_screen.h"
 #include "gesture_detector.h"
 #include "screen_builders.h"
 #include "transition_compositor.h"
 #include "metadata.h"
+#include "db_log.h"
 #include "audio.h"
 #include "settings.h"
 #include "assets.h"
@@ -1214,7 +1216,7 @@ static void poll_refresh_bt_icon(void) {
  * living on lv_layer_top() (drawn above every screen) so a swipe-up
  * starting there is caught by this object.
  * Position tracking is handled via raw coordinate polling in
- * poll_quick_drawer_drag() / gesture_home_state_poll(). */
+ * poll_quick_drawer_drag() / gesture_home_state_is_eligible(). */
 
 static void build_home_indicator_bar(void) {
     lv_obj_t * top = lv_layer_top();
@@ -1604,8 +1606,23 @@ static int32_t quick_drawer_last_velocity = 0;
 #define QUICK_DRAWER_FLICK_VELOCITY 12 /* px/tick (~750px/s at the ~16ms poll rate) -- fast enough to read as an intentional flick */
 #define QUICK_DRAWER_DRAG_DEADZONE 10 /* matches LVGL's own LV_INDEV_DEF_SCROLL_LIMIT -- see poll_quick_drawer_drag()'s comment */
 
-/* Home-indicator swipe-up tracking state machine -- see gesture_detector.h. */
-static gesture_home_state_t s_home_gesture_state = { 0 };
+/* Swipe-up-to-Home tracking -- same live per-tick overlay as player_swipe_*
+ * below, but vertical and sliding up from the bottom edge. Eligibility
+ * (band/overlay/lyrics/lock-screen exclusions) is still gesture_detector.h's
+ * gesture_home_state_is_eligible() -- gui_lock_screen.c's own independent
+ * swipe-up-to-dismiss still uses gesture_home_state_poll()/state_t directly,
+ * so that machinery stays in place; this only replaces how gui_shell.c
+ * itself consumes eligibility, trading a fixed post-threshold instant cut
+ * for the same candidate/tracking live-drag shape as the other two gestures. */
+static bool home_swipe_candidate = false;
+static bool home_swipe_tracking = false;
+static int32_t home_swipe_touch_start_x = 0;
+static int32_t home_swipe_touch_start_y = 0;
+static int32_t home_swipe_last_v = 0;
+static int32_t home_swipe_last_velocity = 0;
+static slide_transition_ctx_t * home_swipe_ctx = NULL;
+#define HOME_SWIPE_DEADZONE 20 /* same scale/reasoning as PLAYER_SWIPE_DEADZONE/BACK_SWIPE_DEADZONE */
+#define HOME_SWIPE_FLICK_VELOCITY 12 /* same scale/reasoning as PLAYER_SWIPE_FLICK_VELOCITY */
 
 /* Swipe-left-to-player tracking -- same "raw indev polling, own dedicated
  * fast timer" reasoning as poll_quick_drawer_drag()'s own doc comment,
@@ -1620,8 +1637,9 @@ static gesture_home_state_t s_home_gesture_state = { 0 };
  * direction, then either confirmed (player_swipe_tracking, the overlay
  * gets built and starts following the finger) or abandoned, letting the
  * press fall through as whatever else it actually was (a tap, a vertical
- * scroll, or the existing swipe-RIGHT-to-back gesture, still handled the
- * old event-based way since only entering the player needed this). */
+ * scroll, or a rightward back-swipe -- that one has its own live-tracking
+ * state machine below. screen_gesture_event_cb()'s event-based right-swipe
+ * remains the fallback for presses that state machine rejects). */
 static bool player_swipe_candidate = false;
 static bool player_swipe_tracking = false;
 static int32_t player_swipe_touch_start_x = 0;
@@ -1631,6 +1649,41 @@ static int32_t player_swipe_last_velocity = 0;
 static slide_transition_ctx_t * player_swipe_ctx = NULL;
 #define PLAYER_SWIPE_DEADZONE 20 /* px before judging direction -- comfortably under LVGL's own ~50px built-in gesture threshold (LV_INDEV_DEF_GESTURE_LIMIT) so this always claims a genuine left-swipe before LVGL's own dormant gesture recognition would have */
 #define PLAYER_SWIPE_FLICK_VELOCITY 12 /* same scale/reasoning as QUICK_DRAWER_FLICK_VELOCITY */
+
+/* Swipe-right-to-go-back -- same live per-tick overlay as player_swipe_*
+ * above, mirrored in sign. Provisional until BACK_SWIPE_DEADZONE so a
+ * leftward player-swipe or a vertical scroll can still claim the press.
+ * screen_gesture_event_cb()'s LV_DIR_RIGHT -> nav_pop() path stays as
+ * the fallback for presses this candidate rejects (excluded screens,
+ * dead zones, depth == 1). Unlike player-swipe's own left-swipe (which has
+ * no competing consumer -- screen_gesture_event_cb only ever acts on
+ * LV_DIR_RIGHT), this candidate genuinely races LVGL's own native gesture
+ * recognition for the exact same direction: on real hardware, a fast swipe
+ * can cross LVGL's own internal gesture threshold and dispatch
+ * LV_EVENT_GESTURE before this poll-based BACK_SWIPE_DEADZONE confirms on
+ * its own next tick, so wait_release() alone does not reliably win that
+ * race (confirmed via on-device logging -- both fired for the same
+ * continued drag, each independently acting on directory depth). back_swipe_
+ * owns_press below is the actual mutual-exclusion mechanism: latched true
+ * at press-down whenever this press is eligible at all (regardless of
+ * whether the deadzone ever confirms a direction), and checked by
+ * gui_shell_back_swipe_owns_press() so screen_gesture_event_cb can
+ * unconditionally stand down for the whole press rather than trust timing. */
+static bool back_swipe_candidate = false;
+static bool back_swipe_owns_press = false;
+static bool back_swipe_tracking = false;
+static int32_t back_swipe_touch_start_x = 0;
+static int32_t back_swipe_touch_start_y = 0;
+static int32_t back_swipe_last_v = 0;
+static int32_t back_swipe_last_velocity = 0;
+static slide_transition_ctx_t * back_swipe_ctx = NULL;
+static lv_obj_t * back_swipe_target_scr = NULL;
+#define BACK_SWIPE_DEADZONE 20 /* same scale/reasoning as PLAYER_SWIPE_DEADZONE */
+#define BACK_SWIPE_FLICK_VELOCITY 12 /* same scale/reasoning as PLAYER_SWIPE_FLICK_VELOCITY */
+
+bool gui_shell_back_swipe_owns_press(void) {
+    return back_swipe_owns_press;
+}
 
 /* Forward declarations -- both fully built later in this file, needed here
  * so poll_quick_drawer_drag() below can exclude the home-swipe gesture
@@ -1856,22 +1909,6 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                                   gui_player_volume_control_hit_test(p);
     }
 
-    gesture_home_config_t home_cfg;
-    home_cfg.swipe_up_home_enabled = current_settings.swipe_up_home_enabled;
-    home_cfg.quick_drawer_open = quick_drawer_open;
-    home_cfg.is_bt_dac_overlay = (lv_screen_active() == gui_network_get_bt_dac_overlay());
-    home_cfg.is_usb_dac_overlay = (lv_screen_active() == gui_network_get_usb_dac_overlay());
-    home_cfg.is_lyrics_screen = (lv_screen_active() == gui_lyrics_get_screen());
-    home_cfg.is_lock_screen = (lv_screen_active() == gui_lock_screen_get_screen());
-    home_cfg.has_background_work = gui_library_navigation_blocked();
-    home_cfg.screen_height = h;
-    /* Slightly expand only the raw press-down target. The overlay band and
-     * its visible pill retain their existing dimensions. */
-    home_cfg.band_height = HOME_INDICATOR_BAND_HEIGHT + HOME_SWIPE_HIT_EXTRA_PX;
-
-    bool home_trigger = gesture_home_state_poll(&s_home_gesture_state, &home_cfg,
-                                                pressed && !drag_adjust_press_owned, p.y);
-
     if (pressed && !quick_drawer_was_pressed) {
         /* Cancel any release-snap animation still in flight to prevent it
          * from fighting a newly started drag. */
@@ -1902,18 +1939,38 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         quick_drawer_drag_claimed = false;
         quick_drawer_drag_touch_start_y = p.y;
 
+        gesture_home_config_t home_cfg;
+        home_cfg.swipe_up_home_enabled = current_settings.swipe_up_home_enabled;
+        home_cfg.quick_drawer_open = quick_drawer_open;
+        home_cfg.is_bt_dac_overlay = (lv_screen_active() == gui_network_get_bt_dac_overlay());
+        home_cfg.is_usb_dac_overlay = (lv_screen_active() == gui_network_get_usb_dac_overlay());
+        home_cfg.is_lyrics_screen = (lv_screen_active() == gui_lyrics_get_screen());
+        home_cfg.is_lock_screen = (lv_screen_active() == gui_lock_screen_get_screen());
+        home_cfg.has_background_work = gui_library_navigation_blocked();
+        home_cfg.screen_height = h;
+        /* Slightly expand only the raw press-down target. The overlay band and
+         * its visible pill retain their existing dimensions. */
+        home_cfg.band_height = HOME_INDICATOR_BAND_HEIGHT + HOME_SWIPE_HIT_EXTRA_PX;
+
+        /* gesture_home_config_t's fields are shared with gui_lock_screen.c's
+         * own independent use of gesture_home_state_is_eligible(), which
+         * doesn't need these -- same reasoning as back-swipe's own
+         * exclusions just above: text-entry, Import via Wi-Fi, and the busy
+         * overlay all skip finalize_screen_navigation() because leaving
+         * them needs teardown (in-progress input, import_web_stop(),
+         * modal ownership) that a stack-only reset to Home would bypass. */
+        home_swipe_candidate = !drag_adjust_press_owned && gesture_home_state_is_eligible(&home_cfg, p.y) &&
+                                lv_screen_active() != gui_text_input_get_screen() &&
+                                lv_screen_active() != gui_network_get_import_wifi_screen() &&
+                                lv_screen_active() != gui_busy_get_screen();
+        home_swipe_touch_start_x = p.x;
+        home_swipe_touch_start_y = p.y;
+        home_swipe_tracking = false;
+
 #ifdef UI_GESTURE_TRACE
         printf("[GESTURE_TRACE] poll: press-down at (%d, %d), res_h=%d\n", (int)p.x, (int)p.y, (int)h);
-        printf("[GESTURE_TRACE] poll: home_swipe eval: enabled=%d, drawer_open=%d, bt_dac=%d, usb_dac=%d, lyrics=%d, bg_work=%d, in_band=%d (y=%d >= %d) -> tracking=%d\n",
-               home_cfg.swipe_up_home_enabled,
-               home_cfg.quick_drawer_open,
-               home_cfg.is_bt_dac_overlay,
-               home_cfg.is_usb_dac_overlay,
-               home_cfg.is_lyrics_screen,
-               home_cfg.has_background_work,
-               p.y >= h - home_cfg.band_height,
-               (int)p.y, (int)(h - home_cfg.band_height),
-               s_home_gesture_state.tracking);
+        printf("[GESTURE_TRACE] poll: home_swipe eval: enabled=%d, tracking=%d\n",
+               current_settings.swipe_up_home_enabled, home_swipe_candidate);
 #endif
 
         /* Player-swipe: eligible unless claimed by the drawer drag, the drawer
@@ -1931,15 +1988,76 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         player_swipe_touch_start_x = p.x;
         player_swipe_touch_start_y = p.y;
         player_swipe_tracking = false;
+
+        /* Depth > 1 is the stack-pop precondition. Lyrics owns its own
+         * right-swipe (lyrics_gesture_event_cb -> close_lyrics_screen).
+         * Lock, text-entry, both DAC overlays, Import via Wi-Fi, and the
+         * busy overlay skip finalize_screen_navigation() -- a live pop
+         * here would bypass their leave-confirmation, teardown, or
+         * modal-ownership. Same drawer/dead-zone/drag-adjust exclusions
+         * as player-swipe: a slider drag must never become a back-swipe.
+         * Lyrics is NOT excluded -- it now uses this same live-tracking
+         * swipe-back (reveal-style, exiting to Player) instead of its own
+         * lyrics_gesture_event_cb()'s plain nav_pop(); that handler still
+         * exists for the auto-close-on-track-change-with-no-lyrics path,
+         * but stands down for a user swipe once this candidate owns the
+         * press (see gui_shell_back_swipe_owns_press()). */
+        back_swipe_candidate = !quick_drawer_drag_tracking && !quick_drawer_open &&
+                                gui_navigation_get_depth() > 1 &&
+                                lv_screen_active() != gui_lock_screen_get_screen() &&
+                                lv_screen_active() != gui_text_input_get_screen() &&
+                                lv_screen_active() != gui_network_get_usb_dac_overlay() &&
+                                lv_screen_active() != gui_network_get_bt_dac_overlay() &&
+                                lv_screen_active() != gui_network_get_import_wifi_screen() &&
+                                lv_screen_active() != gui_busy_get_screen() &&
+                                !gui_library_navigation_blocked() &&
+                                !player_swipe_press_excluded(p);
+        back_swipe_touch_start_x = p.x;
+        back_swipe_touch_start_y = p.y;
+        back_swipe_tracking = false;
+        back_swipe_owns_press = back_swipe_candidate;
+        DB_LOG("GESTURE", "back_swipe_candidate=%d screen=%s depth=%d",
+               back_swipe_candidate,
+               lv_screen_active() == gui_library_get_files_screen() ? "files" : "other",
+               gui_navigation_get_depth());
     }
 
-    if (home_trigger) {
+    if (pressed && home_swipe_candidate && !home_swipe_tracking && !player_swipe_tracking && !back_swipe_tracking) {
+        int32_t dx = p.x - home_swipe_touch_start_x;
+        int32_t dy = p.y - home_swipe_touch_start_y;
+        int32_t adx = dx < 0 ? -dx : dx;
+        int32_t ady = dy < 0 ? -dy : dy;
+        if (adx >= HOME_SWIPE_DEADZONE || ady >= HOME_SWIPE_DEADZONE) {
+            if (dy < 0 && ady > adx) {
+                /* EXPERIMENTAL reveal=true (see gui_navigation.h's own
+                 * comment on slide_transition_ctx_t's reveal field): Home
+                 * stays static, uncovered as the current screen slides up
+                 * over it, instead of both panels moving together. A/B
+                 * test against the two-panel style back-swipe/player-swipe
+                 * still use -- not yet settled as the final behavior. */
+                home_swipe_ctx = begin_slide_transition_ex(gui_shell_get_home_screen(), true, true, true);
+                if (home_swipe_ctx) {
+                    /* No navigation decision exists until release. A
+                     * compositor failure during the live drag therefore
+                     * recovers to from_scr and leaves the stack untouched. */
+                    home_swipe_ctx->commit = false;
+                    home_swipe_tracking = true;
+                    home_swipe_last_v = 0;
+                    home_swipe_last_velocity = 0;
 #ifdef UI_GESTURE_TRACE
-        printf("[GESTURE_TRACE] poll: home_swipe TRIGGERED at dy=%d >= %d (start_y=%d, cur_y=%d)\n",
-               (int)(s_home_gesture_state.start_y - p.y), HOME_SWIPE_UP_THRESHOLD, (int)s_home_gesture_state.start_y, (int)p.y);
+                    printf("[GESTURE_TRACE] poll: home_swipe TRIGGERED (start_y=%d, cur_y=%d)\n",
+                           (int)home_swipe_touch_start_y, (int)p.y);
 #endif
-        lv_indev_wait_release(indev);
-        nav_reset_to_home();
+                    lv_indev_wait_release(indev);
+                }
+            } else if (adx > ady && !lv_indev_get_scroll_obj(indev)) {
+                /* Same non-scrollable drag tap suppression as player-swipe/
+                 * back-swipe, mirrored for a horizontal drag ruling out a
+                 * vertical home-swipe. */
+                lv_indev_wait_release(indev);
+            }
+            home_swipe_candidate = false;
+        }
     }
 
     if (pressed && player_swipe_candidate && !player_swipe_tracking) {
@@ -1980,6 +2098,71 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         }
     }
 
+    if (pressed && back_swipe_candidate && !back_swipe_tracking && !player_swipe_tracking) {
+        int32_t dx = p.x - back_swipe_touch_start_x;
+        int32_t dy = p.y - back_swipe_touch_start_y;
+        int32_t adx = dx < 0 ? -dx : dx;
+        int32_t ady = dy < 0 ? -dy : dy;
+        if (adx >= BACK_SWIPE_DEADZONE || ady >= BACK_SWIPE_DEADZONE) {
+            if (dx > 0 && adx > ady) {
+                lv_obj_t * active = lv_screen_active();
+                /* Search-open and Files-not-at-root consume a right-swipe
+                 * as in-screen back (close the bar / step up a directory)
+                 * rather than a stack pop. Dispatch those here so this
+                 * path cannot steal them into a slide; wait_release so
+                 * the still-down finger cannot also fire
+                 * screen_gesture_event_cb's leftover fallback (which
+                 * would then nav_pop after search already closed). */
+                bool consumed_in_place = search_close_if_active_for_screen(active) ||
+                                         file_browser_back_if_not_root_for_screen(active);
+                DB_LOG("GESTURE", "back_swipe confirm screen=%s in_place=%d",
+                       active == gui_library_get_files_screen() ? "files" : "other", consumed_in_place);
+                if (consumed_in_place) {
+                    lv_indev_wait_release(indev);
+                } else {
+                    back_swipe_target_scr = gui_navigation_get_screen_at(gui_navigation_get_depth() - 2);
+                    if (back_swipe_target_scr) {
+                        /* Reveal-style everywhere except leaving the Player
+                         * screen itself, which keeps the original two-panel
+                         * slide -- see ISSUES.md's swipe-up-to-Home to-do
+                         * entry for the same reveal field, still an active
+                         * A/B test rather than settled for every gesture. */
+                        bool reveal = active != gui_player_get_screen();
+                        back_swipe_ctx = begin_slide_transition_ex(back_swipe_target_scr, false, false, reveal);
+                        DB_LOG("GESTURE", "back_swipe slide target=%p ctx=%p",
+                               (void *) back_swipe_target_scr, (void *) back_swipe_ctx);
+                        if (back_swipe_ctx) {
+                            /* No navigation decision exists until release.
+                             * A compositor failure during the live drag
+                             * therefore recovers to from_scr and leaves
+                             * the stack untouched. */
+                            back_swipe_ctx->commit = false;
+                            back_swipe_tracking = true;
+                            back_swipe_last_v = 0;
+                            back_swipe_last_velocity = 0;
+                            lv_indev_wait_release(indev);
+                        }
+                    }
+                }
+            } else if (ady > adx && !lv_indev_get_scroll_obj(indev)) {
+                /* Same non-scrollable vertical-drag tap suppression as
+                 * player-swipe. Harmless if that path already called
+                 * wait_release on this press. */
+                lv_indev_wait_release(indev);
+            }
+            back_swipe_candidate = false;
+        }
+    }
+
+    if (pressed && home_swipe_tracking) {
+        int32_t v = p.y - home_swipe_touch_start_y;
+        if (v > 0) v = 0;  /* never past fully-closed (finger drifting back down just holds at 0) */
+        if (v < -h) v = -h; /* never past fully-off (finger overshooting up of a full screen height) */
+        home_swipe_last_velocity = v - home_swipe_last_v;
+        home_swipe_last_v = v;
+        slide_transition_anim_x_cb(home_swipe_ctx, v);
+    }
+
     if (pressed && player_swipe_tracking) {
         int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
         int32_t v = p.x - player_swipe_touch_start_x;
@@ -1988,6 +2171,16 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         player_swipe_last_velocity = v - player_swipe_last_v;
         player_swipe_last_v = v;
         slide_transition_anim_x_cb(player_swipe_ctx, v);
+    }
+
+    if (pressed && back_swipe_tracking) {
+        int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
+        int32_t v = p.x - back_swipe_touch_start_x;
+        if (v < 0) v = 0;  /* never past fully-closed (finger drifting back left of the start point just holds at 0) */
+        if (v > w) v = w;  /* never past fully-off (finger overshooting right of a full screen width) */
+        back_swipe_last_velocity = v - back_swipe_last_v;
+        back_swipe_last_v = v;
+        slide_transition_anim_x_cb(back_swipe_ctx, v);
     }
 
     if (pressed && quick_drawer_drag_tracking) {
@@ -2050,6 +2243,37 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         }
     }
 
+    if (!pressed && quick_drawer_was_pressed && home_swipe_tracking) {
+        home_swipe_tracking = false;
+        int32_t current_v = home_swipe_last_v;
+        bool commit;
+        if (home_swipe_last_velocity < -HOME_SWIPE_FLICK_VELOCITY) {
+            commit = true; /* still moving up fast at release */
+        } else if (home_swipe_last_velocity > HOME_SWIPE_FLICK_VELOCITY) {
+            commit = false; /* still moving back down fast at release */
+        } else {
+            commit = current_v < -h / 2; /* past halfway, slow/undecided release */
+        }
+        home_swipe_ctx->commit = commit;
+        if (commit) {
+            /* Stack-only bookkeeping -- actual lv_screen_load() waits for
+             * slide_transition_done_cb(). Cancel leaves the stack
+             * untouched, matching player-swipe/back-swipe's own cancel path. */
+            nav_reset_to_home_stack_only();
+        }
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, home_swipe_ctx);
+        lv_anim_set_user_data(&a, home_swipe_ctx);
+        lv_anim_set_values(&a, current_v, commit ? -h : 0);
+        lv_anim_set_duration(&a, QUICK_DRAWER_ANIM_MS);
+        lv_anim_set_exec_cb(&a, slide_transition_anim_x_cb);
+        lv_anim_set_completed_cb(&a, slide_transition_done_cb);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+        home_swipe_ctx = NULL;
+    }
+
     if (!pressed && quick_drawer_was_pressed && player_swipe_tracking) {
         /* Finger lifted mid-swipe. Same flick-vs-halfway decision as the
          * drawer's own release logic just above, just horizontal. */
@@ -2090,12 +2314,53 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         player_swipe_ctx = NULL;
     }
 
+    if (!pressed && quick_drawer_was_pressed && back_swipe_tracking) {
+        back_swipe_tracking = false;
+        int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
+        int32_t current_v = back_swipe_last_v;
+        bool commit;
+        if (back_swipe_last_velocity > BACK_SWIPE_FLICK_VELOCITY) {
+            commit = true; /* still moving right fast at release */
+        } else if (back_swipe_last_velocity < -BACK_SWIPE_FLICK_VELOCITY) {
+            commit = false; /* still moving back left fast at release */
+        } else {
+            commit = current_v > w / 2; /* past halfway, slow/undecided release */
+        }
+        back_swipe_ctx->commit = commit;
+        if (commit) {
+            /* Stack-only bookkeeping -- actual lv_screen_load() waits for
+             * slide_transition_done_cb(). Cancel leaves the stack
+             * untouched, matching player-swipe's own cancel path. */
+            nav_pop_stack_only();
+            /* Lyrics' own timer/backdrop teardown, normally done by
+             * close_lyrics_screen() -- skipped entirely on cancel, since a
+             * cancelled swipe leaves the user back on Lyrics with both
+             * still needed. */
+            if (back_swipe_ctx->from_scr == gui_lyrics_get_screen()) gui_lyrics_prepare_exit();
+        }
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, back_swipe_ctx);
+        lv_anim_set_user_data(&a, back_swipe_ctx);
+        lv_anim_set_values(&a, current_v, commit ? w : 0);
+        lv_anim_set_duration(&a, QUICK_DRAWER_ANIM_MS);
+        lv_anim_set_exec_cb(&a, slide_transition_anim_x_cb);
+        lv_anim_set_completed_cb(&a, slide_transition_done_cb);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+        back_swipe_ctx = NULL;
+        back_swipe_target_scr = NULL;
+    }
+
     if (!pressed && quick_drawer_was_pressed) {
 #ifdef UI_GESTURE_TRACE
-        printf("[GESTURE_TRACE] poll: release observed (home_tracking=%d, home_triggered=%d, drawer_tracking=%d, player_tracking=%d)\n",
-               s_home_gesture_state.tracking, s_home_gesture_state.triggered, quick_drawer_drag_tracking, player_swipe_tracking);
+        printf("[GESTURE_TRACE] poll: release observed (home_tracking=%d, drawer_tracking=%d, player_tracking=%d, back_tracking=%d)\n",
+               home_swipe_tracking, quick_drawer_drag_tracking, player_swipe_tracking, back_swipe_tracking);
 #endif
         player_swipe_candidate = false;
+        back_swipe_candidate = false;
+        back_swipe_owns_press = false;
+        home_swipe_candidate = false;
     }
 
     quick_drawer_was_pressed = pressed;
@@ -3087,7 +3352,7 @@ void gui_shell_resume_fast_timers(void) {
 void gui_shell_reset_drag_state(void) {
 #ifdef UI_GESTURE_TRACE
     printf("[GESTURE_TRACE] reset_drag_state called (was_pressed=%d, home_tracking=%d, drawer_tracking=%d, player_tracking=%d)\n",
-           quick_drawer_was_pressed, s_home_gesture_state.tracking, quick_drawer_drag_tracking, player_swipe_tracking);
+           quick_drawer_was_pressed, home_swipe_tracking, quick_drawer_drag_tracking, player_swipe_tracking);
 #endif
     quick_drawer_was_pressed = false;
     quick_drawer_drag_tracking = false;
@@ -3095,7 +3360,11 @@ void gui_shell_reset_drag_state(void) {
     quick_drawer_drag_claimed = false;
     quick_drawer_last_velocity = 0;
 
-    gesture_home_state_reset(&s_home_gesture_state);
+    home_swipe_candidate = false;
+    home_swipe_tracking = false;
+    if (home_swipe_ctx) {
+        slide_transition_cancel(&home_swipe_ctx);
+    }
 
     /* Cancel any active drawer animation or motion and restore deterministic closed state */
     lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb);
@@ -3109,6 +3378,13 @@ void gui_shell_reset_drag_state(void) {
     if (player_swipe_ctx) {
         slide_transition_cancel(&player_swipe_ctx);
     }
+    back_swipe_candidate = false;
+    back_swipe_owns_press = false;
+    back_swipe_tracking = false;
+    back_swipe_target_scr = NULL;
+    if (back_swipe_ctx) {
+        slide_transition_cancel(&back_swipe_ctx);
+    }
     s_last_raw_pointer_state = LV_INDEV_STATE_RELEASED;
     s_require_release_after_wake = true;
     if (quick_drawer_drag_timer) {
@@ -3117,9 +3393,28 @@ void gui_shell_reset_drag_state(void) {
 }
 
 void gui_shell_player_swipe_recover(void * ctx) {
-    if ((slide_transition_ctx_t *) ctx == player_swipe_ctx) player_swipe_ctx = NULL;
+    slide_transition_ctx_t * sctx = (slide_transition_ctx_t *) ctx;
+    if (sctx == player_swipe_ctx) player_swipe_ctx = NULL;
     player_swipe_tracking = false;
     player_swipe_candidate = false;
+    if (sctx == back_swipe_ctx) back_swipe_ctx = NULL;
+    back_swipe_tracking = false;
+    back_swipe_candidate = false;
+    back_swipe_owns_press = false;
+    back_swipe_target_scr = NULL;
+    /* home_swipe_ctx is never driven through the compositor by its OWN
+     * begin_slide_transition_ex() call (vertical=true skips that), but
+     * transition_compositor_is_active() is a single global flag shared with
+     * close_quick_drawer()'s own vertical-overlay compositor session --
+     * quick_drawer_open already flips false the instant that close starts,
+     * well before its ~200ms animation (and that compositor session) ends,
+     * so a home-swipe confirmed in that window still sees the drawer's
+     * session as "active" on its very first tick, hits a compositor mode
+     * mismatch, and lands here with sctx == home_swipe_ctx even though
+     * home_swipe never touched the compositor itself. */
+    if (sctx == home_swipe_ctx) home_swipe_ctx = NULL;
+    home_swipe_tracking = false;
+    home_swipe_candidate = false;
 }
 
 bool gui_shell_has_background_work(void) {

@@ -60,13 +60,20 @@ bool point_in_swipe_dead_zone(lv_point_t p);
 void gui_shell_resume_fast_timers(void);
 void gui_shell_reset_drag_state(void);
 /* Narrow counterpart to gui_shell_reset_drag_state() above -- resets only
- * the interactive player-swipe tracking state (player_swipe_tracking,
- * candidate, ctx) without touching quick-drawer or home-gesture state,
+ * the interactive slide-swipe tracking state (player_swipe_* and
+ * back_swipe_*) without touching quick-drawer or home-gesture state,
  * and does NOT call slide_transition_cancel().
  * Called by gui_navigation.c on compositor-failure recovery
  * (slide_transition_anim_x_cb()) before freeing the slide_transition_ctx_t.
  * Takes void* so this header does not need gui_navigation.h's type definition. */
 void gui_shell_player_swipe_recover(void * ctx);
+/* True from press-down until release whenever that press was eligible for
+ * the live-tracking back-swipe (regardless of whether its own deadzone ever
+ * confirmed a direction) -- screen_gesture_event_cb() must stand down its
+ * own LV_DIR_RIGHT handling for the whole press when this is true, since
+ * LVGL's native gesture recognition can win the race against this poll-
+ * based deadzone check for the exact same direction on a fast swipe. */
+bool gui_shell_back_swipe_owns_press(void);
 void gui_shell_install_indev_hooks(lv_indev_t * indev);
 /* Not just lv_indev_get_next(NULL) -- the host simulator also registers a
  * keyboard indev, so which one enumerates first isn't guaranteed. Shared by

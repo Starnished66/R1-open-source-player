@@ -8,6 +8,20 @@ void gesture_home_state_reset(gesture_home_state_t * state) {
     state->start_y = 0;
 }
 
+bool gesture_home_state_is_eligible(const gesture_home_config_t * cfg, int32_t touch_y) {
+    if (!cfg) return false;
+
+    bool in_band = (touch_y >= cfg->screen_height - cfg->band_height);
+    return cfg->swipe_up_home_enabled &&
+           !cfg->quick_drawer_open &&
+           !cfg->is_bt_dac_overlay &&
+           !cfg->is_usb_dac_overlay &&
+           !cfg->is_lyrics_screen &&
+           !cfg->is_lock_screen &&
+           !cfg->has_background_work &&
+           in_band;
+}
+
 bool gesture_home_state_poll(gesture_home_state_t * state,
                              const gesture_home_config_t * cfg,
                              bool pressed,
@@ -17,17 +31,7 @@ bool gesture_home_state_poll(gesture_home_state_t * state,
 
     if (pressed && !state->was_pressed) {
         /* Press-down edge: evaluate eligibility for home gesture tracking */
-        bool in_band = (touch_y >= cfg->screen_height - cfg->band_height);
-        bool eligible = cfg->swipe_up_home_enabled &&
-                        !cfg->quick_drawer_open &&
-                        !cfg->is_bt_dac_overlay &&
-                        !cfg->is_usb_dac_overlay &&
-                        !cfg->is_lyrics_screen &&
-                        !cfg->is_lock_screen &&
-                        !cfg->has_background_work &&
-                        in_band;
-
-        state->tracking = eligible;
+        state->tracking = gesture_home_state_is_eligible(cfg, touch_y);
         state->start_y = touch_y;
         state->triggered = false;
     }

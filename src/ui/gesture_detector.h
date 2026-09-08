@@ -33,6 +33,9 @@ typedef struct {
 /* Resets all state for a clean released baseline */
 void gesture_home_state_reset(gesture_home_state_t * state);
 
+/* Stateless predicate: true if touch_y satisfies all configured eligibility rules */
+bool gesture_home_state_is_eligible(const gesture_home_config_t * cfg, int32_t touch_y);
+
 /* Evaluates a press event (e.g. called each poll tick).
  * Returns true if Home navigation should be triggered on this tick (fired at most once per press). */
 bool gesture_home_state_poll(gesture_home_state_t * state,

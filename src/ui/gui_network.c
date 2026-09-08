@@ -3222,3 +3222,4 @@ lv_obj_t * gui_network_get_bt_screen(void) { return bt_screen; }
 lv_obj_t * gui_network_get_wireless_screen(void) { return wireless_screen; }
 lv_obj_t * gui_network_get_bt_dac_overlay(void) { return bt_dac_overlay_screen; }
 lv_obj_t * gui_network_get_usb_dac_overlay(void) { return usb_dac_overlay_screen; }
+lv_obj_t * gui_network_get_import_wifi_screen(void) { return import_wifi_screen; }

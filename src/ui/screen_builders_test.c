@@ -86,7 +86,7 @@ static void check_layout(int display_height) {
     lv_display_set_flush_cb(display, flush);
     fonts_reset();
     gui_theme_init();
-    assert(ui_list_row_width() == 456 && ui_list_row_width_wide() == 464);
+    assert(ui_list_row_width() == 480 && ui_list_row_width_wide() == 480);
     lv_obj_t * list, * title;
     compact_list_item_t items[1000] = {0};
     for (int i = 0; i < 1000; ++i) items[i].label = "Song";

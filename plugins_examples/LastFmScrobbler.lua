@@ -255,4 +255,4 @@ local function open_menu()
     plugin.show_settings_list("Last.fm Scrobbler", rows)
 end
 
-plugin.register_list_item("playback", "Last.fm Scrobbler", open_menu)
+plugin.register_list_item("music_library", "Last.fm Scrobbler", open_menu)

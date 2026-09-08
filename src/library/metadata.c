@@ -50,6 +50,9 @@ static bool safe_chunk_advance(long chunk_start, uint64_t size, long pad, long *
 
 /* Enabled only in the disposable artwork helper, never in playback readers. */
 static bool artwork_only;
+/* Per-thread mode used by the lyrics worker: retain lyrics while skipping
+ * caller-visible artwork extraction.  TLS keeps concurrent readers isolated. */
+static _Thread_local bool lyrics_only;
 
 static bool store_picture_bytes(track_metadata_t * out, const uint8_t * src, uint32_t n) {
     if (!out || out->picture_data != NULL || !src || n == 0 || n > EMBEDDED_COVER_MAX_BYTES) return false;
@@ -164,7 +167,8 @@ static void apply_replaygain_field(track_metadata_t * out, const char * key, siz
  * OpusTags (read_opus_metadata(), same comment-list layout per RFC 7845
  * 5.2). Only the iteration mechanism differs between formats; this matching
  * logic has no dr_flac-specific coupling. */
-static void apply_vorbis_comment_field(track_metadata_t * out, const char * comment, size_t comment_len) {
+static void apply_vorbis_comment_field(track_metadata_t * out, const char * comment, size_t comment_len,
+                                       bool include_blobs) {
     const char * eq = memchr(comment, '=', comment_len);
     if (!eq) return;
 
@@ -197,7 +201,7 @@ static void apply_vorbis_comment_field(track_metadata_t * out, const char * comm
          * strip it -- apply_replaygain_field() re-checks the full key
          * against each of the four exact REPLAYGAIN_* names itself. */
         apply_replaygain_field(out, comment, key_len, value, value_len);
-    } else if (!artwork_only && out->lyrics == NULL && value_len > 0 &&
+    } else if (include_blobs && !artwork_only && out->lyrics == NULL && value_len > 0 &&
                ((key_len == 6 && strncasecmp(comment, "LYRICS", 6) == 0) ||
                 (key_len == 14 && strncasecmp(comment, "UNSYNCEDLYRICS", 14) == 0))) {
         /* Plain UTF-8 text, no ID3v2-style encoding byte to strip -- unlike
@@ -272,7 +276,7 @@ static void flac_meta_cb(void * user_data, drflac_metadata * meta) {
         /* dr_flac frees its own copy of pPictureData right after this
          * callback returns, so it has to be copied here, not just
          * pointed to. */
-        if (ctx->include_blobs && out->picture_data == NULL && meta->data.picture.pictureDataSize > 0 &&
+        if (ctx->include_blobs && !lyrics_only && out->picture_data == NULL && meta->data.picture.pictureDataSize > 0 &&
             meta->data.picture.pPictureData != NULL) {
             store_picture_bytes(out, meta->data.picture.pPictureData, meta->data.picture.pictureDataSize);
         }
@@ -296,11 +300,84 @@ static void flac_meta_cb(void * user_data, drflac_metadata * meta) {
                 (key_len == 14 && strncasecmp(comment, "UNSYNCEDLYRICS", 14) == 0))
                 continue;
         }
-        apply_vorbis_comment_field(out, comment, comment_len);
+        apply_vorbis_comment_field(out, comment, comment_len, ctx->include_blobs);
     }
 }
 
+static uint32_t read_be32(const uint8_t * b, bool synchsafe); /* defined below, in the ID3v2 section */
+
+static void read_flac_text_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
+        FILE * f = fopen(path, "rb");
+        if (!f) return;
+
+        /* Some taggers prepend a plain ID3v2 tag before "fLaC" -- dr_flac's
+         * own drflac_init() skips exactly this (see dr_flac.h's "Skip over
+         * any ID3 tags" loop) before falling through to the full-parse
+         * path, so this lightweight walker has to do the same or an
+         * ID3-prefixed FLAC loses ALL of its text tags in no-artwork/
+         * lyrics-only mode, not just the album art. */
+        uint8_t sig[4];
+        for (;;) {
+            if (fread(sig, 1, 4, f) != 4) { fclose(f); return; }
+            if (memcmp(sig, "ID3", 3) != 0) break;
+            uint8_t rest[6];
+            if (fread(rest, 1, sizeof(rest), f) != sizeof(rest)) { fclose(f); return; }
+            uint32_t tag_size = read_be32(&rest[2], true);
+            if (rest[1] & 0x10) tag_size += 10; /* footer present */
+            if (fseek(f, (long) tag_size, SEEK_CUR) != 0) { fclose(f); return; }
+        }
+        if (memcmp(sig, "fLaC", 4) != 0) {
+            fclose(f);
+            return;
+        }
+        bool last = false;
+        while (!last) {
+            uint8_t h[4];
+            if (fread(h, 1, 4, f) != 4) break;
+            last = (h[0] & 0x80) != 0;
+            uint32_t n = ((uint32_t)(h[1] << 16) | ((uint32_t)h[2] << 8) | h[3]);
+            if ((h[0] & 0x7f) != 4) {
+                if (fseek(f, (long)n, SEEK_CUR) != 0) break;
+                continue;
+            }
+            if (n > METADATA_BLOB_MAX_BYTES) break;
+            uint8_t * block = malloc(n ? n : 1);
+            if (!block || fread(block, 1, n, f) != n) { free(block); break; }
+            if (n >= 8) {
+                uint32_t pos = 4;
+                uint32_t vendor = (uint32_t)block[0] | ((uint32_t)block[1] << 8) |
+                                  ((uint32_t)block[2] << 16) | ((uint32_t)block[3] << 24);
+                if (vendor <= n - pos - 4) {
+                    pos += vendor;
+                    uint32_t count = (uint32_t)block[pos] | ((uint32_t)block[pos+1] << 8) |
+                                     ((uint32_t)block[pos+2] << 16) | ((uint32_t)block[pos+3] << 24);
+                    pos += 4;
+                    for (uint32_t i = 0; i < count && pos + 4 <= n; i++) {
+                        uint32_t len = (uint32_t)block[pos] | ((uint32_t)block[pos+1] << 8) |
+                                       ((uint32_t)block[pos+2] << 16) | ((uint32_t)block[pos+3] << 24);
+                        pos += 4;
+                        if (len > n - pos) break;
+                        const char * field = (const char *)&block[pos];
+                        size_t eq = 0;
+                        while (eq < len && field[eq] != '=') eq++;
+                        bool lyric = (eq == 6 && strncasecmp(field, "LYRICS", 6) == 0) ||
+                                     (eq == 14 && strncasecmp(field, "UNSYNCEDLYRICS", 14) == 0);
+                        if (include_blobs || !lyric) apply_vorbis_comment_field(out, field, len, include_blobs);
+                        pos += len;
+                    }
+                }
+            }
+            free(block);
+        }
+        fclose(f);
+        return;
+    }
+
 static void read_flac_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
+    if (lyrics_only || !include_blobs) {
+        read_flac_text_metadata(path, out, include_blobs);
+        return;
+    }
     flac_metadata_ctx_t ctx = { out, include_blobs };
     drflac * flac = drflac_open_file_with_metadata(path, flac_meta_cb, &ctx, NULL);
     if (flac) drflac_close(flac);
@@ -678,7 +755,9 @@ static bool read_id3v2_streaming(FILE * f, track_metadata_t * out, uint8_t major
             grouped = (flags2 & 0x20) != 0; data_len = compressed;
         }
 
-        bool wanted = is_text || is_txxx || (include_blobs && (is_picture || (is_lyrics && !artwork_only)));
+        bool wanted = is_text || is_txxx ||
+                      (include_blobs && !lyrics_only && is_picture) ||
+                      (include_blobs && is_lyrics && !artwork_only);
         if (wanted && !compressed && !encrypted && frame_size <= limit) {
             uint8_t * data = malloc(frame_size ? frame_size : 1);
             bool read_ok = data && id3_stream_read(&stream, data, frame_size);
@@ -732,7 +811,7 @@ static bool read_id3v2(FILE * f, track_metadata_t * out, bool include_blobs) {
     /* A database scan only needs bounded text frames. Always stream in that
      * mode so a large APIC/USLT body is skipped without allocating the
      * complete ID3 tag first. */
-    if (artwork_only || !include_blobs || tag_size > METADATA_BLOB_MAX_BYTES)
+    if (artwork_only || lyrics_only || !include_blobs || tag_size > METADATA_BLOB_MAX_BYTES)
         return read_id3v2_streaming(f, out, major_version, flags, tag_size, include_blobs);
 
     uint8_t * tag_data = malloc(tag_size);
@@ -1216,7 +1295,7 @@ static void read_m4a_metadata(const char * path, track_metadata_t * out, bool in
             m4a_read_sequence_tag(f, item, false, out);
         } else if (strcmp(item.type, "disk") == 0) {
             m4a_read_sequence_tag(f, item, true, out);
-        } else if (include_blobs && strcmp(item.type, "covr") == 0) {
+        } else if (include_blobs && !lyrics_only && strcmp(item.type, "covr") == 0) {
             m4a_read_cover_art(f, item, out);
         } else if (include_blobs && !artwork_only && strcmp(item.type, "\xA9" "lyr") == 0) {
             m4a_read_lyrics_tag(f, item, out);
@@ -1247,7 +1326,7 @@ static void read_opus_metadata(const char * path, track_metadata_t * out, bool i
          * binary decoding) keeps it a pure text-field matcher. */
         static const char picture_key[] = "METADATA_BLOCK_PICTURE=";
         size_t picture_key_len = sizeof(picture_key) - 1;
-        if (include_blobs && comment_len > picture_key_len && strncasecmp(comment, picture_key, picture_key_len) == 0) {
+        if (include_blobs && !lyrics_only && comment_len > picture_key_len && strncasecmp(comment, picture_key, picture_key_len) == 0) {
             const char * b64 = comment + picture_key_len;
             size_t b64_len = comment_len - picture_key_len;
 
@@ -1267,7 +1346,7 @@ static void read_opus_metadata(const char * path, track_metadata_t * out, bool i
             continue;
         }
 
-        apply_vorbis_comment_field(out, comment, comment_len);
+        apply_vorbis_comment_field(out, comment, comment_len, include_blobs);
     }
 
     ogg_demux_close(demux);
@@ -1307,7 +1386,7 @@ static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out, 
          * apply_vorbis_comment_field() itself. */
         static const char picture_key[] = "METADATA_BLOCK_PICTURE=";
         size_t picture_key_len = sizeof(picture_key) - 1;
-        if (include_blobs && field_len > picture_key_len && strncasecmp(field, picture_key, picture_key_len) == 0) {
+        if (include_blobs && !lyrics_only && field_len > picture_key_len && strncasecmp(field, picture_key, picture_key_len) == 0) {
             const char * b64 = field + picture_key_len;
             size_t b64_len = field_len - picture_key_len;
 
@@ -1327,7 +1406,7 @@ static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out, 
             continue;
         }
 
-        apply_vorbis_comment_field(out, field, field_len);
+        apply_vorbis_comment_field(out, field, field_len, include_blobs);
     }
 
     stb_vorbis_close(f);
@@ -1335,7 +1414,7 @@ static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out, 
 
 /* AIFF/AIFC metadata parser. Reads embedded "ID3 " IFF chunks, which are often
  * positioned after the SSND chunk. */
-static void read_aiff_metadata(const char * path, track_metadata_t * out) {
+static void read_aiff_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
 
@@ -1357,7 +1436,7 @@ static void read_aiff_metadata(const char * path, track_metadata_t * out) {
         long chunk_data_start = ftell(f);
 
         if (strcmp(chunk_id, "ID3 ") == 0) {
-            read_id3v2(f, out, true);
+            read_id3v2(f, out, include_blobs);
             break;
         }
 
@@ -1372,7 +1451,7 @@ static void read_aiff_metadata(const char * path, track_metadata_t * out) {
 
 /* WAV ID3 fallback parser. Scans for embedded "id3 " / "ID3 " RIFF chunks
  * (often placed after audio data) when standard RIFF LIST/INFO chunks are absent. */
-static void read_wav_id3_fallback(const char * path, track_metadata_t * out) {
+static void read_wav_id3_fallback(const char * path, track_metadata_t * out, bool include_blobs) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
 
@@ -1395,7 +1474,7 @@ static void read_wav_id3_fallback(const char * path, track_metadata_t * out) {
         long chunk_data_start = ftell(f);
 
         if (strcasecmp(chunk_id, "id3 ") == 0) {
-            read_id3v2(f, out, true);
+            read_id3v2(f, out, include_blobs);
             break;
         }
 
@@ -1416,7 +1495,7 @@ static uint64_t read_u64le(const uint8_t * b) {
 
 /* DSF metadata parser. Reads the ID3v2 metadataPointer offset from the "DSD "
  * master chunk and parses the ID3v2 tag. */
-static void read_dsf_metadata(const char * path, track_metadata_t * out) {
+static void read_dsf_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
 
@@ -1428,7 +1507,7 @@ static void read_dsf_metadata(const char * path, track_metadata_t * out) {
 
     uint64_t metadata_pointer = read_u64le(&dsd_chunk[20]);
     if (metadata_pointer != 0 && fseek(f, (long) metadata_pointer, SEEK_SET) == 0) {
-        read_id3v2(f, out, true);
+        read_id3v2(f, out, include_blobs);
     }
 
     fclose(f);
@@ -1581,7 +1660,7 @@ static bool dff_read_chunk_header(FILE * f, char id_out[5], uint64_t * size_out)
     return true;
 }
 
-static void read_dff_metadata(const char * path, track_metadata_t * out) {
+static void read_dff_metadata(const char * path, track_metadata_t * out, bool include_blobs) {
     FILE * f = fopen(path, "rb");
     if (!f) return;
 
@@ -1606,7 +1685,7 @@ static void read_dff_metadata(const char * path, track_metadata_t * out) {
         chunk_data_start = ftell(f);
 
         if (strcmp(id, "ID3 ") == 0) {
-            read_id3v2(f, out, true);
+            read_id3v2(f, out, include_blobs);
             fclose(f);
             return;
         }
@@ -1804,7 +1883,7 @@ static void metadata_read_internal(const char * path, track_metadata_t * out, bo
         read_mp3_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".wav") == 0) {
         read_wav_metadata(path, out);
-        if (!out->has_title) read_wav_id3_fallback(path, out); /* see its own comment */
+        if (!out->has_title) read_wav_id3_fallback(path, out, include_blobs); /* see its own comment */
     } else if (strcasecmp(ext, ".aac") == 0) {
         read_aac_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".m4a") == 0 || strcasecmp(ext, ".m4b") == 0) {
@@ -1816,13 +1895,13 @@ static void metadata_read_internal(const char * path, track_metadata_t * out, bo
         if (codec == OGG_CODEC_OPUS) read_opus_metadata(path, out, include_blobs);
         else if (codec == OGG_CODEC_VORBIS) read_ogg_vorbis_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".aiff") == 0 || strcasecmp(ext, ".aif") == 0) {
-        read_aiff_metadata(path, out);
+        read_aiff_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".dsf") == 0) {
-        read_dsf_metadata(path, out);
+        read_dsf_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".ape") == 0) {
         read_ape_metadata(path, out);
     } else if (strcasecmp(ext, ".dff") == 0) {
-        read_dff_metadata(path, out);
+        read_dff_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".wma") == 0) {
         read_wma_metadata(path, out);
     }
@@ -1830,6 +1909,19 @@ static void metadata_read_internal(const char * path, track_metadata_t * out, bo
 
 void metadata_read(const char * path, track_metadata_t * out) {
     metadata_read_internal(path, out, true);
+}
+
+void metadata_read_without_artwork(const char * path, track_metadata_t * out) {
+    /* The no-blob mode preserves textual tags and ReplayGain while avoiding
+     * embedded artwork (lyrics are intentionally omitted as well). */
+    metadata_read_internal(path, out, false);
+}
+
+void metadata_read_lyrics_without_artwork(const char * path, track_metadata_t * out) {
+    bool previous = lyrics_only;
+    lyrics_only = true;
+    metadata_read_internal(path, out, true);
+    lyrics_only = previous;
 }
 
 /* Isolates decoder-based metadata parsing in a short-lived child process so

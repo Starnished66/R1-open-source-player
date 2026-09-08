@@ -263,6 +263,10 @@ static bool bmp_source_mtime(const char * path, int expected_width, int expected
     return true;
 }
 
+uint64_t albumart_debug_thumbnail_key(const albumart_info_t * info) {
+    return thumbnail_key(info);
+}
+
 bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int height, char * found, size_t found_size) {
     if (!info || !found || width <= 0 || height <= 0) return false;
     char size_string[24];
@@ -279,6 +283,26 @@ bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int hei
     uint32_t src = source_mtime_of(info);
     if (stored != 0 && src != 0 && stored != src) return false;
     return true;
+}
+
+bool albumart_generated_cache_fresh(const albumart_info_t * info, int width, int height,
+                                    char * found, size_t found_size) {
+    if (!info || !found || found_size == 0 || width <= 0 || height <= 0 ||
+        !info->album[0] || !(info->albumartist[0] || info->artist[0]))
+        return false;
+
+    char path[PATH_MAX];
+    int pathlen = snprintf(path, sizeof(path), "%s/v2-%016llx.%dx%d.bmp", ALBUMART_DIR,
+                           (unsigned long long) thumbnail_key(info), width, height);
+    if (pathlen < 0 || (size_t) pathlen >= sizeof(path) ||
+        (size_t) pathlen >= found_size || !file_exists(path)) return false;
+
+    uint32_t stored = 0;
+    if (!bmp_source_mtime(path, width, height, &stored)) return false;
+    uint32_t src = source_mtime_of(info);
+    if (stored != 0 && src != 0 && stored != src) return false;
+    strmemccpy_local(found, path, found_size);
+    return found[0] != '\0';
 }
 
 bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, const uint16_t * pixels) {

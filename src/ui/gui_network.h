@@ -8,6 +8,7 @@ lv_obj_t * gui_network_get_bt_screen(void);
 lv_obj_t * gui_network_get_wireless_screen(void);
 lv_obj_t * gui_network_get_bt_dac_overlay(void);
 lv_obj_t * gui_network_get_usb_dac_overlay(void);
+lv_obj_t * gui_network_get_import_wifi_screen(void);
 
 void gui_network_init(void);
 /* Deletes every screen/popup this module owns so gui_reload.c's in-process

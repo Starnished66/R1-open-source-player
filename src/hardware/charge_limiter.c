@@ -1,5 +1,5 @@
 #include "charge_limiter.h"
-#include "board_config.h"
+#include "board_config.h"  // TODO: fix false-positive "'debug_log.h' file not found" warning in IDE
 #include "debug_log.h"  // TODO: fix false-positive "'debug_log.h' file not found" warning in IDE
 
 #include <fcntl.h>
@@ -10,6 +10,8 @@
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
+
+// TODO: maybe add additional checks (maybe device names) to ensure that no super bad stuff happens because of the manual register writes
 
 /* CHARGE_LIMITER_ACTIVE gates the AXP2101 i2c transactions.
  * Set to 0 to disable entirely; the limiter is independent of
@@ -168,7 +170,7 @@ static void log_chg_stat(const char * when) {
     DBG_LOG("charge_limiter: chg_stat %s = %s (0x%02X)\n", when, names[stat & 0x07], stat & 0x07);
 
     if (!axp2101_read_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, &stat)) return;
-    printf("charge_limiter: CV Charge Voltage Setting = %d\n", stat);
+    DBG_LOG("charge_limiter: CV Charge Voltage Setting = %d\n", stat);
 }
 
 enum AXP2101_CHARGE_VOLTAGE_LIMIT {

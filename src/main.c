@@ -481,6 +481,22 @@ int main(int argc, char ** argv) {
         uint64_t perf_handler_start_us = perf_now_us();
 #endif
         uint32_t time_till_next = lv_timer_handler();
+        /* After lv_tick_set_cb(NULL), LVGL's tick stays frozen at the loop-top
+         * lv_tick_inc() value for this entire handler pass. lv_timer_exec()
+         * stamps timer->last_run = lv_tick_get() (that frozen value)
+         * immediately before invoking the callback, so a blocking callback --
+         * the transition compositor waiting on FBIOPAN_DISPLAY vsync,
+         * commonly ~16ms -- is invisible to LVGL's time_till_next math, which
+         * then returns the timer's full period again. Sleeping that full
+         * amount on top of time already spent doubles the cycle. One extra
+         * custom_tick_get() here is cheap next to the thousands of
+         * clock_gettime() calls the NULL-cb handoff was designed to avoid.
+         * last_real_tick is left at the loop-top read: the next lv_tick_inc()
+         * must still measure loop-top-to-loop-top, independent of this
+         * sleep-only correction. */
+        uint32_t handler_elapsed_ms = custom_tick_get() - real_tick;
+        if (time_till_next > handler_elapsed_ms) time_till_next -= handler_elapsed_ms;
+        else time_till_next = 0;
 #ifdef UI_PERF_TRACE
         uint64_t perf_handler_us = perf_now_us() - perf_handler_start_us;
         perf_handler_total_us += perf_handler_us;

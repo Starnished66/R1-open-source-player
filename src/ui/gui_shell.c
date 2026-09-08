@@ -1616,6 +1616,15 @@ static int32_t quick_drawer_last_velocity = 0;
  * for the same candidate/tracking live-drag shape as the other two gestures. */
 static bool home_swipe_candidate = false;
 static bool home_swipe_tracking = false;
+/* Real UI_PERF_TRACE data showed begin_slide_transition_ex() (17-34ms) and
+ * the first compositor/overlay frame's own present (another ~16ms) both
+ * landing in the SAME poll_quick_drawer_drag() tick as the deadzone
+ * confirm -- a single tick blocking 33-50ms worst case, felt as a stall-
+ * then-jump right when the gesture starts. Set true only at the instant
+ * tracking begins; the tracking block below checks and clears it to skip
+ * presenting a frame that same tick, deferring frame 0 to the next poll
+ * tick instead. */
+static bool home_swipe_just_confirmed = false;
 static int32_t home_swipe_touch_start_x = 0;
 static int32_t home_swipe_touch_start_y = 0;
 static int32_t home_swipe_last_v = 0;
@@ -1642,9 +1651,11 @@ static slide_transition_ctx_t * home_swipe_ctx = NULL;
  * remains the fallback for presses that state machine rejects). */
 static bool player_swipe_candidate = false;
 static bool player_swipe_tracking = false;
+/* Same one-tick present deferral as home_swipe_just_confirmed above. */
+static bool player_swipe_just_confirmed = false;
 static int32_t player_swipe_touch_start_x = 0;
 static int32_t player_swipe_touch_start_y = 0;
-static int32_t player_swipe_last_v = 0; /* last x actually applied to img_from, for per-tick velocity -- same idea as quick_drawer_last_velocity */
+static int32_t player_swipe_last_v = 0; /* last sampled x (not necessarily presented -- see player_swipe_just_confirmed's deferred tick), for per-tick velocity -- same idea as quick_drawer_last_velocity */
 static int32_t player_swipe_last_velocity = 0;
 static slide_transition_ctx_t * player_swipe_ctx = NULL;
 #define PLAYER_SWIPE_DEADZONE 20 /* px before judging direction -- comfortably under LVGL's own ~50px built-in gesture threshold (LV_INDEV_DEF_GESTURE_LIMIT) so this always claims a genuine left-swipe before LVGL's own dormant gesture recognition would have */
@@ -1672,6 +1683,8 @@ static slide_transition_ctx_t * player_swipe_ctx = NULL;
 static bool back_swipe_candidate = false;
 static bool back_swipe_owns_press = false;
 static bool back_swipe_tracking = false;
+/* Same one-tick present deferral as home_swipe_just_confirmed above. */
+static bool back_swipe_just_confirmed = false;
 static int32_t back_swipe_touch_start_x = 0;
 static int32_t back_swipe_touch_start_y = 0;
 static int32_t back_swipe_last_v = 0;
@@ -2042,6 +2055,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                      * recovers to from_scr and leaves the stack untouched. */
                     home_swipe_ctx->commit = false;
                     home_swipe_tracking = true;
+                    home_swipe_just_confirmed = true;
                     home_swipe_last_v = 0;
                     home_swipe_last_velocity = 0;
 #ifdef UI_GESTURE_TRACE
@@ -2077,6 +2091,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                      * recovers to from_scr and leaves the stack untouched. */
                     player_swipe_ctx->commit = false;
                     player_swipe_tracking = true;
+                    player_swipe_just_confirmed = true;
                     player_swipe_last_v = 0;
                     player_swipe_last_velocity = 0;
                     /* Same reasoning as nav_pop()'s own lv_indev_wait_release()
@@ -2138,6 +2153,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
                              * the stack untouched. */
                             back_swipe_ctx->commit = false;
                             back_swipe_tracking = true;
+                            back_swipe_just_confirmed = true;
                             back_swipe_last_v = 0;
                             back_swipe_last_velocity = 0;
                             lv_indev_wait_release(indev);
@@ -2160,7 +2176,16 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         if (v < -h) v = -h; /* never past fully-off (finger overshooting up of a full screen height) */
         home_swipe_last_velocity = v - home_swipe_last_v;
         home_swipe_last_v = v;
-        slide_transition_anim_x_cb(home_swipe_ctx, v);
+        /* last_v/last_velocity always stay current (a release landing on
+         * this exact tick must still see accurate flick/halfway state) --
+         * only the frame PRESENT is skipped, on the same tick begin_slide_
+         * transition_ex() ran on. See home_swipe_just_confirmed's own
+         * comment at its declaration. */
+        if (home_swipe_just_confirmed) {
+            home_swipe_just_confirmed = false;
+        } else {
+            slide_transition_anim_x_cb(home_swipe_ctx, v);
+        }
     }
 
     if (pressed && player_swipe_tracking) {
@@ -2170,7 +2195,11 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         if (v < -w) v = -w; /* never past fully-off (finger overshooting left of a full screen width) */
         player_swipe_last_velocity = v - player_swipe_last_v;
         player_swipe_last_v = v;
-        slide_transition_anim_x_cb(player_swipe_ctx, v);
+        if (player_swipe_just_confirmed) {
+            player_swipe_just_confirmed = false;
+        } else {
+            slide_transition_anim_x_cb(player_swipe_ctx, v);
+        }
     }
 
     if (pressed && back_swipe_tracking) {
@@ -2180,7 +2209,11 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         if (v > w) v = w;  /* never past fully-off (finger overshooting right of a full screen width) */
         back_swipe_last_velocity = v - back_swipe_last_v;
         back_swipe_last_v = v;
-        slide_transition_anim_x_cb(back_swipe_ctx, v);
+        if (back_swipe_just_confirmed) {
+            back_swipe_just_confirmed = false;
+        } else {
+            slide_transition_anim_x_cb(back_swipe_ctx, v);
+        }
     }
 
     if (pressed && quick_drawer_drag_tracking) {
@@ -2279,9 +2312,11 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * drawer's own release logic just above, just horizontal. */
         player_swipe_tracking = false;
         int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
-        /* player_swipe_last_v stores the last offset applied to
-         * slide_transition_anim_x_cb(). Reads it directly rather than inspecting
-         * img_from, which is NULL when direct-framebuffer compositing is active. */
+        /* player_swipe_last_v stores the last sampled offset, updated every
+         * tracking tick regardless of whether that tick actually presented
+         * a frame (see player_swipe_just_confirmed). Reads it directly
+         * rather than inspecting img_from, which is NULL when direct-
+         * framebuffer compositing is active. */
         int32_t current_v = player_swipe_last_v;
         bool commit;
         if (player_swipe_last_velocity < -PLAYER_SWIPE_FLICK_VELOCITY) {
@@ -3362,6 +3397,7 @@ void gui_shell_reset_drag_state(void) {
 
     home_swipe_candidate = false;
     home_swipe_tracking = false;
+    home_swipe_just_confirmed = false;
     if (home_swipe_ctx) {
         slide_transition_cancel(&home_swipe_ctx);
     }
@@ -3375,12 +3411,14 @@ void gui_shell_reset_drag_state(void) {
 
     player_swipe_candidate = false;
     player_swipe_tracking = false;
+    player_swipe_just_confirmed = false;
     if (player_swipe_ctx) {
         slide_transition_cancel(&player_swipe_ctx);
     }
     back_swipe_candidate = false;
     back_swipe_owns_press = false;
     back_swipe_tracking = false;
+    back_swipe_just_confirmed = false;
     back_swipe_target_scr = NULL;
     if (back_swipe_ctx) {
         slide_transition_cancel(&back_swipe_ctx);
@@ -3397,10 +3435,12 @@ void gui_shell_player_swipe_recover(void * ctx) {
     if (sctx == player_swipe_ctx) player_swipe_ctx = NULL;
     player_swipe_tracking = false;
     player_swipe_candidate = false;
+    player_swipe_just_confirmed = false;
     if (sctx == back_swipe_ctx) back_swipe_ctx = NULL;
     back_swipe_tracking = false;
     back_swipe_candidate = false;
     back_swipe_owns_press = false;
+    back_swipe_just_confirmed = false;
     back_swipe_target_scr = NULL;
     /* home_swipe_ctx is never driven through the compositor by its OWN
      * begin_slide_transition_ex() call (vertical=true skips that), but
@@ -3415,6 +3455,7 @@ void gui_shell_player_swipe_recover(void * ctx) {
     if (sctx == home_swipe_ctx) home_swipe_ctx = NULL;
     home_swipe_tracking = false;
     home_swipe_candidate = false;
+    home_swipe_just_confirmed = false;
 }
 
 bool gui_shell_has_background_work(void) {

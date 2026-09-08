@@ -230,8 +230,12 @@ static lv_draw_buf_t * build_flattened_transition_frame(lv_obj_t * target_screen
  * stale); begin_slide_transition() blends them in fresh every time it uses
  * this cache. Anything with actual dynamic content (player screen, file/
  * song lists, Settings' toggles, the accent-color picker's selection ring,
- * Subsonic status screens) is deliberately left out and always rendered
- * fresh. */
+ * Subsonic status screens) is deliberately left out of THIS particular
+ * cache -- the player screen has its own dedicated cache
+ * (player_transition_cache_buf below), and whatever screen a nav_push()
+ * most recently left behind has its own single-slot cache too
+ * (back_target_cache_buf, further below); anything else genuinely is
+ * rendered fresh on every transition. */
 #define STATIC_SNAPSHOT_SCREEN_COUNT 9
 static lv_obj_t * static_snapshot_screen[STATIC_SNAPSHOT_SCREEN_COUNT];
 static lv_draw_buf_t * static_snapshot_buf[STATIC_SNAPSHOT_SCREEN_COUNT];
@@ -255,6 +259,7 @@ void register_static_snapshot(int index, lv_obj_t * scr) {
 }
 
 static void player_transition_discard_cache(void);
+static void back_target_cache_discard(void);
 
 static void rebuild_font_snapshots_async_cb(void * unused) {
     (void) unused;
@@ -276,6 +281,7 @@ void gui_navigation_invalidate_font_snapshots(void) {
         static_snapshot_buf[i] = NULL;
     }
     player_transition_discard_cache();
+    back_target_cache_discard();
     lv_async_call(rebuild_font_snapshots_async_cb, NULL);
 }
 
@@ -293,6 +299,7 @@ void gui_navigation_invalidate_theme_snapshots(void) {
         static_snapshot_buf[i] = NULL;
     }
     player_transition_discard_cache();
+    back_target_cache_discard();
     lv_async_call(rebuild_theme_snapshots_async_cb, NULL);
 }
 
@@ -354,6 +361,98 @@ void player_transition_cache_async_cb(void * unused) {
 void player_transition_mark_dirty(void) {
     player_transition_cache_dirty = true;
     if (gui_player_get_screen()) lv_async_call(player_transition_cache_async_cb, NULL);
+}
+
+/* Back-target transition-frame cache -- one slot, for whatever screen sits
+ * directly below the current top of the nav stack (nav_push()'s own "from"
+ * screen). That's exactly the destination a back-swipe or the hardware/
+ * software back action targets, and real UI_PERF_TRACE data showed this is
+ * the single biggest remaining begin_slide_transition_ex() cost once the
+ * static/player caches don't apply: a synchronous lv_snapshot_take() of a
+ * live, potentially large widget tree (a Files/Albums/Songs list, Settings,
+ * etc), costing 13-27ms. Rebuilt asynchronously right when nav_push()
+ * leaves a screen behind, not on every visit -- a few-seconds-stale
+ * destination frame for a screen the user isn't even looking at is the same
+ * accepted tradeoff player_transition_cache_buf above already makes.
+ * Screen-only base -- persistent bars blended in fresh at transition time,
+ * same as every other cache here. Deliberately skipped for static-snapshot
+ * screens and the player screen (get_static_snapshot()/the player-cache
+ * check both run first in begin_slide_transition_ex(), and back_target_
+ * cache_rebuild_cb() below also declines to snapshot either kind) -- this
+ * slot exists purely to cover the dynamic screens neither of those already
+ * handle. Only hooked into nav_push() (the common case: tapping from Home/
+ * a list into a deeper screen) -- not nav_push_stack_only()'s player-swipe-
+ * commit call site, since that path already gets the compositor's fast
+ * horizontal two-panel mode (reveal=false leaving Player) and the
+ * remaining cold-snapshot tail there is a smaller, separate win not worth
+ * the added complexity of exposing that path's own from_scr here too. */
+static lv_obj_t * back_target_cache_screen = NULL;
+static lv_draw_buf_t * back_target_cache_buf = NULL;
+
+static void back_target_cache_rebuild_cb(void * unused) {
+    (void) unused;
+    if (!back_target_cache_screen) return;
+    /* The screen we meant to cache may no longer be the thing a back-swipe
+     * would target by the time this async callback actually runs (another
+     * push could have landed first) -- covered by nav_push() re-pointing
+     * this slot at the new "from" screen and destroying any stale buffer
+     * before scheduling a fresh rebuild, so a stale screen pointer here
+     * would already have been cleared. Also decline a screen that's live
+     * right now (nothing to gain snapshotting what's on screen) or one
+     * already covered by a faster dedicated cache. */
+    if (lv_screen_active() == back_target_cache_screen) return;
+    if (get_static_snapshot(back_target_cache_screen)) return;
+    if (back_target_cache_screen == gui_player_get_screen()) return;
+    lv_draw_buf_t * fresh = snapshot_screen_base(back_target_cache_screen);
+    if (!fresh) return; /* OOM -- keep whatever's cached (stale beats nothing) */
+    if (back_target_cache_buf) lv_draw_buf_destroy(back_target_cache_buf);
+    back_target_cache_buf = fresh;
+}
+
+/* Destroys any cached buffer and, if the target screen is still valid,
+ * schedules a fresh rebuild against it -- same shape as player_transition_
+ * discard_cache() above. Callers that need the screen pointer itself
+ * cleared (the screen is about to be freed) must do so BEFORE calling this,
+ * so there's nothing left to reschedule a rebuild against. */
+static void back_target_cache_discard(void) {
+    if (back_target_cache_buf) lv_draw_buf_destroy(back_target_cache_buf);
+    back_target_cache_buf = NULL;
+    if (back_target_cache_screen) lv_async_call(back_target_cache_rebuild_cb, NULL);
+}
+
+/* Called from nav_push() right after it decides `scr` is being left behind
+ * (covered) by a new push -- `scr` is now exactly what a future back-swipe/
+ * back-action from the new top of the stack would target. */
+static void back_target_cache_note_covered(lv_obj_t * scr) {
+    /* Skip static/player screens entirely -- get_static_snapshot()/player
+     * checks in back_target_cache_rebuild_cb() above already decline to
+     * snapshot them, so caching the pointer here would only ever sit idle
+     * while still needing the exact same replace-time fixup real dynamic
+     * screens do (see back_target_cache_note_replaced()'s own comment) --
+     * narrower is safer than correct-but-pointless. */
+    if (get_static_snapshot(scr) || scr == gui_player_get_screen()) scr = NULL;
+    if (back_target_cache_screen != scr) back_target_cache_screen = scr;
+    back_target_cache_discard();
+}
+
+/* Real use-after-free caught in review: nav_push() sets this cache's screen
+ * pointer even for static/player screens the rebuild callback itself
+ * declines to snapshot (get_static_snapshot()/gui_player_get_screen()
+ * checks inside back_target_cache_rebuild_cb() above) -- e.g. leaving Home
+ * still sets back_target_cache_screen to the OLD Home object. A theme/font
+ * refresh then rebuilds Home as a brand-new lv_obj_t and deletes the old
+ * one, but gui_navigation_replace_home()/gui_navigation_replace_static_
+ * screen() (below) only ever fixed up nav_stack[] and the static-snapshot
+ * array -- not this cache -- so the already-queued async rebuild callback
+ * (scheduled by gui_navigation_invalidate_theme_snapshots()'s own call to
+ * back_target_cache_discard() just above it) would run AFTER the old
+ * screen is freed, calling snapshot_screen_base() on a dangling pointer.
+ * Called from both replace functions below to keep this cache's pointer in
+ * lockstep with theirs. */
+static void back_target_cache_note_replaced(lv_obj_t * old_screen, lv_obj_t * new_screen) {
+    if (back_target_cache_screen != old_screen) return;
+    back_target_cache_screen = new_screen;
+    back_target_cache_discard();
 }
 
 /* slide_transition_ctx_t defined in gui.h */
@@ -545,8 +644,8 @@ slide_transition_ctx_t * begin_slide_transition(lv_obj_t * to_scr, bool forward)
 slide_transition_ctx_t * begin_slide_transition_ex(lv_obj_t * to_scr, bool forward, bool vertical, bool reveal) {
 #ifdef UI_PERF_TRACE
     uint64_t perf_begin_us = ui_perf_now_us();
-    uint64_t perf_to_done_us;
     uint64_t perf_drain_done_us;
+    uint64_t perf_to_done_us;
     uint64_t perf_from_done_us;
 #endif
     lv_obj_t * from_scr = lv_screen_active();
@@ -556,8 +655,65 @@ slide_transition_ctx_t * begin_slide_transition_ex(lv_obj_t * to_scr, bool forwa
     int32_t w = lv_display_get_horizontal_resolution(disp);
     int32_t h = lv_display_get_vertical_resolution(disp);
 
+    /* Real bug caught in review: disabling invalidation below only stops
+     * NEW invalidations -- it does nothing about an area some OTHER timer
+     * already queued dirty before this tick's own gesture/nav timer ran
+     * (LVGL's timer list is LIFO -- lv_timer_create() inserts at the head
+     * and lv_timer_handler() walks head-first, so a more-recently-created
+     * timer like this module's own gesture polling can run BEFORE the
+     * display's own refresh timer in the very same tick, not after, the
+     * opposite of what an earlier version of this comment assumed).
+     * DIRECT-mode rendering (this driver's LV_LINUX_FBDEV_RENDER_MODE)
+     * draws straight into a physical framebuffer page, so if that stale
+     * queued area is left to render once invalidation is re-enabled or the
+     * compositor takes over, it can stomp physical pixels the compositor
+     * is actively managing -- the fbdev driver's external-composition guard
+     * only suppresses the subsequent PAN, not the render that already
+     * happened. A synchronous drain here, before this function's OWN
+     * snapshot-prep work below has dirtied anything itself, flushes
+     * whatever a truly external timer left queued -- unlike the drain this
+     * replaced (removed for being 12-20ms on real hardware), this one runs
+     * before any self-inflicted dirtying exists, so the common case (no
+     * unrelated timer mid-flight) is cheap; only a genuinely-external
+     * pending redraw costs anything here. */
+    lv_refr_now(disp);
+#ifdef UI_PERF_TRACE
+    perf_drain_done_us = ui_perf_now_us();
+#endif
+
     slide_transition_ctx_t * ctx = lv_malloc(sizeof(*ctx));
     if (!ctx) return NULL;
+    /* Nothing this function's own snapshot-prep code does (hiding the
+     * dismiss button, toggling the status bar / home indicator bands,
+     * restyling via gui_shell_set_status_bar_screen_context()) should be
+     * allowed to reach the physical screen while we're about to capture it
+     * as a frozen 'from' snapshot -- lv_display_enable_invalidation(false)
+     * makes those self-inflicted invalidations a silent no-op. Deliberately
+     * narrow: re-enabled immediately below, right after buf_from is
+     * captured, NOT held disabled for the rest of the transition -- the
+     * LVGL-overlay fallback further down (any vertical slide, or a
+     * horizontal one the compositor declines) creates real lv_obj_t/
+     * lv_image_t children and drives them via lv_obj_set_x/set_y for the
+     * whole gesture, which only ever reaches the screen through LVGL's
+     * normal invalidate-then-redraw pipeline -- leaving invalidation
+     * disabled through that branch would make every one of those calls a
+     * silent no-op (_lv_inv_area()/lv_obj_invalidate_area() both bail
+     * immediately when disabled), so the fallback would never actually
+     * draw a moving frame at all. transition_compositor_begin() below
+     * re-disables invalidation itself, on its own separate, already-correct
+     * disable/enable pairing, for the entirely different reason of keeping
+     * LVGL's normal pipeline off the physical framebuffer while it writes
+     * to it directly -- that pairing is untouched by this one.
+     * Capturing the currently-active scanned-out page is already correct
+     * and up to date without any of that: the lv_refr_now() call above,
+     * before any of this function's own work, already flushed whatever a
+     * genuinely external timer left queued dirty -- do NOT assume LVGL's
+     * own display-refresh timer happens to run before this one in a given
+     * tick just because it was created first; lv_timer_create() inserts at
+     * the list head and lv_timer_handler() walks head-first, so a more-
+     * recently-created timer (this module's own gesture polling included)
+     * can run BEFORE it in the very same tick, not after. */
+    lv_display_enable_invalidation(disp, false);
     ctx->commit = true;
     ctx->buf_from_owned = true;
     ctx->buf_to_owned = true;
@@ -580,6 +736,9 @@ slide_transition_ctx_t * begin_slide_transition_ex(lv_obj_t * to_scr, bool forwa
         used_player_cache = true;
 #endif
     }
+    if (!cached_base && to_scr == back_target_cache_screen && back_target_cache_buf) {
+        cached_base = back_target_cache_buf;
+    }
     if (cached_base) {
         buf_to = lv_draw_buf_dup(cached_base);
         if (buf_to) blend_persistent_bars(buf_to, to_scr);
@@ -590,18 +749,9 @@ slide_transition_ctx_t * begin_slide_transition_ex(lv_obj_t * to_scr, bool forwa
     perf_to_done_us = ui_perf_now_us();
 #endif
 
-    /* Drain any already-queued LVGL rendering now, before capturing the
-     * outgoing physical page. Capturing first and draining afterward could
-     * allow a pending redraw to update to a different physical page, causing
-     * an initial frame jump. Synchronous lv_refr_now() ensures all pending
-     * drawing and flushing is complete before capture. */
-    lv_refr_now(disp);
-#ifdef UI_PERF_TRACE
-    perf_drain_done_us = ui_perf_now_us();
-#endif
-
-    /* Outgoing source: an owned copy of the physical scanout page,
-     * captured after the drain above. lv_linux_fbdev_get_active_page() is the
+    /* Outgoing source: an owned copy of the physical scanout page.
+     * Invalidation was disabled above, so snapshot-prep cannot pan us onto
+     * a different page. lv_linux_fbdev_get_active_page() is the
      * fbdev driver's accessor for the physical half currently being scanned
      * out; lv_display_get_buf_active() is used as fallback (host/SDL builds,
      * or if fbdev pan-based double buffering is inactive). */
@@ -631,6 +781,10 @@ slide_transition_ctx_t * begin_slide_transition_ex(lv_obj_t * to_scr, bool forwa
 #ifdef UI_PERF_TRACE
     perf_from_done_us = ui_perf_now_us();
 #endif
+    /* Re-enable now that both snapshots are safely captured -- see the
+     * disable's own comment above for why this window is deliberately
+     * narrow rather than held for the whole transition. */
+    lv_display_enable_invalidation(disp, true);
     if (!buf_from || !buf_to) {
         /* Snapshot failed (e.g. OOM) -- caller falls back to an instant cut
          * rather than crash or get stuck mid-navigation/mid-drag. */
@@ -655,11 +809,12 @@ slide_transition_ctx_t * begin_slide_transition_ex(lv_obj_t * to_scr, bool forwa
      * creating LVGL overlay/image objects. Skipping overlay objects when
      * the compositor takes over avoids queuing initial-draw invalidations
      * that could flash during compositing. The compositor's fast path is
-     * horizontal-only (see transition_compositor.c) and always draws the
-     * plain two-panel slide -- it has no concept of reveal, so a reveal
-     * request must always fall through to the LVGL-overlay branch below,
-     * same as a vertical slide does. */
-    if (!vertical && !reveal && transition_compositor_begin(buf_from, buf_to, to_offset)) {
+     * horizontal-only (see transition_compositor.c) -- a vertical slide
+     * always takes the LVGL-overlay branch below -- but now handles reveal
+     * too (destination pinned at (0,0), source slides over/off it), so a
+     * horizontal reveal request no longer needs to fall back to the slower
+     * LVGL-overlay path the way it used to. */
+    if (!vertical && transition_compositor_begin(buf_from, buf_to, to_offset, reveal)) {
         ctx->overlay = NULL;
         ctx->img_from = NULL;
         ctx->img_to = NULL;
@@ -714,11 +869,11 @@ slide_transition_ctx_t * begin_slide_transition_ex(lv_obj_t * to_scr, bool forwa
     }
 #ifdef UI_PERF_TRACE
     uint64_t perf_end_us = ui_perf_now_us();
-    printf("PERF transition begin_us=%llu to_us=%llu drain_us=%llu from_us=%llu setup_us=%llu from_owned=%d to_owned=%d player_cache=%d cache_dirty=%d compositor=%d\n",
+    printf("PERF transition begin_us=%llu drain_us=%llu to_us=%llu from_us=%llu setup_us=%llu from_owned=%d to_owned=%d player_cache=%d cache_dirty=%d compositor=%d\n",
            (unsigned long long) (perf_end_us - perf_begin_us),
-           (unsigned long long) (perf_to_done_us - perf_begin_us),
-           (unsigned long long) (perf_drain_done_us - perf_to_done_us),
-           (unsigned long long) (perf_from_done_us - perf_drain_done_us),
+           (unsigned long long) (perf_drain_done_us - perf_begin_us),
+           (unsigned long long) (perf_to_done_us - perf_drain_done_us),
+           (unsigned long long) (perf_from_done_us - perf_to_done_us),
            (unsigned long long) (perf_end_us - perf_from_done_us),
            ctx->buf_from_owned, ctx->buf_to_owned,
            used_player_cache, player_transition_cache_dirty, transition_compositor_is_active());
@@ -757,6 +912,7 @@ void nav_push(lv_obj_t * scr) {
         sync_home_indicator_visibility(scr);
         return;
     }
+    if (nav_depth > 0) back_target_cache_note_covered(nav_stack[nav_depth - 1]);
     if (nav_depth < NAV_STACK_MAX) {
         nav_stack[nav_depth++] = scr;
     }
@@ -975,6 +1131,16 @@ void gui_navigation_teardown(void) {
         static_snapshot_screen[i] = NULL;
     }
     player_transition_discard_cache();
+    /* Unlike the font/theme-invalidate call sites above, the screen this
+     * slot points at is about to be freed by the reload orchestrator --
+     * clear back_target_cache_screen FIRST (not just the buffer), before
+     * discarding, so a subsequent begin_slide_transition_ex() can never
+     * match a stale, freed pointer (or worse, one reused by a newly-built
+     * screen at the same address) against a would-be cache hit, and
+     * back_target_cache_discard() below has no still-valid screen left to
+     * schedule a pointless rebuild against. */
+    back_target_cache_screen = NULL;
+    back_target_cache_discard();
 }
 
 /* Returns true while a committed slide transition is still animating.
@@ -1011,6 +1177,13 @@ void gui_navigation_remove_screen_instances(lv_obj_t ** screens, int count) {
                 nav_remove_stack_slot(i);
             }
         }
+        /* These screens are being deleted outright (not replaced by a new
+         * instance) -- clear rather than reschedule, same reasoning as
+         * gui_navigation_teardown()'s own screen-pointer clear. */
+        if (back_target_cache_screen == screens[j]) {
+            back_target_cache_screen = NULL;
+            back_target_cache_discard();
+        }
     }
 }
 
@@ -1025,6 +1198,7 @@ void gui_navigation_replace_home(lv_obj_t * old_screen, lv_obj_t * new_screen) {
         if (nav_stack[i] == old_screen) nav_stack[i] = new_screen;
     }
     register_static_snapshot(0, new_screen);
+    back_target_cache_note_replaced(old_screen, new_screen);
     if (lv_screen_active() == old_screen) lv_screen_load(new_screen);
 }
 
@@ -1033,6 +1207,7 @@ void gui_navigation_replace_static_screen(int snapshot_index, lv_obj_t * old_scr
         if (nav_stack[i] == old_screen) nav_stack[i] = new_screen;
     }
     register_static_snapshot(snapshot_index, new_screen);
+    back_target_cache_note_replaced(old_screen, new_screen);
     if (lv_screen_active() == old_screen) lv_screen_load(new_screen);
 }
 

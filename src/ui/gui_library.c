@@ -1835,6 +1835,14 @@ static void album_thumbnail_end_screen(lv_obj_t * list) {
 }
 
 static void album_thumbnail_poll_cb(lv_timer_t * timer) {
+    /* Same reasoning as compact_list_poll_fetch_cb()'s own comment
+     * (screen_builders.c): this timer's row-image/cache-eviction work
+     * landing in the same tick as a live gesture's frame-present call is
+     * exactly the kind of variable-cost interference that produces uneven
+     * frame pacing mid-animation. Deferring costs nothing -- a landed
+     * decode just sits ready a tick or two longer, and this timer keeps
+     * rescheduling itself regardless. */
+    if (gui_navigation_transition_in_progress()) return;
     if (!album_thumbnail_active) {
         start_next_album_thumbnail();
         if (!album_thumbnail_active && !atomic_load(&album_thumb_gen_active)) lv_timer_pause(timer);
@@ -3501,13 +3509,18 @@ static void refresh_library_screens_after_reload(void) {
      * whose rows reference the library arrays replaced by the reload. */
     if (lv_screen_active() != gui_busy_get_screen()) {
         nav_reset_to_home();
-    } else {
-        /* Purge screens being replaced from nav_stack before deleting them
-         * so a subsequent nav_pop() does not pop a deleted screen. */
-        lv_obj_t * being_replaced[] = { all_songs_screen, artists_screen, albums_screen, album_artist_screen,
-                                         recently_added_screen };
-        gui_navigation_remove_screen_instances(being_replaced, (int)(sizeof(being_replaced) / sizeof(being_replaced[0])));
     }
+    /* Purge screens being replaced from nav_stack before deleting them so a
+     * subsequent nav_pop() does not pop a deleted screen -- a no-op for the
+     * nav-stack part after nav_reset_to_home() above already cleared it,
+     * but this ALSO clears gui_navigation.c's back_target_cache_screen if
+     * it points at any of these (real use-after-free caught in review:
+     * that cache can be covered by a screen one of these lists pushed, and
+     * previously only the busy-screen branch ran this cleanup, leaving the
+     * non-busy path free to delete a screen this cache still pointed at). */
+    lv_obj_t * being_replaced[] = { all_songs_screen, artists_screen, albums_screen, album_artist_screen,
+                                     recently_added_screen };
+    gui_navigation_remove_screen_instances(being_replaced, (int)(sizeof(being_replaced) / sizeof(being_replaced[0])));
 
     lv_obj_delete(all_songs_screen);
     lv_obj_delete(artists_screen);

@@ -356,8 +356,7 @@ void safe_charging_poll(bool enabled, bool force) {
     static struct timespec last_apply;
     /* Captured the first time the cap is applied this run, so disabling can
      * restore the exact pre-cap values rather than a guessed "default"
-     * register value (which the AXP2101/MP2731 quirks elsewhere in this file
-     * have shown can't be assumed to be the same across hardware revisions). */
+     * register value. */
     static bool current_saved = false;
     static uint8_t saved_axp2101_current;
     static uint8_t saved_mp2731_current;

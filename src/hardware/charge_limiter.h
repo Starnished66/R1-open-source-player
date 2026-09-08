@@ -29,8 +29,12 @@ bool charge_limiter_is_holding(void);
  * (e.g. LED indicators). */
 bool charge_limiter_is_confirmed_off(void);
 
-/* Enforces the 500mA charge-current cap while enabled. Disabled is a no-op
- * and does not restore or otherwise modify the current PMIC setting. */
+/* Enforces the 500mA charge-current cap while enabled, on both the AXP2101
+ * and the MP2731 (the AXP2101's cap has no effect on the R3Pro II, so the
+ * MP2731 register is set to its closest equivalent, 480mA). The pre-cap
+ * register values are captured the first time the cap is applied each run
+ * and written back when disabled, restoring whatever charge-current setting
+ * was in place before this module touched it. */
 void safe_charging_poll(bool enabled, bool force);
 
 #endif /* CHARGE_LIMITER_H */

@@ -1,11 +1,11 @@
 #include "charge_limiter.h"
-#include "battery.h"
 #include "debug_log.h"
 
 #include <fcntl.h>
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -18,15 +18,10 @@
 #define AXP2101_I2C_BUS "/dev/i2c-0"
 #define AXP2101_I2C_ADDR 0x34
 
-/* module_en, X-Powers AXP2101 datasheet register map section 8.2 (addr
- * 0x18) -- bit 1 (chg_en) is the real charger master enable/disable
- * ("Cell Battery charge enable"), distinct from bit 3 (gauge_en, the fuel
- * gauge -- must be preserved, never touched here) and bit 0 (watchdog_en).
- * Always read-modify-write this register, never a blind write of just the
- * one bit's value -- a naive write would silently disable the fuel gauge
- * and/or watchdog too. */
-#define AXP2101_REG_MODULE_EN 0x18
-#define AXP2101_MODULE_EN_CHG_BIT (1u << 1)
+/* Register 0x64 on the AXP2101 is for CV Charge Voltage Settings.
+ * Only the 3 low bits are used. The 3 low bits define the charge voltage
+ * limit. */
+#define AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING 0x64
 
 /* comm_stat1, addr 0x01, bits[2:0] -- charging status straight from the
  * PMIC (000 tri-charge, 001 pre-charge, 010 constant-current, 011
@@ -42,13 +37,6 @@
 #define AXP2101_REG_CHG_CURRENT 0x62
 #define AXP2101_CHG_CURRENT_MASK 0x1Fu
 #define AXP2101_CHG_CURRENT_500MA 0x08u
-
-/* Disabling chg_en in REG_MODULE_EN turns off the charger state machine
- * across both constant-current and constant-voltage phases. */
-
-#define CHARGE_LIMITER_STOP_PERCENT 85
-#define CHARGE_LIMITER_TRIGGER_PERCENT 84
-#define CHARGE_LIMITER_RESUME_PERCENT 82
 
 /* Re-checks and re-applies at most this often rather than on every GUI tick.
  * Periodic re-application ensures any state changes (such as adapter replug)
@@ -106,28 +94,60 @@ static void log_chg_stat(const char * when) {
         "charge_done", "not_charging", "reserved", "reserved",
     };
     DBG_LOG("charge_limiter: chg_stat %s = %s (0x%02X)\n", when, names[stat & 0x07], stat & 0x07);
+
+    if (!axp2101_read_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, &stat)) return;
+    printf("charge_limiter: CV Charge Voltage Setting = %d\n", stat);
 }
 
-static bool set_charging_enabled(bool enabled) {
-    uint8_t module_en;
-    if (!axp2101_read_reg(AXP2101_REG_MODULE_EN, &module_en)) return false;
+enum CHARGE_VOLTAGE_LIMIT {
+	CHARGE_VOLTAGE_LIMIT_4V    = 1,
+	CHARGE_VOLTAGE_LIMIT_4_1V  = 2,
+	CHARGE_VOLTAGE_LIMIT_4_2V  = 3,
+	CHARGE_VOLTAGE_LIMIT_4_35V = 4,
+	CHARGE_VOLTAGE_LIMIT_4_4V  = 5,
+};
 
-    uint8_t desired = enabled ? (module_en | AXP2101_MODULE_EN_CHG_BIT)
-                              : (module_en & (uint8_t) ~AXP2101_MODULE_EN_CHG_BIT);
-    if (desired != module_en && !axp2101_write_reg(AXP2101_REG_MODULE_EN, desired)) return false;
+// Function to set AXP2101 charge_voltage_limit
+// Returns true on success, false on failure
+/*
+ * Charge Voltage Limit Value Definition:
+ * 000 -> reserved
+ * 001 -> 4.0V
+ * 010 -> 4.1V
+ * 011 -> 4.2V
+ * 100 -> 4.35V
+ * 101 -> 4.4V
+ * 11X -> reserved
+ *
+ * Source: https://files.waveshare.com/wiki/common/X-power-AXP2101_SWcharge_V1.0.pdf
+ */
+// NOTE: the low 3 bits of register 0x64 are the only ones used in that byte. So it is safe to always write 0 to the other bits.
+static bool set_charge_voltage_limit(enum CHARGE_VOLTAGE_LIMIT value) {
+	// return failure if trying to set an invalid value (reserved)
+	if (value == 0 || value >= 6) {
+		return false;
+	}
 
-    uint8_t readback;
-    if (!axp2101_read_reg(AXP2101_REG_MODULE_EN, &readback)) return false;
-    bool confirmed = (readback & AXP2101_MODULE_EN_CHG_BIT) ==
-                     (enabled ? AXP2101_MODULE_EN_CHG_BIT : 0);
-    DBG_LOG("charge_limiter: charger %s readback reg18=0x%02X -> %s\n",
-            enabled ? "enable" : "disable", readback, confirmed ? "confirmed" : "FAILED");
-    log_chg_stat(enabled ? "after restore" : "after throttle");
-    return confirmed;
+	uint8_t stat;
+
+	// read current setting
+	if (!axp2101_read_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, &stat)) return false;
+	printf("charge_limiter: CV Charge Voltage Setting = %d\n", stat);
+
+	// if value already correct, exit early
+	if (stat == value) return true;
+
+	// write the new setting (no write happens if value was already correct)
+	if (!axp2101_write_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, value)) return false;
+	printf("charge_limiter: set charge voltage limit value to %d\n", value);
+
+	// check for failed write
+	axp2101_read_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, &stat);
+	printf("charge_limiter: checked charge voltage limit value: %d\n", value);
+	if (stat != value) return false;
+
+	return true;
 }
-
-static bool disable_charging(void) { return set_charging_enabled(false); }
-static bool enable_charging(void) { return set_charging_enabled(true); }
 #endif
 
 void charge_limiter_poll(bool enabled, bool force) {
@@ -143,34 +163,17 @@ void charge_limiter_poll(bool enabled, bool force) {
     last_apply = now;
 
     if (!enabled) {
-        if (enable_charging()) {
-            limiter_holding = false;
-            charger_confirmed_off = false;
-        } else {
-            last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+        // set back to default 4.4V charge voltage
+        if (!set_charge_voltage_limit(CHARGE_VOLTAGE_LIMIT_4_4V)) {
+        	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
         }
+
         return;
     }
 
-    int percent = battery_get_percent();
-    if (percent < 0) return; /* no battery data (e.g. host build) -- nothing to act on */
-
-    /* Log battery percent and threshold state. */
-    DBG_LOG("charge_limiter: poll percent=%d (target=%d trigger=%d resume=%d holding=%d)\n",
-            percent, CHARGE_LIMITER_STOP_PERCENT, CHARGE_LIMITER_TRIGGER_PERCENT,
-            CHARGE_LIMITER_RESUME_PERCENT, limiter_holding);
-
-    /* Trigger one percentage point early to absorb gauge lag, with hysteresis
-     * to avoid repeatedly cycling charging on noisy readings. */
-    if (percent >= CHARGE_LIMITER_TRIGGER_PERCENT) limiter_holding = true;
-    else if (percent <= CHARGE_LIMITER_RESUME_PERCENT) limiter_holding = false;
-
-    bool applied = limiter_holding ? disable_charging() : enable_charging();
-    if (applied) {
-        /* Update confirmed state only upon register confirmation. */
-        charger_confirmed_off = limiter_holding;
-    } else {
-        last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+    // set to 4.2V charge voltage
+    if (!set_charge_voltage_limit(CHARGE_VOLTAGE_LIMIT_4_2V)) {
+    	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
     }
 #endif
 }

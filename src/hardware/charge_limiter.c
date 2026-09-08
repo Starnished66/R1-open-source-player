@@ -354,14 +354,40 @@ void safe_charging_poll(bool enabled, bool force) {
     (void) force;
 #else
     static struct timespec last_apply;
-    // TODO: doesn't just returning mean that the registers are never reset? shouldn't this use the same pattern as charge_limiter_poll() uses?
-    if (!enabled) return; /* Off means leave the PMIC unchanged. */
+    /* Captured the first time the cap is applied this run, so disabling can
+     * restore the exact pre-cap values rather than a guessed "default"
+     * register value (which the AXP2101/MP2731 quirks elsewhere in this file
+     * have shown can't be assumed to be the same across hardware revisions). */
+    static bool current_saved = false;
+    static uint8_t saved_axp2101_current;
+    static uint8_t saved_mp2731_current;
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     if (!force && last_apply.tv_sec != 0 &&
         now.tv_sec - last_apply.tv_sec < CHARGE_LIMITER_REEVALUATE_SECONDS) return;
+
+    if (!enabled) {
+        if (!current_saved) return; /* cap was never applied this run; nothing to restore */
+        last_apply = now;
+
+        bool axp_ok = axp2101_set_charge_current_limit(saved_axp2101_current);
+        bool mp_ok = mp2731_set_charge_current_limit(saved_mp2731_current);
+        if (!axp_ok || !mp_ok) {
+            last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
+            return;
+        }
+        current_saved = false;
+        return;
+    }
     last_apply = now;
+
+    if (!current_saved) {
+        uint8_t stat;
+        if (axp2101_read_reg(AXP2101_REG_CHG_CURRENT, &stat)) saved_axp2101_current = stat & AXP2101_CHG_CURRENT_MASK;
+        if (mp2731_read_reg(MP2731_REG_CHARGE_CURRENT_REGULATION, &stat)) saved_mp2731_current = stat & MP2731_FAST_CHARGE_CURRENT_MASK;
+        current_saved = true;
+    }
 
     // cap to 500mA charge current
     if (!axp2101_set_charge_current_limit(AXP2101_CHG_CURRENT_500MA)) {

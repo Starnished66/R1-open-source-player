@@ -1,4 +1,5 @@
 #include "battery.h"
+#include "board_config.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -10,6 +11,16 @@
 #include <time.h>
 
 #define POWER_SUPPLY_DIR "/sys/class/power_supply"
+
+/* On the R3Pro II, the "battery" power-supply node's own "status" attribute
+ * is stuck reporting "Discharging" even while actually charging (its
+ * "capacity" attribute is unaffected and stays accurate). The MP2731
+ * charger IC exposes its own power-supply node with a correct "status"
+ * attribute, so that node is used for status specifically on this board --
+ * see charge_limiter.c's own BOARD_R3PROII gating for the same charger. */
+#if defined(BOARD_R3PROII)
+#define MP2731_CHARGER_DEVICE "mp2731-charger"
+#endif
 
 /* Reads a single-line sysfs attribute (e.g. ".../battery/capacity") into
  * `out`, trimming the trailing newline. Returns false if the file doesn't
@@ -179,8 +190,13 @@ static bool refresh_battery_cache_locked(void) {
 
     char capacity_str[16];
     char status[24];
+#if defined(MP2731_CHARGER_DEVICE)
+    bool have_status = read_sysfs_attr(MP2731_CHARGER_DEVICE, "status", status, sizeof(status));
+#else
+    bool have_status = read_sysfs_attr(cached_battery_device, "status", status, sizeof(status));
+#endif
     if (!read_sysfs_attr(cached_battery_device, "capacity", capacity_str, sizeof(capacity_str)) ||
-        !read_sysfs_attr(cached_battery_device, "status", status, sizeof(status))) {
+        !have_status) {
         /* A driver can disappear/reappear across suspend. Rediscover once
          * on the next call instead of pinning a stale sysfs name forever. */
         cached_battery_device[0] = '\0';

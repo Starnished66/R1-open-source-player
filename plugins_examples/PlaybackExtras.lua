@@ -1,9 +1,10 @@
 plugin.define({ id = "example.playback_extras", name = "Playback Extras", version = "1.0", api_min = 1 })
 
--- Reference implementation for plugin.register_list_item("playback", ...)
+-- Reference implementation for plugin.register_list_item("music_audio", ...)
 -- and plugin.show_settings_list() (see PLUGINS.md): adds a "Loudness Boost"
--- row to Settings -> Playback, opening a nested submenu with a real toggle
--- switch, a real slider, and a nested row (a submenu inside a submenu).
+-- row to Settings -> Music Settings -> Audio, opening a nested submenu with
+-- a real toggle switch, a real slider, and a nested row (a submenu inside a
+-- submenu).
 -- Also demonstrates the icon/height/text_size row options: the toggle row
 -- gets a real icon (pointed at a real stock theme2 asset by its raw
 -- filesystem path -- no user-supplied image needed for this example to
@@ -101,4 +102,4 @@ local function open_menu()
     })
 end
 
-plugin.register_list_item("playback", "Loudness Boost", open_menu)
+plugin.register_list_item("music_audio", "Loudness Boost", open_menu)

@@ -1,6 +1,7 @@
 #include "screen_builders.h"
 #include "gui_theme.h"
 #include "gui_plugins.h"
+#include "gui_navigation.h"
 #include "assets.h"
 #include "debug_log.h"
 
@@ -57,8 +58,9 @@ lv_style_t style_theme_text_primary;
 lv_style_t style_theme_text_muted;
 
 /* Runtime geometry replaces the original panel-specific 448/464/476px
- * constants.  Small symmetric edge gutters preserve the pill silhouette
- * while allowing the same screens to fill a wider sibling device. */
+ * constants. Rows span the active display: parent lists already own their
+ * scrolling/clipping bounds, so subtracting a second gutter here produced
+ * asymmetric empty space whenever a flex list left-aligned its children. */
 static int32_t active_display_width(void) {
     lv_display_t * display = lv_display_get_default();
     int32_t width = display ? lv_display_get_horizontal_resolution(display) : 480;
@@ -69,15 +71,11 @@ static void compact_list_refresh_font_layout(lv_obj_t * list);
 static void row_label_layout_identity(lv_obj_t * row, lv_obj_t * secondary, int32_t height);
 
 int32_t ui_list_row_width(void) {
-    int32_t width = active_display_width();
-    int32_t gutter = 12;
-    return width > gutter * 2 ? width - gutter * 2 : width;
+    return active_display_width();
 }
 
 int32_t ui_list_row_width_wide(void) {
-    int32_t width = active_display_width();
-    int32_t gutter = 8;
-    return width > gutter * 2 ? width - gutter * 2 : width;
+    return active_display_width();
 }
 
 void screen_builders_init_list_row_style(void) {
@@ -1498,6 +1496,19 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
  * creation comment (build_compact_list_widget()) for why it's per-list and
  * starts paused rather than a single always-on global timer. */
 static void compact_list_poll_fetch_cb(lv_timer_t * timer) {
+    /* Real perf finding: this timer's own memcpy/repaint work (below) is
+     * exactly the kind of variable-cost work that, landing in the same
+     * lv_timer_handler() tick as a live gesture's own frame-present call,
+     * pushes that tick over the 16.67ms vsync budget and produces visibly
+     * uneven frame pacing mid-animation -- LVGL has no timer priority
+     * scheduling in this version, and its timer list is LIFO (newest-
+     * created runs first), so which one wins a given tick isn't something
+     * this app otherwise controls. Deferring is free: a landed job just
+     * sits ready a tick or two longer, picked up the instant the
+     * transition ends, since this timer keeps rescheduling itself
+     * regardless (nothing below ever runs to pause it while this guard is
+     * what's returning early). */
+    if (gui_navigation_transition_in_progress()) return;
     lv_obj_t * list = (lv_obj_t *) lv_timer_get_user_data(timer);
     compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
     compact_list_fetch_job_t * job = data->pending_job;

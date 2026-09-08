@@ -6,6 +6,12 @@
 #include <stdint.h>
 #include "artwork_coordinator.h"
 
+/* Persistent RGB565 cache sizes shared by the library and player.  The
+ * on-card representation is a 24-bit BMP, while callers receive RGB565
+ * buffers from cover_decode.c. */
+#define ALBUMART_THUMBNAIL_SIZE 72
+#define ALBUMART_PLAYER_CACHE_SIZE 480
+
 /* POSIX port of Rockbox apps/recorder/albumart.c (GPLv2+).
  * Search order matches find_albumart()/search_albumart_files():
  *   ./<track><size>.{jpeg,jpg,png,bmp}
@@ -35,6 +41,17 @@ bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, 
  * cover (or audio file) mtime. User-supplied sized files next to the track
  * are accepted as-is. */
 bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int height, char * found, size_t found_size);
+
+/* Strict variant for consumers that need the player-generated cache rather
+ * than an arbitrary user-supplied .WxH image beside the track.  It only
+ * accepts the hashed atomic BMP produced by albumart_store_rgb565(). */
+bool albumart_generated_cache_fresh(const albumart_info_t * info, int width, int height,
+                                    char * found, size_t found_size);
+
+/* Exposes the internal v2-<hash> filename key for diagnostics only (e.g.
+ * logging the exact key a lookup computed, to compare against what's
+ * actually on disk). Not for constructing paths outside this file. */
+uint64_t albumart_debug_thumbnail_key(const albumart_info_t * info);
 
 /* Reads a JPEG/PNG/BMP found by albumart_find into *out_data (caller frees). */
 bool albumart_load_file(const char * path, uint8_t ** out_data, uint32_t * out_size, uint32_t max_bytes);

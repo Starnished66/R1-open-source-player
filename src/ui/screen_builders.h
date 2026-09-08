@@ -39,8 +39,8 @@
 int32_t ui_list_row_width(void);
 int32_t ui_list_row_width_wide(void);
 #define LIST_ROW_WIDTH (ui_list_row_width())
-/* Wider rows for the main library lists. Both widths are calculated from
- * the active panel: music rows retain 8px/side, settings/actions 12px/side. */
+/* Compatibility name used by roomier library lists. Both row-width helpers
+ * follow the active display width and intentionally add no outer gutter. */
 #define LIST_ROW_WIDTH_WIDE (ui_list_row_width_wide())
 #define LIST_ROW_HEIGHT 84
 #define MUSIC_LIST_ROW_HEIGHT GUI_MUSIC_ROW_HEIGHT

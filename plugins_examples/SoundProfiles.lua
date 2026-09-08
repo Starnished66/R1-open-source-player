@@ -1,6 +1,7 @@
 plugin.define({ id = "example.sound_profiles", name = "Sound Profiles", version = "1.0", api_min = 1 })
 
--- Sound profile switcher, adds a "Sound Profile" row to Settings -> Playback.
+-- Sound profile switcher, adds a "Sound Profile" row to Settings -> Music
+-- Settings -> Audio.
 -- Reference implementation for the plugin.eq_*() API (see PLUGINS.md):
 -- ships a few curated EQ presets on top of this app's own 10-band
 -- parametric EQ (src/audio/peq.c), switchable with one tap, persisted
@@ -94,7 +95,7 @@ end
 local current_key = read_state()
 apply_profile(current_key)
 
-plugin.register_list_item("playback", "Sound Profile", function()
+plugin.register_list_item("music_audio", "Sound Profile", function()
     local names = { "Flat (Default)" }
     for _, p in ipairs(PROFILES) do table.insert(names, p.name) end
 

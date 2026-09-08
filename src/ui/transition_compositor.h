@@ -31,7 +31,9 @@
  * and MUST be independently owned -- never a live alias of real
  * framebuffer memory. to_offset is the same +width/-width convention
  * slide_transition_anim_x_cb() uses (the incoming frame's position relative
- * to the outgoing one).
+ * to the outgoing one). When reveal is true, the incoming frame stays
+ * stationary at (0, 0) for the entire transition while the outgoing frame
+ * slides off to reveal it.
  *
  * The two physical framebuffer pages ping-pong every frame (writing into
  * whichever page is currently inactive, then presenting it). A live-aliased
@@ -54,7 +56,7 @@
  * isn't available on this display, a compositor session is already
  * active, or either buffer isn't a plain, full-screen, opaque RGB565
  * buffer of the expected shape. */
-bool transition_compositor_begin(const lv_draw_buf_t * from, const lv_draw_buf_t * to, int32_t to_offset);
+bool transition_compositor_begin(const lv_draw_buf_t * from, const lv_draw_buf_t * to, int32_t to_offset, bool reveal);
 
 /* True if this display could potentially use the compositor at all (pan-
  * based double buffering active) -- doesn't guarantee a later
@@ -67,7 +69,9 @@ bool transition_compositor_available(void);
 
 /* Composes and presents exactly one frame at horizontal offset v (the
  * outgoing frame effectively at x=v, the incoming one at x=v+to_offset --
- * same convention slide_transition_anim_x_cb() uses). Every row from y=0
+ * same convention slide_transition_anim_x_cb() uses -- except in reveal
+ * mode, where the incoming frame stays pinned at x=0 for the whole
+ * gesture instead). Every row from y=0
  * through height-1 is recomposited from `from`/`to` on every call -- no
  * row is ever skipped, re-stamped from a fixed source, or left untouched,
  * so the persistent status bar / home-indicator content (already baked

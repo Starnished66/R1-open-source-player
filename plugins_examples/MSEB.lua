@@ -2,8 +2,8 @@ plugin.define({ id = "example.mseb", name = "MSEB", version = "1.0", api_min = 1
 
 -- "MSEB" -- an intuitive, mood-based tone-tuning screen on top of this
 -- app's own 10-band parametric EQ (src/audio/peq.c), adds an "MSEB" row to
--- Settings -> Playback (plugin.register_list_item(), same hook
--- SoundProfiles.lua already uses for its own row).
+-- Settings -> Music Settings -> Audio (plugin.register_list_item(), same
+-- hook SoundProfiles.lua already uses for its own row).
 --
 -- Modeled after the stock HiBy R1 firmware's own "MSEB" (MageSound 8-Ball)
 -- feature, reverse-engineered from a decompile of the stock binary: that
@@ -233,7 +233,7 @@ end
 -- Grouped into 3 sub-screens (3/4/3 sliders) rather than one 10-slider
 -- screen: plugin.show_settings_list() silently drops any slider past
 -- PLUGIN_SETTINGS_LIST_MAX_SLIDERS (4) in a single call.
-plugin.register_list_item("playback", "MSEB", function()
+plugin.register_list_item("music_audio", "MSEB", function()
     plugin.show_settings_list("MSEB", {
         {
             type = "toggle",

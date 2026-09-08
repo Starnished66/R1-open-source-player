@@ -45,6 +45,7 @@ static compositor_mode_t compositor_mode = COMPOSITOR_MODE_NONE;
 static const lv_draw_buf_t * compositor_from;
 static const lv_draw_buf_t * compositor_to;
 static int32_t compositor_to_offset;
+static bool compositor_reveal;
 static int32_t compositor_width;
 static int32_t compositor_height;
 static uint32_t compositor_fb_stride;
@@ -64,8 +65,13 @@ static uint64_t compositor_perf_now_us(void) {
 }
 static uint64_t compositor_perf_frame_total_us;
 static uint64_t compositor_perf_frame_max_us;
+static uint64_t compositor_perf_compose_total_us;
+static uint64_t compositor_perf_compose_max_us;
+static uint64_t compositor_perf_present_total_us;
+static uint64_t compositor_perf_present_max_us;
 static unsigned compositor_perf_frame_count;
 static unsigned compositor_perf_present_failures;
+static uint64_t compositor_perf_last_frame_start_us;
 #endif
 
 bool transition_compositor_available(void) {
@@ -76,9 +82,9 @@ bool transition_compositor_available(void) {
 #endif
 }
 
-bool transition_compositor_begin(const lv_draw_buf_t * from, const lv_draw_buf_t * to, int32_t to_offset) {
+bool transition_compositor_begin(const lv_draw_buf_t * from, const lv_draw_buf_t * to, int32_t to_offset, bool reveal) {
 #if COMPOSITOR_DISABLED || !LV_USE_LINUX_FBDEV
-    (void) from; (void) to; (void) to_offset;
+    (void) from; (void) to; (void) to_offset; (void) reveal;
     return false;
 #else
     if (compositor_active) return false; /* only one slide transition is ever in flight at once (see slide_transition_active in gui.c) -- never expected, guarded anyway */
@@ -155,6 +161,7 @@ bool transition_compositor_begin(const lv_draw_buf_t * from, const lv_draw_buf_t
     compositor_from = from;
     compositor_to = to;
     compositor_to_offset = to_offset;
+    compositor_reveal = reveal;
     compositor_width = w;
     compositor_height = h;
     compositor_fb_stride = fb_stride;
@@ -162,6 +169,10 @@ bool transition_compositor_begin(const lv_draw_buf_t * from, const lv_draw_buf_t
 #ifdef UI_PERF_TRACE
     compositor_perf_frame_total_us = 0;
     compositor_perf_frame_max_us = 0;
+    compositor_perf_compose_total_us = 0;
+    compositor_perf_compose_max_us = 0;
+    compositor_perf_present_total_us = 0;
+    compositor_perf_present_max_us = 0;
     compositor_perf_frame_count = 0;
     compositor_perf_present_failures = 0;
 #endif
@@ -192,6 +203,15 @@ bool transition_compositor_frame(int32_t v) {
     if (compositor_mode != COMPOSITOR_MODE_HORIZONTAL) return false;
 #ifdef UI_PERF_TRACE
     uint64_t perf_frame_start_us = compositor_perf_now_us();
+    /* Gap since the PREVIOUS frame's own start -- the metric that actually
+     * shows pacing unevenness (a frame whose own compose+present took a
+     * normal ~16ms can still have been DELIVERED late if something else
+     * ran in the same lv_timer_handler() tick before this callback fired,
+     * or if the previous tick's own call overran). 0 for this session's
+     * first frame (nothing to compare against yet). */
+    uint64_t perf_gap_us = compositor_perf_frame_count ?
+                            (perf_frame_start_us - compositor_perf_last_frame_start_us) : 0;
+    compositor_perf_last_frame_start_us = perf_frame_start_us;
 #endif
     lv_display_t * disp = lv_display_get_default();
     /* Re-queried every frame, not cached at begin() -- the inactive half
@@ -213,18 +233,24 @@ bool transition_compositor_frame(int32_t v) {
 
     int32_t w = compositor_width;
     int32_t from_x = v;
-    int32_t to_x = v + compositor_to_offset;
+    int32_t to_x = compositor_reveal ? 0 : (v + compositor_to_offset);
 
     /* Intersect each source's current on-screen span with the visible
      * [0, w) screen area -- handles every offset (0, -w/+w, any
      * intermediate value, and a clamped overshoot past either end)
-     * uniformly, with no separate forward/backward special-casing: the two
-     * spans are always exactly adjacent (to_offset is always +-w), so
-     * together they cover the full destination row with no gap or overlap.
-     * At v==0, from_start=0/from_end=w and to_start=to_end (nothing) --
-     * i.e. the outgoing source reproduces byte-for-byte; at v==-to_offset
-     * the reverse holds for the incoming source -- the exact boundary
-     * invariants TARGET ARCHITECTURE section D calls for. */
+     * uniformly, with no separate forward/backward special-casing. In
+     * non-reveal mode, the two spans are always exactly adjacent
+     * (to_offset is always +-w), so together they cover the full
+     * destination row with no gap or overlap. In reveal mode, the
+     * destination span stays fixed across the entire width [0, w), so the
+     * two spans intentionally overlap: writing `to` first and `from` second
+     * ensures the moving outgoing screen correctly covers the stationary
+     * incoming screen on top without being overwritten. In non-reveal mode,
+     * the spans are disjoint, so write order is completely interchangeable.
+     * At v==0, from_start=0/from_end=w and to_start=to_end (nothing) in
+     * non-reveal mode; in reveal mode, from covers the full row over to.
+     * At v==-to_offset, the incoming source is fully revealed -- the exact
+     * boundary invariants TARGET ARCHITECTURE section D calls for. */
     int32_t from_start = from_x < 0 ? 0 : from_x;
     int32_t from_end = (from_x + w > w) ? w : from_x + w;
     if (from_end < from_start) from_end = from_start;
@@ -270,14 +296,18 @@ bool transition_compositor_frame(int32_t v) {
      * baked in, so compositing the whole frame uniformly is what makes
      * those bars slide correctly instead of staying stationary). */
     for (int32_t y = 0; y < compositor_height; y++) {
-        if (from_copy_bytes)
-            memcpy(dest_row + (size_t) from_start * 2U, from_row, from_copy_bytes);
         if (to_copy_bytes)
             memcpy(dest_row + (size_t) to_start * 2U, to_row, to_copy_bytes);
+        if (from_copy_bytes)
+            memcpy(dest_row + (size_t) from_start * 2U, from_row, from_copy_bytes);
         from_row += compositor_from->header.stride;
         to_row += compositor_to->header.stride;
         dest_row += compositor_fb_stride;
     }
+
+#ifdef UI_PERF_TRACE
+    uint64_t perf_compose_end_us = compositor_perf_now_us();
+#endif
 
     /* Only commit the just-composed page to the screen once every row has
      * been written. A present failure means the just-composed frame was
@@ -302,9 +332,26 @@ bool transition_compositor_frame(int32_t v) {
         return false;
     }
 #ifdef UI_PERF_TRACE
-    uint64_t perf_frame_us = compositor_perf_now_us() - perf_frame_start_us;
+    uint64_t perf_present_end_us = compositor_perf_now_us();
+    uint64_t perf_compose_us = perf_compose_end_us - perf_frame_start_us;
+    uint64_t perf_present_us = perf_present_end_us - perf_compose_end_us;
+    uint64_t perf_frame_us = perf_present_end_us - perf_frame_start_us;
+    compositor_perf_compose_total_us += perf_compose_us;
+    if (perf_compose_us > compositor_perf_compose_max_us) compositor_perf_compose_max_us = perf_compose_us;
+    compositor_perf_present_total_us += perf_present_us;
+    if (perf_present_us > compositor_perf_present_max_us) compositor_perf_present_max_us = perf_present_us;
     compositor_perf_frame_total_us += perf_frame_us;
     if (perf_frame_us > compositor_perf_frame_max_us) compositor_perf_frame_max_us = perf_frame_us;
+    /* Per-frame line, not just the end-of-session aggregate -- pacing
+     * unevenness (this app's own timers competing for the same tick, an
+     * occasional missed vblank, anything else) only shows up as a PATTERN
+     * across consecutive frames, which avg_us/max_us alone can't reveal. */
+    printf("PERF compositor frame idx=%u gap_us=%llu compose_us=%llu present_us=%llu total_us=%llu\n",
+           compositor_perf_frame_count,
+           (unsigned long long) perf_gap_us,
+           (unsigned long long) perf_compose_us,
+           (unsigned long long) perf_present_us,
+           (unsigned long long) perf_frame_us);
     compositor_perf_frame_count++;
 #endif
     return true;
@@ -388,6 +435,10 @@ bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay,
 #ifdef UI_PERF_TRACE
     compositor_perf_frame_total_us = 0;
     compositor_perf_frame_max_us = 0;
+    compositor_perf_compose_total_us = 0;
+    compositor_perf_compose_max_us = 0;
+    compositor_perf_present_total_us = 0;
+    compositor_perf_present_max_us = 0;
     compositor_perf_frame_count = 0;
     compositor_perf_present_failures = 0;
     printf("PERF drawer compositor begin_active=1 w=%d h=%d stride=%u fixed_top=%d\n",
@@ -471,6 +522,10 @@ bool transition_compositor_vertical_overlay_frame(int32_t y) {
         }
     }
 
+#ifdef UI_PERF_TRACE
+    uint64_t perf_compose_end_us = compositor_perf_now_us();
+#endif
+
     if (!lv_linux_fbdev_present_external_page(disp)) {
 #ifdef UI_PERF_TRACE
         compositor_perf_present_failures++;
@@ -479,7 +534,14 @@ bool transition_compositor_vertical_overlay_frame(int32_t y) {
         return false;
     }
 #ifdef UI_PERF_TRACE
-    uint64_t frame_us = compositor_perf_now_us() - perf_frame_start_us;
+    uint64_t perf_present_end_us = compositor_perf_now_us();
+    uint64_t perf_compose_us = perf_compose_end_us - perf_frame_start_us;
+    uint64_t perf_present_us = perf_present_end_us - perf_compose_end_us;
+    uint64_t frame_us = perf_present_end_us - perf_frame_start_us;
+    compositor_perf_compose_total_us += perf_compose_us;
+    if (perf_compose_us > compositor_perf_compose_max_us) compositor_perf_compose_max_us = perf_compose_us;
+    compositor_perf_present_total_us += perf_present_us;
+    if (perf_present_us > compositor_perf_present_max_us) compositor_perf_present_max_us = perf_present_us;
     compositor_perf_frame_total_us += frame_us;
     if (frame_us > compositor_perf_frame_max_us) compositor_perf_frame_max_us = frame_us;
     compositor_perf_frame_count++;
@@ -501,11 +563,15 @@ void transition_compositor_end(void) {
     lv_display_enable_invalidation(disp, true);
     compositor_mode = COMPOSITOR_MODE_NONE;
 #ifdef UI_PERF_TRACE
-    printf("PERF compositor end frames=%u avg_us=%llu max_us=%llu present_failures=%u\n",
+    printf("PERF compositor end frames=%u avg_us=%llu max_us=%llu present_failures=%u compose_avg_us=%llu compose_max_us=%llu present_avg_us=%llu present_max_us=%llu\n",
            compositor_perf_frame_count,
            (unsigned long long) (compositor_perf_frame_count ? compositor_perf_frame_total_us / compositor_perf_frame_count : 0),
            (unsigned long long) compositor_perf_frame_max_us,
-           compositor_perf_present_failures);
+           compositor_perf_present_failures,
+           (unsigned long long) (compositor_perf_frame_count ? compositor_perf_compose_total_us / compositor_perf_frame_count : 0),
+           (unsigned long long) compositor_perf_compose_max_us,
+           (unsigned long long) (compositor_perf_frame_count ? compositor_perf_present_total_us / compositor_perf_frame_count : 0),
+           (unsigned long long) compositor_perf_present_max_us);
 #endif
     /* Catches up anything that changed elsewhere while invalidation was
      * disabled (status bar clock, etc.) on top of the transition's own

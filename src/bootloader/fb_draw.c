@@ -81,6 +81,8 @@ static const uint8_t * glyph_rows(char c) {
         case 'D': { static const uint8_t g[7] = { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E }; return g; }
         /* #####   #....   #....   ####.   #....   #....   ##### */
         case 'E': { static const uint8_t g[7] = { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F }; return g; }
+        /* .####   #....   #....   #.###   #...#   #...#   .###. */
+        case 'G': { static const uint8_t g[7] = { 0x0F, 0x10, 0x10, 0x17, 0x11, 0x11, 0x0E }; return g; }
         /* .###.   ..#..   ..#..   ..#..   ..#..   ..#..   .###. */
         case 'I': { static const uint8_t g[7] = { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E }; return g; }
         /* #...#   #..#.   #.#..   ##...   #.#..   #..#.   #...# */

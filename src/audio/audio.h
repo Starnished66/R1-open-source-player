@@ -138,8 +138,8 @@ void audio_seek_percent(double percent);
 
 double audio_get_position_seconds(void);
 /* Pending-aware position for durable pause/power-loss checkpoints. Unlike
- * audio_get_position_seconds(), this returns the latest deferred long-MP3
- * seek target while its background index is still being prepared. */
+ * audio_get_position_seconds(), this returns the latest deferred MP3 seek
+ * target while its background seek-index is still being prepared. */
 double audio_get_resume_position_seconds(void);
 double audio_get_duration_seconds(void);
 
@@ -149,6 +149,10 @@ unsigned int audio_get_sample_rate(void);
 /* Copies a coherent current-decoder snapshot. Returns false and zeroes *out
  * when nothing is loaded or the requested track has not opened yet. */
 bool audio_get_current_format_info(audio_current_format_info_t * out);
+
+/* Opens a local file only long enough to read its stream/container facts,
+ * then closes it without touching playback state or the output device. */
+bool audio_probe_file_format(const char * path, audio_current_format_info_t * out);
 
 /* 0.0 (silent) - 1.0 (full volume). Applied as software gain on the decoded PCM. */
 void audio_set_volume(float volume);

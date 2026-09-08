@@ -187,11 +187,39 @@ static plugin_list_item_t plugin_display_list_items[PLUGIN_MAX_DISPLAY_LIST_ITEM
 static int plugin_display_list_item_count = 0;
 
 /* Registry for plugin.register_list_item("playback", ...) --
- * gui_settings.c's build_music_plugins_screen() (Settings > Music Settings >
- * Plugins) lists these on their own dedicated screen. See PLUGIN_MAX_
- * PLAYBACK_LIST_ITEMS's own comment in plugin_manager.h. */
+ * gui_settings.c's build_music_playback_screen() appends these after its own
+ * built-in rows. See PLUGIN_MAX_PLAYBACK_LIST_ITEMS's own comment in
+ * plugin_manager.h. */
 static plugin_list_item_t plugin_playback_list_items[PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
 static int plugin_playback_list_item_count = 0;
+
+/* Registry for plugin.register_list_item("music_audio", ...) --
+ * gui_settings.c's build_music_audio_screen() appends these after its own
+ * built-in rows. See PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS's own comment in
+ * plugin_manager.h. */
+static plugin_list_item_t plugin_music_audio_list_items[PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS];
+static int plugin_music_audio_list_item_count = 0;
+
+/* Registry for plugin.register_list_item("music_controls", ...) --
+ * gui_settings.c's build_music_controls_screen() appends these after its own
+ * built-in rows. See PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS's own comment in
+ * plugin_manager.h. */
+static plugin_list_item_t plugin_music_controls_list_items[PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS];
+static int plugin_music_controls_list_item_count = 0;
+
+/* Registry for plugin.register_list_item("music_timers", ...) --
+ * gui_settings.c's build_music_timers_screen() appends these after its own
+ * built-in row. See PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS's own comment in
+ * plugin_manager.h. */
+static plugin_list_item_t plugin_music_timers_list_items[PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS];
+static int plugin_music_timers_list_item_count = 0;
+
+/* Registry for plugin.register_list_item("music_library", ...) --
+ * gui_settings.c's build_music_library_screen() appends these after its own
+ * built-in row. See PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS's own comment in
+ * plugin_manager.h. */
+static plugin_list_item_t plugin_music_library_list_items[PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS];
+static int plugin_music_library_list_item_count = 0;
 
 /* Registry for plugin.register_list_item("power", ...) -- gui.c's
  * build_settings_power_screen() appends these after its own built-in rows.
@@ -621,6 +649,30 @@ static int l_plugin_register_list_item(lua_State * L) {
                                PLUGIN_MAX_PLAYBACK_LIST_ITEMS);
         }
         append_list_item(plugin_playback_list_items, &plugin_playback_list_item_count, L, label);
+    } else if (strcmp(list_id, "music_audio") == 0) {
+        if (plugin_music_audio_list_item_count >= PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS) {
+            return luaL_error(L, "plugin.register_list_item: too many items registered for \"music_audio\" (max %d)",
+                               PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS);
+        }
+        append_list_item(plugin_music_audio_list_items, &plugin_music_audio_list_item_count, L, label);
+    } else if (strcmp(list_id, "music_controls") == 0) {
+        if (plugin_music_controls_list_item_count >= PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS) {
+            return luaL_error(L, "plugin.register_list_item: too many items registered for \"music_controls\" (max %d)",
+                               PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS);
+        }
+        append_list_item(plugin_music_controls_list_items, &plugin_music_controls_list_item_count, L, label);
+    } else if (strcmp(list_id, "music_timers") == 0) {
+        if (plugin_music_timers_list_item_count >= PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS) {
+            return luaL_error(L, "plugin.register_list_item: too many items registered for \"music_timers\" (max %d)",
+                               PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS);
+        }
+        append_list_item(plugin_music_timers_list_items, &plugin_music_timers_list_item_count, L, label);
+    } else if (strcmp(list_id, "music_library") == 0) {
+        if (plugin_music_library_list_item_count >= PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS) {
+            return luaL_error(L, "plugin.register_list_item: too many items registered for \"music_library\" (max %d)",
+                               PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS);
+        }
+        append_list_item(plugin_music_library_list_items, &plugin_music_library_list_item_count, L, label);
     } else if (strcmp(list_id, "power") == 0) {
         if (plugin_power_list_item_count >= PLUGIN_MAX_POWER_LIST_ITEMS) {
             return luaL_error(L, "plugin.register_list_item: too many items registered for \"power\" (max %d)",
@@ -634,7 +686,7 @@ static int l_plugin_register_list_item(lua_State * L) {
         }
         append_list_item(plugin_system_list_items, &plugin_system_list_item_count, L, label);
     } else {
-        return luaL_error(L, "plugin.register_list_item: unknown list_id '%s' (expected \"books\", \"settings\", \"display\", \"playback\", \"power\", or \"system\")", list_id);
+        return luaL_error(L, "plugin.register_list_item: unknown list_id '%s' (expected \"books\", \"settings\", \"display\", \"playback\", \"music_audio\", \"music_controls\", \"music_timers\", \"music_library\", \"power\", or \"system\")", list_id);
     }
     return 0;
 }
@@ -4149,6 +4201,14 @@ void plugin_manager_deinit(void) {
     plugin_display_list_item_count = 0;
     memset(plugin_playback_list_items, 0, sizeof(plugin_playback_list_items));
     plugin_playback_list_item_count = 0;
+    memset(plugin_music_audio_list_items, 0, sizeof(plugin_music_audio_list_items));
+    plugin_music_audio_list_item_count = 0;
+    memset(plugin_music_controls_list_items, 0, sizeof(plugin_music_controls_list_items));
+    plugin_music_controls_list_item_count = 0;
+    memset(plugin_music_timers_list_items, 0, sizeof(plugin_music_timers_list_items));
+    plugin_music_timers_list_item_count = 0;
+    memset(plugin_music_library_list_items, 0, sizeof(plugin_music_library_list_items));
+    plugin_music_library_list_item_count = 0;
     memset(plugin_power_list_items, 0, sizeof(plugin_power_list_items));
     plugin_power_list_item_count = 0;
     memset(plugin_system_list_items, 0, sizeof(plugin_system_list_items));
@@ -4348,6 +4408,86 @@ void plugin_manager_get_playback_list_item_options(int index, const char ** out_
                                                     int32_t * out_width, const char ** out_text_size) {
     get_list_item_options(plugin_playback_list_items, plugin_playback_list_item_count, index, out_icon, out_height,
                            out_width, out_text_size);
+}
+
+int plugin_manager_get_music_audio_list_item_count(void) {
+    return plugin_music_audio_list_item_count;
+}
+
+const char * plugin_manager_get_music_audio_list_item_label(int index) {
+    if (index < 0 || index >= plugin_music_audio_list_item_count) return "";
+    return plugin_music_audio_list_items[index].label;
+}
+
+void plugin_manager_music_audio_list_item_clicked(int index) {
+    if (index < 0 || index >= plugin_music_audio_list_item_count) return;
+    dispatch_list_item_open(&plugin_music_audio_list_items[index], "music_audio list item");
+}
+
+void plugin_manager_get_music_audio_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                       int32_t * out_width, const char ** out_text_size) {
+    get_list_item_options(plugin_music_audio_list_items, plugin_music_audio_list_item_count, index, out_icon,
+                           out_height, out_width, out_text_size);
+}
+
+int plugin_manager_get_music_controls_list_item_count(void) {
+    return plugin_music_controls_list_item_count;
+}
+
+const char * plugin_manager_get_music_controls_list_item_label(int index) {
+    if (index < 0 || index >= plugin_music_controls_list_item_count) return "";
+    return plugin_music_controls_list_items[index].label;
+}
+
+void plugin_manager_music_controls_list_item_clicked(int index) {
+    if (index < 0 || index >= plugin_music_controls_list_item_count) return;
+    dispatch_list_item_open(&plugin_music_controls_list_items[index], "music_controls list item");
+}
+
+void plugin_manager_get_music_controls_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                          int32_t * out_width, const char ** out_text_size) {
+    get_list_item_options(plugin_music_controls_list_items, plugin_music_controls_list_item_count, index, out_icon,
+                           out_height, out_width, out_text_size);
+}
+
+int plugin_manager_get_music_timers_list_item_count(void) {
+    return plugin_music_timers_list_item_count;
+}
+
+const char * plugin_manager_get_music_timers_list_item_label(int index) {
+    if (index < 0 || index >= plugin_music_timers_list_item_count) return "";
+    return plugin_music_timers_list_items[index].label;
+}
+
+void plugin_manager_music_timers_list_item_clicked(int index) {
+    if (index < 0 || index >= plugin_music_timers_list_item_count) return;
+    dispatch_list_item_open(&plugin_music_timers_list_items[index], "music_timers list item");
+}
+
+void plugin_manager_get_music_timers_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                        int32_t * out_width, const char ** out_text_size) {
+    get_list_item_options(plugin_music_timers_list_items, plugin_music_timers_list_item_count, index, out_icon,
+                           out_height, out_width, out_text_size);
+}
+
+int plugin_manager_get_music_library_list_item_count(void) {
+    return plugin_music_library_list_item_count;
+}
+
+const char * plugin_manager_get_music_library_list_item_label(int index) {
+    if (index < 0 || index >= plugin_music_library_list_item_count) return "";
+    return plugin_music_library_list_items[index].label;
+}
+
+void plugin_manager_music_library_list_item_clicked(int index) {
+    if (index < 0 || index >= plugin_music_library_list_item_count) return;
+    dispatch_list_item_open(&plugin_music_library_list_items[index], "music_library list item");
+}
+
+void plugin_manager_get_music_library_list_item_options(int index, const char ** out_icon, int32_t * out_height,
+                                                         int32_t * out_width, const char ** out_text_size) {
+    get_list_item_options(plugin_music_library_list_items, plugin_music_library_list_item_count, index, out_icon,
+                           out_height, out_width, out_text_size);
 }
 
 int plugin_manager_get_power_list_item_count(void) {

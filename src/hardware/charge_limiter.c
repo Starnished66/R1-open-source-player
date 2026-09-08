@@ -214,18 +214,18 @@ static bool axp2101_set_charge_voltage_limit(enum AXP2101_CHARGE_VOLTAGE_LIMIT v
 
 	// read current setting
 	if (!axp2101_read_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, &stat)) return false;
-	printf("charge_limiter: CV Charge Voltage Setting = %d\n", stat);
+	DBG_LOG("charge_limiter: CV Charge Voltage Setting = %d\n", stat);
 
 	// if value already correct, exit early
 	if (stat == value) return true;
 
 	// write the new setting (no write happens if value was already correct)
 	if (!axp2101_write_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, value)) return false;
-	printf("charge_limiter: set charge voltage limit value to %d\n", value);
+	DBG_LOG("charge_limiter: set charge voltage limit value to %d\n", value);
 
 	// check for failed write
 	axp2101_read_reg(AXP2101_REG_CV_CHARGE_VOLTAGE_SETTING, &stat);
-	printf("charge_limiter: checked charge voltage limit value: %d\n", value);
+	DBG_LOG("charge_limiter: checked charge voltage limit value: %d\n", value);
 	if (stat != value) return false;
 
 	return true;

@@ -191,6 +191,8 @@ static bool refresh_battery_cache_locked(void) {
     char capacity_str[16];
     char status[24];
 #if defined(MP2731_CHARGER_DEVICE)
+	// devices using the MP2731 (at least the R3Pro II) always read status as "discharging" from battery
+	// reading from the mp2731 instead gives the correct value
     bool have_status = read_sysfs_attr(MP2731_CHARGER_DEVICE, "status", status, sizeof(status));
 #else
     bool have_status = read_sysfs_attr(cached_battery_device, "status", status, sizeof(status));

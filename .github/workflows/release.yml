@@ -1,0 +1,94 @@
+name: Build HiBy R1 Firmware
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build HiBy R1 Firmware
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install repository-cached MIPS musl toolchain
+        run: |
+          set -euo pipefail
+          toolchain_dir="$(scripts/install_mips_toolchain.sh "$RUNNER_TEMP")"
+          echo "$toolchain_dir/bin" >> "$GITHUB_PATH"
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends file lua5.4 zip
+
+      - name: Build open_hiby_player_target
+        run: |
+          set -euo pipefail
+          make -j2 target
+
+      - name: Verify binary
+        run: |
+          set -euo pipefail
+          file open_hiby_player_target
+          test -s open_hiby_player_target
+          mipsel-linux-musl-readelf -h open_hiby_player_target | grep 'Machine:.*MIPS' >/dev/null
+          echo "Binary successfully built:"
+          ls -lh open_hiby_player_target
+
+      - name: Create automatic main build release
+        if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+
+          cat > release-notes.txt <<EOF
+          Automatic HiBy R1 build
+
+          Commit: ${GITHUB_SHA}
+          Build: ${GITHUB_RUN_NUMBER}
+
+          Binary: open_hiby_player_target
+          EOF
+
+          gh release create "$TAG" \
+            open_hiby_player_target \
+            --target "$GITHUB_SHA" \
+            --title "Latest Build" \
+            --notes-file release-notes.txt \
+            --latest
+
+      - name: Create version release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+
+          cat > release-notes.txt <<EOF
+          HiBy R1 Player ${TAG}
+
+          Commit: ${GITHUB_SHA}
+
+          Binary: open_hiby_player_target
+          EOF
+
+          gh release create "$TAG" \
+            open_hiby_player_target \
+            --verify-tag \
+            --title "HiBy R1 Player ${TAG}" \
+            --notes-file release-notes.txt \
+            --latest

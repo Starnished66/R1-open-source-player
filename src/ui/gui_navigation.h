@@ -64,6 +64,11 @@ void nav_push(lv_obj_t * scr);
  * player-swipe commit path and slide_transition_done_cb()). */
 void nav_push_stack_only(lv_obj_t * scr);
 void nav_pop(void);
+/* General form of nav_pop() -- see begin_slide_transition_ex()'s own doc
+ * comment for what forward/vertical/reveal mean. nav_pop() is a thin
+ * wrapper calling this with (false, false, false), i.e. the existing
+ * horizontal back-slide every other caller already gets unchanged. */
+void nav_pop_ex(bool forward, bool vertical, bool reveal);
 /* Stack-only counterpart to nav_pop() -- decrements nav_depth (if > 1)
  * without loading any screen or touching topbar/home-indicator state. Used
  * by a caller with its own settle animation in flight (an interactive

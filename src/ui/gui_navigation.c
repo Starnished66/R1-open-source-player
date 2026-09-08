@@ -491,7 +491,7 @@ void slide_transition_anim_x_cb(void * var, int32_t v) {
      * img_from/img_to are never drawn at all (LVGL invalidation is disabled
      * for the whole session), so driving them with lv_obj_set_x() here would
      * be pure wasted work: skip straight to compositing this frame instead.
-     * Every caller of this function (screen_transition_slide()'s own
+     * Every caller of this function (screen_transition_slide_ex()'s own
      * lv_anim_t, poll_quick_drawer_drag()'s per-tick interactive drag, and
      * its release settle animation) goes through this one shared path, so
      * all three get compositor support with no changes of their own. */
@@ -614,7 +614,7 @@ void slide_transition_cancel(slide_transition_ctx_t ** pctx) {
 }
 
 
-/* Shared setup for both screen_transition_slide()'s own fixed-duration
+/* Shared setup for both screen_transition_slide_ex()'s own fixed-duration
  * path and the interactive (finger-driven) player-swipe further down
  * (poll_quick_drawer_drag()'s player_swipe_* state) -- snapshotting
  * from_scr/to_scr and building the two-image overlay is identical either
@@ -623,7 +623,7 @@ void slide_transition_cancel(slide_transition_ctx_t ** pctx) {
  * short commit/cancel settle animation). Returns NULL if to_scr is
  * already active, a transition is already in flight, or a snapshot
  * failed (OOM) -- the caller should fall back to an instant
- * lv_screen_load(to_scr) in every one of those cases (screen_transition_slide()
+ * lv_screen_load(to_scr) in every one of those cases (screen_transition_slide_ex()
  * does; the interactive path just abandons the gesture and lets it fall
  * through as whatever else it might have been, since there's no
  * "genuinely already there" case to fall back to for a still-in-progress
@@ -881,8 +881,8 @@ slide_transition_ctx_t * begin_slide_transition_ex(lv_obj_t * to_scr, bool forwa
     return ctx;
 }
 
-static void screen_transition_slide(lv_obj_t * to_scr, bool forward) {
-    slide_transition_ctx_t * ctx = begin_slide_transition(to_scr, forward);
+static void screen_transition_slide_ex(lv_obj_t * to_scr, bool forward, bool vertical, bool reveal) {
+    slide_transition_ctx_t * ctx = begin_slide_transition_ex(to_scr, forward, vertical, reveal);
     if (!ctx) {
         lv_screen_load(to_scr);
         sync_player_topbar_visibility(to_scr);
@@ -931,12 +931,16 @@ void nav_push_stack_only(lv_obj_t * scr) {
     if (nav_depth < NAV_STACK_MAX) nav_stack[nav_depth++] = scr;
 }
 
-void nav_pop(void) {
+void nav_pop_ex(bool forward, bool vertical, bool reveal) {
     if (nav_depth > 1) nav_depth--;
     /* Keep the outgoing screen's bars untouched until its physical frame
      * has been captured. The transition completion/cut-fallback path
      * applies the destination state at the actual screen handoff. */
-    screen_transition_slide(nav_stack[nav_depth - 1], false);
+    screen_transition_slide_ex(nav_stack[nav_depth - 1], forward, vertical, reveal);
+}
+
+void nav_pop(void) {
+    nav_pop_ex(false, false, false);
 }
 
 void nav_pop_stack_only(void) {

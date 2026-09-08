@@ -124,7 +124,7 @@ The LAN remote-control interface provides a simple way to control the player fro
 - USB DAC support
 - Smoothed real battery percentage that filters transient fuel-gauge jumps
 - Real Wi-Fi signal strength
-- Charge limiter (4.2V voltage cap) for improved battery longevity
+- Charge limiter (caps charging around 85%) for improved battery longevity
 - **Safe Charging (500mA)** mode with immediate, persistent PMIC-level current limiting
 - Configurable idle shutdown or suspend behavior
 - Car mode

@@ -1,4 +1,5 @@
 #include "charge_limiter.h"
+#include "board_config.h"
 #include "debug_log.h"  // TODO: fix false-positive "'debug_log.h' file not found" warning in IDE
 
 #include <fcntl.h>
@@ -14,6 +15,16 @@
  * Set to 0 to disable entirely; the limiter is independent of
  * battery.c's status polling. */
 #define CHARGE_LIMITER_ACTIVE 1
+
+/* The MP2731 is only populated on the R3Pro II; the R1 (and any other
+ * BOARD_R1 device) only has the AXP2101. Gating on the same BOARD_DEFINE
+ * that board_config.h uses keeps this file from ever issuing i2c traffic to
+ * the MP2731's address (0x4b) on a board where nothing is listening there. */
+#if defined(BOARD_R3PROII)
+#define CHARGE_LIMITER_HAS_MP2731 1
+#else
+#define CHARGE_LIMITER_HAS_MP2731 0
+#endif
 
 #define MP2731_I2C_BUS "/dev/i2c-0"
 #define MP2731_I2C_ADDR 0x4b
@@ -129,6 +140,7 @@ static bool axp2101_write_reg(uint8_t reg, uint8_t value) {
     return smbus_xfer(AXP2101_I2C_BUS, AXP2101_I2C_ADDR, reg, &value, true);
 }
 
+#if CHARGE_LIMITER_HAS_MP2731
 static bool mp2731_read_reg(uint8_t reg, uint8_t * out) {
     return smbus_xfer(MP2731_I2C_BUS, MP2731_I2C_ADDR, reg, out, false);
 }
@@ -136,6 +148,15 @@ static bool mp2731_read_reg(uint8_t reg, uint8_t * out) {
 static bool mp2731_write_reg(uint8_t reg, uint8_t value) {
     return smbus_xfer(MP2731_I2C_BUS, MP2731_I2C_ADDR, reg, &value, true);
 }
+#else
+/* No MP2731 on this board -- stub out its i2c traffic entirely rather than
+ * gating every call site, so nothing ever probes the MP2731's address. */
+static bool mp2731_read_reg(uint8_t reg, uint8_t * out) {
+    (void) reg;
+    (void) out;
+    return false;
+}
+#endif
 
 static void log_chg_stat(const char * when) {
     uint8_t stat;
@@ -239,6 +260,7 @@ static bool axp2101_set_charge_current_limit(uint8_t value) {
 	return true;
 }
 
+#if CHARGE_LIMITER_HAS_MP2731
 // function to set the mp2731 charge voltage limit
 // reference the comment above MP2731_BATTERY_REGULATION_VOLTAGE_MASK to see what each input value means
 static bool mp2731_set_charge_voltage_limit(enum MP2731_CHARGE_VOLTAGE_LIMIT value) {
@@ -301,6 +323,20 @@ static bool mp2731_set_charge_current_limit(uint8_t value) {
 
 	return true;
 }
+#else
+/* No MP2731 on this board -- always report success without touching i2c,
+ * so callers' retry-on-failure logic doesn't spin forever chasing a chip
+ * that was never there. */
+static bool mp2731_set_charge_voltage_limit(enum MP2731_CHARGE_VOLTAGE_LIMIT value) {
+	(void) value;
+	return true;
+}
+
+static bool mp2731_set_charge_current_limit(uint8_t value) {
+	(void) value;
+	return true;
+}
+#endif
 #endif
 
 void charge_limiter_poll(bool enabled, bool force) {
@@ -321,7 +357,6 @@ void charge_limiter_poll(bool enabled, bool force) {
         	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
         }
 
-        // TODO: make sure the mp2731 code doesn't cause bad stuff on the R1
         if (!mp2731_set_charge_voltage_limit(MP2731_CHARGE_VOLTAGE_LIMIT_4_4V)) {
         	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
         }

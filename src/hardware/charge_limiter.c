@@ -371,7 +371,7 @@ void charge_limiter_poll(bool enabled, bool force) {
     	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
     }
 
-    if (!mp2731_set_charge_voltage_limit(MP2731_CHARGE_VOLTAGE_LIMIT_4V)) {
+    if (!mp2731_set_charge_voltage_limit(MP2731_CHARGE_VOLTAGE_LIMIT_4_2V)) {
     	last_apply.tv_sec -= CHARGE_LIMITER_REEVALUATE_SECONDS - 1; /* retry in ~1s */
     }
 #endif

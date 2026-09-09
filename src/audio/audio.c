@@ -1,5 +1,17 @@
 #include "audio.h"
 
+/* Default (4096 bytes) is dr_flac's own general-purpose tuning -- its header
+ * comment notes "diminishing returns after about 4KB" for a typical fast
+ * onRead() implementation, but local playback here reads from an SD card,
+ * where each refill is a real synchronous read on the audio thread, not a
+ * memory copy. A 24-bit/96kHz FLAC can run 2.5-4Mbps compressed vs ~1Mbps
+ * for 16-bit/44.1kHz, so the same 4KB cache holds proportionally less
+ * playback time and empties (forcing a refill) proportionally more often
+ * for exactly the high-resolution files a real user reported stutter on.
+ * Quadrupling to 16KB trades a modest per-open-decoder RAM cost for fewer
+ * mid-playback SD reads on the highest-bitrate files. Must be a multiple of
+ * 8 per dr_flac.h's own requirement. */
+#define DR_FLAC_BUFFER_SIZE 16384
 #define DR_FLAC_IMPLEMENTATION
 #include "dr_flac.h"
 #define DR_MP3_IMPLEMENTATION
@@ -1738,6 +1750,20 @@ static void mix_crossfade_s32(const int32_t * buf_cur, const int32_t * buf_next,
 
 static void * audio_thread_func(void * arg) {
     (void) arg;
+    /* A modest priority boost, not full SCHED_FIFO: real-time scheduling
+     * would risk priority inversion against audio_mutex (also taken by the
+     * UI thread for format/volume reads), which could make things worse
+     * under contention rather than better. nice(-5) just makes this thread
+     * win CFS scheduling contests against normal-priority UI/decode work
+     * (library scans/MP3 indexing already deliberately lower their own
+     * priority the same way, see mp3_index_worker's nice(10) above) without
+     * that inversion risk. Best-effort: fails silently without CAP_SYS_NICE
+     * (e.g. an unprivileged host dev build), leaving the thread at its
+     * inherited default priority. Matters most at high sample rates, where
+     * the ALSA buffer covers less wall-clock time and a UI-caused scheduling
+     * delay is more likely to outlast it -- see open_device()'s own comment
+     * on why period_size is now rate-scaled for the same reason. */
+    (void) nice(-5);
 
     decoder_t cur_dec;
     bool cur_open = false;

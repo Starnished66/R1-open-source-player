@@ -159,9 +159,32 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
             config.period_size = 1024;
             config.period_count = 4;
         } else {
-            /* Standard buffer tuning: 2048 frames x 4 periods (~186ms buffer)
-             * to balance wakeup frequency and underrun protection. */
-            config.period_size = 2048;
+            /* Standard buffer tuning targets a constant ~170-190ms of
+             * underrun tolerance regardless of sample rate, not a constant
+             * frame count. period_size was previously a flat 2048 frames at
+             * every rate -- ~186ms at 44.1kHz, but only ~85ms at 96kHz and
+             * ~43ms at 192kHz, since a fixed frame count covers proportionally
+             * less wall-clock time as the rate rises. That halved-or-worse
+             * buffer margin at high sample rates was the primary suspect in a
+             * real user report of stutter on 24-bit/96kHz FLAC (investigated
+             * with Codex/Grok/Gemini -- all three independently converged on
+             * this as the dominant cause; see ISSUES.md).
+             *
+             * period_count=4 is a hardware-validated constant, not a free
+             * variable: tools/s24_hw_params_probe.c swept period_count in
+             * {2,3,4} at period_size in {512,1024,2048,4096,8192} across
+             * every standard rate 44.1kHz-384kHz and both S16_LE/S24_LE on a
+             * real R1 -- period_count 2 and 3 failed hw_params (EINVAL) in
+             * every single case; only 4 ever worked. Only period_size is
+             * scaled here, using values that same probe already confirmed
+             * negotiate successfully at every rate. */
+            if (sample_rate <= 48000) {
+                config.period_size = 2048;  /* ~186ms @ 44.1kHz, ~171ms @ 48kHz */
+            } else if (sample_rate <= 96000) {
+                config.period_size = 4096;  /* ~171ms @ 88.2/96kHz */
+            } else {
+                config.period_size = 8192;  /* ~171ms @ 176.4/192kHz, ~85ms @ 352.8/384kHz (best available -- period_size 16384 was not part of the validated sweep) */
+            }
             config.period_count = 4;
         }
         /* Explicit rather than left at the zeroed default -- matches

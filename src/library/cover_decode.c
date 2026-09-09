@@ -348,17 +348,36 @@ static cover_decode_result_t decode_jpeg_progressive_rgb888(const uint8_t * data
     return COVER_DECODE_OK;
 }
 
-static bool inspect_png(const uint8_t * data, uint32_t size, int * out_w, int * out_h) {
+static bool inspect_png(const uint8_t * data, uint32_t size, int * out_w, int * out_h, uint32_t * out_bpp) {
     unsigned w = 0, h = 0;
     LodePNGState state;
     lodepng_state_init(&state);
     unsigned inspect_error = lodepng_inspect(&w, &h, &state, data, size);
+    /* lodepng_inspect() already parsed and validated IHDR's bitdepth/colortype
+     * (checkColorValidity()) before returning success -- lodepng_get_bpp()
+     * reads that same populated state, no extra parsing. Needed by the
+     * caller to bill decode_png_rgb888()'s real transient memory use
+     * (artwork_estimate_decode_bytes()), which scales with the PNG's real
+     * bit depth, not a flat assumption. */
+    unsigned bpp = (inspect_error == 0) ? lodepng_get_bpp(&state.info_png.color) : 0;
     lodepng_state_cleanup(&state);
     if (inspect_error != 0) return false;
     *out_w = (int) w;
     *out_h = (int) h;
+    if (out_bpp) *out_bpp = (uint32_t) bpp;
     return true;
 }
+
+/* Real ICC profiles (sRGB, Display P3, etc) this app will ever see attached
+ * to actual cover art run a few KB to low hundreds of KB. LodePNG's own
+ * default cap (max_icc_size, 16MB) exists only to stop a pathological
+ * profile from inflating unbounded -- 16MB is still enough to blow past
+ * artwork admission's own memory budget on this device, so cap it much
+ * tighter here. This is decode-local, not a vendored-file change: iCCP
+ * data is parsed but never used for cover art (no color management is
+ * applied to decoded pixels), so a real profile larger than this is
+ * rejected (COVER_DECODE_FAIL_UNSUPPORTED) with zero visible effect. */
+#define COVER_PNG_MAX_ICC_BYTES (1024UL * 1024UL)
 
 static cover_decode_result_t decode_png_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
                                                uint8_t ** out_buf, int * out_w, int * out_h) {
@@ -371,8 +390,23 @@ static cover_decode_result_t decode_png_rgb888(const uint8_t * data, uint32_t si
     if (!rgb888_size_ok(w, h, max_side, NULL)) return COVER_DECODE_FAIL_OVERSIZED;
     unsigned inspected_w = w, inspected_h = h;
 
+    /* Inlined equivalent of lodepng_decode24() (LCT_RGB/8-bit output), not
+     * the convenience wrapper, so max_icc_size can be capped -- see
+     * COVER_PNG_MAX_ICC_BYTES's own comment. Also disables ancillary text
+     * chunk storage, matching lodepng_decode_memory()'s own defaults (their
+     * data is never used here either). */
     unsigned char * decoded = NULL;
-    unsigned decode_error = lodepng_decode24(&decoded, &w, &h, data, size);
+    LodePNGState dec_state;
+    lodepng_state_init(&dec_state);
+    dec_state.info_raw.colortype = LCT_RGB;
+    dec_state.info_raw.bitdepth = 8;
+#ifdef LODEPNG_COMPILE_ANCILLARY_CHUNKS
+    dec_state.decoder.read_text_chunks = 0;
+    dec_state.decoder.remember_unknown_chunks = 0;
+    dec_state.decoder.max_icc_size = COVER_PNG_MAX_ICC_BYTES;
+#endif
+    unsigned decode_error = lodepng_decode(&decoded, &w, &h, &dec_state, data, size);
+    lodepng_state_cleanup(&dec_state);
     /* Our LVGL LodePNG fork returns a draw-buffer descriptor, not a raw
      * malloc buffer. RGB24 conversion writes packed RGB into its data field
      * (the descriptor's ARGB8888 stride is allocation capacity only). */
@@ -632,7 +666,15 @@ static cover_decode_result_t decode_bmp_rgb888(const uint8_t * data, uint32_t si
     if (size < 54 || data[0] != 'B' || data[1] != 'M') return COVER_DECODE_FAIL_UNSUPPORTED;
     uint32_t off = le32(data + 10);
     uint32_t dib = le32(data + 14);
-    if (dib < 40 || off < 14 + dib || off >= size) return COVER_DECODE_FAIL_UNSUPPORTED;
+    /* uint64_t, not uint32_t: "14 + dib" wraps for dib near UINT32_MAX
+     * (e.g. dib=0xFFFFFFFF wraps to 13), which would falsely satisfy
+     * "off < 14+dib" for a small, otherwise-plausible off and defeat this
+     * check's actual intent (pixel data must start after a validly-sized
+     * DIB header). Not reachable as a real out-of-bounds read today (off
+     * itself is still bounds-checked below against the real pixel-data
+     * extent, and dib is never used for anything else), but the check
+     * should mean what it says. */
+    if (dib < 40 || (uint64_t) off < 14ULL + (uint64_t) dib || off >= size) return COVER_DECODE_FAIL_UNSUPPORTED;
     int width = le32s(data + 18);
     int height_raw = le32s(data + 22);
     if (height_raw == INT32_MIN) return COVER_DECODE_FAIL_UNSUPPORTED;
@@ -683,6 +725,7 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
     int native_w = 0, native_h = 0;
     artwork_format_t fmt = ARTWORK_FORMAT_UNKNOWN;
     uint64_t progressive_coeff_bytes = 0;
+    uint32_t png_native_bpp = 0;
 
     if (data[0] == 0xFF && data[1] == 0xD8) {
         /* jpeg_probe() (not inspect_jpeg()/tjpgd's jd_prepare()) makes the
@@ -704,7 +747,7 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
         }
     } else if (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') {
         fmt = ARTWORK_FORMAT_PNG;
-        if (!inspect_png(data, size, &native_w, &native_h)) return COVER_DECODE_FAIL_UNSUPPORTED;
+        if (!inspect_png(data, size, &native_w, &native_h, &png_native_bpp)) return COVER_DECODE_FAIL_UNSUPPORTED;
     } else if (data[0] == 'B' && data[1] == 'M') {
         fmt = ARTWORK_FORMAT_BMP;
         if (!inspect_bmp(data, size, &native_w, &native_h)) return COVER_DECODE_FAIL_UNSUPPORTED;
@@ -756,7 +799,7 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
     }
     size_t est_bytes = artwork_estimate_decode_bytes(fmt, size, (size_t) est_w, (size_t) est_h,
                                                      (size_t) target_w, (size_t) target_h,
-                                                     progressive_coeff_bytes);
+                                                     progressive_coeff_bytes, png_native_bpp);
     uint32_t timeout_ms = (prio == ARTWORK_PRIO_PLAYER) ? 1000 : 300;
 
     artwork_acquire_result_t acq = artwork_coordinator_acquire(prio, est_bytes, timeout_ms,

@@ -66,11 +66,20 @@ void system_set_mock_mem_available(size_t bytes);
  * alone: it depends on the SOF's true native dimensions and component
  * sampling factors, not the post-scale output size this function otherwise
  * bills). Pass 0 for every non-progressive-JPEG call.
+ * png_native_bpp is the PNG's real IHDR bits-per-pixel (from
+ * lodepng_get_bpp() on the inspected color mode) -- ignored for every
+ * format except PNG, where the decoder's real transient workspace (the
+ * inflated scanline buffer, live at the same time as the decoded pixel
+ * buffer) scales with it directly: a 16-bit-per-channel RGBA PNG (64bpp)
+ * needs a scanline row 8x wider than an 8-bit grayscale one at the same
+ * pixel dimensions, not the flat "4 bytes/pixel" this used to assume
+ * regardless of real bit depth. Pass 0 for every non-PNG call.
  * Returns estimated bytes, or SIZE_MAX on overflow / invalid dimensions. */
 size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_size,
                                      size_t native_w, size_t native_h,
                                      size_t target_w, size_t target_h,
-                                     uint64_t progressive_coeff_bytes);
+                                     uint64_t progressive_coeff_bytes,
+                                     uint32_t png_native_bpp);
 
 /* Checks if MemAvailable satisfies (reserve + estimated_bytes). */
 bool artwork_check_memory_admission(artwork_priority_t prio, size_t estimated_bytes);

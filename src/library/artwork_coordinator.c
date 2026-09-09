@@ -103,7 +103,8 @@ size_t system_get_mem_available_bytes(void) {
 size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_size,
                                      size_t native_w, size_t native_h,
                                      size_t target_w, size_t target_h,
-                                     uint64_t progressive_coeff_bytes) {
+                                     uint64_t progressive_coeff_bytes,
+                                     uint32_t png_native_bpp) {
     if (native_w == 0 || native_h == 0 || target_w == 0 || target_h == 0) return SIZE_MAX;
     if (native_w > 4096 || native_h > 4096 || target_w > 1024 || target_h > 1024) return SIZE_MAX;
 
@@ -125,7 +126,30 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
      * - BMP: uncompressed linear stream; ~16KB overhead. */
     uint64_t decoder_workspace = 64ULL * 1024ULL;
     if (fmt == ARTWORK_FORMAT_PNG) {
-        decoder_workspace = (uint64_t) native_w * (uint64_t) native_h * 4ULL + (128ULL * 1024ULL);
+        /* Real transient peak, not a flat "4 bytes/pixel" guess: decodeGeneric()
+         * inflates the whole image into a packed "scanlines" buffer (row_bytes
+         * = ceil(w * png_native_bpp / 8), * h total) that stays allocated while
+         * postProcessScanlines() unfilters it into a SEPARATE decoded buffer
+         * (row = max(row_bytes, 4*w)) -- both live at once. If the PNG's
+         * native color mode isn't already 8-bit RGB, lodepng_decode() then
+         * allocates a THIRD 4*w*h conversion buffer while the decoded one is
+         * still live (freed right after). The real peak is the larger of
+         * these two overlapping pairs (scanlines+decoded, or decoded+
+         * converted), not their sum -- but summing both pair-costs here is a
+         * simple, always-safe upper bound rather than replaying that branchy
+         * lifetime logic. A 16-bit RGBA (64bpp) source is exactly the shape
+         * that blew this estimate before (see patches/lvgl_runtime_fixes.patch's
+         * PNG hunk): row_bytes there is 8*w, twice the old flat 4*w
+         * assumption. icc_cap_bytes matches decode_png_rgb888()'s own
+         * max_icc_size cap on the decoder settings used for this decode. */
+        uint32_t bpp = png_native_bpp ? png_native_bpp : 32;
+        uint64_t row_bytes = ((uint64_t) native_w * (uint64_t) bpp + 7ULL) / 8ULL;
+        uint64_t argb_row_bytes = 4ULL * (uint64_t) native_w;
+        uint64_t stride_bytes = row_bytes > argb_row_bytes ? row_bytes : argb_row_bytes;
+        uint64_t icc_cap_bytes = 1ULL * 1024ULL * 1024ULL;
+        decoder_workspace = 2ULL * stride_bytes * (uint64_t) native_h
+                           + 4ULL * (uint64_t) native_w * (uint64_t) native_h
+                           + icc_cap_bytes + (128ULL * 1024ULL);
     } else if (fmt == ARTWORK_FORMAT_JPEG) {
         decoder_workspace = 32ULL * 1024ULL;
     } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE) {

@@ -1515,7 +1515,7 @@ static lv_obj_t * build_music_audio_screen(void) {
 }
 
 static lv_obj_t * build_music_controls_screen(void) {
-    static pill_list_item_t items[2 + PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS];
+    static pill_list_item_t items[3 + PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Play/Pause Button", PILL_ACCESSORY_CHEVRON, false, play_pause_button_mode_settings_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Car Mode", PILL_ACCESSORY_TOGGLE,
                                     current_settings.car_mode_enabled, NULL, car_mode_switch_event_cb, NULL };

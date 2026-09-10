@@ -533,9 +533,13 @@ static void * bridge_reader_thread_func(void * arg) {
 
     /* Recovery tracking across EOF / gadget session boundaries.
      * Genuine disconnect is bounded by RECOVERY_TIMEOUT_NS (~5s) since last
-     * successful read. FAST_RECOVERY_MAX_GAP_NS defines the latency threshold
-     * (e.g. 500ms, 2x POLL_INTERVAL_MS) below which an in-progress rate-measurement
-     * window is preserved across reopen because dead time was negligible. */
+     * successful read. The in-progress rate-measurement window is always
+     * discarded across a reopen, regardless of gap length (see the
+     * `if (in_recovery)` block's own comment further down) -- only the
+     * multi-window CONFIRMATION streak (pending_rate/pending_rate_count) is
+     * gated on FAST_RECOVERY_MAX_GAP_NS (e.g. 500ms, 2x POLL_INTERVAL_MS),
+     * preserved across a fast reopen so a brief blip doesn't force
+     * re-accumulating RATE_CONFIRM_COUNT clean windows from scratch. */
     #define RECOVERY_TIMEOUT_NS (5ULL * 1000000000ULL)
     #define FAST_RECOVERY_MAX_GAP_NS (500ULL * 1000000ULL)
 
@@ -823,10 +827,19 @@ static void * bridge_reader_thread_func(void * arg) {
                        cumulative_backoff_ms,
                        ring_buffer_get_occupancy(&g_rb));
 
-            /* Rate state management: preserve if recovery was fast, reset if slow */
+            /* The in-progress measurement window must never span this gap,
+             * fast or slow: rate_window_start_ns predates the recovery, so
+             * counting the dead time as elapsed while rate_window_bytes only
+             * counts real bytes snaps that one window to a spuriously LOW
+             * rate (audible as a brief pitch drop until the next clean
+             * window self-corrects) -- same "never span a gap" reasoning the
+             * poll-timeout path above already applies unconditionally. Only
+             * the multi-window CONFIRMATION streak stays gated on fast vs
+             * slow, since a brief recovery shouldn't force re-accumulating
+             * RATE_CONFIRM_COUNT clean windows from scratch. */
+            rate_window_active = false;
+            rate_window_bytes = 0;
             if (recovery_duration_ns > FAST_RECOVERY_MAX_GAP_NS) {
-                rate_window_active = false;
-                rate_window_bytes = 0;
                 pending_rate = 0;
                 pending_rate_count = 0;
             }

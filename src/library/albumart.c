@@ -8,6 +8,8 @@
 
 #include "albumart.h"
 
+#include <ctype.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,10 +96,164 @@ static bool try_exts(char * path, int len) {
     return false;
 }
 
+/* Tries <album><size_string>.*, then cover<size_string>.*, then (only when
+ * size_string is empty) folder.jpg/.jpeg/.png, inside dir. dirlen is
+ * strlen(dir) including the trailing '/'. path must point at a PATH_MAX-sized
+ * buffer (same contract as try_exts); on success it holds the found path. */
+static bool try_art_in_dir(const char * dir, int dirlen, const albumart_info_t * id3,
+                            const char * size_string, int albumlen, char * path) {
+    int pathlen;
+
+    if (albumlen > 0) {
+        pathlen = snprintf(path, PATH_MAX, "%s%s%s.", dir, id3->album, size_string);
+        fix_path_part(path, dirlen, albumlen);
+        if (try_exts(path, pathlen)) return true;
+    }
+
+    pathlen = snprintf(path, PATH_MAX, "%scover%s.", dir, size_string);
+    if (try_exts(path, pathlen)) return true;
+
+    if (size_string[0] == '\0') {
+        snprintf(path, PATH_MAX, "%sfolder.jpg", dir);
+        if (file_exists(path)) return true;
+        snprintf(path, PATH_MAX, "%sfolder.jpeg", dir);
+        if (file_exists(path)) return true;
+        snprintf(path, PATH_MAX, "%sfolder.png", dir);
+        if (file_exists(path)) return true;
+    }
+
+    return false;
+}
+
+/* Matches (case-insensitively) a directory name that is exactly a disc-set
+ * marker: "cd"/"disc"/"disk", optional separators (space/'_'/'-'/'.'), then
+ * one or more digits and nothing else -- e.g. "CD1", "Disc 2", "disk_03".
+ * Deliberately narrow: bare numbers, Roman numerals and descriptive suffixes
+ * ("2 Disc Set", "Disc") are excluded to avoid false positives on ordinary
+ * (non-multi-disc) album folders. */
+static bool looks_like_disc_dir(const char * name) {
+    static const char * const prefixes[] = { "cd", "disc", "disk" };
+    if (!name || !name[0]) return false;
+
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        size_t plen = strlen(prefixes[i]);
+        size_t j;
+        for (j = 0; j < plen; j++) {
+            if (!name[j] || tolower((unsigned char) name[j]) != prefixes[i][j]) break;
+        }
+        if (j != plen) continue;
+
+        const char * p = name + plen;
+        while (*p == ' ' || *p == '_' || *p == '-' || *p == '.') p++;
+        if (!*p) continue;
+
+        bool all_digits = true;
+        for (const char * q = p; *q; q++) {
+            if (!('0' <= *q && *q <= '9')) { all_digits = false; break; }
+        }
+        if (all_digits) return true;
+    }
+    return false;
+}
+
+/* Extracts the final path component (no trailing slash) from dir (which
+ * itself must end in '/', as produced by strip_filename()). */
+static void basename_of_dir(const char * dir, char * out, size_t out_size) {
+    out[0] = '\0';
+    size_t len = strlen(dir);
+    if (len < 2 || out_size == 0) return;
+    size_t end = len - 1; /* skip trailing '/' */
+    size_t start = end;
+    while (start > 0 && dir[start - 1] != '/') start--;
+    size_t n = end - start;
+    if (n >= out_size) n = out_size - 1;
+    memcpy(out, dir + start, n);
+    out[n] = '\0';
+}
+
+#define SIBLING_DISC_SCAN_MAX 32
+#define SIBLING_DISC_NAME_MAX 256
+
+/* Unsized-only fallback for multi-disc layouts: when the current disc
+ * folder (e.g. "Disc2") has no own art and the album-root retry also found
+ * nothing, look at sibling disc folders (e.g. "Disc1") under the same
+ * parent and use the first one (by name, ascending) that has its own art.
+ * Gated by the caller on size_string being empty and current_disc_name
+ * matching looks_like_disc_dir(); parent_dir must end in '/'. */
+static bool find_sibling_disc_art(const char * parent_dir, const char * current_disc_name,
+                                   const albumart_info_t * id3, int albumlen, char * path) {
+    DIR * dp = opendir(parent_dir[0] ? parent_dir : ".");
+    if (!dp) return false;
+
+    char names[SIBLING_DISC_SCAN_MAX][SIBLING_DISC_NAME_MAX];
+    int count = 0;
+    struct dirent * de;
+
+    while ((de = readdir(dp)) != NULL) {
+        const char * name = de->d_name;
+        if (name[0] == '.') continue;
+        if (strcmp(name, current_disc_name) == 0) continue;
+        if (strlen(name) >= SIBLING_DISC_NAME_MAX) continue;
+        if (!looks_like_disc_dir(name)) continue;
+
+        char full[PATH_MAX];
+        int n = snprintf(full, sizeof(full), "%s%s", parent_dir, name);
+        if (n < 0 || (size_t) n >= sizeof(full)) continue;
+        struct stat st;
+        if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+
+        if (count < SIBLING_DISC_SCAN_MAX) {
+            strcpy(names[count], name);
+            count++;
+        } else {
+            /* Keep the SIBLING_DISC_SCAN_MAX lexicographically-smallest
+             * names collected so far (deterministic regardless of
+             * readdir() order), by evicting the current largest if name
+             * sorts smaller than it. */
+            int max_idx = 0;
+            for (int i = 1; i < SIBLING_DISC_SCAN_MAX; i++) {
+                int cmp = strcasecmp(names[i], names[max_idx]);
+                if (cmp > 0 || (cmp == 0 && strcmp(names[i], names[max_idx]) > 0)) max_idx = i;
+            }
+            int cmp = strcasecmp(name, names[max_idx]);
+            if (cmp < 0 || (cmp == 0 && strcmp(name, names[max_idx]) < 0)) {
+                strcpy(names[max_idx], name);
+            }
+        }
+    }
+    closedir(dp);
+
+    if (count == 0) return false;
+
+    for (int i = 0; i < count - 1; i++) {
+        int best = i;
+        for (int j = i + 1; j < count; j++) {
+            int cmp = strcasecmp(names[j], names[best]);
+            if (cmp < 0 || (cmp == 0 && strcmp(names[j], names[best]) < 0)) best = j;
+        }
+        if (best != i) {
+            char tmp[SIBLING_DISC_NAME_MAX];
+            strcpy(tmp, names[i]);
+            strcpy(names[i], names[best]);
+            strcpy(names[best], tmp);
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        char sibling_dir[PATH_MAX];
+        int n = snprintf(sibling_dir, sizeof(sibling_dir), "%s%s/", parent_dir, names[i]);
+        if (n < 0 || (size_t) n >= sizeof(sibling_dir)) continue;
+        if (try_art_in_dir(sibling_dir, n, id3, "", albumlen, path)) return true;
+    }
+    return false;
+}
+
 bool albumart_search_files(const albumart_info_t * id3, const char * size_string, char * buf, size_t buflen) {
     char path[PATH_MAX];
     char dir[PATH_MAX];
+    char disc_name[SIBLING_DISC_NAME_MAX];
     bool found = false;
+    bool walked_to_parent = false;
     int track_first = 1;
     const char * artist;
     int dirlen;
@@ -115,6 +271,7 @@ bool albumart_search_files(const albumart_info_t * id3, const char * size_string
     strip_filename(dir, (int) sizeof(dir), id3->path);
     dirlen = (int) strlen(dir);
     albumlen = id3->album[0] ? (int) strlen(id3->album) : 0;
+    disc_name[0] = '\0';
 
     for (int pass = 0; pass < 2 - track_first; pass++) {
         if (track_first || pass) {
@@ -126,29 +283,7 @@ bool albumart_search_files(const albumart_info_t * id3, const char * size_string
         }
         if (pass) break;
 
-        if (!found && albumlen > 0) {
-            pathlen = snprintf(path, sizeof(path), "%s%s%s.", dir, id3->album, size_string);
-            fix_path_part(path, dirlen, albumlen);
-            found = try_exts(path, pathlen);
-        }
-
-        if (!found) {
-            pathlen = snprintf(path, sizeof(path), "%scover%s.", dir, size_string);
-            found = try_exts(path, pathlen);
-        }
-
-        if (!found && size_string[0] == '\0') {
-            snprintf(path, sizeof(path), "%sfolder.jpg", dir);
-            found = file_exists(path);
-            if (!found) {
-                snprintf(path, sizeof(path), "%sfolder.jpeg", dir);
-                found = file_exists(path);
-            }
-            if (!found) {
-                snprintf(path, sizeof(path), "%sfolder.png", dir);
-                found = file_exists(path);
-            }
-        }
+        if (!found) found = try_art_in_dir(dir, dirlen, id3, size_string, albumlen, path);
 
         artist = id3->albumartist[0] ? id3->albumartist : id3->artist;
         if (!found && artist[0] && id3->album[0]) {
@@ -162,23 +297,20 @@ bool albumart_search_files(const albumart_info_t * id3, const char * size_string
         }
 
         if (!found && dirlen > 1) {
+            basename_of_dir(dir, disc_name, sizeof(disc_name));
             strcpy(path, dir);
             path[dirlen - 1] = '\0';
             strip_filename(dir, (int) sizeof(dir), path);
             dirlen = (int) strlen(dir);
+            walked_to_parent = true;
         }
 
-        if (dirlen > 0) {
-            if (!found && albumlen > 0) {
-                pathlen = snprintf(path, sizeof(path), "%s%s%s.", dir, id3->album, size_string);
-                fix_path_part(path, dirlen, albumlen);
-                found = try_exts(path, pathlen);
-            }
-            if (!found) {
-                pathlen = snprintf(path, sizeof(path), "%scover%s.", dir, size_string);
-                found = try_exts(path, pathlen);
-            }
+        if (dirlen > 0 && !found) found = try_art_in_dir(dir, dirlen, id3, size_string, albumlen, path);
+
+        if (!found && walked_to_parent && dirlen > 0 && size_string[0] == '\0' && looks_like_disc_dir(disc_name)) {
+            found = find_sibling_disc_art(dir, disc_name, id3, albumlen, path);
         }
+
         if (found) break;
     }
 

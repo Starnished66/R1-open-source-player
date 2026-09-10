@@ -84,6 +84,7 @@
 /open_hiby_player_settings.txt*
 /open_hiby_player_peq.txt*
 /open_hiby_player_music.db
+/.open_hiby_player/books.list
 
 # Host-only test audio fixtures (generated locally for manual verification,
 # not needed to build or run the project)

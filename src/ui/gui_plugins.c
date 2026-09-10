@@ -700,12 +700,43 @@ static void populate_plugin_settings_list_screen(int slot) {
     }
 }
 
+static bool plugin_settings_screen_on_nav_stack(lv_obj_t * scr) {
+    int depth = gui_navigation_get_depth();
+    for (int i = 0; i < depth; i++) {
+        if (gui_navigation_get_screen_at(i) == scr) return true;
+    }
+    return false;
+}
+
 int gui_plugin_show_settings_list(const char * title, const int * row_types, const char * const * labels,
                                    const bool * toggle_initial, const int * slider_min, const int * slider_max,
                                    const int * slider_value, const char * const * icon_paths, const int32_t * heights,
                                    const int32_t * widths, const char * const * text_sizes, int count) {
+    /* WHY BLIND ROUND-ROBIN IS WRONG:
+     * A common pattern is: open plugin settings list (slot 0) -> tap an option
+     * to open a child list (slot 1) -> back (to slot 0) -> tap a DIFFERENT
+     * option. If we just blindly used pool_next, that second child descent
+     * would wrap to slot 0 -- overwriting the STILL-LIVE parent screen
+     * underneath it, and failing to increment the nav stack since we'd push a
+     * screen already at the top.
+     *
+     * We fix this narrow but common pattern by checking liveness across the
+     * whole nav stack. Note: the pool can still be exhausted by deep
+     * SIMULTANEOUS nesting (e.g., 3+ levels deep without popping). In that
+     * exhaustion case, we fall back to the old round-robin behavior, which
+     * IS still destructive: it silently overwrites a still-navigably-reachable
+     * ancestor screen's content AND releases its Lua callback references (unlike
+     * row truncation which just degrades gracefully).
+     */
     int slot = plugin_settings_list_pool_next;
-    plugin_settings_list_pool_next = (plugin_settings_list_pool_next + 1) % PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE;
+    for (int i = 0; i < PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE; i++) {
+        int candidate = (plugin_settings_list_pool_next + i) % PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE;
+        if (!plugin_settings_screen_on_nav_stack(plugin_settings_list_screens[candidate])) {
+            slot = candidate;
+            break;
+        }
+    }
+    plugin_settings_list_pool_next = (slot + 1) % PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE;
 
     lv_label_set_text(plugin_settings_list_title_labels[slot], title);
 
@@ -744,18 +775,19 @@ void gui_plugins_init(void) {
 
 /* For gui_reload.c's in-process UI reload -- deletes every pool screen this
  * module owns so gui_plugins_init() can rebuild them from a clean slate
- * without leaking the old objects. Does not separately touch
- * plugin_settings_list_slider_cards[][] -- those are children of their own
- * plugin_settings_list_screens[] slot, freed along with it, and get
- * repopulated the same way they normally are (a plugin's own show_settings_
- * list() call) once plugin_manager_init() re-runs every plugin's top-level
- * script in step 7 of gui_soft_reload(). */
+ * without leaking the old objects. Also resets the slider card counts for
+ * each slot -- while the slider card objects themselves are children of their
+ * own plugin_settings_list_screens[] slot and get freed along with it, we
+ * must reset the counts so that a subsequent populate_plugin_settings_list_screen()
+ * doesn't iterate stale counts and call unregister_swipe_dead_zone() on
+ * already-freed pointers. */
 void gui_plugins_teardown(void) {
     for (int i = 0; i < PLUGIN_LIST_SCREEN_POOL_SIZE; i++) {
         if (plugin_list_screens[i]) { lv_obj_del(plugin_list_screens[i]); plugin_list_screens[i] = NULL; }
     }
     for (int i = 0; i < PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE; i++) {
         if (plugin_settings_list_screens[i]) { lv_obj_del(plugin_settings_list_screens[i]); plugin_settings_list_screens[i] = NULL; }
+        plugin_settings_list_slider_card_count[i] = 0;
     }
 }
 

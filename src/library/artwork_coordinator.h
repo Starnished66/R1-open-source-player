@@ -29,6 +29,15 @@ typedef enum {
      * see artwork_estimate_decode_bytes()'s progressive_coeff_bytes
      * parameter. */
     ARTWORK_FORMAT_JPEG_PROGRESSIVE,
+    /* Baseline (SOF0) JPEG whose chroma sampling factors tjpgd's own
+     * minimal whitelist rejects (e.g. vertical-only/4:4:0 subsampling --
+     * valid JPEG, just rare) -- decoded via the same libjpeg fallback as
+     * ARTWORK_FORMAT_JPEG_PROGRESSIVE, but genuinely single-scan (the
+     * decoder itself rejects a sequential-multiscan SOF0 as unsupported
+     * before allocating anything), so it shares PROGRESSIVE's larger
+     * libjpeg workspace allowance but never carries a real
+     * progressive_coeff_bytes cost -- see artwork_estimate_decode_bytes(). */
+    ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE,
 } artwork_format_t;
 
 typedef enum {

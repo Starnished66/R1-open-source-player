@@ -2,8 +2,11 @@
 
 #include "lvgl/src/libs/tjpgd/tjpgd.h"
 #include "lvgl/src/libs/lodepng/lodepng.h"
-/* Progressive-JPEG-only fallback (decode_jpeg_progressive_rgb888() below) --
- * tjpgd above stays the sole decoder for every baseline JPEG, unchanged. */
+/* libjpeg fallback (decode_jpeg_libjpeg_rgb888() below) -- tjpgd above stays
+ * the decoder for every ORDINARY baseline JPEG. Two cases route to libjpeg
+ * instead: progressive (SOF2, which tjpgd rejects outright) and baseline
+ * (SOF0) with a chroma sampling factor tjpgd's own minimal whitelist
+ * rejects (e.g. vertical-only/4:4:0 subsampling). See jpeg_probe_t. */
 #include <stdio.h>  /* jpeglib.h expects size_t/FILE to already be visible */
 #include "jpeglib.h"
 #include "jerror.h"
@@ -110,6 +113,23 @@ static uint64_t jpeg_probe_coeff_bytes(int width, int height, int num_comp,
     return total;
 }
 
+/* Mirrors lvgl/src/libs/tjpgd/tjpgd.c's own SOF0 sampling-factor whitelist
+ * exactly (its jd_prepare() switch(marker) case 0xC0 handler): only 1 or 3
+ * components; component 0 (Y) must be 4:4:4 (h=1,v=1), 4:2:0 (h=2,v=2), or
+ * 4:2:2-horizontal (h=2,v=1); every other component (Cb/Cr) must be h=1,v=1.
+ * Used only for SOF0 -- SOF2 is routed via is_progressive regardless. */
+static bool tjpgd_supports_sof0_sampling(int num_comp, const uint8_t * h_samp, const uint8_t * v_samp) {
+    if (num_comp != 1 && num_comp != 3) return false;
+    bool y_ok = (h_samp[0] == 1 && v_samp[0] == 1) ||
+               (h_samp[0] == 2 && v_samp[0] == 2) ||
+               (h_samp[0] == 2 && v_samp[0] == 1);
+    if (!y_ok) return false;
+    for (int i = 1; i < num_comp; i++) {
+        if (h_samp[i] != 1 || v_samp[i] != 1) return false;
+    }
+    return true;
+}
+
 bool jpeg_probe(const uint8_t * data, uint32_t size, jpeg_probe_t * result) {
     memset(result, 0, sizeof(*result));
     if (!data || size < 4 || data[0] != 0xFF || data[1] != 0xD8) return false; /* not even a JPEG SOI */
@@ -163,9 +183,9 @@ bool jpeg_probe(const uint8_t * data, uint32_t size, jpeg_probe_t * result) {
             if (seg_len < 8 + comp_bytes) return false;
             if (size - payload < 6 + comp_bytes) return false;
 
-            /* We only ever support SOF0 (routes to the existing tjpgd
-             * baseline path, unchanged) or SOF2 (routes to the new
-             * progressive libjpeg path) -- extended sequential (SOF1),
+            /* We only ever support SOF0 (routes to tjpgd, or to the libjpeg
+             * fallback if tjpgd_incompatible below) or SOF2 (always routes
+             * to the libjpeg fallback) -- extended sequential (SOF1),
              * lossless (SOF3), differential (SOF5-7), and every arithmetic-
              * coded variant (SOF9-15, jdarith.c is deliberately not
              * vendored/linked) are all genuinely unsupported. */
@@ -196,6 +216,8 @@ bool jpeg_probe(const uint8_t * data, uint32_t size, jpeg_probe_t * result) {
             result->native_h = height;
             result->coeff_bytes = result->is_progressive ?
                 jpeg_probe_coeff_bytes(width, height, num_comp, h_samp, v_samp) : 0;
+            result->tjpgd_incompatible = !result->is_progressive &&
+                !tjpgd_supports_sof0_sampling(num_comp, h_samp, v_samp);
             return true;
         }
 
@@ -263,9 +285,16 @@ static void my_jpeg_error_exit(j_common_ptr cinfo) {
     longjmp(myerr->setjmp_buffer, 1);
 }
 
-static cover_decode_result_t decode_jpeg_progressive_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
-                                                             int target_w, int target_h,
-                                                             uint8_t ** out_buf, int * out_w, int * out_h) {
+/* Handles both progressive (SOF2) JPEGs and baseline (SOF0) JPEGs whose
+ * chroma sampling tjpgd's own minimal whitelist rejects -- see jpeg_probe_t.
+ * The actual decode logic below is not progressive-specific in any way; it
+ * is a plain libjpeg header/scale/scanline-loop decode. A genuinely
+ * sequential-multiscan SOF0 (legal JPEG, but rare, and NOT accounted for by
+ * ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE's admission estimate -- see the
+ * jpeg_has_multiple_scans() guard below) is rejected rather than decoded. */
+static cover_decode_result_t decode_jpeg_libjpeg_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
+                                                         int target_w, int target_h,
+                                                         uint8_t ** out_buf, int * out_w, int * out_h) {
     if (!out_buf || !out_w || !out_h) return COVER_DECODE_FAIL_UNSUPPORTED;
     *out_buf = NULL;
     *out_w = 0;
@@ -274,7 +303,12 @@ static cover_decode_result_t decode_jpeg_progressive_rgb888(const uint8_t * data
 
     struct jpeg_decompress_struct cinfo;
     struct my_jpeg_error_mgr jerr;
-    uint8_t * raw_buf = NULL;
+    /* volatile: modified after setjmp() and read in the setjmp() recovery
+     * block below (reached via longjmp() from deep inside libjpeg, e.g.
+     * during jpeg_read_scanlines()) -- a non-volatile automatic variable's
+     * value after a longjmp is unspecified by the C standard unless it was
+     * never written between the setjmp() call and the longjmp(). */
+    uint8_t * volatile raw_buf = NULL;
 
     memset(&cinfo, 0, sizeof(cinfo));
     cinfo.err = jpeg_std_error(&jerr.pub);
@@ -294,6 +328,21 @@ static cover_decode_result_t decode_jpeg_progressive_rgb888(const uint8_t * data
     jpeg_mem_src(&cinfo, data, (size_t) size);
 
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return COVER_DECODE_FAIL_UNSUPPORTED;
+    }
+
+    /* A baseline (SOF0) file can still be "sequential multiscan" -- its
+     * first scan omits some components, so libjpeg still needs full
+     * native-sized coefficient buffers to hold it together across scans,
+     * exactly like true progressive. jpeg_has_multiple_scans() is true for
+     * BOTH that case and genuine progressive; cinfo.progressive_mode
+     * distinguishes them. Real progressive already has its coefficient
+     * cost billed via jpeg_probe_coeff_bytes()/progressive_coeff_bytes
+     * upstream -- this guard only rejects the OTHER case, which
+     * ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE's admission estimate never
+     * accounts for. Checked before any allocation. */
+    if (!cinfo.progressive_mode && jpeg_has_multiple_scans(&cinfo)) {
         jpeg_destroy_decompress(&cinfo);
         return COVER_DECODE_FAIL_UNSUPPORTED;
     }
@@ -709,6 +758,21 @@ static cover_decode_result_t decode_bmp_rgb888(const uint8_t * data, uint32_t si
     return COVER_DECODE_OK;
 }
 
+/* Ceiling-based equivalent of jpeg_scale_for_target()'s scaled dims for the
+ * SAME chosen scale factor -- libjpeg's own jpeg_core_output_dimensions()
+ * (jpeg/jdinput.c) rounds UP via jdiv_round_up(), not down like tjpgd's
+ * floor(native/2^n) (see jpeg_scale_for_target()'s own doc comment). Used
+ * only for the two libjpeg-routed formats (JPEG_PROGRESSIVE,
+ * JPEG_LIBJPEG_BASELINE) so their admission estimate/dimension cap matches
+ * what libjpeg will actually produce, rather than tjpgd's rounding. */
+static void jpeg_libjpeg_scaled_dims(int native_w, int native_h, int target_w, int target_h,
+                                     int * out_w, int * out_h) {
+    uint8_t n = jpeg_scale_for_target(native_w, native_h, target_w, target_h);
+    int denom = 1 << n;
+    *out_w = (native_w + denom - 1) / denom;
+    *out_h = (native_h + denom - 1) / denom;
+}
+
 cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t size,
                                                int target_w, int target_h,
                                                artwork_priority_t prio,
@@ -729,11 +793,13 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
 
     if (data[0] == 0xFF && data[1] == 0xD8) {
         /* jpeg_probe() (not inspect_jpeg()/tjpgd's jd_prepare()) makes the
-         * routing decision here: baseline (SOF0) still goes through tjpgd
-         * completely unchanged below via inspect_jpeg(), progressive (SOF2)
-         * routes to the separate libjpeg fallback -- see jpeg_probe_t's own
-         * doc comment (cover_decode.h) for why tjpgd's own probe can't be
-         * reused for this (it rejects SOF2 outright, with no dimensions). */
+         * routing decision here: ordinary baseline (SOF0) still goes
+         * through tjpgd completely unchanged below via inspect_jpeg();
+         * progressive (SOF2) and baseline with a tjpgd-incompatible
+         * sampling factor both route to the separate libjpeg fallback --
+         * see jpeg_probe_t's own doc comment (cover_decode.h) for why
+         * tjpgd's own probe can't be reused for this (it rejects SOF2 and
+         * unusual sampling outright, with no dimensions). */
         jpeg_probe_t probe;
         if (!jpeg_probe(data, size, &probe) || !probe.supported) return COVER_DECODE_FAIL_UNSUPPORTED;
         if (probe.is_progressive) {
@@ -741,6 +807,16 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
             native_w = probe.native_w;
             native_h = probe.native_h;
             progressive_coeff_bytes = probe.coeff_bytes;
+        } else if (probe.tjpgd_incompatible) {
+            /* Baseline JPEG, but a chroma-subsampling combination tjpgd's
+             * own minimal SOF0 whitelist rejects (e.g. vertical-only/4:4:0
+             * subsampling -- valid JPEG, just rare). Native dimensions come
+             * from jpeg_probe()'s own SOF parse, not inspect_jpeg()/tjpgd's
+             * jd_prepare() -- that would fail for exactly the same reason
+             * this whole case exists. */
+            fmt = ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE;
+            native_w = probe.native_w;
+            native_h = probe.native_h;
         } else {
             fmt = ARTWORK_FORMAT_JPEG;
             if (!inspect_jpeg(data, size, &native_w, &native_h)) return COVER_DECODE_FAIL_UNSUPPORTED;
@@ -778,6 +854,27 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
                     native_w, native_h, MAX_DECODED_COVER_SIDE);
             return COVER_DECODE_FAIL_OVERSIZED;
         }
+    } else if (fmt == ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE) {
+        /* Same lenient policy as tjpgd's own baseline cap (native up to
+         * MAX_JPEG_NATIVE_SIDE as long as post-scale fits) -- genuinely
+         * single-scan libjpeg decode has no native-dimension-scaling
+         * coefficient cost the way progressive does (decode_jpeg_libjpeg_
+         * rgb888()'s own jpeg_has_multiple_scans() guard rejects the one
+         * baseline case that WOULD have that cost), so progressive's
+         * stricter native-only cap doesn't apply here. Post-scale uses
+         * libjpeg's own ceiling rounding, not tjpgd's floor. */
+        if (native_w > MAX_JPEG_NATIVE_SIDE || native_h > MAX_JPEG_NATIVE_SIDE) {
+            DBG_LOG("cover_decode: libjpeg-baseline JPEG rejected by native dimension cap (%dx%d > %d)\n",
+                    native_w, native_h, MAX_JPEG_NATIVE_SIDE);
+            return COVER_DECODE_FAIL_OVERSIZED;
+        }
+        int sw, sh;
+        jpeg_libjpeg_scaled_dims(native_w, native_h, target_w, target_h, &sw, &sh);
+        if (sw > MAX_DECODED_COVER_SIDE || sh > MAX_DECODED_COVER_SIDE) {
+            DBG_LOG("cover_decode: libjpeg-baseline JPEG rejected by post-scale cap (%dx%d > %d)\n",
+                    sw, sh, MAX_DECODED_COVER_SIDE);
+            return COVER_DECODE_FAIL_OVERSIZED;
+        }
     } else {
         if ((size_t) native_w > max_side || (size_t) native_h > max_side) {
             DBG_LOG("cover_decode: image rejected by dimension cap (%dx%d > max %zu)\n",
@@ -792,10 +889,12 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
      * coefficient cost is billed separately via progressive_coeff_bytes,
      * computed from the SOF's true native size, not this post-scale size. */
     int est_w = native_w, est_h = native_h;
-    if (fmt == ARTWORK_FORMAT_JPEG || fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE) {
+    if (fmt == ARTWORK_FORMAT_JPEG) {
         uint8_t scale = jpeg_scale_for_target(native_w, native_h, target_w, target_h);
         est_w = native_w >> scale;
         est_h = native_h >> scale;
+    } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE || fmt == ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE) {
+        jpeg_libjpeg_scaled_dims(native_w, native_h, target_w, target_h, &est_w, &est_h);
     }
     size_t est_bytes = artwork_estimate_decode_bytes(fmt, size, (size_t) est_w, (size_t) est_h,
                                                      (size_t) target_w, (size_t) target_h,
@@ -822,9 +921,9 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
     if (fmt == ARTWORK_FORMAT_JPEG) {
         dec_res = decode_jpeg_rgb888(data, size, max_side, target_w, target_h,
                                      &native_buf, &decoded_w, &decoded_h);
-    } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE) {
-        dec_res = decode_jpeg_progressive_rgb888(data, size, max_side, target_w, target_h,
-                                                 &native_buf, &decoded_w, &decoded_h);
+    } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE || fmt == ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE) {
+        dec_res = decode_jpeg_libjpeg_rgb888(data, size, max_side, target_w, target_h,
+                                             &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_PNG) {
         dec_res = decode_png_rgb888(data, size, max_side, &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_BMP) {

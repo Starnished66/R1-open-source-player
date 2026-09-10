@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include "backlight.h"
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
 #else
@@ -58,6 +59,11 @@ static lv_obj_t * dev_options_screen;
 static lv_obj_t * accent_color_screen;
 static lv_obj_t * custom_font_screen;
 static lv_obj_t * screen_timeout_screen;
+static lv_obj_t * screen_dimming_screen;
+static lv_obj_t * screen_dimming_switch;
+static lv_obj_t * screen_dimming_slider_card;
+static lv_obj_t * screen_dimming_slider;
+static lv_obj_t * screen_dimming_value_label;
 static lv_obj_t * startup_volume_screen;
 static lv_obj_t * sleep_timer_screen;
 static lv_obj_t * idle_shutdown_screen;
@@ -814,6 +820,147 @@ static lv_obj_t * build_screen_timeout_screen(void) {
 static void screen_timeout_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     nav_push(screen_timeout_screen);
+}
+
+static int screen_dim_delay_seconds_to_step_index(int seconds) {
+    int best = 0;
+    int best_diff = abs(seconds - SCREEN_DIM_DELAY_STEPS[0]);
+    for (int i = 1; i < SCREEN_DIM_DELAY_STEP_COUNT; i++) {
+        int diff = abs(seconds - SCREEN_DIM_DELAY_STEPS[i]);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void screen_dimming_ui_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.screen_dimming_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    if (!current_settings.screen_dimming_enabled) {
+        backlight_set_dimmed(false);
+    }
+    settings_save(&current_settings);
+
+    if (current_settings.screen_dimming_enabled) {
+        lv_obj_remove_flag(screen_dimming_slider_card, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(screen_dimming_slider_card, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void screen_dim_delay_slider_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    int32_t index = lv_slider_get_value(lv_event_get_target(e));
+    int seconds = SCREEN_DIM_DELAY_STEPS[index];
+
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        current_settings.screen_dim_delay_seconds = seconds;
+        char buf[32];
+        format_screen_timeout(buf, sizeof(buf), seconds);
+        lv_label_set_text(screen_dimming_value_label, buf);
+    } else if (code == LV_EVENT_RELEASED) {
+        settings_save(&current_settings);
+    }
+}
+
+static void screen_dimming_screen_loaded_cb(lv_event_t * e) {
+    int effective_max_index = SCREEN_DIM_DELAY_STEP_COUNT - 1;
+    if (current_settings.screen_timeout_enabled) {
+        effective_max_index = -1;
+        for (int i = SCREEN_DIM_DELAY_STEP_COUNT - 1; i >= 0; i--) {
+            if (SCREEN_DIM_DELAY_STEPS[i] < current_settings.screen_timeout_seconds) {
+                effective_max_index = i;
+                break;
+            }
+        }
+        if (effective_max_index == -1) {
+            effective_max_index = 0;
+        }
+    }
+    
+    lv_slider_set_range(screen_dimming_slider, 0, effective_max_index);
+    
+    int current_index = screen_dim_delay_seconds_to_step_index(current_settings.screen_dim_delay_seconds);
+    if (current_index > effective_max_index) {
+        current_settings.screen_dim_delay_seconds = SCREEN_DIM_DELAY_STEPS[effective_max_index];
+        lv_slider_set_value(screen_dimming_slider, effective_max_index, LV_ANIM_OFF);
+        char buf[32];
+        format_screen_timeout(buf, sizeof(buf), current_settings.screen_dim_delay_seconds);
+        lv_label_set_text(screen_dimming_value_label, buf);
+        settings_save(&current_settings);
+    }
+}
+
+static lv_obj_t * build_screen_dimming_screen(void) {
+    lv_obj_t * scr = lv_obj_create(NULL);
+    lv_obj_add_event_cb(scr, screen_dimming_screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
+
+    build_screen_header(scr, "Screen Dimming", generic_back_cb, NULL, NULL);
+
+    lv_obj_t * enable_row = lv_obj_create(scr);
+    lv_obj_set_width(enable_row, lv_pct(90));
+    lv_obj_set_height(enable_row, LV_SIZE_CONTENT);
+    lv_obj_align(enable_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 20);
+    lv_obj_set_style_bg_opa(enable_row, 0, 0);
+    lv_obj_set_style_border_width(enable_row, 0, 0);
+    lv_obj_remove_flag(enable_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(enable_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(enable_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(enable_row, 12, 0);
+
+    lv_obj_t * enable_label = lv_label_create(enable_row);
+    lv_label_set_text(enable_label, "Dim screen before timeout");
+    lv_obj_add_style(enable_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(enable_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_label_set_long_mode(enable_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(enable_label, 1);
+
+    screen_dimming_switch = lv_switch_create(enable_row);
+    lv_obj_add_style(screen_dimming_switch, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (current_settings.screen_dimming_enabled) lv_obj_add_state(screen_dimming_switch, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(screen_dimming_switch, screen_dimming_ui_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    screen_dimming_slider_card = lv_obj_create(scr);
+    lv_obj_set_size(screen_dimming_slider_card, lv_pct(90), 170);
+    lv_obj_align_to(screen_dimming_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
+    lv_obj_add_style(screen_dimming_slider_card, &style_theme_card_bg, 0);
+    lv_obj_set_style_border_width(screen_dimming_slider_card, 0, 0);
+    lv_obj_set_style_radius(screen_dimming_slider_card, 10, 0);
+    if (!current_settings.screen_dimming_enabled) lv_obj_add_flag(screen_dimming_slider_card, LV_OBJ_FLAG_HIDDEN);
+
+    screen_dimming_slider = lv_slider_create(screen_dimming_slider_card);
+    lv_obj_set_width(screen_dimming_slider, lv_pct(94));
+    lv_obj_set_height(screen_dimming_slider, SLIDER_TRACK_HEIGHT);
+    lv_obj_align(screen_dimming_slider, LV_ALIGN_TOP_MID, 0, 18);
+    lv_slider_set_range(screen_dimming_slider, 0, SCREEN_DIM_DELAY_STEP_COUNT - 1);
+    lv_slider_set_value(screen_dimming_slider, screen_dim_delay_seconds_to_step_index(current_settings.screen_dim_delay_seconds), LV_ANIM_OFF);
+    lv_obj_add_style(screen_dimming_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(screen_dimming_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
+    lv_obj_set_style_width(screen_dimming_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(screen_dimming_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_add_event_cb(screen_dimming_slider, screen_dim_delay_slider_event_cb, LV_EVENT_ALL, NULL);
+    lv_obj_set_ext_click_area(screen_dimming_slider, 20);
+
+    screen_dimming_value_label = lv_label_create(screen_dimming_slider_card);
+    lv_obj_add_style(screen_dimming_value_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(screen_dimming_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    lv_obj_align(screen_dimming_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
+    char initial_buf[32];
+    format_screen_timeout(initial_buf, sizeof(initial_buf), current_settings.screen_dim_delay_seconds);
+    lv_label_set_text(screen_dimming_value_label, initial_buf);
+
+    finalize_screen_navigation(scr);
+    lv_obj_remove_flag(screen_dimming_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    register_swipe_dead_zone(screen_dimming_slider_card);
+    return scr;
+}
+
+static void screen_dimming_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(screen_dimming_screen);
 }
 
 static void startup_volume_switch_event_cb(lv_event_t * e) {
@@ -1636,8 +1783,7 @@ static lv_obj_t * build_settings_display_screen(void) {
     items[2] = (pill_list_item_t){ "Font Size", PILL_ACCESSORY_CHEVRON, false, font_size_settings_row_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "Lyrics Text Size", PILL_ACCESSORY_CHEVRON, false, lyrics_font_size_settings_row_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "Screen Timeout", PILL_ACCESSORY_CHEVRON, false, screen_timeout_row_cb, NULL, NULL };
-    items[5] = (pill_list_item_t){ "Screen Dimming", PILL_ACCESSORY_TOGGLE,
-                                    current_settings.screen_dimming_enabled, NULL, screen_dimming_switch_event_cb, NULL };
+    items[5] = (pill_list_item_t){ "Screen Dimming", PILL_ACCESSORY_CHEVRON, false, screen_dimming_row_cb, NULL, NULL };
     items[6] = (pill_list_item_t){ "Swipe Up for Home", PILL_ACCESSORY_TOGGLE,
                                     current_settings.swipe_up_home_enabled, NULL, swipe_up_home_switch_event_cb, NULL };
     items[7] = (pill_list_item_t){ "Hide Player/Lyrics Top Bar", PILL_ACCESSORY_TOGGLE,
@@ -3073,6 +3219,7 @@ void gui_settings_init(void) {
     accent_color_screen = build_accent_color_screen();
     custom_font_screen = build_custom_font_screen();
     screen_timeout_screen = build_screen_timeout_screen();
+    screen_dimming_screen = build_screen_dimming_screen();
     startup_volume_screen = build_startup_volume_screen();
     sleep_timer_screen = build_sleep_timer_screen();
     idle_shutdown_screen = build_idle_shutdown_screen();
@@ -3126,6 +3273,7 @@ void gui_settings_teardown(void) {
     if (accent_color_screen) { lv_obj_del(accent_color_screen); accent_color_screen = NULL; }
     if (custom_font_screen) { lv_obj_del(custom_font_screen); custom_font_screen = NULL; }
     if (screen_timeout_screen) { lv_obj_del(screen_timeout_screen); screen_timeout_screen = NULL; }
+    if (screen_dimming_screen) { lv_obj_del(screen_dimming_screen); screen_dimming_screen = NULL; }
     if (startup_volume_screen) { lv_obj_del(startup_volume_screen); startup_volume_screen = NULL; }
     if (sleep_timer_screen) { lv_obj_del(sleep_timer_screen); sleep_timer_screen = NULL; }
     if (idle_shutdown_screen) { lv_obj_del(idle_shutdown_screen); idle_shutdown_screen = NULL; }

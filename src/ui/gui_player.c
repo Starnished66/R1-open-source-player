@@ -3349,15 +3349,6 @@ void swipe_up_home_switch_event_cb(lv_event_t * e) {
     settings_save(&current_settings);
 }
 
-void screen_dimming_switch_event_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-    current_settings.screen_dimming_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    if (!current_settings.screen_dimming_enabled) {
-        backlight_set_dimmed(false);
-    }
-    settings_save(&current_settings);
-}
-
 void hide_player_topbar_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.hide_player_topbar = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);

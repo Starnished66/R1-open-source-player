@@ -27,6 +27,7 @@ player_settings_t current_settings;
 #define SETTINGS_TMP_FILE_PATH SETTINGS_FILE_PATH ".tmp"
 
 const int SCREEN_TIMEOUT_STEPS[SCREEN_TIMEOUT_STEP_COUNT] = { 15, 30, 60, 120, 300, 600, 1800 };
+const int SCREEN_DIM_DELAY_STEPS[SCREEN_DIM_DELAY_STEP_COUNT] = { 5, 10, 15, 30, 60, 120, 300 };
 const int IDLE_SHUTDOWN_STEPS[IDLE_SHUTDOWN_STEP_COUNT] = { 10, 15, 30, 60, 120 };
 const int SLEEP_TIMER_STEPS[SLEEP_TIMER_STEP_COUNT] = { 5, 10, 15, 20, 30, 45, 60, 90, 120, 180 };
 
@@ -39,6 +40,19 @@ static int nearest_screen_timeout_step(int seconds) {
         if (diff < best_diff) {
             best_diff = diff;
             best = SCREEN_TIMEOUT_STEPS[i];
+        }
+    }
+    return best;
+}
+
+static int nearest_screen_dim_delay_step(int seconds) {
+    int best = SCREEN_DIM_DELAY_STEPS[0];
+    int best_diff = abs(seconds - best);
+    for (int i = 1; i < SCREEN_DIM_DELAY_STEP_COUNT; i++) {
+        int diff = abs(seconds - SCREEN_DIM_DELAY_STEPS[i]);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best = SCREEN_DIM_DELAY_STEPS[i];
         }
     }
     return best;
@@ -101,6 +115,7 @@ static void set_defaults(player_settings_t * out) {
     out->screen_timeout_enabled = true;
     out->screen_timeout_seconds = 30;
     out->screen_dimming_enabled = true;
+    out->screen_dim_delay_seconds = 10;
     out->hide_player_topbar = false;
     out->led_indicator_enabled = true;
     out->db_logging_enabled = false; /* opt-in developer diagnostic, off by default */
@@ -343,6 +358,8 @@ bool settings_load(player_settings_t * out) {
             out->screen_timeout_seconds = atoi(value);
         } else if (strcmp(key, "screen_dimming_enabled") == 0) {
             out->screen_dimming_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "screen_dim_delay_seconds") == 0) {
+            out->screen_dim_delay_seconds = atoi(value);
         } else if (strcmp(key, "hide_player_topbar") == 0) {
             out->hide_player_topbar = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "led_indicator_enabled") == 0) {
@@ -434,6 +451,7 @@ bool settings_load(player_settings_t * out) {
     }
 
     out->screen_timeout_seconds = nearest_screen_timeout_step(out->screen_timeout_seconds);
+    out->screen_dim_delay_seconds = nearest_screen_dim_delay_step(out->screen_dim_delay_seconds);
     out->idle_shutdown_minutes = nearest_idle_shutdown_step(out->idle_shutdown_minutes);
     out->sleep_timer_minutes = nearest_sleep_timer_step(out->sleep_timer_minutes);
 
@@ -490,6 +508,7 @@ static void settings_write_file(const player_settings_t * settings) {
     fprintf(f, "screen_timeout_enabled=%d\n", settings->screen_timeout_enabled ? 1 : 0);
     fprintf(f, "screen_timeout_seconds=%d\n", settings->screen_timeout_seconds);
     fprintf(f, "screen_dimming_enabled=%d\n", settings->screen_dimming_enabled ? 1 : 0);
+    fprintf(f, "screen_dim_delay_seconds=%d\n", settings->screen_dim_delay_seconds);
     fprintf(f, "hide_player_topbar=%d\n", settings->hide_player_topbar ? 1 : 0);
     fprintf(f, "led_indicator_enabled=%d\n", settings->led_indicator_enabled ? 1 : 0);
     fprintf(f, "db_logging_enabled=%d\n", settings->db_logging_enabled ? 1 : 0);

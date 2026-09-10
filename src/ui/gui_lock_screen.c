@@ -6,7 +6,7 @@
 #include "app_clock.h"
 #include "assets.h"
 #include "screen_builders.h"
-#include "gesture_detector.h"
+#include "backlight.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -20,14 +20,20 @@ static lv_timer_t * lock_touch_timer = NULL;
 static gui_lock_screen_mode_t current_mode = LOCK_SCREEN_MODE_OFF;
 static bool current_clock_24h = true;
 
-/* Swipe-up-to-dismiss tracking -- reuses the same detector already driving
- * the home-indicator swipe gesture elsewhere (gui_shell.c) rather than
- * hand-rolling a second copy of the same press/track/threshold bookkeeping.
- * band_height is set to the full screen height at poll time (see
- * lock_touch_timer_cb()) so every press anywhere on the lock screen is
- * eligible, not just one starting in a narrow bottom band like the home
- * indicator's own gesture. */
-static gesture_home_state_t lock_gesture_state;
+static void stop_timers(void);
+
+static bool lock_swipe_was_pressed = false;
+static bool lock_swipe_candidate = false;
+static bool lock_swipe_tracking = false;
+static bool lock_swipe_just_confirmed = false;
+static int32_t lock_swipe_touch_start_x = 0;
+static int32_t lock_swipe_touch_start_y = 0;
+static int32_t lock_swipe_last_v = 0;
+static int32_t lock_swipe_last_velocity = 0;
+static slide_transition_ctx_t * lock_swipe_ctx = NULL;
+static slide_transition_ctx_t * lock_settle_ctx = NULL;
+#define LOCK_SWIPE_DEADZONE 20
+#define LOCK_SWIPE_SETTLE_MS 200
 
 lv_obj_t * gui_lock_screen_get_screen(void) {
     return lock_screen;
@@ -77,9 +83,15 @@ static void lock_clock_timer_cb(lv_timer_t * timer) {
     update_clock_display();
 }
 
+static void lock_settle_done_cb(lv_anim_t * a) {
+    lock_settle_ctx = NULL;
+    slide_transition_done_cb(a);
+}
+
 static void lock_touch_timer_cb(lv_timer_t * timer) {
     (void) timer;
     if (!gui_lock_screen_is_showing()) return;
+    if (!backlight_screen_is_on()) return;
 
     lv_indev_t * indev = find_pointer_indev();
     if (!indev) return;
@@ -87,30 +99,127 @@ static void lock_touch_timer_cb(lv_timer_t * timer) {
     bool pressed = (lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED);
     lv_point_t p;
     lv_indev_get_point(indev, &p);
-
-    gesture_home_config_t cfg;
     int32_t screen_height = lv_display_get_vertical_resolution(lv_display_get_default());
-    cfg.swipe_up_home_enabled = true;
-    cfg.quick_drawer_open = false;
-    cfg.is_bt_dac_overlay = false;
-    cfg.is_usb_dac_overlay = false;
-    cfg.is_lyrics_screen = false;
-    cfg.is_lock_screen = false;
-    cfg.has_background_work = false;
-    cfg.screen_height = screen_height;
-    cfg.band_height = screen_height; /* the whole screen is the swipe surface, not just a bottom band */
 
-    bool dismiss = gesture_home_state_poll(&lock_gesture_state, &cfg, pressed, p.y);
-    if (dismiss) {
-        /* Same real-device fix already applied to the home-swipe and
-         * player-swipe gestures elsewhere (gui_navigation.c) -- without
-         * this, the finger is still down when nav_pop() loads the screen
-         * underneath, and the eventual release lands on whatever's at that
-         * coordinate there (e.g. a Home tile), firing an unintended tap
-         * right as the lock screen dismisses. */
-        lv_indev_wait_release(indev);
-        gui_lock_screen_hide();
+    if (pressed && !lock_swipe_was_pressed) {
+        lock_swipe_candidate = true;
+        lock_swipe_touch_start_x = p.x;
+        lock_swipe_touch_start_y = p.y;
+        lock_swipe_tracking = false;
     }
+
+    if (pressed && lock_swipe_candidate && !lock_swipe_tracking) {
+        int32_t dx = p.x - lock_swipe_touch_start_x;
+        int32_t dy = p.y - lock_swipe_touch_start_y;
+        int32_t adx = dx < 0 ? -dx : dx;
+        int32_t ady = dy < 0 ? -dy : dy;
+
+        if (adx >= LOCK_SWIPE_DEADZONE || ady >= LOCK_SWIPE_DEADZONE) {
+            if (dy < 0 && ady > adx) {
+                lv_obj_t * target = gui_navigation_get_screen_at(gui_navigation_get_depth() - 2);
+                if (target) {
+                    lock_swipe_ctx = begin_slide_transition_ex(target, true, true, true);
+                    if (lock_swipe_ctx) {
+                        lock_swipe_ctx->commit = false;
+                        lock_swipe_tracking = true;
+                        lock_swipe_just_confirmed = true;
+                        lock_swipe_last_v = 0;
+                        lock_swipe_last_velocity = 0;
+                        lv_indev_wait_release(indev);
+                    }
+                }
+            } else if (adx > ady && !lv_indev_get_scroll_obj(indev)) {
+                lv_indev_wait_release(indev);
+            }
+            lock_swipe_candidate = false;
+        }
+    }
+
+    /* Deliberately a separate `if`, not `else if` chained to the deadzone-
+     * confirm block above -- on the exact tick the deadzone confirms and
+     * sets lock_swipe_tracking, this block must ALSO run so lock_swipe_
+     * last_v/last_velocity are sampled from the real touch position right
+     * away, not left at the confirm block's own zero-initialization. A fast
+     * flick that crosses the deadzone and releases on the very next tick
+     * would otherwise see last_v/last_velocity still 0 at release and
+     * wrongly fall through to the halfway-position cancel path despite the
+     * confirmed upward movement. just_confirmed still defers only the frame
+     * PRESENTATION (slide_transition_anim_x_cb) to the next tick, not this
+     * position sampling -- matching gui_shell.c's home-swipe/back-swipe. */
+    if (pressed && lock_swipe_tracking) {
+        int32_t v = p.y - lock_swipe_touch_start_y;
+        if (v < -screen_height) v = -screen_height;
+        if (v > 0) v = 0;
+
+        int32_t delta = v - lock_swipe_last_v;
+        if (delta != 0) lock_swipe_last_velocity = delta;
+        lock_swipe_last_v = v;
+
+        if (lock_swipe_just_confirmed) {
+            lock_swipe_just_confirmed = false;
+        } else {
+            slide_transition_anim_x_cb(lock_swipe_ctx, v);
+        }
+    }
+
+    if (!pressed && lock_swipe_was_pressed && lock_swipe_tracking) {
+        lock_swipe_tracking = false;
+        int32_t current_v = lock_swipe_last_v;
+        bool commit = (lock_swipe_last_velocity < 0) ? true
+                     : (lock_swipe_last_velocity > 0) ? false
+                     : (current_v < -screen_height / 2);
+
+        slide_transition_ctx_t * settle_ctx = lock_swipe_ctx;
+        lock_swipe_ctx = NULL;
+        lock_swipe_candidate = false;
+        lock_swipe_just_confirmed = false;
+        lock_swipe_was_pressed = false;
+
+        settle_ctx->commit = commit;
+
+        if (commit) {
+            stop_timers();
+            nav_pop_stack_only();
+        }
+
+        lock_settle_ctx = settle_ctx;
+
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, settle_ctx);
+        lv_anim_set_user_data(&a, settle_ctx);
+        lv_anim_set_values(&a, current_v, commit ? -screen_height : 0);
+        lv_anim_set_duration(&a, LOCK_SWIPE_SETTLE_MS);
+        lv_anim_set_exec_cb(&a, slide_transition_anim_x_cb);
+        lv_anim_set_completed_cb(&a, lock_settle_done_cb);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+    }
+
+    lock_swipe_was_pressed = pressed;
+}
+
+void gui_lock_screen_swipe_recover(void * ctx) {
+    slide_transition_ctx_t * sctx = (slide_transition_ctx_t *) ctx;
+    if (sctx == lock_swipe_ctx) lock_swipe_ctx = NULL;
+    if (sctx == lock_settle_ctx) lock_settle_ctx = NULL;
+    lock_swipe_tracking = false;
+    lock_swipe_candidate = false;
+    lock_swipe_just_confirmed = false;
+    lock_swipe_was_pressed = false;
+}
+
+void gui_lock_screen_reset_drag_state(void) {
+    if (lock_swipe_ctx) {
+        slide_transition_cancel(&lock_swipe_ctx);
+    }
+    if (lock_settle_ctx && !lock_settle_ctx->commit) {
+        slide_transition_cancel(&lock_settle_ctx);
+    }
+    lock_swipe_tracking = false;
+    lock_swipe_candidate = false;
+    lock_swipe_just_confirmed = false;
+    lock_swipe_was_pressed = false;
 }
 
 static void start_timers(void) {
@@ -145,7 +254,6 @@ static void stop_timers(void) {
         lv_timer_delete(lock_touch_timer);
         lock_touch_timer = NULL;
     }
-    gesture_home_state_reset(&lock_gesture_state);
 }
 
 static void build_lock_screen_if_needed(void) {
@@ -297,7 +405,6 @@ void gui_lock_screen_init(void) {
     lock_clock_timer = NULL;
     lock_touch_timer = NULL;
     current_mode = LOCK_SCREEN_MODE_OFF;
-    gesture_home_state_reset(&lock_gesture_state);
 }
 
 /* Called from gui_soft_reload() (gui_reload.c), after gui_navigation_teardown()

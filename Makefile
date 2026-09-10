@@ -13,13 +13,29 @@ $(error Unknown BOARD '$(BOARD)' -- expected r1, r3proii, or r3ii_2025)
 endif
 BOARD_DEFINE = -DBOARD_$(shell echo $(BOARD) | tr a-z A-Z)
 
-# Object directories
+# Object directories -- same r1-stays-bare reasoning as HOST_BIN/TARGET_BIN
+# below. Every build_target/ or build_host/ path elsewhere in this file is
+# written through these two variables, never the literal string, so a board
+# switch can't accidentally reuse the other board's stale .o files.
+ifeq ($(BOARD),r1)
+BUILD_TARGET_DIR = build_target
+BUILD_HOST_DIR = build_host
+else
 BUILD_TARGET_DIR = build_target_$(BOARD)
 BUILD_HOST_DIR = build_host_$(BOARD)
+endif
 
-# Target executables
+# Target executables -- r1 keeps its exact original unsuffixed names (every
+# downstream consumer -- the Test2 repack workflow, CI, TESTING.md -- expects
+# these exact filenames), other boards get a distinct suffix so a non-r1
+# build can never be mistaken for or silently overwrite an r1 one.
+ifeq ($(BOARD),r1)
+HOST_BIN = open_hiby_player_host
+TARGET_BIN = open_hiby_player_target
+else
 HOST_BIN = open_hiby_player_host_$(BOARD)
 TARGET_BIN = open_hiby_player_target_$(BOARD)
+endif
 
 # Compiler and Linker configuration
 CC = gcc

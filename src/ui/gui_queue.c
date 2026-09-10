@@ -250,6 +250,7 @@ void gui_queue_poll(void) {
         populate_queue_screen();
         lv_obj_scroll_to_y(queue_list, scroll, LV_ANIM_OFF);
     }
+    gui_player_queue_poll_urgent();
     if (now - last_checkpoint >= 30000 || (revision != saved_revision && now - last_checkpoint >= 1000)) {
         gui_player_queue_checkpoint();
         last_checkpoint = now; saved_revision = revision;

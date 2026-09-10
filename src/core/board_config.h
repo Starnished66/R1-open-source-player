@@ -70,4 +70,42 @@
 #define BOARD_SCALE_PX(px) \
   (((px) * BOARD_SCREEN_WIDTH + (BOARD_REFERENCE_WIDTH / 2)) / BOARD_REFERENCE_WIDTH)
 
+
+  /* R3 Pro II has a dedicated charger IC, MP2731, alongside the AXP2101 PMIC
+ * shared with R1 -- R1 relies on the AXP2101 alone for charging. */
+#if defined(BOARD_R3PROII)
+  #define HAS_MP2731 1
+#else
+  #define HAS_MP2731 0
+#endif
+
+/* R3 Pro II's dedicated charger IC's own device node name -- only defined
+ * (not defined-as-empty) on that board, matching how src/hardware/battery.c
+ * gates its own #if defined(MP2731_CHARGER_DEVICE) use of it. On the R3Pro
+ * II, the "battery" power-supply node's own "status" attribute is stuck
+ * reporting "Discharging" even while actually charging (its "capacity"
+ * attribute is unaffected and stays accurate); the MP2731 charger IC
+ * exposes its own power-supply node with a correct "status" attribute, so
+ * that node is used for status specifically on this board instead. */
+#if defined(BOARD_R3PROII)
+  #define MP2731_CHARGER_DEVICE "mp2731-charger"
+#endif
+
+/* True per-board stock charge-voltage targets -- NOT guessed or captured
+ * from a live register read. Pulled directly from each board's own stock
+ * firmware boot script (module_driver/axp2101.sh's "insmod axp2101.ko ...
+ * charge_voltage_limit=<mV>" parameter, which the kernel driver reprograms
+ * into AXP_REG_VOLTAGE unconditionally on every boot -- so there is nothing
+ * to infer at runtime, and no ambiguity from a prior buggy build having left
+ * the register at some other value):
+ *   R1:        charge_voltage_limit=4350 -> AXP2101 enum 4 (4.35V)
+ *   R3 Pro II: charge_voltage_limit=4400 -> AXP2101 enum 5 (4.40V)
+ * AXP_REG_VOLTAGE's low 3 bits (src/hardware/charge_limiter.c): 1=4.0V
+ * 2=4.1V 3=4.2V 4=4.35V 5=4.4V. */
+#if defined(BOARD_R3PROII)
+  #define AXP_VOLTAGE_BASELINE 5u
+#else
+  #define AXP_VOLTAGE_BASELINE 4u
+#endif
+
 #endif /* BOARD_CONFIG_H */

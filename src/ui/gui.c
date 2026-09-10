@@ -1,6 +1,7 @@
 #include "gui.h"
 #include "app_clock.h"
 #include "gui_library.h"
+#include "gui_lock_screen.h"
 #include "gui_queue.h"
 #include "gui_player.h"
 #include "gui_plugins.h"
@@ -313,6 +314,7 @@ static void apply_screen_runtime_state(bool screen_on) {
 
     gui_shell_reset_drag_state();
     gui_library_reset_drag_state();
+    gui_lock_screen_reset_drag_state();
 
     lv_timer_t * refr_timer = lv_display_get_refr_timer(lv_display_get_default());
     if (refr_timer) {

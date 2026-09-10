@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "artwork_coordinator.h"
 
 typedef struct {
     char title[128];
@@ -130,14 +131,26 @@ typedef enum {
 /* Artwork-only metadata read with embedded cover bytes, contained in a child
  * process. Unlike metadata_read_isolated(), this intentionally transfers
  * picture_data back to the caller (lyrics are not decoded). Parser address
- * space is bounded and the parent admits the actual picture-copy size. The result
- * distinguishes a completed read with no picture from transient process,
- * timeout, I/O, and allocation failures. Caller owns out->picture_data. */
+ * space is bounded and the parent admits the actual picture-copy size --
+ * using `prio`, the caller's own real priority (matching the
+ * artwork_coordinator_acquire()/release() call already wrapping this at
+ * every call site), not a fixed worst-case reserve: an interactive
+ * PRIO_PLAYER extraction should not be held to the background warmer's own
+ * stricter 8MiB reserve just because this happens to share code with it.
+ * The result distinguishes a completed read with no picture from transient
+ * process, timeout, I/O, and allocation failures. Caller owns
+ * out->picture_data. */
 metadata_artwork_result_t metadata_read_artwork_isolated(const char * path,
                                                          track_metadata_t * out,
-                                                         int timeout_ms);
+                                                         int timeout_ms,
+                                                         artwork_priority_t prio);
 
-/* Internal subprocess entry point used by main() before player startup. */
-int metadata_artwork_helper_run(const char * path, int output_fd);
+/* Internal subprocess entry point used by main() before player startup.
+ * `prio` is the parent's own real priority for this extraction, threaded
+ * across the fork/exec boundary via argv (see
+ * metadata_read_artwork_isolated_impl()'s own comment) so this child's
+ * memory ceiling (metadata_artwork_limit_memory()) uses the matching
+ * reserve instead of always the warmer's own strictest one. */
+int metadata_artwork_helper_run(const char * path, int output_fd, artwork_priority_t prio);
 
 #endif /* METADATA_H */

@@ -2275,6 +2275,7 @@ static lv_obj_t * create_eq_slider_card(lv_obj_t * parent, eq_field_t field, lv_
  * separate, explicit "keep this exact setup around under a name" action,
  * living in their own SD card folder rather than mixed in with music. */
 static lv_obj_t * eq_profiles_list;
+static lv_obj_t * eq_profiles_title_label;
 /* Name of the named profile whose values are currently loaded.  The PEQ
  * engine deliberately knows only about values and its always-current
  * autosave file, so the UI owns this bit of presentation state.  Saving
@@ -2483,11 +2484,15 @@ static void hostname_row_cb(lv_event_t * e) {
 static char ** eq_profile_paths = NULL;
 static int eq_profile_count = 0;
 static bool eq_profiles_edit_mode = false;
+/* When true, populate_eq_profiles_screen() wires rows to overwrite the
+ * tapped profile with the CURRENT PEQ values instead of loading it --
+ * entered only via the Save flow's "Replace Existing" choice (see
+ * eq_open_save_choice_popup()), never a standalone navigation target. */
+static bool eq_profiles_replace_mode = false;
 static lv_obj_t * eq_profiles_edit_btn = NULL;
 static char eq_profile_pending_path[512];
 static lv_obj_t * eq_profile_delete_popup;
 static lv_obj_t * eq_profile_delete_popup_backdrop;
-static bool eq_save_as_long_press_fired = false;
 
 static void eq_profiles_free_paths(void) {
     for (int i = 0; i < eq_profile_count; i++) free(eq_profile_paths[i]);
@@ -2535,6 +2540,29 @@ static void eq_profile_row_cb(lv_event_t * e) {
     peq_save();
     nav_pop();
     show_info_toast("Profile loaded");
+}
+
+/* Replace-mode row tap: overwrites the tapped profile's file with the
+ * CURRENT PEQ values (the opposite direction of eq_profile_row_cb's load) --
+ * only reachable via the Save flow's "Replace Existing" choice, so tapping a
+ * row here is already the user's one deliberate confirming action, same as
+ * a normal in-place Save never asking again.
+ * Writes to `path` directly (already a real, scanned, existing file -- no
+ * need to re-validate a name or reconstruct it via eq_profile_path_from_name())
+ * and only commits eq_current_profile_name/leaves the screen on success --
+ * committing identity before the write could succeed would leave a FAILED
+ * overwrite (SD full, unmount mid-write) pointing the next in-place Save at
+ * the tapped file instead of whatever was actually current before this tap. */
+static void eq_profile_replace_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    const char * path = (const char *) lv_event_get_user_data(e);
+    if (!peq_save_to_path(path)) {
+        show_error_toast("Failed to save profile");
+        return;
+    }
+    eq_set_current_profile_from_path(path);
+    show_info_toast("Profile saved");
+    nav_pop();
 }
 
 static void hide_eq_profile_delete_popup(void) {
@@ -2620,8 +2648,16 @@ static void populate_eq_profiles_screen(void) {
     lv_obj_clean(eq_profiles_list);
     eq_profiles_free_paths();
 
-    if (eq_profiles_edit_btn)
+    if (eq_profiles_title_label)
+        lv_label_set_text(eq_profiles_title_label, eq_profiles_replace_mode ? "Replace Profile" : "Profiles");
+    if (eq_profiles_edit_btn) {
         lv_label_set_text(eq_profiles_edit_btn, eq_profiles_edit_mode ? "Done" : "Edit");
+        /* Rename/delete don't make sense mid-replace -- hide the entry point
+         * entirely rather than let a mode switch there leave replace_mode
+         * armed underneath a "Done" tap that returns to it unexpectedly. */
+        if (eq_profiles_replace_mode) lv_obj_add_flag(eq_profiles_edit_btn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(eq_profiles_edit_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 
     if (!peq_scan_profiles(PEQ_PROFILES_DIR, &eq_profile_paths, &eq_profile_count)) {
         lv_obj_t * label = lv_label_create(eq_profiles_list);
@@ -2659,11 +2695,23 @@ static void populate_eq_profiles_screen(void) {
             lv_obj_align(delete_icon, LV_ALIGN_RIGHT_MID, -20, 0);
             lv_obj_add_flag(delete_icon, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(delete_icon, eq_profile_delete_row_cb, LV_EVENT_CLICKED, eq_profile_paths[i]);
+        } else if (eq_profiles_replace_mode) {
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, eq_profile_replace_row_cb, LV_EVENT_CLICKED, eq_profile_paths[i]);
         } else {
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(row, eq_profile_row_cb, LV_EVENT_CLICKED, eq_profile_paths[i]);
         }
     }
+}
+
+/* Catches every way this screen can be left (back button, back-swipe, Home
+ * swipe) -- not just eq_profile_replace_row_cb's own success-path nav_pop()
+ * -- so replace mode can never stay armed into a later, unrelated visit to
+ * this same screen via "Load Profile". */
+static void eq_profiles_screen_unloaded_cb(lv_event_t * e) {
+    (void) e;
+    eq_profiles_replace_mode = false;
 }
 
 static void eq_profiles_edit_btn_cb(lv_event_t * e) {
@@ -2680,8 +2728,8 @@ static void build_eq_profile_delete_popup(void) {
 }
 
 static lv_obj_t * build_eq_profiles_screen(void) {
-    lv_obj_t * title_label;
-    lv_obj_t * scr = build_subsonic_list_screen("Profiles", &title_label, &eq_profiles_list);
+    lv_obj_t * scr = build_subsonic_list_screen("Profiles", &eq_profiles_title_label, &eq_profiles_list);
+    lv_obj_add_event_cb(scr, eq_profiles_screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
     eq_profiles_edit_btn = lv_label_create(scr);
     lv_label_set_text(eq_profiles_edit_btn, "Edit");
     lv_obj_set_style_text_color(eq_profiles_edit_btn, accent_lv_color(), 0);
@@ -2689,13 +2737,23 @@ static lv_obj_t * build_eq_profiles_screen(void) {
     align_screen_header_action(eq_profiles_edit_btn, 20);
     lv_obj_add_flag(eq_profiles_edit_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(eq_profiles_edit_btn, eq_profiles_edit_btn_cb, LV_EVENT_CLICKED, NULL);
-    if (title_label) reserve_title_width_before(title_label, eq_profiles_edit_btn);
+    if (eq_profiles_title_label) reserve_title_width_before(eq_profiles_title_label, eq_profiles_edit_btn);
     return scr;
 }
 
 static void eq_load_profile_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     eq_profiles_edit_mode = false;
+    eq_profiles_replace_mode = false;
+    populate_eq_profiles_screen();
+    nav_push(eq_profiles_screen);
+}
+
+/* Entered only from the Save flow's "Replace Existing" choice -- see
+ * eq_open_save_choice_popup(). */
+static void eq_open_profiles_for_replace(void) {
+    eq_profiles_edit_mode = false;
+    eq_profiles_replace_mode = true;
     populate_eq_profiles_screen();
     nav_push(eq_profiles_screen);
 }
@@ -2705,23 +2763,102 @@ static void eq_save_profile_name_done_cb(const char * text, void * user_data) {
     eq_save_named_profile(text);
 }
 
-static void eq_save_profile_long_press_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
-    eq_save_as_long_press_fired = true;
-    show_text_entry("Save Profile As", eq_current_profile_name, false, false, eq_save_profile_name_done_cb, NULL);
+/* Save-choice popup: offered whenever a Save action would otherwise go
+ * straight to a blank/prefilled text entry (no current profile, or a
+ * deliberate "Save As" hold) AND at least one profile already exists to
+ * replace -- reported gap: users had no way to pick an EXISTING preset to
+ * overwrite, only a text box to name a new one. `eq_save_choice_prefill_current`
+ * remembers which of those two triggered it, so "New Profile" opens the
+ * right text-entry variant once the choice is made. */
+static lv_obj_t * eq_save_choice_popup;
+static lv_obj_t * eq_save_choice_popup_backdrop;
+static bool eq_save_choice_prefill_current = false;
+
+static void eq_hide_save_choice_popup(void) {
+    lv_obj_add_flag(eq_save_choice_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(eq_save_choice_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void eq_save_choice_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    eq_hide_save_choice_popup();
+}
+
+static void eq_save_choice_new_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    eq_hide_save_choice_popup();
+    const char * prefill = eq_save_choice_prefill_current ? eq_current_profile_name : "";
+    const char * title = eq_save_choice_prefill_current ? "Save Profile As" : "Profile Name";
+    show_text_entry(title, prefill, false, false, eq_save_profile_name_done_cb, NULL);
+}
+
+static void eq_save_choice_replace_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    eq_hide_save_choice_popup();
+    eq_open_profiles_for_replace();
+}
+
+static void build_eq_save_choice_popup(void) {
+    eq_save_choice_popup = build_confirm_popup(
+        "Save Profile", LV_LABEL_LONG_WRAP, NULL,
+        "Save as a new profile, or replace one that already exists?",
+        "Replace Existing", lv_color_make(255, 120, 120), eq_save_choice_replace_cb, NULL,
+        "New Profile", accent_lv_color(), eq_save_choice_new_cb, NULL,
+        eq_save_choice_backdrop_cb, &eq_save_choice_popup_backdrop);
+}
+
+/* Shows the choice popup when there's at least one existing profile to
+ * offer replacing; otherwise (first-ever save) goes straight to the same
+ * text-entry a plain "New Profile" choice would have opened, since there's
+ * nothing yet to replace. */
+static void eq_open_save_choice_popup(bool prefill_current_name) {
+    char ** existing_paths = NULL;
+    int existing_count = 0;
+    bool have_existing = peq_scan_profiles(PEQ_PROFILES_DIR, &existing_paths, &existing_count) && existing_count > 0;
+    for (int i = 0; i < existing_count; i++) free(existing_paths[i]);
+    free(existing_paths);
+
+    if (!have_existing) {
+        const char * prefill = prefill_current_name ? eq_current_profile_name : "";
+        const char * title = prefill_current_name ? "Save Profile As" : "Profile Name";
+        show_text_entry(title, prefill, false, false, eq_save_profile_name_done_cb, NULL);
+        return;
+    }
+
+    eq_save_choice_prefill_current = prefill_current_name;
+    lv_obj_remove_flag(eq_save_choice_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(eq_save_choice_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(eq_save_choice_popup_backdrop);
+    lv_obj_move_foreground(eq_save_choice_popup);
+}
+
+/* Save Profile: a quick tap saves in place; a deliberate hold opens the save
+ * choice above (prefilled with the current name if choosing "New Profile").
+ * Tracked locally via our own PRESSED/CLICKED timestamps rather than LVGL's
+ * global LV_EVENT_LONG_PRESSED (LV_INDEV_DEF_LONG_PRESS_TIME, 400ms, shared
+ * by every long-press in the app) -- 400ms was too easy to trip on an
+ * ordinary deliberate tap here, especially right after a run of slider
+ * drags, so this button alone uses a longer local hold. */
+#define EQ_SAVE_PROFILE_HOLD_MS 700
+static uint32_t eq_save_profile_press_start_ms = 0;
+
+static void eq_save_profile_pressed_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_PRESSED) return;
+    eq_save_profile_press_start_ms = lv_tick_get();
 }
 
 static void eq_save_profile_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (eq_save_as_long_press_fired) {
-        eq_save_as_long_press_fired = false;
+    bool held = lv_tick_elaps(eq_save_profile_press_start_ms) >= EQ_SAVE_PROFILE_HOLD_MS;
+    if (held) {
+        eq_open_save_choice_popup(true);
         return;
     }
     if (eq_current_profile_name[0]) {
         eq_save_named_profile(eq_current_profile_name);
         return;
     }
-    show_text_entry("Profile Name", "", false, false, eq_save_profile_name_done_cb, NULL);
+    eq_open_save_choice_popup(false);
 }
 
 static lv_obj_t * build_eq_screen(void) {
@@ -2878,8 +3015,8 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_set_style_pad_all(save_btn, 14, 0);
     lv_obj_remove_flag(save_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(save_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(save_btn, eq_save_profile_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(save_btn, eq_save_profile_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(save_btn, eq_save_profile_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
     lv_obj_t * save_label = lv_label_create(save_btn);
     lv_label_set_text(save_label, "Save Profile");
     lv_obj_set_style_text_font(save_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
@@ -2965,6 +3102,7 @@ void gui_settings_init(void) {
     build_firmware_update_popup();
     build_eq_reset_popup();
     build_eq_profile_delete_popup();
+    build_eq_save_choice_popup();
     build_factory_reset_popup();
     build_hostname_reboot_popup();
 }
@@ -2984,6 +3122,8 @@ void gui_settings_teardown(void) {
     if (eq_reset_popup_backdrop) { lv_obj_del(eq_reset_popup_backdrop); eq_reset_popup_backdrop = NULL; }
     if (eq_profile_delete_popup) { lv_obj_del(eq_profile_delete_popup); eq_profile_delete_popup = NULL; }
     if (eq_profile_delete_popup_backdrop) { lv_obj_del(eq_profile_delete_popup_backdrop); eq_profile_delete_popup_backdrop = NULL; }
+    if (eq_save_choice_popup) { lv_obj_del(eq_save_choice_popup); eq_save_choice_popup = NULL; }
+    if (eq_save_choice_popup_backdrop) { lv_obj_del(eq_save_choice_popup_backdrop); eq_save_choice_popup_backdrop = NULL; }
     if (factory_reset_popup) { lv_obj_del(factory_reset_popup); factory_reset_popup = NULL; }
     if (factory_reset_popup_backdrop) { lv_obj_del(factory_reset_popup_backdrop); factory_reset_popup_backdrop = NULL; }
     if (hostname_reboot_popup) { lv_obj_del(hostname_reboot_popup); hostname_reboot_popup = NULL; }
@@ -3019,6 +3159,7 @@ void gui_settings_teardown(void) {
     if (eq_screen) { lv_obj_del(eq_screen); eq_screen = NULL; }
     if (eq_profiles_screen) { lv_obj_del(eq_profiles_screen); eq_profiles_screen = NULL; }
     eq_profiles_edit_btn = NULL;
+    eq_profiles_title_label = NULL;
     eq_profiles_free_paths();
 }
 

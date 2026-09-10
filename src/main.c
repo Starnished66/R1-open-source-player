@@ -291,12 +291,33 @@ int main(int argc, char ** argv) {
     sigaction(SIGBUS, &crash_sa, NULL);
 #endif
 
-    if (argc == 4 && strcmp(argv[1], "--metadata-artwork-helper") == 0) {
+    /* Recognized before validating the full argument count, so a malformed
+     * helper invocation (wrong arg count, unparsable fd/priority) fails
+     * fast here rather than falling through into normal application
+     * startup with a leftover "--metadata-artwork-helper" argv entry. */
+    if (argc >= 2 && strcmp(argv[1], "--metadata-artwork-helper") == 0) {
+        if (argc != 5) return 1;
         char * end = NULL;
         errno = 0;
         long fd = strtol(argv[2], &end, 10);
-        if (errno != 0 || !end || *end != '\0' || fd < 0 || fd > INT_MAX) return 1;
-        return metadata_artwork_helper_run(argv[3], (int) fd);
+        if (errno != 0 || !end || end == argv[2] || *end != '\0' || fd < 0 || fd > INT_MAX) return 1;
+        /* argv[4]: the parent's real artwork_priority_t (see
+         * metadata_read_artwork_isolated_impl()'s own comment on why this
+         * crosses the fork/exec boundary as a decimal string) -- any
+         * unparsable or out-of-range value defaults to the most
+         * conservative ARTWORK_PRIO_WARMER rather than being trusted, since
+         * a malformed value here must never grant a LARGER memory ceiling
+         * than intended. */
+        end = NULL;
+        errno = 0;
+        long prio_val = strtol(argv[4], &end, 10);
+        artwork_priority_t prio = ARTWORK_PRIO_WARMER;
+        if (errno == 0 && end && end != argv[4] && *end == '\0' &&
+            (prio_val == ARTWORK_PRIO_WARMER || prio_val == ARTWORK_PRIO_THUMBNAIL ||
+             prio_val == ARTWORK_PRIO_PLAYER)) {
+            prio = (artwork_priority_t) prio_val;
+        }
+        return metadata_artwork_helper_run(argv[3], (int) fd, prio);
     }
 
     setvbuf(stdout, NULL, _IOLBF, 0);

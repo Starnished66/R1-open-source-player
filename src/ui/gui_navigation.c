@@ -520,6 +520,7 @@ void slide_transition_anim_x_cb(void * var, int32_t v) {
              * fixes. Must run before the free below, while ctx is still a
              * valid pointer to compare against. */
             gui_shell_player_swipe_recover(ctx);
+            gui_lock_screen_swipe_recover(ctx);
             lv_free(ctx);
             slide_transition_active = false;
         }

@@ -130,26 +130,49 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
          * inflates the whole image into a packed "scanlines" buffer (row_bytes
          * = ceil(w * png_native_bpp / 8), * h total) that stays allocated while
          * postProcessScanlines() unfilters it into a SEPARATE decoded buffer
-         * (row = max(row_bytes, 4*w)) -- both live at once. If the PNG's
-         * native color mode isn't already 8-bit RGB, lodepng_decode() then
-         * allocates a THIRD 4*w*h conversion buffer while the decoded one is
-         * still live (freed right after). The real peak is the larger of
-         * these two overlapping pairs (scanlines+decoded, or decoded+
-         * converted), not their sum -- but summing both pair-costs here is a
-         * simple, always-safe upper bound rather than replaying that branchy
-         * lifetime logic. A 16-bit RGBA (64bpp) source is exactly the shape
-         * that blew this estimate before (see patches/lvgl_runtime_fixes.patch's
-         * PNG hunk): row_bytes there is 8*w, twice the old flat 4*w
-         * assumption. icc_cap_bytes matches decode_png_rgb888()'s own
-         * max_icc_size cap on the decoder settings used for this decode. */
+         * (row = max(row_bytes, 4*w)) -- both live at once (pair 1). If the
+         * PNG's native color mode isn't already 8-bit RGB, lodepng_decode()
+         * then allocates a THIRD 4*w*h conversion buffer -- but only AFTER
+         * the scanlines buffer has already been freed, while the decoded one
+         * is still live (pair 2). These two pairs never coexist, so the real
+         * peak is max(pair1, pair2), not their sum -- billing the sum here
+         * (confirmed via host-simulated realistic memory pressure, 2026-09-10:
+         * under a plausible ~12MB MemAvailable during the background
+         * thumbnail warmer, on top of the icc overestimate below, summing
+         * both pairs instead of taking their max was enough on its own to
+         * push even a routine 480x480 or 600x600 cover -- the overwhelming
+         * common case -- over the warmer's admission budget, rejecting
+         * decodable album art outright) was an unnecessary extra ~33-50%
+         * margin on top of an already-conservative per-pair estimate, not a
+         * correctness requirement. A 16-bit RGBA (64bpp) source is exactly
+         * the shape that blew this estimate before (see
+         * patches/lvgl_runtime_fixes.patch's PNG hunk): row_bytes there is
+         * 8*w, twice the old flat 4*w assumption -- pair1/pair2 below still
+         * capture that correctly.
+         *
+         * icc_estimate_bytes is deliberately NOT decode_png_rgb888()'s own
+         * COVER_PNG_MAX_ICC_BYTES (1MB) -- that constant is the decoder's
+         * hard safety CAP against a pathological/malicious profile, not a
+         * realistic size to bill on every PNG's admission estimate. Its own
+         * comment already documents real cover-art ICC profiles as "a few KB
+         * to low hundreds of KB"; billing the full 1MB worst-case cap
+         * unconditionally here was needlessly pessimistic for the common
+         * case this estimate actually has to serve. lodepng_inspect() only
+         * reads the IHDR chunk (see its own implementation) and returns
+         * before reaching a later iCCP chunk, so the real per-file size
+         * genuinely isn't cheaply knowable here without a more invasive
+         * pre-scan -- this stays a fixed assumption, just a realistic one
+         * instead of the hard ceiling. */
         uint32_t bpp = png_native_bpp ? png_native_bpp : 32;
         uint64_t row_bytes = ((uint64_t) native_w * (uint64_t) bpp + 7ULL) / 8ULL;
         uint64_t argb_row_bytes = 4ULL * (uint64_t) native_w;
         uint64_t stride_bytes = row_bytes > argb_row_bytes ? row_bytes : argb_row_bytes;
-        uint64_t icc_cap_bytes = 1ULL * 1024ULL * 1024ULL;
-        decoder_workspace = 2ULL * stride_bytes * (uint64_t) native_h
-                           + 4ULL * (uint64_t) native_w * (uint64_t) native_h
-                           + icc_cap_bytes + (128ULL * 1024ULL);
+        uint64_t icc_estimate_bytes = 256ULL * 1024ULL;
+        uint64_t pair1_bytes = 2ULL * stride_bytes * (uint64_t) native_h;
+        uint64_t pair2_bytes = stride_bytes * (uint64_t) native_h
+                              + 4ULL * (uint64_t) native_w * (uint64_t) native_h;
+        uint64_t peak_pair_bytes = pair1_bytes > pair2_bytes ? pair1_bytes : pair2_bytes;
+        decoder_workspace = peak_pair_bytes + icc_estimate_bytes + (128ULL * 1024ULL);
     } else if (fmt == ARTWORK_FORMAT_JPEG) {
         decoder_workspace = 32ULL * 1024ULL;
     } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE) {
@@ -174,13 +197,24 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
 #define MEM_RESERVE_THUMBNAIL (4U * 1024U * 1024U)  /* 4 MiB reserve for visible thumbnails */
 #define MEM_RESERVE_WARMER    (8U * 1024U * 1024U)  /* 8 MiB reserve for background warmer */
 
+/* Single source of truth for the per-priority reserve, shared with
+ * src/library/metadata.c's metadata_artwork_limit_memory() -- that function
+ * bounds the isolated artwork-extraction child process's own RLIMIT_AS
+ * ceiling, which used to hardcode this same WARMER reserve regardless of
+ * the caller's real priority, holding an interactive PRIO_PLAYER request to
+ * the background warmer's own strictest headroom. Unknown/out-of-range
+ * values default to the most conservative (WARMER) reserve, same as the
+ * fallback this function already had before this was pulled out. */
+size_t artwork_reserve_bytes_for_priority(artwork_priority_t prio) {
+    if (prio == ARTWORK_PRIO_PLAYER) return MEM_RESERVE_PLAYER;
+    if (prio == ARTWORK_PRIO_THUMBNAIL) return MEM_RESERVE_THUMBNAIL;
+    return MEM_RESERVE_WARMER;
+}
+
 bool artwork_check_memory_admission(artwork_priority_t prio, size_t estimated_bytes) {
     if (estimated_bytes == SIZE_MAX) return false;
 
-    size_t reserve = MEM_RESERVE_WARMER;
-    if (prio == ARTWORK_PRIO_PLAYER) reserve = MEM_RESERVE_PLAYER;
-    else if (prio == ARTWORK_PRIO_THUMBNAIL) reserve = MEM_RESERVE_THUMBNAIL;
-
+    size_t reserve = artwork_reserve_bytes_for_priority(prio);
     size_t available = system_get_mem_available_bytes();
     if (available < reserve) return false;
     return (available - reserve) >= estimated_bytes;

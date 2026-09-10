@@ -160,7 +160,7 @@ int main(void) {
     pid_t child = fork();
     assert(child >= 0);
     if (child == 0) {
-        assert(metadata_artwork_limit_memory());
+        assert(metadata_artwork_limit_memory(ARTWORK_PRIO_WARMER));
         void * small = malloc(128U * 1024U);
         assert(small);
         free(small);

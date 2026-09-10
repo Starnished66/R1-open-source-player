@@ -2101,6 +2101,7 @@ static int albums_fetch_page(void * ctx, int offset, int count, compact_list_pag
     int n = rows ? metadata_db_get_albums_page_filtered(NULL, offset, count, rows) : 0;
     for (int i = 0; i < n; i++) {
         snprintf(out_rows[i].label, sizeof(out_rows[i].label), "%s", rows[i].name);
+        snprintf(out_rows[i].subtitle, sizeof(out_rows[i].subtitle), "%s", rows[i].album_artist);
         out_rows[i].identity = rows[i].first_song_id;
         snprintf(out_rows[i].trailing_asset, sizeof(out_rows[i].trailing_asset),
                  "%s", "playing_plane/ic_more.png");

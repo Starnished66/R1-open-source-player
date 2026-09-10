@@ -299,6 +299,7 @@ void free_group_song_entries(group_song_entry_t * entries, int count) {
     for (int i = 0; i < count; i++) {
         free(entries[i].path);
         free(entries[i].title);
+        free(entries[i].album_artist);
     }
     free(entries);
 }
@@ -311,7 +312,8 @@ bool copy_group_song_entries(group_song_entry_t ** out, const group_song_entry_t
     for (int i = 0; i < count; i++) {
         copy[i].path = strdup(entries[i].path ? entries[i].path : "");
         copy[i].title = strdup(entries[i].title ? entries[i].title : "");
-        if (!copy[i].path || !copy[i].title) {
+        copy[i].album_artist = strdup(entries[i].album_artist ? entries[i].album_artist : "");
+        if (!copy[i].path || !copy[i].title || !copy[i].album_artist) {
             free_group_song_entries(copy, count);
             return false;
         }
@@ -2019,6 +2021,7 @@ static int albums_fetch_page(void * ctx, int offset, int count, compact_list_pag
     int n = rows ? metadata_db_get_albums_page_filtered(NULL, offset, count, rows) : 0;
     for (int i = 0; i < n; i++) {
         snprintf(out_rows[i].label, sizeof(out_rows[i].label), "%s", rows[i].name);
+        snprintf(out_rows[i].subtitle, sizeof(out_rows[i].subtitle), "%s", rows[i].album_artist);
         out_rows[i].identity = rows[i].first_song_id;
         snprintf(out_rows[i].trailing_asset, sizeof(out_rows[i].trailing_asset),
                  "%s", "playing_plane/ic_more.png");
@@ -2052,6 +2055,7 @@ static group_song_entry_t * load_album_entries(const char * name, const char * a
             format_music_submenu_identity(&page[i], title, sizeof(title));
             entries[n + i].path = strdup(page[i].path);
             entries[n + i].title = strdup(title);
+            entries[n + i].album_artist = strdup(album_artist);
             if (!entries[n + i].path || !entries[n + i].title) {
                 free_group_song_entries(entries, song_count);
                 return NULL;
@@ -4420,6 +4424,7 @@ static bool artist_albums_show_all_songs(void) {
         for (int i = 0; i < total; i++) {
             free(sort_entries[i].path);
             free(sort_entries[i].title);
+            free(sort_entries[i].album_artist);
         }
         free(sort_entries);
         return false;
@@ -4435,6 +4440,7 @@ static bool artist_albums_show_all_songs(void) {
         for (int i = 0; i < n; i++) {
             free(sort_entries[i].path);
             free(sort_entries[i].title);
+            free(sort_entries[i].album_artist);
         }
         free(sort_entries);
         return false;
@@ -4442,6 +4448,7 @@ static bool artist_albums_show_all_songs(void) {
     for (int i = 0; i < n; i++) {
         entries[i].path = sort_entries[i].path;
         entries[i].title = sort_entries[i].title;
+        entries[i].album_artist = sort_entries[i].album_artist;
     }
     free(sort_entries);
 

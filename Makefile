@@ -8,34 +8,18 @@
 # file-mtime tracking, so two boards sharing one build_target/ would be a
 # real, silent-corruption hazard without this.
 BOARD ?= r1
-ifeq ($(filter $(BOARD),r1 r3proii),)
-$(error Unknown BOARD '$(BOARD)' -- expected r1 or r3proii)
+ifeq ($(filter $(BOARD),r1 r3proii r3ii_2025),)
+$(error Unknown BOARD '$(BOARD)' -- expected r1, r3proii, or r3ii_2025)
 endif
 BOARD_DEFINE = -DBOARD_$(shell echo $(BOARD) | tr a-z A-Z)
 
-# Object directories -- same r1-stays-bare reasoning as HOST_BIN/TARGET_BIN
-# below. Every build_target/ or build_host/ path elsewhere in this file is
-# written through these two variables, never the literal string, so a board
-# switch can't accidentally reuse the other board's stale .o files.
-ifeq ($(BOARD),r1)
-BUILD_TARGET_DIR = build_target
-BUILD_HOST_DIR = build_host
-else
+# Object directories
 BUILD_TARGET_DIR = build_target_$(BOARD)
 BUILD_HOST_DIR = build_host_$(BOARD)
-endif
 
-# Target executables -- r1 keeps its exact original unsuffixed names (every
-# downstream consumer -- the Test2 repack workflow, CI, TESTING.md -- expects
-# these exact filenames), other boards get a distinct suffix so a r3proii
-# build can never be mistaken for or silently overwrite an r1 one.
-ifeq ($(BOARD),r1)
-HOST_BIN = open_hiby_player_host
-TARGET_BIN = open_hiby_player_target
-else
+# Target executables
 HOST_BIN = open_hiby_player_host_$(BOARD)
 TARGET_BIN = open_hiby_player_target_$(BOARD)
-endif
 
 # Compiler and Linker configuration
 CC = gcc

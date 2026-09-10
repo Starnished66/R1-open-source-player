@@ -116,6 +116,11 @@ extern bool user_seeking;
 extern bool deferred_resume_pending;
 extern double deferred_resume_position;
 bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * out_index);
+bool build_sd_card_resume_playlist(char *** out_playlist, int * out_count, int * out_index, double * out_position);
+bool gui_player_restore_sd_queue(bool is_boot);
+void gui_player_notify_sd_unmounted_immediate(void);
+void gui_player_notify_sd_mounted(void);
+void gui_player_handle_sd_unmount(void);
 bool install_saved_resume_playlist(char ** resume_playlist, int resume_count);
 void prepare_deferred_resume(int index, double start_seconds);
 

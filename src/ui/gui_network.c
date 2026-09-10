@@ -1713,6 +1713,11 @@ static lv_obj_t * usb_mode_list;
 
 static pthread_t usb_mode_switch_thread;
 static bool usb_mode_switch_active = false;
+static bool usb_mode_switch_queued = false;
+/* UI-owned guard; the detached worker only publishes completion. It may
+ * wait indefinitely for an old bridge writer, so never join it on the UI. */
+static bool usb_bridge_restart_active = false;
+static atomic_bool usb_bridge_restart_done = false;
 static atomic_bool usb_mode_switch_done_flag = false;
 static volatile bool usb_mode_switch_succeeded = false;
 static usb_mode_t usb_mode_switch_target;
@@ -1765,10 +1770,15 @@ static void * usb_mode_switch_thread_func(void * arg) {
     return NULL;
 }
 
-void start_usb_mode_switch(usb_mode_t target) {
-    if (usb_mode_switch_active) return; /* already switching -- ignore taps until it lands, same guard as wifi/bt toggles */
-    usb_mode_switch_target = target;
-    usb_mode_switch_active = true;
+static void * usb_bridge_restart_thread_func(void * arg) {
+    (void) arg;
+    usb_dac_bridge_start();
+    atomic_store_explicit(&usb_bridge_restart_done, true, memory_order_release);
+    return NULL;
+}
+
+static void launch_usb_mode_switch(void) {
+    usb_mode_switch_queued = false;
     atomic_store_explicit(&usb_mode_switch_done_flag, false, memory_order_relaxed);
     int rc = pthread_create(&usb_mode_switch_thread, NULL, usb_mode_switch_thread_func, NULL);
     if (rc != 0) {
@@ -1780,17 +1790,46 @@ void start_usb_mode_switch(usb_mode_t target) {
     }
 }
 
+void start_usb_mode_switch(usb_mode_t target) {
+    if (usb_mode_switch_active) return;
+    usb_mode_switch_target = target;
+    usb_mode_switch_active = true;
+    /* Preserve the explicit request without letting gadget teardown race a
+     * watchdog start already in flight. Polling launches it once safe. */
+    usb_mode_switch_queued = usb_bridge_restart_active;
+    if (!usb_mode_switch_queued) launch_usb_mode_switch();
+}
+
 void poll_usb_mode_switch(void) {
+    if (usb_bridge_restart_active &&
+        atomic_load_explicit(&usb_bridge_restart_done, memory_order_acquire)) {
+        usb_bridge_restart_active = false;
+    }
+    if (usb_mode_switch_queued && !usb_bridge_restart_active)
+        launch_usb_mode_switch();
     /* If set to USB DAC mode but the audio bridge is not running, restart it.
      * Skipped while a mode switch is in flight to avoid racing
      * usb_mode_control_apply(). */
-    if (!usb_mode_switch_active && current_settings.usb_mode == (int) USB_MODE_DAC) {
+    if (!usb_mode_switch_active && !usb_bridge_restart_active &&
+        current_settings.usb_mode == (int) USB_MODE_DAC) {
         usb_dac_stream_info_t info;
         usb_dac_bridge_get_stream_info(&info);
-        if (!info.bridge_running) usb_dac_bridge_start();
+        if (!info.bridge_running) {
+            pthread_attr_t attr;
+            if (pthread_attr_init(&attr) == 0) {
+                if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) == 0) {
+                    pthread_t thread;
+                    atomic_store_explicit(&usb_bridge_restart_done, false, memory_order_relaxed);
+                    usb_bridge_restart_active = true;
+                    if (pthread_create(&thread, &attr, usb_bridge_restart_thread_func, NULL) != 0)
+                        usb_bridge_restart_active = false;
+                }
+                pthread_attr_destroy(&attr);
+            }
+        }
     }
 
-    if (!usb_mode_switch_active || !atomic_load_explicit(&usb_mode_switch_done_flag, memory_order_acquire)) return;
+    if (!usb_mode_switch_active || usb_mode_switch_queued || !atomic_load_explicit(&usb_mode_switch_done_flag, memory_order_acquire)) return;
     usb_mode_switch_active = false;
     pthread_join(usb_mode_switch_thread, NULL);
 
@@ -3167,10 +3206,12 @@ void gui_network_teardown(void) {
 bool gui_network_has_background_work(void) {
     return wifi_connect_active || wifi_connect_saved_active || wifi_disconnect_active ||
            wifi_scan_active || wifi_forget_active || bt_connect_active || bt_forget_active ||
-           bt_scan_active || usb_mode_switch_active || import_web_stop_active;
+           bt_scan_active || usb_mode_switch_active || usb_bridge_restart_active || import_web_stop_active;
 }
 
 void gui_network_cancel_background_work(void) {
+    /* The detached bridge restart owns no UI objects and may be stuck in
+     * start() indefinitely. Leave its guard intact; never join it here. */
     if (wifi_connect_active) {
         pthread_join(wifi_connect_thread, NULL);
         wifi_connect_active = false;
@@ -3206,7 +3247,8 @@ void gui_network_cancel_background_work(void) {
         bt_scan_active = false;
     }
     if (usb_mode_switch_active) {
-        pthread_join(usb_mode_switch_thread, NULL);
+        if (!usb_mode_switch_queued) pthread_join(usb_mode_switch_thread, NULL);
+        usb_mode_switch_queued = false;
         usb_mode_switch_active = false;
     }
     if (import_web_stop_active) {

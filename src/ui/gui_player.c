@@ -67,6 +67,7 @@ static uint64_t current_playback_generation = 0;
 #include <limits.h>
 #include <ctype.h>
 #include <math.h>
+#include <sys/stat.h>
 
 #define VOLUME_POPUP_TIMEOUT_MS 3000
 
@@ -3616,25 +3617,77 @@ void on_file_selected_lazy_recently_added(int selected_index) {
 static bool resume_playlist_needs_lazy_order = false;
 #ifdef HOST_BUILD
 #define QUEUE_RESUME_PATH "./open_hiby_player_queue.bin"
+#define SD_QUEUE_RESUME_PATH "./music/.open_hiby_player/queue.bin"
+#define SD_QUEUE_RESUME_DIR "./music/.open_hiby_player"
 #else
 #define QUEUE_RESUME_PATH "/usr/data/open_hiby_player_queue.bin"
+#define SD_QUEUE_RESUME_PATH "/data/mnt/sd_0/.open_hiby_player/queue.bin"
+#define SD_QUEUE_RESUME_DIR "/data/mnt/sd_0/.open_hiby_player"
 #endif
+
+static atomic_bool sd_card_absent_immediate = false;
+
+void gui_player_notify_sd_unmounted_immediate(void) {
+    atomic_store(&sd_card_absent_immediate, true);
+}
+
+/* Call on every poll that currently observes the SD card mounted, regardless
+ * of whether a full confirmed mount/unmount transition fires -- a transient
+ * one-poll blip also calls gui_player_notify_sd_unmounted_immediate() above,
+ * and this is what un-sticks the resulting flag for a card that was never
+ * actually removed. */
+void gui_player_notify_sd_mounted(void) {
+    atomic_store(&sd_card_absent_immediate, false);
+}
+
+static bool is_sd_card_path(const char * path) {
+    if (!path || !path[0]) return false;
+    size_t root_len = strlen(MUSIC_ROOT_DIR);
+    if (strncmp(path, MUSIC_ROOT_DIR, root_len) != 0) return false;
+    return path[root_len] == '/' || path[root_len] == '\0';
+}
+
 static queue_resume_t restored_queue;
 static bool have_restored_queue;
-static queue_resume_t checkpoint_queue;
+
+typedef struct {
+    char target_path[PATH_MAX];
+    char target_dir[PATH_MAX];
+    uint64_t * failure_rev_ptr;
+    queue_resume_t queue;
+} checkpoint_worker_ctx_t;
+
+static checkpoint_worker_ctx_t checkpoint_ctx;
 static pthread_t checkpoint_thread;
 static bool checkpoint_running;
 static atomic_bool checkpoint_done;
-static uint64_t checkpoint_revision;
-static double checkpoint_position = -1;
 
-static void * queue_checkpoint_worker(void * unused) {
-    (void) unused;
-    if (!queue_resume_write(QUEUE_RESUME_PATH, &checkpoint_queue)) {
-        /* Retry on the next checkpoint; never replace a valid file on failure. */
-        checkpoint_revision = 0;
+/* Plain uint64_t, not atomic: this target's toolchain lacks a native 64-bit
+ * atomic instruction and needs libatomic for one (confirmed -- linking
+ * atomic_uint_least64_t here fails with "undefined reference to
+ * __atomic_store_8" on this project's mipsel cross-compiler, which isn't
+ * linked against libatomic), so an 8-byte atomic isn't a free change here
+ * the way the existing 1-byte atomic_bool usage in this file is. The
+ * checkpoint worker thread can write checkpoint_revision_sd to 0 on failure
+ * at the same time gui_player_handle_sd_unmount() resets it to 0 on the UI
+ * thread on a confirmed unmount -- both only ever write the same value (0),
+ * so this is a logically harmless race, accepted rather than pulling in a
+ * new link dependency to make it formally well-defined. */
+static uint64_t checkpoint_revision_internal;
+static double checkpoint_position_internal = -1;
+static uint64_t checkpoint_revision_sd;
+static double checkpoint_position_sd = -1;
+
+static void * queue_checkpoint_worker(void * arg) {
+    checkpoint_worker_ctx_t * ctx = (checkpoint_worker_ctx_t *) arg;
+    if (ctx->target_dir[0]) {
+        mkdir(ctx->target_dir, 0755);
     }
-    queue_resume_free(&checkpoint_queue);
+    if (!queue_resume_write(ctx->target_path, &ctx->queue)) {
+        /* Retry on the next checkpoint; never replace a valid file on failure. */
+        if (ctx->failure_rev_ptr) *(ctx->failure_rev_ptr) = 0;
+    }
+    queue_resume_free(&ctx->queue);
     atomic_store(&checkpoint_done, true);
     return NULL;
 }
@@ -3651,7 +3704,33 @@ void gui_player_queue_checkpoint(void) {
     }
     if (!gui_player_has_active_track()) return;
     double position = deferred_resume_pending ? deferred_resume_position : audio_get_resume_position_seconds();
-    if (queue_revision == checkpoint_revision && fabs(position - checkpoint_position) < 1.0) return;
+
+    bool is_sd_persistable = true;
+    for (int i = 0; i < playlist_count; i++) {
+        const char * p = playlist_path_at(i);
+        if (!p || !p[0] || !is_sd_card_path(p) ||
+            strncmp(p, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) == 0) {
+            is_sd_persistable = false;
+            break;
+        }
+    }
+
+    bool sd_mounted = sd_card_root_is_mounted() && !atomic_load(&sd_card_absent_immediate);
+
+    const char * target_file = QUEUE_RESUME_PATH;
+    const char * target_dir = "";
+    uint64_t * last_rev = &checkpoint_revision_internal;
+    double * last_pos = &checkpoint_position_internal;
+
+    if (is_sd_persistable && sd_mounted) {
+        target_file = SD_QUEUE_RESUME_PATH;
+        target_dir = SD_QUEUE_RESUME_DIR;
+        last_rev = &checkpoint_revision_sd;
+        last_pos = &checkpoint_position_sd;
+    }
+
+    if (queue_revision == *last_rev && fabs(position - *last_pos) < 1.0) return;
+
     queue_resume_t s = { .count = playlist_count, .current = playlist_index, .pending = queued_pending_count,
         .mode = current_settings.play_mode, .shuffle_pos = shuffle_pos, .position = position };
     s.paths = calloc((size_t) s.count, sizeof(char *));
@@ -3677,11 +3756,17 @@ void gui_player_queue_checkpoint(void) {
         }
     }
     if (!ok) { queue_resume_free(&s); return; }
-    checkpoint_queue = s;
-    checkpoint_revision = queue_revision; checkpoint_position = position;
+
+    snprintf(checkpoint_ctx.target_path, sizeof(checkpoint_ctx.target_path), "%s", target_file);
+    snprintf(checkpoint_ctx.target_dir, sizeof(checkpoint_ctx.target_dir), "%s", target_dir);
+    checkpoint_ctx.failure_rev_ptr = last_rev;
+    checkpoint_ctx.queue = s;
+    *last_rev = queue_revision;
+    *last_pos = position;
+
     atomic_store(&checkpoint_done, false);
-    checkpoint_running = pthread_create(&checkpoint_thread, NULL, queue_checkpoint_worker, NULL) == 0;
-    if (!checkpoint_running) { queue_resume_free(&checkpoint_queue); checkpoint_revision = 0; }
+    checkpoint_running = pthread_create(&checkpoint_thread, NULL, queue_checkpoint_worker, &checkpoint_ctx) == 0;
+    if (!checkpoint_running) { queue_resume_free(&checkpoint_ctx.queue); *last_rev = 0; }
 }
 
 void gui_player_queue_flush(void) {
@@ -3694,6 +3779,145 @@ void gui_player_queue_flush(void) {
         pthread_join(checkpoint_thread, NULL);
         checkpoint_running = false;
     }
+}
+
+void gui_player_handle_sd_unmount(void) {
+    atomic_store(&sd_card_absent_immediate, true);
+    checkpoint_revision_sd = 0;
+    checkpoint_position_sd = -1;
+
+    /* Deliberately do NOT join checkpoint_thread here, even if one is still
+     * running: this runs on the UI thread (via poll_sd_card_hotplug()'s
+     * 500ms timer), and the worker may be blocked inside a write()/fsync()
+     * to the very card that's being pulled out from under it -- joining
+     * unconditionally here would risk freezing the whole UI on a stalled/
+     * hung SD write. This is safe to skip: the worker only ever touches its
+     * own deep-copied checkpoint_ctx.queue snapshot (built synchronously
+     * before pthread_create()), never the live playlist[] this function is
+     * about to free, so there's no actual data race to guard against by
+     * waiting for it here. It will finish (or fail harmlessly, retried on
+     * the next checkpoint) on its own; checkpoint_running/checkpoint_done
+     * are already correctly rechecked, non-blockingly, by the next call to
+     * gui_player_queue_checkpoint(). */
+
+    if (!gui_player_has_active_track()) return;
+    const char * cur_path = playlist_path_at(playlist_index);
+    if (!is_sd_card_path(cur_path)) return;
+
+    audio_stop();
+    plugin_manager_notify_stopped();
+    free_playlist();
+    clear_player_source();
+    set_play_button_state(false);
+    if (song_title_label) lv_label_set_text(song_title_label, "No track loaded");
+    if (song_folder_label) lv_label_set_text(song_folder_label, "");
+    if (lv_screen_active() == player_screen) nav_pop();
+}
+
+bool build_sd_card_resume_playlist(char *** out_playlist, int * out_count, int * out_index, double * out_position) {
+    resume_playlist_needs_lazy_order = false;
+    queue_resume_free(&restored_queue);
+    have_restored_queue = false;
+
+    if (!queue_resume_read(SD_QUEUE_RESUME_PATH, &restored_queue)) return false;
+
+    if (restored_queue.count <= 0 || restored_queue.current < 0 || restored_queue.current >= restored_queue.count) {
+        queue_resume_free(&restored_queue);
+        return false;
+    }
+
+    bool all_sd = true;
+    for (int i = 0; i < restored_queue.count; i++) {
+        const char * path = restored_queue.paths[i];
+        if (!path || !path[0] || !is_sd_card_path(path) ||
+            strncmp(path, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) == 0) {
+            all_sd = false;
+            break;
+        }
+    }
+    if (!all_sd) {
+        queue_resume_free(&restored_queue);
+        return false;
+    }
+
+    *out_playlist = restored_queue.paths;
+    *out_count = restored_queue.count;
+    *out_index = restored_queue.current;
+    if (out_position) *out_position = restored_queue.position;
+    restored_queue.paths = NULL;
+    have_restored_queue = true;
+    return true;
+}
+
+bool gui_player_restore_sd_queue(bool is_boot) {
+    atomic_store(&sd_card_absent_immediate, false);
+
+    if (is_boot) {
+        /* This can be called a second time shortly after boot -- once from
+         * gui_init() directly, and again from poll_sd_card_hotplug()'s
+         * boot-time-mount-race recheck (which covers the case where the
+         * card wasn't mounted yet when gui_init() ran) -- both with
+         * is_boot=true. Block on ANY already-loaded track, not just an
+         * SD-based one: an SD-based track means the first call (or the
+         * pre-existing car-mode/resume_mode fallback) already handled it,
+         * so re-running here would free_playlist() and restart playback
+         * moments after it had already started correctly -- but a NON-SD
+         * track is just as much a reason to skip (e.g. the user started a
+         * Subsonic stream while the card was out, reinserted it -- the
+         * confirmed-reinsertion path already correctly preserved that
+         * session, is_boot=true must not then clobber it on the very next
+         * poll just because it doesn't recognize the path as "already SD").
+         * Only actually restore here if nothing is loaded at all -- that's
+         * the genuine late-mount case this second call exists for. */
+        if (gui_player_has_active_track()) return false;
+    } else {
+        /* Preserve any loaded non-SD session, not just an actively-playing
+         * one -- a paused (or deferred-pending) stream is just as much a
+         * session the user cares about and doesn't want silently replaced
+         * by a newly-inserted card's queue. */
+        if (gui_player_has_active_track()) {
+            const char * cur = playlist_path_at(playlist_index);
+            if (!is_sd_card_path(cur)) return false;
+        }
+    }
+
+    char ** resume_playlist = NULL;
+    int resume_count = 0, resume_index = 0;
+    double position = 0.0;
+    if (!build_sd_card_resume_playlist(&resume_playlist, &resume_count, &resume_index, &position)) return false;
+
+    /* install_saved_resume_playlist() only swaps the queue bookkeeping
+     * (free_playlist() + replace playlist[]/playlist_count) -- it never
+     * touches the audio subsystem. The guards above block the common cases
+     * where something is still active, but the is_boot=false path
+     * deliberately still allows through an active track that's already
+     * SD-based (a genuinely unusual leftover, since gui_player_handle_sd_unmount()
+     * normally clears that on confirmed unmount) -- if that's somehow still
+     * playing here, stop it first so playback and the newly-installed queue
+     * never disagree about what's current. */
+    if (gui_player_has_active_track() && audio_is_playing()) audio_stop();
+
+    if (!install_saved_resume_playlist(resume_playlist, resume_count)) return false;
+
+    if (current_settings.resume_mode == 1) {
+        play_track_at_from(resume_index, position);
+    } else if (current_settings.resume_mode == 2) {
+        prepare_deferred_resume(resume_index, position);
+    } else {
+        /* Resume disabled: load and display the queue/track, but don't
+         * resume playback position -- deferred_resume_pending still needs
+         * to be set (position 0, not the checkpoint's) so a later Play
+         * actually starts this track from the top, matching the existing
+         * "queue loaded, not playing" pattern used elsewhere in this file.
+         * Without it, playlist_index is set but nothing is "current" in the
+         * audio subsystem yet, so toggle_play_pause() would be a no-op. */
+        playlist_index = resume_index;
+        track_metadata_t meta;
+        apply_track_metadata_to_ui(resume_index, &meta);
+        set_play_button_state(false);
+        deferred_resume_pending = true; deferred_resume_position = 0.0;
+    }
+    return true;
 }
 
 bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * out_index) {

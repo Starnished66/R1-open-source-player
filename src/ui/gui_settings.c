@@ -28,6 +28,7 @@
 #include "fallback_font.h"
 #include "gui_navigation.h"
 #include "db_log.h"
+#include "usb_dac_bridge.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -428,11 +429,12 @@ static void db_logging_switch_event_cb(lv_event_t * e) {
     current_settings.db_logging_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     settings_save(&current_settings);
     db_log_set_enabled(current_settings.db_logging_enabled);
+    usb_dac_bridge_set_debug_log_enabled(current_settings.db_logging_enabled);
 }
 
 /* Writes a detailed timestamped log of library database scans and album art
- * cache jobs (including lazy load) to .logs/database_artwork.log on the SD
- * card -- see db_log.h. */
+ * cache jobs to .logs/database_artwork.log, and USB DAC bridge diagnostics to
+ * .logs/usb_dac_bridge.log on the SD card -- see db_log.h and usb_dac_bridge.h. */
 static lv_obj_t * build_dev_options_screen(void) {
     static pill_list_item_t items[1];
     items[0] = (pill_list_item_t){ "Enable database logging", PILL_ACCESSORY_TOGGLE,

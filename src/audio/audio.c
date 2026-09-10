@@ -1269,7 +1269,7 @@ static bool can_use_wide_path(const decoder_t * dec) {
         dec->type != DECODER_ALAC &&
         dec->type != DECODER_APE &&
         dec->type != DECODER_AIFF) return false;
-    if (!audio_output_is_local_requested()) return false;
+    if (!audio_output_supports_wide_path()) return false;
     if (!buf_cur_s32) return false;
     return true;
 }
@@ -1296,11 +1296,12 @@ static void publish_current_format_locked(const decoder_t * dec, const char * pa
     /* can_use_wide_path() alone is a prediction (source eligibility + what
      * output route is currently REQUESTED) -- audio_output_is_s24_active()
      * is the ground truth for what's actually open right now. They can
-     * disagree: a route change to Bluetooth/USB, or an S24_LE hw_params
+     * disagree: a route change to Bluetooth, or an S24_LE hw_params
      * negotiation failure that fell back to S16_LE (see audio_output.c's
      * open_device()), both leave can_use_wide_path() true while the device
      * is actually running at S16_LE. Requiring both here means the UI never
-     * claims 24-bit output that isn't really happening. At a crossfade
+     * claims 24-bit output that isn't really happening (or, for USB, that the
+     * app didn't successfully request and spawn as a 24-bit stream). At a crossfade
      * promotion (cur_dec = nxt_dec) this can under-report by one chunk's
      * worth of time, since the device's format for the newly-promoted track
      * isn't renegotiated until the next chunk's own ensure_device_format()
@@ -1610,7 +1611,7 @@ static inline write_result_t write_device_transition_ramp(const int16_t * buf, u
  * (buf_cur, already allocated at MAX_CHUNK_FRAMES*MAX_CHANNELS and otherwise
  * idle while a chunk is being decoded/written through this s32 path, is what
  * every real caller passes -- see write_device_with_retry_s32()'s own
- * caller). Used only if the device turns out not to actually be local S24_LE
+ * caller). Used only if the device turns out not to actually be local or USB S24_LE
  * when it's time to write -- see the ground-truth check inside the loop. */
 static write_result_t write_device_with_retry_s32_ex(const int32_t * buf, uint64_t frames,
                                                     unsigned int channels,
@@ -1656,8 +1657,8 @@ static write_result_t write_device_with_retry_s32_ex(const int32_t * buf, uint64
         } else {
             /* ensure_device_format() above only REQUESTED S24_LE -- this is the
              * ground truth for what actually opened. A route change to
-             * Bluetooth/USB landing between the request and this write (want_s24
-             * is silently irrelevant to those paths), or an S24_LE hw_params
+             * Bluetooth landing between the request and this write (want_s24
+             * is silently irrelevant to that path), or an S24_LE hw_params
              * negotiation failure that fell back to S16_LE (open_device()'s own
              * fallback), both leave this false even though the request above
              * just returned true. audio_output_write_s24() itself now refuses
@@ -2807,17 +2808,16 @@ static void * audio_thread_func(void * arg) {
              * track's format doesn't match) -- plain single-source playback. */
 #ifndef HOST_BUILD
             /* can_use_wide_path() alone is source-side eligibility only --
-             * whether the device is ACTUALLY open as local S24_LE right now
-             * can differ (a route change to Bluetooth/USB landed after this
-             * chunk's own ensure_device_format() call above, or that call's
-             * S24_LE negotiation failed and silently fell back to S16_LE;
-             * see audio_output_is_s24_active()'s own doc comment). Requiring
-             * both here, at the single point that decides whether this whole
+             * whether the device is ACTUALLY open as S24_LE right now
+             * can differ (a route change to Bluetooth landed after this
+             * track's initial ensure() returned, or hw_params negotiation
+             * failed). Checking audio_output_is_s24_active() as well
+             * here, at the single point that decides whether this whole
              * chunk decodes/processes/writes through the s32 path, means a
              * stale or failed wide-path prediction falls through to the
              * ordinary s16 path below instead of reaching
              * audio_output_write_s24(), which would otherwise correctly
-             * refuse the write (active_target != OUTPUT_TARGET_LOCAL) and
+             * refuse the write (audio_output_is_s24_active() false) and
              * exhaust this chunk's retry budget into a hard playback failure. */
             if (can_use_wide_path(&cur_dec) && audio_output_is_s24_active()) {
                 decoder_read_result_t r_cur = decoder_read_s32(&cur_dec, chunk_frames, buf_cur_s32);
@@ -3001,7 +3001,7 @@ static void * audio_thread_func(void * arg) {
                 uint64_t delivered = 0;
                 /* buf_cur is idle here -- this chunk decoded into buf_cur_s32
                  * instead -- so it doubles as the S16 fallback scratch buffer
-                 * if the device turns out not to actually be local S24_LE by
+                 * if the device turns out not to actually be S24_LE by
                  * write time (see write_device_with_retry_s32_ex()'s own
                  * comment). */
                 write_result_t wr = write_device_with_retry_s32(buf_cur_s32, n_cur, cur_dec.channels,

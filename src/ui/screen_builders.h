@@ -348,9 +348,17 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size);
  * passes 6, today's exact hardcoded value -- see build_pill_list_screen()'s
  * own history). Only plugin.set_home_layout()'s options.row_gap
  * (PLUGINS.md, list mode) ever passes anything else. */
+/* icon_scale_pct: scales every row's own icon (item->icon_asset) the same
+ * way build_icon_grid_screen()'s icon_scale_percent scales a tile's icon --
+ * 100 = PILL_ROW_ICON_PX_DEFAULT (64px), unchanged from before this
+ * parameter existed. Every native call site passes 100. Only build_launcher_
+ * menu_screen()'s list-mode branch (plugin.set_home_layout(), PLUGINS.md)
+ * ever passes anything else, so its own icon_scale_pct argument no longer
+ * gets silently dropped when list_mode is set. */
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
-                                   lv_style_t * toggle_accent_style, int32_t row_gap);
+                                   lv_style_t * toggle_accent_style, int32_t row_gap,
+                                   int32_t icon_scale_pct);
 
 lv_obj_t * build_launcher_menu_screen(const char * title, lv_event_cb_t back_btn_cb,
                                       const icon_grid_item_t * items, int item_count,

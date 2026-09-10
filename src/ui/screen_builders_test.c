@@ -250,7 +250,7 @@ static void check_layout(int display_height) {
           .row_width = 400, .has_bg_color = true, .bg_color = 0xE0E0E0,
           .has_text_color = true, .text_color = 0x101010, .has_radius = true, .radius = 4 },
     };
-    lv_obj_t * settings_screen = build_pill_list_screen("Settings", noop, settings, 3, gui_theme_accent_style(), GUI_ROW_GAP);
+    lv_obj_t * settings_screen = build_pill_list_screen("Settings", noop, settings, 3, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     lv_screen_load(settings_screen);
     lv_tick_inc(500);
     lv_timer_handler();

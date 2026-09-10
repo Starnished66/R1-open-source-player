@@ -1,4 +1,5 @@
 #include "headphone_status.h"
+#include "settings.h"
 
 #include <stdio.h>
 
@@ -44,6 +45,10 @@ static void set_earpods_adc_enabled(bool enabled) {
     fclose(f);
 }
 
+static void apply_earpods_adc_state(enum HEADPHONE_STATE state) {
+    set_earpods_adc_enabled(state == HEADPHONE_STATE_HEADSET && current_settings.inline_remote_enabled);
+}
+
 // returns which headphone output is plugged in
 // if 3.5mm and 4.4mm are both plugged in, 4.4mm is prioritized
 // syncs earpods_adc_sw with headphone state
@@ -60,9 +65,13 @@ enum HEADPHONE_STATE get_headphone_state(void) {
     }
 
     if (state != last_state) {
-        set_earpods_adc_enabled(state == HEADPHONE_STATE_HEADSET);
+        apply_earpods_adc_state(state);
         last_state = state;
     }
 
     return state;
+}
+
+void headphone_status_refresh_earpods_adc(void) {
+    apply_earpods_adc_state(get_headphone_state());
 }

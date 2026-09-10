@@ -70,6 +70,12 @@ typedef struct {
      * resumes automatically. Off by default. */
     bool car_mode_enabled;
 
+    /* In-line remote: Enables the use of Volume +/- buttons on the headphones,
+     * along with single tapping the play/pause button to play/pause,
+     * double tapping to skip to the next track, or triple tapping to go back
+     * to the previous track. On by default. */
+    bool inline_remote_enabled;
+
     /* Lyrics: show lyrics screen when tapping on cover image. On by default. */
     bool lyrics_enabled;
 

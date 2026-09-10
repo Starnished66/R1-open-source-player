@@ -445,6 +445,7 @@ void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon);
 void crossfade_switch_event_cb(lv_event_t * e);
 void lyrics_switch_event_cb(lv_event_t * e);
 void car_mode_switch_event_cb(lv_event_t * e);
+void inline_remote_switch_event_cb(lv_event_t *e);
 void swipe_up_home_switch_event_cb(lv_event_t * e);
 void hide_player_topbar_switch_event_cb(lv_event_t * e);
 void charge_limiter_switch_event_cb(lv_event_t * e);

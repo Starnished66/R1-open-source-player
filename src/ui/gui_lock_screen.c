@@ -269,10 +269,15 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
     bool opening = (lv_screen_active() != lock_screen);
     if (opening) {
         nav_push(lock_screen);
+    }
 
-        if (current_mode == LOCK_SCREEN_MODE_IMAGE) {
-            animate_custom_lock_image();
-        }
+    /* Keep the custom-image opening fade independent of the navigation-stack
+     * state. The lock screen can be refreshed/re-shown while it is already
+     * the active screen (for example after another screen_woke event). In
+     * that case opening is false, so gating the animation inside the
+     * navigation block silently kills the fade. */
+    if (current_mode == LOCK_SCREEN_MODE_IMAGE) {
+        animate_custom_lock_image();
     }
 
     return true;

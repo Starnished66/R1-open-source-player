@@ -2191,7 +2191,7 @@ lv_obj_t * build_home_screen(void) {
             .list_mode = true,
             .row_gap = home_layout_config.row_gap > 0 ? home_layout_config.row_gap : 6,
         };
-        lv_obj_t * scr = build_launcher_menu_screen(NULL, NULL, items, count, 100, false, &home_list_layout);
+        lv_obj_t * scr = build_launcher_menu_screen(NULL, NULL, items, count, BOARD_SCALE_PX(100), false, &home_list_layout);
         apply_home_background_image(scr);
         finalize_screen_navigation(scr);
         return scr;
@@ -2217,7 +2217,7 @@ lv_obj_t * build_home_screen(void) {
      * look) unless a plugin configured one. l_plugin_set_home_layout()
      * already rejects a tile-mode `order` past 6 entries, so `count` here
      * never exceeds what build_icon_grid_screen()'s own row math expects. */
-    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, count, 100, false,
+    lv_obj_t * scr = build_icon_grid_screen(NULL, NULL, items, count, BOARD_SCALE_PX(100), false,
                                              home_layout_config.configured ? home_layout_config.tile_gap : 0);
     apply_home_background_image(scr);
     finalize_screen_navigation(scr);

@@ -11,6 +11,9 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <time.h>
 
 #include <tinyalsa/asoundlib.h>
 #include <tinyalsa/mixer.h>
@@ -133,6 +136,15 @@ static bool spawn_aplay(const char * device, unsigned int channels, unsigned int
                        (char *) "-r", rate_str, (char *) "-c", channels_str, NULL };
     if (!subprocess_popen_stdin(argv, out_pid, out_fd)) {
         DBG_LOG("audio_output: failed to spawn aplay for '%s' output\n", device);
+        return false;
+    }
+    int flags = fcntl(*out_fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(*out_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        subprocess_terminate(*out_pid);
+        close(*out_fd);
+        *out_pid = -1;
+        *out_fd = -1;
+        DBG_LOG("audio_output: failed to set aplay pipe non-blocking for '%s' output\n", device);
         return false;
     }
     return true;
@@ -351,6 +363,65 @@ bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool l
     return opened;
 }
 
+static bool write_pipe_bounded(int fd, const char * p, size_t remaining, size_t frame_bytes, size_t * out_written_bytes) {
+    size_t total_bytes = remaining;
+    size_t chunk_cap = PIPE_BUF - (PIPE_BUF % frame_bytes);
+    if (frame_bytes > PIPE_BUF) chunk_cap = frame_bytes;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += 2;
+
+    while (remaining > 0) {
+        size_t write_len = (remaining < chunk_cap) ? remaining : chunk_cap;
+        ssize_t n = write(fd, p, write_len);
+        if (n > 0) {
+            p += n;
+            remaining -= (size_t) n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long long remaining_ms = (long long)(deadline.tv_sec - now.tv_sec) * 1000 + (deadline.tv_nsec - now.tv_nsec) / 1000000;
+            if (remaining_ms <= 0) {
+                errno = ETIMEDOUT;
+                *out_written_bytes = total_bytes - remaining;
+                return false;
+            }
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            int pr = poll(&pfd, 1, remaining_ms);
+            if (pr == 0) {
+                errno = ETIMEDOUT;
+                *out_written_bytes = total_bytes - remaining;
+                return false;
+            }
+            if (pr < 0 && errno == EINTR) {
+                continue;
+            }
+            if (pr < 0) {
+                *out_written_bytes = total_bytes - remaining;
+                return false;
+            }
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                errno = EPIPE;
+                *out_written_bytes = total_bytes - remaining;
+                return false;
+            }
+            if (pfd.revents & POLLOUT) {
+                continue;
+            }
+        }
+        *out_written_bytes = total_bytes - remaining;
+        return false;
+    }
+    *out_written_bytes = total_bytes;
+    return true;
+}
+
 bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written) {
     if (out_frames_written) *out_frames_written = 0;
     if (!caller_owns_output()) return false;
@@ -362,34 +433,33 @@ bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int chann
             usleep((useconds_t) ((uint64_t) frames * 1000000ULL / rate));
             return false;
         }
-        /* Pipe write: loop until all bytes delivered, handling EINTR.
-         * aplay's own ALSA write blocks on its end once its buffer is full,
-         * which backpressures this write() naturally -- same as pcm_writei().
-         * Any other error (EPIPE, EIO, ...) means aplay died; report failure
-         * so the caller can close+reopen rather than silently dropping. */
+        /* Pipe write: bounded, frame-safe. */
         const char * p = (const char *) buf;
         size_t frame_bytes = channels * sizeof(int16_t);
         size_t total_bytes = (size_t) frames * frame_bytes;
-        size_t remaining = total_bytes;
-        while (remaining > 0) {
-            ssize_t n;
-            do { n = write(fd, p, remaining); } while (n < 0 && errno == EINTR);
-            if (n <= 0) {
-                size_t written_bytes = total_bytes - remaining;
-                /* On pipe write error (aplay terminated/EPIPE), the old pipe is closed
-                 * and destroyed. Return the count of fully delivered whole frames.
-                 * The caller will reopen a new aplay pipe and resume from the whole-frame
-                 * boundary, ensuring the new pipe receives strictly frame-aligned PCM. */
-                if (out_frames_written) {
-                    *out_frames_written = written_bytes / frame_bytes;
-                }
-                DBG_LOG("audio_output: pipe write failed (target=%d errno=%d written=%" PRIu64 "/%" PRIu64 " frames)\n",
-                        (int) active_target, errno,
-                        out_frames_written ? *out_frames_written : 0ULL, frames);
-                return false;
+        size_t written_bytes = 0;
+        
+        if (!write_pipe_bounded(fd, p, total_bytes, frame_bytes, &written_bytes)) {
+            int err = errno;
+            if (out_frames_written) {
+                *out_frames_written = written_bytes / frame_bytes;
             }
-            p += n;
-            remaining -= (size_t) n;
+            
+            output_target_t target = active_target;
+            if (target == OUTPUT_TARGET_BT) {
+                close_bt_device();
+            } else if (target == OUTPUT_TARGET_USB) {
+                close_usb_device();
+            }
+            
+            if (err == ETIMEDOUT) {
+                DBG_LOG("audio_output: BT/USB pipe write timed out after 2s, closing device (target=%d written=%" PRIu64 "/%" PRIu64 " frames)\n",
+                        (int) target, out_frames_written ? *out_frames_written : 0ULL, frames);
+            } else {
+                DBG_LOG("audio_output: pipe write failed (target=%d errno=%d written=%" PRIu64 "/%" PRIu64 " frames)\n",
+                        (int) target, err, out_frames_written ? *out_frames_written : 0ULL, frames);
+            }
+            return false;
         }
         if (out_frames_written) *out_frames_written = frames;
         return true;

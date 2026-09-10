@@ -52,4 +52,22 @@
   #define BOARD_PLAYER_OVERLAY_HEIGHT 320
 #endif
 
+/* Widget pixel sizes throughout the src/ui GUI sources (button/slider/roller/
+ * swatch widths & heights, spacing, etc.) were authored against a 480px-wide
+ * reference panel -- both the R1 and R3PRO II screens are 480 wide, so
+ * those literals have always rendered correctly on them. The R3II 2025
+ * panel is only 320 wide (2/3 of that reference), so the same literal
+ * pixel sizes read as oversized there.
+ *
+ * Rather than hand-tune every call site per board, route any such
+ * reference-width-relative literal through BOARD_SCALE_PX() at its
+ * definition/call site. It scales proportionally to how much narrower the
+ * real panel is than the 480px reference, so it is a no-op on R1/R3PRO II
+ * (BOARD_SCREEN_WIDTH == BOARD_REFERENCE_WIDTH) and shrinks automatically
+ * for any future narrower board without adding another per-board branch.
+ * Rounds to the nearest pixel rather than always truncating down. */
+#define BOARD_REFERENCE_WIDTH 480
+#define BOARD_SCALE_PX(px) \
+  (((px) * BOARD_SCREEN_WIDTH + (BOARD_REFERENCE_WIDTH / 2)) / BOARD_REFERENCE_WIDTH)
+
 #endif /* BOARD_CONFIG_H */

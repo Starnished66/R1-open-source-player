@@ -111,9 +111,9 @@ void populate_queue_screen(void) {
             for (int a = 0; a < 3; a++) {
                 lv_obj_t * button = lv_label_create(row);
                 lv_label_set_text(button, a == 0 ? LV_SYMBOL_UP : a == 1 ? LV_SYMBOL_DOWN : LV_SYMBOL_TRASH);
-                lv_obj_align(button, LV_ALIGN_RIGHT_MID, -110 + a * 50, 0);
+                lv_obj_align(button, LV_ALIGN_RIGHT_MID, BOARD_SCALE_PX(-110 + a * 50), 0);
                 lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
-                lv_obj_set_ext_click_area(button, 12);
+                lv_obj_set_ext_click_area(button, BOARD_SCALE_PX(12));
                 lv_obj_add_event_cb(button, queue_edit_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (i * 3 + a));
             }
         } else {
@@ -121,15 +121,15 @@ void populate_queue_screen(void) {
              * dedicated trailing column reserved before either label is
              * laid out. The queue state shares the metadata baseline but
              * cannot overlap or be crossed by either marquee. */
-            const int32_t state_column_width = 112;
-            const int32_t state_column_reserve = state_column_width + GUI_TEXT_INSET + 12;
+            const int32_t state_column_width = BOARD_SCALE_PX(112);
+            const int32_t state_column_reserve = state_column_width + GUI_TEXT_INSET + BOARD_SCALE_PX(12);
             lv_obj_t * row = build_music_list_row(queue_list, numbered_title, subtitle, state_column_reserve);
             lv_obj_t * state_label = lv_label_create(row);
             lv_label_set_text(state_label, state);
             lv_obj_add_style(state_label, &style_theme_text_muted, 0);
             lv_obj_set_style_text_font(state_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
             lv_obj_set_width(state_label, state_column_width);
-            lv_obj_set_pos(state_label, LIST_ROW_WIDTH - GUI_TEXT_INSET - state_column_width, 64);
+            lv_obj_set_pos(state_label, LIST_ROW_WIDTH - GUI_TEXT_INSET - state_column_width, BOARD_SCALE_PX(64));
             lv_obj_set_style_text_align(state_label, LV_TEXT_ALIGN_RIGHT, 0);
             row_label_apply_bounded_height(state_label, gui_theme_font(GUI_FONT_ROLE_BODY));
             lv_label_set_long_mode(state_label, LV_LABEL_LONG_DOT);

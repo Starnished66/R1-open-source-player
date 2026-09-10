@@ -1069,7 +1069,7 @@ static void populate_subsonic_saved_servers_screen(void) {
         lv_obj_t * label = lv_label_create(subsonic_saved_servers_list);
         lv_label_set_text(label, "No saved servers yet");
         lv_obj_add_style(label, &style_theme_text_muted, 0);
-        lv_obj_set_style_pad_left(label, 24, 0);
+        lv_obj_set_style_pad_left(label, BOARD_SCALE_PX(24), 0);
         return;
     }
     populate_indexed_list(subsonic_saved_servers_list, subsonic_saved_server_count, subsonic_saved_server_label_of,
@@ -1237,8 +1237,8 @@ void gui_subsonic_init(void) {
     lv_image_set_src(subsonic_albums_download_btn, asset_path("stream_media/download.png"));
     lv_obj_set_style_image_recolor(subsonic_albums_download_btn, accent_lv_color(), 0);
     lv_obj_set_style_image_recolor_opa(subsonic_albums_download_btn, LV_OPA_COVER, 0);
-    align_screen_header_action(subsonic_albums_download_btn, 87);
-    lv_obj_set_ext_click_area(subsonic_albums_download_btn, 16);
+    align_screen_header_action(subsonic_albums_download_btn, BOARD_SCALE_PX(87));
+    lv_obj_set_ext_click_area(subsonic_albums_download_btn, BOARD_SCALE_PX(16));
     lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(subsonic_albums_download_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(subsonic_albums_download_btn, subsonic_download_artist_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -1248,8 +1248,8 @@ void gui_subsonic_init(void) {
     lv_image_set_src(subsonic_songs_download_btn, asset_path("stream_media/download.png"));
     lv_obj_set_style_image_recolor(subsonic_songs_download_btn, accent_lv_color(), 0);
     lv_obj_set_style_image_recolor_opa(subsonic_songs_download_btn, LV_OPA_COVER, 0);
-    align_screen_header_action(subsonic_songs_download_btn, 20);
-    lv_obj_set_ext_click_area(subsonic_songs_download_btn, 16);
+    align_screen_header_action(subsonic_songs_download_btn, BOARD_SCALE_PX(20));
+    lv_obj_set_ext_click_area(subsonic_songs_download_btn, BOARD_SCALE_PX(16));
     lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(subsonic_songs_download_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(subsonic_songs_download_btn, subsonic_download_songs_btn_cb, LV_EVENT_CLICKED, NULL);

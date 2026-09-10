@@ -465,7 +465,7 @@ static lv_obj_t * build_accent_color_screen(void) {
 
     for (size_t i = 0; i < ACCENT_PALETTE_COUNT; i++) {
         lv_obj_t * swatch = lv_obj_create(swatch_row);
-        lv_obj_set_size(swatch, 64, 64);
+        lv_obj_set_size(swatch, BOARD_SCALE_PX(64), BOARD_SCALE_PX(64));
         lv_obj_set_style_radius(swatch, LV_RADIUS_CIRCLE, 0);
         lv_obj_set_style_bg_color(swatch, lv_color_hex(accent_palette[i]), 0);
         lv_obj_set_style_border_width(swatch, current_settings.accent_color == accent_palette[i] ? 4 : 0, 0);
@@ -628,7 +628,7 @@ static lv_obj_t * build_custom_font_screen(void) {
 
     /* Preview card pinned at top */
     lv_obj_t * preview_card = lv_obj_create(scr);
-    lv_obj_set_size(preview_card, lv_pct(90), 120);
+    lv_obj_set_size(preview_card, lv_pct(90), BOARD_SCALE_PX(120));
     lv_obj_align(preview_card, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 8);
     lv_obj_add_style(preview_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(preview_card, 0, 0);
@@ -775,7 +775,7 @@ static lv_obj_t * build_screen_timeout_screen(void) {
     /* Rounded slider card with vertical clearance below the track for the
      * knob diameter and centered value label. */
     screen_timeout_slider_card = lv_obj_create(scr);
-    lv_obj_set_size(screen_timeout_slider_card, lv_pct(90), 170);
+    lv_obj_set_size(screen_timeout_slider_card, lv_pct(90), BOARD_SCALE_PX(170));
     lv_obj_align_to(screen_timeout_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_add_style(screen_timeout_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(screen_timeout_slider_card, 0, 0);
@@ -879,7 +879,7 @@ static lv_obj_t * build_startup_volume_screen(void) {
     lv_obj_add_event_cb(startup_volume_switch, startup_volume_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     startup_volume_slider_card = lv_obj_create(scr);
-    lv_obj_set_size(startup_volume_slider_card, lv_pct(90), 170);
+    lv_obj_set_size(startup_volume_slider_card, lv_pct(90), BOARD_SCALE_PX(170));
     lv_obj_align_to(startup_volume_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_add_style(startup_volume_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(startup_volume_slider_card, 0, 0);
@@ -1041,7 +1041,7 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_add_event_cb(sleep_timer_switch, sleep_timer_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     sleep_timer_slider_card = lv_obj_create(scr);
-    lv_obj_set_size(sleep_timer_slider_card, lv_pct(90), 170);
+    lv_obj_set_size(sleep_timer_slider_card, lv_pct(90), BOARD_SCALE_PX(170));
     lv_obj_align_to(sleep_timer_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_add_style(sleep_timer_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(sleep_timer_slider_card, 0, 0);
@@ -1070,7 +1070,7 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_label_set_text(sleep_timer_value_label, duration_buf);
 
     sleep_timer_remaining_btn = lv_obj_create(scr);
-    lv_obj_set_size(sleep_timer_remaining_btn, lv_pct(90), 70);
+    lv_obj_set_size(sleep_timer_remaining_btn, lv_pct(90), BOARD_SCALE_PX(70));
     lv_obj_align_to(sleep_timer_remaining_btn, sleep_timer_slider_card, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_add_style(sleep_timer_remaining_btn, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(sleep_timer_remaining_btn, 0, 0);
@@ -1241,7 +1241,7 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     /* Slider card positioned below idle_action_section. Sized at 200px height
      * to accommodate the explanatory caption above the slider. */
     idle_shutdown_slider_card = lv_obj_create(scr);
-    lv_obj_set_size(idle_shutdown_slider_card, lv_pct(90), 200);
+    lv_obj_set_size(idle_shutdown_slider_card, lv_pct(90), BOARD_SCALE_PX(200));
     lv_obj_align_to(idle_shutdown_slider_card, idle_action_section, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
     lv_obj_add_style(idle_shutdown_slider_card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(idle_shutdown_slider_card, 0, 0);
@@ -1822,7 +1822,7 @@ static lv_obj_t * build_clock_set_time_screen(void) {
     build_screen_header(scr, "Set Time", generic_back_cb, NULL, NULL);
 
     lv_obj_t * row = lv_obj_create(scr);
-    lv_obj_set_size(row, lv_pct(92), 360);
+    lv_obj_set_size(row, lv_pct(92), BOARD_SCALE_PX(360));
     lv_obj_align(row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + 18);
     lv_obj_add_style(row, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(row, 0, 0);
@@ -1838,7 +1838,7 @@ static lv_obj_t * build_clock_set_time_screen(void) {
     lv_roller_set_options(clock_ampm_roller, "AM\nPM", LV_ROLLER_MODE_NORMAL);
     lv_obj_t * rollers[] = { clock_hour_roller, clock_minute_roller, clock_ampm_roller };
     for (int i = 0; i < 3; i++) {
-        lv_obj_set_size(rollers[i], i == 2 ? 105 : 120, 300);
+        lv_obj_set_size(rollers[i], i == 2 ? BOARD_SCALE_PX(105) : BOARD_SCALE_PX(120), BOARD_SCALE_PX(300));
         lv_obj_set_style_text_font(rollers[i], gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
         lv_obj_add_style(rollers[i], gui_theme_accent_style(), LV_PART_SELECTED);
         /* style_accent deliberately sets both background and text to the
@@ -1851,7 +1851,7 @@ static lv_obj_t * build_clock_set_time_screen(void) {
     }
 
     lv_obj_t * save = lv_button_create(scr);
-    lv_obj_set_size(save, 220, 78);
+    lv_obj_set_size(save, BOARD_SCALE_PX(220), BOARD_SCALE_PX(78));
     lv_obj_align_to(save, row, LV_ALIGN_OUT_BOTTOM_MID, 0, 28);
     lv_obj_add_style(save, gui_theme_accent_style(), 0);
     lv_obj_add_event_cb(save, clock_set_time_save_cb, LV_EVENT_CLICKED, NULL);

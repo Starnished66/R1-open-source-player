@@ -78,7 +78,7 @@ static int32_t quick_drawer_direct_y = 0;
 static bool quick_drawer_snapshot_dirty = true;
 static bool quick_drawer_open = false;
 
-#define QUICK_DRAWER_TRIGGER_ZONE 140
+#define QUICK_DRAWER_TRIGGER_ZONE BOARD_SCALE_PX(140)
 
 static void start_bt_dac_startup_reapply_if_needed(void);
 static lv_obj_t * quick_drawer_brightness_track = NULL;
@@ -479,7 +479,7 @@ static void build_status_bar(void) {
      * this alignment (confirmed on real hardware in an earlier round of
      * this same bug: the group ended up anchored low and out of vertical
      * sync with the rest of the bar). */
-    lv_obj_align(volume_topbar_group, LV_ALIGN_LEFT_MID, 16, 0);
+    lv_obj_align(volume_topbar_group, LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(16), 0);
 
     /* Outline frame -- swapped between battery_bg.png (normal),
      * battery_charge_bg.png (charging, has its own baked-in bolt glyph) and
@@ -492,7 +492,7 @@ static void build_status_bar(void) {
     battery_icon_frame = lv_image_create(band);
     lv_image_set_src(battery_icon_frame, asset_path("topbar/battery_bg.png"));
     lv_image_set_scale(battery_icon_frame, LV_SCALE_NONE);
-    lv_obj_align(battery_icon_frame, LV_ALIGN_RIGHT_MID, -15, 0);
+    lv_obj_align(battery_icon_frame, LV_ALIGN_RIGHT_MID, -BOARD_SCALE_PX(15), 0);
 
     /* Charge-level gauge: a plain clipping container sized/positioned every
      * refresh to BATTERY_FILL_W x (BATTERY_FILL_H * percent/100), holding
@@ -543,18 +543,18 @@ static void build_status_bar(void) {
      * fixed band offset, since the group's own width varies with the
      * digit count (1-3) -- LAST, after every child exists, same reasoning
      * as volume_topbar_group's align() below. */
-    lv_obj_align_to(battery_topbar_group, battery_icon_frame, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+    lv_obj_align_to(battery_topbar_group, battery_icon_frame, LV_ALIGN_OUT_LEFT_MID, -BOARD_SCALE_PX(5), 0);
 
     wifi_icon = lv_image_create(band);
     lv_image_set_src(wifi_icon, asset_path("topbar/wifi_unconnect.png"));
     lv_image_set_scale(wifi_icon, LV_SCALE_NONE);
-    lv_obj_align(wifi_icon, LV_ALIGN_RIGHT_MID, -105, 0);
+    lv_obj_align(wifi_icon, LV_ALIGN_RIGHT_MID, -BOARD_SCALE_PX(105), 0);
     lv_obj_add_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN); /* shown by refresh_wifi_icon() once wifi_control_is_enabled() */
 
     bt_status_icon = lv_image_create(band);
     lv_image_set_src(bt_status_icon, asset_path("topbar/bluetooth.png"));
     lv_image_set_scale(bt_status_icon, LV_SCALE_NONE);
-    lv_obj_align(bt_status_icon, LV_ALIGN_RIGHT_MID, -145, 0);
+    lv_obj_align(bt_status_icon, LV_ALIGN_RIGHT_MID, -BOARD_SCALE_PX(145), 0);
     lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN); /* shown by refresh_bt_icon() once bt_control_is_powered() */
 }
 
@@ -672,7 +672,7 @@ void refresh_battery_topbar(void) {
     if (len != battery_topbar_visible_digit_count) {
         battery_topbar_visible_digit_count = len;
         lv_obj_update_layout(battery_topbar_group);
-        lv_obj_align_to(battery_topbar_group, battery_icon_frame, LV_ALIGN_OUT_LEFT_MID, -5, 0);
+        lv_obj_align_to(battery_topbar_group, battery_icon_frame, LV_ALIGN_OUT_LEFT_MID, -BOARD_SCALE_PX(5), 0);
         sync_topbar_status_icon_positions();
     }
 }
@@ -810,7 +810,7 @@ static void sync_topbar_status_icon_positions(void) {
                             : topbar_status_icon_order[i] == TOPBAR_STATUS_ICON_BT ? bt_status_icon
                                                                                     : NULL;
         if (!widget) continue;
-        lv_obj_align_to(widget, anchor, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+        lv_obj_align_to(widget, anchor, LV_ALIGN_OUT_LEFT_MID, -BOARD_SCALE_PX(8), 0);
         anchor = widget;
     }
 }
@@ -1230,7 +1230,7 @@ static void build_home_indicator_bar(void) {
      * Android's own gesture-nav home indicator. */
     lv_obj_t * pill = lv_obj_create(home_indicator_band);
     lv_obj_remove_style_all(pill);
-    lv_obj_set_size(pill, 120, 4);
+    lv_obj_set_size(pill, BOARD_SCALE_PX(120), BOARD_SCALE_PX(4));
     lv_obj_align(pill, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(pill, lv_color_make(220, 220, 220), 0);
     lv_obj_set_style_bg_opa(pill, LV_OPA_60, 0);
@@ -1888,7 +1888,7 @@ static bool quick_drawer_brightness_hit_test(lv_point_t point) {
     if (!quick_drawer_open || !quick_drawer_brightness_track) return false;
     lv_area_t area;
     lv_obj_get_coords(quick_drawer_brightness_track, &area);
-    lv_area_increase(&area, 44, 44); /* matches build_quick_drawer()'s hit area */
+    lv_area_increase(&area, BOARD_SCALE_PX(44), BOARD_SCALE_PX(44)); /* matches build_quick_drawer()'s hit area */
     return point.x >= area.x1 && point.x <= area.x2 &&
            point.y >= area.y1 && point.y <= area.y2;
 }
@@ -2906,9 +2906,9 @@ static void poll_bt_apply_output_settings(void) {
  * 19px above the real panel top of 59, and the card started at
  * STATUS_BAR_CLEARANCE+250=298, 65px above the real second panel's top of
  * 363). */
-#define QUICK_DRAWER_PANEL1_TOP 59
-#define QUICK_DRAWER_PANEL1_BOTTOM 338
-#define QUICK_DRAWER_PANEL2_TOP 363
+#define QUICK_DRAWER_PANEL1_TOP BOARD_SCALE_PX(59)
+#define QUICK_DRAWER_PANEL1_BOTTOM BOARD_SCALE_PX(338)
+#define QUICK_DRAWER_PANEL2_TOP BOARD_SCALE_PX(363)
 #define BRIGHTNESS_HW_APPLY_INTERVAL_MS 50
 
 static void brightness_hw_apply_pending(void) {
@@ -2977,21 +2977,21 @@ static void build_quick_drawer(void) {
      * slider left in this drawer. */
     quick_drawer_wifi_icon = lv_image_create(quick_drawer);
     lv_image_set_src(quick_drawer_wifi_icon, asset_path("pull_down/wifi.png"));
-    lv_obj_align(quick_drawer_wifi_icon, LV_ALIGN_TOP_LEFT, 40, QUICK_DRAWER_PANEL1_TOP + 30);
+    lv_obj_align(quick_drawer_wifi_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(40), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(30));
     lv_obj_add_flag(quick_drawer_wifi_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_wifi_icon, quick_drawer_wifi_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(quick_drawer_wifi_icon, quick_drawer_wifi_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
 
     quick_drawer_bt_icon = lv_image_create(quick_drawer);
     lv_image_set_src(quick_drawer_bt_icon, asset_path("pull_down/bt.png"));
-    lv_obj_align(quick_drawer_bt_icon, LV_ALIGN_TOP_LEFT, 145, QUICK_DRAWER_PANEL1_TOP + 30);
+    lv_obj_align(quick_drawer_bt_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(145), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(30));
     lv_obj_add_flag(quick_drawer_bt_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_bt_icon, quick_drawer_bt_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(quick_drawer_bt_icon, quick_drawer_bt_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
 
     quick_drawer_sleep_icon = lv_image_create(quick_drawer);
     lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
-    lv_obj_align(quick_drawer_sleep_icon, LV_ALIGN_TOP_LEFT, 250, QUICK_DRAWER_PANEL1_TOP + 30);
+    lv_obj_align(quick_drawer_sleep_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(250), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(30));
     lv_obj_add_flag(quick_drawer_sleep_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_sleep_icon, quick_drawer_sleep_event_cb, LV_EVENT_CLICKED, NULL);
 
@@ -3001,13 +3001,13 @@ static void build_quick_drawer(void) {
     quick_drawer_sleep_label = lv_label_create(quick_drawer);
     lv_obj_add_style(quick_drawer_sleep_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(quick_drawer_sleep_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
-    lv_obj_set_width(quick_drawer_sleep_label, 84);
+    lv_obj_set_width(quick_drawer_sleep_label, BOARD_SCALE_PX(84));
     lv_obj_set_style_text_align(quick_drawer_sleep_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(quick_drawer_sleep_label, LV_ALIGN_TOP_LEFT, 250, QUICK_DRAWER_PANEL1_TOP + 30 + 84 + 4);
+    lv_obj_align(quick_drawer_sleep_label, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(250), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(30) + BOARD_SCALE_PX(84) + BOARD_SCALE_PX(4));
     lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
 
     quick_drawer_crossfade_icon = lv_image_create(quick_drawer);
-    lv_obj_align(quick_drawer_crossfade_icon, LV_ALIGN_TOP_LEFT, 355, QUICK_DRAWER_PANEL1_TOP + 30);
+    lv_obj_align(quick_drawer_crossfade_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(355), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(30));
     lv_obj_add_flag(quick_drawer_crossfade_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_crossfade_icon, quick_drawer_crossfade_event_cb, LV_EVENT_CLICKED, NULL);
     refresh_quick_drawer_crossfade_icon();
@@ -3019,23 +3019,23 @@ static void build_quick_drawer(void) {
     const void * brightness = asset_decoded_image_open(&quick_drawer_brightness_image, "pull_down/blk.png")
                             ? asset_decoded_image_source(&quick_drawer_brightness_image) : NULL;
     lv_image_set_src(quick_drawer_brightness_icon, brightness ? brightness : asset_path("pull_down/blk.png"));
-    lv_obj_align(quick_drawer_brightness_icon, LV_ALIGN_TOP_LEFT, 40, QUICK_DRAWER_PANEL1_TOP + 174);
+    lv_obj_align(quick_drawer_brightness_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(40), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(174));
 
     quick_drawer_brightness_label = lv_label_create(quick_drawer);
     lv_obj_add_style(quick_drawer_brightness_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(quick_drawer_brightness_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(quick_drawer_brightness_label, LV_ALIGN_TOP_RIGHT, -20, QUICK_DRAWER_PANEL1_TOP + 177);
+    lv_obj_align(quick_drawer_brightness_label, LV_ALIGN_TOP_RIGHT, -BOARD_SCALE_PX(20), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(177));
 
     /* Dynamically sizes slider width based on the maximum width of the percentage
      * label ("100%") to prevent horizontal overlap when using larger font tiers. */
     int32_t brightness_label_max_w = lv_text_get_width("100%", 4, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    int32_t brightness_track_w = (w - 20 - brightness_label_max_w - 20) - 90;
-    if (brightness_track_w > 300) brightness_track_w = 300; /* never wider than the original design */
-    if (brightness_track_w < 120) brightness_track_w = 120; /* sane floor so the track never collapses to nothing */
+    int32_t brightness_track_w = (w - BOARD_SCALE_PX(20) - brightness_label_max_w - BOARD_SCALE_PX(20)) - BOARD_SCALE_PX(90);
+    if (brightness_track_w > BOARD_SCALE_PX(300)) brightness_track_w = BOARD_SCALE_PX(300); /* never wider than the original design */
+    if (brightness_track_w < BOARD_SCALE_PX(120)) brightness_track_w = BOARD_SCALE_PX(120); /* sane floor so the track never collapses to nothing */
 
     quick_drawer_brightness_track = lv_slider_create(quick_drawer);
     lv_obj_set_size(quick_drawer_brightness_track, brightness_track_w, SLIDER_TRACK_HEIGHT);
-    lv_obj_align(quick_drawer_brightness_track, LV_ALIGN_TOP_LEFT, 90, QUICK_DRAWER_PANEL1_TOP + 185);
+    lv_obj_align(quick_drawer_brightness_track, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(90), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(185));
     /* Full 0-100 -- backlight.c now maps this logical range to its own safe
      * raw range internally (see backlight.h's own comment), so the slider
      * itself is free to show a clean, honest 0%-100% again. */
@@ -3063,15 +3063,15 @@ static void build_quick_drawer(void) {
     /* Stock's drawer gives this control an explicit 436x100 touch rectangle.
      * Its neighboring icon and percentage are display-only, so matching that
      * generous vertical capture area does not steal another control's tap. */
-    lv_obj_set_ext_click_area(quick_drawer_brightness_track, 44);
+    lv_obj_set_ext_click_area(quick_drawer_brightness_track, BOARD_SCALE_PX(44));
 
     refresh_quick_drawer_brightness();
 
     /* Mini now-playing card: track title, artist, and transport controls.
      * Sized to fit the second panel's bounds with a balanced bottom margin. */
     lv_obj_t * card = lv_obj_create(quick_drawer);
-    lv_obj_set_size(card, 440, 330);
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, QUICK_DRAWER_PANEL2_TOP + 12);
+    lv_obj_set_size(card, BOARD_SCALE_PX(440), BOARD_SCALE_PX(330));
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, QUICK_DRAWER_PANEL2_TOP + BOARD_SCALE_PX(12));
     lv_obj_set_style_bg_opa(card, 0, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -3081,21 +3081,21 @@ static void build_quick_drawer(void) {
     lv_label_set_text(quick_drawer_title_label, "No track loaded");
     lv_obj_add_style(quick_drawer_title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(quick_drawer_title_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
-    lv_obj_set_width(quick_drawer_title_label, 392);
+    lv_obj_set_width(quick_drawer_title_label, BOARD_SCALE_PX(392));
     lv_obj_set_style_text_align(quick_drawer_title_label, LV_TEXT_ALIGN_CENTER, 0);
     row_label_apply_bounded_height(quick_drawer_title_label, gui_theme_font(GUI_FONT_ROLE_ROW));
     row_label_enable_marquee(quick_drawer_title_label);
-    lv_obj_align(quick_drawer_title_label, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_align(quick_drawer_title_label, LV_ALIGN_TOP_MID, 0, BOARD_SCALE_PX(22));
 
     quick_drawer_artist_label = lv_label_create(card);
     lv_label_set_text(quick_drawer_artist_label, "");
     lv_obj_add_style(quick_drawer_artist_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(quick_drawer_artist_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_set_width(quick_drawer_artist_label, 392);
+    lv_obj_set_width(quick_drawer_artist_label, BOARD_SCALE_PX(392));
     lv_obj_set_style_text_align(quick_drawer_artist_label, LV_TEXT_ALIGN_CENTER, 0);
     row_label_apply_bounded_height(quick_drawer_artist_label, gui_theme_font(GUI_FONT_ROLE_BODY));
     row_label_enable_marquee(quick_drawer_artist_label);
-    lv_obj_align(quick_drawer_artist_label, LV_ALIGN_TOP_MID, 0, 76);
+    lv_obj_align(quick_drawer_artist_label, LV_ALIGN_TOP_MID, 0, BOARD_SCALE_PX(76));
 
     /* Transport row: order/prev/play/next/favorite, all five in one row --
      * matching the stock drawer exactly (shuffle-style icon leftmost,
@@ -3108,7 +3108,7 @@ static void build_quick_drawer(void) {
      * actual asset files), and a shorter row was clipping the top/bottom of
      * that icon, confirmed on a real device. */
     lv_obj_set_size(controls_row, lv_pct(100), 84);
-    lv_obj_align(controls_row, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_align(controls_row, LV_ALIGN_BOTTOM_MID, 0, -BOARD_SCALE_PX(8));
     lv_obj_set_style_bg_opa(controls_row, 0, 0);
     lv_obj_set_style_border_width(controls_row, 0, 0);
     lv_obj_remove_flag(controls_row, LV_OBJ_FLAG_SCROLLABLE);

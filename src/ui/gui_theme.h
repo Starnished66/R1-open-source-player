@@ -1,5 +1,6 @@
 #pragma once
 #include <lvgl/lvgl.h>
+#include "board_config.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -13,21 +14,23 @@
 #define GUI_COLOR_PRIMARY 0xF1F3F5
 #define GUI_COLOR_SECONDARY 0xA8B0BC
 #define GUI_COLOR_BORDER 0x343B46
-#define GUI_ROW_GAP 8
-#define GUI_TEXT_INSET 24
-#define GUI_SETTINGS_ROW_HEIGHT 112
-#define GUI_MUSIC_ROW_HEIGHT 112
+#define GUI_ROW_GAP BOARD_SCALE_PX(8)
+#define GUI_TEXT_INSET BOARD_SCALE_PX(24)
+#define GUI_SETTINGS_ROW_HEIGHT BOARD_SCALE_PX(112)
+#define GUI_MUSIC_ROW_HEIGHT BOARD_SCALE_PX(112)
 /* Shared native-painted track thickness -- every slider except Player's
  * own progress_slider, which stays at a hardcoded 440x12 to match its
  * fixed-size progress_bg.png/progress.png art (gui_player.c's own comment
  * at that call site explains why; confirmed via the real asset files,
  * both exactly 440x12 -- LVGL doesn't stretch a bg_image to fit). */
-#define SLIDER_TRACK_HEIGHT 16
+#define SLIDER_TRACK_HEIGHT BOARD_SCALE_PX(16)
 /* Knob diameter is track height plus pad on both sides -- lv_slider.c's
  * position_knob() ignores LV_PART_KNOB width/height. 32px sits just above
- * the 16px track; 4px inward white border leaves a 24px accent disc. */
-#define SLIDER_KNOB_SIZE 32
-#define SLIDER_KNOB_BORDER_WIDTH 4
+ * the 16px track; 4px inward white border leaves a 24px accent disc.
+ * (Both scale together with SLIDER_TRACK_HEIGHT so the knob keeps the same
+ * proportional relationship to the track on narrower boards.) */
+#define SLIDER_KNOB_SIZE BOARD_SCALE_PX(32)
+#define SLIDER_KNOB_BORDER_WIDTH BOARD_SCALE_PX(4)
 #define SLIDER_KNOB_PAD ((SLIDER_KNOB_SIZE - SLIDER_TRACK_HEIGHT) / 2)
 
 typedef enum {

@@ -551,7 +551,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
      * broken tile content positioning, not just a wide gap, so it needs a
      * real ceiling rather than a cosmetic one. */
     if (tile_gap < 0) tile_gap = 0;
-    if (tile_gap > 64) tile_gap = 64;
+    if (tile_gap > BOARD_SCALE_PX(64)) tile_gap = BOARD_SCALE_PX(64);
 
     int32_t target_icon_px = (ICON_GRID_TARGET_ICON_PX * icon_scale_percent) / 100;
 

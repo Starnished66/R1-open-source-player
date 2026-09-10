@@ -2,6 +2,7 @@
 #define SCREEN_BUILDERS_H
 
 #include "lvgl/lvgl.h"
+#include "board_config.h"
 #include "fallback_font.h"
 #include "launcher_layout.h"
 #include "gui_theme.h"
@@ -26,9 +27,9 @@
  * Topbar assets (clock, battery, wifi, codec badges) are 30px tall, leaving
  * 1px margin above/below them. Consumers derive positions algebraically
  * from this constant. */
-#define STATUS_BAR_CLEARANCE 32
-#define TITLE_ROW_HEIGHT 64
-#define HOME_INDICATOR_BAND_HEIGHT 24
+#define STATUS_BAR_CLEARANCE BOARD_SCALE_PX(32)
+#define TITLE_ROW_HEIGHT BOARD_SCALE_PX(64)
+#define HOME_INDICATOR_BAND_HEIGHT BOARD_SCALE_PX(24)
 
 /* Shared touch-list row geometry -- every tappable row-of-text list
  * (Artists/Albums/Album Artist/Genres/All Songs/group-songs drill-down,
@@ -42,9 +43,9 @@ int32_t ui_list_row_width_wide(void);
 /* Compatibility name used by roomier library lists. Both row-width helpers
  * follow the active display width and intentionally add no outer gutter. */
 #define LIST_ROW_WIDTH_WIDE (ui_list_row_width_wide())
-#define LIST_ROW_HEIGHT 84
+#define LIST_ROW_HEIGHT BOARD_SCALE_PX(84)
 #define MUSIC_LIST_ROW_HEIGHT GUI_MUSIC_ROW_HEIGHT
-#define LIST_ROW_RADIUS 16
+#define LIST_ROW_RADIUS BOARD_SCALE_PX(16)
 #define LIST_ROW_BG_COLOR lv_color_hex(GUI_COLOR_ROW)
 #define LIST_ROW_FONT app_font_22 /* see fallback_font.h -- same metrics as lv_font_montserrat_22, plus a non-Latin fallback */
 #define LIST_ROW_LABEL_INSET GUI_TEXT_INSET

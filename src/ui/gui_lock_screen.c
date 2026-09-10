@@ -198,6 +198,15 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
             lv_image_set_src(lock_image_obj, asset_path("playing_plane/default_cover_565.png"));
         }
 
+        /* lv_image_set_src() only marks the content-sized object's layout
+         * dirty (lv_obj_refresh_self_size() -> lv_obj_mark_layout_as_dirty());
+         * the actual resize is deferred to the next layout pass. Force it now
+         * so the lv_obj_get_width/height() calls below see this image's real
+         * natural size instead of stale (often zero, on first show) coords --
+         * same fix already applied for this exact LVGL behavior elsewhere in
+         * this codebase (gui_lyrics.c, gui_shell.c, gui_library.c). */
+        lv_obj_update_layout(lock_image_obj);
+
         /* Album art should behave like a full-screen wallpaper: make the
          * image widget cover the whole lock screen while preserving the
          * artwork's aspect ratio. The R1's LVGL build does not provide
@@ -269,10 +278,15 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
     return true;
 }
 
+/* Dismissal is a swipe-up gesture (see lock_touch_timer_cb() above), so it
+ * plays the same "swipe up to reveal" transition as swipe-up-to-Home
+ * (gui_shell.c's home-swipe): forward=true, vertical=true, reveal=true --
+ * the underlying screen stays fixed in place, revealed as the lock screen
+ * slides up and away over it, rather than a plain horizontal back-slide. */
 void gui_lock_screen_hide(void) {
     stop_timers();
     if (lock_screen && lv_screen_active() == lock_screen) {
-        nav_pop();
+        nav_pop_ex(true, true, true);
     }
 }
 

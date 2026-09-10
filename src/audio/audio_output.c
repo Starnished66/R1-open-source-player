@@ -19,6 +19,22 @@
 
 static struct pcm * alsa_pcm = NULL;
 
+/* The shared device handles have one logical producer at a time.  This gate
+ * is held only for ownership bookkeeping; device I/O is never done under it. */
+static pthread_mutex_t owner_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool owner_valid = false;
+static pthread_t owner_thread;
+static pthread_mutex_t config_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool caller_owns_output(void) {
+    bool owns;
+    pthread_mutex_lock(&owner_mutex);
+    owns = owner_valid && pthread_equal(owner_thread, pthread_self());
+    pthread_mutex_unlock(&owner_mutex);
+    return owns;
+}
+
 /* Three possible output targets: local (ALSA), Bluetooth (bluealsa/aplay),
  * and USB DAC (handled by usb_dac_bridge.c). A tri-state enum rather than
  * multiple bools, since exactly one target is active at any time. */
@@ -138,20 +154,27 @@ static void close_usb_device(void) {
     usb_aplay_fd = -1;
 }
 
-static bool open_device(unsigned int channels, unsigned int sample_rate, bool low_latency, bool want_s24) {
-    if (requested_target == OUTPUT_TARGET_USB) {
-        if (!spawn_aplay(usb_alsa_device, channels, sample_rate, &usb_aplay_pid, &usb_aplay_fd)) return false;
+static bool open_device(unsigned int channels, unsigned int sample_rate, bool low_latency, bool want_s24,
+                        output_target_t target, const char * usb_device) {
+    if (target == OUTPUT_TARGET_USB) {
+        if (!spawn_aplay(usb_device, channels, sample_rate, &usb_aplay_pid, &usb_aplay_fd)) return false;
+        pthread_mutex_lock(&state_mutex);
         active_target = OUTPUT_TARGET_USB;
-    } else if (requested_target == OUTPUT_TARGET_BT) {
+        pthread_mutex_unlock(&state_mutex);
+    } else if (target == OUTPUT_TARGET_BT) {
         if (!spawn_aplay("bluealsa", channels, sample_rate, &bt_aplay_pid, &bt_aplay_fd)) return false;
+        pthread_mutex_lock(&state_mutex);
         active_target = OUTPUT_TARGET_BT;
+        pthread_mutex_unlock(&state_mutex);
     } else {
         struct pcm_config config;
         memset(&config, 0, sizeof(config));
         config.channels = channels;
         config.rate = sample_rate;
         config.format = want_s24 ? PCM_FORMAT_S24_LE : PCM_FORMAT_S16_LE;
+        pthread_mutex_lock(&state_mutex);
         active_format = config.format;
+        pthread_mutex_unlock(&state_mutex);
         active_low_latency = low_latency;
         if (low_latency) {
             /* Low-latency buffer tuning: 1024 frames x 4 periods (~43ms at 96kHz)
@@ -203,11 +226,15 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
             /* Fall back to S16_LE if S24_LE hw_params negotiation fails, and record
              * the unsupported format so subsequent chunks do not re-probe. */
             DBG_LOG("audio_output: S24_LE open failed, falling back to S16_LE\n");
+            pthread_mutex_lock(&state_mutex);
             s24_unsupported_known = true;
             s24_unsupported_channels = channels;
             s24_unsupported_rate = sample_rate;
+            pthread_mutex_unlock(&state_mutex);
             config.format = PCM_FORMAT_S16_LE;
+            pthread_mutex_lock(&state_mutex);
             active_format = config.format;
+            pthread_mutex_unlock(&state_mutex);
             alsa_pcm = pcm_open(ALSA_CARD, ALSA_DEVICE, PCM_OUT, &config);
             if (!alsa_pcm || !pcm_is_ready(alsa_pcm)) {
                 DBG_LOG("audio_output: S16_LE fallback also failed: %s\n",
@@ -217,31 +244,70 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
                 return false;
             }
         }
+        pthread_mutex_lock(&state_mutex);
         active_target = OUTPUT_TARGET_LOCAL;
+        pthread_mutex_unlock(&state_mutex);
     }
+    pthread_mutex_lock(&state_mutex);
     device_channels = channels;
     device_sample_rate = sample_rate;
+    pthread_mutex_unlock(&state_mutex);
     return true;
 }
 
-void audio_output_close(void) {
-    if (active_target == OUTPUT_TARGET_BT) close_bt_device();
-    if (active_target == OUTPUT_TARGET_USB) close_usb_device();
+static void close_device_state(void) {
+    pthread_mutex_lock(&state_mutex);
+    output_target_t target = active_target;
+    struct pcm * pcm = alsa_pcm;
+    alsa_pcm = NULL;
+    pthread_mutex_unlock(&state_mutex);
+    if (target == OUTPUT_TARGET_BT) close_bt_device();
+    if (target == OUTPUT_TARGET_USB) close_usb_device();
+    if (pcm) pcm_close(pcm);
+    pthread_mutex_lock(&state_mutex);
     active_target = OUTPUT_TARGET_LOCAL; /* only open_device() above was ever setting this to BT/USB, never this side */
-    if (alsa_pcm) { pcm_close(alsa_pcm); alsa_pcm = NULL; }
     active_format = PCM_FORMAT_S16_LE;
     device_channels = 0;
     device_sample_rate = 0;
+    pthread_mutex_unlock(&state_mutex);
+}
+
+void audio_output_close(void) {
+    if (!caller_owns_output()) return;
+    close_device_state();
+    pthread_mutex_lock(&owner_mutex);
+    owner_valid = false;
+    pthread_mutex_unlock(&owner_mutex);
 }
 
 bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool low_latency, bool want_s24) {
+    pthread_mutex_lock(&owner_mutex);
+    if (owner_valid) {
+        bool same_owner = pthread_equal(owner_thread, pthread_self());
+        pthread_mutex_unlock(&owner_mutex);
+        if (!same_owner) return false;
+    } else {
+        owner_thread = pthread_self();
+        owner_valid = true;
+        pthread_mutex_unlock(&owner_mutex);
+    }
+
+    pthread_mutex_lock(&config_mutex);
+    output_target_t target = requested_target;
+    char usb_device[sizeof(usb_alsa_device)];
+    memcpy(usb_device, usb_alsa_device, sizeof(usb_device));
+    pthread_mutex_unlock(&config_mutex);
+
     /* Already know this exact (channels, rate) fails S24_LE hw_params
      * negotiation (open_device()'s fallback set this on a real failure) --
      * downgrading here, before the format-mismatch check below, keeps a
      * fallen-back-to-S16 device from being torn down and re-attempted at
      * S24_LE on every subsequent chunk of the same track. */
-    if (want_s24 && s24_unsupported_known &&
-        s24_unsupported_channels == channels && s24_unsupported_rate == sample_rate) {
+    pthread_mutex_lock(&state_mutex);
+    bool s24_known = s24_unsupported_known &&
+        s24_unsupported_channels == channels && s24_unsupported_rate == sample_rate;
+    pthread_mutex_unlock(&state_mutex);
+    if (want_s24 && s24_known) {
         want_s24 = false;
     }
 
@@ -267,20 +333,27 @@ bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool l
     }
 
     bool device_open = (alsa_pcm != NULL || bt_aplay_pid >= 0 || usb_aplay_pid >= 0);
-    if (device_open && active_target != requested_target) device_open = false;
+    if (device_open && active_target != target) device_open = false;
     /* Only the OUTPUT_TARGET_LOCAL tinyalsa path has format and tuning options --
      * a format or mode mismatch must force a reopen the same as a channel/rate change. */
-    enum pcm_format requested_format = (requested_target == OUTPUT_TARGET_LOCAL && want_s24)
+    enum pcm_format requested_format = (target == OUTPUT_TARGET_LOCAL && want_s24)
                                        ? PCM_FORMAT_S24_LE : PCM_FORMAT_S16_LE;
-    if (device_open && requested_target == OUTPUT_TARGET_LOCAL && active_format != requested_format) device_open = false;
-    if (device_open && requested_target == OUTPUT_TARGET_LOCAL && active_low_latency != low_latency) device_open = false;
+    if (device_open && target == OUTPUT_TARGET_LOCAL && active_format != requested_format) device_open = false;
+    if (device_open && target == OUTPUT_TARGET_LOCAL && active_low_latency != low_latency) device_open = false;
     if (device_open && device_channels == channels && device_sample_rate == sample_rate) return true;
-    audio_output_close();
-    return open_device(channels, sample_rate, low_latency, want_s24);
+    close_device_state();
+    bool opened = open_device(channels, sample_rate, low_latency, want_s24, target, usb_device);
+    if (!opened) {
+        pthread_mutex_lock(&owner_mutex);
+        owner_valid = false;
+        pthread_mutex_unlock(&owner_mutex);
+    }
+    return opened;
 }
 
 bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written) {
     if (out_frames_written) *out_frames_written = 0;
+    if (!caller_owns_output()) return false;
     if (active_target == OUTPUT_TARGET_BT || active_target == OUTPUT_TARGET_USB) {
         int fd = (active_target == OUTPUT_TARGET_BT) ? bt_aplay_fd : usb_aplay_fd;
         if (fd < 0) {
@@ -348,6 +421,7 @@ bool audio_output_write(const int16_t * buf, uint64_t frames, unsigned int chann
 
 bool audio_output_write_s24(const int32_t * buf, uint64_t frames, unsigned int channels, uint64_t * out_frames_written) {
     if (out_frames_written) *out_frames_written = 0;
+    if (!caller_owns_output()) return false;
     /* Checking active_target alone is not enough: open_device()'s own S24_LE
      * hw_params fallback can leave active_target == OUTPUT_TARGET_LOCAL while
      * active_format == PCM_FORMAT_S16_LE. Handing this 32-bit-per-sample
@@ -386,15 +460,23 @@ bool audio_output_write_s24(const int32_t * buf, uint64_t frames, unsigned int c
 }
 
 bool audio_output_is_local_requested(void) {
-    return requested_target == OUTPUT_TARGET_LOCAL;
+    pthread_mutex_lock(&config_mutex);
+    bool local = requested_target == OUTPUT_TARGET_LOCAL;
+    pthread_mutex_unlock(&config_mutex);
+    return local;
 }
 
 bool audio_output_is_s24_active(void) {
-    return active_target == OUTPUT_TARGET_LOCAL && active_format == PCM_FORMAT_S24_LE;
+    pthread_mutex_lock(&state_mutex);
+    bool active = active_target == OUTPUT_TARGET_LOCAL && active_format == PCM_FORMAT_S24_LE;
+    pthread_mutex_unlock(&state_mutex);
+    return active;
 }
 
 void audio_output_reset_s24_probe(void) {
+    pthread_mutex_lock(&state_mutex);
     s24_unsupported_known = false;
+    pthread_mutex_unlock(&state_mutex);
 }
 
 
@@ -412,14 +494,18 @@ static void recompute_requested_target(void) {
 }
 
 void audio_output_set_bt_requested(bool requested) {
+    pthread_mutex_lock(&config_mutex);
     bt_requested = requested;
     recompute_requested_target();
+    pthread_mutex_unlock(&config_mutex);
 }
 
 void audio_output_set_usb_requested(bool requested, const char * alsa_device) {
+    pthread_mutex_lock(&config_mutex);
     usb_requested = requested;
     if (requested) snprintf(usb_alsa_device, sizeof(usb_alsa_device), "%s", alsa_device);
     recompute_requested_target();
+    pthread_mutex_unlock(&config_mutex);
 }
 
 /* Lazily opened, never closed -- lives for the process's lifetime, same as
@@ -568,5 +654,8 @@ void audio_output_request_hw_volume_raw(int raw_left, int raw_right) {
 }
 
 bool audio_output_is_usb_active(void) {
-    return active_target == OUTPUT_TARGET_USB;
+    pthread_mutex_lock(&state_mutex);
+    bool active = active_target == OUTPUT_TARGET_USB;
+    pthread_mutex_unlock(&state_mutex);
+    return active;
 }

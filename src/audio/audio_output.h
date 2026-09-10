@@ -8,14 +8,20 @@
  * a connected Bluetooth accessory, or USB DAC (via piped aplay). Used by both
  * audio.c's playback thread and usb_dac_bridge.c's USB DAC bridge thread.
  *
- * Safe to share despite being file-scope state because only one caller is active
- * at a time (USB DAC mode stops playback before streaming; exiting DAC mode tears
- * down the bridge before playback resumes).
+ * The implementation enforces one owner thread from a successful ensure() until
+ * its close(). Calls to ensure()/write()/close() from another thread fail or
+ * no-op immediately (writes return false with zero frames), including when the
+ * owner is blocked in device I/O; this keeps a timed-out USB DAC bridge writer
+ * from sharing or destroying handles used by a later playback owner. Any failed
+ * ensure() releases its reservation so another caller can retry. The owner
+ * must close before exiting its thread. Route setters and state queries may
+ * still be called from other threads; they never wait for device I/O.
  *
  * Target build only; host simulator uses SDL. */
 
 /* Opens (or reopens) the output device for the given format, target, and latency mode.
  * Returns false if opening failed.
+ * If another thread currently owns the output, returns false immediately.
  *
  * low_latency configures smaller period/buffer sizes on the local tinyalsa path
  * (e.g. for real-time sources like AirPlay). */
@@ -31,6 +37,8 @@ bool audio_output_ensure(unsigned int channels, unsigned int sample_rate, bool l
  *
  * Returns true if ALL requested frames were successfully delivered.
  * Returns false on partial delivery, write error, or if no device is open.
+ * A call from a thread that does not own the current ensure() reservation
+ * returns false immediately with zero frames.
  *
  * When nothing is open, sleeps for the chunk's nominal playback duration and
  * returns false with *out_frames_written = 0. */
@@ -71,7 +79,8 @@ bool audio_output_is_s24_active(void);
 void audio_output_reset_s24_probe(void);
 
 /* Closes whatever's open (local or Bluetooth) and resets format tracking,
- * so the next audio_output_ensure() call always does a fresh open. */
+ * so the next audio_output_ensure() call always does a fresh open. A call from
+ * a non-owner thread is a no-op. */
 void audio_output_close(void);
 
 /* Routes subsequent audio_output_ensure()/_write() calls to a connected

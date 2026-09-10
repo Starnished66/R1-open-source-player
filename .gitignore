@@ -152,3 +152,5 @@ plugins_examples-02.zip
 BT_DAC_LONG_SESSION.md
 docs/UI_VISUAL_REFRESH.md
 AGENTS.md
+src/hardware/usb_dac_bridge_lifecycle_regression.c
+src/audio/audio_output_ownership_regression.c

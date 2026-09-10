@@ -150,7 +150,8 @@ typedef struct {
     /* Settings -> About -> Developer Options -> "Enable database logging" --
      * writes a detailed, timestamped log of library database scans and
      * album art cache jobs (including lazy load) to .logs/database_artwork.log
-     * on the SD card. See db_log.h. */
+     * on the SD card (see db_log.h), and also gates the USB DAC bridge's own
+     * diagnostic log to .logs/usb_dac_bridge.log (see usb_dac_bridge.h). */
     bool db_logging_enabled;
 
     /* Caps the PMIC's charge-termination voltage to 4.2V to extend battery

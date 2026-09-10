@@ -84,6 +84,7 @@ static void set_defaults(player_settings_t * out) {
     out->crossfade_enabled = false;
     out->replaygain_mode = 1; /* Per Track -- preserves the old replaygain_enabled=true default */
     out->car_mode_enabled = false;
+    out->lyrics_enabled = true;
     out->subsonic_url[0] = '\0';
     out->subsonic_username[0] = '\0';
     out->subsonic_password[0] = '\0';
@@ -296,6 +297,8 @@ bool settings_load(player_settings_t * out) {
             out->replaygain_mode = atoi(value);
         } else if (strcmp(key, "car_mode_enabled") == 0) {
             out->car_mode_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "lyrics_enabled") == 0) {
+            out->lyrics_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "subsonic_url") == 0) {
             snprintf(out->subsonic_url, sizeof(out->subsonic_url), "%s", value);
         } else if (strcmp(key, "subsonic_username") == 0) {
@@ -466,6 +469,7 @@ static void settings_write_file(const player_settings_t * settings) {
     fprintf(f, "crossfade=%d\n", settings->crossfade_enabled ? 1 : 0);
     fprintf(f, "replaygain_mode=%d\n", settings->replaygain_mode);
     fprintf(f, "car_mode_enabled=%d\n", settings->car_mode_enabled ? 1 : 0);
+    fprintf(f, "lyrics_enabled=%d\n", settings->lyrics_enabled ? 1 : 0);
     fprintf(f, "subsonic_url=%s\n", settings->subsonic_url);
     fprintf(f, "subsonic_username=%s\n", settings->subsonic_username);
     fprintf(f, "subsonic_password=%s\n", settings->subsonic_password);

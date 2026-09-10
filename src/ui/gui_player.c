@@ -1543,7 +1543,9 @@ static void build_more_menu_popup(void) {
 
 static void cover_img_tap_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    gui_lyrics_open_screen();
+    if (current_settings.lyrics_enabled) {
+        gui_lyrics_open_screen();
+    }
 }
 
 
@@ -3328,6 +3330,12 @@ void crossfade_switch_event_cb(lv_event_t * e) {
 void car_mode_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.car_mode_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+}
+
+void lyrics_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.lyrics_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     settings_save(&current_settings);
 }
 

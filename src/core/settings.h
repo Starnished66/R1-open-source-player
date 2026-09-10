@@ -65,6 +65,9 @@ typedef struct {
      * resumes automatically. Off by default. */
     bool car_mode_enabled;
 
+    /* Lyrics: show lyrics screen when tapping on cover image. On by default. */
+    bool lyrics_enabled;
+
     /* Subsonic-compatible (Subsonic/Navidrome/Airsonic/...) server config.
      * Stored in plaintext like every other setting here -- this project has
      * no secure-storage mechanism (keychain, encrypted-at-rest file, etc.)

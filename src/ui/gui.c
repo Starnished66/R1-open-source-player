@@ -1322,6 +1322,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #endif
     settings_load(&current_settings);
     db_log_set_enabled(current_settings.db_logging_enabled);
+    usb_dac_bridge_set_debug_log_enabled(current_settings.db_logging_enabled);
     app_clock_init(current_settings.clock_automatic, current_settings.clock_manual_epoch,
                    current_settings.clock_system_reference);
 #ifndef HOST_BUILD
@@ -1541,10 +1542,17 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #endif
 
     /* Auto-resume playback on startup:
-     * Used by Car Mode and the opt-in "Resume Last Track" setting.
+     * If an SD card is mounted and contains a saved queue checkpoint, restore it
+     * first. Otherwise fall back to Car Mode and the opt-in "Resume Last Track"
+     * setting from internal storage / metadata database.
      * Tracks in SUBSONIC_STREAM_CACHE_DIR are skipped to prevent resuming into
      * transient cache files without network connectivity. */
-    if (current_settings.car_mode_enabled && current_settings.last_track[0] != '\0' &&
+    bool sd_restored = false;
+    if (sd_card_root_is_mounted()) {
+        sd_restored = gui_player_restore_sd_queue(true);
+    }
+
+    if (!sd_restored && current_settings.car_mode_enabled && current_settings.last_track[0] != '\0' &&
         strncmp(current_settings.last_track, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) != 0) {
 #ifndef HOST_BUILD
         /* Car Mode expects a connected headphone/aux jack to resume into.
@@ -1568,7 +1576,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
                 }
             }
         }
-    } else if (current_settings.resume_mode != 0 && current_settings.last_track[0] != '\0' &&
+    } else if (!sd_restored && current_settings.resume_mode != 0 && current_settings.last_track[0] != '\0' &&
                strncmp(current_settings.last_track, SUBSONIC_STREAM_CACHE_DIR, strlen(SUBSONIC_STREAM_CACHE_DIR)) != 0) {
         /* General "Resume Last Track" (Settings -> Playback):
          * Resumes the last played local track on launch without requiring

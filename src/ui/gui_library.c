@@ -4,6 +4,7 @@
 #include "idle_shutdown.h"
 #include "backlight.h"
 #include "usb_mode_control.h"
+#include "gui_player.h"
 
 extern void on_file_browser_selected(char ** new_playlist, int count, int selected_index);
 extern void open_queue_screen(void);
@@ -1174,9 +1175,6 @@ static atomic_int album_thumb_gen_total_count;
 static atomic_bool album_thumb_gen_retry_pending;
 static uint32_t album_thumb_gen_retry_tick;
 static volatile bool sd_format_active = false;
-#ifndef HOST_BUILD
-static bool sd_card_root_is_mounted(void);
-#endif
 
 static bool album_thumb_gen_should_cancel(int my_generation) {
     return atomic_load(&album_thumb_gen_cancel) ||
@@ -3707,7 +3705,7 @@ static bool sd_mount_fail_notified = false;
  * isn't left staring at an empty library wondering what's wrong). */
 #define SD_MOUNT_FAIL_STREAK_THRESHOLD 6
 
-static bool sd_card_root_is_mounted(void) {
+bool sd_card_root_is_mounted(void) {
     struct stat parent_st, root_st;
     if (stat("/data/mnt", &parent_st) != 0) return false;
     if (stat(MUSIC_ROOT_DIR, &root_st) != 0) return false;
@@ -3773,6 +3771,7 @@ void poll_sd_card_hotplug(void) {
     }
 
     if (!mounted) {
+        gui_player_notify_sd_unmounted_immediate();
         mount_sd_card_if_needed();
         if (was_mounted) {
             /* Stop post-scan artwork reads/writes as soon as removal is
@@ -3783,6 +3782,7 @@ void poll_sd_card_hotplug(void) {
             atomic_store(&album_thumb_gen_retry_pending, false);
             unmount_confirm_streak++;
             if (unmount_confirm_streak >= SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD && !library_rescan_active) {
+                gui_player_handle_sd_unmount();
                 /* Close the SD-resident tagcache so a later reinsert opens
                  * the files on whichever card is actually mounted, not a
                  * stale handle. Do not scan: the mountpoint is empty and
@@ -3837,12 +3837,17 @@ void poll_sd_card_hotplug(void) {
     mount_fail_streak = 0;
     sd_mount_fail_notified = false;
     unmount_confirm_streak = 0; /* seeing "mounted" again cancels any not-yet-confirmed removal */
+    /* Every poll that observes the card mounted un-sticks the checkpoint
+     * target, even for a transient blip that never reached the confirmed-
+     * removal streak above. */
+    gui_player_notify_sd_mounted();
     /* Reset file browser and reload fallback fonts before triggering the
      * rescan screen switch. */
     if (!was_mounted && !library_rescan_active) {
         file_browser_reset_to_root();
         fallback_font_on_sd_mounted();
         reload_library_on_sd_reinsert();
+        gui_player_restore_sd_queue(false);
     } else if (!boot_library_recheck_done) {
         boot_library_recheck_done = true;
         fallback_font_on_sd_mounted();
@@ -3850,10 +3855,24 @@ void poll_sd_card_hotplug(void) {
             file_browser_reset_to_root();
             reload_library_on_sd_reinsert();
         }
+        /* Covers the boot-time mount race this whole branch exists for: the
+         * card genuinely was NOT YET mounted when gui_init() ran its own
+         * SD-restore attempt (both use the same sd_card_root_is_mounted()
+         * check), but became mounted by this first poll. This is the only
+         * other place a "the card actually showed up right after boot"
+         * restore can happen --
+         * boot_library_recheck_done's one-shot guard means this fires at
+         * most once per run. */
+        gui_player_restore_sd_queue(true);
     }
     was_mounted = true;
 }
 #else
+bool sd_card_root_is_mounted(void) {
+    struct stat st;
+    return stat(MUSIC_ROOT_DIR, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 void poll_sd_card_hotplug(void) {
 }
 #endif

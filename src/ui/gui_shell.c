@@ -1596,7 +1596,6 @@ static bool drag_adjust_press_owned = false;
 static int32_t quick_drawer_drag_touch_start_y = 0;
 static int32_t quick_drawer_drag_panel_start_y = 0;
 static int32_t quick_drawer_last_velocity = 0;
-#define QUICK_DRAWER_FLICK_VELOCITY 12 /* px/tick (~750px/s at the ~16ms poll rate) -- fast enough to read as an intentional flick */
 #define QUICK_DRAWER_DRAG_DEADZONE 10 /* matches LVGL's own LV_INDEV_DEF_SCROLL_LIMIT -- see poll_quick_drawer_drag()'s comment */
 
 /* Swipe-up-to-Home tracking -- same live per-tick overlay as player_swipe_*
@@ -1624,7 +1623,6 @@ static int32_t home_swipe_last_v = 0;
 static int32_t home_swipe_last_velocity = 0;
 static slide_transition_ctx_t * home_swipe_ctx = NULL;
 #define HOME_SWIPE_DEADZONE 20 /* same scale/reasoning as PLAYER_SWIPE_DEADZONE/BACK_SWIPE_DEADZONE */
-#define HOME_SWIPE_FLICK_VELOCITY 12 /* same scale/reasoning as PLAYER_SWIPE_FLICK_VELOCITY */
 
 /* Swipe-left-to-player tracking -- same "raw indev polling, own dedicated
  * fast timer" reasoning as poll_quick_drawer_drag()'s own doc comment,
@@ -1652,7 +1650,6 @@ static int32_t player_swipe_last_v = 0; /* last sampled x (not necessarily prese
 static int32_t player_swipe_last_velocity = 0;
 static slide_transition_ctx_t * player_swipe_ctx = NULL;
 #define PLAYER_SWIPE_DEADZONE 20 /* px before judging direction -- comfortably under LVGL's own ~50px built-in gesture threshold (LV_INDEV_DEF_GESTURE_LIMIT) so this always claims a genuine left-swipe before LVGL's own dormant gesture recognition would have */
-#define PLAYER_SWIPE_FLICK_VELOCITY 12 /* same scale/reasoning as QUICK_DRAWER_FLICK_VELOCITY */
 
 /* Swipe-right-to-go-back -- same live per-tick overlay as player_swipe_*
  * above, mirrored in sign. Provisional until BACK_SWIPE_DEADZONE so a
@@ -1685,7 +1682,6 @@ static int32_t back_swipe_last_velocity = 0;
 static slide_transition_ctx_t * back_swipe_ctx = NULL;
 static lv_obj_t * back_swipe_target_scr = NULL;
 #define BACK_SWIPE_DEADZONE 20 /* same scale/reasoning as PLAYER_SWIPE_DEADZONE */
-#define BACK_SWIPE_FLICK_VELOCITY 12 /* same scale/reasoning as PLAYER_SWIPE_FLICK_VELOCITY */
 
 bool gui_shell_back_swipe_owns_press(void) {
     return back_swipe_owns_press;
@@ -1927,6 +1923,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         } else if (quick_drawer_open) {
             quick_drawer_drag_tracking = true;
             quick_drawer_drag_panel_start_y = quick_drawer_motion_y();
+            quick_drawer_last_velocity = 0; /* fresh drag, no leftover direction from a previous completed one -- same reset as home/player/back-swipe's own tracking-start */
         } else if (p.y <= QUICK_DRAWER_TRIGGER_ZONE && !gui_library_navigation_blocked() &&
                    lv_screen_active() != gui_lock_screen_get_screen()) {
             /* gui_library_navigation_blocked() only covers modal library
@@ -1937,6 +1934,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
              * dragged closed again. */
             quick_drawer_drag_tracking = true;
             quick_drawer_drag_panel_start_y = quick_drawer_motion_y();
+            quick_drawer_last_velocity = 0; /* fresh drag -- see the other branch's own comment */
             lv_obj_move_foreground(quick_drawer); /* above regular screens/volume popup while dragging into view */
             lv_obj_move_foreground(status_bar_band); /* but the status bar stays above THAT -- see open_quick_drawer()'s comment */
         } else {
@@ -1964,8 +1962,20 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * exclusions just above: text-entry, Import via Wi-Fi, and the busy
          * overlay all skip finalize_screen_navigation() because leaving
          * them needs teardown (in-progress input, import_web_stop(),
-         * modal ownership) that a stack-only reset to Home would bypass. */
-        home_swipe_candidate = !drag_adjust_press_owned && gesture_home_state_is_eligible(&home_cfg, p.y) &&
+         * modal ownership) that a stack-only reset to Home would bypass.
+         *
+         * Deliberately NOT gated on drag_adjust_press_owned (unlike player-
+         * swipe/back-swipe below): home_indicator_band already sits on
+         * lv_layer_top(), CLICKABLE, sized to this exact band, so nothing on
+         * the active screen can genuinely receive a press inside this strip.
+         * point_in_swipe_dead_zone() is purely coordinate-based with no
+         * z-order awareness, so it was vetoing this gesture whenever some
+         * OTHER, actually-covered widget's registered dead zone happened to
+         * overlap this band's coordinates -- e.g. a bottom-aligned EQ screen
+         * or a plugin slider card extending into the last ~31px of the
+         * screen. Keep this ungated so the indicator band's own hitbox keeps
+         * real priority over whatever is positioned underneath it. */
+        home_swipe_candidate = gesture_home_state_is_eligible(&home_cfg, p.y) &&
                                 lv_screen_active() != gui_text_input_get_screen() &&
                                 lv_screen_active() != gui_network_get_import_wifi_screen() &&
                                 lv_screen_active() != gui_busy_get_screen();
@@ -2167,10 +2177,22 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         int32_t v = p.y - home_swipe_touch_start_y;
         if (v > 0) v = 0;  /* never past fully-closed (finger drifting back down just holds at 0) */
         if (v < -h) v = -h; /* never past fully-off (finger overshooting up of a full screen height) */
-        home_swipe_last_velocity = v - home_swipe_last_v;
+        /* Sticky velocity: only overwrite on an actual per-tick move. A real
+         * finger decelerates to a near-zero last-tick delta right before it
+         * lifts (that's how a deliberate slow drag naturally ends), so
+         * clobbering the last direction with that final stall/zero tick would
+         * make the halfway-position fallback fire on most slow drags, not
+         * just genuinely-still releases. Holding the last nonzero delta
+         * across a zero-delta tick is what makes "continue in the last
+         * registered direction" mean the last real movement, not the last
+         * sample. */
+        int32_t home_swipe_delta = v - home_swipe_last_v;
+        if (home_swipe_delta != 0) home_swipe_last_velocity = home_swipe_delta;
         home_swipe_last_v = v;
-        /* last_v/last_velocity always stay current (a release landing on
-         * this exact tick must still see accurate flick/halfway state) --
+        /* last_v always stays current every tick, and last_velocity holds
+         * the last real (nonzero) direction (a release landing on this
+         * exact tick must still see the accurate last direction/halfway
+         * state) --
          * only the frame PRESENT is skipped, on the same tick begin_slide_
          * transition_ex() ran on. See home_swipe_just_confirmed's own
          * comment at its declaration. */
@@ -2186,7 +2208,10 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         int32_t v = p.x - player_swipe_touch_start_x;
         if (v > 0) v = 0;   /* never past fully-open (finger drifting back right of the start point just holds at 0) */
         if (v < -w) v = -w; /* never past fully-off (finger overshooting left of a full screen width) */
-        player_swipe_last_velocity = v - player_swipe_last_v;
+        /* Sticky velocity -- see home_swipe's own comment on this same
+         * pattern just above. */
+        int32_t player_swipe_delta = v - player_swipe_last_v;
+        if (player_swipe_delta != 0) player_swipe_last_velocity = player_swipe_delta;
         player_swipe_last_v = v;
         if (player_swipe_just_confirmed) {
             player_swipe_just_confirmed = false;
@@ -2200,7 +2225,10 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         int32_t v = p.x - back_swipe_touch_start_x;
         if (v < 0) v = 0;  /* never past fully-closed (finger drifting back left of the start point just holds at 0) */
         if (v > w) v = w;  /* never past fully-off (finger overshooting right of a full screen width) */
-        back_swipe_last_velocity = v - back_swipe_last_v;
+        /* Sticky velocity -- see home_swipe's own comment on this same
+         * pattern just above. */
+        int32_t back_swipe_delta = v - back_swipe_last_v;
+        if (back_swipe_delta != 0) back_swipe_last_velocity = back_swipe_delta;
         back_swipe_last_v = v;
         if (back_swipe_just_confirmed) {
             back_swipe_just_confirmed = false;
@@ -2237,24 +2265,30 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
              * this function already reads, not a second/possibly-
              * differently-timed source. */
             if (!quick_drawer_bitmap_motion) quick_drawer_begin_bitmap_motion();
-            quick_drawer_last_velocity = new_y - quick_drawer_motion_y();
+            /* Sticky velocity -- see home_swipe's own comment on this same
+             * pattern above. A zero-delta tick (finger momentarily still, or
+             * settled back within the deadzone below) must not clobber the
+             * last real direction, since a deliberate slow drag naturally
+             * decelerates to near-zero right before it lifts. */
+            int32_t quick_drawer_delta = new_y - quick_drawer_motion_y();
+            if (quick_drawer_delta != 0) quick_drawer_last_velocity = quick_drawer_delta;
             quick_drawer_anim_y_cb(quick_drawer, new_y);
-        } else {
-            quick_drawer_last_velocity = 0;
         }
     }
 
     if (!pressed && quick_drawer_was_pressed && quick_drawer_drag_tracking) {
-        /* Settle decision on release: fast flicks snap based on exit velocity;
-         * otherwise snaps based on whether position crossed the halfway mark. */
+        /* Settle decision on release: any registered direction at the exact
+         * moment of release wins, however slow; only a perfectly still
+         * release (zero exit velocity) falls back to whichever side of the
+         * halfway mark the panel was on. */
         quick_drawer_drag_tracking = false;
         bool snap_open;
-        if (quick_drawer_last_velocity > QUICK_DRAWER_FLICK_VELOCITY) {
-            snap_open = true; /* still moving down at release */
-        } else if (quick_drawer_last_velocity < -QUICK_DRAWER_FLICK_VELOCITY) {
-            snap_open = false; /* still moving up at release */
+        if (quick_drawer_last_velocity > 0) {
+            snap_open = true; /* still moving down (toward open) at release, however slowly */
+        } else if (quick_drawer_last_velocity < 0) {
+            snap_open = false; /* still moving up (toward closed) at release, however slowly */
         } else {
-            snap_open = quick_drawer_motion_y() > -h / 2;
+            snap_open = quick_drawer_motion_y() > -h / 2; /* perfectly still at release -- fall back to position */
         }
         /* open_quick_drawer()/close_quick_drawer() animate from the
          * drawer's CURRENT (mid-drag) position, so forcing quick_drawer_open
@@ -2273,12 +2307,12 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         home_swipe_tracking = false;
         int32_t current_v = home_swipe_last_v;
         bool commit;
-        if (home_swipe_last_velocity < -HOME_SWIPE_FLICK_VELOCITY) {
-            commit = true; /* still moving up fast at release */
-        } else if (home_swipe_last_velocity > HOME_SWIPE_FLICK_VELOCITY) {
-            commit = false; /* still moving back down fast at release */
+        if (home_swipe_last_velocity < 0) {
+            commit = true; /* still moving up (toward Home) at release, however slowly */
+        } else if (home_swipe_last_velocity > 0) {
+            commit = false; /* still moving back down (toward cancel) at release, however slowly */
         } else {
-            commit = current_v < -h / 2; /* past halfway, slow/undecided release */
+            commit = current_v < -h / 2; /* perfectly still at release -- fall back to position */
         }
         home_swipe_ctx->commit = commit;
         if (commit) {
@@ -2301,7 +2335,7 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     }
 
     if (!pressed && quick_drawer_was_pressed && player_swipe_tracking) {
-        /* Finger lifted mid-swipe. Same flick-vs-halfway decision as the
+        /* Finger lifted mid-swipe. Same direction-vs-halfway decision as the
          * drawer's own release logic just above, just horizontal. */
         player_swipe_tracking = false;
         int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
@@ -2312,12 +2346,12 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
          * framebuffer compositing is active. */
         int32_t current_v = player_swipe_last_v;
         bool commit;
-        if (player_swipe_last_velocity < -PLAYER_SWIPE_FLICK_VELOCITY) {
-            commit = true; /* still moving left fast at release */
-        } else if (player_swipe_last_velocity > PLAYER_SWIPE_FLICK_VELOCITY) {
-            commit = false; /* still moving back right fast at release */
+        if (player_swipe_last_velocity < 0) {
+            commit = true; /* still moving left (toward Player) at release, however slowly */
+        } else if (player_swipe_last_velocity > 0) {
+            commit = false; /* still moving back right (toward cancel) at release, however slowly */
         } else {
-            commit = current_v < -w / 2; /* past halfway, slow/undecided release */
+            commit = current_v < -w / 2; /* perfectly still at release -- fall back to position */
         }
         player_swipe_ctx->commit = commit;
         if (commit) {
@@ -2347,12 +2381,12 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         int32_t w = lv_display_get_horizontal_resolution(lv_display_get_default());
         int32_t current_v = back_swipe_last_v;
         bool commit;
-        if (back_swipe_last_velocity > BACK_SWIPE_FLICK_VELOCITY) {
-            commit = true; /* still moving right fast at release */
-        } else if (back_swipe_last_velocity < -BACK_SWIPE_FLICK_VELOCITY) {
-            commit = false; /* still moving back left fast at release */
+        if (back_swipe_last_velocity > 0) {
+            commit = true; /* still moving right (toward Back) at release, however slowly */
+        } else if (back_swipe_last_velocity < 0) {
+            commit = false; /* still moving back left (toward cancel) at release, however slowly */
         } else {
-            commit = current_v > w / 2; /* past halfway, slow/undecided release */
+            commit = current_v > w / 2; /* perfectly still at release -- fall back to position */
         }
         back_swipe_ctx->commit = commit;
         if (commit) {

@@ -88,6 +88,7 @@ void start_power_off_countdown(void);
 void poll_power_off_countdown(void);
 void build_power_off_countdown_popup(void);
 void poll_sd_card_hotplug(void);
+bool sd_card_root_is_mounted(void);
 
 void gui_library_resume_fast_timers(void);
 void gui_library_reset_drag_state(void);

@@ -12,14 +12,20 @@
 #define ALBUMART_THUMBNAIL_SIZE 72
 #define ALBUMART_PLAYER_CACHE_SIZE 480
 
-/* POSIX port of Rockbox apps/recorder/albumart.c (GPLv2+).
- * Search order matches find_albumart()/search_albumart_files():
+/* POSIX port of Rockbox apps/recorder/albumart.c (GPLv2+), extended with a
+ * multi-disc fallback (own repo addition, not present in upstream Rockbox).
+ * Search order matches find_albumart()/search_albumart_files(), plus that
+ * extension:
  *   ./<track><size>.{jpeg,jpg,png,bmp}
  *   ./<album><size>.{jpeg,jpg,png,bmp}
  *   ./cover<size>.{jpeg,jpg,png,bmp}
  *   ./folder.{jpg,jpeg,png}  (unsized pass only)
  *   <musicroot>/.open_hiby_player/albumart/<artist>-<album><size>.{jpeg,jpg,png,bmp}
- *   same album/cover names in the parent directory
+ *   same album/cover/folder names in the parent directory
+ *   (unsized only) if this directory's name looks like a disc marker
+ *   ("CD1", "Disc 2", "disk_03", ...), the same album/cover/folder names
+ *   in the lexicographically-first sibling directory (under the same
+ *   parent) whose name also looks like a disc marker and that has art
  * <size> is ".WxH" or empty for a generic file. */
 
 typedef struct {

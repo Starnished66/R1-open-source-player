@@ -12,16 +12,6 @@
 
 #define POWER_SUPPLY_DIR "/sys/class/power_supply"
 
-/* On the R3Pro II, the "battery" power-supply node's own "status" attribute
- * is stuck reporting "Discharging" even while actually charging (its
- * "capacity" attribute is unaffected and stays accurate). The MP2731
- * charger IC exposes its own power-supply node with a correct "status"
- * attribute, so that node is used for status specifically on this board --
- * see charge_limiter.c's own BOARD_R3PROII gating for the same charger. */
-#if defined(BOARD_R3PROII)
-#define MP2731_CHARGER_DEVICE "mp2731-charger"
-#endif
-
 /* Reads a single-line sysfs attribute (e.g. ".../battery/capacity") into
  * `out`, trimming the trailing newline. Returns false if the file doesn't
  * exist or is empty -- normal on host, where none of this exists at all. */
@@ -199,7 +189,8 @@ static bool refresh_battery_cache_locked(void) {
     cached_capacity = atoi(capacity_str);
 
     /* Status comes from a separate, independent node on R3 Pro II (see
-     * MP2731_CHARGER_DEVICE's own comment above) -- a transient failure to
+     * MP2731_CHARGER_DEVICE's own comment in board_config.h) -- a transient
+     * failure to
      * read IT must not blank out the capacity we just successfully read.
      * Leave cached_status at whatever it was (stale-but-better-than-
      * pretending-no-data-exists-at-all); it refreshes on the next

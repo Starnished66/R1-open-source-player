@@ -2137,12 +2137,17 @@ static bool write_all(int fd, const void * src, size_t size) {
     return true;
 }
 
-static bool metadata_artwork_limit_memory(void) {
+static bool metadata_artwork_limit_memory(artwork_priority_t prio) {
     /* Bound ALL parser allocations, including third-party container readers.
      * The limit is headroom, not an allocation: a small picture only uses
-     * its actual bytes. Keep the same 8 MiB system reserve as the warmer. */
+     * its actual bytes. Reserve matches the CALLER's real priority (see
+     * artwork_reserve_bytes_for_priority()'s own comment) -- this used to
+     * always use the warmer's own 8 MiB reserve regardless of priority,
+     * refusing to even attempt an interactive PRIO_PLAYER extraction under
+     * the same ~9MB-available threshold that only the background warmer
+     * should be held to. */
     size_t available = system_get_mem_available_bytes();
-    const size_t reserve = 8U * 1024U * 1024U;
+    const size_t reserve = artwork_reserve_bytes_for_priority(prio);
     if (available <= reserve + 1024U * 1024U) return false;
     size_t budget = available - reserve;
     if (budget > 12U * 1024U * 1024U) budget = 12U * 1024U * 1024U;
@@ -2160,9 +2165,9 @@ static bool metadata_artwork_limit_memory(void) {
     return setrlimit(RLIMIT_AS, &limit) == 0;
 }
 
-int metadata_artwork_helper_run(const char * path, int output_fd) {
+int metadata_artwork_helper_run(const char * path, int output_fd, artwork_priority_t prio) {
     if (!path || !path[0] || output_fd < 0) return 1;
-    if (!metadata_artwork_limit_memory()) return 1;
+    if (!metadata_artwork_limit_memory(prio)) return 1;
     artwork_only = true;
 
     /* This process is disposable; under unexpected memory pressure the
@@ -2199,7 +2204,8 @@ int metadata_artwork_helper_run(const char * path, int output_fd) {
 
 static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char * path,
                                                                      track_metadata_t * out,
-                                                                     int timeout_ms) {
+                                                                     int timeout_ms,
+                                                                     artwork_priority_t prio) {
     memset(out, 0, sizeof(*out));
     if (!path || !path[0] || timeout_ms <= 0) return METADATA_ARTWORK_TEMPORARY_FAILURE;
 
@@ -2211,6 +2217,13 @@ static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char 
     if (pipe(pipefd) != 0) return METADATA_ARTWORK_TEMPORARY_FAILURE;
     char output_fd_arg[24];
     snprintf(output_fd_arg, sizeof(output_fd_arg), "%d", pipefd[1]);
+    /* Formatted here, before fork() -- snprintf() in the freshly-forked
+     * (but still address-space-copied, pre-exec) child would run in a
+     * process that inherited every lock this multithreaded parent might
+     * have held mid-acquire; safer to have both argv strings ready in the
+     * parent and just execv() them across. */
+    char prio_arg[8];
+    snprintf(prio_arg, sizeof(prio_arg), "%d", (int) prio);
     pid_t pid = fork();
     if (pid < 0) {
         close(pipefd[0]);
@@ -2225,6 +2238,7 @@ static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char 
             (char *) "--metadata-artwork-helper",
             output_fd_arg,
             (char *) path,
+            prio_arg,
             NULL,
         };
         execv("/proc/self/exe", argv);
@@ -2245,8 +2259,11 @@ static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char 
     }
     if (ok && result.picture_size > 0) {
         /* The helper still owns its copy. Charge only the additional copy
-         * against current free memory, not a fixed worst-case tag size. */
-        picture = artwork_check_memory_admission(ARTWORK_PRIO_WARMER, result.picture_size)
+         * against current free memory, not a fixed worst-case tag size --
+         * against the CALLER's real reserve (`prio`), not always the
+         * warmer's own stricter one (see this function's own header
+         * comment). */
+        picture = artwork_check_memory_admission(prio, result.picture_size)
             ? malloc(result.picture_size) : NULL;
         ok = picture && read_with_deadline(pipefd[0], picture, result.picture_size, &start, timeout_ms);
     }
@@ -2283,12 +2300,13 @@ static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char 
 
 metadata_artwork_result_t metadata_read_artwork_isolated(const char * path,
                                                          track_metadata_t * out,
-                                                         int timeout_ms) {
+                                                         int timeout_ms,
+                                                         artwork_priority_t prio) {
     if (!out) return METADATA_ARTWORK_TEMPORARY_FAILURE;
     memset(out, 0, sizeof(*out));
     pthread_mutex_lock(&artwork_isolation_mutex);
     metadata_artwork_result_t result =
-        metadata_read_artwork_isolated_impl(path, out, timeout_ms);
+        metadata_read_artwork_isolated_impl(path, out, timeout_ms, prio);
     pthread_mutex_unlock(&artwork_isolation_mutex);
     return result;
 }

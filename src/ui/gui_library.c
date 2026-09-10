@@ -1120,6 +1120,14 @@ static int album_thumbnail_result_generation;
 static int album_thumbnail_result_logical_index;
 static lv_obj_t * album_thumbnail_result_list;
 static uint8_t * album_thumbnail_result_pixels;
+/* Set alongside result_pixels in album_thumbnail_thread_func(), valid only
+ * when result_pixels is NULL (a failed decode) -- lets album_thumbnail_poll_cb()
+ * ask artwork_failure_cache_is_blocked() whether THIS specific failure (already
+ * recorded by album_thumbnail_load_or_decode_ex() on every one of its own
+ * exit paths) was temporary or permanent, instead of caching every failure as
+ * a permanent "no art" the way an unconditional `known = true` used to. */
+static time_t album_thumbnail_result_source_mtime;
+static bool album_thumbnail_result_have_source_mtime;
 static lv_timer_t * album_thumbnail_poll_timer;
 static album_thumbnail_request_t album_thumbnail_queue[ALBUM_THUMBNAIL_QUEUE_SIZE];
 static atomic_bool album_thumbnail_screen_active;
@@ -1301,6 +1309,31 @@ static cover_decode_result_t album_thumbnail_pixels_from_source(
  * failure, cancellation) -- a caller keying a negative cache off this must
  * not do so on a transient false, or a passing resource hiccup would
  * permanently hide art that is actually there. */
+/* Shared by both sources below: decodes+stores the 480px player cache from
+ * BORROWED `data`/`size` (caller still owns and must free it) and, on
+ * success, resizes it into *out_pixels for immediate display. Deliberately
+ * makes no negative-cache/"no art confirmed" decision of its own -- source
+ * selection, input ownership, and confirmation semantics all stay the
+ * caller's responsibility, since a permanent failure decoding ONE source
+ * must not by itself confirm "no art anywhere" while another source still
+ * has a chance (see gui_library_generate_player_cover()'s own comment). */
+static cover_decode_result_t generate_player_cover_from_data(
+        const albumart_info_t * info, const uint8_t * data, uint32_t size,
+        artwork_cancel_fn cancel_cb, void * user_data, uint16_t ** out_pixels) {
+    uint16_t * cache_pixels = NULL;
+    cover_decode_result_t res = cover_decode_to_rgb565_ex(
+        data, size, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX,
+        ARTWORK_PRIO_PLAYER, cancel_cb, user_data, &cache_pixels);
+    if (res == COVER_DECODE_OK && cache_pixels) {
+        albumart_store_rgb565(info, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX, cache_pixels);
+        *out_pixels = cover_resize_rgb565(cache_pixels, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX,
+                                          COVER_ART_WIDTH, COVER_ART_HEIGHT);
+        if (!*out_pixels) res = COVER_DECODE_FAIL_ALLOC;
+    }
+    free(cache_pixels);
+    return res;
+}
+
 bool gui_library_generate_player_cover(const char * track_path, const char * artist,
                                        const char * album, const char * album_artist,
                                        artwork_cancel_fn cancel_cb, void * user_data,
@@ -1315,66 +1348,71 @@ bool gui_library_generate_player_cover(const char * track_path, const char * art
     snprintf(info.album, sizeof(info.album), "%s", album ? album : "");
     snprintf(info.albumartist, sizeof(info.albumartist), "%s", album_artist ? album_artist : "");
 
-    uint8_t * data = NULL;
-    uint32_t size = 0;
-
-    bool from_sidecar = false;
+    /* Step 1: try an external sidecar file first. A permanent DECODE failure
+     * here (corrupt/oversized/unsupported -- as opposed to merely failing
+     * to LOAD, or a transient/cancelled result) falls through to embedded
+     * extraction below instead of giving up -- this function used to keep
+     * whatever sidecar bytes loaded and never attempt embedded art at all
+     * once ALBUMART_LOAD_OK was seen, permanently hiding real embedded art
+     * behind one corrupt sidecar file. */
     char found[PATH_MAX];
     if (albumart_search_files(&info, "", found, sizeof(found))) {
-        albumart_load_result_t load = albumart_load_file_ex(found, &data, &size,
+        uint8_t * sidecar_data = NULL;
+        uint32_t sidecar_size = 0;
+        albumart_load_result_t load = albumart_load_file_ex(found, &sidecar_data, &sidecar_size,
                                                              THUMBNAIL_SIDECAR_MAX_BYTES, ARTWORK_PRIO_PLAYER);
         if (load == ALBUMART_LOAD_TEMPORARY) return false; /* transient -- do not confirm "no art" */
-        if (load == ALBUMART_LOAD_OK) from_sidecar = true;
-        else { data = NULL; size = 0; }
+        if (load == ALBUMART_LOAD_OK) {
+            DB_LOG("ART_PLAYER", "generate_source path=%s source=sidecar", track_path);
+            cover_decode_result_t res = generate_player_cover_from_data(
+                &info, sidecar_data, sidecar_size, cancel_cb, user_data, out_pixels);
+            free(sidecar_data);
+            if (res == COVER_DECODE_OK && *out_pixels) return true;
+            if (res == COVER_DECODE_FAIL_CANCELLED) return false;
+            if (cover_decode_result_is_temporary(res)) return false; /* transient -- do not confirm "no art" */
+            /* Permanent sidecar decode failure -- fall through to embedded
+             * extraction. Must NOT confirm "no art" here on its own; only
+             * the fully-exhausted embedded path below may do that. */
+        }
+        /* ALBUMART_LOAD_INVALID (missing/unreadable/oversized) also falls
+         * through here with no special-casing needed. */
     }
 
-    metadata_artwork_result_t artwork_result = METADATA_ARTWORK_NOT_FOUND;
-    if (!data || size == 0) {
-        artwork_acquire_result_t admission = artwork_coordinator_acquire(
-            ARTWORK_PRIO_PLAYER, ALBUM_ART_METADATA_START_BYTES, 300, cancel_cb, user_data);
-        if (admission != ARTWORK_ACQUIRE_OK) return false; /* transient -- coordinator busy/cancelled */
-        track_metadata_t meta;
-        memset(&meta, 0, sizeof(meta));
-        artwork_result = metadata_read_artwork_isolated(track_path, &meta, ALBUM_ART_METADATA_TIMEOUT_MS);
-        artwork_coordinator_release(ARTWORK_PRIO_PLAYER);
-        data = meta.picture_data;
-        size = meta.picture_size;
-        free(meta.lyrics);
-        if (!info.artist[0]) snprintf(info.artist, sizeof(info.artist), "%s", meta.artist);
-        if (!info.album[0]) snprintf(info.album, sizeof(info.album), "%s", meta.album);
-        if (!info.albumartist[0]) snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
-    }
+    /* Step 2: embedded picture from the audio file's own tags. Reached when
+     * there's no sidecar, the sidecar failed to load, or it loaded but
+     * failed to decode permanently. */
+    artwork_acquire_result_t admission = artwork_coordinator_acquire(
+        ARTWORK_PRIO_PLAYER, ALBUM_ART_METADATA_START_BYTES, 300, cancel_cb, user_data);
+    if (admission != ARTWORK_ACQUIRE_OK) return false; /* transient -- coordinator busy/cancelled */
+    track_metadata_t meta;
+    memset(&meta, 0, sizeof(meta));
+    metadata_artwork_result_t artwork_result = metadata_read_artwork_isolated(
+        track_path, &meta, ALBUM_ART_METADATA_TIMEOUT_MS, ARTWORK_PRIO_PLAYER);
+    artwork_coordinator_release(ARTWORK_PRIO_PLAYER);
+    uint8_t * embedded_data = meta.picture_data;
+    uint32_t embedded_size = meta.picture_size;
+    free(meta.lyrics);
+    if (!info.artist[0]) snprintf(info.artist, sizeof(info.artist), "%s", meta.artist);
+    if (!info.album[0]) snprintf(info.album, sizeof(info.album), "%s", meta.album);
+    if (!info.albumartist[0]) snprintf(info.albumartist, sizeof(info.albumartist), "%s", meta.album_artist);
 
-    if (!data || size == 0) {
-        free(data);
+    if (!embedded_data || embedded_size == 0) {
+        free(embedded_data);
         /* Confirmed empty only if the embedded-picture helper actually ran
          * to completion and found nothing (or found something invalid) --
-         * not if it merely failed to run (fork/pipe/timeout). A corrupt or
-         * unreadable sidecar file still falls through to that embedded
-         * check above (data/size stay NULL/0), so reaching here already
-         * means embedded extraction had its chance regardless of whether a
-         * sidecar file existed. */
+         * not if it merely failed to run (fork/pipe/timeout). Reaching here
+         * already means embedded extraction had its chance regardless of
+         * whether a sidecar file existed or how it failed. */
         if (out_no_art_confirmed && (artwork_result == METADATA_ARTWORK_NOT_FOUND ||
                                      artwork_result == METADATA_ARTWORK_INVALID))
             *out_no_art_confirmed = true;
         return false;
     }
 
-    DB_LOG("ART_PLAYER", "generate_source path=%s source=%s", track_path,
-           from_sidecar ? "sidecar" : "embedded");
-
-    uint16_t * cache_pixels = NULL;
-    cover_decode_result_t res = cover_decode_to_rgb565_ex(
-        data, size, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX,
-        ARTWORK_PRIO_PLAYER, cancel_cb, user_data, &cache_pixels);
-    if (res == COVER_DECODE_OK && cache_pixels) {
-        albumart_store_rgb565(&info, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX, cache_pixels);
-        *out_pixels = cover_resize_rgb565(cache_pixels, ALBUM_PLAYER_CACHE_PX, ALBUM_PLAYER_CACHE_PX,
-                                          COVER_ART_WIDTH, COVER_ART_HEIGHT);
-        if (!*out_pixels) res = COVER_DECODE_FAIL_ALLOC;
-    }
-    free(cache_pixels);
-    free(data);
+    DB_LOG("ART_PLAYER", "generate_source path=%s source=embedded", track_path);
+    cover_decode_result_t res = generate_player_cover_from_data(
+        &info, embedded_data, embedded_size, cancel_cb, user_data, out_pixels);
+    free(embedded_data);
     if (res != COVER_DECODE_OK && out_no_art_confirmed && cover_decode_result_is_permanent(res))
         *out_no_art_confirmed = true; /* corrupt/oversized source -- won't change until re-tagged */
     return res == COVER_DECODE_OK;
@@ -1461,12 +1499,20 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
             uint16_t * player_pixels = NULL;
             cover_decode_result_t player_res = album_thumbnail_maybe_store_player_cache(
                 &info, data, size, prio, cancel_cb, user_data, &player_pixels);
-            if (cover_decode_result_is_temporary(player_res)) {
+            if (player_res == COVER_DECODE_FAIL_CANCELLED) {
                 free(player_pixels);
                 free(data);
-                artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
                 return false;
             }
+            /* Any OTHER temporary player-cache failure (memory admission,
+             * coordinator busy) must not abort the whole attempt --
+             * player_pixels is already NULL on any player_res failure (see
+             * album_thumbnail_maybe_store_player_cache()'s own contract), so
+             * falling through to the much smaller thumbnail-only decode
+             * below costs nothing extra and can very plausibly still
+             * succeed under the same pressure that blocked the larger 480px
+             * attempt. Only the outcome of THAT decode (checked below) gets
+             * recorded/returned. */
             cover_decode_result_t res = album_thumbnail_pixels_from_source(
                 data, size, player_pixels, prio, cancel_cb, user_data, out_pixels);
             free(player_pixels);
@@ -1499,7 +1545,7 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     track_metadata_t meta;
     memset(&meta, 0, sizeof(meta));
     metadata_artwork_result_t metadata_result =
-        metadata_read_artwork_isolated(song->path, &meta, ALBUM_ART_METADATA_TIMEOUT_MS);
+        metadata_read_artwork_isolated(song->path, &meta, ALBUM_ART_METADATA_TIMEOUT_MS, prio);
     artwork_coordinator_release(prio);
     data = meta.picture_data;
     size = meta.picture_size;
@@ -1512,12 +1558,14 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
         uint16_t * player_pixels = NULL;
         cover_decode_result_t player_res = album_thumbnail_maybe_store_player_cache(
             &info, data, size, prio, cancel_cb, user_data, &player_pixels);
-        if (cover_decode_result_is_temporary(player_res)) {
+        if (player_res == COVER_DECODE_FAIL_CANCELLED) {
             free(player_pixels);
             free(data);
-            artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
             return false;
         }
+        /* See the mirrored sidecar-path comment above (Step 2) -- any OTHER
+         * temporary player-cache failure falls through to the smaller
+         * thumbnail-only decode instead of aborting immediately. */
         cover_decode_result_t res = album_thumbnail_pixels_from_source(
             data, size, player_pixels, prio, cancel_cb, user_data, out_pixels);
         free(player_pixels);
@@ -1567,8 +1615,19 @@ static void * album_thumbnail_thread_func(void * arg) {
                (long long) req->song_id, req->logical_index, req->generation, db_log_rss_kb());
     uint16_t * pixels = NULL;
     song_row_t song;
-    if (metadata_db_get_song_by_id(req->song_id, &song))
+    album_thumbnail_result_have_source_mtime = false;
+    if (metadata_db_get_song_by_id(req->song_id, &song)) {
         album_thumbnail_load_or_decode(&song, req->generation, &pixels);
+        if (!pixels) {
+            /* Only needed to look up the failure this decode already
+             * recorded (see result_source_mtime's own comment) -- skip the
+             * work entirely on success. */
+            albumart_info_t info;
+            albumart_info_from_song_row(&song, &info);
+            album_thumbnail_result_source_mtime = album_source_mtime(&song, &info);
+            album_thumbnail_result_have_source_mtime = true;
+        }
+    }
     album_thumbnail_result_song_id = req->song_id;
     album_thumbnail_result_generation = req->generation;
     album_thumbnail_result_logical_index = req->logical_index;
@@ -1919,18 +1978,41 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
             free(retired_pixels);
         }
         memset(e, 0, sizeof(*e));
-        e->song_id = album_thumbnail_result_song_id;
-        e->known = true;
-        e->pixels = album_thumbnail_result_pixels;
-        e->last_use = ++album_thumbnail_use_counter;
-        if (e->pixels) {
-            e->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-            e->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-            e->dsc.header.w = ALBUM_THUMBNAIL_PX;
-            e->dsc.header.h = ALBUM_THUMBNAIL_PX;
-            e->dsc.header.stride = ALBUM_THUMBNAIL_PX * 2;
-            e->dsc.data = e->pixels;
-            e->dsc.data_size = ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2;
+        /* A failed decode (pixels == NULL) is only worth caching as a durable
+         * "known, no art" entry if album_thumbnail_load_or_decode_ex() itself
+         * already recorded it as PERMANENT (corrupt/oversized/genuinely
+         * absent source). A TEMPORARY failure (memory admission, coordinator
+         * busy, a cancelled/preempted decode) must NOT be cached here the
+         * same way -- album_thumbnail_cache_find()'s only gate is `known`,
+         * so caching it at all previously made a transient hiccup permanent
+         * for this song for the rest of this cache slot's lifetime, with no
+         * retry until unrelated LRU pressure happened to evict it. Leaving
+         * the slot at its just-memset "unused" state (known=false) instead
+         * lets queue_album_thumbnail() legitimately retry this song next
+         * time it scrolls back into view. */
+        bool commit_known = album_thumbnail_result_pixels != NULL;
+        if (!commit_known && album_thumbnail_result_have_source_mtime) {
+            artwork_fail_reason_t fail_reason = ARTWORK_FAIL_NONE;
+            if (artwork_failure_cache_is_blocked(album_thumbnail_result_song_id,
+                                                 album_thumbnail_result_source_mtime, &fail_reason) &&
+                fail_reason == ARTWORK_FAIL_PERMANENT) {
+                commit_known = true;
+            }
+        }
+        if (commit_known) {
+            e->song_id = album_thumbnail_result_song_id;
+            e->known = true;
+            e->pixels = album_thumbnail_result_pixels;
+            e->last_use = ++album_thumbnail_use_counter;
+            if (e->pixels) {
+                e->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+                e->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+                e->dsc.header.w = ALBUM_THUMBNAIL_PX;
+                e->dsc.header.h = ALBUM_THUMBNAIL_PX;
+                e->dsc.header.stride = ALBUM_THUMBNAIL_PX * 2;
+                e->dsc.data = e->pixels;
+                e->dsc.data_size = ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2;
+            }
         }
         album_thumbnail_result_pixels = NULL;
         result_applied = true;

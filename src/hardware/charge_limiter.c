@@ -33,11 +33,6 @@
  * is N=11: 200 + (11-8)*100 = 500. */
 #define AXP_CURRENT_CAP 0x0Bu
 
-#if defined(BOARD_R3PROII)
-#define HAS_MP2731 1
-#else
-#define HAS_MP2731 0
-#endif
 #define MP_BUS "/dev/i2c-0"
 #define MP_ADDR 0x4b
 #define MP_REG_CURRENT 0x05
@@ -46,21 +41,6 @@
 #define MP_CURRENT_CAP 0x04u
 #define MP_VOLTAGE_MASK 0xFEu
 
-/* True per-board stock charge-voltage targets -- NOT guessed or captured
- * from a live register read. Pulled directly from each board's own stock
- * firmware boot script (module_driver/axp2101.sh's "insmod axp2101.ko ...
- * charge_voltage_limit=<mV>" parameter, which the kernel driver reprograms
- * into AXP_REG_VOLTAGE unconditionally on every boot -- so there is nothing
- * to infer at runtime, and no ambiguity from a prior buggy build having left
- * the register at some other value):
- *   R1:        charge_voltage_limit=4350 -> AXP2101 enum 4 (4.35V)
- *   R3 Pro II: charge_voltage_limit=4400 -> AXP2101 enum 5 (4.40V)
- * AXP_REG_VOLTAGE's low 3 bits: 1=4.0V 2=4.1V 3=4.2V 4=4.35V 5=4.4V. */
-#if defined(BOARD_R3PROII)
-#define AXP_VOLTAGE_BASELINE 5u
-#else
-#define AXP_VOLTAGE_BASELINE 4u
-#endif
 /* R3 Pro II's dedicated charger IC, MP2731 -- its own stock boot script
  * (module_driver/mp2731.sh) sets "vbat_target=4400000" (4.4V), matching the
  * AXP2101's own 4.4V target on this board. 0xC8 (0b11001000) is this
@@ -125,7 +105,8 @@ static bool mp_write(uint8_t r, uint8_t v) { return xfer(MP_BUS, MP_ADDR, r, &v,
 #endif
 
 /* Only the charge-CURRENT registers need a captured baseline: unlike
- * voltage (see AXP_VOLTAGE_BASELINE/MP_VOLTAGE_BASELINE above), neither
+ * voltage (see board_config.h's AXP_VOLTAGE_BASELINE and MP_VOLTAGE_BASELINE
+ * above), neither
  * board's stock boot script pins a specific charge-current register value
  * -- it is whatever the chip's own factory/OTP default leaves it at, so
  * there is no known constant to hardcode and a live pre-cap read remains

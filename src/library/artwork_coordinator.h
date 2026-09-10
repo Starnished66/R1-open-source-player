@@ -84,6 +84,12 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
 /* Checks if MemAvailable satisfies (reserve + estimated_bytes). */
 bool artwork_check_memory_admission(artwork_priority_t prio, size_t estimated_bytes);
 
+/* The per-priority reserve artwork_check_memory_admission() itself uses --
+ * exported as the single source of truth for src/library/metadata.c's own
+ * child-process memory-ceiling use of the same reserve tiers. Unknown/
+ * out-of-range values return the most conservative (WARMER) reserve. */
+size_t artwork_reserve_bytes_for_priority(artwork_priority_t prio);
+
 /* Attempts to acquire the exclusive decode slot for the given priority and estimated memory.
  * Strictly guarantees priority ordering: Player beats Thumbnail, Thumbnail beats Warmer.
  * On ARTWORK_ACQUIRE_OK, caller MUST call artwork_coordinator_release(). */

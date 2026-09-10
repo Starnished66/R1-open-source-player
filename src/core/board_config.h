@@ -6,16 +6,20 @@
  * real, device-confirmed values, not placeholders:
  *   - R1: 480x800, this codebase's own long-standing confirmed value (see
  *     HARDWARE_DRIVERS.md and main.c's own history).
- *   - R3PROII: 480x720, confirmed via the extracted stock firmware dump
+ *   - R3PRO II: 480x720, confirmed via the extracted stock firmware dump
  *     (usr/resource/config.json's own "type":"screen","hor":480,"ver":720
  *     entry, independently corroborated by etc/logo.jpeg/logo1.jpeg/
  *     logo2.jpeg all measuring exactly 480x720 -- the same evidentiary
  *     standard src/bootloader/fb_draw.h's own comment already relies on:
- *     the boot splash is authored to exactly match the real panel). */
+ *     the boot splash is authored to exactly match the real panel).
+ *   - R3II 2025: 320x480 from the specs in hiby wiki. */
 #if defined(BOARD_R3PROII)
   #define BOARD_SCREEN_WIDTH  480
   #define BOARD_SCREEN_HEIGHT 720
-#else
+#elif defined(BOARD_R3II_2025)
+  #define BOARD_SCREEN_WIDTH  320
+  #define BOARD_SCREEN_HEIGHT 480
+#else // default to R1 config (though BOARD_R1 could be checked)
   #define BOARD_SCREEN_WIDTH  480
   #define BOARD_SCREEN_HEIGHT 800
 #endif
@@ -30,14 +34,19 @@
  * device's own real asset dimensions exactly, not an arbitrary split:
  *   - R1: default_cover_565.png is 480x480, buttom.png is 480x320
  *     (480+320=800, this codebase's own long-standing values).
- *   - R3PROII: confirmed directly from the extracted stock firmware's own
+ *   - R3Pro II: confirmed directly from the extracted stock firmware's own
  *     theme2 assets -- default_cover_565.png measures 480x460, buttom.png
  *     measures 480x260 (460+260=720). HiBy's own stock UI already solved
  *     this exact layout problem for this panel; these numbers are read
- *     from their asset files, not derived. */
+ *     from their asset files, not derived.
+ *   - R3II 2025: Confirmed by referencing buttom.png from v1.3 of
+ *     r3ii_2025.upt (320x170) and subtracting that from the screen height */
 #if defined(BOARD_R3PROII)
   #define BOARD_PLAYER_COVER_HEIGHT 460
   #define BOARD_PLAYER_OVERLAY_HEIGHT 260
+#elif defined(BOARD_R3II_2025)
+  #define BOARD_PLAYER_COVER_HEIGHT 310
+  #define BOARD_PLAYER_OVERLAY_HEIGHT 170
 #else
   #define BOARD_PLAYER_COVER_HEIGHT 480
   #define BOARD_PLAYER_OVERLAY_HEIGHT 320

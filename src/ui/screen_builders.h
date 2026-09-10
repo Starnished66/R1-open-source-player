@@ -155,6 +155,24 @@ typedef struct {
     bool has_bg_color;   uint32_t bg_color;   /* 0xRRGGBB */
     bool has_text_color; uint32_t text_color; /* 0xRRGGBB */
     bool has_radius;     int32_t radius;      /* px corner radius */
+
+    /* ---- Optional per-item LIST-MODE overrides, ignored entirely in tile
+     * mode -- build_launcher_menu_screen()'s own per-tile counterpart to its
+     * `layout` argument's shared fields (plugin.set_home_layout(), PLUGINS.md).
+     * Unset (false/0/NULL) means "use `layout`'s own shared value for this
+     * field instead", same convention has_bg_color/has_text_color/has_radius
+     * above already use. Music/Stream Media/Wireless (launcher_layout_config's
+     * screens) leave every one of these unset -- their own layout is
+     * genuinely uniform across every tile, so `layout` alone is enough.
+     * Only Home's build_home_screen() (gui_settings.c), whose per-tile
+     * plugin.set_home_layout() overrides can legitimately differ tile by
+     * tile, ever sets these. ---- */
+    bool has_row_height; int32_t row_height;
+    bool has_row_width;  int32_t row_width;
+    bool has_accessory;  bool accessory;
+    const char * text_size;  /* non-NULL overrides layout's own text_size */
+    const char * text_align; /* non-NULL overrides layout's own align */
+    bool has_icon; bool icon; /* whether THIS item's icon_asset should render at all */
 } icon_grid_item_t;
 
 /* Titled screen: real back-arrow button (top-left, invokes back_btn_cb) and

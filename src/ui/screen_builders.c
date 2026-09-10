@@ -1050,17 +1050,26 @@ lv_obj_t * build_launcher_menu_screen(const char * title, lv_event_cb_t back_btn
 
     pill_list_item_t rows[item_count];
     for (int i = 0; i < item_count; i++) {
+        bool accessory = items[i].has_accessory ? items[i].accessory
+                                                 : (layout->has_accessory && layout->accessory);
+        bool show_icon = items[i].has_icon ? items[i].icon : (layout->has_icon && layout->icon);
         rows[i] = (pill_list_item_t) {
             .label = items[i].label,
-            .accessory = layout->has_accessory && layout->accessory ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
+            .accessory = accessory ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
             .on_click = items[i].on_click, .user_data = items[i].user_data,
-            .icon_asset = layout->has_icon && layout->icon ? asset_path_plain(items[i].icon_asset) : NULL,
-            .row_height = layout->height, .row_width = layout->width,
-            .has_bg_color = layout->has_bg_color, .bg_color = layout->bg_color,
-            .has_text_color = layout->has_text_color, .text_color = layout->text_color,
-            .has_radius = layout->has_radius, .radius = layout->radius,
-            .text_size = layout->text_size[0] ? layout->text_size : NULL,
-            .text_align = layout->align[0] ? layout->align : NULL,
+            .icon_asset = show_icon ? asset_path_plain(items[i].icon_asset) : NULL,
+            .row_height = items[i].has_row_height ? items[i].row_height : layout->height,
+            .row_width = items[i].has_row_width ? items[i].row_width : layout->width,
+            .has_bg_color = items[i].has_bg_color || layout->has_bg_color,
+            .bg_color = items[i].has_bg_color ? items[i].bg_color : layout->bg_color,
+            .has_text_color = items[i].has_text_color || layout->has_text_color,
+            .text_color = items[i].has_text_color ? items[i].text_color : layout->text_color,
+            .has_radius = items[i].has_radius || layout->has_radius,
+            .radius = items[i].has_radius ? items[i].radius : layout->radius,
+            .text_size = items[i].text_size ? items[i].text_size
+                                             : (layout->text_size[0] ? layout->text_size : NULL),
+            .text_align = items[i].text_align ? items[i].text_align
+                                               : (layout->align[0] ? layout->align : NULL),
         };
     }
     return build_pill_list_screen(title, back_btn_cb, rows, item_count, gui_theme_accent_style(),

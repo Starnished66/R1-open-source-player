@@ -2157,33 +2157,41 @@ lv_obj_t * build_home_screen(void) {
      * THIS boot's plugin-load time (or the most recent plugin.refresh_
      * theme()/reload_ui()), never a live mid-session change outside that. */
     if (home_layout_config.configured && home_layout_config.list_mode) {
-        static pill_list_item_t items[HOME_LAYOUT_MAX_TILES];
+        static icon_grid_item_t items[HOME_LAYOUT_MAX_TILES];
         for (int i = 0; i < count; i++) {
             const home_tile_override_t * ov = resolved[i].override ? resolved[i].override : &zero_override;
-            /* asset_path_plain(), not asset_path() -- pill_row_apply_icon()
-             * (screen_builders.c) expects a raw filesystem path with no "S:"
-             * LVGL-driver prefix (it prepends that itself), exactly what
-             * asset_path_plain() returns; asset_path() itself is already
-             * "S:"-prefixed for direct lv_image_set_src() use and would
-             * double up here. */
-            const char * icon_path = (ov->has_icon && ov->icon) ? asset_path_plain(resolved[i].icon_asset) : NULL;
-            items[i] = (pill_list_item_t){
+            items[i] = (icon_grid_item_t){
+                .icon_asset = resolved[i].icon_asset,
                 .label = resolved[i].label,
-                .accessory = (ov->has_accessory && ov->accessory) ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
                 .on_click = resolved[i].on_click,
                 .user_data = resolved[i].user_data,
-                .icon_asset = icon_path,
-                .row_height = ov->height,
-                .row_width = ov->width,
-                .text_size = ov->text_size[0] ? ov->text_size : NULL,
                 .has_bg_color = ov->has_bg_color, .bg_color = ov->bg_color,
                 .has_text_color = ov->has_text_color, .text_color = ov->text_color,
                 .has_radius = ov->has_radius, .radius = ov->radius,
+                /* Every field below is a per-tile LIST-MODE override
+                 * (icon_grid_item_t's own doc comment, screen_builders.h) --
+                 * always supplied here (has_* = true) since Home's per-tile
+                 * defaults (no accessory/icon unless explicitly overridden)
+                 * differ from build_launcher_menu_screen()'s own layout-level
+                 * defaults, so there is no shared `layout` value worth
+                 * falling back to. */
+                .has_row_height = true, .row_height = ov->height,
+                .has_row_width = true, .row_width = ov->width,
+                .has_accessory = true, .accessory = ov->has_accessory && ov->accessory,
+                .text_size = ov->text_size[0] ? ov->text_size : NULL,
                 .text_align = ov->align[0] ? ov->align : NULL,
+                .has_icon = true, .icon = ov->has_icon && ov->icon,
             };
         }
-        lv_obj_t * scr = build_pill_list_screen(NULL, NULL, items, count, gui_theme_accent_style(),
-                                                 home_layout_config.row_gap > 0 ? home_layout_config.row_gap : 6, 100);
+
+        /* No per-screen style here (that lives entirely in each item's own
+         * override above) -- this layout only carries what's genuinely
+         * shared across every tile: list mode itself and the row gap. */
+        launcher_menu_layout_t home_list_layout = {
+            .list_mode = true,
+            .row_gap = home_layout_config.row_gap > 0 ? home_layout_config.row_gap : 6,
+        };
+        lv_obj_t * scr = build_launcher_menu_screen(NULL, NULL, items, count, 100, false, &home_list_layout);
         apply_home_background_image(scr);
         finalize_screen_navigation(scr);
         return scr;

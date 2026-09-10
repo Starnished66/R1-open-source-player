@@ -2479,7 +2479,6 @@ static lv_obj_t * eq_profiles_edit_btn = NULL;
 static char eq_profile_pending_path[512];
 static lv_obj_t * eq_profile_delete_popup;
 static lv_obj_t * eq_profile_delete_popup_backdrop;
-static bool eq_save_as_long_press_fired = false;
 
 static void eq_profiles_free_paths(void) {
     for (int i = 0; i < eq_profile_count; i++) free(eq_profile_paths[i]);
@@ -2697,16 +2696,26 @@ static void eq_save_profile_name_done_cb(const char * text, void * user_data) {
     eq_save_named_profile(text);
 }
 
-static void eq_save_profile_long_press_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
-    eq_save_as_long_press_fired = true;
-    show_text_entry("Save Profile As", eq_current_profile_name, false, false, eq_save_profile_name_done_cb, NULL);
+/* Save Profile: a quick tap saves in place; a deliberate hold opens "Save
+ * Profile As" (prefilled with the current name). Tracked locally via our own
+ * PRESSED/CLICKED timestamps rather than LVGL's global LV_EVENT_LONG_PRESSED
+ * (LV_INDEV_DEF_LONG_PRESS_TIME, 400ms, shared by every long-press in the
+ * app) -- 400ms was too easy to trip on an ordinary deliberate tap here,
+ * especially right after a run of slider drags, so this button alone uses a
+ * longer local hold. */
+#define EQ_SAVE_PROFILE_HOLD_MS 700
+static uint32_t eq_save_profile_press_start_ms = 0;
+
+static void eq_save_profile_pressed_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_PRESSED) return;
+    eq_save_profile_press_start_ms = lv_tick_get();
 }
 
 static void eq_save_profile_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (eq_save_as_long_press_fired) {
-        eq_save_as_long_press_fired = false;
+    bool held = lv_tick_elaps(eq_save_profile_press_start_ms) >= EQ_SAVE_PROFILE_HOLD_MS;
+    if (held) {
+        show_text_entry("Save Profile As", eq_current_profile_name, false, false, eq_save_profile_name_done_cb, NULL);
         return;
     }
     if (eq_current_profile_name[0]) {
@@ -2870,8 +2879,8 @@ static lv_obj_t * build_eq_screen(void) {
     lv_obj_set_style_pad_all(save_btn, 14, 0);
     lv_obj_remove_flag(save_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(save_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(save_btn, eq_save_profile_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(save_btn, eq_save_profile_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(save_btn, eq_save_profile_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
     lv_obj_t * save_label = lv_label_create(save_btn);
     lv_label_set_text(save_label, "Save Profile");
     lv_obj_set_style_text_font(save_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);

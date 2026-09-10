@@ -112,8 +112,21 @@ static void bridge_log(const char * fmt, ...) {
      * to survive a hard power-cycle (the only recovery from a stuck USB mode
      * switch with no ADB access), so the most recent lines are exactly the
      * ones that must not be lost to write-back timing; fsync() forces them
-     * out to the device before returning. */
-    fsync(fileno(bridge_log_file));
+     * out to the device before returning.
+     * Throttled to at most once/second rather than every call: this runs on
+     * the reader thread, which must keep up with incoming USB audio, and
+     * fsync() is a blocking device write -- confirmed on real hardware
+     * (2026-09-10) as a direct cause of periodic audible crackling when
+     * called on every one of this device's routine ~9-15ms EOF/reopen
+     * cycles (hundreds of times/second). Worst-case durability cost: up to
+     * ~1s of the most recent lines lost on a genuine hard power-cut,
+     * accepted given this log's own purpose is post-mortem debugging of a
+     * stuck USB mode, not sub-second forensic precision. */
+    static uint64_t last_fsync_ms = 0;
+    if (now_ms - last_fsync_ms >= 1000) {
+        fsync(fileno(bridge_log_file));
+        last_fsync_ms = now_ms;
+    }
     bridge_log_rotate_if_needed_locked();
     pthread_mutex_unlock(&bridge_log_mutex);
 }
@@ -175,6 +188,25 @@ static const unsigned int STANDARD_RATES[] = {
 };
 #define RATE_MEASURE_WINDOW_MS 250
 #define RATE_CONFIRM_COUNT 3
+
+/* Below this, a measurement is treated as a corrupted/implausible outlier
+ * rather than real audio, and the window is discarded without touching
+ * pending_rate/pending_rate_count -- confirmed on real hardware (2026-09-10):
+ * a window whose elapsed wall-clock time was inflated by a stall (a brief
+ * gap, or this file's own synchronous per-line log fsync()) can read bytes/
+ * elapsed far below the true rate, since a stall can only ever bias this
+ * measurement DOWNWARD (undercounting real bytes against inflated elapsed
+ * time), never upward. Without this check, snap_to_standard_rate() below
+ * still picks the NEAREST standard rate for any input, including obvious
+ * garbage (e.g. measured ~2-8kHz snapping to 32000 Hz, then getting
+ * confirmed and adopted -- observed on real hardware, played unchanged
+ * 48kHz PCM at 32kHz, an audible two-thirds-speed pitch drop). Set well
+ * under the lowest real STANDARD_RATES entry (32000, >25% below it) so
+ * ordinary jitter on genuine 32kHz audio won't cross it -- a real stream
+ * would need an unusually severe stall of its own to read this low, while a
+ * stall-corrupted reading this far below any
+ * real device rate is. */
+#define RATE_MEASURE_MIN_PLAUSIBLE_HZ 24000.0
 
 static unsigned int snap_to_standard_rate(double measured_rate) {
     unsigned int best = STANDARD_RATES[0];
@@ -533,15 +565,20 @@ static void * bridge_reader_thread_func(void * arg) {
 
     /* Recovery tracking across EOF / gadget session boundaries.
      * Genuine disconnect is bounded by RECOVERY_TIMEOUT_NS (~5s) since last
-     * successful read. The in-progress rate-measurement window is always
-     * discarded across a reopen, regardless of gap length (see the
-     * `if (in_recovery)` block's own comment further down) -- only the
-     * multi-window CONFIRMATION streak (pending_rate/pending_rate_count) is
-     * gated on FAST_RECOVERY_MAX_GAP_NS (e.g. 500ms, 2x POLL_INTERVAL_MS),
-     * preserved across a fast reopen so a brief blip doesn't force
-     * re-accumulating RATE_CONFIRM_COUNT clean windows from scratch. */
+     * successful read. FAST_RECOVERY_MAX_GAP_NS defines the latency threshold
+     * (e.g. 500ms, 2x POLL_INTERVAL_MS) below which an in-progress rate-measurement
+     * window is preserved across reopen -- load-bearing, not just an
+     * optimization: real BRIDGE_LOG capture showed this device's /dev/uac_sa
+     * reopens every ~9-15ms as normal steady-state operation, far more often
+     * than the 250ms window needs to complete uninterrupted, so discarding it
+     * on every reopen (tried once, reverted -- see the `if (in_recovery)`
+     * block's own comment further down) starves rate confirmation entirely. */
     #define RECOVERY_TIMEOUT_NS (5ULL * 1000000000ULL)
     #define FAST_RECOVERY_MAX_GAP_NS (500ULL * 1000000ULL)
+    /* Above this, a completed recovery is logged even if it only took one
+     * open() attempt -- see the "recovered from EOF" log call's own comment
+     * for why the routine (~9-15ms) case isn't logged at all. */
+    #define EOF_RECOVERY_LOG_MIN_MS 20.0
 
     uint64_t last_successful_read_ns = monotonic_ns();
     int eof_reopen_attempts = 0;
@@ -607,15 +644,20 @@ static void * bridge_reader_thread_func(void * arg) {
         }
         poll_timeouts_in_a_row = 0;
 
-        /* Check revents explicitly */
-        if (pfd.revents != POLLIN) {
-            BRIDGE_LOG("usb_dac_bridge: poll returned revents=0x%x (POLLIN=%d POLLHUP=%d POLLERR=%d POLLNVAL=%d)\n",
-                       pfd.revents,
-                       (pfd.revents & POLLIN) ? 1 : 0,
-                       (pfd.revents & POLLHUP) ? 1 : 0,
-                       (pfd.revents & POLLERR) ? 1 : 0,
-                       (pfd.revents & POLLNVAL) ? 1 : 0);
-        }
+        /* Raw revents bitmask dump removed (2026-09-10): confirmed via a real
+         * device log capture to never fire in practice -- this device's
+         * routine ~9-15ms reconnect cycle consistently reports plain POLLIN
+         * from poll() and gets its EOF from read() returning 0, never from
+         * this POLLHUP/POLLERR/POLLNVAL branch. If it ever does start firing
+         * (a different host, a different failure mode), the branch below
+         * still logs "repeat revents=..." on any 2nd+ attempt within an
+         * episode, and the deadline-exceeded paths remain unconditional --
+         * this line was purely a redundant raw-bitmask breakdown on top of
+         * those, and unconditionally printing it every poll() where
+         * revents != POLLIN was a real risk of reintroducing the same
+         * audio-thread logging-stall class of bug fixed elsewhere in this
+         * function, for no retained diagnostic value in the case that
+         * actually occurs on real hardware. */
 
         /* If poll signaled hangup/error without readable data, treat as recoverable EOF/boundary */
         if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) && !(pfd.revents & POLLIN)) {
@@ -627,8 +669,12 @@ static void * bridge_reader_thread_func(void * arg) {
                 eof_reopen_attempts = 0;
                 cumulative_backoff_ms = 0;
                 bytes_before_eof = total_bytes_read;
-                BRIDGE_LOG("usb_dac_bridge: entering recovery from revents=0x%x, ring_occupancy=%zu bytes\n",
-                           pfd.revents, ring_buffer_get_occupancy(&g_rb));
+                /* Not logged here -- see "recovered from EOF"'s own comment.
+                 * That single summary (fired once this episode's next
+                 * successful read lands, in the shared `if (in_recovery)`
+                 * block further down) already covers whichever path
+                 * (revents-triggered here, or clean EOF below) entered
+                 * recovery, so this entry point needs no log of its own. */
             } else {
                 /* Repeat hit within active recovery episode: escalating backoff to prevent tight spin without flat latency tax */
                 unsigned int backoff_ms = repeat_hit_backoff_ms(eof_reopen_attempts);
@@ -661,7 +707,10 @@ static void * bridge_reader_thread_func(void * arg) {
                 double elapsed_loop_ms = (double)(monotonic_ns() - loop_start_ns) / 1e6;
                 if (uac_fd >= 0) {
                     if (eof_first_open_success_ns == 0) eof_first_open_success_ns = monotonic_ns();
-                    if (eof_reopen_attempts <= 5 || eof_reopen_attempts % 10 == 0) {
+                    /* attempt 1 is the routine (~9-15ms) fast path -- not
+                     * logged here either, folded into "recovered from EOF"'s
+                     * own attempt count once this episode actually ends. */
+                    if ((eof_reopen_attempts > 1 && eof_reopen_attempts <= 5) || eof_reopen_attempts % 10 == 0) {
                         BRIDGE_LOG("usb_dac_bridge: open() succeeded (attempt %d, elapsed %.2f ms since retry loop started)\n",
                                    eof_reopen_attempts, elapsed_loop_ms);
                     }
@@ -699,8 +748,9 @@ static void * bridge_reader_thread_func(void * arg) {
                     eof_reopen_attempts = 0;
                     cumulative_backoff_ms = 0;
                     bytes_before_eof = total_bytes_read;
-                    BRIDGE_LOG("usb_dac_bridge: entering recovery from EOF, ring_occupancy=%zu bytes\n",
-                               ring_buffer_get_occupancy(&g_rb));
+                    /* Not logged here -- see "recovered from EOF"'s own
+                     * comment; that single summary covers this entry point
+                     * too once the episode ends. */
                 } else {
                     /* Repeat hit within active recovery episode: escalating backoff to prevent tight spin without flat latency tax */
                     unsigned int backoff_ms = repeat_hit_backoff_ms(eof_reopen_attempts);
@@ -735,7 +785,9 @@ static void * bridge_reader_thread_func(void * arg) {
                     double elapsed_loop_ms = (double)(monotonic_ns() - loop_start_ns) / 1e6;
                     if (uac_fd >= 0) {
                         if (eof_first_open_success_ns == 0) eof_first_open_success_ns = monotonic_ns();
-                        if (eof_reopen_attempts <= 5 || eof_reopen_attempts % 10 == 0) {
+                        /* attempt 1 is the routine fast path -- see the
+                         * mirrored revents-triggered block's own comment. */
+                        if ((eof_reopen_attempts > 1 && eof_reopen_attempts <= 5) || eof_reopen_attempts % 10 == 0) {
                             BRIDGE_LOG("usb_dac_bridge: open() succeeded (attempt %d, elapsed %.2f ms since retry loop started)\n",
                                        eof_reopen_attempts, elapsed_loop_ms);
                         }
@@ -818,28 +870,62 @@ static void * bridge_reader_thread_func(void * arg) {
              * near 0) from "the freshly-opened fd re-EOF'd and needed the repeat-
              * hit pacing before real data showed up" (this absorbs that time). */
             double open_to_read_ms = (first_open_ms >= 0.0) ? (recovery_ms - first_open_ms) : -1.0;
-            BRIDGE_LOG("usb_dac_bridge: recovered from EOF: %llu bytes read before EOF, %d reopen attempts, latency %.2f ms (time-to-first-open %.2f ms, open-to-first-read %.2f ms, cumulative_backoff %u ms, ring_occupancy=%zu bytes)\n",
-                       (unsigned long long) bytes_before_eof,
-                       eof_reopen_attempts,
-                       recovery_ms,
-                       first_open_ms,
-                       open_to_read_ms,
-                       cumulative_backoff_ms,
-                       ring_buffer_get_occupancy(&g_rb));
+            /* Only log a recovery that took more than one open() attempt or
+             * meaningfully longer than typical -- confirmed on real hardware
+             * (2026-09-10): this device's /dev/uac_sa reopens every ~9-15ms
+             * as NORMAL steady-state operation (99.5% of measured cycles),
+             * so logging every single one of these routine reconnects
+             * (previously unconditional here, plus "entering recovery"/
+             * "open() succeeded" at each of those call sites) ran BRIDGE_LOG's
+             * synchronous fsync() roughly 250-300 times/second on this same
+             * reader thread, and grew the log fast enough to hit its 2MB
+             * rotation size (its own separate fclose+remove+rename+fopen
+             * stall) roughly every 30s -- both squarely on the thread that
+             * must keep up with incoming audio. Confirmed as the cause of
+             * reported periodic crackling. A genuinely slow/anomalous
+             * recovery is still fully logged; the routine fast path no
+             * longer costs anything here. */
+            if (eof_reopen_attempts > 1 || recovery_ms > EOF_RECOVERY_LOG_MIN_MS) {
+                BRIDGE_LOG("usb_dac_bridge: recovered from EOF: %llu bytes read before EOF, %d reopen attempts, latency %.2f ms (time-to-first-open %.2f ms, open-to-first-read %.2f ms, cumulative_backoff %u ms, ring_occupancy=%zu bytes)\n",
+                           (unsigned long long) bytes_before_eof,
+                           eof_reopen_attempts,
+                           recovery_ms,
+                           first_open_ms,
+                           open_to_read_ms,
+                           cumulative_backoff_ms,
+                           ring_buffer_get_occupancy(&g_rb));
+            }
 
-            /* The in-progress measurement window must never span this gap,
-             * fast or slow: rate_window_start_ns predates the recovery, so
-             * counting the dead time as elapsed while rate_window_bytes only
-             * counts real bytes snaps that one window to a spuriously LOW
-             * rate (audible as a brief pitch drop until the next clean
-             * window self-corrects) -- same "never span a gap" reasoning the
-             * poll-timeout path above already applies unconditionally. Only
-             * the multi-window CONFIRMATION streak stays gated on fast vs
-             * slow, since a brief recovery shouldn't force re-accumulating
-             * RATE_CONFIRM_COUNT clean windows from scratch. */
-            rate_window_active = false;
-            rate_window_bytes = 0;
+            /* REVERTED (real-hardware regression, see below): a prior version
+             * of this comment argued the in-progress measurement window
+             * should always be discarded across this gap, fast or slow,
+             * reasoning that a stale rate_window_start_ns spanning the gap
+             * corrupts that window's measured rate downward. That reasoning
+             * was correct in isolation but wrong for this device's actual
+             * behavior: real BRIDGE_LOG capture showed /dev/uac_sa reopens
+             * every ~9-15ms as NORMAL steady-state operation (99.5% of
+             * measured recovery cycles), far more often than
+             * RATE_MEASURE_WINDOW_MS (250ms) needs to complete uninterrupted.
+             * Always discarding the window on every recovery made it nearly
+             * impossible for any window to ever reach 250ms elapsed at all,
+             * starving g_rate_confirmed_once and forcing every session into
+             * the full MUTE_FALLBACK_TIMEOUT_NS (5s) bounded-mute fallback --
+             * confirmed via real device log analysis (Codex, 2026-09-10)
+             * against a live capture: only ~0.05% of successful-recovery-to-
+             * next-EOF spans reached 250ms. Reverted to the original
+             * behavior: only discard the window on a SLOW recovery
+             * (matching the multi-window CONFIRMATION streak's own gating
+             * below), preserving it across the device's normal fast
+             * micro-reconnects so a window can accumulate across them. The
+             * corruption this was meant to fix is real but rare and
+             * self-correcting (the next clean window re-measures and
+             * re-confirms); see snap_to_standard_rate()'s own comment for
+             * the actual fix applied for that -- rejecting implausible
+             * measurements outright, rather than never letting a window
+             * survive a gap. */
             if (recovery_duration_ns > FAST_RECOVERY_MAX_GAP_NS) {
+                rate_window_active = false;
+                rate_window_bytes = 0;
                 pending_rate = 0;
                 pending_rate_count = 0;
             }
@@ -864,30 +950,39 @@ static void * bridge_reader_thread_func(void * arg) {
         if (elapsed_ns >= (uint64_t) RATE_MEASURE_WINDOW_MS * 1000000ULL) {
             double elapsed_s = (double) elapsed_ns / 1e9;
             double measured_frames_per_sec = ((double) rate_window_bytes / (double) frame_bytes) / elapsed_s;
-            unsigned int snapped = snap_to_standard_rate(measured_frames_per_sec);
-            if (snapped == pending_rate) {
-                pending_rate_count++;
+            if (measured_frames_per_sec < RATE_MEASURE_MIN_PLAUSIBLE_HZ) {
+                /* Implausible outlier (see RATE_MEASURE_MIN_PLAUSIBLE_HZ's own
+                 * comment) -- discard this window without touching
+                 * pending_rate/pending_rate_count, so an otherwise-valid
+                 * confirmation streak isn't broken by one corrupted sample. */
+                BRIDGE_LOG("usb_dac_bridge: rate window: measured ~%.0f Hz -- implausible, discarding window (confirmed count %d, current confirmed %u Hz)\n",
+                           measured_frames_per_sec, pending_rate_count, g_confirmed_rate);
             } else {
-                pending_rate = snapped;
-                pending_rate_count = 1;
-            }
-
-            pthread_mutex_lock(&bridge_mutex);
-            unsigned int current_confirmed = g_confirmed_rate;
-            if (pending_rate_count >= RATE_CONFIRM_COUNT) {
-                g_rate_confirmed_once = true;
-                if (pending_rate != current_confirmed) {
-                    g_confirmed_rate = pending_rate;
+                unsigned int snapped = snap_to_standard_rate(measured_frames_per_sec);
+                if (snapped == pending_rate) {
+                    pending_rate_count++;
+                } else {
+                    pending_rate = snapped;
+                    pending_rate_count = 1;
                 }
-            }
-            pthread_mutex_unlock(&bridge_mutex);
 
-            BRIDGE_LOG("usb_dac_bridge: rate window: measured ~%.0f Hz -> snapped %u Hz (confirmed count %d, current confirmed %u Hz)\n",
-                       measured_frames_per_sec, snapped, pending_rate_count, current_confirmed);
+                pthread_mutex_lock(&bridge_mutex);
+                unsigned int current_confirmed = g_confirmed_rate;
+                if (pending_rate_count >= RATE_CONFIRM_COUNT) {
+                    g_rate_confirmed_once = true;
+                    if (pending_rate != current_confirmed) {
+                        g_confirmed_rate = pending_rate;
+                    }
+                }
+                pthread_mutex_unlock(&bridge_mutex);
 
-            if (pending_rate_count >= RATE_CONFIRM_COUNT && pending_rate != current_confirmed) {
-                BRIDGE_LOG("usb_dac_bridge: incoming rate changed %u -> %u Hz (measured ~%.0f), signalling writer\n",
-                        current_confirmed, pending_rate, measured_frames_per_sec);
+                BRIDGE_LOG("usb_dac_bridge: rate window: measured ~%.0f Hz -> snapped %u Hz (confirmed count %d, current confirmed %u Hz)\n",
+                           measured_frames_per_sec, snapped, pending_rate_count, current_confirmed);
+
+                if (pending_rate_count >= RATE_CONFIRM_COUNT && pending_rate != current_confirmed) {
+                    BRIDGE_LOG("usb_dac_bridge: incoming rate changed %u -> %u Hz (measured ~%.0f), signalling writer\n",
+                            current_confirmed, pending_rate, measured_frames_per_sec);
+                }
             }
             rate_window_start_ns = now_ns;
             rate_window_bytes = 0;

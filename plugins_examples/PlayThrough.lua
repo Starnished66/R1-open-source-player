@@ -46,14 +46,12 @@ local function save_state()
     os.rename(tmp, STATE_PATH)
 end
 
-local function natural_key(value)
-    return tostring(value or ""):lower():gsub("%d+", function(number)
-        return string.format("%012d", tonumber(number))
-    end)
+local function lexical_key(value)
+    return tostring(value or ""):lower()
 end
 
-local function natural_less(a, b)
-    return natural_key(a.name or a) < natural_key(b.name or b)
+local function lexical_less(a, b)
+    return lexical_key(a.name or a) < lexical_key(b.name or b)
 end
 
 local function is_audio(name)
@@ -83,7 +81,7 @@ local function folder_tracks(directory)
             tracks[#tracks + 1] = { name = entry.name, path = directory .. "/" .. entry.name }
         end
     end
-    table.sort(tracks, natural_less)
+    table.sort(tracks, lexical_less)
     return tracks
 end
 
@@ -101,7 +99,7 @@ local function next_folder_tracks(current_path)
     for _, entry in ipairs(plugin.list_dir(parent)) do
         if entry.dir then folders[#folders + 1] = entry end
     end
-    table.sort(folders, natural_less)
+    table.sort(folders, lexical_less)
 
     local found_current = false
     for _, folder in ipairs(folders) do
@@ -200,7 +198,7 @@ end)
 local function open_about()
     plugin.show_list("About Play Through", {
         "Albums continue in the artist's alphabetical album order.",
-        "Folders continue in natural sibling-folder order.",
+        "Folders continue in lexical (alphabetical, case-insensitive) sibling-folder order.",
         "Album mode has priority when both options are enabled.",
         "Shuffle and repeat modes are left unchanged.",
     }, function() end)

@@ -34,7 +34,7 @@ typedef struct {
 #define LYRICS_BACKDROP_DARKEN_NUM 9
 #define LYRICS_BACKDROP_DARKEN_DEN 20
 #define LYRICS_POOL_SIZE 20
-#define LYRICS_ROW_WIDTH 440
+#define LYRICS_ROW_WIDTH (BOARD_SCREEN_WIDTH - 40)
 #define LYRICS_ROW_GAP 24
 #define LYRICS_ACTIVE_LINE_ANCHOR_Y 200
 #define LYRICS_TOP_PAD LYRICS_ACTIVE_LINE_ANCHOR_Y
@@ -460,9 +460,9 @@ static lv_obj_t * lyrics_rows[LYRICS_POOL_SIZE];
  * offsets[count] is the bottom after its final gap. Long lines can wrap to
  * an arbitrary number of visual lines (up to LYRICS_MAX_LINE_BYTES), so a
  * fixed "three lines ought to fit" stride still allowed real text to paint
- * into its neighbor. This table costs at most ~16KB for 4000 lines and
- * makes rendering, hit mapping and auto-follow share the exact measured
- * geometry. */
+ * into its neighbor. These two parallel tables (offsets and per-line
+ * line_space) cost at most ~32KB for 4000 lines and make rendering, hit
+ * mapping and auto-follow share the exact measured geometry. */
 static lyrics_layout_t lyrics_layout;
 static int lyrics_window_start = -1; /* index currently shown by lyrics_rows[0]; -1 forces the first update to actually run */
 static int lyrics_pool_synced_for_index = -1; /* current_lyrics_doc_for_index the pool/spacer were last built from */
@@ -484,6 +484,9 @@ static int32_t lyrics_line_y(int index) {
 }
 static int32_t lyrics_line_height(int index) {
     return lyrics_layout_height(&lyrics_layout, index);
+}
+static int32_t lyrics_line_line_space(int index) {
+    return lyrics_layout_line_space(&lyrics_layout, index);
 }
 static void lyrics_build_line_offsets(void) {
     lyrics_layout_build(&lyrics_layout, current_lyrics_doc_valid ? &current_lyrics_doc : NULL,
@@ -595,6 +598,7 @@ static void lyrics_update_window(int active_index) {
         if (window_moved) {
             lv_obj_set_y(row, lyrics_line_y(index));
             lv_obj_set_height(row, lyrics_line_height(index));
+            lv_obj_set_style_text_line_space(row, lyrics_line_line_space(index), 0);
             lv_label_set_text(row, current_lyrics_doc.lines[index].text);
         }
         lv_obj_set_style_text_color(row, index == active_index ? accent_lv_color() : lv_color_make(150, 150, 150), 0);
@@ -845,7 +849,7 @@ static lv_obj_t * build_lyrics_screen(void) {
      * scrollable) is enough here -- unlike the synced rows, there's no
      * windowing/virtualization needed for a single object. */
     lyrics_plain_label = lv_label_create(lyrics_list);
-    lv_obj_set_width(lyrics_plain_label, 440);
+    lv_obj_set_width(lyrics_plain_label, LYRICS_ROW_WIDTH);
     lv_label_set_long_mode(lyrics_plain_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(lyrics_plain_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(lyrics_plain_label, &app_font_lyrics, 0);

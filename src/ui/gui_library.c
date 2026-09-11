@@ -1172,6 +1172,13 @@ static bool album_player_cache_hit(const albumart_info_t * info, char * found, s
  * and the returned picture is admitted at its actual compressed size. */
 #define ALBUM_ART_METADATA_START_BYTES (1024U * 1024U)
 
+/* Bound on how many other songs from the same album to probe for embedded
+ * art once the album's own representative song (first_song_id) has none
+ * and no sidecar exists either -- covers rips where only some tracks carry
+ * embedded art (e.g. a short intro/interlude or bonus track).
+ * Kept small: each probe is a full isolated-process extraction. */
+#define ALBUM_ART_SIBLING_FALLBACK_MAX 5
+
 /* Persistent warmer state flags */
 static pthread_t album_thumb_gen_thread;
 static atomic_bool album_thumb_gen_active;
@@ -1416,6 +1423,71 @@ bool gui_library_generate_player_cover(const char * track_path, const char * art
     return res == COVER_DECODE_OK;
 }
 
+/* Result of one embedded-art probe against a single sibling song file --
+ * distinguishes "this song genuinely has no picture" (keep trying other
+ * siblings) from every transient/cancelled outcome (stop probing without
+ * ever letting the caller record a permanent album-level failure over a
+ * passing interruption -- mirrors how Step 3 above treats the primary
+ * song's own cancelled/temporary outcomes). */
+typedef enum {
+    SIBLING_ART_FOUND,      /* success -- *out_pixels populated */
+    SIBLING_ART_NOT_FOUND,  /* probe completed, this song has no usable picture */
+    SIBLING_ART_TEMPORARY,  /* busy/low-memory/timeout/temporary decode failure */
+    SIBLING_ART_CANCELLED,  /* cancelled or suspended -- record nothing */
+} sibling_art_result_t;
+
+/* One bounded attempt at embedded-picture extraction from a single sibling
+ * song file, used only by the Step 3b fallback below (the primary
+ * representative song still goes through the separately inlined Step 3
+ * above, which this mirrors). On success, also persists the sized
+ * thumbnail/player caches keyed by `info`, i.e. by album identity, not by
+ * which song file supplied the bytes. */
+static sibling_art_result_t album_thumbnail_try_embedded_art_from_path(
+        const albumart_info_t * info, const char * path, artwork_priority_t prio,
+        artwork_cancel_fn cancel_cb, void * user_data, uint16_t ** out_pixels) {
+    artwork_acquire_result_t admission = artwork_coordinator_acquire(
+        prio, ALBUM_ART_METADATA_START_BYTES, 300, cancel_cb, user_data);
+    if (admission == ARTWORK_ACQUIRE_CANCELLED || admission == ARTWORK_ACQUIRE_SUSPENDED)
+        return SIBLING_ART_CANCELLED;
+    if (admission != ARTWORK_ACQUIRE_OK)
+        return SIBLING_ART_TEMPORARY;
+
+    track_metadata_t meta;
+    memset(&meta, 0, sizeof(meta));
+    metadata_artwork_result_t metadata_result =
+        metadata_read_artwork_isolated(path, &meta, ALBUM_ART_METADATA_TIMEOUT_MS, prio);
+    artwork_coordinator_release(prio);
+    uint8_t * data = meta.picture_data;
+    uint32_t size = meta.picture_size;
+    free(meta.lyrics);
+
+    if (!data || size == 0) {
+        free(data);
+        return metadata_result == METADATA_ARTWORK_TEMPORARY_FAILURE
+            ? SIBLING_ART_TEMPORARY : SIBLING_ART_NOT_FOUND;
+    }
+
+    uint16_t * player_pixels = NULL;
+    cover_decode_result_t player_res = album_thumbnail_maybe_store_player_cache(
+        info, data, size, prio, cancel_cb, user_data, &player_pixels);
+    if (player_res == COVER_DECODE_FAIL_CANCELLED) {
+        free(player_pixels);
+        free(data);
+        return SIBLING_ART_CANCELLED;
+    }
+    cover_decode_result_t res = album_thumbnail_pixels_from_source(
+        data, size, player_pixels, prio, cancel_cb, user_data, out_pixels);
+    free(player_pixels);
+    free(data);
+    if (res == COVER_DECODE_OK && *out_pixels) {
+        albumart_store_rgb565(info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, *out_pixels);
+        return SIBLING_ART_FOUND;
+    }
+    if (res == COVER_DECODE_FAIL_CANCELLED) return SIBLING_ART_CANCELLED;
+    if (cover_decode_result_is_temporary(res)) return SIBLING_ART_TEMPORARY;
+    return SIBLING_ART_NOT_FOUND;
+}
+
 /* Rockbox albumart search, then embedded picture. A successful decode is
  * written as MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp
  * so the next pass is a small BMP load instead of a JPEG/PNG decode.
@@ -1584,6 +1656,35 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     if (metadata_result == METADATA_ARTWORK_TEMPORARY_FAILURE) {
         artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
         return false;
+    }
+
+    /* Step 3b: the representative song for this album may simply be a track
+     * with no embedded picture of its own (e.g. a short intro/interlude or
+     * bonus track) even though sibling tracks in the same album do carry
+     * art -- and Step 2 already searched the whole folder for a sidecar, so
+     * a missing sidecar here means there truly isn't one. Try a bounded
+     * number of other songs from the same album before giving up on the album
+     * entirely. A cancelled/suspended or merely transient outcome on any
+     * probe stops the loop immediately without recording anything permanent --
+     * only a probe that actually completed and found nothing counts toward
+     * "try the next sibling". */
+    if (info.album[0] && info.albumartist[0]) {
+        song_row_t siblings[ALBUM_ART_SIBLING_FALLBACK_MAX];
+        int sibling_count = metadata_db_get_album_songs(info.album, info.albumartist, 0,
+                                                         siblings, ALBUM_ART_SIBLING_FALLBACK_MAX);
+        for (int i = 0; i < sibling_count; i++) {
+            if (siblings[i].id == song->id || !siblings[i].path[0]) continue;
+            if (cancel_cb && cancel_cb(user_data)) return false;
+            sibling_art_result_t sr = album_thumbnail_try_embedded_art_from_path(
+                &info, siblings[i].path, prio, cancel_cb, user_data, out_pixels);
+            if (sr == SIBLING_ART_FOUND) return true;
+            if (sr == SIBLING_ART_CANCELLED) return false;
+            if (sr == SIBLING_ART_TEMPORARY) {
+                artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+                return false;
+            }
+            /* SIBLING_ART_NOT_FOUND -- try the next sibling */
+        }
     }
 
     /* Step 4: No valid artwork found or permanent decode failure */

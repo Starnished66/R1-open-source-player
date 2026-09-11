@@ -83,15 +83,23 @@ typedef struct {
     bool tjpgd_incompatible;
     int native_w;
     int native_h;
-    /* Real coefficient-buffer size estimate for progressive JPEG admission
-     * control -- 0 if !is_progressive or !supported. Computed from the SOF
-     * marker's own component sampling factors (never assumed/guessed):
-     * MCU-round each component's block dimensions against the frame's own
-     * max sampling factors, 128 bytes (64 coefficients * sizeof(int16_t))
-     * per 8x8 block, summed across all components. This is the dominant,
-     * unavoidable memory cost of progressive JPEG -- it scales with native
-     * (SOF) dimensions, not the caller's requested output size, and no
-     * decoder (this one included) can avoid materializing it. */
+    /* Real coefficient-buffer size estimate for JPEG admission control -- 0
+     * only if !supported. Computed unconditionally for every supported
+     * SOF0/SOF2 (not just progressive) from the SOF marker's own component
+     * sampling factors (never assumed/guessed): MCU-round each component's
+     * block dimensions against the frame's own max sampling factors, 128
+     * bytes (64 coefficients * sizeof(int16_t)) per 8x8 block, summed across
+     * all components. This is the dominant, unavoidable memory cost of
+     * progressive JPEG -- it scales with native (SOF) dimensions, not the
+     * caller's requested output size, and no decoder (this one included)
+     * can avoid materializing it. A baseline (SOF0) file gets this same
+     * conservative worst-case estimate too, because a cheap header-only
+     * probe can't tell single-scan and sequential-multiscan apart (that's a
+     * property of the entropy-coded scan structure, not the frame header),
+     * and multiscan needs the identical full-native coefficient buffer --
+     * billing every baseline as if it might be multiscan is deliberately
+     * conservative, not a bug (see decode_jpeg_libjpeg_rgb888()'s own
+     * comment in cover_decode.c). */
     uint64_t coeff_bytes;
 } jpeg_probe_t;
 
@@ -108,13 +116,16 @@ bool jpeg_probe(const uint8_t * data, uint32_t size, jpeg_probe_t * result);
  * cropping whichever dimension overflows -- same as a photo app's cover/
  * thumbnail mode) into a newly malloc()'d RGB565 buffer the caller owns and
  * must free(). JPEGs are decompressed at the largest 1/2^n that still covers
- * the target (tjpgd for ordinary baseline, or a vendored libjpeg fallback
- * for progressive/SOF2 and for baseline with a chroma sampling factor
- * tjpgd's own whitelist rejects -- see jpeg_probe_t), then cover-fitted;
- * PNG/BMP decode at native size first. JPEG native may be up to 4096px if
- * scaled RGB888 <= 1200px (progressive JPEG is the one exception: its
- * native-scaling coefficient-buffer cost caps it at 1200px native); PNG/BMP
- * still reject native dimensions exceeding 1200px.
+ * the target (tjpgd first for ordinary baseline, falling through to a
+ * vendored libjpeg decoder if tjpgd itself fails on it; libjpeg is also
+ * used directly, with no tjpgd attempt at all, for progressive/SOF2 and for
+ * baseline with a chroma sampling factor tjpgd's own whitelist rejects --
+ * see jpeg_probe_t), then cover-fitted; PNG/BMP decode at native size
+ * first. JPEG native (baseline and
+ * progressive alike) may be up to 4096px as long as scaled RGB888 <= 1200px
+ * -- progressive's real, dimension-dependent coefficient-buffer cost is
+ * billed separately through memory admission (coeff_bytes), not capped by
+ * dimension alone; PNG/BMP still reject native dimensions exceeding 1200px.
  * Serialized through the process-wide artwork decode coordinator with memory admission. */
 bool cover_decode_to_rgb565(const uint8_t * data, uint32_t size, int target_w, int target_h,
                             uint16_t ** out_pixels);

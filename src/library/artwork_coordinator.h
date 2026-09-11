@@ -21,6 +21,7 @@ typedef enum {
     ARTWORK_FORMAT_JPEG,
     ARTWORK_FORMAT_PNG,
     ARTWORK_FORMAT_BMP,
+    ARTWORK_FORMAT_PNG_STREAMING,
     /* Progressive (SOF2) JPEG -- decoded via a separate vendored libjpeg
      * fallback (src/library/cover_decode.c), never tjpgd (which rejects
      * SOF2 outright). Its memory profile is fundamentally different from
@@ -29,14 +30,19 @@ typedef enum {
      * see artwork_estimate_decode_bytes()'s progressive_coeff_bytes
      * parameter. */
     ARTWORK_FORMAT_JPEG_PROGRESSIVE,
-    /* Baseline (SOF0) JPEG whose chroma sampling factors tjpgd's own
-     * minimal whitelist rejects (e.g. vertical-only/4:4:0 subsampling --
-     * valid JPEG, just rare) -- decoded via the same libjpeg fallback as
-     * ARTWORK_FORMAT_JPEG_PROGRESSIVE, but genuinely single-scan (the
-     * decoder itself rejects a sequential-multiscan SOF0 as unsupported
-     * before allocating anything), so it shares PROGRESSIVE's larger
-     * libjpeg workspace allowance but never carries a real
-     * progressive_coeff_bytes cost -- see artwork_estimate_decode_bytes(). */
+    /* Any baseline (SOF0) JPEG decoded via the libjpeg fallback instead of
+     * tjpgd: either its chroma sampling factors fail tjpgd's own minimal
+     * whitelist (e.g. vertical-only/4:4:0 subsampling -- valid JPEG, just
+     * rare), or tjpgd's own jd_prepare()/jd_decomp() failed on it despite
+     * looking like an ordinary baseline file. Shares PROGRESSIVE's larger
+     * libjpeg workspace allowance AND (unlike an earlier version of this
+     * format) DOES carry a real progressive_coeff_bytes-shaped cost:
+     * jpeg_probe() now computes that estimate unconditionally for every
+     * supported SOF0/SOF2, not just progressive, because a cheap header
+     * probe can't tell single-scan and sequential-multiscan SOF0 apart --
+     * see artwork_estimate_decode_bytes(). Passing 0 here for this format
+     * would silently reopen the exact OOM risk that estimate exists to
+     * close for a genuinely multiscan baseline file. */
     ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE,
 } artwork_format_t;
 
@@ -69,12 +75,14 @@ void system_set_mock_mem_available(size_t bytes);
  * decode's own jpeg_scale_for_target() policy), and the true NATIVE (source)
  * dimensions for PNG/BMP, which don't scale during decode.
  * progressive_coeff_bytes is the real coefficient-buffer size from a prior
- * jpeg_probe() call -- ignored for every format except JPEG_PROGRESSIVE,
- * where it's the dominant cost (see jpeg_probe_t's own doc comment,
- * cover_decode.h, for why this can't be derived from native_w/native_h
- * alone: it depends on the SOF's true native dimensions and component
- * sampling factors, not the post-scale output size this function otherwise
- * bills). Pass 0 for every non-progressive-JPEG call.
+ * jpeg_probe() call -- ignored for every format except JPEG_PROGRESSIVE and
+ * JPEG_LIBJPEG_BASELINE (both libjpeg-decoded), where it's the dominant
+ * cost (see jpeg_probe_t's own doc comment, cover_decode.h, for why this
+ * can't be derived from native_w/native_h alone: it depends on the SOF's
+ * true native dimensions and component sampling factors, not the post-scale
+ * output size this function otherwise bills, and jpeg_probe() computes it
+ * unconditionally for every supported SOF0/SOF2, not just progressive).
+ * Pass 0 only for ARTWORK_FORMAT_JPEG (tjpgd) or a non-JPEG format.
  * png_native_bpp is the PNG's real IHDR bits-per-pixel (from
  * lodepng_get_bpp() on the inspected color mode) -- ignored for every
  * format except PNG, where the decoder's real transient workspace (the

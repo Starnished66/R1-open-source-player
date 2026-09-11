@@ -118,11 +118,16 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
      *   raw scanline buffers with filter bytes (~4 bytes/pixel) + zlib window.
      * - JPEG: tjpgd streams 8x8 MCU blocks into destination; minimal ~32KB buffer.
      *   native_w/h for JPEG is the post-scale RGB888 size, not the source pixel size.
-     * - JPEG_PROGRESSIVE: vendored libjpeg decoder-only build. native_w/h here
-     *   are ALSO the post-scale RGB888 size (same convention as baseline
-     *   JPEG) -- the coefficient buffer (the dominant, dimension-dependent
-     *   cost, scaling with the SOF's true native size, not this post-scale
-     *   size) is billed separately via progressive_coeff_bytes below.
+     * - JPEG_PROGRESSIVE / JPEG_LIBJPEG_BASELINE: vendored libjpeg
+     *   decoder-only build -- the latter covers both a baseline file whose
+     *   chroma sampling tjpgd's whitelist rejects, and any other baseline
+     *   file tjpgd itself failed to decode. native_w/h here are ALSO the
+     *   post-scale RGB888 size (same convention as tjpgd JPEG) -- the
+     *   coefficient buffer (the dominant, dimension-dependent cost, scaling
+     *   with the SOF's true native size, not this post-scale size) is
+     *   billed separately via progressive_coeff_bytes below for BOTH
+     *   formats, not just progressive (see jpeg_probe_t's own comment for
+     *   why a baseline file is billed this same worst-case cost).
      * - BMP: uncompressed linear stream; ~16KB overhead. */
     uint64_t decoder_workspace = 64ULL * 1024ULL;
     if (fmt == ARTWORK_FORMAT_PNG) {
@@ -173,6 +178,10 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
                               + 4ULL * (uint64_t) native_w * (uint64_t) native_h;
         uint64_t peak_pair_bytes = pair1_bytes > pair2_bytes ? pair1_bytes : pair2_bytes;
         decoder_workspace = peak_pair_bytes + icc_estimate_bytes + (128ULL * 1024ULL);
+    } else if (fmt == ARTWORK_FORMAT_PNG_STREAMING) {
+        uint32_t bpp_bytes = png_native_bpp ? (png_native_bpp / 8) : 4;
+        uint64_t row_bytes = (uint64_t) native_w * (uint64_t) bpp_bytes + 1ULL;
+        decoder_workspace = 32768ULL + (2ULL * row_bytes);
     } else if (fmt == ARTWORK_FORMAT_JPEG) {
         decoder_workspace = 32ULL * 1024ULL;
     } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE || fmt == ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE) {
@@ -181,9 +190,12 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
          * struct/table footprint is genuinely bigger, independent of image
          * size. progressive_coeff_bytes (the real, dimension/sampling-
          * dependent cost) is added on top, not folded into this constant --
-         * always 0 for JPEG_LIBJPEG_BASELINE, whose caller never computes a
-         * real one (that path is single-scan only; the decoder itself
-         * rejects a sequential-multiscan SOF0 before it would need one). */
+         * real and non-zero for JPEG_LIBJPEG_BASELINE too, not just
+         * JPEG_PROGRESSIVE: jpeg_probe() computes it unconditionally for
+         * every supported SOF0/SOF2, deliberately conservative (billed as
+         * if any baseline file might turn out to be sequential-multiscan,
+         * since a cheap header probe can't tell single-scan and multiscan
+         * apart) so that case doesn't need its own separate rejection. */
         decoder_workspace = 128ULL * 1024ULL + progressive_coeff_bytes;
     } else if (fmt == ARTWORK_FORMAT_BMP) {
         decoder_workspace = 16ULL * 1024ULL;

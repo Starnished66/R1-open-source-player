@@ -157,3 +157,7 @@ src/hardware/usb_dac_bridge_lifecycle_regression.c
 src/audio/audio_output_ownership_regression.c
 src/audio/test_write_pipe_bounded.c
 src/audio/test_audio_output_usb.c
+grok-albumart.md
+claude-albumart.md
+gemini-albumart.md
+png_red_1300.png

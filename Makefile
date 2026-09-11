@@ -69,6 +69,20 @@ STB_VORBIS_DIR = stb_vorbis
 # source for unmodified historical IJG releases, not a random fork.
 JPEG_DIR = jpeg
 
+# tinfl (MIT, standalone genuinely incremental raw-DEFLATE decompressor extracted from miniz)
+# Vendored specifically for the memory-bounded streaming PNG decode path (cover_decode.c).
+# - miniz_tinfl.c is the actual implementation.
+# - miniz_tinfl.h, miniz_common.h, miniz_tdef.h, miniz_zip.h, miniz.h are headers only.
+# - miniz_tinfl.c includes the umbrella miniz.h, which unconditionally includes miniz_tdef.h
+#   and miniz_zip.h for declarations, so these headers must be present for compilation.
+# - miniz_tdef.c, miniz_zip.c, miniz.c are deliberately NOT fetched or added, as this integration
+#   never calls compression/archive-API functions (those would be dead code).
+# - The MINIZ_NO_* defines strip out the compression/archive-writing declarations at the
+#   preprocessor level.
+TINFL_DIR = tinfl
+TINFL_SRCS = $(TINFL_DIR)/miniz_tinfl.c
+
+
 # Self-bootstrap: clone dependencies if they don't exist yet before evaluating variables
 ifeq ($(wildcard $(LVGL_DIR)),)
 $(info Cloning LVGL v9.1.0...)
@@ -413,8 +427,8 @@ endif
 # that companion include.
 CFLAGS = -O3 -g -Wall -MMD -MP -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -Ijpeg_vendor_config -I$(JPEG_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
-HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags)
-HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags)
+HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
+HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
 # Optional: `make target TEST_BUILD_TAG=test25_avrcp` -- replaces the release
 # label in About with a conspicuous test-build identity, so a binary running
 # on the device can be identified without checking timestamps or hashes.
@@ -464,8 +478,8 @@ BUILD_STAMP_DEFINE = -DBUILD_STAMP=\"$(shell date +%Y-%m-%d_%H:%M)\"
 # #include <execinfo.h> resolves to on target: musl (unlike host's glibc)
 # ships no execinfo.h/backtrace() of its own, which is what main.c's SIGSEGV
 # handler needs. Host build doesn't need this -- glibc already provides it.
-TARGET_CFLAGS = $(CFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
-TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE)
+TARGET_CFLAGS = $(CFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
+TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
 TINYALSA_CFLAGS = -O3 -g -Wall -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 # DBUS_COMPILATION/DBUS_STATIC_BUILD: libdbus's own headers gate some
 # declarations on these (matching how its own build always defines them
@@ -638,7 +652,8 @@ HOST_OBJS = $(APP_SRCS:src/%.c=$(BUILD_HOST_DIR)/%.o) $(APP_CXX_SRCS:src/%.cpp=$
             $(OPUS_SRCS:$(OPUS_DIR)/%.c=$(BUILD_HOST_DIR)/opus/%.o) \
             $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=$(BUILD_HOST_DIR)/stb_vorbis/%.o) \
             $(LUA_SRCS:$(LUA_DIR)/src/%.c=$(BUILD_HOST_DIR)/lua/%.o) \
-            $(JPEG_SRCS:$(JPEG_DIR)/%.c=$(BUILD_HOST_DIR)/jpeg/%.o)
+            $(JPEG_SRCS:$(JPEG_DIR)/%.c=$(BUILD_HOST_DIR)/jpeg/%.o) \
+            $(TINFL_SRCS:$(TINFL_DIR)/%.c=$(BUILD_HOST_DIR)/tinfl/%.o)
 TARGET_OBJS = $(APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) $(APP_CXX_SRCS:src/%.cpp=$(BUILD_TARGET_DIR)/%.o) \
               $(TARGET_ONLY_APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) \
               $(LVGL_SRCS:$(LVGL_DIR)/%.c=$(BUILD_TARGET_DIR)/lvgl/%.o) $(TINYALSA_SRCS:$(TINYALSA_DIR)/%.c=$(BUILD_TARGET_DIR)/tinyalsa/%.o) \
@@ -650,7 +665,8 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) $(APP_CXX_SRCS:src/%.c
               $(STB_VORBIS_SRCS:$(STB_VORBIS_DIR)/%.c=$(BUILD_TARGET_DIR)/stb_vorbis/%.o) \
               $(LUA_SRCS:$(LUA_DIR)/src/%.c=$(BUILD_TARGET_DIR)/lua/%.o) \
               $(LIBEXECINFO_SRCS:$(LIBEXECINFO_DIR)/%.c=$(BUILD_TARGET_DIR)/libexecinfo/%.o) \
-              $(JPEG_SRCS:$(JPEG_DIR)/%.c=$(BUILD_TARGET_DIR)/jpeg/%.o)
+              $(JPEG_SRCS:$(JPEG_DIR)/%.c=$(BUILD_TARGET_DIR)/jpeg/%.o) \
+              $(TINFL_SRCS:$(TINFL_DIR)/%.c=$(BUILD_TARGET_DIR)/tinfl/%.o)
 
 .PHONY: all host target bootloader sd_ready_test cover_decode_scale_test clean compile_commands.json FORCE_VERSION
 
@@ -779,6 +795,10 @@ $(BUILD_HOST_DIR)/opus/%.o: $(OPUS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(OPUS_CFLAGS) -c $< -o $@
 
+$(BUILD_HOST_DIR)/tinfl/%.o: $(TINFL_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(HOST_CFLAGS) -c $< -o $@
+
 $(BUILD_HOST_DIR)/jpeg/%.o: $(JPEG_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(JPEG_CFLAGS) -c $< -o $@
@@ -889,10 +909,11 @@ cover_decode_scale_test: $(LVGL_PATCH_STAMP)
 	@mkdir -p $(BUILD_TARGET_DIR)
 	$(CC) -O0 -g -Wall -DHOST_BUILD=1 -DLV_CONF_INCLUDE_SIMPLE=1 \
 	    -I. -Isrc/library -Isrc/core -Isrc/audio -Ilvgl \
-	    -Ijpeg_vendor_config -I$(JPEG_DIR) \
+	    -Ijpeg_vendor_config -I$(JPEG_DIR) -I$(TINFL_DIR) \
+	    -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS \
 	    src/library/cover_decode_scale_test.c src/library/cover_decode.c \
 	    src/library/artwork_coordinator.c lvgl/src/libs/tjpgd/tjpgd.c \
-	    $(JPEG_SRCS) \
+	    $(JPEG_SRCS) $(TINFL_SRCS) \
 	    -lpthread -lm -o $(BUILD_TARGET_DIR)/cover_decode_scale_test
 	./$(BUILD_TARGET_DIR)/cover_decode_scale_test
 
@@ -983,6 +1004,10 @@ $(BUILD_TARGET_DIR)/dbus/%.o: $(DBUS_DIR)/dbus/%.c
 $(BUILD_TARGET_DIR)/opus/%.o: $(OPUS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CROSS_CC) $(OPUS_CFLAGS) -c $< -o $@
+
+$(BUILD_TARGET_DIR)/tinfl/%.o: $(TINFL_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
 
 $(BUILD_TARGET_DIR)/jpeg/%.o: $(JPEG_DIR)/%.c
 	@mkdir -p $(dir $@)

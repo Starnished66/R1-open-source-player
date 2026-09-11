@@ -161,3 +161,4 @@ grok-albumart.md
 claude-albumart.md
 gemini-albumart.md
 png_red_1300.png
+src/library/cover_decode_scale_test.c

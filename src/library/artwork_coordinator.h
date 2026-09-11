@@ -73,7 +73,13 @@ void system_set_mock_mem_available(size_t bytes);
  * native_w/native_h are the POST-SCALE dimensions the decoder will actually
  * produce for ARTWORK_FORMAT_JPEG/JPEG_PROGRESSIVE (matching this JPEG
  * decode's own jpeg_scale_for_target() policy), and the true NATIVE (source)
- * dimensions for PNG/BMP, which don't scale during decode.
+ * dimensions for PNG/BMP, which don't scale during decode. For
+ * PNG_STREAMING, pass the true native (source) dimensions too -- this
+ * function derives its own post-scale size internally (mirroring
+ * decode_png_streaming()'s own jpeg_scale_for_target()-based downscale,
+ * extended the same way past its normal stopping point when needed to fit
+ * MAX_DECODED_COVER_SIDE) since the row-buffer sizing cost genuinely
+ * depends on the true native width, not the post-scale one.
  * progressive_coeff_bytes is the real coefficient-buffer size from a prior
  * jpeg_probe() call -- ignored for every format except JPEG_PROGRESSIVE and
  * JPEG_LIBJPEG_BASELINE (both libjpeg-decoded), where it's the dominant
@@ -85,12 +91,13 @@ void system_set_mock_mem_available(size_t bytes);
  * Pass 0 only for ARTWORK_FORMAT_JPEG (tjpgd) or a non-JPEG format.
  * png_native_bpp is the PNG's real IHDR bits-per-pixel (from
  * lodepng_get_bpp() on the inspected color mode) -- ignored for every
- * format except PNG, where the decoder's real transient workspace (the
- * inflated scanline buffer, live at the same time as the decoded pixel
- * buffer) scales with it directly: a 16-bit-per-channel RGBA PNG (64bpp)
- * needs a scanline row 8x wider than an 8-bit grayscale one at the same
- * pixel dimensions, not the flat "4 bytes/pixel" this used to assume
- * regardless of real bit depth. Pass 0 for every non-PNG call.
+ * format except PNG and PNG_STREAMING, where the decoder's real transient
+ * workspace (the inflated scanline buffer, live at the same time as the
+ * decoded pixel buffer for PNG; the two native-row filter buffers for
+ * PNG_STREAMING) scales with it directly: a 16-bit-per-channel RGBA PNG
+ * (64bpp) needs a scanline row 8x wider than an 8-bit grayscale one at the
+ * same pixel dimensions, not the flat "4 bytes/pixel" this used to assume
+ * regardless of real bit depth. Pass 0 for every other format.
  * Returns estimated bytes, or SIZE_MAX on overflow / invalid dimensions. */
 size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_size,
                                      size_t native_w, size_t native_h,

@@ -776,13 +776,6 @@ static void jpeg_libjpeg_scaled_dims(int native_w, int native_h, int target_w, i
 }
 
 
-/* Hard sanity ceiling on native PNG dimensions eligible for the streaming
- * decoder below -- a security/sanity bound against a pathological/malicious
- * dimension claim, not a memory-workaround bound (the streaming decoder's
- * own peak RAM is a small constant regardless of native size, so this can
- * be generous). Twice MAX_JPEG_NATIVE_SIDE, matching that same convention. */
-#define MAX_PNG_STREAMING_NATIVE_SIDE 8192
-
 static inline uint8_t paeth_predictor(int a, int b, int c) {
     int p = a + b - c;
     int pa = abs(p - a);
@@ -793,31 +786,67 @@ static inline uint8_t paeth_predictor(int a, int b, int c) {
     return c;
 }
 
-static cover_decode_result_t decode_png_streaming(const uint8_t * data, uint32_t size, int target_w, int target_h, uint16_t ** out_pixels) {
+/* Streaming decoder for large (up to MAX_PNG_STREAMING_NATIVE_SIDE) non-
+ * interlaced, 8-bit or 16-bit, RGB/RGBA (color type 2/6) PNGs -- the one case regular
+ * PNG decode (decode_png_rgb888(), lodepng) can't handle within a bounded
+ * memory budget, since lodepng always materializes the full native-size
+ * image before any scaling. Mirrors decode_jpeg_rgb888()'s own contract
+ * exactly (same signature shape, same "decode at the largest 1/2^n that
+ * still covers target_w x target_h, output that scaled RGB888 buffer"
+ * behavior) so the shared resize_cover_fit() call in
+ * cover_decode_to_rgb565_ex() does the final scale-to-target/crop for both
+ * decoders identically -- this function does not do any target-shaped
+ * cropping of its own. */
+static cover_decode_result_t decode_png_streaming(const uint8_t * data, uint32_t size, size_t max_side,
+                                                   int target_w, int target_h,
+                                                   uint8_t ** out_buf, int * out_w, int * out_h) {
     if (size < 8 + 25) return COVER_DECODE_FAIL_UNSUPPORTED;
     if (memcmp(data, "\x89PNG\r\n\x1a\n", 8) != 0) return COVER_DECODE_FAIL_UNSUPPORTED;
 
-    uint32_t pos = 8;
     int native_w = 0, native_h = 0;
-    uint8_t bit_depth = 0, color_type = 0, interlace_method = 0;
-    uint32_t total_idat_size = 0;
-    uint32_t scan_pos = pos;
+    uint8_t bit_depth = 0, color_type = 0, compression_method = 0, filter_method = 0, interlace_method = 0;
+    uint64_t total_idat_size = 0;
     bool found_ihdr = false;
-    
-    // Parse chunks
-    while (scan_pos + 8 <= size) {
-        uint32_t chunk_len = ((uint32_t)data[scan_pos] << 24) | ((uint32_t)data[scan_pos+1] << 16) | ((uint32_t)data[scan_pos+2] << 8) | data[scan_pos+3];
-        if (scan_pos + 12 + chunk_len > size) break;
+
+    /* Parse chunks. Every bound check below is subtraction-based against the
+     * bytes actually remaining in `data` (never an addition on
+     * attacker-controlled chunk_len) -- see jpeg_probe()'s own comment for
+     * why an addition-based check is unsafe: it can wrap a uint32_t near
+     * UINT32_MAX and silently pass when it shouldn't. Because every accepted
+     * chunk_len is bounded this way and scan_pos only ever advances within
+     * `size`, total_idat_size (the sum of disjoint IDAT chunk_lens, each
+     * part of this same size-byte buffer) can never itself overflow either.
+     *
+     * IHDR is required to be the very first chunk (PNG's own requirement)
+     * and only the first: a second chunk later in the stream that also
+     * claims to be "IHDR" is rejected outright rather than silently
+     * overwriting the dimensions already used for the routing/admission
+     * decision upstream (inspect_png()'s lodepng_inspect() only ever reads
+     * the first chunk) -- otherwise a crafted file could pass admission at
+     * one small, legal size and then decode as though it were a different,
+     * unchecked (and unbounded) size. */
+    uint32_t scan_pos = 8;
+    while (size - scan_pos >= 8) {
+        uint32_t chunk_len = ((uint32_t) data[scan_pos] << 24) | ((uint32_t) data[scan_pos + 1] << 16) |
+                             ((uint32_t) data[scan_pos + 2] << 8) | data[scan_pos + 3];
+        uint32_t remaining = size - scan_pos - 8;
+        if (remaining < 4 || chunk_len > remaining - 4) return COVER_DECODE_FAIL_UNSUPPORTED;
         const uint8_t * type = data + scan_pos + 4;
-        
-        if (memcmp(type, "IHDR", 4) == 0 && chunk_len >= 13) {
-            native_w = ((uint32_t)data[scan_pos+8] << 24) | ((uint32_t)data[scan_pos+9] << 16) | ((uint32_t)data[scan_pos+10] << 8) | data[scan_pos+11];
-            native_h = ((uint32_t)data[scan_pos+12] << 24) | ((uint32_t)data[scan_pos+13] << 16) | ((uint32_t)data[scan_pos+14] << 8) | data[scan_pos+15];
-            bit_depth = data[scan_pos+16];
-            color_type = data[scan_pos+17];
-            interlace_method = data[scan_pos+20];
+
+        if (memcmp(type, "IHDR", 4) == 0) {
+            if (scan_pos != 8 || found_ihdr || chunk_len < 13) return COVER_DECODE_FAIL_UNSUPPORTED;
+            native_w = (int) (((uint32_t) data[scan_pos + 8] << 24) | ((uint32_t) data[scan_pos + 9] << 16) |
+                              ((uint32_t) data[scan_pos + 10] << 8) | data[scan_pos + 11]);
+            native_h = (int) (((uint32_t) data[scan_pos + 12] << 24) | ((uint32_t) data[scan_pos + 13] << 16) |
+                              ((uint32_t) data[scan_pos + 14] << 8) | data[scan_pos + 15]);
+            bit_depth = data[scan_pos + 16];
+            color_type = data[scan_pos + 17];
+            compression_method = data[scan_pos + 18];
+            filter_method = data[scan_pos + 19];
+            interlace_method = data[scan_pos + 20];
             found_ihdr = true;
         } else if (memcmp(type, "IDAT", 4) == 0) {
+            if (!found_ihdr) return COVER_DECODE_FAIL_UNSUPPORTED;
             total_idat_size += chunk_len;
         } else if (memcmp(type, "IEND", 4) == 0) {
             break;
@@ -825,37 +854,57 @@ static cover_decode_result_t decode_png_streaming(const uint8_t * data, uint32_t
         scan_pos += 12 + chunk_len;
     }
 
-    if (!found_ihdr) return COVER_DECODE_FAIL_UNSUPPORTED;
-    if (interlace_method != 0 || bit_depth != 8 || (color_type != 2 && color_type != 6)) {
+    if (!found_ihdr || total_idat_size == 0) return COVER_DECODE_FAIL_UNSUPPORTED;
+    /* PNG spec: compression method and filter method are both always 0 --
+     * any other value isn't a real PNG, so reject at header parse rather
+     * than relying on the zlib/filter-byte handling below to eventually
+     * fail on it. */
+    if (compression_method != 0 || filter_method != 0) return COVER_DECODE_FAIL_UNSUPPORTED;
+    if (interlace_method != 0 || (bit_depth != 8 && bit_depth != 16) || (color_type != 2 && color_type != 6))
         return COVER_DECODE_FAIL_UNSUPPORTED;
-    }
-    
+    if (native_w <= 0 || native_h <= 0 ||
+        native_w > MAX_PNG_STREAMING_NATIVE_SIDE || native_h > MAX_PNG_STREAMING_NATIVE_SIDE)
+        return COVER_DECODE_FAIL_UNSUPPORTED;
+
     uint8_t scale = jpeg_scale_for_target(native_w, native_h, target_w, target_h);
     int scaled_w = native_w >> scale;
     int scaled_h = native_h >> scale;
-    if (scaled_w == 0) scaled_w = 1;
-    if (scaled_h == 0) scaled_h = 1;
+    if (scaled_w < 1) scaled_w = 1;
+    if (scaled_h < 1) scaled_h = 1;
 
-    // Crop box in scaled coordinates
-    
-    // Actually, resize_cover_fit does float math, but simple int crop is basically the same since we only have integer scales.
-    // Let's implement exact same logic:
-    // float scale_w = (float) target_w / (float) scaled_w;
-    // float scale_h = (float) target_h / (float) scaled_h;
-    // float fit_scale = scale_w > scale_h ? scale_w : scale_h;
-    // wait, resize_cover_fit upscales if fit_scale > 1.0. Here scaled_w/h >= target_w/h because it's the "largest 1/2^n that STILL COVERS the target". So scaled_w >= target_w and scaled_h >= target_h!
-    // So upscaling is false. We just crop!
-    
+    /* jpeg_scale_for_target() stops increasing scale once EITHER dimension
+     * would drop below its target dimension -- a policy choice to avoid
+     * ever needing to upscale afterward, which matters for tjpgd (which
+     * only ever downscales). That guarantee doesn't matter here:
+     * resize_cover_fit() (the shared caller below) already upscales
+     * correctly regardless. For an extreme-aspect-ratio native image where
+     * one dimension is already below its target at scale=0 (e.g. a
+     * 1400x400 banner: height already below a 480 target height stops the
+     * loop at scale=0), the OTHER dimension can still exceed max_side and
+     * genuinely need further downscaling purely to fit the memory cap --
+     * keep downscaling past jpeg_scale_for_target()'s stopping point until
+     * it does, same 1/2^n step as everywhere else in this file. */
+    while ((scaled_w > (int) max_side || scaled_h > (int) max_side) && scaled_w > 1 && scaled_h > 1) {
+        scale++;
+        scaled_w = native_w >> scale;
+        scaled_h = native_h >> scale;
+        if (scaled_w < 1) scaled_w = 1;
+        if (scaled_h < 1) scaled_h = 1;
+    }
+
+    size_t scaled_bytes = 0;
+    if (!rgb888_size_ok((size_t) scaled_w, (size_t) scaled_h, max_side, &scaled_bytes))
+        return COVER_DECODE_FAIL_OVERSIZED;
+
     uint8_t * idat_buf = malloc(total_idat_size);
     if (!idat_buf) return COVER_DECODE_FAIL_ALLOC;
-    
-    uint32_t idat_pos = 0;
-    scan_pos = pos;
-    while (scan_pos + 8 <= size) {
-        uint32_t chunk_len = ((uint32_t)data[scan_pos] << 24) | ((uint32_t)data[scan_pos+1] << 16) | ((uint32_t)data[scan_pos+2] << 8) | data[scan_pos+3];
-        if (scan_pos + 12 + chunk_len > size) break;
+
+    uint64_t idat_pos = 0;
+    scan_pos = 8;
+    while (size - scan_pos >= 8) {
+        uint32_t chunk_len = ((uint32_t) data[scan_pos] << 24) | ((uint32_t) data[scan_pos + 1] << 16) |
+                             ((uint32_t) data[scan_pos + 2] << 8) | data[scan_pos + 3];
         const uint8_t * type = data + scan_pos + 4;
-        
         if (memcmp(type, "IDAT", 4) == 0) {
             memcpy(idat_buf + idat_pos, data + scan_pos + 8, chunk_len);
             idat_pos += chunk_len;
@@ -864,166 +913,232 @@ static cover_decode_result_t decode_png_streaming(const uint8_t * data, uint32_t
         }
         scan_pos += 12 + chunk_len;
     }
-    
-    uint16_t * rgb565_buf = calloc((size_t)target_w * target_h, sizeof(uint16_t));
-    if (!rgb565_buf) {
-        free(idat_buf);
-        return COVER_DECODE_FAIL_ALLOC;
-    }
-    
+
+    uint8_t * rgb888_buf = malloc(scaled_bytes);
     uint8_t * dict_buf = malloc(TINFL_LZ_DICT_SIZE);
-    uint32_t bpp_bytes = (color_type == 6) ? 4 : 3;
-    uint32_t row_bytes = native_w * bpp_bytes + 1;
+    /* bytes_per_channel is 1 for 8-bit, 2 for 16-bit (PNG samples are always
+     * a whole number of bytes at these depths). bpp_bytes -- PNG's own
+     * "bytes per complete pixel" used by the Sub/Paeth filter math below to
+     * find each byte's left neighbor -- scales with it the same way the
+     * admission estimate already does via png_native_bpp/8
+     * (artwork_coordinator.c), so no changes are needed there. */
+    uint32_t bytes_per_channel = bit_depth / 8;
+    uint32_t bpp_bytes = ((color_type == 6) ? 4U : 3U) * bytes_per_channel;
+    uint32_t row_bytes = (uint32_t) native_w * bpp_bytes + 1;
     uint8_t * row_curr = malloc(row_bytes);
     uint8_t * row_prev = calloc(1, row_bytes);
-    
-    if (!dict_buf || !row_curr || !row_prev) {
-        free(idat_buf); free(rgb565_buf);
-        if (dict_buf) free(dict_buf);
-        if (row_curr) free(row_curr);
-        if (row_prev) free(row_prev);
+    uint32_t * accum_r = calloc((size_t) scaled_w, sizeof(uint32_t));
+    uint32_t * accum_g = calloc((size_t) scaled_w, sizeof(uint32_t));
+    uint32_t * accum_b = calloc((size_t) scaled_w, sizeof(uint32_t));
+
+    if (!rgb888_buf || !dict_buf || !row_curr || !row_prev || !accum_r || !accum_g || !accum_b) {
+        free(idat_buf); free(rgb888_buf); free(dict_buf); free(row_curr); free(row_prev);
+        free(accum_r); free(accum_g); free(accum_b);
         return COVER_DECODE_FAIL_ALLOC;
     }
-    
+
     tinfl_decompressor decomp;
     tinfl_init(&decomp);
-    
-    size_t in_pos = 0;
+
+    uint64_t in_pos = 0;
     size_t dict_ofs = 0;
     uint32_t current_y = 0;
     uint32_t row_filled = 0;
-    uint32_t block_size = 1 << scale;
-    
-    uint32_t * accum_r = calloc(scaled_w, sizeof(uint32_t));
-    uint32_t * accum_g = calloc(scaled_w, sizeof(uint32_t));
-    uint32_t * accum_b = calloc(scaled_w, sizeof(uint32_t));
-    
-    if (!accum_r || !accum_g || !accum_b) {
-        free(idat_buf); free(rgb565_buf); free(dict_buf); free(row_curr); free(row_prev);
-        if (accum_r) free(accum_r);
-        if (accum_g) free(accum_g);
-        if (accum_b) free(accum_b);
-        return COVER_DECODE_FAIL_ALLOC;
-    }
-    
+    uint32_t block_size = 1U << scale;
+    uint32_t rows_in_bucket = 0;
+    int dst_y_bucket = 0;
+
     cover_decode_result_t result = COVER_DECODE_OK;
     int status = TINFL_STATUS_NEEDS_MORE_INPUT;
-    
-    // We use resize_cover_fit's exact fractional cropping:
-    // crop_x = (scaled_w - target_w) / 2.0f;
-    // For each pixel in target: mapped_x = dx + crop_x;
-    // So target_x maps to scaled_x = target_x + crop_x
-    // Thus scaled_x maps to target_x = scaled_x - crop_x
-    // In resize_cover_fit, mapping is:
-    // float fx = ((dx + 0.5f) + crop_x) / 1.0f - 0.5f = dx + crop_x;
-    // So nearest pixel in scaled image is (int)(dx + crop_x + 0.5f)
-    // To go from scaled_x back to dx:
-    // dx = scaled_x - crop_x - 0.5f? No, since it's 1:1, dx = scaled_x - (int)crop_x.
-    // Let's just do integer crop since we are doing 1:1 mapping at the scaled resolution!
-    int icrop_x = (scaled_w - target_w) / 2;
-    int icrop_y = (scaled_h - target_h) / 2;
-    
-    while (current_y < (uint32_t)native_h) {
-        size_t in_bytes = total_idat_size - in_pos;
+
+    while (current_y < (uint32_t) native_h) {
+        size_t in_bytes = (size_t) (total_idat_size - in_pos);
         size_t out_bytes = TINFL_LZ_DICT_SIZE - dict_ofs;
-        
-        status = tinfl_decompress(&decomp, idat_buf + in_pos, &in_bytes, dict_buf, dict_buf + dict_ofs, &out_bytes, TINFL_FLAG_PARSE_ZLIB_HEADER | (in_bytes == total_idat_size - in_pos ? 0 : TINFL_FLAG_HAS_MORE_INPUT));
-        // wait, we pass all IDAT bytes, so it has no more input. But what if total_idat_size - in_pos == 0?
-        
+
+        /* The whole IDAT stream is concatenated into idat_buf up front, so
+         * every call passes the true remaining tail as `in_bytes` and never
+         * sets TINFL_FLAG_HAS_MORE_INPUT -- tinfl is correctly told "this is
+         * all the input there ever will be" on every call. */
+        status = tinfl_decompress(&decomp, idat_buf + in_pos, &in_bytes, dict_buf, dict_buf + dict_ofs,
+                                  &out_bytes, TINFL_FLAG_PARSE_ZLIB_HEADER);
+        if (status < 0) { result = COVER_DECODE_FAIL_UNSUPPORTED; break; }
+        if (in_bytes == 0 && out_bytes == 0 && status != TINFL_STATUS_DONE) {
+            /* No forward progress and not finished -- without
+             * TINFL_FLAG_HAS_MORE_INPUT tinfl should itself already fail
+             * with TINFL_STATUS_FAILED_CANNOT_MAKE_PROGRESS in this
+             * situation, but this guard makes that explicit rather than
+             * relying on it, closing off any chance of an infinite loop on
+             * truncated/corrupt input while artwork_coordinator's decode
+             * slot is held. */
+            result = COVER_DECODE_FAIL_UNSUPPORTED;
+            break;
+        }
         in_pos += in_bytes;
-        
+
         size_t processed = 0;
         while (processed < out_bytes) {
             size_t to_copy = row_bytes - row_filled;
             if (to_copy > out_bytes - processed) to_copy = out_bytes - processed;
-            
+
             memcpy(row_curr + row_filled, dict_buf + dict_ofs + processed, to_copy);
             row_filled += to_copy;
             processed += to_copy;
-            
+
             if (row_filled == row_bytes) {
                 uint8_t filter = row_curr[0];
                 for (uint32_t x = 1; x < row_bytes; x++) {
                     uint8_t a = (x > bpp_bytes) ? row_curr[x - bpp_bytes] : 0;
                     uint8_t b = row_prev[x];
                     uint8_t c = (x > bpp_bytes) ? row_prev[x - bpp_bytes] : 0;
-                    
-                    if (filter == 1) { row_curr[x] += a; }
-                    else if (filter == 2) { row_curr[x] += b; }
-                    else if (filter == 3) { row_curr[x] += (a + b) / 2; }
-                    else if (filter == 4) { row_curr[x] += paeth_predictor(a, b, c); }
+
+                    if (filter == 1) row_curr[x] = (uint8_t) (row_curr[x] + a);
+                    else if (filter == 2) row_curr[x] = (uint8_t) (row_curr[x] + b);
+                    else if (filter == 3) row_curr[x] = (uint8_t) (row_curr[x] + (a + b) / 2);
+                    else if (filter == 4) row_curr[x] = (uint8_t) (row_curr[x] + paeth_predictor(a, b, c));
                     else if (filter != 0) { result = COVER_DECODE_FAIL_UNSUPPORTED; break; }
                 }
                 if (result != COVER_DECODE_OK) break;
-                
-                int dst_y = current_y >> scale;
-                if (dst_y >= icrop_y && dst_y < icrop_y + target_h) {
-                    for (int sx = 0; sx < native_w; sx++) {
-                        int dst_x = sx >> scale;
-                        if (dst_x >= icrop_x && dst_x < icrop_x + target_w) {
-                            accum_r[dst_x] += row_curr[1 + sx * bpp_bytes + 0];
-                            accum_g[dst_x] += row_curr[1 + sx * bpp_bytes + 1];
-                            accum_b[dst_x] += row_curr[1 + sx * bpp_bytes + 2];
-                        }
-                    }
+
+                /* Horizontal box-downsample of this one native row into the
+                 * scaled_w-wide column accumulators. dst_x is clamped to
+                 * scaled_w-1 for the trailing columns left over when
+                 * native_w isn't a multiple of block_size (floor-scale
+                 * semantics -- see jpeg_scale_for_target()'s doc comment --
+                 * fold the remainder into the final column rather than
+                 * indexing one past accum_r/g/b, which is otherwise the
+                 * common case: dst_x = (native_w-1)>>scale equals scaled_w,
+                 * not scaled_w-1, whenever native_w isn't block_size-
+                 * aligned). */
+                for (int sx = 0; sx < native_w; sx++) {
+                    int dst_x = sx >> scale;
+                    if (dst_x >= scaled_w) dst_x = scaled_w - 1;
+                    /* Each channel is bytes_per_channel wide, big-endian
+                     * (PNG spec) -- taking only the first (most-significant)
+                     * byte of a 16-bit sample is the standard 16-to-8-bit
+                     * truncation, matching what the non-streaming PNG path
+                     * (decode_png_rgb888(), via lodepng_decode() into an
+                     * explicit 8-bit LCT_RGB target) already does for a
+                     * small 16-bit PNG. This pipeline only ever needs an
+                     * 8-bit RGB888/RGB565 result, so the low byte of each
+                     * sample carries no information this decoder uses. */
+                    uint32_t base = 1 + (uint32_t) sx * bpp_bytes;
+                    accum_r[dst_x] += row_curr[base + 0 * bytes_per_channel];
+                    accum_g[dst_x] += row_curr[base + 1 * bytes_per_channel];
+                    accum_b[dst_x] += row_curr[base + 2 * bytes_per_channel];
                 }
-                
-                if ((current_y & (block_size - 1)) == block_size - 1 || current_y == native_h - 1) {
-                    int count = block_size;
-                    if (current_y == native_h - 1 && (native_h & (block_size - 1)) != 0) {
-                        count = native_h & (block_size - 1);
+                rows_in_bucket++;
+
+                /* Vertical flush: every output row except the last is
+                 * exactly block_size native rows; the last output row
+                 * (dst_y_bucket == scaled_h-1) instead absorbs whatever
+                 * remains up to native_h-1, however many rows that is --
+                 * it is only ever flushed by the current_y==native_h-1
+                 * condition below, never by the rows_in_bucket==block_size
+                 * one, so a non-block_size-aligned native_h can't cause an
+                 * early partial flush of that bucket (dividing by
+                 * block_size while only block_size, not block_size+
+                 * remainder, rows had actually been accumulated). */
+                bool at_last_row = (current_y == (uint32_t) native_h - 1);
+                bool flush_now = at_last_row ||
+                                 (rows_in_bucket == block_size && dst_y_bucket < scaled_h - 1);
+                if (flush_now) {
+                    uint32_t rows_in_block = rows_in_bucket;
+                    uint8_t * out_row = rgb888_buf + (size_t) dst_y_bucket * (size_t) scaled_w * 3U;
+                    for (int dx = 0; dx < scaled_w; dx++) {
+                        uint32_t cols_in_block = (dx == scaled_w - 1)
+                            ? ((uint32_t) native_w - ((uint32_t) dx << scale))
+                            : block_size;
+                        uint32_t total_px = rows_in_block * cols_in_block;
+                        if (total_px == 0) total_px = 1;
+                        out_row[dx * 3 + 0] = (uint8_t) (accum_r[dx] / total_px);
+                        out_row[dx * 3 + 1] = (uint8_t) (accum_g[dx] / total_px);
+                        out_row[dx * 3 + 2] = (uint8_t) (accum_b[dx] / total_px);
+                        accum_r[dx] = 0; accum_g[dx] = 0; accum_b[dx] = 0;
                     }
-                    if (dst_y >= icrop_y && dst_y < icrop_y + target_h) {
-                        int target_dy = dst_y - icrop_y;
-                        for (int dx = icrop_x; dx < icrop_x + target_w; dx++) {
-                            int count_x = block_size;
-                            if (dx == scaled_w - 1 && (native_w & (block_size - 1)) != 0) {
-                                count_x = native_w & (block_size - 1);
-                            }
-                            int total_pixels = count * count_x;
-                            if (total_pixels == 0) total_pixels = 1;
-                            
-                            uint8_t r = accum_r[dx] / total_pixels;
-                            uint8_t g = accum_g[dx] / total_pixels;
-                            uint8_t b = accum_b[dx] / total_pixels;
-                            
-                            int target_dx = dx - icrop_x;
-                            rgb565_buf[target_dy * target_w + target_dx] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-                            
-                            accum_r[dx] = 0; accum_g[dx] = 0; accum_b[dx] = 0;
-                        }
-                    }
+                    dst_y_bucket++;
+                    rows_in_bucket = 0;
                 }
-                
+
                 uint8_t * temp = row_prev;
                 row_prev = row_curr;
                 row_curr = temp;
                 row_filled = 0;
                 current_y++;
-                if (current_y == native_h) break;
+                if (current_y == (uint32_t) native_h) {
+                    /* The drain loop below only ever sees output from
+                     * SUBSEQUENT tinfl_decompress() calls (it only runs
+                     * once this outer loop has exited) -- any leftover
+                     * decompressed bytes already sitting in this same call's
+                     * out_bytes, past what the last row consumed, would
+                     * otherwise never be checked. A well-formed IDAT
+                     * decompresses to exactly row_bytes*native_h bytes, so
+                     * leftover here means the same "unaccounted-for extra
+                     * scanline data" the drain loop's own out_bytes != 0
+                     * check exists to reject. */
+                    if (processed < out_bytes) result = COVER_DECODE_FAIL_UNSUPPORTED;
+                    break;
+                }
             }
         }
-        
-        if (result != COVER_DECODE_OK || current_y == native_h) break;
-        
+
+        if (result != COVER_DECODE_OK || current_y == (uint32_t) native_h) break;
+
+        /* tinfl's own contract (miniz_tinfl.h): once it returns DONE, every
+         * subsequent call -- regardless of input -- just returns DONE again
+         * with zero output. Without this check, a syntactically valid but
+         * short zlib stream (fewer than native_h rows' worth of scanline
+         * bytes, followed by a valid end-of-stream/Adler-32) would leave
+         * current_y stuck below native_h forever: the zero-progress guard
+         * above never fires (status IS DONE, not negative or stalled), so
+         * the outer while (current_y < native_h) loop would spin
+         * indefinitely while artwork_coordinator's decode slot is held. */
+        if (status == TINFL_STATUS_DONE) {
+            result = COVER_DECODE_FAIL_UNSUPPORTED;
+            break;
+        }
+
         dict_ofs += out_bytes;
         if (dict_ofs == TINFL_LZ_DICT_SIZE) dict_ofs = 0;
-        
-        if (status < 0) {
+    }
+
+    /* Every scaled_h output row can be produced without the zlib stream
+     * ever actually finishing -- a stream truncated right after the last
+     * needed byte, or with a corrupt/missing trailing Adler-32, would
+     * otherwise decode every pixel correctly and still be silently
+     * accepted. Keep draining until tinfl itself reports DONE (verifying
+     * the checksum) or fails, exactly the same "don't trust a decode that
+     * merely produced enough bytes" policy as decode_jpeg_libjpeg_rgb888()'s
+     * own num_warnings check. A well-formed PNG's IDAT decompresses to
+     * exactly row_bytes*native_h bytes and no more -- any further output
+     * bytes here mean the stream is carrying extra, unaccounted-for
+     * scanline data, which is rejected rather than silently discarded. */
+    while (result == COVER_DECODE_OK && status != TINFL_STATUS_DONE) {
+        if (in_pos >= total_idat_size) { result = COVER_DECODE_FAIL_UNSUPPORTED; break; }
+        size_t in_bytes = (size_t) (total_idat_size - in_pos);
+        size_t out_bytes = TINFL_LZ_DICT_SIZE - dict_ofs;
+        status = tinfl_decompress(&decomp, idat_buf + in_pos, &in_bytes, dict_buf, dict_buf + dict_ofs,
+                                  &out_bytes, TINFL_FLAG_PARSE_ZLIB_HEADER);
+        in_pos += in_bytes;
+        dict_ofs += out_bytes;
+        if (dict_ofs == TINFL_LZ_DICT_SIZE) dict_ofs = 0;
+        if (status < 0) { result = COVER_DECODE_FAIL_UNSUPPORTED; break; }
+        if (out_bytes != 0) { result = COVER_DECODE_FAIL_UNSUPPORTED; break; }
+        if (in_bytes == 0 && out_bytes == 0 && status != TINFL_STATUS_DONE) {
             result = COVER_DECODE_FAIL_UNSUPPORTED;
             break;
         }
     }
-    
+
     free(accum_r); free(accum_g); free(accum_b);
     free(dict_buf); free(row_curr); free(row_prev); free(idat_buf);
-    
+
     if (result == COVER_DECODE_OK) {
-        *out_pixels = rgb565_buf;
+        *out_buf = rgb888_buf;
+        *out_w = scaled_w;
+        *out_h = scaled_h;
     } else {
-        free(rgb565_buf);
+        free(rgb888_buf);
     }
-    
     return result;
 }
 
@@ -1134,7 +1249,8 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
         }
     } else {
         if ((size_t) native_w > max_side || (size_t) native_h > max_side) {
-            if (fmt == ARTWORK_FORMAT_PNG && png_interlace == 0 && png_bit_depth == 8 &&
+            if (fmt == ARTWORK_FORMAT_PNG && png_interlace == 0 &&
+                (png_bit_depth == 8 || png_bit_depth == 16) &&
                 (png_color_type == 2 || png_color_type == 6)) {
                 if (native_w > MAX_PNG_STREAMING_NATIVE_SIDE || native_h > MAX_PNG_STREAMING_NATIVE_SIDE) {
                     DBG_LOG("cover_decode: streaming PNG rejected by hard native dimension cap (%dx%d > max %d)\n",
@@ -1221,15 +1337,8 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
         dec_res = decode_jpeg_libjpeg_rgb888(data, size, max_side, target_w, target_h,
                                              &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_PNG_STREAMING) {
-        uint16_t * resized = NULL;
-        dec_res = decode_png_streaming(data, size, target_w, target_h, &resized);
-        artwork_coordinator_release(prio);
-        if (dec_res == COVER_DECODE_OK && resized) {
-            *out_pixels = resized;
-        } else {
-            if (resized) free(resized);
-        }
-        return dec_res;
+        dec_res = decode_png_streaming(data, size, max_side, target_w, target_h,
+                                       &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_PNG) {
         dec_res = decode_png_rgb888(data, size, max_side, &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_BMP) {

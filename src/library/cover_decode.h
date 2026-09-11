@@ -10,6 +10,19 @@
 #define MAX_PLAYER_COVER_SIDE  MAX_DECODED_COVER_SIDE
 #define MAX_THUMBNAIL_COVER_SIDE MAX_DECODED_COVER_SIDE
 
+/* Hard sanity ceiling on native PNG dimensions eligible for the streaming
+ * decoder (cover_decode.c's decode_png_streaming()) -- a security/sanity
+ * bound against a pathological/malicious dimension claim, not a
+ * memory-workaround bound (the streaming decoder's own peak RAM is bounded
+ * by the post-scale output size regardless of native size, so this can be
+ * generous). Twice MAX_JPEG_NATIVE_SIDE, matching that same convention.
+ * Shared with artwork_coordinator.c's admission estimate so the two can
+ * never independently drift out of sync on what this decoder is allowed to
+ * attempt (a prior mismatch -- estimator capped at 4096, decoder at 8192 --
+ * silently made every 4097-8192px streaming-eligible PNG a permanent
+ * LOW_MEMORY reject instead of ever reaching the decoder). */
+#define MAX_PNG_STREAMING_NATIVE_SIDE 8192
+
 typedef enum {
     COVER_DECODE_OK = 0,
     COVER_DECODE_FAIL_UNSUPPORTED,  /* Corrupt header or unsupported format */

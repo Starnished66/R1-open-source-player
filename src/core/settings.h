@@ -11,6 +11,11 @@ extern const int SCREEN_TIMEOUT_STEPS[];
 #define SCREEN_TIMEOUT_MIN_SECONDS 15
 #define SCREEN_TIMEOUT_MAX_SECONDS 1800
 
+extern const int SCREEN_DIM_DELAY_STEPS[];
+#define SCREEN_DIM_DELAY_STEP_COUNT 7
+#define SCREEN_DIM_DELAY_MIN_SECONDS 5
+#define SCREEN_DIM_DELAY_MAX_SECONDS 300
+
 /* Idle-shutdown choices, in minutes -- same discrete-steps reasoning as
  * SCREEN_TIMEOUT_STEPS above. This is a full poweroff (see idle_shutdown.h),
  * not a sleep, so the steps skew longer than the screen timeout. */
@@ -137,8 +142,9 @@ typedef struct {
     int screen_timeout_seconds;
 
     /* Pre-timeout low-brightness stage. When enabled, gui.c dims an idle
-     * screen to approximately 5% before the full screen timeout. */
+     * screen to BACKLIGHT_MIN_PERCENT before the final timeout. */
     bool screen_dimming_enabled;
+    int screen_dim_delay_seconds;
 
     /* Hide the global status bar (and, on the Player specifically, the
      * standalone back arrow) while the Player or its fullscreen Lyrics

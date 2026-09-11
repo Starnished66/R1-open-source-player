@@ -28,6 +28,7 @@ lv_font_t app_font_lyrics;
   #define FALLBACK_FONT_FILE FALLBACK_FONT_ROOT "cjk_cyrillic.ttf"
   #define KOREAN_FONT_FILE FALLBACK_FONT_ROOT "korean.ttf"
   #define THAI_FONT_FILE FALLBACK_FONT_ROOT "thai.ttf"
+  #define EMOJI_FONT_FILE FALLBACK_FONT_ROOT "emoji.ttf"
   #define CUSTOM_FONT_SD_DIR "music/Fonts"
   #define CUSTOM_FONT_ALT_SD_DIR "Fonts"
   #define STAGING_DIR "build_host/fonts"
@@ -37,6 +38,7 @@ lv_font_t app_font_lyrics;
   #define FALLBACK_FONT_FILE "/usr/resource/fonts/cjk_cyrillic.ttf"
   #define KOREAN_FONT_FILE "/usr/resource/fonts/Korean.ttf"
   #define THAI_FONT_FILE "/usr/resource/fonts/Thai.ttf"
+  #define EMOJI_FONT_FILE "/usr/resource/fonts/emoji.ttf"
   #define CUSTOM_FONT_SD_DIR "/data/mnt/sd_0/Fonts"
   #define CUSTOM_FONT_ALT_SD_DIR "/data/mnt/sd_0/fonts"
   #define STAGING_DIR "/data/app_data/fonts"
@@ -64,7 +66,7 @@ static bool s_fallback_loaded = false;
  * during list scrolling. The buffer is shared across pixel-size instances built from
  * the same file.
  *
- * Fallback faces (CJK, Korean, Thai) stream from disk to preserve RAM given their
+ * Fallback faces (CJK, Korean, Thai, Emoji) stream from disk to preserve RAM given their
  * larger file sizes and lower consultation frequency.
  *
  * s_custom_font_data/_size/_generation holds the committed buffer that built
@@ -81,6 +83,7 @@ typedef enum {
     FACE_SRC_CJK,
     FACE_SRC_KOREAN,
     FACE_SRC_THAI,
+    FACE_SRC_EMOJI,
     FACE_SRC_COUNT
 } face_source_type_t;
 
@@ -91,6 +94,7 @@ typedef struct {
     lv_font_t * font;
 } loaded_face_entry_t;
 
+/* roughly 5 distinct pixel sizes (four general UI sizes + one independent Lyrics size) x (1 custom + 4 fallback faces) = 25 entries */
 #define MAX_LOADED_FACES 32
 static loaded_face_entry_t s_loaded_faces[MAX_LOADED_FACES];
 static int s_loaded_face_count = 0;
@@ -166,6 +170,8 @@ static const char * face_source_file_path(face_source_type_t type, bool custom_s
             return KOREAN_FONT_FILE;
         case FACE_SRC_THAI:
             return THAI_FONT_FILE;
+        case FACE_SRC_EMOJI:
+            return EMOJI_FONT_FILE;
         default:
             return NULL;
     }
@@ -350,11 +356,13 @@ static bool build_candidate_slot(face_table_t * tbl, lv_font_t * out_font, int p
         lv_font_t * cjk = get_or_load_face_in_table(tbl, FACE_SRC_CJK, pixel_size, custom_staged, custom_gen);
         lv_font_t * kr = get_or_load_face_in_table(tbl, FACE_SRC_KOREAN, pixel_size, custom_staged, custom_gen);
         lv_font_t * th = get_or_load_face_in_table(tbl, FACE_SRC_THAI, pixel_size, custom_staged, custom_gen);
+        lv_font_t * emoji = get_or_load_face_in_table(tbl, FACE_SRC_EMOJI, pixel_size, custom_staged, custom_gen);
 
         lv_font_t * fallback_head = NULL;
         if (cjk) font_chain_append(&fallback_head, cjk);
         if (kr)  font_chain_append(&fallback_head, kr);
         if (th)  font_chain_append(&fallback_head, th);
+        if (emoji) font_chain_append(&fallback_head, emoji);
 
         out_font->fallback = fallback_head;
     }
@@ -399,11 +407,18 @@ static bool build_new_tier_slot(face_table_t * tbl, lv_font_t * out_font,
     lv_font_t * kr = load_new_face_in_table(tbl, FACE_SRC_KOREAN, pixel_size, false, 0);
     lv_font_t * th = load_new_face_in_table(tbl, FACE_SRC_THAI, pixel_size, false, 0);
     if (!cjk || !kr || !th) return false;
+    /* Emoji is intentionally optional, unlike cjk/kr/th above: it's a nice-to-have
+     * enhancement, not core-market localization, and its file is only present after a
+     * full firmware repack (see firmware/overlay/) -- an SD-only player-binary update,
+     * adb-pushed binary, or the R3 Pro II board (no repack step yet) never has it, and
+     * that must not break the rest of the font stack. */
+    lv_font_t * emoji = load_new_face_in_table(tbl, FACE_SRC_EMOJI, pixel_size, false, 0);
 
     lv_font_t * head = NULL;
     font_chain_append(&head, cjk);
     font_chain_append(&head, kr);
     font_chain_append(&head, th);
+    if (emoji) font_chain_append(&head, emoji);
     out_font->fallback = head;
     return true;
 }
@@ -588,19 +603,47 @@ bool fallback_font_validate_file(const char * path) {
 
     FILE * f = fopen(path, "rb");
     if (!f) return false;
+
     uint8_t hdr[4];
     if (fread(hdr, 1, 4, f) != 4) { fclose(f); return false; }
-    fclose(f);
 
     uint32_t magic = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
                      ((uint32_t)hdr[2] << 8) | (uint32_t)hdr[3];
     if (magic != 0x00010000 && magic != 0x74727565) {
         DBG_LOG("fallback_font: invalid TTF magic 0x%08X in %s\n", (unsigned int)magic, path);
+        fclose(f);
         return false;
     }
 
-    char lv_path[PATH_MAX + 4];
-    snprintf(lv_path, sizeof(lv_path), "S:%s", path);
+    /* Read the whole candidate file into RAM once (already bounded by the
+     * MAX_CUSTOM_FONT_FILE_SIZE check above) and validate against that in-memory
+     * copy via lv_tiny_ttf_create_data() instead of the disk-streamed
+     * lv_tiny_ttf_create_file() -- the streamed path routes every single glyph
+     * lookup below through real lv_fs_seek()/lv_fs_read() filesystem calls (see
+     * lv_tiny_ttf.c's own ttf_cb_stream_read()/ttf_cb_stream_seek()), and this
+     * loop does that lookup up to 950 times (10 pixel sizes x 95 ASCII
+     * characters) per newly-selected custom font -- a very large number of
+     * small, synchronous filesystem round trips entirely on the UI thread,
+     * which is what made applying certain custom fonts visibly lag the whole
+     * player. Validating against an already-resident buffer instead turns
+     * those into cheap in-memory accesses with no behavioral change to what's
+     * accepted or rejected. */
+    rewind(f);
+    uint8_t * data = lv_malloc((size_t) st.st_size);
+    if (!data) {
+        DBG_LOG("fallback_font: out of memory validating %s (%lld bytes)\n",
+                path, (long long) st.st_size);
+        fclose(f);
+        return false;
+    }
+    size_t n = fread(data, 1, (size_t) st.st_size, f);
+    fclose(f);
+    if (n != (size_t) st.st_size) {
+        DBG_LOG("fallback_font: short read validating %s (%zu of %lld bytes)\n",
+                path, n, (long long) st.st_size);
+        lv_free(data);
+        return false;
+    }
 
     /* Validate test loads and metrics at all tier pixel sizes */
     static const int s_test_sizes[] = { 16, 20, 22, 24, 26, 28, 30, 32, 34, 40 };
@@ -608,7 +651,7 @@ bool fallback_font_validate_file(const char * path) {
 
     for (size_t s = 0; s < sizeof(s_test_sizes)/sizeof(s_test_sizes[0]); s++) {
         int px = s_test_sizes[s];
-        lv_font_t * tf = lv_tiny_ttf_create_file(lv_path, px);
+        lv_font_t * tf = lv_tiny_ttf_create_data(data, (size_t) st.st_size, px);
         if (!tf) {
             DBG_LOG("fallback_font: test create failed at size %d for %s\n", px, path);
             valid = false;
@@ -635,6 +678,8 @@ bool fallback_font_validate_file(const char * path) {
         lv_tiny_ttf_destroy(tf);
         if (!valid) break;
     }
+
+    lv_free(data);
     return valid;
 }
 

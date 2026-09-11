@@ -444,7 +444,6 @@ void crossfade_switch_event_cb(lv_event_t * e);
 void lyrics_switch_event_cb(lv_event_t * e);
 void car_mode_switch_event_cb(lv_event_t * e);
 void swipe_up_home_switch_event_cb(lv_event_t * e);
-void screen_dimming_switch_event_cb(lv_event_t * e);
 void hide_player_topbar_switch_event_cb(lv_event_t * e);
 void charge_limiter_switch_event_cb(lv_event_t * e);
 void safe_charging_switch_event_cb(lv_event_t * e);

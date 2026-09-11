@@ -7,6 +7,7 @@
 
 typedef struct {
     int32_t * offsets;
+    int32_t * line_space;   /* NEW: per-line computed overshoot, parallel to offsets[0..count-1] */
     int count;
     int32_t top_pad;
     int32_t row_width;
@@ -19,6 +20,7 @@ void lyrics_layout_build(lyrics_layout_t * layout, const lyrics_doc_t * doc, con
 void lyrics_layout_destroy(lyrics_layout_t * layout);
 int32_t lyrics_layout_y(const lyrics_layout_t * layout, int index);
 int32_t lyrics_layout_height(const lyrics_layout_t * layout, int index);
+int32_t lyrics_layout_line_space(const lyrics_layout_t * layout, int index);   /* NEW */
 int lyrics_layout_first_at_y(const lyrics_layout_t * layout, int32_t y, int count);
 
 #endif

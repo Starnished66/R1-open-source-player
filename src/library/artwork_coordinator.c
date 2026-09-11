@@ -175,12 +175,15 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
         decoder_workspace = peak_pair_bytes + icc_estimate_bytes + (128ULL * 1024ULL);
     } else if (fmt == ARTWORK_FORMAT_JPEG) {
         decoder_workspace = 32ULL * 1024ULL;
-    } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE) {
+    } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE || fmt == ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE) {
         /* 128KiB workspace (Huffman tables, MCU row buffers, jpeg_decompress_
          * struct) -- larger than baseline tjpgd's flat 32KiB since libjpeg's
          * struct/table footprint is genuinely bigger, independent of image
          * size. progressive_coeff_bytes (the real, dimension/sampling-
-         * dependent cost) is added on top, not folded into this constant. */
+         * dependent cost) is added on top, not folded into this constant --
+         * always 0 for JPEG_LIBJPEG_BASELINE, whose caller never computes a
+         * real one (that path is single-scan only; the decoder itself
+         * rejects a sequential-multiscan SOF0 before it would need one). */
         decoder_workspace = 128ULL * 1024ULL + progressive_coeff_bytes;
     } else if (fmt == ARTWORK_FORMAT_BMP) {
         decoder_workspace = 16ULL * 1024ULL;

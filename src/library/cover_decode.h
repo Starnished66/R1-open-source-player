@@ -57,8 +57,10 @@ static inline bool jpeg_decode_dims_ok(int native_w, int native_h, int target_w,
 /* Cheap up-front JPEG header inspection, independent of tjpgd's jd_prepare()
  * (which rejects progressive/SOF2 outright and allocates Huffman tables even
  * for the baseline case). Walks markers (SOI -> skip APPn/COM/DQT/DHT/DRI ->
- * first SOFn) with no heap allocation, so both baseline and progressive
- * files can be routed correctly BEFORE committing to either decoder. */
+ * first SOFn) with no heap allocation, so baseline, progressive, and
+ * tjpgd-incompatible-sampling baseline files can all be routed correctly
+ * BEFORE committing to either decoder -- see is_progressive/
+ * tjpgd_incompatible above. */
 typedef struct {
     bool is_progressive;  /* true only for SOF2 */
     bool supported;       /* false for arithmetic coding (SOF9-SOF15), lossless
@@ -67,6 +69,18 @@ typedef struct {
                             * genuinely malformed marker -- caller must treat as
                             * COVER_DECODE_FAIL_UNSUPPORTED regardless of
                             * is_progressive in that case. */
+    /* true only for a baseline (SOF0) JPEG whose per-component sampling
+     * factors tjpgd's own minimal whitelist would reject -- anything other
+     * than 4:4:4 (0x11), 4:2:0 (0x22), or 4:2:2-horizontal (0x21) for
+     * component 0, non-0x11 for any other component, or a component count
+     * other than 1 or 3 (see lvgl/src/libs/tjpgd/tjpgd.c's own SOF0
+     * handler). Always false when is_progressive is true (that case is
+     * already fully handled by is_progressive) or when !supported.
+     * This is a ROUTING HINT, not a decode guarantee: a 2- or 4-component
+     * file can set this true, but the libjpeg fallback's forced JCS_RGB
+     * output does not implement CMYK/YCCK conversion, so such a file will
+     * still fail to decode (cleanly) rather than succeed. */
+    bool tjpgd_incompatible;
     int native_w;
     int native_h;
     /* Real coefficient-buffer size estimate for progressive JPEG admission
@@ -93,10 +107,14 @@ bool jpeg_probe(const uint8_t * data, uint32_t size, jpeg_probe_t * result);
  * with a "cover fit" (scale to fully fill target_w x target_h, center-
  * cropping whichever dimension overflows -- same as a photo app's cover/
  * thumbnail mode) into a newly malloc()'d RGB565 buffer the caller owns and
- * must free(). JPEGs are decompressed at the largest tjpgd 1/2^n that still
- * covers the target, then cover-fitted; PNG/BMP decode at native size first.
- * JPEG native may be up to 4096px if scaled RGB888 <= 1200px; PNG/BMP still
- * reject native dimensions exceeding 1200px.
+ * must free(). JPEGs are decompressed at the largest 1/2^n that still covers
+ * the target (tjpgd for ordinary baseline, or a vendored libjpeg fallback
+ * for progressive/SOF2 and for baseline with a chroma sampling factor
+ * tjpgd's own whitelist rejects -- see jpeg_probe_t), then cover-fitted;
+ * PNG/BMP decode at native size first. JPEG native may be up to 4096px if
+ * scaled RGB888 <= 1200px (progressive JPEG is the one exception: its
+ * native-scaling coefficient-buffer cost caps it at 1200px native); PNG/BMP
+ * still reject native dimensions exceeding 1200px.
  * Serialized through the process-wide artwork decode coordinator with memory admission. */
 bool cover_decode_to_rgb565(const uint8_t * data, uint32_t size, int target_w, int target_h,
                             uint16_t ** out_pixels);

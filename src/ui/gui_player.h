@@ -60,6 +60,8 @@ bool gui_player_queue_select(uint64_t revision, int index);
 void gui_player_queue_clear_all(void);
 bool gui_player_queue_save_as(const char * name);
 void gui_player_queue_checkpoint(void);
+void gui_player_queue_checkpoint_urgent(void);
+void gui_player_queue_poll_urgent(void);
 bool gui_player_queue_write_busy(void);
 void gui_player_queue_flush(void);
 void gui_player_play_at(int index);

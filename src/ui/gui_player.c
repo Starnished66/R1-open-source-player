@@ -3267,9 +3267,15 @@ void toggle_play_pause(void) {
         plugin_manager_notify_resumed();
     } else {
         /* Checkpoint the resume position on pause -- a natural point to
-         * persist, and far less write-heavy than saving on every tick. */
+         * persist, and far less write-heavy than saving on every tick.
+         * Also urgently (re)writes the queue-checkpoint file (the file
+         * startup restore actually reads for SD/internal tracks, separate
+         * from settings.txt's own last_position field), so a pause
+         * immediately followed by any kind of reboot does not resume from
+         * a stale pre-pause position. */
         current_settings.last_position = audio_get_resume_position_seconds();
         settings_save(&current_settings);
+        gui_player_queue_checkpoint_urgent();
         plugin_manager_notify_paused();
     }
 }
@@ -3346,15 +3352,6 @@ void swipe_up_home_switch_event_cb(lv_event_t * e) {
     gui_shell_set_home_indicator_visible(current_settings.swipe_up_home_enabled &&
                                          active != gui_shell_get_home_screen() &&
                                          active != gui_lyrics_get_screen());
-    settings_save(&current_settings);
-}
-
-void screen_dimming_switch_event_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-    current_settings.screen_dimming_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    if (!current_settings.screen_dimming_enabled) {
-        backlight_set_dimmed(false);
-    }
     settings_save(&current_settings);
 }
 
@@ -3512,6 +3509,12 @@ void gui_player_poll_confirmed_playback(void) {
 
 void gui_player_update_progress(void) {
     gui_player_poll_confirmed_playback();
+    if (deferred_resume_pending) return; /* audio_get_position_seconds()/
+        audio_get_duration_seconds() are both meaningless here -- no decoder is open
+        yet. Preserve prepare_deferred_resume()'s seeded slider/label values until the
+        user presses Play (which clears deferred_resume_pending and opens the real
+        decoder, at which point this function's normal live-value logic takes over
+        correctly on its own). */
     double position = audio_get_position_seconds();
     double duration = audio_get_duration_seconds();
 
@@ -3669,6 +3672,7 @@ static checkpoint_worker_ctx_t checkpoint_ctx;
 static pthread_t checkpoint_thread;
 static bool checkpoint_running;
 static atomic_bool checkpoint_done;
+static atomic_bool checkpoint_urgent_pending;
 
 /* Plain uint64_t, not atomic: this target's toolchain lacks a native 64-bit
  * atomic instruction and needs libatomic for one (confirmed -- linking
@@ -3775,6 +3779,29 @@ void gui_player_queue_checkpoint(void) {
     atomic_store(&checkpoint_done, false);
     checkpoint_running = pthread_create(&checkpoint_thread, NULL, queue_checkpoint_worker, &checkpoint_ctx) == 0;
     if (!checkpoint_running) { queue_resume_free(&checkpoint_ctx.queue); *last_rev = 0; }
+}
+
+/* Like gui_player_queue_checkpoint(), but guarantees the request is not silently
+ * dropped if a previous checkpoint's background worker is still writing: it marks
+ * an urgent-pending flag instead, which gui_player_queue_poll_urgent() below
+ * retries on the very next UI poll tick once the in-flight worker finishes,
+ * rather than waiting for the next scheduled 30-second/1-second periodic tick. */
+void gui_player_queue_checkpoint_urgent(void) {
+    if (checkpoint_running && !atomic_load(&checkpoint_done)) {
+        atomic_store(&checkpoint_urgent_pending, true);
+        return;
+    }
+    gui_player_queue_checkpoint();
+}
+
+/* Called every UI poll tick (gui_queue_poll()) to retry a checkpoint request that
+ * gui_player_queue_checkpoint_urgent() deferred because a worker was already
+ * in flight. No-op unless a retry is actually pending. */
+void gui_player_queue_poll_urgent(void) {
+    if (!atomic_load(&checkpoint_urgent_pending)) return;
+    if (checkpoint_running && !atomic_load(&checkpoint_done)) return; /* still busy */
+    atomic_store(&checkpoint_urgent_pending, false);
+    gui_player_queue_checkpoint();
 }
 
 void gui_player_queue_flush(void) {
@@ -4052,6 +4079,43 @@ void prepare_deferred_resume(int index, double start_seconds) {
     set_play_button_state(false);
     deferred_resume_pending = true;
     deferred_resume_position = start_seconds;
+
+    /* apply_track_metadata_to_ui() just reset the progress slider/labels to
+     * 0:00 on the assumption a real decoder is about to open and the timer
+     * (gui_player_update_progress()) will pick up the true position/duration
+     * within its next tick -- see that function's own comment. That doesn't
+     * happen here: deferred resume deliberately leaves the audio subsystem
+     * untouched until the user presses Play (see install_saved_resume_
+     * playlist()'s own comment), so audio_get_position_seconds()/
+     * audio_get_duration_seconds() both read 0 the whole time this screen
+     * sits paused, and the progress UI would otherwise falsely show the
+     * track at its very beginning until Play is pressed. Probe the file
+     * directly instead -- the same lightweight, decoder-open/close-only
+     * call (no ALSA/output-device involvement) the Library screen's own
+     * track-info display already uses for showing duration without
+     * playing a track (see format_music_submenu_identity() in
+     * gui_library.c) -- so the seek bar and elapsed time reflect the real
+     * resume point immediately, not just after Play is pressed. */
+    const char * path = playlist_path_at(index);
+    audio_current_format_info_t probe;
+    if (path && isfinite(start_seconds) && audio_probe_file_format(path, &probe) && probe.duration_seconds > 0.0) {
+        double position = start_seconds;
+        if (position < 0.0) position = 0.0;
+        if (position > probe.duration_seconds) position = probe.duration_seconds;
+
+        int32_t percent = (int32_t) ((position / probe.duration_seconds) * 100.0);
+        displayed_progress_percent = percent;
+        lv_slider_set_value(progress_slider, percent, LV_ANIM_OFF);
+
+        displayed_position_second = (int) position;
+        displayed_duration_second = (int) probe.duration_seconds;
+        char time_str[24];
+        gui_format_time(position, time_str, sizeof(time_str));
+        lv_label_set_text(pos_label, time_str);
+        gui_format_time(probe.duration_seconds, time_str, sizeof(time_str));
+        lv_label_set_text(dur_label, time_str);
+    }
+
     nav_push(player_screen);
 }
 

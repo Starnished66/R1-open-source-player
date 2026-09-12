@@ -21,7 +21,7 @@
  *  4. gui_navigation_teardown() -- resets the nav stack and destroys its own
  *     snapshot/transition-cache buffers. Does NOT delete any screen itself
  *     (each screen is owned and freed by its own module, right below).
- *  5. Every module's own _teardown(): lv_obj_del()s the screens/popups it
+ *  5. Every module's own _teardown(): lv_obj_delete()s the screens/popups it
  *     owns, INCLUDING any recurring lv_timer_t its _init() unconditionally
  *     (re)creates (volume_popup_hide_timer, lyrics_timer, text_entry_
  *     multitap_timer) -- left running, the old (leaked) timer's own

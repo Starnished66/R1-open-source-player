@@ -8,6 +8,7 @@
 #include "lvgl/lvgl.h"
 #include "assets.h"
 #include "gui.h"
+#include "screen_builders.h"
 
 #include "settings.h"
 #include "metadata.h"
@@ -46,7 +47,6 @@ extern lv_font_t app_font_lyrics;
 extern void enable_gesture_bubble_recursive(lv_obj_t * parent);
 extern lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * text);
 extern lv_color_t accent_lv_color(void);
-extern lv_obj_t * build_subsonic_list_screen(const char * title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
 extern void show_error_toast(const char * msg);
 extern void gui_navigation_invalidate_font_snapshots(void);
 
@@ -906,11 +906,8 @@ static void populate_lyrics_font_size_screen(void) {
     lv_obj_clean(lyrics_font_size_list);
     for (size_t i = 0; i < LYRICS_FONT_SIZE_OPTION_COUNT; i++) {
         bool selected = current_settings.lyrics_font_size_tier == lyrics_font_size_options[i].tier;
-        lv_obj_t * row = add_pill_row_base(lyrics_font_size_list, lyrics_font_size_options[i].label);
-        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
-        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, lyrics_font_size_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        add_pill_option_row(lyrics_font_size_list, lyrics_font_size_options[i].label,
+                            selected, lyrics_font_size_option_row_cb, (void *) (intptr_t) i);
     }
 }
 /* Live-apply, same black-mask-behind-a-one-shot-timer shape as the general
@@ -1000,16 +997,12 @@ void gui_lyrics_teardown(void) {
      * leaked-old-timer hazard as gui_player_teardown()'s volume_popup_hide_
      * timer, see its own comment. */
     if (lyrics_timer) { lv_timer_del(lyrics_timer); lyrics_timer = NULL; }
-    if (lyrics_screen) { lv_obj_del(lyrics_screen); lyrics_screen = NULL; }
-    if (lyrics_font_size_screen) { lv_obj_del(lyrics_font_size_screen); lyrics_font_size_screen = NULL; }
+    if (lyrics_screen) { lv_obj_delete(lyrics_screen); lyrics_screen = NULL; }
+    if (lyrics_font_size_screen) { lv_obj_delete(lyrics_font_size_screen); lyrics_font_size_screen = NULL; }
 }
 
 lv_obj_t * gui_lyrics_get_screen(void) {
     return lyrics_screen;
-}
-
-lv_obj_t * gui_lyrics_get_font_size_screen(void) {
-    return lyrics_font_size_screen;
 }
 
 void gui_lyrics_poll_load(void) {

@@ -1078,7 +1078,6 @@ void gui_show_boot_splash(void) {
 }
 
 
-/* build_files_screen moved to gui_library.c */
 
 
 
@@ -1086,7 +1085,6 @@ const char * basename_of(const char * path) {
     const char * slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
 }
-/* group_song_entries moved to gui_library.c */
 
 
 const char * gui_plugin_get_play_mode(void) {
@@ -1323,7 +1321,7 @@ static lv_obj_t * build_stream_media_screen(void) {
  * wrappers instead of calling it directly. */
 void gui_stream_media_teardown(void) {
     if (stream_media_screen) {
-        lv_obj_del(stream_media_screen);
+        lv_obj_delete(stream_media_screen);
         stream_media_screen = NULL;
     }
 }
@@ -1338,7 +1336,7 @@ void gui_stream_media_refresh(void) {
     if (!fresh) return;
     stream_media_screen = fresh;
     gui_navigation_replace_static_screen(2, old, fresh);
-    if (old) lv_obj_del(old);
+    if (old) lv_obj_delete(old);
 }
 
 /* One-shot deferred trigger for a fresh-SD-card/first-run auto rescan --

@@ -1,7 +1,6 @@
 #include "gui_track_info.h"
 
 #include "gui.h"
-#include "gui_subsonic.h"
 #include "gui_theme.h"
 #include "screen_builders.h"
 
@@ -394,7 +393,7 @@ static void rebuild_info_text(const audio_current_format_info_t * runtime, bool 
  * call unless info_screen is deleted AND nulled first here. */
 void gui_track_info_teardown(void) {
     if (!info_screen) return;
-    lv_obj_del(info_screen);
+    lv_obj_delete(info_screen);
     info_screen = NULL;
     info_list = NULL;
     info_title = NULL;

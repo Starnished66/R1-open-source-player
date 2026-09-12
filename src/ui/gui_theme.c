@@ -66,10 +66,6 @@ void gui_theme_update_surface_contrast(void) {
     lv_obj_report_style_change(&style_theme_card_bg);
 }
 
-void apply_accent_color(uint32_t rgb) {
-    gui_theme_apply_accent(rgb);
-}
-
 void gui_theme_apply_accent(uint32_t rgb) {
     current_settings.accent_color = rgb;
     lv_style_set_bg_color(&style_accent, lv_color_hex(rgb));

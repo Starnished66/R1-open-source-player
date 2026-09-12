@@ -116,7 +116,7 @@ void gui_plugin_manage_init(void) {
 
 void gui_plugin_manage_teardown(void) {
     if (plugin_manage_screen) {
-        lv_obj_del(plugin_manage_screen);
+        lv_obj_delete(plugin_manage_screen);
         plugin_manage_screen = NULL;
     }
 }

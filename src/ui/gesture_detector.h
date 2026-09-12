@@ -30,9 +30,6 @@ typedef struct {
     int32_t start_y;
 } gesture_home_state_t;
 
-/* Resets all state for a clean released baseline */
-void gesture_home_state_reset(gesture_home_state_t * state);
-
 /* Stateless predicate: true if touch_y satisfies all configured eligibility rules */
 bool gesture_home_state_is_eligible(const gesture_home_config_t * cfg, int32_t touch_y);
 

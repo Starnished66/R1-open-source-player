@@ -1,13 +1,5 @@
 #include "gesture_detector.h"
 
-void gesture_home_state_reset(gesture_home_state_t * state) {
-    if (!state) return;
-    state->was_pressed = false;
-    state->tracking = false;
-    state->triggered = false;
-    state->start_y = 0;
-}
-
 bool gesture_home_state_is_eligible(const gesture_home_config_t * cfg, int32_t touch_y) {
     if (!cfg) return false;
 

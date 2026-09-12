@@ -16,7 +16,6 @@
   /* Writable override, checked first by asset_path(), for custom assets
    * not present in the read-only THEME_ROOT squashfs pack. /usr/data is the
    * persistent writable partition. */
-  #include <unistd.h>
   #define THEME_OVERRIDE_ROOT "/usr/data/theme_overrides/"
 #endif
 

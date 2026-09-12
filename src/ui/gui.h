@@ -366,7 +366,6 @@ void hide_more_menu_popup(void);
 
 extern char now_playing_path[600];
 
-void set_player_source_none(void);
 void set_player_source_all_songs(int index);
 void set_player_source_recently_added(int index);
 void set_player_source_file_browser(const char * dir, int row);
@@ -471,6 +470,5 @@ void quick_drawer_wifi_event_cb(lv_event_t * e);
 void quick_drawer_bt_event_cb(lv_event_t * e);
 
 void populate_wifi_screen(bool enabled);
-void show_bt_connect_popup(const char * name, const char * mac);
 
 #endif /* GUI_H */

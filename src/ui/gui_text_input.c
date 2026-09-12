@@ -731,7 +731,7 @@ void gui_text_input_teardown(void) {
      * below rather than under one shared early-return, so it's still
      * cleaned up even if the two ever get out of sync. */
     if (text_entry_multitap_timer) { lv_timer_del(text_entry_multitap_timer); text_entry_multitap_timer = NULL; }
-    if (text_entry_screen) { lv_obj_del(text_entry_screen); text_entry_screen = NULL; }
+    if (text_entry_screen) { lv_obj_delete(text_entry_screen); text_entry_screen = NULL; }
 }
 
 lv_obj_t * gui_text_input_get_screen(void) {

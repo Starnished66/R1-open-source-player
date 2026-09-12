@@ -12,7 +12,6 @@
 #include "metadata_db.h"
 #include "text_reader.h"
 #include "plugin_manager.h"
-#include "gui.h"
 
 extern lv_style_t style_theme_screen_bg;
 extern lv_style_t style_theme_text_primary;
@@ -23,7 +22,6 @@ extern lv_style_t style_theme_list_padding;
 extern lv_style_t style_button_pressed;
 
 extern const char * basename_of(const char * path);
-extern lv_obj_t * build_subsonic_list_screen(const char * title_text, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
 
 /* gui_font_role_t defined in gui_theme.h */
 
@@ -294,17 +292,11 @@ static lv_obj_t * build_books_screen(void) {
     items[1] = (pill_list_item_t){ "Favorites", PILL_ACCESSORY_CHEVRON, false, books_favorites_row_cb, NULL, NULL };
 
     int count = 2;
-    int plugin_count = plugin_manager_get_books_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_BOOKS_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_books_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_books_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_books_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium"; /* see pill_row_resolve_text_size()'s own comment on why plugin rows always supply a non-NULL default */
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_BOOKS_LIST_ITEMS,
+                                    plugin_manager_get_books_list_item_count,
+                                    plugin_manager_get_books_list_item_label,
+                                    plugin_manager_get_books_list_item_options,
+                                    plugin_books_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
     finalize_screen_navigation(scr);
@@ -328,17 +320,13 @@ bool gui_books_init(void) {
  * module owns so gui_books_init() can rebuild them from a clean slate
  * without leaking the old objects. */
 void gui_books_teardown(void) {
-    if (books_files_screen) { lv_obj_del(books_files_screen); books_files_screen = NULL; }
-    if (text_reader_screen) { lv_obj_del(text_reader_screen); text_reader_screen = NULL; }
-    if (books_screen) { lv_obj_del(books_screen); books_screen = NULL; }
+    if (books_files_screen) { lv_obj_delete(books_files_screen); books_files_screen = NULL; }
+    if (text_reader_screen) { lv_obj_delete(text_reader_screen); text_reader_screen = NULL; }
+    if (books_screen) { lv_obj_delete(books_screen); books_screen = NULL; }
 }
 
 void gui_books_rescan(void) {
     rescan_books();
-}
-
-void gui_books_show(void) {
-    nav_push(books_screen);
 }
 
 lv_obj_t * gui_books_get_screen(void) {

@@ -25,7 +25,6 @@ extern player_settings_t current_settings;
 
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
-extern lv_obj_t * build_subsonic_list_screen(const char * title_text, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
 extern void row_label_enable_marquee(lv_obj_t * label);
 extern void register_swipe_dead_zone(lv_obj_t * obj);
 extern void unregister_swipe_dead_zone(lv_obj_t * obj);
@@ -783,10 +782,10 @@ void gui_plugins_init(void) {
  * already-freed pointers. */
 void gui_plugins_teardown(void) {
     for (int i = 0; i < PLUGIN_LIST_SCREEN_POOL_SIZE; i++) {
-        if (plugin_list_screens[i]) { lv_obj_del(plugin_list_screens[i]); plugin_list_screens[i] = NULL; }
+        if (plugin_list_screens[i]) { lv_obj_delete(plugin_list_screens[i]); plugin_list_screens[i] = NULL; }
     }
     for (int i = 0; i < PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE; i++) {
-        if (plugin_settings_list_screens[i]) { lv_obj_del(plugin_settings_list_screens[i]); plugin_settings_list_screens[i] = NULL; }
+        if (plugin_settings_list_screens[i]) { lv_obj_delete(plugin_settings_list_screens[i]); plugin_settings_list_screens[i] = NULL; }
         plugin_settings_list_slider_card_count[i] = 0;
     }
 }

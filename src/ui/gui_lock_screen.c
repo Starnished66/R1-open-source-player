@@ -386,18 +386,6 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
     return true;
 }
 
-/* Dismissal is a swipe-up gesture (see lock_touch_timer_cb() above), so it
- * plays the same "swipe up to reveal" transition as swipe-up-to-Home
- * (gui_shell.c's home-swipe): forward=true, vertical=true, reveal=true --
- * the underlying screen stays fixed in place, revealed as the lock screen
- * slides up and away over it, rather than a plain horizontal back-slide. */
-void gui_lock_screen_hide(void) {
-    stop_timers();
-    if (lock_screen && lv_screen_active() == lock_screen) {
-        nav_pop_ex(true, true, true);
-    }
-}
-
 void gui_lock_screen_init(void) {
     lock_screen = NULL;
     lock_image_obj = NULL;

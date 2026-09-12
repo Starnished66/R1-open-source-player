@@ -119,8 +119,7 @@ static asset_decoded_image_t volume_popup_speaker_image;
 static asset_decoded_image_t play_btn_play_img;
 static asset_decoded_image_t play_btn_pause_img;
 static void load_play_btn_images(void);
-static lv_obj_t * delete_song_popup = NULL;
-static lv_obj_t * delete_song_popup_backdrop = NULL;
+static gui_popup_t delete_song_popup;
 static lv_obj_t * delete_song_popup_title = NULL;
 
 static lv_image_dsc_t current_cover_dsc;
@@ -1387,8 +1386,7 @@ void resolve_replaygain(const track_metadata_t * meta, bool * out_has_gain, doub
 /* ---- Delete confirmation popup ---- */
 
 static void hide_delete_song_popup(void) {
-    lv_obj_add_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(delete_song_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&delete_song_popup);
 }
 
 static void delete_song_popup_backdrop_cb(lv_event_t * e) {
@@ -1442,16 +1440,6 @@ static void delete_song_confirm_cb(lv_event_t * e) {
     show_error_toast("Song deleted");
 }
 
-/* Defined much further down, in gui_network.c (see its own doc comment
- * there for the shared "are you sure?" 2-button popup shape this builds) --
- * forward-declared here since this and every other popup builder before
- * that point in the file needs it. */
-lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
-                                       lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
-                                       lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
-                                       const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
-                                       lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
-
 /* Defined alongside build_confirm_popup() above -- see its own doc comment
  * for why this is a separate shared shape (an N-row menu, not a yes/no
  * confirmation) and why both are forward-declared here. */
@@ -1462,10 +1450,10 @@ static void build_delete_song_popup(void) {
      * (delete_song_confirm_prompt() below) to "Delete <filename>?..." with
      * an arbitrary-length real filename spliced in, so it needs to
      * truncate rather than potentially wrap across several lines. */
-    delete_song_popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &delete_song_popup_title, NULL, "Delete",
+    delete_song_popup.popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &delete_song_popup_title, NULL, "Delete",
                                              lv_color_make(255, 120, 120), delete_song_confirm_cb, NULL, "Cancel",
                                              accent_lv_color(), delete_song_cancel_cb, NULL,
-                                             delete_song_popup_backdrop_cb, &delete_song_popup_backdrop);
+                                             delete_song_popup_backdrop_cb, &delete_song_popup.backdrop);
 }
 
 /* ---- The "more" 3-row menu itself ---- */
@@ -1511,10 +1499,7 @@ static void more_menu_delete_cb(lv_event_t * e) {
     if (playlist_index < 0 || playlist_index >= playlist_count) return;
 
     lv_label_set_text_fmt(delete_song_popup_title, "Delete %s?\nThis cannot be undone.", basename_of(playlist_path_at(playlist_index)));
-    lv_obj_remove_flag(delete_song_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(delete_song_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(delete_song_popup_backdrop);
-    lv_obj_move_foreground(delete_song_popup);
+    gui_popup_show(&delete_song_popup);
 }
 
 static void more_icon_event_cb(lv_event_t * e) {
@@ -3451,17 +3436,16 @@ void gui_player_teardown(void) {
     volume_drag_active = false;
     if (volume_hw_apply_timer) { lv_timer_delete(volume_hw_apply_timer); volume_hw_apply_timer = NULL; }
     volume_hw_pending = -1;
-    if (volume_popup) { lv_obj_del(volume_popup); volume_popup = NULL; }
+    if (volume_popup) { lv_obj_delete(volume_popup); volume_popup = NULL; }
     volume_popup_speaker_icon = NULL;
     asset_decoded_image_close(&volume_popup_bg_image);
     asset_decoded_image_close(&volume_popup_speaker_image);
     volume_popup_track = NULL;
-    if (delete_song_popup) { lv_obj_del(delete_song_popup); delete_song_popup = NULL; }
-    if (delete_song_popup_backdrop) { lv_obj_del(delete_song_popup_backdrop); delete_song_popup_backdrop = NULL; }
-    if (more_menu_popup) { lv_obj_del(more_menu_popup); more_menu_popup = NULL; }
-    if (more_menu_popup_backdrop) { lv_obj_del(more_menu_popup_backdrop); more_menu_popup_backdrop = NULL; }
+    gui_popup_teardown(&delete_song_popup);
+    if (more_menu_popup) { lv_obj_delete(more_menu_popup); more_menu_popup = NULL; }
+    if (more_menu_popup_backdrop) { lv_obj_delete(more_menu_popup_backdrop); more_menu_popup_backdrop = NULL; }
     gui_track_info_teardown();
-    if (player_screen) { lv_obj_del(player_screen); player_screen = NULL; }
+    if (player_screen) { lv_obj_delete(player_screen); player_screen = NULL; }
     favorite_icon = NULL;
     asset_png_memory_free(progress_bg_image); progress_bg_image = NULL;
     asset_png_memory_free(progress_fill_image); progress_fill_image = NULL;

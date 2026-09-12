@@ -42,7 +42,6 @@ typedef struct {
     int64_t clock_ms;
     bool clock_broken; /* monotonic_ms() always returns -1 */
 
-    bool partition_exists_after_ms; /* -1 = never; else the clock_ms at/after which path_exists(partition) is true */
     bool whole_exists_after_ms_set;
     int64_t whole_exists_after_ms;
     bool partition_exists_after_ms_set;

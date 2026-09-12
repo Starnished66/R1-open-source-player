@@ -76,8 +76,8 @@ typedef struct {
     int y;
     int height;
     const char * line1;
-    char line2[40];
-    char line3[40];
+    const char * line2;
+    const char * line3;
     int boot_entry; /* a BOOT_ENTRY_* value (scanner.h) -- which real choice this card represents */
 } card_layout_t;
 
@@ -91,8 +91,7 @@ static void layout_cards(card_layout_t * cards, int count) {
 }
 
 static void draw_centered(int y, const char * text, fb_color_t color) {
-    int w = fb_text_width(text);
-    fb_draw_text((FB_WIDTH - w) / 2, y, text, color);
+    fb_draw_text_centered(y, text, color);
 }
 
 static void draw_card(const card_layout_t * card, bool selected) {
@@ -143,17 +142,30 @@ static long elapsed_ms_since(const struct timespec * start) {
 /* Populates menu cards based on detected player installations. */
 static int build_cards(const scan_result_t * scan, card_layout_t * cards) {
     int count = 0;
-    cards[count] = (card_layout_t) { .line1 = "OPEN PLAYER", .boot_entry = BOOT_ENTRY_INTERNAL };
-    snprintf(cards[count].line2, sizeof(cards[count].line2), "INTERNAL");
-    snprintf(cards[count].line3, sizeof(cards[count].line3), "%s", scan->internal_build_stamp);
+    cards[count] = (card_layout_t) {
+        .line1 = "OPEN PLAYER",
+        .line2 = "INTERNAL",
+        .line3 = scan->internal_build_stamp[0] ? scan->internal_build_stamp : "",
+        .boot_entry = BOOT_ENTRY_INTERNAL,
+    };
     count++;
     if (scan->sd_stock_present) {
-        cards[count] = (card_layout_t) { .line1 = "STOCK PLAYER", .boot_entry = BOOT_ENTRY_SD_STOCK };
-        snprintf(cards[count].line2, sizeof(cards[count].line2), "SD CARD");
+        cards[count] = (card_layout_t) {
+            .line1 = "STOCK PLAYER",
+            .line2 = "SD CARD",
+            .line3 = "",
+            .boot_entry = BOOT_ENTRY_SD_STOCK,
+        };
         count++;
     }
     layout_cards(cards, count);
     return count;
+}
+
+static void cancel_countdown_and_redraw(bool * countdown_active, const card_layout_t * cards, int card_count,
+                                        int selected, int timeout_ms) {
+    *countdown_active = false;
+    draw_menu(cards, card_count, selected, -1, timeout_ms);
 }
 
 static int run_menu(const scan_result_t * scan) {
@@ -210,8 +222,7 @@ static int run_menu(const scan_result_t * scan) {
             }
             idx = (ev.type == BL_INPUT_MOVE_DOWN) ? (idx + 1) % card_count : (idx - 1 + card_count) % card_count;
             selected = cards[idx].boot_entry;
-            countdown_active = false;
-            draw_menu(cards, card_count, selected, -1, timeout_ms);
+            cancel_countdown_and_redraw(&countdown_active, cards, card_count, selected, timeout_ms);
         } else if (ev.type == BL_INPUT_CONFIRM) {
             return selected;
         } else if (ev.type == BL_INPUT_TOUCH_DOWN) {
@@ -220,8 +231,7 @@ static int run_menu(const scan_result_t * scan) {
              * just stops the deadline from expiring out from under a
              * finger already resting on a card (see BL_INPUT_TOUCH_DOWN's
              * own doc comment in input.h). */
-            countdown_active = false;
-            draw_menu(cards, card_count, selected, -1, timeout_ms);
+            cancel_countdown_and_redraw(&countdown_active, cards, card_count, selected, timeout_ms);
         } else if (ev.type == BL_INPUT_TOUCH_TAP) {
             bool hit_a_card = false;
             for (int i = 0; i < card_count; i++) {
@@ -235,8 +245,7 @@ static int run_menu(const scan_result_t * scan) {
             /* Tap outside every card -- cancels the countdown without
              * changing the selection, same as a nav key press, rather
              * than being silently ignored. */
-            countdown_active = false;
-            draw_menu(cards, card_count, selected, -1, timeout_ms);
+            cancel_countdown_and_redraw(&countdown_active, cards, card_count, selected, timeout_ms);
         } else if (countdown_active) {
             draw_menu(cards, card_count, selected, remaining_ms, timeout_ms);
         }
@@ -351,8 +360,6 @@ int main(void) {
             input_close();
         }
         boot_path = (chosen_entry == BOOT_ENTRY_SD_STOCK) ? SD_STOCK_PLAYER_PATH : internal_path;
-        /* Persist user choice as the new default entry. */
-        scanner_save_last_boot(chosen_entry);
     }
 
     /* Drop SD update page cache before launching Stock player to free memory. */

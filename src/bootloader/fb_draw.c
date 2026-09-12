@@ -37,7 +37,7 @@ static uint16_t * bg_cache = NULL;
  * blitting to the visible framebuffer in fb_flush(). */
 static uint16_t * back_buffer = NULL;
 
-/* 5x7 dot-matrix font, uppercase + digits + space only. Deliberately not a
+/* 5x7 dot-matrix font, uppercase + digits + space + ':', '-', and '_' only. Deliberately not a
  * full ASCII table -- every string this bootloader ever draws is
  * hand-written UI text, known in full at the time this was written (see
  * main.c's own string literals), so the font only needs to cover the
@@ -109,6 +109,13 @@ static const uint8_t * glyph_rows(char c) {
         case 'V': { static const uint8_t g[7] = { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 }; return g; }
         /* #...#   #...#   .#.#.   ..#..   ..#..   ..#..   ..#.. */
         case 'Y': { static const uint8_t g[7] = { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 }; return g; }
+
+        /* .....   .....   ..#..   .....   ..#..   .....   ..... */
+        case ':': { static const uint8_t g[7] = { 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00 }; return g; }
+        /* .....   .....   .....   #####   .....   .....   ..... */
+        case '-': { static const uint8_t g[7] = { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 }; return g; }
+        /* .....   .....   .....   .....   .....   .....   ##### */
+        case '_': { static const uint8_t g[7] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F }; return g; }
 
         case ' ': return blank;
         default: return blank; /* unsupported char -- a visible gap, not a silent shift (see fb_draw.h) */
@@ -384,6 +391,11 @@ int fb_text_width(const char * text) {
 
 int fb_text_height(void) {
     return GLYPH_ROWS * GLYPH_SCALE;
+}
+
+void fb_draw_text_centered(int y, const char * text, fb_color_t color) {
+    int w = fb_text_width(text);
+    fb_draw_text((FB_WIDTH - w) / 2, y, text, color);
 }
 
 void fb_flush(void) {

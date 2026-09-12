@@ -41,12 +41,13 @@ void fb_fill_rect_alpha(int x, int y, int w, int h, fb_color_t color, uint8_t al
 
 void fb_draw_rect_border(int x, int y, int w, int h, int thickness, fb_color_t color);
 
-/* Uppercase letters, digits, space, and ':' only -- see fb_draw.c's own
+/* Uppercase letters, digits, space, ':', '-', and '_' only -- see fb_draw.c's own
  * font table doc comment for exactly why the character set is this
  * narrow. Any other byte is drawn as a blank cell rather than skipped, so
  * a typo in a caller's string is visible (a gap) instead of silently
  * shifting all following characters left. */
 void fb_draw_text(int x, int y, const char * text, fb_color_t color);
+void fb_draw_text_centered(int y, const char * text, fb_color_t color);
 int fb_text_width(const char * text);
 int fb_text_height(void);
 

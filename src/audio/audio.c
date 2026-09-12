@@ -3728,10 +3728,6 @@ audio_error_t audio_consume_error_ex(uint64_t * out_generation) {
     return err;
 }
 
-audio_error_t audio_consume_error(void) {
-    return audio_consume_error_ex(NULL);
-}
-
 uint64_t audio_get_playback_generation(void) {
     pthread_mutex_lock(&audio_mutex);
     uint64_t gen = playback_generation;

@@ -288,7 +288,6 @@ typedef enum {
 
 /* Returns the most recent unrecoverable error (and clears it) exactly once.
  * AUDIO_ERROR_NONE means no pending error. Polled from the GUI timer. */
-audio_error_t audio_consume_error(void);
 audio_error_t audio_consume_error_ex(uint64_t * out_generation);
 
 /* Returns the current playback generation counter. */

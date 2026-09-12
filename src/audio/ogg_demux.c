@@ -1,4 +1,5 @@
 #include "ogg_demux.h"
+#include "audio_helpers.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,9 +27,7 @@ struct ogg_demux {
 
     uint8_t channels;
     uint16_t pre_skip;
-    int16_t output_gain_q78;
 
-    char * vendor_string;
     char ** comments;
     uint32_t * comment_lens;
     unsigned int comment_count;
@@ -58,20 +57,6 @@ struct ogg_demux {
     uint8_t header_type;
     long next_page_offset;
 };
-
-static uint16_t le16(const uint8_t * p) {
-    return (uint16_t) (p[0] | (p[1] << 8));
-}
-
-static uint32_t le32(const uint8_t * p) {
-    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
-}
-
-static uint64_t le64(const uint8_t * p) {
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
-}
 
 ogg_codec_t ogg_detect_codec(const char * path) {
     FILE * f = fopen(path, "rb");
@@ -161,7 +146,7 @@ static bool load_page_at(ogg_demux_t * d, long offset) {
     memset(d->page_buf + 22, 0, 4);
     uint32_t computed = ogg_crc32(d->crc_table, d->page_buf, total_size);
     memcpy(d->page_buf + 22, saved_crc, 4);
-    if (computed != le32(saved_crc)) return false;
+    if (computed != audio_read_u32le(saved_crc)) return false;
 
     d->current_page_offset = offset;
     memcpy(d->segment_table, seg_table, page_segments);
@@ -251,8 +236,7 @@ static bool parse_opus_head(ogg_demux_t * d, const uint8_t * data, uint32_t size
     if ((version & 0xF0) != 0) return false; /* incompatible major version, per RFC 7845 5.1 */
 
     d->channels = data[9];
-    d->pre_skip = le16(data + 10);
-    d->output_gain_q78 = (int16_t) le16(data + 16);
+    d->pre_skip = audio_read_u16le(data + 10);
     uint8_t channel_mapping_family = data[18];
 
     /* Mapping family 0 (mono/stereo, no extra channel-mapping table) is the
@@ -263,10 +247,9 @@ static bool parse_opus_head(ogg_demux_t * d, const uint8_t * data, uint32_t size
     return true;
 }
 
-/* Best-effort: a missing or malformed OpusTags packet leaves vendor_string
- * NULL and comment_count 0, which read_opus_metadata() (metadata.c) already
- * treats the same as any other unhandled/failed tag read -- never fatal to
- * opening the file for playback. */
+/* Best-effort: a missing or malformed OpusTags packet leaves comment_count 0,
+ * which read_opus_metadata() (metadata.c) already treats the same as any other
+ * unhandled/failed tag read -- never fatal to opening the file for playback. */
 static bool comment_is_large_scan_value(const uint8_t * value, uint32_t len) {
     static const char picture[] = "METADATA_BLOCK_PICTURE=";
     static const char lyrics[] = "LYRICS=";
@@ -281,19 +264,13 @@ static void parse_opus_tags(ogg_demux_t * d, const uint8_t * data, uint32_t size
 
     uint32_t pos = 8;
     if (pos + 4 > size) return;
-    uint32_t vendor_len = le32(data + pos);
+    uint32_t vendor_len = audio_read_u32le(data + pos);
     pos += 4;
     if (pos + vendor_len > size) return;
-
-    d->vendor_string = malloc((size_t) vendor_len + 1);
-    if (d->vendor_string) {
-        memcpy(d->vendor_string, data + pos, vendor_len);
-        d->vendor_string[vendor_len] = '\0';
-    }
     pos += vendor_len;
 
     if (pos + 4 > size) return;
-    uint32_t comment_count = le32(data + pos);
+    uint32_t comment_count = audio_read_u32le(data + pos);
     pos += 4;
 
     /* Bound a corrupt/hostile huge count against what's actually left in
@@ -310,7 +287,7 @@ static void parse_opus_tags(ogg_demux_t * d, const uint8_t * data, uint32_t size
     unsigned int stored = 0;
     for (uint32_t i = 0; i < comment_count; i++) {
         if (pos + 4 > size) break;
-        uint32_t clen = le32(data + pos);
+        uint32_t clen = audio_read_u32le(data + pos);
         pos += 4;
         if (pos + clen > size) break;
 
@@ -351,7 +328,7 @@ static bool build_page_index(ogg_demux_t * d) {
         if (memcmp(hdr, "OggS", 4) != 0 || hdr[4] != 0) break;
 
         uint8_t header_type = hdr[5];
-        uint64_t granule = le64(hdr + 6);
+        uint64_t granule = audio_read_u64le(hdr + 6);
         uint8_t page_segments = hdr[26];
         uint8_t seg_table[OGG_MAX_PAGE_SEGMENTS];
         if (page_segments > 0 && fread(seg_table, 1, page_segments, d->f) != page_segments) break;
@@ -406,7 +383,7 @@ static ogg_demux_t * ogg_demux_open_internal(const char * path, bool build_index
         ogg_demux_close(d);
         return NULL;
     }
-    d->serial_number = le32(d->page_buf + 14);
+    d->serial_number = audio_read_u32le(d->page_buf + 14);
 
     uint8_t * head_packet;
     uint32_t head_size;
@@ -470,16 +447,8 @@ uint16_t ogg_demux_get_opus_pre_skip(const ogg_demux_t * d) {
     return d->pre_skip;
 }
 
-int16_t ogg_demux_get_opus_output_gain_q78(const ogg_demux_t * d) {
-    return d->output_gain_q78;
-}
-
 uint64_t ogg_demux_get_total_granule(const ogg_demux_t * d) {
     return d->total_granule;
-}
-
-const char * ogg_demux_get_vendor_string(const ogg_demux_t * d) {
-    return d->vendor_string;
 }
 
 unsigned int ogg_demux_get_comment_count(const ogg_demux_t * d) {
@@ -540,7 +509,6 @@ void ogg_demux_close(ogg_demux_t * d) {
     if (d->f) fclose(d->f);
     free(d->page_buf);
     free(d->page_index);
-    free(d->vendor_string);
     if (d->comments) {
         for (unsigned int i = 0; i < d->comment_count; i++) free(d->comments[i]);
         free(d->comments);

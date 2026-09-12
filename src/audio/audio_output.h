@@ -108,11 +108,6 @@ void audio_output_set_bt_requested(bool requested);
  * format change. */
 void audio_output_set_usb_requested(bool requested, const char * alsa_device);
 
-/* Writes the codec's hardware attenuation registers ("Left"/"Right Playback Volume",
- * raw 0-255) via tinyalsa. The control is write-only as driver reads do not reflect
- * written values; callers track written values independently if needed. */
-void audio_output_set_hw_volume_raw(int raw_left, int raw_right);
-
 /* R3 Pro II output-port routing. Picks a route (3.5mm headset vs. 4.4mm
  * balanced, headphone_status.h deciding which)
  * and writes it to the "Output Port Switch" mixer control -- a control
@@ -120,8 +115,8 @@ void audio_output_set_hw_volume_raw(int raw_left, int raw_right);
  * this same hardware, not a guess. A genuine no-op on R1 and on host, since
  * neither switch_dev node nor this mixer control exist there. Safe to call
  * from any thread/frequency: the actual mixer write happens on the same
- * dedicated worker thread audio_output_set_hw_volume_raw() above already
- * uses, not synchronously on the caller's own thread. */
+ * dedicated worker thread hardware volume writes use, not synchronously on
+ * the caller's own thread. */
 void audio_output_sync_balanced_output(void);
 
 /* Coalesces hardware-volume writes on a dedicated process-lifetime worker,

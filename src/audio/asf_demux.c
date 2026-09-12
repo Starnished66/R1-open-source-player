@@ -34,7 +34,6 @@ struct asf_demux {
     uint32_t sample_rate;
     uint32_t byte_rate;
     uint16_t block_align;
-    uint16_t bits_per_sample;
     uint8_t codec_data[64];
     uint32_t codec_data_size;
     int audio_stream_number; /* -1 until a Stream Properties Object with the audio type GUID is found */
@@ -347,7 +346,7 @@ asf_demux_t * asf_demux_open(const char * path) {
                 d->sample_rate = read_u32le(f);
                 d->byte_rate = read_u32le(f);
                 d->block_align = read_u16le(f);
-                d->bits_per_sample = read_u16le(f);
+                read_u16le(f); /* bits_per_sample (unused) */
                 uint16_t codec_specific_size = read_u16le(f);
                 if (codec_specific_size > sizeof(d->codec_data)) codec_specific_size = sizeof(d->codec_data);
                 fread(d->codec_data, 1, codec_specific_size, f);
@@ -386,7 +385,6 @@ unsigned int asf_demux_get_channels(const asf_demux_t * d) { return d->channels;
 unsigned int asf_demux_get_sample_rate(const asf_demux_t * d) { return d->sample_rate; }
 uint32_t asf_demux_get_byte_rate(const asf_demux_t * d) { return d->byte_rate; }
 uint16_t asf_demux_get_block_align(const asf_demux_t * d) { return d->block_align; }
-uint16_t asf_demux_get_bits_per_sample(const asf_demux_t * d) { return d->bits_per_sample; }
 
 const uint8_t * asf_demux_get_codec_data(const asf_demux_t * d, uint32_t * out_size) {
     *out_size = d->codec_data_size;

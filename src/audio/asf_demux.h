@@ -26,7 +26,6 @@ unsigned int asf_demux_get_channels(const asf_demux_t * d);
 unsigned int asf_demux_get_sample_rate(const asf_demux_t * d);
 uint32_t asf_demux_get_byte_rate(const asf_demux_t * d);
 uint16_t asf_demux_get_block_align(const asf_demux_t * d);
-uint16_t asf_demux_get_bits_per_sample(const asf_demux_t * d);
 
 /* WMA-specific "codec data" trailing the WAVEFORMATEX-style stream header --
  * the "encode options" bitfield the decoder needs to know which optional

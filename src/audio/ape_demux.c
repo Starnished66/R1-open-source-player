@@ -1,4 +1,5 @@
 #include "ape_demux.h"
+#include "audio_helpers.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,14 +29,6 @@ struct ape_demux {
     ape_frame_t * frames;
 };
 
-static uint16_t read_u16le(const uint8_t * b) {
-    return (uint16_t) (b[0] | (b[1] << 8));
-}
-
-static uint32_t read_u32le(const uint8_t * b) {
-    return (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
-}
-
 ape_demux_t * ape_demux_open(const char * path) {
     FILE * f = fopen(path, "rb");
     if (!f) return NULL;
@@ -48,7 +41,7 @@ ape_demux_t * ape_demux_open(const char * path) {
 
     uint8_t buf[36];
     if (fread(buf, 1, 2, f) != 2) { fclose(f); return NULL; }
-    int fileversion = read_u16le(buf);
+    int fileversion = audio_read_u16le(buf);
     /* Only the modern (fileversion >= 3980) descriptor+header layout is
      * supported -- see ape_demux.h for why that's not a practical
      * limitation. */
@@ -64,11 +57,11 @@ ape_demux_t * ape_demux_open(const char * path) {
      * ignored), wavtaillength(4), md5(16, ignored). */
     uint8_t desc[46];
     if (fread(desc, 1, 46, f) != 46) { fclose(f); return NULL; }
-    uint32_t descriptorlength = read_u32le(desc + 2);
-    uint32_t headerlength = read_u32le(desc + 6);
-    uint32_t seektablelength = read_u32le(desc + 10);
-    uint32_t wavheaderlength = read_u32le(desc + 14);
-    uint32_t wavtaillength = read_u32le(desc + 26);
+    uint32_t descriptorlength = audio_read_u32le(desc + 2);
+    uint32_t headerlength = audio_read_u32le(desc + 6);
+    uint32_t seektablelength = audio_read_u32le(desc + 10);
+    uint32_t wavheaderlength = audio_read_u32le(desc + 14);
+    uint32_t wavtaillength = audio_read_u32le(desc + 26);
 
     if (descriptorlength > 52) {
         if (fseek(f, (long) (descriptorlength - 52), SEEK_CUR) != 0) { fclose(f); return NULL; }
@@ -80,14 +73,14 @@ ape_demux_t * ape_demux_open(const char * path) {
     ape_demux_t * d = calloc(1, sizeof(*d));
     d->f = f;
     d->fileversion = fileversion;
-    d->compressiontype = read_u16le(hb + 0);
-    d->formatflags = read_u16le(hb + 2);
-    d->blocksperframe = read_u32le(hb + 4);
-    d->finalframeblocks = read_u32le(hb + 8);
-    d->totalframes = read_u32le(hb + 12);
-    d->bps = read_u16le(hb + 16);
-    d->channels = read_u16le(hb + 18);
-    d->samplerate = read_u32le(hb + 20);
+    d->compressiontype = audio_read_u16le(hb + 0);
+    d->formatflags = audio_read_u16le(hb + 2);
+    d->blocksperframe = audio_read_u32le(hb + 4);
+    d->finalframeblocks = audio_read_u32le(hb + 8);
+    d->totalframes = audio_read_u32le(hb + 12);
+    d->bps = audio_read_u16le(hb + 16);
+    d->channels = audio_read_u16le(hb + 18);
+    d->samplerate = audio_read_u32le(hb + 20);
 
     if (!d->totalframes || d->channels == 0 || d->channels > 2 ||
         (d->bps != 16 && d->bps != 24)) {
@@ -118,7 +111,7 @@ ape_demux_t * ape_demux_open(const char * path) {
     }
     for (uint32_t i = 1; i < d->totalframes; i++) {
         if (fread(entry, 1, 4, f) != 4) { ape_demux_close(d); return NULL; }
-        uint32_t seektable_entry = read_u32le(entry);
+        uint32_t seektable_entry = audio_read_u32le(entry);
         d->frames[i].pos = seektable_entry;
         d->frames[i].nblocks = d->blocksperframe;
         d->frames[i - 1].size = d->frames[i].pos - d->frames[i - 1].pos;

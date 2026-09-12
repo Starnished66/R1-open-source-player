@@ -44,7 +44,8 @@ void dsd_channel_reset(dsd_channel_state_t * ch) {
 
 bool dsd_channel_feed_bit(dsd_channel_state_t * ch, const dsd_filter_design_t * design, float bit_value, float * out_sample) {
     ch->history[ch->history_pos] = bit_value;
-    ch->history_pos = (ch->history_pos + 1) % design->num_taps;
+    ch->history_pos++;
+    if (ch->history_pos == design->num_taps) ch->history_pos = 0;
 
     ch->bit_counter++;
     if (ch->bit_counter < design->decimation_factor) return false;
@@ -57,7 +58,7 @@ bool dsd_channel_feed_bit(dsd_channel_state_t * ch, const dsd_filter_design_t * 
     int idx = ch->history_pos;
     for (int k = 0; k < design->num_taps; k++) {
         acc += design->taps[k] * ch->history[idx];
-        idx = (idx + 1) % design->num_taps;
+        if (++idx == design->num_taps) idx = 0;
     }
 
     *out_sample = acc;

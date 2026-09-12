@@ -1,5 +1,6 @@
 #include "dsd_decoder.h"
 #include "dsd_filter.h"
+#include "audio_helpers.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,30 +43,6 @@ struct dsd_decoder {
     dsd_channel_state_t channel_states[DSD_MAX_CHANNELS];
 };
 
-static uint32_t read_u32le(const uint8_t * b) {
-    return (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
-}
-
-static uint64_t read_u64le(const uint8_t * b) {
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = (v << 8) | b[i];
-    return v;
-}
-
-static uint32_t read_u32be(const uint8_t * b) {
-    return ((uint32_t) b[0] << 24) | ((uint32_t) b[1] << 16) | ((uint32_t) b[2] << 8) | (uint32_t) b[3];
-}
-
-static uint16_t read_u16be(const uint8_t * b) {
-    return (uint16_t) (((uint16_t) b[0] << 8) | b[1]);
-}
-
-static uint64_t read_u64be(const uint8_t * b) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; i++) v = (v << 8) | b[i];
-    return v;
-}
-
 /* Picks the decimation factor landing closest to 352.8kHz output, rejecting
  * anything above DSD128 (not supported -- see header comment). */
 static int pick_decimation_factor(unsigned int dsd_rate) {
@@ -103,10 +80,10 @@ static dsd_decoder_t * open_dsf(FILE * f) {
     uint8_t fmt[40];
     if (fread(fmt, 1, sizeof(fmt), f) != sizeof(fmt)) return NULL;
 
-    unsigned int channels = read_u32le(fmt + 12);
-    unsigned int sample_rate = read_u32le(fmt + 16);
-    uint64_t sample_count = read_u64le(fmt + 24);
-    uint32_t block_size = read_u32le(fmt + 32);
+    unsigned int channels = audio_read_u32le(fmt + 12);
+    unsigned int sample_rate = audio_read_u32le(fmt + 16);
+    uint64_t sample_count = audio_read_u64le(fmt + 24);
+    uint32_t block_size = audio_read_u32le(fmt + 32);
 
     /* "data" chunk: magic(4) + chunkSize u64LE(8) + raw block-interleaved DSD data */
     uint8_t data_header[12];
@@ -137,7 +114,7 @@ static bool dff_read_chunk_header(FILE * f, char id_out[5], uint64_t * size_out)
     if (fread(header, 1, sizeof(header), f) != sizeof(header)) return false;
     memcpy(id_out, header, 4);
     id_out[4] = '\0';
-    *size_out = read_u64be(header + 4);
+    *size_out = audio_read_u64be(header + 4);
     return true;
 }
 
@@ -180,10 +157,10 @@ static dsd_decoder_t * open_dff(FILE * f) {
 
                 if (strcmp(sub_id, "FS  ") == 0 && sub_size >= 4) { /* DFF chunk IDs are always 4 bytes: "FS" padded with two spaces */
                     uint8_t buf[4];
-                    if (fread(buf, 1, 4, f) == 4) sample_rate = read_u32be(buf);
+                    if (fread(buf, 1, 4, f) == 4) sample_rate = audio_read_u32be(buf);
                 } else if (strcmp(sub_id, "CHNL") == 0 && sub_size >= 2) {
                     uint8_t buf[2];
-                    if (fread(buf, 1, 2, f) == 2) channels = read_u16be(buf);
+                    if (fread(buf, 1, 2, f) == 2) channels = audio_read_u16be(buf);
                 }
 
                 long next = sub_data_start + (long) sub_size + (long) (sub_size & 1);

@@ -3,6 +3,29 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+
+static inline void db_log_rotate_file_if_needed_locked(FILE ** file, const char * path, const char * rotated_path, long max_bytes) {
+    if (fseek(*file, 0, SEEK_END) != 0) return;
+    long size = ftell(*file);
+    if (size < max_bytes) return;
+    fclose(*file);
+    *file = NULL;
+    /* Clear any previous backup explicitly first -- rename() replacing an
+     * existing destination isn't guaranteed reliable on every filesystem
+     * this runs on (notably vfat SD cards), so don't rely on rename() alone
+     * to make room. Ignored if it doesn't exist. */
+    remove(rotated_path);
+    rename(path, rotated_path); /* best-effort */
+    /* "w", not "a": if the rename above failed for any reason, the oversized
+     * file would still be sitting at path, and "a" would keep appending to
+     * it -- re-triggering this same rotation, and repeating the failed
+     * close/remove/rename/reopen sequence, on every subsequent flush. "w"
+     * always starts a fresh, empty file regardless of whether the rename
+     * actually moved the old one out of the way first. */
+    *file = fopen(path, "w");
+}
+
 
 /* Runtime-toggleable, file-backed diagnostic log for the library database
  * scan and album art cache pipelines (Settings -> About -> Developer

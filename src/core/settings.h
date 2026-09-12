@@ -8,13 +8,9 @@
  * is preserved, with a new 15-second choice added at the beginning. */
 extern const int SCREEN_TIMEOUT_STEPS[];
 #define SCREEN_TIMEOUT_STEP_COUNT 7
-#define SCREEN_TIMEOUT_MIN_SECONDS 15
-#define SCREEN_TIMEOUT_MAX_SECONDS 1800
 
 extern const int SCREEN_DIM_DELAY_STEPS[];
 #define SCREEN_DIM_DELAY_STEP_COUNT 7
-#define SCREEN_DIM_DELAY_MIN_SECONDS 5
-#define SCREEN_DIM_DELAY_MAX_SECONDS 300
 
 /* Idle-shutdown choices, in minutes -- same discrete-steps reasoning as
  * SCREEN_TIMEOUT_STEPS above. This is a full poweroff (see idle_shutdown.h),

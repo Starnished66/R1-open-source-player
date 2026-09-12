@@ -1,6 +1,7 @@
 #include "subprocess.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -165,11 +166,9 @@ bool subprocess_spawn_daemon_logged(char * const argv[], const char * log_path) 
         _exit(0);
     }
 
-    /* Wait for intermediate child exit with timeout to avoid hanging if the child
-     * process stalls. */
-    for (int waited_ms = 0; waited_ms < SUBPROCESS_TIMEOUT_MS; waited_ms += 50) {
-        if (waitpid(pid, NULL, WNOHANG) == pid) break;
-        usleep(50000);
+    int wait_status;
+    while (waitpid(pid, &wait_status, 0) < 0 && errno == EINTR) {
+        /* retry -- interrupted by a signal, not an indication the child is still running */
     }
     return true;
 }

@@ -31,7 +31,6 @@
 #include "audio.h"
 #include "audio_output.h"
 #include "file_browser.h"
-#include "text_reader.h"
 #include "hw_buttons.h"
 #include "metadata.h"
 #include "metadata_db.h"

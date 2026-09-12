@@ -45,14 +45,7 @@ static FILE * bridge_log_file = NULL;
 
 /* Must be called with bridge_log_mutex held and bridge_log_file non-NULL. */
 static void bridge_log_rotate_if_needed_locked(void) {
-    if (fseek(bridge_log_file, 0, SEEK_END) != 0) return;
-    long size = ftell(bridge_log_file);
-    if (size < BRIDGE_LOG_MAX_BYTES) return;
-    fclose(bridge_log_file);
-    bridge_log_file = NULL;
-    remove(BRIDGE_LOG_ROTATED_PATH);
-    rename(BRIDGE_LOG_PATH, BRIDGE_LOG_ROTATED_PATH);
-    bridge_log_file = fopen(BRIDGE_LOG_PATH, "w");
+    db_log_rotate_file_if_needed_locked(&bridge_log_file, BRIDGE_LOG_PATH, BRIDGE_LOG_ROTATED_PATH, BRIDGE_LOG_MAX_BYTES);
 }
 
 void usb_dac_bridge_set_debug_log_enabled(bool enabled) {

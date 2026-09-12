@@ -1,5 +1,4 @@
 #include "text_reader.h"
-#include "path_cache.h"
 
 #include <dirent.h>
 #include <limits.h>
@@ -16,7 +15,10 @@ static bool is_txt_file(const char * name) {
 /* Same depth-first, unsorted-until-the-end approach as
  * file_browser.c's scan_all_songs_recursive() -- see its own comment for
  * why sorting per-directory would be wasted work. */
-static void scan_recursive(const char * dir_path, char *** paths, int * count, int * capacity) {
+#define TEXT_READER_SCAN_MAX_DEPTH 64
+static void scan_recursive(const char * dir_path, char *** paths, int * count, int * capacity, int depth) {
+    if (depth > TEXT_READER_SCAN_MAX_DEPTH) return;
+
     DIR * dir = opendir(dir_path);
     if (!dir) return;
 
@@ -28,17 +30,23 @@ static void scan_recursive(const char * dir_path, char *** paths, int * count, i
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, de->d_name);
 
         struct stat st;
-        if (stat(full_path, &st) != 0) continue;
+        if (lstat(full_path, &st) != 0) continue;
+        /* Reject symlinks to prevent path traversal outside the books root. */
+        if (S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            scan_recursive(full_path, paths, count, capacity);
+            scan_recursive(full_path, paths, count, capacity, depth + 1);
             continue;
         }
         if (!is_txt_file(de->d_name)) continue;
 
         if (*count == *capacity) {
-            *capacity = *capacity ? *capacity * 2 : 64;
-            *paths = realloc(*paths, sizeof(char *) * (size_t) *capacity);
+            /* Safely reallocate paths array; stop collecting entries on failure. */
+            int new_capacity = *capacity ? *capacity * 2 : 64;
+            char ** grown = realloc(*paths, sizeof(char *) * (size_t) new_capacity);
+            if (!grown) break;
+            *paths = grown;
+            *capacity = new_capacity;
         }
         (*paths)[*count] = strdup(full_path);
         (*count)++;
@@ -58,7 +66,7 @@ bool text_reader_scan_txt_files(const char * root, char *** out_paths, int * out
     int count = 0;
     int capacity = 0;
 
-    scan_recursive(root, &paths, &count, &capacity);
+    scan_recursive(root, &paths, &count, &capacity, 0);
 
     if (count == 0) {
         free(paths);
@@ -101,23 +109,3 @@ char * text_reader_load(const char * path, bool * out_truncated) {
     return buf;
 }
 
-void text_reader_index_replace(char * const * paths, int count) {
-    path_cache_replace(PATH_CACHE_BOOKS, paths, count);
-}
-
-void text_reader_index_load(char *** out_paths, int * out_count) {
-    path_cache_load(PATH_CACHE_BOOKS, out_paths, out_count);
-}
-
-bool text_reader_favorite_is_set(const char * path) {
-    return path_cache_has(PATH_CACHE_BOOK_FAVORITES, path);
-}
-
-void text_reader_favorite_set(const char * path, bool is_favorite) {
-    if (is_favorite) path_cache_insert(PATH_CACHE_BOOK_FAVORITES, path);
-    else path_cache_delete(PATH_CACHE_BOOK_FAVORITES, path);
-}
-
-void text_reader_load_favorites(char *** out_paths, int * out_count) {
-    path_cache_load_matching(PATH_CACHE_BOOK_FAVORITES, PATH_CACHE_BOOKS, out_paths, out_count);
-}

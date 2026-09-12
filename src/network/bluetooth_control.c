@@ -4,7 +4,6 @@
 #include "subprocess.h"
 #include "audio.h"
 
-#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -640,86 +639,6 @@ bool bt_control_forget(const char * mac) {
     return strstr(out, "Failed") == NULL;
 }
 
-/* Intercepts incoming AVRCP absolute-volume updates from bluealsa-cli monitor
- * and reshapes them through a 20dB logarithmic taper before applying them,
- * correcting the default linear amplitude curve. */
-#define BT_VOLUME_CURVE_TAPER_DB 20.0
-#define BT_VOLUME_RAW_MAX 127
-
-static pthread_t bt_volume_curve_thread;
-static bool bt_volume_curve_active = false;
-static pid_t bt_volume_curve_monitor_pid = -1;
-
-static void * bt_volume_curve_thread_func(void * arg) {
-    (void) arg;
-    /* Starts at the full spec range rather than this phone's actual 85 --
-     * unknown at startup, and erring toward treating a given raw value as a
-     * SMALLER fraction of "the phone's max" makes the correction quieter
-     * than strictly necessary until it self-calibrates upward on the first
-     * observed value, rather than louder. Given the sensitive-headphones
-     * motivation for this whole feature, quieter-until-calibrated is the
-     * right direction to err in. */
-    int observed_phone_max = BT_VOLUME_RAW_MAX;
-    int last_written_raw = -1; /* our own echo from the write below -- see the loop */
-
-    char * argv[] = { (char *) "bluealsa-cli", (char *) "monitor", (char *) "-p", NULL };
-    pid_t pid;
-    int read_fd;
-    if (!subprocess_popen(argv, &pid, &read_fd)) return NULL;
-    bt_volume_curve_monitor_pid = pid;
-
-    FILE * f = fdopen(read_fd, "r");
-    if (!f) {
-        subprocess_terminate(pid);
-        close(read_fd);
-        return NULL;
-    }
-
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        char path[256];
-        unsigned int raw_hex;
-        if (sscanf(line, "PropertyChanged %255s Volume 0x%x", path, &raw_hex) != 2) continue;
-
-        int raw = (int) ((raw_hex >> 8) & 0xFF); /* left byte -- left/right always move together for this stereo sync */
-        if (raw == last_written_raw) continue; /* our own write below echoing back -- not a real phone-driven change */
-
-        if (raw > observed_phone_max) observed_phone_max = raw;
-        double fraction = (double) raw / (double) observed_phone_max;
-        double gain = pow(10.0, (fraction - 1.0) * BT_VOLUME_CURVE_TAPER_DB / 20.0);
-        int corrected = (int) (gain * BT_VOLUME_RAW_MAX + 0.5);
-        if (corrected < 0) corrected = 0;
-        if (corrected > BT_VOLUME_RAW_MAX) corrected = BT_VOLUME_RAW_MAX;
-
-        /* Update last_written_raw before issuing write to avoid misinterpreting
-         * our own echo as a new volume change. */
-        last_written_raw = corrected;
-        char corrected_str[8];
-        snprintf(corrected_str, sizeof(corrected_str), "%d", corrected);
-        char * vol_argv[] = { (char *) "bluealsa-cli", (char *) "volume", path, corrected_str, corrected_str, NULL };
-        subprocess_run(vol_argv, NULL, 0);
-    }
-
-    fclose(f); /* also closes read_fd */
-    return NULL;
-}
-
-/* Called from bt_control_apply_output_settings() */
-static void bt_volume_curve_stop(void) {
-    if (!bt_volume_curve_active) return;
-    bt_volume_curve_active = false;
-    /* Terminate the monitor subprocess to unblock fgets. */
-    if (bt_volume_curve_monitor_pid > 0) subprocess_terminate(bt_volume_curve_monitor_pid);
-    pthread_join(bt_volume_curve_thread, NULL);
-    bt_volume_curve_monitor_pid = -1;
-}
-
-static void bt_volume_curve_start(void) {
-    bt_volume_curve_stop(); /* defensive -- never start a second one on top of an existing one */
-    bt_volume_curve_active = true;
-    pthread_create(&bt_volume_curve_thread, NULL, bt_volume_curve_thread_func, NULL);
-}
-
 /* Synchronizes volume between this player and connected a2dp-source accessories.
  * Maps AVRCP 0-127 linearly to the player's 0-100% volume. */
 #define BT_SOURCE_VOLUME_MAX 127
@@ -819,8 +738,7 @@ static atomic_int bt_source_vol_pending_percent = -1;
 
 /* Set by whichever direction writes/observes a value most recently, so the
  * other direction recognizes it as already in sync instead of re-writing
- * it right back -- same reasoning as bt_volume_curve_thread_func's own
- * last_written_raw, just shared between two directions here instead of one
+ * it right back, just shared between two directions here instead of one
  * direction echoing itself. */
 static int bt_source_vol_last_synced_raw = -1;
 
@@ -878,11 +796,10 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
          * the slider/topbar still showed the old app value. */
         bt_source_push_app_volume_if_changed(&last_synced_app_percent);
 
-        /* Bounded, not a blocking fgets() like bt_volume_curve_thread_func
-         * above -- this loop also needs to notice this app's OWN volume
-         * changing (UI slider, hardware buttons), which has no fd to
-         * select() on, so it polls this monitor's pipe with a short
-         * timeout instead of blocking on it indefinitely. 500ms is
+        /* Bounded, not a blocking fgets() -- this loop also needs to notice
+         * this app's OWN volume changing (UI slider, hardware buttons), which
+         * has no fd to select() on, so it polls this monitor's pipe with a
+         * short timeout instead of blocking on it indefinitely. 500ms is
          * imprecise for a "keep two volume controls in sync" feature (not
          * a latency-sensitive control path), matched on both sides of this
          * loop -- see the push check below. */
@@ -929,7 +846,7 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
 }
 
 void bt_control_source_volume_sync_start(void) {
-    if (bt_source_vol_sync_active) return; /* already running -- matches bt_volume_curve_start()'s own idempotency, just without the defensive re-stop since callers here are expected not to double-start (see gui.c's own gating) */
+    if (bt_source_vol_sync_active) return; /* already running -- callers here are expected not to double-start (see gui.c's own gating) */
     bt_source_vol_sync_active = true;
     bt_source_vol_last_synced_raw = -1;
     atomic_store_explicit(&bt_source_vol_pending_percent, -1, memory_order_relaxed);
@@ -1004,7 +921,7 @@ static void * bt_output_disconnect_thread_func(void * arg) {
     }
 
     DBG_LOG("bt_control: output_disconnect_watch: monitor exited (pid %d)\n", (int) pid);
-    fclose(f); /* also closes read_fd -- reached once bt_control_output_disconnect_watch_stop() kills the monitor subprocess and fgets() sees EOF, same as bt_volume_curve_stop()'s identical shutdown pattern above */
+    fclose(f); /* also closes read_fd -- reached once bt_control_output_disconnect_watch_stop() kills the monitor subprocess and fgets() sees EOF */
     return NULL;
 }
 
@@ -1064,7 +981,6 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
 
     /* Single profile mode: runs a2dp-sink or a2dp-source. */
     /* Clean up existing instances before respawning daemons. */
-    bt_volume_curve_stop();
     bt_dac_info_monitor_stop();
 
     subprocess_kill_all_matching("bluealsa");

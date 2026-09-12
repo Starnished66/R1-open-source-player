@@ -44,10 +44,6 @@ bool bt_control_init_chip(void);
 void bt_control_enable(void);
 void bt_control_disable(void);
 
-/* Restarts bluetoothd (kill, adapter reset, power restore, output profile reapply).
- * Blocks for several seconds; call off the UI thread. */
-void bt_control_restart_daemon(void);
-
 /* True if any paired device currently has an active connection. Cheap
  * relative to bt_control_scan() (no discovery window): just `info` on each
  * already-paired device, same query bt_control_scan() already does per

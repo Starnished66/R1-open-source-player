@@ -324,6 +324,7 @@ void gui_plugin_set_text_color(const char * slot, uint32_t rgb) {
  * separately rebuilds Home after the calling Lua callback returns. */
 home_layout_config_t home_layout_config = { 0 };
 launcher_layout_config_t launcher_layout_config = { 0 };
+player_layout_config_t player_layout_config = { 0 };
 
 /* plugin_manager.c's l_plugin_set_home_layout() has already validated every
  * enum-like field (key -> array index, mode, align, text_size) before
@@ -344,6 +345,14 @@ void gui_plugin_set_launcher_layout(const launcher_layout_config_t * config) {
 
 void gui_plugin_reset_launcher_layout(void) {
     launcher_layout_config = (launcher_layout_config_t) { 0 };
+}
+
+void gui_plugin_set_player_layout(const player_layout_config_t * config) {
+    player_layout_config = *config;
+}
+
+void gui_plugin_reset_player_layout(void) {
+    player_layout_config = (player_layout_config_t) { 0 };
 }
 
 /* ---- Playback control bridges -- see gui.h's own comment on why these

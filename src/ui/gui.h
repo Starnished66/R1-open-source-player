@@ -20,6 +20,7 @@
 #include "remote_track.h" /* remote_track_meta_t, used by gui_plugin_play_remote_tracks() below */
 #include "home_layout.h" /* home_layout_config_t, used by gui_plugin_set_home_layout() below */
 #include "launcher_layout.h"
+#include "player_layout.h"
 #include <stdint.h>
 
 #ifdef UI_PERF_TRACE
@@ -137,6 +138,8 @@ void gui_plugin_set_home_layout(const home_layout_config_t * config);
 void gui_plugin_reset_home_layout(void);
 void gui_plugin_set_launcher_layout(const launcher_layout_config_t * config);
 void gui_plugin_reset_launcher_layout(void);
+void gui_plugin_set_player_layout(const player_layout_config_t * config);
+void gui_plugin_reset_player_layout(void);
 
 /* ---- Playback control bridges for plugin.toggle_pause()/stop()/next_track()/
  * prev_track()/seek()/set_volume()/is_playing()/is_paused()/get_position()/

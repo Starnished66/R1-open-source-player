@@ -309,6 +309,7 @@ static void theme_refresh_cb(lv_timer_t * timer) {
     theme_refresh_scheduled = false;
     lv_image_cache_drop(NULL);
     gui_player_refresh_static_assets();
+    gui_player_refresh_frosted_background();
     gui_shell_refresh_static_assets();
     /* Drop old bases before replacement. Each replacement registers one
      * fresh base; invalidating afterwards would immediately destroy those

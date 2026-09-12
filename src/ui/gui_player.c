@@ -41,6 +41,8 @@ static uint64_t current_playback_generation = 0;
 #define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
 #define SUBSONIC_STREAM_CACHE_DIR "/tmp/subsonic_stream_cache"
 #include "gui_lyrics.h"
+#include "frosted_glass.h"
+#include "player_layout.h"
 #include "gui_track_info.h"
 #include "gui_settings.h"
 #include "gui_subsonic.h"
@@ -324,59 +326,17 @@ static void build_volume_popup(void) {
 #define REFLECTION_DARKEN_NUM 1
 #define REFLECTION_DARKEN_DEN 2
 
-/* 1D box blur via a sliding running sum -- O(length) regardless of radius,
- * rather than O(length * radius) from re-summing the whole window at every
- * pixel. `stride` is measured in elements, not bytes, so the same function
- * serves both passes of the separable 2D blur generate_reflection() below
- * does: 1 for a horizontal pass along a contiguous row, `width` for a
- * vertical pass down a column. Edges are clamped (repeats the edge pixel)
- * rather than wrapping or zero-padding, so the blur doesn't darken/lighten
- * near the image boundary. */
-void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stride, int radius) {
-    int window = radius * 2 + 1;
-    int sum = 0;
-    for (int i = -radius; i <= radius; i++) {
-        int idx = i < 0 ? 0 : (i >= length ? length - 1 : i);
-        sum += src[idx * stride];
-    }
-    for (int i = 0; i < length; i++) {
-        dst[i * stride] = (uint8_t) (sum / window);
-        int add_idx = i + radius + 1;
-        if (add_idx >= length) add_idx = length - 1;
-        int rem_idx = i - radius;
-        if (rem_idx < 0) rem_idx = 0;
-        sum += src[add_idx * stride] - src[rem_idx * stride];
-    }
-}
+/* Pure pixel math -- builds the reflection from a given COVER_ART_WIDTH x
+ * COVER_ART_HEIGHT RGB565 buffer and returns a freshly malloc'd
+ * REFLECTION_WIDTH x REFLECTION_HEIGHT RGB565 buffer, or NULL on allocation
+ * failure. Caller owns the result. Accepts blur radius, passes, and darken
+ * fraction parameters with defensive clamping. */
+uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes, int blur_radius, int blur_passes, int darken_num, int darken_den) {
+    if (darken_den <= 0) darken_den = 1;
+    if (blur_radius < 0) blur_radius = 0;
+    if (blur_passes < 0) blur_passes = 0;
+    if (darken_num < 0) darken_num = 0;
 
-/* RGB565 has only 32 red/blue and 64 green levels, so a strong blur exposes
- * broad contour bands even though all filtering above is done in 8-bit
- * planes. Ordered 8x8 dithering trades those coherent bands for a tiny,
- * stable sub-pixel texture. Stable (not random) matters because a changing
- * noise field would shimmer on every redraw. */
-uint16_t rgb888_to_565_dithered(int r, int g, int b, int x, int y) {
-    static const uint8_t bayer8[8][8] = {
-        { 0,48,12,60, 3,51,15,63 }, { 32,16,44,28,35,19,47,31 },
-        { 8,56, 4,52,11,59, 7,55 }, { 40,24,36,20,43,27,39,23 },
-        { 2,50,14,62, 1,49,13,61 }, { 34,18,46,30,33,17,45,29 },
-        { 10,58, 6,54, 9,57, 5,53 }, { 42,26,38,22,41,25,37,21 }
-    };
-    int threshold = bayer8[y & 7][x & 7];
-    r += threshold / 8 - 4;
-    g += threshold / 16 - 2;
-    b += threshold / 8 - 4;
-    if (r < 0) r = 0; else if (r > 255) r = 255;
-    if (g < 0) g = 0; else if (g > 255) g = 255;
-    if (b < 0) b = 0; else if (b > 255) b = 255;
-    return (uint16_t) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-}
-
-/* Pure pixel math -- no LVGL/shared-state touch, so it's safe to call from
- * a background thread (see the async cover-decode pipeline below). Builds
- * the reflection from a given COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565
- * buffer and returns a freshly malloc'd REFLECTION_WIDTH x REFLECTION_HEIGHT
- * RGB565 buffer, or NULL on allocation failure. Caller owns the result. */
-uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
     int w = REFLECTION_WIDTH, h = REFLECTION_HEIGHT;
     uint8_t * r = malloc((size_t) w * h);
     uint8_t * g = malloc((size_t) w * h);
@@ -403,25 +363,23 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
 
     /* Separable box blur: one horizontal pass (per row) then one vertical
      * pass (per column), on each channel independently -- a full 2D blur
-     * at a fraction of the cost of a real 2D kernel. Heavy (radius 16)
-     * deliberately, per the "frosted glass" look this is going for rather
-     * than a sharp mirror image. */
-    for (int pass = 0; pass < REFLECTION_BLUR_PASSES; pass++) {
-        for (int y = 0; y < h; y++) box_blur_1d(r + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+     * at a fraction of the cost of a real 2D kernel. */
+    for (int pass = 0; pass < blur_passes; pass++) {
+        for (int y = 0; y < h; y++) box_blur_1d(r + y * w, tmp + y * w, w, 1, blur_radius);
         memcpy(r, tmp, (size_t) w * h);
-        for (int x = 0; x < w; x++) box_blur_1d(r + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+        for (int x = 0; x < w; x++) box_blur_1d(r + x, tmp + x, h, w, blur_radius);
         memcpy(r, tmp, (size_t) w * h);
     }
-    for (int pass = 0; pass < REFLECTION_BLUR_PASSES; pass++) {
-        for (int y = 0; y < h; y++) box_blur_1d(g + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+    for (int pass = 0; pass < blur_passes; pass++) {
+        for (int y = 0; y < h; y++) box_blur_1d(g + y * w, tmp + y * w, w, 1, blur_radius);
         memcpy(g, tmp, (size_t) w * h);
-        for (int x = 0; x < w; x++) box_blur_1d(g + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+        for (int x = 0; x < w; x++) box_blur_1d(g + x, tmp + x, h, w, blur_radius);
         memcpy(g, tmp, (size_t) w * h);
     }
-    for (int pass = 0; pass < REFLECTION_BLUR_PASSES; pass++) {
-        for (int y = 0; y < h; y++) box_blur_1d(b + y * w, tmp + y * w, w, 1, REFLECTION_BLUR_RADIUS);
+    for (int pass = 0; pass < blur_passes; pass++) {
+        for (int y = 0; y < h; y++) box_blur_1d(b + y * w, tmp + y * w, w, 1, blur_radius);
         memcpy(b, tmp, (size_t) w * h);
-        for (int x = 0; x < w; x++) box_blur_1d(b + x, tmp + x, h, w, REFLECTION_BLUR_RADIUS);
+        for (int x = 0; x < w; x++) box_blur_1d(b + x, tmp + x, h, w, blur_radius);
         memcpy(b, tmp, (size_t) w * h);
     }
 
@@ -435,20 +393,137 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes) {
      * and repack into RGB565, same channel layout current_cover_dsc uses. */
     uint16_t * out = (uint16_t *) out_bytes;
     for (int i = 0; i < w * h; i++) {
-        int rv = (r[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
-        int gv = (g[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
-        int bv = (b[i] * REFLECTION_DARKEN_NUM) / REFLECTION_DARKEN_DEN;
+        int rv = (r[i] * darken_num) / darken_den;
+        int gv = (g[i] * darken_num) / darken_den;
+        int bv = (b[i] * darken_num) / darken_den;
         out[i] = rgb888_to_565_dithered(rv, gv, bv, i % w, i / w);
     }
     free(r); free(g); free(b); free(tmp);
     return out_bytes;
 }
 
+typedef struct {
+    bool flat;
+    bool has_bg_color;
+    uint32_t bg_color;
+    int blur_radius;
+    int blur_passes;
+    int darken_num;
+    int darken_den;
+} player_frost_params_t;
+
+/* Resolves effective frosted-glass layout parameters from player_layout_config,
+ * applying defaults and defensive clamping. Reads the global layout config once
+ * into a local snapshot to avoid data races with UI thread updates. */
+static player_frost_params_t resolve_player_frost_params(void) {
+    player_layout_config_t cfg = player_layout_config;
+    player_frost_params_t params = {
+        .flat = false,
+        .has_bg_color = false,
+        .bg_color = 0,
+        .blur_radius = REFLECTION_BLUR_RADIUS,
+        .blur_passes = REFLECTION_BLUR_PASSES,
+        .darken_num = REFLECTION_DARKEN_NUM,
+        .darken_den = REFLECTION_DARKEN_DEN,
+    };
+
+    if (cfg.configured) {
+        if (cfg.flat) {
+            params.flat = true;
+            params.has_bg_color = cfg.has_bg_color;
+            params.bg_color = cfg.bg_color;
+            return params;
+        }
+        if (cfg.has_blur_radius) {
+            params.blur_radius = cfg.blur_radius;
+            if (params.blur_radius < 0) params.blur_radius = 0;
+            if (params.blur_radius > 64) params.blur_radius = 64;
+        }
+        if (cfg.has_blur_passes) {
+            params.blur_passes = cfg.blur_passes;
+            if (params.blur_passes < 0) params.blur_passes = 0;
+            if (params.blur_passes > 16) params.blur_passes = 16;
+        }
+        if (cfg.has_darken) {
+            params.darken_num = cfg.darken_num;
+            params.darken_den = cfg.darken_den;
+            if (params.darken_num < 0) params.darken_num = 0;
+            if (params.darken_num > 64) params.darken_num = 64;
+            if (params.darken_den < 1) params.darken_den = 1;
+            if (params.darken_den > 64) params.darken_den = 64;
+        }
+    }
+
+    return params;
+}
+
+static void apply_player_flat_background(bool has_bg_color, uint32_t bg_color) {
+    free(current_reflection_bytes);
+    current_reflection_bytes = NULL;
+
+    if (!player_overlay_panel) return;
+
+    lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
+    if (has_bg_color) {
+        lv_obj_set_style_bg_color(player_overlay_panel, lv_color_hex(bg_color), 0);
+    } else {
+        lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
+    }
+    lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_COVER, 0);
+    player_transition_mark_dirty();
+}
+
+void gui_player_refresh_frosted_background(void) {
+    if (!player_overlay_panel) return;
+
+    player_frost_params_t params = resolve_player_frost_params();
+    if (params.flat) {
+        /* Flat mode is a plain color fill -- doesn't need decoded cover
+         * pixels, so it must apply even before any track has played or
+         * after a failed decode, unlike the blur branch below. */
+        apply_player_flat_background(params.has_bg_color, params.bg_color);
+        return;
+    }
+    if (!current_cover_bytes) {
+        /* Nothing to blur yet -- next decode picks up the current config.
+         * Still clear any flat-mode BG_COLOR left over from a previous
+         * live switch away from flat, so a stale tint doesn't linger
+         * behind the frosted image once a cover does decode. */
+        lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
+        return;
+    }
+
+    free(current_reflection_bytes);
+    current_reflection_bytes = compute_reflection_bytes(current_cover_bytes, params.blur_radius, params.blur_passes, params.darken_num, params.darken_den);
+
+    lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
+    lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_COVER, 0);
+
+    if (current_reflection_bytes) {
+        memset(&current_reflection_dsc, 0, sizeof(current_reflection_dsc));
+        current_reflection_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        current_reflection_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        current_reflection_dsc.header.w = REFLECTION_WIDTH;
+        current_reflection_dsc.header.h = REFLECTION_HEIGHT;
+        current_reflection_dsc.header.stride = REFLECTION_WIDTH * 2;
+        current_reflection_dsc.data = current_reflection_bytes;
+        current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * REFLECTION_HEIGHT * 2;
+        lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
+    } else {
+        lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
+    }
+    player_transition_mark_dirty();
+}
+
 /* Cover art decoding (cover_decode_to_rgb565()) and reflection blur
- * computation are offloaded to a background pthread to avoid blocking the
- * UI thread. launch_cover_decode_req() spawns the worker thread, and
- * poll_cover_decode() (called periodically from update_timer_cb) applies
- * the decoded RGB565 buffers to the image widgets once ready. */
+ * computation (compute_reflection_bytes()) are offloaded to a background
+ * pthread to avoid blocking the UI thread. Frost parameters (radius,
+ * passes, darken ratio, or flat styling) are snapshotted on the UI thread
+ * into each request before launching the worker thread, avoiding data races
+ * against live player_layout_config modifications. launch_cover_decode_req()
+ * spawns the worker thread, and poll_cover_decode() (called periodically
+ * from update_timer_cb) applies the decoded RGB565 buffers or flat styling
+ * to the image widgets once ready. */
 typedef struct {
     int for_index;
     uint8_t * picture_data; /* owned download buffer for streamed artwork */
@@ -470,6 +545,16 @@ typedef struct {
     char artist[128];
     char album[128];
     char album_artist[128];
+
+    /* Resolved frosted-glass parameters snapshotted from player_layout_config
+     * on the UI thread before launching the worker thread. */
+    bool flat;
+    bool has_bg_color;
+    uint32_t bg_color;
+    int blur_radius;
+    int blur_passes;
+    int darken_num;
+    int darken_den;
 } cover_decode_request_t;
 
 static pthread_t cover_decode_thread;
@@ -486,6 +571,29 @@ static int cover_decode_result_for_index;
 static bool cover_decode_result_ok;
 static uint16_t * cover_decode_result_pixels;    /* COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565, owned */
 static uint8_t * cover_decode_result_reflection; /* REFLECTION_WIDTH x REFLECTION_HEIGHT RGB565, owned */
+static bool cover_decode_result_flat;
+static bool cover_decode_result_has_bg_color;
+static uint32_t cover_decode_result_bg_color;
+/* Snapshotted at request-launch time, same as the 3 fields above -- carried
+ * through so poll_cover_decode() can tell whether player_layout_config
+ * changed while this decode was in flight (see its own comment). */
+static int cover_decode_result_blur_radius;
+static int cover_decode_result_blur_passes;
+static int cover_decode_result_darken_num;
+static int cover_decode_result_darken_den;
+
+/* Helper called only from the UI thread when constructing a fresh decode request.
+ * Resolves current layout frost parameters once and snapshots them into the request. */
+static void cover_decode_request_snapshot_frost(cover_decode_request_t * req) {
+    player_frost_params_t p = resolve_player_frost_params();
+    req->flat = p.flat;
+    req->has_bg_color = p.has_bg_color;
+    req->bg_color = p.bg_color;
+    req->blur_radius = p.blur_radius;
+    req->blur_passes = p.blur_passes;
+    req->darken_num = p.darken_num;
+    req->darken_den = p.darken_den;
+}
 
 
 /* Holds at most one superseded request -- see launch_cover_decode_req()'s own
@@ -623,12 +731,26 @@ static void * cover_decode_thread_func(void * arg) {
                                        req->album_artist, &pixels);
     }
 
-    uint8_t * reflection = ok ? compute_reflection_bytes((const uint8_t *) pixels) : NULL;
+    uint8_t * reflection = NULL;
+    if (ok && !req->flat) {
+        reflection = compute_reflection_bytes((const uint8_t *) pixels,
+                                              req->blur_radius,
+                                              req->blur_passes,
+                                              req->darken_num,
+                                              req->darken_den);
+    }
 
     cover_decode_result_for_index = req->for_index;
     cover_decode_result_ok = ok;
     cover_decode_result_pixels = pixels;
     cover_decode_result_reflection = reflection;
+    cover_decode_result_flat = req->flat;
+    cover_decode_result_has_bg_color = req->has_bg_color;
+    cover_decode_result_bg_color = req->bg_color;
+    cover_decode_result_blur_radius = req->blur_radius;
+    cover_decode_result_blur_passes = req->blur_passes;
+    cover_decode_result_darken_num = req->darken_num;
+    cover_decode_result_darken_den = req->darken_den;
     free(req);
     atomic_store_explicit(&cover_decode_done_flag, true, memory_order_release); /* written last -- poll_cover_decode() only checks this flag */
     return NULL;
@@ -678,6 +800,7 @@ static void launch_cover_decode_from_track(int for_index, const char * track_pat
     snprintf(r.artist, sizeof(r.artist), "%s", artist ? artist : "");
     snprintf(r.album, sizeof(r.album), "%s", album ? album : "");
     snprintf(r.album_artist, sizeof(r.album_artist), "%s", album_artist ? album_artist : "");
+    cover_decode_request_snapshot_frost(&r);
     launch_cover_decode_req(r);
 }
 
@@ -690,6 +813,7 @@ static void launch_cover_decode_from_url(int for_index, const char * url, bool v
     cover_decode_request_t r = { .for_index = for_index, .picture_data = NULL, .picture_size = 0,
                                   .stream_verify_tls = verify_tls };
     snprintf(r.stream_url, sizeof(r.stream_url), "%s", url);
+    cover_decode_request_snapshot_frost(&r);
     launch_cover_decode_req(r);
 }
 
@@ -709,6 +833,7 @@ void poll_cover_decode(void) {
         free(cover_decode_result_pixels);
         free(cover_decode_result_reflection);
     } else if (!cover_decode_result_ok) {
+        free(cover_decode_result_reflection);
         free(current_cover_bytes);
         current_cover_bytes = NULL;
         current_cover_for_index = -1;
@@ -723,19 +848,27 @@ void poll_cover_decode(void) {
         current_cover_dsc.data = NULL;
         lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
         /* No in-memory raw bitmap to reflect for the static placeholder
-         * cover -- reset the panel back to its plain background rather
-         * than leaving a stale reflection from whatever track played
+         * cover. Apply a configured flat color if set (it needs no cover
+         * pixels), otherwise reset the panel back to its plain background
+         * rather than leaving a stale reflection from whatever track played
          * before this one. */
-        free(current_reflection_bytes);
-        current_reflection_bytes = NULL;
-        lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
+        player_frost_params_t failure_params = resolve_player_frost_params();
+        if (failure_params.flat) {
+            apply_player_flat_background(failure_params.has_bg_color, failure_params.bg_color);
+        } else {
+            free(current_reflection_bytes);
+            current_reflection_bytes = NULL;
+            /* Clear any flat-mode BG_COLOR left over from a previous live
+             * switch away from flat -- same reasoning as gui_player_
+             * refresh_frosted_background()'s own no-cover-yet branch. */
+            lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
+            lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
+        }
         player_transition_mark_dirty(); /* cover_img just changed to the placeholder -- see the cache's own doc comment */
     } else {
         free(current_cover_bytes);
         current_cover_bytes = (uint8_t *) cover_decode_result_pixels;
         current_cover_for_index = cover_decode_result_for_index;
-        free(current_reflection_bytes);
-        current_reflection_bytes = cover_decode_result_reflection;
 
         /* lv_image_header_t.magic must be set to LV_IMAGE_HEADER_MAGIC;
          * otherwise LVGL's bin decoder treats a 0 magic value as a legacy
@@ -751,16 +884,57 @@ void poll_cover_decode(void) {
         current_cover_dsc.data_size = (uint32_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2;
         lv_image_set_src(cover_img, &current_cover_dsc);
 
-        /* Same LV_IMAGE_HEADER_MAGIC requirement as current_cover_dsc above. */
-        memset(&current_reflection_dsc, 0, sizeof(current_reflection_dsc));
-        current_reflection_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-        current_reflection_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-        current_reflection_dsc.header.w = REFLECTION_WIDTH;
-        current_reflection_dsc.header.h = REFLECTION_HEIGHT;
-        current_reflection_dsc.header.stride = REFLECTION_WIDTH * 2;
-        current_reflection_dsc.data = current_reflection_bytes;
-        current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * REFLECTION_HEIGHT * 2;
-        lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
+        /* The reflection this decode computed was built from frost params
+         * snapshotted when the decode was LAUNCHED. If a plugin changed
+         * player_layout_config while this decode was in flight (a rare
+         * race, e.g. plugin.set_player_layout()/refresh_theme() firing
+         * mid-decode), that stale snapshot must not silently overwrite the
+         * live config the plugin just applied -- compare against the
+         * current live params and only trust the worker's precomputed
+         * result when they still match. */
+        player_frost_params_t live_params = resolve_player_frost_params();
+        bool snapshot_is_stale = (live_params.flat != cover_decode_result_flat) ||
+            (live_params.flat
+                ? (live_params.has_bg_color != cover_decode_result_has_bg_color ||
+                   (live_params.has_bg_color && live_params.bg_color != cover_decode_result_bg_color))
+                : (live_params.blur_radius != cover_decode_result_blur_radius ||
+                   live_params.blur_passes != cover_decode_result_blur_passes ||
+                   live_params.darken_num != cover_decode_result_darken_num ||
+                   live_params.darken_den != cover_decode_result_darken_den));
+
+        if (snapshot_is_stale) {
+            /* Discard the worker's now-outdated result and recompute
+             * synchronously against the live config and the cover art
+             * just installed above -- a one-off UI-thread recompute here
+             * is the same acceptable tradeoff gui_player_refresh_frosted_
+             * background()'s own live-refresh callers already make. */
+            free(cover_decode_result_reflection);
+            gui_player_refresh_frosted_background();
+        } else if (cover_decode_result_flat) {
+            free(cover_decode_result_reflection);
+            apply_player_flat_background(cover_decode_result_has_bg_color, cover_decode_result_bg_color);
+        } else {
+            free(current_reflection_bytes);
+            current_reflection_bytes = cover_decode_result_reflection;
+
+            lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
+            lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_COVER, 0);
+
+            if (current_reflection_bytes) {
+                /* Same LV_IMAGE_HEADER_MAGIC requirement as current_cover_dsc above. */
+                memset(&current_reflection_dsc, 0, sizeof(current_reflection_dsc));
+                current_reflection_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+                current_reflection_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+                current_reflection_dsc.header.w = REFLECTION_WIDTH;
+                current_reflection_dsc.header.h = REFLECTION_HEIGHT;
+                current_reflection_dsc.header.stride = REFLECTION_WIDTH * 2;
+                current_reflection_dsc.data = current_reflection_bytes;
+                current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * REFLECTION_HEIGHT * 2;
+                lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
+            } else {
+                lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
+            }
+        }
 
         /* Refresh lyrics screen backdrop now that current_cover_bytes has
          * been updated with new cover art. */
@@ -3408,6 +3582,12 @@ void gui_player_init(uint32_t screen_width, uint32_t screen_height) {
     build_more_menu_popup();
     gui_track_info_init();
     player_screen = build_player_screen(screen_width, screen_height);
+    /* Apply any player_layout_config already set (a plugin's top-level code
+     * runs before this on boot/reload, per gui_plugin_set_player_layout()'s
+     * own comment) to the freshly-built overlay right away, rather than
+     * waiting for the next track's cover decode to pick it up. No-ops
+     * cleanly if no config was ever set or no cover is loaded yet. */
+    gui_player_refresh_frosted_background();
 }
 
 /* For gui_reload.c's in-process UI reload -- deletes every screen/popup this
@@ -3446,6 +3626,15 @@ void gui_player_teardown(void) {
     if (more_menu_popup_backdrop) { lv_obj_delete(more_menu_popup_backdrop); more_menu_popup_backdrop = NULL; }
     gui_track_info_teardown();
     if (player_screen) { lv_obj_delete(player_screen); player_screen = NULL; }
+    /* player_overlay_panel/cover_img are descendants of player_screen, so
+     * lv_obj_delete() above already destroyed them -- null the pointers too
+     * so gui_player_refresh_frosted_background() (reachable from a plugin's
+     * own top-level code via plugin.set_player_layout(), which can run
+     * before gui_player_init() rebuilds this screen on reload) sees its
+     * existing '!player_overlay_panel' guard correctly no-op instead of
+     * writing LVGL styles to freed memory. */
+    player_overlay_panel = NULL;
+    cover_img = NULL;
     favorite_icon = NULL;
     asset_png_memory_free(progress_bg_image); progress_bg_image = NULL;
     asset_png_memory_free(progress_fill_image); progress_fill_image = NULL;

@@ -16,6 +16,7 @@
 
 #include "lyrics.h"
 #include "lyrics_layout.h"
+#include "frosted_glass.h"
 #include "fallback_font.h"
 #include "db_log.h"
 
@@ -85,8 +86,6 @@ static int lyrics_load_generation = 0;
  * current_lyrics_doc_valid. current_lyrics_plain_text is malloc'd, owned
  * by these globals once poll_lyrics_load() transfers it; freed on the next
  * load and whenever current_lyrics_plain_mode is cleared. */
-extern void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stride, int radius);
-
 
 typedef struct {
     uint8_t * cover_copy;
@@ -94,8 +93,6 @@ typedef struct {
     int lyrics_generation;
 } lyrics_backdrop_request_t;
 
-
-extern uint16_t rgb888_to_565_dithered(uint8_t r, uint8_t g, uint8_t b, int x, int y);
 extern void audio_seek(double seconds);
 extern double audio_get_position_seconds(void);
 

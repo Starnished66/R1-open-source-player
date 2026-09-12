@@ -170,3 +170,5 @@ png_red_1300.png
 # as well.
 src/library/png_fixtures.h
 src/library/cover_decode_jpeg_fixtures.h
+repomix-output.xml
+src/library/cover_decode_scale_test.c

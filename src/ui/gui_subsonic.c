@@ -31,7 +31,6 @@ extern void nav_pop(void);
 extern void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
 extern void start_library_rescan(void);
 extern void finalize_screen_navigation(lv_obj_t * screen);
-extern lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode, lv_obj_t ** out_title, const char * body_text, const char * confirm_text, lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row, const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb, lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
 extern lv_color_t accent_lv_color(void);
 
 
@@ -111,8 +110,6 @@ static gui_busy_handle_t subsonic_browse_token = 0;
 static gui_busy_handle_t subsonic_connect_token = 0;
 
 static lv_obj_t * subsonic_entry_screen;
-
-lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
 
 subsonic_stream_song_meta_t * subsonic_stream_meta = NULL; /* parallel array, NULL when no Subsonic stream queue is loaded */
 
@@ -400,33 +397,6 @@ static void populate_indexed_list(lv_obj_t * list, int count, const char * (*lab
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
     }
-}
-
-lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list) {
-    lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
-
-    lv_obj_t * title_label = build_screen_header(scr, default_title, generic_back_cb, NULL, NULL);
-
-    lv_obj_t * list = lv_obj_create(scr);
-    lv_obj_set_size(list, lv_pct(100),
-                    lv_display_get_vertical_resolution(lv_display_get_default()) - STATUS_BAR_CLEARANCE -
-                        TITLE_ROW_HEIGHT);
-    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_opa(list, 0, 0);
-    lv_obj_set_style_border_width(list, 0, 0);
-    /* Clear padding so rows align cleanly to screen edges without horizontal offset. */
-    lv_obj_set_style_pad_all(list, 0, 0);
-    lv_obj_set_scroll_dir(list, LV_DIR_VER); /* see build_icon_grid_screen's comment in screen_builders.c */
-    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_gap(list, GUI_ROW_GAP, 0);
-    lv_obj_set_style_pad_top(list, GUI_ROW_GAP, 0);
-
-    *out_title_label = title_label;
-    *out_list = list;
-    finalize_screen_navigation(scr);
-    return scr;
 }
 
 static subsonic_artist_t * subsonic_artists_cache = NULL;
@@ -810,15 +780,12 @@ static void subsonic_menu_albums_row_cb(lv_event_t * e) {
 
 static subsonic_download_pending_t subsonic_download_pending = SUBSONIC_DOWNLOAD_PENDING_NONE;
 
-static lv_obj_t * subsonic_download_confirm_popup;
-
-static lv_obj_t * subsonic_download_confirm_popup_backdrop;
+static gui_popup_t subsonic_download_confirm_popup;
 
 static lv_obj_t * subsonic_download_confirm_title;
 
 static void hide_subsonic_download_confirm_popup(void) {
-    lv_obj_add_flag(subsonic_download_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(subsonic_download_confirm_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&subsonic_download_confirm_popup);
     subsonic_download_pending = SUBSONIC_DOWNLOAD_PENDING_NONE;
 }
 
@@ -835,10 +802,7 @@ static void subsonic_download_confirm_cancel_cb(lv_event_t * e) {
 static void show_subsonic_download_confirm_popup(subsonic_download_pending_t kind, const char * msg) {
     subsonic_download_pending = kind;
     lv_label_set_text(subsonic_download_confirm_title, msg);
-    lv_obj_remove_flag(subsonic_download_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(subsonic_download_confirm_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(subsonic_download_confirm_popup_backdrop);
-    lv_obj_move_foreground(subsonic_download_confirm_popup);
+    gui_popup_show(&subsonic_download_confirm_popup);
 }
 
 static void subsonic_download_songs_now(void) {
@@ -891,10 +855,10 @@ static void subsonic_download_confirm_cb(lv_event_t * e) {
 }
 
 static void build_subsonic_download_confirm_popup(void) {
-    subsonic_download_confirm_popup = build_confirm_popup(
+    subsonic_download_confirm_popup.popup = build_confirm_popup(
         "", LV_LABEL_LONG_WRAP, &subsonic_download_confirm_title, NULL, "Download", accent_lv_color(),
         subsonic_download_confirm_cb, NULL, "Cancel", lv_color_make(160, 160, 160), subsonic_download_confirm_cancel_cb,
-        NULL, subsonic_download_confirm_backdrop_cb, &subsonic_download_confirm_popup_backdrop);
+        NULL, subsonic_download_confirm_backdrop_cb, &subsonic_download_confirm_popup.backdrop);
 }
 
 static pthread_t subsonic_connect_thread;
@@ -1273,19 +1237,15 @@ void gui_subsonic_init(void) {
  * frees its own prior state on re-registration (gui_library.c) -- nothing
  * extra needed here for that. */
 void gui_subsonic_teardown(void) {
-    if (subsonic_download_confirm_popup) { lv_obj_del(subsonic_download_confirm_popup); subsonic_download_confirm_popup = NULL; }
-    if (subsonic_download_confirm_popup_backdrop) {
-        lv_obj_del(subsonic_download_confirm_popup_backdrop);
-        subsonic_download_confirm_popup_backdrop = NULL;
-    }
-    if (subsonic_entry_screen) { lv_obj_del(subsonic_entry_screen); subsonic_entry_screen = NULL; }
-    if (subsonic_saved_servers_screen) { lv_obj_del(subsonic_saved_servers_screen); subsonic_saved_servers_screen = NULL; }
-    if (subsonic_new_connection_screen) { lv_obj_del(subsonic_new_connection_screen); subsonic_new_connection_screen = NULL; }
-    if (subsonic_menu_screen) { lv_obj_del(subsonic_menu_screen); subsonic_menu_screen = NULL; }
-    if (subsonic_artists_screen) { lv_obj_del(subsonic_artists_screen); subsonic_artists_screen = NULL; }
-    if (subsonic_albums_screen) { lv_obj_del(subsonic_albums_screen); subsonic_albums_screen = NULL; }
-    if (subsonic_songs_screen) { lv_obj_del(subsonic_songs_screen); subsonic_songs_screen = NULL; }
-    if (subsonic_playlists_screen) { lv_obj_del(subsonic_playlists_screen); subsonic_playlists_screen = NULL; }
+    gui_popup_teardown(&subsonic_download_confirm_popup);
+    if (subsonic_entry_screen) { lv_obj_delete(subsonic_entry_screen); subsonic_entry_screen = NULL; }
+    if (subsonic_saved_servers_screen) { lv_obj_delete(subsonic_saved_servers_screen); subsonic_saved_servers_screen = NULL; }
+    if (subsonic_new_connection_screen) { lv_obj_delete(subsonic_new_connection_screen); subsonic_new_connection_screen = NULL; }
+    if (subsonic_menu_screen) { lv_obj_delete(subsonic_menu_screen); subsonic_menu_screen = NULL; }
+    if (subsonic_artists_screen) { lv_obj_delete(subsonic_artists_screen); subsonic_artists_screen = NULL; }
+    if (subsonic_albums_screen) { lv_obj_delete(subsonic_albums_screen); subsonic_albums_screen = NULL; }
+    if (subsonic_songs_screen) { lv_obj_delete(subsonic_songs_screen); subsonic_songs_screen = NULL; }
+    if (subsonic_playlists_screen) { lv_obj_delete(subsonic_playlists_screen); subsonic_playlists_screen = NULL; }
 }
 
 bool gui_subsonic_has_background_work(void) {

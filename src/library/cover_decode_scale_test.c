@@ -1,3 +1,4 @@
+#include "png_fixtures.h"
 /* Host tests for JPEG cover decode: jpeg_probe() SOF walking, scale
  * selection, tjpgd 1/2 1/4 1/8 output geometry and BGR order,
  * cover_decode_to_rgb565_ex cover-fit, and malformed/oversized rejection.
@@ -34,11 +35,18 @@ void lodepng_state_cleanup(LodePNGState * state) {
     (void) state;
 }
 unsigned lodepng_inspect(unsigned * w, unsigned * h, LodePNGState * state, const unsigned char * in, size_t insize) {
-    (void) state;
-    (void) in;
-    (void) insize;
     if (mock_png) {
         *w = *h = 2;
+        return 0;
+    }
+    if (insize > 24 && in[0] == 0x89) {
+        if (w) *w = (in[16] << 24) | (in[17] << 16) | (in[18] << 8) | in[19];
+        if (h) *h = (in[20] << 24) | (in[21] << 16) | (in[22] << 8) | in[23];
+        if (state) {
+            state->info_png.color.bitdepth = in[24];
+            state->info_png.color.colortype = in[25];
+            state->info_png.interlace_method = in[28];
+        }
         return 0;
     }
     if (w) *w = 0;
@@ -278,6 +286,24 @@ static bool patch_sof0_size(uint8_t * jpeg, uint32_t size, uint16_t w, uint16_t 
     return false;
 }
 
+
+static void test_png_streaming(void) {
+    BEGIN_TEST("png_streaming");
+    uint16_t * pixels = NULL;
+    // 1300x1300 > 1200 max_side, should trigger streaming and succeed!
+    cover_decode_result_t res = cover_decode_to_rgb565_ex(png_red_1300, png_red_1300_len, 480, 480, ARTWORK_PRIO_PLAYER, NULL, NULL, &pixels);
+    CHECK(res == COVER_DECODE_OK);
+    CHECK(pixels != NULL);
+    
+    // Check color (Red in RGB565 is 0xF800)
+    int correct = 0;
+    for(int i=0; i<480*480; i++) {
+        if(pixels[i] == 0xF800) correct++;
+    }
+    CHECK(correct > 480*480 * 0.99); // Allow some minor inaccuracies if any, though should be 100%
+    free(pixels);
+}
+
 static void test_malformed_and_oversized(void) {
     BEGIN_TEST("malformed_and_oversized");
     system_set_mock_mem_available(64U * 1024U * 1024U);
@@ -313,7 +339,10 @@ static void test_malformed_and_oversized(void) {
     CHECK(pixels == NULL);
 
     /* 2000x2000 target 72x72: scale 1/8 -> 250 <= 1200, dims are OK, so not OVERSIZED.
-     * It fails later in decomp because scan data is still 128x128 fixture bytes. */
+     * It fails later because scan data is still only 128x128 worth of entropy-coded
+     * bytes: tjpgd fails outright, and the libjpeg fallback this now tries also
+     * rejects it (rather than silently padding a truncated image with garbage --
+     * see the num_warnings check in decode_jpeg_libjpeg_rgb888()). */
     memcpy(oversized, jpeg_red_128, jpeg_red_128_size);
     CHECK(patch_sof0_size(oversized, jpeg_red_128_size, 2000, 2000));
     cover_decode_result_t res_2k = cover_decode_to_rgb565_ex(oversized, jpeg_red_128_size, 72, 72,
@@ -334,14 +363,16 @@ static void test_jpeg_probe(void) {
     BEGIN_TEST("jpeg_probe");
     jpeg_probe_t p;
 
-    /* (a) Existing 128x128 SOF0 baseline, 4:4:4. coeff_bytes is 0 for baseline. */
+    /* (a) Existing 128x128 SOF0 baseline, 4:4:4. coeff_bytes is now computed
+     * unconditionally (worst-case, as if this might be sequential-multiscan)
+     * rather than only for progressive -- see jpeg_probe_t's own comment. */
     memset(&p, 0xff, sizeof(p));
     CHECK(jpeg_probe(jpeg_red_128, jpeg_red_128_size, &p) == true);
     CHECK(p.supported == true);
     CHECK(p.is_progressive == false);
     CHECK(p.native_w == 128);
     CHECK(p.native_h == 128);
-    CHECK(p.coeff_bytes == 0);
+    CHECK(p.coeff_bytes == 98304);
 
     /* (b) Real 48x40 SOF2, 4:2:0 (Y 2x2, Cb 1x1, Cr 1x1).
      *
@@ -397,8 +428,12 @@ static void test_jpeg_probe(void) {
     CHECK(prog_pixels != NULL);
     free(prog_pixels);
 
-    /* (c) Synthetic SOF2 1600x100 4:2:0 -- probe succeeds; cover_decode
-     * rejects native progressive side > MAX_DECODED_COVER_SIDE (1200).
+    /* (c) Synthetic SOF2 1600x100 4:2:0 -- probe succeeds; 1600 is under the
+     * progressive native cap (MAX_JPEG_NATIVE_SIDE, 4096), so this is no
+     * longer rejected by dimension alone. It has no real scan data behind
+     * its header, though, so it still fails -- now at actual libjpeg decode
+     * time (COVER_DECODE_FAIL_UNSUPPORTED), not via the old permanent
+     * OVERSIZED dimension gate.
      *
      *   Hmax=2, Vmax=2  =>  MCU 16 x 16
      *   mcus_per_row = ceil(1600 / 16) = 100
@@ -417,9 +452,9 @@ static void test_jpeg_probe(void) {
 
     system_set_mock_mem_available(64U * 1024U * 1024U);
     uint16_t * pixels = NULL;
-    CHECK(cover_decode_to_rgb565_ex(jpeg_prog_oversized_1600x100, jpeg_prog_oversized_1600x100_size,
-                                    480, 480, ARTWORK_PRIO_PLAYER, NULL, NULL, &pixels) ==
-          COVER_DECODE_FAIL_OVERSIZED);
+    cover_decode_result_t res = cover_decode_to_rgb565_ex(jpeg_prog_oversized_1600x100, jpeg_prog_oversized_1600x100_size,
+                                                          480, 480, ARTWORK_PRIO_PLAYER, NULL, NULL, &pixels);
+    CHECK(res == COVER_DECODE_FAIL_UNSUPPORTED);
     CHECK(pixels == NULL);
 
     /* (d) SOF9 arithmetic sequential: SOF is reached, but unsupported. */
@@ -599,6 +634,7 @@ int main(void) {
     test_cover_decode_quadrants_each_scale();
     test_malformed_and_oversized();
     test_cover_resize_rgb565();
+    test_png_streaming();
 
     if (g_failures == 0) {
         fprintf(stderr, "All cover_decode_scale tests passed.\n");

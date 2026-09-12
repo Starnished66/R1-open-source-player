@@ -77,14 +77,12 @@ extern void nav_remove_stack_slot(int depth);
 extern void finalize_screen_navigation(lv_obj_t * screen);
 extern void show_error_toast(const char * msg);
 extern void show_info_toast(const char * msg);
-extern lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode, lv_obj_t ** out_title, const char * body_text, const char * confirm_text, lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row, const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb, lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
 extern lv_color_t accent_lv_color(void);
 extern lv_obj_t * add_pill_chevron_row(lv_obj_t * list, const char * text, lv_event_cb_t cb);
 extern lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);
 extern lv_obj_t * add_pill_row_base(lv_obj_t * list, const char * text);
 extern const lv_font_t * gui_theme_font(gui_font_role_t role);
 extern void generic_back_cb(lv_event_t * e);
-extern void finalize_screen_navigation(lv_obj_t * screen);
 static gui_busy_handle_t wifi_connect_saved_token = 0;
 extern gui_busy_handle_t gui_busy_show(const char * title, const char * msg);
 extern void gui_busy_hide(gui_busy_handle_t handle);
@@ -447,14 +445,12 @@ void poll_wifi_forget(void) {
 /* ---- Wi-Fi saved-network action popup ------------------------------------
  * Presents options to Connect or Forget for a selected memorized network,
  * matching bt_action_popup's overlay and backdrop pattern. */
-static lv_obj_t * wifi_action_popup;
-static lv_obj_t * wifi_action_popup_backdrop;
+static gui_popup_t wifi_action_popup;
 static lv_obj_t * wifi_action_popup_title;
 static int wifi_action_popup_network_index = -1;
 
 static void hide_wifi_action_popup(void) {
-    lv_obj_add_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(wifi_action_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&wifi_action_popup);
     wifi_action_popup_network_index = -1;
 }
 
@@ -489,20 +485,16 @@ static void wifi_action_forget_cb(lv_event_t * e) {
 }
 
 void build_wifi_action_popup(void) {
-    wifi_action_popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &wifi_action_popup_title, NULL, "Connect",
-                                             accent_lv_color(), wifi_action_connect_cb, NULL, "Forget",
-                                             lv_color_make(255, 120, 120), wifi_action_forget_cb, NULL,
-                                             wifi_action_popup_backdrop_cb, &wifi_action_popup_backdrop);
+    wifi_action_popup.popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &wifi_action_popup_title, NULL, "Connect",
+                                                   accent_lv_color(), wifi_action_connect_cb, NULL, "Forget",
+                                                   lv_color_make(255, 120, 120), wifi_action_forget_cb, NULL,
+                                                   wifi_action_popup_backdrop_cb, &wifi_action_popup.backdrop);
 }
 
 static void show_wifi_action_popup(int index) {
     wifi_action_popup_network_index = index;
     lv_label_set_text(wifi_action_popup_title, wifi_saved_results[index].ssid);
-
-    lv_obj_remove_flag(wifi_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(wifi_action_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(wifi_action_popup_backdrop);
-    lv_obj_move_foreground(wifi_action_popup);
+    gui_popup_show(&wifi_action_popup);
 }
 
 static void wifi_saved_row_click_cb(lv_event_t * e) {
@@ -908,16 +900,14 @@ void poll_bt_forget(void) {
 /* ---- Bluetooth device action popup --------------------------------------
  * Displays an action popup offering Connect or Forget based on the device's
  * current paired/connected state. */
-static lv_obj_t * bt_action_popup;
-static lv_obj_t * bt_action_popup_backdrop;
+static gui_popup_t bt_action_popup;
 static lv_obj_t * bt_action_popup_title;
 static lv_obj_t * bt_action_connect_row;
 static lv_obj_t * bt_action_forget_row;
 static int bt_action_popup_device_index = -1;
 
 static void hide_bt_action_popup(void) {
-    lv_obj_add_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(bt_action_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&bt_action_popup);
     bt_action_popup_device_index = -1;
 }
 
@@ -951,10 +941,10 @@ static void bt_action_forget_cb(lv_event_t * e) {
 }
 
 void build_bt_action_popup(void) {
-    bt_action_popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &bt_action_popup_title, NULL, "Connect",
-                                           accent_lv_color(), bt_action_connect_cb, &bt_action_connect_row, "Forget",
-                                           lv_color_make(255, 120, 120), bt_action_forget_cb, &bt_action_forget_row,
-                                           bt_action_popup_backdrop_cb, &bt_action_popup_backdrop);
+    bt_action_popup.popup = build_confirm_popup("", LV_LABEL_LONG_DOT, &bt_action_popup_title, NULL, "Connect",
+                                                 accent_lv_color(), bt_action_connect_cb, &bt_action_connect_row, "Forget",
+                                                 lv_color_make(255, 120, 120), bt_action_forget_cb, &bt_action_forget_row,
+                                                 bt_action_popup_backdrop_cb, &bt_action_popup.backdrop);
 }
 
 static void show_bt_action_popup(int index) {
@@ -977,10 +967,7 @@ static void show_bt_action_popup(int index) {
     if (show_forget) lv_obj_remove_flag(bt_action_forget_row, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(bt_action_forget_row, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_remove_flag(bt_action_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(bt_action_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(bt_action_popup_backdrop);
-    lv_obj_move_foreground(bt_action_popup);
+    gui_popup_show(&bt_action_popup);
 }
 
 static void bt_row_click_cb(lv_event_t * e) {
@@ -1243,12 +1230,10 @@ void bt_dac_settings_row_cb(lv_event_t * e) {
  * USB DAC mode's own (build_usb_dac_overlay_screen()/
  * build_usb_dac_leave_popup()): full-screen takeover, no swipe-to-back, the
  * only way out is the back button which asks for confirmation first. ---- */
-static lv_obj_t * bt_dac_leave_popup;
-static lv_obj_t * bt_dac_leave_popup_backdrop;
+static gui_popup_t bt_dac_leave_popup;
 
 static void hide_bt_dac_leave_popup(void) {
-    lv_obj_add_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(bt_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&bt_dac_leave_popup);
 }
 
 static void bt_dac_leave_popup_backdrop_cb(lv_event_t * e) {
@@ -1273,17 +1258,14 @@ static void bt_dac_leave_confirm_cb(lv_event_t * e) {
 
 static void bt_dac_overlay_back_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    lv_obj_remove_flag(bt_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(bt_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(bt_dac_leave_popup_backdrop);
-    lv_obj_move_foreground(bt_dac_leave_popup);
+    gui_popup_show(&bt_dac_leave_popup);
 }
 
 void build_bt_dac_leave_popup(void) {
-    bt_dac_leave_popup = build_confirm_popup("Leave Bluetooth DAC mode?", LV_LABEL_LONG_WRAP, NULL, NULL, "Leave",
-                                              lv_color_make(255, 120, 120), bt_dac_leave_confirm_cb, NULL, "Cancel",
-                                              accent_lv_color(), bt_dac_leave_cancel_cb, NULL,
-                                              bt_dac_leave_popup_backdrop_cb, &bt_dac_leave_popup_backdrop);
+    bt_dac_leave_popup.popup = build_confirm_popup("Leave Bluetooth DAC mode?", LV_LABEL_LONG_WRAP, NULL, NULL, "Leave",
+                                                    lv_color_make(255, 120, 120), bt_dac_leave_confirm_cb, NULL, "Cancel",
+                                                    accent_lv_color(), bt_dac_leave_cancel_cb, NULL,
+                                                    bt_dac_leave_popup_backdrop_cb, &bt_dac_leave_popup.backdrop);
 }
 
 static lv_obj_t * build_bt_dac_overlay_screen(void) {
@@ -1354,11 +1336,8 @@ static void populate_bt_codec_screen(void) {
     lv_obj_clean(bt_codec_list);
     for (size_t i = 0; i < BT_CODEC_OPTION_COUNT; i++) {
         bool selected = strcmp(current_settings.bt_codec, bt_codec_options[i].value) == 0;
-        lv_obj_t * row = add_pill_row_base(bt_codec_list, bt_codec_options[i].label);
-        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
-        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, bt_codec_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        add_pill_option_row(bt_codec_list, bt_codec_options[i].label,
+                            selected, bt_codec_option_row_cb, (void *) (intptr_t) i);
     }
 }
 
@@ -1410,11 +1389,8 @@ static void populate_resume_mode_screen(void) {
     lv_obj_clean(resume_mode_list);
     for (size_t i = 0; i < RESUME_MODE_OPTION_COUNT; i++) {
         bool selected = current_settings.resume_mode == resume_mode_options[i].mode;
-        lv_obj_t * row = add_pill_row_base(resume_mode_list, resume_mode_options[i].label);
-        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
-        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, resume_mode_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        add_pill_option_row(resume_mode_list, resume_mode_options[i].label,
+                            selected, resume_mode_option_row_cb, (void *) (intptr_t) i);
     }
 }
 
@@ -1470,11 +1446,8 @@ static void populate_play_pause_button_mode_screen(void) {
     lv_obj_clean(play_pause_button_mode_list);
     for (size_t i = 0; i < PLAY_PAUSE_BUTTON_MODE_OPTION_COUNT; i++) {
         bool selected = current_settings.play_pause_button_mode == play_pause_button_mode_options[i].mode;
-        lv_obj_t * row = add_pill_row_base(play_pause_button_mode_list, play_pause_button_mode_options[i].label);
-        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
-        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, play_pause_button_mode_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        add_pill_option_row(play_pause_button_mode_list, play_pause_button_mode_options[i].label,
+                            selected, play_pause_button_mode_option_row_cb, (void *) (intptr_t) i);
     }
 }
 
@@ -1524,11 +1497,8 @@ static void populate_font_size_screen(void) {
     lv_obj_clean(font_size_list);
     for (size_t i = 0; i < FONT_SIZE_OPTION_COUNT; i++) {
         bool selected = current_settings.font_size_tier == font_size_options[i].tier;
-        lv_obj_t * row = add_pill_row_base(font_size_list, font_size_options[i].label);
-        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
-        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, font_size_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        add_pill_option_row(font_size_list, font_size_options[i].label,
+                            selected, font_size_option_row_cb, (void *) (intptr_t) i);
     }
 }
 
@@ -1621,21 +1591,6 @@ void font_size_settings_row_cb(lv_event_t * e) {
     open_font_size_screen();
 }
 
-/* ---- Lyrics Text Size (Settings -> Display) ------------------------------
- * Dedicated font size selector for fullscreen lyrics view, separate from
- * main app font size. ---- */
-
-typedef struct {
-    int tier; /* matches player_settings_t.lyrics_font_size_tier -- 1 or 2 only */
-    const char * label;
-} lyrics_font_size_option_t;
-
-
-
-
-
-
-
 
 
 /* ---- ReplayGain mode (Settings -> Playback) -- 3-way option (Off, Per Track,
@@ -1660,11 +1615,8 @@ static void populate_replaygain_mode_screen(void) {
     lv_obj_clean(replaygain_mode_list);
     for (size_t i = 0; i < REPLAYGAIN_MODE_OPTION_COUNT; i++) {
         bool selected = current_settings.replaygain_mode == replaygain_mode_options[i].mode;
-        lv_obj_t * row = add_pill_row_base(replaygain_mode_list, replaygain_mode_options[i].label);
-        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
-        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, replaygain_mode_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        add_pill_option_row(replaygain_mode_list, replaygain_mode_options[i].label,
+                            selected, replaygain_mode_option_row_cb, (void *) (intptr_t) i);
     }
 }
 
@@ -1746,19 +1698,16 @@ static void populate_usb_mode_screen(void) {
         if (usb_mode_options[i].mode == USB_MODE_ADB) continue; /* handled by the toggle above */
 
         bool selected = !adb_active && current_settings.usb_mode == (int) usb_mode_options[i].mode;
-        lv_obj_t * row = add_pill_row_base(usb_mode_list, usb_mode_options[i].label);
-        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
-        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
+        lv_obj_t * row = add_pill_option_row(usb_mode_list, usb_mode_options[i].label,
+                                            selected, usb_mode_option_row_cb, (void *) (intptr_t) i);
 
         if (adb_active) {
             /* Storage/DAC aren't meaningful choices while ADB owns the USB
              * port -- dimmed and inert rather than removed, so the row
              * stays put (no layout jump) and it's visually clear these
              * exist but aren't the current mode. */
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_set_style_opa(row, LV_OPA_50, 0);
-        } else {
-            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(row, usb_mode_option_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
         }
     }
 }
@@ -1985,12 +1934,10 @@ void usb_mode_settings_row_cb(lv_event_t * e) {
  * the point. The confirmation popup itself reuses bt_action_popup's own
  * hand-built top-layer overlay shape (this codebase doesn't use LVGL's
  * lv_msgbox anywhere). ---- */
-static lv_obj_t * usb_dac_leave_popup;
-static lv_obj_t * usb_dac_leave_popup_backdrop;
+static gui_popup_t usb_dac_leave_popup;
 
 static void hide_usb_dac_leave_popup(void) {
-    lv_obj_add_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(usb_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&usb_dac_leave_popup);
 }
 
 static void usb_dac_leave_popup_backdrop_cb(lv_event_t * e) {
@@ -2012,17 +1959,14 @@ static void usb_dac_leave_confirm_cb(lv_event_t * e) {
 
 static void usb_dac_overlay_back_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    lv_obj_remove_flag(usb_dac_leave_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(usb_dac_leave_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(usb_dac_leave_popup_backdrop);
-    lv_obj_move_foreground(usb_dac_leave_popup);
+    gui_popup_show(&usb_dac_leave_popup);
 }
 
 void build_usb_dac_leave_popup(void) {
-    usb_dac_leave_popup = build_confirm_popup("Leave USB DAC mode?", LV_LABEL_LONG_WRAP, NULL, NULL, "Leave",
-                                               lv_color_make(255, 120, 120), usb_dac_leave_confirm_cb, NULL, "Cancel",
-                                               accent_lv_color(), usb_dac_leave_cancel_cb, NULL,
-                                               usb_dac_leave_popup_backdrop_cb, &usb_dac_leave_popup_backdrop);
+    usb_dac_leave_popup.popup = build_confirm_popup("Leave USB DAC mode?", LV_LABEL_LONG_WRAP, NULL, NULL, "Leave",
+                                                     lv_color_make(255, 120, 120), usb_dac_leave_confirm_cb, NULL, "Cancel",
+                                                     accent_lv_color(), usb_dac_leave_cancel_cb, NULL,
+                                                     usb_dac_leave_popup_backdrop_cb, &usb_dac_leave_popup.backdrop);
 }
 
 static lv_obj_t * build_usb_dac_overlay_screen(void) {
@@ -2258,98 +2202,6 @@ static void populate_import_wifi_screen(void) {
     lv_obj_remove_flag(import_wifi_qrcode, LV_OBJ_FLAG_HIDDEN);
     lv_qrcode_update(import_wifi_qrcode, url, strlen(url));
 #endif
-}
-
-/* Shared 2-button confirmation popup builder (backdrop, card, wrapped title,
- * and confirm/cancel buttons) using LV_SIZE_CONTENT and flex layout to
- * accommodate varying font sizes. */
-lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
-                                       lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
-                                       lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
-                                       const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
-                                       lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop) {
-    lv_obj_t * top = lv_layer_top();
-
-    lv_obj_t * backdrop = lv_obj_create(top);
-    lv_obj_set_size(backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(backdrop, 0, 0);
-    lv_obj_remove_flag(backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(backdrop, backdrop_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t * popup = lv_obj_create(top);
-    lv_obj_set_width(popup, lv_pct(84));
-    lv_obj_set_height(popup, LV_SIZE_CONTENT);
-    lv_obj_align(popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(popup, 16, 0);
-    lv_obj_add_style(popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(popup, 0, 0);
-    lv_obj_set_style_pad_all(popup, BOARD_SCALE_PX(20), 0);
-    lv_obj_set_style_pad_row(popup, BOARD_SCALE_PX(14), 0);
-    lv_obj_remove_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t * title = lv_label_create(popup);
-    lv_label_set_text(title, title_text);
-    lv_obj_set_width(title, lv_pct(100));
-    lv_label_set_long_mode(title, title_long_mode);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
-    if (out_title) *out_title = title;
-
-    if (body_text) {
-        lv_obj_t * body = lv_label_create(popup);
-        lv_label_set_text(body, body_text);
-        lv_obj_set_width(body, lv_pct(100));
-        lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_add_style(body, &style_theme_text_muted, 0);
-        lv_obj_set_style_text_font(body, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
-    }
-
-    lv_obj_t * confirm_row = lv_obj_create(popup);
-    lv_obj_set_width(confirm_row, lv_pct(100));
-    lv_obj_set_height(confirm_row, LV_SIZE_CONTENT);
-    lv_obj_set_style_pad_all(confirm_row, BOARD_SCALE_PX(14), 0);
-    lv_obj_set_style_radius(confirm_row, 12, 0);
-    lv_obj_set_style_bg_opa(confirm_row, 0, 0);
-    lv_obj_set_style_border_width(confirm_row, 0, 0);
-    lv_obj_remove_flag(confirm_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(confirm_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(confirm_row, confirm_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * confirm_label = lv_label_create(confirm_row);
-    lv_label_set_text(confirm_label, confirm_text);
-    lv_obj_set_style_text_color(confirm_label, confirm_color, 0);
-    lv_obj_set_style_text_font(confirm_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_center(confirm_label);
-    if (out_confirm_row) *out_confirm_row = confirm_row;
-
-    lv_obj_t * cancel_row = lv_obj_create(popup);
-    lv_obj_set_width(cancel_row, lv_pct(100));
-    lv_obj_set_height(cancel_row, LV_SIZE_CONTENT);
-    lv_obj_set_style_pad_all(cancel_row, BOARD_SCALE_PX(14), 0);
-    lv_obj_set_style_radius(cancel_row, 12, 0);
-    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
-    lv_obj_set_style_border_width(cancel_row, 0, 0);
-    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(cancel_row, cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * cancel_label = lv_label_create(cancel_row);
-    lv_label_set_text(cancel_label, cancel_text);
-    lv_obj_set_style_text_color(cancel_label, cancel_color, 0);
-    lv_obj_set_style_text_font(cancel_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_center(cancel_label);
-    if (out_cancel_row) *out_cancel_row = cancel_row;
-
-    *out_backdrop = backdrop;
-    return popup;
 }
 
 /* Shared N-row action-menu popup shape is built by build_menu_popup in gui.c. */
@@ -3131,7 +2983,7 @@ void gui_network_refresh_wireless_screen(void) {
     if (!fresh) return;
     wireless_screen = fresh;
     gui_navigation_replace_static_screen(3, old, fresh);
-    if (old) lv_obj_del(old);
+    if (old) lv_obj_delete(old);
 }
 
 void gui_network_init(void) {
@@ -3174,34 +3026,30 @@ void gui_network_init(void) {
  * as children of any of these screens, so each needs its own explicit
  * deletion. */
 void gui_network_teardown(void) {
-    if (bt_action_popup) { lv_obj_del(bt_action_popup); bt_action_popup = NULL; }
-    if (bt_action_popup_backdrop) { lv_obj_del(bt_action_popup_backdrop); bt_action_popup_backdrop = NULL; }
-    if (wifi_action_popup) { lv_obj_del(wifi_action_popup); wifi_action_popup = NULL; }
-    if (wifi_action_popup_backdrop) { lv_obj_del(wifi_action_popup_backdrop); wifi_action_popup_backdrop = NULL; }
-    if (usb_dac_leave_popup) { lv_obj_del(usb_dac_leave_popup); usb_dac_leave_popup = NULL; }
-    if (usb_dac_leave_popup_backdrop) { lv_obj_del(usb_dac_leave_popup_backdrop); usb_dac_leave_popup_backdrop = NULL; }
-    if (bt_dac_leave_popup) { lv_obj_del(bt_dac_leave_popup); bt_dac_leave_popup = NULL; }
-    if (bt_dac_leave_popup_backdrop) { lv_obj_del(bt_dac_leave_popup_backdrop); bt_dac_leave_popup_backdrop = NULL; }
+    gui_popup_teardown(&bt_action_popup);
+    gui_popup_teardown(&wifi_action_popup);
+    gui_popup_teardown(&usb_dac_leave_popup);
+    gui_popup_teardown(&bt_dac_leave_popup);
 
-    if (wifi_screen) { lv_obj_del(wifi_screen); wifi_screen = NULL; }
-    if (wifi_info_screen) { lv_obj_del(wifi_info_screen); wifi_info_screen = NULL; }
-    if (wifi_dns_screen) { lv_obj_del(wifi_dns_screen); wifi_dns_screen = NULL; }
-    if (bt_screen) { lv_obj_del(bt_screen); bt_screen = NULL; }
-    if (bt_dac_screen) { lv_obj_del(bt_dac_screen); bt_dac_screen = NULL; }
-    if (bt_dac_overlay_screen) { lv_obj_del(bt_dac_overlay_screen); bt_dac_overlay_screen = NULL; }
-    if (bt_codec_screen) { lv_obj_del(bt_codec_screen); bt_codec_screen = NULL; }
-    if (font_size_screen) { lv_obj_del(font_size_screen); font_size_screen = NULL; }
-    if (replaygain_mode_screen) { lv_obj_del(replaygain_mode_screen); replaygain_mode_screen = NULL; }
-    if (resume_mode_screen) { lv_obj_del(resume_mode_screen); resume_mode_screen = NULL; }
-    if (play_pause_button_mode_screen) { lv_obj_del(play_pause_button_mode_screen); play_pause_button_mode_screen = NULL; }
-    if (usb_mode_screen) { lv_obj_del(usb_mode_screen); usb_mode_screen = NULL; }
-    if (usb_dac_overlay_screen) { lv_obj_del(usb_dac_overlay_screen); usb_dac_overlay_screen = NULL; }
-    if (import_wifi_screen) { lv_obj_del(import_wifi_screen); import_wifi_screen = NULL; }
-    if (airplay_screen) { lv_obj_del(airplay_screen); airplay_screen = NULL; }
-    if (airplay_overlay_screen) { lv_obj_del(airplay_overlay_screen); airplay_overlay_screen = NULL; }
-    if (dlna_screen) { lv_obj_del(dlna_screen); dlna_screen = NULL; }
-    if (remote_control_screen) { lv_obj_del(remote_control_screen); remote_control_screen = NULL; }
-    if (wireless_screen) { lv_obj_del(wireless_screen); wireless_screen = NULL; }
+    if (wifi_screen) { lv_obj_delete(wifi_screen); wifi_screen = NULL; }
+    if (wifi_info_screen) { lv_obj_delete(wifi_info_screen); wifi_info_screen = NULL; }
+    if (wifi_dns_screen) { lv_obj_delete(wifi_dns_screen); wifi_dns_screen = NULL; }
+    if (bt_screen) { lv_obj_delete(bt_screen); bt_screen = NULL; }
+    if (bt_dac_screen) { lv_obj_delete(bt_dac_screen); bt_dac_screen = NULL; }
+    if (bt_dac_overlay_screen) { lv_obj_delete(bt_dac_overlay_screen); bt_dac_overlay_screen = NULL; }
+    if (bt_codec_screen) { lv_obj_delete(bt_codec_screen); bt_codec_screen = NULL; }
+    if (font_size_screen) { lv_obj_delete(font_size_screen); font_size_screen = NULL; }
+    if (replaygain_mode_screen) { lv_obj_delete(replaygain_mode_screen); replaygain_mode_screen = NULL; }
+    if (resume_mode_screen) { lv_obj_delete(resume_mode_screen); resume_mode_screen = NULL; }
+    if (play_pause_button_mode_screen) { lv_obj_delete(play_pause_button_mode_screen); play_pause_button_mode_screen = NULL; }
+    if (usb_mode_screen) { lv_obj_delete(usb_mode_screen); usb_mode_screen = NULL; }
+    if (usb_dac_overlay_screen) { lv_obj_delete(usb_dac_overlay_screen); usb_dac_overlay_screen = NULL; }
+    if (import_wifi_screen) { lv_obj_delete(import_wifi_screen); import_wifi_screen = NULL; }
+    if (airplay_screen) { lv_obj_delete(airplay_screen); airplay_screen = NULL; }
+    if (airplay_overlay_screen) { lv_obj_delete(airplay_overlay_screen); airplay_overlay_screen = NULL; }
+    if (dlna_screen) { lv_obj_delete(dlna_screen); dlna_screen = NULL; }
+    if (remote_control_screen) { lv_obj_delete(remote_control_screen); remote_control_screen = NULL; }
+    if (wireless_screen) { lv_obj_delete(wireless_screen); wireless_screen = NULL; }
 }
 
 bool gui_network_has_background_work(void) {

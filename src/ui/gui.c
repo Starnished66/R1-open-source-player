@@ -1078,7 +1078,6 @@ void gui_show_boot_splash(void) {
 }
 
 
-/* build_files_screen moved to gui_library.c */
 
 
 
@@ -1086,7 +1085,6 @@ const char * basename_of(const char * path) {
     const char * slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
 }
-/* group_song_entries moved to gui_library.c */
 
 
 const char * gui_plugin_get_play_mode(void) {
@@ -1127,20 +1125,27 @@ char ** gui_plugin_get_artist_albums(const char * artist, int * out_count) {
     return names;
 }
 
-static char ** load_plugin_album_paths(const char * artist, const char * album, int * out_count) {
+static char ** load_plugin_album_group_paths(const char * album, const char * album_artist, int * out_count) {
     *out_count = 0;
-    int64_t count64 = metadata_db_count_songs_filtered(NULL, artist, NULL, album);
-    if (count64 <= 0 || count64 > INT_MAX) return NULL;
-    int count = (int) count64;
-    char ** paths = calloc((size_t) count, sizeof(*paths));
-    if (!paths) return NULL;
-    song_row_t rows[64];
+    char ** paths = NULL;
+    size_t capacity = 0;
     int loaded = 0;
-    while (loaded < count) {
-        int want = count - loaded;
-        if (want > 64) want = 64;
-        int got = metadata_db_get_songs_filtered_page(NULL, artist, NULL, album, loaded, want, rows);
+    song_row_t rows[64];
+    for (;;) {
+        int got = metadata_db_get_album_songs(album, album_artist, loaded, rows, 64);
         if (got <= 0) break;
+        if ((size_t) (loaded + got) > capacity) {
+            size_t new_capacity = capacity == 0 ? 64 : capacity * 2;
+            while (new_capacity < (size_t) (loaded + got)) new_capacity *= 2;
+            char ** grown = realloc(paths, new_capacity * sizeof(*paths));
+            if (!grown) {
+                for (int j = 0; j < loaded; j++) free(paths[j]);
+                free(paths);
+                return NULL;
+            }
+            paths = grown;
+            capacity = new_capacity;
+        }
         for (int i = 0; i < got; i++) {
             paths[loaded + i] = strdup(rows[i].path);
             if (!paths[loaded + i]) {
@@ -1150,7 +1155,11 @@ static char ** load_plugin_album_paths(const char * artist, const char * album, 
             }
         }
         loaded += got;
-        if (got < want) break;
+        if (got < 64) break;
+    }
+    if (loaded == 0) {
+        free(paths);
+        return NULL;
     }
     *out_count = loaded;
     return paths;
@@ -1158,7 +1167,32 @@ static char ** load_plugin_album_paths(const char * artist, const char * album, 
 
 char ** gui_plugin_get_album_tracks(const char * artist, const char * album, int * out_count) {
     *out_count = 0;
-    return load_plugin_album_paths(artist, album, out_count);
+    if (!artist || !artist[0] || !album || !album[0]) return NULL;
+
+    int64_t count64 = metadata_db_count_albums_for_group(METADATA_DB_GROUP_ARTIST, artist);
+    if (count64 <= 0 || count64 > INT_MAX) return NULL;
+    int total = (int) count64;
+
+    char matched_album_artist[128] = "";
+    int match_count = 0;
+    group_row_t rows[32];
+    int offset = 0;
+    while (offset < total) {
+        int want = total - offset;
+        if (want > 32) want = 32;
+        int got = metadata_db_get_albums_for_group(METADATA_DB_GROUP_ARTIST, artist, offset, want, rows);
+        if (got <= 0) break;
+        for (int i = 0; i < got; i++) {
+            if (strcasecmp(rows[i].name, album) != 0) continue;
+            match_count++;
+            snprintf(matched_album_artist, sizeof(matched_album_artist), "%s", rows[i].album_artist);
+        }
+        offset += got;
+        if (got < want) break;
+    }
+    if (match_count != 1) return NULL;
+
+    return load_plugin_album_group_paths(album, matched_album_artist, out_count);
 }
 
 char ** gui_plugin_get_next_album_tracks(const char * artist, const char * current_album, int * out_count) {
@@ -1174,10 +1208,10 @@ char ** gui_plugin_get_next_album_tracks(const char * artist, const char * curre
         if (got <= 0) break;
         for (int i = 0; i < got; i++) {
             if (strcasecmp(rows[i].name, current_album) != 0) continue;
-            if (i + 1 < got) return load_plugin_album_paths(artist, rows[i + 1].name, out_count);
+            if (i + 1 < got) return load_plugin_album_group_paths(rows[i + 1].name, rows[i + 1].album_artist, out_count);
             group_row_t next;
             if (metadata_db_get_albums_for_group(METADATA_DB_GROUP_ARTIST, artist, offset + got, 1, &next) == 1)
-                return load_plugin_album_paths(artist, next.name, out_count);
+                return load_plugin_album_group_paths(next.name, next.album_artist, out_count);
             return NULL;
         }
         offset += got;
@@ -1287,7 +1321,7 @@ static lv_obj_t * build_stream_media_screen(void) {
  * wrappers instead of calling it directly. */
 void gui_stream_media_teardown(void) {
     if (stream_media_screen) {
-        lv_obj_del(stream_media_screen);
+        lv_obj_delete(stream_media_screen);
         stream_media_screen = NULL;
     }
 }
@@ -1302,7 +1336,7 @@ void gui_stream_media_refresh(void) {
     if (!fresh) return;
     stream_media_screen = fresh;
     gui_navigation_replace_static_screen(2, old, fresh);
-    if (old) lv_obj_del(old);
+    if (old) lv_obj_delete(old);
 }
 
 /* One-shot deferred trigger for a fresh-SD-card/first-run auto rescan --

@@ -10,6 +10,19 @@
 #define MAX_PLAYER_COVER_SIDE  MAX_DECODED_COVER_SIDE
 #define MAX_THUMBNAIL_COVER_SIDE MAX_DECODED_COVER_SIDE
 
+/* Hard sanity ceiling on native PNG dimensions eligible for the streaming
+ * decoder (cover_decode.c's decode_png_streaming()) -- a security/sanity
+ * bound against a pathological/malicious dimension claim, not a
+ * memory-workaround bound (the streaming decoder's own peak RAM is bounded
+ * by the post-scale output size regardless of native size, so this can be
+ * generous). Twice MAX_JPEG_NATIVE_SIDE, matching that same convention.
+ * Shared with artwork_coordinator.c's admission estimate so the two can
+ * never independently drift out of sync on what this decoder is allowed to
+ * attempt (a prior mismatch -- estimator capped at 4096, decoder at 8192 --
+ * silently made every 4097-8192px streaming-eligible PNG a permanent
+ * LOW_MEMORY reject instead of ever reaching the decoder). */
+#define MAX_PNG_STREAMING_NATIVE_SIDE 8192
+
 typedef enum {
     COVER_DECODE_OK = 0,
     COVER_DECODE_FAIL_UNSUPPORTED,  /* Corrupt header or unsupported format */
@@ -83,15 +96,23 @@ typedef struct {
     bool tjpgd_incompatible;
     int native_w;
     int native_h;
-    /* Real coefficient-buffer size estimate for progressive JPEG admission
-     * control -- 0 if !is_progressive or !supported. Computed from the SOF
-     * marker's own component sampling factors (never assumed/guessed):
-     * MCU-round each component's block dimensions against the frame's own
-     * max sampling factors, 128 bytes (64 coefficients * sizeof(int16_t))
-     * per 8x8 block, summed across all components. This is the dominant,
-     * unavoidable memory cost of progressive JPEG -- it scales with native
-     * (SOF) dimensions, not the caller's requested output size, and no
-     * decoder (this one included) can avoid materializing it. */
+    /* Real coefficient-buffer size estimate for JPEG admission control -- 0
+     * only if !supported. Computed unconditionally for every supported
+     * SOF0/SOF2 (not just progressive) from the SOF marker's own component
+     * sampling factors (never assumed/guessed): MCU-round each component's
+     * block dimensions against the frame's own max sampling factors, 128
+     * bytes (64 coefficients * sizeof(int16_t)) per 8x8 block, summed across
+     * all components. This is the dominant, unavoidable memory cost of
+     * progressive JPEG -- it scales with native (SOF) dimensions, not the
+     * caller's requested output size, and no decoder (this one included)
+     * can avoid materializing it. A baseline (SOF0) file gets this same
+     * conservative worst-case estimate too, because a cheap header-only
+     * probe can't tell single-scan and sequential-multiscan apart (that's a
+     * property of the entropy-coded scan structure, not the frame header),
+     * and multiscan needs the identical full-native coefficient buffer --
+     * billing every baseline as if it might be multiscan is deliberately
+     * conservative, not a bug (see decode_jpeg_libjpeg_rgb888()'s own
+     * comment in cover_decode.c). */
     uint64_t coeff_bytes;
 } jpeg_probe_t;
 
@@ -108,13 +129,21 @@ bool jpeg_probe(const uint8_t * data, uint32_t size, jpeg_probe_t * result);
  * cropping whichever dimension overflows -- same as a photo app's cover/
  * thumbnail mode) into a newly malloc()'d RGB565 buffer the caller owns and
  * must free(). JPEGs are decompressed at the largest 1/2^n that still covers
- * the target (tjpgd for ordinary baseline, or a vendored libjpeg fallback
- * for progressive/SOF2 and for baseline with a chroma sampling factor
- * tjpgd's own whitelist rejects -- see jpeg_probe_t), then cover-fitted;
- * PNG/BMP decode at native size first. JPEG native may be up to 4096px if
- * scaled RGB888 <= 1200px (progressive JPEG is the one exception: its
- * native-scaling coefficient-buffer cost caps it at 1200px native); PNG/BMP
- * still reject native dimensions exceeding 1200px.
+ * the target (tjpgd first for ordinary baseline, falling through to a
+ * vendored libjpeg decoder if tjpgd itself fails on it; libjpeg is also
+ * used directly, with no tjpgd attempt at all, for progressive/SOF2 and for
+ * baseline with a chroma sampling factor tjpgd's own whitelist rejects --
+ * see jpeg_probe_t), then cover-fitted; PNG/BMP decode at native size
+ * first. JPEG native (baseline and
+ * progressive alike) may be up to 4096px as long as scaled RGB888 <= 1200px
+ * -- progressive's real, dimension-dependent coefficient-buffer cost is
+ * billed separately through memory admission (coeff_bytes), not capped by
+ * dimension alone; BMP still rejects native dimensions exceeding 1200px, and
+ * so does PNG UNLESS it's non-interlaced, 8- or 16-bit, RGB/RGBA (color
+ * type 2/6) -- that case instead streams (decode_png_streaming()) up to
+ * MAX_PNG_STREAMING_NATIVE_SIDE (8192px) at bounded memory, since it can
+ * downscale during decode the way JPEG already does; everything else
+ * (interlaced, palette, grayscale, other bit depths) keeps the 1200px cap.
  * Serialized through the process-wide artwork decode coordinator with memory admission. */
 bool cover_decode_to_rgb565(const uint8_t * data, uint32_t size, int target_w, int target_h,
                             uint16_t ** out_pixels);

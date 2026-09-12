@@ -379,6 +379,23 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    lv_style_t * toggle_accent_style, int32_t row_gap,
                                    int32_t icon_scale_pct);
 
+/* Function pointer signatures matching plugin_manager_get_<target>_list_item_* accessors. */
+typedef int (*plugin_list_item_count_cb_t)(void);
+typedef const char * (*plugin_list_item_label_cb_t)(int index);
+typedef void (*plugin_list_item_options_cb_t)(int index, const char ** out_icon, int32_t * out_height,
+                                              int32_t * out_width, const char ** out_text_size);
+
+/* Appends up to max_items plugin-provided rows to items[] starting at index count,
+ * querying row metadata via the given get_count/get_label/get_options accessors and
+ * routing row clicks to click_cb with (void *)(intptr_t)index as user_data.
+ * Preserves the standard "medium" text_size fallback and chevron accessory styling.
+ * Returns the updated item count (count + rows appended). */
+int append_plugin_list_rows(pill_list_item_t * items, int count, int max_items,
+                            plugin_list_item_count_cb_t get_count_fn,
+                            plugin_list_item_label_cb_t get_label_fn,
+                            plugin_list_item_options_cb_t get_options_fn,
+                            lv_event_cb_t click_cb);
+
 lv_obj_t * build_launcher_menu_screen(const char * title, lv_event_cb_t back_btn_cb,
                                       const icon_grid_item_t * items, int item_count,
                                       int icon_scale_pct, bool label_inside_icon,
@@ -549,9 +566,43 @@ void compact_list_set_row_height(lv_obj_t * list, int32_t row_height);
 void compact_list_set_paged_provider(lv_obj_t * list, compact_list_fetch_page_cb_t fetch_page, void * ctx,
                                       int total_count);
 
-#endif /* SCREEN_BUILDERS_H */
+lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
+lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
+                               lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
+                               lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
+                               const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
+                               lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
+
+typedef struct {
+    lv_obj_t * popup;
+    lv_obj_t * backdrop;
+} gui_popup_t;
+
+void gui_popup_show(gui_popup_t * p);
+void gui_popup_hide(gui_popup_t * p);
+void gui_popup_teardown(gui_popup_t * p);
 
 lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text);
 lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);
 lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_text, lv_event_cb_t on_click);
+lv_obj_t * add_pill_option_row(lv_obj_t * parent, const char * label_text, bool selected,
+                              lv_event_cb_t on_click, void * user_data);
 lv_obj_t * add_section_header(lv_obj_t * parent, const char * text);
+
+int find_nearest_step_index(const int * steps, int count, int value);
+
+/* Builds the shared "rounded card + slider + centered value label" widget
+ * tree used by several settings screens (screen timeout, screen dimming,
+ * startup volume, sleep timer, idle shutdown), including the gesture-bubble
+ * removal and swipe dead zone registration every one of them repeats.
+ * track_top_offset lets a caller that adds its own caption label above the
+ * slider (idle shutdown) push the slider down within the card. Does NOT set
+ * the value label's initial text (callers use different formats) or the
+ * card's hidden flag (callers use different enabled conditions) -- set both
+ * via the returned card / *out_value_label after the call. */
+lv_obj_t * build_setting_slider_card(lv_obj_t * parent, lv_obj_t * align_target, int32_t card_height,
+                                      int32_t track_top_offset, int32_t min_range, int32_t max_range,
+                                      int32_t initial_val, lv_event_cb_t slider_cb,
+                                      lv_obj_t ** out_slider, lv_obj_t ** out_value_label);
+
+#endif /* SCREEN_BUILDERS_H */

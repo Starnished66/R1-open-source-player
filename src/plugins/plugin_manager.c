@@ -1893,6 +1893,60 @@ static int l_plugin_set_launcher_layout(lua_State * L) {
     return 0;
 }
 
+static int l_plugin_set_player_layout(lua_State * L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+
+    player_layout_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.configured = true;
+
+    lua_getfield(L, 1, "flat");
+    if (!lua_isnil(L, -1)) {
+        config.flat = lua_toboolean(L, -1);
+    }
+    lua_pop(L, 1);
+
+    get_opt_color_field(L, 1, "bg_color", &config.has_bg_color, &config.bg_color);
+
+    lua_getfield(L, 1, "blur_radius");
+    if (!lua_isnil(L, -1)) {
+        lua_Integer val = luaL_checkinteger(L, -1);
+        config.has_blur_radius = true;
+        config.blur_radius = check_int32_field(L, val, "plugin.set_player_layout", "blur_radius");
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "blur_passes");
+    if (!lua_isnil(L, -1)) {
+        lua_Integer val = luaL_checkinteger(L, -1);
+        config.has_blur_passes = true;
+        config.blur_passes = check_int32_field(L, val, "plugin.set_player_layout", "blur_passes");
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "darken_num");
+    bool has_num = !lua_isnil(L, -1);
+    lua_getfield(L, 1, "darken_den");
+    bool has_den = !lua_isnil(L, -1);
+
+    if (has_num != has_den) {
+        lua_pop(L, 2);
+        return luaL_error(L, "plugin.set_player_layout: darken_num and darken_den must both be set together");
+    }
+    if (has_num && has_den) {
+        lua_Integer num = luaL_checkinteger(L, -2);
+        lua_Integer den = luaL_checkinteger(L, -1);
+        config.has_darken = true;
+        config.darken_num = check_int32_field(L, num, "plugin.set_player_layout", "darken_num");
+        config.darken_den = check_int32_field(L, den, "plugin.set_player_layout", "darken_den");
+    }
+    lua_pop(L, 2);
+
+    gui_plugin_set_player_layout(&config);
+    gui_player_refresh_frosted_background();
+    return 0;
+}
+
 /* plugin.reload_ui() -- rebuilds every screen/style in the same process
  * (see gui_reload.h/.c) so a plugin.set_icon()/set_background_color()/
  * set_text_color()/set_home_layout() call takes full effect without
@@ -3552,6 +3606,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "set_text_color",            l_plugin_set_text_color },
     { "set_home_layout",           l_plugin_set_home_layout },
     { "set_launcher_layout",       l_plugin_set_launcher_layout },
+    { "set_player_layout",         l_plugin_set_player_layout },
     { "refresh_theme",             l_plugin_refresh_theme },
     { "reload_ui",                 l_plugin_reload_ui },
     { "eq_load_profile",           l_plugin_eq_load_profile },
@@ -4150,6 +4205,7 @@ void plugin_manager_deinit(void) {
     deinit_diag("plugin_manager_deinit: reset_home_layout before");
     gui_plugin_reset_home_layout();
     gui_plugin_reset_launcher_layout();
+    gui_plugin_reset_player_layout();
     /* Same "in-process plugin config must not outlive the plugin" category
      * as the two resets above -- without this, disabling/removing a Gain
      * Mode-style plugin followed by a UI reload left its hardware volume

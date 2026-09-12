@@ -54,7 +54,6 @@ lv_style_t * gui_theme_accent_knob_style(void);
 lv_style_t * gui_theme_muted_text_style(void);
 const lv_font_t * gui_theme_font(gui_font_role_t role);
 lv_color_t accent_lv_color(void);
-void apply_accent_color(uint32_t rgb);
 void gui_theme_apply_accent(uint32_t rgb);
 void gui_theme_update_surface_contrast(void);
 void accent_swatch_event_cb(lv_event_t * e);

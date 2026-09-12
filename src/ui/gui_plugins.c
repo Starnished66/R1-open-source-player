@@ -25,7 +25,6 @@ extern player_settings_t current_settings;
 
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
-extern lv_obj_t * build_subsonic_list_screen(const char * title_text, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
 extern void row_label_enable_marquee(lv_obj_t * label);
 extern void register_swipe_dead_zone(lv_obj_t * obj);
 extern void unregister_swipe_dead_zone(lv_obj_t * obj);
@@ -325,6 +324,7 @@ void gui_plugin_set_text_color(const char * slot, uint32_t rgb) {
  * separately rebuilds Home after the calling Lua callback returns. */
 home_layout_config_t home_layout_config = { 0 };
 launcher_layout_config_t launcher_layout_config = { 0 };
+player_layout_config_t player_layout_config = { 0 };
 
 /* plugin_manager.c's l_plugin_set_home_layout() has already validated every
  * enum-like field (key -> array index, mode, align, text_size) before
@@ -345,6 +345,14 @@ void gui_plugin_set_launcher_layout(const launcher_layout_config_t * config) {
 
 void gui_plugin_reset_launcher_layout(void) {
     launcher_layout_config = (launcher_layout_config_t) { 0 };
+}
+
+void gui_plugin_set_player_layout(const player_layout_config_t * config) {
+    player_layout_config = *config;
+}
+
+void gui_plugin_reset_player_layout(void) {
+    player_layout_config = (player_layout_config_t) { 0 };
 }
 
 /* ---- Playback control bridges -- see gui.h's own comment on why these
@@ -783,10 +791,10 @@ void gui_plugins_init(void) {
  * already-freed pointers. */
 void gui_plugins_teardown(void) {
     for (int i = 0; i < PLUGIN_LIST_SCREEN_POOL_SIZE; i++) {
-        if (plugin_list_screens[i]) { lv_obj_del(plugin_list_screens[i]); plugin_list_screens[i] = NULL; }
+        if (plugin_list_screens[i]) { lv_obj_delete(plugin_list_screens[i]); plugin_list_screens[i] = NULL; }
     }
     for (int i = 0; i < PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE; i++) {
-        if (plugin_settings_list_screens[i]) { lv_obj_del(plugin_settings_list_screens[i]); plugin_settings_list_screens[i] = NULL; }
+        if (plugin_settings_list_screens[i]) { lv_obj_delete(plugin_settings_list_screens[i]); plugin_settings_list_screens[i] = NULL; }
         plugin_settings_list_slider_card_count[i] = 0;
     }
 }

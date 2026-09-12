@@ -118,13 +118,22 @@ index 22dfd56..5e910ca 100644
      mx >>= jd->scale;
      if(rx < mx) {   /* Is the MCU spans rigit edge? */
 diff --git a/src/libs/tjpgd/tjpgdcnf.h b/src/libs/tjpgd/tjpgdcnf.h
-index dc27d6a..514b63d 100644
+index dc27d6a..1b543b0 100644
 --- a/src/libs/tjpgd/tjpgdcnf.h
 +++ b/src/libs/tjpgd/tjpgdcnf.h
+@@ -2,7 +2,7 @@
+ /* TJpgDec System Configurations R0.03          */
+ /*----------------------------------------------*/
+
+-#define JD_SZBUF        512
++#define JD_SZBUF        1024
+ /* Specifies size of stream input buffer */
+
+ #define JD_FORMAT       0
 @@ -12,7 +12,7 @@
  /  2: Grayscale (8-bit/pix)
  */
- 
+
 -#define JD_USE_SCALE    0
 +#define JD_USE_SCALE    1
  /* Switches output descaling feature.

@@ -1121,7 +1121,7 @@ void gui_navigation_init(void) {
  * its own screens, so nothing here is left pointing at an object that's
  * about to be freed. Only resets gui_navigation.c's own state (the nav
  * stack and its snapshot/transition-cache buffers); it does not, and must
- * not, lv_obj_del() the screens themselves -- each screen is owned and
+ * not, lv_obj_delete() the screens themselves -- each screen is owned and
  * freed by its own module's teardown function (gui_shell_teardown(),
  * gui_network_teardown(), etc.), called separately by the reload
  * orchestrator. gui_navigation_init() (called again after every screen is
@@ -1162,10 +1162,6 @@ int gui_navigation_get_depth(void) {
     return nav_depth;
 }
 
-lv_obj_t * gui_navigation_get_top_screen(void) {
-    return (nav_depth > 0) ? nav_stack[nav_depth - 1] : NULL;
-}
-
 lv_obj_t * gui_navigation_get_screen_at(int index) {
     if (index < 0 || index >= nav_depth) return NULL;
     return nav_stack[index];
@@ -1192,12 +1188,6 @@ void gui_navigation_remove_screen_instances(lv_obj_t ** screens, int count) {
     }
 }
 
-void gui_navigation_replace_top(lv_obj_t * new_screen) {
-    if (nav_depth > 0) {
-        nav_stack[nav_depth - 1] = new_screen;
-    }
-}
-
 void gui_navigation_replace_home(lv_obj_t * old_screen, lv_obj_t * new_screen) {
     for (int i = 0; i < nav_depth; i++) {
         if (nav_stack[i] == old_screen) nav_stack[i] = new_screen;
@@ -1216,8 +1206,3 @@ void gui_navigation_replace_static_screen(int snapshot_index, lv_obj_t * old_scr
     if (lv_screen_active() == old_screen) lv_screen_load(new_screen);
 }
 
-void gui_navigation_pop_to_depth(int target_depth) {
-    if (target_depth >= 1 && target_depth < nav_depth) {
-        nav_depth = target_depth;
-    }
-}

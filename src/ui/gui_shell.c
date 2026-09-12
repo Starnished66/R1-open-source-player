@@ -160,7 +160,6 @@ extern lv_obj_t * gui_settings_get_eq_screen();
 extern lv_obj_t * favorites_screen;
 extern lv_obj_t * gui_library_get_playlists_screen();
 
-extern player_settings_t current_settings;
 extern bool favorite_is_set;
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
@@ -3209,7 +3208,7 @@ void gui_shell_build_screens(uint32_t screen_width, uint32_t screen_height) {
 /* Deletes every screen/top-layer object gui_shell.c itself owns -- for
  * gui_reload.c's in-process UI reload, so gui_shell_build_screens() can
  * rebuild these from a clean slate without leaking the old objects. Only
- * three root containers need an explicit lv_obj_del(): status_bar_band/
+ * three root containers need an explicit lv_obj_delete(): status_bar_band/
  * home_indicator_band/quick_drawer own every other status-bar/quick-drawer
  * child (clock digits, battery icon, wifi/bt icons, sliders, ...) as an
  * LVGL child, so deleting the root recursively frees them -- no need to
@@ -3237,7 +3236,7 @@ void gui_shell_teardown(void) {
     volume_topbar_last_len = -1;
     volume_topbar_last_digits[0] = '\0';
     if (quick_drawer_motion_image) {
-        lv_obj_del(quick_drawer_motion_image);
+        lv_obj_delete(quick_drawer_motion_image);
         quick_drawer_motion_image = NULL;
     }
     if (quick_drawer_motion_buf) {
@@ -3246,26 +3245,26 @@ void gui_shell_teardown(void) {
     }
     quick_drawer_bitmap_motion = false;
     if (quick_drawer) {
-        lv_obj_del(quick_drawer);
+        lv_obj_delete(quick_drawer);
         quick_drawer = NULL;
     }
     quick_drawer_brightness_icon = NULL;
     asset_decoded_image_close(&quick_drawer_bg_image);
     asset_decoded_image_close(&quick_drawer_brightness_image);
     if (status_bar_band) {
-        lv_obj_del(status_bar_band);
+        lv_obj_delete(status_bar_band);
         status_bar_band = NULL;
     }
     if (home_indicator_band) {
-        lv_obj_del(home_indicator_band);
+        lv_obj_delete(home_indicator_band);
         home_indicator_band = NULL;
     }
     if (dac_home_screen) {
-        lv_obj_del(dac_home_screen);
+        lv_obj_delete(dac_home_screen);
         dac_home_screen = NULL;
     }
     if (home_screen) {
-        lv_obj_del(home_screen);
+        lv_obj_delete(home_screen);
         home_screen = NULL;
     }
 }
@@ -3291,7 +3290,7 @@ void gui_shell_refresh_home(void) {
     if (!fresh) return;
     home_screen = fresh;
     gui_navigation_replace_home(old, fresh);
-    if (old) lv_obj_del(old);
+    if (old) lv_obj_delete(old);
 }
 
 void gui_shell_init(uint32_t screen_width, uint32_t screen_height) {

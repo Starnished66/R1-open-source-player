@@ -1,4 +1,5 @@
 #include "artwork_coordinator.h"
+#include "cover_decode.h"  /* MAX_PNG_STREAMING_NATIVE_SIDE, jpeg_scale_for_target() */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -106,10 +107,26 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
                                      uint64_t progressive_coeff_bytes,
                                      uint32_t png_native_bpp) {
     if (native_w == 0 || native_h == 0 || target_w == 0 || target_h == 0) return SIZE_MAX;
-    if (native_w > 4096 || native_h > 4096 || target_w > 1024 || target_h > 1024) return SIZE_MAX;
+    /* PNG_STREAMING is allowed up to MAX_PNG_STREAMING_NATIVE_SIDE (8192),
+     * not the 4096 every other format is capped at -- that decoder's own
+     * peak RAM is bounded by the post-scale output size, not native size
+     * (see the decoder_workspace branch below), so the tighter cap doesn't
+     * apply. This must track cover_decode.c's own MAX_PNG_STREAMING_NATIVE_
+     * SIDE check exactly: a looser check here than the decoder's own would
+     * be harmless (the decoder still rejects it), but a TIGHTER one (as
+     * this used to be, hardcoded at 4096 for every format) turned every
+     * 4097-8192px streaming-eligible PNG into a permanent SIZE_MAX/
+     * LOW_MEMORY reject before ever reaching a decoder that was built to
+     * handle exactly that range. */
+    size_t max_native = (fmt == ARTWORK_FORMAT_PNG_STREAMING) ? MAX_PNG_STREAMING_NATIVE_SIDE : 4096;
+    if (native_w > max_native || native_h > max_native || target_w > 1024 || target_h > 1024) return SIZE_MAX;
 
-    /* Native RGB888 output buffer */
-    uint64_t native_bytes = (uint64_t) native_w * (uint64_t) native_h * 3ULL;
+    /* Native RGB888 output buffer -- not billed for PNG_STREAMING, which
+     * never materializes one at native resolution; its real transient
+     * costs (bounded by the post-scale size instead) are billed entirely
+     * through decoder_workspace below. */
+    uint64_t native_bytes = (fmt == ARTWORK_FORMAT_PNG_STREAMING) ? 0ULL
+                           : (uint64_t) native_w * (uint64_t) native_h * 3ULL;
     /* Resized target RGB565 buffer */
     uint64_t target_bytes = (uint64_t) target_w * (uint64_t) target_h * 2ULL;
 
@@ -118,11 +135,16 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
      *   raw scanline buffers with filter bytes (~4 bytes/pixel) + zlib window.
      * - JPEG: tjpgd streams 8x8 MCU blocks into destination; minimal ~32KB buffer.
      *   native_w/h for JPEG is the post-scale RGB888 size, not the source pixel size.
-     * - JPEG_PROGRESSIVE: vendored libjpeg decoder-only build. native_w/h here
-     *   are ALSO the post-scale RGB888 size (same convention as baseline
-     *   JPEG) -- the coefficient buffer (the dominant, dimension-dependent
-     *   cost, scaling with the SOF's true native size, not this post-scale
-     *   size) is billed separately via progressive_coeff_bytes below.
+     * - JPEG_PROGRESSIVE / JPEG_LIBJPEG_BASELINE: vendored libjpeg
+     *   decoder-only build -- the latter covers both a baseline file whose
+     *   chroma sampling tjpgd's whitelist rejects, and any other baseline
+     *   file tjpgd itself failed to decode. native_w/h here are ALSO the
+     *   post-scale RGB888 size (same convention as tjpgd JPEG) -- the
+     *   coefficient buffer (the dominant, dimension-dependent cost, scaling
+     *   with the SOF's true native size, not this post-scale size) is
+     *   billed separately via progressive_coeff_bytes below for BOTH
+     *   formats, not just progressive (see jpeg_probe_t's own comment for
+     *   why a baseline file is billed this same worst-case cost).
      * - BMP: uncompressed linear stream; ~16KB overhead. */
     uint64_t decoder_workspace = 64ULL * 1024ULL;
     if (fmt == ARTWORK_FORMAT_PNG) {
@@ -173,6 +195,51 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
                               + 4ULL * (uint64_t) native_w * (uint64_t) native_h;
         uint64_t peak_pair_bytes = pair1_bytes > pair2_bytes ? pair1_bytes : pair2_bytes;
         decoder_workspace = peak_pair_bytes + icc_estimate_bytes + (128ULL * 1024ULL);
+    } else if (fmt == ARTWORK_FORMAT_PNG_STREAMING) {
+        /* Real transient peak for decode_png_streaming() (cover_decode.c):
+         * the concatenated IDAT bytes (a genuinely separate allocation from
+         * the resident compressed file already billed via compressed_size
+         * above, so billed again here), the 32KB tinfl dictionary, two
+         * native-row-width filter-reconstruction buffers, three scaled_w
+         * column accumulators, and the scaled-resolution RGB888 output
+         * buffer itself (native_w/h downscaled by the same 1/2^n
+         * jpeg_scale_for_target() picks for JPEG -- this decoder never
+         * holds a native-resolution RGB888 buffer, only this smaller one,
+         * which is why native_bytes above is zeroed out for this format
+         * instead of being billed at the true native size). */
+        uint32_t bpp_bytes = png_native_bpp ? (png_native_bpp / 8) : 4;
+        uint64_t row_bytes = (uint64_t) native_w * (uint64_t) bpp_bytes + 1ULL;
+        uint8_t scale = jpeg_scale_for_target((int) native_w, (int) native_h,
+                                              (int) target_w, (int) target_h);
+        uint64_t scaled_w = native_w >> scale, scaled_h = native_h >> scale;
+        if (scaled_w < 1) scaled_w = 1;
+        if (scaled_h < 1) scaled_h = 1;
+        /* decode_png_streaming() keeps downscaling past jpeg_scale_for_
+         * target()'s own stopping point when needed purely to fit
+         * max_side (MAX_DECODED_COVER_SIDE, the cap it actually enforces
+         * via rgb888_size_ok()) -- for an extreme-aspect-ratio native
+         * image (e.g. 8192x400) where one side is already below its
+         * target at scale=0, jpeg_scale_for_target() alone stops too
+         * early and this would otherwise bill the pre-extra-scale (much
+         * larger) buffer size, over-admitting relative to what the
+         * decoder will actually hold. Mirror that same extra downscale
+         * here so the two can't drift the way the old 4096-vs-8192 cap
+         * mismatch did. */
+        while ((scaled_w > MAX_DECODED_COVER_SIDE || scaled_h > MAX_DECODED_COVER_SIDE) &&
+               scaled_w > 1 && scaled_h > 1) {
+            scale++;
+            scaled_w = native_w >> scale;
+            scaled_h = native_h >> scale;
+            if (scaled_w < 1) scaled_w = 1;
+            if (scaled_h < 1) scaled_h = 1;
+        }
+        uint64_t scaled_rgb888_bytes = scaled_w * scaled_h * 3ULL;
+        uint64_t accum_bytes = scaled_w * 4ULL * 3ULL;
+        decoder_workspace = (uint64_t) compressed_size /* idat_buf copy */
+                           + 32768ULL /* tinfl dictionary */
+                           + (2ULL * row_bytes) /* row_curr/row_prev */
+                           + accum_bytes
+                           + scaled_rgb888_bytes;
     } else if (fmt == ARTWORK_FORMAT_JPEG) {
         decoder_workspace = 32ULL * 1024ULL;
     } else if (fmt == ARTWORK_FORMAT_JPEG_PROGRESSIVE || fmt == ARTWORK_FORMAT_JPEG_LIBJPEG_BASELINE) {
@@ -181,9 +248,12 @@ size_t artwork_estimate_decode_bytes(artwork_format_t fmt, size_t compressed_siz
          * struct/table footprint is genuinely bigger, independent of image
          * size. progressive_coeff_bytes (the real, dimension/sampling-
          * dependent cost) is added on top, not folded into this constant --
-         * always 0 for JPEG_LIBJPEG_BASELINE, whose caller never computes a
-         * real one (that path is single-scan only; the decoder itself
-         * rejects a sequential-multiscan SOF0 before it would need one). */
+         * real and non-zero for JPEG_LIBJPEG_BASELINE too, not just
+         * JPEG_PROGRESSIVE: jpeg_probe() computes it unconditionally for
+         * every supported SOF0/SOF2, deliberately conservative (billed as
+         * if any baseline file might turn out to be sequential-multiscan,
+         * since a cheap header probe can't tell single-scan and multiscan
+         * apart) so that case doesn't need its own separate rejection. */
         decoder_workspace = 128ULL * 1024ULL + progressive_coeff_bytes;
     } else if (fmt == ARTWORK_FORMAT_BMP) {
         decoder_workspace = 16ULL * 1024ULL;

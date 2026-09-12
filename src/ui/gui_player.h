@@ -15,6 +15,7 @@ void gui_player_init(uint32_t screen_width, uint32_t screen_height);
  * call gui_player_init() again from a clean slate. */
 void gui_player_teardown(void);
 void gui_player_refresh_static_assets(void);
+void gui_player_refresh_frosted_background(void);
 void sync_player_topbar_visibility(lv_obj_t * screen);
 void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta);
 void poll_cover_decode(void);

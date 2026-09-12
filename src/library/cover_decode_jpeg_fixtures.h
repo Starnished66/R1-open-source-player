@@ -213,7 +213,10 @@ static const uint8_t jpeg_prog_420_48x40[] = {
 static const uint32_t jpeg_prog_420_48x40_size = 542;
 
 /* Hand-constructed SOF2 header only (no scan data). 1600x100, 4:2:0
- * (Y 2x2, Cb/Cr 1x1). Width 1600 > MAX_DECODED_COVER_SIDE (1200). */
+ * (Y 2x2, Cb/Cr 1x1). Under the progressive native cap (MAX_JPEG_NATIVE_SIDE,
+ * 4096) so no longer dimension-rejected -- fails at actual decode instead,
+ * since there's no real scan data behind this header (see the test's own
+ * comment for the current expected result). */
 static const uint8_t jpeg_prog_oversized_1600x100[] = {
     0xff, 0xd8, 0xff, 0xc2, 0x00, 0x11, 0x08, 0x00, 0x64, 0x06, 0x40, 0x03, 0x01, 0x22, 0x00, 0x02,
     0x11, 0x01, 0x03, 0x11, 0x01,

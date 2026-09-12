@@ -27,11 +27,6 @@ extern lv_style_t style_theme_text_muted;
 extern void nav_push(lv_obj_t * screen);
 extern void get_display_names(const char * path, char * out_title, size_t title_sz, char * out_folder, size_t folder_sz);
 extern void row_label_enable_marquee(lv_obj_t * label);
-extern lv_obj_t * build_subsonic_list_screen(const char * title_text, lv_obj_t ** out_title_label, lv_obj_t ** out_list);
-
-lv_obj_t * gui_queue_get_screen(void) {
-    return queue_screen;
-}
 
 #define QUEUE_PAGE_SIZE 100
 static int queue_page;
@@ -323,8 +318,8 @@ void gui_queue_init(void) {
 void gui_queue_teardown(void) {
     if (queue_actions) { lv_obj_delete(queue_actions); queue_actions = NULL; }
     if (queue_actions_backdrop) { lv_obj_delete(queue_actions_backdrop); queue_actions_backdrop = NULL; }
-    if (song_context_menu_popup) { lv_obj_del(song_context_menu_popup); song_context_menu_popup = NULL; }
-    if (song_context_menu_popup_backdrop) { lv_obj_del(song_context_menu_popup_backdrop); song_context_menu_popup_backdrop = NULL; }
-    if (queue_screen) { lv_obj_del(queue_screen); queue_screen = NULL; }
+    if (song_context_menu_popup) { lv_obj_delete(song_context_menu_popup); song_context_menu_popup = NULL; }
+    if (song_context_menu_popup_backdrop) { lv_obj_delete(song_context_menu_popup_backdrop); song_context_menu_popup_backdrop = NULL; }
+    if (queue_screen) { lv_obj_delete(queue_screen); queue_screen = NULL; }
     queue_list = NULL;
 }

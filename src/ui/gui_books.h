@@ -9,7 +9,6 @@ bool gui_books_init(void);
  * reload can call gui_books_init() again from a clean slate. */
 void gui_books_teardown(void);
 void gui_books_rescan(void);
-void gui_books_show(void);
 lv_obj_t * gui_books_get_screen(void);
 void gui_books_home_tile_cb(lv_event_t * e);
 

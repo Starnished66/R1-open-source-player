@@ -18,7 +18,6 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "gui_notifications.h"
 #include "gui_settings.h"
 #include "gui_text_input.h"
-#include "gui_subsonic.h"
 #include "gui_books.h"
 #include "fallback_font.h"
 #include "plugin_manager.h"
@@ -155,7 +154,6 @@ extern void finalize_screen_navigation(lv_obj_t * screen);
 extern void on_file_selected(char ** new_playlist, int count, int selected_index);
 extern const char * playlist_path_at(int index);
 extern void enable_gesture_bubble_recursive(lv_obj_t * obj);
-extern lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode, lv_obj_t ** out_title, const char * body_text, const char * confirm_text, lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row, const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb, lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
 extern void register_static_snapshot(int index, lv_obj_t * screen);
 extern void unregister_static_snapshot(lv_obj_t * screen);
 
@@ -1172,6 +1170,13 @@ static bool album_player_cache_hit(const albumart_info_t * info, char * found, s
  * and the returned picture is admitted at its actual compressed size. */
 #define ALBUM_ART_METADATA_START_BYTES (1024U * 1024U)
 
+/* Bound on how many other songs from the same album to probe for embedded
+ * art once the album's own representative song (first_song_id) has none
+ * and no sidecar exists either -- covers rips where only some tracks carry
+ * embedded art (e.g. a short intro/interlude or bonus track).
+ * Kept small: each probe is a full isolated-process extraction. */
+#define ALBUM_ART_SIBLING_FALLBACK_MAX 5
+
 /* Persistent warmer state flags */
 static pthread_t album_thumb_gen_thread;
 static atomic_bool album_thumb_gen_active;
@@ -1416,6 +1421,71 @@ bool gui_library_generate_player_cover(const char * track_path, const char * art
     return res == COVER_DECODE_OK;
 }
 
+/* Result of one embedded-art probe against a single sibling song file --
+ * distinguishes "this song genuinely has no picture" (keep trying other
+ * siblings) from every transient/cancelled outcome (stop probing without
+ * ever letting the caller record a permanent album-level failure over a
+ * passing interruption -- mirrors how Step 3 above treats the primary
+ * song's own cancelled/temporary outcomes). */
+typedef enum {
+    SIBLING_ART_FOUND,      /* success -- *out_pixels populated */
+    SIBLING_ART_NOT_FOUND,  /* probe completed, this song has no usable picture */
+    SIBLING_ART_TEMPORARY,  /* busy/low-memory/timeout/temporary decode failure */
+    SIBLING_ART_CANCELLED,  /* cancelled or suspended -- record nothing */
+} sibling_art_result_t;
+
+/* One bounded attempt at embedded-picture extraction from a single sibling
+ * song file, used only by the Step 3b fallback below (the primary
+ * representative song still goes through the separately inlined Step 3
+ * above, which this mirrors). On success, also persists the sized
+ * thumbnail/player caches keyed by `info`, i.e. by album identity, not by
+ * which song file supplied the bytes. */
+static sibling_art_result_t album_thumbnail_try_embedded_art_from_path(
+        const albumart_info_t * info, const char * path, artwork_priority_t prio,
+        artwork_cancel_fn cancel_cb, void * user_data, uint16_t ** out_pixels) {
+    artwork_acquire_result_t admission = artwork_coordinator_acquire(
+        prio, ALBUM_ART_METADATA_START_BYTES, 300, cancel_cb, user_data);
+    if (admission == ARTWORK_ACQUIRE_CANCELLED || admission == ARTWORK_ACQUIRE_SUSPENDED)
+        return SIBLING_ART_CANCELLED;
+    if (admission != ARTWORK_ACQUIRE_OK)
+        return SIBLING_ART_TEMPORARY;
+
+    track_metadata_t meta;
+    memset(&meta, 0, sizeof(meta));
+    metadata_artwork_result_t metadata_result =
+        metadata_read_artwork_isolated(path, &meta, ALBUM_ART_METADATA_TIMEOUT_MS, prio);
+    artwork_coordinator_release(prio);
+    uint8_t * data = meta.picture_data;
+    uint32_t size = meta.picture_size;
+    free(meta.lyrics);
+
+    if (!data || size == 0) {
+        free(data);
+        return metadata_result == METADATA_ARTWORK_TEMPORARY_FAILURE
+            ? SIBLING_ART_TEMPORARY : SIBLING_ART_NOT_FOUND;
+    }
+
+    uint16_t * player_pixels = NULL;
+    cover_decode_result_t player_res = album_thumbnail_maybe_store_player_cache(
+        info, data, size, prio, cancel_cb, user_data, &player_pixels);
+    if (player_res == COVER_DECODE_FAIL_CANCELLED) {
+        free(player_pixels);
+        free(data);
+        return SIBLING_ART_CANCELLED;
+    }
+    cover_decode_result_t res = album_thumbnail_pixels_from_source(
+        data, size, player_pixels, prio, cancel_cb, user_data, out_pixels);
+    free(player_pixels);
+    free(data);
+    if (res == COVER_DECODE_OK && *out_pixels) {
+        albumart_store_rgb565(info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, *out_pixels);
+        return SIBLING_ART_FOUND;
+    }
+    if (res == COVER_DECODE_FAIL_CANCELLED) return SIBLING_ART_CANCELLED;
+    if (cover_decode_result_is_temporary(res)) return SIBLING_ART_TEMPORARY;
+    return SIBLING_ART_NOT_FOUND;
+}
+
 /* Rockbox albumart search, then embedded picture. A successful decode is
  * written as MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp
  * so the next pass is a small BMP load instead of a JPEG/PNG decode.
@@ -1584,6 +1654,35 @@ static bool album_thumbnail_load_or_decode_ex(const song_row_t * song, artwork_p
     if (metadata_result == METADATA_ARTWORK_TEMPORARY_FAILURE) {
         artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
         return false;
+    }
+
+    /* Step 3b: the representative song for this album may simply be a track
+     * with no embedded picture of its own (e.g. a short intro/interlude or
+     * bonus track) even though sibling tracks in the same album do carry
+     * art -- and Step 2 already searched the whole folder for a sidecar, so
+     * a missing sidecar here means there truly isn't one. Try a bounded
+     * number of other songs from the same album before giving up on the album
+     * entirely. A cancelled/suspended or merely transient outcome on any
+     * probe stops the loop immediately without recording anything permanent --
+     * only a probe that actually completed and found nothing counts toward
+     * "try the next sibling". */
+    if (info.album[0] && info.albumartist[0]) {
+        song_row_t siblings[ALBUM_ART_SIBLING_FALLBACK_MAX];
+        int sibling_count = metadata_db_get_album_songs(info.album, info.albumartist, 0,
+                                                         siblings, ALBUM_ART_SIBLING_FALLBACK_MAX);
+        for (int i = 0; i < sibling_count; i++) {
+            if (siblings[i].id == song->id || !siblings[i].path[0]) continue;
+            if (cancel_cb && cancel_cb(user_data)) return false;
+            sibling_art_result_t sr = album_thumbnail_try_embedded_art_from_path(
+                &info, siblings[i].path, prio, cancel_cb, user_data, out_pixels);
+            if (sr == SIBLING_ART_FOUND) return true;
+            if (sr == SIBLING_ART_CANCELLED) return false;
+            if (sr == SIBLING_ART_TEMPORARY) {
+                artwork_failure_cache_record(song->id, source_mtime, ARTWORK_FAIL_TEMPORARY);
+                return false;
+            }
+            /* SIBLING_ART_NOT_FOUND -- try the next sibling */
+        }
     }
 
     /* Step 4: No valid artwork found or permanent decode failure */
@@ -3291,14 +3390,13 @@ static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_te
  * never wired onto the Favorites/Most Played/Queue/Recently Added rows (see
  * populate_playlists_screen() below), since none is backed by a real file
  * playlist_files_delete()/playlist_files_rename() could act on. */
-static lv_obj_t * playlist_delete_popup, * playlist_delete_backdrop;
+static gui_popup_t playlist_delete_popup;
 static lv_obj_t * playlist_context_menu_popup, * playlist_context_menu_backdrop;
 static char playlist_action_path[PATH_MAX];
 
 static void playlist_delete_cancel_cb(lv_event_t * e) {
     (void) e;
-    if (playlist_delete_popup) lv_obj_add_flag(playlist_delete_popup, LV_OBJ_FLAG_HIDDEN);
-    if (playlist_delete_backdrop) lv_obj_add_flag(playlist_delete_backdrop, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&playlist_delete_popup);
 }
 
 static void playlist_delete_confirm_cb(lv_event_t * e) {
@@ -3342,15 +3440,12 @@ static void playlist_context_menu_rename_cb(lv_event_t * e) {
 static void playlist_context_menu_delete_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_playlist_context_menu_popup();
-    if (!playlist_delete_popup)
-        playlist_delete_popup = build_confirm_popup("Delete playlist?", LV_LABEL_LONG_WRAP, NULL,
+    if (!playlist_delete_popup.popup)
+        playlist_delete_popup.popup = build_confirm_popup("Delete playlist?", LV_LABEL_LONG_WRAP, NULL,
             "The playlist file will be deleted. Music files are kept.", "Delete",
             accent_lv_color(), playlist_delete_confirm_cb, NULL, "Cancel", accent_lv_color(),
-            playlist_delete_cancel_cb, NULL, playlist_delete_cancel_cb, &playlist_delete_backdrop);
-    lv_obj_remove_flag(playlist_delete_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(playlist_delete_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(playlist_delete_backdrop);
-    lv_obj_move_foreground(playlist_delete_popup);
+            playlist_delete_cancel_cb, NULL, playlist_delete_cancel_cb, &playlist_delete_popup.backdrop);
+    gui_popup_show(&playlist_delete_popup);
 }
 
 static void playlist_context_menu_cancel_cb(lv_event_t * e) {
@@ -4068,19 +4163,15 @@ void poll_sd_format(void) {
     }
 }
 
-static lv_obj_t * sd_mount_failed_popup;
-static lv_obj_t * sd_mount_failed_popup_backdrop;
-static lv_obj_t * sd_format_confirm_popup;
-static lv_obj_t * sd_format_confirm_popup_backdrop;
+static gui_popup_t sd_mount_failed_popup;
+static gui_popup_t sd_format_confirm_popup;
 
 static void hide_sd_mount_failed_popup(void) {
-    lv_obj_add_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(sd_mount_failed_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&sd_mount_failed_popup);
 }
 
 static void hide_sd_format_confirm_popup(void) {
-    lv_obj_add_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(sd_format_confirm_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&sd_format_confirm_popup);
 }
 
 static void sd_mount_failed_popup_backdrop_cb(lv_event_t * e) {
@@ -4106,10 +4197,7 @@ static void sd_format_cancel_cb(lv_event_t * e) {
 static void sd_mount_failed_format_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_sd_mount_failed_popup();
-    lv_obj_remove_flag(sd_format_confirm_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(sd_format_confirm_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(sd_format_confirm_popup_backdrop);
-    lv_obj_move_foreground(sd_format_confirm_popup);
+    gui_popup_show(&sd_format_confirm_popup);
 }
 
 static void sd_format_confirm_cb(lv_event_t * e) {
@@ -4120,28 +4208,25 @@ static void sd_format_confirm_cb(lv_event_t * e) {
 
 /* Displayed when persistent SD card mount failure is detected. */
 static void show_sd_mount_failed_popup(void) {
-    lv_obj_remove_flag(sd_mount_failed_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(sd_mount_failed_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(sd_mount_failed_popup_backdrop);
-    lv_obj_move_foreground(sd_mount_failed_popup);
+    gui_popup_show(&sd_mount_failed_popup);
 }
 
 static void build_sd_mount_failed_popup(void) {
-    sd_mount_failed_popup = build_confirm_popup(
+    sd_mount_failed_popup.popup = build_confirm_popup(
         "SD card couldn't be read", LV_LABEL_LONG_WRAP, NULL,
         "It may have no partition table or a file system this player can't use. "
         "Formatting will erase it and set it up for this player.",
         "Format SD Card", lv_color_make(255, 120, 120), sd_mount_failed_format_btn_cb, NULL, "Dismiss",
         accent_lv_color(), sd_mount_failed_dismiss_cb, NULL, sd_mount_failed_popup_backdrop_cb,
-        &sd_mount_failed_popup_backdrop);
+        &sd_mount_failed_popup.backdrop);
 }
 
 static void build_sd_format_confirm_popup(void) {
-    sd_format_confirm_popup = build_confirm_popup(
+    sd_format_confirm_popup.popup = build_confirm_popup(
         "Erase and format SD card?", LV_LABEL_LONG_WRAP, NULL,
         "This permanently deletes everything on the card. This cannot be undone.", "Format",
         lv_color_make(255, 120, 120), sd_format_confirm_cb, NULL, "Cancel", accent_lv_color(), sd_format_cancel_cb,
-        NULL, sd_format_confirm_popup_backdrop_cb, &sd_format_confirm_popup_backdrop);
+        NULL, sd_format_confirm_popup_backdrop_cb, &sd_format_confirm_popup.backdrop);
 }
 
 /* Power-off countdown -- shown when hw_buttons_consume_power_long_press()
@@ -4156,16 +4241,13 @@ static void build_sd_format_confirm_popup(void) {
  * beyond that. */
 #define POWER_OFF_COUNTDOWN_SECONDS 3
 
-static lv_obj_t * power_off_countdown_popup;
-static lv_obj_t * power_off_countdown_popup_backdrop;
+static gui_popup_t power_off_countdown_popup;
 static lv_obj_t * power_off_countdown_label;
 static bool power_off_countdown_active = false;
 static uint32_t power_off_countdown_start_tick;
 
 static void hide_power_off_countdown_popup(void) {
-    /* Null-check ensures safe teardown even if countdown popups were not built. */
-    if (power_off_countdown_popup_backdrop) lv_obj_add_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    if (power_off_countdown_popup) lv_obj_add_flag(power_off_countdown_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&power_off_countdown_popup);
 }
 
 static void cancel_power_off_countdown(void) {
@@ -4187,10 +4269,7 @@ void start_power_off_countdown(void) {
     power_off_countdown_active = true;
     power_off_countdown_start_tick = lv_tick_get();
     lv_label_set_text_fmt(power_off_countdown_label, "%d", POWER_OFF_COUNTDOWN_SECONDS);
-    lv_obj_remove_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(power_off_countdown_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(power_off_countdown_popup_backdrop);
-    lv_obj_move_foreground(power_off_countdown_popup);
+    gui_popup_show(&power_off_countdown_popup);
 }
 
 /* Called every tick from update_timer_cb while power_off_countdown_active --
@@ -4216,27 +4295,27 @@ void poll_power_off_countdown(void) {
 void build_power_off_countdown_popup(void) {
     lv_obj_t * top = lv_layer_top();
 
-    power_off_countdown_popup_backdrop = lv_obj_create(top);
-    lv_obj_set_size(power_off_countdown_popup_backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(power_off_countdown_popup_backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(power_off_countdown_popup_backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(power_off_countdown_popup_backdrop, 0, 0);
-    lv_obj_remove_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(power_off_countdown_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(power_off_countdown_popup_backdrop, power_off_countdown_backdrop_cb, LV_EVENT_CLICKED, NULL);
+    power_off_countdown_popup.backdrop = lv_obj_create(top);
+    lv_obj_set_size(power_off_countdown_popup.backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(power_off_countdown_popup.backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(power_off_countdown_popup.backdrop, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(power_off_countdown_popup.backdrop, 0, 0);
+    lv_obj_remove_flag(power_off_countdown_popup.backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(power_off_countdown_popup.backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(power_off_countdown_popup.backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(power_off_countdown_popup.backdrop, power_off_countdown_backdrop_cb, LV_EVENT_CLICKED, NULL);
 
-    power_off_countdown_popup = lv_obj_create(top);
-    lv_obj_set_size(power_off_countdown_popup, BOARD_SCALE_PX(320), BOARD_SCALE_PX(280));
-    lv_obj_align(power_off_countdown_popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(power_off_countdown_popup, 16, 0);
-    lv_obj_add_style(power_off_countdown_popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(power_off_countdown_popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(power_off_countdown_popup, 0, 0);
-    lv_obj_remove_flag(power_off_countdown_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(power_off_countdown_popup, LV_OBJ_FLAG_HIDDEN);
+    power_off_countdown_popup.popup = lv_obj_create(top);
+    lv_obj_set_size(power_off_countdown_popup.popup, BOARD_SCALE_PX(320), BOARD_SCALE_PX(280));
+    lv_obj_align(power_off_countdown_popup.popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(power_off_countdown_popup.popup, 16, 0);
+    lv_obj_add_style(power_off_countdown_popup.popup, &style_theme_card_bg, 0);
+    lv_obj_set_style_bg_opa(power_off_countdown_popup.popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(power_off_countdown_popup.popup, 0, 0);
+    lv_obj_remove_flag(power_off_countdown_popup.popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(power_off_countdown_popup.popup, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t * title = lv_label_create(power_off_countdown_popup);
+    lv_obj_t * title = lv_label_create(power_off_countdown_popup.popup);
     lv_obj_set_width(title, lv_pct(90));
     lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
@@ -4245,15 +4324,15 @@ void build_power_off_countdown_popup(void) {
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, BOARD_SCALE_PX(20));
     lv_label_set_text(title, "Powering Off");
 
-    power_off_countdown_label = lv_label_create(power_off_countdown_popup);
+    power_off_countdown_label = lv_label_create(power_off_countdown_popup.popup);
     lv_obj_add_style(power_off_countdown_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(power_off_countdown_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
     lv_obj_align(power_off_countdown_label, LV_ALIGN_CENTER, 0, BOARD_SCALE_PX(-10));
     lv_label_set_text_fmt(power_off_countdown_label, "%d", POWER_OFF_COUNTDOWN_SECONDS);
 
-    lv_obj_t * cancel_row = lv_obj_create(power_off_countdown_popup);
-    lv_obj_set_size(cancel_row, lv_pct(90), BOARD_SCALE_PX(56));
-    lv_obj_align(cancel_row, LV_ALIGN_BOTTOM_MID, 0, BOARD_SCALE_PX(-20));
+	lv_obj_t * cancel_row = lv_obj_create(power_off_countdown_popup.popup);
+	lv_obj_set_size(cancel_row, lv_pct(90), BOARD_SCALE_PX(56));
+	lv_obj_align(cancel_row, LV_ALIGN_BOTTOM_MID, 0, BOARD_SCALE_PX(-20));
     lv_obj_set_style_radius(cancel_row, 12, 0);
     lv_obj_set_style_bg_opa(cancel_row, 0, 0);
     lv_obj_set_style_border_width(cancel_row, 0, 0);
@@ -4352,7 +4431,7 @@ void gui_library_refresh_music_screen(void) {
     if (!fresh) return;
     music_screen = fresh;
     gui_navigation_replace_static_screen(1, old, fresh);
-    if (old) lv_obj_del(old);
+    if (old) lv_obj_delete(old);
 }
 
 
@@ -4979,8 +5058,7 @@ void gui_library_teardown(void) {
     reset_az_index_bindings();
     if (playlist_start_popup) { lv_obj_delete(playlist_start_popup); playlist_start_popup = NULL; }
     if (playlist_start_backdrop) { lv_obj_delete(playlist_start_backdrop); playlist_start_backdrop = NULL; }
-    if (playlist_delete_popup) { lv_obj_delete(playlist_delete_popup); playlist_delete_popup = NULL; }
-    if (playlist_delete_backdrop) { lv_obj_delete(playlist_delete_backdrop); playlist_delete_backdrop = NULL; }
+    gui_popup_teardown(&playlist_delete_popup);
     if (playlist_context_menu_popup) { lv_obj_delete(playlist_context_menu_popup); playlist_context_menu_popup = NULL; }
     if (playlist_context_menu_backdrop) { lv_obj_delete(playlist_context_menu_backdrop); playlist_context_menu_backdrop = NULL; }
     /* poll_power_off_countdown() runs every tick from update_timer_cb,
@@ -4997,48 +5075,44 @@ void gui_library_teardown(void) {
     library_teardown_diag("cancel_power_off_countdown before");
     cancel_power_off_countdown();
     library_teardown_diag("sd_mount_failed_popup before");
-    if (sd_mount_failed_popup) { lv_obj_del(sd_mount_failed_popup); sd_mount_failed_popup = NULL; }
-    library_teardown_diag("sd_mount_failed_popup_backdrop before");
-    if (sd_mount_failed_popup_backdrop) { lv_obj_del(sd_mount_failed_popup_backdrop); sd_mount_failed_popup_backdrop = NULL; }
+    gui_popup_teardown(&sd_mount_failed_popup);
     library_teardown_diag("sd_format_confirm_popup before");
-    if (sd_format_confirm_popup) { lv_obj_del(sd_format_confirm_popup); sd_format_confirm_popup = NULL; }
-    library_teardown_diag("sd_format_confirm_popup_backdrop before");
-    if (sd_format_confirm_popup_backdrop) { lv_obj_del(sd_format_confirm_popup_backdrop); sd_format_confirm_popup_backdrop = NULL; }
+    gui_popup_teardown(&sd_format_confirm_popup);
     library_teardown_diag("collection_menu_popup before");
-    if (collection_menu_popup) { lv_obj_del(collection_menu_popup); collection_menu_popup = NULL; }
+    if (collection_menu_popup) { lv_obj_delete(collection_menu_popup); collection_menu_popup = NULL; }
     library_teardown_diag("collection_menu_backdrop before");
-    if (collection_menu_backdrop) { lv_obj_del(collection_menu_backdrop); collection_menu_backdrop = NULL; }
+    if (collection_menu_backdrop) { lv_obj_delete(collection_menu_backdrop); collection_menu_backdrop = NULL; }
     library_teardown_diag("album_collection_menu_popup before");
-    if (album_collection_menu_popup) { lv_obj_del(album_collection_menu_popup); album_collection_menu_popup = NULL; }
+    if (album_collection_menu_popup) { lv_obj_delete(album_collection_menu_popup); album_collection_menu_popup = NULL; }
     library_teardown_diag("album_collection_menu_backdrop before");
     if (album_collection_menu_backdrop) {
-        lv_obj_del(album_collection_menu_backdrop);
+        lv_obj_delete(album_collection_menu_backdrop);
         album_collection_menu_backdrop = NULL;
     }
     library_teardown_diag("music_screen before");
-    if (music_screen) { lv_obj_del(music_screen); music_screen = NULL; }
+    if (music_screen) { lv_obj_delete(music_screen); music_screen = NULL; }
     library_teardown_diag("files_screen before");
-    if (files_screen) { lv_obj_del(files_screen); files_screen = NULL; }
+    if (files_screen) { lv_obj_delete(files_screen); files_screen = NULL; }
     library_teardown_diag("all_songs_screen before");
-    if (all_songs_screen) { lv_obj_del(all_songs_screen); all_songs_screen = NULL; }
+    if (all_songs_screen) { lv_obj_delete(all_songs_screen); all_songs_screen = NULL; }
     library_teardown_diag("recently_added_screen before");
-    if (recently_added_screen) { lv_obj_del(recently_added_screen); recently_added_screen = NULL; }
+    if (recently_added_screen) { lv_obj_delete(recently_added_screen); recently_added_screen = NULL; }
     library_teardown_diag("artists_screen before");
-    if (artists_screen) { lv_obj_del(artists_screen); artists_screen = NULL; }
+    if (artists_screen) { lv_obj_delete(artists_screen); artists_screen = NULL; }
     library_teardown_diag("albums_screen before");
-    if (albums_screen) { lv_obj_del(albums_screen); albums_screen = NULL; }
+    if (albums_screen) { lv_obj_delete(albums_screen); albums_screen = NULL; }
     library_teardown_diag("album_artist_screen before");
-    if (album_artist_screen) { lv_obj_del(album_artist_screen); album_artist_screen = NULL; }
+    if (album_artist_screen) { lv_obj_delete(album_artist_screen); album_artist_screen = NULL; }
     library_teardown_diag("group_songs_screen before");
-    if (group_songs_screen) { lv_obj_del(group_songs_screen); group_songs_screen = NULL; }
+    if (group_songs_screen) { lv_obj_delete(group_songs_screen); group_songs_screen = NULL; }
     library_teardown_diag("artist_albums_screen before");
-    if (artist_albums_screen) { lv_obj_del(artist_albums_screen); artist_albums_screen = NULL; }
+    if (artist_albums_screen) { lv_obj_delete(artist_albums_screen); artist_albums_screen = NULL; }
     library_teardown_diag("playlists_screen before");
-    if (playlists_screen) { lv_obj_del(playlists_screen); playlists_screen = NULL; }
+    if (playlists_screen) { lv_obj_delete(playlists_screen); playlists_screen = NULL; }
     library_teardown_diag("cue_tracks_screen before");
-    if (cue_tracks_screen) { lv_obj_del(cue_tracks_screen); cue_tracks_screen = NULL; }
+    if (cue_tracks_screen) { lv_obj_delete(cue_tracks_screen); cue_tracks_screen = NULL; }
     library_teardown_diag("add_to_playlist_screen before");
-    if (add_to_playlist_screen) { lv_obj_del(add_to_playlist_screen); add_to_playlist_screen = NULL; }
+    if (add_to_playlist_screen) { lv_obj_delete(add_to_playlist_screen); add_to_playlist_screen = NULL; }
     /* The screens owned these children; clear the borrowed pointers with
      * their parents so non-NULL remains a valid liveness check. */
     files_search_list = NULL;
@@ -5066,12 +5140,7 @@ void gui_library_teardown(void) {
      * rebuilt UI forever, invisible only until the next power-off countdown
      * actually shows it. */
     library_teardown_diag("power_off_countdown_popup before");
-    if (power_off_countdown_popup) { lv_obj_del(power_off_countdown_popup); power_off_countdown_popup = NULL; }
-    library_teardown_diag("power_off_countdown_popup_backdrop before");
-    if (power_off_countdown_popup_backdrop) {
-        lv_obj_del(power_off_countdown_popup_backdrop);
-        power_off_countdown_popup_backdrop = NULL;
-    }
+    gui_popup_teardown(&power_off_countdown_popup);
     power_off_countdown_label = NULL;
     library_teardown_diag("done");
 }

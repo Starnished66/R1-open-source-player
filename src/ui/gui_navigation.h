@@ -41,14 +41,11 @@ typedef struct {
 } slide_transition_ctx_t;
 
 int gui_navigation_get_depth(void);
-lv_obj_t * gui_navigation_get_top_screen(void);
 lv_obj_t * gui_navigation_get_screen_at(int index);
 bool gui_navigation_is_top(lv_obj_t * screen);
 void gui_navigation_remove_screen_instances(lv_obj_t ** screens, int count);
-void gui_navigation_replace_top(lv_obj_t * new_screen);
 void gui_navigation_replace_home(lv_obj_t * old_screen, lv_obj_t * new_screen);
 void gui_navigation_replace_static_screen(int snapshot_index, lv_obj_t * old_screen, lv_obj_t * new_screen);
-void gui_navigation_pop_to_depth(int target_depth);
 bool player_transition_cache_is_dirty(void);
 
 void gui_navigation_init(void);

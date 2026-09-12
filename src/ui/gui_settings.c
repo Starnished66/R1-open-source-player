@@ -12,7 +12,6 @@
 #include "subprocess.h"
 #include "timezone_apply.h"
 #include "gui_lyrics.h"
-#include "gui_lyrics.h"
 #include "screen_builders.h"
 #include "settings.h"
 #include "assets.h"
@@ -90,7 +89,6 @@ extern void nav_pop(void);
 extern void finalize_screen_navigation(lv_obj_t * screen);
 extern void show_error_toast(const char * msg);
 extern void show_info_toast(const char * msg);
-extern lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode, lv_obj_t ** out_title, const char * body_text, const char * confirm_text, lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row, const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb, lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
 extern lv_color_t accent_lv_color(void);
 extern lv_obj_t * add_pill_chevron_row(lv_obj_t * list, const char * text, lv_event_cb_t cb);
 extern lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);
@@ -360,13 +358,11 @@ static void eq_q_slider_event_cb(lv_event_t * e) {
     }
 }
 
-static lv_obj_t * firmware_update_popup;
-static lv_obj_t * firmware_update_popup_backdrop;
+static gui_popup_t firmware_update_popup;
 static lv_obj_t * firmware_update_popup_title;
 
 static void hide_firmware_update_popup(void) {
-    lv_obj_add_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(firmware_update_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&firmware_update_popup);
 }
 
 static void firmware_update_popup_backdrop_cb(lv_event_t * e) {
@@ -386,10 +382,10 @@ static void firmware_update_confirm_cb(lv_event_t * e) {
 }
 
 static void build_firmware_update_popup(void) {
-    firmware_update_popup = build_confirm_popup(
+    firmware_update_popup.popup = build_confirm_popup(
         "", LV_LABEL_LONG_WRAP, &firmware_update_popup_title, NULL, "Update & Reboot", lv_color_make(255, 120, 120),
         firmware_update_confirm_cb, NULL, "Cancel", accent_lv_color(), firmware_update_cancel_cb, NULL,
-        firmware_update_popup_backdrop_cb, &firmware_update_popup_backdrop);
+        firmware_update_popup_backdrop_cb, &firmware_update_popup.backdrop);
 }
 
 void firmware_update_row_cb(lv_event_t * e) {
@@ -406,10 +402,7 @@ void firmware_update_row_cb(lv_event_t * e) {
     lv_label_set_text_fmt(firmware_update_popup_title, "Update using %s?\nDevice will reboot into recovery mode.",
                            filename);
 
-    lv_obj_remove_flag(firmware_update_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(firmware_update_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(firmware_update_popup_backdrop);
-    lv_obj_move_foreground(firmware_update_popup);
+    gui_popup_show(&firmware_update_popup);
 }
 
 static void dev_options_row_cb(lv_event_t * e) {
@@ -509,20 +502,14 @@ static void populate_custom_font_screen(void) {
 
     /* 1. Default (built-in Montserrat) option */
     bool default_selected = (strcmp(active_name, "Default") == 0 || !current_settings.custom_font[0]);
-    lv_obj_t * def_row = add_pill_row_base(custom_font_list, "Default (Built-in)");
-    lv_obj_set_style_border_width(def_row, default_selected ? 3 : 0, 0);
-    lv_obj_set_style_border_color(def_row, accent_lv_color(), 0);
-    lv_obj_add_flag(def_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(def_row, custom_font_option_cb, LV_EVENT_CLICKED, (void *) (intptr_t) -1);
+    add_pill_option_row(custom_font_list, "Default (Built-in)",
+                        default_selected, custom_font_option_cb, (void *) (intptr_t) -1);
 
     /* 2. Discovered fonts from <SD>/Fonts */
     for (int i = 0; i < discovered_custom_font_count; i++) {
         bool selected = (strcmp(active_name, discovered_custom_fonts[i]) == 0);
-        lv_obj_t * row = add_pill_row_base(custom_font_list, discovered_custom_fonts[i]);
-        lv_obj_set_style_border_width(row, selected ? 3 : 0, 0);
-        lv_obj_set_style_border_color(row, accent_lv_color(), 0);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(row, custom_font_option_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
+        add_pill_option_row(custom_font_list, discovered_custom_fonts[i],
+                            selected, custom_font_option_cb, (void *) (intptr_t) i);
     }
 
     if (discovered_custom_font_count == 0) {
@@ -702,16 +689,7 @@ static void format_screen_timeout(char * buf, size_t buf_size, int seconds) {
 
 /* Index of the closest shared timeout preset. */
 static int screen_timeout_seconds_to_step_index(int seconds) {
-    int best = 0;
-    int best_diff = abs(seconds - SCREEN_TIMEOUT_STEPS[0]);
-    for (int i = 1; i < SCREEN_TIMEOUT_STEP_COUNT; i++) {
-        int diff = abs(seconds - SCREEN_TIMEOUT_STEPS[i]);
-        if (diff < best_diff) {
-            best_diff = diff;
-            best = i;
-        }
-    }
-    return best;
+    return find_nearest_step_index(SCREEN_TIMEOUT_STEPS, SCREEN_TIMEOUT_STEP_COUNT, seconds);
 }
 
 static void screen_timeout_switch_event_cb(lv_event_t * e) {
@@ -780,40 +758,16 @@ static lv_obj_t * build_screen_timeout_screen(void) {
 
     /* Rounded slider card with vertical clearance below the track for the
      * knob diameter and centered value label. */
-    screen_timeout_slider_card = lv_obj_create(scr);
-    lv_obj_set_size(screen_timeout_slider_card, lv_pct(90), BOARD_SCALE_PX(170));
-    lv_obj_align_to(screen_timeout_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
-    lv_obj_add_style(screen_timeout_slider_card, &style_theme_card_bg, 0);
-    lv_obj_set_style_border_width(screen_timeout_slider_card, 0, 0);
-    lv_obj_set_style_radius(screen_timeout_slider_card, 10, 0);
+    screen_timeout_slider_card = build_setting_slider_card(scr, enable_row, BOARD_SCALE_PX(170), BOARD_SCALE_PX(18),
+        0, SCREEN_TIMEOUT_STEP_COUNT - 1,
+        screen_timeout_seconds_to_step_index(current_settings.screen_timeout_seconds),
+        screen_timeout_slider_event_cb, &screen_timeout_slider, &screen_timeout_value_label);
     if (!current_settings.screen_timeout_enabled) lv_obj_add_flag(screen_timeout_slider_card, LV_OBJ_FLAG_HIDDEN);
-
-    screen_timeout_slider = lv_slider_create(screen_timeout_slider_card);
-    lv_obj_set_width(screen_timeout_slider, lv_pct(94));
-    lv_obj_set_height(screen_timeout_slider, SLIDER_TRACK_HEIGHT);
-    lv_obj_align(screen_timeout_slider, LV_ALIGN_TOP_MID, 0, 18);
-    lv_slider_set_range(screen_timeout_slider, 0, SCREEN_TIMEOUT_STEP_COUNT - 1);
-    lv_slider_set_value(screen_timeout_slider, screen_timeout_seconds_to_step_index(current_settings.screen_timeout_seconds), LV_ANIM_OFF);
-    lv_obj_add_style(screen_timeout_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(screen_timeout_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
-    lv_obj_set_style_width(screen_timeout_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_set_style_height(screen_timeout_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_add_event_cb(screen_timeout_slider, screen_timeout_slider_event_cb, LV_EVENT_ALL, NULL);
-    lv_obj_set_ext_click_area(screen_timeout_slider, 20);
-
-    screen_timeout_value_label = lv_label_create(screen_timeout_slider_card);
-    lv_obj_add_style(screen_timeout_value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(screen_timeout_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
-    lv_obj_align(screen_timeout_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     char initial_buf[32];
     format_screen_timeout(initial_buf, sizeof(initial_buf), current_settings.screen_timeout_seconds);
     lv_label_set_text(screen_timeout_value_label, initial_buf);
 
     finalize_screen_navigation(scr);
-    /* Remove gesture bubble from the card and register a swipe dead zone so
-     * touch drags intended for the slider do not trigger navigation gestures. */
-    lv_obj_remove_flag(screen_timeout_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    register_swipe_dead_zone(screen_timeout_slider_card);
     return scr;
 }
 
@@ -823,16 +777,7 @@ static void screen_timeout_row_cb(lv_event_t * e) {
 }
 
 static int screen_dim_delay_seconds_to_step_index(int seconds) {
-    int best = 0;
-    int best_diff = abs(seconds - SCREEN_DIM_DELAY_STEPS[0]);
-    for (int i = 1; i < SCREEN_DIM_DELAY_STEP_COUNT; i++) {
-        int diff = abs(seconds - SCREEN_DIM_DELAY_STEPS[i]);
-        if (diff < best_diff) {
-            best_diff = diff;
-            best = i;
-        }
-    }
-    return best;
+    return find_nearest_step_index(SCREEN_DIM_DELAY_STEPS, SCREEN_DIM_DELAY_STEP_COUNT, seconds);
 }
 
 static void screen_dimming_ui_switch_event_cb(lv_event_t * e) {
@@ -879,9 +824,9 @@ static void screen_dimming_screen_loaded_cb(lv_event_t * e) {
             effective_max_index = 0;
         }
     }
-    
+
     lv_slider_set_range(screen_dimming_slider, 0, effective_max_index);
-    
+
     int current_index = screen_dim_delay_seconds_to_step_index(current_settings.screen_dim_delay_seconds);
     if (current_index > effective_max_index) {
         current_settings.screen_dim_delay_seconds = SCREEN_DIM_DELAY_STEPS[effective_max_index];
@@ -923,38 +868,16 @@ static lv_obj_t * build_screen_dimming_screen(void) {
     if (current_settings.screen_dimming_enabled) lv_obj_add_state(screen_dimming_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(screen_dimming_switch, screen_dimming_ui_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    screen_dimming_slider_card = lv_obj_create(scr);
-    lv_obj_set_size(screen_dimming_slider_card, lv_pct(90), 170);
-    lv_obj_align_to(screen_dimming_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
-    lv_obj_add_style(screen_dimming_slider_card, &style_theme_card_bg, 0);
-    lv_obj_set_style_border_width(screen_dimming_slider_card, 0, 0);
-    lv_obj_set_style_radius(screen_dimming_slider_card, 10, 0);
+    screen_dimming_slider_card = build_setting_slider_card(scr, enable_row, BOARD_SCALE_PX(170), BOARD_SCALE_PX(18),
+        0, SCREEN_DIM_DELAY_STEP_COUNT - 1,
+        screen_dim_delay_seconds_to_step_index(current_settings.screen_dim_delay_seconds),
+        screen_dim_delay_slider_event_cb, &screen_dimming_slider, &screen_dimming_value_label);
     if (!current_settings.screen_dimming_enabled) lv_obj_add_flag(screen_dimming_slider_card, LV_OBJ_FLAG_HIDDEN);
-
-    screen_dimming_slider = lv_slider_create(screen_dimming_slider_card);
-    lv_obj_set_width(screen_dimming_slider, lv_pct(94));
-    lv_obj_set_height(screen_dimming_slider, SLIDER_TRACK_HEIGHT);
-    lv_obj_align(screen_dimming_slider, LV_ALIGN_TOP_MID, 0, 18);
-    lv_slider_set_range(screen_dimming_slider, 0, SCREEN_DIM_DELAY_STEP_COUNT - 1);
-    lv_slider_set_value(screen_dimming_slider, screen_dim_delay_seconds_to_step_index(current_settings.screen_dim_delay_seconds), LV_ANIM_OFF);
-    lv_obj_add_style(screen_dimming_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(screen_dimming_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
-    lv_obj_set_style_width(screen_dimming_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_set_style_height(screen_dimming_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_add_event_cb(screen_dimming_slider, screen_dim_delay_slider_event_cb, LV_EVENT_ALL, NULL);
-    lv_obj_set_ext_click_area(screen_dimming_slider, 20);
-
-    screen_dimming_value_label = lv_label_create(screen_dimming_slider_card);
-    lv_obj_add_style(screen_dimming_value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(screen_dimming_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
-    lv_obj_align(screen_dimming_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     char initial_buf[32];
     format_screen_timeout(initial_buf, sizeof(initial_buf), current_settings.screen_dim_delay_seconds);
     lv_label_set_text(screen_dimming_value_label, initial_buf);
 
     finalize_screen_navigation(scr);
-    lv_obj_remove_flag(screen_dimming_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    register_swipe_dead_zone(screen_dimming_slider_card);
     return scr;
 }
 
@@ -1025,40 +948,13 @@ static lv_obj_t * build_startup_volume_screen(void) {
     if (current_settings.startup_volume_fixed_enabled) lv_obj_add_state(startup_volume_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(startup_volume_switch, startup_volume_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    startup_volume_slider_card = lv_obj_create(scr);
-    lv_obj_set_size(startup_volume_slider_card, lv_pct(90), BOARD_SCALE_PX(170));
-    lv_obj_align_to(startup_volume_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
-    lv_obj_add_style(startup_volume_slider_card, &style_theme_card_bg, 0);
-    lv_obj_set_style_border_width(startup_volume_slider_card, 0, 0);
-    lv_obj_set_style_radius(startup_volume_slider_card, 10, 0);
+    startup_volume_slider_card = build_setting_slider_card(scr, enable_row, BOARD_SCALE_PX(170), BOARD_SCALE_PX(18),
+        0, 100, current_settings.startup_volume_fixed_percent,
+        startup_volume_slider_event_cb, &startup_volume_slider, &startup_volume_value_label);
     if (!current_settings.startup_volume_fixed_enabled) lv_obj_add_flag(startup_volume_slider_card, LV_OBJ_FLAG_HIDDEN);
-
-    startup_volume_slider = lv_slider_create(startup_volume_slider_card);
-    lv_obj_set_width(startup_volume_slider, lv_pct(94));
-    lv_obj_set_height(startup_volume_slider, SLIDER_TRACK_HEIGHT);
-    lv_obj_align(startup_volume_slider, LV_ALIGN_TOP_MID, 0, 18);
-    lv_slider_set_range(startup_volume_slider, 0, 100);
-    lv_slider_set_value(startup_volume_slider, current_settings.startup_volume_fixed_percent, LV_ANIM_OFF);
-    lv_obj_add_style(startup_volume_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(startup_volume_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
-    lv_obj_set_style_width(startup_volume_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_set_style_height(startup_volume_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_add_event_cb(startup_volume_slider, startup_volume_slider_event_cb, LV_EVENT_ALL, NULL);
-    lv_obj_set_ext_click_area(startup_volume_slider, 20);
-
-    startup_volume_value_label = lv_label_create(startup_volume_slider_card);
-    lv_obj_add_style(startup_volume_value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(startup_volume_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
-    lv_obj_align(startup_volume_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_label_set_text_fmt(startup_volume_value_label, "%d%%", current_settings.startup_volume_fixed_percent);
 
     finalize_screen_navigation(scr);
-    /* Same reasoning as screen_timeout_slider_card's identical line: don't
-     * let a drag that misses the slider bubble up as an app-wide swipe.
-     * Also registered as a player-swipe dead zone -- see
-     * register_swipe_dead_zone()'s own comment. */
-    lv_obj_remove_flag(startup_volume_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    register_swipe_dead_zone(startup_volume_slider_card);
     return scr;
 }
 
@@ -1070,16 +966,7 @@ static void startup_volume_row_cb(lv_event_t * e) {
 /* Index into SLEEP_TIMER_STEPS closest to `minutes' -- same reasoning as
  * screen_timeout_seconds_to_step_index() above. */
 static int sleep_timer_minutes_to_step_index(int minutes) {
-    int best = 0;
-    int best_diff = abs(minutes - SLEEP_TIMER_STEPS[0]);
-    for (int i = 1; i < SLEEP_TIMER_STEP_COUNT; i++) {
-        int diff = abs(minutes - SLEEP_TIMER_STEPS[i]);
-        if (diff < best_diff) {
-            best_diff = diff;
-            best = i;
-        }
-    }
-    return best;
+    return find_nearest_step_index(SLEEP_TIMER_STEPS, SLEEP_TIMER_STEP_COUNT, minutes);
 }
 
 /* Extracted from build_sleep_timer_screen() so it can be shared with its
@@ -1187,31 +1074,11 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     if (quick_drawer_sleep_timer_is_active()) lv_obj_add_state(sleep_timer_switch, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sleep_timer_switch, sleep_timer_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    sleep_timer_slider_card = lv_obj_create(scr);
-    lv_obj_set_size(sleep_timer_slider_card, lv_pct(90), BOARD_SCALE_PX(170));
-    lv_obj_align_to(sleep_timer_slider_card, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
-    lv_obj_add_style(sleep_timer_slider_card, &style_theme_card_bg, 0);
-    lv_obj_set_style_border_width(sleep_timer_slider_card, 0, 0);
-    lv_obj_set_style_radius(sleep_timer_slider_card, 10, 0);
+    sleep_timer_slider_card = build_setting_slider_card(scr, enable_row, BOARD_SCALE_PX(170), BOARD_SCALE_PX(18),
+        0, SLEEP_TIMER_STEP_COUNT - 1,
+        sleep_timer_minutes_to_step_index(current_settings.sleep_timer_minutes),
+        sleep_timer_slider_event_cb, &sleep_timer_slider, &sleep_timer_value_label);
     if (!quick_drawer_sleep_timer_is_active()) lv_obj_add_flag(sleep_timer_slider_card, LV_OBJ_FLAG_HIDDEN);
-
-    sleep_timer_slider = lv_slider_create(sleep_timer_slider_card);
-    lv_obj_set_width(sleep_timer_slider, lv_pct(94));
-    lv_obj_set_height(sleep_timer_slider, SLIDER_TRACK_HEIGHT);
-    lv_obj_align(sleep_timer_slider, LV_ALIGN_TOP_MID, 0, 18);
-    lv_slider_set_range(sleep_timer_slider, 0, SLEEP_TIMER_STEP_COUNT - 1);
-    lv_slider_set_value(sleep_timer_slider, sleep_timer_minutes_to_step_index(current_settings.sleep_timer_minutes), LV_ANIM_OFF);
-    lv_obj_add_style(sleep_timer_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(sleep_timer_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
-    lv_obj_set_style_width(sleep_timer_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_set_style_height(sleep_timer_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_add_event_cb(sleep_timer_slider, sleep_timer_slider_event_cb, LV_EVENT_ALL, NULL);
-    lv_obj_set_ext_click_area(sleep_timer_slider, 20);
-
-    sleep_timer_value_label = lv_label_create(sleep_timer_slider_card);
-    lv_obj_add_style(sleep_timer_value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(sleep_timer_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
-    lv_obj_align(sleep_timer_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     char duration_buf[32];
     format_sleep_timer_duration(duration_buf, sizeof(duration_buf), current_settings.sleep_timer_minutes);
     lv_label_set_text(sleep_timer_value_label, duration_buf);
@@ -1233,12 +1100,6 @@ static lv_obj_t * build_sleep_timer_screen(void) {
     lv_obj_center(remaining_label);
 
     finalize_screen_navigation(scr);
-    /* Same reasoning as screen_timeout_slider_card's identical line: don't
-     * let a drag that misses the slider bubble up as an app-wide swipe.
-     * Also registered as a player-swipe dead zone -- see
-     * register_swipe_dead_zone()'s own comment. */
-    lv_obj_remove_flag(sleep_timer_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    register_swipe_dead_zone(sleep_timer_slider_card);
     return scr;
 }
 
@@ -1259,16 +1120,7 @@ static void format_idle_shutdown(char * buf, size_t buf_size, int minutes) {
 }
 
 static int idle_shutdown_minutes_to_step_index(int minutes) {
-    int best = 0;
-    int best_diff = abs(minutes - IDLE_SHUTDOWN_STEPS[0]);
-    for (int i = 1; i < IDLE_SHUTDOWN_STEP_COUNT; i++) {
-        int diff = abs(minutes - IDLE_SHUTDOWN_STEPS[i]);
-        if (diff < best_diff) {
-            best_diff = diff;
-            best = i;
-        }
-    }
-    return best;
+    return find_nearest_step_index(IDLE_SHUTDOWN_STEPS, IDLE_SHUTDOWN_STEP_COUNT, minutes);
 }
 
 static void idle_shutdown_switch_event_cb(lv_event_t * e) {
@@ -1387,12 +1239,10 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
 
     /* Slider card positioned below idle_action_section. Sized at 200px height
      * to accommodate the explanatory caption above the slider. */
-    idle_shutdown_slider_card = lv_obj_create(scr);
-    lv_obj_set_size(idle_shutdown_slider_card, lv_pct(90), BOARD_SCALE_PX(200));
-    lv_obj_align_to(idle_shutdown_slider_card, idle_action_section, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
-    lv_obj_add_style(idle_shutdown_slider_card, &style_theme_card_bg, 0);
-    lv_obj_set_style_border_width(idle_shutdown_slider_card, 0, 0);
-    lv_obj_set_style_radius(idle_shutdown_slider_card, 10, 0);
+    idle_shutdown_slider_card = build_setting_slider_card(scr, idle_action_section, BOARD_SCALE_PX(200), BOARD_SCALE_PX(48),
+        0, IDLE_SHUTDOWN_STEP_COUNT - 1,
+        idle_shutdown_minutes_to_step_index(current_settings.idle_shutdown_minutes),
+        idle_shutdown_slider_event_cb, &idle_shutdown_slider, &idle_shutdown_value_label);
     if (!current_settings.idle_shutdown_enabled) lv_obj_add_flag(idle_shutdown_slider_card, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t * idle_shutdown_slider_caption = lv_label_create(idle_shutdown_slider_card);
@@ -1400,32 +1250,11 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_add_style(idle_shutdown_slider_caption, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(idle_shutdown_slider_caption, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
     lv_obj_align(idle_shutdown_slider_caption, LV_ALIGN_TOP_LEFT, 24, 14);
-
-    idle_shutdown_slider = lv_slider_create(idle_shutdown_slider_card);
-    lv_obj_set_width(idle_shutdown_slider, lv_pct(94));
-    lv_obj_set_height(idle_shutdown_slider, SLIDER_TRACK_HEIGHT);
-    lv_obj_align(idle_shutdown_slider, LV_ALIGN_TOP_MID, 0, 48);
-    lv_slider_set_range(idle_shutdown_slider, 0, IDLE_SHUTDOWN_STEP_COUNT - 1);
-    lv_slider_set_value(idle_shutdown_slider, idle_shutdown_minutes_to_step_index(current_settings.idle_shutdown_minutes), LV_ANIM_OFF);
-    lv_obj_add_style(idle_shutdown_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
-    lv_obj_add_style(idle_shutdown_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
-    lv_obj_set_style_width(idle_shutdown_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_set_style_height(idle_shutdown_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_add_event_cb(idle_shutdown_slider, idle_shutdown_slider_event_cb, LV_EVENT_ALL, NULL);
-    lv_obj_set_ext_click_area(idle_shutdown_slider, 20);
-
-    idle_shutdown_value_label = lv_label_create(idle_shutdown_slider_card);
-    lv_obj_add_style(idle_shutdown_value_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(idle_shutdown_value_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
-    lv_obj_align(idle_shutdown_value_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     char initial_buf[32];
     format_idle_shutdown(initial_buf, sizeof(initial_buf), current_settings.idle_shutdown_minutes);
     lv_label_set_text(idle_shutdown_value_label, initial_buf);
 
     finalize_screen_navigation(scr);
-    /* Prevent dragging or touching near the slider from bubbling up as a screen swipe. */
-    lv_obj_remove_flag(idle_shutdown_slider_card, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    register_swipe_dead_zone(idle_shutdown_slider_card);
     return scr;
 }
 
@@ -1621,17 +1450,11 @@ static lv_obj_t * build_music_playback_screen(void) {
                                     &settings_crossfade_toggle_img };
 
     int count = 3;
-    int plugin_count = plugin_manager_get_playback_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_PLAYBACK_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_playback_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_playback_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_playback_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium";
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_PLAYBACK_LIST_ITEMS,
+                                    plugin_manager_get_playback_list_item_count,
+                                    plugin_manager_get_playback_list_item_label,
+                                    plugin_manager_get_playback_list_item_options,
+                                    plugin_playback_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Playback", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -1644,17 +1467,11 @@ static lv_obj_t * build_music_audio_screen(void) {
     items[1] = (pill_list_item_t){ "Startup Volume", PILL_ACCESSORY_CHEVRON, false, startup_volume_row_cb, NULL, NULL };
 
     int count = 2;
-    int plugin_count = plugin_manager_get_music_audio_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_music_audio_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_music_audio_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_music_audio_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium";
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS,
+                                    plugin_manager_get_music_audio_list_item_count,
+                                    plugin_manager_get_music_audio_list_item_label,
+                                    plugin_manager_get_music_audio_list_item_options,
+                                    plugin_music_audio_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Audio", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -1670,17 +1487,11 @@ static lv_obj_t * build_music_controls_screen(void) {
                                     current_settings.lyrics_enabled, NULL, lyrics_switch_event_cb, NULL };
 
     int count = 3;
-    int plugin_count = plugin_manager_get_music_controls_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_music_controls_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_music_controls_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_music_controls_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium";
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS,
+                                    plugin_manager_get_music_controls_list_item_count,
+                                    plugin_manager_get_music_controls_list_item_label,
+                                    plugin_manager_get_music_controls_list_item_options,
+                                    plugin_music_controls_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Controls & Interface", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -1692,17 +1503,11 @@ static lv_obj_t * build_music_timers_screen(void) {
     items[0] = (pill_list_item_t){ "Sleep Timer", PILL_ACCESSORY_CHEVRON, false, sleep_timer_row_cb, NULL, NULL };
 
     int count = 1;
-    int plugin_count = plugin_manager_get_music_timers_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_music_timers_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_music_timers_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_music_timers_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium";
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS,
+                                    plugin_manager_get_music_timers_list_item_count,
+                                    plugin_manager_get_music_timers_list_item_label,
+                                    plugin_manager_get_music_timers_list_item_options,
+                                    plugin_music_timers_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Timers", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -1714,17 +1519,11 @@ static lv_obj_t * build_music_library_screen(void) {
     items[0] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
 
     int count = 1;
-    int plugin_count = plugin_manager_get_music_library_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_music_library_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_music_library_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_music_library_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium";
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS,
+                                    plugin_manager_get_music_library_list_item_count,
+                                    plugin_manager_get_music_library_list_item_label,
+                                    plugin_manager_get_music_library_list_item_options,
+                                    plugin_music_library_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Library", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -1791,17 +1590,11 @@ static lv_obj_t * build_settings_display_screen(void) {
                                     hide_player_topbar_switch_event_cb, NULL };
 
     int count = 8;
-    int plugin_count = plugin_manager_get_display_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_DISPLAY_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_display_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_display_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_display_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium";
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_DISPLAY_LIST_ITEMS,
+                                    plugin_manager_get_display_list_item_count,
+                                    plugin_manager_get_display_list_item_label,
+                                    plugin_manager_get_display_list_item_options,
+                                    plugin_display_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Display", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -1830,17 +1623,11 @@ static lv_obj_t * build_settings_power_screen(void) {
                                     current_settings.show_battery_percent, NULL, battery_percent_switch_event_cb, NULL };
 
     int count = 5;
-    int plugin_count = plugin_manager_get_power_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_POWER_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_power_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_power_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_power_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium";
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_POWER_LIST_ITEMS,
+                                    plugin_manager_get_power_list_item_count,
+                                    plugin_manager_get_power_list_item_label,
+                                    plugin_manager_get_power_list_item_options,
+                                    plugin_power_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Power", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -2020,17 +1807,11 @@ static lv_obj_t * build_settings_system_screen(void) {
     items[4] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
 
     int count = 5;
-    int plugin_count = plugin_manager_get_system_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SYSTEM_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_system_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_system_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_system_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium";
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_SYSTEM_LIST_ITEMS,
+                                    plugin_manager_get_system_list_item_count,
+                                    plugin_manager_get_system_list_item_label,
+                                    plugin_manager_get_system_list_item_options,
+                                    plugin_system_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("System", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -2083,17 +1864,11 @@ static lv_obj_t * build_settings_screen(void) {
     items[4] = (pill_list_item_t){ "About", PILL_ACCESSORY_CHEVRON, false, settings_about_row_cb, NULL, NULL };
 
     int count = 5;
-    int plugin_count = plugin_manager_get_settings_list_item_count();
-    for (int i = 0; i < plugin_count && i < PLUGIN_MAX_SETTINGS_LIST_ITEMS; i++) {
-        pill_list_item_t item = {
-            plugin_manager_get_settings_list_item_label(i), PILL_ACCESSORY_CHEVRON, false,
-            plugin_settings_list_item_click_cb, NULL, (void *) (intptr_t) i
-        };
-        const char * text_size = NULL;
-        plugin_manager_get_settings_list_item_options(i, &item.icon_asset, &item.row_height, &item.row_width, &text_size);
-        item.text_size = text_size ? text_size : "medium";
-        items[count++] = item;
-    }
+    count = append_plugin_list_rows(items, count, PLUGIN_MAX_SETTINGS_LIST_ITEMS,
+                                    plugin_manager_get_settings_list_item_count,
+                                    plugin_manager_get_settings_list_item_label,
+                                    plugin_manager_get_settings_list_item_options,
+                                    plugin_settings_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -2453,12 +2228,10 @@ static void refresh_all_eq_widgets(void) {
  * LVGL's lv_msgbox anywhere), since a factory reset of every band's
  * freq/gain/Q/type plus the preamp is not something a stray tap should be
  * able to trigger by accident. ---- */
-static lv_obj_t * eq_reset_popup;
-static lv_obj_t * eq_reset_popup_backdrop;
+static gui_popup_t eq_reset_popup;
 
 static void hide_eq_reset_popup(void) {
-    lv_obj_add_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(eq_reset_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&eq_reset_popup);
 }
 
 static void eq_reset_popup_backdrop_cb(lv_event_t * e) {
@@ -2483,17 +2256,14 @@ static void eq_reset_confirm_cb(lv_event_t * e) {
 
 static void eq_reset_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    lv_obj_remove_flag(eq_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(eq_reset_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(eq_reset_popup_backdrop);
-    lv_obj_move_foreground(eq_reset_popup);
+    gui_popup_show(&eq_reset_popup);
 }
 
 static void build_eq_reset_popup(void) {
-    eq_reset_popup = build_confirm_popup("Reset PEQ to defaults?", LV_LABEL_LONG_WRAP, NULL, NULL, "Reset",
-                                          lv_color_make(255, 120, 120), eq_reset_confirm_cb, NULL, "Cancel",
-                                          accent_lv_color(), eq_reset_cancel_cb, NULL, eq_reset_popup_backdrop_cb,
-                                          &eq_reset_popup_backdrop);
+    eq_reset_popup.popup = build_confirm_popup("Reset PEQ to defaults?", LV_LABEL_LONG_WRAP, NULL, NULL, "Reset",
+                                                lv_color_make(255, 120, 120), eq_reset_confirm_cb, NULL, "Cancel",
+                                                accent_lv_color(), eq_reset_cancel_cb, NULL, eq_reset_popup_backdrop_cb,
+                                                &eq_reset_popup.backdrop);
 }
 
 /* ---- Factory Reset, with a confirmation popup -- same hand-built
@@ -2504,12 +2274,10 @@ static void build_eq_reset_popup(void) {
  * settings file and returns -- see its own comment in settings.h for why
  * nothing here tries to hot-apply the reset settings instead of just
  * rebooting into them fresh). ---- */
-static lv_obj_t * factory_reset_popup;
-static lv_obj_t * factory_reset_popup_backdrop;
+static gui_popup_t factory_reset_popup;
 
 static void hide_factory_reset_popup(void) {
-    lv_obj_add_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(factory_reset_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&factory_reset_popup);
 }
 
 static void factory_reset_popup_backdrop_cb(lv_event_t * e) {
@@ -2530,28 +2298,23 @@ static void factory_reset_confirm_cb(lv_event_t * e) {
 
 static void factory_reset_btn_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    lv_obj_remove_flag(factory_reset_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(factory_reset_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(factory_reset_popup_backdrop);
-    lv_obj_move_foreground(factory_reset_popup);
+    gui_popup_show(&factory_reset_popup);
 }
 
 static void build_factory_reset_popup(void) {
-    factory_reset_popup = build_confirm_popup(
+    factory_reset_popup.popup = build_confirm_popup(
         "Reset all settings and reboot?", LV_LABEL_LONG_WRAP, NULL, NULL, "Reset", lv_color_make(255, 120, 120),
         factory_reset_confirm_cb, NULL, "Cancel", accent_lv_color(), factory_reset_cancel_cb, NULL,
-        factory_reset_popup_backdrop_cb, &factory_reset_popup_backdrop);
+        factory_reset_popup_backdrop_cb, &factory_reset_popup.backdrop);
 }
 
 /* Settings -> System -> Hostname uses the shared confirmation-popup helper;
  * see hostname_apply()'s own comment for why a reboot is genuinely required
  * here (wifi_on.sh/bt_init each only read their file once, on demand). */
-static lv_obj_t * hostname_reboot_popup;
-static lv_obj_t * hostname_reboot_popup_backdrop;
+static gui_popup_t hostname_reboot_popup;
 
 static void hide_hostname_reboot_popup(void) {
-    lv_obj_add_flag(hostname_reboot_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(hostname_reboot_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&hostname_reboot_popup);
 }
 
 static void hostname_reboot_popup_backdrop_cb(lv_event_t * e) {
@@ -2572,17 +2335,14 @@ static void hostname_reboot_now_cb(lv_event_t * e) {
 }
 
 static void show_hostname_reboot_popup(void) {
-    lv_obj_remove_flag(hostname_reboot_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(hostname_reboot_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(hostname_reboot_popup_backdrop);
-    lv_obj_move_foreground(hostname_reboot_popup);
+    gui_popup_show(&hostname_reboot_popup);
 }
 
 static void build_hostname_reboot_popup(void) {
-    hostname_reboot_popup = build_confirm_popup(
+    hostname_reboot_popup.popup = build_confirm_popup(
         "Restart now to apply the new hostname?", LV_LABEL_LONG_WRAP, NULL, NULL, "Restart Now", accent_lv_color(),
         hostname_reboot_now_cb, NULL, "Later", lv_color_make(160, 160, 160), hostname_reboot_later_cb, NULL,
-        hostname_reboot_popup_backdrop_cb, &hostname_reboot_popup_backdrop);
+        hostname_reboot_popup_backdrop_cb, &hostname_reboot_popup.backdrop);
 }
 
 /* RFC 952/1123 hostname-label charset -- letters/digits/hyphen only, no
@@ -2637,8 +2397,7 @@ static bool eq_profiles_edit_mode = false;
 static bool eq_profiles_replace_mode = false;
 static lv_obj_t * eq_profiles_edit_btn = NULL;
 static char eq_profile_pending_path[512];
-static lv_obj_t * eq_profile_delete_popup;
-static lv_obj_t * eq_profile_delete_popup_backdrop;
+static gui_popup_t eq_profile_delete_popup;
 
 static void eq_profiles_free_paths(void) {
     for (int i = 0; i < eq_profile_count; i++) free(eq_profile_paths[i]);
@@ -2712,8 +2471,7 @@ static void eq_profile_replace_row_cb(lv_event_t * e) {
 }
 
 static void hide_eq_profile_delete_popup(void) {
-    lv_obj_add_flag(eq_profile_delete_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(eq_profile_delete_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&eq_profile_delete_popup);
 }
 
 static void eq_profile_delete_popup_backdrop_cb(lv_event_t * e) {
@@ -2750,10 +2508,7 @@ static void eq_profile_delete_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     const char * path = (const char *) lv_event_get_user_data(e);
     snprintf(eq_profile_pending_path, sizeof(eq_profile_pending_path), "%s", path);
-    lv_obj_remove_flag(eq_profile_delete_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(eq_profile_delete_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(eq_profile_delete_popup_backdrop);
-    lv_obj_move_foreground(eq_profile_delete_popup);
+    gui_popup_show(&eq_profile_delete_popup);
 }
 
 static void eq_profile_rename_done_cb(const char * text, void * user_data) {
@@ -2867,10 +2622,10 @@ static void eq_profiles_edit_btn_cb(lv_event_t * e) {
 }
 
 static void build_eq_profile_delete_popup(void) {
-    eq_profile_delete_popup = build_confirm_popup("Delete this profile?", LV_LABEL_LONG_WRAP, NULL, NULL, "Delete",
-                                                   lv_color_make(255, 120, 120), eq_profile_delete_confirm_cb, NULL,
-                                                   "Cancel", accent_lv_color(), eq_profile_delete_cancel_cb, NULL,
-                                                   eq_profile_delete_popup_backdrop_cb, &eq_profile_delete_popup_backdrop);
+    eq_profile_delete_popup.popup = build_confirm_popup("Delete this profile?", LV_LABEL_LONG_WRAP, NULL, NULL, "Delete",
+                                                         lv_color_make(255, 120, 120), eq_profile_delete_confirm_cb, NULL,
+                                                         "Cancel", accent_lv_color(), eq_profile_delete_cancel_cb, NULL,
+                                                         eq_profile_delete_popup_backdrop_cb, &eq_profile_delete_popup.backdrop);
 }
 
 static lv_obj_t * build_eq_profiles_screen(void) {
@@ -2916,13 +2671,11 @@ static void eq_save_profile_name_done_cb(const char * text, void * user_data) {
  * overwrite, only a text box to name a new one. `eq_save_choice_prefill_current`
  * remembers which of those two triggered it, so "New Profile" opens the
  * right text-entry variant once the choice is made. */
-static lv_obj_t * eq_save_choice_popup;
-static lv_obj_t * eq_save_choice_popup_backdrop;
+static gui_popup_t eq_save_choice_popup;
 static bool eq_save_choice_prefill_current = false;
 
 static void eq_hide_save_choice_popup(void) {
-    lv_obj_add_flag(eq_save_choice_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(eq_save_choice_popup, LV_OBJ_FLAG_HIDDEN);
+    gui_popup_hide(&eq_save_choice_popup);
 }
 
 static void eq_save_choice_backdrop_cb(lv_event_t * e) {
@@ -2945,12 +2698,12 @@ static void eq_save_choice_replace_cb(lv_event_t * e) {
 }
 
 static void build_eq_save_choice_popup(void) {
-    eq_save_choice_popup = build_confirm_popup(
+    eq_save_choice_popup.popup = build_confirm_popup(
         "Save Profile", LV_LABEL_LONG_WRAP, NULL,
         "Save as a new profile, or replace one that already exists?",
         "Replace Existing", lv_color_make(255, 120, 120), eq_save_choice_replace_cb, NULL,
         "New Profile", accent_lv_color(), eq_save_choice_new_cb, NULL,
-        eq_save_choice_backdrop_cb, &eq_save_choice_popup_backdrop);
+        eq_save_choice_backdrop_cb, &eq_save_choice_popup.backdrop);
 }
 
 /* Shows the choice popup when there's at least one existing profile to
@@ -2972,10 +2725,7 @@ static void eq_open_save_choice_popup(bool prefill_current_name) {
     }
 
     eq_save_choice_prefill_current = prefill_current_name;
-    lv_obj_remove_flag(eq_save_choice_popup_backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(eq_save_choice_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(eq_save_choice_popup_backdrop);
-    lv_obj_move_foreground(eq_save_choice_popup);
+    gui_popup_show(&eq_save_choice_popup);
 }
 
 /* Save Profile: a quick tap saves in place; a deliberate hold opens the save
@@ -3263,49 +3013,43 @@ void gui_settings_init(void) {
  * build_confirm_popup()'s own comment), not as children of any of these
  * screens, so each needs its own explicit deletion. */
 void gui_settings_teardown(void) {
-    if (firmware_update_popup) { lv_obj_del(firmware_update_popup); firmware_update_popup = NULL; }
-    if (firmware_update_popup_backdrop) { lv_obj_del(firmware_update_popup_backdrop); firmware_update_popup_backdrop = NULL; }
-    if (eq_reset_popup) { lv_obj_del(eq_reset_popup); eq_reset_popup = NULL; }
-    if (eq_reset_popup_backdrop) { lv_obj_del(eq_reset_popup_backdrop); eq_reset_popup_backdrop = NULL; }
-    if (eq_profile_delete_popup) { lv_obj_del(eq_profile_delete_popup); eq_profile_delete_popup = NULL; }
-    if (eq_profile_delete_popup_backdrop) { lv_obj_del(eq_profile_delete_popup_backdrop); eq_profile_delete_popup_backdrop = NULL; }
-    if (eq_save_choice_popup) { lv_obj_del(eq_save_choice_popup); eq_save_choice_popup = NULL; }
-    if (eq_save_choice_popup_backdrop) { lv_obj_del(eq_save_choice_popup_backdrop); eq_save_choice_popup_backdrop = NULL; }
-    if (factory_reset_popup) { lv_obj_del(factory_reset_popup); factory_reset_popup = NULL; }
-    if (factory_reset_popup_backdrop) { lv_obj_del(factory_reset_popup_backdrop); factory_reset_popup_backdrop = NULL; }
-    if (hostname_reboot_popup) { lv_obj_del(hostname_reboot_popup); hostname_reboot_popup = NULL; }
-    if (hostname_reboot_popup_backdrop) { lv_obj_del(hostname_reboot_popup_backdrop); hostname_reboot_popup_backdrop = NULL; }
+    gui_popup_teardown(&firmware_update_popup);
+    gui_popup_teardown(&eq_reset_popup);
+    gui_popup_teardown(&eq_profile_delete_popup);
+    gui_popup_teardown(&eq_save_choice_popup);
+    gui_popup_teardown(&factory_reset_popup);
+    gui_popup_teardown(&hostname_reboot_popup);
 
-    if (about_screen) { lv_obj_del(about_screen); about_screen = NULL; }
-    if (dev_options_screen) { lv_obj_del(dev_options_screen); dev_options_screen = NULL; }
-    if (accent_color_screen) { lv_obj_del(accent_color_screen); accent_color_screen = NULL; }
-    if (custom_font_screen) { lv_obj_del(custom_font_screen); custom_font_screen = NULL; }
-    if (screen_timeout_screen) { lv_obj_del(screen_timeout_screen); screen_timeout_screen = NULL; }
-    if (screen_dimming_screen) { lv_obj_del(screen_dimming_screen); screen_dimming_screen = NULL; }
-    if (startup_volume_screen) { lv_obj_del(startup_volume_screen); startup_volume_screen = NULL; }
-    if (sleep_timer_screen) { lv_obj_del(sleep_timer_screen); sleep_timer_screen = NULL; }
-    if (idle_shutdown_screen) { lv_obj_del(idle_shutdown_screen); idle_shutdown_screen = NULL; }
-    if (timezone_region_screen) { lv_obj_del(timezone_region_screen); timezone_region_screen = NULL; }
-    if (clock_screen) { lv_obj_del(clock_screen); clock_screen = NULL; }
-    if (clock_set_time_screen) { lv_obj_del(clock_set_time_screen); clock_set_time_screen = NULL; }
+    if (about_screen) { lv_obj_delete(about_screen); about_screen = NULL; }
+    if (dev_options_screen) { lv_obj_delete(dev_options_screen); dev_options_screen = NULL; }
+    if (accent_color_screen) { lv_obj_delete(accent_color_screen); accent_color_screen = NULL; }
+    if (custom_font_screen) { lv_obj_delete(custom_font_screen); custom_font_screen = NULL; }
+    if (screen_timeout_screen) { lv_obj_delete(screen_timeout_screen); screen_timeout_screen = NULL; }
+    if (screen_dimming_screen) { lv_obj_delete(screen_dimming_screen); screen_dimming_screen = NULL; }
+    if (startup_volume_screen) { lv_obj_delete(startup_volume_screen); startup_volume_screen = NULL; }
+    if (sleep_timer_screen) { lv_obj_delete(sleep_timer_screen); sleep_timer_screen = NULL; }
+    if (idle_shutdown_screen) { lv_obj_delete(idle_shutdown_screen); idle_shutdown_screen = NULL; }
+    if (timezone_region_screen) { lv_obj_delete(timezone_region_screen); timezone_region_screen = NULL; }
+    if (clock_screen) { lv_obj_delete(clock_screen); clock_screen = NULL; }
+    if (clock_set_time_screen) { lv_obj_delete(clock_set_time_screen); clock_set_time_screen = NULL; }
     clock_hour_roller = clock_minute_roller = clock_ampm_roller = NULL;
     clock_set_time_row = NULL;
     clock_timezone_row = clock_timezone_value_label = NULL;
     /* Lazily built by open_timezone_city_screen() -- NULL until the user has
      * opened at least one region, same guard shape as every screen above. */
-    if (timezone_city_screen) { lv_obj_del(timezone_city_screen); timezone_city_screen = NULL; }
-    if (settings_music_screen) { lv_obj_del(settings_music_screen); settings_music_screen = NULL; }
-    if (music_playback_screen) { lv_obj_del(music_playback_screen); music_playback_screen = NULL; }
-    if (music_audio_screen) { lv_obj_del(music_audio_screen); music_audio_screen = NULL; }
-    if (music_controls_screen) { lv_obj_del(music_controls_screen); music_controls_screen = NULL; }
-    if (music_timers_screen) { lv_obj_del(music_timers_screen); music_timers_screen = NULL; }
-    if (music_library_screen) { lv_obj_del(music_library_screen); music_library_screen = NULL; }
-    if (settings_display_screen) { lv_obj_del(settings_display_screen); settings_display_screen = NULL; }
-    if (settings_power_screen) { lv_obj_del(settings_power_screen); settings_power_screen = NULL; }
-    if (settings_system_screen) { lv_obj_del(settings_system_screen); settings_system_screen = NULL; }
-    if (settings_screen) { lv_obj_del(settings_screen); settings_screen = NULL; }
-    if (eq_screen) { lv_obj_del(eq_screen); eq_screen = NULL; }
-    if (eq_profiles_screen) { lv_obj_del(eq_profiles_screen); eq_profiles_screen = NULL; }
+    if (timezone_city_screen) { lv_obj_delete(timezone_city_screen); timezone_city_screen = NULL; }
+    if (settings_music_screen) { lv_obj_delete(settings_music_screen); settings_music_screen = NULL; }
+    if (music_playback_screen) { lv_obj_delete(music_playback_screen); music_playback_screen = NULL; }
+    if (music_audio_screen) { lv_obj_delete(music_audio_screen); music_audio_screen = NULL; }
+    if (music_controls_screen) { lv_obj_delete(music_controls_screen); music_controls_screen = NULL; }
+    if (music_timers_screen) { lv_obj_delete(music_timers_screen); music_timers_screen = NULL; }
+    if (music_library_screen) { lv_obj_delete(music_library_screen); music_library_screen = NULL; }
+    if (settings_display_screen) { lv_obj_delete(settings_display_screen); settings_display_screen = NULL; }
+    if (settings_power_screen) { lv_obj_delete(settings_power_screen); settings_power_screen = NULL; }
+    if (settings_system_screen) { lv_obj_delete(settings_system_screen); settings_system_screen = NULL; }
+    if (settings_screen) { lv_obj_delete(settings_screen); settings_screen = NULL; }
+    if (eq_screen) { lv_obj_delete(eq_screen); eq_screen = NULL; }
+    if (eq_profiles_screen) { lv_obj_delete(eq_profiles_screen); eq_profiles_screen = NULL; }
     eq_profiles_edit_btn = NULL;
     eq_profiles_title_label = NULL;
     eq_profiles_free_paths();

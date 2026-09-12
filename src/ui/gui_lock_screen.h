@@ -26,9 +26,6 @@ bool gui_lock_screen_is_showing(void);
 /* Shows the lock screen with the specified options. Returns true on success. */
 bool gui_lock_screen_show(const gui_lock_screen_options_t * options);
 
-/* Hides the lock screen by popping it from the navigation stack. */
-void gui_lock_screen_hide(void);
-
 /* Drag-state recovery hooks for gui_navigation.c / gui.c */
 void gui_lock_screen_swipe_recover(void * ctx);
 void gui_lock_screen_reset_drag_state(void);

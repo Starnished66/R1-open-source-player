@@ -86,6 +86,8 @@ static void copy_song(const tagcache_song_t * src, song_row_t * dst) {
     snprintf(dst->tags.album, sizeof(dst->tags.album), "%s", src->album);
     snprintf(dst->tags.album_artist, sizeof(dst->tags.album_artist), "%s", src->album_artist);
     snprintf(dst->tags.genre, sizeof(dst->tags.genre), "%s", src->genre);
+    dst->tags.track_number = src->track_number;
+    dst->tags.disc_number = src->disc_number;
 }
 
 static void copy_group(const tagcache_group_t * src, group_row_t * dst) {

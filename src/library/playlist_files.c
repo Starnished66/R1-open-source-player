@@ -1,5 +1,6 @@
 #include "playlist_files.h"
 #include "path_cache.h"
+#include "library_endian.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -75,11 +76,6 @@ bool playlist_files_has_active_write(void) {
     return false;
 }
 
-static bool is_m3u_file(const char * name) {
-    const char * ext = strrchr(name, '.');
-    if (!ext) return false;
-    return strcasecmp(ext, ".m3u") == 0 || strcasecmp(ext, ".m3u8") == 0;
-}
 
 /* Directory a file lives in, i.e. everything before its last '/' -- same
  * split every m3u_path-consuming function here needs, pulled out once
@@ -234,7 +230,7 @@ static bool scan_dir(const char * dir_path, char *** paths, int * count, int * c
             if (!scan_dir(full_path, paths, count, capacity, depth + 1)) { ok = false; break; }
             continue;
         }
-        if (!S_ISREG(st.st_mode) || !is_m3u_file(de->d_name)) continue;
+        if (!S_ISREG(st.st_mode) || !library_is_m3u_file(de->d_name)) continue;
 
         if (*count == *capacity) {
             int new_capacity = *capacity ? *capacity * 2 : 64;
@@ -318,10 +314,7 @@ bool playlist_files_append(const char * path, const char * song_path) {
  * on any line short enough to fit in the buffer, and playlist_files_append()/
  * playlist_files_create() only ever write bare \n themselves, but a file
  * dropped onto the SD card by hand could have \r\n line endings. */
-static void trim_eol(char * line) {
-    size_t len = strlen(line);
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-}
+
 
 bool playlist_files_contains(const char * m3u_path, const char * song_path) {
     FILE * f = fopen(m3u_path, "r");
@@ -330,7 +323,7 @@ bool playlist_files_contains(const char * m3u_path, const char * song_path) {
     char line[PATH_MAX];
     bool found = false;
     while (fgets(line, sizeof(line), f)) {
-        trim_eol(line);
+        library_trim_eol(line);
         if (line[0] == '\0') continue;
 
         /* line may be an old-style absolute entry or a new-style relative
@@ -368,7 +361,7 @@ bool playlist_files_remove(const char * m3u_path, const char * song_path) {
 
     char line[PATH_MAX];
     while (fgets(line, sizeof(line), f)) {
-        trim_eol(line);
+        library_trim_eol(line);
         if (line[0] == '\0') continue; /* drop blank lines while rewriting anyway */
 
         /* Same absolute-vs-relative resolve needed here as
@@ -422,7 +415,7 @@ bool playlist_files_write_new(const char * dir, const char * name,
                               const char * const * paths, int count, char * out, size_t size) {
     if (!valid_playlist_name(name) || count < 0) return false;
     char path[PATH_MAX], temp[PATH_MAX];
-    if (snprintf(path, sizeof(path), "%s/%s%s", dir, name, is_m3u_file(name) ? "" : ".m3u") >= (int) sizeof(path) ||
+    if (snprintf(path, sizeof(path), "%s/%s%s", dir, name, library_is_m3u_file(name) ? "" : ".m3u") >= (int) sizeof(path) ||
         (out && strlen(path) >= size) ||
         snprintf(temp, sizeof(temp), "%s/.playlist-XXXXXX", dir) >= (int) sizeof(temp)) return false;
     pthread_mutex_lock(&playlist_files_mutex);
@@ -456,7 +449,7 @@ bool playlist_files_rename(const char * path, const char * name, char * out, siz
     char dir[PATH_MAX], dest[PATH_MAX];
     dir_of(path, dir, sizeof(dir));
     const char * ext = strrchr(path, '.');
-    if (snprintf(dest, sizeof(dest), "%s/%s%s", dir, name, is_m3u_file(name) ? "" : (ext ? ext : ".m3u")) >= (int) sizeof(dest) ||
+    if (snprintf(dest, sizeof(dest), "%s/%s%s", dir, name, library_is_m3u_file(name) ? "" : (ext ? ext : ".m3u")) >= (int) sizeof(dest) ||
         (out && strlen(dest) >= size)) return false;
     pthread_mutex_lock(&playlist_files_mutex);
     bool ok = strcmp(path, dest) == 0;
@@ -485,7 +478,7 @@ bool playlist_files_edit_entry(const char * path, int from, int to) {
     bool ok = f != NULL, bom = false;
     while (ok && getline(&line, &cap, f) >= 0) {
         char * text = line;
-        if (count == 0 && used == 0 && strncmp(text, "\357\273\277", 3) == 0) { text += 3; bom = true; }
+        if (count == 0 && used == 0 && library_utf8_bom_skip(text) == 3) { text += 3; bom = true; }
         if (strncmp(text, "#EXTM3U", 7) == 0) continue;
         size_t n = strlen(text);
         char * grown = realloc(pending, used + n + 1);
@@ -571,9 +564,9 @@ playlist_read_status_t playlist_files_read_ex(const char * path, char *** out_pa
     while ((length = getline(&line, &line_size, f)) >= 0) {
         if ((size_t) length != strlen(line)) { status = PLAYLIST_READ_INVALID; break; }
         char * entry = line;
-        if (first && strncmp(entry, "\357\273\277", 3) == 0) entry += 3;
+        if (first && library_utf8_bom_skip(entry) == 3) entry += 3;
         first = false;
-        trim_eol(entry);
+        library_trim_eol(entry);
         if (!entry[0] || entry[0] == '#') continue;
         char full[PATH_MAX], dir[PATH_MAX];
         dir_of(path, dir, sizeof(dir));
@@ -631,7 +624,7 @@ static bool migrate_one_file(const char * m3u_path) {
 
     char line[PATH_MAX];
     while (fgets(line, sizeof(line), in)) {
-        trim_eol(line);
+        library_trim_eol(line);
         if (line[0] == '\0' || line[0] == '#') continue;
 
         char full_path[PATH_MAX];
@@ -681,20 +674,4 @@ void playlist_files_migrate_to_relative(const char * dir) {
         fclose(marker);
         fsync_dir(dir);
     }
-}
-
-void playlist_files_index_replace(char * const * paths, int count) {
-    path_cache_replace(PATH_CACHE_PLAYLISTS, paths, count);
-}
-
-void playlist_files_index_load(char *** out_paths, int * out_count) {
-    path_cache_load(PATH_CACHE_PLAYLISTS, out_paths, out_count);
-}
-
-void playlist_files_index_insert(const char * path) {
-    path_cache_insert(PATH_CACHE_PLAYLISTS, path);
-}
-
-void playlist_files_index_delete(const char * path) {
-    path_cache_delete(PATH_CACHE_PLAYLISTS, path);
 }

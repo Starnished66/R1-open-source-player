@@ -54,7 +54,6 @@ typedef struct {
 
 bool tagcache_open(const char * dir);
 void tagcache_close(void);
-bool tagcache_is_open(void);
 /* True when the most recent tagcache_open() found no database_idx.tcd* file
  * at all (fresh SD card / first run), as opposed to one that loaded
  * successfully but is legitimately empty. */
@@ -90,15 +89,12 @@ int tagcache_album_song_ids(const char * album, const char * album_artist, int o
 
 void tagcache_set_rating(const char * path, int32_t rating);
 void tagcache_add_play(const char * path, int32_t now);
-void tagcache_flush_numeric(void);
 /* RAM-only overlay used when migrating sidecar stats onto a just-upserted
  * scan row. Persisted by the following end_update write. */
 void tagcache_overlay_stats(const char * path, int32_t rating, int32_t playcount, int32_t last_played);
 
 int32_t tagcache_title_rank_of_path(const char * path);
 int32_t tagcache_recency_rank_of_path(const char * path);
-/* First title-order rank strictly after (after_title, after_id). */
-int32_t tagcache_title_rank_after(const char * after_title, int32_t after_id);
 int tagcache_group_index(int kind, const char * name, const char * album_artist);
 
 int tagcache_cmp_ascii(const char * a, const char * b);

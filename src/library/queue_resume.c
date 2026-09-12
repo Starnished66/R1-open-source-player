@@ -1,4 +1,5 @@
 #include "queue_resume.h"
+#include "library_endian.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,8 +63,7 @@ bool queue_resume_write(const char * path, const queue_resume_t * s) {
         char dir[PATH_MAX]; snprintf(dir, sizeof(dir), "%s", path);
         char * slash = strrchr(dir, '/');
         if (slash) *slash = 0; else snprintf(dir, sizeof(dir), ".");
-        int dfd = open(dir, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { fsync(dfd); close(dfd); }
+        (void) library_fsync_dir(dir);
     }
     return ok;
 }

@@ -4,8 +4,8 @@
 #include <stdbool.h>
 
 /* Recursively scans root for .txt files, sorted alphabetically by full
- * path -- same contract as file_browser_scan_all_songs() (see its own
- * comment) for plain text files instead of audio, kept as a separate
+ * path -- same contract as file_browser.c's own recursive directory-scanning
+ * approach for plain text files instead of audio, kept as a separate
  * standalone scanner rather than generalizing file_browser.c's internals
  * (which are tightly coupled to playable-audio extensions and playlist
  * building, a different shape of problem than "list some files, open one

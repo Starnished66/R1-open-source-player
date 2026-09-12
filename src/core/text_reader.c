@@ -13,7 +13,7 @@ static bool is_txt_file(const char * name) {
 }
 
 /* Same depth-first, unsorted-until-the-end approach as
- * file_browser.c's scan_all_songs_recursive() -- see its own comment for
+ * file_browser.c's own recursive directory-scanning approach -- see its own comment for
  * why sorting per-directory would be wasted work. */
 #define TEXT_READER_SCAN_MAX_DEPTH 64
 static void scan_recursive(const char * dir_path, char *** paths, int * count, int * capacity, int depth) {

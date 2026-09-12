@@ -15,6 +15,7 @@
  * (`database_*.tcd.gN`) and atomically switches `tagcache.gen`. */
 
 #include "tagcache.h"
+#include "library_endian.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -32,6 +33,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+static void tagcache_flush_numeric(void);
 
 enum tag_type {
     tag_artist = 0,
@@ -1061,13 +1064,6 @@ static bool close_synced(int fd) {
     return ok;
 }
 
-static bool fsync_dir(const char * dir) {
-    int fd = open(dir, O_RDONLY | O_DIRECTORY);
-    if (fd < 0) return false;
-    bool ok = fsync(fd) == 0;
-    close(fd);
-    return ok;
-}
 
 static const int persist_tag_ids[] = { tag_artist,       tag_album,    tag_genre,     tag_albumartist, tag_composer,
                                        tag_comment,      tag_grouping, tag_virt_canonicalartist, tag_title, tag_filename };
@@ -1099,7 +1095,7 @@ static bool write_gen_pointer(int32_t gen) {
         unlink(tmp);
         return false;
     }
-    return fsync_dir(db_dir);
+    return library_fsync_dir(db_dir);
 }
 
 static bool read_gen_pointer(int32_t * out) {
@@ -1347,7 +1343,7 @@ static bool write_all(void) {
 
     int32_t previous_gen = 0;
     if (ok) read_gen_pointer(&previous_gen);
-    if (ok) ok = fsync_dir(db_dir);
+    if (ok) ok = library_fsync_dir(db_dir);
     if (ok) ok = write_gen_pointer(new_gen);
 
     if (!ok) {
@@ -1960,7 +1956,7 @@ static void numeric_flush_locked(void) {
     pthread_mutex_lock(&numeric_mutex);
 }
 
-void tagcache_flush_numeric(void) {
+static void tagcache_flush_numeric(void) {
     pthread_mutex_lock(&numeric_mutex);
     numeric_flush_locked();
     pthread_mutex_unlock(&numeric_mutex);
@@ -2149,10 +2145,6 @@ void tagcache_close(void) {
     opened_ok = false;
     disk_gen = 0;
     db_dir[0] = '\0';
-}
-
-bool tagcache_is_open(void) {
-    return db_open && opened_ok;
 }
 
 /* Returns true if the most recent tagcache_open() found no database files on disk. */
@@ -2377,26 +2369,6 @@ int32_t tagcache_recency_rank_of_path(const char * path) {
     int32_t idx = path_hash_find(path);
     if (idx < 0 || (ents[idx].flag & FLAG_DELETED) || !recency_rank_of) return -1;
     return recency_rank_of[idx];
-}
-
-int32_t tagcache_title_rank_after(const char * after_title, int32_t after_id) {
-    if (!after_title || !title_order || live_count <= 0) return 0;
-    int lo = 0, hi = (int) live_count;
-    while (lo < hi) {
-        int mid = lo + (hi - lo) / 2;
-        int32_t idx = title_order[mid];
-        int c = ascii_casecmp(entry_title_str(&ents[idx]), after_title);
-        if (c == 0) {
-            int32_t id = idx + 1;
-            if (id <= after_id) lo = mid + 1;
-            else hi = mid;
-        } else if (c < 0) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
 }
 
 int tagcache_group_index(int kind, const char * name, const char * album_artist) {

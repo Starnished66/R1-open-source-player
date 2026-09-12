@@ -1,4 +1,5 @@
 #include "cue_parser.h"
+#include "library_endian.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -121,7 +122,7 @@ bool cue_parse_file(const char * cue_path, cue_sheet_t * out) {
          * way, fgets() always NUL-terminates within the buffer, but a false
          * match there would wrongly eat that line's own first 3 real
          * characters). */
-        if (first_line && (unsigned char) p[0] == 0xEF && (unsigned char) p[1] == 0xBB && (unsigned char) p[2] == 0xBF) {
+        if (first_line && library_utf8_bom_skip(p) == 3) {
             p += 3;
         }
         first_line = false;

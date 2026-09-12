@@ -78,10 +78,10 @@ size_t system_get_mem_available_bytes(void) {
         if (sscanf(line, "MemAvailable: %lu kB", &mem_avail_kb) == 1) {
             found_avail = true;
             break;
-        } else if (sscanf(line, "MemFree: %lu kB", &mem_free_kb) == 1) {
-        } else if (sscanf(line, "Buffers: %lu kB", &buffers_kb) == 1) {
-        } else if (sscanf(line, "Cached: %lu kB", &cached_kb) == 1) {
         }
+        sscanf(line, "MemFree: %lu kB", &mem_free_kb);
+        sscanf(line, "Buffers: %lu kB", &buffers_kb);
+        sscanf(line, "Cached: %lu kB", &cached_kb);
     }
     fclose(f);
 

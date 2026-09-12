@@ -68,12 +68,17 @@ bool remote_track_meta_set_all(const remote_track_meta_t * entries, int count) {
 
 bool remote_track_meta_copy_for_path(const char * path, remote_track_meta_t * out) {
     if (!remote_track_path_is_remote(path)) return false;
-    char key[256];
+    const char * rest = path + 9; /* skip the "remote://" prefix already confirmed present */
+    const char * slash = strchr(rest, '/');
+    if (!slash) return false; /* malformed -- no provider/track_id separator */
+    size_t provider_len = (size_t) (slash - rest);
+    const char * track_id = slash + 1;
     bool found = false;
     pthread_mutex_lock(&remote_track_mutex);
     for (int i = 0; i < remote_track_table_count; i++) {
-        if (!remote_track_make_key(remote_track_table[i].provider, remote_track_table[i].track_id, key, sizeof(key))) continue;
-        if (strcmp(path, key) == 0) {
+        if (strlen(remote_track_table[i].provider) == provider_len &&
+            strncmp(remote_track_table[i].provider, rest, provider_len) == 0 &&
+            strcmp(remote_track_table[i].track_id, track_id) == 0) {
             *out = remote_track_table[i];
             found = true;
             break;

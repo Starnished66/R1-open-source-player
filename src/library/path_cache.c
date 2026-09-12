@@ -1,4 +1,5 @@
 #include "path_cache.h"
+#include "library_endian.h"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -102,8 +103,7 @@ static bool path_valid_for_list(const named_list_t * entry, const char * path) {
      * rows.  Older interrupted database builds could leave unrelated paths
      * in this sidecar; rejecting them while loading makes those devices
      * self-heal instead of presenting songs/albums as playlist rows forever. */
-    const char * ext = strrchr(path, '.');
-    return ext && (strcasecmp(ext, ".m3u") == 0 || strcasecmp(ext, ".m3u8") == 0);
+    return library_is_m3u_file(path);
 }
 
 static void list_load_file(named_list_t * entry) {
@@ -115,17 +115,17 @@ static void list_load_file(named_list_t * entry) {
     if (!f) return;
     char line[PATH_CACHE_PATH_MAX];
     while (fgets(line, sizeof(line), f)) {
-        size_t n = strlen(line);
+        size_t raw_len = strlen(line);
         /* A record longer than the fixed reader would otherwise be split
          * into several convincing-looking cache entries.  Discard its
          * remainder and the whole record. */
-        bool complete = n > 0 && line[n - 1] == '\n';
+        bool complete = raw_len > 0 && line[raw_len - 1] == '\n';
         if (!complete && !feof(f)) {
             int c;
             while ((c = fgetc(f)) != '\n' && c != EOF) {}
             continue;
         }
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        size_t n = library_trim_eol(line);
         if (n == 0 || !path_valid_for_list(entry, line)) continue;
         path_list_add(&entry->list, line);
     }
@@ -164,11 +164,7 @@ static void list_save_file(const named_list_t * entry) {
         unlink(tmp);
         return;
     }
-    int dfd = open(PATH_CACHE_DIR, O_RDONLY | O_DIRECTORY);
-    if (dfd >= 0) {
-        fsync(dfd);
-        close(dfd);
-    }
+    (void) library_fsync_dir(PATH_CACHE_DIR);
 }
 
 static void dup_sorted(const path_list_t * list, const path_list_t * filter, char *** out_paths, int * out_count) {

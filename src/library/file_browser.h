@@ -47,51 +47,29 @@ void file_browser_reset_to_root(void);
  * playable files (e.g. it was deleted/moved since). */
 bool file_browser_build_playlist_for_path(const char * path, char *** out_playlist, int * out_count, int * out_selected_index);
 
-/* Recursively scans every subdirectory of root for playable files, sorted
- * alphabetically by full path -- for library-wide views (e.g. "All Songs")
- * that aren't scoped to one directory the way the interactive browser
- * above is. Caller owns *out_paths (free each entry, then the array).
- * Returns false if root can't be read or has no playable files anywhere
- * under it.
- *
- * progress, if non-NULL, is incremented (not overwritten -- start it at 0)
- * after each lstat() returns, so a background caller can detect genuine
- * forward progress distinct from a hung readdir()/lstat() without needing
- * its own copy of the running count. */
-bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, atomic_int * progress);
-
 /* Bounded-memory library walk. Each playable file is delivered immediately
  * to cb; the path is valid only for the duration of the callback. Returning
  * false from cb stops the walk. out_count receives the number of songs
  * delivered. Memory use is bounded by the recursion stack + one PATH_MAX
  * buffer per active directory, independent of library size. */
 typedef bool (*file_browser_song_visit_cb_t)(const char * path, void * user);
-bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t cb, void * user,
-                                 int * out_count, atomic_int * progress);
 
 /* Database-oriented variant which prunes one immediate child directory of
- * root, case-insensitively.  Descendants with the same name elsewhere are
- * not skipped.  The ordinary walker above intentionally remains unfiltered
- * so Files, folder playback, and plugins retain Rockbox-like access to every
- * playable file on the card. */
+ * root, case-insensitively. Descendants with the same name elsewhere are
+ * not skipped. */
 bool file_browser_walk_all_songs_excluding_top_level(const char * root, const char * excluded_dir,
                                                      file_browser_song_visit_cb_t cb, void * user,
                                                      int * out_count, atomic_int * progress);
 
 /* Snapshot of the directory + on-screen row a file/playlist was last
- * tapped from, and a way to jump the browser back there -- for the
- * player's "List" option to reopen the folder a track was played from.
- * The getters are only meaningful right after a tap (same convention as
- * e.g. lv_event_get_user_data() being valid only within its own
- * callback), so gui.c must read them synchronously from its own
- * select_cb before returning. file_browser_navigate_to() points the
- * browser at `dir`, rebuilds its row list as if the user had tapped
- * their way there, and scrolls `row_to_reveal` (the exact value
- * file_browser_get_last_selected_row() returned) into view; both are
- * no-ops if file_browser_init() hasn't run yet. */
+ * tapped from -- for the player's "List" option to reopen the folder a
+ * track was played from. The getters are only meaningful right after a tap
+ * (same convention as e.g. lv_event_get_user_data() being valid only
+ * within its own callback), so gui.c must read them synchronously from its
+ * own select_cb before returning. Both return defaults if file_browser_init()
+ * hasn't run yet. */
 const char * file_browser_get_last_selected_dir(void);
 int file_browser_get_last_selected_row(void);
-void file_browser_navigate_to(const char * dir, int row_to_reveal);
 
 /* True when the browser is showing root_dir itself. */
 bool file_browser_at_root(void);

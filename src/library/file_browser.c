@@ -3,6 +3,7 @@
 #include "assets.h"
 #include "screen_builders.h" /* STATUS_BAR_CLEARANCE / TITLE_ROW_HEIGHT / LIST_ROW_* */
 #include "playlist_files.h" /* playlist_files_resolve_path() -- shared M3U line resolution */
+#include "library_endian.h"
 #include "fallback_font.h"
 
 #include <dirent.h>
@@ -36,7 +37,7 @@ static file_browser_cue_select_cb_t cue_select_cb;
  * file-only position select_cb receives) a file/playlist was last tapped
  * from -- set in entry_click_cb() right before invoking select_cb(), for
  * gui.c's player "List" option to later reopen the browser at that same
- * spot via file_browser_navigate_to(). */
+ * spot. */
 static char last_selected_dir[PATH_MAX];
 static int last_selected_row = -1;
 
@@ -56,11 +57,6 @@ static bool is_playable_file(const char * name) {
     return false;
 }
 
-static bool is_m3u_file(const char * name) {
-    const char * ext = strrchr(name, '.');
-    if (!ext) return false;
-    return strcasecmp(ext, ".m3u") == 0 || strcasecmp(ext, ".m3u8") == 0;
-}
 
 static bool is_cue_file(const char * name) {
     const char * ext = strrchr(name, '.');
@@ -114,7 +110,7 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
         if (stat(full_path, &st) != 0) continue;
 
         bool is_dir = S_ISDIR(st.st_mode);
-        bool is_playlist = !is_dir && is_m3u_file(de->d_name);
+        bool is_playlist = !is_dir && library_is_m3u_file(de->d_name);
         /* Only shown at all if a caller actually wants .cue sheets (see
          * file_browser_init()'s own comment) -- a caller with cue_select_cb
          * == NULL never sees them, same as any other file type this
@@ -131,7 +127,6 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
         }
 
         utf8_truncate_safe(result[count].name, de->d_name, sizeof(result[count].name));
-        utf8_sanitize(result[count].name);
         result[count].is_dir = is_dir;
         result[count].is_playlist = is_playlist;
         result[count].is_cue = is_cue;
@@ -303,62 +298,8 @@ static void rebuild_list(void) {
     }
 }
 
-/* Recursively scans directories up to SCAN_ALL_SONGS_MAX_DEPTH. Uses lstat()
- * and rejects symlinks (both directories and files) to prevent recursion loops
- * and path traversal outside the music root. Entries are visited in readdir()
- * order since the final result is sorted by full path. */
+/* Maximum directory recursion depth when walking song directories. */
 #define SCAN_ALL_SONGS_MAX_DEPTH 64
-static void scan_all_songs_recursive(const char * dir_path, char *** paths, int * count, int * capacity, int depth,
-                                      atomic_int * progress) {
-    if (depth > SCAN_ALL_SONGS_MAX_DEPTH) return;
-
-    DIR * dir = opendir(dir_path);
-    if (!dir) return;
-
-    struct dirent * de;
-    while ((de = readdir(dir)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-
-        char full_path[PATH_MAX];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, de->d_name);
-
-        struct stat st;
-        bool stat_ok = lstat(full_path, &st) == 0;
-        /* Incremented after each lstat() returns, for every entry examined
-         * (not just playable files), so callers can distinguish a long
-         * stretch of non-music entries from a hung lstat(). Placed after
-         * the call so a stuck lstat() is not counted as progress. */
-        if (progress) atomic_fetch_add_explicit(progress, 1, memory_order_relaxed);
-        if (!stat_ok) continue;
-        /* Reject symlinks to prevent path traversal outside the music root. */
-        if (S_ISLNK(st.st_mode)) continue;
-
-        if (S_ISDIR(st.st_mode)) {
-            scan_all_songs_recursive(full_path, paths, count, capacity, depth + 1, progress);
-            continue;
-        }
-        if (!is_playable_file(de->d_name)) continue;
-
-        if (*count == *capacity) {
-            /* Safely reallocate paths array; stop collecting entries on failure. */
-            int new_capacity = *capacity ? *capacity * 2 : 64;
-            char ** grown = realloc(*paths, sizeof(char *) * (size_t) new_capacity);
-            if (!grown) break;
-            *paths = grown;
-            *capacity = new_capacity;
-        }
-        (*paths)[*count] = strdup(full_path);
-        (*count)++;
-    }
-
-    closedir(dir);
-}
-
-static int compare_paths(const void * a, const void * b) {
-    const char * const * pa = (const char * const *) a;
-    const char * const * pb = (const char * const *) b;
-    return strcasecmp(*pa, *pb);
-}
 
 
 /* Bounded-memory variant used by the database scanner. Does not sort:
@@ -411,11 +352,6 @@ static bool walk_all_songs_recursive(const char * dir_path, file_browser_song_vi
     return keep_going;
 }
 
-bool file_browser_walk_all_songs(const char * root, file_browser_song_visit_cb_t cb, void * user,
-                                 int * out_count, atomic_int * progress) {
-    return file_browser_walk_all_songs_excluding_top_level(root, NULL, cb, user, out_count, progress);
-}
-
 bool file_browser_walk_all_songs_excluding_top_level(const char * root, const char * excluded_dir,
                                                      file_browser_song_visit_cb_t cb, void * user,
                                                      int * out_count, atomic_int * progress) {
@@ -423,24 +359,6 @@ bool file_browser_walk_all_songs_excluding_top_level(const char * root, const ch
     bool completed = walk_all_songs_recursive(root, cb, user, &count, 0, progress, excluded_dir);
     if (out_count) *out_count = count;
     return completed;
-}
-
-bool file_browser_scan_all_songs(const char * root, char *** out_paths, int * out_count, atomic_int * progress) {
-    char ** paths = NULL;
-    int count = 0;
-    int capacity = 0;
-
-    scan_all_songs_recursive(root, &paths, &count, &capacity, 0, progress);
-
-    if (count == 0) {
-        free(paths);
-        return false;
-    }
-
-    qsort(paths, (size_t) count, sizeof(char *), compare_paths);
-    *out_paths = paths;
-    *out_count = count;
-    return true;
 }
 
 void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select_cb_t on_select,
@@ -497,23 +415,6 @@ int file_browser_get_last_selected_row(void) {
     return last_selected_row;
 }
 
-/* row_to_reveal is the raw entries[] index (same value
- * file_browser_get_last_selected_row() returned), not a file-only
- * position -- rebuild_list() prepends a "Back" row whenever current_dir
- * isn't root_dir, shifting every entries[] row down by one on screen, so
- * that offset is added here to land on the right actual child. */
-void file_browser_navigate_to(const char * dir, int row_to_reveal) {
-    if (!list) return; /* gui_library_get_files_screen() not built yet */
-    snprintf(current_dir, sizeof(current_dir), "%s", dir);
-    scan_current_dir();
-    rebuild_list();
-    if (row_to_reveal < 0) return;
-    int child_index = row_to_reveal + (strlen(current_dir) > strlen(root_dir) ? 1 : 0);
-    lv_obj_update_layout(list);
-    if (child_index < (int) lv_obj_get_child_count(list)) {
-        lv_obj_scroll_to_view(lv_obj_get_child(list, child_index), LV_ANIM_OFF);
-    }
-}
 
 bool file_browser_build_playlist_for_path(const char * path, char *** out_playlist, int * out_count, int * out_selected_index) {
     const char * slash = strrchr(path, '/');

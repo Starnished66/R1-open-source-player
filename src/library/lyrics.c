@@ -1,4 +1,5 @@
 #include "lyrics.h"
+#include "library_endian.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -210,7 +211,7 @@ bool lyrics_parse_buffer(const char * buf, size_t len, lyrics_doc_t * out) {
     if (!buf || !out || len == 0 || len > LYRICS_MAX_FILE_BYTES) return false;
 
     size_t pos = 0;
-    if (len >= 3 && (unsigned char) buf[0] == 0xEF && (unsigned char) buf[1] == 0xBB && (unsigned char) buf[2] == 0xBF) pos = 3;
+    if (len >= 3 && library_utf8_bom_skip(buf) == 3) pos = 3;
 
     line_builder_t b = { 0 };
     long offset_ms = 0;

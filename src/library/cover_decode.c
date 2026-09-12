@@ -776,6 +776,35 @@ static void jpeg_libjpeg_scaled_dims(int native_w, int native_h, int target_w, i
 }
 
 
+/* Standard CRC-32/ISO-HDLC (the same algorithm PNG, zlib, and gzip all use),
+ * computed bit-by-bit rather than via a lookup table -- this only ever runs
+ * once per chunk on cover-art-sized files, not in a per-pixel hot loop, so
+ * the table's flash footprint isn't worth trading for speed here. */
+static uint32_t png_crc32(const uint8_t * buf, size_t len) {
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int k = 0; k < 8; k++) {
+            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320U : (crc >> 1);
+        }
+    }
+    return crc ^ 0xFFFFFFFFU;
+}
+
+/* Verifies a chunk's trailing 4-byte CRC-32, computed (per PNG spec) over
+ * its 4-byte type field plus its chunk_len-byte payload -- NOT including
+ * the preceding 4-byte length field. Caller must have already established
+ * that scan_pos+12+chunk_len <= size (the same bound every chunk in
+ * decode_png_streaming()'s parse loop is already checked against). */
+static bool png_chunk_crc_ok(const uint8_t * data, uint32_t scan_pos, uint32_t chunk_len) {
+    uint32_t computed = png_crc32(data + scan_pos + 4, 4 + (size_t) chunk_len);
+    uint32_t stored = ((uint32_t) data[scan_pos + 8 + chunk_len] << 24) |
+                      ((uint32_t) data[scan_pos + 9 + chunk_len] << 16) |
+                      ((uint32_t) data[scan_pos + 10 + chunk_len] << 8) |
+                      data[scan_pos + 11 + chunk_len];
+    return computed == stored;
+}
+
 static inline uint8_t paeth_predictor(int a, int b, int c) {
     int p = a + b - c;
     int pa = abs(p - a);
@@ -799,6 +828,7 @@ static inline uint8_t paeth_predictor(int a, int b, int c) {
  * cropping of its own. */
 static cover_decode_result_t decode_png_streaming(const uint8_t * data, uint32_t size, size_t max_side,
                                                    int target_w, int target_h,
+                                                   artwork_cancel_fn cancel_cb, void * user_data,
                                                    uint8_t ** out_buf, int * out_w, int * out_h) {
     if (size < 8 + 25) return COVER_DECODE_FAIL_UNSUPPORTED;
     if (memcmp(data, "\x89PNG\r\n\x1a\n", 8) != 0) return COVER_DECODE_FAIL_UNSUPPORTED;
@@ -806,7 +836,7 @@ static cover_decode_result_t decode_png_streaming(const uint8_t * data, uint32_t
     int native_w = 0, native_h = 0;
     uint8_t bit_depth = 0, color_type = 0, compression_method = 0, filter_method = 0, interlace_method = 0;
     uint64_t total_idat_size = 0;
-    bool found_ihdr = false;
+    bool found_ihdr = false, found_iend = false;
 
     /* Parse chunks. Every bound check below is subtraction-based against the
      * bytes actually remaining in `data` (never an addition on
@@ -835,6 +865,7 @@ static cover_decode_result_t decode_png_streaming(const uint8_t * data, uint32_t
 
         if (memcmp(type, "IHDR", 4) == 0) {
             if (scan_pos != 8 || found_ihdr || chunk_len < 13) return COVER_DECODE_FAIL_UNSUPPORTED;
+            if (!png_chunk_crc_ok(data, scan_pos, chunk_len)) return COVER_DECODE_FAIL_UNSUPPORTED;
             native_w = (int) (((uint32_t) data[scan_pos + 8] << 24) | ((uint32_t) data[scan_pos + 9] << 16) |
                               ((uint32_t) data[scan_pos + 10] << 8) | data[scan_pos + 11]);
             native_h = (int) (((uint32_t) data[scan_pos + 12] << 24) | ((uint32_t) data[scan_pos + 13] << 16) |
@@ -847,14 +878,23 @@ static cover_decode_result_t decode_png_streaming(const uint8_t * data, uint32_t
             found_ihdr = true;
         } else if (memcmp(type, "IDAT", 4) == 0) {
             if (!found_ihdr) return COVER_DECODE_FAIL_UNSUPPORTED;
+            if (!png_chunk_crc_ok(data, scan_pos, chunk_len)) return COVER_DECODE_FAIL_UNSUPPORTED;
             total_idat_size += chunk_len;
         } else if (memcmp(type, "IEND", 4) == 0) {
+            if (!png_chunk_crc_ok(data, scan_pos, chunk_len)) return COVER_DECODE_FAIL_UNSUPPORTED;
+            found_iend = true;
             break;
         }
         scan_pos += 12 + chunk_len;
     }
 
-    if (!found_ihdr || total_idat_size == 0) return COVER_DECODE_FAIL_UNSUPPORTED;
+    /* Requiring IEND (not just "ran out of chunks to scan") rejects a file
+     * that happens to decompress enough IDAT bytes to fill every row but
+     * was truncated before ever reaching its real end -- CRC-checking IHDR/
+     * IDAT/IEND individually (above) catches a corrupted-but-still-valid-
+     * looking chunk; this catches the file being cut off between chunks
+     * instead of within one. */
+    if (!found_ihdr || !found_iend || total_idat_size == 0) return COVER_DECODE_FAIL_UNSUPPORTED;
     /* PNG spec: compression method and filter method are both always 0 --
      * any other value isn't a real PNG, so reject at header parse rather
      * than relying on the zlib/filter-byte handling below to eventually
@@ -952,6 +992,23 @@ static cover_decode_result_t decode_png_streaming(const uint8_t * data, uint32_t
     int status = TINFL_STATUS_NEEDS_MORE_INPUT;
 
     while (current_y < (uint32_t) native_h) {
+        /* Unlike every other decoder in this file (tjpgd, the libjpeg
+         * fallback, lodepng), this one can be asked to process up to
+         * MAX_PNG_STREAMING_NATIVE_SIDE (8192) pixels on a side -- real CPU
+         * time on this device's class of hardware, not the near-instant
+         * decode a <=1200px cap always was. Checking cancellation only
+         * before/after the whole decode (cover_decode_to_rgb565_ex()'s own
+         * artwork_coordinator_should_yield() calls) would let a cancelled
+         * request keep holding the coordinator's decode slot for that
+         * entire duration; checking once per outer-loop iteration here
+         * (naturally bounded by how much of the 32KB tinfl window each
+         * pass drains, so this can't fire excessively often) bails out
+         * promptly instead. */
+        if (cancel_cb && cancel_cb(user_data)) {
+            result = COVER_DECODE_FAIL_CANCELLED;
+            break;
+        }
+
         size_t in_bytes = (size_t) (total_idat_size - in_pos);
         size_t out_bytes = TINFL_LZ_DICT_SIZE - dict_ofs;
 
@@ -1338,6 +1395,7 @@ cover_decode_result_t cover_decode_to_rgb565_ex(const uint8_t * data, uint32_t s
                                              &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_PNG_STREAMING) {
         dec_res = decode_png_streaming(data, size, max_side, target_w, target_h,
+                                       cancel_cb, user_data,
                                        &native_buf, &decoded_w, &decoded_h);
     } else if (fmt == ARTWORK_FORMAT_PNG) {
         dec_res = decode_png_rgb888(data, size, max_side, &native_buf, &decoded_w, &decoded_h);

@@ -138,7 +138,12 @@ bool jpeg_probe(const uint8_t * data, uint32_t size, jpeg_probe_t * result);
  * progressive alike) may be up to 4096px as long as scaled RGB888 <= 1200px
  * -- progressive's real, dimension-dependent coefficient-buffer cost is
  * billed separately through memory admission (coeff_bytes), not capped by
- * dimension alone; PNG/BMP still reject native dimensions exceeding 1200px.
+ * dimension alone; BMP still rejects native dimensions exceeding 1200px, and
+ * so does PNG UNLESS it's non-interlaced, 8- or 16-bit, RGB/RGBA (color
+ * type 2/6) -- that case instead streams (decode_png_streaming()) up to
+ * MAX_PNG_STREAMING_NATIVE_SIDE (8192px) at bounded memory, since it can
+ * downscale during decode the way JPEG already does; everything else
+ * (interlaced, palette, grayscale, other bit depths) keeps the 1200px cap.
  * Serialized through the process-wide artwork decode coordinator with memory admission. */
 bool cover_decode_to_rgb565(const uint8_t * data, uint32_t size, int target_w, int target_h,
                             uint16_t ** out_pixels);

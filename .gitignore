@@ -161,4 +161,12 @@ grok-albumart.md
 claude-albumart.md
 gemini-albumart.md
 png_red_1300.png
-src/library/cover_decode_scale_test.c
+
+# Fixture-only data for cover_decode_scale_test.c (raw PNG/JPEG byte arrays),
+# never included outside that test file and not part of APP_SRCS / `make
+# target` -- same "local-only from here forward" treatment as the *_test.c
+# rule above, and same caveat: gitignore never affects files git already
+# tracks; `git rm --cached` them too if the intent is to stop tracking those
+# as well.
+src/library/png_fixtures.h
+src/library/cover_decode_jpeg_fixtures.h

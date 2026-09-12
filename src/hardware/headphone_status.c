@@ -9,22 +9,8 @@
 #define HEADSET_SWITCH_STATE_PATH "/sys/devices/virtual/switch/headset/state"
 #define BALANCED_SWITCH_STATE_PATH "/sys/devices/virtual/switch/balance/state"
 
-
-// returns true if headset 3.5mm jack is plugged in
-bool headset_is_connected(void) {
-    FILE * f = fopen(HEADSET_SWITCH_STATE_PATH, "r");
-    if (!f) return false;
-
-    char buf[8] = {0};
-    bool ok = fgets(buf, (int) sizeof(buf), f) != NULL;
-    fclose(f);
-
-    return ok && buf[0] == '1';
-}
-
-// returns true if balanced 4.4mm jack is plugged in
-bool balanced_is_connected(void) {
-    FILE * f = fopen(BALANCED_SWITCH_STATE_PATH, "r");
+static bool switch_is_active(const char * path) {
+    FILE * f = fopen(path, "r");
     if (!f) return false;
 
     char buf[8] = {0};
@@ -37,9 +23,9 @@ bool balanced_is_connected(void) {
 // returns which headphone output is plugged in
 // if 3.5mm and 4.4mm are both plugged in, 4.4mm is prioritized
 enum HEADPHONE_STATE get_headphone_state(void) {
-	if (balanced_is_connected()) {
+	if (switch_is_active(BALANCED_SWITCH_STATE_PATH)) {
 		return HEADPHONE_STATE_BALANCED;
-	} else if (headset_is_connected()) {
+	} else if (switch_is_active(HEADSET_SWITCH_STATE_PATH)) {
 		return HEADPHONE_STATE_HEADSET;
 	}
 

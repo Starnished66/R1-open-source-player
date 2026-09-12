@@ -54,7 +54,6 @@
 #include "bt_media_player.h"
 #endif
 #include "headphone_status.h"
-#include "usb_audio_output.h"
 #include "plugin_manager.h"
 #include "gui_plugin_manage.h"
 #include "led_control.h"

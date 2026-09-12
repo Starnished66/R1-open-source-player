@@ -261,9 +261,9 @@ void charge_limiter_poll(bool enabled, bool force) {
 #endif
 }
 
-bool charge_limiter_is_voltage_limited(void) { return voltage_limited; }
+bool charge_limiter_is_holding(void) { return voltage_limited; }
 
-bool charge_limiter_is_charge_complete(void) {
+bool charge_limiter_is_confirmed_off(void) {
 #if CHARGE_LIMITER_ACTIVE
     if (!voltage_limited) return false;
 #if HAS_MP2731
@@ -282,9 +282,6 @@ bool charge_limiter_is_charge_complete(void) {
 #endif
     return false;
 }
-
-bool charge_limiter_is_holding(void) { return charge_limiter_is_voltage_limited(); }
-bool charge_limiter_is_confirmed_off(void) { return charge_limiter_is_charge_complete(); }
 
 void safe_charging_poll(bool enabled, bool force) {
 #if !CHARGE_LIMITER_ACTIVE

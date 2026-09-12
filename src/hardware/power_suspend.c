@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,21 +83,21 @@ static void log_suspend_diagnostics(uint32_t slept_ms, bool suspend_write_ok) {
 }
 #endif /* TEST_BUILD_TAG */
 
-typedef struct {
-    bool wifi_was_on;
-    bool bt_was_on;
-} radio_restore_args_t;
+static void radio_restore_perform(bool wifi_was_on, bool bt_was_on) {
+    if (bt_was_on) {
+        bt_control_init_chip();
+        bt_control_enable();
+    }
+    if (wifi_was_on) wifi_control_enable();
+}
 
 /* Restores Bluetooth and Wi-Fi in a detached thread after resume so that
  * the caller and display unblank are not blocked by radio re-initialization. */
 static void * radio_restore_thread_func(void * arg) {
-    radio_restore_args_t * args = (radio_restore_args_t *) arg;
-    if (args->bt_was_on) {
-        bt_control_init_chip();
-        bt_control_enable();
-    }
-    if (args->wifi_was_on) wifi_control_enable();
-    free(args);
+    uintptr_t flags = (uintptr_t) arg;
+    bool wifi_was_on = flags & 1;
+    bool bt_was_on = flags & 2;
+    radio_restore_perform(wifi_was_on, bt_was_on);
     return NULL;
 }
 
@@ -130,11 +131,12 @@ void power_suspend_now(void) {
     write_sysfs("/sys/class/graphics/fb0/blank", "0"); /* FB_BLANK_UNBLANK */
 
     if (bt_was_on || wifi_was_on) {
-        radio_restore_args_t * args = malloc(sizeof(*args));
-        args->wifi_was_on = wifi_was_on;
-        args->bt_was_on = bt_was_on;
+        uintptr_t flags = (wifi_was_on ? 1u : 0u) | (bt_was_on ? 2u : 0u);
         pthread_t restore_thread;
-        pthread_create(&restore_thread, NULL, radio_restore_thread_func, args);
-        pthread_detach(restore_thread);
+        if (pthread_create(&restore_thread, NULL, radio_restore_thread_func, (void *)(uintptr_t) flags) == 0) {
+            pthread_detach(restore_thread);
+        } else {
+            radio_restore_perform(wifi_was_on, bt_was_on);
+        }
     }
 }

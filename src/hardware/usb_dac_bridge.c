@@ -67,6 +67,8 @@ void usb_dac_bridge_set_debug_log_enabled(bool enabled) {
     }
 }
 
+static uint64_t monotonic_ns(void);
+
 static void bridge_log(const char * fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -98,9 +100,7 @@ static void bridge_log(const char * fmt, ...) {
         }
     }
 
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now_ms = (uint64_t) ts.tv_sec * 1000ULL + (uint64_t) ts.tv_nsec / 1000000ULL;
+    uint64_t now_ms = monotonic_ns() / 1000000ULL;
     fprintf(bridge_log_file, "[usb_dac_bridge] t=%llu ", (unsigned long long) now_ms);
 
     va_start(ap, fmt);
@@ -217,6 +217,8 @@ static unsigned int snap_to_standard_rate(double measured_rate) {
         if (best_diff < 0 || diff < best_diff) {
             best_diff = diff;
             best = STANDARD_RATES[i];
+        } else if (diff > best_diff) {
+            break;
         }
     }
     return best;

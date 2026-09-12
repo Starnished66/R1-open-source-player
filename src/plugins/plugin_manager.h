@@ -26,13 +26,13 @@
 #define PLUGIN_MAX_BOOKS_LIST_ITEMS 8
 
 /* Same shape and same reasoning as PLUGIN_MAX_BOOKS_LIST_ITEMS above, for
- * plugin.register_list_item("settings", ...) -- sizes plugin_manager.c's
- * own internal plugin_settings_list_items[] array, and gui.c's
+ * plugin.register_list_item("settings", ...) -- sizes this target's own
+ * slot in plugin_manager.c's shared plugin_list_items[][] storage (one
+ * 2D array covering all 10 list targets via a plugin_list_target_desc_t
+ * descriptor table, not a separate array per target), and gui.c's
  * build_settings_screen() sizes its own static items[] array off this (5
  * built-in category rows -- "Playback", "Display", "Power", "System",
- * "About" -- plus this many plugin rows). A separate array from the Books
- * one, not shared storage, per plugin_manager.c's own comment on why a new
- * list_id gets its own array rather than a fully generic dispatch table. */
+ * "About" -- plus this many plugin rows). */
 #define PLUGIN_MAX_SETTINGS_LIST_ITEMS 8
 
 /* Same shape and reasoning as PLUGIN_MAX_SETTINGS_LIST_ITEMS above, for
@@ -239,7 +239,6 @@ int plugin_manager_scan_available(plugin_available_entry_t * out, int max);
  * plugin_call() is on the C stack -- see gui_reload.h's own comment on
  * deferred execution. */
 void plugin_manager_deinit(void);
-void plugin_manager_cancel_all_async_http(void);
 
 /* Rows registered via plugin.register_list_item("books", label, on_open) --
  * gui.c's build_books_screen() appends these after its own 2 built-in rows
@@ -372,9 +371,7 @@ void plugin_manager_stream_tile_clicked(int index);
  * currently-registered tile has that id -- build_home_screen() uses this to
  * tell "resolves to a plugin tile" apart from "unknown/not loaded", which it
  * skips with a log rather than treating as an error. */
-int plugin_manager_get_home_tile_count(void);
 int plugin_manager_find_home_tile_by_id(const char * id);
-const char * plugin_manager_get_home_tile_id(int index);
 const char * plugin_manager_get_home_tile_label(int index);
 const char * plugin_manager_get_home_tile_icon(int index);
 const char * plugin_manager_get_home_tile_icon_selected(int index);

@@ -124,11 +124,6 @@ static int fail(lua_State * L, const char * msg) {
     return 2;
 }
 
-static int ok_value(lua_State * L) {
-    lua_pushnil(L);
-    return 2;
-}
-
 static bool push_cjson(lua_State * L, const cJSON * node, int depth, const json_limits_t * lim, int * entries,
                        const char ** err) {
     if (depth > lim->max_nesting) {
@@ -314,7 +309,8 @@ int l_plugin_json_decode(lua_State * L) {
         return fail(L, err);
     }
     cJSON_Delete(json);
-    return ok_value(L);
+    lua_pushnil(L);
+    return 2;
 }
 
 int l_plugin_json_encode(lua_State * L) {
@@ -339,5 +335,6 @@ int l_plugin_json_encode(lua_State * L) {
     }
     lua_pushlstring(L, printed, n);
     cJSON_free(printed);
-    return ok_value(L);
+    lua_pushnil(L);
+    return 2;
 }

@@ -1,4 +1,5 @@
 #include "plugin_storage.h"
+#include "plugin_internal.h"
 
 #include "mbedtls/md5.h"
 
@@ -63,12 +64,8 @@ static bool mkdir_p(const char * path, mode_t mode) {
 }
 
 static bool id_ok(const char * plugin_id) {
-    if (!plugin_id || !plugin_id[0] || strlen(plugin_id) > PLUGIN_STORAGE_ID_MAX) return false;
-    for (const unsigned char * p = (const unsigned char *) plugin_id; *p; p++) {
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-              (*p >= '0' && *p <= '9') || *p == '.' || *p == '_' || *p == '-')) return false;
-    }
-    return true;
+    if (!plugin_id || strlen(plugin_id) > PLUGIN_STORAGE_ID_MAX) return false;
+    return plugin_id_charset_ok(plugin_id);
 }
 
 static bool key_ok(const char * key) {
@@ -85,7 +82,7 @@ static void md5_hex(const char * a, const char * b, char out[33]) {
     buf[n++] = 0;
     memcpy(buf + n, b ? b : "", lb); n += lb;
     mbedtls_md5(buf, n, digest);
-    for (int i = 0; i < 16; i++) snprintf(out + i * 2, 3, "%02x", digest[i]);
+    md5_digest_to_hex(digest, out);
 }
 
 static bool plugin_dir(char * out, size_t out_size, const char * plugin_id) {

@@ -2625,7 +2625,8 @@ static void * bt_toggle_thread_func(void * arg) {
          * (bluealsa/bt-agent) before powering down the radio to prevent
          * orphaned processes from corrupting bluetoothd adapter registration. */
         if (current_settings.bt_dac_mode_enabled) {
-            bt_control_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
+            bt_control_apply_output_settings(false, current_settings.bt_volume_sync_enabled,
+                                              current_settings.bt_sbc_xq_enabled);
             bt_toggle_forced_dac_off = true;
         }
         bt_control_disable();
@@ -2818,7 +2819,8 @@ static void * bt_dac_startup_reapply_thread_func(void * arg) {
     bt_control_init_chip();
     bt_control_enable();
     mark_bt_media_player_enable_pending();
-    bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
+    bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled,
+                                      current_settings.bt_sbc_xq_enabled);
     atomic_store_explicit(&bt_dac_startup_reapply_done_flag, true, memory_order_release); /* written last -- poll_bt_dac_startup_reapply only checks this flag */
     return NULL;
 }
@@ -2856,11 +2858,12 @@ static atomic_bool bt_apply_output_settings_done_flag = false;
 typedef struct {
     bool dac_mode_enabled;
     bool volume_sync_enabled;
+    bool sbc_xq_enabled;
 } bt_apply_output_settings_request_t;
 
 static void * bt_apply_output_settings_thread_func(void * arg) {
     bt_apply_output_settings_request_t * req = (bt_apply_output_settings_request_t *) arg;
-    bt_control_apply_output_settings(req->dac_mode_enabled, req->volume_sync_enabled);
+    bt_control_apply_output_settings(req->dac_mode_enabled, req->volume_sync_enabled, req->sbc_xq_enabled);
     free(req);
     atomic_store_explicit(&bt_apply_output_settings_done_flag, true, memory_order_release); /* written last -- poll_bt_apply_output_settings only checks this flag */
     return NULL;
@@ -2872,12 +2875,13 @@ static void * bt_apply_output_settings_thread_func(void * arg) {
  * slow operations, and the current_settings values the caller already wrote
  * before calling this are what the eventually-scheduled apply would use
  * anyway once the in-flight one finishes and the screen is re-populated. */
-void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled) {
+void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled, bool sbc_xq_enabled) {
     if (bt_apply_output_settings_active) return;
     bt_apply_output_settings_request_t * req = malloc(sizeof(*req));
     if (!req) return;
     req->dac_mode_enabled = dac_mode_enabled;
     req->volume_sync_enabled = volume_sync_enabled;
+    req->sbc_xq_enabled = sbc_xq_enabled;
     atomic_store_explicit(&bt_apply_output_settings_done_flag, false, memory_order_relaxed);
     bt_apply_output_settings_active = true;
         if (pthread_create(&bt_apply_output_settings_thread, NULL, bt_apply_output_settings_thread_func, req) != 0) {

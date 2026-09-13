@@ -1164,7 +1164,8 @@ void populate_bt_dac_screen(void) {
 static void enable_bt_dac_and_show_overlay(void) {
     current_settings.bt_dac_mode_enabled = true;
     settings_save(&current_settings);
-    start_bt_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
+    start_bt_apply_output_settings(true, current_settings.bt_volume_sync_enabled,
+                                    current_settings.bt_sbc_xq_enabled);
 
     /* Bluetooth DAC, AirPlay, and local playback share the same physical ALSA
      * audio device and are mutually exclusive. Enabling Bluetooth DAC stops local
@@ -1253,7 +1254,8 @@ static void bt_dac_leave_confirm_cb(lv_event_t * e) {
 
     current_settings.bt_dac_mode_enabled = false;
     settings_save(&current_settings);
-    start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
+    start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled,
+                                    current_settings.bt_sbc_xq_enabled);
 }
 
 static void bt_dac_overlay_back_cb(lv_event_t * e) {
@@ -1825,7 +1827,8 @@ void poll_usb_mode_switch(void) {
         if (current_settings.bt_dac_mode_enabled) {
             current_settings.bt_dac_mode_enabled = false;
             settings_save(&current_settings);
-            start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
+            start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled,
+                                            current_settings.bt_sbc_xq_enabled);
         }
         if (current_settings.wifi_dac_mode_enabled) {
             current_settings.wifi_dac_mode_enabled = false;
@@ -2058,7 +2061,17 @@ static void bt_volume_sync_toggle_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     current_settings.bt_volume_sync_enabled = !current_settings.bt_volume_sync_enabled;
     settings_save(&current_settings);
-    start_bt_apply_output_settings(current_settings.bt_dac_mode_enabled, current_settings.bt_volume_sync_enabled);
+    start_bt_apply_output_settings(current_settings.bt_dac_mode_enabled, current_settings.bt_volume_sync_enabled,
+                                    current_settings.bt_sbc_xq_enabled);
+    populate_bt_screen();
+}
+
+static void bt_sbc_xq_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    current_settings.bt_sbc_xq_enabled = !current_settings.bt_sbc_xq_enabled;
+    settings_save(&current_settings);
+    start_bt_apply_output_settings(current_settings.bt_dac_mode_enabled, current_settings.bt_volume_sync_enabled,
+                                    current_settings.bt_sbc_xq_enabled);
     populate_bt_screen();
 }
 
@@ -2112,6 +2125,7 @@ void populate_bt_screen(void) {
                         bt_volume_sync_toggle_cb);
     add_pill_chevron_row(bt_list, "Bluetooth DAC", bt_dac_settings_row_cb);
     add_pill_chevron_row(bt_list, "Codec", bt_codec_settings_row_cb);
+    add_pill_toggle_row(bt_list, "SBC-XQ", current_settings.bt_sbc_xq_enabled, bt_sbc_xq_toggle_cb);
     add_pill_toggle_row(bt_list, "Hide Unnamed Devices", current_settings.bt_hide_unnamed_devices,
                         bt_hide_unnamed_toggle_cb);
 
@@ -2476,7 +2490,8 @@ static void airplay_toggle_cb(lv_event_t * e) {
         if (current_settings.bt_dac_mode_enabled) {
             current_settings.bt_dac_mode_enabled = false;
             settings_save(&current_settings);
-            start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
+            start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled,
+                                            current_settings.bt_sbc_xq_enabled);
         }
     } else {
         airplay_control_stop();

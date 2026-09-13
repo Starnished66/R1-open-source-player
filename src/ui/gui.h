@@ -341,7 +341,7 @@ lv_obj_t * build_menu_popup(const menu_popup_row_t * rows, int row_count, lv_eve
 
 
 lv_obj_t * add_section_header(lv_obj_t * parent, const char * text);
-void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled);
+void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled, bool sbc_xq_enabled);
 void set_play_button_state(bool is_playing);
 void arm_next_track_for_audio(int index);
 

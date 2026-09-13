@@ -954,6 +954,7 @@ bool bt_control_output_disconnect_consume(void) {
  * profile was actually requested last. */
 static bool last_applied_dac_mode_enabled = false;
 static bool last_applied_volume_sync_enabled = false;
+static bool last_applied_sbc_xq_enabled = false;
 static bool output_settings_ever_applied = false;
 
 /* Serializes bt_control_apply_output_settings() against itself across the
@@ -971,12 +972,13 @@ static bool spawn_bluealsa_and_verify(char * const argv[]) {
 #endif
 }
 
-bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled) {
+bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled, bool sbc_xq_enabled) {
     /* Serializes bluealsa/bt-agent respawns and updates last-applied settings
      * to protect against concurrent caller races. */
     pthread_mutex_lock(&bt_daemon_respawn_mutex);
     last_applied_dac_mode_enabled = dac_mode_enabled;
     last_applied_volume_sync_enabled = volume_sync_enabled;
+    last_applied_sbc_xq_enabled = sbc_xq_enabled;
     output_settings_ever_applied = true;
 
     /* Single profile mode: runs a2dp-sink or a2dp-source. */
@@ -993,12 +995,13 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
      * bare `&`, script just ends), and was just confirmed working
      * flawlessly. */
 
-    char * argv[9];
+    char * argv[10];
     int i = 0;
     argv[i++] = (char *) "/usr/bin/bluealsa";
     argv[i++] = (char *) "-p";
     argv[i++] = dac_mode_enabled ? (char *) "a2dp-sink" : (char *) "a2dp-source";
     if (volume_sync_enabled) argv[i++] = (char *) "--a2dp-volume";
+    if (sbc_xq_enabled) argv[i++] = (char *) "--sbc-quality=xq";
     /* Codec restriction (-c SBC -c AAC, excluding LDAC) TEMPORARILY REMOVED
      * for a live A/B test: the stock player's own bluealsa_profile script
      * runs with no codec restriction at all and was just confirmed on a
@@ -1051,10 +1054,11 @@ static void bt_control_reapply_last_output_settings(void) {
     bool ever_applied = output_settings_ever_applied;
     bool dac_mode = last_applied_dac_mode_enabled;
     bool volume_sync = last_applied_volume_sync_enabled;
+    bool sbc_xq = last_applied_sbc_xq_enabled;
     pthread_mutex_unlock(&bt_daemon_respawn_mutex);
 
     if (!ever_applied) return; /* this session never asked for a particular profile -- nothing to restore */
-    bt_control_apply_output_settings(dac_mode, volume_sync);
+    bt_control_apply_output_settings(dac_mode, volume_sync, sbc_xq);
 }
 
 bool bt_control_set_codec(const char * codec) {

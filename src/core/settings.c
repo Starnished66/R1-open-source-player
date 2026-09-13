@@ -72,6 +72,7 @@ static void set_defaults(player_settings_t * out) {
     out->bt_volume_sync_enabled = true;
     out->bt_dac_mode_enabled = false;
     snprintf(out->bt_codec, sizeof(out->bt_codec), "auto");
+    out->bt_sbc_xq_enabled = false;
     out->bt_hide_unnamed_devices = true;
     out->wifi_dac_mode_enabled = false;
     out->dlna_renderer_enabled = false;
@@ -310,6 +311,8 @@ bool settings_load(player_settings_t * out) {
             out->bt_dac_mode_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "bt_codec") == 0) {
             snprintf(out->bt_codec, sizeof(out->bt_codec), "%s", value);
+        } else if (strcmp(key, "bt_sbc_xq") == 0) {
+            out->bt_sbc_xq_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "bt_hide_unnamed_devices") == 0) {
             out->bt_hide_unnamed_devices = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "wifi_dac_mode") == 0) {
@@ -468,6 +471,7 @@ static void settings_write_file(const player_settings_t * settings) {
     fprintf(f, "bt_volume_sync=%d\n", settings->bt_volume_sync_enabled ? 1 : 0);
     fprintf(f, "bt_dac_mode=%d\n", settings->bt_dac_mode_enabled ? 1 : 0);
     fprintf(f, "bt_codec=%s\n", settings->bt_codec);
+    fprintf(f, "bt_sbc_xq=%d\n", settings->bt_sbc_xq_enabled ? 1 : 0);
     fprintf(f, "bt_hide_unnamed_devices=%d\n", settings->bt_hide_unnamed_devices ? 1 : 0);
     fprintf(f, "wifi_dac_mode=%d\n", settings->wifi_dac_mode_enabled ? 1 : 0);
     fprintf(f, "dlna_renderer_enabled=%d\n", settings->dlna_renderer_enabled ? 1 : 0);

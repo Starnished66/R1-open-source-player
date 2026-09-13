@@ -107,6 +107,12 @@ typedef struct {
     bool bt_volume_sync_enabled; /* --a2dp-volume: HW volume buttons also change the paired device's volume */
     bool bt_dac_mode_enabled;    /* a2dp-sink profile: lets another device stream audio TO this one */
     char bt_codec[16];           /* "auto"/"ldac_hq"/"ldac_sq"/"aptx"/"aac"/"sbc" -- written into alsa.conf */
+    /* SBC-XQ: raises the SBC bitpool bluealsa negotiates (--sbc-quality=xq)
+     * well above the stock default, closing most of the gap to AAC/aptX at
+     * the cost of higher bandwidth. Only takes effect when SBC ends up being
+     * the negotiated codec (whether chosen explicitly above or landed on via
+     * "auto" fallback) -- see bluetooth_control.h. */
+    bool bt_sbc_xq_enabled;
     /* When true, BLE devices without a broadcast name are hidden from the
      * "Available Devices" list (shown as raw MAC addresses otherwise).
      * Paired devices are always shown regardless of this setting. */

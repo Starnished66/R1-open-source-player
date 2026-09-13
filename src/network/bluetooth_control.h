@@ -127,8 +127,15 @@ bool bt_control_forget(const char * mac);
  * incoming audio to the hardware output and makes the adapter
  * discoverable+pairable so a phone can find and connect to it as a sink
  * target; turning it off stops bluealsa-aplay and discoverability again.
- * volume_sync_enabled maps directly to the --a2dp-volume flag. */
-bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled);
+ * volume_sync_enabled maps directly to the --a2dp-volume flag.
+ *
+ * sbc_xq_enabled adds --sbc-quality=xq, raising the bitpool bluealsa uses
+ * whenever SBC ends up being the negotiated codec (explicit "sbc" preference
+ * or "auto" falling back to it) -- unconfirmed on this project's bluealsa
+ * build, same caveat as the LDAC_HQ/LDAC_SQ mapping below: needs on-device
+ * confirmation that the daemon binary is new enough to accept this flag at
+ * all (older bluealsa builds will refuse to start with an unknown option). */
+bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled, bool sbc_xq_enabled);
 
 /* Regenerates /usr/data/alsa.conf's bt_alsa_sink stanza -- the same
  * file/stanza the stock bt_init script creates once if missing (real

@@ -33,8 +33,8 @@ static void build_error_toast(void) {
     lv_obj_t * top = lv_layer_top();
 
     error_toast = lv_obj_create(top);
-    lv_obj_set_size(error_toast, 400, 70);
-    lv_obj_align(error_toast, LV_ALIGN_CENTER, 0, -180);
+    lv_obj_set_size(error_toast, BOARD_SCALE_PX(400), BOARD_SCALE_PX(70));
+    lv_obj_align(error_toast, LV_ALIGN_CENTER, 0, -BOARD_SCALE_PX(180));
     lv_obj_set_style_radius(error_toast, 16, 0);
     lv_obj_set_style_bg_color(error_toast, lv_color_make(40, 20, 20), 0);
     lv_obj_set_style_bg_opa(error_toast, LV_OPA_80, 0);
@@ -73,8 +73,8 @@ static void build_info_toast(void) {
     lv_obj_t * top = lv_layer_top();
 
     info_toast = lv_obj_create(top);
-    lv_obj_set_size(info_toast, 420, 140);
-    lv_obj_align(info_toast, LV_ALIGN_CENTER, 0, -160);
+    lv_obj_set_size(info_toast, BOARD_SCALE_PX(420), BOARD_SCALE_PX(140));
+    lv_obj_align(info_toast, LV_ALIGN_CENTER, 0, -BOARD_SCALE_PX(160));
     lv_obj_set_style_radius(info_toast, 16, 0);
     lv_obj_add_style(info_toast, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(info_toast, LV_OPA_80, 0);
@@ -119,11 +119,11 @@ gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
         gui_busy_label = lv_label_create(gui_busy_screen);
         lv_obj_add_style(gui_busy_label, &style_theme_text_primary, 0);
         lv_obj_set_style_text_align(gui_busy_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(gui_busy_label, LV_ALIGN_CENTER, 0, -20);
+        lv_obj_align(gui_busy_label, LV_ALIGN_CENTER, 0, -BOARD_SCALE_PX(20));
 
         gui_busy_progress_bar = lv_bar_create(gui_busy_screen);
-        lv_obj_set_size(gui_busy_progress_bar, 280, 14);
-        lv_obj_align(gui_busy_progress_bar, LV_ALIGN_CENTER, 0, 30);
+        lv_obj_set_size(gui_busy_progress_bar, BOARD_SCALE_PX(280), BOARD_SCALE_PX(14));
+        lv_obj_align(gui_busy_progress_bar, LV_ALIGN_CENTER, 0, BOARD_SCALE_PX(30));
         lv_bar_set_range(gui_busy_progress_bar, 0, 100);
         lv_obj_add_style(gui_busy_progress_bar, gui_theme_accent_style(), LV_PART_INDICATOR);
     }
@@ -188,7 +188,7 @@ lv_obj_t * build_menu_popup(const menu_popup_row_t * rows, int row_count, lv_eve
     lv_obj_add_style(popup, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(popup, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(popup, 1, 0);
-    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_style_pad_all(popup, BOARD_SCALE_PX(20), 0);
     lv_obj_set_style_pad_row(popup, GUI_ROW_GAP, 0);
     lv_obj_add_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(popup, LV_DIR_VER);
@@ -200,8 +200,8 @@ lv_obj_t * build_menu_popup(const menu_popup_row_t * rows, int row_count, lv_eve
         lv_obj_t * row = lv_obj_create(popup);
         lv_obj_set_width(row, lv_pct(100));
         lv_obj_set_height(row, LV_SIZE_CONTENT);
-        lv_obj_set_style_min_height(row, 64, 0);
-        lv_obj_set_style_pad_all(row, 14, 0);
+        lv_obj_set_style_min_height(row, BOARD_SCALE_PX(64), 0);
+        lv_obj_set_style_pad_all(row, BOARD_SCALE_PX(14), 0);
         lv_obj_set_style_radius(row, 12, 0);
         lv_obj_set_style_bg_opa(row, 0, 0);
         lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);

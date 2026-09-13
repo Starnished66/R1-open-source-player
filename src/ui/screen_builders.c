@@ -551,7 +551,7 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
      * broken tile content positioning, not just a wide gap, so it needs a
      * real ceiling rather than a cosmetic one. */
     if (tile_gap < 0) tile_gap = 0;
-    if (tile_gap > 64) tile_gap = 64;
+    if (tile_gap > BOARD_SCALE_PX(64)) tile_gap = BOARD_SCALE_PX(64);
 
     int32_t target_icon_px = (ICON_GRID_TARGET_ICON_PX * icon_scale_percent) / 100;
 
@@ -853,7 +853,14 @@ int32_t pill_row_default_width(void) {
 
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
-                                   lv_style_t * toggle_accent_style, int32_t row_gap) {
+                                   lv_style_t * toggle_accent_style, int32_t row_gap,
+                                   int32_t icon_scale_pct) {
+    /* Same scale-to-target-px formula as build_icon_grid_screen()'s own
+     * target_icon_px -- 100 (every native call site) reproduces
+     * PILL_ROW_ICON_PX_DEFAULT exactly, unchanged from before this
+     * parameter existed. */
+    int32_t icon_px = (PILL_ROW_ICON_PX_DEFAULT * icon_scale_pct) / 100;
+
     /* Clamped here, not just left to whatever the caller passed -- every
      * native call site already passes a small literal (6), but
      * plugin.set_home_layout()'s row_gap (PLUGINS.md) is plugin-controlled
@@ -943,13 +950,13 @@ lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
         lv_obj_set_style_text_font(label, pill_row_resolve_text_size(item->text_size), 0);
         if (item->has_text_color) lv_obj_set_style_text_color(label, lv_color_hex(item->text_color), 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
-        pill_row_apply_icon(row, label, item->icon_asset, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
+        pill_row_apply_icon(row, label, item->icon_asset, icon_px, LV_ALIGN_LEFT_MID, 24, 0);
 
         /* Keep long labels inside their own row instead of letting the
          * label's content-sized box extend over the accessory or following
          * row. LV_LABEL_LONG_SCROLL_CIRCULAR is inert when the text fits and
          * becomes a single-line marquee only when it does not. */
-        int32_t label_left = 24 + (item->icon_asset ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0);
+        int32_t label_left = 24 + (item->icon_asset ? icon_px + 12 : 0);
         int32_t accessory_space = item->accessory == PILL_ACCESSORY_TOGGLE ? 112
                                   : item->accessory == PILL_ACCESSORY_CHEVRON ? 60 : 24;
         int32_t label_width = width - label_left - accessory_space;
@@ -1043,21 +1050,30 @@ lv_obj_t * build_launcher_menu_screen(const char * title, lv_event_cb_t back_btn
 
     pill_list_item_t rows[item_count];
     for (int i = 0; i < item_count; i++) {
+        bool accessory = items[i].has_accessory ? items[i].accessory
+                                                 : (layout->has_accessory && layout->accessory);
+        bool show_icon = items[i].has_icon ? items[i].icon : (layout->has_icon && layout->icon);
         rows[i] = (pill_list_item_t) {
             .label = items[i].label,
-            .accessory = layout->has_accessory && layout->accessory ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
+            .accessory = accessory ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
             .on_click = items[i].on_click, .user_data = items[i].user_data,
-            .icon_asset = layout->has_icon && layout->icon ? asset_path_plain(items[i].icon_asset) : NULL,
-            .row_height = layout->height, .row_width = layout->width,
-            .has_bg_color = layout->has_bg_color, .bg_color = layout->bg_color,
-            .has_text_color = layout->has_text_color, .text_color = layout->text_color,
-            .has_radius = layout->has_radius, .radius = layout->radius,
-            .text_size = layout->text_size[0] ? layout->text_size : NULL,
-            .text_align = layout->align[0] ? layout->align : NULL,
+            .icon_asset = show_icon ? asset_path_plain(items[i].icon_asset) : NULL,
+            .row_height = items[i].has_row_height ? items[i].row_height : layout->height,
+            .row_width = items[i].has_row_width ? items[i].row_width : layout->width,
+            .has_bg_color = items[i].has_bg_color || layout->has_bg_color,
+            .bg_color = items[i].has_bg_color ? items[i].bg_color : layout->bg_color,
+            .has_text_color = items[i].has_text_color || layout->has_text_color,
+            .text_color = items[i].has_text_color ? items[i].text_color : layout->text_color,
+            .has_radius = items[i].has_radius || layout->has_radius,
+            .radius = items[i].has_radius ? items[i].radius : layout->radius,
+            .text_size = items[i].text_size ? items[i].text_size
+                                             : (layout->text_size[0] ? layout->text_size : NULL),
+            .text_align = items[i].text_align ? items[i].text_align
+                                               : (layout->align[0] ? layout->align : NULL),
         };
     }
     return build_pill_list_screen(title, back_btn_cb, rows, item_count, gui_theme_accent_style(),
-                                  layout->row_gap > 0 ? layout->row_gap : 6);
+                                  layout->row_gap > 0 ? layout->row_gap : 6, icon_scale_pct);
 }
 
 int append_plugin_list_rows(pill_list_item_t * items, int count, int max_items,

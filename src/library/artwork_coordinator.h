@@ -138,6 +138,13 @@ bool artwork_failure_cache_is_blocked(int64_t song_id, time_t source_mtime, artw
 /* Records an artwork failure for an album with its current source mtime. */
 void artwork_failure_cache_record(int64_t song_id, time_t source_mtime, artwork_fail_reason_t reason);
 
+/* Clears any recorded failure (and its consecutive-TEMPORARY count) for one
+ * song after a decode for it actually succeeds -- otherwise a stale count
+ * left over from a past, now-resolved TEMPORARY streak could combine with a
+ * later, unrelated TEMPORARY failure to wrongly promote it to PERMANENT
+ * despite a fully successful decode in between. */
+void artwork_failure_cache_note_success(int64_t song_id);
+
 /* Clears/invalidates the failure cache. */
 void artwork_failure_cache_clear(void);
 

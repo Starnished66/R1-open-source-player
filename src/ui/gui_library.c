@@ -1082,12 +1082,12 @@ static lv_obj_t * build_group_songs_screen(void) {
 /* ---- Virtualized local-album thumbnails -------------------------------
  * Only the 20 recycled compact-list rows can request artwork. One worker at
  * a time reads/decodes a representative song's embedded or Rockbox albumart
- * file, while a 100-entry RGB565 LRU cache keeps the visible window plus
- * scroll headroom bounded at ~1013 KiB. Persistent sized files live in
+ * file, while a 250-entry RGB565 LRU cache keeps the visible window plus
+ * scroll headroom bounded at ~2531 KiB. Persistent sized files live in
  * MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp. */
 #define ALBUM_THUMBNAIL_PX ALBUMART_THUMBNAIL_SIZE
 #define ALBUM_PLAYER_CACHE_PX ALBUMART_PLAYER_CACHE_SIZE
-#define ALBUM_THUMBNAIL_CACHE_SIZE 100
+#define ALBUM_THUMBNAIL_CACHE_SIZE 250
 
 typedef struct {
     int64_t song_id;
@@ -1841,6 +1841,8 @@ static void * album_thumbnail_thread_func(void * arg) {
             albumart_info_from_song_row(&song, &info);
             album_thumbnail_result_source_mtime = album_source_mtime(&song, &info);
             album_thumbnail_result_have_source_mtime = true;
+        } else {
+            artwork_failure_cache_note_success(req->song_id);
         }
     }
     album_thumbnail_result_song_id = req->song_id;
@@ -1967,7 +1969,15 @@ static void * album_thumb_gen_thread_func(void * arg) {
                 (artwork_failure_cache_is_blocked(song.id, source_mtime, &fail_reason) &&
                  fail_reason == ARTWORK_FAIL_TEMPORARY)))
                 atomic_store(&album_thumb_gen_retry_pending, true);
-            if (pixels) generated++; else failed++;
+            if (pixels) { artwork_failure_cache_note_success(song.id); generated++; } else { failed++; }
+            if (!pixels) {
+                artwork_fail_reason_t diag_fail_reason = ARTWORK_FAIL_NONE;
+                bool diag_blocked = artwork_failure_cache_is_blocked(song.id, source_mtime, &diag_fail_reason);
+                DB_LOG("ART_CACHE", "album_failed song=%lld path=%s reason=%s",
+                       (long long) song.id, song.path,
+                       !diag_blocked ? "unrecorded" :
+                       (diag_fail_reason == ARTWORK_FAIL_PERMANENT ? "PERMANENT" : "TEMPORARY"));
+            }
 
 #ifdef UI_PERF_TRACE
             if (pixels) perf_generated++; else perf_failed++;

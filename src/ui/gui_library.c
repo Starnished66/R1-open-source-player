@@ -1082,12 +1082,12 @@ static lv_obj_t * build_group_songs_screen(void) {
 /* ---- Virtualized local-album thumbnails -------------------------------
  * Only the 20 recycled compact-list rows can request artwork. One worker at
  * a time reads/decodes a representative song's embedded or Rockbox albumart
- * file, while a 32-entry RGB565 LRU cache keeps the visible window plus
- * scroll headroom bounded at ~324 KiB. Persistent sized files live in
+ * file, while a 100-entry RGB565 LRU cache keeps the visible window plus
+ * scroll headroom bounded at ~1013 KiB. Persistent sized files live in
  * MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp. */
 #define ALBUM_THUMBNAIL_PX ALBUMART_THUMBNAIL_SIZE
 #define ALBUM_PLAYER_CACHE_PX ALBUMART_PLAYER_CACHE_SIZE
-#define ALBUM_THUMBNAIL_CACHE_SIZE 32
+#define ALBUM_THUMBNAIL_CACHE_SIZE 100
 
 typedef struct {
     int64_t song_id;
@@ -4413,7 +4413,7 @@ static lv_obj_t * build_music_screen(void) {
      * own to need it. */
     items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
     // icon size percentage is scaled using BOARD_SCALE_PX which is relative to device screen width, so that it look a similar size on all devices
-    lv_obj_t * scr = build_launcher_menu_screen("Music", generic_back_cb, items, 6, BOARD_SCALE_PX(80), false,
+    lv_obj_t * scr = build_launcher_menu_screen("Music", generic_back_cb, items, 6, BOARD_SCALE_PX(100), false,
                                                  &launcher_layout_config.music);
     /* Same real stock-firmware gear icon as the Queue screen's own Options
      * button (sub_back/set.png) -- build_top_right_icon_button() guarantees

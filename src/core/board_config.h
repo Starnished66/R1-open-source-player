@@ -68,7 +68,9 @@
  * Rounds to the nearest pixel rather than always truncating down. */
 #define BOARD_REFERENCE_WIDTH 480
 #define BOARD_SCALE_PX(px) \
-  (((px) * BOARD_SCREEN_WIDTH + (BOARD_REFERENCE_WIDTH / 2)) / BOARD_REFERENCE_WIDTH)
+  ((px) >= 0 \
+    ? (((px) * BOARD_SCREEN_WIDTH + (BOARD_REFERENCE_WIDTH / 2)) / BOARD_REFERENCE_WIDTH) \
+    : (((px) * BOARD_SCREEN_WIDTH - (BOARD_REFERENCE_WIDTH / 2)) / BOARD_REFERENCE_WIDTH))
 
 
   /* R3 Pro II has a dedicated charger IC, MP2731, alongside the AXP2101 PMIC

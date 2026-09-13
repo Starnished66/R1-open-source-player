@@ -36,7 +36,7 @@ typedef struct {
 #define LYRICS_BACKDROP_DARKEN_NUM 9
 #define LYRICS_BACKDROP_DARKEN_DEN 20
 #define LYRICS_POOL_SIZE 20
-#define LYRICS_ROW_WIDTH BOARD_SCALE_PX(BOARD_SCREEN_WIDTH - 40)
+#define LYRICS_ROW_WIDTH (BOARD_SCREEN_WIDTH - BOARD_SCALE_PX(40))
 #define LYRICS_ROW_GAP BOARD_SCALE_PX(24)
 #define LYRICS_ACTIVE_LINE_ANCHOR_Y BOARD_SCALE_PX(200)
 #define LYRICS_TOP_PAD LYRICS_ACTIVE_LINE_ANCHOR_Y
@@ -846,7 +846,7 @@ static lv_obj_t * build_lyrics_screen(void) {
      * scrollable) is enough here -- unlike the synced rows, there's no
      * windowing/virtualization needed for a single object. */
     lyrics_plain_label = lv_label_create(lyrics_list);
-    lv_obj_set_width(lyrics_plain_label, BOARD_SCALE_PX(LYRICS_ROW_WIDTH));
+    lv_obj_set_width(lyrics_plain_label, LYRICS_ROW_WIDTH);
     lv_label_set_long_mode(lyrics_plain_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(lyrics_plain_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(lyrics_plain_label, &app_font_lyrics, 0);

@@ -340,33 +340,9 @@ static const char * song_quality_asset_for_path(const char * path) {
     return "touch_list/quality_nomal.png";
 }
 
-static const char * library_codec_name(audio_codec_t codec) {
-    switch (codec) {
-        case AUDIO_CODEC_FLAC: return "FLAC";
-        case AUDIO_CODEC_MP3: return "MP3";
-        case AUDIO_CODEC_PCM: return "PCM";
-        case AUDIO_CODEC_DSD: return "DSD";
-        case AUDIO_CODEC_AAC: return "AAC";
-        case AUDIO_CODEC_ALAC: return "ALAC";
-        case AUDIO_CODEC_APE: return "APE";
-        case AUDIO_CODEC_WMA: return "WMA";
-        case AUDIO_CODEC_OPUS: return "Opus";
-        case AUDIO_CODEC_VORBIS: return "Vorbis";
-        case AUDIO_CODEC_UNKNOWN: break;
-    }
-    return "Audio";
-}
-
 static void format_music_submenu_identity(const song_row_t * song, char * out, size_t out_size) {
     char title[128];
     metadata_db_song_display_title(song, title, sizeof(title));
-    audio_current_format_info_t info;
-    if (audio_probe_file_format(song->path, &info) && info.duration_seconds > 0.0) {
-        unsigned int seconds = (unsigned int)(info.duration_seconds + 0.5);
-        snprintf(out, out_size, "%s\n%u:%02u · %s", title, seconds / 60, seconds % 60,
-                 library_codec_name(info.codec));
-        return;
-    }
     const char * ext = strrchr(song->path, '.');
     snprintf(out, out_size, "%s\n%s", title, ext && ext[1] ? ext + 1 : "Audio");
 }
@@ -566,6 +542,157 @@ static int group_songs_page_start;
 static lv_obj_t * group_songs_now_playing_bar;
 static lv_obj_t * group_songs_visible_rows[GROUP_SONGS_PAGE_SIZE];
 static bool group_songs_music_submenu;
+
+/* ---- Async duration/codec probing for group_songs_screen rows ---------
+ * format_music_submenu_identity() above stays fast/synchronous (title +
+ * extension only), so the screen keeps appearing instantly. This worker
+ * restores the "<mm:ss> - <CODEC>" subtitle by calling audio_probe_file_
+ * format() off the UI thread, one row at a time, only for the page of
+ * rows actually on screen (group_songs_visible_rows[]), then patches the
+ * result into that row's own subtitle label -- same single-slot-
+ * rendezvous shape as album_thumbnail_thread_func() further down, just
+ * sized to a whole page of requests instead of one. No cache yet (see
+ * plan): revisiting an album re-probes its visible rows again. */
+static const char * song_duration_codec_name(audio_codec_t codec) {
+    switch (codec) {
+        case AUDIO_CODEC_FLAC: return "FLAC";
+        case AUDIO_CODEC_MP3: return "MP3";
+        case AUDIO_CODEC_PCM: return "PCM";
+        case AUDIO_CODEC_DSD: return "DSD";
+        case AUDIO_CODEC_AAC: return "AAC";
+        case AUDIO_CODEC_ALAC: return "ALAC";
+        case AUDIO_CODEC_APE: return "APE";
+        case AUDIO_CODEC_WMA: return "WMA";
+        case AUDIO_CODEC_OPUS: return "Opus";
+        case AUDIO_CODEC_VORBIS: return "Vorbis";
+        case AUDIO_CODEC_UNKNOWN: break;
+    }
+    return "Audio";
+}
+
+typedef struct {
+    char path[PATH_MAX];
+    int generation;
+    int slot_index; /* index into group_songs_visible_rows[] */
+} song_duration_request_t;
+
+#define SONG_DURATION_QUEUE_SIZE GROUP_SONGS_PAGE_SIZE
+
+static song_duration_request_t song_duration_queue[SONG_DURATION_QUEUE_SIZE];
+static int song_duration_queue_count;
+static pthread_t song_duration_thread;
+static bool song_duration_active;
+static atomic_bool song_duration_done;
+static int song_duration_result_generation;
+static int song_duration_result_slot_index;
+static bool song_duration_result_ok;
+static double song_duration_result_seconds;
+static audio_codec_t song_duration_result_codec;
+static lv_timer_t * song_duration_poll_timer;
+/* Bumped every time populate_group_songs_rows() rebuilds the visible page
+ * (page change, edit-mode toggle, a different album/artist/group opened)
+ * -- lets song_duration_poll_cb() discard a result that no longer matches
+ * what's on screen, same discard-if-stale rule album_thumbnail_generation
+ * enforces for cover art. */
+static int song_duration_generation;
+
+static void * song_duration_thread_func(void * arg) {
+    install_thread_crash_altstack(); /* see its own comment (main.c) */
+    song_duration_request_t * req = (song_duration_request_t *) arg;
+    audio_current_format_info_t info;
+    bool ok = audio_probe_file_format(req->path, &info) && info.duration_seconds > 0.0;
+    song_duration_result_generation = req->generation;
+    song_duration_result_slot_index = req->slot_index;
+    song_duration_result_ok = ok;
+    song_duration_result_seconds = ok ? info.duration_seconds : 0.0;
+    song_duration_result_codec = ok ? info.codec : AUDIO_CODEC_UNKNOWN;
+    free(req);
+    song_duration_done = true;
+    return NULL;
+}
+
+static void start_next_song_duration_probe(void) {
+    if (song_duration_active || song_duration_queue_count <= 0) return;
+    song_duration_request_t * req = malloc(sizeof(*req));
+    if (!req) return;
+    *req = song_duration_queue[0];
+    memmove(&song_duration_queue[0], &song_duration_queue[1],
+            sizeof(song_duration_queue[0]) * (size_t) (--song_duration_queue_count));
+    song_duration_done = false;
+    song_duration_active = true;
+    bool created = pthread_create(&song_duration_thread, NULL, song_duration_thread_func, req) == 0;
+    if (!created) {
+        song_duration_active = false;
+        free(req);
+        return;
+    }
+    if (song_duration_poll_timer) lv_timer_resume(song_duration_poll_timer);
+}
+
+/* Applies a completed probe result to its row's subtitle label only if the
+ * generation still matches what's currently on screen; otherwise the
+ * result is silently discarded (navigated away, or the page/edit-mode
+ * was rebuilt since this request was queued). On probe failure, the
+ * row's existing "<title>\n<EXT or Audio>" fallback text is left as-is. */
+static void song_duration_poll_cb(lv_timer_t * timer) {
+    if (gui_navigation_transition_in_progress()) return;
+    if (!song_duration_done) return;
+    pthread_join(song_duration_thread, NULL);
+    song_duration_active = false;
+    if (song_duration_result_generation == song_duration_generation && song_duration_result_ok &&
+        song_duration_result_slot_index >= 0 && song_duration_result_slot_index < GROUP_SONGS_PAGE_SIZE) {
+        lv_obj_t * row = group_songs_visible_rows[song_duration_result_slot_index];
+        if (row && lv_obj_get_child_count(row) >= 2) {
+            lv_obj_t * secondary = lv_obj_get_child(row, 1);
+            unsigned int seconds = (unsigned int) (song_duration_result_seconds + 0.5);
+            char text[64];
+            snprintf(text, sizeof(text), "%u:%02u - %s", seconds / 60, seconds % 60,
+                     song_duration_codec_name(song_duration_result_codec));
+            lv_label_set_text(secondary, text);
+            lv_obj_remove_flag(secondary, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    start_next_song_duration_probe();
+    if (!song_duration_active && song_duration_queue_count <= 0) lv_timer_pause(timer);
+}
+
+/* Discards any not-yet-started requests from whatever page/edit-mode was
+ * showing before and enqueues one probe per row in [first_index,
+ * last_index_exclusive) of group_songs_entries -- called only for the
+ * plain (non-edit-mode) row shape. An already in-flight probe (if any) is
+ * left to finish and gets discarded on arrival by the generation check
+ * above, rather than cancelled outright. */
+static void queue_song_duration_probes(int first_index, int last_index_exclusive) {
+    song_duration_queue_count = 0;
+    song_duration_generation++;
+    if (!song_duration_poll_timer) {
+        song_duration_poll_timer = lv_timer_create(song_duration_poll_cb, 50, NULL);
+        lv_timer_pause(song_duration_poll_timer);
+    }
+    for (int i = first_index; i < last_index_exclusive && song_duration_queue_count < SONG_DURATION_QUEUE_SIZE; i++) {
+        song_duration_queue[song_duration_queue_count].generation = song_duration_generation;
+        song_duration_queue[song_duration_queue_count].slot_index = i - first_index;
+        snprintf(song_duration_queue[song_duration_queue_count].path,
+                 sizeof(song_duration_queue[song_duration_queue_count].path),
+                 "%s", group_songs_entries[i].path);
+        song_duration_queue_count++;
+    }
+    start_next_song_duration_probe();
+}
+
+/* UI reloads and database replacement both invalidate every path/row
+ * pointer a queued or in-flight request carries. Same "stop, then join
+ * the single active worker" shape as quiesce_album_artwork_workers(). */
+static void quiesce_song_duration_worker(void) {
+    song_duration_generation++;
+    song_duration_queue_count = 0;
+    if (song_duration_active) {
+        pthread_join(song_duration_thread, NULL);
+        song_duration_active = false;
+    }
+    song_duration_done = false;
+    if (song_duration_poll_timer) lv_timer_pause(song_duration_poll_timer);
+}
 
 /* Forward-declared here (defined after on_file_selected()) because
  * set_player_source_group_songs() needs group_songs_entries/count/title_label
@@ -883,6 +1010,14 @@ static void populate_group_songs_rows(void) {
                  group_songs_page_start + 1, page_end, group_songs_count);
         add_group_songs_page_row(page_text, group_songs_next_page_cb);
     }
+
+    /* Editing rows have no subtitle to backfill (move/remove icons occupy
+     * that space instead) -- queue_song_duration_probes(0, 0) still bumps
+     * the generation and clears any pending requests from before, so a
+     * probe queued for the previous (non-edit) page can't land on one of
+     * these rows once it completes. */
+    if (editing) queue_song_duration_probes(0, 0);
+    else queue_song_duration_probes(group_songs_page_start, page_end);
 
     /* Recreated fresh here (lv_obj_clean() above just destroyed whatever
      * was here before) rather than kept as a truly persistent object --
@@ -5681,7 +5816,8 @@ void gui_library_start_boot_thumbnail_warmup(void) {
 
 bool gui_library_has_background_work(void) {
     return library_rescan_active || library_rescan_success_pending || album_thumbnail_active ||
-           atomic_load(&album_thumb_gen_active) || sd_format_active || search_job_active;
+           atomic_load(&album_thumb_gen_active) || sd_format_active || search_job_active ||
+           song_duration_active;
 }
 
 bool gui_library_navigation_blocked(void) {
@@ -5693,6 +5829,7 @@ bool gui_library_navigation_blocked(void) {
 
 void gui_library_prepare_for_ui_reload(void) {
     quiesce_album_artwork_workers();
+    quiesce_song_duration_worker();
 
     if (search_debounce_timer) lv_timer_pause(search_debounce_timer);
     search_job_pending_valid = false;
@@ -5707,6 +5844,7 @@ void gui_library_prepare_for_ui_reload(void) {
 
 void gui_library_cancel_background_work(void) {
     quiesce_album_artwork_workers();
+    quiesce_song_duration_worker();
     if (library_rescan_active) {
         pthread_join(library_rescan_thread, NULL);
         library_rescan_active = false;

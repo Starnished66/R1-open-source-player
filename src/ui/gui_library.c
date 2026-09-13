@@ -1129,6 +1129,31 @@ static album_thumbnail_request_t album_thumbnail_queue[ALBUM_THUMBNAIL_QUEUE_SIZ
 static atomic_bool album_thumbnail_screen_active;
 static int album_thumbnail_queue_count;
 static bool album_thumbnail_scrolling;
+    /* Boot-time RAM cache preload: piggybacks on the existing persistent
+     * warmer thread (album_thumb_gen_thread_func) to also hand its first
+     * ALBUM_THUMBNAIL_CACHE_SIZE decoded thumbnails to the main/LVGL thread
+     * for insertion into album_thumbnail_cache[], instead of only writing the
+     * on-disk sized BMP sidecar. Single-slot rendezvous (like the on-screen
+     * lazy-decode hand-off above) -- the warmer thread blocks after staging
+     * one result until album_thumbnail_poll_cb() has consumed it, so at most
+     * one pending buffer ever exists and the cache array is still only ever
+     * written from the main thread. */
+    static int album_thumb_gen_ram_filled;
+    /* EMPTY: slot free, warmer may stage the next result into it.
+     * PENDING: warmer has staged a result and is waiting.
+     * CLAIMED: album_thumbnail_poll_cb() has taken ownership and is still
+     * reading/committing it -- the warmer must not touch the staged fields
+     * again until this goes back to EMPTY. A plain 2-state pending/not-
+     * pending flag let the warmer's own wait-loop-exit race the callback:
+     * clearing "pending" and THEN reading the payload left a window where
+     * the warmer saw the slot as free and overwrote the fields the callback
+     * was still using. The CAS transitions below close that window. */
+    enum { ALBUM_BOOT_PRELOAD_EMPTY = 0, ALBUM_BOOT_PRELOAD_PENDING, ALBUM_BOOT_PRELOAD_CLAIMED };
+    static atomic_int album_boot_preload_state;
+    static int64_t album_boot_preload_result_song_id;
+    static uint8_t * album_boot_preload_result_pixels;
+    static bool album_boot_preload_result_have_source_mtime;
+    static time_t album_boot_preload_result_source_mtime;
 static bool album_thumbnail_list_is_visible(lv_obj_t * list) {
     if (!list) return false;
     lv_obj_t * active = lv_screen_active();
@@ -1154,6 +1179,99 @@ static void album_thumbnail_cache_clear(void) {
     album_thumbnail_use_counter = 0;
     artwork_failure_cache_clear();
 }
+
+    /* Evicts the LRU slot (or the first unused one) and installs `pixels` (or
+     * a durable "known, no art" marker for a PERMANENT failure) into it.
+     * Shared by the on-screen lazy-decode commit and the boot-time RAM
+     * preload hand-off further below -- both only ever run on the main/LVGL
+     * thread, the only thread allowed to touch album_thumbnail_cache[].
+     * Takes ownership of `pixels`: either stores it or frees it, never both. */
+    static void album_thumbnail_cache_commit(int64_t song_id, uint8_t * pixels,
+                                              bool have_source_mtime, time_t source_mtime) {
+        /* A failed decode (pixels == NULL) is only worth caching as a durable
+         * "known, no art" entry if album_thumbnail_load_or_decode_ex() itself
+         * already recorded it as PERMANENT (corrupt/oversized/genuinely
+         * absent source). A TEMPORARY failure must NOT be cached here the
+         * same way -- album_thumbnail_cache_find()'s only gate is `known`, so
+         * caching it at all would make a transient hiccup permanent for this
+         * song for the rest of this cache slot's lifetime. Leaving the slot
+         * at its just-memset "unused" state (known=false) instead lets a
+         * future request legitimately retry this song. */
+        bool commit_known = pixels != NULL;
+        if (!commit_known && have_source_mtime) {
+            artwork_fail_reason_t fail_reason = ARTWORK_FAIL_NONE;
+            if (artwork_failure_cache_is_blocked(song_id, source_mtime, &fail_reason) &&
+                fail_reason == ARTWORK_FAIL_PERMANENT) {
+                commit_known = true;
+            }
+        }
+        int victim = -1;
+        /* An interrupted-then-restarted boot preload pass can reach the same
+         * song_id twice (it always restarts at offset 0). Without this check
+         * that would waste a second slot on a duplicate instead of just
+         * refreshing the one that's already there. The on-screen lazy-decode
+         * path never hits this: queue_album_thumbnail() already skips
+         * queuing a song album_thumbnail_cache_find() reports as known. A
+         * full pass for the match has to run before the unused/LRU pass
+         * below, which stops at the first unused slot -- a duplicate further
+         * down the array would otherwise never be seen. */
+        for (int i = 0; i < ALBUM_THUMBNAIL_CACHE_SIZE; i++) {
+            if (album_thumbnail_cache[i].known && album_thumbnail_cache[i].song_id == song_id) {
+                victim = i;
+                break;
+            }
+        }
+        /* A TEMPORARY failure must not blank a previously valid entry for
+         * this song. pixels is NULL whenever commit_known is false. */
+        if (victim >= 0 && !commit_known) {
+            free(pixels);
+            return;
+        }
+        if (victim < 0) {
+            uint32_t oldest = UINT32_MAX;
+            for (int i = 0; i < ALBUM_THUMBNAIL_CACHE_SIZE; i++) {
+                if (!album_thumbnail_cache[i].known) { victim = i; break; }
+                if (album_thumbnail_cache[i].last_use < oldest) {
+                    oldest = album_thumbnail_cache[i].last_use;
+                    victim = i;
+                }
+            }
+        }
+        album_thumbnail_cache_entry_t * e = &album_thumbnail_cache[victim];
+        uint8_t * retired_pixels = e->pixels;
+        if (retired_pixels) {
+            /* A leading lv_image can retain &e->dsc after its row last ran
+             * the decorator. Freeing pixels first made that image descriptor
+             * point into released heap memory until the row happened to be
+             * recycled: a redraw/scroll use-after-free on libraries larger
+             * than the LRU. Mark this as a known no-art entry temporarily and
+             * repaint every visible row so all references are detached before
+             * releasing/reusing the slot. */
+            e->pixels = NULL;
+            e->dsc.data = NULL;
+            if (album_thumbnail_active_list)
+                compact_list_refresh_visible(album_thumbnail_active_list);
+            free(retired_pixels);
+        }
+        memset(e, 0, sizeof(*e));
+        if (commit_known) {
+            e->song_id = song_id;
+            e->known = true;
+            e->pixels = pixels;
+            e->last_use = ++album_thumbnail_use_counter;
+            if (e->pixels) {
+                e->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+                e->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+                e->dsc.header.w = ALBUM_THUMBNAIL_PX;
+                e->dsc.header.h = ALBUM_THUMBNAIL_PX;
+                e->dsc.header.stride = ALBUM_THUMBNAIL_PX * 2;
+                e->dsc.data = e->pixels;
+                e->dsc.data_size = ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2;
+            }
+        } else {
+            free(pixels);
+        }
+    }
 
 static bool album_thumbnail_sized_cache_hit(const albumart_info_t * info, char * found, size_t found_size) {
     return albumart_sized_thumb_fresh(info, ALBUM_THUMBNAIL_PX, ALBUM_THUMBNAIL_PX, found, found_size);
@@ -1820,7 +1938,18 @@ static void * album_thumb_gen_thread_func(void * arg) {
             }
 
             char found[PATH_MAX];
-            if (album_thumbnail_sized_cache_hit(&info, found, sizeof(found)) &&
+            /* Still enter the decode call below for the first ALBUM_THUMBNAIL_
+             * CACHE_SIZE albums even when both persistent caches already exist
+             * -- on every boot after the very first one this is nearly always
+             * true for the whole library, and skipping straight to `continue`
+             * here (as every album past the RAM budget still does) would mean
+             * the RAM-preload hand-off below never runs at all on a normal
+             * boot. album_thumbnail_load_or_decode_ex() already returns the
+             * existing 72px sidecar's pixels immediately in this case without
+             * touching the original source file, so this costs one cheap BMP
+             * read+decode per album instead of a real cache regeneration. */
+            if (album_thumb_gen_ram_filled >= ALBUM_THUMBNAIL_CACHE_SIZE &&
+                album_thumbnail_sized_cache_hit(&info, found, sizeof(found)) &&
                 album_player_cache_hit(&info, found, sizeof(found))) {
                 cached++;
 #ifdef UI_PERF_TRACE
@@ -1843,8 +1972,61 @@ static void * album_thumb_gen_thread_func(void * arg) {
 #ifdef UI_PERF_TRACE
             if (pixels) perf_generated++; else perf_failed++;
 #endif
-            free(pixels);
-            atomic_fetch_add(&album_thumb_gen_done_count, 1);
+                if (album_thumb_gen_ram_filled < ALBUM_THUMBNAIL_CACHE_SIZE) {
+                    album_thumb_gen_ram_filled++;
+                    if (album_thumb_gen_should_cancel(my_generation)) {
+                        free(pixels);
+                    } else {
+                        album_boot_preload_result_song_id = song.id;
+                        album_boot_preload_result_pixels = (uint8_t *) pixels;
+                        album_boot_preload_result_have_source_mtime = (pixels == NULL);
+                        album_boot_preload_result_source_mtime = source_mtime;
+                        atomic_store(&album_boot_preload_state, ALBUM_BOOT_PRELOAD_PENDING);
+                        /* Single-slot rendezvous: wait for album_thumbnail_poll_cb()
+                         * (main/LVGL thread) to fully finish with this result before
+                         * decoding the next album, so at most one handed-off buffer
+                         * is ever outstanding and the cache array is still only ever
+                         * written from the main thread. Waiting for EMPTY specifically
+                         * (not just "not PENDING") matters: once the callback CASes
+                         * PENDING->CLAIMED it still needs to read album_boot_preload_
+                         * result_* before this thread may reuse them for the next
+                         * album -- stopping at "not PENDING" would let this thread
+                         * race ahead and overwrite fields the callback is still
+                         * reading. */
+                        while (atomic_load(&album_boot_preload_state) != ALBUM_BOOT_PRELOAD_EMPTY &&
+                               !album_thumb_gen_should_cancel(my_generation)) {
+                            usleep(5000);
+                        }
+                        /* CAS (not a plain load+store) so exactly one of "we reclaim
+                         * it here because nobody has claimed it yet" and the poll
+                         * callback's own PENDING->CLAIMED transition wins. If the
+                         * callback already claimed it, this CAS fails (state is
+                         * CLAIMED, not PENDING) and the callback alone owns freeing
+                         * or storing the pixels -- it moves the slot back to EMPTY
+                         * once done, which is what the wait loop above is for. */
+                        int expected_state = ALBUM_BOOT_PRELOAD_PENDING;
+                        if (atomic_compare_exchange_strong(&album_boot_preload_state, &expected_state,
+                                                            ALBUM_BOOT_PRELOAD_EMPTY)) {
+                            /* Cancelled while waiting and nobody claimed it first. */
+                            free(album_boot_preload_result_pixels);
+                            album_boot_preload_result_pixels = NULL;
+                        } else {
+                            /* The callback already CASed PENDING->CLAIMED (it can
+                             * race ahead of a should_cancel() that only looked true
+                             * for an instant). CLAIMED is always short-lived -- the
+                             * callback never blocks on anything while holding it --
+                             * so wait it out unconditionally rather than risk this
+                             * thread reusing album_boot_preload_result_* the moment
+                             * should_cancel() flips back to false. */
+                            while (atomic_load(&album_boot_preload_state) != ALBUM_BOOT_PRELOAD_EMPTY) {
+                                usleep(5000);
+                            }
+                        }
+                    }
+                } else {
+                    free(pixels);
+                }
+                atomic_fetch_add(&album_thumb_gen_done_count, 1);
 
             int diag_done = atomic_load(&album_thumb_gen_done_count);
             if ((diag_done % 50) == 0) {
@@ -1895,6 +2077,7 @@ static void start_album_thumbnail_generation(void) {
     cancel_album_thumbnail_generation();
     reap_album_thumbnail_generation();
     atomic_store(&album_thumb_gen_retry_pending, false);
+    album_thumb_gen_ram_filled = 0;
     album_thumb_gen_retry_tick = lv_tick_get();
 
     int artist_count = 0, album_artist_count = 0, album_count = 0;
@@ -1904,6 +2087,13 @@ static void start_album_thumbnail_generation(void) {
     atomic_store(&album_thumb_gen_cancel, false);
     int generation = atomic_fetch_add(&album_thumb_gen_generation, 1) + 1;
     atomic_store(&album_thumb_gen_active, true);
+    /* Only start_next_album_thumbnail()'s own two trigger points used to
+     * need this timer, and both already resume it. The RAM-preload hand-off
+     * below now also depends on it ticking to drain album_boot_preload_
+     * pending -- without this, a cold boot's first generation pass would
+     * stage exactly one result and then block forever with nothing left to
+     * consume it. */
+    if (album_thumbnail_poll_timer) lv_timer_resume(album_thumbnail_poll_timer);
     DB_LOG("ART_CACHE", "start generation=%d albums=%d rss_kb=%ld",
            generation, album_count, db_log_rss_kb());
 
@@ -2035,6 +2225,22 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
      * decode just sits ready a tick or two longer, and this timer keeps
      * rescheduling itself regardless. */
     if (gui_navigation_transition_in_progress()) return;
+    /* CAS claims sole ownership of album_boot_preload_result_* against the
+     * warmer thread's own matching CAS in album_thumb_gen_thread_func() --
+     * see that call site's comment for the full protocol. Moving the slot
+     * back to EMPTY only AFTER the payload is fully read/committed (not
+     * before) is what lets the warmer thread's wait loop safely tell "still
+     * being read by the callback" apart from "free to reuse". */
+    int boot_preload_state = ALBUM_BOOT_PRELOAD_PENDING;
+    if (atomic_compare_exchange_strong(&album_boot_preload_state, &boot_preload_state,
+                                        ALBUM_BOOT_PRELOAD_CLAIMED)) {
+        album_thumbnail_cache_commit(album_boot_preload_result_song_id, album_boot_preload_result_pixels,
+                                      album_boot_preload_result_have_source_mtime,
+                                      album_boot_preload_result_source_mtime);
+        album_boot_preload_result_pixels = NULL;
+        if (album_thumbnail_active_list) compact_list_refresh_visible(album_thumbnail_active_list);
+        atomic_store(&album_boot_preload_state, ALBUM_BOOT_PRELOAD_EMPTY);
+    }
     if (!album_thumbnail_active) {
         start_next_album_thumbnail();
         if (!album_thumbnail_active && !atomic_load(&album_thumb_gen_active)) lv_timer_pause(timer);
@@ -2049,68 +2255,9 @@ static void album_thumbnail_poll_cb(lv_timer_t * timer) {
     bool result_had_art = album_thumbnail_result_pixels != NULL;
     if (album_thumbnail_result_generation == album_thumbnail_generation &&
         album_thumbnail_active_list && album_thumbnail_list_is_visible(album_thumbnail_active_list)) {
-        int victim = -1;
-        uint32_t oldest = UINT32_MAX;
-        for (int i = 0; i < ALBUM_THUMBNAIL_CACHE_SIZE; i++) {
-            if (!album_thumbnail_cache[i].known) { victim = i; break; }
-            if (album_thumbnail_cache[i].last_use < oldest) {
-                oldest = album_thumbnail_cache[i].last_use;
-                victim = i;
-            }
-        }
-        album_thumbnail_cache_entry_t * e = &album_thumbnail_cache[victim];
-        uint8_t * retired_pixels = e->pixels;
-        if (retired_pixels) {
-            /* A leading lv_image can retain &e->dsc after its row last ran
-             * the decorator. Freeing pixels first made that image descriptor
-             * point into released heap memory until the row happened to be
-             * recycled: a redraw/scroll use-after-free on libraries larger
-             * than the LRU. Mark this as a known no-art entry temporarily and
-             * repaint every visible row so all references are detached before
-             * releasing/reusing the slot. */
-            e->pixels = NULL;
-            e->dsc.data = NULL;
-            if (album_thumbnail_active_list)
-                compact_list_refresh_visible(album_thumbnail_active_list);
-            free(retired_pixels);
-        }
-        memset(e, 0, sizeof(*e));
-        /* A failed decode (pixels == NULL) is only worth caching as a durable
-         * "known, no art" entry if album_thumbnail_load_or_decode_ex() itself
-         * already recorded it as PERMANENT (corrupt/oversized/genuinely
-         * absent source). A TEMPORARY failure (memory admission, coordinator
-         * busy, a cancelled/preempted decode) must NOT be cached here the
-         * same way -- album_thumbnail_cache_find()'s only gate is `known`,
-         * so caching it at all previously made a transient hiccup permanent
-         * for this song for the rest of this cache slot's lifetime, with no
-         * retry until unrelated LRU pressure happened to evict it. Leaving
-         * the slot at its just-memset "unused" state (known=false) instead
-         * lets queue_album_thumbnail() legitimately retry this song next
-         * time it scrolls back into view. */
-        bool commit_known = album_thumbnail_result_pixels != NULL;
-        if (!commit_known && album_thumbnail_result_have_source_mtime) {
-            artwork_fail_reason_t fail_reason = ARTWORK_FAIL_NONE;
-            if (artwork_failure_cache_is_blocked(album_thumbnail_result_song_id,
-                                                 album_thumbnail_result_source_mtime, &fail_reason) &&
-                fail_reason == ARTWORK_FAIL_PERMANENT) {
-                commit_known = true;
-            }
-        }
-        if (commit_known) {
-            e->song_id = album_thumbnail_result_song_id;
-            e->known = true;
-            e->pixels = album_thumbnail_result_pixels;
-            e->last_use = ++album_thumbnail_use_counter;
-            if (e->pixels) {
-                e->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-                e->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-                e->dsc.header.w = ALBUM_THUMBNAIL_PX;
-                e->dsc.header.h = ALBUM_THUMBNAIL_PX;
-                e->dsc.header.stride = ALBUM_THUMBNAIL_PX * 2;
-                e->dsc.data = e->pixels;
-                e->dsc.data_size = ALBUM_THUMBNAIL_PX * ALBUM_THUMBNAIL_PX * 2;
-            }
-        }
+        album_thumbnail_cache_commit(album_thumbnail_result_song_id, album_thumbnail_result_pixels,
+                                      album_thumbnail_result_have_source_mtime,
+                                      album_thumbnail_result_source_mtime);
         album_thumbnail_result_pixels = NULL;
         result_applied = true;
     }
@@ -5503,6 +5650,23 @@ void library_load_from_cache_only(void) {
      * handle against the previous (or empty unmounted) mount. */
     metadata_db_close();
     metadata_db_open();
+}
+
+    /* Kicks off the persistent album-art warmer at boot (normally only
+     * started after a rescan or SD reinsert) so its first
+     * ALBUM_THUMBNAIL_CACHE_SIZE decoded thumbnails are already sitting in
+     * album_thumbnail_cache[] before the user ever opens Albums, in addition
+     * to its existing on-disk sized-BMP warming. No-op on a fresh/empty
+     * database, matching every other start_album_thumbnail_generation() call
+     * site's own guard. */
+/* Kicks off the persistent album-art warmer at boot (normally only started
+ * after a rescan or SD reinsert) so its first ALBUM_THUMBNAIL_CACHE_SIZE
+ * decoded thumbnails are already sitting in album_thumbnail_cache[] before
+ * the user ever opens Albums, in addition to its existing on-disk sized-BMP
+ * warming. No-op on a fresh/empty database, matching every other
+ * start_album_thumbnail_generation() call site's own guard. */
+void gui_library_start_boot_thumbnail_warmup(void) {
+    if (metadata_db_get_song_count() > 0) start_album_thumbnail_generation();
 }
 
 bool gui_library_has_background_work(void) {

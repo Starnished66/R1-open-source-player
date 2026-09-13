@@ -938,6 +938,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     charge_limiter_poll(current_settings.charge_limiter_enabled, false);
     safe_charging_poll(current_settings.safe_charging_enabled, false);
     led_control_poll(current_settings.led_indicator_enabled);
+    headphone_status_refresh_earpods_adc();
 
     if (current_settings.remote_control_enabled) {
         /* No separate now-playing metadata cache exists in this app beyond
@@ -1360,6 +1361,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     settings_load(&current_settings);
     db_log_set_enabled(current_settings.db_logging_enabled);
     usb_dac_bridge_set_debug_log_enabled(current_settings.db_logging_enabled);
+    headphone_status_refresh_earpods_adc();
     app_clock_init(current_settings.clock_automatic, current_settings.clock_manual_epoch,
                    current_settings.clock_system_reference);
 #ifndef HOST_BUILD
@@ -1522,6 +1524,9 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * against. */
 
     gui_library_init();
+    /* Warms the first ALBUM_THUMBNAIL_CACHE_SIZE album thumbnails into RAM
+     * (and the rest onto disk) before the user ever opens Albums. */
+    gui_library_start_boot_thumbnail_warmup();
     gui_network_init();
     gui_settings_init();
     gui_plugin_manage_init();

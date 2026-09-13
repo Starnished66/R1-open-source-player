@@ -8,6 +8,12 @@
 typedef struct group_song_entry_s {
     char * path;
     char * title;
+    int32_t track_number;   /* -1/0 = unknown, same convention as metadata_db.h */
+    int32_t disc_number;    /* effective disc number, defaults to 1 when unknown */
+    bool show_disc_header;  /* true => populate_group_songs_rows() inserts a
+                              * "Disc N" divider immediately before this entry;
+                              * only ever set when the enclosing album actually
+                              * spans more than one disc. */
 } group_song_entry_t;
 
 void free_group_song_entries(group_song_entry_t * entries, int count);

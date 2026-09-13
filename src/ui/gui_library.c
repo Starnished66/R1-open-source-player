@@ -309,6 +309,9 @@ bool copy_group_song_entries(group_song_entry_t ** out, const group_song_entry_t
     for (int i = 0; i < count; i++) {
         copy[i].path = strdup(entries[i].path ? entries[i].path : "");
         copy[i].title = strdup(entries[i].title ? entries[i].title : "");
+        copy[i].track_number = entries[i].track_number;
+        copy[i].disc_number = entries[i].disc_number;
+        copy[i].show_disc_header = entries[i].show_disc_header;
         if (!copy[i].path || !copy[i].title) {
             free_group_song_entries(copy, count);
             return false;
@@ -340,11 +343,56 @@ static const char * song_quality_asset_for_path(const char * path) {
     return "touch_list/quality_nomal.png";
 }
 
+/* Scans a set of songs already known to belong to the same album (and
+ * album_artist) and reports whether more than one distinct disc number
+ * shows up -- absent/legacy disc numbers (<= 0, see metadata_db.h) count
+ * as disc 1, same default this file uses elsewhere, so a single real disc
+ * mixed with a few untagged tracks doesn't falsely read as multi-disc. */
+static bool album_songs_are_multi_disc(const song_row_t * songs, int count) {
+    int32_t first_disc = 0;
+    bool have_first = false;
+    for (int i = 0; i < count; i++) {
+        int32_t disc = songs[i].tags.disc_number > 0 ? songs[i].tags.disc_number : 1;
+        if (!have_first) {
+            first_disc = disc;
+            have_first = true;
+        } else if (disc != first_disc) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Orders songs within one album by disc, then track, then path -- the
+ * DB's own per-album order (metadata_db_get_album_songs()) is by file
+ * path, not disc/track, so single-album call sites need this before
+ * building entries for disc dividers/track numbers to make sense on
+ * screen. Mirrors cmp_artist_song_sort_entry()'s own disc/track rule
+ * further down, used by the multi-album "All Songs" aggregate. */
+static int cmp_song_disc_track(const void * a, const void * b) {
+    const song_row_t * sa = (const song_row_t *) a;
+    const song_row_t * sb = (const song_row_t *) b;
+    int32_t da = sa->tags.disc_number > 0 ? sa->tags.disc_number : 1;
+    int32_t db = sb->tags.disc_number > 0 ? sb->tags.disc_number : 1;
+    if (da != db) return da < db ? -1 : 1;
+    int32_t ta = sa->tags.track_number, tb = sb->tags.track_number;
+    if (ta > 0 || tb > 0) {
+        if (ta <= 0) return 1;
+        if (tb <= 0) return -1;
+        if (ta != tb) return ta < tb ? -1 : 1;
+    }
+    return strcasecmp(sa->path, sb->path);
+}
+
 static void format_music_submenu_identity(const song_row_t * song, char * out, size_t out_size) {
     char title[128];
     metadata_db_song_display_title(song, title, sizeof(title));
-    const char * ext = strrchr(song->path, '.');
-    snprintf(out, out_size, "%s\n%s", title, ext && ext[1] ? ext + 1 : "Audio");
+    int32_t track = song->tags.track_number;
+    if (track > 0) {
+        snprintf(out, out_size, "%s\n%d", title, track);
+    } else {
+        snprintf(out, out_size, "%s\n ", title);
+    }
 }
 
 void gui_library_format_song_identity(const song_row_t * row,
@@ -574,6 +622,10 @@ typedef struct {
     char path[PATH_MAX];
     int generation;
     int slot_index; /* index into group_songs_visible_rows[] */
+    int32_t track_number; /* -1/0 = unknown -- carried through so the
+                            * completed result can render "<track> · " as a
+                            * prefix without having to look group_songs_
+                            * entries[] back up by the time the probe lands. */
 } song_duration_request_t;
 
 #define SONG_DURATION_QUEUE_SIZE GROUP_SONGS_PAGE_SIZE
@@ -585,6 +637,7 @@ static bool song_duration_active;
 static atomic_bool song_duration_done;
 static int song_duration_result_generation;
 static int song_duration_result_slot_index;
+static int32_t song_duration_result_track_number;
 static bool song_duration_result_ok;
 static double song_duration_result_seconds;
 static audio_codec_t song_duration_result_codec;
@@ -603,6 +656,7 @@ static void * song_duration_thread_func(void * arg) {
     bool ok = audio_probe_file_format(req->path, &info) && info.duration_seconds > 0.0;
     song_duration_result_generation = req->generation;
     song_duration_result_slot_index = req->slot_index;
+    song_duration_result_track_number = req->track_number;
     song_duration_result_ok = ok;
     song_duration_result_seconds = ok ? info.duration_seconds : 0.0;
     song_duration_result_codec = ok ? info.codec : AUDIO_CODEC_UNKNOWN;
@@ -633,7 +687,7 @@ static void start_next_song_duration_probe(void) {
  * generation still matches what's currently on screen; otherwise the
  * result is silently discarded (navigated away, or the page/edit-mode
  * was rebuilt since this request was queued). On probe failure, the
- * row's existing "<title>\n<EXT or Audio>" fallback text is left as-is. */
+ * row's existing blank (single-space) subtitle is left as-is. */
 static void song_duration_poll_cb(lv_timer_t * timer) {
     if (gui_navigation_transition_in_progress()) return;
     if (!song_duration_done) return;
@@ -646,8 +700,13 @@ static void song_duration_poll_cb(lv_timer_t * timer) {
             lv_obj_t * secondary = lv_obj_get_child(row, 1);
             unsigned int seconds = (unsigned int) (song_duration_result_seconds + 0.5);
             char text[64];
-            snprintf(text, sizeof(text), "%u:%02u - %s", seconds / 60, seconds % 60,
-                     song_duration_codec_name(song_duration_result_codec));
+            if (song_duration_result_track_number > 0) {
+                snprintf(text, sizeof(text), "%d · %u:%02u - %s", song_duration_result_track_number,
+                         seconds / 60, seconds % 60, song_duration_codec_name(song_duration_result_codec));
+            } else {
+                snprintf(text, sizeof(text), "%u:%02u - %s", seconds / 60, seconds % 60,
+                         song_duration_codec_name(song_duration_result_codec));
+            }
             lv_label_set_text(secondary, text);
             lv_obj_remove_flag(secondary, LV_OBJ_FLAG_HIDDEN);
         }
@@ -672,6 +731,7 @@ static void queue_song_duration_probes(int first_index, int last_index_exclusive
     for (int i = first_index; i < last_index_exclusive && song_duration_queue_count < SONG_DURATION_QUEUE_SIZE; i++) {
         song_duration_queue[song_duration_queue_count].generation = song_duration_generation;
         song_duration_queue[song_duration_queue_count].slot_index = i - first_index;
+        song_duration_queue[song_duration_queue_count].track_number = group_songs_entries[i].track_number;
         snprintf(song_duration_queue[song_duration_queue_count].path,
                  sizeof(song_duration_queue[song_duration_queue_count].path),
                  "%s", group_songs_entries[i].path);
@@ -962,6 +1022,19 @@ static void populate_group_songs_rows(void) {
     }
 
     for (int i = group_songs_page_start; i < page_end; i++) {
+        /* No-background "Disc N" divider (add_section_header(), same style
+         * already used by Wi-Fi/Bluetooth section labels) immediately
+         * before the first track of a disc -- only ever set on entries
+         * belonging to an album that actually has more than one (see
+         * album_songs_are_multi_disc()/its per-album equivalent in
+         * artist_albums_show_all_songs()). Skipped in edit mode, same as
+         * the subtitle backfill below -- move/remove icons occupy that
+         * row shape instead. */
+        if (!editing && group_songs_entries[i].show_disc_header) {
+            char disc_text[32];
+            snprintf(disc_text, sizeof(disc_text), "Disc %d", group_songs_entries[i].disc_number);
+            add_section_header(group_songs_list, disc_text);
+        }
         if (editing) {
             lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, BOARD_SCALE_PX(190));
             if (group_songs_music_submenu) lv_obj_set_width(row, lv_pct(100));
@@ -2514,30 +2587,51 @@ static group_song_entry_t * load_album_entries(const char * name, const char * a
     if (song_count <= 0) return NULL;
     group_song_entry_t * entries = calloc((size_t) song_count, sizeof(*entries));
     if (!entries) return NULL;
-    song_row_t page[64];
+    /* Fetched into a full song_count-sized array (not a page[64] scratch
+     * buffer like before) rather than formatted row-by-row during the
+     * fetch loop -- disc dividers/track numbers need the whole album
+     * seen first, both to know if it's multi-disc (album_songs_are_multi_
+     * disc()) and to sort it into disc/track order (cmp_song_disc_track())
+     * since the DB's own per-album order is by file path. */
+    song_row_t * songs = malloc(sizeof(song_row_t) * (size_t) song_count);
+    if (!songs) {
+        free(entries);
+        return NULL;
+    }
     int n = 0;
     while (n < song_count) {
         int want = song_count - n;
-        if (want > 64) want = 64;
-        int got = metadata_db_get_album_songs(name, album_artist, n, page, want);
+        int got = metadata_db_get_album_songs(name, album_artist, n, &songs[n], want);
         if (got <= 0) break;
-        for (int i = 0; i < got; i++) {
-            char title[384];
-            format_music_submenu_identity(&page[i], title, sizeof(title));
-            entries[n + i].path = strdup(page[i].path);
-            entries[n + i].title = strdup(title);
-            if (!entries[n + i].path || !entries[n + i].title) {
-                free_group_song_entries(entries, song_count);
-                return NULL;
-            }
-        }
         n += got;
         if (got < want) break;
     }
     if (n <= 0) {
         free_group_song_entries(entries, song_count);
+        free(songs);
         return NULL;
     }
+    qsort(songs, (size_t) n, sizeof(*songs), cmp_song_disc_track);
+    bool multi_disc = album_songs_are_multi_disc(songs, n);
+    int32_t prev_disc = 0;
+    bool have_prev = false;
+    for (int i = 0; i < n; i++) {
+        char title[384];
+        format_music_submenu_identity(&songs[i], title, sizeof(title));
+        entries[i].path = strdup(songs[i].path);
+        entries[i].title = strdup(title);
+        entries[i].track_number = songs[i].tags.track_number;
+        entries[i].disc_number = songs[i].tags.disc_number > 0 ? songs[i].tags.disc_number : 1;
+        entries[i].show_disc_header = multi_disc && (!have_prev || entries[i].disc_number != prev_disc);
+        prev_disc = entries[i].disc_number;
+        have_prev = true;
+        if (!entries[i].path || !entries[i].title) {
+            free_group_song_entries(entries, song_count);
+            free(songs);
+            return NULL;
+        }
+    }
+    free(songs);
     *out_count = n;
     return entries;
 }
@@ -4786,6 +4880,9 @@ typedef struct {
     char album_artist[128];
     int32_t disc_number;
     int32_t track_number;
+    bool show_disc_header; /* set after sorting, once each album's songs are
+                             * grouped together -- see the post-sort pass in
+                             * artist_albums_show_all_songs() below. */
 } artist_song_sort_entry_t;
 
 /* Sorts songs by album, then album artist, then disc number, track number,
@@ -4883,6 +4980,41 @@ static bool artist_albums_show_all_songs(void) {
     /* Sort songs in disc and track order within each album across the artist's catalog. */
     qsort(sort_entries, (size_t) n, sizeof(*sort_entries), cmp_artist_song_sort_entry);
 
+    /* Mark the first track of each disc for every album that actually has
+     * more than one, now that this artist's songs are grouped by album --
+     * multi-disc detection is only meaningful once every track of one
+     * album can be seen together (album_songs_are_multi_disc()'s own rule,
+     * applied here per contiguous album run instead of via song_row_t). */
+    for (int i = 0; i < n; ) {
+        int j = i;
+        while (j < n && strcasecmp(sort_entries[j].album, sort_entries[i].album) == 0 &&
+               strcasecmp(sort_entries[j].album_artist, sort_entries[i].album_artist) == 0) {
+            j++;
+        }
+        int32_t first_disc = 0;
+        bool have_first = false, multi_disc = false;
+        for (int k = i; k < j; k++) {
+            int32_t d = sort_entries[k].disc_number > 0 ? sort_entries[k].disc_number : 1;
+            if (!have_first) {
+                first_disc = d;
+                have_first = true;
+            } else if (d != first_disc) {
+                multi_disc = true;
+                break;
+            }
+        }
+        int32_t prev_disc = 0;
+        bool have_prev = false;
+        for (int k = i; k < j; k++) {
+            int32_t d = sort_entries[k].disc_number > 0 ? sort_entries[k].disc_number : 1;
+            sort_entries[k].disc_number = d;
+            sort_entries[k].show_disc_header = multi_disc && (!have_prev || d != prev_disc);
+            prev_disc = d;
+            have_prev = true;
+        }
+        i = j;
+    }
+
     /* Transfer ownership of path and title strings into a group_song_entry_t
      * array for show_group_songs_take_ownership() to avoid duplicate allocations. */
     group_song_entry_t * entries = malloc(sizeof(*entries) * (size_t) n);
@@ -4897,6 +5029,9 @@ static bool artist_albums_show_all_songs(void) {
     for (int i = 0; i < n; i++) {
         entries[i].path = sort_entries[i].path;
         entries[i].title = sort_entries[i].title;
+        entries[i].track_number = sort_entries[i].track_number;
+        entries[i].disc_number = sort_entries[i].disc_number;
+        entries[i].show_disc_header = sort_entries[i].show_disc_header;
     }
     free(sort_entries);
 
@@ -4920,31 +5055,50 @@ static void artist_album_row_click_cb(int index) {
     int group_index = index - 1;
     if (group_index < 0 || group_index >= artist_albums_group_count) return;
     group_row_t * group = &artist_albums_groups[group_index];
-    group_song_entry_t * entries = calloc((size_t) group->song_count, sizeof(*entries));
+    /* Fetched into a full song_count-sized array first (not formatted
+     * row-by-row from a page[64] scratch buffer) -- see load_album_
+     * entries()'s own comment on why: disc dividers/track numbers need
+     * the whole album seen and sorted into disc/track order before any
+     * entry is built. */
+    song_row_t * songs = malloc(sizeof(song_row_t) * (size_t) group->song_count);
     int n = 0;
-    song_row_t page[64];
-    while (entries && n < group->song_count) {
+    while (songs && n < group->song_count) {
         int want = group->song_count - n;
-        if (want > 64) want = 64;
-        int got = metadata_db_get_album_songs(group->name, group->album_artist, n, page, want);
+        int got = metadata_db_get_album_songs(group->name, group->album_artist, n, &songs[n], want);
         if (got <= 0) break;
-        for (int i = 0; i < got; i++) {
-            char title[192];
-            format_music_submenu_identity(&page[i], title, sizeof(title));
-            entries[n + i].path = strdup(page[i].path);
-            entries[n + i].title = strdup(title);
-            if (!entries[n + i].path || !entries[n + i].title) {
-                free_group_song_entries(entries, group->song_count);
-                entries = NULL;
-                n = 0;
-                break;
-            }
-        }
-        if (!entries) break;
         n += got;
         if (got < want) break;
     }
-    if (!entries) return;
+    if (!songs || n <= 0) {
+        free(songs);
+        return;
+    }
+    qsort(songs, (size_t) n, sizeof(*songs), cmp_song_disc_track);
+    bool multi_disc = album_songs_are_multi_disc(songs, n);
+    group_song_entry_t * entries = calloc((size_t) n, sizeof(*entries));
+    if (!entries) {
+        free(songs);
+        return;
+    }
+    int32_t prev_disc = 0;
+    bool have_prev = false;
+    for (int i = 0; i < n; i++) {
+        char title[192];
+        format_music_submenu_identity(&songs[i], title, sizeof(title));
+        entries[i].path = strdup(songs[i].path);
+        entries[i].title = strdup(title);
+        entries[i].track_number = songs[i].tags.track_number;
+        entries[i].disc_number = songs[i].tags.disc_number > 0 ? songs[i].tags.disc_number : 1;
+        entries[i].show_disc_header = multi_disc && (!have_prev || entries[i].disc_number != prev_disc);
+        prev_disc = entries[i].disc_number;
+        have_prev = true;
+        if (!entries[i].path || !entries[i].title) {
+            free_group_song_entries(entries, n);
+            free(songs);
+            return;
+        }
+    }
+    free(songs);
     show_music_group_songs(group->name, entries, n);
     free_group_song_entries(entries, n);
     group_songs_source_is_album = true;

@@ -14,4 +14,6 @@ enum HEADPHONE_STATE {
 // if 3.5mm and 4.4mm are both plugged in, 4.4mm is prioritized
 enum HEADPHONE_STATE get_headphone_state(void);
 
+void headphone_status_refresh_earpods_adc(void);
+
 #endif

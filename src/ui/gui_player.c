@@ -7,6 +7,7 @@
 #include "backlight.h"
 #include "led_control.h"
 #include "charge_limiter.h"
+#include "headphone_status.h"
 
 /* ---- Playback state and advance machinery ---- */
 static char ** playlist = NULL;
@@ -3495,6 +3496,13 @@ void crossfade_switch_event_cb(lv_event_t * e) {
 void car_mode_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.car_mode_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+}
+
+void inline_remote_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.inline_remote_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    headphone_status_refresh_earpods_adc();
     settings_save(&current_settings);
 }
 

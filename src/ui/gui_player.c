@@ -77,16 +77,21 @@ static uint64_t current_playback_generation = 0;
 static lv_obj_t * player_screen = NULL;
 lv_obj_t * player_dismiss_btn = NULL;
 lv_obj_t * player_overlay_panel = NULL;
+lv_obj_t * player_background_img = NULL;
+lv_obj_t * cover_card = NULL;
 lv_obj_t * cover_img = NULL;
 lv_obj_t * song_folder_label = NULL;
+lv_obj_t * song_album_label = NULL;
 lv_obj_t * song_quality_label = NULL;
 lv_obj_t * song_bitrate_label = NULL;
 lv_obj_t * song_track_label = NULL;
 lv_obj_t * song_count_label = NULL;
 lv_obj_t * song_title_label = NULL;
+lv_obj_t * quality_pill = NULL;
 lv_obj_t * format_badge_label = NULL;
 lv_obj_t * play_mode_img = NULL;
 static lv_obj_t * order_icon = NULL;
+lv_obj_t * favorite_circle = NULL;
 lv_obj_t * favorite_icon = NULL;
 lv_obj_t * play_btn = NULL;
 lv_obj_t * prev_btn = NULL;
@@ -111,8 +116,6 @@ lv_obj_t * more_menu_popup_backdrop = NULL;
 static lv_obj_t * volume_popup_track = NULL;
 static lv_obj_t * volume_popup_speaker_icon = NULL;
 static lv_timer_t * volume_popup_hide_timer = NULL;
-static const lv_image_dsc_t * progress_bg_image = NULL;
-static const lv_image_dsc_t * progress_fill_image = NULL;
 static asset_decoded_image_t volume_popup_bg_image;
 static asset_decoded_image_t volume_popup_speaker_image;
 /* Decoded copies of btn_play.png / btn_pause.png with the baked-in cyan
@@ -311,10 +314,13 @@ static void build_volume_popup(void) {
  * blurred, darkened, vertically-mirrored copy of the album art,
  * replacing the flat buttom.png placeholder. Generated fresh from the
  * per-track RGB565 buffer decoded by cover_decode_to_rgb565(). */
-/* Tracks the overlay panel's own real size (BOARD_PLAYER_OVERLAY_HEIGHT),
- * not the cover's -- this buffer is drawn as player_overlay_panel's own
- * background (build_player_screen()), so it must fill exactly that panel,
- * same as buttom.png (the no-track-playing placeholder background) does. */
+static inline int32_t player_x(int32_t px) { return BOARD_SCALE_PX(px); }
+static inline int32_t player_y(int32_t px) { return (int32_t) (((int64_t) px * BOARD_SCREEN_HEIGHT + 400) / 800); }
+static inline int32_t player_s(int32_t px) {
+    int32_t sx = player_x(px), sy = player_y(px);
+    return sx < sy ? sx : sy;
+}
+
 #define REFLECTION_WIDTH BOARD_SCREEN_WIDTH
 #define REFLECTION_HEIGHT BOARD_PLAYER_OVERLAY_HEIGHT
 #define REFLECTION_BLUR_RADIUS 32
@@ -322,14 +328,15 @@ static void build_volume_popup(void) {
 /* Kept as an integer ratio (channel * NUM / DEN) rather than a float --
  * matches this codebase's general preference for integer arithmetic on the
  * embedded target, and there's no accuracy need here that would justify a
- * float. 1/4 reads as "mostly faded into black" without the panel going
- * fully flat. */
-#define REFLECTION_DARKEN_NUM 1
-#define REFLECTION_DARKEN_DEN 2
+ * float. 3/4 keeps the background legible as art rather than a flat dark
+ * smear, while still darkening it enough for the foreground text/controls
+ * to read clearly on top. */
+#define REFLECTION_DARKEN_NUM 3
+#define REFLECTION_DARKEN_DEN 4
 
 /* Pure pixel math -- builds the reflection from a given COVER_ART_WIDTH x
  * COVER_ART_HEIGHT RGB565 buffer and returns a freshly malloc'd
- * REFLECTION_WIDTH x REFLECTION_HEIGHT RGB565 buffer, or NULL on allocation
+ * REFLECTION_WIDTH x BOARD_SCREEN_HEIGHT RGB565 buffer, or NULL on allocation
  * failure. Caller owns the result. Accepts blur radius, passes, and darken
  * fraction parameters with defensive clamping. */
 uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes, int blur_radius, int blur_passes, int darken_num, int darken_den) {
@@ -348,14 +355,27 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes, int blur_radius,
         return NULL;
     }
 
-    /* Center-crop the square cover to this wide panel. The previous bottom-
+    /* Center-crop the square cover to this wide panel -- or, since
+     * COVER_ART_WIDTH/HEIGHT no longer has to match the screen (see gui.h's
+     * own comment on COVER_ART_WIDTH), center-and-edge-extend when the
+     * decoded cover is SMALLER than this panel in either dimension. src_x/
+     * src_y are clamped into the real buffer either way, so this never reads
+     * past cover_bytes regardless of how COVER_ART_WIDTH/HEIGHT and
+     * REFLECTION_WIDTH/HEIGHT relate on a given board. The previous bottom-
      * strip mirror preserved recognizable hard shapes even after blurring,
      * which looked like a smeared reflection rather than frosted glass. */
+    int y_offset = (COVER_ART_HEIGHT - h) / 2;
+    int x_offset = (COVER_ART_WIDTH - w) / 2;
     for (int y = 0; y < h; y++) {
-        int src_y = (COVER_ART_HEIGHT - h) / 2 + y;
+        int src_y = y + y_offset;
+        if (src_y < 0) src_y = 0;
+        else if (src_y >= COVER_ART_HEIGHT) src_y = COVER_ART_HEIGHT - 1;
         const uint16_t * src_row = (const uint16_t *) (cover_bytes + (size_t) src_y * COVER_ART_WIDTH * 2);
         for (int x = 0; x < w; x++) {
-            uint16_t px = src_row[x];
+            int src_x = x + x_offset;
+            if (src_x < 0) src_x = 0;
+            else if (src_x >= COVER_ART_WIDTH) src_x = COVER_ART_WIDTH - 1;
+            uint16_t px = src_row[src_x];
             r[y * w + x] = (uint8_t) (((px >> 11) & 0x1F) * 255 / 31);
             g[y * w + x] = (uint8_t) (((px >> 5) & 0x3F) * 255 / 63);
             b[y * w + x] = (uint8_t) ((px & 0x1F) * 255 / 31);
@@ -384,7 +404,7 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes, int blur_radius,
         memcpy(b, tmp, (size_t) w * h);
     }
 
-    uint8_t * out_bytes = malloc((size_t) w * h * 2);
+    uint8_t * out_bytes = malloc((size_t) w * BOARD_SCREEN_HEIGHT * 2);
     if (!out_bytes) {
         free(r); free(g); free(b); free(tmp);
         return NULL;
@@ -400,6 +420,16 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes, int blur_radius,
         out[i] = rgb888_to_565_dithered(rv, gv, bv, i % w, i / w);
     }
     free(r); free(g); free(b); free(tmp);
+    /* Expand once, not through LVGL's image-transform path on every redraw.
+     * Walk backwards so expansion can reuse the allocation in place. Keep
+     * the small working blur buffers and the existing vertical mapping. */
+    const int scale_y = (BOARD_SCREEN_HEIGHT * LV_SCALE_NONE + h - 1) / h;
+    for (int y = BOARD_SCREEN_HEIGHT - 1; y >= 0; --y) {
+        int src_y = y * LV_SCALE_NONE / scale_y;
+        if (src_y >= h) src_y = h - 1;
+        if (src_y != y)
+            memcpy(out + (size_t) y * w, out + (size_t) src_y * w, (size_t) w * 2);
+    }
     return out_bytes;
 }
 
@@ -459,12 +489,14 @@ static player_frost_params_t resolve_player_frost_params(void) {
 }
 
 static void apply_player_flat_background(bool has_bg_color, uint32_t bg_color) {
+    if (player_background_img) {
+        lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+    }
     free(current_reflection_bytes);
     current_reflection_bytes = NULL;
 
     if (!player_overlay_panel) return;
 
-    lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
     if (has_bg_color) {
         lv_obj_set_style_bg_color(player_overlay_panel, lv_color_hex(bg_color), 0);
     } else {
@@ -490,28 +522,40 @@ void gui_player_refresh_frosted_background(void) {
          * Still clear any flat-mode BG_COLOR left over from a previous
          * live switch away from flat, so a stale tint doesn't linger
          * behind the frosted image once a cover does decode. */
+        if (player_background_img) {
+            lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+        }
         lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
         return;
     }
 
+    if (player_background_img) {
+        lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+    }
     free(current_reflection_bytes);
     current_reflection_bytes = compute_reflection_bytes(current_cover_bytes, params.blur_radius, params.blur_passes, params.darken_num, params.darken_den);
 
     lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
     lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_COVER, 0);
 
-    if (current_reflection_bytes) {
+    if (current_reflection_bytes && player_background_img) {
         memset(&current_reflection_dsc, 0, sizeof(current_reflection_dsc));
         current_reflection_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
         current_reflection_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
         current_reflection_dsc.header.w = REFLECTION_WIDTH;
-        current_reflection_dsc.header.h = REFLECTION_HEIGHT;
+        current_reflection_dsc.header.h = BOARD_SCREEN_HEIGHT;
         current_reflection_dsc.header.stride = REFLECTION_WIDTH * 2;
         current_reflection_dsc.data = current_reflection_bytes;
-        current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * REFLECTION_HEIGHT * 2;
-        lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
-    } else {
-        lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
+        current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * BOARD_SCREEN_HEIGHT * 2;
+        lv_image_set_src(player_background_img, &current_reflection_dsc);
+        lv_obj_set_pos(player_background_img, 0, 0);
+        lv_obj_set_size(player_background_img, REFLECTION_WIDTH, BOARD_SCREEN_HEIGHT);
+        lv_image_set_pivot(player_background_img, 0, 0);
+        lv_image_set_scale_x(player_background_img, LV_SCALE_NONE);
+        lv_image_set_scale_y(player_background_img, LV_SCALE_NONE);
+        lv_obj_remove_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+    } else if (player_background_img) {
+        lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
     }
     player_transition_mark_dirty();
 }
@@ -569,9 +613,12 @@ static atomic_bool cover_decode_done_flag = false;
  * thread only reads after seeing the flag" contract as every other _done_
  * flag in this file. */
 static int cover_decode_result_for_index;
+static audio_current_format_info_t cover_decode_result_format;
+/* UI-thread cache, keyed by path rather than a mutable playlist index. */
+static audio_current_format_info_t player_cached_format;
 static bool cover_decode_result_ok;
 static uint16_t * cover_decode_result_pixels;    /* COVER_ART_WIDTH x COVER_ART_HEIGHT RGB565, owned */
-static uint8_t * cover_decode_result_reflection; /* REFLECTION_WIDTH x REFLECTION_HEIGHT RGB565, owned */
+static uint8_t * cover_decode_result_reflection; /* REFLECTION_WIDTH x BOARD_SCREEN_HEIGHT RGB565, owned */
 static bool cover_decode_result_flat;
 static bool cover_decode_result_has_bg_color;
 static uint32_t cover_decode_result_bg_color;
@@ -704,10 +751,45 @@ static bool load_cached_player_cover(const char * track_path, const char * artis
     return false;
 }
 
+/* Read native FLAC STREAMINFO without opening a second decoder. This is
+ * bounded I/O and avoids shared codec initialization or whole-file scans. */
+static bool player_read_flac_format(const char * path, audio_current_format_info_t * out) {
+    unsigned char header[42];
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+    size_t n = fread(header, 1, sizeof(header), f);
+    fclose(f);
+    if (n != sizeof(header) || memcmp(header, "fLaC", 4) != 0 ||
+        (header[4] & 0x7f) != 0 || header[5] != 0 || header[6] != 0 || header[7] != 34)
+        return false;
+    /* STREAMINFO bytes 10..13 pack rate (20 bits), channels (3), depth (5). */
+    unsigned int rate = ((unsigned int) header[18] << 12) |
+                        ((unsigned int) header[19] << 4) | (header[20] >> 4);
+    unsigned int depth = (((header[20] & 1u) << 4) | (header[21] >> 4)) + 1;
+    if (!rate || depth < 4) return false;
+    memset(out, 0, sizeof(*out));
+    out->valid = true;
+    snprintf(out->path, sizeof(out->path), "%s", path);
+    out->source_sample_rate = rate;
+    out->source_bit_depth = depth;
+    return true;
+}
+
 static void * cover_decode_thread_func(void * arg) {
     cover_decode_request_t * req = (cover_decode_request_t *) arg;
     uint16_t * pixels = NULL;
     bool ok = false;
+
+    memset(&cover_decode_result_format, 0, sizeof(cover_decode_result_format));
+    if (req->local_track_path[0]) {
+        if (!audio_get_current_format_info(&cover_decode_result_format) ||
+            strcmp(cover_decode_result_format.path, req->local_track_path) != 0) {
+            memset(&cover_decode_result_format, 0, sizeof(cover_decode_result_format));
+            /* Restored paused tracks have no decoder yet. Probe off the UI
+             * thread; never start playback merely to populate the badge. */
+            player_read_flac_format(req->local_track_path, &cover_decode_result_format);
+        }
+    }
 
     if (req->stream_url[0] != '\0') {
         int status = 0;
@@ -819,6 +901,24 @@ static void launch_cover_decode_from_url(int for_index, const char * url, bool v
 }
 
 
+static void fit_cover_img_to_card(void) {
+    if (!cover_img || !cover_card) return;
+    lv_image_header_t header;
+    if (lv_image_decoder_get_info(lv_image_get_src(cover_img), &header) != LV_RESULT_OK ||
+        header.w <= 0 || header.h <= 0) return;
+    int32_t card_w = lv_obj_get_width(cover_card);
+    int32_t card_h = lv_obj_get_height(cover_card);
+    if (card_w <= 0 || card_h <= 0) {
+        card_w = player_s(350);
+        card_h = player_s(350);
+    }
+    int32_t scale_w = (card_w * LV_SCALE_NONE + header.w - 1) / header.w;
+    int32_t scale_h = (card_h * LV_SCALE_NONE + header.h - 1) / header.h;
+    int32_t scale = scale_w > scale_h ? scale_w : scale_h;
+    lv_image_set_scale(cover_img, scale);
+    lv_obj_align(cover_img, LV_ALIGN_CENTER, 0, 0);
+}
+
 /* Called every tick from update_timer_cb. Applies the finished decode to
  * cover_img/player_overlay_panel -- unless playlist_index has already moved
  * on to a different track by the time this lands (another launch_cover_
@@ -829,6 +929,12 @@ void poll_cover_decode(void) {
     if (!cover_decode_active || !atomic_load_explicit(&cover_decode_done_flag, memory_order_acquire)) return;
     cover_decode_active = false;
     pthread_join(cover_decode_thread, NULL);
+
+    if (cover_decode_result_format.valid &&
+        strcmp(cover_decode_result_format.path, playlist_path_at(playlist_index)) == 0) {
+        player_cached_format = cover_decode_result_format;
+        refresh_format_badge();
+    }
 
     if (cover_decode_result_for_index != playlist_index) {
         free(cover_decode_result_pixels);
@@ -848,6 +954,7 @@ void poll_cover_decode(void) {
          * consistency for readers other than cover_img. */
         current_cover_dsc.data = NULL;
         lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
+        fit_cover_img_to_card();
         /* No in-memory raw bitmap to reflect for the static placeholder
          * cover. Apply a configured flat color if set (it needs no cover
          * pixels), otherwise reset the panel back to its plain background
@@ -857,13 +964,15 @@ void poll_cover_decode(void) {
         if (failure_params.flat) {
             apply_player_flat_background(failure_params.has_bg_color, failure_params.bg_color);
         } else {
+            if (player_background_img) {
+                lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+            }
             free(current_reflection_bytes);
             current_reflection_bytes = NULL;
             /* Clear any flat-mode BG_COLOR left over from a previous live
              * switch away from flat -- same reasoning as gui_player_
              * refresh_frosted_background()'s own no-cover-yet branch. */
             lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
-            lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
         }
         player_transition_mark_dirty(); /* cover_img just changed to the placeholder -- see the cache's own doc comment */
     } else {
@@ -884,6 +993,7 @@ void poll_cover_decode(void) {
         current_cover_dsc.data = current_cover_bytes;
         current_cover_dsc.data_size = (uint32_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2;
         lv_image_set_src(cover_img, &current_cover_dsc);
+        fit_cover_img_to_card();
 
         /* The reflection this decode computed was built from frost params
          * snapshotted when the decode was LAUNCHED. If a plugin changed
@@ -915,25 +1025,34 @@ void poll_cover_decode(void) {
             free(cover_decode_result_reflection);
             apply_player_flat_background(cover_decode_result_has_bg_color, cover_decode_result_bg_color);
         } else {
+            if (player_background_img) {
+                lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+            }
             free(current_reflection_bytes);
             current_reflection_bytes = cover_decode_result_reflection;
 
             lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
             lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_COVER, 0);
 
-            if (current_reflection_bytes) {
+            if (current_reflection_bytes && player_background_img) {
                 /* Same LV_IMAGE_HEADER_MAGIC requirement as current_cover_dsc above. */
                 memset(&current_reflection_dsc, 0, sizeof(current_reflection_dsc));
                 current_reflection_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
                 current_reflection_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
                 current_reflection_dsc.header.w = REFLECTION_WIDTH;
-                current_reflection_dsc.header.h = REFLECTION_HEIGHT;
+                current_reflection_dsc.header.h = BOARD_SCREEN_HEIGHT;
                 current_reflection_dsc.header.stride = REFLECTION_WIDTH * 2;
                 current_reflection_dsc.data = current_reflection_bytes;
-                current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * REFLECTION_HEIGHT * 2;
-                lv_obj_set_style_bg_image_src(player_overlay_panel, &current_reflection_dsc, 0);
-            } else {
-                lv_obj_set_style_bg_image_src(player_overlay_panel, NULL, 0);
+                current_reflection_dsc.data_size = (uint32_t) REFLECTION_WIDTH * BOARD_SCREEN_HEIGHT * 2;
+                lv_image_set_src(player_background_img, &current_reflection_dsc);
+                lv_obj_set_pos(player_background_img, 0, 0);
+                lv_obj_set_size(player_background_img, REFLECTION_WIDTH, BOARD_SCREEN_HEIGHT);
+                lv_image_set_pivot(player_background_img, 0, 0);
+                lv_image_set_scale_x(player_background_img, LV_SCALE_NONE);
+                lv_image_set_scale_y(player_background_img, LV_SCALE_NONE);
+                lv_obj_remove_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+            } else if (player_background_img) {
+                lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
             }
         }
 
@@ -1458,8 +1577,10 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
 
     const char * title_text = out_meta->has_title ? out_meta->title : title;
     const char * folder_text = out_meta->has_artist ? out_meta->artist : folder;
+    const char * album_text = out_meta->has_album ? out_meta->album : "";
 
     lv_label_set_text(song_title_label, title_text);
+    if (song_album_label) lv_label_set_text(song_album_label, album_text);
     lv_label_set_text(song_folder_label, folder_text);
     gui_shell_update_quick_drawer_track(title_text, folder_text);
     refresh_format_badge();
@@ -1604,6 +1725,8 @@ static void delete_song_confirm_cb(lv_event_t * e) {
         clear_player_source();
         set_play_button_state(false);
         lv_label_set_text(song_title_label, "No track loaded");
+        if (song_album_label) lv_label_set_text(song_album_label, "");
+        if (song_folder_label) lv_label_set_text(song_folder_label, "");
         nav_pop(); /* nothing left to show on the player screen */
     } else {
         int new_index = (del_index < playlist_count) ? del_index : playlist_count - 1;
@@ -1936,176 +2059,184 @@ static void progress_slider_event_cb(lv_event_t * e) {
     }
 }
 
-/* mode/prev/next (order_icon/prev_btn/next_btn, 40x40 icons) extend click area
- * by 18px on each side. controls_row lays out icons with a 36px flex gap,
- * so 18px is the maximum padding before adjacent hit areas overlap
- * (40 + 18*2 = 76x76 effective hit area). */
-#define TRANSPORT_ICON_EXT_CLICK_AREA 18
-
-/* favorite_icon (also 40x40) has no clickable neighbors, so this can go
- * wider than the tightly-packed transport row above. */
-#define FAVORITE_ICON_EXT_CLICK_AREA 24
-#define FAVORITE_ICON_EXTRA_LEFT_CLICK_AREA 10
-
-/* Distance above play_btn's top edge for the shared transport hit area
- * line (roughly level with song_count_label without overlapping the progress
- * bar or time row). */
-#define TRANSPORT_HIT_LINE_ABOVE_PLAY 20
-
 static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_height) {
     (void) screen_width;
     (void) screen_height;
     lv_obj_t * scr = lv_obj_create(NULL);
     lv_obj_add_style(scr, &style_theme_screen_bg, 0);
 
-    /* Full-bleed album art (real per-track art is Task #16 -- this is the
-     * firmware's own default cover placeholder, top-aligned) plus a
-     * matching gradient panel that exactly fills the remaining screen
-     * height below it, giving the seamless art-fades-to-dark backdrop from
-     * the reference photo without needing any distortion/stretching of the
-     * art. Both this app's own real per-track cover art and buttom.png are
-     * decoded/drawn at their native size (cover_img has no explicit size
-     * here -- it's driven entirely by whatever the active board's own
-     * default_cover_565.png actually is, same as THEME_ROOT needing no
-     * board branch), so only the overlay panel's own size needs to track
-     * the active board explicitly -- see board_config.h's own comment on
-     * where BOARD_PLAYER_OVERLAY_HEIGHT comes from (each board's real
-     * buttom.png asset, not an arbitrary split). */
-    cover_img = lv_image_create(scr);
+    /* Full-screen fallback surface and background reflection image */
+    player_overlay_panel = lv_obj_create(scr);
+    lv_obj_set_style_pad_all(player_overlay_panel, 0, 0);
+    lv_obj_set_size(player_overlay_panel, BOARD_SCREEN_WIDTH, BOARD_SCREEN_HEIGHT);
+    lv_obj_set_pos(player_overlay_panel, 0, 0);
+    lv_obj_add_style(player_overlay_panel, &style_theme_screen_bg, 0);
+    lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(player_overlay_panel, 0, 0);
+    lv_obj_set_style_radius(player_overlay_panel, 0, 0);
+    lv_obj_remove_flag(player_overlay_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    player_background_img = lv_image_create(player_overlay_panel);
+    lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+
+    /* Cover card (clipped, crisp, unblurred) */
+    cover_card = lv_obj_create(scr);
+    lv_obj_remove_style_all(cover_card);
+    /* Centered directly from the resolved card size rather than a fixed
+     * offset literal -- that would only center a player_s(350) card when
+     * player_x and player_s agree, which is true on R1 but not on the other
+     * boards. 350x350 matches COVER_ART_WIDTH/HEIGHT (gui.h) exactly, so the
+     * reference board needs no runtime scale at all in fit_cover_img_to_card(). */
+    lv_obj_set_pos(cover_card, (BOARD_SCREEN_WIDTH - player_s(350)) / 2, player_y(152));
+    lv_obj_set_size(cover_card, player_s(350), player_s(350));
+    lv_obj_set_style_radius(cover_card, player_s(10), 0);
+    lv_obj_set_style_clip_corner(cover_card, true, 0);
+    lv_obj_set_style_bg_opa(cover_card, 0, 0);
+    lv_obj_remove_flag(cover_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    cover_img = lv_image_create(cover_card);
     lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
-    lv_obj_align(cover_img, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_add_flag(cover_img, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(cover_img, cover_img_tap_cb, LV_EVENT_CLICKED, NULL);
 
-    player_overlay_panel = lv_obj_create(scr);
-    lv_obj_t * overlay = player_overlay_panel; /* short local alias, rest of this function was written against this name */
-    lv_obj_set_size(overlay, BOARD_SCREEN_WIDTH, BOARD_PLAYER_OVERLAY_HEIGHT);
-    lv_obj_align(overlay, LV_ALIGN_BOTTOM_MID, 0, 0);
-    /* Native fallback surface; per-track artwork reflections remain unchanged. */
-    lv_obj_add_style(overlay, &style_theme_screen_bg, 0);
-    lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(overlay, 0, 0);
-    lv_obj_set_style_radius(overlay, 0, 0);
-    lv_obj_remove_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_all(overlay, 16, 0);
-    /* Extra bottom padding, on top of pad_all's 16 -- SPACE_BETWEEN below
-     * packs controls_row (the transport row: prev/play/next) flush against
-     * this panel's own bottom padding edge, which otherwise put it directly
-     * under the home indicator bar (see build_home_indicator_bar()) and its
-     * swipe-up hit zone, confirmed overlapping on a real screenshot. Only
-     * the bottom side changes -- top/left/right stay at the plain 16 set
-     * above. */
-    lv_obj_set_style_pad_bottom(overlay, 16 + HOME_INDICATOR_BAND_HEIGHT, 0);
-    lv_obj_set_flex_flow(overlay, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(overlay, 6, 0);
-    /* Without an explicit main-axis alignment, flex defaults to packing
-     * children at the top, leaving the rest of this panel (BOARD_PLAYER_
-     * OVERLAY_HEIGHT tall -- board_config.h) empty below the transport row
-     * -- SPACE_BETWEEN spreads title/artist/progress/time/controls out to
-     * fill the whole panel instead, controls_row landing at the very
-     * bottom edge, regardless of the active board's own overlay height. */
-    lv_obj_set_flex_align(overlay, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    favorite_circle = lv_obj_create(cover_card);
+    lv_obj_remove_style_all(favorite_circle);
+    lv_obj_set_pos(favorite_circle, player_s(296), player_s(296)); /* 352-44-12=296 from each edge */
+    lv_obj_set_size(favorite_circle, player_s(44), player_s(44));
+    lv_obj_set_style_radius(favorite_circle, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(favorite_circle, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(favorite_circle, LV_OPA_40, 0);
+    lv_obj_add_style(favorite_circle, gui_theme_accent_outline_style(), 0);
+    lv_obj_remove_flag(favorite_circle, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Dismiss affordance over the album art, top-left -- same left-pointing
-     * back arrow as every other screen's back button, for a consistent
-     * back-button convention across the app. */
-    /* Hitbox is deliberately larger than the visual icon (64x64 vs the
-     * icon's native size) -- real-hardware testing showed taps aimed at this
-     * corner landing a handful of pixels below a tight 44x44 box (finger
-     * imprecision on a small corner target), so the touch area is padded out
-     * generously while the icon itself stays centered at its normal size. */
-    player_dismiss_btn = build_header_back_button(scr, library_btn_event_cb);
+    favorite_icon = lv_image_create(favorite_circle);
+    lv_image_set_src(favorite_icon, asset_path("playing_plane/collect_out.png"));
+    lv_obj_add_style(favorite_icon, &icon_press_style, LV_STATE_PRESSED);
+    lv_obj_center(favorite_icon);
 
-    /* Title row: song title (left) + favorite icon (right) -- matches the
-     * reference layout, where the 3-dot "more" menu lives in the transport
-     * row below instead (repeat/prev/play/next/more), not up here. */
-    lv_obj_t * title_row = lv_obj_create(overlay);
-    lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(title_row, 0, 0);
-    lv_obj_set_style_border_width(title_row, 0, 0);
-    lv_obj_set_style_pad_all(title_row, 0, 0);
-    lv_obj_remove_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    /* The supplied reference is the R1 480x800 composition. Keep the
+     * existing compact typography on shorter panels so the three metadata
+     * lines do not collide with the cover there. */
+    const bool reference_player = BOARD_SCREEN_HEIGHT >= 800;
+    const lv_font_t * player_title_font = reference_player ? &app_font_28 : &app_font_16;
+    const lv_font_t * player_meta_font = reference_player ? &app_font_20 : &app_font_16;
 
-    song_title_label = lv_label_create(title_row);
+    /* Explicit positioning for metadata labels */
+    song_title_label = lv_label_create(scr);
     lv_label_set_text(song_title_label, "No track loaded");
     lv_obj_add_style(song_title_label, &style_theme_text_primary, 0);
-    /* Explicit rather than relying on LV_FONT_DEFAULT -- see fallback_font.h,
-     * this is one of the handful of labels that needs the non-Latin
-     * fallback but was never otherwise styled. */
-    lv_obj_set_style_text_font(song_title_label, &app_font_16, 0);
-    /* Bounded to the row's remaining width via flex_grow so long titles
-     * marquee instead of overflowing adjacent controls. */
-    lv_obj_set_flex_grow(song_title_label, 1);
+    lv_obj_set_style_text_font(song_title_label, player_title_font, 0);
+    lv_obj_set_style_text_align(song_title_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(song_title_label, player_x(22), player_y(44));
+    lv_obj_set_size(song_title_label, BOARD_SCREEN_WIDTH - 2 * player_x(22),
+                    reference_player ? lv_font_get_line_height(player_title_font) : player_y(32));
     row_label_enable_marquee(song_title_label);
 
-    favorite_icon = lv_image_create(title_row);
-    lv_image_set_src(favorite_icon, asset_path("playing_plane/collect_out.png"));
-    lv_obj_add_style(favorite_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
+    song_album_label = lv_label_create(scr);
+    lv_label_set_text(song_album_label, "");
+    lv_obj_add_style(song_album_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(song_album_label, player_meta_font, 0);
+    lv_obj_set_style_text_align(song_album_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(song_album_label, player_x(22), player_y(82));
+    /* Leave a full metadata line between the title and artist. The old
+     * 26px box could trigger vertical circular scrolling even for short
+     * albums. Content height also accommodates updated font metrics. */
+    lv_obj_set_size(song_album_label, BOARD_SCREEN_WIDTH - 2 * player_x(22), LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(song_album_label, player_y(36), 0);
+    row_label_enable_marquee(song_album_label);
 
-    /* Artist row: artist (left) + format/quality badge (right). */
-    lv_obj_t * artist_row = lv_obj_create(overlay);
-    lv_obj_set_size(artist_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(artist_row, 0, 0);
-    lv_obj_set_style_border_width(artist_row, 0, 0);
-    lv_obj_set_style_pad_all(artist_row, 0, 0);
-    lv_obj_remove_flag(artist_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(artist_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(artist_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    song_folder_label = lv_label_create(artist_row);
+    song_folder_label = lv_label_create(scr); /* holds ARTIST text, keep this name */
     lv_label_set_text(song_folder_label, "");
     lv_obj_add_style(song_folder_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(song_folder_label, &app_font_16, 0); /* see song_title_label's own comment above */
-    /* Bounded to the row's remaining width via flex_grow so long artist text
-     * marquees instead of overflowing adjacent format badges. */
-    lv_obj_set_flex_grow(song_folder_label, 1);
+    lv_obj_set_style_text_font(song_folder_label, player_meta_font, 0);
+    lv_obj_set_style_text_align(song_folder_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(song_folder_label, player_x(22), player_y(122));
+    /* Circular marquee falls back to vertical scrolling when text exceeds
+     * a fixed height. Fit the actual font metrics (including loaded fallback
+     * fonts) while retaining the fixed width for horizontal overflow. */
+    lv_obj_set_size(song_folder_label, BOARD_SCREEN_WIDTH - 2 * player_x(22),
+                    LV_SIZE_CONTENT);
     row_label_enable_marquee(song_folder_label);
 
-    format_badge_label = lv_label_create(artist_row);
+    /* Back/dismiss button. build_header_back_button()'s shared 64x64 default
+     * (TITLE_ROW_HEIGHT, used by every other screen's header) would reach
+     * further into the album label's row than the symmetric 44x44 "more"
+     * target on the opposite corner -- shrink to match it instead of
+     * needlessly widening this corner's overlap with the metadata block. */
+    player_dismiss_btn = build_header_back_button(scr, library_btn_event_cb);
+    lv_obj_set_size(player_dismiss_btn, player_s(44), player_s(44));
+    lv_obj_set_pos(player_dismiss_btn, player_x(22), player_y(62));
+    /* The reference keeps the status bar unobstructed and has no visible
+     * back arrow on the Player. Retain the transparent hit target so the
+     * established tap-to-dismiss behavior remains available. */
+    lv_obj_t * dismiss_arrow = lv_obj_get_child(player_dismiss_btn, 0);
+    if (dismiss_arrow) lv_obj_add_flag(dismiss_arrow, LV_OBJ_FLAG_HIDDEN);
+
+    /* 3-dot "more" menu */
+    lv_obj_t * more_icon = lv_image_create(scr);
+    lv_image_set_src(more_icon, asset_path("playing_plane/ic_more.png"));
+    lv_obj_add_style(more_icon, &icon_press_style, LV_STATE_PRESSED);
+    lv_obj_align(more_icon, LV_ALIGN_TOP_RIGHT, -player_x(16), player_y(80));
+
+    /* Quality pill */
+    quality_pill = lv_obj_create(scr);
+    lv_obj_remove_style_all(quality_pill);
+    lv_obj_set_size(quality_pill, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(quality_pill, LV_ALIGN_TOP_MID, 0, player_y(518));
+    lv_obj_set_style_pad_hor(quality_pill, player_s(14), 0);
+    lv_obj_set_style_pad_ver(quality_pill, player_s(6), 0);
+    lv_obj_set_style_pad_column(quality_pill, player_s(10), 0);
+    lv_obj_set_flex_flow(quality_pill, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(quality_pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_radius(quality_pill, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(quality_pill, LV_OPA_20, 0);
+    lv_obj_set_style_bg_color(quality_pill, lv_color_hex(0x000000), 0);
+    lv_obj_add_style(quality_pill, gui_theme_accent_outline_style(), 0);
+    lv_obj_remove_flag(quality_pill, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* A native waveform keeps the badge independent of stock image assets. */
+    lv_obj_t * waveform = lv_obj_create(quality_pill);
+    lv_obj_remove_style_all(waveform);
+    lv_obj_set_size(waveform, player_s(20), player_s(20));
+    lv_obj_remove_flag(waveform, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < 5; ++i) {
+        const int heights[] = { 8, 14, 20, 12, 6 };
+        lv_obj_t * bar = lv_obj_create(waveform);
+        lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, player_s(2), player_s(heights[i]));
+        lv_obj_set_pos(bar, player_s(i * 4), (player_s(20) - player_s(heights[i])) / 2);
+        lv_obj_add_style(bar, gui_theme_accent_style(), 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    }
+
+    format_badge_label = lv_label_create(quality_pill);
     lv_label_set_text(format_badge_label, "");
     lv_obj_add_style(format_badge_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(format_badge_label, &app_font_16, 0);
+    /* Bound unusually long codec descriptions without clipping the ring. */
+    lv_obj_set_style_max_width(format_badge_label,
+                              BOARD_SCREEN_WIDTH - 2 * player_x(30) - player_s(64), 0);
+    row_label_enable_marquee(format_badge_label);
 
-    /* Real seek bar: progress_bg.png/progress.png are fixed 440x12 pixel
-     * art (confirmed against the real asset files), so the track keeps
-     * those exact dimensions rather than a percentage width or the shared
-     * SLIDER_TRACK_HEIGHT -- LVGL centers a bg_image at its native size
-     * instead of stretching it, so any taller/wider track here would just
-     * show blank space around the unstretched art. The knob itself is no
-     * longer image-based (see gui_theme_accent_knob_style()), so only the
-     * track's own size is still asset-constrained. */
-    progress_slider = lv_slider_create(overlay);
-    lv_obj_set_size(progress_slider, 440, 12);
-    lv_obj_align(progress_slider, LV_ALIGN_TOP_MID, 0, 0);
+    /* Progress bar (native rail, not the old fixed PNG sprites) */
+    progress_slider = lv_slider_create(scr);
+    lv_obj_set_pos(progress_slider, player_x(30), player_y(590));
+    lv_obj_set_size(progress_slider, player_x(420), player_y(5) < 3 ? 3 : player_y(5));
     lv_slider_set_range(progress_slider, 0, 100);
     lv_slider_set_value(progress_slider, 0, LV_ANIM_OFF);
-    progress_bg_image = asset_png_memory("playing_plane/progress_bg.png");
-    progress_fill_image = asset_png_memory("playing_plane/progress.png");
-    lv_obj_set_style_bg_image_src(progress_slider, progress_bg_image ? (const void *) progress_bg_image : asset_path("playing_plane/progress_bg.png"), LV_PART_MAIN);
-    lv_obj_set_style_bg_image_src(progress_slider, progress_fill_image ? (const void *) progress_fill_image : asset_path("playing_plane/progress.png"), LV_PART_INDICATOR);
+    configure_native_slider_rail(progress_slider);
     lv_obj_add_style(progress_slider, gui_theme_accent_style(), LV_PART_INDICATOR);
     lv_obj_add_style(progress_slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
-    /* Keep the dedicated playing-plane art here: unlike the reused 360px
-     * volume rail sprites, these assets match this progress rail's design. */
-    lv_obj_set_style_radius(progress_slider, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(progress_slider, LV_OPA_COVER, LV_PART_KNOB);
-    lv_obj_set_style_width(progress_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_set_style_height(progress_slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    /* Extended click area (20px) ensures touches near the 12px bar are
-     * captured rather than falling through to the gesture handler. */
-    lv_obj_set_ext_click_area(progress_slider, 20);
+    lv_obj_set_style_width(progress_slider, player_s(18), LV_PART_KNOB);
+    lv_obj_set_style_height(progress_slider, player_s(18), LV_PART_KNOB);
+    lv_obj_set_ext_click_area(progress_slider, player_y(20));
     lv_obj_add_event_cb(progress_slider, progress_slider_event_cb, LV_EVENT_ALL, NULL);
-    /* See screen_gesture_event_cb()'s own comment -- covers a press that
-     * lands just off the slider's own hit-test box (still within
-     * ext_click_area's reach for a tap, but a fast swipe's start point can
-     * land outside even that) from being hijacked into a back-swipe. */
     register_swipe_dead_zone(progress_slider);
 
-    lv_obj_t * time_row = lv_obj_create(overlay);
-    lv_obj_set_size(time_row, lv_pct(100), LV_SIZE_CONTENT);
+    /* Time row */
+    lv_obj_t * time_row = lv_obj_create(scr);
+    lv_obj_set_pos(time_row, player_x(30), player_y(610));
+    lv_obj_set_size(time_row, player_x(420), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(time_row, 0, 0);
     lv_obj_set_style_border_width(time_row, 0, 0);
     lv_obj_set_style_pad_all(time_row, 0, 0);
@@ -2121,32 +2252,22 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_label_set_text(dur_label, "0:00");
     lv_obj_add_style(dur_label, &style_theme_text_muted, 0);
 
-    /* "N/M" position within the current queue -- centered, between the
-     * progress bar and the transport row below it. */
-    song_count_label = lv_label_create(overlay);
+    /* song_count_label kept allocated for queue updates but hidden */
+    song_count_label = lv_label_create(scr);
     lv_label_set_text(song_count_label, "");
-    lv_obj_add_style(song_count_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_translate_y(song_count_label, -3, 0);
+    lv_obj_add_flag(song_count_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* Transport row: prev / play-pause / next, centered. */
-    lv_obj_t * controls_row = lv_obj_create(overlay);
-    lv_obj_set_size(controls_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(controls_row, 0, 0);
-    lv_obj_set_style_border_width(controls_row, 0, 0);
-    lv_obj_set_style_pad_all(controls_row, 0, 0);
-    lv_obj_set_style_pad_top(controls_row, 10, 0);
+    /* Transport row -- 4 controls only */
+    lv_obj_t * controls_row = lv_obj_create(scr);
+    lv_obj_remove_style_all(controls_row);
+    const int32_t transport_top = player_y(645);
+    lv_obj_set_pos(controls_row, 0, transport_top);
+    lv_obj_set_size(controls_row, BOARD_SCREEN_WIDTH, player_y(94));
     lv_obj_remove_flag(controls_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(controls_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(controls_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_gap(controls_row, 36, 0);
-    lv_obj_set_style_translate_y(controls_row, -3, 0);
 
-    /* Play-mode icon (sequential/repeat/shuffle) -- leftmost, matching the
-     * reference layout (repeat / prev / play / next / more). Visual-only;
-     * input is handled by order_hit below. */
     order_icon = lv_image_create(controls_row);
     lv_image_set_src(order_icon, asset_path(play_mode_icon_asset((play_mode_t) current_settings.play_mode)));
-    lv_obj_add_style(order_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
+    lv_obj_add_style(order_icon, &icon_press_style, LV_STATE_PRESSED);
 
     prev_btn = lv_image_create(controls_row);
     lv_image_set_src(prev_btn, asset_path("playing_plane/btn_prev.png"));
@@ -2154,15 +2275,12 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     if (!prev_ctx) return NULL;
     *prev_ctx = (transport_btn_ctx_t){ prev_btn, "playing_plane/btn_prev.png", "playing_plane/btn_prev_s.png" };
 
+    /* btn_play.png/btn_pause.png already contain their own filled accent
+     * circle -- no separate outline ring needed here, unlike favorite_circle/
+     * quality_pill which wrap plain glyphs/text with no ring of their own. */
     play_btn = lv_image_create(controls_row);
     load_play_btn_images();
     lv_image_set_src(play_btn, gui_player_play_btn_image_src(audio_is_playing()));
-    /* Not transport_btn_ctx_t's fixed normal/pressed asset-swap -- this
-     * icon's own "normal" image already alternates between btn_play.png and
-     * btn_pause.png depending on playback state (set_play_button_state()),
-     * so a fixed pressed_path would flash the wrong artwork half the time.
-     * icon_press_style dims whichever of the two is currently showing
-     * instead. */
     lv_obj_add_style(play_btn, &icon_press_style, LV_STATE_PRESSED);
 
     next_btn = lv_image_create(controls_row);
@@ -2174,85 +2292,81 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     }
     *next_ctx = (transport_btn_ctx_t){ next_btn, "playing_plane/btn_next.png", "playing_plane/btn_next_s.png" };
 
-    /* 3-dot "more" menu -- rightmost, matching the reference layout. Opens
-     * more_menu_popup (Add to Playlist / EQ / Delete). Visual-only; input is
-     * handled by more_hit below. */
-    lv_obj_t * more_icon = lv_image_create(controls_row);
-    lv_image_set_src(more_icon, asset_path("playing_plane/ic_more.png"));
-    lv_obj_add_style(more_icon, &icon_press_style, LV_STATE_PRESSED); /* see icon_press_style's own comment */
-
-    /* Force-resolve controls_row's flex layout now so the coordinates read
-     * below are real absolute screen positions, not the stale (0,0) a
-     * flex/align property leaves until a layout pass actually runs -- see
-     * reserve_title_width_before()'s own comment in gui_library.c for the
-     * same gotcha. */
     lv_obj_update_layout(controls_row);
+    int32_t row_h = lv_obj_get_height(controls_row);
+    const int32_t transport_center_y = transport_top + row_h / 2;
+    lv_obj_set_pos(play_btn, player_x(240) - lv_obj_get_width(play_btn) / 2, (row_h - lv_obj_get_height(play_btn)) / 2);
+    lv_obj_set_pos(order_icon, player_x(57) - lv_obj_get_width(order_icon) / 2, (row_h - lv_obj_get_height(order_icon)) / 2);
+    lv_obj_set_pos(prev_btn, player_x(142) - lv_obj_get_width(prev_btn) / 2, (row_h - lv_obj_get_height(prev_btn)) / 2);
+    lv_obj_set_pos(next_btn, player_x(338) - lv_obj_get_width(next_btn) / 2, (row_h - lv_obj_get_height(next_btn)) / 2);
 
-    lv_area_t order_area, play_area, prev_area, next_area, more_area;
-    lv_obj_get_coords(order_icon, &order_area);
-    lv_obj_get_coords(play_btn, &play_area);
-    lv_obj_get_coords(prev_btn, &prev_area);
-    lv_obj_get_coords(next_btn, &next_area);
-    lv_obj_get_coords(more_icon, &more_area);
+    /* Part D: Hit targets */
+    lv_obj_update_layout(scr);
 
-    /* Shared top line so all transport controls have consistent vertical
-     * hit reach. */
-    int32_t shared_hit_top = play_area.y1 - TRANSPORT_HIT_LINE_ABOVE_PLAY;
-
-    lv_obj_t * order_hit = add_transport_hit_target(scr, (order_area.x1 + order_area.x2) / 2,
-                                (order_area.x2 - order_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
-                                order_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, order_icon_event_cb,
+    int32_t order_hit_w = player_s(56); if (order_hit_w < 44) order_hit_w = 44;
+    int32_t order_hit_h = player_s(56); if (order_hit_h < 44) order_hit_h = 44;
+    lv_obj_t * order_hit = add_transport_hit_target(scr, player_x(57), order_hit_w,
+                                transport_center_y - order_hit_h / 2, transport_center_y + (order_hit_h + 1) / 2, order_icon_event_cb,
                                 lv_palette_main(LV_PALETTE_RED));
     lv_obj_add_event_cb(order_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, order_icon);
     lv_obj_add_event_cb(order_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, order_icon);
     lv_obj_add_event_cb(order_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, order_icon);
 
-    lv_obj_t * play_hit = add_transport_hit_target(scr, (play_area.x1 + play_area.x2) / 2, play_area.x2 - play_area.x1 + 1,
-                                shared_hit_top, play_area.y2 + 1, play_btn_event_cb, lv_palette_main(LV_PALETTE_BLUE));
-    lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, play_btn);
-    lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, play_btn);
-    lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, play_btn);
-
-    lv_obj_t * prev_hit = add_transport_hit_target(scr, (prev_area.x1 + prev_area.x2) / 2,
-                                (prev_area.x2 - prev_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
-                                prev_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, prev_btn_event_cb,
+    int32_t prev_hit_w = player_s(56); if (prev_hit_w < 44) prev_hit_w = 44;
+    int32_t prev_hit_h = player_s(56); if (prev_hit_h < 44) prev_hit_h = 44;
+    lv_obj_t * prev_hit = add_transport_hit_target(scr, player_x(142), prev_hit_w,
+                                transport_center_y - prev_hit_h / 2, transport_center_y + (prev_hit_h + 1) / 2, prev_btn_event_cb,
                                 lv_palette_main(LV_PALETTE_GREEN));
-    /* Not forward_press_state_to_icon_cb -- prev_btn's own pressed feedback
-     * is a fixed sprite swap (transport_btn_press_event_cb/prev_ctx, set up
-     * above), not icon_press_style's LV_STATE_PRESSED selector. Attaching
-     * the same handler+ctx here, on the object that now actually receives
-     * the touch, restores that swap exactly the same way. */
     lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_PRESSED, prev_ctx);
     lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_RELEASED, prev_ctx);
     lv_obj_add_event_cb(prev_hit, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, prev_ctx);
     lv_obj_add_event_cb(prev_hit, transport_btn_ctx_delete_cb, LV_EVENT_DELETE, prev_ctx);
-    /* Hold-to-rewind -- see transport_seek_repeat_cb()'s own comment. Bound
-     * to prev_hit (the object that actually receives the touch now, not the
-     * icon underneath it) so it fires for a real user press. transport_seek_
-     * repeat_cb is bound to BOTH events (first step on LONG_PRESSED itself,
-     * then one more per REPEAT tick) -- see its own comment on why. */
     lv_obj_add_event_cb(prev_hit, transport_long_press_cb, LV_EVENT_LONG_PRESSED, &prev_btn_long_press_fired);
     lv_obj_add_event_cb(prev_hit, transport_long_press_cancel_cb, LV_EVENT_PRESS_LOST, &prev_btn_long_press_fired);
     lv_obj_add_event_cb(prev_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED, (void *) (intptr_t) -1);
     lv_obj_add_event_cb(prev_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED_REPEAT, (void *) (intptr_t) -1);
 
-    lv_obj_t * next_hit = add_transport_hit_target(scr, (next_area.x1 + next_area.x2) / 2,
-                                (next_area.x2 - next_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
-                                next_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, next_btn_event_cb,
+    int32_t play_hit_w = player_s(94); if (play_hit_w < 44) play_hit_w = 44;
+    int32_t play_hit_h = player_s(94); if (play_hit_h < 44) play_hit_h = 44;
+    lv_obj_t * play_hit = add_transport_hit_target(scr, player_x(240), play_hit_w,
+                                transport_center_y - play_hit_h / 2, transport_center_y + (play_hit_h + 1) / 2, play_btn_event_cb,
+                                lv_palette_main(LV_PALETTE_BLUE));
+    lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, play_btn);
+    lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, play_btn);
+    lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, play_btn);
+
+    int32_t next_hit_w = player_s(56); if (next_hit_w < 44) next_hit_w = 44;
+    int32_t next_hit_h = player_s(56); if (next_hit_h < 44) next_hit_h = 44;
+    lv_obj_t * next_hit = add_transport_hit_target(scr, player_x(338), next_hit_w,
+                                transport_center_y - next_hit_h / 2, transport_center_y + (next_hit_h + 1) / 2, next_btn_event_cb,
                                 lv_palette_main(LV_PALETTE_ORANGE));
     lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_PRESSED, next_ctx);
     lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_RELEASED, next_ctx);
     lv_obj_add_event_cb(next_hit, transport_btn_press_event_cb, LV_EVENT_PRESS_LOST, next_ctx);
     lv_obj_add_event_cb(next_hit, transport_btn_ctx_delete_cb, LV_EVENT_DELETE, next_ctx);
-    /* Hold-to-fast-forward -- see transport_seek_repeat_cb()'s own comment. */
     lv_obj_add_event_cb(next_hit, transport_long_press_cb, LV_EVENT_LONG_PRESSED, &next_btn_long_press_fired);
     lv_obj_add_event_cb(next_hit, transport_long_press_cancel_cb, LV_EVENT_PRESS_LOST, &next_btn_long_press_fired);
     lv_obj_add_event_cb(next_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED, (void *) (intptr_t) 1);
     lv_obj_add_event_cb(next_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED_REPEAT, (void *) (intptr_t) 1);
 
-    lv_obj_t * more_hit = add_transport_hit_target(scr, (more_area.x1 + more_area.x2) / 2,
-                                (more_area.x2 - more_area.x1 + 1) + 2 * TRANSPORT_ICON_EXT_CLICK_AREA, shared_hit_top,
-                                more_area.y2 + TRANSPORT_ICON_EXT_CLICK_AREA + 1, more_icon_event_cb,
+    lv_area_t more_area;
+    lv_obj_get_coords(more_icon, &more_area);
+    int32_t more_icon_w = lv_area_get_width(&more_area);
+    int32_t more_hit_w = more_icon_w + player_x(24); if (more_hit_w < 44) more_hit_w = 44;
+    /* Keep centered metadata clear of both header touch targets. Narrowing
+     * the label also makes its existing marquee activate for long albums. */
+    int32_t metadata_inset = BOARD_SCREEN_WIDTH -
+        ((more_area.x1 + more_area.x2) / 2 - more_hit_w / 2) + player_x(8);
+    int32_t dismiss_inset = player_x(22) + player_s(44) + player_x(8);
+    if (metadata_inset < dismiss_inset) metadata_inset = dismiss_inset;
+    lv_obj_set_x(song_title_label, metadata_inset);
+    lv_obj_set_width(song_title_label, BOARD_SCREEN_WIDTH - 2 * metadata_inset);
+    lv_obj_set_x(song_album_label, metadata_inset);
+    lv_obj_set_width(song_album_label, BOARD_SCREEN_WIDTH - 2 * metadata_inset);
+    int32_t more_hit_top = more_area.y1 - player_y(12);
+    int32_t more_hit_bottom = more_area.y2 + player_y(12) + 1;
+    lv_obj_t * more_hit = add_transport_hit_target(scr, (more_area.x1 + more_area.x2) / 2, more_hit_w,
+                                more_hit_top, more_hit_bottom, more_icon_event_cb,
                                 lv_palette_main(LV_PALETTE_PURPLE));
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, more_icon);
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, more_icon);
@@ -2266,21 +2380,20 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(more_hit, debug_transport_btn_all_cb, LV_EVENT_ALL, NULL);
 #endif
 
-    /* Use one explicit target because LVGL's ext-click API is symmetric. It
-     * preserves the proven bounds and adds ten pixels only on the left. */
-    lv_obj_update_layout(scr);
     lv_area_t favorite_area;
-    lv_obj_get_coords(favorite_icon, &favorite_area);
+    lv_obj_get_coords(favorite_circle, &favorite_area);
+    int32_t fav_w = lv_area_get_width(&favorite_area);
+    int32_t fav_h = lv_area_get_height(&favorite_area);
+    int32_t fav_hit_w = fav_w < 44 ? 44 : fav_w;
+    int32_t fav_hit_h = fav_h < 44 ? 44 : fav_h;
     lv_obj_t * favorite_hit = lv_obj_create(scr);
     lv_obj_remove_style_all(favorite_hit);
     lv_obj_set_pos(favorite_hit,
-                   favorite_area.x1 - FAVORITE_ICON_EXT_CLICK_AREA - FAVORITE_ICON_EXTRA_LEFT_CLICK_AREA,
-                   favorite_area.y1 - FAVORITE_ICON_EXT_CLICK_AREA);
-    lv_obj_set_size(favorite_hit,
-                    lv_area_get_width(&favorite_area) + 2 * FAVORITE_ICON_EXT_CLICK_AREA +
-                        FAVORITE_ICON_EXTRA_LEFT_CLICK_AREA,
-                    lv_area_get_height(&favorite_area) + 2 * FAVORITE_ICON_EXT_CLICK_AREA);
+                   favorite_area.x1 - (fav_hit_w - fav_w) / 2,
+                   favorite_area.y1 - (fav_hit_h - fav_h) / 2);
+    lv_obj_set_size(favorite_hit, fav_hit_w, fav_hit_h);
     lv_obj_add_flag(favorite_hit, LV_OBJ_FLAG_IGNORE_LAYOUT | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(favorite_hit, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(favorite_hit, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(favorite_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, favorite_icon);
     lv_obj_add_event_cb(favorite_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, favorite_icon);
@@ -2291,17 +2404,13 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_border_opa(favorite_hit, LV_OPA_COVER, 0);
 #endif
 
-    /* Volume is controlled via hardware buttons (see update_timer_cb) and,
-     * per the real device, shown only as a transient overlay rather than a
-     * permanently visible slider (Task #28) -- kept alive here, just
-     * invisible, so the existing hw-button volume logic keeps working
-     * unchanged until that overlay lands. */
     volume_slider = lv_slider_create(scr);
     lv_obj_add_flag(volume_slider, LV_OBJ_FLAG_HIDDEN);
     lv_slider_set_range(volume_slider, 0, 100);
     lv_slider_set_value(volume_slider, (int32_t) (audio_get_volume() * 100.0f), LV_ANIM_OFF);
 
     finalize_screen_navigation(scr);
+    fit_cover_img_to_card();
     return scr;
 }
 
@@ -2351,13 +2460,32 @@ void refresh_format_badge(void) {
         }
     }
 
-    unsigned int sample_rate = audio_get_sample_rate();
+    unsigned int sample_rate = is_remote_track ? remote_meta.sample_rate : 0;
+    audio_current_format_info_t fmt_info;
+    unsigned int bit_depth = is_remote_track ? remote_meta.bit_depth : 0;
+    if (player_cached_format.valid && strcmp(player_cached_format.path, path) == 0) {
+        sample_rate = player_cached_format.source_sample_rate;
+        bit_depth = player_cached_format.source_bit_depth;
+    }
+    if (audio_get_current_format_info(&fmt_info) && fmt_info.valid &&
+        strcmp(fmt_info.path, path) == 0) {
+        sample_rate = fmt_info.source_sample_rate;
+        bit_depth = fmt_info.source_bit_depth;
+    }
     if (format_badge_label) {
-        if (sample_rate > 0) {
-            lv_label_set_text_fmt(format_badge_label, "%s  %.1fkHz", ext, sample_rate / 1000.0);
+        char text[96];
+        if (sample_rate > 0 && bit_depth > 0) {
+            snprintf(text, sizeof(text), "%s %u-bit / %.1fkHz", ext, bit_depth, sample_rate / 1000.0);
+        } else if (sample_rate > 0) {
+            snprintf(text, sizeof(text), "%s  %.1fkHz", ext, sample_rate / 1000.0);
+        } else if (bit_depth > 0) {
+            snprintf(text, sizeof(text), "%s %u-bit", ext, bit_depth);
         } else {
-            lv_label_set_text(format_badge_label, ext);
+            snprintf(text, sizeof(text), "%s", ext);
         }
+        /* Polling unchanged text must not restart its marquee every tick. */
+        if (strcmp(lv_label_get_text(format_badge_label), text) != 0)
+            lv_label_set_text(format_badge_label, text);
     }
 }
 
@@ -3642,10 +3770,25 @@ void gui_player_teardown(void) {
      * existing '!player_overlay_panel' guard correctly no-op instead of
      * writing LVGL styles to freed memory. */
     player_overlay_panel = NULL;
+    player_background_img = NULL;
+    cover_card = NULL;
     cover_img = NULL;
+    song_folder_label = NULL;
+    song_album_label = NULL;
+    song_count_label = NULL;
+    song_title_label = NULL;
+    quality_pill = NULL;
+    format_badge_label = NULL;
+    order_icon = NULL;
+    favorite_circle = NULL;
     favorite_icon = NULL;
-    asset_png_memory_free(progress_bg_image); progress_bg_image = NULL;
-    asset_png_memory_free(progress_fill_image); progress_fill_image = NULL;
+    play_btn = NULL;
+    prev_btn = NULL;
+    next_btn = NULL;
+    progress_slider = NULL;
+    pos_label = NULL;
+    dur_label = NULL;
+    player_dismiss_btn = NULL;
     volume_slider = NULL;
 }
 
@@ -4026,6 +4169,7 @@ void gui_player_handle_sd_unmount(void) {
     clear_player_source();
     set_play_button_state(false);
     if (song_title_label) lv_label_set_text(song_title_label, "No track loaded");
+    if (song_album_label) lv_label_set_text(song_album_label, "");
     if (song_folder_label) lv_label_set_text(song_folder_label, "");
     if (lv_screen_active() == player_screen) nav_pop();
 }

@@ -7,9 +7,11 @@
 
 static lv_style_t style_accent;
 static lv_style_t style_accent_knob;
+static lv_style_t style_accent_outline;
 
 lv_style_t * gui_theme_accent_style(void) { return &style_accent; }
 lv_style_t * gui_theme_accent_knob_style(void) { return &style_accent_knob; }
+lv_style_t * gui_theme_accent_outline_style(void) { return &style_accent_outline; }
 lv_style_t * gui_theme_muted_text_style(void) { return &style_theme_text_muted; }
 
 const uint32_t accent_palette[ACCENT_PALETTE_COUNT] = {
@@ -79,6 +81,9 @@ void gui_theme_apply_accent(uint32_t rgb) {
     lv_style_set_bg_color(&style_accent_knob, lv_color_hex(rgb));
     lv_obj_report_style_change(&style_accent_knob);
 
+    lv_style_set_border_color(&style_accent_outline, lv_color_hex(rgb));
+    lv_obj_report_style_change(&style_accent_outline);
+
     settings_save(&current_settings);
     player_transition_mark_dirty();
     /* Play/pause art is a white disc with a baked-in cyan glyph -- LVGL
@@ -111,6 +116,7 @@ static void init_style_objects(void) {
     if (already_initialized) {
         lv_style_reset(&style_accent);
         lv_style_reset(&style_accent_knob);
+        lv_style_reset(&style_accent_outline);
     }
     already_initialized = true;
 
@@ -130,6 +136,12 @@ static void init_style_objects(void) {
     lv_style_set_border_opa(&style_accent_knob, LV_OPA_COVER);
     lv_style_set_radius(&style_accent_knob, LV_RADIUS_CIRCLE);
     lv_style_set_pad_all(&style_accent_knob, SLIDER_KNOB_PAD);
+
+    lv_style_init(&style_accent_outline);
+    lv_style_set_border_color(&style_accent_outline, accent_lv_color());
+    lv_style_set_border_width(&style_accent_outline, 2);
+    lv_style_set_border_opa(&style_accent_outline, LV_OPA_COVER);
+    lv_style_set_bg_opa(&style_accent_outline, 0); /* outline only, no fill -- callers that want a fill set their own bg_color/bg_opa separately */
 
     screen_builders_init_list_row_style();
 }

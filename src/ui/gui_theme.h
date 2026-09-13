@@ -51,6 +51,7 @@ void gui_theme_init(void);
 void gui_theme_reload_styles(void);
 lv_style_t * gui_theme_accent_style(void);
 lv_style_t * gui_theme_accent_knob_style(void);
+lv_style_t * gui_theme_accent_outline_style(void);
 lv_style_t * gui_theme_muted_text_style(void);
 const lv_font_t * gui_theme_font(gui_font_role_t role);
 lv_color_t accent_lv_color(void);

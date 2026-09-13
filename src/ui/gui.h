@@ -305,14 +305,17 @@ void gui_plugin_clear_interval(int slot);
 void gui_plugin_show_text_input(const char * title, const char * initial_text, bool is_password);
 
 
-/* The real decoded-cover render target -- must equal each board's own
- * default_cover_565.png dimensions (BOARD_PLAYER_COVER_HEIGHT, board_
- * config.h's own comment) so a real playing track's art occupies exactly
- * the same footprint the placeholder cover does, keeping the Player
- * screen's cover+overlay = full screen height invariant true whether or
- * not anything is actually playing. */
-#define COVER_ART_WIDTH BOARD_SCREEN_WIDTH
-#define COVER_ART_HEIGHT BOARD_PLAYER_COVER_HEIGHT
+/* The real decoded-cover render target. No longer tied to board screen
+ * dimensions -- the Player screen shows this at a fixed square card size
+ * (fit_cover_img_to_card() in gui_player.c reads the real decoded image
+ * header and scales it to fit, so any target size here works), and
+ * compute_reflection_bytes() safely center-crops/edge-extends whichever of
+ * COVER_ART_WIDTH/REFLECTION_WIDTH and COVER_ART_HEIGHT/REFLECTION_HEIGHT
+ * is larger against the other. Matches the on-screen card's own decode-
+ * target size (see cover_card's size in build_player_screen()) so the
+ * crisp card needs no runtime upscale/downscale on the reference board. */
+#define COVER_ART_WIDTH 350
+#define COVER_ART_HEIGHT 350
 
 
 typedef enum {

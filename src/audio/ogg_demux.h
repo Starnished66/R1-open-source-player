@@ -43,7 +43,6 @@ ogg_demux_t * ogg_demux_open_metadata(const char * path, bool skip_large_values)
  * (single-stream mono/stereo) -- multistream Opus files fail to open. */
 unsigned int ogg_demux_get_opus_channels(const ogg_demux_t * d);
 uint16_t     ogg_demux_get_opus_pre_skip(const ogg_demux_t * d);   /* samples @ 48kHz to discard from decode start */
-int16_t      ogg_demux_get_opus_output_gain_q78(const ogg_demux_t * d);
 
 /* Granule position of the last page in the file -- the total sample count
  * (at 48kHz, inclusive of pre-skip) per RFC 7845's EOS-page convention.
@@ -52,12 +51,10 @@ int16_t      ogg_demux_get_opus_output_gain_q78(const ogg_demux_t * d);
 uint64_t ogg_demux_get_total_granule(const ogg_demux_t * d);
 
 /* OpusTags (RFC 7845 Section 5.2, same layout as a Vorbis comment header).
- * vendor_string may be NULL if the file's tags were missing/malformed --
- * parsing OpusTags is best-effort and never fails ogg_demux_open() on its
+ * Parsing OpusTags is best-effort and never fails ogg_demux_open() on its
  * own (only OpusHead is required). Comment strings are raw "KEY=VALUE"
  * pairs, NUL-terminated for convenience but not guaranteed free of
  * embedded NULs -- out_len gives the real length. */
-const char * ogg_demux_get_vendor_string(const ogg_demux_t * d);
 unsigned int ogg_demux_get_comment_count(const ogg_demux_t * d);
 const char * ogg_demux_get_comment(const ogg_demux_t * d, unsigned int index, uint32_t * out_len);
 

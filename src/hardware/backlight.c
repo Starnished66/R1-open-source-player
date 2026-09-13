@@ -101,7 +101,7 @@ int backlight_get_percent(void) {
     return result;
 }
 
-void backlight_set_percent(int percent) {
+static void backlight_set_percent(int percent) {
     pthread_mutex_lock(&backlight_io_mutex);
     char device_name[64];
     if (!find_backlight_device(device_name, sizeof(device_name))) goto done;

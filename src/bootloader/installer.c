@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "installer.h"
+#include "scanner.h"
 #include "fb_draw.h"
 
 #include <errno.h>
@@ -24,11 +25,6 @@
 
 /* Temporary path used during installation before atomic rename. */
 #define INSTALL_TMP_PATH "/usr/data/.open_hiby_player.installing"
-
-static bool path_is_executable_file(const char * path) {
-    struct stat st;
-    return path && path[0] && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
-}
 
 /* Table-driven CRC-32 (standard reflected 0xEDB88320 polynomial) used to
  * verify copy integrity and detect truncation or file corruption.
@@ -208,8 +204,8 @@ static void draw_updating_screen(void) {
     const char * line1 = "UPDATING PLAYER";
     const char * line2 = "DO NOT REMOVE SD CARD";
     int th = fb_text_height();
-    fb_draw_text((FB_WIDTH - fb_text_width(line1)) / 2, FB_HEIGHT / 2 - th, line1, white);
-    fb_draw_text((FB_WIDTH - fb_text_width(line2)) / 2, FB_HEIGHT / 2 + th / 2, line2, white);
+    fb_draw_text_centered(FB_HEIGHT / 2 - th, line1, white);
+    fb_draw_text_centered(FB_HEIGHT / 2 + th / 2, line2, white);
     fb_flush();
 }
 
@@ -225,7 +221,7 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
 
     /* If the SD update is byte-identical to the installed player, skip
      * installation and complete any pending cleanup of the SD update file. */
-    if (path_is_executable_file(INSTALLED_PLAYER_PATH)) {
+    if (scanner_path_is_executable(INSTALLED_PLAYER_PATH)) {
         uint32_t inst_crc;
         off_t inst_size;
         if (file_crc32_and_size(INSTALLED_PLAYER_PATH, &inst_crc, &inst_size) && inst_size == sd_size &&
@@ -327,5 +323,5 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
 }
 
 const char * installer_internal_player_path(void) {
-    return path_is_executable_file(INSTALLED_PLAYER_PATH) ? INSTALLED_PLAYER_PATH : INTERNAL_PLAYER_PATH;
+    return scanner_path_is_executable(INSTALLED_PLAYER_PATH) ? INSTALLED_PLAYER_PATH : INTERNAL_PLAYER_PATH;
 }

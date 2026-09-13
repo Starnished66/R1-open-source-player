@@ -44,24 +44,7 @@ static unsigned db_log_lines_since_flush;
 
 /* Must be called with db_log_mutex held and db_log_file non-NULL. */
 static void db_log_rotate_if_needed_locked(void) {
-    if (fseek(db_log_file, 0, SEEK_END) != 0) return;
-    long size = ftell(db_log_file);
-    if (size < DB_LOG_MAX_BYTES) return;
-    fclose(db_log_file);
-    db_log_file = NULL;
-    /* Clear any previous backup explicitly first -- rename() replacing an
-     * existing destination isn't guaranteed reliable on every filesystem
-     * this runs on (notably vfat SD cards), so don't rely on rename() alone
-     * to make room. Ignored if it doesn't exist. */
-    remove(DB_LOG_ROTATED_PATH);
-    rename(DB_LOG_PATH, DB_LOG_ROTATED_PATH); /* best-effort */
-    /* "w", not "a": if the rename above failed for any reason, the oversized
-     * file would still be sitting at DB_LOG_PATH, and "a" would keep
-     * appending to it -- re-triggering this same rotation, and repeating the
-     * failed close/remove/rename/reopen sequence, on every subsequent flush.
-     * "w" always starts a fresh, empty file regardless of whether the
-     * rename actually moved the old one out of the way first. */
-    db_log_file = fopen(DB_LOG_PATH, "w");
+    db_log_rotate_file_if_needed_locked(&db_log_file, DB_LOG_PATH, DB_LOG_ROTATED_PATH, DB_LOG_MAX_BYTES);
 }
 
 void db_log_set_enabled(bool enabled) {

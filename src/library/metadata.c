@@ -1,4 +1,5 @@
 #include "metadata.h"
+#include "library_endian.h"
 
 #include "dr_flac.h"
 #include "dr_wav.h"
@@ -1513,10 +1514,6 @@ static void read_dsf_metadata(const char * path, track_metadata_t * out, bool in
     fclose(f);
 }
 
-static uint32_t read_u32le(const uint8_t * b) {
-    return (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
-}
-
 /* Same key -> field matching apply_vorbis_comment_field() does, factored
  * out since both APEv2 items and Vorbis comments are plain case-
  * insensitive "Title"/"Artist"/"Album" text fields -- only how each
@@ -1587,8 +1584,8 @@ static void read_ape_metadata(const char * path, track_metadata_t * out) {
         return;
     }
 
-    uint32_t tag_size = read_u32le(&footer[12]);
-    uint32_t item_count = read_u32le(&footer[16]);
+    uint32_t tag_size = library_read_u32le(&footer[12]);
+    uint32_t item_count = library_read_u32le(&footer[16]);
     if (tag_size < 32 || (long) tag_size > effective_end) {
         fclose(f);
         return;
@@ -1603,8 +1600,8 @@ static void read_ape_metadata(const char * path, track_metadata_t * out) {
     for (uint32_t i = 0; i < item_count; i++) {
         uint8_t item_header[8];
         if (fread(item_header, 1, sizeof(item_header), f) != sizeof(item_header)) break;
-        uint32_t value_length = read_u32le(&item_header[0]);
-        uint32_t item_flags = read_u32le(&item_header[4]);
+        uint32_t value_length = library_read_u32le(&item_header[0]);
+        uint32_t item_flags = library_read_u32le(&item_header[4]);
 
         char key[64];
         size_t key_len = 0;
@@ -1759,10 +1756,6 @@ static const uint8_t GUID_ASF_HEADER[16] = {
     0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C
 };
 
-static uint16_t read_u16le(const uint8_t * b) {
-    return (uint16_t) ((uint16_t) b[0] | ((uint16_t) b[1] << 8));
-}
-
 /* Reuses decode_id3v2_text_frame() for the UTF-16LE -> UTF-8 conversion
  * rather than a second implementation: encoding byte 0x01 ("UTF-16 with
  * optional BOM") already treats absent-BOM input as little-endian by
@@ -1797,7 +1790,7 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
         fclose(f);
         return;
     }
-    uint32_t num_objects = read_u32le(count_buf);
+    uint32_t num_objects = library_read_u32le(count_buf);
 
     long pos = ftell(f);
     for (uint32_t i = 0; i < num_objects; i++) {
@@ -1817,8 +1810,8 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
         if (memcmp(sub_guid, GUID_CONTENT_DESCRIPTION, 16) == 0) {
             uint8_t lens[10]; /* 5 x u16LE lengths: title, author, copyright, description, rating */
             if (fread(lens, 1, sizeof(lens), f) == sizeof(lens)) {
-                uint16_t title_len = read_u16le(&lens[0]);
-                uint16_t author_len = read_u16le(&lens[2]);
+                uint16_t title_len = library_read_u16le(&lens[0]);
+                uint16_t author_len = library_read_u16le(&lens[2]);
                 if (title_len > 0) {
                     decode_asf_utf16le(f, title_len, out->title, sizeof(out->title));
                     out->has_title = out->title[0] != '\0';
@@ -1835,11 +1828,11 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
         } else if (memcmp(sub_guid, GUID_EXT_CONTENT_DESCRIPTION, 16) == 0) {
             uint8_t count_field[2];
             if (fread(count_field, 1, sizeof(count_field), f) == sizeof(count_field)) {
-                uint16_t desc_count = read_u16le(count_field);
+                uint16_t desc_count = library_read_u16le(count_field);
                 for (uint16_t d = 0; d < desc_count; d++) {
                     uint8_t name_len_buf[2];
                     if (fread(name_len_buf, 1, 2, f) != 2) break;
-                    uint16_t name_len = read_u16le(name_len_buf);
+                    uint16_t name_len = library_read_u16le(name_len_buf);
                     char name[64];
                     decode_asf_utf16le(f, name_len, name, sizeof(name));
                     /* decode_asf_utf16le() already consumed exactly
@@ -1850,8 +1843,8 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
 
                     uint8_t type_len_buf[4];
                     if (fread(type_len_buf, 1, 4, f) != 4) break;
-                    uint16_t value_type = read_u16le(&type_len_buf[0]);
-                    uint16_t value_len = read_u16le(&type_len_buf[2]);
+                    uint16_t value_type = library_read_u16le(&type_len_buf[0]);
+                    uint16_t value_len = library_read_u16le(&type_len_buf[2]);
 
                     if (value_type == 0 && value_len > 0 && strcasecmp(name, "WM/AlbumTitle") == 0) {
                         decode_asf_utf16le(f, value_len, out->album, sizeof(out->album));

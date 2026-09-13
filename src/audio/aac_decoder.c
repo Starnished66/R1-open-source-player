@@ -45,8 +45,6 @@ struct aac_decoder {
     int16_t carry_buffer[AAC_MAX_FRAME_SAMPLES];
     uint64_t carry_frames;
     uint64_t carry_read_pos;
-
-    uint64_t current_pcm_frame;
 };
 
 static bool parse_adts_header(const uint8_t * h, unsigned int * out_frame_length) {
@@ -428,7 +426,6 @@ decoder_read_result_t aac_read_pcm_frames_s16(aac_decoder_t * dec, uint64_t fram
 
         dec->carry_read_pos += to_copy;
         res.frames += to_copy;
-        dec->current_pcm_frame += to_copy;
     }
 
     return res;
@@ -474,8 +471,6 @@ bool aac_seek_to_pcm_frame(aac_decoder_t * dec, uint64_t frame_index) {
     dec->consecutive_errors = 0;
 
     if (!decode_next_frame(dec)) return false;
-
-    dec->current_pcm_frame = target_frame * dec->frame_size;
     return true;
 }
 

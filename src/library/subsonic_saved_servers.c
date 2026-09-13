@@ -1,4 +1,5 @@
 #include "subsonic_saved_servers.h"
+#include "library_endian.h"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -73,8 +74,7 @@ static bool append_parsed(const char * url, const char * username, const char * 
 static void parse_file(FILE * f) {
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
-        size_t n = strlen(line);
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        size_t n = library_trim_eol(line);
         if (n == 0) continue;
 
         char * url = line;
@@ -160,11 +160,7 @@ static void save_file(void) {
         unlink(tmp);
         return;
     }
-    int dfd = open(SUBSONIC_SAVED_SERVERS_DIR, O_RDONLY | O_DIRECTORY);
-    if (dfd >= 0) {
-        fsync(dfd);
-        close(dfd);
-    }
+    (void) library_fsync_dir(SUBSONIC_SAVED_SERVERS_DIR);
 }
 
 static bool field_ok(const char * s) {
@@ -194,26 +190,7 @@ void subsonic_saved_servers_upsert(const char * url, const char * username, cons
     ensure_loaded();
     int i = find_index(url);
     if (i < 0) {
-        if (entry_n >= SUBSONIC_SAVED_SERVERS_MAX) {
-            pthread_mutex_unlock(&mu);
-            return;
-        }
-        if (entry_n >= entry_cap) {
-            int cap = entry_cap ? entry_cap * 2 : 16;
-            subsonic_saved_server_t * nent = realloc(entries, sizeof(*nent) * (size_t) cap);
-            if (!nent) {
-                pthread_mutex_unlock(&mu);
-                return;
-            }
-            entries = nent;
-            entry_cap = cap;
-        }
-        i = entry_n++;
-        snprintf(entries[i].url, sizeof(entries[i].url), "%s", url);
-        snprintf(entries[i].username, sizeof(entries[i].username), "%s", username);
-        snprintf(entries[i].password, sizeof(entries[i].password), "%s", password);
-        entries[i].verify_tls = verify_tls;
-        save_file();
+        if (append_parsed(url, username, password, verify_tls)) save_file();
         pthread_mutex_unlock(&mu);
         return;
     }

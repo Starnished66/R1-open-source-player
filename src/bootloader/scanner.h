@@ -100,12 +100,13 @@ typedef struct {
  * against SD_DEVICE_NODE_PARTITION then SD_DEVICE_NODE_WHOLE_DISK -- then
  * populates out with whether the SD "stock" alternate exists (and therefore
  * forces the menu), whether an SD "update" build is present (for
- * installer_run() to act on), and the computed default entry plus persisted
- * timeout for the countdown. Never fails outright -- no SD card present at
- * all, a missing/corrupt preference file, or an unreadable candidate binary
- * all degrade to "internal player, no menu, default timeout" rather than
- * blocking boot. Safe to call even if the real player later mounts the same
- * card again itself -- both check "already mounted" first. */
+ * installer_run() to act on), the hardcoded default entry (BOOT_ENTRY_INTERNAL),
+ * and the persisted timeout for the countdown loaded from preferences.
+ * Never fails outright -- no SD card present at all, a missing/corrupt preference
+ * file, or an unreadable candidate binary all degrade to "internal player, no
+ * menu, default timeout" rather than blocking boot. Safe to call even if the
+ * real player later mounts the same card again itself -- both check "already
+ * mounted" first. */
 void scanner_scan(scan_result_t * out);
 
 /* Reads INTERNAL_PLAYER_PATH's or INSTALLED_PLAYER_PATH's embedded
@@ -122,12 +123,7 @@ bool scanner_read_build_stamp(const char * path, char * out, size_t out_size);
  * pages. */
 void scanner_drop_sd_update_cache(void);
 
-/* Persists `entry` (a BOOT_ENTRY_* value) as the new default for the next
- * boot's countdown/highlighted entry -- called once boot_choice_path (see
- * main.c) is actually about to be handed off to, whether that was reached
- * by explicit user selection or an unattended timeout. Best-effort: a
- * failure to write is logged, never fatal (the device still boots either
- * way; only next boot's remembered default is affected). */
-void scanner_save_last_boot(int entry);
+/* Returns true if path exists, is a regular file, and has execute permission. */
+bool scanner_path_is_executable(const char * path);
 
 #endif /* BOOTLOADER_SCANNER_H */

@@ -7,6 +7,7 @@
  * are stored under .open_hiby_player/albumart, next to tagcache. */
 
 #include "albumart.h"
+#include "library_endian.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -319,17 +320,6 @@ bool albumart_search_files(const albumart_info_t * id3, const char * size_string
     return true;
 }
 
-bool albumart_find(const albumart_info_t * info, char * buf, size_t buflen, int width, int height) {
-    if (!info || !buf) return false;
-    char size_string[24];
-    if (width > 0 && height > 0)
-        snprintf(size_string, sizeof(size_string), ".%dx%d", width, height);
-    else
-        size_string[0] = '\0';
-    if (size_string[0] && albumart_search_files(info, size_string, buf, buflen)) return true;
-    return albumart_search_files(info, "", buf, buflen);
-}
-
 static void rgb565_to_bgr(uint16_t p, uint8_t * b, uint8_t * g, uint8_t * r) {
     uint8_t r5 = (uint8_t) ((p >> 11) & 0x1f);
     uint8_t g6 = (uint8_t) ((p >> 5) & 0x3f);
@@ -349,15 +339,6 @@ static uint32_t source_mtime_of(const albumart_info_t * info) {
     return 0;
 }
 
-static uint16_t bmp_le16(const unsigned char * p) {
-    return (uint16_t) p[0] | ((uint16_t) p[1] << 8);
-}
-
-static uint32_t bmp_le32(const unsigned char * p) {
-    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) |
-           ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
-}
-
 static bool bmp_source_mtime(const char * path, int expected_width, int expected_height,
                              uint32_t * out) {
     if (!out || expected_width <= 0 || expected_height <= 0) return false;
@@ -372,14 +353,14 @@ static bool bmp_source_mtime(const char * path, int expected_width, int expected
     fclose(f);
     if (!ok || hdr[0] != 'B' || hdr[1] != 'M') return false;
 
-    uint32_t file_size = bmp_le32(hdr + 2);
-    uint32_t pixel_offset = bmp_le32(hdr + 10);
-    uint32_t dib_size = bmp_le32(hdr + 14);
-    uint32_t width = bmp_le32(hdr + 18);
-    uint32_t height = bmp_le32(hdr + 22);
-    uint16_t planes = bmp_le16(hdr + 26);
-    uint16_t bits = bmp_le16(hdr + 28);
-    uint32_t compression = bmp_le32(hdr + 30);
+    uint32_t file_size = library_read_u32le(hdr + 2);
+    uint32_t pixel_offset = library_read_u32le(hdr + 10);
+    uint32_t dib_size = library_read_u32le(hdr + 14);
+    uint32_t width = library_read_u32le(hdr + 18);
+    uint32_t height = library_read_u32le(hdr + 22);
+    uint16_t planes = library_read_u16le(hdr + 26);
+    uint16_t bits = library_read_u16le(hdr + 28);
+    uint32_t compression = library_read_u32le(hdr + 30);
     if (file_size != (uint32_t) st.st_size || dib_size < 40 ||
         pixel_offset < 54 || (uint64_t) pixel_offset < 14ULL + dib_size ||
         width != (uint32_t) expected_width || height != (uint32_t) expected_height ||
@@ -391,7 +372,7 @@ static bool bmp_source_mtime(const char * path, int expected_width, int expected
     uint64_t expected_size = (uint64_t) pixel_offset + stride * (uint64_t) height;
     if (expected_size != file_size) return false;
 
-    *out = bmp_le32(hdr + 6);
+    *out = library_read_u32le(hdr + 6);
     return true;
 }
 
@@ -512,19 +493,9 @@ bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, 
     if (ok && fsync(fileno(f)) != 0) ok = false;
     if (fclose(f) != 0) ok = false;
     if (ok && rename(tmp, path) != 0) ok = false;
-    if (ok) {
-        int dfd = open(ALBUMART_DIR, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) {
-            fsync(dfd);
-            close(dfd);
-        }
-    }
+    if (ok) (void) library_fsync_dir(ALBUMART_DIR);
     if (!ok) unlink(tmp);
     return ok;
-}
-
-bool albumart_load_file(const char * path, uint8_t ** out_data, uint32_t * out_size, uint32_t max_bytes) {
-    return albumart_load_file_ex(path, out_data, out_size, max_bytes, ARTWORK_PRIO_PLAYER) == ALBUMART_LOAD_OK;
 }
 
 albumart_load_result_t albumart_load_file_ex(const char * path, uint8_t ** out_data,

@@ -133,5 +133,5 @@ size_t utf8_truncate_safe_bounded(char * dst, size_t dst_size, const char * src,
 
 size_t utf8_truncate_safe(char * dst, const char * src, size_t max_bytes) {
     if (!src) return utf8_truncate_safe_bounded(dst, max_bytes, NULL, 0);
-    return utf8_truncate_safe_bounded(dst, max_bytes, src, strlen(src));
+    return utf8_truncate_safe_bounded(dst, max_bytes, src, strnlen(src, max_bytes));
 }

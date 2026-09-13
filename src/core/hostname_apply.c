@@ -5,7 +5,7 @@
 #include <string.h>
 
 #ifndef HOST_BUILD
-#include "subprocess.h"
+#include <sys/mount.h>
 #include <unistd.h>
 
 #define HOSTNAME_OVERRIDE_FILE "/usr/data/hostname_override.txt"
@@ -13,8 +13,7 @@
 #define STOCK_BT_NAME_PATH "/usr/resource/bt_name"
 
 static bool bind_mount_over(const char * source, const char * target) {
-    char * argv[] = { "/bin/mount", "-o", "bind", (char *) source, (char *) target, NULL };
-    return subprocess_run(argv, NULL, 0);
+    return mount(source, target, NULL, MS_BIND, NULL) == 0;
 }
 #endif
 

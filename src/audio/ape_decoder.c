@@ -31,7 +31,6 @@
 
 #define APE_FILTER_LEVELS 3
 
-#define APE_FRAMECODE_MONO_SILENCE 1
 #define APE_FRAMECODE_STEREO_SILENCE 3
 #define APE_FRAMECODE_PSEUDO_STEREO 4
 
@@ -125,14 +124,12 @@ struct ape_decoder {
     uint32_t carry_read_pos;
 
     uint64_t total_pcm_frames;
-    uint64_t current_pcm_frame;
 };
 
 /* ---- range decoder (verbatim port) ---- */
 
 #define CODE_BITS 32
 #define TOP_VALUE ((unsigned int) 1 << (CODE_BITS - 1))
-#define SHIFT_BITS (CODE_BITS - 9)
 #define EXTRA_BITS ((CODE_BITS - 2) % 8 + 1)
 #define BOTTOM_VALUE (TOP_VALUE >> 8)
 
@@ -841,7 +838,6 @@ decoder_read_result_t ape_read_pcm_frames_s16(ape_decoder_t * dec, uint64_t fram
 
         dec->carry_read_pos += (uint32_t) to_copy;
         res.frames += to_copy;
-        dec->current_pcm_frame += to_copy;
     }
 
     return res;
@@ -892,7 +888,6 @@ decoder_read_result_t ape_read_pcm_frames_s32(ape_decoder_t * dec, uint64_t fram
 
         dec->carry_read_pos += (uint32_t) to_copy;
         res.frames += to_copy;
-        dec->current_pcm_frame += to_copy;
     }
 
     return res;
@@ -915,7 +910,6 @@ bool ape_seek_to_pcm_frame(ape_decoder_t * dec, uint64_t frame_index) {
     if (within > dec->carry_frames) within = dec->carry_frames;
 
     dec->carry_read_pos = (uint32_t) within;
-    dec->current_pcm_frame = frame_start + within;
     return true;
 }
 

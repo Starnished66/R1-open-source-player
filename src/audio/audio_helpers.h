@@ -7,6 +7,29 @@
 #include <stdint.h>
 #include <string.h>
 
+static inline uint16_t audio_read_u16le(const uint8_t * b) {
+    return (uint16_t) (b[0] | (b[1] << 8));
+}
+static inline uint32_t audio_read_u32le(const uint8_t * b) {
+    return (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+}
+static inline uint64_t audio_read_u64le(const uint8_t * b) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | b[i];
+    return v;
+}
+static inline uint32_t audio_read_u32be(const uint8_t * b) {
+    return ((uint32_t) b[0] << 24) | ((uint32_t) b[1] << 16) | ((uint32_t) b[2] << 8) | (uint32_t) b[3];
+}
+static inline uint16_t audio_read_u16be(const uint8_t * b) {
+    return (uint16_t) (((uint16_t) b[0] << 8) | b[1]);
+}
+static inline uint64_t audio_read_u64be(const uint8_t * b) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | b[i];
+    return v;
+}
+
 /* Upper bound on missing end-of-track frames due to container padding,
  * gapless encoder delay, or imprecise duration metadata (e.g. VBR MP3/AAC).
  * 8192 frames is ~0.18s at 44.1kHz. Any termination with more than 8192
@@ -86,7 +109,7 @@ static inline bool is_premature_eof(uint64_t frames_played_local, uint64_t total
  * Capped to [1, 1024] to avoid excess latency or zero-frame divisions. */
 static inline uint64_t calculate_ramp_frames(unsigned int sample_rate) {
     if (sample_rate == 0) sample_rate = 44100;
-    uint64_t f = (uint64_t) ((5.0 / 1000.0) * (double) sample_rate + 0.5);
+    uint64_t f = (uint64_t) (((double) RAMP_DURATION_MS / 1000.0) * (double) sample_rate + 0.5);
     if (f < 1) f = 1;
     if (f > 1024) f = 1024;
     return f;

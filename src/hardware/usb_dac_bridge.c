@@ -45,14 +45,7 @@ static FILE * bridge_log_file = NULL;
 
 /* Must be called with bridge_log_mutex held and bridge_log_file non-NULL. */
 static void bridge_log_rotate_if_needed_locked(void) {
-    if (fseek(bridge_log_file, 0, SEEK_END) != 0) return;
-    long size = ftell(bridge_log_file);
-    if (size < BRIDGE_LOG_MAX_BYTES) return;
-    fclose(bridge_log_file);
-    bridge_log_file = NULL;
-    remove(BRIDGE_LOG_ROTATED_PATH);
-    rename(BRIDGE_LOG_PATH, BRIDGE_LOG_ROTATED_PATH);
-    bridge_log_file = fopen(BRIDGE_LOG_PATH, "w");
+    db_log_rotate_file_if_needed_locked(&bridge_log_file, BRIDGE_LOG_PATH, BRIDGE_LOG_ROTATED_PATH, BRIDGE_LOG_MAX_BYTES);
 }
 
 void usb_dac_bridge_set_debug_log_enabled(bool enabled) {
@@ -66,6 +59,8 @@ void usb_dac_bridge_set_debug_log_enabled(bool enabled) {
         pthread_mutex_unlock(&bridge_log_mutex);
     }
 }
+
+static uint64_t monotonic_ns(void);
 
 static void bridge_log(const char * fmt, ...) {
     va_list ap;
@@ -98,9 +93,7 @@ static void bridge_log(const char * fmt, ...) {
         }
     }
 
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now_ms = (uint64_t) ts.tv_sec * 1000ULL + (uint64_t) ts.tv_nsec / 1000000ULL;
+    uint64_t now_ms = monotonic_ns() / 1000000ULL;
     fprintf(bridge_log_file, "[usb_dac_bridge] t=%llu ", (unsigned long long) now_ms);
 
     va_start(ap, fmt);
@@ -217,6 +210,8 @@ static unsigned int snap_to_standard_rate(double measured_rate) {
         if (best_diff < 0 || diff < best_diff) {
             best_diff = diff;
             best = STANDARD_RATES[i];
+        } else if (diff > best_diff) {
+            break;
         }
     }
     return best;

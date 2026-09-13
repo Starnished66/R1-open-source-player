@@ -15,8 +15,6 @@
   #define PEQ_FILE_PATH "/usr/data/open_hiby_player_peq.txt"
 #endif
 
-#define PEQ_TMP_FILE_PATH PEQ_FILE_PATH ".tmp"
-
 #define PEQ_MAX_CHANNELS 2
 
 /* Direct Form I biquad: y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2]

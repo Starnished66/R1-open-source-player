@@ -90,13 +90,5 @@ void playlist_files_resolve_path(const char * m3u_path, const char * line, char 
  * once, gated by a marker file (dir/.relative_paths_migrated). */
 void playlist_files_migrate_to_relative(const char * dir);
 
-/* Cached index of discovered .m3u paths -- tagcache does not store
- * playlists, so this lives as a path list next to the music database
- * directory rather than in the tag files. Refreshed by a full scan;
- * insert/delete keep a single create/delete instant. */
-void playlist_files_index_replace(char * const * paths, int count);
-void playlist_files_index_load(char *** out_paths, int * out_count);
-void playlist_files_index_insert(const char * path);
-void playlist_files_index_delete(const char * path);
 
 #endif /* PLAYLIST_FILES_H */

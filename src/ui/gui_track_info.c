@@ -208,8 +208,8 @@ static void add_info_line(const char * name, const char * value) {
 
     const lv_font_t * font = gui_theme_font(GUI_FONT_ROLE_BODY);
     int32_t scr_w = lv_display_get_horizontal_resolution(lv_display_get_default());
-    int32_t max_w = scr_w - 48;
-    if (max_w <= 0) max_w = 432;
+    int32_t max_w = scr_w - BOARD_SCALE_PX(48);
+    if (max_w <= 0) max_w = BOARD_SCREEN_WIDTH - BOARD_SCALE_PX(48);
 
     char wrapped_line[4096];
     wrap_text_to_width(raw_line, wrapped_line, sizeof(wrapped_line), font, max_w);
@@ -220,7 +220,7 @@ static void add_info_line(const char * name, const char * value) {
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
     lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, font, 0);
-    lv_obj_set_style_pad_top(label, 8, 0);
+    lv_obj_set_style_pad_top(label, BOARD_SCALE_PX(8), 0);
     lv_obj_add_flag(label, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_label_set_text(label, wrapped_line);
 }
@@ -383,7 +383,7 @@ static void rebuild_info_text(const audio_current_format_info_t * runtime, bool 
         lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
         lv_obj_add_style(label, &style_theme_text_primary, 0);
         lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-        lv_obj_set_style_pad_top(label, 8, 0);
+        lv_obj_set_style_pad_top(label, BOARD_SCALE_PX(8), 0);
         lv_label_set_text(label, "No track information available");
     }
 }
@@ -406,10 +406,10 @@ void gui_track_info_init(void) {
      * No pill rows, no marquee.  The list stays vertically scrollable for a
      * long local path or a larger font size. */
     lv_obj_set_flex_align(info_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_left(info_list, 24, 0);
-    lv_obj_set_style_pad_right(info_list, 24, 0);
-    lv_obj_set_style_pad_top(info_list, 12, 0);
-    lv_obj_set_style_pad_bottom(info_list, 16, 0);
+    lv_obj_set_style_pad_left(info_list, BOARD_SCALE_PX(24), 0);
+    lv_obj_set_style_pad_right(info_list, BOARD_SCALE_PX(24), 0);
+    lv_obj_set_style_pad_top(info_list, BOARD_SCALE_PX(12), 0);
+    lv_obj_set_style_pad_bottom(info_list, BOARD_SCALE_PX(16), 0);
 }
 
 lv_obj_t * gui_track_info_get_screen(void) {

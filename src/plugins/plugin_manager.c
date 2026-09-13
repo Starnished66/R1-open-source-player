@@ -8,6 +8,7 @@
 #include "playlist_files.h"
 #include "plugin_json.h"
 #include "plugin_storage.h"
+#include "plugin_internal.h"
 #include "plugin_disabled_list.h"
 #include "app_version.h"
 #include "fallback_font.h"
@@ -160,78 +161,52 @@ static const char * check_plugin_external_path(lua_State * L, int index, const c
     return path;
 }
 
-/* Registry for plugin.register_list_item("books", ...) -- gui.c's
- * build_books_screen() appends these after its own 2 built-in rows. See
- * PLUGIN_MAX_BOOKS_LIST_ITEMS's own comment in plugin_manager.h. list_id is
- * validated against a fixed, small set of recognized strings ("books",
- * "settings", "display") rather than driving any real per-list-id
- * storage/dispatch here -- each recognized list_id gets its own array +
- * validation branch (see plugin_settings_list_items[]/plugin_display_list_
- * items[] right below), not a fully generic dispatch table built ahead of
- * actually needing one. */
-static plugin_list_item_t plugin_books_list_items[PLUGIN_MAX_BOOKS_LIST_ITEMS];
-static int plugin_books_list_item_count = 0;
+/* Registries for plugin.register_list_item(list_id, ...) -- native screens
+ * (books, settings, display, playback, music_audio, music_controls,
+ * music_timers, music_library, power, system) append their plugin rows
+ * after built-in items. Storage is organized into a shared 2D array indexed
+ * by target descriptor, while enforcing each target's individual max_items. */
+typedef enum {
+    PLUGIN_LIST_TARGET_BOOKS = 0,
+    PLUGIN_LIST_TARGET_SETTINGS,
+    PLUGIN_LIST_TARGET_DISPLAY,
+    PLUGIN_LIST_TARGET_PLAYBACK,
+    PLUGIN_LIST_TARGET_MUSIC_AUDIO,
+    PLUGIN_LIST_TARGET_MUSIC_CONTROLS,
+    PLUGIN_LIST_TARGET_MUSIC_TIMERS,
+    PLUGIN_LIST_TARGET_MUSIC_LIBRARY,
+    PLUGIN_LIST_TARGET_POWER,
+    PLUGIN_LIST_TARGET_SYSTEM,
+    PLUGIN_LIST_TARGET_COUNT
+} plugin_list_target_t;
 
-/* Registry for plugin.register_list_item("settings", ...) -- gui.c's
- * build_settings_screen() appends these after its own 5 built-in category
- * rows. See PLUGIN_MAX_SETTINGS_LIST_ITEMS's own comment in
- * plugin_manager.h. */
-static plugin_list_item_t plugin_settings_list_items[PLUGIN_MAX_SETTINGS_LIST_ITEMS];
-static int plugin_settings_list_item_count = 0;
+typedef struct {
+    const char * list_id;
+    const char * kind;
+    int max_items;
+} plugin_list_target_desc_t;
 
-/* Registry for plugin.register_list_item("display", ...) -- gui.c's
- * build_settings_display_screen() appends these after its own 4 built-in
- * rows. See PLUGIN_MAX_DISPLAY_LIST_ITEMS's own comment in
- * plugin_manager.h. */
-static plugin_list_item_t plugin_display_list_items[PLUGIN_MAX_DISPLAY_LIST_ITEMS];
-static int plugin_display_list_item_count = 0;
+static const plugin_list_target_desc_t plugin_list_targets[PLUGIN_LIST_TARGET_COUNT] = {
+    [PLUGIN_LIST_TARGET_BOOKS] = { "books", "books list item", PLUGIN_MAX_BOOKS_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_SETTINGS] = { "settings", "settings list item", PLUGIN_MAX_SETTINGS_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_DISPLAY] = { "display", "display list item", PLUGIN_MAX_DISPLAY_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_PLAYBACK] = { "playback", "playback list item", PLUGIN_MAX_PLAYBACK_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_MUSIC_AUDIO] = { "music_audio", "music_audio list item", PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_MUSIC_CONTROLS] = { "music_controls", "music_controls list item", PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_MUSIC_TIMERS] = { "music_timers", "music_timers list item", PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_MUSIC_LIBRARY] = { "music_library", "music_library list item", PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_POWER] = { "power", "power list item", PLUGIN_MAX_POWER_LIST_ITEMS },
+    [PLUGIN_LIST_TARGET_SYSTEM] = { "system", "system list item", PLUGIN_MAX_SYSTEM_LIST_ITEMS },
+};
 
-/* Registry for plugin.register_list_item("playback", ...) --
- * gui_settings.c's build_music_playback_screen() appends these after its own
- * built-in rows. See PLUGIN_MAX_PLAYBACK_LIST_ITEMS's own comment in
- * plugin_manager.h. */
-static plugin_list_item_t plugin_playback_list_items[PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
-static int plugin_playback_list_item_count = 0;
-
-/* Registry for plugin.register_list_item("music_audio", ...) --
- * gui_settings.c's build_music_audio_screen() appends these after its own
- * built-in rows. See PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS's own comment in
- * plugin_manager.h. */
-static plugin_list_item_t plugin_music_audio_list_items[PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS];
-static int plugin_music_audio_list_item_count = 0;
-
-/* Registry for plugin.register_list_item("music_controls", ...) --
- * gui_settings.c's build_music_controls_screen() appends these after its own
- * built-in rows. See PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS's own comment in
- * plugin_manager.h. */
-static plugin_list_item_t plugin_music_controls_list_items[PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS];
-static int plugin_music_controls_list_item_count = 0;
-
-/* Registry for plugin.register_list_item("music_timers", ...) --
- * gui_settings.c's build_music_timers_screen() appends these after its own
- * built-in row. See PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS's own comment in
- * plugin_manager.h. */
-static plugin_list_item_t plugin_music_timers_list_items[PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS];
-static int plugin_music_timers_list_item_count = 0;
-
-/* Registry for plugin.register_list_item("music_library", ...) --
- * gui_settings.c's build_music_library_screen() appends these after its own
- * built-in row. See PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS's own comment in
- * plugin_manager.h. */
-static plugin_list_item_t plugin_music_library_list_items[PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS];
-static int plugin_music_library_list_item_count = 0;
-
-/* Registry for plugin.register_list_item("power", ...) -- gui.c's
- * build_settings_power_screen() appends these after its own built-in rows.
- * See PLUGIN_MAX_POWER_LIST_ITEMS's own comment in plugin_manager.h. */
-static plugin_list_item_t plugin_power_list_items[PLUGIN_MAX_POWER_LIST_ITEMS];
-static int plugin_power_list_item_count = 0;
-
-/* Registry for plugin.register_list_item("system", ...) -- gui.c's
- * build_settings_system_screen() appends these after its own built-in rows.
- * See PLUGIN_MAX_SYSTEM_LIST_ITEMS's own comment in plugin_manager.h. */
-static plugin_list_item_t plugin_system_list_items[PLUGIN_MAX_SYSTEM_LIST_ITEMS];
-static int plugin_system_list_item_count = 0;
+/* Second dimension uses PLUGIN_MAX_BOOKS_LIST_ITEMS as a stand-in for "the
+ * largest of the 10 per-target maxes" -- true today since all 10 are 8, but
+ * NOT automatically enforced: if any single PLUGIN_MAX_*_LIST_ITEMS above is
+ * ever raised past 8, this dimension must be raised to match, or that
+ * target's registration bounds check (which correctly checks its own
+ * max_items) would still accept writes this array can't physically hold. */
+static plugin_list_item_t plugin_list_items[PLUGIN_LIST_TARGET_COUNT][PLUGIN_MAX_BOOKS_LIST_ITEMS];
+static int plugin_list_item_counts[PLUGIN_LIST_TARGET_COUNT];
 
 /* Separate registry for plugin.register_stream_media_tile() -- same
  * plugin_tile_t shape, different surface (gui.c's Stream Media screen).
@@ -616,79 +591,27 @@ static void append_list_item(plugin_list_item_t * array, int * count, lua_State 
 
 /* Adds a row to an existing native list screen -- see PLUGIN_MAX_BOOKS_
  * LIST_ITEMS/PLUGIN_MAX_SETTINGS_LIST_ITEMS's own comments in plugin_
- * manager.h. list_id is checked against a small, fixed set of recognized
- * strings ("books", "settings") rather than accepted as-is: a typo'd or
- * unsupported list_id should fail loudly at plugin load time, not silently
- * register into nothing. */
+ * manager.h. list_id is checked against plugin_list_targets[]'s own fixed
+ * set of recognized strings ("books", "settings", ...) rather than accepted
+ * as-is: a typo'd or unsupported list_id should fail loudly at plugin load
+ * time, not silently register into nothing. */
 static int l_plugin_register_list_item(lua_State * L) {
     const char * list_id = luaL_checkstring(L, 1);
     const char * label = luaL_checkstring(L, 2);
     luaL_checktype(L, 3, LUA_TFUNCTION);
 
-    if (strcmp(list_id, "books") == 0) {
-        if (plugin_books_list_item_count >= PLUGIN_MAX_BOOKS_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"books\" (max %d)",
-                               PLUGIN_MAX_BOOKS_LIST_ITEMS);
+    for (int i = 0; i < PLUGIN_LIST_TARGET_COUNT; i++) {
+        if (strcmp(list_id, plugin_list_targets[i].list_id) == 0) {
+            if (plugin_list_item_counts[i] >= plugin_list_targets[i].max_items) {
+                return luaL_error(L, "plugin.register_list_item: too many items registered for \"%s\" (max %d)",
+                                  plugin_list_targets[i].list_id, plugin_list_targets[i].max_items);
+            }
+            append_list_item(plugin_list_items[i], &plugin_list_item_counts[i], L, label);
+            return 0;
         }
-        append_list_item(plugin_books_list_items, &plugin_books_list_item_count, L, label);
-    } else if (strcmp(list_id, "settings") == 0) {
-        if (plugin_settings_list_item_count >= PLUGIN_MAX_SETTINGS_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"settings\" (max %d)",
-                               PLUGIN_MAX_SETTINGS_LIST_ITEMS);
-        }
-        append_list_item(plugin_settings_list_items, &plugin_settings_list_item_count, L, label);
-    } else if (strcmp(list_id, "display") == 0) {
-        if (plugin_display_list_item_count >= PLUGIN_MAX_DISPLAY_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"display\" (max %d)",
-                               PLUGIN_MAX_DISPLAY_LIST_ITEMS);
-        }
-        append_list_item(plugin_display_list_items, &plugin_display_list_item_count, L, label);
-    } else if (strcmp(list_id, "playback") == 0) {
-        if (plugin_playback_list_item_count >= PLUGIN_MAX_PLAYBACK_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"playback\" (max %d)",
-                               PLUGIN_MAX_PLAYBACK_LIST_ITEMS);
-        }
-        append_list_item(plugin_playback_list_items, &plugin_playback_list_item_count, L, label);
-    } else if (strcmp(list_id, "music_audio") == 0) {
-        if (plugin_music_audio_list_item_count >= PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"music_audio\" (max %d)",
-                               PLUGIN_MAX_MUSIC_AUDIO_LIST_ITEMS);
-        }
-        append_list_item(plugin_music_audio_list_items, &plugin_music_audio_list_item_count, L, label);
-    } else if (strcmp(list_id, "music_controls") == 0) {
-        if (plugin_music_controls_list_item_count >= PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"music_controls\" (max %d)",
-                               PLUGIN_MAX_MUSIC_CONTROLS_LIST_ITEMS);
-        }
-        append_list_item(plugin_music_controls_list_items, &plugin_music_controls_list_item_count, L, label);
-    } else if (strcmp(list_id, "music_timers") == 0) {
-        if (plugin_music_timers_list_item_count >= PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"music_timers\" (max %d)",
-                               PLUGIN_MAX_MUSIC_TIMERS_LIST_ITEMS);
-        }
-        append_list_item(plugin_music_timers_list_items, &plugin_music_timers_list_item_count, L, label);
-    } else if (strcmp(list_id, "music_library") == 0) {
-        if (plugin_music_library_list_item_count >= PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"music_library\" (max %d)",
-                               PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS);
-        }
-        append_list_item(plugin_music_library_list_items, &plugin_music_library_list_item_count, L, label);
-    } else if (strcmp(list_id, "power") == 0) {
-        if (plugin_power_list_item_count >= PLUGIN_MAX_POWER_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"power\" (max %d)",
-                               PLUGIN_MAX_POWER_LIST_ITEMS);
-        }
-        append_list_item(plugin_power_list_items, &plugin_power_list_item_count, L, label);
-    } else if (strcmp(list_id, "system") == 0) {
-        if (plugin_system_list_item_count >= PLUGIN_MAX_SYSTEM_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"system\" (max %d)",
-                               PLUGIN_MAX_SYSTEM_LIST_ITEMS);
-        }
-        append_list_item(plugin_system_list_items, &plugin_system_list_item_count, L, label);
-    } else {
-        return luaL_error(L, "plugin.register_list_item: unknown list_id '%s' (expected \"books\", \"settings\", \"display\", \"playback\", \"music_audio\", \"music_controls\", \"music_timers\", \"music_library\", \"power\", or \"system\")", list_id);
     }
-    return 0;
+
+    return luaL_error(L, "plugin.register_list_item: unknown list_id '%s' (expected \"books\", \"settings\", \"display\", \"playback\", \"music_audio\", \"music_controls\", \"music_timers\", \"music_library\", \"power\", or \"system\")", list_id);
 }
 
 /* Registers a Stream Media tile, appended after the built-in Subsonic tile.
@@ -722,6 +645,7 @@ static int l_plugin_register_stream_media_tile(lua_State * L) {
  * must not contain a comma or whitespace; letters/digits/'.'/'_'/'-' is
  * already exactly that safe set. */
 static bool plugin_id_is_valid(const char * id);
+static int push_plugin_error(lua_State * L, const char * message);
 
 /* Registers a tile a theme can place on Home via set_home_layout()'s
  * `options.order`. The `icon` parameter is required.
@@ -775,9 +699,12 @@ static int l_plugin_register_home_tile(lua_State * L) {
     snprintf(t->id, sizeof(t->id), "%s", id);
     utf8_truncate_safe(t->label, label, sizeof(t->label));
     utf8_sanitize(t->label);
-    fill_tile_icon(t, icon, "", ""); /* icon is required above (luaL_checkstring), so
-                                         fill_tile_icon()'s default-fallback branch is dead
-                                         code here -- these two are never actually read. */
+    char base[80];
+    snprintf(base, sizeof(base), "%s", icon);
+    char * dot = strrchr(base, '.');
+    if (dot) *dot = '\0';
+    snprintf(t->icon, sizeof(t->icon), "%s", icon);
+    snprintf(t->icon_selected, sizeof(t->icon_selected), "%s_s.png", base);
     return 0;
 }
 
@@ -797,12 +724,13 @@ static int l_plugin_show_list(lua_State * L) {
     lua_Unsigned raw_n = lua_rawlen(L, 2);
     int n = (raw_n > (lua_Unsigned) PLUGIN_MAX_LIST_ITEMS) ? PLUGIN_MAX_LIST_ITEMS : (int) raw_n;
 
-    static char label_bufs[PLUGIN_MAX_LIST_ITEMS][160];
-    static const char * labels[PLUGIN_MAX_LIST_ITEMS];
-    static char icon_bufs[PLUGIN_MAX_LIST_ITEMS][256];
-    static const char * icon_paths[PLUGIN_MAX_LIST_ITEMS];
-    static char text_size_bufs[PLUGIN_MAX_LIST_ITEMS][8];
-    static const char * text_sizes[PLUGIN_MAX_LIST_ITEMS];
+    size_t alloc_n = (n > 0) ? (size_t) n : 1;
+    char (*label_bufs)[160] = lua_newuserdata(L, (size_t) alloc_n * sizeof(*label_bufs));
+    const char ** labels = lua_newuserdata(L, (size_t) alloc_n * sizeof(*labels));
+    char (*icon_bufs)[256] = lua_newuserdata(L, (size_t) alloc_n * sizeof(*icon_bufs));
+    const char ** icon_paths = lua_newuserdata(L, (size_t) alloc_n * sizeof(*icon_paths));
+    char (*text_size_bufs)[8] = lua_newuserdata(L, (size_t) alloc_n * sizeof(*text_size_bufs));
+    const char ** text_sizes = lua_newuserdata(L, (size_t) alloc_n * sizeof(*text_sizes));
 
     for (int i = 0; i < n; i++) {
         lua_rawgeti(L, 2, i + 1);
@@ -1076,9 +1004,7 @@ static int l_plugin_mkdir(lua_State * L) {
     const char * path = check_plugin_external_path(L, 1, "plugin.mkdir");
     size_t len = strlen(path);
     if (len == 0 || len >= PATH_MAX) {
-        lua_pushnil(L);
-        lua_pushstring(L, "invalid path");
-        return 2;
+        return push_plugin_error(L, "invalid path");
     }
 
     char buf[PATH_MAX];
@@ -1122,8 +1048,8 @@ static int l_plugin_play_list(lua_State * L) {
     if (start < 0) start = 0;
     if (start >= n) start = n - 1;
 
-    static char path_bufs[PLUGIN_MAX_LIST_ITEMS][512];
-    static const char * paths[PLUGIN_MAX_LIST_ITEMS];
+    char (*path_bufs)[512] = lua_newuserdata(L, (size_t) n * sizeof(*path_bufs));
+    const char ** paths = lua_newuserdata(L, (size_t) n * sizeof(*paths));
     for (int i = 0; i < n; i++) {
         lua_rawgeti(L, 1, i + 1);
         const char * s = lua_tostring(L, -1);
@@ -2210,9 +2136,7 @@ static int l_plugin_http_get(lua_State * L) {
     size_t body_size = 0;
     bool ok = http_get_to_buffer(url, verify_tls, &status, &body, &body_size);
     if (!ok) {
-        lua_pushnil(L);
-        lua_pushstring(L, "network error");
-        return 2;
+        return push_plugin_error(L, "network error");
     }
 
     lua_pushinteger(L, status);
@@ -2243,9 +2167,7 @@ static int l_plugin_http_post(lua_State * L) {
     bool ok = http_post_to_buffer(url, verify_tls, content_type, (const uint8_t *) body, body_len, &status,
                                    &resp_body, &resp_body_size);
     if (!ok) {
-        lua_pushnil(L);
-        lua_pushstring(L, "network error");
-        return 2;
+        return push_plugin_error(L, "network error");
     }
 
     lua_pushinteger(L, status);
@@ -2451,9 +2373,7 @@ static int l_plugin_http_request(lua_State * L) {
         if (!plugin_async_http[i].active) { slot = i; break; }
     }
     if (slot < 0) {
-        lua_pushnil(L);
-        lua_pushstring(L, "too many active HTTP requests");
-        return 2;
+        return push_plugin_error(L, "too many active HTTP requests");
     }
 
     lua_getfield(L, 1, "url");
@@ -2634,9 +2554,7 @@ static int l_plugin_http_request(lua_State * L) {
         req->request_body = NULL;
         req->active = false;
         http_cancel_token_destroy(&req->cancel);
-        lua_pushnil(L);
-        lua_pushstring(L, "could not start HTTP worker");
-        return 2;
+        return push_plugin_error(L, "could not start HTTP worker");
     }
 
     int handle = ((int) generation << 8) | (slot + 1);
@@ -2668,9 +2586,7 @@ static int l_plugin_download_file_async(lua_State * L) {
         if (!plugin_async_http[i].active) { slot = i; break; }
     }
     if (slot < 0) {
-        lua_pushnil(L);
-        lua_pushstring(L, "too many active HTTP requests");
-        return 2;
+        return push_plugin_error(L, "too many active HTTP requests");
     }
 
     plugin_async_http_t * req = &plugin_async_http[slot];
@@ -2693,9 +2609,7 @@ static int l_plugin_download_file_async(lua_State * L) {
         luaL_unref(L, LUA_REGISTRYINDEX, req->callback_ref);
         req->active = false;
         http_cancel_token_destroy(&req->cancel);
-        lua_pushnil(L);
-        lua_pushstring(L, "could not start HTTP worker");
-        return 2;
+        return push_plugin_error(L, "could not start HTTP worker");
     }
 
     lua_pushinteger(L, ((int) generation << 8) | (slot + 1));
@@ -2735,7 +2649,7 @@ static int l_plugin_md5(lua_State * L) {
     mbedtls_md5((const unsigned char *) data, len, digest);
 
     char hex[33];
-    for (int i = 0; i < 16; i++) snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    md5_digest_to_hex(digest, hex);
     lua_pushstring(L, hex);
     return 1;
 }
@@ -3330,12 +3244,7 @@ static int l_plugin_show_lock_screen(lua_State * L) {
 }
 
 static bool plugin_id_is_valid(const char * id) {
-    if (!id || !id[0]) return false;
-    for (const unsigned char * p = (const unsigned char *) id; *p; p++) {
-        if (!( (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-               (*p >= '0' && *p <= '9') || *p == '.' || *p == '_' || *p == '-')) return false;
-    }
-    return true;
+    return plugin_id_charset_ok(id);
 }
 
 /* Checks whether a plugin ID collides with any already-loaded plugin instance. */
@@ -3523,9 +3432,7 @@ static int l_plugin_storage_list(lua_State * L) {
     char ** keys = NULL;
     int count = plugin_storage_list(id, prefix, &keys);
     if (count < 0) {
-        lua_pushnil(L);
-        lua_pushstring(L, "plugin.storage.list failed");
-        return 2;
+        return push_plugin_error(L, "plugin.storage.list failed");
     }
     lua_newtable(L);
     for (int i = 0; i < count; i++) {
@@ -3752,9 +3659,7 @@ static lua_CFunction real_os_rename = NULL;
 static int l_guarded_io_open(lua_State * L) {
     const char * path = luaL_optstring(L, 1, "");
     if (plugin_storage_path_is_reserved(path)) {
-        lua_pushnil(L);
-        lua_pushliteral(L, "io.open: path is reserved for plugin.storage/plugin.secrets");
-        return 2;
+        return push_plugin_error(L, "io.open: path is reserved for plugin.storage/plugin.secrets");
     }
     return plugin_call_native(L, real_io_open);
 }
@@ -3802,9 +3707,7 @@ static int l_guarded_io_output(lua_State * L) {
 static int l_guarded_os_remove(lua_State * L) {
     const char * path = luaL_optstring(L, 1, "");
     if (plugin_storage_path_is_reserved(path)) {
-        lua_pushnil(L);
-        lua_pushliteral(L, "os.remove: path is reserved for plugin.storage/plugin.secrets");
-        return 2;
+        return push_plugin_error(L, "os.remove: path is reserved for plugin.storage/plugin.secrets");
     }
     return plugin_call_native(L, real_os_remove);
 }
@@ -3813,9 +3716,7 @@ static int l_guarded_os_rename(lua_State * L) {
     const char * from = luaL_optstring(L, 1, "");
     const char * to = luaL_optstring(L, 2, "");
     if (plugin_storage_path_is_reserved(from) || plugin_storage_path_is_reserved(to)) {
-        lua_pushnil(L);
-        lua_pushliteral(L, "os.rename: path is reserved for plugin.storage/plugin.secrets");
-        return 2;
+        return push_plugin_error(L, "os.rename: path is reserved for plugin.storage/plugin.secrets");
     }
     return plugin_call_native(L, real_os_rename);
 }
@@ -4137,7 +4038,7 @@ int plugin_manager_scan_available(plugin_available_entry_t * out, int max) {
  * plugin_manager_poll()'s own cancelled-request branch already skips it for
  * the same reason (a cancelled request has nothing meaningful to report),
  * and here the callback's L is about to be closed by the caller regardless. */
-void plugin_manager_cancel_all_async_http(void) {
+static void plugin_manager_cancel_all_async_http(void) {
     for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
         plugin_async_http_t * req = &plugin_async_http[i];
         if (!req->active) continue;
@@ -4251,26 +4152,10 @@ void plugin_manager_deinit(void) {
     memset(plugin_instances, 0, sizeof(plugin_instances));
     plugin_instance_count = 0;
 
-    memset(plugin_books_list_items, 0, sizeof(plugin_books_list_items));
-    plugin_books_list_item_count = 0;
-    memset(plugin_settings_list_items, 0, sizeof(plugin_settings_list_items));
-    plugin_settings_list_item_count = 0;
-    memset(plugin_display_list_items, 0, sizeof(plugin_display_list_items));
-    plugin_display_list_item_count = 0;
-    memset(plugin_playback_list_items, 0, sizeof(plugin_playback_list_items));
-    plugin_playback_list_item_count = 0;
-    memset(plugin_music_audio_list_items, 0, sizeof(plugin_music_audio_list_items));
-    plugin_music_audio_list_item_count = 0;
-    memset(plugin_music_controls_list_items, 0, sizeof(plugin_music_controls_list_items));
-    plugin_music_controls_list_item_count = 0;
-    memset(plugin_music_timers_list_items, 0, sizeof(plugin_music_timers_list_items));
-    plugin_music_timers_list_item_count = 0;
-    memset(plugin_music_library_list_items, 0, sizeof(plugin_music_library_list_items));
-    plugin_music_library_list_item_count = 0;
-    memset(plugin_power_list_items, 0, sizeof(plugin_power_list_items));
-    plugin_power_list_item_count = 0;
-    memset(plugin_system_list_items, 0, sizeof(plugin_system_list_items));
-    plugin_system_list_item_count = 0;
+    memset(plugin_list_items, 0, sizeof(plugin_list_items));
+    for (int i = 0; i < PLUGIN_LIST_TARGET_COUNT; i++) {
+        plugin_list_item_counts[i] = 0;
+    }
     memset(plugin_stream_tiles, 0, sizeof(plugin_stream_tiles));
     plugin_stream_tile_count = 0;
     memset(plugin_home_tiles, 0, sizeof(plugin_home_tiles));
@@ -4388,205 +4273,88 @@ static void get_list_item_options(const plugin_list_item_t * array, int count, i
     if (item->text_size[0]) *out_text_size = item->text_size;
 }
 
-int plugin_manager_get_books_list_item_count(void) {
-    return plugin_books_list_item_count;
+static int generic_list_item_count(int target) {
+    if (target < 0 || target >= PLUGIN_LIST_TARGET_COUNT) return 0;
+    return plugin_list_item_counts[target];
 }
 
-const char * plugin_manager_get_books_list_item_label(int index) {
-    if (index < 0 || index >= plugin_books_list_item_count) return "";
-    return plugin_books_list_items[index].label;
+static const char * generic_list_item_label(int target, int index) {
+    if (target < 0 || target >= PLUGIN_LIST_TARGET_COUNT) return "";
+    if (index < 0 || index >= plugin_list_item_counts[target] || index >= plugin_list_targets[target].max_items) return "";
+    return plugin_list_items[target][index].label;
 }
 
-void plugin_manager_books_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_books_list_item_count) return;
-    dispatch_list_item_open(&plugin_books_list_items[index], "books list item");
+static void generic_list_item_clicked(int target, int index) {
+    if (target < 0 || target >= PLUGIN_LIST_TARGET_COUNT) return;
+    if (index < 0 || index >= plugin_list_item_counts[target] || index >= plugin_list_targets[target].max_items) return;
+    dispatch_list_item_open(&plugin_list_items[target][index], plugin_list_targets[target].kind);
 }
 
-void plugin_manager_get_books_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                 int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_books_list_items, plugin_books_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
+static void generic_list_item_options(int target, int index, const char ** out_icon, int32_t * out_height,
+                                      int32_t * out_width, const char ** out_text_size) {
+    if (target < 0 || target >= PLUGIN_LIST_TARGET_COUNT) {
+        *out_icon = NULL;
+        *out_height = 0;
+        *out_width = 0;
+        *out_text_size = NULL;
+        return;
+    }
+    int count = plugin_list_item_counts[target];
+    if (count > plugin_list_targets[target].max_items) {
+        count = plugin_list_targets[target].max_items;
+    }
+    get_list_item_options(plugin_list_items[target], count, index, out_icon, out_height, out_width, out_text_size);
 }
 
-int plugin_manager_get_settings_list_item_count(void) {
-    return plugin_settings_list_item_count;
-}
+int plugin_manager_get_books_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_BOOKS); }
+const char * plugin_manager_get_books_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_BOOKS, index); }
+void plugin_manager_books_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_BOOKS, index); }
+void plugin_manager_get_books_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_BOOKS, index, out_icon, out_height, out_width, out_text_size); }
 
-const char * plugin_manager_get_settings_list_item_label(int index) {
-    if (index < 0 || index >= plugin_settings_list_item_count) return "";
-    return plugin_settings_list_items[index].label;
-}
+int plugin_manager_get_settings_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_SETTINGS); }
+const char * plugin_manager_get_settings_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_SETTINGS, index); }
+void plugin_manager_settings_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_SETTINGS, index); }
+void plugin_manager_get_settings_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_SETTINGS, index, out_icon, out_height, out_width, out_text_size); }
 
-void plugin_manager_settings_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_settings_list_item_count) return;
-    dispatch_list_item_open(&plugin_settings_list_items[index], "settings list item");
-}
+int plugin_manager_get_display_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_DISPLAY); }
+const char * plugin_manager_get_display_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_DISPLAY, index); }
+void plugin_manager_display_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_DISPLAY, index); }
+void plugin_manager_get_display_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_DISPLAY, index, out_icon, out_height, out_width, out_text_size); }
 
-void plugin_manager_get_settings_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                    int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_settings_list_items, plugin_settings_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
+int plugin_manager_get_playback_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_PLAYBACK); }
+const char * plugin_manager_get_playback_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_PLAYBACK, index); }
+void plugin_manager_playback_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_PLAYBACK, index); }
+void plugin_manager_get_playback_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_PLAYBACK, index, out_icon, out_height, out_width, out_text_size); }
 
-int plugin_manager_get_display_list_item_count(void) {
-    return plugin_display_list_item_count;
-}
+int plugin_manager_get_music_audio_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_MUSIC_AUDIO); }
+const char * plugin_manager_get_music_audio_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_MUSIC_AUDIO, index); }
+void plugin_manager_music_audio_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_MUSIC_AUDIO, index); }
+void plugin_manager_get_music_audio_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_MUSIC_AUDIO, index, out_icon, out_height, out_width, out_text_size); }
 
-const char * plugin_manager_get_display_list_item_label(int index) {
-    if (index < 0 || index >= plugin_display_list_item_count) return "";
-    return plugin_display_list_items[index].label;
-}
+int plugin_manager_get_music_controls_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_MUSIC_CONTROLS); }
+const char * plugin_manager_get_music_controls_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_MUSIC_CONTROLS, index); }
+void plugin_manager_music_controls_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_MUSIC_CONTROLS, index); }
+void plugin_manager_get_music_controls_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_MUSIC_CONTROLS, index, out_icon, out_height, out_width, out_text_size); }
 
-void plugin_manager_display_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_display_list_item_count) return;
-    dispatch_list_item_open(&plugin_display_list_items[index], "display list item");
-}
+int plugin_manager_get_music_timers_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_MUSIC_TIMERS); }
+const char * plugin_manager_get_music_timers_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_MUSIC_TIMERS, index); }
+void plugin_manager_music_timers_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_MUSIC_TIMERS, index); }
+void plugin_manager_get_music_timers_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_MUSIC_TIMERS, index, out_icon, out_height, out_width, out_text_size); }
 
-void plugin_manager_get_display_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                   int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_display_list_items, plugin_display_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
+int plugin_manager_get_music_library_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_MUSIC_LIBRARY); }
+const char * plugin_manager_get_music_library_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_MUSIC_LIBRARY, index); }
+void plugin_manager_music_library_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_MUSIC_LIBRARY, index); }
+void plugin_manager_get_music_library_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_MUSIC_LIBRARY, index, out_icon, out_height, out_width, out_text_size); }
 
-int plugin_manager_get_playback_list_item_count(void) {
-    return plugin_playback_list_item_count;
-}
+int plugin_manager_get_power_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_POWER); }
+const char * plugin_manager_get_power_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_POWER, index); }
+void plugin_manager_power_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_POWER, index); }
+void plugin_manager_get_power_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_POWER, index, out_icon, out_height, out_width, out_text_size); }
 
-const char * plugin_manager_get_playback_list_item_label(int index) {
-    if (index < 0 || index >= plugin_playback_list_item_count) return "";
-    return plugin_playback_list_items[index].label;
-}
-
-void plugin_manager_playback_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_playback_list_item_count) return;
-    dispatch_list_item_open(&plugin_playback_list_items[index], "playback list item");
-}
-
-void plugin_manager_get_playback_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                    int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_playback_list_items, plugin_playback_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
-
-int plugin_manager_get_music_audio_list_item_count(void) {
-    return plugin_music_audio_list_item_count;
-}
-
-const char * plugin_manager_get_music_audio_list_item_label(int index) {
-    if (index < 0 || index >= plugin_music_audio_list_item_count) return "";
-    return plugin_music_audio_list_items[index].label;
-}
-
-void plugin_manager_music_audio_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_music_audio_list_item_count) return;
-    dispatch_list_item_open(&plugin_music_audio_list_items[index], "music_audio list item");
-}
-
-void plugin_manager_get_music_audio_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                       int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_music_audio_list_items, plugin_music_audio_list_item_count, index, out_icon,
-                           out_height, out_width, out_text_size);
-}
-
-int plugin_manager_get_music_controls_list_item_count(void) {
-    return plugin_music_controls_list_item_count;
-}
-
-const char * plugin_manager_get_music_controls_list_item_label(int index) {
-    if (index < 0 || index >= plugin_music_controls_list_item_count) return "";
-    return plugin_music_controls_list_items[index].label;
-}
-
-void plugin_manager_music_controls_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_music_controls_list_item_count) return;
-    dispatch_list_item_open(&plugin_music_controls_list_items[index], "music_controls list item");
-}
-
-void plugin_manager_get_music_controls_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                          int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_music_controls_list_items, plugin_music_controls_list_item_count, index, out_icon,
-                           out_height, out_width, out_text_size);
-}
-
-int plugin_manager_get_music_timers_list_item_count(void) {
-    return plugin_music_timers_list_item_count;
-}
-
-const char * plugin_manager_get_music_timers_list_item_label(int index) {
-    if (index < 0 || index >= plugin_music_timers_list_item_count) return "";
-    return plugin_music_timers_list_items[index].label;
-}
-
-void plugin_manager_music_timers_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_music_timers_list_item_count) return;
-    dispatch_list_item_open(&plugin_music_timers_list_items[index], "music_timers list item");
-}
-
-void plugin_manager_get_music_timers_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                        int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_music_timers_list_items, plugin_music_timers_list_item_count, index, out_icon,
-                           out_height, out_width, out_text_size);
-}
-
-int plugin_manager_get_music_library_list_item_count(void) {
-    return plugin_music_library_list_item_count;
-}
-
-const char * plugin_manager_get_music_library_list_item_label(int index) {
-    if (index < 0 || index >= plugin_music_library_list_item_count) return "";
-    return plugin_music_library_list_items[index].label;
-}
-
-void plugin_manager_music_library_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_music_library_list_item_count) return;
-    dispatch_list_item_open(&plugin_music_library_list_items[index], "music_library list item");
-}
-
-void plugin_manager_get_music_library_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                         int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_music_library_list_items, plugin_music_library_list_item_count, index, out_icon,
-                           out_height, out_width, out_text_size);
-}
-
-int plugin_manager_get_power_list_item_count(void) {
-    return plugin_power_list_item_count;
-}
-
-const char * plugin_manager_get_power_list_item_label(int index) {
-    if (index < 0 || index >= plugin_power_list_item_count) return "";
-    return plugin_power_list_items[index].label;
-}
-
-void plugin_manager_power_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_power_list_item_count) return;
-    dispatch_list_item_open(&plugin_power_list_items[index], "power list item");
-}
-
-void plugin_manager_get_power_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                 int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_power_list_items, plugin_power_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
-
-int plugin_manager_get_system_list_item_count(void) {
-    return plugin_system_list_item_count;
-}
-
-const char * plugin_manager_get_system_list_item_label(int index) {
-    if (index < 0 || index >= plugin_system_list_item_count) return "";
-    return plugin_system_list_items[index].label;
-}
-
-void plugin_manager_system_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_system_list_item_count) return;
-    dispatch_list_item_open(&plugin_system_list_items[index], "system list item");
-}
-
-void plugin_manager_get_system_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                  int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_system_list_items, plugin_system_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
+int plugin_manager_get_system_list_item_count(void) { return generic_list_item_count(PLUGIN_LIST_TARGET_SYSTEM); }
+const char * plugin_manager_get_system_list_item_label(int index) { return generic_list_item_label(PLUGIN_LIST_TARGET_SYSTEM, index); }
+void plugin_manager_system_list_item_clicked(int index) { generic_list_item_clicked(PLUGIN_LIST_TARGET_SYSTEM, index); }
+void plugin_manager_get_system_list_item_options(int index, const char ** out_icon, int32_t * out_height, int32_t * out_width, const char ** out_text_size) { generic_list_item_options(PLUGIN_LIST_TARGET_SYSTEM, index, out_icon, out_height, out_width, out_text_size); }
 
 /* Shared by plugin_manager_stream_tile_clicked() below (the only remaining
  * caller now that plugin_manager_tile_clicked() -- the old, single-slot
@@ -4625,21 +4393,12 @@ void plugin_manager_stream_tile_clicked(int index) {
     dispatch_tile_open(&plugin_stream_tiles[index]);
 }
 
-int plugin_manager_get_home_tile_count(void) {
-    return plugin_home_tile_count;
-}
-
 int plugin_manager_find_home_tile_by_id(const char * id) {
     if (!id) return -1;
     for (int i = 0; i < plugin_home_tile_count; i++) {
         if (strcmp(plugin_home_tiles[i].id, id) == 0) return i;
     }
     return -1;
-}
-
-const char * plugin_manager_get_home_tile_id(int index) {
-    if (index < 0 || index >= plugin_home_tile_count) return "";
-    return plugin_home_tiles[index].id;
 }
 
 const char * plugin_manager_get_home_tile_label(int index) {

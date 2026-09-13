@@ -86,6 +86,8 @@ static void copy_song(const tagcache_song_t * src, song_row_t * dst) {
     snprintf(dst->tags.album, sizeof(dst->tags.album), "%s", src->album);
     snprintf(dst->tags.album_artist, sizeof(dst->tags.album_artist), "%s", src->album_artist);
     snprintf(dst->tags.genre, sizeof(dst->tags.genre), "%s", src->genre);
+    dst->tags.track_number = src->track_number;
+    dst->tags.disc_number = src->disc_number;
 }
 
 static void copy_group(const tagcache_group_t * src, group_row_t * dst) {
@@ -266,21 +268,6 @@ void metadata_db_get_group_counts(int * out_artist_count, int * out_album_artist
     *out_artist_count = tagcache_group_count(TAGCACHE_GROUP_ARTIST);
     *out_album_artist_count = tagcache_group_count(TAGCACHE_GROUP_ALBUM_ARTIST);
     *out_album_count = tagcache_group_count(TAGCACHE_GROUP_ALBUM);
-}
-
-int metadata_db_get_songs_page(const char * after_title, int64_t after_id, int max_rows, song_row_t * out_rows) {
-    METADATA_DB_GUARD;
-    if (!db_ready || max_rows <= 0) return 0;
-    int32_t live = tagcache_live_count();
-    int32_t start = 0;
-    if (after_title) start = tagcache_title_rank_after(after_title, (int32_t) after_id);
-    int w = 0;
-    for (int32_t i = start; i < live && w < max_rows; i++) {
-        tagcache_song_t song;
-        if (!tagcache_song_at_title_rank(i, &song)) continue;
-        copy_song(&song, &out_rows[w++]);
-    }
-    return w;
 }
 
 int metadata_db_get_songs_page_by_recency(int offset, int max_rows, song_row_t * out_rows) {
@@ -529,12 +516,10 @@ void metadata_db_song_display_title(const song_row_t * row, char * out, size_t o
     if (!row || !out || out_size == 0) return;
     if (row->tags.title[0] != '\0') {
         utf8_truncate_safe(out, row->tags.title, out_size);
-        utf8_sanitize(out);
         return;
     }
     const char * slash = strrchr(row->path, '/');
     utf8_truncate_safe(out, slash ? slash + 1 : row->path, out_size);
-    utf8_sanitize(out);
 }
 
 int metadata_db_search_songs(const char * query_text, song_row_t * out_rows, int max_rows) {
@@ -638,12 +623,9 @@ int metadata_db_get_albums_page_filtered(const char * artist_or_album_artist_fil
     return w;
 }
 
-int64_t metadata_db_count_albums_for_group(metadata_db_group_kind_t kind, const char * name) {
-    METADATA_DB_GUARD;
-    if (!db_ready || !name || (kind != METADATA_DB_GROUP_ARTIST && kind != METADATA_DB_GROUP_ALBUM_ARTIST)) return 0;
-    const int buckets = 4096;
+static pair_node_t ** build_group_album_set(metadata_db_group_kind_t kind, const char * name, int buckets) {
     pair_node_t ** set = calloc((size_t) buckets, sizeof(*set));
-    if (!set) return 0;
+    if (!set) return NULL;
     int32_t slots = tagcache_slot_count();
     for (int32_t s = 0; s < slots; s++) {
         tagcache_song_t song;
@@ -652,6 +634,15 @@ int64_t metadata_db_count_albums_for_group(metadata_db_group_kind_t kind, const 
         if (tagcache_cmp_ascii(col, name) != 0) continue;
         pair_set_add(set, buckets, song.album, song.album_artist);
     }
+    return set;
+}
+
+int64_t metadata_db_count_albums_for_group(metadata_db_group_kind_t kind, const char * name) {
+    METADATA_DB_GUARD;
+    if (!db_ready || !name || (kind != METADATA_DB_GROUP_ARTIST && kind != METADATA_DB_GROUP_ALBUM_ARTIST)) return 0;
+    const int buckets = 4096;
+    pair_node_t ** set = build_group_album_set(kind, name, buckets);
+    if (!set) return 0;
     int n = tagcache_group_count(TAGCACHE_GROUP_ALBUM);
     int64_t count = 0;
     for (int i = 0; i < n; i++) {
@@ -672,16 +663,8 @@ int metadata_db_get_albums_for_group(metadata_db_group_kind_t kind, const char *
         return 0;
     if (offset < 0) offset = 0;
     const int buckets = 4096;
-    pair_node_t ** set = calloc((size_t) buckets, sizeof(*set));
+    pair_node_t ** set = build_group_album_set(kind, name, buckets);
     if (!set) return 0;
-    int32_t slots = tagcache_slot_count();
-    for (int32_t s = 0; s < slots; s++) {
-        tagcache_song_t song;
-        if (!tagcache_song_at_slot(s, &song)) continue;
-        const char * col = kind == METADATA_DB_GROUP_ARTIST ? song.artist : song.album_artist;
-        if (tagcache_cmp_ascii(col, name) != 0) continue;
-        pair_set_add(set, buckets, song.album, song.album_artist);
-    }
     int n = tagcache_group_count(TAGCACHE_GROUP_ALBUM);
     int skipped = 0;
     int w = 0;
@@ -698,47 +681,6 @@ int metadata_db_get_albums_for_group(metadata_db_group_kind_t kind, const char *
     pair_set_free(set, buckets);
     free(set);
     return w;
-}
-
-void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * out_count) {
-    METADATA_DB_GUARD;
-    *out_paths = NULL;
-    *out_tags = NULL;
-    *out_count = 0;
-    if (!db_ready) return;
-    int32_t live = tagcache_live_count();
-    if (live <= 0) return;
-    char ** paths = calloc((size_t) live, sizeof(*paths));
-    cached_tags_t * tags = malloc(sizeof(*tags) * (size_t) live);
-    if (!paths || !tags) {
-        free(paths);
-        free(tags);
-        return;
-    }
-    int w = 0;
-    for (int32_t i = 0; i < live; i++) {
-        tagcache_song_t song;
-        if (!tagcache_song_at_title_rank(i, &song)) continue;
-        paths[w] = strdup(song.path);
-        if (!paths[w]) break;
-        snprintf(tags[w].title, sizeof(tags[w].title), "%s", song.title);
-        snprintf(tags[w].artist, sizeof(tags[w].artist), "%s", song.artist);
-        snprintf(tags[w].album, sizeof(tags[w].album), "%s", song.album);
-        snprintf(tags[w].album_artist, sizeof(tags[w].album_artist), "%s", song.album_artist);
-        snprintf(tags[w].genre, sizeof(tags[w].genre), "%s", song.genre);
-        tags[w].track_number = song.track_number;
-        tags[w].disc_number = song.disc_number;
-        w++;
-    }
-    if (w != live) {
-        for (int j = 0; j < w; j++) free(paths[j]);
-        free(paths);
-        free(tags);
-        return;
-    }
-    *out_paths = paths;
-    *out_tags = tags;
-    *out_count = w;
 }
 
 bool metadata_db_song_favorite_is_set(const char * path) {
@@ -912,10 +854,6 @@ void metadata_db_load_favorite_books(char *** out_paths, int * out_count) {
 
 void metadata_db_load_all_books(char *** out_paths, int * out_count) {
     path_cache_load(PATH_CACHE_BOOKS, out_paths, out_count);
-}
-
-void metadata_db_playlist_replace_all(char * const * paths, int count) {
-    path_cache_replace(PATH_CACHE_PLAYLISTS, paths, count);
 }
 
 void metadata_db_load_all_playlists(char *** out_paths, int * out_count) {

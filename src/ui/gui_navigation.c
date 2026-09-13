@@ -1010,7 +1010,7 @@ void enable_gesture_bubble_recursive(lv_obj_t * obj) {
 /* Used by screen_gesture_event_cb() below -- defined later with the drawer
  * and dead-zone machinery. */
 #define QUICK_DRAWER_ANIM_MS 120 /* post-release snap animation duration */
-#define QUICK_DRAWER_TRIGGER_ZONE 140 /* swipe-down must start within this many px of the top edge to open it */
+#define QUICK_DRAWER_TRIGGER_ZONE BOARD_SCALE_PX(140) /* swipe-down must start within this many px of the top edge to open it */
 
 /* Global swipe handling for back/forward nav. Swipe left-to-right (finger
  * drags rightward) = go back. Swipe right-to-left = jump to the player

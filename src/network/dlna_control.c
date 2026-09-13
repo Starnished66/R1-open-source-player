@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
@@ -41,6 +42,7 @@ static char pending_album[256] = {0};
 
 static volatile bool stop_requested = false;
 
+static uint64_t dlna_download_generation = 0;
 static bool track_ready = false;
 static char ready_path[512] = {0};
 static char ready_title[256] = {0};
@@ -58,6 +60,7 @@ static bool status_paused = false;
 static bool cast_intent_playing = false;
 
 typedef struct {
+    uint64_t generation;
     char uri[2048];
     char title[256];
     char artist[256];
@@ -88,12 +91,16 @@ static void * dlna_download_thread_func(void * arg) {
 
     mkdir(DLNA_TEMP_DOWNLOAD_DIR, 0755); /* Ignore EEXIST */
 
+    char temp_path[600];
+    snprintf(temp_path, sizeof(temp_path), DLNA_TEMP_DOWNLOAD_DIR "/dlna_track.%llu.download",
+             (unsigned long long) req->generation);
+
     char content_type[128];
-    bool ok = http_get_to_file_ex(req->uri, true, DLNA_TEMP_DOWNLOAD_PATH, NULL, NULL,
+    bool ok = http_get_to_file_ex(req->uri, true, temp_path, NULL, NULL,
                                    content_type, sizeof(content_type));
     if (!ok) {
         DBG_LOG("dlna_control: download failed for '%s'\n", req->uri);
-        remove(DLNA_TEMP_DOWNLOAD_PATH);
+        remove(temp_path);
         free(req);
         return NULL;
     }
@@ -101,22 +108,30 @@ static void * dlna_download_thread_func(void * arg) {
     const char * ext = extension_for_content_type(content_type);
     if (!ext) {
         DBG_LOG("dlna_control: unrecognized/non-audio Content-Type '%s', not playing\n", content_type);
-        remove(DLNA_TEMP_DOWNLOAD_PATH);
+        remove(temp_path);
         free(req);
         return NULL;
     }
 
     /* Target path with extension corresponding to the detected Content-Type. */
     char final_path[512];
-    snprintf(final_path, sizeof(final_path), DLNA_TEMP_DOWNLOAD_DIR "/dlna_track%s", ext);
-    if (rename(DLNA_TEMP_DOWNLOAD_PATH, final_path) != 0) {
+    snprintf(final_path, sizeof(final_path), DLNA_TEMP_DOWNLOAD_DIR "/dlna_track.%llu%s",
+             (unsigned long long) req->generation, ext);
+    if (rename(temp_path, final_path) != 0) {
         DBG_LOG("dlna_control: rename to '%s' failed\n", final_path);
-        remove(DLNA_TEMP_DOWNLOAD_PATH);
+        remove(temp_path);
         free(req);
         return NULL;
     }
 
     pthread_mutex_lock(&dlna_mutex);
+    if (req->generation != dlna_download_generation) {
+        /* a newer play request has since arrived, or stop() was called -- discard this stale completion */
+        pthread_mutex_unlock(&dlna_mutex);
+        remove(final_path);
+        free(req);
+        return NULL;
+    }
     if (last_produced_path[0] != '\0' && strcmp(last_produced_path, final_path) != 0) {
         remove(last_produced_path);
     }
@@ -149,6 +164,7 @@ static void handle_play(void) {
 
     pthread_mutex_lock(&dlna_mutex);
     cast_intent_playing = true;
+    req->generation = ++dlna_download_generation;
     pthread_mutex_unlock(&dlna_mutex);
 
     /* Run download in a detached thread to prevent blocking socket polling. */
@@ -156,7 +172,9 @@ static void handle_play(void) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&t, &attr, dlna_download_thread_func, req);
+    if (pthread_create(&t, &attr, dlna_download_thread_func, req) != 0) {
+        free(req);
+    }
     pthread_attr_destroy(&attr);
 }
 
@@ -267,6 +285,11 @@ void dlna_control_start(void) {
 
 void dlna_control_stop(void) {
     if (!running) return;
+
+    pthread_mutex_lock(&dlna_mutex);
+    ++dlna_download_generation;
+    pthread_mutex_unlock(&dlna_mutex);
+
     running = false;
 
     /* Wait for listener thread to exit after noticing running = false. */

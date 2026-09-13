@@ -32,8 +32,6 @@ struct alac_decoder {
     int32_t * carry_buffer_s32; /* converted to S32/S24_LE layout, ready to deliver */
     uint32_t carry_frames;
     uint32_t carry_read_pos;
-
-    uint64_t current_pcm_frame;
 };
 
 #define ALAC_MAX_CONSECUTIVE_ERRORS 5
@@ -221,7 +219,6 @@ decoder_read_result_t alac_read_pcm_frames_s16(alac_decoder_t * dec, uint64_t fr
 
         dec->carry_read_pos += (uint32_t) to_copy;
         res.frames += to_copy;
-        dec->current_pcm_frame += to_copy;
     }
 
     return res;
@@ -278,7 +275,6 @@ decoder_read_result_t alac_read_pcm_frames_s32(alac_decoder_t * dec, uint64_t fr
 
         dec->carry_read_pos += (uint32_t) to_copy;
         res.frames += to_copy;
-        dec->current_pcm_frame += to_copy;
     }
 
     return res;
@@ -298,8 +294,6 @@ bool alac_seek_to_pcm_frame(alac_decoder_t * dec, uint64_t frame_index) {
     dec->consecutive_errors = 0;
 
     if (!decode_next_sample(dec)) return false;
-
-    dec->current_pcm_frame = (uint64_t) target_sample * dec->frame_size;
     return true;
 }
 

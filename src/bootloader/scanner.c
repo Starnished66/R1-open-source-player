@@ -20,7 +20,7 @@
 #define MIN_TIMEOUT_SECONDS 1
 #define MAX_TIMEOUT_SECONDS 30
 
-static bool path_is_executable(const char * path) {
+bool scanner_path_is_executable(const char * path) {
     struct stat st;
     return path && path[0] && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
 }
@@ -103,14 +103,7 @@ void scanner_drop_sd_update_cache(void) {
     close(fd);
 }
 
-/* Round-tripped by scanner_save_last_boot() so persisting a new default
- * entry never clobbers a separately hand-edited timeout_seconds back to
- * the default -- set once by scanner_scan() (the only place a boot
- * preference file is ever read), read once by scanner_save_last_boot(). */
-static int loaded_timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
-
-static void load_preferences(int * out_default_entry, int * out_timeout_seconds) {
-    *out_default_entry = BOOT_ENTRY_INTERNAL;
+static void load_preferences(int * out_timeout_seconds) {
     *out_timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
 
     FILE * f = fopen(BOOT_PREF_PATH, "r");
@@ -119,9 +112,7 @@ static void load_preferences(int * out_default_entry, int * out_timeout_seconds)
     char line[128];
     while (fgets(line, sizeof(line), f)) {
         int value;
-        if (sscanf(line, "default_entry=%d", &value) == 1) {
-            if (value == BOOT_ENTRY_INTERNAL || value == BOOT_ENTRY_SD_STOCK) *out_default_entry = value;
-        } else if (sscanf(line, "timeout_seconds=%d", &value) == 1) {
+        if (sscanf(line, "timeout_seconds=%d", &value) == 1) {
             if (value >= MIN_TIMEOUT_SECONDS && value <= MAX_TIMEOUT_SECONDS) *out_timeout_seconds = value;
         }
     }
@@ -133,14 +124,13 @@ void scanner_scan(scan_result_t * out) {
 
     mount_sd_card_if_needed();
 
-    out->sd_stock_present = path_is_executable(SD_STOCK_PLAYER_PATH);
-    out->sd_update_present = path_is_executable(SD_UPDATE_PLAYER_PATH);
+    out->sd_stock_present = scanner_path_is_executable(SD_STOCK_PLAYER_PATH);
+    out->sd_update_present = scanner_path_is_executable(SD_UPDATE_PLAYER_PATH);
 
     scanner_read_build_stamp(INTERNAL_PLAYER_PATH, out->internal_build_stamp,
                              sizeof(out->internal_build_stamp));
 
-    load_preferences(&out->default_entry, &out->timeout_seconds);
-    loaded_timeout_seconds = out->timeout_seconds;
+    load_preferences(&out->timeout_seconds);
     /* Stock is never the automatic selection -- see scan_result_t's own doc
      * comment on default_entry. There is no longer a competing "newer SD
      * build" auto-selection either: an SD update binary is never a boot
@@ -148,28 +138,4 @@ void scanner_scan(scan_result_t * out) {
      * destinations here are Internal and Stock, and Internal always wins
      * the unattended default. */
     out->default_entry = BOOT_ENTRY_INTERNAL;
-}
-
-void scanner_save_last_boot(int entry) {
-    /* Same tmp-file-then-rename pattern this project already uses for
-     * on-disk state it cares about not corrupting on a mid-write power
-     * loss (see albumart.c's albumart_store_rgb565()) -- a boot
-     * preference file is small and rare enough to write that the extra
-     * few syscalls here cost nothing. */
-    char tmp[sizeof(BOOT_PREF_PATH) + 16];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", BOOT_PREF_PATH);
-
-    FILE * f = fopen(tmp, "w");
-    if (!f) {
-        fprintf(stderr, "scanner: failed to open %s for writing boot preference\n", tmp);
-        return;
-    }
-    fprintf(f, "default_entry=%d\n", entry);
-    fprintf(f, "timeout_seconds=%d\n", loaded_timeout_seconds);
-    bool ok = fflush(f) == 0 && fclose(f) == 0;
-    if (ok) ok = rename(tmp, BOOT_PREF_PATH) == 0;
-    if (!ok) {
-        fprintf(stderr, "scanner: failed to persist boot preference\n");
-        unlink(tmp);
-    }
 }

@@ -1,4 +1,5 @@
 #include "aiff_decoder.h"
+#include "audio_helpers.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -26,14 +27,6 @@ static bool checked_mul_size(size_t a, size_t b, size_t * out) {
     if (a != 0 && b > SIZE_MAX / a) return false;
     *out = a * b;
     return true;
-}
-
-static uint32_t read_u32be(const uint8_t * b) {
-    return ((uint32_t) b[0] << 24) | ((uint32_t) b[1] << 16) | ((uint32_t) b[2] << 8) | (uint32_t) b[3];
-}
-
-static uint16_t read_u16be(const uint8_t * b) {
-    return (uint16_t) (((uint16_t) b[0] << 8) | b[1]);
 }
 
 /* AIFF stores sample rate as an 80-bit IEEE 754 extended precision float. */
@@ -79,16 +72,16 @@ aiff_decoder_t * aiff_open_file(const char * path) {
 
         char chunk_id[5] = {0};
         memcpy(chunk_id, chunk_header, 4);
-        uint32_t chunk_size = read_u32be(chunk_header + 4);
+        uint32_t chunk_size = audio_read_u32be(chunk_header + 4);
         long chunk_data_start = ftell(f);
 
         if (strcmp(chunk_id, "COMM") == 0 && chunk_size >= 18) {
             uint8_t comm[18];
             if (fread(comm, 1, sizeof(comm), f) != sizeof(comm)) break;
 
-            dec->channels = read_u16be(comm);
-            dec->total_frames = read_u32be(comm + 2);
-            dec->bits_per_sample = read_u16be(comm + 6);
+            dec->channels = audio_read_u16be(comm);
+            dec->total_frames = audio_read_u32be(comm + 2);
+            dec->bits_per_sample = audio_read_u16be(comm + 6);
             dec->sample_rate = (unsigned int) read_ieee80_extended(comm + 8);
             dec->little_endian = false;
 
@@ -112,7 +105,7 @@ aiff_decoder_t * aiff_open_file(const char * path) {
         } else if (strcmp(chunk_id, "SSND") == 0) {
             uint8_t ssnd_header[8];
             if (fread(ssnd_header, 1, sizeof(ssnd_header), f) != sizeof(ssnd_header)) break;
-            uint32_t data_offset = read_u32be(ssnd_header);
+            uint32_t data_offset = audio_read_u32be(ssnd_header);
             dec->data_start_offset = chunk_data_start + 8 + (long) data_offset;
             have_ssnd = true;
             /* Sample data itself doesn't need parsing here -- reads happen on demand. */

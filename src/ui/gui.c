@@ -31,7 +31,6 @@
 #include "audio.h"
 #include "audio_output.h"
 #include "file_browser.h"
-#include "text_reader.h"
 #include "hw_buttons.h"
 #include "metadata.h"
 #include "metadata_db.h"
@@ -54,7 +53,6 @@
 #include "bt_media_player.h"
 #endif
 #include "headphone_status.h"
-#include "usb_audio_output.h"
 #include "plugin_manager.h"
 #include "gui_plugin_manage.h"
 #include "led_control.h"

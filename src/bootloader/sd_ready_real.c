@@ -40,8 +40,7 @@ static bool real_path_exists(void * ctx, const char * path) {
 
 static bool real_path_is_executable(void * ctx, const char * path) {
     (void) ctx;
-    struct stat st;
-    return path && path[0] && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+    return scanner_path_is_executable(path);
 }
 
 /* Per-command timeout cap for individual filesystem mount invocations. */
@@ -206,13 +205,16 @@ static void log_sd_ready_outcome(const sd_ready_result_t * r) {
         return;
     }
 
-    if (r->executable_ready) {
+    switch (r->stage) {
+    case SD_READY_STAGE_EXEC_READY:
         fprintf(stderr, "%s: ready after %lldms via %s\n", prefix, (long long) r->elapsed_ms,
                 r->device_node_used ? r->device_node_used : "(unknown device)");
-    } else if (r->mounted) {
+        break;
+    case SD_READY_STAGE_MOUNTED:
         fprintf(stderr, "%s: filesystem mounted after %lldms (via %s) but no configured executable was found\n",
                 prefix, (long long) r->elapsed_ms, r->device_node_used ? r->device_node_used : "(unknown device)");
-    } else if (r->saw_whole_node || r->saw_partition_node) {
+        break;
+    case SD_READY_STAGE_NODE_PRESENT:
         if (r->saw_partition_node) {
             fprintf(stderr, "%s: device node present after %lldms but the filesystem never mounted\n", prefix,
                     (long long) r->elapsed_ms);
@@ -222,11 +224,15 @@ static void log_sd_ready_outcome(const sd_ready_result_t * r) {
                     "filesystem never mounted\n",
                     prefix, (long long) r->elapsed_ms);
         }
-    } else if (r->saw_mmc_evidence) {
+        break;
+    case SD_READY_STAGE_MMC_EVIDENCE:
         fprintf(stderr, "%s: MMC host reported a card after %lldms but no block-device node ever appeared\n", prefix,
                 (long long) r->elapsed_ms);
-    } else {
+        break;
+    case SD_READY_STAGE_NONE:
+    default:
         fprintf(stderr, "%s: no MMC/card evidence after %lldms\n", prefix, (long long) r->elapsed_ms);
+        break;
     }
 }
 

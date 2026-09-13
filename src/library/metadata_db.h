@@ -65,13 +65,9 @@ void metadata_db_abort_update(void);
  * tag files and master index are the lookup structure, and nothing beyond
  * the rows a caller actually asks for is copied out. Replaces the old
  * "load every song into one big array" boot-time model for the paged/
- * on-demand queries below -- metadata_db_load_all() itself is NOT unused,
- * though: gui.c's own ensure_library_arrays_loaded() still calls it as a
- * deliberate lazy-fallback full load (see that function's own doc comment
- * there, and metadata_db_load_all()'s own comment here, for why). `id` in
- * every row below is the song's stable tagcache slot id (1-based). Deleted
- * slots stay holes and are never reused, so a surviving song keeps its id
- * across rescans. ---- */
+ * on-demand queries below. `id` in every row below is the song's stable
+ * tagcache slot id (1-based). Deleted slots stay holes and are never reused,
+ * so a surviving song keeps its id across rescans. ---- */
 
 typedef struct {
     int64_t id;
@@ -97,13 +93,6 @@ int64_t metadata_db_get_song_count(void);
  * own paging math (total row count) without materializing the groups
  * themselves. */
 void metadata_db_get_group_counts(int * out_artist_count, int * out_album_artist_count, int * out_album_count);
-
-/* Keyset-paginated page of songs ordered by title. First page: pass
- * after_title = NULL, after_id = 0. Next page: pass the last row's own
- * title/id from the previous call. Returns the number of rows written into
- * out_rows (a caller-owned buffer of at least max_rows entries) -- less
- * than max_rows (including 0) means this was the last page. */
-int metadata_db_get_songs_page(const char * after_title, int64_t after_id, int max_rows, song_row_t * out_rows);
 
 /* Offset-paginated page of songs ordered by first_seen DESC (path
  * case-insensitive tiebreak) -- backs the Recently Added screen's compact_list_set_paged_
@@ -241,16 +230,6 @@ int64_t metadata_db_count_albums_for_group(metadata_db_group_kind_t kind, const 
 int metadata_db_get_albums_for_group(metadata_db_group_kind_t kind, const char * name, int offset, int max_rows,
                                       group_row_t * out_rows);
 
-/* Deliberate full-library load, for the handful of consumers not yet
- * converted to the paged/on-demand queries above (gui.c's own
- * ensure_library_arrays_loaded(), called lazily on first actual need --
- * never from the boot path). See metadata_db.c's own comment on this
- * function for why it still exists rather than being deleted outright.
- * *out_paths and *out_tags are freshly malloc'd parallel arrays the caller
- * owns (including each out_paths[i] string); both are set to NULL and
- * *out_count to 0 if the cache is empty or unopened. */
-void metadata_db_load_all(char *** out_paths, cached_tags_t ** out_tags, int * out_count);
-
 /* Per-song favorite flag, keyed by path. Local scan rows store this as the
  * Rockbox rating tag. Paths that are not tagcache rows (remote:// plugin
  * tracks, Subsonic stream URLs, unscanned files) persist in a sidecar so
@@ -297,14 +276,9 @@ void metadata_db_load_all_books(char *** out_paths, int * out_count);
  * screen in gui.c was slow to open, ~5s against a real SD card, because it
  * ran playlist_files_scan() on every visit). Unlike books there's no fast
  * stock-db path to warm-start from (m3u playlists are this app's own
- * concept, not something the stock player ever indexes) -- populated only
- * by gui.c's rescan_playlists() (folded into library_scan_once(), same as
- * rescan_books(), so it runs at boot and on an explicit Settings > Update
- * Music Database rescan, never on the fast cache-only boot path) and by
+ * concept, not something the stock player ever indexes) -- populated by
  * the single-row insert/delete functions below for ordinary in-app
- * playlist create/delete, so those stay instant without a full rescan.
- * rescan_playlists() walks PLAYLISTS_DIR only, not the whole music tree. */
-void metadata_db_playlist_replace_all(char * const * paths, int count);
+ * playlist create/delete, so those stay instant without a full rescan. */
 
 /* Enumerates every cached playlist path, alphabetically -- caller-owned
  * array, same convention as metadata_db_load_all_books(). */
@@ -312,9 +286,9 @@ void metadata_db_load_all_playlists(char *** out_paths, int * out_count);
 
 /* Adds/removes a single path from the playlist cache -- for gui.c's own
  * playlist_files_create()/playlist_files_delete() call sites, so creating
- * or deleting one playlist doesn't pay for a full metadata_db_playlist_
- * replace_all() rescan just to reflect that one file. INSERT is a no-op if
- * the path's already cached; DELETE is a no-op if it wasn't. */
+ * or deleting one playlist doesn't pay for a full rescan just to reflect
+ * that one file. INSERT is a no-op if the path's already cached; DELETE is
+ * a no-op if it wasn't. */
 void metadata_db_playlist_insert_one(const char * path);
 void metadata_db_playlist_delete_one(const char * path);
 

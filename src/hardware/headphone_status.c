@@ -28,6 +28,8 @@ bool headset_is_connected(void) {
 // returns true if balanced 4.4mm jack is plugged in
 bool balanced_is_connected(void) {
     FILE * f = fopen(BALANCED_SWITCH_STATE_PATH, "r");
+static bool switch_is_active(const char * path) {
+    FILE * f = fopen(path, "r");
     if (!f) return false;
 
     char buf[8] = {0};
@@ -63,6 +65,11 @@ enum HEADPHONE_STATE get_headphone_state(void) {
     } else {
         state = HEADPHONE_STATE_NONE;
     }
+	if (switch_is_active(BALANCED_SWITCH_STATE_PATH)) {
+		return HEADPHONE_STATE_BALANCED;
+	} else if (switch_is_active(HEADSET_SWITCH_STATE_PATH)) {
+		return HEADPHONE_STATE_HEADSET;
+	}
 
     if (state != last_state) {
         apply_earpods_adc_state(state);

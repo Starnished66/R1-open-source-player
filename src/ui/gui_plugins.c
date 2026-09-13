@@ -88,7 +88,7 @@ static void plugin_list_row_click_cb(lv_event_t * e) {
  * rather than allowing the label itself to grow over adjacent UI. The mode
  * has no visible effect when the text already fits. */
 void configure_scrolling_row_label(lv_obj_t * label, int32_t width) {
-    if (width < 40) width = 40;
+    if (width < BOARD_SCALE_PX(40)) width = BOARD_SCALE_PX(40);
     lv_obj_set_width(label, width);
     const lv_font_t * font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
     /* Not a bare lv_obj_set_height(label, line_height) -- see that
@@ -114,7 +114,7 @@ int gui_plugin_show_list(const char * title, const char * const * labels, const 
         lv_obj_t * label = lv_label_create(list);
         lv_label_set_text(label, "Nothing here");
         lv_obj_add_style(label, &style_theme_text_muted, 0);
-        lv_obj_set_style_pad_left(label, 24, 0);
+        lv_obj_set_style_pad_left(label, BOARD_SCALE_PX(24), 0);
     }
 
     /* Any icon anywhere in this call, or an explicit height, means every row
@@ -182,7 +182,7 @@ int gui_plugin_show_list(const char * title, const char * const * labels, const 
         lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size ? text_size : "medium"), 0);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
         pill_row_apply_icon(row, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
-        int32_t label_left = LIST_ROW_LABEL_INSET + (icon ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0);
+        int32_t label_left = LIST_ROW_LABEL_INSET + (icon ? PILL_ROW_ICON_PX_DEFAULT + BOARD_SCALE_PX(12) : 0);
         configure_scrolling_row_label(label, row_w - label_left - LIST_ROW_LABEL_INSET);
 
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -508,7 +508,7 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
     const char * text_size) {
     lv_obj_t * card = lv_obj_create(parent);
     int32_t row_width = pill_row_default_width();
-    lv_obj_set_size(card, row_width, 130);
+    lv_obj_set_size(card, row_width, BOARD_SCALE_PX(130));
     lv_obj_add_style(card, &style_theme_card_bg, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_radius(card, 10, 0);
@@ -520,15 +520,15 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
     /* text_size is never NULL here -- populate_plugin_settings_list_screen()
      * already defaults it to "small" (matching this row's own previous
      * hardcoded gui_theme_font(GUI_FONT_ROLE_SUBTEXT)) before calling in. */
-    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 20, 12);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(20), BOARD_SCALE_PX(12));
     lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
     pill_row_apply_icon(card, label, icon_path, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_TOP_LEFT, 20, 12);
-    configure_scrolling_row_label(label, row_width - (icon_path ? 212 : 136));
+    configure_scrolling_row_label(label, row_width - (icon_path ? BOARD_SCALE_PX(212) : BOARD_SCALE_PX(136)));
 
     lv_obj_t * value_label = lv_label_create(card); /* child 1 -- see plugin_settings_slider_event_cb()'s lookup */
     lv_obj_add_style(value_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(value_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
-    lv_obj_align(value_label, LV_ALIGN_TOP_RIGHT, -20, 12);
+    lv_obj_align(value_label, LV_ALIGN_TOP_RIGHT, BOARD_SCALE_PX(-20), BOARD_SCALE_PX(12));
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", value);
     lv_label_set_text(value_label, buf);
@@ -536,7 +536,7 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
     lv_obj_t * slider = lv_slider_create(card); /* child 2 */
     lv_obj_set_width(slider, lv_pct(88));
     lv_obj_set_height(slider, SLIDER_TRACK_HEIGHT);
-    lv_obj_align(slider, LV_ALIGN_BOTTOM_MID, 0, -14);
+    lv_obj_align(slider, LV_ALIGN_BOTTOM_MID, 0, BOARD_SCALE_PX(-14));
     if (max <= min) max = min + 1; /* lv_slider_set_range requires min < max */
     lv_slider_set_range(slider, min, max);
     lv_slider_set_value(slider, value, LV_ANIM_OFF);
@@ -544,7 +544,7 @@ static lv_obj_t * add_pill_slider_row(lv_obj_t * parent, const char * label_text
     lv_obj_add_style(slider, gui_theme_accent_knob_style(), LV_PART_KNOB);
     lv_obj_set_style_width(slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_set_style_height(slider, SLIDER_KNOB_SIZE, LV_PART_KNOB);
-    lv_obj_set_ext_click_area(slider, 20);
+    lv_obj_set_ext_click_area(slider, BOARD_SCALE_PX(20));
     lv_obj_add_event_cb(slider, slider_event_cb, LV_EVENT_ALL, user_data);
 
     return card;
@@ -652,7 +652,7 @@ static void populate_plugin_settings_list_screen(int slot) {
         lv_obj_t * label = lv_label_create(list);
         lv_label_set_text(label, "Nothing here");
         lv_obj_add_style(label, &style_theme_text_muted, 0);
-        lv_obj_set_style_pad_left(label, 24, 0);
+        lv_obj_set_style_pad_left(label, BOARD_SCALE_PX(24), 0);
         return;
     }
 
@@ -675,7 +675,7 @@ static void populate_plugin_settings_list_screen(int slot) {
             int32_t row_width = st->row_width > 0 ? st->row_width : pill_row_default_width();
             if (row_width < PILL_ROW_WIDTH_MIN) row_width = PILL_ROW_WIDTH_MIN;
             if (row_width > PILL_ROW_WIDTH_MAX) row_width = PILL_ROW_WIDTH_MAX;
-            configure_scrolling_row_label(label, row_width - 24 - (icon ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0) - 112);
+            configure_scrolling_row_label(label, row_width - BOARD_SCALE_PX(24) - (icon ? PILL_ROW_ICON_PX_DEFAULT + BOARD_SCALE_PX(12) : 0) - BOARD_SCALE_PX(112));
         } else if (st->type == PLUGIN_SETTINGS_ROW_SLIDER) {
             lv_obj_t * card = add_pill_slider_row(list, st->label, st->slider_min, st->slider_max, st->slider_value,
                                                    plugin_settings_slider_event_cb, packed, icon, text_size);
@@ -684,7 +684,7 @@ static void populate_plugin_settings_list_screen(int slot) {
             if (row_width < PILL_ROW_WIDTH_MIN) row_width = PILL_ROW_WIDTH_MIN;
             if (row_width > PILL_ROW_WIDTH_MAX) row_width = PILL_ROW_WIDTH_MAX;
             lv_obj_t * label = lv_obj_get_child(card, 0);
-            configure_scrolling_row_label(label, row_width - 20 - (icon ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0) - 96);
+            configure_scrolling_row_label(label, row_width - BOARD_SCALE_PX(20) - (icon ? PILL_ROW_ICON_PX_DEFAULT + BOARD_SCALE_PX(12) : 0) - BOARD_SCALE_PX(96));
             /* Same reasoning as every native slider card's own identical
              * pair of calls -- see register_swipe_dead_zone()'s own
              * top-of-block comment. */
@@ -703,7 +703,7 @@ static void populate_plugin_settings_list_screen(int slot) {
             int32_t row_width = st->row_width > 0 ? st->row_width : pill_row_default_width();
             if (row_width < PILL_ROW_WIDTH_MIN) row_width = PILL_ROW_WIDTH_MIN;
             if (row_width > PILL_ROW_WIDTH_MAX) row_width = PILL_ROW_WIDTH_MAX;
-            configure_scrolling_row_label(label, row_width - 24 - (icon ? PILL_ROW_ICON_PX_DEFAULT + 12 : 0) - 60);
+            configure_scrolling_row_label(label, row_width - BOARD_SCALE_PX(24) - (icon ? PILL_ROW_ICON_PX_DEFAULT + BOARD_SCALE_PX(12) : 0) - BOARD_SCALE_PX(60));
         }
     }
 }

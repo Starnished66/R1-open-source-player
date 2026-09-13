@@ -745,11 +745,11 @@ static void layout_music_submenu_row_text(lv_obj_t * row) {
     lv_obj_t * primary = lv_obj_get_child(row, 0);
     lv_obj_t * secondary = lv_obj_get_child(row, 1);
     if (lv_obj_has_flag(secondary, LV_OBJ_FLAG_HIDDEN)) {
-        lv_obj_set_y(primary, 28);
+        lv_obj_set_y(primary, BOARD_SCALE_PX(28));
         return;
     }
-    lv_obj_set_y(primary, 18);
-    lv_obj_set_y(secondary, 62);
+    lv_obj_set_y(primary, BOARD_SCALE_PX(18));
+    lv_obj_set_y(secondary, BOARD_SCALE_PX(62));
 }
 
 /* Positions/shows or hides group_songs_now_playing_bar against the CURRENT
@@ -836,29 +836,29 @@ static void populate_group_songs_rows(void) {
 
     for (int i = group_songs_page_start; i < page_end; i++) {
         if (editing) {
-            lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, 190);
+            lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, BOARD_SCALE_PX(190));
             if (group_songs_music_submenu) lv_obj_set_width(row, lv_pct(100));
             group_songs_visible_rows[i - group_songs_page_start] = row;
             if (group_songs_music_submenu) layout_music_submenu_row_text(row);
             for (int direction = 0; direction < 2; direction++) {
                 lv_obj_t * move = lv_label_create(row);
                 lv_label_set_text(move, direction ? LV_SYMBOL_DOWN : LV_SYMBOL_UP);
-                lv_obj_align(move, LV_ALIGN_RIGHT_MID, direction ? -80 : -130, 0);
-                lv_obj_set_ext_click_area(move, 12);
+                lv_obj_align(move, LV_ALIGN_RIGHT_MID, direction ? BOARD_SCALE_PX(-80) : BOARD_SCALE_PX(-130), 0);
+                lv_obj_set_ext_click_area(move, BOARD_SCALE_PX(12));
                 lv_obj_add_flag(move, LV_OBJ_FLAG_CLICKABLE);
                 lv_obj_add_event_cb(move, group_song_move_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (i * 2 + direction));
             }
 
             lv_obj_t * remove_icon = lv_image_create(row);
             lv_image_set_src(remove_icon, asset_path("touch_list/del.png"));
-            lv_obj_align(remove_icon, LV_ALIGN_RIGHT_MID, -20, 0);
+            lv_obj_align(remove_icon, LV_ALIGN_RIGHT_MID, BOARD_SCALE_PX(-20), 0);
             lv_obj_add_flag(remove_icon, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(remove_icon, group_song_remove_row_cb, LV_EVENT_CLICKED, (void *) (intptr_t) i);
         } else {
             /* One lv_label via the shared list_row_style, not a container +
              * child label each with their own local style properties -- see
              * list_row_style's own doc comment (screen_builders.h). */
-            lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, 70);
+            lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, BOARD_SCALE_PX(70));
             if (group_songs_music_submenu) lv_obj_set_width(row, lv_pct(100));
             group_songs_visible_rows[i - group_songs_page_start] = row;
             if (group_songs_music_submenu) layout_music_submenu_row_text(row);
@@ -868,7 +868,7 @@ static void populate_group_songs_rows(void) {
             /* Child alignment is relative to the label's padded content
              * box. Cancel the 70px text reserve so the badge is physically
              * 14px from the card edge (same rule as compact-list rows). */
-            lv_obj_align(quality, LV_ALIGN_RIGHT_MID, -14, 0);
+            lv_obj_align(quality, LV_ALIGN_RIGHT_MID, BOARD_SCALE_PX(-14), 0);
             lv_obj_remove_flag(quality, LV_OBJ_FLAG_CLICKABLE);
 
             lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -896,7 +896,7 @@ static void populate_group_songs_rows(void) {
      * open, e.g. a gapless auto-advance to the next track in the group. */
     group_songs_now_playing_bar = lv_obj_create(group_songs_list);
     lv_obj_remove_style_all(group_songs_now_playing_bar);
-    lv_obj_set_size(group_songs_now_playing_bar, 5, MUSIC_LIST_ROW_HEIGHT);
+    lv_obj_set_size(group_songs_now_playing_bar, BOARD_SCALE_PX(5), MUSIC_LIST_ROW_HEIGHT);
     lv_obj_set_style_bg_color(group_songs_now_playing_bar, accent_lv_color(), 0);
     lv_obj_set_style_bg_opa(group_songs_now_playing_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(group_songs_now_playing_bar, 2, 0);
@@ -1012,7 +1012,7 @@ static lv_obj_t * build_group_songs_screen(void) {
     lv_label_set_text(group_songs_edit_btn, "Edit");
     lv_obj_set_style_text_color(group_songs_edit_btn, accent_lv_color(), 0);
     lv_obj_set_style_text_font(group_songs_edit_btn, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    align_screen_header_action(group_songs_edit_btn, 20);
+    align_screen_header_action(group_songs_edit_btn, BOARD_SCALE_PX(20));
     lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(group_songs_edit_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(group_songs_edit_btn, group_songs_edit_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -1082,12 +1082,12 @@ static lv_obj_t * build_group_songs_screen(void) {
 /* ---- Virtualized local-album thumbnails -------------------------------
  * Only the 20 recycled compact-list rows can request artwork. One worker at
  * a time reads/decodes a representative song's embedded or Rockbox albumart
- * file, while a 32-entry RGB565 LRU cache keeps the visible window plus
- * scroll headroom bounded at ~324 KiB. Persistent sized files live in
+ * file, while a 100-entry RGB565 LRU cache keeps the visible window plus
+ * scroll headroom bounded at ~1013 KiB. Persistent sized files live in
  * MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp. */
 #define ALBUM_THUMBNAIL_PX ALBUMART_THUMBNAIL_SIZE
 #define ALBUM_PLAYER_CACHE_PX ALBUMART_PLAYER_CACHE_SIZE
-#define ALBUM_THUMBNAIL_CACHE_SIZE 32
+#define ALBUM_THUMBNAIL_CACHE_SIZE 100
 
 typedef struct {
     int64_t song_id;
@@ -2436,8 +2436,8 @@ static void register_az_index(lv_obj_t * screen, lv_obj_t * list, metadata_db_az
     const lv_font_t * strip_font = &lv_font_montserrat_20;
     int32_t line_h = lv_font_get_line_height(strip_font);
     lv_obj_set_style_text_font(strip, strip_font, 0);
-    lv_obj_set_width(strip, 30);
-    lv_obj_set_style_pad_right(strip, 4, 0);
+    lv_obj_set_width(strip, BOARD_SCALE_PX(30));
+    lv_obj_set_style_pad_right(strip, BOARD_SCALE_PX(4), 0);
     lv_obj_add_style(strip, &style_theme_text_primary, 0);
     lv_obj_set_style_text_align(strip, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_style_bg_opa(strip, LV_OPA_TRANSP, 0);
@@ -3375,7 +3375,7 @@ static lv_obj_t * add_playlist_row_base(lv_obj_t * parent, const char * label_te
     lv_obj_add_style(label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(label, &LIST_ROW_FONT, 0);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
-    configure_scrolling_row_label(label, LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - 60);
+    configure_scrolling_row_label(label, LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - BOARD_SCALE_PX(60));
     if (parent == playlists_list) {
         lv_obj_t * chevron = lv_label_create(row);
         lv_label_set_text(chevron, ">");
@@ -3518,7 +3518,7 @@ static void populate_playlists_screen(void) {
         const char * display = playlists_m3u_paths[i];
         if (strncmp(display, PLAYLISTS_DIR "/", strlen(PLAYLISTS_DIR) + 1) == 0) display += strlen(PLAYLISTS_DIR) + 1;
         lv_obj_t * row = add_playlist_row_base(playlists_list, display);
-        lv_obj_set_width(lv_obj_get_child(row, 0), LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - 60);
+        lv_obj_set_width(lv_obj_get_child(row, 0), LIST_ROW_WIDTH_WIDE - LIST_ROW_LABEL_INSET - BOARD_SCALE_PX(60));
         lv_label_set_long_mode(lv_obj_get_child(row, 0), LV_LABEL_LONG_DOT);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(row, playlist_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) (4 + i));
@@ -4306,7 +4306,7 @@ void build_power_off_countdown_popup(void) {
     lv_obj_add_event_cb(power_off_countdown_popup.backdrop, power_off_countdown_backdrop_cb, LV_EVENT_CLICKED, NULL);
 
     power_off_countdown_popup.popup = lv_obj_create(top);
-    lv_obj_set_size(power_off_countdown_popup.popup, 320, 280);
+    lv_obj_set_size(power_off_countdown_popup.popup, BOARD_SCALE_PX(320), BOARD_SCALE_PX(280));
     lv_obj_align(power_off_countdown_popup.popup, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(power_off_countdown_popup.popup, 16, 0);
     lv_obj_add_style(power_off_countdown_popup.popup, &style_theme_card_bg, 0);
@@ -4321,18 +4321,18 @@ void build_power_off_countdown_popup(void) {
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(title, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, BOARD_SCALE_PX(20));
     lv_label_set_text(title, "Powering Off");
 
     power_off_countdown_label = lv_label_create(power_off_countdown_popup.popup);
     lv_obj_add_style(power_off_countdown_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(power_off_countdown_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
-    lv_obj_align(power_off_countdown_label, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_align(power_off_countdown_label, LV_ALIGN_CENTER, 0, BOARD_SCALE_PX(-10));
     lv_label_set_text_fmt(power_off_countdown_label, "%d", POWER_OFF_COUNTDOWN_SECONDS);
 
-    lv_obj_t * cancel_row = lv_obj_create(power_off_countdown_popup.popup);
-    lv_obj_set_size(cancel_row, lv_pct(90), 56);
-    lv_obj_align(cancel_row, LV_ALIGN_BOTTOM_MID, 0, -20);
+	lv_obj_t * cancel_row = lv_obj_create(power_off_countdown_popup.popup);
+	lv_obj_set_size(cancel_row, lv_pct(90), BOARD_SCALE_PX(56));
+	lv_obj_align(cancel_row, LV_ALIGN_BOTTOM_MID, 0, BOARD_SCALE_PX(-20));
     lv_obj_set_style_radius(cancel_row, 12, 0);
     lv_obj_set_style_bg_opa(cancel_row, 0, 0);
     lv_obj_set_style_border_width(cancel_row, 0, 0);
@@ -4412,7 +4412,8 @@ static lv_obj_t * build_music_screen(void) {
      * genre.png/genre_s.png here since Genres no longer has a tile of its
      * own to need it. */
     items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
-    lv_obj_t * scr = build_launcher_menu_screen("Music", generic_back_cb, items, 6, 100, false,
+    // icon size percentage is scaled using BOARD_SCALE_PX which is relative to device screen width, so that it look a similar size on all devices
+    lv_obj_t * scr = build_launcher_menu_screen("Music", generic_back_cb, items, 6, BOARD_SCALE_PX(100), false,
                                                  &launcher_layout_config.music);
     /* Same real stock-firmware gear icon as the Queue screen's own Options
      * button (sub_back/set.png) -- build_top_right_icon_button() guarantees

@@ -36,9 +36,9 @@ typedef struct {
 #define LYRICS_BACKDROP_DARKEN_NUM 9
 #define LYRICS_BACKDROP_DARKEN_DEN 20
 #define LYRICS_POOL_SIZE 20
-#define LYRICS_ROW_WIDTH (BOARD_SCREEN_WIDTH - 40)
-#define LYRICS_ROW_GAP 24
-#define LYRICS_ACTIVE_LINE_ANCHOR_Y 200
+#define LYRICS_ROW_WIDTH (BOARD_SCREEN_WIDTH - BOARD_SCALE_PX(40))
+#define LYRICS_ROW_GAP BOARD_SCALE_PX(24)
+#define LYRICS_ACTIVE_LINE_ANCHOR_Y BOARD_SCALE_PX(200)
 #define LYRICS_TOP_PAD LYRICS_ACTIVE_LINE_ANCHOR_Y
 #define LYRICS_TIMER_PERIOD_MS 150
 #define LYRICS_AUTO_FOLLOW_RESUME_MS 3000L
@@ -831,7 +831,7 @@ static lv_obj_t * build_lyrics_screen(void) {
         lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_font(row, &app_font_lyrics, 0); /* own separate size, not app_font_28 -- see fallback_font.h */
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(row, 20, LYRICS_TOP_PAD);
+        lv_obj_set_pos(row, BOARD_SCALE_PX(20), LYRICS_TOP_PAD);
         lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN); /* shown by lyrics_update_window() once it has real content */
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE); /* tap to seek -- lyrics_row_click_cb() */
         lv_obj_add_event_cb(row, lyrics_row_click_cb, LV_EVENT_CLICKED, (void *) (intptr_t) slot);
@@ -853,7 +853,7 @@ static lv_obj_t * build_lyrics_screen(void) {
     lv_obj_set_style_text_color(lyrics_plain_label, lv_color_make(230, 230, 230), 0);
     lv_obj_remove_flag(lyrics_plain_label, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(lyrics_plain_label, LV_OBJ_FLAG_CLICKABLE); /* static text -- no tap-to-seek, there's no timing to seek to */
-    lv_obj_set_pos(lyrics_plain_label, 20, LYRICS_TOP_PAD);
+    lv_obj_set_pos(lyrics_plain_label, BOARD_SCALE_PX(20), LYRICS_TOP_PAD);
     lv_obj_add_flag(lyrics_plain_label, LV_OBJ_FLAG_HIDDEN); /* shown by lyrics_reset_pool() when current_lyrics_plain_mode */
 
     /* 1x1 invisible spacer at the bottom of the FULL virtual list -- not

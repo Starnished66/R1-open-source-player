@@ -2,6 +2,7 @@
 #define SCREEN_BUILDERS_H
 
 #include "lvgl/lvgl.h"
+#include "board_config.h"
 #include "fallback_font.h"
 #include "launcher_layout.h"
 #include "gui_theme.h"
@@ -26,9 +27,9 @@
  * Topbar assets (clock, battery, wifi, codec badges) are 30px tall, leaving
  * 1px margin above/below them. Consumers derive positions algebraically
  * from this constant. */
-#define STATUS_BAR_CLEARANCE 32
-#define TITLE_ROW_HEIGHT 64
-#define HOME_INDICATOR_BAND_HEIGHT 24
+#define STATUS_BAR_CLEARANCE BOARD_SCALE_PX(32)
+#define TITLE_ROW_HEIGHT BOARD_SCALE_PX(64)
+#define HOME_INDICATOR_BAND_HEIGHT BOARD_SCALE_PX(24)
 
 /* Shared touch-list row geometry -- every tappable row-of-text list
  * (Artists/Albums/Album Artist/Genres/All Songs/group-songs drill-down,
@@ -42,9 +43,9 @@ int32_t ui_list_row_width_wide(void);
 /* Compatibility name used by roomier library lists. Both row-width helpers
  * follow the active display width and intentionally add no outer gutter. */
 #define LIST_ROW_WIDTH_WIDE (ui_list_row_width_wide())
-#define LIST_ROW_HEIGHT 84
+#define LIST_ROW_HEIGHT BOARD_SCALE_PX(84)
 #define MUSIC_LIST_ROW_HEIGHT GUI_MUSIC_ROW_HEIGHT
-#define LIST_ROW_RADIUS 16
+#define LIST_ROW_RADIUS BOARD_SCALE_PX(16)
 #define LIST_ROW_BG_COLOR lv_color_hex(GUI_COLOR_ROW)
 #define LIST_ROW_FONT app_font_22 /* see fallback_font.h -- same metrics as lv_font_montserrat_22, plus a non-Latin fallback */
 #define LIST_ROW_LABEL_INSET GUI_TEXT_INSET
@@ -154,6 +155,24 @@ typedef struct {
     bool has_bg_color;   uint32_t bg_color;   /* 0xRRGGBB */
     bool has_text_color; uint32_t text_color; /* 0xRRGGBB */
     bool has_radius;     int32_t radius;      /* px corner radius */
+
+    /* ---- Optional per-item LIST-MODE overrides, ignored entirely in tile
+     * mode -- build_launcher_menu_screen()'s own per-tile counterpart to its
+     * `layout` argument's shared fields (plugin.set_home_layout(), PLUGINS.md).
+     * Unset (false/0/NULL) means "use `layout`'s own shared value for this
+     * field instead", same convention has_bg_color/has_text_color/has_radius
+     * above already use. Music/Stream Media/Wireless (launcher_layout_config's
+     * screens) leave every one of these unset -- their own layout is
+     * genuinely uniform across every tile, so `layout` alone is enough.
+     * Only Home's build_home_screen() (gui_settings.c), whose per-tile
+     * plugin.set_home_layout() overrides can legitimately differ tile by
+     * tile, ever sets these. ---- */
+    bool has_row_height; int32_t row_height;
+    bool has_row_width;  int32_t row_width;
+    bool has_accessory;  bool accessory;
+    const char * text_size;  /* non-NULL overrides layout's own text_size */
+    const char * text_align; /* non-NULL overrides layout's own align */
+    bool has_icon; bool icon; /* whether THIS item's icon_asset should render at all */
 } icon_grid_item_t;
 
 /* Titled screen: real back-arrow button (top-left, invokes back_btn_cb) and
@@ -348,9 +367,17 @@ const lv_font_t * pill_row_resolve_text_size(const char * text_size);
  * passes 6, today's exact hardcoded value -- see build_pill_list_screen()'s
  * own history). Only plugin.set_home_layout()'s options.row_gap
  * (PLUGINS.md, list mode) ever passes anything else. */
+/* icon_scale_pct: scales every row's own icon (item->icon_asset) the same
+ * way build_icon_grid_screen()'s icon_scale_percent scales a tile's icon --
+ * 100 = PILL_ROW_ICON_PX_DEFAULT (64px), unchanged from before this
+ * parameter existed. Every native call site passes 100. Only build_launcher_
+ * menu_screen()'s list-mode branch (plugin.set_home_layout(), PLUGINS.md)
+ * ever passes anything else, so its own icon_scale_pct argument no longer
+ * gets silently dropped when list_mode is set. */
 lv_obj_t * build_pill_list_screen(const char * title, lv_event_cb_t back_btn_cb,
                                    const pill_list_item_t * items, int item_count,
-                                   lv_style_t * toggle_accent_style, int32_t row_gap);
+                                   lv_style_t * toggle_accent_style, int32_t row_gap,
+                                   int32_t icon_scale_pct);
 
 /* Function pointer signatures matching plugin_manager_get_<target>_list_item_* accessors. */
 typedef int (*plugin_list_item_count_cb_t)(void);

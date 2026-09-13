@@ -35,7 +35,6 @@ typedef struct {
     char albumartist[128];
 } albumart_info_t;
 
-bool albumart_find(const albumart_info_t * info, char * buf, size_t buflen, int width, int height);
 bool albumart_search_files(const albumart_info_t * info, const char * size_string, char * buf, size_t buflen);
 
 /* Writes <musicroot>/.open_hiby_player/albumart/<artist>-<album>.WxH.bmp from RGB565.
@@ -58,9 +57,6 @@ bool albumart_generated_cache_fresh(const albumart_info_t * info, int width, int
  * logging the exact key a lookup computed, to compare against what's
  * actually on disk). Not for constructing paths outside this file. */
 uint64_t albumart_debug_thumbnail_key(const albumart_info_t * info);
-
-/* Reads a JPEG/PNG/BMP found by albumart_find into *out_data (caller frees). */
-bool albumart_load_file(const char * path, uint8_t ** out_data, uint32_t * out_size, uint32_t max_bytes);
 
 typedef enum {
     ALBUMART_LOAD_OK,

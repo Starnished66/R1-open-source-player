@@ -190,52 +190,36 @@ static void apply_due_next_seek(void) {
 static void * hw_buttons_thread_func(void * arg) {
     (void) arg;
 
-    char gpio_keys_path[64];
-    char adc_keyboard_path[64];
-    char earpods_path[64];
-    bool have_gpio_keys = find_input_device_by_name("md-gpio-keys", gpio_keys_path, sizeof(gpio_keys_path));
-    bool have_adc_keyboard = find_input_device_by_name("jz adc keyboard", adc_keyboard_path, sizeof(adc_keyboard_path));
-    /* Wired headphone inline remote (earpods_adc). */
-    bool have_earpods = find_input_device_by_name("earpods_adc", earpods_path, sizeof(earpods_path));
-
-    if (!have_gpio_keys && !have_adc_keyboard && !have_earpods) {
-        fprintf(stderr, "hw_buttons: no physical button input devices found, hardware keys disabled\n");
-        return NULL;
-    }
+    static const struct { const char * name; const char * label; } BUTTON_DEVICES[] = {
+        { "md-gpio-keys", "md-gpio-keys" },
+        { "jz adc keyboard", "jz adc keyboard" },
+        /* Wired headphone inline remote (earpods_adc). */
+        { "earpods_adc", "earpods_adc" },
+    };
 
     /* O_NONBLOCK prevents empty read queues on one device from blocking poll
      * and starving inputs from the other button devices. */
     struct pollfd fds[3];
     int nfds = 0;
-    if (have_gpio_keys) {
-        fds[nfds].fd = open(gpio_keys_path, O_RDONLY | O_NONBLOCK);
-        if (fds[nfds].fd >= 0) {
-            fds[nfds].events = POLLIN;
-            DBG_LOG("hw_buttons: fd_index=%d -> %s (md-gpio-keys)\n", nfds, gpio_keys_path);
-            nfds++;
-        } else {
-            fprintf(stderr, "hw_buttons: failed to open %s\n", gpio_keys_path);
+    int found = 0;
+    for (size_t i = 0; i < sizeof(BUTTON_DEVICES) / sizeof(BUTTON_DEVICES[0]); i++) {
+        char path[64];
+        if (!find_input_device_by_name(BUTTON_DEVICES[i].name, path, sizeof(path))) continue;
+        found++;
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) {
+            fprintf(stderr, "hw_buttons: failed to open %s\n", path);
+            continue;
         }
+        fds[nfds].fd = fd;
+        fds[nfds].events = POLLIN;
+        DBG_LOG("hw_buttons: fd_index=%d -> %s (%s)\n", nfds, path, BUTTON_DEVICES[i].label);
+        nfds++;
     }
-    if (have_adc_keyboard) {
-        fds[nfds].fd = open(adc_keyboard_path, O_RDONLY | O_NONBLOCK);
-        if (fds[nfds].fd >= 0) {
-            fds[nfds].events = POLLIN;
-            DBG_LOG("hw_buttons: fd_index=%d -> %s (jz adc keyboard)\n", nfds, adc_keyboard_path);
-            nfds++;
-        } else {
-            fprintf(stderr, "hw_buttons: failed to open %s\n", adc_keyboard_path);
-        }
-    }
-    if (have_earpods) {
-        fds[nfds].fd = open(earpods_path, O_RDONLY | O_NONBLOCK);
-        if (fds[nfds].fd >= 0) {
-            fds[nfds].events = POLLIN;
-            DBG_LOG("hw_buttons: fd_index=%d -> %s (earpods_adc)\n", nfds, earpods_path);
-            nfds++;
-        } else {
-            fprintf(stderr, "hw_buttons: failed to open %s\n", earpods_path);
-        }
+
+    if (found == 0) {
+        fprintf(stderr, "hw_buttons: no physical button input devices found, hardware keys disabled\n");
+        return NULL;
     }
 
     if (nfds == 0) return NULL;

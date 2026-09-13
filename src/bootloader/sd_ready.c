@@ -15,6 +15,25 @@ static sd_ready_stage_t stage_from_evidence(bool mmc_evidence, bool whole_node, 
     return SD_READY_STAGE_NONE;
 }
 
+static bool any_exec_ready(const sd_ready_probes_t * probes, const char * const * exec_candidates,
+                            int exec_candidate_count) {
+    for (int i = 0; i < exec_candidate_count; i++) {
+        if (probes->path_is_executable(probes->ctx, exec_candidates[i])) return true;
+    }
+    return false;
+}
+
+static bool try_mount_candidate_node(const sd_ready_probes_t * probes, const char * node,
+                                      bool * saw_node_flag, int64_t start, int64_t elapsed,
+                                      int64_t hard_deadline_ms) {
+    if (!probes->path_exists(probes->ctx, node)) return false;
+    *saw_node_flag = true;
+    int64_t before = probes->monotonic_ms(probes->ctx);
+    int64_t remaining = hard_deadline_ms - (before >= 0 ? before - start : elapsed);
+    probes->try_mount(probes->ctx, node, remaining);
+    return probes->mount_point_mounted(probes->ctx);
+}
+
 sd_ready_result_t wait_for_sd_ready(const sd_ready_probes_t * probes, const char * partition_node,
                                     const char * whole_disk_node, const char * const * exec_candidates,
                                     int exec_candidate_count, int64_t short_deadline_ms,
@@ -30,12 +49,7 @@ sd_ready_result_t wait_for_sd_ready(const sd_ready_probes_t * probes, const char
         bool mounted = probes->mount_point_mounted(probes->ctx);
         bool exec_ready = false;
         if (mounted) {
-            for (int i = 0; i < exec_candidate_count; i++) {
-                if (probes->path_is_executable(probes->ctx, exec_candidates[i])) {
-                    exec_ready = true;
-                    break;
-                }
-            }
+            exec_ready = any_exec_ready(probes, exec_candidates, exec_candidate_count);
         }
         result.mounted = mounted;
         result.executable_ready = exec_ready;
@@ -66,13 +80,11 @@ sd_ready_result_t wait_for_sd_ready(const sd_ready_probes_t * probes, const char
             if (mounted_at_ms < 0) mounted_at_ms = elapsed;
             result.mounted = true;
 
-            for (int i = 0; i < exec_candidate_count; i++) {
-                if (probes->path_is_executable(probes->ctx, exec_candidates[i])) {
-                    result.executable_ready = true;
-                    result.elapsed_ms = elapsed;
-                    result.stage = SD_READY_STAGE_EXEC_READY;
-                    return result;
-                }
+            if (any_exec_ready(probes, exec_candidates, exec_candidate_count)) {
+                result.executable_ready = true;
+                result.elapsed_ms = elapsed;
+                result.stage = SD_READY_STAGE_EXEC_READY;
+                return result;
             }
 
             /* Mounted, but no candidate executable yet -- worth a short,
@@ -90,26 +102,13 @@ sd_ready_result_t wait_for_sd_ready(const sd_ready_probes_t * probes, const char
             }
         } else {
             /* Attempt mounting partition node first, then whole-disk node if present. */
-            if (probes->path_exists(probes->ctx, partition_node)) {
-                result.saw_partition_node = true;
-                /* Compute remaining deadline time for mount attempt. */
-                int64_t before = probes->monotonic_ms(probes->ctx);
-                int64_t remaining = hard_deadline_ms - (before >= 0 ? before - start : elapsed);
-                probes->try_mount(probes->ctx, partition_node, remaining);
-                if (probes->mount_point_mounted(probes->ctx)) {
-                    result.device_node_used = partition_node;
-                    continue; /* re-enter the loop; the `mounted` branch above handles the rest */
-                }
+            if (try_mount_candidate_node(probes, partition_node, &result.saw_partition_node, start, elapsed, hard_deadline_ms)) {
+                result.device_node_used = partition_node;
+                continue;
             }
-            if (probes->path_exists(probes->ctx, whole_disk_node)) {
-                result.saw_whole_node = true;
-                int64_t before = probes->monotonic_ms(probes->ctx);
-                int64_t remaining = hard_deadline_ms - (before >= 0 ? before - start : elapsed);
-                probes->try_mount(probes->ctx, whole_disk_node, remaining);
-                if (probes->mount_point_mounted(probes->ctx)) {
-                    result.device_node_used = whole_disk_node;
-                    continue;
-                }
+            if (try_mount_candidate_node(probes, whole_disk_node, &result.saw_whole_node, start, elapsed, hard_deadline_ms)) {
+                result.device_node_used = whole_disk_node;
+                continue;
             }
             if (!result.saw_whole_node && !result.saw_partition_node && probes->mmc_evidence_present(probes->ctx)) {
                 result.saw_mmc_evidence = true;

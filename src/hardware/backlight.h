@@ -29,11 +29,6 @@
  * entirely). */
 int backlight_get_percent(void);
 
-/* Sets brightness to logical `percent`, clamped to [0, 100] and mapped to
- * the safe raw range described above. No-op if no backlight class device
- * is present. */
-void backlight_set_percent(int percent);
-
 /* Sets the user's normal brightness and makes it the level restored after
  * dimming or a full screen-off cycle. */
 void backlight_set_normal_percent(int percent);

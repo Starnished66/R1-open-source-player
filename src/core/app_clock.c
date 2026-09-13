@@ -38,7 +38,7 @@ static time_t manual_now(void) {
     return manual_base + (time_t) elapsed_seconds(&manual_anchor, &now);
 }
 
-time_t app_clock_now(void) {
+static time_t app_clock_now(void) {
     return clock_automatic ? time(NULL) : manual_now();
 }
 
@@ -47,8 +47,6 @@ void app_clock_localtime(struct tm * out) {
     if (clock_automatic) localtime_r(&now, out);
     else gmtime_r(&now, out);
 }
-
-bool app_clock_is_automatic(void) { return clock_automatic; }
 
 void app_clock_set_automatic(bool automatic) {
     if (automatic == clock_automatic) return;
@@ -64,13 +62,7 @@ void app_clock_set_automatic(bool automatic) {
 
 void app_clock_set_local_time(int hour, int minute) {
     struct tm local;
-    if (clock_automatic) {
-        time_t current = time(NULL);
-        localtime_r(&current, &local);
-    } else {
-        time_t current = manual_now();
-        gmtime_r(&current, &local);
-    }
+    app_clock_localtime(&local);
     local.tm_hour = hour;
     local.tm_min = minute;
     local.tm_sec = 0;

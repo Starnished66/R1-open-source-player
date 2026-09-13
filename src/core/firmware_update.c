@@ -11,6 +11,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef HOST_BUILD
+#include <sys/reboot.h>
+#endif
+
 #ifdef HOST_BUILD
   #define FIRMWARE_UPDATE_SD_ROOT "./music"
 #else
@@ -50,8 +54,12 @@ void firmware_update_enter_recovery(void) {
     char * bootmode_argv[] = { "/usr/bin/bootmode.sh", "Recovery", NULL };
     subprocess_run(bootmode_argv, NULL, 0);
 
-    char * reboot_argv[] = { "/sbin/reboot", NULL };
-    subprocess_run(reboot_argv, NULL, 0);
+#ifndef HOST_BUILD
+    sync();
+    execl("/sbin/reboot", "reboot", (char *) NULL);
+    reboot(RB_AUTOBOOT);
+    for (;;) pause();
+#endif
 }
 
 #define KEY_BITS_PER_LONG (sizeof(unsigned long) * 8)

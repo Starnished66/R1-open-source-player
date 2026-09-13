@@ -1,4 +1,5 @@
 #include "mp4_demux.h"
+#include "audio_helpers.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,9 +34,6 @@ struct mp4_demux {
     uint8_t * codec_config;
     uint32_t codec_config_size;
 
-    unsigned int channels;
-    unsigned int sample_rate;
-
     uint32_t sample_count;
     uint32_t uniform_size; /* stsz default; 0 = per-sample table on disk */
     long stsz_table_offset;
@@ -55,33 +53,19 @@ struct mp4_demux {
     uint64_t total_pcm_frames;
 };
 
-static uint32_t read_u32be(const uint8_t * b) {
-    return ((uint32_t) b[0] << 24) | ((uint32_t) b[1] << 16) | ((uint32_t) b[2] << 8) | (uint32_t) b[3];
-}
-
-static uint64_t read_u64be(const uint8_t * b) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; i++) v = (v << 8) | b[i];
-    return v;
-}
-
-static uint16_t read_u16be(const uint8_t * b) {
-    return (uint16_t) (((uint16_t) b[0] << 8) | b[1]);
-}
-
 static bool read_box_header(FILE * f, box_header_t * out) {
     long start = ftell(f);
     uint8_t hdr[8];
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) return false;
 
-    uint32_t size32 = read_u32be(hdr);
+    uint32_t size32 = audio_read_u32be(hdr);
     memcpy(out->type, hdr + 4, 4);
     out->type[4] = '\0';
 
     if (size32 == 1) {
         uint8_t ext[8];
         if (fread(ext, 1, sizeof(ext), f) != sizeof(ext)) return false;
-        out->size = read_u64be(ext);
+        out->size = audio_read_u64be(ext);
         out->header_size = 16;
     } else if (size32 == 0) {
         long cur = ftell(f);
@@ -171,15 +155,9 @@ static bool parse_stsd(mp4_demux_t * d, box_header_t stsd) {
     uint8_t entry_header[36];
     if (fread(entry_header, 1, sizeof(entry_header), d->f) != sizeof(entry_header)) return false;
 
-    uint32_t entry_size = read_u32be(entry_header);
+    uint32_t entry_size = audio_read_u32be(entry_header);
     memcpy(d->codec_fourcc, entry_header + 4, 4);
     d->codec_fourcc[4] = '\0';
-    d->channels = read_u16be(entry_header + 16);
-    /* entry_header+24 (sample_rate) is a 16.16 fixed-point mirror of the
-     * real rate; the codec's own config (ALACSpecificConfig, or the AAC
-     * ASC's sampling frequency index) is authoritative and read separately
-     * after Init()/parsing, so this is just a fallback. */
-    d->sample_rate = read_u32be(entry_header + 24) >> 16;
 
     if (entry_size <= 36 || entry_size > MP4_MAX_STSD_ENTRY_BYTES || !box_payload_has(stsd, 8, entry_size)) return false;
     uint32_t config_region_size = entry_size - 36;
@@ -205,7 +183,7 @@ static bool parse_stsd(mp4_demux_t * d, box_header_t stsd) {
          * payload from its MPEG-4 descriptor tags (a small tag+length+value
          * structure, not a plain sub-box). */
         for (uint32_t pos = 0; pos + 8 <= config_region_size;) {
-            uint32_t box_size = read_u32be(config_region + pos);
+            uint32_t box_size = audio_read_u32be(config_region + pos);
             if (box_size < 8 || pos + box_size > config_region_size) break;
 
             if (memcmp(config_region + pos + 4, "esds", 4) == 0) {
@@ -248,7 +226,7 @@ static bool parse_stsd(mp4_demux_t * d, box_header_t stsd) {
 static bool read_u32be_file(FILE * f, uint32_t * out) {
     uint8_t b[4];
     if (fread(b, 1, 4, f) != 4) return false;
-    *out = read_u32be(b);
+    *out = audio_read_u32be(b);
     return true;
 }
 
@@ -273,7 +251,7 @@ static bool chunk_offset_at(mp4_demux_t * d, uint32_t chunk_index0, uint64_t * o
     uint8_t buf[8];
     size_t n = d->stco_is64 ? 8 : 4;
     if (fread(buf, 1, n, d->f) != n) return false;
-    *out = d->stco_is64 ? read_u64be(buf) : (uint64_t) read_u32be(buf);
+    *out = d->stco_is64 ? audio_read_u64be(buf) : (uint64_t) audio_read_u32be(buf);
     return true;
 }
 
@@ -336,8 +314,8 @@ static bool parse_stsz(mp4_demux_t * d, box_header_t stsz) {
     if (!box_payload_has(stsz, 0, sizeof(hdr)) || fseek(d->f, stsz.data_start, SEEK_SET) != 0) return false;
     if (fread(hdr, 1, sizeof(hdr), d->f) != sizeof(hdr)) return false;
 
-    d->uniform_size = read_u32be(hdr + 4);
-    uint32_t count = read_u32be(hdr + 8);
+    d->uniform_size = audio_read_u32be(hdr + 4);
+    uint32_t count = audio_read_u32be(hdr + 8);
     if (count == 0) return false;
     d->sample_count = count;
     d->stsz_table_offset = stsz.data_start + 12;
@@ -376,14 +354,14 @@ static bool parse_sample_offsets(mp4_demux_t * d, box_header_t stbl) {
     if (!box_payload_has(stco_box, 0, 8) || !box_payload_has(stsc_box, 0, 8)) return false;
     fseek(d->f, stco_box.data_start, SEEK_SET);
     if (fread(hdr, 1, 8, d->f) != 8) return false;
-    d->chunk_count = read_u32be(hdr + 4);
+    d->chunk_count = audio_read_u32be(hdr + 4);
     if (d->chunk_count == 0 || d->chunk_count > d->sample_count) return false;
     if (!box_payload_has(stco_box, 8, (uint64_t) d->chunk_count * (d->stco_is64 ? 8U : 4U))) return false;
     d->stco_table_offset = stco_box.data_start + 8;
 
     fseek(d->f, stsc_box.data_start, SEEK_SET);
     if (fread(hdr, 1, 8, d->f) != 8) return false;
-    d->stsc_count = read_u32be(hdr + 4);
+    d->stsc_count = audio_read_u32be(hdr + 4);
     if (d->stsc_count == 0 || d->stsc_count > MP4_MAX_STSC_ENTRIES) return false;
     if (!box_payload_has(stsc_box, 8, (uint64_t) d->stsc_count * 12U)) return false;
 
@@ -392,8 +370,8 @@ static bool parse_sample_offsets(mp4_demux_t * d, box_header_t stbl) {
     for (uint32_t i = 0; i < d->stsc_count; i++) {
         uint8_t buf[12];
         if (fread(buf, 1, 12, d->f) != 12) return false;
-        d->stsc[i].first_chunk = read_u32be(buf);
-        d->stsc[i].samples_per_chunk = read_u32be(buf + 4);
+        d->stsc[i].first_chunk = audio_read_u32be(buf);
+        d->stsc[i].samples_per_chunk = audio_read_u32be(buf + 4);
         if (d->stsc[i].first_chunk == 0 || d->stsc[i].samples_per_chunk == 0) return false;
         if (i > 0 && d->stsc[i].first_chunk <= d->stsc[i - 1].first_chunk) return false;
     }
@@ -414,7 +392,7 @@ static bool parse_sample_offsets(mp4_demux_t * d, box_header_t stbl) {
             free(chunk_offsets);
             return false;
         }
-        chunk_offsets[i] = d->stco_is64 ? read_u64be(buf) : (uint64_t) read_u32be(buf);
+        chunk_offsets[i] = d->stco_is64 ? audio_read_u64be(buf) : (uint64_t) audio_read_u32be(buf);
         if (chunk_offsets[i] >= d->file_size) { free(chunk_offsets); return false; }
     }
 
@@ -460,7 +438,7 @@ static bool parse_stts(mp4_demux_t * d, box_header_t stbl) {
     if (!box_payload_has(stts_box, 0, 8)) return false;
     fseek(d->f, stts_box.data_start, SEEK_SET);
     if (fread(hdr, 1, 8, d->f) != 8) return false;
-    uint32_t entry_count = read_u32be(hdr + 4);
+    uint32_t entry_count = audio_read_u32be(hdr + 4);
     if (entry_count == 0) return false;
     if (!box_payload_has(stts_box, 8, (uint64_t) entry_count * 8U)) return false;
 
@@ -469,8 +447,8 @@ static bool parse_stts(mp4_demux_t * d, box_header_t stbl) {
     for (uint32_t i = 0; i < entry_count; i++) {
         uint8_t entry[8];
         if (fread(entry, 1, 8, d->f) != 8) return false;
-        uint32_t sample_count = read_u32be(entry);
-        uint32_t sample_delta = read_u32be(entry + 4);
+        uint32_t sample_count = audio_read_u32be(entry);
+        uint32_t sample_delta = audio_read_u32be(entry + 4);
         if (sample_count == 0 || sample_delta == 0 || timed_samples + sample_count < timed_samples) return false;
         timed_samples += sample_count;
         if (i == 0) d->frames_per_sample = sample_delta; /* first entry covers the vast majority of samples */
@@ -568,7 +546,7 @@ bool mp4_demux_peek_codec(const char * path, char out_fourcc[5]) {
               find_child_box(f, minf.data_start, minf.size - (uint64_t) minf.header_size, "stbl", &stbl) &&
               find_child_box(f, stbl.data_start, stbl.size - (uint64_t) stbl.header_size, "stsd", &stsd) &&
               box_payload_has(stsd, 0, 20) && fseek(f, stsd.data_start + 8, SEEK_SET) == 0 &&
-              fread(entry, 1, sizeof(entry), f) == sizeof(entry) && read_u32be(entry) >= 36;
+              fread(entry, 1, sizeof(entry), f) == sizeof(entry) && audio_read_u32be(entry) >= 36;
     if (ok) { memcpy(out_fourcc, entry + 4, 4); out_fourcc[4] = '\0'; }
     fclose(f);
     return ok;
@@ -581,14 +559,6 @@ void mp4_demux_get_codec_fourcc(const mp4_demux_t * d, char out_fourcc[5]) {
 const uint8_t * mp4_demux_get_codec_config(const mp4_demux_t * d, uint32_t * out_size) {
     *out_size = d->codec_config_size;
     return d->codec_config;
-}
-
-unsigned int mp4_demux_get_channels(const mp4_demux_t * d) {
-    return d->channels;
-}
-
-unsigned int mp4_demux_get_sample_rate(const mp4_demux_t * d) {
-    return d->sample_rate;
 }
 
 uint32_t mp4_demux_get_sample_count(const mp4_demux_t * d) {

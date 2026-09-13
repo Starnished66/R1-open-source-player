@@ -29,8 +29,6 @@ void mp4_demux_get_codec_fourcc(const mp4_demux_t * d, char out_fourcc[5]);
  * codec decoder's init function as-is. */
 const uint8_t * mp4_demux_get_codec_config(const mp4_demux_t * d, uint32_t * out_size);
 
-unsigned int mp4_demux_get_channels(const mp4_demux_t * d);
-unsigned int mp4_demux_get_sample_rate(const mp4_demux_t * d);
 uint32_t mp4_demux_get_sample_count(const mp4_demux_t * d);
 
 /* PCM frames represented by one demuxed "sample" (i.e. one compressed

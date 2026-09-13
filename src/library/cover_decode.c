@@ -1,4 +1,5 @@
 #include "cover_decode.h"
+#include "library_endian.h"
 
 #include "lvgl/src/libs/tjpgd/tjpgd.h"
 #include "lvgl/src/libs/lodepng/lodepng.h"
@@ -688,16 +689,8 @@ uint16_t * cover_resize_rgb565(const uint16_t * src, int src_w, int src_h, int d
     return dst;
 }
 
-static uint32_t le32(const uint8_t * p) {
-    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
-}
-
 static int32_t le32s(const uint8_t * p) {
-    return (int32_t) le32(p);
-}
-
-static uint16_t le16(const uint8_t * p) {
-    return (uint16_t) (p[0] | (p[1] << 8));
+    return (int32_t) library_read_u32le(p);
 }
 
 static bool inspect_bmp(const uint8_t * data, uint32_t size, int * out_w, int * out_h) {
@@ -715,8 +708,8 @@ static bool inspect_bmp(const uint8_t * data, uint32_t size, int * out_w, int * 
 static cover_decode_result_t decode_bmp_rgb888(const uint8_t * data, uint32_t size, size_t max_side,
                                                uint8_t ** out_buf, int * out_w, int * out_h) {
     if (size < 54 || data[0] != 'B' || data[1] != 'M') return COVER_DECODE_FAIL_UNSUPPORTED;
-    uint32_t off = le32(data + 10);
-    uint32_t dib = le32(data + 14);
+    uint32_t off = library_read_u32le(data + 10);
+    uint32_t dib = library_read_u32le(data + 14);
     /* uint64_t, not uint32_t: "14 + dib" wraps for dib near UINT32_MAX
      * (e.g. dib=0xFFFFFFFF wraps to 13), which would falsely satisfy
      * "off < 14+dib" for a small, otherwise-plausible off and defeat this
@@ -731,9 +724,9 @@ static cover_decode_result_t decode_bmp_rgb888(const uint8_t * data, uint32_t si
     if (height_raw == INT32_MIN) return COVER_DECODE_FAIL_UNSUPPORTED;
     bool top_down = height_raw < 0;
     int height = top_down ? -height_raw : height_raw;
-    uint16_t planes = le16(data + 26);
-    uint16_t bits = le16(data + 28);
-    uint32_t compression = le32(data + 30);
+    uint16_t planes = library_read_u16le(data + 26);
+    uint16_t bits = library_read_u16le(data + 28);
+    uint32_t compression = library_read_u32le(data + 30);
     if (width <= 0 || height <= 0 || planes != 1 || compression != 0) return COVER_DECODE_FAIL_UNSUPPORTED;
     if (bits != 24 && bits != 32) return COVER_DECODE_FAIL_UNSUPPORTED;
     size_t need;

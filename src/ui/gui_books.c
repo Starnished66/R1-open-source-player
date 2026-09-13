@@ -193,7 +193,7 @@ static void populate_books_files_screen(void) {
         lv_obj_t * label = lv_label_create(books_files_list);
         lv_label_set_text(label, books_showing_favorites ? "No favorites yet" : "No .txt files found");
         lv_obj_add_style(label, &style_theme_text_muted, 0);
-        lv_obj_set_style_pad_left(label, 24, 0);
+        lv_obj_set_style_pad_left(label, BOARD_SCALE_PX(24), 0);
         free(paths);
         return;
     }
@@ -263,7 +263,7 @@ static lv_obj_t * build_text_reader_screen(void) {
     lv_obj_set_style_bg_opa(text_reader_scroll, 0, 0);
     lv_obj_set_style_border_width(text_reader_scroll, 0, 0);
     lv_obj_set_scroll_dir(text_reader_scroll, LV_DIR_VER);
-    lv_obj_set_style_pad_all(text_reader_scroll, 16, 0);
+    lv_obj_set_style_pad_all(text_reader_scroll, BOARD_SCALE_PX(16), 0);
 
     text_reader_content_label = lv_label_create(text_reader_scroll);
     lv_label_set_long_mode(text_reader_content_label, LV_LABEL_LONG_WRAP);
@@ -298,7 +298,7 @@ static lv_obj_t * build_books_screen(void) {
                                     plugin_manager_get_books_list_item_options,
                                     plugin_books_list_item_click_cb);
 
-    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP);
+    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
     return scr;
 }

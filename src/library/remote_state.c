@@ -1,4 +1,5 @@
 #include "remote_state.h"
+#include "library_endian.h"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -57,8 +58,7 @@ static void load_file(void) {
     if (!f) return;
     char line[REMOTE_STATE_PATH_MAX + 64];
     while (fgets(line, sizeof(line), f)) {
-        size_t n = strlen(line);
-        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        size_t n = library_trim_eol(line);
         if (n == 0) continue;
         int32_t rating = 0, playcount = 0, last_played = 0;
         char * rest = line;
@@ -122,11 +122,7 @@ static void save_file(void) {
         unlink(tmp);
         return;
     }
-    int dfd = open(REMOTE_STATE_DIR, O_RDONLY | O_DIRECTORY);
-    if (dfd >= 0) {
-        fsync(dfd);
-        close(dfd);
-    }
+    (void) library_fsync_dir(REMOTE_STATE_DIR);
 }
 
 static rs_entry_t * ensure_entry(const char * path) {

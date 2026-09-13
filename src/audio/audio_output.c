@@ -641,7 +641,7 @@ static struct mixer * get_alsa_mixer(void) {
     return alsa_mixer;
 }
 
-void audio_output_set_hw_volume_raw(int raw_left, int raw_right) {
+static void audio_output_set_hw_volume_raw(int raw_left, int raw_right) {
     static struct mixer_ctl * left_ctl = NULL;
     static struct mixer_ctl * right_ctl = NULL;
     static int last_left = INT_MIN;
@@ -669,10 +669,7 @@ void audio_output_set_hw_volume_raw(int raw_left, int raw_right) {
  * plain 3.5mm if somehow both switch_dev nodes read connected at once,
  * otherwise 3.5mm, otherwise 3.5mm again as the default output port. */
 static int detect_output_port(void) {
-	enum HEADPHONE_STATE headphone_state = get_headphone_state();
-    if (headphone_state == HEADPHONE_STATE_BALANCED) return OUTPUT_PORT_BALANCED;
-    if (headphone_state == HEADPHONE_STATE_HEADSET) return OUTPUT_PORT_HEADSET;
-    return OUTPUT_PORT_HEADSET;
+    return (get_headphone_state() == HEADPHONE_STATE_BALANCED) ? OUTPUT_PORT_BALANCED : OUTPUT_PORT_HEADSET;
 }
 
 /* Actual mixer write for output-port routing -- called from volume_worker_main()

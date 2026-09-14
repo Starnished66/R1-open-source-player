@@ -33,6 +33,7 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "device_config.h"
 #include "settings.h"
 #include "audio.h"
+#include "track_probe.h"
 #include "subprocess.h"
 #include "db_log.h"
 #include <stdio.h>
@@ -360,13 +361,8 @@ static const char * library_codec_name(audio_codec_t codec) {
 static void format_music_submenu_identity(const song_row_t * song, char * out, size_t out_size) {
     char title[128];
     metadata_db_song_display_title(song, title, sizeof(title));
-    audio_current_format_info_t info;
-    if (audio_probe_file_format(song->path, &info) && info.duration_seconds > 0.0) {
-        unsigned int seconds = (unsigned int)(info.duration_seconds + 0.5);
-        snprintf(out, out_size, "%s\n%u:%02u · %s", title, seconds / 60, seconds % 60,
-                 library_codec_name(info.codec));
-        return;
-    }
+    /* Building a list must not open every track's decoder. The displayed
+     * page is enriched by gui_library_poll_track_probes() after it opens. */
     const char * ext = strrchr(song->path, '.');
     snprintf(out, out_size, "%s\n%s", title, ext && ext[1] ? ext + 1 : "Audio");
 }
@@ -557,6 +553,24 @@ static void set_group_songs_entries_owned(group_song_entry_t * entries, int coun
  * only one bounded page of rows at a time. */
 #define GROUP_SONGS_PAGE_SIZE 200
 static int group_songs_page_start;
+
+/* One bounded job at a time. The worker owns path copies and never sees
+ * LVGL objects or group_songs_entries. Page generations invalidate late
+ * results without waiting for the current decoder to finish. */
+static track_probe_job_t * group_probe_job;
+static uint64_t group_probe_generation = 1;
+static uint64_t group_probe_job_generation;
+static uint64_t group_probe_requested_generation;
+static int group_probe_page_start;
+static bool group_probe_storage_available = true;
+static bool group_probe_retry_pending;
+static uint32_t group_probe_retry_tick;
+
+static void cancel_group_song_probes(void) {
+    ++group_probe_generation;
+    group_probe_retry_pending = false;
+    if (group_probe_job) track_probe_job_cancel(group_probe_job);
+}
 
 /* Now-playing indicator bar -- recreated fresh every populate_group_songs_
  * rows() call (that function's own lv_obj_clean(group_songs_list) destroys
@@ -752,6 +766,81 @@ static void layout_music_submenu_row_text(lv_obj_t * row) {
     lv_obj_set_y(secondary, BOARD_SCALE_PX(62));
 }
 
+void gui_library_poll_track_probes(void) {
+    bool visible = group_songs_screen && lv_screen_active() == group_songs_screen &&
+                   group_songs_music_submenu && group_probe_storage_available && backlight_screen_is_on();
+    if (!visible && group_probe_job && group_probe_job_generation == group_probe_generation)
+        cancel_group_song_probes();
+
+    if (group_probe_job) {
+        bool current = visible && group_probe_job_generation == group_probe_generation;
+        /* Take the completion snapshot before draining results, so a final
+         * result published just after next() returns false is not lost. */
+        bool done = track_probe_job_done(group_probe_job);
+        bool drained = false;
+        if (current) {
+            /* Limit label work per tick; never rebuild the list or reset
+             * its scroll position when a probe completes. */
+            for (int budget = 0; budget < 4; ++budget) {
+                size_t index;
+                audio_current_format_info_t info;
+                if (!track_probe_job_next(group_probe_job, &index, &info)) {
+                    drained = true;
+                    break;
+                }
+                int pos = group_probe_page_start + (int)index;
+                if (!info.valid || !(info.duration_seconds > 0.0 &&
+                    info.duration_seconds <= UINT_MAX - 1.0) ||
+                    index >= GROUP_SONGS_PAGE_SIZE || pos >= group_songs_count) continue;
+                char detail[64];
+                unsigned int seconds = (unsigned int)(info.duration_seconds + 0.5);
+                snprintf(detail, sizeof(detail), "%u:%02u · %s", seconds / 60, seconds % 60,
+                         library_codec_name(info.codec));
+                const char * old = group_songs_entries[pos].title;
+                const char * newline = strchr(old, '\n');
+                size_t title_len = newline ? (size_t)(newline - old) : strlen(old);
+                char * title = malloc(title_len + strlen(detail) + 2);
+                if (!title) continue;
+                memcpy(title, old, title_len);
+                title[title_len] = '\n';
+                strcpy(title + title_len + 1, detail);
+                free(group_songs_entries[pos].title);
+                group_songs_entries[pos].title = title;
+                lv_obj_t * row = group_songs_visible_rows[index];
+                if (row) {
+                    lv_obj_t * secondary = lv_obj_get_child(row, 1);
+                    lv_label_set_text(secondary, detail);
+                    lv_obj_remove_flag(secondary, LV_OBJ_FLAG_HIDDEN);
+                    layout_music_submenu_row_text(row);
+                }
+            }
+        }
+        if (done && (!current || drained)) {
+            track_probe_job_destroy(group_probe_job);
+            group_probe_job = NULL;
+        }
+    }
+
+    if (!visible || group_probe_job || group_probe_requested_generation == group_probe_generation)
+        return;
+    if (group_probe_retry_pending && lv_tick_elaps(group_probe_retry_tick) < 1000) return;
+    int count = group_songs_count - group_songs_page_start;
+    if (count > GROUP_SONGS_PAGE_SIZE) count = GROUP_SONGS_PAGE_SIZE;
+    if (count <= 0) return;
+    const char * paths[GROUP_SONGS_PAGE_SIZE];
+    for (int i = 0; i < count; ++i) paths[i] = group_songs_entries[group_songs_page_start + i].path;
+    group_probe_job = track_probe_job_start(paths, (size_t)count);
+    if (!group_probe_job) {
+        group_probe_retry_pending = true;
+        group_probe_retry_tick = lv_tick_get();
+        return;
+    }
+    group_probe_retry_pending = false;
+    group_probe_requested_generation = group_probe_generation;
+    group_probe_job_generation = group_probe_generation;
+    group_probe_page_start = group_songs_page_start;
+}
+
 /* Positions/shows or hides group_songs_now_playing_bar against the CURRENT
  * group_songs_entries/count -- callable standalone (no row rebuild, no
  * scroll reset) whenever now_playing_path changes while this screen
@@ -800,6 +889,7 @@ static void refresh_group_songs_now_playing_indicator(void) {
  * remove callback and the Edit/Done toggle can both redraw in place without
  * re-deriving the group or nav_push()ing a second copy of this screen. */
 static void populate_group_songs_rows(void) {
+    cancel_group_song_probes();
     lv_obj_clean(group_songs_list);
     memset(group_songs_visible_rows, 0, sizeof(group_songs_visible_rows));
 
@@ -4105,7 +4195,10 @@ void poll_sd_card_hotplug(void) {
         mounted = false;
     }
 
+    group_probe_storage_available = mounted;
     if (!mounted) {
+        if (group_probe_job && group_probe_job_generation == group_probe_generation)
+            cancel_group_song_probes();
         gui_player_notify_sd_unmounted_immediate();
         mount_sd_card_if_needed();
         if (was_mounted) {
@@ -5207,6 +5300,7 @@ static void library_teardown_diag(const char * step) {
 }
 
 void gui_library_teardown(void) {
+    cancel_group_song_probes();
     reset_az_index_bindings();
     if (playlist_start_popup) { lv_obj_delete(playlist_start_popup); playlist_start_popup = NULL; }
     if (playlist_start_backdrop) { lv_obj_delete(playlist_start_backdrop); playlist_start_backdrop = NULL; }
@@ -5676,7 +5770,8 @@ void gui_library_start_boot_thumbnail_warmup(void) {
 
 bool gui_library_has_background_work(void) {
     return library_rescan_active || library_rescan_success_pending || album_thumbnail_active ||
-           atomic_load(&album_thumb_gen_active) || sd_format_active || search_job_active;
+           atomic_load(&album_thumb_gen_active) || sd_format_active || search_job_active ||
+           (group_probe_job && !track_probe_job_done(group_probe_job));
 }
 
 bool gui_library_navigation_blocked(void) {
@@ -5687,6 +5782,7 @@ bool gui_library_navigation_blocked(void) {
 }
 
 void gui_library_prepare_for_ui_reload(void) {
+    cancel_group_song_probes();
     quiesce_album_artwork_workers();
 
     if (search_debounce_timer) lv_timer_pause(search_debounce_timer);
@@ -5701,6 +5797,11 @@ void gui_library_prepare_for_ui_reload(void) {
 }
 
 void gui_library_cancel_background_work(void) {
+    cancel_group_song_probes();
+    if (group_probe_job) {
+        track_probe_job_cancel_and_destroy(group_probe_job);
+        group_probe_job = NULL;
+    }
     quiesce_album_artwork_workers();
     if (library_rescan_active) {
         pthread_join(library_rescan_thread, NULL);

@@ -545,6 +545,7 @@ APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c src/plugins/p
 APP_SRCS += src/ui/gui_plugin_manage.c src/ui/gui_lock_screen.c
 APP_SRCS += src/library/remote_track.c
 APP_SRCS += src/library/queue_resume.c
+APP_SRCS += src/audio/track_probe.c
 APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c src/library/artwork_coordinator.c
 APP_SRCS += src/core/utf8_util.c src/core/app_clock.c src/core/db_log.c
 APP_SRCS += src/ui/gesture_detector.c
@@ -864,6 +865,15 @@ sd_ready_test:
 	$(CC) -O0 -g -Wall -Isrc/bootloader src/bootloader/sd_ready.c src/bootloader/sd_ready_test.c \
 	    -o $(BUILD_TARGET_DIR)/sd_ready_test
 	./$(BUILD_TARGET_DIR)/sd_ready_test
+
+# Host worker tests with a controlled probe stub; no decoder or UI linkage.
+.PHONY: track-probe-selftest
+track-probe-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Isrc/audio src/audio/track_probe.c src/audio/track_probe_test.c \
+	    -Wl,--wrap=calloc,--wrap=malloc,--wrap=pthread_create,--wrap=pthread_join \
+	    -pthread -o $(BUILD_TARGET_DIR)/track_probe_test
+	./$(BUILD_TARGET_DIR)/track_probe_test
 
 # Isolated host codec tests; include real Bluetooth code and discard unused
 # hardware paths. The wrapper redirects /usr/data/alsa.conf to a temp fixture.

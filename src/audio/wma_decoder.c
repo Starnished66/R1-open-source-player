@@ -11,6 +11,7 @@
 #include "wma_tables.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -344,11 +345,9 @@ static void wma_decode_exp_lsp(wma_decoder_t * s, int ch) {
  * range used by the exponent VLC below (computed, not table-copied --
  * a plain power-of-ten ladder is not bitstream-mandated data). */
 static float wma_pow_tab[156];
-static bool wma_pow_tab_ready = false;
+static pthread_once_t wma_pow_tab_once = PTHREAD_ONCE_INIT;
 static void wma_pow_tab_init(void) {
-    if (wma_pow_tab_ready) return;
     for (int i = 0; i < 156; i++) wma_pow_tab[i] = powf(10.0f, (float) (i - 60) * 0.0625f);
-    wma_pow_tab_ready = true;
 }
 
 static int wma_decode_exp_vlc(wma_decoder_t * s, int ch) {
@@ -1019,7 +1018,8 @@ wma_decoder_t * wma_open_file(const char * path) {
         }
     }
 
-    wma_pow_tab_init();
+    /* Playback and background song-list probing may open WMA concurrently. */
+    pthread_once(&wma_pow_tab_once, wma_pow_tab_init);
     if (s->use_exp_vlc) {
         if (!huff_build(&s->exp_vlc, wma_exp_huffcodes, wma_exp_huffbits, 121)) {
             wma_close(s);

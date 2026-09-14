@@ -985,6 +985,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_usb_storage_hotplug();
     poll_sd_card_hotplug();
     gui_library_poll_playlists();
+    gui_library_poll_track_probes();
     poll_cover_decode();
     gui_lyrics_poll_load();
     gui_lyrics_poll_backdrop();

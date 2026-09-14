@@ -2,8 +2,8 @@ name: Weekly staging beta
 
 on:
   schedule:
-    # Every Sunday at 00:47 in Costa Rica (UTC-6).
-    - cron: "47 6 * * 0"
+    # Every Monday at 13:00 in Costa Rica (UTC-6).
+    - cron: "0 19 * * 1"
   workflow_dispatch:
 
 permissions:

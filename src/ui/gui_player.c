@@ -2418,14 +2418,11 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     /* Quality pill */
     quality_pill = lv_obj_create(scr);
     lv_obj_remove_style_all(quality_pill);
-    /* Height fixed, not LV_SIZE_CONTENT -- format_badge_label's marquee
-     * (player_label_enable_marquee() below) re-lays-out on its own continuous
-     * timer, and an LV_SIZE_CONTENT height here let that same tick jitter
-     * this pill's own bounding box (top-anchored via lv_obj_align below),
-     * seen on a real device as a flickering line at the pill's top/bottom
-     * border. Width stays content-based so the pill still hugs whatever
-     * length the format text happens to be. */
-    lv_obj_set_size(quality_pill, LV_SIZE_CONTENT, player_s(36));
+    /* Keep both dimensions independent of the marquee child. A content-sized
+     * flex container is re-laid out on every marquee tick in LVGL 9.5; when
+     * that same object owns an anti-aliased border, the changing partial draw
+     * areas produce a visible flashing ring on the RGB565 framebuffer. */
+    lv_obj_set_size(quality_pill, player_s(260), player_s(36));
     lv_obj_align(quality_pill, LV_ALIGN_TOP_MID, 0, player_y(518));
     lv_obj_set_style_pad_hor(quality_pill, player_s(14), 0);
     lv_obj_set_style_pad_ver(quality_pill, player_s(6), 0);
@@ -2435,6 +2432,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_radius(quality_pill, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(quality_pill, LV_OPA_20, 0);
     lv_obj_set_style_bg_color(quality_pill, lv_color_hex(0x000000), 0);
+    lv_obj_add_style(quality_pill, gui_theme_accent_outline_style(), 0);
     lv_obj_remove_flag(quality_pill, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t * quality_waveform = lv_image_create(quality_pill);
@@ -2449,9 +2447,8 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_label_set_text(format_badge_label, "");
     lv_obj_add_style(format_badge_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(format_badge_label, &app_font_16, 0);
-    /* Bound unusually long codec descriptions without clipping the ring. */
-    lv_obj_set_style_max_width(format_badge_label,
-                              BOARD_SCREEN_WIDTH - 2 * player_x(30) - player_s(64), 0);
+    /* A fixed label viewport keeps its marquee from resizing the pill. */
+    lv_obj_set_width(format_badge_label, player_s(194));
     player_label_enable_marquee(format_badge_label);
 
     /* Progress bar (native rail, not the old fixed PNG sprites) */

@@ -535,6 +535,7 @@ static const char * http_conn_error_to_str(http_conn_error_t e) {
         case HTTP_CONN_OK: return HTTP_ERR_NONE;
         case HTTP_CONN_ERR_CANCELLED: return HTTP_ERR_CANCELLED;
         case HTTP_CONN_ERR_DNS: return HTTP_ERR_DNS;
+        case HTTP_CONN_ERR_DNS_TIMEOUT: return HTTP_ERR_CONNECT_TIMEOUT;
         case HTTP_CONN_ERR_SOCKET: return HTTP_ERR_CONNECT;
         case HTTP_CONN_ERR_CONNECT: return HTTP_ERR_CONNECT;
         case HTTP_CONN_ERR_CONNECT_TIMEOUT: return HTTP_ERR_CONNECT_TIMEOUT;

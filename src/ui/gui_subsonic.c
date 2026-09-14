@@ -877,16 +877,19 @@ static subsonic_server_t subsonic_connect_pending_server;
 static void * subsonic_connect_thread_func(void * arg) {
     subsonic_connect_request_t * req = (subsonic_connect_request_t *) arg;
 
-    bool ok = subsonic_ping(&req->server, &subsonic_connect_cancel);
-    if (ok) {
+    bool authenticated = subsonic_ping(&req->server, &subsonic_connect_cancel);
+    if (authenticated) {
         free(subsonic_artists_cache);
         subsonic_artists_cache = NULL;
         subsonic_artists_count = 0;
-        ok = subsonic_get_artists(&req->server, &subsonic_artists_cache, &subsonic_artists_count,
-                                   &subsonic_connect_cancel);
+        /* Authentication and initial browsing are separate operations. A
+         * Navidrome account with an empty or temporarily unavailable artist
+         * index is still a valid connection. */
+        (void)subsonic_get_artists(&req->server, &subsonic_artists_cache,
+                                   &subsonic_artists_count, &subsonic_connect_cancel);
     }
 
-    subsonic_connect_success_flag = ok;
+    subsonic_connect_success_flag = authenticated;
     atomic_store_explicit(&subsonic_connect_done_flag, true, memory_order_release); /* written last -- poll_subsonic_connect only checks this flag */
     free(req);
     return NULL;

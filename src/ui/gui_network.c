@@ -1526,6 +1526,7 @@ static void font_size_apply_timer_cb(lv_timer_t * timer) {
     lv_obj_report_style_change(NULL);
     screen_builders_refresh_font_geometry(NULL);
     gui_settings_refresh_font_geometry();
+    gui_player_refresh_font_geometry();
     compact_list_refresh_all();
     quick_drawer_mark_snapshot_dirty();
     /* Every screen still on the nav stack right now (Home -> Settings ->

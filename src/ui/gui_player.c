@@ -1519,6 +1519,17 @@ static const char * info_path_hint(const char * path) {
     return dot ? dot + 1 : NULL;
 }
 
+static void player_set_secondary_metadata(const char * artist, const char * album) {
+    if (!song_album_label) return;
+    char text[768];
+    artist = artist ? artist : "";
+    album = album ? album : "";
+    if (*artist && *album) snprintf(text, sizeof(text), "%s · %s", artist, album);
+    else snprintf(text, sizeof(text), "%s", *artist ? artist : album);
+    if (strcmp(lv_label_get_text(song_album_label), text) != 0)
+        lv_label_set_text(song_album_label, text);
+}
+
 void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     /* Resolved once -- this is playlist_index's first real touch on every
      * track-start (play_track_at_from()/on_track_auto_advanced() both call
@@ -1638,8 +1649,8 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     const char * album_text = out_meta->has_album ? out_meta->album : "";
 
     lv_label_set_text(song_title_label, title_text);
-    if (song_album_label) lv_label_set_text(song_album_label, album_text);
     lv_label_set_text(song_folder_label, folder_text);
+    player_set_secondary_metadata(folder_text, album_text);
     gui_shell_update_quick_drawer_track(title_text, folder_text);
     refresh_format_badge();
     if (is_remote_track && remote_meta.artwork_url[0]) {
@@ -1702,6 +1713,7 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     lv_label_set_text(dur_label, "0:00");
 
     lv_label_set_text_fmt(song_count_label, "%d/%d", index + 1, playlist_count);
+    lv_obj_remove_flag(song_count_label, LV_OBJ_FLAG_HIDDEN);
     player_transition_mark_dirty(); /* title/artist/format badge/progress reset above all just changed player_screen's own content -- see the cache's own doc comment */
 }
 
@@ -1888,12 +1900,12 @@ typedef struct {
     int32_t compact_x, compact_y, compact_w, compact_h;
     int32_t height_style;
     int32_t normal_pad_left;
-    int32_t centered_text_inset;
 } player_lyrics_geometry_t;
 
 static bool player_lyrics_open;
 static bool player_lyrics_animating;
-static player_lyrics_geometry_t player_lyrics_geometry[4];
+#define PLAYER_LYRICS_MORPH_OBJECT_COUNT 3
+static player_lyrics_geometry_t player_lyrics_geometry[PLAYER_LYRICS_MORPH_OBJECT_COUNT];
 static lv_obj_t * player_lyrics_hidden[32];
 static unsigned player_lyrics_hidden_count;
 static int32_t player_lyrics_content_top;
@@ -1905,19 +1917,12 @@ static int32_t player_lyrics_lerp(int32_t a, int32_t b, int32_t progress) {
 
 static void player_lyrics_morph(void * unused, int32_t progress) {
     (void) unused;
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < PLAYER_LYRICS_MORPH_OBJECT_COUNT; ++i) {
         player_lyrics_geometry_t * g = &player_lyrics_geometry[i];
         lv_obj_set_pos(g->obj, player_lyrics_lerp(g->x, g->compact_x, progress),
                               player_lyrics_lerp(g->y, g->compact_y, progress));
         lv_obj_set_size(g->obj, player_lyrics_lerp(g->w, g->compact_w, progress),
                                player_lyrics_lerp(g->h, g->compact_h, progress));
-        if (i) {
-            /* Move the visible text, not just its label box. Keeping LEFT
-             * alignment throughout the morph avoids the old end-of-exit
-             * snap from the box's left edge to its centered text position. */
-            lv_obj_set_style_pad_left(g->obj, g->normal_pad_left +
-                player_lyrics_lerp(g->centered_text_inset, 0, progress), 0);
-        }
     }
     /* The decoded image stays the same: only its scale and card bounds move.
      * Cache the image header once per transition, not on each animation tick. */
@@ -1927,6 +1932,11 @@ static void player_lyrics_morph(void * unused, int32_t progress) {
         int32_t sx = (size * LV_SCALE_NONE + player_lyrics_cover_header.w - 1) / player_lyrics_cover_header.w;
         int32_t sy = (size * LV_SCALE_NONE + player_lyrics_cover_header.h - 1) / player_lyrics_cover_header.h;
         lv_image_set_scale(cover_img, sx > sy ? sx : sy);
+        /* LVGL alignment writes coordinates; it is not a persistent layout
+         * constraint. Recenter as the parent card changes size so the image
+         * follows the card throughout the reverse morph instead of snapping
+         * into place only when fit_cover_img_to_card() runs at completion. */
+        lv_obj_center(cover_img);
     }
 }
 
@@ -1934,11 +1944,11 @@ static void player_lyrics_restore_controls(void) {
     for (unsigned i = 0; i < player_lyrics_hidden_count; ++i)
         lv_obj_remove_flag(player_lyrics_hidden[i], LV_OBJ_FLAG_HIDDEN);
     player_lyrics_hidden_count = 0;
-    for (unsigned i = 1; i < 4; ++i) {
+    for (unsigned i = 1; i < PLAYER_LYRICS_MORPH_OBJECT_COUNT; ++i) {
         lv_obj_set_style_pad_left(player_lyrics_geometry[i].obj,
                                  player_lyrics_geometry[i].normal_pad_left, 0);
         lv_obj_set_height(player_lyrics_geometry[i].obj, player_lyrics_geometry[i].height_style);
-        lv_obj_set_style_text_align(player_lyrics_geometry[i].obj, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_align(player_lyrics_geometry[i].obj, LV_TEXT_ALIGN_LEFT, 0);
     }
 }
 
@@ -1968,12 +1978,12 @@ static void player_lyrics_set_open(bool open, bool animate) {
     lv_anim_delete(player_screen, player_lyrics_morph);
     if (open) {
         lv_obj_update_layout(player_screen);
-        lv_obj_t * objects[] = { cover_card, song_title_label, song_album_label, song_folder_label };
+        lv_obj_t * objects[] = { cover_card, song_title_label, song_album_label };
         int32_t cover_size = player_s(112);
         int32_t left = player_x(24), top = player_y(48);
         int32_t text_x = left + cover_size + player_x(16);
         int32_t text_y = top;
-        for (unsigned i = 0; i < 4; ++i) {
+        for (unsigned i = 0; i < PLAYER_LYRICS_MORPH_OBJECT_COUNT; ++i) {
             player_lyrics_geometry_t * g = &player_lyrics_geometry[i];
             g->obj = objects[i];
             g->x = lv_obj_get_x(g->obj); g->y = lv_obj_get_y(g->obj);
@@ -2002,18 +2012,12 @@ static void player_lyrics_set_open(bool open, bool animate) {
     } else {
         gui_lyrics_hide_embedded();
     }
-    /* Measure once per direction, since a new track may have been selected
-     * while lyrics were open. Do not measure fonts on animation frames. */
-    for (unsigned i = 1; i < 4; ++i) {
+    /* Both endpoint layouts are left aligned. Move their boxes directly;
+     * interpolating an obsolete centered-text inset caused a sideways jump
+     * on entry and another snap when exit restored the normal padding. */
+    for (unsigned i = 1; i < PLAYER_LYRICS_MORPH_OBJECT_COUNT; ++i) {
         player_lyrics_geometry_t * g = &player_lyrics_geometry[i];
-        lv_point_t text_size;
-        lv_text_get_size(&text_size, lv_label_get_text(g->obj),
-                        lv_obj_get_style_text_font(g->obj, 0),
-                        lv_obj_get_style_text_letter_space(g->obj, 0),
-                        lv_obj_get_style_text_line_space(g->obj, 0),
-                        LV_COORD_MAX, LV_TEXT_FLAG_EXPAND);
-        int32_t available = g->w - g->normal_pad_left - lv_obj_get_style_pad_right(g->obj, 0);
-        g->centered_text_inset = text_size.x < available ? (available - text_size.x) / 2 : 0;
+        lv_obj_set_style_pad_left(g->obj, g->normal_pad_left, 0);
         lv_obj_set_style_text_align(g->obj, LV_TEXT_ALIGN_LEFT, 0);
     }
     player_lyrics_open = open;
@@ -2036,14 +2040,12 @@ static void player_lyrics_set_open(bool open, bool animate) {
     lv_anim_start(&anim);
 }
 
-static void lyrics_icon_tap_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED && current_settings.lyrics_enabled)
-        player_lyrics_set_open(true, true);
-}
-
 static void cover_img_tap_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED && player_lyrics_open)
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (player_lyrics_open)
         player_lyrics_set_open(false, true);
+    else if (current_settings.lyrics_enabled)
+        player_lyrics_set_open(true, true);
 }
 
 static void player_lyrics_screen_unloaded_cb(lv_event_t * e) {
@@ -2275,6 +2277,20 @@ static void player_label_enable_marquee(lv_obj_t * label) {
     row_label_enable_marquee(label);
 }
 
+static void player_secondary_label_enable_marquee(lv_obj_t * label) {
+    static lv_anim_t player_secondary_marquee_anim;
+    static bool initialized = false;
+    if (!initialized) {
+        lv_anim_init(&player_secondary_marquee_anim);
+        lv_anim_set_delay(&player_secondary_marquee_anim, 2000);
+        lv_anim_set_repeat_delay(&player_secondary_marquee_anim, 2000);
+        initialized = true;
+    }
+
+    lv_obj_set_style_anim(label, &player_secondary_marquee_anim, LV_PART_MAIN);
+    row_label_enable_marquee(label);
+}
+
 static void progress_slider_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * slider = lv_event_get_target(e);
@@ -2355,15 +2371,16 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * existing compact typography on shorter panels so the three metadata
      * lines do not collide with the cover there. */
     const bool reference_player = BOARD_SCREEN_HEIGHT >= 800;
-    const lv_font_t * player_title_font = reference_player ? &app_font_28 : &app_font_16;
-    const lv_font_t * player_meta_font = reference_player ? &app_font_20 : &app_font_16;
+    const lv_font_t * player_title_font = reference_player ? &app_font_22 : &app_font_16;
+    const lv_font_t * player_meta_font = &app_font_16;
 
-    /* Explicit positioning for metadata labels */
+    /* Two fixed-height, left-aligned metadata lines remain usable at the
+     * BlindMF tier: title first, then the combined Artist · Album line. */
     song_title_label = lv_label_create(scr);
     lv_label_set_text(song_title_label, "No track loaded");
     lv_obj_add_style(song_title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(song_title_label, player_title_font, 0);
-    lv_obj_set_style_text_align(song_title_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_align(song_title_label, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_pos(song_title_label, player_x(22), player_y(44));
     lv_obj_set_size(song_title_label, BOARD_SCREEN_WIDTH - 2 * player_x(22),
                     reference_player ? lv_font_get_line_height(player_title_font) : player_y(32));
@@ -2371,29 +2388,21 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
 
     song_album_label = lv_label_create(scr);
     lv_label_set_text(song_album_label, "");
-    lv_obj_add_style(song_album_label, &style_theme_text_primary, 0);
+    lv_obj_add_style(song_album_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(song_album_label, player_meta_font, 0);
-    lv_obj_set_style_text_align(song_album_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(song_album_label, player_x(22), player_y(86));
-    /* Leave a full metadata line between the title and artist. The old
-     * 26px box could trigger vertical circular scrolling even for short
-     * albums. Content height also accommodates updated font metrics. */
-    lv_obj_set_size(song_album_label, BOARD_SCREEN_WIDTH - 2 * player_x(22), LV_SIZE_CONTENT);
-    lv_obj_set_style_min_height(song_album_label, player_y(36), 0);
-    player_label_enable_marquee(song_album_label);
+    lv_obj_set_style_text_align(song_album_label, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_pos(song_album_label, player_x(22), player_y(44) +
+                   lv_font_get_line_height(player_title_font) + player_y(4));
+    lv_obj_set_size(song_album_label, BOARD_SCREEN_WIDTH - 2 * player_x(22),
+                    lv_font_get_line_height(player_meta_font));
+    player_secondary_label_enable_marquee(song_album_label);
 
     song_folder_label = lv_label_create(scr); /* holds ARTIST text, keep this name */
     lv_label_set_text(song_folder_label, "");
     lv_obj_add_style(song_folder_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(song_folder_label, player_meta_font, 0);
-    lv_obj_set_style_text_align(song_folder_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(song_folder_label, player_x(22), player_y(122));
-    /* Circular marquee falls back to vertical scrolling when text exceeds
-     * a fixed height. Fit the actual font metrics (including loaded fallback
-     * fonts) while retaining the fixed width for horizontal overflow. */
-    lv_obj_set_size(song_folder_label, BOARD_SCREEN_WIDTH - 2 * player_x(22),
-                    LV_SIZE_CONTENT);
-    player_label_enable_marquee(song_folder_label);
+    lv_obj_set_style_text_align(song_folder_label, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_add_flag(song_folder_label, LV_OBJ_FLAG_HIDDEN);
 
     /* Back/dismiss button. build_header_back_button()'s shared 64x64 default
      * (TITLE_ROW_HEIGHT, used by every other screen's header) would reach
@@ -2409,20 +2418,13 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_t * dismiss_arrow = lv_obj_get_child(player_dismiss_btn, 0);
     if (dismiss_arrow) lv_obj_add_flag(dismiss_arrow, LV_OBJ_FLAG_HIDDEN);
 
-    /* 3-dot "more" menu */
-    lv_obj_t * more_icon = lv_image_create(scr);
-    lv_image_set_src(more_icon, asset_path("playing_plane/ic_more.png"));
-    lv_obj_add_style(more_icon, &icon_press_style, LV_STATE_PRESSED);
-    lv_obj_align(more_icon, LV_ALIGN_TOP_RIGHT, -player_x(16), player_y(80));
-
     /* Quality pill */
     quality_pill = lv_obj_create(scr);
     lv_obj_remove_style_all(quality_pill);
-    /* Keep both dimensions independent of the marquee child. A content-sized
-     * flex container is re-laid out on every marquee tick in LVGL 9.5; when
-     * that same object owns an anti-aliased border, the changing partial draw
-     * areas produce a visible flashing ring on the RGB565 framebuffer. */
-    lv_obj_set_size(quality_pill, player_s(260), player_s(36));
+    /* This label is intentionally not marquee-animated: the pill grows to
+     * the complete, short format string and therefore never clips codec,
+     * bit-depth, or sample-rate information. */
+    lv_obj_set_size(quality_pill, LV_SIZE_CONTENT, player_s(36));
     lv_obj_align(quality_pill, LV_ALIGN_TOP_MID, 0, player_y(518));
     lv_obj_set_style_pad_hor(quality_pill, player_s(14), 0);
     lv_obj_set_style_pad_ver(quality_pill, player_s(6), 0);
@@ -2432,7 +2434,6 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_radius(quality_pill, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(quality_pill, LV_OPA_20, 0);
     lv_obj_set_style_bg_color(quality_pill, lv_color_hex(0x000000), 0);
-    lv_obj_add_style(quality_pill, gui_theme_accent_outline_style(), 0);
     lv_obj_remove_flag(quality_pill, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t * quality_waveform = lv_image_create(quality_pill);
@@ -2447,9 +2448,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_label_set_text(format_badge_label, "");
     lv_obj_add_style(format_badge_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(format_badge_label, &app_font_16, 0);
-    /* A fixed label viewport keeps its marquee from resizing the pill. */
-    lv_obj_set_width(format_badge_label, player_s(194));
-    player_label_enable_marquee(format_badge_label);
+    lv_obj_set_width(format_badge_label, LV_SIZE_CONTENT);
 
     /* Progress bar (native rail, not the old fixed PNG sprites) */
     progress_slider = lv_slider_create(scr);
@@ -2485,12 +2484,22 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_label_set_text(dur_label, "0:00");
     lv_obj_add_style(dur_label, &style_theme_text_muted, 0);
 
-    /* song_count_label kept allocated for queue updates but hidden */
-    song_count_label = lv_label_create(scr);
-    lv_label_set_text(song_count_label, "");
+    /* Current position in the active queue, overlaid on the cover. */
+    song_count_label = lv_label_create(cover_card);
+    lv_label_set_text(song_count_label, "--/--");
+    lv_obj_add_style(song_count_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(song_count_label, &app_font_16, 0);
+    lv_obj_set_style_bg_color(song_count_label, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(song_count_label, LV_OPA_50, 0);
+    lv_obj_set_style_radius(song_count_label, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_hor(song_count_label, player_s(9), 0);
+    lv_obj_set_style_pad_ver(song_count_label, player_s(5), 0);
+    lv_obj_set_pos(song_count_label, player_s(10), player_s(10));
+    lv_obj_remove_flag(song_count_label, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(song_count_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* Transport row: order, previous, play/pause, next, lyrics. */
+    /* Transport row: order, previous, play/pause, next, more. Cover taps are
+     * the sole lyrics actuator, leaving the final slot for song actions. */
     lv_obj_t * controls_row = lv_obj_create(scr);
     lv_obj_remove_style_all(controls_row);
     const int32_t transport_top = player_y(645);
@@ -2516,9 +2525,9 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_image_set_src(play_btn, gui_player_play_btn_image_src(audio_is_playing()));
     lv_obj_add_style(play_btn, &icon_press_style, LV_STATE_PRESSED);
 
-    lv_obj_t * lyrics_icon = lv_image_create(controls_row);
-    lv_image_set_src(lyrics_icon, asset_path("playing_plane/lyrics_out.png"));
-    lv_obj_add_style(lyrics_icon, &icon_press_style, LV_STATE_PRESSED);
+    lv_obj_t * more_icon = lv_image_create(controls_row);
+    lv_image_set_src(more_icon, asset_path("playing_plane/ic_more.png"));
+    lv_obj_add_style(more_icon, &icon_press_style, LV_STATE_PRESSED);
 
     next_btn = lv_image_create(controls_row);
     lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
@@ -2535,7 +2544,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_pos(play_btn, player_x(240) - lv_obj_get_width(play_btn) / 2, (row_h - lv_obj_get_height(play_btn)) / 2);
     lv_obj_set_pos(order_icon, player_x(57) - lv_obj_get_width(order_icon) / 2, (row_h - lv_obj_get_height(order_icon)) / 2);
     lv_obj_set_pos(prev_btn, player_x(142) - lv_obj_get_width(prev_btn) / 2, (row_h - lv_obj_get_height(prev_btn)) / 2);
-    lv_obj_set_pos(lyrics_icon, player_x(423) - lv_obj_get_width(lyrics_icon) / 2, (row_h - lv_obj_get_height(lyrics_icon)) / 2);
+    lv_obj_set_pos(more_icon, player_x(423) - lv_obj_get_width(more_icon) / 2, (row_h - lv_obj_get_height(more_icon)) / 2);
     lv_obj_set_pos(next_btn, player_x(338) - lv_obj_get_width(next_btn) / 2, (row_h - lv_obj_get_height(next_btn)) / 2);
 
     /* Part D: Hit targets */
@@ -2573,15 +2582,6 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, play_btn);
     lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, play_btn);
 
-    int32_t lyrics_hit_size = player_s(56); if (lyrics_hit_size < 44) lyrics_hit_size = 44;
-    lv_obj_t * lyrics_hit = add_transport_hit_target(scr, player_x(423), lyrics_hit_size,
-                                transport_center_y - lyrics_hit_size / 2,
-                                transport_center_y + (lyrics_hit_size + 1) / 2,
-                                lyrics_icon_tap_cb, lv_palette_main(LV_PALETTE_PURPLE));
-    lv_obj_add_event_cb(lyrics_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, lyrics_icon);
-    lv_obj_add_event_cb(lyrics_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, lyrics_icon);
-    lv_obj_add_event_cb(lyrics_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, lyrics_icon);
-
     int32_t next_hit_w = player_s(56); if (next_hit_w < 44) next_hit_w = 44;
     int32_t next_hit_h = player_s(56); if (next_hit_h < 44) next_hit_h = 44;
     lv_obj_t * next_hit = add_transport_hit_target(scr, player_x(338), next_hit_w,
@@ -2596,24 +2596,11 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(next_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED, (void *) (intptr_t) 1);
     lv_obj_add_event_cb(next_hit, transport_seek_repeat_cb, LV_EVENT_LONG_PRESSED_REPEAT, (void *) (intptr_t) 1);
 
-    lv_area_t more_area;
-    lv_obj_get_coords(more_icon, &more_area);
-    int32_t more_icon_w = lv_area_get_width(&more_area);
-    int32_t more_hit_w = more_icon_w + player_x(24); if (more_hit_w < 44) more_hit_w = 44;
-    /* Keep centered metadata clear of both header touch targets. Narrowing
-     * the label also makes its existing marquee activate for long albums. */
-    int32_t metadata_inset = BOARD_SCREEN_WIDTH -
-        ((more_area.x1 + more_area.x2) / 2 - more_hit_w / 2) + player_x(8);
-    int32_t dismiss_inset = player_x(22) + player_s(44) + player_x(8);
-    if (metadata_inset < dismiss_inset) metadata_inset = dismiss_inset;
-    lv_obj_set_x(song_title_label, metadata_inset);
-    lv_obj_set_width(song_title_label, BOARD_SCREEN_WIDTH - 2 * metadata_inset);
-    lv_obj_set_x(song_album_label, metadata_inset);
-    lv_obj_set_width(song_album_label, BOARD_SCREEN_WIDTH - 2 * metadata_inset);
-    int32_t more_hit_top = more_area.y1 - player_y(12);
-    int32_t more_hit_bottom = more_area.y2 + player_y(12) + 1;
-    lv_obj_t * more_hit = add_transport_hit_target(scr, (more_area.x1 + more_area.x2) / 2, more_hit_w,
-                                more_hit_top, more_hit_bottom, more_icon_event_cb,
+    int32_t more_hit_size = player_s(56); if (more_hit_size < 44) more_hit_size = 44;
+    lv_obj_t * more_hit = add_transport_hit_target(scr, player_x(423), more_hit_size,
+                                transport_center_y - more_hit_size / 2,
+                                transport_center_y + (more_hit_size + 1) / 2,
+                                more_icon_event_cb,
                                 lv_palette_main(LV_PALETTE_PURPLE));
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, more_icon);
     lv_obj_add_event_cb(more_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, more_icon);
@@ -5097,6 +5084,19 @@ void gui_player_sync_topbar_visibility(lv_obj_t * screen) {
         else
             lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+void gui_player_refresh_font_geometry(void) {
+    if (!song_title_label || !song_album_label) return;
+    const bool reference_player = BOARD_SCREEN_HEIGHT >= 800;
+    const lv_font_t * title_font = reference_player ? &app_font_22 : &app_font_16;
+    const lv_font_t * meta_font = &app_font_16;
+    int32_t title_h = lv_font_get_line_height(title_font);
+    lv_obj_set_height(song_title_label, title_h);
+    lv_obj_set_y(song_title_label, player_y(44));
+    lv_obj_set_height(song_album_label, lv_font_get_line_height(meta_font));
+    lv_obj_set_y(song_album_label, player_y(44) + title_h + player_y(4));
+    player_transition_mark_dirty();
 }
 
 

@@ -1335,7 +1335,9 @@ lv_obj_t * build_category_menu_screen(const char * title, lv_event_cb_t back_btn
     pill_list_item_t rows[item_count];
     lv_obj_t * row_objects[item_count];
     memset(row_objects, 0, sizeof(row_objects));
-    int32_t default_height = BOARD_SCALE_PX(item_count <= 5 ? 112 : 96);
+    /* Category rows use one consistent native height. Longer menus remain
+     * scrollable instead of silently compressing every row to fit. */
+    int32_t default_height = BOARD_SCALE_PX(112);
 
     for (int i = 0; i < item_count; ++i) {
         bool accessory = items[i].has_accessory ? items[i].accessory

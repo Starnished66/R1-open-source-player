@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 
 #define SUBSONIC_API_VERSION "1.16.1"
@@ -67,6 +68,20 @@ static void build_auth_query(const subsonic_server_t * server, char * out, size_
               user_enc, token, salt, SUBSONIC_API_VERSION, SUBSONIC_CLIENT_NAME);
 }
 
+static void normalize_base_url(const char * input, char * out, size_t out_size) {
+    while (*input && isspace((unsigned char)*input)) input++;
+    size_t len = strlen(input);
+    while (len && isspace((unsigned char)input[len - 1])) len--;
+    while (len && input[len - 1] == '/') len--;
+    if (len >= 5 && memcmp(input + len - 5, "/rest", 5) == 0) {
+        len -= 5;
+        while (len && input[len - 1] == '/') len--;
+    }
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, input, len);
+    out[len] = '\0';
+}
+
 /* Calls a Subsonic REST endpoint, parses the JSON response, and validates status "ok".
  * Caller owns *out_root upon success. */
 static cJSON * api_request(const subsonic_server_t * server, const char * endpoint, const char * extra_params,
@@ -75,10 +90,12 @@ static cJSON * api_request(const subsonic_server_t * server, const char * endpoi
     build_auth_query(server, auth, sizeof(auth));
 
     char url[1536];
+    char base_url[sizeof(server->base_url)];
+    normalize_base_url(server->base_url, base_url, sizeof(base_url));
     if (extra_params) {
-        snprintf(url, sizeof(url), "%s/rest/%s?%s&%s", server->base_url, endpoint, auth, extra_params);
+        snprintf(url, sizeof(url), "%s/rest/%s?%s&%s", base_url, endpoint, auth, extra_params);
     } else {
-        snprintf(url, sizeof(url), "%s/rest/%s?%s", server->base_url, endpoint, auth);
+        snprintf(url, sizeof(url), "%s/rest/%s?%s", base_url, endpoint, auth);
     }
 
     http_request_t request = {0};
@@ -175,7 +192,10 @@ bool subsonic_get_artists(const subsonic_server_t * server, subsonic_artist_t **
     cJSON_Delete(root);
     *out_artists = artists;
     *out_count = count;
-    return count > 0;
+    /* A valid empty index is a successful response, not an authentication
+     * failure. Navidrome can legitimately return no artists for a new user
+     * or library while ping.view has already authenticated successfully. */
+    return true;
 }
 
 bool subsonic_get_artist_albums(const subsonic_server_t * server, const char * artist_id,

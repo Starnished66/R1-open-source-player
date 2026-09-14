@@ -56,8 +56,11 @@ void firmware_update_enter_recovery(void) {
 
 #ifndef HOST_BUILD
     sync();
-    execl("/sbin/reboot", "reboot", (char *) NULL);
+    /* Reboot directly while still inside the player process. Executing the
+     * reboot utility first can return a clean child exit to our supervising
+     * bootloader, whose deliberate clean-exit policy is to power off. */
     reboot(RB_AUTOBOOT);
+    execl("/sbin/reboot", "reboot", (char *) NULL);
     for (;;) pause();
 #endif
 }

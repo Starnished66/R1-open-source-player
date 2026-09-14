@@ -142,5 +142,6 @@ void gui_player_handle_playback_error_ex(audio_error_t err, uint64_t err_generat
 void gui_player_poll_confirmed_playback(void);
 
 void gui_player_sync_topbar_visibility(lv_obj_t * screen);
+void gui_player_refresh_font_geometry(void);
 lv_obj_t * gui_player_get_dismiss_btn(void);
 const lv_image_dsc_t * gui_player_get_current_cover_dsc(void);

@@ -1,3 +1,9 @@
+/* pthread_timedjoin_np (net_connect_timeout's bounded DNS resolution below)
+ * is a musl/glibc extension gated behind _GNU_SOURCE -- must be defined
+ * before any system header pulls in pthread.h transitively, so this has to
+ * be the file's very first line. */
+#define _GNU_SOURCE
+
 #include "http_conn.h"
 #include "http_client.h" /* for struct http_cancel_token's real definition */
 #include "ca_bundle.h"
@@ -98,19 +104,139 @@ static void cancel_unregister_and_close(struct http_cancel_token * cancel, int f
     pthread_mutex_unlock(&cancel->mutex);
 }
 
+/* getaddrinfo() has no timeout parameter of its own and is not interruptible
+ * mid-call -- on a Wi-Fi network where DNS packets are silently dropped
+ * (association succeeds, so the radio-level guard callers already run
+ * passes, but the resolver never gets a reply) it can block far longer than
+ * connect_timeout_ms, or effectively forever, with no way for a caller's
+ * cancel token to take effect (real-device report: Subsonic's "Connecting
+ * to server..." busy overlay never dismissing). Run it on its own thread and
+ * bound the WAIT with pthread_timedjoin_np instead of bounding the call
+ * itself, which can't be done for a blocking libc function.
+ *
+ * Ownership handoff on timeout: the resolver thread is still running when
+ * the caller gives up, so the caller must not free/touch ctx or ctx->result
+ * -- the thread itself takes over that responsibility (checked via
+ * ctx->abandoned under ctx->mutex) once getaddrinfo() finally returns,
+ * detaching itself so the OS reclaims its resources without anyone having
+ * to join it. This deliberately leaks a small ctx struct and one thread
+ * stack until that eventually-returning call completes -- an accepted
+ * tradeoff for turning an unbounded hang into a bounded one. */
+typedef struct {
+    char host[256];
+    char port[16];
+    pthread_mutex_t mutex;
+    bool abandoned; /* caller gave up waiting; thread must clean up on exit */
+    bool done;      /* thread finished; only meaningful while NOT abandoned */
+    int rc;
+    struct addrinfo * result;
+} dns_resolve_ctx_t;
+
+static void * dns_resolve_thread_func(void * arg) {
+    dns_resolve_ctx_t * ctx = (dns_resolve_ctx_t *) arg;
+
+    struct addrinfo hints, * addr_list = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    int rc = getaddrinfo(ctx->host, ctx->port, &hints, &addr_list);
+
+    pthread_mutex_lock(&ctx->mutex);
+    if (ctx->abandoned) {
+        pthread_mutex_unlock(&ctx->mutex);
+        if (rc == 0) freeaddrinfo(addr_list);
+        pthread_mutex_destroy(&ctx->mutex);
+        free(ctx);
+        pthread_detach(pthread_self());
+        return NULL;
+    }
+    ctx->rc = rc;
+    ctx->result = (rc == 0) ? addr_list : NULL;
+    ctx->done = true;
+    pthread_mutex_unlock(&ctx->mutex);
+    return NULL;
+}
+
+/* Bounded getaddrinfo(): returns 0 and *out_result on success, matching
+ * getaddrinfo()'s own return convention, or a nonzero sentinel
+ * (DNS_RESOLVE_TIMED_OUT) distinct from any real getaddrinfo() error code
+ * when the deadline passes before the resolver thread finishes.
+ * timeout_ms == 0 means "wait indefinitely" (same convention connect_
+ * timeout_ms already uses), matching plain getaddrinfo()'s own blocking
+ * behavior for that case. */
+#define DNS_RESOLVE_TIMED_OUT (-1000)
+static int dns_resolve_bounded(const char * host, const char * port, uint32_t timeout_ms,
+                               struct addrinfo ** out_result) {
+    dns_resolve_ctx_t * ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return EAI_MEMORY;
+    snprintf(ctx->host, sizeof(ctx->host), "%s", host);
+    snprintf(ctx->port, sizeof(ctx->port), "%s", port);
+    pthread_mutex_init(&ctx->mutex, NULL);
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, dns_resolve_thread_func, ctx) != 0) {
+        /* Thread creation itself failing is rare and not the hang this
+         * exists to guard against -- fall back to a direct blocking call
+         * rather than failing the request outright. */
+        pthread_mutex_destroy(&ctx->mutex);
+        free(ctx);
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        return getaddrinfo(host, port, &hints, out_result);
+    }
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    uint64_t deadline_ns = (uint64_t) deadline.tv_nsec + (uint64_t) timeout_ms * 1000000ULL;
+    deadline.tv_sec += (time_t) (deadline_ns / 1000000000ULL);
+    deadline.tv_nsec = (long) (deadline_ns % 1000000000ULL);
+
+    int join_rc = timeout_ms > 0 ? pthread_timedjoin_np(thread, NULL, &deadline)
+                                  : pthread_join(thread, NULL);
+    if (join_rc == 0) {
+        int rc = ctx->rc;
+        *out_result = ctx->result;
+        pthread_mutex_destroy(&ctx->mutex);
+        free(ctx);
+        return rc;
+    }
+
+    /* Timed out (or some other join failure) -- the thread may still be
+     * blocked inside getaddrinfo(). Hand ctx off to it via the abandoned
+     * flag rather than freeing something it might still write into. */
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->abandoned = true;
+    bool already_done = ctx->done;
+    struct addrinfo * leftover = already_done ? ctx->result : NULL;
+    int leftover_rc = already_done ? ctx->rc : 0;
+    pthread_mutex_unlock(&ctx->mutex);
+    if (already_done) {
+        /* Vanishingly rare race: it finished between the join timing out
+         * and this lock -- reclaim ctx ourselves instead of leaving the
+         * thread to do it, and use the real result. */
+        pthread_join(thread, NULL);
+        pthread_mutex_destroy(&ctx->mutex);
+        free(ctx);
+        if (leftover_rc == 0) { *out_result = leftover; return 0; }
+        return leftover_rc;
+    }
+    return DNS_RESOLVE_TIMED_OUT;
+}
+
 /* Connects to host:port with a timeout using non-blocking connect() and poll().
  * Registers socket into cancel token to allow cancellation during connect. */
 static http_conn_error_t net_connect_timeout(mbedtls_net_context * ctx, const char * host, const char * port,
                                               uint32_t connect_timeout_ms, struct http_cancel_token * cancel) {
     if (cancel_requested_conn(cancel)) return HTTP_CONN_ERR_CANCELLED;
 
-    /* Blocking DNS resolution via getaddrinfo. */
-    struct addrinfo hints, * addr_list, * cur;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    if (getaddrinfo(host, port, &hints, &addr_list) != 0) return HTTP_CONN_ERR_DNS;
+    struct addrinfo * addr_list, * cur;
+    int dns_rc = dns_resolve_bounded(host, port, connect_timeout_ms, &addr_list);
+    if (dns_rc == DNS_RESOLVE_TIMED_OUT) return HTTP_CONN_ERR_DNS_TIMEOUT;
+    if (dns_rc != 0) return HTTP_CONN_ERR_DNS;
 
     if (cancel_requested_conn(cancel)) { freeaddrinfo(addr_list); return HTTP_CONN_ERR_CANCELLED; }
 

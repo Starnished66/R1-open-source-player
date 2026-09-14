@@ -518,7 +518,9 @@ static void check_layout(int display_height) {
     lv_obj_update_layout(category_screen);
     lv_obj_t * category_list = lv_obj_get_child(category_screen, 2);
     lv_obj_t * category_row = lv_obj_get_child(category_list, 0);
-    assert(lv_obj_get_height(category_row) == BOARD_SCALE_PX(96));
+    /* Six-item menus (Wireless) keep the standard category-row height and
+     * rely on the shared list's scrolling rather than shrinking their rows. */
+    assert(lv_obj_get_height(category_row) == BOARD_SCALE_PX(112));
     assert(category_asset_opens == 2);
     /* Deleting a child emits a bubbled DELETE event. The row context must
      * survive it and be released only by the row's own DELETE event. */

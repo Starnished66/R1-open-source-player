@@ -1,4 +1,4 @@
-plugin.define({ id = "example.audiobooks", name = "Audiobooks", version = "2.0", api_min = 1 })
+plugin.define({ id = "example.audiobooks", name = "Audiobooks", version = "2.1", api_min = 1 })
 
 -- Audiobook library for <SD>/Audiobooks. Version 2 adds durable per-book
 -- resume, Continue Listening, natural chapter ordering, completion state,
@@ -6,9 +6,20 @@ plugin.define({ id = "example.audiobooks", name = "Audiobooks", version = "2.0",
 
 local ROOT = plugin.sd_root() .. "/Audiobooks"
 local STATE_PATH = plugin.sd_root() .. "/.plugins/.audiobooks_state_v2"
+local THEME_ICON_ROOT = "/usr/resource/litegui/theme2/"
+local ICON_BOOKS = THEME_ICON_ROOT .. "submenu/books.png"
+local ICON_FAVORITES = THEME_ICON_ROOT .. "submenu/favorites.png"
+local ICON_ALL_SONGS = THEME_ICON_ROOT .. "submenu/all_songs.png"
+local ICON_PLAYLISTS = THEME_ICON_ROOT .. "submenu/playlists.png"
 local state = {}
 local pending_seek = nil
 local last_saved_position = -1
+
+-- Keep plugin-owned rows on the same icon contract as native submenu rows;
+-- omit dimensions and fonts so the current native layout remains authoritative.
+local function themed_item(label, icon)
+    return { label = label, icon = icon }
+end
 
 local function encode(s)
     return (tostring(s or ""):gsub("([^%w%._%- ])", function(c)
@@ -155,7 +166,7 @@ local function open_bookmarks(key)
     local marks = (state[key] and state[key].bookmarks) or {}
     if #marks == 0 then plugin.show_toast("No bookmarks for " .. key); return end
     local labels = {}
-    for i, b in ipairs(marks) do labels[i] = b.label end
+    for i, b in ipairs(marks) do labels[i] = themed_item(b.label, ICON_PLAYLISTS) end
     plugin.show_list("Bookmarks", labels, function(index)
         local b = marks[index]
         play_at(key, b.chapter, b.position)
@@ -168,7 +179,7 @@ local function open_chapters(key)
     local labels = {}
     local saved = state[key]
     for i, chapter in ipairs(chapters) do
-        labels[i] = (saved and saved.chapter == chapter.name and "▶ " or "") .. chapter.name
+        labels[i] = themed_item((saved and saved.chapter == chapter.name and "▶ " or "") .. chapter.name, ICON_ALL_SONGS)
     end
     plugin.show_list(key, labels, function(index) play_at(key, chapters[index].name, 0) end)
 end
@@ -178,12 +189,16 @@ local function open_book(key)
     local rows = {}
     if s and s.chapter and s.chapter ~= "" and not s.finished then
         rows[#rows + 1] = { type = "row", label = "Resume at " .. format_time(s.position),
+            icon = ICON_ALL_SONGS,
             on_select = function() play_at(key, s.chapter, s.position) end }
     end
-    rows[#rows + 1] = { type = "row", label = "Chapters", on_select = function() open_chapters(key) end }
-    rows[#rows + 1] = { type = "row", label = "Add Current Bookmark", on_select = add_bookmark }
-    rows[#rows + 1] = { type = "row", label = "Bookmarks", on_select = function() open_bookmarks(key) end }
-    rows[#rows + 1] = { type = "toggle", label = "Finished", value = s and s.finished or false,
+    rows[#rows + 1] = { type = "row", label = "Chapters", icon = ICON_ALL_SONGS,
+        on_select = function() open_chapters(key) end }
+    rows[#rows + 1] = { type = "row", label = "Add Current Bookmark", icon = ICON_FAVORITES,
+        on_select = add_bookmark }
+    rows[#rows + 1] = { type = "row", label = "Bookmarks", icon = ICON_PLAYLISTS,
+        on_select = function() open_bookmarks(key) end }
+    rows[#rows + 1] = { type = "toggle", label = "Finished", icon = ICON_BOOKS, value = s and s.finished or false,
         on_change = function(value)
             state[key] = state[key] or { bookmarks = {} }
             state[key].finished = value
@@ -209,15 +224,15 @@ local function open_continue()
     table.sort(books, function(a, b) return (state[a].last_played or 0) > (state[b].last_played or 0) end)
     if #books == 0 then plugin.show_toast("No books in progress"); return end
     local labels = {}
-    for i, key in ipairs(books) do labels[i] = progress_label(key) end
+    for i, key in ipairs(books) do labels[i] = themed_item(progress_label(key), ICON_BOOKS) end
     plugin.show_list("Continue Listening", labels, function(index) open_book(books[index]) end)
 end
 
 local function open_library()
     local books = discover_books()
     if #books == 0 then plugin.show_toast("Add book folders under Audiobooks on the SD card"); return end
-    local labels = { "Continue Listening" }
-    for _, key in ipairs(books) do labels[#labels + 1] = progress_label(key) end
+    local labels = { themed_item("Continue Listening", ICON_ALL_SONGS) }
+    for _, key in ipairs(books) do labels[#labels + 1] = themed_item(progress_label(key), ICON_BOOKS) end
     plugin.show_list("Audiobooks", labels, function(index)
         if index == 1 then open_continue() else open_book(books[index - 1]) end
     end)
@@ -258,6 +273,6 @@ plugin.on("paused", function() save_current_progress(true) end)
 plugin.on("stopped", function() save_current_progress(true) end)
 plugin.set_interval(10, function() save_current_progress(false) end)
 
--- No layout overrides here: an entry inserted into a native list should
--- inherit that list's exact row dimensions and sprite styling.
-plugin.register_list_item("books", "Audiobooks", open_library)
+-- No layout overrides here: the native Books row supplies its dimensions and
+-- gradient styling, while this existing submenu icon identifies Audiobooks.
+plugin.register_list_item("books", "Audiobooks", open_library, { icon = ICON_BOOKS })

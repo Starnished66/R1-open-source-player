@@ -1,4 +1,4 @@
-plugin.define({ id = "example.net_radio", name = "Net Radio", version = "1.2", api_min = 1 })
+plugin.define({ id = "example.net_radio", name = "Net Radio", version = "1.3", api_min = 1 })
 
 -- Net Radio reads its stations from Radio.txt at the root of the SD card:
 --
@@ -15,6 +15,13 @@ plugin.define({ id = "example.net_radio", name = "Net Radio", version = "1.2", a
 --   * ICY/stream metadata is not displayed; Radio.txt supplies the title.
 
 local RADIO_FILE = plugin.sd_root() .. "/Radio.txt"
+local THEME_ICON_ROOT = "/usr/resource/litegui/theme2/"
+
+-- Absolute theme2 paths are supported for show_list() row icons and keep the
+-- station rows aligned with the native wireless submenu artwork.
+local function themed_item(label, icon)
+    return { label = label, icon = THEME_ICON_ROOT .. icon }
+end
 
 local function trim(value)
     return (value:gsub("^%s+", ""):gsub("%s+$", ""))
@@ -60,9 +67,14 @@ local function open_stations()
         return
     end
 
-    plugin.show_list("Net Radio", stations.labels, function(index)
+    local items = {}
+    for i, label in ipairs(stations.labels) do
+        items[i] = themed_item(label, "wireless/list_airplay.png")
+    end
+
+    plugin.show_list("Net Radio", items, function(index)
         plugin.play_list(stations.urls, index)
     end)
 end
 
-plugin.register_stream_media_tile("Net Radio", open_stations, "stream_media/radio.png")
+plugin.register_stream_media_tile("Net Radio", open_stations, "wireless/list_airplay.png")

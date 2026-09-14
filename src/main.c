@@ -393,7 +393,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Warning: /dev/fb0 not ready after 5s of retries, proceeding anyway...\n");
     }
     boot_checkpoint("wait_for_fbdev_ready done");
-    lv_linux_fbdev_set_file(disp, "/dev/fb0");
+    if (lv_linux_fbdev_set_file(disp, "/dev/fb0") != LV_RESULT_OK) {
+        fprintf(stderr, "Error: Failed to open framebuffer device /dev/fb0\n");
+        boot_checkpoint("lv_linux_fbdev_set_file FAILED, returning 1");
+        return 1;
+    }
     boot_checkpoint("lv_linux_fbdev_set_file done");
 
     /* As early as this process can paint anything -- see gui_show_boot_

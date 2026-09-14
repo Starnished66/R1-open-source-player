@@ -29,6 +29,7 @@
 #include "db_log.h"
 #include "usb_dac_bridge.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "backlight.h"
@@ -1859,11 +1860,13 @@ static void plugin_settings_list_item_click_cb(lv_event_t * e) {
 
 static lv_obj_t * build_settings_screen(void) {
     static pill_list_item_t items[5 + PLUGIN_MAX_SETTINGS_LIST_ITEMS];
+    lv_obj_t * category_rows[5] = { NULL };
     items[0] = (pill_list_item_t){ "Music Settings", PILL_ACCESSORY_CHEVRON, false, settings_category_music_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Display", PILL_ACCESSORY_CHEVRON, false, settings_category_display_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Power", PILL_ACCESSORY_CHEVRON, false, settings_category_power_cb, NULL, NULL };
     items[3] = (pill_list_item_t){ "System", PILL_ACCESSORY_CHEVRON, false, settings_category_system_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "About", PILL_ACCESSORY_CHEVRON, false, settings_about_row_cb, NULL, NULL };
+    for (unsigned i = 0; i < 5; ++i) items[i].out_row = &category_rows[i];
 
     int count = 5;
     count = append_plugin_list_rows(items, count, PLUGIN_MAX_SETTINGS_LIST_ITEMS,
@@ -1873,6 +1876,14 @@ static lv_obj_t * build_settings_screen(void) {
                                     plugin_settings_list_item_click_cb);
 
     lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    static const char * names[] = { "music", "display", "power", "system", "about" };
+    for (unsigned i = 0; i < 5; ++i) {
+        char icon[64], background[64];
+        snprintf(icon, sizeof(icon), "settings/%s.png", names[i]);
+        snprintf(background, sizeof(background), "settings/bg_%s.png", names[i]);
+        if (category_rows[i]) decorate_category_row(category_rows[i], icon, background);
+        items[i].out_row = NULL;
+    }
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1926,10 +1937,11 @@ static void dac_home_usb_row_cb(lv_event_t * e) {
 }
 
 lv_obj_t * build_dac_home_screen(void) {
-    static pill_list_item_t items[2];
-    items[0] = (pill_list_item_t){ "USB DAC", PILL_ACCESSORY_CHEVRON, false, dac_home_usb_row_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Bluetooth DAC", PILL_ACCESSORY_CHEVRON, false, bt_dac_settings_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("DAC", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    const icon_grid_item_t items[] = {
+        { "submenu/usb.png", NULL, "USB DAC", dac_home_usb_row_cb, NULL, .bg_image = "submenu/bg_gold.png" },
+        { "submenu/bluetooth.png", NULL, "Bluetooth DAC", bt_dac_settings_row_cb, NULL, .bg_image = "submenu/bg_blue.png" },
+    };
+    lv_obj_t * scr = build_category_menu_screen("DAC", generic_back_cb, items, 2, NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1957,16 +1969,17 @@ typedef struct {
     const char * icon_asset_selected;
     const char * label;
     lv_event_cb_t on_click;
+    uint32_t glow_color; /* 0 leaves the icon's background transparent. */
 } home_native_tile_t;
 
 static const home_native_tile_t home_native_tiles[HOME_LAYOUT_TILE_COUNT] = {
-    { "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb },
-    { "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb },
-    { "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb },
-    { "launcher/book.png", "launcher/book_s.png", "Books", gui_books_home_tile_cb },
-    { "launcher/sys_set.png", "launcher/sys_set_s.png", "Settings", settings_tile_cb },
-    { "launcher/dac.png", "launcher/dac_s.png", "DAC", dac_home_tile_cb },
-    { "stream_media/subsonic.png", "stream_media/subsonic_s.png", "Subsonic", subsonic_tile_cb },
+    { "launcher/music.png", "launcher/music_s.png", "Music", music_tile_cb, 0xF5B457 },
+    { "launcher/stream_media.png", "launcher/stream_media_s.png", "Stream Media", stream_media_tile_cb, 0x48ADE5 },
+    { "launcher/wireless.png", "launcher/wireless_s.png", "Wireless", wireless_tile_cb, 0x39BD95 },
+    { "launcher/book.png", "launcher/book_s.png", "Books", gui_books_home_tile_cb, 0xF5B457 },
+    { "launcher/sys_set.png", "launcher/sys_set_s.png", "Settings", settings_tile_cb, 0x909EB5 },
+    { "launcher/dac.png", "launcher/dac_s.png", "DAC", dac_home_tile_cb, 0xA36BE4 },
+    { "stream_media/subsonic.png", "stream_media/subsonic_s.png", "Subsonic", subsonic_tile_cb, 0 },
 };
 
 /* One resolved entry (native tile or plugin-registered tile), independent
@@ -1980,6 +1993,7 @@ typedef struct {
     lv_event_cb_t on_click;
     void * user_data;
     const home_tile_override_t * override; /* NULL = never restyled, every native default applies */
+    uint32_t glow_color; /* 0 for plugin tiles */
 } resolved_home_tile_t;
 
 static void plugin_home_tile_click_cb(lv_event_t * e) {
@@ -2035,6 +2049,7 @@ static int resolve_home_tiles(resolved_home_tile_t * out) {
             r->label = native->label;
             r->on_click = native->on_click;
             r->user_data = NULL;
+            r->glow_color = native->glow_color;
         } else {
             int plugin_idx = plugin_manager_find_home_tile_by_id(key);
             if (plugin_idx < 0) {
@@ -2047,6 +2062,7 @@ static int resolve_home_tiles(resolved_home_tile_t * out) {
             r->label = plugin_manager_get_home_tile_label(plugin_idx);
             r->on_click = plugin_home_tile_click_cb;
             r->user_data = (void *) (intptr_t) plugin_idx;
+            r->glow_color = 0;
         }
         r->override = find_home_tile_override(key);
         count++;
@@ -2132,6 +2148,8 @@ lv_obj_t * build_home_screen(void) {
             .has_bg_color = ov->has_bg_color, .bg_color = ov->bg_color,
             .has_text_color = ov->has_text_color, .text_color = ov->text_color,
             .has_radius = ov->has_radius, .radius = ov->radius,
+            /* Explicit plugin surfaces take precedence over native glows. */
+            .icon_glow_color = ov->has_bg_color ? 0 : resolved[i].glow_color,
         };
     }
     /* No back_btn_cb -- this is the true root, nothing to go back to. No

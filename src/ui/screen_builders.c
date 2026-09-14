@@ -421,6 +421,68 @@ lv_obj_t * build_list_message(lv_obj_t * parent, const char * title, const char 
  * pad_all style. */
 #define ICON_GRID_TILE_PAD 8
 
+typedef struct {
+    lv_draw_buf_t * pixels;
+    lv_obj_t * icon_wrapper;
+} icon_glow_t;
+
+static void icon_glow_event_cb(lv_event_t * e) {
+    if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    icon_glow_t * glow = lv_event_get_user_data(e);
+    if (lv_event_get_code(e) == LV_EVENT_DELETE) {
+        lv_draw_buf_destroy(glow->pixels);
+        free(glow);
+    } else if (lv_event_get_code(e) == LV_EVENT_DRAW_MAIN) {
+        lv_area_t area;
+        lv_obj_get_coords(glow->icon_wrapper, &area);
+        int32_t diameter = glow->pixels->header.w;
+        area.x1 = (area.x1 + area.x2 + 1 - diameter) / 2;
+        area.y1 = (area.y1 + area.y2 + 1 - diameter) / 2;
+        area.x2 = area.x1 + diameter - 1;
+        area.y2 = area.y1 + diameter - 1;
+        lv_draw_image_dsc_t dsc;
+        lv_draw_image_dsc_init(&dsc);
+        dsc.src = glow->pixels;
+        lv_draw_image(lv_event_get_layer(e), &dsc, &area);
+    }
+}
+
+static void add_icon_glow(lv_obj_t * tile, lv_obj_t * wrapper, uint32_t color,
+                           int32_t diameter) {
+    if (!color || diameter < 4) return;
+    icon_glow_t * glow = calloc(1, sizeof(*glow));
+    if (!glow) return;
+    glow->pixels = lv_draw_buf_create(diameter, diameter, LV_COLOR_FORMAT_ARGB8888, LV_STRIDE_AUTO);
+    if (!glow->pixels) { free(glow); return; }
+    glow->icon_wrapper = wrapper;
+    /* Compact support, rather than an opaque rectangular card: alpha and
+     * its slope both reach zero before the bitmap's edge. Bake once, then
+     * draw like an ordinary image during screen transitions. */
+    static const uint8_t bayer[4][4] = {
+        {0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}
+    };
+    int32_t radius2 = (diameter - 2) * (diameter - 2);
+    for (int32_t y = 0; y < diameter; ++y) {
+        lv_color32_t * row = (lv_color32_t *)(glow->pixels->data + y * glow->pixels->header.stride);
+        for (int32_t x = 0; x < diameter; ++x) {
+            int32_t dx = 2 * x - diameter + 1, dy = 2 * y - diameter + 1;
+            int32_t distance2 = dx * dx + dy * dy;
+            int32_t alpha = 0;
+            if (distance2 < radius2) {
+                int32_t t = 255 - distance2 * 255 / radius2;
+                alpha = ((92 * t * t / 255) * t) / (255 * 255);
+                /* Fixed spatial noise reduces RGB565 banding; fade the
+                 * noise out with the glow, so the perimeter stays clear. */
+                alpha += ((int32_t)bayer[y & 3][x & 3] - 8) * t / (2 * 255);
+                if (alpha < 0) alpha = 0;
+            }
+            row[x] = (lv_color32_t){ .red = color >> 16, .green = color >> 8,
+                                    .blue = color, .alpha = alpha };
+        }
+    }
+    lv_obj_add_event_cb(tile, icon_glow_event_cb, LV_EVENT_ALL, glow);
+}
+
 /* STATUS_BAR_CLEARANCE / TITLE_ROW_HEIGHT now live in screen_builders.h --
  * gui.c's hand-built screens (player, accent color, EQ, ...) need them too. */
 
@@ -631,6 +693,14 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
             lv_obj_set_style_bg_color(tile, lv_color_hex(item->bg_color), 0);
         }
         if (item->has_radius) lv_obj_set_style_radius(tile, item->radius, 0);
+        /* Per-tile background image (rounded card shape + accent glow are
+         * already baked into the asset's own alpha/pixels) -- drawn via
+         * bg_image_src rather than bg_color, so it composites independently
+         * of the has_bg_color branch above. */
+        if (item->bg_image) {
+            lv_obj_set_style_bg_image_src(tile, asset_path(item->bg_image), 0);
+            lv_obj_set_style_bg_image_opa(tile, LV_OPA_COVER, 0);
+        }
         /* Visual press feedback using GUI_COLOR_PRESSED with full opacity. */
         lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_STATE_PRESSED);
         lv_obj_set_style_bg_color(tile, lv_color_hex(GUI_COLOR_PRESSED), LV_STATE_PRESSED);
@@ -721,6 +791,14 @@ lv_obj_t * build_icon_grid_screen(const char * title, lv_event_cb_t back_btn_cb,
             if (top_offset < 0) top_offset = 0;
             lv_obj_align(img_wrap, LV_ALIGN_TOP_MID, 0, top_offset);
             lv_obj_align(label, LV_ALIGN_TOP_MID, 0, top_offset + target_icon_h + ICON_GRID_ICON_LABEL_GAP);
+        }
+
+        if (item->icon_glow_color && !item->has_bg_color) {
+            int32_t diameter = target_icon_px * 4 / 3;
+            int32_t max_diameter = active_display_width() / col_count - tile_gap - 2 * ICON_GRID_TILE_PAD;
+            if (diameter > max_diameter) diameter = max_diameter;
+            if (diameter > available_h) diameter = available_h;
+            add_icon_glow(tile, img_wrap, item->icon_glow_color, diameter);
         }
 
         if (item->icon_asset_selected) {
@@ -1074,6 +1152,232 @@ lv_obj_t * build_launcher_menu_screen(const char * title, lv_event_cb_t back_btn
     }
     return build_pill_list_screen(title, back_btn_cb, rows, item_count, gui_theme_accent_style(),
                                   layout->row_gap > 0 ? layout->row_gap : 6, icon_scale_pct);
+}
+
+typedef struct category_shared_image {
+    char * relative_path;
+    bool gradient;
+    unsigned refcount;
+    asset_decoded_image_t asset;
+    struct category_shared_image * next;
+} category_shared_image_t;
+
+typedef struct {
+    category_shared_image_t * shared;
+} category_image_owner_t;
+
+static category_shared_image_t * category_shared_images;
+static void category_shared_image_release(category_shared_image_t * shared);
+
+typedef struct {
+    lv_obj_t * label;
+    lv_obj_t * icon;
+    lv_obj_t * background;
+    lv_color_t background_default_color;
+} category_row_context_t;
+
+static void category_image_delete_cb(lv_event_t * e) {
+    /* LV_EVENT_DELETE can bubble. This callback owns exactly the image it
+     * was attached to, so a descendant's deletion must not drop its ref. */
+    if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+    category_image_owner_t * owner = lv_event_get_user_data(e);
+    if (!owner) return;
+    category_shared_image_t * shared = owner->shared;
+    free(owner);
+    category_shared_image_release(shared);
+}
+
+static category_shared_image_t * category_shared_image_acquire(const char * relative_path,
+                                                                bool gradient) {
+    if (!relative_path) return NULL;
+    for (category_shared_image_t * shared = category_shared_images; shared;
+         shared = shared->next) {
+        if (shared->gradient == gradient &&
+            strcmp(shared->relative_path, relative_path) == 0) {
+            shared->refcount++;
+            return shared;
+        }
+    }
+
+    category_shared_image_t * shared = calloc(1, sizeof(*shared));
+    if (!shared) return NULL;
+    shared->relative_path = strdup(relative_path);
+    if (!shared->relative_path) {
+        free(shared);
+        return NULL;
+    }
+    bool opened = gradient
+                    ? asset_decoded_gradient_open(&shared->asset, relative_path)
+                    : asset_decoded_image_open(&shared->asset, relative_path);
+    if (!opened) {
+        free(shared->relative_path);
+        free(shared);
+        return NULL;
+    }
+    shared->gradient = gradient;
+    shared->refcount = 1;
+    shared->next = category_shared_images;
+    category_shared_images = shared;
+    return shared;
+}
+
+static void category_shared_image_release(category_shared_image_t * shared) {
+    if (!shared || shared->refcount == 0) return;
+    if (--shared->refcount != 0) return;
+    category_shared_image_t ** link = &category_shared_images;
+    while (*link && *link != shared) link = &(*link)->next;
+    if (*link == shared) *link = shared->next;
+    asset_decoded_image_close(&shared->asset);
+    free(shared->relative_path);
+    free(shared);
+}
+
+static lv_obj_t * category_create_retained_image(lv_obj_t * row, const char * relative_path,
+                                                  bool gradient) {
+    category_shared_image_t * shared = category_shared_image_acquire(relative_path, gradient);
+    if (!shared) return NULL;
+    category_image_owner_t * owner = malloc(sizeof(*owner));
+    if (!owner) {
+        category_shared_image_release(shared);
+        return NULL;
+    }
+    owner->shared = shared;
+    lv_obj_t * image = lv_image_create(row);
+    if (!image) {
+        category_shared_image_release(shared);
+        free(owner);
+        return NULL;
+    }
+    lv_obj_remove_flag(image, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(image, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_image_set_src(image, asset_decoded_image_source(&shared->asset));
+    lv_image_set_inner_align(image, LV_IMAGE_ALIGN_STRETCH);
+    lv_obj_add_event_cb(image, category_image_delete_cb, LV_EVENT_DELETE, owner);
+    return image;
+}
+
+static void category_row_fit(lv_obj_t * row, category_row_context_t * context) {
+    int32_t width = lv_obj_get_width(row);
+    int32_t height = lv_obj_get_height(row);
+    if (width <= 0 || height <= 0) return;
+    if (context->background) {
+        if (lv_obj_get_width(context->background) != width ||
+            lv_obj_get_height(context->background) != height)
+            lv_obj_set_size(context->background, width, height);
+        lv_obj_align(context->background, LV_ALIGN_CENTER, 0, 0);
+    }
+    if (context->icon && context->label) {
+        int32_t left = BOARD_SCALE_PX(96);
+        int32_t available = width - left - 60;
+        if (available < 1) available = 1;
+        if (lv_obj_get_width(context->label) != available)
+            lv_obj_set_width(context->label, available);
+        lv_obj_align(context->label, LV_ALIGN_LEFT_MID, left, 0);
+    }
+}
+
+static void category_row_sync_background_style(lv_obj_t * row,
+                                                category_row_context_t * context) {
+    if (!context->background) return;
+    lv_color_t row_color = lv_obj_get_style_bg_color(row, LV_PART_MAIN);
+    if (lv_color_eq(row_color, context->background_default_color))
+        lv_obj_remove_flag(context->background, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(context->background, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void category_row_event_cb(lv_event_t * e) {
+    category_row_context_t * context = lv_event_get_user_data(e);
+    lv_obj_t * row = lv_event_get_current_target(e);
+    if (!context || lv_event_get_target(e) != row) return;
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_DELETE) {
+        free(context);
+        return;
+    }
+    if (code == LV_EVENT_SIZE_CHANGED) category_row_fit(row, context);
+    else if (code == LV_EVENT_STYLE_CHANGED) category_row_sync_background_style(row, context);
+    else if (context->background &&
+             (code == LV_EVENT_PRESSED || code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST)) {
+        lv_obj_set_style_image_recolor_opa(context->background,
+                                          code == LV_EVENT_PRESSED ? LV_OPA_30 : LV_OPA_TRANSP, 0);
+    }
+}
+
+void decorate_category_row(lv_obj_t * row, const char * icon_asset, const char * bg_asset) {
+    if (!row) return;
+    category_row_context_t * context = calloc(1, sizeof(*context));
+    if (!context) return;
+    /* build_pill_list_screen() creates the primary label first. */
+    context->label = lv_obj_get_child(row, 0);
+    context->background_default_color = LIST_ROW_BG_COLOR;
+    context->background = category_create_retained_image(row, bg_asset, true);
+    if (context->background) {
+        lv_obj_set_style_clip_corner(row, true, 0);
+        lv_obj_move_to_index(context->background, 0);
+        lv_obj_set_style_image_recolor(context->background, lv_color_white(), 0);
+        lv_obj_set_style_image_recolor_opa(context->background, LV_OPA_TRANSP, 0);
+    }
+    context->icon = category_create_retained_image(row, icon_asset, false);
+    if (context->icon) {
+        lv_obj_set_size(context->icon, BOARD_SCALE_PX(44), BOARD_SCALE_PX(44));
+        lv_obj_align(context->icon, LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(28), 0);
+    }
+    lv_obj_add_event_cb(row, category_row_event_cb, LV_EVENT_ALL, context);
+    category_row_sync_background_style(row, context);
+    category_row_fit(row, context);
+}
+
+lv_obj_t * build_category_menu_screen(const char * title, lv_event_cb_t back_btn_cb,
+                                      const icon_grid_item_t * items, int item_count,
+                                      const launcher_menu_layout_t * layout) {
+    if (!items || item_count <= 0) return NULL;
+    pill_list_item_t rows[item_count];
+    lv_obj_t * row_objects[item_count];
+    memset(row_objects, 0, sizeof(row_objects));
+    int32_t default_height = BOARD_SCALE_PX(item_count <= 5 ? 112 : 96);
+
+    for (int i = 0; i < item_count; ++i) {
+        bool accessory = items[i].has_accessory ? items[i].accessory
+                         : !(layout && layout->has_accessory && !layout->accessory);
+        const char * text_size = items[i].text_size ? items[i].text_size
+                              : (layout && layout->text_size[0] ? layout->text_size : NULL);
+        int32_t native_height = default_height;
+        int32_t font_height = lv_font_get_line_height(pill_row_resolve_text_size(text_size)) +
+                              BOARD_SCALE_PX(32);
+        if (native_height < font_height) native_height = font_height;
+        rows[i] = (pill_list_item_t) {
+            .label = items[i].label,
+            .accessory = accessory ? PILL_ACCESSORY_CHEVRON : PILL_ACCESSORY_NONE,
+            .on_click = items[i].on_click,
+            .user_data = items[i].user_data,
+            .row_height = items[i].has_row_height ? items[i].row_height
+                        : (layout && layout->height > 0 ? layout->height : native_height),
+            .row_width = items[i].has_row_width ? items[i].row_width : (layout ? layout->width : 0),
+            .text_size = text_size,
+            .has_bg_color = items[i].has_bg_color || (layout && layout->has_bg_color),
+            .bg_color = items[i].has_bg_color ? items[i].bg_color : (layout ? layout->bg_color : 0),
+            .has_text_color = items[i].has_text_color || (layout && layout->has_text_color),
+            .text_color = items[i].has_text_color ? items[i].text_color : (layout ? layout->text_color : 0),
+            .has_radius = items[i].has_radius || (layout && layout->has_radius),
+            .radius = items[i].has_radius ? items[i].radius : (layout ? layout->radius : 0),
+            .text_align = items[i].text_align ? items[i].text_align
+                        : (layout && layout->align[0] ? layout->align : NULL),
+            .out_row = &row_objects[i],
+        };
+    }
+    int32_t row_gap = layout && layout->row_gap > 0 ? layout->row_gap : GUI_ROW_GAP;
+    lv_obj_t * scr = build_pill_list_screen(title, back_btn_cb, rows, item_count,
+                                            gui_theme_accent_style(), row_gap, 100);
+    for (int i = 0; i < item_count; ++i) {
+        bool show_icon = items[i].has_icon ? items[i].icon
+                       : !(layout && layout->has_icon && !layout->icon);
+        bool custom_background = items[i].has_bg_color || (layout && layout->has_bg_color);
+        if (row_objects[i])
+            decorate_category_row(row_objects[i], show_icon ? items[i].icon_asset : NULL,
+                                  custom_background ? NULL : items[i].bg_image);
+    }
+    return scr;
 }
 
 int append_plugin_list_rows(pill_list_item_t * items, int count, int max_items,

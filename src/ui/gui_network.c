@@ -25,6 +25,9 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include "dlna_control.h"
 #include "remote_control.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -2962,18 +2965,20 @@ void gui_network_handle_wifi_disabled(void) {
 
 static lv_obj_t * build_wireless_screen(void) {
     static icon_grid_item_t items[6];
-    items[0] = (icon_grid_item_t){ "wireless/wifi.png", "wireless/wifi_s.png", "Wi-Fi", wifi_tile_cb, NULL };
-    items[1] = (icon_grid_item_t){ "wireless/bt.png", "wireless/bt_s.png", "Bluetooth", bt_tile_cb, NULL };
-    items[2] = (icon_grid_item_t){ "wireless/airplay.png", "wireless/airplay_s.png", "AirPlay", airplay_tile_cb, NULL };
-    items[3] = (icon_grid_item_t){ "wireless/dlna.png", "wireless/dlna_s.png", "DLNA", dlna_tile_cb, NULL };
-    /* Shortened captions ("Remote" and "Import") prevent overflow within tile bounds. */
-    items[4] = (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "Remote", remote_control_tile_cb, NULL };
-    items[5] = (icon_grid_item_t){ "wireless/via.png", "wireless/via_s.png", "Import", import_wifi_tile_cb, NULL };
-    /* Replacement artwork has no built-in caption band. Use the shared
-     * below-icon layout so it reserves separate space for icon and text.
-     * Keep the standard icon footprint and narrow-board downscaling. */
-    lv_obj_t * scr = build_launcher_menu_screen("Wireless", generic_back_cb, items, 6, BOARD_SCALE_PX(100), false,
-                                                 &launcher_layout_config.wireless);
+    items[0] = (icon_grid_item_t){ "wireless/list_wifi.png", NULL, "Wi-Fi", wifi_tile_cb, NULL,
+                                   .bg_image = "wireless/list_bg_wifi.png" };
+    items[1] = (icon_grid_item_t){ "wireless/list_bt.png", NULL, "Bluetooth", bt_tile_cb, NULL,
+                                   .bg_image = "wireless/list_bg_bt.png" };
+    items[2] = (icon_grid_item_t){ "wireless/list_airplay.png", NULL, "AirPlay", airplay_tile_cb, NULL,
+                                   .bg_image = "wireless/list_bg_airplay.png" };
+    items[3] = (icon_grid_item_t){ "wireless/list_dlna.png", NULL, "DLNA", dlna_tile_cb, NULL,
+                                   .bg_image = "wireless/list_bg_dlna.png" };
+    items[4] = (icon_grid_item_t){ "wireless/list_remote.png", NULL, "Remote", remote_control_tile_cb, NULL,
+                                   .bg_image = "wireless/list_bg_remote.png" };
+    items[5] = (icon_grid_item_t){ "wireless/list_import.png", NULL, "Import", import_wifi_tile_cb, NULL,
+                                   .bg_image = "wireless/list_bg_import.png" };
+    lv_obj_t * scr = build_category_menu_screen("Wireless", generic_back_cb, items, 6,
+                                                &launcher_layout_config.wireless);
     finalize_screen_navigation(scr);
     return scr;
 }

@@ -325,6 +325,10 @@ static void player_transition_discard_cache(void) {
 bool player_transition_cache_is_dirty(void) { return player_transition_cache_dirty; }
 
 static void player_transition_rebuild_cache(void) {
+    /* The source remains active until the slide completes, so the active-
+     * screen check alone still allows a costly snapshot during entry.
+     * Keep dirty set; the screen-handoff sync retries when Player is offscreen. */
+    if (gui_navigation_transition_in_progress()) return;
     /* Nothing to gain while gui_player_get_screen() is already the live screen --
      * no transition can ever target the screen already on display, and
      * re-snapshotting it here would just be wasted work on every one of
@@ -1205,4 +1209,3 @@ void gui_navigation_replace_static_screen(int snapshot_index, lv_obj_t * old_scr
     back_target_cache_note_replaced(old_screen, new_screen);
     if (lv_screen_active() == old_screen) lv_screen_load(new_screen);
 }
-

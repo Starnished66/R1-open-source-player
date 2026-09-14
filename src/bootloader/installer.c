@@ -76,6 +76,34 @@ static bool fsync_path(const char * path, bool is_dir) {
     return ok;
 }
 
+static void fsync_parent_dir_best_effort(const char * path) {
+    char parent[512];
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(parent)) return;
+    memcpy(parent, path, len + 1);
+    char * slash = strrchr(parent, '/');
+    if (!slash) {
+        memcpy(parent, ".", 2);
+    } else if (slash == parent) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    (void) fsync_path(parent, true);
+}
+
+static bool executable_regular_snapshot(const char * path, struct stat * out) {
+    if (!path || !path[0] || lstat(path, out) != 0 || !S_ISREG(out->st_mode)) return false;
+    return access(path, X_OK) == 0;
+}
+
+static bool same_file_snapshot(const struct stat * before, const struct stat * after) {
+    return before->st_dev == after->st_dev && before->st_ino == after->st_ino &&
+           before->st_mode == after->st_mode && before->st_size == after->st_size &&
+           before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec;
+}
+
 /* Copies bytes from src to dst. Returns false on short read or write failure. */
 static bool copy_file(const char * src_path, const char * dst_path) {
     int src_fd = open(src_path, O_RDONLY);
@@ -322,6 +350,46 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
     fprintf(stderr, "installer: installed SD update to %s\n", INSTALLED_PLAYER_PATH);
 }
 
+const char * installer_select_internal_player(const char * packaged, const char * installed) {
+    struct stat packaged_before, installed_before;
+    /* Preserve the legacy selection policy exactly. Strict lstat-based
+     * validation below only decides whether an installed override is safe
+     * to delete; an executable symlink remains selected but is never
+     * deletion-eligible. */
+    if (!scanner_path_is_executable(installed)) return packaged;
+    if (!executable_regular_snapshot(installed, &installed_before)) return installed;
+
+    if (!executable_regular_snapshot(packaged, &packaged_before)) return installed;
+
+    char packaged_stamp[BOOT_BUILD_STAMP_LEN + 1];
+    char installed_stamp[BOOT_BUILD_STAMP_LEN + 1];
+    if (!scanner_read_build_stamp(packaged, packaged_stamp, sizeof(packaged_stamp)) ||
+        !scanner_read_build_stamp(installed, installed_stamp, sizeof(installed_stamp))) {
+        return installed;
+    }
+
+    fprintf(stderr, "installer: packaged player %s, installed player %s\n", packaged_stamp, installed_stamp);
+    if (strcmp(packaged_stamp, installed_stamp) <= 0) return installed;
+
+    struct stat packaged_after, installed_after;
+    if (!executable_regular_snapshot(packaged, &packaged_after) ||
+        !executable_regular_snapshot(installed, &installed_after) ||
+        !same_file_snapshot(&packaged_before, &packaged_after) ||
+        !same_file_snapshot(&installed_before, &installed_after)) {
+        fprintf(stderr, "installer: player changed during version check; preserving installed copy\n");
+        return installed;
+    }
+
+    fprintf(stderr, "installer: packaged player is newer; removing stale installed override %s\n", installed);
+    if (unlink(installed) != 0) {
+        fprintf(stderr, "installer: unlink(%s) failed: %s; booting packaged player anyway\n",
+                installed, strerror(errno));
+    } else {
+        fsync_parent_dir_best_effort(installed);
+    }
+    return packaged;
+}
+
 const char * installer_internal_player_path(void) {
-    return scanner_path_is_executable(INSTALLED_PLAYER_PATH) ? INSTALLED_PLAYER_PATH : INTERNAL_PLAYER_PATH;
+    return installer_select_internal_player(INTERNAL_PLAYER_PATH, INSTALLED_PLAYER_PATH);
 }

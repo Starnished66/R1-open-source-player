@@ -64,7 +64,9 @@ void gui_reset_interactive_timeout_baseline(void);
  * screen_builders.h's pill_row_apply_icon())/text-size ("small"/"medium"/
  * "large", already validated by plugin_manager.c) -- a row with neither set
  * anywhere in this call keeps today's exact plain-label rendering. height
- * (0 = default 84px) applies to every row in this call, not per-row. Returns
+ * (0 = default 84px, or 96px for icon lists, scaled for the board) applies
+ * to every row in this call, not per-row. Icon rows inherit native category
+ * gradients and use 44px reference icons. Returns
  * the selected screen-pool slot so callbacks can be stored per slot. */
 int gui_plugin_show_list(const char * title, const char * const * labels, const char * const * icon_paths,
                           const char * const * text_sizes, int32_t height, int32_t width,

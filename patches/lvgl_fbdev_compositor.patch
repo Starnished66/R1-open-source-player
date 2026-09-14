@@ -1,30 +1,11 @@
 diff --git a/src/drivers/display/fb/lv_linux_fbdev.c b/src/drivers/display/fb/lv_linux_fbdev.c
-index cf529a2..e162698 100644
+index c78b881..b6474e2 100644
 --- a/src/drivers/display/fb/lv_linux_fbdev.c
 +++ b/src/drivers/display/fb/lv_linux_fbdev.c
-@@ -9,6 +9,18 @@
- #include "lv_linux_fbdev.h"
- #if LV_USE_LINUX_FBDEV
- 
-+#include "../../../draw/lv_draw_buf.h"
-+/* Needed only for the external-composition handoff (lv_linux_fbdev_end_
-+ * external_composition() below) to point disp->buf_act at a specific
-+ * physical page directly -- there is no public setter for just buf_act
-+ * (lv_display_set_draw_buffers() would also reset buf_1/buf_2, which are
-+ * already correct and must not change), and this is exactly the kind of
-+ * driver-internal synchronization this header exists for. Nothing outside
-+ * this file ever sees or touches disp->buf_act -- see this driver's own
-+ * header for why external callers only get the narrow, explicit
-+ * begin/get/present/end API instead. */
-+#include "../../../display/lv_display_private.h"
-+
- #include <stdlib.h>
- #include <unistd.h>
- #include <stddef.h>
-@@ -60,6 +72,25 @@ typedef struct {
-     long int screensize;
-     int fbfd;
+@@ -71,6 +71,25 @@ typedef struct {
      bool force_refresh;
+     uint8_t * draw_buf_1;
+     uint8_t * draw_buf_2;
 +
 +    /* True when /dev/fb0 is double-buffered via panning (yres_virtual >=
 +     * 2*yres) and we've handed LVGL the two real physical halves as its
@@ -47,15 +28,15 @@ index cf529a2..e162698 100644
  } lv_linux_fb_t;
  
  /**********************
-@@ -222,14 +253,51 @@ void lv_linux_fbdev_set_file(lv_display_t * disp, const char * file)
+@@ -234,14 +253,45 @@ lv_result_t lv_linux_fbdev_set_file(lv_display_t * disp, const char * file)
  
      uint8_t * draw_buf = NULL;
      uint8_t * draw_buf_2 = NULL;
--    draw_buf = malloc(draw_buf_size);
+-    draw_buf = lv_malloc(draw_buf_size);
  
 -    if(LV_LINUX_FBDEV_BUFFER_COUNT == 2) {
--        draw_buf_2 = malloc(draw_buf_size);
-+#if !LV_LINUX_FBDEV_BSD
+-        draw_buf_2 = lv_malloc(draw_buf_size);
++#if LV_LINUX_FBDEV_MMAP && !LV_LINUX_FBDEV_BSD
 +    /* If this display is double-buffered via panning (virtual height is at
 +     * least twice the visible height) and we've been asked for DIRECT mode
 +     * with 2 buffers, skip malloc entirely and hand LVGL the two physical
@@ -78,32 +59,27 @@ index cf529a2..e162698 100644
 +        dsc->page_yoffset = dsc->vinfo.yres;
 +        draw_buf = dsc->page0;
 +        draw_buf_2 = dsc->page1;
++        /* Do not store these in draw_buf_1/draw_buf_2 -- del_event_cb()
++         * lv_free()s those, and these are mmap'd framebuffer pages. */
      }
-+#endif /* !LV_LINUX_FBDEV_BSD */
- 
--    lv_display_set_buffers(disp, draw_buf, draw_buf_2, draw_buf_size, LV_LINUX_FBDEV_RENDER_MODE);
++#endif /* LV_LINUX_FBDEV_MMAP && !LV_LINUX_FBDEV_BSD */
++
 +    if(!dsc->pan_double_buffer) {
-+        draw_buf = malloc(draw_buf_size);
++        draw_buf = lv_malloc(draw_buf_size);
 +
 +        if(LV_LINUX_FBDEV_BUFFER_COUNT == 2) {
-+            draw_buf_2 = malloc(draw_buf_size);
++            draw_buf_2 = lv_malloc(draw_buf_size);
 +        }
-+    }
-+
-+    /* Must happen before lv_display_set_buffers(): that call reads the
-+     * display's CURRENT resolution (still lv_display_create()'s 800x480
-+     * placeholder at this point) to work out each buffer's width/height/
-+     * stride. On a panel that isn't 800x480 those come out transposed --
-+     * harmless in PARTIAL mode (flush_cb does its own row math straight
-+     * from vinfo/finfo, ignoring these), but DIRECT mode's internal
-+     * buffer-sync (lv_draw_buf_copy) trusts them directly and walks off
-+     * the end of the real buffer, segfaulting. */
-     lv_display_set_resolution(disp, hor_res, ver_res);
-+    lv_display_set_buffers(disp, draw_buf, draw_buf_2, draw_buf_size, LV_LINUX_FBDEV_RENDER_MODE);
  
-     if(width > 0) {
-         lv_display_set_dpi(disp, DIV_ROUND_UP(hor_res * 254, width * 10));
-@@ -245,6 +313,98 @@ void lv_linux_fbdev_set_force_refresh(lv_display_t * disp, bool enabled)
+-    dsc->draw_buf_1 = draw_buf;
+-    dsc->draw_buf_2 = draw_buf_2;
++        dsc->draw_buf_1 = draw_buf;
++        dsc->draw_buf_2 = draw_buf_2;
++    }
+ 
+     lv_display_set_resolution(disp, hor_res, ver_res);
+     lv_display_set_buffers(disp, draw_buf, draw_buf_2, draw_buf_size, LV_LINUX_FBDEV_RENDER_MODE);
+@@ -262,6 +312,98 @@ void lv_linux_fbdev_set_force_refresh(lv_display_t * disp, bool enabled)
      dsc->force_refresh = enabled;
  }
  
@@ -160,11 +136,11 @@ index cf529a2..e162698 100644
 +    if(dsc->vinfo.yoffset == target_yoffset) return true; /* already showing the right page -- nothing to do */
 +
 +    /* Pan using a TEMPORARY copy, only committing dsc->vinfo.yoffset after
-+     * FBIOPAN_DISPLAY actually succeeds -- the previous version wrote
-+     * dsc->vinfo.yoffset before the ioctl, so a failed pan left this
-+     * driver's own bookkeeping claiming a page change that never physically
-+     * happened, silently desyncing every later get_active_page()/
-+     * get_inactive_page() call from the real hardware state. */
++     * FBIOPAN_DISPLAY actually succeeds -- writing dsc->vinfo.yoffset
++     * before the ioctl would leave this driver's own bookkeeping claiming
++     * a page change that never physically happened, silently desyncing
++     * every later get_active_page()/get_inactive_page() call from the
++     * real hardware state. */
 +    struct fb_var_screeninfo tmp = dsc->vinfo;
 +    tmp.yoffset = target_yoffset;
 +    if(ioctl(dsc->fbfd, FBIOPAN_DISPLAY, &tmp) == -1) {
@@ -202,11 +178,28 @@ index cf529a2..e162698 100644
  /**********************
   *   STATIC FUNCTIONS
   **********************/
-@@ -253,6 +413,57 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
- {
-     lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
+@@ -297,8 +439,14 @@ static void del_event_cb(lv_event_t * e)
+         dsc->fbfd = -1;
+     }
+     if(dsc->rotated_buf) lv_free(dsc->rotated_buf);
+-    if(dsc->draw_buf_1) lv_free(dsc->draw_buf_1);
+-    if(dsc->draw_buf_2) lv_free(dsc->draw_buf_2);
++    /* pan_double_buffer aliases the mmap'd framebuffer pages as LVGL draw
++     * buffers and never stores them in draw_buf_1/2 -- those fields stay
++     * NULL. Still skip the free if a future change points them at mmap'd
++     * memory: lv_free() of /dev/fb0 would be a real heap corruption. */
++    if(!dsc->pan_double_buffer) {
++        if(dsc->draw_buf_1) lv_free(dsc->draw_buf_1);
++        if(dsc->draw_buf_2) lv_free(dsc->draw_buf_2);
++    }
+     if(dsc->devname) lv_free((void *)dsc->devname);
  
-+#if !LV_LINUX_FBDEV_BSD
+     lv_free(dsc);
+@@ -316,6 +464,50 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
+     }
+ #endif
+ 
++#if LV_LINUX_FBDEV_MMAP && !LV_LINUX_FBDEV_BSD
 +    if(dsc->pan_double_buffer) {
 +        /* An external caller (the transition compositor) currently owns
 +         * page presentation -- see lv_linux_fbdev_begin_external_
@@ -227,14 +220,7 @@ index cf529a2..e162698 100644
 +         * NOT being displayed is always safe to render into regardless of
 +         * scanout timing, which is what actually kills the tearing -- the
 +         * pan itself only needs to line up with vblank, which fbdev drivers
-+         * are expected to handle internally for FBIOPAN_DISPLAY. An earlier
-+         * version of this also called FBIO_WAITFORVSYNC before panning as
-+         * an extra safety net, but on real hardware that added a
-+         * noticeable, consistent bump to touch-to-screen latency on EVERY
-+         * redraw (not just transitions) -- likely double-waiting for a
-+         * vblank the pan was already going to wait for on its own. Removed;
-+         * if a future panel needs it back, gate it behind a flag rather
-+         * than always-on. */
++         * are expected to handle internally for FBIOPAN_DISPLAY. */
 +        if(lv_display_flush_is_last(disp)) {
 +            uint32_t target_yoffset = (color_p == dsc->page1) ? dsc->page_yoffset : 0;
 +            if(dsc->vinfo.yoffset != target_yoffset) {
@@ -255,16 +241,16 @@ index cf529a2..e162698 100644
 +        lv_display_flush_ready(disp);
 +        return;
 +    }
-+#endif /* !LV_LINUX_FBDEV_BSD */
++#endif /* LV_LINUX_FBDEV_MMAP && !LV_LINUX_FBDEV_BSD */
 +
-     if(dsc->fbp == NULL ||
-        area->x2 < 0 || area->y2 < 0 ||
-        area->x1 > (int32_t)dsc->vinfo.xres - 1 || area->y1 > (int32_t)dsc->vinfo.yres - 1) {
+     const bool wait_for_last_flush = LV_LINUX_FBDEV_RENDER_MODE == LV_DISPLAY_RENDER_MODE_FULL;
+     const bool is_last_flush = lv_display_flush_is_last(disp);
+     const bool skip_flush = wait_for_last_flush && !is_last_flush;
 diff --git a/src/drivers/display/fb/lv_linux_fbdev.h b/src/drivers/display/fb/lv_linux_fbdev.h
-index c14e973..b3e639a 100644
+index a9b7be0..6759d6a 100644
 --- a/src/drivers/display/fb/lv_linux_fbdev.h
 +++ b/src/drivers/display/fb/lv_linux_fbdev.h
-@@ -39,6 +39,77 @@ void lv_linux_fbdev_set_file(lv_display_t * disp, const char * file);
+@@ -39,6 +39,77 @@ lv_result_t lv_linux_fbdev_set_file(lv_display_t * disp, const char * file);
   */
  void lv_linux_fbdev_set_force_refresh(lv_display_t * disp, bool enabled);
  

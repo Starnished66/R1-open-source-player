@@ -1,34 +1,50 @@
+diff --git a/src/core/lv_obj_pos.c b/src/core/lv_obj_pos.c
+--- a/src/core/lv_obj_pos.c
++++ b/src/core/lv_obj_pos.c
+@@ -367,6 +367,10 @@ bool lv_obj_is_layout_positioned(const lv_obj_t * obj)
+ 
+ void lv_obj_mark_layout_as_dirty(lv_obj_t * obj)
+ {
++    /* Root screens and display layers have no parent. Flag changes can
++     * request layout invalidation for that absent parent. */
++    if(obj == NULL) return;
++
+     obj->layout_inv = 1;
+ 
+     /*Mark the screen as dirty too to mark that there is something to do on this screen*/
+diff --git a/src/libs/lodepng/lodepng.c b/src/libs/lodepng/lodepng.c
+index 7e37636..9c617b2 100644
+--- a/src/libs/lodepng/lodepng.c
++++ b/src/libs/lodepng/lodepng.c
+@@ -5795,7 +5795,22 @@ static void decodeGeneric(unsigned char ** out, unsigned * w, unsigned * h,
+     lodepng_free(idat);
+ 
+     if(!state->error) {
+-        lv_draw_buf_t * decoded = lv_draw_buf_create_ex(image_cache_draw_buf_handlers, *w, *h, LV_COLOR_FORMAT_ARGB8888, 4 * *w);
++        /* postProcessScanlines() below unfilters straight into this buffer at
++        the PNG's own native bpp (lodepng_get_bpp(&state->info_png.color)),
++        not at the fixed 4 bytes/pixel this ARGB8888 draw_buf's default
++        stride assumes -- any source with more than 32 bits per pixel (e.g.
++        16-bit-per-channel RGBA, 64bpp) overflows a 4**w stride by exactly
++        that much, corrupting whatever the allocator placed next on the
++        heap. Widening the stride to the larger of the two needs keeps this
++        buffer correct for both the native unfilter step here and, when no
++        color conversion turns out to be needed (lodepng_decode()'s "same
++        color type" branch), for the final ARGB8888 image this same
++        allocation becomes. */
++        size_t native_bpp = lodepng_get_bpp(&state->info_png.color);
++        size_t native_row_bytes = ((size_t)*w * native_bpp + 7u) / 8u;
++        size_t argb8888_row_bytes = 4 * (size_t)*w;
++        uint32_t stride = (uint32_t)(native_row_bytes > argb8888_row_bytes ? native_row_bytes : argb8888_row_bytes);
++        lv_draw_buf_t * decoded = lv_draw_buf_create_ex(image_cache_draw_buf_handlers, *w, *h, LV_COLOR_FORMAT_ARGB8888, stride);
+         if(decoded) {
+             *out = (unsigned char*)decoded;
+             outsize = decoded->data_size;
 diff --git a/src/libs/tiny_ttf/lv_tiny_ttf.c b/src/libs/tiny_ttf/lv_tiny_ttf.c
-index b185d39..087f911 100644
+index 09f1e87..f7fd498 100644
 --- a/src/libs/tiny_ttf/lv_tiny_ttf.c
 +++ b/src/libs/tiny_ttf/lv_tiny_ttf.c
-@@ -134,18 +134,23 @@ void lv_tiny_ttf_destroy(lv_font_t * font)
- 
- void lv_tiny_ttf_init(void)
- {
-+    if(tiny_ttf_cache != NULL) return;
-+
-     lv_cache_ops_t ops = {
-         .compare_cb = (lv_cache_compare_cb_t)tiny_ttf_cache_compare_cb,
-         .create_cb = (lv_cache_create_cb_t)tiny_ttf_cache_create_cb,
-         .free_cb = (lv_cache_free_cb_t)tiny_ttf_cache_free_cb,
-     };
- 
--    tiny_ttf_cache = lv_cache_create(&lv_cache_class_lru_rb_count, sizeof(tiny_ttf_cache_data_t), 128, ops);
-+    tiny_ttf_cache = lv_cache_create(&lv_cache_class_lru_rb_count, sizeof(tiny_ttf_cache_data_t), 512, ops);
- }
- 
- void lv_tiny_ttf_deinit(void)
- {
--    lv_cache_destroy(tiny_ttf_cache, NULL);
-+    if(tiny_ttf_cache != NULL) {
-+        lv_cache_destroy(tiny_ttf_cache, NULL);
-+        tiny_ttf_cache = NULL;
-+    }
- }
- 
- /**********************
-@@ -286,6 +291,9 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
+@@ -459,6 +459,9 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
          dsc->stream.size = data_size;
      }
      if(0 == stbtt_InitFont(&dsc->info, &dsc->stream, stbtt_GetFontOffsetForIndex(&dsc->stream, 0))) {
@@ -36,9 +52,9 @@ index b185d39..087f911 100644
 +            lv_fs_close(&dsc->file);
 +        }
          lv_free(dsc);
-         LV_LOG_ERROR("tiny_ttf: init failed\n");
+         LV_LOG_ERROR("tiny_ttf: init failed");
          return NULL;
-@@ -302,6 +310,11 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
+@@ -477,6 +480,11 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
  
      lv_font_t * out_font = lv_malloc_zeroed(sizeof(lv_font_t));
      if(out_font == NULL) {
@@ -48,13 +64,13 @@ index b185d39..087f911 100644
 +        }
 +#endif
          lv_free(dsc);
-         LV_LOG_ERROR("tiny_ttf: out of memory\n");
+         LV_LOG_ERROR("tiny_ttf: out of memory");
          return NULL;
 diff --git a/src/libs/tjpgd/tjpgd.c b/src/libs/tjpgd/tjpgd.c
-index 22dfd56..5e910ca 100644
+index 7152adf..51c7915 100644
 --- a/src/libs/tjpgd/tjpgd.c
 +++ b/src/libs/tjpgd/tjpgd.c
-@@ -887,8 +887,61 @@ JRESULT jd_mcu_output(
+@@ -888,6 +888,60 @@ JRESULT jd_mcu_output(
                  }
              }
          }
@@ -113,10 +129,8 @@ index 22dfd56..5e910ca 100644
 +            }
 +        }
      }
--
+ 
      /* Squeeze up pixel table if a part of MCU is to be truncated */
-     mx >>= jd->scale;
-     if(rx < mx) {   /* Is the MCU spans rigit edge? */
 diff --git a/src/libs/tjpgd/tjpgdcnf.h b/src/libs/tjpgd/tjpgdcnf.h
 index dc27d6a..1b543b0 100644
 --- a/src/libs/tjpgd/tjpgdcnf.h
@@ -124,60 +138,30 @@ index dc27d6a..1b543b0 100644
 @@ -2,7 +2,7 @@
  /* TJpgDec System Configurations R0.03          */
  /*----------------------------------------------*/
-
+ 
 -#define JD_SZBUF        512
 +#define JD_SZBUF        1024
  /* Specifies size of stream input buffer */
-
+ 
  #define JD_FORMAT       0
 @@ -12,7 +12,7 @@
  /  2: Grayscale (8-bit/pix)
  */
-
+ 
 -#define JD_USE_SCALE    0
 +#define JD_USE_SCALE    1
  /* Switches output descaling feature.
  /  0: Disable
  /  1: Enable
-diff --git a/src/misc/cache/_lv_cache_lru_rb.c b/src/misc/cache/_lv_cache_lru_rb.c
-index 097f764..b6e7bb6 100644
---- a/src/misc/cache/_lv_cache_lru_rb.c
-+++ b/src/misc/cache/_lv_cache_lru_rb.c
-@@ -403,6 +403,7 @@ static void drop_all_cb(lv_cache_t * cache, void * user_data)
+diff --git a/src/misc/cache/class/lv_cache_lru_rb.c b/src/misc/cache/class/lv_cache_lru_rb.c
+index 79b64b1..3774def 100644
+--- a/src/misc/cache/class/lv_cache_lru_rb.c
++++ b/src/misc/cache/class/lv_cache_lru_rb.c
+@@ -410,6 +410,7 @@ static void drop_all_cb(lv_cache_t * cache, void * user_data)
  
      lv_rb_destroy(&lru->rb);
-     _lv_ll_clear(&lru->ll);
+     lv_ll_clear(&lru->ll);
 +    lv_rb_init(&lru->rb, lru->cache.ops.compare_cb, lv_cache_entry_get_size(lru->cache.node_size) + sizeof(void *));
  
      cache->size = 0;
  }
-diff --git a/src/libs/lodepng/lodepng.c b/src/libs/lodepng/lodepng.c
-index 385cf45..0dbfcf9 100644
---- a/src/libs/lodepng/lodepng.c
-+++ b/src/libs/lodepng/lodepng.c
-@@ -5307,7 +5307,24 @@ static void decodeGeneric(unsigned char ** out, unsigned * w, unsigned * h,
-     lodepng_free(idat);
- 
-     if(!state->error) {
--        lv_draw_buf_t * decoded = lv_draw_buf_create(*w, *h, LV_COLOR_FORMAT_ARGB8888, 4 * *w);
-+        /* postProcessScanlines() below unfilters straight into this buffer at
-+        the PNG's own native bpp (lodepng_get_bpp(&state->info_png.color)),
-+        not at the fixed 4 bytes/pixel this ARGB8888 draw_buf's default
-+        stride assumes -- any source with more than 32 bits per pixel (e.g.
-+        16-bit-per-channel RGBA, 64bpp) overflows a 4**w stride by exactly
-+        that much, corrupting whatever the allocator placed next on the
-+        heap. A real-device crash traced to exactly this: decoding a stock
-+        16-bit RGBA icon corrupted the heap silently, surfacing later as a
-+        segfault inside an unrelated free() call. Widening the stride to
-+        the larger of the two needs keeps this buffer correct for both the
-+        native unfilter step here and, when no color conversion turns out
-+        to be needed (lodepng_decode()'s "same color type" branch), for the
-+        final ARGB8888 image this same allocation becomes. */
-+        size_t native_bpp = lodepng_get_bpp(&state->info_png.color);
-+        size_t native_row_bytes = ((size_t)*w * native_bpp + 7u) / 8u;
-+        size_t argb8888_row_bytes = 4 * (size_t)*w;
-+        uint32_t stride = (uint32_t)(native_row_bytes > argb8888_row_bytes ? native_row_bytes : argb8888_row_bytes);
-+        lv_draw_buf_t * decoded = lv_draw_buf_create(*w, *h, LV_COLOR_FORMAT_ARGB8888, stride);
-         if(decoded) {
-             *out = (unsigned char*)decoded;
-             outsize = decoded->data_size;

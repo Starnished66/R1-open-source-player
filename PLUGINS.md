@@ -768,6 +768,14 @@ Each pool slot owns its own `on_select` callback. Backing out of a nested list
 therefore restores the earlier screen and its correct callback. Reusing a slot
 beyond four simultaneously stacked plugin lists remains unsupported.
 
+Icon rows inherit the native submenu design: board-scaled 44 px icons and
+96 px default list-row height, with a shared decoded blue gradient. Explicit
+row sizes and text sizes still take precedence. Plain text-only lists keep
+their compact rendering. Icon-bearing tap and toggle rows in
+`show_settings_list` use the same decoration without changing their control
+behavior; slider cards retain their existing layout. A custom `list_row`
+background color hides the gradient so theme overrides remain visible.
+
 ### `plugin.show_settings_list(title, items)`
 
 Opens a **settings submenu** -- indistinguishable from a native Settings

@@ -28,11 +28,16 @@
  * anything) remains exactly as bootable as it was before this call. */
 void installer_run(const scan_result_t * scan, bool fb_ready);
 
-/* The player to boot as "the internal copy": INSTALLED_PLAYER_PATH if it is
- * present and executable (a prior or just-completed install), else
- * INTERNAL_PLAYER_PATH (scanner.h) on a device that has never received one.
- * Call after installer_run() so a just-completed install is reflected on
- * the same boot, not just the next one. */
+/* Selects between arbitrary packaged/installed player paths using the same
+ * policy as installer_internal_player_path(). Exposed for host regression
+ * tests; returned pointers are exactly one of the two input pointers. */
+const char * installer_select_internal_player(const char * packaged, const char * installed);
+
+/* The player to boot as "the internal copy." Normally preserves the prior
+ * INSTALLED_PLAYER_PATH-first behavior, but removes that override and selects
+ * INTERNAL_PLAYER_PATH when both have trustworthy build stamps and the
+ * packaged player is strictly newer. Call after installer_run() so a
+ * just-completed install is reflected on the same boot. */
 const char * installer_internal_player_path(void);
 
 #endif /* BOOTLOADER_INSTALLER_H */

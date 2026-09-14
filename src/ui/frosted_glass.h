@@ -13,6 +13,8 @@ extern "C" {
 void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stride, int radius);
 
 uint16_t rgb888_to_565_dithered(int r, int g, int b, int x, int y);
+/* Non-periodic, coordinate-stable variant for full-screen frosted artwork. */
+uint16_t rgb888_to_565_spatial_dithered(int r, int g, int b, int x, int y);
 
 #ifdef __cplusplus
 }

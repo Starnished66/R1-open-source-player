@@ -1,4 +1,5 @@
 #include "assets.h"
+#include "frosted_glass.h"
 
 #include "lvgl.h"
 
@@ -146,6 +147,26 @@ void asset_decoded_image_close(asset_decoded_image_t * image) {
     if (image->open) lv_image_decoder_close(&image->decoder);
     free(image->path);
     memset(image, 0, sizeof(*image));
+}
+
+bool asset_decoded_gradient_open(asset_decoded_image_t * image, const char * relative_path) {
+    if (!asset_decoded_image_open(image, relative_path)) return false;
+    const lv_draw_buf_t * buffer = image->decoder.decoded;
+    if (buffer->header.cf != LV_COLOR_FORMAT_ARGB8888) return true;
+    /* Keep the decoder's owned ARGB buffer and its alpha plane. Expanding
+     * the dithered 565 result back to 888 makes the eventual framebuffer
+     * conversion exact without changing LVGL's image/decoder ownership. */
+    for (uint32_t y = 0; y < buffer->header.h; ++y) {
+        lv_color32_t * row = (lv_color32_t *) (buffer->data + y * buffer->header.stride);
+        for (uint32_t x = 0; x < buffer->header.w; ++x) {
+            uint16_t pixel = rgb888_to_565_dithered(row[x].red, row[x].green, row[x].blue, x, y);
+            uint8_t r = (pixel >> 11) & 31, g = (pixel >> 5) & 63, b = pixel & 31;
+            row[x].red = (r << 3) | (r >> 2);
+            row[x].green = (g << 2) | (g >> 4);
+            row[x].blue = (b << 3) | (b >> 2);
+        }
+    }
+    return true;
 }
 
 const void * asset_decoded_image_source(const asset_decoded_image_t * image) {

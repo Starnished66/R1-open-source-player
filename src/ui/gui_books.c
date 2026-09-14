@@ -288,6 +288,7 @@ static void plugin_books_list_item_click_cb(lv_event_t * e) {
 
 static lv_obj_t * build_books_screen(void) {
     static pill_list_item_t items[2 + PLUGIN_MAX_BOOKS_LIST_ITEMS];
+    lv_obj_t * native_rows[2 + PLUGIN_MAX_BOOKS_LIST_ITEMS] = { NULL };
     items[0] = (pill_list_item_t){ "Books", PILL_ACCESSORY_CHEVRON, false, books_files_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "Favorites", PILL_ACCESSORY_CHEVRON, false, books_favorites_row_cb, NULL, NULL };
 
@@ -298,7 +299,24 @@ static lv_obj_t * build_books_screen(void) {
                                     plugin_manager_get_books_list_item_options,
                                     plugin_books_list_item_click_cb);
 
-    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    for (int i = 0; i < count; ++i) items[i].out_row = &native_rows[i];
+    int icon_percent = (BOARD_SCALE_PX(44) * 100 + PILL_ROW_ICON_PX_DEFAULT - 1) / PILL_ROW_ICON_PX_DEFAULT;
+    lv_obj_t * scr = build_pill_list_screen("Books", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, icon_percent);
+    if (native_rows[0]) decorate_category_row(native_rows[0], "submenu/books.png", "submenu/bg_gold.png");
+    if (native_rows[1]) decorate_category_row(native_rows[1], "submenu/favorites.png", "submenu/bg_blue.png");
+    for (int i = 2; i < count; ++i) {
+        if (!native_rows[i]) continue;
+        if (items[i].icon_asset) {
+            lv_obj_t * label = lv_obj_get_child(native_rows[i], 0);
+            lv_obj_t * icon = lv_obj_get_child(native_rows[i], 1);
+            lv_obj_align(icon, LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(28), 0);
+            lv_obj_align(label, LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(96), 0);
+            lv_obj_update_layout(native_rows[i]);
+            configure_scrolling_row_label(label, lv_obj_get_width(native_rows[i]) - BOARD_SCALE_PX(96) - 60);
+        }
+        decorate_category_row(native_rows[i], NULL, "submenu/bg_green.png");
+    }
+    for (int i = 0; i < count; ++i) items[i].out_row = NULL;
     finalize_screen_navigation(scr);
     return scr;
 }

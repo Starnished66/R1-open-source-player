@@ -25,6 +25,16 @@ void box_blur_1d(const uint8_t * src, uint8_t * dst, int length, int stride, int
     }
 }
 
+static uint16_t rgb888_to_565_with_threshold(int r, int g, int b, int threshold) {
+    r += threshold / 8 - 4;
+    g += threshold / 16 - 2;
+    b += threshold / 8 - 4;
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+    return (uint16_t) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
 /* RGB565 has only 32 red/blue and 64 green levels, so a strong blur exposes
  * broad contour bands even though all filtering above is done in 8-bit
  * planes. Ordered 8x8 dithering trades those coherent bands for a tiny,
@@ -38,11 +48,19 @@ uint16_t rgb888_to_565_dithered(int r, int g, int b, int x, int y) {
         { 10,58, 6,54, 9,57, 5,53 }, { 42,26,38,22,41,25,37,21 }
     };
     int threshold = bayer8[y & 7][x & 7];
-    r += threshold / 8 - 4;
-    g += threshold / 16 - 2;
-    b += threshold / 8 - 4;
-    if (r < 0) r = 0; else if (r > 255) r = 255;
-    if (g < 0) g = 0; else if (g > 255) g = 255;
-    if (b < 0) b = 0; else if (b > 255) b = 255;
-    return (uint16_t) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+    return rgb888_to_565_with_threshold(r, g, b, threshold);
+}
+
+uint16_t rgb888_to_565_spatial_dithered(int r, int g, int b, int x, int y) {
+    /* Coordinate-only noise: immutable between redraws and decodes. Unlike
+     * the Bayer matrix it does not concentrate high/low pixels on alternate
+     * scanlines or columns across the full-screen Player background. Keep
+     * the same quantization amplitude; removing dither would restore bands. */
+    uint32_t h = (uint32_t)x * 0x1f123bb5u ^ (uint32_t)y * 0x5f356495u;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return rgb888_to_565_with_threshold(r, g, b, (int)(h >> 26));
 }

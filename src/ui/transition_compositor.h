@@ -94,7 +94,12 @@ bool transition_compositor_available(void);
  * would leave GUI-level state disagreeing with what's actually on screen. */
 bool transition_compositor_frame(int32_t v);
 
-/* Vertical opaque-overlay variant used by the quick drawer. On opening,
+/* Vertical overlay variant used by the quick drawer. `overlay` may be an
+ * opaque RGB565 buffer (the original memcpy fast path) or an unpremultiplied
+ * ARGB8888 buffer, which is alpha-blended over the saved RGB565 base. Both
+ * formats may have padded row strides; stride and data_size are validated
+ * against their respective 2- or 4-byte pixel size before composition.
+ * On opening,
  * the current physical display is copied into an owned stationary base.
  * That clean underlay can be retained while the drawer is open and reused
  * when closing; capturing the then-current framebuffer on close would
@@ -106,6 +111,11 @@ bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay,
                                                   int32_t fixed_top_rows,
                                                   bool reuse_saved_base);
 bool transition_compositor_vertical_overlay_frame(int32_t y);
+/* Testable production primitive used by the ARGB8888 vertical path. Blends
+ * straight-alpha BGRA rows over RGB565 while honoring independent strides. */
+void transition_compositor_blend_argb8888_over_rgb565(uint8_t * dst, uint32_t dst_stride,
+                                                       const uint8_t * src, uint32_t src_stride,
+                                                       int32_t width, int32_t height);
 /* Releases the retained drawer underlay once the drawer is fully closed. */
 void transition_compositor_discard_vertical_base(void);
 

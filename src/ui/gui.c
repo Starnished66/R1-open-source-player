@@ -92,7 +92,7 @@ gui_busy_handle_t import_web_stop_token = 0;
 #include "src/layouts/flex/lv_flex.h"
 #include "src/misc/lv_area.h"
 #include "src/draw/lv_draw_buf.h"
-#include "src/others/snapshot/lv_snapshot.h"
+#include "src/draw/snapshot/lv_snapshot.h"
 #include "src/core/lv_refr.h"
 #include "src/widgets/image/lv_image.h"
 #include "src/drivers/display/fb/lv_linux_fbdev.h"
@@ -1011,6 +1011,10 @@ static void update_timer_cb(lv_timer_t * timer) {
      * eliminating invisible slider/label rendering and asset I/O. */
     if (!backlight_screen_is_on()) return;
 
+    /* The slide displays frozen frames; defer purely visual refreshes until
+     * it settles, while keeping the playback/hardware polling above live. */
+    if (gui_navigation_transition_in_progress()) return;
+
     if (!gui_player_has_active_track() || gui_player_is_seeking()) return;
 
     gui_player_update_progress();
@@ -1297,19 +1301,21 @@ static void poll_dlna_control(void) {
 
 static lv_obj_t * build_stream_media_screen(void) {
     static icon_grid_item_t items[1 + PLUGIN_MAX_STREAM_TILES];
-    items[0] = (icon_grid_item_t){ "stream_media/subsonic.png", "stream_media/subsonic_s.png", "Subsonic", subsonic_tile_cb, NULL };
+    items[0] = (icon_grid_item_t){ "submenu/subsonic.png", NULL, "Subsonic", subsonic_tile_cb, NULL,
+                                  .bg_image = "submenu/bg_gold.png" };
 
     int count = 1;
     int plugin_count = plugin_manager_get_stream_tile_count();
     for (int i = 0; i < plugin_count && i < PLUGIN_MAX_STREAM_TILES; i++) {
         items[count++] = (icon_grid_item_t){
             plugin_manager_get_stream_tile_icon(i), plugin_manager_get_stream_tile_icon_selected(i),
-            plugin_manager_get_stream_tile_label(i), plugin_stream_tile_click_cb, (void *) (intptr_t) i
+            plugin_manager_get_stream_tile_label(i), plugin_stream_tile_click_cb, (void *) (intptr_t) i,
+            .bg_image = "submenu/bg_blue.png"
         };
     }
 
-    lv_obj_t * scr = build_launcher_menu_screen("Stream Media", generic_back_cb, items, count, 100, false,
-                                                 &launcher_layout_config.stream_media);
+    lv_obj_t * scr = build_category_menu_screen("Stream Media", generic_back_cb, items, count,
+                                                &launcher_layout_config.stream_media);
     finalize_screen_navigation(scr);
     return scr;
 }

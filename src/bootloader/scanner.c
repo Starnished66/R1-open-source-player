@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200112L
+#define _POSIX_C_SOURCE 200809L
 
 #include "scanner.h"
 #include "sd_ready.h"
@@ -36,13 +36,23 @@ static bool looks_like_build_stamp(const unsigned char * p) {
     for (int i = 11; i < 13; i++) if (!isdigit(p[i])) return false;
     if (p[13] != ':') return false;
     for (int i = 14; i < 16; i++) if (!isdigit(p[i])) return false;
-    return p[16] == '\0';
+    if (p[16] != '\0') return false;
+    int year = (p[0] - '0') * 1000 + (p[1] - '0') * 100 + (p[2] - '0') * 10 + p[3] - '0';
+    int month = (p[5] - '0') * 10 + p[6] - '0';
+    int day = (p[8] - '0') * 10 + p[9] - '0';
+    int hour = (p[11] - '0') * 10 + p[12] - '0';
+    int minute = (p[14] - '0') * 10 + p[15] - '0';
+    static const int days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (year == 0 || month < 1 || month > 12 || hour > 23 || minute > 59) return false;
+    int max_day = days[month - 1];
+    if (month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) max_day++;
+    return day >= 1 && day <= max_day;
 }
 
 /* Scans an executable binary in chunks for build stamps matching looks_like_build_stamp()
  * and selects the lexicographically maximum stamp found. */
 bool scanner_read_build_stamp(const char * path, char * out, size_t out_size) {
-    if (out_size <= BUILD_STAMP_LEN) return false;
+    if (!path || !out || out_size <= BUILD_STAMP_LEN) return false;
     FILE * f = fopen(path, "rb");
     if (!f) return false;
 
@@ -75,13 +85,15 @@ bool scanner_read_build_stamp(const char * path, char * out, size_t out_size) {
         memmove(buf, buf + total - carry, carry);
     }
 
-    if (found) {
+    /* A partial read cannot establish which embedded stamp is newest. */
+    bool read_ok = !ferror(f);
+    if (fclose(f) != 0) read_ok = false;
+    if (found && read_ok) {
         best[BUILD_STAMP_LEN] = '\0';
         memcpy(out, best, sizeof(best));
     }
 
-    fclose(f);
-    return found;
+    return found && read_ok;
 }
 
 void scanner_drop_sd_update_cache(void) {

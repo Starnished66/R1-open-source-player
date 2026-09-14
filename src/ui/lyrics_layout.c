@@ -1,5 +1,7 @@
 #include "lyrics_layout.h"
 
+#include "src/misc/lv_text_private.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -10,13 +12,13 @@ static int32_t fallback_stride(const lyrics_layout_t * layout) {
 static int32_t lyrics_line_glyph_overshoot(const char * text, const lv_font_t * font) {
     if (!text || !text[0] || !font) return 0;
     int32_t worst = 0;
-    /* uint32_t, not size_t -- _lv_text_encoded_next()'s own signature is
-     * uint32_t (*)(const char *, uint32_t *) (lv_text.h). See gui_track_info.c's
+    /* uint32_t, not size_t -- lv_text_encoded_next()'s own signature is
+     * uint32_t (*)(const char *, uint32_t *) (lv_text_private.h). See gui_track_info.c's
      * own comment on this exact same real correctness pitfall on a 64-bit host. */
     uint32_t i = 0;
     while (text[i] != '\0') {
-        uint32_t letter = _lv_text_encoded_next(text, &i);
-        if (_lv_text_is_marker(letter)) continue;
+        uint32_t letter = lv_text_encoded_next(text, &i);
+        if (lv_text_is_marker(letter)) continue;
         lv_font_glyph_dsc_t g_dsc;
         if (!lv_font_get_glyph_dsc(font, &g_dsc, letter, 0)) continue;
         if (g_dsc.box_w == 0 || g_dsc.box_h == 0) continue; /* ordinary whitespace, etc. -- nothing drawn */

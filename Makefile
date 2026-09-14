@@ -85,13 +85,13 @@ TINFL_SRCS = $(TINFL_DIR)/miniz_tinfl.c
 
 # Self-bootstrap: clone dependencies if they don't exist yet before evaluating variables
 ifeq ($(wildcard $(LVGL_DIR)),)
-$(info Cloning LVGL v9.1.0...)
-$(shell git clone --depth 1 -b v9.1.0 https://github.com/lvgl/lvgl.git)
+$(info Cloning LVGL v9.5.0...)
+$(shell git clone --depth 1 -b v9.5.0 https://github.com/lvgl/lvgl.git)
 endif
 
 # This project's own LVGL checkout (gitignored -- real upstream source,
 # not ours to redistribute) carries three categories of local
-# customization that upstream v9.1.0 does not have, all needed for a
+# customization that upstream v9.5.0 does not have, all needed for a
 # clean GitHub clone to both LINK and BEHAVE like this developer's tree
 # (see ISSUES.md's "clean GitHub clones cannot link the transition
 # compositor" entry -- fixing only the first category still leaves a
@@ -107,51 +107,44 @@ endif
 #      entirely from upstream -- a clean clone fails to link with
 #      "undefined reference to `lv_linux_fbdev_get_active_page'" (and the
 #      other five) the moment either caller is linked in.
-#   2. runtime fixes (patches/lvgl_runtime_fixes.patch): five small
-#      genuine upstream bugs/limitations this app hit in practice, not
-#      feature work -- lv_tiny_ttf_init()/_deinit() missing a null-guard (a
-#      second init call, or deinit after a failed init, double-destroys/
-#      leaks the shared font cache) plus two error paths in
-#      lv_tiny_ttf_create() that leaked an open font-file handle;
-#      _lv_cache_lru_rb.c's drop_all_cb() destroyed the cache's red-black
-#      tree without reinitializing it, so any cache use after a full clear
-#      (e.g. a settings change that invalidates cached UI bitmaps) operated
-#      on a destroyed tree; tjpgdcnf.h's JD_USE_SCALE was left at the
-#      upstream default of 0, disabling TJpgDec's own output downscaling
-#      that this app's album-art path uses to decode cover JPEGs at the
-#      largest 2^n that still covers the target, then cover-fit, instead of
-#      full-size-then-software-resize (see ISSUES.md's Albums-screen
-#      overheat/OOM entry); tjpgd.c's jd_mcu_output was also missing ChaN's
-#      1/2 and 1/4 MCU averaging and 1/8 DC RGB path, so scale!=0 was unusable
-#      until restored here (BGR order, matching this copy's full-MCU loop);
-#      lv_tiny_ttf_init() also hardcoded its shared rasterized-glyph LRU
-#      cache to 128 entries -- fine for this app's default Montserrat
-#      tiers, which are pre-baked bitmap fonts (lv_font_montserrat_*, see
-#      the generated-fonts category below) that never touch this cache at
-#      all, but the moment Settings > Display > Font applies a custom SD
-#      card .ttf, every one of app_font_16/20/22/28/lyrics (fallback_font.c)
-#      becomes a runtime-rasterized tiny_ttf instance sharing this one
-#      global cache -- a scrolling list cycling through more distinct
-#      glyphs than that across those sizes evicts and re-rasterizes
-#      (STB truetype software rasterization) on nearly every frame, which
-#      is exactly the real-device report ("selecting an SD card font lags
-#      the device, scroll lists become slow"). Bumped to 512: each cached
-#      glyph is a small LV_COLOR_FORMAT_A8 bitmap sized to its own glyph
-#      box (tiny_ttf_cache_create_cb()), so worst case (512 of the largest
-#      BlindMF-tier glyphs) is still under ~1MB against this device's
-#      ~19MB available RAM, comfortably covering several font sizes' full
-#      alphanumeric+punctuation working sets at once without the earlier
-#      128-entry thrashing. lodepng.c's decodeGeneric() sized the buffer it
-#      unfilters a PNG's native-depth scanlines into as a hardcoded 4 bytes/
-#      pixel (an ARGB8888-shaped stride), but postProcessScanlines() writes
-#      that buffer at the PNG's own native bpp -- any source with more than
-#      32 bits per pixel (16-bit-per-channel RGBA is 64bpp) overflowed that
-#      buffer by exactly the difference, corrupting the heap. Real-device
-#      report: decoding a stock 16-bit RGBA icon (copied in from an R3 Pro
-#      II firmware dump for the in-progress port) silently corrupted the
-#      heap, surfacing later as a segfault inside an unrelated free() call
-#      and a reboot-on-crash loop. Fixed by sizing that buffer's stride to
-#      the larger of the native row width and the ARGB8888 row width.
+#   2. runtime fixes (patches/lvgl_runtime_fixes.patch): a null-parent guard
+#      in layout invalidation prevents the 9.5 splash-to-UI crash when
+#      unhiding the parentless top layer; plus genuine upstream
+#      bugs/limitations this app hit in practice, not feature work --
+#      lv_tiny_ttf_create() still leaks an open font-file handle on two
+#      error paths (stbtt_InitFont failure and out-of-memory allocating
+#      the lv_font_t); 9.5 dropped the old global lv_tiny_ttf_init() cache
+#      (caches are now per-font) so the 9.1 128->512 global bump lives in
+#      lv_conf.h as LV_TINY_TTF_CACHE_GLYPH_CNT 512 instead -- needed the
+#      moment Settings > Display > Font applies a custom SD card .ttf,
+#      when app_font_16/20/22/28/lyrics (fallback_font.c) become runtime-
+#      rasterized tiny_ttf instances (a scrolling list cycling through
+#      more distinct glyphs than a 128-entry cache evicts and re-rasterizes
+#      on nearly every frame; real-device report: "selecting an SD card
+#      font lags the device, scroll lists become slow");
+#      src/misc/cache/class/lv_cache_lru_rb.c's drop_all_cb() still
+#      destroys the cache's red-black tree without reinitializing it, so
+#      any cache use after a full clear (e.g. a settings change that
+#      invalidates cached UI bitmaps) operated on a destroyed tree;
+#      tjpgdcnf.h's JD_USE_SCALE is still the upstream default of 0,
+#      disabling TJpgDec's own output downscaling that this app's album-art
+#      path uses to decode cover JPEGs at the largest 2^n that still covers
+#      the target, then cover-fit, instead of full-size-then-software-resize
+#      (see ISSUES.md's Albums-screen overheat/OOM entry); tjpgd.c's
+#      jd_mcu_output is also still missing ChaN's 1/2 and 1/4 MCU averaging
+#      and 1/8 DC RGB path, so scale!=0 was unusable until restored here
+#      (BGR order, matching this copy's full-MCU loop); lodepng.c's
+#      decodeGeneric() still sizes the buffer it unfilters a PNG's native-
+#      depth scanlines into as a hardcoded 4 bytes/pixel (an ARGB8888-
+#      shaped stride), but postProcessScanlines() writes that buffer at the
+#      PNG's own native bpp -- any source with more than 32 bits per pixel
+#      (16-bit-per-channel RGBA is 64bpp) overflowed that buffer by exactly
+#      the difference, corrupting the heap. Real-device report: decoding a
+#      stock 16-bit RGBA icon (copied in from an R3 Pro II firmware dump
+#      for the in-progress port) silently corrupted the heap, surfacing
+#      later as a segfault inside an unrelated free() call and a reboot-on-
+#      crash loop. Fixed by sizing that buffer's stride to the larger of
+#      the native row width and the ARGB8888 row width.
 #   3. generated fonts (patches/lvgl_generated_fonts/, copied in whole
 #      rather than diffed): ten Montserrat .c files regenerated with an
 #      expanded lv_font_conv codepoint range (Latin-1 Supplement +
@@ -177,9 +170,9 @@ endif
 #      copies rather than a text diff -- diffing them would be both far
 #      larger than the files themselves and fragile to patch fuzz.
 #
-# LVGL_PINNED_COMMIT is v9.1.0's tag commit (the tag object peels to this
+# LVGL_PINNED_COMMIT is v9.5.0's tag commit (the tag object peels to this
 # -- `git ls-remote https://github.com/lvgl/lvgl.git refs/tags/
-# v9.1.0^{}`), checked before touching anything so none of the three
+# v9.5.0^{}`), checked before touching anything so none of the three
 # categories above can silently apply to a different LVGL revision and
 # produce a corrupted tree.
 #
@@ -216,13 +209,14 @@ LVGL_PATCH := patches/lvgl_fbdev_compositor.patch
 LVGL_RUNTIME_FIXES_PATCH := patches/lvgl_runtime_fixes.patch
 LVGL_GENERATED_FONTS_DIR := patches/lvgl_generated_fonts
 LVGL_GENERATED_FONTS := lv_font_montserrat_16.c lv_font_montserrat_20.c lv_font_montserrat_22.c lv_font_montserrat_24.c lv_font_montserrat_26.c lv_font_montserrat_28.c lv_font_montserrat_30.c lv_font_montserrat_32.c lv_font_montserrat_34.c lv_font_montserrat_40.c
-LVGL_PINNED_COMMIT := e1c0b21b2723d391b885de4b2ee5cc997eccca91
+LVGL_PINNED_COMMIT := 85aa60d18b3d5e5588d7b247abf90198f07c8a63
 LVGL_FBDEV_C := $(LVGL_DIR)/src/drivers/display/fb/lv_linux_fbdev.c
 LVGL_FBDEV_H := $(LVGL_DIR)/src/drivers/display/fb/lv_linux_fbdev.h
 LVGL_TINY_TTF := $(LVGL_DIR)/src/libs/tiny_ttf/lv_tiny_ttf.c
 LVGL_TJPGDCNF := $(LVGL_DIR)/src/libs/tjpgd/tjpgdcnf.h
-LVGL_LRU_RB := $(LVGL_DIR)/src/misc/cache/_lv_cache_lru_rb.c
+LVGL_LRU_RB := $(LVGL_DIR)/src/misc/cache/class/lv_cache_lru_rb.c
 LVGL_LODEPNG := $(LVGL_DIR)/src/libs/lodepng/lodepng.c
+LVGL_OBJ_POS := $(LVGL_DIR)/src/core/lv_obj_pos.c
 LVGL_FONT_TARGETS := $(LVGL_GENERATED_FONTS:%=$(LVGL_DIR)/src/font/%)
 LVGL_FONT_GOLDEN := $(LVGL_GENERATED_FONTS:%=$(LVGL_GENERATED_FONTS_DIR)/%)
 LVGL_PATCH_STAMP := $(LVGL_DIR)/.lvgl_fbdev_patch_applied
@@ -306,8 +300,8 @@ endif
 # so this is vendored and cross-compiled the same way as every other
 # dependency here rather than relying on anything already on the device.
 ifeq ($(wildcard $(MBEDTLS_DIR)),)
-$(info Cloning mbedTLS v3.6.2...)
-$(shell git clone --depth 1 -b v3.6.2 https://github.com/Mbed-TLS/mbedtls.git)
+$(info Cloning mbedTLS v3.6.7...)
+$(shell git clone --depth 1 -b v3.6.7 https://github.com/Mbed-TLS/mbedtls.git)
 endif
 
 # cJSON (MIT, single .c/.h pair) -- both Subsonic (?f=json) and Jellyfin
@@ -686,12 +680,12 @@ $(HOST_BIN): $(HOST_OBJS)
 # on the tracked patch file (so a future change to the patch itself also
 # invalidates it), not just on $(LVGL_DIR) existing.
 $(LVGL_PATCH_STAMP): $(LVGL_FBDEV_C) $(LVGL_FBDEV_H) $(LVGL_PATCH) \
-                     $(LVGL_TINY_TTF) $(LVGL_TJPGDCNF) $(LVGL_LRU_RB) $(LVGL_LODEPNG) $(LVGL_RUNTIME_FIXES_PATCH) \
+                     $(LVGL_TINY_TTF) $(LVGL_TJPGDCNF) $(LVGL_LRU_RB) $(LVGL_LODEPNG) $(LVGL_OBJ_POS) $(LVGL_RUNTIME_FIXES_PATCH) \
                      $(LVGL_FONT_TARGETS) $(LVGL_FONT_GOLDEN)
 	@set -e; \
 	actual_commit=$$(git -C $(LVGL_DIR) rev-parse HEAD 2>/dev/null || echo ""); \
 	if [ "$$actual_commit" != "$(LVGL_PINNED_COMMIT)" ]; then \
-	  echo "ERROR: $(LVGL_DIR) is at commit '$$actual_commit', not the pinned LVGL v9.1.0 commit $(LVGL_PINNED_COMMIT)."; \
+	  echo "ERROR: $(LVGL_DIR) is at commit '$$actual_commit', not the pinned LVGL v9.5.0 commit $(LVGL_PINNED_COMMIT)."; \
 	  echo "       This repo's LVGL patches/golden files are only known to apply cleanly to that exact revision."; \
 	  echo "       Remove $(LVGL_DIR) and re-run make to re-clone the pinned tag, or update"; \
 	  echo "       LVGL_PINNED_COMMIT and the patches/golden files together if intentionally bumping LVGL."; \
@@ -734,7 +728,7 @@ $(LVGL_PATCH_STAMP): $(LVGL_FBDEV_C) $(LVGL_FBDEV_H) $(LVGL_PATCH) \
 	  }; \
 	  echo "LVGL runtime-fixes patch applied successfully."; \
 	else \
-	  echo "ERROR: $(LVGL_DIR) matches the pinned commit $(LVGL_PINNED_COMMIT) but tiny_ttf/tjpgd/lru-rb/lodepng are"; \
+	  echo "ERROR: $(LVGL_DIR) matches the pinned commit $(LVGL_PINNED_COMMIT) but layout/tiny_ttf/tjpgd/lru-rb/lodepng are"; \
 	  echo "       neither a pristine match for $(LVGL_RUNTIME_FIXES_PATCH) nor an exact match for its"; \
 	  echo "       already-applied result. Remove $(LVGL_DIR) and re-run make to start from a clean checkout."; \
 	  exit 1; \
@@ -845,6 +839,14 @@ BOOTLOADER_SRCS = src/bootloader/main.c src/bootloader/fb_draw.c src/bootloader/
 # in full, so this actually earns its keep here rather than being cargo-cult.
 BOOTLOADER_CFLAGS = -O2 -Wall -I. -Isrc/bootloader -Isrc/hardware -Isrc/core $(BOARD_DEFINE) -ffunction-sections -fdata-sections
 
+.PHONY: bootloader-player-selftest
+bootloader-player-selftest:
+	@mkdir -p build_bootloader_test
+	$(CC) -O0 -g -Wall -Wextra -ffunction-sections -fdata-sections -Isrc/bootloader -Isrc/core \
+	    src/bootloader/player_selection_test.c src/bootloader/scanner.c src/bootloader/installer.c \
+	    -Wl,--gc-sections -Wl,--wrap=unlink -o build_bootloader_test/player_selection_test
+	./build_bootloader_test/player_selection_test
+
 bootloader:
 	@mkdir -p $(BUILD_TARGET_DIR)
 	$(CROSS_CC) $(BOOTLOADER_CFLAGS) -static -no-pie $(BOOTLOADER_SRCS) -o $(BUILD_TARGET_DIR)/$(BOOTLOADER_BIN)_unstripped -Wl,--gc-sections
@@ -867,7 +869,7 @@ sd_ready_test:
 .PHONY: ui-style-selftest
 # Headless real-LVGL layout tests: no SDL development package or device
 # required. Keep these objects separate from both production configurations.
-UI_STYLE_TEST_SRCS = $(LVGL_SRCS) src/ui/screen_builders.c src/ui/gui_theme.c src/ui/gui_notifications.c src/ui/gui_plugins.c src/ui/screen_builders_test.c
+UI_STYLE_TEST_SRCS = $(LVGL_SRCS) src/ui/screen_builders.c src/ui/gui_theme.c src/ui/gui_notifications.c src/ui/gui_plugins.c src/ui/transition_compositor.c src/ui/frosted_glass.c src/ui/screen_builders_test.c
 UI_STYLE_TEST_OBJS = $(UI_STYLE_TEST_SRCS:%.c=build_ui_test/%.o)
 ui-style-selftest: build_ui_test/ui_style_test
 	./build_ui_test/ui_style_test

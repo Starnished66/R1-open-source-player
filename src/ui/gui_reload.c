@@ -80,6 +80,7 @@
 #include "gui_reload.h"
 
 #include "lvgl/lvgl.h"
+#include "src/misc/cache/instance/lv_image_cache.h"
 
 #include <fcntl.h>
 #include <stdio.h>

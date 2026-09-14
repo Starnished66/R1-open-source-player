@@ -4557,21 +4557,16 @@ static void music_screen_playback_settings_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_music_screen(void) {
-    static icon_grid_item_t items[6];
-    items[0] = (icon_grid_item_t){ "category/explorer.png", "category/explorer_s.png", "Files", music_files_tile_cb, NULL };
-    items[1] = (icon_grid_item_t){ "category/artist.png", "category/artist_s.png", "Artists", artists_tile_cb, NULL };
-    items[2] = (icon_grid_item_t){ "category/album.png", "category/album_s.png", "Albums", albums_tile_cb, NULL };
-    items[3] = (icon_grid_item_t){ "category/album_artist.png", "category/album_artist_s.png", "Album Artist", album_artist_tile_cb, NULL };
-    items[4] = (icon_grid_item_t){ "category/all.png", "category/all_s.png", "All Songs", all_songs_tile_cb, NULL };
-    /* No dedicated "playlist" icon exists anywhere in the stock theme pack
-     * (assets/theme2/category/ has album/album_artist/all/artist/explorer/
-     * genre/item/net_radio and nothing else playlist-shaped) -- reusing
-     * genre.png/genre_s.png here since Genres no longer has a tile of its
-     * own to need it. */
-    items[5] = (icon_grid_item_t){ "category/genre.png", "category/genre_s.png", "Playlists", playlists_tile_cb, NULL };
-    // icon size percentage is scaled using BOARD_SCALE_PX which is relative to device screen width, so that it look a similar size on all devices
-    lv_obj_t * scr = build_launcher_menu_screen("Music", generic_back_cb, items, 6, BOARD_SCALE_PX(100), false,
-                                                 &launcher_layout_config.music);
+    const icon_grid_item_t items[] = {
+        { "submenu/files.png", NULL, "Files", music_files_tile_cb, NULL, .bg_image = "submenu/bg_gold.png" },
+        { "submenu/artists.png", NULL, "Artists", artists_tile_cb, NULL, .bg_image = "submenu/bg_blue.png" },
+        { "submenu/albums.png", NULL, "Albums", albums_tile_cb, NULL, .bg_image = "submenu/bg_green.png" },
+        { "submenu/album_artist.png", NULL, "Album Artist", album_artist_tile_cb, NULL, .bg_image = "submenu/bg_silver.png" },
+        { "submenu/all_songs.png", NULL, "All Songs", all_songs_tile_cb, NULL, .bg_image = "submenu/bg_purple.png" },
+        { "submenu/playlists.png", NULL, "Playlists", playlists_tile_cb, NULL, .bg_image = "submenu/bg_coral.png" },
+    };
+    lv_obj_t * scr = build_category_menu_screen("Music", generic_back_cb, items, 6,
+                                                &launcher_layout_config.music);
     /* Same real stock-firmware gear icon as the Queue screen's own Options
      * button (sub_back/set.png) -- build_top_right_icon_button() guarantees
      * it lands at exactly the same visual level as this screen's own back

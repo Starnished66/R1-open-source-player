@@ -470,7 +470,7 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes, int blur_radius,
             int rv = bilerp_plane(r, w, h, x_fp, y_fp) * darken_num / darken_den;
             int gv = bilerp_plane(g, w, h, x_fp, y_fp) * darken_num / darken_den;
             int bv = bilerp_plane(b, w, h, x_fp, y_fp) * darken_num / darken_den;
-            out_row[x] = rgb888_to_565_dithered(rv, gv, bv, x, y);
+            out_row[x] = rgb888_to_565_spatial_dithered(rv, gv, bv, x, y);
         }
     }
 #undef REFLECTION_UPSAMPLE_YIELD_ROWS
@@ -978,6 +978,10 @@ static void fit_cover_img_to_card(void) {
  * one is now either running or about to be), in which case the result is
  * just discarded rather than briefly flashing a stale track's art. */
 void poll_cover_decode(void) {
+    /* Slides display owned snapshots. Applying artwork now cannot update
+     * those frames, but image/layout work can delay their presentation.
+     * Leave the completed result owned by the worker until the next poll. */
+    if (gui_navigation_transition_in_progress()) return;
     if (!cover_decode_active || !atomic_load_explicit(&cover_decode_done_flag, memory_order_acquire)) return;
     cover_decode_active = false;
     pthread_join(cover_decode_thread, NULL);
@@ -2254,6 +2258,23 @@ static void pending_progress_seek_timer_cb(lv_timer_t * timer) {
     audio_seek_percent(pending_progress_seek_percent);
 }
 
+static void player_label_enable_marquee(lv_obj_t * label) {
+    static lv_anim_t player_marquee_anim;
+    static bool initialized = false;
+    if (!initialized) {
+        lv_anim_init(&player_marquee_anim);
+        lv_anim_set_delay(&player_marquee_anim, 3000);
+        lv_anim_set_repeat_delay(&player_marquee_anim, 3000);
+        initialized = true;
+    }
+
+    /* Local style properties outrank row_label_enable_marquee()'s shared
+     * style. Install the player-only pause before that helper enables and
+     * refreshes circular scrolling, while retaining its speed duration. */
+    lv_obj_set_style_anim(label, &player_marquee_anim, LV_PART_MAIN);
+    row_label_enable_marquee(label);
+}
+
 static void progress_slider_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * slider = lv_event_get_target(e);
@@ -2346,7 +2367,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_pos(song_title_label, player_x(22), player_y(44));
     lv_obj_set_size(song_title_label, BOARD_SCREEN_WIDTH - 2 * player_x(22),
                     reference_player ? lv_font_get_line_height(player_title_font) : player_y(32));
-    row_label_enable_marquee(song_title_label);
+    player_label_enable_marquee(song_title_label);
 
     song_album_label = lv_label_create(scr);
     lv_label_set_text(song_album_label, "");
@@ -2359,7 +2380,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * albums. Content height also accommodates updated font metrics. */
     lv_obj_set_size(song_album_label, BOARD_SCREEN_WIDTH - 2 * player_x(22), LV_SIZE_CONTENT);
     lv_obj_set_style_min_height(song_album_label, player_y(36), 0);
-    row_label_enable_marquee(song_album_label);
+    player_label_enable_marquee(song_album_label);
 
     song_folder_label = lv_label_create(scr); /* holds ARTIST text, keep this name */
     lv_label_set_text(song_folder_label, "");
@@ -2372,7 +2393,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * fonts) while retaining the fixed width for horizontal overflow. */
     lv_obj_set_size(song_folder_label, BOARD_SCREEN_WIDTH - 2 * player_x(22),
                     LV_SIZE_CONTENT);
-    row_label_enable_marquee(song_folder_label);
+    player_label_enable_marquee(song_folder_label);
 
     /* Back/dismiss button. build_header_back_button()'s shared 64x64 default
      * (TITLE_ROW_HEIGHT, used by every other screen's header) would reach
@@ -2398,7 +2419,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     quality_pill = lv_obj_create(scr);
     lv_obj_remove_style_all(quality_pill);
     /* Height fixed, not LV_SIZE_CONTENT -- format_badge_label's marquee
-     * (row_label_enable_marquee() below) re-lays-out on its own continuous
+     * (player_label_enable_marquee() below) re-lays-out on its own continuous
      * timer, and an LV_SIZE_CONTENT height here let that same tick jitter
      * this pill's own bounding box (top-anchored via lv_obj_align below),
      * seen on a real device as a flickering line at the pill's top/bottom
@@ -2414,23 +2435,15 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_style_radius(quality_pill, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(quality_pill, LV_OPA_20, 0);
     lv_obj_set_style_bg_color(quality_pill, lv_color_hex(0x000000), 0);
-    lv_obj_add_style(quality_pill, gui_theme_accent_outline_style(), 0);
     lv_obj_remove_flag(quality_pill, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* A native waveform keeps the badge independent of stock image assets. */
-    lv_obj_t * waveform = lv_obj_create(quality_pill);
-    lv_obj_remove_style_all(waveform);
-    lv_obj_set_size(waveform, player_s(20), player_s(20));
-    lv_obj_remove_flag(waveform, LV_OBJ_FLAG_SCROLLABLE);
-    for (int i = 0; i < 5; ++i) {
-        const int heights[] = { 8, 14, 20, 12, 6 };
-        lv_obj_t * bar = lv_obj_create(waveform);
-        lv_obj_remove_style_all(bar);
-        lv_obj_set_size(bar, player_s(2), player_s(heights[i]));
-        lv_obj_set_pos(bar, player_s(i * 4), (player_s(20) - player_s(heights[i])) / 2);
-        lv_obj_add_style(bar, gui_theme_accent_style(), 0);
-        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-    }
+    lv_obj_t * quality_waveform = lv_image_create(quality_pill);
+    lv_image_set_src(quality_waveform, asset_path("playing_plane/quality_waveform.png"));
+    lv_image_set_scale(quality_waveform, (player_s(20) * LV_SCALE_NONE) / 20);
+    lv_obj_set_size(quality_waveform, player_s(20), player_s(20));
+    lv_obj_add_style(quality_waveform, gui_theme_accent_style(), 0);
+    lv_obj_set_style_bg_opa(quality_waveform, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_image_recolor_opa(quality_waveform, LV_OPA_COVER, 0);
 
     format_badge_label = lv_label_create(quality_pill);
     lv_label_set_text(format_badge_label, "");
@@ -2439,7 +2452,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     /* Bound unusually long codec descriptions without clipping the ring. */
     lv_obj_set_style_max_width(format_badge_label,
                               BOARD_SCREEN_WIDTH - 2 * player_x(30) - player_s(64), 0);
-    row_label_enable_marquee(format_badge_label);
+    player_label_enable_marquee(format_badge_label);
 
     /* Progress bar (native rail, not the old fixed PNG sprites) */
     progress_slider = lv_slider_create(scr);

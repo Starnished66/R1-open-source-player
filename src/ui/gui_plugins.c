@@ -127,7 +127,7 @@ int gui_plugin_show_list(const char * title, const char * const * labels, const 
     }
     bool use_container_rows = any_icon || height > 0 || width > 0;
 
-    int32_t row_h = LIST_ROW_HEIGHT;
+    int32_t row_h = any_icon ? BOARD_SCALE_PX(96) : LIST_ROW_HEIGHT;
     if (height > 0) {
         row_h = height;
         if (row_h < PILL_ROW_HEIGHT_MIN) row_h = PILL_ROW_HEIGHT_MIN;
@@ -167,9 +167,10 @@ int gui_plugin_show_list(const char * title, const char * const * labels, const 
         lv_obj_t * row = lv_obj_create(list);
         lv_obj_set_size(row, row_w, row_h);
         lv_obj_set_style_radius(row, LIST_ROW_RADIUS, 0);
-        lv_obj_set_style_bg_color(row, LIST_ROW_BG_COLOR, 0);
+        lv_obj_add_style(row, &pill_row_bg_style, 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_style(row, &list_row_pressed_style, LV_STATE_PRESSED);
 
@@ -180,10 +181,14 @@ int gui_plugin_show_list(const char * title, const char * const * labels, const 
          * existing show_list() row font, so a row without an explicit
          * text_size still renders at its previous size. */
         lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size ? text_size : "medium"), 0);
-        lv_obj_align(label, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
-        pill_row_apply_icon(row, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, LIST_ROW_LABEL_INSET, 0);
-        int32_t label_left = LIST_ROW_LABEL_INSET + (icon ? PILL_ROW_ICON_PX_DEFAULT + BOARD_SCALE_PX(12) : 0);
+        int32_t label_left = icon ? BOARD_SCALE_PX(96) : LIST_ROW_LABEL_INSET;
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, label_left, 0);
+        pill_row_apply_icon(row, label, icon, BOARD_SCALE_PX(44), LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(28), 0);
+        /* The icon helper sets a compact default inset; match the native
+         * category text column after installing the plugin's icon. */
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, label_left, 0);
         configure_scrolling_row_label(label, row_w - label_left - LIST_ROW_LABEL_INSET);
+        if (icon) decorate_category_row(row, NULL, "submenu/bg_blue.png");
 
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         intptr_t packed = ((intptr_t) slot << 16) | (intptr_t) (i & 0xFFFF);
@@ -670,12 +675,15 @@ static void populate_plugin_settings_list_screen(int slot) {
             lv_obj_add_event_cb(row_obj, plugin_settings_toggle_row_click_cb, LV_EVENT_CLICKED, packed);
             lv_obj_t * label = lv_obj_get_child(row_obj, 0); /* add_pill_row_base()'s own child-0-is-the-label layout */
             lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
-            pill_row_apply_icon(row_obj, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
+            pill_row_apply_icon(row_obj, label, icon, BOARD_SCALE_PX(44), LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(28), 0);
             apply_plugin_pill_row_resize(row_obj, st->row_height, st->row_width);
             int32_t row_width = st->row_width > 0 ? st->row_width : pill_row_default_width();
             if (row_width < PILL_ROW_WIDTH_MIN) row_width = PILL_ROW_WIDTH_MIN;
             if (row_width > PILL_ROW_WIDTH_MAX) row_width = PILL_ROW_WIDTH_MAX;
-            configure_scrolling_row_label(label, row_width - BOARD_SCALE_PX(24) - (icon ? PILL_ROW_ICON_PX_DEFAULT + BOARD_SCALE_PX(12) : 0) - BOARD_SCALE_PX(112));
+            int32_t left = icon ? BOARD_SCALE_PX(96) : BOARD_SCALE_PX(24);
+            lv_obj_align(label, LV_ALIGN_LEFT_MID, left, 0);
+            configure_scrolling_row_label(label, row_width - left - BOARD_SCALE_PX(112));
+            if (icon) decorate_category_row(row_obj, NULL, "submenu/bg_blue.png");
         } else if (st->type == PLUGIN_SETTINGS_ROW_SLIDER) {
             lv_obj_t * card = add_pill_slider_row(list, st->label, st->slider_min, st->slider_max, st->slider_value,
                                                    plugin_settings_slider_event_cb, packed, icon, text_size);
@@ -698,12 +706,15 @@ static void populate_plugin_settings_list_screen(int slot) {
             lv_obj_add_event_cb(row_obj, plugin_settings_tap_row_click_cb, LV_EVENT_CLICKED, packed);
             lv_obj_t * label = lv_obj_get_child(row_obj, 0);
             lv_obj_set_style_text_font(label, pill_row_resolve_text_size(text_size), 0);
-            pill_row_apply_icon(row_obj, label, icon, PILL_ROW_ICON_PX_DEFAULT, LV_ALIGN_LEFT_MID, 24, 0);
+            pill_row_apply_icon(row_obj, label, icon, BOARD_SCALE_PX(44), LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(28), 0);
             apply_plugin_pill_row_resize(row_obj, st->row_height, st->row_width);
             int32_t row_width = st->row_width > 0 ? st->row_width : pill_row_default_width();
             if (row_width < PILL_ROW_WIDTH_MIN) row_width = PILL_ROW_WIDTH_MIN;
             if (row_width > PILL_ROW_WIDTH_MAX) row_width = PILL_ROW_WIDTH_MAX;
-            configure_scrolling_row_label(label, row_width - BOARD_SCALE_PX(24) - (icon ? PILL_ROW_ICON_PX_DEFAULT + BOARD_SCALE_PX(12) : 0) - BOARD_SCALE_PX(60));
+            int32_t left = icon ? BOARD_SCALE_PX(96) : BOARD_SCALE_PX(24);
+            lv_obj_align(label, LV_ALIGN_LEFT_MID, left, 0);
+            configure_scrolling_row_label(label, row_width - left - BOARD_SCALE_PX(60));
+            if (icon) decorate_category_row(row_obj, NULL, "submenu/bg_blue.png");
         }
     }
 }

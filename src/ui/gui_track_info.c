@@ -3,6 +3,7 @@
 #include "gui.h"
 #include "gui_theme.h"
 #include "screen_builders.h"
+#include "src/misc/lv_text_private.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -123,7 +124,7 @@ static void wrap_text_to_width(const char * src, char * out, size_t out_size, co
     size_t out_pos = 0;
     int32_t cur_line_w = 0;
 
-    /* uint32_t, not size_t -- _lv_text_encoded_next()'s own signature is
+    /* uint32_t, not size_t -- lv_text_encoded_next()'s own signature is
      * uint32_t (*)(const char *, uint32_t *) (lv_text_private.h). On a
      * 32-bit target size_t and uint32_t are the same width, so this built
      * silently there, but on a 64-bit host passing a size_t* (8 bytes)
@@ -145,8 +146,8 @@ static void wrap_text_to_width(const char * src, char * out, size_t out_size, co
         uint32_t token_start = i;
         int32_t token_w = 0;
         while (src[i] != '\0' && src[i] != '\n') {
-            uint32_t letter = _lv_text_encoded_next(src, &i);
-            uint32_t next_letter = src[i] ? _lv_text_encoded_next(src, NULL) : 0;
+            uint32_t letter = lv_text_encoded_next(src, &i);
+            uint32_t next_letter = src[i] ? lv_text_encoded_next(src, NULL) : 0;
             token_w += lv_font_get_glyph_width(font, letter, next_letter);
 
             if (letter == '/' || letter == ' ' || letter == '-' || letter == '_' ||
@@ -174,8 +175,8 @@ static void wrap_text_to_width(const char * src, char * out, size_t out_size, co
                 uint32_t c_idx = token_start;
                 while (c_idx < token_start + token_bytes && out_pos + 1 < out_size) {
                     uint32_t char_start = c_idx;
-                    uint32_t letter = _lv_text_encoded_next(src, &c_idx);
-                    uint32_t next_letter = (c_idx < token_start + token_bytes) ? _lv_text_encoded_next(src, NULL) : 0;
+                    uint32_t letter = lv_text_encoded_next(src, &c_idx);
+                    uint32_t next_letter = (c_idx < token_start + token_bytes) ? lv_text_encoded_next(src, NULL) : 0;
                     int32_t glyph_w = lv_font_get_glyph_width(font, letter, next_letter);
                     uint32_t char_len = c_idx - char_start;
 

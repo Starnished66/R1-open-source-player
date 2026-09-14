@@ -2,6 +2,10 @@
 #define ASSETS_H
 
 #include "lvgl.h"
+/* lv_image_decoder_dsc_t / lv_image_decoder_args_t moved behind the private
+ * decoder header in LVGL 9.2+. asset_decoded_image_t embeds a decoder
+ * session so large PNGs can stay decoded across animation frames. */
+#include "src/draw/lv_image_decoder_private.h"
 
 /* Real UI assets, straight from the stock HiBy firmware's own theme2 (dark)
  * resource pack -- not ours to redistribute, so nothing is vendored into
@@ -45,6 +49,9 @@ typedef struct {
 } asset_decoded_image_t;
 
 bool asset_decoded_image_open(asset_decoded_image_t * image, const char * relative_path);
+/* Pre-quantize smooth backgrounds with fixed ordered dithering for RGB565.
+ * Alpha is preserved; run once at load, never during a redraw. */
+bool asset_decoded_gradient_open(asset_decoded_image_t * image, const char * relative_path);
 void asset_decoded_image_close(asset_decoded_image_t * image);
 const void * asset_decoded_image_source(const asset_decoded_image_t * image);
 

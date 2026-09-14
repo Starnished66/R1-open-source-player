@@ -57,6 +57,36 @@ static uint32_t compositor_vertical_base_stride;
 static int32_t compositor_vertical_fixed_top;
 #endif
 
+/* Deliberately identical to LVGL's lv_color_24_16_mix() quantization. This
+ * makes the direct framebuffer result match the ordinary software-rendered
+ * fallback at drawer endpoints, including its 5/6-bit partial-alpha math. */
+static inline uint16_t compositor_argb8888_pixel_over_rgb565(const uint8_t * src, uint16_t dst) {
+    uint32_t mix = src[3];
+    if (mix == 0U) return dst;
+    if (mix == 255U)
+        return (uint16_t) (((src[2] & 0xf8U) << 8) |
+                           ((src[1] & 0xfcU) << 3) |
+                           ((src[0] & 0xf8U) >> 3));
+
+    uint32_t inv = 255U - mix;
+    return (uint16_t) (((((src[2] >> 3) * mix + ((dst >> 11) & 0x1fU) * inv) << 3) & 0xf800U) |
+                       ((((src[1] >> 2) * mix + ((dst >> 5) & 0x3fU) * inv) >> 3) & 0x07e0U) |
+                       (((src[0] >> 3) * mix + (dst & 0x1fU) * inv) >> 8));
+}
+
+void transition_compositor_blend_argb8888_over_rgb565(uint8_t * dst, uint32_t dst_stride,
+                                                       const uint8_t * src, uint32_t src_stride,
+                                                       int32_t width, int32_t height) {
+    if (!dst || !src || width <= 0 || height <= 0) return;
+    for (int32_t y = 0; y < height; y++) {
+        uint16_t * dst_px = (uint16_t *) dst;
+        for (int32_t x = 0; x < width; x++)
+            dst_px[x] = compositor_argb8888_pixel_over_rgb565(src + (size_t) x * 4U, dst_px[x]);
+        dst += dst_stride;
+        src += src_stride;
+    }
+}
+
 #ifdef UI_PERF_TRACE
 static uint64_t compositor_perf_now_us(void) {
     struct timespec ts;
@@ -368,7 +398,9 @@ bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay,
     return false;
 #else
     if (compositor_active || !overlay) return false;
-    if (overlay->header.cf != LV_COLOR_FORMAT_RGB565) return false;
+    bool overlay_rgb565 = overlay->header.cf == LV_COLOR_FORMAT_RGB565;
+    bool overlay_argb8888 = overlay->header.cf == LV_COLOR_FORMAT_ARGB8888;
+    if (!overlay_rgb565 && !overlay_argb8888) return false;
 
     lv_display_t * disp = lv_display_get_default();
     int32_t w = lv_display_get_horizontal_resolution(disp);
@@ -376,9 +408,12 @@ bool transition_compositor_begin_vertical_overlay(const lv_draw_buf_t * overlay,
     uint32_t fb_stride = lv_linux_fbdev_get_stride(disp);
     const uint8_t * active_page = (const uint8_t *) lv_linux_fbdev_get_active_page(disp);
     if (w <= 0 || h <= 0 || !active_page || fb_stride < (uint32_t) w * 2U) return false;
+    uint32_t overlay_bpp = overlay_argb8888 ? 4U : 2U;
+    uint64_t overlay_min_stride = (uint64_t) (uint32_t) w * overlay_bpp;
+    uint64_t overlay_need = (uint64_t) overlay->header.stride * (uint32_t) h;
     if ((int32_t) overlay->header.w != w || (int32_t) overlay->header.h != h ||
-        overlay->header.stride < (uint32_t) w * 2U ||
-        (uint64_t) overlay->data_size < (uint64_t) overlay->header.stride * (uint32_t) h)
+        (uint64_t) overlay->header.stride < overlay_min_stride ||
+        (uint64_t) overlay->data_size < overlay_need)
         return false;
 
     if (fixed_top_rows < 0) fixed_top_rows = 0;
@@ -487,7 +522,8 @@ bool transition_compositor_vertical_overlay_frame(int32_t y) {
     if (overlay_end < overlay_start) overlay_end = overlay_start;
     if (overlay_end > h) overlay_end = h;
 
-    if (compositor_fb_stride == row_bytes && compositor_from->header.stride == row_bytes) {
+    if (compositor_from->header.cf == LV_COLOR_FORMAT_RGB565 &&
+        compositor_fb_stride == row_bytes && compositor_from->header.stride == row_bytes) {
         /* The real fbdev path and LVGL's RGB565 snapshot are normally both
          * tightly packed. Copy the three vertical spans wholesale: fixed/
          * revealed base, visible drawer, then any revealed base below it.
@@ -505,7 +541,7 @@ bool transition_compositor_vertical_overlay_frame(int32_t y) {
             size_t bottom_offset = (size_t) overlay_end * row_bytes;
             memcpy(dest + bottom_offset, compositor_vertical_base + bottom_offset, bottom_bytes);
         }
-    } else {
+    } else if (compositor_from->header.cf == LV_COLOR_FORMAT_RGB565) {
         /* Defensive path for a future driver/snapshot alignment change. */
         const uint8_t * base_row = compositor_vertical_base;
         for (int32_t dest_y = 0; dest_y < h; dest_y++) {
@@ -516,6 +552,24 @@ bool transition_compositor_vertical_overlay_frame(int32_t y) {
                 memcpy(dest, overlay_row, row_bytes);
             } else {
                 memcpy(dest, base_row, row_bytes);
+            }
+            dest += compositor_fb_stride;
+            base_row += compositor_fb_stride;
+        }
+    } else {
+        /* ARGB8888 overlay path. Start with the saved RGB565 underlay on
+         * every row, then blend only the visible drawer span. Source rows
+         * and framebuffer rows advance by their independent padded strides. */
+        const uint8_t * base_row = compositor_vertical_base;
+        for (int32_t dest_y = 0; dest_y < h; dest_y++) {
+            memcpy(dest, base_row, row_bytes);
+            if (dest_y >= overlay_start && dest_y < overlay_end) {
+                int32_t overlay_y = dest_y - y;
+                const uint8_t * src_bytes = (const uint8_t *) compositor_from->data +
+                                           (size_t) overlay_y * compositor_from->header.stride;
+                transition_compositor_blend_argb8888_over_rgb565(dest, compositor_fb_stride,
+                                                                  src_bytes, compositor_from->header.stride,
+                                                                  compositor_width, 1);
             }
             dest += compositor_fb_stride;
             base_row += compositor_fb_stride;

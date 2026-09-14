@@ -106,6 +106,13 @@
 #define LV_USE_TINY_TTF 1
 #if LV_USE_TINY_TTF
   #define LV_TINY_TTF_FILE_SUPPORT 1
+  /* 9.5 moved tiny_ttf from one global 128-entry glyph cache to a per-font
+   * cache of this many entries. 128 thrashes as soon as Settings > Display
+   * > Font loads a custom SD-card .ttf (several sizes share distinct glyph
+   * working sets on a scrolling list). 512 still fits comfortably in this
+   * device's ~19MB available RAM -- see the Makefile's runtime-fixes
+   * comment. */
+  #define LV_TINY_TTF_CACHE_GLYPH_CNT 512
 #endif
 
 /* Real UI assets (theme2 PNGs from the stock firmware) are loaded from
@@ -206,6 +213,12 @@
    * before adding a fifth theory to this list. */
   #define LV_LINUX_FBDEV_RENDER_MODE LV_DISPLAY_RENDER_MODE_DIRECT
   #define LV_LINUX_FBDEV_BUFFER_COUNT 2
+  /* Pan-flip double buffering aliases the two physical /dev/fb0 pages as
+   * LVGL's DIRECT-mode draw buffers (see patches/lvgl_fbdev_compositor.patch).
+   * That path needs mmap; 9.5 made this a separate switch (default 1 without
+   * Kconfig, but set it explicitly so a future Kconfig default cannot
+   * silently fall back to memcpy flush and tearing). */
+  #define LV_LINUX_FBDEV_MMAP 1
 #endif
 
 #endif /* LV_CONF_H */

@@ -173,6 +173,17 @@ typedef struct {
     const char * text_size;  /* non-NULL overrides layout's own text_size */
     const char * text_align; /* non-NULL overrides layout's own align */
     bool has_icon; bool icon; /* whether THIS item's icon_asset should render at all */
+
+    /* Optional per-tile/category-row background image (theme2-relative,
+     * e.g. "launcher/bg_music.png"). NULL reproduces the plain row/tile.
+     * Drawn via bg_image_src rather than bg_color -- the asset itself
+     * already bakes in the rounded-rect card shape (as alpha) and the
+     * accent-tinted radial glow, so no separate radius/clip_corner styling
+     * is needed here. */
+    const char * bg_image;
+    /* Optional compact, transparent glow centered on the icon (0 = none).
+     * Unlike bg_image this has no card surface or visible tile boundary. */
+    uint32_t icon_glow_color;
 } icon_grid_item_t;
 
 /* Titled screen: real back-arrow button (top-left, invokes back_btn_cb) and
@@ -399,6 +410,19 @@ int append_plugin_list_rows(pill_list_item_t * items, int count, int max_items,
 lv_obj_t * build_launcher_menu_screen(const char * title, lv_event_cb_t back_btn_cb,
                                       const icon_grid_item_t * items, int item_count,
                                       int icon_scale_pct, bool label_inside_icon,
+                                      const launcher_menu_layout_t * layout);
+
+/* Adds the Settings-style 44px icon and stretched pill background to an
+ * already-built native pill row. Both paths are theme-relative. Identical
+ * paths share one retained decoded buffer across rows/screens; it is released
+ * when the last referencing image is deleted. */
+void decorate_category_row(lv_obj_t * row, const char * icon_asset, const char * bg_asset);
+
+/* Builds a Settings-style vertical category menu. Six-or-more entries use
+ * 96px reference rows; up to five use 112px. Explicit item/layout overrides
+ * remain authoritative. icon_asset/bg_image paths are theme-relative. */
+lv_obj_t * build_category_menu_screen(const char * title, lv_event_cb_t back_btn_cb,
+                                      const icon_grid_item_t * items, int item_count,
                                       const launcher_menu_layout_t * layout);
 
 typedef struct {

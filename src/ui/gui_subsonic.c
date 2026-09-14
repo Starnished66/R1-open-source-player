@@ -4,6 +4,8 @@
 #include "screen_builders.h"
 #include "gui_text_input.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "assets.h"
 #include "metadata.h"

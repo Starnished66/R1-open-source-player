@@ -872,6 +872,7 @@ bluetooth-codec-selftest:
 	@mkdir -p $(BUILD_TARGET_DIR)
 	$(CC) -O0 -g -Wall -Wextra -ffunction-sections -fdata-sections -Isrc/network -Isrc/core -Isrc/audio \
 	    src/network/bluetooth_codec_test.c -Wl,--gc-sections -Wl,--wrap=fopen -lpthread \
+	    -Wl,--wrap=opendir -Wl,--wrap=readdir -Wl,--wrap=closedir -Wl,--wrap=pthread_create \
 	    -o $(BUILD_TARGET_DIR)/bluetooth_codec_test
 	./$(BUILD_TARGET_DIR)/bluetooth_codec_test
 

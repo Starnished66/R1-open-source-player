@@ -318,6 +318,19 @@ void sync_player_topbar_visibility(lv_obj_t * screen) {
         lv_async_call(player_transition_cache_async_cb, NULL);
 }
 
+/* Keeps volume_topbar_group snug against clock_topbar_group's right edge.
+ * Called once at build time and again from refresh_clock_label() whenever
+ * the am/pm glyph's visibility changes (the only thing that changes the
+ * clock group's width after boot) -- lv_obj_align_to() resolves position
+ * once from the target's current geometry, it does not keep tracking it,
+ * so a later width change needs an explicit re-call or the icon row is
+ * left either gapped or overlapping the clock. */
+static void realign_volume_topbar_after_clock(void) {
+    if (!volume_topbar_group || !clock_topbar_group) return;
+    lv_obj_update_layout(clock_topbar_group);
+    lv_obj_align_to(volume_topbar_group, clock_topbar_group, LV_ALIGN_OUT_RIGHT_MID, BOARD_SCALE_PX(10), 0);
+}
+
 static void build_status_bar(void) {
     lv_obj_t * bar = lv_layer_top();
 
@@ -352,10 +365,8 @@ static void build_status_bar(void) {
     lv_obj_set_pos(band, 0, 0);
     lv_obj_remove_flag(band, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Centered on screen, not left-aligned -- confirmed against a real
-     * stock-player screenshot: "02:45" sat at x=205-273 out of a 480px-wide
-     * panel (center ~239, screen center is 240), not flush against the
-     * left edge like our previous layout had it. Sprite digits (topbar/
+    /* Leftmost element in the bar -- the icon row below is anchored to its
+     * right edge, so build/align this one first. Sprite digits (topbar/
      * N.png + colon.png), same as volume_topbar_group below, instead of an
      * lv_label -- keeps every top bar readout pixel-identical in size/style
      * rather than an lv_font approximating it. */
@@ -383,10 +394,12 @@ static void build_status_bar(void) {
      * it). refresh_clock_label() (called right after build_status_bar() in
      * gui_init) immediately overwrites these placeholder "0"/":" sprites
      * with the real time, so there's no visible flash of "00:00". */
-    lv_obj_align(clock_topbar_group, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(clock_topbar_group, LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(16), 0);
 
-    /* Left edge of the bar: speaker icon, red volume number, headphone-out
-     * icon, all pinned left. A flex row lets hidden digit slots (see
+    /* Icon row: speaker icon, red volume number, headphone-out icon, etc.
+     * Anchored to clock_topbar_group's right edge (see the align_to() call
+     * below) instead of a fixed left offset, so it always sits directly
+     * after the clock reading. A flex row lets hidden digit slots (see
      * refresh_volume_topbar()) collapse cleanly instead of leaving a gap. */
     volume_topbar_group = lv_obj_create(band);
     lv_obj_remove_style_all(volume_topbar_group);
@@ -477,8 +490,13 @@ static void build_status_bar(void) {
      * its later growth as children were added did NOT retroactively re-run
      * this alignment (confirmed on real hardware in an earlier round of
      * this same bug: the group ended up anchored low and out of vertical
-     * sync with the rest of the bar). */
-    lv_obj_align(volume_topbar_group, LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(16), 0);
+     * sync with the rest of the bar). Anchored to clock_topbar_group's
+     * right edge rather than a fixed band offset via
+     * realign_volume_topbar_after_clock() below -- refresh_clock_label()
+     * calls the same helper whenever the am/pm glyph's visibility changes,
+     * so the icon row stays snug against the clock even as its width
+     * changes afterward (12h/24h setting toggled live). */
+    realign_volume_topbar_after_clock();
 
     /* Outline frame -- swapped between battery_bg.png (normal),
      * battery_charge_bg.png (charging, has its own baked-in bolt glyph) and
@@ -1059,7 +1077,7 @@ static void sync_bt_codec_status_icon(void) {
                           ((uint32_t)(vol_digits_vis & 0x7) << 5);
 
     /* If eligibility, codec type, and layout factors haven't changed, and the badge is in its steady state
-     * (either visible or already known to be hidden due to clock overlap), do nothing */
+     * (either visible or already known to be hidden due to right-side overlap), do nothing */
     if (last_codec_eligible && last_codec_type == codec_type && last_codec_layout_sig == layout_sig) {
         if (hidden_due_to_overlap || !currently_hidden) {
             return;
@@ -1079,19 +1097,38 @@ static void sync_bt_codec_status_icon(void) {
 
     lv_obj_remove_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
 
-    /* Clock-overlap protection:
-     * Determine whether displaying bt_codec_status_icon would make volume_topbar_group
-     * reach into clock_topbar_group. Reserve a small visual margin (6px).
-     * If it would overlap, hide only bt_codec_status_icon to preserve all higher-priority
-     * indicators (volume, headphone, A2DP, USB, play/pause). */
+    /* Right-side overlap protection:
+     * clock_topbar_group and volume_topbar_group are now adjacent by
+     * construction (see realign_volume_topbar_after_clock()) -- the icon
+     * row can never reach backward into the clock anymore, so the hazard
+     * this used to guard against (comparing against clock_topbar_group's
+     * left edge) no longer exists. The real remaining hazard is the row
+     * growing far enough right to reach whichever right-side status
+     * element currently sits closest to center: bt_status_icon and
+     * wifi_icon are each hidden unless their radio is on, so check
+     * whichever of the three (bt icon, wifi icon, battery digit group) is
+     * currently visible and leftmost. Reserve a small visual margin (6px).
+     * If it would overlap, hide only bt_codec_status_icon to preserve all
+     * higher-priority indicators (volume, headphone, A2DP, USB, play/pause). */
     hidden_due_to_overlap = false;
-    if (volume_topbar_group && clock_topbar_group) {
+    if (volume_topbar_group) {
         lv_obj_update_layout(volume_topbar_group);
-        lv_obj_update_layout(clock_topbar_group);
         int32_t left_right = lv_obj_get_x(volume_topbar_group) + lv_obj_get_width(volume_topbar_group);
-        int32_t clock_left = lv_obj_get_x(clock_topbar_group);
-        if (clock_left <= 0) clock_left = 200; /* safe fallback if layout not yet evaluated */
-        if (left_right + 6 > clock_left) {
+        int32_t right_boundary = LV_COORD_MAX;
+        if (bt_status_icon && !lv_obj_has_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN)) {
+            int32_t x = lv_obj_get_x(bt_status_icon);
+            if (x < right_boundary) right_boundary = x;
+        }
+        if (wifi_icon && !lv_obj_has_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN)) {
+            int32_t x = lv_obj_get_x(wifi_icon);
+            if (x < right_boundary) right_boundary = x;
+        }
+        if (battery_topbar_group) {
+            lv_obj_update_layout(battery_topbar_group);
+            int32_t x = lv_obj_get_x(battery_topbar_group);
+            if (x < right_boundary) right_boundary = x;
+        }
+        if (right_boundary != LV_COORD_MAX && left_right + 6 > right_boundary) {
             lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
             lv_obj_update_layout(volume_topbar_group);
             hidden_due_to_overlap = true;
@@ -3163,11 +3200,18 @@ void refresh_clock_label(void) {
         lv_image_set_src(clock_topbar_digit[i], asset_path(asset));
     }
 
+    bool ampm_was_hidden = lv_obj_has_flag(clock_topbar_ampm, LV_OBJ_FLAG_HIDDEN);
     if (current_settings.clock_24h) {
         lv_obj_add_flag(clock_topbar_ampm, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_image_set_src(clock_topbar_ampm, asset_path(tm_info.tm_hour < 12 ? "topbar/am.png" : "topbar/pm.png"));
         lv_obj_remove_flag(clock_topbar_ampm, LV_OBJ_FLAG_HIDDEN);
+    }
+    /* am/pm showing/hiding is the only thing that changes clock_topbar_group's
+     * width after boot -- re-anchor the icon row only when that actually
+     * flips, not on every tick (this runs once a second). */
+    if (ampm_was_hidden != lv_obj_has_flag(clock_topbar_ampm, LV_OBJ_FLAG_HIDDEN)) {
+        realign_volume_topbar_after_clock();
     }
 }
 

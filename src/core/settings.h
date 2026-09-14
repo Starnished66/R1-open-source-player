@@ -72,7 +72,7 @@ typedef struct {
      * to the previous track. On by default. */
     bool inline_remote_enabled;
 
-    /* Lyrics: show lyrics screen when tapping on cover image. On by default. */
+    /* Lyrics: enable the player's lyrics icon/view. On by default. */
     bool lyrics_enabled;
 
     /* Subsonic-compatible (Subsonic/Navidrome/Airsonic/...) server config.

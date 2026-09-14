@@ -2969,9 +2969,10 @@ static lv_obj_t * build_wireless_screen(void) {
     /* Shortened captions ("Remote" and "Import") prevent overflow within tile bounds. */
     items[4] = (icon_grid_item_t){ "wireless/hibylink.png", "wireless/hibylink_s.png", "Remote", remote_control_tile_cb, NULL };
     items[5] = (icon_grid_item_t){ "wireless/via.png", "wireless/via_s.png", "Import", import_wifi_tile_cb, NULL };
-    /* 160% icon scale to closely match native asset resolution within cell height. */
-    // icon scale percentage goes through BOARD_SCALE_PX() to make it look approx. the same size on different devices
-    lv_obj_t * scr = build_launcher_menu_screen("Wireless", generic_back_cb, items, 6, BOARD_SCALE_PX(160), true,
+    /* Replacement artwork has no built-in caption band. Use the shared
+     * below-icon layout so it reserves separate space for icon and text.
+     * Keep the standard icon footprint and narrow-board downscaling. */
+    lv_obj_t * scr = build_launcher_menu_screen("Wireless", generic_back_cb, items, 6, BOARD_SCALE_PX(100), false,
                                                  &launcher_layout_config.wireless);
     finalize_screen_navigation(scr);
     return scr;

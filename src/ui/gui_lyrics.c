@@ -38,7 +38,7 @@ typedef struct {
 #define LYRICS_POOL_SIZE 20
 #define LYRICS_ROW_WIDTH (BOARD_SCREEN_WIDTH - BOARD_SCALE_PX(40))
 #define LYRICS_ROW_GAP BOARD_SCALE_PX(24)
-#define LYRICS_ACTIVE_LINE_ANCHOR_Y BOARD_SCALE_PX(200)
+#define LYRICS_ACTIVE_LINE_ANCHOR_Y (lyrics_embedded ? BOARD_SCALE_PX(16) : BOARD_SCALE_PX(200))
 #define LYRICS_TOP_PAD LYRICS_ACTIVE_LINE_ANCHOR_Y
 #define LYRICS_TIMER_PERIOD_MS 150
 #define LYRICS_AUTO_FOLLOW_RESUME_MS 3000L
@@ -137,6 +137,8 @@ static lv_obj_t * lyrics_spacer;
 static lv_obj_t * lyrics_empty_label;
 static lv_obj_t * lyrics_plain_label; /* current_lyrics_plain_mode's own display -- see its own comment */
 static lv_timer_t * lyrics_timer;
+static bool lyrics_embedded = false;
+static bool lyrics_backdrop_discard_active = false;
 static uint8_t * current_lyrics_backdrop_bytes;
 static lv_image_dsc_t current_lyrics_backdrop_dsc;
 static void launch_lyrics_backdrop_decode(void); /* defined alongside build_lyrics_screen() below -- see poll_cover_decode()'s own use of it */
@@ -374,6 +376,9 @@ static bool lyrics_backdrop_regenerate_pending = false;
  * module once it becomes available, so that attempt is retried without
  * blocking the tap. */
 static void launch_lyrics_backdrop_decode(void) {
+    /* The player-hosted view reuses its existing background. Only generate
+     * the legacy backdrop when that standalone screen is actually visible. */
+    if (lyrics_embedded || lv_screen_active() != lyrics_screen) return;
     if (current_lyrics_doc_generation != lyrics_load_generation ||
         current_lyrics_doc_for_index != gui_player_get_playlist_index() ||
         (!current_lyrics_doc_valid && !current_lyrics_plain_mode)) return;
@@ -400,6 +405,7 @@ static void launch_lyrics_backdrop_decode(void) {
 
     atomic_store_explicit(&lyrics_backdrop_done_flag, false, memory_order_relaxed);
     lyrics_backdrop_active = true;
+    lyrics_backdrop_discard_active = false;
     lyrics_backdrop_active_for_index = req->for_index;
     lyrics_backdrop_active_generation = req->lyrics_generation;
     if (pthread_create(&lyrics_backdrop_thread, NULL, lyrics_backdrop_thread_func, req) != 0) {
@@ -418,7 +424,8 @@ static void poll_lyrics_backdrop(void) {
     lyrics_backdrop_active = false;
     pthread_join(lyrics_backdrop_thread, NULL);
 
-    bool result_current = lyrics_backdrop_result_for_index == gui_player_get_playlist_index() &&
+    bool result_current = !lyrics_embedded && !lyrics_backdrop_discard_active &&
+                          lyrics_backdrop_result_for_index == gui_player_get_playlist_index() &&
                           lyrics_backdrop_result_generation == lyrics_load_generation;
     if (lyrics_backdrop_result_bytes && result_current) { /* NULL = allocation failure -- keep whatever backdrop (or plain black) is already showing */
         free(current_lyrics_backdrop_bytes);
@@ -531,6 +538,7 @@ static void lyrics_reset_pool(bool force_layout_rebuild) {
         lv_obj_add_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
         for (int slot = 0; slot < LYRICS_POOL_SIZE; slot++) lv_obj_add_flag(lyrics_rows[slot], LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(lyrics_plain_label, current_lyrics_plain_text);
+        lv_obj_set_y(lyrics_plain_label, LYRICS_TOP_PAD);
         lv_obj_remove_flag(lyrics_plain_label, LV_OBJ_FLAG_HIDDEN);
 
         /* LV_LABEL_LONG_WRAP's real rendered height depends on the text
@@ -653,6 +661,7 @@ static void close_lyrics_screen(void) {
  * wait_release() at gesture-recognition time, is what actually prevents
  * double-handling on real hardware. */
 static void lyrics_gesture_event_cb(lv_event_t * e) {
+    if (lyrics_embedded) return;
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
     lv_indev_t * indev = lv_indev_active();
     if (!indev || lv_indev_get_gesture_dir(indev) != LV_DIR_RIGHT) return;
@@ -678,9 +687,11 @@ static void lyrics_scroll_event_cb(lv_event_t * e) {
 }
 static void lyrics_timer_cb(lv_timer_t * timer) {
     (void) timer;
+    launch_lyrics_backdrop_decode();
     poll_lyrics_backdrop();
 
-    if (current_lyrics_doc_for_index != lyrics_pool_synced_for_index) {
+    if (current_lyrics_doc_for_index != lyrics_pool_synced_for_index ||
+        current_lyrics_doc_generation != lyrics_pool_synced_generation) {
         /* current_lyrics_doc_for_index changes synchronously the moment the
          * track changes (gui_lyrics_load_track()), well before the
          * background .lrc/tag load (poll_lyrics_load(), on gui.c's own
@@ -696,7 +707,7 @@ static void lyrics_timer_cb(lv_timer_t * timer) {
          * deciding anything. */
         if (current_lyrics_doc_generation != lyrics_load_generation) return;
 
-        if (!current_lyrics_doc_valid && !current_lyrics_plain_mode) {
+        if (!lyrics_embedded && !current_lyrics_doc_valid && !current_lyrics_plain_mode) {
             /* The song this screen was showing lyrics for changed (manual
              * skip or natural end-of-track advance) and the new one has
              * none -- close back out instead of sitting on the "No
@@ -765,6 +776,9 @@ static void lyrics_timer_cb(lv_timer_t * timer) {
     lyrics_update_window(active_index);
 }
 static void open_lyrics_screen(void) {
+    gui_lyrics_hide_embedded();
+    lv_obj_remove_flag(lyrics_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
     launch_lyrics_backdrop_decode();
     if (current_lyrics_backdrop_bytes &&
         current_lyrics_backdrop_for_index == gui_player_get_playlist_index() &&
@@ -774,6 +788,43 @@ static void open_lyrics_screen(void) {
     lv_timer_resume(lyrics_timer);
     nav_push(lyrics_screen);
     lyrics_timer_cb(NULL); /* one immediate tick so the view isn't blank for up to LYRICS_TIMER_PERIOD_MS after opening */
+}
+
+void gui_lyrics_show_embedded(lv_obj_t * parent, int32_t top, int32_t height) {
+    if (!parent || !lyrics_screen || height <= 0) return;
+    lyrics_embedded = true;
+    lyrics_backdrop_discard_active = lyrics_backdrop_active;
+    lyrics_backdrop_regenerate_pending = false;
+    lv_obj_add_flag(lyrics_backdrop_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_parent(lyrics_list, parent);
+    lv_obj_set_parent(lyrics_empty_label, parent);
+    lv_obj_align(lyrics_list, LV_ALIGN_TOP_LEFT, 0, top);
+    lv_obj_set_size(lyrics_list, BOARD_SCREEN_WIDTH, height);
+    lv_obj_remove_flag(lyrics_list, LV_OBJ_FLAG_HIDDEN);
+    /* Align to the list's center so parent height/padding do not shift the
+     * empty state outside the requested region. */
+    lv_obj_update_layout(lyrics_list);
+    lv_obj_align_to(lyrics_empty_label, lyrics_list, LV_ALIGN_CENTER, 0, 0);
+    /* The embedded view has a different top anchor from the legacy screen. */
+    lyrics_reset_pool(true);
+    lv_timer_resume(lyrics_timer);
+    lyrics_timer_cb(NULL);
+}
+
+void gui_lyrics_hide_embedded(void) {
+    if (!lyrics_embedded) return;
+    lv_timer_pause(lyrics_timer);
+    lv_obj_add_flag(lyrics_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_parent(lyrics_list, lyrics_screen);
+    lv_obj_set_parent(lyrics_empty_label, lyrics_screen);
+    lv_obj_set_size(lyrics_list, LYRICS_BACKDROP_WIDTH, LYRICS_BACKDROP_HEIGHT);
+    lv_obj_align(lyrics_list, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_center(lyrics_empty_label);
+    lyrics_embedded = false;
+    /* Force legacy open to rebuild offsets for its full-screen top anchor. */
+    lyrics_pool_synced_generation = -1;
+    /* Fullscreen open restores visibility and reconciles the document. */
 }
 static lv_obj_t * build_lyrics_screen(void) {
     lv_obj_t * scr = lv_obj_create(NULL);
@@ -990,6 +1041,7 @@ void gui_lyrics_init(void) {
  * module owns so gui_lyrics_init() can rebuild them from a clean slate
  * without leaking the old objects. */
 void gui_lyrics_teardown(void) {
+    gui_lyrics_hide_embedded();
     /* Unguarded lv_timer_create() at this screen's own build site -- same
      * leaked-old-timer hazard as gui_player_teardown()'s volume_popup_hide_
      * timer, see its own comment. */
@@ -1030,6 +1082,13 @@ void gui_lyrics_load_track(int index, const char * path) {
     }
     current_lyrics_doc_for_index = index;
     if (path) launch_lyrics_load(index, path);
+    else {
+        /* Invalidate an in-flight local load when switching to a track
+         * without a local lyrics source, including the same queue slot. */
+        lyrics_load_pending_valid = false;
+        current_lyrics_doc_generation = ++lyrics_load_generation;
+    }
+    if (lyrics_embedded) lyrics_reset_pool(true);
 }
 
 void gui_lyrics_open_screen(void) {

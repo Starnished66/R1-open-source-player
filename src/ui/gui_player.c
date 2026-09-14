@@ -322,17 +322,45 @@ static inline int32_t player_s(int32_t px) {
 }
 
 #define REFLECTION_WIDTH BOARD_SCREEN_WIDTH
-#define REFLECTION_HEIGHT BOARD_PLAYER_OVERLAY_HEIGHT
-#define REFLECTION_BLUR_RADIUS 32
-#define REFLECTION_BLUR_PASSES 5
+/* Small work-buffer + bilinear-both-ways architecture, matching gui_lyrics.c's
+ * own proven compute_lyrics_backdrop_bytes() exactly (same work size, same
+ * blur radius/passes, same bilinear downsample-then-upsample shape) instead
+ * of this function's own earlier nearest-neighbor row-duplication approach.
+ * That earlier approach hard-repeated each small-buffer source row into
+ * ~2-3 destination rows with a hard boundary between them -- real banding in
+ * the underlying image that no amount of per-pixel dithering can fix, only
+ * mask. The lyrics screen never showed this "shimmer" on the same hardware
+ * with the same darken range; this is the actual reason why, not the
+ * dither-timing or panel-compositing theories tried (and fixed as real, but
+ * insufficient) earlier. Also dramatically cheaper: 6000 work pixels here
+ * vs the old 153600, closing the audio-thread-starvation risk at the root
+ * instead of needing the cooperative-yield workaround. */
+#define REFLECTION_WORK_WIDTH 60
+#define REFLECTION_WORK_HEIGHT 100
+#define REFLECTION_BLUR_RADIUS 5
+#define REFLECTION_BLUR_PASSES 3
 /* Kept as an integer ratio (channel * NUM / DEN) rather than a float --
  * matches this codebase's general preference for integer arithmetic on the
  * embedded target, and there's no accuracy need here that would justify a
- * float. 3/4 keeps the background legible as art rather than a flat dark
- * smear, while still darkening it enough for the foreground text/controls
- * to read clearly on top. */
-#define REFLECTION_DARKEN_NUM 3
-#define REFLECTION_DARKEN_DEN 4
+ * float. */
+#define REFLECTION_DARKEN_NUM 1
+#define REFLECTION_DARKEN_DEN 2
+
+/* Same bilinear-sample helper as gui_lyrics.c's own bilerp_plane() (not
+ * shared between the two files -- both are small, self-contained, and this
+ * keeps compute_reflection_bytes() free-standing). x_fp/y_fp are 16.16
+ * fixed-point coordinates into `plane`. */
+static uint8_t bilerp_plane(const uint8_t * plane, int width, int height, uint32_t x_fp, uint32_t y_fp) {
+    int x0 = (int) (x_fp >> 16), y0 = (int) (y_fp >> 16);
+    int x1 = x0 + 1 < width ? x0 + 1 : x0;
+    int y1 = y0 + 1 < height ? y0 + 1 : y0;
+    uint32_t fx = x_fp & 0xffffu, fy = y_fp & 0xffffu;
+    uint32_t top = ((uint32_t) plane[y0 * width + x0] * (65536u - fx) +
+                    (uint32_t) plane[y0 * width + x1] * fx) >> 16;
+    uint32_t bottom = ((uint32_t) plane[y1 * width + x0] * (65536u - fx) +
+                       (uint32_t) plane[y1 * width + x1] * fx) >> 16;
+    return (uint8_t) ((top * (65536u - fy) + bottom * fy) >> 16);
+}
 
 /* Pure pixel math -- builds the reflection from a given COVER_ART_WIDTH x
  * COVER_ART_HEIGHT RGB565 buffer and returns a freshly malloc'd
@@ -345,7 +373,7 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes, int blur_radius,
     if (blur_passes < 0) blur_passes = 0;
     if (darken_num < 0) darken_num = 0;
 
-    int w = REFLECTION_WIDTH, h = REFLECTION_HEIGHT;
+    int w = REFLECTION_WORK_WIDTH, h = REFLECTION_WORK_HEIGHT;
     uint8_t * r = malloc((size_t) w * h);
     uint8_t * g = malloc((size_t) w * h);
     uint8_t * b = malloc((size_t) w * h);
@@ -355,36 +383,47 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes, int blur_radius,
         return NULL;
     }
 
-    /* Center-crop the square cover to this wide panel -- or, since
-     * COVER_ART_WIDTH/HEIGHT no longer has to match the screen (see gui.h's
-     * own comment on COVER_ART_WIDTH), center-and-edge-extend when the
-     * decoded cover is SMALLER than this panel in either dimension. src_x/
-     * src_y are clamped into the real buffer either way, so this never reads
-     * past cover_bytes regardless of how COVER_ART_WIDTH/HEIGHT and
-     * REFLECTION_WIDTH/HEIGHT relate on a given board. The previous bottom-
-     * strip mirror preserved recognizable hard shapes even after blurring,
-     * which looked like a smeared reflection rather than frosted glass. */
-    int y_offset = (COVER_ART_HEIGHT - h) / 2;
-    int x_offset = (COVER_ART_WIDTH - w) / 2;
+    /* Bilinear downsample straight from the real (COVER_ART_WIDTH x
+     * COVER_ART_HEIGHT) cover into this tiny work buffer, center-cropping
+     * the source to REFLECTION_WIDTH:BOARD_SCREEN_HEIGHT's aspect first --
+     * same shape as compute_lyrics_backdrop_bytes()'s own crop_w/crop_x,
+     * adapted to this function's own destination aspect ratio. */
+    int crop_w = COVER_ART_HEIGHT * REFLECTION_WIDTH / BOARD_SCREEN_HEIGHT;
+    if (crop_w > COVER_ART_WIDTH) crop_w = COVER_ART_WIDTH;
+    int crop_x = (COVER_ART_WIDTH - crop_w) / 2;
+    const uint16_t * source = (const uint16_t *) cover_bytes;
     for (int y = 0; y < h; y++) {
-        int src_y = y + y_offset;
-        if (src_y < 0) src_y = 0;
-        else if (src_y >= COVER_ART_HEIGHT) src_y = COVER_ART_HEIGHT - 1;
-        const uint16_t * src_row = (const uint16_t *) (cover_bytes + (size_t) src_y * COVER_ART_WIDTH * 2);
+        uint32_t sy_fp = h > 1 ? (uint32_t) (((uint64_t) y * (COVER_ART_HEIGHT - 1) << 16) / (h - 1)) : 0;
+        int sy = (int) (sy_fp >> 16);
+        int sy1 = sy + 1 < COVER_ART_HEIGHT ? sy + 1 : sy;
+        uint32_t fy = sy_fp & 0xffffu;
         for (int x = 0; x < w; x++) {
-            int src_x = x + x_offset;
-            if (src_x < 0) src_x = 0;
-            else if (src_x >= COVER_ART_WIDTH) src_x = COVER_ART_WIDTH - 1;
-            uint16_t px = src_row[src_x];
-            r[y * w + x] = (uint8_t) (((px >> 11) & 0x1F) * 255 / 31);
-            g[y * w + x] = (uint8_t) (((px >> 5) & 0x3F) * 255 / 63);
-            b[y * w + x] = (uint8_t) ((px & 0x1F) * 255 / 31);
+            uint32_t sx_fp = (uint32_t) crop_x << 16;
+            if (w > 1) sx_fp += (uint32_t) (((uint64_t) x * (crop_w - 1) << 16) / (w - 1));
+            int sx = (int) (sx_fp >> 16);
+            int sx1 = sx + 1 < COVER_ART_WIDTH ? sx + 1 : sx;
+            uint32_t fx = sx_fp & 0xffffu;
+            uint16_t px00 = source[sy * COVER_ART_WIDTH + sx], px01 = source[sy * COVER_ART_WIDTH + sx1];
+            uint16_t px10 = source[sy1 * COVER_ART_WIDTH + sx], px11 = source[sy1 * COVER_ART_WIDTH + sx1];
+            uint16_t pixels[4] = { px00, px01, px10, px11 };
+            uint8_t * channels[3] = { r, g, b };
+            for (int c = 0; c < 3; c++) {
+                uint32_t values[4];
+                for (int p = 0; p < 4; p++) {
+                    if (c == 0) values[p] = ((pixels[p] >> 11) & 0x1F) * 255 / 31;
+                    else if (c == 1) values[p] = ((pixels[p] >> 5) & 0x3F) * 255 / 63;
+                    else values[p] = (pixels[p] & 0x1F) * 255 / 31;
+                }
+                uint32_t top = (values[0] * (65536u - fx) + values[1] * fx) >> 16;
+                uint32_t bottom = (values[2] * (65536u - fx) + values[3] * fx) >> 16;
+                channels[c][y * w + x] = (uint8_t) ((top * (65536u - fy) + bottom * fy) >> 16);
+            }
         }
     }
 
-    /* Separable box blur: one horizontal pass (per row) then one vertical
-     * pass (per column), on each channel independently -- a full 2D blur
-     * at a fraction of the cost of a real 2D kernel. */
+    /* Separable box blur on the tiny work buffer -- one horizontal pass
+     * (per row) then one vertical pass (per column), on each channel
+     * independently, for blur_passes passes. */
     for (int pass = 0; pass < blur_passes; pass++) {
         for (int y = 0; y < h; y++) box_blur_1d(r + y * w, tmp + y * w, w, 1, blur_radius);
         memcpy(r, tmp, (size_t) w * h);
@@ -404,32 +443,38 @@ uint8_t * compute_reflection_bytes(const uint8_t * cover_bytes, int blur_radius,
         memcpy(b, tmp, (size_t) w * h);
     }
 
-    uint8_t * out_bytes = malloc((size_t) w * BOARD_SCREEN_HEIGHT * 2);
+    uint8_t * out_bytes = malloc((size_t) REFLECTION_WIDTH * BOARD_SCREEN_HEIGHT * 2);
     if (!out_bytes) {
         free(r); free(g); free(b); free(tmp);
         return NULL;
     }
 
-    /* Darken (mostly faded into player_overlay_panel's black background)
-     * and repack into RGB565, same channel layout current_cover_dsc uses. */
+    /* Bilinear upsample from the tiny blurred work buffer to the full
+     * REFLECTION_WIDTH x BOARD_SCREEN_HEIGHT output, darkening and dithering
+     * at each FINAL destination pixel's own (x,y) -- smooth interpolation
+     * here (not nearest-neighbor row duplication) is what actually removes
+     * the banding that looked like "shimmer" once densely dithered. Still
+     * touches all REFLECTION_WIDTH*BOARD_SCREEN_HEIGHT destination pixels
+     * (the earlier full-resolution pass's own audio-starvation risk applies
+     * here too, just to a cheaper per-pixel cost now), so keep the same
+     * cooperative yield this codebase already uses elsewhere for background
+     * decode work. */
     uint16_t * out = (uint16_t *) out_bytes;
-    for (int i = 0; i < w * h; i++) {
-        int rv = (r[i] * darken_num) / darken_den;
-        int gv = (g[i] * darken_num) / darken_den;
-        int bv = (b[i] * darken_num) / darken_den;
-        out[i] = rgb888_to_565_dithered(rv, gv, bv, i % w, i / w);
+#define REFLECTION_UPSAMPLE_YIELD_ROWS 40
+    for (int y = 0; y < BOARD_SCREEN_HEIGHT; y++) {
+        if (y > 0 && (y % REFLECTION_UPSAMPLE_YIELD_ROWS) == 0) usleep(1000);
+        uint32_t y_fp = h > 1 ? (uint32_t) (((uint64_t) y * (h - 1) << 16) / (BOARD_SCREEN_HEIGHT - 1)) : 0;
+        uint16_t * out_row = out + (size_t) y * REFLECTION_WIDTH;
+        for (int x = 0; x < REFLECTION_WIDTH; x++) {
+            uint32_t x_fp = w > 1 ? (uint32_t) (((uint64_t) x * (w - 1) << 16) / (REFLECTION_WIDTH - 1)) : 0;
+            int rv = bilerp_plane(r, w, h, x_fp, y_fp) * darken_num / darken_den;
+            int gv = bilerp_plane(g, w, h, x_fp, y_fp) * darken_num / darken_den;
+            int bv = bilerp_plane(b, w, h, x_fp, y_fp) * darken_num / darken_den;
+            out_row[x] = rgb888_to_565_dithered(rv, gv, bv, x, y);
+        }
     }
+#undef REFLECTION_UPSAMPLE_YIELD_ROWS
     free(r); free(g); free(b); free(tmp);
-    /* Expand once, not through LVGL's image-transform path on every redraw.
-     * Walk backwards so expansion can reuse the allocation in place. Keep
-     * the small working blur buffers and the existing vertical mapping. */
-    const int scale_y = (BOARD_SCREEN_HEIGHT * LV_SCALE_NONE + h - 1) / h;
-    for (int y = BOARD_SCREEN_HEIGHT - 1; y >= 0; --y) {
-        int src_y = y * LV_SCALE_NONE / scale_y;
-        if (src_y >= h) src_y = h - 1;
-        if (src_y != y)
-            memcpy(out + (size_t) y * w, out + (size_t) src_y * w, (size_t) w * 2);
-    }
     return out_bytes;
 }
 
@@ -535,8 +580,15 @@ void gui_player_refresh_frosted_background(void) {
     free(current_reflection_bytes);
     current_reflection_bytes = compute_reflection_bytes(current_cover_bytes, params.blur_radius, params.blur_passes, params.darken_num, params.darken_den);
 
+    /* TRANSP, not COVER -- player_background_img (the frosted image, about
+     * to be shown) fully covers this panel; keeping the panel's own paint
+     * opaque underneath it forces LVGL to composite two full-screen opaque
+     * layers every frame for no visible benefit. The lyrics screen's own
+     * analogous wrapper (dark_overlay in gui_lyrics.c) is deliberately kept
+     * transparent for exactly this reason -- its own comment explains
+     * darkness is already baked into its backdrop image. */
     lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
-    lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_TRANSP, 0);
 
     if (current_reflection_bytes && player_background_img) {
         memset(&current_reflection_dsc, 0, sizeof(current_reflection_dsc));
@@ -1031,8 +1083,10 @@ void poll_cover_decode(void) {
             free(current_reflection_bytes);
             current_reflection_bytes = cover_decode_result_reflection;
 
+            /* TRANSP, not COVER -- see gui_player_refresh_frosted_background()'s
+             * own comment on this exact line for why. */
             lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
-            lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_opa(player_overlay_panel, LV_OPA_TRANSP, 0);
 
             if (current_reflection_bytes && player_background_img) {
                 /* Same LV_IMAGE_HEADER_MAGIC requirement as current_cover_dsc above. */
@@ -1824,11 +1878,173 @@ static void build_more_menu_popup(void) {
 
 /* Song context menu moved to gui_queue.c. */
 
-static void cover_img_tap_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (current_settings.lyrics_enabled) {
-        gui_lyrics_open_screen();
+typedef struct {
+    lv_obj_t * obj;
+    int32_t x, y, w, h;
+    int32_t compact_x, compact_y, compact_w, compact_h;
+    int32_t height_style;
+    int32_t normal_pad_left;
+    int32_t centered_text_inset;
+} player_lyrics_geometry_t;
+
+static bool player_lyrics_open;
+static bool player_lyrics_animating;
+static player_lyrics_geometry_t player_lyrics_geometry[4];
+static lv_obj_t * player_lyrics_hidden[32];
+static unsigned player_lyrics_hidden_count;
+static int32_t player_lyrics_content_top;
+static lv_image_header_t player_lyrics_cover_header;
+
+static int32_t player_lyrics_lerp(int32_t a, int32_t b, int32_t progress) {
+    return a + (int32_t) (((int64_t) (b - a) * progress) / 1024);
+}
+
+static void player_lyrics_morph(void * unused, int32_t progress) {
+    (void) unused;
+    for (unsigned i = 0; i < 4; ++i) {
+        player_lyrics_geometry_t * g = &player_lyrics_geometry[i];
+        lv_obj_set_pos(g->obj, player_lyrics_lerp(g->x, g->compact_x, progress),
+                              player_lyrics_lerp(g->y, g->compact_y, progress));
+        lv_obj_set_size(g->obj, player_lyrics_lerp(g->w, g->compact_w, progress),
+                               player_lyrics_lerp(g->h, g->compact_h, progress));
+        if (i) {
+            /* Move the visible text, not just its label box. Keeping LEFT
+             * alignment throughout the morph avoids the old end-of-exit
+             * snap from the box's left edge to its centered text position. */
+            lv_obj_set_style_pad_left(g->obj, g->normal_pad_left +
+                player_lyrics_lerp(g->centered_text_inset, 0, progress), 0);
+        }
     }
+    /* The decoded image stays the same: only its scale and card bounds move.
+     * Cache the image header once per transition, not on each animation tick. */
+    int32_t size = player_lyrics_lerp(player_lyrics_geometry[0].w,
+                                    player_lyrics_geometry[0].compact_w, progress);
+    if (player_lyrics_cover_header.w && player_lyrics_cover_header.h) {
+        int32_t sx = (size * LV_SCALE_NONE + player_lyrics_cover_header.w - 1) / player_lyrics_cover_header.w;
+        int32_t sy = (size * LV_SCALE_NONE + player_lyrics_cover_header.h - 1) / player_lyrics_cover_header.h;
+        lv_image_set_scale(cover_img, sx > sy ? sx : sy);
+    }
+}
+
+static void player_lyrics_restore_controls(void) {
+    for (unsigned i = 0; i < player_lyrics_hidden_count; ++i)
+        lv_obj_remove_flag(player_lyrics_hidden[i], LV_OBJ_FLAG_HIDDEN);
+    player_lyrics_hidden_count = 0;
+    for (unsigned i = 1; i < 4; ++i) {
+        lv_obj_set_style_pad_left(player_lyrics_geometry[i].obj,
+                                 player_lyrics_geometry[i].normal_pad_left, 0);
+        lv_obj_set_height(player_lyrics_geometry[i].obj, player_lyrics_geometry[i].height_style);
+        lv_obj_set_style_text_align(player_lyrics_geometry[i].obj, LV_TEXT_ALIGN_CENTER, 0);
+    }
+}
+
+static void player_lyrics_morph_done(lv_anim_t * anim) {
+    (void) anim;
+    player_lyrics_animating = false;
+    if (player_lyrics_open) {
+        gui_lyrics_show_embedded(player_screen, player_lyrics_content_top,
+                                BOARD_SCREEN_HEIGHT - player_lyrics_content_top - player_y(32));
+    } else {
+        player_lyrics_restore_controls();
+    }
+    fit_cover_img_to_card();
+    player_transition_mark_dirty();
+}
+
+static void player_lyrics_hide_object(lv_obj_t * obj) {
+    if (!obj || lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) return;
+    if (player_lyrics_hidden_count >= sizeof(player_lyrics_hidden) / sizeof(player_lyrics_hidden[0])) return;
+    player_lyrics_hidden[player_lyrics_hidden_count++] = obj;
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void player_lyrics_set_open(bool open, bool animate) {
+    if (!player_screen || (animate && player_lyrics_animating)) return;
+    if (open == player_lyrics_open && !player_lyrics_animating) return;
+    lv_anim_delete(player_screen, player_lyrics_morph);
+    if (open) {
+        lv_obj_update_layout(player_screen);
+        lv_obj_t * objects[] = { cover_card, song_title_label, song_album_label, song_folder_label };
+        int32_t cover_size = player_s(112);
+        int32_t left = player_x(24), top = player_y(48);
+        int32_t text_x = left + cover_size + player_x(16);
+        int32_t text_y = top;
+        for (unsigned i = 0; i < 4; ++i) {
+            player_lyrics_geometry_t * g = &player_lyrics_geometry[i];
+            g->obj = objects[i];
+            g->x = lv_obj_get_x(g->obj); g->y = lv_obj_get_y(g->obj);
+            g->w = lv_obj_get_width(g->obj); g->h = lv_obj_get_height(g->obj);
+            g->height_style = lv_obj_get_style_height(g->obj, 0);
+            g->normal_pad_left = lv_obj_get_style_pad_left(g->obj, 0);
+            g->compact_x = i ? text_x : left;
+            g->compact_y = i ? text_y : top;
+            g->compact_w = i ? BOARD_SCREEN_WIDTH - text_x - left : cover_size;
+            g->compact_h = i ? g->h : cover_size;
+            if (i) {
+                text_y += g->compact_h + player_y(6);
+                lv_obj_set_style_text_align(g->obj, LV_TEXT_ALIGN_LEFT, 0);
+            }
+        }
+        player_lyrics_content_top = (text_y > top + cover_size ? text_y : top + cover_size) + player_y(16);
+        /* Hide both visual controls and their separate, enlarged touch targets.
+         * Remember only visible objects so hidden state is restored exactly. */
+        for (uint32_t i = 0; i < lv_obj_get_child_count(player_screen); ++i) {
+            lv_obj_t * child = lv_obj_get_child(player_screen, i);
+            if (child == player_overlay_panel || child == cover_card || child == song_title_label ||
+                child == song_album_label || child == song_folder_label) continue;
+            player_lyrics_hide_object(child);
+        }
+        player_lyrics_hide_object(favorite_circle);
+    } else {
+        gui_lyrics_hide_embedded();
+    }
+    /* Measure once per direction, since a new track may have been selected
+     * while lyrics were open. Do not measure fonts on animation frames. */
+    for (unsigned i = 1; i < 4; ++i) {
+        player_lyrics_geometry_t * g = &player_lyrics_geometry[i];
+        lv_point_t text_size;
+        lv_text_get_size(&text_size, lv_label_get_text(g->obj),
+                        lv_obj_get_style_text_font(g->obj, 0),
+                        lv_obj_get_style_text_letter_space(g->obj, 0),
+                        lv_obj_get_style_text_line_space(g->obj, 0),
+                        LV_COORD_MAX, LV_TEXT_FLAG_EXPAND);
+        int32_t available = g->w - g->normal_pad_left - lv_obj_get_style_pad_right(g->obj, 0);
+        g->centered_text_inset = text_size.x < available ? (available - text_size.x) / 2 : 0;
+        lv_obj_set_style_text_align(g->obj, LV_TEXT_ALIGN_LEFT, 0);
+    }
+    player_lyrics_open = open;
+    memset(&player_lyrics_cover_header, 0, sizeof(player_lyrics_cover_header));
+    lv_image_decoder_get_info(lv_image_get_src(cover_img), &player_lyrics_cover_header);
+    if (!animate) {
+        player_lyrics_morph(NULL, open ? 1024 : 0);
+        player_lyrics_morph_done(NULL);
+        return;
+    }
+    player_lyrics_animating = true;
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, player_screen);
+    lv_anim_set_values(&anim, open ? 0 : 1024, open ? 1024 : 0);
+    lv_anim_set_duration(&anim, 240);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
+    lv_anim_set_exec_cb(&anim, player_lyrics_morph);
+    lv_anim_set_completed_cb(&anim, player_lyrics_morph_done);
+    lv_anim_start(&anim);
+}
+
+static void lyrics_icon_tap_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED && current_settings.lyrics_enabled)
+        player_lyrics_set_open(true, true);
+}
+
+static void cover_img_tap_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED && player_lyrics_open)
+        player_lyrics_set_open(false, true);
+}
+
+static void player_lyrics_screen_unloaded_cb(lv_event_t * e) {
+    (void) e;
+    player_lyrics_set_open(false, false);
 }
 
 
@@ -2137,7 +2353,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_style(song_album_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(song_album_label, player_meta_font, 0);
     lv_obj_set_style_text_align(song_album_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(song_album_label, player_x(22), player_y(82));
+    lv_obj_set_pos(song_album_label, player_x(22), player_y(86));
     /* Leave a full metadata line between the title and artist. The old
      * 26px box could trigger vertical circular scrolling even for short
      * albums. Content height also accommodates updated font metrics. */
@@ -2181,7 +2397,14 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     /* Quality pill */
     quality_pill = lv_obj_create(scr);
     lv_obj_remove_style_all(quality_pill);
-    lv_obj_set_size(quality_pill, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    /* Height fixed, not LV_SIZE_CONTENT -- format_badge_label's marquee
+     * (row_label_enable_marquee() below) re-lays-out on its own continuous
+     * timer, and an LV_SIZE_CONTENT height here let that same tick jitter
+     * this pill's own bounding box (top-anchored via lv_obj_align below),
+     * seen on a real device as a flickering line at the pill's top/bottom
+     * border. Width stays content-based so the pill still hugs whatever
+     * length the format text happens to be. */
+    lv_obj_set_size(quality_pill, LV_SIZE_CONTENT, player_s(36));
     lv_obj_align(quality_pill, LV_ALIGN_TOP_MID, 0, player_y(518));
     lv_obj_set_style_pad_hor(quality_pill, player_s(14), 0);
     lv_obj_set_style_pad_ver(quality_pill, player_s(6), 0);
@@ -2257,7 +2480,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_label_set_text(song_count_label, "");
     lv_obj_add_flag(song_count_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* Transport row -- 4 controls only */
+    /* Transport row: order, previous, play/pause, next, lyrics. */
     lv_obj_t * controls_row = lv_obj_create(scr);
     lv_obj_remove_style_all(controls_row);
     const int32_t transport_top = player_y(645);
@@ -2283,6 +2506,10 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_image_set_src(play_btn, gui_player_play_btn_image_src(audio_is_playing()));
     lv_obj_add_style(play_btn, &icon_press_style, LV_STATE_PRESSED);
 
+    lv_obj_t * lyrics_icon = lv_image_create(controls_row);
+    lv_image_set_src(lyrics_icon, asset_path("playing_plane/lyrics_out.png"));
+    lv_obj_add_style(lyrics_icon, &icon_press_style, LV_STATE_PRESSED);
+
     next_btn = lv_image_create(controls_row);
     lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
     transport_btn_ctx_t * next_ctx = malloc(sizeof(transport_btn_ctx_t));
@@ -2298,6 +2525,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_pos(play_btn, player_x(240) - lv_obj_get_width(play_btn) / 2, (row_h - lv_obj_get_height(play_btn)) / 2);
     lv_obj_set_pos(order_icon, player_x(57) - lv_obj_get_width(order_icon) / 2, (row_h - lv_obj_get_height(order_icon)) / 2);
     lv_obj_set_pos(prev_btn, player_x(142) - lv_obj_get_width(prev_btn) / 2, (row_h - lv_obj_get_height(prev_btn)) / 2);
+    lv_obj_set_pos(lyrics_icon, player_x(423) - lv_obj_get_width(lyrics_icon) / 2, (row_h - lv_obj_get_height(lyrics_icon)) / 2);
     lv_obj_set_pos(next_btn, player_x(338) - lv_obj_get_width(next_btn) / 2, (row_h - lv_obj_get_height(next_btn)) / 2);
 
     /* Part D: Hit targets */
@@ -2334,6 +2562,15 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, play_btn);
     lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, play_btn);
     lv_obj_add_event_cb(play_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, play_btn);
+
+    int32_t lyrics_hit_size = player_s(56); if (lyrics_hit_size < 44) lyrics_hit_size = 44;
+    lv_obj_t * lyrics_hit = add_transport_hit_target(scr, player_x(423), lyrics_hit_size,
+                                transport_center_y - lyrics_hit_size / 2,
+                                transport_center_y + (lyrics_hit_size + 1) / 2,
+                                lyrics_icon_tap_cb, lv_palette_main(LV_PALETTE_PURPLE));
+    lv_obj_add_event_cb(lyrics_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESSED, lyrics_icon);
+    lv_obj_add_event_cb(lyrics_hit, forward_press_state_to_icon_cb, LV_EVENT_RELEASED, lyrics_icon);
+    lv_obj_add_event_cb(lyrics_hit, forward_press_state_to_icon_cb, LV_EVENT_PRESS_LOST, lyrics_icon);
 
     int32_t next_hit_w = player_s(56); if (next_hit_w < 44) next_hit_w = 44;
     int32_t next_hit_h = player_s(56); if (next_hit_h < 44) next_hit_h = 44;
@@ -2410,6 +2647,7 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_slider_set_value(volume_slider, (int32_t) (audio_get_volume() * 100.0f), LV_ANIM_OFF);
 
     finalize_screen_navigation(scr);
+    lv_obj_add_event_cb(scr, player_lyrics_screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
     fit_cover_img_to_card();
     return scr;
 }
@@ -2985,16 +3223,19 @@ void get_display_names(const char * path, char * title_out, size_t title_size,
 
 
 
-/* Stock btn_play.png / btn_pause.png are a white disc with a baked-in
+/* Tint the outer ring of the outline play/pause assets while preserving
+ * their white center symbols. Also support the older stock assets:
+ * stock btn_play.png / btn_pause.png are a white disc with a baked-in
  * #009FF6 play/pause mark. LVGL image_recolor mixes every pixel toward the
  * recolor color, so applying gui_theme_accent_style() would tint the disc
  * as well (same COVER flattening apply_accent_color() documents for
  * on.png). Rewrite only pixels that aren't white / near-white, keeping the
  * disc and the anti-aliased circle edge, and mixing the glyph toward the
  * current accent. */
-static void recolor_play_btn_glyph(lv_draw_buf_t * buf, lv_color_t accent)
+static void recolor_play_btn_accent(lv_draw_buf_t * buf, lv_color_t accent)
 {
-    if (!buf || !buf->data || buf->header.cf != LV_COLOR_FORMAT_ARGB8888) return;
+    if (!buf || !buf->data || !buf->header.w || !buf->header.h ||
+        buf->header.cf != LV_COLOR_FORMAT_ARGB8888) return;
     uint32_t w = buf->header.w;
     uint32_t h = buf->header.h;
     uint32_t stride = buf->header.stride;
@@ -3005,6 +3246,17 @@ static void recolor_play_btn_glyph(lv_draw_buf_t * buf, lv_color_t accent)
         lv_color32_t * row = (lv_color32_t *) (buf->data + y * stride);
         for (uint32_t x = 0; x < w; x++) {
             if (row[x].alpha == 0) continue;
+            /* Normalize to the image ellipse. The outer quarter of its
+             * radius contains the ring, outside either center glyph.
+             * Preserve alpha so antialiased edges remain smooth. */
+            int32_t dx = ((int32_t) (2 * x + 1) - (int32_t) w) * 256 / (int32_t) w;
+            int32_t dy = ((int32_t) (2 * y + 1) - (int32_t) h) * 256 / (int32_t) h;
+            if (dx * dx + dy * dy >= 192 * 192) {
+                row[x].red = ar;
+                row[x].green = ag;
+                row[x].blue = ab;
+                continue;
+            }
             uint8_t minc = row[x].red;
             if (row[x].green < minc) minc = row[x].green;
             if (row[x].blue < minc) minc = row[x].blue;
@@ -3025,9 +3277,9 @@ static void load_play_btn_images(void)
     asset_decoded_image_close(&play_btn_pause_img);
     lv_color_t accent = accent_lv_color();
     if (asset_decoded_image_open(&play_btn_play_img, "playing_plane/btn_play.png"))
-        recolor_play_btn_glyph((lv_draw_buf_t *) play_btn_play_img.decoder.decoded, accent);
+        recolor_play_btn_accent((lv_draw_buf_t *) play_btn_play_img.decoder.decoded, accent);
     if (asset_decoded_image_open(&play_btn_pause_img, "playing_plane/btn_pause.png"))
-        recolor_play_btn_glyph((lv_draw_buf_t *) play_btn_pause_img.decoder.decoded, accent);
+        recolor_play_btn_accent((lv_draw_buf_t *) play_btn_pause_img.decoder.decoded, accent);
 }
 
 const void * gui_player_play_btn_image_src(bool is_playing)
@@ -3733,6 +3985,7 @@ void gui_player_init(uint32_t screen_width, uint32_t screen_height) {
  * (see build_confirm_popup()'s own comment), not as children of
  * player_screen, so deleting player_screen alone would not reach them. */
 void gui_player_teardown(void) {
+    player_lyrics_set_open(false, false);
     /* build_volume_popup() creates this with an unguarded lv_timer_create()
      * -- for gui_reload.c's in-process UI reload, delete it here or the old
      * (leaked) timer keeps firing volume_popup_hide_timer_cb() forever,
@@ -4828,7 +5081,8 @@ void gui_player_handle_playback_error(audio_error_t err) {
 
 void gui_player_sync_topbar_visibility(lv_obj_t * screen) {
     if (player_dismiss_btn) {
-        if (current_settings.hide_player_topbar && screen == player_screen)
+        if (player_lyrics_open || player_lyrics_animating ||
+            (current_settings.hide_player_topbar && screen == player_screen))
             lv_obj_add_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);
         else
             lv_obj_remove_flag(player_dismiss_btn, LV_OBJ_FLAG_HIDDEN);

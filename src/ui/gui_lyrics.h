@@ -14,6 +14,10 @@ void gui_lyrics_poll_backdrop(void);
 void gui_lyrics_on_cover_changed(int current_playlist_index);
 void gui_lyrics_load_track(int index, const char * path);
 void gui_lyrics_open_screen(void);
+/* Borrows parent for content only; no navigation or player chrome changes.
+ * Caller must hide before deleting parent (including player teardown). */
+void gui_lyrics_show_embedded(lv_obj_t * parent, int32_t top, int32_t height);
+void gui_lyrics_hide_embedded(void);
 void lyrics_font_size_settings_row_cb(lv_event_t * e);
 
 bool gui_lyrics_has_background_work(void);

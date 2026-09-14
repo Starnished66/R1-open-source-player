@@ -475,8 +475,15 @@ static bool bluealsa_needs_source_restart(bool xq) {
 static void ensure_bluealsa_running(void) {
     pthread_mutex_lock(&bt_daemon_respawn_mutex);
     bool xq = atomic_load(&sbc_xq_enabled);
-    if (bluealsa_needs_source_restart(xq)) subprocess_kill_all_matching("bluealsa");
-    if (count_matching("bluealsa") > 0) {
+    /* subprocess_kill_all_matching() is fire-and-forget (SIGKILL, no
+     * waitpid), so the just-killed process can still be visible to a
+     * count_matching() ps snapshot taken right after -- once we've decided
+     * a restart is needed, respawn unconditionally rather than re-checking
+     * whether the old daemon "is still running", or that race can skip the
+     * respawn entirely and leave the stale (pre-restart) daemon in place. */
+    bool must_restart = bluealsa_needs_source_restart(xq);
+    if (must_restart) subprocess_kill_all_matching("bluealsa");
+    if (!must_restart && count_matching("bluealsa") > 0) {
         pthread_mutex_unlock(&bt_daemon_respawn_mutex);
         return;
     }

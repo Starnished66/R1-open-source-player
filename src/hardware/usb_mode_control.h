@@ -30,6 +30,12 @@ bool usb_mode_control_apply(usb_mode_t mode);
  * rather than guessing. */
 bool usb_mode_control_detect_current(usb_mode_t * out_mode);
 
+/* Read-only host-enumeration check: true only for a live Storage gadget whose
+ * bound controller reports exactly "configured" in /sys/class/udc/<name>/state.
+ * Binding or cable power alone is insufficient. Missing/unreadable state,
+ * invalid controller names, and DAC/ADB modes return false; no legacy fallback. */
+bool usb_mode_control_storage_host_configured(void);
+
 /* Best-effort physical USB-power/cable presence. Used only to detect a new
  * connection and (re)bind the default Storage gadget; it does not claim to
  * distinguish a PC host from a charge-only adapter. */

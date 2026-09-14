@@ -16,6 +16,8 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include "wifi_control.h"
 #include "bluetooth_control.h"
 #include "usb_mode_control.h"
+#include "battery.h"
+#include "usb_storage_session.h"
 #include "usb_dac_bridge.h"
 #include "firmware_update.h"
 #include "gui_subsonic.h"
@@ -1689,6 +1691,8 @@ static usb_mode_t usb_mode_switch_target;
 static bool usb_cable_state_initialized;
 static bool usb_cable_was_connected;
 static bool usb_storage_rebind_pending;
+static usb_storage_session_t usb_storage_session;
+static uint32_t usb_storage_host_check_tick;
 
 static void usb_mode_option_row_cb(lv_event_t * e);
 static void usb_mode_adb_toggle_cb(lv_event_t * e);
@@ -1855,7 +1859,20 @@ void poll_usb_mode_switch(void) {
  * missing UDC bind. Reapply Storage on every physical connection edge so a
  * PC enumerates it immediately. Never override an active DAC/ADB session. */
 void poll_usb_storage_hotplug(void) {
-    bool connected = usb_mode_control_cable_connected();
+    battery_external_power_state_t power = battery_get_external_power_state();
+    /* A failed power-supply read is not an unplug. Preserve both the cable
+     * edge and confirmed host session until power presence is known again. */
+    if (power == BATTERY_EXTERNAL_POWER_UNKNOWN) return;
+    bool connected = power == BATTERY_EXTERNAL_POWER_CONNECTED;
+    bool storage_configured = false;
+    if (connected && !usb_storage_session.host_seen && !usb_mode_switch_active &&
+        (!usb_cable_state_initialized || !usb_cable_was_connected ||
+         lv_tick_elaps(usb_storage_host_check_tick) >= 250)) {
+        usb_storage_host_check_tick = lv_tick_get();
+        storage_configured = usb_mode_control_storage_host_configured();
+    }
+    bool storage_session_ended = usb_storage_session_poll(&usb_storage_session,
+                                                          connected, storage_configured);
     if (!usb_cable_state_initialized) {
         usb_cable_state_initialized = true;
         usb_cable_was_connected = connected;
@@ -1865,17 +1882,9 @@ void poll_usb_storage_hotplug(void) {
         usb_storage_rebind_pending = connected;
     } else if (connected && !usb_cable_was_connected) {
         usb_storage_rebind_pending = true;
-    } else if (!connected && usb_cable_was_connected) {
-        /* On USB disconnect while in Storage mode, automatically initiate
-         * a library rescan if auto-rescan is enabled, updating the music
-         * database for newly transferred files. */
-        usb_mode_t live_mode;
-        if (gui_library_auto_rescan_enabled() && usb_mode_control_detect_current(&live_mode) &&
-            live_mode == USB_MODE_STORAGE) {
-            start_library_rescan();
-        }
     }
     usb_cable_was_connected = connected;
+    if (storage_session_ended && gui_library_auto_rescan_enabled()) start_library_rescan();
 
     if (!connected || !usb_storage_rebind_pending || usb_mode_switch_active) return;
 
@@ -1888,6 +1897,10 @@ void poll_usb_storage_hotplug(void) {
 
     usb_storage_rebind_pending = false;
     start_usb_mode_switch(USB_MODE_STORAGE);
+}
+
+bool gui_network_usb_storage_session_active(void) {
+    return usb_storage_session.host_seen && usb_cable_was_connected;
 }
 
 static void usb_mode_option_row_cb(lv_event_t * e) {

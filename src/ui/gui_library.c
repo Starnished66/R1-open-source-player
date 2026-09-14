@@ -1,5 +1,6 @@
 #include "gui_navigation.h"
 #include "gui_library.h"
+#include "gui_network.h"
 #include "assets.h"
 #include "idle_shutdown.h"
 #include "backlight.h"
@@ -5600,7 +5601,8 @@ void gui_library_poll_playlists(void) {
     if (!startup && !entered && now - last_check < 5000) return;
     last_check = now;
     usb_mode_t mode;
-    bool storage = usb_mode_control_cable_connected() && usb_mode_control_detect_current(&mode) && mode == USB_MODE_STORAGE;
+    bool storage = gui_network_usb_storage_session_active() &&
+                   usb_mode_control_detect_current(&mode) && mode == USB_MODE_STORAGE;
     bool returned = was_storage && !storage;
     was_storage = storage;
     if (storage) return;

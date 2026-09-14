@@ -29,6 +29,8 @@ void populate_bt_dac_screen(void);
 void poll_import_web_stop(void);
 void poll_usb_mode_switch(void);
 void poll_usb_storage_hotplug(void);
+/* UI-thread snapshot: a real Storage host was observed on this cable session. */
+bool gui_network_usb_storage_session_active(void);
 void build_bt_action_popup(void);
 void build_wifi_action_popup(void);
 void build_usb_dac_leave_popup(void);

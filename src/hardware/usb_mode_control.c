@@ -359,3 +359,40 @@ bool usb_mode_control_detect_current(usb_mode_t * out_mode) {
     }
     return false;
 }
+
+/* Read a complete bounded sysfs value, accepting its optional final newline.
+ * Reject truncation, embedded NULs and read errors rather than matching a
+ * valid-looking prefix of unavailable or malformed state. */
+static bool read_storage_host_value(const char * path, char * out, size_t size) {
+    FILE * f = fopen(path, "r");
+    if (!f) return false;
+    size_t len = fread(out, 1, size - 1, f);
+    bool ok = !ferror(f) && feof(f) && memchr(out, '\0', len) == NULL;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) return false;
+    if (len && out[len - 1] == '\n') --len;
+    out[len] = '\0';
+    return len != 0;
+}
+
+bool usb_mode_control_storage_host_configured(void) {
+    usb_mode_t mode;
+    if (!usb_mode_control_detect_current(&mode) || mode != USB_MODE_STORAGE) return false;
+
+    char controller[258]; /* NAME_MAX controller plus optional newline and NUL. */
+    if (!read_storage_host_value(ANDROID0_UDC_PATH, controller, sizeof(controller))) return false;
+    size_t len = strlen(controller);
+    if (len > 255 || strcmp(controller, "none") == 0 ||
+        strcmp(controller, ".") == 0 || strcmp(controller, "..") == 0) return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)controller[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) return false;
+    }
+
+    char path[300];
+    snprintf(path, sizeof(path), "/sys/class/udc/%s/state", controller);
+    char state[32];
+    return read_storage_host_value(path, state, sizeof(state)) &&
+           strcmp(state, "configured") == 0;
+}

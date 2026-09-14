@@ -100,6 +100,12 @@ feedback when a Subsonic connection or library request fails.
 
 Upgraded LVGL, the library that powers the interface, from **9.1 to 9.5**.
 
+Song lists now read track duration and format in the background, so titles
+appear without waiting for every audio file to be opened. Details fill in
+without resetting your scroll position, and results from pages you have left
+are ignored. WMA decoder initialization is also synchronized so background
+probing and playback can safely open WMA files at the same time.
+
 Shared UI builders and substantial cleanup across the player reduce duplicated
 code and make layouts easier to maintain. Other work includes safer handling
 of overlapping DLNA requests, reduced memory use during plugin reloads,

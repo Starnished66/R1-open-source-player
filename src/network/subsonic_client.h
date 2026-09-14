@@ -14,6 +14,10 @@ typedef struct {
     bool verify_tls;
 } subsonic_server_t;
 
+/* Safe diagnostic for the most recent API request on the calling thread.
+ * Copy before leaving a worker; never includes URLs or credentials. */
+const char * subsonic_last_error(void);
+
 typedef struct {
     char id[64];
     char name[128];

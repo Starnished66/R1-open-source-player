@@ -25,6 +25,7 @@ extern player_settings_t current_settings;
 #define SUBSONIC_STREAM_CACHE_DIR MUSIC_ROOT_DIR "/.subsonic_cache"
 #define TITLE_LABEL_LEFT_INSET 76
 #define TITLE_LABEL_DEFAULT_RIGHT_MARGIN 20
+#define SUBSONIC_REQUEST_TIMEOUT_MS 30000U
 
 extern bool playlist_files_append(const char * path, const char * dest_path);
 extern int search_remap_index(search_binding_id_t id, int list_index);
@@ -75,6 +76,7 @@ typedef struct {
 
 
 typedef enum {
+    SUBSONIC_BROWSE_ARTISTS,
     SUBSONIC_BROWSE_ALBUM_SONGS,
     SUBSONIC_BROWSE_ARTIST_ALBUMS,
     SUBSONIC_BROWSE_PLAYLIST_SONGS,
@@ -405,6 +407,9 @@ static subsonic_artist_t * subsonic_artists_cache = NULL;
 
 static int subsonic_artists_count = 0;
 
+/* A successful empty response is a loaded cache too. */
+static bool subsonic_artists_loaded = false;
+
 static subsonic_album_t * subsonic_albums_cache = NULL;
 
 static int subsonic_albums_count = 0;
@@ -464,6 +469,25 @@ static bool subsonic_songs_context_is_playlist = false;
 static char subsonic_songs_context_playlist_name[128] = "";
 
 static const char * subsonic_artist_label_of(int i) { return subsonic_artists_cache[i].name; }
+
+static bool populate_subsonic_artists(void) {
+    if (subsonic_artists_count == 0) {
+        compact_list_set_items(subsonic_artists_list, NULL, 0);
+        return true;
+    }
+    compact_list_item_t * items =
+        malloc(sizeof(*items) * (size_t) subsonic_artists_count);
+    if (!items) return false;
+    for (int i = 0; i < subsonic_artists_count; i++) items[i] = (compact_list_item_t){ subsonic_artist_label_of(i) };
+    compact_list_set_items(subsonic_artists_list, items, subsonic_artists_count);
+    free(items);
+    return true;
+}
+
+static void subsonic_copy_request_error(char * dest, size_t size, const char * fallback) {
+    const char * error = subsonic_last_error();
+    snprintf(dest, size, "%s", error && error[0] ? error : fallback);
+}
 
 static const char * subsonic_album_label_of(int i) { return subsonic_albums_cache[i].name; }
 
@@ -579,6 +603,8 @@ static pthread_t subsonic_browse_thread;
 static http_cancel_token_t subsonic_browse_cancel;
 
 static bool subsonic_browse_active = false;
+static bool subsonic_browse_timed_out = false;
+static uint32_t subsonic_browse_started_at = 0;
 
 static atomic_bool subsonic_browse_done_flag = false;
 
@@ -587,6 +613,10 @@ static volatile bool subsonic_browse_success_flag = false;
 static subsonic_browse_kind_t subsonic_browse_result_kind;
 
 static char subsonic_browse_result_title[128];
+
+static char subsonic_browse_result_error[256];
+
+static subsonic_artist_t * subsonic_browse_result_artists = NULL;
 
 static subsonic_song_t * subsonic_browse_result_songs = NULL;
 
@@ -602,6 +632,10 @@ static void * subsonic_browse_thread_func(void * arg) {
     int count = 0;
 
     switch (req->kind) {
+        case SUBSONIC_BROWSE_ARTISTS:
+            ok = subsonic_get_artists(&req->server, &subsonic_browse_result_artists, &count,
+                                      &subsonic_browse_cancel);
+            break;
         case SUBSONIC_BROWSE_ALBUM_SONGS:
             ok = subsonic_get_album_songs(&req->server, req->id, &subsonic_browse_result_songs, &count,
                                            &subsonic_browse_cancel);
@@ -624,6 +658,10 @@ static void * subsonic_browse_thread_func(void * arg) {
             break;
     }
 
+    if (!ok) {
+        subsonic_copy_request_error(subsonic_browse_result_error, sizeof(subsonic_browse_result_error),
+                                    "Failed to load from server");
+    }
     subsonic_browse_result_kind = req->kind;
     snprintf(subsonic_browse_result_title, sizeof(subsonic_browse_result_title), "%s", req->title);
     subsonic_browse_result_count = count;
@@ -633,21 +671,31 @@ static void * subsonic_browse_thread_func(void * arg) {
 }
 
 static void start_subsonic_browse(subsonic_browse_kind_t kind, const char * id, const char * title) {
-    if (subsonic_browse_active) return;
+    if (subsonic_browse_active || subsonic_connect_active) {
+        show_info_toast("Previous request still finishing");
+        return;
+    }
 
     subsonic_browse_request_t * req = calloc(1, sizeof(*req));
-    if (!req) return;
+    if (!req) {
+        show_error_toast("Not enough memory to load from server");
+        return;
+    }
     req->kind = kind;
     req->server = subsonic_server_from_settings();
     if (id) snprintf(req->id, sizeof(req->id), "%s", id);
     if (title) snprintf(req->title, sizeof(req->title), "%s", title);
 
+    subsonic_browse_result_artists = NULL;
+    subsonic_browse_result_error[0] = '\0';
     subsonic_browse_result_songs = NULL;
     subsonic_browse_result_albums = NULL;
     subsonic_browse_result_playlists = NULL;
     subsonic_browse_result_count = 0;
     atomic_store_explicit(&subsonic_browse_done_flag, false, memory_order_relaxed);
     subsonic_browse_success_flag = false;
+    subsonic_browse_timed_out = false;
+    subsonic_browse_started_at = lv_tick_get();
     http_cancel_token_init(&subsonic_browse_cancel);
     subsonic_browse_active = true;
 
@@ -657,20 +705,48 @@ static void start_subsonic_browse(subsonic_browse_kind_t kind, const char * id, 
         http_cancel_token_destroy(&subsonic_browse_cancel);
         free(req);
         gui_busy_hide(subsonic_browse_token);
+        subsonic_browse_token = 0;
+        show_error_toast("Thread launch failed");
     }
 }
 
 void poll_subsonic_browse(void) {
-    if (!subsonic_browse_active || !atomic_load_explicit(&subsonic_browse_done_flag, memory_order_acquire)) return;
+    if (!subsonic_browse_active) return;
+    if (!subsonic_browse_timed_out &&
+        lv_tick_elaps(subsonic_browse_started_at) >= SUBSONIC_REQUEST_TIMEOUT_MS) {
+        subsonic_browse_timed_out = true;
+        http_cancel_token_cancel(&subsonic_browse_cancel);
+        gui_busy_hide(subsonic_browse_token);
+        subsonic_browse_token = 0;
+        show_error_toast("Server request timed out after 30 seconds");
+        /* Keep the worker and its buffers alive; a later poll reaps it. */
+        return;
+    }
+    if (!atomic_load_explicit(&subsonic_browse_done_flag, memory_order_acquire)) return;
 
     subsonic_browse_active = false;
     pthread_join(subsonic_browse_thread, NULL);
     http_cancel_token_destroy(&subsonic_browse_cancel);
-    bool success = subsonic_browse_success_flag;
+    bool success = subsonic_browse_success_flag && !subsonic_browse_timed_out;
     int depth_before = gui_navigation_get_depth();
 
     if (success) {
         switch (subsonic_browse_result_kind) {
+            case SUBSONIC_BROWSE_ARTISTS:
+                compact_list_set_items(subsonic_artists_list, NULL, 0);
+                free(subsonic_artists_cache);
+                subsonic_artists_cache = subsonic_browse_result_artists;
+                subsonic_browse_result_artists = NULL;
+                subsonic_artists_count = subsonic_browse_result_count;
+                subsonic_artists_loaded = populate_subsonic_artists();
+                if (subsonic_artists_loaded) {
+                    nav_push(subsonic_artists_screen);
+                } else {
+                    success = false;
+                    snprintf(subsonic_browse_result_error, sizeof(subsonic_browse_result_error),
+                             "Not enough memory to load artists");
+                }
+                break;
             case SUBSONIC_BROWSE_ALBUM_SONGS:
             case SUBSONIC_BROWSE_PLAYLIST_SONGS:
                 free(subsonic_songs_cache);
@@ -726,13 +802,22 @@ void poll_subsonic_browse(void) {
                 break;
         }
     } else {
+        free(subsonic_browse_result_artists);
+        subsonic_browse_result_artists = NULL;
         free(subsonic_browse_result_songs);
+        subsonic_browse_result_songs = NULL;
         free(subsonic_browse_result_albums);
+        subsonic_browse_result_albums = NULL;
         free(subsonic_browse_result_playlists);
+        subsonic_browse_result_playlists = NULL;
     }
 
+    /* Timeout already dismissed busy and notified the user. */
+    if (subsonic_browse_timed_out) return;
     if (gui_navigation_get_depth() > depth_before) nav_remove_stack_slot(depth_before - 1);
-    else nav_pop();
+    else gui_busy_hide(subsonic_browse_token);
+    subsonic_browse_token = 0;
+    if (!success) show_error_toast(subsonic_browse_result_error);
 }
 
 static void subsonic_album_row_click_cb(int index) {
@@ -762,10 +847,15 @@ static void subsonic_playlist_row_click_cb(lv_event_t * e) {
 
 static void subsonic_menu_artists_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    /* Already fetched/populated at connect time (poll_subsonic_connect()) --
-     * no re-fetch needed here, matching every other "browse from cache"
-     * screen entry in this app. */
-    nav_push(subsonic_artists_screen);
+    if (subsonic_connect_active || subsonic_browse_active) {
+        show_info_toast("Previous request still finishing");
+        return;
+    }
+    if (subsonic_artists_loaded) {
+        nav_push(subsonic_artists_screen);
+    } else {
+        start_subsonic_browse(SUBSONIC_BROWSE_ARTISTS, NULL, "Artists");
+    }
 }
 
 static void subsonic_menu_playlists_row_cb(lv_event_t * e) {
@@ -867,10 +957,17 @@ static pthread_t subsonic_connect_thread;
 static http_cancel_token_t subsonic_connect_cancel;
 
 bool subsonic_connect_active = false;
+static bool subsonic_connect_timed_out = false;
+static uint32_t subsonic_connect_started_at = 0;
 
 static atomic_bool subsonic_connect_done_flag = false;
 
 static volatile bool subsonic_connect_success_flag = false;
+
+static bool subsonic_connect_artists_success = false;
+static subsonic_artist_t * subsonic_connect_result_artists = NULL;
+static int subsonic_connect_result_artists_count = 0;
+static char subsonic_connect_result_error[256];
 
 static subsonic_server_t subsonic_connect_pending_server;
 
@@ -879,14 +976,19 @@ static void * subsonic_connect_thread_func(void * arg) {
 
     bool authenticated = subsonic_ping(&req->server, &subsonic_connect_cancel);
     if (authenticated) {
-        free(subsonic_artists_cache);
-        subsonic_artists_cache = NULL;
-        subsonic_artists_count = 0;
         /* Authentication and initial browsing are separate operations. A
          * Navidrome account with an empty or temporarily unavailable artist
          * index is still a valid connection. */
-        (void)subsonic_get_artists(&req->server, &subsonic_artists_cache,
-                                   &subsonic_artists_count, &subsonic_connect_cancel);
+        subsonic_connect_artists_success =
+            subsonic_get_artists(&req->server, &subsonic_connect_result_artists,
+                                 &subsonic_connect_result_artists_count, &subsonic_connect_cancel);
+        if (!subsonic_connect_artists_success) {
+            subsonic_copy_request_error(subsonic_connect_result_error, sizeof(subsonic_connect_result_error),
+                                        "Failed to load artists");
+        }
+    } else {
+        subsonic_copy_request_error(subsonic_connect_result_error, sizeof(subsonic_connect_result_error),
+                                    "Failed to connect to server");
     }
 
     subsonic_connect_success_flag = authenticated;
@@ -896,11 +998,28 @@ static void * subsonic_connect_thread_func(void * arg) {
 }
 
 void poll_subsonic_connect(void) {
-    if (!subsonic_connect_active || !atomic_load_explicit(&subsonic_connect_done_flag, memory_order_acquire)) return;
+    if (!subsonic_connect_active) return;
+    if (!subsonic_connect_timed_out &&
+        lv_tick_elaps(subsonic_connect_started_at) >= SUBSONIC_REQUEST_TIMEOUT_MS) {
+        subsonic_connect_timed_out = true;
+        http_cancel_token_cancel(&subsonic_connect_cancel);
+        gui_busy_hide(subsonic_connect_token);
+        subsonic_connect_token = 0;
+        show_error_toast("Connection timed out after 30 seconds");
+        /* Do not join a request that may still be blocked in the network. */
+        return;
+    }
+    if (!atomic_load_explicit(&subsonic_connect_done_flag, memory_order_acquire)) return;
 
     subsonic_connect_active = false;
     pthread_join(subsonic_connect_thread, NULL);
     http_cancel_token_destroy(&subsonic_connect_cancel);
+    if (subsonic_connect_timed_out) {
+        free(subsonic_connect_result_artists);
+        subsonic_connect_result_artists = NULL;
+        subsonic_connect_result_artists_count = 0;
+        return; /* Discard even successful late authentication without navigation. */
+    }
     bool success = subsonic_connect_success_flag;
 
     /* Same nav_pop()-races-a-navigating-callback issue already fixed for
@@ -935,26 +1054,40 @@ void poll_subsonic_connect(void) {
                                         subsonic_connect_pending_server.verify_tls);
         settings_save(&current_settings);
 
-        /* Subsonic menu screen: pre-populates the artists list so opening it is
-         * immediate without an additional server fetch, while playlists and albums
-         * fetch on demand when their respective rows are tapped. */
-        {
-            compact_list_item_t * items =
-                malloc(sizeof(compact_list_item_t) * (size_t) (subsonic_artists_count > 0 ? subsonic_artists_count : 1));
-            for (int i = 0; i < subsonic_artists_count; i++) items[i] = (compact_list_item_t){ subsonic_artist_label_of(i) };
-            compact_list_set_items(subsonic_artists_list, items, subsonic_artists_count);
-            free(items);
+        /* Only commit the new connection's cache on the UI thread. Failed
+         * preload remains retryable; a successful empty list stays cached. */
+        subsonic_artists_loaded = false;
+        compact_list_set_items(subsonic_artists_list, NULL, 0);
+        free(subsonic_artists_cache);
+        subsonic_artists_cache = NULL;
+        subsonic_artists_count = 0;
+        if (subsonic_connect_artists_success) {
+            subsonic_artists_cache = subsonic_connect_result_artists;
+            subsonic_connect_result_artists = NULL;
+            subsonic_artists_count = subsonic_connect_result_artists_count;
+            subsonic_artists_loaded = populate_subsonic_artists();
+            if (!subsonic_artists_loaded) {
+                snprintf(subsonic_connect_result_error, sizeof(subsonic_connect_result_error),
+                         "Not enough memory to load artists");
+            }
         }
         nav_push(subsonic_menu_screen);
     }
+    free(subsonic_connect_result_artists);
+    subsonic_connect_result_artists = NULL;
     if (gui_navigation_get_depth() > depth_before) {
         nav_remove_stack_slot(depth_before - 1);
     } else {
         gui_busy_hide(subsonic_connect_token);
     }
     subsonic_connect_token = 0;
-    /* else (failure): silently stays wherever nav_pop() landed -- same
-     * documented gap as poll_subsonic_download above. */
+    if (!success) {
+        show_error_toast(subsonic_connect_result_error);
+    } else if (!subsonic_artists_loaded) {
+        char message[320];
+        snprintf(message, sizeof(message), "Failed to load artists: %s", subsonic_connect_result_error);
+        show_error_toast(message);
+    }
 }
 
 /* Bug report: opening Subsonic (or attempting a connection from within it)
@@ -984,15 +1117,28 @@ static bool subsonic_wifi_connected_guard(void) {
 }
 
 static void start_subsonic_connect(const subsonic_server_t * server) {
+    if (subsonic_connect_active || subsonic_browse_active) {
+        show_info_toast("Previous request still finishing");
+        return;
+    }
     if (!subsonic_wifi_connected_guard()) return;
     subsonic_connect_pending_server = *server;
 
     subsonic_connect_request_t * req = malloc(sizeof(*req));
-    if (!req) return;
+    if (!req) {
+        show_error_toast("Not enough memory to connect");
+        return;
+    }
     req->server = *server;
 
     atomic_store_explicit(&subsonic_connect_done_flag, false, memory_order_relaxed);
     subsonic_connect_success_flag = false;
+    subsonic_connect_timed_out = false;
+    subsonic_connect_started_at = lv_tick_get();
+    subsonic_connect_artists_success = false;
+    subsonic_connect_result_artists = NULL;
+    subsonic_connect_result_artists_count = 0;
+    subsonic_connect_result_error[0] = '\0';
     http_cancel_token_init(&subsonic_connect_cancel);
     subsonic_connect_active = true;
 
@@ -1002,9 +1148,9 @@ static void start_subsonic_connect(const subsonic_server_t * server) {
         free(req);
         subsonic_connect_active = false;
         http_cancel_token_destroy(&subsonic_connect_cancel);
-        gui_busy_dismiss(subsonic_connect_token);
+        gui_busy_hide(subsonic_connect_token);
         subsonic_connect_token = 0;
-        show_info_toast("Failed to start connection");
+        show_error_toast("Failed to start connection");
     }
 }
 
@@ -1242,6 +1388,7 @@ void gui_subsonic_init(void) {
  * frees its own prior state on re-registration (gui_library.c) -- nothing
  * extra needed here for that. */
 void gui_subsonic_teardown(void) {
+    subsonic_artists_loaded = false;
     gui_popup_teardown(&subsonic_download_confirm_popup);
     if (subsonic_entry_screen) { lv_obj_delete(subsonic_entry_screen); subsonic_entry_screen = NULL; }
     if (subsonic_saved_servers_screen) { lv_obj_delete(subsonic_saved_servers_screen); subsonic_saved_servers_screen = NULL; }
@@ -1273,7 +1420,10 @@ void gui_subsonic_cancel_background_work(void) {
         pthread_join(subsonic_connect_thread, NULL);
         subsonic_connect_active = false;
         http_cancel_token_destroy(&subsonic_connect_cancel);
+        free(subsonic_connect_result_artists);
+        subsonic_connect_result_artists = NULL;
         gui_busy_hide(subsonic_connect_token);
+        subsonic_connect_token = 0;
     }
     if (download_active) {
         pthread_join(download_thread, NULL);
@@ -1291,5 +1441,15 @@ void gui_subsonic_cancel_background_work(void) {
         pthread_join(subsonic_browse_thread, NULL);
         subsonic_browse_active = false;
         http_cancel_token_destroy(&subsonic_browse_cancel);
+        free(subsonic_browse_result_artists);
+        subsonic_browse_result_artists = NULL;
+        free(subsonic_browse_result_songs);
+        subsonic_browse_result_songs = NULL;
+        free(subsonic_browse_result_albums);
+        subsonic_browse_result_albums = NULL;
+        free(subsonic_browse_result_playlists);
+        subsonic_browse_result_playlists = NULL;
+        gui_busy_hide(subsonic_browse_token);
+        subsonic_browse_token = 0;
     }
 }

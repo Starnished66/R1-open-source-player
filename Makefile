@@ -301,7 +301,7 @@ endif
 # dependency here rather than relying on anything already on the device.
 ifeq ($(wildcard $(MBEDTLS_DIR)),)
 $(info Cloning mbedTLS v3.6.7...)
-$(shell git clone --depth 1 -b v3.6.7 https://github.com/Mbed-TLS/mbedtls.git)
+$(shell git clone --depth 1 -b v3.6.2 https://github.com/Mbed-TLS/mbedtls.git)
 endif
 
 # cJSON (MIT, single .c/.h pair) -- both Subsonic (?f=json) and Jellyfin

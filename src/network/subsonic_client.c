@@ -18,6 +18,12 @@
 #define SUBSONIC_TOTAL_TIMEOUT_MS 30000U
 #define SUBSONIC_MAX_API_RESPONSE (8U * 1024U * 1024U)
 
+static _Thread_local char api_error[128];
+
+const char * subsonic_last_error(void) {
+    return api_error[0] ? api_error : "Unexpected library response";
+}
+
 static void url_encode(const char * in, char * out, size_t out_size) {
     static const char hex[] = "0123456789ABCDEF";
     size_t pos = 0;
@@ -86,6 +92,7 @@ static void normalize_base_url(const char * input, char * out, size_t out_size) 
  * Caller owns *out_root upon success. */
 static cJSON * api_request(const subsonic_server_t * server, const char * endpoint, const char * extra_params,
                            cJSON ** out_root, http_cancel_token_t * cancel) {
+    api_error[0] = '\0';
     char auth[512];
     build_auth_query(server, auth, sizeof(auth));
 
@@ -111,19 +118,39 @@ static cJSON * api_request(const subsonic_server_t * server, const char * endpoi
     http_response_t http_response;
     bool ok = http_request_ex(&request, cancel, &http_response);
     if (!ok || http_response.status != 200 || !http_response.body) {
+        if (!ok)
+            snprintf(api_error, sizeof(api_error), "Server request failed: %s",
+                     http_response.error ? http_response.error : "network error");
+        else if (http_response.status != 200)
+            snprintf(api_error, sizeof(api_error), "Server returned HTTP %d", http_response.status);
+        else
+            snprintf(api_error, sizeof(api_error), "Server returned an empty response");
         http_response_free(&http_response);
         return NULL;
     }
 
     cJSON * root = cJSON_ParseWithLength((const char *) http_response.body, http_response.body_len);
     http_response_free(&http_response);
-    if (!root) return NULL;
+    if (!root) {
+        snprintf(api_error, sizeof(api_error), "Server returned invalid JSON");
+        return NULL;
+    }
 
     cJSON * resp = cJSON_GetObjectItemCaseSensitive(root, "subsonic-response");
-    if (!resp) { cJSON_Delete(root); return NULL; }
+    if (!resp) {
+        snprintf(api_error, sizeof(api_error), "Server response is not Subsonic JSON");
+        cJSON_Delete(root);
+        return NULL;
+    }
 
     cJSON * status_item = cJSON_GetObjectItemCaseSensitive(resp, "status");
     if (!cJSON_IsString(status_item) || strcmp(status_item->valuestring, "ok") != 0) {
+        cJSON * error = cJSON_GetObjectItemCaseSensitive(resp, "error");
+        cJSON * code = cJSON_GetObjectItemCaseSensitive(error, "code");
+        if (cJSON_IsNumber(code))
+            snprintf(api_error, sizeof(api_error), "Subsonic error %d", code->valueint);
+        else
+            snprintf(api_error, sizeof(api_error), "Invalid Subsonic response status");
         cJSON_Delete(root);
         return NULL;
     }

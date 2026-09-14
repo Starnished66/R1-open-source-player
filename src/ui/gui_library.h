@@ -8,6 +8,8 @@
 typedef struct group_song_entry_s {
     char * path;
     char * title;
+    int32_t disc_number;
+    bool show_disc_header;
 } group_song_entry_t;
 
 void free_group_song_entries(group_song_entry_t * entries, int count);

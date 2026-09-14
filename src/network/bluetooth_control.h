@@ -134,7 +134,7 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
  * file/stanza the stock bt_init script creates once if missing (real
  * content read directly off a real device, default codec "ldac" /
  * ldac_eqmid "LDAC_ABR"). `codec` is one of "auto"/"ldac_hq"/"ldac_sq"/
- * "aptx"/"aac"/"sbc"; "auto" omits the codec line entirely so bluealsa
+ * "aptx"/"aac"/"sbc"/"sbc_xq"; "auto" omits the codec line entirely so bluealsa
  * negotiates automatically instead of this file forcing one. LDAC_HQ/
  * LDAC_SQ are this project's best-effort mapping of "LDAC quality"/"LDAC
  * Standard" to LDAC's own quality-mode naming -- the stock script's only
@@ -143,6 +143,14 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
  * accepts them. Blocking (just a file write); call off the UI thread for
  * consistency with everything else here. */
 bool bt_control_set_codec(const char * codec);
+
+/* Restore the encoder preference before Bluetooth workers start; no I/O.
+ * SBC-XQ changes take effect after Bluetooth is turned off and on, or a
+ * profile restart. They do not alter Bluetooth DAC receiver encoding. */
+void bt_control_restore_codec_preference(const char * codec);
+/* ALSA PCM used for outgoing audio. SBC-XQ explicitly selects SBC while
+ * daemon startup supplies --sbc-quality=xq. Returned storage is static. */
+const char * bt_control_get_playback_pcm(void);
 
 /* Keeps this app's own playback volume and a connected a2dp-source
  * accessory's (headphones/speaker this device streams TO) AVRCP volume in

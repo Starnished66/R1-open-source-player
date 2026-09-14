@@ -4,6 +4,7 @@
 #include "subprocess.h"
 #include "audio.h"
 
+#include <dirent.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -19,6 +20,19 @@
 /* Guards bt_control_init_chip(), bt_control_enable(), and bt_control_disable()
  * so chip firmware operations and power toggles are strictly serialized across threads. */
 static pthread_mutex_t bt_chip_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Shared by fallback bring-up and explicit profile changes. */
+static pthread_mutex_t bt_daemon_respawn_mutex = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool sbc_xq_enabled = false;
+
+void bt_control_restore_codec_preference(const char * codec) {
+    atomic_store(&sbc_xq_enabled, codec && strcmp(codec, "sbc_xq") == 0);
+}
+
+const char * bt_control_get_playback_pcm(void) {
+    /* Playback uses pcm.bluealsa, not the legacy bt_alsa_sink stanza.
+     * XQ still negotiates SBC; it must not silently select AAC/LDAC. */
+    return atomic_load(&sbc_xq_enabled) ? "bluealsa:CODEC=SBC" : "bluealsa";
+}
 
 static pthread_mutex_t bt_dac_info_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t bt_dac_monitor_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -426,11 +440,50 @@ bool bt_control_is_powered(void) {
  * needed a fresh bring-up; bt_control_apply_output_settings() still layers
  * DAC mode / --a2dp-volume on top via its own call sites once the user
  * touches a Bluetooth output setting. */
+/* Inspect the real daemon, excluding bluealsa-cli/aplay. Stock bt_resume
+ * can start it without our encoder options, including after a reboot.
+ * Leave an existing receiver profile alone: XQ is an encoder preference. */
+static bool bluealsa_needs_source_restart(bool xq) {
+    DIR * proc = opendir("/proc");
+    if (!proc) return false;
+    bool restart = false;
+    struct dirent * entry;
+    while ((entry = readdir(proc))) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        char path[320];
+        snprintf(path, sizeof(path), "/proc/%s/cmdline", entry->d_name);
+        FILE * f = fopen(path, "r");
+        if (!f) continue;
+        char args[2048] = {0};
+        size_t len = fread(args, 1, sizeof(args) - 1, f);
+        fclose(f);
+        if (!len) continue;
+        const char * name = strrchr(args, '/');
+        name = name ? name + 1 : args;
+        if (strcmp(name, "bluealsa") != 0) continue;
+        bool sink = false, active_xq = false;
+        for (size_t pos = strlen(args) + 1; pos < len; pos += strlen(args + pos) + 1) {
+            if (strcmp(args + pos, "a2dp-sink") == 0) sink = true;
+            if (strcmp(args + pos, "--sbc-quality=xq") == 0) active_xq = true;
+        }
+        if (!sink && active_xq != xq) restart = true;
+    }
+    closedir(proc);
+    return restart;
+}
+
 static void ensure_bluealsa_running(void) {
-    if (count_matching("bluealsa") > 0) return;
+    pthread_mutex_lock(&bt_daemon_respawn_mutex);
+    bool xq = atomic_load(&sbc_xq_enabled);
+    if (bluealsa_needs_source_restart(xq)) subprocess_kill_all_matching("bluealsa");
+    if (count_matching("bluealsa") > 0) {
+        pthread_mutex_unlock(&bt_daemon_respawn_mutex);
+        return;
+    }
     char * argv[] = { (char *) "bluealsa", (char *) "-p", (char *) "a2dp-source",
-                       (char *) "--a2dp-volume", NULL };
+                       (char *) "--a2dp-volume", xq ? (char *) "--sbc-quality=xq" : NULL, NULL };
     subprocess_spawn_daemon(argv);
+    pthread_mutex_unlock(&bt_daemon_respawn_mutex);
 }
 
 bool bt_control_init_chip(void) {
@@ -956,10 +1009,6 @@ static bool last_applied_dac_mode_enabled = false;
 static bool last_applied_volume_sync_enabled = false;
 static bool output_settings_ever_applied = false;
 
-/* Serializes bt_control_apply_output_settings() against itself across the
- * two independent threads that can call it. */
-static pthread_mutex_t bt_daemon_respawn_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 #define BLUEALSA_STARTUP_LOG_PATH "/usr/data/bluealsa_startup.log"
 
 /* Spawns bluealsa daemon, logging startup output if TEST_BUILD_TAG is defined. */
@@ -999,6 +1048,8 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
     argv[i++] = (char *) "-p";
     argv[i++] = dac_mode_enabled ? (char *) "a2dp-sink" : (char *) "a2dp-source";
     if (volume_sync_enabled) argv[i++] = (char *) "--a2dp-volume";
+    if (!dac_mode_enabled && atomic_load(&sbc_xq_enabled))
+        argv[i++] = (char *) "--sbc-quality=xq";
     /* Codec restriction (-c SBC -c AAC, excluding LDAC) TEMPORARILY REMOVED
      * for a live A/B test: the stock player's own bluealsa_profile script
      * runs with no codec restriction at all and was just confirmed on a
@@ -1053,7 +1104,10 @@ static void bt_control_reapply_last_output_settings(void) {
     bool volume_sync = last_applied_volume_sync_enabled;
     pthread_mutex_unlock(&bt_daemon_respawn_mutex);
 
-    if (!ever_applied) return; /* this session never asked for a particular profile -- nothing to restore */
+    if (!ever_applied) {
+        ensure_bluealsa_running(); /* restore saved source encoder quality too */
+        return;
+    }
     bt_control_apply_output_settings(dac_mode, volume_sync);
 }
 
@@ -1073,13 +1127,15 @@ bool bt_control_set_codec(const char * codec) {
             fprintf(f, "            codec \"ldac\"\n");
             fprintf(f, "            ldac_eqmid \"%s\"\n", strcmp(codec, "ldac_hq") == 0 ? "LDAC_HQ" : "LDAC_SQ");
         } else {
-            fprintf(f, "            codec \"%s\"\n", codec);
+            fprintf(f, "            codec \"%s\"\n", strcmp(codec, "sbc_xq") == 0 ? "sbc" : codec);
         }
     }
     fprintf(f, "        }\n");
     fprintf(f, "    }\n");
     fprintf(f, "}\n");
 
-    fclose(f);
-    return true;
+    bool ok = !ferror(f);
+    if (fclose(f) != 0) ok = false;
+    if (ok) bt_control_restore_codec_preference(codec);
+    return ok;
 }

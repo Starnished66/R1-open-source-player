@@ -1365,6 +1365,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     boot_checkpoint("gui_init entered");
 #endif
     settings_load(&current_settings);
+    bt_control_restore_codec_preference(current_settings.bt_codec);
     db_log_set_enabled(current_settings.db_logging_enabled);
     usb_dac_bridge_set_debug_log_enabled(current_settings.db_logging_enabled);
     headphone_status_refresh_earpods_adc();

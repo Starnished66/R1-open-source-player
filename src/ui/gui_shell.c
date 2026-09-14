@@ -2807,9 +2807,8 @@ static void poll_bt_toggle(void) {
     start_refresh_bt_icon(); /* re-reads the real state -- updates the status bar/drawer icons and (once done) the Bluetooth screen's toggle row */
 }
 
-/* Reapplies persisted bt_dac_mode_enabled configuration asynchronously
- * at startup, launching the necessary bluealsa and bt-agent processes without
- * blocking the UI thread. */
+/* Reconciles the saved source encoder quality, or restores DAC mode,
+ * asynchronously once Bluetooth startup is ready. */
 static pthread_t bt_dac_startup_reapply_thread;
 static bool bt_dac_startup_reapply_active = false;
 static bool bt_dac_startup_reapply_started = false;
@@ -2818,18 +2817,20 @@ static atomic_bool bt_dac_startup_reapply_done_flag = false;
 static void * bt_dac_startup_reapply_thread_func(void * arg) {
     (void) arg;
     bt_control_init_chip();
-    bt_control_enable();
-    mark_bt_media_player_enable_pending();
-    bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
+    if (current_settings.bt_dac_mode_enabled) {
+        bt_control_enable();
+        mark_bt_media_player_enable_pending();
+        bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
+    }
     atomic_store_explicit(&bt_dac_startup_reapply_done_flag, true, memory_order_release); /* written last -- poll_bt_dac_startup_reapply only checks this flag */
     return NULL;
 }
 
-/* Called once from gui_init(), only if bt_dac_mode_enabled was already true
- * at load time (a fresh toggle-on tap already goes through
- * bt_dac_toggle_cb() directly and doesn't need this). */
+/* Also reconcile an already-powered source daemon with the saved encoder
+ * preference. Stock boot scripts do not know about SBC-XQ. Do not turn on
+ * an otherwise-disabled radio just because an output codec was saved. */
 static void start_bt_dac_startup_reapply_if_needed(void) {
-    if (!current_settings.bt_dac_mode_enabled || bt_dac_startup_reapply_started ||
+    if ((!current_settings.bt_dac_mode_enabled && !bt_is_powered_cached) || bt_dac_startup_reapply_started ||
         !refresh_bt_startup_readiness()) return;
     bt_dac_startup_reapply_started = true;
     bt_dac_startup_reapply_active = true;

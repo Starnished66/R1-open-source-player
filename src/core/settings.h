@@ -106,7 +106,7 @@ typedef struct {
      * --a2dp-volume`, no a2dp-sink, no forced codec). */
     bool bt_volume_sync_enabled; /* --a2dp-volume: HW volume buttons also change the paired device's volume */
     bool bt_dac_mode_enabled;    /* a2dp-sink profile: lets another device stream audio TO this one */
-    char bt_codec[16];           /* "auto"/"ldac_hq"/"ldac_sq"/"aptx"/"aac"/"sbc" -- written into alsa.conf */
+    char bt_codec[16];           /* "auto"/"ldac_hq"/"ldac_sq"/"aptx"/"aac"/"sbc"/"sbc_xq" */
     /* When true, BLE devices without a broadcast name are hidden from the
      * "Available Devices" list (shown as raw MAC addresses otherwise).
      * Paired devices are always shown regardless of this setting. */

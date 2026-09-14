@@ -865,6 +865,16 @@ sd_ready_test:
 	    -o $(BUILD_TARGET_DIR)/sd_ready_test
 	./$(BUILD_TARGET_DIR)/sd_ready_test
 
+# Isolated host codec tests; include real Bluetooth code and discard unused
+# hardware paths. The wrapper redirects /usr/data/alsa.conf to a temp fixture.
+.PHONY: bluetooth-codec-selftest
+bluetooth-codec-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -ffunction-sections -fdata-sections -Isrc/network -Isrc/core -Isrc/audio \
+	    src/network/bluetooth_codec_test.c -Wl,--gc-sections -Wl,--wrap=fopen -lpthread \
+	    -o $(BUILD_TARGET_DIR)/bluetooth_codec_test
+	./$(BUILD_TARGET_DIR)/bluetooth_codec_test
+
 .PHONY: playlist-selftest
 .PHONY: ui-style-selftest
 # Headless real-LVGL layout tests: no SDL development package or device

@@ -1328,6 +1328,7 @@ typedef struct {
 static const bt_codec_option_t bt_codec_options[] = {
     { "auto", "Auto" },      { "ldac_hq", "LDAC Quality" }, { "ldac_sq", "LDAC Standard" },
     { "aptx", "aptX" },      { "aac", "AAC" },              { "sbc", "SBC" },
+    { "sbc_xq", "SBC-XQ" },
 };
 #define BT_CODEC_OPTION_COUNT (sizeof(bt_codec_options) / sizeof(bt_codec_options[0]))
 
@@ -1347,10 +1348,18 @@ static void populate_bt_codec_screen(void) {
 static void bt_codec_option_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int index = (int) (intptr_t) lv_event_get_user_data(e);
+    if (index < 0 || (size_t) index >= BT_CODEC_OPTION_COUNT) return;
+    const char * codec = bt_codec_options[index].value;
+    bool quality_changed = (strcmp(current_settings.bt_codec, "sbc_xq") == 0) !=
+                           (strcmp(codec, "sbc_xq") == 0);
+    if (!bt_control_set_codec(codec)) {
+        show_error_toast("Could not save Bluetooth codec");
+        return;
+    }
     snprintf(current_settings.bt_codec, sizeof(current_settings.bt_codec), "%s", bt_codec_options[index].value);
     settings_save(&current_settings);
-    bt_control_set_codec(current_settings.bt_codec);
     populate_bt_codec_screen();
+    if (quality_changed) show_info_toast("Turn Bluetooth off and on to apply");
 }
 
 static lv_obj_t * build_bt_codec_screen(void) {

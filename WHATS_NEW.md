@@ -33,6 +33,9 @@ feedback when a Subsonic connection or library request fails.
 
 ## Playback and everyday controls
 
+- Added **SBC-XQ** to Bluetooth codec settings for higher-quality SBC
+  output to compatible headphones. Turn Bluetooth off and on after
+  switching into or out of this mode.
 - Added native 24-bit USB audio output and support for 24-bit crossfades.
   Improved high-sample-rate playback and fixed USB DAC compatibility with macOS.
 - Improved Bluetooth DAC buffering for longer listening sessions and fixed

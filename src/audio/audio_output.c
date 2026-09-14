@@ -2,6 +2,7 @@
 #include "debug_log.h"
 #include "subprocess.h"
 #include "headphone_status.h"
+#include "bluetooth_control.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -181,7 +182,7 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
         active_format = format;
         pthread_mutex_unlock(&state_mutex);
     } else if (target == OUTPUT_TARGET_BT) {
-        if (!spawn_aplay("bluealsa", channels, sample_rate, PCM_FORMAT_S16_LE, &bt_aplay_pid, &bt_aplay_fd)) return false;
+        if (!spawn_aplay(bt_control_get_playback_pcm(), channels, sample_rate, PCM_FORMAT_S16_LE, &bt_aplay_pid, &bt_aplay_fd)) return false;
         pthread_mutex_lock(&state_mutex);
         active_target = OUTPUT_TARGET_BT;
         active_format = PCM_FORMAT_S16_LE;

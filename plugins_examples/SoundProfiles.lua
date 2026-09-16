@@ -1,4 +1,4 @@
-plugin.define({ id = "example.sound_profiles", name = "Sound Profiles", version = "1.0", api_min = 1 })
+plugin.define({ id = "example.sound_profiles", name = "Sound Profiles", version = "1.1", api_min = 1 })
 
 -- Sound profile switcher, adds a "Sound Profile" row to Settings -> Music
 -- Settings -> Audio.
@@ -10,6 +10,7 @@ plugin.define({ id = "example.sound_profiles", name = "Sound Profiles", version 
 -- the top of this script on every boot.
 
 local STATE_PATH = plugin.sd_root() .. "/.plugins/.eq_profile_state"
+local AUTOEQ_ENABLED_PATH = plugin.sd_root() .. "/.plugins/.autoeq_enabled"
 
 -- Matches peq.c's own set_defaults() exactly (ISO-standard 10-band layout,
 -- band 0 a low shelf, band 9 a high shelf, the rest peaking bells) so a
@@ -26,9 +27,31 @@ local BAND_TYPE  = { "low_shelf", "peaking", "peaking", "peaking", "peaking",
 -- other band is left disabled at its default gain (0dB), the same "skip
 -- disabled bands" fast path peq_process() already takes.
 local PROFILES = {
-    { key = "bass_boost",   name = "Bass Boost",   gains = { [1] = 6, [2] = 4, [3] = 2 } },
-    { key = "vocal",        name = "Vocal",         gains = { [1] = -2, [6] = 3, [7] = 4, [8] = 3 } },
-    { key = "treble_boost", name = "Treble Boost", gains = { [8] = 3, [9] = 4, [10] = 5 } },
+    { key = "bass_boost",        name = "Bass Boost",        gains = { [1] = 6, [2] = 4, [3] = 2 } },
+    { key = "vocal",             name = "Vocal",             gains = { [1] = -2, [6] = 3, [7] = 4, [8] = 3 } },
+    { key = "treble_boost",      name = "Treble Boost",      gains = { [8] = 3, [9] = 4, [10] = 5 } },
+
+    -- Harman In-Ear 2017 (IE) approximation from the supplied target graph.
+    -- The original IE curve has a strong bass shelf, a deep lower-mid dip,
+    -- a pronounced 2-4 kHz rise, and a treble fall above ~8-10 kHz.
+    -- This 10-band EQ approximates that shape with the plugin's fixed bands.
+    -- 16 kHz is kept at 0 dB because the very steep end-of-graph fall is
+    -- strongly affected by the measurement/coupler limit and cannot be
+    -- represented cleanly by the 0.2-Q high shelf.
+    { key = "harman_ie_2017", name = "Harman IE 2017", gains = {
+        [1] = 8, [2] = 6, [3] = 2, [4] = -2, [5] = -1,
+        [6] = 0, [7] = 6, [8] = 9, [9] = 6, [10] = 0
+    } },
+
+    -- V-shaped: elevated bass and upper treble with a recessed midrange.
+    { key = "v_shape",           name = "V Shape",           gains = {
+        [1] = 4, [2] = 3, [3] = 1, [6] = -2, [7] = -2, [8] = 2, [9] = 3, [10] = 3
+    } },
+
+    -- U-shaped: milder V-shape with less midrange recession.
+    { key = "u_shape",           name = "U Shape",           gains = {
+        [1] = 3, [2] = 2, [3] = 1, [6] = -1, [7] = -1, [8] = 1, [9] = 2, [10] = 2
+    } },
 }
 
 local function profile_path(key)
@@ -48,6 +71,14 @@ local function write_state(key)
     if not f then return end
     f:write(key)
     f:close()
+end
+
+local function autoeq_enabled()
+    local f = io.open(AUTOEQ_ENABLED_PATH, "r")
+    if not f then return false end
+    local v = f:read("*l")
+    f:close()
+    return v == "1"
 end
 
 -- Generates profile's .peq file the first time it's ever selected (peq.c
@@ -93,13 +124,22 @@ local function apply_profile(key)
 end
 
 local current_key = read_state()
-apply_profile(current_key)
+if autoeq_enabled() then
+    current_key = "flat"
+    plugin.eq_reset()
+else
+    apply_profile(current_key)
+end
 
-plugin.register_list_item("music_audio", "Sound Profile", function()
+plugin.register_list_item("playback", "Sound Profile", function()
     local names = { "Flat (Default)" }
     for _, p in ipairs(PROFILES) do table.insert(names, p.name) end
 
     plugin.show_list("Sound Profile", names, function(index)
+        if autoeq_enabled() then
+            plugin.show_toast("AutoEq is ON — turn it OFF to use Sound Profile", 3500)
+            return
+        end
         local key = (index == 1) and "flat" or PROFILES[index - 1].key
         if key == current_key then return end
         current_key = key

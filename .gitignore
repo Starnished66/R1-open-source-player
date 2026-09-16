@@ -62,6 +62,7 @@
 /build_host/
 /build_ui_test/
 /build_bootloader_test/
+/build_test/
 /build_host_*/
 /build_target/
 /build_target_*/

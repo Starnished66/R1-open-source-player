@@ -10,6 +10,17 @@
 
 #define BACKLIGHT_CLASS_DIR "/sys/class/backlight"
 
+/* Same node power_suspend.c already blanks/unblanks around full suspend
+ * (confirmed working there on real hardware) -- reused here for a plain
+ * screen-timeout off too, instead of just zeroing PWM brightness. Blanking
+ * the framebuffer powers down the panel driver itself (and, on this
+ * hardware, the touch controller sharing its power rail) rather than
+ * leaving the panel/touch powered with the backlight LED merely dimmed to
+ * nothing, so it saves more power. Touch is never relied on to wake the
+ * screen (see gui.c's own comment: only the power button does), so losing
+ * touch while off is expected, not a regression. */
+#define SYSFS_FB_BLANK "/sys/class/graphics/fb0/blank"
+
 /* Doesn't hardcode "backlight_pwm0" -- same reasoning as battery.c's dynamic
  * power_supply scan, in case a different unit/firmware names its backlight
  * device differently. Unlike power_supply, everything under this class
@@ -159,20 +170,24 @@ static pthread_cond_t brightness_worker_cond = PTHREAD_COND_INITIALIZER;
 static bool brightness_worker_ready = false;
 static bool brightness_worker_pending = false;
 
-static void write_screen_off(void) {
-    pthread_mutex_lock(&backlight_io_mutex);
-    char device_name[64];
-    if (!find_backlight_device(device_name, sizeof(device_name))) goto done;
+/* fb0/blank is a distinct sysfs node from anything backlight_io_mutex
+ * protects (brightness_fd, last_written_raw, the cached device name/max) --
+ * no lock needed here. fb_blanked tracks the last value written so a run of
+ * on/off or dim/undim requests (e.g. a live brightness-slider drag while
+ * the screen is already on) doesn't re-blank or re-unblank redundantly. */
+static bool fb_blanked = false;
 
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s/brightness", BACKLIGHT_CLASS_DIR, device_name);
-    FILE * f = fopen(path, "w");
-    if (!f) goto done;
-    fprintf(f, "0");
+static void write_fb_blank(bool blank) {
+    if (blank == fb_blanked) return;
+    FILE * f = fopen(SYSFS_FB_BLANK, "w");
+    if (!f) return;
+    fprintf(f, blank ? "4" : "0"); /* FB_BLANK_POWERDOWN / FB_BLANK_UNBLANK */
     fclose(f);
-    last_written_raw = -1;
-done:
-    pthread_mutex_unlock(&backlight_io_mutex);
+    fb_blanked = blank;
+}
+
+static void write_screen_off(void) {
+    write_fb_blank(true);
 }
 
 static void apply_requested_brightness(void) {
@@ -181,8 +196,17 @@ static void apply_requested_brightness(void) {
     int normal = restore_percent;
     int target = screen_dimmed && normal > 5 ? 5 : normal;
     pthread_mutex_unlock(&screen_power_mutex);
-    if (on) backlight_set_percent(target);
-    else write_screen_off();
+    if (on) {
+        /* Unblank before re-driving the PWM channel -- some panel/backlight
+         * controllers need a fresh brightness write after coming out of
+         * blank rather than resuming from whatever the register already
+         * held, so this order matters even though blanking never touched
+         * that register itself. */
+        write_fb_blank(false);
+        backlight_set_percent(target);
+    } else {
+        write_screen_off();
+    }
 }
 
 static void * brightness_worker_main(void * unused) {

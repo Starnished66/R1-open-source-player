@@ -609,10 +609,23 @@ static bool decoder_seek(decoder_t * dec, uint64_t frame) {
     return false;
 }
 
+/* Every branch nulls the union member it just freed, making this safe to
+ * call more than once in a row on the same decoder_t without an
+ * intervening decoder_open() (whose own memset() would otherwise be the
+ * only thing clearing a stale pointer). reopen_decoder_at()'s premature-EOF
+ * recovery path relies on exactly this: it calls decoder_close() itself
+ * when a post-reopen seek fails, then returns false, and the retry loop
+ * that called it goes straight into another decoder_close() (via the next
+ * reopen_decoder_at() attempt) without an open in between. Before this
+ * nulled the pointer, that second close ran drflac_close() (etc.) again on
+ * an already-freed pointer -- a real use-after-free/double-free, reliably
+ * reachable by any local file whose decoder opens fine but whose audio data
+ * is corrupt at the retry position (confirmed independently with ffmpeg on
+ * a real-world file: "invalid sync code" / "invalid frame header"). */
 static void decoder_close(decoder_t * dec) {
     switch (dec->type) {
         case DECODER_FLAC:
-            if (dec->as.flac) drflac_close(dec->as.flac);
+            if (dec->as.flac) { drflac_close(dec->as.flac); dec->as.flac = NULL; }
             if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_MP3:
@@ -620,6 +633,7 @@ static void decoder_close(decoder_t * dec) {
                 drmp3_bind_seek_table(dec->as.mp3, 0, NULL);
                 drmp3_uninit(dec->as.mp3);
                 free(dec->as.mp3);
+                dec->as.mp3 = NULL;
             }
             free(dec->mp3_seek_points);
             dec->mp3_seek_points = NULL;
@@ -627,32 +641,32 @@ static void decoder_close(decoder_t * dec) {
             if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_WAV:
-            if (dec->as.wav) { drwav_uninit(dec->as.wav); free(dec->as.wav); }
+            if (dec->as.wav) { drwav_uninit(dec->as.wav); free(dec->as.wav); dec->as.wav = NULL; }
             break;
         case DECODER_AIFF:
-            if (dec->as.aiff) aiff_close(dec->as.aiff);
+            if (dec->as.aiff) { aiff_close(dec->as.aiff); dec->as.aiff = NULL; }
             break;
         case DECODER_DSD:
-            if (dec->as.dsd) dsd_close(dec->as.dsd);
+            if (dec->as.dsd) { dsd_close(dec->as.dsd); dec->as.dsd = NULL; }
             break;
         case DECODER_AAC:
-            if (dec->as.aac) aac_close(dec->as.aac);
+            if (dec->as.aac) { aac_close(dec->as.aac); dec->as.aac = NULL; }
             if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_ALAC:
-            if (dec->as.alac) alac_close(dec->as.alac);
+            if (dec->as.alac) { alac_close(dec->as.alac); dec->as.alac = NULL; }
             break;
         case DECODER_APE:
-            if (dec->as.ape) ape_close(dec->as.ape);
+            if (dec->as.ape) { ape_close(dec->as.ape); dec->as.ape = NULL; }
             break;
         case DECODER_WMA:
-            if (dec->as.wma) wma_close(dec->as.wma);
+            if (dec->as.wma) { wma_close(dec->as.wma); dec->as.wma = NULL; }
             break;
         case DECODER_OPUS:
-            if (dec->as.opus) opus_close(dec->as.opus);
+            if (dec->as.opus) { opus_close(dec->as.opus); dec->as.opus = NULL; }
             break;
         case DECODER_VORBIS:
-            if (dec->as.vorbis) vorbis_close(dec->as.vorbis);
+            if (dec->as.vorbis) { vorbis_close(dec->as.vorbis); dec->as.vorbis = NULL; }
             break;
     }
 }

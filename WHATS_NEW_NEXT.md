@@ -44,12 +44,12 @@ computer connection can still trigger a scan even if no files were changed.
   command-line tools on the UI thread. Read-only Wi-Fi queries use bounded
   timeouts, including a single elapsed-time budget for subprocess output
   and exit handling.
-- Temporarily reverted the recent multi-disc album sorting and "Disc N"
-  dividers for the next slowdown comparison. Single-album lists again use
-  paged database order; existing Artist "All Songs" sorting is preserved.
-- Temporarily reverted asynchronous song-list duration/codec probing for
-  slowdown testing. Durations are again read when building the list, so
-  opening a large list may take longer. WMA fixes are unchanged.
+- Restored multi-disc album sorting and "Disc N" dividers. Single-album
+  lists now sort by effective disc and track order, with untagged tracks
+  treated as disc 1; Artist "All Songs" keeps its existing album/disc order.
+- Restored asynchronous duration and codec probing for song-list rows, so
+  list construction no longer waits for every file probe. WMA fixes remain
+  unchanged.
 - Restored the optional SBC-XQ Bluetooth setting for another device test
   alongside the UI responsiveness fixes. It uses SBC with higher encoder
   quality for outgoing audio; Bluetooth DAC reception is unchanged.

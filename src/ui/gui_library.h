@@ -8,6 +8,8 @@
 typedef struct group_song_entry_s {
     char * path;
     char * title;
+    int32_t disc_number;
+    bool show_disc_header;
 } group_song_entry_t;
 
 void free_group_song_entries(group_song_entry_t * entries, int count);
@@ -64,6 +66,8 @@ bool gui_library_generate_player_cover(const char * track_path, const char * art
 
 void open_add_to_playlist_for(const char * path);
 void gui_library_poll_playlists(void);
+/* Nonblocking duration/codec completion polling; updates only the current page. */
+void gui_library_poll_track_probes(void);
 void on_cue_file_selected(const char * cue_path);
 void show_artist_albums(const char * name, metadata_db_group_kind_t kind);
 void refresh_library_screens_after_rescan(void);

@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -1943,20 +1942,13 @@ static void compact_list_delete_event_cb(lv_event_t * e) {
     compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
     if (data->poll_timer) lv_timer_delete(data->poll_timer);
     if (data->pending_job) {
-        /* Short bounded wait, not indefinite -- the overwhelmingly common
-         * case is a fetch that's already done or lands within a handful of
-         * ms, in which case this joins and frees normally below; a
-         * genuinely slow/stuck one falls through to the same detach-and-
-         * abandon tolerance compact_list_poll_fetch_cb()'s own timeout
-         * uses, rather than blocking screen teardown/navigation on it. */
+        /* Teardown must not wait on a provider: the job owns its worker
+         * reference, so abandoning it can detach an unfinished worker and
+         * let that worker release the allocation after its late completion.
+         * Completed jobs are joined by compact_list_abandon_job(). */
         compact_list_fetch_job_t * job = data->pending_job;
-        for (int i = 0; i < 20 && job->result_count < 0; i++) usleep(10000);
-        if (job->result_count >= 0) {
-            pthread_join(job->thread, NULL);
-            compact_list_job_release(job); /* the UI-side reference -- see compact_list_fetch_job_s's own doc comment */
-        } else {
-            compact_list_abandon_job(job);
-        }
+        data->pending_job = NULL;
+        compact_list_abandon_job(job);
     }
     for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) free(data->row_ctx[slot]);
     free(data->items);

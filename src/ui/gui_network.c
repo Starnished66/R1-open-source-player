@@ -7,6 +7,7 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include "import_web.h"
 #include "gui_settings.h"
 #include "gui_navigation.h"
+#include "gui_shell.h"
 #include "screen_builders.h"
 #include "fallback_font.h"
 #include "settings.h"
@@ -34,6 +35,15 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/stat.h>
+
+typedef enum {
+    NETWORK_SERVICE_IMPORT,
+    NETWORK_SERVICE_REMOTE,
+    NETWORK_SERVICE_DLNA,
+    NETWORK_SERVICE_COUNT
+} network_service_t;
+
+static bool network_service_enqueue(network_service_t service, bool start, bool force_stop);
 
 /* Screens owned by this module */
 static lv_obj_t * wifi_screen;
@@ -127,7 +137,37 @@ static lv_obj_t * wifi_rescan_btn;
 static bool wifi_enable_pending_feedback = false;
 static char wifi_connect_pending_ssid[WIFI_MAX_SSID_LEN];
 
+/* Saved-network/configuration reads are deliberately kept separate from the
+ * scan buffers.  The worker owns its staging snapshot; the UI copies it only
+ * after joining the worker, so no LVGL code and no partially-written strings
+ * can cross the thread boundary. */
+typedef struct {
+    wifi_saved_network_t saved[WIFI_MAX_SAVED];
+    int saved_count;
+    wifi_info_t info;
+    bool info_connected;
+    unsigned generation;
+} wifi_settings_snapshot_t;
+
+static pthread_t wifi_settings_snapshot_thread;
+static bool wifi_settings_snapshot_active = false;
+static atomic_bool wifi_settings_snapshot_done_flag = false;
+static atomic_uint wifi_settings_snapshot_generation = 1;
+static wifi_settings_snapshot_t wifi_settings_snapshot_worker;
+static unsigned wifi_settings_snapshot_cached_generation = 0;
+static bool wifi_settings_snapshot_cached = false;
+static uint32_t wifi_settings_snapshot_tick;
+static bool wifi_settings_snapshot_enabled = false;
+static wifi_info_t wifi_cached_info;
+static bool wifi_cached_info_connected = false;
+
+static void populate_wifi_info_screen(void);
+static void populate_import_wifi_screen(void);
+static void remote_control_refresh_address(void);
+
 static void start_wifi_scan(void);
+static void wifi_settings_snapshot_invalidate(void);
+static void wifi_settings_snapshot_start(void);
 
 static pthread_t wifi_connect_thread;
 static bool wifi_connect_active = false;
@@ -191,6 +231,8 @@ void poll_wifi_connect(void) {
     if (!wifi_connect_succeeded) {
         show_error_toast("Couldn't connect to Wi-Fi network");
     }
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_start();
     start_wifi_scan(); /* refresh so the list reflects the new connection state */
 }
 
@@ -255,6 +297,8 @@ void poll_wifi_connect_saved(void) {
     if (!wifi_connect_saved_succeeded) {
         show_error_toast("Couldn't connect to Wi-Fi network");
     }
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_start();
     start_wifi_scan(); /* refresh so the list reflects the new connection state */
 }
 
@@ -282,6 +326,8 @@ void poll_wifi_disconnect(void) {
     if (!wifi_disconnect_active || !atomic_load_explicit(&wifi_disconnect_done_flag, memory_order_acquire)) return;
     wifi_disconnect_active = false;
     pthread_join(wifi_disconnect_thread, NULL);
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_start();
     start_wifi_scan(); /* refresh so the list reflects the disconnected state */
 }
 
@@ -315,8 +361,78 @@ static void wifi_rescan_btn_cb(lv_event_t * e) {
      * radio is collecting its replacement set. Saved networks remain in
      * their own section because they are configuration, not scan results. */
     wifi_scan_result_count = 0;
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_enabled = true;
     populate_wifi_screen(wifi_control_is_enabled());
     start_wifi_scan();
+}
+
+static void * wifi_settings_snapshot_thread_func(void * arg) {
+    unsigned generation = (unsigned) (uintptr_t) arg;
+    wifi_settings_snapshot_t * snapshot = &wifi_settings_snapshot_worker;
+
+    snapshot->generation = generation;
+    snapshot->saved_count = wifi_control_list_saved(snapshot->saved, WIFI_MAX_SAVED);
+    snapshot->info_connected = wifi_control_get_info(&snapshot->info);
+    atomic_store_explicit(&wifi_settings_snapshot_done_flag, true, memory_order_release);
+    return NULL;
+}
+
+static void wifi_settings_snapshot_invalidate(void) {
+    atomic_fetch_add_explicit(&wifi_settings_snapshot_generation, 1, memory_order_acq_rel);
+    wifi_settings_snapshot_cached = false;
+    wifi_settings_snapshot_cached_generation = 0;
+    wifi_cached_info_connected = false;
+    wifi_saved_result_count = 0;
+}
+
+static void wifi_settings_snapshot_start(void) {
+    if (wifi_settings_snapshot_active || wifi_enable_pending_feedback || !wifi_settings_snapshot_enabled ||
+        !gui_shell_wifi_effective_enabled()) return;
+
+    unsigned generation = atomic_load_explicit(&wifi_settings_snapshot_generation, memory_order_acquire);
+    if (wifi_settings_snapshot_cached && wifi_settings_snapshot_cached_generation == generation &&
+        lv_tick_elaps(wifi_settings_snapshot_tick) < 5000) return;
+
+    atomic_store_explicit(&wifi_settings_snapshot_done_flag, false, memory_order_relaxed);
+    wifi_settings_snapshot_active = true;
+    if (pthread_create(&wifi_settings_snapshot_thread, NULL, wifi_settings_snapshot_thread_func,
+                       (void *) (uintptr_t) generation) != 0) {
+        wifi_settings_snapshot_active = false;
+    }
+}
+
+/* Returns true when a completed snapshot was published.  Rendering is kept
+ * in the UI poller, never in the worker, and a generation mismatch discards
+ * results collected across an enable/disable transition. */
+static bool poll_wifi_settings_snapshot(void) {
+    if (!wifi_settings_snapshot_active ||
+        !atomic_load_explicit(&wifi_settings_snapshot_done_flag, memory_order_acquire)) return false;
+
+    wifi_settings_snapshot_active = false;
+    pthread_join(wifi_settings_snapshot_thread, NULL);
+
+    unsigned generation = atomic_load_explicit(&wifi_settings_snapshot_generation, memory_order_acquire);
+    if (wifi_settings_snapshot_worker.generation != generation) {
+        wifi_settings_snapshot_start();
+        return false;
+    }
+
+    wifi_saved_result_count = wifi_settings_snapshot_worker.saved_count;
+    memcpy(wifi_saved_results, wifi_settings_snapshot_worker.saved,
+           sizeof(wifi_saved_results[0]) * (size_t) wifi_saved_result_count);
+    wifi_cached_info = wifi_settings_snapshot_worker.info;
+    wifi_cached_info_connected = wifi_settings_snapshot_worker.info_connected;
+    wifi_settings_snapshot_cached_generation = generation;
+    wifi_settings_snapshot_cached = true;
+    wifi_settings_snapshot_tick = lv_tick_get();
+    return true;
+}
+
+static bool wifi_cached_info_is_current(void) {
+    return wifi_settings_snapshot_cached &&
+           wifi_settings_snapshot_cached_generation ==
+               atomic_load_explicit(&wifi_settings_snapshot_generation, memory_order_acquire);
 }
 
 static void set_wifi_rescan_active(bool active) {
@@ -375,12 +491,33 @@ static void start_wifi_scan(void) {
 }
 
 void poll_wifi_scan(void) {
-    if (!wifi_scan_active || !atomic_load_explicit(&wifi_scan_done_flag, memory_order_acquire)) return;
+    if (wifi_settings_snapshot_enabled && !gui_shell_wifi_effective_enabled()) {
+        wifi_settings_snapshot_enabled = false;
+        wifi_settings_snapshot_invalidate();
+    }
+    bool snapshot_published = poll_wifi_settings_snapshot();
+    bool scan_published = false;
+    if (wifi_scan_active && atomic_load_explicit(&wifi_scan_done_flag, memory_order_acquire)) {
+        wifi_scan_active = false;
+        pthread_join(wifi_scan_thread, NULL);
+        set_wifi_rescan_active(false);
+        scan_published = true;
+    }
 
-    wifi_scan_active = false;
-    pthread_join(wifi_scan_thread, NULL);
-    set_wifi_rescan_active(false);
-    populate_wifi_screen(wifi_control_is_enabled()); /* refresh the list either way -- worth keeping current even if the user already backed out */
+    if ((snapshot_published || scan_published) &&
+        wifi_screen && gui_navigation_is_top(wifi_screen))
+        populate_wifi_screen(wifi_control_is_enabled());
+
+    if (snapshot_published) {
+        if (wifi_info_screen && gui_navigation_is_top(wifi_info_screen)) populate_wifi_info_screen();
+        if (import_wifi_screen && gui_navigation_is_top(import_wifi_screen)) populate_import_wifi_screen();
+        if (remote_control_screen && gui_navigation_is_top(remote_control_screen)) remote_control_refresh_address();
+    }
+    if ((wifi_screen && gui_navigation_is_top(wifi_screen)) ||
+        (wifi_info_screen && gui_navigation_is_top(wifi_info_screen)) ||
+        (import_wifi_screen && gui_navigation_is_top(import_wifi_screen)) ||
+        (remote_control_screen && gui_navigation_is_top(remote_control_screen)))
+        wifi_settings_snapshot_start();
 }
 
 static void show_wifi_toggle_pending_async(void * user_data) {
@@ -388,6 +525,8 @@ static void show_wifi_toggle_pending_async(void * user_data) {
     if (!gui_navigation_is_top(gui_network_get_wifi_screen())) return;
 
     wifi_enable_pending_feedback = enabled;
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_enabled = enabled;
     if (enabled) wifi_scan_result_count = 0;
     populate_wifi_screen(enabled);
     set_wifi_rescan_active(enabled || wifi_scan_active);
@@ -402,6 +541,9 @@ void gui_network_show_wifi_toggle_pending(bool enabled) {
 
 void gui_network_wifi_toggle_completed(bool enabled) {
     wifi_enable_pending_feedback = false;
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_enabled = enabled;
+    if (enabled) wifi_settings_snapshot_start();
     if (!gui_navigation_is_top(gui_network_get_wifi_screen())) {
         set_wifi_rescan_active(wifi_scan_active);
         return;
@@ -444,6 +586,8 @@ void poll_wifi_forget(void) {
     if (!wifi_forget_active || !atomic_load_explicit(&wifi_forget_done_flag, memory_order_acquire)) return;
     wifi_forget_active = false;
     pthread_join(wifi_forget_thread, NULL);
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_start();
     start_wifi_scan(); /* refresh both memorized and available sections */
 }
 
@@ -515,15 +659,16 @@ static lv_obj_t * wifi_info_list;
 static void populate_wifi_info_screen(void) {
     lv_obj_clean(wifi_info_list);
 
-    wifi_info_t info;
-    if (!wifi_control_get_info(&info)) {
+    wifi_settings_snapshot_start();
+    if (!wifi_cached_info_is_current() || !wifi_cached_info_connected) {
         lv_obj_t * label = lv_label_create(wifi_info_list);
-        lv_label_set_text(label, "Not connected");
+        lv_label_set_text(label, wifi_settings_snapshot_active ? "Loading..." : "Not connected");
         lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, BOARD_SCALE_PX(24), 0);
         return;
     }
 
+    wifi_info_t info = wifi_cached_info;
     static const char * signal_labels[] = { "Weak", "Fair", "Good", "Excellent" };
     int signal_index = (info.signal_level >= 0 && info.signal_level <= 3) ? info.signal_level : 0;
     char lines[5][80];
@@ -549,6 +694,8 @@ static lv_obj_t * build_wifi_info_screen(void) {
 }
 
 static void open_wifi_info_screen(void) {
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_enabled = true;
     populate_wifi_info_screen();
     nav_push(wifi_info_screen);
 }
@@ -652,6 +799,7 @@ static void wifi_dns_settings_row_cb(lv_event_t * e) {
  * a parameter. */
 void populate_wifi_screen(bool enabled) {
     lv_obj_clean(wifi_list);
+    wifi_settings_snapshot_enabled = enabled;
 
     if (wifi_rescan_btn) {
         if (enabled) lv_obj_remove_flag(wifi_rescan_btn, LV_OBJ_FLAG_HIDDEN);
@@ -667,6 +815,8 @@ void populate_wifi_screen(bool enabled) {
 
     if (!enabled) return;
 
+    wifi_settings_snapshot_start();
+
     add_pill_chevron_row(wifi_list, "Wi-Fi Info", wifi_info_row_cb);
     add_pill_chevron_row(wifi_list, "Manual SSID Entry", wifi_manual_entry_row_cb);
     add_pill_chevron_row(wifi_list, "DNS Settings", wifi_dns_settings_row_cb);
@@ -676,19 +826,16 @@ void populate_wifi_screen(bool enabled) {
      * socket yet. Keep the last cached saved-network rows instead of
      * launching synchronous wpa_cli subprocesses that cannot succeed and
      * would undermine the immediate feedback this state exists to provide. */
-    if (!wifi_enable_pending_feedback)
-        wifi_saved_result_count = wifi_control_list_saved(wifi_saved_results, WIFI_MAX_SAVED);
+    bool have_settings_snapshot = wifi_cached_info_is_current();
     if (wifi_saved_result_count == 0) {
         lv_obj_t * label = lv_label_create(wifi_list);
-        lv_label_set_text(label, "No memorized networks");
+        lv_label_set_text(label, have_settings_snapshot ? "No memorized networks" : "Loading Wi-Fi settings...");
         lv_obj_add_style(label, &style_theme_text_muted, 0);
         lv_obj_set_style_pad_left(label, BOARD_SCALE_PX(24), 0);
     }
     /* Cross-reference wpa_cli status against saved network SSIDs to indicate
      * which saved network is currently connected. */
-    wifi_info_t current_wifi_info;
-    bool wifi_currently_connected = !wifi_enable_pending_feedback &&
-                                    wifi_control_get_info(&current_wifi_info);
+    bool wifi_currently_connected = have_settings_snapshot && wifi_cached_info_connected;
     for (int i = 0; i < wifi_saved_result_count; i++) {
         lv_obj_t * row = lv_obj_create(wifi_list);
         lv_obj_set_size(row, LIST_ROW_WIDTH, LIST_ROW_HEIGHT);
@@ -698,7 +845,7 @@ void populate_wifi_screen(bool enabled) {
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-        bool is_connected = wifi_currently_connected && strcmp(wifi_saved_results[i].ssid, current_wifi_info.ssid) == 0;
+        bool is_connected = wifi_currently_connected && strcmp(wifi_saved_results[i].ssid, wifi_cached_info.ssid) == 0;
         char text[WIFI_MAX_SSID_LEN + 20];
         snprintf(text, sizeof(text), "%s%s", wifi_saved_results[i].ssid, is_connected ? "  - Connected" : "");
 
@@ -767,6 +914,7 @@ static lv_obj_t * build_wifi_screen(void) {
 
 void open_wifi_screen(void) {
     bool enabled = wifi_control_is_enabled();
+    wifi_settings_snapshot_invalidate();
     populate_wifi_screen(enabled);
     nav_push(wifi_screen);
     if (enabled) start_wifi_scan(); /* auto-refresh -- matches the old always-scan-on-open behavior, but only when there's a radio to scan with */
@@ -854,6 +1002,7 @@ static atomic_bool bt_forget_done_flag = false;
 
 typedef struct {
     char mac[18];
+    bool succeeded;
 } bt_forget_request_t;
 
 /* Kept alive past the thread completing (freed in poll_bt_forget() instead
@@ -864,12 +1013,14 @@ static bt_forget_request_t * bt_forget_pending_req = NULL;
 
 static void * bt_forget_thread_func(void * arg) {
     bt_forget_request_t * req = (bt_forget_request_t *) arg;
-    bt_control_forget(req->mac);
+    req->succeeded = bt_control_forget(req->mac);
     atomic_store_explicit(&bt_forget_done_flag, true, memory_order_release); /* written last -- poll_bt_forget only checks this flag */
     return NULL;
 }
 
 static void start_bt_forget(const char * mac) {
+    if (bt_forget_active) return;
+    gui_shell_cancel_bt_reconnect();
     bt_forget_request_t * req = malloc(sizeof(*req));
     if (!req) return;
     snprintf(req->mac, sizeof(req->mac), "%s", mac);
@@ -879,6 +1030,7 @@ static void start_bt_forget(const char * mac) {
     bt_forget_active = true;
         if (pthread_create(&bt_forget_thread, NULL, bt_forget_thread_func, req) != 0) {
         bt_forget_active = false;
+        bt_forget_pending_req = NULL;
         free(req);
     }
 }
@@ -890,11 +1042,21 @@ void poll_bt_forget(void) {
     bt_forget_active = false;
     pthread_join(bt_forget_thread, NULL);
 
-    for (int i = 0; i < bt_scan_result_count; i++) {
-        if (strcmp(bt_scan_results[i].mac, bt_forget_pending_req->mac) == 0) {
-            bt_scan_results[i].paired = false;
-            bt_scan_results[i].connected = false;
-            break;
+    if (bt_forget_pending_req->succeeded) {
+        /* A refresh launched after the initial manual cancellation may still
+         * have observed the device before Forget completed. Invalidate that
+         * positive snapshot before changing the remembered preference. */
+        gui_shell_cancel_bt_reconnect();
+        for (int i = 0; i < bt_scan_result_count; i++) {
+            if (strcmp(bt_scan_results[i].mac, bt_forget_pending_req->mac) == 0) {
+                bt_scan_results[i].paired = false;
+                bt_scan_results[i].connected = false;
+                break;
+            }
+        }
+        if (strcmp(current_settings.bt_last_output_mac, bt_forget_pending_req->mac) == 0) {
+            current_settings.bt_last_output_mac[0] = '\0';
+            settings_save_async(&current_settings);
         }
     }
     free(bt_forget_pending_req);
@@ -930,6 +1092,7 @@ static void bt_action_connect_cb(lv_event_t * e) {
     char mac[18];
     snprintf(mac, sizeof(mac), "%s", bt_scan_results[bt_action_popup_device_index].mac);
     hide_bt_action_popup();
+    gui_shell_cancel_bt_reconnect();
     start_bt_connect(mac);
 }
 
@@ -1167,6 +1330,7 @@ void populate_bt_dac_screen(void) {
  * rather than relying solely on current_settings.bt_dac_mode_enabled, ensuring
  * the underlying pipeline matches the active UI state. */
 static void enable_bt_dac_and_show_overlay(void) {
+    gui_shell_cancel_bt_reconnect();
     current_settings.bt_dac_mode_enabled = true;
     settings_save(&current_settings);
     start_bt_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
@@ -1358,8 +1522,8 @@ static void bt_codec_option_row_cb(lv_event_t * e) {
         show_error_toast("Could not save Bluetooth codec");
         return;
     }
-    snprintf(current_settings.bt_codec, sizeof(current_settings.bt_codec), "%s", bt_codec_options[index].value);
-    settings_save(&current_settings);
+    snprintf(current_settings.bt_codec, sizeof(current_settings.bt_codec), "%s", codec);
+    settings_save_async(&current_settings);
     populate_bt_codec_screen();
     if (quality_changed) show_info_toast("Turn Bluetooth off and on to apply");
 }
@@ -2210,8 +2374,8 @@ static lv_obj_t * import_wifi_qrcode;
 #endif
 
 static void populate_import_wifi_screen(void) {
-    wifi_info_t info;
-    if (!wifi_control_get_info(&info) || info.ip[0] == '\0') {
+    wifi_settings_snapshot_start();
+    if (!wifi_cached_info_is_current() || !wifi_cached_info_connected || wifi_cached_info.ip[0] == '\0') {
         lv_label_set_text(import_wifi_status_label, "Connect to Wi-Fi first");
         lv_label_set_text(import_wifi_url_label, "");
 #if LV_USE_QRCODE
@@ -2221,7 +2385,7 @@ static void populate_import_wifi_screen(void) {
     }
 
     char url[64];
-    snprintf(url, sizeof(url), "http://%s:4399", info.ip);
+    snprintf(url, sizeof(url), "http://%s:4399", wifi_cached_info.ip);
     lv_label_set_text(import_wifi_status_label, "Open this address on your phone or computer:");
     lv_label_set_text(import_wifi_url_label, url);
 #if LV_USE_QRCODE
@@ -2236,6 +2400,7 @@ static void populate_import_wifi_screen(void) {
  * asynchronously without blocking the UI thread during process teardown. */
 static pthread_t import_web_stop_thread;
 static bool import_web_stop_active = false;
+static bool import_web_stop_via_service_worker = false;
 static atomic_bool import_web_stop_done_flag = false;
 /* Import via Wi-Fi screen's own stack slot, recorded right before the busy
  * screen gets pushed on top of it -- spliced out via nav_remove_stack_slot()
@@ -2265,6 +2430,139 @@ static bool import_web_active = false;
  * downloaded anything worth rescanning for at all). */
 static bool import_web_stop_suppress_rescan = false;
 
+/* All service lifecycle calls below are process/socket teardown or setup and
+ * must not run on the LVGL thread.  Keep one bounded, joinable worker and a
+ * tiny FIFO so Wi-Fi-loss cleanup can serialize several stops without ever
+ * overlapping a start/stop for the same service.  The worker contains no UI
+ * code; completion is joined and consumed by poll_network_service_ops(). */
+typedef struct {
+    network_service_t service;
+    bool start;
+} network_service_job_t;
+
+#define NETWORK_SERVICE_QUEUE_CAPACITY 8
+static pthread_mutex_t network_service_mutex = PTHREAD_MUTEX_INITIALIZER;
+static network_service_job_t network_service_queue[NETWORK_SERVICE_QUEUE_CAPACITY];
+static unsigned network_service_queue_head;
+static unsigned network_service_queue_count;
+static bool network_service_busy_flags[NETWORK_SERVICE_COUNT];
+static bool network_service_stop_queued[NETWORK_SERVICE_COUNT];
+static bool network_service_worker_active;
+static pthread_t network_service_thread;
+static atomic_bool network_service_done = false;
+
+static void poll_network_service_ops(void);
+
+static void * network_service_worker_func(void * arg) {
+    (void) arg;
+    for (;;) {
+        network_service_job_t job;
+        pthread_mutex_lock(&network_service_mutex);
+        if (network_service_queue_count == 0) {
+            pthread_mutex_unlock(&network_service_mutex);
+            break;
+        }
+        job = network_service_queue[network_service_queue_head];
+        network_service_queue_head = (network_service_queue_head + 1) % NETWORK_SERVICE_QUEUE_CAPACITY;
+        network_service_queue_count--;
+        pthread_mutex_unlock(&network_service_mutex);
+
+        if (job.service == NETWORK_SERVICE_IMPORT) {
+            if (job.start) import_web_start();
+            else import_web_stop();
+        } else if (job.service == NETWORK_SERVICE_REMOTE) {
+            if (job.start) remote_control_start();
+            else remote_control_stop();
+        } else if (job.service == NETWORK_SERVICE_DLNA) {
+            if (job.start) dlna_control_start();
+            else dlna_control_stop();
+        }
+        pthread_mutex_lock(&network_service_mutex);
+        bool same_service_queued = false;
+        for (unsigned i = 0; i < network_service_queue_count; i++) {
+            unsigned index = (network_service_queue_head + i) % NETWORK_SERVICE_QUEUE_CAPACITY;
+            if (network_service_queue[index].service == job.service) {
+                same_service_queued = true;
+                break;
+            }
+        }
+        if (!same_service_queued) network_service_busy_flags[job.service] = false;
+        if (!job.start) network_service_stop_queued[job.service] = false;
+        pthread_mutex_unlock(&network_service_mutex);
+    }
+    atomic_store_explicit(&network_service_done, true, memory_order_release);
+    return NULL;
+}
+
+static bool network_service_is_busy(network_service_t service) {
+    pthread_mutex_lock(&network_service_mutex);
+    bool busy = network_service_busy_flags[service];
+    pthread_mutex_unlock(&network_service_mutex);
+    return busy;
+}
+
+static bool network_service_launch_locked(void) {
+    atomic_store_explicit(&network_service_done, false, memory_order_relaxed);
+    network_service_worker_active = true;
+    if (pthread_create(&network_service_thread, NULL, network_service_worker_func, NULL) != 0) {
+        network_service_worker_active = false;
+        return false;
+    }
+    return true;
+}
+
+static bool network_service_enqueue(network_service_t service, bool start, bool force_stop) {
+    /* A completed worker may still await the next UI poll. Reap it before
+     * appending work, otherwise a new job could be stranded behind a thread
+     * that has already exited. */
+    poll_network_service_ops();
+    pthread_mutex_lock(&network_service_mutex);
+    if ((!force_stop && network_service_busy_flags[service]) ||
+        (force_stop && network_service_stop_queued[service]) ||
+        network_service_queue_count >= NETWORK_SERVICE_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&network_service_mutex);
+        return false;
+    }
+    unsigned tail = (network_service_queue_head + network_service_queue_count) % NETWORK_SERVICE_QUEUE_CAPACITY;
+    bool was_busy = network_service_busy_flags[service];
+    bool had_stop = network_service_stop_queued[service];
+    network_service_queue[tail] = (network_service_job_t){ .service = service, .start = start };
+    network_service_queue_count++;
+    network_service_busy_flags[service] = true;
+    if (!start) network_service_stop_queued[service] = true;
+    if (!network_service_worker_active) {
+        if (!network_service_launch_locked()) {
+            network_service_queue_count--;
+            network_service_busy_flags[service] = was_busy;
+            network_service_stop_queued[service] = had_stop;
+            network_service_worker_active = false;
+            pthread_mutex_unlock(&network_service_mutex);
+            return false;
+        }
+    }
+    pthread_mutex_unlock(&network_service_mutex);
+    return true;
+}
+
+static void poll_network_service_ops(void) {
+    pthread_mutex_lock(&network_service_mutex);
+    bool active = network_service_worker_active;
+    pthread_mutex_unlock(&network_service_mutex);
+    if (active && !atomic_load_explicit(&network_service_done, memory_order_acquire)) return;
+    if (active) pthread_join(network_service_thread, NULL);
+    pthread_mutex_lock(&network_service_mutex);
+    if (active) network_service_worker_active = false;
+    /* The worker may have observed an empty queue just before an enqueue
+     * published a job and set done. Re-launch any such job while holding the
+     * lifecycle lock; this closes the exit/enqueue handshake race. */
+    if (network_service_queue_count > 0) {
+        /* Retry creation on every UI poll. A transient pthread resource
+         * failure must not strand a busy flag or an Import teardown. */
+        (void) network_service_launch_locked();
+    }
+    pthread_mutex_unlock(&network_service_mutex);
+}
+
 static void * import_web_stop_thread_func(void * arg) {
     (void) arg;
     import_web_stop();
@@ -2273,10 +2571,17 @@ static void * import_web_stop_thread_func(void * arg) {
 }
 
 void poll_import_web_stop(void) {
-    if (!import_web_stop_active || !atomic_load_explicit(&import_web_stop_done_flag, memory_order_acquire)) return;
+    poll_network_service_ops();
+    if (!import_web_stop_active) return;
+    if (import_web_stop_via_service_worker) {
+        if (network_service_is_busy(NETWORK_SERVICE_IMPORT)) return;
+    } else if (!atomic_load_explicit(&import_web_stop_done_flag, memory_order_acquire)) {
+        return;
+    }
 
     import_web_stop_active = false;
-    pthread_join(import_web_stop_thread, NULL);
+    if (!import_web_stop_via_service_worker) pthread_join(import_web_stop_thread, NULL);
+    import_web_stop_via_service_worker = false;
 
     if (import_web_stop_nav_slot >= 0 && import_web_stop_nav_slot < gui_navigation_get_depth()) {
         nav_remove_stack_slot(import_web_stop_nav_slot);
@@ -2314,8 +2619,21 @@ static void import_web_stop_start(bool suppress_rescan) {
     import_web_stop_nav_slot = gui_navigation_get_depth() - 1; /* this screen's own slot, before pushing the busy screen on top of it */
     import_web_stop_token = gui_busy_show("Closing\nWeb Server...", "");
 
-    atomic_store_explicit(&import_web_stop_done_flag, false, memory_order_relaxed);
     import_web_stop_active = true;
+    import_web_stop_via_service_worker = false;
+    if (network_service_is_busy(NETWORK_SERVICE_IMPORT)) {
+        if (!network_service_enqueue(NETWORK_SERVICE_IMPORT, false, true)) {
+            import_web_stop_active = false;
+            import_web_stop_suppress_rescan = false;
+            gui_busy_hide(import_web_stop_token);
+            show_error_toast("Thread launch failed");
+            return;
+        }
+        import_web_stop_via_service_worker = true;
+        import_web_active = false;
+        return;
+    }
+    atomic_store_explicit(&import_web_stop_done_flag, false, memory_order_relaxed);
     if (pthread_create(&import_web_stop_thread, NULL, import_web_stop_thread_func, NULL) != 0) {
         import_web_stop_active = false;
         import_web_stop_suppress_rescan = false;
@@ -2402,7 +2720,16 @@ static bool wifi_feature_guard(void) {
 
 static void open_import_wifi_screen(void) {
     if (!wifi_feature_guard()) return;
-    import_web_start();
+    if (import_web_active || import_web_stop_active || network_service_is_busy(NETWORK_SERVICE_IMPORT)) {
+        show_info_toast("Web Server is busy");
+        return;
+    }
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_enabled = true;
+    if (!network_service_enqueue(NETWORK_SERVICE_IMPORT, true, false)) {
+        show_error_toast("Thread launch failed");
+        return;
+    }
     populate_import_wifi_screen();
     nav_push(import_wifi_screen);
     import_web_active = true;
@@ -2468,7 +2795,7 @@ static void airplay_toggle_cb(lv_event_t * e) {
         return;
     }
     current_settings.wifi_dac_mode_enabled = turning_on;
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 
     if (current_settings.wifi_dac_mode_enabled) {
         char name[64];
@@ -2479,7 +2806,7 @@ static void airplay_toggle_cb(lv_event_t * e) {
              * running, so just undo the toggle rather than reporting the
              * device as "on" when it can't produce sound or be discovered. */
             current_settings.wifi_dac_mode_enabled = false;
-            settings_save(&current_settings);
+            settings_save_async(&current_settings);
             show_error_toast("Failed to enable AirPlay");
             populate_airplay_screen();
             return;
@@ -2505,7 +2832,6 @@ static void airplay_toggle_cb(lv_event_t * e) {
             start_bt_apply_output_settings(false, current_settings.bt_volume_sync_enabled);
         }
     } else {
-        airplay_control_stop();
     }
 
     populate_airplay_screen();
@@ -2722,14 +3048,14 @@ static void dlna_toggle_cb(lv_event_t * e) {
         populate_dlna_screen();
         return;
     }
-    current_settings.dlna_renderer_enabled = turning_on;
-    settings_save(&current_settings);
-
-    if (current_settings.dlna_renderer_enabled) {
-        dlna_control_start();
-    } else {
-        dlna_control_stop();
+    if (network_service_is_busy(NETWORK_SERVICE_DLNA) ||
+        !network_service_enqueue(NETWORK_SERVICE_DLNA, turning_on, false)) {
+        show_info_toast("Service is busy");
+        populate_dlna_screen();
+        return;
     }
+    current_settings.dlna_renderer_enabled = turning_on;
+    settings_save_async(&current_settings);
 
     populate_dlna_screen();
 }
@@ -2791,8 +3117,8 @@ static void remote_control_refresh_address(void) {
         return;
     }
 
-    wifi_info_t info;
-    if (!wifi_control_get_info(&info) || info.ip[0] == '\0') {
+    wifi_settings_snapshot_start();
+    if (!wifi_cached_info_is_current() || !wifi_cached_info_connected || wifi_cached_info.ip[0] == '\0') {
         lv_label_set_text(remote_control_status_label, "Connect to Wi-Fi first");
         lv_label_set_text(remote_control_url_label, "");
 #if LV_USE_QRCODE
@@ -2803,7 +3129,7 @@ static void remote_control_refresh_address(void) {
     }
 
     char url[64];
-    snprintf(url, sizeof(url), "http://%s:8899", info.ip);
+    snprintf(url, sizeof(url), "http://%s:8899", wifi_cached_info.ip);
     lv_label_set_text(remote_control_status_label, "Open this address on your phone or computer:");
     lv_label_set_text(remote_control_url_label, url);
 #if LV_USE_QRCODE
@@ -2822,18 +3148,19 @@ static void remote_control_toggle_cb(lv_event_t * e) {
         remote_control_refresh_address(); /* nothing changed, but keeps the address text/QR state honest */
         return;
     }
+    if (network_service_is_busy(NETWORK_SERVICE_REMOTE) ||
+        !network_service_enqueue(NETWORK_SERVICE_REMOTE, turning_on, false)) {
+        show_info_toast("Service is busy");
+        remote_control_refresh_address();
+        return;
+    }
     current_settings.remote_control_enabled = turning_on;
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 
     /* Real lv_switch now (see build_remote_control_screen()'s own comment)
      * -- CHECKED state alone drives its visual, no sprite swap needed. */
     if (current_settings.remote_control_enabled) lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
     else lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
-    if (current_settings.remote_control_enabled) {
-        remote_control_start();
-    } else {
-        remote_control_stop();
-    }
     remote_control_refresh_address();
 }
 
@@ -2923,6 +3250,8 @@ static lv_obj_t * build_remote_control_screen(void) {
 }
 
 static void open_remote_control_screen(void) {
+    wifi_settings_snapshot_invalidate();
+    wifi_settings_snapshot_enabled = true;
     remote_control_refresh_address();
     nav_push(remote_control_screen);
 }
@@ -2964,18 +3293,20 @@ void gui_network_handle_wifi_disabled(void) {
     }
 
     if (current_settings.dlna_renderer_enabled) {
-        dlna_control_stop();
-        current_settings.dlna_renderer_enabled = false;
-        settings_changed = true;
-        populate_dlna_screen();
+        if (network_service_enqueue(NETWORK_SERVICE_DLNA, false, true)) {
+            current_settings.dlna_renderer_enabled = false;
+            settings_changed = true;
+            populate_dlna_screen();
+        }
     }
 
     if (current_settings.remote_control_enabled) {
-        remote_control_stop();
-        current_settings.remote_control_enabled = false;
-        settings_changed = true;
-        lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
-        remote_control_refresh_address();
+        if (network_service_enqueue(NETWORK_SERVICE_REMOTE, false, true)) {
+            current_settings.remote_control_enabled = false;
+            settings_changed = true;
+            lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
+            remote_control_refresh_address();
+        }
     }
 
     /* Import via Wi-Fi has no persisted enabled flag (session-only, started
@@ -3055,6 +3386,8 @@ void gui_network_init(void) {
  * as children of any of these screens, so each needs its own explicit
  * deletion. */
 void gui_network_teardown(void) {
+    wifi_settings_snapshot_enabled = false;
+    wifi_settings_snapshot_invalidate();
     gui_popup_teardown(&bt_action_popup);
     gui_popup_teardown(&wifi_action_popup);
     gui_popup_teardown(&usb_dac_leave_popup);
@@ -3082,9 +3415,14 @@ void gui_network_teardown(void) {
 }
 
 bool gui_network_has_background_work(void) {
+    pthread_mutex_lock(&network_service_mutex);
+    bool network_service_work = network_service_worker_active || network_service_queue_count > 0;
+    pthread_mutex_unlock(&network_service_mutex);
     return wifi_connect_active || wifi_connect_saved_active || wifi_disconnect_active ||
-           wifi_scan_active || wifi_forget_active || bt_connect_active || bt_forget_active ||
-           bt_scan_active || usb_mode_switch_active || usb_bridge_restart_active || import_web_stop_active;
+           wifi_scan_active || wifi_forget_active || wifi_settings_snapshot_active ||
+           bt_connect_active || bt_forget_active ||
+           bt_scan_active || usb_mode_switch_active || usb_bridge_restart_active || import_web_stop_active ||
+           network_service_work;
 }
 
 void gui_network_cancel_background_work(void) {
@@ -3112,6 +3450,10 @@ void gui_network_cancel_background_work(void) {
         pthread_join(wifi_forget_thread, NULL);
         wifi_forget_active = false;
     }
+    if (wifi_settings_snapshot_active) {
+        pthread_join(wifi_settings_snapshot_thread, NULL);
+        wifi_settings_snapshot_active = false;
+    }
     if (bt_connect_active) {
         pthread_join(bt_connect_thread, NULL);
         bt_connect_active = false;
@@ -3129,9 +3471,41 @@ void gui_network_cancel_background_work(void) {
         usb_mode_switch_queued = false;
         usb_mode_switch_active = false;
     }
+    /* Drain the serialized service worker before teardown. If a worker could
+     * not be created, execute its bounded queue synchronously so cancellation
+     * cannot leave lifecycle flags or an Import busy overlay permanently set. */
+    pthread_mutex_lock(&network_service_mutex);
+    bool service_worker_active = network_service_worker_active;
+    pthread_t service_thread = network_service_thread;
+    pthread_mutex_unlock(&network_service_mutex);
+    if (service_worker_active) pthread_join(service_thread, NULL);
+    pthread_mutex_lock(&network_service_mutex);
+    network_service_worker_active = false;
+    pthread_mutex_unlock(&network_service_mutex);
+    for (;;) {
+        pthread_mutex_lock(&network_service_mutex);
+        if (network_service_queue_count == 0) {
+            pthread_mutex_unlock(&network_service_mutex);
+            break;
+        }
+        network_service_job_t job = network_service_queue[network_service_queue_head];
+        network_service_queue_head = (network_service_queue_head + 1) % NETWORK_SERVICE_QUEUE_CAPACITY;
+        network_service_queue_count--;
+        network_service_busy_flags[job.service] = false;
+        if (!job.start) network_service_stop_queued[job.service] = false;
+        pthread_mutex_unlock(&network_service_mutex);
+        if (job.service == NETWORK_SERVICE_IMPORT) {
+            if (job.start) import_web_start(); else import_web_stop();
+        } else if (job.service == NETWORK_SERVICE_REMOTE) {
+            if (job.start) remote_control_start(); else remote_control_stop();
+        } else if (job.service == NETWORK_SERVICE_DLNA) {
+            if (job.start) dlna_control_start(); else dlna_control_stop();
+        }
+    }
     if (import_web_stop_active) {
-        pthread_join(import_web_stop_thread, NULL);
+        if (!import_web_stop_via_service_worker) pthread_join(import_web_stop_thread, NULL);
         import_web_stop_active = false;
+        import_web_stop_via_service_worker = false;
         gui_busy_hide(import_web_stop_token);
     }
 }

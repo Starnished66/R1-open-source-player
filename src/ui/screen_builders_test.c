@@ -11,8 +11,10 @@
 #include "lvgl/src/libs/lodepng/lodepng.h"
 #include "settings.h"
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <stdlib.h>
 
@@ -237,6 +239,42 @@ static int fetch(void * context, int offset, int count, compact_list_page_row_t 
     return count;
 }
 
+static atomic_int late_fetch_release;
+static atomic_int late_fetch_finished;
+static void compact_noop_click(int index) { (void)index; }
+
+static int gated_fetch(void * context, int offset, int count, compact_list_page_row_t * rows) {
+    (void)context;
+    while (!atomic_load(&late_fetch_release)) usleep(1000);
+    snprintf(rows[0].label, sizeof(rows[0].label), "Late fetch %d", offset);
+    atomic_store(&late_fetch_finished, 1);
+    return count > 0 ? 1 : 0;
+}
+
+static void check_compact_list_delete_does_not_wait(void) {
+    compact_list_item_t item = { .label = "Pending" };
+    lv_obj_t * host = lv_obj_create(NULL);
+    lv_obj_t * list = build_compact_list_widget(host, &item, 1, compact_noop_click, NULL,
+                                                 LIST_ROW_WIDTH, false, lv_color_black());
+    atomic_store(&late_fetch_release, 0);
+    atomic_store(&late_fetch_finished, 0);
+    compact_list_set_paged_provider(list, gated_fetch, NULL, 100);
+
+    struct timespec started, finished;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    lv_obj_delete(host);
+    clock_gettime(CLOCK_MONOTONIC, &finished);
+    long elapsed_ms = (finished.tv_sec - started.tv_sec) * 1000L +
+                      (finished.tv_nsec - started.tv_nsec) / 1000000L;
+    assert(elapsed_ms < 150);
+
+    /* The detached worker must still be able to finish against its own job
+     * storage after the list/data have been freed. */
+    atomic_store(&late_fetch_release, 1);
+    for (int i = 0; i < 200 && !atomic_load(&late_fetch_finished); ++i) usleep(1000);
+    assert(atomic_load(&late_fetch_finished));
+}
+
 /* LVGL 9.5's hidden-flag removal dirties both the object and its parent.
  * Root screens and display layers have no parent, so that path must tolerate
  * NULL while preserving ordinary child layout invalidation.  This mirrors
@@ -454,6 +492,7 @@ static void check_layout(int display_height) {
     }
     lv_obj_t * fetched = find_row(list, "Fetched 0");
     assert(fetched && lv_obj_has_flag(lv_obj_get_child(fetched, 2), LV_OBJ_FLAG_HIDDEN));
+    check_compact_list_delete_does_not_wait();
 
     menu_popup_row_t rows[14];
     for (int i = 0; i < 14; ++i)

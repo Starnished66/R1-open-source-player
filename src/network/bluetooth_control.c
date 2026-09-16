@@ -5,6 +5,7 @@
 #include "audio.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -23,15 +24,92 @@ static pthread_mutex_t bt_chip_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Shared by fallback bring-up and explicit profile changes. */
 static pthread_mutex_t bt_daemon_respawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 static atomic_bool sbc_xq_enabled = false;
+static atomic_bool modern_soft_volume_requested = false;
+static pthread_mutex_t bt_soft_volume_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char bt_soft_volume_applied_path[256];
+#define BT_SOURCE_VOLUME_MAX 127
+
+/* BlueALSA 5 renamed both executables.  Select the pair as one unit: using a
+ * v5 daemon with the legacy client (or vice versa) leaves the control path
+ * talking to the wrong CLI/API.  access(2) is intentionally used here rather
+ * than probing with a command on hot paths. */
+typedef struct {
+    const char * daemon;
+    const char * daemon_name;
+    const char * ctl;
+    bool modern;
+} bluealsa_backend_t;
+
+static bluealsa_backend_t bluealsa_backend(void) {
+    if (access("/usr/bin/bluealsad", X_OK) == 0 &&
+            access("/usr/bin/bluealsactl", X_OK) == 0) {
+        return (bluealsa_backend_t) {
+            "/usr/bin/bluealsad", "bluealsad", "/usr/bin/bluealsactl", true
+        };
+    }
+    return (bluealsa_backend_t) { "bluealsa", "bluealsa", "bluealsa-cli", false };
+}
+
+static const char * bluealsa_ctl_name(void) {
+    return bluealsa_backend().ctl;
+}
 
 void bt_control_restore_codec_preference(const char * codec) {
     atomic_store(&sbc_xq_enabled, codec && strcmp(codec, "sbc_xq") == 0);
 }
 
 const char * bt_control_get_playback_pcm(void) {
-    /* Playback uses pcm.bluealsa, not the legacy bt_alsa_sink stanza.
-     * XQ still negotiates SBC; it must not silently select AAC/LDAC. */
     return atomic_load(&sbc_xq_enabled) ? "bluealsa:CODEC=SBC" : "bluealsa";
+}
+
+static bool bluealsa_is_audio_pcm_path(const char * path) {
+    return path && (strstr(path, "/a2dpsnk/source") != NULL ||
+                    strstr(path, "/a2dpsrc/sink") != NULL);
+}
+
+/* BlueALSA 4's missing --a2dp-volume meant local/software volume.  BlueALSA
+ * 5 defaults to native volume and has no --a2dp-soft-volume daemon option;
+ * apply the equivalent v5 control command when each PCM appears. */
+static void bluealsa_apply_soft_volume(const char * path) {
+    bluealsa_backend_t backend = bluealsa_backend();
+    if (!backend.modern || !bluealsa_is_audio_pcm_path(path)) return;
+    pthread_mutex_lock(&bt_soft_volume_mutex);
+    if (strcmp(bt_soft_volume_applied_path, path) == 0) {
+        pthread_mutex_unlock(&bt_soft_volume_mutex);
+        return;
+    }
+    snprintf(bt_soft_volume_applied_path, sizeof(bt_soft_volume_applied_path), "%s", path);
+    char * argv[] = { (char *) backend.ctl, (char *) "soft-volume",
+                      (char *) path,
+                      (char *) (atomic_load(&modern_soft_volume_requested) ? "on" : "off"), NULL };
+    int exit_code = -1;
+    bool ok = subprocess_run_checked(argv, NULL, 0, 5000, &exit_code) && exit_code == 0;
+    if (!ok) bt_soft_volume_applied_path[0] = '\0';
+    pthread_mutex_unlock(&bt_soft_volume_mutex);
+}
+
+static void bluealsa_clear_soft_volume_path(const char * path) {
+    pthread_mutex_lock(&bt_soft_volume_mutex);
+    if (!path || strcmp(bt_soft_volume_applied_path, path) == 0)
+        bt_soft_volume_applied_path[0] = '\0';
+    pthread_mutex_unlock(&bt_soft_volume_mutex);
+}
+
+static bool parse_monitor_volume(const char * text, int * out) {
+    if (!text || !out) return false;
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        char * end;
+        unsigned long packed = strtoul(text, &end, 16);
+        if (end == text || *end != '\0' || packed > UINT32_MAX) return false;
+        *out = (int) ((packed >> 8) & 0xFF); /* legacy left channel byte */
+        return true;
+    }
+    char * end;
+    long value = strtol(text, &end, 10);
+    if (end == text || (strcmp(end, "[M]") != 0 && *end != '\0') ||
+            value < 0 || value > BT_SOURCE_VOLUME_MAX) return false;
+    *out = (int) value; /* v5 prints one value per channel */
+    return true;
 }
 
 static pthread_mutex_t bt_dac_info_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -76,8 +154,9 @@ static void copy_info_field(char * dst, size_t size, const char * text, const ch
 
 static void bt_dac_info_refresh(void) {
     bt_dac_stream_info_t info = {0};
+    const char * ctl = bluealsa_ctl_name();
     char list_out[4096];
-    char * list_argv[] = { (char *) "bluealsa-cli", (char *) "list-pcms", NULL };
+    char * list_argv[] = { (char *) ctl, (char *) "list-pcms", NULL };
     if (!subprocess_run(list_argv, list_out, sizeof(list_out))) {
         bt_dac_info_store(&info);
         return;
@@ -91,19 +170,25 @@ static void bt_dac_info_refresh(void) {
         }
     }
     if (!path[0]) {
+        bluealsa_clear_soft_volume_path(NULL);
         bt_dac_info_store(&info); /* PCM disappeared: clear stale data now. */
         return;
     }
+    bluealsa_apply_soft_volume(path);
     info.available = true;
     char info_out[2048];
-    char * info_argv[] = { (char *) "bluealsa-cli", (char *) "info", path, NULL };
+    char * info_argv[] = { (char *) ctl, (char *) "info", path, NULL };
     if (subprocess_run(info_argv, info_out, sizeof(info_out))) {
         copy_info_field(info.codec, sizeof(info.codec), info_out, "Selected codec:");
         copy_info_field(info.pcm_format, sizeof(info.pcm_format), info_out, "Format:");
         const char * sampling = strstr(info_out, "Sampling:");
+        if (!sampling) sampling = strstr(info_out, "Rate:");
         const char * channels = strstr(info_out, "Channels:");
         const char * running = strstr(info_out, "Running:");
-        if (sampling) (void) sscanf(sampling + strlen("Sampling:"), "%u", &info.sample_rate);
+        if (sampling) {
+            const char * value = strchr(sampling, ':');
+            if (value) (void) sscanf(value + 1, "%u", &info.sample_rate);
+        }
         if (channels) (void) sscanf(channels + strlen("Channels:"), "%u", &info.channels);
         if (running) {
             running += strlen("Running:");
@@ -117,7 +202,7 @@ static void bt_dac_info_refresh(void) {
 
 static void * bt_dac_info_thread_func(void * arg) {
     (void) arg;
-    char * argv[] = { (char *) "bluealsa-cli", (char *) "monitor", NULL };
+    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "monitor", NULL };
     pid_t pid;
     int fd;
     if (!subprocess_popen(argv, &pid, &fd)) return NULL;
@@ -239,6 +324,74 @@ static int count_matching(const char * needle) {
         line = strtok_r(NULL, "\n", &line_save);
     }
     return count;
+}
+
+static int count_process_exact(const char * name) {
+    char out[4096];
+    char * argv[] = { (char *) "ps", NULL };
+    if (!subprocess_run(argv, out, sizeof(out))) return 0;
+
+    int count = 0;
+    char * line_save = NULL;
+    char * line = strtok_r(out, "\n", &line_save);
+    while (line) {
+        char * field_save = NULL;
+        char * field = strtok_r(line, " \t", &field_save);
+        while (field) {
+            const char * base = strrchr(field, '/');
+            if (base) base++;
+            else base = field;
+            if (strcmp(base, name) == 0) {
+                count++;
+                break;
+            }
+            field = strtok_r(NULL, " \t", &field_save);
+        }
+        line = strtok_r(NULL, "\n", &line_save);
+    }
+    return count;
+}
+
+/* Reconcile only the backend daemon itself.  The stock startup scripts can
+ * leave a source daemon running without the requested encoder quality; a
+ * sink daemon is deliberately left alone because SBC-XQ is source-only. */
+static bool bluealsa_needs_source_restart(const bluealsa_backend_t * backend, bool xq) {
+    DIR * proc = opendir("/proc");
+    if (!proc) return false;
+    bool restart = false;
+    struct dirent * entry;
+    while ((entry = readdir(proc))) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        char path[320];
+        snprintf(path, sizeof(path), "/proc/%s/cmdline", entry->d_name);
+        FILE * f = fopen(path, "r");
+        if (!f) continue;
+        char args[2048] = {0};
+        size_t len = fread(args, 1, sizeof(args) - 1, f);
+        fclose(f);
+        if (!len) continue;
+        const char * name = strrchr(args, '/');
+        name = name ? name + 1 : args;
+        if (strcmp(name, backend->daemon_name) != 0) continue;
+        bool sink = false, active_xq = false;
+        for (size_t pos = strlen(args) + 1; pos < len; ) {
+            size_t arg_len = strlen(args + pos);
+            const char * arg = args + pos;
+            if (strcmp(arg, "a2dp-sink") == 0 ||
+                    strcmp(arg, "--profile=a2dp-sink") == 0) sink = true;
+            if (strcmp(arg, "--profile") == 0 && pos + arg_len + 1 < len &&
+                    strcmp(args + pos + arg_len + 1, "a2dp-sink") == 0) sink = true;
+            if (strcmp(arg, "--sbc-quality=xq") == 0 ||
+                    (strcmp(arg, "--sbc-quality") == 0 &&
+                     pos + arg_len + 1 < len &&
+                     strcmp(args + pos + arg_len + 1, "xq") == 0)) active_xq = true;
+            if (!arg_len) break;
+            pos += arg_len + 1;
+        }
+        if (!sink && active_xq != xq) restart = true;
+    }
+    closedir(proc);
+    return restart;
 }
 
 static bool dbus_system_bus_reachable(void) {
@@ -440,55 +593,29 @@ bool bt_control_is_powered(void) {
  * needed a fresh bring-up; bt_control_apply_output_settings() still layers
  * DAC mode / --a2dp-volume on top via its own call sites once the user
  * touches a Bluetooth output setting. */
-/* Inspect the real daemon, excluding bluealsa-cli/aplay. Stock bt_resume
- * can start it without our encoder options, including after a reboot.
- * Leave an existing receiver profile alone: XQ is an encoder preference. */
-static bool bluealsa_needs_source_restart(bool xq) {
-    DIR * proc = opendir("/proc");
-    if (!proc) return false;
-    bool restart = false;
-    struct dirent * entry;
-    while ((entry = readdir(proc))) {
-        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
-        char path[320];
-        snprintf(path, sizeof(path), "/proc/%s/cmdline", entry->d_name);
-        FILE * f = fopen(path, "r");
-        if (!f) continue;
-        char args[2048] = {0};
-        size_t len = fread(args, 1, sizeof(args) - 1, f);
-        fclose(f);
-        if (!len) continue;
-        const char * name = strrchr(args, '/');
-        name = name ? name + 1 : args;
-        if (strcmp(name, "bluealsa") != 0) continue;
-        bool sink = false, active_xq = false;
-        for (size_t pos = strlen(args) + 1; pos < len; pos += strlen(args + pos) + 1) {
-            if (strcmp(args + pos, "a2dp-sink") == 0) sink = true;
-            if (strcmp(args + pos, "--sbc-quality=xq") == 0) active_xq = true;
-        }
-        if (!sink && active_xq != xq) restart = true;
-    }
-    closedir(proc);
-    return restart;
-}
-
 static void ensure_bluealsa_running(void) {
     pthread_mutex_lock(&bt_daemon_respawn_mutex);
+    bluealsa_backend_t backend = bluealsa_backend();
     bool xq = atomic_load(&sbc_xq_enabled);
-    /* subprocess_kill_all_matching() is fire-and-forget (SIGKILL, no
-     * waitpid), so the just-killed process can still be visible to a
-     * count_matching() ps snapshot taken right after -- once we've decided
-     * a restart is needed, respawn unconditionally rather than re-checking
-     * whether the old daemon "is still running", or that race can skip the
-     * respawn entirely and leave the stale (pre-restart) daemon in place. */
-    bool must_restart = bluealsa_needs_source_restart(xq);
-    if (must_restart) subprocess_kill_all_matching("bluealsa");
-    if (!must_restart && count_matching("bluealsa") > 0) {
+    bool must_restart = bluealsa_needs_source_restart(&backend, xq);
+    if (must_restart)
+        subprocess_kill_all_matching(backend.daemon_name);
+    /* Killing detached daemons is asynchronous; the old process may still be
+     * visible to an immediate ps snapshot. Once a mismatch was established,
+     * respawn unconditionally instead of allowing that stale snapshot to
+     * suppress the replacement. */
+    if (!must_restart && count_process_exact(backend.daemon_name) > 0) {
         pthread_mutex_unlock(&bt_daemon_respawn_mutex);
         return;
     }
-    char * argv[] = { (char *) "bluealsa", (char *) "-p", (char *) "a2dp-source",
-                       (char *) "--a2dp-volume", xq ? (char *) "--sbc-quality=xq" : NULL, NULL };
+    char * argv[6];
+    int argc = 0;
+    argv[argc++] = (char *) backend.daemon;
+    argv[argc++] = (char *) "-p";
+    argv[argc++] = (char *) "a2dp-source";
+    if (!backend.modern) argv[argc++] = (char *) "--a2dp-volume";
+    if (xq) argv[argc++] = (char *) "--sbc-quality=xq";
+    argv[argc] = NULL;
     subprocess_spawn_daemon(argv);
     pthread_mutex_unlock(&bt_daemon_respawn_mutex);
 }
@@ -569,10 +696,107 @@ static void query_device_state(const char * mac, bool * out_paired, bool * out_c
     *out_connected = strstr(out, "Connected: yes") != NULL;
 }
 
+/* BlueZ 5.87 removed the legacy `paired-devices` command and added the
+ * `Paired` property filter to `devices`.  Probe the CLI's own command help,
+ * rather than coupling this to the BlueZ daemon version or filesystem paths.
+ * Keep the mutex held while probing so concurrent callers cannot spawn two
+ * capability probes.  A failed, empty, truncated, or unrecognized probe
+ * deliberately leaves the cache empty, allowing a later poll to retry. */
+typedef enum {
+    BT_BLUETOOTHCTL_DEVICES_UNKNOWN,
+    BT_BLUETOOTHCTL_DEVICES_MODERN,
+    BT_BLUETOOTHCTL_DEVICES_LEGACY
+} bt_bluetoothctl_devices_capability_t;
+
+static pthread_mutex_t bt_bluetoothctl_devices_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bt_bluetoothctl_devices_capability_t bt_bluetoothctl_devices_capability =
+    BT_BLUETOOTHCTL_DEVICES_UNKNOWN;
+
+/* `bluetoothctl --help` prints first-level commands as tab-indented lines,
+ * followed by a tab-separated description.  It intentionally does not print
+ * the command argument specification, so detect command names only. */
+static bool bt_bluetoothctl_help_has_command(const char * help, const char * command) {
+    size_t command_len = strlen(command);
+    const char * line = help;
+    while (line && *line) {
+        const char * end = strchr(line, '\n');
+        const char * token = line;
+        if (*token == '\t' && token[1] != '\t') {
+            const char * token_end = token + 1;
+            token++;
+            while (*token_end && *token_end != '\t' && *token_end != ' ' &&
+                    *token_end != '\r' && *token_end != '\n') token_end++;
+            if ((size_t) (token_end - token) == command_len &&
+                    strncmp(token, command, command_len) == 0) return true;
+        }
+        if (!end) break;
+        line = end + 1;
+    }
+    return false;
+}
+
+static bool bt_control_paired_devices_argv_checked(char * argv[4], int timeout_ms,
+                                                   bt_control_cancel_callback_t cancel_cb,
+                                                   void * cancel_ctx) {
+    pthread_mutex_lock(&bt_bluetoothctl_devices_mutex);
+
+    if (cancel_cb && cancel_cb(cancel_ctx)) {
+        pthread_mutex_unlock(&bt_bluetoothctl_devices_mutex);
+        return false;
+    }
+
+    if (bt_bluetoothctl_devices_capability == BT_BLUETOOTHCTL_DEVICES_UNKNOWN) {
+        /* 5.87 prints over 9 KiB including submenu commands. A 4 KiB
+         * capture truncates it and would leave this probe retrying forever. */
+        char help[16384] = {0};
+        char * help_argv[] = { (char *) "bluetoothctl", (char *) "--help", NULL };
+        int exit_code = -1;
+        bool ran = timeout_ms > 0 ? subprocess_run_checked(help_argv, help, sizeof(help),
+                                                            timeout_ms, &exit_code) && exit_code == 0 :
+                                   subprocess_run(help_argv, help, sizeof(help));
+        if (ran) {
+            size_t help_len = strnlen(help, sizeof(help));
+            bool complete = help_len > 0 && help_len < sizeof(help) - 1 &&
+                            help[help_len - 1] == '\n';
+            /* Prefer the legacy command if both names ever appear in a
+             * vendor-customized help listing. */
+            if (complete && bt_bluetoothctl_help_has_command(help, "paired-devices"))
+                bt_bluetoothctl_devices_capability = BT_BLUETOOTHCTL_DEVICES_LEGACY;
+            else if (complete && bt_bluetoothctl_help_has_command(help, "devices"))
+                bt_bluetoothctl_devices_capability = BT_BLUETOOTHCTL_DEVICES_MODERN;
+        }
+    }
+
+    switch (bt_bluetoothctl_devices_capability) {
+    case BT_BLUETOOTHCTL_DEVICES_MODERN:
+        argv[0] = (char *) "bluetoothctl";
+        argv[1] = (char *) "devices";
+        argv[2] = (char *) "Paired";
+        argv[3] = NULL;
+        break;
+    case BT_BLUETOOTHCTL_DEVICES_LEGACY:
+        argv[0] = (char *) "bluetoothctl";
+        argv[1] = (char *) "paired-devices";
+        argv[2] = NULL;
+        break;
+    default:
+        pthread_mutex_unlock(&bt_bluetoothctl_devices_mutex);
+        return false;
+    }
+
+    pthread_mutex_unlock(&bt_bluetoothctl_devices_mutex);
+    return !cancel_cb || !cancel_cb(cancel_ctx);
+}
+
+static bool bt_control_paired_devices_argv(char * argv[4]) {
+    return bt_control_paired_devices_argv_checked(argv, 0, NULL, NULL);
+}
+
 bool bt_control_is_connected(void) {
     char devices_buf[4096];
-    char * devices_argv[] = { (char *) "bluetoothctl", (char *) "paired-devices", NULL };
-    if (!subprocess_run(devices_argv, devices_buf, sizeof(devices_buf))) return false;
+    char * devices_argv[4];
+    if (!bt_control_paired_devices_argv(devices_argv) ||
+            !subprocess_run(devices_argv, devices_buf, sizeof(devices_buf))) return false;
 
     char * line_save = NULL;
     char * line = strtok_r(devices_buf, "\n", &line_save);
@@ -598,8 +822,9 @@ bool bt_control_is_connected(void) {
  * Returns device count, or -1 if the underlying bluetoothctl call fails. */
 int bt_control_list_paired_states(bt_device_t * out, int max_count) {
     char devices_buf[4096];
-    char * devices_argv[] = { (char *) "bluetoothctl", (char *) "paired-devices", NULL };
-    if (!subprocess_run(devices_argv, devices_buf, sizeof(devices_buf))) return -1;
+    char * devices_argv[4];
+    if (!bt_control_paired_devices_argv(devices_argv) ||
+            !subprocess_run(devices_argv, devices_buf, sizeof(devices_buf))) return -1;
 
     int count = 0;
     char * line_save = NULL;
@@ -673,6 +898,7 @@ int bt_control_scan(int seconds, bt_device_t * out, int max_count) {
 
 bool bt_control_connect(const char * mac) {
     char out[512];
+    pthread_mutex_lock(&bt_chip_mutex);
 
     char * pair_argv[] = { (char *) "bluetoothctl", (char *) "pair", (char *) mac, NULL };
     subprocess_run(pair_argv, out, sizeof(out)); /* no-op if already paired -- not fatal either way */
@@ -681,31 +907,256 @@ bool bt_control_connect(const char * mac) {
     subprocess_run(trust_argv, out, sizeof(out));
 
     char * connect_argv[] = { (char *) "bluetoothctl", (char *) "connect", (char *) mac, NULL };
-    if (!subprocess_run(connect_argv, out, sizeof(out))) return false;
-    return strstr(out, "Failed") == NULL;
+    bool ok = subprocess_run(connect_argv, out, sizeof(out)) && strstr(out, "Failed") == NULL;
+    pthread_mutex_unlock(&bt_chip_mutex);
+    return ok;
 }
 
 bool bt_control_disconnect(const char * mac) {
     char out[512];
+    pthread_mutex_lock(&bt_chip_mutex);
     char * argv[] = { (char *) "bluetoothctl", (char *) "disconnect", (char *) mac, NULL };
-    if (!subprocess_run(argv, out, sizeof(out))) return false;
-    return strstr(out, "Failed") == NULL;
+    bool ok = subprocess_run(argv, out, sizeof(out)) && strstr(out, "Failed") == NULL;
+    pthread_mutex_unlock(&bt_chip_mutex);
+    return ok;
 }
 
 bool bt_control_forget(const char * mac) {
     char out[512];
+    pthread_mutex_lock(&bt_chip_mutex);
     char * argv[] = { (char *) "bluetoothctl", (char *) "remove", (char *) mac, NULL };
-    if (!subprocess_run(argv, out, sizeof(out))) return false;
-    return strstr(out, "Failed") == NULL;
+    bool ok = subprocess_run(argv, out, sizeof(out)) && strstr(out, "Failed") == NULL;
+    pthread_mutex_unlock(&bt_chip_mutex);
+    return ok;
+}
+
+#define BT_RECONNECT_QUERY_TIMEOUT_MS 1500
+#define BT_RECONNECT_CONNECT_TIMEOUT_MS 6500
+
+static bool bt_reconnect_cancelled(bt_control_cancel_callback_t cancel_cb, void * cancel_ctx) {
+    return cancel_cb && cancel_cb(cancel_ctx);
+}
+
+static bool bt_reconnect_valid_mac(const char * mac) {
+    if (!mac || strlen(mac) != 17) return false;
+    for (int i = 0; i < 17; i++) {
+        if (i % 3 == 2) {
+            if (mac[i] != ':') return false;
+        } else if (!((mac[i] >= '0' && mac[i] <= '9') ||
+                     (mac[i] >= 'A' && mac[i] <= 'F') ||
+                     (mac[i] >= 'a' && mac[i] <= 'f'))) return false;
+    }
+    return true;
+}
+
+static bool bt_reconnect_run(char * const argv[], char * output, size_t output_size,
+                             int timeout_ms, bt_control_cancel_callback_t cancel_cb,
+                             void * cancel_ctx, int * exit_code) {
+    if (bt_reconnect_cancelled(cancel_cb, cancel_ctx)) return false;
+    bool ran = subprocess_run_checked(argv, output, output_size, timeout_ms, exit_code);
+    if (!ran || (exit_code && *exit_code != 0)) return false;
+    /* An incomplete snapshot cannot establish that another output is absent. */
+    if (output && output_size && strnlen(output, output_size) >= output_size - 1) return false;
+    return !bt_reconnect_cancelled(cancel_cb, cancel_ctx);
+}
+
+static bool bt_reconnect_info(const char * mac, char * output, size_t output_size,
+                              bt_control_cancel_callback_t cancel_cb, void * cancel_ctx) {
+    char * argv[] = { (char *) "bluetoothctl", (char *) "info", (char *) mac, NULL };
+    int exit_code = -1;
+    return bt_reconnect_run(argv, output, output_size, BT_RECONNECT_QUERY_TIMEOUT_MS,
+                            cancel_cb, cancel_ctx, &exit_code);
+}
+
+static bool bt_reconnect_audio_output_connected(bt_control_cancel_callback_t cancel_cb,
+                                                void * cancel_ctx, bool * query_ok) {
+    char output[4096] = {0};
+    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "list-pcms", NULL };
+    int exit_code = -1;
+    bool ok = bt_reconnect_run(argv, output, sizeof(output), BT_RECONNECT_QUERY_TIMEOUT_MS,
+                               cancel_cb, cancel_ctx, &exit_code);
+    if (query_ok) *query_ok = ok;
+    if (!ok) return false;
+    return strstr(output, "/a2dpsrc/sink") != NULL;
+}
+
+/* Do not call bt_control_is_powered() from the reconnect critical section:
+ * that public status path has its own recovery behavior and can re-enter
+ * chip/daemon lifecycle code. This is the private, bounded read-only query
+ * needed by the worker and deliberately never powers the adapter on. */
+static bool bt_reconnect_adapter_powered(bt_control_cancel_callback_t cancel_cb,
+                                         void * cancel_ctx) {
+    char output[2048] = {0};
+    char * argv[] = { (char *) "bluetoothctl", (char *) "show", NULL };
+    int exit_code = -1;
+    return bt_reconnect_run(argv, output, sizeof(output), BT_RECONNECT_QUERY_TIMEOUT_MS,
+                            cancel_cb, cancel_ctx, &exit_code) &&
+           strstr(output, "Powered: yes") != NULL;
+}
+
+static bool bt_reconnect_info_line_is(const char * info, const char * key, const char * value) {
+    size_t key_len = strlen(key);
+    const char * line = info;
+    while (line && *line) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (strncmp(line, key, key_len) == 0) {
+            const char * p = line + key_len;
+            while (*p == ' ' || *p == '\t') p++;
+            size_t value_len = strcspn(p, "\r\n");
+            while (value_len && (p[value_len - 1] == ' ' || p[value_len - 1] == '\t')) value_len--;
+            if (strlen(value) == value_len && strncmp(p, value, value_len) == 0) return true;
+        }
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
+    return false;
+}
+
+static bool bt_reconnect_info_has_uuid(const char * info, const char * uuid) {
+    size_t key_len = strlen("UUID:");
+    const char * line = info;
+    while (line && *line) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (strncmp(line, "UUID:", key_len) == 0) {
+            const char * end = strchr(line, '\n');
+            size_t line_len = end ? (size_t)(end - line) : strlen(line);
+            const char * match = strstr(line + key_len, uuid);
+            if (match && (size_t)(match - line) + strlen(uuid) <= line_len) return true;
+        }
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
+    return false;
+}
+
+static bool bt_reconnect_info_eligible(const char * info, bool * connected) {
+    if (connected) *connected = false;
+    if (!info || !bt_reconnect_info_line_is(info, "Paired:", "yes") ||
+            !bt_reconnect_info_line_is(info, "Trusted:", "yes") ||
+            bt_reconnect_info_line_is(info, "Blocked:", "yes") ||
+            !bt_reconnect_info_has_uuid(info, "0000110b-0000-1000-8000-00805f9b34fb")) return false;
+    if (connected) *connected = bt_reconnect_info_line_is(info, "Connected:", "yes");
+    return true;
+}
+
+static bool bt_reconnect_disconnect_locked(const char * mac) {
+    char output[512] = {0};
+    char * argv[] = { (char *) "bluetoothctl", (char *) "disconnect", (char *) mac, NULL };
+    int exit_code = -1;
+    return subprocess_run_checked(argv, output, sizeof(output),
+                                  BT_RECONNECT_QUERY_TIMEOUT_MS, &exit_code) &&
+           exit_code == 0 && strstr(output, "Failed") == NULL;
+}
+
+bool bt_control_reconnect_paired(const char * preferred_mac,
+                                 bt_control_cancel_callback_t cancel_cb,
+                                 void * cancel_ctx) {
+    if (preferred_mac && (!bt_reconnect_valid_mac(preferred_mac) ||
+                          bt_reconnect_cancelled(cancel_cb, cancel_ctx))) return false;
+    if (!bt_reconnect_adapter_powered(cancel_cb, cancel_ctx)) return false;
+    bool pcm_query_ok = false;
+    if (bt_reconnect_audio_output_connected(cancel_cb, cancel_ctx, &pcm_query_ok)) return true;
+    if (!pcm_query_ok) return false;
+    if (bt_reconnect_cancelled(cancel_cb, cancel_ctx)) return false;
+
+    char target[18] = {0};
+    char info[4096] = {0};
+    bool was_connected = false;
+    if (preferred_mac) {
+        snprintf(target, sizeof(target), "%s", preferred_mac);
+        if (!bt_reconnect_info(target, info, sizeof(info), cancel_cb, cancel_ctx) ||
+                !bt_reconnect_info_eligible(info, &was_connected)) return false;
+    } else {
+        char devices[4096] = {0};
+        char * devices_argv[4];
+        if (!bt_control_paired_devices_argv_checked(devices_argv, BT_RECONNECT_QUERY_TIMEOUT_MS,
+                                                     cancel_cb, cancel_ctx)) return false;
+        int exit_code = -1;
+        if (!bt_reconnect_run(devices_argv, devices, sizeof(devices),
+                              BT_RECONNECT_QUERY_TIMEOUT_MS, cancel_cb, cancel_ctx, &exit_code)) return false;
+        size_t devices_len = strnlen(devices, sizeof(devices));
+        if (devices_len == 0 || devices_len >= sizeof(devices) - 1 || devices[devices_len - 1] != '\n') return false;
+        unsigned int eligible = 0;
+        char * save = NULL;
+        for (char * line = strtok_r(devices, "\r\n", &save); line;
+             line = strtok_r(NULL, "\r\n", &save)) {
+            if (bt_reconnect_cancelled(cancel_cb, cancel_ctx)) return false;
+            if (strncmp(line, "Device ", 7) != 0) continue;
+            const char * mac = line + 7;
+            const char * name = strchr(mac, ' ');
+            char candidate[18];
+            if (!name || (size_t)(name - mac) != 17) continue;
+            memcpy(candidate, mac, 17);
+            candidate[17] = '\0';
+            if (!bt_reconnect_valid_mac(candidate)) continue;
+            char candidate_info[4096] = {0};
+            bool candidate_connected = false;
+            if (!bt_reconnect_info(candidate, candidate_info, sizeof(candidate_info),
+                                   cancel_cb, cancel_ctx)) return false;
+            if (bt_reconnect_info_eligible(candidate_info, &candidate_connected)) {
+                eligible++;
+                snprintf(target, sizeof(target), "%s", candidate);
+                snprintf(info, sizeof(info), "%s", candidate_info);
+                was_connected = candidate_connected;
+                if (eligible > 1) return false;
+            }
+        }
+        if (eligible != 1) return false;
+    }
+    if (was_connected) return true;
+    if (bt_reconnect_cancelled(cancel_cb, cancel_ctx)) return false;
+
+    pthread_mutex_lock(&bt_chip_mutex);
+    bool result = false;
+    bool connected_after = false;
+    if (!bt_reconnect_cancelled(cancel_cb, cancel_ctx) &&
+            bt_reconnect_adapter_powered(cancel_cb, cancel_ctx) &&
+            bt_reconnect_audio_output_connected(cancel_cb, cancel_ctx, &pcm_query_ok) == false &&
+            pcm_query_ok) {
+        /* Refresh under the chip lock so a connection made by another path
+         * before lock acquisition is treated as preexisting. */
+        char locked_info[4096] = {0};
+        bool locked_connected = false;
+        if (!bt_reconnect_info(target, locked_info, sizeof(locked_info), NULL, NULL) ||
+                !bt_reconnect_info_eligible(locked_info, &locked_connected)) {
+            pthread_mutex_unlock(&bt_chip_mutex);
+            return false;
+        }
+        if (locked_connected) {
+            pthread_mutex_unlock(&bt_chip_mutex);
+            return true;
+        }
+        if (bt_reconnect_cancelled(cancel_cb, cancel_ctx)) {
+            pthread_mutex_unlock(&bt_chip_mutex);
+            return false;
+        }
+        char * connect_argv[] = { (char *) "bluetoothctl", (char *) "--timeout", (char *) "5",
+                                  (char *) "connect", target, NULL };
+        char connect_output[1024] = {0};
+        int exit_code = -1;
+        bool connect_ran = subprocess_run_checked(connect_argv, connect_output, sizeof(connect_output),
+                                                  BT_RECONNECT_CONNECT_TIMEOUT_MS, &exit_code);
+        bool connect_ok = connect_ran && exit_code == 0 && strstr(connect_output, "Failed") == NULL;
+        /* Verify and, when cancellation raced the command, clean up using an
+         * uncancelled bounded read. The callback is intentionally not used
+         * for this cleanup observation. */
+        if (bt_reconnect_info(target, info, sizeof(info), NULL, NULL))
+            connected_after = bt_reconnect_info_eligible(info, &was_connected) && was_connected;
+        if (bt_reconnect_cancelled(cancel_cb, cancel_ctx)) {
+            (void) bt_reconnect_disconnect_locked(target);
+        } else {
+            result = connect_ok && connected_after;
+        }
+    }
+    pthread_mutex_unlock(&bt_chip_mutex);
+    return result;
 }
 
 /* Synchronizes volume between this player and connected a2dp-source accessories.
  * Maps AVRCP 0-127 linearly to the player's 0-100% volume. */
-#define BT_SOURCE_VOLUME_MAX 127
-
 static bool find_source_pcm_path(char * out, size_t out_size) {
     char list_out[4096];
-    char * argv[] = { (char *) "bluealsa-cli", (char *) "list-pcms", NULL };
+    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "list-pcms", NULL };
     if (!subprocess_run(argv, list_out, sizeof(list_out))) {
         /* Log failure if bluealsa-cli list-pcms fails or times out. */
         DBG_LOG("bt_control: find_source_pcm_path: bluealsa-cli list-pcms failed/timed out\n");
@@ -722,6 +1173,10 @@ static bool find_source_pcm_path(char * out, size_t out_size) {
          * "/org/bluealsa/hci0/dev_XX_XX_XX_XX_XX_XX/a2dpsrc/sink"). */
         if (strstr(line, "/a2dpsrc/sink") != NULL) {
             snprintf(out, out_size, "%s", line);
+            /* A source PCM can predate this monitor subscription, so apply
+             * the v5 SoftVolume preference during discovery as well as on
+             * PCMAdded. */
+            bluealsa_apply_soft_volume(out);
             return true;
         }
         line = strtok_r(NULL, "\n", &line_save);
@@ -766,7 +1221,7 @@ bool bt_control_get_connected_device_codec(char * out, size_t out_size) {
     if (!find_source_pcm_path(path, sizeof(path))) return false;
 
     char info_out[2048];
-    char * argv[] = { (char *) "bluealsa-cli", (char *) "info", path, NULL };
+    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "info", path, NULL };
     if (!subprocess_run(argv, info_out, sizeof(info_out))) return false;
 
     /* "Selected codec: AAC" -- confirmed live via `bluealsa-cli info
@@ -792,8 +1247,8 @@ bool bt_control_get_connected_device_codec(char * out, size_t out_size) {
 }
 
 static pthread_t bt_source_vol_sync_thread;
-static bool bt_source_vol_sync_active = false;
-static pid_t bt_source_vol_sync_monitor_pid = -1;
+static atomic_bool bt_source_vol_sync_active = false;
+static bool bt_source_vol_sync_joinable;
 static atomic_int bt_source_vol_pending_percent = -1;
 
 /* Set by whichever direction writes/observes a value most recently, so the
@@ -820,7 +1275,7 @@ static void bt_source_push_app_volume_if_changed(float * last_synced_app_percent
 
     char raw_str[8];
     snprintf(raw_str, sizeof(raw_str), "%d", raw);
-    char * vol_argv[] = { (char *) "bluealsa-cli", (char *) "volume", path, raw_str, raw_str, NULL };
+    char * vol_argv[] = { (char *) bluealsa_ctl_name(), (char *) "volume", path, raw_str, raw_str, NULL };
     if (!subprocess_run(vol_argv, NULL, 0)) return;
 
     bt_source_vol_last_synced_raw = raw;
@@ -837,12 +1292,15 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
      * the app even if we push immediately afterward. */
     float last_synced_app_percent = -1.0f;
     bt_source_push_app_volume_if_changed(&last_synced_app_percent);
+    if (!atomic_load(&bt_source_vol_sync_active)) return NULL;
 
-    char * argv[] = { (char *) "bluealsa-cli", (char *) "monitor", (char *) "-p", NULL };
+    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "monitor", (char *) "-p", NULL };
     pid_t pid;
     int read_fd;
-    if (!subprocess_popen(argv, &pid, &read_fd)) return NULL;
-    bt_source_vol_sync_monitor_pid = pid;
+    if (!subprocess_popen(argv, &pid, &read_fd)) {
+        atomic_store(&bt_source_vol_sync_active, false);
+        return NULL;
+    }
 
     char buf[512];
     size_t buf_len = 0;
@@ -865,6 +1323,10 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
          * loop -- see the push check below. */
         struct pollfd pfd = { .fd = read_fd, .events = POLLIN };
         int pr = poll(&pfd, 1, 500);
+        if (!atomic_load(&bt_source_vol_sync_active)) break;
+        if (pr < 0 && errno != EINTR) break;
+        if (pr > 0 && (pfd.revents & (POLLERR | POLLNVAL))) break;
+        if (pr > 0 && (pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) break;
 
         if (pr > 0 && (pfd.revents & POLLIN)) {
             if (buf_len >= sizeof(buf) - 1) buf_len = 0; /* defensive -- a line this long can't be a real PropertyChanged message, drop and resync */
@@ -878,10 +1340,11 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
             while ((newline = memchr(line_start, '\n', buf_len - (size_t) (line_start - buf))) != NULL) {
                 *newline = '\0';
                 char path[256];
-                unsigned int raw_hex;
-                if (sscanf(line_start, "PropertyChanged %255s Volume 0x%x", path, &raw_hex) == 2 &&
-                    strstr(path, "/a2dpsrc/sink") != NULL) {
-                    int raw = (int) ((raw_hex >> 8) & 0xFF); /* left byte -- left/right always move together for this stereo sync */
+                int raw;
+                char volume_text[64];
+                if (sscanf(line_start, "PropertyChanged %255s Volume %63s", path, volume_text) == 2 &&
+                    strstr(path, "/a2dpsrc/sink") != NULL &&
+                    parse_monitor_volume(volume_text, &raw)) {
                     if (raw != bt_source_vol_last_synced_raw) {
                         bt_source_vol_last_synced_raw = raw;
                         last_synced_app_percent = (float) raw / (float) BT_SOURCE_VOLUME_MAX;
@@ -902,23 +1365,36 @@ static void * bt_source_vol_sync_thread_func(void * arg) {
     }
 
     close(read_fd);
+    subprocess_terminate(pid); /* worker owns and reaps its own child */
+    atomic_store(&bt_source_vol_sync_active, false);
     return NULL;
 }
 
+bool bt_control_source_volume_sync_is_running(void) {
+    return atomic_load(&bt_source_vol_sync_active);
+}
+
 void bt_control_source_volume_sync_start(void) {
-    if (bt_source_vol_sync_active) return; /* already running -- callers here are expected not to double-start (see gui.c's own gating) */
+    if (bt_source_vol_sync_joinable) {
+        if (atomic_load(&bt_source_vol_sync_active)) return;
+        pthread_join(bt_source_vol_sync_thread, NULL);
+        bt_source_vol_sync_joinable = false;
+    }
     bt_source_vol_sync_active = true;
     bt_source_vol_last_synced_raw = -1;
     atomic_store_explicit(&bt_source_vol_pending_percent, -1, memory_order_relaxed);
-    pthread_create(&bt_source_vol_sync_thread, NULL, bt_source_vol_sync_thread_func, NULL);
+    if (pthread_create(&bt_source_vol_sync_thread, NULL, bt_source_vol_sync_thread_func, NULL) == 0)
+        bt_source_vol_sync_joinable = true;
+    else bt_source_vol_sync_active = false;
 }
 
 void bt_control_source_volume_sync_stop(void) {
-    if (!bt_source_vol_sync_active) return;
-    bt_source_vol_sync_active = false; /* checked at the top of the thread's own loop -- the poll() timeout above (<=500ms) is what actually lets it notice and exit, not this flag alone */
-    if (bt_source_vol_sync_monitor_pid > 0) subprocess_terminate(bt_source_vol_sync_monitor_pid);
+    if (!bt_source_vol_sync_joinable) return;
+    /* Cancellation is observed after any in-flight command and the bounded
+     * pipe poll. This join belongs on the lifecycle worker, never LVGL. */
+    bt_source_vol_sync_active = false;
     pthread_join(bt_source_vol_sync_thread, NULL);
-    bt_source_vol_sync_monitor_pid = -1;
+    bt_source_vol_sync_joinable = false;
     atomic_store_explicit(&bt_source_vol_pending_percent, -1, memory_order_release);
 }
 
@@ -942,69 +1418,193 @@ bool bt_control_source_volume_sync_consume_percent(int * out_percent) {
  * (audio_output.c's `aplay -D bluealsa`), not any other PCM bluealsa might
  * have (e.g. one from DAC mode). */
 static pthread_t bt_output_disconnect_thread;
-static bool bt_output_disconnect_active = false;
-static pid_t bt_output_disconnect_monitor_pid = -1;
-static volatile bool bt_output_disconnect_flag = false;
+static atomic_bool bt_output_disconnect_active = false;
+static bool bt_output_disconnect_joinable;
+static atomic_bool bt_output_disconnect_flag = false;
+static pthread_mutex_t bt_output_disconnect_state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char bt_output_disconnect_confirmed_path[256];
+
+#define BT_OUTPUT_DISCONNECT_MAX_ADDED_PATHS 16
+
+static void bt_output_disconnect_process_line(const char * line, char * pending_path,
+                                              uint32_t * pending_deadline,
+                                              char added_paths[][256], int * added_count) {
+    char path[256];
+    if (sscanf(line, "PCMRemoved %255s", path) == 1) {
+        if (strstr(path, "/a2dpsrc/sink") != NULL) {
+            snprintf(pending_path, 256, "%s", path);
+            *pending_deadline = bt_control_monotonic_ms() + BT_OUTPUT_RECONFIGURE_GRACE_MS;
+            bluealsa_clear_soft_volume_path(path);
+            DBG_LOG("bt_control: output_disconnect_watch: PCMRemoved %s -- pending disconnect\n", path);
+        }
+        return;
+    }
+    if (strncmp(line, "PCMAdded ", 9) != 0 || sscanf(line, "PCMAdded %255s", path) != 1) return;
+    if (strcmp(pending_path, path) == 0) {
+        pending_path[0] = '\0';
+        *pending_deadline = 0;
+        DBG_LOG("bt_control: output_disconnect_watch: PCMAdded %s -- cancelled pending disconnect\n", path);
+    }
+    /* A replacement can arrive after the deadline but before the UI consumes
+     * the event. Cancel only the event for this exact PCM, under the same
+     * short lock used by the UI consumer. Never hold it during control I/O. */
+    pthread_mutex_lock(&bt_output_disconnect_state_mutex);
+    if (strcmp(bt_output_disconnect_confirmed_path, path) == 0) {
+        atomic_store(&bt_output_disconnect_flag, false);
+        bt_output_disconnect_confirmed_path[0] = '\0';
+    }
+    pthread_mutex_unlock(&bt_output_disconnect_state_mutex);
+    if (*added_count < BT_OUTPUT_DISCONNECT_MAX_ADDED_PATHS)
+        snprintf(added_paths[(*added_count)++], 256, "%s", path);
+    DBG_LOG("bt_control: output_disconnect_watch: %s\n", line);
+}
+
+static bool bt_output_disconnect_read_batch(int fd, char * buf, size_t * used,
+                                            char * pending_path, uint32_t * pending_deadline,
+                                            char added_paths[][256], int * added_count) {
+    if (*used == 511) *used = 0;
+    ssize_t n = read(fd, buf + *used, 511 - *used);
+    if (n <= 0) return false;
+    *used += (size_t)n;
+    buf[*used] = '\0';
+    char * line = buf;
+    char * end;
+    while ((end = strchr(line, '\n')) != NULL) {
+        *end = '\0';
+        bt_output_disconnect_process_line(line, pending_path, pending_deadline,
+                                          added_paths, added_count);
+        line = end + 1;
+    }
+    size_t remaining = *used - (size_t)(line - buf);
+    memmove(buf, line, remaining);
+    *used = remaining;
+    return true;
+}
+
+static void bt_output_disconnect_publish_if_due(char * pending_path, uint32_t * pending_deadline) {
+    if (!pending_path[0] || (int32_t)(bt_control_monotonic_ms() - *pending_deadline) < 0) return;
+    pthread_mutex_lock(&bt_output_disconnect_state_mutex);
+    if (atomic_load(&bt_output_disconnect_active) && !atomic_load(&bt_output_disconnect_flag)) {
+        snprintf(bt_output_disconnect_confirmed_path, sizeof(bt_output_disconnect_confirmed_path), "%s", pending_path);
+        atomic_store(&bt_output_disconnect_flag, true);
+    }
+    pthread_mutex_unlock(&bt_output_disconnect_state_mutex);
+    DBG_LOG("bt_control: output_disconnect_watch: PCMRemoved %s -- flagging disconnect\n", pending_path);
+    pending_path[0] = '\0';
+    *pending_deadline = 0;
+}
 
 static void * bt_output_disconnect_thread_func(void * arg) {
     (void) arg;
 
-    char * argv[] = { (char *) "bluealsa-cli", (char *) "monitor", NULL };
+    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "monitor", NULL };
     pid_t pid;
     int read_fd;
     if (!subprocess_popen(argv, &pid, &read_fd)) {
         DBG_LOG("bt_control: output_disconnect_watch: failed to spawn bluealsa-cli monitor\n");
+        atomic_store(&bt_output_disconnect_active, false);
         return NULL;
     }
-    bt_output_disconnect_monitor_pid = pid;
     DBG_LOG("bt_control: output_disconnect_watch: monitor started (pid %d)\n", (int) pid);
 
-    FILE * f = fdopen(read_fd, "r");
-    if (!f) {
-        subprocess_terminate(pid);
-        close(read_fd);
-        return NULL;
-    }
-
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        char path[256];
-        if (sscanf(line, "PCMRemoved %255s", path) == 1) {
-            if (strstr(path, "/a2dpsrc/sink") != NULL) {
-                DBG_LOG("bt_control: output_disconnect_watch: PCMRemoved %s -- flagging disconnect\n", path);
-                bt_output_disconnect_flag = true;
+    char buf[512];
+    size_t used = 0;
+    char pending_path[256] = "";
+    uint32_t pending_deadline = 0;
+    char added_paths[BT_OUTPUT_DISCONNECT_MAX_ADDED_PATHS][256];
+    int added_count = 0;
+    while (atomic_load(&bt_output_disconnect_active)) {
+        uint32_t now = bt_control_monotonic_ms();
+        int timeout_ms = 100;
+        if (pending_path[0]) {
+            int32_t remaining = (int32_t)(pending_deadline - now);
+            timeout_ms = remaining <= 0 ? 0 : (remaining < timeout_ms ? remaining : timeout_ms);
+        }
+        struct pollfd pfd = { .fd = read_fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, timeout_ms);
+        if (!atomic_load(&bt_output_disconnect_active)) break;
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        bool terminal = false;
+        if (pr > 0 && (pfd.revents & POLLIN))
+            terminal = !bt_output_disconnect_read_batch(read_fd, buf, &used, pending_path,
+                                                         &pending_deadline, added_paths, &added_count);
+        if (!terminal) {
+            struct pollfd drain = { .fd = read_fd, .events = POLLIN };
+            while (atomic_load(&bt_output_disconnect_active) && poll(&drain, 1, 0) > 0) {
+                if (!(drain.revents & POLLIN)) {
+                    terminal = (drain.revents & (POLLERR | POLLNVAL | POLLHUP)) != 0;
+                    break;
+                }
+                if (!bt_output_disconnect_read_batch(read_fd, buf, &used, pending_path,
+                                                     &pending_deadline, added_paths, &added_count)) {
+                    terminal = true;
+                    break;
+                }
+                drain.revents = 0;
             }
-        } else if (strncmp(line, "PCMAdded ", 9) == 0) {
-            /* Log PCMAdded events for diagnostics. */
-            DBG_LOG("bt_control: output_disconnect_watch: %s", line);
+        }
+        if (!atomic_load(&bt_output_disconnect_active)) break;
+        if (terminal || (pr > 0 && (pfd.revents & (POLLERR | POLLNVAL | POLLHUP)))) {
+            /* A failed monitor may have missed the replacement. Leave an
+             * unconfirmed removal to periodic polling rather than inventing
+             * a disconnect after its event stream has ended. */
+            break;
+        }
+        bt_output_disconnect_publish_if_due(pending_path, &pending_deadline);
+        /* Do not let volume subprocesses delay reading a replacement while
+         * a removal is pending. Keep the bounded queue until it settles. */
+        if (!pending_path[0]) {
+            for (int i = 0; i < added_count && atomic_load(&bt_output_disconnect_active); i++)
+                bluealsa_apply_soft_volume(added_paths[i]);
+            added_count = 0;
         }
     }
 
     DBG_LOG("bt_control: output_disconnect_watch: monitor exited (pid %d)\n", (int) pid);
-    fclose(f); /* also closes read_fd -- reached once bt_control_output_disconnect_watch_stop() kills the monitor subprocess and fgets() sees EOF */
+    close(read_fd);
+    subprocess_terminate(pid);
+    atomic_store(&bt_output_disconnect_active, false);
     return NULL;
 }
 
+bool bt_control_output_disconnect_watch_is_running(void) {
+    return atomic_load(&bt_output_disconnect_active);
+}
+
 void bt_control_output_disconnect_watch_start(void) {
-    if (bt_output_disconnect_active) return;
+    if (bt_output_disconnect_joinable) {
+        if (atomic_load(&bt_output_disconnect_active)) return;
+        pthread_join(bt_output_disconnect_thread, NULL);
+        bt_output_disconnect_joinable = false;
+    }
+    pthread_mutex_lock(&bt_output_disconnect_state_mutex);
     bt_output_disconnect_active = true;
     bt_output_disconnect_flag = false;
-    pthread_create(&bt_output_disconnect_thread, NULL, bt_output_disconnect_thread_func, NULL);
+    bt_output_disconnect_confirmed_path[0] = '\0';
+    pthread_mutex_unlock(&bt_output_disconnect_state_mutex);
+    if (pthread_create(&bt_output_disconnect_thread, NULL, bt_output_disconnect_thread_func, NULL) == 0)
+        bt_output_disconnect_joinable = true;
+    else bt_output_disconnect_active = false;
 }
 
 void bt_control_output_disconnect_watch_stop(void) {
-    if (!bt_output_disconnect_active) return;
     bt_output_disconnect_active = false;
-    DBG_LOG("bt_control: output_disconnect_watch: stopping (pid %d)\n", (int) bt_output_disconnect_monitor_pid);
-    if (bt_output_disconnect_monitor_pid > 0) subprocess_terminate(bt_output_disconnect_monitor_pid);
-    pthread_join(bt_output_disconnect_thread, NULL);
-    bt_output_disconnect_monitor_pid = -1;
+    if (bt_output_disconnect_joinable) {
+        pthread_join(bt_output_disconnect_thread, NULL);
+        bt_output_disconnect_joinable = false;
+    }
+    pthread_mutex_lock(&bt_output_disconnect_state_mutex);
+    atomic_store(&bt_output_disconnect_flag, false);
+    bt_output_disconnect_confirmed_path[0] = '\0';
+    pthread_mutex_unlock(&bt_output_disconnect_state_mutex);
 }
 
 bool bt_control_output_disconnect_consume(void) {
-    if (!bt_output_disconnect_flag) return false;
-    bt_output_disconnect_flag = false;
-    return true;
+    pthread_mutex_lock(&bt_output_disconnect_state_mutex);
+    bool disconnected = atomic_exchange(&bt_output_disconnect_flag, false);
+    bt_output_disconnect_confirmed_path[0] = '\0';
+    pthread_mutex_unlock(&bt_output_disconnect_state_mutex);
+    return disconnected;
 }
 
 /* Recorded so bt_control_reapply_last_output_settings() (the wedge
@@ -1030,16 +1630,20 @@ static bool spawn_bluealsa_and_verify(char * const argv[]) {
 bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled) {
     /* Serializes bluealsa/bt-agent respawns and updates last-applied settings
      * to protect against concurrent caller races. */
+    pthread_mutex_lock(&bt_chip_mutex);
     pthread_mutex_lock(&bt_daemon_respawn_mutex);
     last_applied_dac_mode_enabled = dac_mode_enabled;
     last_applied_volume_sync_enabled = volume_sync_enabled;
     output_settings_ever_applied = true;
+    atomic_store(&modern_soft_volume_requested, !volume_sync_enabled && bluealsa_backend().modern);
+    bluealsa_clear_soft_volume_path(NULL);
 
     /* Single profile mode: runs a2dp-sink or a2dp-source. */
     /* Clean up existing instances before respawning daemons. */
     bt_dac_info_monitor_stop();
 
-    subprocess_kill_all_matching("bluealsa");
+    bluealsa_backend_t backend = bluealsa_backend();
+    subprocess_kill_all_matching(backend.daemon_name);
     subprocess_kill_all_matching("aplay");
     subprocess_kill_all_matching("bt-agent");
     /* usleep(500000) delay TEMPORARILY REMOVED for the same live A/B test
@@ -1051,10 +1655,10 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
 
     char * argv[9];
     int i = 0;
-    argv[i++] = (char *) "/usr/bin/bluealsa";
+    argv[i++] = (char *) backend.daemon;
     argv[i++] = (char *) "-p";
     argv[i++] = dac_mode_enabled ? (char *) "a2dp-sink" : (char *) "a2dp-source";
-    if (volume_sync_enabled) argv[i++] = (char *) "--a2dp-volume";
+    if (volume_sync_enabled && !backend.modern) argv[i++] = (char *) "--a2dp-volume";
     if (!dac_mode_enabled && atomic_load(&sbc_xq_enabled))
         argv[i++] = (char *) "--sbc-quality=xq";
     /* Codec restriction (-c SBC -c AAC, excluding LDAC) TEMPORARILY REMOVED
@@ -1072,6 +1676,7 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
     argv[i] = NULL;
     if (!spawn_bluealsa_and_verify(argv)) {
         pthread_mutex_unlock(&bt_daemon_respawn_mutex);
+        pthread_mutex_unlock(&bt_chip_mutex);
         return false;
     }
 
@@ -1099,6 +1704,7 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
     }
     if (dac_mode_enabled) bt_dac_info_monitor_start();
     pthread_mutex_unlock(&bt_daemon_respawn_mutex);
+    pthread_mutex_unlock(&bt_chip_mutex);
     return true;
 }
 
@@ -1112,7 +1718,7 @@ static void bt_control_reapply_last_output_settings(void) {
     pthread_mutex_unlock(&bt_daemon_respawn_mutex);
 
     if (!ever_applied) {
-        ensure_bluealsa_running(); /* restore saved source encoder quality too */
+        ensure_bluealsa_running();
         return;
     }
     bt_control_apply_output_settings(dac_mode, volume_sync);

@@ -43,6 +43,10 @@ void close_quick_drawer(void);
 
 bool gui_shell_is_bt_audio_connected(void);
 void gui_shell_notify_bt_audio_disconnected(void);
+/* Cancels persisted-device auto-reconnect and suppresses it for the current
+ * powered Bluetooth cycle. Manual connect/forget actions use this so an
+ * automatic worker cannot race the user's explicit choice. */
+void gui_shell_cancel_bt_reconnect(void);
 
 void gui_shell_poll(void);
 void refresh_quick_drawer_crossfade_icon(void);

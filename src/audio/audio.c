@@ -1540,6 +1540,37 @@ static void close_device(void) {
 #define OUTPUT_WRITE_RETRIES 3
 #define OUTPUT_WRITE_RETRY_SLEEP_US 20000  /* 20 ms */
 
+/* Initial output acquisition has its own bounded recovery budget. In
+ * particular, audio_output_ensure() can fail transiently while another route
+ * is handing ownership back; do not turn that into a permanent track failure
+ * before the first sample is written. This helper never closes an existing
+ * device: audio_output_close() is owner-guarded, and an ensure failure must
+ * not tear down another producer's output. */
+static write_result_t ensure_device_with_retry(unsigned int channels,
+                                               unsigned int sample_rate,
+                                               bool want_s24,
+                                               const char * path,
+                                               bool allow_during_stop_restart) {
+    for (int attempt = 0; attempt <= OUTPUT_WRITE_RETRIES; attempt++) {
+        pthread_mutex_lock(&audio_mutex);
+        bool abort = should_abort_write_retry(allow_during_stop_restart,
+                                              stop_requested, restart_requested);
+        pthread_mutex_unlock(&audio_mutex);
+        if (abort) return WRITE_RESULT_ABORTED;
+
+        bool ok = want_s24
+            ? ensure_device_format(channels, sample_rate, true)
+            : ensure_device(channels, sample_rate);
+        if (ok) return WRITE_RESULT_OK;
+
+        if (attempt == OUTPUT_WRITE_RETRIES) break;
+        DBG_LOG("audio: output ensure failed attempt %d/%d (%s)\n",
+                attempt + 1, OUTPUT_WRITE_RETRIES + 1, safe_path_tail(path));
+        usleep(OUTPUT_WRITE_RETRY_SLEEP_US);
+    }
+    return WRITE_RESULT_FAILED;
+}
+
 static write_result_t write_device_with_retry_ex(const int16_t * buf, uint64_t frames,
                                                 unsigned int channels,
                                                 unsigned int sample_rate,
@@ -1549,9 +1580,9 @@ static write_result_t write_device_with_retry_ex(const int16_t * buf, uint64_t f
     uint64_t delivered = 0;
     if (out_delivered_frames) *out_delivered_frames = 0;
 
-    if (!ensure_device(channels, sample_rate)) {
-        return WRITE_RESULT_FAILED;
-    }
+    write_result_t ensured = ensure_device_with_retry(channels, sample_rate, false,
+                                                      path, allow_during_stop_restart);
+    if (ensured != WRITE_RESULT_OK) return ensured;
 
     for (int attempt = 0; attempt <= OUTPUT_WRITE_RETRIES; attempt++) {
         pthread_mutex_lock(&audio_mutex);
@@ -1565,6 +1596,14 @@ static write_result_t write_device_with_retry_ex(const int16_t * buf, uint64_t f
         if (attempt > 0) {
             close_device();
             usleep(OUTPUT_WRITE_RETRY_SLEEP_US);
+            pthread_mutex_lock(&audio_mutex);
+            abort = should_abort_write_retry(allow_during_stop_restart,
+                                              stop_requested, restart_requested);
+            pthread_mutex_unlock(&audio_mutex);
+            if (abort) {
+                if (out_delivered_frames) *out_delivered_frames = delivered;
+                return WRITE_RESULT_ABORTED;
+            }
             if (!ensure_device(channels, sample_rate)) {
                 DBG_LOG("audio: output reopen failed on retry %d (%s)\n",
                         attempt, safe_path_tail(path));
@@ -1623,9 +1662,9 @@ static write_result_t write_device_with_retry_s32_ex(const int32_t * buf, uint64
     uint64_t delivered = 0;
     if (out_delivered_frames) *out_delivered_frames = 0;
 
-    if (!ensure_device_format(channels, sample_rate, true)) {
-        return WRITE_RESULT_FAILED;
-    }
+    write_result_t ensured = ensure_device_with_retry(channels, sample_rate, true,
+                                                      path, allow_during_stop_restart);
+    if (ensured != WRITE_RESULT_OK) return ensured;
 
     for (int attempt = 0; attempt <= OUTPUT_WRITE_RETRIES; attempt++) {
         pthread_mutex_lock(&audio_mutex);
@@ -1639,6 +1678,14 @@ static write_result_t write_device_with_retry_s32_ex(const int32_t * buf, uint64
         if (attempt > 0) {
             close_device();
             usleep(OUTPUT_WRITE_RETRY_SLEEP_US);
+            pthread_mutex_lock(&audio_mutex);
+            abort = should_abort_write_retry(allow_during_stop_restart,
+                                              stop_requested, restart_requested);
+            pthread_mutex_unlock(&audio_mutex);
+            if (abort) {
+                if (out_delivered_frames) *out_delivered_frames = delivered;
+                return WRITE_RESULT_ABORTED;
+            }
             if (!ensure_device_format(channels, sample_rate, true)) {
                 DBG_LOG("audio: output reopen (s32) failed on retry %d (%s)\n",
                         attempt, safe_path_tail(path));
@@ -1694,6 +1741,49 @@ static inline write_result_t write_device_with_retry_s32(const int32_t * buf, ui
                                                          int16_t * fallback_buf,
                                                          uint64_t * out_delivered_frames) {
     return write_device_with_retry_s32_ex(buf, frames, channels, sample_rate, path, fallback_buf, out_delivered_frames, false);
+}
+
+static inline write_result_t write_device_transition_ramp_s32(const int32_t * buf, uint64_t frames,
+                                                              unsigned int channels,
+                                                              unsigned int sample_rate,
+                                                              const char * path,
+                                                              int16_t * fallback_buf,
+                                                              uint64_t * out_delivered_frames) {
+    return write_device_with_retry_s32_ex(buf, frames, channels, sample_rate, path,
+                                          fallback_buf, out_delivered_frames, true);
+}
+
+/* Decode/process/write one transition fade without narrowing an eligible S24
+ * track.  The active output check is intentional: route changes and S24
+ * negotiation fallback can make the request differ from the actual format.
+ * The s32 writer retains its S16 fallback and exact delivered-frame count. */
+static uint64_t write_transition_fade(decoder_t * dec, uint64_t fade_frames,
+                                      int16_t * buf_s16, int32_t * buf_s32,
+                                      float replaygain_linear, float volume,
+                                      const char * path) {
+    if (can_use_wide_path(dec) && audio_output_is_s24_active()) {
+        decoder_read_result_t r = decoder_read_s32(dec, fade_frames, buf_s32);
+        if (r.frames == 0) return 0;
+        apply_gain_s32(buf_s32, (size_t) r.frames * dec->channels, replaygain_linear);
+        peq_process_s32(buf_s32, (size_t) r.frames, (int) dec->channels, dec->sample_rate);
+        apply_gain_s32(buf_s32, (size_t) r.frames * dec->channels, volume);
+        apply_ramp_s32(buf_s32, r.frames, dec->channels, 1.0f, 0.0f);
+        uint64_t delivered = 0;
+        write_device_transition_ramp_s32(buf_s32, r.frames, dec->channels,
+                                         dec->sample_rate, path, buf_s16, &delivered);
+        return delivered;
+    }
+
+    decoder_read_result_t r = decoder_read_s16(dec, fade_frames, buf_s16);
+    if (r.frames == 0) return 0;
+    apply_gain(buf_s16, (size_t) r.frames * dec->channels, replaygain_linear);
+    peq_process(buf_s16, (size_t) r.frames, (int) dec->channels, dec->sample_rate);
+    apply_gain(buf_s16, (size_t) r.frames * dec->channels, volume);
+    apply_ramp(buf_s16, r.frames, dec->channels, 1.0f, 0.0f);
+    uint64_t delivered = 0;
+    write_device_transition_ramp(buf_s16, r.frames, dec->channels,
+                                 dec->sample_rate, path, &delivered);
+    return delivered;
 }
 #endif /* !HOST_BUILD */
 
@@ -1895,25 +1985,83 @@ static void * audio_thread_func(void * arg) {
          * can negotiate S24_LE output. */
         audio_output_reset_s24_probe();
         bool initial_wide = can_use_wide_path(&cur_dec);
-        if (!ensure_device_format(cur_dec.channels, cur_dec.sample_rate, initial_wide)) {
+        write_result_t initial_output = ensure_device_with_retry(cur_dec.channels,
+                                                                 cur_dec.sample_rate,
+                                                                 initial_wide,
+                                                                 cur_path_local,
+                                                                 false);
 #else
-        if (!ensure_device(cur_dec.channels, cur_dec.sample_rate)) {
+        bool initial_output_ok = ensure_device(cur_dec.channels, cur_dec.sample_rate);
 #endif
+#ifndef HOST_BUILD
+        if (initial_output != WRITE_RESULT_OK) {
+            bool stale_or_cancelled = initial_output == WRITE_RESULT_ABORTED;
             decoder_close(&cur_dec);
             cur_open = false;
             pthread_mutex_lock(&audio_mutex);
-            have_current = false;
-            clear_current_format_locked();
-            last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
-            last_playback_error_generation = cur_generation;
+            bool stale_generation = playback_generation != cur_generation;
+            bool cancelled = stop_requested || restart_requested;
+            bool same_generation_cancel = !stale_generation && cancelled;
+            if (same_generation_cancel) {
+                have_current = false;
+                clear_current_format_locked();
+                paused = false;
+                stop_requested = false;
+            } else if (!stale_or_cancelled && !stale_generation && !cancelled) {
+                have_current = false;
+                clear_current_format_locked();
+                last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                last_playback_error_generation = cur_generation;
+            }
             pthread_mutex_unlock(&audio_mutex);
+            if (same_generation_cancel) close_device();
             continue;
         }
+#else
+        if (!initial_output_ok) {
+            decoder_close(&cur_dec);
+            cur_open = false;
+            pthread_mutex_lock(&audio_mutex);
+            bool same_generation = playback_generation == cur_generation;
+            bool cancelled = stop_requested || restart_requested;
+            bool same_generation_cancel = same_generation && cancelled;
+            if (same_generation_cancel) {
+                have_current = false;
+                clear_current_format_locked();
+                paused = false;
+                stop_requested = false;
+            } else if (same_generation && !cancelled) {
+                have_current = false;
+                clear_current_format_locked();
+                last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                last_playback_error_generation = cur_generation;
+            }
+            pthread_mutex_unlock(&audio_mutex);
+            if (same_generation_cancel) close_device();
+            continue;
+        }
+#endif
 #ifndef HOST_BUILD
         if (initial_mp3_seek_deferred) close_device();
 #endif
 
         pthread_mutex_lock(&audio_mutex);
+        bool initial_request_stale = playback_generation != cur_generation ||
+                                     stop_requested || restart_requested;
+        if (initial_request_stale) {
+            bool same_generation_cancel = playback_generation == cur_generation;
+            if (same_generation_cancel) {
+                have_current = false;
+                clear_current_format_locked();
+                paused = false;
+                stop_requested = false;
+            }
+            pthread_mutex_unlock(&audio_mutex);
+            if (same_generation_cancel) close_device();
+            decoder_close(&cur_dec);
+            cur_open = false;
+            continue;
+        }
         have_current = true;
         frames_played = cur_frames_played_local;
         current_total_frames = cur_dec.total_frames;
@@ -1941,17 +2089,9 @@ static void * audio_thread_func(void * arg) {
                 pthread_mutex_unlock(&audio_mutex);
                 if (!mp3_seek_output_held && cur_open && cur_dec.sample_rate > 0) {
                     uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
-                    decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
-                    if (r_fade.frames > 0) {
-                        apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, cur_replaygain_linear);
-                        peq_process(buf_cur, (size_t) r_fade.frames, (int) cur_dec.channels, cur_dec.sample_rate);
-                        apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, vol);
-                        apply_ramp(buf_cur, r_fade.frames, cur_dec.channels, 1.0f, 0.0f);
-                        uint64_t delivered = 0;
-                        write_device_transition_ramp(buf_cur, r_fade.frames, cur_dec.channels,
-                                                     cur_dec.sample_rate, cur_path_local, &delivered);
-                        cur_frames_played_local += delivered;
-                    }
+                    cur_frames_played_local += write_transition_fade(&cur_dec, rf, buf_cur,
+                                                                      buf_cur_s32, cur_replaygain_linear,
+                                                                      vol, cur_path_local);
                 }
                 close_device();
                 need_fade_in = true;
@@ -2120,20 +2260,19 @@ static void * audio_thread_func(void * arg) {
                 /* Phase 4: Controlled transition ramp-down on manual stop/restart */
                 if (!mp3_seek_output_held && cur_open && cur_dec.sample_rate > 0) {
                     uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+#ifndef HOST_BUILD
+                    (void) write_transition_fade(&cur_dec, rf, buf_cur, buf_cur_s32,
+                                                  cur_replaygain_linear, vol, cur_path_local);
+#else
                     decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
                     if (r_fade.frames > 0) {
                         apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, cur_replaygain_linear);
                         peq_process(buf_cur, (size_t) r_fade.frames, (int) cur_dec.channels, cur_dec.sample_rate);
                         apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, vol);
                         apply_ramp(buf_cur, r_fade.frames, cur_dec.channels, 1.0f, 0.0f);
-#ifndef HOST_BUILD
-                        uint64_t delivered = 0;
-                        write_device_transition_ramp(buf_cur, r_fade.frames, cur_dec.channels,
-                                                     cur_dec.sample_rate, cur_path_local, &delivered);
-#else
                         write_device(buf_cur, r_fade.frames, cur_dec.channels);
-#endif
                     }
+#endif
                 }
                 if (do_restart) should_restart = true;
                 if (do_stop) was_stopped = true;
@@ -2192,20 +2331,19 @@ static void * audio_thread_func(void * arg) {
                  * reach this point only after their bounded table is ready. */
                 if (!mp3_seek_output_held && cur_open && cur_dec.sample_rate > 0) {
                     uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+#ifndef HOST_BUILD
+                    (void) write_transition_fade(&cur_dec, rf, buf_cur, buf_cur_s32,
+                                                  cur_replaygain_linear, vol, cur_path_local);
+#else
                     decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
                     if (r_fade.frames > 0) {
                         apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, cur_replaygain_linear);
                         peq_process(buf_cur, (size_t) r_fade.frames, (int) cur_dec.channels, cur_dec.sample_rate);
                         apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, vol);
                         apply_ramp(buf_cur, r_fade.frames, cur_dec.channels, 1.0f, 0.0f);
-#ifndef HOST_BUILD
-                        uint64_t delivered = 0;
-                        write_device_transition_ramp(buf_cur, r_fade.frames, cur_dec.channels,
-                                                     cur_dec.sample_rate, cur_path_local, &delivered);
-#else
                         write_device(buf_cur, r_fade.frames, cur_dec.channels);
-#endif
                     }
+#endif
                 }
 
                 close_decoder_if_open(&nxt_dec, &nxt_open);

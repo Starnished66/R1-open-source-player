@@ -14,3 +14,57 @@ Unreleased changes following the September 14, 2026 release notes.
 
 This detects a computer Storage session, not individual file transfers: a
 computer connection can still trigger a scan even if no files were changed.
+
+## Behind the scenes
+
+- Corrected the upgraded Bluetooth service's pairing-storage location so
+  saved headphones and trust settings survive a restart. Previously, manual
+  connection worked for the current boot but pairing could not be saved to
+  the read-only firmware filesystem.
+- Turning Bluetooth on now makes a bounded background attempt to reconnect
+  the last used headphones. Manual device selection and turning Bluetooth
+  off cancel the attempt; Bluetooth DAC mode is unchanged.
+- Bluetooth sample-rate changes no longer count as an immediate headphone
+  disconnect. Brief audio-output removal/re-creation is given time to settle
+  before pausing playback or clearing the route; persistent removals still
+  trigger the disconnect protection.
+- Improved playback restart recovery: temporary output-open failures now get
+  bounded retries, and eligible 24-bit tracks keep their output format during
+  pause, seek and track-change fades. Bluetooth routing clears on disconnect
+  or power-off and requires a usable audio connection. These changes still
+  need testing on the player.
+- Routine volume and playback settings now save in the background, while
+  shutdown checkpoints still finish writing before exit. Closing a song
+  list no longer waits for a pending page fetch, and Bluetooth monitor
+  cleanup runs outside the UI thread.
+- Web Import startup and Open Link/DLNA service changes now run in the
+  background. Stopping Open Link or DLNA also interrupts idle client
+  connections instead of waiting indefinitely for them to send data.
+- Wi-Fi signal updates now run in the background instead of waiting on
+  command-line tools on the UI thread. Read-only Wi-Fi queries use bounded
+  timeouts, including a single elapsed-time budget for subprocess output
+  and exit handling.
+- Temporarily reverted the recent multi-disc album sorting and "Disc N"
+  dividers for the next slowdown comparison. Single-album lists again use
+  paged database order; existing Artist "All Songs" sorting is preserved.
+- Temporarily reverted asynchronous song-list duration/codec probing for
+  slowdown testing. Durations are again read when building the list, so
+  opening a large list may take longer. WMA fixes are unchanged.
+- Restored the optional SBC-XQ Bluetooth setting for another device test
+  alongside the UI responsiveness fixes. It uses SBC with higher encoder
+  quality for outgoing audio; Bluetooth DAC reception is unchanged.
+- Prepared a refresh of the firmware's Bluetooth audio and supporting
+  libraries, led by BlueALSA 5.0.0. The player understands both the old and
+  new Bluetooth tools, including their different volume-control formats.
+- Updated ALSA, SBC, AAC, GLib, D-Bus, zlib and XML parsing libraries in the
+  candidate base image. The device's kernel, hardware drivers and working
+  LDAC libraries remain unchanged.
+- Updated the external ALSA playback/recording and mixer tools to 1.2.16.
+  These include `aplay`, which the player uses for Bluetooth and USB DAC
+  output. Raw-PCM pipe tests pass on the R1 without changing mixer settings.
+- Added compatibility with newer BlueZ paired-device commands and corrected
+  retry handling when a Bluetooth software-volume command fails. Separate
+  BlueZ and Wi-Fi upgrade candidates are being validated before inclusion.
+
+The base-image refresh has build and emulation checks; device playback and
+reconnect testing is still required before release.

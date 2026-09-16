@@ -31,6 +31,8 @@ bool subprocess_run_timeout(char * const argv[], char * out_buf, size_t out_buf_
  * NULL if the caller doesn't care, same as subprocess_run_timeout()).
  * *out_exit_code is set to -1 up front and left there if the process never
  * got to exit normally (spawn failure, timeout-kill). */
+/* timeout_ms is one elapsed-time budget shared by output reading and exit
+ * waiting, not a new budget for each chunk of stdout. */
 bool subprocess_run_checked(char * const argv[], char * out_buf, size_t out_buf_size, int timeout_ms,
                              int * out_exit_code);
 

@@ -1406,7 +1406,7 @@ void gui_player_set_play_mode(int mode_value) {
     play_mode_t mode = (play_mode_t) mode_value;
     if (mode < PLAY_MODE_SEQUENTIAL || mode > PLAY_MODE_SHUFFLE) return;
     current_settings.play_mode = (int) mode;
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 
     lv_image_set_src(order_icon, asset_path(play_mode_icon_asset(mode)));
     gui_shell_update_quick_drawer_play_mode((int) mode);
@@ -3389,7 +3389,7 @@ void gui_player_queue_add_many(const char * const * paths, int count) {
         current_settings.last_position = 0;
         current_settings.last_source_kind = 0;
         current_settings.last_source_name[0] = '\0';
-        settings_save(&current_settings);
+        settings_save_async(&current_settings);
         show_info_toast("Queue ready. Press Play to start.");
         return;
     }
@@ -3596,7 +3596,7 @@ static void play_track_at_from_internal(int index, double start_seconds, bool pu
         snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", path);
         current_settings.last_position = start_seconds;
     }
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 }
 
 void play_track_at_from(int index, double start_seconds) {
@@ -3637,7 +3637,7 @@ void on_track_auto_advanced(int index) {
         snprintf(current_settings.last_track, sizeof(current_settings.last_track), "%s", playlist_path_at(index));
         current_settings.last_position = 0.0;
     }
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 }
 
 void play_track_at(int index) {
@@ -3809,7 +3809,9 @@ void toggle_play_pause(void) {
          * startup restore actually reads for SD/internal tracks, separate
          * from settings.txt's own last_position field), so a pause
          * immediately followed by any kind of reboot does not resume from
-         * a stale pre-pause position. */
+         * a stale pre-pause position. Keep this settings save synchronous:
+         * the urgent checkpoint is part of the same reboot-sensitive pause
+         * persistence boundary. */
         current_settings.last_position = audio_get_resume_position_seconds();
         settings_save(&current_settings);
         gui_player_queue_checkpoint_urgent();
@@ -3866,27 +3868,27 @@ void crossfade_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.crossfade_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     audio_set_crossfade_enabled(current_settings.crossfade_enabled);
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
     refresh_quick_drawer_crossfade_icon(); /* see its own comment -- keeps the drawer icon in sync */
 }
 
 void car_mode_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.car_mode_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 }
 
 void inline_remote_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.inline_remote_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     headphone_status_refresh_earpods_adc();
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 }
 
 void lyrics_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.lyrics_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 }
 
 void swipe_up_home_switch_event_cb(lv_event_t * e) {
@@ -3896,13 +3898,13 @@ void swipe_up_home_switch_event_cb(lv_event_t * e) {
     gui_shell_set_home_indicator_visible(current_settings.swipe_up_home_enabled &&
                                          active != gui_shell_get_home_screen() &&
                                          active != gui_lyrics_get_screen());
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 }
 
 void hide_player_topbar_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.hide_player_topbar = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
     sync_player_topbar_visibility(lv_screen_active());
     player_transition_mark_dirty(); /* topbar/back-button target-state visibility just changed -- see the cache's own doc comment */
 }
@@ -3911,21 +3913,21 @@ void led_indicator_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.led_indicator_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     led_control_apply(current_settings.led_indicator_enabled);
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 }
 
 void charge_limiter_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.charge_limiter_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     charge_limiter_poll(current_settings.charge_limiter_enabled, true);
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 }
 
 void safe_charging_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.safe_charging_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     safe_charging_poll(current_settings.safe_charging_enabled, true);
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
 }
 
 /* refresh_battery_topbar() (defined earlier in this file, topbar setup near
@@ -3936,7 +3938,7 @@ void safe_charging_switch_event_cb(lv_event_t * e) {
 void battery_percent_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     current_settings.show_battery_percent = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
     refresh_battery_topbar();
 }
 
@@ -3948,7 +3950,7 @@ void clock_24h_switch_event_cb(lv_event_t * e) {
     current_settings.clock_24h = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     app_clock_get_persistence(&current_settings.clock_manual_epoch,
                               &current_settings.clock_system_reference);
-    settings_save(&current_settings);
+    settings_save_async(&current_settings);
     refresh_clock_label();
 }
 
@@ -3997,7 +3999,7 @@ void gui_player_teardown(void) {
         int pending = volume_hw_pending;
         volume_hw_apply_final();
         current_settings.volume = (float) pending / 100.0f;
-        settings_save(&current_settings);
+        settings_save(&current_settings); /* Final teardown checkpoint must reach storage. */
     }
     volume_drag_active = false;
     if (volume_hw_apply_timer) { lv_timer_delete(volume_hw_apply_timer); volume_hw_apply_timer = NULL; }

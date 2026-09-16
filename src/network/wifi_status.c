@@ -1,28 +1,21 @@
 #include "wifi_status.h"
+#include "subprocess.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define WIFI_INTERFACE "wlan0"
+#define WIFI_QUERY_TIMEOUT_MS 1500
 
-/* Runs `wpa_cli -i wlan0 <args>` and reads its stdout into out_buf.
- * `args` is always one of this file's own literal strings below, never
- * caller/user-controlled input, so building the command line with
- * snprintf is safe here. Returns false if wpa_cli can't be run at all
- * (not installed, no permission, etc.) or produced no output -- both
- * normal and expected on the host simulator. */
+/* Runs `wpa_cli -i wlan0 <args>` directly and reads its stdout into out_buf.
+ * `args` is always one of this file's own literal strings below. Returns
+ * false if wpa_cli cannot be run, times out, exits unsuccessfully, or produces
+ * no output -- all normal and expected on the host simulator. */
 static bool run_wpa_cli(const char * args, char * out_buf, size_t out_buf_size) {
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "wpa_cli -i %s %s 2>/dev/null", WIFI_INTERFACE, args);
-
-    FILE * p = popen(cmd, "r");
-    if (!p) return false;
-
-    size_t n = fread(out_buf, 1, out_buf_size - 1, p);
-    out_buf[n] = '\0';
-    pclose(p);
-    return n > 0;
+    char * argv[] = { (char *) "wpa_cli", (char *) "-i", (char *) WIFI_INTERFACE, (char *) args, NULL };
+    int exit_code = -1;
+    return subprocess_run_checked(argv, out_buf, out_buf_size, WIFI_QUERY_TIMEOUT_MS, &exit_code) && exit_code == 0 &&
+           out_buf[0] != '\0';
 }
 
 /* Conventional RSSI (dBm) buckets -- not extracted from the stock binary

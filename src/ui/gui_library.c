@@ -34,7 +34,6 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "device_config.h"
 #include "settings.h"
 #include "audio.h"
-#include "track_probe.h"
 #include "subprocess.h"
 #include "db_log.h"
 #include <stdio.h>
@@ -311,8 +310,6 @@ bool copy_group_song_entries(group_song_entry_t ** out, const group_song_entry_t
     for (int i = 0; i < count; i++) {
         copy[i].path = strdup(entries[i].path ? entries[i].path : "");
         copy[i].title = strdup(entries[i].title ? entries[i].title : "");
-        copy[i].disc_number = entries[i].disc_number;
-        copy[i].show_disc_header = entries[i].show_disc_header;
         if (!copy[i].path || !copy[i].title) {
             free_group_song_entries(copy, count);
             return false;
@@ -364,47 +361,15 @@ static const char * library_codec_name(audio_codec_t codec) {
 static void format_music_submenu_identity(const song_row_t * song, char * out, size_t out_size) {
     char title[128];
     metadata_db_song_display_title(song, title, sizeof(title));
-    /* Building a list must not open every track's decoder. The displayed
-     * page is enriched by gui_library_poll_track_probes() after it opens. */
+    audio_current_format_info_t info;
+    if (audio_probe_file_format(song->path, &info) && info.duration_seconds > 0.0) {
+        unsigned int seconds = (unsigned int)(info.duration_seconds + 0.5);
+        snprintf(out, out_size, "%s\n%u:%02u · %s", title, seconds / 60, seconds % 60,
+                 library_codec_name(info.codec));
+        return;
+    }
     const char * ext = strrchr(song->path, '.');
     snprintf(out, out_size, "%s\n%s", title, ext && ext[1] ? ext + 1 : "Audio");
-}
-
-static int effective_disc_number(const song_row_t * song) {
-    return song && song->tags.disc_number > 0 ? song->tags.disc_number : 1;
-}
-
-static bool album_songs_are_multi_disc(const song_row_t * songs, int count) {
-    if (!songs || count <= 1) return false;
-    int first = effective_disc_number(&songs[0]);
-    for (int i = 1; i < count; i++) {
-        if (effective_disc_number(&songs[i]) != first) return true;
-    }
-    return false;
-}
-
-static int cmp_song_disc_track(const void * a, const void * b) {
-    const song_row_t * sa = (const song_row_t *) a;
-    const song_row_t * sb = (const song_row_t *) b;
-    int da = effective_disc_number(sa), db = effective_disc_number(sb);
-    if (da != db) return da < db ? -1 : 1;
-    int ta = sa->tags.track_number, tb = sb->tags.track_number;
-    if (ta > 0 || tb > 0) {
-        if (ta <= 0) return 1;
-        if (tb <= 0) return -1;
-        if (ta != tb) return ta < tb ? -1 : 1;
-    }
-    return strcasecmp(sa->path, sb->path);
-}
-
-static void set_album_disc_headers(const song_row_t * songs, int count,
-                                   bool multi_disc, group_song_entry_t * entries) {
-    int previous_disc = effective_disc_number(&songs[0]);
-    for (int i = 0; i < count; i++) {
-        entries[i].disc_number = effective_disc_number(&songs[i]);
-        entries[i].show_disc_header = multi_disc && i > 0 && entries[i].disc_number != previous_disc;
-        previous_disc = entries[i].disc_number;
-    }
 }
 
 void gui_library_format_song_identity(const song_row_t * row,
@@ -593,24 +558,6 @@ static void set_group_songs_entries_owned(group_song_entry_t * entries, int coun
  * only one bounded page of rows at a time. */
 #define GROUP_SONGS_PAGE_SIZE 200
 static int group_songs_page_start;
-
-/* One bounded job at a time. The worker owns path copies and never sees
- * LVGL objects or group_songs_entries. Page generations invalidate late
- * results without waiting for the current decoder to finish. */
-static track_probe_job_t * group_probe_job;
-static uint64_t group_probe_generation = 1;
-static uint64_t group_probe_job_generation;
-static uint64_t group_probe_requested_generation;
-static int group_probe_page_start;
-static bool group_probe_storage_available = true;
-static bool group_probe_retry_pending;
-static uint32_t group_probe_retry_tick;
-
-static void cancel_group_song_probes(void) {
-    ++group_probe_generation;
-    group_probe_retry_pending = false;
-    if (group_probe_job) track_probe_job_cancel(group_probe_job);
-}
 
 /* Now-playing indicator bar -- recreated fresh every populate_group_songs_
  * rows() call (that function's own lv_obj_clean(group_songs_list) destroys
@@ -806,81 +753,6 @@ static void layout_music_submenu_row_text(lv_obj_t * row) {
     lv_obj_set_y(secondary, BOARD_SCALE_PX(62));
 }
 
-void gui_library_poll_track_probes(void) {
-    bool visible = group_songs_screen && lv_screen_active() == group_songs_screen &&
-                   group_songs_music_submenu && group_probe_storage_available && backlight_screen_is_on();
-    if (!visible && group_probe_job && group_probe_job_generation == group_probe_generation)
-        cancel_group_song_probes();
-
-    if (group_probe_job) {
-        bool current = visible && group_probe_job_generation == group_probe_generation;
-        /* Take the completion snapshot before draining results, so a final
-         * result published just after next() returns false is not lost. */
-        bool done = track_probe_job_done(group_probe_job);
-        bool drained = false;
-        if (current) {
-            /* Limit label work per tick; never rebuild the list or reset
-             * its scroll position when a probe completes. */
-            for (int budget = 0; budget < 4; ++budget) {
-                size_t index;
-                audio_current_format_info_t info;
-                if (!track_probe_job_next(group_probe_job, &index, &info)) {
-                    drained = true;
-                    break;
-                }
-                int pos = group_probe_page_start + (int)index;
-                if (!info.valid || !(info.duration_seconds > 0.0 &&
-                    info.duration_seconds <= UINT_MAX - 1.0) ||
-                    index >= GROUP_SONGS_PAGE_SIZE || pos >= group_songs_count) continue;
-                char detail[64];
-                unsigned int seconds = (unsigned int)(info.duration_seconds + 0.5);
-                snprintf(detail, sizeof(detail), "%u:%02u · %s", seconds / 60, seconds % 60,
-                         library_codec_name(info.codec));
-                const char * old = group_songs_entries[pos].title;
-                const char * newline = strchr(old, '\n');
-                size_t title_len = newline ? (size_t)(newline - old) : strlen(old);
-                char * title = malloc(title_len + strlen(detail) + 2);
-                if (!title) continue;
-                memcpy(title, old, title_len);
-                title[title_len] = '\n';
-                strcpy(title + title_len + 1, detail);
-                free(group_songs_entries[pos].title);
-                group_songs_entries[pos].title = title;
-                lv_obj_t * row = group_songs_visible_rows[index];
-                if (row) {
-                    lv_obj_t * secondary = lv_obj_get_child(row, 1);
-                    lv_label_set_text(secondary, detail);
-                    lv_obj_remove_flag(secondary, LV_OBJ_FLAG_HIDDEN);
-                    layout_music_submenu_row_text(row);
-                }
-            }
-        }
-        if (done && (!current || drained)) {
-            track_probe_job_destroy(group_probe_job);
-            group_probe_job = NULL;
-        }
-    }
-
-    if (!visible || group_probe_job || group_probe_requested_generation == group_probe_generation)
-        return;
-    if (group_probe_retry_pending && lv_tick_elaps(group_probe_retry_tick) < 1000) return;
-    int count = group_songs_count - group_songs_page_start;
-    if (count > GROUP_SONGS_PAGE_SIZE) count = GROUP_SONGS_PAGE_SIZE;
-    if (count <= 0) return;
-    const char * paths[GROUP_SONGS_PAGE_SIZE];
-    for (int i = 0; i < count; ++i) paths[i] = group_songs_entries[group_songs_page_start + i].path;
-    group_probe_job = track_probe_job_start(paths, (size_t)count);
-    if (!group_probe_job) {
-        group_probe_retry_pending = true;
-        group_probe_retry_tick = lv_tick_get();
-        return;
-    }
-    group_probe_retry_pending = false;
-    group_probe_requested_generation = group_probe_generation;
-    group_probe_job_generation = group_probe_generation;
-    group_probe_page_start = group_songs_page_start;
-}
-
 /* Positions/shows or hides group_songs_now_playing_bar against the CURRENT
  * group_songs_entries/count -- callable standalone (no row rebuild, no
  * scroll reset) whenever now_playing_path changes while this screen
@@ -929,7 +801,6 @@ static void refresh_group_songs_now_playing_indicator(void) {
  * remove callback and the Edit/Done toggle can both redraw in place without
  * re-deriving the group or nav_push()ing a second copy of this screen. */
 static void populate_group_songs_rows(void) {
-    cancel_group_song_probes();
     lv_obj_clean(group_songs_list);
     memset(group_songs_visible_rows, 0, sizeof(group_songs_visible_rows));
 
@@ -965,11 +836,6 @@ static void populate_group_songs_rows(void) {
     }
 
     for (int i = group_songs_page_start; i < page_end; i++) {
-        if (group_songs_entries[i].show_disc_header) {
-            char header[32];
-            snprintf(header, sizeof(header), "Disc %d", group_songs_entries[i].disc_number);
-            add_section_header(group_songs_list, header);
-        }
         if (editing) {
             lv_obj_t * row = build_music_list_row(group_songs_list, group_songs_entries[i].title, NULL, BOARD_SCALE_PX(190));
             if (group_songs_music_submenu) lv_obj_set_width(row, lv_pct(100));
@@ -2512,38 +2378,32 @@ static group_song_entry_t * load_album_entries(const char * name, const char * a
                                                 int song_count, int * out_count) {
     *out_count = 0;
     if (song_count <= 0) return NULL;
-    song_row_t * songs = calloc((size_t) song_count, sizeof(*songs));
     group_song_entry_t * entries = calloc((size_t) song_count, sizeof(*entries));
-    if (!songs || !entries) { free(songs); free(entries); return NULL; }
+    if (!entries) return NULL;
+    song_row_t page[64];
     int n = 0;
     while (n < song_count) {
         int want = song_count - n;
         if (want > 64) want = 64;
-        int got = metadata_db_get_album_songs(name, album_artist, n, songs + n, want);
+        int got = metadata_db_get_album_songs(name, album_artist, n, page, want);
         if (got <= 0) break;
+        for (int i = 0; i < got; i++) {
+            char title[384];
+            format_music_submenu_identity(&page[i], title, sizeof(title));
+            entries[n + i].path = strdup(page[i].path);
+            entries[n + i].title = strdup(title);
+            if (!entries[n + i].path || !entries[n + i].title) {
+                free_group_song_entries(entries, song_count);
+                return NULL;
+            }
+        }
         n += got;
         if (got < want) break;
     }
     if (n <= 0) {
-        free(songs);
         free_group_song_entries(entries, song_count);
         return NULL;
     }
-    qsort(songs, (size_t)n, sizeof(*songs), cmp_song_disc_track);
-    bool multi_disc = album_songs_are_multi_disc(songs, n);
-    for (int i = 0; i < n; i++) {
-        char title[384];
-        format_music_submenu_identity(&songs[i], title, sizeof(title));
-        entries[i].path = strdup(songs[i].path);
-        entries[i].title = strdup(title);
-        if (!entries[i].path || !entries[i].title) {
-            free(songs);
-            free_group_song_entries(entries, song_count);
-            return NULL;
-        }
-    }
-    set_album_disc_headers(songs, n, multi_disc, entries);
-    free(songs);
     *out_count = n;
     return entries;
 }
@@ -4246,10 +4106,7 @@ void poll_sd_card_hotplug(void) {
         mounted = false;
     }
 
-    group_probe_storage_available = mounted;
     if (!mounted) {
-        if (group_probe_job && group_probe_job_generation == group_probe_generation)
-            cancel_group_song_probes();
         gui_player_notify_sd_unmounted_immediate();
         mount_sd_card_if_needed();
         if (was_mounted) {
@@ -4790,7 +4647,6 @@ typedef struct {
     char album_artist[128];
     int32_t disc_number;
     int32_t track_number;
-    bool show_disc_header;
 } artist_song_sort_entry_t;
 
 /* Sorts songs by album, then album artist, then disc number, track number,
@@ -4888,28 +4744,6 @@ static bool artist_albums_show_all_songs(void) {
     /* Sort songs in disc and track order within each album across the artist's catalog. */
     qsort(sort_entries, (size_t) n, sizeof(*sort_entries), cmp_artist_song_sort_entry);
 
-    /* Mark disc boundaries independently for each contiguous album identity.
-     * Untagged tracks belong to disc 1, matching the single-album path. */
-    for (int start = 0; start < n; ) {
-        int end = start + 1;
-        while (end < n && strcasecmp(sort_entries[end].album, sort_entries[start].album) == 0 &&
-               strcasecmp(sort_entries[end].album_artist, sort_entries[start].album_artist) == 0)
-            end++;
-        bool multi_disc = false;
-        int first_disc = sort_entries[start].disc_number > 0 ? sort_entries[start].disc_number : 1;
-        for (int i = start + 1; i < end; i++) {
-            int disc = sort_entries[i].disc_number > 0 ? sort_entries[i].disc_number : 1;
-            if (disc != first_disc) { multi_disc = true; break; }
-        }
-        int previous_disc = first_disc;
-        for (int i = start; i < end; i++) {
-            int disc = sort_entries[i].disc_number > 0 ? sort_entries[i].disc_number : 1;
-            sort_entries[i].show_disc_header = multi_disc && i > start && disc != previous_disc;
-            previous_disc = disc;
-        }
-        start = end;
-    }
-
     /* Transfer ownership of path and title strings into a group_song_entry_t
      * array for show_group_songs_take_ownership() to avoid duplicate allocations. */
     group_song_entry_t * entries = malloc(sizeof(*entries) * (size_t) n);
@@ -4924,8 +4758,6 @@ static bool artist_albums_show_all_songs(void) {
     for (int i = 0; i < n; i++) {
         entries[i].path = sort_entries[i].path;
         entries[i].title = sort_entries[i].title;
-        entries[i].disc_number = sort_entries[i].disc_number > 0 ? sort_entries[i].disc_number : 1;
-        entries[i].show_disc_header = sort_entries[i].show_disc_header;
     }
     free(sort_entries);
 
@@ -4949,9 +4781,30 @@ static void artist_album_row_click_cb(int index) {
     int group_index = index - 1;
     if (group_index < 0 || group_index >= artist_albums_group_count) return;
     group_row_t * group = &artist_albums_groups[group_index];
+    group_song_entry_t * entries = calloc((size_t) group->song_count, sizeof(*entries));
     int n = 0;
-    group_song_entry_t * entries = load_album_entries(group->name, group->album_artist,
-                                                       group->song_count, &n);
+    song_row_t page[64];
+    while (entries && n < group->song_count) {
+        int want = group->song_count - n;
+        if (want > 64) want = 64;
+        int got = metadata_db_get_album_songs(group->name, group->album_artist, n, page, want);
+        if (got <= 0) break;
+        for (int i = 0; i < got; i++) {
+            char title[192];
+            format_music_submenu_identity(&page[i], title, sizeof(title));
+            entries[n + i].path = strdup(page[i].path);
+            entries[n + i].title = strdup(title);
+            if (!entries[n + i].path || !entries[n + i].title) {
+                free_group_song_entries(entries, group->song_count);
+                entries = NULL;
+                n = 0;
+                break;
+            }
+        }
+        if (!entries) break;
+        n += got;
+        if (got < want) break;
+    }
     if (!entries) return;
     show_music_group_songs(group->name, entries, n);
     free_group_song_entries(entries, n);
@@ -5355,7 +5208,6 @@ static void library_teardown_diag(const char * step) {
 }
 
 void gui_library_teardown(void) {
-    cancel_group_song_probes();
     reset_az_index_bindings();
     if (playlist_start_popup) { lv_obj_delete(playlist_start_popup); playlist_start_popup = NULL; }
     if (playlist_start_backdrop) { lv_obj_delete(playlist_start_backdrop); playlist_start_backdrop = NULL; }
@@ -5826,8 +5678,7 @@ void gui_library_start_boot_thumbnail_warmup(void) {
 
 bool gui_library_has_background_work(void) {
     return library_rescan_active || library_rescan_success_pending || album_thumbnail_active ||
-           atomic_load(&album_thumb_gen_active) || sd_format_active || search_job_active ||
-           (group_probe_job && !track_probe_job_done(group_probe_job));
+           atomic_load(&album_thumb_gen_active) || sd_format_active || search_job_active;
 }
 
 bool gui_library_navigation_blocked(void) {
@@ -5838,7 +5689,6 @@ bool gui_library_navigation_blocked(void) {
 }
 
 void gui_library_prepare_for_ui_reload(void) {
-    cancel_group_song_probes();
     quiesce_album_artwork_workers();
 
     if (search_debounce_timer) lv_timer_pause(search_debounce_timer);
@@ -5853,11 +5703,6 @@ void gui_library_prepare_for_ui_reload(void) {
 }
 
 void gui_library_cancel_background_work(void) {
-    cancel_group_song_probes();
-    if (group_probe_job) {
-        track_probe_job_cancel_and_destroy(group_probe_job);
-        group_probe_job = NULL;
-    }
     quiesce_album_artwork_workers();
     if (library_rescan_active) {
         pthread_join(library_rescan_thread, NULL);

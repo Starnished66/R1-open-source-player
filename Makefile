@@ -545,10 +545,10 @@ APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c src/plugins/p
 APP_SRCS += src/ui/gui_plugin_manage.c src/ui/gui_lock_screen.c
 APP_SRCS += src/library/remote_track.c
 APP_SRCS += src/library/queue_resume.c
-APP_SRCS += src/audio/track_probe.c
 APP_SRCS += src/library/albumart.c src/library/tagcache.c src/library/path_cache.c src/library/remote_state.c src/library/subsonic_saved_servers.c src/library/artwork_coordinator.c
 APP_SRCS += src/core/utf8_util.c src/core/app_clock.c src/core/db_log.c
 APP_SRCS += src/ui/gesture_detector.c
+APP_SRCS += src/network/bluetooth_reconnect.c
 APP_CXX_SRCS = src/audio/alac_decoder.cpp
 LVGL_SRCS = $(sort $(shell find $(LVGL_DIR)/src -type f -name '*.c'))
 TINYALSA_SRCS = $(sort $(shell find $(TINYALSA_DIR)/src -type f -name '*.c'))
@@ -866,18 +866,38 @@ sd_ready_test:
 	    -o $(BUILD_TARGET_DIR)/sd_ready_test
 	./$(BUILD_TARGET_DIR)/sd_ready_test
 
-# Host worker tests with a controlled probe stub; no decoder or UI linkage.
-.PHONY: track-probe-selftest
-track-probe-selftest:
+.PHONY: wifi-status-selftest subprocess-timeout-selftest
+wifi-status-selftest:
 	@mkdir -p $(BUILD_TARGET_DIR)
-	$(CC) -O0 -g -Wall -Wextra -Isrc/audio src/audio/track_probe.c src/audio/track_probe_test.c \
-	    -Wl,--wrap=calloc,--wrap=malloc,--wrap=pthread_create,--wrap=pthread_join \
-	    -pthread -o $(BUILD_TARGET_DIR)/track_probe_test
-	./$(BUILD_TARGET_DIR)/track_probe_test
+	$(CC) -O0 -g -Wall -Wextra -Isrc/network -Isrc/core src/network/wifi_status.c src/network/wifi_status_test.c -o $(BUILD_TARGET_DIR)/wifi_status_test
+	./$(BUILD_TARGET_DIR)/wifi_status_test
+
+subprocess-timeout-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Isrc/core src/core/subprocess.c src/core/subprocess_timeout_test.c -o $(BUILD_TARGET_DIR)/subprocess_timeout_test
+	./$(BUILD_TARGET_DIR)/subprocess_timeout_test
 
 # Isolated host codec tests; include real Bluetooth code and discard unused
 # hardware paths. The wrapper redirects /usr/data/alsa.conf to a temp fixture.
-.PHONY: bluetooth-codec-selftest
+.PHONY: bluetooth-codec-selftest bluetooth-monitor-selftest bluetooth-reconnect-selftest
+bluetooth-reconnect-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -ffunction-sections -fdata-sections -Isrc/network -Isrc/core -Isrc/audio \
+	    src/network/bluetooth_reconnect_test.c -Wl,--gc-sections -lpthread \
+	    -o $(BUILD_TARGET_DIR)/bluetooth_reconnect_test
+	./$(BUILD_TARGET_DIR)/bluetooth_reconnect_test
+	$(CC) -O0 -g -Wall -Wextra -ffunction-sections -fdata-sections -Isrc/network -Isrc/core -Isrc/audio \
+	    src/network/bluetooth_reconnect_backend_test.c -Wl,--gc-sections -lpthread \
+	    -o $(BUILD_TARGET_DIR)/bluetooth_reconnect_backend_test
+	./$(BUILD_TARGET_DIR)/bluetooth_reconnect_backend_test
+
+bluetooth-monitor-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -ffunction-sections -fdata-sections -Isrc/network -Isrc/core -Isrc/audio \
+	    src/network/bluetooth_monitor_test.c -Wl,--gc-sections -lpthread \
+	    -o $(BUILD_TARGET_DIR)/bluetooth_monitor_test
+	./$(BUILD_TARGET_DIR)/bluetooth_monitor_test
+
 bluetooth-codec-selftest:
 	@mkdir -p $(BUILD_TARGET_DIR)
 	$(CC) -O0 -g -Wall -Wextra -ffunction-sections -fdata-sections -Isrc/network -Isrc/core -Isrc/audio \
@@ -1053,6 +1073,20 @@ clean:
 	    open_hiby_player_host open_hiby_player_host_* \
 	    open_hiby_player_target open_hiby_player_target_* \
 	    compile_commands.json compile_flags.txt
+
+# Focused target-path audio retry regression test. It includes the real
+# audio.c, mocks audio_output_* and usleep, and relies on section GC to discard
+# unrelated decoder/playback code. Keep this host-only target out of all.
+.PHONY: audio-restart-selftest
+audio-restart-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -ffunction-sections -fdata-sections -DTEST_BUILD_TAG \
+	    -I. -Isrc/audio -Isrc/library -Isrc/core -Isrc/network -Isrc/hardware -Isrc/plugins \
+	    -Ilvgl -Idr_libs -Ifaad2/include -Ialac/codec -Imbedtls/include -IcJSON -Iopus/include \
+	    -Ilua/src -Istb_vorbis -Ijpeg_vendor_config -Ijpeg -Itinfl \
+	    src/audio/audio_restart_test.c -Wl,--gc-sections -Wl,--wrap=usleep -lpthread -lm \
+	    -o $(BUILD_TARGET_DIR)/audio_restart_test
+	./$(BUILD_TARGET_DIR)/audio_restart_test
 
 # Companion to -MMD -MP in CFLAGS above (see that comment for the real-
 # device/real-build incident this exists to prevent) -- pulls in every

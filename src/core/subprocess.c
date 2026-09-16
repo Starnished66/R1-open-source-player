@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <stdint.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Closes all file descriptors above stderr in the child after fork().
@@ -45,9 +47,19 @@ bool subprocess_run_timeout(char * const argv[], char * out_buf, size_t out_buf_
     return subprocess_run_checked(argv, out_buf, out_buf_size, timeout_ms, NULL);
 }
 
+static int64_t subprocess_monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 bool subprocess_run_checked(char * const argv[], char * out_buf, size_t out_buf_size, int timeout_ms,
                              int * out_exit_code) {
     if (out_exit_code) *out_exit_code = -1;
+    if (timeout_ms < 0) return false;
+    /* One deadline covers stdout and child exit. Repeated output must not
+     * reset the budget (radio clients can keep printing while unresponsive). */
+    int64_t deadline = subprocess_monotonic_ms() + timeout_ms;
 
     int pipefd[2] = { -1, -1 };
     if (out_buf && out_buf_size > 0) {
@@ -86,7 +98,10 @@ bool subprocess_run_checked(char * const argv[], char * out_buf, size_t out_buf_
         for (;;) {
             if (total + 1 >= out_buf_size) break;
             struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
-            int pr = poll(&pfd, 1, timeout_ms);
+            int64_t remaining = deadline - subprocess_monotonic_ms();
+            if (remaining <= 0) { timed_out = true; break; }
+            int pr = poll(&pfd, 1, (int)remaining);
+            if (pr < 0 && errno == EINTR) continue;
             if (pr <= 0) {
                 timed_out = (pr == 0); /* 0 = timeout; <0 = poll() error, treat like EOF */
                 break;
@@ -110,14 +125,17 @@ bool subprocess_run_checked(char * const argv[], char * out_buf, size_t out_buf_
      * but keeps running could still hang here forever otherwise. Polled in
      * small slices rather than a single blocking waitpid() since there's no
      * "wait with timeout" syscall. */
-    for (int waited_ms = 0; waited_ms < timeout_ms; waited_ms += 50) {
+    for (;;) {
         int status = 0;
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) {
             if (out_exit_code && WIFEXITED(status)) *out_exit_code = WEXITSTATUS(status);
             return true;
         }
-        usleep(50000);
+        if (r < 0 && errno != EINTR) break;
+        int64_t remaining = deadline - subprocess_monotonic_ms();
+        if (remaining <= 0) break;
+        usleep((useconds_t)(remaining < 50 ? remaining : 50) * 1000);
     }
     kill(pid, SIGKILL);
     waitpid(pid, NULL, 0);

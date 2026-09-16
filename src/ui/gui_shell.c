@@ -29,6 +29,7 @@
 #include "wifi_status.h"
 #include "wifi_control.h"
 #include "bluetooth_control.h"
+#include "bluetooth_reconnect.h"
 #ifndef HOST_BUILD
 #include "bt_media_player.h"
 #endif
@@ -331,6 +332,24 @@ static void layout_lucide_topbar_image(lv_obj_t * image) {
     lv_image_set_offset_y(image, 0);
 }
 
+/* Battery specifically renders larger than every other Lucide status icon --
+ * real-device feedback found the shared 28px size too small to read charge
+ * level at a glance. Widens the slot by the same amount the glyph grows
+ * (38px glyph in a 42px slot, same ~4px padding the shared 28-in-32 sizing
+ * already used) rather than just overscaling within the old 32px slot, so
+ * the glyph doesn't visually crowd its own slot edges. battery_icon_frame
+ * stays anchored via LV_ALIGN_RIGHT_MID (unaffected by width), so this
+ * only grows the icon leftward, away from the screen edge -- and since
+ * battery_topbar_group's own position is align_to()'d against this object
+ * AFTER this runs (build_status_bar()) and this function always produces
+ * the same fixed size on every later refresh_battery_topbar() call too,
+ * that one-time anchor never goes stale. */
+static void layout_battery_topbar_image(lv_obj_t * image) {
+    layout_lucide_topbar_image(image);
+    lv_image_set_scale(image, (BOARD_SCALE_PX(38) * LV_SCALE_NONE + 12) / 24);
+    lv_obj_set_size(image, BOARD_SCALE_PX(42), STATUS_BAR_CLEARANCE);
+}
+
 /* Theme2 status sprites share a 30 px canvas, but their visible alpha bounds
  * vary substantially. Measure the solid glyph (alpha >= 128), not faint
  * antialiasing fringes: these made Wi-Fi/Bluetooth appear undersized.
@@ -505,7 +524,7 @@ static void build_status_bar(void) {
      * states avoids the old independently-rounded frame/fill/terminal seams. */
     battery_icon_frame = lv_image_create(band);
     lv_image_set_src(battery_icon_frame, asset_path("topbar/lucide_battery.png"));
-    layout_lucide_topbar_image(battery_icon_frame);
+    layout_battery_topbar_image(battery_icon_frame);
     lv_obj_align(battery_icon_frame, LV_ALIGN_RIGHT_MID, -BOARD_SCALE_PX(15), 0);
 
     /* Sprite digits (topbar/N.png + percent.png), same treatment as the
@@ -627,7 +646,7 @@ void refresh_battery_topbar(void) {
                                  percent >= 10 ? "topbar/lucide_battery_low.png" :
                                                  "topbar/lucide_battery.png";
     lv_image_set_src(battery_icon_frame, asset_path(battery_asset));
-    layout_lucide_topbar_image(battery_icon_frame);
+    layout_battery_topbar_image(battery_icon_frame);
     if (low) {
         lv_obj_set_style_image_recolor(battery_icon_frame, lv_color_make(255, 64, 64), 0);
         lv_obj_set_style_image_recolor_opa(battery_icon_frame, LV_OPA_COVER, 0);
@@ -793,7 +812,36 @@ static void sync_topbar_status_icon_positions(void) {
 
 /* The drawer's wifi icon reflects radio on/off (highlighted when enabled),
  * while the top bar icon indicates connection status and signal strength. */
-static void refresh_wifi_icon(void) {
+static pthread_t wifi_status_thread;
+static bool wifi_status_active;
+static atomic_bool wifi_status_done;
+static bool wifi_status_result_connected;
+static int wifi_status_result_level;
+static bool wifi_status_connected;
+static int wifi_status_level;
+static unsigned wifi_status_generation;
+static unsigned wifi_status_job_generation;
+static bool wifi_status_enabled;
+
+static void * wifi_status_thread_func(void * arg) {
+    (void)arg;
+    int level = 0;
+    wifi_status_result_connected = wifi_get_status(&level);
+    wifi_status_result_level = level;
+    atomic_store_explicit(&wifi_status_done, true, memory_order_release);
+    return NULL;
+}
+
+/* UI-thread only: stale replies from a previous radio state are discarded. */
+static void wifi_status_observe_enabled(bool enabled) {
+    if (enabled == wifi_status_enabled) return;
+    wifi_status_enabled = enabled;
+    ++wifi_status_generation;
+    wifi_status_connected = false;
+    wifi_status_level = 0;
+}
+
+static void render_wifi_icon(void) {
     /* Keep an in-flight enable visually enabled even before wlan0's
      * wpa_supplicant socket exists.  Association is still queried below,
      * so the topbar naturally advances from the existing disconnected
@@ -815,8 +863,8 @@ static void refresh_wifi_icon(void) {
     lv_obj_remove_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
     sync_topbar_status_icon_positions();
 
-    int level;
-    if (wifi_get_status(&level)) {
+    int level = wifi_status_level;
+    if (wifi_status_connected) {
         static const char * const assets[] = {
             "topbar/lucide_wifi_zero.png", "topbar/lucide_wifi_low.png",
             "topbar/lucide_wifi_high.png", "topbar/lucide_wifi.png",
@@ -828,6 +876,30 @@ static void refresh_wifi_icon(void) {
         lv_image_set_src(wifi_icon, asset_path("topbar/lucide_wifi_off.png"));
     }
     layout_lucide_topbar_image(wifi_icon);
+}
+
+static void poll_wifi_status(void) {
+    wifi_status_observe_enabled(gui_shell_wifi_effective_enabled());
+    if (!wifi_status_active ||
+        !atomic_load_explicit(&wifi_status_done, memory_order_acquire)) return;
+    pthread_join(wifi_status_thread, NULL); /* worker has already finished its query */
+    wifi_status_active = false;
+    if (wifi_status_enabled && wifi_status_job_generation == wifi_status_generation) {
+        wifi_status_connected = wifi_status_result_connected;
+        wifi_status_level = wifi_status_result_level;
+        render_wifi_icon();
+    }
+}
+
+static void refresh_wifi_icon(void) {
+    poll_wifi_status();
+    render_wifi_icon();
+    /* Preserve the existing ~5s refresh cadence, with at most one query. */
+    if (!wifi_status_enabled || wifi_status_active || wifi_toggle_active) return;
+    wifi_status_job_generation = wifi_status_generation;
+    atomic_store_explicit(&wifi_status_done, false, memory_order_relaxed);
+    if (pthread_create(&wifi_status_thread, NULL, wifi_status_thread_func, NULL) == 0)
+        wifi_status_active = true;
 }
 
 /* Same treatment as refresh_wifi_icon(): the drawer's bt icon just reflects
@@ -916,6 +988,37 @@ static char refresh_bt_icon_result_codec[32] = "";
 static bool bt_is_a2dp_connected_ui = false;
 static uint32_t bt_disconnect_epoch = 0;
 static uint32_t bt_worker_launch_epoch = 0;
+static uint32_t bt_preference_epoch = 0;
+static uint32_t bt_worker_preference_epoch = 0;
+
+/* One persisted-device reconnect attempt is armed per authoritative
+ * powered-on cycle. A link loss alone must not re-arm it; only a later
+ * off->on observation (or the initial powered-on observation at startup)
+ * starts a new cycle. */
+static bool bt_reconnect_observed_powered = false;
+static bool bt_reconnect_observed_power_valid = false;
+static bool bt_reconnect_pending = false;
+static bool bt_reconnect_cycle_suppressed = false;
+
+static void cancel_bt_reconnect_for_cycle(bool suppress_cycle) {
+    bt_reconnect_cancel();
+    bt_reconnect_pending = false;
+    if (suppress_cycle) bt_reconnect_cycle_suppressed = true;
+}
+
+void gui_shell_cancel_bt_reconnect(void) {
+    /* Invalidate preference updates from an in-flight refresh. Manual
+     * actions (especially Forget) must not let a pre-action positive A2DP
+     * result repopulate the remembered preference when that worker returns.
+     * Keep this separate from the audio-route epoch: cancelling a reconnect
+     * is not evidence that the current headphones disconnected. */
+    bt_preference_epoch++;
+    cancel_bt_reconnect_for_cycle(true);
+}
+
+/* Forward declaration: route teardown is also required by immediate
+ * disconnect/power-off paths, before the next authoritative poll lands. */
+static void clear_bt_audio_route_now(void);
 
 bool gui_shell_is_bt_audio_connected(void) { return bt_is_a2dp_connected_ui; }
 
@@ -934,7 +1037,9 @@ static void invalidate_bt_codec_status_cache(void) {
 void gui_shell_notify_bt_audio_disconnected(void) {
     bt_disconnect_epoch++;
     bt_is_a2dp_connected_ui = false;
+    bt_connected_mac_cached[0] = '\0';
     bt_connected_codec_cached[0] = '\0';
+    clear_bt_audio_route_now();
     if (a2dp_status_icon) lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
     if (bt_codec_status_icon) lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
     invalidate_bt_codec_status_cache();
@@ -950,6 +1055,14 @@ static void * refresh_bt_icon_thread_func(void * arg) {
      * subprocess call (bluealsa-cli list-pcms) alongside the bluetoothctl
      * calls below, not a separate poll loop. */
     refresh_bt_icon_result_a2dp_connected = powered && bt_control_is_a2dp_source_connected();
+    if (powered && !refresh_bt_icon_result_a2dp_connected) {
+        /* A sample-rate change recreates the BlueALSA PCM (observed: 90 ms
+         * from removal to replacement). A poll in that gap must not clear
+         * the route or stop the disconnect watcher. Confirm absence after
+         * the same grace interval as the watcher, entirely off the UI thread. */
+        usleep(BT_OUTPUT_RECONFIGURE_GRACE_MS * 1000U);
+        refresh_bt_icon_result_a2dp_connected = bt_control_is_a2dp_source_connected();
+    }
 
     /* Two more subprocess calls (bluealsa-cli info, reusing the same PCM
      * path lookup bt_control_is_a2dp_source_connected() just did) -- only
@@ -992,6 +1105,7 @@ static void start_refresh_bt_icon(void) {
     if (refresh_bt_icon_active) return; /* previous check still in flight -- same "ignore taps until it lands" pattern as everything else here */
     refresh_bt_icon_active = true;
     bt_worker_launch_epoch = bt_disconnect_epoch;
+    bt_worker_preference_epoch = bt_preference_epoch;
     atomic_store_explicit(&refresh_bt_icon_done_flag, false, memory_order_relaxed);
         if (pthread_create(&refresh_bt_icon_thread, NULL, refresh_bt_icon_thread_func, NULL) != 0) {
         refresh_bt_icon_active = false;
@@ -1093,6 +1207,62 @@ static void sync_bt_codec_status_icon(void) {
     }
 }
 
+/* Only this lifecycle worker starts/stops the monitors. A rapid reconnect
+ * updates the desired state without making LVGL join a live monitor. */
+static pthread_t bt_monitor_lifecycle_thread;
+static bool bt_monitor_lifecycle_active;
+static atomic_bool bt_monitor_lifecycle_done;
+static bool bt_monitor_want_output, bt_monitor_want_volume;
+static bool bt_monitor_job_output, bt_monitor_job_volume;
+static bool bt_monitor_applied_output, bt_monitor_applied_volume;
+static bool bt_monitor_refresh_requested;
+
+static void poll_bt_monitor_lifecycle(void);
+
+static void clear_bt_audio_route_now(void) {
+    audio_set_bt_output(false);
+    usb_dac_bridge_set_bt_output(false);
+    bt_monitor_want_output = false;
+    bt_monitor_want_volume = false;
+    /* A desired/applied mismatch already schedules the required stop after an
+     * in-flight lifecycle job completes. Only force a retry when no lifecycle
+     * job is active but a monitor is still actually running; repeated
+     * authoritative-off polls must not spawn redundant stop workers. */
+    bt_monitor_refresh_requested = !bt_monitor_lifecycle_active &&
+        (bt_control_source_volume_sync_is_running() ||
+         bt_control_output_disconnect_watch_is_running());
+    poll_bt_monitor_lifecycle();
+}
+
+static void * bt_monitor_lifecycle_worker(void * unused) {
+    (void)unused;
+    if (bt_monitor_job_volume) bt_control_source_volume_sync_start();
+    else bt_control_source_volume_sync_stop();
+    if (bt_monitor_job_output) bt_control_output_disconnect_watch_start();
+    else bt_control_output_disconnect_watch_stop();
+    atomic_store_explicit(&bt_monitor_lifecycle_done, true, memory_order_release);
+    return NULL;
+}
+
+static void poll_bt_monitor_lifecycle(void) {
+    if (bt_monitor_lifecycle_active) {
+        if (!atomic_load_explicit(&bt_monitor_lifecycle_done, memory_order_acquire)) return;
+        pthread_join(bt_monitor_lifecycle_thread, NULL);
+        bt_monitor_lifecycle_active = false;
+        bt_monitor_applied_output = bt_monitor_job_output;
+        bt_monitor_applied_volume = bt_monitor_job_volume;
+    }
+    if (!bt_monitor_refresh_requested && bt_monitor_want_output == bt_monitor_applied_output &&
+        bt_monitor_want_volume == bt_monitor_applied_volume) return;
+    bt_monitor_job_output = bt_monitor_want_output;
+    bt_monitor_job_volume = bt_monitor_want_volume;
+    atomic_store_explicit(&bt_monitor_lifecycle_done, false, memory_order_relaxed);
+    if (pthread_create(&bt_monitor_lifecycle_thread, NULL, bt_monitor_lifecycle_worker, NULL) == 0) {
+        bt_monitor_lifecycle_active = true;
+        bt_monitor_refresh_requested = false;
+    }
+}
+
 static void poll_refresh_bt_icon(void) {
     if (!refresh_bt_icon_active || !atomic_load_explicit(&refresh_bt_icon_done_flag, memory_order_acquire)) return;
     refresh_bt_icon_active = false;
@@ -1104,6 +1274,23 @@ static void poll_refresh_bt_icon(void) {
     if (bt_toggle_active) return;
 
     bool display_powered = refresh_bt_icon_result_powered;
+
+    bool powered_rising = display_powered &&
+        (!bt_reconnect_observed_power_valid || !bt_reconnect_observed_powered);
+    if (!display_powered) {
+        /* An authoritative power-off ends the old cycle. Clear suppression so
+         * the next real power-on can arm a fresh, single reconnect attempt. */
+        cancel_bt_reconnect_for_cycle(false);
+        bt_reconnect_observed_power_valid = true;
+        bt_reconnect_observed_powered = false;
+        bt_reconnect_cycle_suppressed = false;
+    } else {
+        bt_reconnect_observed_power_valid = true;
+        bt_reconnect_observed_powered = true;
+        if (powered_rising && !bt_reconnect_cycle_suppressed &&
+            !current_settings.bt_dac_mode_enabled)
+            bt_reconnect_pending = true;
+    }
 
 #ifndef HOST_BUILD
     if (display_powered &&
@@ -1128,6 +1315,7 @@ static void poll_refresh_bt_icon(void) {
     }
 
     if (!display_powered) {
+        clear_bt_audio_route_now();
         lv_obj_add_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
@@ -1176,25 +1364,34 @@ static void poll_refresh_bt_icon(void) {
 
     /* Route audio to Bluetooth when connected, unless Bluetooth DAC mode is
      * enabled (which runs bluealsa as an A2DP sink rather than source). */
-    bool use_bt_output = refresh_bt_icon_result_connected && !current_settings.bt_dac_mode_enabled;
+    bool use_bt_output = a2dp_connected && !current_settings.bt_dac_mode_enabled;
     audio_set_bt_output(use_bt_output);
 
     /* Volume synchronization with Bluetooth audio output devices. */
-    if (use_bt_output && current_settings.bt_volume_sync_enabled) {
-        bt_control_source_volume_sync_start();
-    } else {
-        bt_control_source_volume_sync_stop();
-    }
-
-    /* Output disconnect watcher for faster disconnection detection. */
-    if (use_bt_output) {
-        bt_control_output_disconnect_watch_start();
-    } else {
-        bt_control_output_disconnect_watch_stop();
-    }
+    bt_monitor_want_volume = use_bt_output && current_settings.bt_volume_sync_enabled;
+    bt_monitor_want_output = use_bt_output;
+    /* Retry missing monitors, without creating a thread on every healthy
+     * radio poll. Failed starts and unexpected EOF are both retried here. */
+    bt_monitor_refresh_requested =
+        (bt_monitor_want_volume && !bt_control_source_volume_sync_is_running()) ||
+        (bt_monitor_want_output && !bt_control_output_disconnect_watch_is_running());
+    poll_bt_monitor_lifecycle();
 
     /* Mirror Bluetooth output setting to USB DAC bridge when active. */
     usb_dac_bridge_set_bt_output(use_bt_output);
+
+    /* Persist only a verified A2DP snapshot from this refresh worker. The
+     * epoch check above prevents a stale pre-disconnect result from becoming
+     * the remembered output device. Disconnections intentionally retain the
+     * preference until the user forgets it. */
+    if (a2dp_connected && bt_worker_preference_epoch == bt_preference_epoch &&
+        refresh_bt_icon_result_mac[0] &&
+        strcmp(current_settings.bt_last_output_mac, refresh_bt_icon_result_mac) != 0 &&
+        strlen(refresh_bt_icon_result_mac) == 17) {
+        snprintf(current_settings.bt_last_output_mac,
+                 sizeof(current_settings.bt_last_output_mac), "%s", refresh_bt_icon_result_mac);
+        settings_save_async(&current_settings);
+    }
 }
 
 /* Volume popup moved to gui_player.c */
@@ -2704,6 +2901,7 @@ static void show_optimistic_bt_state(bool powered) {
 
     bt_disconnect_epoch++;
     bt_is_a2dp_connected_ui = false;
+    bt_connected_mac_cached[0] = '\0';
     bt_connected_codec_cached[0] = '\0';
     if (powered) {
         lv_obj_remove_flag(bt_status_icon, LV_OBJ_FLAG_HIDDEN);
@@ -2718,6 +2916,7 @@ static void show_optimistic_bt_state(bool powered) {
     sync_topbar_status_icon_positions();
 
     bt_is_powered_cached = powered;
+    if (!powered) clear_bt_audio_route_now();
     if (gui_navigation_is_top(gui_network_get_bt_screen())) populate_bt_screen();
 }
 
@@ -2728,6 +2927,20 @@ void quick_drawer_bt_event_cb(lv_event_t * e) {
         return;
     }
     bool bt_will_be_powered = !bt_is_powered_cached;
+
+    if (!bt_will_be_powered) {
+        /* Explicit OFF is user intent immediately, before the slow toggle
+         * worker has produced its next authoritative snapshot. */
+        gui_shell_cancel_bt_reconnect();
+        bt_reconnect_observed_power_valid = true;
+        bt_reconnect_observed_powered = false;
+    } else {
+        /* A rapid user OFF->ON is a new requested cycle even if the polling
+         * cadence did not happen to observe the intermediate OFF state. */
+        bt_reconnect_observed_power_valid = true;
+        bt_reconnect_observed_powered = false;
+        bt_reconnect_cycle_suppressed = false;
+    }
 
     /* Last intent wins while a slow resume/enable is still finishing. The
      * running operation cannot be safely interrupted while it owns the chip
@@ -2807,8 +3020,9 @@ static void poll_bt_toggle(void) {
     start_refresh_bt_icon(); /* re-reads the real state -- updates the status bar/drawer icons and (once done) the Bluetooth screen's toggle row */
 }
 
-/* Reconciles the saved source encoder quality, or restores DAC mode,
- * asynchronously once Bluetooth startup is ready. */
+/* Reapplies persisted bt_dac_mode_enabled configuration asynchronously
+ * at startup, launching the necessary bluealsa and bt-agent processes without
+ * blocking the UI thread. */
 static pthread_t bt_dac_startup_reapply_thread;
 static bool bt_dac_startup_reapply_active = false;
 static bool bt_dac_startup_reapply_started = false;
@@ -2817,20 +3031,18 @@ static atomic_bool bt_dac_startup_reapply_done_flag = false;
 static void * bt_dac_startup_reapply_thread_func(void * arg) {
     (void) arg;
     bt_control_init_chip();
-    if (current_settings.bt_dac_mode_enabled) {
-        bt_control_enable();
-        mark_bt_media_player_enable_pending();
-        bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
-    }
+    bt_control_enable();
+    mark_bt_media_player_enable_pending();
+    bt_control_apply_output_settings(true, current_settings.bt_volume_sync_enabled);
     atomic_store_explicit(&bt_dac_startup_reapply_done_flag, true, memory_order_release); /* written last -- poll_bt_dac_startup_reapply only checks this flag */
     return NULL;
 }
 
-/* Also reconcile an already-powered source daemon with the saved encoder
- * preference. Stock boot scripts do not know about SBC-XQ. Do not turn on
- * an otherwise-disabled radio just because an output codec was saved. */
+/* Called once from gui_init(), only if bt_dac_mode_enabled was already true
+ * at load time (a fresh toggle-on tap already goes through
+ * bt_dac_toggle_cb() directly and doesn't need this). */
 static void start_bt_dac_startup_reapply_if_needed(void) {
-    if ((!current_settings.bt_dac_mode_enabled && !bt_is_powered_cached) || bt_dac_startup_reapply_started ||
+    if (!current_settings.bt_dac_mode_enabled || bt_dac_startup_reapply_started ||
         !refresh_bt_startup_readiness()) return;
     bt_dac_startup_reapply_started = true;
     bt_dac_startup_reapply_active = true;
@@ -2856,6 +3068,21 @@ static pthread_t bt_apply_output_settings_thread;
 static bool bt_apply_output_settings_active = false;
 static atomic_bool bt_apply_output_settings_done_flag = false;
 
+static void poll_bt_reconnect(void) {
+    bt_reconnect_poll();
+    if (!bt_reconnect_pending || bt_reconnect_cycle_suppressed ||
+        bt_reconnect_busy() || !bt_reconnect_observed_powered ||
+        current_settings.bt_dac_mode_enabled || bt_toggle_active ||
+        bt_dac_startup_reapply_active || bt_apply_output_settings_active)
+        return;
+
+    /* Consume the arm before starting. A failed start or exhausted worker is
+     * deliberately not retried until a new authoritative power cycle. */
+    bt_reconnect_pending = false;
+    bt_reconnect_start(current_settings.bt_last_output_mac[0] ?
+                       current_settings.bt_last_output_mac : NULL);
+}
+
 typedef struct {
     bool dac_mode_enabled;
     bool volume_sync_enabled;
@@ -2879,6 +3106,7 @@ void start_bt_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enab
     if (bt_apply_output_settings_active) return;
     bt_apply_output_settings_request_t * req = malloc(sizeof(*req));
     if (!req) return;
+    gui_shell_cancel_bt_reconnect();
     req->dac_mode_enabled = dac_mode_enabled;
     req->volume_sync_enabled = volume_sync_enabled;
     atomic_store_explicit(&bt_apply_output_settings_done_flag, false, memory_order_relaxed);
@@ -3315,6 +3543,7 @@ void gui_shell_init(uint32_t screen_width, uint32_t screen_height) {
 
 
 void gui_shell_poll(void) {
+    poll_wifi_status();
     poll_usb_audio_output();
     poll_sleep_timer();
     poll_wifi_toggle();
@@ -3322,6 +3551,8 @@ void gui_shell_poll(void) {
     poll_bt_dac_startup_reapply();
     poll_bt_apply_output_settings();
     poll_refresh_bt_icon();
+    poll_bt_monitor_lifecycle();
+    poll_bt_reconnect();
 }
 
 void gui_shell_resume_connections(bool wifi_was_on, bool bt_was_on) {
@@ -3335,6 +3566,11 @@ void gui_shell_resume_connections(bool wifi_was_on, bool bt_was_on) {
             wifi_toggle_active = false;
     }
     if (bt_was_on && !bt_is_powered_cached && !bt_toggle_active) {
+        /* Resume is a new power-on cycle even if no status poll ran while
+         * suspended to observe the intermediate OFF state. */
+        bt_reconnect_observed_power_valid = true;
+        bt_reconnect_observed_powered = false;
+        bt_reconnect_cycle_suppressed = false;
         bt_toggle_active = true;
         bt_toggle_target_enabled = true;
         bt_toggle_followup_pending = false;
@@ -3351,6 +3587,7 @@ void gui_shell_resume_connections(bool wifi_was_on, bool bt_was_on) {
 
 void gui_shell_suspend_connections(bool * wifi_was_on, bool * bt_was_on) {
 #ifndef HOST_BUILD
+    gui_shell_cancel_bt_reconnect();
     *wifi_was_on = wifi_control_is_enabled();
     *bt_was_on = bt_is_powered_cached;
     if (*wifi_was_on && !wifi_toggle_active) {
@@ -3493,10 +3730,29 @@ void gui_shell_player_swipe_recover(void * ctx) {
 
 bool gui_shell_has_background_work(void) {
     return bt_toggle_active || bt_dac_startup_reapply_active || bt_apply_output_settings_active ||
-           refresh_bt_icon_active || wifi_toggle_active;
+           refresh_bt_icon_active || wifi_toggle_active || wifi_status_active || bt_monitor_lifecycle_active ||
+           bt_reconnect_busy();
 }
 
 void gui_shell_cancel_background_work(void) {
+    bt_reconnect_shutdown();
+    bt_reconnect_pending = false;
+    if (bt_monitor_lifecycle_active) {
+        pthread_join(bt_monitor_lifecycle_thread, NULL);
+        bt_monitor_lifecycle_active = false;
+    }
+    /* Explicit teardown may wait; ordinary UI interactions never do. */
+    bt_control_source_volume_sync_stop();
+    bt_control_output_disconnect_watch_stop();
+    bt_monitor_want_output = bt_monitor_want_volume = false;
+    bt_monitor_applied_output = bt_monitor_applied_volume = false;
+    bt_monitor_refresh_requested = false;
+    if (wifi_status_active) {
+        pthread_join(wifi_status_thread, NULL);
+        wifi_status_active = false;
+    }
+    ++wifi_status_generation;
+    wifi_status_connected = false;
     if (bt_toggle_active) {
         pthread_join(bt_toggle_thread, NULL);
         bt_toggle_active = false;

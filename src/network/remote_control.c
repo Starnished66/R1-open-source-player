@@ -8,6 +8,8 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <sys/time.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,9 +70,11 @@ static char request_play_album_filter[128] = "";
 static int64_t * queue_song_ids = NULL;
 static int queue_song_id_count = 0;
 
-static bool running = false;
+static atomic_bool running = false;
 static int listen_fd = -1;
 static pthread_t listener_thread;
+static pthread_mutex_t listener_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int active_client_fd = -1;
 
 void remote_control_notify_status(bool playing, bool paused, const char * title, const char * artist,
                                    const char * album, const char * path, int position_seconds,
@@ -790,10 +794,7 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
 static void handle_connection(int cfd) {
     char buf[REQUEST_LINE_MAX];
     ssize_t n = read(cfd, buf, sizeof(buf) - 1);
-    if (n <= 0) {
-        close(cfd);
-        return;
-    }
+    if (n <= 0) return; /* listener owns close/active-client cleanup */
     buf[n] = '\0';
 
     char method[8] = {0};
@@ -1023,7 +1024,6 @@ static void handle_connection(int cfd) {
         send_response(cfd, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
     }
 
-    close(cfd);
 }
 
 /* Timeout for poll() on listen_fd so listener_thread_func periodically checks
@@ -1032,24 +1032,51 @@ static void handle_connection(int cfd) {
 
 static void * listener_thread_func(void * arg) {
     (void) arg;
-    while (running) {
-        struct pollfd pfd = { .fd = listen_fd, .events = POLLIN, .revents = 0 };
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_lock(&listener_mutex);
+        int fd = listen_fd;
+        pthread_mutex_unlock(&listener_mutex);
+        if (fd < 0) break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
         int pr = poll(&pfd, 1, ACCEPT_POLL_TIMEOUT_MS);
         if (pr <= 0) continue; /* Timeout or interrupted -- re-check running */
-        if (!running) break;
+        if (!atomic_load_explicit(&running, memory_order_acquire)) break;
 
-        int cfd = accept(listen_fd, NULL, NULL);
+        int cfd = accept(fd, NULL, NULL);
         if (cfd < 0) continue;
+        struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        pthread_mutex_lock(&listener_mutex);
+        if (!atomic_load_explicit(&running, memory_order_acquire)) {
+            pthread_mutex_unlock(&listener_mutex);
+            close(cfd);
+            break;
+        }
+        active_client_fd = cfd;
+        pthread_mutex_unlock(&listener_mutex);
         handle_connection(cfd);
+        pthread_mutex_lock(&listener_mutex);
+        if (active_client_fd == cfd) {
+            active_client_fd = -1;
+            close(cfd);
+        }
+        pthread_mutex_unlock(&listener_mutex);
     }
     return NULL;
 }
 
 void remote_control_start(void) {
-    if (running) return;
+    pthread_mutex_lock(&listener_mutex);
+    if (atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
 
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) return;
+    if (listen_fd < 0) {
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
 
     int reuse = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -1063,26 +1090,44 @@ void remote_control_start(void) {
     if (bind(listen_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         close(listen_fd);
         listen_fd = -1;
+        pthread_mutex_unlock(&listener_mutex);
         return;
     }
     if (listen(listen_fd, 4) < 0) {
         close(listen_fd);
         listen_fd = -1;
+        pthread_mutex_unlock(&listener_mutex);
         return;
     }
 
-    running = true;
-    pthread_create(&listener_thread, NULL, listener_thread_func, NULL);
-}
-
-void remote_control_stop(void) {
-    if (!running) return;
-    running = false;
-
-    /* Wait for listener thread to exit after noticing running = false. */
-    pthread_join(listener_thread, NULL);
-    if (listen_fd >= 0) {
+    atomic_store_explicit(&running, true, memory_order_release);
+    if (pthread_create(&listener_thread, NULL, listener_thread_func, NULL) != 0) {
+        atomic_store_explicit(&running, false, memory_order_release);
         close(listen_fd);
         listen_fd = -1;
     }
+    pthread_mutex_unlock(&listener_mutex);
+}
+
+void remote_control_stop(void) {
+    pthread_mutex_lock(&listener_mutex);
+    if (!atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
+    atomic_store_explicit(&running, false, memory_order_release);
+    /* Interrupt poll(), accept(), and a client read before joining. The
+     * client handler owns close(); shutdown only wakes a concurrent read. */
+    int stopped_listen_fd = listen_fd;
+    if (stopped_listen_fd >= 0) shutdown(stopped_listen_fd, SHUT_RDWR);
+    if (active_client_fd >= 0) shutdown(active_client_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&listener_mutex);
+
+    pthread_join(listener_thread, NULL);
+    pthread_mutex_lock(&listener_mutex);
+    if (listen_fd == stopped_listen_fd && listen_fd >= 0) {
+        close(listen_fd);
+        listen_fd = -1;
+    }
+    pthread_mutex_unlock(&listener_mutex);
 }

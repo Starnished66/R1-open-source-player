@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #define WIFI_INTERFACE "wlan0"
+#define WIFI_QUERY_TIMEOUT_MS 1500
 
 bool wifi_control_is_enabled(void) {
     return access("/var/run/wpa_supplicant/" WIFI_INTERFACE, F_OK) == 0;
@@ -221,7 +222,8 @@ bool wifi_control_disconnect(void) {
 int wifi_control_list_saved(wifi_saved_network_t * out, int max_count) {
     char buf[4096];
     char * argv[] = { (char *) "wpa_cli", (char *) "-i", (char *) WIFI_INTERFACE, (char *) "list_networks", NULL };
-    if (!subprocess_run(argv, buf, sizeof(buf))) return 0;
+    int exit_code = -1;
+    if (!subprocess_run_checked(argv, buf, sizeof(buf), WIFI_QUERY_TIMEOUT_MS, &exit_code) || exit_code != 0) return 0;
 
     int count = 0;
     char * line_save = NULL;
@@ -292,7 +294,10 @@ bool wifi_control_get_info(wifi_info_t * out) {
 
     char status_buf[512];
     char * status_argv[] = { (char *) "wpa_cli", (char *) "-i", (char *) WIFI_INTERFACE, (char *) "status", NULL };
-    if (!subprocess_run(status_argv, status_buf, sizeof(status_buf))) return false;
+    int exit_code = -1;
+    if (!subprocess_run_checked(status_argv, status_buf, sizeof(status_buf), WIFI_QUERY_TIMEOUT_MS, &exit_code) ||
+        exit_code != 0)
+        return false;
     if (!strstr(status_buf, "wpa_state=COMPLETED")) return false;
 
     const char * p = strstr(status_buf, "\nssid=");
@@ -310,14 +315,18 @@ bool wifi_control_get_info(wifi_info_t * out) {
     char signal_buf[512];
     char * signal_argv[] = { (char *) "wpa_cli", (char *) "-i", (char *) WIFI_INTERFACE, (char *) "signal_poll",
                              NULL };
-    if (subprocess_run(signal_argv, signal_buf, sizeof(signal_buf))) {
+    exit_code = -1;
+    if (subprocess_run_checked(signal_argv, signal_buf, sizeof(signal_buf), WIFI_QUERY_TIMEOUT_MS, &exit_code) &&
+        exit_code == 0) {
         const char * rssi_pos = strstr(signal_buf, "RSSI=");
         if (rssi_pos) out->signal_level = rssi_to_level(atoi(rssi_pos + 5));
     }
 
     char route_buf[256];
     char * route_argv[] = { (char *) "ip", (char *) "route", (char *) "show", (char *) "default", NULL };
-    if (subprocess_run(route_argv, route_buf, sizeof(route_buf))) {
+    exit_code = -1;
+    if (subprocess_run_checked(route_argv, route_buf, sizeof(route_buf), WIFI_QUERY_TIMEOUT_MS, &exit_code) &&
+        exit_code == 0) {
         const char * via = strstr(route_buf, "via ");
         if (via) sscanf(via + 4, "%15s", out->gateway);
     }

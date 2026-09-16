@@ -11,6 +11,8 @@
 #include <strings.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -29,9 +31,11 @@
 
 static pthread_mutex_t dlna_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static bool running = false;
+static atomic_bool running = false;
 static int listen_fd = -1;
 static pthread_t listener_thread;
+static pthread_mutex_t listener_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int active_client_fd = -1;
 
 /* Accumulated from set_uri: and set_meta: commands before play@ triggers
  * download. Guarded by dlna_mutex. */
@@ -40,7 +44,7 @@ static char pending_title[256] = {0};
 static char pending_artist[256] = {0};
 static char pending_album[256] = {0};
 
-static volatile bool stop_requested = false;
+static atomic_bool stop_requested = false;
 
 static uint64_t dlna_download_generation = 0;
 static bool track_ready = false;
@@ -181,7 +185,7 @@ static void handle_play(void) {
 static void handle_connection(int cfd) {
     unsigned char buf[4096];
     ssize_t n = read(cfd, buf, sizeof(buf) - 1);
-    if (n <= 0) { close(cfd); return; }
+    if (n <= 0) return; /* listener owns close/active-client cleanup */
     buf[n] = '\0';
     DBG_LOG("dlna_control: recv '%.100s'\n", (const char *) buf);
 
@@ -223,11 +227,10 @@ static void handle_connection(int cfd) {
         pthread_mutex_lock(&dlna_mutex);
         cast_intent_playing = false;
         pthread_mutex_unlock(&dlna_mutex);
-        stop_requested = true; /* Consumed by LVGL/main thread */
+        atomic_store_explicit(&stop_requested, true, memory_order_release); /* Consumed by LVGL/main thread */
     }
     /* Other commands are ignored without reply. */
 
-    close(cfd);
 }
 
 /* Timeout for accept polling so listener_thread_func periodically checks the
@@ -236,21 +239,45 @@ static void handle_connection(int cfd) {
 
 static void * listener_thread_func(void * arg) {
     (void) arg;
-    while (running) {
-        struct pollfd pfd = { .fd = listen_fd, .events = POLLIN, .revents = 0 };
+    while (atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_lock(&listener_mutex);
+        int fd = listen_fd;
+        pthread_mutex_unlock(&listener_mutex);
+        if (fd < 0) break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
         int pr = poll(&pfd, 1, ACCEPT_POLL_TIMEOUT_MS);
         if (pr <= 0) continue; /* Timeout or interrupted -- re-check running */
-        if (!running) break;
+        if (!atomic_load_explicit(&running, memory_order_acquire)) break;
 
-        int cfd = accept(listen_fd, NULL, NULL);
+        int cfd = accept(fd, NULL, NULL);
         if (cfd < 0) continue;
+        struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        pthread_mutex_lock(&listener_mutex);
+        if (!atomic_load_explicit(&running, memory_order_acquire)) {
+            pthread_mutex_unlock(&listener_mutex);
+            close(cfd);
+            break;
+        }
+        active_client_fd = cfd;
+        pthread_mutex_unlock(&listener_mutex);
         handle_connection(cfd);
+        pthread_mutex_lock(&listener_mutex);
+        if (active_client_fd == cfd) {
+            active_client_fd = -1;
+            close(cfd);
+        }
+        pthread_mutex_unlock(&listener_mutex);
     }
     return NULL;
 }
 
 void dlna_control_start(void) {
-    if (running) return;
+    pthread_mutex_lock(&listener_mutex);
+    if (atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
 
     char * dmrd_argv[] = { (char *) "/usr/bin/dmrd", NULL };
     subprocess_spawn_daemon(dmrd_argv);
@@ -258,7 +285,10 @@ void dlna_control_start(void) {
     unlink(DMR_STREAMER_SOCKET_PATH);
 
     listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (listen_fd < 0) return;
+    if (listen_fd < 0) {
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -268,6 +298,7 @@ void dlna_control_start(void) {
     if (bind(listen_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         close(listen_fd);
         listen_fd = -1;
+        pthread_mutex_unlock(&listener_mutex);
         return;
     }
     chmod(DMR_STREAMER_SOCKET_PATH, 0777); /* Allow dmrd process to connect */
@@ -275,29 +306,44 @@ void dlna_control_start(void) {
     if (listen(listen_fd, 4) < 0) {
         close(listen_fd);
         listen_fd = -1;
+        pthread_mutex_unlock(&listener_mutex);
         return;
     }
 
-    running = true;
-    stop_requested = false;
-    pthread_create(&listener_thread, NULL, listener_thread_func, NULL);
+    atomic_store_explicit(&running, true, memory_order_release);
+    atomic_store_explicit(&stop_requested, false, memory_order_release);
+    if (pthread_create(&listener_thread, NULL, listener_thread_func, NULL) != 0) {
+        atomic_store_explicit(&running, false, memory_order_release);
+        close(listen_fd);
+        listen_fd = -1;
+    }
+    pthread_mutex_unlock(&listener_mutex);
 }
 
 void dlna_control_stop(void) {
-    if (!running) return;
+    pthread_mutex_lock(&listener_mutex);
+    if (!atomic_load_explicit(&running, memory_order_acquire)) {
+        pthread_mutex_unlock(&listener_mutex);
+        return;
+    }
 
     pthread_mutex_lock(&dlna_mutex);
     ++dlna_download_generation;
     pthread_mutex_unlock(&dlna_mutex);
 
-    running = false;
+    atomic_store_explicit(&running, false, memory_order_release);
+    int stopped_listen_fd = listen_fd;
+    if (stopped_listen_fd >= 0) shutdown(stopped_listen_fd, SHUT_RDWR);
+    if (active_client_fd >= 0) shutdown(active_client_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&listener_mutex);
 
-    /* Wait for listener thread to exit after noticing running = false. */
     pthread_join(listener_thread, NULL);
-    if (listen_fd >= 0) {
+    pthread_mutex_lock(&listener_mutex);
+    if (listen_fd == stopped_listen_fd && listen_fd >= 0) {
         close(listen_fd);
         listen_fd = -1;
     }
+    pthread_mutex_unlock(&listener_mutex);
     unlink(DMR_STREAMER_SOCKET_PATH);
 
     char * argv[] = { (char *) "killall", (char *) "dmrd", NULL };
@@ -322,9 +368,7 @@ bool dlna_control_consume_ready_track(char * out_path, size_t path_size,
 }
 
 bool dlna_control_consume_stop_requested(void) {
-    if (!stop_requested) return false;
-    stop_requested = false;
-    return true;
+    return atomic_exchange_explicit(&stop_requested, false, memory_order_acq_rel);
 }
 
 void dlna_control_notify_status(bool playing, bool paused) {

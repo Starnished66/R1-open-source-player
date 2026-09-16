@@ -479,7 +479,7 @@ static void update_timer_cb(lv_timer_t * timer) {
         !gui_player_volume_is_being_adjusted()) {
         gui_player_set_volume_percent(bt_synced_volume_percent);
         current_settings.volume = (float) bt_synced_volume_percent / 100.0f;
-        settings_save(&current_settings);
+        settings_save_async(&current_settings);
         show_volume_popup(bt_synced_volume_percent);
         refresh_volume_topbar(bt_synced_volume_percent);
     }
@@ -492,7 +492,7 @@ static void update_timer_cb(lv_timer_t * timer) {
         gui_player_set_volume_percent(new_percent);
         audio_set_volume((float) new_percent / 100.0f);
         current_settings.volume = (float) new_percent / 100.0f;
-        settings_save(&current_settings);
+        settings_save_async(&current_settings);
         show_volume_popup(new_percent);
         refresh_volume_topbar(new_percent);
     }
@@ -524,7 +524,7 @@ static void update_timer_cb(lv_timer_t * timer) {
         gui_player_set_volume_percent(remote_volume_percent);
         audio_set_volume((float) remote_volume_percent / 100.0f);
         current_settings.volume = (float) remote_volume_percent / 100.0f;
-        settings_save(&current_settings);
+        settings_save_async(&current_settings);
         show_volume_popup(remote_volume_percent);
         refresh_volume_topbar(remote_volume_percent);
     }
@@ -591,20 +591,11 @@ static void update_timer_cb(lv_timer_t * timer) {
         } else if (bt_disconnected_since_tick == 0) {
             bt_disconnected_since_tick = lv_tick_get();
         }
-        /* Fast path: bt_control_output_disconnect_watch_start() (started
-         * alongside audio_set_bt_output() -- see poll_refresh_bt_icon())
-         * catches a real disconnect via bluealsa's own D-Bus signal in well
-         * under a second, instead of waiting on this debounce's full 12s (on
-         * top of refresh_bt_icon_result_a2dp_connected's own ~5s poll
-         * cadence) -- see bluetooth_control.h's own comment on why the
-         * debounce itself still has to stay, as the fallback for if this
-         * monitor subprocess dies or bluealsa doesn't emit the signal.
-         * Edge-triggered (consumed once), so this only forces the debounced
-         * read false for the one tick right after a real removal -- harmless
-         * if refresh_bt_icon_result_a2dp_connected is still stale-true a tick
-         * later (nothing auto-resumes playback off output_connected going
-         * back to true, so there's no user-visible flicker, just the stop
-         * below firing sooner than the plain poll+debounce alone would have). */
+        /* The monitor confirms a removal after a short reconfiguration
+         * grace period: BlueALSA can remove/re-add its PCM while changing
+         * sample rates without disconnecting the headphones. Only a
+         * confirmed removal bypasses the slower polling fallback above.
+         * The event is consumed once; reconnection never auto-resumes. */
         bool bt_disconnect_event = bt_control_output_disconnect_consume();
         if (bt_disconnect_event) {
             gui_shell_notify_bt_audio_disconnected();
@@ -712,6 +703,9 @@ static void update_timer_cb(lv_timer_t * timer) {
 
         if (car_shutdown_pending && !shutdown_background_work_active()) {
             current_settings.last_position = audio_get_resume_position_seconds();
+            /* This save is intentionally synchronous: idle_shutdown_now() is
+             * imminent, so the final playback checkpoint must reach storage
+             * before power is removed. */
             settings_save(&current_settings);
             idle_shutdown_now(); /* full poweroff -- does not return, see idle_shutdown.h */
         }
@@ -985,7 +979,6 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_usb_storage_hotplug();
     poll_sd_card_hotplug();
     gui_library_poll_playlists();
-    gui_library_poll_track_probes();
     poll_cover_decode();
     gui_lyrics_poll_load();
     gui_lyrics_poll_backdrop();
@@ -1425,7 +1418,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     current_settings.wifi_dac_mode_enabled = false;
     current_settings.dlna_renderer_enabled = false;
     current_settings.remote_control_enabled = false;
-    if (network_modes_changed) settings_save(&current_settings);
+    if (network_modes_changed) settings_save_async(&current_settings);
 
     /* The quick drawer's own open/close drag tracking is polled from
      * update_timer_cb instead (poll_quick_drawer_drag()) -- see its comment
@@ -1610,7 +1603,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
          * Car Mode to prevent unexpected playback or boot issues. */
         if (get_headphone_state() == HEADPHONE_STATE_NONE) {
             current_settings.car_mode_enabled = false;
-            settings_save(&current_settings);
+            settings_save_async(&current_settings);
             show_info_toast("Car Mode disabled: no headphone detected at boot");
         } else
 #endif

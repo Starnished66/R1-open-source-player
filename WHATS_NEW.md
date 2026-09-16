@@ -1,6 +1,6 @@
 # What's New
 
-Changes from August 31 to September 14, 2026, for the next weekly beta.
+Changes from August 31 to September 15, 2026, for the next weekly beta.
 
 This update brings a redesigned player and menus, lyrics that open directly
 from the album cover, smoother navigation, and improvements to audio playback
@@ -26,6 +26,9 @@ feedback when a Subsonic connection or library request fails.
   have refreshed icons and backgrounds. Net Radio and Audiobooks follow
   the new menu style too. The status bar uses Lucide icons, including the
   battery, with a centered clock and sizing independent of text-size settings.
+  The battery icon is now larger and easier to read at a glance.
+- Fixed a gesture conflict where swiping on the Now Playing seek bar could
+  trigger the back-swipe navigation instead of adjusting playback position.
 - **More display options.** Home supports custom background images and
   individual tile colors through themes and plugins. You can also choose
   how long the screen waits before dimming. Custom fonts have improved
@@ -95,6 +98,15 @@ feedback when a Subsonic connection or library request fails.
   newer player included in a firmware update.
 - Fixed the Firmware Update action powering off instead of rebooting into
   recovery, and corrected updater status text.
+- **No unnecessary library scans after charging.** Unplugging from a wall
+  charger or a charging-only cable no longer triggers a database update.
+  Automatic scans now require a confirmed USB Storage connection to a
+  computer and still respect the auto-rescan setting. A confirmed Storage
+  session is remembered even if the USB controller suspends or resets
+  before unplugging, and unreadable power-status samples are no longer
+  treated as disconnections. This detects a computer Storage session, not
+  individual file transfers: a computer connection can still trigger a scan
+  even if no files were changed.
 
 ## Behind the scenes
 
@@ -111,6 +123,31 @@ code and make layouts easier to maintain. Other work includes safer handling
 of overlapping DLNA requests, reduced memory use during plugin reloads,
 and improved crash diagnostics. The build configuration
 again selects mbedTLS 3.6.2 after connectivity regressions with 3.6.7.
+
+Corrected the upgraded Bluetooth service's pairing-storage location so saved
+headphones and trust settings survive a restart, and Bluetooth sample-rate
+changes no longer count as an immediate headphone disconnect. Turning
+Bluetooth on now makes a bounded background attempt to reconnect the last
+used headphones. Bluetooth status checks behind the top bar and quick-drawer
+icons also no longer fork one process per paired device on every refresh,
+removing a source of UI slowdown after turning on both Bluetooth and Wi-Fi.
+
+Improved playback restart recovery, including bounded retries for temporary
+output-open failures and preserved output format for eligible 24-bit tracks
+during pause, seek, and track-change fades. Routine volume and playback
+settings now save in the background, Web Import and Open Link/DLNA service
+changes run in the background, and Wi-Fi signal updates no longer wait on
+command-line tools on the UI thread. Library scans that fail to save now
+record the specific cause in the diagnostic log instead of a plain pass/fail
+flag, when database logging is enabled in Developer Options.
+
+Prepared a refresh of the firmware's Bluetooth audio and supporting
+libraries, led by BlueALSA 5.0.0, with updated ALSA, SBC, AAC, GLib, D-Bus,
+zlib, and XML parsing libraries and ALSA utilities (1.2.16) in the candidate
+base image, plus compatibility with newer BlueZ paired-device commands. The
+device's kernel, hardware drivers, and working LDAC libraries remain
+unchanged; device playback and reconnect testing is still required before
+inclusion.
 
 Automated daily builds continue; weekly beta builds are scheduled for Mondays
 at 1:00 p.m. Costa Rica time.

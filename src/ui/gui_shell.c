@@ -83,6 +83,7 @@ static bool quick_drawer_open = false;
 #define QUICK_DRAWER_TRIGGER_ZONE BOARD_SCALE_PX(140)
 
 static void start_bt_dac_startup_reapply_if_needed(void);
+static void start_bt_source_codec_reconcile_if_needed(void);
 static lv_obj_t * quick_drawer_brightness_track = NULL;
 static lv_obj_t * quick_drawer_brightness_label = NULL;
 static lv_timer_t * brightness_hw_apply_timer = NULL;
@@ -1006,6 +1007,7 @@ static bool bt_reconnect_observed_powered = false;
 static bool bt_reconnect_observed_power_valid = false;
 static bool bt_reconnect_pending = false;
 static bool bt_reconnect_cycle_suppressed = false;
+static uint32_t bt_power_status_generation = 0;
 
 static void cancel_bt_reconnect_for_cycle(bool suppress_cycle) {
     bt_reconnect_cancel();
@@ -1059,7 +1061,7 @@ static void * refresh_bt_icon_thread_func(void * arg) {
     refresh_bt_icon_result_powered = powered;
 
     /* Same background thread/cadence as everything else here -- one more
-     * subprocess call (bluealsa-cli list-pcms) alongside the bluetoothctl
+     * subprocess call (bluealsactl list-pcms) alongside the bluetoothctl
      * calls below, not a separate poll loop. */
     refresh_bt_icon_result_a2dp_connected = powered && bt_control_is_a2dp_source_connected();
     if (powered && !refresh_bt_icon_result_a2dp_connected) {
@@ -1071,7 +1073,7 @@ static void * refresh_bt_icon_thread_func(void * arg) {
         refresh_bt_icon_result_a2dp_connected = bt_control_is_a2dp_source_connected();
     }
 
-    /* Two more subprocess calls (bluealsa-cli info, reusing the same PCM
+    /* Two more subprocess calls (bluealsactl info, reusing the same PCM
      * path lookup bt_control_is_a2dp_source_connected() just did) -- only
      * worth paying when something's actually A2DP-connected. Both left at
      * "" (not stale) when nothing is, so add_bt_device_row() never shows a
@@ -1331,6 +1333,7 @@ static void poll_refresh_bt_icon(void) {
 
     bt_is_powered_cached = display_powered;
     bt_is_a2dp_connected_ui = a2dp_connected;
+    bt_power_status_generation++;
 
     snprintf(bt_connected_mac_cached, sizeof(bt_connected_mac_cached), "%s", a2dp_connected ? refresh_bt_icon_result_mac : "");
     snprintf(bt_connected_codec_cached, sizeof(bt_connected_codec_cached), "%s", a2dp_connected ? refresh_bt_icon_result_codec : "");
@@ -3100,11 +3103,63 @@ static pthread_t bt_apply_output_settings_thread;
 static bool bt_apply_output_settings_active = false;
 static atomic_bool bt_apply_output_settings_done_flag = false;
 
+static pthread_t bt_source_codec_reconcile_thread;
+static bool bt_source_codec_reconcile_active = false;
+static bool bt_source_codec_reconcile_started = false;
+static bool bt_source_codec_reconcile_succeeded = false;
+static bool bt_source_codec_reconcile_retry_pending = true;
+static uint32_t bt_source_codec_reconcile_failed_generation = 0;
+static atomic_bool bt_source_codec_reconcile_done_flag = false;
+
+static void * bt_source_codec_reconcile_thread_func(void * arg) {
+    (void) arg;
+    bool success = false;
+    if (!current_settings.bt_dac_mode_enabled && bt_control_is_powered())
+        success = bt_control_reconcile_source_settings();
+    bt_source_codec_reconcile_succeeded = success;
+    bt_source_codec_reconcile_retry_pending = !success;
+    atomic_store_explicit(&bt_source_codec_reconcile_done_flag, true, memory_order_release);
+    return NULL;
+}
+
+static void start_bt_source_codec_reconcile_if_needed(void) {
+    if (bt_source_codec_reconcile_active || bt_source_codec_reconcile_succeeded ||
+        current_settings.bt_dac_mode_enabled ||
+        !refresh_bt_startup_readiness()) return;
+    /* The first attempt is allowed to query the authoritative state even if
+     * the cached status is still false. After a transient failure, wait for a
+     * newer completed status refresh before retrying; this avoids a retry
+     * storm while still recovering when Bluetooth becomes ready later. */
+    if (bt_source_codec_reconcile_started &&
+        (!bt_source_codec_reconcile_retry_pending ||
+         bt_source_codec_reconcile_failed_generation == bt_power_status_generation ||
+         !bt_is_powered_cached)) return;
+    bt_source_codec_reconcile_started = true;
+    bt_source_codec_reconcile_active = true;
+    atomic_store_explicit(&bt_source_codec_reconcile_done_flag, false, memory_order_relaxed);
+    if (pthread_create(&bt_source_codec_reconcile_thread, NULL,
+                       bt_source_codec_reconcile_thread_func, NULL) != 0) {
+        bt_source_codec_reconcile_active = false;
+        bt_source_codec_reconcile_retry_pending = true;
+        bt_source_codec_reconcile_failed_generation = bt_power_status_generation;
+    }
+}
+
+static void poll_bt_source_codec_reconcile(void) {
+    if (!bt_source_codec_reconcile_active ||
+        !atomic_load_explicit(&bt_source_codec_reconcile_done_flag, memory_order_acquire)) return;
+    bt_source_codec_reconcile_active = false;
+    pthread_join(bt_source_codec_reconcile_thread, NULL);
+    if (!bt_source_codec_reconcile_succeeded)
+        bt_source_codec_reconcile_failed_generation = bt_power_status_generation;
+}
+
 static void poll_bt_reconnect(void) {
     bt_reconnect_poll();
     if (!bt_reconnect_pending || bt_reconnect_cycle_suppressed ||
         bt_reconnect_busy() || !bt_reconnect_observed_powered ||
         current_settings.bt_dac_mode_enabled || bt_toggle_active ||
+        bt_source_codec_reconcile_active ||
         bt_dac_startup_reapply_active || bt_apply_output_settings_active)
         return;
 
@@ -3562,6 +3617,7 @@ void gui_shell_refresh_home(void) {
 
 void gui_shell_init(uint32_t screen_width, uint32_t screen_height) {
     gui_shell_build_screens(screen_width, screen_height);
+    start_bt_source_codec_reconcile_if_needed();
     start_bt_dac_startup_reapply_if_needed();
 #ifndef HOST_BUILD
     boot_checkpoint("start_refresh_bt_icon about to be called");
@@ -3580,9 +3636,12 @@ void gui_shell_poll(void) {
     poll_sleep_timer();
     poll_wifi_toggle();
     poll_bt_toggle();
+    start_bt_source_codec_reconcile_if_needed();
+    poll_bt_source_codec_reconcile();
     poll_bt_dac_startup_reapply();
     poll_bt_apply_output_settings();
     poll_refresh_bt_icon();
+    start_bt_source_codec_reconcile_if_needed();
     poll_bt_monitor_lifecycle();
     poll_bt_reconnect();
 }
@@ -3762,7 +3821,8 @@ void gui_shell_player_swipe_recover(void * ctx) {
 
 bool gui_shell_has_background_work(void) {
     return bt_toggle_active || bt_dac_startup_reapply_active || bt_apply_output_settings_active ||
-           refresh_bt_icon_active || wifi_toggle_active || wifi_status_active || bt_monitor_lifecycle_active ||
+           bt_source_codec_reconcile_active || refresh_bt_icon_active || wifi_toggle_active ||
+           wifi_status_active || bt_monitor_lifecycle_active ||
            bt_reconnect_busy();
 }
 
@@ -3800,6 +3860,10 @@ void gui_shell_cancel_background_work(void) {
     if (bt_apply_output_settings_active) {
         pthread_join(bt_apply_output_settings_thread, NULL);
         bt_apply_output_settings_active = false;
+    }
+    if (bt_source_codec_reconcile_active) {
+        pthread_join(bt_source_codec_reconcile_thread, NULL);
+        bt_source_codec_reconcile_active = false;
     }
     if (refresh_bt_icon_active) {
         pthread_join(refresh_bt_icon_thread, NULL);

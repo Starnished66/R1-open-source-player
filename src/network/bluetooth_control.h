@@ -29,7 +29,7 @@ typedef struct {
 /* Non-blocking, thread-safe cached snapshot. */
 void bt_control_get_dac_stream_info(bt_dac_stream_info_t * out);
 
-/* bluetoothd, bluealsa, and a NoInputNoOutput pairing agent are already
+/* bluetoothd, BlueALSA 5, and a NoInputNoOutput pairing agent are already
  * running on this device; everything here just drives bluetoothctl's
  * non-interactive CLI mode (`bluetoothctl <command> [args]`), which
  * produces clean output with no ANSI/prompt junk to strip. */
@@ -40,6 +40,9 @@ bool bt_control_is_powered(void);
  * running /usr/bin/bt_resume. No-op if hci0 already exists.
  * Call off the UI thread as this takes several seconds. */
 bool bt_control_init_chip(void);
+/* Reconcile the persisted outgoing codec with any daemon started by the
+ * stock boot scripts. Call from a worker after Bluetooth startup readiness. */
+bool bt_control_reconcile_source_settings(void);
 
 /* Each blocks for about a second (bluetoothctl's own controller-power round
  * trip) -- call off the UI thread, same as everything else here. */
@@ -94,7 +97,7 @@ int bt_control_list_paired_states(bt_device_t * out, int max_count);
  * specific signal than bt_control_is_connected()/bt_control_list_paired_states()
  * (those report ANY paired device with an active connection, not
  * necessarily one that actually supports/negotiated A2DP audio). Forks a
- * process (`bluealsa-cli list-pcms`); call off the UI thread. */
+ * process (`bluealsactl list-pcms`); call off the UI thread. */
 bool bt_control_is_a2dp_source_connected(void);
 
 /* Writes the connected A2DP-source accessory's Bluetooth MAC address (e.g.
@@ -108,7 +111,7 @@ bool bt_control_get_connected_device_mac(char * out, size_t out_size);
 
 /* Writes the ACTUAL negotiated A2DP codec the connected accessory is
  * currently streaming with (e.g. "AAC", "LDAC", "SBC" -- whatever
- * `bluealsa-cli info` reports as "Selected codec") into out. This is the
+ * `bluealsactl info` reports as "Selected codec") into out. This is the
  * real, live-negotiated codec, NOT current_settings.bt_codec (this app's
  * own PREFERRED codec setting, Settings > Bluetooth > Codec) -- those can
  * differ if the accessory doesn't support the preferred one and bluealsa
@@ -145,16 +148,13 @@ bool bt_control_reconnect_paired(const char * preferred_mac,
                                 bt_control_cancel_callback_t cancel_cb,
                                 void * cancel_ctx);
 
-/* Output settings, confirmed against the real firmware's bt_init script,
- * which launches bluealsa as `bluealsa -p a2dp-source --a2dp-volume` --
- * a2dp-source only (this device sending audio OUT to headphones/speakers),
- * with AVRCP absolute-volume sync on by default. Both settings below are
- * flags on that SAME bluealsa process, so changing either kills and
- * relaunches it with the full combination implied by both current values
- * (never just one flag in isolation) -- callers pass both, not just the
- * one that changed. This is a real running-service restart, briefly
- * interrupting any in-progress Bluetooth audio; blocking, call off the UI
- * thread.
+/* Output settings use the firmware's BlueALSA 5 service, with an
+ * a2dp-source profile for this device sending audio OUT to
+ * headphones/speakers. Changing either setting kills and relaunches that
+ * service with the full combination implied by both current values (callers
+ * pass both, not just the one that changed). This is a real running-service
+ * restart, briefly interrupting in-progress Bluetooth audio; blocking, call
+ * off the UI thread.
  *
  * dac_mode_enabled adds the a2dp-sink profile (so another device can
  * stream audio TO this one, using it as an external DAC) and, when
@@ -162,26 +162,21 @@ bool bt_control_reconnect_paired(const char * preferred_mac,
  * incoming audio to the hardware output and makes the adapter
  * discoverable+pairable so a phone can find and connect to it as a sink
  * target; turning it off stops bluealsa-aplay and discoverability again.
- * volume_sync_enabled maps directly to the --a2dp-volume flag. */
+ * volume_sync_enabled selects whether the app mirrors volume through the
+ * BlueALSA 5 control API. */
 bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_enabled);
 
-/* Regenerates /usr/data/alsa.conf's bt_alsa_sink stanza -- the same
- * file/stanza the stock bt_init script creates once if missing (real
- * content read directly off a real device, default codec "ldac" /
- * ldac_eqmid "LDAC_ABR"). `codec` is one of "auto"/"ldac_hq"/"ldac_sq"/
- * "aptx"/"aac"/"sbc"/"sbc_xq"; "auto" omits the codec line entirely so bluealsa
- * negotiates automatically instead of this file forcing one. LDAC_HQ/
- * LDAC_SQ are this project's best-effort mapping of "LDAC quality"/"LDAC
- * Standard" to LDAC's own quality-mode naming -- the stock script's only
- * confirmed real value is LDAC_ABR (adaptive), so these two specifically
- * need on-device confirmation that bluealsa's LDAC codec plugin actually
- * accepts them. Blocking (just a file write); call off the UI thread for
- * consistency with everything else here. */
+/* Select the outgoing BlueALSA 5 encoder preference. `codec` is one of
+ * "auto"/"ldac_hq"/"ldac_sq"/"aptx"/"aac"/"sbc"/"sbc_xq". The active
+ * daemon is reconciled separately by bt_control_reconcile_source_settings().
+ * This only updates the in-memory preference; settings persistence belongs to
+ * the caller. */
 bool bt_control_set_codec(const char * codec);
 
 /* Restore the saved outgoing encoder preference without doing I/O. */
 void bt_control_restore_codec_preference(const char * codec);
-/* ALSA PCM used for outgoing Bluetooth audio; SBC-XQ explicitly selects SBC. */
+/* ALSA PCM used for outgoing Bluetooth audio; an explicit preference selects
+ * its BlueALSA CODEC parameter, while auto leaves negotiation unchanged. */
 const char * bt_control_get_playback_pcm(void);
 
 /* Keeps this app's own playback volume and a connected a2dp-source
@@ -201,7 +196,7 @@ void bt_control_source_volume_sync_stop(void);
 bool bt_control_source_volume_sync_is_running(void);
 bool bt_control_source_volume_sync_consume_percent(int * out_percent);
 
-/* Fast disconnect detection for a2dp-source output PCM via `bluealsa-cli monitor`.
+/* Fast disconnect detection for a2dp-source output PCM via `bluealsactl monitor`.
  * Confirms absence after a short grace interval: sample-rate/codec changes can
  * remove and re-create the same PCM without disconnecting the headphones.
  *

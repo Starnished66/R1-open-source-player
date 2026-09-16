@@ -316,7 +316,7 @@ endif
 # BlueZ org.bluez.MediaPlayer1 so a connected Bluetooth accessory's own
 # play/pause/next/previous buttons control playback, which needs a real
 # D-Bus service (responding to incoming method calls) rather than the
-# one-shot `bluetoothctl`/`dbus-send`/`bluealsa-cli` invocations everything
+# one-shot `bluetoothctl`/`dbus-send`/`bluealsactl` invocations everything
 # else in bluetooth_control.c uses -- no CLI tool can host a service object.
 #
 # Vendored and cross-compiled from source rather than dynamically linking
@@ -888,7 +888,7 @@ track-probe-selftest:
 	./$(BUILD_TARGET_DIR)/track_probe_test
 
 # Isolated host codec tests; include real Bluetooth code and discard unused
-# hardware paths. The wrapper redirects /usr/data/alsa.conf to a temp fixture.
+# hardware paths. The test mocks the process and BlueALSA 5 control paths.
 .PHONY: bluetooth-codec-selftest bluetooth-monitor-selftest bluetooth-reconnect-selftest
 bluetooth-reconnect-selftest:
 	@mkdir -p $(BUILD_TARGET_DIR)

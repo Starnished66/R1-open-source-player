@@ -988,12 +988,20 @@ void poll_bt_connect(void) {
     if (!bt_connect_active || !atomic_load_explicit(&bt_connect_done_flag, memory_order_acquire)) return;
 
     bt_connect_active = false;
+    char connected_mac[18];
+    snprintf(connected_mac, sizeof(connected_mac), "%s", bt_connecting_mac);
     pthread_join(bt_connect_thread, NULL);
     if (!bt_connect_succeeded) {
-        snprintf(bt_connect_failed_mac, sizeof(bt_connect_failed_mac), "%s", bt_connecting_mac);
+        snprintf(bt_connect_failed_mac, sizeof(bt_connect_failed_mac), "%s", connected_mac);
+    }
+    for (int i = 0; i < bt_scan_result_count; i++) {
+        if (strcmp(bt_scan_results[i].mac, connected_mac) != 0) continue;
+        bt_scan_results[i].paired = bt_connect_succeeded || bt_scan_results[i].paired;
+        bt_scan_results[i].connected = bt_connect_succeeded;
+        break;
     }
     bt_connecting_mac[0] = '\0';
-    start_bt_scan(); /* refresh so the list reflects the new pair/connect state -- runs in the background too, see its own comment */
+    populate_bt_screen();
 }
 
 static pthread_t bt_forget_thread;
@@ -1071,11 +1079,11 @@ static gui_popup_t bt_action_popup;
 static lv_obj_t * bt_action_popup_title;
 static lv_obj_t * bt_action_connect_row;
 static lv_obj_t * bt_action_forget_row;
-static int bt_action_popup_device_index = -1;
+static char bt_action_popup_device_mac[18] = "";
 
 static void hide_bt_action_popup(void) {
     gui_popup_hide(&bt_action_popup);
-    bt_action_popup_device_index = -1;
+    bt_action_popup_device_mac[0] = '\0';
 }
 
 static void bt_action_popup_backdrop_cb(lv_event_t * e) {
@@ -1085,12 +1093,12 @@ static void bt_action_popup_backdrop_cb(lv_event_t * e) {
 
 static void bt_action_connect_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (bt_action_popup_device_index < 0 || bt_action_popup_device_index >= bt_scan_result_count) {
+    if (strlen(bt_action_popup_device_mac) != 17) {
         hide_bt_action_popup();
         return;
     }
     char mac[18];
-    snprintf(mac, sizeof(mac), "%s", bt_scan_results[bt_action_popup_device_index].mac);
+    snprintf(mac, sizeof(mac), "%s", bt_action_popup_device_mac);
     hide_bt_action_popup();
     gui_shell_cancel_bt_reconnect();
     start_bt_connect(mac);
@@ -1098,12 +1106,12 @@ static void bt_action_connect_cb(lv_event_t * e) {
 
 static void bt_action_forget_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (bt_action_popup_device_index < 0 || bt_action_popup_device_index >= bt_scan_result_count) {
+    if (strlen(bt_action_popup_device_mac) != 17) {
         hide_bt_action_popup();
         return;
     }
     char mac[18];
-    snprintf(mac, sizeof(mac), "%s", bt_scan_results[bt_action_popup_device_index].mac);
+    snprintf(mac, sizeof(mac), "%s", bt_action_popup_device_mac);
     hide_bt_action_popup();
     start_bt_forget(mac);
 }
@@ -1116,8 +1124,9 @@ void build_bt_action_popup(void) {
 }
 
 static void show_bt_action_popup(int index) {
-    bt_action_popup_device_index = index;
+    if (index < 0 || index >= bt_scan_result_count) return;
     bt_device_t * dev = &bt_scan_results[index];
+    snprintf(bt_action_popup_device_mac, sizeof(bt_action_popup_device_mac), "%s", dev->mac);
 
     lv_label_set_text(bt_action_popup_title, dev->name[0] != '\0' ? dev->name : dev->mac);
 
@@ -1208,7 +1217,7 @@ static void add_bt_device_row(lv_obj_t * parent, int index) {
      * bt_connected_mac_cached, the accessory bt_control_get_connected_
      * device_mac()/_codec() actually queried. Both come from the same
      * background poll as the rest of this screen's live state (see
-     * refresh_bt_icon_thread_func()) -- never a synchronous bluealsa-cli
+     * refresh_bt_icon_thread_func()) -- never a synchronous bluealsactl
      * call here on the UI thread. */
     bool show_codec = dev->connected && bt_connected_codec_cached[0] != '\0' &&
                        strcasecmp(dev->mac, bt_connected_mac_cached) == 0;
@@ -1254,10 +1263,12 @@ static void add_bt_device_row(lv_obj_t * parent, int index) {
 static pthread_t bt_scan_thread;
 static bool bt_scan_active = false;
 static atomic_bool bt_scan_done_flag = false;
+static bt_device_t bt_scan_pending_results[BT_MAX_RESULTS];
+static int bt_scan_pending_result_count = 0;
 
 static void * bt_scan_thread_func(void * arg) {
     (void) arg;
-    bt_scan_result_count = bt_control_scan(6, bt_scan_results, BT_MAX_RESULTS);
+    bt_scan_pending_result_count = bt_control_scan(6, bt_scan_pending_results, BT_MAX_RESULTS);
     atomic_store_explicit(&bt_scan_done_flag, true, memory_order_release); /* written last -- poll_bt_scan only checks this flag */
     return NULL;
 }
@@ -1282,6 +1293,11 @@ void poll_bt_scan(void) {
     bt_scan_active = false;
     pthread_join(bt_scan_thread, NULL);
     set_bt_rescan_active(false);
+    if (bt_scan_pending_result_count >= 0 && bt_scan_pending_result_count <= BT_MAX_RESULTS) {
+        memcpy(bt_scan_results, bt_scan_pending_results,
+               (size_t) bt_scan_pending_result_count * sizeof(bt_scan_results[0]));
+        bt_scan_result_count = bt_scan_pending_result_count;
+    }
     populate_bt_screen(); /* refresh the list either way -- worth keeping current even if the user already backed out */
 }
 
@@ -1482,9 +1498,8 @@ static lv_obj_t * build_bt_dac_overlay_screen(void) {
  * via an accent-colored border rather than a checkmark glyph (same
  * indicator build_accent_color_screen's swatches use; safer than a unicode
  * checkmark that this project's subset LVGL fonts may not actually have a
- * glyph for). Writes straight into /usr/data/alsa.conf via
- * bt_control_set_codec() -- see its own doc comment for the LDAC_HQ/
- * LDAC_SQ caveat. ---- */
+ * glyph for). The preference is applied through the BlueALSA 5 source daemon
+ * reconciliation path. ---- */
 
 typedef struct {
     const char * value; /* matches player_settings_t.bt_codec / bt_control_set_codec()'s argument */
@@ -1516,8 +1531,7 @@ static void bt_codec_option_row_cb(lv_event_t * e) {
     int index = (int) (intptr_t) lv_event_get_user_data(e);
     if (index < 0 || (size_t) index >= BT_CODEC_OPTION_COUNT) return;
     const char * codec = bt_codec_options[index].value;
-    bool quality_changed = (strcmp(current_settings.bt_codec, "sbc_xq") == 0) !=
-                           (strcmp(codec, "sbc_xq") == 0);
+    bool codec_changed = strcmp(current_settings.bt_codec, codec) != 0;
     if (!bt_control_set_codec(codec)) {
         show_error_toast("Could not save Bluetooth codec");
         return;
@@ -1525,7 +1539,7 @@ static void bt_codec_option_row_cb(lv_event_t * e) {
     snprintf(current_settings.bt_codec, sizeof(current_settings.bt_codec), "%s", codec);
     settings_save_async(&current_settings);
     populate_bt_codec_screen();
-    if (quality_changed) show_info_toast("Turn Bluetooth off and on to apply");
+    if (codec_changed) show_info_toast("Turn Bluetooth off and on to apply");
 }
 
 static lv_obj_t * build_bt_codec_screen(void) {

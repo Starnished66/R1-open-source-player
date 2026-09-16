@@ -55,7 +55,7 @@ bool subprocess_spawn_daemon(char * const argv[]);
 bool subprocess_spawn_daemon_logged(char * const argv[], const char * log_path);
 
 /* For a long-running child whose stdout the caller wants to read
- * continuously as it's produced (e.g. `bluealsa-cli monitor`, which streams
+ * continuously as it's produced (e.g. `bluealsactl monitor`, which streams
  * D-Bus property-change lines indefinitely rather than exiting) -- unlike
  * subprocess_run(), doesn't buffer/wait for anything itself. A single fork
  * (not the daemonizing double-fork subprocess_spawn_daemon() uses), so the

@@ -614,7 +614,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * screen_on_now below (background, screen-off playback needs the same
      * protection). get_headphone_state() is a cheap sysfs read (no
      * subprocess); the A2DP half reuses whatever poll_refresh_bt_icon()
-     * last found rather than re-querying bluealsa-cli here every tick --
+     * last found rather than re-querying bluealsactl here every tick --
      * that's already throttled to its own ~5s cadence (see
      * refresh_bt_icon_thread_func()), and a few seconds of extra latency on
      * just the Bluetooth half is an acceptable tradeoff against forking a
@@ -629,7 +629,7 @@ static void update_timer_cb(lv_timer_t * timer) {
      * app's simulated jack/BT state. */
 #ifndef HOST_BUILD
     /* Bluetooth disconnect is debounced on wall-clock time (12s) to prevent
-     * transient bluealsa-cli busy polling failures from falsely cutting playback.
+     * transient bluealsactl busy polling failures from falsely cutting playback.
      * Wired headphone disconnects remain immediate via direct sysfs reads. */
 #define BT_OUTPUT_DISCONNECT_DEBOUNCE_MS 12000
     {

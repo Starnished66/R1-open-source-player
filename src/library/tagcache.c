@@ -16,6 +16,7 @@
 
 #include "tagcache.h"
 #include "library_endian.h"
+#include "db_log.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -31,8 +32,26 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
+
+/* On-failure diagnostic: free space on the SD card, so a commit failure that
+ * is actually ENOSPC (two generations of tag files briefly coexist during a
+ * commit -- see write_all()) shows up as an actionable number in the log
+ * instead of a bare ok=0. Only ever called from a failure path, so the
+ * statvfs() syscall never runs during a normal successful scan. */
+static void tagcache_log_free_space(const char * dir) {
+    if (!db_log_enabled()) return;
+    struct statvfs vfs;
+    if (statvfs(dir, &vfs) != 0) {
+        DB_LOG("DB", "statvfs_failed dir=%s errno=%d(%s)", dir, errno, strerror(errno));
+        return;
+    }
+    uint64_t free_bytes = (uint64_t) vfs.f_bsize * (uint64_t) vfs.f_bavail;
+    DB_LOG("DB", "free_space dir=%s free_kb=%" PRIu64 " free_inodes=%" PRIu64, dir, free_bytes / 1024,
+           (uint64_t) vfs.f_favail);
+}
 
 static void tagcache_flush_numeric(void);
 
@@ -744,12 +763,16 @@ static bool rebuild_indexes(void) {
     if (mem_needed == UINT64_MAX) {
         fprintf(stderr, "tagcache: rebuild_indexes rejected -- insufficient memory (avail=%" PRIu64 ", need=%" PRIu64 ", reserve=n/a)\n",
                 mem_avail, mem_needed);
+        DB_LOG("DB", "rebuild_rejected reason=need_overflow avail_kb=%" PRIu64 " entries=%d live=%d",
+               mem_avail == UINT64_MAX ? (uint64_t) 0 : mem_avail / 1024, ent_count, new_live);
         return false;
     }
     uint64_t reserve = tagcache_rebuild_reserve(mem_needed);
     if (mem_avail != UINT64_MAX && mem_avail < mem_needed + reserve) {
         fprintf(stderr, "tagcache: rebuild_indexes rejected -- insufficient memory (avail=%" PRIu64 ", need=%" PRIu64 ", reserve=%" PRIu64 ")\n",
                 mem_avail, mem_needed, reserve);
+        DB_LOG("DB", "rebuild_rejected reason=low_memory avail_kb=%" PRIu64 " need_kb=%" PRIu64 " reserve_kb=%" PRIu64 " entries=%d live=%d",
+               mem_avail / 1024, mem_needed / 1024, reserve / 1024, ent_count, new_live);
         return false;
     }
 
@@ -759,6 +782,7 @@ static bool rebuild_indexes(void) {
         new_title = malloc(sizeof(int32_t) * (size_t) new_live);
         new_recency = malloc(sizeof(int32_t) * (size_t) new_live);
         if (!new_title || !new_recency) {
+            DB_LOG("DB", "rebuild_rejected reason=alloc_failed step=title_recency live=%d", new_live);
             free(new_title);
             free(new_recency);
             return false;
@@ -779,6 +803,7 @@ static bool rebuild_indexes(void) {
     }
     new_hash = calloc((size_t) new_hash_cap, sizeof(*new_hash));
     if (!new_hash) {
+        DB_LOG("DB", "rebuild_rejected reason=alloc_failed step=hash cap=%d", new_hash_cap);
         free(new_title);
         free(new_recency);
         return false;
@@ -941,6 +966,7 @@ static bool rebuild_indexes(void) {
         new_title_rank = malloc(sizeof(int32_t) * (size_t) ent_count);
         new_recency_rank = malloc(sizeof(int32_t) * (size_t) ent_count);
         if (!new_title_rank || !new_recency_rank) {
+            DB_LOG("DB", "rebuild_rejected reason=alloc_failed step=rank entries=%d", ent_count);
             free(new_title_rank);
             free(new_recency_rank);
             new_title_rank = new_recency_rank = NULL;
@@ -958,6 +984,7 @@ static bool rebuild_indexes(void) {
     }
 
     if (!ok) {
+        DB_LOG("DB", "rebuild_rejected reason=alloc_failed step=group_build entries=%d live=%d", ent_count, new_live);
         for (int k = 0; k < 3; k++) {
             if (new_groups[k]) {
                 for (int i = 0; i < new_n[k]; i++) free(new_groups[k][i].songs);
@@ -1083,19 +1110,33 @@ static bool write_gen_pointer(int32_t gen) {
     db_path(path, sizeof(path), "tagcache.gen");
     db_path(tmp, sizeof(tmp), "tagcache.gen.tmp");
     int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        DB_LOG("DB", "write_gen_pointer open_failed gen=%d errno=%d(%s) path=%s", gen, errno, strerror(errno), tmp);
+        tagcache_log_free_space(db_dir);
+        return false;
+    }
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "%d\n", gen);
     bool ok = n > 0 && write_fully(fd, buf, (size_t) n);
-    if (!close_synced(fd) || !ok) {
+    bool synced = close_synced(fd);
+    if (!synced || !ok) {
+        DB_LOG("DB", "write_gen_pointer write_failed gen=%d errno=%d(%s) path=%s", gen, errno, strerror(errno), tmp);
+        tagcache_log_free_space(db_dir);
         unlink(tmp);
         return false;
     }
     if (rename(tmp, path) != 0) {
+        DB_LOG("DB", "write_gen_pointer rename_failed gen=%d errno=%d(%s) from=%s to=%s", gen, errno,
+               strerror(errno), tmp, path);
         unlink(tmp);
         return false;
     }
-    return library_fsync_dir(db_dir);
+    if (!library_fsync_dir(db_dir)) {
+        DB_LOG("DB", "write_gen_pointer fsync_dir_failed gen=%d errno=%d(%s) dir=%s", gen, errno, strerror(errno),
+               db_dir);
+        return false;
+    }
+    return true;
 }
 
 static bool read_gen_pointer(int32_t * out) {
@@ -1172,11 +1213,17 @@ static bool write_tag_new(int tag, int32_t gen, int32_t * title_seek, int32_t * 
     tag_file_name(name, sizeof(name), tag, gen);
     db_path(path, sizeof(path), name);
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        DB_LOG("DB", "write_tag_new open_failed tag=%d errno=%d(%s) path=%s", tag, errno, strerror(errno), path);
+        tagcache_log_free_space(db_dir);
+        return false;
+    }
     struct tagcache_header hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = TAGCACHE_MAGIC;
     if (!write_fully(fd, &hdr, sizeof(hdr))) {
+        DB_LOG("DB", "write_tag_new header_write_failed tag=%d errno=%d(%s) path=%s", tag, errno, strerror(errno), path);
+        tagcache_log_free_space(db_dir);
         close(fd);
         unlink(path);
         return false;
@@ -1228,8 +1275,24 @@ static bool write_tag_new(int tag, int32_t gen, int32_t * title_seek, int32_t * 
     }
     hdr.entry_count = n;
     hdr.datasize = datasize;
-    if (ok) ok = lseek(fd, 0, SEEK_SET) == 0 && write_fully(fd, &hdr, sizeof(hdr));
-    if (!close_synced(fd) || !ok) {
+    if (!ok) {
+        DB_LOG("DB", "write_tag_new entry_write_failed tag=%d n=%d errno=%d(%s) path=%s", tag, n, errno,
+               strerror(errno), path);
+        tagcache_log_free_space(db_dir);
+    } else {
+        ok = lseek(fd, 0, SEEK_SET) == 0 && write_fully(fd, &hdr, sizeof(hdr));
+        if (!ok) {
+            DB_LOG("DB", "write_tag_new header_rewrite_failed tag=%d errno=%d(%s) path=%s", tag, errno,
+                   strerror(errno), path);
+            tagcache_log_free_space(db_dir);
+        }
+    }
+    bool synced = close_synced(fd);
+    if (!synced) {
+        DB_LOG("DB", "write_tag_new close_sync_failed tag=%d errno=%d(%s) path=%s", tag, errno, strerror(errno), path);
+        tagcache_log_free_space(db_dir);
+    }
+    if (!synced || !ok) {
         unlink(path);
         return false;
     }
@@ -1259,6 +1322,7 @@ static bool write_all(void) {
     int32_t * genre_seek_snap = calloc((size_t) nslot, sizeof(int32_t));
     int32_t * aa_seek_snap = calloc((size_t) nslot, sizeof(int32_t));
     if (!title_seek || !path_seek || !artist_seek_snap || !album_seek_snap || !genre_seek_snap || !aa_seek_snap) {
+        DB_LOG("DB", "write_all alloc_failed nslot=%d", nslot);
         free(title_seek);
         free(path_seek);
         free(artist_seek_snap);
@@ -1303,8 +1367,11 @@ static bool write_all(void) {
         mh.commitid = new_gen;
         mh.dirty = 0;
         int fd = open(master_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-        if (fd < 0) ok = false;
-        else {
+        if (fd < 0) {
+            DB_LOG("DB", "write_all master_open_failed errno=%d(%s) path=%s", errno, strerror(errno), master_path);
+            tagcache_log_free_space(db_dir);
+            ok = false;
+        } else {
             ok = write_fully(fd, &mh, sizeof(mh));
             for (int32_t i = 0; ok && i < ent_count; i++) {
                 struct index_entry idx;
@@ -1333,7 +1400,18 @@ static bool write_all(void) {
                 }
                 ok = write_fully(fd, &idx, sizeof(idx));
             }
-            if (!close_synced(fd) || !ok) {
+            if (!ok) {
+                DB_LOG("DB", "write_all master_write_failed errno=%d(%s) entries=%d path=%s", errno, strerror(errno),
+                       ent_count, master_path);
+                tagcache_log_free_space(db_dir);
+            }
+            bool synced = close_synced(fd);
+            if (!synced) {
+                DB_LOG("DB", "write_all master_close_sync_failed errno=%d(%s) path=%s", errno, strerror(errno),
+                       master_path);
+                tagcache_log_free_space(db_dir);
+            }
+            if (!synced || !ok) {
                 unlink(master_path);
                 ok = false;
             }
@@ -1343,10 +1421,18 @@ static bool write_all(void) {
 
     int32_t previous_gen = 0;
     if (ok) read_gen_pointer(&previous_gen);
-    if (ok) ok = library_fsync_dir(db_dir);
+    if (ok) {
+        ok = library_fsync_dir(db_dir);
+        if (!ok) {
+            DB_LOG("DB", "write_all fsync_dir_failed errno=%d(%s) dir=%s", errno, strerror(errno), db_dir);
+            tagcache_log_free_space(db_dir);
+        }
+    }
     if (ok) ok = write_gen_pointer(new_gen);
 
     if (!ok) {
+        DB_LOG("DB", "write_all result=failed new_gen=%d previous_gen=%d entries=%d", new_gen, previous_gen,
+               ent_count);
         unlink_generation(new_gen);
         char leftover[640];
         db_path(leftover, sizeof(leftover), "tagcache.gen.tmp");

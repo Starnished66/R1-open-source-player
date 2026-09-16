@@ -1,4 +1,5 @@
 #include "peq.h"
+#include "library_endian.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -419,6 +420,24 @@ bool peq_load_from_path(const char * path) {
     return true;
 }
 
+/* rename() alone is not durable against an unclean shutdown/crash -- the
+ * directory entry update needs its own fsync, same requirement every other
+ * atomic-write path in this codebase already handles (settings.c's
+ * fsync_settings_dir(), library_fsync_dir()'s other callers). Generic over
+ * the parent directory rather than a fixed path since peq_save_to_path()
+ * writes both the always-current autosave file (/usr/data) and named
+ * profiles (wherever the caller's directory lives). Best-effort: a failure
+ * here does not fail the save the caller already completed and reported. */
+static void peq_fsync_parent_dir(const char * path) {
+    char dir[520];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char * slash = strrchr(dir, '/');
+    if (!slash) return;
+    if (slash == dir) slash[1] = '\0'; /* "/name" -> "/" */
+    else *slash = '\0';
+    library_fsync_dir(dir);
+}
+
 bool peq_save_to_path(const char * path) {
     char tmp_path[520];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
@@ -448,7 +467,10 @@ bool peq_save_to_path(const char * path) {
     /* Rename temp file to target. On filesystems where atomic overwrite via
      * rename() is not supported when target exists, fall back to staging a
      * backup copy and restoring it if installation fails. */
-    if (rename(tmp_path, path) == 0) return true;
+    if (rename(tmp_path, path) == 0) {
+        peq_fsync_parent_dir(path);
+        return true;
+    }
     int direct_rename_errno = errno;
     if (access(path, F_OK) != 0) {
         fprintf(stderr, "peq: rename '%s' -> '%s' failed: %s\n", tmp_path, path, strerror(direct_rename_errno));
@@ -473,6 +495,7 @@ bool peq_save_to_path(const char * path) {
         return false;
     }
     unlink(backup_path);
+    peq_fsync_parent_dir(path);
     return true;
 }
 

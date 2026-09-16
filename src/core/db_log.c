@@ -49,6 +49,13 @@ static void db_log_rotate_if_needed_locked(void) {
 
 void db_log_set_enabled(bool enabled) {
     bool was_enabled = atomic_exchange(&db_log_is_enabled, enabled);
+    if (enabled) {
+        /* The reload/crash diagnostics share this directory, but may be the
+         * first logging output produced after the developer option is
+         * enabled. Create it here so the signal-safe crash path need not call
+         * mkdir(). */
+        (void) mkdir(DB_LOG_DIR, 0755);
+    }
     if (was_enabled && !enabled) {
         pthread_mutex_lock(&db_log_mutex);
         if (db_log_file) {

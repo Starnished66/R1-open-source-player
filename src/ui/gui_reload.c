@@ -83,6 +83,7 @@
 #include "src/misc/cache/instance/lv_image_cache.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -103,12 +104,20 @@
 #include "plugin_manager.h"
 #include "gui_plugin_manage.h"
 #include "gui_lock_screen.h"
+#include "db_log.h"
 
 /* Diagnostic logging for UI reload steps. Append-only with fsync per line
  * to ensure entries are flushed to storage immediately to identify the
  * failure point if a crash occurs during reload. */
-#define RELOAD_DIAG_PATH "/data/mnt/sd_0/reload_diag.log"
+#ifdef HOST_BUILD
+  #define RELOAD_DIAG_DIR "./music/.logs"
+#else
+  #define RELOAD_DIAG_DIR "/data/mnt/sd_0/.logs"
+#endif
+#define RELOAD_DIAG_PATH RELOAD_DIAG_DIR "/reload_diag.log"
 static void reload_diag(const char * step) {
+    if (!db_log_enabled()) return;
+    (void) mkdir(RELOAD_DIAG_DIR, 0755);
     int fd = open(RELOAD_DIAG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd < 0) return;
     char line[160];

@@ -437,7 +437,7 @@ static void db_logging_switch_event_cb(lv_event_t * e) {
  * .logs/usb_dac_bridge.log on the SD card -- see db_log.h and usb_dac_bridge.h. */
 static lv_obj_t * build_dev_options_screen(void) {
     static pill_list_item_t items[1];
-    items[0] = (pill_list_item_t){ "Enable database logging", PILL_ACCESSORY_TOGGLE,
+    items[0] = (pill_list_item_t){ "Enable debug logging", PILL_ACCESSORY_TOGGLE,
                                     current_settings.db_logging_enabled, NULL, db_logging_switch_event_cb, NULL };
     lv_obj_t * scr = build_pill_list_screen("Developer Options", generic_back_cb, items, 1, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);

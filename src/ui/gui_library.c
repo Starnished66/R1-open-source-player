@@ -5342,7 +5342,9 @@ void gui_library_init(void) {
 /* Diagnostic logging helper writing teardown and init steps to reload_diag.log
  * with fsync per line to pinpoint failures during theme reload. */
 static void library_teardown_diag(const char * step) {
-    int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (!db_log_enabled()) return;
+    (void) mkdir("/data/mnt/sd_0/.logs", 0755);
+    int fd = open("/data/mnt/sd_0/.logs/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd < 0) return;
     char line[96];
     int len = snprintf(line, sizeof(line), "[pid=%ld]   gui_library_teardown: %s\n", (long) getpid(), step);

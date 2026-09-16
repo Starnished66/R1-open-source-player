@@ -17,6 +17,7 @@
 #endif
 
 #include "gui.h"
+#include "db_log.h"
 
 #ifdef HOST_BUILD
   #include "src/drivers/sdl/lv_sdl_window.h"
@@ -77,10 +78,16 @@ void install_thread_crash_altstack(void) {}
  * array from a signal handler is safe (no allocation, no lock). */
 extern char g_scan_last_path[PATH_MAX];
 
-/* Signal handler that logs register state and a stack word scan to
- * reload_diag.log, then re-raises the signal with the default handler. */
+/* Signal handler that logs register state and a stack word scan to the
+ * opt-in .logs/reload_diag.log, then re-raises the signal with the default
+ * handler. */
 static void crash_diag_handler(int sig, siginfo_t * info, void * ucontext_v) {
-    int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (!db_log_enabled()) {
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
+    int fd = open("/data/mnt/sd_0/.logs/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd >= 0) {
         ucontext_t * uc = (ucontext_t *) ucontext_v;
         unsigned long pc = (unsigned long) uc->uc_mcontext.pc;

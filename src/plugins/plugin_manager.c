@@ -10,6 +10,7 @@
 #include "plugin_storage.h"
 #include "plugin_internal.h"
 #include "plugin_disabled_list.h"
+#include "db_log.h"
 #include "app_version.h"
 #include "fallback_font.h"
 #include "mbedtls/md5.h" /* plugin.md5() -- same primitive subsonic_client.c already uses for its own token auth */
@@ -4090,7 +4091,9 @@ static void plugin_manager_cancel_all_async_http(void) {
  * state a reload exists to re-read, not something to clear. */
 /* Diagnostic logging for plugin deinitialization steps during reload. */
 static void deinit_diag(const char * step) {
-    int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (!db_log_enabled()) return;
+    (void) mkdir("/data/mnt/sd_0/.logs", 0755);
+    int fd = open("/data/mnt/sd_0/.logs/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd < 0) return;
     char line[224];
     int len = snprintf(line, sizeof(line), "[pid=%ld] %s\n", (long) getpid(), step);

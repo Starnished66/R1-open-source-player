@@ -419,6 +419,54 @@ static void notify_screen_woke_async_cb(void * unused) {
     plugin_manager_notify_screen_woke();
 }
 
+/* Keep power-button consumption separate from the 500ms control timer. While
+ * the screen is off, main.c may sleep for up to that same interval, making a
+ * button wake feel sluggish even though backlight I/O is asynchronous. */
+static void process_power_button_events(void) {
+    if (resumed_from_suspend_pending && lv_tick_elaps(resumed_from_suspend_tick) >= RESUME_POWER_DRAIN_WINDOW_MS) {
+        DBG_LOG("resume: grace window expired unused at tick=%u\n", lv_tick_get());
+        resumed_from_suspend_pending = false;
+    }
+
+    if (hw_buttons_consume_power()) {
+        DBG_LOG("resume: hw_buttons_consume_power() true at tick=%u, pending=%d\n",
+                lv_tick_get(), resumed_from_suspend_pending);
+        if (resumed_from_suspend_pending) {
+            resumed_from_suspend_pending = false;
+        } else {
+            bool turn_on = !backlight_screen_is_on();
+            lv_display_trigger_activity(NULL);
+            backlight_set_screen_on(turn_on);
+            apply_screen_runtime_state(turn_on);
+            if (turn_on) {
+                inactivity_dimmed = false;
+                force_screen_just_woke = true;
+            }
+        }
+    }
+
+    if (hw_buttons_consume_power_long_press()) {
+        if (resumed_from_suspend_pending) {
+            resumed_from_suspend_pending = false;
+        } else {
+            bool was_on = backlight_screen_is_on();
+            backlight_set_screen_on(true);
+            if (!was_on) {
+                apply_screen_runtime_state(true);
+                inactivity_dimmed = false;
+                force_screen_just_woke = true;
+            }
+            lv_display_trigger_activity(NULL);
+            start_power_off_countdown();
+        }
+    }
+}
+
+static void power_button_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    process_power_button_events();
+}
+
 static void update_timer_cb(lv_timer_t * timer) {
     (void) timer;
 
@@ -720,50 +768,7 @@ static void update_timer_cb(lv_timer_t * timer) {
 
     bool screen_was_on = backlight_screen_is_on();
 
-    /* Screen wake is triggered only by the power button; touch and other hardware
-     * buttons do not wake the display. The backlight toggle and inactivity clock
-     * reset are performed together on this thread so the display does not immediately
-     * re-expire on the next tick. */
-    if (resumed_from_suspend_pending && lv_tick_elaps(resumed_from_suspend_tick) >= RESUME_POWER_DRAIN_WINDOW_MS) {
-        DBG_LOG("resume: grace window expired unused at tick=%u\n", lv_tick_get());
-        resumed_from_suspend_pending = false;
-    }
-    if (hw_buttons_consume_power()) {
-        DBG_LOG("resume: hw_buttons_consume_power() true at tick=%u, pending=%d\n", lv_tick_get(), resumed_from_suspend_pending);
-        if (resumed_from_suspend_pending) {
-            /* Echo of the press that woke the device from suspend -- see
-             * resumed_from_suspend_pending's own comment. Swallowed once
-             * (not the whole window's worth of presses): only the wake
-             * press itself should ever land here, so there's nothing more
-             * to drain after the first one arrives, and continuing to
-             * suppress every press for the rest of the window would make a
-             * deliberate quick re-sleep tap right after waking do nothing. */
-            resumed_from_suspend_pending = false;
-        } else {
-            lv_display_trigger_activity(NULL);
-            backlight_set_screen_on(!backlight_screen_is_on());
-        }
-    }
-    if (hw_buttons_consume_power_long_press()) {
-        /* Same resumed_from_suspend_pending guard as the short-tap consumer
-         * just above -- a long hold that woke the device from suspend
-         * shouldn't also immediately pop up a power-off countdown the
-         * instant the screen comes back on. power_off_countdown_active's
-         * own guard (inside start_power_off_countdown() isn't needed here
-         * since hw_buttons.c already only fires this once per physical
-         * press) still lets a *second* long-press restart the countdown
-         * from the top while one is already showing, which is fine. */
-        if (resumed_from_suspend_pending) {
-            resumed_from_suspend_pending = false;
-        } else {
-            /* If screen is asleep when long-press threshold is reached, wake the
-             * backlight and reset inactivity so the countdown dialog and touch
-             * controls are visible and active. */
-            backlight_set_screen_on(true);
-            lv_display_trigger_activity(NULL);
-            start_power_off_countdown();
-        }
-    }
+    /* Power-button events are consumed by power_button_timer_cb(). */
     poll_power_off_countdown();
 
     uint32_t screen_inactive_ms = lv_display_get_inactive_time(NULL);
@@ -1578,6 +1583,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     /* Initialize user inactivity baseline at the splash-to-Home transition,
      * start runtime update timer, and install gesture indev hooks. */
     gui_reset_interactive_timeout_baseline();
+    lv_timer_create(power_button_timer_cb, 25, NULL);
     lv_timer_create(update_timer_cb, 500, NULL);
     lv_indev_t * gesture_indev = find_pointer_indev();
     gui_shell_install_indev_hooks(gesture_indev);

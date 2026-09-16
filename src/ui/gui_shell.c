@@ -2091,7 +2091,14 @@ bool point_in_swipe_dead_zone(lv_point_t p) {
         if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) continue;
         if (lv_obj_get_screen(obj) != lv_screen_active()) continue;
         lv_area_t area;
-        lv_obj_get_coords(obj, &area);
+        /* lv_obj_get_click_area(), not lv_obj_get_coords() -- a native
+         * slider's raw box can be a few px tall (e.g. the player's progress
+         * bar) while lv_obj_set_ext_click_area() widens what LVGL itself
+         * treats as a touch on it. Using the raw box here left a real,
+         * visually-on-the-slider press just outside the registered dead
+         * zone free to start a back-swipe instead. Falls back to the raw
+         * box automatically when an object has no ext click area set. */
+        lv_obj_get_click_area(obj, &area);
         if (p.x >= area.x1 && p.x <= area.x2 && p.y >= area.y1 && p.y <= area.y2) return true;
     }
     return false;

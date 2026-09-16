@@ -17,6 +17,17 @@ computer connection can still trigger a scan even if no files were changed.
 
 ## Behind the scenes
 
+- The battery icon in the status bar is now larger and easier to read at a
+  glance.
+- Bluetooth status checks behind the top bar and quick-drawer icons no
+  longer fork one process per paired device on every refresh; a single
+  check is used when the installed Bluetooth tools support it. This removes
+  a source of UI slowdown lasting a couple of minutes after turning on both
+  Bluetooth and Wi-Fi.
+- Library scans that fail to save now record the specific cause (low disk
+  space, low memory, or a write error) in the diagnostic log instead of a
+  plain pass/fail flag, when database logging is enabled in Developer
+  Options.
 - Corrected the upgraded Bluetooth service's pairing-storage location so
   saved headphones and trust settings survive a restart. Previously, manual
   connection worked for the current boot but pairing could not be saved to
@@ -44,15 +55,6 @@ computer connection can still trigger a scan even if no files were changed.
   command-line tools on the UI thread. Read-only Wi-Fi queries use bounded
   timeouts, including a single elapsed-time budget for subprocess output
   and exit handling.
-- Restored multi-disc album sorting and "Disc N" dividers. Single-album
-  lists now sort by effective disc and track order, with untagged tracks
-  treated as disc 1; Artist "All Songs" keeps its existing album/disc order.
-- Restored asynchronous duration and codec probing for song-list rows, so
-  list construction no longer waits for every file probe. WMA fixes remain
-  unchanged.
-- Restored the optional SBC-XQ Bluetooth setting for another device test
-  alongside the UI responsiveness fixes. It uses SBC with higher encoder
-  quality for outgoing audio; Bluetooth DAC reception is unchanged.
 - Prepared a refresh of the firmware's Bluetooth audio and supporting
   libraries, led by BlueALSA 5.0.0. The player understands both the old and
   new Bluetooth tools, including their different volume-control formats.
@@ -66,5 +68,3 @@ computer connection can still trigger a scan even if no files were changed.
   retry handling when a Bluetooth software-volume command fails. Separate
   BlueZ and Wi-Fi upgrade candidates are being validated before inclusion.
 
-The base-image refresh has build and emulation checks; device playback and
-reconnect testing is still required before release.

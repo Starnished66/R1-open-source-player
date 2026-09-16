@@ -53,6 +53,32 @@ void bt_control_disable(void);
  * so callers should poll this at a throttled cadence, not every frame. */
 bool bt_control_is_connected(void);
 
+/* Like bt_control_is_connected(), but avoids the per-paired-device fork
+ * loop when the bluetoothctl on this system supports filtering `devices` by
+ * property (the same capability bt_control_list_paired_states() already
+ * detects and caches for the `Paired` filter) -- a single
+ * `bluetoothctl devices Connected` call replaces querying every paired
+ * device individually on that path. Falls back to bt_control_is_connected()
+ * only when that capability is not (yet) known to be available; a failed
+ * `devices Connected` call on a system already known to support it does
+ * NOT fall back, to avoid reintroducing the O(N) fork cost on exactly the
+ * transient failures most likely during Bluetooth power-on -- see the .c
+ * file's own comment. Returns 1/0/-1 (connected / not connected / could not
+ * determine this cycle), not a bool -- callers should keep their last known
+ * state on -1 rather than treat it as "nothing connected".
+ *
+ * Note the fast path answers a very slightly different question than the
+ * per-device path: `devices Connected` reports any currently-connected
+ * device, not only paired ones, so it can briefly disagree with
+ * bt_control_is_connected() during an in-progress pairing handshake. Given
+ * this is only used for the topbar/quick-drawer "is Bluetooth connected to
+ * something" icon (not anything pairing-sensitive), that's an accepted
+ * tradeoff, not a bug. This is what that icon refresh should poll instead of
+ * bt_control_is_connected() -- see the .c file's own comment on why the
+ * naive per-device version noticeably competes with the UI thread for CPU
+ * on systems with several paired devices. */
+int bt_control_any_paired_connected(void);
+
 /* Like bt_control_is_connected(), but returns the full per-device
  * paired/connected breakdown instead of collapsing it into a single bool --
  * see the .c file for why (avoids paying for the same per-device query loop

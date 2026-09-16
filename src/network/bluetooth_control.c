@@ -818,6 +818,36 @@ bool bt_control_is_connected(void) {
     return false;
 }
 
+/* See the header comment. bt_bluetoothctl_devices_capability is written
+ * under bt_bluetoothctl_devices_mutex by bt_control_paired_devices_argv_checked()'s
+ * one-time probe, so it must be read under that same mutex too -- copy it out
+ * and unlock before doing anything else, both because the mutex is plain
+ * (non-recursive) and the LEGACY/UNKNOWN fallback below (bt_control_is_connected())
+ * re-enters that exact probe and would self-deadlock if this still held it.
+ *
+ * Returns 1 (connected), 0 (not connected), or -1 if this cycle couldn't
+ * determine either way. -1 covers two cases: capability still UNKNOWN and
+ * bt_control_is_connected()'s own query failed, or capability is MODERN but
+ * this specific `devices Connected` call failed. The latter deliberately
+ * does NOT fall back to the O(N) per-paired-device path -- that fallback is
+ * exactly the fork storm this function exists to avoid, and a transient
+ * bluetoothctl hiccup is most likely during the same radio power-on window
+ * that storm is worst in. Callers should keep the last known state on -1,
+ * not treat it as "nothing connected". */
+int bt_control_any_paired_connected(void) {
+    pthread_mutex_lock(&bt_bluetoothctl_devices_mutex);
+    bt_bluetoothctl_devices_capability_t capability = bt_bluetoothctl_devices_capability;
+    pthread_mutex_unlock(&bt_bluetoothctl_devices_mutex);
+
+    if (capability == BT_BLUETOOTHCTL_DEVICES_MODERN) {
+        char out[512];
+        char * argv[] = { (char *) "bluetoothctl", (char *) "devices", (char *) "Connected", NULL };
+        if (subprocess_run(argv, out, sizeof(out))) return strstr(out, "Device ") != NULL ? 1 : 0;
+        return -1;
+    }
+    return bt_control_is_connected() ? 1 : 0;
+}
+
 /* Returns paired and connected state for all paired devices.
  * Returns device count, or -1 if the underlying bluetoothctl call fails. */
 int bt_control_list_paired_states(bt_device_t * out, int max_count) {

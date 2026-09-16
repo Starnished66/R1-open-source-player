@@ -991,6 +991,13 @@ static uint32_t bt_worker_launch_epoch = 0;
 static uint32_t bt_preference_epoch = 0;
 static uint32_t bt_worker_preference_epoch = 0;
 
+/* Snapshotted on the UI thread in start_refresh_bt_icon(), before the worker
+ * launches -- gui_navigation_is_top()/gui_network_get_bt_screen() touch the
+ * navigation stack and must not be called from refresh_bt_icon_thread_func()
+ * itself (a background thread), same reasoning as every other UI-state
+ * value this worker reads via a snapshot rather than a live getter. */
+static bool bt_worker_bt_screen_visible = false;
+
 /* One persisted-device reconnect attempt is armed per authoritative
  * powered-on cycle. A link loss alone must not re-arm it; only a later
  * off->on observation (or the initial powered-on observation at startup)
@@ -1077,20 +1084,37 @@ static void * refresh_bt_icon_thread_func(void * arg) {
     }
 
     if (powered) {
-        /* bt_control_list_paired_states(), not bt_control_is_connected() --
-         * same per-device `bluetoothctl info` cost either way, but this also
-         * hands back the full breakdown poll_refresh_bt_icon() merges into
-         * bt_scan_results below, instead of throwing it away. -1 (the query
-         * itself failed, not "genuinely 0 paired") is normalized to 0 here
-         * for the any_connected scan below (an empty loop either way), but
-         * poll_refresh_bt_icon() checks the raw value separately before
-         * treating "nothing here" as authoritative -- see its own comment. */
-        bt_paired_states_count = bt_control_list_paired_states(bt_paired_states_result, BT_MAX_RESULTS);
-        bool any_connected = false;
-        for (int i = 0; i < bt_paired_states_count; i++) {
-            if (bt_paired_states_result[i].connected) { any_connected = true; break; }
+        if (bt_worker_bt_screen_visible) {
+            /* bt_control_list_paired_states(), not bt_control_is_connected() --
+             * same per-device `bluetoothctl info` cost either way, but this also
+             * hands back the full breakdown poll_refresh_bt_icon() merges into
+             * bt_scan_results below, instead of throwing it away. -1 (the query
+             * itself failed, not "genuinely 0 paired") is normalized to 0 here
+             * for the any_connected scan below (an empty loop either way), but
+             * poll_refresh_bt_icon() checks the raw value separately before
+             * treating "nothing here" as authoritative -- see its own comment. */
+            bt_paired_states_count = bt_control_list_paired_states(bt_paired_states_result, BT_MAX_RESULTS);
+            bool any_connected = false;
+            for (int i = 0; i < bt_paired_states_count; i++) {
+                if (bt_paired_states_result[i].connected) { any_connected = true; break; }
+            }
+            refresh_bt_icon_result_connected = any_connected;
+        } else {
+            /* Bluetooth screen isn't open, so nothing reads the per-device
+             * breakdown this cycle -- skip the O(paired devices) fork loop
+             * entirely and ask for just the boolean the topbar icon actually
+             * needs. -1 (not -- as opposed to 0 devices/none connected --
+             * refreshed this cycle) makes poll_refresh_bt_icon() skip the
+             * bt_scan_results merge below and keep whatever it last had,
+             * same "skip merge, retain current state" convention the -1
+             * query-failure case above already relies on. */
+            bt_paired_states_count = -1;
+            int any_connected_now = bt_control_any_paired_connected();
+            /* -1 means this cycle couldn't tell (see the .c file's own
+             * comment) -- leave refresh_bt_icon_result_connected at its
+             * last known value instead of guessing "nothing connected". */
+            if (any_connected_now >= 0) refresh_bt_icon_result_connected = any_connected_now != 0;
         }
-        refresh_bt_icon_result_connected = any_connected;
     } else {
         bt_paired_states_count = 0;
         refresh_bt_icon_result_connected = false;
@@ -1106,6 +1130,7 @@ static void start_refresh_bt_icon(void) {
     refresh_bt_icon_active = true;
     bt_worker_launch_epoch = bt_disconnect_epoch;
     bt_worker_preference_epoch = bt_preference_epoch;
+    bt_worker_bt_screen_visible = gui_navigation_is_top(gui_network_get_bt_screen());
     atomic_store_explicit(&refresh_bt_icon_done_flag, false, memory_order_relaxed);
         if (pthread_create(&refresh_bt_icon_thread, NULL, refresh_bt_icon_thread_func, NULL) != 0) {
         refresh_bt_icon_active = false;

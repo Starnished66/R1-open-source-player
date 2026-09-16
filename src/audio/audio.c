@@ -124,6 +124,10 @@ typedef struct {
      * drmp3* was opened against a local file or a read callback, only
      * decoder_open()/decoder_close() need to know the difference. */
     http_stream_t * net_stream;
+
+    /* Local FLAC callback stream. dr_flac has no relaxed file convenience
+     * wrapper, so keep the FILE alive for the decoder lifetime. */
+    FILE * flac_file;
 } decoder_t;
 
 /* A stream URL is never dispatched by file extension (see decoder_open()
@@ -169,6 +173,26 @@ static drflac_bool32 flac_stream_seek_cb(void * user_data, int offset, drflac_se
         if (http_stream_read((http_stream_t *) user_data, discard, take) != take) return DRFLAC_FALSE;
         remaining -= (int) take;
     }
+    return DRFLAC_TRUE;
+}
+
+/* Use relaxed native-container parsing for local FLAC files. This tolerates
+ * damaged metadata and lets dr_flac skip malformed frames in otherwise
+ * playable files, as desktop decoders do. */
+static size_t flac_file_read_cb(void * user_data, void * buffer_out, size_t bytes_to_read) {
+    return fread(buffer_out, 1, bytes_to_read, (FILE *) user_data);
+}
+
+static drflac_bool32 flac_file_seek_cb(void * user_data, int offset, drflac_seek_origin origin) {
+    int whence = origin == DRFLAC_SEEK_SET ? SEEK_SET
+               : origin == DRFLAC_SEEK_END ? SEEK_END : SEEK_CUR;
+    return fseek((FILE *) user_data, (long) offset, whence) == 0 ? DRFLAC_TRUE : DRFLAC_FALSE;
+}
+
+static drflac_bool32 flac_file_tell_cb(void * user_data, drflac_int64 * cursor) {
+    long position = ftell((FILE *) user_data);
+    if (position < 0) return DRFLAC_FALSE;
+    *cursor = (drflac_int64) position;
     return DRFLAC_TRUE;
 }
 
@@ -288,8 +312,16 @@ static bool decoder_open(decoder_t * dec, const char * path) {
 
     if (strcasecmp(ext, ".flac") == 0) {
         dec->type = DECODER_FLAC;
-        dec->as.flac = drflac_open_file(path, NULL);
-        if (!dec->as.flac) return false;
+        dec->flac_file = fopen(path, "rb");
+        if (!dec->flac_file) return false;
+        dec->as.flac = drflac_open_relaxed(flac_file_read_cb, flac_file_seek_cb,
+                                           flac_file_tell_cb, drflac_container_native,
+                                           dec->flac_file, NULL);
+        if (!dec->as.flac) {
+            fclose(dec->flac_file);
+            dec->flac_file = NULL;
+            return false;
+        }
         dec->channels = dec->as.flac->channels;
         dec->sample_rate = dec->as.flac->sampleRate;
         dec->source_sample_rate = dec->sample_rate;
@@ -626,6 +658,7 @@ static void decoder_close(decoder_t * dec) {
     switch (dec->type) {
         case DECODER_FLAC:
             if (dec->as.flac) { drflac_close(dec->as.flac); dec->as.flac = NULL; }
+            if (dec->flac_file) { fclose(dec->flac_file); dec->flac_file = NULL; }
             if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
             break;
         case DECODER_MP3:

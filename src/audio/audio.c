@@ -189,13 +189,6 @@ static drflac_bool32 flac_file_seek_cb(void * user_data, int offset, drflac_seek
     return fseek((FILE *) user_data, (long) offset, whence) == 0 ? DRFLAC_TRUE : DRFLAC_FALSE;
 }
 
-static drflac_bool32 flac_file_tell_cb(void * user_data, drflac_int64 * cursor) {
-    long position = ftell((FILE *) user_data);
-    if (position < 0) return DRFLAC_FALSE;
-    *cursor = (drflac_int64) position;
-    return DRFLAC_TRUE;
-}
-
 static bool decoder_open(decoder_t * dec, const char * path) {
     memset(dec, 0, sizeof(*dec));
 
@@ -315,7 +308,7 @@ static bool decoder_open(decoder_t * dec, const char * path) {
         dec->flac_file = fopen(path, "rb");
         if (!dec->flac_file) return false;
         dec->as.flac = drflac_open_relaxed(flac_file_read_cb, flac_file_seek_cb,
-                                           flac_file_tell_cb, drflac_container_native,
+                                           NULL, drflac_container_native,
                                            dec->flac_file, NULL);
         if (!dec->as.flac) {
             fclose(dec->flac_file);

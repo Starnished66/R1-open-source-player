@@ -120,9 +120,37 @@ if plugin.has_capability("audio.hw_volume_curve") then
             current_mode = mode
             write_state(mode.key)
             plugin.set_hw_volume_curve(mode.curve)
+            -- Keep the quick drawer's own tile in step with a change made
+            -- here, since it reads this state rather than being pushed to.
+            if plugin.has_capability("ui.quick_toggle") then
+                plugin.set_quick_toggle("gain", mode.key == "high")
+            end
             plugin.show_toast(mode.name .. " applied")
         end, selected > 0 and { selected = selected } or nil)
     end)
+
+    -- Quick drawer tile: High/Low only, the same two modes the list offers.
+    -- Gated on the capability rather than api_min for the same reason the
+    -- whole plugin is (see the header comment) -- an older player build
+    -- simply doesn't get the tile.
+    if plugin.has_capability("ui.quick_toggle") then
+        plugin.register_quick_toggle("gain", "Gain", function(on)
+            local mode = find_mode(on and "high" or "low")
+            if not mode then return end
+            current_mode = mode
+            write_state(mode.key)
+            plugin.set_hw_volume_curve(mode.curve)
+        end, {
+            -- gain_l/gain_h rather than the usual name/name_s pair: these
+            -- two stock assets are the Low and High artwork, not an off/on
+            -- pair of one icon.
+            icon = "pull_down/gain_l.png",
+            icon_selected = "pull_down/gain_h.png",
+            value = current_mode ~= nil and current_mode.key == "high",
+            on_text = "High",
+            off_text = "Low",
+        })
+    end
 else
     plugin.show_toast("Gain Mode needs a newer player build")
 end

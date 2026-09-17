@@ -7,7 +7,7 @@
 /* Plugin API version definition.
  * Plugins can declare api_min to require specific API features.
  * Sandboxed Lua states restrict filesystem and OS execution access. */
-#define PLUGIN_API_VERSION 11
+#define PLUGIN_API_VERSION 12
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
 /* Third-party Lua plugin support. Every *.lua file under
@@ -413,6 +413,36 @@ void plugin_manager_notify_resumed(void);
 void plugin_manager_notify_stopped(void);
 void plugin_manager_notify_screen_woke(void);
 void plugin_manager_notify_queue_exhausted(int direction);
+
+/* ---- plugin.register_quick_toggle() -- a toggle in the quick drawer's
+ * expanded area (gui_shell.c's build_quick_drawer(), third toggle row),
+ * alongside the native Wifi/Bluetooth/Sleep/Crossfade ones. For a plugin
+ * whose feature is a plain on/off the user wants to reach without walking
+ * into Settings (an MSEB-style tone tuner, a gain-mode switch). A plugin
+ * that wants a full screen instead still uses register_list_item(). ---- */
+
+/* Fills exactly the drawer's third toggle row (the same 4-column grid the
+ * native row uses), across every loaded plugin combined. */
+#define PLUGIN_MAX_QUICK_TOGGLES 4
+
+int plugin_manager_get_quick_toggle_count(void);
+const char * plugin_manager_get_quick_toggle_label(int index);
+const char * plugin_manager_get_quick_toggle_icon(int index);
+const char * plugin_manager_get_quick_toggle_icon_selected(int index);
+
+/* Caption shown under the icon for the given state -- "On"/"Off" unless the
+ * plugin passed its own (GainMode uses "High"/"Low"). */
+const char * plugin_manager_get_quick_toggle_state_text(int index, bool on);
+
+/* Last value the plugin published, via the registration's `value` or a later
+ * plugin.set_quick_toggle(). The drawer re-reads these on open rather than
+ * being pushed to, so a change made inside the plugin's own settings screen
+ * shows up the next time the drawer is pulled down. */
+bool plugin_manager_get_quick_toggle_value(int index);
+
+/* Stores `new_value` and calls that toggle's on_change(new_value). Invoked by
+ * the drawer when the user taps it. */
+void plugin_manager_quick_toggle_set(int index, bool new_value);
 
 /* Invoked by gui.c's shared plugin-interval lv_timer callback when the
  * timer for pool slot `slot` (plugin_interval_timers[], gui.c) fires --

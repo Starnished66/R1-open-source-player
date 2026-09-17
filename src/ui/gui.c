@@ -768,8 +768,9 @@ static void update_timer_cb(lv_timer_t * timer) {
 
     bool screen_was_on = backlight_screen_is_on();
 
-    /* Power-button events are consumed by power_button_timer_cb(). */
-    poll_power_off_countdown();
+    /* Power-button events are consumed by power_button_timer_cb(). The power
+     * action overlay itself has no timer to poll -- Power Off/Reboot fire
+     * immediately on tap. */
 
     uint32_t screen_inactive_ms = lv_display_get_inactive_time(NULL);
     if (interactive_ui_started) {

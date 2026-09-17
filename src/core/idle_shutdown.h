@@ -18,4 +18,10 @@
  * on host. */
 void idle_shutdown_now(void);
 
+/* Same mechanism as idle_shutdown_now() (busybox first, raw reboot()
+ * syscall as fallback, never returns on the device) but for a normal
+ * restart instead of a full poweroff -- same /sbin/reboot + RB_AUTOBOOT
+ * pattern settings.c's factory reset already uses. No-op on host. */
+void idle_shutdown_reboot_now(void);
+
 #endif /* IDLE_SHUTDOWN_H */

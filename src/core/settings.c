@@ -636,8 +636,20 @@ void settings_factory_reset(void) {
     remove(SETTINGS_TMP_FILE_PATH); /* stray leftover from an interrupted settings_save(), if any -- harmless to attempt even when it doesn't exist */
 
 #ifndef HOST_BUILD
+    /* Not execl("/sbin/reboot", ...): open_hiby_bootloader's
+     * run_player_supervised() (src/bootloader/main.c) treats ANY clean
+     * (status 0) exit of this exact supervised PID as "player exited
+     * cleanly -- power off", regardless of which command replaced this
+     * process's image. /sbin/reboot typically exits 0 once it hands off to
+     * init, well before the actual kernel restart completes, so the
+     * bootloader's poweroff-on-clean-exit races ahead of and wins over the
+     * real reboot -- this was the reported "factory reset just shuts down
+     * instead of rebooting" bug. Calling reboot(2) directly, same as
+     * main.c's own reboot_device() already does for every other abnormal-
+     * exit reboot, restarts the kernel immediately from within this
+     * process instead of handing off through an external command whose
+     * exit status the supervisor can misread. */
     sync();
-    execl("/sbin/reboot", "reboot", (char *) NULL);
     reboot(RB_AUTOBOOT);
     for (;;) pause();
 #endif

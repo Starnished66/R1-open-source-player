@@ -220,7 +220,7 @@ from the moment your script starts running (injected before
 | Area | Main APIs |
 |---|---|
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info`, `media_capabilities` |
-| UI | `register_list_item`, `register_stream_media_tile`, `register_home_tile`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
+| UI | `register_list_item`, `register_stream_media_tile`, `register_home_tile`, `register_quick_toggle`, `set_quick_toggle`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
 | Theme | `set_icon`, `set_background_color`, `set_text_color`, `set_home_layout`, `refresh_theme`, `reload_ui` |
 | Playback | `play_file`, `play_list`, `play_remote`, `queue_remote_list`, transport controls, playback state |
 | Files & Playlists | `sd_root`, `list_dir`, `mkdir`, `playlist_list`, `playlist_read`, `playlist_create`, `playlist_add`, `playlist_remove`, `playlist_delete` |
@@ -259,7 +259,7 @@ plugin's own file path (stable across reloads) rather than by load order.
 Existing plugins without `define()` remain supported as legacy plugins
 using an identity derived from their filename.
 
-- `plugin.api_version()` returns the current integer plugin API version (currently `4`).
+- `plugin.api_version()` returns the current integer plugin API version (currently `12`).
 - `plugin.has_capability(name)` reports whether an optional interface exists.
   Supported capability tokens:
   - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`, `ui.launcher_layout`, `ui.home_background`, `ui.lock_screen`
@@ -368,6 +368,62 @@ device's Low/Medium/High Gain modes. Purely additive, no breaking changes
 bundled into this window. A plugin that only needs this can feature-detect
 it with `plugin.has_capability("audio.hw_volume_curve")` instead of
 bumping `api_min`.
+
+#### API version 12 changelog
+
+New in API 12: `plugin.register_quick_toggle()` and
+`plugin.set_quick_toggle()` (see their own doc section below) -- put an
+on/off tile in the quick drawer's expanded area, alongside the built-in
+Wi-Fi/Bluetooth/Sleep/Crossfade ones. Purely additive, no breaking changes
+bundled into this window. A plugin that only needs this can feature-detect
+it with `plugin.has_capability("ui.quick_toggle")` instead of bumping
+`api_min`.
+
+### `plugin.register_quick_toggle(id, label, on_change, options)`
+
+Adds a tile to the quick drawer's expanded area -- pull the drawer down,
+then drag the small handle below the first toggle row. For a feature that
+is a plain on/off the user wants to reach without walking into Settings.
+A plugin that needs a whole screen should use `register_list_item()`
+instead.
+
+At most four plugin tiles exist across all plugins combined; they fill the
+drawer's third row in registration order. With none registered, the drawer
+simply expands by one row instead of two.
+
+- `id` -- 1-39 characters, letters/digits/`.`/`_`/`-`. Must be unique.
+- `label` -- caption under the icon. Keep it short: the slot is 84px wide
+  and uses a fixed 12px font, so roughly 8 characters fit.
+- `on_change(new_value)` -- called with the new boolean when tapped.
+- `options.icon` -- **required**, the off-state image, under 80 characters.
+- `options.icon_selected` -- on-state image. Defaults to `icon` with its
+  extension replaced by `_s.png`, the convention the bundled artwork uses.
+  The on-state image is automatically recolored to the user's accent color.
+- `options.value` -- initial state, default `false`.
+- `options.on_text` / `options.off_text` -- state caption under the label,
+  default `"On"` / `"Off"`.
+
+```lua
+if plugin.has_capability("ui.quick_toggle") then
+    plugin.register_quick_toggle("mseb", "MSEB", function(on)
+        set_enabled(on)
+    end, {
+        icon = "pull_down/mseb.png",
+        value = enabled,
+    })
+end
+```
+
+### `plugin.set_quick_toggle(id, value)`
+
+Publishes a state change the plugin made on its own, so the drawer shows it
+next time it is expanded. Does **not** fire `on_change` -- the plugin is the
+one reporting the change, so calling back into it would loop. Call this
+whenever the same setting is changed from somewhere else in the plugin (its
+own settings screen, say), or the drawer's tile will drift out of step.
+
+The drawer re-reads every tile's value when the expansion opens rather than
+being pushed to, so this only needs to keep the stored value current.
 
 <a id="plugin-ui"></a>
 

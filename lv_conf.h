@@ -17,12 +17,29 @@
  * (no GPU), this just stops LVGL from artificially waiting past that. */
 #define LV_DEF_REFR_PERIOD 16
 
+/* lv_obj_scroll.c's own overscroll-snap-back animation duration, clamped
+ * between these two (distance-scaled via lv_anim_speed_clamped) -- LVGL's
+ * built-in defaults are 200-400ms. Real-hardware feedback on the list
+ * submenus (Settings rows, etc.) was that the snap-back after an overscroll
+ * bounce read as sluggish/laggy at those defaults; halving both keeps the
+ * same distance-based scaling and an animated (not instant) snap, just
+ * snappier. Paired with lv_indev_scroll.c's own ELASTIC_SLOWNESS_FACTOR
+ * (hand-tuned directly in that vendored file -- LVGL exposes no config
+ * override for it) for the "way overshot" half of the same bug report. */
+#define SCROLL_ANIM_TIME_MIN 100
+#define SCROLL_ANIM_TIME_MAX 200
+
 /* Memory management: Use standard C library functions */
 #define LV_USE_STDLIB_MALLOC  LV_STDLIB_CLIB
 #define LV_USE_STDLIB_STRING  LV_STDLIB_CLIB
 #define LV_USE_STDLIB_SPRINTF LV_STDLIB_CLIB
 
 /* Enable built-in fonts we want to use in our UI */
+#define LV_FONT_MONTSERRAT_12 1 /* quick drawer toggle name/state captions --
+                                  * fixed, non-scaling (like build_status_bar()'s
+                                  * own clock/volume/battery faces), so they
+                                  * still fit their 84px slot under the icon
+                                  * regardless of the Settings > Font Size tier */
 #define LV_FONT_MONTSERRAT_16 1
 #define LV_FONT_MONTSERRAT_20 1 /* status bar text, 16*1.25 -- see build_status_bar() */
 #define LV_FONT_MONTSERRAT_22 1 /* touch_list rows (Artists/Albums/Songs/...) -- see LIST_ROW_FONT */

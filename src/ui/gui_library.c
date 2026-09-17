@@ -6,6 +6,9 @@
 #include "backlight.h"
 #include "usb_mode_control.h"
 #include "gui_player.h"
+#include "frosted_glass.h"
+#include "src/draw/lv_draw_buf.h"
+#include "src/draw/snapshot/lv_snapshot.h"
 
 extern void on_file_browser_selected(char ** new_playlist, int count, int selected_index);
 extern void open_queue_screen(void);
@@ -2664,6 +2667,9 @@ static int az_index_registered_count = 0;
 static lv_timer_t * az_index_visibility_timer;
 static az_index_binding_t * az_index_visibility_binding;
 static bool az_index_dragging;
+/* Whether this press's origin has already been judged against the strip --
+ * see poll_az_index_drag()'s own comment on deciding ownership once. */
+static bool az_index_press_judged;
 
 #define AZ_INDEX_HIDE_DELAY_MS 900
 
@@ -2800,15 +2806,29 @@ void poll_az_index_drag(lv_timer_t * timer) {
     if (!az_index_dragging) {
         /* Only paused here (truly idle -- resumed on the next press-down by
          * resume_fast_gesture_timers_cb(), see this timer's own handle
-         * comment) and in the just-released branch below, not in either
-         * return just past this one: those happen mid-press (on a screen/
-         * area with no A-Z strip *yet*), and a press can still slide into
-         * the strip's own bounds before it lifts -- pausing there would
-         * stop catching that. */
+         * comment) and in the just-released branch below. */
         if (!pressed) {
+            az_index_press_judged = false;
             lv_timer_pause(timer);
             return;
         }
+        /* Ownership is decided ONCE, at press-down: the strip only takes a
+         * drag that actually started on it.
+         *
+         * This used to re-test the live touch point on every tick, on
+         * purpose, so that a press begun before the strip appeared could
+         * still slide into it. The cost of that was GitHub #84: an ordinary
+         * upward list swipe that drifts rightward lands in the strip near
+         * the end of its travel, silently changes owner, and jumps the list
+         * to a letter. Deciding at press-down is the same latching
+         * drag_adjust_press_owned (gui_shell.c) already uses for sliders,
+         * and it is what the report itself asked for. The press-begun-
+         * before-the-strip-appeared case is given up deliberately: the
+         * strip is not on screen to aim at then anyway, so nothing is lost
+         * that the user could have been aiming for. */
+        if (az_index_press_judged) return;
+        az_index_press_judged = true;
+
         az_index_binding_t * b = find_az_binding_for_screen(lv_screen_active());
         if (!b) return;
         if (lv_obj_has_flag(b->strip, LV_OBJ_FLAG_HIDDEN)) return;
@@ -2831,6 +2851,7 @@ void poll_az_index_drag(lv_timer_t * timer) {
         lv_obj_add_flag(az_index_active_binding->popup, LV_OBJ_FLAG_HIDDEN);
         az_index_dragging = false;
         az_index_active_binding = NULL;
+        az_index_press_judged = false;
         lv_timer_pause(timer);
         return;
     }
@@ -4530,121 +4551,217 @@ static void build_sd_format_confirm_popup(void) {
         NULL, sd_format_confirm_popup_backdrop_cb, &sd_format_confirm_popup.backdrop);
 }
 
-/* Power-off countdown -- shown when hw_buttons_consume_power_long_press()
+/* Power action overlay -- shown when hw_buttons_consume_power_long_press()
  * fires (see update_timer_cb()'s own consumer block). Same lv_layer_top()
  * overlay shape as sd_mount_failed_popup/sd_format_confirm_popup above,
  * built once and shown/hidden by flag rather than nav_push()'d, so it can
- * appear over whatever screen is currently active. Unlike those two, the
- * countdown itself isn't tied to the popup being visible for any particular
- * duration on its own -- poll_power_off_countdown() (called every tick from
- * update_timer_cb) drives it, and idle_shutdown_now() at zero doesn't
- * return on a real device, so there's no explicit "now power off" call site
- * beyond that. */
-#define POWER_OFF_COUNTDOWN_SECONDS 3
+ * appear over whatever screen is currently active. Unlike the countdown
+ * this replaced, there is no timer and no implicit action: Power Off and
+ * Reboot both fire immediately on tap (idle_shutdown_now()/
+ * idle_shutdown_reboot_now(), neither of which returns on a real device),
+ * and tapping anywhere else dismisses with no action taken. */
+static gui_popup_t power_action_overlay;
+static lv_obj_t * power_action_blur_img;
+static uint8_t * power_action_blur_bytes;
+static lv_image_dsc_t power_action_blur_dsc;
 
-static gui_popup_t power_off_countdown_popup;
-static lv_obj_t * power_off_countdown_label;
-static bool power_off_countdown_active = false;
-static uint32_t power_off_countdown_start_tick;
+#define POWER_OVERLAY_BLUR_WORK_WIDTH 60
+#define POWER_OVERLAY_BLUR_WORK_HEIGHT 100
+#define POWER_OVERLAY_BLUR_RADIUS 5
+#define POWER_OVERLAY_BLUR_PASSES 3
+#define POWER_OVERLAY_DARKEN_NUM 3
+#define POWER_OVERLAY_DARKEN_DEN 5
 
-static void hide_power_off_countdown_popup(void) {
-    gui_popup_hide(&power_off_countdown_popup);
-}
-
-static void cancel_power_off_countdown(void) {
-    power_off_countdown_active = false;
-    hide_power_off_countdown_popup();
-}
-
-static void power_off_countdown_backdrop_cb(lv_event_t * e) {
+static void power_action_backdrop_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    cancel_power_off_countdown();
+    gui_popup_hide(&power_action_overlay);
 }
 
-static void power_off_countdown_cancel_cb(lv_event_t * e) {
+static void power_action_power_off_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    cancel_power_off_countdown();
+    idle_shutdown_now(); /* does not return on a real device */
+}
+
+static void power_action_reboot_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    idle_shutdown_reboot_now(); /* does not return on a real device */
 }
 
 void start_power_off_countdown(void) {
-    power_off_countdown_active = true;
-    power_off_countdown_start_tick = lv_tick_get();
-    lv_label_set_text_fmt(power_off_countdown_label, "%d", POWER_OFF_COUNTDOWN_SECONDS);
-    gui_popup_show(&power_off_countdown_popup);
+    /* Snapshot+blur whatever screen is currently behind the overlay fresh
+     * on every show -- it can be a different screen each time, and this is
+     * cheap enough (tiny work buffer) to do synchronously right before
+     * gui_popup_show() rather than showing a stale or blank backdrop for a
+     * frame while an async job catches up. */
+    uint8_t * bytes = frosted_glass_blur_screen_rgb565(lv_screen_active(),
+        POWER_OVERLAY_BLUR_WORK_WIDTH, POWER_OVERLAY_BLUR_WORK_HEIGHT,
+        POWER_OVERLAY_BLUR_RADIUS, POWER_OVERLAY_BLUR_PASSES,
+        POWER_OVERLAY_DARKEN_NUM, POWER_OVERLAY_DARKEN_DEN,
+        BOARD_SCREEN_WIDTH, BOARD_SCREEN_HEIGHT);
+    if (bytes) {
+        free(power_action_blur_bytes);
+        power_action_blur_bytes = bytes;
+        memset(&power_action_blur_dsc, 0, sizeof(power_action_blur_dsc));
+        power_action_blur_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        power_action_blur_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        power_action_blur_dsc.header.w = BOARD_SCREEN_WIDTH;
+        power_action_blur_dsc.header.h = BOARD_SCREEN_HEIGHT;
+        power_action_blur_dsc.header.stride = BOARD_SCREEN_WIDTH * 2;
+        power_action_blur_dsc.data = power_action_blur_bytes;
+        power_action_blur_dsc.data_size = (uint32_t) BOARD_SCREEN_WIDTH * BOARD_SCREEN_HEIGHT * 2;
+        if (power_action_blur_img) {
+            lv_image_set_src(power_action_blur_img, &power_action_blur_dsc);
+            lv_obj_remove_flag(power_action_blur_img, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else if (power_action_blur_img) {
+        /* Snapshot or allocation failed -- hide rather than show a stale
+         * frame from a previous, unrelated screen. The backdrop's own
+         * black tint still shows through, so the overlay is not blank. */
+        lv_obj_add_flag(power_action_blur_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    gui_popup_show(&power_action_overlay);
 }
 
-/* Called every tick from update_timer_cb while power_off_countdown_active --
- * updates the on-screen seconds-remaining label, and calls idle_shutdown_now()
- * once the countdown reaches zero (only reachable by letting it run out;
- * tapping Cancel or the backdrop aborts it first, via
- * cancel_power_off_countdown() above). */
-void poll_power_off_countdown(void) {
-    if (!power_off_countdown_active) return;
+#define POWER_ACTION_ICON_PX 150
 
-    uint32_t elapsed_ms = lv_tick_elaps(power_off_countdown_start_tick);
-    uint32_t total_ms = (uint32_t) POWER_OFF_COUNTDOWN_SECONDS * 1000;
-    if (elapsed_ms >= total_ms) {
-        power_off_countdown_active = false;
-        idle_shutdown_now(); /* does not return on a real device */
-        return;
+/* True if icon_path actually resolves to a real file (override or stock),
+ * not just a path string asset_path() is always willing to hand back --
+ * skips the "S:" LVGL POSIX-driver prefix asset_path() adds before the
+ * access() check. These two icons ship as separate PNG assets outside the
+ * normal firmware pack (see the .png files' own commit); a build or device
+ * that never received them must still show a usable, clearly-labeled
+ * button instead of a blank image with a tiny caption under it. */
+static bool power_action_icon_exists(const char * icon_path) {
+    const char * resolved = asset_path(icon_path);
+    if (resolved[0] == 'S' && resolved[1] == ':') resolved += 2;
+    return access(resolved, R_OK) == 0;
+}
+
+static lv_obj_t * add_power_action_button(lv_obj_t * zone, const char * icon_path,
+                                          const char * label_text, lv_event_cb_t cb) {
+    bool have_icon = power_action_icon_exists(icon_path);
+
+    /* Taller when the icon is present -- room for the caption label below
+     * it (icon + gap + one text line), same idea as the fallback card's
+     * own sizing just below. */
+    lv_obj_t * btn = lv_obj_create(zone);
+    lv_obj_set_size(btn, BOARD_SCALE_PX(POWER_ACTION_ICON_PX),
+                    BOARD_SCALE_PX(have_icon ? POWER_ACTION_ICON_PX + 50 : 60));
+    lv_obj_center(btn);
+    lv_obj_set_style_bg_opa(btn, 0, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
+    lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+    if (have_icon) {
+        lv_obj_t * icon = lv_image_create(btn);
+        lv_image_set_src(icon, asset_path(icon_path));
+        lv_image_set_inner_align(icon, LV_IMAGE_ALIGN_CENTER);
+        /* Explicit size alongside scale, not scale alone -- same pairing
+         * layout_lucide_topbar_image() (gui_shell.c) already relies on;
+         * scale-only left the widget's own layout box at its pre-scale
+         * footprint, so it only ever painted a thin sliver of the source
+         * image instead of the intended ~150px badge. */
+        lv_image_set_scale(icon, (BOARD_SCALE_PX(POWER_ACTION_ICON_PX) * LV_SCALE_NONE + 256) / 512);
+        lv_obj_set_size(icon, BOARD_SCALE_PX(POWER_ACTION_ICON_PX), BOARD_SCALE_PX(POWER_ACTION_ICON_PX));
+        lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 0);
+
+        lv_obj_t * label = lv_label_create(btn);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+        lv_label_set_text(label, label_text);
+        lv_obj_align_to(label, icon, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(10));
+    } else {
+        /* No icon asset available -- the label alone is the whole button,
+         * so it needs to read as tappable on its own: bigger text, plus a
+         * simple pill background instead of relying on an icon to carry
+         * the visual weight. */
+        lv_obj_t * label = lv_label_create(btn);
+        lv_obj_add_style(label, &style_theme_text_primary, 0);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+        lv_label_set_text(label, label_text);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_add_style(btn, &style_theme_card_bg, 0);
+        lv_obj_set_style_radius(btn, BOARD_SCALE_PX(28), 0);
+        lv_obj_center(label);
     }
 
-    int seconds_left = (int) ((total_ms - elapsed_ms + 999) / 1000);
-    lv_label_set_text_fmt(power_off_countdown_label, "%d", seconds_left);
+    return btn;
 }
 
 void build_power_off_countdown_popup(void) {
-    lv_obj_t * top = lv_layer_top();
+    /* lv_layer_sys(), not lv_layer_top() -- the status bar band lives on
+     * lv_layer_top() and several places in gui_shell.c explicitly
+     * re-foreground it above every other lv_layer_top() sibling (quick
+     * drawer, drag motion, etc: "the status bar stays above THAT"), which
+     * fought back against this popup's own one-time move-to-foreground and
+     * left the status bar rendering uncovered/unblurred as a strip across
+     * the top. lv_layer_sys() is documented as always above both the
+     * normal screen AND lv_layer_top(), so this needs no z-order fight at
+     * all -- already the pattern used elsewhere in this codebase (see
+     * gui_lyrics.c/gui_network.c/gui_settings.c's own mask objects) for
+     * anything that must cover literally everything. */
+    lv_obj_t * top = lv_layer_sys();
 
-    power_off_countdown_popup.backdrop = lv_obj_create(top);
-    lv_obj_set_size(power_off_countdown_popup.backdrop, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(power_off_countdown_popup.backdrop, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(power_off_countdown_popup.backdrop, LV_OPA_50, 0);
-    lv_obj_set_style_border_width(power_off_countdown_popup.backdrop, 0, 0);
-    lv_obj_remove_flag(power_off_countdown_popup.backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(power_off_countdown_popup.backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(power_off_countdown_popup.backdrop, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(power_off_countdown_popup.backdrop, power_off_countdown_backdrop_cb, LV_EVENT_CLICKED, NULL);
+    power_action_overlay.backdrop = lv_obj_create(top);
+    lv_obj_set_size(power_action_overlay.backdrop, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(power_action_overlay.backdrop, lv_color_black(), 0);
+    /* Light residual tint over the frosted-glass backdrop image below, for
+     * legibility -- the blur itself already darkens the snapshot (see
+     * POWER_OVERLAY_DARKEN_NUM/DEN), so this is deliberately much lower
+     * than a flat, image-less overlay would need. */
+    lv_obj_set_style_bg_opa(power_action_overlay.backdrop, 76, 0); /* 30% -- LV_OPA_* presets only cover multiples of 10 */
+    lv_obj_set_style_border_width(power_action_overlay.backdrop, 0, 0);
+    /* Default theme padding otherwise insets LV_ALIGN_TOP_LEFT-positioned
+     * children (power_action_blur_img below) from the content area, not
+     * the true outer edge -- left the blurred backdrop image short of the
+     * real top-left corner while its fixed BOARD_SCREEN_WIDTH/HEIGHT size
+     * pushed it past the opposite edges instead of just resizing. */
+    lv_obj_set_style_pad_all(power_action_overlay.backdrop, 0, 0);
+    lv_obj_remove_flag(power_action_overlay.backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(power_action_overlay.backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(power_action_overlay.backdrop, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(power_action_overlay.backdrop, power_action_backdrop_cb, LV_EVENT_CLICKED, NULL);
 
-    power_off_countdown_popup.popup = lv_obj_create(top);
-    lv_obj_set_size(power_off_countdown_popup.popup, BOARD_SCALE_PX(320), BOARD_SCALE_PX(280));
-    lv_obj_align(power_off_countdown_popup.popup, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(power_off_countdown_popup.popup, 16, 0);
-    lv_obj_add_style(power_off_countdown_popup.popup, &style_theme_card_bg, 0);
-    lv_obj_set_style_bg_opa(power_off_countdown_popup.popup, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(power_off_countdown_popup.popup, 0, 0);
-    lv_obj_remove_flag(power_off_countdown_popup.popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(power_off_countdown_popup.popup, LV_OBJ_FLAG_HIDDEN);
+    /* Bottom-most child (created first, so later zones/buttons draw on top
+     * of it) -- filled in fresh on every start_power_off_countdown() call
+     * with a blurred snapshot of whichever screen is behind the overlay at
+     * that moment. Hidden until the first real snapshot lands. */
+    power_action_blur_img = lv_image_create(power_action_overlay.backdrop);
+    lv_obj_set_size(power_action_blur_img, BOARD_SCREEN_WIDTH, BOARD_SCREEN_HEIGHT);
+    lv_obj_align(power_action_blur_img, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_remove_flag(power_action_blur_img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(power_action_blur_img, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t * title = lv_label_create(power_off_countdown_popup.popup);
-    lv_obj_set_width(title, lv_pct(90));
-    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_style(title, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(title, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, BOARD_SCALE_PX(20));
-    lv_label_set_text(title, "Powering Off");
+    /* One half-height, full-width, non-clickable zone per button --
+     * centering the button within it via lv_obj_center() guarantees an
+     * exact upper/lower half split regardless of screen resolution. Not
+     * clickable itself so a tap anywhere in a zone outside the button falls
+     * through to the backdrop behind it (LVGL skips non-clickable objects
+     * during hit-testing), giving the same "tap the background to dismiss"
+     * behavior as every other popup here without needing a second explicit
+     * hit-test region. */
+    lv_obj_t * upper_zone = lv_obj_create(power_action_overlay.backdrop);
+    lv_obj_set_size(upper_zone, lv_pct(100), lv_pct(50));
+    lv_obj_align(upper_zone, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_opa(upper_zone, 0, 0);
+    lv_obj_set_style_border_width(upper_zone, 0, 0);
+    lv_obj_remove_flag(upper_zone, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(upper_zone, LV_OBJ_FLAG_CLICKABLE);
+    add_power_action_button(upper_zone, "power_action/power.png", "Power Off", power_action_power_off_cb);
 
-    power_off_countdown_label = lv_label_create(power_off_countdown_popup.popup);
-    lv_obj_add_style(power_off_countdown_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(power_off_countdown_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
-    lv_obj_align(power_off_countdown_label, LV_ALIGN_CENTER, 0, BOARD_SCALE_PX(-10));
-    lv_label_set_text_fmt(power_off_countdown_label, "%d", POWER_OFF_COUNTDOWN_SECONDS);
-
-	lv_obj_t * cancel_row = lv_obj_create(power_off_countdown_popup.popup);
-	lv_obj_set_size(cancel_row, lv_pct(90), BOARD_SCALE_PX(56));
-	lv_obj_align(cancel_row, LV_ALIGN_BOTTOM_MID, 0, BOARD_SCALE_PX(-20));
-    lv_obj_set_style_radius(cancel_row, 12, 0);
-    lv_obj_set_style_bg_opa(cancel_row, 0, 0);
-    lv_obj_set_style_border_width(cancel_row, 0, 0);
-    lv_obj_remove_flag(cancel_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(cancel_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(cancel_row, power_off_countdown_cancel_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t * cancel_label = lv_label_create(cancel_row);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_color(cancel_label, accent_lv_color(), 0);
-    lv_obj_set_style_text_font(cancel_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_center(cancel_label);
+    lv_obj_t * lower_zone = lv_obj_create(power_action_overlay.backdrop);
+    lv_obj_set_size(lower_zone, lv_pct(100), lv_pct(50));
+    lv_obj_align(lower_zone, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(lower_zone, 0, 0);
+    lv_obj_set_style_border_width(lower_zone, 0, 0);
+    lv_obj_remove_flag(lower_zone, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(lower_zone, LV_OBJ_FLAG_CLICKABLE);
+    add_power_action_button(lower_zone, "power_action/reboot.png", "Reboot", power_action_reboot_cb);
 }
 
 void update_music_database_row_cb(lv_event_t * e) {
@@ -5364,19 +5481,11 @@ void gui_library_teardown(void) {
     gui_popup_teardown(&playlist_delete_popup);
     if (playlist_context_menu_popup) { lv_obj_delete(playlist_context_menu_popup); playlist_context_menu_popup = NULL; }
     if (playlist_context_menu_backdrop) { lv_obj_delete(playlist_context_menu_backdrop); playlist_context_menu_backdrop = NULL; }
-    /* poll_power_off_countdown() runs every tick from update_timer_cb,
-     * which this reload never touches or pauses -- if a countdown is live
-     * when a reload happens, deleting power_off_countdown_popup/backdrop
-     * below without this would leave power_off_countdown_active true and
-     * power_off_countdown_start_tick unchanged, so the countdown keeps
-     * running against a freshly rebuilt (and therefore hidden-by-default)
-     * popup with no visible warning at all, and still calls
-     * idle_shutdown_now() once it reaches zero -- an invisible, surprise
-     * power-off. cancel_power_off_countdown() is the same function Cancel/
-     * the backdrop tap already uses, so this is exactly "the user cancelled
-     * it," not a new code path. */
-    library_teardown_diag("cancel_power_off_countdown before");
-    cancel_power_off_countdown();
+    library_teardown_diag("power_action_overlay before");
+    gui_popup_teardown(&power_action_overlay);
+    power_action_blur_img = NULL; /* child of backdrop -- already deleted by the teardown above */
+    free(power_action_blur_bytes);
+    power_action_blur_bytes = NULL;
     library_teardown_diag("sd_mount_failed_popup before");
     gui_popup_teardown(&sd_mount_failed_popup);
     library_teardown_diag("sd_format_confirm_popup before");
@@ -5437,14 +5546,16 @@ void gui_library_teardown(void) {
     album_thumbnail_active_list = NULL;
     album_thumbnail_result_list = NULL;
     /* build_power_off_countdown_popup() -- called separately from gui_init()
-     * (not from gui_library_init()), but its two lv_layer_top() objects are
+     * (not from gui_library_init()), but its lv_layer_top() objects are
      * still this file's own statics to own and delete. Left out, a visible
-     * (if currently hidden) old popup/backdrop pair would linger above the
-     * rebuilt UI forever, invisible only until the next power-off countdown
+     * (if currently hidden) old overlay would linger above the rebuilt UI
+     * forever, invisible only until the next power-button long-press
      * actually shows it. */
-    library_teardown_diag("power_off_countdown_popup before");
-    gui_popup_teardown(&power_off_countdown_popup);
-    power_off_countdown_label = NULL;
+    library_teardown_diag("power_action_overlay before");
+    gui_popup_teardown(&power_action_overlay);
+    power_action_blur_img = NULL; /* child of backdrop -- already deleted by the teardown above */
+    free(power_action_blur_bytes);
+    power_action_blur_bytes = NULL;
     library_teardown_diag("done");
 }
 
@@ -5461,6 +5572,12 @@ void gui_library_reset_drag_state(void) {
         az_index_active_binding = NULL;
     }
     az_index_dragging = false;
+    /* Safe to clear even mid-press: this pauses the timer below, and it is
+     * only ever resumed on a raw press-DOWN edge (gui_shell.c's indev
+     * hooks), so the remainder of an in-flight press cannot be re-judged at
+     * a drifted position. Leaving it set would instead disable the strip
+     * for the whole of the NEXT press. */
+    az_index_press_judged = false;
     if (az_index_drag_timer) {
         lv_timer_pause(az_index_drag_timer);
     }

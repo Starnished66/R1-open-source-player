@@ -223,6 +223,25 @@ static int plugin_stream_tile_count = 0;
 static plugin_tile_t plugin_home_tiles[PLUGIN_MAX_HOME_TILES];
 static int plugin_home_tile_count = 0;
 
+/* Registry for plugin.register_quick_toggle() -- its own struct rather than
+ * plugin_tile_t because a quick toggle carries live state (value) and two
+ * state captions a tile has no concept of, and its Lua ref is an
+ * on_change(new_value) rather than a no-arg on_open. */
+typedef struct {
+    lua_State * L;
+    int change_ref; /* LUA_REGISTRYINDEX ref to the on_change function */
+    char id[40];
+    char label[64];
+    char icon[96];
+    char icon_selected[96];
+    char on_text[16];
+    char off_text[16];
+    bool value;
+} plugin_quick_toggle_t;
+
+static plugin_quick_toggle_t plugin_quick_toggles[PLUGIN_MAX_QUICK_TOGGLES];
+static int plugin_quick_toggle_count = 0;
+
 /* Each reusable plugin.show_list() screen owns its on_select callback. This
  * matters after Back returns from a nested list: the older screen must route
  * through its original callback, not whichever list was opened most recently. */
@@ -706,6 +725,112 @@ static int l_plugin_register_home_tile(lua_State * L) {
     if (dot) *dot = '\0';
     snprintf(t->icon, sizeof(t->icon), "%s", icon);
     snprintf(t->icon_selected, sizeof(t->icon_selected), "%s_s.png", base);
+    return 0;
+}
+
+static int plugin_find_quick_toggle_by_id(const char * id) {
+    if (!id) return -1;
+    for (int i = 0; i < plugin_quick_toggle_count; i++) {
+        if (strcmp(plugin_quick_toggles[i].id, id) == 0) return i;
+    }
+    return -1;
+}
+
+/* plugin.register_quick_toggle(id, label, on_change, options) -- adds an
+ * on/off tile to the quick drawer's expanded third row. `options` carries
+ * icon (required), plus the optional icon_selected / value / on_text /
+ * off_text. Same id rules as register_home_tile(); the "_s.png" sibling is
+ * derived from `icon` the same way unless icon_selected says otherwise, so
+ * a plugin shipping the usual pair only names one path. */
+static int l_plugin_register_quick_toggle(lua_State * L) {
+    const char * id = luaL_checkstring(L, 1);
+    const char * label = luaL_checkstring(L, 2);
+    luaL_checktype(L, 3, LUA_TFUNCTION);
+
+    if (!plugin_id_is_valid(id) || strlen(id) >= sizeof(plugin_quick_toggles[0].id)) {
+        return luaL_error(L, "plugin.register_quick_toggle: id must be 1-%zu characters using letters, digits, '.', '_' or '-'",
+                          sizeof(plugin_quick_toggles[0].id) - 1);
+    }
+    if (plugin_find_quick_toggle_by_id(id) >= 0) {
+        return luaL_error(L, "plugin.register_quick_toggle: id '%s' is already registered", id);
+    }
+    if (plugin_quick_toggle_count >= PLUGIN_MAX_QUICK_TOGGLES) {
+        return luaL_error(L, "too many quick toggles registered (max %d)", PLUGIN_MAX_QUICK_TOGGLES);
+    }
+    if (lua_gettop(L) < 4 || !lua_istable(L, 4)) {
+        return luaL_error(L, "plugin.register_quick_toggle: options table with an `icon` is required");
+    }
+
+    lua_getfield(L, 4, "icon");
+    const char * icon = lua_tostring(L, -1);
+    /* Same 80-byte ceiling and same reason as register_home_tile()'s own
+     * check -- the extension strip below runs through a shorter scratch
+     * buffer than the stored path. */
+    if (!icon || icon[0] == '\0' || strlen(icon) >= 80) {
+        lua_pop(L, 1);
+        return luaL_error(L, "plugin.register_quick_toggle: icon must be a non-empty path under 80 characters");
+    }
+    /* 80, matching the length check above, so the extension-strip copy below
+     * is same-size and cannot truncate. */
+    char icon_copy[80];
+    snprintf(icon_copy, sizeof(icon_copy), "%s", icon);
+    lua_pop(L, 1);
+
+    plugin_quick_toggle_t * t = &plugin_quick_toggles[plugin_quick_toggle_count];
+
+    char base[80];
+    snprintf(base, sizeof(base), "%s", icon_copy);
+    char * dot = strrchr(base, '.');
+    if (dot) *dot = '\0';
+    snprintf(t->icon, sizeof(t->icon), "%s", icon_copy);
+    snprintf(t->icon_selected, sizeof(t->icon_selected), "%s_s.png", base);
+
+    lua_getfield(L, 4, "icon_selected");
+    const char * icon_sel = lua_tostring(L, -1);
+    if (icon_sel && icon_sel[0] != '\0')
+        snprintf(t->icon_selected, sizeof(t->icon_selected), "%s", icon_sel);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 4, "on_text");
+    const char * on_text = lua_tostring(L, -1);
+    snprintf(t->on_text, sizeof(t->on_text), "%s", on_text && on_text[0] ? on_text : "On");
+    utf8_sanitize(t->on_text);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 4, "off_text");
+    const char * off_text = lua_tostring(L, -1);
+    snprintf(t->off_text, sizeof(t->off_text), "%s", off_text && off_text[0] ? off_text : "Off");
+    utf8_sanitize(t->off_text);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 4, "value");
+    t->value = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+
+    /* Ref taken last: every rejection above must leave the registry and the
+     * Lua registry untouched, not leak a ref for a toggle that never landed. */
+    lua_pushvalue(L, 3);
+    t->change_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    t->L = L;
+    snprintf(t->id, sizeof(t->id), "%s", id);
+    utf8_truncate_safe(t->label, label, sizeof(t->label));
+    utf8_sanitize(t->label);
+    plugin_quick_toggle_count++;
+    return 0;
+}
+
+/* plugin.set_quick_toggle(id, value) -- publishes a state change the plugin
+ * made on its own (from its settings screen, say) so the drawer shows it the
+ * next time it opens. Deliberately does NOT fire on_change: the plugin is the
+ * one telling us, so calling back into it would just loop. */
+static int l_plugin_set_quick_toggle(lua_State * L) {
+    const char * id = luaL_checkstring(L, 1);
+    luaL_checkany(L, 2);
+    int index = plugin_find_quick_toggle_by_id(id);
+    if (index < 0) {
+        return luaL_error(L, "plugin.set_quick_toggle: no quick toggle registered with id '%s'", id);
+    }
+    plugin_quick_toggles[index].value = lua_toboolean(L, 2);
     return 0;
 }
 
@@ -3312,7 +3437,7 @@ static const char * const plugin_capabilities[] = {
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
     "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
     "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles", "ui.launcher_layout",
-    "ui.home_background", "audio.hw_volume_curve", "ui.lock_screen"
+    "ui.home_background", "audio.hw_volume_curve", "ui.lock_screen", "ui.quick_toggle"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -3493,6 +3618,8 @@ static const luaL_Reg plugin_funcs[] = {
     { "register_list_item",        l_plugin_register_list_item },
     { "register_stream_media_tile", l_plugin_register_stream_media_tile },
     { "register_home_tile",        l_plugin_register_home_tile },
+    { "register_quick_toggle",     l_plugin_register_quick_toggle },
+    { "set_quick_toggle",          l_plugin_set_quick_toggle },
     { "show_list",                 l_plugin_show_list },
     { "show_settings_list",        l_plugin_show_settings_list },
     { "list_dir",                  l_plugin_list_dir },
@@ -4163,6 +4290,8 @@ void plugin_manager_deinit(void) {
     plugin_stream_tile_count = 0;
     memset(plugin_home_tiles, 0, sizeof(plugin_home_tiles));
     plugin_home_tile_count = 0;
+    memset(plugin_quick_toggles, 0, sizeof(plugin_quick_toggles));
+    plugin_quick_toggle_count = 0;
     memset(plugin_list_callbacks, 0, sizeof(plugin_list_callbacks));
     memset(plugin_settings_list_rows, 0, sizeof(plugin_settings_list_rows));
     memset(plugin_settings_list_row_counts, 0, sizeof(plugin_settings_list_row_counts));
@@ -4422,6 +4551,52 @@ const char * plugin_manager_get_home_tile_icon_selected(int index) {
 void plugin_manager_home_tile_clicked(int index) {
     if (index < 0 || index >= plugin_home_tile_count) return;
     dispatch_tile_open(&plugin_home_tiles[index]);
+}
+
+int plugin_manager_get_quick_toggle_count(void) {
+    return plugin_quick_toggle_count;
+}
+
+const char * plugin_manager_get_quick_toggle_label(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return "";
+    return plugin_quick_toggles[index].label;
+}
+
+const char * plugin_manager_get_quick_toggle_icon(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return "";
+    return plugin_quick_toggles[index].icon;
+}
+
+const char * plugin_manager_get_quick_toggle_icon_selected(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return "";
+    return plugin_quick_toggles[index].icon_selected;
+}
+
+const char * plugin_manager_get_quick_toggle_state_text(int index, bool on) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return on ? "On" : "Off";
+    return on ? plugin_quick_toggles[index].on_text : plugin_quick_toggles[index].off_text;
+}
+
+bool plugin_manager_get_quick_toggle_value(int index) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return false;
+    return plugin_quick_toggles[index].value;
+}
+
+void plugin_manager_quick_toggle_set(int index, bool new_value) {
+    if (index < 0 || index >= plugin_quick_toggle_count) return;
+    plugin_quick_toggle_t * t = &plugin_quick_toggles[index];
+    /* Stored before the call so a plugin that reads its own state back from
+     * inside on_change (or calls plugin.set_quick_toggle() there) sees the
+     * new value rather than the one it is replacing. */
+    t->value = new_value;
+    if (!t->L || t->change_ref == LUA_NOREF) return;
+    lua_rawgeti(t->L, LUA_REGISTRYINDEX, t->change_ref);
+    lua_pushboolean(t->L, new_value);
+    if (plugin_call(t->L, 1, 0, 0) != LUA_OK) {
+        const char * err = lua_tostring(t->L, -1);
+        fprintf(stderr, "[plugins] quick toggle '%s' on_change error: %s\n", t->label, err ? err : "unknown error");
+        lua_pop(t->L, 1);
+    }
 }
 
 void plugin_manager_list_item_selected(int slot, int index) {

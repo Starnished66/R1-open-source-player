@@ -52,3 +52,16 @@ void gui_network_cancel_background_work(void);
  * and clears their persisted enabled flags, since all four require Wi-Fi.
  * Cheap no-op for whichever of them wasn't running. */
 void gui_network_handle_wifi_disabled(void);
+
+/* Flip AirPlay / DLNA / the phone remote-control server, and return the state
+ * it actually ended up in. Each is the same function the matching settings
+ * screen's own toggle row runs, so the quick drawer's tiles inherit every
+ * Wi-Fi guard, busy-service check, "Service is busy" toast, transactional
+ * start and Bluetooth-DAC mutual exclusion rather than duplicating any of it.
+ * The returned state is not always the requested one: a rejected enable (no
+ * Wi-Fi, or the service still settling) comes back still-off, which is what
+ * the caller should draw. Safe to call before the corresponding settings
+ * screen has ever been built. */
+bool gui_network_toggle_airplay(void);
+bool gui_network_toggle_dlna(void);
+bool gui_network_toggle_remote_control(void);

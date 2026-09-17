@@ -46,6 +46,7 @@ const void * asset_decoded_image_source(const asset_decoded_image_t * image) {
 void settings_save(const player_settings_t * settings) { (void)settings; }
 void player_transition_mark_dirty(void) {}
 void refresh_play_btn_icon(void) {}
+void gui_shell_refresh_quick_drawer_toggle_accent(void) {}
 static lv_obj_t * last_pushed;
 void nav_push(lv_obj_t * screen) { last_pushed = screen; }
 void nav_pop(void) {}

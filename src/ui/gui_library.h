@@ -90,7 +90,6 @@ void poll_search_job(void);
 void play_remote_control_song(const char * song_path, const char * playlist_name, const char * artist_filter,
                               const char * album_artist_filter, const char * album_filter);
 void start_power_off_countdown(void);
-void poll_power_off_countdown(void);
 void build_power_off_countdown_popup(void);
 void poll_sd_card_hotplug(void);
 bool sd_card_root_is_mounted(void);

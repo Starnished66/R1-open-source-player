@@ -1203,11 +1203,29 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     /* Mutually-exclusive idle-action choice (Power Off or Suspend to RAM).
      * Shown/hidden together with the slider card in
      * idle_shutdown_switch_event_cb(). */
+    /* Section height and the two pill rows' Y offsets below were all
+     * hardcoded (292 / 34 / 34+124+10) at some medium-tier row height --
+     * add_pill_row_base()'s own row height already scales with
+     * GUI_FONT_ROLE_BODY's line height, but these hand-rolled offsets
+     * didn't, so at the largest ("BlindMF") font tier the two rows grew
+     * taller than the fixed gaps between them and overflowed the fixed
+     * section height into the slider card below (GitHub issue #91).
+     * Derived from the same font metrics add_pill_row_base() itself uses,
+     * so this stays correct at every tier without needing another manual
+     * retune. */
+    int32_t idle_action_explain_h = lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_SUBTEXT));
+    int32_t idle_action_row_h = lv_font_get_line_height(gui_theme_font(GUI_FONT_ROLE_BODY)) + 32;
+    if (idle_action_row_h < GUI_SETTINGS_ROW_HEIGHT) idle_action_row_h = GUI_SETTINGS_ROW_HEIGHT;
+    int32_t idle_action_row1_y = idle_action_explain_h + 14;
+    int32_t idle_action_row_gap = 10;
+    int32_t idle_action_row2_y = idle_action_row1_y + idle_action_row_h + idle_action_row_gap;
+    int32_t idle_action_section_h = idle_action_row2_y + idle_action_row_h;
+
     /* 100% width accommodates display-width pill rows without clipping.
      * pad_top and pad_bottom are zeroed so the child rows and label fit within
-     * the 292px section height without vertical overflow. */
+     * the section height (now font-tier-derived above) without vertical overflow. */
     idle_action_section = lv_obj_create(scr);
-    lv_obj_set_size(idle_action_section, lv_pct(100), 292);
+    lv_obj_set_size(idle_action_section, lv_pct(100), idle_action_section_h);
     /* Positioned relative to enable_row's bottom edge so wrapped label text
      * does not cause overlapping. */
     lv_obj_align_to(idle_action_section, enable_row, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
@@ -1225,14 +1243,14 @@ static lv_obj_t * build_idle_shutdown_screen(void) {
     lv_obj_align(idle_action_explain_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
     idle_action_poweroff_row = add_pill_row_base(idle_action_section, "Power Off");
-    lv_obj_align(idle_action_poweroff_row, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_align(idle_action_poweroff_row, LV_ALIGN_TOP_MID, 0, idle_action_row1_y);
     lv_obj_set_style_border_color(idle_action_poweroff_row, accent_lv_color(), 0);
     lv_obj_set_style_border_width(idle_action_poweroff_row, current_settings.idle_suspend_enabled ? 0 : 3, 0);
     lv_obj_add_flag(idle_action_poweroff_row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(idle_action_poweroff_row, idle_action_choice_cb, LV_EVENT_CLICKED, (void *) (intptr_t) false);
 
     idle_action_suspend_row = add_pill_row_base(idle_action_section, "Suspend to RAM");
-    lv_obj_align(idle_action_suspend_row, LV_ALIGN_TOP_MID, 0, 34 + 124 + 10);
+    lv_obj_align(idle_action_suspend_row, LV_ALIGN_TOP_MID, 0, idle_action_row2_y);
     lv_obj_set_style_border_color(idle_action_suspend_row, accent_lv_color(), 0);
     lv_obj_set_style_border_width(idle_action_suspend_row, current_settings.idle_suspend_enabled ? 3 : 0, 0);
     lv_obj_add_flag(idle_action_suspend_row, LV_OBJ_FLAG_CLICKABLE);

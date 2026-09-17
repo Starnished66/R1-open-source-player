@@ -1132,9 +1132,11 @@ static bool write_gen_pointer(int32_t gen) {
         return false;
     }
     if (!library_fsync_dir(db_dir)) {
-        DB_LOG("DB", "write_gen_pointer fsync_dir_failed gen=%d errno=%d(%s) dir=%s", gen, errno, strerror(errno),
-               db_dir);
-        return false;
+        /* Non-fatal: the rename() above already committed the pointer, so
+         * the generation is live regardless. A failed directory fsync only
+         * risks losing the directory entry to an immediate power cut. */
+        DB_LOG("DB", "write_gen_pointer fsync_dir_failed gen=%d errno=%d(%s) dir=%s (non-fatal, rename already committed)",
+               gen, errno, strerror(errno), db_dir);
     }
     return true;
 }
@@ -1421,12 +1423,16 @@ static bool write_all(void) {
 
     int32_t previous_gen = 0;
     if (ok) read_gen_pointer(&previous_gen);
-    if (ok) {
-        ok = library_fsync_dir(db_dir);
-        if (!ok) {
-            DB_LOG("DB", "write_all fsync_dir_failed errno=%d(%s) dir=%s", errno, strerror(errno), db_dir);
-            tagcache_log_free_space(db_dir);
-        }
+    if (ok && !library_fsync_dir(db_dir)) {
+        /* Non-fatal: every file above was written and fsync'd individually
+         * (close_synced()), so the data is already on the card. A directory
+         * fsync only makes the directory entries durable across a sudden
+         * power cut, and the worst case without it is that the previous
+         * generation stays active -- what the generation scheme exists to
+         * survive. Every other library_fsync_dir() caller (void)s it. */
+        DB_LOG("DB", "write_all fsync_dir_failed errno=%d(%s) dir=%s (non-fatal, commit continues)", errno,
+               strerror(errno), db_dir);
+        tagcache_log_free_space(db_dir);
     }
     if (ok) ok = write_gen_pointer(new_gen);
 

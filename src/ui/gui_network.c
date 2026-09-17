@@ -2794,8 +2794,20 @@ void get_device_name(char * out, size_t out_size) {
     }
 }
 
-static void airplay_toggle_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+/* The settings screens below are built lazily, so anything reachable from
+ * the quick drawer (which can toggle these long before their own screen has
+ * ever been opened) has to refresh through these rather than calling
+ * populate_*() directly -- lv_obj_clean() on a NULL list is not survivable. */
+static void refresh_airplay_screen_if_built(void) {
+    if (airplay_list) populate_airplay_screen();
+}
+
+/* Shared by the AirPlay settings screen's toggle row and the quick drawer's
+ * AirPlay tile -- the drawer must not reimplement any of the Wi-Fi guard,
+ * transactional-start, or BT-DAC mutual-exclusion logic below. Returns the
+ * resulting enabled state, which is NOT always the requested one (a rejected
+ * enable returns false). */
+bool gui_network_toggle_airplay(void) {
     bool turning_on = !current_settings.wifi_dac_mode_enabled;
     /* Guard the enable path even though the tile itself is already guarded
      * (airplay_tile_cb() below) -- this screen can already be open when
@@ -2805,8 +2817,8 @@ static void airplay_toggle_cb(lv_event_t * e) {
      * Wi-Fi state notwithstanding -- an already-enabled feature must still
      * be toggleable off. */
     if (turning_on && !wifi_feature_guard()) {
-        populate_airplay_screen(); /* nothing changed, but keeps the toggle row's own drawn state honest */
-        return;
+        refresh_airplay_screen_if_built(); /* nothing changed, but keeps the toggle row's own drawn state honest */
+        return current_settings.wifi_dac_mode_enabled;
     }
     current_settings.wifi_dac_mode_enabled = turning_on;
     settings_save_async(&current_settings);
@@ -2822,8 +2834,8 @@ static void airplay_toggle_cb(lv_event_t * e) {
             current_settings.wifi_dac_mode_enabled = false;
             settings_save_async(&current_settings);
             show_error_toast("Failed to enable AirPlay");
-            populate_airplay_screen();
-            return;
+            refresh_airplay_screen_if_built();
+            return current_settings.wifi_dac_mode_enabled;
         }
 
         /* Deliberately does NOT touch local playback here -- toggling
@@ -2848,7 +2860,13 @@ static void airplay_toggle_cb(lv_event_t * e) {
     } else {
     }
 
-    populate_airplay_screen();
+    refresh_airplay_screen_if_built();
+    return current_settings.wifi_dac_mode_enabled;
+}
+
+static void airplay_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_network_toggle_airplay();
 }
 
 static lv_obj_t * build_airplay_screen(void) {
@@ -3052,26 +3070,37 @@ static void populate_dlna_screen(void) {
     lv_obj_set_style_pad_top(explanation, BOARD_SCALE_PX(12), 0);
 }
 
-static void dlna_toggle_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+static void refresh_dlna_screen_if_built(void) {
+    if (dlna_list) populate_dlna_screen();
+}
+
+/* gui_network_toggle_airplay()'s twin for DLNA -- same reason the drawer
+ * routes through it rather than setting the flag itself. */
+bool gui_network_toggle_dlna(void) {
     bool turning_on = !current_settings.dlna_renderer_enabled;
     /* Same defensive enable guard as airplay_toggle_cb() -- this screen can
      * already be open when Wi-Fi is disabled elsewhere, so the tile guard
      * alone (dlna_tile_cb() below) isn't sufficient. */
     if (turning_on && !wifi_feature_guard()) {
-        populate_dlna_screen();
-        return;
+        refresh_dlna_screen_if_built();
+        return current_settings.dlna_renderer_enabled;
     }
     if (network_service_is_busy(NETWORK_SERVICE_DLNA) ||
         !network_service_enqueue(NETWORK_SERVICE_DLNA, turning_on, false)) {
         show_info_toast("Service is busy");
-        populate_dlna_screen();
-        return;
+        refresh_dlna_screen_if_built();
+        return current_settings.dlna_renderer_enabled;
     }
     current_settings.dlna_renderer_enabled = turning_on;
     settings_save_async(&current_settings);
 
-    populate_dlna_screen();
+    refresh_dlna_screen_if_built();
+    return current_settings.dlna_renderer_enabled;
+}
+
+static void dlna_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_network_toggle_dlna();
 }
 
 static lv_obj_t * build_dlna_screen(void) {
@@ -3153,29 +3182,43 @@ static void remote_control_refresh_address(void) {
     remote_control_relayout_below_status();
 }
 
-static void remote_control_toggle_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+static void refresh_remote_control_screen_if_built(void) {
+    if (remote_control_toggle_img) remote_control_refresh_address();
+}
+
+/* gui_network_toggle_airplay()'s twin for the phone remote-control server --
+ * shown as "RC" on the quick drawer's own tile, where there is no room for
+ * the full name. */
+bool gui_network_toggle_remote_control(void) {
     bool turning_on = !current_settings.remote_control_enabled;
     /* Same defensive enable guard as airplay_toggle_cb()/dlna_toggle_cb() --
      * this screen can already be open when Wi-Fi is disabled elsewhere. */
     if (turning_on && !wifi_feature_guard()) {
-        remote_control_refresh_address(); /* nothing changed, but keeps the address text/QR state honest */
-        return;
+        refresh_remote_control_screen_if_built(); /* nothing changed, but keeps the address text/QR state honest */
+        return current_settings.remote_control_enabled;
     }
     if (network_service_is_busy(NETWORK_SERVICE_REMOTE) ||
         !network_service_enqueue(NETWORK_SERVICE_REMOTE, turning_on, false)) {
         show_info_toast("Service is busy");
-        remote_control_refresh_address();
-        return;
+        refresh_remote_control_screen_if_built();
+        return current_settings.remote_control_enabled;
     }
     current_settings.remote_control_enabled = turning_on;
     settings_save_async(&current_settings);
 
     /* Real lv_switch now (see build_remote_control_screen()'s own comment)
      * -- CHECKED state alone drives its visual, no sprite swap needed. */
-    if (current_settings.remote_control_enabled) lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
-    else lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
-    remote_control_refresh_address();
+    if (remote_control_toggle_img) {
+        if (current_settings.remote_control_enabled) lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
+        else lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
+    }
+    refresh_remote_control_screen_if_built();
+    return current_settings.remote_control_enabled;
+}
+
+static void remote_control_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_network_toggle_remote_control();
 }
 
 static lv_obj_t * build_remote_control_screen(void) {

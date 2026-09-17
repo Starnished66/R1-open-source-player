@@ -1006,24 +1006,44 @@ static void * bridge_reader_thread_func(void * arg) {
 
 #define CATCHUP_TARGET_RESERVE_MS 150.0  /* starting point per Codex's review -- expect to tune down after real-device testing, as low as possible without reintroducing the earlier crackling/underrun bug */
 #define CATCHUP_FADE_MS 10.0             /* short fade-in applied right after a trim, to avoid an audible click at the discontinuity */
+#define CATCHUP_PERIODIC_INTERVAL_MS 1000.0      /* how often steady-state playback
+    re-checks ring backlog. Gated on occupancy inside writer_catchup_trim() itself, so
+    this is a no-op check whenever backlog is already at/under target -- this constant
+    only bounds how much overshoot can accumulate between checks. */
+#define CATCHUP_PERIODIC_TARGET_RESERVE_MS 400.0 /* deliberately NOT the same as
+    CATCHUP_TARGET_RESERVE_MS (150ms): that value is only meant to be briefly exposed at
+    a startup/rate-change transition, and is explicitly too small for the reader's rare
+    worst-case ~277ms backoff-ladder escalation (repeat_hit_backoff_ms() above) -- see
+    that tradeoff explained in writer_catchup_trim()'s own comment below. Pinning
+    steady-state playback permanently at 150ms would remove the cushion that normally
+    absorbs that worst case and risks reintroducing the crackling/underrun regression
+    referenced elsewhere in this file. 400ms keeps clear margin above the ~277ms worst
+    case (at 48kHz; at 352.8/384kHz, 400ms exceeds the ring's own ~350ms capacity at
+    those rates, so the periodic trim is a no-op there -- harmless, since the ring can't
+    hold enough backlog at those rates to need it, but worth knowing). */
 
 /* Called by the writer thread whenever the ring buffer might be holding more
- * backlog than necessary (writer startup, and every time it adopts a newly
- * confirmed rate from the reader -- see call sites below). If current
- * occupancy exceeds a small target reserve (enough to survive the backoff
- * ladder's typical recovery latency, per usb_dac_bridge_lifecycle_regression.c's
- * own evidence and the real-device captures -- NOT enough for its rare
- * worst-case ~277ms+ escalation, which is an accepted, explicit tradeoff per
- * the "as low as possible" instruction, not an oversight), discard the excess
- * directly (skipping stale, already-queued audio -- it's valid data, just
- * queued longer than necessary, not corrupted), then apply a short linear
- * fade-in to the audio immediately following the discard point before it's
- * played, so the skip doesn't produce an audible click. This does NOT touch
- * the reader thread or its pacing in any way -- it only ever discards data
- * the reader has ALREADY produced and buffered, never slows how fast the
- * reader consumes from /dev/uac_sa. */
-static bool writer_catchup_trim(unsigned int rate, size_t frame_bytes) {
-    size_t target_reserve_bytes = (size_t) ((double) rate * CATCHUP_TARGET_RESERVE_MS / 1000.0) * frame_bytes;
+ * backlog than necessary (writer startup, every time it adopts a newly
+ * confirmed rate from the reader, and periodically during steady-state
+ * playback -- see call sites below). Discards any occupancy above the
+ * caller-supplied target_reserve_ms directly (skipping stale, already-queued
+ * audio -- it's valid data, just queued longer than necessary, not corrupted),
+ * then applies a short linear fade-in to the audio immediately following the
+ * discard point before it's played, so the skip doesn't produce an audible
+ * click. The two transition call sites pass CATCHUP_TARGET_RESERVE_MS (150ms):
+ * enough to survive the backoff ladder's typical recovery latency, per
+ * usb_dac_bridge_lifecycle_regression.c's own evidence and the real-device
+ * captures, but NOT enough for its rare worst-case ~277ms+ escalation, which is
+ * an accepted, explicit tradeoff per the "as low as possible" instruction for
+ * those two sites specifically, not an oversight. The periodic call site
+ * passes the larger CATCHUP_PERIODIC_TARGET_RESERVE_MS instead, precisely
+ * because steady-state playback can't accept that same tradeoff indefinitely.
+ * This does NOT touch the reader thread or its pacing in any way -- it only
+ * ever discards data the reader has ALREADY produced and buffered, never
+ * slows how fast the reader consumes from /dev/uac_sa. */
+static bool writer_catchup_trim(unsigned int rate, size_t frame_bytes,
+                                double target_reserve_ms, bool verbose) {
+    size_t target_reserve_bytes = (size_t) ((double) rate * target_reserve_ms / 1000.0) * frame_bytes;
     size_t occupancy_before = ring_buffer_get_occupancy(&g_rb);
     if (occupancy_before <= target_reserve_bytes) return false;
 
@@ -1066,8 +1086,27 @@ static bool writer_catchup_trim(unsigned int rate, size_t frame_bytes) {
     }
 
     size_t occupancy_after = ring_buffer_get_occupancy(&g_rb);
-    BRIDGE_LOG("usb_dac_bridge: catch-up trim: discarded %zu bytes + %zu-byte fade (occupancy %zu -> %zu bytes, target ~%zu bytes, rate %u Hz)\n",
-               discarded, fade_bytes, occupancy_before, occupancy_after, target_reserve_bytes, rate);
+    if (verbose) {
+        BRIDGE_LOG("usb_dac_bridge: catch-up trim: discarded %zu bytes + %zu-byte fade (occupancy %zu -> %zu bytes, target ~%zu bytes, rate %u Hz)\n",
+                   discarded, fade_bytes, occupancy_before, occupancy_after, target_reserve_bytes, rate);
+    } else {
+        static uint64_t silent_discarded_bytes_total = 0;
+        static uint64_t last_silent_log_ns = 0;
+        uint64_t silent_bytes_to_log = 0;
+
+        silent_discarded_bytes_total += (uint64_t) discarded;
+        uint64_t now_ns = monotonic_ns();
+        if (now_ns - last_silent_log_ns >= 10000000000ULL) { /* rate-limit to once per ~10s */
+            silent_bytes_to_log = silent_discarded_bytes_total;
+            silent_discarded_bytes_total = 0;
+            last_silent_log_ns = now_ns;
+        }
+
+        if (silent_bytes_to_log != 0) {
+            BRIDGE_LOG("usb_dac_bridge: catch-up trim: discarded %llu bytes cumulative since last log (occupancy %zu -> %zu bytes, target ~%zu bytes, rate %u Hz)\n",
+                       (unsigned long long) silent_bytes_to_log, occupancy_before, occupancy_after, target_reserve_bytes, rate);
+        }
+    }
     return true;
 }
 
@@ -1100,6 +1139,7 @@ static void * bridge_writer_thread_func(void * arg) {
     unsigned int current_rate = USB_ADVERTISED_SAMPLE_RATE;
     bool started_output = false;
     uint64_t first_read_ns = 0;
+    uint64_t last_periodic_trim_ns = 0;
 
     size_t frame_bytes = (size_t) BRIDGE_CHANNELS * sizeof(int16_t);
     size_t chunk_bytes = (size_t) BRIDGE_PERIOD_FRAMES * frame_bytes;
@@ -1173,7 +1213,8 @@ static void * bridge_writer_thread_func(void * arg) {
                 free(buf);
                 return NULL;
             }
-            writer_catchup_trim(current_rate, frame_bytes);
+            writer_catchup_trim(current_rate, frame_bytes, CATCHUP_TARGET_RESERVE_MS, true);
+            last_periodic_trim_ns = monotonic_ns();
             started_output = true;
             /* Discard this transition chunk (it was read before we knew we were
              * about to start real output) rather than play it -- matching this
@@ -1206,7 +1247,8 @@ static void * bridge_writer_thread_func(void * arg) {
              * writer_catchup_trim() is a no-op (no fade played) -- `n` is
              * then just an ordinary chunk and must be played normally below,
              * or it would be silently, needlessly dropped. */
-            if (writer_catchup_trim(current_rate, frame_bytes)) {
+            last_periodic_trim_ns = monotonic_ns();
+            if (writer_catchup_trim(current_rate, frame_bytes, CATCHUP_TARGET_RESERVE_MS, true)) {
                 continue;
             }
         }
@@ -1219,6 +1261,7 @@ static void * bridge_writer_thread_func(void * arg) {
 
         /* Only process whole frames */
         size_t frame_count = n / frame_bytes;
+        bool write_ok = true;
         if (frame_count > 0) {
             /* Overwrite the always-noise first channel slot with the real second one */
             int16_t * frame_samples = (int16_t *) buf;
@@ -1227,10 +1270,24 @@ static void * bridge_writer_thread_func(void * arg) {
             }
 
             uint64_t written_frames = 0;
-            bool write_ok = audio_output_write(frame_samples, frame_count, BRIDGE_CHANNELS, &written_frames);
+            write_ok = audio_output_write(frame_samples, frame_count, BRIDGE_CHANNELS, &written_frames);
             if (!write_ok || written_frames != (uint64_t) frame_count) {
                 BRIDGE_LOG("usb_dac_bridge: audio_output_write failure/partial: ok=%d written=%" PRIu64 "/%zu frames\n",
                            write_ok ? 1 : 0, written_frames, frame_count);
+            }
+        }
+
+        /* !stop_requested: the trim's own fade write is a second blocking
+         * audio_output_write() call in this same iteration, each bounded at
+         * up to 2s on a stalled BT/USB pipe (write_pipe_bounded()). Skipping
+         * it once a stop is already pending keeps worst-case shutdown latency
+         * from stacking two of those against usb_dac_bridge_stop()'s own
+         * fixed 3s join timeout. */
+        if (write_ok && !stop_requested) {
+            uint64_t now_ns = monotonic_ns();
+            if (now_ns - last_periodic_trim_ns >= (uint64_t) (CATCHUP_PERIODIC_INTERVAL_MS * 1000000.0)) {
+                writer_catchup_trim(current_rate, frame_bytes, CATCHUP_PERIODIC_TARGET_RESERVE_MS, false);
+                last_periodic_trim_ns = now_ns;
             }
         }
     }

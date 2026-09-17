@@ -95,6 +95,16 @@ void play_track_at_from(int index, double start_seconds);
 void toggle_play_pause(void);
 int compute_manual_step_index(int index, int direction);
 void arm_next_track_for_audio(int current_index);
+
+/* Applies a crossfade on/off change from either entry point (the Settings
+ * switch or the quick drawer tile). Enabling it also re-enables gapless,
+ * which crossfade depends on -- see the definition's own comment. */
+void gui_player_set_crossfade_enabled(bool enabled);
+
+/* Applies a gapless on/off change from either entry point (the Settings
+ * switch or the quick drawer tile). Disabling it also disables crossfade,
+ * which depends on it -- see the definition's own comment. */
+void gui_player_set_gapless_enabled(bool enabled);
 void commit_auto_advance(void);
 
 void queue_add_song(const char * path);

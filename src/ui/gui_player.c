@@ -3289,8 +3289,14 @@ void arm_next_track_for_audio(int index) {
             for (int i = 0; i < playlist_count; i++) if (shuffle_order[i] == index) { shuffle_pos = i; break; }
         }
     }
+    /* Gapless off: arm nothing, exactly as if this were the end of the
+     * queue. The playback thread then reaches a true EOF, and
+     * gui_player_handle_track_finished() computes the same next index and
+     * opens it fresh -- which reopens the output device, producing the gap
+     * between tracks that turning this off is asking for. Auto-advance
+     * itself is unaffected; only the seamless handoff is given up. */
     int next_index = compute_auto_advance_index(index);
-    if (next_index < 0) {
+    if (next_index < 0 || !current_settings.gapless_enabled) {
         audio_set_next_track(NULL, false, 0.0, false, 0.0);
         return;
     }
@@ -3836,12 +3842,60 @@ void next_btn_event_cb(lv_event_t * e) {
 
 
 
+/* The one place crossfade is applied, for both entry points (the Settings
+ * switch below and the quick drawer's own tile) -- the gapless implication
+ * here is easy to apply in one and forget in the other.
+ *
+ * Crossfade blends into an ARMED next track, so it cannot engage at all
+ * while gapless is off, because then nothing gets armed (see
+ * arm_next_track_for_audio()). Enabling crossfade therefore switches
+ * gapless back on rather than leaving a control that reads On and silently
+ * does nothing. */
+void gui_player_set_crossfade_enabled(bool enabled) {
+    current_settings.crossfade_enabled = enabled;
+    if (enabled) current_settings.gapless_enabled = true;
+    audio_set_crossfade_enabled(enabled);
+    settings_save_async(&current_settings);
+    /* Apply to the next transition, not the one after it. */
+    if (gui_player_has_active_track()) arm_next_track_for_audio(playlist_index);
+    refresh_quick_drawer_crossfade_icon(); /* see its own comment -- keeps the drawer icon in sync */
+    /* Both of gapless's own surfaces, since enabling crossfade may have just
+     * switched it back on. Done here rather than in each caller so no entry
+     * point can forget one of them. */
+    gui_settings_sync_gapless_toggle();
+    gui_shell_refresh_quick_drawer_expansion_toggles();
+}
+
 void crossfade_switch_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-    current_settings.crossfade_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-    audio_set_crossfade_enabled(current_settings.crossfade_enabled);
+    gui_player_set_crossfade_enabled(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+/* gui_player_set_crossfade_enabled()'s counterpart, and for the same reason:
+ * two entry points (the Settings switch and the quick drawer tile) share
+ * one rule, so it cannot be applied in one and missed in the other.
+ *
+ * Turning gapless off turns crossfade off with it -- crossfade has nothing
+ * to blend into once no next track is armed. */
+void gui_player_set_gapless_enabled(bool enabled) {
+    current_settings.gapless_enabled = enabled;
+    if (!enabled && current_settings.crossfade_enabled) {
+        /* Sets crossfade false and saves; deliberately called before this
+         * function's own save so the two flags persist together. */
+        gui_player_set_crossfade_enabled(false);
+        gui_settings_sync_crossfade_toggle();
+    }
     settings_save_async(&current_settings);
-    refresh_quick_drawer_crossfade_icon(); /* see its own comment -- keeps the drawer icon in sync */
+    /* Apply to the next transition, not the one after it: an already-armed
+     * next track would otherwise still hand off gaplessly once more. */
+    if (gui_player_has_active_track()) arm_next_track_for_audio(playlist_index);
+    gui_settings_sync_gapless_toggle();
+    gui_shell_refresh_quick_drawer_expansion_toggles();
+}
+
+void gapless_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    gui_player_set_gapless_enabled(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
 void car_mode_switch_event_cb(lv_event_t * e) {

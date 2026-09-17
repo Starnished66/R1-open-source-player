@@ -17,6 +17,15 @@
  * that care should parse out_buf). */
 bool subprocess_run(char * const argv[], char * out_buf, size_t out_buf_size);
 
+/* Like subprocess_run(), but the child is niced down before exec. For
+ * periodic UI-status reads with no deadline -- notably the bluetoothctl/
+ * bluealsactl polls, which are D-Bus clients of bluealsad, the same process
+ * encoding LDAC/aptX on this single-core SoC. Deprioritizing them keeps a
+ * status poll from competing with the encoder; the only cost is a status
+ * indicator updating slightly later under load. Never use it for an action
+ * the user is waiting on. */
+bool subprocess_run_low_priority(char * const argv[], char * out_buf, size_t out_buf_size);
+
 /* Like subprocess_run(), but with an explicit timeout instead of the
  * built-in 15s default -- for the rare legitimate call that needs longer
  * (e.g. bt_control_init_chip()'s /usr/bin/bt_init invocation, whose own

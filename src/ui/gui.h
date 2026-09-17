@@ -448,6 +448,7 @@ void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon);
 /* ---- Busy Indicator & Notifications ---- */
 /* Notifications and Accent declared in gui_notifications.h and gui_theme.h */
 void crossfade_switch_event_cb(lv_event_t * e);
+void gapless_switch_event_cb(lv_event_t * e);
 void lyrics_switch_event_cb(lv_event_t * e);
 void car_mode_switch_event_cb(lv_event_t * e);
 void inline_remote_switch_event_cb(lv_event_t *e);

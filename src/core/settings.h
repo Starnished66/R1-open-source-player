@@ -51,6 +51,18 @@ typedef struct {
     uint32_t accent_color;     /* packed 0xRRGGBB, applied to sliders/switches app-wide */
     bool crossfade_enabled;    /* if true, fade into the next queued track near the current one's end */
 
+    /* Default true -- gapless is this pipeline's normal behavior, not an
+     * opt-in. Turning it off makes arm_next_track_for_audio() (gui_player.c)
+     * stop arming the next track, so the playback thread reaches a true EOF
+     * and the track finishes before the next one is opened, reopening the
+     * output device between them. That is the same path a queue already
+     * takes at its end, so nothing in audio.c changes.
+     *
+     * Crossfade needs an armed next track, so it cannot work while this is
+     * off; turning this off turns crossfade off too, the same mutual
+     * exclusion the DAC-mode toggles use. */
+    bool gapless_enabled;
+
     /* Settings -> Playback -> ReplayGain. 0 = Off (no gain applied), 1 = Per
      * Track (default -- normalizes every track to the same perceived
      * loudness), 2 = Per Album (preserves intentional relative loudness

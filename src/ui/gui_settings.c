@@ -44,6 +44,7 @@
 
 /* Extern references to screen pointers owned by this module (defined here) */
 static lv_obj_t * settings_crossfade_toggle_img = NULL;
+static lv_obj_t * settings_gapless_toggle_img = NULL;
 static lv_obj_t * settings_screen;
 static lv_obj_t * settings_music_screen;
 static lv_obj_t * music_playback_screen;
@@ -1461,14 +1462,21 @@ static void plugin_music_library_list_item_click_cb(lv_event_t * e) {
 }
 
 static lv_obj_t * build_music_playback_screen(void) {
-    static pill_list_item_t items[3 + PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
+    static pill_list_item_t items[4 + PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
     items[0] = (pill_list_item_t){ "Resume Last Track", PILL_ACCESSORY_CHEVRON, false, resume_mode_settings_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "ReplayGain", PILL_ACCESSORY_CHEVRON, false, replaygain_mode_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Crossfade", PILL_ACCESSORY_TOGGLE,
                                     current_settings.crossfade_enabled, NULL, crossfade_switch_event_cb, NULL,
                                     &settings_crossfade_toggle_img };
+    /* Directly below Crossfade: the two are coupled (crossfade needs an
+     * armed next track, which only gapless provides), so seeing them
+     * together is what makes that relationship legible when one flips the
+     * other -- see gui_player_set_gapless_enabled(). */
+    items[3] = (pill_list_item_t){ "Gapless", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.gapless_enabled, NULL, gapless_switch_event_cb, NULL,
+                                    &settings_gapless_toggle_img };
 
-    int count = 3;
+    int count = 4;
     count = append_plugin_list_rows(items, count, PLUGIN_MAX_PLAYBACK_LIST_ITEMS,
                                     plugin_manager_get_playback_list_item_count,
                                     plugin_manager_get_playback_list_item_label,
@@ -3111,6 +3119,12 @@ lv_obj_t * gui_settings_get_custom_font_screen(void) { return custom_font_screen
 lv_obj_t * gui_settings_get_eq_screen(void) { return eq_screen; }
 
 
+
+void gui_settings_sync_gapless_toggle(void) {
+    if (!settings_gapless_toggle_img) return;
+    if (current_settings.gapless_enabled) lv_obj_add_state(settings_gapless_toggle_img, LV_STATE_CHECKED);
+    else lv_obj_clear_state(settings_gapless_toggle_img, LV_STATE_CHECKED);
+}
 
 void gui_settings_sync_crossfade_toggle(void) {
     if (!settings_crossfade_toggle_img) return;

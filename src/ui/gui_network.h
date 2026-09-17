@@ -8,6 +8,12 @@ lv_obj_t * gui_network_get_bt_screen(void);
 lv_obj_t * gui_network_get_wireless_screen(void);
 lv_obj_t * gui_network_get_bt_dac_overlay(void);
 lv_obj_t * gui_network_get_usb_dac_overlay(void);
+
+/* True while USB DAC mode owns the UI -- i.e. the device is presenting
+ * itself to a PC as a sound card and its overlay has taken the screen.
+ * Deliberately NOT current_settings.usb_mode, which is only a persisted UI
+ * hint and can still read DAC after a restart with no cable attached. */
+bool gui_network_usb_dac_mode_active(void);
 lv_obj_t * gui_network_get_import_wifi_screen(void);
 
 void gui_network_init(void);

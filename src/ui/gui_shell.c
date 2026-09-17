@@ -197,6 +197,7 @@ static lv_obj_t * quick_drawer_expansion_handle = NULL;
 static lv_obj_t * quick_drawer_card = NULL;
 static lv_obj_t * quick_drawer_airplay_icon = NULL;
 static lv_obj_t * quick_drawer_dlna_icon = NULL;
+static lv_obj_t * quick_drawer_gapless_icon = NULL;
 static lv_obj_t * quick_drawer_rc_icon = NULL;
 static lv_obj_t * quick_drawer_plugin_icon[PLUGIN_MAX_QUICK_TOGGLES];
 static int quick_drawer_plugin_toggle_count = 0;
@@ -1197,6 +1198,11 @@ static void refresh_quick_drawer_expansion_toggles(void) {
         lv_image_set_src(quick_drawer_dlna_icon, quick_drawer_toggle_src(QD_TOGGLE_DLNA, dlna));
     quick_drawer_set_toggle_state(QD_TOGGLE_DLNA, dlna);
 
+    bool gapless = current_settings.gapless_enabled;
+    if (quick_drawer_gapless_icon)
+        lv_image_set_src(quick_drawer_gapless_icon, quick_drawer_toggle_src(QD_TOGGLE_GAPLESS, gapless));
+    quick_drawer_set_toggle_state(QD_TOGGLE_GAPLESS, gapless);
+
     bool rc = current_settings.remote_control_enabled;
     if (quick_drawer_rc_icon)
         lv_image_set_src(quick_drawer_rc_icon, quick_drawer_toggle_src(QD_TOGGLE_RC, rc));
@@ -1221,6 +1227,18 @@ static void quick_drawer_dlna_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     gui_network_toggle_dlna();
     refresh_quick_drawer_expansion_toggles();
+}
+
+void gui_shell_refresh_quick_drawer_expansion_toggles(void) {
+    refresh_quick_drawer_expansion_toggles();
+}
+
+static void quick_drawer_gapless_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    /* Shared with the Settings switch so the crossfade implication, the
+     * re-arm and both toggles' refreshes happen identically from either --
+     * see gui_player_set_gapless_enabled(). */
+    gui_player_set_gapless_enabled(!current_settings.gapless_enabled);
 }
 
 static void quick_drawer_rc_event_cb(lv_event_t * e) {
@@ -1939,11 +1957,9 @@ void refresh_quick_drawer_crossfade_icon(void) {
 
 static void quick_drawer_crossfade_event_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    current_settings.crossfade_enabled = !current_settings.crossfade_enabled;
-    audio_set_crossfade_enabled(current_settings.crossfade_enabled);
-    settings_save(&current_settings);
-    refresh_quick_drawer_crossfade_icon();
-
+    /* Shared with the Settings switch so the gapless implication is applied
+     * identically from both -- see gui_player_set_crossfade_enabled(). */
+    gui_player_set_crossfade_enabled(!current_settings.crossfade_enabled);
     gui_settings_sync_crossfade_toggle();
 }
 
@@ -3984,16 +4000,8 @@ static void build_quick_drawer(void) {
                 lv_obj_add_event_cb(icon, quick_drawer_dlna_event_cb, LV_EVENT_CLICKED, NULL);
                 break;
             case QD_TOGGLE_GAPLESS:
-                /* No gapless code path exists yet (GitHub: pending). Drawn
-                 * dimmed and deliberately left non-interactive rather than
-                 * wired to a no-op -- a tile that visibly does nothing when
-                 * tapped reads as broken, one that is greyed out reads as
-                 * not-yet-available, which is the truth. */
-                lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
-                lv_obj_set_style_opa(icon, LV_OPA_40, 0);
-                lv_obj_set_style_opa(name, LV_OPA_40, 0);
-                lv_obj_set_style_opa(quick_drawer_toggle_state[slot], LV_OPA_40, 0);
-                lv_label_set_text(quick_drawer_toggle_state[slot], "Pending");
+                quick_drawer_gapless_icon = icon;
+                lv_obj_add_event_cb(icon, quick_drawer_gapless_event_cb, LV_EVENT_CLICKED, NULL);
                 break;
             case QD_TOGGLE_RC:
                 quick_drawer_rc_icon = icon;

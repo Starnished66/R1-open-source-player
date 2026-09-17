@@ -284,6 +284,25 @@ static void quick_drawer_reset_expansion(void) {
     quick_drawer_apply_expansion(0);
 }
 
+/* Restarts the now-playing marquees from offset 0, with their 2s wait
+ * counted from now.
+ *
+ * lv_label_set_long_mode() deletes the running offset animations and zeroes
+ * the offset even when the mode is unchanged, so re-setting it is the
+ * restart. That matters because the scroll animation is otherwise created
+ * once, when the track's metadata is set -- and the 2s delay rides on that
+ * animation's act_time (lv_anim_set_delay() stores it as a negative
+ * act_time, which lv_label.c's overwrite_anim_property() only copies while
+ * act_time <= 0, i.e. only at creation). Without this the wait elapses
+ * while the drawer is still closed and the title is already scrolling by
+ * the time it is pulled down. */
+static void quick_drawer_restart_marquee(void) {
+    if (quick_drawer_title_label)
+        lv_label_set_long_mode(quick_drawer_title_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    if (quick_drawer_artist_label)
+        lv_label_set_long_mode(quick_drawer_artist_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+}
+
 static void quick_drawer_expansion_handle_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     /* A drag that already moved the expansion consumes its own release in
@@ -2137,6 +2156,11 @@ static void quick_drawer_finish_bitmap_motion(void) {
             quick_drawer_reset_expansion();
             quick_drawer_snapshot_dirty = true;
         }
+        /* Park the marquees at offset 0 while off-screen so the snapshot
+         * rebuilt below captures them unscrolled -- otherwise it freezes
+         * whatever mid-scroll position they happened to be at, and the next
+         * open animates that stale image before the live labels take over. */
+        quick_drawer_restart_marquee();
     }
     if (quick_drawer_snapshot_dirty || quick_drawer_open)
         lv_async_call(quick_drawer_snapshot_async_cb, NULL);
@@ -2159,6 +2183,10 @@ void open_quick_drawer(void) {
      * documents. They are invisible at this point anyway, so the read
      * happens when the expansion actually starts instead. */
     quick_drawer_reset_expansion();
+    /* Both labels are already parked at offset 0 by the close path below,
+     * so this adds no visible jump -- it just starts the 2s wait now, on
+     * open, which is where the wait is meant to be measured from. */
+    quick_drawer_restart_marquee();
     quick_drawer_begin_bitmap_motion();
     lv_obj_move_foreground(quick_drawer); /* above regular screens/volume popup while showing */
     /* ...but the status bar (clock/battery/wifi/bt) stays above THAT --

@@ -855,6 +855,15 @@ static lv_obj_t * build_lyrics_screen(void) {
     lv_label_set_text(lyrics_empty_label, "No synchronized lyrics found");
     lv_obj_set_style_text_font(lyrics_empty_label, &app_font_22, 0);
     lv_obj_set_style_text_color(lyrics_empty_label, lv_color_make(200, 200, 200), 0);
+    /* app_font_22 is one of the size-tier-swappable app_font_* handles (see
+     * fallback_font_apply_size_tier()'s own comment) -- at the largest tier
+     * this string's natural single-line width exceeds the screen, and with
+     * no width/wrap set here it just ran off both edges instead of
+     * wrapping (GitHub issue #91). Bounded width + centered wrap keeps it
+     * fully visible at every tier. */
+    lv_obj_set_width(lyrics_empty_label, lv_pct(90));
+    lv_label_set_long_mode(lyrics_empty_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(lyrics_empty_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(lyrics_empty_label);
     lv_obj_add_flag(lyrics_empty_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(lyrics_empty_label, LV_OBJ_FLAG_CLICKABLE);

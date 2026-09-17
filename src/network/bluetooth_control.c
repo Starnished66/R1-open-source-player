@@ -105,6 +105,24 @@ static const char * bt_codec_daemon_name(void) {
     }
 }
 
+/* The codec name `bluealsactl codec PCM_PATH CODEC` expects. Deliberately
+ * NOT bt_codec_daemon_name() above: that one feeds the daemon's own -c
+ * enable flag, where SBC is omitted because it is mandatory and always
+ * built in, but selecting a codec on a live PCM has to name SBC explicitly.
+ * AUTO returns NULL -- there is nothing to force, BlueALSA negotiating on
+ * its own IS the preference. */
+static const char * bt_codec_select_name(void) {
+    switch ((bt_codec_preference_t) atomic_load(&bt_codec_preference)) {
+    case BT_CODEC_LDAC_HQ:
+    case BT_CODEC_LDAC_SQ: return "LDAC";
+    case BT_CODEC_APTX: return "aptX";
+    case BT_CODEC_AAC: return "AAC";
+    case BT_CODEC_SBC:
+    case BT_CODEC_SBC_XQ: return "SBC";
+    default: return NULL;
+    }
+}
+
 static const char * bt_codec_daemon_quality(void) {
     switch ((bt_codec_preference_t) atomic_load(&bt_codec_preference)) {
     case BT_CODEC_LDAC_HQ: return "high";
@@ -166,6 +184,96 @@ static void bluealsa_clear_soft_volume_path(const char * path) {
     if (!path || strcmp(bt_soft_volume_applied_path, path) == 0)
         bt_soft_volume_applied_path[0] = '\0';
     pthread_mutex_unlock(&bt_soft_volume_mutex);
+}
+
+/* Extracts the "Selected codec: X" line from `bluealsactl info` output.
+ * Shared by the codec readback below and bt_control_get_connected_device_
+ * codec() so the two cannot drift apart on the format. */
+static bool bluealsa_parse_selected_codec(const char * info_out, char * out, size_t out_size) {
+    const char * line = strstr(info_out, "Selected codec:");
+    if (!line) return false;
+    line += strlen("Selected codec:");
+    while (*line == ' ') line++;
+    size_t i = 0;
+    while (line[i] != '\0' && line[i] != '\n' && line[i] != '\r' && i < out_size - 1) {
+        out[i] = line[i];
+        i++;
+    }
+    out[i] = '\0';
+    return i != 0;
+}
+
+/* Applies the user's codec preference to a live PCM.
+ *
+ * Without this, the preference only ever reached BlueALSA through the
+ * bluealsa:CODEC=... PCM name that audio_output.c opens (see
+ * bt_control_get_playback_pcm()), so a freshly connected accessory kept
+ * whatever BlueALSA negotiated on its own -- usually AAC -- until the next
+ * time playback happened to reopen that PCM, i.e. a track change a couple
+ * of songs later. That is GitHub issue #94's remaining half: manual
+ * selection appeared to work only because changing it restarts the daemon
+ * and the user then presses play.
+ *
+ * `bluealsactl codec` terminates the PCM if it is currently running (its
+ * own documented behavior), which is exactly why this runs at PCMAdded --
+ * the PCM exists but nothing has opened it for playback yet. A codec change
+ * can itself cycle the PCM; that is already tolerated, since PCMRemoved
+ * starts BT_OUTPUT_RECONFIGURE_GRACE_MS rather than reporting a disconnect,
+ * and the re-add carries the same path (BlueALSA paths key on device and
+ * profile, not codec), so the latch below suppresses a re-apply loop.
+ *
+ * Purely additive: if this fails, the PCM-name path still applies the codec
+ * on the next open exactly as before, so the worst case is today's
+ * behavior. */
+static char bt_codec_applied_path[256];
+static pthread_mutex_t bt_codec_applied_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void bluealsa_clear_codec_path(const char * path) {
+    pthread_mutex_lock(&bt_codec_applied_mutex);
+    if (!path || strcmp(bt_codec_applied_path, path) == 0)
+        bt_codec_applied_path[0] = '\0';
+    pthread_mutex_unlock(&bt_codec_applied_mutex);
+}
+
+/* Defined further down alongside the volume-sync helpers; needed earlier by
+ * bt_control_reconcile_source_settings()'s already-connected case. */
+static bool find_source_pcm_path(char * out, size_t out_size);
+
+static void bluealsa_apply_codec_preference(const char * path) {
+    const char * codec = bt_codec_select_name();
+    if (!codec) return; /* AUTO -- let BlueALSA negotiate, nothing to force */
+    if (!bluealsa_is_audio_pcm_path(path)) return;
+    bluealsa_backend_t backend = bluealsa_backend();
+
+    pthread_mutex_lock(&bt_codec_applied_mutex);
+    if (strcmp(bt_codec_applied_path, path) == 0) {
+        pthread_mutex_unlock(&bt_codec_applied_mutex);
+        return;
+    }
+    snprintf(bt_codec_applied_path, sizeof(bt_codec_applied_path), "%s", path);
+    char * argv[] = { (char *) backend.ctl, (char *) "codec",
+                      (char *) path, (char *) codec, NULL };
+    int exit_code = -1;
+    bool ok = subprocess_run_checked(argv, NULL, 0, 5000, &exit_code) && exit_code == 0;
+    if (!ok) bt_codec_applied_path[0] = '\0'; /* let the next PCMAdded retry */
+    pthread_mutex_unlock(&bt_codec_applied_mutex);
+
+    if (!ok) {
+        DBG_LOG("bt_control: codec select %s -> %s FAILED (exit %d)\n", path, codec, exit_code);
+        return;
+    }
+    /* Read back rather than trusting the exit status: the accessory can
+     * refuse a codec it advertised, and the top bar reports the real
+     * transport, so a silent mismatch would look like the original bug. */
+    char info_out[2048];
+    char * info_argv[] = { (char *) backend.ctl, (char *) "info", (char *) path, NULL };
+    char active[32];
+    if (subprocess_run(info_argv, info_out, sizeof(info_out)) &&
+        bluealsa_parse_selected_codec(info_out, active, sizeof(active))) {
+        DBG_LOG("bt_control: codec select %s -> %s, now reports %s\n", path, codec, active);
+    } else {
+        DBG_LOG("bt_control: codec select %s -> %s applied, readback unavailable\n", path, codec);
+    }
 }
 
 static bool parse_monitor_volume(const char * text, int * out) {
@@ -741,7 +849,16 @@ bool bt_control_init_chip(void) {
 }
 
 bool bt_control_reconcile_source_settings(void) {
-    return ensure_bluealsa_running();
+    if (!ensure_bluealsa_running()) return false;
+    /* An accessory already connected before the PCMAdded watch started
+     * never produces that event, so the codec preference would sit
+     * unapplied until the next reconnect. Same reasoning (and same pairing
+     * with discovery) find_source_pcm_path() already documents for the v5
+     * SoftVolume preference, which it applies on discovery itself. */
+    char path[256];
+    if (find_source_pcm_path(path, sizeof(path)))
+        bluealsa_apply_codec_preference(path);
+    return true;
 }
 
 /* /usr/bin/bt_enable -- matches hiby_player's own confirmed strings rather
@@ -1363,19 +1480,8 @@ bool bt_control_get_connected_device_codec(char * out, size_t out_size) {
      * <pcm-path>` (also reports "Available codecs: SBC AAC", but that's
      * every codec the accessory advertised support for, not what's
      * actually in use right now). */
-    const char * line = strstr(info_out, "Selected codec:");
-    if (!line) return false;
-    line += strlen("Selected codec:");
-    while (*line == ' ') line++;
-
     char codec[32];
-    int i = 0;
-    while (line[i] != '\0' && line[i] != '\n' && line[i] != '\r' && i < (int) sizeof(codec) - 1) {
-        codec[i] = line[i];
-        i++;
-    }
-    codec[i] = '\0';
-    if (i == 0) return false;
+    if (!bluealsa_parse_selected_codec(info_out, codec, sizeof(codec))) return false;
 
     snprintf(out, out_size, "%s", codec);
     return true;
@@ -1569,6 +1675,12 @@ static void bt_output_disconnect_process_line(const char * line, char * pending_
         if (strstr(path, "/a2dpsrc/sink") != NULL) {
             snprintf(pending_path, 256, "%s", path);
             *pending_deadline = bt_control_monotonic_ms() + BT_OUTPUT_RECONFIGURE_GRACE_MS;
+            /* Soft volume only: the PCM is recreated by a reconfigure, so
+             * that setting must be re-applied. The codec latch deliberately
+             * survives here and is cleared only once a disconnect is
+             * actually confirmed -- selecting a codec can itself cycle the
+             * PCM, and clearing on every PCMRemoved would let the resulting
+             * PCMAdded re-select, cycling it again without end. */
             bluealsa_clear_soft_volume_path(path);
             DBG_LOG("bt_control: output_disconnect_watch: PCMRemoved %s -- pending disconnect\n", path);
         }
@@ -1625,6 +1737,7 @@ static void bt_output_disconnect_publish_if_due(char * pending_path, uint32_t * 
     }
     pthread_mutex_unlock(&bt_output_disconnect_state_mutex);
     DBG_LOG("bt_control: output_disconnect_watch: PCMRemoved %s -- flagging disconnect\n", pending_path);
+    bluealsa_clear_codec_path(pending_path); /* real disconnect: next connect must re-select */
     pending_path[0] = '\0';
     *pending_deadline = 0;
 }
@@ -1689,13 +1802,20 @@ static void * bt_output_disconnect_thread_func(void * arg) {
         /* Do not let volume subprocesses delay reading a replacement while
          * a removal is pending. Keep the bounded queue until it settles. */
         if (!pending_path[0]) {
-            for (int i = 0; i < added_count && atomic_load(&bt_output_disconnect_active); i++)
+            for (int i = 0; i < added_count && atomic_load(&bt_output_disconnect_active); i++) {
+                /* Codec first: selecting one can cycle the PCM, which would
+                 * otherwise drop a soft-volume setting applied just before. */
+                bluealsa_apply_codec_preference(added_paths[i]);
                 bluealsa_apply_soft_volume(added_paths[i]);
+            }
             added_count = 0;
         }
     }
 
     DBG_LOG("bt_control: output_disconnect_watch: monitor exited (pid %d)\n", (int) pid);
+    /* The monitor can exit with a removal still unconfirmed, which would
+     * leave the latch set and suppress the re-select on the next connect. */
+    bluealsa_clear_codec_path(NULL);
     close(read_fd);
     subprocess_terminate(pid);
     atomic_store(&bt_output_disconnect_active, false);

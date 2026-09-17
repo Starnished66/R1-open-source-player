@@ -48,6 +48,14 @@
 !/assets/theme2/playing_plane/
 /assets/theme2/playing_plane/*
 !/assets/theme2/playing_plane/airplay_logo_white.png
+!/assets/theme2/wireless/
+/assets/theme2/wireless/*
+!/assets/theme2/wireless/list_wifi.png
+!/assets/theme2/wireless/list_bt.png
+!/assets/theme2/wireless/list_airplay.png
+!/assets/theme2/wireless/list_dlna.png
+!/assets/theme2/wireless/list_remote.png
+!/assets/theme2/wireless/list_import.png
 
 # Korean.ttf-derived host-simulator font: excluded, unlike the rest of
 # assets/fonts/, because this particular file's own embedded metadata

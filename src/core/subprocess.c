@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <stdint.h>
 #include <time.h>
@@ -39,12 +40,33 @@ static void close_inherited_fds(void) {
  * Commands requiring longer budgets (e.g. bt_init) call subprocess_run_timeout() directly. */
 #define SUBPROCESS_TIMEOUT_MS 15000
 
+/* Nice value for subprocess_run_low_priority(). These are periodic UI-status
+ * reads with no deadline, and several of them (bluetoothctl/bluealsactl) are
+ * D-Bus clients of bluealsad -- the same process encoding LDAC on this
+ * single-core SoC. Letting the kernel prefer the encoder whenever both are
+ * runnable costs nothing here: the worst case is a status icon updating a
+ * fraction of a second later. */
+#define SUBPROCESS_BACKGROUND_NICE 10
+
+static bool subprocess_run_impl(char * const argv[], char * out_buf, size_t out_buf_size, int timeout_ms,
+                                 int * out_exit_code, int child_nice);
+
 bool subprocess_run(char * const argv[], char * out_buf, size_t out_buf_size) {
     return subprocess_run_timeout(argv, out_buf, out_buf_size, SUBPROCESS_TIMEOUT_MS);
 }
 
+bool subprocess_run_low_priority(char * const argv[], char * out_buf, size_t out_buf_size) {
+    return subprocess_run_impl(argv, out_buf, out_buf_size, SUBPROCESS_TIMEOUT_MS, NULL,
+                               SUBPROCESS_BACKGROUND_NICE);
+}
+
 bool subprocess_run_timeout(char * const argv[], char * out_buf, size_t out_buf_size, int timeout_ms) {
     return subprocess_run_checked(argv, out_buf, out_buf_size, timeout_ms, NULL);
+}
+
+bool subprocess_run_checked(char * const argv[], char * out_buf, size_t out_buf_size, int timeout_ms,
+                             int * out_exit_code) {
+    return subprocess_run_impl(argv, out_buf, out_buf_size, timeout_ms, out_exit_code, 0);
 }
 
 static int64_t subprocess_monotonic_ms(void) {
@@ -53,8 +75,11 @@ static int64_t subprocess_monotonic_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-bool subprocess_run_checked(char * const argv[], char * out_buf, size_t out_buf_size, int timeout_ms,
-                             int * out_exit_code) {
+/* child_nice is applied in the child between fork() and execvp(). 0 leaves
+ * scheduling alone, which is what every caller except the explicitly
+ * low-priority ones gets. */
+static bool subprocess_run_impl(char * const argv[], char * out_buf, size_t out_buf_size, int timeout_ms,
+                                 int * out_exit_code, int child_nice) {
     if (out_exit_code) *out_exit_code = -1;
     if (timeout_ms < 0) return false;
     /* One deadline covers stdout and child exit. Repeated output must not
@@ -86,6 +111,9 @@ bool subprocess_run_checked(char * const argv[], char * out_buf, size_t out_buf_
         int devnull_err = open("/dev/null", O_WRONLY);
         if (devnull_err >= 0) { dup2(devnull_err, STDERR_FILENO); close(devnull_err); }
         close_inherited_fds();
+        /* Best-effort: a failure here only means this child keeps normal
+         * priority, which is exactly the old behavior. */
+        if (child_nice != 0) (void) setpriority(PRIO_PROCESS, 0, child_nice);
         execvp(argv[0], argv);
         _exit(127); /* execvp only returns on failure */
     }

@@ -23,4 +23,5 @@ lv_obj_t * build_home_screen(void);
 lv_obj_t * build_dac_home_screen(void);
 
 void gui_settings_sync_crossfade_toggle(void);
+void gui_settings_sync_gapless_toggle(void);
 void gui_settings_sync_sleep_timer_toggle(void);

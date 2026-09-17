@@ -969,17 +969,35 @@ void nav_remove_stack_slot(int index) {
  * since any deeper screen (Artists/Albums/group songs/...) may be showing
  * rows built from the pre-rescan data and would otherwise still be reachable
  * via back-navigation. */
+/* Where "home" actually is right now.
+ *
+ * In USB DAC mode the device presents itself to a PC as a sound card and the
+ * DAC overlay owns the whole screen (see gui_network.c's mode-switch success
+ * path) -- it cannot sensibly be used as a normal music player at the same
+ * time, so the ordinary Home is not a destination the user is meant to reach
+ * while that holds. Routing every reset-to-home through here keeps that true
+ * for all of them, rather than only the one path that happened to be
+ * reported. Falls back to Home if the overlay was never built. */
+static lv_obj_t * nav_home_target(void) {
+    if (gui_network_usb_dac_mode_active()) {
+        lv_obj_t * dac_overlay = gui_network_get_usb_dac_overlay();
+        if (dac_overlay) return dac_overlay;
+    }
+    return gui_shell_get_home_screen();
+}
+
 void nav_reset_to_home(void) {
+    lv_obj_t * target = nav_home_target();
     nav_depth = 1;
-    nav_stack[0] = gui_shell_get_home_screen();
-    lv_screen_load(gui_shell_get_home_screen());
-    sync_player_topbar_visibility(gui_shell_get_home_screen());
-    sync_home_indicator_visibility(gui_shell_get_home_screen());
+    nav_stack[0] = target;
+    lv_screen_load(target);
+    sync_player_topbar_visibility(target);
+    sync_home_indicator_visibility(target);
 }
 
 void nav_reset_to_home_stack_only(void) {
     nav_depth = 1;
-    nav_stack[0] = gui_shell_get_home_screen();
+    nav_stack[0] = nav_home_target();
 }
 
 /* Shared back-button handler for every screen built via the reusable

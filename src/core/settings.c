@@ -75,6 +75,7 @@ static void set_defaults(player_settings_t * out) {
     out->play_pause_button_mode = 0;
     out->accent_color = 0x2196F3; /* matches the app's existing default blue */
     out->crossfade_enabled = false;
+    out->gapless_enabled = true; /* on by default -- see settings.h */
     out->replaygain_mode = 1; /* Per Track -- preserves the old replaygain_enabled=true default */
     out->car_mode_enabled = false;
     out->inline_remote_enabled = true;
@@ -281,6 +282,8 @@ bool settings_load(player_settings_t * out) {
             out->accent_color = (uint32_t) strtoul(value, NULL, 16);
         } else if (strcmp(key, "crossfade") == 0) {
             out->crossfade_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "gapless") == 0) {
+            out->gapless_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "replaygain_enabled") == 0) {
             /* Legacy on/off key, from before the Off/Per Track/Per Album
              * mode selector -- settings_save() only ever writes the new
@@ -474,6 +477,7 @@ static void settings_write_file(const player_settings_t * settings) {
     fprintf(f, "play_pause_button_mode=%d\n", settings->play_pause_button_mode);
     fprintf(f, "accent_color=%06X\n", (unsigned int) (settings->accent_color & 0xFFFFFF));
     fprintf(f, "crossfade=%d\n", settings->crossfade_enabled ? 1 : 0);
+    fprintf(f, "gapless=%d\n", settings->gapless_enabled ? 1 : 0);
     fprintf(f, "replaygain_mode=%d\n", settings->replaygain_mode);
     fprintf(f, "car_mode_enabled=%d\n", settings->car_mode_enabled ? 1 : 0);
     fprintf(f, "inline_remote_enabled=%d\n", settings->inline_remote_enabled ? 1 : 0);

@@ -913,7 +913,7 @@ static void query_device_state(const char * mac, bool * out_paired, bool * out_c
     *out_connected = false;
     char out[2048];
     char * argv[] = { (char *) "bluetoothctl", (char *) "info", (char *) mac, NULL };
-    if (!subprocess_run(argv, out, sizeof(out))) return;
+    if (!subprocess_run_low_priority(argv, out, sizeof(out))) return;
     *out_paired = strstr(out, "Paired: yes") != NULL;
     *out_connected = strstr(out, "Connected: yes") != NULL;
 }
@@ -1064,7 +1064,7 @@ int bt_control_any_paired_connected(void) {
     if (capability == BT_BLUETOOTHCTL_DEVICES_MODERN) {
         char out[512];
         char * argv[] = { (char *) "bluetoothctl", (char *) "devices", (char *) "Connected", NULL };
-        if (subprocess_run(argv, out, sizeof(out))) return strstr(out, "Device ") != NULL ? 1 : 0;
+        if (subprocess_run_low_priority(argv, out, sizeof(out))) return strstr(out, "Device ") != NULL ? 1 : 0;
         return -1;
     }
     return bt_control_is_connected() ? 1 : 0;
@@ -1076,7 +1076,7 @@ int bt_control_list_paired_states(bt_device_t * out, int max_count) {
     char devices_buf[4096];
     char * devices_argv[4];
     if (!bt_control_paired_devices_argv(devices_argv) ||
-            !subprocess_run(devices_argv, devices_buf, sizeof(devices_buf))) return -1;
+            !subprocess_run_low_priority(devices_argv, devices_buf, sizeof(devices_buf))) return -1;
 
     int count = 0;
     char * line_save = NULL;
@@ -1409,7 +1409,7 @@ bool bt_control_reconnect_paired(const char * preferred_mac,
 static bool find_source_pcm_path(char * out, size_t out_size) {
     char list_out[4096];
     char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "list-pcms", NULL };
-    if (!subprocess_run(argv, list_out, sizeof(list_out))) {
+    if (!subprocess_run_low_priority(argv, list_out, sizeof(list_out))) {
         /* Log failure if bluealsactl list-pcms fails or times out. */
         DBG_LOG("bt_control: find_source_pcm_path: bluealsactl list-pcms failed/timed out\n");
         return false;
@@ -1474,7 +1474,7 @@ bool bt_control_get_connected_device_codec(char * out, size_t out_size) {
 
     char info_out[2048];
     char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "info", path, NULL };
-    if (!subprocess_run(argv, info_out, sizeof(info_out))) return false;
+    if (!subprocess_run_low_priority(argv, info_out, sizeof(info_out))) return false;
 
     /* "Selected codec: AAC" -- confirmed live via `bluealsactl info
      * <pcm-path>` (also reports "Available codecs: SBC AAC", but that's

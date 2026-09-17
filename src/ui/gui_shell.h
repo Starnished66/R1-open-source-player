@@ -60,6 +60,12 @@ void gui_shell_cancel_bt_reconnect(void);
 
 void gui_shell_poll(void);
 void refresh_quick_drawer_crossfade_icon(void);
+
+/* Re-reads the quick drawer's expanded-row tiles (AirPlay/DLNA/Gapless/RC
+ * and any plugin tiles) from their authoritative sources. Safe before the
+ * drawer is built. Call after changing one of those settings from outside
+ * the drawer, so its tile doesn't show a stale state next time it opens. */
+void gui_shell_refresh_quick_drawer_expansion_toggles(void);
 bool quick_drawer_sleep_timer_is_active(void);
 void quick_drawer_sleep_timer_set_active(bool active);
 int quick_drawer_sleep_timer_remaining_seconds(void);

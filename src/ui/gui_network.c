@@ -56,6 +56,9 @@ static lv_obj_t * bt_dac_stream_label;
 static lv_obj_t * bt_codec_screen;
 static lv_obj_t * usb_mode_screen;
 static lv_obj_t * usb_dac_overlay_screen;
+/* See the mode-switch success path for why this exists rather than reading
+ * current_settings.usb_mode. */
+static bool usb_dac_mode_active = false;
 static lv_obj_t * usb_dac_hint_label;
 static lv_obj_t * usb_dac_input_label;
 static lv_obj_t * usb_dac_path_label;
@@ -1996,6 +1999,14 @@ void poll_usb_mode_switch(void) {
 
     current_settings.usb_mode = (int) usb_mode_switch_target;
     settings_save(&current_settings);
+    /* Process-lifetime truth for "the DAC overlay owns the UI", as opposed to
+     * current_settings.usb_mode, which settings.h documents as only a UI hint
+     * and which silently keeps a stale DAC value across a restart with no
+     * cable attached (gui.c's startup correction only applies when
+     * usb_mode_control_detect_current() can see a bound gadget, and it can't
+     * when nothing is plugged in). Set here rather than next to the nav_push
+     * below so leaving DAC mode clears it just as reliably. */
+    usb_dac_mode_active = (usb_mode_switch_target == USB_MODE_DAC);
     populate_usb_mode_screen(); /* refresh which row shows the accent border */
 
     /* DAC mode takes over the whole screen with its own overlay (matching
@@ -2062,7 +2073,19 @@ void poll_usb_storage_hotplug(void) {
         usb_storage_rebind_pending = true;
     }
     usb_cable_was_connected = connected;
-    if (storage_session_ended && gui_library_auto_rescan_enabled()) start_library_rescan();
+    /* Not while the device is a USB sound card. host_seen latches for the
+     * whole cable session, so a Storage phase before the user switched to
+     * DAC (poll_usb_storage_hotplug() force-binds Storage on every fresh
+     * connect) was still latched here and fired a rescan on unplug -- the
+     * modal "Updating music database..." taking over the DAC overlay, long
+     * after the host was done with the card. The latch itself is already
+     * cleared by usb_storage_session_poll() above, so this only suppresses
+     * the rescan; anything the PC wrote during that earlier Storage phase
+     * is picked up by the next ordinary rescan trigger or a manual one from
+     * Settings. */
+    if (storage_session_ended && !usb_dac_mode_active && gui_library_auto_rescan_enabled()) {
+        start_library_rescan();
+    }
 
     if (!connected || !usb_storage_rebind_pending || usb_mode_switch_active) return;
 
@@ -3573,4 +3596,6 @@ lv_obj_t * gui_network_get_bt_screen(void) { return bt_screen; }
 lv_obj_t * gui_network_get_wireless_screen(void) { return wireless_screen; }
 lv_obj_t * gui_network_get_bt_dac_overlay(void) { return bt_dac_overlay_screen; }
 lv_obj_t * gui_network_get_usb_dac_overlay(void) { return usb_dac_overlay_screen; }
+
+bool gui_network_usb_dac_mode_active(void) { return usb_dac_mode_active; }
 lv_obj_t * gui_network_get_import_wifi_screen(void) { return import_wifi_screen; }

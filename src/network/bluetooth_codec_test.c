@@ -91,6 +91,13 @@ bool subprocess_run_checked(char * const argv[], char * out, size_t size,
     return true; /* Exercise callers that must inspect the exit status. */
 }
 
+/* Same fixture as subprocess_run(): the production code niced this call
+ * down, which changes the child's scheduling priority, nothing the test
+ * fixture models. */
+bool subprocess_run_low_priority(char * const argv[], char * out, size_t size) {
+    return subprocess_run(argv, out, size);
+}
+
 bool subprocess_run(char * const argv[], char * out, size_t size) {
     expect_locked();
     if (strcmp(argv[0], "bluetoothctl") == 0) {

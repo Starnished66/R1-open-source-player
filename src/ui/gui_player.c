@@ -2233,8 +2233,10 @@ static void player_label_enable_marquee(lv_obj_t * label) {
     static bool initialized = false;
     if (!initialized) {
         lv_anim_init(&player_marquee_anim);
-        lv_anim_set_delay(&player_marquee_anim, 3000);
-        lv_anim_set_repeat_delay(&player_marquee_anim, 3000);
+        /* 2s, matching player_secondary_label_enable_marquee()'s own wait
+         * below -- was 3s, inconsistent with it for no functional reason. */
+        lv_anim_set_delay(&player_marquee_anim, 2000);
+        lv_anim_set_repeat_delay(&player_marquee_anim, 2000);
         initialized = true;
     }
 

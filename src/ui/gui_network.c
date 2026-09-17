@@ -3399,18 +3399,16 @@ void gui_network_handle_wifi_disabled(void) {
 
 static lv_obj_t * build_wireless_screen(void) {
     static icon_grid_item_t items[6];
-    items[0] = (icon_grid_item_t){ "wireless/list_wifi.png", NULL, "Wi-Fi", wifi_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_wifi.png" };
-    items[1] = (icon_grid_item_t){ "wireless/list_bt.png", NULL, "Bluetooth", bt_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_bt.png" };
-    items[2] = (icon_grid_item_t){ "wireless/list_airplay.png", NULL, "AirPlay", airplay_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_airplay.png" };
-    items[3] = (icon_grid_item_t){ "wireless/list_dlna.png", NULL, "DLNA", dlna_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_dlna.png" };
-    items[4] = (icon_grid_item_t){ "wireless/list_remote.png", NULL, "Remote", remote_control_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_remote.png" };
-    items[5] = (icon_grid_item_t){ "wireless/list_import.png", NULL, "Import", import_wifi_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_import.png" };
+    /* No .bg_image here: the stock per-tile background pill isn't present in
+     * every board's own firmware (missing on R1, so the tile silently rendered
+     * without one there) and measurably added render/decode cost on R3 Pro II
+     * for a background that isn't load-bearing to this screen. */
+    items[0] = (icon_grid_item_t){ "wireless/list_wifi.png", NULL, "Wi-Fi", wifi_tile_cb, NULL };
+    items[1] = (icon_grid_item_t){ "wireless/list_bt.png", NULL, "Bluetooth", bt_tile_cb, NULL };
+    items[2] = (icon_grid_item_t){ "wireless/list_airplay.png", NULL, "AirPlay", airplay_tile_cb, NULL };
+    items[3] = (icon_grid_item_t){ "wireless/list_dlna.png", NULL, "DLNA", dlna_tile_cb, NULL };
+    items[4] = (icon_grid_item_t){ "wireless/list_remote.png", NULL, "Remote", remote_control_tile_cb, NULL };
+    items[5] = (icon_grid_item_t){ "wireless/list_import.png", NULL, "Import", import_wifi_tile_cb, NULL };
     lv_obj_t * scr = build_category_menu_screen("Wireless", generic_back_cb, items, 6,
                                                 &launcher_layout_config.wireless);
     finalize_screen_navigation(scr);

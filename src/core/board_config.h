@@ -72,6 +72,23 @@
     ? (((px) * BOARD_SCREEN_WIDTH + (BOARD_REFERENCE_WIDTH / 2)) / BOARD_REFERENCE_WIDTH) \
     : (((px) * BOARD_SCREEN_WIDTH - (BOARD_REFERENCE_WIDTH / 2)) / BOARD_REFERENCE_WIDTH))
 
+/* Vertical layout coordinates and heights were authored against an 800px-tall
+ * reference panel (the R1). Because R1 and R3 Pro II are both 480 wide,
+ * BOARD_SCALE_PX() evaluates to a 1:1 ratio between them and cannot express
+ * a height difference. The R3 Pro II panel is only 720 tall, so vertical
+ * coordinates need their own scale.
+ *
+ * BOARD_SCALE_PY() scales proportionally to the panel height relative to the
+ * 800px reference height, rounding to the nearest pixel. It is a no-op on R1
+ * (BOARD_SCREEN_HEIGHT == BOARD_REFERENCE_HEIGHT, 800/800) and scales
+ * proportionally on shorter panels such as R3 Pro II (720) and R3II 2025 (480). */
+#define BOARD_REFERENCE_HEIGHT 800
+#define BOARD_SCALE_PY(px) \
+  ((px) >= 0 \
+    ? (((px) * BOARD_SCREEN_HEIGHT + (BOARD_REFERENCE_HEIGHT / 2)) / BOARD_REFERENCE_HEIGHT) \
+    : (((px) * BOARD_SCREEN_HEIGHT - (BOARD_REFERENCE_HEIGHT / 2)) / BOARD_REFERENCE_HEIGHT))
+
+
 
   /* R3 Pro II has a dedicated charger IC, MP2731, alongside the AXP2101 PMIC
  * shared with R1 -- R1 relies on the AXP2101 alone for charging. */

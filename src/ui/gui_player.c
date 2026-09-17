@@ -24,6 +24,7 @@ static int failed_physical_paths_count = 0;
 static uint64_t current_playback_generation = 0;
 
 #include "audio_helpers.h"
+#include "hw_volume_coalesce.h"
 #include "gui_player.h"
 #include "app_clock.h"
 #include "gui.h"
@@ -175,37 +176,12 @@ static void volume_popup_hide_timer_cb(lv_timer_t * timer) {
     lv_timer_pause(volume_popup_hide_timer);
 }
 
-/* Coalesce live volume feedback to at most 20 worker requests per second. */
-#define VOLUME_HW_APPLY_INTERVAL_MS 50
-static int volume_hw_pending = -1;
-static lv_timer_t * volume_hw_apply_timer = NULL;
-static bool volume_drag_active = false;
-
-static void volume_hw_apply_final(void) {
-    int pending = volume_hw_pending;
-    if (pending < 0) return;
-    volume_hw_pending = -1;
-    if (volume_slider) lv_slider_set_value(volume_slider, pending, LV_ANIM_OFF);
-    refresh_volume_topbar(pending);
-    audio_set_volume((float) pending / 100.0f);
-}
-
-static void volume_hw_apply_timer_cb(lv_timer_t * timer) {
-    (void) timer;
-    int pending = volume_hw_pending;
-    if (pending >= 0) {
-        volume_hw_pending = -1;
-        audio_request_volume((float) pending / 100.0f);
-    }
-    if (volume_hw_apply_timer && !volume_drag_active && volume_hw_pending < 0)
-        lv_timer_pause(volume_hw_apply_timer);
-}
-
-static void request_volume_hw(int percent) {
-    if (percent < 0) percent = 0;
-    if (percent > 100) percent = 100;
-    volume_hw_pending = percent;
-}
+/* hw_volume_coalesce.h -- extracted from what used to be this file's own
+ * private volume_hw_pending/volume_hw_apply_timer/volume_drag_active
+ * machinery, so the quick drawer's own volume slider (gui_shell.c) can
+ * reuse the exact same, already-proven debounce instead of a second,
+ * simpler, worse copy of it. Behavior here is unchanged. */
+static hw_volume_coalesce_t volume_popup_hv = { .pending = -1 };
 
 /* Handles touch/drag interactions on the popup volume slider. Its knob
  * follows LVGL directly; secondary displays and hardware consume the
@@ -215,23 +191,17 @@ static void volume_popup_track_event_cb(lv_event_t * e) {
     int32_t percent = lv_slider_get_value(lv_event_get_target(e));
 
     if (code == LV_EVENT_PRESSED) {
-        volume_drag_active = true;
-        if (volume_hw_apply_timer) {
-            lv_timer_reset(volume_hw_apply_timer);
-            lv_timer_resume(volume_hw_apply_timer);
-        }
+        hw_volume_coalesce_drag_begin(&volume_popup_hv);
         /* Stop the 1.5s auto-hide countdown while a finger's still on it --
          * otherwise a slow drag could get hidden out from under the user
          * mid-interaction. */
         lv_timer_pause(volume_popup_hide_timer);
     } else if (code == LV_EVENT_VALUE_CHANGED) {
-        request_volume_hw((int) percent);
+        hw_volume_coalesce_drag_update(&volume_popup_hv, (int) percent);
         refresh_volume_topbar(percent);
     } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
-        volume_drag_active = false;
-        request_volume_hw((int) percent);
-        volume_hw_apply_final();
-        if (volume_hw_apply_timer) lv_timer_pause(volume_hw_apply_timer);
+        hw_volume_coalesce_drag_end(&volume_popup_hv, (int) percent);
+        if (volume_slider) lv_slider_set_value(volume_slider, percent, LV_ANIM_OFF);
         current_settings.volume = (float) percent / 100.0f;
         settings_save_async(&current_settings);
         lv_timer_reset(volume_popup_hide_timer);
@@ -303,10 +273,8 @@ static void build_volume_popup(void) {
 
     volume_popup_hide_timer = lv_timer_create(volume_popup_hide_timer_cb, 1500, NULL);
     lv_timer_pause(volume_popup_hide_timer);
-    if (!volume_hw_apply_timer) {
-        volume_hw_apply_timer = lv_timer_create(volume_hw_apply_timer_cb, VOLUME_HW_APPLY_INTERVAL_MS, NULL);
-        if (volume_hw_apply_timer) lv_timer_pause(volume_hw_apply_timer);
-    }
+    /* hw_volume_coalesce_drag_begin() creates its own timer lazily on the
+     * first drag -- no eager creation needed here. */
 }
 
 /* Generates a "frosted mirror" look behind the transport controls
@@ -3993,17 +3961,17 @@ void gui_player_teardown(void) {
      * would keep incorrectly pausing/resetting the NEW one on every tick,
      * never itself getting paused, instead of a clean single timer. */
     if (volume_popup_hide_timer) { lv_timer_del(volume_popup_hide_timer); volume_popup_hide_timer = NULL; }
-    if (volume_drag_active && volume_popup_track)
-        request_volume_hw((int) lv_slider_get_value(volume_popup_track));
-    if (volume_hw_pending >= 0) {
-        int pending = volume_hw_pending;
-        volume_hw_apply_final();
-        current_settings.volume = (float) pending / 100.0f;
+    /* hw_volume_coalesce_teardown() can't re-read a live slider itself (it
+     * doesn't know which widget owns the drag) -- that's a deliberate
+     * caller-side step, done here exactly like before the extraction. */
+    if (volume_popup_hv.drag_active && volume_popup_track)
+        hw_volume_coalesce_drag_update(&volume_popup_hv, (int) lv_slider_get_value(volume_popup_track));
+    int volume_teardown_pending = volume_popup_hv.pending;
+    hw_volume_coalesce_teardown(&volume_popup_hv);
+    if (volume_teardown_pending >= 0) {
+        current_settings.volume = (float) volume_teardown_pending / 100.0f;
         settings_save(&current_settings); /* Final teardown checkpoint must reach storage. */
     }
-    volume_drag_active = false;
-    if (volume_hw_apply_timer) { lv_timer_delete(volume_hw_apply_timer); volume_hw_apply_timer = NULL; }
-    volume_hw_pending = -1;
     if (volume_popup) { lv_obj_delete(volume_popup); volume_popup = NULL; }
     volume_popup_speaker_icon = NULL;
     asset_decoded_image_close(&volume_popup_bg_image);
@@ -4931,9 +4899,7 @@ int32_t gui_player_get_volume_percent(void) {
 
 void gui_player_set_volume_percent(int32_t percent) {
     /* External/hardware writes are newer than any coalesced drag sample. */
-    volume_hw_pending = -1;
-    volume_drag_active = false;
-    if (volume_hw_apply_timer) lv_timer_pause(volume_hw_apply_timer);
+    hw_volume_coalesce_cancel(&volume_popup_hv);
     if (volume_slider) lv_slider_set_value(volume_slider, percent, LV_ANIM_OFF);
 }
 

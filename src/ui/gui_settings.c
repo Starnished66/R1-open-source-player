@@ -1904,10 +1904,9 @@ static lv_obj_t * build_settings_screen(void) {
     lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     static const char * names[] = { "music", "display", "power", "system", "about" };
     for (unsigned i = 0; i < 5; ++i) {
-        char icon[64], background[64];
+        char icon[64];
         snprintf(icon, sizeof(icon), "settings/%s.png", names[i]);
-        snprintf(background, sizeof(background), "settings/bg_%s.png", names[i]);
-        if (category_rows[i]) decorate_category_row(category_rows[i], icon, background);
+        if (category_rows[i]) decorate_category_row(category_rows[i], icon, NULL);
         items[i].out_row = NULL;
     }
     finalize_screen_navigation(scr);
@@ -1964,8 +1963,8 @@ static void dac_home_usb_row_cb(lv_event_t * e) {
 
 lv_obj_t * build_dac_home_screen(void) {
     const icon_grid_item_t items[] = {
-        { "submenu/usb.png", NULL, "USB DAC", dac_home_usb_row_cb, NULL, .bg_image = "submenu/bg_gold.png" },
-        { "submenu/bluetooth.png", NULL, "Bluetooth DAC", bt_dac_settings_row_cb, NULL, .bg_image = "submenu/bg_blue.png" },
+        { "submenu/usb.png", NULL, "USB DAC", dac_home_usb_row_cb, NULL },
+        { "submenu/bluetooth.png", NULL, "Bluetooth DAC", bt_dac_settings_row_cb, NULL },
     };
     lv_obj_t * scr = build_category_menu_screen("DAC", generic_back_cb, items, 2, NULL);
     finalize_screen_navigation(scr);

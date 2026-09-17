@@ -4819,12 +4819,12 @@ static void music_screen_playback_settings_cb(lv_event_t * e) {
 
 static lv_obj_t * build_music_screen(void) {
     const icon_grid_item_t items[] = {
-        { "submenu/files.png", NULL, "Files", music_files_tile_cb, NULL, .bg_image = "submenu/bg_gold.png" },
-        { "submenu/artists.png", NULL, "Artists", artists_tile_cb, NULL, .bg_image = "submenu/bg_blue.png" },
-        { "submenu/albums.png", NULL, "Albums", albums_tile_cb, NULL, .bg_image = "submenu/bg_green.png" },
-        { "submenu/album_artist.png", NULL, "Album Artist", album_artist_tile_cb, NULL, .bg_image = "submenu/bg_silver.png" },
-        { "submenu/all_songs.png", NULL, "All Songs", all_songs_tile_cb, NULL, .bg_image = "submenu/bg_purple.png" },
-        { "submenu/playlists.png", NULL, "Playlists", playlists_tile_cb, NULL, .bg_image = "submenu/bg_coral.png" },
+        { "submenu/files.png", NULL, "Files", music_files_tile_cb, NULL },
+        { "submenu/artists.png", NULL, "Artists", artists_tile_cb, NULL },
+        { "submenu/albums.png", NULL, "Albums", albums_tile_cb, NULL },
+        { "submenu/album_artist.png", NULL, "Album Artist", album_artist_tile_cb, NULL },
+        { "submenu/all_songs.png", NULL, "All Songs", all_songs_tile_cb, NULL },
+        { "submenu/playlists.png", NULL, "Playlists", playlists_tile_cb, NULL },
     };
     lv_obj_t * scr = build_category_menu_screen("Music", generic_back_cb, items, 6,
                                                 &launcher_layout_config.music);

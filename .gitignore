@@ -80,9 +80,11 @@
 # Accent-recolored glyph in the player's quality pill (gui_player.c). Drawn
 # for this project and absent from a genuine stock dump entirely.
 !/assets/theme2/playing_plane/quality_waveform.png
-# Wholly ours (SOURCES.txt / LIST_SOURCES.txt), except the per-tile list
-# backgrounds, which nothing renders since the tiles went flat.
+# Wholly ours (SOURCES.txt / LIST_SOURCES.txt), except the tile backgrounds:
+# nothing renders those since the wireless tiles went flat, and the main menu
+# is the only screen that keeps a per-tile background.
 !/assets/theme2/wireless/
+/assets/theme2/wireless/bg_*.png
 /assets/theme2/wireless/list_bg_*.png
 
 # Wholly ours: this directory does not exist at all in a genuine stock dump
@@ -111,6 +113,14 @@
 !/assets/theme2/launcher/sys_set_s.png
 !/assets/theme2/launcher/dac.png
 !/assets/theme2/launcher/dac_s.png
+# Main menu tile card backgrounds -- the only per-tile backgrounds kept, all
+# six absent from a genuine stock dump.
+!/assets/theme2/launcher/bg_music.png
+!/assets/theme2/launcher/bg_book.png
+!/assets/theme2/launcher/bg_dac.png
+!/assets/theme2/launcher/bg_stream_media.png
+!/assets/theme2/launcher/bg_sys_set.png
+!/assets/theme2/launcher/bg_wireless.png
 
 # Settings category rows. Mixed directory: the five icons and their five
 # gradient backgrounds are ours (CATEGORY_SOURCES.txt + CATEGORY_LICENSE.txt,

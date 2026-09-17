@@ -670,7 +670,7 @@ TARGET_OBJS = $(APP_SRCS:src/%.c=$(BUILD_TARGET_DIR)/%.o) $(APP_CXX_SRCS:src/%.c
 all: host compile_commands.json
 
 # Build for host (Arch Linux PC)
-host: $(HOST_BIN)
+host: $(HOST_BIN) compile_commands.json
 
 $(HOST_BIN): $(HOST_OBJS)
 	$(CXX) -o $@ $(HOST_OBJS) $(HOST_LDFLAGS)
@@ -804,7 +804,7 @@ $(BUILD_HOST_DIR)/lua/%.o: $(LUA_DIR)/src/%.c
 	$(CC) $(LUA_CFLAGS) -DHOST_BUILD=1 -c $< -o $@
 
 # Build for target (MIPS HiBy Device)
-target: $(TARGET_BIN)
+target: $(TARGET_BIN) compile_commands.json
 
 $(TARGET_BIN): $(TARGET_OBJS)
 	$(CROSS_CXX) -o $(BUILD_TARGET_DIR)/$(TARGET_BIN)_unstripped $(TARGET_OBJS) $(TARGET_LDFLAGS)

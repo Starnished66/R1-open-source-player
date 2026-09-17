@@ -95,6 +95,9 @@
 # Local Python helper scripts, including files created in any future
 # subdirectory. Tracked Python files remain tracked by Git as usual.
 *.py
+# ...except the compile_commands.json generator the Makefile's own
+# `compile_commands.json` target invokes -- this one ships with the repo.
+!/generate_compile_commands.py
 
 # Standalone development self-tests are local-only and are not shipped in
 # the public source/release tree. Match future files in any directory too.
@@ -145,7 +148,6 @@ stock_perf_capture.log
 stock_perf_idle.log
 battery_profile.csv
 BATTERY_REPORT.md
-generate_compile_commands.py
 HARDWARE_DRIVERS.md
 PLUGIN_IDEAS_DRAFT.md
 PLUGIN_SET_HOME_LAYOUT_DRAFT.md

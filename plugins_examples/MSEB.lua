@@ -239,7 +239,14 @@ plugin.register_list_item("music_audio", "MSEB", function()
             type = "toggle",
             label = "Enabled",
             value = enabled,
-            on_change = function(v) set_enabled(v) end,
+            on_change = function(v)
+                set_enabled(v)
+                -- The quick drawer tile reads this state rather than being
+                -- pushed to, so keep the two in step when it changes here.
+                if plugin.has_capability("ui.quick_toggle") then
+                    plugin.set_quick_toggle("mseb", enabled)
+                end
+            end,
         },
         {
             type = "row",
@@ -304,3 +311,16 @@ plugin.register_list_item("music_audio", "MSEB", function()
         },
     })
 end)
+
+-- Quick drawer tile, mirroring the "Enabled" row above. Gated on the
+-- capability rather than api_min so this plugin still loads on an older
+-- player build that has no quick-toggle support -- it just doesn't get a
+-- tile there. Same reasoning GainMode.lua documents for its own gating.
+if plugin.has_capability("ui.quick_toggle") then
+    plugin.register_quick_toggle("mseb", "MSEB", function(on)
+        set_enabled(on)
+    end, {
+        icon = "pull_down/mseb.png",
+        value = enabled,
+    })
+end

@@ -57,28 +57,53 @@ local function write_state(filename)
 end
 
 -- Every theme2-relative asset path this app actually resolves via
--- asset_path() (src/ui/assets.c) -- collected by grepping src/ui/*.c for
--- every literal asset_path("...") call (including inside ternaries, e.g.
--- topbar/am.png vs pm.png) plus the digit/wifi-signal/codec paths built
+-- asset_path() (src/ui/assets.c) -- every literal asset_path("...") argument
+-- across src/, plus the keypad/wifi-signal/settings-row paths built
 -- dynamically at runtime. Deliberately NOT a full mirror of theme1's ~620
 -- files (2.7MB): the device's /usr/data partition (where plugin.set_icon()'s
 -- overrides land) typically has only a few MB free, and this app never
 -- resolves most of theme1/theme2 anyway. Shared by every theme this loader
 -- applies -- a .theme file names WHICH root to copy these from (or none at
--- all), never its own asset list. Re-verified against every asset_path()
--- call site in src/ui/*.c (not just literal ".png" strings) after a review
--- found this list missing codec icons, am/pm, usb, the Subsonic download
--- button, quality badges, a second default-cover asset, and the AirPlay
--- overlay's own logo -- all added below -- plus one longstanding wrong
--- extension (boot_animation/en/0.png, corrected to the real .jpg this app
--- actually resolves; the old entry silently copied to a filename asset_
--- path() never requested, a no-op that never restored the real boot splash).
+-- all), never its own asset list.
+--
+-- When re-verifying, a plain asset_path("...") grep is not enough: some paths
+-- sit in the second branch of a ternary (keyboard/psk_hide.png), and others
+-- exist only as runtime-built strings (topbar/wifi_connect_<n>.png,
+-- keyboard/<n>.png, keyboard/symbol<n>.png, keyboard/<letters>_<case>.png),
+-- so they never appear as a literal argument anywhere. A list regenerated
+-- from literal matches alone silently drops those.
+--
+-- The status bar renders from the lucide glyph set. The sprite digits,
+-- colon/percent/am/pm and the older battery/bluetooth/play/pause/speaker/
+-- po/usb/a2dp/wifi_unconnect faces it replaced are no longer resolved by the
+-- app; they were listed here long after they stopped being used, copying
+-- dead files into the override root on every theme apply.
+--
+-- The list is exactly the resolved set, nothing more: a path the app never
+-- asks for would only copy a dead file into the override root on every theme
+-- apply, costing /usr/data space for an asset no screen can ever show.
 local ASSETS = {
     "boot_animation/en/0.jpg", "bt/bt.png",
+    -- Text-entry keypad. Only the mode/edit keys appear as literals; every
+    -- key FACE is built at runtime by text_entry_key_image()
+    -- (gui_text_input.c) from the current mode and shift state:
+    -- keyboard/<n>.png in NUM mode, keyboard/symbol<n>.png in SYM mode, and
+    -- keyboard/<letter-group>_<l|u>.png in ABC mode (key 1 being char_*).
     "keyboard/char.png", "keyboard/del.png", "keyboard/dot.png", "keyboard/enter.png",
     "keyboard/left.png", "keyboard/num.png", "keyboard/psk_show.png", "keyboard/psk_hide.png",
     "keyboard/right.png", "keyboard/space2.png", "keyboard/symbol.png", "keyboard/upper.png",
-    "launcher/hor_line.png", "launcher/ver_line.png",
+    "keyboard/0.png", "keyboard/1.png", "keyboard/2.png", "keyboard/3.png", "keyboard/4.png",
+    "keyboard/5.png", "keyboard/6.png", "keyboard/7.png", "keyboard/8.png", "keyboard/9.png",
+    "keyboard/symbol0.png", "keyboard/symbol1.png", "keyboard/symbol2.png", "keyboard/symbol3.png",
+    "keyboard/symbol4.png", "keyboard/symbol5.png", "keyboard/symbol6.png", "keyboard/symbol7.png",
+    "keyboard/symbol8.png", "keyboard/symbol9.png",
+    "keyboard/char_l.png", "keyboard/char_u.png",
+    "keyboard/abc_l.png", "keyboard/abc_u.png", "keyboard/def_l.png", "keyboard/def_u.png",
+    "keyboard/ghi_l.png", "keyboard/ghi_u.png", "keyboard/jkl_l.png", "keyboard/jkl_u.png",
+    "keyboard/mno_l.png", "keyboard/mno_u.png", "keyboard/pqrs_l.png", "keyboard/pqrs_u.png",
+    "keyboard/tuv_l.png", "keyboard/tuv_u.png", "keyboard/wxyz_l.png", "keyboard/wxyz_u.png",
+    -- Home tiles (home_native_tiles[], gui_settings.c). hor_line/ver_line and
+    -- the bg_*.png tile cards are not resolved by this app.
     "launcher/music.png", "launcher/music_s.png",
     "launcher/stream_media.png", "launcher/stream_media_s.png",
     "launcher/wireless.png", "launcher/wireless_s.png",
@@ -88,46 +113,70 @@ local ASSETS = {
     "playing_plane/btn_next.png", "playing_plane/btn_next_s.png",
     "playing_plane/btn_play.png", "playing_plane/btn_pause.png",
     "playing_plane/btn_prev.png", "playing_plane/btn_prev_s.png",
-    "playing_plane/buttom.png", "playing_plane/collect_out.png", "playing_plane/collect_in.png",
-    "playing_plane/cursor.png", "playing_plane/default_cover_565.png", "playing_plane/ic_more.png",
-    "playing_plane/progress_bg.png", "playing_plane/progress.png",
+    "playing_plane/collect_out.png", "playing_plane/collect_in.png",
+    "playing_plane/default_cover_565.png", "playing_plane/ic_more.png",
     "playing_plane/loop.png", "playing_plane/single.png", "playing_plane/random.png", "playing_plane/order.png",
+    "playing_plane/quality_waveform.png",
     "playing_plane/airplay_logo_white.png",
-    "pull_down/bg.png", "pull_down/blk.png", "pull_down/bt.png", "pull_down/bt_s.png",
+    "power_action/power.png", "power_action/reboot.png",
+    "pull_down/blk.png", "pull_down/bt.png", "pull_down/bt_s.png",
     "pull_down/sleep_switch.png", "pull_down/sleep_switch_s.png",
     "pull_down/wifi.png", "pull_down/wifi_s.png", "pull_down/fade.png", "pull_down/fade_s.png",
+    "pull_down/airplay.png", "pull_down/airplay_s.png",
+    "pull_down/dlna.png", "pull_down/dlna_s.png",
+    "pull_down/gapless_play.png", "pull_down/gapless_play_s.png",
+    "pull_down/hibylink.png", "pull_down/hibylink_s.png",
     "sub_back/bg_search.png", "sub_back/btn_back.png", "sub_back/btn_search.png", "sub_back/close.png",
-    "topbar/0.png", "topbar/1.png", "topbar/2.png", "topbar/3.png", "topbar/4.png",
-    "topbar/5.png", "topbar/6.png", "topbar/7.png", "topbar/8.png", "topbar/9.png",
-    "topbar/colon.png", "topbar/a2dp.png",
-    "topbar/battery_bg.png", "topbar/battery_charge_bg.png", "topbar/battery_low_bg.png", "topbar/battery.png",
-    "topbar/bluetooth.png", "topbar/bluetooth_unconnect.png",
-    "topbar/pause.png", "topbar/percent.png", "topbar/play.png", "topbar/po.png", "topbar/speaker.png",
+    "sub_back/btn_playlist.png", "sub_back/set.png",
+    -- Status bar glyphs. The clock, battery, volume, transport, Wi-Fi and
+    -- Bluetooth indicators all render from the lucide set; the sprite digits,
+    -- colon/percent/am/pm and the older battery/bluetooth/play/pause/speaker/
+    -- po/usb/a2dp/wifi_unconnect glyphs they replaced are no longer resolved
+    -- by the app and are deliberately absent here.
+    "topbar/lucide_audio_lines.png", "topbar/lucide_headphones.png",
+    "topbar/lucide_volume_2.png", "topbar/lucide_usb.png",
+    "topbar/lucide_play.png", "topbar/lucide_pause.png",
+    "topbar/lucide_battery.png", "topbar/lucide_battery_charging.png",
+    "topbar/lucide_battery_full.png", "topbar/lucide_battery_medium.png",
+    "topbar/lucide_battery_low.png",
+    "topbar/lucide_bluetooth.png", "topbar/lucide_bluetooth_off.png",
+    "topbar/lucide_wifi.png", "topbar/lucide_wifi_high.png",
+    "topbar/lucide_wifi_low.png", "topbar/lucide_wifi_zero.png",
+    "topbar/lucide_wifi_off.png",
+    -- Per-network signal strength in the Wi-Fi list, built as
+    -- topbar/wifi_connect_<level>.png at runtime.
     "topbar/wifi_connect_0.png", "topbar/wifi_connect_1.png", "topbar/wifi_connect_2.png", "topbar/wifi_connect_3.png",
-    "topbar/wifi_unconnect.png",
-    "topbar/am.png", "topbar/pm.png", "topbar/usb.png",
     "topbar/sbc.png", "topbar/aac.png", "topbar/aptx.png", "topbar/aptx_hd.png", "topbar/ldac.png", "topbar/uat.png",
     "touch_list/a_z_result_bg.png", "touch_list/del.png", "touch_list/item_bg.png",
-    "touch_list/list_default_album.png",
+    "touch_list/list_default_album.png", "touch_list/list_folder.png",
     "touch_list/quality_hr.png", "touch_list/quality_high.png", "touch_list/quality_nomal.png",
     "usb/usb.png",
-    "volume/bg.png", "volume/cursor.png", "volume/vol_bg.png", "volume/vol.png", "volume/vol_progress.png",
-    "category/explorer.png", "category/explorer_s.png",
-    "category/artist.png", "category/artist_s.png",
-    "category/album.png", "category/album_s.png",
-    "category/album_artist.png", "category/album_artist_s.png",
-    "category/all.png", "category/all_s.png",
-    "category/genre.png", "category/genre_s.png",
+    "volume/bg.png", "volume/vol.png",
+    -- Remote-control category icons (src/network/remote_control.c). Only
+    -- these four unsuffixed names are resolved.
+    "category/artist.png", "category/album_artist.png",
+    "category/all.png", "category/genre.png",
     "stream_media/subsonic.png", "stream_media/subsonic_s.png",
     "stream_media/radio.png", "stream_media/radio_s.png",
     "stream_media/download.png",
-    "settings/off.png", "settings/on.png",
-    "wireless/wifi.png", "wireless/wifi_s.png",
-    "wireless/bt.png", "wireless/bt_s.png",
-    "wireless/airplay.png", "wireless/airplay_s.png",
-    "wireless/dlna.png", "wireless/dlna_s.png",
-    "wireless/hibylink.png", "wireless/hibylink_s.png",
-    "wireless/via.png", "wireless/via_s.png",
+    -- Settings category rows, built as settings/<name>.png plus
+    -- settings/bg_<name>.png at runtime (gui_settings.c).
+    "settings/music.png", "settings/display.png", "settings/power.png",
+    "settings/system.png", "settings/about.png",
+    "settings/bg_music.png", "settings/bg_display.png", "settings/bg_power.png",
+    "settings/bg_system.png", "settings/bg_about.png",
+    -- Library/DAC submenu tiles and their gradient card backgrounds
+    -- (gui_library.c, gui_settings.c, gui.c, gui_books.c, gui_plugins.c).
+    "submenu/files.png", "submenu/artists.png", "submenu/albums.png",
+    "submenu/album_artist.png", "submenu/all_songs.png", "submenu/playlists.png",
+    "submenu/favorites.png", "submenu/books.png", "submenu/subsonic.png",
+    "submenu/bluetooth.png", "submenu/usb.png",
+    "submenu/bg_blue.png", "submenu/bg_coral.png", "submenu/bg_gold.png",
+    "submenu/bg_green.png", "submenu/bg_purple.png", "submenu/bg_silver.png",
+    -- Wireless list rows. Only the list_* faces are resolved; the unsuffixed
+    -- wireless/<name>.png tile icons went away with the old tile grid.
+    "wireless/list_wifi.png", "wireless/list_bt.png", "wireless/list_airplay.png",
+    "wireless/list_dlna.png", "wireless/list_remote.png", "wireless/list_import.png",
 }
 
 -- Default's colors match this app's own built-in defaults (screen_

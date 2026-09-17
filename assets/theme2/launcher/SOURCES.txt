@@ -1,0 +1,47 @@
+theme2/launcher icons (swapped in place; old assets removed)
+Firmware reads these unsuffixed names.
+Skipped chrome: hor_line.png, ver_line.png, item.png, item_s.png
+_s selected copies are byte-identical duplicates of the base file (firmware
+requires both files present; the app does not render a distinct pressed
+state for these tiles).
+Style: Outline/stroke line-art with hollow interiors, matching a user
+reference design (soft pastel-gemstone accent colors, one per tile).
+
+Icon Family: Phosphor Icons (Regular / Outline variant)
+License: MIT License
+https://github.com/phosphor-icons/core
+https://cdn.jsdelivr.net/npm/@phosphor-icons/core@2.1.1/assets/regular/<name>.svg
+
+Equalizer Waveform Icon: Google Material Symbols (Rounded variant)
+License: Apache License 2.0
+https://github.com/google/material-design-icons
+Source: symbols/web/graphic_eq/materialsymbolsrounded/graphic_eq_24px.svg
+Used for dac.png to match the reference's symmetrical 5-bar rounded
+equalizer profile (Phosphor's own waveform glyph is asymmetrical).
+
+140x140 RGBA, transparent background.
+
+Mapping:
+  music.png / music_s.png <- phosphor/music-notes-simple #FDBB63 (outline stems/beam, solid noteheads)
+  book.png / book_s.png <- phosphor/book-open #FEBB6C (outline open book pages)
+  dac.png / dac_s.png <- material-symbols/graphic_eq #A26CF0 (5 solid rounded equalizer bars)
+  wireless.png / wireless_s.png <- phosphor/wifi-high #75F2C6 (outline wifi arcs + base dot)
+  stream_media.png / stream_media_s.png <- phosphor/cloud-arrow-down #55C2FE (outline cloud + download arrow)
+  sys_set.png / sys_set_s.png <- phosphor/gear #C5CEDE (outline 8-tooth cog)
+
+Tile background cards: bg_music.png, bg_book.png, bg_dac.png, bg_wireless.png,
+bg_stream_media.png, bg_sys_set.png (240x256, RGBA, rounded-rect alpha mask
+baked in at radius 24). Generated, not sourced from a library -- a flat
+#121214 base with a radial glow blended toward each tile's own accent color
+above, peaking at ~40% blend near the icon position and falling off to the
+base color by the tile edges, calibrated by sampling the actual pixel values
+of the user's reference design image. Wired via icon_grid_item_t.bg_image
+(screen_builders.h/.c) and home_native_tiles[] (gui_settings.c).
+Bayer-dithered at generation time (same 8x8 matrix/threshold formula as
+frosted_glass.c's rgb888_to_565_dithered(), replicated in the Python
+generator) -- a first, undithered pass caused visible flicker on real
+hardware (smooth 8-bit gradient banding once quantized to the panel's
+actual color depth), same root-cause family as the Player background
+shimmer fixed earlier. Plain lv_obj_set_style_bg_image_src() does not
+dither on load (only asset_decoded_gradient_open()'s category-row path
+does), so the dithering has to be baked into the PNG itself here.

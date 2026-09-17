@@ -47,6 +47,13 @@
 !/assets/theme2/topbar/aptx.png
 !/assets/theme2/topbar/aptx_hd.png
 !/assets/theme2/topbar/uat.png
+# Per-network Wi-Fi signal bars, built as topbar/wifi_connect_<level>.png by
+# gui_network.c. Phosphor wifi-*-fill redraws (see SOURCES.txt), byte-different
+# from the stock files of the same name.
+!/assets/theme2/topbar/wifi_connect_0.png
+!/assets/theme2/topbar/wifi_connect_1.png
+!/assets/theme2/topbar/wifi_connect_2.png
+!/assets/theme2/topbar/wifi_connect_3.png
 !/assets/theme2/boot_animation/
 /assets/theme2/boot_animation/*
 !/assets/theme2/boot_animation/en/
@@ -63,10 +70,80 @@
 !/assets/theme2/playing_plane/
 /assets/theme2/playing_plane/*
 !/assets/theme2/playing_plane/airplay_logo_white.png
+# Transport buttons drawn for this project, deliberately kept under the stock
+# filenames so they drop straight into the existing asset path and both the
+# player screen and the quick drawer pick them up with no code change. Both
+# are byte-different from the same-named files in a genuine stock dump. The
+# rest of this directory is stock artwork and stays excluded.
+!/assets/theme2/playing_plane/btn_play.png
+!/assets/theme2/playing_plane/btn_pause.png
+# Accent-recolored glyph in the player's quality pill (gui_player.c). Drawn
+# for this project and absent from a genuine stock dump entirely.
+!/assets/theme2/playing_plane/quality_waveform.png
 # Wholly ours (SOURCES.txt / LIST_SOURCES.txt), except the per-tile list
 # backgrounds, which nothing renders since the tiles went flat.
 !/assets/theme2/wireless/
 /assets/theme2/wireless/list_bg_*.png
+
+# Wholly ours: this directory does not exist at all in a genuine stock dump
+# (diffed directly against one), and carries its own SOURCES.txt + LICENSE
+# (Phosphor Icons, MIT). Home/Music/DAC submenu tiles and their gradient
+# backgrounds.
+!/assets/theme2/submenu/
+
+# Home launcher tiles. Mixed directory: the six tile glyphs and their _s
+# duplicates are Phosphor/Material redraws swapped in place (SOURCES.txt),
+# each byte-different from the stock file of the same name. The rest of the
+# directory (item*.png, hor_line/ver_line, bg_*.png) is either stock or no
+# longer rendered, so it stays excluded.
+!/assets/theme2/launcher/
+/assets/theme2/launcher/*
+!/assets/theme2/launcher/SOURCES.txt
+!/assets/theme2/launcher/music.png
+!/assets/theme2/launcher/music_s.png
+!/assets/theme2/launcher/stream_media.png
+!/assets/theme2/launcher/stream_media_s.png
+!/assets/theme2/launcher/wireless.png
+!/assets/theme2/launcher/wireless_s.png
+!/assets/theme2/launcher/book.png
+!/assets/theme2/launcher/book_s.png
+!/assets/theme2/launcher/sys_set.png
+!/assets/theme2/launcher/sys_set_s.png
+!/assets/theme2/launcher/dac.png
+!/assets/theme2/launcher/dac_s.png
+
+# Settings category rows. Mixed directory: the five icons and their five
+# gradient backgrounds are ours (CATEGORY_SOURCES.txt + CATEGORY_LICENSE.txt,
+# Phosphor Icons MIT), absent from a genuine stock dump entirely. Everything
+# else here (bt, color_*, cursor, gain_*, lo, po, on/off, progress) is stock
+# and stays excluded.
+!/assets/theme2/settings/
+/assets/theme2/settings/*
+!/assets/theme2/settings/CATEGORY_SOURCES.txt
+!/assets/theme2/settings/CATEGORY_LICENSE.txt
+!/assets/theme2/settings/music.png
+!/assets/theme2/settings/display.png
+!/assets/theme2/settings/power.png
+!/assets/theme2/settings/system.png
+!/assets/theme2/settings/about.png
+!/assets/theme2/settings/bg_music.png
+!/assets/theme2/settings/bg_display.png
+!/assets/theme2/settings/bg_power.png
+!/assets/theme2/settings/bg_system.png
+!/assets/theme2/settings/bg_about.png
+
+# Remote-control category icons (src/network/remote_control.c). Mixed
+# directory: the four the app resolves are Material Design Icons redraws
+# swapped in place (SOURCES.txt), byte-different from stock. item*.png are
+# byte-identical to the stock dump and stay excluded, as do the *_s and
+# album/explorer/net_radio files nothing resolves.
+!/assets/theme2/category/
+/assets/theme2/category/*
+!/assets/theme2/category/SOURCES.txt
+!/assets/theme2/category/all.png
+!/assets/theme2/category/artist.png
+!/assets/theme2/category/album_artist.png
+!/assets/theme2/category/genre.png
 
 # Korean.ttf-derived host-simulator font: excluded, unlike the rest of
 # assets/fonts/, because this particular file's own embedded metadata

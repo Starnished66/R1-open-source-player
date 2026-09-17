@@ -82,8 +82,7 @@ https://scripts.sil.org/OFL
 Not stock-firmware content -- HiBy's own firmware has no emoji font to
 piggyback on (unlike Thai.ttf/Korean.ttf below, or Latin/CJK/Cyrillic
 coverage). This project ships its own copy for both host and target.
-`assets/fonts/emoji.ttf` (this file) is a symlink to the single real copy
-at `firmware/overlay/usr/resource/fonts/emoji.ttf`, which
+`assets/fonts/emoji.ttf` (this file) is the single real copy, which
 `scripts/repack_upt.sh` copies onto the device's `/usr/resource/fonts/`
 directory as part of a full firmware repack -- the same mechanism this
 project already uses to ship other files it owns that aren't in stock

@@ -15,23 +15,38 @@
 /libexecinfo
 /jpeg
 
-# Stock-firmware UI assets (theme2 PNGs). Proprietary HiBy graphics --
-# never redistributed, see README.md's own note on this. Populate this
-# locally from your own device/firmware dump if you want to build with the
-# real UI; assets/fonts/ (this repo's own, openly-licensed subsets, see its
-# own NOTICE.md) is tracked normally.
+# theme2 UI assets. This tree mirrors the device layout: everything tracked
+# here is copied to /usr/resource/litegui/theme2/ by scripts/repack_upt.sh,
+# so a tracked file is exactly a shipped file.
 #
-# A handful of files under here are exceptions, confirmed NOT present in a
-# genuine stock firmware dump (diffed directly against one) -- this app's
-# own boot animation and Subsonic integration icons, not HiBy IP, so they're
-# safe to track normally. Excluding everything else in the tree first, then
-# re-including just those specific paths one directory level at a time --
-# git won't apply a file-level negation inside a directory that's still
-# itself excluded, so each level needs its own `!` before the next. Anyone
-# who populates the rest of this directory locally from their own firmware
-# dump (per the note above) won't have those real stock files
-# accidentally un-ignored by this.
+# Stock HiBy graphics are proprietary and never redistributed (see README.md's
+# own note). Populate those locally from your own device/firmware dump; the
+# blanket exclude below keeps them from being committed by accident.
+#
+# Everything re-included below is this project's own work, each directory
+# carrying its own SOURCES.txt recording the upstream icon set and license
+# (Phosphor/Lucide MIT, Montserrat OFL) or confirmed absent from a genuine
+# stock dump. Excluding everything first, then re-including specific paths one
+# directory level at a time -- git won't apply a file-level negation inside a
+# directory that is still itself excluded, so each level needs its own `!`
+# before the next.
 /assets/theme2/*
+
+# Wholly ours, minus the stock files that happen to share the directory.
+!/assets/theme2/power_action/
+!/assets/theme2/pull_down/
+/assets/theme2/pull_down/bg.png
+!/assets/theme2/topbar/
+/assets/theme2/topbar/*
+!/assets/theme2/topbar/lucide_*.png
+!/assets/theme2/topbar/LUCIDE_SOURCES.txt
+!/assets/theme2/topbar/SOURCES.txt
+!/assets/theme2/topbar/aac.png
+!/assets/theme2/topbar/sbc.png
+!/assets/theme2/topbar/ldac.png
+!/assets/theme2/topbar/aptx.png
+!/assets/theme2/topbar/aptx_hd.png
+!/assets/theme2/topbar/uat.png
 !/assets/theme2/boot_animation/
 /assets/theme2/boot_animation/*
 !/assets/theme2/boot_animation/en/
@@ -48,14 +63,10 @@
 !/assets/theme2/playing_plane/
 /assets/theme2/playing_plane/*
 !/assets/theme2/playing_plane/airplay_logo_white.png
+# Wholly ours (SOURCES.txt / LIST_SOURCES.txt), except the per-tile list
+# backgrounds, which nothing renders since the tiles went flat.
 !/assets/theme2/wireless/
-/assets/theme2/wireless/*
-!/assets/theme2/wireless/list_wifi.png
-!/assets/theme2/wireless/list_bt.png
-!/assets/theme2/wireless/list_airplay.png
-!/assets/theme2/wireless/list_dlna.png
-!/assets/theme2/wireless/list_remote.png
-!/assets/theme2/wireless/list_import.png
+/assets/theme2/wireless/list_bg_*.png
 
 # Korean.ttf-derived host-simulator font: excluded, unlike the rest of
 # assets/fonts/, because this particular file's own embedded metadata

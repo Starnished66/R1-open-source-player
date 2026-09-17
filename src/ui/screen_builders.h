@@ -113,6 +113,7 @@ lv_obj_t * build_list_message(lv_obj_t * parent, const char * title, const char 
  * scrolling row -- never call this directly from a new call site instead of
  * going through that. */
 void row_label_apply_bounded_height(lv_obj_t * label, const lv_font_t * font);
+int32_t row_label_bounded_height(const lv_font_t * font);
 /* Theming: shared, mutable bg_color styles for the app's other two
  * "background categories" -- attach with lv_obj_add_style(x, &style_theme_screen_bg, 0)
  * on every screen root, or &style_theme_card_bg on every popup/EQ-card/
@@ -612,6 +613,18 @@ lv_obj_t * add_pill_chevron_row(lv_obj_t * parent, const char * label_text, lv_e
 lv_obj_t * add_pill_option_row(lv_obj_t * parent, const char * label_text, bool selected,
                               lv_event_cb_t on_click, void * user_data);
 lv_obj_t * add_section_header(lv_obj_t * parent, const char * text);
+
+/* Radial accent glow behind an icon -- same technique the Home screen's
+ * tiles use (add_icon_glow's own doc comment there has the full mechanics):
+ * bakes a small ARGB8888 blob once and draws it centered on `wrapper`
+ * during `tile`'s own LV_EVENT_DRAW_MAIN, so it composites correctly with
+ * screen transitions like an ordinary image. `color` is 0xRRGGBB (0 is a
+ * no-op); `diameter` is the glow bitmap's own size in pixels, not the
+ * icon's -- make it comfortably larger than the icon for it to read as a
+ * glow rather than a tight outline. `tile` owns the glow's lifetime (freed
+ * on the tile's own LV_EVENT_DELETE), so it doesn't need a separate
+ * teardown call as long as `tile` itself gets deleted normally. */
+void add_icon_glow(lv_obj_t * tile, lv_obj_t * wrapper, uint32_t color, int32_t diameter);
 
 int find_nearest_step_index(const int * steps, int count, int value);
 

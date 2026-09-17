@@ -21,6 +21,7 @@
 #include "metadata.h"
 #include "db_log.h"
 #include "audio.h"
+#include "hw_volume_coalesce.h"
 #include "settings.h"
 #include "assets.h"
 #include "device_config.h"
@@ -81,6 +82,7 @@ static bool quick_drawer_snapshot_dirty = true;
 static bool quick_drawer_open = false;
 
 #define QUICK_DRAWER_TRIGGER_ZONE BOARD_SCALE_PX(140)
+#define QUICK_DRAWER_COVER_PX 150
 
 static void start_bt_dac_startup_reapply_if_needed(void);
 static void start_bt_source_codec_reconcile_if_needed(void);
@@ -149,8 +151,211 @@ static lv_obj_t * home_indicator_band = NULL;
 static lv_obj_t * quick_drawer_title_label = NULL;
 static lv_obj_t * quick_drawer_artist_label = NULL;
 static lv_obj_t * quick_drawer_favorite_icon = NULL;
+static lv_obj_t * quick_drawer_cover_img = NULL;
+static lv_obj_t * quick_drawer_cover_frame = NULL;
 static lv_obj_t * quick_drawer_play_btn = NULL;
 static lv_obj_t * quick_drawer_order_icon = NULL;
+static lv_obj_t * quick_drawer_volume_track = NULL;
+static lv_obj_t * quick_drawer_volume_label = NULL;
+/* Shared with gui_player.c's own volume popup via hw_volume_coalesce.h --
+ * see that header's own comment for why this replaced a second, simpler,
+ * worse copy of the same debounce (this used to call audio_request_
+ * volume() directly and untethered on every drag tick, which is what made
+ * this slider feel sluggish). Own instance: only one slider can be
+ * mid-drag at a time (single touch), but there is no reason to share the
+ * popup's own timer/pending state, only this code. */
+static hw_volume_coalesce_t quick_drawer_volume_hv = { .pending = -1 };
+/* 4 native row-1 toggles + 4 native row-2 ones (qd_toggle_t, declared further
+ * down) + PLUGIN_MAX_QUICK_TOGGLES row-3 plugin tiles. Not expressed as
+ * QD_TOGGLE_COUNT + ... because that enum is declared below this point. */
+#define QUICK_DRAWER_TOGGLE_SLOTS (8 + PLUGIN_MAX_QUICK_TOGGLES)
+static lv_obj_t * quick_drawer_toggle_state[QUICK_DRAWER_TOGGLE_SLOTS];
+
+/* ---- Expanded area ----------------------------------------------------
+ * The handle under the first toggle row drags down to reveal two more rows.
+ * Both slider rails shift down by exactly the revealed height, and the
+ * now-playing card hides for the duration -- there is no room for both.
+ *
+ * The rows live inside quick_drawer_expansion_box, whose HEIGHT is the
+ * animation: LVGL clips children to their parent, so growing the box from
+ * zero wipes the rows into view without touching their own geometry. One
+ * resize per frame, rather than fading ~18 objects individually -- a
+ * subtree opacity would force a composited layer every frame, which this
+ * file already avoids for drawer motion (see quick_drawer_begin_bitmap_
+ * motion()'s own snapshot reasoning). */
+/* A toggle row is ~123px of content (84px icon + name + state caption), so
+ * a 148 pitch leaves ~25px between rows where 128 left ~5. The taller panel
+ * pays for it: fully expanded, the volume rail now ends at 724 against a
+ * panel bottom of 785. */
+#define QUICK_DRAWER_TOGGLE_ROW_PITCH BOARD_SCALE_PX(148)
+/* 231, not 219: row 1's state caption ends at ~219, so the old value butted
+ * row 2 straight against it with no gap at all. */
+#define QUICK_DRAWER_EXPANSION_TOP BOARD_SCALE_PX(231)
+
+static lv_obj_t * quick_drawer_expansion_box = NULL;
+static lv_obj_t * quick_drawer_expansion_handle = NULL;
+static lv_obj_t * quick_drawer_card = NULL;
+static lv_obj_t * quick_drawer_airplay_icon = NULL;
+static lv_obj_t * quick_drawer_dlna_icon = NULL;
+static lv_obj_t * quick_drawer_rc_icon = NULL;
+static lv_obj_t * quick_drawer_plugin_icon[PLUGIN_MAX_QUICK_TOGGLES];
+static int quick_drawer_plugin_toggle_count = 0;
+static int32_t quick_drawer_expansion_full = 0; /* height when fully open */
+static int32_t quick_drawer_expansion_y = 0;    /* current, 0..full */
+static bool quick_drawer_expanded = false;
+
+/* Everything that slides down by the revealed height, captured at build time
+ * with its own collapsed y so applying a shift is one lv_obj_set_y() per
+ * entry and never re-derives geometry. lv_obj_set_y() is correct for the
+ * lv_obj_align()-positioned entries too: align mode is stored separately and
+ * stays put, so this just replaces the y offset it aligns by. */
+#define QUICK_DRAWER_SHIFT_MAX 12
+static struct {
+    lv_obj_t * obj;
+    int32_t base_y;
+} quick_drawer_shift_objs[QUICK_DRAWER_SHIFT_MAX];
+static int quick_drawer_shift_count = 0;
+
+static void quick_drawer_register_shift_obj(lv_obj_t * obj, int32_t base_y) {
+    if (!obj || quick_drawer_shift_count >= QUICK_DRAWER_SHIFT_MAX) return;
+    quick_drawer_shift_objs[quick_drawer_shift_count].obj = obj;
+    quick_drawer_shift_objs[quick_drawer_shift_count].base_y = base_y;
+    quick_drawer_shift_count++;
+}
+
+static void quick_drawer_apply_expansion(int32_t y) {
+    if (y < 0) y = 0;
+    if (y > quick_drawer_expansion_full) y = quick_drawer_expansion_full;
+    quick_drawer_expansion_y = y;
+    if (quick_drawer_expansion_box) lv_obj_set_height(quick_drawer_expansion_box, y);
+    for (int i = 0; i < quick_drawer_shift_count; i++)
+        lv_obj_set_y(quick_drawer_shift_objs[i].obj, quick_drawer_shift_objs[i].base_y + y);
+    /* Hidden the moment the expansion is off zero -- even a partly-shifted
+     * volume rail already overlaps the card's top edge. */
+    if (quick_drawer_card) {
+        if (y > 0) lv_obj_add_flag(quick_drawer_card, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(quick_drawer_card, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void quick_drawer_expansion_anim_cb(void * var, int32_t v) {
+    (void) var;
+    quick_drawer_apply_expansion(v);
+}
+
+static void quick_drawer_expansion_anim_done_cb(lv_anim_t * a) {
+    (void) a;
+    quick_drawer_mark_snapshot_dirty();
+}
+
+/* Defined below, past the qd_toggle_t table it reads. */
+static void refresh_quick_drawer_expansion_toggles(void);
+
+static void quick_drawer_animate_expansion(bool expand) {
+    if (!quick_drawer_expansion_box || quick_drawer_expansion_full <= 0) return;
+    /* Re-read on the way open rather than when the drawer opens -- see
+     * open_quick_drawer()'s own comment on why this must not run there. */
+    if (expand) refresh_quick_drawer_expansion_toggles();
+    quick_drawer_expanded = expand;
+    int32_t target = expand ? quick_drawer_expansion_full : 0;
+    lv_anim_delete(quick_drawer_expansion_box, quick_drawer_expansion_anim_cb);
+    if (quick_drawer_expansion_y == target) {
+        quick_drawer_mark_snapshot_dirty();
+        return;
+    }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, quick_drawer_expansion_box);
+    lv_anim_set_values(&a, quick_drawer_expansion_y, target);
+    lv_anim_set_duration(&a, QUICK_DRAWER_ANIM_MS);
+    lv_anim_set_exec_cb(&a, quick_drawer_expansion_anim_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_completed_cb(&a, quick_drawer_expansion_anim_done_cb);
+    lv_anim_start(&a);
+}
+
+/* Back to collapsed with no animation -- the drawer always opens in its
+ * unexpanded state, so this runs on close rather than leaving the expansion
+ * to reappear mid-slide the next time it is pulled down. */
+static void quick_drawer_reset_expansion(void) {
+    if (quick_drawer_expansion_box)
+        lv_anim_delete(quick_drawer_expansion_box, quick_drawer_expansion_anim_cb);
+    quick_drawer_expanded = false;
+    quick_drawer_apply_expansion(0);
+}
+
+static void quick_drawer_expansion_handle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    /* A drag that already moved the expansion consumes its own release in
+     * poll_quick_drawer_drag(); only a genuine tap reaches here. */
+    quick_drawer_animate_expansion(!quick_drawer_expanded);
+}
+
+static void quick_drawer_volume_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    int percent = (int) lv_slider_get_value(lv_event_get_target(e));
+    if (code == LV_EVENT_PRESSED) {
+        hw_volume_coalesce_drag_begin(&quick_drawer_volume_hv);
+        return;
+    }
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        hw_volume_coalesce_drag_update(&quick_drawer_volume_hv, percent);
+        if (quick_drawer_volume_label) lv_label_set_text_fmt(quick_drawer_volume_label, "%d", percent);
+        refresh_volume_topbar(percent);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        hw_volume_coalesce_drag_end(&quick_drawer_volume_hv, percent);
+        /* Authoritative settled value -- sync the Player screen's own
+         * volume_slider mirror now, same as the popup's own release
+         * handler does, instead of on every drag tick (its previous spot)
+         * -- that also fired a cross-file lv_slider_set_value() call on
+         * every tick, one of the other costs stacking on top of the
+         * un-throttled audio call to make this feel sluggish. */
+        gui_player_set_volume_percent(percent);
+        current_settings.volume = (float) percent / 100.0f;
+        /* Async, not sync, matching this same file's own
+         * quick_drawer_brightness_changed_cb() release branch -- a fast
+         * release must not block the UI thread on a synchronous file
+         * write. */
+        settings_save_async(&current_settings);
+        quick_drawer_mark_snapshot_dirty();
+    }
+}
+
+static void quick_drawer_refresh_volume(void) {
+    if (!quick_drawer_volume_track || quick_drawer_volume_hv.drag_active) return;
+    int percent = (int) gui_player_get_volume_percent();
+    lv_slider_set_value(quick_drawer_volume_track, percent, LV_ANIM_OFF);
+    if (quick_drawer_volume_label) lv_label_set_text_fmt(quick_drawer_volume_label, "%d", percent);
+}
+
+/* `text` overrides the usual "On"/"Off" caption -- a plugin tile can publish
+ * its own pair (GainMode's "High"/"Low"). NULL keeps the default. */
+static void quick_drawer_set_toggle_state_text(int index, bool enabled, const char * text) {
+    if (index < 0 || index >= QUICK_DRAWER_TOGGLE_SLOTS) return;
+    if (!quick_drawer_toggle_state[index]) return;
+    lv_label_set_text(quick_drawer_toggle_state[index], text ? text : (enabled ? "On" : "Off"));
+    lv_obj_set_style_text_color(quick_drawer_toggle_state[index],
+                                enabled ? accent_lv_color() : lv_color_hex(0x8d918f), 0);
+    quick_drawer_mark_snapshot_dirty();
+}
+
+static void quick_drawer_set_toggle_state(int index, bool enabled) {
+    quick_drawer_set_toggle_state_text(index, enabled, NULL);
+}
+
+static void quick_drawer_fit_cover(void) {
+    if (!quick_drawer_cover_img || !quick_drawer_cover_frame) return;
+    lv_image_header_t header;
+    if (lv_image_decoder_get_info(lv_image_get_src(quick_drawer_cover_img), &header) != LV_RESULT_OK ||
+        header.w <= 0 || header.h <= 0) return;
+    uint32_t sx = ((uint32_t) BOARD_SCALE_PX(QUICK_DRAWER_COVER_PX) * LV_SCALE_NONE + header.w - 1U) / header.w;
+    uint32_t sy = ((uint32_t) BOARD_SCALE_PX(QUICK_DRAWER_COVER_PX) * LV_SCALE_NONE + header.h - 1U) / header.h;
+    lv_obj_set_size(quick_drawer_cover_img, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_image_set_inner_align(quick_drawer_cover_img, LV_IMAGE_ALIGN_DEFAULT);
+    lv_image_set_scale(quick_drawer_cover_img, sx > sy ? sx : sy);
+    lv_obj_update_layout(quick_drawer_cover_img);
+    lv_obj_align(quick_drawer_cover_img, LV_ALIGN_CENTER, 0, 0);
+}
 
 extern lv_obj_t * gui_books_get_screen();
 extern lv_obj_t * lyrics_screen;
@@ -691,6 +896,10 @@ void refresh_battery_topbar(void) {
 void refresh_volume_topbar(int32_t percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
+    if (quick_drawer_volume_track && !quick_drawer_volume_hv.drag_active) {
+        lv_slider_set_value(quick_drawer_volume_track, percent, LV_ANIM_OFF);
+        if (quick_drawer_volume_label) lv_label_set_text_fmt(quick_drawer_volume_label, "%d", percent);
+    }
 
     char digits[4];
     snprintf(digits, sizeof(digits), "%d", (int) percent);
@@ -842,6 +1051,173 @@ static void wifi_status_observe_enabled(bool enabled) {
     wifi_status_level = 0;
 }
 
+/* The drawer's four "on" toggle icons are a filled circle in the stock
+ * #009FF6 with a near-white glyph on top. LVGL image_recolor mixes every
+ * pixel toward the recolor colour, so gui_theme_accent_style() would tint
+ * the glyph as well -- the same COVER-flattening problem gui_player.c
+ * documents for btn_play.png/btn_pause.png. Rewrite the circle in decoded
+ * pixels instead, exactly as recolor_play_btn_accent() does there: keep the
+ * glyph (and every anti-aliased step toward it) by mixing the accent toward
+ * white in proportion to how white the source pixel already was. A pixel's
+ * minimum channel is that measure -- 0 across the saturated stock blue, 223+
+ * inside the near-white glyph -- so the circle lands on the exact accent and
+ * the glyph stays the glyph. */
+typedef enum {
+    QD_TOGGLE_WIFI = 0,
+    QD_TOGGLE_BT,
+    QD_TOGGLE_SLEEP,
+    QD_TOGGLE_CROSSFADE,
+    /* Row 2, revealed by the expansion handle -- see build_quick_drawer()'s
+     * own comment on the expanded area. */
+    QD_TOGGLE_AIRPLAY,
+    QD_TOGGLE_DLNA,
+    QD_TOGGLE_GAPLESS,
+    QD_TOGGLE_RC,
+    QD_TOGGLE_COUNT
+} qd_toggle_t;
+
+static const char * const qd_toggle_on_asset[QD_TOGGLE_COUNT] = {
+    "pull_down/wifi_s.png",
+    "pull_down/bt_s.png",
+    "pull_down/sleep_switch_s.png",
+    "pull_down/fade_s.png",
+    "pull_down/airplay_s.png",
+    "pull_down/dlna_s.png",
+    "pull_down/gapless_play_s.png",
+    "pull_down/hibylink_s.png",
+};
+static const char * const qd_toggle_off_asset[QD_TOGGLE_COUNT] = {
+    "pull_down/wifi.png",
+    "pull_down/bt.png",
+    "pull_down/sleep_switch.png",
+    "pull_down/fade.png",
+    "pull_down/airplay.png",
+    "pull_down/dlna.png",
+    "pull_down/gapless_play.png",
+    "pull_down/hibylink.png",
+};
+static asset_decoded_image_t qd_toggle_on_img[QD_TOGGLE_COUNT];
+
+/* Row 3's tiles come from plugin.register_quick_toggle() rather than the
+ * fixed table above, so their "on" artwork is decoded per registered toggle
+ * (same accent recolor, just a runtime icon path). */
+static asset_decoded_image_t qd_plugin_toggle_on_img[PLUGIN_MAX_QUICK_TOGGLES];
+
+static void recolor_toggle_on_accent(lv_draw_buf_t * buf, lv_color_t accent) {
+    if (!buf || !buf->data || !buf->header.w || !buf->header.h ||
+        buf->header.cf != LV_COLOR_FORMAT_ARGB8888) return;
+    uint32_t w = buf->header.w;
+    uint32_t h = buf->header.h;
+    uint32_t stride = buf->header.stride;
+    for (uint32_t y = 0; y < h; y++) {
+        lv_color32_t * row = (lv_color32_t *) (buf->data + y * stride);
+        for (uint32_t x = 0; x < w; x++) {
+            if (row[x].alpha == 0) continue; /* outside the circle -- leave transparent */
+            uint8_t t = row[x].red;
+            if (row[x].green < t) t = row[x].green;
+            if (row[x].blue < t) t = row[x].blue;
+            row[x].red   = (uint8_t) (accent.red   + ((uint16_t) (255 - accent.red)   * t) / 255);
+            row[x].green = (uint8_t) (accent.green + ((uint16_t) (255 - accent.green) * t) / 255);
+            row[x].blue  = (uint8_t) (accent.blue  + ((uint16_t) (255 - accent.blue)  * t) / 255);
+        }
+    }
+}
+
+static void load_quick_drawer_toggle_on_images(void) {
+    lv_color_t accent = accent_lv_color();
+    for (int i = 0; i < QD_TOGGLE_COUNT; i++) {
+        asset_decoded_image_close(&qd_toggle_on_img[i]);
+        if (asset_decoded_image_open(&qd_toggle_on_img[i], qd_toggle_on_asset[i]))
+            recolor_toggle_on_accent((lv_draw_buf_t *) qd_toggle_on_img[i].decoder.decoded, accent);
+    }
+    int plugin_count = plugin_manager_get_quick_toggle_count();
+    if (plugin_count > PLUGIN_MAX_QUICK_TOGGLES) plugin_count = PLUGIN_MAX_QUICK_TOGGLES;
+    for (int i = 0; i < PLUGIN_MAX_QUICK_TOGGLES; i++) {
+        asset_decoded_image_close(&qd_plugin_toggle_on_img[i]);
+        if (i >= plugin_count) continue;
+        if (asset_decoded_image_open(&qd_plugin_toggle_on_img[i],
+                                     plugin_manager_get_quick_toggle_icon_selected(i)))
+            recolor_toggle_on_accent((lv_draw_buf_t *) qd_plugin_toggle_on_img[i].decoder.decoded, accent);
+    }
+}
+
+/* Off state stays the stock grey circle (nothing accent-coloured about it),
+ * so only the on state goes through the decoded copy -- with the plain asset
+ * path as the fallback if that decode ever failed. */
+static const void * quick_drawer_toggle_src(qd_toggle_t t, bool on) {
+    if (!on) return asset_path(qd_toggle_off_asset[t]);
+    const void * src = asset_decoded_image_source(&qd_toggle_on_img[t]);
+    return src ? src : (const void *) asset_path(qd_toggle_on_asset[t]);
+}
+
+/* quick_drawer_toggle_src()'s twin for a row-3 plugin tile, whose two icon
+ * paths come from the registration rather than a compile-time table. */
+static const void * quick_drawer_plugin_toggle_src(int index, bool on) {
+    if (!on) return asset_path(plugin_manager_get_quick_toggle_icon(index));
+    const void * src = (index >= 0 && index < PLUGIN_MAX_QUICK_TOGGLES)
+                           ? asset_decoded_image_source(&qd_plugin_toggle_on_img[index])
+                           : NULL;
+    return src ? src : (const void *) asset_path(plugin_manager_get_quick_toggle_icon_selected(index));
+}
+
+/* Re-reads every expanded-row toggle from its authoritative source. Called
+ * when the drawer opens rather than pushed to on change: three of these are
+ * network services whose real state can move underneath us (a Wi-Fi drop
+ * disables all of them via gui_network_handle_wifi_disabled()), and the
+ * plugin tiles are documented as read-on-open. */
+static void refresh_quick_drawer_expansion_toggles(void) {
+    if (!quick_drawer_expansion_box) return;
+
+    bool airplay = current_settings.wifi_dac_mode_enabled;
+    if (quick_drawer_airplay_icon)
+        lv_image_set_src(quick_drawer_airplay_icon, quick_drawer_toggle_src(QD_TOGGLE_AIRPLAY, airplay));
+    quick_drawer_set_toggle_state(QD_TOGGLE_AIRPLAY, airplay);
+
+    bool dlna = current_settings.dlna_renderer_enabled;
+    if (quick_drawer_dlna_icon)
+        lv_image_set_src(quick_drawer_dlna_icon, quick_drawer_toggle_src(QD_TOGGLE_DLNA, dlna));
+    quick_drawer_set_toggle_state(QD_TOGGLE_DLNA, dlna);
+
+    bool rc = current_settings.remote_control_enabled;
+    if (quick_drawer_rc_icon)
+        lv_image_set_src(quick_drawer_rc_icon, quick_drawer_toggle_src(QD_TOGGLE_RC, rc));
+    quick_drawer_set_toggle_state(QD_TOGGLE_RC, rc);
+
+    for (int i = 0; i < quick_drawer_plugin_toggle_count; i++) {
+        bool on = plugin_manager_get_quick_toggle_value(i);
+        if (quick_drawer_plugin_icon[i])
+            lv_image_set_src(quick_drawer_plugin_icon[i], quick_drawer_plugin_toggle_src(i, on));
+        quick_drawer_set_toggle_state_text(QD_TOGGLE_COUNT + i, on,
+                                           plugin_manager_get_quick_toggle_state_text(i, on));
+    }
+}
+
+static void quick_drawer_airplay_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_network_toggle_airplay();
+    refresh_quick_drawer_expansion_toggles();
+}
+
+static void quick_drawer_dlna_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_network_toggle_dlna();
+    refresh_quick_drawer_expansion_toggles();
+}
+
+static void quick_drawer_rc_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_network_toggle_remote_control();
+    refresh_quick_drawer_expansion_toggles();
+}
+
+static void quick_drawer_plugin_toggle_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int index = (int) (intptr_t) lv_event_get_user_data(e);
+    if (index < 0 || index >= quick_drawer_plugin_toggle_count) return;
+    plugin_manager_quick_toggle_set(index, !plugin_manager_get_quick_toggle_value(index));
+    refresh_quick_drawer_expansion_toggles();
+}
+
 static void render_wifi_icon(void) {
     /* Keep an in-flight enable visually enabled even before wlan0's
      * wpa_supplicant socket exists.  Association is still queried below,
@@ -852,9 +1228,10 @@ static void render_wifi_icon(void) {
      * failure normally. */
     bool enabled = gui_shell_wifi_effective_enabled();
     if (quick_drawer_wifi_icon) {
-        lv_image_set_src(quick_drawer_wifi_icon, asset_path(enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
+        lv_image_set_src(quick_drawer_wifi_icon, quick_drawer_toggle_src(QD_TOGGLE_WIFI, enabled));
         quick_drawer_mark_snapshot_dirty();
     }
+    quick_drawer_set_toggle_state(0, enabled);
 
     if (!enabled) {
         lv_obj_add_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
@@ -1338,9 +1715,10 @@ static void poll_refresh_bt_icon(void) {
     snprintf(bt_connected_mac_cached, sizeof(bt_connected_mac_cached), "%s", a2dp_connected ? refresh_bt_icon_result_mac : "");
     snprintf(bt_connected_codec_cached, sizeof(bt_connected_codec_cached), "%s", a2dp_connected ? refresh_bt_icon_result_codec : "");
     if (quick_drawer_bt_icon) {
-        lv_image_set_src(quick_drawer_bt_icon, asset_path(display_powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
+        lv_image_set_src(quick_drawer_bt_icon, quick_drawer_toggle_src(QD_TOGGLE_BT, display_powered));
         quick_drawer_mark_snapshot_dirty();
     }
+    quick_drawer_set_toggle_state(1, display_powered);
 
     if (!display_powered) {
         clear_bt_audio_route_now();
@@ -1532,7 +1910,8 @@ static lv_obj_t * quick_drawer_crossfade_icon;
 void refresh_quick_drawer_crossfade_icon(void) {
     if (!quick_drawer_crossfade_icon) return;
     lv_image_set_src(quick_drawer_crossfade_icon,
-                     asset_path(current_settings.crossfade_enabled ? "pull_down/fade_s.png" : "pull_down/fade.png"));
+                     quick_drawer_toggle_src(QD_TOGGLE_CROSSFADE, current_settings.crossfade_enabled));
+    quick_drawer_set_toggle_state(3, current_settings.crossfade_enabled);
     quick_drawer_mark_snapshot_dirty();
 }
 
@@ -1545,6 +1924,7 @@ static void quick_drawer_crossfade_event_cb(lv_event_t * e) {
     audio_set_crossfade_enabled(current_settings.crossfade_enabled);
     settings_save(&current_settings);
     refresh_quick_drawer_crossfade_icon();
+
     gui_settings_sync_crossfade_toggle();
 }
 
@@ -1571,14 +1951,18 @@ static lv_obj_t * quick_drawer_sleep_label;
  * but still calls that same sync afterward. */
 static void apply_sleep_timer_active(bool active) {
     sleep_timer_active = active;
+    quick_drawer_set_toggle_state(2, sleep_timer_active);
     if (sleep_timer_active) {
         sleep_timer_start_tick = lv_tick_get();
-        lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch_s.png"));
+        lv_image_set_src(quick_drawer_sleep_icon, quick_drawer_toggle_src(QD_TOGGLE_SLEEP, true));
         lv_label_set_text_fmt(quick_drawer_sleep_label, "%dm", current_settings.sleep_timer_minutes);
-        lv_obj_remove_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
+        /* The measured drawer reserves the state row for "On"/"Off"; keep
+         * the minute countdown internal so it cannot collide with that row. */
+        lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
         lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
+        quick_drawer_set_toggle_state(2, false);
     }
     quick_drawer_mark_snapshot_dirty();
 }
@@ -1622,6 +2006,7 @@ static void poll_sleep_timer(void) {
         if (audio_is_playing()) toggle_play_pause(); /* pause, not stop -- resumable, same as any other pause */
         lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
         lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
+        quick_drawer_set_toggle_state(2, false);
         quick_drawer_mark_snapshot_dirty();
         gui_settings_sync_sleep_timer_toggle(); /* Settings' toggle must not keep showing armed once expiry disarmed it */
         return;
@@ -1740,8 +2125,19 @@ static void quick_drawer_finish_bitmap_motion(void) {
         lv_obj_add_flag(quick_drawer_motion_image, LV_OBJ_FLAG_HIDDEN);
     }
     quick_drawer_bitmap_motion = false;
-    if (!quick_drawer_open)
+    if (!quick_drawer_open) {
         transition_compositor_discard_vertical_base();
+        /* Collapse here, off-screen, rather than on the next open: the
+         * snapshot was last rebuilt while the drawer was still expanded, so
+         * collapsing at open time would leave that stale expanded image to
+         * animate in and visibly pop to collapsed once motion finished.
+         * Doing it now lets the rebuild below produce a clean collapsed
+         * snapshot while nothing is visible. */
+        if (quick_drawer_expansion_y != 0) {
+            quick_drawer_reset_expansion();
+            quick_drawer_snapshot_dirty = true;
+        }
+    }
     if (quick_drawer_snapshot_dirty || quick_drawer_open)
         lv_async_call(quick_drawer_snapshot_async_cb, NULL);
 }
@@ -1755,6 +2151,14 @@ void open_quick_drawer(void) {
     if (quick_drawer_open) return;
     quick_drawer_open = true;
     refresh_quick_drawer_brightness(); /* see its own comment -- keeps the slider from showing a stale pre-screen-off value */
+    quick_drawer_refresh_volume();
+    /* Always opens collapsed. The expanded rows' state is deliberately NOT
+     * re-read here: refreshing them marks the snapshot dirty, which would
+     * make quick_drawer_begin_bitmap_motion() below bail into live-tree
+     * motion on every single open -- exactly the hitch its own comment
+     * documents. They are invisible at this point anyway, so the read
+     * happens when the expansion actually starts instead. */
+    quick_drawer_reset_expansion();
     quick_drawer_begin_bitmap_motion();
     lv_obj_move_foreground(quick_drawer); /* above regular screens/volume popup while showing */
     /* ...but the status bar (clock/battery/wifi/bt) stays above THAT --
@@ -2120,6 +2524,46 @@ static bool quick_drawer_brightness_hit_test(lv_point_t point) {
            point.y >= area.y1 && point.y <= area.y2;
 }
 
+/* quick_drawer_brightness_hit_test()'s own twin for the volume slider --
+ * this one was missing entirely, which was the real cause of "dragging the
+ * volume slider sometimes stops tracking / triggers a swipe": without it,
+ * drag_adjust_press_owned below fell back to active_object_is_drag_adjust_
+ * widget() alone, which reads lv_indev_get_active_obj() -- state LVGL's own
+ * indev processing updates independently of this timer's own 16ms poll, so
+ * on some press-downs (this timer racing ahead of that update, more likely
+ * under a fast repeated drag) it read stale state and saw no slider owning
+ * the press. Ownership then fell through to quick_drawer_drag_tracking /
+ * the swipe detectors instead, at which point the slider stopped
+ * following the finger and the drawer itself (or a swipe-up) took over.
+ * A direct, coordinate-based check has no such race. */
+static bool quick_drawer_volume_hit_test(lv_point_t point) {
+    if (!quick_drawer_open || !quick_drawer_volume_track) return false;
+    lv_area_t area;
+    lv_obj_get_coords(quick_drawer_volume_track, &area);
+    lv_area_increase(&area, BOARD_SCALE_PX(44), BOARD_SCALE_PX(44)); /* matches its own ext_click_area */
+    return point.x >= area.x1 && point.x <= area.x2 &&
+           point.y >= area.y1 && point.y <= area.y2;
+}
+
+/* The expansion handle's own twin of the two above. Must be in the same
+ * press-down ownership chain: without it a downward drag starting on the
+ * handle reads as an ordinary drawer drag and closes the drawer instead of
+ * expanding it -- the exact failure the volume rail already hit once. */
+static bool quick_drawer_expansion_handle_hit_test(lv_point_t point) {
+    if (!quick_drawer_open || !quick_drawer_expansion_handle) return false;
+    if (quick_drawer_expansion_full <= 0) return false;
+    lv_area_t area;
+    lv_obj_get_coords(quick_drawer_expansion_handle, &area);
+    lv_area_increase(&area, BOARD_SCALE_PX(30), BOARD_SCALE_PX(30)); /* matches its own ext_click_area */
+    return point.x >= area.x1 && point.x <= area.x2 &&
+           point.y >= area.y1 && point.y <= area.y2;
+}
+
+static bool quick_drawer_expansion_dragging = false;
+static bool quick_drawer_expansion_moved = false;
+static int32_t quick_drawer_expansion_drag_start_y = 0;
+static int32_t quick_drawer_expansion_drag_start_value = 0;
+
 static void poll_quick_drawer_drag(lv_timer_t * timer) {
     lv_indev_t * indev = find_pointer_indev();
     if (!indev) return;
@@ -2132,9 +2576,22 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
     if (pressed && !quick_drawer_was_pressed) {
         /* Gesture ownership is decided once at press-down. A fast slider
          * drag may leave its bounds, but it remains a slider drag until lift. */
+        quick_drawer_expansion_dragging = quick_drawer_expansion_handle_hit_test(p);
+        quick_drawer_expansion_moved = false;
+        if (quick_drawer_expansion_dragging) {
+            lv_anim_delete(quick_drawer_expansion_box, quick_drawer_expansion_anim_cb);
+            quick_drawer_expansion_drag_start_y = p.y;
+            quick_drawer_expansion_drag_start_value = quick_drawer_expansion_y;
+            /* Same read-on-the-way-open as the animated path, for a drag
+             * that reveals the rows without going through it. */
+            if (quick_drawer_expansion_y == 0) refresh_quick_drawer_expansion_toggles();
+        }
+
         drag_adjust_press_owned = active_object_is_drag_adjust_widget() ||
                                   point_in_swipe_dead_zone(p) ||
                                   quick_drawer_brightness_hit_test(p) ||
+                                  quick_drawer_volume_hit_test(p) ||
+                                  quick_drawer_expansion_dragging ||
                                   gui_player_volume_control_hit_test(p);
     }
 
@@ -2464,6 +2921,37 @@ static void poll_quick_drawer_drag(lv_timer_t * timer) {
         }
     }
 
+    /* Expansion drag: tracks the finger 1:1 between collapsed and fully
+     * open. Runs before the drawer's own drag block below, which cannot be
+     * active at the same time -- drag_adjust_press_owned took this press. */
+    if (pressed && quick_drawer_expansion_dragging) {
+        int32_t raw_delta = p.y - quick_drawer_expansion_drag_start_y;
+        if (!quick_drawer_expansion_moved &&
+            (raw_delta > QUICK_DRAWER_DRAG_DEADZONE || raw_delta < -QUICK_DRAWER_DRAG_DEADZONE)) {
+            /* Past the deadzone this is a drag, not a tap on the handle --
+             * suppress the release so quick_drawer_expansion_handle_cb()
+             * cannot also fire and immediately undo the snap below. */
+            quick_drawer_expansion_moved = true;
+            lv_indev_wait_release(indev);
+        }
+        if (quick_drawer_expansion_moved) {
+            int32_t adjusted = raw_delta > 0 ? raw_delta - QUICK_DRAWER_DRAG_DEADZONE
+                                             : raw_delta + QUICK_DRAWER_DRAG_DEADZONE;
+            quick_drawer_apply_expansion(quick_drawer_expansion_drag_start_value + adjusted);
+        }
+    }
+
+    if (!pressed && quick_drawer_was_pressed && quick_drawer_expansion_dragging) {
+        quick_drawer_expansion_dragging = false;
+        if (quick_drawer_expansion_moved) {
+            /* Snap to whichever end the drag ended nearer. A tap that never
+             * left the deadzone falls through to the handle's own CLICKED
+             * handler instead. */
+            quick_drawer_animate_expansion(quick_drawer_expansion_y * 2 >= quick_drawer_expansion_full);
+            quick_drawer_expansion_moved = false;
+        }
+    }
+
     if (pressed && quick_drawer_drag_tracking) {
         /* Deadzone before moving panel: suppresses minor jitter during taps
          * and long-presses so child widgets (icons) do not receive PRESS_LOST.
@@ -2754,7 +3242,7 @@ void quick_drawer_wifi_event_cb(lv_event_t * e) {
      * is what makes the tap read as instant. poll_wifi_toggle() still
      * re-reads the real state once the thread lands and corrects this if
      * the toggle unexpectedly failed. */
-    lv_image_set_src(quick_drawer_wifi_icon, asset_path(wifi_will_be_enabled ? "pull_down/wifi_s.png" : "pull_down/wifi.png"));
+    lv_image_set_src(quick_drawer_wifi_icon, quick_drawer_toggle_src(QD_TOGGLE_WIFI, wifi_will_be_enabled));
     quick_drawer_mark_snapshot_dirty();
 
     /* Optimistically update the topbar Wi-Fi icon alongside the drawer icon.
@@ -2931,7 +3419,7 @@ static void * bt_pending_enable_thread_func(void * arg) {
 }
 
 static void show_optimistic_bt_state(bool powered) {
-    lv_image_set_src(quick_drawer_bt_icon, asset_path(powered ? "pull_down/bt_s.png" : "pull_down/bt.png"));
+    lv_image_set_src(quick_drawer_bt_icon, quick_drawer_toggle_src(QD_TOGGLE_BT, powered));
     quick_drawer_mark_snapshot_dirty();
 
     bt_disconnect_epoch++;
@@ -3278,12 +3766,66 @@ static void build_quick_drawer(void) {
     lv_obj_remove_style_all(quick_drawer);
     lv_obj_set_size(quick_drawer, w, h);
     lv_obj_set_pos(quick_drawer, 0, -h); /* fully off-screen above until opened */
-    const void * drawer_bg = asset_decoded_image_open(&quick_drawer_bg_image, "pull_down/bg.png")
-                           ? asset_decoded_image_source(&quick_drawer_bg_image) : NULL;
-    lv_obj_set_style_bg_image_src(quick_drawer, drawer_bg ? drawer_bg : asset_path("pull_down/bg.png"), 0);
+    lv_obj_set_style_bg_color(quick_drawer, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(quick_drawer, LV_OPA_COVER, 0);
     lv_obj_remove_flag(quick_drawer, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(quick_drawer, LV_OBJ_FLAG_CLICKABLE); /* swallow touches to whatever's behind while open */
+
+    /* The reference uses one continuous rounded drawer surface.  Keep the
+     * panel independent of the vendor backdrop asset so every native 480x800
+     * coordinate remains explicit and stable across theme revisions. */
+    lv_obj_t * drawer_panel = lv_obj_create(quick_drawer);
+    lv_obj_remove_style_all(drawer_panel);
+    lv_obj_set_pos(drawer_panel, BOARD_SCALE_PX(19), BOARD_SCALE_PX(59));
+    /* 726, not 683: the panel used to stop at y=742 on an 800px screen and
+     * leave 58px of dead space below it. Ends at 785 now, keeping the same
+     * ~15px bottom margin the sides already use. */
+    lv_obj_set_size(drawer_panel, BOARD_SCALE_PX(442), BOARD_SCALE_PX(726));
+    lv_obj_set_style_bg_color(drawer_panel, lv_color_hex(0x0d130f), 0);
+    lv_obj_set_style_bg_opa(drawer_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(drawer_panel, BOARD_SCALE_PX(30), 0);
+    lv_obj_remove_flag(drawer_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_background(drawer_panel);
+
+    quick_drawer_expansion_handle = lv_obj_create(quick_drawer);
+    lv_obj_t * expansion_handle = quick_drawer_expansion_handle;
+    lv_obj_remove_style_all(expansion_handle);
+    lv_obj_set_pos(expansion_handle, BOARD_SCALE_PX(210), BOARD_SCALE_PX(239));
+    lv_obj_set_size(expansion_handle, BOARD_SCALE_PX(59), BOARD_SCALE_PX(8));
+    lv_obj_set_style_bg_color(expansion_handle, lv_color_hex(0x4a4d4b), 0);
+    lv_obj_set_style_bg_opa(expansion_handle, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(expansion_handle, BOARD_SCALE_PX(4), 0);
+    /* A bar this thin is far too small a touch target on its own; the drag
+     * itself is claimed by coordinate hit-test in poll_quick_drawer_drag()
+     * over the same padded rectangle this advertises. */
+    lv_obj_set_ext_click_area(expansion_handle, BOARD_SCALE_PX(30));
+    lv_obj_add_flag(expansion_handle, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(expansion_handle, quick_drawer_expansion_handle_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Brightness first, volume second -- swapped from the reference's own
+     * order at the user's request. Only the container Y (and the matching
+     * icon/track/label Y offsets below) moved; every X position, size, and
+     * per-row delta stays exactly as measured before. */
+    lv_obj_t * brightness_container = lv_obj_create(quick_drawer);
+    lv_obj_remove_style_all(brightness_container);
+    lv_obj_set_pos(brightness_container, BOARD_SCALE_PX(34), BOARD_SCALE_PX(268));
+    lv_obj_set_size(brightness_container, BOARD_SCALE_PX(413), BOARD_SCALE_PX(72));
+    lv_obj_set_style_bg_color(brightness_container, lv_color_hex(0x151b17), 0);
+    lv_obj_set_style_bg_opa(brightness_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(brightness_container, BOARD_SCALE_PX(23), 0);
+
+    lv_obj_t * volume_container = lv_obj_create(quick_drawer);
+    lv_obj_remove_style_all(volume_container);
+    lv_obj_set_pos(volume_container, BOARD_SCALE_PX(34), BOARD_SCALE_PX(355));
+    lv_obj_set_size(volume_container, BOARD_SCALE_PX(413), BOARD_SCALE_PX(73));
+    lv_obj_set_style_bg_color(volume_container, lv_color_hex(0x151b17), 0);
+    lv_obj_set_style_bg_opa(volume_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(volume_container, BOARD_SCALE_PX(23), 0);
+
+    /* Decode the four "on" icons with the current accent before anything
+     * asks for one below -- quick_drawer_toggle_src() falls back to the
+     * plain (stock-blue) asset while these are unloaded. */
+    load_quick_drawer_toggle_on_images();
 
     /* Row 1: every toggle icon (Bluetooth / Wifi / sleep timer / output
      * gain) together in one row -- 4 icons x 84px + 5 gaps of 21px exactly
@@ -3294,21 +3836,21 @@ static void build_quick_drawer(void) {
      * slider left in this drawer. */
     quick_drawer_wifi_icon = lv_image_create(quick_drawer);
     lv_image_set_src(quick_drawer_wifi_icon, asset_path("pull_down/wifi.png"));
-    lv_obj_align(quick_drawer_wifi_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(40), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(30));
+    lv_obj_align(quick_drawer_wifi_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(39), BOARD_SCALE_PX(91));
     lv_obj_add_flag(quick_drawer_wifi_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_wifi_icon, quick_drawer_wifi_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(quick_drawer_wifi_icon, quick_drawer_wifi_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
 
     quick_drawer_bt_icon = lv_image_create(quick_drawer);
     lv_image_set_src(quick_drawer_bt_icon, asset_path("pull_down/bt.png"));
-    lv_obj_align(quick_drawer_bt_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(145), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(30));
+    lv_obj_align(quick_drawer_bt_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(143), BOARD_SCALE_PX(91));
     lv_obj_add_flag(quick_drawer_bt_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_bt_icon, quick_drawer_bt_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(quick_drawer_bt_icon, quick_drawer_bt_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
 
     quick_drawer_sleep_icon = lv_image_create(quick_drawer);
     lv_image_set_src(quick_drawer_sleep_icon, asset_path("pull_down/sleep_switch.png"));
-    lv_obj_align(quick_drawer_sleep_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(250), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(30));
+    lv_obj_align(quick_drawer_sleep_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(251), BOARD_SCALE_PX(91));
     lv_obj_add_flag(quick_drawer_sleep_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_sleep_icon, quick_drawer_sleep_event_cb, LV_EVENT_CLICKED, NULL);
 
@@ -3324,24 +3866,165 @@ static void build_quick_drawer(void) {
     lv_obj_add_flag(quick_drawer_sleep_label, LV_OBJ_FLAG_HIDDEN);
 
     quick_drawer_crossfade_icon = lv_image_create(quick_drawer);
-    lv_obj_align(quick_drawer_crossfade_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(355), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(30));
+    lv_obj_align(quick_drawer_crossfade_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(358), BOARD_SCALE_PX(91));
     lv_obj_add_flag(quick_drawer_crossfade_icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_crossfade_icon, quick_drawer_crossfade_event_cb, LV_EVENT_CLICKED, NULL);
     refresh_quick_drawer_crossfade_icon();
 
-    /* Row 2: screen brightness -- real control, via the standard Linux
+    /* Captions and volume rail complete the reference drawer's first panel.
+     * Fixed &lv_font_montserrat_12, not gui_theme_font(GUI_FONT_ROLE_SUBTEXT)
+     * -- that role scales with Settings > Font Size (app_font_16 underneath),
+     * which is right for reading text but was already too big to fit "Bluetooth"
+     * in this 84px-wide slot below its icon even at the default tier, let alone
+     * BlindMF. Fixed and non-scaling, same "accessibility-independent" choice
+     * build_status_bar() already makes for its own clock/volume/battery faces. */
+    const char * names[] = { "Wi-Fi", "Bluetooth", "Sleep", "Crossfade" };
+    const int label_x[] = { 39, 143, 251, 358 };
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t * name = lv_label_create(quick_drawer);
+        lv_label_set_text(name, names[i]);
+        lv_obj_add_style(name, &style_theme_text_primary, 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_12, 0);
+        lv_obj_set_width(name, BOARD_SCALE_PX(84));
+        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(name, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(label_x[i]), BOARD_SCALE_PX(177));
+        quick_drawer_toggle_state[i] = lv_label_create(quick_drawer);
+        lv_obj_set_width(quick_drawer_toggle_state[i], BOARD_SCALE_PX(84));
+        lv_obj_set_style_text_align(quick_drawer_toggle_state[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(quick_drawer_toggle_state[i], &lv_font_montserrat_12, 0);
+        lv_obj_align(quick_drawer_toggle_state[i], LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(label_x[i]), BOARD_SCALE_PX(199));
+        lv_label_set_text(quick_drawer_toggle_state[i], "Off");
+        lv_obj_set_style_text_color(quick_drawer_toggle_state[i], lv_color_hex(0x8d918f), 0);
+    }
+    quick_drawer_set_toggle_state(0, gui_shell_wifi_effective_enabled());
+    quick_drawer_set_toggle_state(1, bt_control_is_powered());
+    quick_drawer_set_toggle_state(2, sleep_timer_active);
+    quick_drawer_set_toggle_state(3, current_settings.crossfade_enabled);
+
+    /* ---- Expanded rows 2 and 3, inside the clipping box ----------------
+     * Same 4-column grid and same caption geometry as row 1 above, just
+     * offset by whole QUICK_DRAWER_TOGGLE_ROW_PITCH steps and expressed
+     * relative to the box's own top rather than the drawer's. Row 3 exists
+     * only when a plugin registered a quick toggle, so with none installed
+     * the drawer expands by one row instead of two. */
+    quick_drawer_expansion_box = lv_obj_create(quick_drawer);
+    lv_obj_remove_style_all(quick_drawer_expansion_box);
+    lv_obj_set_pos(quick_drawer_expansion_box, 0, QUICK_DRAWER_EXPANSION_TOP);
+    lv_obj_set_width(quick_drawer_expansion_box, BOARD_SCALE_PX(480));
+    lv_obj_set_height(quick_drawer_expansion_box, 0);
+    lv_obj_remove_flag(quick_drawer_expansion_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(quick_drawer_expansion_box, 0, 0);
+
+    quick_drawer_plugin_toggle_count = plugin_manager_get_quick_toggle_count();
+    if (quick_drawer_plugin_toggle_count > PLUGIN_MAX_QUICK_TOGGLES)
+        quick_drawer_plugin_toggle_count = PLUGIN_MAX_QUICK_TOGGLES;
+
+    /* "RC", not "HiBy Link": the stock asset is hibylink.png but what it
+     * actually drives here is remote_control.h's own phone web UI, and the
+     * full name does not fit an 84px slot at any font tier. */
+    static const char * const row2_names[] = { "AirPlay", "DLNA", "Gapless", "RC" };
+    for (int i = 0; i < 4; i++) {
+        int32_t x = BOARD_SCALE_PX(label_x[i]);
+        lv_obj_t * icon = lv_image_create(quick_drawer_expansion_box);
+        lv_obj_set_pos(icon, x, 0);
+        lv_obj_add_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t * name = lv_label_create(quick_drawer_expansion_box);
+        lv_label_set_text(name, row2_names[i]);
+        lv_obj_add_style(name, &style_theme_text_primary, 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_12, 0);
+        lv_obj_set_width(name, BOARD_SCALE_PX(84));
+        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(name, x, BOARD_SCALE_PX(86));
+
+        int slot = QD_TOGGLE_AIRPLAY + i;
+        quick_drawer_toggle_state[slot] = lv_label_create(quick_drawer_expansion_box);
+        lv_obj_set_width(quick_drawer_toggle_state[slot], BOARD_SCALE_PX(84));
+        lv_obj_set_style_text_align(quick_drawer_toggle_state[slot], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(quick_drawer_toggle_state[slot], &lv_font_montserrat_12, 0);
+        lv_obj_set_pos(quick_drawer_toggle_state[slot], x, BOARD_SCALE_PX(108));
+        lv_label_set_text(quick_drawer_toggle_state[slot], "Off");
+        lv_obj_set_style_text_color(quick_drawer_toggle_state[slot], lv_color_hex(0x8d918f), 0);
+
+        switch (slot) {
+            case QD_TOGGLE_AIRPLAY:
+                quick_drawer_airplay_icon = icon;
+                lv_obj_add_event_cb(icon, quick_drawer_airplay_event_cb, LV_EVENT_CLICKED, NULL);
+                break;
+            case QD_TOGGLE_DLNA:
+                quick_drawer_dlna_icon = icon;
+                lv_obj_add_event_cb(icon, quick_drawer_dlna_event_cb, LV_EVENT_CLICKED, NULL);
+                break;
+            case QD_TOGGLE_GAPLESS:
+                /* No gapless code path exists yet (GitHub: pending). Drawn
+                 * dimmed and deliberately left non-interactive rather than
+                 * wired to a no-op -- a tile that visibly does nothing when
+                 * tapped reads as broken, one that is greyed out reads as
+                 * not-yet-available, which is the truth. */
+                lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_set_style_opa(icon, LV_OPA_40, 0);
+                lv_obj_set_style_opa(name, LV_OPA_40, 0);
+                lv_obj_set_style_opa(quick_drawer_toggle_state[slot], LV_OPA_40, 0);
+                lv_label_set_text(quick_drawer_toggle_state[slot], "Pending");
+                break;
+            case QD_TOGGLE_RC:
+                quick_drawer_rc_icon = icon;
+                lv_obj_add_event_cb(icon, quick_drawer_rc_event_cb, LV_EVENT_CLICKED, NULL);
+                break;
+            default: break;
+        }
+        lv_image_set_src(icon, quick_drawer_toggle_src((qd_toggle_t) slot, false));
+    }
+
+    for (int i = 0; i < quick_drawer_plugin_toggle_count; i++) {
+        int32_t x = BOARD_SCALE_PX(label_x[i]);
+        int32_t row_y = QUICK_DRAWER_TOGGLE_ROW_PITCH;
+        bool on = plugin_manager_get_quick_toggle_value(i);
+
+        lv_obj_t * icon = lv_image_create(quick_drawer_expansion_box);
+        lv_image_set_src(icon, quick_drawer_plugin_toggle_src(i, on));
+        lv_obj_set_pos(icon, x, row_y);
+        lv_obj_add_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(icon, quick_drawer_plugin_toggle_event_cb, LV_EVENT_CLICKED,
+                            (void *) (intptr_t) i);
+        quick_drawer_plugin_icon[i] = icon;
+
+        lv_obj_t * name = lv_label_create(quick_drawer_expansion_box);
+        lv_label_set_text(name, plugin_manager_get_quick_toggle_label(i));
+        lv_obj_add_style(name, &style_theme_text_primary, 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_12, 0);
+        lv_obj_set_width(name, BOARD_SCALE_PX(84));
+        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(name, x, row_y + BOARD_SCALE_PX(86));
+
+        int slot = QD_TOGGLE_COUNT + i;
+        quick_drawer_toggle_state[slot] = lv_label_create(quick_drawer_expansion_box);
+        lv_obj_set_width(quick_drawer_toggle_state[slot], BOARD_SCALE_PX(84));
+        lv_obj_set_style_text_align(quick_drawer_toggle_state[slot], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(quick_drawer_toggle_state[slot], &lv_font_montserrat_12, 0);
+        lv_obj_set_pos(quick_drawer_toggle_state[slot], x, row_y + BOARD_SCALE_PX(108));
+        quick_drawer_set_toggle_state_text(slot, on, plugin_manager_get_quick_toggle_state_text(i, on));
+    }
+
+    quick_drawer_expansion_full =
+        QUICK_DRAWER_TOGGLE_ROW_PITCH * (quick_drawer_plugin_toggle_count > 0 ? 2 : 1);
+
+    /* Row 1: screen brightness -- real control, via the standard Linux
      * backlight sysfs class (backlight.h), no dedicated slider-track asset
-     * in this theme so it reuses the (generic-looking) volume slider's own. */
+     * in this theme so it reuses the (generic-looking) volume slider's own.
+     * Swapped ahead of volume below at the user's request -- Y offsets
+     * moved to brightness_container's new top (268: deltas 21/29/25
+     * unchanged), volume's moved to what used to be brightness's slot. */
     quick_drawer_brightness_icon = lv_image_create(quick_drawer);
     const void * brightness = asset_decoded_image_open(&quick_drawer_brightness_image, "pull_down/blk.png")
                             ? asset_decoded_image_source(&quick_drawer_brightness_image) : NULL;
     lv_image_set_src(quick_drawer_brightness_icon, brightness ? brightness : asset_path("pull_down/blk.png"));
-    lv_obj_align(quick_drawer_brightness_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(40), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(174));
+    lv_obj_align(quick_drawer_brightness_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(55), BOARD_SCALE_PX(289));
 
     quick_drawer_brightness_label = lv_label_create(quick_drawer);
     lv_obj_add_style(quick_drawer_brightness_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(quick_drawer_brightness_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(quick_drawer_brightness_label, LV_ALIGN_TOP_RIGHT, -BOARD_SCALE_PX(20), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(177));
+    lv_obj_align(quick_drawer_brightness_label, LV_ALIGN_TOP_RIGHT, -BOARD_SCALE_PX(52), BOARD_SCALE_PX(293));
 
     /* Dynamically sizes slider width based on the maximum width of the percentage
      * label ("100%") to prevent horizontal overlap when using larger font tiers. */
@@ -3349,13 +4032,15 @@ static void build_quick_drawer(void) {
     lv_text_get_size(&brightness_label_size, "100%", gui_theme_font(GUI_FONT_ROLE_BODY),
                      0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
     int32_t brightness_label_max_w = brightness_label_size.x;
-    int32_t brightness_track_w = (w - BOARD_SCALE_PX(20) - brightness_label_max_w - BOARD_SCALE_PX(20)) - BOARD_SCALE_PX(90);
-    if (brightness_track_w > BOARD_SCALE_PX(300)) brightness_track_w = BOARD_SCALE_PX(300); /* never wider than the original design */
+    /* The percentage is anchored at x=428. Leave a 16px visual gap before
+     * its actual text box and keep the knob's overhang inside that gap. */
+    int32_t brightness_track_w = BOARD_SCALE_PX(428) - brightness_label_max_w - BOARD_SCALE_PX(16) - BOARD_SCALE_PX(103);
+    if (brightness_track_w > BOARD_SCALE_PX(300)) brightness_track_w = BOARD_SCALE_PX(300);
     if (brightness_track_w < BOARD_SCALE_PX(120)) brightness_track_w = BOARD_SCALE_PX(120); /* sane floor so the track never collapses to nothing */
 
     quick_drawer_brightness_track = lv_slider_create(quick_drawer);
     lv_obj_set_size(quick_drawer_brightness_track, brightness_track_w, SLIDER_TRACK_HEIGHT);
-    lv_obj_align(quick_drawer_brightness_track, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(90), QUICK_DRAWER_PANEL1_TOP + BOARD_SCALE_PX(185));
+    lv_obj_align(quick_drawer_brightness_track, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(103), BOARD_SCALE_PX(297));
     /* Full 0-100 -- backlight.c now maps this logical range to its own safe
      * raw range internally (see backlight.h's own comment), so the slider
      * itself is free to show a clean, honest 0%-100% again. */
@@ -3387,35 +4072,137 @@ static void build_quick_drawer(void) {
 
     refresh_quick_drawer_brightness();
 
-    /* Mini now-playing card: track title, artist, and transport controls.
-     * Sized to fit the second panel's bounds with a balanced bottom margin. */
-    lv_obj_t * card = lv_obj_create(quick_drawer);
-    lv_obj_set_size(card, BOARD_SCALE_PX(440), BOARD_SCALE_PX(330));
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, QUICK_DRAWER_PANEL2_TOP + BOARD_SCALE_PX(12));
-    lv_obj_set_style_bg_opa(card, 0, 0);
-    lv_obj_set_style_border_width(card, 0, 0);
+    /* Row 2: volume, in what used to be brightness's slot (see the "Row 1"
+     * comment above for why these two swapped). */
+    lv_obj_t * volume_icon = lv_image_create(quick_drawer);
+    lv_image_set_src(volume_icon, asset_path("volume/vol.png"));
+    lv_obj_align(volume_icon, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(55), BOARD_SCALE_PX(376));
+    quick_drawer_volume_track = lv_slider_create(quick_drawer);
+    lv_obj_set_size(quick_drawer_volume_track, BOARD_SCALE_PX(285), SLIDER_TRACK_HEIGHT);
+    lv_obj_align(quick_drawer_volume_track, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(103), BOARD_SCALE_PX(384));
+    lv_slider_set_range(quick_drawer_volume_track, 0, 100);
+    lv_obj_set_style_bg_color(quick_drawer_volume_track, lv_color_black(), LV_PART_MAIN);
+    lv_obj_add_style(quick_drawer_volume_track, gui_theme_accent_style(), LV_PART_INDICATOR);
+    lv_obj_add_style(quick_drawer_volume_track, gui_theme_accent_knob_style(), LV_PART_KNOB);
+    configure_native_slider_rail(quick_drawer_volume_track);
+    /* Its sibling brightness track (just above) already had all of these --
+     * this one was missing every one of them, leaving a smaller, harder-to-
+     * grab knob and a touch-catch area confined to the bare track box
+     * instead of the same forgiving margin, which is the real reason
+     * dragging this one felt worse than the popup's own volume slider
+     * (that mismatch, not the audio-request throttling already fixed
+     * earlier, was the remaining gap). */
+    lv_obj_set_style_bg_opa(quick_drawer_volume_track, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_width(quick_drawer_volume_track, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_style_height(quick_drawer_volume_track, SLIDER_KNOB_SIZE, LV_PART_KNOB);
+    lv_obj_set_ext_click_area(quick_drawer_volume_track, BOARD_SCALE_PX(44));
+    lv_obj_add_event_cb(quick_drawer_volume_track, quick_drawer_volume_event_cb, LV_EVENT_ALL, NULL);
+    lv_slider_set_value(quick_drawer_volume_track, gui_player_get_volume_percent(), LV_ANIM_OFF);
+    quick_drawer_volume_label = lv_label_create(quick_drawer);
+    lv_obj_add_style(quick_drawer_volume_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(quick_drawer_volume_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_align(quick_drawer_volume_label, LV_ALIGN_TOP_RIGHT, -BOARD_SCALE_PX(52), BOARD_SCALE_PX(380));
+    lv_label_set_text_fmt(quick_drawer_volume_label, "%d", gui_player_get_volume_percent());
+
+    /* Everything below the expansion box slides down by whatever height it
+     * currently has. Registered with the collapsed y each object was just
+     * built at, so quick_drawer_apply_expansion() never has to re-derive
+     * any of this geometry. Both slider hit tests read live
+     * lv_obj_get_coords(), so they follow these automatically. */
+    quick_drawer_shift_count = 0;
+    quick_drawer_register_shift_obj(quick_drawer_expansion_handle, BOARD_SCALE_PX(239));
+    quick_drawer_register_shift_obj(brightness_container, BOARD_SCALE_PX(268));
+    quick_drawer_register_shift_obj(quick_drawer_brightness_icon, BOARD_SCALE_PX(289));
+    quick_drawer_register_shift_obj(quick_drawer_brightness_label, BOARD_SCALE_PX(293));
+    quick_drawer_register_shift_obj(quick_drawer_brightness_track, BOARD_SCALE_PX(297));
+    quick_drawer_register_shift_obj(volume_container, BOARD_SCALE_PX(355));
+    quick_drawer_register_shift_obj(volume_icon, BOARD_SCALE_PX(376));
+    quick_drawer_register_shift_obj(quick_drawer_volume_label, BOARD_SCALE_PX(380));
+    quick_drawer_register_shift_obj(quick_drawer_volume_track, BOARD_SCALE_PX(384));
+
+    /* Mini now-playing card: cover thumbnail (left), track title/artist
+     * (right of it), and transport controls (bottom row). Sized to fit the
+     * second panel's bounds with a balanced bottom margin. style_theme_card_bg
+     * is the same theme-aware panel-surface-plus-border style used for cards
+     * elsewhere (build_setting_slider_card(), popups) -- gives this card a
+     * lighter-than-backdrop fill and a subtle, theme-mixed border outline
+     * instead of sitting fully transparent over the drawer's own black/gray
+     * backdrop artwork. */
+    quick_drawer_card = lv_obj_create(quick_drawer);
+    lv_obj_t * card = quick_drawer_card;
+    lv_obj_remove_style_all(card);
+    lv_obj_set_pos(card, BOARD_SCALE_PX(34), BOARD_SCALE_PX(441));
+    /* Grows downward into the space the taller panel just freed (441..765,
+     * 20px above the panel's new bottom edge). The cover/title/artist block
+     * at the top is untouched; the extra height goes to the transport row. */
+    lv_obj_set_size(card, BOARD_SCALE_PX(413), BOARD_SCALE_PX(324));
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x111712), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, BOARD_SCALE_PX(24), 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Title and artist labels centered within explicit widths. */
+    /* Cover thumbnail -- reuses whatever the Player screen already decoded
+     * (gui_player_get_current_cover_dsc(), same accessor gui_lock_screen.c
+     * already relies on for its own small cover display) rather than a
+     * fresh disk read/decode. COVER_ART_WIDTH is the known native size of
+     * both that buffer and its default-cover fallback PNG, so one fixed
+     * scale factor is correct for either source; gui_shell_refresh_quick_
+     * drawer_cover() (called on every track/cover update) fills the src in. */
+    quick_drawer_cover_frame = lv_obj_create(card);
+    lv_obj_remove_style_all(quick_drawer_cover_frame);
+    lv_obj_set_size(quick_drawer_cover_frame, BOARD_SCALE_PX(150), BOARD_SCALE_PX(150));
+    lv_obj_align(quick_drawer_cover_frame, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(15), BOARD_SCALE_PX(18));
+    lv_obj_set_style_radius(quick_drawer_cover_frame, BOARD_SCALE_PX(16), 0);
+    lv_obj_set_style_clip_corner(quick_drawer_cover_frame, true, 0);
+    quick_drawer_cover_img = lv_image_create(quick_drawer_cover_frame);
+    lv_obj_remove_flag(quick_drawer_cover_img, LV_OBJ_FLAG_CLICKABLE);
+    lv_image_set_src(quick_drawer_cover_img, asset_path("playing_plane/default_cover_565.png"));
+    quick_drawer_fit_cover();
+
+    /* Title and artist to the right of the cover, left-aligned -- centering
+     * made sense for text-only, but not once it sits beside an image. */
+    int32_t text_left = BOARD_SCALE_PX(15) + BOARD_SCALE_PX(QUICK_DRAWER_COVER_PX) + BOARD_SCALE_PX(23);
+    int32_t text_width = BOARD_SCALE_PX(413) - text_left - BOARD_SCALE_PX(15);
+
     quick_drawer_title_label = lv_label_create(card);
     lv_label_set_text(quick_drawer_title_label, "No track loaded");
     lv_obj_add_style(quick_drawer_title_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(quick_drawer_title_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
-    lv_obj_set_width(quick_drawer_title_label, BOARD_SCALE_PX(392));
-    lv_obj_set_style_text_align(quick_drawer_title_label, LV_TEXT_ALIGN_CENTER, 0);
-    row_label_apply_bounded_height(quick_drawer_title_label, gui_theme_font(GUI_FONT_ROLE_ROW));
+    lv_obj_set_style_text_font(quick_drawer_title_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    lv_obj_set_width(quick_drawer_title_label, text_width);
+    lv_obj_set_style_text_align(quick_drawer_title_label, LV_TEXT_ALIGN_LEFT, 0);
+    row_label_apply_bounded_height(quick_drawer_title_label, gui_theme_font(GUI_FONT_ROLE_TITLE));
     row_label_enable_marquee(quick_drawer_title_label);
-    lv_obj_align(quick_drawer_title_label, LV_ALIGN_TOP_MID, 0, BOARD_SCALE_PX(22));
 
     quick_drawer_artist_label = lv_label_create(card);
     lv_label_set_text(quick_drawer_artist_label, "");
     lv_obj_add_style(quick_drawer_artist_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(quick_drawer_artist_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_set_width(quick_drawer_artist_label, BOARD_SCALE_PX(392));
-    lv_obj_set_style_text_align(quick_drawer_artist_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(quick_drawer_artist_label, text_width);
+    lv_obj_set_style_text_align(quick_drawer_artist_label, LV_TEXT_ALIGN_LEFT, 0);
     row_label_apply_bounded_height(quick_drawer_artist_label, gui_theme_font(GUI_FONT_ROLE_BODY));
     row_label_enable_marquee(quick_drawer_artist_label);
-    lv_obj_align(quick_drawer_artist_label, LV_ALIGN_TOP_MID, 0, BOARD_SCALE_PX(76));
+
+    /* Vertically center the title+artist stack against the cover thumbnail
+     * when it's shorter than the thumbnail (the common case); fall back to
+     * top-aligned with the thumbnail if the stack is taller (e.g. the
+     * largest "BlindMF" font tier), same fallback direction as GitHub issue
+     * #91's own fix. Computed directly from font metrics -- NOT by reading
+     * the labels' own height back via lv_obj_get_height() right after
+     * row_label_apply_bounded_height() sets it, which returned a stale,
+     * pre-layout-pass value and was the actual cause of the title/artist
+     * overlap this replaces (LVGL doesn't recompute lv_obj_get_*() until
+     * the next layout pass, not synchronously on lv_obj_set_height()). */
+    int32_t title_h = row_label_bounded_height(gui_theme_font(GUI_FONT_ROLE_TITLE));
+    int32_t artist_h = row_label_bounded_height(gui_theme_font(GUI_FONT_ROLE_BODY));
+    int32_t text_gap = BOARD_SCALE_PX(4);
+    int32_t stack_h = title_h + text_gap + artist_h;
+    int32_t cover_top = BOARD_SCALE_PX(18);
+    int32_t cover_h = BOARD_SCALE_PX(QUICK_DRAWER_COVER_PX);
+    int32_t text_top = cover_top;
+    if (stack_h < cover_h) text_top = cover_top + (cover_h - stack_h) / 2;
+
+    lv_obj_align(quick_drawer_title_label, LV_ALIGN_TOP_LEFT, text_left, text_top);
+    lv_obj_align(quick_drawer_artist_label, LV_ALIGN_TOP_LEFT, text_left, text_top + title_h + text_gap);
 
     /* Transport row: order/prev/play/next/favorite, all five in one row --
      * matching the stock drawer exactly (shuffle-style icon leftmost,
@@ -3427,36 +4214,37 @@ static void build_quick_drawer(void) {
     /* 84, not 70 -- btn_play.png/btn_pause.png are 84x84 (confirmed via the
      * actual asset files), and a shorter row was clipping the top/bottom of
      * that icon, confirmed on a real device. */
-    lv_obj_set_size(controls_row, lv_pct(100), 84);
-    lv_obj_align(controls_row, LV_ALIGN_BOTTOM_MID, 0, -BOARD_SCALE_PX(8));
+    lv_obj_set_size(controls_row, lv_pct(100), BOARD_SCALE_PX(86));
+    /* 218, not 180: sits lower in the now-taller card, opening the gap
+     * under the title/artist block (which ends at 168) from 12px to 50px
+     * while keeping 20px below the buttons. */
+    lv_obj_align(controls_row, LV_ALIGN_TOP_MID, 0, BOARD_SCALE_PX(218));
     lv_obj_set_style_bg_opa(controls_row, 0, 0);
     lv_obj_set_style_border_width(controls_row, 0, 0);
+    lv_obj_set_style_pad_all(controls_row, 0, 0);
     lv_obj_remove_flag(controls_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(controls_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(controls_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    quick_drawer_order_icon = lv_image_create(controls_row);
-    lv_image_set_src(quick_drawer_order_icon, asset_path(play_mode_icon_asset((play_mode_t) current_settings.play_mode)));
-
     lv_obj_t * prev_btn = lv_image_create(controls_row);
     lv_image_set_src(prev_btn, asset_path("playing_plane/btn_prev.png"));
+    lv_obj_set_pos(prev_btn, BOARD_SCALE_PX(84), BOARD_SCALE_PX(23));
+    lv_obj_set_ext_click_area(prev_btn, BOARD_SCALE_PX(4));
     lv_obj_add_flag(prev_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(prev_btn, prev_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
     quick_drawer_play_btn = lv_image_create(controls_row);
     lv_image_set_src(quick_drawer_play_btn, gui_player_play_btn_image_src(audio_is_playing()));
+    lv_obj_set_pos(quick_drawer_play_btn, BOARD_SCALE_PX(164), 0);
+    lv_image_set_scale(quick_drawer_play_btn, (BOARD_SCALE_PX(86) * LV_SCALE_NONE + 42) / 84);
     lv_obj_add_flag(quick_drawer_play_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(quick_drawer_play_btn, play_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t * next_btn = lv_image_create(controls_row);
     lv_image_set_src(next_btn, asset_path("playing_plane/btn_next.png"));
+    lv_obj_set_pos(next_btn, BOARD_SCALE_PX(290), BOARD_SCALE_PX(23));
+    lv_obj_set_ext_click_area(next_btn, BOARD_SCALE_PX(4));
     lv_obj_add_flag(next_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(next_btn, next_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
-    quick_drawer_favorite_icon = lv_image_create(controls_row);
-    lv_image_set_src(quick_drawer_favorite_icon, asset_path("playing_plane/collect_out.png"));
-    lv_obj_add_flag(quick_drawer_favorite_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(quick_drawer_favorite_icon, favorite_icon_event_cb, LV_EVENT_CLICKED, NULL);
+    gui_shell_refresh_quick_drawer_cover();
 
     /* Render the complex live control tree once while still under the boot
      * splash. Drag/snap motion uses this one opaque RGB565 image; controls
@@ -3566,13 +4354,44 @@ void gui_shell_teardown(void) {
         quick_drawer_motion_buf = NULL;
     }
     quick_drawer_bitmap_motion = false;
+    /* hw_volume_coalesce_teardown() can't re-read a live slider itself (it
+     * doesn't know which widget owns the drag) -- caller-side step, same
+     * as gui_player_teardown()'s own equivalent for the volume popup, done
+     * here while quick_drawer_volume_track still exists (just below). */
+    if (quick_drawer_volume_hv.drag_active && quick_drawer_volume_track)
+        hw_volume_coalesce_drag_update(&quick_drawer_volume_hv, (int) lv_slider_get_value(quick_drawer_volume_track));
+    hw_volume_coalesce_teardown(&quick_drawer_volume_hv);
     if (quick_drawer) {
         lv_obj_delete(quick_drawer);
         quick_drawer = NULL;
     }
     quick_drawer_brightness_icon = NULL;
+    quick_drawer_cover_img = NULL; /* child of quick_drawer -- already deleted by the delete above */
+    quick_drawer_cover_frame = NULL;
+    quick_drawer_volume_track = NULL;
+    quick_drawer_volume_label = NULL;
+    for (int i = 0; i < QUICK_DRAWER_TOGGLE_SLOTS; i++) quick_drawer_toggle_state[i] = NULL;
+    /* All children of quick_drawer, already deleted with it just above --
+     * cleared so a rebuild (gui_reload.c) cannot act on a dangling one, and
+     * so the expansion state machine no-ops until it is rebuilt. */
+    quick_drawer_expansion_box = NULL;
+    quick_drawer_expansion_handle = NULL;
+    quick_drawer_card = NULL;
+    quick_drawer_airplay_icon = NULL;
+    quick_drawer_dlna_icon = NULL;
+    quick_drawer_rc_icon = NULL;
+    for (int i = 0; i < PLUGIN_MAX_QUICK_TOGGLES; i++) quick_drawer_plugin_icon[i] = NULL;
+    quick_drawer_plugin_toggle_count = 0;
+    quick_drawer_shift_count = 0;
+    quick_drawer_expansion_full = 0;
+    quick_drawer_expansion_y = 0;
+    quick_drawer_expanded = false;
+    quick_drawer_expansion_dragging = false;
+    quick_drawer_expansion_moved = false;
     asset_decoded_image_close(&quick_drawer_bg_image);
     asset_decoded_image_close(&quick_drawer_brightness_image);
+    for (int i = 0; i < QD_TOGGLE_COUNT; i++) asset_decoded_image_close(&qd_toggle_on_img[i]);
+    for (int i = 0; i < PLUGIN_MAX_QUICK_TOGGLES; i++) asset_decoded_image_close(&qd_plugin_toggle_on_img[i]);
     if (status_bar_band) {
         lv_obj_delete(status_bar_band);
         status_bar_band = NULL;
@@ -3593,16 +4412,17 @@ void gui_shell_teardown(void) {
 
 void gui_shell_refresh_static_assets(void) {
     if (!quick_drawer) return;
-    asset_decoded_image_close(&quick_drawer_bg_image);
     asset_decoded_image_close(&quick_drawer_brightness_image);
-    const void * bg = asset_decoded_image_open(&quick_drawer_bg_image, "pull_down/bg.png")
-                    ? asset_decoded_image_source(&quick_drawer_bg_image) : NULL;
     const void * brightness = asset_decoded_image_open(&quick_drawer_brightness_image, "pull_down/blk.png")
                             ? asset_decoded_image_source(&quick_drawer_brightness_image) : NULL;
-    lv_obj_set_style_bg_image_src(quick_drawer, bg ? bg : asset_path("pull_down/bg.png"), 0);
     if (quick_drawer_brightness_icon)
         lv_image_set_src(quick_drawer_brightness_icon,
                          brightness ? brightness : asset_path("pull_down/blk.png"));
+    /* The four "on" toggle icons are decoded copies too, so a changed asset
+     * on disk only reaches them through a re-decode -- and that re-decode
+     * frees the buffers the widgets currently point at, so this must also
+     * re-point them, which is exactly what this does. */
+    gui_shell_refresh_quick_drawer_toggle_accent();
     quick_drawer_mark_snapshot_dirty();
 }
 
@@ -3894,10 +4714,36 @@ void gui_shell_set_home_indicator_visible(bool visible) {
 
 void gui_shell_update_quick_drawer_track(const char * title, const char * artist) {
     if (quick_drawer_title_label) {
-        lv_label_set_text(quick_drawer_title_label, title ? title : "No track loaded");
-        lv_label_set_text(quick_drawer_artist_label, artist ? artist : "");
-        quick_drawer_mark_snapshot_dirty();
+        const char * want_title = title ? title : "No track loaded";
+        const char * want_artist = artist ? artist : "";
+        const char * cur_title = lv_label_get_text(quick_drawer_title_label);
+        const char * cur_artist = lv_label_get_text(quick_drawer_artist_label);
+        /* Only touch a label whose text actually changed: lv_label_set_text()
+         * restarts LV_LABEL_LONG_SCROLL_CIRCULAR from the beginning, so
+         * re-setting identical text would keep resetting the marquee (and
+         * its 2s wait) instead of letting it scroll. Same guard gui_player.c
+         * already applies to its own now-playing labels. */
+        bool changed = false;
+        if (!cur_title || strcmp(cur_title, want_title) != 0) {
+            lv_label_set_text(quick_drawer_title_label, want_title);
+            changed = true;
+        }
+        if (!cur_artist || strcmp(cur_artist, want_artist) != 0) {
+            lv_label_set_text(quick_drawer_artist_label, want_artist);
+            changed = true;
+        }
+        if (changed) quick_drawer_mark_snapshot_dirty();
     }
+    gui_shell_refresh_quick_drawer_cover();
+}
+
+void gui_shell_refresh_quick_drawer_cover(void) {
+    if (!quick_drawer_cover_img) return;
+    const lv_image_dsc_t * cover = gui_player_get_current_cover_dsc();
+    if (cover && cover->data) lv_image_set_src(quick_drawer_cover_img, cover);
+    else lv_image_set_src(quick_drawer_cover_img, asset_path("playing_plane/default_cover_565.png"));
+    quick_drawer_fit_cover();
+    quick_drawer_mark_snapshot_dirty();
 }
 
 void gui_shell_update_quick_drawer_favorite(bool is_favorite) {
@@ -3920,4 +4766,33 @@ void gui_shell_update_quick_drawer_play_mode(int mode) {
         lv_image_set_src(quick_drawer_order_icon, asset_path(play_mode_icon_asset((play_mode_t) mode)));
         quick_drawer_mark_snapshot_dirty();
     }
+}
+
+void gui_shell_refresh_quick_drawer_toggle_accent(void) {
+    load_quick_drawer_toggle_on_images();
+    /* Re-point every widget at the buffers just decoded -- load_...() freed
+     * the previous ones, so anything still holding those would be reading
+     * released memory on its next draw. Same reason refresh_play_btn_icon()
+     * re-sets its own widgets after reloading. State comes from the same
+     * authoritative reads build_quick_drawer() uses for the captions. */
+    if (quick_drawer_wifi_icon)
+        lv_image_set_src(quick_drawer_wifi_icon,
+                         quick_drawer_toggle_src(QD_TOGGLE_WIFI, gui_shell_wifi_effective_enabled()));
+    if (quick_drawer_bt_icon)
+        lv_image_set_src(quick_drawer_bt_icon,
+                         quick_drawer_toggle_src(QD_TOGGLE_BT, bt_control_is_powered()));
+    if (quick_drawer_sleep_icon)
+        lv_image_set_src(quick_drawer_sleep_icon,
+                         quick_drawer_toggle_src(QD_TOGGLE_SLEEP, sleep_timer_active));
+    if (quick_drawer_crossfade_icon)
+        lv_image_set_src(quick_drawer_crossfade_icon,
+                         quick_drawer_toggle_src(QD_TOGGLE_CROSSFADE, current_settings.crossfade_enabled));
+    /* The expanded rows are subject to the exact same hazard -- load_...()
+     * re-decoded their "on" buffers too (including every plugin tile's), so
+     * any of them currently showing an on-state would otherwise still point
+     * at freed memory. Their off-state icons are plain asset paths and were
+     * never at risk, which is also why the inert Gapless tile needs nothing
+     * here. */
+    refresh_quick_drawer_expansion_toggles();
+    quick_drawer_mark_snapshot_dirty();
 }

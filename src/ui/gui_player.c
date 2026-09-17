@@ -979,6 +979,7 @@ void poll_cover_decode(void) {
         current_cover_dsc.data = NULL;
         lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
         fit_cover_img_to_card();
+        gui_shell_refresh_quick_drawer_cover();
         /* No in-memory raw bitmap to reflect for the static placeholder
          * cover. Apply a configured flat color if set (it needs no cover
          * pixels), otherwise reset the panel back to its plain background
@@ -1018,6 +1019,7 @@ void poll_cover_decode(void) {
         current_cover_dsc.data_size = (uint32_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2;
         lv_image_set_src(cover_img, &current_cover_dsc);
         fit_cover_img_to_card();
+        gui_shell_refresh_quick_drawer_cover();
 
         /* The reflection this decode computed was built from frost params
          * snapshotted when the decode was LAUNCHED. If a plugin changed

@@ -39,6 +39,7 @@ extern player_settings_t current_settings;
 extern void settings_save(const player_settings_t * s);
 extern void player_transition_mark_dirty(void);
 extern void refresh_play_btn_icon(void);
+extern void gui_shell_refresh_quick_drawer_toggle_accent(void);
 
 const lv_font_t * gui_theme_font(gui_font_role_t role) {
     switch (role) {
@@ -90,6 +91,9 @@ void gui_theme_apply_accent(uint32_t rgb) {
      * image_recolor would tint the disc too, so the glyph is rewritten in
      * decoded pixels (see refresh_play_btn_icon()). */
     refresh_play_btn_icon();
+    /* Same deal for the quick drawer's "on" toggle icons: a baked-in
+     * #009FF6 circle under a near-white glyph. */
+    gui_shell_refresh_quick_drawer_toggle_accent();
 }
 
 void accent_swatch_event_cb(lv_event_t * e) {

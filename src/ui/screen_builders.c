@@ -164,6 +164,17 @@ void screen_builders_init_list_row_style(void) {
     lv_style_set_text_color(&style_theme_text_muted, lv_color_hex(GUI_COLOR_SECONDARY));
 }
 
+/* The height row_label_apply_bounded_height() will set for this font, for
+ * callers that must position a following element without reading the label's
+ * height back (lv_obj_get_height() returns a stale value until the next
+ * layout pass). */
+int32_t row_label_bounded_height(const lv_font_t * font) {
+    int32_t line_h = font ? lv_font_get_line_height(font) : 24;
+    int32_t descender_margin = line_h / 8;
+    if (descender_margin < 4) descender_margin = 4;
+    return line_h + descender_margin * 2;
+}
+
 /* Applies a bounded height and descender margin to scrolling row labels,
  * preventing descender clipping and spurious vertical scroll animation.
  * Adds proportional top padding to maintain vertical centering within the row. */
@@ -171,7 +182,7 @@ void row_label_apply_bounded_height(lv_obj_t * label, const lv_font_t * font) {
     int32_t line_h = font ? lv_font_get_line_height(font) : 24;
     int32_t descender_margin = line_h / 8;
     if (descender_margin < 4) descender_margin = 4;
-    lv_obj_set_height(label, line_h + descender_margin * 2);
+    lv_obj_set_height(label, row_label_bounded_height(font));
     lv_obj_set_style_pad_top(label, descender_margin, 0);
     lv_obj_add_flag(label, LV_OBJ_FLAG_USER_3);
 }
@@ -446,8 +457,8 @@ static void icon_glow_event_cb(lv_event_t * e) {
     }
 }
 
-static void add_icon_glow(lv_obj_t * tile, lv_obj_t * wrapper, uint32_t color,
-                           int32_t diameter) {
+void add_icon_glow(lv_obj_t * tile, lv_obj_t * wrapper, uint32_t color,
+                    int32_t diameter) {
     if (!color || diameter < 4) return;
     icon_glow_t * glow = calloc(1, sizeof(*glow));
     if (!glow) return;

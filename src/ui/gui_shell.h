@@ -13,6 +13,16 @@ void gui_shell_refresh_home(void);
 bool gui_shell_wifi_effective_enabled(void);
 
 void gui_shell_update_quick_drawer_track(const char * title, const char * artist);
+/* Refreshes the drawer's own small cover thumbnail from whatever
+ * gui_player_get_current_cover_dsc() currently returns (or the default
+ * placeholder if NULL) -- call whenever that changes, not just on a title/
+ * artist change, since cover decode can complete later than metadata. */
+void gui_shell_refresh_quick_drawer_cover(void);
+/* Re-decodes the drawer's four "on" toggle icons with the current accent
+ * baked into their circle (they ship with a fixed #009FF6 that LVGL's own
+ * image_recolor cannot retint without flattening the glyph too) and
+ * re-points the widgets at the new buffers. Call after the accent changes. */
+void gui_shell_refresh_quick_drawer_toggle_accent(void);
 void gui_shell_update_quick_drawer_favorite(bool is_favorite);
 void gui_shell_update_quick_drawer_play_state(bool is_playing);
 void gui_shell_update_quick_drawer_play_mode(int mode);

@@ -2664,6 +2664,9 @@ static int az_index_registered_count = 0;
 static lv_timer_t * az_index_visibility_timer;
 static az_index_binding_t * az_index_visibility_binding;
 static bool az_index_dragging;
+/* Whether this press's origin has already been judged against the strip --
+ * see poll_az_index_drag()'s own comment on deciding ownership once. */
+static bool az_index_press_judged;
 
 #define AZ_INDEX_HIDE_DELAY_MS 900
 
@@ -2800,15 +2803,29 @@ void poll_az_index_drag(lv_timer_t * timer) {
     if (!az_index_dragging) {
         /* Only paused here (truly idle -- resumed on the next press-down by
          * resume_fast_gesture_timers_cb(), see this timer's own handle
-         * comment) and in the just-released branch below, not in either
-         * return just past this one: those happen mid-press (on a screen/
-         * area with no A-Z strip *yet*), and a press can still slide into
-         * the strip's own bounds before it lifts -- pausing there would
-         * stop catching that. */
+         * comment) and in the just-released branch below. */
         if (!pressed) {
+            az_index_press_judged = false;
             lv_timer_pause(timer);
             return;
         }
+        /* Ownership is decided ONCE, at press-down: the strip only takes a
+         * drag that actually started on it.
+         *
+         * This used to re-test the live touch point on every tick, on
+         * purpose, so that a press begun before the strip appeared could
+         * still slide into it. The cost of that was GitHub #84: an ordinary
+         * upward list swipe that drifts rightward lands in the strip near
+         * the end of its travel, silently changes owner, and jumps the list
+         * to a letter. Deciding at press-down is the same latching
+         * drag_adjust_press_owned (gui_shell.c) already uses for sliders,
+         * and it is what the report itself asked for. The press-begun-
+         * before-the-strip-appeared case is given up deliberately: the
+         * strip is not on screen to aim at then anyway, so nothing is lost
+         * that the user could have been aiming for. */
+        if (az_index_press_judged) return;
+        az_index_press_judged = true;
+
         az_index_binding_t * b = find_az_binding_for_screen(lv_screen_active());
         if (!b) return;
         if (lv_obj_has_flag(b->strip, LV_OBJ_FLAG_HIDDEN)) return;
@@ -2831,6 +2848,7 @@ void poll_az_index_drag(lv_timer_t * timer) {
         lv_obj_add_flag(az_index_active_binding->popup, LV_OBJ_FLAG_HIDDEN);
         az_index_dragging = false;
         az_index_active_binding = NULL;
+        az_index_press_judged = false;
         lv_timer_pause(timer);
         return;
     }
@@ -5461,6 +5479,12 @@ void gui_library_reset_drag_state(void) {
         az_index_active_binding = NULL;
     }
     az_index_dragging = false;
+    /* Safe to clear even mid-press: this pauses the timer below, and it is
+     * only ever resumed on a raw press-DOWN edge (gui_shell.c's indev
+     * hooks), so the remainder of an in-flight press cannot be re-judged at
+     * a drifted position. Leaving it set would instead disable the strip
+     * for the whole of the NEXT press. */
+    az_index_press_judged = false;
     if (az_index_drag_timer) {
         lv_timer_pause(az_index_drag_timer);
     }

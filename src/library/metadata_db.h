@@ -37,13 +37,6 @@ void metadata_db_close(void);
  * checked that call), same as every other query against an unready DB. */
 bool metadata_db_had_no_saved_database(void);
 
-/* Applies a new ARTIST-tag delimiter set and re-files the artist index under
- * the metadata lock. Blocking; call off the UI thread. Returns false if the
- * rebuild failed, in which case the previous index is still in place. */
-bool metadata_db_set_artist_delimiters(const char * delims);
-/* Guarded accessors -- use these rather than the tagcache globals, which a
- * rescan or split rebuild can change concurrently. */
-void metadata_db_get_artist_delimiters(char * out, size_t out_size);
 /* Resolves the Artists row a track belongs to in one lock scope. Returns false
  * without waiting when the database is busy (a split rebuild holds the lock for
  * its whole run), leaving the caller to skip a cosmetic highlight rather than

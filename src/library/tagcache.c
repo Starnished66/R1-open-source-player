@@ -755,28 +755,13 @@ static bool rebuild_indexes(void);
 static int artist_group_names_with(const char * delims, const char * artist, const char ** out, int max);
 
 /* Characters that separate several artists inside one ARTIST tag. Semicolon
- * and slash are genuine multi-value separators; comma is deliberately not a
- * default, because it occurs inside ordinary artist names ("Crosby, Stills &
- * Nash", "Beethoven, Ludwig van") and splitting on it would shatter them.
- * Empty disables splitting entirely. Applied when the artist index is built,
- * not when tags are read, so the raw tag stays stored and changing this only
- * costs an index rebuild rather than a full rescan of the card. */
-static char artist_delims[TAGCACHE_ARTIST_DELIM_MAX] = ";/";
-
-void tagcache_set_artist_delimiters(const char * delims) {
-    snprintf(artist_delims, sizeof(artist_delims), "%s", delims ? delims : "");
-}
-
-const char * tagcache_get_artist_delimiters(void) {
-    return artist_delims;
-}
-
-/* Re-files every track under the current delimiter set. Cheap next to a scan:
- * the entries and their raw tags are already in RAM, only the derived group
- * lists are thrown away and rebuilt. */
-bool tagcache_rebuild_indexes_only(void) {
-    return rebuild_indexes();
-}
+ * and slash are genuine multi-value separators; comma is deliberately absent,
+ * because it occurs inside ordinary artist names ("Crosby, Stills & Nash",
+ * classical "Lastname, Firstname") and splitting on it would shatter them.
+ * Fixed rather than configurable: the set that is actually used in tags is
+ * small and well known, and making it changeable at runtime meant a mutable
+ * global read by both index passes and every query. */
+static const char artist_delims[] = ";/";
 
 /* Whether a raw ARTIST tag should be filed under `name`, splitting it exactly
  * as the index build does. Queries have to ask this rather than comparing the
@@ -859,11 +844,6 @@ static int artist_group_names_with(const char * delims, const char * artist, con
 
 static bool rebuild_indexes(void) {
     TC_TIME_START(rebuild);
-    /* Snapshot once. Both passes must split identically -- pass 1's counts size
-     * the arrays pass 2 fills -- so re-reading a delimiter set that changed
-     * underneath would overflow them. */
-    char delims_snapshot[TAGCACHE_ARTIST_DELIM_MAX];
-    snprintf(delims_snapshot, sizeof(delims_snapshot), "%s", artist_delims);
     int32_t new_live = 0;
     for (int32_t i = 0; i < ent_count; i++) {
         if (!(ents[i].flag & FLAG_DELETED)) new_live++;
@@ -971,7 +951,7 @@ static bool rebuild_indexes(void) {
             const char * b = "";
             int name_count = 1;
             if (kind == TAGCACHE_GROUP_ARTIST) {
-                name_count = artist_group_names_with(delims_snapshot, ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+                name_count = artist_group_names_with(artist_delims, ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
                 if (name_count < 0) { /* interning failed: fail the rebuild, do not publish a wrong index */
                     ok = false;
                     break;
@@ -1056,7 +1036,7 @@ static bool rebuild_indexes(void) {
             const char * b = "";
             int name_count = 1;
             if (kind == TAGCACHE_GROUP_ARTIST) {
-                name_count = artist_group_names_with(delims_snapshot, ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+                name_count = artist_group_names_with(artist_delims, ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
                 if (name_count < 0) { /* interning failed: fail the rebuild, do not publish a wrong index */
                     ok = false;
                     break;

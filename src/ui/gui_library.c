@@ -5811,11 +5811,6 @@ void library_scan_once(void) {
     library_scan_progress_total = 0;
 
     DB_LOG("DB", "scan_begin root=%s rss_kb=%ld", MUSIC_ROOT_DIR, db_log_rss_kb());
-    /* Set before the tagcache builds its artist index -- it splits ARTIST tags
-     * as it files them, so the setting has to be in place first. Goes through
-     * metadata_db so it is taken under the same lock the split-rebuild worker
-     * holds, rather than writing the shared delimiter buffer from this thread. */
-    metadata_db_set_artist_delimiters(current_settings.artist_delimiters);
     metadata_db_open();
     DB_LOG("DB", "db_open elapsed_ms=%llu songs=%lld rss_kb=%ld",
            (unsigned long long) (db_log_now_ms() - phase_started_ms), (long long) metadata_db_get_song_count(),
@@ -5934,7 +5929,6 @@ void library_load_from_cache_only(void) {
     /* Close first so a remounted card is not served from a still-open
      * handle against the previous (or empty unmounted) mount. */
     metadata_db_close();
-    metadata_db_set_artist_delimiters(current_settings.artist_delimiters);
     metadata_db_open();
 }
 

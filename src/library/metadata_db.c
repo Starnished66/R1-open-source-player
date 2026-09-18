@@ -203,15 +203,6 @@ bool metadata_db_had_no_saved_database(void) {
  * indexes, so a reader or a background scan running concurrently would be left
  * holding freed memory. Blocking and allocation-heavy on a large library --
  * call it off the UI thread. */
-/* Guarded reads of state the rebuild worker can change underneath a caller,
- * so UI code never reads tagcache's mutable delimiter buffer directly while a
- * rescan or a split rebuild is running. */
-void metadata_db_get_artist_delimiters(char * out, size_t out_size) {
-    if (!out || out_size == 0) return;
-    METADATA_DB_GUARD;
-    snprintf(out, out_size, "%s", tagcache_get_artist_delimiters());
-}
-
 /* Which Artists row a track belongs to, resolved in ONE lock scope: the name
  * is derived from the tag and looked up in the index without releasing in
  * between, so it cannot be split under one delimiter set and searched in an
@@ -235,27 +226,6 @@ bool metadata_db_try_artist_row(const char * raw_artist, int64_t * out_offset) {
     return true;
 }
 
-bool metadata_db_set_artist_delimiters(const char * delims) {
-    METADATA_DB_GUARD;
-    char previous[TAGCACHE_ARTIST_DELIM_MAX];
-    snprintf(previous, sizeof(previous), "%s", tagcache_get_artist_delimiters());
-
-    /* Nothing to re-file when the set has not moved. Without this the rescan
-     * path, which applies the current setting on every pass, would rebuild the
-     * whole index each time it runs -- including the automatic rescan after an
-     * SD reinsert, where nothing about the delimiters has changed at all. */
-    if (strcmp(previous, delims ? delims : "") == 0) return true;
-
-    tagcache_set_artist_delimiters(delims);
-    if (!db_ready) return true; /* nothing built yet; applied when the cache opens */
-    if (tagcache_rebuild_indexes_only()) return true;
-
-    /* The rebuild failed and the previous index is still the published one, so
-     * the delimiters have to go back with it: leaving the new set active would
-     * make lookups split differently from the groups they are searching. */
-    tagcache_set_artist_delimiters(previous);
-    return false;
-}
 
 void metadata_db_close(void) {
     METADATA_DB_GUARD;

@@ -26,6 +26,3 @@ void gui_settings_sync_crossfade_toggle(void);
 void gui_settings_sync_gapless_toggle(void);
 void gui_settings_sync_sleep_timer_toggle(void);
 void gui_settings_sync_adb_toggle(void);
-/* Joins a finished artist-index rebuild and refreshes the library view. Call
- * from the UI tick; the rebuild itself runs on its own thread. */
-void poll_artist_split_rebuild(void);

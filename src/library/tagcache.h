@@ -18,11 +18,10 @@
 
 #define TAGCACHE_PATH_MAX 600
 #define TAGCACHE_TAG_MAX 128
-/* Most artists a single ARTIST tag can be filed under, and the buffer for the
- * delimiter set itself. Splitting stops at the cap rather than growing, so a
- * pathological tag cannot blow up the index build. */
+/* Most artists a single ARTIST tag can be filed under. Splitting stops at the
+ * cap rather than growing, so a pathological tag cannot blow up the index
+ * build. */
 #define TAGCACHE_ARTIST_SPLIT_MAX 8
-#define TAGCACHE_ARTIST_DELIM_MAX 8
 
 #define TAGCACHE_GROUP_ARTIST 0
 #define TAGCACHE_GROUP_ALBUM_ARTIST 1
@@ -105,14 +104,6 @@ int tagcache_group_index(int kind, const char * name, const char * album_artist)
 
 int tagcache_cmp_ascii(const char * a, const char * b);
 
-/* Characters treated as separators inside one ARTIST tag, e.g. ";/". Empty
- * disables splitting. Set before the index is built; changing it requires an
- * index rebuild but not a rescan, since the raw tag is what gets stored. */
-void tagcache_set_artist_delimiters(const char * delims);
-const char * tagcache_get_artist_delimiters(void);
-/* Rebuilds the in-RAM indexes from the entries already loaded, without
- * touching the card. */
-bool tagcache_rebuild_indexes_only(void);
 /* Whether a raw ARTIST tag belongs to artist `name` under the current
  * delimiters. Queries must use this instead of comparing the raw string. */
 bool tagcache_artist_matches(const char * raw_artist, const char * name);

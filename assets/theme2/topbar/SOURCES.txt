@@ -1,0 +1,64 @@
+theme2/topbar icons (Phosphor Fill swapped in place; supersedes an earlier
+partial swap from the same day -- this is the full, current mapping)
+Target sizes: 28x30 (status bar glyphs), 20x30 (battery indicators), 48x30
+(audio codec format badges). Digits (0-9.png, colon.png, percent.png) are a
+separate typography pass, documented at the end of this file.
+
+Glyphs: Phosphor Icons (Fill variant)
+License: MIT License
+https://github.com/phosphor-icons/core
+https://cdn.jsdelivr.net/npm/@phosphor-icons/core@2.1.1/assets/fill/<name>.svg
+
+Typography & Badges: Montserrat (Bold / SemiBold)
+License: SIL Open Font License 1.1 (OFL)
+https://github.com/JulietaUla/Montserrat
+
+Mapping:
+  bluetooth.png <- phosphor/bluetooth-fill #FFFFFF (28x30)
+  bluetooth_unconnect.png <- phosphor/bluetooth-slash-fill #808080 (28x30)
+  wifi_connect_0.png <- phosphor/wifi-none-fill #FFFFFF (28x30)
+  wifi_connect_1.png <- phosphor/wifi-low-fill #FFFFFF (28x30)
+  wifi_connect_2.png <- phosphor/wifi-medium-fill #FFFFFF (28x30)
+  wifi_connect_3.png <- phosphor/wifi-high-fill #FFFFFF (28x30)
+  wifi_unconnect.png <- phosphor/wifi-slash-fill #808080 (28x30)
+  usb.png <- phosphor/usb-fill (rotated vertical) #FFFFFF (28x30)
+  adb.png <- phosphor/android-logo-fill #FFFFFF (28x30)
+  play.png <- phosphor/play-fill #FFFFFF (28x30)
+  pause.png <- phosphor/pause-fill #FFFFFF (28x30)
+  battery_bg.png <- phosphor/battery-empty-fill (rotated vertical) #FFFFFF (20x30)
+  battery_charge_bg.png <- phosphor/battery-charging-fill (rotated vertical) #FFFFFF (20x30)
+  battery_low_bg.png <- phosphor/battery-warning-fill (rotated vertical) #FF0000 (20x30)
+  battery.png <- inner well fill meter of battery-empty #FFFFFF (20x30)
+  a2dp.png <- phosphor/bluetooth-fill + phosphor/speaker-simple-high-fill audio waves #FFFFFF (28x30)
+  spdif.png <- phosphor/waveform-fill #FFFFFF (28x30)
+  speaker.png <- phosphor/speaker-simple-high-fill #FFFFFF (28x30)
+  balance.png <- phosphor/circle-half-fill #FFFFFF (28x30)
+  lo.png <- phosphor/plugs-fill #FFFFFF (28x30)
+  po.png <- phosphor/headphones-fill #FFFFFF (28x30)
+  am.png <- Montserrat SemiBold "AM" #FFFFFF (28x30)
+  pm.png <- Montserrat SemiBold "PM" #FFFFFF (28x30)
+  hl_connect.png <- phosphor/broadcast-fill #FFFFFF (28x30)
+  hl_disconnect.png <- phosphor/broadcast-fill #808080 (28x30)
+  aac.png <- Montserrat Bold rounded wordmark badge "AAC" #FFFFFF (48x30)
+  sbc.png <- Montserrat Bold rounded wordmark badge "SBC" #FFFFFF (48x30)
+  ldac.png <- Montserrat Bold rounded wordmark badge "LDAC" #FFFFFF (48x30)
+  aptx.png <- Montserrat Bold rounded wordmark badge "aptX" #FFFFFF (48x30)
+  aptx_hd.png <- Montserrat Bold rounded wordmark badge "aptX HD" #FFFFFF (48x30)
+  uat.png <- Montserrat Bold rounded wordmark badge "UAT" #FFFFFF (48x30)
+
+Numeric Readouts Typography: Barlow Condensed (Bold)
+License: SIL Open Font License 1.1 (OFL)
+Author: Jeremy Tribby
+https://github.com/jpt/barlow
+https://fonts.google.com/specimen/Barlow+Condensed
+Selected over Current Stock, Montserrat Bold, Roboto Condensed Bold, Antonio
+Bold, and IBM Plex Sans Condensed Bold for legibility at actual render size:
+23px glyph height within the 30px canvas (vs 16-20px for the alternatives),
+sturdy 3.5-4.0px stems, and open counters that stay distinct at tiny scale.
+Comparison renders: topbar/icons/typography_comparison.png and
+typography_comparison_10x.png (not copied into the live theme).
+
+Numeric Mapping:
+  0.png..9.png <- Barlow Condensed Bold '0'..'9' #FFFFFF (14x30)
+  colon.png <- Barlow Condensed Bold ':' #FFFFFF (14x30)
+  percent.png <- Barlow Condensed Bold '%' #FFFFFF (18x30)

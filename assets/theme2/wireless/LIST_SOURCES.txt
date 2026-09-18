@@ -1,0 +1,18 @@
+Wireless list assets (2026-09-13)
+Runtime path: /usr/resource/litegui/theme2/wireless/list_*.png
+Icons: 44x44 RGBA. Backgrounds: 480x96 RGB, decoded once per screen.
+Phosphor Icons @2.1.1 (MIT): wifi-high, bluetooth, airplay, share-network,
+download-simple. Remote is an original outline matching the reference.
+Palette: gold, cyan, mint, silver, purple, coral.
+Reference: ChatGPT Image Sep 13, 2026, 07_31_51 PM.png.
+SVG sources rendered with ffmpeg's librsvg renderer, Lanczos reduction.
+First five backgrounds reuse the Settings assets with size-only export.
+Import background created with the built-in image generation tool.
+Final prompt: Generate a single flat 3:1 landscape FULL BLEED UI color-gradient
+texture. Entire canvas is opaque colored pixels, no margins. Top left color
+#3b2223 softly fades to #171216 across right and bottom. Extremely subtle low
+contrast smooth gradient on very dark background. No objects, no text, NO CARD
+OUTLINE, no rounded corners, NO CHECKERBOARD, NO transparency, no frame. Just
+the gradient color field entirely filling the image. Firmware Wireless Import
+row backdrop, warm dark coral red at upper left.
+Existing wireless grid files are retained under their original names.

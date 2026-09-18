@@ -14,6 +14,7 @@
 #include "gui_lyrics.h"
 #include "screen_builders.h"
 #include "settings.h"
+#include "tagcache.h"
 #include "assets.h"
 #include "metadata.h"
 #include "audio.h"
@@ -407,8 +408,39 @@ void firmware_update_row_cb(lv_event_t * e) {
     gui_popup_show(&firmware_update_popup);
 }
 
+static lv_obj_t * adb_switch = NULL;
+
+/* The Developer Options screen is built once and cached, so its ADB row would
+ * otherwise keep showing whatever the state was at build time. Called when the
+ * screen opens, and again by poll_usb_mode_switch() once the gadget settles so
+ * a switch that failed does not leave the toggle promising ADB. */
+void gui_settings_sync_adb_toggle(void) {
+    if (!adb_switch) return;
+    if (gui_network_adb_active()) lv_obj_add_state(adb_switch, LV_STATE_CHECKED);
+    else lv_obj_clear_state(adb_switch, LV_STATE_CHECKED);
+}
+
+static void adb_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    /* Turning ADB off falls back to Storage: the stock default, and the safer
+     * of the other two since DAC takes over the whole screen with its own
+     * overlay rather than just quietly changing what the USB port does. */
+    bool want_adb = !gui_network_adb_active();
+    if (!start_usb_mode_switch(want_adb ? USB_MODE_ADB : USB_MODE_STORAGE)) {
+        /* Request dropped because a switch is already in flight. Put the
+         * switch back rather than leaving it showing a state nothing is
+         * working toward. */
+        gui_settings_sync_adb_toggle();
+        return;
+    }
+    /* Accepted: the switch already shows the requested state, and applying it
+     * takes seconds. Leave it optimistically flipped; poll_usb_mode_switch()
+     * confirms or rolls it back. */
+}
+
 static void dev_options_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_settings_sync_adb_toggle();
     nav_push(dev_options_screen);
 }
 
@@ -437,10 +469,17 @@ static void db_logging_switch_event_cb(lv_event_t * e) {
  * cache jobs to .logs/database_artwork.log, and USB DAC bridge diagnostics to
  * .logs/usb_dac_bridge.log on the SD card -- see db_log.h and usb_dac_bridge.h. */
 static lv_obj_t * build_dev_options_screen(void) {
-    static pill_list_item_t items[1];
-    items[0] = (pill_list_item_t){ "Enable debug logging", PILL_ACCESSORY_TOGGLE,
+    static pill_list_item_t items[2];
+    /* ADB lives here rather than on the USB Mode screen: it overrides
+     * Storage/DAC while on and persists across a reboot, so it sits behind
+     * Developer Options as the explicit opt-in that makes re-applying it on
+     * startup reasonable. The USB Mode screen still dims the other modes
+     * while it owns the port. */
+    items[0] = (pill_list_item_t){ "ADB", PILL_ACCESSORY_TOGGLE, gui_network_adb_active(),
+                                    NULL, adb_switch_event_cb, NULL, &adb_switch };
+    items[1] = (pill_list_item_t){ "Enable debug logging", PILL_ACCESSORY_TOGGLE,
                                     current_settings.db_logging_enabled, NULL, db_logging_switch_event_cb, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Developer Options", generic_back_cb, items, 1, gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    lv_obj_t * scr = build_pill_list_screen("Developer Options", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1543,11 +1582,74 @@ static lv_obj_t * build_music_timers_screen(void) {
     return scr;
 }
 
-static lv_obj_t * build_music_library_screen(void) {
-    static pill_list_item_t items[1 + PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
+static lv_obj_t * artist_split_screen = NULL;
+static lv_obj_t * artist_split_toggles[3] = { NULL, NULL, NULL };
+static const char artist_split_chars[3] = { ';', '/', ',' };
 
-    int count = 1;
+static bool artist_delim_enabled(char c) {
+    return strchr(current_settings.artist_delimiters, c) != NULL;
+}
+
+/* Rebuilds the artist index in place. The raw ARTIST tag is what gets stored,
+ * and splitting happens while the index is built, so a delimiter change costs
+ * a rebuild rather than a rescan of the card. */
+static void artist_split_apply(void) {
+    settings_save(&current_settings);
+    tagcache_set_artist_delimiters(current_settings.artist_delimiters);
+    tagcache_rebuild_indexes_only();
+    gui_library_refresh_music_screen();
+}
+
+static void artist_split_toggle_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    int idx = (int) (intptr_t) lv_event_get_user_data(e);
+    if (idx < 0 || idx >= 3) return;
+    char c = artist_split_chars[idx];
+
+    char next[sizeof(current_settings.artist_delimiters)];
+    size_t n = 0;
+    for (size_t i = 0; current_settings.artist_delimiters[i] && n + 1 < sizeof(next); i++) {
+        if (current_settings.artist_delimiters[i] != c) next[n++] = current_settings.artist_delimiters[i];
+    }
+    if (!artist_delim_enabled(c) && n + 1 < sizeof(next)) next[n++] = c; /* was off, turn on */
+    next[n] = '\0';
+    snprintf(current_settings.artist_delimiters, sizeof(current_settings.artist_delimiters), "%s", next);
+    artist_split_apply();
+}
+
+/* Filing one track under several artists, e.g. "artistA;artistB" appearing in
+ * both. Comma is offered but off by default: it occurs inside ordinary artist
+ * names ("Crosby, Stills & Nash") that splitting would break. Album artist is
+ * never split, which is what keeps it useful as the single grouping value. */
+static lv_obj_t * build_artist_split_screen(void) {
+    static pill_list_item_t items[3];
+    items[0] = (pill_list_item_t){ "Semicolon  ;", PILL_ACCESSORY_TOGGLE, artist_delim_enabled(';'),
+                                    NULL, artist_split_toggle_cb, (void *) (intptr_t) 0, &artist_split_toggles[0] };
+    items[1] = (pill_list_item_t){ "Slash  /", PILL_ACCESSORY_TOGGLE, artist_delim_enabled('/'),
+                                    NULL, artist_split_toggle_cb, (void *) (intptr_t) 1, &artist_split_toggles[1] };
+    items[2] = (pill_list_item_t){ "Comma  ,", PILL_ACCESSORY_TOGGLE, artist_delim_enabled(','),
+                                    NULL, artist_split_toggle_cb, (void *) (intptr_t) 2, &artist_split_toggles[2] };
+    lv_obj_t * scr = build_pill_list_screen("Split Artist Tags", generic_back_cb, items, 3, gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static void artist_split_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    for (int i = 0; i < 3; i++) {
+        if (!artist_split_toggles[i]) continue;
+        if (artist_delim_enabled(artist_split_chars[i])) lv_obj_add_state(artist_split_toggles[i], LV_STATE_CHECKED);
+        else lv_obj_clear_state(artist_split_toggles[i], LV_STATE_CHECKED);
+    }
+    nav_push(artist_split_screen);
+}
+
+static lv_obj_t * build_music_library_screen(void) {
+    static pill_list_item_t items[2 + PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS];
+    items[0] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
+    items[1] = (pill_list_item_t){ "Split Artist Tags", PILL_ACCESSORY_CHEVRON, false, artist_split_row_cb, NULL, NULL };
+
+    int count = 2;
     count = append_plugin_list_rows(items, count, PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS,
                                     plugin_manager_get_music_library_list_item_count,
                                     plugin_manager_get_music_library_list_item_label,
@@ -1904,10 +2006,9 @@ static lv_obj_t * build_settings_screen(void) {
     lv_obj_t * scr = build_pill_list_screen("Settings", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     static const char * names[] = { "music", "display", "power", "system", "about" };
     for (unsigned i = 0; i < 5; ++i) {
-        char icon[64], background[64];
+        char icon[64];
         snprintf(icon, sizeof(icon), "settings/%s.png", names[i]);
-        snprintf(background, sizeof(background), "settings/bg_%s.png", names[i]);
-        if (category_rows[i]) decorate_category_row(category_rows[i], icon, background);
+        if (category_rows[i]) decorate_category_row(category_rows[i], icon, NULL);
         items[i].out_row = NULL;
     }
     finalize_screen_navigation(scr);
@@ -1964,8 +2065,8 @@ static void dac_home_usb_row_cb(lv_event_t * e) {
 
 lv_obj_t * build_dac_home_screen(void) {
     const icon_grid_item_t items[] = {
-        { "submenu/usb.png", NULL, "USB DAC", dac_home_usb_row_cb, NULL, .bg_image = "submenu/bg_gold.png" },
-        { "submenu/bluetooth.png", NULL, "Bluetooth DAC", bt_dac_settings_row_cb, NULL, .bg_image = "submenu/bg_blue.png" },
+        { "submenu/usb.png", NULL, "USB DAC", dac_home_usb_row_cb, NULL },
+        { "submenu/bluetooth.png", NULL, "Bluetooth DAC", bt_dac_settings_row_cb, NULL },
     };
     lv_obj_t * scr = build_category_menu_screen("DAC", generic_back_cb, items, 2, NULL);
     finalize_screen_navigation(scr);
@@ -3035,6 +3136,7 @@ void gui_settings_init(void) {
     music_controls_screen = build_music_controls_screen();
     music_timers_screen = build_music_timers_screen();
     music_library_screen = build_music_library_screen();
+    artist_split_screen = build_artist_split_screen();
     settings_music_screen = build_music_settings_screen();
     settings_display_screen = build_settings_display_screen();
     settings_power_screen = build_settings_power_screen();
@@ -3068,6 +3170,7 @@ void gui_settings_teardown(void) {
 
     if (about_screen) { lv_obj_delete(about_screen); about_screen = NULL; }
     if (dev_options_screen) { lv_obj_delete(dev_options_screen); dev_options_screen = NULL; }
+    adb_switch = NULL; /* owned by the screen just deleted; sync runs off the USB poll, not this screen's lifetime */
     if (accent_color_screen) { lv_obj_delete(accent_color_screen); accent_color_screen = NULL; }
     if (custom_font_screen) { lv_obj_delete(custom_font_screen); custom_font_screen = NULL; }
     if (screen_timeout_screen) { lv_obj_delete(screen_timeout_screen); screen_timeout_screen = NULL; }
@@ -3085,6 +3188,8 @@ void gui_settings_teardown(void) {
      * opened at least one region, same guard shape as every screen above. */
     if (timezone_city_screen) { lv_obj_delete(timezone_city_screen); timezone_city_screen = NULL; }
     if (settings_music_screen) { lv_obj_delete(settings_music_screen); settings_music_screen = NULL; }
+    if (artist_split_screen) { lv_obj_delete(artist_split_screen); artist_split_screen = NULL; }
+    artist_split_toggles[0] = artist_split_toggles[1] = artist_split_toggles[2] = NULL;
     if (music_playback_screen) { lv_obj_delete(music_playback_screen); music_playback_screen = NULL; }
     if (music_audio_screen) { lv_obj_delete(music_audio_screen); music_audio_screen = NULL; }
     if (music_controls_screen) { lv_obj_delete(music_controls_screen); music_controls_screen = NULL; }

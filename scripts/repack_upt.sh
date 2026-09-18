@@ -58,12 +58,34 @@ fi
 install -m 0755 "$player" "$work/root/usr/bin/open_hiby_player"
 install -m 0755 "$bootloader" "$work/root/usr/bin/open_hiby_bootloader"
 
-# Files we own that are not in stock, laid out as squashfs-root-relative
-# paths under firmware/overlay/ (e.g. usr/share/udhcpc/default.script.d/
-# ntpdate). Applied after unpack so a newer overlay wins over whatever the
-# Staging Image already has -- or doesn't. cp -a keeps mode bits and
-# relative symlinks (sync_ntp.sh).
-overlay="$(cd "$(dirname "$0")/.." && pwd)/firmware/overlay"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+
+# UI assets and fonts we own, kept under assets/ in the tree the device itself
+# uses: assets/theme2/<dir>/<file> lands at /usr/resource/litegui/theme2/, and
+# assets/fonts/ at /usr/resource/fonts/. Copied after unpack so ours win over
+# whatever the Staging Image already has -- or doesn't. Anything not copied
+# here reaches the device only if the base image already carried it.
+# Only tracked files are copied, so "tracked in git" and "shipped on the
+# device" mean the same thing. That also keeps a contributor's own local
+# stock-firmware dump (ignored, see .gitignore) out of the image -- stock
+# assets already come from the base image.
+copy_tracked_assets() {
+    local src="$1" dest="$2" f rel
+    [[ -d "$repo/$src" ]] || return 0
+    while IFS= read -r f; do
+        rel="${f#"$src"/}"
+        mkdir -p "$dest/$(dirname "$rel")"
+        cp -a "$repo/$f" "$dest/$rel"
+    done < <(git -C "$repo" ls-files "$src")
+}
+copy_tracked_assets assets/theme2 "$work/root/usr/resource/litegui/theme2"
+copy_tracked_assets assets/fonts  "$work/root/usr/resource/fonts"
+
+# Non-asset files we own that are not in stock, laid out as squashfs-root-
+# relative paths under firmware/overlay/ (e.g. usr/share/udhcpc/
+# default.script.d/ntpdate). cp -a keeps mode bits and relative symlinks
+# (sync_ntp.sh).
+overlay="$repo/firmware/overlay"
 if [[ -d "$overlay" ]]; then
     cp -a "$overlay"/. "$work/root/"
 fi

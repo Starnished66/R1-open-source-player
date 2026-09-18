@@ -1,0 +1,30 @@
+Settings assets, 2026-09-13
+
+Runtime destination: /usr/resource/litegui/theme2/settings/
+PNG icons: 44x44 RGBA. Backgrounds: 480x112 RGB, resized to row geometry
+for other boards/font sizes and retained decoded by gui_settings.c.
+
+Icons extend the same Phosphor family used by the main menu.
+Source: https://github.com/phosphor-icons/core (MIT license).
+Pinned distribution: @phosphor-icons/core@2.1.1, assets/regular/*.svg
+music: music-notes-simple; display: sun; power: battery-medium;
+system: assets/fill/gear-fill.svg; about: info.
+Power charge bars replaced with one half-full block to match the reference.
+SVG source copies include the two-stop pastel color gradients.
+
+Background generation: built-in image generation tool, followed by size/PNG
+format export. No UI text or icons are baked into the backgrounds.
+Reference: ChatGPT Image Sep 13, 2026, 07_12_05 PM.png.
+Final prompt template:
+Generate a single flat 3:1 landscape FULL BLEED UI color-gradient texture.
+Entire canvas is opaque colored pixels, no margins. Top left color LEFT
+softly fades to RIGHT across right and bottom. Extremely subtle low contrast
+smooth gradient on very dark background. No objects, no text, NO CARD OUTLINE,
+no rounded corners, NO CHECKERBOARD, NO transparency, no frame. Just the
+gradient color field entirely filling the image. Firmware Settings row backdrop.
+LEFT/RIGHT pairs:
+music #392a1c / #0d1115; display #142f3f / #0a141a;
+power #10372e / #091916; system #242b38 / #11151c;
+about #30223e / #14101e.
+
+Generated icon drafts were not used in the shipped files.

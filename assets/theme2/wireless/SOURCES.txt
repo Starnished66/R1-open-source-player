@@ -1,0 +1,30 @@
+theme2/wireless icons (swapped in place; old assets removed)
+Firmware reads these unsuffixed names.
+212x190 dark plates with colorful glyphs (same slot as stream_media).
+_s selected copies are byte-identical duplicates of the base file (firmware
+requires both files present; the app does not render a distinct pressed
+state for these tiles).
+Style: Outline/stroke line-art with hollow interiors, extending the
+launcher's reference-matched look with a distinct soft pastel-gemstone hue
+per icon.
+
+Icon Family: Phosphor Icons (Regular / Outline variant)
+License: MIT License
+https://github.com/phosphor-icons/core
+https://cdn.jsdelivr.net/npm/@phosphor-icons/core@2.1.1/assets/regular/<name>.svg
+
+Mapping:
+  airplay.png / airplay_s.png <- phosphor/airplay #F87CA6 (Rose Quartz)
+  bt.png / bt_s.png <- phosphor/bluetooth #7B9CFF (Periwinkle / iris blue)
+  dlna.png / dlna_s.png <- phosphor/screencast #F8D046 (Citrine Gold)
+  hibylink.png / hibylink_s.png <- phosphor/broadcast #DA70E8 (Orchid Amethyst)
+  via.png / via_s.png <- phosphor/arrows-left-right #FA8E66 (Apricot / soft melon)
+  wifi.png / wifi_s.png <- phosphor/wifi-high #B8E550 (Peridot Lime)
+
+Tile background cards: bg_airplay.png, bg_bt.png, bg_dlna.png,
+bg_hibylink.png, bg_via.png, bg_wifi.png (240x256, RGBA, rounded-rect alpha
+mask baked in at radius 24). Same generation method as launcher/SOURCES.txt's
+tile backgrounds, tinted to each icon's own accent color above. Wired via
+icon_grid_item_t.bg_image (screen_builders.h/.c) and build_wireless_screen()
+(gui_network.c). Bayer-dithered at generation time -- see launcher/SOURCES.txt
+for why (undithered gradients caused real on-device flicker).

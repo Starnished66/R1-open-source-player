@@ -1876,8 +1876,6 @@ static usb_storage_session_t usb_storage_session;
 static uint32_t usb_storage_host_check_tick;
 
 static void usb_mode_option_row_cb(lv_event_t * e);
-static void usb_mode_adb_toggle_cb(lv_event_t * e);
-
 /* ADB is a separate toggle, not a third equal option alongside Storage/DAC
  * -- matches the stock firmware's own USB device mode screen (confirmed by
  * the user against a real stock device: ADB overrides Storage/DAC while
@@ -1886,11 +1884,15 @@ static void usb_mode_adb_toggle_cb(lv_event_t * e);
  * directory, entirely separate from the "android0" one Storage and DAC
  * share (see usb_mode_control.c), so it really is orthogonal rather than a
  * third position in the same rotation. */
+static bool adb_owns_usb_port(void);
+
 static void populate_usb_mode_screen(void) {
     lv_obj_clean(usb_mode_list);
 
-    bool adb_active = current_settings.usb_mode == (int) USB_MODE_ADB;
-    add_pill_toggle_row(usb_mode_list, "ADB", adb_active, usb_mode_adb_toggle_cb);
+    /* ADB itself is toggled from Developer Options, not here, but it still
+     * owns the port while on, so this screen keeps showing that the other
+     * modes are unavailable. */
+    bool adb_active = adb_owns_usb_port();
 
     for (size_t i = 0; i < USB_MODE_OPTION_COUNT; i++) {
         if (usb_mode_options[i].mode == USB_MODE_ADB) continue; /* handled by the toggle above */
@@ -1924,7 +1926,10 @@ static void * usb_bridge_restart_thread_func(void * arg) {
     return NULL;
 }
 
-static void launch_usb_mode_switch(void) {
+/* Returns whether the worker actually started. A launch that fails runs no
+ * poll, so nothing else will ever correct a control left flipped in
+ * anticipation of it -- the caller has to know. */
+static bool launch_usb_mode_switch(void) {
     usb_mode_switch_queued = false;
     atomic_store_explicit(&usb_mode_switch_done_flag, false, memory_order_relaxed);
     int rc = pthread_create(&usb_mode_switch_thread, NULL, usb_mode_switch_thread_func, NULL);
@@ -1934,17 +1939,41 @@ static void launch_usb_mode_switch(void) {
          * ignored until the player or device is restarted. */
         usb_mode_switch_active = false;
         show_error_toast("Could not start USB mode switch");
+        return false;
     }
+    return true;
 }
 
-void start_usb_mode_switch(usb_mode_t target) {
-    if (usb_mode_switch_active) return;
+/* Returns whether the request was accepted. A caller that flips its own UI
+ * ahead of the hardware needs to know when a tap was dropped, or the control
+ * ends up showing a state nothing is working toward. */
+bool start_usb_mode_switch(usb_mode_t target) {
+    if (usb_mode_switch_active) return false;
     usb_mode_switch_target = target;
     usb_mode_switch_active = true;
     /* Preserve the explicit request without letting gadget teardown race a
      * watchdog start already in flight. Polling launches it once safe. */
     usb_mode_switch_queued = usb_bridge_restart_active;
-    if (!usb_mode_switch_queued) launch_usb_mode_switch();
+    if (!usb_mode_switch_queued) return launch_usb_mode_switch();
+    return true;
+}
+
+/* The state the ADB control should show: the target while a switch is in
+ * flight, otherwise the recorded mode. */
+bool gui_network_adb_active(void) {
+    if (usb_mode_switch_active) return usb_mode_switch_target == USB_MODE_ADB;
+    return current_settings.usb_mode == (int) USB_MODE_ADB;
+}
+
+/* Whether ADB still has a claim on the port, which is deliberately more
+ * cautious than gui_network_adb_active(). Leaving ADB does not free the port
+ * until the switch actually lands, so the modes that cannot be chosen yet stay
+ * dimmed for the whole transition in both directions rather than offering rows
+ * whose taps the in-flight guard would only reject. */
+static bool adb_owns_usb_port(void) {
+    bool recorded_adb = current_settings.usb_mode == (int) USB_MODE_ADB;
+    if (usb_mode_switch_active) return recorded_adb || usb_mode_switch_target == USB_MODE_ADB;
+    return recorded_adb;
 }
 
 void poll_usb_mode_switch(void) {
@@ -1952,8 +1981,12 @@ void poll_usb_mode_switch(void) {
         atomic_load_explicit(&usb_bridge_restart_done, memory_order_acquire)) {
         usb_bridge_restart_active = false;
     }
-    if (usb_mode_switch_queued && !usb_bridge_restart_active)
-        launch_usb_mode_switch();
+    if (usb_mode_switch_queued && !usb_bridge_restart_active) {
+        /* Deferred launch: same failure consequence as the immediate one, but
+         * the original caller has long since returned, so the control it
+         * flipped has to be corrected from here. */
+        if (!launch_usb_mode_switch()) gui_settings_sync_adb_toggle();
+    }
     /* If set to USB DAC mode but the audio bridge is not running, restart it.
      * Skipped while a mode switch is in flight to avoid racing
      * usb_mode_control_apply(). */
@@ -1993,7 +2026,15 @@ void poll_usb_mode_switch(void) {
         char msg[64];
         snprintf(msg, sizeof(msg), "Failed to switch to %s", label);
         show_error_toast(msg);
+        /* apply() tears the old gadget down before bringing the target up, so
+         * a failure can leave neither bound -- the recorded mode is then not
+         * merely unchanged, it is wrong. Re-read the hardware so the rollback
+         * below reflects what is actually there. */
+        usb_mode_t actual_usb_mode;
+        if (usb_mode_control_detect_current(&actual_usb_mode))
+            current_settings.usb_mode = (int) actual_usb_mode;
         populate_usb_mode_screen(); /* in case current_settings.usb_mode's actual row needs re-highlighting */
+        gui_settings_sync_adb_toggle(); /* roll the optimistic flip back to what the hardware actually did */
         return;
     }
 
@@ -2008,6 +2049,7 @@ void poll_usb_mode_switch(void) {
      * below so leaving DAC mode clears it just as reliably. */
     usb_dac_mode_active = (usb_mode_switch_target == USB_MODE_DAC);
     populate_usb_mode_screen(); /* refresh which row shows the accent border */
+    gui_settings_sync_adb_toggle();
 
     /* DAC mode takes over the whole screen with its own overlay (matching
      * the stock firmware's hiby_usb.view) -- the device can't sensibly be
@@ -2110,16 +2152,6 @@ static void usb_mode_option_row_cb(lv_event_t * e) {
     usb_mode_t target = usb_mode_options[index].mode;
     if (current_settings.usb_mode == (int) target) return;
     start_usb_mode_switch(target);
-}
-
-static void usb_mode_adb_toggle_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    bool currently_adb = current_settings.usb_mode == (int) USB_MODE_ADB;
-    /* Turning ADB off falls back to Storage -- the stock default, and the
-     * safer of the other two since DAC takes over the whole screen with
-     * its own overlay rather than just quietly changing what the USB port
-     * does. */
-    start_usb_mode_switch(currently_adb ? USB_MODE_STORAGE : USB_MODE_ADB);
 }
 
 static lv_obj_t * build_usb_mode_screen(void) {
@@ -3399,18 +3431,16 @@ void gui_network_handle_wifi_disabled(void) {
 
 static lv_obj_t * build_wireless_screen(void) {
     static icon_grid_item_t items[6];
-    items[0] = (icon_grid_item_t){ "wireless/list_wifi.png", NULL, "Wi-Fi", wifi_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_wifi.png" };
-    items[1] = (icon_grid_item_t){ "wireless/list_bt.png", NULL, "Bluetooth", bt_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_bt.png" };
-    items[2] = (icon_grid_item_t){ "wireless/list_airplay.png", NULL, "AirPlay", airplay_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_airplay.png" };
-    items[3] = (icon_grid_item_t){ "wireless/list_dlna.png", NULL, "DLNA", dlna_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_dlna.png" };
-    items[4] = (icon_grid_item_t){ "wireless/list_remote.png", NULL, "Remote", remote_control_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_remote.png" };
-    items[5] = (icon_grid_item_t){ "wireless/list_import.png", NULL, "Import", import_wifi_tile_cb, NULL,
-                                   .bg_image = "wireless/list_bg_import.png" };
+    /* No .bg_image here: the stock per-tile background pill isn't present in
+     * every board's own firmware (missing on R1, so the tile silently rendered
+     * without one there) and measurably added render/decode cost on R3 Pro II
+     * for a background that isn't load-bearing to this screen. */
+    items[0] = (icon_grid_item_t){ "wireless/list_wifi.png", NULL, "Wi-Fi", wifi_tile_cb, NULL };
+    items[1] = (icon_grid_item_t){ "wireless/list_bt.png", NULL, "Bluetooth", bt_tile_cb, NULL };
+    items[2] = (icon_grid_item_t){ "wireless/list_airplay.png", NULL, "AirPlay", airplay_tile_cb, NULL };
+    items[3] = (icon_grid_item_t){ "wireless/list_dlna.png", NULL, "DLNA", dlna_tile_cb, NULL };
+    items[4] = (icon_grid_item_t){ "wireless/list_remote.png", NULL, "Remote", remote_control_tile_cb, NULL };
+    items[5] = (icon_grid_item_t){ "wireless/list_import.png", NULL, "Import", import_wifi_tile_cb, NULL };
     lv_obj_t * scr = build_category_menu_screen("Wireless", generic_back_cb, items, 6,
                                                 &launcher_layout_config.wireless);
     finalize_screen_navigation(scr);

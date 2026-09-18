@@ -1,0 +1,28 @@
+Lucide top-bar status icons
+
+Source: https://github.com/lucide-icons/lucide/tree/main/icons
+License: ISC License
+Copyright (c) 2026 Lucide Icons and Contributors
+
+Rendered from the official 24x24 SVG sources at 384 DPI, downsampled to
+24x24 RGBA PNG with ImageMagick. Stroke color is white on transparency.
+
+Mapping:
+  lucide_volume_2.png      <- volume-2.svg
+  lucide_headphones.png    <- headphones.svg
+  lucide_audio_lines.png   <- audio-lines.svg
+  lucide_usb.png           <- usb.svg
+  lucide_play.png          <- play.svg
+  lucide_pause.png         <- pause.svg
+  lucide_wifi.png          <- wifi.svg
+  lucide_wifi_high.png     <- wifi-high.svg
+  lucide_wifi_low.png      <- wifi-low.svg
+  lucide_wifi_zero.png     <- wifi-zero.svg
+  lucide_wifi_off.png      <- wifi-off.svg
+  lucide_bluetooth.png     <- bluetooth.svg
+  lucide_bluetooth_off.png <- bluetooth-off.svg
+
+ISC permission notice:
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.

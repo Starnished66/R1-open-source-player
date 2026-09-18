@@ -48,7 +48,8 @@ void populate_bt_screen(void);
 void gui_network_show_wifi_toggle_pending(bool enabled);
 void gui_network_wifi_toggle_completed(bool enabled);
 
-void start_usb_mode_switch(usb_mode_t target);
+bool start_usb_mode_switch(usb_mode_t target);
+bool gui_network_adb_active(void);
 
 bool gui_network_has_background_work(void);
 void gui_network_cancel_background_work(void);

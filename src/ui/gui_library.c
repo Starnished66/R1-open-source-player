@@ -150,6 +150,9 @@ static char collection_menu_name[128];
 static char collection_menu_album_artist[128];
 static metadata_db_group_kind_t collection_menu_artist_kind;
 static int collection_menu_song_count;
+/* Credited artist the album menu was opened under, empty when it was not
+ * opened from an Artists drill-down. */
+static char collection_menu_artist[128];
 
 /* Externs to player/queue and global state */
 extern player_settings_t current_settings;
@@ -2512,9 +2515,19 @@ static void artist_row_click_cb(int index) {
     show_artist_albums(group.name, METADATA_DB_GROUP_ARTIST);
 }
 
-static group_song_entry_t * load_album_entries(const char * name, const char * album_artist,
-                                                int song_count, int * out_count) {
+/* artist_filter scopes an album to one credited artist, for the Artists
+ * drill-down where a track tagged "A;B" puts the album under both. The album
+ * group's own song_count covers the whole album, so a filtered listing has to
+ * count its own rows or it would promise tracks it will not show. Album
+ * Artists and the plain Albums list pass NULL and keep the whole album. */
+static group_song_entry_t * load_album_entries_filtered(const char * name, const char * album_artist,
+                                                         int song_count, const char * artist_filter,
+                                                         int * out_count) {
     *out_count = 0;
+    if (artist_filter && artist_filter[0]) {
+        int64_t filtered = metadata_db_count_songs_filtered(NULL, artist_filter, album_artist, name);
+        song_count = filtered > 0 && filtered <= INT_MAX ? (int) filtered : 0;
+    }
     if (song_count <= 0) return NULL;
     song_row_t * songs = calloc((size_t) song_count, sizeof(*songs));
     group_song_entry_t * entries = calloc((size_t) song_count, sizeof(*entries));
@@ -2523,7 +2536,10 @@ static group_song_entry_t * load_album_entries(const char * name, const char * a
     while (n < song_count) {
         int want = song_count - n;
         if (want > 64) want = 64;
-        int got = metadata_db_get_album_songs(name, album_artist, n, songs + n, want);
+        int got = (artist_filter && artist_filter[0])
+                      ? metadata_db_get_songs_filtered_page(NULL, artist_filter, album_artist, name,
+                                                            n, want, songs + n)
+                      : metadata_db_get_album_songs(name, album_artist, n, songs + n, want);
         if (got <= 0) break;
         n += got;
         if (got < want) break;
@@ -2552,15 +2568,29 @@ static group_song_entry_t * load_album_entries(const char * name, const char * a
     return entries;
 }
 
-static bool show_album_group(const group_row_t * group) {
+static group_song_entry_t * load_album_entries(const char * name, const char * album_artist,
+                                                int song_count, int * out_count) {
+    return load_album_entries_filtered(name, album_artist, song_count, NULL, out_count);
+}
+
+/* The artist whose album list is on screen, when that list is a plain artist
+ * rather than an album artist. NULL elsewhere, so only the Artists path
+ * scopes an album to one contributor. */
+static const char * artist_albums_song_filter(void);
+
+static bool show_album_group_filtered(const group_row_t * group, const char * artist_filter) {
     int count = 0;
-    group_song_entry_t * entries = load_album_entries(group->name, group->album_artist,
-                                                       group->song_count, &count);
+    group_song_entry_t * entries = load_album_entries_filtered(group->name, group->album_artist,
+                                                                group->song_count, artist_filter, &count);
     if (!entries) return false;
     show_music_group_songs(group->name, entries, count);
     free_group_song_entries(entries, count);
     group_songs_source_is_album = true;
     return true;
+}
+
+static bool show_album_group(const group_row_t * group) {
+    return show_album_group_filtered(group, NULL);
 }
 
 static void album_row_click_cb(int index) {
@@ -4889,6 +4919,10 @@ static int artist_albums_group_count;
 static char artist_albums_current_name[128];
 static metadata_db_group_kind_t artist_albums_current_kind;
 
+static const char * artist_albums_song_filter(void) {
+    return artist_albums_current_kind == METADATA_DB_GROUP_ARTIST ? artist_albums_current_name : NULL;
+}
+
 /* Defined with the shared bounded artwork cache below. */
 static void album_row_thumbnail_decorator(lv_obj_t * list, lv_obj_t * row, lv_obj_t * image,
                                            int logical_index, int pool_slot, int64_t song_id, void * ctx);
@@ -5073,8 +5107,9 @@ static void artist_album_row_click_cb(int index) {
     if (group_index < 0 || group_index >= artist_albums_group_count) return;
     group_row_t * group = &artist_albums_groups[group_index];
     int n = 0;
-    group_song_entry_t * entries = load_album_entries(group->name, group->album_artist,
-                                                       group->song_count, &n);
+    group_song_entry_t * entries = load_album_entries_filtered(group->name, group->album_artist,
+                                                                group->song_count,
+                                                                artist_albums_song_filter(), &n);
     if (!entries) return;
     show_music_group_songs(group->name, entries, n);
     free_group_song_entries(entries, n);
@@ -5129,7 +5164,7 @@ static bool load_collection_for_playback(void) {
     snprintf(group.name, sizeof(group.name), "%s", collection_menu_name);
     snprintf(group.album_artist, sizeof(group.album_artist), "%s", collection_menu_album_artist);
     group.song_count = collection_menu_song_count;
-    return show_album_group(&group);
+    return show_album_group_filtered(&group, collection_menu_artist[0] ? collection_menu_artist : NULL);
 }
 
 static void collection_play_shuffled_cb(lv_event_t * e) {
@@ -5145,9 +5180,17 @@ static void collection_play_sequential_cb(lv_event_t * e) {
 }
 
 static bool collection_song_at(int offset, song_row_t * song) {
-    if (collection_menu_is_album)
+    if (collection_menu_is_album) {
+        /* collection_menu_song_count is the filtered total when the menu was
+         * opened from an Artists drill-down, so the rows must be filtered the
+         * same way or the offset indexes a different list. */
+        if (collection_menu_artist[0])
+            return metadata_db_get_songs_filtered_page(NULL, collection_menu_artist,
+                                                       collection_menu_album_artist,
+                                                       collection_menu_name, offset, 1, song) == 1;
         return metadata_db_get_album_songs(collection_menu_name, collection_menu_album_artist,
                                             offset, song, 1) == 1;
+    }
     return (collection_menu_artist_kind == METADATA_DB_GROUP_ALBUM_ARTIST
                 ? metadata_db_get_album_artist_songs(collection_menu_name, offset, song, 1)
                 : metadata_db_get_artist_songs(collection_menu_name, offset, song, 1)) == 1;
@@ -5166,9 +5209,11 @@ static void collection_add_album_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_collection_menu();
     int count = 0;
-    group_song_entry_t * entries = load_album_entries(collection_menu_name,
-                                                       collection_menu_album_artist,
-                                                       collection_menu_song_count, &count);
+    group_song_entry_t * entries = load_album_entries_filtered(collection_menu_name,
+                                                                collection_menu_album_artist,
+                                                                collection_menu_song_count,
+                                                                collection_menu_artist[0] ? collection_menu_artist : NULL,
+                                                                &count);
     if (!entries) return;
     const char ** paths = malloc(sizeof(*paths) * (size_t) count);
     if (paths) {
@@ -5179,9 +5224,18 @@ static void collection_add_album_cb(lv_event_t * e) {
     free_group_song_entries(entries, count);
 }
 
-static void open_album_collection_menu(const group_row_t * group) {
+static void open_album_collection_menu(const group_row_t * group, const char * artist_filter) {
     collection_menu_is_album = true;
-    collection_menu_song_count = group->song_count;
+    snprintf(collection_menu_artist, sizeof(collection_menu_artist), "%s", artist_filter ? artist_filter : "");
+    /* Match the row's own listing, so "add album" never queues tracks the
+     * screen does not show. */
+    if (collection_menu_artist[0]) {
+        int64_t filtered = metadata_db_count_songs_filtered(NULL, collection_menu_artist,
+                                                            group->album_artist, group->name);
+        collection_menu_song_count = filtered > 0 && filtered <= INT_MAX ? (int) filtered : 0;
+    } else {
+        collection_menu_song_count = group->song_count;
+    }
     snprintf(collection_menu_name, sizeof(collection_menu_name), "%s", group->name);
     snprintf(collection_menu_album_artist, sizeof(collection_menu_album_artist), "%s", group->album_artist);
     show_collection_menu(true);
@@ -5191,14 +5245,14 @@ static void album_more_click_cb(int index) {
     index = search_remap_index(SEARCH_BINDING_ALBUMS, index);
     group_row_t group;
     if (metadata_db_get_albums_page_filtered(NULL, index, 1, &group) == 1)
-        open_album_collection_menu(&group);
+        open_album_collection_menu(&group, NULL);
 }
 
 static void artist_album_more_click_cb(int index) {
     if (index > 0) {
         int group_index = index - 1;
         if (group_index >= 0 && group_index < artist_albums_group_count)
-            open_album_collection_menu(&artist_albums_groups[group_index]);
+            open_album_collection_menu(&artist_albums_groups[group_index], artist_albums_song_filter());
         return;
     }
     int64_t offset = metadata_db_get_group_offset(artist_albums_current_kind,
@@ -5211,6 +5265,7 @@ static void artist_album_more_click_cb(int index) {
     collection_menu_song_count = group.song_count;
     snprintf(collection_menu_name, sizeof(collection_menu_name), "%s", artist_albums_current_name);
     collection_menu_album_artist[0] = '\0';
+    collection_menu_artist[0] = '\0'; /* this menu is the artist itself, not one of their albums */
     show_collection_menu(false);
 }
 

@@ -436,9 +436,17 @@ static void test_force_audio_cd_argv(void) {
     ensure_bluealsa_running();
     assert(kill_calls == 0 && spawn_calls == 0);
 
-    /* Automatic must drop it again, which is a real argv mismatch. Nothing is
-     * connected, so correcting it is allowed to restart the daemon. */
+    /* Automatic resolves to 44.1 kHz, so it keeps the argument. */
     bt_control_set_sample_rate(0);
+    source_pcm_present = false;
+    process_cmdline = forced; process_cmdline_size = sizeof(forced);
+    process_present = true; kill_calls = spawn_calls = 0;
+    ensure_bluealsa_running();
+    assert(kill_calls == 0 && spawn_calls == 0);
+
+    /* An explicit non-44.1 rate drops it, which is a real argv mismatch.
+     * Nothing is connected, so correcting it may restart the daemon. */
+    bt_control_set_sample_rate(48000);
     source_pcm_present = false;
     process_cmdline = forced; process_cmdline_size = sizeof(forced);
     process_present = true; retain_process_after_kill = true; kill_calls = spawn_calls = 0;
@@ -457,12 +465,91 @@ static void test_force_audio_cd_argv(void) {
     source_pcm_present = false;
 
     /* DAC mode never forces the rate: the phone picks it. */
-    bt_control_set_sample_rate(44100);
+    bt_control_set_sample_rate(0); /* automatic still means 44.1 for the source */
     kill_calls = spawn_calls = 0;
     assert(!bt_control_apply_output_settings(true, false));
     assert(spawn_calls == 1 && spawned_argc == 3);
     assert(strcmp(spawned[2], "a2dp-sink") == 0);
-    bt_control_set_sample_rate(0);
+    bt_control_set_sample_rate(48000);
+}
+
+/* Capability decoding, against dbus-send output captured verbatim from a
+ * real headset (Galaxy Buds2 Pro, AAC endpoint). Both byte-array spellings
+ * are covered: requiring either one alone silently produced an empty rate
+ * list on hardware that used the other. */
+static void test_a2dp_capability_rates(void) {
+    static const char bare[] =
+        "   array [\n"
+        "      dict entry(\n"
+        "         string \"UUID\"\n"
+        "         variant             string \"0000110b-0000-1000-8000-00805f9b34fb\"\n"
+        "      )\n"
+        "      dict entry(\n"
+        "         string \"Codec\"\n"
+        "         variant             byte 2\n"
+        "      )\n"
+        "      dict entry(\n"
+        "         string \"Capabilities\"\n"
+        "         variant             array of bytes [\n"
+        "               80 01 8c 83 e8 00\n"
+        "            ]\n"
+        "      )\n"
+        "   ]\n";
+    static const char prefixed[] =
+        "         string \"Capabilities\"\n"
+        "         variant             array of bytes [\n"
+        "               byte 0x80, byte 0x01, byte 0x8c, byte 0x83, byte 0xe8, byte 0x00\n"
+        "            ]\n";
+
+    uint8_t caps[32];
+    size_t caps_len = 0;
+    assert(dbus_prop_byte_array(bare, "Capabilities", caps, sizeof(caps), &caps_len));
+    assert(caps_len == 6 && caps[0] == 0x80 && caps[1] == 0x01 && caps[2] == 0x8c && caps[5] == 0x00);
+
+    uint8_t codec_id = 0;
+    assert(dbus_prop_byte(bare, "Codec", &codec_id) && codec_id == 0x02);
+    assert(a2dp_caps_match_codec(caps, caps_len, codec_id, "AAC"));
+    assert(!a2dp_caps_match_codec(caps, caps_len, codec_id, "SBC"));
+
+    /* 0x018: bit 4 is 44.1 kHz and bit 3 is 48 kHz, listed low to high. */
+    unsigned int rates[12];
+    int n = a2dp_caps_rates(caps, caps_len, "AAC", rates, 12);
+    assert(n == 2 && rates[0] == 44100 && rates[1] == 48000);
+
+    size_t prefixed_len = 0;
+    uint8_t prefixed_caps[32];
+    assert(dbus_prop_byte_array(prefixed, "Capabilities", prefixed_caps, sizeof(prefixed_caps), &prefixed_len));
+    assert(prefixed_len == 6 && memcmp(prefixed_caps, caps, 6) == 0);
+
+    /* Wire layouts for the other codecs this player offers. */
+    static const uint8_t sbc[] = { 0x3f, 0xff, 2, 53 };
+    n = a2dp_caps_rates(sbc, sizeof(sbc), "SBC", rates, 12);
+    assert(n == 2 && rates[0] == 44100 && rates[1] == 48000);
+
+    static const uint8_t ldac[] = { 0x2d, 0x01, 0x00, 0x00, 0xaa, 0x00, 0x3c, 0x07 };
+    n = a2dp_caps_rates(ldac, sizeof(ldac), "LDAC", rates, 12);
+    assert(n == 4 && rates[0] == 44100 && rates[1] == 48000 && rates[2] == 88200 && rates[3] == 96000);
+    assert(a2dp_caps_match_codec(ldac, sizeof(ldac), 0xff, "LDAC"));
+    assert(!a2dp_caps_match_codec(ldac, sizeof(ldac), 0xff, "aptX"));
+
+    /* A truncated or unparsable array must yield nothing rather than junk.
+     * Checked against a fresh buffer: reusing the one above would still hold
+     * the decoded AAC blob and pass even if a parse failure wrote garbage. */
+    uint8_t empty_caps[32];
+    size_t empty_len = 1;
+    memset(empty_caps, 0xAA, sizeof(empty_caps));
+    assert(!dbus_prop_byte_array("string \"Capabilities\" variant array of bytes [ ]",
+                                 "Capabilities", empty_caps, sizeof(empty_caps), &empty_len));
+    assert(!dbus_prop_byte_array("string \"Capabilities\" variant array of bytes [ 80 01",
+                                 "Capabilities", empty_caps, sizeof(empty_caps), &empty_len));
+    assert(a2dp_caps_rates(empty_caps, 2, "AAC", rates, 12) == 0); /* AAC needs 3 bytes */
+
+    /* aptX shares SBC's nibble layout but sits after the 6-byte vendor header. */
+    static const uint8_t aptx[] = { 0x4f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x32 };
+    n = a2dp_caps_rates(aptx, sizeof(aptx), "aptX", rates, 12);
+    assert(n == 2 && rates[0] == 44100 && rates[1] == 48000);
+    assert(a2dp_caps_match_codec(aptx, sizeof(aptx), 0xff, "aptX"));
+    assert(!a2dp_caps_match_codec(aptx, sizeof(aptx), 0xff, "aptX-HD"));
 }
 
 int main(void) {
@@ -479,13 +566,15 @@ int main(void) {
 
     assert(bt_control_set_codec("auto"));
     /* The existing argv assertions below cover codec arguments, so the rate
-     * is parked on Automatic to keep them positional. A dedicated case for
-     * the 44.1 kHz argument follows them. */
-    bt_control_set_sample_rate(0);
+     * is parked on one that adds no argument of its own to keep them
+     * positional. Automatic is NOT that: it resolves to 44.1 kHz and so
+     * carries --a2dp-force-audio-cd. A dedicated case for it follows. */
+    bt_control_set_sample_rate(48000);
     test_daemon_argv();
     test_sbc_xq_lifecycle();
     test_modern_argv();
     test_force_audio_cd_argv();
+    test_a2dp_capability_rates();
     test_bluez_paired_devices();
     alarm(0);
     puts("bluetooth-codec-selftest: PASS (BlueALSA 5 daemon/codec behavior, soft volume, BlueZ compatibility)");

@@ -193,6 +193,12 @@ void bt_control_set_speexrate_enabled(bool enabled);
  * a Bluetooth off/on cycle; any other rate is selected per connection. */
 void bt_control_set_sample_rate(unsigned int rate);
 
+/* Cycles the connected accessory's link so a changed transport rate is
+ * negotiated. The radio stays on; only the device link drops. Blocks for
+ * several seconds, so call it from a worker thread. False when nothing is
+ * connected, in which case the new rate applies on the next connection. */
+bool bt_control_reconnect_for_rate_change(unsigned int rate);
+
 /* Rates the connected accessory supports for the codec currently in use,
  * newest query each call. Returns the count written, 0 when nothing is
  * connected or the rates could not be read. */

@@ -1776,7 +1776,18 @@ static void poll_refresh_bt_icon(void) {
     bt_is_a2dp_connected_ui = a2dp_connected;
     bt_power_status_generation++;
 
+    char previous_mac[sizeof(bt_connected_mac_cached)];
+    snprintf(previous_mac, sizeof(previous_mac), "%s", bt_connected_mac_cached);
     snprintf(bt_connected_mac_cached, sizeof(bt_connected_mac_cached), "%s", a2dp_connected ? refresh_bt_icon_result_mac : "");
+    if (strcmp(previous_mac, bt_connected_mac_cached) != 0) {
+        /* The right transport rate belongs to the accessory, so the effective
+         * one follows whatever is connected: 44.1 kHz headphones and a 96 kHz
+         * LDAC speaker each keep their own. Only on a real change, so a
+         * rate being applied right now is not overwritten by a routine
+         * refresh that happens to see the link mid-cycle. */
+        bt_control_set_sample_rate(settings_bt_rate_for(&current_settings, bt_connected_mac_cached));
+        gui_network_notify_bt_device_changed();
+    }
     snprintf(bt_connected_codec_cached, sizeof(bt_connected_codec_cached), "%s", a2dp_connected ? refresh_bt_icon_result_codec : "");
     bt_connected_rate_cached = a2dp_connected ? refresh_bt_icon_result_rate : 0;
     if (quick_drawer_bt_icon) {

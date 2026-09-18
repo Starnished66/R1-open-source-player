@@ -212,6 +212,7 @@ void poll_wifi_disconnect(void);
 void poll_wifi_forget(void);
 void poll_bt_scan(void);
 void poll_bt_rate_query(void);
+void poll_bt_rate_apply(void);
 void poll_bt_connect(void);
 void poll_bt_forget(void);
 
@@ -978,6 +979,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     plugin_manager_poll();
     poll_bt_scan();
     poll_bt_rate_query();
+    poll_bt_rate_apply();
     poll_bt_connect();
     poll_bt_forget();
     poll_library_rescan();

@@ -4,6 +4,7 @@
 #include "subprocess.h"
 #include "audio.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <poll.h>
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -82,9 +84,22 @@ void bt_control_set_sample_rate(unsigned int rate) {
 }
 
 /* 44.1 kHz is the one rate the daemon can be told to negotiate directly, so
- * it is the only one that costs no transport re-handshake. */
+ * it is the only one reached without re-establishing the link. Automatic
+ * resolves to it: left to itself BlueALSA picks the highest rate up to
+ * 48 kHz, which would resample the 44.1 kHz majority of a music library.
+ * The rate list is read from BlueZ, so clamping what the daemon advertises
+ * no longer hides the accessory's other rates from the user. */
+/* Automatic is not "let BlueALSA choose": left alone it picks the highest
+ * rate up to 48 kHz, which resamples the 44.1 kHz majority of a music
+ * library. Every reader resolves it through here so the daemon argument, the
+ * per-connection apply and the UI cannot disagree about what it means. */
+static unsigned int bt_effective_sample_rate(void) {
+    unsigned int rate = atomic_load(&bt_sample_rate);
+    return rate == 0 ? 44100 : rate;
+}
+
 static bool bt_rate_wants_audio_cd(void) {
-    return atomic_load(&bt_sample_rate) == 44100;
+    return bt_effective_sample_rate() == 44100;
 }
 
 /* Selects the speex resampler for Bluetooth output. On by default: a track
@@ -313,10 +328,10 @@ static bool find_source_pcm_path(char * out, size_t out_size);
 static void copy_info_field(char * dst, size_t size, const char * text, const char * key);
 
 static void bluealsa_apply_rate_preference(const char * path) {
-    unsigned int want = atomic_load(&bt_sample_rate);
-    /* 0 leaves BlueALSA's own choice alone, and 44100 is already carried by
-     * the daemon argument, which costs no re-handshake. */
-    if (want == 0 || want == 44100) return;
+    /* 44.1 kHz, including the Automatic that resolves to it, is already
+     * carried by the daemon argument and costs no re-handshake. */
+    unsigned int want = bt_effective_sample_rate();
+    if (want == 44100) return;
     if (!bluealsa_is_audio_pcm_path(path)) return;
 
     pthread_mutex_lock(&bt_rate_applied_mutex);
@@ -1691,62 +1706,351 @@ bool bt_control_get_connected_device_stream(char * out, size_t out_size, unsigne
  *
  * Returns false when the transport cannot be read, leaving the caller to
  * open bt_control_get_playback_pcm() directly as before. */
-/* `bluealsactl -vv info` prints each entry of "Available codecs:" on its own
- * indented line as "NAME:hex [channels: ...] [rate: 44100 48000 ...]", and
- * the rates there are already the intersection with what the accessory
- * supports. The selected codec's own line is what the transport is using, so
- * its name picks which available entry to read. */
+/* Rates the accessory itself advertises, read from BlueZ rather than from
+ * BlueALSA. BlueALSA reports the negotiated intersection, and
+ * --a2dp-force-audio-cd rewrites its own advertised capability to 44.1 kHz
+ * alone (a2dp-aac.c and friends), so asking it while the clamp is on would
+ * only ever answer "44.1". BlueZ still exposes each remote endpoint under
+ * org.bluez.MediaEndpoint1 with the capability bytes the accessory actually
+ * sent, which is what this decodes. */
+
+/* Value of one dbus-send property, as the tool prints it. */
+static const char * dbus_prop_value(const char * out, const char * prop) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "string \"%s\"", prop);
+    const size_t needle_len = strlen(needle);
+    const char * p = out;
+    while ((p = strstr(p, needle)) != NULL) {
+        const char * value = p + needle_len;
+        while (isspace((unsigned char) *value)) value++;
+        /* A property key is followed immediately by its variant value. This
+         * avoids treating the same text inside an unrelated string value as
+         * a property. */
+        if (strncmp(value, "variant", 7) == 0 &&
+                (isspace((unsigned char) value[7]) || value[7] == '\0')) {
+            value += 7;
+            while (isspace((unsigned char) *value)) value++;
+            return value;
+        }
+        p += needle_len;
+    }
+    return NULL;
+}
+
+static bool dbus_prop_string_equals(const char * out, const char * prop,
+                                    const char * expected) {
+    const char * value = dbus_prop_value(out, prop);
+    if (!value) return false;
+    while (isspace((unsigned char) *value)) value++;
+    if (strncmp(value, "string", 6) != 0 ||
+            !isspace((unsigned char) value[6])) return false;
+    value += 6;
+    while (isspace((unsigned char) *value)) value++;
+    if (*value++ != '"') return false;
+    const char * end = strchr(value, '"');
+    if (!end) return false;
+    size_t len = (size_t) (end - value);
+    return len == strlen(expected) && strncasecmp(value, expected, len) == 0;
+}
+
+/* dbus-send prints byte arrays differently across versions: this device
+ * emits bare "80 01 8c", others "byte 0x80, byte 0x01". Both the "byte"
+ * token and the "0x" prefix are therefore optional, because requiring
+ * either one silently yields an empty capability list on the other format. */
+static bool dbus_parse_hex_byte(const char ** cursor, uint8_t * out) {
+    const char * p = *cursor;
+    while (isspace((unsigned char) *p)) p++;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+
+    unsigned int value = 0;
+    int digits = 0;
+    while (isxdigit((unsigned char) *p) && digits < 2) {
+        value <<= 4;
+        if (*p >= '0' && *p <= '9') value += (unsigned int) (*p - '0');
+        else if (*p >= 'a' && *p <= 'f') value += (unsigned int) (*p - 'a' + 10);
+        else value += (unsigned int) (*p - 'A' + 10);
+        p++;
+        digits++;
+    }
+    if (digits == 0 || isxdigit((unsigned char) *p)) return false;
+    *out = (uint8_t) value;
+    *cursor = p;
+    return true;
+}
+
+static bool dbus_prop_byte(const char * out, const char * prop, uint8_t * value) {
+    const char * p = dbus_prop_value(out, prop);
+    if (!p) return false;
+    while (isspace((unsigned char) *p)) p++;
+    if (strncmp(p, "byte", 4) != 0 || !isspace((unsigned char) p[4])) return false;
+    p += 4;
+    return dbus_parse_hex_byte(&p, value);
+}
+
+/* dbus-send prints a byte array as e.g. "array [ byte 0x80 byte 0x01 ]";
+ * line wrapping and optional commas are presentation details, not separators
+ * that can be ignored while starting at the first character after '['. */
+static bool dbus_prop_byte_array(const char * out, const char * prop,
+                                 uint8_t * bytes, size_t bytes_size,
+                                 size_t * out_len) {
+    const char * p = dbus_prop_value(out, prop);
+    if (!p) return false;
+    p = strchr(p, '[');
+    if (!p) return false;
+    p++;
+
+    size_t len = 0;
+    for (;;) {
+        while (isspace((unsigned char) *p) || *p == ',') p++;
+        if (*p == ']') {
+            *out_len = len;
+            return len != 0;
+        }
+        if (*p == '\0' || len >= bytes_size) return false;
+        if (strncmp(p, "byte", 4) == 0 && isspace((unsigned char) p[4])) p += 4;
+        if (!dbus_parse_hex_byte(&p, &bytes[len])) return false;
+        len++;
+    }
+}
+
+/* BlueALSA exposes the standard codec byte separately and vendor codec IDs
+ * in the first six bytes of a vendor capability blob. Match both, because
+ * the selected codec name alone cannot distinguish two remote vendor SEPs. */
+static bool a2dp_caps_match_codec(const uint8_t * caps, size_t len,
+                                  uint8_t codec_id, const char * codec) {
+    if (strcasecmp(codec, "SBC") == 0) return codec_id == 0x00;
+    if (strcasecmp(codec, "AAC") == 0) return codec_id == 0x02;
+    if (len < 6 || codec_id != 0xff) return false;
+
+    uint32_t vendor_id = (uint32_t) caps[0] |
+                         ((uint32_t) caps[1] << 8) |
+                         ((uint32_t) caps[2] << 16) |
+                         ((uint32_t) caps[3] << 24);
+    uint16_t vendor_codec_id = (uint16_t) caps[4] | ((uint16_t) caps[5] << 8);
+    if (strcasecmp(codec, "aptX") == 0)
+        return vendor_id == 0x004f && vendor_codec_id == 0x0001;
+    if (strcasecmp(codec, "aptX-HD") == 0)
+        return vendor_id == 0x00d7 && vendor_codec_id == 0x0024;
+    if (strcasecmp(codec, "LDAC") == 0)
+        return vendor_id == 0x012d && vendor_codec_id == 0x00aa;
+    return false;
+}
+
+/* A2DP capability bytes are transmitted most-significant-bit first, so each
+ * codec's rate bitfield is read straight off the wire layout in
+ * bluetooth-a2dp.h rather than through its packed struct. */
+static int a2dp_caps_rates(const uint8_t * caps, size_t len, const char * codec,
+                           unsigned int * out, int max_count) {
+    typedef struct { unsigned int mask, rate; } rate_bit_t;
+    static const rate_bit_t sbc_aptx[] = {
+        { 1u << 3, 16000 }, { 1u << 2, 32000 }, { 1u << 1, 44100 }, { 1u << 0, 48000 },
+    };
+    static const rate_bit_t aac[] = {
+        { 1u << 11, 8000 }, { 1u << 10, 11025 }, { 1u << 9, 12000 }, { 1u << 8, 16000 },
+        { 1u << 7, 22050 }, { 1u << 6, 24000 }, { 1u << 5, 32000 }, { 1u << 4, 44100 },
+        { 1u << 3, 48000 }, { 1u << 2, 64000 }, { 1u << 1, 88200 }, { 1u << 0, 96000 },
+    };
+    static const rate_bit_t ldac[] = {
+        { 1u << 5, 44100 }, { 1u << 4, 48000 }, { 1u << 3, 88200 },
+        { 1u << 2, 96000 }, { 1u << 1, 176400 }, { 1u << 0, 192000 },
+    };
+
+    const rate_bit_t * table = NULL;
+    size_t table_n = 0;
+    unsigned int field = 0;
+
+    if (strcasecmp(codec, "SBC") == 0) {
+        if (len < 1) return 0;
+        field = caps[0] >> 4;
+        table = sbc_aptx; table_n = sizeof(sbc_aptx) / sizeof(sbc_aptx[0]);
+    } else if (strcasecmp(codec, "AAC") == 0) {
+        if (len < 3) return 0;
+        field = ((unsigned int) caps[1] << 4) | (caps[2] >> 4);
+        table = aac; table_n = sizeof(aac) / sizeof(aac[0]);
+    } else if (len >= 7) { /* vendor codecs carry 4-byte vendor + 2-byte codec first */
+        if (strcasecmp(codec, "LDAC") == 0) {
+            field = caps[6] & 0x3f;
+            table = ldac; table_n = sizeof(ldac) / sizeof(ldac[0]);
+        } else if (strcasecmp(codec, "aptX") == 0 ||
+                   strcasecmp(codec, "aptX-HD") == 0) {
+            /* a2dp_aptx_hd_t embeds a2dp_aptx_t, so both rate fields are at
+             * byte 6 despite aptX-HD's additional trailing reserved bytes. */
+            field = caps[6] >> 4;
+            table = sbc_aptx; table_n = sizeof(sbc_aptx) / sizeof(sbc_aptx[0]);
+        }
+    }
+    if (!table) return 0;
+
+    /* Tables run low to high, so a forward walk lists rates in order. */
+    int count = 0;
+    for (size_t i = 0; i < table_n && count < max_count; i++)
+        if (field & table[i].mask) out[count++] = table[i].rate;
+    return count;
+}
+
+/* Re-establishes the accessory's link so a new transport rate takes effect.
+ *
+ * The rate is fixed when the A2DP configuration is negotiated, and these
+ * accessories refuse to renegotiate a live transport: SelectCodec on a
+ * connected PCM returns EIO and takes the link down with it (measured on a
+ * real headset, in both clamped and unclamped daemons). Cycling the device
+ * link is therefore the only thing that actually applies a rate change --
+ * but only the link needs cycling, not the radio, so this does it instead
+ * of asking the user to turn Bluetooth off and on.
+ *
+ * Blocks for several seconds. Callers must run it off the UI thread. */
+bool bt_control_reconnect_for_rate_change(unsigned int want) {
+    char mac[18];
+    if (!bt_control_get_connected_device_mac(mac, sizeof(mac))) return false;
+    if (want == 0) want = 44100; /* Automatic resolves the same way everywhere */
+    /* Re-asserted rather than read from the atomic: disconnecting below makes
+     * the status refresh publish "nothing connected", which would otherwise
+     * overwrite the requested rate with the global default before the daemon
+     * is respawned with it. */
+    atomic_store(&bt_sample_rate, want);
+
+    /* Try reconfiguring the live transport first. A Galaxy Buds2 Pro refuses
+     * this with EIO and drops the link whether or not it is streaming
+     * (measured), but accessories that accept it change rate with nothing
+     * dropping at all, so it is worth one attempt before cycling the link. */
+    char path[256];
+    if (find_source_pcm_path(path, sizeof(path))) {
+        char info_out[2048];
+        char * info_argv[] = { (char *) bluealsa_ctl_name(), (char *) "info", path, NULL };
+        if (subprocess_run_low_priority(info_argv, info_out, sizeof(info_out))) {
+            char codec[32] = {0};
+            copy_info_field(codec, sizeof(codec), info_out, "Selected codec:");
+            char * codec_end = strchr(codec, ':');
+            if (codec_end) *codec_end = '\0';
+
+            if (codec[0]) {
+                char rate_str[16];
+                snprintf(rate_str, sizeof(rate_str), "%u", want);
+                char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "codec",
+                                  (char *) "-r", rate_str, path, codec, NULL };
+                (void) subprocess_run_checked(argv, NULL, 0, 5000, NULL);
+
+                /* Believe the transport, not the exit status: a refusal can
+                 * still leave the link up at the old rate. */
+                unsigned int now = 0;
+                if (find_source_pcm_path(path, sizeof(path)) &&
+                        subprocess_run_low_priority(info_argv, info_out, sizeof(info_out))) {
+                    const char * field = strstr(info_out, "Rate:");
+                    if (field) (void) sscanf(field + strlen("Rate:"), "%u", &now);
+                }
+                if (now == want) return true; /* accepted in place, nothing dropped */
+            }
+        }
+    }
+
+    bt_control_disconnect(mac);
+    /* The PCM outlives the disconnect briefly, and ensure_bluealsa_running()
+     * refuses to respawn while it still sees one, so the respawn would be
+     * skipped and the old arguments kept. Wait for it to go. */
+    for (int waited_ms = 0; waited_ms < 5000; waited_ms += 250) {
+        char gone[256];
+        if (!find_source_pcm_path(gone, sizeof(gone))) break;
+        usleep(250000);
+    }
+    ensure_bluealsa_running();
+    bt_control_connect(mac);
+
+    /* Believe the transport, not bluetoothctl's exit: it reports failure on a
+     * slow connect that then completes on its own a few seconds later, which
+     * otherwise told the user it had failed right before it worked. */
+    /* Bounded on the clock, not on iterations: each probe forks a subprocess
+     * that can itself take up to the subprocess timeout, so counting rounds
+     * would let this run for minutes and stall a teardown that joins it. */
+    uint32_t deadline = bt_control_monotonic_ms() + 20000;
+    while ((int32_t) (deadline - bt_control_monotonic_ms()) > 0) {
+        usleep(500000);
+        char path[256];
+        if (!find_source_pcm_path(path, sizeof(path))) continue;
+        char info_out[2048];
+        char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "info", path, NULL };
+        if (!subprocess_run_low_priority(argv, info_out, sizeof(info_out))) continue;
+        unsigned int now = 0;
+        const char * field = strstr(info_out, "Rate:");
+        if (field) (void) sscanf(field + strlen("Rate:"), "%u", &now);
+        if (now == want) return true;
+    }
+    return false;
+}
+
 int bt_control_get_available_rates(unsigned int * out, int max_count) {
     if (!out || max_count <= 0) return 0;
 
     char path[256];
     if (!find_source_pcm_path(path, sizeof(path))) return 0;
 
-    char info_out[4096];
-    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "-vv", (char *) "info", path, NULL };
-    if (!subprocess_run_low_priority(argv, info_out, sizeof(info_out))) return 0;
+    char info_out[2048];
+    char * info_argv[] = { (char *) bluealsa_ctl_name(), (char *) "info", path, NULL };
+    if (!subprocess_run_low_priority(info_argv, info_out, sizeof(info_out))) return 0;
 
-    /* Selected codec name: the line after the "Selected codec:" header, up
-     * to the ':' that starts its configuration blob. */
-    const char * selected = strstr(info_out, "Selected codec:");
-    if (!selected) return 0;
-    selected = strchr(selected, '\n');
-    if (!selected) return 0;
-    selected++;
-    while (*selected == ' ' || *selected == '\t') selected++;
-    char codec_name[32];
-    size_t name_len = strcspn(selected, ": \t\r\n");
-    if (name_len == 0 || name_len >= sizeof(codec_name)) return 0;
-    memcpy(codec_name, selected, name_len);
-    codec_name[name_len] = '\0';
+    char device_path[160] = {0};
+    copy_info_field(device_path, sizeof(device_path), info_out, "Device:");
+    char codec[32] = {0};
+    copy_info_field(codec, sizeof(codec), info_out, "Selected codec:");
+    char * codec_end = strchr(codec, ':');
+    if (codec_end) *codec_end = '\0';
+    if (!device_path[0] || !codec[0]) return 0;
 
-    const char * available = strstr(info_out, "Available codecs:");
-    if (!available) return 0;
-
-    /* Walk the indented entries, stopping at the first line that is not one. */
-    int count = 0;
-    const char * line = strchr(available, '\n');
-    while (line && count < max_count) {
-        line++;
-        if (*line != ' ' && *line != '\t') break;
-        while (*line == ' ' || *line == '\t') line++;
-        size_t line_len = strcspn(line, "\r\n");
-        if (strncmp(line, codec_name, name_len) == 0 &&
-                (line[name_len] == ':' || line[name_len] == ' ')) {
-            const char * rates = strstr(line, "[rate:");
-            if (rates && (size_t) (rates - line) < line_len) {
-                rates += strlen("[rate:");
-                while (*rates && *rates != ']' && count < max_count) {
-                    while (*rates == ' ') rates++;
-                    if (*rates < '0' || *rates > '9') break;
-                    out[count++] = (unsigned int) strtoul(rates, (char **) &rates, 10);
-                }
-            }
-            break;
-        }
-        line = strchr(line, '\n');
+    /* The accessory's endpoints hang off its BlueZ object as sepN children,
+     * listed at the very END of the introspection XML after every interface
+     * and method. That document runs past 5 KiB on a real headset, so this
+     * buffer is generous and heap-allocated rather than sitting on the
+     * worker's stack -- undersizing it silently drops the sep nodes and the
+     * rate list comes back empty. */
+    enum { BT_INTROSPECT_MAX = 16384 };
+    char * introspect = malloc(BT_INTROSPECT_MAX);
+    if (!introspect) return 0;
+    char * intro_argv[] = { (char *) "dbus-send", (char *) "--system", (char *) "--print-reply",
+                            (char *) "--dest=org.bluez", device_path,
+                            (char *) "org.freedesktop.DBus.Introspectable.Introspect", NULL };
+    if (!subprocess_run_low_priority(intro_argv, introspect, BT_INTROSPECT_MAX)) {
+        free(introspect);
+        return 0;
     }
-    return count;
+
+    const char * scan = introspect;
+    const char * node;
+    while ((node = strstr(scan, "<node name=\"sep")) != NULL) {
+        scan = node + 1;
+        const char * name = node + strlen("<node name=\"");
+        size_t name_len = strcspn(name, "\"");
+        if (name_len == 0 || name_len >= 16) continue;
+
+        char sep_path[192];
+        snprintf(sep_path, sizeof(sep_path), "%s/%.*s", device_path, (int) name_len, name);
+
+        char props[2048];
+        char * prop_argv[] = { (char *) "dbus-send", (char *) "--system", (char *) "--print-reply",
+                               (char *) "--dest=org.bluez", sep_path,
+                               (char *) "org.freedesktop.DBus.Properties.GetAll",
+                               (char *) "string:org.bluez.MediaEndpoint1", NULL };
+        if (!subprocess_run_low_priority(prop_argv, props, sizeof(props))) continue;
+
+        /* Only the accessory's SINK endpoint matters: that is what this
+         * device streams into. */
+        if (!dbus_prop_string_equals(props, "UUID",
+                                     "0000110b-0000-1000-8000-00805f9b34fb")) continue;
+
+        uint8_t codec_id;
+        if (!dbus_prop_byte(props, "Codec", &codec_id)) continue;
+
+        uint8_t caps[32];
+        size_t caps_len = 0;
+        if (!dbus_prop_byte_array(props, "Capabilities", caps, sizeof(caps), &caps_len)) continue;
+        if (!a2dp_caps_match_codec(caps, caps_len, codec_id, codec)) continue;
+
+        int n = a2dp_caps_rates(caps, caps_len, codec, out, max_count);
+        if (n > 0) {
+            free(introspect);
+            return n;
+        }
+    }
+    free(introspect);
+    return 0;
 }
 
 bool bt_control_prepare_playback_pcm(char * out, size_t out_size) {

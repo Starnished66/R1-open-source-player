@@ -1594,15 +1594,21 @@ static void bt_rate_format(char * out, size_t out_size, unsigned int rate) {
     else snprintf(out, out_size, "%u.%u kHz", rate / 1000, (rate % 1000) / 100);
 }
 
+/* Rate shown and edited is the connected accessory's own, falling back to the
+ * global default when nothing is connected. */
+static unsigned int bt_rate_selected(void) {
+    return settings_bt_rate_for(&current_settings, bt_connected_mac_cached);
+}
+
 static void populate_bt_rate_screen(void) {
     lv_obj_clean(bt_rate_list);
-    add_pill_option_row(bt_rate_list, "Automatic", current_settings.bt_sample_rate == 0,
+    add_pill_option_row(bt_rate_list, "Automatic (44.1 kHz)", bt_rate_selected() == 0,
                         bt_rate_option_row_cb, (void *) (intptr_t) 0);
 
     /* Nothing connected means nothing to query, and only 44.1 can be applied
      * without an accessory present to negotiate with. */
     if (bt_rate_option_count == 0) {
-        add_pill_option_row(bt_rate_list, "44.1 kHz", current_settings.bt_sample_rate == 44100,
+        add_pill_option_row(bt_rate_list, "44.1 kHz", bt_rate_selected() == 44100,
                             bt_rate_option_row_cb, (void *) (intptr_t) 44100);
         add_section_header(bt_rate_list, bt_rate_query_active ? "Reading supported rates..."
                                                               : "Connect a device to see its supported rates");
@@ -1611,7 +1617,7 @@ static void populate_bt_rate_screen(void) {
     for (int i = 0; i < bt_rate_option_count; i++) {
         char label[32];
         bt_rate_format(label, sizeof(label), bt_rate_options[i]);
-        add_pill_option_row(bt_rate_list, label, current_settings.bt_sample_rate == bt_rate_options[i],
+        add_pill_option_row(bt_rate_list, label, bt_rate_selected() == bt_rate_options[i],
                             bt_rate_option_row_cb, (void *) (intptr_t) bt_rate_options[i]);
     }
 }
@@ -1623,18 +1629,68 @@ static void bt_volume_sync_toggle_cb(lv_event_t * e);
 static void bt_hide_unnamed_toggle_cb(lv_event_t * e);
 static void bt_codec_settings_row_cb(lv_event_t * e);
 
+/* Cycling the accessory's link blocks for seconds, so it runs on a worker
+ * while the screen stays live. */
+static pthread_t bt_rate_apply_thread;
+static bool bt_rate_apply_active = false;
+static atomic_bool bt_rate_apply_done_flag = false;
+static bool bt_rate_apply_result = false;
+/* Captured at launch so a status refresh cannot change what is being applied
+ * half way through. */
+static unsigned int bt_rate_apply_target = 0;
+
+static void * bt_rate_apply_thread_func(void * arg) {
+    (void) arg;
+    bt_rate_apply_result = bt_control_reconnect_for_rate_change(bt_rate_apply_target);
+    atomic_store_explicit(&bt_rate_apply_done_flag, true, memory_order_release); /* written last */
+    return NULL;
+}
+
+void poll_bt_rate_apply(void) {
+    if (!bt_rate_apply_active || !atomic_load_explicit(&bt_rate_apply_done_flag, memory_order_acquire)) return;
+    bt_rate_apply_active = false;
+    pthread_join(bt_rate_apply_thread, NULL);
+    show_info_toast(bt_rate_apply_result ? "Sample rate applied" : "Could not apply this sample rate");
+    /* The accessory reconnected, so its rates and the selected row are worth
+     * re-reading rather than leaving whatever was on screen before. */
+    if (gui_navigation_is_top(bt_rate_screen)) populate_bt_rate_screen();
+}
+
 static void bt_rate_option_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     unsigned int rate = (unsigned int) (intptr_t) lv_event_get_user_data(e);
-    bool changed = current_settings.bt_sample_rate != rate;
-    current_settings.bt_sample_rate = rate;
+    bool changed = bt_rate_selected() != rate;
+    /* Remembered against the accessory when one is connected, so each keeps
+     * its own; with nothing connected this sets the default for accessories
+     * that have no entry yet. */
+    if (bt_connected_mac_cached[0]) settings_bt_set_rate_for(&current_settings, bt_connected_mac_cached, rate);
+    else current_settings.bt_sample_rate = rate;
     settings_save_async(&current_settings);
     bt_control_set_sample_rate(rate);
     populate_bt_rate_screen();
-    /* The transport rate is fixed when the daemon starts and again when the
-     * accessory negotiates, so neither an already-running daemon nor a live
-     * connection picks this up -- the same constraint the codec choice has. */
-    if (changed) show_info_toast("Turn Bluetooth off and on to apply");
+    if (!changed) return;
+
+    /* The rate is fixed when the A2DP configuration is negotiated, and these
+     * accessories refuse to renegotiate a live transport, so the link has to
+     * be re-established for the choice to take effect. Only the link cycles;
+     * the radio stays on. With nothing connected there is nothing to cycle
+     * and the choice simply applies on the next connection. */
+    if (!gui_shell_is_bt_audio_connected()) return;
+    if (bt_rate_apply_active) {
+        /* Silently dropping this would leave the setting saying one thing and
+         * the transport doing another. */
+        show_info_toast("Still applying the previous choice");
+        return;
+    }
+    atomic_store_explicit(&bt_rate_apply_done_flag, false, memory_order_relaxed);
+    bt_rate_apply_target = rate;
+    bt_rate_apply_active = true;
+    if (pthread_create(&bt_rate_apply_thread, NULL, bt_rate_apply_thread_func, NULL) != 0) {
+        bt_rate_apply_active = false;
+        show_info_toast("Turn Bluetooth off and on to apply");
+        return;
+    }
+    show_info_toast("Headset may disconnect, manual reconnection might be required");
 }
 
 static lv_obj_t * build_bt_rate_screen(void) {
@@ -1659,6 +1715,15 @@ static void * bt_rate_query_thread_func(void * arg) {
     return NULL;
 }
 
+/* The screen shows one accessory's rates and edits that accessory's entry,
+ * so a device changing underneath it has to redraw or it would edit the
+ * wrong one. */
+void gui_network_notify_bt_device_changed(void) {
+    if (!bt_rate_screen || !gui_navigation_is_top(bt_rate_screen)) return;
+    bt_rate_option_count = 0;
+    populate_bt_rate_screen();
+}
+
 void poll_bt_rate_query(void) {
     if (!bt_rate_query_active || !atomic_load_explicit(&bt_rate_query_done_flag, memory_order_acquire)) return;
     bt_rate_query_active = false;
@@ -1666,9 +1731,10 @@ void poll_bt_rate_query(void) {
     if (bt_rate_query_result_count > 0) {
         memcpy(bt_rate_options, bt_rate_query_results, sizeof(bt_rate_options));
         bt_rate_option_count = bt_rate_query_result_count;
-        /* Only repaint if the user is still looking at it. */
-        if (gui_navigation_is_top(bt_rate_screen)) populate_bt_rate_screen();
     }
+    /* Repainted even when the query found nothing, so the "reading" note is
+     * replaced rather than left up until the screen is reopened. */
+    if (gui_navigation_is_top(bt_rate_screen)) populate_bt_rate_screen();
 }
 
 static void bt_rate_settings_row_cb(lv_event_t * e) {
@@ -3758,6 +3824,10 @@ void gui_network_cancel_background_work(void) {
     if (bt_rate_query_active) {
         pthread_join(bt_rate_query_thread, NULL);
         bt_rate_query_active = false;
+    }
+    if (bt_rate_apply_active) {
+        pthread_join(bt_rate_apply_thread, NULL);
+        bt_rate_apply_active = false;
     }
     if (bt_scan_active) {
         pthread_join(bt_scan_thread, NULL);

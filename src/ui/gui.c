@@ -1392,7 +1392,26 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * repeatedly during development), which is exactly when the persisted
      * value and reality can disagree. */
     usb_mode_t detected_usb_mode;
-    if (usb_mode_control_detect_current(&detected_usb_mode)) current_settings.usb_mode = (int) detected_usb_mode;
+    bool detected = usb_mode_control_detect_current(&detected_usb_mode);
+    if (detected) current_settings.usb_mode = (int) detected_usb_mode;
+
+    /* ADB is the one mode that survives a restart, because enabling it means
+     * going into Developer Options and asking for it. Anything else starts as
+     * Storage: DAC in particular would otherwise block local playback on a
+     * device that may not even be plugged into anything.
+     *
+     * Applied through the ordinary switch path rather than inline --
+     * usb_mode_control_apply() spends seconds in settle and retry loops, which
+     * would stall startup if it ran on this thread. poll_usb_mode_switch()
+     * completes it in the background. */
+    if (!detected) {
+        if (current_settings.usb_mode == (int) USB_MODE_ADB) {
+            start_usb_mode_switch(USB_MODE_ADB);
+        } else if (current_settings.usb_mode != (int) USB_MODE_STORAGE) {
+            current_settings.usb_mode = (int) USB_MODE_STORAGE;
+            settings_save(&current_settings);
+        }
+    }
 
     /* current_settings.volume itself is left untouched here even when the
      * fixed-startup path below is taken -- it keeps tracking "last used"

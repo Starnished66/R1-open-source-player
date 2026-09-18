@@ -232,19 +232,18 @@ typedef struct {
      * the three back off afterward is not touched again. */
     bool idle_suspend_default_migrated;
 
-    /* USB gadget mode (Storage/USB DAC/ADB) -- see usb_mode_control.h for
+    /* USB gadget mode (Storage/USB DAC/ADB): see usb_mode_control.h for
      * usb_mode_t and how each is actually applied. Plain int here (values
-     * matching usb_mode_t), not the enum itself, so this header doesn't
-     * need to depend on usb_mode_control.h -- same reasoning as bt_codec
+     * matching usb_mode_t), not the enum itself, so this header does not
+     * need to depend on usb_mode_control.h, same reasoning as bt_codec
      * above being a plain string rather than pulling in an enum from
-     * bluetooth_control.h. Purely a UI/persistence value: this only
-     * remembers the last mode the user picked (to pre-select the right
-     * radio button next time Settings is opened), it does NOT get
-     * automatically re-applied to the real USB gadget hardware on startup
-     * -- that hardware state doesn't survive a reboot regardless (ADB's
-     * own init script is deliberately not auto-started either), and
-     * silently re-enabling ADB/DAC mode on every boot without the user
-     * asking felt like the wrong default. */
+     * bluetooth_control.h.
+     *
+     * Startup behavior: if the user enabled ADB, it persists and is
+     * re-applied on boot because it lives behind Developer Options as an
+     * explicit opt-in. Any other mode (Storage, USB DAC) resets to Storage
+     * on boot to prevent unexpected USB configurations or blocking local
+     * playback. */
     int usb_mode;
 
     /* Player queue play mode -- Sequential/Repeat All/Repeat One/Shuffle.

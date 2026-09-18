@@ -407,8 +407,39 @@ void firmware_update_row_cb(lv_event_t * e) {
     gui_popup_show(&firmware_update_popup);
 }
 
+static lv_obj_t * adb_switch = NULL;
+
+/* The Developer Options screen is built once and cached, so its ADB row would
+ * otherwise keep showing whatever the state was at build time. Called when the
+ * screen opens, and again by poll_usb_mode_switch() once the gadget settles so
+ * a switch that failed does not leave the toggle promising ADB. */
+void gui_settings_sync_adb_toggle(void) {
+    if (!adb_switch) return;
+    if (gui_network_adb_active()) lv_obj_add_state(adb_switch, LV_STATE_CHECKED);
+    else lv_obj_clear_state(adb_switch, LV_STATE_CHECKED);
+}
+
+static void adb_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    /* Turning ADB off falls back to Storage: the stock default, and the safer
+     * of the other two since DAC takes over the whole screen with its own
+     * overlay rather than just quietly changing what the USB port does. */
+    bool want_adb = !gui_network_adb_active();
+    if (!start_usb_mode_switch(want_adb ? USB_MODE_ADB : USB_MODE_STORAGE)) {
+        /* Request dropped because a switch is already in flight. Put the
+         * switch back rather than leaving it showing a state nothing is
+         * working toward. */
+        gui_settings_sync_adb_toggle();
+        return;
+    }
+    /* Accepted: the switch already shows the requested state, and applying it
+     * takes seconds. Leave it optimistically flipped; poll_usb_mode_switch()
+     * confirms or rolls it back. */
+}
+
 static void dev_options_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_settings_sync_adb_toggle();
     nav_push(dev_options_screen);
 }
 
@@ -437,10 +468,17 @@ static void db_logging_switch_event_cb(lv_event_t * e) {
  * cache jobs to .logs/database_artwork.log, and USB DAC bridge diagnostics to
  * .logs/usb_dac_bridge.log on the SD card -- see db_log.h and usb_dac_bridge.h. */
 static lv_obj_t * build_dev_options_screen(void) {
-    static pill_list_item_t items[1];
-    items[0] = (pill_list_item_t){ "Enable debug logging", PILL_ACCESSORY_TOGGLE,
+    static pill_list_item_t items[2];
+    /* ADB lives here rather than on the USB Mode screen: it overrides
+     * Storage/DAC while on and persists across a reboot, so it sits behind
+     * Developer Options as the explicit opt-in that makes re-applying it on
+     * startup reasonable. The USB Mode screen still dims the other modes
+     * while it owns the port. */
+    items[0] = (pill_list_item_t){ "ADB", PILL_ACCESSORY_TOGGLE, gui_network_adb_active(),
+                                    NULL, adb_switch_event_cb, NULL, &adb_switch };
+    items[1] = (pill_list_item_t){ "Enable debug logging", PILL_ACCESSORY_TOGGLE,
                                     current_settings.db_logging_enabled, NULL, db_logging_switch_event_cb, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Developer Options", generic_back_cb, items, 1, gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    lv_obj_t * scr = build_pill_list_screen("Developer Options", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -3067,6 +3105,7 @@ void gui_settings_teardown(void) {
 
     if (about_screen) { lv_obj_delete(about_screen); about_screen = NULL; }
     if (dev_options_screen) { lv_obj_delete(dev_options_screen); dev_options_screen = NULL; }
+    adb_switch = NULL; /* owned by the screen just deleted; sync runs off the USB poll, not this screen's lifetime */
     if (accent_color_screen) { lv_obj_delete(accent_color_screen); accent_color_screen = NULL; }
     if (custom_font_screen) { lv_obj_delete(custom_font_screen); custom_font_screen = NULL; }
     if (screen_timeout_screen) { lv_obj_delete(screen_timeout_screen); screen_timeout_screen = NULL; }

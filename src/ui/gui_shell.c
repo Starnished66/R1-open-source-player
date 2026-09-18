@@ -119,6 +119,15 @@ static bool bt_toggle_followup_target_enabled = false;
  * preserving their settings across screen-off sleep cycles. */
 static bool wifi_toggle_is_radio_suspend = false;
 
+/* A tap that arrives while a toggle is still in flight. wifi_on.sh/wifi_off.sh
+ * take a couple of seconds, which is long enough to tap again, and dropping
+ * that tap left the radio in the opposite state to the one the icon was
+ * showing. Only the most recent request is kept: tapping twice settles on the
+ * second target rather than replaying both, so the radio is never cycled just
+ * to satisfy a request the user already changed their mind about. */
+static bool wifi_toggle_queued = false;
+static bool wifi_toggle_queued_target = false;
+
 /* Read-only effective-Wi-Fi-state accessor for callers outside this file
  * (gui_network.c's Wi-Fi dependency guard for AirPlay/DLNA/Remote Control/
  * Import via Wi-Fi) that need the same "in-flight toggle counts as its
@@ -130,6 +139,11 @@ static bool wifi_toggle_is_radio_suspend = false;
  * active/wifi_toggle_target_enabled themselves -- callers have no business
  * reading or driving this file's own toggle machinery directly. */
 bool gui_shell_wifi_effective_enabled(void) {
+    /* A queued request outranks the one in flight: it is the newer intent, it
+     * is already what the icons show, and it is what the radio will be left
+     * at. Without it here, any redraw between the tap and the relaunch (a
+     * status refresh, a wake) would repaint the older target over it. */
+    if (wifi_toggle_queued) return wifi_toggle_queued_target;
     return wifi_toggle_active ? wifi_toggle_target_enabled : wifi_control_is_enabled();
 }
 
@@ -3265,33 +3279,17 @@ static void * wifi_toggle_thread_func(void * arg) {
 
 /* populate_wifi_screen declared in gui.h */ /* defined with the rest of the Wi-Fi settings screen, below */
 
-void quick_drawer_wifi_event_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (quick_drawer_wifi_long_press_fired) { /* see quick_drawer_wifi_long_press_cb()'s own comment */
-        quick_drawer_wifi_long_press_fired = false;
-        return;
-    }
-    if (wifi_toggle_active) return; /* already toggling -- ignore taps until it lands */
-    bool wifi_will_be_enabled = !wifi_control_is_enabled();
-    wifi_toggle_active = true;
-    wifi_toggle_is_radio_suspend = false; /* a real user tap, not the idle radio-suspend cycle */
-    atomic_store_explicit(&wifi_toggle_done_flag, false, memory_order_relaxed);
-    wifi_toggle_target_enabled = wifi_will_be_enabled;
-
-    /* Optimistic sprite flip -- wifi_control_is_enabled() is a plain
-     * access() check (see its own comment), not a subprocess spawn, so
-     * it's cheap enough to call synchronously right here. The actual
-     * radio toggle below can take a couple seconds; flipping the icon
-     * immediately instead of waiting for poll_wifi_toggle() to confirm it
-     * is what makes the tap read as instant. poll_wifi_toggle() still
-     * re-reads the real state once the thread lands and corrects this if
-     * the toggle unexpectedly failed. */
-    lv_image_set_src(quick_drawer_wifi_icon, quick_drawer_toggle_src(QD_TOGGLE_WIFI, wifi_will_be_enabled));
+/* Everything that makes a tap read as instant, applied before the radio has
+ * actually changed. wifi_control_is_enabled() is a plain access() check (see
+ * its own comment), not a subprocess spawn, so the surrounding state reads
+ * here are cheap enough to do synchronously. The real toggle takes a couple
+ * of seconds; poll_wifi_toggle() re-reads the hardware once the worker lands
+ * and corrects all of this if the toggle failed. */
+static void wifi_toggle_apply_optimistic_ui(bool will_be_enabled) {
+    lv_image_set_src(quick_drawer_wifi_icon, quick_drawer_toggle_src(QD_TOGGLE_WIFI, will_be_enabled));
     quick_drawer_mark_snapshot_dirty();
 
-    /* Optimistically update the topbar Wi-Fi icon alongside the drawer icon.
-     * Overwritten with authoritative state once the worker thread settles. */
-    if (wifi_will_be_enabled) {
+    if (will_be_enabled) {
         lv_obj_remove_flag(wifi_icon, LV_OBJ_FLAG_HIDDEN);
         lv_image_set_src(wifi_icon, asset_path("topbar/lucide_wifi_off.png"));
         layout_lucide_topbar_image(wifi_icon);
@@ -3300,15 +3298,37 @@ void quick_drawer_wifi_event_cb(lv_event_t * e) {
     }
     sync_topbar_status_icon_positions();
 
-    /* Optimistically rebuild Wi-Fi settings screen if visible so dependent rows
-     * appear immediately rather than waiting for the backend script to complete. */
-    /* Do not clean/rebuild wifi_list from inside the clicked row's own
-     * event callback: doing so deletes the event target while LVGL is still
-     * dispatching through it. gui_network_show_wifi_toggle_pending() defers
-     * the optimistic rebuild by one UI turn; poll_wifi_toggle() performs the
-     * authoritative rebuild once the worker settles. */
+    /* Do not clean/rebuild wifi_list from inside the clicked row's own event
+     * callback: that deletes the event target while LVGL is still dispatching
+     * through it. gui_network_show_wifi_toggle_pending() defers the rebuild by
+     * one UI turn; poll_wifi_toggle() performs the authoritative one. */
     if (gui_navigation_is_top(gui_network_get_wifi_screen()))
-        gui_network_show_wifi_toggle_pending(wifi_will_be_enabled);
+        gui_network_show_wifi_toggle_pending(will_be_enabled);
+}
+
+void quick_drawer_wifi_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (quick_drawer_wifi_long_press_fired) { /* see quick_drawer_wifi_long_press_cb()'s own comment */
+        quick_drawer_wifi_long_press_fired = false;
+        return;
+    }
+    if (wifi_toggle_active) {
+        /* Queue rather than drop: the in-flight attempt owns the radio until
+         * it settles, but the user's newest intent still has to survive.
+         * poll_wifi_toggle() launches this once the current attempt lands,
+         * and only if it actually disagrees with the settled state. */
+        wifi_toggle_queued_target = !gui_shell_wifi_effective_enabled();
+        wifi_toggle_queued = true;
+        wifi_toggle_apply_optimistic_ui(wifi_toggle_queued_target);
+        return;
+    }
+    bool wifi_will_be_enabled = !wifi_control_is_enabled();
+    wifi_toggle_active = true;
+    wifi_toggle_is_radio_suspend = false; /* a real user tap, not the idle radio-suspend cycle */
+    atomic_store_explicit(&wifi_toggle_done_flag, false, memory_order_relaxed);
+    wifi_toggle_target_enabled = wifi_will_be_enabled;
+
+    wifi_toggle_apply_optimistic_ui(wifi_will_be_enabled);
 
     if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0) {
         wifi_toggle_active = false;
@@ -3347,7 +3367,30 @@ static void poll_wifi_toggle(void) {
      * toggle_is_radio_suspend's own comment above for the full reasoning. */
     bool was_radio_suspend = wifi_toggle_is_radio_suspend;
     wifi_toggle_is_radio_suspend = false;
+
+    /* A queued request that disagrees with where the radio actually landed is
+     * relaunched here, once the previous attempt has fully released it. */
+    bool relaunch = wifi_toggle_queued && wifi_toggle_queued_target != enabled;
+    wifi_toggle_queued = false;
+
+    /* Runs for a queued re-enable too, so a disable behaves the same whether
+     * the user reverses it quickly or slowly. The features this tears down
+     * are gated on Wi-Fi being connected rather than merely enabled, so an
+     * off state that is about to be undone has nothing live to take away. */
     if (!enabled && !was_radio_suspend) gui_network_handle_wifi_disabled();
+
+    if (relaunch) {
+        wifi_toggle_active = true;
+        wifi_toggle_is_radio_suspend = false;
+        atomic_store_explicit(&wifi_toggle_done_flag, false, memory_order_relaxed);
+        wifi_toggle_target_enabled = wifi_toggle_queued_target;
+        wifi_toggle_apply_optimistic_ui(wifi_toggle_queued_target);
+        if (pthread_create(&wifi_toggle_thread, NULL, wifi_toggle_thread_func, NULL) != 0) {
+            wifi_toggle_active = false;
+            refresh_wifi_icon();
+            gui_network_wifi_toggle_completed(wifi_control_is_enabled());
+        }
+    }
 }
 
 /* Same real tap-to-toggle treatment for Bluetooth, mirroring the wifi

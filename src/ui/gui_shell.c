@@ -526,6 +526,13 @@ void sync_player_topbar_visibility(lv_obj_t * screen) {
      * approach, not by this function. */
     bool hide = (current_settings.hide_player_topbar && (screen == gui_player_get_screen() || screen == gui_lyrics_get_screen())) ||
                 screen == gui_lock_screen_get_screen();
+    /* The quick drawer wins while it is open. It deliberately keeps the
+     * status bar above itself (see open_quick_drawer()), which does nothing
+     * when the Player has hidden it outright -- the drawer would slide down
+     * over an immersive Player with no clock or battery on it at all. Any
+     * path that re-syncs while the drawer is open gets the same answer, so
+     * navigating away from a drawer long-press cannot leave it stuck on. */
+    if (quick_drawer_open && screen != gui_lock_screen_get_screen()) hide = false;
     if (status_bar_band) {
         gui_shell_set_status_bar_screen_context(screen);
         if (hide) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
@@ -2233,6 +2240,10 @@ void open_quick_drawer(void) {
      * directly off the asset), so the status bar ends up sitting on that as
      * a backdrop rather than on anything from the screen underneath. */
     lv_obj_move_foreground(status_bar_band);
+    /* Moving it forward is not enough on an immersive Player, where it is
+     * flagged hidden; re-syncing now that quick_drawer_open is set reveals
+     * it for as long as the drawer is down. */
+    sync_player_topbar_visibility(lv_screen_active());
     /* Cancel any prior animation on this exact (var, exec_cb) pair before
      * starting a new one to prevent concurrent animations from fighting. */
     lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb);
@@ -2250,6 +2261,9 @@ void open_quick_drawer(void) {
 void close_quick_drawer(void) {
     if (!quick_drawer_open) return;
     quick_drawer_open = false;
+    /* Hidden again on the way out, so it leaves with the drawer rather than
+     * popping out once the slide finishes. */
+    sync_player_topbar_visibility(lv_screen_active());
     int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
     lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb); /* see open_quick_drawer()'s own comment on why */
     lv_anim_t a;

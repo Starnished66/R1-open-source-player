@@ -11,6 +11,7 @@ player_settings_t current_settings;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #ifndef HOST_BUILD
@@ -89,7 +90,9 @@ static void set_defaults(player_settings_t * out) {
     out->bt_volume_sync_enabled = true;
     out->bt_dac_mode_enabled = false;
     out->bt_speexrate_enabled = true;
-    out->bt_sample_rate = 44100;
+    out->bt_sample_rate = 0;
+    out->bt_device_rate_count = 0;
+    memset(out->bt_device_rates, 0, sizeof(out->bt_device_rates));
     snprintf(out->bt_codec, sizeof(out->bt_codec), "auto");
     out->bt_last_output_mac[0] = '\0';
     out->bt_hide_unnamed_devices = true;
@@ -328,6 +331,22 @@ bool settings_load(player_settings_t * out) {
             }
         } else if (strcmp(key, "bt_volume_sync") == 0) {
             out->bt_volume_sync_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "bt_device_rate") == 0) {
+            /* "AA:BB:CC:DD:EE:FF,44100" */
+            char * comma = strchr(value, ',');
+            char * rate_end = NULL;
+            unsigned long parsed = comma ? strtoul(comma + 1, &rate_end, 10) : 0;
+            /* A malformed line is dropped rather than stored: a bad rate here
+             * would be pushed straight at the Bluetooth daemon. */
+            if (comma && out->bt_device_rate_count < BT_DEVICE_RATE_MAX &&
+                    (size_t) (comma - value) == 17 && valid_bt_output_mac(value) &&
+                    rate_end && rate_end != comma + 1 && *rate_end == '\0' &&
+                    (parsed == 0 || (parsed >= 8000 && parsed <= 192000))) {
+                int i = out->bt_device_rate_count++;
+                memcpy(out->bt_device_rates[i].mac, value, 17);
+                out->bt_device_rates[i].mac[17] = '\0';
+                out->bt_device_rates[i].rate = (unsigned int) parsed;
+            }
         } else if (strcmp(key, "bt_sample_rate") == 0) {
             out->bt_sample_rate = (unsigned int) strtoul(value, NULL, 10);
         } else if (strcmp(key, "bt_speexrate") == 0) {
@@ -499,6 +518,9 @@ static void settings_write_file(const player_settings_t * settings) {
     fprintf(f, "bt_volume_sync=%d\n", settings->bt_volume_sync_enabled ? 1 : 0);
     fprintf(f, "bt_speexrate=%d\n", settings->bt_speexrate_enabled ? 1 : 0);
     fprintf(f, "bt_sample_rate=%u\n", settings->bt_sample_rate);
+    for (int i = 0; i < settings->bt_device_rate_count && i < BT_DEVICE_RATE_MAX; i++)
+        fprintf(f, "bt_device_rate=%s,%u\n", settings->bt_device_rates[i].mac,
+                settings->bt_device_rates[i].rate);
     fprintf(f, "bt_codec=%s\n", settings->bt_codec);
     fprintf(f, "bt_last_output_mac=%s\n", settings->bt_last_output_mac);
     fprintf(f, "bt_hide_unnamed_devices=%d\n", settings->bt_hide_unnamed_devices ? 1 : 0);
@@ -555,6 +577,37 @@ static uint64_t settings_save_generation = 0;
 static uint64_t settings_queued_generation = 0;
 static bool settings_save_pending = false;
 static bool settings_worker_ready = false;
+
+/* Rate remembered for one accessory, falling back to the global choice when
+ * that accessory has never been given one. */
+unsigned int settings_bt_rate_for(const player_settings_t * settings, const char * mac) {
+    if (settings && mac && mac[0])
+        for (int i = 0; i < settings->bt_device_rate_count && i < BT_DEVICE_RATE_MAX; i++)
+            if (strcasecmp(settings->bt_device_rates[i].mac, mac) == 0)
+                return settings->bt_device_rates[i].rate;
+    return settings ? settings->bt_sample_rate : 0;
+}
+
+void settings_bt_set_rate_for(player_settings_t * settings, const char * mac, unsigned int rate) {
+    if (!settings || !mac || !mac[0]) return;
+    for (int i = 0; i < settings->bt_device_rate_count && i < BT_DEVICE_RATE_MAX; i++)
+        if (strcasecmp(settings->bt_device_rates[i].mac, mac) == 0) {
+            settings->bt_device_rates[i].rate = rate;
+            return;
+        }
+    if (settings->bt_device_rate_count < BT_DEVICE_RATE_MAX) {
+        int i = settings->bt_device_rate_count++;
+        snprintf(settings->bt_device_rates[i].mac, sizeof(settings->bt_device_rates[i].mac), "%s", mac);
+        settings->bt_device_rates[i].rate = rate;
+        return;
+    }
+    /* Full: drop the oldest so a newly used accessory is still remembered. */
+    memmove(&settings->bt_device_rates[0], &settings->bt_device_rates[1],
+            sizeof(settings->bt_device_rates[0]) * (BT_DEVICE_RATE_MAX - 1));
+    int last = BT_DEVICE_RATE_MAX - 1;
+    snprintf(settings->bt_device_rates[last].mac, sizeof(settings->bt_device_rates[last].mac), "%s", mac);
+    settings->bt_device_rates[last].rate = rate;
+}
 
 void settings_save(const player_settings_t * settings) {
     if (!settings) return;

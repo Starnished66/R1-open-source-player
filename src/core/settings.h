@@ -26,6 +26,8 @@ extern const int SLEEP_TIMER_STEPS[];
 #define SLEEP_TIMER_STEP_COUNT 10
 #define SETTINGS_SUBSONIC_SAVED_MAX 16
 
+#define BT_DEVICE_RATE_MAX 8
+
 typedef struct {
     float volume;              /* 0.0 - 1.0 */
     char last_track[512];      /* absolute path, empty if none */
@@ -131,14 +133,23 @@ typedef struct {
      * it can be turned off. Quality 5 costs far more; quality 10 cannot keep
      * up at all. */
     bool bt_speexrate_enabled;
-    /* A2DP transport rate in Hz, or 0 to let BlueALSA pick (highest up to
-     * 48 kHz). Resampling only happens when a track's rate differs from the
-     * transport's, so matching the rate most of a library uses avoids it.
-     * 44100 is applied as a daemon argument at negotiation time; any other
-     * explicit rate has to be selected per connection, which recreates the
-     * transport, so it costs one re-handshake and can be refused outright by
-     * the accessory. */
+    /* A2DP transport rate in Hz, or 0 for automatic. Automatic is the
+     * default and means 44.1 kHz: resampling only happens when a track's
+     * rate differs from the transport's, and CD-derived 44.1 kHz material is
+     * the bulk of a typical music library. 44.1 is negotiated directly via a
+     * daemon argument; any other rate needs the accessory's link
+     * re-established, because A2DP fixes the rate when the configuration is
+     * negotiated. */
     unsigned int bt_sample_rate;
+    /* Per-accessory overrides of the rate above, because the right rate is a
+     * property of the accessory: 44.1 kHz suits headphones fed CD-derived
+     * music, while an LDAC device may be worth 96 kHz. Keyed by MAC, oldest
+     * entry reused once full. */
+    struct {
+        char mac[18];
+        unsigned int rate;
+    } bt_device_rates[BT_DEVICE_RATE_MAX];
+    int bt_device_rate_count;
     char bt_last_output_mac[18]; /* verified A2DP source MAC, empty when none is remembered */
     /* When true, BLE devices without a broadcast name are hidden from the
      * "Available Devices" list (shown as raw MAC addresses otherwise).
@@ -355,6 +366,11 @@ bool settings_load(player_settings_t * out);
  * temporary file and renames it into place, so a crash or power loss
  * mid-write can't corrupt the settings file. */
 void settings_save(const player_settings_t * settings);
+
+/* Bluetooth transport rate remembered per accessory; falls back to
+ * bt_sample_rate when that accessory has no entry of its own. */
+unsigned int settings_bt_rate_for(const player_settings_t * settings, const char * mac);
+void settings_bt_set_rate_for(player_settings_t * settings, const char * mac, unsigned int rate);
 
 /* Queue a durable save without blocking the caller on filesystem syncs.
  * Rapid requests are coalesced to the newest complete snapshot. */

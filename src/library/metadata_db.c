@@ -203,17 +203,36 @@ bool metadata_db_had_no_saved_database(void) {
  * indexes, so a reader or a background scan running concurrently would be left
  * holding freed memory. Blocking and allocation-heavy on a large library --
  * call it off the UI thread. */
-/* Guarded reads of state the rebuild worker can change underneath a caller.
- * Both exist so UI code never reads tagcache's mutable delimiter buffer
- * directly while a rescan or a split rebuild is running. */
+/* Guarded reads of state the rebuild worker can change underneath a caller,
+ * so UI code never reads tagcache's mutable delimiter buffer directly while a
+ * rescan or a split rebuild is running. */
 void metadata_db_get_artist_delimiters(char * out, size_t out_size) {
+    if (!out || out_size == 0) return;
     METADATA_DB_GUARD;
     snprintf(out, out_size, "%s", tagcache_get_artist_delimiters());
 }
 
-void metadata_db_artist_primary(const char * raw_artist, char * out, size_t out_size) {
-    METADATA_DB_GUARD;
-    tagcache_artist_primary(raw_artist, out, out_size);
+/* Which Artists row a track belongs to, resolved in ONE lock scope: the name
+ * is derived from the tag and looked up in the index without releasing in
+ * between, so it cannot be split under one delimiter set and searched in an
+ * index built from another.
+ *
+ * Does not wait. This runs on the UI refresh path, and a split rebuild holds
+ * the lock for its whole run, so blocking here would freeze the screen for as
+ * long as the rebuild takes. A highlight is cosmetic: when the lock is busy
+ * this reports no row, and the refresh that follows the rebuild sets it. */
+bool metadata_db_try_artist_row(const char * raw_artist, int64_t * out_offset) {
+    if (!out_offset) return false;
+    pthread_once(&metadata_db_mutex_once, metadata_db_mutex_init);
+    if (pthread_mutex_trylock(&metadata_db_mutex) != 0) return false;
+
+    char primary[TAGCACHE_TAG_MAX];
+    tagcache_artist_primary(raw_artist, primary, sizeof(primary));
+    /* Safe to call while holding the lock: it takes the same recursive mutex. */
+    *out_offset = metadata_db_get_group_offset(METADATA_DB_GROUP_ARTIST, primary, NULL);
+
+    pthread_mutex_unlock(&metadata_db_mutex);
+    return true;
 }
 
 bool metadata_db_set_artist_delimiters(const char * delims) {

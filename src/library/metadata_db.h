@@ -44,7 +44,11 @@ bool metadata_db_set_artist_delimiters(const char * delims);
 /* Guarded accessors -- use these rather than the tagcache globals, which a
  * rescan or split rebuild can change concurrently. */
 void metadata_db_get_artist_delimiters(char * out, size_t out_size);
-void metadata_db_artist_primary(const char * raw_artist, char * out, size_t out_size);
+/* Resolves the Artists row a track belongs to in one lock scope. Returns false
+ * without waiting when the database is busy (a split rebuild holds the lock for
+ * its whole run), leaving the caller to skip a cosmetic highlight rather than
+ * stall the UI. */
+bool metadata_db_try_artist_row(const char * raw_artist, int64_t * out_offset);
 
 /* Starts a scan pass against the SD-resident tagcache. Unchanged files
  * are marked seen; new/changed files are upserted. metadata_db_end_update()

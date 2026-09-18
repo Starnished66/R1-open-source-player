@@ -3520,12 +3520,12 @@ void refresh_now_playing_indicators(void) {
     song_row_t row;
     if (now_playing_path[0] && metadata_db_get_song_by_path(now_playing_path, &row)) {
         /* The index files a split tag under each artist, so the raw combined
-         * string is not a group -- ask for the first name it was filed under,
-         * otherwise nothing highlights for a multi-artist track. */
-        char first_artist[TAGCACHE_TAG_MAX];
-        metadata_db_artist_primary(row.tags.artist, first_artist, sizeof(first_artist));
-        int64_t v = metadata_db_get_group_offset(METADATA_DB_GROUP_ARTIST, first_artist, NULL);
-        if (v >= 0 && v <= INT_MAX) artist_row = (int) v;
+         * string is not a group -- resolve which row it was filed under. Done
+         * in one call so the name cannot be split under one delimiter set and
+         * looked up in an index built from another, and it gives up rather
+         * than waiting on a rebuild that would stall this refresh. */
+        int64_t v = 0;
+        if (metadata_db_try_artist_row(row.tags.artist, &v) && v >= 0 && v <= INT_MAX) artist_row = (int) v;
         v = metadata_db_get_group_offset(METADATA_DB_GROUP_ALBUM, row.tags.album, row.tags.album_artist);
         if (v >= 0 && v <= INT_MAX) album_row = (int) v;
         v = metadata_db_get_group_offset(METADATA_DB_GROUP_ALBUM_ARTIST, row.tags.album_artist, NULL);

@@ -1621,8 +1621,8 @@ void poll_artist_split_rebuild(void) {
         /* The rebuild failed and metadata_db put the delimiters back with the
          * index it kept, so the saved setting has to follow rather than claim
          * a split that is not in effect. */
-        snprintf(current_settings.artist_delimiters, sizeof(current_settings.artist_delimiters),
-                 "%s", tagcache_get_artist_delimiters());
+        metadata_db_get_artist_delimiters(current_settings.artist_delimiters,
+                                          sizeof(current_settings.artist_delimiters));
         settings_save(&current_settings);
         artist_split_sync_toggles();
         show_error_toast("Could not rebuild the artist index");
@@ -1638,8 +1638,8 @@ static void artist_split_apply(void) {
     artist_split_active = true;
     if (pthread_create(&artist_split_thread, NULL, artist_split_thread_func, NULL) != 0) {
         artist_split_active = false;
-        snprintf(current_settings.artist_delimiters, sizeof(current_settings.artist_delimiters),
-                 "%s", tagcache_get_artist_delimiters());
+        metadata_db_get_artist_delimiters(current_settings.artist_delimiters,
+                                          sizeof(current_settings.artist_delimiters));
         settings_save(&current_settings);
         artist_split_sync_toggles();
         show_error_toast("Could not rebuild the artist index");

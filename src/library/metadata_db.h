@@ -41,6 +41,10 @@ bool metadata_db_had_no_saved_database(void);
  * the metadata lock. Blocking; call off the UI thread. Returns false if the
  * rebuild failed, in which case the previous index is still in place. */
 bool metadata_db_set_artist_delimiters(const char * delims);
+/* Guarded accessors -- use these rather than the tagcache globals, which a
+ * rescan or split rebuild can change concurrently. */
+void metadata_db_get_artist_delimiters(char * out, size_t out_size);
+void metadata_db_artist_primary(const char * raw_artist, char * out, size_t out_size);
 
 /* Starts a scan pass against the SD-resident tagcache. Unchanged files
  * are marked seen; new/changed files are upserted. metadata_db_end_update()

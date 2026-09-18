@@ -3523,7 +3523,7 @@ void refresh_now_playing_indicators(void) {
          * string is not a group -- ask for the first name it was filed under,
          * otherwise nothing highlights for a multi-artist track. */
         char first_artist[TAGCACHE_TAG_MAX];
-        tagcache_artist_primary(row.tags.artist, first_artist, sizeof(first_artist));
+        metadata_db_artist_primary(row.tags.artist, first_artist, sizeof(first_artist));
         int64_t v = metadata_db_get_group_offset(METADATA_DB_GROUP_ARTIST, first_artist, NULL);
         if (v >= 0 && v <= INT_MAX) artist_row = (int) v;
         v = metadata_db_get_group_offset(METADATA_DB_GROUP_ALBUM, row.tags.album, row.tags.album_artist);

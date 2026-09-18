@@ -203,10 +203,29 @@ bool metadata_db_had_no_saved_database(void) {
  * indexes, so a reader or a background scan running concurrently would be left
  * holding freed memory. Blocking and allocation-heavy on a large library --
  * call it off the UI thread. */
+/* Guarded reads of state the rebuild worker can change underneath a caller.
+ * Both exist so UI code never reads tagcache's mutable delimiter buffer
+ * directly while a rescan or a split rebuild is running. */
+void metadata_db_get_artist_delimiters(char * out, size_t out_size) {
+    METADATA_DB_GUARD;
+    snprintf(out, out_size, "%s", tagcache_get_artist_delimiters());
+}
+
+void metadata_db_artist_primary(const char * raw_artist, char * out, size_t out_size) {
+    METADATA_DB_GUARD;
+    tagcache_artist_primary(raw_artist, out, out_size);
+}
+
 bool metadata_db_set_artist_delimiters(const char * delims) {
     METADATA_DB_GUARD;
     char previous[TAGCACHE_ARTIST_DELIM_MAX];
     snprintf(previous, sizeof(previous), "%s", tagcache_get_artist_delimiters());
+
+    /* Nothing to re-file when the set has not moved. Without this the rescan
+     * path, which applies the current setting on every pass, would rebuild the
+     * whole index each time it runs -- including the automatic rescan after an
+     * SD reinsert, where nothing about the delimiters has changed at all. */
+    if (strcmp(previous, delims ? delims : "") == 0) return true;
 
     tagcache_set_artist_delimiters(delims);
     if (!db_ready) return true; /* nothing built yet; applied when the cache opens */

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 /* Guards bt_control_init_chip(), bt_control_enable(), and bt_control_disable()
@@ -57,6 +58,44 @@ static const char * bluealsa_ctl_name(void) {
     return bluealsa_backend().ctl;
 }
 
+/* Both are pushed in from the UI; see their setters below. */
+static atomic_bool bt_speexrate_enabled = false;
+/* Requested A2DP transport rate in Hz, 0 for BlueALSA's own choice. */
+static atomic_uint bt_sample_rate = 44100;
+
+/* Remembers a rate the accessory REFUSED, not one that was applied: a refusal
+ * can tear the transport down, so retrying it every reconnect would become a
+ * connect/refuse/drop cycle. A successful apply needs no memory, because the
+ * transport then reports the requested rate and the next attempt is a no-op. */
+static pthread_mutex_t bt_rate_applied_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char bt_rate_refused_path[256];
+static unsigned int bt_rate_refused_rate;
+
+void bt_control_set_sample_rate(unsigned int rate) {
+    atomic_store(&bt_sample_rate, rate);
+    /* A different choice deserves a fresh attempt even on a device that
+     * refused the previous one. */
+    pthread_mutex_lock(&bt_rate_applied_mutex);
+    bt_rate_refused_path[0] = '\0';
+    bt_rate_refused_rate = 0;
+    pthread_mutex_unlock(&bt_rate_applied_mutex);
+}
+
+/* 44.1 kHz is the one rate the daemon can be told to negotiate directly, so
+ * it is the only one that costs no transport re-handshake. */
+static bool bt_rate_wants_audio_cd(void) {
+    return atomic_load(&bt_sample_rate) == 44100;
+}
+
+/* Selects the speex resampler for Bluetooth output. On by default: a track
+ * whose rate differs from the A2DP transport's is converted either way, and
+ * speex measured about a point of CPU more than alsa-lib's built-in linear
+ * converter while sounding better. Converting at all is the expensive part,
+ * which is why the transport rate matters more than the converter. */
+void bt_control_set_speexrate_enabled(bool enabled) {
+    atomic_store(&bt_speexrate_enabled, enabled);
+}
+
 void bt_control_restore_codec_preference(const char * codec) {
     bt_codec_preference_t preference = BT_CODEC_AUTO;
     if (codec) {
@@ -69,6 +108,29 @@ void bt_control_restore_codec_preference(const char * codec) {
     }
     atomic_store(&bt_codec_preference, preference);
 }
+
+/* ALSA reads $HOME/.asoundrc; main() points HOME at this writable
+ * directory because the rootfs is a read-only squashfs. */
+/* Negotiate the A2DP transport at 44.1 kHz. Resampling costs ~28% of a core
+ * on an R1 whatever converter does it, and it only happens when a track's
+ * rate differs from the transport's, so the cheapest transport rate is the
+ * one most tracks already use. BlueALSA otherwise picks the highest rate up
+ * to 48 kHz, which resamples the 44.1 kHz majority of a typical library.
+ * Source only: see bt_control_apply_output_settings(). */
+#define BT_A2DP_FORCE_44K1_ARG "--a2dp-force-audio-cd"
+
+#define BT_ALSA_CONFIG_DIR "/usr/data/alsa"
+#define BT_ALSA_PCM_NAME "bt_out"
+/* Quality-3 speex converter, shipped in the base image. Measured on an R1
+ * resampling 44.1k to a 48k transport, it costs the same as alsa-lib's
+ * built-in linear converter while being a real sinc resampler; quality 5
+ * costs ~14 points more CPU and quality 10 cannot keep up at all. alsa-lib
+ * fails the open outright when a named converter is missing, so its
+ * presence is checked rather than assumed: a player binary must keep
+ * working on a base image that predates it. */
+#define BT_ALSA_RATE_CONVERTER "speexrate"
+#define BT_ALSA_RATE_CONVERTER_PLUGIN \
+    "/usr/lib/alsa-lib/libasound_module_rate_" BT_ALSA_RATE_CONVERTER ".so"
 
 const char * bt_control_get_playback_pcm(void) {
     switch ((bt_codec_preference_t) atomic_load(&bt_codec_preference)) {
@@ -239,6 +301,59 @@ static void bluealsa_clear_codec_path(const char * path) {
  * bt_control_reconcile_source_settings()'s already-connected case. */
 static bool find_source_pcm_path(char * out, size_t out_size);
 
+/* Applies an explicit transport rate other than 44.1 kHz, which the daemon
+ * has no argument for. This goes through SelectCodec, and in BlueALSA 5 that
+ * recreates the A2DP transport rather than reconfiguring it, so it costs a
+ * brief re-handshake and the accessory is free to refuse it outright.
+ *
+ * Attempted at most once per PCM path per run, and deliberately NOT reset on
+ * disconnect the way the codec preference is: a refusal can itself tear the
+ * transport down, and retrying on every reconnect would turn that into an
+ * endless connect/refuse/drop cycle. */
+static void copy_info_field(char * dst, size_t size, const char * text, const char * key);
+
+static void bluealsa_apply_rate_preference(const char * path) {
+    unsigned int want = atomic_load(&bt_sample_rate);
+    /* 0 leaves BlueALSA's own choice alone, and 44100 is already carried by
+     * the daemon argument, which costs no re-handshake. */
+    if (want == 0 || want == 44100) return;
+    if (!bluealsa_is_audio_pcm_path(path)) return;
+
+    pthread_mutex_lock(&bt_rate_applied_mutex);
+    bool refused = bt_rate_refused_rate == want && strcmp(bt_rate_refused_path, path) == 0;
+    pthread_mutex_unlock(&bt_rate_applied_mutex);
+    if (refused) return;
+
+    bluealsa_backend_t backend = bluealsa_backend();
+    char info_out[2048];
+    char * info_argv[] = { (char *) backend.ctl, (char *) "info", (char *) path, NULL };
+    if (!subprocess_run_low_priority(info_argv, info_out, sizeof(info_out))) return;
+
+    unsigned int current = 0;
+    const char * rate_field = strstr(info_out, "Rate:");
+    if (rate_field) (void) sscanf(rate_field + strlen("Rate:"), "%u", &current);
+    if (current == want) return; /* already negotiated there */
+
+    char codec[32] = {0};
+    copy_info_field(codec, sizeof(codec), info_out, "Selected codec:");
+    char * codec_end = strchr(codec, ':'); /* v5 appends the configuration blob */
+    if (codec_end) *codec_end = '\0';
+    if (!codec[0]) return;
+
+    char rate_str[16];
+    snprintf(rate_str, sizeof(rate_str), "%u", want);
+    char * argv[] = { (char *) backend.ctl, (char *) "codec", (char *) "-r", rate_str,
+                      (char *) path, codec, NULL };
+    int exit_code = -1;
+    if (!subprocess_run_checked(argv, NULL, 0, 5000, &exit_code) || exit_code != 0) {
+        DBG_LOG("bt_control: rate %u refused for %s\n", want, path);
+        pthread_mutex_lock(&bt_rate_applied_mutex);
+        snprintf(bt_rate_refused_path, sizeof(bt_rate_refused_path), "%s", path);
+        bt_rate_refused_rate = want;
+        pthread_mutex_unlock(&bt_rate_applied_mutex);
+    }
+}
+
 static void bluealsa_apply_codec_preference(const char * path) {
     const char * codec = bt_codec_select_name();
     if (!codec) return; /* AUTO -- let BlueALSA negotiate, nothing to force */
@@ -383,7 +498,13 @@ static void bt_dac_info_refresh(void) {
 
 static void * bt_dac_info_thread_func(void * arg) {
     (void) arg;
-    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "monitor", NULL };
+    /* Codec and Running are property changes, which the monitor omits unless
+     * asked for: a PCM appears before playback starts, so without these the
+     * idle-to-running transition never arrives. The set is narrowed because
+     * Delay/ClientDelay change continuously during playback and each event
+     * costs two subprocesses in bt_dac_info_refresh(). */
+    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "monitor",
+                      (char *) "--properties=Codec,Running", NULL };
     pid_t pid;
     int fd;
     if (!subprocess_popen(argv, &pid, &fd)) return NULL;
@@ -555,7 +676,7 @@ static bool bluealsa_needs_source_restart(const bluealsa_backend_t * backend,
         const char * name = strrchr(args, '/');
         name = name ? name + 1 : args;
         if (strcmp(name, backend->daemon_name) != 0) continue;
-        bool sink = false, active_xq = false, active_all_codecs = false;
+        bool sink = false, active_xq = false, active_all_codecs = false, active_force_cd = false;
         const char * active_codec = NULL;
         const char * active_ldac_quality = NULL;
         for (size_t pos = strlen(args) + 1; pos < len; ) {
@@ -570,6 +691,7 @@ static bool bluealsa_needs_source_restart(const bluealsa_backend_t * backend,
                      pos + arg_len + 1 < len &&
                      strcmp(args + pos + arg_len + 1, "xq") == 0)) active_xq = true;
             if (strcmp(arg, "--all-codecs") == 0) active_all_codecs = true;
+            if (strcmp(arg, BT_A2DP_FORCE_44K1_ARG) == 0) active_force_cd = true;
             if (strcmp(arg, "-c") == 0 || strcmp(arg, "--codec") == 0) {
                 if (pos + arg_len + 1 < len) active_codec = args + pos + arg_len + 1;
             } else if (strncmp(arg, "--codec=", 8) == 0) {
@@ -590,7 +712,9 @@ static bool bluealsa_needs_source_restart(const bluealsa_backend_t * backend,
             const char * expected_ldac_quality = preference == BT_CODEC_LDAC_HQ ? "high" :
                                                   preference == BT_CODEC_LDAC_SQ ? "standard" : NULL;
             bool expected_all_codecs = preference == BT_CODEC_AUTO;
+            bool expected_force_cd = bt_rate_wants_audio_cd();
             if (active_xq != expected_xq || active_all_codecs != expected_all_codecs ||
+                    active_force_cd != expected_force_cd ||
                     (expected_codec && (!active_codec || strcasecmp(active_codec, expected_codec) != 0)) ||
                     (!expected_codec && active_codec) ||
                     (expected_ldac_quality && (!active_ldac_quality ||
@@ -801,11 +925,40 @@ bool bt_control_is_powered(void) {
  * ensures the BlueALSA 5 source daemon specifically, every time, decoupled
  * from whether hci0 needed a fresh bring-up; DAC mode and the app's volume
  * synchronization are handled by their own call sites. */
-static bool ensure_bluealsa_running(void) {
+/* Side-effect-free accessory probe, answering "maybe" rather than "no" when
+ * it cannot tell: a failed or timed-out list-pcms must never authorize
+ * killing a daemon that may own a live link, and a timeout is likeliest
+ * exactly when the system is already struggling. A daemon that is genuinely
+ * gone is still respawned, because the caller finds no process to keep.
+ * Deliberately not find_source_pcm_path(), which also applies the
+ * SoftVolume preference to whatever it finds. */
+static bool bluealsa_source_pcm_may_be_connected(void) {
+    char list_out[4096];
+    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "list-pcms", NULL };
+    if (!subprocess_run_low_priority(argv, list_out, sizeof(list_out))) return true;
+    return strstr(list_out, "/a2dpsrc/sink") != NULL;
+}
+
+static bool ensure_bluealsa_running_ex(bool * out_deferred) {
     pthread_mutex_lock(&bt_daemon_respawn_mutex);
     bluealsa_backend_t backend = bluealsa_backend();
     bt_codec_preference_t preference = (bt_codec_preference_t) atomic_load(&bt_codec_preference);
     bool must_restart = bluealsa_needs_source_restart(&backend, preference);
+    /* Killing the daemon tears down every A2DP link it owns, and encoder
+     * arguments only affect codec negotiation for new connections, so a
+     * connected accessory is never dropped to correct them; the mismatch is
+     * reconciled on a later call once nothing is connected. That session
+     * keeps whatever it already negotiated: bluealsa_apply_codec_preference()
+     * can retarget a live PCM only for an explicit codec choice, never for
+     * "auto", and LDAC quality is a daemon-level argument either way.
+     * bt_resume/bt_init start the daemon without the arguments an "auto"
+     * preference expects, so this mismatch is present on every boot. */
+    if (must_restart && bluealsa_source_pcm_may_be_connected()) {
+        must_restart = false;
+        /* Reported so the caller can retry once nothing is connected, rather
+         * than recording a reconciliation that never actually happened. */
+        if (out_deferred) *out_deferred = true;
+    }
     if (must_restart)
         subprocess_kill_all_matching(backend.daemon_name);
     /* Killing detached daemons is asynchronous; the old process may still be
@@ -816,17 +969,22 @@ static bool ensure_bluealsa_running(void) {
         pthread_mutex_unlock(&bt_daemon_respawn_mutex);
         return true;
     }
-    char * argv[10];
+    char * argv[11];
     int argc = 0;
     argv[argc++] = (char *) backend.daemon;
     argv[argc++] = (char *) "-p";
     argv[argc++] = (char *) "a2dp-source";
+    if (bt_rate_wants_audio_cd()) argv[argc++] = (char *) BT_A2DP_FORCE_44K1_ARG;
     if (bt_codec_is_sbc_xq()) argv[argc++] = (char *) "--sbc-quality=xq";
     argc = bt_codec_append_daemon_args(argv, argc);
     argv[argc] = NULL;
     bool ok = subprocess_spawn_daemon(argv);
     pthread_mutex_unlock(&bt_daemon_respawn_mutex);
     return ok;
+}
+
+static bool ensure_bluealsa_running(void) {
+    return ensure_bluealsa_running_ex(NULL);
 }
 
 bool bt_control_init_chip(void) {
@@ -849,16 +1007,20 @@ bool bt_control_init_chip(void) {
 }
 
 bool bt_control_reconcile_source_settings(void) {
-    if (!ensure_bluealsa_running()) return false;
+    bool deferred = false;
+    if (!ensure_bluealsa_running_ex(&deferred)) return false;
     /* An accessory already connected before the PCMAdded watch started
      * never produces that event, so the codec preference would sit
      * unapplied until the next reconnect. Same reasoning (and same pairing
      * with discovery) find_source_pcm_path() already documents for the v5
      * SoftVolume preference, which it applies on discovery itself. */
     char path[256];
-    if (find_source_pcm_path(path, sizeof(path)))
+    if (find_source_pcm_path(path, sizeof(path))) {
         bluealsa_apply_codec_preference(path);
-    return true;
+        bluealsa_apply_rate_preference(path);
+    }
+    /* Not reconciled while an accessory held the daemon's old arguments. */
+    return !deferred;
 }
 
 /* /usr/bin/bt_enable -- matches hiby_player's own confirmed strings rather
@@ -1120,8 +1282,16 @@ static void run_bredr_scan(int seconds) {
     subprocess_terminate(pid); /* reaps it either way -- `quit` alone isn't guaranteed to have taken effect yet */
 }
 
+/* Lists devices BlueZ already knows (paired, and anything seen since boot)
+ * without running an inquiry. An inquiry makes the controller interleave
+ * discovery with an active A2DP link, which is audible as the stream cutting
+ * in and out, so the caller decides when that cost is worth paying. */
+int bt_control_list_devices(bt_device_t * out, int max_count) {
+    return bt_control_scan(0, out, max_count);
+}
+
 int bt_control_scan(int seconds, bt_device_t * out, int max_count) {
-    run_bredr_scan(seconds); /* blocks for `seconds` -- that's the point */
+    if (seconds > 0) run_bredr_scan(seconds); /* blocks for `seconds` -- that's the point */
 
     char devices_buf[8192];
     char * devices_argv[] = { (char *) "bluetoothctl", (char *) "devices", NULL };
@@ -1503,6 +1673,145 @@ bool bt_control_get_connected_device_stream(char * out, size_t out_size, unsigne
     return true;
 }
 
+/* Writes an ALSA PCM definition whose plug slave is pinned to the rate the
+ * A2DP transport already negotiated, and reports the PCM name to open.
+ *
+ * Opening the BlueALSA PCM at the track's own rate instead is destructive:
+ * on a mismatch the plugin calls SelectCodec, and in BlueALSA 5 that is a
+ * transport recreation, not a reconfiguration ("A2DP codec selection is in
+ * fact a transport recreation", ba-transport.c), so the accessory drops --
+ * and the call fails outright on devices that refuse the new configuration.
+ * Pinning the slave rate makes ALSA convert the track instead, which is what
+ * PipeWire, PulseAudio and Android all do with an A2DP transport.
+ *
+ * The definition names the accessory explicitly rather than relying on
+ * BlueALSA's "most recently connected" default, so it cannot follow a
+ * different device than the one just queried. Written atomically: a
+ * half-written file in HOME would break every ALSA open, not just this one.
+ *
+ * Returns false when the transport cannot be read, leaving the caller to
+ * open bt_control_get_playback_pcm() directly as before. */
+/* `bluealsactl -vv info` prints each entry of "Available codecs:" on its own
+ * indented line as "NAME:hex [channels: ...] [rate: 44100 48000 ...]", and
+ * the rates there are already the intersection with what the accessory
+ * supports. The selected codec's own line is what the transport is using, so
+ * its name picks which available entry to read. */
+int bt_control_get_available_rates(unsigned int * out, int max_count) {
+    if (!out || max_count <= 0) return 0;
+
+    char path[256];
+    if (!find_source_pcm_path(path, sizeof(path))) return 0;
+
+    char info_out[4096];
+    char * argv[] = { (char *) bluealsa_ctl_name(), (char *) "-vv", (char *) "info", path, NULL };
+    if (!subprocess_run_low_priority(argv, info_out, sizeof(info_out))) return 0;
+
+    /* Selected codec name: the line after the "Selected codec:" header, up
+     * to the ':' that starts its configuration blob. */
+    const char * selected = strstr(info_out, "Selected codec:");
+    if (!selected) return 0;
+    selected = strchr(selected, '\n');
+    if (!selected) return 0;
+    selected++;
+    while (*selected == ' ' || *selected == '\t') selected++;
+    char codec_name[32];
+    size_t name_len = strcspn(selected, ": \t\r\n");
+    if (name_len == 0 || name_len >= sizeof(codec_name)) return 0;
+    memcpy(codec_name, selected, name_len);
+    codec_name[name_len] = '\0';
+
+    const char * available = strstr(info_out, "Available codecs:");
+    if (!available) return 0;
+
+    /* Walk the indented entries, stopping at the first line that is not one. */
+    int count = 0;
+    const char * line = strchr(available, '\n');
+    while (line && count < max_count) {
+        line++;
+        if (*line != ' ' && *line != '\t') break;
+        while (*line == ' ' || *line == '\t') line++;
+        size_t line_len = strcspn(line, "\r\n");
+        if (strncmp(line, codec_name, name_len) == 0 &&
+                (line[name_len] == ':' || line[name_len] == ' ')) {
+            const char * rates = strstr(line, "[rate:");
+            if (rates && (size_t) (rates - line) < line_len) {
+                rates += strlen("[rate:");
+                while (*rates && *rates != ']' && count < max_count) {
+                    while (*rates == ' ') rates++;
+                    if (*rates < '0' || *rates > '9') break;
+                    out[count++] = (unsigned int) strtoul(rates, (char **) &rates, 10);
+                }
+            }
+            break;
+        }
+        line = strchr(line, '\n');
+    }
+    return count;
+}
+
+bool bt_control_prepare_playback_pcm(char * out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+
+    char path[256];
+    if (!find_source_pcm_path(path, sizeof(path))) return false;
+
+    /* Derived from the path already in hand: bt_control_get_connected_device_mac()
+     * would repeat the list-pcms this just did. */
+    const char * dev = strstr(path, "dev_");
+    if (!dev || strlen(dev + 4) < 17) return false;
+    dev += 4;
+    char mac[18];
+    for (int i = 0; i < 17; i++) mac[i] = (dev[i] == '_') ? ':' : dev[i];
+    mac[17] = '\0';
+
+    char info_out[2048];
+    char * info_argv[] = { (char *) bluealsa_ctl_name(), (char *) "info", path, NULL };
+    if (!subprocess_run_low_priority(info_argv, info_out, sizeof(info_out))) return false;
+
+    unsigned int rate = 0;
+    unsigned int channels = 0;
+    const char * rate_field = strstr(info_out, "Rate:");
+    if (rate_field) (void) sscanf(rate_field + strlen("Rate:"), "%u", &rate);
+    const char * channels_field = strstr(info_out, "Channels:");
+    if (channels_field) (void) sscanf(channels_field + strlen("Channels:"), "%u", &channels);
+    if (rate == 0) return false;
+    if (channels == 0) channels = 2;
+
+    if (mkdir(BT_ALSA_CONFIG_DIR, 0755) != 0 && errno != EEXIST) return false;
+
+    char tmp_path[128];
+    char final_path[128];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/.asoundrc.tmp", BT_ALSA_CONFIG_DIR);
+    snprintf(final_path, sizeof(final_path), "%s/.asoundrc", BT_ALSA_CONFIG_DIR);
+
+    FILE * f = fopen(tmp_path, "w");
+    if (!f) return false;
+    fprintf(f, "pcm.%s {\n", BT_ALSA_PCM_NAME);
+    fprintf(f, "    type plug\n");
+    fprintf(f, "    slave {\n");
+    fprintf(f, "        pcm {\n");
+    fprintf(f, "            type bluealsa\n");
+    fprintf(f, "            device \"%s\"\n", mac);
+    fprintf(f, "            profile \"a2dp\"\n");
+    const char * codec = bt_codec_select_name();
+    if (codec) fprintf(f, "            codec \"%s\"\n", codec);
+    fprintf(f, "        }\n");
+    fprintf(f, "        rate %u\n", rate);
+    fprintf(f, "        channels %u\n", channels);
+    fprintf(f, "    }\n");
+    if (atomic_load(&bt_speexrate_enabled) && access(BT_ALSA_RATE_CONVERTER_PLUGIN, F_OK) == 0)
+        fprintf(f, "    rate_converter \"%s\"\n", BT_ALSA_RATE_CONVERTER);
+    fprintf(f, "}\n");
+    bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok) { remove(tmp_path); return false; }
+    if (rename(tmp_path, final_path) != 0) { remove(tmp_path); return false; }
+
+    snprintf(out, out_size, "%s", BT_ALSA_PCM_NAME);
+    DBG_LOG("bt_control: BT output pinned to %u Hz %u ch for %s\n", rate, channels, mac);
+    return true;
+}
+
 static pthread_t bt_source_vol_sync_thread;
 static atomic_bool bt_source_vol_sync_active = false;
 static bool bt_source_vol_sync_joinable;
@@ -1822,6 +2131,7 @@ static void * bt_output_disconnect_thread_func(void * arg) {
                 /* Codec first: selecting one can cycle the PCM, which would
                  * otherwise drop a soft-volume setting applied just before. */
                 bluealsa_apply_codec_preference(added_paths[i]);
+                bluealsa_apply_rate_preference(added_paths[i]);
                 bluealsa_apply_soft_volume(added_paths[i]);
             }
             added_count = 0;
@@ -1924,11 +2234,14 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
      * bare `&`, script just ends), and was just confirmed working
      * flawlessly. */
 
-    char * argv[9];
+    char * argv[10];
     int i = 0;
     argv[i++] = (char *) backend.daemon;
     argv[i++] = (char *) "-p";
     argv[i++] = dac_mode_enabled ? (char *) "a2dp-sink" : (char *) "a2dp-source";
+    /* Source only. In DAC mode the rate is the phone's choice and the local
+     * DAC takes it as-is, so forcing 44.1 there would resample for nothing. */
+    if (!dac_mode_enabled && bt_rate_wants_audio_cd()) argv[i++] = (char *) BT_A2DP_FORCE_44K1_ARG;
     if (!dac_mode_enabled && bt_codec_is_sbc_xq())
         argv[i++] = (char *) "--sbc-quality=xq";
     if (!dac_mode_enabled) i = bt_codec_append_daemon_args(argv, i);

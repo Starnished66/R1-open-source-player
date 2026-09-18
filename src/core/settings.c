@@ -88,6 +88,8 @@ static void set_defaults(player_settings_t * out) {
     out->subsonic_saved_count = 0;
     out->bt_volume_sync_enabled = true;
     out->bt_dac_mode_enabled = false;
+    out->bt_speexrate_enabled = true;
+    out->bt_sample_rate = 44100;
     snprintf(out->bt_codec, sizeof(out->bt_codec), "auto");
     out->bt_last_output_mac[0] = '\0';
     out->bt_hide_unnamed_devices = true;
@@ -326,8 +328,10 @@ bool settings_load(player_settings_t * out) {
             }
         } else if (strcmp(key, "bt_volume_sync") == 0) {
             out->bt_volume_sync_enabled = (strcmp(value, "1") == 0);
-        } else if (strcmp(key, "bt_dac_mode") == 0) {
-            out->bt_dac_mode_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "bt_sample_rate") == 0) {
+            out->bt_sample_rate = (unsigned int) strtoul(value, NULL, 10);
+        } else if (strcmp(key, "bt_speexrate") == 0) {
+            out->bt_speexrate_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "bt_codec") == 0) {
             snprintf(out->bt_codec, sizeof(out->bt_codec), "%s", value);
         } else if (strcmp(key, "bt_last_output_mac") == 0) {
@@ -493,7 +497,8 @@ static void settings_write_file(const player_settings_t * settings) {
         fprintf(f, "subsonic_saved_%d_verify_tls=%d\n", i, settings->subsonic_saved[i].verify_tls ? 1 : 0);
     }
     fprintf(f, "bt_volume_sync=%d\n", settings->bt_volume_sync_enabled ? 1 : 0);
-    fprintf(f, "bt_dac_mode=%d\n", settings->bt_dac_mode_enabled ? 1 : 0);
+    fprintf(f, "bt_speexrate=%d\n", settings->bt_speexrate_enabled ? 1 : 0);
+    fprintf(f, "bt_sample_rate=%u\n", settings->bt_sample_rate);
     fprintf(f, "bt_codec=%s\n", settings->bt_codec);
     fprintf(f, "bt_last_output_mac=%s\n", settings->bt_last_output_mac);
     fprintf(f, "bt_hide_unnamed_devices=%d\n", settings->bt_hide_unnamed_devices ? 1 : 0);

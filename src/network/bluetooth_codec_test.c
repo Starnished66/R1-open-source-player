@@ -414,6 +414,57 @@ static void test_bluez_paired_devices(void) {
     assert(bluez_help_calls == 1 && bluez_paired_calls == 2);
 }
 
+/* 44.1 kHz is the one transport rate the daemon can be told to negotiate, and
+ * it is the default, so the argument has to reach the source daemon and stay
+ * off the sink. */
+static void test_force_audio_cd_argv(void) {
+    bt_control_restore_codec_preference("auto");
+    bt_control_set_sample_rate(44100);
+
+    process_cmdline = NULL; process_cmdline_size = 0;
+    process_present = false; kill_calls = spawn_calls = 0;
+    ensure_bluealsa_running();
+    assert(spawn_calls == 1 && spawned_argc == 5);
+    assert(strcmp(spawned[2], "a2dp-source") == 0);
+    assert(strcmp(spawned[3], "--a2dp-force-audio-cd") == 0);
+    assert(strcmp(spawned[4], "--all-codecs") == 0);
+
+    /* A daemon already carrying the argument is left alone. */
+    static const char forced[] = "/usr/bin/bluealsad\0-p\0a2dp-source\0--a2dp-force-audio-cd\0--all-codecs\0";
+    process_cmdline = forced; process_cmdline_size = sizeof(forced);
+    process_present = true; kill_calls = spawn_calls = 0;
+    ensure_bluealsa_running();
+    assert(kill_calls == 0 && spawn_calls == 0);
+
+    /* Automatic must drop it again, which is a real argv mismatch. Nothing is
+     * connected, so correcting it is allowed to restart the daemon. */
+    bt_control_set_sample_rate(0);
+    source_pcm_present = false;
+    process_cmdline = forced; process_cmdline_size = sizeof(forced);
+    process_present = true; retain_process_after_kill = true; kill_calls = spawn_calls = 0;
+    ensure_bluealsa_running();
+    assert(kill_calls == 1 && spawn_calls == 1 && spawned_argc == 4);
+    assert(strcmp(spawned[3], "--all-codecs") == 0);
+    retain_process_after_kill = false;
+
+    /* Same mismatch with an accessory connected must NOT kill the daemon:
+     * that would drop a live A2DP link just to correct an argument. */
+    source_pcm_present = true;
+    process_cmdline = forced; process_cmdline_size = sizeof(forced);
+    process_present = true; kill_calls = spawn_calls = 0;
+    ensure_bluealsa_running();
+    assert(kill_calls == 0 && spawn_calls == 0);
+    source_pcm_present = false;
+
+    /* DAC mode never forces the rate: the phone picks it. */
+    bt_control_set_sample_rate(44100);
+    kill_calls = spawn_calls = 0;
+    assert(!bt_control_apply_output_settings(true, false));
+    assert(spawn_calls == 1 && spawned_argc == 3);
+    assert(strcmp(spawned[2], "a2dp-sink") == 0);
+    bt_control_set_sample_rate(0);
+}
+
 int main(void) {
     /* A locking regression must fail promptly rather than hang the target. */
     alarm(10);
@@ -427,9 +478,14 @@ int main(void) {
     assert(!parse_monitor_volume("0x7f7fjunk", &monitor_volume));
 
     assert(bt_control_set_codec("auto"));
+    /* The existing argv assertions below cover codec arguments, so the rate
+     * is parked on Automatic to keep them positional. A dedicated case for
+     * the 44.1 kHz argument follows them. */
+    bt_control_set_sample_rate(0);
     test_daemon_argv();
     test_sbc_xq_lifecycle();
     test_modern_argv();
+    test_force_audio_cd_argv();
     test_bluez_paired_devices();
     alarm(0);
     puts("bluetooth-codec-selftest: PASS (BlueALSA 5 daemon/codec behavior, soft volume, BlueZ compatibility)");

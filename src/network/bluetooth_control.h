@@ -129,6 +129,9 @@ bool bt_control_get_connected_device_stream(char * out, size_t out_size, unsigne
  * back the combined paired+discovered device list via `info` on each one
  * for Paired/Connected state. Call off the UI thread. Returns how many
  * devices were written into out[] (capped at max_count). */
+/* Known devices only, no inquiry: safe to call while audio is streaming. */
+int bt_control_list_devices(bt_device_t * out, int max_count);
+
 int bt_control_scan(int seconds, bt_device_t * out, int max_count);
 
 /* Pair (if not already) + trust + connect, in that order -- trusting first
@@ -180,9 +183,30 @@ bool bt_control_set_codec(const char * codec);
 
 /* Restore the saved outgoing encoder preference without doing I/O. */
 void bt_control_restore_codec_preference(const char * codec);
+
+/* Selects the speex resampler for Bluetooth output instead of alsa-lib's
+ * built-in linear one. On by default; roughly a point of CPU more. */
+void bt_control_set_speexrate_enabled(bool enabled);
+
+/* Requested A2DP transport rate in Hz, or 0 for BlueALSA's own choice
+ * (highest up to 48 kHz). 44100 is applied as a daemon argument, so it needs
+ * a Bluetooth off/on cycle; any other rate is selected per connection. */
+void bt_control_set_sample_rate(unsigned int rate);
+
+/* Rates the connected accessory supports for the codec currently in use,
+ * newest query each call. Returns the count written, 0 when nothing is
+ * connected or the rates could not be read. */
+int bt_control_get_available_rates(unsigned int * out, int max_count);
 /* ALSA PCM used for outgoing Bluetooth audio; an explicit preference selects
  * its BlueALSA CODEC parameter, while auto leaves negotiation unchanged. */
 const char * bt_control_get_playback_pcm(void);
+
+/* Prepares an ALSA PCM pinned to the rate the A2DP transport already
+ * negotiated and reports its name, so playback never asks BlueALSA to change
+ * the transport's rate (which recreates it and drops the accessory). False
+ * when the transport cannot be read; open bt_control_get_playback_pcm()
+ * directly in that case. */
+bool bt_control_prepare_playback_pcm(char * out, size_t out_size);
 
 /* Keeps this app's own playback volume and a connected a2dp-source
  * accessory's (headphones/speaker this device streams TO) AVRCP volume in

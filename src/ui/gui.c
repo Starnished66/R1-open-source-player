@@ -211,6 +211,7 @@ void poll_wifi_connect_saved(void);
 void poll_wifi_disconnect(void);
 void poll_wifi_forget(void);
 void poll_bt_scan(void);
+void poll_bt_rate_query(void);
 void poll_bt_connect(void);
 void poll_bt_forget(void);
 
@@ -976,6 +977,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     gui_shell_poll();
     plugin_manager_poll();
     poll_bt_scan();
+    poll_bt_rate_query();
     poll_bt_connect();
     poll_bt_forget();
     poll_library_rescan();
@@ -1365,6 +1367,8 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #endif
     settings_load(&current_settings);
     bt_control_restore_codec_preference(current_settings.bt_codec);
+    bt_control_set_speexrate_enabled(current_settings.bt_speexrate_enabled);
+    bt_control_set_sample_rate(current_settings.bt_sample_rate);
     db_log_set_enabled(current_settings.db_logging_enabled);
     usb_dac_bridge_set_debug_log_enabled(current_settings.db_logging_enabled);
     headphone_status_refresh_earpods_adc();

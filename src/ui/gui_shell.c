@@ -3637,9 +3637,9 @@ static void poll_bt_toggle(void) {
     start_refresh_bt_icon(); /* re-reads the real state -- updates the status bar/drawer icons and (once done) the Bluetooth screen's toggle row */
 }
 
-/* Reapplies persisted bt_dac_mode_enabled configuration asynchronously
- * at startup, launching the necessary bluealsa and bt-agent processes without
- * blocking the UI thread. */
+/* Applies bt_dac_mode_enabled configuration asynchronously during the
+ * startup window, launching the necessary bluealsa and bt-agent processes
+ * without blocking the UI thread. */
 static pthread_t bt_dac_startup_reapply_thread;
 static bool bt_dac_startup_reapply_active = false;
 static bool bt_dac_startup_reapply_started = false;
@@ -3655,9 +3655,10 @@ static void * bt_dac_startup_reapply_thread_func(void * arg) {
     return NULL;
 }
 
-/* Called once from gui_init(), only if bt_dac_mode_enabled was already true
- * at load time (a fresh toggle-on tap already goes through
- * bt_dac_toggle_cb() directly and doesn't need this). */
+/* Runs at most once, and only if DAC mode was switched on before the
+ * Bluetooth startup gate opened. bt_dac_mode_enabled is not persisted, so
+ * this never fires on a normal boot; a toggle-on tap after that gate goes
+ * through bt_dac_toggle_cb() directly and doesn't need this. */
 static void start_bt_dac_startup_reapply_if_needed(void) {
     if (!current_settings.bt_dac_mode_enabled || bt_dac_startup_reapply_started ||
         !refresh_bt_startup_readiness()) return;
@@ -3711,11 +3712,16 @@ static void start_bt_source_codec_reconcile_if_needed(void) {
     /* The first attempt is allowed to query the authoritative state even if
      * the cached status is still false. After a transient failure, wait for a
      * newer completed status refresh before retrying; this avoids a retry
-     * storm while still recovering when Bluetooth becomes ready later. */
+     * storm while still recovering when Bluetooth becomes ready later. A
+     * deferred reconcile is different: while the cached A2DP link remains
+     * up, retrying every newer status generation would just repeat the
+     * connected-accessory guard. Wait for the cached link to go away before
+     * trying again, so the next attempt can actually restart the daemon. */
     if (bt_source_codec_reconcile_started &&
         (!bt_source_codec_reconcile_retry_pending ||
          bt_source_codec_reconcile_failed_generation == bt_power_status_generation ||
-         !bt_is_powered_cached)) return;
+         !bt_is_powered_cached ||
+         gui_shell_is_bt_audio_connected())) return;
     bt_source_codec_reconcile_started = true;
     bt_source_codec_reconcile_active = true;
     atomic_store_explicit(&bt_source_codec_reconcile_done_flag, false, memory_order_relaxed);
@@ -4606,7 +4612,7 @@ void gui_shell_update_topbar(bool screen_just_woke) {
     /* Cheap startup-only marker check.  This runs every 500ms so the first
      * authoritative Bluetooth refresh begins promptly when bt_init finishes,
      * without delaying the rest of the UI or polling BlueZ prematurely.  It
-     * also releases a persisted Bluetooth-DAC reapply behind the same gate. */
+     * also releases a pending Bluetooth-DAC apply behind the same gate. */
     if (!bt_startup_ready) {
         start_bt_dac_startup_reapply_if_needed();
         start_refresh_bt_icon();

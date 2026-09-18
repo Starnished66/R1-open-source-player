@@ -115,8 +115,30 @@ typedef struct {
     /* Bluetooth output settings -- see bluetooth_control.h for the BlueALSA
      * 5 service behavior. */
     bool bt_volume_sync_enabled; /* Mirror hardware volume changes to the paired device. */
-    bool bt_dac_mode_enabled;    /* a2dp-sink profile: lets another device stream audio TO this one */
+    /* a2dp-sink profile: lets another device stream audio TO this one.
+     * Runtime-only, never persisted: the single-profile daemon cannot serve
+     * a2dp-source at the same time, so restoring this at boot would leave
+     * headphones unable to connect with no DAC overlay on screen to exit
+     * from. Leaving the overlay already clears it, so a stored "true" only
+     * ever came from powering off while the overlay was open. */
+    bool bt_dac_mode_enabled;
     char bt_codec[16];           /* "auto"/"ldac_hq"/"ldac_sq"/"aptx"/"aac"/"sbc"/"sbc_xq" */
+    /* Resample Bluetooth output with the speex converter instead of
+     * alsa-lib's built-in linear one. A track whose rate differs from the
+     * A2DP transport's has to be converted either way, and speex measured
+     * about a point of CPU more than linear on an R1 while sounding better,
+     * so it is on by default and exposed under Bluetooth > Advanced only so
+     * it can be turned off. Quality 5 costs far more; quality 10 cannot keep
+     * up at all. */
+    bool bt_speexrate_enabled;
+    /* A2DP transport rate in Hz, or 0 to let BlueALSA pick (highest up to
+     * 48 kHz). Resampling only happens when a track's rate differs from the
+     * transport's, so matching the rate most of a library uses avoids it.
+     * 44100 is applied as a daemon argument at negotiation time; any other
+     * explicit rate has to be selected per connection, which recreates the
+     * transport, so it costs one re-handshake and can be refused outright by
+     * the accessory. */
+    unsigned int bt_sample_rate;
     char bt_last_output_mac[18]; /* verified A2DP source MAC, empty when none is remembered */
     /* When true, BLE devices without a broadcast name are hidden from the
      * "Available Devices" list (shown as raw MAC addresses otherwise).

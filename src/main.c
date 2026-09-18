@@ -338,6 +338,12 @@ int main(int argc, char ** argv) {
      * needing a reflash (e.g. libldacdec.so, required by bluealsa). */
     setenv("LD_LIBRARY_PATH", "/usr/data/lib", 1);
 
+    /* ALSA looks for $HOME/.asoundrc, and the rootfs is a read-only
+     * squashfs, so point HOME at the writable partition. Bluetooth playback
+     * writes a rate-pinned PCM definition there; the file only adds a PCM
+     * name, leaving local and USB output untouched. */
+    setenv("HOME", "/usr/data/alsa", 1);
+
     /* Must run before firmware_update_check_boot_combo() and gui_init() --
      * both read from the SD card. */
     mount_sd_card_if_needed();
